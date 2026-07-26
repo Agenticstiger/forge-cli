@@ -26,48 +26,12 @@ from .base import (
     fluid_id,
     get_metadata_passthrough,
     metadata_passthrough,
+    resolve_status,
 )
 from .types import fluid_to_odcs_status, odcs_to_fluid_status
 
 ODCS_API_VERSION = "v3.1.0"
 ODCS_KIND = "DataContract"
-
-
-def resolve_status(fluid: Mapping[str, Any]) -> str:
-    """Resolve the FLUID lifecycle status a spec exporter should publish.
-
-    ``lifecycle.state`` is the field the FLUID schema actually defines
-    (``preview``/``active``/``deprecated``/``retired``) and the one users set.
-    The exporters used to read only ``metadata.status`` — a key the schema
-    forbids, so it was never populated and every export shipped the hard-coded
-    default. Resolution order, most specific first:
-
-    1. ``_scoped_status`` — the per-port status the ODPS bundle exporter
-       stamps on from ``expose.lifecycle.state``;
-    2. ``metadata.status`` — never present in a schema-valid contract on disk;
-       it is set in-memory by :func:`normalize.rehydrate` to replay an imported
-       document's verbatim status, and accepted from legacy in-process dicts;
-    3. the expose's own ``lifecycle.state`` when the contract has exactly one;
-    4. the contract-root ``lifecycle.state``.
-    """
-    scoped = fluid.get("_scoped_status")
-    if scoped:
-        return str(scoped)
-
-    metadata = fluid.get("metadata")
-    if isinstance(metadata, Mapping) and metadata.get("status"):
-        return str(metadata["status"])
-
-    exposes = fluid.get("exposes")
-    if isinstance(exposes, list) and len(exposes) == 1 and isinstance(exposes[0], Mapping):
-        expose_lifecycle = exposes[0].get("lifecycle")
-        if isinstance(expose_lifecycle, Mapping) and expose_lifecycle.get("state"):
-            return str(expose_lifecycle["state"])
-
-    lifecycle = fluid.get("lifecycle")
-    if isinstance(lifecycle, Mapping) and lifecycle.get("state"):
-        return str(lifecycle["state"])
-    return "active"
 
 
 # ----- ODCS → FLUID --------------------------------------------------------
