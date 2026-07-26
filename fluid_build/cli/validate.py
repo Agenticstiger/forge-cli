@@ -760,6 +760,48 @@ def _validate_contract_for_version(
             if args.verbose:
                 info(logger, f"Vector binding check skipped: {exc}")
 
+        # --- Packaging checks (RFC-packaging-modes.md file 9) ---------------
+        # ``fluid validate`` had NO packaging awareness: a `shared` block with
+        # no `pool` validated clean and then failed at `fluid plan` with an
+        # error whose own remediation says "Run 'fluid validate <contract>'
+        # first to rule out a contract problem". Resolving through the same
+        # single chokepoint plan/generate-iac/apply use means validate cannot
+        # drift from what those stages will decide.
+        #
+        # The overlay check needs the base and the override SEPARATELY, so it
+        # re-reads the overlay document rather than the (already deep-merged)
+        # contract: an overlay that flips `mode` while inheriting the base's
+        # `containers` map changes nothing for those kinds, because the
+        # per-kind entries beat `mode`.
+        try:
+            from fluid_build.iac.packaging import (
+                validate_overlay_packaging,
+                validate_packaging_block,
+            )
+
+            pkg_errors, pkg_warnings = validate_packaging_block(contract)
+            contract_path = getattr(args, "contract", None)
+            env = getattr(args, "env", None)
+            if contract_path and env:
+                from fluid_build.loader import load_contract, load_overlay_document
+
+                found = load_overlay_document(contract_path, env)
+                if found is not None:
+                    _overlay_path, overlay_doc = found
+                    ov_errors, ov_warnings = validate_overlay_packaging(
+                        load_contract(contract_path, resolve_refs=False), overlay_doc
+                    )
+                    pkg_errors.extend(ov_errors)
+                    pkg_warnings.extend(ov_warnings)
+            for msg in pkg_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in pkg_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Packaging check skipped: {exc}")
+
         # --- Semantic-model checks (double aggregation) ---------------------
         # A measure's ``expr`` is the PRE-aggregation input that ``agg`` is
         # applied to, so ``{agg: sum, expr: SUM(amount)}`` compiles to
