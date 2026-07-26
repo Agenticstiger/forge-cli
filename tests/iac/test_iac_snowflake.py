@@ -1375,3 +1375,61 @@ class TestSnowflakeCatalogEnrichment:
         assert "snowflake_tag" not in res
         assert "snowflake_tag_association" not in res
         assert "snowflake_tag_masking_policy_association" not in res
+
+
+class TestIcebergIsRefusedNotSubstituted:
+    """``format: iceberg`` must not fall through to ``snowflake_table``.
+
+    Snowflake Iceberg needs ``snowflake_iceberg_table`` + an EXTERNAL VOLUME
+    + a CATALOG + a ``base_location``, none of which this plugin emits. It
+    used to fall through and emit a plain table: every Iceberg field
+    (catalog / warehouse / uri) was dropped into the table COMMENT, and
+    ``tofu apply`` still reported ``+1`` success while
+    ``INFORMATION_SCHEMA.TABLES.IS_ICEBERG`` said ``NO``.
+    """
+
+    def _iceberg_exposure(self, fmt="iceberg"):
+        return {
+            "exposeId": "ice",
+            "binding": {
+                "platform": "snowflake",
+                "format": fmt,
+                "location": {
+                    "database": "DB",
+                    "schema": "SC",
+                    "table": "ICE",
+                    "catalog": "rest",
+                    "warehouse": "s3://bucket/warehouse",
+                    "uri": "https://example.snowflakecomputing.com/polaris/api/catalog",
+                },
+            },
+            "contract": {"schema": [{"name": "ID", "type": "integer", "required": True}]},
+        }
+
+    @pytest.mark.parametrize("fmt", ["iceberg", "iceberg_table", "ICEBERG"])
+    def test_iceberg_format_raises(self, fmt):
+        from fluid_build.iac.base import UnsupportedBindingError
+
+        with pytest.raises(UnsupportedBindingError) as exc:
+            _sf().emit(_contract([self._iceberg_exposure(fmt)]))
+        assert exc.value.kind == "snowflake-iceberg-unsupported"
+        # Actionable, not just "unsupported".
+        assert exc.value.remediation
+        assert any("dbt" in step for step in exc.value.remediation)
+
+    def test_no_plain_table_is_emitted_for_an_iceberg_expose(self):
+        """The failure mode being pinned: a `snowflake_table` standing in."""
+        from fluid_build.iac.base import UnsupportedBindingError
+
+        try:
+            res = _sf().emit(_contract([self._iceberg_exposure()]))
+        except UnsupportedBindingError:
+            return  # refused — correct
+        raise AssertionError(
+            f"iceberg expose silently emitted {sorted(res)}; "
+            "substituting a different resource kind is the defect"
+        )
+
+    def test_regular_snowflake_table_is_unaffected(self):
+        res = _sf().emit(_contract([_table_exposure(database="DB", schema="SC", table="T")]))
+        assert "snowflake_table" in res

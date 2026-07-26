@@ -28,6 +28,7 @@ from typing import Any, Dict, Mapping
 from fluid_build.cli.console import cprint
 from fluid_build.iac import build_module, get_iac_plugin, runner
 from fluid_build.iac.backend import parse_backend
+from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.credentials import build_tofu_env, credential_report
 from fluid_build.iac.naming import safe_ident
 
@@ -110,9 +111,18 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     module_path = workdir / "main.tf.json"
     actions = native_actions(contract, logger)
-    module_path.write_text(
-        build_module(plugin, contract, actions=actions, backend=backend), encoding="utf-8"
-    )
+    try:
+        module = build_module(plugin, contract, actions=actions, backend=backend)
+    except UnsupportedBindingError as exc:
+        # The emitter refused to substitute a different resource kind for the
+        # declared binding. Surface it as a typed CLI error rather than a
+        # traceback — and, critically, before anything reaches the warehouse.
+        raise CLIError(
+            1,
+            "unsupported_binding",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        )
+    module_path.write_text(module, encoding="utf-8")
 
     env = build_tofu_env()
     env.update(plugin.credential_env(env))

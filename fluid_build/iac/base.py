@@ -15,6 +15,27 @@ from typing import Any, Dict, Iterable, List, Mapping, Protocol, Tuple
 from .importer import ImportBlock
 
 
+class UnsupportedBindingError(ValueError):
+    """An ``exposes[].binding`` asks for something this plugin cannot emit.
+
+    Raised by a provider emitter instead of silently substituting a
+    different resource kind. Substitution is the worst failure mode
+    available: ``format: iceberg`` on Snowflake used to emit a plain
+    ``snowflake_table``, so ``tofu apply`` reported ``+1`` success while
+    ``INFORMATION_SCHEMA.TABLES.IS_ICEBERG`` said ``NO`` — the operator had
+    no signal at all that the declared format was dropped.
+
+    ``kind`` is a stable, greppable tag (same discipline as
+    :class:`~fluid_build.iac.packaging.PackagingError`); ``remediation``
+    lists the concrete next steps the CLI renders.
+    """
+
+    def __init__(self, kind: str, message: str, remediation: Tuple[str, ...] = ()):
+        super().__init__(message)
+        self.kind = kind
+        self.remediation = remediation
+
+
 class IacProviderPlugin(Protocol):
     """One plugin per cloud — the unit of modularity.
 
