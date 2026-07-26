@@ -35,6 +35,23 @@ Two directions, deliberately asymmetric:
   ``--adopt-shared-container`` and emits a WARNING-level audit event —
   the same discipline as ``--allow-data-loss``.
 
+Detecting the adoption direction needs **two** signals, because a
+REFERENCED container does not always leave a footprint in state:
+
+1. a ``data.`` address in prior state (AWS/GCP, whose plugins emit data
+   sources for a shared pool), and
+2. the *absence* of a container the contract now declares OWNED from an
+   otherwise non-empty prior state.
+
+Signal 2 exists because ``SnowflakeIacPlugin.emit_data`` returns ``{}`` —
+Snowflake emits resources only — so a shared Snowflake pool leaves *no*
+trace at all. With signal 1 alone the guard was a silent no-op on every
+Snowflake contract: the flip re-owned the platform pool, wiped its
+attributes to the tenant contract's values, and never asked. The candidate
+list for signal 2 is the provider plugin's own ``discover_imports`` output
+(the exact addresses ``_adopt_existing`` is about to ``tofu import``), so
+no provider knowledge is duplicated here.
+
 The existing data-loss gate remains the unconditional last line: this
 guard runs earlier and is about *ownership*, not about destroy counts.
 
@@ -202,7 +219,10 @@ def _decisions_in_scope(contract: Mapping[str, Any], kind: str) -> Set[Container
 
 
 def detect_ownership_transitions(
-    contract: Mapping[str, Any], state_addresses: Iterable[str]
+    contract: Mapping[str, Any],
+    state_addresses: Iterable[str],
+    *,
+    import_candidates: Iterable[str] = (),
 ) -> Tuple[OwnershipTransition, ...]:
     """Diff prior state against the contract's resolved ownership model.
 
@@ -214,6 +234,15 @@ def detect_ownership_transitions(
     raising: the emit path resolves the same block moments later and
     reports it as a typed error naming the real culprit (the same posture
     as ``backend.default_state_key``).
+
+    ``import_candidates`` is the provider plugin's ``discover_imports``
+    address list — the containers ``_adopt_existing`` is about to
+    ``tofu import``. A container address in that list that is *absent*
+    from a non-empty prior state was referenced (or unmanaged) until now
+    and is being adopted, which is the only signal available for providers
+    that emit no ``data`` sub-tree for a shared pool (Snowflake). Ignored
+    when the state is empty: a greenfield first apply adopts nothing it
+    did not already declare.
     """
     try:
         if resolve_packaging(contract) is LEGACY:
@@ -222,11 +251,26 @@ def detect_ownership_transitions(
         return ()
 
     transitions = []
+    seen_addresses: Set[str] = set()
+
+    def _record(address: str, kind: str, frm: str, to: str) -> None:
+        if address in seen_addresses:
+            return
+        seen_addresses.add(address)
+        transitions.append(
+            OwnershipTransition(
+                address=address, container_kind=kind, from_ownership=frm, to_ownership=to
+            )
+        )
+
+    managed: Set[str] = set()
     for address in state_addresses or ():
         parsed = parse_state_address(address)
         if parsed is None:
             continue
         is_data, resource_type, _name = parsed
+        if not is_data:
+            managed.add(address.strip())
         kind = CONTAINER_RESOURCE_TYPES.get(resource_type)
         if kind is None:
             continue
@@ -235,23 +279,33 @@ def detect_ownership_transitions(
         except PackagingError:
             continue
         if not is_data and ContainerDecision.REFERENCED in decisions:
-            transitions.append(
-                OwnershipTransition(
-                    address=address.strip(),
-                    container_kind=kind,
-                    from_ownership=_OWNED,
-                    to_ownership=_REFERENCED,
-                )
-            )
+            _record(address.strip(), kind, _OWNED, _REFERENCED)
         elif is_data and ContainerDecision.OWNED in decisions:
-            transitions.append(
-                OwnershipTransition(
-                    address=address.strip(),
-                    container_kind=kind,
-                    from_ownership=_REFERENCED,
-                    to_ownership=_OWNED,
-                )
-            )
+            _record(address.strip(), kind, _REFERENCED, _OWNED)
+
+    # Signal 2 — a container about to be imported that this state has never
+    # managed. Only meaningful once the contract has state of its own.
+    if managed:
+        for address in import_candidates or ():
+            candidate = (address or "").strip()
+            if not candidate or candidate in managed:
+                continue
+            parsed = parse_state_address(candidate)
+            if parsed is None:
+                continue
+            is_data, resource_type, _name = parsed
+            if is_data:
+                continue
+            kind = CONTAINER_RESOURCE_TYPES.get(resource_type)
+            if kind is None:
+                continue
+            try:
+                decisions = _decisions_in_scope(contract, kind)
+            except PackagingError:
+                continue
+            if ContainerDecision.OWNED in decisions:
+                _record(candidate, kind, _REFERENCED, _OWNED)
+
     return tuple(transitions)
 
 
@@ -286,6 +340,7 @@ def guard_ownership_transitions(
     *,
     workdir: Optional[str] = None,
     adopt_shared_container: bool = False,
+    import_candidates: Iterable[str] = (),
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[OwnershipTransition, ...]:
     """Fail closed on any ownership flip; return the adoptions allowed through.
@@ -297,7 +352,9 @@ def guard_ownership_transitions(
     WARNING is logged here too, so the paper trail survives a caller that
     forgets.
     """
-    transitions = detect_ownership_transitions(contract, state_addresses)
+    transitions = detect_ownership_transitions(
+        contract, state_addresses, import_candidates=import_candidates
+    )
     if not transitions:
         return ()
 

@@ -334,6 +334,173 @@ class TestResourceTypeMapping:
         assert [t.container_kind for t in transitions] == ["database"]
 
 
+SNOWFLAKE_POOLED = {
+    "fluidVersion": "0.7.6",
+    "id": "silver.misc.tenant_v1",
+    "exposes": [
+        {
+            "exposeId": "tenant_table",
+            "binding": {
+                "platform": "snowflake",
+                "format": "snowflake_table",
+                "location": {
+                    "database": "FLUID_MISC_POOL",
+                    "schema": "MPOOL",
+                    "table": "MISC_TENANT_TABLE",
+                },
+            },
+        }
+    ],
+}
+
+
+def _snowflake_contract(packaging: Dict[str, Any]) -> Dict[str, Any]:
+    contract = {k: v for k, v in SNOWFLAKE_POOLED.items()}
+    contract["packaging"] = packaging
+    return contract
+
+
+# What `tofu state list` really holds after a shared-mode Snowflake apply:
+# the leaf table and NOTHING else. `SnowflakeIacPlugin.emit_data` returns {},
+# so the REFERENCED pool leaves no `data.` address behind.
+SF_SHARED_STATE = ["snowflake_table.silver_misc_tenant_v1_FLUID_MISC_POOL_MPOOL_MISC_TENANT_TABLE"]
+
+# What `discover_imports` yields once the block flips to `isolated` — the exact
+# addresses `_adopt_existing` would `tofu import`.
+SF_ISOLATED_IMPORTS = [
+    "snowflake_database.silver_misc_tenant_v1_FLUID_MISC_POOL",
+    "snowflake_schema.silver_misc_tenant_v1_FLUID_MISC_POOL_MPOOL",
+    "snowflake_table.silver_misc_tenant_v1_FLUID_MISC_POOL_MPOOL_MISC_TENANT_TABLE",
+]
+
+
+class TestSnowflakeAdoptionHasNoDataAddress:
+    """A REFERENCED Snowflake container leaves no state footprint at all.
+
+    Regression pin: with the state diff as the only signal, the guard was a
+    silent no-op on every Snowflake contract. A shared -> isolated flip
+    imported the platform's pool database and schema into the tenant's state
+    and rewrote their attributes (verified live: the platform's database and
+    schema COMMENTs were erased), with the flag never consulted — a control
+    run with and without ``--adopt-shared-container`` produced byte-identical
+    output.
+    """
+
+    def test_state_alone_cannot_see_the_flip(self):
+        """Documents the blind spot the import-candidate signal exists to cover."""
+        assert detect_ownership_transitions(_snowflake_contract(ISOLATED), SF_SHARED_STATE) == ()
+
+    def test_the_import_candidates_reveal_the_adoption(self):
+        transitions = detect_ownership_transitions(
+            _snowflake_contract(ISOLATED),
+            SF_SHARED_STATE,
+            import_candidates=SF_ISOLATED_IMPORTS,
+        )
+        assert [(t.container_kind, t.from_ownership, t.to_ownership) for t in transitions] == [
+            ("database", "referenced", "owned"),
+            ("schema", "referenced", "owned"),
+        ]
+        assert all(t.is_adoption for t in transitions)
+
+    def test_it_is_blocked_without_the_flag(self):
+        with pytest.raises(PackagingTransitionError) as excinfo:
+            guard_ownership_transitions(
+                _snowflake_contract(ISOLATED),
+                SF_SHARED_STATE,
+                import_candidates=SF_ISOLATED_IMPORTS,
+            )
+        assert excinfo.value.kind == "shared-adoption-requires-flag"
+
+    def test_the_flag_waves_it_through(self):
+        adoptions = guard_ownership_transitions(
+            _snowflake_contract(ISOLATED),
+            SF_SHARED_STATE,
+            import_candidates=SF_ISOLATED_IMPORTS,
+            adopt_shared_container=True,
+        )
+        assert len(adoptions) == 2
+
+    def test_a_steady_state_shared_contract_is_still_a_no_op(self):
+        """`discover_imports` skips REFERENCED containers, so nothing to adopt."""
+        assert (
+            guard_ownership_transitions(
+                _snowflake_contract(SHARED),
+                SF_SHARED_STATE,
+                import_candidates=SF_SHARED_STATE,
+            )
+            == ()
+        )
+
+    def test_a_steady_state_isolated_contract_is_a_no_op(self):
+        """Second apply of an isolated contract: the containers are already managed."""
+        assert (
+            guard_ownership_transitions(
+                _snowflake_contract(ISOLATED),
+                SF_ISOLATED_IMPORTS,
+                import_candidates=SF_ISOLATED_IMPORTS,
+            )
+            == ()
+        )
+
+    def test_an_empty_state_never_flags_an_adoption(self):
+        """Greenfield first apply — no prior state, nothing was ever referenced."""
+        assert (
+            detect_ownership_transitions(
+                _snowflake_contract(ISOLATED), [], import_candidates=SF_ISOLATED_IMPORTS
+            )
+            == ()
+        )
+
+    def test_leaf_import_candidates_are_never_adoptions(self):
+        """Only container types transition; a table is owned in every mode."""
+        assert (
+            detect_ownership_transitions(
+                _snowflake_contract(ISOLATED),
+                SF_SHARED_STATE,
+                import_candidates=["snowflake_table.some_other_table"],
+            )
+            == ()
+        )
+
+    def test_a_legacy_contract_is_untouched_by_the_new_signal(self):
+        contract = {k: v for k, v in SNOWFLAKE_POOLED.items()}
+        assert (
+            detect_ownership_transitions(
+                contract, SF_SHARED_STATE, import_candidates=SF_ISOLATED_IMPORTS
+            )
+            == ()
+        )
+
+    def test_the_engine_feeds_the_plugin_import_candidates_to_the_guard(self, monkeypatch):
+        """The wiring pin: without the plugin the guard gets no candidates."""
+        from fluid_build.cli import _apply_opentofu_engine as engine
+        from fluid_build.cli._common import CLIError
+        from fluid_build.iac.base import ImportBlock
+
+        monkeypatch.setattr(engine.runner, "tofu_state_list", lambda *a, **k: SF_SHARED_STATE)
+        plugin = type(
+            "P",
+            (),
+            {
+                "discover_imports": staticmethod(
+                    lambda contract, actions: [ImportBlock(to=a, id=a) for a in SF_ISOLATED_IMPORTS]
+                )
+            },
+        )()
+        args = type("Args", (), {"adopt_shared_container": False})()
+        with pytest.raises(CLIError) as excinfo:
+            engine._guard_packaging_transitions(
+                _snowflake_contract(ISOLATED),
+                "/w",
+                {},
+                args,
+                logging.getLogger("t"),
+                plugin=plugin,
+                actions=(),
+            )
+        assert excinfo.value.context["kind"] == "shared-adoption-requires-flag"
+
+
 class TestEngineWiring:
     """The guard must genuinely run in the apply engine — not just exist."""
 
