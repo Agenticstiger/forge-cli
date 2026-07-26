@@ -104,7 +104,10 @@ def test_query_with_metric_and_dimension(tmp_path):
         table_reference=descriptor.table_reference,
     )
     result = driver.query(compiled=compiled)
-    assert "customer_count" in result.columns
+    # The projection is aliased to the METRIC name, not the underlying
+    # measure, so two metrics over one measure stay distinguishable.
+    assert "active_customers" in result.columns
+    assert "customer_count" not in result.columns
     assert all("signup_date" in row for row in result.rows)
 
 

@@ -48,7 +48,7 @@ For one `expose` block at a time, the server advertises:
 |---|---|
 | `describe` | Returns the bound expose's contract — schema, semantic model, QoS, classification, lineage hints, binding location. No engine round-trip. |
 | `sample` | Returns up to `--max-sample-rows` rows. Column-level restrictions from `expose.policy.authz.columnRestrictions` are enforced; restricted columns are dropped. |
-| `query` | Predeclared semantic query — pick a metric or measure from `expose.semantics`, group by zero or more dimensions, optionally filter on dimension keys. Compiled to parameterised SQL; the LLM never authors raw SQL. |
+| `query` | Predeclared semantic query — pick a metric or measure from `expose.semantics`, group by zero or more dimensions, optionally filter on dimension keys. Compiled to parameterised SQL; the LLM never authors raw SQL. The measure column is aliased to the **metric** name when you ask for a metric, so two metrics over one measure stay distinguishable. A grouped result is ordered by the measure descending (then by each grouping key) and reports `truncated: true` when the `LIMIT` clipped it — so "revenue by day" gives you a reproducible top-N, not an arbitrary slice labelled complete. |
 | `query_sql` | **Gated** — only advertised when `--allow-sql` is set. Caller-supplied SQL is checked through the SQL-safety allowlist before execution. |
 
 The server also speaks MCP `resources/list` + `resources/read`, so an
@@ -189,11 +189,49 @@ Every `tools/call` is checked against:
    silently returns the cap.
 4. **Column-level masking.** Columns listed in
    `expose.policy.authz.columnRestrictions` with `access: deny`
-   are dropped from `sample` and `query` projections.
+   are dropped from `sample` projections, and **rejected outright**
+   on `query` / `query_sql`. Rejecting rather than dropping is
+   deliberate: the semantic layer aliases its projection, so a
+   measure `{name: avg_balance, agg: avg, expr: account_balance}`
+   would otherwise serve statistics over a denied column under a
+   name the drop step never recognises, and `filters:
+   {account_balance: 9999.99}` is an inference oracle over the
+   column's values even though it never appears in the projection.
+   The denial applies to a measure's `expr`, a dimension's `expr`,
+   a metric's `filter`, and any caller filter key.
 5. **Privacy masking.** Columns listed in
    `expose.policy.privacy.masking` are dropped today (Phase 1);
    Phase 2 emits the engine-specific masking expression so
    masked values flow back hashed / tokenised / encrypted.
+6. **PII / PHI redaction.** Columns marked `sensitivity: pii`
+   (or `phi` / `sensitive`) in `expose.contract.schema` stay
+   VISIBLE but their values are replaced with `[REDACTED-PII]`, so
+   an agent can still aggregate over them (`COUNT(DISTINCT
+   customer_email)`) without ever seeing an address. Redaction
+   keys off the underlying **column expression**, not the output
+   name: a dimension `{name: seg_alias, expr: market_segment}` is
+   redacted exactly like `{name: market_segment}`. A
+   value-revealing aggregate (`min` / `max` / `median` /
+   `percentile`) over a PII column returns a real cell value, so
+   it is redacted too; `count` / `count_distinct` / `sum` / `avg`
+   are not.
+7. **Model + use-case gate (`agentPolicy`).** When an expose
+   declares `policy.agentPolicy.{allowedModels, deniedModels,
+   allowedUseCases, deniedUseCases}` — or an operator passes
+   `--allow-models` / `--deny-models` / `--allow-use-cases` /
+   `--deny-use-cases` — every `tools/call` is evaluated against
+   the caller's declared identity. **Caller identity is not part
+   of the MCP spec**: the `initialize` request's `Implementation`
+   object carries `{name, version}`, so the gateway reads the
+   model from a non-standard `model` field (and the use case from
+   `useCase`) inside `clientInfo`, or from cryptographically
+   verified `fluid_auth_attrs` when the HTTP transport's auth
+   middleware is enabled. A client that sends neither is denied
+   with `missing-model-identity` — fail-closed, including on the
+   denylist-only case, because otherwise a denied model would slip
+   the gate by omitting the field. **When no model policy is
+   declared at all the gate is inert**, so an off-the-shelf client
+   (Claude Code, Cursor, the MCP Inspector) works out of the box.
 
 The 0.7.3 schema also lets each contract author pin MCP-specific
 overrides via a new `expose.mcp` block:
@@ -243,6 +281,23 @@ The script:
 Use `--json` for machine-readable output. Optional clients are
 reported as `skipped` rather than failing so the same script runs
 in dev sandboxes and release CI.
+
+## Error reporting
+
+Every refusal and every failure comes back as a normal `tools/call`
+result carrying `isError: true` plus a JSON envelope with `error`,
+`tool` and `message` — the shape the MCP spec prescribes, so agent
+loops can branch on it and the model can see what went wrong.
+`AgentPolicyDenied`, `RateLimitExceeded`, `CircuitOpen`,
+`TokenBudgetExceeded`, `ToolNotAllowed`, `UnknownTool`,
+`QueryValidationError` and engine failures all use it.
+
+`QueryValidationError` messages are surfaced VERBATIM — they name
+only contract-declared measures / metrics / dimensions / columns
+the caller can already enumerate via `describe`, so an agent can
+self-correct its next call. Engine and binding failures are
+sanitised behind "see server audit trail" so the binding's
+database / schema / table never reaches the model.
 
 ## Troubleshooting
 
