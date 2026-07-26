@@ -76,7 +76,15 @@ def _contract(in_path: Path, out_path: Path) -> Dict[str, Any]:
 
 
 def _run(tmp_path: Path, monkeypatch, *, stream_override: str | None = None):
-    """Run one duckdb acquisition with a buffered emitter installed."""
+    """Run one duckdb acquisition with a buffered emitter installed.
+
+    ``duckdb`` is an optional extra and the runner imports it lazily, so the
+    CI legs that install the base package only (Stage 1 — pure-function emit)
+    can import this module but cannot execute a build. Skip at the point of
+    use rather than module-wide, so ``test_dry_run_emits_nothing`` — which
+    never reaches the engine — still runs there.
+    """
+    pytest.importorskip("duckdb")
     in_path = tmp_path / "in" / "data.csv"
     in_path.parent.mkdir(parents=True, exist_ok=True)
     in_path.write_text("id,name\n1,a\n2,b\n", encoding="utf-8")

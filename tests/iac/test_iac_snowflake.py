@@ -1469,4 +1469,3 @@ class TestBodylessViewExposure:
         body = next(iter(res["snowflake_view"].values()))
         assert body["statement"] == "SELECT ID FROM SRC"
         assert body["name"] == "V"
-
