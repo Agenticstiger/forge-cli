@@ -27,6 +27,7 @@ from ..base import (
     ValidationIssue,
 )
 from ..registry import register_engine
+from .catalogs_yml import generate_catalogs_yml
 from .models import generate_models
 from .profiles import generate_profiles
 from .project_yml import generate_project_yml
@@ -78,6 +79,14 @@ class DbtEngine(TransformationEngine):
 
         # dbt_project.yml
         files["dbt_project.yml"] = generate_project_yml(contract, build)
+
+        # catalogs.yml, only when the contract exposes an Iceberg table on an
+        # adapter whose shape we have verified. dbt writes the table entry but
+        # not the external volume or catalog integration behind it, so this
+        # points dbt at what `fluid apply` provisions.
+        catalogs_content = generate_catalogs_yml(contract, build)
+        if catalogs_content:
+            files["catalogs.yml"] = catalogs_content
 
         # models/sources.yml — when a workspace_root is supplied we walk it
         # looking for upstream contracts so ``sources.yml`` can point at the
