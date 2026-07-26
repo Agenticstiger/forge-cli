@@ -721,4 +721,30 @@ def run_builds_from_args(
     cprint(f"⏭️  Skipped: {total_skipped}")
     cprint(f"{'=' * 80}\n")
 
-    return 0 if total_failed == 0 else 1
+    if total_failed:
+        return 1
+
+    # Green-on-nothing guard. A build-augmented apply whose every build was
+    # skipped used to exit 0: the DDL landed, no transformation ran, no rows
+    # were produced, and CI reported a successful data-product deployment
+    # against an empty table. "Nothing ran" is not "success" — a missing dbt
+    # project or driver script is a broken deployment, not a no-op.
+    # ``--allow-skipped-builds`` is the explicit opt-in for contracts whose
+    # build artifacts legitimately live outside the checkout.
+    if total_skipped and not total_executed:
+        if getattr(args, "allow_skipped_builds", False):
+            LOG.warning(
+                "build.all_skipped_allowed skipped=%d (--allow-skipped-builds)",
+                total_skipped,
+            )
+            return 0
+        console_error(
+            f"Every build was skipped ({total_skipped}/{len(builds)}) — nothing "
+            "was transformed and no rows were produced. Fix the missing build "
+            "artifact(s) reported above, or pass --allow-skipped-builds if the "
+            "skip is expected."
+        )
+        LOG.error("build.all_skipped skipped=%d total=%d", total_skipped, len(builds))
+        return 1
+
+    return 0

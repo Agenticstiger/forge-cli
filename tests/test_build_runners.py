@@ -32,6 +32,7 @@ to suppress anymore — ``fluid execute`` was removed).
 """
 
 import argparse
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -1718,13 +1719,16 @@ class TestRun:
         assert exc_info.value.event == "contract_load_failed"
 
     def test_script_not_found_skipped(self, tmp_path):
+        """A missing driver script skips the build — and an all-skipped run is
+        an error, not success (green-on-nothing guard). The explicit
+        ``--allow-skipped-builds`` opt-in restores exit 0."""
         contract_file = tmp_path / "contract.yaml"
         contract_file.touch()
         build = {"id": "b1", "repository": "repo", "properties": {"model": "missing"}}
         args = self._args(contract=str(contract_file))
         logger = logging.getLogger("test")
 
-        with (
+        patches = (
             patch(
                 "fluid_build.build_runners.base.load_contract_with_overlay",
                 return_value={"builds": [build]},
@@ -1732,9 +1736,47 @@ class TestRun:
             patch("fluid_build.build_runners.base.cprint"),
             patch("fluid_build.build_runners.base.success"),
             patch("fluid_build.build_runners.base.console_error"),
+        )
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            assert run(args, logger) == 1
+            args.allow_skipped_builds = True
+            assert run(args, logger) == 0
+
+    def test_one_executed_build_keeps_a_partial_skip_green(self, tmp_path):
+        """The guard fires only when NOTHING ran. A run with at least one
+        executed build still exits 0 even if a sibling was skipped."""
+        contract_file = tmp_path / "contract.yaml"
+        contract_file.touch()
+        contract = {
+            "builds": [
+                {"id": "skipped", "repository": "repo", "properties": {"model": "missing"}},
+                {
+                    "id": "ran",
+                    "engine": "sql",
+                    "pattern": "embedded-logic",
+                    "properties": {"sql": "SELECT 1"},
+                },
+            ]
+        }
+        args = self._args(contract=str(contract_file))
+        logger = logging.getLogger("test")
+
+        with (
+            patch(
+                "fluid_build.build_runners.base.load_contract_with_overlay",
+                return_value=contract,
+            ),
+            patch(
+                "fluid_build.build_runners.base._execute_embedded_sql_build",
+                return_value=0,
+            ),
+            patch("fluid_build.build_runners.base.cprint"),
+            patch("fluid_build.build_runners.base.success"),
+            patch("fluid_build.build_runners.base.console_error"),
         ):
-            result = run(args, logger)
-        assert result == 0
+            assert run(args, logger) == 0
 
     def test_dbt_engine_on_inline_sql_warns_not_silently_ignored(self, tmp_path):
         """A build that declares ``engine: dbt`` but carries inline SQL runs via

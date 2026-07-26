@@ -486,6 +486,16 @@ def register(subparsers: argparse._SubParsersAction):
             "means the inputs have changed and a fresh generate is needed."
         ),
     )
+    safety_group.add_argument(
+        "--allow-skipped-builds",
+        action="store_true",
+        help=(
+            "Exit 0 from a build-augmented mode even when every build was "
+            "skipped (missing dbt project / driver script). Without this the "
+            "apply exits 1, because DDL-only success on an empty table is a "
+            "broken deployment reported green."
+        ),
+    )
 
     # Reporting and monitoring
     reporting_group = p.add_argument_group("Reporting & Monitoring")
