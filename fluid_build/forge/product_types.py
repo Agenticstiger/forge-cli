@@ -67,6 +67,10 @@ class ProductType:
     interview_question_keys: Tuple[str, ...] = ()
     prompt_hint: str = ""
     allowed_upstream_types: FrozenSet[str] = frozenset()
+    #: Bitol ODPS v1.1.0 top-level ``type`` value (approved RFC 0029:
+    #: sourceAligned / aggregate / consumerAligned). Empty for any future
+    #: row with no ODPS analogue.
+    odps_type: str = ""
 
     @property
     def canonical_names(self) -> Tuple[str, str]:
@@ -91,6 +95,7 @@ PRODUCT_TYPES: Tuple[ProductType, ...] = (
             "NOT add joins, derived columns, or business logic."
         ),
         allowed_upstream_types=frozenset(),
+        odps_type="sourceAligned",
     ),
     ProductType(
         code="ADP",
@@ -108,6 +113,7 @@ PRODUCT_TYPES: Tuple[ProductType, ...] = (
             "with a transformation engine."
         ),
         allowed_upstream_types=frozenset({"SDP", "ADP"}),
+        odps_type="aggregate",
     ),
     ProductType(
         code="CDP",
@@ -132,6 +138,7 @@ PRODUCT_TYPES: Tuple[ProductType, ...] = (
         # ML-feature CDP, etc. Only SDP rejects upstreams (it's the
         # raw-acquisition tier and has no upstream by definition).
         allowed_upstream_types=frozenset({"SDP", "ADP", "CDP"}),
+        odps_type="consumerAligned",
     ),
 )
 
@@ -147,6 +154,16 @@ VALID_LAYERS: FrozenSet[str] = frozenset(
     {pt.layer for pt in PRODUCT_TYPES} | {"Platinum", "Logical"}
 )
 VALID_PRODUCT_TYPES: FrozenSet[str] = frozenset({pt.code for pt in PRODUCT_TYPES})
+
+# Bitol ODPS v1.1.0 ``type`` (approved RFC 0029) in both directions, derived
+# from the registry rows so a new product type extends the ODPS mapping
+# automatically. Consumed by providers/odps_standard/mappers/product.py.
+PRODUCT_TYPE_TO_ODPS_TYPE: Dict[str, str] = {
+    pt.code: pt.odps_type for pt in PRODUCT_TYPES if pt.odps_type
+}
+ODPS_TYPE_TO_PRODUCT_TYPE: Dict[str, str] = {
+    pt.odps_type: pt.code for pt in PRODUCT_TYPES if pt.odps_type
+}
 
 
 # ---------------------------------------------------------------------------

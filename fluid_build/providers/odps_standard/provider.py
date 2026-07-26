@@ -30,7 +30,13 @@ from .io import read_input, write_output
 from .mappers import EXPORT_PIPELINE, IMPORT_PIPELINE
 from .mappers.base import ExportCtx, ImportCtx
 from .resolver import ContractNotFound, ContractResolver, ResolvedContract
-from .validation import load_schema, validate
+from .validation import (
+    DEFAULT_API_VERSION,
+    SUPPORTED_API_VERSIONS,
+    load_schema,
+    schema_for_document,
+    validate,
+)
 
 
 class BitolOdpsProvider(BaseProvider):
@@ -51,9 +57,22 @@ class BitolOdpsProvider(BaseProvider):
     def __init__(self) -> None:
         super().__init__()
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        self.api_version = "v1.0.0"
+        # Emit target. v1.0.0 stays the default until Bitol releases v1.1.0
+        # on main: emitting an unreleased apiVersion by default would produce
+        # documents that fail validation against the published schema.
+        # Opt in per process via ODPS_API_VERSION=v1.1.0 (or set api_version
+        # on the instance) to emit the RFC 0029 top-level ``type``.
+        self.api_version = os.getenv("ODPS_API_VERSION", DEFAULT_API_VERSION)
+        if self.api_version not in SUPPORTED_API_VERSIONS:
+            self.logger.warning(
+                "ODPS_API_VERSION=%r is not supported (%s); using %s",
+                self.api_version,
+                ", ".join(SUPPORTED_API_VERSIONS),
+                DEFAULT_API_VERSION,
+            )
+            self.api_version = DEFAULT_API_VERSION
         self.spec_url = "https://github.com/bitol-io/open-data-product-standard"
-        self.schema = load_schema()
+        self.schema = load_schema(self.api_version)
         self.include_custom_properties = os.getenv("ODPS_INCLUDE_CUSTOM", "true").lower() == "true"
         # Strict by default — a contract that fails the schema is a bug.
         self.strict_validation = os.getenv("ODPS_STRICT", "true").lower() == "true"
@@ -122,6 +141,7 @@ class BitolOdpsProvider(BaseProvider):
             options={
                 "include_custom_properties": self.include_custom_properties,
                 "default_port_version": self.default_port_version,
+                "api_version": self.api_version,
             },
         )
         for mapper in EXPORT_PIPELINE:
@@ -461,10 +481,14 @@ class BitolOdpsProvider(BaseProvider):
     # ---- validation -----------------------------------------------------
 
     def validate_product(self, odps: Mapping[str, Any]) -> None:
-        if not self.schema:
+        # Validate against the document's OWN declared apiVersion, not the
+        # provider's emit target: a v1.1.0 document is valid regardless of
+        # what this process is configured to emit.
+        schema = schema_for_document(odps) or self.schema
+        if not schema:
             self.logger.warning("ODPS schema not available, skipping validation")
             return
-        validate(odps, self.schema)
+        validate(odps, schema)
 
 
 def _sniff_kind(path: Path) -> Optional[str]:

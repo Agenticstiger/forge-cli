@@ -257,6 +257,17 @@ def register(subparsers) -> None:
         "--format", "-f", choices=["yaml", "json"], default="yaml", help="Output format"
     )
     export.add_argument("--no-custom", action="store_true", help="Exclude custom properties")
+    export.add_argument(
+        "--api-version",
+        choices=["v1.0.0", "v1.1.0"],
+        default=None,
+        help=(
+            "ODPS apiVersion to emit. Default v1.0.0 (the released standard). "
+            "v1.1.0 adds the RFC 0029 top-level `type` (sourceAligned / aggregate / "
+            "consumerAligned, mapped from metadata.productType) but is pre-release "
+            "until Bitol cuts it, so it stays opt-in."
+        ),
+    )
     export.set_defaults(func=lambda args, logger=None: _run_odps_export(args))
 
     # odps-bitol validate
@@ -284,6 +295,11 @@ def _run_odps_export(args):
     provider = OdpsStandardProvider()
     if args.no_custom:
         provider.include_custom_properties = False
+    if getattr(args, "api_version", None):
+        from fluid_build.providers.odps_standard.validation import load_schema
+
+        provider.api_version = args.api_version
+        provider.schema = load_schema(args.api_version)
 
     # Generate output path if not specified
     if not args.output:
