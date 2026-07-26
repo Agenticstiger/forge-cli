@@ -95,7 +95,8 @@ class TestValidationReport:
     def test_add_warning(self):
         report = self._make_report()
         report.add_issue("warning", "binding", "Optional missing", "path")
-        assert report.checks_passed == 1
+        # A warning is an advisory issue, not a passed check.
+        assert report.checks_passed == 0
         assert len(report.get_warnings()) == 1
 
     def test_is_valid_no_errors(self):

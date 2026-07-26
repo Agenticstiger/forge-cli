@@ -742,6 +742,89 @@ def _print_doctor_next_steps(
     cprint()
 
 
+def _check_snowflake_readiness() -> Dict[str, any]:
+    """Report Snowflake connector + credential readiness.
+
+    Deliberately does *not* open a connection — ``fluid doctor`` must
+    stay fast and offline-safe. It reports whether the driver is
+    importable and whether an account/user/authentication method has
+    been resolved; ``fluid auth status`` performs the live probe.
+
+    Non-critical (``ok`` stays True) on the same grounds as the GCP/AWS
+    rows: a workspace that does not use Snowflake must not fail doctor.
+    """
+    try:
+        import importlib.metadata as _md
+
+        _md.version("snowflake-connector-python")
+    except Exception:  # noqa: BLE001 — absence is the signal
+        return {
+            "check": "Snowflake Provider Actions",
+            "category": "providers",
+            "status": "⚠️  Not available",
+            "ok": True,
+            "details": (
+                "snowflake-connector-python is not installed — validate/plan/"
+                "apply/test against Snowflake will fail. "
+                "Install with: pip install 'data-product-forge[snowflake]'"
+            ),
+        }
+
+    try:
+        from fluid_build.providers.snowflake.util.config import resolve_snowflake_settings
+
+        settings = resolve_snowflake_settings()
+    except Exception as exc:  # noqa: BLE001 — misconfiguration is the signal
+        return {
+            "check": "Snowflake Provider Actions",
+            "category": "providers",
+            "status": "⚠️  Driver OK, credentials unreadable",
+            "ok": True,
+            "details": f"Connector installed; credential resolution failed: {exc}",
+        }
+
+    account = settings.get("account")
+    user = settings.get("user")
+    has_auth = any(
+        settings.get(k) for k in ("password", "private_key_path", "oauth_token", "authenticator")
+    )
+
+    missing = []
+    if not account:
+        missing.append("SNOWFLAKE_ACCOUNT")
+    if not user:
+        missing.append("SNOWFLAKE_USER")
+    if not has_auth:
+        missing.append(
+            "an authentication method (SNOWFLAKE_PASSWORD / "
+            "SNOWFLAKE_PRIVATE_KEY_PATH / SNOWFLAKE_OAUTH_TOKEN / "
+            "SNOWFLAKE_AUTHENTICATOR)"
+        )
+
+    if missing:
+        return {
+            "check": "Snowflake Provider Actions",
+            "category": "providers",
+            "status": "⚠️  Driver OK, not configured",
+            "ok": True,
+            "details": "Connector installed; missing " + ", ".join(missing),
+        }
+
+    role = settings.get("role") or "(account default)"
+    warehouse = settings.get("warehouse") or "(account default)"
+    return {
+        "check": "Snowflake Provider Actions",
+        "category": "providers",
+        "status": "✅ Available",
+        "ok": True,
+        "details": (
+            f"Connector installed; account={account} user={user} "
+            f"role={role} warehouse={warehouse}. "
+            "Run `fluid auth status` to verify the connection live."
+        ),
+    }
+
+
 def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
     """
     Check FLUID feature availability (v0.7.x line).
@@ -910,6 +993,12 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
                 "details": "Install AWS dependencies for full support",
             }
         )
+
+    # Snowflake. Without this row, an account whose only configured
+    # provider is Snowflake got an unconditional "All critical features
+    # available!" that said nothing about the provider actually in use —
+    # while `fluid test` / `fluid plan` hard-fail without the connector.
+    checks.append(_check_snowflake_readiness())
 
     # dbt engine detection — Python dbt-core v1 vs Fusion (dbt Core v2,
     # Rust). Non-critical (ok=True either way): a missing dbt only matters

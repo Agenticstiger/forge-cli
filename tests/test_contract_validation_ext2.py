@@ -145,19 +145,32 @@ class TestValidateBindingDeeper:
         warnings = [i for i in v.report.issues if i.severity == "warning"]
         assert any("format" in w.message for w in warnings)
 
-    def test_location_missing_properties(self):
+    def test_binding_without_properties_is_not_warned(self):
+        """``binding.properties`` is optional and must not warn.
+
+        The old check looked for ``location.properties``, a key
+        ``$defs.bindingLocation`` forbids (additionalProperties: false),
+        so it fired on every schema-valid contract and made ``--strict``
+        unsatisfiable.
+        """
         v = _make_validator()
         v._validate_binding(
-            {"platform": "local", "location": {"format": "parquet"}}, "exposes[0].binding", "test"
+            {"platform": "local", "format": "parquet", "location": {"path": "d.parquet"}},
+            "exposes[0].binding",
+            "test",
         )
-        warnings = [i for i in v.report.issues if i.severity == "warning"]
-        assert any("properties" in w.message for w in warnings)
+        assert v.report.issues == []
 
     def test_gcp_missing_required_props(self):
         v = _make_validator()
         v.provider_name = "gcp"
         v._validate_binding(
-            {"platform": "gcp", "location": {"format": "parquet", "properties": {"project": "p"}}},
+            {
+                "platform": "gcp",
+                "format": "parquet",
+                "properties": {"project": "p"},
+                "location": {},
+            },
             "path",
             "test",
         )
@@ -172,10 +185,8 @@ class TestValidateBindingDeeper:
         v._validate_binding(
             {
                 "platform": "gcp",
-                "location": {
-                    "format": "parquet",
-                    "properties": {"project": "p", "dataset": "d", "table": "t"},
-                },
+                "format": "parquet",
+                "location": {"project": "p", "dataset": "d", "table": "t"},
             },
             "path",
             "test",
@@ -188,7 +199,8 @@ class TestValidateBindingDeeper:
         v._validate_binding(
             {
                 "platform": "local",
-                "location": {"format": "parquet", "properties": {"path": "/data"}},
+                "format": "parquet",
+                "location": {"path": "/data"},
             },
             "path",
             "test",
@@ -833,12 +845,18 @@ class TestRunExposeQualityChecksExt(unittest.TestCase):
         warnings = v.report.get_warnings()
         assert any("Row count low" in w.message for w in warnings)
 
-    def test_quality_checks_exception_adds_warning(self):
+    def test_quality_checks_exception_is_an_error(self):
+        """A DQ batch that blew up did not pass — it must gate the run.
+
+        Reporting it as a warning let `fluid test` exit 0 having checked
+        nothing at all.
+        """
         v = _make_validator_new()
         mock_provider = MagicMock()
         mock_provider.run_quality_checks.side_effect = RuntimeError("DQ fail")
         v.validation_provider = mock_provider
 
         v._run_expose_quality_checks({"id": "t1"}, [{"name": "x"}], "exposes[0]")
-        warnings = v.report.get_warnings()
-        assert any("Quality check execution failed" in w.message for w in warnings)
+        errors = v.report.get_errors()
+        assert any("Quality check execution failed" in e.message for e in errors)
+        assert v.report.is_valid() is False
