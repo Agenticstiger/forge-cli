@@ -73,29 +73,38 @@ class OpenMetadataRegistrar(CatalogRegistrar):
         product_urn = f"forge://{payload.product.product_id}"
         last_err: Optional[str] = None
         published: List[str] = []
+        # Assets whose table publish landed but whose ODCS Data Contract did
+        # not — a partially-applied result the caller must be able to see.
+        contract_degraded: Dict[str, str] = {}
         for asset in payload.assets:
             asset_urn = f"forge://{payload.product.product_id}/{asset.asset_id}"
             payload_body = self._build_payload(payload, asset)
             try:
                 self._put(payload_body)
-                self._publish_odcs_contract(payload_body["fullyQualifiedName"], asset)
+                degraded = self._publish_odcs_contract(payload_body["fullyQualifiedName"], asset)
+                if degraded:
+                    contract_degraded[asset.asset_id] = degraded
                 published.append(asset_urn)
             except Exception as exc:  # noqa: BLE001
                 last_err = str(exc)
                 break
+        metadata: Dict[str, Any] = {"published_assets": published}
+        if contract_degraded:
+            metadata["odcs_contract_degraded"] = contract_degraded
+            metadata["partial"] = True
         if last_err is not None:
             return RegistrationResult(
                 target="openmetadata",
                 urn=product_urn,
                 succeeded=False,
                 error=last_err,
-                metadata={"published_assets": published},
+                metadata=metadata,
             )
         return RegistrationResult(
             target="openmetadata",
             urn=product_urn,
             succeeded=True,
-            metadata={"published_assets": published},
+            metadata=metadata,
         )
 
     def register(
@@ -123,12 +132,17 @@ class OpenMetadataRegistrar(CatalogRegistrar):
         try:
             body = self._build_payload(payload, scoped[0])
             self._put(body)
-            self._publish_odcs_contract(body["fullyQualifiedName"], scoped[0])
+            degraded = self._publish_odcs_contract(body["fullyQualifiedName"], scoped[0])
         except Exception as exc:  # noqa: BLE001
             return RegistrationResult(
                 target="openmetadata", urn=urn, succeeded=False, error=str(exc)
             )
-        return RegistrationResult(target="openmetadata", urn=urn, succeeded=True)
+        metadata: Dict[str, Any] = {}
+        if degraded:
+            metadata = {"odcs_contract_degraded": {expose_id: degraded}, "partial": True}
+        return RegistrationResult(
+            target="openmetadata", urn=urn, succeeded=True, metadata=metadata
+        )
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult:
         from fluid_build.util.safe_http import safe_httpx_client
@@ -187,29 +201,54 @@ class OpenMetadataRegistrar(CatalogRegistrar):
             entity_id = r.json().get("id")
         return str(entity_id) if entity_id else None
 
-    def _publish_odcs_contract(self, fqn: str, asset: AssetPayload) -> None:
+    def _publish_odcs_contract(self, fqn: str, asset: AssetPayload) -> Optional[str]:
         """Register the asset's ODCS document as a first-class DataContract.
 
-        Best-effort by design. OpenMetadata only grew the Data Contracts
-        entity in 1.10, so older servers 404 this route; the contract is
-        still present in the table's ``extension`` blob either way, and the
-        table publish has already succeeded by the time this runs. Any
-        failure is logged at debug and swallowed.
+        Non-fatal by design. OpenMetadata only grew the Data Contracts entity
+        in 1.10, so older servers 404 this route; the contract is still present
+        in the table's ``extension`` blob either way, and the table publish has
+        already succeeded by the time this runs.
+
+        But "non-fatal" is not "invisible". The stated motivation for the Data
+        Contracts route is that the extension blob is invisible to the
+        contracts UI, to contract search and to validation runs — so falling
+        back to exactly that state is a *partially applied* publish. It was
+        logged at DEBUG and the result still said ok=True / err=None, which
+        reads as full success. The degrade is now a WARNING and the reason is
+        returned so :meth:`register_payload` can mark the result partial.
+
+        Returns ``None`` on success (or when there is nothing to publish), and
+        a short reason string when the contract did not land.
         """
         if not asset.odcs_yaml:
-            return
+            return None
         try:
             entity_id = self._resolve_entity_id(fqn)
             if not entity_id:
-                LOG.debug("Skipping ODCS contract publish: %s has no resolvable entity id", fqn)
-                return
+                reason = "no resolvable entity id"
+                LOG.warning(
+                    "ODCS Data Contract NOT registered for %s (%s). The contract is still "
+                    "in the table's extension blob, but it is invisible to the contracts "
+                    "UI, contract search and validation runs.",
+                    fqn,
+                    reason,
+                )
+                return reason
             self._put_odcs_yaml(entity_id, asset.odcs_yaml)
             LOG.debug("Registered ODCS contract for %s", fqn)
+            return None
         except Exception as exc:  # noqa: BLE001
             # Class-only: OpenMetadata error bodies can echo the token-bearing URL.
-            LOG.debug(
-                "ODCS contract publish skipped for %s (non-fatal): %s", fqn, type(exc).__name__
+            reason = type(exc).__name__
+            LOG.warning(
+                "ODCS Data Contract NOT registered for %s (%s — a pre-1.10 OpenMetadata "
+                "server does not serve /api/v1/dataContracts). The contract is still in "
+                "the table's extension blob, but it is invisible to the contracts UI, "
+                "contract search and validation runs.",
+                fqn,
+                reason,
             )
+            return reason
 
     def _put_odcs_yaml(self, entity_id: str, odcs_yaml: str) -> None:
         """``PUT /api/v1/dataContracts/odcs/yaml`` with the raw ODCS document.
@@ -290,6 +329,7 @@ class OpenMetadataRegistrar(CatalogRegistrar):
 from fluid_build.api.catalog_backend import (  # noqa: E402 — register-on-import is intentional
     CatalogBackendSpec,
     CatalogCapability,
+    CatalogNotConfiguredError,
     register_catalog_backend,
 )
 
@@ -297,8 +337,18 @@ from ._factory_helpers import pick_endpoint, pick_int, pick_token  # noqa: E402
 
 
 def _build_openmetadata_registrar(config: dict) -> OpenMetadataRegistrar:
+    # No placeholder default. ``https://openmetadata.test`` is a hostname that
+    # exists only in this module's HTTP-mocked unit tests; handing it to a real
+    # publish made an *unconfigured* target dial it and report
+    # "cannot resolve hostname 'openmetadata.test'" — a DNS error where the
+    # operator needed "you have not set FLUID_CATALOG_OPENMETADATA_URL".
+    # Refusing here is what lets the dispatcher say so; it is also what
+    # ``build_registrar``'s own docstring already promised.
+    endpoint = pick_endpoint(config)
+    if not endpoint:
+        raise CatalogNotConfiguredError("openmetadata")
     return OpenMetadataRegistrar(
-        base_url=pick_endpoint(config, default="https://openmetadata.test"),
+        base_url=endpoint,
         api_token=pick_token(config),
         timeout_seconds=pick_int(config, "timeout", 30),
     )

@@ -33,6 +33,18 @@ LOG = logging.getLogger("fluid.acquire.catalog")
 # extras (e.g., DataHub SDK) don't fail import.
 _REGISTRY: Dict[str, CatalogRegistrar] = {}
 
+# Why the most recent ``build_registrar`` call for a target returned None, when
+# the reason was "not configured" rather than "not wired anywhere". Written by
+# build_registrar, read by the dispatchers below so the operator sees the
+# missing setting instead of a generic message (or, before this, the DNS
+# failure from dialling a placeholder host).
+_LAST_NOT_CONFIGURED: Dict[str, str] = {}
+
+
+def _unavailable_reason(target: str) -> str:
+    """The most specific explanation available for an unusable target."""
+    return _LAST_NOT_CONFIGURED.get(target) or f"No registrar configured for target '{target}'"
+
 
 def register_registrar(target: str, registrar: CatalogRegistrar) -> None:
     _REGISTRY[target] = registrar
@@ -69,13 +81,17 @@ def build_registrar(
     Surface B even when a native async provider shares the name.
     """
     config = config or {}
+    _LAST_NOT_CONFIGURED.pop(target, None)
     # 1. Plug-in spec (preferred).
     try:
         # Importing the registrar package triggers each module's
         # ``register_catalog_backend(...)`` side effect — required for
         # callers that haven't already touched ``providers.catalogs``.
         import fluid_build.build_runners.catalog_registrars  # noqa: F401
-        from fluid_build.api.catalog_backend import get_catalog_backend
+        from fluid_build.api.catalog_backend import (
+            CatalogNotConfiguredError,
+            get_catalog_backend,
+        )
     except Exception:  # pragma: no cover — defensive
         spec = None
     else:
@@ -83,6 +99,12 @@ def build_registrar(
     if spec is not None:
         try:
             return spec.registrar_factory(config)
+        except CatalogNotConfiguredError as exc:
+            # Deliberate refusal, not a failure: the backend has no endpoint.
+            # Remember why so the dispatcher can tell the operator what to set
+            # instead of emitting the generic "No registrar configured".
+            _LAST_NOT_CONFIGURED[target] = exc.operator_message()
+            return None
         except Exception as exc:  # noqa: BLE001
             LOG.warning("Failed to build catalog backend %s from spec: %s", target, exc)
             # Fall through to the CATALOG_PROVIDERS path — there might
@@ -183,7 +205,7 @@ def register_all(
                     target=target,
                     urn=f"forge://{product_id}/{expose_id}",
                     succeeded=False,
-                    error=f"No registrar configured for target '{target}'",
+                    error=_unavailable_reason(target),
                 )
             )
             continue
@@ -259,7 +281,7 @@ def register_all_payload(
                     target=target,
                     urn=product_urn_fallback,
                     succeeded=False,
-                    error=f"No registrar configured for target '{target}'",
+                    error=_unavailable_reason(target),
                 )
             )
             continue
