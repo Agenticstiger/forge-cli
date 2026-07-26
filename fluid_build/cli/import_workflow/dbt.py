@@ -1105,16 +1105,57 @@ def _source_freshness(src: Dict[str, Any]) -> Optional[str]:
 # Semantic layer: manifest semantic_models / metrics → exposes[].semantics
 # ---------------------------------------------------------------------------
 
-_VALID_SEMANTIC_AGGS = {
-    "sum",
-    "avg",
-    "count",
-    "count_distinct",
-    "min",
-    "max",
-    "median",
-    "percentile",
+# MetricFlow ``AggregationType`` → the FLUID ``measures[].agg`` enum. The
+# inverse of ``engines/dbt/semantic_models.AGG_TO_METRICFLOW`` (round-trip
+# pinned in the tests): only ``average``/``avg`` differ in spelling, and
+# ``sum_boolean`` has no FLUID equivalent so it is reported, not guessed.
+# Without the fold, ``fluid import dbt`` rejected dbt's own ``average``
+# ("unsupported agg 'average' — dropped") and every metric built on that
+# measure was dropped behind it, so an avg measure could not survive the
+# round trip in either direction.
+METRICFLOW_TO_AGG = {
+    "sum": "sum",
+    "average": "avg",
+    "avg": "avg",
+    "count": "count",
+    "count_distinct": "count_distinct",
+    "min": "min",
+    "max": "max",
+    "median": "median",
+    "percentile": "percentile",
 }
+
+_VALID_SEMANTIC_AGGS = frozenset(METRICFLOW_TO_AGG)
+
+# The percentile a measure answers when the contract carries no aggParams.
+# MUST stay equal to ``engines/dbt/semantic_models.DEFAULT_PERCENTILE`` and
+# ``output_ports/mcp/query_compiler.DEFAULT_PERCENTILE`` (pinned by tests) —
+# it is the number an imported percentile measure would silently start
+# returning if its parameters were dropped.
+_DEFAULT_PERCENTILE = 0.5
+
+
+def _percentile_params_are_default(agg_params: Any) -> bool:
+    """True when ``agg_params`` describe exactly the importer's default.
+
+    A percentile measure can only be imported losslessly when dropping its
+    ``agg_params`` changes nothing: percentile == :data:`_DEFAULT_PERCENTILE`
+    and no discrete-percentile flag. Anything else (``percentile: 0.9``) would
+    keep the measure's *name* while changing the number it answers.
+    """
+    if not agg_params:
+        return True
+    if not isinstance(agg_params, dict):
+        return False
+    if agg_params.get("use_discrete_percentile"):
+        return False
+    percentile = agg_params.get("percentile", _DEFAULT_PERCENTILE)
+    if isinstance(percentile, bool) or not isinstance(percentile, (int, float)):
+        return False
+    if float(percentile) != _DEFAULT_PERCENTILE:
+        return False
+    # Any other key is something we cannot reason about — refuse to guess.
+    return not (set(agg_params) - {"percentile", "use_discrete_percentile"})
 _VALID_ENTITY_TYPES = {"primary", "foreign", "unique", "natural"}
 
 # Jinja delimiters. dbt renders Jinja in YAML property values (descriptions,
@@ -1378,11 +1419,26 @@ def _semantics_block_from_semantic_model(
     for raw in sm.get("measures") or []:
         if not isinstance(raw, dict) or not raw.get("name"):
             continue
-        agg = str(raw.get("agg") or "").lower()
-        if agg not in _VALID_SEMANTIC_AGGS:
+        agg = METRICFLOW_TO_AGG.get(str(raw.get("agg") or "").lower())
+        if agg is None:
             report.unsupported.append(
                 f"semantic model {sm_name}: measure {raw.get('name')!r} has "
                 f"unsupported agg {raw.get('agg')!r} — dropped"
+            )
+            continue
+        if agg == "percentile" and not _percentile_params_are_default(raw.get("agg_params")):
+            # ``measures[].aggParams`` only lands in the 0.7.6 preview schema
+            # and the importer emits the GA fluidVersion, so the parameters
+            # cannot be carried. Keeping the measure without them would
+            # silently re-default it to DEFAULT_PERCENTILE — a p90 measure
+            # would keep its name and start answering the median. Drop the
+            # whole measure so the loss is loud instead of numeric.
+            report.unsupported.append(
+                f"semantic model {sm_name}: measure {raw['name']!r} is a percentile "
+                f"measure whose agg_params ({raw.get('agg_params')!r}) require "
+                "fluidVersion >= 0.7.6 — measure dropped rather than re-defaulted "
+                f"to percentile={_DEFAULT_PERCENTILE}. Upgrade the contract "
+                "version and re-import to keep it."
             )
             continue
         measure: Dict[str, Any] = {"name": str(raw["name"]), "agg": agg}
@@ -1411,14 +1467,13 @@ def _semantics_block_from_semantic_model(
                     "non_additive_dimension.window_groupings has no contract "
                     "slot yet — dropped"
                 )
-        if raw.get("agg_params"):
-            # measures[].aggParams lands in the 0.7.6 preview schema; the
-            # importer emits the GA fluidVersion, so record the loss
-            # instead of emitting a key the schema rejects.
+        if raw.get("agg_params") and agg != "percentile":
+            # Non-percentile agg_params carry no numeric meaning we would
+            # silently change; record the loss and keep the measure.
             report.unsupported.append(
                 f"semantic model {sm_name}: measure {raw['name']!r} agg_params "
                 "requires fluidVersion >= 0.7.6 — dropped (re-import after "
-                "upgrading the contract version to keep percentile parameters)"
+                "upgrading the contract version to keep them)"
             )
         measures.append(measure)
     if measures:
