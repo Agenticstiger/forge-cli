@@ -32,6 +32,7 @@ merely writes into a platform-owned pool:
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -49,6 +50,15 @@ from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
 from ..packaging import ContainerDecision, PackagingResolution, resolve_packaging
 from ..versions import required_providers
+
+_logger = logging.getLogger(__name__)
+
+# Keys a binding location may carry an explicit view body under. The
+# ``bindingLocation`` schema has ``additionalProperties: false`` and declares
+# none of them today, so in practice an ``exposes[]`` view has no body and is
+# reference-only — but an overlay/extension that adds one must not silently
+# fall back to a self-referential ``SELECT * FROM <itself>``.
+_VIEW_BODY_KEYS = ("query", "statement", "sql", "viewDefinition")
 
 # FLUID column type → Snowflake SQL type.
 _SF_TYPES = {
@@ -305,7 +315,13 @@ class SnowflakeIacPlugin:
             if table:
                 tkey = safe_ident(f"{cid}_{database}_{schema}_{table}")
                 if binding.get("format") == "snowflake_view":
-                    _add(f"snowflake_view.{tkey}", f'"{database}"."{schema}"."{table}"')
+                    # Only adopt a view the emitter actually declares. A view
+                    # expose with no body is reference-only (see
+                    # ``_emit_snowflake``), and an import block pointing at a
+                    # resource address absent from the config fails `tofu`
+                    # with "Configuration for import target does not exist".
+                    if _expose_view_statement(loc) is not None:
+                        _add(f"snowflake_view.{tkey}", f'"{database}"."{schema}"."{table}"')
                 else:
                     _add(f"snowflake_table.{tkey}", f"{database}|{schema}|{table}")
         return blocks
@@ -469,11 +485,32 @@ def _emit_snowflake(
     table_comment = _build_horizon_table_comment(contract, pool=placement.pool) if contract else ""
 
     if fmt == "snowflake_view":
+        statement = _expose_view_statement(loc)
+        if statement is None:
+            # No body anywhere in the contract → the view is reference-only.
+            # It used to be provisioned as ``SELECT * FROM <itself>``, which
+            # Snowflake rejects outright ("View definition refers to view
+            # being defined") and which only appeared to work when an
+            # identifier-casing bug made the quoted target and the unquoted
+            # reference resolve to two different objects. The build engine
+            # (dbt for a view-materialized model) owns view bodies; the same
+            # rule already governs the ``views[]`` path — see
+            # ``_emit_planned_view``, which skips a view with no ``query``.
+            _logger.warning(
+                "snowflake: expose view %s.%s.%s declares no view body — "
+                "not provisioned. Its definition belongs to the build engine "
+                "that materialises it (e.g. dbt); `fluid apply` only "
+                "provisions the database and schema around it.",
+                database,
+                schema_name,
+                table,
+            )
+            return
         view_body = {
             "name": table,
             "database": db_ref,
             "schema": sc_ref,
-            "statement": loc.get("query") or f"SELECT * FROM {table}",
+            "statement": statement,
         }
         if table_comment:
             view_body["comment"] = table_comment
@@ -1065,3 +1102,16 @@ def _emit_row_access_policy(
     if deps:
         row_access["depends_on"] = deps
     resources.setdefault("snowflake_row_access_policy", {})[res] = row_access
+
+
+def _expose_view_statement(loc: Mapping[str, Any]) -> Optional[str]:
+    """The explicit SELECT body an ``exposes[]`` view binding carries, if any.
+
+    Returns ``None`` when the contract supplies no body — the caller then
+    leaves the view unprovisioned rather than inventing one.
+    """
+    for key in _VIEW_BODY_KEYS:
+        value = loc.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None

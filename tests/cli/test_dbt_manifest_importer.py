@@ -814,3 +814,42 @@ class TestExposeDescriptionScrubbed:
         assert "env_var" not in desc and "{{" not in desc
         assert "Orders" in desc and "table" in desc
         assert any("orders_mart description" in x for x in report.notes + report.unsupported)
+
+
+# ── Binding identifier: warehouse-resolved, not the source spelling ─────
+#
+# dbt emits unquoted SQL, so a lowercase model alias lands in Snowflake as an
+# UPPERCASE object. Binding to the alias made `fluid apply` create a second,
+# case-sensitive, quoted-lowercase object beside the real one:
+#
+#   FLUID_TEST.FORGE_DBTB.CUSTOMER_ORDERS   BASE TABLE   5000 rows (dbt)
+#   FLUID_TEST.FORGE_DBTB."customer_orders" BASE TABLE      0 rows (forge)
+#
+# and `fluid verify` then greened against the empty shadow. catalog.json —
+# which the importer already reads for column types — carries the name the
+# warehouse actually resolved.
+
+
+class TestBindingIdentifierFromCatalog:
+    def test_catalog_name_wins_over_the_manifest_alias(self, tmp_path: Path):
+        project = _project_dir(tmp_path, with_catalog=True)
+        contract, _ = DbtManifestImporter().import_to_contract(str(project))
+        assert _expose(contract, "orders")["binding"]["location"] == {
+            "database": "ANALYTICS",
+            "schema": "JAFFLE",
+            "table": "ORDERS",
+        }
+        assert _expose(contract, "customers")["binding"]["location"]["table"] == "CUSTOMERS"
+
+    def test_alias_is_the_fallback_when_no_catalog_was_generated(self, tmp_path: Path):
+        project = _project_dir(tmp_path, with_catalog=False)
+        contract, _ = DbtManifestImporter().import_to_contract(str(project))
+        assert _expose(contract, "orders")["binding"]["location"]["table"] == "orders"
+
+    def test_models_absent_from_the_catalog_keep_their_alias(self, tmp_path: Path):
+        """catalog.json only lists what was built; a model dbt never ran is
+        not in it and must still get a binding."""
+        project = _project_dir(tmp_path, with_catalog=True)
+        contract, _ = DbtManifestImporter().import_to_contract(str(project))
+        # stg_orders is in the manifest but not in catalog_v12.json.
+        assert _expose(contract, "stg_orders")["binding"]["location"]["table"] == "stg_orders"

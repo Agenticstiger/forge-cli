@@ -622,7 +622,7 @@ def _build_expose(
         "exposeId": expose_id,
         "kind": kind,
         "labels": labels,
-        "binding": _build_binding(node, materialized, adapter),
+        "binding": _build_binding(node, materialized, adapter, catalog=catalog, uid=uid),
         "contract": contract_block,
     }
     description = node.get("description")
@@ -650,14 +650,32 @@ def _upstream_model_names(node: Dict[str, Any]) -> List[str]:
     return list(dict.fromkeys(upstream))
 
 
-def _build_binding(node: Dict[str, Any], materialized: str, adapter: str) -> Dict[str, Any]:
+def _build_binding(
+    node: Dict[str, Any],
+    materialized: str,
+    adapter: str,
+    *,
+    catalog: Optional[Dict[str, Any]] = None,
+    uid: str = "",
+) -> Dict[str, Any]:
+    """Build ``exposes[].binding`` for one dbt model.
+
+    The identifier comes from ``catalog.json`` (``metadata.name``) when the
+    project has been through ``dbt docs generate``, because that is the name
+    the warehouse actually resolved. The manifest's ``alias`` is the *source*
+    spelling: dbt emits unquoted SQL, so a lowercase alias lands in Snowflake
+    as an uppercase object. Binding to the alias made ``fluid apply`` create a
+    second, case-sensitive, quoted-lowercase object beside the real one, and
+    ``fluid verify`` then greened against that empty shadow table while dbt's
+    output sat untouched in the uppercase one.
+    """
     platform, fmt = _ADAPTER_BINDINGS.get(adapter, ("other", "other"))
     if adapter == "snowflake" and materialized == "view":
         fmt = "snowflake_view"
     location: Dict[str, str] = {}
     database = node.get("database")
     schema = node.get("schema")
-    table = node.get("alias") or node.get("name")
+    table = _catalog_identifier(catalog, uid) or node.get("alias") or node.get("name")
     if platform == "gcp":
         if database:
             location["project"] = str(database)
@@ -725,6 +743,26 @@ def _build_columns(
             entry["validationRules"] = validation_rules
         columns.append(entry)
     return columns
+
+
+def _catalog_identifier(catalog: Optional[Dict[str, Any]], uid: str) -> Optional[str]:
+    """The warehouse-resolved object name for a node, from ``catalog.json``.
+
+    ``catalog.json`` is produced by ``dbt docs generate`` against the live
+    warehouse, so ``metadata.name`` is the identifier the warehouse reports
+    (``CUSTOMER_ORDERS``) rather than the source spelling in the manifest
+    (``customer_orders``). Returns ``None`` when no catalog was loaded, so the
+    caller falls back to the alias.
+    """
+    if not catalog or not uid:
+        return None
+    entry = (catalog.get("nodes") or {}).get(uid) or (catalog.get("sources") or {}).get(uid) or {}
+    metadata = entry.get("metadata") if isinstance(entry, dict) else None
+    if isinstance(metadata, dict):
+        name = metadata.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
 
 
 def _catalog_types(catalog: Dict[str, Any], uid: str) -> Dict[str, Any]:

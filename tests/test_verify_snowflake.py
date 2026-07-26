@@ -191,6 +191,112 @@ def test_run_routes_snowflake_table_to_verify_function(tmp_path: Path):
     verify_mock.assert_called_once()
 
 
+def test_run_routes_snowflake_view_to_verify_function(tmp_path: Path, capsys):
+    """``snowflake_view`` is the format ``fluid import dbt`` emits for every
+    view-materialized model — the dominant materialization in any staging
+    layer. verify used to reject it outright:
+
+        ❌ Error: Unsupported format: snowflake_view
+        Target: ..stg_customers          # database/schema blank on that path
+
+    A Snowflake view is verifiable by exactly the same queries as a table
+    (INFORMATION_SCHEMA.COLUMNS and SELECT COUNT(*) are relation-agnostic).
+    """
+    contract_file = tmp_path / "contract.fluid.yaml"
+    contract_file.write_text("id: snowflake.test\n")
+    contract = {
+        "id": "snowflake.test",
+        "exposes": [
+            {
+                "id": "stg_customers",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_view",
+                    "location": {
+                        "database": "ANALYTICS",
+                        "schema": "CURATED",
+                        "table": "STG_CUSTOMERS",
+                    },
+                },
+                "contract": {"schema": [{"name": "ID", "type": "INTEGER"}]},
+            }
+        ],
+    }
+
+    with patch("fluid_build.cli.verify.load_contract_with_overlay", return_value=contract):
+        with patch(
+            "fluid_build.providers.snowflake.util.config.resolve_snowflake_settings",
+            return_value={
+                "account": "acme-account",
+                "warehouse": "TRANSFORM_WH",
+                "user": "svc_forge",
+                "password": "secret",
+                "schema": "CURATED",
+            },
+        ):
+            with patch(
+                "fluid_build.cli.verify.verify_snowflake_table",
+                return_value={"status": "match", "exists": True},
+            ) as verify_mock:
+                run(
+                    _args(str(contract_file), strict=False),
+                    logger=__import__("logging").getLogger("test"),
+                )
+
+    verify_mock.assert_called_once()
+    assert verify_mock.call_args.kwargs["table"] == "STG_CUSTOMERS"
+    out = capsys.readouterr().out
+    assert "Unsupported format" not in out
+    # The target line carries the full three-part name, not "..stg_customers".
+    assert "ANALYTICS.CURATED.STG_CUSTOMERS" in out
+
+
+def test_snowflake_view_bound_via_location_view_key(tmp_path: Path):
+    """Some view bindings name the object under ``location.view``."""
+    contract_file = tmp_path / "contract.fluid.yaml"
+    contract_file.write_text("id: snowflake.test\n")
+    contract = {
+        "id": "snowflake.test",
+        "exposes": [
+            {
+                "id": "v",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_view",
+                    "location": {
+                        "database": "ANALYTICS",
+                        "schema": "CURATED",
+                        "view": "EVENTS_V",
+                    },
+                },
+                "contract": {"schema": [{"name": "ID", "type": "INTEGER"}]},
+            }
+        ],
+    }
+
+    with patch("fluid_build.cli.verify.load_contract_with_overlay", return_value=contract):
+        with patch(
+            "fluid_build.providers.snowflake.util.config.resolve_snowflake_settings",
+            return_value={
+                "account": "a",
+                "warehouse": "W",
+                "user": "u",
+                "password": "p",
+                "schema": "CURATED",
+            },
+        ):
+            with patch(
+                "fluid_build.cli.verify.verify_snowflake_table",
+                return_value={"status": "match", "exists": True},
+            ) as verify_mock:
+                run(
+                    _args(str(contract_file), strict=False),
+                    logger=__import__("logging").getLogger("test"),
+                )
+
+    assert verify_mock.call_args.kwargs["table"] == "EVENTS_V"
+
+
 # ---------------------------------------------------------------------------
 # SQL injection defense (PR follow-up to #44)
 # ---------------------------------------------------------------------------

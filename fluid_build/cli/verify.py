@@ -43,6 +43,14 @@ from ._common import CLIError, load_contract_with_overlay
 
 LOG = logging.getLogger("fluid.cli.verify")
 
+# Snowflake binding formats that address a *relation* — a table or a view.
+# Both are verified the same way: INFORMATION_SCHEMA.COLUMNS and
+# ``SELECT COUNT(*)`` are relation-agnostic in Snowflake. ``snowflake_view``
+# is the format the dbt importer emits for every view-materialized model —
+# the dominant materialization in any staging layer — so rejecting it made
+# `fluid verify` unusable on the importer's own output.
+_SNOWFLAKE_RELATION_FORMATS = frozenset({"snowflake_table", "snowflake_view"})
+
 COMMAND = "verify"
 
 
@@ -994,7 +1002,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             )
 
             results[expose_name] = result
-        elif format_type == "snowflake_table":
+        elif format_type in _SNOWFLAKE_RELATION_FORMATS:
             binding = expose_config.get("binding", {})
             location = binding.get("location", expose_config.get("location", {}))
             properties = binding.get("properties", {})
@@ -1007,6 +1015,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             )
             table = (
                 resolve_env_templates(location.get("table"))
+                or resolve_env_templates(location.get("view"))
                 or properties.get("table")
                 or expose_name
             )
@@ -1086,13 +1095,15 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         if not properties:
             binding = expose_config.get("binding", {})
             location = binding.get("location", {})
-            if format_type == "snowflake_table":
+            if format_type in _SNOWFLAKE_RELATION_FORMATS:
                 target = ".".join(
                     part
                     for part in [
                         resolve_env_templates(location.get("database", "")) or "",
                         resolve_env_templates(location.get("schema", "")) or "",
-                        resolve_env_templates(location.get("table", "")) or "",
+                        resolve_env_templates(location.get("table", ""))
+                        or resolve_env_templates(location.get("view", ""))
+                        or "",
                     ]
                     if part
                 )
