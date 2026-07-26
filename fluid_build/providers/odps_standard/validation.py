@@ -23,19 +23,47 @@ from fluid_build.providers.odcs.validation import roundtrip_check  # noqa: F401
 
 LOG = logging.getLogger(__name__)
 
-_SCHEMA_PATH = Path(__file__).parent / "schemas" / "odps-product-v1.0.0.json"
+_SCHEMA_DIR = Path(__file__).parent / "schemas"
+_SCHEMA_PATH = _SCHEMA_DIR / "odps-product-v1.0.0.json"
+
+#: apiVersion values with a vendored schema. v1.1.0 is sourced from the dev
+#: branch (approved RFCs staged for release, top-level ``type`` from RFC 0029)
+#: and stays opt-in as an emit target until Bitol cuts it on main.
+SUPPORTED_API_VERSIONS = ("v1.0.0", "v1.1.0")
+DEFAULT_API_VERSION = "v1.0.0"
 
 
-def load_schema() -> Optional[Dict[str, Any]]:
-    if not _SCHEMA_PATH.exists():
-        LOG.warning("ODPS schema not found: %s", _SCHEMA_PATH)
+def load_schema(api_version: str = DEFAULT_API_VERSION) -> Optional[Dict[str, Any]]:
+    if api_version not in SUPPORTED_API_VERSIONS:
+        LOG.warning(
+            "Unsupported ODPS apiVersion %r (supported: %s), falling back to %s",
+            api_version,
+            ", ".join(SUPPORTED_API_VERSIONS),
+            DEFAULT_API_VERSION,
+        )
+        api_version = DEFAULT_API_VERSION
+    path = _SCHEMA_DIR / f"odps-product-{api_version}.json"
+    if not path.exists():
+        LOG.warning("ODPS schema not found: %s", path)
         return None
     try:
-        with open(_SCHEMA_PATH, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception as exc:  # pragma: no cover - defensive
         LOG.error("Failed to load ODPS schema: %s", exc)
         return None
+
+
+def schema_for_document(odps: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The vendored schema matching the document's OWN ``apiVersion``.
+
+    Emission targets the provider's configured version, but an incoming
+    document declares its version itself; validating a v1.1.0 document
+    against the v1.0.0 schema would reject the RFC 0029 ``type`` field
+    (v1.0.0 is ``additionalProperties: false``).
+    """
+    declared = str(odps.get("apiVersion") or DEFAULT_API_VERSION)
+    return load_schema(declared)
 
 
 def validate(odps: Mapping[str, Any], schema: Mapping[str, Any]) -> None:

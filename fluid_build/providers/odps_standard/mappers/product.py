@@ -18,6 +18,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from fluid_build.forge.product_types import (
+    LAYER_TO_PRODUCT_TYPE,
+    ODPS_TYPE_TO_PRODUCT_TYPE,
+    PRODUCT_TYPE_TO_ODPS_TYPE,
+)
 from fluid_build.providers.base import ProviderError
 
 from .base import (
@@ -52,12 +57,30 @@ def to_odps(ctx: ExportCtx) -> None:
             "Set it at the contract root or under metadata.name."
         )
 
-    odps["apiVersion"] = API_VERSION
+    api_version = str(ctx.options.get("api_version") or API_VERSION)
+    odps["apiVersion"] = api_version
     odps["kind"] = KIND
     odps["id"] = product_id
     odps["name"] = name
     odps["version"] = str(metadata.get("version", "1.0.0"))
     odps["status"] = fluid_to_bitol_status(metadata.get("status", "draft"))
+
+    # Top-level ``type`` (approved RFC 0029, first shipped in v1.1.0).
+    # v1.0.0 is ``additionalProperties: false``, so the field is emitted
+    # only when targeting v1.1.0. Precedence: the CURRENT classification
+    # wins whenever it yields a value, so editing metadata.productType
+    # after an import re-exports the edited truth rather than a stale
+    # imported value. The passthrough copy wins only when it is a custom
+    # organisation type (RFC 0029 allows those) that no classification
+    # can express.
+    if api_version != API_VERSION:
+        pt_bucket = get_metadata_passthrough(fluid)
+        passthrough_type = str(pt_bucket.get("odps_type") or "")
+        derived = _odps_type_from_classification(metadata)
+        if derived:
+            odps["type"] = derived
+        elif passthrough_type and passthrough_type not in ODPS_TYPE_TO_PRODUCT_TYPE:
+            odps["type"] = passthrough_type
 
     # Description: ODPS uses {purpose, limitations, usage}. Accept the
     # description from any of three FLUID locations — explicit
@@ -129,6 +152,16 @@ def to_fluid(ctx: ImportCtx) -> None:
     if odps.get("tags"):
         metadata["tags"] = list(odps["tags"])
 
+    # RFC 0029 ``type`` (v1.1.0). A known value maps onto FLUID's Data Mesh
+    # classification; ANY value (the spec allows custom organisation types)
+    # is kept verbatim in the passthrough bucket so re-export reproduces it.
+    odps_type = odps.get("type")
+    if isinstance(odps_type, str) and odps_type:
+        mapped = ODPS_TYPE_TO_PRODUCT_TYPE.get(odps_type)
+        if mapped:
+            metadata.setdefault("productType", mapped)
+        metadata_passthrough(fluid)["odps_type"] = odps_type
+
     pt = metadata_passthrough(fluid)
     if odps.get("productCreatedTs"):
         pt["product_created_ts"] = odps["productCreatedTs"]
@@ -138,15 +171,32 @@ def to_fluid(ctx: ImportCtx) -> None:
         pt["authoritative_definitions"] = list(odps["authoritativeDefinitions"])
 
 
+def _odps_type_from_classification(metadata: Mapping[str, Any]) -> str:
+    """FLUID's Data Mesh classification as the RFC 0029 ``type`` value.
+
+    ``metadata.productType`` (SDP / ADP / CDP) wins; a contract carrying only
+    the medallion ``metadata.layer`` derives the productType through the
+    canonical Bronze/Silver/Gold mapping first. Platinum and Logical layers
+    have no Data Mesh analogue and yield no ``type``.
+    """
+    product_type = metadata.get("productType")
+    if not product_type:
+        product_type = LAYER_TO_PRODUCT_TYPE.get(str(metadata.get("layer") or ""))
+    return PRODUCT_TYPE_TO_ODPS_TYPE.get(str(product_type or ""), "")
+
+
 def _legacy_custom_properties(fluid: Mapping[str, Any]) -> list:
     """Synthesise a legacy ``customProperties`` entry for the product ``type``.
 
-    The Bitol ODPS v1.0.0 schema has no top-level slot for product type
-    (e.g. ``analytical`` vs ``operational``), so callers that previously
-    relied on the deprecated ``OdpsStandardProvider`` got it as a custom
-    property. We preserve that surface for back-compat, but skip ``domain``
-    and ``fluidVersion`` — the former is already a Bitol top-level field
-    and the latter would pollute the round-trip.
+    Historically the only home for a product type: the v1.0.0 schema has no
+    top-level slot, so the deprecated ``OdpsStandardProvider`` surfaced it as
+    a custom property. Since v1.1.0 the REAL slot is the RFC 0029 top-level
+    ``type`` (see :func:`_odps_type_from_classification`); this legacy
+    surface reads a DIFFERENT field (``metadata.product_type`` /
+    ``metadata.type``, e.g. ``analytical`` vs ``operational``) and is kept
+    for back-compat only. We skip ``domain`` and ``fluidVersion``: the former
+    is already a Bitol top-level field and the latter would pollute the
+    round-trip.
     """
     metadata = fluid.get("metadata") or {}
     product_type = (

@@ -388,7 +388,8 @@ def cmd_opds_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
         except ProviderError as e:
             console_error(f"✗ Bitol ODPS validation failed: {e}")
             return 1
-        cprint(f"✓ Bitol ODPS v1.0.0 file is valid: {path}")
+        declared_version = str(odps_data.get("apiVersion") or "v1.0.0")
+        cprint(f"✓ Bitol ODPS {declared_version} file is valid: {path}")
         cprint(f"  Spec: {BITOL_SPEC_URL}")
         return 0
 
