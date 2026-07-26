@@ -145,14 +145,19 @@ class TestPolicyCheckRun:
         code = self._run_with_mocked_engine(args, result)
         assert code == 0
 
-    def test_run_returns_1_when_file_not_found(self):
+    def test_run_raises_the_shared_slug_when_file_not_found(self):
+        # Was swallowed into `logger.error("Policy check error: file_not_found")`
+        # — a raw internal token with no slug, no suggestion and no docs URL.
         from fluid_build.cli import policy_check
+        from fluid_build.cli._common import CLIError
 
         args = _make_args(contract="/nonexistent/contract.fluid.yaml")
         with patch.object(Path, "exists", return_value=False):
             with patch.object(policy_check, "RICH_AVAILABLE", False):
-                code = policy_check.run(args, logger)
-        assert code == 1
+                with pytest.raises(CLIError) as exc_info:
+                    policy_check.run(args, logger)
+        assert exc_info.value.event == "contract_file_not_found"
+        assert exc_info.value.exit_code == 1
 
     def test_run_category_filter_applied(self):
         """When --category is set, violations should be filtered."""
@@ -207,6 +212,7 @@ class TestPolicyCheckRun:
 
     def test_run_handles_unexpected_exception(self):
         from fluid_build.cli import policy_check
+        from fluid_build.cli._common import CLIError
 
         args = _make_args()
         with patch.object(Path, "exists", return_value=True):
@@ -215,8 +221,11 @@ class TestPolicyCheckRun:
                 side_effect=RuntimeError("boom"),
             ):
                 with patch.object(policy_check, "RICH_AVAILABLE", False):
-                    code = policy_check.run(args, logger)
-        assert code == 1
+                    with pytest.raises(CLIError) as exc_info:
+                        policy_check.run(args, logger)
+        # Typed error, not `logger.exception` + a raw traceback.
+        assert exc_info.value.event == "policy_check_failed"
+        assert exc_info.value.exit_code == 1
 
 
 # ---------------------------------------------------------------------------

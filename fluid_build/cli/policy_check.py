@@ -170,8 +170,8 @@ def run(args: argparse.Namespace, logger_instance: logging.Logger) -> int:
                 if not contract_path.exists():
                     raise CLIError(
                         1,
-                        "file_not_found",
-                        context={"message": f"Contract not found: {args.contract}"},
+                        "contract_file_not_found",
+                        context={"path": str(args.contract)},
                     )
 
                 contract = load_contract_with_overlay(str(contract_path), args.env, logger)
@@ -196,7 +196,7 @@ def run(args: argparse.Namespace, logger_instance: logging.Logger) -> int:
 
             if not contract_path.exists():
                 raise CLIError(
-                    1, "file_not_found", context={"message": f"Contract not found: {args.contract}"}
+                    1, "contract_file_not_found", context={"path": str(args.contract)}
                 )
 
             contract = load_contract_with_overlay(str(contract_path), args.env, logger)
@@ -237,13 +237,19 @@ def run(args: argparse.Namespace, logger_instance: logging.Logger) -> int:
             logger.warning("Policy check FAILED (strict mode)")
         return 1
 
-    except CLIError as e:
-        logger.error(f"Policy check error: {e.message}")
-        return e.exit_code
+    except CLIError:
+        # Already typed — let the entry point render the five-field panel
+        # (stable slug + suggestions + docs URL) instead of collapsing it to
+        # a bare ``Policy check error: file_not_found`` log line that carries
+        # neither a slug nor a next step.
+        raise
     except Exception as e:
-        logger.exception("Unexpected error during policy check")
-        console_error(f"Policy check failed: {e}")
-        return 1
+        # ``_errors.py``: "No raw stack traces in user-facing output unless
+        # --debug is set." ``logger.exception`` emits at ERROR regardless of
+        # verbosity, so a malformed contract printed a traceback through
+        # util/safe_yaml.py with and without --debug alike.
+        logger.debug("policy_check_error", exc_info=True)
+        raise CLIError(1, "policy_check_failed", {"error": str(e)})
 
 
 def output_rich(

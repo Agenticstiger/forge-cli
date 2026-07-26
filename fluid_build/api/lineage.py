@@ -48,6 +48,12 @@ class RunEvent:
     inputs: List[DatasetFacet] = field(default_factory=list)
     outputs: List[DatasetFacet] = field(default_factory=list)
     run_facets: Dict[str, Any] = field(default_factory=dict)
+    #: ISO-8601 start of the *run* (not of this event). The OpenLineage
+    #: ``runId`` is a UUIDv7 derived from ``run_id`` seeded with an instant;
+    #: seeding it with each event's own ``event_time`` gave START and
+    #: COMPLETE of one run two different ``runId`` values, so no consumer
+    #: could correlate them. Defaults to ``event_time`` when unset.
+    run_started_at: Optional[str] = None
 
 
 class LineageEmitter(Protocol):

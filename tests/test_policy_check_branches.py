@@ -243,10 +243,15 @@ class TestPolicyCheckRun:
         assert run(args, logging.getLogger()) == 1
 
     def test_run_missing_contract(self, tmp_path):
+        import pytest
+
+        from fluid_build.cli._common import CLIError
         from fluid_build.cli.policy_check import run
 
         args = self._make_args(tmp_path / "nonexistent.yaml", format="text")
-        assert run(args, logging.getLogger()) == 1
+        with pytest.raises(CLIError) as exc_info:
+            run(args, logging.getLogger())
+        assert exc_info.value.event == "contract_file_not_found"
 
     @patch("fluid_build.cli.policy_check.SchemaBasedPolicyEngine")
     @patch("fluid_build.cli.policy_check.load_contract_with_overlay")
@@ -280,6 +285,12 @@ class TestPolicyCheckRun:
 
         contract_file = tmp_path / "c.yaml"
         contract_file.write_text("id: test")
+        import pytest
+
+        from fluid_build.cli._common import CLIError
+
         mock_load.side_effect = RuntimeError("file error")
         args = self._make_args(contract_file)
-        assert run(args, logging.getLogger()) == 1
+        with pytest.raises(CLIError) as exc_info:
+            run(args, logging.getLogger())
+        assert exc_info.value.event == "policy_check_failed"

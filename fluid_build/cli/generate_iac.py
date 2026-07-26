@@ -24,6 +24,7 @@ import re
 
 from fluid_build.cli.console import cprint
 from fluid_build.iac import IAC_PLUGINS, assemble_tofu_document, get_iac_plugin, render_tofu_json
+from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.packaging import resolve_packaging
 
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
@@ -113,6 +114,15 @@ def run(args, logger: logging.Logger) -> int:
             f.write(render_tofu_json(document))
     except CLIError:
         raise
+    except UnsupportedBindingError as exc:
+        # A binding the provider cannot emit. Typed + actionable rather than
+        # collapsed into the generic generate_iac_failed slug, because the
+        # remediation is contract-level, not tooling-level.
+        raise CLIError(
+            1,
+            "unsupported_binding",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        )
     except Exception as e:
         raise CLIError(1, "generate_iac_failed", {"error": str(e)})
 

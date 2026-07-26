@@ -292,7 +292,11 @@ class TestRunContractErrors:
         logger = logging.getLogger("test")
         with pytest.raises(CLIError) as exc_info:
             run(args, logger)
-        assert exc_info.value.event == "contract_not_found"
+        # One stable slug for "the contract file isn't there", shared with
+        # validate / plan / apply / test / policy-check / publish. It used to
+        # differ per command (contract_not_found here, file_not_found from
+        # plan/apply, contract_file_not_found from validate).
+        assert exc_info.value.event == "contract_file_not_found"
 
     def test_load_failure_raises_clierror(self, tmp_path):
         contract_path = tmp_path / "bad.yaml"

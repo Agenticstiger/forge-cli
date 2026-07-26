@@ -49,6 +49,9 @@ from typing import Dict, List, Optional
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.cli.console import error as console_error
 
+from ._common import CLIError
+from .core import FluidCLIError
+
 # Rich imports (optional)
 try:
     from rich.console import Console
@@ -220,8 +223,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Execute ``fluid test``."""
     contract_path = Path(args.contract)
     if not contract_path.exists():
-        console_error(f"Contract file not found: {contract_path}")
-        return 1
+        # Same stable slug ``fluid validate`` raises for the identical
+        # condition, so a CI log parser sees one identity for "the contract
+        # file isn't there" rather than one slug per command.
+        raise CLIError(1, "contract_file_not_found", {"path": str(contract_path)})
 
     # Soda engine dispatch — generates SodaCL from the contract's quality
     # block and shells out to the user's installed `soda` binary. Skipped
@@ -251,10 +256,22 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     try:
         report = validator.validate()
+    except FluidCLIError as e:
+        # A typed contract error (malformed YAML, missing file, unsupported
+        # version) is an ordinary user error. Re-raise as a CLIError so the
+        # entry point renders the five-field panel `fluid validate` already
+        # renders for the same input, instead of the raw traceback
+        # ``LOG.exception`` used to print unconditionally.
+        LOG.debug("test_error", exc_info=True)
+        context = dict(getattr(e, "context", None) or {})
+        raise CLIError(1, e.event, context or {"error": str(e)})
     except Exception as e:
-        console_error(f"Test failed: {e}")
-        LOG.exception("test_error")
-        return 1
+        # ``_errors.py``: "No raw stack traces in user-facing output unless
+        # --debug is set." ``LOG.exception`` ignored that — it emits at ERROR
+        # regardless of verbosity, so a malformed contract printed 73 lines
+        # ending in a traceback with and without --debug alike.
+        LOG.debug("test_error", exc_info=True)
+        raise CLIError(1, "test_failed", {"error": str(e)})
 
     # --- output ---
     output_format = getattr(args, "output", "text")

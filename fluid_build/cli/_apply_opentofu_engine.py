@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
 from fluid_build.cli.console import cprint
 from fluid_build.iac import build_module, get_iac_plugin, runner
 from fluid_build.iac.backend import parse_backend
+from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.credentials import build_tofu_env, credential_report
 from fluid_build.iac.naming import safe_ident
 
@@ -110,9 +112,18 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     module_path = workdir / "main.tf.json"
     actions = native_actions(contract, logger)
-    module_path.write_text(
-        build_module(plugin, contract, actions=actions, backend=backend), encoding="utf-8"
-    )
+    try:
+        module = build_module(plugin, contract, actions=actions, backend=backend)
+    except UnsupportedBindingError as exc:
+        # The emitter refused to substitute a different resource kind for the
+        # declared binding. Surface it as a typed CLI error rather than a
+        # traceback — and, critically, before anything reaches the warehouse.
+        raise CLIError(
+            1,
+            "unsupported_binding",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        )
+    module_path.write_text(module, encoding="utf-8")
 
     env = build_tofu_env()
     env.update(plugin.credential_env(env))
@@ -195,18 +206,84 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
         info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
         return 0
 
-    apply_result = runner.tofu_apply(str(workdir), env=env)
-    if not apply_result.ok:
-        raise CLIError(
-            1,
-            "opentofu_apply_failed",
-            {"error": _tail(apply_result.stderr or apply_result.stdout)},
-        )
-    applied = runner.change_summary(apply_result)
+    # ``fluid apply`` is the headline state-changing command, so a receiver
+    # configured with the standard OPENLINEAGE_URL must see it. Emission was
+    # previously wired only into the acquisition runners, so a real Snowflake
+    # apply produced zero events. Opt-in and zero-cost when unconfigured
+    # (``resolve_lineage_emitter`` returns the null emitter), and every
+    # emit call soft-fails — lineage never breaks an apply.
+    with _apply_lineage(contract, provider=provider, planned=changes) as record:
+        apply_result = runner.tofu_apply(str(workdir), env=env)
+        if not apply_result.ok:
+            raise CLIError(
+                1,
+                "opentofu_apply_failed",
+                {"error": _tail(apply_result.stderr or apply_result.stdout)},
+            )
+        applied = runner.change_summary(apply_result)
+        record(applied)
+
     cprint(f"\n  tofu apply complete: +{applied['add']} ~{applied['change']} -{applied['remove']}")
 
     info(logger, "opentofu_apply_ok", provider=provider, **applied)
     return 0
+
+
+@contextmanager
+def _apply_lineage(contract: Mapping[str, Any], *, provider: str, planned: Mapping[str, Any]):
+    """Emit START then COMPLETE / FAIL around one ``tofu apply``.
+
+    Yields a ``record(applied)`` callback so the terminal event carries the
+    real applied change counts rather than the planned ones. Any exception
+    escaping the block (including the ``opentofu_apply_failed`` CLIError)
+    produces a FAIL event and is re-raised untouched.
+    """
+    from fluid_build.api.lineage import RunEventType
+    from fluid_build.build_runners._acquisition_common import generate_run_id, utc_now_iso
+    from fluid_build.build_runners._lineage import emit_apply_event, resolve_lineage_emitter
+
+    emitter = resolve_lineage_emitter()
+    run_id = generate_run_id()
+    started_at = utc_now_iso()
+    applied: Dict[str, Any] = {}
+
+    def record(counts: Mapping[str, Any]) -> None:
+        applied.update(counts)
+
+    emit_apply_event(
+        emitter,
+        contract,
+        event_type=RunEventType.START,
+        event_time=started_at,
+        run_id=run_id,
+        run_started_at=started_at,
+        provider=provider,
+        facets={"planned_changes": dict(planned)},
+    )
+    try:
+        yield record
+    except BaseException:
+        emit_apply_event(
+            emitter,
+            contract,
+            event_type=RunEventType.FAIL,
+            event_time=utc_now_iso(),
+            run_id=run_id,
+            run_started_at=started_at,
+            provider=provider,
+            facets={"planned_changes": dict(planned)},
+        )
+        raise
+    emit_apply_event(
+        emitter,
+        contract,
+        event_type=RunEventType.COMPLETE,
+        event_time=utc_now_iso(),
+        run_id=run_id,
+        run_started_at=started_at,
+        provider=provider,
+        facets={"planned_changes": dict(planned), "applied_changes": dict(applied)},
+    )
 
 
 def resolve_apply_engine(args, logger: logging.Logger) -> str:

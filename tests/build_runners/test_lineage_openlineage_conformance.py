@@ -37,6 +37,7 @@ import pytest
 from fluid_build.api.conformance.runner import assert_openlineage_shape
 from fluid_build.api.lineage import DatasetFacet, RunEvent, RunEventType
 from fluid_build.build_runners._lineage import (
+    FLUID_ENGINE_FACET_KEY,
     FLUID_RUN_FACET_KEY,
     BufferedLineageEmitter,
     HttpLineageEmitter,
@@ -333,3 +334,242 @@ class TestShapeAssertionCatchesRegressions:
         del payload["producer"]
         with pytest.raises(AssertionError):
             assert_openlineage_shape(payload)
+
+
+class TestTerminalEventFacets:
+    """Defect 4: ``run.facets`` carried bare scalars on every terminal event.
+
+    ``RunResult.facets`` is a flat dict of engine telemetry
+    (``{"engine": "duckdb", "duration_seconds": 0.02}``). It used to be
+    copied straight into ``run.facets``, where the spec requires each value
+    to be a ``RunFacet`` object with ``_producer`` + ``_schemaURL``. START
+    (which has no ``result``) validated; COMPLETE / FAIL / ABORT did not.
+    """
+
+    def _ctx(self):
+        return SimpleNamespace(
+            run_id=_FLUID_RUN_ID,
+            product_id="orders",
+            build_id="acquire",
+            lineage=BufferedLineageEmitter(),
+            source=SimpleNamespace(kind="duckdb", streams=["orders"]),
+        )
+
+    def _result(self, **extra):
+        base = {"engine": "duckdb", "duration_seconds": 0.0243}
+        base.update(extra)
+        return SimpleNamespace(facets=base, started_at=_EVENT_TIME)
+
+    @pytest.mark.parametrize(
+        "event_type", [RunEventType.COMPLETE, RunEventType.FAIL, RunEventType.ABORT]
+    )
+    def test_terminal_events_are_shape_conformant(self, event_type):
+        payload = encode_event(
+            build_run_event(
+                self._ctx(),
+                event_type=event_type,
+                event_time="2026-05-15T00:00:05Z",
+                result=self._result(),
+            )
+        )
+        assert_openlineage_shape(payload)
+
+    def test_engine_scalars_are_nested_under_one_conformant_facet(self):
+        payload = encode_event(
+            build_run_event(
+                self._ctx(),
+                event_type=RunEventType.COMPLETE,
+                event_time="2026-05-15T00:00:05Z",
+                result=self._result(pii_findings=["email"]),
+            )
+        )
+        facets = payload["run"]["facets"]
+        # No bare scalars promoted to top-level facet names.
+        assert "engine" not in facets
+        assert "duration_seconds" not in facets
+        engine_facet = facets[FLUID_ENGINE_FACET_KEY]
+        assert engine_facet["_producer"] and engine_facet["_schemaURL"]
+        assert engine_facet["engine"] == "duckdb"
+        assert engine_facet["duration_seconds"] == pytest.approx(0.0243)
+        # Nothing the engine reported is dropped.
+        assert engine_facet["pii_findings"] == ["email"]
+
+    def test_no_engine_facet_when_result_has_none(self):
+        payload = encode_event(
+            build_run_event(
+                self._ctx(), event_type=RunEventType.START, event_time=_EVENT_TIME
+            )
+        )
+        assert FLUID_ENGINE_FACET_KEY not in payload["run"]["facets"]
+
+    def test_shape_assertion_rejects_a_bare_scalar_run_facet(self):
+        """The helper itself must catch the regression, not skip it.
+
+        It previously guarded the facet loop with ``isinstance(facet, dict)``,
+        so a bare scalar facet passed conformance silently.
+        """
+        payload = encode_event(_event())
+        payload["run"]["facets"]["engine"] = "duckdb"
+        with pytest.raises(AssertionError):
+            assert_openlineage_shape(payload)
+
+
+class TestRunIdIsStableAcrossOneRun:
+    """Defect 5: START and COMPLETE of one run carried different ``runId``.
+
+    ``generate_static_uuid`` folds the supplied instant into the UUIDv7
+    timestamp field. Seeding it with each event's own ``event_time`` made
+    the pair uncorrelatable in Marquez / DataHub.
+    """
+
+    def _ctx(self):
+        return SimpleNamespace(
+            run_id=_FLUID_RUN_ID,
+            product_id="orders",
+            build_id="acquire",
+            lineage=BufferedLineageEmitter(),
+            source=SimpleNamespace(kind="duckdb", streams=["orders"]),
+        )
+
+    def test_start_and_complete_share_one_run_id(self):
+        start = encode_event(
+            build_run_event(
+                self._ctx(), event_type=RunEventType.START, event_time=_EVENT_TIME
+            )
+        )
+        complete = encode_event(
+            build_run_event(
+                self._ctx(),
+                event_type=RunEventType.COMPLETE,
+                # Finished later — the event times legitimately differ.
+                event_time="2026-05-15T00:00:37Z",
+                result=SimpleNamespace(
+                    facets={"engine": "duckdb"}, started_at=_EVENT_TIME
+                ),
+            )
+        )
+        assert start["run"]["runId"] == complete["run"]["runId"]
+        assert start["eventTime"] != complete["eventTime"]
+
+    def test_run_started_at_falls_back_to_event_time(self):
+        """A result without ``started_at`` must still produce a valid event."""
+        payload = encode_event(
+            build_run_event(
+                self._ctx(),
+                event_type=RunEventType.COMPLETE,
+                event_time=_EVENT_TIME,
+                result=SimpleNamespace(facets={"engine": "duckdb"}),
+            )
+        )
+        assert payload["run"]["runId"] == run_id_to_uuid(_FLUID_RUN_ID, _EVENT_TIME)
+
+
+class TestOutputDatasetIsThePhysicalBinding:
+    """Defect 6: the output side was a synthetic ``fluid``/<product id> node.
+
+    ``build_run_event`` hardcoded ``DatasetFacet(namespace="fluid",
+    name=product_id)`` regardless of where the build actually lands, so a
+    FLUID lineage edge could never join to the dataset a warehouse-side
+    OpenLineage integration reports for the same table. Resolved from
+    ``exposes[].binding`` instead — contract-declared, so unlike the input
+    side there is no resolved-connection material to leak.
+    """
+
+    def _ctx(self, contract):
+        return SimpleNamespace(
+            run_id=_FLUID_RUN_ID,
+            product_id="bronze.demo.orders",
+            build_id="ingest",
+            contract=contract,
+            lineage=BufferedLineageEmitter(),
+            source=SimpleNamespace(kind="sqlite", streams=["orders"]),
+        )
+
+    def test_snowflake_expose_resolves_to_the_table(self):
+        contract = {
+            "id": "bronze.demo.orders",
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "binding": {
+                        "platform": "snowflake",
+                        "location": {"database": "DB", "schema": "SC", "table": "ORDERS"},
+                    },
+                }
+            ],
+        }
+        payload = encode_event(
+            build_run_event(
+                self._ctx(contract), event_type=RunEventType.START, event_time=_EVENT_TIME
+            )
+        )
+        assert [(d["namespace"], d["name"]) for d in payload["outputs"]] == [
+            ("snowflake", "DB.SC.ORDERS")
+        ]
+
+    def test_file_expose_resolves_to_the_path(self):
+        contract = {
+            "id": "bronze.demo.orders",
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "binding": {
+                        "platform": "local",
+                        "format": "parquet",
+                        "location": {"path": "./out/orders.parquet"},
+                    },
+                }
+            ],
+        }
+        payload = encode_event(
+            build_run_event(
+                self._ctx(contract), event_type=RunEventType.START, event_time=_EVENT_TIME
+            )
+        )
+        assert [(d["namespace"], d["name"]) for d in payload["outputs"]] == [
+            ("local", "./out/orders.parquet")
+        ]
+
+    def test_falls_back_to_the_product_node_without_exposes(self):
+        """An event must always carry an output, even for a bare contract."""
+        payload = encode_event(
+            build_run_event(
+                self._ctx({"id": "bronze.demo.orders"}),
+                event_type=RunEventType.START,
+                event_time=_EVENT_TIME,
+            )
+        )
+        assert [(d["namespace"], d["name"]) for d in payload["outputs"]] == [
+            ("fluid", "bronze.demo.orders")
+        ]
+        assert_openlineage_shape(payload)
+
+    def test_no_connection_material_reaches_the_output_side(self):
+        """``exposes[].binding`` is contract-declared, but assert it anyway."""
+        contract = {
+            "id": "bronze.demo.orders",
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "binding": {
+                        "platform": "postgres",
+                        "location": {
+                            "database": "app",
+                            "schema": "public",
+                            "table": "orders",
+                        },
+                    },
+                }
+            ],
+        }
+        ctx = self._ctx(contract)
+        ctx.source = SimpleNamespace(
+            kind="postgres",
+            streams=["public.orders"],
+            connection=SimpleNamespace(raw={"host": "db.internal", "password": "s3cret"}),
+        )
+        payload = encode_event(
+            build_run_event(ctx, event_type=RunEventType.START, event_time=_EVENT_TIME)
+        )
+        assert "s3cret" not in str(payload)
+        assert "db.internal" not in str(payload)

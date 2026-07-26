@@ -195,7 +195,15 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
             ("forge", "Create a data product  [dim]AI copilot · template · --blank[/dim]"),
             ("validate", "Check contract syntax and provider rules"),
             ("plan", "Plan execution  [dim]--html · --env · --out[/dim]"),
-            ("apply", "Deploy end-to-end  [dim]--yes · --dry-run · --build[/dim]"),
+            # NB: these must be flags that actually exist. `--build` was
+            # advertised here and does not — argparse prefix-matched it to
+            # `--build-id` and the user got "argument --build-id: expected
+            # one argument" for a flag they never typed. Running the builds
+            # is `--mode amend-and-build`.
+            (
+                "apply",
+                "Deploy end-to-end  [dim]--yes · --dry-run · --mode amend-and-build[/dim]",
+            ),
         ],
     )
 

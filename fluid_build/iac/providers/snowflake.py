@@ -46,6 +46,7 @@ from ...providers._iceberg_catalog import (
     iceberg_external_volume_name,
 )
 from ...providers._sql_safety import validate_ident
+from ..base import UnsupportedBindingError
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
 from ..packaging import ContainerDecision, PackagingResolution, resolve_packaging
@@ -59,6 +60,11 @@ _logger = logging.getLogger(__name__)
 # reference-only — but an overlay/extension that adds one must not silently
 # fall back to a self-referential ``SELECT * FROM <itself>``.
 _VIEW_BODY_KEYS = ("query", "statement", "sql", "viewDefinition")
+
+#: ``binding.format`` values that mark an expose as an Iceberg table. Kept in
+#: sync with ``engines.dbt.catalogs_yml._ICEBERG_FORMATS`` — the alias
+#: normalises to ``iceberg`` upstream but both spellings reach here.
+_ICEBERG_FORMATS = frozenset({"iceberg", "iceberg_table"})
 
 # FLUID column type → Snowflake SQL type.
 _SF_TYPES = {
@@ -578,6 +584,32 @@ def _emit_snowflake(
     table = loc.get("table") or loc.get("view")
     if not table:
         return
+
+    # Iceberg is NOT provisionable through this emitter. Snowflake's Iceberg
+    # tables need `snowflake_iceberg_table` + an EXTERNAL VOLUME + a CATALOG
+    # + a `base_location`, none of which this plugin emits. Falling through
+    # to `snowflake_table` produced a plain table, dropped every Iceberg
+    # field (catalog / warehouse / uri) into the table COMMENT, and still
+    # reported `tofu apply complete: +1` — so downstream code reading
+    # IS_ICEBERG saw NO while the CLI said success. Refuse instead.
+    if str(fmt or "").lower() in _ICEBERG_FORMATS:
+        raise UnsupportedBindingError(
+            "snowflake-iceberg-unsupported",
+            f"exposes[].binding.format 'iceberg' is not provisionable by the Snowflake "
+            f"IaC provider (table {database}.{schema_name}.{table}). Emitting a regular "
+            f"table instead would silently drop the Iceberg catalog, external volume and "
+            f"base location.",
+            (
+                "Materialize the Iceberg table from a dbt build — `fluid generate dbt` "
+                "emits catalogs.yml for iceberg exposes and dbt issues the "
+                "CREATE ICEBERG TABLE.",
+                "Or change binding.format to 'snowflake_table' if a regular Snowflake "
+                "table is what you actually want.",
+                "Snowflake Iceberg also requires an EXTERNAL VOLUME on the account "
+                "(`SHOW EXTERNAL VOLUMES`); FLUID does not create one for you.",
+            ),
+        )
+
     tbl_res = safe_ident(f"{cid}_{database}_{schema_name}_{table}")
 
     table_comment = _build_horizon_table_comment(contract, pool=placement.pool) if contract else ""

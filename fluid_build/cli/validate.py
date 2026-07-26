@@ -281,7 +281,7 @@ def run(args, logger: logging.Logger) -> int:
         try:
             contract_path = validate_cli_path(args.contract, mode="read", file_type="contract")
         except FluidCLIError as exc:
-            if exc.event == "file_not_found":
+            if exc.event in ("file_not_found", "contract_file_not_found"):
                 raise CLIError(1, "contract_file_not_found", {"path": str(args.contract)})
             raise
         args.contract = str(contract_path)

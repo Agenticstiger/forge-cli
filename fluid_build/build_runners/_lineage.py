@@ -61,19 +61,30 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-# Reuse the canonical SSRF post-DNS-resolution gate (RFC1918,
+# Reuse the canonical SSRF post-DNS-resolution gates (RFC1918,
 # link-local 169.254.0.0/16 for AWS/GCP metadata, loopback, reserved;
-# fails closed on DNS errors).
-from fluid_build._net import _hostname_is_private
+# the broad gate fails closed on DNS errors).
+from fluid_build._net import _hostname_is_link_local, _hostname_is_private
 from fluid_build.api.lineage import LineageEmitter, RunEvent
 
 LOG = logging.getLogger("fluid.acquire.lineage")
+
+#: Truthy tokens for the boolean environment overrides in this module.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 #: OpenLineage requires a ``producer`` URI identifying the emitting tool.
 _PRODUCER_BASE = "https://github.com/Agenticstiger/forge-cli"
 
 #: Namespace for the custom run facet carrying FLUID's native run id.
 FLUID_RUN_FACET_KEY = "fluid_run"
+
+#: Namespace for the custom run facet carrying the engine's own run
+#: telemetry (``engine``, ``duration_seconds``, per-engine extras).
+#: ``RunResult.facets`` is a *flat* dict of scalars; a spec ``RunFacet``
+#: must be an object carrying ``_producer`` + ``_schemaURL``, so the whole
+#: engine payload is nested under this one conformant facet rather than
+#: spilled as bare scalars into ``run.facets``.
+FLUID_ENGINE_FACET_KEY = "fluid_engine"
 
 #: Default OpenLineage receiver path. Matches Marquez and the OpenLineage
 #: client's own default so ``OPENLINEAGE_URL=https://marquez.example`` works
@@ -141,10 +152,32 @@ def run_id_to_uuid(run_id: str, event_time: str) -> str:
     returns a UUIDv7, so the derived id stays monotonic for increasing
     timestamps just like the FLUID one. Deterministic, so re-emitting the
     same run produces the same OpenLineage id.
+
+    ``event_time`` must be the instant the **run** started, identical for
+    every event of that run. ``generate_static_uuid`` folds the instant into
+    the UUIDv7 timestamp field, so seeding it with each event's own
+    timestamp produced a *different* ``runId`` for START and COMPLETE of the
+    same run — which makes the pair uncorrelatable in Marquez/DataHub.
     """
     from openlineage.client.uuid import generate_static_uuid
 
     return str(generate_static_uuid(_parse_event_time(event_time), run_id.encode("utf-8")))
+
+
+def _as_run_facet(payload: Dict[str, Any], *, schema_path: str) -> Dict[str, Any]:
+    """Wrap ``payload`` as a spec-conformant ``RunFacet`` object.
+
+    ``#/$defs/RunFacet`` inherits ``BaseFacet``, whose ``required`` list is
+    ``["_producer", "_schemaURL"]``, so every value in ``run.facets`` must be
+    an object carrying both. Keys already present in ``payload`` win, so a
+    facet that arrives pre-stamped is passed through unchanged.
+    """
+    producer = producer_uri()
+    return {
+        "_producer": producer,
+        "_schemaURL": f"{_PRODUCER_BASE}/blob/main/{schema_path}",
+        **payload,
+    }
 
 
 def to_openlineage(event: RunEvent) -> Any:
@@ -177,7 +210,10 @@ def to_openlineage(event: RunEvent) -> Any:
         "fluidRunId": event.run_id,
     }
 
-    run = Run(runId=run_id_to_uuid(event.run_id, event_time), facets=run_facets)
+    # Seed the UUIDv7 from the RUN's start instant, not this event's, so every
+    # event of one run carries the same ``runId``.
+    run_uuid_seed_time = _safe_event_time(event.run_started_at or event.event_time)
+    run = Run(runId=run_id_to_uuid(event.run_id, run_uuid_seed_time), facets=run_facets)
     job = Job(namespace=event.job_namespace, name=event.job_name)
 
     inputs = [
@@ -228,6 +264,53 @@ class BufferedLineageEmitter(LineageEmitter):
         return True
 
 
+def _warn_once(key: str, message: str) -> None:
+    """Log a warning AND surface it on the CLI, at most once per process.
+
+    A lineage refusal that only reaches ``LOG.warning`` is invisible during
+    a normal ``fluid apply`` (the ``fluid.acquire.lineage`` logger is not
+    printed at default verbosity), so an operator who configured
+    ``OPENLINEAGE_URL`` had no way to learn that nothing shipped. Deduped by
+    ``key`` because emission is per-event and a run emits at least two.
+    """
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    LOG.warning("%s", message)
+    try:
+        from fluid_build._console import warning as console_warning
+
+        console_warning(message)
+    except Exception:  # pragma: no cover — console is best-effort
+        pass
+
+
+#: Process-level dedup set for :func:`_warn_once`.
+_WARNED: set = set()
+
+
+def _allow_private_endpoints() -> bool:
+    """Whether the lineage emitter may POST to a private/loopback endpoint.
+
+    Defaults to **True** to match the sibling catalog registrars, which pass
+    ``allow_private=True`` to :func:`~fluid_build.util.safe_http.safe_httpx_client`
+    for exactly the same reason: an OpenLineage receiver (Marquez, DataHub
+    GMS) is an internal service almost by definition — the project's own
+    CLAUDE.md prescribes ``OPENLINEAGE_URL=http://marquez:5000/api/v1/lineage``.
+    Blocking every RFC1918 address turned the headline feature of #467 into a
+    silent no-op for every realistic deployment.
+
+    Link-local / instance-metadata addresses stay blocked regardless (see
+    :func:`~fluid_build._net._hostname_is_link_local`) — that is the actual
+    SSRF-exfil shape. Set ``FLUID_OPENLINEAGE_ALLOW_PRIVATE=false`` to restore
+    the strict public-only gate, e.g. when the endpoint is not operator-owned.
+    """
+    raw = os.environ.get("FLUID_OPENLINEAGE_ALLOW_PRIVATE")
+    if raw is None:
+        return True
+    return raw.strip().lower() in _TRUTHY
+
+
 @dataclass
 class HttpLineageEmitter(LineageEmitter):
     """POSTs each event to ``endpoint``.
@@ -236,16 +319,21 @@ class HttpLineageEmitter(LineageEmitter):
     because lineage is observability, not correctness.
 
     Security: ``endpoint`` comes from the environment via
-    :func:`resolve_lineage_emitter`, which is a trusted source, but the gate
-    below is kept unconditional as defence in depth for any future caller
-    that constructs this emitter from less trustworthy configuration.
-    Before any POST the endpoint host is run through
-    :func:`_hostname_is_private`. A host that resolves to a
-    private, loopback, link-local or cloud-metadata address is refused (a
-    Bearer-token-bearing POST to ``http://169.254.169.254/`` is exactly the
-    SSRF-exfil shape this blocks). The request uses :mod:`httpx` with
-    ``follow_redirects=False`` and ``verify=True`` so the auth header is
-    never re-sent across a 30x redirect to an internal host.
+    :func:`resolve_lineage_emitter`, which is a trusted source, but a gate
+    is kept unconditional as defence in depth for any future caller that
+    constructs this emitter from less trustworthy configuration. Before any
+    POST the endpoint host is resolved and checked:
+
+    * ``allow_private=False`` — the broad :func:`_hostname_is_private` gate
+      (private, loopback, link-local, reserved; fails closed on DNS error).
+    * ``allow_private=True`` (the default, see :func:`_allow_private_endpoints`)
+      — the narrow :func:`_hostname_is_link_local` gate, so an internal
+      Marquez/DataHub receiver works while a Bearer-token-bearing POST to
+      ``http://169.254.169.254/`` is still refused.
+
+    The request uses :mod:`httpx` with ``follow_redirects=False`` and
+    ``verify=True`` so the auth header is never re-sent across a 30x
+    redirect to an internal host.
 
     The gate runs per-emit rather than once at construction, which is what
     makes it resistant to DNS rebinding.
@@ -254,6 +342,7 @@ class HttpLineageEmitter(LineageEmitter):
     endpoint: str
     timeout_seconds: float = 5.0
     api_key: Optional[str] = None
+    allow_private: bool = True
 
     def emit(self, event: RunEvent) -> None:
         try:
@@ -261,15 +350,28 @@ class HttpLineageEmitter(LineageEmitter):
 
             host = urlparse(self.endpoint).hostname
             if not host:
-                LOG.warning("OpenLineage emission skipped: endpoint has no resolvable host")
+                _warn_once(
+                    "no-host",
+                    "OpenLineage emission skipped: endpoint has no resolvable host",
+                )
                 return
-            if _hostname_is_private(host):
-                # Fail-closed SSRF gate: refuse private/metadata targets.
-                LOG.warning(
-                    "OpenLineage emission skipped: endpoint host %r resolves to "
-                    "a private/loopback/link-local/cloud-metadata address, "
-                    "refusing to POST (SSRF guard)",
-                    host,
+            if self.allow_private:
+                if _hostname_is_link_local(host):
+                    _warn_once(
+                        f"link-local:{host}",
+                        f"OpenLineage emission skipped: endpoint host {host!r} resolves to "
+                        "a link-local / cloud instance-metadata address, refusing to POST "
+                        "(SSRF guard)",
+                    )
+                    return
+            elif _hostname_is_private(host):
+                # Strict mode (FLUID_OPENLINEAGE_ALLOW_PRIVATE=false).
+                _warn_once(
+                    f"private:{host}",
+                    f"OpenLineage emission skipped: endpoint host {host!r} resolves to "
+                    "a private/loopback/link-local/cloud-metadata address, refusing to "
+                    "POST (SSRF guard). Unset FLUID_OPENLINEAGE_ALLOW_PRIVATE=false to "
+                    "allow an internal receiver.",
                 )
                 return
 
@@ -285,7 +387,12 @@ class HttpLineageEmitter(LineageEmitter):
                 resp.raise_for_status()
         except Exception as exc:  # noqa: BLE001
             # Class-only, because httpx error messages can echo the endpoint URL.
-            LOG.warning("OpenLineage emission failed (non-fatal): %s", type(exc).__name__)
+            # Surfaced on the CLI too: "lineage configured but nothing shipped"
+            # is precisely the state an operator must not have to guess at.
+            _warn_once(
+                f"transport:{type(exc).__name__}",
+                f"OpenLineage emission failed (non-fatal): {type(exc).__name__}",
+            )
 
     def flush(self, timeout_seconds: float = 5.0) -> bool:
         return True
@@ -339,9 +446,22 @@ def build_run_event(
 
     product_id = getattr(ctx, "product_id", "unknown")
     build_id = getattr(ctx, "build_id", "unknown")
-    outputs = [DatasetFacet(namespace="fluid", name=product_id)]
+    # Resolve the output side to the *physical* binding the build lands in
+    # (``snowflake`` / ``DB.SCHEMA.TABLE``) rather than a synthetic
+    # ``fluid``/<product id> node, so a FLUID lineage edge joins to the same
+    # dataset a warehouse-side integration reports. Everything used here is
+    # contract-declared (``exposes[].binding``), never resolved-connection
+    # material — see :func:`_dataset_namespace` for why the *input* side
+    # stays conservative. Falls back to the product node when the contract
+    # declares no usable expose, so an event always has an output.
+    contract = getattr(ctx, "contract", None)
+    exposes = contract.get("exposes") or [] if isinstance(contract, dict) else []
+    outputs = [d for d in (_expose_dataset(e) for e in exposes) if d is not None]
+    if not outputs:
+        outputs = [DatasetFacet(namespace="fluid", name=product_id)]
 
     run_facets: Dict[str, Any] = {}
+    run_started_at: Optional[str] = None
     if result is not None:
         facets = getattr(result, "facets", None)
         if isinstance(facets, dict):
@@ -354,8 +474,19 @@ def build_run_event(
             # would be a strictly worse leak than the on-disk one that
             # chokepoint exists to prevent.
             redacted = redact_value(facets)
-            if isinstance(redacted, dict):
-                run_facets.update(redacted)
+            if isinstance(redacted, dict) and redacted:
+                # ``RunResult.facets`` is a FLAT dict of engine scalars
+                # (``{"engine": "duckdb", "duration_seconds": 0.02}``).
+                # Copying it straight into ``run.facets`` made every
+                # terminal event fail spec validation — a run facet must be
+                # an object with ``_producer`` + ``_schemaURL``. Nest the
+                # whole payload under one conformant custom facet instead.
+                run_facets[FLUID_ENGINE_FACET_KEY] = _as_run_facet(
+                    redacted, schema_path="fluid_build/build_runners/_lineage.py"
+                )
+        started = getattr(result, "started_at", None)
+        if isinstance(started, str) and started:
+            run_started_at = started
 
     return RunEvent(
         event_type=event_type,
@@ -366,6 +497,7 @@ def build_run_event(
         inputs=inputs,
         outputs=outputs,
         run_facets=run_facets,
+        run_started_at=run_started_at,
     )
 
 
@@ -433,4 +565,118 @@ def resolve_lineage_emitter() -> LineageEmitter:
         endpoint=endpoint,
         timeout_seconds=timeout_seconds,
         api_key=api_key,
+        allow_private=_allow_private_endpoints(),
     )
+
+
+# ── Apply-stage lineage ──────────────────────────────────────────────────
+#
+# ``fluid apply`` is the headline command that changes warehouse state, but
+# emission used to be wired only into the acquisition runners: a receiver
+# configured with the standard ``OPENLINEAGE_URL`` saw nothing at all for a
+# real Snowflake / AWS / GCP apply. The helpers below give the apply engine
+# the same START / COMPLETE-FAIL pair the acquisition runners emit, with the
+# provisioned exposes as output datasets.
+
+
+def _expose_dataset(expose: Any) -> Optional[Any]:
+    """Map one ``exposes[]`` entry onto an OpenLineage output dataset.
+
+    Everything here comes from the *contract*, never from a resolved
+    connection, so unlike the acquisition input side there is no credential
+    to leak: ``binding.platform`` and ``binding.location`` are declared by
+    the author and are already published verbatim to DataHub / OpenMetadata
+    by ``fluid publish``.
+    """
+    from fluid_build.api.lineage import DatasetFacet
+
+    if not isinstance(expose, dict):
+        return None
+    binding = expose.get("binding") or {}
+    location = binding.get("location") or {}
+    namespace = str(binding.get("platform") or "fluid")
+    parts = [
+        location.get("database") or location.get("project") or location.get("catalog"),
+        location.get("schema") or location.get("dataset"),
+        location.get("table") or location.get("view") or location.get("topic"),
+    ]
+    dotted = ".".join(str(p) for p in parts if p)
+    name = dotted or str(location.get("path") or expose.get("exposeId") or expose.get("id") or "")
+    if not name:
+        return None
+    return DatasetFacet(namespace=namespace, name=name)
+
+
+def build_apply_event(
+    contract: Any,
+    *,
+    event_type: Any,
+    event_time: str,
+    run_id: str,
+    run_started_at: str,
+    provider: str,
+    facets: Optional[Dict[str, Any]] = None,
+) -> RunEvent:
+    """Assemble the ``RunEvent`` for one ``fluid apply``.
+
+    ``job_name`` is ``<contract id>.apply``, matching the acquisition
+    runners' ``<product_id>.<build_id>`` shape so both kinds of FLUID job
+    sort together in a receiver's job list.
+    """
+    contract = contract if isinstance(contract, dict) else {}
+    product_id = str(contract.get("id") or "unknown")
+    outputs = [d for d in (_expose_dataset(e) for e in (contract.get("exposes") or [])) if d]
+
+    run_facets: Dict[str, Any] = {}
+    payload: Dict[str, Any] = {"engine": "opentofu", "provider": provider}
+    payload.update(facets or {})
+    run_facets[FLUID_ENGINE_FACET_KEY] = _as_run_facet(
+        payload, schema_path="fluid_build/build_runners/_lineage.py"
+    )
+
+    return RunEvent(
+        event_type=event_type,
+        event_time=event_time,
+        run_id=run_id,
+        job_namespace="fluid",
+        job_name=f"{product_id}.apply",
+        inputs=[],
+        outputs=outputs,
+        run_facets=run_facets,
+        run_started_at=run_started_at,
+    )
+
+
+def emit_apply_event(
+    emitter: Any,
+    contract: Any,
+    *,
+    event_type: Any,
+    event_time: str,
+    run_id: str,
+    run_started_at: str,
+    provider: str,
+    facets: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Emit one apply lineage event, never raising.
+
+    Lineage is observability, not correctness — an apply must not fail
+    because a receiver is down or a facet could not be assembled. Mirrors
+    :func:`emit_run_event`'s contract exactly.
+    """
+    if emitter is None or isinstance(emitter, NullLineageEmitter):
+        return
+    try:
+        emitter.emit(
+            build_apply_event(
+                contract,
+                event_type=event_type,
+                event_time=event_time,
+                run_id=run_id,
+                run_started_at=run_started_at,
+                provider=provider,
+                facets=facets,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("Apply lineage event assembly failed (non-fatal): %s", type(exc).__name__)
