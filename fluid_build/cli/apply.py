@@ -259,6 +259,51 @@ def _run_apply_hooks(
     return 1
 
 
+def _run_apply_hooks_for_source(args, logger: logging.Logger) -> int:
+    """Run apply-time hooks for whatever ``args.contract`` points at.
+
+    The native path already holds a loaded contract when it reaches its
+    hook call site; the OpenTofu path does not — it hands ``args`` straight
+    to :func:`apply_via_opentofu`. This adapter loads the contract for both
+    documented apply inputs (a ``.fluid.yaml`` path and a pre-generated
+    ``plan.json``, which embeds the contract under ``contract``) so the hook
+    surface is identical on both engines.
+
+    A contract that cannot be loaded is NOT a reason to skip the guards
+    silently — but it is also not this function's error to report: the
+    engine loads the same source moments later and raises the proper
+    ``CLIError``. So we log at debug and return 0, letting the engine own
+    the failure message.
+    """
+    src = str(getattr(args, "contract", "") or "")
+    try:
+        if src.endswith(".json"):
+            plan_data = read_json(src)
+            contract = plan_data.get("contract") if isinstance(plan_data, dict) else None
+            if not isinstance(contract, dict) or not contract:
+                logger.debug("apply hooks skipped: %s has no embedded contract", src)
+                return 0
+        else:
+            contract = load_contract_with_overlay(src, getattr(args, "env", None), logger)
+    except Exception as exc:  # noqa: BLE001 — the engine re-loads and reports
+        logger.debug("apply hooks skipped: %s could not be loaded (%s)", src, type(exc).__name__)
+        return 0
+
+    rc = _run_apply_hooks(
+        contract,
+        Path(src).resolve().parent,
+        logger,
+        force=bool(getattr(args, "force_pattern_drift", False)),
+        env=getattr(args, "env", None),
+    )
+    if rc != 0:
+        logger.error(
+            "apply aborted by an apply-time plugin hook. "
+            "Pass --force-pattern-drift to override."
+        )
+    return rc
+
+
 def _gate_contract_for_apply(contract: Dict[str, Any], logger: logging.Logger) -> None:
     """Reject pre-0.7 + schema-invalid contracts before any DDL.
 
@@ -1477,6 +1522,18 @@ def run(args, logger: logging.Logger) -> int:
     )
 
     if resolve_apply_engine(args, logger) == "opentofu":
+        # Apply-time plugin hooks run on EVERY engine. They used to be
+        # invoked only from the native path's YAML branch, several hundred
+        # lines below this early return — so for aws / gcp / snowflake /
+        # confluent (i.e. every cloud in ``OPENTOFU_DEFAULT_PROVIDERS``) a
+        # registered scaffold-drift / lockfile / env-aware deploy guard
+        # silently never ran and ``--force-pattern-drift`` had nothing to
+        # override. A guard that fires on the toy local target and no-ops
+        # against production clouds is a fail-open control, so the dispatch
+        # is mirrored here, ahead of ``tofu init/plan/apply``.
+        _hook_rc = _run_apply_hooks_for_source(args, logger)
+        if _hook_rc != 0:
+            return _hook_rc
         rc = apply_via_opentofu(args, logger)
         # The OpenTofu engine provisions infrastructure only. Build-augmented
         # modes (amend-and-build / replace-and-build) still need their build
