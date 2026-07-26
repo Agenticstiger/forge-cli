@@ -38,6 +38,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import yaml
 
+from ...providers._iceberg_catalog import (
+    EXTERNAL_ICEBERG_CATALOGS,
+    iceberg_external_volume_is_override,
+    iceberg_external_volume_name,
+)
 from ...providers._sql_safety import validate_ident
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
@@ -206,6 +211,7 @@ class SnowflakeIacPlugin:
                 resources, loc, fmt, schema_cols, cid, contract=contract, placement=placement
             )
             _emit_warehouse(resources, loc, cid, placement=placement)
+            _emit_iceberg_prereqs(resources, contract, binding, loc, fmt, cid)
         _emit_grants(resources, contract, cid)
         # Streams / tasks / views / procedures / functions — the planner
         # already interpreted the `streams[]`, `views[]`, `build` and
@@ -501,6 +507,157 @@ def _emit_snowflake(
     if table_comment:
         table_body["comment"] = table_comment
     resources.setdefault("snowflake_table", {})[tbl_res] = table_body
+
+
+#: ``binding.format`` values that mark an Iceberg-table expose (the alias
+#: normalises upstream, but the validator accepts both, so agree with it).
+_ICEBERG_FORMATS = ("iceberg", "iceberg_table")
+
+#: ``location.warehouse`` scheme to the external volume's ``storage_provider``.
+#: Azure is deliberately absent: the volume needs ``azure_tenant_id`` and the
+#: contract schema has no slot for it yet, and guessing would emit a volume
+#: Snowflake rejects at CREATE time.
+_STORAGE_PROVIDERS = (("s3://", "S3"), ("gs://", "GCS"))
+
+
+def _emit_iceberg_prereqs(
+    resources: Dict[str, Any],
+    contract: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    loc: Mapping[str, Any],
+    fmt: Any,
+    cid: str,
+) -> None:
+    """Emit the Iceberg prerequisites dbt refuses to create.
+
+    dbt 1.10+ materializes Iceberg tables through ``catalogs.yml`` but its
+    documentation puts the infrastructure on the user: the EXTERNAL VOLUME for
+    Snowflake-managed (Horizon) catalogs, and the CATALOG INTEGRATION for
+    external ones. This closes the loop with the dbt engine's ``catalogs.yml``
+    emitter: the volume created here carries **exactly** the name that file
+    references, because both sides call
+    :func:`fluid_build.providers._iceberg_catalog.iceberg_external_volume_name`.
+    Diverge and dbt writes to a volume that does not exist.
+
+    Emit-when-derivable, matching this module's pure-emitter shape (no
+    logging, no I/O):
+
+    - Snowflake-managed catalog (no external ``location.catalog``): a
+      ``snowflake_external_volume``. Needs a ``location.warehouse`` with an
+      ``s3://`` or ``gs://`` scheme (or a ``bucket``, treated as S3); S3 also
+      needs ``location.iam_role_arn``. ``allow_writes`` is pinned ``"true"``,
+      which the provider requires for Iceberg tables using Snowflake as the
+      catalog.
+    - ``location.catalog: glue``: a ``snowflake_catalog_integration_aws_glue``.
+      Needs ``location.iam_role_arn`` (the role Snowflake assumes) and
+      ``location.account`` (the AWS account id).
+    - Other external catalogs (rest / polaris / unity): nothing yet. Their
+      integrations authenticate with OAuth client secrets or bearer tokens,
+      and this emitter's ``.tf.json`` is credential-free by invariant, so
+      wiring them needs a variables design first. Documented follow-up.
+
+    The external-vs-managed split uses the SAME
+    ``EXTERNAL_ICEBERG_CATALOGS`` set as the dbt emitter, so an unlisted
+    catalog value (``snowflake``, say) is Snowflake-managed to both sides
+    rather than dbt referencing a volume this side never creates.
+
+    An explicit ``binding.icebergConfig.properties.external_volume`` means
+    "I already have a volume": dbt references it and NO resource is emitted
+    here, so apply never collides with the operator's own object.
+
+    Two exposes deriving the same volume name with DIFFERENT storage raise
+    ``ValueError`` at emit time. First-expose-wins would silently route the
+    second expose's data into the first one's bucket, which is a data-
+    placement (and potentially a compliance-isolation) failure that must
+    never be quiet.
+    """
+    if str(fmt or "").lower() not in _ICEBERG_FORMATS:
+        return
+
+    catalog = str(loc.get("catalog") or "").lower()
+
+    if catalog == "glue":
+        role_arn = loc.get("iam_role_arn")
+        account = loc.get("account")
+        if not (role_arn and account):
+            return
+        name = iceberg_external_volume_name(contract, binding).removesuffix("_VOL") + "_GLUE_CAT"
+        key = safe_ident(f"{cid}_glue_catalog_integration")
+        resources.setdefault("snowflake_catalog_integration_aws_glue", {}).setdefault(
+            key,
+            {
+                "name": validate_ident(name),
+                "enabled": True,
+                "glue_aws_role_arn": str(role_arn),
+                "glue_catalog_id": str(account),
+            },
+        )
+        return
+
+    if catalog in EXTERNAL_ICEBERG_CATALOGS:
+        # rest / polaris / unity / nessie: secret-bearing auth, see docstring.
+        return
+
+    if iceberg_external_volume_is_override(binding):
+        # Operator-owned volume: reference-only on the dbt side, no CREATE.
+        return
+
+    # Snowflake-managed (Horizon) catalog: the EXTERNAL VOLUME path. An
+    # unlisted ``catalog`` value lands here too, mirroring the dbt emitter's
+    # built_in fallback.
+    warehouse = str(loc.get("warehouse") or "")
+    base_url = ""
+    provider = ""
+    for scheme, provider_name in _STORAGE_PROVIDERS:
+        if warehouse.startswith(scheme):
+            base_url, provider = warehouse, provider_name
+            break
+    if not base_url and loc.get("bucket"):
+        path = str(loc.get("path") or "").strip("/")
+        base_url = f"s3://{loc['bucket']}/{path}" if path else f"s3://{loc['bucket']}/"
+        provider = "S3"
+    if not base_url:
+        return
+
+    role_arn = loc.get("iam_role_arn")
+    if provider == "S3" and not role_arn:
+        # Snowflake requires storage_aws_role_arn for S3 volumes.
+        return
+
+    volume_name = iceberg_external_volume_name(contract, binding)
+    storage_location: Dict[str, Any] = {
+        # The provider forbids `|`, `.` and `"` in location names; the volume
+        # name is validate_ident-clean so a derived suffix stays legal.
+        "storage_location_name": f"{volume_name}_LOC",
+        "storage_provider": provider,
+        "storage_base_url": base_url,
+    }
+    if provider == "S3":
+        storage_location["storage_aws_role_arn"] = str(role_arn)
+
+    # Keyed per volume NAME, not per contract: several exposes sharing one
+    # warehouse coalesce into one resource, and a same-name/different-storage
+    # pair fails loudly instead of first-expose-wins.
+    key = safe_ident(f"{cid}_vol_{volume_name}")
+    volumes = resources.setdefault("snowflake_external_volume", {})
+    existing = volumes.get(key)
+    if existing is not None:
+        if existing["storage_location"] != [storage_location]:
+            raise ValueError(
+                f"two Iceberg exposes derive external volume '{volume_name}' with "
+                f"different storage locations ({existing['storage_location'][0]['storage_base_url']!r} "
+                f"vs {storage_location['storage_base_url']!r}); set an explicit "
+                "binding.icebergConfig.properties.external_volume on one of them"
+            )
+        return
+    volumes[key] = {
+        "name": volume_name,
+        # Required "true" for Iceberg tables that use Snowflake as the
+        # catalog; the provider's tri-state default would leave it unset.
+        "allow_writes": "true",
+        "comment": f"Iceberg external volume for FLUID product {contract.get('id') or cid}",
+        "storage_location": [storage_location],
+    }
 
 
 def _emit_warehouse(

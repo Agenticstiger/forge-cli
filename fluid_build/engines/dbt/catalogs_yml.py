@@ -63,6 +63,7 @@ from typing import Any, Dict, List, Mapping, Optional
 import yaml
 
 from fluid_build.providers._iceberg_catalog import (
+    EXTERNAL_ICEBERG_CATALOGS,
     iceberg_external_volume_name,
     resolve_iceberg_catalog,
 )
@@ -80,10 +81,12 @@ _ICEBERG_FORMATS = frozenset({"iceberg", "iceberg_table"})
 _CATALOG_TYPE_BUILT_IN = "built_in"
 _CATALOG_TYPE_REST = "iceberg_rest"
 
-#: ``location.catalog`` values that mean "an external catalog", i.e. anything
-#: other than Snowflake's own Horizon. Anything here maps to ``iceberg_rest``;
-#: an absent or Snowflake-managed catalog maps to ``built_in``.
-_EXTERNAL_CATALOGS = frozenset({"glue", "polaris", "unity", "rest", "iceberg_rest", "nessie"})
+#: The external-vs-managed split. Shared with the Snowflake IaC emitter via
+#: ``_iceberg_catalog.EXTERNAL_ICEBERG_CATALOGS``: the two sides must
+#: partition identically or this file references a volume the IaC never
+#: creates. Anything in the set maps to ``iceberg_rest``; an absent or
+#: unlisted catalog maps to ``built_in``.
+_EXTERNAL_CATALOGS = EXTERNAL_ICEBERG_CATALOGS
 
 #: Only Snowflake's shape is verified against dbt's documentation.
 _SUPPORTED_ADAPTERS = frozenset({"snowflake"})
