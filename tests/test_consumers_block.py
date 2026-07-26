@@ -176,3 +176,57 @@ def test_consumers_block_is_rejected_on_075_contracts():
     contract["fluidVersion"] = "0.7.5"
     vr = _validate(contract)
     assert vr.is_valid is False
+
+
+# ---------------------------------------------------------------------------
+# The description must describe what the code does — nothing more.
+#
+# The shipped 0.7.6 description read "they feed lineage terminal nodes and
+# impact statements ('Affects: Revenue dashboard')" in the present tense. The
+# first clause ("consumers never affect plan/apply") was honest; the second was
+# not implemented: grepping HEAD for any reader of the key — get("consumers"),
+# ["consumers"], .consumers — found only this test file, and neither the ODPS
+# nor the ODCS artifact generated from a contract carrying the block contained
+# a single consumer. A schema field whose documentation describes behaviour
+# that does not exist sets up every consumer to assume it works.
+# ---------------------------------------------------------------------------
+
+
+def _consumers_description() -> str:
+    import json
+    from pathlib import Path
+
+    import fluid_build
+
+    path = Path(fluid_build.__file__).resolve().parent / "schemas" / "fluid-schema-0.7.6.json"
+    schema = json.loads(path.read_text(encoding="utf-8"))
+    return schema["properties"]["consumers"]["description"]
+
+
+def test_the_description_says_the_block_is_not_yet_consumed():
+    description = _consumers_description()
+    assert "not yet consumed" in description
+    assert "RESERVED" in description
+
+
+def test_the_description_does_not_claim_present_tense_lineage_consumption():
+    description = _consumers_description()
+    assert "they feed lineage terminal nodes" not in description
+
+
+def test_nothing_in_the_package_reads_the_key():
+    """The fact the description now admits. Delete this test in the same change
+    that implements the consumption — and restore the present tense."""
+    import re
+    from pathlib import Path
+
+    import fluid_build
+
+    root = Path(fluid_build.__file__).resolve().parent
+    reader = re.compile(r"""get\(\s*["']consumers["']|\["consumers"\]|\.consumers\b""")
+    hits = [
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*.py")
+        if reader.search(path.read_text(encoding="utf-8"))
+    ]
+    assert hits == [], f"consumers now has a reader ({hits}) — update the schema description"
