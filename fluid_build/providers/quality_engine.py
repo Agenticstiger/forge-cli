@@ -32,7 +32,10 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from fluid_build.providers._sql_safety import quote_string_literal
+from fluid_build.providers._sql_safety import (
+    dialect_uses_backslash_escapes,
+    quote_string_literal,
+)
 from fluid_build.providers.validation_provider import ValidationIssue
 
 LOG = logging.getLogger("fluid.providers.quality_engine")
@@ -361,6 +364,7 @@ def _execute_single_rule(
             valid_values,
             table_ref,
             execute_fn,
+            dialect,
         )
     elif rule_type == "freshness":
         return _check_freshness(
@@ -395,6 +399,7 @@ def _execute_single_rule(
             valid_values,
             table_ref,
             execute_fn,
+            dialect,
         )
     else:
         return QualityCheckResult(
@@ -519,6 +524,7 @@ def _check_validity(
     valid_values,
     table_ref,
     execute_fn,
+    dialect: str = "ansi",
 ) -> QualityCheckResult:
     if not valid_values:
         return QualityCheckResult(
@@ -530,8 +536,15 @@ def _check_validity(
             message=f"Rule '{rule_id}' is type 'validity' but has no 'validValues' list",
         )
     col = _validate_ident(selector)
-    # Build SQL with quoted string literals for valid values
-    escaped = ", ".join(quote_string_literal(str(v)) for v in valid_values)
+    # Build SQL with quoted string literals for valid values. The literals are
+    # contract-supplied, so the quoting must hold on the *target* dialect:
+    # Snowflake/BigQuery honour ``\`` escapes inside ``'...'``, and a value
+    # ending in a backslash would otherwise terminate the literal early and
+    # append live SQL to this predicate (silently flipping the check to pass).
+    backslash_escapes = dialect_uses_backslash_escapes(dialect)
+    escaped = ", ".join(
+        quote_string_literal(str(v), backslash_escapes=backslash_escapes) for v in valid_values
+    )
     sql = (
         f"SELECT COUNT(*) AS invalid_count FROM {table_ref} "
         f'WHERE "{col}" IS NOT NULL AND "{col}" NOT IN ({escaped})'

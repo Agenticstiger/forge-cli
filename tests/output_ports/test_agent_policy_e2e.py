@@ -92,6 +92,11 @@ def _build_policy(
         cli_denied_models=cli_denied_models,
         cli_allowed_use_cases=cli_allowed_use_cases,
         cli_denied_use_cases=cli_denied_use_cases,
+        # The fixture CSV lives under the test's tmp dir (``audit_root`` is
+        # ``<tmp>/.fluid/store/audit``), not cwd. ``--readable-paths`` is
+        # enforced by the driver now, so the sandbox has to name the
+        # directory the data actually lives in.
+        readable_paths=(audit_root.parents[2].resolve(),),
     )
 
 

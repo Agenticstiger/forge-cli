@@ -48,7 +48,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_json
 from fluid_build.cli.console import error as console_error
 
 # Logger name intentionally preserved as ``"fluid.cli.opds"`` even though
@@ -193,7 +193,7 @@ def _export_bitol(
 
     if out == "-" and not out_dir:
         # Stdout dump of the product doc — JSON for unambiguous pipeline use.
-        cprint(json.dumps(bundle["product"], indent=2, ensure_ascii=False))
+        cprint_json(json.dumps(bundle["product"], indent=2, ensure_ascii=False))
     else:
         contract_count = len(bundle.get("contracts") or {})
         location = out_dir if out_dir else out
@@ -229,9 +229,9 @@ def _export_odps_v4_1(
         result = provider.render(contract, out=out_path, fmt="opds")
         if out_path == "-":
             if getattr(args, "pretty", True):
-                cprint(json.dumps(result, indent=2, ensure_ascii=False))
+                cprint_json(json.dumps(result, indent=2, ensure_ascii=False))
             else:
-                cprint(json.dumps(result, ensure_ascii=False))
+                cprint_json(json.dumps(result, ensure_ascii=False))
         else:
             cprint(f"✓ Exported to ODPS v4.1 (LF/ODPI): {out_path}")
             cprint(f"  Specification: {ODPS_4_1_SPEC_URL}")
@@ -308,7 +308,7 @@ def cmd_opds_import(args: argparse.Namespace, logger: logging.Logger) -> int:
         cprint(f"✓ Imported {in_path} → {out_path}")
     else:
         if fmt == "json":
-            cprint(json.dumps(fluid, indent=2, ensure_ascii=False))
+            cprint_json(json.dumps(fluid, indent=2, ensure_ascii=False))
         else:
             import yaml
 
@@ -451,7 +451,7 @@ def cmd_opds_info(args: argparse.Namespace, logger: logging.Logger) -> int:
             }
         else:
             info = ODPS_VERSIONS["4.1"]
-        cprint(json.dumps(info, indent=2))
+        cprint_json(json.dumps(info, indent=2))
         return 0
 
     if spec == SPEC_BITOL_1_0_0:

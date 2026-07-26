@@ -29,7 +29,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_json
 
 try:
     from rich.console import Console
@@ -960,7 +960,7 @@ def handle_language_server(args, ide_integration: IDEIntegration, logger: loggin
             # Output completions as JSON for IDE consumption
             completion_response = {"completions": [comp.to_dict() for comp in completions]}
 
-            cprint(json.dumps(completion_response, indent=2))
+            cprint_json(json.dumps(completion_response, indent=2))
             return 0
 
         except Exception as e:

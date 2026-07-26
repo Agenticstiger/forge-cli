@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlsplit
 
+from fluid_build.observability.secret_redactor import register_secrets
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_WAREHOUSE = "COMPUTE_WH"
@@ -379,6 +381,15 @@ def resolve_snowflake_settings(
 
     if _is_present(resolved.get("account")):
         resolved["account"] = _normalize_account_identifier(resolved["account"])
+
+    # Every credential this call resolved is now HELD by the process, so hand
+    # its literal value to the redactor's exact-match layer. That is what makes
+    # a password containing ``;`` ``,`` ``}`` ``]`` ``"`` or a space redactable
+    # at all: an assignment pattern has to guess where the value ends and
+    # truncates at the first such character, emitting the tail verbatim. Once
+    # the literal is registered, the value is masked whole wherever it surfaces
+    # — a driver's error body, a traceback, a subprocess dump.
+    register_secrets(resolved.get(key) for key in SECRET_KEYS)
 
     # Never echo the provenance of secret values — avoids leaking, for
     # example, that a passphrase came from `env:SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`

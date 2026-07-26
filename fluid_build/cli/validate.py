@@ -22,7 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_json
 from fluid_build.cli.console import error as console_error
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
@@ -439,7 +439,7 @@ def _handle_list_versions(schema_manager: FluidSchemaManager, args, logger: logg
         if args.format == "json":
             import json
 
-            cprint(json.dumps({"available_versions": versions}, indent=2))
+            cprint_json(json.dumps({"available_versions": versions}, indent=2))
         else:
             cprint("Available FLUID Schema Versions:")
             cprint("==================================")
@@ -884,7 +884,7 @@ def _show_schema_info(
 
         cprint("Schema Information:")
         cprint("==================")
-        cprint(json.dumps(schema, indent=2))
+        cprint_json(json.dumps(schema, indent=2))
     else:
         cprint(f"\nSchema Information for v{version}:")
         cprint("=" * 40)
@@ -1000,7 +1000,7 @@ def _output_json_results(result: ValidationResult, args) -> int:
         "validation_time": result.validation_time,
     }
 
-    cprint(json.dumps(output, indent=2))
+    cprint_json(json.dumps(output, indent=2))
     return 0 if result.is_valid and (not args.strict or not result.warnings) else 1
 
 
@@ -1018,10 +1018,16 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
             cprint("Validation Errors:")
             cprint("==================")
         for i, error in enumerate(result.errors, 1):
+            # ``markup=False``: a validator message quotes the schema verbatim,
+            # and a JSON Schema ``pattern`` is full of ``[...]`` character
+            # classes. Rendered as markup, Rich *consumes* them —
+            # ``^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$`` printed as
+            # ``^*$|^$``, which tells the operator nothing about what is
+            # allowed. The message is data, not markup.
             if args.quiet:
-                cprint(f"ERROR: {error}")
+                cprint(f"ERROR: {error}", markup=False)
             else:
-                cprint(f"{i:2}. {error}")
+                cprint(f"{i:2}. {error}", markup=False)
 
         if not args.quiet:
             cprint()
@@ -1031,7 +1037,8 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
         cprint("Validation Warnings:")
         cprint("====================")
         for i, warning in enumerate(result.warnings, 1):
-            cprint(f"{i:2}. {warning}")
+            # Same verbatim-text rule as the error loop above.
+            cprint(f"{i:2}. {warning}", markup=False)
         cprint()
 
     # Verbose information
@@ -1234,7 +1241,7 @@ def _run_bundle_validation(
     verbose = bool(getattr(args, "verbose", False))
 
     if out_format == "json":
-        cprint(json.dumps(report.to_dict(), indent=2))
+        cprint_json(json.dumps(report.to_dict(), indent=2))
     elif not quiet:
         status_icon = "✅" if report.status == "pass" else "❌"
         cprint(f"{status_icon} Bundle {report.status}: {tgz_path}")

@@ -28,7 +28,7 @@ import platform
 import sys
 from typing import Any, Dict
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_json
 from fluid_build.cli.forge_banner import compact_next_line
 
 from .. import __version__ as CLI_VERSION
@@ -111,7 +111,7 @@ def run(args, logger: logging.Logger) -> int:
         # Output in requested format
         output_format = getattr(args, "format", "text")
         if output_format == "json":
-            cprint(json.dumps(version_info, indent=2))
+            cprint_json(json.dumps(version_info, indent=2))
         else:
             _display_version_info(version_info, getattr(args, "verbose", False))
 

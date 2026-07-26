@@ -116,8 +116,17 @@ def cprint(*args: Any, **kwargs: Any) -> None:
     # markup, then run the result through :func:`_redact_str` one final
     # time so any non-string args that bypassed
     # ``_redact_sensitive_output`` are redacted on their ``str()`` form.
+    #
+    # ``markup=False`` (forwarded verbatim to ``console.print`` on the Rich
+    # branch) means "this text is not markup — print every ``[...]`` run
+    # literally". Honour it here too, or the two branches disagree: a JSON
+    # Schema ``pattern`` such as ``^[a-z0-9][a-z0-9-]*[a-z0-9]$`` renders as
+    # the unactionable ``^*$`` once its character classes are eaten.
     joined = " ".join(str(a) for a in safe_args)
-    text = _redact_str(_RICH_TAG_PATTERN.sub("", joined))
+    if kwargs.get("markup") is False:
+        text = _redact_str(joined)
+    else:
+        text = _redact_str(_RICH_TAG_PATTERN.sub("", joined))
     end = kwargs.get("end", "\n")
     stream = kwargs.get("file") or sys.stdout
     # ``text`` is already run through ``_redact_str`` above, so any secret is
@@ -125,6 +134,29 @@ def cprint(*args: Any, **kwargs: Any) -> None:
     # and re-flags this sink whenever the code moves to new lines; suppress it
     # exactly like the ``console.print`` sink above (matching the pre-move
     # accepted state — this line is byte-identical to the former cli/console.py).
+    stream.write(text + end)  # lgtm[py/clear-text-logging-sensitive-data]
+    if kwargs.get("flush"):
+        stream.flush()
+
+
+def cprint_json(document: str, **kwargs: Any) -> None:
+    """Emit a machine-readable document (JSON / YAML / XML) verbatim.
+
+    :func:`cprint` routes through the Rich console, which **word-wraps at the
+    terminal width and interprets ``[...]`` as style markup**. For prose that
+    is what you want; for a serialized document it is a correctness bug — Rich
+    hard-wraps at 80 columns when stdout is a pipe, injecting a literal newline
+    *inside* a JSON string literal, and ``fluid <cmd> --format json | jq`` then
+    fails with "Invalid string: control characters ... must be escaped".
+
+    So this writes straight to the stream, exactly like ``fluid test``'s
+    already-correct ``_output_json``. The redaction pass that :func:`cprint`
+    applies is kept — a credential must not reach stdout on either path.
+    """
+    text = _redact_str(document)
+    end = kwargs.get("end", "\n")
+    stream = kwargs.get("file") or sys.stdout
+    # ``text`` is redacted above; same suppression rationale as ``cprint``.
     stream.write(text + end)  # lgtm[py/clear-text-logging-sensitive-data]
     if kwargs.get("flush"):
         stream.flush()

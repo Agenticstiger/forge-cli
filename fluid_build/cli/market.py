@@ -48,7 +48,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from fluid_build.cli.console import cprint, hint, success
+from fluid_build.cli.console import cprint, cprint_json, hint, success
 
 # Rich imports for enhanced output
 try:
@@ -905,7 +905,7 @@ async def handle_health_check(engine: MarketDiscoveryEngine, args, logger: loggi
         else:
             import json
 
-            cprint(json.dumps(health_status, indent=2))
+            cprint_json(json.dumps(health_status, indent=2))
 
         return 0 if health_status.get("status") in ["healthy", "partial"] else 1
     except Exception as e:
@@ -967,7 +967,7 @@ async def handle_metrics(engine: MarketDiscoveryEngine, logger: logging.Logger) 
         else:
             import json
 
-            cprint(json.dumps(performance_summary, indent=2))
+            cprint_json(json.dumps(performance_summary, indent=2))
 
         return 0
     except Exception as e:

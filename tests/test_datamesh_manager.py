@@ -646,8 +646,11 @@ class TestCmdGet:
         printed = []
         with (
             patch("fluid_build.cli.datamesh_manager._make_provider", return_value=mock_provider),
+            # JSON output goes through ``cprint_json`` (a raw stream write)
+            # so a piped ``--format json`` stays parseable; capture that one.
             patch(
-                "fluid_build.cli.datamesh_manager.cprint", side_effect=lambda t: printed.append(t)
+                "fluid_build.cli.datamesh_manager.cprint_json",
+                side_effect=lambda t: printed.append(t),
             ),
         ):
             result = _cmd_get(args)
@@ -764,8 +767,11 @@ class TestCmdTeams:
         printed = []
         with (
             patch("fluid_build.cli.datamesh_manager._make_provider", return_value=mock_provider),
+            # JSON output goes through ``cprint_json`` (a raw stream write)
+            # so a piped ``--format json`` stays parseable; capture that one.
             patch(
-                "fluid_build.cli.datamesh_manager.cprint", side_effect=lambda t: printed.append(t)
+                "fluid_build.cli.datamesh_manager.cprint_json",
+                side_effect=lambda t: printed.append(t),
             ),
         ):
             result = _cmd_teams(args)

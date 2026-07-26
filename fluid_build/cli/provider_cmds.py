@@ -18,7 +18,7 @@ import argparse
 import json
 import logging
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_json
 
 from ._common import CLIError
 from ._logging import info
@@ -63,9 +63,9 @@ def run(args, logger: logging.Logger) -> int:
                     except Exception:
                         pass
                 detail.append(entry)
-            cprint(json.dumps({"providers": detail}, indent=2))
+            cprint_json(json.dumps({"providers": detail}, indent=2))
         else:
-            cprint(json.dumps({"providers": names}, indent=2))
+            cprint_json(json.dumps({"providers": names}, indent=2))
         return 0
     except Exception as e:
         raise CLIError(1, "providers_failed", {"error": str(e)})

@@ -65,7 +65,9 @@ class TestGetVersionInfo:
 
 
 class TestCmdOpdsExport:
-    @patch("fluid_build.cli.odps.cprint")
+    # The exported document goes through ``cprint_json`` (a raw stream write)
+    # so ``--out -`` stays parseable when piped.
+    @patch("fluid_build.cli.odps.cprint_json")
     @patch("fluid_build.cli.bootstrap.build_provider")
     @patch("fluid_build.cli.bootstrap.load_contract_with_overlay")
     def test_export_stdout_pretty(self, mock_load, mock_build, mock_cprint):

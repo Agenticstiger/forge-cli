@@ -646,7 +646,9 @@ class TestOutputFunctionsExt(unittest.TestCase):
         def capture_cprint(text=""):
             captured.append(str(text))
 
-        with patch("fluid_build.cli.contract_validation.cprint", side_effect=capture_cprint):
+        # JSON output goes through ``cprint_json`` (a raw stream write) so a
+        # piped report stays parseable; capture that emitter.
+        with patch("fluid_build.cli.contract_validation.cprint_json", side_effect=capture_cprint):
             output_json_report(report, None)
         out_text = "".join(captured)
         data = json.loads(out_text)

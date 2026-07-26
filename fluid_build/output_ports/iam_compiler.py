@@ -39,7 +39,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Sequence
 
-from fluid_build.providers._sql_safety import quote_string_literal, validate_ident
+from fluid_build.providers._sql_safety import (
+    quote_ansi_string_literal,
+    quote_string_literal,
+    validate_ident,
+)
 
 SUPPORTED_TARGETS = ("snowflake", "postgres", "bigquery", "aws")
 
@@ -160,7 +164,9 @@ def _compile_snowflake(
                     )
             else:
                 # Constant equality → keep verbatim, quote the literal via the
-                # central _sql_safety chokepoint (single-quote doubling).
+                # central _sql_safety chokepoint. Snowflake honours ``\``
+                # escapes inside ``'...'``, so this site needs the
+                # backslash-escaping variant to stay break-out-proof.
                 predicates.append(f'"{col}" = {quote_string_literal(str(value))}')
 
     # 2) agentPolicy.allowedModels → restrict by tag/role.
@@ -266,7 +272,10 @@ def _compile_postgres(
                     )
                     predicates.append(f"\"{col}\" = current_setting('fluid.caller_{attr}', true)")
             else:
-                predicates.append(f'"{col}" = {quote_string_literal(str(value))}')
+                # PostgreSQL literals are standard-conforming (``\`` is an
+                # ordinary character) — quote with the ANSI variant so values
+                # containing a backslash are not corrupted.
+                predicates.append(f'"{col}" = {quote_ansi_string_literal(str(value))}')
     if not predicates:
         return None
     body = " AND ".join(predicates)
@@ -444,7 +453,9 @@ def _compile_aws(
                         "literal — fill in via your IAM workflow."
                     )
             else:
-                filter_predicates.append(f'"{col}" = {quote_string_literal(str(value))}')
+                # Lake Formation filter expressions are evaluated by the
+                # Athena/Trino engine — standard-conforming literals.
+                filter_predicates.append(f'"{col}" = {quote_ansi_string_literal(str(value))}')
 
     allowed_models = agent_policy.get("allowedModels") or []
     grantee_arns: List[str] = []

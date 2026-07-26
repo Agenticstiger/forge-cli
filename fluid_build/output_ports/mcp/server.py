@@ -244,6 +244,13 @@ class SessionState:
                 expose=self.expose,
                 contract=self.contract,
                 logger=self.logger,
+                # The ``--readable-paths`` allowlist lives on the policy and
+                # MUST reach the driver: the file-backed drivers gate
+                # ``binding.location.path`` / ``attach`` / ``dbFile`` against
+                # it. Omitting it here left the sandbox unarmed — a served
+                # contract could point ``path`` at any host file and the
+                # ``sample`` / ``query`` tools returned its contents.
+                readable_paths=self.policy.readable_paths,
             )
         return self.driver
 

@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from pathlib import Path
+
     from ..query_compiler import CompiledQuery
 
 # Row-level-security primitives live in query_compiler (the lower layer that
@@ -171,11 +173,19 @@ class EngineDriver(ABC):
         contract: Mapping[str, Any],
         logger: Optional[logging.Logger] = None,
         connection_options: Optional[Mapping[str, Any]] = None,
+        readable_paths: Tuple["Path", ...] = (),
     ) -> None:
         self.expose: Mapping[str, Any] = expose
         self.contract: Mapping[str, Any] = contract
         self.logger = logger or logging.getLogger(f"fluid.output_port.mcp.{self.name}")
         self.connection_options: Mapping[str, Any] = connection_options or {}
+        # ``--readable-paths`` allowlist, forwarded by ``build_driver`` from
+        # the server's ``OutputPortPolicy``. Part of the *base* contract (not
+        # just the file-backed drivers) so a driver that later grows a
+        # filesystem reference — a credentials file, a local cache dir — has
+        # the confinement roots already in hand instead of silently reading
+        # outside the sandbox. Empty tuple means "no confinement configured".
+        self.readable_paths: Tuple["Path", ...] = tuple(readable_paths)
         self._restricted_columns: Set[str] = self._compute_restricted_columns(expose)
         # NEW in v0.7.4: row-level PII redaction. Columns marked
         # ``sensitivity: pii`` (or ``sensitivity: phi`` for healthcare)
