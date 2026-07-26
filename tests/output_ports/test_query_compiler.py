@@ -857,6 +857,8 @@ def test_bigquery_fails_closed_when_the_column_type_is_unknowable():
     engine rejects. Same fail-closed posture as percentile on BigQuery."""
     with pytest.raises(QueryValidationError, match="BigQuery's truncation function"):
         _grain_sql(dialect="bigquery", column_type="STRING")
+
+
 _RESTRICTED = ("account_balance",)
 _REDACTED = ("email",)
 
