@@ -405,7 +405,7 @@ def _run_odcs_export(args):
     logger = logging.getLogger(__name__)
 
     # Load contract
-    fluid_contract = load_contract_with_overlay(args.contract, None, logger)
+    fluid_contract = resolve_for_export(load_contract_with_overlay(args.contract, None, logger))
 
     # Configure provider
     provider = OdcsProvider()
