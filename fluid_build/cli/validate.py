@@ -570,16 +570,36 @@ def _filter_compatible_versions(versions: list[SchemaVersion], args) -> list[Sch
     return compatible
 
 
+def _drop_preview_versions(versions: list[SchemaVersion]) -> list[SchemaVersion]:
+    """Strip opt-in preview schema versions from an auto-selection candidate list.
+
+    Mirrors ``FluidSchemaManager.latest_bundled_version``: a preview version is
+    fully validatable when a contract *declares* it, but must never become the
+    silent default for an untagged contract.
+    """
+    import fluid_build.cli.validate as _self
+
+    preview = _self.FluidSchemaManager.PREVIEW_VERSIONS
+    return [v for v in versions if str(v) not in preview]
+
+
 def _find_latest_compatible_version(args, schema_manager: FluidSchemaManager) -> SchemaVersion:
     import fluid_build.cli.validate as _self
 
     versions = _available_schema_versions(schema_manager, args)
     compatible_versions = _filter_compatible_versions(versions, args)
+    # Prefer the newest STABLE candidate. Only fall back to a preview when the
+    # caller's own --min-version/--max-version constraints leave nothing else,
+    # i.e. the operator asked for it explicitly.
+    stable_versions = _self._drop_preview_versions(compatible_versions)
+    if stable_versions:
+        return stable_versions[-1]
     if compatible_versions:
         return compatible_versions[-1]
 
     if versions:
-        return versions[-1]
+        stable_all = _self._drop_preview_versions(versions)
+        return stable_all[-1] if stable_all else versions[-1]
 
     # Degenerate case: no schema versions discoverable at all (e.g. an empty
     # schemas dir). Fall back to the latest bundled schema rather than a

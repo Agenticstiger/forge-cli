@@ -32,6 +32,8 @@ import argparse
 import logging
 from unittest.mock import patch
 
+import pytest
+
 from fluid_build.build_runners._state import FileStateStore
 from fluid_build.cli._verify_reconcile_lineage import (
     REASON_DECLARED_NEVER_READ,
@@ -350,6 +352,19 @@ class TestVerifyRunLineageIntegration:
         return argparse.Namespace(**base)
 
     def _setup(self, tmp_path, consumes, observed_streams):
+        # The fixture below needs the local-file expose to verify *cleanly*
+        # (see the comment on the CSV): ``_verify_local_file`` introspects it
+        # with DuckDB, which ships in the ``local`` extra, not ``dev``. Without
+        # it the expose reports ``status: error`` — "we could not check" — and
+        # every exit-code assertion in this class measures that instead of the
+        # lineage reconcile it names. Make the prerequisite explicit and loud
+        # (a reported skip) rather than latent, per the repo's own idiom in
+        # tests/test_forge_db_tools.py and tests/test_fix_a4_bugs.py.
+        pytest.importorskip(
+            "duckdb",
+            reason="local-file expose verification needs DuckDB (the `local` extra); "
+            "without it error_count is 1 and these exit codes stop being about lineage",
+        )
         contract_path = tmp_path / "contract.fluid.yaml"
         contract_path.write_text(f"id: {PRODUCT_ID}\n", encoding="utf-8")
         # A real CSV output so the local-file expose verify passes cleanly

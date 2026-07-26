@@ -25,6 +25,11 @@ still passes ``fluid validate`` afterward:
 * ``dq``       -> a rule under ``exposes[].contract.dq.rules[]``
   (``{id, type, severity}``) on the targeted expose (``--expose``, else the
   first expose).
+
+The result is written back **in place, to the file the user named**, in that
+file's own serialisation (YAML in -> YAML out, JSON in -> JSON out). Writing a
+sibling ``.json`` for YAML input silently broke accumulation: every invocation
+re-read the untouched YAML, so ``product-add`` twice kept only the second item.
 """
 
 from __future__ import annotations
@@ -35,8 +40,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
 from ._common import CLIError
-from ._io import dump_json
+from ._io import atomic_write, dump_json
 from ._logging import info
+from .console import cprint
 
 COMMAND = "product-add"
 
@@ -144,13 +150,10 @@ def run(args, logger: logging.Logger) -> int:
         else:  # dq
             added, total = _add_dq_check(contract, args)
 
-        # Write atomically (JSON for safety; user can convert to YAML if desired).
-        output_path = (
-            contract_path.with_suffix(".json")
-            if contract_path.suffix in (".yaml", ".yml")
-            else contract_path
-        )
-        dump_json(str(output_path), contract)
+        # Write atomically, back to the file the user named and in its own
+        # format. Anything else makes repeated calls non-cumulative: the next
+        # invocation re-reads the (untouched) input and starts over.
+        _dump_contract(contract_path, contract)
 
         info(
             logger,
@@ -158,10 +161,16 @@ def run(args, logger: logging.Logger) -> int:
             what=args.what,
             added=added,
             total=total,
-            output=str(output_path),
+            output=str(contract_path),
         )
         if added == 0:
+            cprint(
+                f"= {args.what} '{args.id}' already present in {contract_path} "
+                f"({total} total) — nothing to do"
+            )
             info(logger, "product_add_duplicate", id=args.id)
+        else:
+            cprint(f"✅ Added {args.what} '{args.id}' to {contract_path} ({total} total)")
 
         return 0
 
@@ -169,6 +178,31 @@ def run(args, logger: logging.Logger) -> int:
         raise
     except Exception as e:
         raise CLIError(1, "product_add_failed", {"error": str(e)})
+
+
+def _dump_contract(path: Path, contract: Dict[str, Any]) -> None:
+    """Serialise ``contract`` back over ``path`` using that path's own format.
+
+    ``.yaml`` / ``.yml`` round-trip through ``yaml.safe_dump`` (the repo-wide
+    idiom: ``sort_keys=False`` so authored key order survives); everything else
+    is JSON. PyYAML is not a round-trip loader, so YAML comments do not survive
+    — say so rather than dropping them silently.
+    """
+    if path.suffix.lower() not in (".yaml", ".yml"):
+        dump_json(str(path), contract)
+        return
+
+    import yaml
+
+    original = path.read_text(encoding="utf-8")
+    atomic_write(
+        str(path),
+        yaml.safe_dump(contract, sort_keys=False, default_flow_style=False, allow_unicode=True),
+    )
+    if any(line.lstrip().startswith("#") for line in original.splitlines()):
+        cprint(
+            f"⚠  YAML comments in {path} were not preserved (contract rewritten from parsed data)"
+        )
 
 
 def _add_source(contract: Dict[str, Any], args) -> Tuple[int, int]:

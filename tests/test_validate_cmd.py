@@ -56,6 +56,52 @@ def test_determine_target_version_defaults_to_latest_compatible():
     assert auto_selected is True
 
 
+def test_untagged_contract_never_auto_selects_a_preview_version():
+    """An untagged contract must default to the newest STABLE schema.
+
+    ``_find_latest_compatible_version`` took ``compatible_versions[-1]`` off
+    the raw list, so a bundled preview (0.7.6) became the silent default for
+    every contract with no ``fluidVersion`` — the exact outcome
+    ``PREVIEW_VERSIONS`` exists to prevent.
+    """
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    schema_manager = MagicMock()
+    schema_manager.detect_version.return_value = None
+    schema_manager.list_available_versions.return_value = list(FluidSchemaManager.BUNDLED_VERSIONS)
+
+    version, auto_selected = _determine_target_version(
+        contract={},
+        args=_args(),
+        schema_manager=schema_manager,
+        logger=logging.getLogger("test"),
+    )
+
+    assert auto_selected is True
+    assert str(version) == FluidSchemaManager.latest_bundled_version()
+    assert str(version) not in FluidSchemaManager.PREVIEW_VERSIONS
+
+
+def test_an_explicit_min_version_can_still_opt_into_a_preview():
+    """Preview is opt-in, not unreachable: a constraint that leaves only a
+    preview must still resolve to it rather than falling off the list."""
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    preview = sorted(FluidSchemaManager.PREVIEW_VERSIONS)[-1]
+    schema_manager = MagicMock()
+    schema_manager.detect_version.return_value = None
+    schema_manager.list_available_versions.return_value = list(FluidSchemaManager.BUNDLED_VERSIONS)
+
+    version, _auto = _determine_target_version(
+        contract={},
+        args=_args(min_version=preview),
+        schema_manager=schema_manager,
+        logger=logging.getLogger("test"),
+    )
+
+    assert str(version) == preview
+
+
 def test_find_previous_compatible_version_steps_back_one_version():
     schema_manager = MagicMock()
     schema_manager.list_available_versions.return_value = ["0.4.0", "0.5.7", "0.7.1", "0.7.2"]

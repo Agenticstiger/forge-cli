@@ -24,7 +24,7 @@ import json
 import logging
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, List, Mapping
 
 from fluid_build.cli.console import cprint
 from fluid_build.iac import build_module, get_iac_plugin, runner
@@ -143,7 +143,9 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     # mechanism that would re-own a shared pool — and before `tofu plan`,
     # which is where an ownership flip would otherwise first surface as a
     # destroy.
-    _guard_packaging_transitions(contract, str(workdir), env, args, logger)
+    _guard_packaging_transitions(
+        contract, str(workdir), env, args, logger, plugin=plugin, actions=actions
+    )
 
     _adopt_existing(plugin, contract, actions, str(workdir), env, logger)
 
@@ -431,6 +433,9 @@ def _guard_packaging_transitions(
     env: Mapping[str, str],
     args,
     logger: logging.Logger,
+    *,
+    plugin: Any = None,
+    actions: Any = (),
 ) -> None:
     """Fail closed when a container's ownership would flip under existing state.
 
@@ -441,6 +446,13 @@ def _guard_packaging_transitions(
 
     A no-op for every contract without a ``packaging`` block (the LEGACY
     sentinel can never transition) and for a fresh workdir with no state.
+
+    ``plugin``/``actions`` supply the import candidates
+    (:meth:`IacProviderPlugin.discover_imports`) — the exact addresses
+    :func:`_adopt_existing` is about to ``tofu import`` moments later. The
+    guard needs them because a provider that emits no ``data`` sub-tree for
+    a shared pool (Snowflake) leaves the REFERENCED container invisible in
+    state, so the state diff alone cannot see the adoption coming.
     """
     from fluid_build.iac.transition import (
         PackagingTransitionError,
@@ -450,12 +462,21 @@ def _guard_packaging_transitions(
     state = runner.tofu_state_list(workdir, env=env)
     if not state:
         return
+    import_candidates: List[str] = []
+    if plugin is not None:
+        try:
+            import_candidates = [
+                str(block.to) for block in plugin.discover_imports(contract, actions)
+            ]
+        except Exception as exc:  # pragma: no cover - defensive; guard must not crash apply
+            logger.debug("opentofu: import-candidate probe failed: %s", exc)
     try:
         adoptions = guard_ownership_transitions(
             contract,
             state,
             workdir=workdir,
             adopt_shared_container=bool(getattr(args, "adopt_shared_container", False)),
+            import_candidates=import_candidates,
             logger=logger,
         )
     except PackagingTransitionError as exc:
