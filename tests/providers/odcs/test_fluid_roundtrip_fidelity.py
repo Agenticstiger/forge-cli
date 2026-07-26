@@ -350,3 +350,19 @@ def test_opting_out_of_the_extras_blob_is_the_documented_trade(
     assert lean["name"] == "Customer 360 (Snowflake)"
     assert lean["domain"] == "retail"
     assert lean["status"] == "retired"
+
+
+@pytest.mark.parametrize(
+    ("declared", "expected"),
+    [("99.9%", 0.999), ("99.95%", 0.9995), ("99%", 0.99), ("99.999%", 0.99999)],
+)
+def test_availability_percent_does_not_pick_up_a_float_artifact(
+    provider: OdcsProvider, declared: str, expected: float
+) -> None:
+    """``99.9%`` published as ``availability: 0.9990000000000001`` — binary
+    floating point leaking into an SLA a human wrote."""
+    contract = yaml.safe_load(yaml.safe_dump(SNOWFLAKE_CONTRACT))
+    contract["exposes"][0]["qos"] = {"availability": declared}
+    sla = {p["property"]: p["value"] for p in provider.render(contract)["slaProperties"]}
+    assert sla["availability"] == expected
+    assert repr(sla["availability"]) == repr(expected)

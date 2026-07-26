@@ -114,7 +114,7 @@ def _build_sla_properties(fluid: Mapping[str, Any]) -> Sequence[Dict[str, Any]]:
         if metadata.get("availability") and "availability" not in sla_values:
             try:
                 a = float(metadata["availability"])
-                sla_values["availability"] = a / 100 if a > 1 else a
+                sla_values["availability"] = _percent_to_fraction(a) if a > 1 else a
             except (TypeError, ValueError):
                 pass
         if metadata.get("quality_threshold"):
@@ -131,16 +131,30 @@ def _build_sla_properties(fluid: Mapping[str, Any]) -> Sequence[Dict[str, Any]]:
     return out
 
 
+def _percent_to_fraction(value: float) -> float:
+    """``99.9`` → ``0.999``, not ``0.9990000000000001``.
+
+    Binary floating point cannot represent 99.9/100 exactly, and the artifact
+    is very visible: a published SLA that reads ``availability:
+    0.9990000000000001`` looks like a computed number nobody intended. Six
+    decimal places is four more than any availability figure needs (99.9999%)
+    and keeps the value a plain float for the JSON/YAML writers.
+    """
+    return round(value / 100, 6)
+
+
 def _qos_to_sla(qos: Mapping[str, Any], sla_values: Dict[str, Any]) -> None:
     avail = qos.get("availability")
     if avail is not None and "availability" not in sla_values:
         try:
             s = str(avail).strip()
             if s.endswith("%"):
-                sla_values["availability"] = float(s.rstrip("%")) / 100
+                sla_values["availability"] = _percent_to_fraction(float(s.rstrip("%")))
             else:
                 parsed = float(s)
-                sla_values["availability"] = parsed / 100 if parsed > 1 else parsed
+                sla_values["availability"] = (
+                    _percent_to_fraction(parsed) if parsed > 1 else parsed
+                )
         except (TypeError, ValueError):
             sla_values["availability"] = str(avail)
 
