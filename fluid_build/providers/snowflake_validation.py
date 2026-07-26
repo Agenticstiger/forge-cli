@@ -89,9 +89,21 @@ class SnowflakeValidationProvider(ValidationProvider):
         ],
         "BOOLEAN": ["BOOLEAN", "BOOL"],
         "DATE": ["DATE"],
-        "TIMESTAMP_NTZ": ["TIMESTAMP_NTZ", "DATETIME", "TIMESTAMP WITHOUT TIME ZONE"],
+        # A contract's bare ``TIMESTAMP`` normalises to TIMESTAMP_NTZ, in
+        # step with the DDL FLUID itself emits
+        # (``providers/snowflake/util/types.py``: timestamp → TIMESTAMP_NTZ)
+        # and with Snowflake's own default TIMESTAMP_TYPE_MAPPING. Mapping
+        # it to TIMESTAMP_TZ made `fluid test` report a type mismatch on
+        # the very table `fluid apply` had just created from the same
+        # contract — including the shipped examples/snowflake/smoke one.
+        "TIMESTAMP_NTZ": [
+            "TIMESTAMP_NTZ",
+            "TIMESTAMP",
+            "DATETIME",
+            "TIMESTAMP WITHOUT TIME ZONE",
+        ],
         "TIMESTAMP_LTZ": ["TIMESTAMP_LTZ", "TIMESTAMP WITH LOCAL TIME ZONE"],
-        "TIMESTAMP_TZ": ["TIMESTAMP_TZ", "TIMESTAMP WITH TIME ZONE", "TIMESTAMP"],
+        "TIMESTAMP_TZ": ["TIMESTAMP_TZ", "TIMESTAMP WITH TIME ZONE"],
         "TIME": ["TIME"],
         "BINARY": ["BINARY", "VARBINARY", "BYTES"],
         "VARIANT": ["VARIANT", "JSON", "JSONB"],
