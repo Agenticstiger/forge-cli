@@ -555,3 +555,116 @@ def resolve_lineage_emitter() -> LineageEmitter:
         api_key=api_key,
         allow_private=_allow_private_endpoints(),
     )
+
+
+# ── Apply-stage lineage ──────────────────────────────────────────────────
+#
+# ``fluid apply`` is the headline command that changes warehouse state, but
+# emission used to be wired only into the acquisition runners: a receiver
+# configured with the standard ``OPENLINEAGE_URL`` saw nothing at all for a
+# real Snowflake / AWS / GCP apply. The helpers below give the apply engine
+# the same START / COMPLETE-FAIL pair the acquisition runners emit, with the
+# provisioned exposes as output datasets.
+
+
+def _expose_dataset(expose: Any) -> Optional[Any]:
+    """Map one ``exposes[]`` entry onto an OpenLineage output dataset.
+
+    Everything here comes from the *contract*, never from a resolved
+    connection, so unlike the acquisition input side there is no credential
+    to leak: ``binding.platform`` and ``binding.location`` are declared by
+    the author and are already published verbatim to DataHub / OpenMetadata
+    by ``fluid publish``.
+    """
+    from fluid_build.api.lineage import DatasetFacet
+
+    if not isinstance(expose, dict):
+        return None
+    binding = expose.get("binding") or {}
+    location = binding.get("location") or {}
+    namespace = str(binding.get("platform") or "fluid")
+    parts = [
+        location.get("database") or location.get("project") or location.get("catalog"),
+        location.get("schema") or location.get("dataset"),
+        location.get("table") or location.get("view") or location.get("topic"),
+    ]
+    dotted = ".".join(str(p) for p in parts if p)
+    name = dotted or str(location.get("path") or expose.get("exposeId") or expose.get("id") or "")
+    if not name:
+        return None
+    return DatasetFacet(namespace=namespace, name=name)
+
+
+def build_apply_event(
+    contract: Any,
+    *,
+    event_type: Any,
+    event_time: str,
+    run_id: str,
+    run_started_at: str,
+    provider: str,
+    facets: Optional[Dict[str, Any]] = None,
+) -> RunEvent:
+    """Assemble the ``RunEvent`` for one ``fluid apply``.
+
+    ``job_name`` is ``<contract id>.apply``, matching the acquisition
+    runners' ``<product_id>.<build_id>`` shape so both kinds of FLUID job
+    sort together in a receiver's job list.
+    """
+    contract = contract if isinstance(contract, dict) else {}
+    product_id = str(contract.get("id") or "unknown")
+    outputs = [d for d in (_expose_dataset(e) for e in (contract.get("exposes") or [])) if d]
+
+    run_facets: Dict[str, Any] = {}
+    payload: Dict[str, Any] = {"engine": "opentofu", "provider": provider}
+    payload.update(facets or {})
+    run_facets[FLUID_ENGINE_FACET_KEY] = _as_run_facet(
+        payload, schema_path="fluid_build/build_runners/_lineage.py"
+    )
+
+    return RunEvent(
+        event_type=event_type,
+        event_time=event_time,
+        run_id=run_id,
+        job_namespace="fluid",
+        job_name=f"{product_id}.apply",
+        inputs=[],
+        outputs=outputs,
+        run_facets=run_facets,
+        run_started_at=run_started_at,
+    )
+
+
+def emit_apply_event(
+    emitter: Any,
+    contract: Any,
+    *,
+    event_type: Any,
+    event_time: str,
+    run_id: str,
+    run_started_at: str,
+    provider: str,
+    facets: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Emit one apply lineage event, never raising.
+
+    Lineage is observability, not correctness — an apply must not fail
+    because a receiver is down or a facet could not be assembled. Mirrors
+    :func:`emit_run_event`'s contract exactly.
+    """
+    if emitter is None or isinstance(emitter, NullLineageEmitter):
+        return
+    try:
+        emitter.emit(
+            build_apply_event(
+                contract,
+                event_type=event_type,
+                event_time=event_time,
+                run_id=run_id,
+                run_started_at=run_started_at,
+                provider=provider,
+                facets=facets,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("Apply lineage event assembly failed (non-fatal): %s", type(exc).__name__)
