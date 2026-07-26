@@ -36,7 +36,13 @@ def register(subparsers: argparse._SubParsersAction):
     )
     p.add_argument("contract", help="contract.fluid.yaml")
     p.add_argument("--env", help="overlay env")
-    p.add_argument("--out", default="runtime/exports/product.opds.json", help="Output path")
+    # The command name is the deprecated letter-swap; the artifact it leaves on
+    # disk must not be. Default to the canonical filename `fluid generate
+    # standard --format odps-v4.1` writes, so a repo does not end up with both
+    # product.odps-v4.1.json and a byte-identical product.opds.json.
+    p.add_argument(
+        "--out", default="runtime/exports/product.odps-v4.1.json", help="Output path"
+    )
     p.set_defaults(cmd=COMMAND, func=run)
 
 
