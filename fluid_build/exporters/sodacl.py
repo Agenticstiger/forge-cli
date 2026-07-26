@@ -40,6 +40,17 @@ human-readable reason). Nothing is dropped on the floor. Callers are
 expected to treat a non-empty ``unmapped`` list as a failure — a quality gate
 nobody executed must never read as green.
 
+Known divergence from the native engine
+---------------------------------------
+``dqRule.severity`` is **not** mapped. Every emitted check is a hard SodaCL
+failure, so a rule the author declared ``severity: warn`` or ``info`` fails
+the soda run where the native engine would only warn. That is deliberate for
+now: SodaCL expresses warn-level gates through per-check ``warn: when ...``
+alert configurations whose operator has to be negated per check shape, and
+getting that subtly wrong maps an ``error`` gate onto a warning — a false
+pass, the exact failure this module exists to prevent. Erring toward "too
+strict" cannot manufacture a green gate; erring toward "too lenient" can.
+
 Prior art
 ---------
 The check shapes follow **datacontract-cli**'s SodaCL exporter
