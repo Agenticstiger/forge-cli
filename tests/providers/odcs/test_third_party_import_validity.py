@@ -191,6 +191,24 @@ def test_latency_and_frequency_no_longer_collide() -> None:
     assert qos["labels"]["retention:y"] == "3"
 
 
+def test_a_repeated_property_lands_in_a_label_rather_than_disappearing() -> None:
+    """ODCS allows repeats — its own reference document carries two
+    ``timeOfAvailability`` entries. The first property to fill a qos field keeps
+    it; the rest must still show up somewhere."""
+    qos = _qos_for(
+        [
+            {"property": "availability", "value": 0.999},
+            {"property": "availability", "value": 0.95},
+            {"property": "interval", "value": 1, "unit": "d"},
+            {"property": "interval", "value": 7, "unit": "d"},
+        ]
+    )
+    assert qos["availability"] == "99.9%"
+    assert qos["freshnessSLO"] == "P1D"
+    assert qos["labels"]["availability"] == "0.95"
+    assert qos["labels"]["interval:d"] == "7"
+
+
 def test_every_qos_label_value_is_a_string() -> None:
     """``$defs/labels`` is ``additionalProperties: {type: string}``; the
     importer wrote raw ints (``errorRate:count: 10``), which is exactly the two

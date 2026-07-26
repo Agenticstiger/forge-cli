@@ -131,13 +131,19 @@ def _apply_sla_to_qos(prop: Mapping[str, Any], qos: Dict[str, Any], labels: Dict
         _set_label(labels, name.removeprefix("label:"), value)
         return
 
+    # Each qos field is claimed by the first property that can fill it; a later
+    # one falls through to a label instead of being dropped. ODCS allows repeats
+    # (the reference document carries two ``timeOfAvailability`` entries), and
+    # silently discarding the loser is the bug that lost ``latency`` when
+    # ``frequency`` had already taken ``freshnessSLO``.
     if name == "availability":
-        pct = _as_availability_pct(value)
-        if pct is not None:
-            qos.setdefault("availability", pct)
-            return
-        # Not expressible as $defs/availabilityPct — fall through to a label
-        # rather than publish a value the FLUID validator rejects.
+        if "availability" not in qos:
+            pct = _as_availability_pct(value)
+            if pct is not None:
+                qos["availability"] = pct
+                return
+            # Not expressible as $defs/availabilityPct — fall through to a label
+            # rather than publish a value the FLUID validator rejects.
     else:
         field = _DURATION_QOS_FIELD.get(name)
         if field is not None and field not in qos:
