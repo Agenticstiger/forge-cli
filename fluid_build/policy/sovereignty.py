@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
+from ._common import iter_exposes
+
 
 class EnforcementMode(Enum):
     """Sovereignty enforcement modes."""
@@ -107,7 +109,7 @@ class SovereigntyValidator:
         cross_border_transfer = sovereignty.get("crossBorderTransfer", True)
 
         # Validate each expose's binding location
-        for expose in contract.get("exposes", []):
+        for expose in iter_exposes(contract):
             binding = expose.get("binding", {})
             location = binding.get("location", {})
             region = location.get("region")
@@ -162,7 +164,7 @@ class SovereigntyValidator:
             if data_residency and not cross_border_transfer:
                 # All regions must be in same jurisdiction
                 first_region_jurisdiction = None
-                for exp in contract.get("exposes", []):
+                for exp in iter_exposes(contract):
                     exp_region = exp.get("binding", {}).get("location", {}).get("region")
                     if exp_region:
                         exp_jurisdiction = self.REGION_JURISDICTION_MAP.get(exp_region)
