@@ -78,7 +78,7 @@ SENSITIVE_PATTERNS = [
     # redacts only the value (``password=hunter2`` -> ``password=[REDACTED]``)
     # instead of whole-match-redacting and destroying the key name. Mirrors
     # the global ``SecretRedactingFilter`` assignment regex, including its
-    # value terminator set (stop at whitespace / ``;`` / ``&`` / ``,``).
+    # value terminator set (stop at whitespace / ``"`` / ``&``).
     # Quantifiers are upper-bounded to prevent catastrophic backtracking.
     re.compile(
         # Key alternation + optional env-var prefix mirror the global
@@ -100,7 +100,14 @@ SENSITIVE_PATTERNS = [
         r"oauth[_-]?token|password|session[_-]token|secret|token|passphrase"
         r"))"
         r"(?P<sep>\s{,8}[:=]\s{,8})"
-        r"(?P<value>[^\s;&,]{,256})"
+        # Value terminator set kept in lock-step with the global twin
+        # (observability/secret_redactor.py ``_ASSIGNMENT_RE``): whitespace,
+        # ``"`` and ``&`` only. ``;`` and ``,`` were terminators here too and
+        # LEAKED the tail of any secret containing one ("password=Pa55;w0rd-x"
+        # -> "password=[REDACTED];w0rd-x"); both are common in real passwords
+        # under complexity policies, and neither is a reliable delimiter in
+        # free text.
+        r"(?P<value>[^\s\"&]{,256})"
     ),
     # AWS keys (for external stages)
     re.compile(r'"aws_key_id":\s*"[^"]*"', re.IGNORECASE),

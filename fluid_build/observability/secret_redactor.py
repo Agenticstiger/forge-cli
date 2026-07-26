@@ -142,6 +142,24 @@ _PEM_PRIVATE_KEY_RE = re.compile(
 # quoted-key shape the Snowflake twin covers with its dedicated ``"credentials":``
 # JSON pattern. The optional quote is a single bounded char, so it adds no
 # backtracking risk.
+#
+# VALUE TERMINATION (S-011). The value is matched in two mutually exclusive
+# branches because a quoted and an unquoted value end differently:
+#
+# * QUOTED — the closing quote ends it, so any character (``;`` ``,`` space)
+#   inside the quotes is part of the secret and gets masked.
+# * UNQUOTED — there is no closing delimiter, so the value runs to the end of
+#   the token. The terminator set is deliberately narrow: whitespace, ``"``
+#   and ``&`` ONLY. It previously also stopped at ``;`` ``,`` ``}`` ``]``,
+#   which LEAKED the tail of every secret containing one of them — and
+#   complexity policies make ``;`` / ``,`` common in real passwords
+#   (``password=Pa55;w0rd-x`` masked as ``***REDACTED***;w0rd-x``). ``"`` and
+#   ``&`` stay terminators because they are true structural delimiters that a
+#   value cannot contain unescaped: ``"`` closes a JSON string, and a URL
+#   query separates parameters with ``&`` (so a literal ``&`` inside the
+#   value would have to be percent-encoded). Whitespace stays a terminator
+#   because it is what keeps redaction precision-scoped — the surrounding log
+#   text ("... retrying", "for user svc") must survive.
 _ASSIGNMENT_RE = re.compile(
     r"(?ix)"
     r"(?P<key>\b(?:[A-Za-z0-9_]{,128}_)?(?:"
@@ -150,9 +168,11 @@ _ASSIGNMENT_RE = re.compile(
     r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token"
     r")\b)"
     r"(?P<sep>['\"]?\s{,8}[:=]\s{,8})"
-    r"(?P<quote>['\"]?)"
-    r"(?P<value>.{,256}?)(?P=quote)"
-    r"(?=(?:[\s,;}\]]|$))"
+    r"(?:"
+    r"(?P<quote>['\"])(?P<qvalue>.{,256}?)(?P=quote)(?=(?:[\s,;}\])]|$))"
+    r"|"
+    r"(?P<value>[^\s\"&]{,256})"
+    r")"
 )
 # ``sasl.jaas.config`` carries the SASL login secret inside the value, often in a
 # field the generic assignment regex does NOT recognize (OAuthBearer
@@ -186,6 +206,17 @@ _PRECEDING_SENSITIVE_KEY_RE = re.compile(
 )
 
 
+def _mask_assignment(match: "re.Match[str]") -> str:
+    """Replace the value of a ``key=value`` assignment, keeping the key name.
+
+    ``quote`` is set only on the quoted branch of :data:`_ASSIGNMENT_RE`; the
+    unquoted branch leaves it ``None``. Re-emitting the quotes keeps the
+    surrounding structure (JSON / repr) intact.
+    """
+    quote = match.group("quote") or ""
+    return f"{match.group('key')}{match.group('sep')}{quote}{_REDACTED}{quote}"
+
+
 def redact_secret_text(text: str) -> str:
     """Redact secret-like substrings in plain text."""
     if not isinstance(text, str) or not text:
@@ -213,13 +244,7 @@ def redact_secret_text(text: str) -> str:
     # Mask the whole sasl.jaas.config value BEFORE the assignment regex (which
     # would only catch an inner ``password=`` and leave a non-standard secret).
     redacted = _JAAS_CONFIG_RE.sub(r"\1" + _REDACTED + r"\3", redacted)
-    redacted = _ASSIGNMENT_RE.sub(
-        lambda match: (
-            f"{match.group('key')}{match.group('sep')}{match.group('quote')}"
-            f"{_REDACTED}{match.group('quote')}"
-        ),
-        redacted,
-    )
+    redacted = _ASSIGNMENT_RE.sub(_mask_assignment, redacted)
     return redacted
 
 

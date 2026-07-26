@@ -124,10 +124,24 @@ class TestSnowflakeAssignmentKeyNamePreserved:
         assert "hunter2" not in out
         assert out.startswith("password: [REDACTED]")
 
-    def test_assignment_stops_at_semicolon_terminator(self) -> None:
-        # Value terminator set mirrors the global layer: stop at ``;``.
-        out = redact_string("password=hunter2;account=acme")
-        assert out == "password=[REDACTED];account=acme"
+    def test_assignment_does_not_stop_at_semicolon_inside_the_secret(self) -> None:
+        """``;`` and ``,`` are NOT value terminators — they occur in real
+        passwords, and stopping there leaked the tail verbatim
+        (``password=Pa55;w0rd-x`` -> ``password=[REDACTED];w0rd-x``). The
+        terminator set mirrors the global layer: whitespace, ``"`` and ``&``.
+        """
+        assert redact_string("password=Pa55;w0rd-x") == "password=[REDACTED]"
+        assert redact_string("password=Pa55,w0rd-x") == "password=[REDACTED]"
+        # Whitespace still bounds it, so surrounding log text survives.
+        assert (
+            redact_string("password=hunter2;account=acme retrying")
+            == "password=[REDACTED] retrying"
+        )
+        # ``&`` still bounds it: a URL query separates parameters with it, so a
+        # literal ``&`` cannot be part of an un-encoded value.
+        assert redact_string("?password=hunter2&account=acme") == (
+            "?password=[REDACTED]&account=acme"
+        )
 
     def test_password_assignment_not_whole_match_redacted(self) -> None:
         # Regression guard: a prior 0-group ``password=`` pattern shadowed
