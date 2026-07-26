@@ -67,10 +67,6 @@ def test_isolated_validates():
         ({"mode": "nonsense"}, "invalid-mode"),
         ({"mode": "isolated", "containers": {"nope": "isolated"}}, "invalid-container-kind"),
         ({"mode": "isolated", "containers": {"schema": "nope"}}, "invalid-container-mode"),
-        (
-            {"mode": "isolated", "containers": {"cluster": "isolated"}},
-            "cluster-isolated-unsupported",
-        ),
         ({"mode": "isolated", "unknownKey": 1}, "invalid-block"),
     ],
 )
@@ -78,6 +74,36 @@ def test_every_packaging_error_kind_surfaces_at_validate_time(block, kind):
     errors, _ = validate_packaging_block(_contract(block))
     assert len(errors) == 1
     assert kind in errors[0]
+
+
+def test_cluster_isolated_surfaces_at_validate_time_when_a_platform_binds_cluster():
+    """``cluster-isolated-unsupported`` needs a cluster-binding platform.
+
+    The rejection is gated on :func:`binds_cluster`, which fails **closed** —
+    a contract with no bindings (or a platform this build does not recognise)
+    is neither owned nor rejected, so asserting the error on a binding-less
+    contract would pin the pre-gate behaviour. ``confluent`` is one of the two
+    platforms that map the ``cluster`` kind.
+    """
+    contract = _contract(
+        {"mode": "isolated", "containers": {"cluster": "isolated"}},
+        exposes=[
+            {
+                "exposeId": "t",
+                "binding": {"platform": "confluent", "format": "iceberg", "location": {}},
+            }
+        ],
+    )
+    errors, _ = validate_packaging_block(contract)
+    assert len(errors) == 1
+    assert "cluster-isolated-unsupported" in errors[0]
+
+
+def test_cluster_isolated_is_not_rejected_without_a_cluster_platform():
+    """The fail-closed half: no binding means no claim, in either direction."""
+    assert validate_packaging_block(
+        _contract({"mode": "isolated", "containers": {"cluster": "isolated"}})
+    ) == ([], [])
 
 
 def test_a_contract_with_no_packaging_block_is_untouched():
