@@ -273,9 +273,16 @@ def _export_odcs(contract_path: str, env, out: str, logger: logging.Logger) -> i
     if out.endswith(os.sep) or os.path.isdir(out):
         out_dir = out.rstrip(os.sep)
         os.makedirs(out_dir, exist_ok=True)
+        # exposeId is document-controlled; gate it through the shared
+        # provider path-safety helper so a foreign contract cannot name a
+        # file outside out_dir. A schema-valid id is used verbatim.
+        from fluid_build.providers._path_safety import safe_output_path
+
         written: list[str] = []
         for eid, doc in results:
-            path = os.path.join(out_dir, f"product.odcs.{eid}.yaml")
+            path = str(
+                safe_output_path(out_dir, f"product.odcs.{eid}", ".yaml", fallback="product.odcs")
+            )
             with open(path, "w", encoding="utf-8") as fh:
                 _yaml.safe_dump(doc, fh, default_flow_style=False, sort_keys=False)
             written.append(path)
