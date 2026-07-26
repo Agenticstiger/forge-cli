@@ -165,9 +165,12 @@ Examples:
         choices=["native", "soda"],
         default="native",
         help=(
-            "Quality-check engine. 'native' (default) runs forge's built-in "
-            "quality gates. 'soda' generates SodaCL from the contract quality "
-            "block and shells out to a locally-installed `soda scan`."
+            "Quality-check engine. Both read the same rules from "
+            "exposes[].contract.dq.rules[]. 'native' (default) runs forge's "
+            "built-in quality gates. 'soda' renders those rules as SodaCL and "
+            "shells out to a locally-installed `soda scan`; it exits non-zero "
+            "if any declared rule has no SodaCL equivalent, so a gate it "
+            "cannot run never reports green."
         ),
     )
     p.add_argument(
