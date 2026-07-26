@@ -312,3 +312,82 @@ class TestResolvePackaging:
         snapshot = copy.deepcopy(contract)
         resolve_packaging(contract)
         assert contract == snapshot
+
+
+class TestBothSpellingsOfADedicatedClusterAgree:
+    """``mode: isolated`` and ``containers.cluster: isolated`` declare the same
+    thing; only the explicit spelling failed.
+
+    ``resolve_packaging({'packaging': {'mode': 'isolated'}})`` resolved
+    ``cluster`` to OWNED and was accepted silently, while
+    ``{'mode':'shared','pool':'p','containers':{'cluster':'isolated'}}`` raised
+    ``cluster-isolated-unsupported``. The resolver's own rationale ("an explicit
+    isolated declaration fails fast here rather than silently no-op'ing at emit
+    time") applies identically to the blanket mode — and the Confluent plugin
+    has no packaging awareness at all, so this resolver is the only check.
+
+    The blanket half is scoped to contracts that actually bind a cluster-backed
+    platform: ``mode: isolated`` on a Snowflake/AWS/GCP contract is not a
+    cluster declaration, and erroring there would reject every isolated
+    contract in existence.
+    """
+
+    def _contract(self, platform, packaging):
+        return {
+            "fluidVersion": "0.7.6",
+            "id": "orders",
+            "packaging": packaging,
+            "exposes": [
+                {
+                    "exposeId": "t",
+                    "binding": {"platform": platform, "format": "iceberg", "location": {}},
+                }
+            ],
+        }
+
+    def test_blanket_isolated_on_a_cluster_contract_now_fails_fast(self):
+        with pytest.raises(PackagingError) as excinfo:
+            resolve_packaging(self._contract("confluent", {"mode": "isolated"}))
+        assert excinfo.value.kind == "cluster-isolated-unsupported"
+
+    def test_the_explicit_spelling_still_fails(self):
+        with pytest.raises(PackagingError) as excinfo:
+            resolve_packaging(
+                self._contract(
+                    "confluent",
+                    {"mode": "shared", "pool": "p", "containers": {"cluster": "isolated"}},
+                )
+            )
+        assert excinfo.value.kind == "cluster-isolated-unsupported"
+
+    def test_a_cluster_contract_can_still_be_isolated_everywhere_else(self):
+        """The escape hatch the error message names."""
+        res = resolve_packaging(
+            self._contract(
+                "confluent",
+                {"mode": "isolated", "pool": "p", "containers": {"cluster": "shared"}},
+            )
+        )
+        assert res.decisions["cluster"] is ContainerDecision.REFERENCED
+        assert res.decisions["bucket"] is ContainerDecision.OWNED
+
+    def test_cluster_shared_stays_an_accepted_no_op(self):
+        res = resolve_packaging(self._contract("confluent", {"mode": "shared", "pool": "p"}))
+        assert res.decisions["cluster"] is ContainerDecision.REFERENCED
+
+    @pytest.mark.parametrize("platform", ["snowflake", "aws", "gcp", "local"])
+    def test_a_non_cluster_contract_is_completely_unaffected(self, platform):
+        """The blast-radius guarantee — every isolated contract keeps working."""
+        res = resolve_packaging(self._contract(platform, {"mode": "isolated"}))
+        assert all(d is ContainerDecision.OWNED for d in res.decisions.values())
+
+    def test_a_contract_with_no_exposes_is_unaffected(self):
+        res = resolve_packaging({"id": "x", "exposes": [], "packaging": {"mode": "isolated"}})
+        assert res.decisions["cluster"] is ContainerDecision.OWNED
+
+    def test_a_per_exposure_isolated_block_on_a_cluster_binding_fails(self):
+        contract = self._contract("confluent", {"mode": "shared", "pool": "p"})
+        contract["exposes"][0]["binding"]["packaging"] = {"mode": "isolated"}
+        with pytest.raises(PackagingError) as excinfo:
+            resolve_packaging(contract)
+        assert excinfo.value.kind == "cluster-isolated-unsupported"

@@ -69,6 +69,12 @@ CONTAINER_KINDS: Tuple[str, ...] = (
 _MODES: Tuple[str, ...] = ("isolated", "shared")
 _BLOCK_KEYS = frozenset({"mode", "pool", "poolManifest", "containers"})
 
+# ``binding.platform`` values whose container is the ``cluster`` kind (RFC
+# §Container-kind ↔ platform mapping: cluster → Confluent environment/cluster).
+# Read only to decide whether a *blanket* ``mode: isolated`` amounts to
+# declaring a dedicated cluster — every other platform leaves the kind vacuous.
+_CLUSTER_PLATFORMS: frozenset = frozenset({"confluent", "kafka"})
+
 
 class PackagingError(ValueError):
     """Raised when a ``packaging`` block declares an invalid combination.
@@ -258,7 +264,11 @@ def _parse_block(raw: Any, *, where: str) -> _Block:
 
 
 def _effective(
-    block: _Block, *, base: Optional[_Block], where: str
+    block: _Block,
+    *,
+    base: Optional[_Block],
+    where: str,
+    binds_cluster: bool = False,
 ) -> Tuple[Dict[str, ContainerDecision], Optional[str], Optional[str]]:
     """Fold one scope: ``block`` over ``base`` → (decisions, pool, manifest).
 
@@ -266,6 +276,10 @@ def _effective(
     ``packaging``); the per-kind ``containers`` overrides win over the
     blanket ``mode``, whose default — when a block is present — is
     ``isolated`` (RFC: "default when block present: isolated").
+
+    ``binds_cluster`` is True when the scope actually targets a
+    cluster-backed platform (see :data:`_CLUSTER_PLATFORMS`). It gates the
+    blanket-mode half of the cluster check below.
     """
     mode = block.mode or (base.mode if base else None) or "isolated"
     pool = block.pool or (base.pool if base else None)
@@ -274,13 +288,31 @@ def _effective(
     containers.update(block.containers)
 
     # v1 accepts only `cluster: shared` — a dedicated Confluent cluster is
-    # not provisionable yet, so an explicit isolated declaration fails fast
-    # here rather than silently no-op'ing at emit time (RFC file 6).
-    if containers.get("cluster") == "isolated":
+    # not provisionable yet, so an isolated declaration fails fast here
+    # rather than silently no-op'ing at emit time (RFC file 6).
+    #
+    # BOTH spellings of "this product owns a dedicated cluster" hit this.
+    # Only the explicit `containers.cluster: isolated` used to: the blanket
+    # `mode: isolated` says exactly the same thing and was waved through,
+    # resolving cluster to OWNED and reporting that ownership in the plan
+    # summary for a container v1 can never provision.
+    #
+    # The blanket half is gated on the contract actually binding a cluster.
+    # `mode: isolated` on a Snowflake/AWS/GCP contract is not a cluster
+    # declaration at all — the kind is vacuous there, and erroring would
+    # reject every isolated contract in existence.
+    cluster_declared = containers.get("cluster")
+    if cluster_declared == "isolated" or (cluster_declared is None and mode == "isolated" and binds_cluster):
+        spelling = (
+            "containers.cluster: isolated"
+            if cluster_declared == "isolated"
+            else "mode: isolated (which declares every container isolated, cluster included)"
+        )
         raise PackagingError(
             "cluster-isolated-unsupported",
-            f"{where}: containers.cluster: isolated is not supported in v1 — "
-            "dedicated-cluster provisioning is not yet available (use 'shared')",
+            f"{where}: {spelling} is not supported in v1 — "
+            "dedicated-cluster provisioning is not yet available "
+            "(use 'shared', or `containers: {cluster: shared}` to keep the rest isolated)",
         )
 
     decisions = {
@@ -327,19 +359,28 @@ def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
     for expose in exposes:
         binding = expose.get("binding") if isinstance(expose, Mapping) else None
         raw = binding.get("packaging") if isinstance(binding, Mapping) else None
-        per_expose_raw.append((expose, raw))
+        platform = binding.get("platform") if isinstance(binding, Mapping) else None
+        binds_cluster = str(platform or "").strip().lower() in _CLUSTER_PLATFORMS
+        per_expose_raw.append((expose, raw, binds_cluster))
 
-    if top_raw is None and all(raw is None for _, raw in per_expose_raw):
+    if top_raw is None and all(raw is None for _, raw, _c in per_expose_raw):
         return LEGACY
+
+    # The contract-level scope declares a cluster only if SOME exposure binds a
+    # cluster-backed platform; a contract with no such binding leaves the kind
+    # vacuous and the blanket `mode` says nothing about it.
+    contract_binds_cluster = any(binds for _e, _r, binds in per_expose_raw)
 
     top = _parse_block(top_raw, where="packaging") if top_raw is not None else None
     if top is not None:
-        contract_decisions, pool, manifest = _effective(top, base=None, where="packaging")
+        contract_decisions, pool, manifest = _effective(
+            top, base=None, where="packaging", binds_cluster=contract_binds_cluster
+        )
     else:
         contract_decisions, pool, manifest = dict(_LEGACY_DECISIONS), None, None
 
     exposures = []
-    for index, (expose, raw) in enumerate(per_expose_raw):
+    for index, (expose, raw, binds_cluster) in enumerate(per_expose_raw):
         expose_id = None
         if isinstance(expose, Mapping):
             candidate = expose.get("exposeId") or expose.get("id")
@@ -369,7 +410,9 @@ def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
             continue
         where = f"exposes[{index}].binding.packaging"
         block = _parse_block(raw, where=where)
-        decisions, epool, emanifest = _effective(block, base=top, where=where)
+        decisions, epool, emanifest = _effective(
+            block, base=top, where=where, binds_cluster=binds_cluster
+        )
         exposures.append(
             ExposurePackaging(
                 expose_id=expose_id,
