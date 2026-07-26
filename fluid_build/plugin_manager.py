@@ -155,9 +155,12 @@ def entry_point_distribution(ep: Any) -> Optional[str]:
     dist = getattr(ep, "dist", None)
     if dist is None:
         return None
-    name = getattr(dist, "name", None) or getattr(
-        getattr(dist, "metadata", None), "get", lambda _k: None
-    )("Name")
+    name = getattr(dist, "name", None)
+    if not name:
+        # ``Distribution.name`` is 3.10+; fall back to the METADATA header.
+        metadata = getattr(dist, "metadata", None)
+        get = getattr(metadata, "get", None)
+        name = get("Name") if callable(get) else None
     if not name:
         return None
     version = getattr(dist, "version", None)
