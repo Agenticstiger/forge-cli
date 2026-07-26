@@ -324,9 +324,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         # argparse's own invalid-choice code), preserving the strictness the
         # hardcoded `choices` list had; the check just consults the live
         # registry instead of a stale literal.
-        known_providers = _known_provider_names()
-        _validate_global_args(args, cli.logger, known_providers=known_providers)
+        #
+        # Discovery imports every provider module, so it runs ONLY when a
+        # provider was actually requested — `fluid <anything>` without
+        # `--provider` / `FLUID_PROVIDER` keeps its current startup cost
+        # (tests/perf/test_startup_budget.py).
         requested_provider = getattr(args, "provider", None)
+        known_providers = _known_provider_names() if requested_provider else []
+        _validate_global_args(args, cli.logger, known_providers=known_providers)
         if requested_provider and known_providers and requested_provider not in known_providers:
             return 2
 

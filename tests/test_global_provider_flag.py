@@ -129,3 +129,34 @@ class TestTheGlobalValueReachesTheSubcommand:
         """The reason apply re-registers --provider at all (cli/apply.py)."""
         args = parser.parse_args(["apply", "c.fluid.yaml", "--provider", "aws", "--yes"])
         assert getattr(args, "provider_config", None) is None
+
+
+class TestTheCheckStaysOffTheColdPath:
+    """Provider discovery imports every provider module — it must run only when
+    a provider was actually requested (tests/perf/test_startup_budget.py)."""
+
+    def _count_discovery(self, argv):
+        import fluid_build.providers as registry
+        from fluid_build.cli import main
+
+        calls = []
+        original = registry.discover_providers
+
+        def _counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        registry.discover_providers = _counting
+        try:
+            main(argv)
+        finally:
+            registry.discover_providers = original
+        return len(calls)
+
+    def test_no_discovery_without_a_provider(self, monkeypatch):
+        monkeypatch.delenv("FLUID_PROVIDER", raising=False)
+        assert self._count_discovery(["version", "--short"]) == 0
+
+    def test_discovery_runs_when_one_is_requested(self, monkeypatch):
+        monkeypatch.delenv("FLUID_PROVIDER", raising=False)
+        assert self._count_discovery(["--provider", "snowflake", "version", "--short"]) == 1
