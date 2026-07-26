@@ -12,14 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Central logging redaction for secret-like values."""
+"""Central logging redaction for secret-like values.
+
+Two layers, in this order:
+
+1. **Exact-value masking** (:func:`mask_known_secrets`) — every credential the
+   process actually *holds* is registered here and removed from a log line by
+   literal substring match. Delimiter-agnostic by construction: it cannot
+   truncate, because it never has to guess where the value ends.
+2. **Pattern masking** (:func:`redact_secret_text`'s regex chain) — the
+   secondary net for values we do NOT hold (a credential echoed by a
+   third-party library, a provider error body, an operator's pasted string).
+
+Layer 1 is the design borrowed from `misprint <https://pypi.org/project/misprint>`_,
+which masks by exact string as well as by pattern, and matches how Pydantic
+Logfire's scrubber treats known values. It exists because layer 2 alone is
+*structurally* unable to be correct: an assignment regex has to terminate the
+value somewhere, and every candidate terminator (``;`` ``,`` ``}`` ``]``
+space ``"`` ``&``) is a character a password may legally contain, so any
+choice tail-leaks some real secret. Widening the terminator set does not fix
+that — it only moves the leak and costs precision elsewhere. Registering the
+literal does fix it.
+
+Layer 2's terminator set is therefore deliberately left at the long-shipped
+one. Callers that hold a credential MUST register it (see
+:func:`register_secret` / :func:`register_secrets_from_environ`) rather than
+rely on the pattern layer.
+"""
 
 from __future__ import annotations
 
 import logging
+import os
 import re
+import threading
 import traceback
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 _REDACTED = "***REDACTED***"
@@ -143,23 +171,27 @@ _PEM_PRIVATE_KEY_RE = re.compile(
 # JSON pattern. The optional quote is a single bounded char, so it adds no
 # backtracking risk.
 #
-# VALUE TERMINATION (S-011). The value is matched in two mutually exclusive
-# branches because a quoted and an unquoted value end differently:
+# VALUE TERMINATION — deliberately UNCHANGED from the long-shipped form.
 #
-# * QUOTED — the closing quote ends it, so any character (``;`` ``,`` space)
-#   inside the quotes is part of the secret and gets masked.
-# * UNQUOTED — there is no closing delimiter, so the value runs to the end of
-#   the token. The terminator set is deliberately narrow: whitespace, ``"``
-#   and ``&`` ONLY. It previously also stopped at ``;`` ``,`` ``}`` ``]``,
-#   which LEAKED the tail of every secret containing one of them — and
-#   complexity policies make ``;`` / ``,`` common in real passwords
-#   (``password=Pa55;w0rd-x`` masked as ``***REDACTED***;w0rd-x``). ``"`` and
-#   ``&`` stay terminators because they are true structural delimiters that a
-#   value cannot contain unescaped: ``"`` closes a JSON string, and a URL
-#   query separates parameters with ``&`` (so a literal ``&`` inside the
-#   value would have to be percent-encoded). Whitespace stays a terminator
-#   because it is what keeps redaction precision-scoped — the surrounding log
-#   text ("... retrying", "for user svc") must survive.
+# This pattern cannot be made leak-free, and trying is how it got worse. It
+# must decide where an unquoted value ends, and every candidate terminator
+# (``;`` ``,`` ``}`` ``]`` whitespace ``"`` ``&``) is a character some real
+# password legally contains, so whichever set is chosen, some secret is masked
+# only up to the first one and its tail is emitted verbatim. A previous attempt
+# swapped ``;,}]`` for ``"&``: it fixed four inputs and broke others that this
+# form handles correctly — ``jdbc:snowflake://h/?password="p@ss"&user=x`` and
+# ``<conn password="p@ss"/>`` went from fully masked to emitting the password
+# verbatim, because a quoted branch that requires a specific character after
+# the closing quote falls through to an unquoted branch that can match ZERO
+# characters. Net: a strictly worse leak surface.
+#
+# The correct fix for a value we HOLD is :func:`mask_known_secrets`, which runs
+# first and matches the literal — no terminator to guess, no truncation
+# possible, and it covers every delimiter including whitespace (which this
+# pattern can never terminate on without destroying the surrounding log text).
+# This regex is the secondary net for values we do NOT hold; its residual
+# truncation on such values is a known, documented limit, not an oversight.
+# Pinned by ``tests/security/test_security_regressions_round3.py``.
 _ASSIGNMENT_RE = re.compile(
     r"(?ix)"
     r"(?P<key>\b(?:[A-Za-z0-9_]{,128}_)?(?:"
@@ -168,11 +200,9 @@ _ASSIGNMENT_RE = re.compile(
     r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token"
     r")\b)"
     r"(?P<sep>['\"]?\s{,8}[:=]\s{,8})"
-    r"(?:"
-    r"(?P<quote>['\"])(?P<qvalue>.{,256}?)(?P=quote)(?=(?:[\s,;}\])]|$))"
-    r"|"
-    r"(?P<value>[^\s\"&]{,256})"
-    r")"
+    r"(?P<quote>['\"]?)"
+    r"(?P<value>.{,256}?)(?P=quote)"
+    r"(?=(?:[\s,;}\]]|$))"
 )
 # ``sasl.jaas.config`` carries the SASL login secret inside the value, often in a
 # field the generic assignment regex does NOT recognize (OAuthBearer
@@ -206,23 +236,349 @@ _PRECEDING_SENSITIVE_KEY_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Layer 1 — exact-value masking of the credentials this process HOLDS
+# ---------------------------------------------------------------------------
+#
+# Borrowed from ``misprint`` (https://pypi.org/project/misprint), which masks
+# registered secrets by exact string in addition to by pattern. The insight:
+# at redaction time the credential's literal value is already in hand (it came
+# from an env var, a keyring adapter, or the contract), so there is nothing to
+# infer. Matching the literal is delimiter-agnostic — a value containing
+# ``;`` ``,`` ``}`` ``]`` ``"`` ``&`` or a space is masked whole — and it can
+# never truncate, which is exactly the failure mode the pattern layer cannot
+# escape.
+
+# Shorter values are refused. A 3-character secret registered globally would
+# match inside ordinary words and blanket-redact the log, destroying far more
+# signal than it protects (masking "dev" would eat every "development"). Eight
+# is Snowflake's own minimum password length; six leaves headroom for shorter
+# API tokens while still being longer than nearly every English word that
+# appears mid-identifier. A refused value is NOT silently dropped — see
+# ``_warn_once``: the operator is told the pattern layer is all that guards it.
+_MIN_REGISTERED_SECRET_LEN = 6
+# Bounded so a pathological caller (registering per-row values in a loop)
+# cannot grow the registry without limit and turn every log call into an
+# O(registry) scan. Hitting the cap is warned about, loudly and once.
+_MAX_REGISTERED_SECRETS = 1024
+
+# Words the PATTERN layer keys on. A secret that is a substring of one of them
+# must NOT be registered, because masking it rewrites the key name itself and
+# silently disables the pattern layer for that line — which then leaks a
+# DIFFERENT secret. Measured: with the literal ``phrase`` registered (a real
+# ``SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`` value), ``passphrase=letmein`` came out
+# as ``pass[REDACTED]=letmein`` — the key mangled and ``letmein`` emitted
+# verbatim, because ``passphrase`` no longer matched the assignment regex.
+# Refusing these is fail-safe: the pattern layer still masks ``key=<word>``,
+# and a credential this guessable is a credential to rotate, not to redact.
+_KEY_VOCABULARY = frozenset(
+    _SENSITIVE_KEY_PARTS
+    + (
+        "aws_secret_access_key",
+        "bearer",
+        "credentials",
+        "oauth-token",
+        "private-key",
+        "private_key_passphrase",
+        "sasl.jaas.config",
+        "secret-access-key",
+        "secret_access_key",
+        "session-token",
+        "-----begin private key-----",
+        "-----begin rsa private key-----",
+        # Both layers' placeholders, so a registered literal cannot chew up an
+        # already-redacted marker and make a redacted line look unredacted.
+        _REDACTED.lower(),
+        "[redacted]",
+    )
+)
+# RESIDUAL, documented rather than hidden: this guard covers a candidate that
+# is a substring OF a key name — the case that actually occurs (a weak,
+# dictionary-fragment credential). A candidate that *spans* a key name (e.g.
+# someone registering the whole string ``"password=abc"`` instead of ``abc``)
+# could still suppress the pattern layer for that one line. Registration is
+# fed only from credential-shaped sources — env values, resolved provider
+# config, contract values under a credential key — never from free text, so a
+# spanning candidate would mean the caller registered the wrong thing.
+# ``tests/security/test_security_regressions_round3.py`` pins both halves.
+
+_registry_lock = threading.Lock()
+_known_secret_set: set[str] = set()
+# Longest-first snapshot, rebound atomically under the lock so readers never
+# need to take it. Longest-first matters when one secret is a substring of
+# another: masking the shorter one first would leave the longer one's
+# remainder in the output.
+_known_secrets: tuple[str, ...] = ()
+_warned: set[str] = set()
+
+_registry_log = logging.getLogger("fluid.observability.redaction")
+
+
+def _warn_once(key: str, message: str, *args: Any) -> None:
+    """Emit ``message`` at WARNING the first time ``key`` is seen.
+
+    Registration failures must be visible — a credential that is not in the
+    registry is protected only by the pattern layer, and the operator is the
+    one who can fix that. Never include the value itself.
+    """
+    with _registry_lock:
+        if key in _warned:
+            return
+        _warned.add(key)
+    _registry_log.warning(message, *args)
+
+
+def _acceptable_secret(value: Any) -> str | None:
+    """Return ``value`` when it is safe to register as an exact-match secret."""
+    if not isinstance(value, str) or not value.strip():
+        # Empty / non-string: nothing to mask, and masking "" would replace
+        # every character boundary in every log line.
+        return None
+    if "{{" in value and "}}" in value:
+        # An unresolved ``{{ env.X }}`` placeholder is the *absence* of a
+        # credential. Registering it would mask the placeholder text that the
+        # IaC env-template guard deliberately leaves literal so operators can
+        # see which variable was refused.
+        return None
+    if len(value) < _MIN_REGISTERED_SECRET_LEN:
+        _warn_once(
+            "short-secret",
+            "A credential shorter than %d characters was not added to the exact-match "
+            "redaction registry (masking it would match inside ordinary words and "
+            "destroy the logs). It is covered only by the pattern layer, which can "
+            "truncate at a delimiter inside the value. Use a longer credential.",
+            _MIN_REGISTERED_SECRET_LEN,
+        )
+        return None
+    lowered = value.lower()
+    if any(lowered in word for word in _KEY_VOCABULARY):
+        _warn_once(
+            "vocabulary-collision",
+            "A credential that is a substring of a redaction key name (e.g. a "
+            "passphrase of 'phrase') was not added to the exact-match redaction "
+            "registry: masking it would rewrite the key name in every log line and "
+            "DISABLE the pattern layer there, leaking other values. It is covered "
+            "only by the pattern layer. Rotate to a credential that is not a "
+            "dictionary fragment.",
+        )
+        return None
+    return value
+
+
+def register_secret(value: Any) -> bool:
+    """Register one literal credential for exact-match redaction.
+
+    Call this wherever a credential is resolved — env var, keyring adapter,
+    contract literal — so every later log line, traceback and published
+    artifact has it removed by value rather than by pattern guesswork.
+
+    Returns ``True`` when the value was registered (or already present).
+    Registration is idempotent and process-wide; the registry is never
+    persisted or serialized.
+    """
+    secret = _acceptable_secret(value)
+    if secret is None:
+        return False
+    global _known_secrets
+    with _registry_lock:
+        if secret in _known_secret_set:
+            return True
+        if len(_known_secret_set) >= _MAX_REGISTERED_SECRETS:
+            full = True
+        else:
+            _known_secret_set.add(secret)
+            _known_secrets = tuple(sorted(_known_secret_set, key=lambda s: (-len(s), s)))
+            full = False
+    if full:
+        _warn_once(
+            "registry-full",
+            "The exact-match secret-redaction registry is full (%d entries); further "
+            "credentials are protected only by the pattern layer, which can truncate "
+            "at a delimiter inside the value. This means something is registering "
+            "secrets in a loop — fix the caller.",
+            _MAX_REGISTERED_SECRETS,
+        )
+        return False
+    return True
+
+
+def register_secrets(values: Iterable[Any]) -> int:
+    """Register several literals; returns how many were accepted."""
+    return sum(1 for value in values if register_secret(value))
+
+
+def collect_secret_values(payload: Any, *, max_depth: int = 12) -> tuple[str, ...]:
+    """Walk ``payload`` and return the string values held under sensitive keys.
+
+    Only a value whose OWN key is credential-shaped is collected — a container
+    under a sensitive key is recursed into normally rather than having all of
+    its leaves swept up, so ``credentials: {password: …, user: bob}`` yields
+    the password and not the username. Over-collecting would blanket-mask
+    ordinary identifiers everywhere they appear.
+
+    Used both to feed :func:`register_secret` and, for one-shot callers that do
+    not want a process-wide side effect, to build ``extra_secrets`` for a
+    single :func:`redact_secret_text` call.
+    """
+    found: list[str] = []
+    seen: set[int] = set()
+
+    def _walk(node: Any, depth: int, key_is_sensitive: bool) -> None:
+        if depth <= 0:
+            return
+        if isinstance(node, str):
+            if key_is_sensitive and _acceptable_secret(node) is not None:
+                found.append(node)
+            return
+        if isinstance(node, Mapping):
+            if id(node) in seen:
+                return
+            seen.add(id(node))
+            for key, item in node.items():
+                _walk(item, depth - 1, _is_sensitive_key(key))
+            return
+        if isinstance(node, (list, tuple, set, frozenset)):
+            if id(node) in seen:
+                return
+            seen.add(id(node))
+            for item in node:
+                _walk(item, depth - 1, key_is_sensitive)
+
+    _walk(payload, max_depth, False)
+    # De-duplicate, keep longest-first so a nested secret can't leave a tail.
+    return tuple(sorted(set(found), key=lambda s: (-len(s), s)))
+
+
+def register_secrets_from_payload(payload: Any, *, max_depth: int = 12) -> int:
+    """Register every credential-shaped literal found in ``payload``."""
+    return register_secrets(collect_secret_values(payload, max_depth=max_depth))
+
+
+# Env harvesting is governed by an ALLOWLIST of name suffixes, deliberately
+# NOT by ``_is_sensitive_key``. That predicate is a substring matcher tuned for
+# mapping keys inside a payload, where over-matching only costs a redundant
+# mask. Applied to the environment it over-collects badly, and every
+# over-collection registers a NON-secret literal that is then masked everywhere
+# it appears. Measured on a real shell during this fix:
+#
+#   SNOWFLAKE_AUTHENTICATOR=snowflake  -> "snowflake" registered; the live
+#       ``fluid apply`` then logged ``"provider": "***REDACTED***"``
+#   SSH_AUTH_SOCK=/private/tmp/.../s   -> a socket path registered
+#   CLAUDE_CODE_OAUTH_SCOPES=user:...  -> an OAuth scope list registered
+#   CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH=1 -> a boolean, warned about on every run
+#
+# A suffix allowlist keeps the coverage that matters (``*_PASSWORD``,
+# ``*_API_KEY``, ``*_TOKEN``, ``*_SECRET``) and excludes all four of the above.
+# Deliberately absent: ``*_CREDENTIALS`` (``GOOGLE_APPLICATION_CREDENTIALS`` is
+# a file path) and ``*_URL`` (a connection URL's password is already masked by
+# ``_URL_USERINFO_RE``, whose ``@`` terminator is required by RFC 3986 rather
+# than guessed, so it cannot truncate — and registering the whole URL would
+# additionally mask the host, which is safe and useful to log).
+_SECRET_ENV_SUFFIXES = (
+    "PASSWORD",
+    "PASSWD",
+    "PASSPHRASE",
+    # ``SECRET`` subsumes CLIENT_SECRET / *_SECRET; ``TOKEN`` subsumes
+    # AUTH_TOKEN / SESSION_TOKEN / SAS_TOKEN / OAUTH_TOKEN. Spelled short on
+    # purpose — a longer list is easier to get wrong than ``endswith``.
+    "SECRET",
+    "TOKEN",
+    "API_KEY",
+    "APIKEY",
+    "ACCESS_KEY",
+    "SECRET_KEY",
+    "PRIVATE_KEY",
+)
+
+
+def register_secrets_from_environ(environ: Mapping[str, str] | None = None) -> int:
+    """Register the values of credential-named environment variables.
+
+    This is where the process's own credentials come from in practice
+    (``SNOWFLAKE_PASSWORD``, ``*_API_KEY``, ``*_TOKEN``), and it is the case
+    the pattern layer handles worst: a password containing a ``;`` or a space
+    is truncated by any assignment regex, but is masked whole once its literal
+    is known. Called once at CLI logging setup.
+
+    Only names ending in :data:`_SECRET_ENV_SUFFIXES` are harvested — see the
+    note there for why a substring predicate is the wrong tool here.
+    """
+    env = os.environ if environ is None else environ
+    accepted = 0
+    for name, value in env.items():
+        if not name.upper().endswith(_SECRET_ENV_SUFFIXES):
+            continue
+        accepted += int(register_secret(value))
+    return accepted
+
+
+def forget_known_secrets() -> None:
+    """Drop every registered secret. For tests and long-lived-process teardown."""
+    global _known_secrets
+    with _registry_lock:
+        _known_secret_set.clear()
+        _known_secrets = ()
+        _warned.clear()
+
+
+def known_secret_count() -> int:
+    """How many literals the exact-match layer currently holds."""
+    return len(_known_secrets)
+
+
+def mask_known_secrets(
+    text: str,
+    *,
+    placeholder: str = _REDACTED,
+    extra: Iterable[str] = (),
+) -> str:
+    """Replace every registered (and ``extra``) literal secret in ``text``.
+
+    ``placeholder`` differs between the two layers (``***REDACTED***``
+    globally, ``[REDACTED]`` in the Snowflake twin), so it is a parameter —
+    the registry itself is shared, which is what keeps the layers from
+    drifting.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    candidates: tuple[str, ...] = _known_secrets
+    if extra:
+        accepted = [s for s in (_acceptable_secret(e) for e in extra) if s is not None]
+        if accepted:
+            candidates = tuple(sorted(set(candidates).union(accepted), key=lambda s: (-len(s), s)))
+    if not candidates:
+        return text
+    for secret in candidates:
+        if secret in text:
+            text = text.replace(secret, placeholder)
+    return text
+
+
 def _mask_assignment(match: "re.Match[str]") -> str:
     """Replace the value of a ``key=value`` assignment, keeping the key name.
 
-    ``quote`` is set only on the quoted branch of :data:`_ASSIGNMENT_RE`; the
-    unquoted branch leaves it ``None``. Re-emitting the quotes keeps the
+    ``quote`` is ``''`` for an unquoted value; re-emitting it keeps the
     surrounding structure (JSON / repr) intact.
     """
     quote = match.group("quote") or ""
     return f"{match.group('key')}{match.group('sep')}{quote}{_REDACTED}{quote}"
 
 
-def redact_secret_text(text: str) -> str:
-    """Redact secret-like substrings in plain text."""
+def redact_secret_text(text: str, *, extra_secrets: Iterable[str] = ()) -> str:
+    """Redact secret-like substrings in plain text.
+
+    ``extra_secrets`` are literals to mask for THIS call only — for callers
+    that hold a credential but must not register it process-wide (e.g. the
+    Snowflake IaC table COMMENT, which carries whatever one contract spelled
+    inline and should not affect redaction of anything else).
+    """
     if not isinstance(text, str) or not text:
         return text
 
-    redacted = _BEARER_RE.sub(r"\1" + _REDACTED, text)
+    # Layer 1 FIRST: remove the literals we hold before any pattern gets a
+    # chance to chew a value into a truncated fragment.
+    redacted = mask_known_secrets(text, extra=extra_secrets)
+    redacted = _BEARER_RE.sub(r"\1" + _REDACTED, redacted)
     # PEM blocks first: a multiline key block can itself contain ``.``/``=``
     # runs that would otherwise be partially mangled by the token regexes.
     redacted = _PEM_PRIVATE_KEY_RE.sub(_REDACTED, redacted)

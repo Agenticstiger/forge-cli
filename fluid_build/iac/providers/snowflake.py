@@ -39,7 +39,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import yaml
 
-from ...observability.secret_redactor import redact_secret_text
+from ...observability.secret_redactor import collect_secret_values, redact_secret_text
 from ...providers._iceberg_catalog import (
     EXTERNAL_ICEBERG_CATALOGS,
     STORAGE_PROVIDERS,
@@ -785,7 +785,14 @@ def _build_horizon_table_comment(contract: Mapping[str, Any], *, pool: Optional[
     # comment through the central redactor before it leaves — a contract that
     # spells a credential inline (``password: hunter2`` in a connection block)
     # must not publish it to the catalog.
-    return redact_secret_text("\n\n".join(sections))
+    #
+    # The contract's own credential literals are passed as ``extra_secrets``
+    # rather than being registered process-wide: we HOLD them (they are right
+    # there in the mapping), so they are masked by exact value and cannot be
+    # truncated at a ``;`` / ``"`` / space inside the password the way the
+    # pattern layer would. Scoping them to this call keeps one contract's
+    # inline strings from altering redaction anywhere else in the run.
+    return redact_secret_text("\n\n".join(sections), extra_secrets=collect_secret_values(contract))
 
 
 # Snowflake object types granted via ``on_account_object``; every other

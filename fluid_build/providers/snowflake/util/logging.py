@@ -25,7 +25,11 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
-from fluid_build.observability.secret_redactor import _URL_USERINFO_RE, is_sensitive_key_name
+from fluid_build.observability.secret_redactor import (
+    _URL_USERINFO_RE,
+    is_sensitive_key_name,
+    mask_known_secrets,
+)
 
 # Patterns for sensitive data that should be redacted
 #
@@ -78,7 +82,7 @@ SENSITIVE_PATTERNS = [
     # redacts only the value (``password=hunter2`` -> ``password=[REDACTED]``)
     # instead of whole-match-redacting and destroying the key name. Mirrors
     # the global ``SecretRedactingFilter`` assignment regex, including its
-    # value terminator set (stop at whitespace / ``"`` / ``&``).
+    # value terminator set (stop at whitespace / ``;`` / ``&`` / ``,``).
     # Quantifiers are upper-bounded to prevent catastrophic backtracking.
     re.compile(
         # Key alternation + optional env-var prefix mirror the global
@@ -101,13 +105,14 @@ SENSITIVE_PATTERNS = [
         r"))"
         r"(?P<sep>\s{,8}[:=]\s{,8})"
         # Value terminator set kept in lock-step with the global twin
-        # (observability/secret_redactor.py ``_ASSIGNMENT_RE``): whitespace,
-        # ``"`` and ``&`` only. ``;`` and ``,`` were terminators here too and
-        # LEAKED the tail of any secret containing one ("password=Pa55;w0rd-x"
-        # -> "password=[REDACTED];w0rd-x"); both are common in real passwords
-        # under complexity policies, and neither is a reliable delimiter in
-        # free text.
-        r"(?P<value>[^\s\"&]{,256})"
+        # (observability/secret_redactor.py ``_ASSIGNMENT_RE``) and
+        # deliberately UNCHANGED. No terminator set is leak-free — every
+        # candidate character is one a real password may contain — so a
+        # secret whose literal value is known must be masked by
+        # ``mask_known_secrets`` (run first, below), not by widening this.
+        # An earlier attempt to widen it here regressed quoted values
+        # followed by ``&`` or ``/`` into emitting the password verbatim.
+        r"(?P<value>[^\s;&,]{,256})"
     ),
     # AWS keys (for external stages)
     re.compile(r'"aws_key_id":\s*"[^"]*"', re.IGNORECASE),
@@ -241,6 +246,13 @@ def redact_string(text: str) -> str:
     """
     Redact sensitive information from a string.
 
+    Runs the SAME two layers as the global redactor, in the same order:
+    exact-value masking of the credentials this process holds
+    (``mask_known_secrets``, which shares one registry with the global layer so
+    the two cannot drift), then the pattern list below as the secondary net for
+    values we do not hold. Only the placeholder differs — this layer's
+    long-standing wire format is ``[REDACTED]``.
+
     Args:
         text: Input string that may contain sensitive data
 
@@ -250,7 +262,10 @@ def redact_string(text: str) -> str:
     if not isinstance(text, str):
         return text
 
-    redacted = text
+    # Layer 1 — literal match on known credentials. Delimiter-agnostic: a
+    # password containing ``;`` ``,`` ``}`` ``]`` ``"`` ``&`` or a space is
+    # masked whole, which no assignment pattern can guarantee.
+    redacted = mask_known_secrets(text, placeholder="[REDACTED]")
 
     for pattern in SENSITIVE_PATTERNS:
         # Three substitution shapes, dispatched on the pattern's groups:

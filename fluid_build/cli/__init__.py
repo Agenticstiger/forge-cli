@@ -33,7 +33,10 @@ from fluid_build.cli.forge_banner import compact_next_line
 # ``install_secret_redacting_filter`` is bound. ``secret_redactor`` itself
 # is a stdlib-only leaf (``logging``/``re``/``traceback``) and has no
 # transitive deps back into this package.
-from fluid_build.observability.secret_redactor import install_secret_redacting_filter
+from fluid_build.observability.secret_redactor import (
+    install_secret_redacting_filter,
+    register_secrets_from_environ,
+)
 
 from ._common import CLIError
 from ._errors import FluidUserError as _FluidUserError
@@ -605,6 +608,13 @@ def _setup_enhanced_logging(
             LOG.warning(f"Failed to setup file logging: {e}")
 
     install_secret_redacting_filter(root_logger)
+    # Hand the redactor the literal value of every credential-named env var, so
+    # it masks them by exact match instead of by pattern. This is the layer that
+    # makes a password containing ``;`` ``,`` ``}`` ``]`` ``"`` or a space
+    # redactable at all — an assignment pattern must guess where the value ends
+    # and truncates at the first such character, emitting the tail verbatim. The
+    # values never leave the process; the registry is in-memory only.
+    register_secrets_from_environ()
 
     # UX hardening — silence noisy third-party loggers by default.
     # ``httpx`` emits an INFO-level "HTTP Request: GET ... 200 OK" on
