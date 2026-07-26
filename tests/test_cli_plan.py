@@ -392,7 +392,12 @@ class TestProviderFlagGate(unittest.TestCase):
             "total_actions": 0,
             "contract": {"name": "Test", "version": "0.5.7"},
         }
-        args = _make_args(provider="snowflake", out="/tmp/plan_provider_ok.json")
+        # ``local`` rather than ``snowflake``: every provider is declared as an
+        # entry point, but the registry drops one whose module fails to import,
+        # and the optional cloud extras are absent on some CI legs. ``local``
+        # has no third-party dependency, so it is the provider that is always
+        # registered — which is what "a KNOWN provider still plans" needs.
+        args = _make_args(provider="local", out="/tmp/plan_provider_ok.json")
         self.assertEqual(run(args, LOG), 0)
 
     @patch("fluid_build.cli.plan.write_json_idempotent")
