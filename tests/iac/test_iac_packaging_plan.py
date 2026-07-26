@@ -32,6 +32,7 @@ from typing import Any, Dict, List
 
 import pytest
 
+from fluid_build.iac.packaging import CONTAINER_KINDS
 from fluid_build.iac.plan_packaging import (
     CONTAINER_CREATION_OPS,
     apply_packaging_to_plan,
@@ -466,3 +467,103 @@ class TestTheApplyPathFiltersToo:
         assert "_drop_referenced_container_actions(" in inspect.getsource(
             generate_iac.native_actions
         )
+
+
+class TestTheSummaryOnlyClaimsKindsThePlatformMaps:
+    """The renderer must not announce ownership of vacuous containers.
+
+    ``containers`` is total by design — the resolver folds a decision for all
+    six kinds because providers index it by their own. Rendering it verbatim
+    printed, for a Snowflake-only contract:
+
+        owned by this product:  bucket, cluster, database, dataset, schema,
+                                warehouse
+
+    Four of those six are containers Snowflake has no notion of, announced in
+    the one artifact an approver reads to decide what an apply will take
+    ownership of. Making the ownership summary visible (RFC file 8) turned an
+    invisible resolver quirk into a visible false claim.
+    """
+
+    SF = {
+        "fluidVersion": "0.7.6",
+        "id": "silver.misc.sf",
+        "packaging": {"mode": "isolated"},
+        "exposes": [
+            {
+                "exposeId": "t",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_table",
+                    "location": {"database": "D", "schema": "S", "table": "T"},
+                },
+            }
+        ],
+    }
+
+    def _lines(self, contract):
+        from fluid_build.cli.plan import _packaging_summary_lines
+
+        return "\n".join(_packaging_summary_lines({"packaging": build_packaging_summary(contract)}))
+
+    def test_the_summary_records_the_applicable_kinds(self):
+        summary = build_packaging_summary(self.SF)
+        assert summary["applicableContainers"] == ["database", "schema", "warehouse"]
+        # ``containers`` keeps its exact shape and values — additive only.
+        assert set(summary["containers"]) == set(CONTAINER_KINDS)
+        assert set(summary["containers"].values()) == {"owned"}
+
+    def test_a_snowflake_contract_no_longer_claims_a_bucket_or_a_cluster(self):
+        text = self._lines(self.SF)
+        assert "owned by this product:  database, schema, warehouse" in text
+        for vacuous in ("bucket", "cluster", "dataset"):
+            assert f"owned by this product:  {vacuous}" not in text
+        assert "not applicable here:" in text
+        assert "bucket, cluster, dataset" in text
+
+    def test_the_vacuous_kinds_are_named_not_silently_dropped(self):
+        """A declaration about a kind the platform lacks is answered."""
+        contract = {
+            **self.SF,
+            "packaging": {"mode": "isolated", "containers": {"cluster": "isolated"}},
+        }
+        text = self._lines(contract)
+        assert "not applicable here:" in text and "cluster" in text
+
+    def test_an_aws_contract_claims_bucket_and_database_only(self):
+        summary = build_packaging_summary(_contract(ISOLATED))
+        assert summary["applicableContainers"] == ["bucket", "database"]
+        text = self._lines(_contract(ISOLATED))
+        assert "owned by this product:  bucket, database" in text
+
+    def test_referenced_kinds_are_filtered_the_same_way(self):
+        text = self._lines(_contract(SHARED))
+        assert "referenced (not owned): bucket, database" in text
+        assert "(pool: acme-pool)" in text
+
+    def test_an_unknown_platform_hides_nothing(self):
+        """Fail-open: never narrow a claim on a platform we cannot classify."""
+        contract = {
+            "fluidVersion": "0.7.6",
+            "id": "x",
+            "packaging": {"mode": "isolated"},
+            "exposes": [{"exposeId": "t", "binding": {"platform": "databricks"}}],
+        }
+        assert build_packaging_summary(contract)["applicableContainers"] == sorted(CONTAINER_KINDS)
+        assert "not applicable here:" not in self._lines(contract)
+
+    def test_a_plan_from_an_older_build_renders_exactly_as_before(self):
+        """No ``applicableContainers`` key ⇒ report everything, as today."""
+        from fluid_build.cli.plan import _packaging_summary_lines
+
+        legacy_plan = {
+            "packaging": {
+                "pool": None,
+                "containers": {kind: "owned" for kind in CONTAINER_KINDS},
+            }
+        }
+        text = "\n".join(_packaging_summary_lines(legacy_plan))
+        assert (
+            "owned by this product:  bucket, cluster, database, dataset, schema, warehouse" in text
+        )
+        assert "not applicable here:" not in text

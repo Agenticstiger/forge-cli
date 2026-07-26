@@ -962,14 +962,32 @@ def _packaging_summary_lines(plan: Dict[str, Any]) -> List[str]:
 
     Empty list for a contract with no ``packaging`` block, so legacy output is
     unchanged.
+
+    Only kinds the contract's bound platforms actually map are reported as
+    owned or referenced (``packaging.applicableContainers``). ``containers``
+    is total — the resolver folds a decision for all six kinds because the
+    providers index it by their own — so rendering it verbatim told the
+    operator a Snowflake-only contract owned "bucket, cluster, database,
+    dataset, schema, warehouse". Four of those six were containers Snowflake
+    has no notion of, in the one artifact an approver reads to decide what
+    this apply will take ownership of. The rest are named on their own line
+    rather than dropped, so a declaration about a kind the platform does not
+    map is answered instead of silently swallowed.
     """
     packaging = plan.get("packaging")
     if not isinstance(packaging, dict):
         return []
 
     containers = packaging.get("containers") or {}
-    owned = sorted(k for k, v in containers.items() if v == "owned")
-    referenced = sorted(k for k, v in containers.items() if v == "referenced")
+    raw_applicable = packaging.get("applicableContainers")
+    # Absent (a plan written by an older build) ⇒ report everything, exactly
+    # as before. Narrowing is never applied on a guess.
+    applicable = (
+        set(raw_applicable) if isinstance(raw_applicable, (list, tuple)) else set(containers)
+    )
+    owned = sorted(k for k, v in containers.items() if v == "owned" and k in applicable)
+    referenced = sorted(k for k, v in containers.items() if v == "referenced" and k in applicable)
+    vacuous = sorted(k for k in containers if k not in applicable)
 
     lines = ["Packaging (effective container ownership):"]
     lines.append(f"  owned by this product:  {', '.join(owned) if owned else 'none'}")
@@ -978,6 +996,10 @@ def _packaging_summary_lines(plan: Dict[str, Any]) -> List[str]:
     if referenced and pool:
         referenced_text += f"  (pool: {pool})"
     lines.append(f"  referenced (not owned): {referenced_text}")
+    if vacuous:
+        lines.append(
+            f"  not applicable here:    {', '.join(vacuous)}  " "(no bound platform maps these)"
+        )
 
     dropped = packaging.get("droppedActions") or []
     if dropped:

@@ -47,8 +47,11 @@ from fluid_build.iac import assemble_tofu_document, get_iac_plugin, render_tofu_
 from fluid_build.iac.packaging import (
     CONTAINER_KINDS,
     LEGACY,
+    PLATFORM_CONTAINER_KINDS,
     ContainerDecision,
     PackagingError,
+    binds_cluster,
+    container_kinds_for_platforms,
     resolve_packaging,
 )
 
@@ -286,10 +289,14 @@ class TestResolvePackaging:
             ({"containers": {"bucket": "owned"}}, "invalid-container-mode"),
             ({"pool": ""}, "invalid-pool"),
             ({"poolManifest": 7}, "invalid-pool"),
-            (
-                {"mode": "isolated", "containers": {"cluster": "isolated"}},
-                "cluster-isolated-unsupported",
-            ),
+            # `cluster-isolated-unsupported` deliberately does NOT belong in
+            # this list. Every other case here is a malformed block, wrong on
+            # any contract. That one depends on the contract binding a cluster
+            # at all — pinning it against `exposes: []` was pinning finding
+            # #13 itself: the same declaration, spelled as `mode: isolated`,
+            # was accepted by this very resolver a few lines up. It is pinned
+            # on a Confluent contract, where it means something, by
+            # TestBothSpellingsOfADedicatedClusterAgree.
         ],
     )
     def test_typed_errors(self, block, kind):
@@ -326,10 +333,15 @@ class TestBothSpellingsOfADedicatedClusterAgree:
     time") applies identically to the blanket mode — and the Confluent plugin
     has no packaging awareness at all, so this resolver is the only check.
 
-    The blanket half is scoped to contracts that actually bind a cluster-backed
+    BOTH halves are scoped to contracts that actually bind a cluster-backed
     platform: ``mode: isolated`` on a Snowflake/AWS/GCP contract is not a
     cluster declaration, and erroring there would reject every isolated
-    contract in existence.
+    contract in existence. Scoping only the blanket half left the finding
+    alive with the sides swapped — on Snowflake the blanket spelling resolved
+    ``cluster`` to OWNED while the explicit one raised. The rejection is a
+    statement about Confluent/Kafka *provisioning*, so it lives where a
+    cluster is bound; where none is, the kind is vacuous and the plan's
+    ownership summary says so (``packaging.applicableContainers``).
     """
 
     def _contract(self, platform, packaging):
@@ -391,3 +403,74 @@ class TestBothSpellingsOfADedicatedClusterAgree:
         with pytest.raises(PackagingError) as excinfo:
             resolve_packaging(contract)
         assert excinfo.value.kind == "cluster-isolated-unsupported"
+
+    # -- the finding itself: same declaration, same outcome, every platform --
+
+    def _outcome(self, platform, packaging):
+        try:
+            return resolve_packaging(self._contract(platform, packaging)).decisions["cluster"].value
+        except PackagingError as exc:
+            return f"error:{exc.kind}"
+
+    @pytest.mark.parametrize("platform", ["snowflake", "aws", "gcp", "local", "confluent", "kafka"])
+    def test_both_spellings_agree(self, platform):
+        """Finding #13, stated directly.
+
+        ``{'mode': 'isolated'}`` and ``{'mode': 'isolated', 'containers':
+        {'cluster': 'isolated'}}`` are the same declaration — the second just
+        spells out what the first says about every kind. Before this, the two
+        disagreed on Snowflake/AWS/GCP/local: the blanket form resolved
+        ``cluster`` to OWNED and the explicit form raised.
+        """
+        blanket = self._outcome(platform, {"mode": "isolated"})
+        explicit = self._outcome(
+            platform, {"mode": "isolated", "containers": {"cluster": "isolated"}}
+        )
+        assert blanket == explicit, (
+            f"{platform}: `mode: isolated` -> {blanket!r} but "
+            f"`containers.cluster: isolated` -> {explicit!r}"
+        )
+
+    @pytest.mark.parametrize("platform", ["confluent", "kafka"])
+    def test_and_the_agreed_outcome_is_still_a_hard_error_where_it_matters(self, platform):
+        assert self._outcome(platform, {"mode": "isolated"}) == (
+            "error:cluster-isolated-unsupported"
+        )
+
+
+class TestTheGateAndTheReporterDisagreeOnlyOnUnknownPlatforms:
+    """Two questions, two defaults — and the difference is deliberate.
+
+    ``binds_cluster`` gates a *rejection*, so it fails CLOSED: an
+    unrecognised platform must not manufacture an error that rejects a
+    working contract. ``container_kinds_for_platforms`` narrows what a
+    reporter *claims*, so it fails OPEN: never hide a container the operator
+    might really own. They agree on every platform this build knows; they
+    diverge only where it does not know, and each diverges in its own safe
+    direction.
+    """
+
+    @pytest.mark.parametrize("platform", sorted(PLATFORM_CONTAINER_KINDS))
+    def test_they_agree_on_every_known_platform(self, platform):
+        assert binds_cluster([platform]) == ("cluster" in container_kinds_for_platforms([platform]))
+
+    @pytest.mark.parametrize("platform", ["local", "databricks", "", None])
+    def test_unknown_platforms_diverge_each_in_its_safe_direction(self, platform):
+        assert binds_cluster([platform]) is False  # no invented rejection
+        assert container_kinds_for_platforms([platform]) == frozenset(CONTAINER_KINDS)  # hide none
+
+    def test_a_contract_with_no_bindings_at_all(self):
+        assert binds_cluster([]) is False
+        assert container_kinds_for_platforms([]) == frozenset(CONTAINER_KINDS)
+
+    def test_a_mixed_contract_unions_the_kinds_and_sees_the_cluster(self):
+        assert container_kinds_for_platforms(["snowflake", "confluent"]) == frozenset(
+            {"database", "schema", "warehouse", "cluster"}
+        )
+        assert binds_cluster(["snowflake", "confluent"]) is True
+
+    def test_platform_matching_is_case_and_whitespace_insensitive(self):
+        assert binds_cluster([" Confluent "]) is True
+        assert container_kinds_for_platforms([" SnowFlake "]) == frozenset(
+            {"database", "schema", "warehouse"}
+        )

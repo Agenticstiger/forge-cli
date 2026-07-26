@@ -39,17 +39,20 @@ Design rules (all load-bearing, see the RFC):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Tuple
 
 __all__ = [
     "CONTAINER_KINDS",
+    "PLATFORM_CONTAINER_KINDS",
     "ContainerDecision",
     "ExposurePackaging",
     "LEGACY",
     "PackagingError",
     "PackagingResolution",
+    "binds_cluster",
+    "container_kinds_for_platforms",
     "resolve_packaging",
 ]
 
@@ -66,14 +69,82 @@ CONTAINER_KINDS: Tuple[str, ...] = (
     "cluster",
 )
 
+#: ``binding.platform`` → the container kinds that platform actually maps.
+#: The comment above :data:`CONTAINER_KINDS` as data — the RFC's
+#: §Container-kind ↔ platform mapping, read in the useful direction.
+#:
+#: A kind absent from a contract's bound platforms is **vacuous**: no emitter
+#: reads it, no resource is created or referenced for it, and a decision about
+#: it is unobservable. The resolver still folds a decision for every kind
+#: (providers index ``decisions`` by their own kinds, so the mapping must be
+#: total), but consumers that *report* ownership must filter by this table —
+#: otherwise a Snowflake-only contract is announced as owning a bucket, a
+#: dataset and a Kafka cluster it has no notion of.
+#:
+#: Pinned against ``iac/transition.py::CONTAINER_RESOURCE_TYPES`` and
+#: ``iac/plan_packaging.py::CONTAINER_CREATION_OPS`` by
+#: ``tests/iac/test_iac_packaging_platform_kinds.py`` so the three tables
+#: cannot drift. ``cluster`` appears in neither of those — no provider maps it
+#: yet, which is exactly why owning one is a v2 feature (RFC file 6).
+PLATFORM_CONTAINER_KINDS: Mapping[str, FrozenSet[str]] = {
+    "aws": frozenset({"bucket", "database"}),
+    "gcp": frozenset({"bucket", "dataset"}),
+    "snowflake": frozenset({"database", "schema", "warehouse"}),
+    "confluent": frozenset({"cluster"}),
+    "kafka": frozenset({"cluster"}),
+}
+
+_ALL_KINDS: FrozenSet[str] = frozenset(CONTAINER_KINDS)
+
 _MODES: Tuple[str, ...] = ("isolated", "shared")
 _BLOCK_KEYS = frozenset({"mode", "pool", "poolManifest", "containers"})
 
-# ``binding.platform`` values whose container is the ``cluster`` kind (RFC
-# §Container-kind ↔ platform mapping: cluster → Confluent environment/cluster).
-# Read only to decide whether a *blanket* ``mode: isolated`` amounts to
-# declaring a dedicated cluster — every other platform leaves the kind vacuous.
-_CLUSTER_PLATFORMS: frozenset = frozenset({"confluent", "kafka"})
+#: ``binding.platform`` values whose container is the ``cluster`` kind.
+#: Derived, not restated — a second hand-written list of the same fact is the
+#: hand-mirrored-table anti-pattern and would drift the moment a platform is
+#: added to :data:`PLATFORM_CONTAINER_KINDS`.
+_CLUSTER_PLATFORMS: FrozenSet[str] = frozenset(
+    platform for platform, kinds in PLATFORM_CONTAINER_KINDS.items() if "cluster" in kinds
+)
+
+
+def binds_cluster(platforms: Iterable[Any]) -> bool:
+    """Does some platform here *definitely* map the ``cluster`` kind?
+
+    Fails **closed** — an unrecognised platform, or none at all, answers
+    False. This gates a *rejection* (``cluster-isolated-unsupported``), and
+    a rejection invented from ignorance would reject every ``mode:
+    isolated`` contract whose bindings this build does not recognise.
+
+    Deliberately the opposite default from
+    :func:`container_kinds_for_platforms`, because the two answer opposite
+    questions: "may I reject this declaration?" (only on certainty) versus
+    "what may I claim this contract owns?" (never hide on uncertainty).
+    Pinned by ``TestTheGateAndTheReporterDisagreeOnlyOnUnknownPlatforms``.
+    """
+    return any(str(p or "").strip().lower() in _CLUSTER_PLATFORMS for p in platforms)
+
+
+def container_kinds_for_platforms(platforms: Iterable[Any]) -> FrozenSet[str]:
+    """The container kinds the given ``binding.platform`` values map.
+
+    Fails **open**: an unrecognised platform (a plugin this build does not
+    know, a typo, a contract with no bindings at all) contributes every
+    kind. Callers use this to *narrow* what they report, so the safe
+    direction is to claim less confidently — never to hide a container the
+    operator might really own.
+    """
+    normalised = [str(p or "").strip().lower() for p in platforms]
+    named = [p for p in normalised if p]
+    if not named:
+        return _ALL_KINDS
+    kinds: set = set()
+    for platform in named:
+        mapped = PLATFORM_CONTAINER_KINDS.get(platform)
+        if mapped is None:
+            return _ALL_KINDS
+        kinds |= mapped
+    return frozenset(kinds)
 
 
 class PackagingError(ValueError):
@@ -143,6 +214,15 @@ class PackagingResolution:
     per-exposure result after the ``binding.packaging`` override, in
     contract order. Every decisions mapping covers all six
     :data:`CONTAINER_KINDS`.
+
+    ``applicable_kinds`` is the subset of :data:`CONTAINER_KINDS` the
+    contract's bound ``binding.platform`` values actually map (see
+    :func:`container_kinds_for_platforms`). ``decisions`` stays total —
+    providers index it by their own kinds and must never see a hole — so
+    this is the companion a *reporter* needs: a decision about a kind the
+    platform does not map is unobservable, and announcing it as owned is a
+    false claim. Defaults to every kind, so a resolution built by hand (or
+    the :data:`LEGACY` sentinel) narrows nothing.
     """
 
     is_legacy: bool
@@ -150,6 +230,7 @@ class PackagingResolution:
     pool_manifest: Optional[str]
     decisions: Mapping[str, ContainerDecision]
     exposures: Tuple[ExposurePackaging, ...]
+    applicable_kinds: FrozenSet[str] = field(default_factory=lambda: _ALL_KINDS)
 
     def exposure_for(self, expose_id: str) -> Optional[ExposurePackaging]:
         """The resolved exposure with this id, or ``None``."""
@@ -268,7 +349,7 @@ def _effective(
     *,
     base: Optional[_Block],
     where: str,
-    binds_cluster: bool = False,
+    cluster_applicable: bool = True,
 ) -> Tuple[Dict[str, ContainerDecision], Optional[str], Optional[str]]:
     """Fold one scope: ``block`` over ``base`` → (decisions, pool, manifest).
 
@@ -277,9 +358,11 @@ def _effective(
     blanket ``mode``, whose default — when a block is present — is
     ``isolated`` (RFC: "default when block present: isolated").
 
-    ``binds_cluster`` is True when the scope actually targets a
-    cluster-backed platform (see :data:`_CLUSTER_PLATFORMS`). It gates the
-    blanket-mode half of the cluster check below.
+    ``cluster_applicable`` is ``"cluster" in
+    container_kinds_for_platforms(<this scope's platforms>)`` — the same
+    fail-open rule the reporters use, so the gate below and the plan's
+    ownership summary can never disagree about whether a contract has a
+    cluster. Defaults to True: an unknown scope keeps the check.
     """
     mode = block.mode or (base.mode if base else None) or "isolated"
     pool = block.pool or (base.pool if base else None)
@@ -291,19 +374,28 @@ def _effective(
     # not provisionable yet, so an isolated declaration fails fast here
     # rather than silently no-op'ing at emit time (RFC file 6).
     #
-    # BOTH spellings of "this product owns a dedicated cluster" hit this.
-    # Only the explicit `containers.cluster: isolated` used to: the blanket
-    # `mode: isolated` says exactly the same thing and was waved through,
-    # resolving cluster to OWNED and reporting that ownership in the plan
-    # summary for a container v1 can never provision.
+    # BOTH spellings of "this product owns a dedicated cluster" hit this, and
+    # BOTH are gated on the same condition: the scope has a cluster to speak
+    # about. Anything else is the filed inconsistency — `{'mode': 'isolated'}`
+    # resolved cluster to OWNED and was accepted while
+    # `{'mode':'isolated','containers':{'cluster':'isolated'}}` raised, the
+    # same declaration with opposite outcomes. Gating only the blanket
+    # spelling moved the inconsistency from Confluent to Snowflake/AWS/GCP
+    # instead of removing it.
     #
-    # The blanket half is gated on the contract actually binding a cluster.
-    # `mode: isolated` on a Snowflake/AWS/GCP contract is not a cluster
-    # declaration at all — the kind is vacuous there, and erroring would
-    # reject every isolated contract in existence.
+    # The gate belongs on the platform because the rejection is a statement
+    # about Confluent/Kafka *provisioning*. Where no cluster is bound there is
+    # no cluster to own or share: the kind is vacuous, exactly as `bucket` is
+    # vacuous on a Snowflake contract, and erroring unconditionally would
+    # reject every `mode: isolated` contract in existence. Vacuous is not
+    # silent — the plan's ownership summary reports which kinds the bound
+    # platforms map (`packaging.applicableContainers`), so a cluster
+    # declaration on a Snowflake contract is answered, not swallowed. And the
+    # rule fails OPEN: a platform this build does not recognise, or a scope
+    # with no binding at all, keeps the check exactly as it was.
     cluster_declared = containers.get("cluster")
-    if cluster_declared == "isolated" or (
-        cluster_declared is None and mode == "isolated" and binds_cluster
+    if cluster_applicable and (
+        cluster_declared == "isolated" or (cluster_declared is None and mode == "isolated")
     ):
         spelling = (
             "containers.cluster: isolated"
@@ -358,31 +450,36 @@ def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
     if not isinstance(exposes, (list, tuple)):
         exposes = []
     per_expose_raw = []
+    platforms = []
     for expose in exposes:
         binding = expose.get("binding") if isinstance(expose, Mapping) else None
         raw = binding.get("packaging") if isinstance(binding, Mapping) else None
         platform = binding.get("platform") if isinstance(binding, Mapping) else None
-        binds_cluster = str(platform or "").strip().lower() in _CLUSTER_PLATFORMS
-        per_expose_raw.append((expose, raw, binds_cluster))
+        platforms.append(platform)
+        per_expose_raw.append((expose, raw, binds_cluster([platform])))
 
     if top_raw is None and all(raw is None for _, raw, _c in per_expose_raw):
         return LEGACY
 
-    # The contract-level scope declares a cluster only if SOME exposure binds a
-    # cluster-backed platform; a contract with no such binding leaves the kind
-    # vacuous and the blanket `mode` says nothing about it.
-    contract_binds_cluster = any(binds for _e, _r, binds in per_expose_raw)
+    # What the contract's bound platforms map — for every *reporter*, so a
+    # Snowflake-only plan stops announcing ownership of a bucket, a dataset
+    # and a Kafka cluster. Fails open (see the helper).
+    applicable_kinds = container_kinds_for_platforms(platforms)
+    # Whether the contract-level scope has a cluster to speak about — for the
+    # *gate*. Fails closed (see the helper); the two defaults differ on
+    # purpose and the difference is pinned by a test.
+    contract_binds_cluster = binds_cluster(platforms)
 
     top = _parse_block(top_raw, where="packaging") if top_raw is not None else None
     if top is not None:
         contract_decisions, pool, manifest = _effective(
-            top, base=None, where="packaging", binds_cluster=contract_binds_cluster
+            top, base=None, where="packaging", cluster_applicable=contract_binds_cluster
         )
     else:
         contract_decisions, pool, manifest = dict(_LEGACY_DECISIONS), None, None
 
     exposures = []
-    for index, (expose, raw, binds_cluster) in enumerate(per_expose_raw):
+    for index, (expose, raw, expose_cluster) in enumerate(per_expose_raw):
         expose_id = None
         if isinstance(expose, Mapping):
             candidate = expose.get("exposeId") or expose.get("id")
@@ -413,7 +510,7 @@ def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
         where = f"exposes[{index}].binding.packaging"
         block = _parse_block(raw, where=where)
         decisions, epool, emanifest = _effective(
-            block, base=top, where=where, binds_cluster=binds_cluster
+            block, base=top, where=where, cluster_applicable=expose_cluster
         )
         exposures.append(
             ExposurePackaging(
@@ -431,4 +528,5 @@ def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
         pool_manifest=manifest,
         decisions=contract_decisions,
         exposures=tuple(exposures),
+        applicable_kinds=applicable_kinds,
     )
