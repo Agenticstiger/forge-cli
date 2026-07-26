@@ -283,11 +283,21 @@ def test_malformed_expose_contract_does_not_crash(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _expose(expose_id: str, cursor_col: str | None, cursor_type: str = "timestamp"):
+    """An upstream expose that declares (or omits) the cursor column."""
+    expose: Dict[str, Any] = {"exposeId": expose_id, "qos": {"freshnessSLO": "PT6H"}}
+    schema = [{"name": "id", "type": "integer"}]
+    if cursor_col:
+        schema.append({"name": cursor_col, "type": cursor_type})
+    expose["contract"] = {"schema": schema}
+    return expose
+
+
 def test_loaded_at_field_from_builds_source_cursor(tmp_path: Path) -> None:
     """Schema-canonical shape: builds[].properties.source.cursor_field."""
     _write_upstream(
         tmp_path,
-        exposes=[{"exposeId": "orders", "qos": {"freshnessSLO": "PT6H"}}],
+        exposes=[_expose("orders", "updated_at")],
         builds=[
             {
                 "role": "acquisition",
@@ -304,11 +314,82 @@ def test_loaded_at_field_from_acquisition_sources(tmp_path: Path) -> None:
     """Card shape: acquisition.sources[].cursor_field."""
     _write_upstream(
         tmp_path,
-        exposes=[{"exposeId": "orders", "qos": {"freshnessSLO": "PT6H"}}],
+        exposes=[_expose("orders", "SystemModstamp")],
         acquisition={"sources": [{"cursor_field": "SystemModstamp"}]},
     )
     table = _first_table(generate_sources(_consumer(), workspace_root=tmp_path))
     assert table["loaded_at_field"] == "SystemModstamp"
+
+
+# ---------------------------------------------------------------------------
+# The cursor is PER-EXPOSE, not per-product (regression)
+#
+# ``_cursor_field_from_upstream`` scans the whole upstream contract and returns
+# the first cursor it finds; that one column was then stamped onto EVERY table
+# resolved from that product. Live symptom on Snowflake:
+#   Database Error in source customers_raw: invalid identifier 'ORDER_DATE'
+#   Database Error in source orders_raw: Expected a timestamp value when
+#     querying field 'last_modified' ... received value of type 'date'
+# Both sources errored, so `dbt source freshness` produced zero results.
+# ---------------------------------------------------------------------------
+
+
+def _two_expose_consumer() -> Dict[str, Any]:
+    consumer = _consumer()
+    consumer["consumes"] = [
+        {"exposeId": "orders", "productId": "up_orders"},
+        {"exposeId": "customers", "productId": "up_orders"},
+    ]
+    return consumer
+
+
+def test_cursor_is_not_stamped_onto_a_sibling_expose_without_it(tmp_path: Path) -> None:
+    _write_upstream(
+        tmp_path,
+        exposes=[_expose("orders", "loaded_at"), _expose("customers", None)],
+        builds=[{"role": "acquisition", "properties": {"source": {"cursor_field": "loaded_at"}}}],
+    )
+    content = generate_sources(_two_expose_consumer(), workspace_root=tmp_path)
+    assert _first_table(content, "orders")["loaded_at_field"] == "loaded_at"
+    customers = _first_table(content, "customers")
+    assert "loaded_at_field" not in customers
+    # Snowflake reads freshness from metadata, so the promise still ships.
+    assert "freshness" in customers
+
+
+def test_non_timestamp_cursor_is_omitted(tmp_path: Path) -> None:
+    """dbt: "Expected a timestamp value ... received value of type 'date'"."""
+    _write_upstream(
+        tmp_path,
+        exposes=[_expose("orders", "order_date", cursor_type="date")],
+        builds=[{"role": "acquisition", "properties": {"source": {"cursor_field": "order_date"}}}],
+    )
+    table = _first_table(generate_sources(_consumer(), workspace_root=tmp_path))
+    assert "loaded_at_field" not in table
+    assert "freshness" in table
+
+
+def test_parameterized_timestamp_cursor_is_kept(tmp_path: Path) -> None:
+    _write_upstream(
+        tmp_path,
+        exposes=[_expose("orders", "loaded_at", cursor_type="timestamp_ntz(9)")],
+        builds=[{"role": "acquisition", "properties": {"source": {"cursor_field": "loaded_at"}}}],
+    )
+    table = _first_table(generate_sources(_consumer(), workspace_root=tmp_path))
+    assert table["loaded_at_field"] == "loaded_at"
+
+
+def test_unverifiable_cursor_is_dropped_on_a_metadata_capable_adapter(tmp_path: Path) -> None:
+    """No declared schema → nothing to check. Snowflake can answer from
+    metadata, so the unverifiable cursor is not worth the risk."""
+    _write_upstream(
+        tmp_path,
+        exposes=[{"exposeId": "orders", "qos": {"freshnessSLO": "PT6H"}}],
+        builds=[{"role": "acquisition", "properties": {"source": {"cursor_field": "loaded_at"}}}],
+    )
+    table = _first_table(generate_sources(_consumer(), workspace_root=tmp_path))
+    assert "loaded_at_field" not in table
+    assert "freshness" in table
 
 
 # ---------------------------------------------------------------------------

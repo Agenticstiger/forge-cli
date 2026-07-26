@@ -275,7 +275,11 @@ def output_rich(
         grade = "FAIR"
     elif score >= 50:
         score_emoji = "🔶"
-        score_color = "orange"
+        # rich has no bare ``orange`` colour — passing it to Panel(border_style=)
+        # raises MissingStyle and takes the whole report down. 50-69 is exactly
+        # where a freshly imported dbt contract lands, so this crashed on the
+        # "Next:" step the importer recommends.
+        score_color = "dark_orange"
         grade = "NEEDS WORK"
     else:
         score_emoji = "🚨"
