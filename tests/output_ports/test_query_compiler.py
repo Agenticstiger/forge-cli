@@ -63,11 +63,16 @@ def test_semantic_query_with_metric_and_dimension():
         limit=10,
         table_reference="customer_profiles",
     )
-    assert "COUNT(DISTINCT customer_id) AS customer_count" in compiled.sql
+    # Aliased to the METRIC name (``active_customers``), not the measure
+    # it wraps, so a transcript / cached result set is self-describing.
+    assert "COUNT(DISTINCT customer_id) AS active_customers" in compiled.sql
     assert "GROUP BY signup_date" in compiled.sql
+    # A grouped result gets a deterministic top-N order; without it the
+    # LIMIT clipped an arbitrary, non-reproducible slice of the groups.
+    assert "ORDER BY active_customers DESC, signup_date ASC" in compiled.sql
     assert "LIMIT 10" in compiled.sql
     assert compiled.params == []
-    assert compiled.columns == ["signup_date", "customer_count"]
+    assert compiled.columns == ["signup_date", "active_customers"]
 
 
 def test_semantic_query_with_filter_uses_parameter_binding():
@@ -523,7 +528,7 @@ def test_metric_filter_is_applied_as_where_predicate():
         table_reference="orders",
     )
     assert "WHERE (status = 'completed')" in compiled.sql
-    assert "SUM(amount) AS revenue" in compiled.sql
+    assert "SUM(amount) AS completed_revenue" in compiled.sql
 
 
 def test_metric_filter_composes_with_dimension_filters_and_binding():
@@ -736,6 +741,54 @@ def _expose_with_grain(granularity="day", dim_type="time", column_type="TIMESTAM
     )
 
 
+# Column-level policy on the GOVERNED semantic path
+#
+# ``project()`` drops restricted columns / redacts PII by matching the
+# OUTPUT column name — which the semantic layer aliases away. These pin
+# the compile-time enforcement that closes the alias bypass.
+# ---------------------------------------------------------------------
+
+
+def _expose_with_governed_columns():
+    """An expose whose semantics reach a DENIED column (account_balance)
+    and a PII column (email) through names that don't look like either."""
+    return make_expose(
+        columns=[
+            {"name": "customer_id", "type": "STRING"},
+            {"name": "email", "type": "STRING", "sensitivity": "pii"},
+            {"name": "account_balance", "type": "FLOAT64"},
+            {"name": "signup_date", "type": "DATE"},
+        ],
+        column_restrictions=[
+            {"principal": "*", "columns": ["account_balance"], "access": "deny"},
+        ],
+        semantics={
+            "name": "customer_profiles",
+            "measures": [
+                {"name": "customer_count", "agg": "count_distinct", "expr": "customer_id"},
+                {"name": "avg_balance", "agg": "avg", "expr": "account_balance"},
+                {"name": "max_email", "agg": "max", "expr": "email"},
+                {"name": "email_count", "agg": "count_distinct", "expr": "email"},
+            ],
+            "dimensions": [
+                {"name": "signup_date", "type": "time"},
+                {"name": "contact", "type": "categorical", "expr": "email"},
+                {"name": "balance_band", "type": "categorical", "expr": "account_balance"},
+            ],
+            "metrics": [
+                {"name": "active_customers", "type": "simple", "measure": "customer_count"},
+                {"name": "mean_balance", "type": "simple", "measure": "avg_balance"},
+                {
+                    "name": "rich_customers",
+                    "type": "simple",
+                    "measure": "customer_count",
+                    "filter": "account_balance > 1000",
+                },
+            ],
+        },
+    )
+
+
 def _grain_sql(**kwargs):
     dialect = kwargs.pop("dialect", "snowflake")
     return compile_semantic_query(
@@ -804,3 +857,345 @@ def test_bigquery_fails_closed_when_the_column_type_is_unknowable():
     engine rejects. Same fail-closed posture as percentile on BigQuery."""
     with pytest.raises(QueryValidationError, match="BigQuery's truncation function"):
         _grain_sql(dialect="bigquery", column_type="STRING")
+
+
+_RESTRICTED = ("account_balance",)
+_REDACTED = ("email",)
+
+
+def test_measure_over_restricted_column_is_rejected():
+    """A measure whose ``expr`` reads a denied column served that
+    column's statistics under an alias the name-matching drop never saw."""
+    with pytest.raises(QueryValidationError, match="account_balance"):
+        compile_semantic_query(
+            expose=_expose_with_governed_columns(),
+            measure="avg_balance",
+            limit=10,
+            table_reference="customer_profiles",
+            restricted_columns=_RESTRICTED,
+        )
+
+
+def test_metric_over_restricted_measure_is_rejected():
+    with pytest.raises(QueryValidationError, match="account_balance"):
+        compile_semantic_query(
+            expose=_expose_with_governed_columns(),
+            metric="mean_balance",
+            limit=10,
+            table_reference="customer_profiles",
+            restricted_columns=_RESTRICTED,
+        )
+
+
+def test_dimension_over_restricted_column_is_rejected():
+    with pytest.raises(QueryValidationError, match="account_balance"):
+        compile_semantic_query(
+            expose=_expose_with_governed_columns(),
+            metric="active_customers",
+            dimensions=["balance_band"],
+            limit=10,
+            table_reference="customer_profiles",
+            restricted_columns=_RESTRICTED,
+        )
+
+
+def test_filter_on_restricted_column_is_rejected():
+    """An equality filter on a denied column is an inference oracle even
+    though the column never appears in the projection."""
+    with pytest.raises(QueryValidationError, match="account_balance"):
+        compile_semantic_query(
+            expose=_expose_with_governed_columns(),
+            metric="active_customers",
+            filters={"account_balance": 9999.99},
+            limit=10,
+            table_reference="customer_profiles",
+            restricted_columns=_RESTRICTED,
+        )
+
+
+def test_metric_filter_over_restricted_column_is_rejected():
+    """The contract's own ``metrics[].filter`` lands in the WHERE too."""
+    with pytest.raises(QueryValidationError, match="account_balance"):
+        compile_semantic_query(
+            expose=_expose_with_governed_columns(),
+            metric="rich_customers",
+            limit=10,
+            table_reference="customer_profiles",
+            restricted_columns=_RESTRICTED,
+        )
+
+
+def test_unrestricted_query_is_unaffected_by_the_deny_scan():
+    compiled = compile_semantic_query(
+        expose=_expose_with_governed_columns(),
+        metric="active_customers",
+        dimensions=["signup_date"],
+        limit=10,
+        table_reference="customer_profiles",
+        restricted_columns=_RESTRICTED,
+        redacted_columns=_REDACTED,
+    )
+    assert compiled.columns == ["signup_date", "active_customers"]
+    assert compiled.redacted_columns == ()
+
+
+def test_pii_dimension_is_redacted_under_any_alias():
+    """Redaction keys off the source EXPRESSION: a dimension named
+    differently from its PII column used to return raw values."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_governed_columns(),
+        metric="active_customers",
+        dimensions=["contact"],
+        limit=10,
+        table_reference="customer_profiles",
+        restricted_columns=_RESTRICTED,
+        redacted_columns=_REDACTED,
+    )
+    assert "email AS contact" in compiled.sql
+    assert compiled.redacted_columns == ("contact",)
+
+
+def test_value_revealing_aggregate_over_pii_is_redacted():
+    """MAX(email) returns an actual address; COUNT(DISTINCT email) does
+    not. Only the former is redacted — aggregate analysis over a PII
+    column stays legitimate, which is the whole point of the
+    visible-but-redacted layer."""
+    revealing = compile_semantic_query(
+        expose=_expose_with_governed_columns(),
+        measure="max_email",
+        limit=10,
+        table_reference="customer_profiles",
+        redacted_columns=_REDACTED,
+    )
+    assert revealing.redacted_columns == ("max_email",)
+    summarising = compile_semantic_query(
+        expose=_expose_with_governed_columns(),
+        measure="email_count",
+        limit=10,
+        table_reference="customer_profiles",
+        redacted_columns=_REDACTED,
+    )
+    assert summarising.redacted_columns == ()
+
+
+def test_deny_scan_ignores_string_literals():
+    """``WHERE label = 'account_balance'`` must not trip the identifier
+    scan — same rule the free-form path already applies."""
+    expose = _expose_with_governed_columns()
+    expose["semantics"]["metrics"].append(
+        {
+            "name": "labelled",
+            "type": "simple",
+            "measure": "customer_count",
+            "filter": "signup_date = 'account_balance'",
+        }
+    )
+    compiled = compile_semantic_query(
+        expose=expose,
+        metric="labelled",
+        limit=10,
+        table_reference="customer_profiles",
+        restricted_columns=_RESTRICTED,
+    )
+    assert "signup_date = 'account_balance'" in compiled.sql
+
+
+# ---------------------------------------------------------------------
+# Honest truncation + deterministic ordering on a grouped query
+# ---------------------------------------------------------------------
+
+
+def test_grouped_query_carries_a_row_cap_and_deterministic_order():
+    compiled = compile_semantic_query(
+        expose=_expose_with_semantics(),
+        metric="active_customers",
+        dimensions=["signup_date"],
+        limit=50,
+        table_reference="customer_profiles",
+    )
+    assert compiled.row_cap == 50
+    assert "ORDER BY active_customers DESC, signup_date ASC" in compiled.sql
+
+
+def test_ungrouped_aggregate_has_no_row_cap():
+    """A bare aggregate is exactly one row whatever the LIMIT says, so it
+    must never be reported as truncatable."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_semantics(),
+        measure="total_ltv_usd",
+        limit=1,
+        table_reference="customer_profiles",
+    )
+    assert compiled.row_cap is None
+    assert "ORDER BY" not in compiled.sql
+
+
+def test_free_form_sql_row_cap_tracks_the_effective_limit():
+    appended = compile_free_form_sql(
+        sql="SELECT customer_id FROM customer_profiles",
+        table_reference="customer_profiles",
+        limit=25,
+    )
+    assert appended.row_cap == 25
+    caller_owned = compile_free_form_sql(
+        sql="SELECT customer_id FROM customer_profiles LIMIT 7",
+        table_reference="customer_profiles",
+        limit=25,
+    )
+    assert caller_owned.row_cap == 7
+
+
+def test_two_metrics_over_one_measure_project_distinct_columns():
+    expose = _expose_with_filtered_metric("status = 'completed'")
+    expose["semantics"]["metrics"].append(
+        {"name": "total_revenue", "type": "simple", "measure": "revenue"}
+    )
+    completed = compile_semantic_query(
+        expose=expose, metric="completed_revenue", limit=10, table_reference="orders"
+    )
+    total = compile_semantic_query(
+        expose=expose, metric="total_revenue", limit=10, table_reference="orders"
+    )
+    assert completed.columns == ["completed_revenue"]
+    assert total.columns == ["total_revenue"]
+
+
+# ---------------------------------------------------------------------
+# Projection-alias uniqueness
+#
+# Aliasing the aggregate to the METRIC name made two metrics over one
+# measure distinguishable, but it can collide with a dimension name:
+# metric / measure / dimension share ONE namespace in every mainstream
+# semantic layer (dbt MetricFlow, Cube), and a duplicate output name
+# both breaks ``ORDER BY <alias>`` and collapses in the drivers'
+# ``dict(zip(columns, values))`` row keying.
+# ---------------------------------------------------------------------
+
+
+def _expose_with_colliding_names():
+    """``order_status`` is BOTH a dimension and a metric; ``priority`` is
+    both a dimension and a measure."""
+    return make_expose(
+        columns=[
+            {"name": "order_id", "type": "STRING"},
+            {"name": "order_status", "type": "STRING"},
+            {"name": "order_priority", "type": "STRING"},
+            {"name": "amount", "type": "FLOAT64"},
+        ],
+        semantics={
+            "name": "orders",
+            "measures": [
+                {"name": "revenue", "agg": "sum", "expr": "amount"},
+                {"name": "priority", "agg": "sum", "expr": "amount"},
+            ],
+            "dimensions": [
+                {"name": "order_status", "type": "categorical"},
+                {"name": "priority", "type": "categorical", "expr": "order_priority"},
+                # Folds onto ``order_status`` but projects a DIFFERENT column.
+                {"name": "Order_Status", "type": "categorical", "expr": "order_priority"},
+            ],
+            "metrics": [
+                {"name": "order_status", "type": "simple", "measure": "revenue"},
+                {"name": "total_revenue", "type": "simple", "measure": "revenue"},
+                {"name": "Order_Status", "type": "simple", "measure": "revenue"},
+                # Name AND measure name both collide with dimension ``priority``.
+                {"name": "priority", "type": "simple", "measure": "priority"},
+            ],
+        },
+    )
+
+
+def test_metric_named_like_a_dimension_falls_back_to_the_measure_name():
+    """The pre-aliasing behaviour for exactly this shape: the aggregate
+    column is named after the MEASURE, and the query still runs."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_colliding_names(),
+        metric="order_status",
+        dimensions=["order_status"],
+        limit=10,
+        table_reference="orders",
+    )
+    assert compiled.columns == ["order_status", "revenue"]
+    assert "SUM(amount) AS revenue" in compiled.sql
+    assert "ORDER BY revenue DESC, order_status ASC" in compiled.sql
+
+
+def test_metric_alias_collision_is_case_insensitive():
+    """Engines fold unquoted identifiers, so ``Order_Status`` and
+    ``order_status`` are ONE output column name — the fallback has to
+    trigger on the folded comparison or the SQL is still ambiguous."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_colliding_names(),
+        metric="Order_Status",
+        dimensions=["order_status"],
+        limit=10,
+        table_reference="orders",
+    )
+    assert compiled.columns == ["order_status", "revenue"]
+
+
+def test_metric_and_measure_both_colliding_is_rejected_loudly():
+    """No distinct name left. Rejecting names the problem; the released
+    behaviour silently dropped one of the two values from every row."""
+    with pytest.raises(QueryValidationError, match="collides too"):
+        compile_semantic_query(
+            expose=_expose_with_colliding_names(),
+            metric="priority",
+            dimensions=["priority"],
+            limit=10,
+            table_reference="orders",
+        )
+
+
+def test_bare_measure_named_like_a_requested_dimension_is_rejected():
+    with pytest.raises(QueryValidationError, match="collides"):
+        compile_semantic_query(
+            expose=_expose_with_colliding_names(),
+            measure="priority",
+            dimensions=["priority"],
+            limit=10,
+            table_reference="orders",
+        )
+
+
+def test_metric_name_survives_when_no_dimension_collides():
+    """The collision guard must not disturb the ordinary case — the
+    metric name is still what the aggregate column is called."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_colliding_names(),
+        metric="total_revenue",
+        dimensions=["order_status"],
+        limit=10,
+        table_reference="orders",
+    )
+    assert compiled.columns == ["order_status", "total_revenue"]
+
+
+def test_repeated_dimension_projects_once():
+    """Asking for the same dimension twice is idempotent, not two
+    identically-named columns (which collapse in the row dict and make
+    ``ORDER BY <alias>`` ambiguous)."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_colliding_names(),
+        metric="total_revenue",
+        dimensions=["order_status", "order_status"],
+        limit=10,
+        table_reference="orders",
+    )
+    assert compiled.columns == ["order_status", "total_revenue"]
+    assert compiled.sql.count("AS order_status") == 1
+    assert "GROUP BY order_status\n" in compiled.sql
+
+
+def test_two_dimensions_with_one_output_name_are_rejected():
+    """``Order_Status`` (expr ``order_status``) and ``order_status`` fold
+    to one column name but carry different expressions, so one value
+    would be silently dropped from every row."""
+    with pytest.raises(QueryValidationError, match="silently dropped"):
+        compile_semantic_query(
+            expose=_expose_with_colliding_names(),
+            metric="total_revenue",
+            dimensions=["order_status", "Order_Status"],
+            limit=10,
+            table_reference="orders",
+        )

@@ -446,6 +446,33 @@ def load_contract(path: str | Path, *, resolve_refs: bool = True) -> Dict[str, A
     return contract
 
 
+def load_overlay_document(
+    contract_path: str | Path, env: Optional[str]
+) -> Optional[Tuple[Path, Dict[str, Any]]]:
+    """Return ``(path, document)`` for the overlay :func:`load_with_overlay`
+    would apply for ``env``, or ``None`` when there is no ``env`` / no
+    matching overlay file.
+
+    Loading the overlay SEPARATELY is what lets a validator compare the
+    author's override against the base. Once ``load_with_overlay`` has
+    deep-merged them the distinction is gone, and checks that need it —
+    e.g. "this overlay flips ``packaging.mode`` but inherits the base's
+    ``containers`` map, which wins over ``mode``" — cannot be written at
+    all. Same candidate search order, so the two never disagree about
+    which file is in play.
+    """
+    if not env:
+        return None
+    base_path = Path(contract_path)
+    for cand in _overlay_candidates(base_path, env):
+        if cand.exists():
+            document = _parse_file(cand)
+            if not isinstance(document, dict):
+                raise ValueError(f"Overlay root must be an object/dict: {cand}")
+            return cand, document
+    return None
+
+
 def load_with_overlay(
     contract_path: str | Path,
     env: Optional[str] = None,

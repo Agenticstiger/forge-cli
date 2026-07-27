@@ -35,10 +35,12 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import yaml
 
+from ...observability.secret_redactor import collect_secret_values, redact_secret_text
 from ...providers._iceberg_catalog import (
     EXTERNAL_ICEBERG_CATALOGS,
     STORAGE_PROVIDERS,
@@ -219,7 +221,14 @@ class SnowflakeIacPlugin:
             schema_cols = (exposure.get("contract") or {}).get("schema") or []
             placement = _placement(packaging, exposure)
             _emit_snowflake(
-                resources, loc, fmt, schema_cols, cid, contract=contract, placement=placement
+                resources,
+                loc,
+                fmt,
+                schema_cols,
+                cid,
+                contract=contract,
+                placement=placement,
+                properties=binding.get("properties") or {},
             )
             _emit_warehouse(resources, loc, cid, placement=placement)
             _emit_iceberg_prereqs(resources, contract, binding, loc, fmt, cid)
@@ -521,6 +530,7 @@ def _emit_snowflake(
     *,
     contract: Mapping[str, Any] = None,  # type: ignore[assignment]
     placement: _Placement = _LEGACY_PLACEMENT,
+    properties: Mapping[str, Any] = MappingProxyType({}),
 ) -> None:
     """Emit a Snowflake exposure — its database, schema, and table (or view).
 
@@ -643,6 +653,9 @@ def _emit_snowflake(
     }
     if table_comment:
         table_body["comment"] = table_comment
+    cluster_by = _cluster_by(properties)
+    if cluster_by:
+        table_body["cluster_by"] = cluster_by
     resources.setdefault("snowflake_table", {})[tbl_res] = table_body
 
 
@@ -795,6 +808,34 @@ def _emit_iceberg_prereqs(
     }
 
 
+def _cluster_by(properties: Mapping[str, Any]) -> List[str]:
+    """``binding.properties.cluster_by`` → the provider's ``cluster_by`` list.
+
+    The v2 ``snowflake_table`` resource models the clustering key as
+    ``list(string)``, so the declared columns map straight across. Before this
+    existed the field was read by nobody: ``apply`` reported success, the
+    emitted ``main.tf.json`` carried no clustering attribute, and Snowflake's
+    ``CLUSTERING_KEY`` stayed NULL — a declared physical-layout property
+    silently dropped (the shipped ``examples/snowflake/smoke`` contract
+    included).
+
+    Each entry is routed through :func:`validate_ident`, the same guard every
+    other identifier in this module uses, so a non-identifier clustering
+    column fails loudly at emit time instead of reaching the provider. A
+    non-list value (or a list of non-strings) is a contract error and raises
+    for the same reason. ``snowflake_view`` has no clustering key, so views
+    never reach here.
+    """
+    raw = properties.get("cluster_by")
+    if raw in (None, "", [], ()):
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"binding.properties.cluster_by must be a list of columns, got {raw!r}")
+    return [validate_ident(str(col)) for col in raw]
+
+
 def _emit_warehouse(
     resources: Dict[str, Any],
     loc: Mapping[str, Any],
@@ -884,7 +925,21 @@ def _build_horizon_table_comment(contract: Mapping[str, Any], *, pool: Optional[
             sections.append("FLUID contract:\n```yaml\n" + fluid_yaml + "\n```")
     except Exception:  # noqa: BLE001 — best-effort, drop on yaml error
         pass
-    return "\n\n".join(sections)
+    # This string is a PUBLISHED sink: it lands in main.tf.json, in the
+    # OpenTofu state file, and in the live Snowflake COMMENT that every role
+    # with schema access can read (SHOW TABLES / INFORMATION_SCHEMA /
+    # Snowsight). The contract body is embedded verbatim, so route the whole
+    # comment through the central redactor before it leaves — a contract that
+    # spells a credential inline (``password: hunter2`` in a connection block)
+    # must not publish it to the catalog.
+    #
+    # The contract's own credential literals are passed as ``extra_secrets``
+    # rather than being registered process-wide: we HOLD them (they are right
+    # there in the mapping), so they are masked by exact value and cannot be
+    # truncated at a ``;`` / ``"`` / space inside the password the way the
+    # pattern layer would. Scoping them to this call keeps one contract's
+    # inline strings from altering redaction anywhere else in the run.
+    return redact_secret_text("\n\n".join(sections), extra_secrets=collect_secret_values(contract))
 
 
 # Snowflake object types granted via ``on_account_object``; every other

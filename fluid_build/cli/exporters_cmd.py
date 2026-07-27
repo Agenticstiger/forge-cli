@@ -46,7 +46,13 @@ def run(args, logger: logging.Logger) -> int:
         cprint(
             json.dumps(
                 [
-                    {"name": e.name, "spec": e.spec, "url": e.url, "formats": list(e.formats)}
+                    {
+                        "name": e.name,
+                        "spec": e.spec,
+                        "url": e.url,
+                        "formats": list(e.formats),
+                        "deprecatedFormats": list(e.deprecated_formats),
+                    }
                     for e in exporters
                 ],
                 indent=2,
@@ -59,8 +65,17 @@ def run(args, logger: logging.Logger) -> int:
         cprint(f"  {e.name:<12} {e.spec}")
         if e.url:
             cprint(f"  {'':<12} {e.url}")
+        # Only canonical spellings are advertised as invocations; deprecated
+        # aliases are named as such on their own line so this listing and
+        # `fluid generate standard --list` cannot disagree about which acronym
+        # is current.
         if e.formats:
             cprint(f"  {'':<12} fluid generate standard --format {' | '.join(e.formats)}")
+        if e.deprecated_formats:
+            cprint(
+                f"  {'':<12} deprecated alias(es): "
+                f"{', '.join(e.deprecated_formats)} — prefer --format {e.formats[0]}"
+            )
         cprint("")
     cprint(
         "Exporters serialize a contract to a SPEC — they are not cloud providers "

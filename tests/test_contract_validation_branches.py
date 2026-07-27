@@ -107,7 +107,8 @@ class TestValidationReport:
     def test_add_issue_warning(self):
         r = self._make_report()
         r.add_issue("warning", "binding", "missing", "x")
-        assert r.checks_passed == 1
+        # A warning is an advisory issue, not a passed check.
+        assert r.checks_passed == 0
         assert len(r.get_warnings()) == 1
         assert r.is_valid()
 
@@ -444,7 +445,11 @@ class TestContractValidator:
 
         v = ContractValidator(Path("test.yaml"), use_cache=False, check_data=False)
         report = v.validate()
-        assert any("No quality" in i.message for i in report.issues if i.severity == "info")
+        assert any(
+            "No data-quality rules declared" in i.message
+            for i in report.issues
+            if i.severity == "info"
+        )
 
     @patch("fluid_build.cli.contract_validation.load_contract_with_overlay")
     @patch("fluid_build.cli.contract_validation.FluidSchemaManager")

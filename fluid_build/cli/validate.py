@@ -281,7 +281,7 @@ def run(args, logger: logging.Logger) -> int:
         try:
             contract_path = validate_cli_path(args.contract, mode="read", file_type="contract")
         except FluidCLIError as exc:
-            if exc.event in ("file_not_found", "contract_file_not_found"):
+            if exc.event == "file_not_found":
                 raise CLIError(1, "contract_file_not_found", {"path": str(args.contract)})
             raise
         args.contract = str(contract_path)
@@ -570,16 +570,36 @@ def _filter_compatible_versions(versions: list[SchemaVersion], args) -> list[Sch
     return compatible
 
 
+def _drop_preview_versions(versions: list[SchemaVersion]) -> list[SchemaVersion]:
+    """Strip opt-in preview schema versions from an auto-selection candidate list.
+
+    Mirrors ``FluidSchemaManager.latest_bundled_version``: a preview version is
+    fully validatable when a contract *declares* it, but must never become the
+    silent default for an untagged contract.
+    """
+    import fluid_build.cli.validate as _self
+
+    preview = _self.FluidSchemaManager.PREVIEW_VERSIONS
+    return [v for v in versions if str(v) not in preview]
+
+
 def _find_latest_compatible_version(args, schema_manager: FluidSchemaManager) -> SchemaVersion:
     import fluid_build.cli.validate as _self
 
     versions = _available_schema_versions(schema_manager, args)
     compatible_versions = _filter_compatible_versions(versions, args)
+    # Prefer the newest STABLE candidate. Only fall back to a preview when the
+    # caller's own --min-version/--max-version constraints leave nothing else,
+    # i.e. the operator asked for it explicitly.
+    stable_versions = _self._drop_preview_versions(compatible_versions)
+    if stable_versions:
+        return stable_versions[-1]
     if compatible_versions:
         return compatible_versions[-1]
 
     if versions:
-        return versions[-1]
+        stable_all = _self._drop_preview_versions(versions)
+        return stable_all[-1] if stable_all else versions[-1]
 
     # Degenerate case: no schema versions discoverable at all (e.g. an empty
     # schemas dir). Fall back to the latest bundled schema rather than a
@@ -759,6 +779,71 @@ def _validate_contract_for_version(
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Vector binding check skipped: {exc}")
+
+        # --- Packaging checks (RFC-packaging-modes.md file 9) ---------------
+        # ``fluid validate`` had NO packaging awareness: a `shared` block with
+        # no `pool` validated clean and then failed at `fluid plan` with an
+        # error whose own remediation says "Run 'fluid validate <contract>'
+        # first to rule out a contract problem". Resolving through the same
+        # single chokepoint plan/generate-iac/apply use means validate cannot
+        # drift from what those stages will decide.
+        #
+        # The overlay check needs the base and the override SEPARATELY, so it
+        # re-reads the overlay document rather than the (already deep-merged)
+        # contract: an overlay that flips `mode` while inheriting the base's
+        # `containers` map changes nothing for those kinds, because the
+        # per-kind entries beat `mode`.
+        try:
+            from fluid_build.iac.packaging import (
+                validate_overlay_packaging,
+                validate_packaging_block,
+            )
+
+            pkg_errors, pkg_warnings = validate_packaging_block(contract)
+            contract_path = getattr(args, "contract", None)
+            env = getattr(args, "env", None)
+            if contract_path and env:
+                from fluid_build.loader import load_contract, load_overlay_document
+
+                found = load_overlay_document(contract_path, env)
+                if found is not None:
+                    _overlay_path, overlay_doc = found
+                    ov_errors, ov_warnings = validate_overlay_packaging(
+                        load_contract(contract_path, resolve_refs=False), overlay_doc
+                    )
+                    pkg_errors.extend(ov_errors)
+                    pkg_warnings.extend(ov_warnings)
+            for msg in pkg_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in pkg_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Packaging check skipped: {exc}")
+
+        # --- Semantic-model checks (double aggregation) ---------------------
+        # A measure's ``expr`` is the PRE-aggregation input that ``agg`` is
+        # applied to, so ``{agg: sum, expr: SUM(amount)}`` compiles to
+        # SUM(SUM(amount)) — invalid SQL on every engine, on both the governed
+        # MCP query path and the dbt MetricFlow export. The emitters were fixed
+        # to stop producing it; nothing caught it in a hand-authored or
+        # third-party contract, which validated clean and then failed at query
+        # time with an opaque engine error.
+        try:
+            from fluid_build.forge_datamodel.semantics_builder import (
+                validate_semantics_block,
+            )
+
+            sem_errors, sem_warnings = validate_semantics_block(contract)
+            for msg in sem_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in sem_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Semantic-model check skipped: {exc}")
 
         try:
             from pathlib import Path as _Path
@@ -988,6 +1073,23 @@ def _output_results(result: ValidationResult, args, logger: logging.Logger) -> i
         return _output_text_results(result, args, logger)
 
 
+def _cprint_json(payload: str) -> None:
+    """Emit a machine-readable JSON document on stdout.
+
+    ``cprint`` renders through Rich, which WORD-WRAPS at the console
+    width (80 when stdout is a pipe). Any validation message longer than
+    that got a newline injected mid-string, which is a literal control
+    character inside a JSON string — so ``fluid validate --format json``
+    produced a document ``json.load`` refuses:
+    ``JSONDecodeError: Invalid control character``. ``soft_wrap=True``
+    turns wrapping off; ``markup=False`` stops Rich from eating a
+    ``[tag]``-shaped substring of a message. Still routed through
+    ``cprint`` (rather than ``sys.stdout.write``) so the console's secret
+    redaction stays on the path.
+    """
+    cprint(payload, soft_wrap=True, markup=False, highlight=False)
+
+
 def _output_json_results(result: ValidationResult, args) -> int:
     """Output results in JSON format."""
     import json
@@ -1000,7 +1102,7 @@ def _output_json_results(result: ValidationResult, args) -> int:
         "validation_time": result.validation_time,
     }
 
-    cprint(json.dumps(output, indent=2))
+    _cprint_json(json.dumps(output, indent=2))
     return 0 if result.is_valid and (not args.strict or not result.warnings) else 1
 
 
@@ -1234,7 +1336,7 @@ def _run_bundle_validation(
     verbose = bool(getattr(args, "verbose", False))
 
     if out_format == "json":
-        cprint(json.dumps(report.to_dict(), indent=2))
+        _cprint_json(json.dumps(report.to_dict(), indent=2))
     elif not quiet:
         status_icon = "✅" if report.status == "pass" else "❌"
         cprint(f"{status_icon} Bundle {report.status}: {tgz_path}")

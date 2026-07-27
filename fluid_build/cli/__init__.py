@@ -33,7 +33,10 @@ from fluid_build.cli.forge_banner import compact_next_line
 # ``install_secret_redacting_filter`` is bound. ``secret_redactor`` itself
 # is a stdlib-only leaf (``logging``/``re``/``traceback``) and has no
 # transitive deps back into this package.
-from fluid_build.observability.secret_redactor import install_secret_redacting_filter
+from fluid_build.observability.secret_redactor import (
+    install_secret_redacting_filter,
+    register_secrets_from_environ,
+)
 
 from ._common import CLIError
 from ._errors import FluidUserError as _FluidUserError
@@ -145,9 +148,18 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
     )
     p.add_argument(
         "--provider",
-        choices=["local", "gcp", "snowflake", "aws", "azure"],
+        # Deliberately NO argparse ``choices``. The provider set is a registry
+        # (built-ins + ``fluid_build.providers`` entry-point plugins), and the
+        # hardcoded enum disagreed with it in both directions: it rejected
+        # ``redshift`` and ``datamesh_manager``, which ``fluid providers``
+        # lists, and accepted ``azure``, which is not registered at all — and a
+        # pip-installed provider plugin could never be passed. Enumerating the
+        # registry here is not an option: discovery imports every provider
+        # module, and ``build_parser()`` is the ``fluid --help`` cold path.
+        # The value is validated against the live registry in
+        # :func:`_validate_global_args`, after the parse.
         default=os.getenv("FLUID_PROVIDER"),
-        help="Infrastructure provider (env: FLUID_PROVIDER)",
+        help="Infrastructure provider (env: FLUID_PROVIDER; see `fluid providers`)",
     )
     p.add_argument(
         "--project",
@@ -311,8 +323,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             getattr(args, "debug", False),
         )
 
-        # Validate global arguments
-        _validate_global_args(args, cli.logger)
+        # Validate global arguments. An unknown `--provider` is fatal (exit 2 —
+        # argparse's own invalid-choice code), preserving the strictness the
+        # hardcoded `choices` list had; the check just consults the live
+        # registry instead of a stale literal.
+        #
+        # Discovery imports every provider module, so it runs ONLY when a
+        # provider was actually requested — `fluid <anything>` without
+        # `--provider` / `FLUID_PROVIDER` keeps its current startup cost
+        # (tests/perf/test_startup_budget.py).
+        requested_provider = getattr(args, "provider", None)
+        known_providers = (
+            _known_provider_names()
+            if requested_provider and requested_provider != _PROVIDER_AUTO
+            else []
+        )
+        _validate_global_args(args, cli.logger, known_providers=known_providers)
+        if requested_provider and known_providers and requested_provider not in known_providers:
+            return 2
 
         # Create CLI context
         context = CLIContext()
@@ -605,6 +633,13 @@ def _setup_enhanced_logging(
             LOG.warning(f"Failed to setup file logging: {e}")
 
     install_secret_redacting_filter(root_logger)
+    # Hand the redactor the literal value of every credential-named env var, so
+    # it masks them by exact match instead of by pattern. This is the layer that
+    # makes a password containing ``;`` ``,`` ``}`` ``]`` ``"`` or a space
+    # redactable at all — an assignment pattern must guess where the value ends
+    # and truncates at the first such character, emitting the tail verbatim. The
+    # values never leave the process; the registry is in-memory only.
+    register_secrets_from_environ()
 
     # UX hardening — silence noisy third-party loggers by default.
     # ``httpx`` emits an INFO-level "HTTP Request: GET ... 200 OK" on
@@ -620,8 +655,35 @@ def _setup_enhanced_logging(
     return ProductionLogger(LOG)
 
 
+#: ``fluid generate iac --provider`` defaults to this sentinel, meaning
+#: "detect the cloud from the contract's bindings" (``generate_iac
+#: ._resolve_provider``). It is never a registry entry, so the registry check
+#: below must not reject it — that default lands on the SAME ``args.provider``
+#: the global flag populates.
+_PROVIDER_AUTO = "auto"
+
+
+def _known_provider_names() -> List[str]:
+    """Sorted names from the live provider registry, or ``[]`` if unavailable.
+
+    The same set ``fluid providers`` prints. Fails open (empty list ⇒ no
+    complaint) so a discovery problem can never block a run — the provider
+    resolution downstream reports its own, more specific error.
+    """
+    try:
+        from fluid_build import providers as registry
+
+        registry.discover_providers()
+        return sorted(registry.PROVIDERS.keys())
+    except Exception:  # noqa: BLE001 - advisory check; never crash the CLI
+        return []
+
+
 def _validate_global_args(
-    args: argparse.Namespace, logger: Optional[ProductionLogger] = None
+    args: argparse.Namespace,
+    logger: Optional[ProductionLogger] = None,
+    *,
+    known_providers: Optional[List[str]] = None,
 ) -> None:
     """Enhanced validation of global arguments with security considerations"""
     issues = []
@@ -629,6 +691,18 @@ def _validate_global_args(
 
     # Provider validation
     if hasattr(args, "provider") and args.provider:
+        # Registry-driven, post-parse: `--provider` carries no argparse
+        # `choices` because the provider set is pluggable and enumerating it
+        # would drag provider discovery onto the `--help` path. Checking it
+        # here means the accepted values are exactly what `fluid providers`
+        # lists, plugins included.
+        known = _known_provider_names() if known_providers is None else known_providers
+        if known and args.provider not in known and args.provider != _PROVIDER_AUTO:
+            issues.append(
+                f"Unknown provider '{args.provider}' — installed providers: "
+                f"{', '.join(known)} (see `fluid providers`)"
+            )
+
         # Only GCP and Azure require an explicit --project; AWS resolves account from STS/env
         if args.provider in ["gcp", "azure"] and not getattr(args, "project", None):
             issues.append(f"Provider '{args.provider}' requires --project to be specified")

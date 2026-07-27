@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from fluid_build.providers._sql_safety import build_libpq_dsn, quote_string_literal
+from fluid_build.providers._sql_safety import build_libpq_dsn, quote_ansi_string_literal
 
 from .registry import DiscoveredColumn, DiscoveredStream, Discoverer
 
@@ -79,7 +79,7 @@ class JdbcDiscoverer(Discoverer):
        emits one :class:`DiscoveredStream` per table with its
        columns.
 
-    All SQL composition routes through :func:`quote_string_literal`
+    All SQL composition routes through :func:`quote_ansi_string_literal`
     so a tampered upstream catalog row can't break out of the SQL
     string literal.
     """
@@ -123,11 +123,11 @@ class JdbcDiscoverer(Discoverer):
         try:
             con.execute(f"INSTALL {self.config.extension}; LOAD {self.config.extension};")
             con.execute(
-                f"ATTACH {quote_string_literal(dsn)} AS {alias} (TYPE {self.config.attach_type})"
+                f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE {self.config.attach_type})"
             )
 
             filter_fn = self.config.table_filter or _default_table_filter
-            where = filter_fn(conn, quote_string_literal)
+            where = filter_fn(conn, quote_ansi_string_literal)
             tables = con.execute(
                 f"SELECT table_schema, table_name "
                 f"FROM {alias}.information_schema.tables "
@@ -136,8 +136,8 @@ class JdbcDiscoverer(Discoverer):
             ).fetchall()
 
             for schema, table in tables:
-                quoted_schema = quote_string_literal(str(schema))
-                quoted_table = quote_string_literal(str(table))
+                quoted_schema = quote_ansi_string_literal(str(schema))
+                quoted_table = quote_ansi_string_literal(str(table))
                 cols = con.execute(
                     "SELECT column_name, data_type, is_nullable "
                     f"FROM {alias}.information_schema.columns "

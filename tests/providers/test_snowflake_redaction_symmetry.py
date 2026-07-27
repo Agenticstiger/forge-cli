@@ -126,6 +126,14 @@ class TestSnowflakeAssignmentKeyNamePreserved:
 
     def test_assignment_stops_at_semicolon_terminator(self) -> None:
         # Value terminator set mirrors the global layer: stop at ``;``.
+        #
+        # This pins the PATTERN layer's terminator set, which is deliberately
+        # left as shipped. It cannot be made leak-free — every candidate
+        # terminator is a character a real password may contain — and an
+        # attempt to widen it regressed inputs this set handles (see
+        # ``tests/security/test_security_regressions_round3.py``). A secret
+        # whose literal value is known is masked whole by the exact-value
+        # layer, which runs first; this pattern is the net for the rest.
         out = redact_string("password=hunter2;account=acme")
         assert out == "password=[REDACTED];account=acme"
 

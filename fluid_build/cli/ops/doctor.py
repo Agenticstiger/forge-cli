@@ -219,6 +219,15 @@ def _build_checks() -> List[DoctorCheck]:
             DoctorScope.INGESTION,
             lambda: _check_python_module("httpx", DoctorScope.INGESTION),
         ),
+        # Snowflake driver. Absent from every scope, so
+        # ``fluid doctor --scope all | grep -i snow`` returned nothing on
+        # a workspace whose only provider is Snowflake — while validate /
+        # plan / apply / test all hard-fail without it.
+        DoctorCheck(
+            "extra:snowflake",
+            DoctorScope.INGESTION,
+            lambda: _check_python_module("snowflake.connector", DoctorScope.INGESTION),
+        ),
         # Infra scope
         DoctorCheck(
             "binary:docker",

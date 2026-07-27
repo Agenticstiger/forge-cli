@@ -47,6 +47,36 @@ if TYPE_CHECKING:
     from .catalog import CatalogRegistrar
 
 
+class CatalogNotConfiguredError(Exception):
+    """A registrar factory refusing to build because required config is unset.
+
+    Raise this instead of substituting a placeholder endpoint. The dispatcher
+    catches it and records a "not configured" result naming the environment
+    variables from the backend's own :attr:`CatalogBackendSpec.env_vars`, so
+    the operator sees the missing setting rather than the DNS failure that
+    dialling a placeholder host produces.
+    """
+
+    def __init__(self, target: str, detail: str = "") -> None:
+        self.target = target
+        self.detail = detail
+        super().__init__(detail or f"{target} is not configured")
+
+    def operator_message(self) -> str:
+        """A message naming what to set, resolved from the registered spec."""
+        if self.detail:
+            return self.detail
+        spec = get_catalog_backend(self.target)
+        env_vars = tuple((spec.env_vars or {}).get("endpoint", ())) if spec else ()
+        if env_vars:
+            return (
+                f"{self.target} not configured "
+                f"(set {' or '.join(env_vars)}, or a catalogs.{self.target}.endpoint "
+                f"config block)"
+            )
+        return f"{self.target} not configured (no endpoint set)"
+
+
 class CatalogCapability(str, Enum):
     """What a catalog backend can persist about a data product.
 
@@ -188,6 +218,7 @@ def apply_env_overrides(name: str, catalog_config: Dict[str, Any]) -> None:
 __all__ = [
     "CatalogBackendSpec",
     "CatalogCapability",
+    "CatalogNotConfiguredError",
     "register_catalog_backend",
     "get_catalog_backend",
     "all_catalog_backend_names",

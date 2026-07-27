@@ -136,9 +136,12 @@ def attach_to_mcp_subparsers(sp: argparse._SubParsersAction) -> None:
         default=None,
         metavar="PATH[,PATH...]",
         help=(
-            "Comma-separated filesystem roots the server may read from "
-            "(today only the contract YAML; field reserved for future "
-            "tools). Defaults to the directory of the contract argument."
+            "Comma-separated filesystem roots the server may read from. "
+            "Every filesystem reference in the served binding "
+            "(location.path, location.attach, location.dbFile) must resolve "
+            "under one of them or the tool call fails with "
+            "UnsupportedBindingError. Symlinks are resolved before the check. "
+            "Defaults to the directory of the contract argument."
         ),
     )
     serve.add_argument(

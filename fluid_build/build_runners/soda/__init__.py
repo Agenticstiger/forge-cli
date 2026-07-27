@@ -14,6 +14,11 @@
 
 """Soda Core integration — shells out to the user-installed ``soda`` binary."""
 
-from .runner import SodaResult, resolve_soda_executable, run_soda_scan
+from .runner import SodaNotInstalled, SodaResult, resolve_soda_executable, run_soda_scan
 
-__all__ = ["SodaResult", "resolve_soda_executable", "run_soda_scan"]
+__all__ = [
+    "SodaNotInstalled",
+    "SodaResult",
+    "resolve_soda_executable",
+    "run_soda_scan",
+]

@@ -92,6 +92,56 @@ def _write_audit_event(*args, **kwargs):
     return fn(*args, **kwargs)
 
 
+class LogicalDraftError(RuntimeError):
+    """A sidecar could not be read or parsed; carries no raw exception text."""
+
+    def __init__(self, error: str, message: str):
+        super().__init__(message)
+        self.error = error
+        self.message = message
+
+    def as_result(self) -> Dict[str, Any]:
+        """The typed tool-result shape the hardened twin returns."""
+        return {"error": self.error, "message": self.message}
+
+
+def _load_logical_draft(path: Path):
+    """Read + parse a ``.model.json`` sidecar, or raise a sanitised error.
+
+    Typed-tool-error invariant (issue #392): the detail — absolute host
+    paths and errno text from ``OSError``, and, from pydantic's
+    ``ValidationError``, a truncated echo of the *file contents* — is
+    logged server-side and never round-tripped into the LLM's tool-use
+    context. The hardened in-process twin
+    (``forge_copilot_tools._dispatch_read_logical_model``) already did
+    this; the ``fluid mcp serve`` path called ``LogicalDraft
+    .model_validate_json(path.read_text(...))`` bare, so the same tool
+    leaked through a different entry point.
+
+    Raises:
+        LogicalDraftError: with a message safe to show a model. The
+            caller decides whether to surface it as a typed result dict
+            (read path) or let it propagate (mutating tools).
+    """
+    from fluid_build.copilot.schemas.stage_outputs import LogicalDraft
+
+    try:
+        body = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("read_logical_model: failed to read %s: %s", path, exc, exc_info=True)
+        raise LogicalDraftError(
+            type(exc).__name__, f"could not read {path.name} — see server logs"
+        ) from exc
+
+    try:
+        return LogicalDraft.model_validate_json(body)
+    except Exception as exc:  # pydantic ValidationError (also covers invalid JSON)
+        logger.warning("read_logical_model: invalid sidecar %s: %s", path, exc, exc_info=True)
+        raise LogicalDraftError(
+            type(exc).__name__, f"{path.name} is not a valid logical model — see server logs"
+        ) from exc
+
+
 def _call_tool(
     name: str,
     arguments: Dict[str, Any],
@@ -106,18 +156,19 @@ def _call_tool(
     to keep this function synchronous and thread-safe.
     """
     from fluid_build.cli.forge_data_model import diff_logical_models
-    from fluid_build.copilot.schemas.stage_outputs import ConceptualRelationship, LogicalDraft
+    from fluid_build.copilot.schemas.stage_outputs import ConceptualRelationship
 
     if name == "read_logical_model":
         path = Path(arguments["path"])
-        return LogicalDraft.model_validate_json(path.read_text(encoding="utf-8")).model_dump(
-            mode="json", by_alias=True
-        )
+        try:
+            return _load_logical_draft(path).model_dump(mode="json", by_alias=True)
+        except LogicalDraftError as exc:
+            return exc.as_result()
     if name == "update_entity":
         if read_only:
             raise RuntimeError("Server is running in read-only mode")
         path = Path(arguments["path"])
-        logical = LogicalDraft.model_validate_json(path.read_text(encoding="utf-8"))
+        logical = _load_logical_draft(path)
         before = logical.model_dump(mode="json", by_alias=True)
         target = arguments["entity"]
         updates = arguments.get("updates") or {}
@@ -135,7 +186,7 @@ def _call_tool(
         if read_only:
             raise RuntimeError("Server is running in read-only mode")
         path = Path(arguments["path"])
-        logical = LogicalDraft.model_validate_json(path.read_text(encoding="utf-8"))
+        logical = _load_logical_draft(path)
         if logical.conceptual is None:
             raise RuntimeError("Logical model has no conceptual section")
         before = logical.model_dump(mode="json", by_alias=True)
@@ -148,7 +199,7 @@ def _call_tool(
         if read_only:
             raise RuntimeError("Server is running in read-only mode")
         path = Path(arguments["path"])
-        logical = LogicalDraft.model_validate_json(path.read_text(encoding="utf-8"))
+        logical = _load_logical_draft(path)
         contract = build_contract_from_logical(
             logical, build_engine=str(arguments.get("engine") or "dbt")
         )
@@ -168,9 +219,7 @@ def _call_tool(
         logical = None
         contract = None
         if arguments.get("logical_path"):
-            logical = LogicalDraft.model_validate_json(
-                Path(arguments["logical_path"]).read_text(encoding="utf-8")
-            )
+            logical = _load_logical_draft(Path(arguments["logical_path"]))
         if arguments.get("contract_path"):
             contract = yaml.safe_load(Path(arguments["contract_path"]).read_text(encoding="utf-8"))
         return validator.validate(logical=logical, contract=contract).model_dump(

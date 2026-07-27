@@ -128,10 +128,10 @@ class TestValidationIssueStrEdgeCases(unittest.TestCase):
 
 
 class TestValidationReportExtra(unittest.TestCase):
-    def test_add_info_severity_counts_as_passed(self):
+    def test_add_info_severity_is_not_a_passed_check(self):
         r = _make_report()
         r.add_issue("info", "metadata", "informational", path="")
-        self.assertEqual(r.checks_passed, 1)
+        self.assertEqual(r.checks_passed, 0)
         self.assertEqual(r.checks_failed, 0)
 
     def test_is_valid_with_only_warnings(self):
@@ -228,10 +228,8 @@ class TestValidateBindingExtra(unittest.TestCase):
     def test_complete_binding_gcp_no_errors(self):
         binding = {
             "platform": "gcp",
-            "location": {
-                "format": "bigquery",
-                "properties": {"project": "proj", "dataset": "ds", "table": "t"},
-            },
+            "format": "bigquery",
+            "location": {"project": "proj", "dataset": "ds", "table": "t"},
         }
         self.v._validate_binding(binding, "path", "e1")
         errors = self.v.report.get_errors()
@@ -243,10 +241,9 @@ class TestValidateBindingExtra(unittest.TestCase):
         self.v.provider_name = "gcp"
         binding = {
             "platform": "gcp",
-            "location": {
-                "format": "bigquery",
-                "properties": {"project": "proj"},  # missing dataset and table
-            },
+            "format": "bigquery",
+            "properties": {"project": "proj"},  # missing dataset and table
+            "location": {},
         }
         self.v._validate_binding(binding, "path", "e1")
         errors = self.v.report.get_errors()
@@ -262,15 +259,23 @@ class TestValidateBindingExtra(unittest.TestCase):
         warnings = self.v.report.get_warnings()
         self.assertTrue(any("format" in w.message for w in warnings))
 
-    def test_missing_location_properties_adds_warning(self):
+    def test_location_only_binding_does_not_warn_about_properties(self):
+        """``binding.properties`` is optional — it must not warn.
+
+        The old check looked for ``location.properties``, which
+        ``$defs.bindingLocation`` (additionalProperties: false) forbids,
+        so every expose emitted an unsatisfiable warning and ``--strict``
+        could never pass.
+        """
         binding = {
             "platform": "local",
-            "location": {"format": "sqlite"},
+            "format": "sqlite",
+            "location": {"path": "data.db"},
         }
         self.v.provider_name = "local"
         self.v._validate_binding(binding, "path", "e1")
         warnings = self.v.report.get_warnings()
-        self.assertTrue(any("properties" in w.message for w in warnings))
+        self.assertFalse(any("properties" in w.message for w in warnings))
 
 
 # ---------------------------------------------------------------------------
@@ -413,13 +418,14 @@ class TestValidateMetadata(unittest.TestCase):
         self.assertTrue(any("metadata" in w.message.lower() for w in warnings))
 
     def test_complete_metadata_no_warnings(self):
+        # ``domain`` is a root key — ``metadata`` forbids it.
         self.v.contract = {
+            "domain": "finance",
             "metadata": {
                 "owner": "team@example.com",
                 "layer": "Gold",
-                "domain": "finance",
                 "tags": ["reporting"],
-            }
+            },
         }
         self.v._validate_metadata()
         # No info issues for recommended fields when all present

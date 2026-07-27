@@ -22,7 +22,14 @@ from typing import TYPE_CHECKING
 
 from .config import CommandCenterConfig
 from .git import get_git_info
-from .secret_redactor import SecretRedactingFilter, install_secret_redacting_filter
+from .secret_redactor import (
+    SecretRedactingFilter,
+    install_secret_redacting_filter,
+    register_secret,
+    register_secrets,
+    register_secrets_from_environ,
+    register_secrets_from_payload,
+)
 
 if TYPE_CHECKING:  # import only for type checkers, never at runtime
     from .reporter import CommandCenterReporter
@@ -33,6 +40,10 @@ __all__ = [
     "SecretRedactingFilter",
     "get_git_info",
     "install_secret_redacting_filter",
+    "register_secret",
+    "register_secrets",
+    "register_secrets_from_environ",
+    "register_secrets_from_payload",
 ]
 
 

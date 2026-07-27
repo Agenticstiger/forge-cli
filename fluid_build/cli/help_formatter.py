@@ -289,6 +289,10 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
             ("auth", "Manage cloud provider credentials  [dim]login · status · logout[/dim]"),
             ("doctor", "Check system health & dependencies"),
             ("providers", "List available infrastructure providers"),
+            # The spec exporters have their own registry, deliberately separate
+            # from `providers`. It was unreachable from this index, so the
+            # "discoverable home" could not be discovered.
+            ("exporters", "List spec exporters  [dim]ODPS · ODCS standards[/dim]"),
             ("version", "Show version info"),
         ],
     )
@@ -644,7 +648,7 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
         "(For Bitol ODPS v1.0.0 — the center-stage default — use `--format odps`.)",
         (
             "  fluid export-opds contract.fluid.yaml\n"
-            "  fluid export-opds contract.fluid.yaml --out my-product.opds.json\n"
+            "  fluid export-opds contract.fluid.yaml --out my-product.odps-v4.1.json\n"
             "  fluid export-opds contract.fluid.yaml --env prod --out prod-product.json"
         ),
     ),

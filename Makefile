@@ -318,6 +318,12 @@ if [ -x "$(VENV)/bin/python" ]; then vp="$(VENV)/bin/python"; \
 elif [ -x "$(VENV)/Scripts/python.exe" ]; then vp="$(VENV)/Scripts/python.exe"; \
 else vp=$(PYTHON); fi; \
 $$vp -m build;'
+	@echo "🔎 Verifying the built artifact (bundled schemas must be YAML-parseable)..."
+	@bash -lc '\
+if [ -x "$(VENV)/bin/python" ]; then vp="$(VENV)/bin/python"; \
+elif [ -x "$(VENV)/Scripts/python.exe" ]; then vp="$(VENV)/Scripts/python.exe"; \
+else vp=$(PYTHON); fi; \
+$$vp -m pytest tests/test_bundled_schemas_yaml_safe.py -q;'
 	@echo "✅ Build complete for profile: $(or $(PROFILE),alpha)"
 	@ls -lh dist/ 2>/dev/null || echo "No dist/ directory yet"
 

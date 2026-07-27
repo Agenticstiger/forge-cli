@@ -44,11 +44,82 @@ def validate_ident(name: str) -> str:
     return name
 
 
-def quote_string_literal(value: str) -> str:
-    """Quote a SQL string literal by doubling embedded single quotes."""
+def quote_string_literal(value: str, *, backslash_escapes: bool = True) -> str:
+    """Quote a SQL string literal so no input can break out of it.
+
+    Doubling the embedded single quotes is only sufficient on dialects whose
+    string literals are *standard-conforming* — i.e. where ``\\`` is an
+    ordinary character. Snowflake, MySQL, BigQuery and Redshift instead treat
+    ``\\`` as an escape character inside ``'...'``, so a value ending in a
+    backslash defeats the doubling: ``\\'`` is consumed as an *escaped* quote
+    and the doubled partner **terminates the literal**, handing the caller's
+    remaining text to the SQL parser.
+
+    Concretely, on Snowflake ``quote_string_literal("X\\\\') AND 1=0 --")``
+    used to emit ``'X\\'') AND 1=0 --'``, which the server parses as the
+    literal ``X'`` followed by live SQL. That is a break-out, not a quoted
+    value.
+
+    ``backslash_escapes`` therefore defaults to ``True`` — the fail-closed
+    setting, correct for every dialect that honours backslash escapes and
+    merely redundant nowhere it matters. Callers targeting a
+    standard-conforming dialect (DuckDB, PostgreSQL, Trino/Athena) MUST pass
+    ``backslash_escapes=False``: doubling backslashes there would corrupt the
+    *value* (a Windows path or a secret would gain extra backslashes) without
+    buying any safety, because ``\\`` cannot escape a quote in the first place.
+    """
     if not isinstance(value, str):
         raise ValueError(f"Invalid SQL string literal: {value!r}")
-    return "'" + value.replace("'", "''") + "'"
+    escaped = value.replace("\\", "\\\\") if backslash_escapes else value
+    return "'" + escaped.replace("'", "''") + "'"
+
+
+def quote_ansi_string_literal(value: str) -> str:
+    """Quote a SQL string literal for a *standard-conforming* dialect.
+
+    DuckDB, PostgreSQL, SQLite and Trino/Athena treat ``\\`` as an ordinary
+    character inside ``'...'``, so doubling the single quotes is already
+    break-out-proof there — and doubling the backslashes on top (what
+    :func:`quote_string_literal` does by default) would corrupt the *value*:
+    a Windows path or a secret would silently gain extra backslashes.
+
+    Thin, greppable sibling of :func:`quote_string_literal` so a DuckDB /
+    PostgreSQL emitter declares its dialect once at the import line instead of
+    repeating ``backslash_escapes=False`` at every call site. Emitters for
+    Snowflake / BigQuery / MySQL / Redshift must keep using
+    :func:`quote_string_literal`.
+    """
+    return quote_string_literal(value, backslash_escapes=False)
+
+
+# Dialect hints used by :func:`dialect_uses_backslash_escapes`. Only the
+# *standard-conforming* side is enumerated: an unknown dialect falls through to
+# ``True`` (escape the backslash) so a new backend fails closed.
+_STANDARD_CONFORMING_DIALECTS = frozenset(
+    {
+        "ansi",
+        "athena",
+        "duckdb",
+        "postgres",
+        "postgresql",
+        "presto",
+        "sqlite",
+        "trino",
+    }
+)
+
+
+def dialect_uses_backslash_escapes(dialect: str | None) -> bool:
+    """Return whether ``dialect`` treats ``\\`` as an escape inside ``'...'``.
+
+    Feed the result to :func:`quote_string_literal`'s ``backslash_escapes``
+    for call sites that already carry a dialect hint (e.g. the quality
+    engine). Unknown / missing dialects return ``True`` — the fail-closed
+    answer.
+    """
+    if not dialect:
+        return True
+    return dialect.strip().lower() not in _STANDARD_CONFORMING_DIALECTS
 
 
 # ---------------------------------------------------------------------------

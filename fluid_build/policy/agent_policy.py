@@ -41,6 +41,8 @@ Validator additions in v0.7.4:
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from ._common import iter_exposes
+
 
 @dataclass
 class AgentPolicyViolation:
@@ -116,7 +118,7 @@ class AgentPolicyValidator:
         """
         violations = []
 
-        for expose in contract.get("exposes", []):
+        for expose in iter_exposes(contract):
             policy = expose.get("policy", {})
             agent_policy = policy.get("agentPolicy")
 
