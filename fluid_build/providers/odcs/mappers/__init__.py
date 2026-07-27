@@ -15,14 +15,18 @@ Order matters:
 - ``servers`` — fills ``expects[]`` from ODCS servers.
 - ``sla`` — attaches qos to ``exposes[0]`` (depends on schema).
 - ``quality`` — contract-level only (property/object level handled in schema).
+- ``extras`` — **last in both directions**. On export it snapshots every FLUID
+  block the mappers above did not consume into ``customProperties``; on import
+  it splices that snapshot back over their output. Running it last is what
+  makes it a deny-list: it sees the finished picture.
 
 On export the same order is fine: each mapper writes its own slice of the
-ODCS dict; no inter-mapper dependencies.
+ODCS dict; no inter-mapper dependencies apart from ``extras`` going last.
 """
 
-from . import metadata, quality, schema, servers, sla, team  # noqa: F401
+from . import extras, metadata, quality, schema, servers, sla, team  # noqa: F401
 
-IMPORT_PIPELINE = [metadata, team, schema, servers, sla, quality]
-EXPORT_PIPELINE = [metadata, team, schema, servers, sla, quality]
+IMPORT_PIPELINE = [metadata, team, schema, servers, sla, quality, extras]
+EXPORT_PIPELINE = [metadata, team, schema, servers, sla, quality, extras]
 
 __all__ = ["IMPORT_PIPELINE", "EXPORT_PIPELINE"]

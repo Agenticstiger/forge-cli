@@ -19,7 +19,7 @@ import json
 import logging
 import os
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_json
 
 from ._common import CLIError
 from ._logging import info
@@ -66,7 +66,7 @@ def run(args, logger: logging.Logger) -> int:
             return _render_context_guide()
         ctx = _read()
         if verb == "list":
-            cprint(json.dumps(ctx, indent=2))
+            cprint_json(json.dumps(ctx, indent=2))
             return 0
         if verb == "get":
             cprint(ctx.get(args.key))

@@ -107,6 +107,20 @@ def build_packaging_summary(contract: Mapping[str, Any]) -> Optional[Dict[str, A
         "containers": {
             kind: decision.value for kind, decision in sorted(resolution.decisions.items())
         },
+        # Which of those decisions are observable at all. ``containers`` is
+        # total by design — providers index it by their own kinds — so on a
+        # Snowflake-only contract it carries `bucket: owned`, `dataset: owned`
+        # and `cluster: owned` for containers Snowflake has no notion of.
+        # Reporting that verbatim announced ownership of infrastructure the
+        # plan will never touch; every reporter must intersect with this list
+        # first. Additive: ``containers`` keeps its exact shape and values.
+        #
+        # Contract-wide (the union over every bound platform), and it governs
+        # the per-exposure ``containers`` blocks below too. A union can only
+        # ever be a superset of what one exposure maps, so applying it to an
+        # exposure fails in the safe direction — it never hides a container
+        # that exposure really owns.
+        "applicableContainers": sorted(resolution.applicable_kinds),
     }
     if resolution.pool_manifest:
         summary["poolManifest"] = resolution.pool_manifest

@@ -14,6 +14,8 @@
 
 from typing import Any, Dict, List, Tuple
 
+from ._common import iter_exposes
+
 SAFE_BQ_PERMS = {
     "readData": ["roles/bigquery.dataViewer"],
     "readMetadata": ["roles/bigquery.metadataViewer"],
@@ -77,7 +79,7 @@ def compile_policy(contract: dict) -> Tuple[List[Dict[str, Any]], List[str]]:
 
         permissions = g.get("permissions", ["read"])
 
-        for exp in contract.get("exposes", []):
+        for exp in iter_exposes(contract):
             binding = exp.get("binding", {})
             platform = binding.get("platform", "")
             fmt = binding.get("format", "")

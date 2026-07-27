@@ -334,7 +334,7 @@
     },
     "consumers": {
       "type": "array",
-      "description": "NEW in v0.7.6: Declared downstream consumers of this data product — the business artifacts built on it (dashboards, notebooks, analyses, ML apps). Shape follows dbt exposures so existing dbt exposure definitions map field-for-field. Purely declarative and additive: consumers never affect plan/apply, they feed lineage terminal nodes and impact statements ('Affects: Revenue dashboard').",
+      "description": "NEW in v0.7.6: Declared downstream consumers of this data product — the business artifacts built on it (dashboards, notebooks, analyses, ML apps). Shape follows dbt exposures so existing dbt exposure definitions map field-for-field. Purely declarative and additive: consumers never affect plan/apply. RESERVED, not yet consumed — no code reads this key today; it is carried verbatim into plan.json and the contract COMMENT so it survives round-trip, and is intended to feed lineage terminal nodes and impact statements ('Affects: Revenue dashboard') in a later release.",
       "items": {
         "$ref": "#/$defs/consumerRef"
       }

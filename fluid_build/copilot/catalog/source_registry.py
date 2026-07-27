@@ -168,10 +168,21 @@ def _ensure_discovered() -> None:
         discover_source_adapters()
 
 
-def list_source_adapters() -> List[str]:
-    """All registered source names (built-in + plugin), sorted."""
+def list_source_adapters(*, include_blocked: bool = True) -> List[str]:
+    """All registered source names (built-in + plugin), sorted.
+
+    ``include_blocked=False`` drops plugin adapters the operator allow/block
+    policy will refuse to load — for surfaces that *offer* a source to a
+    caller (the ``--source`` choice list), where advertising one that raises
+    the moment it is selected is a listing lie. Kept default-True for the
+    "Supported: ..." hint on an unknown-source error, where naming everything
+    installed is the useful answer.
+    """
     _ensure_discovered()
-    return sorted(_REGISTRY)
+    names = sorted(_REGISTRY)
+    if include_blocked:
+        return names
+    return [n for n in names if not is_source_adapter_blocked(n)]
 
 
 def list_catalog_sources() -> List[str]:
@@ -197,12 +208,41 @@ def get_source_adapter(name: str) -> Optional[SourceAdapterSpec]:
     return _REGISTRY.get(str(name).lower().strip())
 
 
+def is_source_adapter_blocked(name: str) -> bool:
+    """Whether the operator allow/block policy will refuse to load ``name``.
+
+    Built-in sources are not entry-point plugins and are never policy-gated —
+    only ``origin == "entrypoint"`` specs go through ``is_allowed``, matching
+    the gate in :func:`resolve_catalog_adapter_class`.
+    """
+    _ensure_discovered()
+    spec = _REGISTRY.get(str(name).lower().strip())
+    if spec is None or spec.origin != "entrypoint":
+        return False
+    from fluid_build.plugin_manager import is_allowed
+
+    return not is_allowed(spec.name)
+
+
 def source_adapter_inventory() -> List[Dict[str, str]]:
     """Inventory for the ``list_source_adapters`` MCP tool: one dict per source
-    with ``name`` / ``kind`` / ``status`` / ``origin``."""
+    with ``name`` / ``kind`` / ``status`` / ``origin``.
+
+    ``status`` reports the allow/block policy, so a caller is never offered a
+    source that will fail the moment it is selected. It used to be the constant
+    ``"available"``: a blocklisted plugin adapter was advertised as available
+    and only :func:`resolve_catalog_adapter_class` enforced the policy — code
+    execution was correctly prevented, but every listing surface lied about it.
+    ``fluid plugins`` has always marked blocked entries; this matches it.
+    """
     _ensure_discovered()
     return [
-        {"name": s.name, "kind": s.kind, "status": "available", "origin": s.origin}
+        {
+            "name": s.name,
+            "kind": s.kind,
+            "status": "blocked" if is_source_adapter_blocked(s.name) else "available",
+            "origin": s.origin,
+        }
         for s in sorted(_REGISTRY.values(), key=lambda s: (s.kind, s.name))
     ]
 

@@ -104,7 +104,10 @@ def test_query_with_metric_and_dimension(tmp_path):
         table_reference=descriptor.table_reference,
     )
     result = driver.query(compiled=compiled)
-    assert "customer_count" in result.columns
+    # The projection is aliased to the METRIC name, not the underlying
+    # measure, so two metrics over one measure stay distinguishable.
+    assert "active_customers" in result.columns
+    assert "customer_count" not in result.columns
     assert all("signup_date" in row for row in result.rows)
 
 
@@ -193,7 +196,11 @@ def _build_session_state(tmp_path):
     return SessionState(
         contract={"exposes": [expose]},
         expose=expose,
-        policy=OutputPortPolicy.from_contract_and_flags(expose=expose),
+        # The fixture CSV lives under tmp_path, not cwd; ``--readable-paths``
+        # is enforced by the driver now, so name the real data directory.
+        policy=OutputPortPolicy.from_contract_and_flags(
+            expose=expose, readable_paths=(tmp_path.resolve(),)
+        ),
         logger=logging.getLogger("test.output_port.handlers"),
     )
 

@@ -196,3 +196,20 @@ def test_run_soda_scan_propagates_failure(tmp_path):
     assert result.ok is False
     assert result.checks_failed == 3
     assert "connection refused" in result.raw_stderr
+
+
+def test_soda_not_installed_is_exported_from_the_package():
+    """``cli/test.py`` imports ``SodaNotInstalled`` from the package.
+
+    It was defined in ``.runner`` but omitted from the package's
+    ``__all__`` / re-exports, so ``fluid test --engine soda`` died with
+    ``ImportError: cannot import name 'SodaNotInstalled'`` before it
+    could reach either a scan or the designed "soda not installed"
+    message — the advertised alternate engine was 100% unreachable.
+    """
+    import fluid_build.build_runners.soda as soda_pkg
+    from fluid_build.build_runners.soda import SodaNotInstalled as Exported
+    from fluid_build.build_runners.soda.runner import SodaNotInstalled as Defined
+
+    assert Exported is Defined
+    assert "SodaNotInstalled" in soda_pkg.__all__

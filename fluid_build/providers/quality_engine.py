@@ -32,7 +32,10 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from fluid_build.providers._sql_safety import quote_string_literal
+from fluid_build.providers._sql_safety import (
+    dialect_uses_backslash_escapes,
+    quote_string_literal,
+)
 from fluid_build.providers.validation_provider import ValidationIssue
 
 LOG = logging.getLogger("fluid.providers.quality_engine")
@@ -94,6 +97,30 @@ def _accuracy_min_sql(table_ref: str, column: str) -> str:
     return f'SELECT MIN("{col}") AS min_val FROM {table_ref}'
 
 
+def _accuracy_max_sql(table_ref: str, column: str) -> str:
+    """Generate SQL to get the maximum value of a numeric column."""
+    col = _validate_ident(column)
+    return f'SELECT MAX("{col}") AS max_val FROM {table_ref}'
+
+
+def _accuracy_violations_sql(table_ref: str, column: str, operator: str, threshold) -> str:
+    """Count rows whose value does NOT satisfy ``value <operator> threshold``.
+
+    Used for equality/inequality bounds, where no single aggregate can
+    decide the rule: ``MIN(col) == t`` says nothing about the rest of
+    the column.
+    """
+    col = _validate_ident(column)
+    negated = _NEGATED_OPERATORS[operator]
+    # ``threshold`` is schema-typed ``number``; coerce so nothing but a
+    # numeric literal can reach the SQL text.
+    literal = float(threshold)
+    return (
+        f"SELECT COUNT(*) AS violation_count FROM {table_ref} "
+        f'WHERE "{col}" IS NOT NULL AND "{col}" {negated} {literal}'
+    )
+
+
 def _freshness_sql(table_ref: str, column: str, dialect: str = "ansi") -> str:
     """Generate SQL to get age of most-recent timestamp value (in seconds)."""
     col = _validate_ident(column)
@@ -127,6 +154,24 @@ _OPERATORS = {
     "==": lambda a, b: a == b,
     "=": lambda a, b: a == b,
     "!=": lambda a, b: a != b,
+}
+
+# Which aggregate decides a bound rule for the whole column.
+#
+# ``value >= t`` holds for every row iff ``MIN(value) >= t``; ``value <= t``
+# holds for every row iff ``MAX(value) <= t``. Issuing MIN for *every*
+# operator meant an upper bound was decided by the smallest value in the
+# column, so ``ACCOUNT_BALANCE <= 5000`` passed against a column whose
+# minimum is -998.97 and whose maximum is 9999.99.
+_LOWER_BOUND_OPERATORS = frozenset({">=", ">"})
+_UPPER_BOUND_OPERATORS = frozenset({"<=", "<"})
+
+# Equality / inequality bounds are not decidable from a single aggregate —
+# they are evaluated by counting violating rows instead.
+_NEGATED_OPERATORS = {
+    "==": "<>",
+    "=": "<>",
+    "!=": "=",
 }
 
 
@@ -180,6 +225,35 @@ def _parse_duration_seconds(value: str) -> Optional[int]:
         return None
     seconds = int(td.total_seconds())
     return seconds if seconds > 0 else None
+
+
+#: Public alias. The SodaCL exporter normalises ``dqRule.window`` through the
+#: *same* parser the native engine uses, so a window the native engine accepts
+#: can never be silently reinterpreted (or dropped) by the Soda engine.
+parse_duration_seconds = _parse_duration_seconds
+
+
+def extract_valid_values(rule: Dict[str, Any]) -> List[str]:
+    """Allowed values for a ``validity`` / ``valid_values`` rule.
+
+    ``$defs.dqRule`` is ``additionalProperties: false`` and has no
+    ``validValues`` key, so schema-valid contracts declare the list inside
+    the description: ``"COLUMN valid values: A, B, C."``. An explicit
+    ``validValues`` list still wins when present (hand-written files).
+
+    Shared by the native engine and the SodaCL exporter so the two cannot
+    disagree about which values a rule allows.
+    """
+    explicit = rule.get("validValues") or []
+    if explicit:
+        return [str(v) for v in explicit]
+    description = rule.get("description") or ""
+    if not isinstance(description, str) or " valid values:" not in description.lower():
+        return []
+    m = re.search(r"valid values:\s*([^.]+)", description, re.IGNORECASE)
+    if not m:
+        return []
+    return [v.strip() for v in m.group(1).split(",") if v.strip()]
 
 
 # ------------------------------------------------------------------
@@ -239,13 +313,8 @@ def execute_quality_checks(
         try:
             # Support validValues from explicit key OR parsed from description
             # Description format: "column valid values: val1, val2, val3."
-            explicit_vv = rule.get("validValues", [])
-            if not explicit_vv and description and " valid values:" in description.lower():
-                import re as _re
-
-                m = _re.search(r"valid values:\s*([^.]+)", description, _re.IGNORECASE)
-                if m:
-                    explicit_vv = [v.strip() for v in m.group(1).split(",") if v.strip()]
+            # Shared with the SodaCL exporter so both engines read the same list.
+            explicit_vv = extract_valid_values(rule)
 
             result = _execute_single_rule(
                 rule_id=rule_id,
@@ -301,6 +370,24 @@ def quality_results_to_issues(
 # ------------------------------------------------------------------
 # Internal dispatch
 # ------------------------------------------------------------------
+
+# Rule types this engine can actually execute.
+_IMPLEMENTED_RULE_TYPES = frozenset(
+    {
+        "completeness",
+        "uniqueness",
+        "accuracy",
+        "validity",
+        "valid_values",
+        "freshness",
+        "anomaly_detection",
+    }
+)
+
+# Rule types ``$defs.dqRule.type`` accepts but this engine cannot run.
+# They are reported as failures at the rule's declared severity so a gate
+# nobody is enforcing can never read as green.
+_UNIMPLEMENTED_RULE_TYPES = frozenset({"schema", "drift_detection"})
 
 
 def _execute_single_rule(
@@ -361,6 +448,7 @@ def _execute_single_rule(
             valid_values,
             table_ref,
             execute_fn,
+            dialect,
         )
     elif rule_type == "freshness":
         return _check_freshness(
@@ -395,6 +483,33 @@ def _execute_single_rule(
             valid_values,
             table_ref,
             execute_fn,
+            dialect,
+        )
+    elif rule_type in _UNIMPLEMENTED_RULE_TYPES:
+        # Schema-legal but not executable by the native engine. Reporting
+        # this at a hardcoded 'warning' meant a governance gate the author
+        # declared `severity: error` silently exited 0 — the author
+        # believes the gate is enforced and nothing is enforcing it.
+        #
+        # The remedy deliberately does NOT offer `--engine soda`: the Soda
+        # engine has no faithful SodaCL rendering for these two types either
+        # (see exporters/sodacl._NO_SODACL_EQUIVALENT), so routing the author
+        # there would just move the unenforced gate to a different command.
+        return QualityCheckResult(
+            rule_id=rule_id,
+            rule_type=rule_type,
+            selector=selector,
+            passed=False,
+            severity=severity,
+            message=(
+                f"Rule '{rule_id}' has type '{rule_type}', which the native "
+                "quality engine does not implement — this gate is NOT being "
+                "enforced. No fluid engine implements it (`--engine soda` "
+                "reports it as unmapped too); express the check as one of: "
+                f"{', '.join(sorted(_IMPLEMENTED_RULE_TYPES))}."
+            ),
+            expected=f"an implemented rule type ({rule_type} is not)",
+            actual="not executed",
         )
     else:
         return QualityCheckResult(
@@ -402,8 +517,11 @@ def _execute_single_rule(
             rule_type=rule_type,
             selector=selector,
             passed=False,
-            severity="warning",
-            message=f"Unknown DQ rule type '{rule_type}' for rule '{rule_id}'",
+            severity=severity,
+            message=(
+                f"Unknown DQ rule type '{rule_type}' for rule '{rule_id}' — "
+                f"expected one of: {', '.join(sorted(_IMPLEMENTED_RULE_TYPES))}"
+            ),
         )
 
 
@@ -482,10 +600,41 @@ def _check_accuracy(
     table_ref,
     execute_fn,
 ) -> QualityCheckResult:
-    sql = _accuracy_min_sql(table_ref, selector)
+    # A bound rule asserts something about EVERY row, so the aggregate
+    # that decides it depends on the direction of the bound. Always
+    # asking for MIN() made every upper bound ('<=', '<') trivially true
+    # and every equality bound undecidable.
+    if threshold is not None and operator in _NEGATED_OPERATORS:
+        sql = _accuracy_violations_sql(table_ref, selector, operator, threshold)
+        rows = execute_fn(sql)
+        violations = rows[0][0] if rows and rows[0][0] is not None else 0
+        passed = int(violations) == 0
+        return QualityCheckResult(
+            rule_id=rule_id,
+            rule_type="accuracy",
+            selector=selector,
+            passed=passed,
+            severity=severity,
+            message=(
+                f"{description or rule_id} — {violations} row(s) in '{selector}' "
+                f"do not satisfy {operator} {threshold}"
+                if not passed
+                else f"Accuracy OK for '{selector}'"
+            ),
+            expected=f"0 rows violating {operator} {threshold}",
+            actual=f"{violations} violating row(s)",
+        )
+
+    use_max = operator in _UPPER_BOUND_OPERATORS
+    aggregate = "max" if use_max else "min"
+    sql = (
+        _accuracy_max_sql(table_ref, selector)
+        if use_max
+        else _accuracy_min_sql(table_ref, selector)
+    )
     rows = execute_fn(sql)
-    min_val = rows[0][0] if rows and rows[0][0] is not None else None
-    if min_val is None:
+    bound_val = rows[0][0] if rows and rows[0][0] is not None else None
+    if bound_val is None:
         return QualityCheckResult(
             rule_id=rule_id,
             rule_type="accuracy",
@@ -494,7 +643,7 @@ def _check_accuracy(
             severity=severity,
             message=f"No data to check accuracy for '{selector}'",
         )
-    passed = _compare(min_val, threshold, operator) if threshold is not None else True
+    passed = _compare(bound_val, threshold, operator) if threshold is not None else True
     return QualityCheckResult(
         rule_id=rule_id,
         rule_type="accuracy",
@@ -502,12 +651,12 @@ def _check_accuracy(
         passed=passed,
         severity=severity,
         message=(
-            f"{description or rule_id} — min value of '{selector}' is {min_val}"
+            f"{description or rule_id} — {aggregate} value of '{selector}' is {bound_val}"
             if not passed
             else f"Accuracy OK for '{selector}'"
         ),
         expected=f"{operator} {threshold}" if threshold is not None else "pass",
-        actual=str(min_val),
+        actual=str(bound_val),
     )
 
 
@@ -519,19 +668,37 @@ def _check_validity(
     valid_values,
     table_ref,
     execute_fn,
+    dialect: str = "ansi",
 ) -> QualityCheckResult:
     if not valid_values:
+        # A misconfigured gate is a failed gate. Forcing 'warning' here
+        # overrode the author's declared severity, so a rule declared
+        # `severity: error` that checks nothing at all exited 0.
         return QualityCheckResult(
             rule_id=rule_id,
             rule_type="validity",
             selector=selector,
             passed=False,
-            severity="warning",
-            message=f"Rule '{rule_id}' is type 'validity' but has no 'validValues' list",
+            severity=severity,
+            message=(
+                f"Rule '{rule_id}' is a valid_values rule but declares no allowed "
+                "values, so nothing was checked. Declare them in the description "
+                f"(\"{selector or 'COLUMN'} valid values: A, B, C.\") or as a "
+                "'validValues' list."
+            ),
+            expected="a non-empty list of allowed values",
+            actual="no allowed values declared",
         )
     col = _validate_ident(selector)
-    # Build SQL with quoted string literals for valid values
-    escaped = ", ".join(quote_string_literal(str(v)) for v in valid_values)
+    # Build SQL with quoted string literals for valid values. The literals are
+    # contract-supplied, so the quoting must hold on the *target* dialect:
+    # Snowflake/BigQuery honour ``\`` escapes inside ``'...'``, and a value
+    # ending in a backslash would otherwise terminate the literal early and
+    # append live SQL to this predicate (silently flipping the check to pass).
+    backslash_escapes = dialect_uses_backslash_escapes(dialect)
+    escaped = ", ".join(
+        quote_string_literal(str(v), backslash_escapes=backslash_escapes) for v in valid_values
+    )
     sql = (
         f"SELECT COUNT(*) AS invalid_count FROM {table_ref} "
         f'WHERE "{col}" IS NOT NULL AND "{col}" NOT IN ({escaped})'
@@ -658,7 +825,8 @@ def _check_anomaly_detection(
             actual=str(row_count),
         )
     else:
-        # Column-level anomaly: check MIN value
+        # Column-level anomaly: delegate to the bound check, which picks
+        # MIN or MAX (or a violating-row count) from the operator.
         return _check_accuracy(
             rule_id, selector, severity, description, threshold, operator, table_ref, execute_fn
         )

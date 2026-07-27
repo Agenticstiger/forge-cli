@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from fluid_build.cli.console import cprint, success
+from fluid_build.cli.console import cprint, cprint_json, success
 from fluid_build.cli.console import error as console_error
 
 # Rich imports for enhanced output
@@ -55,6 +55,8 @@ except ImportError:
 
 from ..providers.validation_cache import ValidationCache, ValidationResultHistory
 from ..providers.validation_provider import ValidationProvider
+from ..severity import is_error as _is_error_severity
+from ..severity import is_warning as _is_warning_severity
 from ._common import load_contract_with_overlay
 
 if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
@@ -130,6 +132,27 @@ class ValidationIssue:
 
 
 @dataclass
+class CheckOutcome:
+    """A named check that actually executed, and whether it passed.
+
+    ``ValidationIssue`` only ever describes something that went *wrong*,
+    so a report made of issues alone cannot distinguish "ran and passed"
+    from "never ran". ``CheckOutcome`` records the executed checks —
+    today the per-rule data-quality gates — so ``checks_passed`` counts
+    passing checks and machine-readable reports (JUnit) can emit one
+    test case per rule instead of one per issue category.
+    """
+
+    name: str
+    category: str
+    passed: bool
+    severity: str = "error"
+    message: str = ""
+    expected: Optional[Any] = None
+    actual: Optional[Any] = None
+
+
+@dataclass
 class ValidationReport:
     """Complete validation report for a FLUID contract."""
 
@@ -144,6 +167,11 @@ class ValidationReport:
     checks_passed: int = 0
     checks_failed: int = 0
     provider_name: Optional[str] = None
+    checks: List[CheckOutcome] = field(default_factory=list)
+    #: False when ``--no-data`` skipped every live-resource check, so
+    #: renderers can say SKIPPED instead of asserting a green tick for a
+    #: check that never ran.
+    data_checks_performed: bool = True
 
     def add_issue(
         self,
@@ -168,16 +196,32 @@ class ValidationReport:
             documentation_url=documentation_url,
         )
         self.issues.append(issue)
-        if severity == "error":
+        # Only failures move the counters. Counting every non-error issue
+        # as a "passed check" made the metric read *count of advisory
+        # issues* — a report with more problems reported more passes,
+        # and a failed ``critical`` DQ rule landed in ``checks_passed``.
+        if _is_error_severity(severity):
             self.checks_failed += 1
-        else:
+
+    def record_check(self, outcome: CheckOutcome) -> None:
+        """Record a named check that actually ran.
+
+        Failures at error severity are already counted by
+        :meth:`add_issue` (the caller emits the matching issue), so only
+        non-error failures are counted here — that way every failed
+        check lands in ``checks_failed`` exactly once.
+        """
+        self.checks.append(outcome)
+        if outcome.passed:
             self.checks_passed += 1
+        elif not _is_error_severity(outcome.severity):
+            self.checks_failed += 1
 
     def get_errors(self) -> List[ValidationIssue]:
-        return [i for i in self.issues if i.severity == "error"]
+        return [i for i in self.issues if _is_error_severity(i.severity)]
 
     def get_warnings(self) -> List[ValidationIssue]:
-        return [i for i in self.issues if i.severity == "warning"]
+        return [i for i in self.issues if _is_warning_severity(i.severity)]
 
     def is_valid(self) -> bool:
         return len(self.get_errors()) == 0
@@ -263,6 +307,17 @@ class ContractValidator:
 
             raise ContractLoadError(str(self.contract_path), str(e))
 
+        # ``{{ env.VAR }}`` in binding.location is the shipped convention
+        # for Snowflake contracts (see examples/snowflake/smoke). plan,
+        # apply, verify and publish all resolve it; validation did not,
+        # so the raw placeholder text was quoted straight into a
+        # Snowflake identifier and a live table was reported missing as
+        # `"{{ env.SNOWFLAKE_DATABASE }}"."{{ env.SNOWFLAKE_SCHEMA }}"."T"`.
+        # Sensitive-looking placeholders are left literal by the helper.
+        from .._contract_loader import resolve_contract_env_templates
+
+        self.contract = resolve_contract_env_templates(self.contract)
+
         # Initialize report
         contract_id = self.contract.get("id", "unknown")
         contract_version = self.contract.get("version", "0.0.0")
@@ -273,6 +328,7 @@ class ContractValidator:
             contract_version=contract_version,
             validation_time=datetime.now(),
             duration=0.0,
+            data_checks_performed=self.check_data,
         )
 
         # Step 1: Validate contract syntax against schema
@@ -298,10 +354,31 @@ class ContractValidator:
         # Step 6: Validate metadata and governance
         self._validate_metadata()
 
+        # Release the provider's live connection (Snowflake holds ONE shared
+        # session for the whole run — see SnowflakeValidationProvider._connect)
+        # so a long-lived embedder isn't left with an open warehouse session.
+        self._close_validation_provider()
+
         # Finalize report
         self.report.duration = time.time() - start_time
 
         return self.report
+
+    def _close_validation_provider(self) -> None:
+        """Close the validation provider's connection if it holds one.
+
+        ``close`` is optional on the ``ValidationProvider`` surface (only the
+        connection-holding providers implement it), so this is a duck-typed
+        best-effort call — a provider without it, or one that raises on
+        teardown, must never fail the validation run.
+        """
+        close = getattr(self.validation_provider, "close", None)
+        if close is None:
+            return
+        try:
+            close()
+        except Exception as exc:  # noqa: BLE001 - teardown must not fail the run
+            LOG.debug("validation_provider_close_failed: %s", exc)
 
     def _validate_contract_schema(self) -> None:
         """Validate contract against FLUID schema."""
@@ -655,42 +732,46 @@ class ContractValidator:
                 "error", "binding", f"Missing 'platform' in binding for {expose_id}", path
             )
 
+        # ``format`` and ``properties`` are siblings of ``location`` on
+        # ``binding``, not members of it — ``$defs.bindingLocation`` is
+        # ``additionalProperties: false`` and defines neither, so a
+        # contract can never satisfy a check for ``location.format``.
+        # Looking in the wrong place emitted two unsatisfiable warnings
+        # for every expose, which made ``--strict`` impossible to pass.
+        if "format" not in binding:
+            self.report.add_issue(
+                "warning",
+                "binding",
+                f"Missing 'format' in binding for {expose_id}",
+                f"{path}.format",
+            )
+
         if "location" not in binding:
             self.report.add_issue(
                 "error", "binding", f"Missing 'location' in binding for {expose_id}", path
             )
         else:
+            # A non-object location/properties is a schema error the
+            # jsonschema pass already reported; treat it as empty rather
+            # than doing a substring ``in`` test against a string.
             location = binding["location"]
+            if not isinstance(location, dict):
+                location = {}
 
-            # Validate location has required fields
-            if "format" not in location:
-                self.report.add_issue(
-                    "warning",
-                    "binding",
-                    f"Missing 'format' in location for {expose_id}",
-                    f"{path}.location",
-                )
-
-            if "properties" not in location:
-                self.report.add_issue(
-                    "warning",
-                    "binding",
-                    f"Missing 'properties' in location for {expose_id}",
-                    f"{path}.location",
-                )
-            else:
-                props = location["properties"]
-                # Provider-specific validation
-                if self.provider_name == "gcp":
-                    required_props = ["project", "dataset", "table"]
-                    for prop in required_props:
-                        if prop not in props:
-                            self.report.add_issue(
-                                "error",
-                                "binding",
-                                f"Missing required property '{prop}' for GCP binding",
-                                f"{path}.location.properties.{prop}",
-                            )
+            # GCP addresses tables via binding.properties (the FLUID
+            # pattern) or directly on binding.location.
+            props = binding.get("properties")
+            if not isinstance(props, dict):
+                props = {}
+            if self.provider_name == "gcp":
+                for prop in ("project", "dataset", "table"):
+                    if prop not in props and prop not in location:
+                        self.report.add_issue(
+                            "error",
+                            "binding",
+                            f"Missing required property '{prop}' for GCP binding",
+                            f"{path}.location.{prop}",
+                        )
 
     def _run_expose_quality_checks(
         self,
@@ -703,18 +784,98 @@ class ContractValidator:
         LOG.debug("Running %d quality checks for %s", len(rules), expose_id)
         try:
             issues = self.validation_provider.run_quality_checks(expose, rules)
-            for issue in issues:
-                # Prefix the issue path with the expose path
-                issue_path = f"{path_prefix}.dq.{issue.path}" if issue.path else f"{path_prefix}.dq"
-                self.report.add_issue(issue.severity, issue.category, issue.message, issue_path)
         except Exception as exc:
             LOG.warning("Quality check execution failed for %s: %s", expose_id, exc)
             self.report.add_issue(
-                "warning",
+                "error",
                 "quality",
                 f"Quality check execution failed: {exc}",
                 f"{path_prefix}.dq",
+                suggestion="Check provider credentials, the bound table, and the DQ rule syntax",
             )
+            return
+
+        for issue in issues:
+            # Provider paths are already rooted at ``contract.dq.rules``;
+            # inserting another ``.dq`` produced the doubled
+            # ``exposes[0].dq.contract.dq.rules.<id>``. ``expected`` and
+            # ``actual`` carry the measured value and the threshold and
+            # were being dropped on the floor by a positional call.
+            issue_path = f"{path_prefix}.{issue.path}" if issue.path else f"{path_prefix}.dq"
+            self.report.add_issue(
+                issue.severity,
+                issue.category,
+                issue.message,
+                issue_path,
+                expected=issue.expected,
+                actual=issue.actual,
+                suggestion=issue.suggestion,
+                documentation_url=issue.documentation_url,
+            )
+
+        self._record_quality_outcomes(expose_id, rules, issues)
+
+    def _record_quality_outcomes(
+        self,
+        expose_id: str,
+        rules: List[Dict[str, Any]],
+        issues: List[Any],
+    ) -> None:
+        """Record one :class:`CheckOutcome` per DQ rule that actually ran.
+
+        ``ValidationProvider.run_quality_checks`` returns one issue per
+        rule that did *not* pass, with ``path`` ending in the rule id
+        (see ``quality_engine.quality_results_to_issues``). Rules with no
+        matching issue therefore ran and passed.
+
+        A provider that could not execute the rules at all (missing
+        table reference, unsupported provider) returns generic issues
+        whose path carries no rule id. In that case nothing is recorded
+        as passing — inferring passes from an unexecuted batch is
+        exactly the false claim this accounting exists to prevent.
+        """
+        declared = [r.get("id") for r in rules if isinstance(r, dict) and r.get("id")]
+        if not declared:
+            return
+
+        by_rule: Dict[str, Any] = {}
+        for issue in issues:
+            rule_id = (getattr(issue, "path", "") or "").rsplit(".", 1)[-1]
+            if rule_id in declared:
+                by_rule[rule_id] = issue
+            else:
+                # Un-attributable issue → the batch did not run per-rule.
+                return
+
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            rule_id = rule.get("id")
+            if not rule_id:
+                continue
+            issue = by_rule.get(rule_id)
+            if issue is None:
+                outcome = CheckOutcome(
+                    name=f"{expose_id}.{rule_id}",
+                    category="quality",
+                    passed=True,
+                    severity=rule.get("severity", "error"),
+                    message=(
+                        f"{rule.get('type', 'rule')} check passed for "
+                        f"'{rule.get('selector', '')}'"
+                    ),
+                )
+            else:
+                outcome = CheckOutcome(
+                    name=f"{expose_id}.{rule_id}",
+                    category="quality",
+                    passed=False,
+                    severity=issue.severity or rule.get("severity", "error"),
+                    message=issue.message,
+                    expected=issue.expected,
+                    actual=issue.actual,
+                )
+            self.report.record_check(outcome)
 
     def _validate_schema_definition(
         self, schema: List[Dict[str, Any]], path: str, expose_id: str
@@ -938,7 +1099,7 @@ class ContractValidator:
         try:
             # Cache lookup
             actual_schema = None
-            cache_key = f"{self.provider_name}:{expose_id}"
+            cache_key = self._resource_cache_key(expose, expose_id)
             if self.cache:
                 actual_schema = self.cache.get_schema(cache_key, self.provider_name)
                 if actual_schema:
@@ -1010,6 +1171,61 @@ class ContractValidator:
                 suggestion="Check provider credentials and connectivity",
             )
 
+    def _resource_cache_key(self, expose: Dict[str, Any], expose_id: str) -> str:
+        """Cache identity for an expose's bound resource.
+
+        The key must identify the *resource*, not the contract's label
+        for it. Keying on ``provider:exposeId`` meant two contracts that
+        happen to share an ``exposeId`` shared a cache entry, so a
+        contract pointing at a table that does not exist was validated
+        against another table's cached schema and reported "Resource
+        exists / All fields match" with exit 0.
+
+        Falls back to the expose id only when the binding carries no
+        addressable location at all (there is nothing better to key on,
+        and no schema will have been fetched for it either).
+        """
+        binding = expose.get("binding", {})
+        location = binding.get("location", {}) if isinstance(binding, dict) else {}
+        props = binding.get("properties", {}) if isinstance(binding, dict) else {}
+        if not isinstance(location, dict):
+            location = {}
+        if not isinstance(props, dict):
+            props = {}
+
+        # A binding may omit database/schema and inherit them from the
+        # provider connection (SNOWFLAKE_DATABASE / SNOWFLAKE_SCHEMA).
+        # Those defaults are part of the resource's identity: the same
+        # table name under two different databases is two tables.
+        defaults = {
+            "database": getattr(self.validation_provider, "database", None),
+            "schema": getattr(self.validation_provider, "schema", None),
+            "project": getattr(self.validation_provider, "project_id", None),
+        }
+
+        # Ordered from broadest scope to narrowest so the joined key
+        # reads like a fully-qualified name for every provider shape
+        # (warehouse: database/schema/table, BigQuery: project/dataset/
+        # table, object store: bucket/path, streaming: topic/stream).
+        parts = [
+            location.get(k) or props.get(k) or defaults.get(k)
+            for k in (
+                "account",
+                "project",
+                "database",
+                "dataset",
+                "bucket",
+                "schema",
+                "namespace",
+                "table",
+                "path",
+                "topic",
+                "stream",
+            )
+        ]
+        fqn = ".".join(str(p) for p in parts if p)
+        return f"{self.provider_name}:{fqn or expose_id}"
+
     def _build_snowflake_config(self) -> Dict[str, Any]:
         """Build Snowflake provider config from contract bindings + env vars."""
         from fluid_build.providers.snowflake.util.config import resolve_snowflake_settings
@@ -1061,9 +1277,28 @@ class ContractValidator:
         LOG.info("Validating quality specifications...")
 
         quality = self.contract.get("quality", {})
+        if not isinstance(quality, dict):
+            quality = {}
 
         if not quality:
-            self.report.add_issue("info", "quality", "No quality specifications defined", "quality")
+            # DQ rules live on the expose (``exposes[].contract.dq.rules``
+            # or ``exposes[].dq.rules``) — the root ``quality`` key is not
+            # a property of any 0.7.x schema and the root is
+            # ``additionalProperties: false``, so it can never be set.
+            # Reporting "No quality specifications defined" off that key
+            # fired on 100% of contracts, including runs that had just
+            # executed (and failed) live DQ rules.
+            if not self._declared_dq_rule_count():
+                self.report.add_issue(
+                    "info",
+                    "quality",
+                    "No data-quality rules declared on any expose",
+                    "exposes[].contract.dq.rules",
+                    suggestion=(
+                        "Add rules under exposes[].contract.dq.rules to have "
+                        "`fluid test` check this product against live data"
+                    ),
+                )
             return
 
         # Validate SLA if present
@@ -1090,6 +1325,20 @@ class ContractValidator:
                     f"quality.tests[{idx}]",
                 )
 
+    def _declared_dq_rule_count(self) -> int:
+        """Total DQ rules declared across every expose in the contract."""
+        total = 0
+        for expose in self._iter_objects("exposes"):
+            rules = expose.get("dq", {})
+            rules = rules.get("rules", []) if isinstance(rules, dict) else []
+            if not rules:
+                contract_block = expose.get("contract", {})
+                dq = contract_block.get("dq", {}) if isinstance(contract_block, dict) else {}
+                rules = dq.get("rules", []) if isinstance(dq, dict) else []
+            if isinstance(rules, list):
+                total += len(rules)
+        return total
+
     def _validate_metadata(self) -> None:
         """Validate metadata and governance fields."""
         LOG.info("Validating metadata and governance...")
@@ -1102,19 +1351,31 @@ class ContractValidator:
         if metadata is not None and not isinstance(metadata, dict):
             return
 
+        # ``domain`` is a *root* key — ``metadata`` is
+        # ``additionalProperties: false`` and does not define it, so
+        # checking ``metadata.domain`` produced advice that makes
+        # ``fluid validate`` fail if it is followed.
+        if not self.contract.get("domain"):
+            self.report.add_issue(
+                "info",
+                "metadata",
+                "Recommended field 'domain' not present",
+                "domain",
+                suggestion="Set the top-level `domain:` key (e.g. domain: finance)",
+            )
+
         if not metadata:
             self.report.add_issue("warning", "metadata", "No metadata section defined", "metadata")
             return
 
-        # Check recommended metadata fields
-        recommended_fields = ["owner", "layer", "domain", "tags"]
-        for field in recommended_fields:
-            if field not in metadata:
+        # Check recommended metadata fields.
+        for fld in ("owner", "layer", "tags"):
+            if fld not in metadata:
                 self.report.add_issue(
                     "info",
                     "metadata",
-                    f"Recommended metadata field '{field}' not present",
-                    f"metadata.{field}",
+                    f"Recommended metadata field '{fld}' not present",
+                    f"metadata.{fld}",
                 )
 
         # Validate layer if present
@@ -1430,4 +1691,4 @@ def output_json_report(report: ValidationReport, output_file: Optional[str] = No
             f.write(json_output)
         success(f"Report saved to: {output_file}")
     else:
-        cprint(json_output)
+        cprint_json(json_output)

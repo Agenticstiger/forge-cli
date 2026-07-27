@@ -36,7 +36,7 @@ import logging
 from pathlib import Path
 
 from fluid_build.cli._common import CLIError
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_json
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
 COMMAND = "validate-artifacts"
@@ -169,7 +169,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     verbose = bool(getattr(args, "verbose", False))
 
     if out_format == "json":
-        cprint(json.dumps(report.to_dict(), indent=2))
+        cprint_json(json.dumps(report.to_dict(), indent=2))
     elif not quiet:
         icon = "✅" if report.status == "pass" else "❌"
         cprint(f"{icon} Artifacts {report.status}: {artifacts_dir}")

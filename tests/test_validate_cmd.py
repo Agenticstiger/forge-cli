@@ -56,6 +56,52 @@ def test_determine_target_version_defaults_to_latest_compatible():
     assert auto_selected is True
 
 
+def test_untagged_contract_never_auto_selects_a_preview_version():
+    """An untagged contract must default to the newest STABLE schema.
+
+    ``_find_latest_compatible_version`` took ``compatible_versions[-1]`` off
+    the raw list, so a bundled preview (0.7.6) became the silent default for
+    every contract with no ``fluidVersion`` — the exact outcome
+    ``PREVIEW_VERSIONS`` exists to prevent.
+    """
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    schema_manager = MagicMock()
+    schema_manager.detect_version.return_value = None
+    schema_manager.list_available_versions.return_value = list(FluidSchemaManager.BUNDLED_VERSIONS)
+
+    version, auto_selected = _determine_target_version(
+        contract={},
+        args=_args(),
+        schema_manager=schema_manager,
+        logger=logging.getLogger("test"),
+    )
+
+    assert auto_selected is True
+    assert str(version) == FluidSchemaManager.latest_bundled_version()
+    assert str(version) not in FluidSchemaManager.PREVIEW_VERSIONS
+
+
+def test_an_explicit_min_version_can_still_opt_into_a_preview():
+    """Preview is opt-in, not unreachable: a constraint that leaves only a
+    preview must still resolve to it rather than falling off the list."""
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    preview = sorted(FluidSchemaManager.PREVIEW_VERSIONS)[-1]
+    schema_manager = MagicMock()
+    schema_manager.detect_version.return_value = None
+    schema_manager.list_available_versions.return_value = list(FluidSchemaManager.BUNDLED_VERSIONS)
+
+    version, _auto = _determine_target_version(
+        contract={},
+        args=_args(min_version=preview),
+        schema_manager=schema_manager,
+        logger=logging.getLogger("test"),
+    )
+
+    assert str(version) == preview
+
+
 def test_find_previous_compatible_version_steps_back_one_version():
     schema_manager = MagicMock()
     schema_manager.list_available_versions.return_value = ["0.4.0", "0.5.7", "0.7.1", "0.7.2"]
@@ -95,3 +141,54 @@ def test_validate_with_version_fallback_retries_previous_version_once():
         "0.7.2",
         "0.7.1",
     ]
+
+
+# ---------------------------------------------------------------------
+# ``--format json`` must emit JSON a machine can parse.
+#
+# The payload went out through ``cprint`` → Rich, which word-wraps at the
+# console width (80 when stdout is a pipe). Any validation message longer
+# than that got a newline injected mid-string — a literal control
+# character inside a JSON string — so ``json.load`` refused the document
+# with "Invalid control character". Every long message tripped it,
+# including the semantics guards that exist precisely so a machine
+# consumer can read them.
+# ---------------------------------------------------------------------
+
+
+def test_json_output_is_parseable_with_a_long_message(capsys):
+    import json as _json
+
+    from fluid_build.cli.validate import _output_json_results
+
+    long_message = (
+        "expose 'orders_enriched': metric 'order_status' has the same name as "
+        "dimension 'order_status'. Metric, measure and dimension names share "
+        "one namespace, so a query for this metric grouped by that dimension "
+        "would project two columns with one name."
+    )
+    result = ValidationResult(is_valid=True)
+    result.warnings = [long_message]
+    result.schema_version = None
+    result.validation_time = 0.001
+
+    exit_code = _output_json_results(result, _args(format="json"))
+
+    payload = _json.loads(capsys.readouterr().out)
+    assert payload["warnings"] == [long_message]
+    assert payload["valid"] is True
+    assert exit_code == 0
+
+
+def test_json_output_strict_exit_code_still_reflects_warnings(capsys):
+    import json as _json
+
+    from fluid_build.cli.validate import _output_json_results
+
+    result = ValidationResult(is_valid=True)
+    result.warnings = ["short warning"]
+    result.schema_version = None
+    result.validation_time = 0.001
+
+    assert _output_json_results(result, _args(format="json", strict=True)) == 1
+    assert _json.loads(capsys.readouterr().out)["warnings"] == ["short warning"]

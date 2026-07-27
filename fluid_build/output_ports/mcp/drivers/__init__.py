@@ -32,8 +32,10 @@ Postgres / Redshift driver as a private wheel only need to:
 
 from __future__ import annotations
 
+import inspect
 import logging
-from typing import Any, Dict, Mapping, Optional, Tuple, Type
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Type
 
 from .athena import AthenaDriver
 from .base import EngineDriver, UnsupportedBindingError, get_binding
@@ -91,12 +93,30 @@ def supported_keys() -> Tuple[DriverKey, ...]:
     return tuple(sorted(_DRIVER_REGISTRY.keys()))
 
 
+def _accepts_kwarg(driver_class: Type[EngineDriver], name: str) -> bool:
+    """Whether ``driver_class.__init__`` accepts the keyword ``name``.
+
+    Out-of-tree drivers registered via :func:`register_driver` may predate a
+    keyword the in-tree drivers grew, so :func:`build_driver` probes before
+    forwarding rather than raising ``TypeError`` inside a customer's wheel.
+    A ``**kwargs`` catch-all counts as accepting.
+    """
+    try:
+        params = inspect.signature(driver_class.__init__).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic callables
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def build_driver(
     *,
     expose: Mapping[str, Any],
     contract: Mapping[str, Any],
     logger: Optional[logging.Logger] = None,
     extra_kwargs: Optional[Mapping[str, Any]] = None,
+    readable_paths: Sequence[Path] = (),
 ) -> EngineDriver:
     """Build the right driver for the given expose's binding.
 
@@ -104,6 +124,13 @@ def build_driver(
     ``(platform, format)`` pair. The error message lists the keys
     that are registered so an operator can install the right extra
     or register an out-of-tree driver.
+
+    ``readable_paths`` is the operator's ``--readable-paths`` allowlist. It
+    MUST be forwarded to the driver: the file-backed drivers gate
+    ``binding.location.path`` / ``attach`` / ``dbFile`` against it, and a
+    driver built without it silently reads any host path the served contract
+    names. Callers that omit it get an unconfined driver, which is only
+    correct for in-process/test construction.
     """
     platform, fmt, _ = get_binding(expose)
     key = (platform, fmt)
@@ -118,6 +145,19 @@ def build_driver(
         "contract": contract,
         "logger": logger,
     }
+    if readable_paths:
+        if _accepts_kwarg(driver_class, "readable_paths"):
+            kwargs["readable_paths"] = tuple(readable_paths)
+        else:
+            # Never drop the allowlist quietly — an operator who passed
+            # --readable-paths must be told when a driver cannot honour it.
+            _LOG.warning(
+                "driver %s does not accept readable_paths; the --readable-paths "
+                "allowlist is NOT enforced for binding (%r, %r)",
+                driver_class.__name__,
+                platform,
+                fmt,
+            )
     if extra_kwargs:
         kwargs.update(extra_kwargs)
     return driver_class(**kwargs)

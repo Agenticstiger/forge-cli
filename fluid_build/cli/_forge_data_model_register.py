@@ -145,6 +145,9 @@ def register_forge_subcommand(subparsers: argparse._SubParsersAction) -> None:
     # Source choices come from the shared registry (built-in catalog +
     # JDBC sources, plus any ``fluid_build.source_adapters`` plugins) so a
     # pip-installed adapter appears in ``--source`` without editing the CLI.
+    # ``include_blocked=False``: a plugin the operator's allow/block policy
+    # will refuse to load must not be offered as a valid choice — selecting it
+    # raises from ``resolve_catalog_adapter_class`` moments later.
     from fluid_build.copilot.catalog.source_registry import list_source_adapters
 
     from_source.add_argument(
@@ -154,7 +157,7 @@ def register_forge_subcommand(subparsers: argparse._SubParsersAction) -> None:
         # validates that a source is present for every non-custom run.
         required=False,
         default=None,
-        choices=list_source_adapters(),
+        choices=list_source_adapters(include_blocked=False),
         help=(
             "Which metadata-source catalog to read from. Catalogs "
             "(snowflake/unity/bigquery/dataplex/glue/datahub/"

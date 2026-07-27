@@ -28,7 +28,7 @@ import platform
 import sys
 from typing import Any, Dict
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_json
 from fluid_build.cli.forge_banner import compact_next_line
 
 from .. import __version__ as CLI_VERSION
@@ -111,7 +111,7 @@ def run(args, logger: logging.Logger) -> int:
         # Output in requested format
         output_format = getattr(args, "format", "text")
         if output_format == "json":
-            cprint(json.dumps(version_info, indent=2))
+            cprint_json(json.dumps(version_info, indent=2))
         else:
             _display_version_info(version_info, getattr(args, "verbose", False))
 
@@ -129,18 +129,19 @@ def _gather_version_info(args) -> Dict[str, Any]:
     from ..schema_manager import FluidSchemaManager
 
     supported_versions = FluidSchemaManager.BUNDLED_VERSIONS
-    latest_version = (
-        supported_versions[-1]
-        if supported_versions
-        else FluidSchemaManager.latest_bundled_version()
-    )
+    # ``default``/``latest`` must be the newest STABLE version. Taking
+    # ``supported_versions[-1]`` bypassed the preview gate and advertised the
+    # opt-in preview as the default a control plane should author against.
+    latest_version = FluidSchemaManager.latest_bundled_version()
     default_version = latest_version
+    preview_versions = [v for v in supported_versions if v in FluidSchemaManager.PREVIEW_VERSIONS]
     version_info = {
         "cli": {"version": CLI_VERSION, "api_version": "v1", "build": "production"},
         "spec_versions": {
             "supported": supported_versions,
             "default": default_version,
             "latest": latest_version,
+            "preview": preview_versions,
         },
         "features": _detect_features(),
         "providers": _detect_providers(),
@@ -237,6 +238,17 @@ def _detect_providers() -> Dict[str, str]:
     return providers
 
 
+def _format_supported_versions(spec_info: Dict[str, Any]) -> str:
+    """Render the supported-version list with preview versions marked.
+
+    ``fluid version`` is the surface operators (and control planes) read to
+    decide which ``fluidVersion`` to author; an opt-in preview listed next to
+    the GA versions with no marker reads as "safe to use".
+    """
+    preview = set(spec_info.get("preview") or ())
+    return ", ".join(f"{v} (preview)" if v in preview else v for v in spec_info["supported"])
+
+
 def _display_version_info(version_info: Dict[str, Any], verbose: bool = False):
     """Display version information with appropriate formatting"""
 
@@ -252,9 +264,9 @@ Version: {cli_info["version"]}
 API: {cli_info["api_version"]}
 
 [bold cyan]Supported Specifications:[/bold cyan]
-• FLUID {", ".join(spec_info["supported"])}
+• FLUID {_format_supported_versions(spec_info)}
 • Default: {spec_info["default"]}
-• Latest: {spec_info["latest"]}"""
+• Latest (stable): {spec_info["latest"]}"""
 
         console.print(Panel(version_text, title="📦 Version Information", border_style="cyan"))
         next_line = compact_next_line()
@@ -321,9 +333,9 @@ API: {cli_info["api_version"]}
         next_line = compact_next_line()
         if next_line:
             cprint(next_line)
-        cprint(f"\nSupported Specifications: {', '.join(spec_info['supported'])}")
+        cprint(f"\nSupported Specifications: {_format_supported_versions(spec_info)}")
         cprint(f"Default: {spec_info['default']}")
-        cprint(f"Latest: {spec_info['latest']}")
+        cprint(f"Latest (stable): {spec_info['latest']}")
 
         cprint("\n" + "=" * 60)
         cprint("Available Features")

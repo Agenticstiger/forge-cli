@@ -31,6 +31,7 @@ from .base import (
     fluid_id,
     get_metadata_passthrough,
     metadata_passthrough,
+    resolve_status,
 )
 from .types import bitol_to_fluid_status, fluid_to_bitol_status
 
@@ -63,7 +64,11 @@ def to_odps(ctx: ExportCtx) -> None:
     odps["id"] = product_id
     odps["name"] = name
     odps["version"] = str(metadata.get("version", "1.0.0"))
-    odps["status"] = fluid_to_bitol_status(metadata.get("status", "draft"))
+    # ``lifecycle.state`` is the field the FLUID schema defines and users set;
+    # ``metadata.status`` is one the schema forbids, so reading it alone meant
+    # every Bitol ODPS export shipped the hard-coded "draft" — an active data
+    # product published to a catalog as a draft, a retired one as a draft too.
+    odps["status"] = fluid_to_bitol_status(resolve_status(fluid))
 
     # Top-level ``type`` (approved RFC 0029, first shipped in v1.1.0).
     # v1.0.0 is ``additionalProperties: false``, so the field is emitted
@@ -94,12 +99,22 @@ def to_odps(ctx: ExportCtx) -> None:
     elif metadata.get("description"):
         odps["description"] = {"purpose": metadata["description"]}
 
-    for key in ("domain", "tenant"):
-        if metadata.get(key):
-            odps[key] = metadata[key]
+    # ``domain`` is a root FLUID field and a root Bitol ODPS field, but only
+    # ``metadata.domain`` was read — a key an ODCS import writes and a
+    # hand-written contract never has — so `domain: retail` was dropped from
+    # every export of every contract authored the documented way.
+    business_context = metadata.get("businessContext")
+    domain = metadata.get("domain") or fluid.get("domain")
+    if not domain and isinstance(business_context, Mapping):
+        domain = business_context.get("domain")
+    if domain:
+        odps["domain"] = domain
+    if metadata.get("tenant"):
+        odps["tenant"] = metadata["tenant"]
 
-    # tags: prefer metadata.tags; fall back to top-level fluid.tags (legacy)
-    tags = metadata.get("tags") or fluid.get("tags")
+    # tags: the contract root is the canonical list (matching the ODCS
+    # exporter); ``metadata.tags`` is the secondary one.
+    tags = fluid.get("tags") or metadata.get("tags")
     if tags:
         odps["tags"] = list(tags)
 

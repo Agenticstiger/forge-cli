@@ -35,6 +35,57 @@ Two directions, deliberately asymmetric:
   ``--adopt-shared-container`` and emits a WARNING-level audit event —
   the same discipline as ``--allow-data-loss``.
 
+Detecting the adoption direction needs **two** signals, because a
+REFERENCED container does not always leave a footprint in state:
+
+1. a ``data.`` address in prior state (AWS/GCP, whose plugins emit data
+   sources for a shared pool), and
+2. the *absence* of a container the contract now declares OWNED from an
+   otherwise non-empty prior state, where that state carries a **footprint**
+   of the missing container (see below).
+
+Signal 2 exists because ``SnowflakeIacPlugin.emit_data`` returns ``{}`` —
+Snowflake emits resources only — so a shared Snowflake pool leaves *no*
+trace at all. With signal 1 alone the guard was a silent no-op on every
+Snowflake contract: the flip re-owned the platform pool, wiped its
+attributes to the tenant contract's values, and never asked. The candidate
+list for signal 2 is the provider plugin's own ``discover_imports`` output
+(the exact addresses ``_adopt_existing`` is about to ``tofu import``), so
+no provider knowledge is duplicated here.
+
+The **footprint** test is what keeps signal 2 a *transition* detector
+rather than a brownfield-adoption detector, and it is deliberately a
+disjunction — either half alone is unsound:
+
+* **Per container.** The state manages a resource that sits *inside* the
+  candidate container (:func:`_nested_under`). That is positive evidence
+  this contract has been writing leaves into a container it does not own,
+  which is exactly the shared-pool footprint.
+* **Per resource type.** The state manages no container of the candidate's
+  OpenTofu resource type at all. The weaker, type-level reading of the same
+  argument — kept because it is the only footprint visible on a provider
+  whose leaf resource names do not nest under their container's (GCP's
+  BigQuery tables are keyed ``<cid>_<table>``, not ``<cid>_<dataset>_
+  <table>``).
+
+Plain brownfield growth satisfies neither: a contract that has owned its
+containers all along, gaining an exposure that points at a pre-existing
+schema inside its OWN database, manages containers of that type *and*
+holds nothing inside the new one. Blocking that would break the documented
+``_adopt_existing`` path.
+
+The type-level half is **not** exhaustive on its own, and an earlier
+revision of this module claimed it was. The counterexample is the
+documented per-exposure ``binding.packaging`` override: one exposure
+``isolated`` (so the state manages a ``snowflake_database`` and a
+``snowflake_schema`` of its own) and one ``shared`` (whose pool leaves only
+a leaf table behind). Flip the second to ``isolated`` and no scope declares
+the kind REFERENCED any more, so signal 1 cannot fire — while the state
+*does* manage a container of both types, from the first exposure, so the
+type-level test skips. Verified live on Snowflake: the apply exited 0,
+adopted the platform pool's database and schema into the tenant's state and
+erased both of their COMMENTs. The per-container half is what catches it.
+
 The existing data-loss gate remains the unconditional last line: this
 guard runs earlier and is about *ownership*, not about destroy counts.
 
@@ -182,6 +233,30 @@ def parse_state_address(address: str) -> Optional[Tuple[bool, str, str]]:
     return is_data, resource_type, name
 
 
+def _nested_under(container_name: str, name: str) -> bool:
+    """Does the resource ``name`` sit *inside* the container ``container_name``?
+
+    Every emitter plugin composes its OpenTofu resource names hierarchically
+    out of :func:`iac.naming.safe_ident` segments, container first: a
+    Snowflake schema is ``<cid>_<db>_<schema>`` and a table inside it
+    ``<cid>_<db>_<schema>_<table>``; an AWS Glue table is
+    ``<cid>_<db>_<table>`` under its database's ``<cid>_<db>``. A strict
+    ``<container>_`` prefix is therefore "sits inside it".
+
+    Strict on purpose — the candidate itself is matched by full address
+    earlier, and equality here would let a leaf whose name happens to
+    collide with a container's masquerade as that container's contents.
+
+    The convention is a coupling, so ``TestContainerNamesNestTheirLeaves``
+    pins it against the real plugins. Where a provider breaks it (GCP keys a
+    BigQuery table ``<cid>_<table>``, not ``<cid>_<dataset>_<table>``) this
+    answers False and the type-level footprint carries the case — and GCP
+    emits a ``data.`` address for every referenced container anyway, so
+    signal 1 sees the flip there regardless.
+    """
+    return name.startswith(container_name + "_")
+
+
 def _decisions_in_scope(contract: Mapping[str, Any], kind: str) -> Set[ContainerDecision]:
     """Every non-LEGACY decision declared for ``kind`` anywhere in the contract.
 
@@ -202,7 +277,10 @@ def _decisions_in_scope(contract: Mapping[str, Any], kind: str) -> Set[Container
 
 
 def detect_ownership_transitions(
-    contract: Mapping[str, Any], state_addresses: Iterable[str]
+    contract: Mapping[str, Any],
+    state_addresses: Iterable[str],
+    *,
+    import_candidates: Iterable[str] = (),
 ) -> Tuple[OwnershipTransition, ...]:
     """Diff prior state against the contract's resolved ownership model.
 
@@ -214,6 +292,22 @@ def detect_ownership_transitions(
     raising: the emit path resolves the same block moments later and
     reports it as a typed error naming the real culprit (the same posture
     as ``backend.default_state_key``).
+
+    ``import_candidates`` is the provider plugin's ``discover_imports``
+    address list — the containers ``_adopt_existing`` is about to
+    ``tofu import``. A candidate is read as an adoption only when the prior
+    state is non-empty, does not already hold that exact address, **and**
+    carries a footprint of the missing container: either it manages a
+    resource nested inside that very container, or it manages no container
+    of that OpenTofu resource type at all (see the module docstring for why
+    the disjunction, and why neither half is sufficient alone). That is the
+    shared-pool footprint on providers that emit no ``data`` sub-tree
+    (Snowflake). Ignored when the state is empty: a greenfield first apply
+    adopts nothing it did not already declare. Ignored when the state owns
+    containers of that type and nothing inside this one: that is ordinary
+    brownfield growth inside an ownership model that is not changing, and
+    it is the documented ``_adopt_existing`` path, not a packaging
+    transition.
     """
     try:
         if resolve_packaging(contract) is LEGACY:
@@ -222,36 +316,102 @@ def detect_ownership_transitions(
         return ()
 
     transitions = []
+    # Keyed on the address with any ``data.`` prefix stripped: on AWS/GCP the
+    # SAME container can surface through both signals — as ``data.<type>.<n>``
+    # in prior state and as ``<type>.<n>`` in the import candidates — and
+    # reporting one container twice under two spellings would make the blocked
+    # message read like two ownership changes.
+    seen_identities: Set[Tuple[str, str]] = set()
+
+    def _record(address: str, kind: str, frm: str, to: str) -> None:
+        parsed = parse_state_address(address)
+        identity = (parsed[1], parsed[2]) if parsed else (address, "")
+        if identity in seen_identities:
+            return
+        seen_identities.add(identity)
+        transitions.append(
+            OwnershipTransition(
+                address=address, container_kind=kind, from_ownership=frm, to_ownership=to
+            )
+        )
+
+    managed: Set[str] = set()
+    # Resource *names* this state manages, and the container *resource types*
+    # among them. Together they are the footprint test signal 2 needs — see
+    # the loop below.
+    managed_names: Set[str] = set()
+    managed_container_types: Set[str] = set()
     for address in state_addresses or ():
         parsed = parse_state_address(address)
         if parsed is None:
             continue
-        is_data, resource_type, _name = parsed
+        is_data, resource_type, name = parsed
+        if not is_data:
+            managed.add(address.strip())
+            managed_names.add(name)
         kind = CONTAINER_RESOURCE_TYPES.get(resource_type)
         if kind is None:
             continue
+        if not is_data:
+            managed_container_types.add(resource_type)
         try:
             decisions = _decisions_in_scope(contract, kind)
         except PackagingError:
             continue
         if not is_data and ContainerDecision.REFERENCED in decisions:
-            transitions.append(
-                OwnershipTransition(
-                    address=address.strip(),
-                    container_kind=kind,
-                    from_ownership=_OWNED,
-                    to_ownership=_REFERENCED,
-                )
-            )
+            _record(address.strip(), kind, _OWNED, _REFERENCED)
         elif is_data and ContainerDecision.OWNED in decisions:
-            transitions.append(
-                OwnershipTransition(
-                    address=address.strip(),
-                    container_kind=kind,
-                    from_ownership=_REFERENCED,
-                    to_ownership=_OWNED,
-                )
-            )
+            _record(address.strip(), kind, _REFERENCED, _OWNED)
+
+    # Signal 2 — a container about to be imported that this state has never
+    # managed but has been writing into. Only meaningful once the contract has
+    # state of its own.
+    if managed:
+        for address in import_candidates or ():
+            candidate = (address or "").strip()
+            if not candidate or candidate in managed:
+                continue
+            parsed = parse_state_address(candidate)
+            if parsed is None:
+                continue
+            is_data, resource_type, candidate_name = parsed
+            if is_data:
+                continue
+            kind = CONTAINER_RESOURCE_TYPES.get(resource_type)
+            if kind is None:
+                continue
+            # Scoped to candidates the prior state carries a footprint of.
+            # Without the scoping the signal fires on *any* pre-existing
+            # container and breaks plain brownfield growth: an always-isolated
+            # contract that gains a second exposure pointing at a schema that
+            # already exists inside its OWN database was blocked with a message
+            # asserting a shared-pool history it never had.
+            #
+            # Two footprints, either of which is enough (module docstring):
+            #   * the state manages something INSIDE this container — the
+            #     contract has been writing leaves into a container it does not
+            #     own, which is the shared-pool footprint itself; or
+            #   * the state manages no container of this resource type at all —
+            #     the weaker type-level reading, kept because it is the only
+            #     footprint visible where leaf names do not nest (GCP).
+            #
+            # Growth has neither: it owns containers of the type and holds
+            # nothing inside the new one. The type-level half alone is NOT
+            # exhaustive — a per-exposure `binding.packaging` override makes
+            # the state manage a container of the type from an always-owned
+            # exposure while a pooled exposure's container is still missing,
+            # and signal 1 stays silent because no scope declares the kind
+            # REFERENCED any more.
+            inside = any(_nested_under(candidate_name, name) for name in managed_names)
+            if not inside and resource_type in managed_container_types:
+                continue
+            try:
+                decisions = _decisions_in_scope(contract, kind)
+            except PackagingError:
+                continue
+            if ContainerDecision.OWNED in decisions:
+                _record(candidate, kind, _REFERENCED, _OWNED)
+
     return tuple(transitions)
 
 
@@ -286,6 +446,7 @@ def guard_ownership_transitions(
     *,
     workdir: Optional[str] = None,
     adopt_shared_container: bool = False,
+    import_candidates: Iterable[str] = (),
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[OwnershipTransition, ...]:
     """Fail closed on any ownership flip; return the adoptions allowed through.
@@ -297,7 +458,9 @@ def guard_ownership_transitions(
     WARNING is logged here too, so the paper trail survives a caller that
     forgets.
     """
-    transitions = detect_ownership_transitions(contract, state_addresses)
+    transitions = detect_ownership_transitions(
+        contract, state_addresses, import_candidates=import_candidates
+    )
     if not transitions:
         return ()
 

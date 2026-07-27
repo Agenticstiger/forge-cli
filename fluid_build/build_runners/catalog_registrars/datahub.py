@@ -982,17 +982,28 @@ class DataHubRegistrar(CatalogRegistrar):
 from fluid_build.api.catalog_backend import (  # noqa: E402 — register-on-import is intentional
     CatalogBackendSpec,
     CatalogCapability,
+    CatalogNotConfiguredError,
     register_catalog_backend,
 )
 
 from ._factory_helpers import pick_endpoint, pick_int, pick_token  # noqa: E402
 
 
+def _require_datahub_endpoint(config: dict) -> str:
+    """The endpoint, or a refusal. See the note in the OpenMetadata factory:
+    ``https://datahub.test`` exists only in this module's HTTP-mocked tests,
+    and defaulting to it turned "not configured" into a DNS failure."""
+    endpoint = pick_endpoint(config)
+    if not endpoint:
+        raise CatalogNotConfiguredError("datahub")
+    return endpoint
+
+
 def _build_datahub_registrar(config: dict) -> DataHubRegistrar:
     import os
 
     return DataHubRegistrar(
-        base_url=pick_endpoint(config, default="https://datahub.test"),
+        base_url=_require_datahub_endpoint(config),
         api_token=pick_token(config),
         timeout_seconds=pick_int(config, "timeout", 30),
         spec_source_base_url=(

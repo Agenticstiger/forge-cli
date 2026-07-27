@@ -52,14 +52,30 @@ class TestMapStatusToODCS:
 
 
 class TestMapStatusFromODCS:
-    def test_draft(self, provider):
-        assert provider._map_status_from_odcs("draft") == "draft"
+    """The FLUID side of this mapping is ``lifecycle.state``, whose enum is
+    preview/active/deprecated/retired — there is no ``draft``. ODCS ``draft``
+    and ``proposed`` both land on ``preview``; the verbatim ODCS spelling is
+    kept in the extensions bucket so re-export reproduces it exactly."""
+
+    def test_draft_maps_to_the_fluid_lifecycle_state(self, provider):
+        assert provider._map_status_from_odcs("draft") == "preview"
+
+    def test_proposed_maps_to_the_fluid_lifecycle_state(self, provider):
+        assert provider._map_status_from_odcs("proposed") == "preview"
 
     def test_active(self, provider):
         assert provider._map_status_from_odcs("active") == "active"
 
     def test_unknown_defaults_to_active(self, provider):
         assert provider._map_status_from_odcs("unknown_status") == "active"
+
+    @pytest.mark.parametrize("state", ["preview", "active", "deprecated", "retired"])
+    def test_every_output_is_a_valid_lifecycle_state(self, provider, state):
+        from fluid_build.providers.odcs.mappers.types import _ODCS_TO_FLUID_STATUS
+
+        valid = {"preview", "active", "deprecated", "retired"}
+        assert set(_ODCS_TO_FLUID_STATUS.values()) <= valid
+        assert state in valid
 
 
 class TestMapTypeToLogical:

@@ -26,7 +26,9 @@ from typing import Optional
 
 import click
 
+from fluid_build.cli._export_env import resolve_for_export
 from fluid_build.cli.console import cprint
+from fluid_build.cli.console import error as console_error
 from fluid_build.loader import load_contract
 from fluid_build.providers.odcs import OdcsProvider
 
@@ -107,7 +109,7 @@ def export_command(
     try:
         # Load FLUID contract
         click.echo(f"Loading FLUID contract: {contract}")
-        fluid_contract = load_contract(contract)
+        fluid_contract = resolve_for_export(load_contract(contract))
 
         # Configure provider
         provider = OdcsProvider()
@@ -404,7 +406,7 @@ def _run_odcs_export(args):
     logger = logging.getLogger(__name__)
 
     # Load contract
-    fluid_contract = load_contract_with_overlay(args.contract, None, logger)
+    fluid_contract = resolve_for_export(load_contract_with_overlay(args.contract, None, logger))
 
     # Configure provider
     provider = OdcsProvider()
@@ -452,8 +454,41 @@ def _run_odcs_import(args):
         else:
             json.dump(fluid_contract, f, indent=2)
 
+    # Check our own work before claiming success. The importer used to print
+    # "✓ Imported" for a file `fluid validate` then rejected — an ODCS document
+    # with `slaProperties` or property-level `classification` produced a
+    # contract that failed FLUID's own schema, and nothing said so until the
+    # user ran a separate command. The mappers are fixed, but a *silent* pass is
+    # the part that made those bugs expensive, so the guarantee is enforced here
+    # rather than assumed: whatever we write, we validate, and a bad import
+    # exits non-zero with the reasons.
+    errors = _validate_imported_contract(fluid_contract)
+    if errors:
+        console_error("Not a valid FLUID contract")
+        console_error(f"  wrote {args.output} ({len(errors)} schema error(s))")
+        for line in errors[:20]:
+            console_error(f"    - {line}")
+        if len(errors) > 20:
+            console_error(f"    (+{len(errors) - 20} more)")
+        console_error("  Kept the file so you can inspect it.")
+        console_error("  This is a FLUID importer bug; please report it with the ODCS source.")
+        return 1
+
     cprint(f"✓ Imported to {args.output}")
     return 0
+
+
+def _validate_imported_contract(contract: dict) -> list:
+    """Validate the freshly-imported contract against its own declared schema.
+
+    Returns a list of human-readable violations; empty means valid. Offline
+    only — an import must not depend on network reachability, and a schema we
+    cannot load is reported as such rather than treated as a pass.
+    """
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    result = FluidSchemaManager().validate_contract(contract, offline_only=True)
+    return [] if result.is_valid else list(result.errors)
 
 
 def _run_odcs_validate(args):
