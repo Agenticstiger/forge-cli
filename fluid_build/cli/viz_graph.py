@@ -276,25 +276,52 @@ THEMES = {
 
 
 def _safe_id(s: str) -> str:
-    """Generate a safe GraphViz identifier from a string."""
-    return (
-        s.replace("-", "_")
-        .replace(".", "_")
-        .replace("/", "_")
-        .replace(" ", "_")
-        .replace(":", "_")
-        .replace("@", "_")
-        .replace("#", "_")
-        .replace("%", "_")
-        .replace("&", "_")
-    )
+    """Generate a safe GraphViz identifier from a string.
+
+    Allowlist, not denylist. Node IDs are interpolated into the DOT source
+    *unquoted* (``f"{nid} [shape=folder, ...]"``), so any character DOT treats as
+    syntax escapes the identifier and becomes graph structure. The previous
+    version replaced nine specific characters, which left ``"`` and ``\\`` — the
+    two that actually matter — untouched: a ``consumes[].ref`` of
+    ``x" fillcolor="red" q="`` renders a graph with FIVE extra phantom nodes
+    (measured against graphviz 12), because the tokens after the quote are parsed
+    as further node statements. Contract YAML is user-authored and the rendered
+    lineage is what a reviewer looks at, so injected structure is a correctness
+    and integrity problem, not a cosmetic one.
+
+    Keeping only ``[alnum_]`` also happens to satisfy DOT's unquoted-ID grammar.
+    ``str.isalnum`` is Unicode-aware on purpose: DOT permits ``\\200-\\377`` in an
+    ID, so international names survive rather than degrading to underscores.
+    Callers all prefix a literal (``product_``/``consume_``/``expose_``/
+    ``action_``/``tag_``), which is what keeps an ID from starting with a digit.
+    """
+    return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in s)
 
 
 def _escape_label(s: str, max_length: Optional[int] = None) -> str:
-    """Escape and optionally truncate a label for GraphViz."""
+    """Escape and optionally truncate a label for GraphViz.
+
+    The backslash is escaped FIRST, and that order is the whole point: escaping
+    quotes first would leave the backslash of each ``\\"`` to be doubled by the
+    later pass, turning an escaped quote back into a literal backslash followed
+    by a string terminator. A label ending in a single backslash used to emit
+    ``label="X\\"``, whose trailing ``\\"`` is a DOT-escaped quote — it swallows
+    the closing quote, so the string ran on and graphviz failed the whole render
+    with an opaque ``syntax error in line N`` (measured: any contract with a
+    trailing backslash in a name, id, domain or layer produced no graph at all).
+
+    Truncation stays ahead of escaping so a cut can never land inside an escape
+    sequence and split it.
+    """
     if max_length and len(s) > max_length:
         s = s[: max_length - 3] + "..."
-    return s.replace('"', '\\"').replace("\n", "\\n").replace("\r", "").replace("\t", " ")
+    return (
+        s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "")
+        .replace("\t", " ")
+    )
 
 
 def _get_theme_value(theme: str, key: str, custom_theme: Optional[Dict[str, str]] = None) -> str:
@@ -564,7 +591,7 @@ class GraphBuilder:
                 if self.config.show_descriptions and c.get("description"):
                     lbl_parts.append(f"({c['description']})")
 
-                label = "\\n".join(lbl_parts)
+                label = "\n".join(lbl_parts)
                 consume_nodes.append((nid, label))
 
         if consume_nodes:
@@ -617,7 +644,7 @@ class GraphBuilder:
                 if self.config.show_descriptions and e.get("description"):
                     lbl_parts.append(f"({e['description']})")
 
-                label = "\\n".join(lbl_parts)
+                label = "\n".join(lbl_parts)
                 expose_nodes.append((nid, label))
 
         if expose_nodes:
@@ -733,11 +760,11 @@ class GraphBuilder:
             # Build label
             label = op
             if "dataset" in action and "table" in action:
-                label = f"{op}\\n{action['dataset']}.{action['table']}"
+                label = f"{op}\n{action['dataset']}.{action['table']}"
             elif "name" in action:
-                label = f"{op}\\n{action['name']}"
+                label = f"{op}\n{action['name']}"
             elif "dst" in action:
-                label = f"{op}\\n{action['dst']}"
+                label = f"{op}\n{action['dst']}"
 
             lines.append(
                 f'    {nid} [shape=diamond, style="filled", '
@@ -1326,7 +1353,13 @@ def _build_mesh_dot(
                 return color
         return "#cfe8ff"
 
-    safe_id = lambda raw: '"' + raw.replace('"', "'") + '"'  # noqa: E731
+    # Quote a DOT ID, escaping the backslash BEFORE the quote. The previous
+    # version replaced `"` with `'`, which stopped a quote breakout but left the
+    # backslash: an ID ending in one produced `"p1\"`, whose trailing `\"` is an
+    # escaped quote, so the string ran on and graphviz failed the whole render.
+    def safe_id(raw: str) -> str:
+        return '"' + raw.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
     lines: List[str] = [
         "digraph fluid_mesh {",
         f"  rankdir={rankdir};",
@@ -1334,19 +1367,24 @@ def _build_mesh_dot(
         '  edge [fontname="Helvetica", fontsize=10];',
     ]
     for node in nodes.values():
+        # Both of these are contract-authored, and neither was escaped: a product
+        # label of `X" label="SPOOFED` closed the label string and injected a
+        # SECOND label attribute, which DOT honours (last one wins) — so a product
+        # could display another product's name in the mesh graph a reviewer reads.
+        # Verified against graphviz 12 before and after.
         attrs = [
-            f'label="{node["label"]}\\n{node["id"]}"',
+            f'label="{_escape_label(str(node["label"]))}\\n{_escape_label(str(node["id"]))}"',
             f'fillcolor="{_fill(node)}"',
         ]
         if node.get("external"):
             attrs.append('style="rounded,filled,dashed"')
             attrs.append('color="#888888"')
-        lines.append(f"  {safe_id(node['id'])} [{', '.join(attrs)}];")
+        lines.append(f"  {safe_id(str(node['id']))} [{', '.join(attrs)}];")
     for upstream, downstream, expose in edges:
         edge_attrs = ""
         if expose:
-            edge_attrs = f' [label="{expose}"]'
-        lines.append(f"  {safe_id(upstream)} -> {safe_id(downstream)}{edge_attrs};")
+            edge_attrs = f' [label="{_escape_label(str(expose))}"]'
+        lines.append(f"  {safe_id(str(upstream))} -> {safe_id(str(downstream))}{edge_attrs};")
     lines.append("}")
     return "\n".join(lines) + "\n"
 
