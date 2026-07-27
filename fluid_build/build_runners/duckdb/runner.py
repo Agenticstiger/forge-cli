@@ -54,7 +54,8 @@ from fluid_build.providers._sql_safety import (
 )
 
 from .._acquisition_common import (
-    enforce_schema_policy_or_raise,
+    begin_acquisition_run,
+    emit_terminal_lineage_event,
     finalize_run_result,
     resolve_connection_secrets,
     utc_now_iso,
@@ -911,15 +912,15 @@ def _persist_cursor_after_run(
 def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     import duckdb
 
-    started_at = utc_now_iso()
-    t_start = time.time()
+    # Shared run-opening chokepoint: timestamp + schema-evolution gate +
+    # duration clock + the OpenLineage START event. duckdb previously
+    # inlined the first three and therefore emitted no lineage at all,
+    # even though it is the default engine.
+    started_at, t_start = begin_acquisition_run(ctx, runner)
     streams_to_run = list(ctx.source.streams) or runner._infer_streams(ctx)
     sink_format = (ctx.sink.format or "parquet").lower()
     out_dir = Path(ctx.workdir) / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Schema-evolution gate (shared across all 6 acquisition runners).
-    enforce_schema_policy_or_raise(ctx, runner)
 
     stream_results: List[StreamResult] = []
     failures = 0
@@ -1303,6 +1304,11 @@ def execute_duckdb_build(
         "facets": result.facets,
     }
     write_run_record(state_store=store, ctx=ctx, result=result, record_dict=duckdb_record)
+    # Terminal OpenLineage event (COMPLETE / FAIL / ABORT). duckdb cannot
+    # use ``write_run_record_and_finalize`` because it has to persist the
+    # record BEFORE raising ``PartialFailureError``, so it emits the same
+    # chokepoint explicitly — write → emit → finalize, in that order.
+    emit_terminal_lineage_event(ctx, result=result, succeeded_states=DuckdbRunner.succeeded_states)
 
     if result.state is RunState.PARTIAL:
         from fluid_build._errors import PartialFailureError

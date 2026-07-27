@@ -31,8 +31,32 @@ OPENTOFU_DEFAULT_PROVIDERS: FrozenSet[str] = frozenset({"aws", "gcp", "snowflake
 
 
 def default_engine(provider: str) -> str:
-    """Return the default apply engine (``native``/``opentofu``) for ``provider``."""
-    return "opentofu" if provider in OPENTOFU_DEFAULT_PROVIDERS else "native"
+    """Return the default apply engine (``native``/``opentofu``) for ``provider``.
+
+    ``OPENTOFU_DEFAULT_PROVIDERS`` stays authoritative for the in-tree clouds
+    — it is the strangler-fig cutover switch, and a cloud with an emitter but
+    no entry in the set is deliberately still on its native path.
+
+    An **out-of-tree** cloud, registered through the ``fluid_build.iac_providers``
+    entry-point group, cannot appear in that frozenset without a core edit —
+    which is precisely the "zero edits to forge-cli core" promise
+    ``registry.py`` makes. Such a plugin exists only to emit an OpenTofu
+    module, so it routes to the OpenTofu engine automatically. Before this,
+    ``default_engine("<plugin-cloud>")`` returned ``native`` and the IaC path
+    the plugin was written for was never selected.
+    """
+    if provider in OPENTOFU_DEFAULT_PROVIDERS:
+        return "opentofu"
+    # Local import: ``iac/__init__`` pulls every provider plugin, and this
+    # module is imported on the apply cold path.
+    try:
+        from .registry import IAC_ENTRYPOINT_PLUGINS
+
+        if provider in IAC_ENTRYPOINT_PLUGINS:
+            return "opentofu"
+    except Exception:  # noqa: BLE001 — registry unavailable → the safe default
+        pass
+    return "native"
 
 
 def resolve_engine(explicit: Optional[str], provider: str) -> str:

@@ -145,14 +145,19 @@ class TestPolicyCheckRun:
         code = self._run_with_mocked_engine(args, result)
         assert code == 0
 
-    def test_run_returns_1_when_file_not_found(self):
+    def test_run_raises_the_shared_slug_when_file_not_found(self):
+        # Was swallowed into `logger.error("Policy check error: file_not_found")`
+        # — a raw internal token with no slug, no suggestion and no docs URL.
         from fluid_build.cli import policy_check
+        from fluid_build.cli._common import CLIError
 
         args = _make_args(contract="/nonexistent/contract.fluid.yaml")
         with patch.object(Path, "exists", return_value=False):
             with patch.object(policy_check, "RICH_AVAILABLE", False):
-                code = policy_check.run(args, logger)
-        assert code == 1
+                with pytest.raises(CLIError) as exc_info:
+                    policy_check.run(args, logger)
+        assert exc_info.value.event == "contract_file_not_found"
+        assert exc_info.value.exit_code == 1
 
     def test_run_category_filter_applied(self):
         """When --category is set, violations should be filtered."""
@@ -207,6 +212,7 @@ class TestPolicyCheckRun:
 
     def test_run_handles_unexpected_exception(self):
         from fluid_build.cli import policy_check
+        from fluid_build.cli._common import CLIError
 
         args = _make_args()
         with patch.object(Path, "exists", return_value=True):
@@ -215,8 +221,11 @@ class TestPolicyCheckRun:
                 side_effect=RuntimeError("boom"),
             ):
                 with patch.object(policy_check, "RICH_AVAILABLE", False):
-                    code = policy_check.run(args, logger)
-        assert code == 1
+                    with pytest.raises(CLIError) as exc_info:
+                        policy_check.run(args, logger)
+        # Typed error, not `logger.exception` + a raw traceback.
+        assert exc_info.value.event == "policy_check_failed"
+        assert exc_info.value.exit_code == 1
 
 
 # ---------------------------------------------------------------------------
@@ -520,3 +529,51 @@ class TestOutputHonoredForRichFormat:
 
         assert code == 0
         assert Path(out_file).exists()
+
+
+# ---------------------------------------------------------------------------
+# Score-band colours must be real rich colours (regression)
+#
+# The 50-69 band set `score_color = "orange"` and passed it to
+# `Panel(border_style=...)`. rich has no bare `orange`, so the whole report
+# died with a traceback:
+#
+#   rich.errors.MissingStyle: Failed to get style 'orange'; unable to parse
+#   'orange' as color; 'orange' is not a valid color
+#
+# 50-69 is exactly where a freshly imported dbt contract lands, i.e. the
+# "Next:" step the importer recommends. The other five bands used valid
+# colours, so only this one crashed.
+# ---------------------------------------------------------------------------
+
+
+class TestScoreBandColours:
+    def test_every_band_colour_parses_in_rich(self):
+        import re
+        from pathlib import Path as _Path
+
+        from rich.style import Style
+
+        from fluid_build.cli import policy_check as pc
+
+        source = _Path(pc.__file__).read_text(encoding="utf-8")
+        colours = set(re.findall(r'score_color = "([^"]+)"', source))
+        assert colours, "no score_color assignments found — did the bands move?"
+        for colour in colours:
+            Style.parse(colour)  # raises MissingStyle on an invalid colour
+
+    @pytest.mark.parametrize("score", [50, 60, 69])
+    def test_the_50_to_69_band_renders_instead_of_raising(self, score, monkeypatch):
+        """The band a brownfield dbt import lands in must render a report."""
+        from fluid_build.cli import policy_check
+
+        result = _make_result(
+            violations=[
+                _make_violation(severity=PolicySeverity.ERROR) for _ in range((100 - score) // 10)
+            ],
+            checks_passed=2,
+            checks_failed=4,
+        )
+        monkeypatch.setattr(result, "calculate_score", lambda: score)
+        # No RICH_AVAILABLE patch — this must exercise the rich renderer.
+        policy_check.output_rich(result, {"id": "imported"}, False, False)

@@ -215,26 +215,40 @@ class TestEngineEmission:
 
 
 class TestRecencyWindow:
+    @staticmethod
+    def _model_recency(files):
+        """The ``dbt_utils.recency`` entry on the emitted *model*.
+
+        Recency is a model-level test: dbt injects ``column_name`` into every
+        generic test reached through ``columns[].tests``, and the
+        ``dbt_utils`` macro accepts no such kwarg — attaching it to a column
+        made the whole project unparseable.
+        """
+        doc = yaml.safe_load(files["models/marts/schema.yml"])
+        model = doc["models"][0]
+        assert not any(
+            "dbt_utils.recency" in t
+            for col in model.get("columns", [])
+            for t in col.get("tests", [])
+            if isinstance(t, dict)
+        ), "recency must never attach to a column"
+        return next(t for t in model["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t)[
+            "dbt_utils.recency"
+        ]
+
     def test_window_drives_datepart_and_interval(self):
         """Acceptance: recency derives from the contract's freshness rule,
-        not a hardcoded 1-day."""
+        not a hardcoded 1-day — and measures the column the rule selected."""
         contract = _contract(dq_rules=[_FRESHNESS_RULE])  # PT6H
-        files = _generate(contract)
-        doc = yaml.safe_load(files["models/marts/schema.yml"])
-        col = next(c for c in doc["models"][0]["columns"] if c["name"] == "updated_at")
-        rec = next(t for t in col["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t)
-        body = rec["dbt_utils.recency"]
+        body = self._model_recency(_generate(contract))
         assert body == {"field": "updated_at", "datepart": "hour", "interval": 6}
 
     def test_missing_window_falls_back_to_one_day(self):
         rule = {"id": "f", "type": "freshness", "selector": "updated_at"}
-        contract = _contract(dq_rules=[rule])
-        files = _generate(contract)
-        doc = yaml.safe_load(files["models/marts/schema.yml"])
-        col = next(c for c in doc["models"][0]["columns"] if c["name"] == "updated_at")
-        rec = next(t for t in col["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t)
-        assert rec["dbt_utils.recency"]["datepart"] == "day"
-        assert rec["dbt_utils.recency"]["interval"] == 1
+        body = self._model_recency(_generate(_contract(dq_rules=[rule])))
+        assert body["field"] == "updated_at"
+        assert body["datepart"] == "day"
+        assert body["interval"] == 1
 
 
 # ---------------------------------------------------------------------------

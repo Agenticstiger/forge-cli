@@ -79,3 +79,39 @@ def _hostname_is_private(hostname: str) -> bool:
         ):
             return True
     return False
+
+
+def _hostname_is_link_local(hostname: str) -> bool:
+    """Return True when ``hostname`` resolves to a link-local address.
+
+    The narrow companion to :func:`_hostname_is_private`, for the callers
+    that *deliberately* accept an operator-configured internal endpoint —
+    an on-prem Marquez, a DataHub GMS on the cluster network, a
+    ``docker compose`` service name — but must still refuse the
+    credential-bearing-POST-to-``169.254.169.254`` shape. Link-local
+    (169.254.0.0/16, fe80::/10) is where AWS/GCP/Azure instance metadata
+    lives and is never a legitimate service endpoint, so it stays blocked
+    even when private ranges are allowed. Unspecified (0.0.0.0, ::) is
+    refused for the same reason it is in the broad gate: on many stacks it
+    routes to loopback.
+
+    Unlike the broad gate this returns ``False`` on DNS failure. An
+    unresolvable host cannot be reached at all, so the connection attempt
+    fails on its own and the caller surfaces an accurate transport error
+    instead of a misleading "address is private" refusal — which is what
+    made a ``docker compose`` hostname like ``marquez`` look like a
+    security block rather than "that container is not running".
+    """
+    try:
+        addresses = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    for entry in addresses:
+        ip_str = entry[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return True
+        if ip.is_link_local or ip.is_unspecified:
+            return True
+    return False

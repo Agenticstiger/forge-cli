@@ -28,7 +28,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fluid_build.cli.console import cprint, warning
 
@@ -296,6 +296,16 @@ def run(args, logger: logging.Logger) -> int:
         # non-zero exit, no plan.json written.
         _gate_contract_for_plan_or_apply(contract, logger, command="plan")
 
+        # --- --provider gate -------------------------------------------------
+        # ``--provider`` reaches ``build_provider`` only on the legacy planner
+        # path and the opt-in cost/sovereignty hooks; the ``providerActions[]``
+        # path never reads it. So ``fluid plan c.yaml --provider nosuchcloud``
+        # printed a normal plan and exited 0 — an accepted-and-discarded
+        # option, while ``fluid apply`` and ``fluid test`` both reject the same
+        # value. Validate it here, on every plan path, with the same registry
+        # and the same ``provider_unknown`` error apply raises.
+        _gate_provider_flag(getattr(args, "provider", None), logger)
+
         info(
             logger,
             "plan_start",
@@ -456,6 +466,26 @@ def run(args, logger: logging.Logger) -> int:
         raise
     except Exception as e:
         raise CLIError(1, "planner_failed", context={"error": str(e)})
+
+
+def _gate_provider_flag(requested: Optional[str], logger: logging.Logger) -> None:
+    """Reject an unknown ``--provider`` value before any plan is generated.
+
+    Mirrors ``_common.build_provider``'s registry lookup and reuses its
+    ``provider_unknown`` catalog entry (exit 2, suggestions + docs link), so
+    ``plan`` rejects exactly what ``apply`` and ``test`` reject. ``None``
+    means "not supplied" — the contract's own binding decides, as before.
+    """
+    if not requested:
+        return
+    from fluid_build import providers as registry
+
+    registry.discover_providers(logger)
+    name = requested.strip().lower().replace("-", "_")
+    if name not in registry.PROVIDERS:
+        raise CLIError(
+            2, "provider_unknown", {"requested": name, "available": sorted(registry.PROVIDERS)}
+        )
 
 
 def _gate_contract_for_plan_or_apply(

@@ -495,7 +495,36 @@ class TestSnowflakeDiscoverImports:
         assert len(dbs) == 1
         assert len(schemas) == 1
 
-    def test_view_exposure_also_yields_the_view(self):
+    def test_view_exposure_with_a_body_also_yields_the_view(self):
+        c = _contract(
+            [
+                {
+                    "exposeId": "v",
+                    "binding": {
+                        "platform": "snowflake",
+                        "format": "snowflake_view",
+                        "location": {
+                            "database": "DB",
+                            "schema": "SC",
+                            "view": "V",
+                            "query": "SELECT 1",
+                        },
+                    },
+                }
+            ]
+        )
+        by_addr = {b.to: b.id for b in _sf().discover_imports(c)}
+        assert by_addr == {
+            "snowflake_database.silver_demo_DB": "DB",
+            "snowflake_schema.silver_demo_DB_SC": '"DB"."SC"',
+            "snowflake_view.silver_demo_DB_SC_V": '"DB"."SC"."V"',
+        }
+
+    def test_bodyless_view_exposure_is_not_adopted(self):
+        """A view expose with no body is reference-only — ``emit`` declares no
+        ``snowflake_view`` resource for it, and an import block naming an
+        address absent from the config fails `tofu` with "Configuration for
+        import target does not exist". The two must agree."""
         c = _contract(
             [
                 {
@@ -512,8 +541,8 @@ class TestSnowflakeDiscoverImports:
         assert by_addr == {
             "snowflake_database.silver_demo_DB": "DB",
             "snowflake_schema.silver_demo_DB_SC": '"DB"."SC"',
-            "snowflake_view.silver_demo_DB_SC_V": '"DB"."SC"."V"',
         }
+        assert "snowflake_view" not in _sf().emit(c)
 
     def test_non_snowflake_exposure_is_skipped(self):
         c = _contract([{"exposeId": "g", "binding": {"platform": "gcp"}}])
@@ -1360,6 +1389,27 @@ class TestSnowflakeCatalogEnrichment:
         assert "```yaml" in comment
         assert "silver.commerce.orders" in comment
 
+    def test_embedded_contract_yaml_is_key_order_canonical(self):
+        """The embedded contract YAML must not depend on the dict's insertion
+        order.
+
+        `tofu` diffs the COMMENT attribute on every apply. A ``.fluid.yaml``
+        input preserves the author's key order; a ``plan.json`` input
+        round-trips the same contract through the plan writer's sorted JSON.
+        With insertion-order serialization the two produced different comment
+        strings for an identical contract, so alternating ``apply c.yaml`` /
+        ``apply plan.json`` re-issued ``ALTER TABLE … SET COMMENT`` forever
+        and "no changes" could never be asserted.
+        """
+        contract = _enriched_snowflake_contract()
+        shuffled = dict(reversed(list(contract.items())))
+
+        def _comment(c):
+            res = _sf().emit(c, [])
+            return next(iter(res["snowflake_table"].values()))["comment"]
+
+        assert _comment(contract) == _comment(shuffled)
+
     def test_per_column_comments_on_snowflake_table(self):
         res = _sf().emit(_enriched_snowflake_contract(), [])
         tbl = next(iter(res["snowflake_table"].values()))
@@ -1375,3 +1425,47 @@ class TestSnowflakeCatalogEnrichment:
         assert "snowflake_tag" not in res
         assert "snowflake_tag_association" not in res
         assert "snowflake_tag_masking_policy_association" not in res
+
+
+class TestBodylessViewExposure:
+    """A ``snowflake_view`` expose that carries no SELECT body.
+
+    This is the shape ``fluid import dbt`` emits for every view-materialized
+    dbt model, and the ``bindingLocation`` schema (additionalProperties:
+    false, every version 0.7.1-0.7.6) declares no body key at all — so it is
+    the *normal* shape, not an edge case. It used to be provisioned as
+    ``CREATE VIEW X AS SELECT * FROM X``, which Snowflake rejects outright:
+
+        Error: error creating view V err = 002094 (42601): SQL compilation
+        error: View definition refers to view being defined
+    """
+
+    @staticmethod
+    def _contract_with_bodyless_view():
+        return _contract(
+            [
+                {
+                    "exposeId": "v",
+                    "binding": {
+                        "platform": "snowflake",
+                        "format": "snowflake_view",
+                        "location": {"database": "DB", "schema": "SC", "table": "V"},
+                    },
+                }
+            ]
+        )
+
+    def test_no_self_referential_view_is_emitted(self):
+        res = _sf().emit(self._contract_with_bodyless_view())
+        assert "snowflake_view" not in res
+        # The containers around it are still provisioned.
+        assert "snowflake_database" in res
+        assert "snowflake_schema" in res
+
+    def test_an_explicit_body_is_still_honoured(self):
+        contract = self._contract_with_bodyless_view()
+        contract["exposes"][0]["binding"]["location"]["query"] = "SELECT ID FROM SRC"
+        res = _sf().emit(contract)
+        body = next(iter(res["snowflake_view"].values()))
+        assert body["statement"] == "SELECT ID FROM SRC"
+        assert body["name"] == "V"

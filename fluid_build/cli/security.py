@@ -45,6 +45,18 @@ MAX_PATH_DEPTH = 25
 ALLOWED_FILE_EXTENSIONS = {".yaml", ".yml", ".json", ".txt", ".md", ".html", ".dot", ".svg", ".png"}
 
 
+def _not_found_event(file_type: str) -> str:
+    """Stable slug for a missing input, specialised for contracts.
+
+    One failure condition must carry one slug across every command. A
+    missing contract used to surface as ``contract_file_not_found`` from
+    ``fluid validate`` (which special-cased it) but ``file_not_found`` from
+    ``fluid plan`` / ``fluid apply``, which route through the same helper —
+    two slugs, one condition, and only one of them in the error catalog.
+    """
+    return "contract_file_not_found" if file_type == "contract" else "file_not_found"
+
+
 def _build_forbidden_paths() -> Set[str]:
     """Return the platform-specific set of system-path prefixes to deny.
 
@@ -167,7 +179,7 @@ class SecurePathValidator:
         if not path_obj.exists():
             raise FluidCLIError(
                 1,
-                "file_not_found",
+                _not_found_event(file_type),
                 f"{file_type.title()} not found: {path}",
                 suggestions=[
                     "Check the file path is correct",
@@ -448,7 +460,7 @@ def validate_cli_path(
         if must_exist and not resolved.exists():
             raise FluidCLIError(
                 1,
-                "file_not_found",
+                _not_found_event(file_type),
                 f"{file_type.title()} not found: {path}",
                 suggestions=[
                     "Check the file path is correct",

@@ -190,12 +190,15 @@ class TestRegister:
 
 
 class TestRun:
-    def test_run_returns_1_when_contract_not_found(self, tmp_path):
+    def test_run_raises_the_shared_slug_when_contract_not_found(self, tmp_path):
+        from fluid_build.cli._common import CLIError
+
         args = _make_args(contract=str(tmp_path / "missing.yaml"))
         logger = MagicMock()
-        with patch("fluid_build.cli.test.console_error"):
-            result = run(args, logger)
-        assert result == 1
+        with pytest.raises(CLIError) as exc_info:
+            run(args, logger)
+        assert exc_info.value.event == "contract_file_not_found"
+        assert exc_info.value.exit_code == 1
 
     def test_run_returns_0_on_valid_report(self, tmp_path):
         contract = tmp_path / "contract.yaml"
@@ -227,12 +230,15 @@ class TestRun:
         mock_validator = MagicMock()
         mock_validator.validate.side_effect = RuntimeError("db connection failed")
 
+        from fluid_build.cli._common import CLIError
+
         with (
             patch.object(cv_mod, "ContractValidator", return_value=mock_validator),
-            patch("fluid_build.cli.test.console_error"),
+            pytest.raises(CLIError) as exc_info,
         ):
-            result = run(args, logger)
-        assert result == 1
+            run(args, logger)
+        assert exc_info.value.event == "test_failed"
+        assert exc_info.value.exit_code == 1
 
     def test_run_calls_output_json_when_format_json(self, tmp_path):
         contract = tmp_path / "c.yaml"

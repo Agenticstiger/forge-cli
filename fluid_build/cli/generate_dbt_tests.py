@@ -65,6 +65,26 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
         help="Output path for the dbt schema.yml (default: ./schema.yml)",
     )
     p.add_argument("--env", help="Environment overlay (dev/test/prod)")
+    # Same flag, same resolution as `fluid generate transformation` — the two
+    # dbt-emitting commands must agree on the dialect, or a Fusion user who
+    # generated a data_tests: project gets a tests: schema.yml from here that
+    # Fusion's strict parser rejects.
+    p.add_argument(
+        "--dbt-tests-key",
+        choices=["auto", "tests", "data_tests"],
+        default=None,
+        help=(
+            "Which YAML key generated dbt data tests attach under. "
+            "dbt-core 1.8 renamed ``tests:`` to ``data_tests:`` (both work "
+            "on core 1.8+); the Fusion engine strict-parses and requires "
+            "``data_tests:``, while dbt-core <1.8 only understands the "
+            "legacy ``tests:``. Default ('auto', also via "
+            "$FLUID_DBT_TESTS_KEY) detects the dbt binary you would "
+            "actually run: Fusion or core>=1.8 emit data_tests:, core<1.8 "
+            "or no dbt found emit the legacy tests:. Pass an explicit "
+            "value in CI generators that have no local dbt binary."
+        ),
+    )
     p.set_defaults(generate_sub=SUBCOMMAND, func=run)
 
 
@@ -72,12 +92,17 @@ def run(args, logger: logging.Logger) -> int:
     """Render the contract quality block as a dbt schema.yml."""
     from ..exporters.dbt_tests import MANAGED_BY_SENTINEL, render_dbt_tests
 
+    # Reuse `generate transformation`'s resolver rather than re-implementing
+    # detection: both commands emit dbt YAML for the same project, so a
+    # second implementation would be a second dialect to keep in sync.
+    from .generate_speed_transformation import _resolve_dbt_tests_key
+
     contract_path = Path(args.contract)
     if not contract_path.exists():
         raise CLIError(1, "contract_not_found", {"path": str(contract_path)})
 
     contract = load_contract_with_overlay(str(contract_path), getattr(args, "env", None), logger)
-    yaml_text = render_dbt_tests(contract)
+    yaml_text = render_dbt_tests(contract, tests_key=_resolve_dbt_tests_key(args, logger))
 
     out_path = Path(args.out)
     # Refuse to clobber a non-managed file — prevents accidental overwrite

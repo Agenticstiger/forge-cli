@@ -73,6 +73,7 @@ for ``not_null`` / ``unique`` and single-key dicts for everything else.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping, Sequence
 
 # ── Package prefixes / canonical test names ───────────────────────────────
@@ -80,6 +81,7 @@ from typing import Any, Mapping, Sequence
 RANGE_TEST_NAME = "dbt_expectations.expect_column_values_to_be_between"
 EXPRESSION_TEST_NAME = "dbt_utils.expression_is_true"
 RECENCY_TEST_NAME = "dbt_utils.recency"
+ROW_COUNT_TEST_NAME = "dbt_expectations.expect_table_row_count_to_be_between"
 
 # Prefix for fail-loud sentinel test names — an unmapped rule surfaces as a
 # ``dbt test`` "test not found" error rather than being silently dropped.
@@ -87,6 +89,27 @@ SENTINEL_PREFIX = "fluid_"
 
 # Selector value that marks a table-wide (not column-scoped) dq rule.
 TABLE_SELECTOR = "*"
+
+# Rule types whose dbt test can only attach at *model* level, whatever the
+# rule's selector says. dbt passes ``column_name`` to every generic test
+# reached through ``columns[].data_tests``; ``dbt_utils.recency`` is declared
+# ``(model, field, datepart, interval, ignore_time_component,
+# group_by_columns)`` and takes no ``column_name``, so a column-attached
+# freshness rule fails the whole project at parse time with
+# "macro 'dbt_macro__test_recency' takes no keyword argument 'column_name'".
+# The column the rule selected is preserved — it becomes the test's ``field``.
+MODEL_SCOPED_RULE_TYPES = frozenset({"freshness"})
+
+# FLUID ``dqRule.operator`` → SQL comparison operator. The enum is
+# ``>= > <= < == !=``; only ``==`` needs translating for SQL.
+_SQL_OPERATORS: dict[str, str] = {
+    ">=": ">=",
+    ">": ">",
+    "<=": "<=",
+    "<": "<",
+    "==": "=",
+    "!=": "!=",
+}
 
 
 # ── Canonical dbt-test emitters (pure) ────────────────────────────────────
@@ -120,12 +143,14 @@ def relationships_test(to: str, field: str) -> dict[str, Any]:
     return {"relationships": {"to": f"ref('{to}')", "field": field}}
 
 
-def numeric_range_test(*, min_value: Any = None, max_value: Any = None) -> dict[str, Any] | None:
+def numeric_range_test(
+    *, min_value: Any = None, max_value: Any = None, strictly: Any = None
+) -> dict[str, Any] | None:
     """The single numeric range/between dialect (dbt_expectations).
 
     Inclusive by default (``expect_column_values_to_be_between`` treats
-    ``strictly`` as ``false``), so no extra key is emitted. Returns ``None``
-    when neither bound is present.
+    ``strictly`` as ``false``), so the key is only emitted when the contract
+    declares exclusive bounds. Returns ``None`` when neither bound is present.
     """
     body: dict[str, Any] = {}
     if min_value is not None:
@@ -134,12 +159,34 @@ def numeric_range_test(*, min_value: Any = None, max_value: Any = None) -> dict[
         body["max_value"] = max_value
     if not body:
         return None
+    if strictly:
+        body["strictly"] = True
     return {RANGE_TEST_NAME: body}
 
 
 def expression_test(expression: str) -> dict[str, Any]:
-    """``dbt_utils.expression_is_true`` — a predicate placeholder/check."""
+    """``dbt_utils.expression_is_true`` — a predicate placeholder/check.
+
+    Attached to a column, dbt_utils compiles this to
+    ``where not(<column_name> <expression>)``, so ``expression`` is the
+    *right-hand side* of the comparison (``">= 0"``). Attached to a model it
+    compiles to ``where not(<expression>)`` and must be a complete row
+    predicate. Either way the string is interpolated into executable SQL —
+    never put a ``--`` comment in it.
+    """
     return {EXPRESSION_TEST_NAME: {"expression": expression}}
+
+
+def row_count_test(min_rows: Any) -> dict[str, Any]:
+    """``dbt_expectations.expect_table_row_count_to_be_between`` — a volume floor.
+
+    The model-level shape for ``anomaly_detection`` / ``drift_detection``
+    thresholds. ``dbt_utils.expression_is_true`` cannot express this: at
+    model level it compiles the expression into a ``WHERE`` clause, and a
+    warehouse rejects an aggregate there ("count(*) > 100" →
+    ``Invalid aggregate function in WHERE clause`` on Snowflake).
+    """
+    return {ROW_COUNT_TEST_NAME: {"min_value": min_rows}}
 
 
 def recency_test(
@@ -195,6 +242,24 @@ _PK_KEYS = ("primary", "primaryKey", "primary_key", "pk", "isPrimary")
 _ENUM_KEYS = ("enum", "acceptedValues", "accepted_values")
 _FK_KEYS = ("foreign_key", "foreignKey", "references", "relationship_to")
 
+# ``column.validationRules[]`` is the *schema-sanctioned* way to declare a
+# range / enum / FK on a column: the ``column`` definition has
+# ``additionalProperties: false`` in every version 0.7.1-0.7.6 and its eleven
+# keys include ``validationRules`` but none of the inline ``minimum`` /
+# ``maximum`` / ``enum`` / ``foreign_key`` spellings recognised above. Those
+# inline forms are accepted best-effort (contracts express intent that way in
+# practice) but a contract using them fails ``fluid validate``, so before this
+# the richest mapping was unreachable from a valid contract. The rule shapes
+# read here are exactly the ones ``cli/import_workflow/dbt.py`` writes
+# (``{"type": "range", "constraint": ">= 0 and <= 100"}``,
+# ``{"type": "custom", "constraint": "references model.field"}``), which also
+# closes the dbt → contract → dbt round trip for those tests.
+_RANGE_BOUND_RE = re.compile(r"(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)")
+_BETWEEN_RE = re.compile(
+    r"^\s*between\s+(-?\d+(?:\.\d+)?)\s+and\s+(-?\d+(?:\.\d+)?)\s*$", re.IGNORECASE
+)
+_REFERENCES_RE = re.compile(r"^\s*references\s+(\S+?)\.(\w+)\s*$", re.IGNORECASE)
+
 
 def is_truthy(value: Any) -> bool:
     """Loose truthiness for YAML/JSON booleans-as-strings (``"true"``/``True``)."""
@@ -222,22 +287,57 @@ def column_is_key(col: Mapping[str, Any]) -> bool:
     return False
 
 
+def validation_rules(col: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """The column's ``validationRules[]`` entries (schema-canonical)."""
+    raw = col.get("validationRules")
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return []
+    return [r for r in raw if isinstance(r, Mapping)]
+
+
+def _rules_of_type(col: Mapping[str, Any], kind: str) -> list[Mapping[str, Any]]:
+    return [
+        rule
+        for rule in validation_rules(col)
+        if str(rule.get("type") or "").strip().lower() == kind
+    ]
+
+
 def column_enum_values(col: Mapping[str, Any]) -> list[Any]:
-    """Return the accepted-value list declared on a column, if any."""
+    """Return the accepted-value list declared on a column, if any.
+
+    Reads the inline ``enum`` / ``acceptedValues`` keys and the
+    schema-canonical ``validationRules[] {type: enum, constraint: "a,b,c"}``
+    (the spelling the shipped examples and the dbt importer use).
+    """
     for key in _ENUM_KEYS:
         raw = col.get(key)
         if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
             vals = [v for v in raw if v is not None]
             if vals:
                 return vals
+    for rule in _rules_of_type(col, "enum"):
+        constraint = rule.get("constraint")
+        if isinstance(constraint, str):
+            vals = [v.strip() for v in constraint.split(",") if v.strip()]
+            if vals:
+                return vals
     return []
 
 
 def column_range(col: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the ``{min_value, max_value}`` declared on a column, if any.
+    """Return the ``{min_value, max_value[, strictly]}`` declared on a column.
 
-    Accepts both ``minimum``/``maximum`` (JSON-Schema spelling) and the
-    ``min``/``max`` aliases the copilot mapper recognises.
+    Accepts ``minimum``/``maximum`` (JSON-Schema spelling), the ``min``/``max``
+    aliases the copilot mapper recognises, and the schema-canonical
+    ``validationRules[] {type: range, constraint: ">= 0 and <= 100"}`` —
+    including ``between X and Y``.
+
+    ``strictly`` is set only when *every* declared bound is exclusive, because
+    ``expect_column_values_to_be_between`` has a single flag for both bounds.
+    A mix of inclusive and exclusive bounds cannot be expressed faithfully, so
+    :func:`constraint_tests` emits a fail-loud sentinel for it rather than
+    quietly moving a boundary.
     """
     out: dict[str, Any] = {}
     minimum = col.get("minimum", col.get("min"))
@@ -246,16 +346,56 @@ def column_range(col: Mapping[str, Any]) -> dict[str, Any]:
         out["min_value"] = minimum
     if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
         out["max_value"] = maximum
-    return out
+    if out:
+        return out
+
+    for rule in _rules_of_type(col, "range"):
+        constraint = rule.get("constraint")
+        if not isinstance(constraint, str):
+            continue
+        between = _BETWEEN_RE.match(constraint)
+        if between is not None:
+            return {
+                "min_value": _as_number(between.group(1)),
+                "max_value": _as_number(between.group(2)),
+            }
+        bounds = _RANGE_BOUND_RE.findall(constraint)
+        if not bounds:
+            continue
+        parsed: dict[str, Any] = {}
+        strict_flags: list[bool] = []
+        for operator, literal in bounds:
+            key = "min_value" if operator.startswith(">") else "max_value"
+            if key in parsed:
+                continue
+            parsed[key] = _as_number(literal)
+            strict_flags.append(operator in (">", "<"))
+        if not parsed:
+            continue
+        if all(strict_flags):
+            parsed["strictly"] = True
+        elif any(strict_flags):
+            parsed["strictly"] = None  # mixed — caller fails loud
+        return parsed
+    return {}
+
+
+def _as_number(literal: str) -> Any:
+    """``"12"`` → ``12``; ``"1.5"`` → ``1.5``."""
+    return float(literal) if "." in literal else int(literal)
 
 
 def column_relationship(col: Mapping[str, Any]) -> tuple[str, str] | None:
     """Return the ``(to, field)`` foreign-key reference declared on a column.
 
     Surfaces ``relationships`` in the engine path (previously only the copilot
-    generator emitted it). Recognises the copilot ``{to, field}`` dict shape and
-    the ODCS-style ``"table.field"`` string (also used by ``datacontract-cli`` →
-    dbt relationships). Returns ``None`` when no complete FK is declared.
+    generator emitted it). Recognises the copilot ``{to, field}`` dict shape,
+    the ODCS-style ``"table.field"`` string (also used by ``datacontract-cli``
+    → dbt relationships), and the schema-canonical
+    ``validationRules[] {type: custom, constraint: "references model.field"}``
+    — the exact shape ``fluid import dbt`` writes when it recovers a dbt
+    ``relationships`` test, so that test survives a full round trip.
+    Returns ``None`` when no complete FK is declared.
     """
     for key in _FK_KEYS:
         raw = col.get(key)
@@ -268,6 +408,13 @@ def column_relationship(col: Mapping[str, Any]) -> tuple[str, str] | None:
             to, _, field = raw.rpartition(".")
             if to and field:
                 return to, field
+    for rule in _rules_of_type(col, "custom"):
+        constraint = rule.get("constraint")
+        if not isinstance(constraint, str):
+            continue
+        match = _REFERENCES_RE.match(constraint)
+        if match is not None:
+            return match.group(1), match.group(2)
     return None
 
 
@@ -277,6 +424,11 @@ def constraint_tests(col: Mapping[str, Any]) -> list[Any]:
     ``required`` → ``not_null``; a declared key → ``unique``; ``enum`` /
     ``acceptedValues`` → ``accepted_values``; ``minimum`` / ``maximum`` →
     the numeric range dialect; a foreign-key reference → ``relationships``.
+
+    Each of those is read from the inline spelling *and* from the
+    schema-canonical ``validationRules[]`` (see the note on
+    :data:`_RANGE_BOUND_RE`), so the mapping is reachable from a contract that
+    passes ``fluid validate``.
     """
     tests: list[Any] = []
 
@@ -294,11 +446,18 @@ def constraint_tests(col: Mapping[str, Any]) -> list[Any]:
     if values:
         tests.append(accepted_values_test(values))
 
-    bounds = column_range(col)
+    bounds = dict(column_range(col))
     if bounds:
-        range_test = numeric_range_test(**bounds)
-        if range_test is not None:
-            tests.append(range_test)
+        if "strictly" in bounds and bounds["strictly"] is None:
+            # Mixed inclusive/exclusive bounds — a single ``strictly`` flag
+            # cannot express them, and picking one would silently move a
+            # boundary. Fail loud instead.
+            bounds.pop("strictly")
+            tests.append(sentinel_test("range_mixed_strictness", str(col.get("name") or "")))
+        else:
+            range_test = numeric_range_test(**bounds)
+            if range_test is not None:
+                tests.append(range_test)
 
     return tests
 
@@ -365,18 +524,30 @@ def forward_column_rule(rule: Mapping[str, Any], column: str) -> Any | None:
 
     if kind == "accuracy":
         threshold = rule.get("threshold")
-        operator = rule.get("operator") or ">="
-        if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
-            # Accuracy is contract-specific; surface it as a predicate
-            # placeholder the operator tunes to their own accuracy check.
-            # The threshold + operator are preserved so the intent isn't lost.
-            expr = f"-- accuracy({column}) {operator} {threshold}: replace with predicate"
-            return expression_test(expr)
+        operator = _SQL_OPERATORS.get(str(rule.get("operator") or ">=").strip())
+        if (
+            operator is not None
+            and isinstance(threshold, (int, float))
+            and not isinstance(threshold, bool)
+        ):
+            # ``dbt_utils.expression_is_true`` attached to a column compiles to
+            # ``where not(<column_name> <expression>)`` — the expression is the
+            # right-hand side only. Emit exactly the comparison the live
+            # quality engine runs for an accuracy rule
+            # (``providers/quality_engine.py::_check_accuracy`` →
+            # ``MIN(col) <operator> <threshold>``), so the artifact and the
+            # checker agree. A SQL *comment* here (the previous placeholder)
+            # swallowed the closing paren and made every `dbt test` fail with
+            # an opaque Snowflake parser error.
+            return expression_test(f"{operator} {threshold}")
         return sentinel_test("accuracy", column)
 
     if kind == "freshness":
-        window = rule.get("window") or rule.get("threshold")
-        return recency_test(column, window=window)
+        # Never reached through a column: freshness is model-scoped (see
+        # MODEL_SCOPED_RULE_TYPES). Kept explicit so a caller that ignores
+        # the partition still emits a fail-loud sentinel rather than the
+        # unparseable column-attached recency test.
+        return sentinel_test("freshness", column)
 
     if kind in ("schema", "anomaly_detection", "drift_detection"):
         return sentinel_test(kind, column)
@@ -384,20 +555,30 @@ def forward_column_rule(rule: Mapping[str, Any], column: str) -> Any | None:
     return sentinel_test(f"unmapped_{kind}", column)
 
 
-def forward_model_rule(rule: Mapping[str, Any]) -> Any | None:
-    """Map one table-wide (``selector: "*"``) ``dqRule`` to a model-level test."""
+def forward_model_rule(rule: Mapping[str, Any], *, field: str | None = None) -> Any | None:
+    """Map one ``dqRule`` to a model-level dbt test.
+
+    ``field`` is the timestamp column a freshness test should measure. It
+    comes from the rule's own ``selector`` when the rule names a column, and
+    otherwise from :func:`default_recency_field` (the contract's first
+    temporal column). The previous hardcoded ``updated_at`` named a column
+    that appears nowhere in the contract, so the emitted test failed with
+    ``invalid identifier``.
+    """
     kind = rule_type(rule)
 
     if kind == "freshness":
-        window = rule.get("window") or rule.get("threshold")
-        if window is not None:
-            return recency_test("updated_at", window=window)
+        if field:
+            # A missing window keeps ``recency_test``'s documented day/1
+            # default; only the *column* is non-negotiable.
+            return recency_test(field, window=rule.get("window") or rule.get("threshold"))
+        # No column to measure — fail loud rather than inventing an identifier.
         return f"{SENTINEL_PREFIX}freshness_check"
 
     if kind in ("anomaly_detection", "drift_detection"):
         threshold = rule.get("threshold")
         if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
-            return expression_test(f"count(*) > {threshold}")
+            return row_count_test(threshold)
         return sentinel_test(kind)
 
     if kind in ("completeness", "uniqueness", "valid_values", "accuracy", "schema"):
@@ -405,6 +586,80 @@ def forward_model_rule(rule: Mapping[str, Any]) -> Any | None:
         return sentinel_test(f"{kind}_table_level")
 
     return sentinel_test(f"unmapped_{kind}")
+
+
+def is_model_scoped(rule: Mapping[str, Any]) -> bool:
+    """True when this rule's dbt test must attach at model level.
+
+    Either the rule is table-wide (``selector: "*"`` or absent) or its type
+    is one dbt can only express as a model-level test
+    (:data:`MODEL_SCOPED_RULE_TYPES`).
+    """
+    selector = rule.get("selector")
+    selector = selector.strip() if isinstance(selector, str) else ""
+    if not selector or selector == TABLE_SELECTOR:
+        return True
+    return rule_type(rule) in MODEL_SCOPED_RULE_TYPES
+
+
+def default_recency_field(schema_cols: Sequence[Any]) -> str | None:
+    """The column a table-wide freshness rule should measure.
+
+    The first column in ``contract.schema[]`` whose declared type is
+    temporal. Returns ``None`` when the contract declares no temporal
+    column, in which case the caller emits a fail-loud sentinel instead of
+    a test bound to a column that does not exist.
+    """
+    for col in schema_cols or ():
+        if not isinstance(col, Mapping):
+            continue
+        name = col.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        declared = str(col.get("type", "")).strip().lower()
+        base = declared.split("(", 1)[0].strip()
+        if base.startswith(("timestamp", "datetime", "date")):
+            return name
+    return None
+
+
+def partition_rules(
+    rules: Sequence[Mapping[str, Any]],
+    *,
+    schema_cols: Sequence[Any] = (),
+) -> tuple[dict[str, list[Any]], list[Any]]:
+    """Split ``dq.rules[]`` into per-column tests and model-level tests.
+
+    The **one** router every dbt-emitting surface uses, so the engine path
+    (``engines/dbt/schema_yml.py``) and the exporter
+    (``exporters/dbt_tests.py``) cannot disagree about where a rule lands —
+    the divergence that made ``selector: "*"`` become a dbt column literally
+    named ``*`` on the engine path while the exporter routed it correctly.
+
+    Returns ``({column_name: [tests]}, [model_tests])``.
+    """
+    by_column: dict[str, list[Any]] = {}
+    model_tests: list[Any] = []
+    fallback_field = default_recency_field(schema_cols)
+
+    for rule in rules:
+        if not isinstance(rule, Mapping):
+            continue
+        selector = rule.get("selector")
+        selector = selector.strip() if isinstance(selector, str) else ""
+        column = "" if selector == TABLE_SELECTOR else selector
+
+        if is_model_scoped(rule):
+            dbt_test = forward_model_rule(rule, field=column or fallback_field)
+            if dbt_test is not None:
+                model_tests.append(dbt_test)
+            continue
+
+        dbt_test = forward_column_rule(rule, selector)
+        if dbt_test is not None:
+            by_column.setdefault(selector, []).append(dbt_test)
+
+    return by_column, model_tests
 
 
 # ── De-duplication (merge dq-rule tests with constraint-derived tests) ─────

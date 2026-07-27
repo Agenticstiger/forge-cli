@@ -158,7 +158,15 @@ def installed_plugins(role: Optional[str] = None) -> Dict[str, List[Dict[str, An
     EVERY installed plugin in EVERY governed group — the fluid_sdk roles AND the
     CLI-internal groups (commands / apply_hooks / extension_*) — with its
     allow/block status, for the operator inspection command (``fluid plugins``).
-    Reads entry-point *names* only — it never imports plugin code.
+
+    **This function** reads entry-point *names* only and imports no plugin
+    code. That is not the same as the *process* being plugin-free: CLI
+    bootstrap builds the full argparse tree first, and the ``iac_provider``
+    and ``modeling_technique`` roles feed argparse ``choices=`` from their
+    registries, so those two roles are discovered — and their entry points
+    loaded — before any command runs, ``fluid --version`` included. Set
+    ``FLUID_PLUGINS_BLOCKLIST`` to inspect an untrusted plugin without
+    executing it; the policy is checked before every ``ep.load()``.
     """
     groups = governed_groups()
     keys = [role] if role else list(groups)

@@ -177,8 +177,10 @@ def test_normal_ids_pass_the_guard(tmp_path: Path) -> None:
     """A valid contract.id + build.id pass the chokepoint and proceed.
 
     The build points at a non-existent python script so the python runner
-    branch reports it as skipped and ``run_builds_from_args`` returns 0 —
-    proving the guard let a normal id through (it did not raise).
+    branch reports it as skipped — proving the guard let a normal id through
+    (it did not raise). ``--allow-skipped-builds`` is set because an
+    all-skipped build run is itself an error now (green-on-nothing guard);
+    this test is about the identifier chokepoint, not that exit code.
     """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -194,7 +196,9 @@ def test_normal_ids_pass_the_guard(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    rc = run_builds_from_args(_args(contract_path), logging.getLogger("test"))
+    args = _args(contract_path)
+    args.allow_skipped_builds = True
+    rc = run_builds_from_args(args, logging.getLogger("test"))
     assert rc == 0
 
 

@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
@@ -146,6 +146,11 @@ def generate_sources(
         freshness = _freshness_block(port, expose)
         if freshness is not None:
             loaded_at_field = resolved.get("loaded_at_field")
+            if not loaded_at_field and not metadata_capable:
+                # Nothing to verify the cursor against, and this adapter has
+                # no metadata fallback — an unverified cursor still beats
+                # silently dropping the contract's freshness promise.
+                loaded_at_field = resolved.get("loaded_at_field_unverified")
             if loaded_at_field:
                 table_entry["loaded_at_field"] = loaded_at_field
                 table_entry["freshness"] = freshness
@@ -270,8 +275,10 @@ def _resolve_binding(
                     location.get("schema") or location.get("dataset")
                 ),
                 "identifier": _identifier_from_location(location, expose_id),
-                "loaded_at_field": _cursor_field_from_upstream(upstream),
             }
+            verified, unverified = _cursor_field_for_expose(upstream, expose)
+            resolved["loaded_at_field"] = verified
+            resolved["loaded_at_field_unverified"] = unverified
             return resolved, expose
 
     # Fallback — we didn't find the upstream contract or the specific expose.
@@ -288,6 +295,7 @@ def _resolve_binding(
         "schema_expr": "{{ env_var('SNOWFLAKE_STAGE_SCHEMA', 'PUBLIC') }}",
         "identifier": expose_id.upper() if expose_id else None,
         "loaded_at_field": None,
+        "loaded_at_field_unverified": None,
     }, None
 
 
@@ -426,14 +434,86 @@ def _consumer_freshness_max(port: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+# dbt's ``loaded_at_field`` must be a timestamp — "Expected a timestamp value
+# when querying field '<x>' ... received value of type 'date'". A DATE cursor
+# is therefore worse than none: it turns every `dbt source freshness` run into
+# an error instead of letting Snowflake answer from table metadata.
+_TIMESTAMP_TYPE_PREFIXES = ("timestamp", "datetime")
+
+
+def _cursor_field_for_expose(
+    upstream: Mapping[str, Any],
+    expose: Mapping[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Derive a dbt ``loaded_at_field`` for **one** upstream expose.
+
+    Returns ``(verified, unverified)`` — at most one is non-``None``.
+
+    The product-wide cursor is only usable on a table that actually has that
+    column. ``_cursor_field_from_upstream`` returns the first ``cursor_field``
+    found anywhere in the upstream contract, and stamping it onto every table
+    resolved from that product produced ``invalid identifier 'ORDER_DATE'`` on
+    a CUSTOMERS source that has no such column — every source in the file
+    erroring, so ``dbt source freshness`` yielded zero usable results.
+
+    Three outcomes, checked against the expose's own ``contract.schema[]``:
+
+    * the column is declared **with a timestamp type** → ``verified``;
+    * the column is declared with a non-timestamp type, or is not declared at
+      all → dropped outright. Both are states dbt is guaranteed to fail on
+      (``invalid identifier``; ``Expected a timestamp value ... received
+      value of type 'date'``), so emitting them is strictly worse than
+      letting freshness fall back to warehouse metadata;
+    * the expose declares **no schema** → ``unverified``. Nothing can be
+      checked, so the caller decides: metadata-capable adapters drop it,
+      duckdb-style adapters keep it because the alternative is no freshness
+      at all.
+    """
+    cursor = _cursor_field_from_upstream(upstream)
+    if not cursor:
+        return None, None
+
+    contract = expose.get("contract")
+    schema = contract.get("schema") if isinstance(contract, Mapping) else None
+    if not isinstance(schema, Sequence) or isinstance(schema, (str, bytes)) or not schema:
+        return None, cursor
+
+    expose_id = expose.get("exposeId") or expose.get("id")
+    for col in schema:
+        if not isinstance(col, Mapping):
+            continue
+        if str(col.get("name") or "").strip().lower() != cursor.strip().lower():
+            continue
+        declared = str(col.get("type") or "").strip().lower()
+        if declared.startswith(_TIMESTAMP_TYPE_PREFIXES):
+            return cursor, None
+        _logger.debug(
+            "sources: cursor %r on expose %r is declared %r, not a timestamp; "
+            "omitting loaded_at_field",
+            cursor,
+            expose_id,
+            declared,
+        )
+        return None, None
+
+    _logger.debug(
+        "sources: cursor %r is not a column of expose %r; omitting loaded_at_field",
+        cursor,
+        expose_id,
+    )
+    return None, None
+
+
 def _cursor_field_from_upstream(upstream: Mapping[str, Any]) -> Optional[str]:
     """Derive a dbt ``loaded_at_field`` from the upstream acquisition source.
 
     Looks for an acquisition source's ``cursor_field`` (e.g. ``updated_at``) in
     the shapes a contract can carry it: a top-level ``acquisition`` block and
     the schema-canonical ``builds[].properties.source`` acquisition pattern.
-    Returns the first match, else ``None`` (freshness then relies on warehouse
-    metadata or is omitted).
+    Returns the first match, else ``None``.
+
+    Product-scoped: callers must confirm the column exists on the specific
+    expose (see :func:`_cursor_field_for_expose`).
     """
     # Card shape: acquisition.sources[].cursor_field / acquisition.source.*
     acquisition = upstream.get("acquisition")

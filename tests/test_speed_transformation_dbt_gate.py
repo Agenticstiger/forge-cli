@@ -235,3 +235,81 @@ def test_run_dbt_parse_gate_returns_false_when_subprocess_raises(
     result = gst._run_dbt_parse_gate(tmp_path, logging.getLogger("test"))
 
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# packages.yml → `dbt deps` before `dbt parse` (regression)
+#
+# #425 emits packages.yml for any project using a namespaced test
+# (dbt_utils.recency, dbt_expectations.*) — i.e. most non-trivial contracts.
+# dbt then refuses to parse at all until the packages are installed:
+#
+#   Compilation Error / dbt expects 1 package(s) based on packages specified
+#   in packages.yml, but found only 0 package(s) installed in dbt_packages.
+#   Run "dbt deps" to install package dependencies.
+#
+# so `--dbt-validate` failed on a chore instead of on the user's contract.
+# ---------------------------------------------------------------------------
+
+
+def _packages_project(tmp_path: Path) -> Path:
+    (tmp_path / "packages.yml").write_text(
+        "packages:\n- package: dbt-labs/dbt_utils\n  version: 1.4.0\n", encoding="utf-8"
+    )
+    return tmp_path
+
+
+def test_gate_runs_dbt_deps_before_parse_when_packages_yml_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _packages_project(tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/dbt")
+    fake_run = MagicMock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    assert gst._run_dbt_parse_gate(tmp_path, logging.getLogger("test")) is True
+
+    commands = [call.args[0] for call in fake_run.call_args_list]
+    assert [c[1] for c in commands] == ["deps", "parse"]
+    for command in commands:
+        assert "--project-dir" in command
+
+
+def test_gate_skips_dbt_deps_when_packages_are_already_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _packages_project(tmp_path)
+    (tmp_path / "dbt_packages").mkdir()
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/dbt")
+    fake_run = MagicMock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    assert gst._run_dbt_parse_gate(tmp_path, logging.getLogger("test")) is True
+    assert [call.args[0][1] for call in fake_run.call_args_list] == ["parse"]
+
+
+def test_gate_reports_a_dbt_deps_failure_distinctly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+) -> None:
+    _packages_project(tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/dbt")
+    fake_run = MagicMock(
+        return_value=SimpleNamespace(returncode=1, stdout="hub unreachable", stderr="")
+    )
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    assert gst._run_dbt_parse_gate(tmp_path, logging.getLogger("test")) is False
+    # Only `dbt deps` ran — parse is not attempted against an unresolved project.
+    assert [call.args[0][1] for call in fake_run.call_args_list] == ["deps"]
+    assert "dbt deps failed" in capsys.readouterr().out
+
+
+def test_gate_without_packages_yml_still_runs_parse_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/dbt")
+    fake_run = MagicMock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    assert gst._run_dbt_parse_gate(tmp_path, logging.getLogger("test")) is True
+    assert [call.args[0][1] for call in fake_run.call_args_list] == ["parse"]

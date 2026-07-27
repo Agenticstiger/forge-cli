@@ -230,10 +230,16 @@ class TestOutputJunit:
 
 
 class TestRun:
-    def test_missing_contract_returns_1(self, logger):
+    def test_missing_contract_raises_the_shared_slug(self, logger):
+        # Was `console_error(...) + return 1`: right exit code, no stable
+        # slug. Now the same typed error every command raises.
+        from fluid_build.cli._common import CLIError
+
         args = SimpleNamespace(contract="/nonexistent/contract.yaml")
-        result = run(args, logger)
-        assert result == 1
+        with pytest.raises(CLIError) as exc_info:
+            run(args, logger)
+        assert exc_info.value.event == "contract_file_not_found"
+        assert exc_info.value.exit_code == 1
 
     @patch("fluid_build.cli.test._output_rich")
     def test_valid_contract_returns_0(self, _mock_output, logger, tmp_path):
@@ -394,8 +400,13 @@ class TestRun:
                 output_file=None,
                 publish=None,
             )
-            result = run(args, logger)
-        assert result == 1
+            from fluid_build.cli._common import CLIError
+
+            with pytest.raises(CLIError) as exc_info:
+                run(args, logger)
+        # A validator crash is rendered as a typed error, not a traceback.
+        assert exc_info.value.event == "test_failed"
+        assert exc_info.value.exit_code == 1
 
 
 # ── _publish_results ────────────────────────────────────────────────

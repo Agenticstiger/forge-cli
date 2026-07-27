@@ -190,6 +190,15 @@ def build_provider(
         raise CLIError(2, "provider_not_specified", {})
     prov_cls = registry.PROVIDERS.get(name)
     if not prov_cls:
+        # Distinguish "no such provider" from "the operator's allow/block
+        # policy removed it". Both end up absent from the registry, but only
+        # one is fixed by editing an env var — reporting a deliberately
+        # blocked provider as "unknown" sends the operator hunting for a
+        # typo or a missing extra.
+        from fluid_build.plugin_manager import is_allowed
+
+        if not is_allowed(name):
+            raise CLIError(2, "provider_blocked_by_policy", {"requested": name})
         raise CLIError(
             2, "provider_unknown", {"requested": name, "available": sorted(registry.PROVIDERS)}
         )

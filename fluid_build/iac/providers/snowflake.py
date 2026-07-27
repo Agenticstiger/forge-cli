@@ -32,6 +32,7 @@ merely writes into a platform-owned pool:
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -49,6 +50,15 @@ from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
 from ..packaging import ContainerDecision, PackagingResolution, resolve_packaging
 from ..versions import required_providers
+
+_logger = logging.getLogger(__name__)
+
+# Keys a binding location may carry an explicit view body under. The
+# ``bindingLocation`` schema has ``additionalProperties: false`` and declares
+# none of them today, so in practice an ``exposes[]`` view has no body and is
+# reference-only — but an overlay/extension that adds one must not silently
+# fall back to a self-referential ``SELECT * FROM <itself>``.
+_VIEW_BODY_KEYS = ("query", "statement", "sql", "viewDefinition")
 
 # FLUID column type → Snowflake SQL type.
 _SF_TYPES = {
@@ -305,7 +315,13 @@ class SnowflakeIacPlugin:
             if table:
                 tkey = safe_ident(f"{cid}_{database}_{schema}_{table}")
                 if binding.get("format") == "snowflake_view":
-                    _add(f"snowflake_view.{tkey}", f'"{database}"."{schema}"."{table}"')
+                    # Only adopt a view the emitter actually declares. A view
+                    # expose with no body is reference-only (see
+                    # ``_emit_snowflake``), and an import block pointing at a
+                    # resource address absent from the config fails `tofu`
+                    # with "Configuration for import target does not exist".
+                    if _expose_view_statement(loc) is not None:
+                        _add(f"snowflake_view.{tkey}", f'"{database}"."{schema}"."{table}"')
                 else:
                     _add(f"snowflake_table.{tkey}", f"{database}|{schema}|{table}")
         return blocks
@@ -326,6 +342,104 @@ class SnowflakeIacPlugin:
                 "snowflake_table_resource",
             ]
         }
+
+    def suppressed_drift(
+        self,
+        contract: Mapping[str, Any],
+        prior_resources: Iterable[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Report column drift this emitter's ``ignore_changes`` swallows.
+
+        ``_emit_snowflake`` pins ``lifecycle.ignore_changes = ["column"]`` on
+        every ``snowflake_table`` so a re-apply never fights the build
+        engine's ``CREATE OR REPLACE`` (Snowflake rejects most in-place scale
+        changes anyway). The cost is that ``tofu`` reports ``~1``/``+0 ~0 -0``
+        and exit 0 for a contract whose declared column types no longer match
+        the live table — including under ``--mode replace``, the *destructive*
+        reconcile mode, where the operator has every reason to believe the
+        table was rebuilt to match.
+
+        This turns that silence into a report. ``prior_resources`` is the
+        refreshed pre-apply state (``tofu show -json <planfile>`` →
+        ``prior_state.values.root_module.resources``); each entry's
+        ``values.column`` is what Snowflake actually has. Comparison is at
+        type-family granularity — the same folding ``fluid verify`` uses — so
+        a widened precision (``VARCHAR`` → ``VARCHAR(16777216)``) is not
+        reported as drift.
+
+        Returns one record per drifted table; an empty list means the
+        declared schema and the live table agree.
+        """
+        from fluid_build.providers.snowflake.util.typefamily import (
+            normalize_snowflake_field_name as _fold_name,
+        )
+        from fluid_build.providers.snowflake.util.typefamily import (
+            normalize_snowflake_type as _fold_type,
+        )
+
+        by_name: Dict[str, Mapping[str, Any]] = {}
+        for resource in prior_resources or []:
+            if not isinstance(resource, Mapping):
+                continue
+            if resource.get("type") != "snowflake_table":
+                continue
+            name = resource.get("name")
+            if isinstance(name, str):
+                by_name[name] = resource.get("values") or {}
+
+        if not by_name:
+            return []
+
+        cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        drift: List[Dict[str, Any]] = []
+        for exposure in contract.get("exposes") or []:
+            binding = exposure.get("binding") or {}
+            if binding.get("platform") != "snowflake":
+                continue
+            if binding.get("format") == "snowflake_view":
+                continue
+            loc = binding.get("location") or {}
+            database, schema, table = (
+                loc.get("database"),
+                loc.get("schema"),
+                loc.get("table") or loc.get("view"),
+            )
+            if not (database and schema and table):
+                continue
+            live = by_name.get(safe_ident(f"{cid}_{database}_{schema}_{table}"))
+            if live is None:
+                continue  # not yet in state — this apply creates it
+
+            declared = {
+                _fold_name(str(col.get("name"))): _fold_type(str(col.get("type") or ""))
+                for col in ((exposure.get("contract") or {}).get("schema") or [])
+                if col.get("name")
+            }
+            actual = {
+                _fold_name(str(col.get("name"))): _fold_type(str(col.get("type") or ""))
+                for col in (live.get("column") or [])
+                if isinstance(col, Mapping) and col.get("name")
+            }
+            if not declared or not actual:
+                continue
+
+            mismatched = [
+                {"column": name, "declared": declared[name], "live": actual[name]}
+                for name in declared
+                if name in actual and declared[name] != actual[name]
+            ]
+            missing = sorted(set(declared) - set(actual))
+            extra = sorted(set(actual) - set(declared))
+            if mismatched or missing or extra:
+                drift.append(
+                    {
+                        "table": f"{database}.{schema}.{table}",
+                        "type_mismatches": mismatched,
+                        "missing": missing,
+                        "extra": extra,
+                    }
+                )
+        return drift
 
 
 def _db_key(cid: str, database: str) -> str:
@@ -464,16 +578,38 @@ def _emit_snowflake(
     table = loc.get("table") or loc.get("view")
     if not table:
         return
+
     tbl_res = safe_ident(f"{cid}_{database}_{schema_name}_{table}")
 
     table_comment = _build_horizon_table_comment(contract, pool=placement.pool) if contract else ""
 
     if fmt == "snowflake_view":
+        statement = _expose_view_statement(loc)
+        if statement is None:
+            # No body anywhere in the contract → the view is reference-only.
+            # It used to be provisioned as ``SELECT * FROM <itself>``, which
+            # Snowflake rejects outright ("View definition refers to view
+            # being defined") and which only appeared to work when an
+            # identifier-casing bug made the quoted target and the unquoted
+            # reference resolve to two different objects. The build engine
+            # (dbt for a view-materialized model) owns view bodies; the same
+            # rule already governs the ``views[]`` path — see
+            # ``_emit_planned_view``, which skips a view with no ``query``.
+            _logger.warning(
+                "snowflake: expose view %s.%s.%s declares no view body — "
+                "not provisioned. Its definition belongs to the build engine "
+                "that materialises it (e.g. dbt); `fluid apply` only "
+                "provisions the database and schema around it.",
+                database,
+                schema_name,
+                table,
+            )
+            return
         view_body = {
             "name": table,
             "database": db_ref,
             "schema": sc_ref,
-            "statement": loc.get("query") or f"SELECT * FROM {table}",
+            "statement": statement,
         }
         if table_comment:
             view_body["comment"] = table_comment
@@ -729,7 +865,18 @@ def _build_horizon_table_comment(contract: Mapping[str, Any], *, pool: Optional[
     if meta_lines:
         sections.append("FLUID classification:\n" + "\n".join(meta_lines))
     try:
-        fluid_yaml = yaml.safe_dump(dict(contract), sort_keys=False)
+        # ``sort_keys=True`` is load-bearing, not cosmetic. This YAML is
+        # written into the table COMMENT, and `tofu` diffs the COMMENT
+        # attribute on every apply. The contract dict's insertion order
+        # differs by apply input — a ``.fluid.yaml`` preserves author order,
+        # a ``plan.json`` round-trips through the plan writer's sorted JSON —
+        # so with insertion order the SAME contract produced two different
+        # comment strings and alternating `apply c.yaml` / `apply plan.json`
+        # re-issued ``ALTER TABLE … SET COMMENT`` forever, never converging.
+        # Canonical key order makes the embedded contract byte-identical for
+        # both documented inputs, so a re-apply of an unchanged product is a
+        # true no-op and drift detection stays quiet.
+        fluid_yaml = yaml.safe_dump(dict(contract), sort_keys=True)
         # Snowflake's table comment is unbounded but Snowsight renders
         # long comments awkwardly; cap at ~50 KB which fits a fairly
         # large contract verbatim.
@@ -1065,3 +1212,16 @@ def _emit_row_access_policy(
     if deps:
         row_access["depends_on"] = deps
     resources.setdefault("snowflake_row_access_policy", {})[res] = row_access
+
+
+def _expose_view_statement(loc: Mapping[str, Any]) -> Optional[str]:
+    """The explicit SELECT body an ``exposes[]`` view binding carries, if any.
+
+    Returns ``None`` when the contract supplies no body — the caller then
+    leaves the view unprovisioned rather than inventing one.
+    """
+    for key in _VIEW_BODY_KEYS:
+        value = loc.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None

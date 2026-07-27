@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
 from fluid_build.cli.console import cprint
 from fluid_build.iac import build_module, get_iac_plugin, runner
 from fluid_build.iac.backend import parse_backend
+from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.credentials import build_tofu_env, credential_report
 from fluid_build.iac.naming import safe_ident
 
@@ -110,9 +112,18 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     module_path = workdir / "main.tf.json"
     actions = native_actions(contract, logger)
-    module_path.write_text(
-        build_module(plugin, contract, actions=actions, backend=backend), encoding="utf-8"
-    )
+    try:
+        module = build_module(plugin, contract, actions=actions, backend=backend)
+    except UnsupportedBindingError as exc:
+        # The emitter refused to substitute a different resource kind for the
+        # declared binding. Surface it as a typed CLI error rather than a
+        # traceback — and, critically, before anything reaches the warehouse.
+        raise CLIError(
+            1,
+            "unsupported_binding",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        )
+    module_path.write_text(module, encoding="utf-8")
 
     env = build_tofu_env()
     env.update(plugin.credential_env(env))
@@ -142,6 +153,13 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     changes = runner.change_summary(plan)
     cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
 
+    # Report what the plan's ``lifecycle.ignore_changes`` deliberately hides.
+    # Without this, a contract whose column types no longer match the live
+    # table plans clean and applies with exit 0 — including under the
+    # destructive ``--mode replace``, where the operator reasonably reads
+    # "apply complete" as "the table now matches the contract".
+    _report_suppressed_drift(plugin, contract, str(workdir), env, args, logger)
+
     # Data-loss gate — `tofu` has no CTAS/CLONE data snapshot (see
     # AUTOGEN_SPIKE.md, risk R1), so a destructive plan fails closed.
     allow_data_loss = bool(getattr(args, "allow_data_loss", False))
@@ -159,9 +177,15 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
         # logged at WARNING so CI log-scrapers + operators have a
         # paper-trail. Matches the same posture as the native engine's
         # _verify_plan_binding bypass warning.
+        cprint(
+            f"\n  ⚠️  --allow-data-loss: {changes['remove']} resource(s) will be "
+            "DESTROYED and no pre-replace snapshot is taken — this engine has "
+            "no CTAS/CLONE step, so `fluid rollback` will have no restore point."
+        )
         logger.warning(
             "--allow-data-loss: bypassing the data-loss gate; %d resource(s) "
-            "will be destroyed by `tofu apply`. Provider: %s. Plan changes: "
+            "will be destroyed by `tofu apply` with NO pre-replace snapshot "
+            "(`fluid rollback` has no restore point). Provider: %s. Plan changes: "
             "+%d ~%d -%d.",
             int(changes.get("remove", 0)),
             provider,
@@ -182,18 +206,84 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
         info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
         return 0
 
-    apply_result = runner.tofu_apply(str(workdir), env=env)
-    if not apply_result.ok:
-        raise CLIError(
-            1,
-            "opentofu_apply_failed",
-            {"error": _tail(apply_result.stderr or apply_result.stdout)},
-        )
-    applied = runner.change_summary(apply_result)
+    # ``fluid apply`` is the headline state-changing command, so a receiver
+    # configured with the standard OPENLINEAGE_URL must see it. Emission was
+    # previously wired only into the acquisition runners, so a real Snowflake
+    # apply produced zero events. Opt-in and zero-cost when unconfigured
+    # (``resolve_lineage_emitter`` returns the null emitter), and every
+    # emit call soft-fails — lineage never breaks an apply.
+    with _apply_lineage(contract, provider=provider, planned=changes) as record:
+        apply_result = runner.tofu_apply(str(workdir), env=env)
+        if not apply_result.ok:
+            raise CLIError(
+                1,
+                "opentofu_apply_failed",
+                {"error": _tail(apply_result.stderr or apply_result.stdout)},
+            )
+        applied = runner.change_summary(apply_result)
+        record(applied)
+
     cprint(f"\n  tofu apply complete: +{applied['add']} ~{applied['change']} -{applied['remove']}")
 
     info(logger, "opentofu_apply_ok", provider=provider, **applied)
     return 0
+
+
+@contextmanager
+def _apply_lineage(contract: Mapping[str, Any], *, provider: str, planned: Mapping[str, Any]):
+    """Emit START then COMPLETE / FAIL around one ``tofu apply``.
+
+    Yields a ``record(applied)`` callback so the terminal event carries the
+    real applied change counts rather than the planned ones. Any exception
+    escaping the block (including the ``opentofu_apply_failed`` CLIError)
+    produces a FAIL event and is re-raised untouched.
+    """
+    from fluid_build.api.lineage import RunEventType
+    from fluid_build.build_runners._acquisition_common import generate_run_id, utc_now_iso
+    from fluid_build.build_runners._lineage import emit_apply_event, resolve_lineage_emitter
+
+    emitter = resolve_lineage_emitter()
+    run_id = generate_run_id()
+    started_at = utc_now_iso()
+    applied: Dict[str, Any] = {}
+
+    def record(counts: Mapping[str, Any]) -> None:
+        applied.update(counts)
+
+    emit_apply_event(
+        emitter,
+        contract,
+        event_type=RunEventType.START,
+        event_time=started_at,
+        run_id=run_id,
+        run_started_at=started_at,
+        provider=provider,
+        facets={"planned_changes": dict(planned)},
+    )
+    try:
+        yield record
+    except BaseException:
+        emit_apply_event(
+            emitter,
+            contract,
+            event_type=RunEventType.FAIL,
+            event_time=utc_now_iso(),
+            run_id=run_id,
+            run_started_at=started_at,
+            provider=provider,
+            facets={"planned_changes": dict(planned)},
+        )
+        raise
+    emit_apply_event(
+        emitter,
+        contract,
+        event_type=RunEventType.COMPLETE,
+        event_time=utc_now_iso(),
+        run_id=run_id,
+        run_started_at=started_at,
+        provider=provider,
+        facets={"planned_changes": dict(planned), "applied_changes": dict(applied)},
+    )
 
 
 def resolve_apply_engine(args, logger: logging.Logger) -> str:
@@ -386,6 +476,67 @@ def _guard_packaging_transitions(
             containers=[t.as_event() for t in adoptions],
             count=len(adoptions),
         )
+
+
+def _report_suppressed_drift(
+    plugin: Any,
+    contract: Mapping[str, Any],
+    workdir: str,
+    env: Mapping[str, str],
+    args,
+    logger: logging.Logger,
+) -> None:
+    """Surface drift the emitted module's ``ignore_changes`` suppresses.
+
+    Optional plugin capability: a cloud plugin that pins
+    ``lifecycle.ignore_changes`` on an attribute derived from the contract
+    implements ``suppressed_drift(contract, prior_resources)`` and returns
+    one record per drifted object. Plugins without it are silently skipped,
+    so this stays a no-op for every other cloud.
+
+    Reporting, not gating. ``ignore_changes`` on Snowflake columns is a
+    deliberate design decision (the build engine owns the real column types,
+    and Snowflake rejects most in-place scale changes) — the defect was that
+    the apply said nothing about it. ``fluid verify --strict`` remains the
+    gate; this makes sure the operator knows to run it.
+    """
+    detect = getattr(plugin, "suppressed_drift", None)
+    if not callable(detect):
+        return
+    try:
+        prior = runner.tofu_prior_state_resources(workdir, env=env)
+        drift = detect(contract, prior)
+    except Exception as exc:  # noqa: BLE001 — advisory only, never fails an apply
+        logger.debug("suppressed-drift report unavailable: %s", type(exc).__name__)
+        return
+    if not drift:
+        return
+
+    mode = str(getattr(args, "mode", None) or "amend")
+    for record in drift:
+        details = []
+        for item in record.get("type_mismatches") or []:
+            details.append(f"{item['column']}: contract={item['declared']} live={item['live']}")
+        for name in record.get("missing") or []:
+            details.append(f"{name}: declared but absent from the live table")
+        for name in record.get("extra") or []:
+            details.append(f"{name}: present in the live table but not declared")
+        cprint(
+            f"\n  ⚠️  column drift NOT reconciled on {record['table']} "
+            f"(mode={mode}): " + "; ".join(details)
+        )
+        logger.warning(
+            "opentofu_suppressed_column_drift table=%s mode=%s details=%s",
+            record["table"],
+            mode,
+            "; ".join(details),
+        )
+    cprint(
+        '      The emitted module pins lifecycle.ignore_changes=["column"], so '
+        "`tofu` will not alter these columns — the build engine owns the "
+        "materialized types. Run `fluid verify --strict` to gate on it."
+    )
+    warn(logger, "opentofu_suppressed_drift_reported", tables=[r["table"] for r in drift])
 
 
 def _data_loss_blocked(changes: Mapping[str, int], allow_data_loss: bool) -> bool:

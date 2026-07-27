@@ -651,3 +651,71 @@ class TestGovernanceMeta:
         assert "config" not in _model(doc)
         for metric in doc.get("metrics", []):
             assert "config" not in metric
+
+
+# ---------------------------------------------------------------------------
+# FLUID agg tokens → MetricFlow AggregationType (regression)
+#
+# dbt's AggregationType enum is
+# ['sum','min','max','count_distinct','sum_boolean','average','percentile',
+#  'median','count'] — there is no 'avg'. Passing FLUID's own first-class
+# `agg: avg` straight through made `dbt parse` abort on the generated project:
+#
+#   ValueError: Invalid enum value: `avg` in enum AggregationType
+#     (dbt/parser/schema_yaml_readers.py, agg=AggregationType(unparsed.agg))
+#
+# i.e. any contract using a valid FLUID agg produced an unparseable project.
+# ---------------------------------------------------------------------------
+
+# The exact enum dbt-semantic-interfaces accepts, transcribed from
+# dbt_semantic_interfaces.type_enums.aggregation_type.AggregationType.
+_DBT_AGGREGATION_TYPES = frozenset(
+    {
+        "sum",
+        "min",
+        "max",
+        "count_distinct",
+        "sum_boolean",
+        "average",
+        "percentile",
+        "median",
+        "count",
+    }
+)
+
+
+class TestAggregationTypeMapping:
+    def test_avg_is_emitted_as_metricflow_average(self):
+        doc = _emit(
+            _contract(
+                semantics=_semantics(
+                    measures=[{"name": "aov", "agg": "avg", "expr": "amount"}],
+                    metrics=[{"name": "aov_m", "type": "simple", "measure": "aov"}],
+                )
+            )
+        )
+        measures = doc["semantic_models"][0]["measures"]
+        assert [m["agg"] for m in measures] == ["average"]
+
+    def test_every_emitted_agg_is_a_valid_dbt_aggregation_type(self):
+        from fluid_build.engines.dbt.semantic_models import AGG_TO_METRICFLOW
+
+        for fluid_agg, mf_agg in AGG_TO_METRICFLOW.items():
+            assert mf_agg in _DBT_AGGREGATION_TYPES, fluid_agg
+
+    def test_the_fluid_schema_enum_is_fully_covered(self):
+        """Every ``measures[].agg`` the 0.7.6 schema admits must map."""
+        import json
+        from pathlib import Path as _Path
+
+        import fluid_build
+
+        schema = json.loads(
+            (_Path(fluid_build.__file__).parent / "schemas" / "fluid-schema-0.7.6.json").read_text()
+        )
+        enum = schema["$defs"]["semanticModel"]["properties"]["measures"]["items"]["properties"][
+            "agg"
+        ]["enum"]
+        from fluid_build.engines.dbt.semantic_models import AGG_TO_METRICFLOW
+
+        assert set(enum) == set(AGG_TO_METRICFLOW)

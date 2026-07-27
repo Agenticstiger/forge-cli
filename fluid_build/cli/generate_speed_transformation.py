@@ -521,6 +521,14 @@ def _generate_single_build(
     # via build_runners — an edge engines/ must not have.
     if engine_name == "dbt":
         engine_kwargs["tests_key"] = _resolve_dbt_tests_key(args, logger)
+        # A bare decimal type (``number`` / ``decimal``) resolves to scale 0
+        # on Snowflake, so cents are silently truncated in the built table.
+        # Surface it here — the fix is a contract edit (``number(12,2)``),
+        # and after generation it's too late to notice.
+        from fluid_build.engines.dbt import _types as _dbt_types
+
+        for warning in _dbt_types.precision_warnings(contract, build):
+            cprint(f"[yellow]Warning: {warning}[/yellow]")
     elif getattr(args, "dbt_tests_key", None):
         cprint(
             f"[yellow]Warning: --dbt-tests-key is only meaningful for "
@@ -773,6 +781,14 @@ def _run_dbt_parse_gate(output_dir: Path, logger: logging.Logger) -> bool:
     wrapper like ``poetry run dbt``) plus the venv-sibling fallback —
     previously this was a hard ``shutil.which("dbt")``, inconsistent
     with how ``fluid apply`` resolves dbt.
+
+    When the generator emitted a ``packages.yml`` — which it does for any
+    contract using a namespaced test (``dbt_utils.recency``,
+    ``dbt_expectations.*``), i.e. most non-trivial contracts — ``dbt
+    parse`` refuses to run at all until the packages are installed
+    ("dbt expects 1 package(s) ... Run `dbt deps`"). That short-circuits
+    the gate on a chore instead of on the user's contract, so we run
+    ``dbt deps`` first.
     """
     import subprocess
 
@@ -794,12 +810,32 @@ def _run_dbt_parse_gate(output_dir: Path, logger: logging.Logger) -> bool:
             return True
         command_prefix = [dbt_bin]
 
-    command = [*command_prefix, "parse", "--project-dir", str(output_dir)]
     # Only inject --profiles-dir when the generator emitted a local
     # profiles.yml. If the project ships without one (e.g. user already
     # manages ~/.dbt/profiles.yml), let dbt use its default resolution.
+    profiles_args: List[str] = []
     if (output_dir / "profiles.yml").exists():
-        command.extend(["--profiles-dir", str(output_dir)])
+        profiles_args = ["--profiles-dir", str(output_dir)]
+
+    if (output_dir / "packages.yml").exists() and not (output_dir / "dbt_packages").is_dir():
+        deps_command = [*command_prefix, "deps", "--project-dir", str(output_dir), *profiles_args]
+        cprint(f"\n[cyan]Running `dbt deps` against {output_dir}[/cyan]")
+        try:
+            deps = subprocess.run(deps_command, capture_output=True, text=True, check=False)
+        except Exception as exc:  # noqa: BLE001
+            error(logger, f"dbt_deps_gate_failed_to_spawn: {exc}")
+            return False
+        if deps.returncode != 0:
+            cprint(
+                "[red]✗ dbt deps failed — the packages the generated tests "
+                "reference could not be installed:[/red]"
+            )
+            for stream in ((deps.stderr or "").strip(), (deps.stdout or "").strip()):
+                if stream:
+                    cprint(stream)
+            return False
+
+    command = [*command_prefix, "parse", "--project-dir", str(output_dir), *profiles_args]
 
     cprint(f"\n[cyan]Running `dbt parse` against {output_dir}[/cyan]")
     try:

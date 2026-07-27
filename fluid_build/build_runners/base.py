@@ -90,7 +90,10 @@ def is_embedded_sql_build(build: Dict[str, Any]) -> bool:
     ``pattern: embedded-logic`` + inline ``properties.sql``).
 
     These builds carry their SQL directly in the contract and are executed
-    by the local provider's DuckDB engine.  They do NOT require an external
+    by the runtime platform the build declares — the local provider's
+    DuckDB engine for ``platform: local`` (or an unset platform), the
+    warehouse itself for a declared warehouse (see
+    :data:`_EMBEDDED_SQL_EXECUTORS`).  They do NOT require an external
     Python script, so the python-runner's ``resolve_script_path`` lookup
     is the wrong dispatch — it always returns ``None`` and emits the
     confusing "Script not found: ingest.py" warning.
@@ -106,6 +109,24 @@ def is_embedded_sql_build(build: Dict[str, Any]) -> bool:
         props = build.get("properties") or {}
         return bool(props.get("sql"))
     return False
+
+
+#: ``execution.runtime.platform`` values that mean "run this inline SQL on
+#: the operator's machine". An absent platform keeps the historical local
+#: behaviour, so contracts that never declared one are unaffected.
+LOCAL_SQL_PLATFORMS = frozenset({"", "local", "duckdb"})
+
+
+def embedded_sql_platform(build: Dict[str, Any]) -> str:
+    """Return the lower-cased ``execution.runtime.platform`` of a build.
+
+    Empty string when the build declares no runtime platform.
+    """
+    execution = build.get("execution") or {}
+    runtime = execution.get("runtime") or {} if isinstance(execution, dict) else {}
+    if not isinstance(runtime, dict):
+        return ""
+    return str(runtime.get("platform") or "").strip().lower()
 
 
 # Engines that ship as acquisition runners under build_runners/<engine>/.
@@ -246,32 +267,138 @@ def _execute_acquisition_build(
     )
 
 
+def _execute_embedded_sql_build_snowflake(
+    build: Dict[str, Any],
+    contract: Dict[str, Any],
+) -> int:
+    """Execute an embedded-SQL build's inline SQL on Snowflake.
+
+    The connection is resolved by the same precedence chain every other
+    Snowflake surface uses (:func:`get_connection_params`): explicit
+    argument → contract binding / ``builds[].execution.runtime.resources``
+    → environment / credential adapter. So a build that declares
+
+    .. code-block:: yaml
+
+        execution:
+          runtime:
+            platform: snowflake
+            resources: {warehouse: WH, database: DB, schema: SC, role: R}
+
+    runs against exactly that warehouse context.
+
+    Returns 0 on success, 1 on failure.
+    """
+    props = build.get("properties") or {}
+    sql = (props.get("sql") or "").strip()
+    if not sql:
+        cprint("   ❌ Build declares platform 'snowflake' but carries no properties.sql")
+        return 1
+
+    from fluid_build.providers.snowflake.connection import SnowflakeConnection
+    from fluid_build.providers.snowflake.util.config import get_connection_params
+
+    # ``schema=None`` is deliberate: ``get_connection_params`` defaults the
+    # parameter to ``PUBLIC``, and an explicit argument outranks the
+    # contract in ``resolve_snowflake_settings`` — passing the default
+    # through would silently override the build's declared schema.
+    params = get_connection_params(contract=contract, schema=None)
+    resources = ((build.get("execution") or {}).get("runtime") or {}).get("resources") or {}
+    for key in ("warehouse", "database", "schema", "role"):
+        value = resources.get(key)
+        if value:
+            params[key] = value
+
+    cprint(
+        f"   target: {params.get('database') or '?'}.{params.get('schema') or '?'} "
+        f"(warehouse={params.get('warehouse') or '?'}, role={params.get('role') or 'default'})"
+    )
+    with SnowflakeConnection(**params) as conn:
+        conn.executescript(sql)
+    return 0
+
+
 def _execute_embedded_sql_build(
     build: Dict[str, Any],
     contract: Dict[str, Any],
     contract_dir: Path,
     dry_run: bool = False,
 ) -> int:
-    """Execute an embedded-SQL build via the local provider's DuckDB engine.
+    """Execute an embedded-SQL build on the runtime platform it declares.
 
     Embedded-SQL builds (``engine: sql`` / ``pattern: embedded-logic`` +
     ``properties.sql``) carry their transformation inline and do not ship a
-    Python driver script.  They are materialised directly by the local
-    provider, not by the python runner.
+    Python driver script, so the python runner is the wrong dispatch.
+
+    ``execution.runtime.platform`` selects the executor:
+
+    * ``local`` / ``duckdb`` / unset — the local provider's DuckDB engine
+      (the historical behaviour, unchanged).
+    * ``snowflake`` — the declared warehouse, via
+      :func:`_execute_embedded_sql_build_snowflake`.
+    * anything else — a hard error. This branch used to fall through to
+      DuckDB, so a contract declaring ``platform: snowflake`` had its
+      warehouse/database/schema/role accepted and silently discarded: the
+      SQL ran against an in-process DuckDB, the rows landed in a local CSV,
+      and the declared warehouse was never touched. Refusing beats
+      downgrading a declared platform without telling anyone.
+
+    ``{{ env.X }}`` placeholders in the build are resolved before any engine
+    sees the SQL — the plan.json input shape resolved them (via
+    ``resolve_contract_env_templates`` in :func:`run_builds_from_args`) and
+    the YAML shape did not, so the same contract shipped a literal
+    ``{{ env.SNOWFLAKE_DATABASE }}`` to the executor depending on which
+    documented input the operator used. Resolving here makes both shapes
+    identical, and mirrors what ``_execute_acquisition_build`` already does
+    on the runtime path.
 
     Returns 0 on success, 1 on failure.
     """
     import time
 
     build_id = build.get("id", "unknown")
+    # Runtime path: resolve every placeholder, secrets included — the value
+    # stays in process memory and is never serialised to a catalog. See the
+    # secrets note in ``_execute_acquisition_build``.
+    build = _resolve_env_placeholders(build)
+    contract = _resolve_env_placeholders(contract)
+    platform = embedded_sql_platform(build)
+
     cprint(f"\n{'─' * 60}")
-    cprint(f"🔷 Build '{build_id}' (embedded-SQL / local DuckDB)")
+    engine_label = "local DuckDB" if platform in LOCAL_SQL_PLATFORMS else platform
+    cprint(f"🔷 Build '{build_id}' (embedded-SQL / {engine_label})")
 
     if dry_run:
         props = build.get("properties") or {}
         sql_preview = (props.get("sql") or "").strip()[:200]
         cprint(f"   [DRY RUN] Would execute SQL:\n{sql_preview}")
         return 0
+
+    if platform not in LOCAL_SQL_PLATFORMS:
+        if platform != "snowflake":
+            cprint(
+                f"   ❌ Build '{build_id}' declares "
+                f"execution.runtime.platform: '{platform}', which has no "
+                "embedded-SQL executor. forge-cli will not downgrade a declared "
+                "platform to the local DuckDB engine. Supported: "
+                f"{', '.join(sorted(LOCAL_SQL_PLATFORMS - {''}))}, snowflake."
+            )
+            LOG.error(
+                "embedded_sql_platform_unsupported build_id=%s platform=%s",
+                build_id,
+                platform,
+            )
+            return 1
+        try:
+            t0 = time.time()
+            rc = _execute_embedded_sql_build_snowflake(build, contract)
+            if rc == 0:
+                cprint(f"   ✅ Completed in {round(time.time() - t0, 2)}s on Snowflake")
+            return rc
+        except Exception as exc:
+            cprint(f"   ❌ Embedded-SQL build '{build_id}' error: {exc}")
+            LOG.exception("embedded_sql_build_error build_id=%s", build_id)
+            return 1
 
     try:
         from fluid_build.providers.local.local import LocalProvider
@@ -594,4 +721,30 @@ def run_builds_from_args(
     cprint(f"⏭️  Skipped: {total_skipped}")
     cprint(f"{'=' * 80}\n")
 
-    return 0 if total_failed == 0 else 1
+    if total_failed:
+        return 1
+
+    # Green-on-nothing guard. A build-augmented apply whose every build was
+    # skipped used to exit 0: the DDL landed, no transformation ran, no rows
+    # were produced, and CI reported a successful data-product deployment
+    # against an empty table. "Nothing ran" is not "success" — a missing dbt
+    # project or driver script is a broken deployment, not a no-op.
+    # ``--allow-skipped-builds`` is the explicit opt-in for contracts whose
+    # build artifacts legitimately live outside the checkout.
+    if total_skipped and not total_executed:
+        if getattr(args, "allow_skipped_builds", False):
+            LOG.warning(
+                "build.all_skipped_allowed skipped=%d (--allow-skipped-builds)",
+                total_skipped,
+            )
+            return 0
+        console_error(
+            f"Every build was skipped ({total_skipped}/{len(builds)}) — nothing "
+            "was transformed and no rows were produced. Fix the missing build "
+            "artifact(s) reported above, or pass --allow-skipped-builds if the "
+            "skip is expected."
+        )
+        LOG.error("build.all_skipped skipped=%d total=%d", total_skipped, len(builds))
+        return 1
+
+    return 0

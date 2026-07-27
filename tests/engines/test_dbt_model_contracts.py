@@ -148,13 +148,19 @@ class TestAdapterTypeMapping:
         assert _types.sql_type("String", "snowflake") == "varchar"
 
     def test_generic_mapping_preserved_for_skeleton_casts(self):
-        """``adapter=None`` reproduces the historical ``models._sql_type``
-        table byte-for-byte — including its case-sensitive keys and the
-        ``varchar`` fallback for unknown/mixed-case types."""
+        """``adapter=None`` keeps the historical generic table's answers for
+        every canonical FLUID scalar, and still falls back to ``varchar`` for
+        a genuinely unknown type.
+
+        Mixed case no longer falls back: ``Datetime`` used to hit the
+        ``varchar`` fallback purely because the historical table's keys were
+        case-sensitive, which is the same silently-wrong-type defect the
+        parameterized/alias handling exists to close.
+        """
         assert _types.sql_type("string") == "varchar"
         assert _types.sql_type("STRING") == "varchar"
         assert _types.sql_type("float") == "numeric"
-        assert _types.sql_type("Datetime") == "varchar"  # mixed case → fallback
+        assert _types.sql_type("Datetime") == "timestamp"
         assert _types.sql_type("mystery_type") == "varchar"
 
     def test_unknown_adapter_falls_back_to_generic(self):
@@ -503,3 +509,92 @@ class TestLiveDbtBuildEnforcement:
             timeout=300,
         )
         assert result.returncode == 0, f"unexpected failure:\n{result.stdout}\n{result.stderr}"
+
+
+# -----------------------------------------------------------------------------
+# Parameterized / alias contract types (regression)
+#
+# ``column.type`` explicitly admits SQL alias spellings and "a parameterized
+# form such as decimal(18,4)". Every one of them used to miss the 10-key
+# adapter table and land on ``_ADAPTER_FALLBACK['snowflake'] = 'varchar'``, so
+# a Snowflake table declared ``number(12,2)`` was built as
+# ``VARCHAR(16777216)`` and ``dbt run`` reported success.
+# -----------------------------------------------------------------------------
+
+
+class TestParameterizedAndAliasTypes:
+    # (declared type, snowflake, bigquery, redshift, duckdb)
+    MATRIX = [
+        ("number(12,2)", "number(12,2)", "numeric(12,2)", "numeric(12,2)", "numeric(12,2)"),
+        ("decimal(18,4)", "decimal(18,4)", "numeric(18,4)", "decimal(18,4)", "decimal(18,4)"),
+        ("varchar(25)", "varchar(25)", "string(25)", "varchar(25)", "varchar(25)"),
+        ("NUMBER(38,0)", "number(38,0)", "numeric(38,0)", "numeric(38,0)", "numeric(38,0)"),
+        ("bigint", "number", "int64", "bigint", "bigint"),
+        ("text", "varchar", "string", "varchar", "varchar"),
+        ("double", "float", "float64", "double precision", "numeric"),
+        ("timestamp_ntz", "timestamp_ntz", "timestamp", "timestamp", "timestamp"),
+        ("variant", "variant", "json", "super", "varchar"),
+        ("decimal", "decimal", "numeric", "decimal", "decimal"),
+    ]
+
+    @pytest.mark.parametrize("declared,sf,bq,rs,duck", MATRIX)
+    def test_declared_type_is_honoured(self, declared, sf, bq, rs, duck):
+        assert _types.sql_type(declared, "snowflake") == sf
+        assert _types.sql_type(declared, "bigquery") == bq
+        assert _types.sql_type(declared, "redshift") == rs
+        assert _types.sql_type(declared, "duckdb") == duck
+
+    def test_no_parameterized_type_collapses_to_bare_varchar(self):
+        """The exact 0.13.0 symptom: every parameterized form fell through to
+        ``_ADAPTER_FALLBACK['snowflake']`` and the column landed as
+        ``VARCHAR(16777216)``."""
+        for declared, *_ in self.MATRIX:
+            if "(" not in declared:
+                continue
+            assert _types.sql_type(declared, "snowflake") != "varchar"
+            assert "(" in _types.sql_type(declared, "snowflake")
+
+    def test_arguments_are_whitespace_normalized(self):
+        """Generated artifacts must be byte-stable for the same intent."""
+        assert _types.sql_type("number(12, 2)", "snowflake") == _types.sql_type(
+            "number(12,2)", "snowflake"
+        )
+
+    def test_arguments_dropped_when_the_resolved_type_takes_none(self):
+        """Better a bare type than SQL the warehouse rejects."""
+        assert _types.sql_type("array(4)", "snowflake") == "array"
+        assert _types.sql_type("boolean(1)", "snowflake") == "boolean"
+
+    def test_split_parameterized(self):
+        assert _types.split_parameterized("decimal(18,4)") == ("decimal", "18,4")
+        assert _types.split_parameterized("varchar(25)") == ("varchar", "25")
+        assert _types.split_parameterized("bigint") == ("bigint", None)
+        assert _types.split_parameterized("number()") == ("number", None)
+
+
+# -----------------------------------------------------------------------------
+# Skeleton casts and contract data_type must resolve through ONE table
+#
+# ``models._sql_type`` used the generic table (float→numeric, array→varchar,
+# object→varchar) while ``schema_yml`` used the adapter table (float→float,
+# array→array, object→object), so a freshly generated ``--model-contracts``
+# project failed its own contract on the first ``dbt run``:
+# ``C_FLOAT FIXED vs REAL``, ``C_ARRAY TEXT vs ARRAY``.
+# -----------------------------------------------------------------------------
+
+
+class TestSkeletonCastsMatchContractDataType:
+    DIVERGENT = ["float", "array", "object", "number(12,2)", "variant", "timestamp"]
+
+    @pytest.mark.parametrize("fluid_type", DIVERGENT)
+    def test_cast_and_data_type_agree_on_snowflake(self, fluid_type):
+        contract = _contract(schema=[{"name": "c", "type": fluid_type}], platform="snowflake")
+        files = DbtEngine().generate(contract, contract["builds"][0], model_contracts=True)
+        model = _parsed_model(files)
+        declared = _column(model, "c")["data_type"]
+        sql = files["models/marts/customer_orders.sql"]
+        assert f"cast(null as {declared}) as c" in sql, sql
+
+    def test_generic_table_is_still_used_without_an_adapter(self):
+        assert _sql_type("float") == "numeric"
+        assert _sql_type("float", "snowflake") == "float"

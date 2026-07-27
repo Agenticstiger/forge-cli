@@ -56,7 +56,12 @@ except ImportError:
 from ..config_manager import FluidConfig
 from ..loader import load_contract
 from ..providers.common import metrics_collector
-from ._common import hydrate_dotenv, resolve_contract_env_templates
+from ._common import (
+    CLIError,
+    hydrate_dotenv,
+    load_contract_with_overlay,
+    resolve_contract_env_templates,
+)
 
 if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
     from ..providers.catalogs import PublishResult
@@ -484,7 +489,7 @@ def format_results(
             return "\n".join(output)
 
 
-def _run_catalog_adapters(contract_paths, args, logger: logging.Logger) -> None:
+def _run_catalog_adapters(contract_paths, args, logger: logging.Logger) -> List[PublishResult]:
     """Dispatch installed ``fluid_build.catalog_adapters`` plugins per contract.
 
     Additive to the configured-catalog publish above: an external
@@ -493,11 +498,20 @@ def _run_catalog_adapters(contract_paths, args, logger: logging.Logger) -> None:
     code loaded) when none is installed. ``--dry-run`` plans without applying.
     Discovery, the allow/block policy, and per-plugin fail-isolation live in the
     unified :mod:`fluid_build.plugin_manager`.
+
+    Returns one :class:`PublishResult` per (contract, plugin) pair so the
+    caller folds adapter outcomes into the results table AND the exit code.
+    Returning nothing here used to mean an adapter whose ``plan()`` raised
+    left ``fluid publish`` at exit 0 under a ✅ Success table, so a CI
+    pipeline reported a green publish while the catalog was never updated.
     """
     from fluid_build.plugin_manager import ROLE_GROUPS, dispatch_catalog_adapters, has_plugins
 
+    from ..providers.catalogs import PublishResult
+
+    adapter_results: List[PublishResult] = []
     if not has_plugins(ROLE_GROUPS["catalog"]):
-        return  # backward-compatible no-op: nothing installed
+        return adapter_results  # backward-compatible no-op: nothing installed
 
     from fluid_build.loader import load_contract
 
@@ -507,10 +521,20 @@ def _run_catalog_adapters(contract_paths, args, logger: logging.Logger) -> None:
             contract = load_contract(str(cp))
         except Exception as e:  # noqa: BLE001 - skip an unreadable contract, typed
             logger.warning("catalog-adapter step: could not load %s: %s", cp, type(e).__name__)
+            adapter_results.append(
+                PublishResult(
+                    success=False,
+                    catalog_id="catalog-adapter",
+                    asset_id=str(cp),
+                    error=f"could not load contract: {type(e).__name__}",
+                )
+            )
             continue
+        asset_id = str(contract.get("id") or cp)
         for s in dispatch_catalog_adapters(contract, dry_run=dry_run, logger=logger):
             verb = "would sync" if dry_run else "synced"
-            status = "" if s.get("ok", True) else f" (FAILED: {s.get('error', 'error')})"
+            ok = bool(s.get("ok", True))
+            status = "" if ok else f" (FAILED: {s.get('error', 'error')})"
             logger.info(
                 "🗂️  catalog adapter %s: %s %d action(s)%s",
                 s.get("plugin", "?"),
@@ -518,6 +542,22 @@ def _run_catalog_adapters(contract_paths, args, logger: logging.Logger) -> None:
                 s.get("planned", 0),
                 status,
             )
+            plugin = str(s.get("plugin", "?"))
+            adapter_results.append(
+                PublishResult(
+                    success=ok,
+                    catalog_id=f"adapter:{plugin}",
+                    asset_id=asset_id,
+                    catalog_url=f"{verb} {s.get('planned', 0)} action(s)" if ok else None,
+                    error=(
+                        None
+                        if ok
+                        else f"catalog adapter {plugin} failed: {s.get('error', 'error')}"
+                    ),
+                    details=dict(s),
+                )
+            )
+    return adapter_results
 
 
 async def run_async(args, logger: logging.Logger) -> int:
@@ -583,11 +623,16 @@ async def run_async(args, logger: logging.Logger) -> int:
         logger.error("No contract files specified")
         return 1
 
-    # Validate contract files exist
+    # Validate contract files exist. Raised as the same stable slug every
+    # other command uses for this condition (``fluid publish`` used to emit
+    # a bare log line with no slug, no suggestion and no docs link).
     invalid_paths = [p for p in contract_paths if not p.exists()]
     if invalid_paths:
-        logger.error(f"Contract files not found: {', '.join(str(p) for p in invalid_paths)}")
-        return 1
+        raise CLIError(
+            1,
+            "contract_file_not_found",
+            {"path": ", ".join(str(p) for p in invalid_paths)},
+        )
 
     # F1 / F6: validate every (glob-expanded) contract path through the
     # platform-aware path validator — traversal, forbidden system paths,
@@ -653,7 +698,10 @@ async def run_async(args, logger: logging.Logger) -> int:
 
     # Additionally run any installed fluid_sdk CatalogAdapter plugins
     # (entry-point group ``fluid_build.catalog_adapters``) against each contract.
-    _run_catalog_adapters(contract_paths, args, logger)
+    # Their outcomes join ``results`` so a failed adapter shows up in the
+    # results table AND degrades the exit code — an adapter that synced
+    # nothing must never be reported as a green publish.
+    results.extend(_run_catalog_adapters(contract_paths, args, logger))
 
     # Display results
     output = format_results(results, args.format, console)
@@ -687,18 +735,42 @@ async def run_async(args, logger: logging.Logger) -> int:
     # catalog auto-registration is observability, not correctness.
     try:
         from fluid_build.cli._acquisition_stage_ext import (
+            acquisition_builds,
             is_acquisition_contract,
             publish_acquisition,
         )
 
+        # The registrars write to the catalog unconditionally, so a
+        # planning-only invocation must not reach them.
+        plan_only = bool(getattr(args, "dry_run", False) or getattr(args, "verify_only", False))
+
         for cp in contract_paths:
             try:
-                from fluid_build.loader import load_contract_with_overlay
-
                 contract = load_contract_with_overlay(str(cp), getattr(args, "env", None), logger)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — one bad contract must not
+                # abort the others, but the skip has to be visible: a silent
+                # ``continue`` here turned a declared ``properties.catalog.register``
+                # into a zero-output no-op with exit 0.
+                logger.warning(
+                    "Acquisition catalog dispatch skipped for %s: %s: %s",
+                    cp,
+                    type(exc).__name__,
+                    exc,
+                )
                 continue
             if not is_acquisition_contract(contract):
+                continue
+            if plan_only:
+                product_id = contract.get("id", "unknown")
+                for build in acquisition_builds(contract):
+                    targets = (build.get("properties", {}).get("catalog", {}) or {}).get(
+                        "register", []
+                    )
+                    for target in targets:
+                        cprint(
+                            f"  🔎 acquisition publish (plan only) "
+                            f"{product_id}/{build.get('id', 'unknown')} → {target}"
+                        )
                 continue
             acq_results = publish_acquisition(contract, Path.cwd())
             for r in acq_results:
@@ -726,6 +798,10 @@ def run(args, logger: logging.Logger) -> int:
     """Main entry point for publish command"""
     try:
         return asyncio.run(run_async(args, logger))
+    except CLIError:
+        # Already typed — the entry point renders the stable slug +
+        # suggestions + docs URL. Collapsing it here would drop all three.
+        raise
     except KeyboardInterrupt:
         logger.warning("\nInterrupted by user")
         return 130

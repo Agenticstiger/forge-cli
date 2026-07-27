@@ -141,12 +141,21 @@ def assert_openlineage_shape(payload: dict) -> None:
         "OTHER",
     }, f"unknown eventType {payload.get('eventType')!r}"
 
-    # Custom facets must carry the OpenLineage bookkeeping keys, otherwise
-    # consumers cannot attribute or version them.
+    # Every value in ``run.facets`` must be a ``RunFacet`` — an *object*
+    # carrying the OpenLineage bookkeeping keys (``BaseFacet.required`` is
+    # ``["_producer", "_schemaURL"]``), otherwise consumers cannot attribute
+    # or version them. The ``isinstance(facet, dict)`` guard that used to
+    # wrap this loop made a non-object facet skip the check silently, which
+    # is precisely how terminal events shipped ``{"engine": "duckdb",
+    # "duration_seconds": 0.02}`` as bare scalars: START validated, every
+    # COMPLETE/FAIL did not.
     for facet_name, facet in (payload["run"].get("facets") or {}).items():
-        if isinstance(facet, dict):
-            for meta in _FACET_META_KEYS:
-                assert meta in facet, f"run facet {facet_name!r} is missing {meta!r}"
+        assert isinstance(facet, dict), (
+            f"run facet {facet_name!r} must be an object (RunFacet inherits BaseFacet), "
+            f"got {type(facet).__name__}"
+        )
+        for meta in _FACET_META_KEYS:
+            assert meta in facet, f"run facet {facet_name!r} is missing {meta!r}"
 
     for side in ("inputs", "outputs"):
         for dataset in payload.get(side) or []:

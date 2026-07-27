@@ -170,8 +170,8 @@ def run(args: argparse.Namespace, logger_instance: logging.Logger) -> int:
                 if not contract_path.exists():
                     raise CLIError(
                         1,
-                        "file_not_found",
-                        context={"message": f"Contract not found: {args.contract}"},
+                        "contract_file_not_found",
+                        context={"path": str(args.contract)},
                     )
 
                 contract = load_contract_with_overlay(str(contract_path), args.env, logger)
@@ -195,9 +195,7 @@ def run(args: argparse.Namespace, logger_instance: logging.Logger) -> int:
             contract_path = Path(args.contract)
 
             if not contract_path.exists():
-                raise CLIError(
-                    1, "file_not_found", context={"message": f"Contract not found: {args.contract}"}
-                )
+                raise CLIError(1, "contract_file_not_found", context={"path": str(args.contract)})
 
             contract = load_contract_with_overlay(str(contract_path), args.env, logger)
             logger.info("Running policy enforcement")
@@ -237,13 +235,19 @@ def run(args: argparse.Namespace, logger_instance: logging.Logger) -> int:
             logger.warning("Policy check FAILED (strict mode)")
         return 1
 
-    except CLIError as e:
-        logger.error(f"Policy check error: {e.message}")
-        return e.exit_code
+    except CLIError:
+        # Already typed — let the entry point render the five-field panel
+        # (stable slug + suggestions + docs URL) instead of collapsing it to
+        # a bare ``Policy check error: file_not_found`` log line that carries
+        # neither a slug nor a next step.
+        raise
     except Exception as e:
-        logger.exception("Unexpected error during policy check")
-        console_error(f"Policy check failed: {e}")
-        return 1
+        # ``_errors.py``: "No raw stack traces in user-facing output unless
+        # --debug is set." ``logger.exception`` emits at ERROR regardless of
+        # verbosity, so a malformed contract printed a traceback through
+        # util/safe_yaml.py with and without --debug alike.
+        logger.debug("policy_check_error", exc_info=True)
+        raise CLIError(1, "policy_check_failed", {"error": str(e)})
 
 
 def output_rich(
@@ -275,7 +279,11 @@ def output_rich(
         grade = "FAIR"
     elif score >= 50:
         score_emoji = "🔶"
-        score_color = "orange"
+        # rich has no bare ``orange`` colour — passing it to Panel(border_style=)
+        # raises MissingStyle and takes the whole report down. 50-69 is exactly
+        # where a freshly imported dbt contract lands, so this crashed on the
+        # "Next:" step the importer recommends.
+        score_color = "dark_orange"
         grade = "NEEDS WORK"
     else:
         score_emoji = "🚨"

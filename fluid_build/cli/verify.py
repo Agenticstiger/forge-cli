@@ -38,10 +38,23 @@ from fluid_build.cli.console import error as console_error
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 from fluid_build.providers._sql_safety import validate_ident
 from fluid_build.providers.snowflake.util.config import resolve_env_templates
+from fluid_build.providers.snowflake.util.typefamily import (
+    SNOWFLAKE_TYPE_FAMILIES,
+    normalize_snowflake_field_name,
+    normalize_snowflake_type,
+)
 
 from ._common import CLIError, load_contract_with_overlay
 
 LOG = logging.getLogger("fluid.cli.verify")
+
+# Snowflake binding formats that address a *relation* — a table or a view.
+# Both are verified the same way: INFORMATION_SCHEMA.COLUMNS and
+# ``SELECT COUNT(*)`` are relation-agnostic in Snowflake. ``snowflake_view``
+# is the format the dbt importer emits for every view-materialized model —
+# the dominant materialization in any staging layer — so rejecting it made
+# `fluid verify` unusable on the importer's own output.
+_SNOWFLAKE_RELATION_FORMATS = frozenset({"snowflake_table", "snowflake_view"})
 
 COMMAND = "verify"
 
@@ -92,41 +105,12 @@ def _contract_is_reference_only(contract: Dict[str, Any]) -> bool:
     return False
 
 
-_SNOWFLAKE_TYPE_FAMILIES = {
-    "STRING": {"VARCHAR", "CHAR", "CHARACTER", "TEXT", "STRING"},
-    "NUMBER": {
-        "NUMBER",
-        "DECIMAL",
-        "NUMERIC",
-        "INT",
-        "INTEGER",
-        "BIGINT",
-        "SMALLINT",
-        "TINYINT",
-        "BYTEINT",
-        "FLOAT",
-        "FLOAT4",
-        "FLOAT8",
-        "DOUBLE",
-        "DOUBLE PRECISION",
-        "REAL",
-    },
-    "BOOLEAN": {"BOOLEAN", "BOOL"},
-    "DATE": {"DATE"},
-    "TIME": {"TIME"},
-    "TIMESTAMP": {
-        "TIMESTAMP",
-        "TIMESTAMP_NTZ",
-        "TIMESTAMP_LTZ",
-        "TIMESTAMP_TZ",
-        "DATETIME",
-        "TIMESTAMP WITHOUT TIME ZONE",
-        "TIMESTAMP WITH LOCAL TIME ZONE",
-        "TIMESTAMP WITH TIME ZONE",
-    },
-    "BINARY": {"BINARY", "VARBINARY", "BYTES"},
-    "VARIANT": {"VARIANT", "JSON", "JSONB", "OBJECT", "ARRAY"},
-}
+# Re-exported from the shared Snowflake type-folding module so ``fluid
+# verify`` and the OpenTofu apply engine compare a contract against a live
+# table with one table of aliases, not two hand-mirrored copies.
+_SNOWFLAKE_TYPE_FAMILIES = SNOWFLAKE_TYPE_FAMILIES
+_normalize_snowflake_type = normalize_snowflake_type
+_normalize_snowflake_field_name = normalize_snowflake_field_name
 
 
 def register(sp: argparse._SubParsersAction) -> None:
@@ -156,8 +140,12 @@ Examples:
   # Show detailed field-by-field differences
   fluid verify contract.fluid.yaml --show-diffs
 
-  # Exit with error code if mismatches found (CI/CD)
+  # Exit with error code on CRITICAL drift or verification errors (CI/CD)
   fluid verify contract.fluid.yaml --strict
+
+  # Exit with error code on ANY mismatch, including the non-critical drift
+  # --strict downgrades (e.g. a required column that went nullable)
+  fluid verify contract.fluid.yaml --strict --fail-on-warning
 
   # Output machine-readable report
   fluid verify contract.fluid.yaml --out verification-report.json
@@ -181,7 +169,25 @@ Use Cases:
     )
 
     p.add_argument(
-        "--strict", action="store_true", help="Exit with error code if any mismatches found"
+        "--strict",
+        action="store_true",
+        help=(
+            "Exit non-zero on CRITICAL drift (missing fields, type mismatches, "
+            "region drift) and on verification errors. Non-critical drift "
+            "(nullable-vs-required constraints, extra columns) is reported and "
+            "downgraded to a warning — add --fail-on-warning to gate on those too."
+        ),
+    )
+
+    p.add_argument(
+        "--fail-on-warning",
+        dest="fail_on_warning",
+        action="store_true",
+        help=(
+            "Exit non-zero on ANY mismatch, including the non-critical drift "
+            "--strict downgrades. Use for a CI gate that must not let a "
+            "required→nullable change through."
+        ),
     )
 
     p.add_argument("--out", help="Output verification report to JSON file")
@@ -473,19 +479,6 @@ def verify_bigquery_table(
     except Exception as e:
         LOG.error(f"Error verifying table {table}: {e}")
         return {"status": "error", "error": str(e), "exists": False}
-
-
-def _normalize_snowflake_type(value: str) -> str:
-    base = (value or "STRING").upper().split("(", 1)[0].strip()
-    for family, aliases in _SNOWFLAKE_TYPE_FAMILIES.items():
-        if base in aliases:
-            return family
-    return base
-
-
-def _normalize_snowflake_field_name(value: str) -> str:
-    """Snowflake folds unquoted identifiers to uppercase."""
-    return (value or "").upper()
 
 
 def _quote_qualified_snowflake_name(database: str, schema: str, table: str) -> str:
@@ -849,8 +842,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     try:
         contract_path = str(validate_cli_path(args.contract, mode="read", file_type="contract"))
     except _FluidCLIError as exc:
-        if exc.event == "file_not_found":
-            raise CLIError(1, "contract_not_found", {"path": args.contract})
+        if exc.event in ("file_not_found", "contract_file_not_found"):
+            raise CLIError(1, "contract_file_not_found", {"path": args.contract})
         raise
     args.contract = contract_path
 
@@ -994,7 +987,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             )
 
             results[expose_name] = result
-        elif format_type == "snowflake_table":
+        elif format_type in _SNOWFLAKE_RELATION_FORMATS:
             binding = expose_config.get("binding", {})
             location = binding.get("location", expose_config.get("location", {}))
             properties = binding.get("properties", {})
@@ -1007,6 +1000,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             )
             table = (
                 resolve_env_templates(location.get("table"))
+                or resolve_env_templates(location.get("view"))
                 or properties.get("table")
                 or expose_name
             )
@@ -1071,6 +1065,12 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # cols by default; contracts often declare ``required: true``) —
     # which conflated a known modelling tension with real schema breaks.
     critical_mismatch_count = 0
+    # One entry per non-critical mismatch, carrying the severity assessment
+    # that produced it. The ``--strict`` downgrade message used to assert
+    # "constraint-only drift" for every non-critical class, which is
+    # factually wrong for an extra column (a schema-structure mismatch
+    # graded INFO) — name what is actually being downgraded instead.
+    downgraded_drift: List[str] = []
 
     for expose_name, result in results.items():
         expose_config = exposes_to_verify.get(expose_name, {})
@@ -1086,13 +1086,15 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         if not properties:
             binding = expose_config.get("binding", {})
             location = binding.get("location", {})
-            if format_type == "snowflake_table":
+            if format_type in _SNOWFLAKE_RELATION_FORMATS:
                 target = ".".join(
                     part
                     for part in [
                         resolve_env_templates(location.get("database", "")) or "",
                         resolve_env_templates(location.get("schema", "")) or "",
-                        resolve_env_templates(location.get("table", "")) or "",
+                        resolve_env_templates(location.get("table", ""))
+                        or resolve_env_templates(location.get("view", ""))
+                        or "",
                     ]
                     if part
                 )
@@ -1218,6 +1220,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             mismatch_count += 1
             if severity.get("level") == "CRITICAL":
                 critical_mismatch_count += 1
+            else:
+                downgraded_drift.append(
+                    f"{expose_name}: {severity.get('reason', 'drift detected')} "
+                    f"[{severity.get('level', 'UNKNOWN')}]"
+                )
 
     # ── Acquisition pattern: post-apply probes ─────────────────────────
     # When the contract has any ``pattern: acquisition`` builds, run the
@@ -1412,17 +1419,30 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     # Exit with error code if strict mode and CRITICAL issues found.
     # Non-critical mismatches (e.g. nullable-vs-required constraint
-    # drift) emit warnings to stderr but do NOT fail the build —
-    # operators can tighten the contract incrementally. ``error_count``
-    # always fails (auth issues, connection failures, missing tables
-    # the contract claims should exist).
+    # drift) emit warnings to stderr but do NOT fail the build under
+    # ``--strict`` — operators tighten the contract incrementally, and
+    # dbt creates nullable columns by default so every dbt-built table
+    # would otherwise red-flag. ``error_count`` always fails (auth
+    # issues, connection failures, missing tables the contract claims
+    # should exist). ``--fail-on-warning`` is the opt-in that makes the
+    # exit code cover the downgraded classes too, which is what a CI
+    # gate that must not let a required→nullable change through needs.
     if args.strict and (critical_mismatch_count > 0 or error_count > 0):
         return 1
-    if args.strict and mismatch_count > 0:
+    fail_on_warning = bool(getattr(args, "fail_on_warning", False))
+    if error_count > 0 and fail_on_warning:
+        return 1
+    if mismatch_count > 0 and (args.strict or fail_on_warning):
+        detail = "; ".join(downgraded_drift) if downgraded_drift else "see the report above"
+        if fail_on_warning:
+            console_error(
+                f"--fail-on-warning: {mismatch_count} non-critical mismatch(es) "
+                f"({detail}). Tighten the contract or fix the warehouse to clear them."
+            )
+            return 1
         warning(
-            f"--strict: {mismatch_count} non-critical mismatch(es) downgraded "
-            "to warning (constraint-only drift). Tighten the contract or fix "
-            "the warehouse to clear them."
+            f"--strict: {mismatch_count} non-critical mismatch(es) downgraded to "
+            f"warning ({detail}). Pass --fail-on-warning to gate CI on these too."
         )
 
     return 0

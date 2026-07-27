@@ -94,6 +94,15 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "providers",
     ),
+    "provider_blocked_by_policy": (
+        [
+            "This provider is named in FLUID_PLUGINS_BLOCKLIST, or an "
+            "FLUID_PLUGINS_ALLOWLIST is set and does not name it",
+            "Run 'fluid plugins --role provider' to see the effective policy",
+            "Unset or amend the env var to re-enable it",
+        ],
+        "providers",
+    ),
     "reserved_provider_name": (
         ["Choose a provider name that is not a reserved built-in"],
         "providers",

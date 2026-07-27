@@ -472,9 +472,12 @@ class TestSemanticLayerImport:
             "name": "most_recent_order_at",
             "windowChoice": "max",
         }
-        # percentile measure survives; its agg_params are reported, not emitted
-        assert measures["p95_order_value"]["agg"] == "percentile"
-        assert "aggParams" not in measures["p95_order_value"]
+        # INTENTIONAL pin update: a percentile measure whose agg_params cannot
+        # be carried is DROPPED, not kept parameterless. Keeping it re-defaulted
+        # it to percentile=0.5, so `p95_order_value` kept its name and started
+        # answering the median — the round trip changed the number while the
+        # report claimed the loss was only "agg_params".
+        assert "p95_order_value" not in measures
         assert "weird" not in measures  # agg: hyperloglog — dropped
 
     def test_metrics_map_simple_ratio_derived_and_skip_cumulative(self) -> None:
@@ -814,3 +817,155 @@ class TestExposeDescriptionScrubbed:
         assert "env_var" not in desc and "{{" not in desc
         assert "Orders" in desc and "table" in desc
         assert any("orders_mart description" in x for x in report.notes + report.unsupported)
+
+
+# ── Binding identifier: warehouse-resolved, not the source spelling ─────
+#
+# dbt emits unquoted SQL, so a lowercase model alias lands in Snowflake as an
+# UPPERCASE object. Binding to the alias made `fluid apply` create a second,
+# case-sensitive, quoted-lowercase object beside the real one:
+#
+#   FLUID_TEST.FORGE_DBTB.CUSTOMER_ORDERS   BASE TABLE   5000 rows (dbt)
+#   FLUID_TEST.FORGE_DBTB."customer_orders" BASE TABLE      0 rows (forge)
+#
+# and `fluid verify` then greened against the empty shadow. catalog.json —
+# which the importer already reads for column types — carries the name the
+# warehouse actually resolved.
+
+
+class TestBindingIdentifierFromCatalog:
+    def test_catalog_name_wins_over_the_manifest_alias(self, tmp_path: Path):
+        project = _project_dir(tmp_path, with_catalog=True)
+        contract, _ = DbtManifestImporter().import_to_contract(str(project))
+        assert _expose(contract, "orders")["binding"]["location"] == {
+            "database": "ANALYTICS",
+            "schema": "JAFFLE",
+            "table": "ORDERS",
+        }
+        assert _expose(contract, "customers")["binding"]["location"]["table"] == "CUSTOMERS"
+
+    def test_alias_is_the_fallback_when_no_catalog_was_generated(self, tmp_path: Path):
+        project = _project_dir(tmp_path, with_catalog=False)
+        contract, _ = DbtManifestImporter().import_to_contract(str(project))
+        assert _expose(contract, "orders")["binding"]["location"]["table"] == "orders"
+
+    def test_models_absent_from_the_catalog_keep_their_alias(self, tmp_path: Path):
+        """catalog.json only lists what was built; a model dbt never ran is
+        not in it and must still get a binding."""
+        project = _project_dir(tmp_path, with_catalog=True)
+        contract, _ = DbtManifestImporter().import_to_contract(str(project))
+        # stg_orders is in the manifest but not in catalog_v12.json.
+        assert _expose(contract, "stg_orders")["binding"]["location"]["table"] == "stg_orders"
+
+
+# ── Semantic round trip: agg spelling and percentile parameters ─────────
+#
+# `fluid generate transformation` exports the semantics block to MetricFlow
+# YAML and this importer reads it back. Two defects broke that loop:
+#
+#   * FLUID's `avg` was passed straight through to dbt, whose AggregationType
+#     enum has `average` and no `avg` — `dbt parse` aborted with
+#     "ValueError: Invalid enum value: `avg` in enum AggregationType". On the
+#     way back, the importer rejected dbt's own `average` and dropped the
+#     measure, taking every metric built on it with it.
+#   * A percentile measure's `agg_params` were reported as dropped while the
+#     measure itself was kept, so it silently re-defaulted to percentile=0.5.
+#     Live on Snowflake, a round-tripped `p90_value` metric compiled to
+#     PERCENTILE_CONT(0.5) and returned 144038.895 (the median) where the
+#     original contract returned 272789.339.
+
+
+def _manifest_with_measures(tmp_path: Path, measures: list) -> Path:
+    manifest = json.loads((FIXTURES / "manifest_v12.json").read_text())
+    sm = manifest["semantic_models"]["semantic_model.jaffle_shop.orders"]
+    sm["measures"] = measures
+    manifest["metrics"] = {
+        k: v
+        for k, v in (manifest.get("metrics") or {}).items()
+        if v.get("type_params", {}).get("measure", {}).get("name") in {m["name"] for m in measures}
+    }
+    out = tmp_path / "manifest.json"
+    out.write_text(json.dumps(manifest))
+    return out
+
+
+class TestSemanticAggRoundTrip:
+    def test_metricflow_average_folds_to_fluid_avg(self, tmp_path: Path):
+        path = _manifest_with_measures(
+            tmp_path, [{"name": "aov", "agg": "average", "expr": "order_total"}]
+        )
+        contract, report = DbtManifestImporter().import_to_contract(str(path))
+        measures = _expose(contract, "orders")["semantics"]["measures"]
+        assert {m["name"]: m["agg"] for m in measures} == {"aov": "avg"}
+        assert not any("average" in u for u in report.unsupported)
+
+    def test_export_and_import_tables_are_inverses(self):
+        from fluid_build.cli.import_workflow.dbt import METRICFLOW_TO_AGG
+        from fluid_build.engines.dbt.semantic_models import AGG_TO_METRICFLOW
+
+        for fluid_agg, mf_agg in AGG_TO_METRICFLOW.items():
+            assert METRICFLOW_TO_AGG[mf_agg] == fluid_agg
+
+    def test_sum_boolean_has_no_fluid_equivalent_and_is_reported(self, tmp_path: Path):
+        path = _manifest_with_measures(
+            tmp_path, [{"name": "is_paid", "agg": "sum_boolean", "expr": "paid"}]
+        )
+        contract, report = DbtManifestImporter().import_to_contract(str(path))
+        assert "measures" not in (_expose(contract, "orders")["semantics"])
+        assert any("sum_boolean" in u for u in report.unsupported)
+
+
+class TestPercentileRoundTrip:
+    def test_non_default_percentile_measure_is_dropped_not_redefaulted(self, tmp_path: Path):
+        path = _manifest_with_measures(
+            tmp_path,
+            [
+                {"name": "revenue", "agg": "sum", "expr": "order_total"},
+                {
+                    "name": "p90_order_value",
+                    "agg": "percentile",
+                    "expr": "order_total",
+                    "agg_params": {"percentile": 0.9},
+                },
+            ],
+        )
+        contract, report = DbtManifestImporter().import_to_contract(str(path))
+        names = {m["name"] for m in _expose(contract, "orders")["semantics"]["measures"]}
+        assert names == {"revenue"}
+        note = next(u for u in report.unsupported if "p90_order_value" in u)
+        assert "dropped rather than re-defaulted" in note
+        assert "0.5" in note
+
+    def test_default_percentile_measure_survives_losslessly(self, tmp_path: Path):
+        """percentile == the importer's own default → dropping the params
+        changes nothing, so the measure is kept."""
+        path = _manifest_with_measures(
+            tmp_path,
+            [
+                {
+                    "name": "median_order_value",
+                    "agg": "percentile",
+                    "expr": "order_total",
+                    "agg_params": {"percentile": 0.5},
+                }
+            ],
+        )
+        contract, _ = DbtManifestImporter().import_to_contract(str(path))
+        measures = _expose(contract, "orders")["semantics"]["measures"]
+        assert [m["name"] for m in measures] == ["median_order_value"]
+        assert "aggParams" not in measures[0]
+
+    def test_discrete_percentile_is_dropped(self, tmp_path: Path):
+        path = _manifest_with_measures(
+            tmp_path,
+            [
+                {
+                    "name": "median_discrete",
+                    "agg": "percentile",
+                    "expr": "order_total",
+                    "agg_params": {"percentile": 0.5, "use_discrete_percentile": True},
+                }
+            ],
+        )
+        contract, _ = DbtManifestImporter().import_to_contract(str(path))
+        assert "measures" not in _expose(contract, "orders")["semantics"]

@@ -314,7 +314,28 @@ def _resolve_agg_time_dimension(
 # Measures
 # ---------------------------------------------------------------------------
 
-_VALID_AGGS = {"sum", "avg", "count", "count_distinct", "min", "max", "median", "percentile"}
+# FLUID ``measures[].agg`` (the 0.7.x schema enum) → the MetricFlow
+# ``AggregationType`` spelling dbt parses. Every token but ``avg`` is shared;
+# dbt's enum is
+# ['sum','min','max','count_distinct','sum_boolean','average','percentile',
+#  'median','count'] and has no ``avg``, so passing the FLUID token straight
+# through made ``dbt parse`` abort on the generated project with
+# "ValueError: Invalid enum value: `avg` in enum AggregationType" — i.e. any
+# contract using a first-class FLUID agg produced an unparseable dbt project.
+# The inverse map lives in ``cli/import_workflow/dbt.py`` so the round trip
+# closes in both directions.
+AGG_TO_METRICFLOW: Dict[str, str] = {
+    "sum": "sum",
+    "avg": "average",
+    "count": "count",
+    "count_distinct": "count_distinct",
+    "min": "min",
+    "max": "max",
+    "median": "median",
+    "percentile": "percentile",
+}
+
+_VALID_AGGS = frozenset(AGG_TO_METRICFLOW)
 
 # Default when a percentile measure carries no ``aggParams.percentile``.
 # MUST stay equal to ``output_ports/mcp/query_compiler.DEFAULT_PERCENTILE``
@@ -388,7 +409,7 @@ def _build_measures(
                 raw.get("agg"),
             )
             continue
-        measure: Dict[str, Any] = {"name": name, "agg": agg}
+        measure: Dict[str, Any] = {"name": name, "agg": AGG_TO_METRICFLOW[agg]}
         if raw.get("description"):
             measure["description"] = str(raw["description"])
         if raw.get("expr"):
