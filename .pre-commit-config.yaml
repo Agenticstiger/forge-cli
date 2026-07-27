@@ -19,6 +19,21 @@ repos:
       - id: ruff
         args: ['--fix']
 
+  # Refuses a commit that carries a value from the committer's own
+  # environment — the class detect-secrets structurally cannot see, because
+  # an account locator and a username are low-entropy and key-prefix-free.
+  # Deliberately NOT ``--all-files``: see the module docstring: this repo's
+  # own comments cite the demo database names a lab .env also carries, so a
+  # whole-repo run flags pre-existing prose. Staged files only.
+  - repo: local
+    hooks:
+      - id: no-live-env-values
+        name: no live environment values in the diff
+        entry: python scripts/check_no_live_env_values.py
+        language: system
+        # Any text file can carry a pasted identifier, not just Python.
+        types: [text]
+
   # Architecture / import-cycle linter — runs the contracts declared
   # under ``[tool.importlinter]`` in pyproject.toml. ``language: system``
   # ensures the tool sees the in-venv install of fluid_build (lint-imports

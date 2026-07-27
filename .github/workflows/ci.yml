@@ -35,6 +35,25 @@ jobs:
             --line-length 100
       - name: Black check
         run: black --check fluid_build/ tests/
+      # detect-secrets was configured in .pre-commit-config.yaml but NOTHING
+      # ran pre-commit in CI, so the gate only fired for contributors who had
+      # installed the hooks locally. Any commit pushed without them — an agent
+      # committing in a fresh worktree, a web edit, a rebase on a new machine —
+      # bypassed it silently.
+      #
+      # Scoped to the files this PR TOUCHES, deliberately. `.secrets.baseline`
+      # predates a fair amount of the tree, so a whole-repo run fails on
+      # pre-existing lines (scanner-config regexes, a CHANGELOG example URL)
+      # and would block every PR regardless of its content — a gate that
+      # blocks everything gets deleted, not fixed. Catching what a change
+      # ADDS is the job; auditing history is a separate, deliberate exercise.
+      - name: Secret scan (detect-secrets on changed files)
+        run: |
+          pip install "detect-secrets==1.5.0"
+          CHANGED=$(git diff --name-only --diff-filter=d origin/${{ github.base_ref || 'main' }}...HEAD)
+          if [ -z "$CHANGED" ]; then echo "no changed files"; exit 0; fi
+          echo "$CHANGED"
+          detect-secrets-hook --baseline .secrets.baseline $CHANGED
 
   # ── import-linter — architecture / cycle gate ───────────────────────
   # Runs the declarative contracts under ``[tool.importlinter]`` in
