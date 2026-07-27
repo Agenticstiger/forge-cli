@@ -241,8 +241,15 @@ def test_distribution_is_none_when_unattributable():
 
 
 def test_detailed_plugins_flags_a_requires_cli_mismatch(monkeypatch):
+    # The satisfiable floor is derived from the RUNNING version, not hardcoded.
+    # `_CLI_VERSION` comes from setuptools-scm, and CI checks out without tags
+    # (actions/checkout defaults to a shallow fetch), so the version there is far
+    # below any literal floor this test could pick — a hardcoded ">=0.1.0" passes
+    # locally and fails every CI leg.
+    from fluid_build.providers import _CLI_VERSION
+
     bad = _LoadableEP("toonew", lambda: _meta_class(version="9.9.9", requires_cli=">=99.0.0"))
-    ok = _LoadableEP("fine", lambda: _meta_class(version="1.0.0", requires_cli=">=0.1.0"))
+    ok = _LoadableEP("fine", lambda: _meta_class(version="1.0.0", requires_cli=f">={_CLI_VERSION}"))
     silent = _LoadableEP("quiet", lambda: _meta_class(version="1.0.0"))
     monkeypatch.setattr(PM, "_entry_points", lambda group: [bad, ok, silent])
     monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)

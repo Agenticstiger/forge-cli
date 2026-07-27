@@ -521,6 +521,13 @@ class TestDoctorSnowflakeRow:
         assert row["status"].startswith("\u26a0")
 
     def test_missing_credentials_are_named(self, monkeypatch):
+        # The credential branch is only REACHABLE when the connector is
+        # installed — otherwise _check_snowflake_readiness short-circuits to
+        # "connector not installed" and never inspects settings. CI's matrix
+        # legs install .[dev,local], without the snowflake extra. The
+        # short-circuit itself is covered by
+        # test_missing_connector_is_reported_and_non_fatal, which needs no extra.
+        pytest.importorskip("snowflake.connector")
         from fluid_build.cli import doctor as doctor_mod
         from fluid_build.providers.snowflake.util import config as sf_config
 
@@ -532,6 +539,8 @@ class TestDoctorSnowflakeRow:
         assert "SNOWFLAKE_ACCOUNT" in row["details"]
 
     def test_configured_account_reports_available(self, monkeypatch):
+        # Same reachability constraint as test_missing_credentials_are_named.
+        pytest.importorskip("snowflake.connector")
         from fluid_build.cli import doctor as doctor_mod
         from fluid_build.providers.snowflake.util import config as sf_config
 
