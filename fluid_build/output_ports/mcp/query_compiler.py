@@ -107,6 +107,159 @@ class RowFilterIdentityMissing(RuntimeError):
 
 _CALLER_PLACEHOLDER = re.compile(r"\$\{caller\.([A-Za-z_][A-Za-z0-9_]*)\}")
 
+_RESTRICTED_NAME_CACHE: Dict[str, "re.Pattern[str]"] = {}
+
+
+def _restricted_name_pattern(name: str) -> "re.Pattern[str]":
+    """Compile (and cache) a case-insensitive word-boundary regex for
+    a restricted column name.
+
+    Used by :func:`compile_semantic_query` and
+    :func:`compile_free_form_sql` to scan a SQL fragment for any
+    reference to a column whose contract policy forbids exposure.
+    Matches identifier occurrences only — string literals are stripped
+    before this regex runs.
+    """
+    cached = _RESTRICTED_NAME_CACHE.get(name)
+    if cached is not None:
+        return cached
+    pattern = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+    _RESTRICTED_NAME_CACHE[name] = pattern
+    return pattern
+
+
+# String literals stripped before scanning for restricted column
+# references. ``'…'`` (single-quoted) and ``"…"`` (double-quoted)
+# both removed; embedded escaped quotes are tolerated. Comments are
+# already blocked by ``_sql_safety``'s ``--`` / ``/*`` / ``*/``
+# rejection.
+_STRING_LITERAL_RE = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"")
+
+
+def _strip_string_literals(sql: str) -> str:
+    """Replace every quoted string literal in ``sql`` with a single
+    space so subsequent identifier scans don't false-positive on
+    quoted occurrences of restricted column names (e.g. ``WHERE name
+    = 'email'``)."""
+    return _STRING_LITERAL_RE.sub(" ", sql)
+
+
+def _clean_column_names(columns: Optional[Iterable[str]]) -> Tuple[str, ...]:
+    """Normalise a caller-supplied column-name iterable to a tuple of
+    non-empty strings (drivers hand us ``set`` objects that may contain
+    junk from a malformed contract)."""
+    return tuple(c for c in (columns or ()) if isinstance(c, str) and c)
+
+
+def _first_referenced_column(expression: str, columns: Iterable[str]) -> Optional[str]:
+    """Return the first name in ``columns`` that ``expression``
+    references as an identifier, or ``None``.
+
+    String literals are stripped first so ``WHERE label = 'email'``
+    doesn't false-positive when ``email`` is one of ``columns``. This
+    is the same identifier scan :func:`compile_free_form_sql` runs
+    over a caller-supplied statement — hoisted here so the semantic
+    ``query`` path enforces the identical rule against contract-declared
+    measure / dimension / filter expressions.
+    """
+    scanned = _strip_string_literals(expression)
+    for column in columns:
+        if _restricted_name_pattern(column).search(scanned):
+            return column
+    return None
+
+
+def _reject_restricted_reference(
+    expression: str, restricted_columns: Iterable[str], *, subject: str
+) -> None:
+    """Raise when ``expression`` references a denied column.
+
+    ``subject`` names the contract element that carried the expression
+    (``"Measure 'avg_balance'"``, ``"Dimension 'seg_alias'"``, …) so the
+    agent can self-correct. Both the subject and the column name are
+    contract-declared and already visible through ``describe``, so the
+    message leaks nothing the caller couldn't enumerate — which is why
+    it is a :class:`QueryValidationError` (surfaced verbatim) rather
+    than a sanitised engine error.
+    """
+    hit = _first_referenced_column(expression, restricted_columns)
+    if hit is None:
+        return
+    raise QueryValidationError(
+        f"{subject} references column {hit!r} which is restricted by "
+        f"expose.policy.authz.columnRestrictions / "
+        f"expose.policy.privacy.masking. The governed query path enforces "
+        f"the same column-level deny rules as the sample / query_sql tools — "
+        f"naming a measure, dimension or filter differently from its column "
+        f"does not bypass them."
+    )
+
+
+def _resolve_measure_alias(
+    *,
+    metric: Optional[str],
+    measure_name: str,
+    taken: Mapping[str, str],
+) -> str:
+    """Pick the projection alias for the aggregate column.
+
+    Preference order — ``metric`` name (so two metrics over one measure
+    are distinguishable), then the ``measure`` name (the pre-0.13.1
+    behaviour), then a hard error.
+
+    ``taken`` maps an already-projected dimension alias (case-folded, the
+    way an engine folds an unquoted identifier) to its SQL expression.
+    A projection alias MUST be unique: the drivers key each row with
+    ``dict(zip(columns, values))``, so two columns sharing a name collapse
+    into one dict entry and silently discard a value, and the compiler's
+    ``ORDER BY <alias>`` becomes an ambiguous reference the engine
+    rejects outright.
+
+    Prior art — every mainstream semantic layer treats metric / measure /
+    dimension names as ONE namespace and rejects the collision at model
+    build time: dbt MetricFlow registers all of them in a single global
+    namespace, and Cube requires ``name`` to be "unique among all
+    dimensions, measures, and segments" in a cube
+    (https://cube.dev/docs/dimensions/). Snowflake Semantic Views tolerate
+    the duplicate but then emit two identically-named output columns and
+    document the remedy as renaming them through a table alias
+    (https://docs.snowflake.com/en/user-guide/views-semantic/querying).
+    We can't retroactively make the collision a query-time error — a
+    contract whose metric happens to share a dimension's name answered
+    correctly before the metric-name aliasing landed — so we apply
+    Snowflake's remedy automatically (deterministic rename) and surface
+    the modelling problem as a ``fluid validate`` warning instead.
+    """
+    preferred = metric if metric is not None else measure_name
+    if preferred.casefold() not in taken:
+        return preferred
+    if metric is not None and measure_name.casefold() not in taken:
+        # Collision with a requested dimension: fall back to the measure
+        # name, which is what this projection was called before metric
+        # aliasing existed. The response's ``columns`` still describes the
+        # result honestly, so the caller can always tell what it got.
+        return measure_name
+    raise QueryValidationError(
+        f"Projection alias {preferred!r} collides with dimension "
+        f"{taken[preferred.casefold()]!r} already in this SELECT, and no "
+        f"distinct fallback name is available"
+        + (f" (measure {measure_name!r} collides too)" if metric is not None else "")
+        + ". Metric, measure and dimension names share one namespace on the "
+        "governed query path — rename one of them, or drop the colliding "
+        "dimension from this request."
+    )
+
+
+# Aggregations whose result is an actual member value of the input
+# column rather than a summary statistic derived from many rows.
+# A ``MIN``/``MAX``/``MEDIAN``/``PERCENTILE`` over a PII column hands
+# the caller a real cell value, so those projections are redacted the
+# same way a raw dimension projection is. ``count`` / ``count_distinct``
+# / ``sum`` / ``avg`` stay visible — the ``_compute_pii_columns``
+# contract explicitly keeps aggregate analysis over a PII column (e.g.
+# ``COUNT(DISTINCT customer_email)``) legitimate.
+_VALUE_REVEALING_AGGS = frozenset({"min", "max", "median", "percentile"})
+
 # Matches a single ``:p_<index>`` named placeholder, capturing the index.
 # Word-boundary anchored so ``:p_1`` never matches inside ``:p_10`` — the
 # substring-collision bug a per-index ``str.replace`` loop has at ≥11 params.
@@ -236,6 +389,32 @@ class CompiledQuery:
 
     columns: List[str] = field(default_factory=list)
     """Column names in the SELECT projection (validated identifiers)."""
+
+    row_cap: Optional[int] = None
+    """The ``LIMIT`` the rendered statement carries, when that LIMIT can
+    actually clip the result set.
+
+    ``None`` means "this statement cannot be truncated" — an ungrouped
+    aggregate returns exactly one row no matter what the LIMIT says, so
+    reporting it as truncated would be its own lie. The driver uses this
+    to set :attr:`...drivers.base.QueryResult.truncated` honestly; before
+    it existed the wire response hardcoded ``truncated: false`` for every
+    ``query``, so a ``revenue by day`` call clipped from 2,405 groups to
+    50 was labelled a complete answer.
+    """
+
+    redacted_columns: Tuple[str, ...] = ()
+    """Projection aliases whose VALUES must be replaced with
+    :attr:`...drivers.base.EngineDriver.PII_TOKEN` before the rows leave
+    the gateway.
+
+    Redaction has to be keyed off the underlying column EXPRESSION, not
+    the output alias: a dimension declared as ``{name: seg_alias, expr:
+    MARKET_SEGMENT}`` projects PII under a name the driver's
+    name-matching redaction step never recognises. The compiler is the
+    only layer that knows the alias→expression mapping, so it resolves
+    the alias set here and the driver applies it.
+    """
 
     def render_sql_for_dialect(self, dialect: str) -> str:
         """Re-render the SQL with the given dialect's placeholder
@@ -575,9 +754,19 @@ def _resolve_percentile_params(measure_name: str, measure: Mapping[str, Any]) ->
 
 
 def _render_measure_expression(
-    measure_name: str, measure: Mapping[str, Any], *, dialect: Optional[str] = None
+    measure_name: str,
+    measure: Mapping[str, Any],
+    *,
+    dialect: Optional[str] = None,
+    alias: Optional[str] = None,
 ) -> str:
-    """Render a measure into ``AGG(expr) AS measure_name``.
+    """Render a measure into ``AGG(expr) AS <alias>``.
+
+    ``alias`` defaults to the measure name but the caller passes the
+    METRIC name when the request named a metric, so two metrics over one
+    measure (``total_revenue`` and ``completed_revenue``, both over
+    ``revenue``) come back as distinguishable, self-describing columns
+    instead of two identical ``revenue`` columns.
 
     The measure's ``expr`` is allowlist-validated. The
     ``count_distinct`` aggregation is rendered as ``COUNT(DISTINCT
@@ -602,8 +791,9 @@ def _render_measure_expression(
         raise QueryValidationError(f"Measure {measure_name!r} has non-string expr")
     validate_sql_expression_allowlist(expr_raw)
     sql_func = _AGG_FUNCTIONS[agg_raw]
+    projection_alias = validate_ident(alias or measure_name)
     if agg_raw == "count_distinct":
-        return f"COUNT(DISTINCT {expr_raw}) AS {validate_ident(measure_name)}"
+        return f"COUNT(DISTINCT {expr_raw}) AS {projection_alias}"
     if agg_raw == "percentile":
         if dialect in ("bigquery", "athena"):
             raise QueryValidationError(
@@ -614,11 +804,8 @@ def _render_measure_expression(
             )
         percentile, use_discrete = _resolve_percentile_params(measure_name, measure)
         fn = "PERCENTILE_DISC" if use_discrete else "PERCENTILE_CONT"
-        return (
-            f"{fn}({percentile:g}) WITHIN GROUP (ORDER BY {expr_raw}) "
-            f"AS {validate_ident(measure_name)}"
-        )
-    return f"{sql_func}({expr_raw}) AS {validate_ident(measure_name)}"
+        return f"{fn}({percentile:g}) WITHIN GROUP (ORDER BY {expr_raw}) " f"AS {projection_alias}"
+    return f"{sql_func}({expr_raw}) AS {projection_alias}"
 
 
 def compile_semantic_query(
@@ -632,6 +819,8 @@ def compile_semantic_query(
     caller_attributes: Optional[Mapping[str, Any]] = None,
     table_reference: str,
     dialect: Optional[str] = None,
+    restricted_columns: Iterable[str] = (),
+    redacted_columns: Iterable[str] = (),
 ) -> CompiledQuery:
     """Compile one ``query`` payload into a :class:`CompiledQuery`.
 
@@ -645,6 +834,15 @@ def compile_semantic_query(
     dimension names that must already exist in ``expose.semantics.dimensions``
     or ``expose.contract.schema``. Unknown keys are rejected.
 
+    The aggregate column is aliased to the METRIC name when the request
+    named a metric (so ``total_revenue`` and ``completed_revenue`` — two
+    metrics over the one ``revenue`` measure — are distinguishable in the
+    result), and to the MEASURE name when the request named a measure
+    directly. Every projection alias in the returned
+    :attr:`CompiledQuery.columns` is unique after case folding; see
+    :func:`_resolve_measure_alias` for how a metric name that collides
+    with a requested dimension is resolved.
+
     ``limit`` is treated as a literal integer, validated to be in
     ``[1, 1_000_000]``. We deliberately don't accept ``None`` for
     "no limit" — every consumer-side query gets a hard cap so a curious
@@ -655,12 +853,38 @@ def compile_semantic_query(
     ``policy.rowFilters[]`` column (backticks on BigQuery, ANSI
     double-quotes elsewhere — see :func:`compile_row_filter_clauses`).
     ``None`` keeps the ANSI form.
+
+    ``restricted_columns`` are the columns denied by
+    ``expose.policy.authz.columnRestrictions`` /
+    ``expose.policy.privacy.masking``. ANY reference to one — from a
+    measure's ``expr``, a dimension's ``expr``, a metric's ``filter``, or
+    a caller filter key — is rejected. Dropping them from the projection
+    (what the driver's ``project()`` does) is NOT enough on this path:
+    the projection is ALIASED, so a measure ``{name: avg_balance, agg:
+    avg, expr: ACCOUNT_BALANCE}`` used to sail past the name-matching
+    drop and hand a denied column's statistics to the agent, and an
+    equality filter on a denied column was a working inference oracle
+    over its values. This is the same rule
+    :func:`compile_free_form_sql` has always enforced on ``query_sql``.
+
+    ``redacted_columns`` are the PII / PHI columns from
+    ``expose.contract.schema[].sensitivity``. Those are NOT rejected —
+    the contract deliberately keeps a PII column visible-but-redacted so
+    an agent can aggregate over it — but every projection alias whose
+    EXPRESSION reads one is returned in
+    :attr:`CompiledQuery.redacted_columns` so the driver redacts by
+    expression rather than by output name. Without that, a dimension
+    ``{name: seg_alias, expr: MARKET_SEGMENT}`` returned raw PII while
+    the identically-sourced ``{name: market_segment}`` was redacted.
     """
     if (metric is None) == (measure is None):
         raise QueryValidationError("Exactly one of 'metric' or 'measure' must be provided")
     if not isinstance(table_reference, str) or not table_reference.strip():
         raise QueryValidationError("table_reference must be a non-empty string")
     validate_sql_expression_allowlist(table_reference)
+
+    restricted = _clean_column_names(restricted_columns)
+    redacted = _clean_column_names(redacted_columns)
 
     index = _index_expose(expose)
     metric_filter: Optional[str] = None
@@ -681,20 +905,72 @@ def compile_semantic_query(
         validate_ident(metric)
         measure_name, measure_definition, metric_filter = _resolve_metric(metric, index)
 
+    measure_expr = measure_definition.get("expr") or measure_name
+    if isinstance(measure_expr, str):
+        _reject_restricted_reference(measure_expr, restricted, subject=f"Measure {measure_name!r}")
+    if metric_filter is not None:
+        _reject_restricted_reference(metric_filter, restricted, subject=f"Metric {metric!r} filter")
+
     select_parts: List[str] = []
     group_columns: List[str] = []
     projection_aliases: List[str] = []
+    redacted_aliases: List[str] = []
+    # Case-folded dimension alias → its SQL expression. Engines fold an
+    # unquoted identifier, so ``Status`` and ``status`` are ONE output
+    # column name as far as the row dicts and the ORDER BY are concerned.
+    dimension_aliases: Dict[str, str] = {}
     for dimension_name in dimensions or []:
         if not isinstance(dimension_name, str):
             raise QueryValidationError("Dimension names must be strings")
         alias, expr = _resolve_dimension(dimension_name, index, dialect=dialect)
+        _reject_restricted_reference(expr, restricted, subject=f"Dimension {dimension_name!r}")
+        already = dimension_aliases.get(alias.casefold())
+        if already is not None:
+            if already == expr:
+                # The same dimension asked for twice — idempotent, so drop
+                # the repeat rather than emit a duplicate output column.
+                # (Projecting it twice used to collapse in the driver's
+                # ``dict(zip(columns, values))`` anyway.)
+                continue
+            raise QueryValidationError(
+                f"Dimension {dimension_name!r} projects the same output column "
+                f"name as an earlier dimension in this request but a different "
+                f"expression ({expr!r} vs {already!r}); one of the two values "
+                f"would be silently dropped from every row. Rename one of the "
+                f"dimensions in expose.semantics.dimensions."
+            )
+        dimension_aliases[alias.casefold()] = expr
         select_parts.append(f"{expr} AS {alias}")
         group_columns.append(expr)
         projection_aliases.append(alias)
+        # A dimension projects raw column values, so a PII source column
+        # must be redacted under WHATEVER alias it is projected as.
+        if _first_referenced_column(expr, redacted) is not None:
+            redacted_aliases.append(alias)
 
-    measure_sql = _render_measure_expression(measure_name, measure_definition, dialect=dialect)
+    # The projection is aliased to the METRIC name when the caller asked
+    # for a metric, so ``total_revenue`` and ``completed_revenue`` — two
+    # metrics over the one ``revenue`` measure — no longer come back as
+    # two indistinguishable ``revenue`` columns. When that name is already
+    # taken by a dimension in this same SELECT it falls back to the
+    # measure name; see :func:`_resolve_measure_alias`.
+    measure_alias = _resolve_measure_alias(
+        metric=metric, measure_name=measure_name, taken=dimension_aliases
+    )
+
+    measure_sql = _render_measure_expression(
+        measure_name, measure_definition, dialect=dialect, alias=measure_alias
+    )
     select_parts.append(measure_sql)
-    projection_aliases.append(measure_name)
+    projection_aliases.append(measure_alias)
+    # MIN / MAX / MEDIAN / PERCENTILE return an actual cell value, so an
+    # otherwise-legitimate aggregate over a PII column still leaks one.
+    if (
+        isinstance(measure_expr, str)
+        and str(measure_definition.get("agg") or "").lower() in _VALUE_REVEALING_AGGS
+        and _first_referenced_column(measure_expr, redacted) is not None
+    ):
+        redacted_aliases.append(measure_alias)
 
     where_clauses: List[str] = []
     params: List[Any] = []
@@ -728,6 +1004,13 @@ def compile_semantic_query(
             _, dimension_expr = _resolve_dimension(filter_key, index, dialect=dialect)
         else:
             dimension_expr = validate_ident(filter_key)
+        # An equality filter on a denied column is a working inference
+        # oracle even though the column never appears in the projection:
+        # ``filters: {ACCOUNT_BALANCE: 9999.99}`` returns the revenue of
+        # exactly the rows carrying that balance. Reject the reference.
+        _reject_restricted_reference(
+            dimension_expr, restricted, subject=f"Filter key {filter_key!r}"
+        )
         placeholder_index = len(params)
         where_clauses.append(f"{dimension_expr} = :p_{placeholder_index}")
         params.append(filter_value)
@@ -755,6 +1038,18 @@ def compile_semantic_query(
         sql_lines.append("WHERE " + " AND ".join(where_clauses))
     if group_columns:
         sql_lines.append("GROUP BY " + ", ".join(group_columns))
+        # A grouped result gets a deterministic "top N by the measure"
+        # order. Without it the LIMIT clipped an ARBITRARY slice of the
+        # groups — "revenue by day" returned 50 of 2,405 days in whatever
+        # order the engine happened to produce, and two identical calls
+        # could disagree. Ordering by the measure descending and then by
+        # each grouping key gives a total order (the group keys are
+        # unique per row of a GROUP BY result), so the answer is both
+        # reproducible and the slice an analyst actually wants.
+        order_terms = [f"{measure_alias} DESC"] + [
+            f"{alias} ASC" for alias in projection_aliases[:-1]
+        ]
+        sql_lines.append("ORDER BY " + ", ".join(order_terms))
     sql_lines.append(f"LIMIT {limit}")
     sql = "\n".join(sql_lines)
 
@@ -765,7 +1060,16 @@ def compile_semantic_query(
     # statement (it blocks the SELECT keyword by design), so we run
     # a narrower statement-level check instead.
     _validate_rendered_statement(sql)
-    return CompiledQuery(sql=sql, params=params, columns=projection_aliases)
+    return CompiledQuery(
+        sql=sql,
+        params=params,
+        columns=projection_aliases,
+        # Only a GROUPED result can be clipped by the LIMIT; an ungrouped
+        # aggregate is exactly one row whatever the cap says, so reporting
+        # it as truncatable would be a different lie.
+        row_cap=limit if group_columns else None,
+        redacted_columns=tuple(redacted_aliases),
+    )
 
 
 def _validate_rendered_statement(sql: str) -> None:
@@ -787,48 +1091,12 @@ def _validate_rendered_statement(sql: str) -> None:
         raise ValueError(f"Rendered statement contains forbidden marker: {sql!r}")
 
 
-_RESTRICTED_NAME_CACHE: Dict[str, "re.Pattern[str]"] = {}
-
-
-def _restricted_name_pattern(name: str) -> "re.Pattern[str]":
-    """Compile (and cache) a case-insensitive word-boundary regex for
-    a restricted column name.
-
-    Used by :func:`compile_free_form_sql` to scan the body of a
-    free-form SQL statement for any reference to a column whose
-    contract policy forbids exposure. Matches identifier occurrences
-    only — string literals are stripped before this regex runs.
-    """
-    cached = _RESTRICTED_NAME_CACHE.get(name)
-    if cached is not None:
-        return cached
-    pattern = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
-    _RESTRICTED_NAME_CACHE[name] = pattern
-    return pattern
-
-
-# String literals stripped before scanning for restricted column
-# references. ``'…'`` (single-quoted) and ``"…"`` (double-quoted)
-# both removed; embedded escaped quotes are tolerated. Comments are
-# already blocked by ``_sql_safety``'s ``--`` / ``/*`` / ``*/``
-# rejection.
-_STRING_LITERAL_RE = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"")
-
-
-def _strip_string_literals(sql: str) -> str:
-    """Replace every quoted string literal in ``sql`` with a single
-    space so subsequent identifier scans don't false-positive on
-    quoted occurrences of restricted column names (e.g. ``WHERE name
-    = 'email'``)."""
-    return _STRING_LITERAL_RE.sub(" ", sql)
-
-
 # A caller statement that already ends in ``LIMIT <n>`` (case-insensitive,
 # trailing whitespace tolerated). Used so the server-side ``LIMIT`` is not
 # appended a second time — two trailing LIMITs is a syntax error on most
 # engines. Only a bare integer literal counts as "already limited"; a
 # ``LIMIT`` with an expression / placeholder is left for the caller to own.
-_TRAILING_LIMIT_RE = re.compile(r"(?is)\blimit\s+\d+\s*$")
+_TRAILING_LIMIT_RE = re.compile(r"(?is)\blimit\s+(\d+)\s*$")
 
 
 def compile_free_form_sql(
@@ -949,8 +1217,14 @@ def compile_free_form_sql(
     # No row filters: append the server-side cap, but only when the caller
     # didn't already supply a trailing ``LIMIT <n>`` (a second one is a syntax
     # error on most engines).
-    if _TRAILING_LIMIT_RE.search(candidate):
+    trailing = _TRAILING_LIMIT_RE.search(candidate)
+    if trailing is not None:
         final_sql = candidate
+        row_cap = int(trailing.group(1))
     else:
         final_sql = f"{candidate}\nLIMIT {limit}"
-    return CompiledQuery(sql=final_sql, params=[], columns=[])
+        row_cap = limit
+    # ``row_cap`` lets the driver report ``truncated`` honestly on the
+    # free-form path too: an arbitrary caller SELECT that comes back
+    # holding exactly ``row_cap`` rows has almost certainly been clipped.
+    return CompiledQuery(sql=final_sql, params=[], columns=[], row_cap=row_cap)

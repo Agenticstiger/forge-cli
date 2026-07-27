@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from ._common import iter_exposes
+
 logger = logging.getLogger(__name__)
 
 
@@ -209,7 +211,7 @@ class SchemaBasedPolicyEngine:
         """Enforce field-level sensitivity and privacy policies"""
         logger.debug("Enforcing sensitivity policies")
 
-        for expose in self.contract.get("exposes", []):
+        for expose in iter_exposes(self.contract):
             expose_id = expose.get("exposeId")
             schema = expose.get("contract", {}).get("schema", [])
 
@@ -288,7 +290,7 @@ class SchemaBasedPolicyEngine:
         """Enforce authorization and access control policies"""
         logger.debug("Enforcing access control policies")
 
-        for expose in self.contract.get("exposes", []):
+        for expose in iter_exposes(self.contract):
             expose_id = expose.get("exposeId")
             policy = expose.get("policy", {})
             authz = policy.get("authz", {})
@@ -375,7 +377,7 @@ class SchemaBasedPolicyEngine:
         """Enforce data quality rules and monitoring"""
         logger.debug("Enforcing data quality policies")
 
-        for expose in self.contract.get("exposes", []):
+        for expose in iter_exposes(self.contract):
             expose_id = expose.get("exposeId")
             dq = expose.get("contract", {}).get("dq", {})
             rules = dq.get("rules", [])
@@ -490,7 +492,7 @@ class SchemaBasedPolicyEngine:
                 )
 
         # Check 2: Retention policy for sensitive data
-        for expose in self.contract.get("exposes", []):
+        for expose in iter_exposes(self.contract):
             expose_id = expose.get("exposeId")
             schema = expose.get("contract", {}).get("schema", [])
 
@@ -571,7 +573,7 @@ class SchemaBasedPolicyEngine:
                 )
 
         # Check 3: Compatibility guarantees in contract
-        for expose in self.contract.get("exposes", []):
+        for expose in iter_exposes(self.contract):
             guarantees = expose.get("contract", {}).get("guarantees", {})
             if guarantees.get("compatibility"):
                 self._add_pass()

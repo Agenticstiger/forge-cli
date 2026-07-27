@@ -129,3 +129,86 @@ def test_dq_requires_an_expose() -> None:
         raise AssertionError("expected CLIError when no expose exists")
     except CLIError:
         pass
+
+
+# --------------------------------------------------------------------------
+# Write-back behaviour.
+#
+# ``run()`` used to redirect YAML input to a sibling ``.json``: the file the
+# user named was never touched, so the *next* invocation re-read the untouched
+# YAML and rebuilt the JSON from scratch — two ``product-add`` calls kept only
+# the second item. It also printed nothing at all (the only success signal was
+# an ``info()`` event, routed at DEBUG for the console handler).
+# --------------------------------------------------------------------------
+
+
+def _run_args(contract: str, what: str, **kw):
+    import logging
+
+    defaults = dict(contract=contract, what=what)
+    defaults.update(kw)
+    return product_add.run(_args(**defaults), logging.getLogger("test_product_add"))
+
+
+def test_yaml_input_is_written_back_in_place(tmp_path, capsys) -> None:
+    import yaml
+
+    path = tmp_path / "c.fluid.yaml"
+    path.write_text(_TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
+
+    assert _run_args(str(path), "source", id="up_a", location="exp_a") == 0
+
+    assert not (tmp_path / "c.fluid.json").exists(), "must not write an unannounced sibling file"
+    written = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert {"productId": "up_a", "exposeId": "exp_a"} in written["consumes"]
+    assert "up_a" in capsys.readouterr().out, "success must be visible on stdout"
+
+
+def test_sequential_calls_accumulate_on_yaml(tmp_path) -> None:
+    path = tmp_path / "c.fluid.yaml"
+    path.write_text(_TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
+
+    _run_args(str(path), "source", id="up_a", location="exp_a")
+    _run_args(str(path), "source", id="up_b", location="exp_b")
+
+    consumes = _parse_file(path)["consumes"]
+    pairs = {(c["productId"], c["exposeId"]) for c in consumes}
+    assert ("up_a", "exp_a") in pairs, "the first addition must survive the second call"
+    assert ("up_b", "exp_b") in pairs
+
+
+def test_json_input_still_round_trips_as_json(tmp_path) -> None:
+    import json
+
+    path = tmp_path / "c.fluid.json"
+    path.write_text(json.dumps(_base_contract()), encoding="utf-8")
+
+    _run_args(str(path), "source", id="up_a", location="exp_a")
+    _run_args(str(path), "source", id="up_b", location="exp_b")
+
+    consumes = json.loads(path.read_text(encoding="utf-8"))["consumes"]
+    pairs = {(c["productId"], c["exposeId"]) for c in consumes}
+    assert {("up_a", "exp_a"), ("up_b", "exp_b")} <= pairs
+
+
+def test_the_rewritten_yaml_still_validates(tmp_path) -> None:
+    path = tmp_path / "c.fluid.yaml"
+    path.write_text(_TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
+
+    _run_args(str(path), "exposure", id="orders_view", type="view")
+    _run_args(str(path), "dq", id="fresh", type="freshness", expose="orders_view")
+
+    assert _validate(_parse_file(path)).is_valid
+
+
+def test_comment_loss_is_announced_not_silent(tmp_path, capsys) -> None:
+    """PyYAML is not a round-trip loader — say so rather than dropping them."""
+    path = tmp_path / "c.fluid.yaml"
+    path.write_text(
+        "# owner: platform team\n" + _TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    _run_args(str(path), "source", id="up_a", location="exp_a")
+
+    out = capsys.readouterr().out
+    assert "comments" in out.lower()

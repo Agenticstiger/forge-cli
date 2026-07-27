@@ -27,7 +27,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fluid_build.cli.console import cprint, success
+from fluid_build.cli.console import cprint, cprint_json, success
 from fluid_build.cli.console import error as console_error
 
 try:
@@ -584,7 +584,7 @@ def output_json(result: PolicyEnforcementResult, output_file: Optional[str] = No
             f.write(json_str)
         success(f"Policy report saved to: {output_file}")
     else:
-        cprint(json_str)
+        cprint_json(json_str)
 
 
 def _estimate_passed_checks(result: PolicyEnforcementResult, category: PolicyCategory) -> int:

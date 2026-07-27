@@ -37,7 +37,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fluid_build.providers._sql_safety import quote_string_literal, validate_ident
+from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderMetadata
 
 from .util.logging import (
@@ -758,23 +758,23 @@ class LocalProvider(BaseProvider):
             # ``KEY:=value``. ``options`` is contract-supplied, so route each
             # key through ``validate_ident`` (allowlist ``^[A-Za-z_]\w*$``,
             # returns simple identifiers unchanged) to reject DDL smuggled via
-            # a key — the value already routes through ``quote_string_literal``.
+            # a key — the value already routes through ``quote_ansi_string_literal``.
             opt_sql = ", ".join(
                 f"{validate_ident(k)}:="
-                f"{json.dumps(v) if not isinstance(v, str) else quote_string_literal(v)}"
+                f"{json.dumps(v) if not isinstance(v, str) else quote_ansi_string_literal(v)}"
                 for k, v in opt.items()
             )
             con.execute(
-                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_csv_auto({quote_string_literal(str(path))}, {opt_sql});"
+                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_csv_auto({quote_ansi_string_literal(str(path))}, {opt_sql});"
             )
         elif fmt in {"parquet", "pq"} or path.suffix.lower() == ".parquet":
             con.execute(
-                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_parquet({quote_string_literal(str(path))});"
+                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_parquet({quote_ansi_string_literal(str(path))});"
             )
         else:
             # try csv auto as fallback
             con.execute(
-                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_csv_auto({quote_string_literal(str(path))});"
+                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_csv_auto({quote_ansi_string_literal(str(path))});"
             )
 
     # ------------------ COPY / materialize (helper) --------------------- #

@@ -379,7 +379,8 @@ class TestRunExposeFiltering:
         )
         with patch("fluid_build.cli.verify.load_contract_with_overlay", return_value=contract):
             result = run(args, logging.getLogger("test"))
-        # unsupported formats return error status, but run completes
+        # A format forge has no verifier for is SKIPPED, not an error — nothing
+        # failed, so the run completes green.
         assert result == 0
 
     def test_specific_expose_verified(self, tmp_path):
@@ -419,10 +420,17 @@ class TestRunExposeFiltering:
 
 class TestRunStrictAndOutput:
     def _simple_contract(self):
+        # ``bad_target_no_dots`` is not a parseable BigQuery target, so the
+        # verifier genuinely FAILS on it. (An ``unsupported_format`` would be
+        # skipped, not errored — see TestUnverifiableIsNotAFailure.)
         return {
             "id": "strict-test",
             "exposes": [
-                {"exposeId": "bad_expose", "format": "unsupported_format"},
+                {
+                    "exposeId": "bad_expose",
+                    "format": "bigquery_table",
+                    "properties": {"target": "bad_target_no_dots"},
+                },
             ],
         }
 
@@ -437,7 +445,13 @@ class TestRunStrictAndOutput:
             result = run(args, logging.getLogger("test"))
         assert result == 1
 
-    def test_non_strict_returns_0_despite_errors(self, tmp_path):
+    def test_an_error_fails_the_run_even_without_strict(self, tmp_path):
+        """An error is "we could not check", not "we checked and found drift".
+
+        This used to be gated on ``--strict`` — contradicting the comment at
+        the gate itself — so a run printing "Error: 1" exited 0 and CI keying
+        on the exit code treated an unreachable pool as a passing verification.
+        """
         contract_path = tmp_path / "c.yaml"
         contract_path.write_text("id: t\n")
         args = _make_args(contract=str(contract_path), strict=False)
@@ -446,7 +460,7 @@ class TestRunStrictAndOutput:
             return_value=self._simple_contract(),
         ):
             result = run(args, logging.getLogger("test"))
-        assert result == 0
+        assert result == 1
 
     def test_out_writes_json_report(self, tmp_path):
         contract_path = tmp_path / "c.yaml"
@@ -473,7 +487,9 @@ class TestRunStrictAndOutput:
             return_value=self._simple_contract(),
         ):
             result = run(args, logging.getLogger("test"))
-        assert result == 0
+        # The point of this test is "--show-diffs does not raise". The fixture
+        # contains a target that fails to verify, so 1 is the expected code.
+        assert result == 1
 
 
 # ---------------------------------------------------------------------------
@@ -697,7 +713,7 @@ class TestRunBigqueryTableFormat:
         contract = self._bq_expose_contract(target="bad_target_no_dots")
         with patch("fluid_build.cli.verify.load_contract_with_overlay", return_value=contract):
             result = run(args, logging.getLogger("test"))
-        assert result == 0  # errors but not strict
+        assert result == 1  # an unparseable target is a failed check, strict or not
 
     def test_bigquery_binding_format(self, tmp_path):
         """Expose using binding.format instead of top-level format."""
@@ -849,3 +865,53 @@ class TestRunBigqueryTableFormat:
             with patch("fluid_build.cli.verify.verify_bigquery_table", return_value=mock_result):
                 result = run(args, logging.getLogger("test"))
         assert result == 1  # strict + error → exit 1
+
+
+class TestUnverifiableIsNotAFailure:
+    """ "We did not check" and "the check failed" must not share an outcome.
+
+    Every non-verifiable expose used to land in ``error_count``. Once an error
+    became fatal, that would have failed `fluid verify` for a contract with a
+    binding format forge simply ships no verifier for (kafka_topic, api, …) —
+    a check that was never attempted. Those are reported as skipped instead.
+    """
+
+    def _contract(self, fmt):
+        return {"id": "skip-test", "exposes": [{"exposeId": "e1", "format": fmt}]}
+
+    def test_a_format_with_no_verifier_is_skipped_not_failed(self, tmp_path, capsys):
+        contract_path = tmp_path / "c.yaml"
+        contract_path.write_text("id: t\n")
+        args = _make_args(contract=str(contract_path))
+        with patch(
+            "fluid_build.cli.verify.load_contract_with_overlay",
+            return_value=self._contract("kafka_topic"),
+        ):
+            assert run(args, logging.getLogger("test")) == 0
+        captured = capsys.readouterr()
+        assert "Skipped" in captured.out
+        assert "Error: 0" in captured.err  # console_error writes to stderr
+
+    def test_skipped_is_still_reported_not_hidden(self, tmp_path):
+        contract_path = tmp_path / "c.yaml"
+        contract_path.write_text("id: t\n")
+        report = tmp_path / "r.json"
+        args = _make_args(contract=str(contract_path), out=str(report))
+        with patch(
+            "fluid_build.cli.verify.load_contract_with_overlay",
+            return_value=self._contract("kafka_topic"),
+        ):
+            run(args, logging.getLogger("test"))
+        summary = json.loads(report.read_text())["summary"]
+        assert summary["unsupported"] == 1
+        assert summary["error"] == 0
+
+    def test_strict_does_not_turn_a_skip_into_a_failure(self, tmp_path):
+        contract_path = tmp_path / "c.yaml"
+        contract_path.write_text("id: t\n")
+        args = _make_args(contract=str(contract_path), strict=True)
+        with patch(
+            "fluid_build.cli.verify.load_contract_with_overlay",
+            return_value=self._contract("kafka_topic"),
+        ):
+            assert run(args, logging.getLogger("test")) == 0

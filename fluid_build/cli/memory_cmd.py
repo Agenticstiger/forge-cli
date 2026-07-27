@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_json
 from fluid_build.cli.forge_copilot_memory import CopilotMemoryStore
 from fluid_build.cli.forge_copilot_personal_memory import load_personal_memory
 from fluid_build.cli.forge_team_memory import load_team_memory, scaffold_team_memory
@@ -143,7 +143,7 @@ def run(args, logger: logging.Logger) -> int:
         )
     if action == "search":
         results = store.search(args.ns, args.query, mode=args.mode, limit=10)
-        cprint(json.dumps([record.value for record in results], indent=2, default=str))
+        cprint_json(json.dumps([record.value for record in results], indent=2, default=str))
         return 0
     return 1
 
@@ -244,21 +244,21 @@ def _run_status(store) -> int:
         "root": str(root) if root is not None else None,
         "namespaces": counts,
     }
-    cprint(json.dumps(payload, indent=2, sort_keys=True))
+    cprint_json(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 
 
 def _run_show(scope: str, store: Any = None, *, limit: int = 20) -> int:
     if scope == "project":
         memory = CopilotMemoryStore(Path.cwd()).load()
-        cprint(json.dumps(memory.to_dict() if memory else {}, indent=2, default=str))
+        cprint_json(json.dumps(memory.to_dict() if memory else {}, indent=2, default=str))
         return 0
     if scope == "team":
         memory = load_team_memory(Path.cwd())
-        cprint(json.dumps(memory.to_prompt_payload() if memory else {}, indent=2, default=str))
+        cprint_json(json.dumps(memory.to_prompt_payload() if memory else {}, indent=2, default=str))
         return 0
     if scope == "personal":
-        cprint(json.dumps(load_personal_memory() or {}, indent=2, default=str))
+        cprint_json(json.dumps(load_personal_memory() or {}, indent=2, default=str))
         return 0
     # Namespace listings — episodic / semantic / history.
     # Each shows the record's metadata + a compact value preview so a
@@ -283,7 +283,7 @@ def _run_show(scope: str, store: Any = None, *, limit: int = 20) -> int:
         }
         for r in records
     ]
-    cprint(json.dumps(payload, indent=2, default=str))
+    cprint_json(json.dumps(payload, indent=2, default=str))
     return 0
 
 

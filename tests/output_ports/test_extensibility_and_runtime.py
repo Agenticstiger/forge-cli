@@ -271,6 +271,11 @@ async def test_rate_limit_denies_after_threshold_under_real_dispatch(
     policy = OutputPortPolicy.from_contract_and_flags(
         expose=expose,
         cli_allowed_models=("burst-driver",),
+        # The fixture CSV lives under tmp_path, not cwd. ``--readable-paths``
+        # is enforced by the driver now (build_driver forwards it), so the
+        # sandbox has to name the directory the data actually lives in — the
+        # same thing a real operator does.
+        readable_paths=(tmp_path.resolve(),),
     )
     server = OutputPortMcpServer(
         contract=contract,
@@ -315,6 +320,11 @@ async def test_backpressure_semaphore_serialises_concurrent_dispatch(
     policy = OutputPortPolicy.from_contract_and_flags(
         expose=expose,
         cli_allowed_models=("burst-driver",),
+        # The fixture CSV lives under tmp_path, not cwd. ``--readable-paths``
+        # is enforced by the driver now (build_driver forwards it), so the
+        # sandbox has to name the directory the data actually lives in — the
+        # same thing a real operator does.
+        readable_paths=(tmp_path.resolve(),),
     )
     server = OutputPortMcpServer(
         contract=contract,
@@ -442,6 +452,11 @@ async def test_http_sse_transport_serves_tools_and_enforces_policy(
     policy = OutputPortPolicy.from_contract_and_flags(
         expose=expose,
         cli_allowed_models=("http-test",),
+        # The fixture CSV lives under tmp_path, not cwd. ``--readable-paths``
+        # is enforced by the driver now (build_driver forwards it), so the
+        # sandbox has to name the directory the data actually lives in — the
+        # same thing a real operator does.
+        readable_paths=(tmp_path.resolve(),),
     )
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
     server.state.model_id = "http-test"
@@ -485,6 +500,11 @@ def test_http_sse_bearer_token_required_when_env_var_set(
     policy = OutputPortPolicy.from_contract_and_flags(
         expose=expose,
         cli_allowed_models=("http-auth-test",),
+        # The fixture CSV lives under tmp_path, not cwd. ``--readable-paths``
+        # is enforced by the driver now (build_driver forwards it), so the
+        # sandbox has to name the directory the data actually lives in — the
+        # same thing a real operator does.
+        readable_paths=(tmp_path.resolve(),),
     )
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
     port = _free_port()
@@ -565,7 +585,13 @@ async def test_query_validation_error_surfaces_message_to_caller(
     monkeypatch.setenv("HOME", str(tmp_path))
     contract, expose = _build_semantic_test_contract(tmp_path)
     policy = OutputPortPolicy.from_contract_and_flags(
-        expose=expose, cli_allowed_models=("test-agent",)
+        expose=expose,
+        cli_allowed_models=("test-agent",),
+        # The fixture CSV lives under tmp_path, not cwd. ``--readable-paths``
+        # is enforced by the driver now (build_driver forwards it), so the
+        # sandbox has to name the directory the data actually lives in — the
+        # same thing a real operator does.
+        readable_paths=(tmp_path.resolve(),),
     )
     server = OutputPortMcpServer(
         contract=contract, expose=expose, policy=policy, rate_limit_calls=0
@@ -598,7 +624,13 @@ async def test_engine_error_stays_sanitised_at_the_wire(
     monkeypatch.setenv("HOME", str(tmp_path))
     contract, expose = _build_semantic_test_contract(tmp_path)
     policy = OutputPortPolicy.from_contract_and_flags(
-        expose=expose, cli_allowed_models=("test-agent",)
+        expose=expose,
+        cli_allowed_models=("test-agent",),
+        # The fixture CSV lives under tmp_path, not cwd. ``--readable-paths``
+        # is enforced by the driver now (build_driver forwards it), so the
+        # sandbox has to name the directory the data actually lives in — the
+        # same thing a real operator does.
+        readable_paths=(tmp_path.resolve(),),
     )
     server = OutputPortMcpServer(
         contract=contract, expose=expose, policy=policy, rate_limit_calls=0

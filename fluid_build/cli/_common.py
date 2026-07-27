@@ -121,8 +121,61 @@ def resolve_env_templates_in_contract(contract: Any) -> Any:
     the contract's ``exposes[]`` data-plane directly, so env templates must
     be resolved before the contract reaches the emitter — otherwise a literal
     ``{{ env.SNOWFLAKE_DATABASE }}`` lands in the ``.tf.json``.
+
+    **Credential-shaped placeholders are NOT resolved.** A resolved contract
+    on this path is serialized into ``main.tf.json``, into the OpenTofu state
+    file, and (Snowflake) into the table ``COMMENT``, which every role with
+    schema access can read via ``SHOW TABLES`` / ``INFORMATION_SCHEMA`` /
+    Snowsight. So ``{{ env.MY_DB_PASSWORD }}`` written into a free-text field
+    used to publish that password verbatim to all three sinks. A placeholder
+    whose *name* looks like a credential is therefore left literal and a
+    warning is emitted once per variable — the same policy
+    ``_contract_loader.resolve_contract_env_templates`` already applies on the
+    publish path, kept symmetric here per the CLAUDE.md "extend both" rule.
+    Real credentials reach the provider through its own environment
+    variables, never through contract text.
     """
-    from fluid_build.providers.snowflake.util.config import resolve_env_templates
+    from fluid_build.observability.secret_redactor import is_sensitive_key_name
+    from fluid_build.providers.snowflake.util.config import ENV_TEMPLATE_RE, resolve_env_templates
+
+    log = logging.getLogger("fluid.cli")
+    seen_sensitive: set[str] = set()
+
+    def _resolve_string(text: str) -> str:
+        if "{{" not in text:
+            return text
+        sensitive = {
+            name.strip()
+            for name in ENV_TEMPLATE_RE.findall(text)
+            if is_sensitive_key_name(name.strip())
+        }
+        if not sensitive:
+            return resolve_env_templates(text)
+        for name in sorted(sensitive):
+            if name not in seen_sensitive:
+                seen_sensitive.add(name)
+                log.warning(
+                    "Refusing to resolve sensitive-looking env placeholder "
+                    "'{{ env.%s }}' in contract body; leaving it literal. The "
+                    "resolved contract is written to main.tf.json, to the "
+                    "OpenTofu state, and to the Snowflake table COMMENT — a "
+                    "credential must not ride along. If this value is not a "
+                    "secret, rename the variable outside the "
+                    "password/secret/token/key family.",
+                    name,
+                )
+
+        # Resolve the non-sensitive placeholders in the same string, leaving
+        # the sensitive ones literal, so a mixed string still works.
+        def _replace(match: "re.Match[str]") -> str:
+            name = match.group(1).strip()
+            if name in sensitive:
+                return match.group(0)
+            return resolve_env_templates(match.group(0))
+
+        # ``.strip()`` mirrors ``resolve_env_templates`` so a partially
+        # resolved string is whitespace-identical to a fully resolved one.
+        return ENV_TEMPLATE_RE.sub(_replace, text).strip()
 
     def _walk(obj: Any) -> Any:
         if isinstance(obj, dict):
@@ -130,7 +183,7 @@ def resolve_env_templates_in_contract(contract: Any) -> Any:
         if isinstance(obj, list):
             return [_walk(item) for item in obj]
         if isinstance(obj, str):
-            return resolve_env_templates(obj)
+            return _resolve_string(obj)
         return obj
 
     return _walk(contract)

@@ -205,6 +205,40 @@ def test_u9_missing_identity_fails_closed_when_gate_present():
     assert reason == "missing-model-identity"
 
 
+def test_u9b_missing_identity_still_denied_when_only_a_denylist_exists():
+    """A denylist needs identity too — otherwise a denied model slips the
+    gate simply by omitting the (non-standard) ``model`` field."""
+    expose = _expose(denied_models=["gpt-4"])
+    policy = OutputPortPolicy.from_contract_and_flags(expose=expose)
+    allowed, reason = policy.check_tool_call(tool="sample", model_id=None, use_case=None)
+    assert allowed is False
+    assert reason == "missing-model-identity"
+
+
+def test_u9c_model_gate_is_inert_when_no_model_policy_is_declared():
+    """With NO agentPolicy and no CLI model flags there is nothing to
+    enforce, so the gate must not deny. Model identity is not part of the
+    MCP spec — ``Implementation`` carries {name, version} only — so an
+    unconditional deny refused every call, ``describe`` included, from
+    every spec-compliant client while the server reported itself healthy.
+    Mirrors ``is_use_case_allowed``'s "no allowlist ⇒ pass"."""
+    policy = OutputPortPolicy.from_contract_and_flags(expose=_expose())
+    assert policy.policy_source == "default"
+    allowed, reason = policy.check_tool_call(tool="describe", model_id=None, use_case=None)
+    assert allowed is True
+    assert reason is None
+    # …and an identified caller is still evaluated normally.
+    allowed, reason = policy.check_tool_call(tool="describe", model_id="any-model", use_case=None)
+    assert allowed is True
+
+
+def test_u9d_inert_model_gate_does_not_weaken_the_tool_gate():
+    policy = OutputPortPolicy.from_contract_and_flags(expose=_expose(), denied_tools=("query_sql",))
+    allowed, reason = policy.check_tool_call(tool="query_sql", model_id=None, use_case=None)
+    assert allowed is False
+    assert reason == "tool-not-allowed"
+
+
 # ---------------------------------------------------------------------
 # U10 — CLI override wins over contract; policy_source records "cli"
 # ---------------------------------------------------------------------

@@ -11,7 +11,11 @@ from __future__ import annotations
 
 from typing import Dict
 
+# The FLUID-side vocabulary is ``lifecycle.state``
+# (preview/active/deprecated/retired). ``preview`` is the state Bitol calls
+# ``draft``; the legacy hand-written spellings below are still accepted.
 _FLUID_TO_BITOL_STATUS: Dict[str, str] = {
+    "preview": "draft",
     "draft": "draft",
     "active": "active",
     "deprecated": "deprecated",

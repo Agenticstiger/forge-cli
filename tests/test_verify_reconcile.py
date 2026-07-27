@@ -77,6 +77,15 @@ def _expose(expose_id, columns, fmt="snowflake_table"):
     return {
         "exposeId": expose_id,
         "format": fmt,
+        # A resolvable location: without database/schema/table the run short
+        # -circuits to an ``error`` BEFORE ``verify_snowflake_table`` is
+        # reached, so the stub in ``_run`` never takes effect and the error —
+        # now fatal on its own — masks the reconcile gate these tests assert.
+        "binding": {
+            "platform": "snowflake",
+            "format": fmt,
+            "location": {"database": "DB", "schema": "SCH", "table": expose_id.upper()},
+        },
         "contract": {"schema": columns},
     }
 
@@ -335,6 +344,22 @@ class TestReconcileNoop:
 # ---------------------------------------------------------------------------
 
 
+# A minimal passing warehouse-verify result: enough shape for the summary
+# renderer, and explicitly NOT an error (see the patch note below).
+_MATCH_RESULT = {
+    "status": "match",
+    "exists": True,
+    "severity": {"symbol": "✅", "level": "SUCCESS", "impact": "NONE"},
+    "metadata": {"num_rows": 0, "created": None, "modified": None},
+    "dimensions": {
+        "structure": {"status": "pass", "matching_fields": [], "total_expected": 0},
+        "types": {"status": "pass", "mismatches": []},
+        "constraints": {"status": "pass", "mismatches": []},
+        "location": {"status": "pass", "expected": None, "actual": None, "message": None},
+    },
+}
+
+
 class TestVerifyRunReconcileIntegration:
     def _args(self, contract, **kw):
         base = dict(
@@ -370,9 +395,13 @@ class TestVerifyRunReconcileIntegration:
                 return_value={"account": "a", "warehouse": "w", "user": "u"},
             ),
             # Neutralize the live warehouse verify so the run reaches reconcile.
+            # It must return a PASSING result, not an ``error``: an error means
+            # "we could not check at all" and now fails the run on its own
+            # (cli/verify.py), which would mask what these tests assert — the
+            # contract-vs-dbt reconcile gate.
             patch(
                 "fluid_build.cli.verify.verify_snowflake_table",
-                return_value={"status": "error", "error": "skipped", "exists": False},
+                return_value=_MATCH_RESULT,
             ),
         ):
             return run(args, logging.getLogger("test"))

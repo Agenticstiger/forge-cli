@@ -46,6 +46,7 @@ from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
 
 from ._common import CLIError, load_contract_with_overlay, write_json
+from ._export_env import resolve_for_export
 from ._logging import info
 
 # Ordered Bitol-first. The dispatcher reads the leading entry as the
@@ -71,7 +72,6 @@ DEFAULT_OUTPUTS = {
     "odps-bitol": "runtime/exports/product.odps-bitol.yaml",
     "odcs": "runtime/exports/product.odcs.yaml",
     "odps-v4.1": "runtime/exports/product.odps-v4.1.json",
-    "opds": "runtime/exports/product.opds.json",
 }
 
 
@@ -214,7 +214,7 @@ def _export_odps_v4_1(contract_path: str, env, out: str, logger: logging.Logger)
     """
     from fluid_build.providers.opds.opds import OdpsProvider
 
-    c = load_contract_with_overlay(contract_path, env, logger)
+    c = resolve_for_export(load_contract_with_overlay(contract_path, env, logger))
     provider = OdpsProvider()
     rendered = provider.render(c)
 
@@ -225,6 +225,10 @@ def _export_odps_v4_1(contract_path: str, env, out: str, logger: logging.Logger)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     write_json(out, payload)
     info(logger, "generate_standard_odps_v4_1_ok", out=out)
+    # Every format confirms what it wrote and where. Three of the five used to
+    # write the file and print nothing at all, which is indistinguishable from
+    # a no-op — including on the documented default (`--format odps`).
+    cprint(f"✓ Wrote 1 ODPS v4.1 (LF/ODPI) doc to {out}")
     return 0
 
 
@@ -261,7 +265,7 @@ def _export_odcs(contract_path: str, env, out: str, logger: logging.Logger) -> i
     from fluid_build.loader import load_contract
     from fluid_build.providers.odcs.provider import OdcsProvider
 
-    c = load_contract(contract_path)
+    c = resolve_for_export(load_contract(contract_path))
     provider = OdcsProvider()
     results = provider.render_all_ports(c)  # [(expose_id, odcs_doc), ...]
 
@@ -325,7 +329,7 @@ def _export_odps_bitol(contract_path: str, env, out: str, logger: logging.Logger
         from fluid_build.loader import load_contract
         from fluid_build.providers.odps_standard import BitolOdpsProvider
 
-        c = load_contract(contract_path)
+        c = resolve_for_export(load_contract(contract_path))
         provider = BitolOdpsProvider()
         provider.strict_validation = False  # bare-product flow shouldn't enforce sibling validation
         bundle = provider.render(c)
@@ -337,10 +341,11 @@ def _export_odps_bitol(contract_path: str, env, out: str, logger: logging.Logger
         with open(out, "w", encoding="utf-8") as f:
             _yaml.safe_dump(product, f, default_flow_style=False)
         info(logger, "generate_standard_odps_bitol_ok", out=out)
+        cprint(f"✓ Wrote 1 Bitol ODPS v1.0.0 doc to {out}")
         return 0
     except ImportError:
         # Fallback
-        c = load_contract_with_overlay(contract_path, env, logger)
+        c = resolve_for_export(load_contract_with_overlay(contract_path, env, logger))
         import yaml as _yaml
 
         odps_bitol = {
@@ -353,5 +358,6 @@ def _export_odps_bitol(contract_path: str, env, out: str, logger: logging.Logger
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:
             _yaml.safe_dump(odps_bitol, f, default_flow_style=False)
-        info(logger, "generate_standard_odps_bitol_ok", out=out)
+        info(logger, "generate_standard_odps_bitol_ok", out=out, mode="fallback-skeleton")
+        cprint(f"✓ Wrote 1 Bitol ODPS v1.0.0 doc to {out} (minimal skeleton)")
         return 0

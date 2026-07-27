@@ -69,6 +69,7 @@ _VERBS = (
     "split",
     "auth",
     "providers",
+    "exporters",
     "version",
     "config",
     "generate",

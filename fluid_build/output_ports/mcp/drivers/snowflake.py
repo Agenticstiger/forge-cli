@@ -44,6 +44,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.providers._sql_safety import validate_ident, validate_sql_expression_allowlist
@@ -80,12 +81,14 @@ class SnowflakeDriver(EngineDriver):
         contract: Mapping[str, Any],
         logger: Optional[logging.Logger] = None,
         connection_options: Optional[Mapping[str, Any]] = None,
+        readable_paths: Tuple[Path, ...] = (),
     ) -> None:
         super().__init__(
             expose=expose,
             contract=contract,
             logger=logger,
             connection_options=connection_options,
+            readable_paths=readable_paths,
         )
         platform, fmt, location = get_binding(expose)
         if platform != "snowflake":

@@ -83,3 +83,69 @@ def test_mcp_regenerate_physical_writes_contract(tmp_path: Path):
     assert Path(result["contract_path"]).exists()
     contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
     assert contract["labels"]["modelSidecar"] == "orders.fluid.yaml.model.json"
+
+
+# ---------------------------------------------------------------------------
+# read_logical_model — typed-tool-error invariant on the MCP-SERVER path.
+#
+# Issue #392 hardened only one of two mirrored implementations:
+# ``forge_copilot_tools._dispatch_read_logical_model`` (in-process toolkit).
+# ``fluid mcp serve`` routes through ``cli/mcp/dispatch.py``, which called
+# ``LogicalDraft.model_validate_json(path.read_text(...))`` bare — so a missing
+# file round-tripped the absolute host path to the LLM, and a wrong-shape or
+# invalid-JSON sidecar round-tripped a truncated echo of the FILE CONTENTS
+# (pydantic's ``input_value=...``). Verified over the real stdio wire.
+# ---------------------------------------------------------------------------
+
+
+def test_read_logical_model_missing_file_returns_typed_error(tmp_path: Path):
+    result = _call_tool("read_logical_model", {"path": str(tmp_path / "nope.json")}, read_only=True)
+
+    assert result["error"] == "FileNotFoundError"
+    assert "see server logs" in result["message"]
+    assert "Errno" not in result["message"]
+    assert str(tmp_path) not in result["message"]
+
+
+def test_read_logical_model_invalid_json_does_not_echo_file_contents(tmp_path: Path):
+    sidecar = tmp_path / "notjson.model.json"
+    sidecar.write_text("not json {{{ PWD_ECHO_SENTINEL_ABC\n", encoding="utf-8")
+
+    result = _call_tool("read_logical_model", {"path": str(sidecar)}, read_only=True)
+
+    assert result["error"] == "ValidationError"
+    assert "see server logs" in result["message"]
+    assert "PWD_ECHO_SENTINEL_ABC" not in result["message"]
+
+
+def test_read_logical_model_wrong_shape_does_not_echo_file_contents(tmp_path: Path):
+    sidecar = tmp_path / "bad.model.json"
+    sidecar.write_text(
+        '{"entities": [{"name": 12}], "secret": "PWD_ECHO_SENTINEL_ABC"}', encoding="utf-8"
+    )
+
+    result = _call_tool("read_logical_model", {"path": str(sidecar)}, read_only=True)
+
+    assert result["error"] == "ValidationError"
+    assert "PWD_ECHO_SENTINEL_ABC" not in result["message"]
+    assert "input_value" not in result["message"]
+
+
+def test_the_mutating_sidecar_tools_share_the_sanitised_reader(tmp_path: Path):
+    """update_entity / add_relationship / regenerate_physical read the same
+    sidecar the same way; the sanitising must not be read-path-only."""
+    import pytest
+
+    from fluid_build.cli.mcp.dispatch import LogicalDraftError
+
+    sidecar = tmp_path / "bad.model.json"
+    sidecar.write_text('{"nope": "PWD_ECHO_SENTINEL_ABC"}', encoding="utf-8")
+
+    for name, arguments in (
+        ("update_entity", {"path": str(sidecar), "entity": "x", "updates": {}}),
+        ("add_relationship", {"path": str(sidecar), "relationship": {}}),
+        ("regenerate_physical", {"path": str(sidecar)}),
+    ):
+        with pytest.raises(LogicalDraftError) as excinfo:
+            _call_tool(name, arguments, read_only=False)
+        assert "PWD_ECHO_SENTINEL_ABC" not in str(excinfo.value), name

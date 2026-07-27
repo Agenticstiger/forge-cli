@@ -169,6 +169,17 @@ def tool_query(
         # THIS engine — backticks on BigQuery (ANSI double-quotes there read
         # as a string literal → predicate always false → zero rows).
         dialect=descriptor.dialect,
+        # Column-level policy, enforced at COMPILE time. The driver's
+        # ``project()`` drops restricted columns / redacts PII by matching
+        # the OUTPUT column name, which the semantic layer aliases away:
+        # a measure ``{name: avg_balance, expr: ACCOUNT_BALANCE}`` served
+        # statistics over a denied column, and a dimension ``{name:
+        # seg_alias, expr: MARKET_SEGMENT}`` served raw PII. The compiler
+        # matches on the underlying EXPRESSION instead — rejecting denied
+        # columns outright (as ``query_sql`` already did) and tagging the
+        # aliases whose values must be redacted.
+        restricted_columns=set(getattr(driver, "_restricted_columns", set())),
+        redacted_columns=set(getattr(driver, "_pii_columns", set())),
     )
     result = driver.query(compiled=compiled, timeout_seconds=state.query_timeout_seconds)
     return _serialize_query_result(state.expose, compiled, result)

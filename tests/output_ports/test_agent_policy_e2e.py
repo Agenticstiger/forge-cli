@@ -92,6 +92,11 @@ def _build_policy(
         cli_denied_models=cli_denied_models,
         cli_allowed_use_cases=cli_allowed_use_cases,
         cli_denied_use_cases=cli_denied_use_cases,
+        # The fixture CSV lives under the test's tmp dir (``audit_root`` is
+        # ``<tmp>/.fluid/store/audit``), not cwd. ``--readable-paths`` is
+        # enforced by the driver now, so the sandbox has to name the
+        # directory the data actually lives in.
+        readable_paths=(audit_root.parents[2].resolve(),),
     )
 
 
@@ -373,3 +378,105 @@ async def test_i6_identity_binding_denies_when_clientinfo_lacks_model(
     audit = _audit_files(audit_root)
     deny = [e for e in audit if e["payload"]["decision"] == "deny"]
     assert deny and deny[-1]["payload"]["reason"] == "missing-model-identity"
+
+
+# ---------------------------------------------------------------------
+# I7 — no agentPolicy anywhere: the model gate is INERT, so a
+#      spec-compliant MCP client (clientInfo carries {name, version}
+#      only — ``model`` is a non-standard field the gateway invented)
+#      can actually use the server.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_i7_spec_compliant_client_works_when_no_model_policy_declared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented quick-start ("drop into Claude Code / Cursor",
+    "drive it with the MCP Inspector CLI") could not work: the gate
+    denied EVERY tool call, ``describe`` included, on contracts with no
+    ``agentPolicy`` block at all — while ``doctor`` and ``tools/list``
+    still reported the server healthy."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    audit_root = tmp_path / ".fluid" / "store" / "audit"
+
+    contract, expose = _build_contract_and_expose(tmp_path)
+    policy = _build_policy(expose=expose, audit_root=audit_root)
+    assert policy.policy_source == "default"
+    assert policy.allowed_models is None and policy.denied_models == ()
+    server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
+
+    async with create_connected_server_and_client_session(
+        server.server,
+        client_info=Implementation(name="mcp-inspector", version="1.0.0"),
+    ) as client:
+        described = await client.call_tool("describe", {})
+        assert described.isError is False
+        assert json.loads(described.content[0].text)["exposeId"] == expose["exposeId"]
+
+        sampled = await client.call_tool("sample", {"limit": 2})
+        assert sampled.isError is False
+        payload = json.loads(sampled.content[0].text)
+        assert payload["rowCount"] == 2
+
+    audit = _audit_files(audit_root)
+    assert audit and all(event["payload"]["decision"] == "allow" for event in audit)
+
+
+# ---------------------------------------------------------------------
+# I8 — every refusal / failure is reported with isError:true, per the
+#      MCP spec, so an agent loop can branch on it.
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_i8_policy_denial_and_tool_errors_set_is_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every gateway refusal used to come back as ``isError: false``, so
+    a framework branching on ``isError`` treated a policy denial or a
+    failed query as a successful tool result and fed the error JSON to
+    the model as data."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    audit_root = tmp_path / ".fluid" / "store" / "audit"
+
+    contract, expose = _build_contract_and_expose(tmp_path)
+    policy = _build_policy(
+        expose=expose,
+        cli_allowed_models=("claude-haiku-4-5-20251001",),
+        audit_root=audit_root,
+    )
+    server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
+
+    # 1. agentPolicy denial (unidentified caller against a real gate).
+    async with create_connected_server_and_client_session(
+        server.server,
+        client_info=Implementation(name="no-model", version="1.0.0"),
+    ) as client:
+        denied = await client.call_tool("sample", {"limit": 1})
+    assert denied.isError is True
+    assert json.loads(denied.content[0].text)["error"] == "AgentPolicyDenied"
+
+    # 2. input validation the agent is expected to self-correct from —
+    #    still an error, because the agent can only react if it can tell
+    #    the call failed. The message stays verbatim.
+    async with create_connected_server_and_client_session(
+        server.server,
+        client_info=Implementation.model_validate(
+            {
+                "name": "allowed",
+                "version": "1.0.0",
+                "model": "claude-haiku-4-5-20251001",
+            }
+        ),
+    ) as client:
+        bad_metric = await client.call_tool("query", {"metric": "nope", "limit": 5})
+        # 3. query_sql without --allow-sql.
+        not_allowed = await client.call_tool("query_sql", {"sql": "SELECT 1"})
+    assert bad_metric.isError is True
+    assert json.loads(bad_metric.content[0].text)["error"] == "QueryValidationError"
+    assert not_allowed.isError is True
+    assert json.loads(not_allowed.content[0].text)["error"] in {
+        "ToolNotAllowed",
+        "AgentPolicyDenied",
+    }

@@ -27,6 +27,7 @@ from typing import Any, Dict
 from fluid_build.providers._mapper_common import (
     fluid_id,
     make_passthrough_helpers,
+    resolve_status,
 )
 
 PASSTHROUGH_KEY = "odcs_passthrough"
@@ -72,4 +73,5 @@ __all__ = [
     "ImportCtx",
     "ExportCtx",
     "fluid_id",
+    "resolve_status",
 ]
