@@ -74,7 +74,7 @@ def _build_contract_dot(
             nid = _safe_id(f"consume_{rid}")
             lbl_top = c.get("id") or "source"
             lbl_bot = rid
-            consume_nodes.append((nid, f"{lbl_top}\\n{lbl_bot}"))
+            consume_nodes.append((nid, f"{lbl_top}\n{lbl_bot}"))
 
     if collapse_exposes and exposes:
         expose_nodes.append(("exposes_agg", "Exposes…"))
@@ -87,7 +87,7 @@ def _build_contract_dot(
             nid = _safe_id(f"expose_{eid}")
             lbl_top = eid
             lbl_bot = f"{et or 'artifact'} {f'[{fmt}]' if fmt else ''}".strip()
-            expose_nodes.append((nid, f"{lbl_top}\\n{lbl_bot}"))
+            expose_nodes.append((nid, f"{lbl_top}\n{lbl_bot}"))
 
     # Plan nodes (optional)
     plan_nodes: List[Tuple[str, str]] = []
@@ -100,11 +100,11 @@ def _build_contract_dot(
             nid = _safe_id(f"action_{i}_{op}")
             label = op
             if "dataset" in a and "table" in a:
-                label = f"{op}\\n{a['dataset']}.{a['table']}"
+                label = f"{op}\n{a['dataset']}.{a['table']}"
             elif "name" in a:
-                label = f"{op}\\n{a['name']}"
+                label = f"{op}\n{a['name']}"
             elif "dst" in a:
-                label = f"{op}\\n{a['dst']}"
+                label = f"{op}\n{a['dst']}"
             plan_nodes.append((nid, label))
             if prev:
                 plan_edges.append((prev, nid))
