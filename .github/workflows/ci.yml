@@ -48,12 +48,30 @@ jobs:
       # blocks everything gets deleted, not fixed. Catching what a change
       # ADDS is the job; auditing history is a separate, deliberate exercise.
       - name: Secret scan (detect-secrets on changed files)
+        env:
+          # Empty on a push build; set on pull_request. Used instead of a
+          # symbolic ref because actions/checkout fetches SHALLOW (depth 1),
+          # so `origin/main` simply does not exist in the runner's clone and
+          # `git diff origin/main...HEAD` fails outright — which is what broke
+          # the first version of this step.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          set -euo pipefail
           pip install "detect-secrets==1.5.0"
-          CHANGED=$(git diff --name-only --diff-filter=d origin/${{ github.base_ref || 'main' }}...HEAD)
-          if [ -z "$CHANGED" ]; then echo "no changed files"; exit 0; fi
-          echo "$CHANGED"
-          detect-secrets-hook --baseline .secrets.baseline $CHANGED
+          if [ -z "${BASE_SHA}" ]; then
+            echo "Not a pull request — nothing to diff against; skipping."
+            exit 0
+          fi
+          # Deepen just enough to reach the base commit.
+          git fetch --no-tags --depth=50 origin "${BASE_SHA}" 2>/dev/null || true
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "Base commit ${BASE_SHA} unreachable; skipping rather than failing on infrastructure."
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only --diff-filter=d "${BASE_SHA}" HEAD)
+          if [ -z "${CHANGED}" ]; then echo "No changed files."; exit 0; fi
+          echo "${CHANGED}"
+          detect-secrets-hook --baseline .secrets.baseline ${CHANGED}
 
   # ── import-linter — architecture / cycle gate ───────────────────────
   # Runs the declarative contracts under ``[tool.importlinter]`` in
