@@ -240,8 +240,8 @@ mission` surface, the Apache Ossie resync, and a wave of fixes that make the
   `fluid mission run` drives a VERIFY-anchored loop in which only code-owned
   checks — never the LLM — can declare success, with hard USD / wall-clock /
   iteration budgets, a fail-closed destructive-diff gate, and
-  resume-by-re-verification (`--resume`). Ships `gdpr_clean` and
-  `quality_coverage` built-in missions. A HIGH path traversal in run-manifest
+  resume-by-re-verification (`--resume`). Ships `gdpr-clean` and
+  `quality-coverage` built-in missions. A HIGH path traversal in run-manifest
   handling was found and fixed by the series' own security pass before merge.
   (#432, #434, #436)
 - **Apache Ossie resync + conformant interchange sidecar.** The OSI
