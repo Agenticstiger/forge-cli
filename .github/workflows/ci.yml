@@ -322,25 +322,35 @@ jobs:
   # ── MCP SDK version drift ───────────────────────────────────────────────
   # Catches breaking changes in ``modelcontextprotocol/python-sdk`` at
   # PR-time instead of at user-install-time. Runs the MCP-touching test
-  # files against the lower-bound pin from pyproject.toml + the latest 1.x
-  # the SDK has released.
+  # files against the lower-bound pin from pyproject.toml, the newest
+  # release inside the supported range, and (informationally) the newest
+  # release on PyPI.
   #
-  # If the SDK ships breaking changes in 2.x, this job will go red and we
-  # can either pin a ceiling in pyproject.toml or do the 2.x port before
-  # users hit it. Either is preferable to "the data team's pip install
-  # picks up an incompatible mcp release tomorrow."
+  # 2026-07-28: the SDK's 2.0.0 shipped and removed ``mcp.server.fastmcp``.
+  # pyproject.toml caps at `mcp>=1.20,<2.0`, so user installs never resolve
+  # 2.x — the "latest" leg below is the early-warning canary for the 2.x
+  # port and stays continue-on-error until that port lands.
   mcp-sdk-drift:
     name: MCP SDK Drift (mcp ${{ matrix.mcp-version }})
     runs-on: ubuntu-latest
+    # The unbounded "latest" leg is informational: red there means the next
+    # SDK major needs a port, not that users are broken (the pyproject
+    # ceiling shields installs). The supported-range legs stay blocking.
+    continue-on-error: ${{ matrix.mcp-version == 'latest' }}
     strategy:
       fail-fast: false
       matrix:
-        # "1.20" = lower-bound pin from pyproject.toml `mcp>=1.20`
-        #          (see comment there for the FastMCP API features we need:
-        #          deferred-annotation handling, ClientSession
-        #          ``sampling_capabilities`` kwarg, etc.)
-        # ""     = no version pin → latest 1.x (this is what users get today)
-        mcp-version: ["1.20", ""]
+        # "1.20"      = lower-bound pin from pyproject.toml `mcp>=1.20`
+        #               (see comment there for the FastMCP API features we
+        #               need: deferred-annotation handling, ClientSession
+        #               ``sampling_capabilities`` kwarg, etc.)
+        # "range-max" = newest release inside the pyproject constraint
+        #               (`mcp>=1.20,<2.0`) — what a fresh
+        #               `pip install data-product-forge` resolves today
+        # "latest"    = newest release on PyPI, ignoring our ceiling —
+        #               early warning for the next-major port (informational,
+        #               see continue-on-error above)
+        mcp-version: ["1.20", "range-max", "latest"]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -351,11 +361,12 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e ".[dev,local]" || pip install -e ".[dev]"
-          if [ -n "${{ matrix.mcp-version }}" ]; then
-            pip install --force-reinstall "mcp==${{ matrix.mcp-version }}"
-          else
-            pip install --upgrade mcp
-          fi
+          case "${{ matrix.mcp-version }}" in
+            # Keep the range-max constraint in sync with pyproject.toml.
+            range-max) pip install --upgrade "mcp>=1.20,<2.0" ;;
+            latest)    pip install --upgrade mcp ;;
+            *)         pip install --force-reinstall "mcp==${{ matrix.mcp-version }}" ;;
+          esac
           pip show mcp | head -3
       - name: Run MCP-touching tests
         run: |
