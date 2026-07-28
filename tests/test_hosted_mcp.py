@@ -198,7 +198,8 @@ class TestBridge:
 
     def test_dispatch_returns_typed_error_no_leak(self):
         def _boom(_self):
-            raise RuntimeError("snowflake://user:pw@acct/db unreachable")
+            dsn = "snowflake://user:pw@acct/db"  # pragma: allowlist secret
+            raise RuntimeError(f"{dsn} unreachable")
 
         with patch.object(HostedMcpClient, "_open_session", _boom):
             out = dispatch_hosted_mcp_tool("github.search_repositories", {"query": "x"}, env=_GH_ON)

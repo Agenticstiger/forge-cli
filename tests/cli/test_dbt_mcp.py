@@ -173,7 +173,8 @@ def test_dispatch_routes_to_server():
 
 def test_dispatch_returns_typed_error_no_leak():
     def _boom(_self):
-        raise RuntimeError("postgres://user:pw@host/db unreachable")
+        dsn = "postgres://user:pw@host/db"  # pragma: allowlist secret
+        raise RuntimeError(f"{dsn} unreachable")
 
     with patch.object(DbtMcpClient, "_open_session", _boom):
         out = dispatch_dbt_mcp_tool("dbt.run_sql", {"sql": "x"}, env=_ON)
