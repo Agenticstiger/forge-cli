@@ -37,11 +37,11 @@ duckdb = pytest.importorskip("duckdb")
 
 from mcp import ClientSession  # noqa: E402
 from mcp.client.sse import sse_client  # noqa: E402
-from mcp.shared.memory import (  # noqa: E402
-    create_connected_server_and_client_session,
-)
 from mcp.types import Implementation  # noqa: E402
 
+# In-memory client<->server harness via the SDK version-compat seam
+# (the v1 helper was removed in mcp 2.x).
+from fluid_build._mcp_compat import open_inmemory_session, self_attesting_client_kwargs
 from fluid_build.output_ports.mcp.drivers import (  # noqa: E402
     EngineDriver,
     UnsupportedBindingError,
@@ -286,9 +286,9 @@ async def test_rate_limit_denies_after_threshold_under_real_dispatch(
     )
 
     payloads: list[Dict[str, Any]] = []
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(name="burst-test", version="1.0.0", model="burst-driver"),
+        **self_attesting_client_kwargs("burst-test", "1.0.0", model="burst-driver"),
     ) as client:
         for _ in range(4):
             result = await client.call_tool("sample", {"limit": 1})
@@ -349,9 +349,9 @@ async def test_backpressure_semaphore_serialises_concurrent_dispatch(
 
     server._dispatch_allowed_tool = _spy_dispatch  # type: ignore[method-assign]
 
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(name="burst-test", version="1.0.0"),
+        **self_attesting_client_kwargs("burst-test", "1.0.0"),
     ) as client:
         await asyncio.gather(*(client.call_tool("sample", {"limit": 1}) for _ in range(20)))
 
@@ -468,9 +468,7 @@ async def test_http_sse_transport_serves_tools_and_enforces_policy(
             async with ClientSession(
                 read_stream,
                 write_stream,
-                client_info=Implementation(
-                    name="http-sse-test", version="1.0.0", model="http-test"
-                ),
+                **self_attesting_client_kwargs("http-sse-test", "1.0.0", model="http-test"),
             ) as session:
                 await session.initialize()
                 listing = await session.list_tools()
@@ -600,9 +598,9 @@ async def test_query_validation_error_surfaces_message_to_caller(
     # PER REQUEST from the SDK's request_context, never cached on the
     # shared SessionState (the cross-client bleed this fix removed; see
     # test_identity_isolation.py).
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(name="validation-test", version="1.0.0", model="test-agent"),
+        **self_attesting_client_kwargs("validation-test", "1.0.0", model="test-agent"),
     ) as client:
         result = await client.call_tool("query", {"measure": "no_such_measure", "limit": 5})
     payload = json.loads(result.content[0].text)
@@ -648,9 +646,9 @@ async def test_engine_error_stays_sanitised_at_the_wire(
     # Declare the model via real ``clientInfo`` — identity is resolved
     # PER REQUEST from the SDK's request_context, never cached on the
     # shared SessionState (see test_identity_isolation.py).
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(name="engine-error-test", version="1.0.0", model="test-agent"),
+        **self_attesting_client_kwargs("engine-error-test", "1.0.0", model="test-agent"),
     ) as client:
         result = await client.call_tool("query", {"measure": "customer_count", "limit": 5})
     payload = json.loads(result.content[0].text)

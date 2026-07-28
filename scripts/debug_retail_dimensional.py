@@ -38,8 +38,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from fluid_build.forge_datamodel.from_intent.pipeline import run_from_intent
 from scripts.gemini_demo_db_scenarios import _build_session, _retail_intent
+
+from fluid_build.forge_datamodel.from_intent.pipeline import run_from_intent
 
 
 def main() -> int:

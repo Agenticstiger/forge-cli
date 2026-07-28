@@ -166,19 +166,22 @@ def _check_direct_jsonrpc(
     3. ``tools/call describe`` returns a non-error payload.
     4. ``resources/list`` returns the contract + expose resources.
 
-    Identity binding (clientInfo.model) is set explicitly so an
-    operator running a sample agentPolicy on the validation contract
-    sees the gate fire on the call path. The expected outcome
-    depends on the contract's policy: if no agentPolicy is set,
-    every call allows; if it is, the cert script needs the model
-    in the allowlist (validation contract is authored with
-    ``cert-script`` already in allowedModels by convention).
+    Identity binding (``model=cert-script``) is self-attested through
+    the version-correct channel (SDK 1.x: ``clientInfo`` extras; SDK
+    2.x: the ``fluid`` capabilities-extensions block) via the
+    ``_mcp_compat`` seam, so an operator running a sample agentPolicy
+    on the validation contract sees the gate fire on the call path.
+    The expected outcome depends on the contract's policy: if no
+    agentPolicy is set, every call allows; if it is, the cert script
+    needs the model in the allowlist (validation contract is authored
+    with ``cert-script`` already in allowedModels by convention).
     """
     import asyncio
 
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
-    from mcp.types import Implementation
+
+    from fluid_build._mcp_compat import attr, self_attesting_client_kwargs
 
     cmd = _server_command(contract_path, expose_id=expose_id)
     server_params = StdioServerParameters(
@@ -189,26 +192,26 @@ def _check_direct_jsonrpc(
     )
 
     async def _drive() -> Dict[str, Any]:
-        client_info = Implementation(
-            name="forge-cli-output-port-certifier",
-            version="1.0.0",
+        client_kwargs = self_attesting_client_kwargs(
+            "forge-cli-output-port-certifier",
+            "1.0.0",
             model="cert-script",
             useCase="analysis",
         )
         async with stdio_client(server_params) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream, client_info=client_info) as session:
+            async with ClientSession(read_stream, write_stream, **client_kwargs) as session:
                 init_result = await session.initialize()
                 listing = await session.list_tools()
                 resources = await session.list_resources()
                 describe = await session.call_tool("describe", {})
                 return {
-                    "protocolVersion": getattr(init_result, "protocolVersion", None),
+                    "protocolVersion": attr(init_result, "protocol_version", "protocolVersion"),
                     "tools": [t.name for t in listing.tools],
                     "resources": [str(r.uri) for r in resources.resources],
                     "describe_payload_excerpt": (
                         describe.content[0].text[:200] if describe.content else ""
                     ),
-                    "describe_is_error": getattr(describe, "isError", False),
+                    "describe_is_error": attr(describe, "is_error", "isError", False),
                 }
 
     try:

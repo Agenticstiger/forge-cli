@@ -16,11 +16,11 @@
 
 These exercise the FULL client path — connect → list_tools → call_tool →
 parse → map → filter — against an **in-memory MCP server** stood up with the
-SDK's ``create_connected_server_and_client_session`` harness. Real MCP
-protocol, zero network, zero Docker: the connector's ``_open_session`` seam is
-overridden to yield the in-memory session, so production transport code
-(``ClientSessionGroup``) is bypassed here and validated separately by the
-Stage-3 live tests.
+``fluid_build._mcp_compat.open_inmemory_session`` harness (version-neutral
+over SDK 1.x/2.x). Real MCP protocol, zero network, zero Docker: the
+connector's ``_open_session`` seam is overridden to yield the in-memory
+session, so production transport code (``ClientSessionGroup``) is bypassed
+here and validated separately by the Stage-3 live tests.
 """
 
 from __future__ import annotations
@@ -33,9 +33,12 @@ import logging
 import mcp.types as mcp_types
 import pytest
 from mcp.server.lowlevel import Server
-from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import Implementation
 
+# In-memory client<->server harness + version-neutral lowlevel Server factory
+# via the SDK version-compat seam (the v1 memory helper and the v1 decorator
+# registration API are both gone in mcp 2.x).
+from fluid_build._mcp_compat import build_lowlevel_server, open_inmemory_session
 from fluid_build.cli.market import DataProductLayer, DataProductStatus, SearchFilters
 from fluid_build.cli.market_catalogs.mcp_catalog import (
     McpCatalogConnector,
@@ -76,12 +79,16 @@ _ROWS = [
 ]
 
 
+@contextlib.asynccontextmanager
+async def _noop_lifespan(_server):
+    """No-op server lifespan (compat seam passes ``lifespan`` through verbatim)."""
+    yield {}
+
+
 def _make_catalog_server(rows, *, tool_name: str = "search") -> Server:
     """A minimal in-memory MCP server exposing one search tool returning rows
     as a JSON text block (the universal CallToolResult shape)."""
-    server: Server = Server("fake-catalog")
 
-    @server.list_tools()
     async def _list_tools():  # noqa: D401
         return [
             mcp_types.Tool(
@@ -97,13 +104,18 @@ def _make_catalog_server(rows, *, tool_name: str = "search") -> Server:
             )
         ]
 
-    @server.call_tool()
-    async def _call_tool(name, arguments):  # noqa: D401
+    async def _call_tool(ctx, name, arguments):  # noqa: D401
         if name != tool_name:
             raise ValueError(f"unknown tool: {name}")
         return [mcp_types.TextContent(type="text", text=json.dumps(rows))]
 
-    return server
+    return build_lowlevel_server(
+        "fake-catalog",
+        version="0.0.0",
+        lifespan=_noop_lifespan,
+        on_list_tools=_list_tools,
+        on_call_tool=_call_tool,
+    )
 
 
 def _wire(connector: McpCatalogConnector, server: Server) -> None:
@@ -111,7 +123,7 @@ def _wire(connector: McpCatalogConnector, server: Server) -> None:
 
     @contextlib.asynccontextmanager
     async def _session():
-        async with create_connected_server_and_client_session(
+        async with open_inmemory_session(
             server, client_info=Implementation(name="fluid-mcp-test", version="0.0.0")
         ) as session:
             yield session
@@ -240,9 +252,7 @@ _DATAHUB_SHAPE = {
 
 def _make_wrapping_server(payload, *, tool_name: str = "search") -> Server:
     """In-memory server returning a single JSON object payload (vs a bare list)."""
-    server: Server = Server("fake-catalog-wrap")
 
-    @server.list_tools()
     async def _list_tools():
         return [
             mcp_types.Tool(
@@ -252,11 +262,16 @@ def _make_wrapping_server(payload, *, tool_name: str = "search") -> Server:
             )
         ]
 
-    @server.call_tool()
-    async def _call_tool(name, arguments):
+    async def _call_tool(ctx, name, arguments):
         return [mcp_types.TextContent(type="text", text=json.dumps(payload))]
 
-    return server
+    return build_lowlevel_server(
+        "fake-catalog-wrap",
+        version="0.0.0",
+        lifespan=_noop_lifespan,
+        on_list_tools=_list_tools,
+        on_call_tool=_call_tool,
+    )
 
 
 def test_search_parses_datahub_searchresults_envelope():
@@ -479,9 +494,7 @@ _SEARCH_HIT = {
 
 def _make_enriching_server() -> Server:
     """In-memory server exposing search + get_entities + list_schema_fields."""
-    server: Server = Server("fake-catalog-enrich")
 
-    @server.list_tools()
     async def _list_tools():
         def tool(name):
             return mcp_types.Tool(
@@ -492,8 +505,7 @@ def _make_enriching_server() -> Server:
 
         return [tool("search"), tool("get_entities"), tool("list_schema_fields")]
 
-    @server.call_tool()
-    async def _call_tool(name, arguments):
+    async def _call_tool(ctx, name, arguments):
         if name == "search":
             payload = _SEARCH_HIT
         elif name == "get_entities":
@@ -504,7 +516,13 @@ def _make_enriching_server() -> Server:
             raise ValueError(f"unknown tool: {name}")
         return [mcp_types.TextContent(type="text", text=json.dumps(payload))]
 
-    return server
+    return build_lowlevel_server(
+        "fake-catalog-enrich",
+        version="0.0.0",
+        lifespan=_noop_lifespan,
+        on_list_tools=_list_tools,
+        on_call_tool=_call_tool,
+    )
 
 
 def test_get_data_product_enriches_with_detail_and_schema():
@@ -557,9 +575,7 @@ def _make_superset_server() -> Server:
         "properties": {"description": "Daily revenue by region (enriched)"},
         "ownership": {"owners": [{"owner": {"properties": {"displayName": "Finance Team"}}}]},
     }
-    server: Server = Server("fake-catalog-superset")
 
-    @server.list_tools()
     async def _list_tools():
         def tool(name):
             return mcp_types.Tool(
@@ -570,8 +586,7 @@ def _make_superset_server() -> Server:
 
         return [tool("search"), tool("get_entities"), tool("list_schema_fields")]
 
-    @server.call_tool()
-    async def _call_tool(name, arguments):
+    async def _call_tool(ctx, name, arguments):
         if name == "search":
             payload = [rich_row]
         elif name == "get_entities":
@@ -582,7 +597,13 @@ def _make_superset_server() -> Server:
             raise ValueError(f"unknown tool: {name}")
         return [mcp_types.TextContent(type="text", text=json.dumps(payload))]
 
-    return server
+    return build_lowlevel_server(
+        "fake-catalog-superset",
+        version="0.0.0",
+        lifespan=_noop_lifespan,
+        on_list_tools=_list_tools,
+        on_call_tool=_call_tool,
+    )
 
 
 def test_get_data_product_detail_is_superset_of_listing():

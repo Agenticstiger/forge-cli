@@ -37,11 +37,10 @@ import pytest
 duckdb = pytest.importorskip("duckdb")
 
 from mcp import ClientSession  # noqa: E402
-from mcp.shared.memory import (  # noqa: E402
-    create_connected_server_and_client_session,
-)
-from mcp.types import Implementation  # noqa: E402
 
+# In-memory client<->server harness via the SDK version-compat seam
+# (the v1 helper was removed in mcp 2.x).
+from fluid_build._mcp_compat import attr, open_inmemory_session, self_attesting_client_kwargs
 from fluid_build.output_ports.mcp.policy import OutputPortPolicy  # noqa: E402
 from fluid_build.output_ports.mcp.server import OutputPortMcpServer  # noqa: E402
 
@@ -133,11 +132,9 @@ async def test_i1_allowed_model_can_sample_data(
     # (``_resolve_request_identity``), never cached on the shared
     # SessionState. (Caching bled the first HTTP/SSE client's identity
     # onto every later client; see test_identity_isolation.py.)
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(
-            name="test-client", version="0.1.0", model="claude-haiku-4-5-20251001"
-        ),
+        **self_attesting_client_kwargs("test-client", "0.1.0", model="claude-haiku-4-5-20251001"),
     ) as client:
         result = await client.call_tool("sample", {"limit": 3})
 
@@ -172,10 +169,10 @@ async def test_i2_denied_model_gets_typed_deny_envelope(
     )
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
 
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(
-            name="test-client", version="0.1.0", model="claude-3-opus"  # NOT in allowlist
+        **self_attesting_client_kwargs(
+            "test-client", "0.1.0", model="claude-3-opus"  # NOT in allowlist
         ),
     ) as client:
         result = await client.call_tool("sample", {"limit": 3})
@@ -212,11 +209,9 @@ async def test_i3_multiple_calls_each_audited(
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
 
     payloads: list[Dict[str, Any]] = []
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(
-            name="test-client", version="0.1.0", model="claude-haiku-4-5-20251001"
-        ),
+        **self_attesting_client_kwargs("test-client", "0.1.0", model="claude-haiku-4-5-20251001"),
     ) as client:
         for tool, args in [
             ("describe", {}),
@@ -265,9 +260,9 @@ async def test_i4_missing_identity_browses_but_cannot_call(
     # Deliberately leave server.state.model_id == None to simulate a
     # client that didn't declare its model at initialize.
 
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(name="test-client", version="0.1.0"),
+        **self_attesting_client_kwargs("test-client", "0.1.0"),
     ) as client:
         listing = await client.list_tools()
         assert any(
@@ -323,11 +318,11 @@ async def test_i5_identity_binding_via_real_clientinfo(
     assert server.state.model_id is None
     assert server.state.use_case is None
 
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(
-            name="identity-binding-test",
-            version="1.0.0",
+        **self_attesting_client_kwargs(
+            "identity-binding-test",
+            "1.0.0",
             model="claude-haiku-4-5-20251001",
             useCase="analysis",
         ),
@@ -366,9 +361,9 @@ async def test_i6_identity_binding_denies_when_clientinfo_lacks_model(
     )
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
 
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(name="no-model", version="1.0.0"),
+        **self_attesting_client_kwargs("no-model", "1.0.0"),
     ) as client:
         result = await client.call_tool("sample", {"limit": 1})
 
@@ -406,16 +401,16 @@ async def test_i7_spec_compliant_client_works_when_no_model_policy_declared(
     assert policy.allowed_models is None and policy.denied_models == ()
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
 
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(name="mcp-inspector", version="1.0.0"),
+        **self_attesting_client_kwargs("mcp-inspector", "1.0.0"),
     ) as client:
         described = await client.call_tool("describe", {})
-        assert described.isError is False
+        assert attr(described, "is_error", "isError") is False
         assert json.loads(described.content[0].text)["exposeId"] == expose["exposeId"]
 
         sampled = await client.call_tool("sample", {"limit": 2})
-        assert sampled.isError is False
+        assert attr(sampled, "is_error", "isError") is False
         payload = json.loads(sampled.content[0].text)
         assert payload["rowCount"] == 2
 
@@ -449,33 +444,27 @@ async def test_i8_policy_denial_and_tool_errors_set_is_error(
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
 
     # 1. agentPolicy denial (unidentified caller against a real gate).
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(name="no-model", version="1.0.0"),
+        **self_attesting_client_kwargs("no-model", "1.0.0"),
     ) as client:
         denied = await client.call_tool("sample", {"limit": 1})
-    assert denied.isError is True
+    assert attr(denied, "is_error", "isError") is True
     assert json.loads(denied.content[0].text)["error"] == "AgentPolicyDenied"
 
     # 2. input validation the agent is expected to self-correct from —
     #    still an error, because the agent can only react if it can tell
     #    the call failed. The message stays verbatim.
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation.model_validate(
-            {
-                "name": "allowed",
-                "version": "1.0.0",
-                "model": "claude-haiku-4-5-20251001",
-            }
-        ),
+        **self_attesting_client_kwargs("allowed", "1.0.0", model="claude-haiku-4-5-20251001"),
     ) as client:
         bad_metric = await client.call_tool("query", {"metric": "nope", "limit": 5})
         # 3. query_sql without --allow-sql.
         not_allowed = await client.call_tool("query_sql", {"sql": "SELECT 1"})
-    assert bad_metric.isError is True
+    assert attr(bad_metric, "is_error", "isError") is True
     assert json.loads(bad_metric.content[0].text)["error"] == "QueryValidationError"
-    assert not_allowed.isError is True
+    assert attr(not_allowed, "is_error", "isError") is True
     assert json.loads(not_allowed.content[0].text)["error"] in {
         "ToolNotAllowed",
         "AgentPolicyDenied",

@@ -19,6 +19,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from fluid_build._mcp_compat import attr as _mcp_attr
 from fluid_build.cli.mcp import (
     TOOL_CAPABILITIES,
     _call_tool,
@@ -251,7 +252,7 @@ def _get_advertised_input_schema(tool_name: str) -> dict:
         tools = await _get_mcp_app().list_tools()
         for tool in tools:
             if tool.name == tool_name:
-                return tool.inputSchema  # type: ignore[no-any-return]
+                return _mcp_attr(tool, "input_schema", "inputSchema")  # type: ignore[no-any-return]
         raise AssertionError(f"Tool {tool_name!r} not advertised")
 
     return asyncio.run(_go())

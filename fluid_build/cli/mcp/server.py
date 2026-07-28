@@ -31,16 +31,25 @@ import yaml
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
-    # Annotation-only. The MCP server SDK (``mcp.server.fastmcp`` / ``mcp.types``)
-    # is heavy (~87 modules / ~100ms). Importing this module only registers the
-    # ``fluid mcp`` subparser — which happens on every ``fluid`` invocation,
-    # including ``--help`` — so the SDK is imported lazily at serve time (see
-    # ``_forge_tool`` / ``_get_mcp_app``) to keep the hot path light. Runtime
-    # uses (FastMCP instantiation, SamplingMessage/TextContent in forge_run)
-    # import locally where needed. Pinned by tests/perf/test_startup_budget.py.
-    from mcp.server.fastmcp import Context, FastMCP
+    # Annotation-only. The MCP server SDK is heavy (~87 modules / ~100ms).
+    # Importing this module only registers the ``fluid mcp`` subparser —
+    # which happens on every ``fluid`` invocation, including ``--help`` —
+    # so the SDK is imported lazily at serve time (see ``_forge_tool`` /
+    # ``_get_mcp_app``) to keep the hot path light. Runtime uses import
+    # locally where needed. Pinned by tests/perf/test_startup_budget.py.
+    #
+    # The high-level app + per-request context classes differ per SDK
+    # generation (v1 ``fastmcp.FastMCP``/``Context``, v2
+    # ``mcpserver.MCPServer``/``Context``), so annotations use permissive
+    # aliases; ``_get_mcp_app`` binds the version-correct ``Context`` class
+    # into module globals before any tool registration (the ``eval_str``
+    # annotation resolution below depends on that).
     from mcp.types import SamplingMessage, TextContent
 
+    FastMCP = Any
+    Context = Any
+
+from fluid_build._mcp_compat import attr as _mcp_attr
 from fluid_build.cli.mcp.models import (
     _ADAPTER_DISPATCH_DESCRIPTION,
     _ALLOW_METADATA_SERVICE_DESCRIPTION,
@@ -127,17 +136,20 @@ def _get_mcp_app() -> "FastMCP":
     """
     global _mcp_app
     if _mcp_app is None:
-        from mcp.server.fastmcp import Context, FastMCP
+        from fluid_build._mcp_compat import get_server_api
 
-        # FastMCP introspects each tool's signature with ``eval_str=True``. The
-        # ``forge_run`` tool annotates its session param ``ctx: Context``, and
-        # under ``from __future__ import annotations`` that annotation is a
-        # string evaluated against THIS module's globals. Bind ``Context`` into
-        # globals here (build time) so the eval resolves — without importing
-        # the SDK at module-load time, which is the whole point of the laziness.
+        ServerCls, Context = get_server_api()
+
+        # The server introspects each tool's signature with ``eval_str=True``.
+        # The ``forge_run`` tool annotates its session param ``ctx: Context``,
+        # and under ``from __future__ import annotations`` that annotation is a
+        # string evaluated against THIS module's globals. Bind the
+        # version-correct ``Context`` into globals here (build time) so the
+        # eval resolves — without importing the SDK at module-load time, which
+        # is the whole point of the laziness.
         globals()["Context"] = Context
 
-        app = FastMCP(name="forge-cli-mcp")
+        app = ServerCls(name="forge-cli-mcp")
         for fn, tool_kwargs in _PENDING_TOOLS:
             app.tool(**tool_kwargs)(fn)
         _mcp_app = app
@@ -585,7 +597,9 @@ async def forge_run(
             "prompt": prompt_text,
             "response_text": text,
             "model": getattr(result, "model", None),
-            "stop_reason": getattr(result, "stopReason", None),
+            # Dual-name read: v1 exposes camelCase, v2 snake_case — a
+            # single-name getattr silently returns None on the other one.
+            "stop_reason": _mcp_attr(result, "stop_reason", "stopReason"),
         }
 
     # Modes 'blank' and 'ai' — run fluid forge in-process inside a worker

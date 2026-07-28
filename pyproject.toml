@@ -86,7 +86,15 @@ dependencies = [
   #   - The gateway depends on the lifespan API + ``mcp.shared.memory``
   #     test fixtures introduced in 1.20.
   #   1.20+ has all of the above. Pinned by the mcp-sdk-drift CI job.
-  # Ceiling ``<2.0`` gates any future major bump (tested against 1.27.x).
+  # Ceiling ``<2.0``: the codebase is DUAL-SUPPORT (1.x and 2.x) via the
+  # fluid_build/_mcp_compat.py seam — the drift job's warn-only "latest"
+  # leg exercises 2.x on every run — but the ceiling stays until that leg
+  # has a green track record on a settled 2.0.x (2.0.0 shipped
+  # 2026-07-28). Phase 2: widen to ``>=1.20,<3`` and make the 2.x leg
+  # blocking. Known 2.x behavior gap: v2 drops clientInfo extra fields at
+  # wire-parse (v1 was extra="allow"), so self-attested output-port
+  # identity moved to the capabilities channel — see
+  # _mcp_compat.self_attesting_client_kwargs.
   #
   # Borrowed-not-built per /borrow-before-build (skill receipts in
   # AGENT_IDE.md "Related work" section + the gateway commit msg):

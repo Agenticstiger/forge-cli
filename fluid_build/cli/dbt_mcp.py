@@ -54,6 +54,8 @@ import shlex
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 
+from fluid_build._mcp_compat import attr as _mcp_attr
+
 LOG = logging.getLogger("fluid.cli.dbt_mcp")
 
 # Forge-side namespace so a dbt MCP tool can never collide with a native tool.
@@ -106,7 +108,7 @@ def _result_to_payload(result: Any) -> Any:
     return value is sent back to the agent as a tool result, mirroring
     ``forge_copilot_tools.dispatch_tool_call``'s contract (plain dict / str).
     """
-    structured = getattr(result, "structuredContent", None)
+    structured = _mcp_attr(result, "structured_content", "structuredContent")
     if structured not in (None, {}):
         return structured
     texts: List[str] = []
@@ -116,7 +118,7 @@ def _result_to_payload(result: Any) -> Any:
             texts.append(text)
     if texts:
         return "\n".join(texts)
-    return {"ok": not getattr(result, "isError", False)}
+    return {"ok": not _mcp_attr(result, "is_error", "isError", False)}
 
 
 class DbtMcpClient:
@@ -203,7 +205,11 @@ class DbtMcpClient:
         async with self._open_session() as session:
             tools = (await session.list_tools()).tools
             return [
-                (t.name, getattr(t, "description", "") or "", getattr(t, "inputSchema", {}) or {})
+                (
+                    t.name,
+                    getattr(t, "description", "") or "",
+                    _mcp_attr(t, "input_schema", "inputSchema", {}) or {},
+                )
                 for t in tools
             ]
 

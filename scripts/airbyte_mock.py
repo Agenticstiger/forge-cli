@@ -83,9 +83,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "namespace": "public",
                                     "jsonSchema": {
                                         "type": "object",
-                                        "properties": {
-                                            "id": {"type": "integer"}
-                                        },
+                                        "properties": {"id": {"type": "integer"}},
                                     },
                                     "supportedSyncModes": [
                                         "full_refresh",

@@ -48,6 +48,8 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from fluid_build._mcp_compat import attr as _mcp_attr
+
 
 def _server_params(cwd: Path) -> StdioServerParameters:
     """Spawn the same way an IDE would: ``python -m fluid_build.cli mcp serve``.
@@ -126,7 +128,7 @@ def test_sdk_client_calls_validate_contract(tmp_path: Path):
                     arguments={"contract_path": str(contract_path)},
                 )
                 # Tool returned a single TextContent with JSON-serialised body.
-                assert not result.isError, result
+                assert not _mcp_attr(result, "is_error", "isError", False), result
                 text_block = result.content[0]
                 return json.loads(text_block.text)
 
@@ -170,7 +172,7 @@ def test_sdk_client_runs_forge_run_blank(tmp_path: Path):
                         "data_product_type": "SDP",
                     },
                 )
-                assert not result.isError, result
+                assert not _mcp_attr(result, "is_error", "isError", False), result
                 return json.loads(result.content[0].text)
 
     payload = asyncio.run(_run())

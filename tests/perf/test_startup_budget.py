@@ -90,6 +90,11 @@ MAX_HELP_WALL_SECONDS = 2.0
 FORBIDDEN_ON_HELP = (
     "mcp",
     "mcp.server.fastmcp",
+    # The SDK 2.x spelling of the high-level server module. A module that
+    # doesn't exist in the installed SDK generation can never appear in
+    # sys.modules, so listing both spellings keeps the ratchet
+    # non-vacuous under either generation.
+    "mcp.server.mcpserver",
     "httpx",
     "jsonschema",
     "litellm",

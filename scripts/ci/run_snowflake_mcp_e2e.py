@@ -46,11 +46,11 @@ AUDIT_ROOT = Path(tempfile.mkdtemp(prefix="forge-mcp-snowflake-ci-"))
 os.environ["FLUID_AUDIT_ROOT"] = str(AUDIT_ROOT)
 
 import litellm  # noqa: E402
-from mcp.shared.memory import (  # noqa: E402
-    create_connected_server_and_client_session,
-)
 from mcp.types import Implementation  # noqa: E402
 
+# In-memory client<->server harness via the SDK version-compat seam
+# (the v1 helper was removed in mcp 2.x).
+from fluid_build._mcp_compat import open_inmemory_session, self_attesting_client_kwargs
 from fluid_build.output_ports.mcp.policy import OutputPortPolicy  # noqa: E402
 from fluid_build.output_ports.mcp.server import OutputPortMcpServer  # noqa: E402
 
@@ -138,9 +138,9 @@ async def _drive(*, label, bound_model_id, bound_use_case, expected) -> Dict[str
     server.state.model_id = bound_model_id
     server.state.use_case = bound_use_case
 
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(name="forge-mcp-snowflake-ci", version="1.0.0"),
+        **self_attesting_client_kwargs("forge-mcp-snowflake-ci", "1.0.0"),
     ) as client:
         listing = await client.list_tools()
         tools = _tool_definitions(listing)
