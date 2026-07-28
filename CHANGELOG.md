@@ -632,7 +632,7 @@ A bug-fix + security release on top of 0.10.0.
 
 ### Security
 
-- **Mask credentials embedded in URL userinfo** (`scheme://user:password@host`)
+- **Mask credentials embedded in URL userinfo** (`scheme://user:password@host`) <!-- pragma: allowlist secret -->
   across both redaction layers — the global `secret_redactor` and the
   Snowflake-local twin. Such a password (an Iceberg REST catalog
   `binding.location.uri`, a JDBC / `connection_url`, or a redis/AMQP broker URL)
