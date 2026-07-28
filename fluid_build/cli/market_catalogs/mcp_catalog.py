@@ -76,6 +76,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
+from fluid_build._mcp_compat import attr as _mcp_attr
 from fluid_build.cli.market import (
     BaseCatalogConnector,
     DataProductLayer,
@@ -531,7 +532,7 @@ class McpCatalogConnector(BaseCatalogConnector):
                     )
                     return False
                 self._search_tool = tool.name
-                self._search_tool_schema = getattr(tool, "inputSchema", {}) or {}
+                self._search_tool_schema = _mcp_attr(tool, "input_schema", "inputSchema", {}) or {}
                 self.logger.info(
                     f"Connected to MCP catalog (profile={self.profile.name}, "
                     f"search tool='{tool.name}')."
@@ -549,10 +550,12 @@ class McpCatalogConnector(BaseCatalogConnector):
                 if resolved is None:
                     return []
                 tool_name = resolved.name
-                self._search_tool_schema = getattr(resolved, "inputSchema", {}) or {}
+                self._search_tool_schema = (
+                    _mcp_attr(resolved, "input_schema", "inputSchema", {}) or {}
+                )
             args = self._build_search_args(filters)
             result = await session.call_tool(tool_name, args)
-            if getattr(result, "isError", False):
+            if _mcp_attr(result, "is_error", "isError", False):
                 self.logger.warning(f"MCP search tool '{tool_name}' returned an error result.")
                 return []
             rows = self._extract_rows(result)
@@ -634,7 +637,7 @@ class McpCatalogConnector(BaseCatalogConnector):
         """Call a tool that returns a single entity object; unwrap the common
         ``{"result": {…}}`` / ``{"entity": {…}}`` envelopes."""
         result = await session.call_tool(tool_name, args)
-        if getattr(result, "isError", False):
+        if _mcp_attr(result, "is_error", "isError", False):
             return None
         payload = self._result_payload(result)
         if isinstance(payload, dict):
@@ -676,7 +679,7 @@ class McpCatalogConnector(BaseCatalogConnector):
     @staticmethod
     def _result_payload(result: Any) -> Any:
         """Best-effort JSON payload from a CallToolResult (structured or text)."""
-        structured = getattr(result, "structuredContent", None)
+        structured = _mcp_attr(result, "structured_content", "structuredContent")
         if structured not in (None, {}):
             return structured
         for block in getattr(result, "content", None) or []:
@@ -730,7 +733,7 @@ class McpCatalogConnector(BaseCatalogConnector):
         content block as JSON. Accepts a bare list, a single object, or a dict
         wrapping the list under a common key.
         """
-        structured = getattr(result, "structuredContent", None)
+        structured = _mcp_attr(result, "structured_content", "structuredContent")
         if structured is not None:
             rows = self._coerce_rows(structured)
             if rows:

@@ -51,11 +51,11 @@ litellm = pytest.importorskip("litellm")
 pytest.importorskip("fastapi")
 
 from mcp import ClientSession  # noqa: E402
-from mcp.shared.memory import (  # noqa: E402
-    create_connected_server_and_client_session,
-)
 from mcp.types import Implementation  # noqa: E402
 
+# In-memory client<->server harness via the SDK version-compat seam
+# (the v1 helper was removed in mcp 2.x).
+from fluid_build._mcp_compat import open_inmemory_session, self_attesting_client_kwargs
 from fluid_build.output_ports.mcp.policy import OutputPortPolicy  # noqa: E402
 from fluid_build.output_ports.mcp.server import OutputPortMcpServer  # noqa: E402
 from tests.output_ports._fixtures import make_expose, write_customer_csv  # noqa: E402
@@ -163,9 +163,9 @@ async def _running_gateway(
     if bound_use_case is not None:
         client_info_kwargs["useCase"] = bound_use_case
 
-    async with create_connected_server_and_client_session(
+    async with open_inmemory_session(
         server.server,
-        client_info=Implementation(**client_info_kwargs),
+        **self_attesting_client_kwargs(**client_info_kwargs),
     ) as client:
         yield client
 

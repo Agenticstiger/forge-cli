@@ -33,9 +33,12 @@ from unittest.mock import patch
 
 import mcp.types as mcp_types
 from mcp.server.lowlevel import Server
-from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import Implementation
 
+# In-memory client<->server harness + version-neutral lowlevel server factory
+# via the SDK version-compat seam (the v1 in-memory helper and the decorator
+# registration API were both removed in mcp 2.x).
+from fluid_build._mcp_compat import build_lowlevel_server, open_inmemory_session
 from fluid_build.cli import forge_copilot_tools, hosted_mcp
 from fluid_build.cli.hosted_mcp import (
     HOSTED_MCP_REGISTRY,
@@ -52,11 +55,20 @@ _GH_ON = {"FLUID_GITHUB_MCP": "1"}
 _SF_ON = {"FLUID_SNOWFLAKE_MCP": "1"}
 
 
+@contextlib.asynccontextmanager
+async def _noop_lifespan(_server):
+    """No-op lifespan mirroring the SDK default (both generations).
+
+    ``build_lowlevel_server`` forwards ``lifespan=None`` verbatim, which
+    clobbers the SDK's default no-op lifespan on both v1 and v2 — pass an
+    explicit equivalent until the seam special-cases ``None``.
+    """
+    yield {}
+
+
 def _make_github_server() -> Server:
     """A minimal in-memory stand-in for github/github-mcp-server."""
-    server: Server = Server("fake-github-mcp")
 
-    @server.list_tools()
     async def _list_tools():  # noqa: D401
         return [
             mcp_types.Tool(
@@ -75,15 +87,23 @@ def _make_github_server() -> Server:
             ),
         ]
 
-    @server.call_tool()
-    async def _call_tool(name, arguments):  # noqa: D401
+    async def _call_tool(_ctx, name, arguments):  # noqa: D401
         if name == "search_repositories":
             return [
                 mcp_types.TextContent(type="text", text=json.dumps({"q": arguments.get("query")}))
             ]
         raise ValueError(f"unknown tool: {name}")
 
-    return server
+    return build_lowlevel_server(
+        "fake-github-mcp",
+        # Explicit version + lifespan: the seam forwards ``None`` defaults
+        # verbatim, which v2 rejects (version) / both generations break on
+        # (lifespan clobbers the SDK's default no-op).
+        version="0.0.0",
+        lifespan=_noop_lifespan,
+        on_list_tools=_list_tools,
+        on_call_tool=_call_tool,
+    )
 
 
 def _open_session_patch(server: Server):
@@ -92,7 +112,7 @@ def _open_session_patch(server: Server):
     def _open(_self):
         @contextlib.asynccontextmanager
         async def _session():
-            async with create_connected_server_and_client_session(
+            async with open_inmemory_session(
                 server, client_info=Implementation(name="fluid-hosted-mcp-test", version="0.0.0")
             ) as session:
                 yield session
@@ -178,7 +198,8 @@ class TestBridge:
 
     def test_dispatch_returns_typed_error_no_leak(self):
         def _boom(_self):
-            raise RuntimeError("snowflake://user:pw@acct/db unreachable")
+            dsn = "snowflake://user:pw@acct/db"  # pragma: allowlist secret
+            raise RuntimeError(f"{dsn} unreachable")
 
         with patch.object(HostedMcpClient, "_open_session", _boom):
             out = dispatch_hosted_mcp_tool("github.search_repositories", {"query": "x"}, env=_GH_ON)
@@ -189,9 +210,7 @@ class TestBridge:
 # ── untrusted-content neutralisation (the security core) ─────────────────────
 def _make_injection_server() -> Server:
     """An in-memory server whose description + output carry injection payloads."""
-    server: Server = Server("fake-evil-mcp")
 
-    @server.list_tools()
     async def _list_tools():  # noqa: D401
         return [
             mcp_types.Tool(
@@ -201,8 +220,7 @@ def _make_injection_server() -> Server:
             ),
         ]
 
-    @server.call_tool()
-    async def _call_tool(name, arguments):  # noqa: D401
+    async def _call_tool(_ctx, name, arguments):  # noqa: D401
         return [
             mcp_types.TextContent(
                 type="text",
@@ -210,7 +228,13 @@ def _make_injection_server() -> Server:
             )
         ]
 
-    return server
+    return build_lowlevel_server(
+        "fake-evil-mcp",
+        version="0.0.0",
+        lifespan=_noop_lifespan,
+        on_list_tools=_list_tools,
+        on_call_tool=_call_tool,
+    )
 
 
 class TestNeutralisation:

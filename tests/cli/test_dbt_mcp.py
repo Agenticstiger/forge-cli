@@ -30,9 +30,12 @@ from unittest.mock import patch
 
 import mcp.types as mcp_types
 from mcp.server.lowlevel import Server
-from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import Implementation
 
+# In-memory client<->server harness + lowlevel-server factory via the SDK
+# version-compat seam (the v1 helper and the @server.* decorator API were
+# both removed in mcp 2.x).
+from fluid_build._mcp_compat import build_lowlevel_server, open_inmemory_session
 from fluid_build.cli import dbt_mcp, forge_copilot_tools
 from fluid_build.cli.dbt_mcp import (
     TOOL_PREFIX,
@@ -47,11 +50,15 @@ from fluid_build.cli.dbt_mcp import (
 _ON = {"FLUID_DBT_MCP": "1"}
 
 
+@contextlib.asynccontextmanager
+async def _noop_lifespan(_server):
+    """No-op server lifespan (compat seam passes ``lifespan`` through verbatim)."""
+    yield {}
+
+
 def _make_dbt_server() -> Server:
     """A minimal in-memory stand-in for dbt-labs/dbt-mcp: two tools."""
-    server: Server = Server("fake-dbt-mcp")
 
-    @server.list_tools()
     async def _list_tools():  # noqa: D401
         return [
             mcp_types.Tool(
@@ -70,8 +77,7 @@ def _make_dbt_server() -> Server:
             ),
         ]
 
-    @server.call_tool()
-    async def _call_tool(name, arguments):  # noqa: D401
+    async def _call_tool(_ctx, name, arguments):  # noqa: D401
         if name == "list_metrics":
             return [mcp_types.TextContent(type="text", text=json.dumps(["revenue", "orders"]))]
         if name == "run_sql":
@@ -79,7 +85,13 @@ def _make_dbt_server() -> Server:
             return [mcp_types.TextContent(type="text", text=json.dumps(payload))]
         raise ValueError(f"unknown tool: {name}")
 
-    return server
+    return build_lowlevel_server(
+        "fake-dbt-mcp",
+        version="0.0.0",
+        lifespan=_noop_lifespan,
+        on_list_tools=_list_tools,
+        on_call_tool=_call_tool,
+    )
 
 
 def _open_session_patch(server: Server):
@@ -88,7 +100,7 @@ def _open_session_patch(server: Server):
     def _open(_self):
         @contextlib.asynccontextmanager
         async def _session():
-            async with create_connected_server_and_client_session(
+            async with open_inmemory_session(
                 server, client_info=Implementation(name="fluid-dbt-test", version="0.0.0")
             ) as session:
                 yield session
@@ -161,7 +173,8 @@ def test_dispatch_routes_to_server():
 
 def test_dispatch_returns_typed_error_no_leak():
     def _boom(_self):
-        raise RuntimeError("postgres://user:pw@host/db unreachable")
+        dsn = "postgres://user:pw@host/db"  # pragma: allowlist secret
+        raise RuntimeError(f"{dsn} unreachable")
 
     with patch.object(DbtMcpClient, "_open_session", _boom):
         out = dispatch_dbt_mcp_tool("dbt.run_sql", {"sql": "x"}, env=_ON)

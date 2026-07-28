@@ -66,6 +66,11 @@ from mcp.types import (  # noqa: E402
     Tool,
 )
 
+# Version-compat seam (SDK 1.x / 2.x): lowlevel registration + dual-name
+# field reads route through fluid_build._mcp_compat — the only module
+# allowed to branch on the SDK generation.
+from fluid_build._mcp_compat import attr as _mcp_attr  # noqa: E402
+from fluid_build._mcp_compat import build_lowlevel_server  # noqa: E402
 from fluid_build.copilot.store.audit_trail import (
     rotate_audit_directory,
     write_audit_event,
@@ -436,18 +441,24 @@ class OutputPortMcpServer:
                     await asyncio.sleep(0.05)
                 state.close_driver()
 
-        self.server: Server = Server(SERVER_NAME, version=SERVER_VERSION, lifespan=_lifespan)
-        self._register_handlers()
+        self.server: Server = self._build_server(_lifespan)
 
-    def _register_handlers(self) -> None:
-        """Bind SDK decorator-based handlers to the server."""
-        server = self.server
+    def _build_server(self, lifespan: Any) -> Server:
+        """Build the lowlevel server through the version-compat factory.
 
-        @server.list_tools()
+        Handlers are defined as closures with a version-neutral signature and
+        handed to ``fluid_build._mcp_compat.build_lowlevel_server``, which
+        registers them via decorators on SDK 1.x and via ``on_*`` constructor
+        kwargs on 2.x. ``_call_tool`` receives the version-native request
+        context as its first parameter (v1: the ``server.request_context``
+        property value, read by the compat adapter; v2: the handler-passed
+        ``ServerRequestContext``) — both expose ``.session`` and ``.request``,
+        which is all identity resolution reads.
+        """
+
         async def _list_tools() -> List[Tool]:
             return _render_tools(self.state.expose, self.state.policy)
 
-        @server.list_resources()
         async def _list_resources() -> List[Resource]:
             return _render_resources(
                 contract=self.state.contract,
@@ -455,20 +466,18 @@ class OutputPortMcpServer:
                 contract_path=self.state.policy.contract_path,
             )
 
-        @server.read_resource()
-        async def _read_resource(uri: Any) -> str:
+        async def _read_resource(uri: str) -> str:
             return _read_resource_payload(
                 uri=str(uri),
                 contract=self.state.contract,
                 expose=self.state.expose,
             )
 
-        @server.call_tool()
         async def _call_tool(
-            name: str, arguments: Dict[str, Any]
+            request_context: Any, name: str, arguments: Dict[str, Any]
         ) -> List[TextContent | EmbeddedResource] | CallToolResult:
             # Identity binding — resolved FRESH per request from the
-            # SDK's request_ctx (NOT cached on the shared SessionState).
+            # request context (NOT cached on the shared SessionState).
             # On HTTP/SSE one process serves many concurrent clients
             # over one SessionState; caching the first client's identity
             # bled it onto every later client (wrong agentPolicy
@@ -476,7 +485,7 @@ class OutputPortMcpServer:
             # guarantees initialize precedes any tools/call, so the SDK
             # has already received this client's clientInfo + auth attrs
             # by the time we get here.
-            model_id, use_case, caller_attributes = self._resolve_request_identity(server)
+            model_id, use_case, caller_attributes = self._resolve_request_identity(request_context)
 
             # Open an OTel span around the full tool-call path so
             # operators can correlate gateway traffic with the rest
@@ -714,35 +723,69 @@ class OutputPortMcpServer:
                 finally:
                     self.state._in_flight = max(0, self.state._in_flight - 1)
 
+        return build_lowlevel_server(
+            SERVER_NAME,
+            version=SERVER_VERSION,
+            lifespan=lifespan,
+            on_list_tools=_list_tools,
+            on_list_resources=_list_resources,
+            on_read_resource=_read_resource,
+            on_call_tool=_call_tool,
+        )
+
     # ------------------------------------------------------------------
     # Identity binding (E3)
     # ------------------------------------------------------------------
 
     def _resolve_request_identity(
-        self, server: Server
+        self, request_context: Any
     ) -> tuple[Optional[str], Optional[str], Dict[str, Any]]:
         """Resolve the CALLING client's identity for THIS request — never
         cached on the shared SessionState. On HTTP/SSE one process serves many
         concurrent clients over one SessionState, so caching bled the first
         client's identity onto every later client. The SDK isolates identity
-        per request via request_ctx, so read it fresh: self-attested clientInfo
-        from request_context.session.client_params, and cryptographic
+        per request via the request context (v1: the ``request_ctx``
+        contextvar behind ``server.request_context``; v2: the ctx object
+        passed into the handler — the compat factory hands us whichever
+        applies), so read it fresh: self-attested clientInfo from
+        request_context.session.client_params, and cryptographic
         fluid_auth_attrs (JWT/mTLS, verified by the transport auth middleware)
         from request_context.request.scope — crypto WINS over self-attestation.
         Returns (model_id, use_case, caller_attributes); any failure -> (None,
         None, {}) so the policy fail-closes on missing identity.
+
+        **Trust tiers are not merged when auth is enforced.** Self-attested
+        values are whatever the caller typed; cryptographic values were
+        verified by the transport auth middleware. Flattening them into one
+        dict made "crypto wins" hold only for the keys the JWT claim mapping
+        happens to produce (the default mapping yields four:
+        ``sub`` / ``model`` / ``use_case`` / ``tenant_id``). Any
+        ``${caller.<attr>}`` rowFilter outside that set — or any custom
+        ``FLUID_MCP_JWT_CLAIM_MAPPING``, which REPLACES rather than merges the
+        defaults — was then satisfied by the caller's own claim, turning a
+        fail-closed denial into an attacker-chosen RLS predicate, and let a
+        client re-attest ``model`` / ``useCase`` past the agentPolicy gate.
+        So: when the transport stamps ``fluid_auth_kind`` (JWT / mTLS
+        actually enforced), ONLY verified attributes bind. Self-attestation
+        stays authoritative solely when no auth is configured — the
+        pre-existing no-auth behaviour, unchanged.
         """
         model_id: Optional[str] = None
         use_case: Optional[str] = None
+        # Self-attested tier (client-controlled). Kept separate from the
+        # verified tier until the merge policy below decides what binds.
         attrs: Dict[str, Any] = {}
-        try:
-            ctx = server.request_context
-        except Exception:  # noqa: BLE001 - no active request context
+        ctx = request_context
+        if ctx is None:
             return None, None, {}
         try:
             session = getattr(ctx, "session", None)
-            client_info = getattr(session, "client_params", None)
-            client_info = getattr(client_info, "clientInfo", None) if client_info else None
+            client_params = getattr(session, "client_params", None)
+            # Dual-name read: v1 exposes ``clientInfo``, v2 ``client_info`` —
+            # a single-name getattr fail-closes EVERY client silently.
+            client_info = (
+                _mcp_attr(client_params, "client_info", "clientInfo") if client_params else None
+            )
             if client_info is not None:
                 extra = getattr(client_info, "model_extra", None) or {}
                 if "model" in extra:
@@ -760,10 +803,67 @@ class OutputPortMcpServer:
         except Exception as exc:  # noqa: BLE001
             self.state.logger.debug("output_port_identity_clientinfo_failed: %s", exc)
         try:
+            # Second self-attestation channel: a ``fluid`` block under the
+            # client's declared capabilities (``extensions`` on SDK 2.x,
+            # ``experimental`` on both generations). SDK 2.x DROPS the
+            # clientInfo extras above at wire-parse time (v1's
+            # ``Implementation`` was ``extra="allow"``, v2 silently ignores
+            # unknown fields — upstream regression), so this is the ONLY
+            # self-attestation path a 2.x server can see. Explicit
+            # capability declaration wins over clientInfo extras.
+            capabilities = getattr(getattr(session, "client_params", None), "capabilities", None)
+            fluid_block: Dict[str, Any] = {}
+            if capabilities is not None:
+                for channel_name in ("experimental", "extensions"):
+                    channel = getattr(capabilities, channel_name, None)
+                    if channel is None:
+                        # v1 parses unknown capability keys into model_extra.
+                        channel = (getattr(capabilities, "model_extra", None) or {}).get(
+                            channel_name
+                        )
+                    block = (channel or {}).get("fluid")
+                    if isinstance(block, Mapping):
+                        fluid_block.update(block)
+            if fluid_block:
+                if "model" in fluid_block:
+                    model_id = str(fluid_block["model"])
+                if "useCase" in fluid_block:
+                    use_case = str(fluid_block["useCase"])
+                elif "use_case" in fluid_block:
+                    use_case = str(fluid_block["use_case"])
+                for key, value in fluid_block.items():
+                    if key in {"model", "useCase", "use_case"}:
+                        continue
+                    attrs[key] = value
+        except Exception as exc:  # noqa: BLE001
+            self.state.logger.debug("output_port_identity_capability_failed: %s", exc)
+        try:
             request = getattr(ctx, "request", None)
-            scope = getattr(request, "scope", None)
-            crypto = (scope or {}).get("fluid_auth_attrs") or {}
-            if crypto:
+            scope = getattr(request, "scope", None) or {}
+            crypto = scope.get("fluid_auth_attrs") or {}
+            # ``fluid_auth_kind`` is stamped by the transport auth middleware
+            # alongside the attrs whenever a validator actually ran, so it —
+            # not the presence of attrs — is the signal that auth is enforced.
+            auth_kind = scope.get("fluid_auth_kind")
+            if auth_kind:
+                # Auth enforced: the verified tier REPLACES the self-attested
+                # one. A caller cannot fill a ${caller.*} hole the claim
+                # mapping doesn't cover, nor re-attest model / use_case.
+                dropped = sorted(set(attrs) - set(crypto))
+                attrs = dict(crypto)
+                model_id = str(crypto["model"]) if "model" in crypto else None
+                use_case = str(crypto["use_case"]) if "use_case" in crypto else None
+                if dropped:
+                    self.state.logger.warning(
+                        "output_port_identity_self_attested_ignored: "
+                        "auth_kind=%s dropped=%s (verified claims bind; widen "
+                        "FLUID_MCP_JWT_CLAIM_MAPPING if these should be honoured)",
+                        auth_kind,
+                        dropped,
+                    )
+            elif crypto:
+                # No auth kind stamped but attrs present (e.g. an mTLS header
+                # extraction path): keep the historical merge, crypto last.
                 attrs.update(crypto)
                 if "model" in crypto:
                     model_id = str(crypto["model"])

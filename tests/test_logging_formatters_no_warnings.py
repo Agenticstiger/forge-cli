@@ -86,9 +86,21 @@ def test_leaked_root_formatter_with_inmemory_mcp_completes():
     loudly instead of wedging the worker (the conftest root-logger guard
     restores logging state afterwards).
     """
+    from fluid_build._mcp_compat import is_v2
+
+    if is_v2():
+        # This test pins the mcp 1.x warning re-log amplification bug
+        # (upstream python-sdk#3122, fixed by our formatter change in
+        # #418) using the v1 decorator registration API. The 2.x SDK
+        # neither has the bug nor the decorator API — v1-only pin.
+        pytest.skip("mcp 1.x-only SDK-bug pin (warning re-log amplification)")
+
     import mcp.types as mcp_types
     from mcp.server.lowlevel import Server
-    from mcp.shared.memory import create_connected_server_and_client_session
+
+    # In-memory client<->server harness via the SDK version-compat seam
+    # (the v1 helper was removed in mcp 2.x).
+    from fluid_build._mcp_compat import open_inmemory_session
 
     server: Server = Server("amplification-probe")
 
@@ -103,7 +115,7 @@ def test_leaked_root_formatter_with_inmemory_mcp_completes():
         ]
 
     async def _drive():
-        async with create_connected_server_and_client_session(server) as session:
+        async with open_inmemory_session(server) as session:
             return [t.name for t in (await session.list_tools()).tools]
 
     warnings.simplefilter("always")

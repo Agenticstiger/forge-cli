@@ -72,6 +72,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 
+from fluid_build._mcp_compat import attr as _mcp_attr
+
 # Reuse dbt-mcp's async bridge + result coercion verbatim (borrow, no drift).
 from fluid_build.cli.dbt_mcp import _result_to_payload, _run_async
 
@@ -308,7 +310,11 @@ class HostedMcpClient:
         async with self._open_session() as session:
             tools = (await session.list_tools()).tools
             return [
-                (t.name, getattr(t, "description", "") or "", getattr(t, "inputSchema", {}) or {})
+                (
+                    t.name,
+                    getattr(t, "description", "") or "",
+                    _mcp_attr(t, "input_schema", "inputSchema", {}) or {},
+                )
                 for t in tools
             ]
 
