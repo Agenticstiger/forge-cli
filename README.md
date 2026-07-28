@@ -33,7 +33,7 @@
 
 ---
 
-> 🚀 **Latest: [`v0.8.6`](CHANGELOG.md)** on PyPI · contract schema **`fluidVersion 0.7.4`** · 📖 **[Full documentation →](https://agenticstiger.github.io/forge_docs/)**
+> 🚀 **Latest: [`v0.14.0`](CHANGELOG.md)** on PyPI · contract schema **`fluidVersion 0.7.5`** (GA) · 📖 **[Full documentation →](https://agenticstiger.github.io/forge_docs/)**
 
 **Jump to:** [Why FLUID Forge?](#why-fluid-forge) · [What is FLUID?](#-what-is-fluid) · [Why We Built This](#-why-we-built-this) · [60 Seconds to Magic](#-60-seconds-to-magic) · [Installation](#installation) · [Contract Anatomy](#-anatomy-of-a-fluid-contract) · [Providers](#-providers--bring-your-own-cloud) · [CLI Reference](#-cli-command-reference) · [Templates](#-templates) · [Contributing](#-contributing)
 
@@ -77,7 +77,9 @@ plan → apply → policy-apply → verify → publish → schedule-sync
 
 You rarely run all 11 by hand; `fluid generate ci` emits a parameterized CI pipeline (Jenkins, GitHub Actions, GitLab CI, Azure DevOps, Bitbucket, CircleCI, Tekton) that runs every stage in order with cryptographic binding between stages 6 and 7 — apply refuses to proceed if the plan has been tampered with since it was computed. See [AGENTS.md](AGENTS.md#the-11-stage-pipeline) for the full stage lifecycle and [the apply mode matrix](AGENTS.md#apply-mode-matrix) (`dry-run`, `create-only`, `amend`, `amend-and-build`, `replace`, `replace-and-build`).
 
-**Under the hood (cloud providers): OpenTofu autogen.** `fluid apply` compiles the contract to a deterministic OpenTofu `main.tf.json` and delegates apply / state / drift / idempotency to the `tofu` binary — battle-tested infrastructure code instead of hand-rolled per-cloud apply. The emitter is modular: one `IacProviderPlugin` per cloud (`fluid_build/iac/providers/{aws,gcp,snowflake}.py`, dbt-adapter pattern). Preview the emitted module before applying with `fluid generate iac <contract>`. See [AUTOGEN_SPIKE.md](AUTOGEN_SPIKE.md) for the architecture and [HONESTLY_TESTED.md](HONESTLY_TESTED.md) for the coverage matrix (unit / emulator / live cloud).
+**Under the hood (cloud providers): OpenTofu autogen.** `fluid apply` compiles the contract to a deterministic OpenTofu `main.tf.json` and delegates apply / state / drift / idempotency to the `tofu` binary — battle-tested infrastructure code instead of hand-rolled per-cloud apply. The emitter is modular: one `IacProviderPlugin` per cloud (`fluid_build/iac/providers/{aws,gcp,snowflake,confluent}.py`, dbt-adapter pattern). Preview the emitted module before applying with `fluid generate iac <contract>`. See [AUTOGEN_SPIKE.md](AUTOGEN_SPIKE.md) for the architecture and [HONESTLY_TESTED.md](HONESTLY_TESTED.md) for the coverage matrix (unit / emulator / live cloud).
+
+**Packaging modes (0.7.6 preview).** Contracts can declare, per infrastructure container, whether the product **owns** it (`packaging: isolated` — today's default) or writes into a **platform-owned shared pool** (`shared`, emitted as an OpenTofu data source + leaf-only resources, so a tenant's product structurally cannot destroy the pool). Ownership transitions are guarded: `fluid apply --adopt-shared-container` is required for a shared→isolated flip and logs a WARNING-level audit event. See [RFC-packaging-modes.md](RFC-packaging-modes.md).
 
 ---
 
@@ -107,8 +109,8 @@ Data engineering shouldn't require weeks of handwritten infrastructure code, bes
 **What Terraform did for infrastructure, FLUID Forge does for data products.**
 
 ```bash
-# 1. Install the CLI
-pip install data-product-forge
+# 1. Install the CLI (the [local] extra bundles the DuckDB dev provider)
+pip install "data-product-forge[local]"
 
 # 2. Validate your data product contract
 fluid validate contract.fluid.yaml
@@ -157,10 +159,12 @@ Two different specs share the **ODPS** acronym. FLUID treats **Bitol Open Data P
 
 | Standard | Role | What it is | Spec | CLI selector | `--format` |
 |---|---|---|---|---|---|
-| **Bitol ODPS v1.0.0** | **default** | Open Data Product **Standard**. Bidirectional; product wrapper that references ODCS contracts by `contractId`. | [bitol-io/open-data-product-standard](https://github.com/bitol-io/open-data-product-standard) | `fluid odps --spec bitol-1.0.0` *(default)* | `--format odps` *(default)* / `--format odps-bitol` |
-| **LF/ODPI ODPS v4.1** | opt-in | Open Data Product **Specification**. Hosted by the Linux Foundation / Open Data Product **Initiative** (ODPI). Export-only; single JSON document. | [Open-Data-Product-Initiative/v4.1](https://github.com/Open-Data-Product-Initiative/v4.1) | `fluid odps --spec odps-4.1` | `--format odps-v4.1` |
+| **Bitol ODPS v1.0.0** | **default** | Open Data Product **Standard**. Bidirectional; product wrapper that references ODCS contracts by `contractId`. | [bitol-io/open-data-product-standard](https://github.com/bitol-io/open-data-product-standard) | `fluid odps export --spec bitol-1.0.0` *(default)* | `--format odps` / `--format odps-bitol` |
+| **LF/ODPI ODPS v4.1** | opt-in | Open Data Product **Specification**. Hosted by the Linux Foundation / Open Data Product **Initiative** (ODPI). Export-only; single JSON document. | [Open-Data-Product-Initiative/v4.1](https://github.com/Open-Data-Product-Initiative/v4.1) | `fluid odps export --spec odps-4.1` | `--format odps-v4.1` |
 
 Bitol export emits **1 ODPS doc + N sibling `<contractId>.odcs.yaml`** fragments; import reverses it — a single ODPS file, a directory bundle, or a lone ODCS file all converge on one validated FLUID contract (and `fluid forge --seed-from <path>` accepts the same three shapes as an AI-authoring seed).
+
+**Bitol v1.1.0** (the RFC 0029 top-level data-product `type`, mapping FLUID's SDP / ADP / CDP to `sourceAligned` / `aggregate` / `consumerAligned`) is supported opt-in via `--api-version v1.1.0` or `ODPS_API_VERSION=v1.1.0`; the emit default stays v1.0.0 until v1.1.0 is released upstream. v1.1.0 documents validate and import against their own declared `apiVersion`.
 
 <details>
 <summary>Back-compat aliases</summary>
@@ -188,8 +192,8 @@ The generated Jenkinsfile has a **"Build with Parameters"** dialog where operato
 
 | Param | Default | Purpose |
 |---|---|---|
-| `RUN_STAGE_N_*` (11 booleans) | all `true` | Toggle individual stages |
-| `APPLY_MODE` | `amend` | 6-mode choice |
+| `RUN_STAGE_N_*` (11 booleans) | stages 1–9 `true`; 10 (publish) & 11 (schedule-sync) `false` | Toggle individual stages |
+| `APPLY_MODE` | `dry-run` | 6-mode choice (pick `amend` for an additive apply) |
 | `ALLOW_DATA_LOSS` | `false` | Required for `replace*` outside dev |
 | `PUBLISH_TARGETS` | `datamesh-manager` | Space-separated list |
 | `SCHEDULER` | `` (none) | DAG push target for stage 11 |
@@ -203,15 +207,26 @@ Generated Jenkinsfiles install `fluid` via `pip install data-product-forge` at b
 FLUID Forge is modular — install only what you need. **Requires Python 3.10+.**
 
 ```bash
-pip install data-product-forge                # Minimal — CLI + Local/DuckDB provider
+pip install "data-product-forge[local]"       # Recommended start — CLI + Local/DuckDB provider
+pip install data-product-forge                # Core CLI only (validate/plan/generate; no DuckDB)
 pip install "data-product-forge[gcp]"         # + Google Cloud (BigQuery, GCS, Composer)
 pip install "data-product-forge[aws]"         # + AWS (S3, Glue, Athena, Redshift)
 pip install "data-product-forge[snowflake]"   # + Snowflake
-pip install "data-product-forge[all]"         # Everything (all providers + dev tools)
+pip install "data-product-forge[all]"         # All providers + dev tools (catalog adapters: [catalogs])
 ```
 
 > 💡 **Tip:** We recommend [pipx](https://pipx.pypa.io/) for an isolated global install:
 > `pipx install "data-product-forge[all]"`
+
+### Docker (GHCR)
+
+Every release also publishes a container image to GitHub Container Registry, tagged `latest`, `X.Y.Z`, and `X.Y` — each scanned for HIGH/CRITICAL CVEs before push:
+
+```bash
+docker pull ghcr.io/agenticstiger/forge-cli:latest
+docker run --rm ghcr.io/agenticstiger/forge-cli --version
+docker run --rm -v "$(pwd)":/workspace ghcr.io/agenticstiger/forge-cli validate /workspace/contract.fluid.yaml
+```
 
 Verify, then scaffold your first product:
 
@@ -408,7 +423,7 @@ fluid validate examples\01-hello-world\contract.fluid.yaml
 Everything starts with `contract.fluid.yaml` — the **single source of truth** for your data product's entire lifecycle.
 
 ```yaml
-fluidVersion: "0.7.4"
+fluidVersion: "0.7.5"
 kind: DataProduct
 id: example.customer_360
 name: Customer 360
@@ -448,16 +463,33 @@ exposes:
           type: string
           sensitivity: pii             # ← Triggers auto-masking/encryption
 
-# 3. THE GOVERNANCE — Who (or what) can access it?
+    # 3. THE SEMANTICS — What do the numbers mean?
+    #    Compiles to MetricFlow semantic_models + metrics in the generated
+    #    dbt project, and grounds the governed MCP `query` tool.
+    semantics:
+      entities:
+        - name: customer
+          type: primary
+          expr: user_id
+      measures:
+        - name: lifetime_value
+          agg: sum
+          expr: LTV
+
+    # 4. THE GOVERNANCE — Which agents can read it, and for what?
+    policy:
+      agentPolicy:                     # ← Agentic Era Governance
+        allowedModels: ["gpt-4", "claude-3"]
+        allowedUseCases: ["analysis", "summarization"]
+
+# Who (or what) can access it?
 accessPolicy:
   grants:
     - principal: "group:marketing@example.com"
       permissions: ["read"]
-
-agentPolicy:                           # ← Agentic Era Governance
-  allowedModels: ["gpt-4", "claude-3"]
-  allowedUseCases: ["analysis", "summarization"]
 ```
+
+This exact contract validates as-is: `fluid validate contract.fluid.yaml` → `✅ Valid FLUID contract (schema v0.7.5)`.
 
 ---
 
@@ -468,11 +500,14 @@ Providers are the bridge between your declarative contract and your target execu
 | Provider | Target Ecosystem | Superpowers |
 |----------|-----------------|-------------|
 | 💻 **local** | DuckDB, Local FS | Zero-config. Runs anywhere. Perfect for dev/test. |
-| ☁️ **gcp** | Google Cloud | BigQuery, GCS, Composer (Airflow), Dataform, IAM. |
+| ☁️ **gcp** | Google Cloud | BigQuery, GCS, Composer (Airflow), Dataform, IAM, BigLake Iceberg. |
 | 🌩️ **aws** | Amazon Web Services | S3, Glue, Athena, Redshift, MWAA, IAM. |
-| ❄️ **snowflake** | Snowflake | Databases, schemas, streams, tasks, RBAC, sharing. |
+| ❄️ **snowflake** | Snowflake | Databases, schemas, streams, tasks, RBAC, sharing, Iceberg tables (auto-provisioned external volumes). |
+| 🔗 **confluent** | Confluent Cloud | Managed Kafka → Iceberg (Tableflow topics + Glue catalog integration). |
 
 > Open-data-standard **export formats** (not cloud providers): **ODPS** (Open Data Product Standard — Bitol / LF-ODPI) via `fluid odps`, plus **odcs** and **datamesh-manager** integrations.
+
+> **Streaming exposes** compile to Kafka Connect / Debezium sink configs — including managed Iceberg tables on Snowflake and BigQuery. `fluid apply` provisions the prerequisites dbt refuses to create (external volumes, GCS buckets), and `fluid validate` gates any Iceberg expose missing a required input before it can silently no-op. See [RFC-streaming-extension.md](RFC-streaming-extension.md).
 
 ---
 
@@ -495,12 +530,45 @@ fluid ship contract.fluid.yaml       # One-shot macro: validate → bundle → p
 
 ```bash
 fluid forge                                  # 🤖 Interactive, AI-powered project creation
+fluid forge --offline                        # Same flow, no LLM / no network (air-gapped, CI)
+fluid forge --watch                          # Re-forge automatically when the source data changes
 fluid generate-airflow contract.fluid.yaml   # Compile contract → native Airflow DAG
-fluid generate-pipeline contract.fluid.yaml  # Scaffold transformation code
+fluid generate transformation contract.fluid.yaml  # Scaffold dbt/SQL transformation code
+fluid generate-pipeline --provider github_actions  # CI/CD pipeline configs (7 systems)
 fluid generate iac contract.fluid.yaml       # Emit a deterministic OpenTofu main.tf.json
+fluid generate vector contract.fluid.yaml    # pgvector RAG target — embeddings table + ANN index
 fluid stats                                  # Aggregate LLM cost across forge runs
 fluid agents list                            # List / show / prune forge runs (.fluid/agents/)
+fluid plugins list                           # Installed plugins (providers, exporters, commands)
 ```
+
+Forge is extensible: third-party packages can register custom LLM providers and exporters via Python entry points — `pip install` them and they appear in `fluid plugins list` / `fluid exporters`, no core edit needed.
+
+### Brownfield import & reconciliation
+
+```bash
+# dbt manifest → FLUID contract(s). --split-by folder|group emits one product
+# per boundary, with cross-split ref()s becoming cross-product consumes[].
+fluid import dbt ./my_dbt_project --split-by group --out ./products
+
+fluid verify contract.fluid.yaml --reconcile-dbt      # Contract schema vs dbt schema.yml drift
+fluid verify contract.fluid.yaml --reconcile-lineage  # Declared vs observed lineage (local-only)
+```
+
+Generated dbt projects close the loop the other way: enforced model contracts (`--model-contracts`), `sources.yml` freshness from the contract's SLOs, MetricFlow `semantic_models` + `metrics` YAML from the `semantics` block, and dbt Fusion (v2) compatibility out of the box.
+
+### Missions — deep agents with verifiable goals
+
+A mission is a YAML spec pairing a plain-language goal with **code-owned success criteria** — the criteria, not the model, decide when work is done.
+
+```bash
+fluid mission check mission.yaml contract.fluid.yaml  # Zero-LLM scorecard — drops straight into CI
+fluid mission run mission.yaml                        # Autonomous loop with USD/wall-clock/iteration budgets
+fluid mission trust mission.yaml                      # Pin a workspace spec's content hash (direnv-style)
+fluid mission list                                    # Built-ins: gdpr-clean, quality-coverage
+```
+
+See [RFC-deep-agents.md](RFC-deep-agents.md) for the trust-pinning and gating model.
 
 ### Staged Forge Pipeline (v1.0)
 
@@ -565,8 +633,8 @@ templates (Caddy / nginx) for production mTLS.
 ### Visualization
 
 ```bash
-fluid graph contract.fluid.yaml   # Graphviz DAG of internal lineage
-fluid docs contract.fluid.yaml    # Auto-generate documentation from contract
+fluid viz-graph contract.fluid.yaml    # Render the contract's internal DAG (SVG; --mesh for the cross-product mesh)
+fluid docs --src ./products --out ./site   # Auto-generate a docs site from every contract under --src
 ```
 
 ### Diagnostics
@@ -590,7 +658,10 @@ fluid init --template customer-360
 | `hello-world` | The basics — start here |
 | `incremental-processing` | Append/Merge load patterns |
 | `multi-source` | Complex DAG dependency orchestration |
-| `policy-examples` | Advanced RBAC and AI agent governance |
+| `customer-360` | Customer analytics quickstart |
+| `data-quality-validation` | Quality rules and contract test patterns |
+
+For advanced RBAC and AI-agent governance patterns, see [`examples/policy-examples/`](examples/policy-examples/).
 
 ---
 
