@@ -329,14 +329,14 @@ jobs:
   # 2026-07-28: the SDK's 2.0.0 shipped and removed ``mcp.server.fastmcp``.
   # pyproject.toml caps at `mcp>=1.20,<2.0`, so user installs never resolve
   # 2.x — the "latest" leg below is the early-warning canary for the 2.x
-  # port and stays continue-on-error until that port lands.
+  # port. The canary must never paint a red check row (repo policy: every
+  # check green or no merge — an upstream SDK event must not block every
+  # PR), so it reports drift via a ::warning annotation + step summary and
+  # exits green. Once the 2.x port lands and has a green track record,
+  # remove the warn-wrapper so the leg becomes hard-blocking.
   mcp-sdk-drift:
     name: MCP SDK Drift (mcp ${{ matrix.mcp-version }})
     runs-on: ubuntu-latest
-    # The unbounded "latest" leg is informational: red there means the next
-    # SDK major needs a port, not that users are broken (the pyproject
-    # ceiling shields installs). The supported-range legs stay blocking.
-    continue-on-error: ${{ matrix.mcp-version == 'latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -348,8 +348,8 @@ jobs:
         #               (`mcp>=1.20,<2.0`) — what a fresh
         #               `pip install data-product-forge` resolves today
         # "latest"    = newest release on PyPI, ignoring our ceiling —
-        #               early warning for the next-major port (informational,
-        #               see continue-on-error above)
+        #               early warning for the next-major port (warn-only,
+        #               see the job comment above)
         mcp-version: ["1.20", "range-max", "latest"]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -370,12 +370,40 @@ jobs:
           pip show mcp | head -3
       - name: Run MCP-touching tests
         run: |
-          python -m pytest \
-            tests/cli/test_scaffold_ide.py \
-            tests/cli/test_mcp_sampling_provider.py \
-            tests/cli/test_mcp_forge_run_live.py \
-            tests/cli/test_mcp_sdk_client_e2e.py \
-            -q
+          set -o pipefail
+          run_mcp_tests() {
+            python -m pytest \
+              tests/cli/test_scaffold_ide.py \
+              tests/cli/test_mcp_sampling_provider.py \
+              tests/cli/test_mcp_forge_run_live.py \
+              tests/cli/test_mcp_sdk_client_e2e.py \
+              -q
+          }
+          if [ "${{ matrix.mcp-version }}" != "latest" ]; then
+            run_mcp_tests
+          elif run_mcp_tests 2>&1 | tee mcp-latest-tests.log; then
+            {
+              echo "## ✅ MCP SDK drift canary"
+              echo ""
+              echo "The MCP-touching tests pass against the newest mcp release on PyPI."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Canary tripped: newest mcp on PyPI breaks the MCP surfaces.
+            # Users are shielded by the pyproject ceiling; the port is
+            # tracked work. Warn loudly, exit green — never a red row.
+            echo "::warning title=MCP SDK drift (latest)::MCP-touching tests FAIL against the newest mcp release on PyPI. User installs are shielded by the pyproject.toml ceiling; the next-major port is due. See the step summary and log."
+            {
+              echo "## ⚠️ MCP SDK drift canary TRIPPED"
+              echo ""
+              echo "The newest \`mcp\` release on PyPI breaks the MCP-touching test files."
+              echo "User installs are shielded by the \`pyproject.toml\` version ceiling."
+              echo ""
+              echo "Last 40 log lines:"
+              echo '```'
+              tail -40 mcp-latest-tests.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   build-check:
     name: Build Smoke Test
