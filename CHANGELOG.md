@@ -7,6 +7,593 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-07-28
+
+A live-verification hardening release: the dbt Iceberg loop reaches BigQuery
+behind a new validate-time no-op gate, 104 defects fixed and proved against a
+real Snowflake account, and DOT-injection, secret-redaction and
+leak-prevention security work.
+
+### Security
+
+- **`fluid viz-graph` escapes contract-authored text before it reaches
+  generated DOT source.** Mesh node/edge labels were interpolated verbatim, so
+  a product label like `X" label="SPOOFED` injected a second `label` attribute
+  and let a contract display a name of its choosing — including another
+  product's — in the rendered mesh graph; node IDs were interpolated unquoted
+  through a denylist that missed `"` and `\`, letting a `consumes[].ref`
+  inject phantom nodes into the lineage graph; and an unescaped trailing
+  backslash failed the entire render. Both shared helpers are fixed (allowlist
+  IDs, backslash-then-quote label escaping), covering the legacy inline
+  emitter and `viz_renderers/dot.py`. (#481)
+- **Secret redaction rewritten to redact by exact known value.** The previous
+  regex-based approach guessed a secret's extent from its shape and leaked 17
+  known inputs; redaction is now delimiter-agnostic by construction, masking
+  the literal values it knows. (#478)
+- **Commits carrying values from the committer's own environment are
+  refused.** A new pre-commit/CI hook flags any diff line byte-identical to a
+  non-trivial value in the committing machine's environment (`SNOWFLAKE_*`,
+  `AWS_*`, `*_TOKEN`, `*_PASSWORD`, …) or a supplied `--env-file` — the
+  low-entropy identifiers (account locators, usernames) that secret-shape
+  scanners cannot see — and never prints the matched value. `detect-secrets`
+  now also actually runs in CI, on changed files. (#479)
+- **Vulnerability reports route through GitHub Private Vulnerability
+  Reporting.** `SECURITY.md` now points at PVR (email stays as the fallback)
+  and the supported-versions table reflects the released 0.13.x line. (#473)
+
+### Added
+
+- **The dbt Iceberg loop extends to BigQuery.** An `iceberg` expose on a GCP
+  binding — which previously fell through the emit dispatch and produced
+  nothing, silently — now emits `catalogs.yml` with
+  `catalog_type: biglake_metastore` and provisions the GCS bucket dbt refuses
+  to create. The IaC bucket name is derived from the same warehouse URI dbt
+  writes into `external_volume`, so the bucket dbt loads into is always the
+  bucket the IaC creates and governs, and whole-bucket `force_destroy` is
+  dropped when the product owns only a prefix of a shared warehouse root.
+  (#474)
+- **Validate-time anti-no-op gate for Iceberg prerequisite bindings.** The
+  Snowflake and GCP IaC emitters skip an Iceberg expose missing a required
+  input rather than emitting a broken resource — previously the user found out
+  at `dbt run`. `fluid validate` now errors on exactly those cases, naming the
+  missing field; each check mirrors one emitter skip-branch and the pairing is
+  test-pinned in both directions. Note for CI: under `--strict`, Snowflake
+  catalogs that authenticate with secrets (polaris / unity / rest / nessie)
+  now fail, since the emitted module is credential-free and strict promotes
+  that existing warning. (#475)
+
+### Fixed
+
+- **Snowflake builds actually run on Snowflake.** Embedded-SQL builds on a
+  `platform: snowflake` contract executed against local DuckDB (exit 0 either
+  way); `--model-contracts` flattened every parameterized/alias type to
+  `VARCHAR(16777216)`, so contract enforcement passed vacuously; generated
+  `profiles.yml` ignored the contract's schema and silently targeted `PUBLIC`;
+  a freshly generated project failed its own contract on first `dbt run`; and
+  a `freshness` dq rule made the generated project unparseable. Part of a
+  104-defect wave found by exercising a month of shipped features against a
+  real Snowflake account, every fix re-verified by a second agent re-running
+  the original failing scenario. (#476, #478)
+- **`fluid import dbt` → `apply` → `verify` round-trips cleanly.** Importing
+  then applying no longer creates a duplicate lowercase shadow namespace
+  (`+2 ~2 -0` → `+0 ~2 -0`), `verify` can read the real objects through
+  `snowflake_view`, and a p90 metric no longer silently round-trips into a
+  median. (#476)
+- **`fluid publish` no longer silently skips contract-declared catalog
+  targets** (an `ImportError` swallowed by a bare `except`), and apply hooks
+  now run on the OpenTofu path, making `--env` plumbing reachable for
+  Snowflake / AWS / GCP applies. (#476)
+- **Governed access enforcement holds under aliasing.** The governed `query`
+  path now enforces `policy.authz.columnRestrictions` (a denied column was
+  readable as a measure), and PII redaction can no longer be bypassed by
+  aliasing a restricted column — policy was previously checked on the output
+  column name, which the semantic layer aliases away. (#478)
+- **Data-quality test reporting is truthful.** A failing `severity: critical`
+  rule no longer reports PASS with exit 0; `accuracy` rules evaluate upper
+  bounds instead of only `MIN()`; `summary.checks_passed` no longer counts
+  warnings and failed criticals as passed; `--no-data` no longer asserts
+  checks it never performed; and `--engine soda` can now actually produce
+  checks (the schemas never defined the `exposes[].quality.tests[]` key it
+  reads). (#478)
+- **ODCS export/import fidelity.** Export no longer flattens every
+  parameterized type to `logicalType: string`, round-trips no longer lose 88
+  of 114 leaf fields, and `odcs import` no longer rewrites a Snowflake binding
+  to `bigquery` while reporting success — now validated against the official
+  ODCS schema. (#478)
+- **`--adopt-shared-container` respects per-exposure `binding.packaging`
+  overrides.** Flipping one binding no longer absorbs a shared platform pool
+  into the tenant's state (which erased the pool's COMMENTs); transition
+  scoping now keys on which container is nested where, not on resource type.
+  (#478)
+
+## [0.13.1] — 2026-07-26
+
+A security + interoperability release on top of 0.13.0: two path-confinement
+security fixes, the dbt importer's product-boundary split, the Snowflake
+Iceberg dbt loop, Bitol ODPS v1.1.0 support, and OpenLineage emission that
+real consumers can actually ingest.
+
+### Security
+
+- **`binding.location.dbFile` is now confined to `--readable-paths`.** The
+  DuckDB output-port driver gated `binding.location.path` and `.attach`
+  against the operator's allowlist but passed `dbFile` raw to
+  `duckdb.connect`, so a served contract could open and read any host
+  database — a read-side sandbox escape. `dbFile` now flows through the same
+  resolve-and-contain gate as its siblings (`:memory:` passes through;
+  no-allowlist behaviour is unchanged). (#463)
+- **Document-controlled ids are contained in exporter filenames.** A contract
+  with a traversal-shaped `exposeId` run through
+  `fluid generate artifacts --out dist` could write an attacker-influenced
+  file outside `--out` — and `MANIFEST.json` would bless the escaped path.
+  New `providers/_path_safety.py` (the filename sibling of `_sql_safety.py`)
+  passes schema-valid FLUID ids through verbatim, cleans-plus-digests
+  anything else, and re-checks the resolved path against the output root at
+  all three write sites; manifest emitters derive names through the same
+  helper. Verified against 204k+ separator/control-char cases and a full
+  Unicode sweep with zero escapes and zero canonical-layout changes. (#472)
+
+### Added
+
+- **`fluid import dbt --split-by {project|folder|group}`** splits a dbt
+  manifest into multiple data products along folder or dbt-group boundaries
+  (`project` remains the byte-stable single-contract default). Cross-split
+  `ref()`s become cross-product `consumes[]`, `--out` becomes the output
+  directory for multi-contract imports, and dbt ≥1.10 manifests with
+  `arguments:`-nested test params now import correctly alongside legacy flat
+  kwargs. In passing, model-level expose descriptions are now scrubbed like
+  their column/semantic siblings (closing a hostile-Jinja smuggling path into
+  generated `schema.yml`), and no-columns exposes emit a schema-valid
+  contract. (#465)
+- **Snowflake Iceberg loop for dbt, both halves.** `fluid generate` emits
+  dbt's `catalogs.yml` (v1 schema, Snowflake adapter) for Iceberg exposes,
+  and `fluid apply` provisions the prerequisites dbt refuses to create — the
+  EXTERNAL VOLUME for Snowflake-managed catalogs and the AWS Glue CATALOG
+  INTEGRATION. A single deterministic naming helper is shared by both
+  emitters, so the volume `fluid apply` creates carries exactly the name
+  `catalogs.yml` references (explicit override honoured via
+  `binding.icebergConfig.properties`). Live-verified with a real
+  `tofu apply`. (#469, #470)
+- **Bitol ODPS v1.1.0 top-level `type`** (approved RFC 0029):
+  `sourceAligned` / `aggregate` / `consumerAligned` map 1:1 and
+  bidirectionally to FLUID's SDP / ADP / CDP classification. The default emit
+  target stays v1.0.0 until Bitol cuts the release; opt in via
+  `--api-version` / `ODPS_API_VERSION`. Validation keys on the document's own
+  `apiVersion`, and custom org types round-trip verbatim. (#471)
+- **Declared `consumers:` block in the 0.7.6 preview schema.** Contracts can
+  now declare their downstream consumers — dashboards, notebooks, ML systems,
+  applications — with a shape borrowed from dbt exposures (`name` / `label` /
+  `type` / `owner` / `url` / `maturity`) plus FLUID-native `exposeIds` tying
+  a consumer to specific output ports. Additive and optional; preview schema
+  only, no GA change. (#466)
+
+### Changed
+
+- **CI:** routine pinned-action bumps. (#454, #455, #456, #457, #458)
+
+### Fixed
+
+- **OpenLineage events are now spec-conformant — and actually emitted.** The
+  emitter historically produced payloads no OpenLineage consumer would accept
+  (missing required `producer`/`schemaURL`, flattened `run`/`job` structure,
+  non-UUID `runId`) and was never wired up, so zero events were ever sent.
+  Emission now routes through `openlineage-python` at the acquisition-runner
+  chokepoints (all six engines, no per-runner wiring), honours the standard
+  `OPENLINEAGE_URL` so an existing Marquez/DataHub deployment just works, and
+  redacts run facets and stream names before anything leaves the machine.
+  ODCS contract publishing also moves onto OpenMetadata's first-class Data
+  Contracts entity. (#467)
+- **`fluid-schema-0.7.5.json` no longer breaks YAML-based consumers.** Six
+  emoji in the GA schema's description were encoded as UTF-16 surrogate-pair
+  escapes — valid JSON, but rejected by libyaml, so tooling that reads JSON
+  Schema through a YAML parser (e.g. `datamodel-code-generator`) could not
+  process the schema at all. The escapes are now literal characters (a
+  lossless, one-line change), and a new guard test asserts every bundled
+  schema stays surrogate-free and YAML-round-trippable. (#451)
+- **Safety-gate override audit events now log at WARNING, as documented.**
+  `opentofu_destructive_gate_override` (`--allow-data-loss`) and
+  `packaging_adoption_override` (`--adopt-shared-container`) were emitted at
+  INFO — invisible to audit pipelines filtering at WARNING and above. Event
+  names and payloads are unchanged. (#450)
+
+## [0.13.0] — 2026-07-18
+
+A packaging + autonomy + semantics-correctness release: declarative
+`isolated`/`shared` infrastructure packaging, the new autonomous `fluid
+mission` surface, the Apache Ossie resync, and a wave of fixes that make the
+`semantics` block return right numbers through every consumer.
+
+### Security
+
+- **dbt manifest import hardened against Jinja exfiltration in recovered
+  free-text fields.** A hostile `manifest.json` carrying e.g.
+  `{{ env_var('AWS_SECRET_ACCESS_KEY') }}` in a tag or description could render
+  the secret into the operator's own artifact after import → generate →
+  `dbt parse`. Display/governance text is now stripped of Jinja spans (fixpoint
+  loop, so no delimiter survives by reforming at a gap junction), with each
+  redaction reported; SQL-bearing fields (`expr`, metric `filter`) are preserved
+  verbatim, with any non-MetricFlow templating surfaced as a
+  review-before-generate risk. (#449)
+
+### Added
+
+- **Declarative packaging modes: contracts can declare infrastructure containers
+  `isolated` (product-owned, today's behavior) or `shared` (referenced from a
+  platform pool).** The 0.7.6-preview schema gains a `packaging` block
+  (contract-wide default, per-binding override, per-kind `containers` map for
+  hybrid tiers); the AWS/GCP/Snowflake IaC emitters emit a data source instead
+  of a managed resource for referenced pools, so a product can never own or
+  destroy shared platform infrastructure; shared-bucket grants are always
+  prefix-scoped and fail closed when `location.path` is missing; a pre-plan
+  ownership-transition guard blocks `isolated`→`shared` flips that would plan a
+  pool DESTROY and gates `shared`→`isolated` adoption behind the new
+  `--adopt-shared-container` flag; and `plan.json` gains a digest-covered
+  `packaging` summary that itemises dropped container-creation actions.
+  Contracts without the block emit byte-identical output, enforced by a golden
+  pin over every example contract. Two IAM-widening bugs and a CEL-condition
+  injection introduced during implementation were caught and fixed by the
+  series' own security pass before merge. (#432, #433, #435, #441)
+- **Mission-based deep agents: `fluid mission check | trust | list | run`.**
+  Declarative YAML mission specs (goal, success criteria, budgets, gates, tool
+  allowlist) with direnv-style content-hash trust pinning for workspace specs;
+  `fluid mission check` is a zero-LLM scorecard usable as a standalone CI gate;
+  `fluid mission run` drives a VERIFY-anchored loop in which only code-owned
+  checks — never the LLM — can declare success, with hard USD / wall-clock /
+  iteration budgets, a fail-closed destructive-diff gate, and
+  resume-by-re-verification (`--resume`). Ships `gdpr-clean` and
+  `quality-coverage` built-in missions. A HIGH path traversal in run-manifest
+  handling was found and fixed by the series' own security pass before merge.
+  (#432, #434, #436)
+- **Apache Ossie resync + conformant interchange sidecar.** The OSI
+  implementation resyncs to the current Apache Ossie core-spec (`BIGQUERY` +
+  `MAQL` dialects, free-form vendors, plain-string `ai_context`), and the
+  `.semantics.osi.*` sidecar is now a valid Ossie document (root wrapper,
+  internal-only fields relocated into `custom_extensions`) validated against the
+  vendored upstream JSON Schema. New `--osi-sidecar-format json` emits the shape
+  dbt Core v1.12+ reads natively, so forge output becomes queryable through the
+  dbt semantic layer — and consumable by the upstream Ossie converters — with
+  zero conversion. (#438)
+- **The dbt importer recovers the semantic layer.** `fluid import dbt` now maps
+  manifest `semantic_models` and project-level metrics (simple / ratio /
+  derived, including where-filters) onto the owning expose's `semantics` block —
+  entities, dimensions with normalized time grains, measures, and
+  `defaultAggTimeDimension` — with a degrade-loudly posture: every unmappable
+  feature lands in `report.unsupported` instead of vanishing. (#442)
+- **Every template product ships a queryable semantics block.** All five
+  templates (analytics / etl_pipeline / ml_pipeline / starter / streaming)
+  derive a conservative, deterministic semantics block from their columns, so
+  template-mode products get the governed MCP `query` tool and MetricFlow export
+  out of the box instead of after hand-authoring; templates can still override
+  with an explicit spec. (#443)
+
+### Changed
+
+- **Cross-account / cross-project access is now live-proven at the emulator
+  tier.** New gated tests drive bilateral cross-account Lake Formation +
+  prefix-scoped S3 bucket policies through `tofu apply` against a two-account
+  LocalStack Pro instance (the emitted bucket policy proven to be the deciding
+  access control under `ENFORCE_IAM=1`), and cross-project BigQuery
+  `dataset.access[]` entries through the BQ emulator; what the emulators cannot
+  prove is recorded explicitly in `HONESTLY_TESTED.md`. (#446, #448)
+- **Tier-1 semantic-layer RFC published.** Design RFC at repo root covering the
+  five audit-ranked gaps — cumulative metrics, structured filters, time spine +
+  null filling, relationships, and SCD validity params — all additive and
+  0.7.6-preview-gated. (#445)
+
+### Fixed
+
+- **Metric filters are honored on the governed query path, and `percentile`
+  gains real parameters.** A metric filter like `status = 'completed'` was
+  silently dropped by the MCP query compiler — unfiltered numbers, no error —
+  while the dbt export honored it; the filter is now allowlist-validated and
+  ANDed into the WHERE alongside caller filters and policy rowFilters, with
+  hostile or unbalanced-paren filters failing closed. `agg: percentile` gains
+  the 0.7.6-preview `measures[].aggParams` (`percentile`,
+  `useDiscretePercentile`), rendered as `PERCENTILE_CONT/DISC(p) WITHIN GROUP`
+  and failing closed on engines without grouped ordered-set percentiles. (#439)
+- **Forge-emitted measures no longer double-aggregate.** The emitter copied
+  whole aggregate calls (`SUM(amount)`) into `measures[].expr` next to an
+  inferred `agg`, so the query compiler rendered invalid `SUM(SUM(amount))` and
+  the dbt bridge exported the same double wrap. A shared semantics builder now
+  splits single-aggregate expressions into `agg` + inner expr (including
+  `COUNT(DISTINCT …)` → `count_distinct`), the time-grain vocabulary is
+  single-sourced with all aliases normalized (interview input included), and
+  `defaultAggTimeDimension` is populated by both producers. (#440)
+- **Metric owner + tags/labels round-trip through dbt.** `metrics[].owner` and
+  semanticModel `tags`/`labels` were dead schema surface — no producer, no
+  consumer. They now emit into MetricFlow `config.meta` (namespaced
+  `fluid_tags` / `fluid_labels`) and the manifest importer recovers them, so the
+  governance surface survives contract → dbt → contract. (#444)
+- **IaC access grants read from the schema-valid `accessPolicy` surface.** The
+  GCP emitter read `metadata.policies` — a shape every shipped schema rejects —
+  so a cross-project-access contract could emit but never validate. Grants now
+  come from `accessPolicy` (the deprecated `metadata.policies` surface is still
+  appended, so a mid-migration contract drops nothing), and typed principals fix
+  a latent bug where every `group:` address was emitted as `user_by_email`.
+  (#447)
+
+## [0.12.0] — 2026-07-18
+
+The dbt-core integration release: generated dbt projects gain source freshness,
+enforced model contracts, auto-pinned packages, MetricFlow semantic models, and
+dbt Fusion (v2) compatibility; a faithful `manifest.json` importer brings
+brownfield dbt projects into fluid contracts; contract schema 0.7.5 goes GA;
+and `fluid verify` learns to reconcile declared vs observed lineage.
+
+### Security
+
+- **Docker image: fixable OS-package CVEs are now patched at build time.** The
+  `Dockerfile` runs `apt-get upgrade` during the build so the published image
+  ships without known-fixable OS CVEs, and the Grype ignore list was re-curated
+  down from 4 suppressions to 1 (a documented, unreachable `html.parser` DoS
+  with a removal trigger) — un-blocking the release pipeline's HIGH/CRITICAL
+  CVE gate. (#412)
+
+### Added
+
+- **`fluid import dbt` — faithful brownfield dbt importer.** A new
+  manifest-based importer (`fluid import dbt <project-dir | manifest.json>`,
+  manifest schema v9+) replaces the old 5-model regex scanner: every enabled
+  model/seed/snapshot becomes an expose with real column types (`catalog.json`
+  overlay when present), `ref()` lineage becomes `consumes[]` + a per-step
+  transformation DAG, generic dbt tests map back to `dq.rules[]` via the shared
+  reverse mapping table, source freshness becomes `qosExpectations`, and
+  everything skipped is accounted for in the import report. Pure stdlib —
+  no dbt-core dependency. (#424)
+- **Generated dbt projects emit `sources.yml` freshness from contract SLOs.**
+  `exposes[].qos.freshnessSLO` and consumer `qosExpectations.freshnessMax`
+  now become `warn_after` / `error_after` blocks (with `loaded_at_field`
+  derived from the acquisition cursor where resolvable), so `dbt source
+  freshness` operationalizes the contract's freshness promise instead of
+  silently dropping it. (#419)
+- **Opt-in dbt model contracts.** `fluid generate transformation
+  --model-contracts` emits `contract: {enforced: true}` with adapter-correct
+  per-column `data_type` (BigQuery / Snowflake / Redshift / DuckDB matrices)
+  and `not_null` / `primary_key` constraints on every expose model, so
+  `dbt build` fails in producer CI whenever the model's output drifts from
+  `exposes[].contract.schema`. Without the flag the generated project is
+  byte-identical to before. (#422)
+- **`packages.yml` is now emitted alongside generated tests.** Projects whose
+  tests reference `dbt_utils.*` / `dbt_expectations.*` get a managed
+  `packages.yml` with only the needed range-pins (folded into
+  `dependencies.yml` under `--mesh-hub`; user-managed files are never
+  overwritten), so generated projects pass their own `dbt parse` gate out of
+  the box. Also fixes the emitted `dbt_utils.recency` test, which carried a
+  non-dbt `_fluid_window` kwarg that failed `dbt compile` — recency windows
+  now derive honestly from the dq rule's ISO-8601 window. (#425)
+- **MetricFlow bridge: `semantic_models.yml` from the contract semantics
+  block.** `fluid generate transformation` now emits `semantic_models:` +
+  `metrics:` YAML (plus the required day-grain time-spine model) from
+  `exposes[].semantics`, with parse-strictness defaulting for primary
+  entities, agg time dimensions, and metric references — verified against a
+  real `dbt parse`. Contracts without semantics produce byte-identical
+  output. (#426)
+- **dbt Fusion (dbt Core v2) compatibility.** The runner now detects the
+  engine flavor from `dbt --version` (`fusion` vs `core`), so Fusion users run
+  natively instead of being silently punted to the Docker pip-install
+  fallback; `fluid doctor` reports the detected engine and the welcome scan
+  annotates the dbt row; `$DBT_EXECUTABLE` is honoured by the parse gate. The
+  generated YAML is engine-aware too: `--dbt-tests-key auto|tests|data_tests`
+  (env `FLUID_DBT_TESTS_KEY`) auto-detects the user's dbt and emits
+  `data_tests:` for Fusion / core ≥ 1.8 while keeping the legacy `tests:`
+  spelling for older cores — Fusion's strict parser no longer rejects
+  generated projects. (#423, #429)
+- **dbt build results close the loop into run records and verify.**
+  `fluid apply --mode amend-and-build` now parses `target/run_results.json`
+  after `dbt build` into per-test run records — `fluid runs status` shows each
+  dbt test with its status and failure counts, and `fluid verify` gains
+  transformation checks (`dbt_tests_passed`, no error-severity failures) that
+  gate the exit code under `--strict`. (#420)
+- **`fluid verify --reconcile-lineage`.** A local-only cross-check (no
+  network) that the contract's declared lineage (`consumes[]` / `exposes[]`)
+  agrees with what was actually observed (run records + cursor state) and
+  what would be published (the catalog registrar payload, rebuilt locally).
+  Drift classes: `declared_but_never_read` (soft), `read_but_undeclared` and
+  `publish_payload_mismatch` (critical, gate under `--strict`). (#430)
+
+### Changed
+
+- **Contract schema 0.7.5 is now stable (GA); 0.7.6 opens as the next
+  preview.** Untagged contracts now validate against 0.7.5 (was 0.7.4),
+  graduating the Redshift-Serverless/Kinesis `bindingLocation` fields, the
+  vector/embeddings `vectorConfig` output port, and the streaming
+  Kafka→Iceberg surface. Note: untagged contracts' plan/bundle digests churn
+  once on upgrade; explicitly-tagged contracts are unaffected. (#431)
+- **One shared contract→dbt-test mapping across all three generation paths.**
+  The engine, exporter, and copilot generators now delegate to a single
+  module, so they can no longer drift: `relationships` tests now derive from
+  the engine and exporter paths (previously copilot-only), numeric ranges
+  standardize on `dbt_expectations.expect_column_values_to_be_between`
+  (retiring `dbt_utils.accepted_range`), and freshness/recency now surfaces
+  in the engine path. A symmetric reverse table powers the manifest
+  importer. (#421)
+- **CI: the overloaded Python 3.12 test leg was split**, moving the coverage
+  run and gates into a parallel `coverage-and-audit` job so no matrix leg
+  exceeds ~8 minutes. (#428)
+
+### Fixed
+
+- **Copilot enrichment now writes schema-valid contracts.** `fluid forge`'s
+  `--apply-enrichment` pass wrote five slots the schema rejects, so every
+  enriched contract failed `fluid validate`; enrichment data now lands in
+  schema-valid locations (`qos.freshnessSLO` + a `dq.rules[]` freshness rule,
+  the `extensions.enrichment.*` namespace, `binding.properties.physical`),
+  and re-applying migrates contracts enriched by older versions. The quality
+  engine also now parses the ISO-8601 `dqRule.window` format the schema
+  requires (`PT6H`, not just `6h`), and a declared-but-unparseable window
+  fails the check loudly instead of silently disabling the gate. (#417)
+- **Retired the intermittent test-leg hang and the last `datetime.utcnow()`
+  calls.** All 18 remaining `utcnow()` sites are now timezone-aware
+  (removing the 3.12+ deprecation warnings that fed an unbounded mcp 1.x
+  warning-relogging loop — filed upstream with a minimal repro), the test
+  suite isolates root-logger state, and hosted-MCP operations gained a
+  wall-clock bound via `FLUID_HOSTED_MCP_TIMEOUT_SECONDS` (default 120s).
+  (#418)
+
+## [0.11.0] — 2026-07-13
+
+A forge-UX + AI-tooling feature release: arrow-key menus, `--offline` and
+`--watch` modes, multi-provider AI config with an LLM-provider plugin system,
+a layered prompt-customization stack, nine new domain agents, opt-in agent
+tools, a pgvector RAG output port, and contract↔dbt reconciliation — plus SQL-
+safety and redaction hardening. No breaking changes (the bare `odps` emit key
+becomes a deprecated alias for `opds`).
+
+### Security
+
+- **Four remaining SQL string-literal sites route through the central
+  `quote_string_literal` helper** (local DuckDB provider, IAM policy compiler,
+  Meltano runner, MCP DuckDB driver). The local provider used `repr()`, which
+  emitted double quotes — so any CSV/Parquet path containing a single quote
+  (e.g. `/tmp/o'brien/data.csv`) broke the `read_csv_auto` / `read_parquet`
+  load outright. (#387)
+- **Six redaction-symmetry gaps closed** between the global secret redactor and
+  the Snowflake-local twin: bare `passphrase=` values, quoted-JSON
+  `"credentials"` keys, `auth` / `conn_str` / `connection_url` dict keys,
+  generic (non-`eyJ`) three-segment JWTs, and bare `private_key=` values are
+  now masked by both layers. (#389)
+- **Exception text no longer leaks.** The `read_logical_model` copilot tool
+  returns typed errors instead of interpolating raw exception strings into the
+  LLM context; the always-on logging redaction filter now scrubs exception
+  *objects* (the pervasive `LOG.warning("… %s", exc)` shape); and litellm
+  exception text in user-facing error messages is routed through the secret
+  redactor. (#392, #394)
+
+### Added
+
+- **Arrow-key navigation for every interactive menu.** ↑/↓ (and vim `k`/`j`)
+  plus Enter on a real TTY across all seven forge / ai-setup menus, degrading
+  cleanly to the numbered prompt in CI, pipes, and non-TTY shells; opt out with
+  `FLUID_FORGE_NO_ARROW_KEYS=1`. (#352)
+- **`fluid forge --offline`** (env twin `FLUID_FORGE_OFFLINE=1`) — a
+  first-class no-network guided authoring path: no LLM, no mode picker, no
+  remote schema fetch, and `--non-interactive` support for air-gapped or
+  scripted runs. (#355)
+- **`fluid forge --watch`** — watches the discovery path and regenerates the
+  contract on source change, debouncing save-storms and never retriggering on
+  its own output; Ctrl-C exits cleanly. (#362)
+- **Mid-run LLM failure recovery.** An API-key 401 now re-prompts for a fresh
+  key and retries generation in place (interview answers preserved) instead of
+  ending the run; a 429 prints a `Rate limited. Waiting Ns before retrying...`
+  notice instead of a silent frozen spinner. (#353, #361)
+- **Multi-provider AI config.** `fluid ai setup` saves each provider into a
+  map — a second setup no longer clobbers the first — `fluid ai status` lists
+  every saved provider, and `fluid forge --llm-provider <name>` resolves any
+  saved provider's key even without its env var set. (#363)
+- **Import API keys from other CLIs.** `fluid ai setup` detects existing keys
+  in well-known credential files (Codex `auth.json`, OpenAI/Anthropic
+  dotfiles, `gh` `hosts.yml` for GitHub Models) and offers to import them —
+  explicit opt-in prompt, HOME-confined reads, key values never displayed or
+  logged. (#366)
+- **Custom LLM provider plugins.** Third-party packages register providers via
+  the `fluid_build.llm_providers` entry-point group
+  (`pip install` → `fluid forge --llm-provider <name>`, no core edit);
+  built-ins always win over a name clash, and the operator plugin allow/block
+  policy governs discovery. (#365)
+- **Layered prompt customization.** `fluid forge --prompt-profile <name>`
+  swaps the whole prompt-guidance set for a named profile (bundled
+  `eu-gdpr-strict` and `ai-lab-permissive` exemplars); per-tenant home-directory
+  shadows and per-domain fragments override individual guidance blocks; and
+  stackable `--prompt-overlay a,b,c` patches compose on top with validator
+  rules and optional ed25519 signing. The active profile is stamped into
+  `metadata.provenance.prompt_profile`. (#359, #364, #383)
+- **Nine new built-in domain agents.** Eight verticals — manufacturing,
+  logistics, energy, government, insurance, pharma, education, media — each
+  grounded in its industry's authoritative standards (ISA-95, GS1 EPCIS,
+  IEC CIM, NIEM, ACORD, CDISC, Ed-Fi, EIDR, …), plus `ai_ready`, which
+  deterministically enforces AI-readiness metadata: per-port `agentPolicy`
+  ("reporting yes, training no" for sensitive data), PII/sensitivity flags,
+  and `ai-embeddable` column labels for RAG consumers. (#371, #405)
+- **Domain keyword learning.** Forge tracks which product domains you build
+  across runs (locally, in `~/.fluid/ai_config.json`) and, once a domain
+  repeats, proactively nudges its template using frecency ranking. (#367)
+- **pgvector vector/embeddings output port.** `fluid generate vector
+  <contract>` compiles pgvector-bound exposes into an embeddings table, ANN
+  index DDL (`hnsw` default / `ivfflat`), and a RAG manifest — driven by
+  `vectorConfig` and the `ai-embeddable` labels the `ai_ready` agent stamps. (#410)
+- **Opt-in agent tools.** SSRF-safe `web_search` + `web_fetch` behind
+  `FLUID_AGENT_WEB_TOOLS=1` (private/metadata address ranges and DNS-rebind
+  blocked, typed errors, keys never logged); plus the AI-tools trio — a
+  read-only, redacted `fetch_sample_rows` live-DB sampler
+  (`FLUID_FORGE_DB_TOOLS=1`), tool-search deferred schema loading
+  (`FLUID_FORGE_TOOL_SEARCH=1`), and a hosted-MCP registry for the GitHub and
+  Snowflake MCP servers (`FLUID_GITHUB_MCP=1` / `FLUID_SNOWFLAKE_MCP=1`). All
+  off by default. (#358, #407)
+- **Semantic-drift guard (opt-in).** `FLUID_FORGE_DRIFT_GUARD=1` catches the
+  LLM renaming, dropping, or silently retyping columns relative to the
+  discovered source schema or the `--refine` prior contract, and feeds the
+  drift into the existing self-healing repair loop. (#409)
+- **`fluid verify --reconcile-dbt`.** Statically cross-checks
+  `exposes[].contract.schema` against the dbt project's `schema.yml` columns
+  and reports drift (missing columns, type mismatches, unmatched models);
+  drift exits 1 for CI, `--warn-only` downgrades it. (#403)
+- **One guided Quickstart starter picker + provider blueprints.** `fluid
+  init`'s first-run menu collapses from five rows to Quickstart / AI / Empty,
+  with Quickstart leading to a single starter picker; new bundled GCP
+  (BigQuery) and Snowflake starter blueprints are reachable via
+  `--quickstart --provider gcp|snowflake` or `--blueprint <id>`. Existing
+  flags are unchanged. (#370, #402)
+- **`fluid apply --env` reaches apply hooks.** Hooks accepting an env
+  parameter receive the resolved environment via backward-compatible signature
+  dispatch (3-arg hooks unchanged), removing the `DEPLOY_ENV` fail-open. (#368)
+- **Opt-in UX telemetry: provider choice + run completion.** Two bounded,
+  enum-like fields behind the existing default-OFF consent gate with unchanged
+  `DO_NOT_TRACK` / `FLUID_TELEMETRY` precedence. (#357)
+- **Emulator-friendly AWS IaC.** When a custom endpoint is configured
+  (`AWS_ENDPOINT_URL*`), the emitted `provider "aws"` block enables path-style
+  S3 addressing and the validation skips LocalStack needs; on real AWS the
+  output is byte-for-byte unchanged. (#411)
+- **Examples.** 5-minute quickstart READMEs for examples 01–06 with an index,
+  plus three realistic AWS-first example contracts (S3/Glue/Athena Parquet
+  lake, Iceberg lakehouse, medallion lake) — all pinned by e2e validate
+  tests. (#356, #384)
+
+### Changed
+
+- **DataHub registrar self-heals transient GMS failures.** Exponential backoff
+  with jitter on 429/5xx (mirroring DataHub's own emitter defaults), honours
+  `Retry-After`, configurable via `FLUID_CATALOG_DATAHUB_MAX_RETRIES`; a
+  terminal outage still degrades to a clean failure instead of blocking the
+  publish. (#404)
+- **Faster, lighter `fluid --help`.** `fluid_build.commands` plugin
+  subcommands now load lazily (an installed plugin's heavy imports no longer
+  land on the cold path — and plugin subcommands that previously crashed on
+  dispatch now work), and the `cli.mcp` re-exports + OTLP exporter are
+  deferred, cutting roughly 200 modules off the cold start. (#369, #390)
+- **LLM runtime relocated to `fluid_build.llm`,** severing the `copilot ⇄ cli`
+  import cycle; every legacy `fluid_build.cli.forge_copilot_llm_*` import path
+  still resolves to the same module via aliases. (#391)
+- **CI hardening.** An incremental `mypy --strict` gate now covers four
+  security-hotspot modules (#360), alongside routine pinned-action bumps.
+
+### Fixed
+
+- **`fluid apply --mode replace-and-build` now hits the data-loss gate.** The
+  build-mode early-return dispatched to the builders before the stage-7 safety
+  gate ran, so a destructive replace-and-build in a protected env proceeded
+  without `--allow-data-loss`; the gate now runs before engine dispatch on
+  both the native and OpenTofu paths. (#386)
+- **FLUID-emitted ODCS round-trips losslessly.** Export is now a fixed point
+  (`export(import(export(x))) == export(x)`): a phantom top-level `name` and
+  dropped explicit `required: false` no longer appear on re-export. (#373)
+- **OPDS/ODPS naming untangled; `opds` restored to the default emit set.** The
+  LF/ODPI Open Data Product Specification is `opds` (provider renamed to
+  `providers/opds/`), Bitol's Open Data Product Standard stays `odps-bitol`,
+  and the bare `odps` key is a deprecated alias that warns; OPDS artifacts now
+  validate against the vendored v4.1 schema in `fluid validate artifacts`. (#381)
+- **Redshift Serverless + Kinesis contracts validate.** `bindingLocation` in
+  schema 0.7.5 now declares `stream`, `namespace`, `workgroup`,
+  `iam_role_arn`, `external_schema`, and `glue_database` — fields the AWS IaC
+  emitter already read — so those contracts no longer fail `fluid validate`
+  while passing `fluid generate iac`. (#396)
+- **AWS IaC declares `aws_caller_identity` whenever the account-derived
+  warehouse bucket is referenced,** so bucket-less Glue table contracts no
+  longer fail `tofu plan` with an undeclared-resource error. (#408)
+- **Copilot project memory reads and writes the same file.** Load, save, and
+  `--show-memory` / `--reset-memory` all resolve one canonical memory root, so
+  scaffolding into a subdirectory no longer duplicates or orphans accumulated
+  workspace memory. (#354)
+
 ## [0.10.2] — 2026-06-27
 
 A polish + internal-quality release on top of 0.10.1. No breaking changes.
@@ -45,7 +632,7 @@ A bug-fix + security release on top of 0.10.0.
 
 ### Security
 
-- **Mask credentials embedded in URL userinfo** (`scheme://user:password@host`)
+- **Mask credentials embedded in URL userinfo** (`scheme://user:password@host`) <!-- pragma: allowlist secret -->
   across both redaction layers — the global `secret_redactor` and the
   Snowflake-local twin. Such a password (an Iceberg REST catalog
   `binding.location.uri`, a JDBC / `connection_url`, or a redis/AMQP broker URL)
@@ -137,6 +724,128 @@ provider-vs-exporter fix, and the operator surfaces (`fluid plugins`,
 ### Performance
 
 - `requests` and `build_runners` are deferred off the cold `--help` path. (#301)
+
+## [0.9.0] — 2026-06-25
+
+The Kafka → Apache Iceberg streaming-sink release: `fluid` now derives Iceberg
+sink configuration for Kafka Connect, Debezium Server, and Confluent Tableflow
+behind an opt-in 0.7.5 schema — alongside Windows UTF-8 fixes, a deterministic
+`planDigest`, and streaming-credential redaction hardening.
+
+### Security
+
+- **Run records are redacted before they reach disk.** Kafka Connect
+  task-failure traces captured into run-record facets can echo the connector
+  config — `database.password`, S3 keys, `sasl.jaas.config` — and were written
+  to `.fluid/<product>/…/runs/<run_id>.json` in plaintext, bypassing the
+  logging redactor entirely. Every runner's run record now passes through the
+  recursive redactor at the single `write_run_record` chokepoint before the
+  bytes hit disk. (#272)
+- **`sasl.jaas.config` values are fully masked in both redaction layers.** The
+  JAAS string's value embeds the SASL login secret but its key contains no
+  sensitive substring, so the key matcher missed it and a non-`password=`
+  secret (e.g. OAuthBearer `clientSecret=`) could leak into logs and failure
+  traces. Both the global `SecretRedactingFilter` and the provider-local
+  redactor now mask the whole value, on the dict-key and serialized-text
+  paths. (#270)
+- **Dotted streaming-credential keys redact symmetrically.**
+  `s3.secret-access-key`, `session-token`, `gcs.oauth2.token`, and
+  `jdbc.password` are masked across all redaction layers (text and dict
+  paths), delegating the key decision to the single `is_sensitive_key_name`
+  source of truth. (#286)
+
+### Added
+
+- **Opt-in `fluid-schema-0.7.5` with a `streamingSink` block.** The
+  `kafka-connect` properties gain a closed `streamingSink` object (typos in
+  the new surface are caught) with typed `iceberg_sink_enabled` /
+  `sink_topics` / `iceberg_catalog_overrides`, and `iceberg_table` is accepted
+  as an alias of the `iceberg` expose format. 0.7.5 is a preview version —
+  bundled and validatable on explicit opt-in, never the silent default, so
+  existing contracts' plan and bundle digests don't churn. (#266)
+- **Derived Iceberg sink config for Kafka Connect.** With
+  `sink.format: iceberg` and no hand-written `sink_connector_config`, the
+  runner derives the full `iceberg.catalog.*` / `iceberg.tables.*` connector
+  config: Glue and REST catalogs, a per-product control topic (avoiding the
+  shared `control-iceberg` collision), JSON or Avro converters depending on
+  Schema Registry presence, and an `iceberg_catalog_overrides` escape hatch
+  where operator keys win. Contracts with a hand-written config are
+  byte-for-byte unaffected. (#264)
+- **REST + GCP/Azure Iceberg catalog profiles.** The catalog resolver picks
+  the FileIO implementation from the warehouse scheme (`s3://` → S3FileIO,
+  `gs://` → GCSFileIO, `abfss://` → ADLSFileIO) and resolves REST/GCP/Azure
+  catalog kinds with a safe `rest` fallback. (#280)
+- **Plan-time validation for the Iceberg streaming sink.** `fluid validate`
+  now catches the connector's silent-fail-at-first-record traps: an Iceberg
+  sink build with no matching expose, `upsertMode` (deferred in v1), dynamic
+  routing without `routeField`, an incomplete REST catalog binding, and an
+  `iceberg_catalog_overrides` warehouse that diverges from the binding
+  warehouse. (#267)
+- **Kafka Connect task-level failure detection.** The status poll previously
+  checked only `connector.state`, so a connector reporting `RUNNING` over a
+  `FAILED` task counted a broken sink as a successful run. Health now requires
+  the connector RUNNING and no task FAILED — the Iceberg sink connector
+  included — with each failed task's trace captured into the run record; the
+  Iceberg late-events side table is named `<database.table>__late_events`
+  beside the target. (#268)
+- **Embedded Debezium-Server Iceberg sink.** The debezium runner derives the
+  `io.debezium.server.iceberg` config surface (warehouse, `table-namespace`,
+  catalog impl, FileIO, region, upsert/identifier fields, partitioning) — a
+  different surface from the Kafka Connect keys. Off when a hand-written
+  `config` block is present; opt in via `iceberg_sink_enabled: true`. (#284)
+- **Confluent Tableflow IaC plugin — managed Kafka → Iceberg.** A `confluent`
+  platform binding compiles into the `confluentinc/confluent` OpenTofu
+  provider's managed control plane: a Tableflow topic (`byob_aws`), the AWS
+  Glue catalog integration, and the storage provider integration, with a
+  validate-time anti-no-op gate. It reuses the AWS warehouse writer so the
+  managed and self-managed paths resolve to the same table identity, and the
+  emitted module stays credential-free. (#285)
+
+### Changed
+
+- **`fluid --help` no longer loads the MCP server SDK.** The ~87 `mcp.*`
+  modules that every non-MCP command eagerly imported are now built lazily on
+  first `fluid mcp serve`, cutting ~245 modules (~15%) off the cold path, with
+  the startup budget enforced as a hard CI gate; `cli/mcp.py` was subsequently
+  split into a package with the lazy loading and all policy/permission gates
+  preserved. (#265, #282)
+- **`fluid_build/config.py` renamed to `config_defaults.py`.** Distinguishes
+  the compile-time static defaults from the runtime hierarchical
+  `config_manager.py`; update imports if you consume the package as a
+  library. (#225)
+
+### Fixed
+
+- **`planDigest` is deterministic across identical plan runs.** The volatile
+  `generated_at` timestamp leaked into the SHA-256 and topological action
+  ordering depended on per-process hash randomization, so two identical
+  `fluid plan` runs disagreed — breaking apply-time plan-binding verification
+  and CI digest diffing. Timestamps are masked out of the digest (they remain
+  in `plan.json` as audit metadata) and action levels are built in stable
+  parse order. (#260)
+- **The CLI no longer crashes on Windows cp1252.** stdout/stderr are
+  reconfigured to UTF-8 at startup — previously the first emoji in the help
+  banner raised `UnicodeEncodeError` whenever output was piped or captured —
+  and all ~160 text file I/O sites now pass `encoding="utf-8"` explicitly, so
+  contracts with accented names or emoji read and write correctly under a
+  cp1252 locale. A static test gate rejects any new unencoded text-I/O site.
+  (#263, #269)
+- **Iceberg warehouse derivation unified into a single writer.** The S3
+  warehouse location for an Iceberg/Glue exposure was derived at three drifted
+  sites (native planner, OpenTofu Glue emitter, Lake Formation emitter) that
+  could resolve the same binding to different warehouses; all three now call
+  one canonical `get_iceberg_warehouse`, with contract-derived text kept out
+  of OpenTofu interpolation. Explicit-bucket contracts emit byte-identical
+  output. (#262)
+- **`fluid bundle --out -` no longer leaks its logging redirect.** Bundling to
+  stdout set `propagate = False` process-globally and never restored it,
+  silently breaking log propagation for every later caller in the same
+  interpreter (pytest `caplog`, the `forge_run` MCP tool, library embeddings);
+  logging state is now snapshot on entry and restored on exit while stdout
+  stays clean during the call. (#261)
+- **Debezium `.properties` values escape backslashes.** `java.util.Properties`
+  treats a bare backslash as an escape introducer, silently corrupting
+  values; the emitter now escapes per the Java grammar. (#286)
 
 ## [0.8.11] - 2026-06-16
 
@@ -1455,7 +2164,8 @@ graduating to a stable `v0.8.2` on PyPI.
 
 ## [0.7.11] — 2026-04-16
 
-Tooling release. No user-facing CLI behavior changes; ships a refactored release pipeline and a few packaging fixes.
+Tooling release. No user-facing CLI behavior changes; ships a refactored
+release pipeline and a few packaging fixes.
 
 ### Changed
 - **Dynamic versioning via `setuptools-scm`.** The wheel's version is now derived from the git tag at build time (`v0.7.11a1` → wheel `0.7.11a1`). Removes the static `version = "..."` literal from `pyproject.toml`, the `__version__ = "..."` literal from `fluid_build/__init__.py`, and the `base_version` field from `fluid_build/build-manifest.yaml`. `fluid_build.__version__` now reads from `importlib.metadata.version("data-product-forge")`. Closes the version-drift bug that produced a `0.7.10` wheel for a `v0.7.10a1` tag.
@@ -1467,9 +2177,13 @@ Tooling release. No user-facing CLI behavior changes; ships a refactored release
 ### Fixed
 - **Version-mismatch verify-install failure** on pre-release tags (the root cause of the v0.7.10a1 incident) — fixed by the setuptools-scm migration above.
 
-Patch release covering post-0.7.9 work that accumulated in the `Unreleased` section. No breaking changes — everything here is additive, internal tidy-up, or hardening.
+Patch release covering post-0.7.9 work that accumulated in the `Unreleased`
+section. No breaking changes — everything here is additive, internal tidy-up,
+or hardening.
 
-**Heads-up for users: the PyPI distribution name is changing.** Starting with 0.7.10, the package publishes as **`data-product-forge`** instead of `fluid-forge`. Update your install command:
+**Heads-up for users: the PyPI distribution name is changing.** Starting with
+0.7.10, the package publishes as **`data-product-forge`** instead of `fluid-
+forge`. Update your install command:
 
 ```bash
 # old
@@ -1479,9 +2193,14 @@ pip install fluid-forge
 pip install data-product-forge
 ```
 
-The import path (`import fluid_build`), the CLI entry point (`fluid`), and all internal provider identifiers (Snowflake query tags, Airflow DAG owners, `managed-by` labels) stay as `fluid-forge` — those are runtime/audit identifiers, not user-facing names. The CLI's Docker image on GHCR also aligns with the GitHub repo name: `ghcr.io/agenticstiger/forge-cli`.
+The import path (`import fluid_build`), the CLI entry point (`fluid`), and all
+internal provider identifiers (Snowflake query tags, Airflow DAG owners,
+`managed-by` labels) stay as `fluid-forge` — those are runtime/audit
+identifiers, not user-facing names. The CLI's Docker image on GHCR also aligns
+with the GitHub repo name: `ghcr.io/agenticstiger/forge-cli`.
 
-Also the first release published from the `Agenticstiger/forge-cli` repository via the Trusted-Publishing release pipeline.
+Also the first release published from the `Agenticstiger/forge-cli` repository
+via the Trusted-Publishing release pipeline.
 
 ### Added
 - **Master-schema validation on DMM publish (opt-in enforcement; backward-compatible across every bundled FLUID version).** `fluid datamesh-manager publish` (alias `fluid dmm publish`) now validates the loaded FLUID contract before constructing any provider payload, enforcing the CLI's role as master coordinator. **Validation honors the contract's own declared `fluidVersion`**: a 0.5.7 contract is validated against `fluid-schema-0.5.7.json`, a 0.7.1 contract against `fluid-schema-0.7.1.json`, a 0.7.2 contract against `fluid-schema-0.7.2.json`, and so on. Upgrading the CLI never invalidates a contract that was valid against its own version — the CLI coordinates publishes across the whole FLUID version range, not just the latest. **The default mode is `warn` — existing workflows are NOT affected: a contract that previously published will still publish, schema errors are logged, and the publish proceeds.** Users who want hard enforcement opt in via `--validation-mode strict`, which aborts the publish with a detailed error summary on any schema violation. Tests cover strict/warn modes, the valid-contract-in-strict-mode happy path, an end-to-end integration test that walks the full pipeline without mocking the provider, and a parametrized backward-compat suite that exercises strict-mode publish on every bundled FLUID version (0.5.7 / 0.7.1 / 0.7.2).
@@ -1603,7 +2322,24 @@ Also the first release published from the `Agenticstiger/forge-cli` repository v
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.8...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.13.1...v0.14.0
+[0.13.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.13.0...v0.13.1
+[0.13.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.10.2...v0.11.0
+[0.10.2]: https://github.com/Agenticstiger/forge-cli/compare/v0.10.1...v0.10.2
+[0.10.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.10.0...v0.10.1
+[0.10.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.11...v0.9.0
+[0.8.11]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.10...v0.8.11
+[0.8.10]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.9...v0.8.10
+[0.8.9]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.8...v0.8.9
+[0.8.7]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.6...v0.8.7
+[0.8.6]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.5...v0.8.6
+[0.8.5]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.4...v0.8.5
+[0.8.4]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.3...v0.8.4
+[0.8.3]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.0...v0.8.3
 [0.8.8]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.7...v0.8.8
 [0.8.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.10...v0.8.0
 [0.7.11]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.10...v0.7.11
