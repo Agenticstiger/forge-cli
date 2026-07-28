@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """``fluid scaffold-ide`` — emit per-IDE agentic config so a data team can drive
 forge-cli from any agentic IDE (Kiro, Cursor, Claude Code, Cline, or a generic
 target).

@@ -259,8 +259,21 @@ def add_header(content: str, header: str) -> str:
     prefix = "".join(lines[:insert_at])
     suffix = "".join(lines[insert_at:])
 
-    # Ensure blank line between header and code
-    separator = "\n" if suffix and not suffix.startswith("\n") else ""
+    # Blank line(s) between the header and the code. PEP 8 (and black) want
+    # TWO blank lines before a top-level def / class / decorator, one is
+    # enough before a docstring or imports. Emitting a single blank line
+    # unconditionally made the writer fight black on the handful of files
+    # whose first statement is a def — black would add the second line and
+    # the next writer run would strip it back out, so neither tool ever
+    # reached a fixed point.
+    if not suffix:
+        separator = ""
+    else:
+        # Normalize: drop whatever blank lines are there, then emit exactly
+        # the number we want. Deterministic, so a second run is a no-op.
+        suffix = suffix.lstrip("\n")
+        needs_two = suffix.startswith(("def ", "class ", "async def ", "@"))
+        separator = "\n\n" if needs_two else "\n"
 
     return prefix + header + separator + suffix
 

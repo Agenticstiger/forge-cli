@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Tests for ``fluid forge --agent`` — the headless agent-drivable preset.
 
 Adversarial bias: the agent in the user's IDE shell-runs forge with a closed

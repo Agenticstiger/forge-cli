@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Regression tests for the ``forge_run`` MCP tool's sandbox enforcement.
 
 Pins the fix for security-review finding #1 (Phase 3 audit):
