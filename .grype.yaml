@@ -21,3 +21,27 @@ ignore:
   # HTML through html.parser.HTMLParser, so it is not reachable in this image.
   # Remove once python:3.13-slim ships a CPython with the backport.
   - vulnerability: CVE-2026-15308
+
+  # High — CVE-2026-11940: tarfile extraction-filter bypass via a crafted archive
+  # whose hardlink references a deeper-path symlink, so the fallback recreates the
+  # symlink at a shallower path and escapes the destination (incomplete fix of
+  # CVE-2025-4330; published 2026). Fixed only in CPython 3.15.0b4 — no stable
+  # Python base image carries the fix. NOT REACHABLE in this image: the only tar
+  # extraction in the shipped code (fluid_build/forge/core/artifact_fanout.py::
+  # _extract_bundle) filters members through _safe_tar_members, which rejects ALL
+  # symlink and hardlink members outright (member.issym()/islnk() -> FanoutError)
+  # before extraction and re-verifies the bundle MANIFEST (SHA-256 merkle root)
+  # first — the link primitive this CVE requires never reaches extractall. The
+  # opentofu installer extracts one named regular member only, never extractall.
+  # EPSS 0.6% (46th percentile). Remove once a stable python:3.13-slim ships the
+  # backport (re-run grype to confirm).
+  - vulnerability: CVE-2026-11940
+
+  # High — CVE-2026-11972: tarfile opened in STREAMING mode ("r|...") mishandles
+  # EOF on a truncated crafted archive (published 2026). Fixed only in CPython
+  # 3.15.0b4 — no stable Python base image carries the fix. NOT REACHABLE in this
+  # image: the codebase never opens tar archives in streaming mode (no "r|" usage
+  # anywhere in fluid_build/); every tarfile.open is random-access "r:gz"/"w" on a
+  # local, MANIFEST-attested file. EPSS 0.4% (35th percentile). Remove once a
+  # stable python:3.13-slim ships the backport (re-run grype to confirm).
+  - vulnerability: CVE-2026-11972
