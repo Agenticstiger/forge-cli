@@ -337,7 +337,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for style guides and architecture overvie
 
 ## License
 
-[Apache License 2.0](LICENSE) · Copyright 2024–2026 Agentics Transformation Pty Ltd
+[Apache License 2.0](LICENSE) · Copyright 2024–2026 Agentics Transformation Limited
 
 ---
 

@@ -169,7 +169,7 @@ fluid_build/auth.py             @jeffwatson-ai
 - [ ] Confirm Apache 2.0 `LICENSE` file is present and correct.
 - [ ] Verify `NOTICE` file lists the correct copyright holder:
   ```
-  Copyright 2024-2026 Agentics Transformation Pty Ltd
+  Copyright 2024-2026 Agentics Transformation Limited
   ```
 - [ ] Run the license header check:
   ```bash

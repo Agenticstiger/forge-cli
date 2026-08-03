@@ -11,7 +11,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-authors = [{ name = "Agentics Transformation Pty Ltd" }]
+authors = [{ name = "Agentics Transformation Limited" }]
 keywords = ["data products", "FLUID", "odps", "odcs", "gitops", "gcp", "snowflake", "duckdb", "composer", "dbt", "dataform"]
 
 # Optional but useful for PyPI/pipx users and internal catalogs

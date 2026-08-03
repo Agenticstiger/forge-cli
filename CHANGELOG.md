@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Corrected the legal entity name across `NOTICE`, `LICENSE`, `pyproject.toml`
+  and repository docs: the project is maintained by **Agentics Transformation
+  Limited** (Ireland); earlier files misnamed the entity as "Pty Ltd". The
+  trademark notice now correctly asserts an unregistered mark ("FLUID Forge™ is
+  a trademark of Agentics Transformation Limited") instead of claiming a
+  registration.
+
 ## [0.14.0] — 2026-07-28
 
 A live-verification hardening release: the dbt Iceberg loop reaches BigQuery
