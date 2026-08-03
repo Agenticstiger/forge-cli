@@ -33,7 +33,7 @@
 
 ---
 
-> 🚀 **Latest: [`v0.14.0`](CHANGELOG.md)** on PyPI · contract schema **`fluidVersion 0.7.5`** (GA) · 📖 **[Full documentation →](https://agenticstiger.github.io/forge_docs/)**
+> 🚀 **Latest: [`v0.14.1`](CHANGELOG.md)** on PyPI · contract schema **`fluidVersion 0.7.5`** (GA) · 📖 **[Full documentation →](https://agenticstiger.github.io/forge_docs/)**
 
 **Jump to:** [Why FLUID Forge?](#why-fluid-forge) · [What is FLUID?](#-what-is-fluid) · [Why We Built This](#-why-we-built-this) · [60 Seconds to Magic](#-60-seconds-to-magic) · [Installation](#installation) · [Contract Anatomy](#-anatomy-of-a-fluid-contract) · [Providers](#-providers--bring-your-own-cloud) · [CLI Reference](#-cli-command-reference) · [Templates](#-templates) · [Contributing](#-contributing)
 

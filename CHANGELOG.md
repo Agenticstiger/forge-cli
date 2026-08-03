@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Release image: two CPython `tarfile` CVEs suppressed with justification.**
+  Both are fixed only in CPython pre-releases, so no stable base image clears
+  them. A curated `.grype.yaml` records each with its reachability argument —
+  the single `extractall` call is guarded by `_safe_tar_members`, which raises
+  on symlink and hardlink members, and no streaming (`"r|"`) mode is used
+  anywhere — so the release gate no longer fails on an unfixable finding.
+
+## [0.14.1] — 2026-08-03
+
+A correctness and security patch: the MCP output port works against both
+generations of the MCP SDK, two authorisation bypasses in that port are closed,
+and the project's legal entity is named correctly across the distributed files.
+
+### Security
+
+- **Two HIGH authorisation bypasses closed in the MCP output port.** Verified
+  caller attributes (JWT/mTLS) and self-attested ones were flattened into a
+  single dictionary, so the "cryptographic identity wins" rule held only for
+  the keys a claim mapping happened to emit. A caller could therefore (a)
+  self-attest any `rowFilter` the mapping did not cover — including another
+  tenant's value, turning a fail-closed denial into an attacker-chosen
+  row-level-security predicate — and (b) self-attest `model` and `useCase` past
+  the `agentPolicy` gate whenever the mapping omitted them, which any custom
+  `FLUID_MCP_JWT_CLAIM_MAPPING` does, since it *replaces* the defaults rather
+  than extending them. The flattening predated the SDK port and was reachable
+  on SDK 1.x through `clientInfo` extras. Fixed by reading the `fluid_auth_kind`
+  stamped by the transport middleware but never consulted: when authentication
+  is enforced, only verified claims bind, and dropped self-attestations are
+  logged at WARNING naming each one. The no-authentication path is unchanged.
+  Five regression tests pin all four exploit shapes plus a no-auth control.
+  (#492)
+
+### Changed
+
+- **The MCP output port supports SDK 1.x and 2.x.** `mcp` 2.0.0 renamed
+  `FastMCP` to `MCPServer`, inverted the lowlevel `Server` registration API from
+  decorators to `on_*` constructor handlers, removed
+  `create_connected_server_and_client_session`, and renamed model fields from
+  camelCase to snake_case at the attribute level. All generation branching is
+  confined to one new tier-0 leaf, `fluid_build/_mcp_compat.py`, which probes
+  with `find_spec` rather than importing `mcp` at module scope so the
+  `fluid --help` startup budget is preserved. Twelve `getattr`-with-default
+  camelCase reads were failing **silently** under 2.x — errors reading as
+  success, tool schemas as empty — and now route through a dual-name accessor.
+  Verified green against both `mcp` 1.29.0 and 2.0.0, including a live
+  end-to-end run of `fluid mcp output-port serve` over HTTP/SSE under 2.0.0.
+  The dependency pin stays `mcp>=1.20,<2.0` and the drift canary stays
+  warn-only until the 2.x leg has a track record. (#492)
+
+### Fixed
+
 - Corrected the legal entity name across `NOTICE`, `LICENSE`, `pyproject.toml`
   and repository docs: the project is maintained by **Agentics Transformation
   Limited** (Ireland); earlier files misnamed the entity as "Pty Ltd". The
@@ -2332,6 +2383,7 @@ via the Trusted-Publishing release pipeline.
 - Basic Airflow DAG export
 
 [Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.14.0...HEAD
+[0.14.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.12.0...v0.13.0
