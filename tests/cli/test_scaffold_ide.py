@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """Tests for ``fluid scaffold-ide`` — the agentic-IDE config emitter.
 
 Adversarial bias: this command emits configs the data team's IDE will execute.

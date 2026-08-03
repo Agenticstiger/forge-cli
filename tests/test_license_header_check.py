@@ -17,6 +17,26 @@
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
+# The complete Apache-2.0 boilerplate the checker requires. Kept literal
+# (rather than imported from the writer) so this file stays a black-box
+# test of check_license_headers.py.
+_COMPLETE_HEADER = (
+    "# Copyright 2024-2026 Agentics Transformation Ltd\n"
+    "#\n"
+    '# Licensed under the Apache License, Version 2.0 (the "License");\n'
+    "# you may not use this file except in compliance with the License.\n"
+    "# You may obtain a copy of the License at\n"
+    "#\n"
+    "#     http://www.apache.org/licenses/LICENSE-2.0\n"
+    "#\n"
+    "# Unless required by applicable law or agreed to in writing, software\n"
+    '# distributed under the License is distributed on an "AS IS" BASIS,\n'
+    "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n"
+    "# See the License for the specific language governing permissions and\n"
+    "# limitations under the License.\n"
+    "\n"
+)
+
 
 def _load_module():
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "check_license_headers.py"
@@ -76,7 +96,11 @@ def test_find_missing_headers_returns_repo_relative_paths(tmp_path):
     bad = tmp_path / "tools" / "bad.py"
     good.parent.mkdir(parents=True, exist_ok=True)
     bad.parent.mkdir(parents=True, exist_ok=True)
-    good.write_text("# Copyright 2024-2026 Agentics Transformation Ltd\nprint('ok')\n")
+    # A bare copyright line is NOT a valid header any more — the checker
+    # validates the whole Apache-2.0 boilerplate (that is what let 346
+    # truncated headers pass unnoticed). This test is about the shape of
+    # the returned paths, so give the "good" file a real header.
+    good.write_text(_COMPLETE_HEADER + "print('ok')\n")
     bad.write_text("print('missing')\n")
 
     missing = module.find_missing_headers([good, bad], tmp_path)
