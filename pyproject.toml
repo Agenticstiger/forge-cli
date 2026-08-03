@@ -100,7 +100,7 @@ dependencies = [
   # AGENT_IDE.md "Related work" section + the gateway commit msg):
   #   docs:  https://modelcontextprotocol.github.io/python-sdk/
   #   repo:  https://github.com/modelcontextprotocol/python-sdk
-  "mcp>=1.20,<2.0",
+  "mcp>=1.20,<3.0",
   # (The MCP output-port rate limiter is an in-process monotonic-clock
   # deque sliding window in SessionState.check_rate_limit — no dependency.
   # PyrateLimiter was dropped: its Limiter spins a background "leaker"
