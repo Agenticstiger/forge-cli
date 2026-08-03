@@ -43,7 +43,7 @@ Maintainers are responsible for the overall direction of the project. They have 
 
 | Name | GitHub | Role |
 |------|--------|------|
-| Jeff Watson | [@jeffwatson-ai](https://github.com/jeffwatson-ai) | Project steward, Agentics Transformation Pty Ltd |
+| Jeff Watson | [@jeffwatson-ai](https://github.com/jeffwatson-ai) | Project steward, Agentics Transformation Limited |
 
 ### Current Committers
 

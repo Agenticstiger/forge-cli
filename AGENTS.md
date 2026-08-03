@@ -622,4 +622,4 @@ plugin" example.
 ---
 
 *FLUID Forge — Declarative Data Products for the Agentic Era*
-*Copyright 2024–2026 Agentics Transformation Pty Ltd — [fluidhq.io](https://fluidhq.io)*
+*Copyright 2024–2026 Agentics Transformation Limited — [fluidhq.io](https://fluidhq.io)*
