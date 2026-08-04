@@ -179,3 +179,173 @@ class TestConvenienceFunctions:
 
     def test_get_region_jurisdiction_unknown(self):
         assert get_region_jurisdiction("mars-central-1") == "Unknown"
+
+
+class TestSchemaDefaultAlignment:
+    """The engine's runtime defaults must equal the schema's declared ones.
+
+    They did not: every one was the permissive inverse of what the schema
+    advertises (``enforcementMode`` advisory-not-strict, ``dataResidency``
+    False-not-True, ``crossBorderTransfer`` True-not-False). A contract that
+    declared a sovereignty policy and relied on the documented defaults was
+    therefore evaluated under the weakest possible settings — a GDPR contract
+    with exposes in two jurisdictions returned a clean pass.
+    """
+
+    @staticmethod
+    def _schema_defaults():
+        import json
+        from pathlib import Path
+
+        from fluid_build.schema_manager import SchemaManager
+
+        version = SchemaManager.latest_bundled_version()
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "fluid_build"
+            / "schemas"
+            / f"fluid-schema-{version}.json"
+        )
+        schema = json.loads(path.read_text(encoding="utf-8"))
+        defs = schema.get("$defs") or schema.get("definitions") or {}
+        return {
+            name: spec["default"]
+            for name, spec in defs["sovereignty"].get("properties", {}).items()
+            if "default" in spec
+        }
+
+    def test_engine_defaults_match_the_bundled_schema(self):
+        from fluid_build.policy import sovereignty as sov
+
+        declared = self._schema_defaults()
+        assert declared["enforcementMode"] == sov.DEFAULT_ENFORCEMENT_MODE
+        assert declared["dataResidency"] == sov.DEFAULT_DATA_RESIDENCY
+        assert declared["crossBorderTransfer"] == sov.DEFAULT_CROSS_BORDER_TRANSFER
+
+    def test_omitted_enforcement_mode_defaults_to_strict(self):
+        """No ``enforcementMode`` must block, not warn."""
+        ok, messages = validate_sovereignty(
+            {
+                "sovereignty": {
+                    "jurisdiction": "EU",
+                    "allowedRegions": ["eu-central-1", "eu-west-1"],
+                },
+                "exposes": [{"exposeId": "x", "binding": {"location": {"region": "us-east-1"}}}],
+            }
+        )
+        assert ok is False
+        assert any("❌" in m for m in messages)
+
+    def test_omitted_residency_keys_still_catch_cross_border_transfer(self):
+        """The reproduced bypass: two jurisdictions used to return a clean pass."""
+        ok, messages = validate_sovereignty(
+            {
+                "sovereignty": {
+                    "enforcementMode": "strict",
+                    "allowedRegions": ["eu-west-1", "us-east-1"],
+                },
+                "exposes": [
+                    {"exposeId": "eu", "binding": {"location": {"region": "eu-west-1"}}},
+                    {"exposeId": "us", "binding": {"location": {"region": "us-east-1"}}},
+                ],
+            }
+        )
+        assert ok is False
+        assert any("Cross-border" in m for m in messages)
+
+    def test_explicit_permissive_values_are_still_honoured(self):
+        """Defaulting strict must not override an author's explicit opt-out."""
+        ok, messages = validate_sovereignty(
+            {
+                "sovereignty": {
+                    "enforcementMode": "advisory",
+                    "allowedRegions": ["eu-west-1", "us-east-1"],
+                    "dataResidency": False,
+                    "crossBorderTransfer": True,
+                },
+                "exposes": [
+                    {"exposeId": "eu", "binding": {"location": {"region": "eu-west-1"}}},
+                    {"exposeId": "us", "binding": {"location": {"region": "us-east-1"}}},
+                ],
+            }
+        )
+        assert ok is True
+        assert not any("❌" in m for m in messages)
+
+
+class TestCrossBorderUnknownJurisdiction:
+    """Check 4 must not conflate "no baseline yet" with "jurisdiction unknown".
+
+    ``REGION_JURISDICTION_MAP`` holds ~31 entries and will always lag the
+    clouds, so an unmapped region is a common, real state. It used to be
+    represented by the same ``None`` as the not-yet-set baseline, which made
+    the check simultaneously over-sensitive (two EU regions, one unmapped,
+    were reported as a cross-border transfer), under-sensitive (two unmapped
+    regions in genuinely different jurisdictions compared equal and passed),
+    and order-dependent (the same pair passed or failed depending on which
+    expose came first).
+
+    These only became reachable by default once the engine's defaults were
+    aligned with the schema (``dataResidency`` true / ``crossBorderTransfer``
+    false), which is what arms Check 4.
+    """
+
+    @staticmethod
+    def _contract(*regions, mode="strict"):
+        return {
+            "sovereignty": {"enforcementMode": mode},
+            "exposes": [
+                {"exposeId": f"e{i}", "binding": {"location": {"region": r}}}
+                for i, r in enumerate(regions)
+            ],
+        }
+
+    @staticmethod
+    def _counts(messages):
+        return (
+            sum(1 for m in messages if "❌" in m),
+            sum(1 for m in messages if "⚠️" in m),
+        )
+
+    def test_unmapped_region_in_same_jurisdiction_does_not_block(self):
+        """``eu-south-1`` (Milan) is a real EU region absent from the map."""
+        ok, messages = validate_sovereignty(self._contract("eu-west-1", "eu-south-1"))
+        errors, warnings = self._counts(messages)
+        assert ok is True
+        assert errors == 0
+        assert warnings == 1  # surfaced, not silently swallowed
+        assert "no known jurisdiction" in "".join(messages)
+
+    def test_verdict_is_independent_of_expose_order(self):
+        forward = validate_sovereignty(self._contract("eu-west-1", "eu-south-1"))
+        reverse = validate_sovereignty(self._contract("eu-south-1", "eu-west-1"))
+        assert forward[0] == reverse[0]
+        assert self._counts(forward[1]) == self._counts(reverse[1])
+
+    def test_two_unmapped_regions_are_not_treated_as_the_same_jurisdiction(self):
+        """``None == None`` used to read as "same jurisdiction" and pass clean."""
+        ok, messages = validate_sovereignty(self._contract("me-central-1", "us-gov-west-1"))
+        errors, warnings = self._counts(messages)
+        assert errors == 0  # we genuinely cannot tell, so we must not assert a violation
+        assert warnings == 2  # but we must not claim it is clean either
+        assert ok is True
+
+    def test_genuine_cross_border_still_blocks(self):
+        ok, messages = validate_sovereignty(self._contract("eu-west-1", "us-east-1"))
+        errors, _ = self._counts(messages)
+        assert ok is False
+        assert errors == 1  # exactly one — the check used to fire once per expose
+        assert "EU and US" in "".join(messages)
+
+    def test_single_and_uniform_jurisdictions_stay_clean(self):
+        for regions in (("eu-west-1",), ("eu-west-1", "eu-central-1")):
+            ok, messages = validate_sovereignty(self._contract(*regions))
+            assert ok is True, regions
+            assert self._counts(messages) == (0, 0), regions
+
+    def test_region_less_exposes_are_skipped(self):
+        contract = self._contract("eu-west-1")
+        contract["exposes"].append({"exposeId": "no_region", "binding": {"location": {}}})
+        ok, messages = validate_sovereignty(contract)
+        assert ok is True
+        assert self._counts(messages) == (0, 0)

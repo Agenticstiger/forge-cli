@@ -34,6 +34,21 @@ class EnforcementMode(Enum):
     AUDIT = "audit"  # Log for compliance tracking
 
 
+# Single source of truth for the sovereignty-block defaults, mirroring the
+# ``default`` keys the JSON schema declares for ``$defs.sovereignty``. Anything
+# that needs to display or apply a default reads these, so the value used to
+# decide and the value shown to the operator cannot drift apart.
+# ``tests/test_sovereignty.py`` pins them against the bundled schema.
+DEFAULT_ENFORCEMENT_MODE = "strict"
+DEFAULT_DATA_RESIDENCY = True
+DEFAULT_CROSS_BORDER_TRANSFER = False
+
+# Distinct from ``None``, which the jurisdiction map also returns for an
+# unmapped region. Check 4 needs "no baseline yet" and "jurisdiction unknown"
+# to be different states — see the comment there.
+_UNSET = object()
+
+
 @dataclass
 class SovereigntyViolation:
     """Represents a sovereignty constraint violation."""
@@ -101,12 +116,25 @@ class SovereigntyValidator:
         if not sovereignty:
             return True, []  # No sovereignty constraints = always valid
 
-        enforcement_mode = EnforcementMode(sovereignty.get("enforcementMode", "advisory"))
+        # Defaults MUST mirror the JSON schema's declared ``default`` keys
+        # (``$defs.sovereignty`` in fluid-schema-0.7.x.json). They previously
+        # did not — every one was the permissive inverse of what the schema
+        # advertises — so a contract that declared a policy and relied on the
+        # documented defaults was evaluated under the weakest possible
+        # settings. A GDPR contract with exposes straddling EU and US printed
+        # ``PASS`` because ``dataResidency`` silently became False and Check 4
+        # was never entered. Same fail-open class as the empty-hook bug: the
+        # control is present, and quietly does nothing.
+        enforcement_mode = EnforcementMode(
+            sovereignty.get("enforcementMode", DEFAULT_ENFORCEMENT_MODE)
+        )
         allowed_regions = sovereignty.get("allowedRegions", [])
         denied_regions = sovereignty.get("deniedRegions", [])
         jurisdiction = sovereignty.get("jurisdiction")
-        data_residency = sovereignty.get("dataResidency", False)
-        cross_border_transfer = sovereignty.get("crossBorderTransfer", True)
+        data_residency = sovereignty.get("dataResidency", DEFAULT_DATA_RESIDENCY)
+        cross_border_transfer = sovereignty.get(
+            "crossBorderTransfer", DEFAULT_CROSS_BORDER_TRANSFER
+        )
 
         # Validate each expose's binding location
         for expose in iter_exposes(contract):
@@ -160,26 +188,71 @@ class SovereigntyValidator:
                         )
                     )
 
-            # Check 4: Data residency and cross-border transfer
-            if data_residency and not cross_border_transfer:
-                # All regions must be in same jurisdiction
-                first_region_jurisdiction = None
-                for exp in iter_exposes(contract):
-                    exp_region = exp.get("binding", {}).get("location", {}).get("region")
-                    if exp_region:
-                        exp_jurisdiction = self.REGION_JURISDICTION_MAP.get(exp_region)
-                        if first_region_jurisdiction is None:
-                            first_region_jurisdiction = exp_jurisdiction
-                        elif exp_jurisdiction != first_region_jurisdiction:
-                            violations.append(
-                                SovereigntyViolation(
-                                    severity="error",
-                                    message="Cross-border data transfer prohibited but multiple jurisdictions detected",
-                                    expose_id=expose_id,
-                                    suggestion="Ensure all regions are within the same jurisdiction when crossBorderTransfer=false",
-                                )
-                            )
-                            break
+        # Check 4: Data residency and cross-border transfer.
+        #
+        # Hoisted OUT of the per-expose loop — it is a property of the contract
+        # as a whole, and running it per-expose emitted one duplicate error per
+        # expose.
+        #
+        # The subtlety this code exists to get right: ``None`` used to mean two
+        # different things — "no baseline yet" and "this region is not in
+        # REGION_JURISDICTION_MAP". Conflating them made the check both
+        # over- and under-sensitive, and its verdict depended on expose order:
+        #   * eu-west-1 + eu-south-1 (both EU, the latter unmapped) -> BLOCKED
+        #   * the same two, reversed                                -> passed
+        #   * me-central-1 + us-gov-west-1 (both unmapped)          -> passed,
+        #     a genuine cross-border transfer reported as clean.
+        # The map holds 31 entries and will always lag AWS/GCP/Azure, so
+        # "unknown" is a real, common state that needs its own answer rather
+        # than being silently folded into a jurisdiction comparison.
+        if data_residency and not cross_border_transfer:
+            baseline: Any = _UNSET
+            for exp in iter_exposes(contract):
+                exp_region = exp.get("binding", {}).get("location", {}).get("region")
+                if not exp_region:
+                    continue
+                exp_id = exp.get("exposeId", "unknown")
+                exp_jurisdiction = self.REGION_JURISDICTION_MAP.get(exp_region, "Unknown")
+
+                if exp_jurisdiction == "Unknown":
+                    # Say what we actually know. Warning severity, so an
+                    # unmapped-but-legitimate region does not block a
+                    # deployment on the strength of a gap in our own table.
+                    violations.append(
+                        SovereigntyViolation(
+                            severity="warning",
+                            message=(
+                                f"Region '{exp_region}' has no known jurisdiction — "
+                                f"cross-border transfer cannot be verified for this expose"
+                            ),
+                            expose_id=exp_id,
+                            region_found=exp_region,
+                            suggestion=(
+                                "Add this region to the jurisdiction map, or pin residency "
+                                "explicitly with sovereignty.allowedRegions"
+                            ),
+                        )
+                    )
+                    # Never seeds or trips the baseline — an unknown must not
+                    # masquerade as agreement with another unknown.
+                    continue
+
+                if baseline is _UNSET:
+                    baseline = exp_jurisdiction
+                elif exp_jurisdiction != baseline:
+                    violations.append(
+                        SovereigntyViolation(
+                            severity="error",
+                            message=(
+                                "Cross-border data transfer prohibited but multiple "
+                                f"jurisdictions detected ({baseline} and {exp_jurisdiction})"
+                            ),
+                            expose_id=exp_id,
+                            region_found=exp_region,
+                            suggestion="Ensure all regions are within the same jurisdiction when crossBorderTransfer=false",
+                        )
+                    )
+                    break
 
         # Determine final validity based on enforcement mode
         has_errors = any(v.severity == "error" for v in violations)
