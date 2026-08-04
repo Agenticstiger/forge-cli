@@ -25,7 +25,8 @@ Example contract:
     {
         "sovereignty": {
             "jurisdiction": "EU",
-            "dataResidency": ["eu-west-1", "eu-central-1"],
+            "dataResidency": true,
+            "allowedRegions": ["eu-west-1", "eu-central-1"],
             "tags": ["gdpr-compliant", "schrems-ii"]
         },
         "binding": {
@@ -37,7 +38,7 @@ Example contract:
 """
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -230,9 +231,75 @@ class SovereigntyValidator:
                 jurisdiction=str(required_jurisdiction),
             )
 
+    @staticmethod
+    def _allowed_regions(sovereignty: Dict[str, Any]) -> List[str]:
+        """The region allow-list, read from the key that actually holds it.
+
+        ``allowedRegions`` is a real sibling key of ``dataResidency`` in every
+        0.7.x schema. This used to read the allow-list out of ``dataResidency``
+        itself, which is a *boolean* — see :meth:`_validate_data_residency`.
+
+        A non-boolean ``dataResidency`` is not schema-valid, but two such shapes
+        exist in the wild — a list (this module's own former docstring and a
+        stale fixture) and a dict (what ``cli/init_scan.py`` emits). They are
+        read **only as a fallback when ``allowedRegions`` is absent**, never
+        merged into it.
+
+        Precedence, not union, and deliberately so. Honouring a lone legacy
+        value is right: ignoring it would turn a stated constraint into no
+        constraint at all. But once ``allowedRegions`` is present there is no
+        such risk — a valid constraint already exists, and every region the
+        invalid key could contribute is by construction one the valid
+        allow-list deliberately excluded. Unioning them would let a
+        schema-invalid field silently *widen* a policy that a reviewer, an OPA
+        gate or a marketplace facet reads from ``allowedRegions`` alone.
+        """
+        allowed = sovereignty.get("allowedRegions") or []
+        if allowed:
+            return [str(r) for r in allowed]
+
+        legacy = sovereignty.get("dataResidency")
+        if isinstance(legacy, (list, tuple, set)):
+            regions = [str(r) for r in legacy]
+        elif isinstance(legacy, dict):
+            # ``{"allowedRegions": [...]}`` — the init_scan shape. Reading it as
+            # a plain container tested the dict's KEYS, so a legitimate region
+            # was refused and the tag value came out as the literal string
+            # "allowedRegions".
+            regions = [str(r) for r in (legacy.get("allowedRegions") or [])]
+        else:
+            return []
+
+        if regions:
+            logger.warning(
+                "sovereignty.dataResidency carries a region list; the schema types it as a "
+                "boolean and puts the allow-list in sovereignty.allowedRegions. Honouring it "
+                "as a fallback — move these regions to allowedRegions."
+            )
+        return regions
+
     def _validate_data_residency(self, sovereignty: Dict[str, Any], region: str) -> None:
         """
         Validate data residency constraints.
+
+        ``dataResidency`` is a **boolean** — "must this data stay inside the
+        declared jurisdiction?" — not a list of regions. Reading it as a list
+        meant the documented, schema-default, example-endorsed ``true`` blew up
+        with ``TypeError: argument of type 'bool' is not a container or
+        iterable``, while ``false`` quietly disabled the check. The strict
+        setting was the one that broke and the permissive one was the one that
+        worked, which is exactly backwards for a governance control.
+
+        The regions themselves come from ``allowedRegions`` / ``deniedRegions``,
+        and **neither is gated on the boolean**. ``allowedRegions`` is a
+        standalone constraint: the canonical engine
+        (``policy/sovereignty.py``, which ``fluid validate`` runs) enforces it
+        with a bare ``if allowed_regions and region not in allowed_regions``,
+        and gating it here would make the AWS provider quietly more permissive
+        than the stage before it. It would also invert the schema's own
+        ``default: true`` — an omitted ``dataResidency`` reads as falsy in
+        Python, so "unspecified" would have meant "opt out" for the very field
+        whose default is the strict setting.
 
         Args:
             sovereignty: Sovereignty configuration
@@ -241,17 +308,30 @@ class SovereigntyValidator:
         Raises:
             SovereigntyViolationError: If data residency is violated
         """
-        allowed_regions = sovereignty.get("dataResidency", [])
-        if not allowed_regions:
-            return
+        from fluid_build.cli._errors import ResidencyViolationError
 
-        if region not in allowed_regions:
-            from fluid_build.cli._errors import ResidencyViolationError
+        allowed_regions = self._allowed_regions(sovereignty)
 
+        # Deny beats allow, and is never gated — the schema is explicit that
+        # deniedRegions takes precedence over allowedRegions.
+        denied = [str(r) for r in (sovereignty.get("deniedRegions") or [])]
+        if region in denied:
             raise ResidencyViolationError.for_transfer(
                 from_region=str(region),
                 to_region="<denied>",
-                jurisdiction=", ".join(map(str, allowed_regions)),
+                jurisdiction=", ".join(allowed_regions) or "<none declared>",
+            )
+
+        if not allowed_regions:
+            # No allow-list declared; the jurisdiction check is the binding
+            # constraint for this contract.
+            return
+
+        if region not in allowed_regions:
+            raise ResidencyViolationError.for_transfer(
+                from_region=str(region),
+                to_region="<denied>",
+                jurisdiction=", ".join(allowed_regions),
             )
 
     def extract_tags(self, contract: Dict[str, Any]) -> Dict[str, str]:
@@ -274,12 +354,26 @@ class SovereigntyValidator:
         if sovereignty.get("jurisdiction"):
             tags["fluid:data_jurisdiction"] = sanitize_tag_value(sovereignty["jurisdiction"])
 
-        # Data residency enforcement tag
-        if sovereignty.get("dataResidency"):
-            tags["fluid:data_residency"] = "enforced"
-            # Store allowed regions as tag (truncated if needed)
-            allowed = ",".join(sovereignty["dataResidency"])
-            tags["fluid:allowed_regions"] = sanitize_tag_value(allowed)
+        # Data residency enforcement tag. ``dataResidency`` is a boolean, so it
+        # says *whether* residency is enforced; the regions come from
+        # ``allowedRegions``. Joining the boolean itself raised
+        # ``TypeError: can only join an iterable``, and joining a dict silently
+        # emitted its keys — one cloud tag literally read
+        # ``fluid:allowed_regions = "allowedRegions"``.
+        #
+        # The default comes from the policy engine rather than a bare
+        # ``.get(...)``, so an omitted key tags as the schema says it behaves
+        # (``default: true``). Getting this wrong is not cosmetic: detective
+        # controls downstream — an AWS Config rule, a tag-based SCP — key on
+        # these tags, so a missing tag silently disarms them.
+        from fluid_build.policy.sovereignty import DEFAULT_DATA_RESIDENCY
+
+        residency = sovereignty.get("dataResidency", DEFAULT_DATA_RESIDENCY)
+        allowed = self._allowed_regions(sovereignty)
+        if residency or allowed:
+            tags["fluid:data_residency"] = "enforced" if residency else "regions-pinned"
+            if allowed:
+                tags["fluid:allowed_regions"] = sanitize_tag_value(",".join(allowed))
 
         # Custom sovereignty tags
         for tag in sovereignty.get("tags", []):

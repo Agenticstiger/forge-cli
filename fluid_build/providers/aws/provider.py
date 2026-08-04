@@ -281,6 +281,8 @@ class AwsProvider(BaseProvider):
         if not sovereignty:
             return
 
+        from fluid_build._errors import ResidencyViolationError
+
         from .util.sovereignty import SovereigntyViolationError, validate_sovereignty
 
         # Build binding from provider configuration
@@ -294,7 +296,14 @@ class AwsProvider(BaseProvider):
                 jurisdiction=sovereignty.get("jurisdiction"),
                 data_residency=sovereignty.get("dataResidency"),
             )
-        except SovereigntyViolationError as e:
+        except (SovereigntyViolationError, ResidencyViolationError) as e:
+            # Both, deliberately. ``ResidencyViolationError`` is a *sibling* of
+            # ``SovereigntyViolationError`` — each derives straight from
+            # ``FluidUserError`` — so catching only the latter let every
+            # residency refusal past this handler. It still failed the plan via
+            # the outer ``except Exception``, but without the
+            # ``sovereignty_violation`` audit event, so the one refusal an
+            # operator most needs in the log was the one missing from it.
             self.err_kv(event="sovereignty_violation", error=str(e))
             raise ProviderError(str(e)) from e
 

@@ -7,22 +7,52 @@
     "owner": "data-platform-team@acme.com",
     "classification": "confidential",
     "contains_pii": true,
-    "compliance": ["GDPR", "SOC2", "PCI-DSS"],
+    "compliance": [
+      "GDPR",
+      "SOC2",
+      "PCI-DSS"
+    ],
     "retention_days": 2555,
     "environment": "production"
   },
   "sovereignty": {
     "jurisdiction": "EU",
-    "dataResidency": ["eu-west-1", "eu-central-1"],
-    "tags": ["gdpr-compliant", "schrems-ii"],
-    "complianceFramework": ["GDPR", "CCPA"]
+    "dataResidency": true,
+    "allowedRegions": [
+      "eu-west-1",
+      "eu-central-1"
+    ],
+    "tags": [
+      "gdpr-compliant",
+      "schrems-ii"
+    ],
+    "complianceFramework": [
+      "GDPR",
+      "CCPA"
+    ]
   },
   "agentPolicy": {
-    "allowedModels": ["gpt-4", "claude-3-opus", "gemini-pro"],
-    "deniedModels": ["public-llm", "uncertified-model"],
+    "allowedModels": [
+      "gpt-4",
+      "claude-3-opus",
+      "gemini-pro"
+    ],
+    "deniedModels": [
+      "public-llm",
+      "uncertified-model"
+    ],
     "usageConstraints": {
-      "prohibitedPurposes": ["advertising", "profiling", "surveillance"],
-      "allowedPurposes": ["analytics", "research", "reporting", "compliance"]
+      "prohibitedPurposes": [
+        "advertising",
+        "profiling",
+        "surveillance"
+      ],
+      "allowedPurposes": [
+        "analytics",
+        "research",
+        "reporting",
+        "compliance"
+      ]
     },
     "requiresHumanApproval": true,
     "auditLevel": "full",
@@ -31,7 +61,10 @@
       "requestsPerHour": 100,
       "requestsPerDay": 1000
     },
-    "tags": ["ai-audited", "llm-restricted"]
+    "tags": [
+      "ai-audited",
+      "llm-restricted"
+    ]
   },
   "schema": {
     "type": "object",
@@ -73,7 +106,11 @@
         "format": {
           "type": "parquet",
           "compression": "snappy",
-          "partitionBy": ["year", "month", "day"]
+          "partitionBy": [
+            "year",
+            "month",
+            "day"
+          ]
         },
         "cataloging": {
           "enabled": true,
@@ -122,7 +159,9 @@
         "taskId": "ensure_glue_database",
         "type": "provider_action",
         "action": "aws.glue.ensure_database",
-        "dependsOn": ["ensure_s3_bucket"],
+        "dependsOn": [
+          "ensure_s3_bucket"
+        ],
         "params": {
           "database": "financial_analytics",
           "description": "GDPR-compliant financial analytics database"
@@ -132,16 +171,27 @@
         "taskId": "ensure_glue_table",
         "type": "provider_action",
         "action": "aws.glue.ensure_table",
-        "dependsOn": ["ensure_glue_database"],
+        "dependsOn": [
+          "ensure_glue_database"
+        ],
         "params": {
           "database": "financial_analytics",
           "table": "transactions",
           "location": "s3://acme-financial-analytics-eu/transactions/",
           "format": "parquet",
           "partitionKeys": [
-            {"name": "year", "type": "int"},
-            {"name": "month", "type": "int"},
-            {"name": "day", "type": "int"}
+            {
+              "name": "year",
+              "type": "int"
+            },
+            {
+              "name": "month",
+              "type": "int"
+            },
+            {
+              "name": "day",
+              "type": "int"
+            }
           ]
         }
       },
@@ -149,7 +199,9 @@
         "taskId": "run_athena_query",
         "type": "provider_action",
         "action": "aws.athena.execute_query",
-        "dependsOn": ["ensure_glue_table"],
+        "dependsOn": [
+          "ensure_glue_table"
+        ],
         "params": {
           "database": "financial_analytics",
           "query": "MSCK REPAIR TABLE transactions",
