@@ -27,3 +27,14 @@ OPDS export functionality references the Open Data Product Standard (ODPS)
 v4.1 schema, developed by the Open Data Product Initiative under the
 Creative Commons Attribution 4.0 International License.
 https://github.com/Open-Data-Product-Initiative/v4.1
+
+Cloud-region location data bundled under
+fluid_build/policy/data/cloud_regions/ (aws.csv, gcp.csv, azure.csv) is
+vendored from the cloud-regions project and is licensed under the Open
+Database License (ODbL) v1.0, not the Apache License 2.0 that covers the rest
+of this distribution. The upstream data derives from OpenStreetMap.
+https://github.com/dgl/cloud-regions
+https://opendatacommons.org/licenses/odbl/1-0/
+
+ODbL applies to that database. It does not extend to this software, which
+reads it, nor to the validation output it produces.

@@ -14,6 +14,8 @@
 
 """Tests for fluid_build.policy.sovereignty — data sovereignty validation."""
 
+import pytest
+
 from fluid_build.policy.sovereignty import (
     EnforcementMode,
     SovereigntyValidator,
@@ -290,6 +292,14 @@ class TestCrossBorderUnknownJurisdiction:
     false), which is what arms Check 4.
     """
 
+    # Deliberately synthetic. These tests exercise the *unknown-jurisdiction*
+    # path, so they need regions guaranteed to stay off the map — using real
+    # ones (eu-south-1, me-central-1) meant the tests broke the moment the
+    # table was widened to cover them, which is the opposite of what they are
+    # for. ``test_placeholders_really_are_unmapped`` keeps them honest.
+    UNMAPPED_A = "zz-unmapped-1"
+    UNMAPPED_B = "zz-unmapped-2"
+
     @staticmethod
     def _contract(*regions, mode="strict"):
         return {
@@ -307,9 +317,16 @@ class TestCrossBorderUnknownJurisdiction:
             sum(1 for m in messages if "⚠️" in m),
         )
 
-    def test_unmapped_region_in_same_jurisdiction_does_not_block(self):
-        """``eu-south-1`` (Milan) is a real EU region absent from the map."""
-        ok, messages = validate_sovereignty(self._contract("eu-west-1", "eu-south-1"))
+    def test_placeholders_really_are_unmapped(self):
+        """Guard the premise of the tests below."""
+        from fluid_build.policy.sovereignty import region_jurisdiction_map
+
+        for region in (self.UNMAPPED_A, self.UNMAPPED_B):
+            assert region not in region_jurisdiction_map()
+
+    def test_unmapped_region_alongside_a_mapped_one_does_not_block(self):
+        """A region the table does not cover must not read as a foreign one."""
+        ok, messages = validate_sovereignty(self._contract("eu-west-1", self.UNMAPPED_A))
         errors, warnings = self._counts(messages)
         assert ok is True
         assert errors == 0
@@ -317,14 +334,14 @@ class TestCrossBorderUnknownJurisdiction:
         assert "no known jurisdiction" in "".join(messages)
 
     def test_verdict_is_independent_of_expose_order(self):
-        forward = validate_sovereignty(self._contract("eu-west-1", "eu-south-1"))
-        reverse = validate_sovereignty(self._contract("eu-south-1", "eu-west-1"))
+        forward = validate_sovereignty(self._contract("eu-west-1", self.UNMAPPED_A))
+        reverse = validate_sovereignty(self._contract(self.UNMAPPED_A, "eu-west-1"))
         assert forward[0] == reverse[0]
         assert self._counts(forward[1]) == self._counts(reverse[1])
 
     def test_two_unmapped_regions_are_not_treated_as_the_same_jurisdiction(self):
         """``None == None`` used to read as "same jurisdiction" and pass clean."""
-        ok, messages = validate_sovereignty(self._contract("me-central-1", "us-gov-west-1"))
+        ok, messages = validate_sovereignty(self._contract(self.UNMAPPED_A, self.UNMAPPED_B))
         errors, warnings = self._counts(messages)
         assert errors == 0  # we genuinely cannot tell, so we must not assert a violation
         assert warnings == 2  # but we must not claim it is clean either
@@ -349,3 +366,106 @@ class TestCrossBorderUnknownJurisdiction:
         ok, messages = validate_sovereignty(contract)
         assert ok is True
         assert self._counts(messages) == (0, 0)
+
+
+class TestRegionJurisdictionMap:
+    """The map is factual data, and a wrong entry is a silent governance bug.
+
+    Two entries were wrong in the permissive direction: ``eu-west-2`` and
+    ``europe-west2`` are both **London**, and both were mapped to ``EU``. A
+    product declaring EU-only residency and binding to London reported clean.
+    """
+
+    def test_london_is_not_the_eu(self):
+        for region in ("eu-west-2", "europe-west2", "uksouth"):
+            assert get_region_jurisdiction(region) == "UK", region
+
+    def test_zurich_is_not_the_eu(self):
+        for region in ("eu-central-2", "europe-west6", "switzerlandnorth"):
+            assert get_region_jurisdiction(region) == "CH", region
+
+    def test_regions_are_derived_not_hand_maintained(self):
+        """The volatile half of the data comes from sources that update
+        themselves — botocore's shipped endpoints.json for AWS, the vendored
+        dgl/cloud-regions csv for GCP/Azure. A hand-kept region list goes stale
+        silently, and a stale entry here is a governance bug."""
+        from fluid_build.policy.sovereignty import region_jurisdiction_map
+
+        table = region_jurisdiction_map()
+        # Spans all three clouds without any of them being typed out in source.
+        assert table["eu-west-1"] == "EU"  # AWS
+        assert table["europe-west1"] == "EU"  # GCP
+        assert table["northeurope"] == "EU"  # Azure
+        assert len(table) > 100
+
+    def test_vendored_region_data_ships(self):
+        """A wheel without these csvs resolves no GCP or Azure region at all."""
+        from fluid_build.policy.sovereignty import _VENDORED_REGION_DATA
+
+        for provider in ("aws", "gcp", "azure"):
+            assert (_VENDORED_REGION_DATA / f"{provider}.csv").exists(), provider
+
+    def test_botocore_supplies_regions_the_vendored_csv_lacks(self):
+        """Why AWS prefers botocore: the csv was 14 regions behind when
+        vendored, missing the AWS European Sovereign Cloud among others."""
+        pytest.importorskip("botocore")
+        from fluid_build.policy.sovereignty import _load_botocore_aws, _load_vendored
+
+        assert set(_load_botocore_aws()) - set(_load_vendored("aws"))
+        assert get_region_jurisdiction("eusc-de-east-1") == "EU"
+
+    def test_eu_member_state_regions_are_eu(self):
+        for region in (
+            "eu-west-1",  # Ireland
+            "eu-west-3",  # Paris
+            "eu-central-1",  # Frankfurt
+            "eu-south-1",  # Milan
+            "eu-south-2",  # Spain
+            "eu-north-1",  # Stockholm
+            "europe-west1",  # Belgium
+            "europe-west4",  # Netherlands
+            "europe-central2",  # Warsaw
+            "europe-southwest1",  # Madrid
+        ):
+            assert get_region_jurisdiction(region) == "EU", region
+
+    def test_an_eu_only_product_in_london_is_reported(self):
+        """The end-to-end consequence of the corrected mapping."""
+        ok, messages = validate_sovereignty(
+            {
+                "sovereignty": {"jurisdiction": "EU", "enforcementMode": "strict"},
+                "exposes": [{"exposeId": "x", "binding": {"location": {"region": "eu-west-2"}}}],
+            }
+        )
+        assert any("eu-west-2" in m for m in messages)
+        assert any("UK" in m for m in messages)
+
+    def test_the_aws_provider_and_the_policy_engine_agree(self):
+        """One table, not two.
+
+        These were maintained separately and had drifted apart on 16 regions —
+        `eu-west-2` was "EU" in one and "UK" in the other, every `ap-*` was a
+        single "APAC" in one and per-country in the other. A governance control
+        that answers differently depending on which stage asks is worse than
+        one that is merely incomplete.
+        """
+        from fluid_build.policy.sovereignty import region_jurisdiction_map
+        from fluid_build.providers.aws.util.sovereignty import REGION_JURISDICTIONS
+
+        canonical = region_jurisdiction_map()
+        disagreements = {
+            r: (REGION_JURISDICTIONS[r], canonical[r])
+            for r in set(REGION_JURISDICTIONS) & set(canonical)
+            if REGION_JURISDICTIONS[r] != canonical[r]
+        }
+        assert disagreements == {}
+
+    def test_unknown_regions_are_still_a_first_class_answer(self):
+        """Deriving the table does not remove the need for the unknown path —
+        a region can post-date both the installed SDK and the vendored csv."""
+        assert get_region_jurisdiction("mars-central-1") == "Unknown"
+
+    def test_eea_is_distinguished_from_the_eu(self):
+        """Norway is in the EEA, so GDPR applies — but a contract asking for
+        `jurisdiction: EU` has not asked for Norway."""
+        assert get_region_jurisdiction("norwayeast") == "EEA"
