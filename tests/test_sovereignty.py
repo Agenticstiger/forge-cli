@@ -542,9 +542,9 @@ class TestFallbackWithoutBotocore:
         verdict would depend on whether boto3 happens to be installed."""
         pytest.importorskip("botocore")
         from fluid_build.policy.sovereignty import (
+            SovereigntyValidator,
             _load_botocore_aws,
             _load_vendored,
-            SovereigntyValidator,
         )
 
         csv_table = _load_vendored("aws")
