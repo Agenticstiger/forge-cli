@@ -306,6 +306,15 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Run 'fluid policy check <contract>' to surface the offending rule before apply"],
         "sovereignty",
     ),
+    "sovereignty_violation": (
+        [
+            "Move the offending binding into an allowed region, or widen "
+            "'sovereignty.allowedRegions' in the contract",
+            "Run 'fluid validate <contract>' to see the same findings with full detail",
+            "Set 'sovereignty.enforcementMode: advisory' to report without blocking",
+        ],
+        "sovereignty",
+    ),
     # ── product authoring ──────────────────────────────────────────────────
     "product_new_failed": (
         [

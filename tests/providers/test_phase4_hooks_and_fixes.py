@@ -281,13 +281,30 @@ class TestCLIHookWrappers:
         assert result is not None
         assert result.monthly == 5.0
 
-    def test_run_validate_sovereignty_empty(self):
+    def test_run_validate_sovereignty_no_hook_is_none_not_empty(self):
+        """No hook must yield ``None``, never ``[]``.
+
+        ``[]`` means "checked, clean" and the plan renderer prints it as PASS.
+        A provider without the hook returning ``[]`` is a fail-open.
+        """
         from fluid_build.cli.hooks import run_validate_sovereignty
 
         class P:
             name = "test"
 
-        assert run_validate_sovereignty(P(), {}, self._logger()) == []
+        assert run_validate_sovereignty(P(), {}, self._logger()) is None
+
+    def test_run_validate_sovereignty_raising_hook_is_none_not_empty(self):
+        """A hook that raises must not be indistinguishable from a clean pass."""
+        from fluid_build.cli.hooks import run_validate_sovereignty
+
+        class P(ProviderHookSpec):
+            name = "test"
+
+            def validate_sovereignty(self, contract):
+                raise RuntimeError("provider exploded")
+
+        assert run_validate_sovereignty(P(), {}, self._logger()) is None
 
     def test_run_validate_sovereignty_with_hook(self):
         from fluid_build.cli.hooks import run_validate_sovereignty

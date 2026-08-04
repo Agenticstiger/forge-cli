@@ -138,10 +138,31 @@ def run_estimate_cost(
 
 def run_validate_sovereignty(
     provider: Any, contract: Dict[str, Any], logger: logging.Logger
-) -> List[str]:
-    """Invoke ``validate_sovereignty`` hook if the provider implements it."""
+) -> Optional[List[str]]:
+    """Invoke ``validate_sovereignty`` hook if the provider implements it.
+
+    Returns ``None`` — never ``[]`` — when the provider produced **no usable
+    verdict**: it has no ``validate_sovereignty`` hook, or the hook raised
+    (``invoke_hook`` swallows the exception and hands back its first argument)
+    or returned a non-list. ``[]`` therefore means one thing only: the hook ran
+    and found nothing.
+
+    That distinction is load-bearing. Collapsing "not checked" into "checked,
+    clean" is a fail-open on a governance control — the caller renders an empty
+    list as a pass, so an absent or crashing hook used to print ``PASS`` on a
+    contract that violates residency. Mirrors ``run_estimate_cost``, whose
+    ``None`` the caller already reports as "not supported by this provider".
+    """
+    name = getattr(provider, "name", "?")
     if not has_hook(provider, "validate_sovereignty"):
-        return []
-    _log(logger, "hook_validate_sovereignty", provider=getattr(provider, "name", "?"))
+        _log(logger, "hook_validate_sovereignty_absent", provider=name)
+        return None
+    _log(logger, "hook_validate_sovereignty", provider=name)
     result = invoke_hook(provider, "validate_sovereignty", contract)
-    return result if isinstance(result, list) else []
+    if not isinstance(result, list):
+        # The hook is present but gave us nothing we can trust. ``invoke_hook``
+        # returns the contract itself on failure, so a non-list here means the
+        # hook raised or is misimplemented — either way we have no verdict.
+        _log(logger, "hook_validate_sovereignty_unusable", provider=name)
+        return None
+    return [str(v) for v in result]
