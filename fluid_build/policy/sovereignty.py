@@ -157,6 +157,7 @@ def region_jurisdiction_map() -> Mapping[str, str]:
     table: Dict[str, str] = {}
     for provider in ("aws", "gcp", "azure"):
         table.update(_load_vendored(provider))
+    table.update(SovereigntyValidator.VENDORED_CORRECTIONS)
     table.update(_load_botocore_aws())
     # Read-only: the cached object is shared process-wide (and re-exported by
     # providers/aws/util/sovereignty.py), so a stray mutation anywhere would
@@ -309,6 +310,23 @@ class SovereigntyValidator:
         "Thailand": "th",
         "Beijing": "cn",
         "Ningxia": "cn",
+    }
+
+    #: Gap-fills for rows the upstream dataset ships incomplete.
+    #:
+    #: Kept HERE rather than patched into the vendored csv: that file is a
+    #: pristine copy of an ODbL dataset and has to stay refreshable from
+    #: upstream, so corrections live in our own source with a reason each.
+    #: botocore still wins where it has an answer — it agrees with all three.
+    #: Only reachable on installs without boto3, which is exactly where a
+    #: silent ``Unknown`` would be least noticed.
+    VENDORED_CORRECTIONS = {
+        # Upstream row reads literally: eu-south-2,"EU () - ???",,,,
+        # AWS calls it "Europe (Spain)".
+        "eu-south-2": "EU",
+        # Upstream leaves country_tld empty for both GovCloud regions.
+        "us-gov-east-1": "US-GOV",
+        "us-gov-west-1": "US-GOV",
     }
 
     #: Descriptions that name a jurisdiction directly rather than a place.

@@ -469,3 +469,90 @@ class TestRegionJurisdictionMap:
         """Norway is in the EEA, so GDPR applies — but a contract asking for
         `jurisdiction: EU` has not asked for Norway."""
         assert get_region_jurisdiction("norwayeast") == "EEA"
+
+
+class TestFallbackWithoutBotocore:
+    """The csv-only path — what an install without boto3 actually gets.
+
+    This class exists because CI caught what local testing missed: the dev venv
+    had botocore, so every AWS region resolved through it and the vendored-csv
+    fallback was never exercised. `eu-south-2` then resolved to EU locally and
+    `Unknown` in CI, because the upstream row for it is literally
+    ``eu-south-2,"EU () - ???",,,,``.
+
+    A governance table that is complete only when an optional dependency
+    happens to be installed is not a governance table.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_memo(self):
+        """The resolved table is memoised process-wide, so a table built with
+        botocore stubbed out must never survive into another test."""
+        from fluid_build.policy.sovereignty import region_jurisdiction_map
+
+        region_jurisdiction_map.cache_clear()
+        yield
+        region_jurisdiction_map.cache_clear()
+
+    @staticmethod
+    def _csv_only_table(monkeypatch):
+        from fluid_build.policy import sovereignty as sov
+
+        monkeypatch.setattr(sov, "_load_botocore_aws", dict)
+        sov.region_jurisdiction_map.cache_clear()
+        return sov.region_jurisdiction_map()
+
+    def test_incomplete_upstream_rows_are_corrected(self, monkeypatch):
+        table = self._csv_only_table(monkeypatch)
+        assert table.get("eu-south-2") == "EU"  # AWS "Europe (Spain)"
+        assert table.get("us-gov-east-1") == "US-GOV"
+        assert table.get("us-gov-west-1") == "US-GOV"
+
+    def test_the_corrections_only_fill_gaps(self, monkeypatch):
+        """A correction must never contradict the data it patches.
+
+        If upstream later fills one of these rows in, the correction becomes a
+        silent override of real data — so assert the rows really are empty.
+        """
+        import csv
+
+        from fluid_build.policy.sovereignty import (
+            _VENDORED_REGION_DATA,
+            SovereigntyValidator,
+        )
+
+        with (_VENDORED_REGION_DATA / "aws.csv").open(encoding="utf-8", newline="") as handle:
+            rows = {
+                r["region"]: (r.get("country_tld") or "").strip() for r in csv.DictReader(handle)
+            }
+        for region in SovereigntyValidator.VENDORED_CORRECTIONS:
+            assert not rows.get(
+                region
+            ), f"upstream now supplies a country for {region}; drop the correction"
+
+    def test_the_three_clouds_still_resolve_without_botocore(self, monkeypatch):
+        table = self._csv_only_table(monkeypatch)
+        assert table.get("eu-west-2") == "UK"  # AWS, from the csv
+        assert table.get("europe-west1") == "EU"  # GCP
+        assert table.get("northeurope") == "EU"  # Azure
+        assert len(table) > 100
+
+    def test_botocore_and_the_csv_never_disagree(self):
+        """Where both have an answer they must give the same one, or the
+        verdict would depend on whether boto3 happens to be installed."""
+        pytest.importorskip("botocore")
+        from fluid_build.policy.sovereignty import (
+            _load_botocore_aws,
+            _load_vendored,
+            SovereigntyValidator,
+        )
+
+        csv_table = _load_vendored("aws")
+        csv_table.update(SovereigntyValidator.VENDORED_CORRECTIONS)
+        boto_table = _load_botocore_aws()
+        conflicts = {
+            r: (csv_table[r], boto_table[r])
+            for r in set(csv_table) & set(boto_table)
+            if csv_table[r] != boto_table[r]
+        }
+        assert conflicts == {}
