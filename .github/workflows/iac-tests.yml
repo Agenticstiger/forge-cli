@@ -174,7 +174,17 @@ jobs:
           PUBSUB_EMULATOR_HOST: "localhost:8085"
           FLUID_GCP_BIGQUERY_EMULATOR: "http://localhost:9050"
           FLUID_GCP_STORAGE_EMULATOR: "http://localhost:4443"
-        run: .venv/bin/python -m pytest tests/iac/test_iac_gcp_emulator_e2e.py -q --no-header
+        # Both emulator files, deliberately. ``test_iac_cross_project_gcp_
+        # emulator.py`` was never in this step, so the cross-project
+        # ``access[]`` tier ran nowhere — which is how it sat broken on a
+        # missing emulator project without anyone noticing. Adding the seed
+        # that fixes it without adding the file that proves it would leave the
+        # same blind spot.
+        run: |
+          .venv/bin/python -m pytest \
+            tests/iac/test_iac_gcp_emulator_e2e.py \
+            tests/iac/test_iac_cross_project_gcp_emulator.py \
+            -q --no-header
 
       - name: Stop LocalStack
         if: always() && env.HAS_LOCALSTACK_TOKEN == 'true'

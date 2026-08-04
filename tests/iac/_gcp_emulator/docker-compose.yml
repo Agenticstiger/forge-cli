@@ -23,11 +23,18 @@ services:
     image: ghcr.io/goccy/bigquery-emulator:latest
     container_name: fluid-bigquery-emulator
     command:
+      # ``--project`` is singular and registers only the default project. The
+      # emulator tier needs two — the cross-project ``access[]`` tests write
+      # into ``fluid-iactest-producer`` — so the full set is declared in
+      # ``bq-seed.yaml`` and loaded with ``--data-from-yaml``. Without it those
+      # tests get ``404 ... project fluid-iactest-producer is not found``
+      # against a container that is otherwise up and serving.
       - --project=fluid-emulator
-      # Default datasets — empty so per-test create operations have
-      # something to chain against.
+      - --data-from-yaml=/seed/bq-seed.yaml
       - --port=9050
       - --grpc-port=9060
+    volumes:
+      - ./bq-seed.yaml:/seed/bq-seed.yaml:ro
     ports:
       - "9050:9050"
       - "9060:9060"
