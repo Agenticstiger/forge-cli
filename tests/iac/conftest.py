@@ -53,6 +53,7 @@ stray ``FLUID_IACTEST_*`` databases left behind by a hard-killed run.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import uuid
@@ -382,6 +383,78 @@ def sf_exists(conn: Any, kind: str, name: str, *, in_clause: str = "") -> bool:
     if in_clause:
         sql += f" {in_clause}"
     return len(sf_rows(conn, sql)) > 0
+
+
+@functools.lru_cache(maxsize=1)
+def _sf_supports_governance_policies(conn_id: int) -> bool:
+    """Whether this account can create masking / row-access policies.
+
+    Column-level and row-level security are Enterprise-Edition features. On a
+    Standard-Edition account Snowflake answers ``CREATE MASKING POLICY`` with
+    ``000002 (0A000): Unsupported feature 'MASKING POLICY'``, which surfaced as
+    three red live tests that no code change could ever fix.
+
+    Probed once per connection rather than assumed from an edition string —
+    ``SHOW PARAMETERS`` does not report the edition, and the authoritative
+    answer is whether the DDL is accepted. ``conn_id`` keys the cache; the
+    caller passes ``id(conn)`` so the session-scoped connection probes once.
+
+    Two properties this probe has to hold, both learned the hard way:
+
+    * **It is fully qualified into a throwaway ``FLUID_IACTEST_*`` database.**
+      An unqualified ``CREATE`` lands in whatever the user's
+      ``DEFAULT_NAMESPACE`` resolves to — a real, operator-owned database —
+      which breaks this module's "no pre-existing database is ever touched"
+      guarantee, and leaves residue that ``_sweep_stray_test_databases``
+      (databases only) could never reach. Creating our own database means the
+      existing sweeper covers the probe for free.
+    * **Only the edition signal counts as "unsupported".** A bare ``except``
+      would fold "no current schema", a permissions error and a network blip
+      into the same answer, and the memoised ``False`` would silently skip the
+      masking- and row-access-policy tests for the whole session — leaving the
+      emitters for column masking and row-level security unverified while the
+      suite still reported green. Anything that is not the edition refusal
+      propagates, so a broken probe fails loudly instead of quietly disarming
+      three governance tests.
+    """
+    conn = _SF_CONN_BY_ID.get(conn_id)
+    if conn is None:  # pragma: no cover - defensive
+        return False
+    database = f"{TEST_DB_PREFIX}CAPPROBE_{uuid.uuid4().hex[:8].upper()}"
+    schema = "S1"
+    probe = f'"{database}"."{schema}"."CAPABILITY_PROBE"'
+    try:
+        create_container(conn, database, schema)
+        try:
+            with contextlib.closing(conn.cursor()) as cur:
+                cur.execute(
+                    f"CREATE MASKING POLICY IF NOT EXISTS {probe} "
+                    "AS (v STRING) RETURNS STRING -> '***'"
+                )
+        except Exception as exc:  # noqa: BLE001 — inspected, then re-raised
+            if "unsupported feature" in str(exc).lower():
+                return False
+            raise
+        return True
+    finally:
+        with contextlib.suppress(Exception):
+            _drop_database(conn, database)
+
+
+#: ``lru_cache`` cannot key on the unhashable connection object, so the probe
+#: takes ``id(conn)`` and looks the real connection up here.
+_SF_CONN_BY_ID: Dict[int, Any] = {}
+
+
+def requires_governance_policies(conn: Any) -> None:
+    """Skip the calling test when the account has no masking/row-access DDL."""
+    _SF_CONN_BY_ID[id(conn)] = conn
+    if not _sf_supports_governance_policies(id(conn)):
+        pytest.skip(
+            "account does not support masking / row-access policies "
+            "(Enterprise Edition feature) — Snowflake returns "
+            "\"Unsupported feature 'MASKING POLICY'\""
+        )
 
 
 def sf_table_columns(
