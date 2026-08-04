@@ -387,8 +387,44 @@ def native_actions(contract, logger: logging.Logger) -> list:
         if hasattr(native, "plan"):
             return _drop_referenced_container_actions(contract, list(native.plan(contract)), logger)
     except Exception as exc:  # noqa: BLE001 — native planner is best-effort
+        # "Best-effort" covers a planner that could not RUN. It must not cover
+        # a planner that ran and REFUSED: the provider's sovereignty check is
+        # the only place AWS enforces jurisdiction/residency, and swallowing
+        # its verdict at DEBUG meant `fluid generate iac` on a contract bound
+        # outside its declared jurisdiction logged the violation and then
+        # emitted the module anyway, exit 0. Absence of a check and a failed
+        # check are different things; only the first is best-effort.
+        if _is_sovereignty_refusal(exc):
+            raise
         logger.debug("shadow: native planner unavailable: %s", exc)
     return []
+
+
+def _is_sovereignty_refusal(exc: BaseException) -> bool:
+    """True when ``exc`` (or anything it was raised *from*) is a sovereignty veto.
+
+    Providers wrap the typed error on the way out — ``AwsProvider._validate_
+    sovereignty`` does ``raise ProviderError(str(e)) from e`` — so the verdict
+    has to be recognised through the ``__cause__`` chain rather than by the
+    outermost type. Matched on type, never on message text.
+
+    Both veto types are matched. ``ResidencyViolationError`` is a *sibling* of
+    ``SovereigntyViolationError`` (each derives straight from
+    ``FluidUserError``), not a subclass — so catching only the latter silently
+    misses every residency refusal, which is half the control.
+    """
+    from fluid_build._errors import ResidencyViolationError
+    from fluid_build.cli._errors import SovereigntyViolationError
+
+    vetoes = (SovereigntyViolationError, ResidencyViolationError)
+    seen: set = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, vetoes):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 def _drop_referenced_container_actions(contract, actions: list, logger: logging.Logger) -> list:
