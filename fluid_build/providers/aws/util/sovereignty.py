@@ -49,45 +49,26 @@ logger = logging.getLogger(__name__)
 # `except SovereigntyViolationError` blocks now see the typed Panel.
 from fluid_build.cli._errors import SovereigntyViolationError  # noqa: E402,F401
 
-# AWS region to jurisdiction mapping
-REGION_JURISDICTIONS = {
-    # US Regions
-    "us-east-1": "US",
-    "us-east-2": "US",
-    "us-west-1": "US",
-    "us-west-2": "US",
-    "us-gov-east-1": "US-GOV",
-    "us-gov-west-1": "US-GOV",
-    # EU Regions
-    "eu-west-1": "EU",
-    "eu-west-2": "EU",
-    "eu-west-3": "EU",
-    "eu-central-1": "EU",
-    "eu-central-2": "EU",
-    "eu-north-1": "EU",
-    "eu-south-1": "EU",
-    "eu-south-2": "EU",
-    # Asia Pacific
-    "ap-south-1": "APAC",
-    "ap-south-2": "APAC",
-    "ap-northeast-1": "APAC",
-    "ap-northeast-2": "APAC",
-    "ap-northeast-3": "APAC",
-    "ap-southeast-1": "APAC",
-    "ap-southeast-2": "APAC",
-    "ap-southeast-3": "APAC",
-    "ap-southeast-4": "APAC",
-    "ap-east-1": "APAC",
-    # Canada
-    "ca-central-1": "CA",
-    # Middle East
-    "me-south-1": "ME",
-    "me-central-1": "ME",
-    # South America
-    "sa-east-1": "SA",
-    # Africa
-    "af-south-1": "AF",
-}
+
+# AWS region → jurisdiction.
+#
+# Delegated to ``policy.sovereignty``, which resolves regions from botocore's
+# shipped ``endpoints.json`` (falling back to a vendored csv). This module used
+# to keep its own parallel table; the two had drifted apart on 16 regions —
+# `eu-west-2` was "EU" here and "UK" there, every `ap-*` collapsed to a single
+# "APAC" here and was per-country there — so `fluid validate` and the AWS
+# provider could reach opposite verdicts on the same contract. A governance
+# control that answers differently depending on which stage asks is worse than
+# one that is merely incomplete.
+#
+# Resolved lazily through PEP 562 so importing this module does not pull
+# botocore or read a csv; `fluid --help` must stay off that path.
+def __getattr__(name: str):  # noqa: D401 - module-level lazy attribute
+    if name == "REGION_JURISDICTIONS":
+        from fluid_build.policy.sovereignty import region_jurisdiction_map
+
+        return region_jurisdiction_map()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def sanitize_tag_value(value: str) -> str:
@@ -213,7 +194,9 @@ class SovereigntyValidator:
             return
 
         # Get actual jurisdiction from region
-        actual_jurisdiction = REGION_JURISDICTIONS.get(region)
+        from fluid_build.policy.sovereignty import region_jurisdiction_map
+
+        actual_jurisdiction = region_jurisdiction_map().get(region)
 
         if not actual_jurisdiction:
             raise SovereigntyViolationError(

@@ -19,9 +19,15 @@ Validates data sovereignty constraints against infrastructure bindings.
 Prevents deployment of contracts that violate jurisdiction requirements.
 """
 
+import csv
+import functools
+import json
+import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from ._common import iter_exposes
 
@@ -61,46 +67,277 @@ class SovereigntyViolation:
     suggestion: Optional[str] = None
 
 
+_VENDORED_REGION_DATA = Path(__file__).parent / "data" / "cloud_regions"
+
+
+def _parse_place(description: str) -> List[str]:
+    """Candidate place names from a botocore region description.
+
+    ``"Europe (London)"`` -> ``["London", "Europe"]`` — the parenthetical first,
+    since "Europe" alone does not name a country and "London" does.
+    """
+    match = re.match(r"^(.*?)\s*\((.*)\)\s*$", description or "")
+    if not match:
+        return [description.strip()] if description else []
+    return [match.group(2).strip(), match.group(1).strip()]
+
+
+def _jurisdiction_for_description(description: str) -> Optional[str]:
+    """Resolve a botocore description through the two hand tables."""
+    places = _parse_place(description)
+    # Specials first across ALL candidates. "AWS GovCloud (US-East)" resolves
+    # correctly today only because the parenthetical is "US-East" (hyphen)
+    # while PLACE_COUNTRIES holds "US East" (space) — if AWS ever normalises
+    # that string, a per-place loop would silently downgrade GovCloud to plain
+    # US. Ordering the lookups this way removes the coupling.
+    for place in places:
+        special = SovereigntyValidator.SPECIAL_PLACE_JURISDICTIONS.get(place)
+        if special:
+            return special
+    for place in places:
+        country = SovereigntyValidator.PLACE_COUNTRIES.get(place)
+        if country:
+            return SovereigntyValidator.COUNTRY_JURISDICTIONS.get(country)
+    return None
+
+
+def _load_vendored(provider: str) -> Dict[str, str]:
+    """``region -> jurisdiction`` from a vendored dgl/cloud-regions csv."""
+    path = _VENDORED_REGION_DATA / f"{provider}.csv"
+    if not path.exists():  # pragma: no cover - packaging guard
+        return {}
+    resolved: Dict[str, str] = {}
+    with path.open(encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            region = (row.get("region") or "").strip().strip('"')
+            country = (row.get("country_tld") or "").strip().lower()
+            jurisdiction = SovereigntyValidator.COUNTRY_JURISDICTIONS.get(country)
+            if region and jurisdiction:
+                resolved[region] = jurisdiction
+    return resolved
+
+
+def _load_botocore_aws() -> Dict[str, str]:
+    """``region -> jurisdiction`` from botocore's shipped ``endpoints.json``.
+
+    Returns ``{}`` when botocore is absent — the light CLI does not require
+    boto3, and a missing optional dependency must degrade to the vendored csv
+    rather than break a governance check.
+    """
+    try:
+        import botocore  # noqa: F401 — presence check, path taken from the module
+    except ImportError:
+        return {}
+    try:
+        data_path = Path(botocore.__file__).parent / "data" / "endpoints.json"
+        payload = json.loads(data_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):  # pragma: no cover - corrupt/renamed SDK data
+        return {}
+
+    resolved: Dict[str, str] = {}
+    for partition in payload.get("partitions") or []:
+        for region, meta in (partition.get("regions") or {}).items():
+            jurisdiction = _jurisdiction_for_description(meta.get("description", ""))
+            if jurisdiction:
+                resolved[region] = jurisdiction
+    return resolved
+
+
+@functools.lru_cache(maxsize=1)
+def region_jurisdiction_map() -> Mapping[str, str]:
+    """The resolved ``region -> jurisdiction`` table.
+
+    Later sources win: vendored csv (all three clouds) first, then botocore for
+    AWS, which is the vendor's own data and measurably ahead of the csv.
+
+    Memoised — the tables are static for the life of the process — and lazy, so
+    ``fluid --help`` never imports botocore or reads a csv. Call
+    ``region_jurisdiction_map.cache_clear()`` in tests that need a rebuild.
+    """
+    table: Dict[str, str] = {}
+    for provider in ("aws", "gcp", "azure"):
+        table.update(_load_vendored(provider))
+    table.update(SovereigntyValidator.VENDORED_CORRECTIONS)
+    table.update(_load_botocore_aws())
+    # Read-only: the cached object is shared process-wide (and re-exported by
+    # providers/aws/util/sovereignty.py), so a stray mutation anywhere would
+    # silently rewrite the jurisdiction table for every later check.
+    return MappingProxyType(table)
+
+
 class SovereigntyValidator:
     """Validates sovereignty constraints in FLUID 0.7.1 contracts."""
 
-    # Region → Jurisdiction mapping (extensible)
-    REGION_JURISDICTION_MAP = {
-        # AWS regions
-        "us-east-1": "US",
-        "us-east-2": "US",
-        "us-west-1": "US",
-        "us-west-2": "US",
-        "eu-west-1": "EU",
-        "eu-west-2": "EU",
-        "eu-west-3": "EU",
-        "eu-central-1": "EU",
-        "eu-north-1": "EU",
-        "ca-central-1": "CA",
-        "ap-southeast-1": "Global",
-        "ap-southeast-2": "AU",
-        "ap-northeast-1": "JP",
-        "ap-northeast-2": "Global",
-        "sa-east-1": "BR",
-        # GCP regions
-        "us-central1": "US",
-        "us-east1": "US",
-        "us-west1": "US",
-        "europe-west1": "EU",
-        "europe-west2": "EU",
-        "europe-west3": "EU",
-        "europe-west4": "EU",
-        "asia-southeast1": "Global",
-        "asia-northeast1": "JP",
-        # Azure regions
-        "eastus": "US",
-        "eastus2": "US",
-        "westus": "US",
-        "westus2": "US",
-        "westeurope": "EU",
-        "northeurope": "EU",
-        "canadacentral": "CA",
+    # Region → jurisdiction is **derived, not hand-maintained**.
+    #
+    # A region table in a repo is a losing race: the clouds ship regions faster
+    # than anyone edits this file, and a stale entry is a silent governance bug
+    # rather than a missing feature. So the volatile half comes from data that
+    # updates itself:
+    #
+    #   AWS          botocore's ``endpoints.json`` — the vendor's own table,
+    #                shipped with the SDK and refreshed on every release. Covers
+    #                all partitions, GovCloud and the EU Sovereign Cloud included.
+    #   GCP / Azure  ``policy/data/cloud_regions/*.csv``, vendored from
+    #                dgl/cloud-regions (ODbL-1.0 — see the README next to it).
+    #                Neither vendor ships an offline dataset of their own.
+    #
+    # Measured when this was written: the vendored AWS csv was 14 regions behind
+    # botocore (missing ``eusc-de-east-1``, the AWS European Sovereign Cloud,
+    # among others) and had no region botocore lacked — hence botocore first for
+    # AWS, with the csv as the fallback for installs without boto3.
+    #
+    # What stays hand-written is the two small, *geopolitically* stable tables
+    # below. They change when borders and treaties change, not when a vendor
+    # opens a datacentre.
+    #
+    # Resolution is lazy and memoised (:func:`region_jurisdiction_map`), so the
+    # ``fluid --help`` cold path never imports botocore or reads a csv.
+
+    #: Country (ISO-ish, TLD-biased — ``uk`` not ``gb``, matching the vendored
+    #: csv) → jurisdiction. **Identity, not adequacy**: the UK and Switzerland
+    #: hold GDPR adequacy decisions, so an EU→UK transfer is usually lawful, but
+    #: it is still a transfer to a third country and a contract asking for
+    #: ``jurisdiction: EU`` has not asked for the UK. Conflating the two is why
+    #: London used to resolve to "EU" and an EU-only product deploying there
+    #: reported clean. Adequacy belongs in ``transferMechanisms``.
+    COUNTRY_JURISDICTIONS = {
+        # EU member states
+        "at": "EU",
+        "be": "EU",
+        "bg": "EU",
+        "hr": "EU",
+        "cy": "EU",
+        "cz": "EU",
+        "dk": "EU",
+        "ee": "EU",
+        "fi": "EU",
+        "fr": "EU",
+        "de": "EU",
+        "gr": "EU",
+        "hu": "EU",
+        "ie": "EU",
+        "it": "EU",
+        "lv": "EU",
+        "lt": "EU",
+        "lu": "EU",
+        "mt": "EU",
+        "nl": "EU",
+        "pl": "EU",
+        "pt": "EU",
+        "ro": "EU",
+        "sk": "EU",
+        "si": "EU",
+        "es": "EU",
+        "se": "EU",
+        # EEA but not EU — GDPR applies, EU-only residency still excludes them
+        "no": "EEA",
+        "is": "EEA",
+        "li": "EEA",
+        # Everyone else, by country
+        "uk": "UK",
+        "ch": "CH",
+        "us": "US",
+        "ca": "CA",
+        "mx": "MX",
+        "br": "BR",
+        "cl": "CL",
+        "il": "IL",
+        "ae": "AE",
+        "bh": "BH",
+        "sa": "SA",
+        "qa": "QA",
+        "za": "ZA",
+        "ng": "NG",
+        "ke": "KE",
+        "jp": "JP",
+        "kr": "KR",
+        "cn": "CN",
+        "hk": "HK",
+        "tw": "TW",
+        "sg": "SG",
+        "in": "IN",
+        "id": "ID",
+        "my": "MY",
+        "th": "TH",
+        "vn": "VN",
+        "ph": "PH",
+        "au": "AU",
+        "nz": "NZ",
+        "tr": "TR",
     }
+
+    #: Place → country, keyed on the names botocore puts in its region
+    #: descriptions ("Europe (London)" → ``London``, "Israel (Tel Aviv)" →
+    #: ``Israel``). Both the parenthetical and the outer group are tried, so a
+    #: description need only match on one. Only needed because botocore
+    #: describes regions in prose rather than by country code.
+    PLACE_COUNTRIES = {
+        "Frankfurt": "de",
+        "Ireland": "ie",
+        "Paris": "fr",
+        "Milan": "it",
+        "Spain": "es",
+        "Stockholm": "se",
+        "Germany": "de",
+        "London": "uk",
+        "Zurich": "ch",
+        "US East": "us",
+        "US West": "us",
+        "Canada": "ca",
+        "Canada West": "ca",
+        "Mexico": "mx",
+        "Sao Paulo": "br",
+        "South America": "br",
+        "Israel": "il",
+        "Tel Aviv": "il",
+        "Bahrain": "bh",
+        "UAE": "ae",
+        "Cape Town": "za",
+        "Hong Kong": "hk",
+        "Taipei": "tw",
+        "Mumbai": "in",
+        "Hyderabad": "in",
+        "Tokyo": "jp",
+        "Osaka": "jp",
+        "Seoul": "kr",
+        "Singapore": "sg",
+        "Sydney": "au",
+        "Melbourne": "au",
+        "Jakarta": "id",
+        "Malaysia": "my",
+        "New Zealand": "nz",
+        "Thailand": "th",
+        "Beijing": "cn",
+        "Ningxia": "cn",
+    }
+
+    #: Gap-fills for rows the upstream dataset ships incomplete.
+    #:
+    #: Kept HERE rather than patched into the vendored csv: that file is a
+    #: pristine copy of an ODbL dataset and has to stay refreshable from
+    #: upstream, so corrections live in our own source with a reason each.
+    #: botocore still wins where it has an answer — it agrees with all three.
+    #: Only reachable on installs without boto3, which is exactly where a
+    #: silent ``Unknown`` would be least noticed.
+    VENDORED_CORRECTIONS = {
+        # Upstream row reads literally: eu-south-2,"EU () - ???",,,,
+        # AWS calls it "Europe (Spain)".
+        "eu-south-2": "EU",
+        # Upstream leaves country_tld empty for both GovCloud regions.
+        "us-gov-east-1": "US-GOV",
+        "us-gov-west-1": "US-GOV",
+    }
+
+    #: Descriptions that name a jurisdiction directly rather than a place.
+    #: Descriptions that name a jurisdiction directly rather than a place.
+    #:
+    #: NB: the classified partitions ("US ISO East", "US ISOB East (Ohio)",
+    #: "EU ISOE West", …) deliberately resolve to Unknown — they carry no
+    #: entry here and no place entry below. Do NOT "fix" that by adding
+    #: ``"Ohio": "us"`` to PLACE_COUNTRIES: it would silently reclassify an
+    #: air-gapped intelligence-community region as ordinary commercial US.
+    SPECIAL_PLACE_JURISDICTIONS = {"AWS GovCloud": "US-GOV"}
 
     def validate(self, contract: Dict[str, Any]) -> Tuple[bool, List[SovereigntyViolation]]:
         """
@@ -176,7 +413,7 @@ class SovereigntyValidator:
 
             # Check 3: Jurisdiction match
             if jurisdiction and jurisdiction != "Global":
-                region_jurisdiction = self.REGION_JURISDICTION_MAP.get(region, "Unknown")
+                region_jurisdiction = region_jurisdiction_map().get(region, "Unknown")
                 if region_jurisdiction != jurisdiction and region_jurisdiction != "Global":
                     violations.append(
                         SovereigntyViolation(
@@ -196,7 +433,7 @@ class SovereigntyValidator:
         #
         # The subtlety this code exists to get right: ``None`` used to mean two
         # different things — "no baseline yet" and "this region is not in
-        # REGION_JURISDICTION_MAP". Conflating them made the check both
+        # the resolved region table. Conflating them made the check both
         # over- and under-sensitive, and its verdict depended on expose order:
         #   * eu-west-1 + eu-south-1 (both EU, the latter unmapped) -> BLOCKED
         #   * the same two, reversed                                -> passed
@@ -212,7 +449,7 @@ class SovereigntyValidator:
                 if not exp_region:
                     continue
                 exp_id = exp.get("exposeId", "unknown")
-                exp_jurisdiction = self.REGION_JURISDICTION_MAP.get(exp_region, "Unknown")
+                exp_jurisdiction = region_jurisdiction_map().get(exp_region, "Unknown")
 
                 if exp_jurisdiction == "Unknown":
                     # Say what we actually know. Warning severity, so an
@@ -298,4 +535,4 @@ def get_region_jurisdiction(region: str) -> str:
     Returns:
         Jurisdiction code (EU, US, etc.) or "Unknown"
     """
-    return SovereigntyValidator.REGION_JURISDICTION_MAP.get(region, "Unknown")
+    return region_jurisdiction_map().get(region, "Unknown")

@@ -481,6 +481,11 @@ fluid_build = [
   "cli/*.json",
   "cli/agent_specs/**/*.yaml",
   "cli/industry_skills/**/*.yaml",
+  # Vendored cloud-region data (ODbL-1.0, see the README beside it) — the
+  # residency check reads these at runtime, so they must ship in the wheel
+  # or a `pip install`ed forge-cli resolves no GCP/Azure region at all.
+  "policy/data/cloud_regions/*.csv",
+  "policy/data/cloud_regions/*.md",
   "copilot/**/*.yaml",
   "copilot/**/*.md",
   "schemas/**/*.json",

@@ -286,10 +286,19 @@ def apply_governance_policies(
         if "eu" in target_db.lower() and Confirm.ask(
             "\nApply GDPR sovereignty controls?", default=True
         ):
+            # Every key here is schema-checked: ``$defs.sovereignty`` sets
+            # ``additionalProperties: false``, so an invented key is a hard
+            # validation error, not a warning. This block previously emitted
+            # ``dataResidency`` as an object (it is a boolean; the region list
+            # belongs in the sibling ``allowedRegions``) and invented
+            # ``jurisdictionRequirements`` for what the schema calls
+            # ``regulatoryFramework`` — so `fluid import` handed the user a
+            # contract that `fluid validate` rejected on the very next step.
             contract["sovereignty"] = {
                 "jurisdiction": "EU",
-                "dataResidency": {"allowedRegions": ["europe-west1", "europe-west4"]},
-                "jurisdictionRequirements": ["GDPR"],
+                "dataResidency": True,
+                "allowedRegions": ["europe-west1", "europe-west4"],
+                "regulatoryFramework": ["GDPR"],
             }
 
     console.print("\n✅ Governance policies applied\n")
