@@ -1,0 +1,26 @@
+# Seed for ghcr.io/goccy/bigquery-emulator.
+#
+# ``--project`` is singular and only registers ONE project, but the emulator
+# tier spans two: ``fluid-emulator`` (the general BigQuery/GCS/Pub/Sub e2e
+# tests) and ``fluid-iactest-producer`` (the cross-project ``access[]`` tests,
+# which need a real producer project to write a dataset into). Anything not
+# registered answers ``404 ... project <id> is not found``, which is what made
+# four tests fail against a container that was otherwise healthy.
+#
+# ``--data-from-yaml`` is the emulator's supported way to declare more than
+# one. Each project needs at least one dataset — the emulator rejects a
+# project with no ``datasets`` key ("Field validation for 'Datasets' failed
+# on the 'required' tag") — so each carries a ``_bootstrap`` placeholder that
+# no test touches; tests create and drop their own datasets alongside it.
+#
+# The consumer projects (``fluid-iactest-consumer`` / ``-consumer-c``) are
+# deliberately absent: a cross-project ``userByEmail`` grant is just an email
+# string to the dataset API, so they are never contacted. That is precisely
+# the property those tests assert.
+projects:
+  - id: fluid-emulator
+    datasets:
+      - id: _bootstrap
+  - id: fluid-iactest-producer
+    datasets:
+      - id: _bootstrap
