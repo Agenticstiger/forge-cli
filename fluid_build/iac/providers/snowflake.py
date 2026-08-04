@@ -268,7 +268,32 @@ class SnowflakeIacPlugin:
         Anything the operator set explicitly (the v2 vars directly) wins. A
         legacy bare account locator with no org (e.g. ``xy12345``) cannot be
         split — the overlay stays empty and the provider surfaces its own
-        clear error.
+        error.
+
+        **The legacy variable must also be cleared, not merely supplemented.**
+        Adding the v2 vars while leaving ``SNOWFLAKE_ACCOUNT`` set is not a
+        superset — it is its own failure mode. From provider 2.x the bare
+        ``account`` field is gated behind an experiment, and the provider
+        errors out the moment it sees the legacy variable *regardless* of the
+        v2 vars being present::
+
+            the account field requires the "PROVIDER_CONFIGURATION_ACCOUNT_FALLBACK"
+            experiment to be enabled; add it to experimental_features_enabled
+
+        Measured against a live account on provider 2.19.0 / OpenTofu 1.12.0:
+
+        ==========================================  ================
+        environment                                 ``tofu plan``
+        ==========================================  ================
+        ``SNOWFLAKE_ACCOUNT`` only                  rejected
+        ``SNOWFLAKE_ACCOUNT`` + the two v2 vars     rejected
+        the two v2 vars, legacy var blanked         **succeeds**
+        ==========================================  ================
+
+        The overlay is applied by the callers as ``env.update(...)`` (see
+        ``cli/_apply_opentofu_engine.py``), which can add but not delete, so
+        the legacy key is blanked rather than removed — an empty value reads
+        as unset to the provider, verified as the third row above.
         """
         account = str(env.get("SNOWFLAKE_ACCOUNT") or "").strip()
         org, sep, account_name = account.partition("-")
@@ -279,6 +304,21 @@ class SnowflakeIacPlugin:
                 overlay["SNOWFLAKE_ORGANIZATION_NAME"] = org
             if not env.get("SNOWFLAKE_ACCOUNT_NAME"):
                 overlay["SNOWFLAKE_ACCOUNT_NAME"] = account_name
+        # Blank the legacy variable only once a complete v2 identity is
+        # actually available — whether the operator supplied it directly or we
+        # just derived it above. An un-splittable bare locator keeps its
+        # legacy value: clearing it would trade the provider's "enable the
+        # experiment" error for a less informative "account is empty", and
+        # neither configuration can plan. That operator's route is to set the
+        # two v2 variables (or opt into the experiment themselves).
+        org_resolved = overlay.get("SNOWFLAKE_ORGANIZATION_NAME") or env.get(
+            "SNOWFLAKE_ORGANIZATION_NAME"
+        )
+        account_resolved = overlay.get("SNOWFLAKE_ACCOUNT_NAME") or env.get(
+            "SNOWFLAKE_ACCOUNT_NAME"
+        )
+        if account and org_resolved and account_resolved:
+            overlay["SNOWFLAKE_ACCOUNT"] = ""
         return overlay
 
     def discover_imports(

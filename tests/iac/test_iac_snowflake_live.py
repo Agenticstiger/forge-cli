@@ -46,6 +46,7 @@ from .conftest import (
     masking_policy_contract,
     planned_view_action,
     procedure_action,
+    requires_governance_policies,
     row_access_policy_contract,
     sf_exists,
     sf_rows,
@@ -235,6 +236,7 @@ def test_live_grant(tofu_project, live_db, sf_connection):
 
 def test_live_masking_policy(tofu_project, live_db, sf_connection):
     """``snowflake_masking_policy`` — created in its home schema."""
+    requires_governance_policies(sf_connection)
     create_container(sf_connection, live_db, _SCHEMA)
     contract = masking_policy_contract(live_db, _SCHEMA, "EVENTS", name="MASK_PII")
     resources = snowflake_plugin().emit(contract)
@@ -251,6 +253,7 @@ def test_live_masking_policy(tofu_project, live_db, sf_connection):
 
 def test_live_row_access_policy(tofu_project, live_db, sf_connection):
     """``snowflake_row_access_policy`` — created in its home schema."""
+    requires_governance_policies(sf_connection)
     create_container(sf_connection, live_db, _SCHEMA)
     contract = row_access_policy_contract(live_db, _SCHEMA, "EVENTS", name="TENANT_RAP")
     resources = snowflake_plugin().emit(contract)
@@ -356,6 +359,7 @@ def test_live_masking_policy_with_emitted_container_single_apply(
     """A contract that emits both a schema/table AND a masking policy on the
     same schema applies in one shot — the policy's ``depends_on`` orders it
     after the schema."""
+    requires_governance_policies(sf_connection)
     contract = masking_policy_contract(live_db, _SCHEMA, "EVENTS", name="MASK_PII")
 
     tofu_project.apply_ok(contract)

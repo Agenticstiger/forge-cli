@@ -32,7 +32,21 @@ services:
       - "9050:9050"
       - "9060:9060"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9050/discovery/v1/apis/bigquery/v2/rest"]
+      # ``wget`` is NOT in ghcr.io/goccy/bigquery-emulator — the old probe
+      # failed with `exec: "wget": executable file not found in $PATH`, so the
+      # container reported ``(unhealthy)`` forever even while the REST server
+      # was up and serving. The image ships no wget/curl/nc, but it does ship
+      # bash, so drive the socket through bash's /dev/tcp. It must be an
+      # explicit ``bash -c``: ``CMD-SHELL`` runs ``/bin/sh``, which is dash
+      # here, and dash has no /dev/tcp ("Directory nonexistent").
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9050 &&
+          printf 'GET /discovery/v1/apis/bigquery/v2/rest HTTP/1.0\r\n\r\n' >&3 &&
+          head -1 <&3 | grep -q '200'
       interval: 5s
       timeout: 3s
       retries: 10

@@ -421,6 +421,8 @@ class TestSnowflakeCredentialEnv:
         assert overlay == {
             "SNOWFLAKE_ORGANIZATION_NAME": "XGVDOZV",
             "SNOWFLAKE_ACCOUNT_NAME": "PV74570",
+            # Blanked, not merely supplemented — see TestSnowflakeAccountFallbackDrift.
+            "SNOWFLAKE_ACCOUNT": "",
         }
 
     def test_explicit_v2_vars_are_not_overridden(self):
@@ -431,14 +433,16 @@ class TestSnowflakeCredentialEnv:
                 "SNOWFLAKE_ACCOUNT_NAME": "MYACCT",
             }
         )
-        assert overlay == {}
+        # The operator's v2 values are left untouched, but the legacy variable
+        # is still retired — its mere presence is what the provider rejects.
+        assert overlay == {"SNOWFLAKE_ACCOUNT": ""}
 
     def test_partial_v2_var_is_completed(self):
         # Org set explicitly, account-name missing → fill only the gap.
         overlay = _sf().credential_env(
             {"SNOWFLAKE_ACCOUNT": "XGVDOZV-PV74570", "SNOWFLAKE_ORGANIZATION_NAME": "MYORG"}
         )
-        assert overlay == {"SNOWFLAKE_ACCOUNT_NAME": "PV74570"}
+        assert overlay == {"SNOWFLAKE_ACCOUNT_NAME": "PV74570", "SNOWFLAKE_ACCOUNT": ""}
 
     def test_hostname_suffix_is_stripped(self):
         overlay = _sf().credential_env(
@@ -447,6 +451,7 @@ class TestSnowflakeCredentialEnv:
         assert overlay == {
             "SNOWFLAKE_ORGANIZATION_NAME": "xgvdozv",
             "SNOWFLAKE_ACCOUNT_NAME": "pv74570",
+            "SNOWFLAKE_ACCOUNT": "",
         }
 
     def test_legacy_locator_without_org_yields_no_overlay(self):
@@ -456,6 +461,69 @@ class TestSnowflakeCredentialEnv:
 
     def test_unset_account_yields_no_overlay(self):
         assert _sf().credential_env({}) == {}
+
+
+class TestSnowflakeAccountFallbackDrift:
+    """Pin the legacy ``SNOWFLAKE_ACCOUNT`` retirement.
+
+    From provider 2.x the bare ``account`` field is gated behind the
+    ``PROVIDER_CONFIGURATION_ACCOUNT_FALLBACK`` experiment, and the provider
+    rejects the configuration the moment it *sees* the legacy variable — even
+    when the v2 ``SNOWFLAKE_ORGANIZATION_NAME`` / ``SNOWFLAKE_ACCOUNT_NAME``
+    pair is also present. Supplementing was therefore not enough; the legacy
+    variable has to go.
+
+    Measured against a live account on provider 2.19.0 / OpenTofu 1.12.0:
+    legacy-only rejected, legacy + v2 rejected, v2 with the legacy variable
+    blanked planned successfully. Every live Snowflake IaC test failed at
+    ``tofu plan`` until this was fixed.
+    """
+
+    def test_legacy_account_is_blanked_when_v2_identity_is_derived(self):
+        overlay = _sf().credential_env({"SNOWFLAKE_ACCOUNT": "XGVDOZV-PV74570"})
+        assert overlay["SNOWFLAKE_ACCOUNT"] == ""
+
+    def test_legacy_account_is_blanked_when_operator_set_v2_directly(self):
+        """The case supplementing missed: both identities present -> rejected."""
+        overlay = _sf().credential_env(
+            {
+                "SNOWFLAKE_ACCOUNT": "XGVDOZV-PV74570",
+                "SNOWFLAKE_ORGANIZATION_NAME": "MYORG",
+                "SNOWFLAKE_ACCOUNT_NAME": "MYACCT",
+            }
+        )
+        assert overlay["SNOWFLAKE_ACCOUNT"] == ""
+
+    def test_applying_the_overlay_leaves_no_usable_legacy_value(self):
+        """End-to-end on the overlay contract: callers do ``env.update(...)``.
+
+        ``env.update`` can add but not delete, which is why the fix blanks
+        rather than pops. What matters is the value the provider ends up
+        seeing, so assert on the merged environment the way the apply engine
+        builds it.
+        """
+        env = {"SNOWFLAKE_ACCOUNT": "XGVDOZV-PV74570", "SNOWFLAKE_USER": "u"}
+        env.update(_sf().credential_env(env))
+        assert not env["SNOWFLAKE_ACCOUNT"]
+        assert env["SNOWFLAKE_ORGANIZATION_NAME"] == "XGVDOZV"
+        assert env["SNOWFLAKE_ACCOUNT_NAME"] == "PV74570"
+        assert env["SNOWFLAKE_USER"] == "u"  # unrelated vars survive
+
+    def test_unsplittable_locator_keeps_its_legacy_value(self):
+        """A bare locator has no v2 identity to fall back on.
+
+        Blanking it would swap the provider's actionable "enable the
+        experiment" error for a vaguer "account is empty"; neither
+        configuration can plan, so leave the operator the better message.
+        """
+        overlay = _sf().credential_env({"SNOWFLAKE_ACCOUNT": "xy12345"})
+        assert "SNOWFLAKE_ACCOUNT" not in overlay
+
+    def test_nothing_to_retire_when_no_legacy_value_was_set(self):
+        overlay = _sf().credential_env(
+            {"SNOWFLAKE_ORGANIZATION_NAME": "MYORG", "SNOWFLAKE_ACCOUNT_NAME": "MYACCT"}
+        )
+        assert "SNOWFLAKE_ACCOUNT" not in overlay
 
 
 class TestSnowflakeDiscoverImports:
