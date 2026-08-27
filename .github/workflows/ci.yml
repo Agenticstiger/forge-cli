@@ -592,7 +592,7 @@ jobs:
         # Skipped on fork PRs — their GITHUB_TOKEN cannot write
         # security-events. The gate step above still runs and still blocks.
         if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81  # v4.37.3
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3  # v4.37.6
         with:
           sarif_file: semgrep.sarif
           category: semgrep
