@@ -4,6 +4,17 @@ Status of `forge-cli`'s IaC test coverage on `feat/opentofu-iac-autogen`.
 Written so a reviewer can pick up cold: what's covered, what's NOT
 covered, and where the upstream limitations live.
 
+**Suite size, pinned at the release tag.** `v0.14.1` (`f41b57bd`) collects
+**17,434** tests:
+
+```
+$ git checkout v0.14.1 && python -m pytest --collect-only -q | tail -1
+17434/17443 tests collected (9 deselected) in 14.90s
+```
+
+Reproduce it before quoting it — the figure moves with every release, and a
+count taken off `main` will not match the tag.
+
 ## Stage ladder
 
 | Stage | Definition | Where it runs |
@@ -44,7 +55,7 @@ Markers declared in `pyproject.toml`.
 | Stage 2 docker emulator | `tests/iac/test_iac_gcp_emulator_e2e.py` | ✅ 8 hybrid (emit via plan + emulator via SDK) + 1 documented xfail — see [Upstream limitations](#upstream-limitations) |
 | Stage 2 cross-project `access[]` | `tests/iac/test_iac_cross_project_gcp_emulator.py` | ✅ 5/5 — the **emitted** cross-project `user_by_email` entry (incl. two distinct consumer projects) round-trips through goccy/bigquery-emulator intact. **Storage fidelity only**: the emulator performs no validation (accepts `role: NOT_A_ROLE` + a non-email principal, HTTP 200) and no IAM evaluation (unauthenticated query succeeds) — both pinned executably by `test_emulator_neither_validates_nor_enforces_access`. Real IAM/authorization still needs a second GCP project (Stage 3 row below). |
 | Stage 3 base | `tests/iac/test_iac_gcp_real_e2e.py` | ✅ 7/7 (BQ dataset+table, BQ view, GCS, Pub/Sub, multi-exposure, dbt-bigquery via CLI, full mesh) |
-| Stage 3 CLI matrix | `tests/iac/test_iac_gcp_real_cli_matrix_e2e.py` | ✅ 6/6 |
+| Stage 3 CLI matrix | `tests/iac/test_iac_gcp_real_cli_matrix_e2e.py` | ✅ 8/8 — the 6 above, plus `fluid verify` in both directions: passes against a matching live table, and **fails** `--strict` when the contract declares a column that was never deployed |
 | Stage 3 idempotency | `tests/iac/test_iac_gcp_real_idempotency_e2e.py` | ✅ (see Stage 3 §) |
 | Stage 3 replace mode | `tests/iac/test_iac_gcp_real_replace_e2e.py` | ✅ |
 | Stage 3 brownfield | _file claimed but absent — see "deferred" §_ | ❌ deferred (`discover_imports()` returns `[]` so any test would be a no-op) |
@@ -56,7 +67,7 @@ Markers declared in `pyproject.toml`.
 |---|---|---|
 | Stage 1 unit | `tests/iac/test_iac_snowflake.py` + `test_iac_tofu_validate.py[snowflake]` | ✅ pre-existing |
 | Stage 3 live | `tests/iac/test_iac_snowflake_live.py` | ✅ pre-existing |
-| Stage 3 CLI matrix | `tests/iac/test_iac_snowflake_real_cli_matrix_e2e.py` | ✅ symmetry with AWS+GCP |
+| Stage 3 CLI matrix | `tests/iac/test_iac_snowflake_real_cli_matrix_e2e.py` | ⚠️ 2/6 — plan-binding tamper-reject + bypass only; validate / plan / dry-run / amend not ported (see "deferred") |
 | Stage 1 catalog enrichment | `tests/iac/test_iac_snowflake.py::TestSnowflakeCatalogEnrichment` (3) | ✅ — Horizon markdown table COMMENT + per-column comments on `snowflake_table`, absorbed from the retired `SnowflakeHorizonRegistrar`. **Zero new schema fields** — reads existing `description`/`metadata.description`/`metadata.layer`/`metadata.productType`/`column.description`. Declarative tag governance deferred (see "deferred" §). |
 | Stage 3 catalog enrichment live | `tests/iac/test_iac_snowflake_live.py::test_live_table_carries_horizon_markdown_comment` | ✅ — apply against real Snowflake (snowflake-biz-lab creds), `SHOW TABLES` exposes the markdown comment, `DESC TABLE` exposes per-column comments. Confirms the Stage 1 emit lands on the live wire. |
 
@@ -146,14 +157,18 @@ follow-up scope. None block the current branch from shipping.
   Real bug found+fixed during closure: the AWS Glue import id needs
   the catalog_id prefix; without it `tofu import` returns "Invalid
   import id" and the subsequent apply fails `AlreadyExistsException`.
-- **Snowflake CLI-surface matrix** — AWS + GCP each have 6 CLI-matrix
-  tests (validate / plan / dry-run / amend / tamper-reject / bypass).
-  Snowflake's Stage 3 suite (`test_iac_snowflake_live.py`) predates
-  the CLI matrix push and goes through `runner.tofu_apply` directly,
-  same shape as the AWS+GCP base Stage 3 files. A Snowflake CLI
-  matrix would be a pure copy with `bigquery_table` swapped for
-  `snowflake_table`; deferred for symmetry with the AWS+GCP work
-  shipping first.
+- **Snowflake CLI-surface matrix — 4 of 6 still missing.** AWS has all
+  six CLI-matrix tests (validate / plan / dry-run / amend /
+  tamper-reject / bypass); Snowflake's file carries **only the last
+  two**, the plan-binding tamper-reject and the `--no-verify-plan-binding`
+  bypass. Its `validate`, `plan`, `apply --mode dry-run` and
+  `apply --mode amend` equivalents were never ported. The coverage
+  table above says `2/6` for this reason.
+  Snowflake's other Stage 3 suite (`test_iac_snowflake_live.py`) does
+  exercise apply end-to-end, but through `runner.tofu_apply` directly
+  rather than the CLI dispatch chain, so it does not close this gap.
+  The remaining four would be a near-copy of the GCP file with
+  `bigquery_table` swapped for `snowflake_table`.
 - **AWS Lake Formation enforcement-side tests** — *partially* covered
   now by `tests/iac/test_iac_aws_real_cross_account_e2e.py` which
   STS-assumes a non-deployer role and runs an Athena SELECT through
