@@ -96,6 +96,21 @@ class TestResolveApplyEngine:
         args = argparse.Namespace(contract="/no/such/contract.yaml", env=None, provider=None)
         assert engine.resolve_apply_engine(args, logging.getLogger("test")) == "native"
 
+    def test_provider_mismatch_propagates_instead_of_falling_back(self):
+        # `fluid apply --provider gcp` on a non-GCP contract used to route
+        # through the OpenTofu engine, emit a resource-free module and report
+        # "tofu plan: +0 ~0 -0" with exit 0. The mismatch must surface — and
+        # must NOT be swallowed by the broad "cannot classify" fallback, which
+        # would silently route the same wrong target to the native engine.
+        args = argparse.Namespace(contract=str(_GCP_CONTRACT), env=None, provider="snowflake")
+        with pytest.raises(CLIError) as exc:
+            engine.resolve_apply_engine(args, logging.getLogger("test"))
+        assert exc.value.event == "generate_iac_provider_mismatch"
+
+    def test_matching_provider_override_still_resolves(self):
+        args = argparse.Namespace(contract=str(_GCP_CONTRACT), env=None, provider="gcp")
+        assert engine.resolve_apply_engine(args, logging.getLogger("test")) == "opentofu"
+
 
 class TestBrownfieldAdoption:
     """`_adopt_existing` tofu-imports pre-existing resources so `tofu apply`

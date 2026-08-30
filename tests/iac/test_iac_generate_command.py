@@ -35,10 +35,49 @@ class TestResolveProvider:
     def test_explicit_provider_wins(self):
         assert generate_iac._resolve_provider({}, "snowflake") == "snowflake"
 
-    def test_explicit_provider_wins_over_contract_binding(self):
-        # An explicit --provider overrides whatever the contract declares.
+    def test_explicit_provider_contradicting_the_binding_is_rejected(self):
+        # An explicit --provider used to override whatever the contract
+        # declared, which emitted a module against the wrong plugin: either
+        # resource-free, or (when a binding is shape-compatible across
+        # clouds) describing the wrong cloud entirely. `--provider`
+        # disambiguates; it does not retarget.
         contract = {"binding": {"provider": "aws"}}
-        assert generate_iac._resolve_provider(contract, "snowflake") == "snowflake"
+        with pytest.raises(CLIError) as exc:
+            generate_iac._resolve_provider(contract, "snowflake")
+        assert exc.value.event == "generate_iac_provider_mismatch"
+        assert "aws" in exc.value.context["error"]
+        assert "snowflake" in exc.value.context["error"]
+
+    def test_explicit_provider_allowed_when_it_matches_the_binding(self):
+        contract = {"binding": {"provider": "aws"}}
+        assert generate_iac._resolve_provider(contract, "aws") == "aws"
+
+    def test_explicit_provider_picks_one_of_an_ambiguous_contract(self):
+        # The documented use of --provider: `generate_iac_ambiguous_provider`
+        # tells the operator to pass it when a contract spans clouds. Both
+        # declared clouds must remain selectable.
+        contract = {
+            "exposes": [
+                {"binding": {"platform": "gcp"}},
+                {"binding": {"platform": "aws"}},
+            ]
+        }
+        assert generate_iac._resolve_provider(contract, "aws") == "aws"
+        assert generate_iac._resolve_provider(contract, "gcp") == "gcp"
+
+    def test_explicit_provider_still_wins_when_nothing_is_detectable(self):
+        # The other documented use: `generate_iac_no_provider` tells the
+        # operator to pass --provider when the contract declares no cloud.
+        # There is nothing to contradict, so the gate must not fire.
+        assert generate_iac._resolve_provider({"exposes": []}, "gcp") == "gcp"
+
+    def test_local_contract_rejects_a_cloud_provider_override(self):
+        # The reported reproduction: `--provider gcp` on the local-bound
+        # hello-world contract emitted a resource-free module with exit 0.
+        contract = {"exposes": [{"binding": {"platform": "local"}}]}
+        with pytest.raises(CLIError) as exc:
+            generate_iac._resolve_provider(contract, "gcp")
+        assert exc.value.event == "generate_iac_provider_mismatch"
 
     def test_auto_detects_single_platform(self):
         contract = {"exposes": [{"binding": {"platform": "gcp"}}]}
@@ -204,6 +243,129 @@ class TestGenerateIacValidate:
         args = self._args(tmp_path)
         args.validate = False
         assert generate_iac.run(args, logging.getLogger("test")) == 0
+
+
+class TestProviderMismatchEndToEnd:
+    """The reported reproduction, driven through ``generate_iac.run``.
+
+    `--provider gcp` on the local-bound hello-world contract used to emit a
+    resource-free `main.tf.json`, print a warning, and exit 0 — and
+    `--validate` on that module reported "OpenTofu validation passed."
+    because `tofu validate` genuinely considers a resource-free config
+    valid. Nothing downstream could catch it.
+    """
+
+    _LOCAL = _EXAMPLES / "01-hello-world" / "contract.fluid.yaml"
+    _AWS = _EXAMPLES / "aws-iceberg-lakehouse" / "contract.fluid.yaml"
+
+    def test_repro_exits_nonzero_and_writes_nothing(self, tmp_path):
+        args = argparse.Namespace(
+            contract=str(self._LOCAL), provider="gcp", out=str(tmp_path), env=None
+        )
+        with pytest.raises(CLIError) as exc:
+            generate_iac.run(args, logging.getLogger("test"))
+        assert exc.value.exit_code == 1
+        assert exc.value.event == "generate_iac_provider_mismatch"
+        # Rejected before any emit — no module for a later `tofu apply` to find.
+        assert not (tmp_path / "main.tf.json").exists()
+
+    def test_validate_cannot_report_green_on_the_repro(self, tmp_path, monkeypatch):
+        from fluid_build.iac import runner
+
+        def _boom():
+            raise AssertionError("tofu must not be reached on a rejected provider")
+
+        monkeypatch.setattr(runner, "tofu_path", _boom)
+        args = argparse.Namespace(
+            contract=str(self._LOCAL),
+            provider="gcp",
+            out=str(tmp_path),
+            env=None,
+            validate=True,
+        )
+        with pytest.raises(CLIError) as exc:
+            generate_iac.run(args, logging.getLogger("test"))
+        assert exc.value.event == "generate_iac_provider_mismatch"
+
+    def test_wrong_cloud_emit_is_rejected(self, tmp_path):
+        # Worse than the empty module: this AWS contract's S3-bound expose is
+        # shape-compatible with the GCP emitter, which produced a
+        # google_storage_bucket named after the S3 bucket carrying
+        # `location: us-east-1` — an AWS region, invalid for GCS. A
+        # zero-resource gate alone would not catch this one.
+        args = argparse.Namespace(
+            contract=str(self._AWS), provider="gcp", out=str(tmp_path), env=None
+        )
+        with pytest.raises(CLIError) as exc:
+            generate_iac.run(args, logging.getLogger("test"))
+        assert exc.value.event == "generate_iac_provider_mismatch"
+        assert not (tmp_path / "main.tf.json").exists()
+
+    def test_matching_provider_still_emits(self, tmp_path):
+        args = argparse.Namespace(
+            contract=str(self._AWS), provider="aws", out=str(tmp_path), env=None
+        )
+        assert generate_iac.run(args, logging.getLogger("test")) == 0
+        doc = json.loads((tmp_path / "main.tf.json").read_text())
+        assert doc.get("resource")
+
+
+class TestEmptyModuleGate:
+    """A module with no resources provisions nothing — that is a failure.
+
+    Backstop for the emit-when-derivable emitters (PR #475), which can skip
+    a resource on a *matching* provider when a required binding input is
+    absent. `tofu validate` calls such a module valid, so this is the only
+    layer that can tell "no infrastructure" from "no contract".
+    """
+
+    def _args(self, tmp_path, **kw) -> argparse.Namespace:
+        base = dict(
+            contract=str(_EXAMPLES / "aws-s3-glue-athena" / "contract.fluid.yaml"),
+            provider="auto",
+            out=str(tmp_path),
+            env=None,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def _force_empty(self, monkeypatch):
+        from fluid_build.iac.providers.aws import AwsIacPlugin
+
+        monkeypatch.setattr(AwsIacPlugin, "emit", lambda self, contract, actions: {})
+
+    def test_zero_resources_is_an_error_by_default(self, tmp_path, monkeypatch):
+        self._force_empty(monkeypatch)
+        with pytest.raises(CLIError) as exc:
+            generate_iac.run(self._args(tmp_path), logging.getLogger("test"))
+        assert exc.value.exit_code == 1
+        assert exc.value.event == "generate_iac_empty_module"
+
+    def test_allow_empty_opts_out(self, tmp_path, monkeypatch):
+        self._force_empty(monkeypatch)
+        rc = generate_iac.run(self._args(tmp_path, allow_empty=True), logging.getLogger("test"))
+        assert rc == 0
+        doc = json.loads((tmp_path / "main.tf.json").read_text())
+        assert "resource" not in doc
+
+    def test_validate_is_not_reached_on_an_empty_module(self, tmp_path, monkeypatch):
+        # Suggested-work item 3: --validate must not report success on a
+        # module with no resources. The gate runs first, so tofu is never
+        # consulted — and cannot answer "valid" for a module that does nothing.
+        from fluid_build.iac import runner
+
+        self._force_empty(monkeypatch)
+
+        def _boom():
+            raise AssertionError("tofu must not be reached on an empty module")
+
+        monkeypatch.setattr(runner, "tofu_path", _boom)
+        with pytest.raises(CLIError) as exc:
+            generate_iac.run(self._args(tmp_path, validate=True), logging.getLogger("test"))
+        assert exc.value.event == "generate_iac_empty_module"
+
+    def test_nonempty_module_is_unaffected(self, tmp_path):
+        assert generate_iac.run(self._args(tmp_path), logging.getLogger("test")) == 0
 
 
 class TestEnvTemplateResolution:

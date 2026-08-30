@@ -152,6 +152,12 @@ def _run_generate_iac(contract_path: Path, out_dir: Path) -> bytes:
         env=None,
         validate=False,
         shadow=False,
+        # This pin's subject is byte-identity of the emit, not whether the
+        # contract has infrastructure. Some fixtures here declare a binding
+        # the emitter derives nothing from and legitimately emit an empty
+        # module; opt them past the zero-resource gate so the pin keeps
+        # testing determinism rather than coverage.
+        allow_empty=True,
     )
     rc = generate_iac.run(args, _LOG)
     assert rc == 0

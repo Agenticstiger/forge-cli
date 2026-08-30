@@ -308,6 +308,16 @@ def resolve_apply_engine(args, logger: logging.Logger) -> str:
     try:
         contract = _load_contract(args, logger)
         provider = _resolve_provider(contract, getattr(args, "provider", None) or "auto")
+    except CLIError as exc:
+        # A `--provider` that contradicts the contract's binding is an
+        # operator error, not a classification failure. Falling through to
+        # the broad handler would swallow it and route to the *native*
+        # engine — trading one silent wrong-target apply for another. Let it
+        # out so `fluid apply` fails with the same message
+        # `fluid generate iac` gives.
+        if getattr(exc, "event", None) == "generate_iac_provider_mismatch":
+            raise
+        return "native"
     except Exception:  # noqa: BLE001 — cannot classify the contract → safe default
         return "native"
     return resolve_engine(None, provider)
