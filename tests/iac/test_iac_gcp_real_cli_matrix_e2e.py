@@ -373,15 +373,25 @@ def test_real_cli_verify_matches_deployed_schema_gcp(gcp_real_project, gcp_accou
     _write_contract(gcp_real_project.workdir, _build_bq_contract(dataset_id))
 
     apply_rc = _fluid(
-        "apply", "contract.fluid.yaml", "--mode", "amend", "--yes",
-        cwd=gcp_real_project.workdir, env_overrides=_live_env(), timeout=600,
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "amend",
+        "--yes",
+        cwd=gcp_real_project.workdir,
+        env_overrides=_live_env(),
+        timeout=600,
     )
     gcp_real_project.applied = True
     assert apply_rc.returncode == 0, apply_rc.stderr or apply_rc.stdout
 
     rc = _fluid(
-        "verify", "contract.fluid.yaml", "--strict",
-        cwd=gcp_real_project.workdir, env_overrides=_live_env(), timeout=600,
+        "verify",
+        "contract.fluid.yaml",
+        "--strict",
+        cwd=gcp_real_project.workdir,
+        env_overrides=_live_env(),
+        timeout=600,
     )
     assert rc.returncode == 0, rc.stderr or rc.stdout
 
@@ -398,8 +408,14 @@ def test_real_cli_verify_detects_schema_drift_gcp(gcp_real_project, gcp_account)
     _write_contract(gcp_real_project.workdir, contract)
 
     apply_rc = _fluid(
-        "apply", "contract.fluid.yaml", "--mode", "amend", "--yes",
-        cwd=gcp_real_project.workdir, env_overrides=_live_env(), timeout=600,
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "amend",
+        "--yes",
+        cwd=gcp_real_project.workdir,
+        env_overrides=_live_env(),
+        timeout=600,
     )
     gcp_real_project.applied = True
     assert apply_rc.returncode == 0, apply_rc.stderr or apply_rc.stdout
@@ -411,8 +427,12 @@ def test_real_cli_verify_detects_schema_drift_gcp(gcp_real_project, gcp_account)
     _write_contract(gcp_real_project.workdir, contract)
 
     rc = _fluid(
-        "verify", "contract.fluid.yaml", "--strict",
-        cwd=gcp_real_project.workdir, env_overrides=_live_env(), timeout=600,
+        "verify",
+        "contract.fluid.yaml",
+        "--strict",
+        cwd=gcp_real_project.workdir,
+        env_overrides=_live_env(),
+        timeout=600,
     )
     assert rc.returncode != 0, (
         "verify --strict passed against a table missing a contracted column; "
