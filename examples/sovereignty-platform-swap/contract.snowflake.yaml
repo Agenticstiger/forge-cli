@@ -1,0 +1,52 @@
+fluidVersion: "0.7.6"
+kind: DataProduct
+id: analytics.eu.customer_events_v1
+name: EU Customer Events
+description: Pseudonymised customer interaction events, EU-resident.
+domain: Customer
+
+metadata:
+  layer: Silver
+  productType: ADP
+  owner:
+    team: customer-platform
+    email: customer-platform@example.com
+
+exposes:
+  - exposeId: customer_events
+    kind: table
+    binding:
+      platform: snowflake
+      format: snowflake_table
+      location:
+        database: ACME_EU
+        schema: CUSTOMER_ANALYTICS
+        table: CUSTOMER_EVENTS
+    contract:
+      schema:
+        - name: event_id
+          type: string
+          required: true
+        - name: event_time
+          type: timestamp
+          required: true
+        - name: customer_id
+          type: string
+          required: true
+          sensitivity: pseudonymized
+        - name: event_type
+          type: string
+          required: true
+        - name: revenue_eur
+          type: double
+      dq:
+        rules:
+          - id: event_id_not_null
+            type: completeness
+            selector: event_id
+            threshold: 1.0
+            operator: ">="
+            severity: error
+    qos:
+      availability: "99.5%"
+      freshnessSLO: "PT1H"
