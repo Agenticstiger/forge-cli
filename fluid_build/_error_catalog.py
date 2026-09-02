@@ -278,6 +278,24 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
+    "generate_iac_provider_mismatch": (
+        [
+            "Drop --provider and let the cloud auto-detect from the contract's binding",
+            "Or change the contract's exposes[].binding.platform to the cloud you meant "
+            "to target — that is how a data product is retargeted, not --provider",
+        ],
+        None,
+    ),
+    "generate_iac_empty_module": (
+        [
+            "Check the contract's exposes[].binding carries the location fields "
+            "the target cloud's emitter needs (bucket/dataset/database)",
+            "Run 'fluid validate <contract>' — the Iceberg and Confluent binding "
+            "gates name the specific field a skipped resource was missing",
+            "Pass --allow-empty only if a resource-free module is genuinely intended",
+        ],
+        None,
+    ),
     "generate_ci_failed": (
         [
             "Check the --system value is a supported CI provider and the contract validates",

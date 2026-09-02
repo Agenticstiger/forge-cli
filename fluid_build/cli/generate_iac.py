@@ -26,10 +26,15 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import re
 
 from fluid_build.cli.console import cprint
-from fluid_build.iac import IAC_PLUGINS, assemble_tofu_document, get_iac_plugin, render_tofu_json
+from fluid_build.iac import (
+    IAC_PLUGINS,
+    assemble_tofu_document,
+    get_iac_plugin,
+    provider_match,
+    render_tofu_json,
+)
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.packaging import resolve_packaging
 
@@ -74,6 +79,14 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         "--validate",
         action="store_true",
         help="After emitting, run `tofu validate` on the module (needs `tofu` on PATH)",
+    )
+    p.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help=(
+            "Emit a module with zero resources instead of failing "
+            "(default: a resource-free module is an error)"
+        ),
     )
     p.set_defaults(generate_sub="iac", func=_run_from_generate)
 
@@ -133,11 +146,34 @@ def run(args, logger: logging.Logger) -> int:
         raise CLIError(1, "generate_iac_failed", {"error": str(e)})
 
     info(logger, "generate_iac_ok", provider=provider, resources=count, out=out_path)
-    if count == 0:
-        cprint(
-            f"\nWarning: no {provider} resources found in the contract — emitted an empty module."
+    if count == 0 and not getattr(args, "allow_empty", False):
+        # A resource-free module provisions nothing, but `tofu validate`
+        # calls it valid (verified: "Success! The configuration is valid."),
+        # so nothing downstream will catch it — the operator generates,
+        # validates, sees green and has provisioned nothing. Fail here, the
+        # only layer that can tell "no infrastructure" from "no contract".
+        #
+        # The provider/binding cross-check in `_resolve_provider` explains
+        # every empty module the example corpus produces today; this gate is
+        # the backstop for the emit-when-derivable emitters (PR #475), which
+        # can legitimately skip a resource on a *matching* provider when a
+        # required input is absent.
+        raise CLIError(
+            1,
+            "generate_iac_empty_module",
+            {
+                "error": (
+                    f"emitted no {provider} resources — the module at {out_path} "
+                    "would provision nothing.\n"
+                    "  Check that the contract's `exposes[].binding` carries the "
+                    f"{provider} location fields the emitter needs, then re-run.\n"
+                    "  Pass --allow-empty to emit the empty module anyway."
+                )
+            },
         )
     cprint(f"\nWrote OpenTofu module: {out_path}  (provider: {provider}, {count} resources)")
+    if count == 0:
+        cprint("Warning: --allow-empty — this module provisions nothing.")
 
     if getattr(args, "validate", False):
         _validate_with_tofu(out_dir)
@@ -191,121 +227,23 @@ def _validate_with_tofu(out_dir: str) -> None:
     cprint("OpenTofu validation passed.")
 
 
-# Cloud aliases → canonical IaC plugin name. The contract surface uses a few
-# interchangeable spellings (``binding.provider: aws`` vs ``binding.platform:
-# aws``; ``google``/``bigquery`` for GCP; ``duckdb`` for the in-process local
-# runner). Normalising here means a contract authored with any documented
-# spelling auto-detects, instead of only the single ``exposes[].binding.platform``
-# token the pre-2026-06 resolver inspected.
-_PROVIDER_ALIASES = {
-    "aws": "aws",
-    "s3": "aws",
-    "glue": "aws",
-    "athena": "aws",
-    "redshift": "aws",
-    "gcp": "gcp",
-    "google": "gcp",
-    "gcs": "gcp",
-    "bigquery": "gcp",
-    "snowflake": "snowflake",
-    # Confluent Cloud Tableflow (managed Kafka->Iceberg) — ``binding.platform:
-    # confluent`` auto-detects to the OpenTofu confluent plugin, matching its
-    # entry in OPENTOFU_DEFAULT_PROVIDERS.
-    "confluent": "confluent",
-    # ``local`` (and its DuckDB engine) is a recognised target but has no
-    # OpenTofu plugin — it runs in-process. Detected so we can emit an
-    # actionable error rather than the misleading "no supported cloud".
-    "local": "local",
-    "duckdb": "local",
-}
-
-# An unambiguous AWS region (``us-east-1``, ``eu-west-2`` …) is a last-resort
-# detection hint — GCP regions (``us-central1``) and the dash-suffixed AWS form
-# are distinguishable by the trailing ``-<n>``.
-_AWS_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
-
-
+# Cloud detection + the ``--provider``/binding cross-check live in
+# ``iac.provider_match`` so ``fluid apply`` shares one table with this
+# command (PR #475's desync lesson). These thin wrappers keep the historical
+# private names importable and patchable from this module.
 def _canonical_cloud(token: object) -> str:
-    """Map a raw contract platform/provider token to a canonical cloud name.
-
-    Returns the canonical name (``aws``/``gcp``/``snowflake``/``local``) or
-    ``""`` when the token is empty or unrecognised.
-    """
-    if not isinstance(token, str):
-        return ""
-    return _PROVIDER_ALIASES.get(token.strip().lower().replace("-", "_"), "")
+    """Map a raw contract platform/provider token to a canonical cloud name."""
+    return provider_match.canonical_cloud(token)
 
 
 def _detect_clouds(contract) -> list[str]:
-    """Collect every canonical cloud declared anywhere in the contract.
-
-    Inspects, in the order the spec documents them:
-
-    * ``exposes[].binding.provider`` / ``exposes[].binding.platform``
-    * top-level ``binding.provider`` / ``binding.platform`` (Snowflake- and
-      single-binding contracts that declare the cloud once at the root)
-    * ``builds[].provider`` and ``builds[].execution.runtime.platform``
-
-    Falls back to an unambiguous AWS region (``binding.region`` /
-    ``binding.location.region``) only when no platform/provider token was
-    found, so a region never overrides an explicit binding. Order-preserving
-    and de-duplicated.
-    """
-    found: list[str] = []
-
-    def _add(token: object) -> None:
-        cloud = _canonical_cloud(token)
-        if cloud and cloud not in found:
-            found.append(cloud)
-
-    # exposes[] data-plane bindings (most specific).
-    for exposure in contract.get("exposes") or []:
-        binding = exposure.get("binding") or {}
-        if isinstance(binding, dict):
-            _add(binding.get("platform"))
-            _add(binding.get("provider"))
-
-    # Top-level binding — Snowflake-style + contracts that declare the cloud
-    # once at the root via either ``platform`` or ``provider``.
-    top_binding = contract.get("binding")
-    if isinstance(top_binding, dict):
-        _add(top_binding.get("platform"))
-        _add(top_binding.get("provider"))
-
-    # builds[].provider and builds[].execution.runtime.platform.
-    for build in contract.get("builds") or []:
-        if not isinstance(build, dict):
-            continue
-        _add(build.get("provider"))
-        runtime = (build.get("execution") or {}).get("runtime") or {}
-        if isinstance(runtime, dict):
-            _add(runtime.get("platform"))
-
-    # Region fallback — only consulted when nothing stronger was declared.
-    if not found:
-        for region in _candidate_regions(contract):
-            if _AWS_REGION_RE.match(region.strip().lower()):
-                found.append("aws")
-                break
-
-    return found
+    """Collect every canonical cloud declared anywhere in the contract."""
+    return provider_match.detect_clouds(contract)
 
 
 def _candidate_regions(contract) -> list[str]:
     """Region strings declared on the top-level / expose bindings."""
-    regions: list[str] = []
-
-    def _collect(binding: object) -> None:
-        if not isinstance(binding, dict):
-            return
-        for value in (binding.get("region"), (binding.get("location") or {}).get("region")):
-            if isinstance(value, str) and value:
-                regions.append(value)
-
-    _collect(contract.get("binding"))
-    for exposure in contract.get("exposes") or []:
-        _collect(exposure.get("binding") or {})
-    return regions
+    return provider_match.candidate_regions(contract)
 
 
 def _resolve_provider(contract, requested: str) -> str:
@@ -318,6 +256,23 @@ def _resolve_provider(contract, requested: str) -> str:
     ``binding.provider: aws`` shape resolves instead of erroring.
     """
     if requested and requested != "auto":
+        # `--provider` disambiguates; it does not retarget. A request that
+        # contradicts every cloud the contract declares would emit an empty
+        # module — or, when a binding is shape-compatible across clouds, the
+        # wrong cloud's resources (a `google_storage_bucket` named after an
+        # S3 bucket, with an AWS region as its `location`). Reject it before
+        # anything is written. Contracts that declare no cloud at all fall
+        # through untouched: that is the documented
+        # `generate_iac_no_provider` escape hatch, where `--provider` is the
+        # only way to name a target.
+        try:
+            provider_match.check_provider_matches_contract(contract, requested)
+        except provider_match.ProviderBindingMismatch as exc:
+            raise CLIError(
+                1,
+                "generate_iac_provider_mismatch",
+                {"error": str(exc)},
+            )
         return requested
 
     found = _detect_clouds(contract)
