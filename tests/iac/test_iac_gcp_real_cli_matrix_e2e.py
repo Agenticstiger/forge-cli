@@ -354,3 +354,87 @@ def test_real_cli_apply_no_verify_plan_binding_bypass_gcp(gcp_real_project, gcp_
     bq = gcp_real_client("bigquery")
     ds = bq.get_dataset(f"{GCP_LIVE_PROJECT}.{dataset_id}")
     assert ds.dataset_id == dataset_id
+
+
+# ---------------------------------------------------------------------------
+# fluid verify — reading the deployed table back
+# ---------------------------------------------------------------------------
+# verify is the only stage that inspects the cloud *after* apply, so it is the
+# one that proves a deployment did what its plan promised. Both directions are
+# asserted on purpose: a verify that only ever exits 0 would pass against a
+# table that was never created, which is the same silent-success class as an
+# emitter returning a module with no resources.
+
+
+def test_real_cli_verify_matches_deployed_schema_gcp(gcp_real_project, gcp_account):
+    """`fluid verify --strict` returns 0 when the live BigQuery table
+    matches the contract it was applied from."""
+    dataset_id = gcp_real_project.name("cliverify").replace("-", "_")
+    _write_contract(gcp_real_project.workdir, _build_bq_contract(dataset_id))
+
+    apply_rc = _fluid(
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "amend",
+        "--yes",
+        cwd=gcp_real_project.workdir,
+        env_overrides=_live_env(),
+        timeout=600,
+    )
+    gcp_real_project.applied = True
+    assert apply_rc.returncode == 0, apply_rc.stderr or apply_rc.stdout
+
+    rc = _fluid(
+        "verify",
+        "contract.fluid.yaml",
+        "--strict",
+        cwd=gcp_real_project.workdir,
+        env_overrides=_live_env(),
+        timeout=600,
+    )
+    assert rc.returncode == 0, rc.stderr or rc.stdout
+
+
+def test_real_cli_verify_detects_schema_drift_gcp(gcp_real_project, gcp_account):
+    """`fluid verify --strict` must FAIL when the contract declares a column
+    the deployed table does not have.
+
+    Without this direction the passing case above proves nothing: it would
+    also pass if verify inspected nothing at all.
+    """
+    dataset_id = gcp_real_project.name("clidrift").replace("-", "_")
+    contract = _build_bq_contract(dataset_id)
+    _write_contract(gcp_real_project.workdir, contract)
+
+    apply_rc = _fluid(
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "amend",
+        "--yes",
+        cwd=gcp_real_project.workdir,
+        env_overrides=_live_env(),
+        timeout=600,
+    )
+    gcp_real_project.applied = True
+    assert apply_rc.returncode == 0, apply_rc.stderr or apply_rc.stdout
+
+    # Declare a column that was never deployed, then re-verify.
+    contract["exposes"][0]["contract"]["schema"].append(
+        {"name": "column_that_was_never_deployed", "type": "string"}
+    )
+    _write_contract(gcp_real_project.workdir, contract)
+
+    rc = _fluid(
+        "verify",
+        "contract.fluid.yaml",
+        "--strict",
+        cwd=gcp_real_project.workdir,
+        env_overrides=_live_env(),
+        timeout=600,
+    )
+    assert rc.returncode != 0, (
+        "verify --strict passed against a table missing a contracted column; "
+        "stdout=%s stderr=%s" % (rc.stdout, rc.stderr)
+    )
