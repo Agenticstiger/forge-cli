@@ -13,7 +13,15 @@
 #     git push --no-verify
 set -e
 cd "$(git rev-parse --show-toplevel)"
-HOOK=.git/hooks/pre-push
+
+# The REAL hooks directory. `.git/hooks` is wrong in a git worktree, where
+# `.git` is a FILE pointing elsewhere — the redirection failed with "Not a
+# directory" and no hook was installed, silently, in exactly the checkouts this
+# team works in. `--git-path hooks` resolves it correctly everywhere, and
+# honours core.hooksPath if the repo sets one.
+HOOKS_DIR="$(git rev-parse --git-path hooks)"
+mkdir -p "$HOOKS_DIR"
+HOOK="$HOOKS_DIR/pre-push"
 LINE='python3 tools/product_guardrail/check.py || exit 1'
 
 # NEVER clobber an existing hook. This repo already ships a pre-push hook that

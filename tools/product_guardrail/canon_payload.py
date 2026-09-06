@@ -12,7 +12,7 @@ the vocabulary, edit tools/canon.py in the canon repo and re-emit.
 Emitted 2026-09-06.
 """
 
-CANON_ID = 'ca94e2b86495d009148024de6014f2a37c8076218f26ff501c4b7e4bd4808b4c'
+CANON_ID = '785922bbdc3f88d382141b7728d2b8a561fe38b7bf8bf5ff23b76a8abf4c9993'
 
 # Approved names. Exact casing is part of the name. `near` matches the
 # near-misses case-insensitively; anything it catches that is not the target
