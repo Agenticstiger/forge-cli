@@ -32,7 +32,17 @@ from pathlib import Path
 from typing import Iterable
 
 REQUIRED_HEADER_TOKEN = "Copyright 2024-2026"
-EXCLUDED_PREFIXES = ("examples/",)
+EXCLUDED_PREFIXES = (
+    "examples/",
+    # Vendored, generated upstream, and byte-identical across every repo that
+    # carries it — that identity is the whole integrity guarantee: check.py
+    # hashes its own source into CANON_ID, so a per-repo header would change
+    # the digest here and make the gate report BLIND. It also cannot carry an
+    # Apache header honestly, because the same bytes ship into a proprietary
+    # repo. Licensing for the directory is stated once in
+    # tools/product_guardrail/README.md instead of per file.
+    "tools/product_guardrail/",
+)
 
 # Every substantive line of the Apache-2.0 boilerplate. Matched
 # whitespace-insensitively against the file preamble so a reflowed comment

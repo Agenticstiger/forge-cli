@@ -89,6 +89,6 @@ CMD ["--help"]
 LABEL maintainer="Agentics Transformation <info@agentics.ai>" \
       org.opencontainers.image.title="FLUID CLI" \
       org.opencontainers.image.description="FLUID Data Products CLI — plan, apply, and visualize data products" \
-      org.opencontainers.image.vendor="Agentics Transformation Pty Ltd" \
+      org.opencontainers.image.vendor="Agentics Transformation Limited" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/Agenticstiger/forge-cli"
