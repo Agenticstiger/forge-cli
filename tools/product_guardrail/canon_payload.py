@@ -12,7 +12,7 @@ the vocabulary, edit tools/canon.py in the canon repo and re-emit.
 Emitted 2026-09-06.
 """
 
-CANON_ID = '1cb953c74a145519e37387d29751899edbe3cf7326c4b0b6f3e3768aca9b9d8c'
+CANON_ID = 'ca94e2b86495d009148024de6014f2a37c8076218f26ff501c4b7e4bd4808b4c'
 
 # Approved names. Exact casing is part of the name. `near` matches the
 # near-misses case-insensitively; anything it catches that is not the target
@@ -127,16 +127,16 @@ RETIRED = [
 NEVER_BRANDS = [
     {
         'name': 'FEDERATION',
-        'pattern': '\\bFEDERATION\\b',
+        'pattern': '\\bFEDERATION\\b|\\bFederation\\s+(?:Hub|Registry|Center|Centre|Service|Platform|Manager|Console)\\b',
         'instead': 'the federation registry (descriptive, lowercase)',
         'allow': ['never a brand|not a brand|descriptive|forbid|retired'],
         'public_why': "Publishing contracts to a cross-org mesh is a capability, not a product. Write 'the federation registry', lowercase.",
-        'must_flag': 'the FEDERATION Registry goes live in month nine',
+        'must_flag': 'open the Federation Hub to browse shared contracts',
         'must_not_flag': "FEDERATION is never a brand; write 'the federation registry'",
     },
     {
         'name': 'FATHOM',
-        'pattern': '\\bFATHOM\\b',
+        'pattern': '\\bFATHOM\\b|\\bFathom\\s+(?:Engine|Service|Platform|Console|Manager)\\b',
         'instead': 'the settlement engine (descriptive, lowercase)',
         'allow': ['never a brand|not a brand|descriptive|forbid|retired'],
         'public_why': "Metering and billing for agent consumption is a capability, not a product. Write 'the settlement engine', lowercase.",
