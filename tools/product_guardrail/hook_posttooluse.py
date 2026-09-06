@@ -58,6 +58,7 @@ del _HERE_REAL
 
 import ast
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -133,6 +134,33 @@ def _append_grace(profile_path, entries):
     profile has been restructured; say so and change nothing rather than
     guessing where a list starts.
     """
+    # One writer at a time. This is a read-modify-write of a file the checker
+    # also reads, and two edits in flight could interleave and lose a waiver or
+    # collide on the temp file. An exclusive lock beside the profile is enough:
+    # the only writers are these hooks on one machine.
+    lock = profile_path.with_suffix(".py.lock")
+    lock_fd = None
+    try:
+        lock_fd = os.open(str(lock), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except OSError:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        lock_fd = None  # locking is best-effort; never block the edit
+
+    try:
+        return _append_grace_locked(profile_path, entries)
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+                lock.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _append_grace_locked(profile_path, entries):
     src = profile_path.read_text(encoding="utf-8")
     anchor = "GRACE = ["
     if src.count(anchor) != 1:
@@ -157,7 +185,8 @@ def _append_grace(profile_path, entries):
     import importlib.util as _ilu
     _spec = _ilu.spec_from_file_location("_pg_check_validate", tmp_check)
     _chk = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_chk)
-    _probe = profile_path.with_suffix(".py.probe")
+    # Unique per process: a shared name is a collision between two hooks.
+    _probe = profile_path.with_suffix(f".py.{os.getpid()}.probe")
     _probe.write_text(updated, encoding="utf-8")
     try:
         _chk._load_data(_probe)
@@ -167,7 +196,7 @@ def _append_grace(profile_path, entries):
     # open, so an encoding error mid-write left profile.py at ZERO BYTES —
     # reproduced under a latin-1 locale, where the em dash in the placeholder
     # raised and the hook then swallowed the error and exited 0.
-    tmp = profile_path.with_suffix(".py.tmp")
+    tmp = profile_path.with_suffix(f".py.{os.getpid()}.tmp")
     tmp.write_text(updated, encoding="utf-8")
     os.replace(tmp, profile_path)
     return True
@@ -204,7 +233,15 @@ def main():
         # edit to the same file consumed it and recorded a grace entry for the
         # finding the owner had just refused. Reproduced end to end, and again
         # with a note aged thirty days.
-        if time.time() - float(note.get("at", 0)) > PENDING_TTL:
+        # The TTL exists so a DENIED note cannot be consumed by a later edit.
+        # It must not discard an APPROVAL: the owner may leave the dialog open
+        # for a while, and silently losing their answer is worse than the stale
+        # note it was written to prevent. The content hash below already proves
+        # this is the very edit that was asked about — that is the real guard,
+        # and it does not expire. An aged note without a content hash (only
+        # possible for a note written before this change) is still dropped.
+        aged = time.time() - float(note.get("at", 0)) > PENDING_TTL
+        if aged and not note.get("content_sha"):
             return 0
         proposed = note.get("content_sha")
         if proposed:
