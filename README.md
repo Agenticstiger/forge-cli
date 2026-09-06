@@ -20,7 +20,7 @@
 [![Open issues](https://img.shields.io/github/issues/Agenticstiger/forge-cli)](https://github.com/Agenticstiger/forge-cli/issues)
 [![Open PRs](https://img.shields.io/github/issues-pr/Agenticstiger/forge-cli)](https://github.com/Agenticstiger/forge-cli/pulls)
 
-[Documentation](https://agenticstiger.github.io/forge_docs/) · [Getting Started](https://agenticstiger.github.io/forge_docs/getting-started/) · [FLUID Specification](https://open-data-protocol.github.io/fluid/) · [The Book](https://a.co/d/04zTi7aQ) · [Community](https://github.com/Agenticstiger/forge-cli/discussions)
+[Documentation](https://agenticstiger.github.io/forge_docs/) · [Getting Started](https://agenticstiger.github.io/forge_docs/getting-started/) · [FLUID Spec](https://open-data-protocol.github.io/fluid/) · [The Book](https://a.co/d/04zTi7aQ) · [Community](https://github.com/Agenticstiger/forge-cli/discussions)
 
 <br>
 
@@ -689,7 +689,7 @@ To report security vulnerabilities, see [SECURITY.md](SECURITY.md).
 
 **Built for the future of data. Built for the Agentic Era.**
 
-[Documentation](https://agenticstiger.github.io/forge_docs/) · [FLUID Specification](https://open-data-protocol.github.io/fluid/) · [The Book](https://a.co/d/04zTi7aQ) · [PyPI](https://pypi.org/project/data-product-forge/) · [Issues](https://github.com/Agenticstiger/forge-cli/issues)
+[Documentation](https://agenticstiger.github.io/forge_docs/) · [FLUID Spec](https://open-data-protocol.github.io/fluid/) · [The Book](https://a.co/d/04zTi7aQ) · [PyPI](https://pypi.org/project/data-product-forge/) · [Issues](https://github.com/Agenticstiger/forge-cli/issues)
 
 ---
 

@@ -315,6 +315,16 @@ def process_file(
     return action
 
 
+# Kept in lockstep with check_license_headers.py's EXCLUDED_PREFIXES, which
+# test_license_headers.py asserts by running this writer over a compliant
+# checkout and requiring zero changes. tools/product_guardrail/ is vendored and
+# byte-identical across every repo carrying it; check.py hashes its own source
+# into CANON_ID, so a header added here would make that gate report BLIND — and
+# the same bytes also ship into a proprietary repo, where an Apache header
+# would be wrong. Licensing for the directory is stated in its README.
+EXCLUDED_PREFIXES = ("examples/", "tools/product_guardrail/")
+
+
 def collect_files(dirs: list[str], root: Path) -> list[Path]:
     """Collect all .py files under the given directories."""
     files = []
@@ -323,7 +333,11 @@ def collect_files(dirs: list[str], root: Path) -> list[Path]:
         if not target.exists():
             print(f"  Warning: directory '{d}' does not exist, skipping")
             continue
-        files.extend(sorted(target.rglob("*.py")))
+        for path in sorted(target.rglob("*.py")):
+            rel = path.relative_to(root).as_posix()
+            if any(rel.startswith(x) for x in EXCLUDED_PREFIXES):
+                continue
+            files.append(path)
     return files
 
 

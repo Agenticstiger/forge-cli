@@ -35,6 +35,19 @@ jobs:
             --line-length 100
       - name: Black check
         run: black --check fluid_build/ tests/
+
+      # Product Guardrail: the names of the commercial offering, held in the
+      # prose a reader of this public repo actually sees — including the two
+      # surfaces no docs linter opens, the Pages site and the Dockerfile's OCI
+      # vendor label, which is where the wrong legal entity had survived.
+      # Stdlib only, nothing to install. --self-test runs first because a
+      # corrupt registry must fail loudly rather than quietly bless the tree,
+      # and it verifies the vendored payload against its own content digest so
+      # a hand-edit fails here, offline.
+      - name: Product Guardrail (terminology)
+        run: |
+          python3 tools/product_guardrail/check.py --self-test
+          python3 tools/product_guardrail/check.py
       # detect-secrets was configured in .pre-commit-config.yaml but NOTHING
       # ran pre-commit in CI, so the gate only fired for contributors who had
       # installed the hooks locally. Any commit pushed without them — an agent

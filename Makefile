@@ -299,6 +299,11 @@ $$vp -m fluid_build.cli version;'
 # Feature Release System (MVP)
 # ============================================================================
 
+
+.PHONY: guardrail
+guardrail: ## Product Guardrail — the commercial offering's names, in the prose users read
+	@python3 tools/product_guardrail/check.py --self-test
+	@python3 tools/product_guardrail/check.py
 .PHONY: show-features build-by-profile build-for-stable build-for-beta build-for-alpha quick-test-profile
 
 show-features: ## 📋 Show feature maturity status and build profiles
