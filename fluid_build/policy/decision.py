@@ -211,7 +211,13 @@ def _canonical_bytes(payload: Mapping[str, Any]) -> bytes:
     try:
         import rfc8785
 
-        return rfc8785.dumps(dict(payload))
+        # rfc8785 ships no type stubs, so its return is Any. Bind it to an
+        # explicitly-typed local rather than returning it straight through:
+        # under --strict a bare `return rfc8785.dumps(...)` is a no-any-return
+        # error, and this module is on the strict allowlist precisely because a
+        # silent Any in a gate that decides data access is a silent allow.
+        encoded: bytes = rfc8785.dumps(dict(payload))
+        return encoded
     except ImportError:  # pragma: no cover - dependency is declared
         return json.dumps(
             dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
