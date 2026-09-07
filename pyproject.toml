@@ -34,6 +34,12 @@ dependencies = [
   "click>=8.1",
   "pyyaml>=6.0",
   "jsonschema>=4.22",
+  # RFC 8785 (JSON Canonicalization Scheme) — the substrate the agentPolicy
+  # policyDigest sits on (fluid_build/policy/decision.py). Chosen because the
+  # FLUX enforcement vectors already digest through it, so the two engines
+  # agree on one canonical form instead of each inventing its own; json.dumps
+  # with sort_keys is NOT equivalent (number formatting differs).
+  "rfc8785",
   "rich>=13.7",
   "pydantic>=2.7",
   "typing-extensions>=4.8",
@@ -502,6 +508,9 @@ fluid_build = [
   # residency check reads these at runtime, so they must ship in the wheel
   # or a `pip install`ed forge-cli resolves no GCP/Azure region at all.
   "policy/data/cloud_regions/*.csv",
+  # Portable agentPolicy decision vectors. Shipped inside the wheel so a
+  # consumer can check their own gate against them without cloning the repo.
+  "policy/data/vectors/*.json",
   "policy/data/cloud_regions/*.md",
   "copilot/**/*.yaml",
   "copilot/**/*.md",
@@ -626,6 +635,9 @@ module = [
     "fluid_build.cli.security",
     "fluid_build.credentials.encrypted_store",
     "fluid_build.observability.secret_redactor",
+    # The agentPolicy gate: it decides whether an agent may read production
+    # data, so a silent Any is a silent allow.
+    "fluid_build.policy.decision",
     "fluid_build.secrets",
 ]
 strict = true
