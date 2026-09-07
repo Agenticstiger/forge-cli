@@ -43,12 +43,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
 
-from fluid_build.policy.agent_policy import (
-    is_model_allowed as _is_model_allowed,
-)
-from fluid_build.policy.agent_policy import (
-    is_use_case_allowed as _is_use_case_allowed,
-)
+from fluid_build.policy.decision import Decision, EffectivePolicy
+from fluid_build.policy.decision import as_tuple as _as_tuple
+from fluid_build.policy.decision import decide as _decide
+from fluid_build.policy.decision import policy_digest as _policy_digest
 
 
 @dataclass(frozen=True)
@@ -236,21 +234,55 @@ class OutputPortPolicy:
     ) -> Tuple[bool, Optional[str]]:
         """Composite gate evaluated on every ``tools/call`` request.
 
-        Precedence (first deny wins): tool denylist > tool allowlist
-        > model denylist > use-case denylist > model allowlist >
-        use-case allowlist. Tool gating is checked first because the
-        toolset is bounded; model/use-case gates exist to enforce
-        agentPolicy on top of an already-allowed tool surface.
+        Delegates to :func:`fluid_build.policy.decision.decide`, which owns the
+        normative check order and the closed reason vocabulary. This method keeps
+        the ``(allowed, reason_or_None)`` shape for existing callers; use
+        :meth:`decision` when you need the policy digest too.
+
+        The precedence documented here — tool > model denylist > use-case
+        denylist > model allowlist > use-case allowlist — is now enforced rather
+        than described. It previously was not: the body evaluated the whole model
+        stage before the use-case stage, so a request whose model was merely
+        absent from an allowlist AND whose use case was explicitly denied
+        reported ``not-in-allowedModels``. The verdict was right; the reason
+        contradicted this docstring. See ``CHECK_ORDER``.
         """
-        if not self.is_tool_allowed(tool):
-            return False, "tool-not-allowed"
-        ok, reason = self.is_model_allowed(model_id)
-        if not ok:
-            return False, reason
-        ok, reason = self.is_use_case_allowed(use_case)
-        if not ok:
-            return False, reason
-        return True, None
+        return _as_tuple(self.decision(tool=tool, model_id=model_id, use_case=use_case))
+
+    def to_effective_policy(self) -> EffectivePolicy:
+        """The six rule lists this policy enforces, normalised for the decider."""
+        return EffectivePolicy.of(
+            allowed_tools=self.allowed_tools,
+            denied_tools=self.denied_tools,
+            allowed_models=self.allowed_models,
+            denied_models=self.denied_models,
+            allowed_use_cases=self.allowed_use_cases,
+            denied_use_cases=self.denied_use_cases,
+        )
+
+    def policy_digest(self) -> str:
+        """Stable identifier for the rules in force, for the audit record."""
+        return _policy_digest(self.to_effective_policy())
+
+    def decision(
+        self,
+        *,
+        tool: Optional[str],
+        model_id: Optional[str],
+        use_case: Optional[str],
+    ) -> Decision:
+        """Full decision — verdict, reason code and policy digest.
+
+        Prefer this over :meth:`check_tool_call` when you intend to record why a
+        call was refused: the tuple form throws the digest away, and a reason
+        without the policy that produced it cannot be audited later.
+        """
+        return _decide(
+            policy=self.to_effective_policy(),
+            tool=tool,
+            model_id=model_id,
+            use_case=use_case,
+        )
 
     @classmethod
     def from_contract_and_flags(
@@ -357,10 +389,15 @@ def _coerce_tuple(value: Any) -> Tuple[str, ...]:
     return ()
 
 
-# Cross-check: keep the OutputPortPolicy gates symmetric with the
-# free-standing helpers in fluid_build.policy.agent_policy. We import
-# them above to make the linkage visible to grep — the runtime can
-# delegate to either form interchangeably and any future change to
-# the helpers' precedence ripples here automatically.
-assert _is_model_allowed is not None
-assert _is_use_case_allowed is not None
+# The linkage to shared policy logic is now real rather than declared: the
+# composite gate delegates to fluid_build.policy.decision.decide, which owns
+# the check order and the reason vocabulary.
+#
+# What stood here was an import of agent_policy's is_model_allowed /
+# is_use_case_allowed kept alive by `assert ... is not None`, under a comment
+# claiming "any future change to the helpers' precedence ripples here
+# automatically". It did not: the helpers were never called, this class
+# reimplemented their logic, and the two could diverge silently — which is
+# how the composite precedence came to contradict its own docstring. Those
+# helpers remain the contract-VALIDATION path (fluid validate) and are
+# deliberately not the runtime gate.

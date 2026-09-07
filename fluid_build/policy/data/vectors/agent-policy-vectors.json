@@ -1,0 +1,609 @@
+{
+  "vectorsVersion": "0.1.0",
+  "description": "agentPolicy decision vectors. A conformant gate reproduces every allow, reasonCode AND policyDigest below. Check order is normative and first match wins; a request that trips several rules is denied regardless of order, but the reasonCode it reports is not free. Matching is exact and case-sensitive.",
+  "canonicalisation": "policyDigest = '<scheme>:<sha256 hex>' over the RFC 8785 (JCS) form of the policy object as it appears in each vector. An absent allowlist is null and an empty one is [] — they are different policies and digest differently.",
+  "checkOrder": [
+    "tool-not-allowed",
+    "missing-model-identity",
+    "in-deniedModels",
+    "in-deniedUseCases",
+    "not-in-allowedModels",
+    "missing-use-case-with-allowlist",
+    "not-in-allowedUseCases"
+  ],
+  "reasonCodes": [
+    "allowed",
+    "tool-not-allowed",
+    "missing-model-identity",
+    "in-deniedModels",
+    "in-deniedUseCases",
+    "not-in-allowedModels",
+    "missing-use-case-with-allowlist",
+    "not-in-allowedUseCases"
+  ],
+  "vectors": [
+    {
+      "name": "allow: nothing declared",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null
+      },
+      "expect": {
+        "allow": true,
+        "reasonCode": "allowed",
+        "policyDigest": "jcs-sha256:1800416c6f7f132aa8140ee70c3ecfdca44a53e32098233c488edeec1097d6e3"
+      }
+    },
+    {
+      "name": "allow: model on the allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": [
+          "good"
+        ],
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": "good",
+        "useCase": null
+      },
+      "expect": {
+        "allow": true,
+        "reasonCode": "allowed",
+        "policyDigest": "jcs-sha256:84cf21310892b27b9bbcc77aaabe31e9eaec501773e953cf5eb17580d2a378ab"
+      }
+    },
+    {
+      "name": "allow: use case on the allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": [
+          "analysis"
+        ],
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": "analysis"
+      },
+      "expect": {
+        "allow": true,
+        "reasonCode": "allowed",
+        "policyDigest": "jcs-sha256:8ac4f0ef071019f42805bd96c6c568cf27df6088a6a17aa8790d5ebf9b17e1c9"
+      }
+    },
+    {
+      "name": "allow: tool on the allowlist",
+      "policy": {
+        "allowedTools": [
+          "describe",
+          "query"
+        ],
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "describe",
+        "modelId": null,
+        "useCase": null
+      },
+      "expect": {
+        "allow": true,
+        "reasonCode": "allowed",
+        "policyDigest": "jcs-sha256:f682ed893142b4dabfbc2a15cb409baf61e370ad75f9e49a18626b11ed2a0c4c"
+      }
+    },
+    {
+      "name": "allow: unidentified caller, no model rules",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [
+          "advertising"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null
+      },
+      "expect": {
+        "allow": true,
+        "reasonCode": "allowed",
+        "policyDigest": "jcs-sha256:f48a1aedb46c1f89adf0ce5dc9dea5040424863b2a5fb855f37e1d638d9810ba"
+      }
+    },
+    {
+      "name": "deny: tool on the denylist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [
+          "query_sql"
+        ],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query_sql",
+        "modelId": null,
+        "useCase": null
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "tool-not-allowed",
+        "policyDigest": "jcs-sha256:8724bc2398d4e67031ae0f426ec84950b96817d1827e253d0f98105160a35a4b"
+      }
+    },
+    {
+      "name": "deny: tool absent from the allowlist",
+      "policy": {
+        "allowedTools": [
+          "query"
+        ],
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query_sql",
+        "modelId": null,
+        "useCase": null
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "tool-not-allowed",
+        "policyDigest": "jcs-sha256:8a363f0257fed31d64cbd9b017ba7175a8491b0d35a28cc30063337a55899298"
+      }
+    },
+    {
+      "name": "deny: empty tool allowlist allows nothing",
+      "policy": {
+        "allowedTools": [],
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "tool-not-allowed",
+        "policyDigest": "jcs-sha256:545e392e9b7dcce377e4c59f01812827a2b6e3d829f7075650ef09624ff58291"
+      }
+    },
+    {
+      "name": "deny: no model identity against a model allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": [
+          "good"
+        ],
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "missing-model-identity",
+        "policyDigest": "jcs-sha256:84cf21310892b27b9bbcc77aaabe31e9eaec501773e953cf5eb17580d2a378ab"
+      }
+    },
+    {
+      "name": "deny: no model identity against a model denylist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [
+          "bad"
+        ],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "missing-model-identity",
+        "policyDigest": "jcs-sha256:9540061a70015f519e189d389d5e2a4a9ffa43a16af2204aaba8541abcb92ce1"
+      }
+    },
+    {
+      "name": "deny: model on the denylist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [
+          "bad"
+        ],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": "bad",
+        "useCase": null
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "in-deniedModels",
+        "policyDigest": "jcs-sha256:9540061a70015f519e189d389d5e2a4a9ffa43a16af2204aaba8541abcb92ce1"
+      }
+    },
+    {
+      "name": "deny: use case on the denylist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [
+          "advertising"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": "advertising"
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "in-deniedUseCases",
+        "policyDigest": "jcs-sha256:f48a1aedb46c1f89adf0ce5dc9dea5040424863b2a5fb855f37e1d638d9810ba"
+      }
+    },
+    {
+      "name": "deny: model absent from the allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": [
+          "good"
+        ],
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": "other",
+        "useCase": null
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "not-in-allowedModels",
+        "policyDigest": "jcs-sha256:84cf21310892b27b9bbcc77aaabe31e9eaec501773e953cf5eb17580d2a378ab"
+      }
+    },
+    {
+      "name": "deny: no use case against a use-case allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": [
+          "analysis"
+        ],
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "missing-use-case-with-allowlist",
+        "policyDigest": "jcs-sha256:8ac4f0ef071019f42805bd96c6c568cf27df6088a6a17aa8790d5ebf9b17e1c9"
+      }
+    },
+    {
+      "name": "deny: use case absent from the allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": [
+          "analysis"
+        ],
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": "advertising"
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "not-in-allowedUseCases",
+        "policyDigest": "jcs-sha256:8ac4f0ef071019f42805bd96c6c568cf27df6088a6a17aa8790d5ebf9b17e1c9"
+      }
+    },
+    {
+      "name": "precedence: denied use case beats absent-from-model-allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": [
+          "good"
+        ],
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [
+          "advertising"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": "bad",
+        "useCase": "advertising"
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "in-deniedUseCases",
+        "policyDigest": "jcs-sha256:680b1bfb30a92a69e86c66856a1caad7ddc2c86cf5a2991543dcd1a508e862c7"
+      }
+    },
+    {
+      "name": "precedence: tool gate beats every identity gate",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [
+          "query_sql"
+        ],
+        "allowedModels": null,
+        "deniedModels": [
+          "bad"
+        ],
+        "allowedUseCases": null,
+        "deniedUseCases": [
+          "advertising"
+        ]
+      },
+      "request": {
+        "tool": "query_sql",
+        "modelId": "bad",
+        "useCase": "advertising"
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "tool-not-allowed",
+        "policyDigest": "jcs-sha256:f6aee2c2bc9913cd71486bfde2daa16f008e9f94eb9d1884de4df13f5295de45"
+      }
+    },
+    {
+      "name": "precedence: denied model beats missing-use-case-allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [
+          "bad"
+        ],
+        "allowedUseCases": [
+          "analysis"
+        ],
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": "bad",
+        "useCase": null
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "in-deniedModels",
+        "policyDigest": "jcs-sha256:9d55a049a4a30bbbcd7b6185569c7c4ca357f562b10fdc650a02bc41a86342f4"
+      }
+    },
+    {
+      "name": "precedence: missing model identity beats a denied use case",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": [
+          "good"
+        ],
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [
+          "advertising"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": "advertising"
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "missing-model-identity",
+        "policyDigest": "jcs-sha256:680b1bfb30a92a69e86c66856a1caad7ddc2c86cf5a2991543dcd1a508e862c7"
+      }
+    },
+    {
+      "name": "precedence: denied model beats absent-from-use-case-allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [
+          "bad"
+        ],
+        "allowedUseCases": [
+          "analysis"
+        ],
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": "bad",
+        "useCase": "advertising"
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "in-deniedModels",
+        "policyDigest": "jcs-sha256:9d55a049a4a30bbbcd7b6185569c7c4ca357f562b10fdc650a02bc41a86342f4"
+      }
+    },
+    {
+      "name": "precedence: absent-from-model-allowlist beats absent-from-use-case-allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": [
+          "good"
+        ],
+        "deniedModels": [],
+        "allowedUseCases": [
+          "analysis"
+        ],
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": "bad",
+        "useCase": "advertising"
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "not-in-allowedModels",
+        "policyDigest": "jcs-sha256:2f9620a8f207bb9eb07abaa60863811ae888c36783630d1cb0f3c1085aa42bd8"
+      }
+    },
+    {
+      "name": "digest: authoring order does not matter",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": [
+          "a",
+          "b"
+        ],
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": "a",
+        "useCase": null
+      },
+      "expect": {
+        "allow": true,
+        "reasonCode": "allowed",
+        "policyDigest": "jcs-sha256:d350ce0e1515b64f07f0bfa7629578c47ec921c6a5ff9bada5df36e32462186d"
+      }
+    },
+    {
+      "name": "digest: duplicates do not matter",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": [
+          "a"
+        ],
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": "a",
+        "useCase": null
+      },
+      "expect": {
+        "allow": true,
+        "reasonCode": "allowed",
+        "policyDigest": "jcs-sha256:9a05f00d086fd43f07aa31a2f496e8d712054e6d5d71c04022263e2ec819f4c4"
+      }
+    },
+    {
+      "name": "deny: empty model allowlist allows no model",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": [],
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": "any",
+        "useCase": null
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "not-in-allowedModels",
+        "policyDigest": "jcs-sha256:ce8787ee6928235c57e8e43c659212ed8424e3a496fec1260b9d6f2adf669f78"
+      }
+    },
+    {
+      "name": "deny: empty use-case allowlist allows no use case",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": [],
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": "analysis"
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "not-in-allowedUseCases",
+        "policyDigest": "jcs-sha256:19b53b03bf74951191b282af73e0a0b414fd461d2da65b0fb6ed686130a82391"
+      }
+    }
+  ]
+}
