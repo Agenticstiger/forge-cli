@@ -118,16 +118,35 @@ class TestSovereigntyValidator:
         )
         assert ok is True
 
-    def test_jurisdiction_mismatch_warning(self):
-        ok, violations = SovereigntyValidator().validate(
-            self._contract(
-                sovereignty={"jurisdiction": "EU"},
-                exposes=[{"exposeId": "e1", "binding": {"location": {"region": "us-east-1"}}}],
+    def test_jurisdiction_mismatch_severity_follows_enforcement_mode(self):
+        """A mismatch is reported in every mode; its severity is the mode's.
+
+        This test previously asserted "warning" while supplying no
+        enforcementMode — which defaults to strict. It therefore pinned the
+        defect: the schema says strict blocks deployment and that jurisdiction
+        exists "to validate binding.location matches sovereignty intent", yet a
+        strict EU contract bound entirely to us-east-1 validated clean because
+        this check hardcoded warning. The assertion that a mismatch is reported
+        at all is preserved; only the severity is corrected.
+        """
+        for mode, expected in (
+            (None, "error"),  # default is strict
+            ("strict", "error"),
+            ("advisory", "warning"),
+            ("audit", "info"),
+        ):
+            sovereignty = {"jurisdiction": "EU"}
+            if mode is not None:
+                sovereignty["enforcementMode"] = mode
+            _, violations = SovereigntyValidator().validate(
+                self._contract(
+                    sovereignty=sovereignty,
+                    exposes=[{"exposeId": "e1", "binding": {"location": {"region": "us-east-1"}}}],
+                )
             )
-        )
-        assert any(
-            v.severity == "warning" and "jurisdiction" in v.message.lower() for v in violations
-        )
+            assert any(
+                v.severity == expected and "jurisdiction" in v.message.lower() for v in violations
+            ), f"enforcementMode={mode!r} should report the mismatch as {expected!r}"
 
     def test_jurisdiction_match_no_violation(self):
         ok, violations = SovereigntyValidator().validate(
