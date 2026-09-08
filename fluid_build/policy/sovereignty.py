@@ -45,6 +45,30 @@ class EnforcementMode(Enum):
 # that needs to display or apply a default reads these, so the value used to
 # decide and the value shown to the operator cannot drift apart.
 # ``tests/test_sovereignty.py`` pins them against the bundled schema.
+def severity_for(mode: "EnforcementMode") -> str:
+    """Map an enforcement mode onto the severity a blocking-class violation carries.
+
+    The schema defines the modes in one sentence — "strict = block deployment,
+    advisory = warn, audit = log only" — and this is the only place that sentence
+    is turned into behaviour.
+
+    It has to live in one place because severity is not merely a label here: it
+    is what actually decides the outcome. ``fluid validate`` routes messages by
+    their rendered PREFIX (❌ / ⚠️ / ℹ️, see validate_sovereignty below and
+    cli/validate.py), so a hardcoded severity silently overrides the mode no
+    matter what the returned boolean says. That is how this diverged in both
+    directions at once: check 1 hardcoded "error", so `advisory` failed builds it
+    was documented to merely warn about, and check 3 hardcoded "warning", so
+    `strict` could not block a jurisdiction mismatch — the single thing the
+    `jurisdiction` field exists to catch.
+    """
+    if mode == EnforcementMode.STRICT:
+        return "error"
+    if mode == EnforcementMode.ADVISORY:
+        return "warning"
+    return "info"
+
+
 DEFAULT_ENFORCEMENT_MODE = "strict"
 DEFAULT_DATA_RESIDENCY = True
 DEFAULT_CROSS_BORDER_TRANSFER = False
@@ -384,7 +408,16 @@ class SovereigntyValidator:
 
             expose_id = expose.get("exposeId", "unknown")
 
-            # Check 1: Denied regions (always enforced regardless of mode)
+            # Check 1: Denied regions — deliberately an error in EVERY mode.
+            #
+            # This is the one carve-out from severity_for(), and it is a
+            # considered decision rather than an oversight: an entry in
+            # deniedRegions is an operator naming a specific prohibition, which
+            # outranks a mode default in the same way an explicit denylist
+            # outranks absence from an allowlist in the agentPolicy CHECK_ORDER.
+            # tests/cli/test_plan_sovereignty_gate.py pins it, and pins WHY:
+            # `fluid validate` exits 1 on an explicit deny, so `plan` must block
+            # too or the two stages disagree about the same contract.
             if region in denied_regions:
                 violations.append(
                     SovereigntyViolation(
@@ -399,7 +432,7 @@ class SovereigntyValidator:
 
             # Check 2: Allowed regions (if specified)
             if allowed_regions and region not in allowed_regions:
-                severity = "error" if enforcement_mode == EnforcementMode.STRICT else "warning"
+                severity = severity_for(enforcement_mode)
                 violations.append(
                     SovereigntyViolation(
                         severity=severity,
@@ -415,9 +448,21 @@ class SovereigntyValidator:
             if jurisdiction and jurisdiction != "Global":
                 region_jurisdiction = region_jurisdiction_map().get(region, "Unknown")
                 if region_jurisdiction != jurisdiction and region_jurisdiction != "Global":
+                    # "Unknown" is an inability to evaluate, not a violation, and
+                    # the two must not be conflated: a region the vendored table
+                    # does not carry says nothing about where it actually is.
+                    # Escalating it under strict would fail closed on every
+                    # contract using an unmapped region — defensible for a
+                    # sovereignty control, but a separate decision with its own
+                    # blast radius, not a side effect of making enforcementMode
+                    # mean what the schema says. Check 4 already draws this exact
+                    # line and refuses to let one Unknown agree with another.
+                    unresolvable = region_jurisdiction == "Unknown"
                     violations.append(
                         SovereigntyViolation(
-                            severity="warning",
+                            severity=(
+                                "warning" if unresolvable else severity_for(enforcement_mode)
+                            ),
                             message=f"Region '{region}' (jurisdiction: {region_jurisdiction}) "
                             f"does not match required jurisdiction: {jurisdiction}",
                             expose_id=expose_id,
@@ -479,7 +524,7 @@ class SovereigntyValidator:
                 elif exp_jurisdiction != baseline:
                     violations.append(
                         SovereigntyViolation(
-                            severity="error",
+                            severity=severity_for(enforcement_mode),
                             message=(
                                 "Cross-border data transfer prohibited but multiple "
                                 f"jurisdictions detected ({baseline} and {exp_jurisdiction})"
@@ -491,15 +536,18 @@ class SovereigntyValidator:
                     )
                     break
 
-        # Determine final validity based on enforcement mode
+        # One rule, in every mode: an error-severity violation blocks and nothing
+        # else does. The mode is already expressed in the severities themselves
+        # (see severity_for), so re-applying it here is what previously let
+        # is_valid=True be returned alongside an error-severity violation.
+        #
+        # Both existing callers work around that: cli/validate.py re-scans for
+        # ❌ messages and cli/plan.py computes its own has_error_finding with a
+        # comment explaining why the boolean could not be trusted. Those
+        # workarounds are now redundant rather than load-bearing, and a third
+        # caller branching on is_valid alone no longer silently under-enforces.
         has_errors = any(v.severity == "error" for v in violations)
-
-        if enforcement_mode == EnforcementMode.STRICT:
-            is_valid = not has_errors
-        elif enforcement_mode == EnforcementMode.ADVISORY:
-            is_valid = True  # Warnings only, allow deployment
-        else:  # AUDIT
-            is_valid = True  # Log only, allow deployment
+        is_valid = not has_errors
 
         return is_valid, violations
 
