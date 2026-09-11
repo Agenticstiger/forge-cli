@@ -35,6 +35,8 @@ explicitly; what they can no longer do is lose it by accident.
 
 from __future__ import annotations
 
+from typing import Dict, Optional
+
 import pytest
 
 from fluid_build.output_ports.mcp.auth import AuthValidator
@@ -42,12 +44,16 @@ from fluid_build.output_ports.mcp.auth import AuthValidator
 DEFAULTS = {"sub", "model", "use_case", "tenant_id"}
 
 
-def _mappings(monkeypatch: pytest.MonkeyPatch, env: str) -> dict:
+def _mappings(monkeypatch: pytest.MonkeyPatch, env: Optional[str]) -> Dict[str, str]:
+    """Resolve the claim mappings under a JWT config; ``env`` of ``None`` unsets the var."""
     monkeypatch.setenv("FLUID_MCP_AUTH_MODE", "jwt")
     monkeypatch.setenv("FLUID_MCP_JWT_ISSUER", "https://issuer.example")
     monkeypatch.setenv("FLUID_MCP_JWT_AUDIENCE", "fluid")
     monkeypatch.setenv("FLUID_MCP_JWT_JWKS_URL", "https://issuer.example/jwks")
-    monkeypatch.setenv("FLUID_MCP_JWT_CLAIM_MAPPING", env)
+    if env is None:
+        monkeypatch.delenv("FLUID_MCP_JWT_CLAIM_MAPPING", raising=False)
+    else:
+        monkeypatch.setenv("FLUID_MCP_JWT_CLAIM_MAPPING", env)
     return dict(AuthValidator.from_env().jwt_claim_mappings)
 
 
@@ -82,15 +88,12 @@ def test_multiple_custom_mappings_all_apply(monkeypatch: pytest.MonkeyPatch) -> 
 def test_no_env_var_leaves_defaults_exactly_as_they_were(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Guard the guard: the merge must not perturb the untouched path."""
-    monkeypatch.delenv("FLUID_MCP_JWT_CLAIM_MAPPING", raising=False)
-    mappings = _mappings.__wrapped__ if hasattr(_mappings, "__wrapped__") else None
-    monkeypatch.setenv("FLUID_MCP_AUTH_MODE", "jwt")
-    monkeypatch.setenv("FLUID_MCP_JWT_ISSUER", "https://issuer.example")
-    monkeypatch.setenv("FLUID_MCP_JWT_AUDIENCE", "fluid")
-    monkeypatch.setenv("FLUID_MCP_JWT_JWKS_URL", "https://issuer.example/jwks")
-    monkeypatch.delenv("FLUID_MCP_JWT_CLAIM_MAPPING", raising=False)
-    assert DEFAULTS <= set(AuthValidator.from_env().jwt_claim_mappings)
+    """Guard the guard: the merge must not perturb the untouched path.
+
+    Exactly the defaults, no extras — an over-eager merge that folded in
+    something else would still satisfy a subset assertion.
+    """
+    assert set(_mappings(monkeypatch, None)) == DEFAULTS
 
 
 def test_malformed_entries_are_skipped_without_losing_defaults(
