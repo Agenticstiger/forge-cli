@@ -321,10 +321,16 @@ def test_from_env_jwt_mode_pulls_issuer_audience_jwks(
     v = AuthValidator.from_env()
     assert v.mode == "jwt"
     assert v.is_enabled()
-    assert v.jwt_claim_mappings == {
-        "sub": "principal",
-        "https://fluid/model": "model",
-    }
+    # The custom entries apply, and `sub` is overridden away from its default.
+    assert v.jwt_claim_mappings["sub"] == "principal"
+    assert v.jwt_claim_mappings["https://fluid/model"] == "model"
+    # …and the defaults the operator did NOT mention survive. This assertion
+    # used to be an exact-equality check, which pinned the env var REPLACING the
+    # defaults: mapping one extra claim silently dropped model/use_case/tenant_id,
+    # turning off the agentPolicy gates and emptying ${caller.*} row filters.
+    # See tests/output_ports/test_jwt_claim_mapping_merge.py.
+    assert v.jwt_claim_mappings["use_case"] == "use_case"
+    assert v.jwt_claim_mappings["tenant_id"] == "tenant_id"
 
 
 def test_from_env_unknown_mode_raises():
