@@ -41,6 +41,13 @@ Two design decisions baked into the digest algorithm:
    referential hashing (hashing a dict that includes its own hash) is
    impossible, and the natural recursion has no fixed point. The masked
    form computes a stable hash regardless of insertion order.
+
+The same canonicalisation (``_canonical_json``) also backs
+``compute_contract_digest`` — the cross-mesh federation primitive used by
+``forge/federation.py`` to hash an *upstream* ``contract.fluid.yaml``
+after parsing it. Keeping both digests on one canonicaliser is the point:
+peers that format the same contract differently must still agree, so a
+raw-text hash is never an acceptable substitute.
 """
 
 from __future__ import annotations
@@ -49,7 +56,7 @@ import hashlib
 import json
 import unicodedata
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 # Plan fields excluded from the planDigest hash input.
 #
@@ -108,6 +115,24 @@ def coerce_keys_to_str(obj: Any) -> Any:
     return obj
 
 
+def _canonical_json(obj: Any) -> str:
+    """Canonical JSON serialisation shared by every fluid digest.
+
+    One definition, so :func:`compute_plan_digest` and
+    :func:`compute_contract_digest` cannot drift apart: NFC-normalise
+    every string, coerce non-``str`` dict keys (see
+    :func:`coerce_keys_to_str`), then dump with sorted keys and compact
+    separators. Deterministic across runs, machines, and Python
+    versions, and reproducible externally with ``jq -cS``.
+    """
+    return json.dumps(
+        coerce_keys_to_str(_nfc_normalise(obj)),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
 def compute_plan_digest(plan: Dict[str, Any]) -> str:
     """SHA-256 over the plan body, canonicalised so it is byte-stable.
 
@@ -131,12 +156,50 @@ def compute_plan_digest(plan: Dict[str, Any]) -> str:
 
     Returns a ``sha256:<hex>`` string (64 hex chars after the prefix).
     """
-    stripped = _nfc_normalise({k: v for k, v in plan.items() if k not in _NON_DIGEST_FIELDS})
-    # Coerce non-str keys to str BEFORE sort_keys serialisation: a contract
-    # carrying a YAML magic-word key (on/off/yes/no) parses it as a Python
-    # bool, and ``sort_keys=True`` cannot order a mixed bool/str key set.
-    stripped = coerce_keys_to_str(stripped)
-    canonical = json.dumps(stripped, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    stripped = {k: v for k, v in plan.items() if k not in _NON_DIGEST_FIELDS}
+    # ``_canonical_json`` NFC-normalises, then coerces non-str keys to str
+    # BEFORE sort_keys serialisation: a contract carrying a YAML magic-word
+    # key (on/off/yes/no) parses it as a Python bool, and ``sort_keys=True``
+    # cannot order a mixed bool/str key set.
+    return "sha256:" + hashlib.sha256(_canonical_json(stripped).encode("utf-8")).hexdigest()
+
+
+def compute_contract_digest(contract: Mapping[str, Any]) -> str:
+    """SHA-256 over a *parsed* contract, canonicalised so it is byte-stable.
+
+    This is the cross-mesh federation primitive (see
+    ``forge/federation.py``): an upstream repo's ``contract.fluid.yaml``
+    is parsed, canonicalised, and hashed so two peers holding the
+    semantically identical contract agree on the digest even when their
+    YAML differs in key order, indentation, quoting style, comments,
+    anchors, or line endings. Hashing the raw file text instead would
+    turn every one of those into a spurious "upstream drifted" verdict.
+
+    Canonicalisation is *exactly* :func:`compute_plan_digest`'s, shared
+    via ``_canonical_json`` so the two cannot drift apart: NFC-normalised
+    strings, ``str``-coerced keys, ``sort_keys=True`` compact JSON.
+    Operators can reproduce it externally with::
+
+        yq -o=json '.' contract.fluid.yaml | jq -cSj '.' | shasum -a 256
+
+    Unlike the plan digest, **nothing is masked out**. A contract has no
+    derived digest field and no volatile timestamp, so every key is part
+    of its identity; masking by name would silently drop real contract
+    content that happened to be called ``generated_at``.
+
+    Returns a ``sha256:<hex>`` string (64 hex chars after the prefix).
+    Raises :class:`TypeError` when handed something that is not a parsed
+    mapping — a caller that passes raw YAML text is asking for the
+    formatting-sensitive hash this function exists to avoid.
+    """
+    if not isinstance(contract, Mapping):
+        raise TypeError(
+            f"compute_contract_digest expects a parsed contract mapping, got "
+            f"{type(contract).__name__}. Parse the YAML first (load_yaml_safe) "
+            f"— hashing raw text is formatting-sensitive and not comparable "
+            f"across peers."
+        )
+    canonical = _canonical_json(dict(contract))
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -451,6 +514,7 @@ def verify_plan_binding(
 __all__ = [
     "PlanBindingError",
     "coerce_keys_to_str",
+    "compute_contract_digest",
     "compute_plan_digest",
     "inject_digests",
     "is_bundle_path",
