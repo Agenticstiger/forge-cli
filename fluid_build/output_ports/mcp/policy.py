@@ -47,6 +47,7 @@ from fluid_build.policy.decision import Decision, EffectivePolicy
 from fluid_build.policy.decision import as_tuple as _as_tuple
 from fluid_build.policy.decision import decide as _decide
 from fluid_build.policy.decision import policy_digest as _policy_digest
+from fluid_build.policy.sovereignty import derive_caller_jurisdictions
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,34 @@ class OutputPortPolicy:
     """Denylist of declared use cases. Evaluated before
     allowed_use_cases so denial wins."""
 
+    allowed_caller_jurisdictions: Optional[Tuple[str, ...]] = None
+    """Jurisdictions a caller may be in, from the contract's root ``sovereignty``.
+
+    ``None`` means no constraint, and the gate is inert — which is every
+    contract that has not pinned a jurisdiction.
+
+    NOT REACHABLE FROM THE CLI TODAY, and the reason is a transport gap rather
+    than an oversight. Read this before wiring it up:
+
+    ``fluid mcp output-port serve`` calls :func:`run_stdio`. The verified
+    markers this gate depends on — ``fluid_auth_attrs`` and ``fluid_auth_kind``
+    — are stamped in exactly one place, ``_transport.py``'s HTTP
+    ``_AuthMiddleware``. Stdio carries no headers, so that middleware never
+    runs and no claim can ever be verified on that path.
+
+    The consequence is not "the gate is weaker over stdio". It is that a
+    jurisdiction rule over stdio refuses 100% of calls, permanently, with no
+    configuration an operator can apply to fix it — because there is no HTTP
+    transport wired to the CLI to configure. ``run_http_async`` exists on the
+    server object but is not exported from the package, and its only caller in
+    the tree is a test.
+
+    So ``_build_policy`` deliberately does NOT pass the root contract: the
+    derivation ships, and activation waits on the CLI growing an HTTP
+    transport. An embedder calling ``run_http_async`` directly can use this
+    today by passing ``contract=`` to :meth:`from_contract_and_flags`.
+    """
+
     policy_source: str = "default"
     """Where the policy came from — ``contract``, ``cli``, or
     ``default``. Surfaced on audit events so operators can tell
@@ -258,6 +287,7 @@ class OutputPortPolicy:
             denied_models=self.denied_models,
             allowed_use_cases=self.allowed_use_cases,
             denied_use_cases=self.denied_use_cases,
+            allowed_caller_jurisdictions=self.allowed_caller_jurisdictions,
         )
 
     def policy_digest(self) -> str:
@@ -270,6 +300,8 @@ class OutputPortPolicy:
         tool: Optional[str],
         model_id: Optional[str],
         use_case: Optional[str],
+        caller_jurisdiction: Optional[str] = None,
+        caller_jurisdiction_verified: bool = False,
     ) -> Decision:
         """Full decision — verdict, reason code and policy digest.
 
@@ -282,6 +314,8 @@ class OutputPortPolicy:
             tool=tool,
             model_id=model_id,
             use_case=use_case,
+            caller_jurisdiction=caller_jurisdiction,
+            caller_jurisdiction_verified=caller_jurisdiction_verified,
         )
 
     @classmethod
@@ -289,6 +323,7 @@ class OutputPortPolicy:
         cls,
         *,
         expose: Mapping[str, Any],
+        contract: Optional[Mapping[str, Any]] = None,
         contract_path: Optional[Path] = None,
         # Existing tool-level overrides (preserved verbatim from the
         # cherry-picked CLI surface)
@@ -315,6 +350,14 @@ class OutputPortPolicy:
         meant to be intentional.
         """
         agent_policy = (expose.get("policy") or {}).get("agentPolicy") or {}
+
+        # Caller-jurisdiction rules come from the contract ROOT, not the expose:
+        # `sovereignty` is declared once per data product. Passing the root
+        # contract is optional so every existing caller keeps compiling and
+        # keeps getting an inert gate.
+        allowed_caller_jurisdictions = (
+            derive_caller_jurisdictions(contract) if contract is not None else None
+        )
 
         contract_allowed_models = _maybe_tuple(agent_policy.get("allowedModels"))
         contract_denied_models = _coerce_tuple(agent_policy.get("deniedModels"))
@@ -367,6 +410,7 @@ class OutputPortPolicy:
                 if cli_denied_use_cases is not None
                 else contract_denied_use_cases
             ),
+            allowed_caller_jurisdictions=allowed_caller_jurisdictions,
             policy_source=policy_source,
         )
 
