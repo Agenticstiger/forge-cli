@@ -77,6 +77,18 @@ class ReasonCode(str, Enum):
     #: The tool is denied outright, or is absent from a declared tool allowlist.
     TOOL_NOT_ALLOWED = "tool-not-allowed"
 
+    #: A jurisdiction rule is in force and the caller presented no VERIFIED
+    #: jurisdiction. Fail-closed: an unverified claim is never admissible in the
+    #: claimant's favour, so "absent" and "self-asserted" collapse to the same
+    #: outcome here on purpose.
+    MISSING_CALLER_JURISDICTION = "missing-caller-jurisdiction"
+
+    #: The caller's verified jurisdiction appears in deniedCallerJurisdictions.
+    IN_DENIED_JURISDICTION = "in-denied-jurisdiction"
+
+    #: An allowlist exists and the caller's verified jurisdiction is not on it.
+    NOT_IN_ALLOWED_JURISDICTIONS = "not-in-allowed-jurisdictions"
+
     #: The caller declared no model identity while the policy has something to
     #: enforce about models. Fail-closed: without identity the gate cannot
     #: decide, and allowing would defeat the contract.
@@ -125,6 +137,13 @@ class ReasonCode(str, Enum):
 #: request. Now the order is data, and the conformance vectors pin it.
 CHECK_ORDER: Tuple[ReasonCode, ...] = (
     ReasonCode.TOOL_NOT_ALLOWED,
+    # Jurisdiction sits above the identity gates on a third principle: a legal
+    # constraint outranks a usage constraint as the reported reason. If a caller
+    # may not receive this data at all, saying "your model is not on the
+    # allowlist" describes the least important thing wrong with the request.
+    ReasonCode.MISSING_CALLER_JURISDICTION,
+    ReasonCode.IN_DENIED_JURISDICTION,
+    ReasonCode.NOT_IN_ALLOWED_JURISDICTIONS,
     ReasonCode.MISSING_MODEL_IDENTITY,
     ReasonCode.IN_DENIED_MODELS,
     ReasonCode.IN_DENIED_USE_CASES,
@@ -163,6 +182,21 @@ class EffectivePolicy:
     denied_models: Tuple[str, ...] = ()
     allowed_use_cases: Optional[Tuple[str, ...]] = None
     denied_use_cases: Tuple[str, ...] = ()
+    allowed_caller_jurisdictions: Optional[Tuple[str, ...]] = None
+    denied_caller_jurisdictions: Tuple[str, ...] = ()
+
+    @property
+    def has_jurisdiction_rules(self) -> bool:
+        """True when this policy says anything at all about caller jurisdiction.
+
+        When false the jurisdiction gate is inert, exactly as the model gate is
+        inert on a contract with no model rules. Enforcing an empty rule set
+        would refuse every caller on every contract that has never heard of
+        sovereignty.
+        """
+        return self.allowed_caller_jurisdictions is not None or bool(
+            self.denied_caller_jurisdictions
+        )
 
     @classmethod
     def of(
@@ -174,6 +208,8 @@ class EffectivePolicy:
         denied_models: Iterable[str] = (),
         allowed_use_cases: Optional[Iterable[str]] = None,
         denied_use_cases: Iterable[str] = (),
+        allowed_caller_jurisdictions: Optional[Iterable[str]] = None,
+        denied_caller_jurisdictions: Iterable[str] = (),
     ) -> "EffectivePolicy":
         return cls(
             allowed_tools=_norm(allowed_tools),
@@ -182,11 +218,13 @@ class EffectivePolicy:
             denied_models=_norm(denied_models) or (),
             allowed_use_cases=_norm(allowed_use_cases),
             denied_use_cases=_norm(denied_use_cases) or (),
+            allowed_caller_jurisdictions=_norm(allowed_caller_jurisdictions),
+            denied_caller_jurisdictions=_norm(denied_caller_jurisdictions) or (),
         )
 
     def as_canonical_mapping(self) -> Dict[str, Any]:
         """The exact object the digest is taken over."""
-        return {
+        payload: Dict[str, Any] = {
             "allowedTools": list(self.allowed_tools) if self.allowed_tools is not None else None,
             "deniedTools": list(self.denied_tools),
             "allowedModels": list(self.allowed_models) if self.allowed_models is not None else None,
@@ -196,6 +234,17 @@ class EffectivePolicy:
             ),
             "deniedUseCases": list(self.denied_use_cases),
         }
+        # Added ONLY when a rule exists. A policy that says nothing about
+        # jurisdiction must serialise to exactly the six-key object it did
+        # before this field existed, or every policyDigest in every stored
+        # decision record silently changes meaning on upgrade. The vectors pin
+        # this: their per-vector policyDigest values are unchanged by this
+        # feature, and a test asserts the pre-change literals directly.
+        if self.allowed_caller_jurisdictions is not None:
+            payload["allowedCallerJurisdictions"] = list(self.allowed_caller_jurisdictions)
+        if self.denied_caller_jurisdictions:
+            payload["deniedCallerJurisdictions"] = list(self.denied_caller_jurisdictions)
+        return payload
 
 
 def _canonical_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -255,6 +304,15 @@ class Decision:
     tool: Optional[str] = None
     model_id: Optional[str] = None
     use_case: Optional[str] = None
+    caller_jurisdiction: Optional[str] = None
+    caller_jurisdiction_source: Optional[str] = None
+    """How the jurisdiction was established, e.g. "jwt:https://fluid/jurisdiction".
+
+    A structured string and never a bare ``verified: true`` boolean. A validated
+    signature establishes that the caller did not author the string; it does not
+    establish that the caller was there. A boolean in an auditor's hands turns
+    that distinction into a documented presence of control.
+    """
 
     def to_record(self) -> Dict[str, Any]:
         """A decision record: the minimum an auditor needs, and nothing more.
@@ -272,6 +330,8 @@ class Decision:
                 "tool": self.tool,
                 "modelId": self.model_id,
                 "useCase": self.use_case,
+                "callerJurisdiction": self.caller_jurisdiction,
+                "callerJurisdictionSource": self.caller_jurisdiction_source,
             },
         }
 
@@ -282,6 +342,8 @@ def decide(
     tool: Optional[str] = None,
     model_id: Optional[str] = None,
     use_case: Optional[str] = None,
+    caller_jurisdiction: Optional[str] = None,
+    caller_jurisdiction_verified: bool = False,
     digest: Optional[str] = None,
 ) -> Decision:
     """Evaluate ``policy`` against one request. Pure and total.
@@ -302,8 +364,15 @@ def decide(
             use_case=use_case,
         )
 
+    # An unverified claim is discarded before any rule sees it. This is the
+    # design's load-bearing rule: a caller-asserted jurisdiction is admissible
+    # AGAINST the claimant and never in their favour, so dropping it here means
+    # "I am in the EU" with no signature behind it can satisfy nothing, while
+    # the fail-closed MISSING_CALLER_JURISDICTION branch still fires.
+    verified_jurisdiction = caller_jurisdiction if caller_jurisdiction_verified else None
+
     for candidate in CHECK_ORDER:
-        if _fires(candidate, policy, tool, model_id, use_case):
+        if _fires(candidate, policy, tool, model_id, use_case, verified_jurisdiction):
             return _denied(candidate)
 
     return Decision(
@@ -322,6 +391,7 @@ def _fires(
     tool: Optional[str],
     model_id: Optional[str],
     use_case: Optional[str],
+    verified_jurisdiction: Optional[str] = None,
 ) -> bool:
     """Does this single rule deny the request? One branch per reason code.
 
@@ -335,6 +405,23 @@ def _fires(
         if tool in policy.denied_tools:
             return True
         return policy.allowed_tools is not None and tool not in policy.allowed_tools
+
+    if reason is ReasonCode.MISSING_CALLER_JURISDICTION:
+        if not policy.has_jurisdiction_rules:
+            return False
+        return not verified_jurisdiction
+
+    if reason is ReasonCode.IN_DENIED_JURISDICTION:
+        return bool(verified_jurisdiction) and (
+            verified_jurisdiction in policy.denied_caller_jurisdictions
+        )
+
+    if reason is ReasonCode.NOT_IN_ALLOWED_JURISDICTIONS:
+        return (
+            bool(verified_jurisdiction)
+            and policy.allowed_caller_jurisdictions is not None
+            and verified_jurisdiction not in policy.allowed_caller_jurisdictions
+        )
 
     if reason is ReasonCode.MISSING_MODEL_IDENTITY:
         if model_id:

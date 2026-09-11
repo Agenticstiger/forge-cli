@@ -61,6 +61,10 @@ def _policy_of(mapping: Dict[str, Any]) -> EffectivePolicy:
         denied_models=mapping["deniedModels"],
         allowed_use_cases=mapping["allowedUseCases"],
         denied_use_cases=mapping["deniedUseCases"],
+        # Absent by design on a policy with no jurisdiction rules — that
+        # absence is what keeps its digest identical to the pre-feature value.
+        allowed_caller_jurisdictions=mapping.get("allowedCallerJurisdictions"),
+        denied_caller_jurisdictions=mapping.get("deniedCallerJurisdictions") or (),
     )
 
 
@@ -71,7 +75,7 @@ def _policy_of(mapping: Dict[str, Any]) -> EffectivePolicy:
 
 def test_vector_file_is_populated() -> None:
     assert VECTORS, "the vector file is empty — this suite would pass vacuously"
-    assert len(VECTORS) >= 20
+    assert len(VECTORS) >= 30
 
 
 def test_vectors_cover_every_reason_code() -> None:
@@ -120,6 +124,8 @@ def test_vector(vector: Dict[str, Any]) -> None:
         tool=request["tool"],
         model_id=request["modelId"],
         use_case=request["useCase"],
+        caller_jurisdiction=request.get("callerJurisdiction"),
+        caller_jurisdiction_verified=bool(request.get("callerJurisdictionVerified")),
     )
 
     assert (
@@ -141,3 +147,21 @@ def test_vector(vector: Dict[str, Any]) -> None:
 def test_vector_digest_is_reproducible_from_the_policy_alone(vector: Dict[str, Any]) -> None:
     """The digest must depend only on the policy, never on the request."""
     assert policy_digest(_policy_of(vector["policy"])) == vector["expect"]["policyDigest"]
+
+
+def test_an_unverified_claim_has_a_vector() -> None:
+    """The design's load-bearing rule must be pinned by data, not only by code.
+
+    If the verified-only rule regressed, a vector asserting that a caller who
+    self-asserts the right answer is still refused is what catches it.
+    """
+    unverified = [
+        v
+        for v in VECTORS
+        if v["request"].get("callerJurisdiction")
+        and not v["request"].get("callerJurisdictionVerified")
+    ]
+    assert unverified, "no vector exercises an unverified jurisdiction claim"
+    assert all(
+        v["expect"]["allow"] is False for v in unverified
+    ), "an unverified claim satisfied a rule in some vector"

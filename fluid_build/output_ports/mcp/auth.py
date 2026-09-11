@@ -54,7 +54,24 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+
+#: Claim -> caller-attribute mappings applied when an operator configures none.
+#:
+#: These are not decoration. ``model`` and ``use_case`` are the inputs to the
+#: agentPolicy gate (``decide()`` in fluid_build.policy.decision), and ``sub`` /
+#: ``tenant_id`` are what ``${caller.*}`` row filters interpolate. Losing any of
+#: them does not fail — it silently widens access, which is why
+#: ``FLUID_MCP_JWT_CLAIM_MAPPING`` MERGES over these rather than replacing them.
+DEFAULT_JWT_CLAIM_MAPPINGS: Mapping[str, str] = MappingProxyType(
+    {
+        "sub": "sub",
+        "model": "model",
+        "use_case": "use_case",
+        "tenant_id": "tenant_id",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -116,13 +133,7 @@ class AuthValidator:
         # "https://fluid/model": "model", "https://fluid/tenant":
         # "tenant_id"}). The defaults cover the most common shapes.
         self.jwt_claim_mappings: Dict[str, str] = dict(
-            jwt_claim_mappings
-            or {
-                "sub": "sub",
-                "model": "model",
-                "use_case": "use_case",
-                "tenant_id": "tenant_id",
-            }
+            jwt_claim_mappings if jwt_claim_mappings is not None else DEFAULT_JWT_CLAIM_MAPPINGS
         )
         self.jwks_cache_ttl_seconds = jwks_cache_ttl_seconds
         self._jwks_cache: Dict[str, Tuple[float, Any]] = {}
@@ -159,7 +170,15 @@ class AuthValidator:
                         continue
                     claim, attr = pair.split("=", 1)
                     parsed[claim.strip()] = attr.strip()
-                kwargs["jwt_claim_mappings"] = parsed
+                # MERGE over the defaults, never replace them. Assigning `parsed`
+                # wholesale meant an operator mapping one extra claim silently
+                # dropped sub/model/use_case/tenant_id — turning off the
+                # agentPolicy model and use-case gates and emptying every
+                # ${caller.*} row filter, with no error and a server still
+                # reporting healthy. An operator who really wants a default gone
+                # can still map it away explicitly; what they can no longer do is
+                # lose it by accident while adding something unrelated.
+                kwargs["jwt_claim_mappings"] = {**DEFAULT_JWT_CLAIM_MAPPINGS, **parsed}
         return cls(**kwargs)
 
     # ------------------------------------------------------------------

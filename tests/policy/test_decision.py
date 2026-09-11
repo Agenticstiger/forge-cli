@@ -89,6 +89,26 @@ def test_every_denial_code_is_reachable(code: ReasonCode) -> None:
             EffectivePolicy.of(allowed_use_cases=["analysis"]),
             {"tool": "query", "use_case": "advertising"},
         ),
+        ReasonCode.MISSING_CALLER_JURISDICTION: (
+            EffectivePolicy.of(allowed_caller_jurisdictions=["EU"]),
+            {"tool": "query"},
+        ),
+        ReasonCode.IN_DENIED_JURISDICTION: (
+            EffectivePolicy.of(denied_caller_jurisdictions=["US"]),
+            {
+                "tool": "query",
+                "caller_jurisdiction": "US",
+                "caller_jurisdiction_verified": True,
+            },
+        ),
+        ReasonCode.NOT_IN_ALLOWED_JURISDICTIONS: (
+            EffectivePolicy.of(allowed_caller_jurisdictions=["EU"]),
+            {
+                "tool": "query",
+                "caller_jurisdiction": "US",
+                "caller_jurisdiction_verified": True,
+            },
+        ),
     }
     policy, request = cases[code]
     decision = decide(policy=policy, **request)
@@ -248,6 +268,8 @@ def test_record_carries_reason_digest_and_request() -> None:
         "tool": "query",
         "modelId": "bad",
         "useCase": "analysis",
+        "callerJurisdiction": None,
+        "callerJurisdictionSource": None,
     }
 
 
@@ -293,3 +315,114 @@ def test_decision_is_frozen() -> None:
     with pytest.raises(Exception):
         decision.allow = False  # type: ignore[misc]
     assert isinstance(decision, Decision)
+
+
+# ---------------------------------------------------------------------------
+# caller jurisdiction: verified-only, fail-closed
+# ---------------------------------------------------------------------------
+
+
+def test_policy_with_no_jurisdiction_rules_is_inert() -> None:
+    """A contract that never heard of sovereignty must not start refusing."""
+    assert decide(policy=ALL, tool="query").allow is True
+
+
+def test_unverified_claim_never_satisfies_an_allowlist() -> None:
+    """The load-bearing rule: a claim is worth exactly its authentication.
+
+    Self-asserting the right answer must be indistinguishable from saying
+    nothing, or the gate is theatre.
+    """
+    policy = EffectivePolicy.of(allowed_caller_jurisdictions=["EU"])
+    d = decide(
+        policy=policy, tool="query", caller_jurisdiction="EU", caller_jurisdiction_verified=False
+    )
+    assert d.allow is False
+    assert d.reason is ReasonCode.MISSING_CALLER_JURISDICTION
+
+
+def test_verified_claim_on_the_allowlist_passes() -> None:
+    policy = EffectivePolicy.of(allowed_caller_jurisdictions=["EU"])
+    d = decide(
+        policy=policy, tool="query", caller_jurisdiction="EU", caller_jurisdiction_verified=True
+    )
+    assert d.allow is True
+
+
+def test_absent_and_unverified_collapse_to_the_same_reason() -> None:
+    """Deliberate: both mean "no admissible jurisdiction", so both fail closed."""
+    policy = EffectivePolicy.of(denied_caller_jurisdictions=["US"])
+    absent = decide(policy=policy, tool="query")
+    asserted = decide(
+        policy=policy, tool="query", caller_jurisdiction="EU", caller_jurisdiction_verified=False
+    )
+    assert absent.reason is asserted.reason is ReasonCode.MISSING_CALLER_JURISDICTION
+
+
+def test_jurisdiction_outranks_the_identity_gates() -> None:
+    """A legal constraint is the more useful reported reason than a usage one."""
+    policy = EffectivePolicy.of(allowed_caller_jurisdictions=["EU"], allowed_models=["good"])
+    d = decide(policy=policy, tool="query", model_id="bad")
+    assert d.reason is ReasonCode.MISSING_CALLER_JURISDICTION
+
+
+def test_tool_gate_still_outranks_jurisdiction() -> None:
+    policy = EffectivePolicy.of(denied_tools=["query_sql"], allowed_caller_jurisdictions=["EU"])
+    assert decide(policy=policy, tool="query_sql").reason is ReasonCode.TOOL_NOT_ALLOWED
+
+
+def test_denied_jurisdiction_beats_absent_from_allowlist() -> None:
+    policy = EffectivePolicy.of(
+        denied_caller_jurisdictions=["US"], allowed_caller_jurisdictions=["EU"]
+    )
+    d = decide(
+        policy=policy, tool="query", caller_jurisdiction="US", caller_jurisdiction_verified=True
+    )
+    assert d.reason is ReasonCode.IN_DENIED_JURISDICTION
+
+
+# ---------------------------------------------------------------------------
+# back-compat: this feature must not move a single existing digest
+# ---------------------------------------------------------------------------
+
+
+def test_pre_existing_digests_are_byte_for_byte_unchanged() -> None:
+    """Hardcoded literals captured BEFORE the jurisdiction fields existed.
+
+    Stored decision records reference these. If adding an optional field moved
+    them, every historical record would silently change meaning on upgrade.
+    """
+    assert policy_digest(EffectivePolicy.of()) == (
+        "jcs-sha256:1800416c6f7f132aa8140ee70c3ecfdca44a53e32098233c488edeec1097d6e3"
+    )
+    assert policy_digest(EffectivePolicy.of(allowed_models=["a"])) == (
+        "jcs-sha256:9a05f00d086fd43f07aa31a2f496e8d712054e6d5d71c04022263e2ec819f4c4"
+    )
+    assert (
+        policy_digest(
+            EffectivePolicy.of(
+                allowed_tools=["query"], denied_models=["bad"], denied_use_cases=["ads"]
+            )
+        )
+        == "jcs-sha256:ad1d358d1adb791a17a56862c5a29255ae015c02c55b739ad644a7650c0af6d9"
+    )
+
+
+def test_canonical_mapping_stays_six_keys_without_jurisdiction_rules() -> None:
+    assert list(EffectivePolicy.of().as_canonical_mapping()) == [
+        "allowedTools",
+        "deniedTools",
+        "allowedModels",
+        "deniedModels",
+        "allowedUseCases",
+        "deniedUseCases",
+    ]
+
+
+def test_jurisdiction_rules_do_change_the_digest() -> None:
+    assert policy_digest(EffectivePolicy.of(allowed_caller_jurisdictions=["EU"])) != policy_digest(
+        EffectivePolicy.of()
+    )
+    assert policy_digest(EffectivePolicy.of(denied_caller_jurisdictions=["US"])) != policy_digest(
+        EffectivePolicy.of(allowed_caller_jurisdictions=["US"])
+    )

@@ -1,9 +1,12 @@
 {
-  "vectorsVersion": "0.1.0",
-  "description": "agentPolicy decision vectors. A conformant gate reproduces every allow, reasonCode AND policyDigest below. Check order is normative and first match wins; a request that trips several rules is denied regardless of order, but the reasonCode it reports is not free. Matching is exact and case-sensitive.",
-  "canonicalisation": "policyDigest = '<scheme>:<sha256 hex>' over the RFC 8785 (JCS) form of the policy object as it appears in each vector. An absent allowlist is null and an empty one is [] — they are different policies and digest differently.",
+  "vectorsVersion": "0.2.0",
+  "description": "agentPolicy decision vectors. A conformant gate reproduces every allow, reasonCode AND policyDigest below. Check order is normative and first match wins; a request that trips several rules is denied regardless of order, but the reasonCode it reports is not free. Matching is exact and case-sensitive. A caller jurisdiction is admissible only when VERIFIED; an unverified claim is discarded before any rule sees it, so it can never satisfy an allowlist.",
+  "canonicalisation": "policyDigest = '<scheme>:<sha256 hex>' over the RFC 8785 (JCS) form of the policy object as it appears in each vector. An absent allowlist is null and an empty one is [] — they are different policies and digest differently. Caller-jurisdiction keys appear in the policy object ONLY when a rule exists, so a policy without them digests exactly as it did before the field was introduced.",
   "checkOrder": [
     "tool-not-allowed",
+    "missing-caller-jurisdiction",
+    "in-denied-jurisdiction",
+    "not-in-allowed-jurisdictions",
     "missing-model-identity",
     "in-deniedModels",
     "in-deniedUseCases",
@@ -14,6 +17,9 @@
   "reasonCodes": [
     "allowed",
     "tool-not-allowed",
+    "missing-caller-jurisdiction",
+    "in-denied-jurisdiction",
+    "not-in-allowed-jurisdictions",
     "missing-model-identity",
     "in-deniedModels",
     "in-deniedUseCases",
@@ -35,7 +41,9 @@
       "request": {
         "tool": "query",
         "modelId": null,
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": true,
@@ -58,7 +66,9 @@
       "request": {
         "tool": "query",
         "modelId": "good",
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": true,
@@ -81,7 +91,9 @@
       "request": {
         "tool": "query",
         "modelId": null,
-        "useCase": "analysis"
+        "useCase": "analysis",
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": true,
@@ -105,7 +117,9 @@
       "request": {
         "tool": "describe",
         "modelId": null,
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": true,
@@ -128,7 +142,9 @@
       "request": {
         "tool": "query",
         "modelId": null,
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": true,
@@ -151,7 +167,9 @@
       "request": {
         "tool": "query_sql",
         "modelId": null,
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -174,7 +192,9 @@
       "request": {
         "tool": "query_sql",
         "modelId": null,
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -195,7 +215,9 @@
       "request": {
         "tool": "query",
         "modelId": null,
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -218,7 +240,9 @@
       "request": {
         "tool": "query",
         "modelId": null,
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -241,7 +265,9 @@
       "request": {
         "tool": "query",
         "modelId": null,
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -264,7 +290,9 @@
       "request": {
         "tool": "query",
         "modelId": "bad",
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -287,7 +315,9 @@
       "request": {
         "tool": "query",
         "modelId": null,
-        "useCase": "advertising"
+        "useCase": "advertising",
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -310,7 +340,9 @@
       "request": {
         "tool": "query",
         "modelId": "other",
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -333,7 +365,9 @@
       "request": {
         "tool": "query",
         "modelId": null,
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -356,7 +390,9 @@
       "request": {
         "tool": "query",
         "modelId": null,
-        "useCase": "advertising"
+        "useCase": "advertising",
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -381,7 +417,9 @@
       "request": {
         "tool": "query",
         "modelId": "bad",
-        "useCase": "advertising"
+        "useCase": "advertising",
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -408,7 +446,9 @@
       "request": {
         "tool": "query_sql",
         "modelId": "bad",
-        "useCase": "advertising"
+        "useCase": "advertising",
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -433,7 +473,9 @@
       "request": {
         "tool": "query",
         "modelId": "bad",
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -458,7 +500,9 @@
       "request": {
         "tool": "query",
         "modelId": null,
-        "useCase": "advertising"
+        "useCase": "advertising",
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -483,7 +527,9 @@
       "request": {
         "tool": "query",
         "modelId": "bad",
-        "useCase": "advertising"
+        "useCase": "advertising",
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -508,7 +554,9 @@
       "request": {
         "tool": "query",
         "modelId": "bad",
-        "useCase": "advertising"
+        "useCase": "advertising",
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -532,7 +580,9 @@
       "request": {
         "tool": "query",
         "modelId": "a",
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": true,
@@ -555,7 +605,9 @@
       "request": {
         "tool": "query",
         "modelId": "a",
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": true,
@@ -576,7 +628,9 @@
       "request": {
         "tool": "query",
         "modelId": "any",
-        "useCase": null
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
@@ -597,12 +651,278 @@
       "request": {
         "tool": "query",
         "modelId": null,
-        "useCase": "analysis"
+        "useCase": "analysis",
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
       },
       "expect": {
         "allow": false,
         "reasonCode": "not-in-allowedUseCases",
         "policyDigest": "jcs-sha256:19b53b03bf74951191b282af73e0a0b414fd461d2da65b0fb6ed686130a82391"
+      }
+    },
+    {
+      "name": "allow: no jurisdiction rules, unidentified caller",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": []
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
+      },
+      "expect": {
+        "allow": true,
+        "reasonCode": "allowed",
+        "policyDigest": "jcs-sha256:1800416c6f7f132aa8140ee70c3ecfdca44a53e32098233c488edeec1097d6e3"
+      }
+    },
+    {
+      "name": "allow: verified jurisdiction on the allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [],
+        "allowedCallerJurisdictions": [
+          "EU"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null,
+        "callerJurisdiction": "EU",
+        "callerJurisdictionVerified": true
+      },
+      "expect": {
+        "allow": true,
+        "reasonCode": "allowed",
+        "policyDigest": "jcs-sha256:f625483f6463645a9a64933d7a4a3ca20f351bcf2c8691cac8267250d4c3d44b"
+      }
+    },
+    {
+      "name": "allow: verified jurisdiction absent from the denylist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [],
+        "deniedCallerJurisdictions": [
+          "US"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null,
+        "callerJurisdiction": "EU",
+        "callerJurisdictionVerified": true
+      },
+      "expect": {
+        "allow": true,
+        "reasonCode": "allowed",
+        "policyDigest": "jcs-sha256:f58c26f8333c59ec7e4ea4bc3755342fe93e417097caf44afd4fbeada17365a4"
+      }
+    },
+    {
+      "name": "deny: jurisdiction rules in force, no claim at all",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [],
+        "allowedCallerJurisdictions": [
+          "EU"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "missing-caller-jurisdiction",
+        "policyDigest": "jcs-sha256:f625483f6463645a9a64933d7a4a3ca20f351bcf2c8691cac8267250d4c3d44b"
+      }
+    },
+    {
+      "name": "deny: UNVERIFIED claim never satisfies an allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [],
+        "allowedCallerJurisdictions": [
+          "EU"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null,
+        "callerJurisdiction": "EU",
+        "callerJurisdictionVerified": false
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "missing-caller-jurisdiction",
+        "policyDigest": "jcs-sha256:f625483f6463645a9a64933d7a4a3ca20f351bcf2c8691cac8267250d4c3d44b"
+      }
+    },
+    {
+      "name": "deny: verified jurisdiction on the denylist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [],
+        "deniedCallerJurisdictions": [
+          "US"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null,
+        "callerJurisdiction": "US",
+        "callerJurisdictionVerified": true
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "in-denied-jurisdiction",
+        "policyDigest": "jcs-sha256:f58c26f8333c59ec7e4ea4bc3755342fe93e417097caf44afd4fbeada17365a4"
+      }
+    },
+    {
+      "name": "deny: verified jurisdiction absent from the allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [],
+        "allowedCallerJurisdictions": [
+          "EU"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null,
+        "callerJurisdiction": "US",
+        "callerJurisdictionVerified": true
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "not-in-allowed-jurisdictions",
+        "policyDigest": "jcs-sha256:f625483f6463645a9a64933d7a4a3ca20f351bcf2c8691cac8267250d4c3d44b"
+      }
+    },
+    {
+      "name": "precedence: jurisdiction outranks the model gate",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": [
+          "good"
+        ],
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [],
+        "allowedCallerJurisdictions": [
+          "EU"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": "bad",
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "missing-caller-jurisdiction",
+        "policyDigest": "jcs-sha256:2fb04739a96b08bdf91e993cad0e0a65a899bf48adb48b29a71066fefdb5b20b"
+      }
+    },
+    {
+      "name": "precedence: tool gate still outranks jurisdiction",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [
+          "query_sql"
+        ],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [],
+        "allowedCallerJurisdictions": [
+          "EU"
+        ]
+      },
+      "request": {
+        "tool": "query_sql",
+        "modelId": null,
+        "useCase": null,
+        "callerJurisdiction": null,
+        "callerJurisdictionVerified": false
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "tool-not-allowed",
+        "policyDigest": "jcs-sha256:fbaa469e00223342a8b78cc3948f39ee397202a89e217f9c558739fa0f754d38"
+      }
+    },
+    {
+      "name": "precedence: denied jurisdiction beats absent-from-allowlist",
+      "policy": {
+        "allowedTools": null,
+        "deniedTools": [],
+        "allowedModels": null,
+        "deniedModels": [],
+        "allowedUseCases": null,
+        "deniedUseCases": [],
+        "allowedCallerJurisdictions": [
+          "EU"
+        ],
+        "deniedCallerJurisdictions": [
+          "US"
+        ]
+      },
+      "request": {
+        "tool": "query",
+        "modelId": null,
+        "useCase": null,
+        "callerJurisdiction": "US",
+        "callerJurisdictionVerified": true
+      },
+      "expect": {
+        "allow": false,
+        "reasonCode": "in-denied-jurisdiction",
+        "policyDigest": "jcs-sha256:813fd9123fc21abdfaf3be71a995888b3efcf69bfc8e40e8fbb73e52403341c2"
       }
     }
   ]
