@@ -33,10 +33,17 @@ import yaml
 
 from .errors import ValidationError as FluidValidationError
 
-# Try to import jsonschema for proper validation
+# Try to import jsonschema for proper validation.
+#
+# Import ONLY the package. This block is a capability probe whose failure mode
+# is silent: JSONSCHEMA_AVAILABLE = False makes _validate_with_jsonschema skip,
+# so contract validation stops happening rather than erroring. It previously
+# also imported Draft7Validator and RefResolver, neither of which was used
+# anywhere in this module — and RefResolver is deprecated, so the day a
+# jsonschema release drops it this ImportError would have silently disabled
+# schema validation across the CLI. Never name more in a probe than you use.
 try:
     import jsonschema
-    from jsonschema import Draft7Validator, RefResolver
 
     JSONSCHEMA_AVAILABLE = True
 except ImportError as e:
@@ -636,7 +643,11 @@ class FluidSchemaManager:
         """Validate using JSON Schema library."""
         try:
             # Create validator
-            validator = jsonschema.Draft7Validator(schema)
+            # Honour the schema's declared $schema. The FLUID schemas say
+            # 2020-12; validating them with Draft 7 worked only because none
+            # has yet used a 2020-12-only keyword. The first one to do so
+            # would have been accepted without error.
+            validator = jsonschema.validators.validator_for(schema)(schema)
 
             # Validate and collect errors
             errors = sorted(validator.iter_errors(contract), key=lambda e: e.path)
