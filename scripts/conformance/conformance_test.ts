@@ -25,10 +25,16 @@ if (!contractPath) {
 async function main(): Promise<number> {
   const ALLOWED_MODEL = "gpt-4o-mini";
   const DENIED_MODEL = "claude-3-opus";
+  // The contract's agentPolicy declares `allowedUseCases`, and a caller that
+  // declares none fails closed (reason MISSING_USE_CASE_WITH_ALLOWLIST) —
+  // deliberately, so an unidentified caller cannot slip past an allowlist.
+  // Scenario 1 must therefore attest BOTH halves of the identity, or it is
+  // denied for the wrong reason and proves nothing about the model gate.
+  const USE_CASE = "analysis";
 
   // Scenario 1: allowed model → sample succeeds
   const allowedClient = new Client(
-    { name: "ts-conformance", version: "1.0.0", model: ALLOWED_MODEL },
+    { name: "ts-conformance", version: "1.0.0", model: ALLOWED_MODEL, useCase: USE_CASE },
     { capabilities: {} },
   );
   const transport1 = new StdioClientTransport({
@@ -59,7 +65,7 @@ async function main(): Promise<number> {
 
   // Scenario 2: denied model → AgentPolicyDenied envelope
   const deniedClient = new Client(
-    { name: "ts-conformance-denied", version: "1.0.0", model: DENIED_MODEL },
+    { name: "ts-conformance-denied", version: "1.0.0", model: DENIED_MODEL, useCase: USE_CASE },
     { capabilities: {} },
   );
   const transport2 = new StdioClientTransport({

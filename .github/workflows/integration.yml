@@ -50,6 +50,13 @@ on:
           - snowflake
           - bigquery
           - aws
+          # Four jobs already guard on `mcp` (the Postgres/Snowflake e2e
+          # pair, the live-LLM check and the client conformance suite), but
+          # the value was missing from this list — so the enumeration this
+          # comment promises to keep in step with the guards was one suite
+          # short, and the MCP jobs could only be reached via `all`, which
+          # also spends real cloud credits on the three provider suites.
+          - mcp
 
 permissions:
   contents: read
@@ -535,6 +542,11 @@ jobs:
     name: Multi-language MCP client conformance
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # The Go and Rust conformance clients are stubs that attest no caller
+      # identity — see the banner above the Go SDK step. Flip to "true" only
+      # together with a real implementation.
+      RUN_MULTILANG_GO_RUST: "false"
     if: |
       github.event_name != 'workflow_dispatch' ||
       contains(fromJSON('["all", "mcp"]'), inputs.providers) ||
@@ -595,11 +607,25 @@ jobs:
           POSTGRES_PORT: "55432"
           POSTGRES_USER: forge_mcp_test
           POSTGRES_PASSWORD: forge_mcp_test_pwd
+          # psql reads PGPASSWORD, NOT POSTGRES_PASSWORD. Only the gate step
+          # set it, so the seed below authenticated as nobody and died with
+          # "fe_sendauth: no password supplied" — silently, see the run line.
+          PGPASSWORD: forge_mcp_test_pwd
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev,local]"
+          # `postgres` is REQUIRED, not optional garnish: the demo contract
+          # binds `platform: postgres`, and without psycopg the gateway
+          # answers every tools/call with UnsupportedBindingError. `[dev,local]`
+          # alone made this job unpassable from the day it was added.
+          pip install -e ".[dev,local,postgres]"
+          # Fail HERE if the seed fails. This used to end in
+          # `2>/dev/null || true`, which discarded both the error text and the
+          # exit code, so a seed that never ran surfaced three steps later as
+          # an unexplained `UndefinedTable` from the gateway. The seed is
+          # idempotent (CREATE ... IF NOT EXISTS + ON CONFLICT DO NOTHING),
+          # so there is nothing here that needs forgiving.
           psql -h 127.0.0.1 -p 55432 -U forge_mcp_test -d forge_mcp_demo \
-            -f examples/mcp-output-port-docker/seed.sql 2>/dev/null || true
+            -v ON_ERROR_STOP=1 -f examples/mcp-output-port-docker/seed.sql
 
       # 2. TypeScript SDK
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
@@ -626,13 +652,30 @@ jobs:
           npx tsx scripts/conformance/conformance_test.ts \
             examples/mcp-output-port-docker/contract.fluid.yaml
 
+      # ── Go / Rust conformance: DISABLED — see issue #583 ───────────────
+      # These two steps have never executed a meaningful assertion. Neither
+      # client attests a caller identity, so the gateway fail-closes on
+      # MISSING_MODEL_IDENTITY:
+      #   * Go  — `initReq.Params.ClientInfo` is set to {Name, Version} and
+      #     the model injection is a COMMENT with no code behind it, so the
+      #     `model` argument to runScenario is accepted and never used.
+      #   * Rust — `client_info` is constructed and then never passed to
+      #     `.serve()`; it is a dead local.
+      # Their "denied model" scenario therefore passes VACUOUSLY: the call is
+      # refused for having no identity, not for naming a denied model. Both
+      # SDKs type `Implementation` as a fixed struct, so attesting a
+      # non-standard `model` field needs a custom serializer or raw JSON-RPC —
+      # which is presumably why they were left as stubs.
+      # Turning them off removes a facade; it retires no coverage, because
+      # there was none. To re-enable alongside a real implementation, set the
+      # job-level RUN_MULTILANG_GO_RUST env below to "true".
       # 3. Go SDK
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
-        if: steps.gate.outputs.enabled == 'true'
+        if: env.RUN_MULTILANG_GO_RUST == 'true'  # off — see the banner above
         with:
           go-version: "1.22"
       - name: Go conformance
-        if: steps.gate.outputs.enabled == 'true'
+        if: env.RUN_MULTILANG_GO_RUST == 'true'  # off — see the banner above
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -648,11 +691,12 @@ jobs:
           go mod tidy
           go run main.go "$GITHUB_WORKSPACE/examples/mcp-output-port-docker/contract.fluid.yaml"
 
+      # (Disabled — see the banner above the Go SDK block, and issue #583.)
       # 4. Rust SDK
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-        if: steps.gate.outputs.enabled == 'true'
+        if: env.RUN_MULTILANG_GO_RUST == 'true'  # off — see the banner above
       - name: Rust conformance
-        if: steps.gate.outputs.enabled == 'true'
+        if: env.RUN_MULTILANG_GO_RUST == 'true'  # off — see the banner above
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
