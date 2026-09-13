@@ -362,7 +362,7 @@ def _run_serve(args, logger: logging.Logger) -> int:
             f"(only expose in contract).\n"
         )
         sys.stderr.flush()
-    policy = _build_policy(args, contract_path=contract_path, expose=expose)
+    policy = _build_policy(args, contract_path=contract_path, expose=expose, contract=contract)
     # Boot-time auditRequired enforcement. The contract can declare
     # ``policy.agentPolicy.auditRequired: true``; the gateway always
     # writes to ``~/.fluid/store/audit/`` so a local sink is implicit,
@@ -460,6 +460,11 @@ def _run_serve(args, logger: logging.Logger) -> int:
     transport = getattr(args, "transport", "stdio")
     host = getattr(args, "host", "127.0.0.1")
     port = int(getattr(args, "port", 8765) or 8765)
+    unsatisfiable = _jurisdiction_gate_unsatisfiable(policy, transport=transport)
+    if unsatisfiable is not None:
+        sys.stderr.write(unsatisfiable)
+        sys.stderr.flush()
+        return 2
     if transport == "http":
         sys.stderr.write(
             f"⚠️  fluid mcp output-port: HTTP transport binds {host}:{port} with "
@@ -633,7 +638,65 @@ def _print_doctor_report(report, *, expose_id: str) -> None:
         sys.stdout.write("\n")
 
 
-def _build_policy(args, *, contract_path: Path, expose) -> OutputPortPolicy:
+def _auth_mode_configured() -> bool:
+    """Whether the HTTP transport will actually run its auth middleware."""
+    mode = (os.environ.get("FLUID_MCP_AUTH_MODE") or "").strip().lower()
+    return mode not in ("", "none", "off", "disabled")
+
+
+def _jurisdiction_gate_unsatisfiable(policy, *, transport: str) -> Optional[str]:
+    """Refuse at startup when a jurisdiction rule could never be satisfied.
+
+    A contract that pins ``sovereignty.jurisdiction`` makes every tool call
+    depend on a VERIFIED caller jurisdiction. That claim only ever arrives one
+    way: the HTTP transport's ``_AuthMiddleware`` stamps it after validating a
+    JWT or mTLS identity. Two configurations can therefore never produce one:
+
+    * ``--transport stdio`` — a pipe carries no headers, so the middleware
+      never runs;
+    * ``--transport http`` with no ``FLUID_MCP_AUTH_MODE`` — the middleware
+      short-circuits before stamping anything when auth is not configured.
+
+    In both the gate is not merely weaker. It refuses 100% of calls, forever,
+    and the operator sees a stream of per-call denials rather than one cause.
+    Failing here turns that into a single message at the one moment somebody
+    is watching.
+
+    Returns the message to print, or ``None`` when the gate can be satisfied.
+    """
+    jurisdictions = getattr(policy, "allowed_caller_jurisdictions", None)
+    if not jurisdictions:
+        return None
+    named = ", ".join(jurisdictions)
+    if transport != "http":
+        return (
+            f"fluid mcp output-port: refusing to serve over {transport!r}.\n"
+            f"  This contract pins sovereignty.jurisdiction to {named}, so every tool "
+            "call needs a cryptographically verified caller jurisdiction.\n"
+            f"  {transport!r} carries no headers, so no credential can supply one and "
+            "every call would be denied.\n"
+            "  Serve it over HTTP with auth instead:\n"
+            "    FLUID_MCP_AUTH_MODE=jwt fluid mcp output-port serve --transport http\n"
+            "  (plus FLUID_MCP_JWT_ISSUER / _AUDIENCE / _JWKS_URL)\n"
+            "  Or set sovereignty.crossBorderTransfer: true if the data may leave "
+            f"{named}.\n"
+        )
+    if not _auth_mode_configured():
+        return (
+            "fluid mcp output-port: refusing to serve unauthenticated.\n"
+            f"  This contract pins sovereignty.jurisdiction to {named}, so every tool "
+            "call needs a verified caller jurisdiction — but FLUID_MCP_AUTH_MODE is "
+            "unset, so the auth middleware never runs and no claim is ever verified. "
+            "Every call would be denied.\n"
+            "  Set FLUID_MCP_AUTH_MODE=jwt (plus FLUID_MCP_JWT_ISSUER, "
+            "FLUID_MCP_JWT_AUDIENCE, FLUID_MCP_JWT_JWKS_URL), and map your IdP's "
+            "jurisdiction claim with FLUID_MCP_JWT_CLAIM_MAPPING if it is not already "
+            "called 'jurisdiction'.\n"
+        )
+    return None
+
+
+def _build_policy(args, *, contract_path: Path, expose, contract=None) -> OutputPortPolicy:
     readable_paths_raw = _csv(getattr(args, "readable_paths", None))
     if readable_paths_raw:
         readable_paths: Tuple[Path, ...] = tuple(
@@ -655,6 +718,7 @@ def _build_policy(args, *, contract_path: Path, expose) -> OutputPortPolicy:
 
     return OutputPortPolicy.from_contract_and_flags(
         expose=expose,
+        contract=contract,
         contract_path=contract_path,
         read_only=True,
         allowed_tools=tuple(allow_tools) if allow_tools else None,

@@ -163,26 +163,31 @@ class OutputPortPolicy:
     ``None`` means no constraint, and the gate is inert — which is every
     contract that has not pinned a jurisdiction.
 
-    NOT REACHABLE FROM THE CLI TODAY, and the reason is a transport gap rather
-    than an oversight. Read this before wiring it up:
+    LIVE. ``_build_policy`` passes the root contract, so a contract that pins
+    ``sovereignty.jurisdiction`` without permitting cross-border transfer
+    constrains who may call the gateway, not merely where it provisions.
 
-    ``fluid mcp output-port serve`` calls :func:`run_stdio`. The verified
-    markers this gate depends on — ``fluid_auth_attrs`` and ``fluid_auth_kind``
-    — are stamped in exactly one place, ``_transport.py``'s HTTP
-    ``_AuthMiddleware``. Stdio carries no headers, so that middleware never
-    runs and no claim can ever be verified on that path.
+    The claim is supplied by
+    ``OutputPortMcpServer._resolve_verified_jurisdiction``, which reads the
+    cryptographically verified channel — ``request.scope["fluid_auth_attrs"]``,
+    written by the HTTP ``_AuthMiddleware`` after it validates a JWT or mTLS
+    identity — and never the caller's self-attested ``clientInfo``. That
+    asymmetry is deliberate and is the control: everywhere else in this server
+    self-attestation still binds when no auth is configured, and a jurisdiction
+    that a client could type would be no gate at all.
 
-    The consequence is not "the gate is weaker over stdio". It is that a
-    jurisdiction rule over stdio refuses 100% of calls, permanently, with no
-    configuration an operator can apply to fix it — because there is no HTTP
-    transport wired to the CLI to configure. ``run_http_async`` exists on the
-    server object but is not exported from the package, and its only caller in
-    the tree is a test.
+    Two deployments therefore cannot satisfy such a rule, and both are refused
+    at startup by ``_jurisdiction_gate_unsatisfiable`` rather than denying
+    every call one at a time: stdio, which carries no headers so the middleware
+    never runs, and HTTP with no ``FLUID_MCP_AUTH_MODE``, where the middleware
+    short-circuits before stamping anything.
 
-    So ``_build_policy`` deliberately does NOT pass the root contract: the
-    derivation ships, and activation waits on the CLI growing an HTTP
-    transport. An embedder calling ``run_http_async`` directly can use this
-    today by passing ``contract=`` to :meth:`from_contract_and_flags`.
+    A correction worth leaving visible, because it changed what got built: an
+    earlier version of this note claimed the blocker was that no HTTP transport
+    was wired to the CLI. That was false — ``serve --transport http`` has
+    existed all along, and ``_transport.run`` dispatches to
+    :func:`run_http_async`. The real gap was the missing identity producer,
+    which is what this now supplies.
     """
 
     policy_source: str = "default"
@@ -260,6 +265,8 @@ class OutputPortPolicy:
         tool: str,
         model_id: Optional[str],
         use_case: Optional[str],
+        caller_jurisdiction: Optional[str] = None,
+        caller_jurisdiction_verified: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """Composite gate evaluated on every ``tools/call`` request.
 
@@ -275,8 +282,23 @@ class OutputPortPolicy:
         absent from an allowlist AND whose use case was explicitly denied
         reported ``not-in-allowedModels``. The verdict was right; the reason
         contradicted this docstring. See ``CHECK_ORDER``.
+
+        ``caller_jurisdiction`` must come from a cryptographically verified
+        channel, and ``caller_jurisdiction_verified`` must say so. Both default
+        to "absent and unverified", which is the safe reading for any caller
+        that has not been taught to supply them: :func:`decide` discards an
+        unverified claim before any rule runs, so passing a self-attested value
+        cannot widen access — it is simply ignored.
         """
-        return _as_tuple(self.decision(tool=tool, model_id=model_id, use_case=use_case))
+        return _as_tuple(
+            self.decision(
+                tool=tool,
+                model_id=model_id,
+                use_case=use_case,
+                caller_jurisdiction=caller_jurisdiction,
+                caller_jurisdiction_verified=caller_jurisdiction_verified,
+            )
+        )
 
     def to_effective_policy(self) -> EffectivePolicy:
         """The six rule lists this policy enforces, normalised for the decider."""

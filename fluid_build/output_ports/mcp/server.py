@@ -89,6 +89,7 @@ from ._expose_utils import (
     _jsonable,
     _summarise_arguments,
 )
+from .auth import JURISDICTION_ATTR
 from .drivers import EngineDriver, build_driver
 from .policy import OutputPortPolicy
 from .query_compiler import QueryValidationError
@@ -546,6 +547,7 @@ class OutputPortMcpServer:
                     arguments=arguments,
                     model_id=model_id,
                     use_case=use_case,
+                    caller_jurisdiction=self._resolve_verified_jurisdiction(request_context),
                 )
                 self._write_audit(decision_payload)
                 _set_span_attrs(
@@ -758,11 +760,12 @@ class OutputPortMcpServer:
         values are whatever the caller typed; cryptographic values were
         verified by the transport auth middleware. Flattening them into one
         dict made "crypto wins" hold only for the keys the JWT claim mapping
-        happens to produce (the default mapping yields four:
-        ``sub`` / ``model`` / ``use_case`` / ``tenant_id``). Any
-        ``${caller.<attr>}`` rowFilter outside that set — or any custom
-        ``FLUID_MCP_JWT_CLAIM_MAPPING``, which REPLACES rather than merges the
-        defaults — was then satisfied by the caller's own claim, turning a
+        happens to produce (the default mapping yields five:
+        ``sub`` / ``model`` / ``use_case`` / ``tenant_id`` /
+        ``jurisdiction``). Any ``${caller.<attr>}`` rowFilter outside that set
+        — or, before ``FLUID_MCP_JWT_CLAIM_MAPPING`` was made to merge over the
+        defaults rather than replace them, any custom mapping at all — was
+        then satisfied by the caller's own claim, turning a
         fail-closed denial into an attacker-chosen RLS predicate, and let a
         client re-attest ``model`` / ``useCase`` past the agentPolicy gate.
         So: when the transport stamps ``fluid_auth_kind`` (JWT / mTLS
@@ -878,6 +881,44 @@ class OutputPortMcpServer:
             attrs.setdefault("useCase", use_case)
         return model_id, use_case, attrs
 
+    def _resolve_verified_jurisdiction(self, request_context: Any) -> Optional[str]:
+        """The caller's jurisdiction, and ONLY if a credential carried it.
+
+        Deliberately separate from :meth:`_resolve_request_identity`, which
+        already keeps the two trust tiers apart but resolves them by a rule
+        this attribute must not follow: *self-attestation stays authoritative
+        when no auth is configured*. That is right for ``model`` and
+        ``use_case``, where the pre-auth behaviour is a caller naming itself
+        and the worst case is a narrower policy.
+
+        It is wrong for jurisdiction, because here the claim IS the control. A
+        client that could put ``jurisdiction: "EU"`` in its own ``clientInfo``
+        would authorise itself past a data-residency rule by typing a string —
+        and it would work precisely on the unauthenticated deployments least
+        able to notice. So this reads ``request.scope["fluid_auth_attrs"]``
+        alone, the map the HTTP ``_AuthMiddleware`` writes only after
+        validating a JWT or mTLS identity, and never ``clientInfo``.
+
+        There is no no-auth fallback, on purpose. Returns ``None`` when there
+        is no request context, no verified attributes, or no jurisdiction among
+        them. ``None`` means "unknown", and a contract that pins a jurisdiction
+        refuses an unknown one — which is why
+        ``_jurisdiction_gate_unsatisfiable`` in the CLI refuses at startup
+        rather than letting every call fail separately.
+        """
+        ctx = request_context
+        if ctx is None:
+            return None
+        try:
+            request = getattr(ctx, "request", None)
+            scope = getattr(request, "scope", None)
+            verified = (scope or {}).get("fluid_auth_attrs") or {}
+            value = verified.get(JURISDICTION_ATTR)
+            return str(value) if value else None
+        except Exception as exc:  # noqa: BLE001
+            self.state.logger.debug("output_port_identity_jurisdiction_failed: %s", exc)
+            return None
+
     # ------------------------------------------------------------------
     # Policy evaluation (E2 wired)
     # ------------------------------------------------------------------
@@ -889,6 +930,7 @@ class OutputPortMcpServer:
         arguments: Mapping[str, Any],
         model_id: Optional[str],
         use_case: Optional[str],
+        caller_jurisdiction: Optional[str] = None,
     ) -> tuple[Dict[str, Any], bool, Optional[str]]:
         """Evaluate the policy gate and produce the audit payload.
 
@@ -896,11 +938,20 @@ class OutputPortMcpServer:
         resolved per-request by :meth:`_resolve_request_identity` — not
         read from the shared SessionState, which would gate every
         concurrent HTTP/SSE client under the first client's identity.
+
+        ``caller_jurisdiction`` comes from
+        :meth:`_resolve_verified_jurisdiction`, which reads the verified
+        channel only. It is passed with ``verified=True`` for exactly that
+        reason — the trust decision is made where the value is read, not here.
+        A ``None`` is forwarded as an absent claim, which a contract that pins
+        a jurisdiction refuses.
         """
         allowed, reason = self.state.policy.check_tool_call(
             tool=tool_name,
             model_id=model_id,
             use_case=use_case,
+            caller_jurisdiction=caller_jurisdiction,
+            caller_jurisdiction_verified=caller_jurisdiction is not None,
         )
         payload = {
             "tool": tool_name,
@@ -912,6 +963,7 @@ class OutputPortMcpServer:
             ),
             "modelId": model_id,
             "useCase": use_case,
+            "callerJurisdiction": caller_jurisdiction,
             "decision": "allow" if allowed else "deny",
             "reason": reason,
             "policySource": self.state.policy.policy_source,
