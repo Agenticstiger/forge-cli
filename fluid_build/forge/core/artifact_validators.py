@@ -324,11 +324,19 @@ def _validate_against_schema(
     import jsonschema  # type: ignore
 
     issues: List[ValidationIssue] = []
-    try:
-        validator = jsonschema.Draft7Validator(schema)
-    except Exception:
-        # ODPS-Bitol uses draft 2019-09 — fall back to generic Validator.
-        validator = jsonschema.validators.validator_for(schema)(schema)
+    # Validate with the dialect the schema DECLARES, not a hardcoded one.
+    #
+    # This was `Draft7Validator(schema)` wrapped in a try/except that "fell back"
+    # to validator_for. The fallback was dead code: constructing a validator does
+    # not run check_schema, so it never raises on a newer dialect, and its comment
+    # claimed a switch that could not happen.
+    #
+    # The cost was not theoretical. Draft 7 IGNORES keywords it does not know
+    # rather than rejecting them, and the vendored ODCS schema declares 2019-09
+    # and guards nine objects with `unevaluatedProperties: false`. A server entry
+    # carrying an unexpected key validated with ZERO errors, reachable from
+    # `fluid validate-artifacts`. See tests/test_jsonschema_dialect.py.
+    validator = jsonschema.validators.validator_for(schema)(schema)
 
     errors = sorted(validator.iter_errors(doc), key=lambda e: list(e.absolute_path))
     for err in errors:

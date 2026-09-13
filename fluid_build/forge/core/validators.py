@@ -371,7 +371,9 @@ def validate_json_schema(
                 )
             ]
 
-        validator = jsonschema.Draft7Validator(schema)
+        # Honour the schema's declared $schema; Draft 7 silently ignores
+        # newer keywords, which drops the constraints they express.
+        validator = jsonschema.validators.validator_for(schema)(schema)
         errors = sorted(validator.iter_errors(doc), key=lambda e: list(e.absolute_path))
         for err in errors:
             loc = "/".join(str(p) for p in err.absolute_path) or "<root>"
