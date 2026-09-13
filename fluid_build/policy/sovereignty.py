@@ -573,6 +573,53 @@ def validate_sovereignty(contract: Dict[str, Any]) -> Tuple[bool, List[str]]:
     return is_valid, messages
 
 
+#: Jurisdictions that assert no constraint on where a caller may be.
+#:
+#: "Global" is already special-cased by the provision-time checks. "Multi-Region"
+#: is added here because an equality predicate would otherwise refuse EVERY
+#: caller on a Multi-Region contract — the value means "several jurisdictions",
+#: not a jurisdiction named "Multi-Region", so nothing can ever equal it.
+UNCONSTRAINED_JURISDICTIONS = frozenset({"Global", "Multi-Region"})
+
+
+def derive_caller_jurisdictions(contract: Mapping[str, Any]) -> Optional[Tuple[str, ...]]:
+    """Which caller jurisdictions a contract's own sovereignty block permits.
+
+    Returns ``None`` — meaning "no constraint" — unless the contract actually
+    says something that constrains a reader. Nothing new is invented here: a
+    contract declaring ``jurisdiction: EU`` with ``crossBorderTransfer`` false
+    already MEANS "this data does not leave the EU", and serving it to a caller
+    elsewhere is the border crossing it forbids. Enforcing that is honouring
+    what is written rather than adding a rule.
+
+    The constraint is dropped in three cases, each for a different reason:
+
+    * **No jurisdiction declared.** There is nothing to enforce.
+    * **Global / Multi-Region.** The contract is explicitly not pinned to one
+      jurisdiction, so no caller can be outside it.
+    * **crossBorderTransfer is true.** The contract permits the transfer this
+      gate exists to prevent, so the gate has no business refusing it.
+
+    ``crossBorderTransfer`` defaults to ``False`` (DEFAULT_CROSS_BORDER_TRANSFER),
+    matching the schema, so a contract that pins a jurisdiction and stays silent
+    about transfers is treated as forbidding them — which is what the schema's
+    own default asserts.
+    """
+    sovereignty = contract.get("sovereignty")
+    if not isinstance(sovereignty, dict):
+        return None
+
+    jurisdiction = sovereignty.get("jurisdiction")
+    if not jurisdiction or jurisdiction in UNCONSTRAINED_JURISDICTIONS:
+        return None
+
+    cross_border = sovereignty.get("crossBorderTransfer", DEFAULT_CROSS_BORDER_TRANSFER)
+    if cross_border:
+        return None
+
+    return (str(jurisdiction),)
+
+
 def get_region_jurisdiction(region: str) -> str:
     """
     Get jurisdiction for a region.
