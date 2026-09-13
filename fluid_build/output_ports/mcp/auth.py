@@ -64,14 +64,28 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 #: ``tenant_id`` are what ``${caller.*}`` row filters interpolate. Losing any of
 #: them does not fail — it silently widens access, which is why
 #: ``FLUID_MCP_JWT_CLAIM_MAPPING`` MERGES over these rather than replacing them.
+#:
+#: ``jurisdiction`` is the exception to that sentence and is worth knowing:
+#: losing it does NOT widen access, it closes the gate completely. A contract
+#: that pins ``sovereignty.jurisdiction`` refuses every caller whose
+#: jurisdiction is unknown, so an operator who maps their IdP's claim to some
+#: other attribute name locks themselves out rather than letting strangers in.
+#: That is the correct direction for a sovereignty control, but it fails loudly
+#: and the mapping is where to look.
 DEFAULT_JWT_CLAIM_MAPPINGS: Mapping[str, str] = MappingProxyType(
     {
         "sub": "sub",
         "model": "model",
         "use_case": "use_case",
         "tenant_id": "tenant_id",
+        "jurisdiction": "jurisdiction",
     }
 )
+
+#: The caller attribute a verified jurisdiction claim lands in. Read from the
+#: cryptographically-verified channel ONLY — see
+#: ``OutputPortMcpServer._resolve_verified_jurisdiction``.
+JURISDICTION_ATTR = "jurisdiction"
 
 
 @dataclass(frozen=True)

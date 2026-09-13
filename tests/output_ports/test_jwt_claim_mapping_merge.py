@@ -41,7 +41,12 @@ import pytest
 
 from fluid_build.output_ports.mcp.auth import AuthValidator
 
-DEFAULTS = {"sub", "model", "use_case", "tenant_id"}
+#: ``jurisdiction`` differs from the other four in which direction it fails.
+#: Losing ``sub`` / ``model`` / ``use_case`` / ``tenant_id`` silently WIDENS
+#: access; losing ``jurisdiction`` CLOSES the gate, because a contract that
+#: pins one refuses every caller whose jurisdiction is unknown. Both belong in
+#: the merge, for opposite reasons.
+DEFAULTS = {"sub", "model", "use_case", "tenant_id", "jurisdiction"}
 
 
 def _mappings(monkeypatch: pytest.MonkeyPatch, env: Optional[str]) -> Dict[str, str]:
