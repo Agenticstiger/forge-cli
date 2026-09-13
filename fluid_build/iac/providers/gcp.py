@@ -59,6 +59,7 @@ from ..packaging import (
     PackagingResolution,
     resolve_packaging,
 )
+from ..provider_match import is_cloud
 from ..versions import required_providers
 
 # FLUID column type → BigQuery type (best-effort; unknown types upper-cased).
@@ -320,12 +321,12 @@ class GcpIacPlugin:
 
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
-            fmt = binding.get("format")
+            target = resolve_gcp_target(binding)
             loc = binding.get("location") or {}
             schema = (exposure.get("contract") or {}).get("schema") or []
             placement = _placement(packaging, exposure)
             labels = _labels_for(base_labels, placement)
-            if fmt in ("bigquery_table", "bigquery_view"):
+            if target in (BIGQUERY_TABLE, BIGQUERY_VIEW):
                 _emit_bigquery(
                     resources,
                     exposure,
@@ -333,17 +334,33 @@ class GcpIacPlugin:
                     schema,
                     cid,
                     labels,
-                    is_view=(fmt == "bigquery_view"),
+                    is_view=(target == BIGQUERY_VIEW),
                     grants=grants,
                     placement=placement,
                 )
-            elif fmt == "gcs_bucket":
-                _emit_gcs(resources, loc, cid, labels, grants=grants, placement=placement)
-            elif str(fmt or "").lower() in _ICEBERG_FORMATS:
+            elif target == GCS_BUCKET:
+                # An expose that NAMES the bucket as its port (``format:
+                # gcs_bucket``) owns it. One resolved from the location shape
+                # merely cites the container its files live in, so a declared
+                # ``path`` makes it a prefix tenant — same reasoning, and the
+                # same flag, as the Iceberg warehouse route.
+                _emit_gcs(
+                    resources,
+                    loc,
+                    cid,
+                    labels,
+                    grants=grants,
+                    placement=placement,
+                    prefix_only=(
+                        _FORMAT_TARGETS.get(_normalized_format(binding)) is not GCS_BUCKET
+                        and bool(str(loc.get("path") or "").strip("/"))
+                    ),
+                )
+            elif target == ICEBERG_STORAGE:
                 _emit_iceberg_storage(
                     resources, binding, loc, cid, labels, grants=grants, placement=placement
                 )
-            elif fmt == "pubsub_topic":
+            elif target == PUBSUB_TOPIC:
                 _emit_pubsub(resources, loc, cid, labels)
         # Cloud Run / Cloud Scheduler / Pub-Sub event resources — the
         # planner already interpreted the loose `execution.trigger`
@@ -370,23 +387,23 @@ class GcpIacPlugin:
         data: Dict[str, Dict[str, Any]] = {}
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
-            # Dispatch on ``format`` exactly as :meth:`emit` does — the two
+            # Resolve through the same chokepoint :meth:`emit` uses — the two
             # must agree, or a container is either looked up but unused
             # (orphan data source) or referenced but never declared.
-            fmt = binding.get("format")
+            target = resolve_gcp_target(binding)
             loc = binding.get("location") or {}
             placement = _placement(packaging, exposure)
-            if fmt in ("bigquery_table", "bigquery_view") and placement.dataset_referenced:
+            if target in (BIGQUERY_TABLE, BIGQUERY_VIEW) and placement.dataset_referenced:
                 dataset = loc.get("dataset") or "default"
                 data.setdefault("google_bigquery_dataset", {}).setdefault(
                     safe_ident(f"{cid}_{dataset}"), {"dataset_id": dataset}
                 )
-            elif fmt == "gcs_bucket" and placement.bucket_referenced:
+            elif target == GCS_BUCKET and placement.bucket_referenced:
                 bucket = loc.get("bucket") or f"{cid}-bucket"
                 data.setdefault("google_storage_bucket", {}).setdefault(
                     safe_ident(f"{cid}_{bucket}"), {"name": bucket}
                 )
-            elif str(fmt or "").lower() in _ICEBERG_FORMATS and placement.bucket_referenced:
+            elif target == ICEBERG_STORAGE and placement.bucket_referenced:
                 # Must mirror the ``emit`` branch. Under shared packaging
                 # ``_emit_gcs`` references ``${data.google_storage_bucket…}``
                 # for each grant, so omitting the lookup here makes every
@@ -459,14 +476,35 @@ class GcpIacPlugin:
 
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
-            if binding.get("platform") != "gcp":
+            # Normalised through the shared cloud table, not a literal
+            # ``== "gcp"``: ``platform: bigquery`` auto-detects as GCP and
+            # emits, so it must be importable too or a brownfield apply tries
+            # to create objects that already exist.
+            if not is_cloud(binding, "gcp"):
                 continue
             loc = binding.get("location") or {}
             placement = _placement(packaging, exposure)
-            dataset = loc.get("dataset")
-            table = loc.get("table") or loc.get("view")
-            bucket = loc.get("bucket")
-            topic = loc.get("topic")
+            # Dispatch on the resolved target, exactly as ``emit`` does. This
+            # block used to read the ``location`` keys directly, which is not
+            # the same question: an Iceberg expose's bucket comes from
+            # ``iceberg_bucket_name`` (where ``warehouse`` beats
+            # ``location.bucket``), so a warehouse-only binding produced no
+            # import at all and a binding carrying both produced an import for
+            # the WRONG bucket — leaving `tofu apply` to 409 on a bucket that
+            # already exists, the very failure ``_bq_table_name`` fixed for
+            # tables.
+            target = resolve_gcp_target(binding)
+            dataset = loc.get("dataset") if target in (BIGQUERY_TABLE, BIGQUERY_VIEW) else None
+            # The same fallback ``_emit_bigquery`` uses — an exposure with no
+            # ``location.table`` still declares a table, named for its id.
+            table = _bq_table_name(exposure, loc) if dataset else None
+            if target is ICEBERG_STORAGE:
+                from ...providers._iceberg_catalog import iceberg_bucket_name
+
+                bucket = iceberg_bucket_name(binding)
+            else:
+                bucket = loc.get("bucket") if target is GCS_BUCKET else None
+            topic = loc.get("topic") if target is PUBSUB_TOPIC else None
 
             if dataset:
                 ds_key = safe_ident(f"{cid}_{dataset}")
@@ -512,7 +550,7 @@ def _emit_bigquery(
     placement: _Placement = _LEGACY_PLACEMENT,
 ) -> None:
     dataset = loc.get("dataset") or "default"
-    table = loc.get("table") or loc.get("view") or exposure.get("exposeId") or "table"
+    table = _bq_table_name(exposure, loc)
     ds_name = safe_ident(f"{cid}_{dataset}")
     tbl_name = safe_ident(f"{cid}_{table}")
 
@@ -578,6 +616,227 @@ def _emit_bigquery(
 #: Snowflake IaC emitter's set so the two providers agree on what Iceberg is.
 _ICEBERG_FORMATS = ("iceberg", "iceberg_table")
 
+# ── Target resolution — the ONE dispatch table ────────────────────────
+#
+# Every consumer that has to answer "which GCP resource does this exposure
+# become?" — :meth:`GcpIacPlugin.emit`, :meth:`~GcpIacPlugin.emit_data`,
+# :meth:`~GcpIacPlugin.discover_imports` and the validate-time gate
+# :func:`validate_gcp_binding` — goes through :func:`resolve_gcp_target`.
+# They MUST agree: emit and emit_data disagreeing leaves a ``${data.…}``
+# reference with no declaration (``tofu validate``: "Reference to undeclared
+# resource"); emit and discover_imports disagreeing makes a brownfield apply
+# try to create a table that already exists; emit and the validator
+# disagreeing either blocks a contract that would have worked or waves
+# through one that emits nothing.
+
+#: The GCP resource kinds an exposure can resolve to.
+BIGQUERY_TABLE = "bigquery_table"
+BIGQUERY_VIEW = "bigquery_view"
+GCS_BUCKET = "gcs_bucket"
+ICEBERG_STORAGE = "iceberg"
+PUBSUB_TOPIC = "pubsub_topic"
+
+#: ``binding.format`` spellings that name a GCP target outright, whatever the
+#: binding's platform. These are the five this emitter has always dispatched
+#: on; keeping them platform-agnostic preserves the emit of a contract that
+#: declares a format but no platform.
+_FORMAT_TARGETS: Dict[str, str] = {
+    "bigquery_table": BIGQUERY_TABLE,
+    "bigquery_view": BIGQUERY_VIEW,
+    "gcs_bucket": GCS_BUCKET,
+    "pubsub_topic": PUBSUB_TOPIC,
+    **{fmt: ICEBERG_STORAGE for fmt in _ICEBERG_FORMATS},
+}
+
+#: ``binding.format`` values that describe an *access surface* or a store this
+#: emitter does not own, rather than a GCP container. Emitting no
+#: ``hashicorp/google`` resource for one of these is correct, so
+#: :func:`validate_gcp_binding` stays quiet about them instead of reporting a
+#: no-op. Everything else that resolves to nothing IS a no-op and is reported.
+_NO_GCP_CONTAINER_FORMATS = frozenset(
+    {
+        # Consumer-served API ports — no infrastructure to declare.
+        "http_api",
+        "grpc_api",
+        # Kafka: self-managed or Confluent, not Pub/Sub (which has its own
+        # ``pubsub_topic`` format).
+        "kafka_topic",
+        # Stores on another platform, or a GCP one this emitter does not
+        # provision yet (Cloud SQL / AlloyDB). Named explicitly so adding
+        # support later is a deletion from this set, not a hunt.
+        "snowflake_table",
+        "snowflake_view",
+        "s3_file",
+        "athena_table",
+        "glue_table",
+        "redshift_table",
+        "redshift_serverless",
+        "redshift_external_schema",
+        "postgres_table",
+        "pgvector_table",
+    }
+)
+
+
+#: ``binding.location`` key → (target, service label), in the precedence
+#: :func:`resolve_gcp_target` applies. The resolver ITERATES this, and
+#: :func:`validate_gcp_binding` renders the labels into its remediation text,
+#: so what the message tells the user to add cannot drift from what the
+#: resolver actually reads. A key naming no container the emitter can build
+#: does not belong here: ``subscription``, for instance, supplies no topic
+#: name, and inferring Pub/Sub from it made ``_emit_pubsub`` fall back to a
+#: fabricated ``<contract>-topic`` that appears nowhere in the contract.
+_GCP_LOCATION_TARGETS = (
+    ("dataset", BIGQUERY_TABLE, "BigQuery"),
+    ("bucket", GCS_BUCKET, "Cloud Storage"),
+    ("topic", PUBSUB_TOPIC, "Pub/Sub"),
+)
+
+
+def _normalized_format(binding: Mapping[str, Any]) -> str:
+    """``binding.format``, lower-cased and stripped — the one spelling rule.
+
+    Every comparison against a format literal goes through this. A raw
+    ``binding.get("format") == "gcs_bucket"`` next to a table lookup that
+    normalises is the drift this module exists to remove.
+    """
+    return str(binding.get("format") or "").strip().lower()
+
+
+def resolve_gcp_target(binding: Mapping[str, Any]) -> Optional[str]:
+    """The GCP resource kind ``binding`` resolves to, or ``None``.
+
+    Resolution order, mirroring what the AWS and Snowflake emitters already do
+    (both dispatch on the shape of ``binding.location`` and let ``format``
+    merely refine the result):
+
+    1. An explicit GCP ``binding.format`` (:data:`_FORMAT_TARGETS`) wins —
+       except an Iceberg expose with no derivable bucket, which resolves to
+       nothing because :func:`_emit_iceberg_storage` would emit nothing for
+       it. Resolving it to a target anyway would make this function disagree
+       with the emitter, which is the one thing it exists to prevent.
+    2. Otherwise, for a GCP-platform binding, the ``location`` shape decides
+       (:data:`_GCP_LOCATION_TARGETS`).
+    3. Nothing → ``None``, and :func:`validate_gcp_binding` explains why.
+
+    Step 2 is what stops a ``platform: gcp`` exposure whose ``format`` is
+    absent, or is the schema-valid ``gcs_file`` (which is *not* one of the
+    five spellings this emitter grew), from silently emitting nothing.
+    """
+    if not isinstance(binding, Mapping):
+        return None
+    target = _FORMAT_TARGETS.get(_normalized_format(binding))
+    if target is ICEBERG_STORAGE:
+        from ...providers._iceberg_catalog import iceberg_bucket_name
+
+        return ICEBERG_STORAGE if iceberg_bucket_name(binding) else None
+    if target:
+        return target
+    if not is_cloud(binding, "gcp"):
+        return None
+    loc = binding.get("location") or {}
+    if not isinstance(loc, Mapping):
+        return None
+    for key, shape_target, _service in _GCP_LOCATION_TARGETS:
+        if loc.get(key):
+            return shape_target
+    return None
+
+
+#: ``binding.format`` → the ``binding.location`` key that format's container
+#: needs. A format here names a GCP container outright, so a location that
+#: omits the key is a contract error, not a matter of taste. ``gcs_file`` is
+#: the schema-valid GCS spelling; the emitter's own ``gcs_bucket`` /
+#: ``bigquery_table`` / ``pubsub_topic`` spellings resolve through
+#: :data:`_FORMAT_TARGETS` and never reach the gate.
+_FORMAT_REQUIRES_LOCATION_KEY = {"gcs_file": "bucket"}
+
+
+def validate_gcp_binding(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    """Validate-time gate for GCP exposures — the loud half of the emitter.
+
+    :meth:`GcpIacPlugin.emit` is pure and emit-when-derivable: an exposure it
+    cannot resolve to a GCP resource produces nothing rather than something
+    broken. Right for an emitter, silent on its own — the user gets an empty
+    module and learns nothing until ``fluid apply`` has no table to write to.
+    Same shape as ``confluent.validate_confluent_binding`` and
+    ``iac.iceberg_validation``: the emitter stays quiet, the validator
+    explains.
+
+    Both halves resolve through :func:`resolve_gcp_target`, so this can neither
+    block a contract that would have emitted nor wave through one that emits
+    nothing — the failure mode a second, hand-mirrored dispatch table here
+    would reintroduce.
+
+    **Error vs warning.** ``fluid validate`` runs for EVERY contract, including
+    ones that never reach ``fluid generate iac``, so a hard error here stops a
+    pipeline that a mere reporting gap would not. Only a format that *names* a
+    GCP container while omitting the location key that container needs
+    (:data:`_FORMAT_REQUIRES_LOCATION_KEY`) is unambiguously broken and errors.
+    Everything else — a generic file format, or no format at all — warns: since
+    #546 the empty module is itself a hard ``generate_iac_empty_module``
+    failure at the stage that actually needs the resource, so the loud stop is
+    already in the right place and this only has to explain it early.
+
+    Scoped to exposures whose ``binding.platform`` is GCP: a format-only
+    binding (no platform) is a different contract error, and the JSON-schema
+    check already names it. Iceberg exposes are left to
+    ``iac.iceberg_validation``, which owns a more specific message for the
+    same input. Returns ``(errors, warnings)``.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    for exposure in contract.get("exposes") or []:
+        if not isinstance(exposure, Mapping):
+            continue
+        binding = exposure.get("binding") or {}
+        if not is_cloud(binding, "gcp") or resolve_gcp_target(binding) is not None:
+            continue
+        eid = exposure.get("exposeId") or exposure.get("id") or "?"
+        fmt = str(binding.get("format") or "").strip().lower()
+        if fmt in _NO_GCP_CONTAINER_FORMATS:
+            # No ``hashicorp/google`` resource exists for this port by design.
+            continue
+        if fmt in _ICEBERG_FORMATS:
+            # An Iceberg expose with no derivable bucket — ``iceberg_validation``
+            # reports it, naming the specific prerequisite that is missing.
+            # Two errors for one cause would read as two problems.
+            continue
+        got = (
+            f"binding.format is '{binding.get('format')}'"
+            if fmt
+            else "it declares no binding.format"
+        )
+        keys = ", ".join(f"{key} ({service})" for key, _target, service in _GCP_LOCATION_TARGETS)
+        required = _FORMAT_REQUIRES_LOCATION_KEY.get(fmt)
+        missing = (
+            f"binding.location has no '{required}' key"
+            if required
+            else f"binding.location names none of {keys}"
+        )
+        message = (
+            f"expose '{eid}': platform=gcp resolves to no GCP resource — {got} and "
+            f"{missing}. `fluid generate iac` and `fluid apply` would emit nothing for "
+            f"this port. Add the binding.location key for the container it lives in."
+        )
+        if _FORMAT_REQUIRES_LOCATION_KEY.get(fmt):
+            errors.append(message)
+        else:
+            warnings.append(message)
+    return errors, warnings
+
+
+def _bq_table_name(exposure: Mapping[str, Any], loc: Mapping[str, Any]) -> str:
+    """The BigQuery table id an exposure emits under.
+
+    Shared by :func:`_emit_bigquery` and :meth:`GcpIacPlugin.discover_imports`
+    so the import block addresses the table the emitter actually declares —
+    they disagreed while only the emitter fell back to the exposeId, which
+    left a contract with no ``location.table`` un-importable and so
+    un-adoptable on brownfield apply.
+    """
+    return loc.get("table") or loc.get("view") or exposure.get("exposeId") or "table"
+
 
 def _emit_iceberg_storage(
     resources: Dict[str, Any],
@@ -616,17 +875,20 @@ def _emit_iceberg_storage(
     # Reuse the GCS emitter so bucket settings, labels and access-grant IAM
     # stay identical to a plain gcs_bucket expose. It reads ``bucket`` from
     # the location, so pass a view with the derived name resolved.
-    _emit_gcs(resources, {**loc, "bucket": bucket}, cid, labels, grants=grants, placement=placement)
-
     # A declared ``path`` means this product owns a PREFIX of the warehouse,
     # not the bucket. Sharing one warehouse root across products namespaced
     # by prefix is the normal Iceberg convention, so whole-bucket
     # force_destroy would let one product's destroy take another's data with
-    # it. Drop it; the owned-bucket case (no path) keeps the default.
-    if str(loc.get("path") or "").strip("/") and not placement.bucket_referenced:
-        body = resources.get("google_storage_bucket", {}).get(safe_ident(f"{cid}_{bucket}"))
-        if body is not None:
-            body.pop("force_destroy", None)
+    # it. The owned-bucket case (no path) keeps the default.
+    _emit_gcs(
+        resources,
+        {**loc, "bucket": bucket},
+        cid,
+        labels,
+        grants=grants,
+        placement=placement,
+        prefix_only=bool(str(loc.get("path") or "").strip("/")),
+    )
 
 
 def _emit_gcs(
@@ -637,7 +899,15 @@ def _emit_gcs(
     *,
     grants: Sequence[AccessGrant],
     placement: _Placement = _LEGACY_PLACEMENT,
+    prefix_only: bool = False,
 ) -> None:
+    """Emit the exposure's Cloud Storage bucket and its access-grant IAM.
+
+    ``prefix_only`` says this product owns a PREFIX of the bucket rather than
+    the bucket — see the ``force_destroy`` comment below. It defaults to False
+    so an explicit ``format: gcs_bucket`` expose, which names the bucket
+    itself as the port, keeps declaring ownership.
+    """
     bucket = loc.get("bucket") or f"{cid}-bucket"
     bkt_res = safe_ident(f"{cid}_{bucket}")
     if placement.bucket_referenced:
@@ -646,13 +916,23 @@ def _emit_gcs(
         # let one tenant's `tofu destroy` empty every tenant's objects.
         bkt_ref: Any = tofu_ref(f"data.google_storage_bucket.{bkt_res}.name")
     else:
-        resources.setdefault("google_storage_bucket", {})[bkt_res] = {
+        bucket_body: Dict[str, Any] = {
             "name": bucket,
             "location": loc.get("region") or loc.get("location") or "US",
             "uniform_bucket_level_access": True,
-            "force_destroy": True,
             "labels": labels,
         }
+        # ``force_destroy`` overrides GCS's refusal to delete a non-empty
+        # bucket, so it is only safe on a bucket this product OWNS. The caller
+        # decides that, because ownership is a property of the exposure's
+        # kind, not of the location: ``format: gcs_bucket`` names the bucket
+        # itself as the port, while an Iceberg warehouse or a file-ish expose
+        # that merely cites a ``bucket`` owns a PREFIX of a root that is
+        # conventionally shared between products. Setting the flag here, in
+        # one place, is what keeps the two from drifting apart.
+        if not prefix_only:
+            bucket_body["force_destroy"] = True
+        resources.setdefault("google_storage_bucket", {})[bkt_res] = bucket_body
         bkt_ref = tofu_ref(f"google_storage_bucket.{bkt_res}.name")
     # Access grants → additive bucket IAM members (mirrors the retired
     # native `iam.bind_gcs_bucket`).

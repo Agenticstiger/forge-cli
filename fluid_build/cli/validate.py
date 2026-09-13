@@ -762,6 +762,25 @@ def _validate_contract_for_version(
             if args.verbose:
                 info(logger, f"Iceberg binding check skipped: {exc}")
 
+        # --- GCP binding checks (anti-no-op gate) ---------------------------
+        # The GCP IaC emitter resolves each expose to a BigQuery / GCS /
+        # Pub-Sub / Iceberg target and emits nothing when it cannot. Surface
+        # the unresolvable ones here — through the emitter's OWN resolver, so
+        # the gate cannot drift from what `fluid generate iac` will do —
+        # rather than letting the user discover an empty module at apply.
+        try:
+            from fluid_build.iac.providers.gcp import validate_gcp_binding
+
+            gcp_errors, gcp_warnings = validate_gcp_binding(contract)
+            for msg in gcp_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in gcp_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"GCP binding check skipped: {exc}")
+
         # --- pgvector vector output-port binding checks ---------------------
         # A pgvector-bound expose (binding.platform: pgvector) needs a vector
         # dimension and non-colliding embeddings-table names — surface a clean

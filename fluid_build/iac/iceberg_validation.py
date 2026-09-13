@@ -40,6 +40,8 @@ from __future__ import annotations
 
 from typing import Any, List, Mapping, Tuple
 
+from .provider_match import is_cloud
+
 #: ``binding.format`` values marking an Iceberg-table expose. Shared shape
 #: with both IaC emitters.
 _ICEBERG_FORMATS = ("iceberg", "iceberg_table")
@@ -51,7 +53,9 @@ def _iceberg_exposures(contract: Mapping[str, Any], platform: str):
         if not isinstance(exposure, Mapping):
             continue
         binding = exposure.get("binding") or {}
-        if str(binding.get("platform") or "").lower() != platform:
+        # Normalised through the same cloud table the emitters filter on, so
+        # this gate cannot go quiet on an exposure they would emit for.
+        if not is_cloud(binding, platform):
             continue
         if str(binding.get("format") or "").lower() not in _ICEBERG_FORMATS:
             continue

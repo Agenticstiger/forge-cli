@@ -30,6 +30,7 @@ from .base import IacProviderPlugin
 from .cutover import OPENTOFU_DEFAULT_PROVIDERS, default_engine, resolve_engine
 from .importer import ImportBlock
 from .module import assemble_tofu_document, build_module, render_tofu_json
+from .provider_match import is_cloud
 from .registry import (
     IAC_PLUGINS,
     discover_iac_entrypoints,
@@ -43,6 +44,7 @@ __all__ = [
     "IacProviderPlugin",
     "ImportBlock",
     "IAC_PLUGINS",
+    "is_cloud",
     "register_iac_plugin",
     "get_iac_plugin",
     "discover_iac_entrypoints",
