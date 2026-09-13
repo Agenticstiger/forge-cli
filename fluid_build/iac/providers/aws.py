@@ -54,6 +54,7 @@ from ..packaging import (
     PackagingResolution,
     resolve_packaging,
 )
+from ..provider_match import is_cloud
 from ..versions import required_providers
 
 # Apply-time AWS account placeholder for the credential-free warehouse fallback.
@@ -331,7 +332,7 @@ class AwsIacPlugin:
 
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
-            if binding.get("platform") != "aws":
+            if not is_cloud(binding, "aws"):
                 continue
             loc = binding.get("location") or {}
             fmt = binding.get("format") or "parquet"
@@ -446,7 +447,7 @@ class AwsIacPlugin:
 
         # Resolve catalog_id once — only when needed (Glue catalog refs).
         contract_needs_catalog_id = any(
-            (b.get("binding") or {}).get("platform") == "aws"
+            is_cloud(b.get("binding") or {}, "aws")
             and ((b.get("binding") or {}).get("location") or {}).get("database")
             and str(((b.get("binding") or {}).get("format")) or "").lower() in _GLUE_CATALOG_FORMATS
             for b in contract.get("exposes") or []
@@ -455,7 +456,7 @@ class AwsIacPlugin:
 
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
-            if binding.get("platform") != "aws":
+            if not is_cloud(binding, "aws"):
                 continue
             loc = binding.get("location") or {}
             fmt = binding.get("format") or "parquet"
@@ -563,7 +564,7 @@ def _emit_referenced_containers(
         return
     for exposure in contract.get("exposes") or []:
         binding = exposure.get("binding") or {}
-        if binding.get("platform") != "aws":
+        if not is_cloud(binding, "aws"):
             continue
         loc = binding.get("location") or {}
         placement = _placement(packaging, exposure)
@@ -1364,7 +1365,7 @@ def _references_caller_account(contract: Mapping[str, Any]) -> bool:
     ``Reference to undeclared resource``."""
     for exposure in contract.get("exposes") or []:
         binding = exposure.get("binding") or {}
-        if binding.get("platform") != "aws":
+        if not is_cloud(binding, "aws"):
             continue
         loc = binding.get("location") or {}
         bucket, _ = _warehouse.normalize_location(

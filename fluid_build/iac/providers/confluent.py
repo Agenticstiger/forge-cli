@@ -43,6 +43,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Tuple
 from ...providers.aws.util.warehouse import normalize_location
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
+from ..provider_match import is_cloud
 from ..versions import required_providers
 
 # Iceberg expose formats a confluent binding may carry (the alias normalises to
@@ -56,7 +57,10 @@ def _confluent_exposures(
     """Yield ``(exposure, binding, location)`` for every confluent-bound expose."""
     for exposure in contract.get("exposes") or []:
         binding = exposure.get("binding") or {}
-        if str(binding.get("platform") or "").lower() == "confluent":
+        # Normalised through the shared cloud table (``iac.registry``) — the
+        # same one ``fluid generate iac`` auto-detects with, so a platform
+        # spelling that routes here can never be one this plugin then skips.
+        if is_cloud(binding, "confluent"):
             yield exposure, binding, (binding.get("location") or {})
 
 

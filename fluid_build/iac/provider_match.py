@@ -121,6 +121,23 @@ def canonical_cloud(token: object) -> str:
     return PROVIDER_ALIASES.get(token.strip().lower().replace("-", "_"), "")
 
 
+def is_cloud(binding: object, cloud: str) -> bool:
+    """Does ``binding`` (a mapping) declare a platform belonging to ``cloud``?
+
+    The per-exposure half of the same question :func:`detect_cloud_declarations`
+    answers for the whole contract, and it must use the same table. Each IaC
+    plugin filters ``exposes[]`` with this rather than comparing
+    ``binding.platform`` to a literal cloud name, because the two questions —
+    "which plugin runs?" and "which exposures are mine?" — are answered by
+    different code and a literal on one side desyncs them: ``platform: glue``
+    auto-detected as AWS and was then skipped by every AWS filter, emitting an
+    empty module for a correctly-detected provider.
+    """
+    if not isinstance(binding, Mapping):
+        return False
+    return canonical_cloud(binding.get("platform")) == cloud
+
+
 def candidate_regions(contract: Mapping[str, Any]) -> List[str]:
     """Region strings declared on the top-level / expose bindings."""
     regions: List[str] = []

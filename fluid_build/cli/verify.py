@@ -825,6 +825,50 @@ def _verify_local_file(
     }
 
 
+#: What ``fluid apply`` provisions for a GCP-bound expose, as far as stage 9
+#: cares. Two coarse outcomes, because verify only needs to know "is there a
+#: verifier for this?" — the fine-grained resource kind is the emitter's
+#: business, and re-deriving it here would be the second dispatch table PR
+#: #475's post-mortem warns about.
+_GCP_BIGQUERY = "bigquery"
+_GCP_NO_VERIFIER = "no-verifier"
+
+
+def _gcp_provisioned_kind(binding: Any) -> str:
+    """Classify a GCP binding by what the IaC emitter provisions for it.
+
+    Returns :data:`_GCP_BIGQUERY`, :data:`_GCP_NO_VERIFIER`, or ``""`` when the
+    binding is not GCP-bound at all (leave it to the format chain).
+
+    Verify must check what ``fluid apply`` actually created, and since the
+    emitter stopped keying on ``binding.format`` alone, the format string no
+    longer identifies the resource: ``{platform: gcp, format: csv, location:
+    {project, dataset}}`` is provisioned as a BigQuery table. Reading it as a
+    format here sent that expose to the local-file verifier, which failed the
+    whole run with "no location.path declared" — diagnosing a missing file for
+    a table that exists.
+
+    Resolved through the emitter's OWN resolver so the two cannot disagree.
+    Imported lazily: ``fluid --help`` must not pull in the ``iac`` package
+    (``tests/perf/test_startup_budget.py`` enforces the ceiling).
+    """
+    if not isinstance(binding, dict) or not binding:
+        return ""
+    from fluid_build.iac.provider_match import is_cloud
+    from fluid_build.iac.providers.gcp import (
+        BIGQUERY_TABLE,
+        BIGQUERY_VIEW,
+        resolve_gcp_target,
+    )
+
+    if not is_cloud(binding, "gcp"):
+        return ""
+    target = resolve_gcp_target(binding)
+    if target in (BIGQUERY_TABLE, BIGQUERY_VIEW):
+        return _GCP_BIGQUERY
+    return _GCP_NO_VERIFIER if target else ""
+
+
 @_traced_stage("verify")
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Main verify command execution"""
@@ -930,7 +974,12 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             binding = expose_config.get("binding", {})
             format_type = binding.get("format", "")
 
-        if format_type == "bigquery_table":
+        # What the emitter provisions for this binding, when it is GCP-bound.
+        # Empty for the legacy dialect (no ``binding``) and every other
+        # platform, so those fall through to the format chain unchanged.
+        gcp_kind = _gcp_provisioned_kind(expose_config.get("binding"))
+
+        if format_type == "bigquery_table" or gcp_kind == _GCP_BIGQUERY:
             # Get properties from either 'properties' or 'binding.location'
             properties = expose_config.get("properties", {})
             if not properties:
@@ -939,7 +988,13 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 # Build target from binding
                 project = location.get("project", "")
                 dataset = location.get("dataset", "")
-                table = location.get("table", "")
+                # The emitter names the table for the exposure when
+                # ``location.table`` is absent, so reading the key directly
+                # built ``project.dataset.`` — three parts, so it passed the
+                # shape check below and then verified a table named "".
+                from fluid_build.iac.providers.gcp import _bq_table_name
+
+                table = _bq_table_name(expose_config, location)
                 target = f"{project}.{dataset}.{table}"
                 properties = {
                     "target": target,
@@ -1037,6 +1092,20 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 oauth_token=snowflake_settings.get("oauth_token"),
             )
             results[expose_name] = result
+        elif gcp_kind == _GCP_NO_VERIFIER:
+            # A GCS bucket / Pub-Sub topic / Iceberg warehouse. Forge ships no
+            # verifier for these, which is "not checked", NOT "check failed" —
+            # same distinction the ``else`` branch below documents. Caught here
+            # so a GCP expose whose format happens to be ``csv``/``parquet``
+            # does not fall into the local-file branch and fail the run looking
+            # for a file on disk.
+            results[expose_name] = {
+                "status": "unsupported",
+                "error": (
+                    f"No verifier for this GCP binding (format: {format_type or 'unset'}); "
+                    "`fluid apply` provisions it, stage 9 does not reconcile it"
+                ),
+            }
         elif format_type in {"csv", "parquet", "pq", "local", ""}:
             # Bug A4-1: verify local csv/parquet output files using duckdb.
             # Mirrors what BigQuery/Snowflake branches do: report row count,

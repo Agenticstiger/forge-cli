@@ -57,6 +57,7 @@ from ...providers._sql_safety import validate_ident
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
 from ..packaging import ContainerDecision, PackagingResolution, resolve_packaging
+from ..provider_match import is_cloud
 from ..versions import required_providers
 
 _logger = logging.getLogger(__name__)
@@ -218,7 +219,7 @@ class SnowflakeIacPlugin:
         first_loc: Mapping[str, Any] = {}
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
-            if binding.get("platform") != "snowflake":
+            if not is_cloud(binding, "snowflake"):
                 continue
             loc = binding.get("location") or {}
             if not first_loc:
@@ -351,7 +352,7 @@ class SnowflakeIacPlugin:
 
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
-            if binding.get("platform") != "snowflake":
+            if not is_cloud(binding, "snowflake"):
                 continue
             loc = binding.get("location") or {}
             database = loc.get("database")
@@ -449,7 +450,7 @@ class SnowflakeIacPlugin:
         drift: List[Dict[str, Any]] = []
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
-            if binding.get("platform") != "snowflake":
+            if not is_cloud(binding, "snowflake"):
                 continue
             if binding.get("format") == "snowflake_view":
                 continue
