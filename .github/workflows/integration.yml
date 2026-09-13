@@ -58,12 +58,17 @@ on:
           # also spends real cloud credits on the three provider suites.
           - mcp
 
+# The FLOOR, not the grant. A job with no `permissions:` block of its own
+# inherits everything declared here, so anything listed at this level is held
+# by EVERY job in the file — including the ones that fetch and execute
+# third-party code at build time.
+#
+# `id-token: write` mints credentials that federate into GCP and AWS, and
+# `issues: write` can write to the repository. Exactly three jobs need either,
+# and they now ask for it themselves. The other five run tests against a local
+# Postgres and have no business holding either one.
 permissions:
   contents: read
-  # OIDC access for cloud federation (BigQuery WIF, AWS IAM role).
-  id-token: write
-  # Auto-file an issue on cron failures.
-  issues: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -163,6 +168,10 @@ jobs:
   bigquery-integration:
     name: BigQuery integration
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Federates into GCP via Workload Identity: the token IS the credential.
+      id-token: write
     timeout-minutes: 15
     if: |
       github.event_name != 'workflow_dispatch' ||
@@ -230,6 +239,10 @@ jobs:
   aws-integration:
     name: AWS integration
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Assumes an AWS IAM role via OIDC: the token IS the credential.
+      id-token: write
     timeout-minutes: 15
     if: |
       github.event_name != 'workflow_dispatch' ||
@@ -739,6 +752,10 @@ jobs:
       - multi-lang-mcp-conformance
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Opens the nightly-failure issue via github.rest.issues.create.
+      issues: write
     steps:
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
