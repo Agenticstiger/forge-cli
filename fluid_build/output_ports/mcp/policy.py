@@ -163,26 +163,47 @@ class OutputPortPolicy:
     ``None`` means no constraint, and the gate is inert — which is every
     contract that has not pinned a jurisdiction.
 
-    NOT REACHABLE FROM THE CLI TODAY, and the reason is a transport gap rather
-    than an oversight. Read this before wiring it up:
+    NOT WIRED IN TODAY. Read this before wiring it up, because the missing
+    piece is not the one you would guess:
 
-    ``fluid mcp output-port serve`` calls :func:`run_stdio`. The verified
-    markers this gate depends on — ``fluid_auth_attrs`` and ``fluid_auth_kind``
-    — are stamped in exactly one place, ``_transport.py``'s HTTP
-    ``_AuthMiddleware``. Stdio carries no headers, so that middleware never
-    runs and no claim can ever be verified on that path.
+    **Nothing anywhere extracts a caller's jurisdiction from any credential.**
+    ``grep -n jurisdiction`` over ``auth.py``, ``server.py`` and
+    ``_transport.py`` returns zero hits, and :meth:`check_tool_call` takes no
+    jurisdiction argument. So the claim reaching :func:`decide` is always
+    ``None``.
 
-    The consequence is not "the gate is weaker over stdio". It is that a
-    jurisdiction rule over stdio refuses 100% of calls, permanently, with no
-    configuration an operator can apply to fix it — because there is no HTTP
-    transport wired to the CLI to configure. ``run_http_async`` exists on the
-    server object but is not exported from the package, and its only caller in
-    the tree is a test.
+    That is why ``_build_policy`` does not pass the root contract. If it did,
+    a contract with a pinned jurisdiction would set this field,
+    :attr:`EffectivePolicy.has_jurisdiction_rules` would become true, and every
+    call would fail closed on ``MISSING_CALLER_JURISDICTION`` — 100% refusal,
+    for every caller, with nothing an operator could configure to stop it.
+    Fail-closed is correct once a claim can arrive; today none can.
 
-    So ``_build_policy`` deliberately does NOT pass the root contract: the
-    derivation ships, and activation waits on the CLI growing an HTTP
-    transport. An embedder calling ``run_http_async`` directly can use this
-    today by passing ``contract=`` to :meth:`from_contract_and_flags`.
+    Activation therefore needs a third change, not a flag: plumb a verified
+    jurisdiction claim through ``AuthValidator`` ->
+    ``request.scope["fluid_auth_attrs"]`` ->
+    ``OutputPortMcpServer._resolve_request_identity`` -> ``check_tool_call``.
+    Map the claim via ``FLUID_MCP_JWT_CLAIM_MAPPING``, which merges with the
+    defaults rather than replacing them.
+
+    The transport is NOT the obstacle, and an earlier version of this note said
+    it was. For the record: ``fluid mcp output-port serve --transport http``
+    exists (``cli/mcp_output_port.py``), and ``_transport.run`` — the CLI's own
+    entry point — dispatches to :func:`run_http_async` at ``transport ==
+    "http"``. ``run_http_async`` is absent from the package ``__all__``, which
+    is what that note mistook for absence. Over HTTP with
+    ``FLUID_MCP_AUTH_MODE`` set, ``_AuthMiddleware`` does stamp
+    ``fluid_auth_attrs`` / ``fluid_auth_kind`` — so the verified-claim
+    machinery is already there and waiting for a jurisdiction claim to carry.
+
+    Stdio remains genuinely unable to carry one: no headers, so the middleware
+    never runs. A jurisdiction rule is therefore an HTTP-plus-auth feature, and
+    whoever wires it should refuse at startup on stdio rather than let every
+    call fail closed one at a time.
+
+    An embedder can opt in today by passing ``contract=`` to
+    :meth:`from_contract_and_flags` — with the same caveat: without a
+    jurisdiction claim, a pinned contract refuses everything.
     """
 
     policy_source: str = "default"
