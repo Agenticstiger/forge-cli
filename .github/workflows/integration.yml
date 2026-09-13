@@ -607,6 +607,10 @@ jobs:
           POSTGRES_PORT: "55432"
           POSTGRES_USER: forge_mcp_test
           POSTGRES_PASSWORD: forge_mcp_test_pwd
+          # psql reads PGPASSWORD, NOT POSTGRES_PASSWORD. Only the gate step
+          # set it, so the seed below authenticated as nobody and died with
+          # "fe_sendauth: no password supplied" — silently, see the run line.
+          PGPASSWORD: forge_mcp_test_pwd
         run: |
           pip install --upgrade pip
           # `postgres` is REQUIRED, not optional garnish: the demo contract
@@ -614,8 +618,14 @@ jobs:
           # answers every tools/call with UnsupportedBindingError. `[dev,local]`
           # alone made this job unpassable from the day it was added.
           pip install -e ".[dev,local,postgres]"
+          # Fail HERE if the seed fails. This used to end in
+          # `2>/dev/null || true`, which discarded both the error text and the
+          # exit code, so a seed that never ran surfaced three steps later as
+          # an unexplained `UndefinedTable` from the gateway. The seed is
+          # idempotent (CREATE ... IF NOT EXISTS + ON CONFLICT DO NOTHING),
+          # so there is nothing here that needs forgiving.
           psql -h 127.0.0.1 -p 55432 -U forge_mcp_test -d forge_mcp_demo \
-            -f examples/mcp-output-port-docker/seed.sql 2>/dev/null || true
+            -v ON_ERROR_STOP=1 -f examples/mcp-output-port-docker/seed.sql
 
       # 2. TypeScript SDK
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
