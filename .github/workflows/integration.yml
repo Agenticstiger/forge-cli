@@ -50,6 +50,13 @@ on:
           - snowflake
           - bigquery
           - aws
+          # Four jobs already guard on `mcp` (the Postgres/Snowflake e2e
+          # pair, the live-LLM check and the client conformance suite), but
+          # the value was missing from this list — so the enumeration this
+          # comment promises to keep in step with the guards was one suite
+          # short, and the MCP jobs could only be reached via `all`, which
+          # also spends real cloud credits on the three provider suites.
+          - mcp
 
 permissions:
   contents: read
