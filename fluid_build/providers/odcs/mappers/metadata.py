@@ -131,12 +131,22 @@ def to_odcs(ctx: ExportCtx) -> None:
 
     pt = get_metadata_passthrough(fluid)
 
-    # Description: pass-through original object if present, else build {purpose}
+    # Description: pass-through the original object if we have it, else build
+    # one from whatever FLUID holds.
+    #
+    # The two directions used to disagree about what `description` can be. The
+    # importer above type-checks it (Mapping -> unwrap `purpose`, str -> use as
+    # is); this side wrapped UNCONDITIONALLY, so handing it a Mapping produced
+    # `{"purpose": {"purpose": ..., "limitations": ..., "usage": ...}}` — an
+    # object where ODCS declares a string, and therefore invalid ODCS emitted
+    # with no error. Mirror the importer instead of assuming a str.
     if "description" in pt:
         odcs["description"] = dict(pt["description"])
     else:
         description = metadata.get("description") or fluid.get("description")
-        if description:
+        if isinstance(description, Mapping) and description:
+            odcs["description"] = dict(description)
+        elif isinstance(description, str) and description:
             odcs["description"] = {"purpose": description}
 
     # The contract root is the canonical tag list (``metadata.tags`` is the
