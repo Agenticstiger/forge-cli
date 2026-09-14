@@ -76,9 +76,9 @@ jobs:
           fi
 
       # Sanity check: the admin lanes run heavier / credentialed work
-      # against PR code, so each MUST be bound to its environment (the
-      # required-reviewer gate). An edit that drops the `environment:`
-      # line would silently un-gate the lane.
+      # against PR code, so each MUST be bound to its environment, which
+      # is what scopes which secrets the lane can read at all. An edit
+      # that drops the `environment:` line would silently un-gate it.
       - name: Check admin lanes are environment-gated
         run: |
           fail=0
@@ -90,11 +90,45 @@ jobs:
               echo "${file} is environment-gated (${env}) OK."
             else
               echo "::error::${file} must declare 'environment: ${env}'."
-              echo "::error::That environment's required-reviewer rule keeps"
-              echo "::error::credentials away from un-reviewed PR code."
+              echo "::error::The environment scopes which secrets this lane can"
+              echo "::error::read at all; without it the lane widens to every"
+              echo "::error::secret the repo holds."
               fail=1
             fi
           }
           check integration-live.yml integration-live
           check integration-emulated-heavy.yml integration-emulated
           [ "$fail" -eq 0 ]
+
+      # Sanity check: the environment scopes the SECRET, but what gates
+      # un-reviewed PR code is the `ci:integration-emulated` label, which
+      # integration-label-guard.yml strips on every push so the vouch is
+      # re-earned per push. integration-emulated-heavy.yml no longer
+      # carries a required-reviewer rule (it ran nightly and unattended;
+      # a reviewer gate there just queues runs until they are cancelled,
+      # which is how the lane sat dead from 2026-07-13). So the label
+      # condition is now load-bearing and has to be enforced here rather
+      # than assumed.
+      - name: Check the emulated lane still gates PR code on its label
+        run: |
+          file=.github/workflows/integration-emulated-heavy.yml
+          if [ ! -f "$file" ]; then
+            echo "No ${file} — nothing to check."
+            exit 0
+          fi
+          if ! grep -q "contains(github.event.pull_request.labels.\*.name, 'ci:integration-emulated')" "$file"; then
+            echo "::error::${file} has a pull_request trigger but no"
+            echo "::error::ci:integration-emulated label condition. That would run"
+            echo "::error::un-vouched PR code with the environment's secrets in scope."
+            exit 1
+          fi
+          echo "${file} gates its pull_request path on the label OK."
+
+          # The guard that makes the label mean something per push.
+          if [ ! -f .github/workflows/integration-label-guard.yml ]; then
+            echo "::error::integration-label-guard.yml is missing — the"
+            echo "::error::ci:integration-emulated label would survive new pushes,"
+            echo "::error::so one vouch would cover every later commit."
+            exit 1
+          fi
+          echo "integration-label-guard.yml present OK."
