@@ -358,11 +358,18 @@ jobs:
         #               need: deferred-annotation handling, ClientSession
         #               ``sampling_capabilities`` kwarg, etc.)
         # "range-max" = newest release inside the pyproject constraint
-        #               (`mcp>=1.20,<2.0`) — what a fresh
-        #               `pip install data-product-forge` resolves today
+        #               (`mcp>=1.20,<3.0`) — what a fresh
+        #               `pip install data-product-forge` resolves today.
+        #               Since Phase 2 widened the ceiling this resolves to
+        #               2.x, and this leg is NOT warn-wrapped, so 2.x is
+        #               now hard-blocking. That is what "make the 2.x leg
+        #               blocking" meant; it needed no change here, only
+        #               the ceiling move in pyproject.toml.
         # "latest"    = newest release on PyPI, ignoring our ceiling —
-        #               early warning for the next-major port (warn-only,
-        #               see the job comment above)
+        #               early warning for the NEXT next-major (3.x). Stays
+        #               warn-only, for the same reason it was warn-only
+        #               for 2.x: an upstream release must not be able to
+        #               paint every open PR red.
         mcp-version: ["1.20", "range-max", "latest"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -376,7 +383,7 @@ jobs:
           pip install -e ".[dev,local]" || pip install -e ".[dev]"
           case "${{ matrix.mcp-version }}" in
             # Keep the range-max constraint in sync with pyproject.toml.
-            range-max) pip install --upgrade "mcp>=1.20,<2.0" ;;
+            range-max) pip install --upgrade "mcp>=1.20,<3.0" ;;
             latest)    pip install --upgrade mcp ;;
             *)         pip install --force-reinstall "mcp==${{ matrix.mcp-version }}" ;;
           esac
