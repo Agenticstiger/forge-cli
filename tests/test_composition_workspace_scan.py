@@ -418,7 +418,7 @@ def test_for_contract_perf_bound_shallow_path(tmp_path, monkeypatch):
     elapsed = time.perf_counter() - start
 
     assert out == []
-    # Deliberately generous bound — cf. tests/ux/test_performance_budgets.py
+    # Deliberately generous bound — cf. tests/perf/test_ux_performance_budgets.py
     # ("catch regressions, not police absolute speed"). The historical
     # BUG-VALIDATE-SLOW took *tens of seconds* because the ancestor walk
     # escaped into huge sibling trees. The fixed, capped scan stays in low

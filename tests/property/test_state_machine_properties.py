@@ -59,7 +59,14 @@ _value_strat = st.recursive(
 )
 
 
-@settings(suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=50)
+@settings(
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+    max_examples=50,
+    # Same reason as test_list_runs_count_matches_writes below: this touches
+    # the filesystem, and file IO plus cleanup can exceed Hypothesis's 200ms
+    # per-example default. Under `-n auto` the workers contend and it does.
+    deadline=None,
+)
 @given(
     product_id=_id_strat,
     build_id=_id_strat,
@@ -77,7 +84,14 @@ def test_cursor_round_trip_property(tmp_path: Path, product_id, build_id, stream
     assert got.value == value
 
 
-@settings(suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=50)
+@settings(
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+    max_examples=50,
+    # Same reason as test_list_runs_count_matches_writes below: this touches
+    # the filesystem, and file IO plus cleanup can exceed Hypothesis's 200ms
+    # per-example default. Under `-n auto` the workers contend and it does.
+    deadline=None,
+)
 @given(
     product_id=_id_strat,
     build_id=_id_strat,
@@ -122,7 +136,12 @@ def test_list_runs_count_matches_writes(tmp_path: Path, n_runs, product_id, buil
     assert len(runs) == n_runs
 
 
-@settings(suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=20)
+@settings(
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+    max_examples=20,
+    # File IO under xdist contention; see the note above.
+    deadline=None,
+)
 @given(
     scope=st.sampled_from(["product", "build"]),
     resource_id=_id_strat,
@@ -136,7 +155,12 @@ def test_lock_release_property(tmp_path: Path, scope, resource_id):
     assert not lock_path.exists()
 
 
-@settings(suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=20)
+@settings(
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+    max_examples=20,
+    # File IO under xdist contention; see the note above.
+    deadline=None,
+)
 @given(
     scope=st.sampled_from(["product", "build"]),
     resource_id=_id_strat,
