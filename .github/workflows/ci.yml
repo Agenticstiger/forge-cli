@@ -358,11 +358,18 @@ jobs:
         #               need: deferred-annotation handling, ClientSession
         #               ``sampling_capabilities`` kwarg, etc.)
         # "range-max" = newest release inside the pyproject constraint
-        #               (`mcp>=1.20,<2.0`) — what a fresh
-        #               `pip install data-product-forge` resolves today
+        #               (`mcp>=1.20,<3.0`) — what a fresh
+        #               `pip install data-product-forge` resolves today.
+        #               Since Phase 2 widened the ceiling this resolves to
+        #               2.x, and this leg is NOT warn-wrapped, so 2.x is
+        #               now hard-blocking. That is what "make the 2.x leg
+        #               blocking" meant; it needed no change here, only
+        #               the ceiling move in pyproject.toml.
         # "latest"    = newest release on PyPI, ignoring our ceiling —
-        #               early warning for the next-major port (warn-only,
-        #               see the job comment above)
+        #               early warning for the NEXT next-major (3.x). Stays
+        #               warn-only, for the same reason it was warn-only
+        #               for 2.x: an upstream release must not be able to
+        #               paint every open PR red.
         mcp-version: ["1.20", "range-max", "latest"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -371,26 +378,51 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install fluid-build + pinned MCP SDK
+        env:
+          MCP_LEG: ${{ matrix.mcp-version }}
         run: |
           pip install --upgrade pip
           pip install -e ".[dev,local]" || pip install -e ".[dev]"
           case "${{ matrix.mcp-version }}" in
             # Keep the range-max constraint in sync with pyproject.toml.
-            range-max) pip install --upgrade "mcp>=1.20,<2.0" ;;
+            range-max) pip install --upgrade "mcp>=1.20,<3.0" ;;
             latest)    pip install --upgrade mcp ;;
             *)         pip install --force-reinstall "mcp==${{ matrix.mcp-version }}" ;;
           esac
           pip show mcp | head -3
+          # Assert the leg installed the generation it claims. Nothing did
+          # this before, so "range-max exercises 2.x" was an assumption about
+          # pip resolution rather than a checked fact. If it ever silently
+          # resolves elsewhere, the leg keeps passing while testing the wrong
+          # SDK, which is the failure mode this whole canary exists to catch.
+          python - <<'PY'
+          import importlib.metadata as md
+          import os
+          import sys
+
+          leg = os.environ["MCP_LEG"]
+          version = md.version("mcp")
+          major = int(version.split(".")[0])
+          print(f"leg={leg} resolved mcp=={version} (major {major})")
+          expected = {"1.20": 1, "range-max": 2, "latest": 2}[leg]
+          if major != expected:
+              sys.exit(
+                  f"::error::leg '{leg}' resolved mcp {version}, expected major {expected}. "
+                  "Either the pyproject ceiling moved and this matrix was not updated, "
+                  "or pip resolved something unexpected. Either way the leg is not "
+                  "testing what its name says."
+              )
+          PY
       - name: Run MCP-touching tests
         run: |
           set -o pipefail
+          # Select by name rather than by an explicit file list. The list
+          # had drifted to 3 of the 12 mcp test files, so "2.x is blocking"
+          # only ever meant those three. A hand-maintained list of what to
+          # test is a list that goes stale; `-k mcp` picks up a new mcp test
+          # file the day it lands. Costs about 20s.
           run_mcp_tests() {
-            python -m pytest \
-              tests/cli/test_scaffold_ide.py \
-              tests/cli/test_mcp_sampling_provider.py \
-              tests/cli/test_mcp_forge_run_live.py \
-              tests/cli/test_mcp_sdk_client_e2e.py \
-              -q
+            python -m pytest -k mcp tests/ -q --no-header
           }
           if [ "${{ matrix.mcp-version }}" != "latest" ]; then
             run_mcp_tests

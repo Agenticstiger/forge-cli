@@ -109,12 +109,31 @@ dependencies = [
   #   - The gateway depends on the lifespan API + ``mcp.shared.memory``
   #     test fixtures introduced in 1.20.
   #   1.20+ has all of the above. Pinned by the mcp-sdk-drift CI job.
-  # Ceiling ``<2.0``: the codebase is DUAL-SUPPORT (1.x and 2.x) via the
-  # fluid_build/_mcp_compat.py seam — the drift job's warn-only "latest"
-  # leg exercises 2.x on every run — but the ceiling stays until that leg
-  # has a green track record on a settled 2.0.x (2.0.0 shipped
-  # 2026-07-28). Phase 2: widen to ``>=1.20,<3`` and make the 2.x leg
-  # blocking. Known 2.x behavior gap: v2 drops clientInfo extra fields at
+  # Ceiling ``<3.0`` since Phase 2 (2026-09-14). The codebase is
+  # DUAL-SUPPORT (1.x and 2.x) via the fluid_build/_mcp_compat.py seam, and
+  # widening the ceiling is what makes 2.x BLOCKING: the drift job's
+  # ``range-max`` leg now resolves inside ``>=1.20,<3.0``, so it runs
+  # without the warn-wrapper. The ``latest`` leg stays warn-only and
+  # becomes the early warning for 3.x, which is the same reasoning that
+  # made it warn-only for 2.x.
+  #
+  # What was audited before widening, against the official rename table at
+  # https://py.sdk.modelcontextprotocol.io/migration (11 fields moved from
+  # camelCase to snake_case ON ATTRIBUTE ACCESS, a read that fails
+  # SILENTLY because getattr returns the default):
+  #   - attribute reads using a renamed spelling, across the 16 modules
+  #     that import mcp:                                              0
+  #   - ``model_dump()`` on an SDK model without ``by_alias=True``
+  #     (2.x emits snake_case keys peers do not recognise, no error):  0
+  #   - dict-key reads of a renamed name:  2, both on forge's OWN
+  #     hand-built tool-advertisement dict (cli/mcp/policy.py writes it,
+  #     output_ports/mcp/server.py reads it), consistent on both sides
+  #   - camelCase CONSTRUCTOR kwargs:  6, and the guide confirms 2.x still
+  #     accepts those; only attribute access moved.
+  # tests/test_mcp_sdk_rename_guard.py pins all of that so it cannot drift
+  # back silently.
+  #
+  # Known 2.x behavior gap, unchanged: v2 drops clientInfo extra fields at
   # wire-parse (v1 was extra="allow"), so self-attested output-port
   # identity moved to the capabilities channel — see
   # _mcp_compat.self_attesting_client_kwargs.
@@ -123,7 +142,7 @@ dependencies = [
   # AGENT_IDE.md "Related work" section + the gateway commit msg):
   #   docs:  https://modelcontextprotocol.github.io/python-sdk/
   #   repo:  https://github.com/modelcontextprotocol/python-sdk
-  "mcp>=1.20,<2.0",
+  "mcp>=1.20,<3.0",
   # (The MCP output-port rate limiter is an in-process monotonic-clock
   # deque sliding window in SessionState.check_rate_limit — no dependency.
   # PyrateLimiter was dropped: its Limiter spins a background "leaker"
