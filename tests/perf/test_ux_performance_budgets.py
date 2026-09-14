@@ -17,6 +17,17 @@
 These bounds are deliberately generous (CI machines vary). The goal is to
 catch regressions, not to police absolute speed. A 5x degradation surfaces
 loudly; a 10% slowdown is allowed to pass.
+
+LIVES IN ``tests/perf/`` FOR A REASON, and moving it back out will make it
+flaky again. ci.yml runs the main suite under ``-n auto`` and ``--ignore``s
+this directory, then runs it serially in its own step, because a wall-clock
+budget measured while N xdist workers contend for the same CPU is not a
+measurement of the code. This file spent its life in ``tests/ux/`` and so ran
+parallel: the state-store round trip, ~0.05s serially, was measured at 0.727s
+against its 0.5s budget on a loaded runner and failed a pull request that had
+touched nothing near it. That is a 14x inflation from contention alone, which
+no threshold can be tuned around — the budget was never wrong, its neighbours
+were.
 """
 
 from __future__ import annotations
