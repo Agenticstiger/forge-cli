@@ -175,7 +175,7 @@ jobs:
           # own bypass; the auth token is what unlocks Glue and Lake Formation.
           FLUID_IAC_LIVE_LOCALSTACK: "1"
           AWS_ACCESS_KEY_ID: test
-          AWS_SECRET_ACCESS_KEY: test
+          AWS_SECRET_ACCESS_KEY: test  # pragma: allowlist secret
           AWS_DEFAULT_REGION: us-east-1
           FLUID_IAC_LIVE_GCP_EMULATOR: "1"
           PUBSUB_EMULATOR_HOST: "localhost:8085"
