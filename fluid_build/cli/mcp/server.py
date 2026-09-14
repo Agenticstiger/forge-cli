@@ -521,6 +521,15 @@ async def forge_run(
     check_tool_permission = _mcp_pkg.check_tool_permission
     _run_forge_inproc = _mcp_pkg._run_forge_inproc
     _policy_fn = _mcp_pkg._policy
+
+    # Anticipated tool failures must be raised as the SDK's ToolError, not a
+    # bare RuntimeError. On SDK 2.x anything else is treated as a crash and the
+    # client sees only "Error executing tool forge_run", losing the sentence
+    # that tells the operator what to do about it. Resolved through the compat
+    # seam because the class moved package between generations. Imported here
+    # rather than at module scope to keep `mcp` off the `fluid --help` path.
+    from fluid_build._mcp_compat import get_tool_error as _tool_error
+
     permission_args: Dict[str, Any] = {
         "mode": mode,
         "target_dir": target_dir,
@@ -530,14 +539,14 @@ async def forge_run(
     }
     check_tool_permission("forge_run", permission_args, policy=_policy_fn())
     if _policy_fn().read_only:
-        raise RuntimeError("Server is running in read-only mode")
+        raise _tool_error()("Server is running in read-only mode")
 
     mode_norm = (mode or "blank").strip().lower()
 
     # Mode 'diag' — single sampling round-trip; proves the channel works.
     if mode_norm == "diag":
         if ctx is None:
-            raise RuntimeError(
+            raise _tool_error()(
                 "forge_run mode='diag' requires the MCP Context (the IDE must "
                 "advertise the 'sampling' capability at initialize)."
             )
@@ -552,7 +561,7 @@ async def forge_run(
         if not ctx.session.check_client_capability(
             ClientCapabilities(sampling=SamplingCapability())
         ):
-            raise RuntimeError(
+            raise _tool_error()(
                 "Your MCP client did not advertise the 'sampling' capability "
                 "at initialize, so forge_run mode='diag' / 'ai' cannot work. "
                 "Use mode='blank' (deterministic scaffold, no LLM), or "
@@ -577,7 +586,7 @@ async def forge_run(
                 include_context="thisServer",
             )
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(
+            raise _tool_error()(
                 "MCP sampling failed — this IDE may not support the "
                 f"'sampling' capability. Underlying error: {exc}. Use "
                 "mode='blank' or set FLUID_LLM_BACKEND=litellm with an API "
@@ -610,7 +619,7 @@ async def forge_run(
     # worker thread can call back into the loop via ``anyio.from_thread.run``.
     if mode_norm in ("blank", "ai"):
         if not target_dir:
-            raise RuntimeError("forge_run requires 'target_dir' for mode='blank'/'ai'")
+            raise _tool_error()("forge_run requires 'target_dir' for mode='blank'/'ai'")
         from anyio.lowlevel import current_token
 
         anyio_token = current_token()
@@ -624,7 +633,7 @@ async def forge_run(
 
             _reset_sampling_context(sampling_tokens)
 
-    raise RuntimeError(f"unknown forge_run mode: {mode_norm!r}")
+    raise _tool_error()(f"unknown forge_run mode: {mode_norm!r}")
 
 
 @_forge_tool(description=TOOL_CAPABILITIES["score_contract_quality"].description)
