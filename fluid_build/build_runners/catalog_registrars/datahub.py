@@ -411,8 +411,15 @@ class DataHubRegistrar(CatalogRegistrar):
         home for ODCS-style contracts: it links the contract to its
         dataset via ``entity`` and carries the raw YAML body on
         ``rawContract``. The UI renders this as a Data Contract page
-        attached to the dataset, far better UX than a multi-KB string
-        crammed into ``customProperties.odcs_contract``.
+        attached to the dataset, which is better UX than reading a
+        multi-KB string out of ``customProperties``.
+
+        It is not a REPLACEMENT for that string, though, which is how
+        this was originally read. ``rawContract`` is absent from the
+        OSS GraphQL schema — only Acryl Cloud renders it — so on OSS
+        DataHub this entity exists but its body cannot be read back.
+        ``_build_dataset_envelope`` therefore also carries the ODCS
+        YAML in ``customProperties.odcs_contract``.
 
         When *assertions* is provided, each ``(urn, bucket)`` tuple
         gets routed into the matching DataContract bucket
@@ -508,7 +515,14 @@ class DataHubRegistrar(CatalogRegistrar):
         when the server supports structured properties. No-op on
         unsupported servers (callers still emit the same values in
         ``customProperties`` for those — see
-        ``_fluid_classification_custom_properties``)."""
+        :meth:`_build_dataset_envelope` and
+        :meth:`_build_dataproduct_properties`).
+
+        Note the deliberate spelling difference: a structured property
+        is identified by a ``qualifiedName`` and uses DataHub's dotted
+        convention (``fluid.layer``), while the customProperties keys
+        are forge's own cross-backend names (``fluid_layer``). They are
+        different namespaces, not an inconsistency."""
         if not self._structured_properties_supported:
             return
         from ._datahub_structured_properties import assignment_for
@@ -772,6 +786,29 @@ class DataHubRegistrar(CatalogRegistrar):
             return None
         return {"elements": elements}
 
+    def _specs_are_linkable(self, product_id: str) -> bool:
+        """True when spec documents have a reachable URL to link to.
+
+        The rule this gates, in one place: **duplicate into
+        ``customProperties`` only what would otherwise be unreadable.**
+
+        Large YAML documents belong behind a link — inlining them bloats
+        every entity GET and pollutes search, which is why the original
+        design linked only. But ``spec_source_base_url`` defaults to
+        None, no factory sets it, and it appears in no documentation, so
+        on a default install ``_spec_url`` returned None, the links were
+        silently skipped, and ``DataContract.rawContract`` is absent
+        from the OSS GraphQL schema. The contract was reachable nowhere:
+        not inlined, not linked, not readable.
+
+        So the blobs are linked when a base URL is configured and
+        inlined when it is not. Small typed values (layer, product type,
+        version, domain) are unconditional — they carry no bloat cost
+        and the OpenMetadata registrar promises them by the same names
+        "whether they're browsing DataHub, OpenMetadata, or Unity".
+        """
+        return self._spec_url(product_id, "contract.fluid.yaml") is not None
+
     def _build_dataset_institutional_memory(
         self, payload: CatalogPublicationPayload, asset: AssetPayload
     ) -> Optional[Dict[str, Any]]:
@@ -853,18 +890,35 @@ class DataHubRegistrar(CatalogRegistrar):
                 }
             return field
 
-        # Dataset-level custom properties carry only the small typed
-        # FLUID classification chips. The ODCS contract for this
-        # dataset lives on a first-class ``DataContract`` entity
-        # (see :meth:`_publish_data_contract`) — NOT here. Domain
-        # is published via the native ``domains`` aspect, not as a
-        # custom string. Dot-notation keys mirror DataHub's own
-        # convention for ingestion-source-tagged properties.
+        # Dataset-level custom properties carry the cross-backend
+        # FLUID-native attachment set. The key names are NOT DataHub's
+        # dot-notation ingestion convention: they are forge's own,
+        # shared verbatim with the OpenMetadata registrar, whose
+        # docstring states the requirement — "so an analyst gets the
+        # same fluid_layer / fluid_product_type / odcs_contract whether
+        # they're browsing DataHub, OpenMetadata, or Unity". A property
+        # an analyst has to spell differently per catalog is not the
+        # same property.
+        #
+        # The ODCS contract is ALSO published as a first-class
+        # ``DataContract`` entity (see :meth:`_publish_data_contract`)
+        # and linked from institutionalMemory. It is carried here as
+        # well because both of those are conditional — DataContract's
+        # ``rawContract`` is absent from the OSS GraphQL schema, and the
+        # link is skipped entirely when ``spec_source_base_url`` is not
+        # configured. Before this, a default OSS install had no path to
+        # the contract at all: not inlined, not linked, not readable.
         custom_properties: Dict[str, str] = {}
         if product.layer:
-            custom_properties["fluid.layer"] = product.layer
+            custom_properties["fluid_layer"] = product.layer
         if product.product_type:
-            custom_properties["fluid.productType"] = product.product_type
+            custom_properties["fluid_product_type"] = product.product_type
+        if product.domain:
+            custom_properties["fluid_domain"] = product.domain
+        if product.version:
+            custom_properties["fluid_version"] = product.version
+        if asset.odcs_yaml and not self._specs_are_linkable(product.product_id):
+            custom_properties["odcs_contract"] = asset.odcs_yaml
 
         aspects: List[Dict[str, Any]] = [
             {
@@ -937,13 +991,21 @@ class DataHubRegistrar(CatalogRegistrar):
     def _build_dataproduct_properties(self, payload: CatalogPublicationPayload) -> Dict[str, Any]:
         """Build the ``dataProductProperties`` aspect.
 
-        Carries only small typed FLUID metadata in ``customProperties``
-        (layer, product type, version). Domain is published via the
-        native ``domains`` aspect; tags via ``globalTags``; and the
-        source FLUID + ODPS YAML documents are *linked* via
-        ``institutionalMemory`` and ``externalUrl`` rather than
-        inlined here — multi-KB YAML in customProperties bloats every
-        entity GET and pollutes search.
+        Carries the cross-backend FLUID-native attachment set, keyed
+        exactly as the OpenMetadata registrar keys it. Domain is also
+        published via the native ``domains`` aspect and tags via
+        ``globalTags``; those stay.
+
+        The source FLUID and ODPS documents are carried here as well as
+        linked via ``institutionalMemory`` / ``externalUrl``. The
+        original design linked ONLY, on the reasoning that multi-KB
+        YAML in customProperties bloats every entity GET and pollutes
+        search. That reasoning is sound and the links are kept, but it
+        did not survive contact with the default install: ``_spec_url``
+        returns None unless ``spec_source_base_url`` is configured, so
+        the links were silently skipped and the contract was reachable
+        nowhere. The sibling OpenMetadata and AWS Glue emitters both
+        inline it; DataHub was the outlier.
 
         ``assets`` lists every expose of the contract so the
         DataProduct page's Assets tab renders the full backing.
@@ -951,11 +1013,18 @@ class DataHubRegistrar(CatalogRegistrar):
         product = payload.product
         custom_properties: Dict[str, str] = {}
         if product.layer:
-            custom_properties["fluid.layer"] = product.layer
+            custom_properties["fluid_layer"] = product.layer
         if product.product_type:
-            custom_properties["fluid.productType"] = product.product_type
+            custom_properties["fluid_product_type"] = product.product_type
+        if product.domain:
+            custom_properties["fluid_domain"] = product.domain
         if product.version:
-            custom_properties["fluid.version"] = product.version
+            custom_properties["fluid_version"] = product.version
+        if not self._specs_are_linkable(product.product_id):
+            if payload.specs.fluid_yaml:
+                custom_properties["fluid_contract"] = payload.specs.fluid_yaml
+            if payload.specs.odps_yaml:
+                custom_properties["odps_spec"] = payload.specs.odps_yaml
 
         assets = [
             {"destinationUrn": self._dataset_urn(product.product_id, asset)}

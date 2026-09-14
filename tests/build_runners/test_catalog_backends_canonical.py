@@ -91,15 +91,80 @@ def payload() -> CatalogPublicationPayload:
 
 
 class TestDataHubCanonicalFields:
-    def test_dataset_snapshot_carries_only_small_typed_fluid_properties(
-        self, payload, datahub_mock
-    ):
-        """Dataset.customProperties should carry ONLY small typed FLUID
-        metadata — never the multi-KB ODCS YAML blob (that's a
-        first-class ``DataContract`` entity now) and never the domain
-        string (that's a first-class ``Domain`` entity link).
+    # The rule these four pin, from ``DataHubRegistrar._specs_are_linkable``:
+    # duplicate into customProperties only what would otherwise be
+    # unreadable. Large YAML is linked when ``spec_source_base_url`` is
+    # configured and inlined when it is not; small typed values are
+    # unconditional and use forge's cross-backend key names.
+    #
+    # The predecessors of these tests asserted the link arm only, and
+    # constructed the registrar WITHOUT a spec URL — so they pinned
+    # "no blobs" in exactly the configuration where the blobs are the
+    # only readable copy. The integration suite asserted the opposite
+    # and never ran, so the contradiction went unnoticed from 2026-05-25.
+
+    SPEC_URL = "https://specs.test/products"
+
+    def test_dataset_properties_use_the_cross_backend_key_names(self, payload, datahub_mock):
+        """Underscore keys, shared verbatim with the OpenMetadata registrar.
+
+        Not DataHub's dotted ingestion convention: OpenMetadata's docstring
+        promises an analyst the same ``fluid_layer`` / ``fluid_product_type``
+        "whether they're browsing DataHub, OpenMetadata, or Unity", and
+        CLAUDE.md records the same spelling for the provider tag emitters.
+        DataHub was the only emitter using dots. Structured properties keep
+        theirs — a ``qualifiedName`` is a different namespace.
         """
         DataHubRegistrar(base_url="https://datahub.test").register_payload(payload)
+        custom = self._dataset_custom_properties(datahub_mock)
+        assert custom["fluid_layer"] == "Bronze"
+        assert custom["fluid_product_type"] == "SDP"
+        assert "fluid.layer" not in custom and "fluid.productType" not in custom
+
+    def test_dataset_inlines_odcs_only_when_there_is_no_url_to_link(self, payload, datahub_mock):
+        """No spec URL configured: the inline copy is the only readable one.
+
+        ``DataContract.rawContract`` is absent from the OSS GraphQL schema and
+        ``institutionalMemory`` is skipped without a URL, so without this the
+        contract is readable nowhere on a default install.
+        """
+        DataHubRegistrar(base_url="https://datahub.test").register_payload(payload)
+        custom = self._dataset_custom_properties(datahub_mock)
+        assert "id: bronze.canonical.orders" in custom["odcs_contract"]
+
+    def test_dataset_omits_the_odcs_blob_once_it_can_be_linked(self, payload, datahub_mock):
+        """Spec URL configured: link it, do not also inline multi-KB YAML."""
+        DataHubRegistrar(
+            base_url="https://datahub.test", spec_source_base_url=self.SPEC_URL
+        ).register_payload(payload)
+        custom = self._dataset_custom_properties(datahub_mock)
+        assert "odcs_contract" not in custom
+
+    def test_dataproduct_inlines_blobs_only_when_there_is_no_url_to_link(
+        self, payload, datahub_mock
+    ):
+        DataHubRegistrar(base_url="https://datahub.test").register_payload(payload)
+        custom = self._dataproduct_custom_properties(datahub_mock)
+        assert custom["fluid_product_type"] == "SDP"
+        assert custom["fluid_layer"] == "Bronze"
+        assert custom["fluid_version"] == "1.2.3"
+        assert "fluid_contract" in custom and "odps_spec" in custom
+        # Per-tag strings stay gone — globalTags is their home, and unlike
+        # the contract they are readable there on OSS.
+        assert "fluid_tag.e2e" not in custom
+
+    def test_dataproduct_omits_blobs_once_they_can_be_linked(self, payload, datahub_mock):
+        DataHubRegistrar(
+            base_url="https://datahub.test", spec_source_base_url=self.SPEC_URL
+        ).register_payload(payload)
+        custom = self._dataproduct_custom_properties(datahub_mock)
+        for forbidden in ("fluid_contract", "odps_spec", "fluid.domain", "fluid_tag.e2e"):
+            assert forbidden not in custom, f"{forbidden!r} should not be in customProperties"
+        # The small typed values are unconditional — they never had a bloat cost.
+        assert custom["fluid_product_type"] == "SDP"
+
+    @staticmethod
+    def _dataset_custom_properties(datahub_mock):
         snapshot = datahub_mock.entities[0]["entity"]["value"][
             "com.linkedin.metadata.snapshot.DatasetSnapshot"
         ]
@@ -108,39 +173,16 @@ class TestDataHubCanonicalFields:
             for a in snapshot["aspects"]
             if "com.linkedin.dataset.DatasetProperties" in a
         )
-        custom = props_aspect["customProperties"]
-        # Small typed values stay (dot-notation per DataHub convention).
-        assert custom["fluid.layer"] == "Bronze"
-        assert custom["fluid.productType"] == "SDP"
-        # YAML blob + redundant domain string must be gone.
-        assert "odcs_contract" not in custom
-        assert "fluid_domain" not in custom and "fluid.domain" not in custom
+        return props_aspect["customProperties"]
 
-    def test_dataproduct_mcp_does_not_inline_yaml_blobs(self, payload, datahub_mock):
-        """DataProduct.customProperties should NOT carry the source
-        FLUID or ODPS YAML — those are linked via
-        ``institutionalMemory`` + ``externalUrl`` instead. Only the
-        small typed FLUID metadata belongs here.
-        """
-        DataHubRegistrar(base_url="https://datahub.test").register_payload(payload)
+    @staticmethod
+    def _dataproduct_custom_properties(datahub_mock):
         dp_props = next(
             p["_aspect_value"]
             for p in datahub_mock.proposals_for("dataProduct")
             if p.get("aspectName") == "dataProductProperties"
         )
-        custom = dp_props["customProperties"]
-        assert custom["fluid.productType"] == "SDP"
-        assert custom["fluid.layer"] == "Bronze"
-        assert custom["fluid.version"] == "1.2.3"
-        # YAML blobs + redundant domain / tag strings are gone.
-        for forbidden in (
-            "fluid_contract",
-            "odps_spec",
-            "fluid_domain",
-            "fluid.domain",
-            "fluid_tag.e2e",
-        ):
-            assert forbidden not in custom, f"{forbidden!r} should not appear in customProperties"
+        return dp_props["customProperties"]
 
     def test_data_contract_entity_is_emitted_per_asset(self, payload, datahub_mock):
         """ODCS lives on a first-class DataContract entity bound to
