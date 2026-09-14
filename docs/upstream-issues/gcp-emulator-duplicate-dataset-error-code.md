@@ -1,4 +1,8 @@
-# Upstream issue draft: goccy/bigquery-emulator
+# Upstream issue: goccy/bigquery-emulator
+
+**FILED 2026-09-14 as https://github.com/goccy/bigquery-emulator/issues/514.**
+Kept here because the draft carries the reproduction and the reasoning; the
+issue body is a copy. Sibling drafts in this directory are still unfiled.
 
 Creating a dataset that already exists returns `internalError` where real
 BigQuery returns `409 alreadyExists`. That breaks the

@@ -157,7 +157,9 @@ jobs:
             localstack/localstack:latest
           # Health-check — wait up to 60 s for the gateway to respond.
           for i in $(seq 1 30); do
-            curl -sf http://localhost:4566/_localstack/health > /dev/null && break
+            if curl -sf http://localhost:4566/_localstack/health > /dev/null; then
+              echo "LocalStack ready after ~$((i * 2))s"; break
+            fi
             sleep 2
           done
 
@@ -166,7 +168,9 @@ jobs:
           docker compose -f tests/iac/_gcp_emulator/docker-compose.yml up -d
           # Health-check loops — the BQ emulator can take ~15s to be ready.
           for i in $(seq 1 30); do
-            curl -sf http://localhost:9050/discovery/v1/apis/bigquery/v2/rest > /dev/null && break
+            if curl -sf http://localhost:9050/discovery/v1/apis/bigquery/v2/rest > /dev/null; then
+              echo "bigquery-emulator ready after ~$((i * 2))s"; break
+            fi
             sleep 2
           done
 

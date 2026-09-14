@@ -84,6 +84,12 @@ jobs:
           CHANGED=$(git diff --name-only --diff-filter=d "${BASE_SHA}" HEAD)
           if [ -z "${CHANGED}" ]; then echo "No changed files."; exit 0; fi
           echo "${CHANGED}"
+          # Deliberately unquoted: CHANGED is a newline-separated file list and
+          # must word-split into one argument per file. Quoting it passes a
+          # single argument containing newlines, which detect-secrets reads as
+          # one impossible filename and then scans nothing. Silently scanning
+          # nothing is the failure this step exists to prevent.
+          # shellcheck disable=SC2086
           detect-secrets-hook --baseline .secrets.baseline ${CHANGED}
 
   # ── import-linter — architecture / cycle gate ───────────────────────
