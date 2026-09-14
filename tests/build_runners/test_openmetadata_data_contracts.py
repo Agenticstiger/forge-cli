@@ -150,3 +150,104 @@ class TestUnchangedBehaviour:
     def test_unregister_is_untouched(self, openmetadata_mock):
         registrar = OpenMetadataRegistrar(base_url="https://openmetadata.test")
         assert registrar.unregister("bronze.x", "orders").succeeded
+
+
+class TestReadPath:
+    """The read half: an OpenMetadata-held contract can drive plan/apply.
+
+    Preferring ``extension.odcs_contract`` over OpenMetadata's own ODCS
+    export is not a hack around the API. Their converter drops ``servers``
+    and six other top-level blocks (open-metadata/OpenMetadata#30493), so
+    the native export cannot round-trip a physical binding. The extension
+    is written verbatim and preserved verbatim, so it can.
+    """
+
+    ODCS_WITH_SERVERS = (
+        "apiVersion: v3.1.0\n"
+        "kind: DataContract\n"
+        "id: bronze.x.orders\n"
+        "status: active\n"
+        "servers:\n"
+        "  - server: prod\n"
+        "    type: snowflake\n"
+        "    account: acme-prod\n"
+        "    database: ANALYTICS\n"
+        "    schema: PUBLIC\n"
+    )
+
+    def _seed(self, mock, *, odcs: str) -> str:
+        """Publish a table carrying an ODCS contract, return its FQN."""
+        registrar = OpenMetadataRegistrar(base_url="https://openmetadata.test")
+        contract = _contract()
+        contract["exposes"][0]["contract"]["odcs"] = odcs
+        registrar.register("bronze.x", "orders", contract, {})
+        mock.tables[0]["extension"]["odcs_contract"] = odcs
+        return mock.tables[0]["fullyQualifiedName"]
+
+    def test_contract_is_read_back_from_the_extension(self, openmetadata_mock):
+        fqn = self._seed(openmetadata_mock, odcs=self.ODCS_WITH_SERVERS)
+        registrar = OpenMetadataRegistrar(base_url="https://openmetadata.test")
+        got = registrar.fetch_odcs_contract(fqn)
+        assert got == self.ODCS_WITH_SERVERS
+
+    def test_the_physical_binding_survives(self, openmetadata_mock):
+        """servers[] is the binding. Losing it is what stops an
+        OpenMetadata-held contract driving fluid apply."""
+        import yaml as _yaml
+
+        fqn = self._seed(openmetadata_mock, odcs=self.ODCS_WITH_SERVERS)
+        registrar = OpenMetadataRegistrar(base_url="https://openmetadata.test")
+        doc = _yaml.safe_load(registrar.fetch_odcs_contract(fqn))
+        assert doc["servers"][0]["account"] == "acme-prod"
+        assert doc["servers"][0]["database"] == "ANALYTICS"
+
+    def test_extension_is_preferred_over_the_lossy_native_export(self, openmetadata_mock):
+        fqn = self._seed(openmetadata_mock, odcs=self.ODCS_WITH_SERVERS)
+        registrar = OpenMetadataRegistrar(base_url="https://openmetadata.test")
+        registrar.fetch_odcs_contract(fqn)
+        assert "get_native_odcs" not in openmetadata_mock.calls
+
+    def test_falls_back_to_the_native_export(self, openmetadata_mock):
+        """A contract published by something other than fluid has no
+        extension, so the native route is the only source."""
+        self._seed(openmetadata_mock, odcs=self.ODCS_WITH_SERVERS)
+        openmetadata_mock.tables[0]["extension"].pop("odcs_contract", None)
+        registrar = OpenMetadataRegistrar(base_url="https://openmetadata.test")
+        got = registrar.fetch_odcs_contract(openmetadata_mock.tables[0]["fullyQualifiedName"])
+        assert got and "id: native.export" in got
+        assert "get_native_odcs" in openmetadata_mock.calls
+
+    def test_unknown_asset_returns_none(self, openmetadata_mock):
+        registrar = OpenMetadataRegistrar(base_url="https://openmetadata.test")
+        assert registrar.fetch_odcs_contract("forge.nope.missing") is None
+
+    def test_neither_source_available_returns_none(self, openmetadata_mock):
+        self._seed(openmetadata_mock, odcs=self.ODCS_WITH_SERVERS)
+        openmetadata_mock.tables[0]["extension"].pop("odcs_contract", None)
+        openmetadata_mock.native_odcs_available = False
+        registrar = OpenMetadataRegistrar(base_url="https://openmetadata.test")
+        assert (
+            registrar.fetch_odcs_contract(openmetadata_mock.tables[0]["fullyQualifiedName"]) is None
+        )
+
+    def test_read_failure_does_not_leak_the_token(self, openmetadata_mock, caplog):
+        openmetadata_mock.native_odcs_available = False
+        registrar = OpenMetadataRegistrar(
+            base_url="https://openmetadata.test", api_token="super-secret-token"
+        )
+        with caplog.at_level("DEBUG"):
+            registrar.fetch_odcs_contract("forge.nope.missing")
+        assert "super-secret-token" not in " ".join(r.getMessage() for r in caplog.records)
+
+    def test_round_trips_into_a_fluid_contract(self, openmetadata_mock):
+        """End to end: OpenMetadata to a FLUID contract, binding intact."""
+        from fluid_build.providers.odcs.provider import OdcsProvider
+
+        fqn = self._seed(openmetadata_mock, odcs=self.ODCS_WITH_SERVERS)
+        registrar = OpenMetadataRegistrar(base_url="https://openmetadata.test")
+        odcs_yaml = registrar.fetch_odcs_contract(fqn)
+
+        import yaml as _yaml
+
+        fluid = OdcsProvider().import_contract(_yaml.safe_load(odcs_yaml))
+        assert fluid is not None

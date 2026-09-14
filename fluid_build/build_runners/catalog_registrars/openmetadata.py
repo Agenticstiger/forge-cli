@@ -185,6 +185,82 @@ class OpenMetadataRegistrar(CatalogRegistrar):
             r = c.put("/api/v1/tables", json=body, headers=self._headers())
             r.raise_for_status()
 
+    def fetch_odcs_contract(self, fqn: str) -> Optional[str]:
+        """Read an asset's ODCS contract back out of OpenMetadata.
+
+        The read half of the loop: with this, an OpenMetadata-held contract
+        can drive ``fluid plan`` / ``fluid apply``, which is what makes
+        "OpenMetadata is the registry, FLUID provisions" mechanically true
+        rather than aspirational.
+
+        Two sources, in this order, and the order is the whole point:
+
+        1. ``extension.odcs_contract`` on the Table entity, which
+           :meth:`_build_payload` wrote verbatim. ``extension`` is a
+           free-form JSON object OpenMetadata preserves byte-for-byte, so
+           this round-trips the WHOLE contract.
+        2. ``GET /api/v1/dataContracts/name/{fqn}/odcs/yaml``, the native
+           export. Correct to prefer as a concept, but lossy today:
+           ``ODCSConverter`` never reads or writes ``servers``,
+           ``customProperties``, ``authoritativeDefinitions``, ``price``,
+           ``support``, ``tenant`` or ``slaDefaultElement``, so a contract
+           fetched this way comes back without its physical binding.
+           Reported upstream as open-metadata/OpenMetadata#30493.
+
+        Preferring the extension is therefore not a hack around the API, it
+        is the only source that survives a round trip until that lands.
+        Returns ``None`` when neither yields a contract.
+        """
+        contract = self._fetch_extension_contract(fqn)
+        if contract:
+            return contract
+        return self._fetch_native_odcs(fqn)
+
+    def _fetch_extension_contract(self, fqn: str) -> Optional[str]:
+        """``extension.odcs_contract`` from the Table entity, if present."""
+        from fluid_build.util.safe_http import safe_httpx_client
+
+        try:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
+                r = c.get(
+                    f"/api/v1/tables/name/{fqn}",
+                    params={"fields": "extension"},
+                    headers=self._headers(),
+                )
+                r.raise_for_status()
+                extension = (r.json() or {}).get("extension") or {}
+            value = extension.get("odcs_contract")
+            return value if isinstance(value, str) and value.strip() else None
+        except Exception as exc:  # noqa: BLE001
+            # Class-only: OpenMetadata error bodies can echo the token-bearing URL.
+            LOG.debug("extension contract read failed for %s: %s", fqn, type(exc).__name__)
+            return None
+
+    def _fetch_native_odcs(self, fqn: str) -> Optional[str]:
+        """OpenMetadata's own ODCS export. Lossy; see :meth:`fetch_odcs_contract`."""
+        from fluid_build.util.safe_http import safe_httpx_client
+
+        try:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
+                r = c.get(
+                    f"/api/v1/dataContracts/name/{fqn}/odcs/yaml",
+                    headers=self._headers(),
+                )
+                r.raise_for_status()
+                text = r.text
+            return text if text and text.strip() else None
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("native ODCS read failed for %s: %s", fqn, type(exc).__name__)
+            return None
+
     def _resolve_entity_id(self, fqn: str) -> Optional[str]:
         """Look up OpenMetadata's internal UUID for a table by FQN.
 

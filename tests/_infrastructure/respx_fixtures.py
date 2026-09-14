@@ -424,6 +424,8 @@ class OpenMetadataMockServer:
         #: One entry per ODCS import: {"yaml", "entityId", "entityType", "mode", "headers"}
         self.odcs_contracts: List[Dict[str, Any]] = []
         self.data_contracts_available: bool = True
+        #: Flip off to model a pre-1.10 server for the read path too.
+        self.native_odcs_available: bool = True
 
     def attach(self, router: "respx.Router") -> None:
         router.put("/api/v1/tables").mock(side_effect=self._put_table)
@@ -434,6 +436,10 @@ class OpenMetadataMockServer:
             side_effect=self._get_table_by_name
         )
         router.put("/api/v1/dataContracts/odcs/yaml").mock(side_effect=self._put_odcs_contract)
+        router.get(
+            host="openmetadata.test",
+            path__regex=r"^/api/v1/dataContracts/name/.+/odcs/yaml$",
+        ).mock(side_effect=self._get_native_odcs)
 
     def _put_table(self, request: Any) -> Any:
         import httpx
@@ -452,15 +458,53 @@ class OpenMetadataMockServer:
         return httpx.Response(200)
 
     def _get_table_by_name(self, request: Any) -> Any:
-        """Resolve an FQN to the internal UUID the ODCS import route needs."""
+        """Resolve an FQN to the internal UUID the ODCS import route needs.
+
+        Also serves ``?fields=extension`` for the read path, returning the
+        stored ``extension`` verbatim the way OpenMetadata does.
+        """
         import httpx
 
         self.calls.append("get_table_by_name")
         fqn = request.url.path.split("/api/v1/tables/name/", 1)[-1]
         for index, table in enumerate(self.tables, start=1):
             if table.get("fullyQualifiedName") == fqn:
-                return httpx.Response(200, json={"id": f"om-{index}", "fullyQualifiedName": fqn})
+                body = {"id": f"om-{index}", "fullyQualifiedName": fqn}
+                if "extension" in request.url.params.get("fields", ""):
+                    body["extension"] = table.get("extension") or {}
+                return httpx.Response(200, json=body)
         return httpx.Response(404, json={"message": "table not found"})
+
+    def _get_native_odcs(self, request: Any) -> Any:
+        """OpenMetadata's own ODCS export, modelling its documented lossiness.
+
+        ``ODCSConverter`` never reads or writes ``servers`` and six other
+        top-level blocks, so the native export cannot return them however
+        they were imported. The mock reproduces that so the fallback path
+        is tested against real behaviour rather than an idealised one.
+        """
+        import httpx
+
+        self.calls.append("get_native_odcs")
+        if not self.native_odcs_available:
+            return httpx.Response(404, json={"message": "Not Found"})
+        # A contract only exists for a published asset. Returning one for any
+        # FQN would make "unknown asset" tests pass against a fiction.
+        fqn = request.url.path.split("/api/v1/dataContracts/name/", 1)[-1].rsplit("/odcs/yaml", 1)[
+            0
+        ]
+        if not any(t.get("fullyQualifiedName") == fqn for t in self.tables):
+            return httpx.Response(404, json={"message": "data contract not found"})
+        return httpx.Response(
+            200,
+            text=(
+                "apiVersion: v3.1.0\n"
+                "kind: DataContract\n"
+                "id: native.export\n"
+                "status: active\n"
+            ),
+            headers={"content-type": "application/yaml"},
+        )
 
     def _put_odcs_contract(self, request: Any) -> Any:
         import httpx
