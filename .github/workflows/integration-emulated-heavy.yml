@@ -83,6 +83,19 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # Every test in tests/iac/test_iac_gcp_emulator_e2e.py is a `*_plan_clean`
+      # test: it shells out to `tofu init` + `tofu plan` to prove the emitted
+      # .tf.json is well-formed for the real google provider. Without the binary
+      # all ten skip themselves, and because they skip rather than fail, pytest
+      # still exits 0 — which is exactly how this lane went green while proving
+      # nothing. Same action SHA and tofu version as iac-tests.yml, deliberately:
+      # two lanes disagreeing about the provider version would be worse than
+      # neither running.
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
+        with:
+          tofu_version: 1.12.0
+
       - name: Install with heavy-emulator extras
         run: |
           python -m pip install --upgrade pip
