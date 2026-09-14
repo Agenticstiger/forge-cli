@@ -158,3 +158,87 @@ def test_the_migration_is_still_explained_in_the_source() -> None:
     text = _SCRIPT.read_text(encoding="utf-8")
     assert "api.artificialanalysis.ai" in text, "the reason the source moved was deleted"
     assert "DEPLOYMENT_NOT_FOUND" in text
+
+
+# ---------------------------------------------------------------------------
+# Capabilities. The consumer fails closed, so an absent entry is not "unknown"
+# — it is an assertion that the model can do nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_every_promoted_model_gets_an_entry() -> None:
+    """The defect this section exists for.
+
+    `model_catalog._model_has_capability` walks `models[]` and returns False
+    for anything it cannot find. So promoting a model without adding its entry
+    marks it incapable rather than unknown. Before this, all twelve selections
+    across the three providers were missing.
+    """
+    api = [
+        {
+            "creator": {"slug": creator},
+            "api_model_id": mid,
+            "evaluations": {"intelligence_index": score},
+            "pricing": {"input_per_million_tokens": price},
+        }
+        for creator, mid, score, price in (
+            ("anthropic", "claude-brand-new", 99.0, 10.0),
+            ("anthropic", "claude-cheap", 40.0, 0.5),
+            ("openai", "gpt-brand-new", 98.0, 10.0),
+            ("openai", "gpt-cheap", 39.0, 0.5),
+            ("google", "gemini-brand-new", 97.0, 10.0),
+            ("google", "gemini-cheap", 38.0, 0.5),
+        )
+    ]
+    catalog = umc.build_catalog(api)
+    for provider in ("openai", "anthropic", "gemini"):
+        entry = catalog["providers"][provider]
+        listed = {m["id"] for m in entry.get("models", [])}
+        for role in ("flagship", "balanced", "routing", "default"):
+            selected = entry.get(role)
+            if selected:
+                assert selected in listed, f"{provider}.{role}={selected} has no models[] entry"
+
+
+def test_capabilities_come_from_litellm_when_it_knows() -> None:
+    """The borrow. litellm ships this per model; we were guessing per provider."""
+    caps = umc.capabilities_for("gemini", "gemini-2.5-flash")
+    assert set(caps) == {"structured_output", "tool_use", "streaming"}
+    assert all(isinstance(v, bool) for v in caps.values())
+
+
+def test_an_unknown_model_falls_back_rather_than_claiming_nothing() -> None:
+    """Absence in litellm is not False.
+
+    litellm omits a flag it has no data for. Reading that as "cannot" would
+    mark a capable model incapable — and the consumer already fails closed, so
+    a wrong False here is invisible.
+    """
+    caps = umc.capabilities_for("anthropic", "a-model-litellm-has-never-heard-of")
+    assert caps == umc.DEFAULT_CAPABILITIES["anthropic"]
+
+
+def test_it_survives_litellm_not_being_installed() -> None:
+    """The job installs explicitly; the fallback must hold if that ever drifts."""
+    import builtins
+
+    real = builtins.__import__
+
+    def blocked(name: str, *a: Any, **k: Any) -> Any:
+        if name == "litellm":
+            raise ImportError("simulated")
+        return real(name, *a, **k)
+
+    builtins.__import__ = blocked
+    try:
+        assert (
+            umc.capabilities_for("gemini", "gemini-2.5-flash") == umc.DEFAULT_CAPABILITIES["gemini"]
+        )
+    finally:
+        builtins.__import__ = real
+
+
+def test_the_gemini_default_no_longer_contradicts_litellm() -> None:
+    """The table said structured_output False; litellm reports True for every
+    current Gemini model. Drift a hand-maintained table accumulates."""
+    assert umc.DEFAULT_CAPABILITIES["gemini"]["structured_output"] is True
