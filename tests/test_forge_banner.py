@@ -34,12 +34,26 @@ fails loudly:
   packaged ``roadmap.md`` (via ``importlib.resources``) and surface the
   next milestone — so the banner's "v1.X lands by …" line is auto-derived
   from the doc, not a hand-edited literal in code.
+* **Exhausted roadmap.** Every bundled milestone eventually falls into the
+  past, and until 0.15.0 that case returned the LAST milestone, which the
+  callers then labelled ``next:``. The published wheel advertised
+  ``next: v1.5 . MCP Server . by Jun 11, 2026`` on 2026-09-14 — a target
+  date three months gone, for an output port that same release ships. The
+  tests below inject the date rather than reading the clock, so they pin
+  the behaviour instead of rotting into it.
+* **Version line.** The banner's own version was a hardcoded ``v1.0``
+  while the package shipped 0.15.0. It now reads the distribution
+  version, and a test substitutes that version to prove the coupling is
+  real rather than a literal that happens to match.
 """
 
 from __future__ import annotations
 
 import importlib
+import re
+from datetime import date
 
+import fluid_build
 from fluid_build.cli import forge_banner
 from fluid_build.cli.forge_banner import (
     banner_enabled,
@@ -63,28 +77,84 @@ def test_load_milestones_reads_packaged_roadmap():
     assert milestones[0].version == "v1.2"
 
 
-def test_compact_next_line_mentions_roadmap():
+def test_compact_next_line_mentions_roadmap(monkeypatch):
+    """Positive control, on an injected date that precedes at least one
+    bundled milestone. Reading the real clock here is what made the old
+    version of this test rot: it passed for months by asserting on a line
+    that had quietly become false."""
+    monkeypatch.setenv("FLUID_BANNER_TODAY", "2026-04-25")
     line = compact_next_line()
     assert "fluid roadmap" in line
     # The next-future milestone shifts as milestones ship — assert on
     # the version-prefix shape instead of a specific version, so the
     # test stays green when next_milestone() rolls forward.
-    import re
-
     assert re.search(r"\bv\d+\.\d+\b", line), f"expected v<X>.<Y> in {line!r}"
 
 
 def test_next_milestone_returns_first_future_milestone():
-    """Banner pointer must always be a *future* milestone — once v1.2
-    ships and its target date is in the past, the helper rolls
-    forward to v1.5 automatically."""
+    """The helper returns the EARLIEST milestone not yet reached, not
+    merely some milestone from the file. Pinned against an injected date
+    that sits before every bundled target so the expected answer is
+    computable from the roadmap itself."""
     milestones = load_milestones()
     assert milestones, "expected at least one milestone in roadmap.md"
-    chosen = next_milestone()
+    earliest = min(m.target_date for m in milestones)
+    chosen = next_milestone(today=earliest)
     assert chosen is not None
-    # Either the first future milestone, or — if all are past — the last
-    # known one (so the banner still has something to point at).
-    assert chosen.version in {m.version for m in milestones}
+    assert chosen.target_date == earliest
+
+
+def test_next_milestone_is_none_when_every_milestone_is_past():
+    """The defect, pinned. The loop used to fall through to
+    ``milestones[-1]`` once every target date had passed, so callers that
+    print ``next:`` named a milestone that had already shipped. A day
+    after the last bundled target there is no next milestone, and the
+    honest answer is ``None``.
+
+    The date is injected rather than read from the clock: a test that
+    asserted on ``date.today()`` would have been green on the day it was
+    written and silently meaningless afterwards, which is precisely how
+    the original defect survived a release."""
+    milestones = load_milestones()
+    assert milestones, "expected at least one milestone in roadmap.md"
+    latest = max(m.target_date for m in milestones)
+    day_after = date.fromordinal(latest.toordinal() + 1)
+    assert next_milestone(today=day_after) is None
+
+
+def test_next_milestone_returns_milestone_on_its_own_target_date():
+    """Boundary: the comparison is ``>=``, so a milestone is still "next"
+    on the day it is due. Pinning this keeps a future fix for the
+    all-past case from tightening the comparison to ``>`` and silently
+    dropping a milestone a day early."""
+    milestones = load_milestones()
+    latest = max(m.target_date for m in milestones)
+    chosen = next_milestone(today=latest)
+    assert chosen is not None
+    assert chosen.target_date == latest
+
+
+def test_shipped_milestone_is_never_advertised_as_next(monkeypatch):
+    """End-to-end form of the reported defect, on the reported date.
+
+    On 2026-09-14 the published wheel printed
+    ``next: v1.5 . MCP Server . by Jun 11, 2026``. Every bundled
+    milestone was in the past, and the MCP output port named by that line
+    had already shipped. ``compact_next_line`` must now produce nothing
+    at all, which is what makes the callers (``fluid --version`` and
+    ``fluid version``, both of which guard on a falsy line) drop the
+    teaser instead of printing a stale promise."""
+    monkeypatch.setenv("FLUID_BANNER_TODAY", "2026-09-14")
+    assert compact_next_line() == ""
+
+
+def test_compact_next_line_empty_when_roadmap_is_exhausted(monkeypatch):
+    """Same contract, stated against the roadmap rather than one date, so
+    it survives a future edit to ``roadmap.md`` that adds milestones."""
+    latest = max(m.target_date for m in load_milestones())
+    day_after = date.fromordinal(latest.toordinal() + 1)
+    monkeypatch.setenv("FLUID_BANNER_TODAY", day_after.isoformat())
+    assert compact_next_line() == ""
 
 
 # ----------------------------------------------------------------------
@@ -230,8 +300,47 @@ def test_print_v2_banner_emits_when_active(monkeypatch, capsys):
     print_v2_banner("forge_data_model")
     captured = capsys.readouterr()
     combined = captured.out + captured.err
-    assert "forge-cli v1.0" in combined
+    assert f"forge-cli v{fluid_build.__version__}" in combined
     assert "fluid roadmap" in combined
+
+
+def test_banner_version_line_tracks_the_installed_package(monkeypatch, capsys):
+    """The header used to read a hardcoded ``forge-cli v1.0`` while the
+    package shipped 0.15.0, so the banner and ``fluid --version``
+    disagreed about the same binary in the same session.
+
+    Substituting the distribution version proves the coupling is real: a
+    literal that merely happened to match the current version would fail
+    this test."""
+    monkeypatch.delenv("FLUID_QUIET", raising=False)
+    monkeypatch.delenv("FLUID_NONINTERACTIVE", raising=False)
+    monkeypatch.setenv("FLUID_BANNER", "1")
+    monkeypatch.setenv("FLUID_BANNER_TODAY", "2026-04-25")
+    monkeypatch.setattr(fluid_build, "__version__", "9.9.9-testpin")
+    print_v2_banner("forge_data_model")
+    combined = "".join(capsys.readouterr())
+    assert "forge-cli v9.9.9-testpin" in combined
+    assert "v1.0" not in combined
+
+
+def test_print_v2_banner_silent_when_there_is_no_next_milestone(monkeypatch, capsys):
+    """The printer's ``milestone is None`` guard, pinned directly.
+
+    The banner carries its own expiry (2026-05-07), which lands before
+    the last bundled target date, so the two conditions cannot be reached
+    together through the calendar alone — substituting the lookup is the
+    only way to exercise the guard. It matters because the guard is what
+    stops the banner printing a headline with a blank milestone line if
+    the roadmap is ever emptied."""
+    monkeypatch.delenv("FLUID_QUIET", raising=False)
+    monkeypatch.delenv("FLUID_NONINTERACTIVE", raising=False)
+    monkeypatch.setenv("FLUID_BANNER", "1")
+    monkeypatch.setenv("FLUID_BANNER_TODAY", "2026-04-25")
+    monkeypatch.setattr(forge_banner, "next_milestone", lambda *a, **k: None)
+    print_v2_banner("forge_data_model")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_print_v2_banner_silent_after_expiry(monkeypatch, capsys):
