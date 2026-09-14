@@ -445,7 +445,7 @@ class SovereigntyValidator:
                 )
 
             # Check 3: Jurisdiction match
-            if jurisdiction and jurisdiction != "Global":
+            if jurisdiction and jurisdiction not in UNCONSTRAINED_JURISDICTIONS:
                 region_jurisdiction = region_jurisdiction_map().get(region, "Unknown")
                 if region_jurisdiction != jurisdiction and region_jurisdiction != "Global":
                     # "Unknown" is an inability to evaluate, not a violation, and

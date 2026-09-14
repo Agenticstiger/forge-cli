@@ -7,69 +7,526 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
 
-- **The emulated integration lane reported success while proving almost
-  nothing.** `integration-emulated-heavy.yml` selected 54 tests by marker and
-  provisioned an emulator for 3 of them: it started LocalStack but never the
-  GCP emulator compose stack, so 15 GCP tests skipped themselves inside a job
-  named for them, and pytest exited 0. Measured before/after on the same
-  commit: **3 passed / 53 skipped → 17 passed / 38 skipped**, keyless, no
-  token. The lane now starts the GCP stack it advertises, and
-  `scripts/ci/assert_lane_coverage.py` fails it unless every provisioned area
-  contributed a passing test.
-- **That lane had also not run at all since 2026-07-13.** Its
-  `ci:integration-emulated` label is stripped on every push by
-  `integration-label-guard.yml`, so the vouch had to be re-applied and
-  re-approved per push; the single run that reached the queue waited twelve
-  days for a required reviewer and was cancelled. It now runs nightly at
-  05:00 UTC unattended, keeping the label for the pull-request path where a
-  maintainer vouch is the point. `actionlint.yml` gained a check that the
-  label condition and its guard both still exist, since that is now the
-  control gating un-reviewed PR code.
-- **A missing `LOCALSTACK_AUTH_TOKEN` no longer passes silently on the
-  nightly.** The skip-clean behaviour stays for pull requests and manual runs;
-  on the cron a missing token fails with the `gh secret set` command that
-  fixes it. An auth token that silently expires is how a sibling lane in
-  another repo stayed dead across four commits.
-- **The lane-coverage guard could be satisfied by a file that merely extended the
-  needle.** It matched by substring, so a trivially-passing
-  `..._happy_path_stub.py` would have marked `..._happy_path.py`'s area covered
-  with no emulator running — the silent-green it exists to prevent. Matching is
-  now anchored. A second bug in the same function stripped `.py` globally rather
-  than as a suffix, mangling a dotted module like `tests.pytest_helpers` into
-  `teststest_helpers`; that one failed safe (a red lane) but would have produced
-  a baffling MISS eventually. Both pinned by tests.
-- **The label gate is now enforced by parsing the workflow, not grepping it.**
-  `scripts/ci/check_env_label_gate.py` replaces a whole-file `grep` that proved
-  only that the label expression appeared somewhere in the file. A third job
-  added later with `environment: integration-emulated` and no label condition
-  would have passed that grep while running on every pull request with the
-  secret in scope. Since the environment no longer carries a required-reviewer
-  rule, this gate is load-bearing, so it is tested rather than assumed.
-- **LocalStack image pinned to `2026.08.2`**, per the repo's
-  fully-pinned-container convention. It was tracking `stable`, which moved
-  while the lane was dormant.
+## [0.15.0] — 2026-09-14
 
-- **Release image: two CPython `tarfile` CVEs suppressed with justification.**
-  Both are fixed only in CPython pre-releases, so no stable base image clears
-  them. A curated `.grype.yaml` records each with its reachability argument —
-  the single `extractall` call is guarded by `_safe_tar_members`, which raises
-  on symlink and hardlink members, and no streaming (`"r|"`) mode is used
-  anywhere — so the release gate no longer fails on an unfixable finding.
+A sovereignty enforcement release, and the one whose upgrade notes matter. Five
+things can break an existing user. A contract that passed `fluid validate` on
+0.14.1 can fail here, because data-residency controls that reported clean while
+checking nothing now actually block: a pinned `jurisdiction` is enforced against
+the binding region, the engine's defaults now match the schema's stricter ones,
+and the region table no longer places London in the EU. A jurisdiction-pinned
+contract makes `fluid mcp output-port serve` refuse to start on the default stdio
+transport, and on HTTP with no auth mode set. The MCP SDK ceiling widens from
+`<2.0` to `<3.0`, so a fresh `pip install` resolves the 2.x generation, where a
+client can no longer self-attest identity through `clientInfo` extras. Federation
+digests for a `git_registry` upstream are computed differently, so a
+`consumes[].upstreamDigest` pinned on 0.14.1 reads as drift and aborts
+`fluid apply`. And DataHub `customProperties` keys lose their dots
+(`fluid.layer` → `fluid_layer`), so anything keyed on the old spelling must be
+updated.
+
+### Security
+
+- **`FLUID_MCP_JWT_CLAIM_MAPPING` merges over the default claim mappings instead of
+  replacing them.** `AuthValidator.from_env` assigned the parsed value wholesale, so
+  mapping one extra claim silently dropped `sub`, `model`, `use_case` and
+  `tenant_id` — switching off the `agentPolicy` gate and emptying every
+  `${caller.*}` row filter, with no error and a server still reporting healthy.
+  0.14.1 named this as the reason a custom mapping could be self-attested past
+  (#492). Mapping a default away explicitly still works. (#574)
+- **Integration CI jobs no longer inherit a token that mints cloud credentials.**
+  `integration.yml` granted `id-token: write` and `issues: write` at the workflow
+  level, which every job without its own `permissions:` block inherits: all eight
+  held both, three need either. That token federates into GCP and assumes an AWS IAM
+  role, and it mattered most for `multi-lang-mcp-conformance`, which executes
+  third-party code at build time with no lockfile. The floor is now
+  `contents: read`, with each job declaring what its own steps call. (#586)
 
 ### Added
 
+- **Caller-jurisdiction enforcement at query time in the MCP output port — on by
+  default, fail-closed, verified-claims-only, derived from the contract's own
+  `sovereignty` block.** A contract declaring `jurisdiction: EU` used to refuse to
+  provision into `us-east-1` and then answer a tool call from a caller sitting
+  there; the gate is now live on every `fluid mcp output-port serve`, with no flag
+  either way, keyed on a pinned `jurisdiction` with `crossBorderTransfer` unset or
+  false. Every escape hatch is in the contract — `crossBorderTransfer: true`,
+  `jurisdiction: Global` or `Multi-Region`, or no `jurisdiction` at all — so every
+  contract that never pinned one is entirely unaffected, policy digest included. A
+  claim binds only when verified, read from what the HTTP middleware stamps after
+  validating a JWT or mTLS identity and never from self-attested `clientInfo`;
+  matching is exact and case-sensitive. **Newly blocking:** a jurisdiction-pinned
+  contract refuses to serve at startup with exit 2 on the two deployments that could
+  never satisfy the rule — `--transport stdio`, the default, which carries no
+  headers, and `--transport http` with `FLUID_MCP_AUTH_MODE` unset — each message
+  naming the jurisdiction and the command that fixes it. `jurisdiction` also joins
+  the default JWT claim mappings, and is the one default whose absence closes the
+  gate: an operator whose IdP names the claim differently is locked out until they
+  map it. (#574, #576, #581)
+- **`agentPolicy` decisions come from one function, with a closed reason vocabulary
+  and a policy digest.** `fluid_build/policy/decision.py` owns `decide()`, a
+  `ReasonCode` str-enum over all eleven outcomes, and `CHECK_ORDER` — precedence as
+  data rather than as an accident of statement order. Wire values stay the existing
+  kebab-case strings, so a caller comparing against `"tool-not-allowed"` keeps
+  working, but `ReasonCode("invented")` now raises. `policy_digest()` is a
+  `"<scheme>:<sha256>"` over the RFC 8785 canonical form of the effective rule
+  lists, sorted and de-duplicated so authoring order cannot change it, with `None`
+  and `()` digesting differently. 35 portable vectors ship inside the wheel at
+  `policy/data/vectors/agent-policy-vectors.json`, `rfc8785` is a new runtime
+  dependency, and the module is enrolled in `mypy --strict`, since a silent `Any` in
+  a gate that decides data access is a silent allow. (#568, #574)
+- **The MCP gateway's audit record names which rules produced a decision, not just
+  where they came from.** `policySource: contract` cannot distinguish the contract
+  before an `allowedModels` edit from the contract after it, so once the contract
+  moved on a denial was no longer reconstructable. Every `data_access` event, allow
+  and deny alike, now carries `policyDigest`, a `jcs-sha256:<hex>` that hashes
+  identically however the YAML was written. **Additive:** one new key, nothing
+  renamed, retyped or removed, so only a reader validating against a closed key set
+  notices; it completes the digest #568 introduced, which was written into no record.
+  (#591)
+- **An ODCS contract can be read back out of the OpenMetadata catalog.** The
+  registrar could publish an ODCS document and not retrieve one, so a contract held
+  in the catalog could not drive `plan` / `apply`; `fetch_odcs_contract(fqn)` closes
+  the read half. It prefers the table's `extension.odcs_contract`, preserved
+  verbatim, over OpenMetadata's native ODCS export, whose converter drops `servers`
+  and six other top-level blocks (open-metadata/OpenMetadata#30493), and keeps that
+  route as the fallback for a contract fluid did not publish. No command calls it
+  yet: this is the library half, and nothing in the CLI behaves differently. (#588)
+- **A validate-time gate for GCP bindings the IaC emitter cannot resolve.**
+  `fluid validate` now reports a GCP expose that would emit no resource, resolved
+  through the emitter's own dispatch so it can neither block a contract that would
+  have emitted nor pass one that emits nothing. Only a format that *names* a
+  container while omitting the location key it needs is an error — in practice
+  `format: gcs_file` with no `location.bucket`; everything else is a warning, since
+  `fluid validate` runs for contracts that never reach `fluid generate iac`. Formats
+  with no `hashicorp/google` resource by design stay silent, and Iceberg exposes are
+  left to the Iceberg gate. (#580)
 - **Snowflake is now exercised over the real wire protocol, keyless.**
   `tests/providers/test_snowflake_server_emulated_happy_path.py` runs the
   **unpatched** snowflake-connector-python against fakesnow's server
   (`fakesnow[server]`, Apache-2.0) — real login, real query submission, real
-  result-set decoding, and `SnowflakeConnection._initialize_session`'s `USE`
-  statements reaching an endpoint for the first time. The existing in-process
-  `fakesnow.patch()` test could not cover any of that, because it replaces the
-  connector rather than talking to it. Runs on every PR including forks, at no
-  cost; LocalStack for Snowflake was considered and rejected as a separate
-  licence ($29–35/user/month) for what this covers at $0.
+  result-set decoding, and `_initialize_session`'s `USE` statements reaching an
+  endpoint for the first time. The in-process `fakesnow.patch()` test could cover
+  none of that, because it replaces the connector rather than talking to it. Runs on
+  every PR including forks, at no cost. (#595)
+- **A runnable sovereignty and platform-swap example corpus.**
+  `examples/sovereignty-platform-swap/` carries one contract compiled against AWS,
+  Google Cloud and Snowflake with the `binding` block as the only difference between
+  the three files, plus a README walking `validate` → `policy-check` → three
+  `generate iac` runs → the ODPS/ODCS export. Re-run from this checkout, AWS emits
+  three resources, GCP two and Snowflake three, exactly as the README claims. The
+  contracts declare `fluidVersion 0.7.6`, a preview version: validatable because
+  they name it explicitly, never the default for an untagged contract. (#556)
+
+### Changed
+
+- **The MCP SDK ceiling moves from `<2.0` to `<3.0`, so a fresh install resolves the
+  2.x generation.** `mcp` is a core dependency, not an extra, so
+  `pip install data-product-forge` picks up 2.x from here on; an existing environment
+  does not move until it is upgraded, and pinning `mcp>=1.20,<2.0` still works. The
+  dual-support seam shipped in 0.14.1 (#492); what changed is the audit that lets the
+  ceiling follow it. `tests/test_mcp_sdk_rename_guard.py` parses the 21 modules that
+  import the SDK or live in forge's own MCP packages and asserts that none of the
+  twelve renamed field names it tracks is read by its camelCase spelling, which on
+  2.x returns the default instead of raising — so an error reads as success and a
+  schema reads as empty. That is a static scan, not a behavioural proof; the 0.14.1
+  note that a dozen read sites fail silently under 2.x described the danger rather
+  than the state, since those sites closed when dual support landed. The drift
+  canary's `range-max` leg now installs `mcp>=1.20,<3.0`, resolves to 2.x and is no
+  longer warn-wrapped, selects with `pytest -k mcp tests/` rather than a hand-kept
+  list that had drifted, and asserts per leg which SDK major it installed. **One
+  behaviour difference survives the widening:** on 1.x a client can self-attest
+  identity (`model`, `useCase`, tenant attributes) as extra fields on `clientInfo`,
+  because v1's `Implementation` is `extra="allow"`, while 2.x drops unknown fields at
+  wire-parse. Forge's own clients go through
+  `_mcp_compat.self_attesting_client_kwargs` and are unaffected, but a third-party
+  client hard-coded to that shape stops being attested with no error; move it to the
+  client's declared capabilities under `experimental.fluid`, which both generations
+  parse. Self-attestation does not bind when authentication is enforced in any case
+  (#492). (#604)
+- **The sovereignty engine's defaults now mirror the schema's, which makes them
+  stricter.** Every bundled schema from 0.7.1 to 0.7.6 declares
+  `enforcementMode: strict`, `dataResidency: true` and `crossBorderTransfer: false`,
+  while the engine defaulted to advisory / false / true — the permissive inverse of
+  all three, so a strict GDPR contract with exposes in `eu-west-1` and `us-east-1`
+  printed `PASS`. The three values are now constants read by both the engine and the
+  display, pinned against the bundled schema. This is the entry most likely to be
+  felt on upgrade, because `fluid validate` shares this engine with `fluid plan`: a
+  contract that declares `sovereignty` while omitting those keys is judged under
+  strict residency and can newly fail a stage it passed on 0.14.1 — an
+  `allowedRegions` mismatch that warned now errors, and `dataResidency: true` with
+  exposes in two jurisdictions now trips the cross-border check where 0.14.1 said
+  nothing. Declaring the keys explicitly restores the old evaluation. (#510)
+- **A resource-free OpenTofu module is now an error, and `--allow-empty` opts out.**
+  Nothing downstream can catch one — `tofu validate` calls it valid — so
+  `fluid generate iac` fails with `generate_iac_empty_module` instead of warning and
+  exiting 0, naming the `binding.location` fields to check plus the `fluid validate`
+  gates that name the missing field. Pass `--allow-empty` when a module that
+  provisions nothing is intended. (#546)
+- **Internal, no runtime change — the weekly model-catalog refresh fetches from
+  OpenRouter and needs no API key.** `scripts/update_model_catalog.py` is maintainer
+  tooling, pruned from the sdist and imported by nothing in `fluid_build`, so no
+  credential is asked of a user and the CLI makes no such call; the old host is
+  undeployed, so the job could never have worked with or without the key it asked
+  for. OpenRouter's public `/api/v1/models` republishes the `intelligence_index`
+  alongside pricing, the two signals the selector ranks on, and degradation stays
+  quiet: nothing rankable means a stderr warning, the committed catalog untouched and
+  exit 0. Three deliberate drops at the fetch boundary — priced variants (`:batch`,
+  `:free`), models with no intelligence index, and `gpt-oss`, unreachable by the
+  OpenAI adapter — plus a family-prefixed `TRACKED_MODEL_PREFIXES`, which had listed
+  ids OpenAI no longer ships and so skipped that provider in silence. Capabilities
+  for a promoted model now come from `litellm.model_cost` read in-process, falling
+  back to the per-provider `DEFAULT_CAPABILITIES` table wherever litellm omits a
+  flag, because an omitted flag means no data and not "cannot" — without it a freshly
+  promoted flagship would report `structured_output=False`, a wrong `False` that
+  fails closed. `fluid_build/cli/llm_models.json` is byte-identical to 0.14.1: this
+  lets a refresh be proposed, it is not one. (#593, #594)
+- **CI:** routine pinned-action bumps — seventeen of them, including two majors
+  (`actions/stale` 10.4.0→11.0.0, `actions/labeler` 6.2.0→7.0.0) and
+  `github/codeql-action/upload-sarif` 4.37.9→4.38.0. Workflow files only; no runtime
+  dependency moved. A `semver-major` ignore on `mcp` was added while the SDK audit
+  was open and removed when it closed, so the shipped `dependabot.yml` carries no
+  `mcp` entry, the same as 0.14.1. Also back-fills the `[0.14.1]` changelog section
+  that tag shipped without, and points the README's latest-version line at it. (#502,
+  #503, #504, #505, #507, #508, #521, #522, #523, #524, #525, #549, #550, #552, #565,
+  #566, #567, #600, #603, #604)
+- **Internal, no runtime change:** a terminology gate,
+  `tools/product_guardrail/check.py`, now runs in the CI lint job and as
+  `make guardrail`, checking the repo's prose against a vendored canon it verifies
+  offline; its first run found the two entity misses below, and follow-ups closed
+  three hook defects (an owner approval discarded after a 600-second TTL, an unlocked
+  read-modify-write in the grace recorder, and a hardcoded `.git/hooks` that installs
+  nothing in a worktree). The BigQuery emulator now seeds its full project set from
+  `--data-from-yaml`, so four tests stop 404'ing against a container that was up and
+  serving; `fluid verify` gained its first live-cloud GCP coverage in both
+  directions; and `HONESTLY_TESTED.md` lost a claim its own deferred section
+  contradicted, pinning the Snowflake CLI matrix at 2 of 6 in both places. The
+  multi-language MCP conformance nightly also passes for the first time since it was
+  added, every defect having been in the harness rather than the gateway; the Go and
+  Rust clients attest no caller identity at all, so their deny scenarios passed
+  vacuously and are now gated off behind `RUN_MULTILANG_GO_RUST` rather than deleted,
+  pending #583. (#512, #547, #561, #562, #563, #584)
+- **Internal, no runtime change:** the guards that now keep the emulated lane honest,
+  plus four unrelated pieces of CI and test debt.
+  `scripts/ci/assert_lane_coverage.py` fails that lane unless every provisioned area
+  contributed a passing test, and a security review of it found two bugs of the class
+  it exists to catch — substring matching, which a trivially-passing
+  `..._happy_path_stub.py` would have satisfied with no emulator running, and a
+  global rather than suffix `.py` strip — both now anchored and pinned by tests. The
+  label gate standing in for the removed required-reviewer rule is enforced by
+  `scripts/ci/check_env_label_gate.py`, which parses the workflow instead of grepping
+  it; a missing `LOCALSTACK_AUTH_TOKEN` fails the nightly with the `gh secret set`
+  command that fixes it while pull requests and manual runs still skip clean; and the
+  LocalStack image is pinned to `2026.08.2` after tracking `stable` through the
+  dormancy. Elsewhere: the two GCP emulator SDK probes hardcoded their dataset and
+  bucket names, so a repeat create against a warm container failed like a network
+  problem rather than an API-fidelity gap, fixed with the UUID suffix the rest of the
+  tier already used; `iac-tests.yml`'s two Stage 3 jobs are now gated on an
+  `IAC_STAGE3_ARMED` repository variable instead of failing at the OIDC step for
+  credentials nobody has set, every scheduled run having been red for at least eight
+  days; and two suites flaky under `-n auto` were fixed by patterns already in the
+  repo, the UX wall-clock budgets moving to `tests/perf/` with no threshold changed
+  and four Hypothesis file-IO properties gaining their sibling's `deadline=None`. The
+  leftovers: two always-xpassing `xfail` markers removed so the tests assert again,
+  two SC2034 wait-loop warnings turned into elapsed-time reporting, and the
+  deliberately unquoted `${CHANGED}` in the secret-scan step given a written
+  `shellcheck disable=SC2086`, since quoting it passes one impossible filename and
+  scans nothing. (#590, #595, #597, #601, #605)
+
+### Fixed
+
+- **`sovereignty.enforcementMode` now means what the schema says it means, and it had
+  failed in both directions at once.** Check 3, the only check that reads
+  `jurisdiction`, hardcoded `severity="warning"` and so could not block in any mode,
+  while check 4's cross-border mismatch hardcoded `severity="error"` and failed the
+  build under advisory — `cli/validate.py` routes on the rendered ❌ / ⚠️ / ℹ️ prefix,
+  which the returned boolean could not override. Severity is now one function of the
+  mode (strict → error, advisory → warning, audit → info) across checks 2, 3 and 4,
+  and `is_valid` is `not has_errors` in every mode, rather than re-applying the mode
+  and letting `is_valid=True` return alongside an error. Two carve-outs stand:
+  `deniedRegions` is an error in every mode, and an unmappable region stays a warning
+  under strict, because "unknown" is an inability to evaluate rather than a
+  violation. **Newly blocking:** a contract pinning `sovereignty.jurisdiction` whose
+  binding region resolves elsewhere now fails `fluid validate` with exit 1 under
+  strict, the default. `jurisdiction: Global` was already skipped. (#569)
+- **`jurisdiction: Multi-Region` is treated as the catch-all it is.** It is a valid
+  value in every bundled schema's `$defs.sovereignty` enum, but check 3 compared it
+  to the region's resolved jurisdiction by equality and special-cased only `Global`,
+  so nothing could ever satisfy it: no region resolves to `Multi-Region`, because it
+  is not a place. Harmless while check 3 was hardcoded to `warning`; once the mode
+  decides severity and strict is the default, it would have refused every region such
+  a contract could name. Check 3 now reads the same `UNCONSTRAINED_JURISDICTIONS`
+  constant the query-time caller gate uses, so both paths agree on what a catch-all
+  means. Enforcement is otherwise unchanged: a contract pinning `EU` with an expose
+  in `us-east-1` still fails under strict. (#606)
+- **The region→jurisdiction table is derived from the vendors' own data instead of
+  hand-kept, and it had said London was in the EU.** 31 hand-typed regions mapped
+  `eu-west-2` and `europe-west2` — both London — to `EU`, and `Global` was worse,
+  since check 3 skips any region whose jurisdiction is `Global`, making
+  `ap-southeast-1` (Singapore), `ap-northeast-2` (Seoul) and `asia-southeast1`
+  pass-anything wildcards. AWS regions now resolve through botocore's shipped
+  `endpoints.json`, all eight partitions including GovCloud and the EU Sovereign
+  Cloud, and GCP and Azure through CSVs vendored from `dgl/cloud-regions` (ODbL-1.0,
+  recorded in `NOTICE`), with `VENDORED_CORRECTIONS` filling three rows upstream
+  ships empty: 31 hand-written entries became 121 resolved and 0 hand-written,
+  nothing resolves to `Global` or `Unknown`, and resolution is lazy so `fluid --help`
+  imports no botocore. The AWS provider kept a second table that had drifted on 16
+  regions, so `fluid validate` and the provider could reach opposite verdicts on one
+  contract; it now delegates. Identity, not adequacy: the UK and Switzerland hold
+  GDPR adequacy decisions, but a contract asking for `jurisdiction: EU` has not asked
+  for the UK. Also folded in: `cli/init_scan.py` emitted a sovereignty block that
+  failed its own schema, so `fluid import` handed back a contract `fluid validate`
+  rejected. **Newly blocking**, with #569: an EU-pinned contract bound to London,
+  Singapore or Seoul passed 0.14.1 silently and now fails, while a `UK`-pinned
+  contract bound to `eu-west-2` stops being a false positive. (#514)
+- **AWS enforces residency from the key that actually holds it, and stops writing a
+  module after refusing a contract.** The AWS util read the allow-list *out of* the
+  boolean `sovereignty.dataResidency` rather than the sibling `allowedRegions`, so
+  `true` — the schema default, and what the repo's own `eu-customer-data-gdpr`
+  example writes — raised `TypeError` while `false` skipped the check in silence: the
+  strict setting broke and the permissive one worked. `allowedRegions` is now
+  enforced whatever the boolean says, `deniedRegions` is honoured for the first time,
+  and the two non-schema shapes in the wild are read as a warned fallback, never
+  merged in. The same confusion reached the cloud tags, where one tag read
+  `fluid:allowed_regions = "allowedRegions"` — tags an AWS Config rule or a tag-based
+  SCP keys on. Separately, `fluid generate iac` swallowed the provider's sovereignty
+  veto in a best-effort `except Exception` and emitted `main.tf.json` anyway; the
+  veto is now recognised through the `__cause__` chain and re-raised, and
+  `_validate_sovereignty` no longer catches only `SovereigntyViolationError`, which
+  had let every `ResidencyViolationError` — a sibling, not a subclass — skip the
+  `sovereignty_violation` audit event. **Newly blocking:** an AWS contract binding
+  outside its own `allowedRegions`, or an EU-jurisdiction contract bound to
+  `us-east-1`, exits 1 and writes no module, where 0.14.1 wrote it with exit 0.
+  (#513)
+- **A `--provider` that contradicts the contract's binding is rejected before
+  anything is written.** `fluid generate iac --provider gcp` on an AWS- or local-bound
+  contract emitted a resource-free `main.tf.json` and exited 0, and `--validate` made
+  it worse, since `tofu validate` reports success for a configuration with no
+  resources: the operator generated, validated, saw green and had provisioned
+  nothing. `--provider` disambiguates a contract that spans clouds or declares none;
+  retargeting is done by editing `binding`. The requested provider must now be among
+  the clouds the contract declares, and the same gate covers `fluid apply
+  --provider`, which had reported `tofu plan: +0 ~0 -0` with exit 0. (#546)
+- **`fluid plan --check-sovereignty` no longer prints `PASS` for a check it never
+  ran.** `AwsProvider` has no public `validate_sovereignty` hook, so the helper
+  returned an empty violation list, which rendered as `PASS` on a contract
+  `fluid validate` rejects with two residency errors; a hook that *raised* was
+  indistinguishable from one that found nothing, because `invoke_hook` swallows the
+  exception. The helper now returns `None` for "no usable verdict", and a new
+  reporter tries the provider hook, then the built-in policy engine, before reporting
+  `NOT CHECKED`, always naming which answered. Since no shipped provider implements
+  the hook, a contract declaring a `sovereignty` block that printed a bare `PASS` on
+  0.14.1 now gets a real verdict, and a failing one **exits 1** where 0.14.1 exited 0
+  (the plan file is still written); a contract with no `sovereignty` block prints
+  `NOT CHECKED` and still exits 0. (#510)
+- **The cross-border transfer check is order-independent, and a gap in our own region
+  table no longer blocks a valid deployment.** `None` meant both "no baseline
+  jurisdiction yet" and "this region has no known jurisdiction", so the verdict
+  depended on declaration order: `eu-west-1` plus `eu-south-1` (both EU, the latter
+  unmapped) was blocked, the same pair reversed passed, and two unmapped regions in
+  different jurisdictions passed as clean. An unknown jurisdiction is now its own
+  warning-severity finding that never seeds the baseline, and the check moved out of
+  the per-expose loop, where it emitted one duplicate error per expose. (#510)
+- **Git-backed federation digests were the raw-text fallback on every call, and
+  fixing it changes the digest value.** `_fetch_digest_via_git` imported
+  `compute_contract_digest` inside a `try/except`, and that function existed nowhere
+  in `fluid_build` — absent at both v0.14.1 and the 0.15.0 branch point — so every
+  call took the except branch and hashed the raw contract bytes. A raw-text hash
+  makes key order, indentation, quoting style, comments and CRLF look like upstream
+  drift, the one thing `upstreamDigest` pinning exists to tell apart from a real
+  change. The helper now exists and is imported at module scope, hashing the *parsed*
+  mapping as NFC-normalised, sorted compact JSON and sharing one canonical form with
+  `compute_plan_digest`; an unparseable upstream contract returns `None`, which the
+  caller escalates to a violation, so federation fails closed instead of degrading.
+  **Upgrade note, and a silent one:** for a `git_registry` upstream a
+  `consumes[].upstreamDigest` pinned against the old value now reads as drift and
+  `fluid apply` aborts with `apply_consumes_drift`, exit 1, before any DDL — re-pin
+  those rows, or use `--no-verify-federation`. Two caveats: the per-workspace cache
+  at `.fluid/federation/<workspace>.digest-cache.json` has no expiry check, so a
+  machine already holding an entry keeps returning the 0.14.1 value until it is
+  cleared, and only `git_registry` is affected, since `catalog` and `http_registry`
+  read a digest off the remote. (#587)
+- **A contract published to a default DataHub install was readable nowhere, and the
+  `customProperties` keys change spelling.** One commit shipped two contradictory
+  specifications, name for name: the unit suite asserted `fluid_contract`,
+  `odps_spec` and the ODCS blob were *forbidden* there, the integration suite that
+  they were *required* — and the unit suite ran on every pull request and pinned the
+  implementation while the integration suite needed a live GMS and had never once
+  run. Neither was right: the "link, don't inline" design rests on a spec URL that is
+  `None` unless `spec_source_base_url` is configured, a field set by no factory and
+  documented nowhere, while `DataContract.rawContract` is absent from the OSS GraphQL
+  schema — so on a default install the contract was neither inlined, nor linked, nor
+  readable. `_specs_are_linkable` now decides in one place: large YAML is linked when
+  a base URL exists and inlined when it does not. **Key rename to know about:**
+  `fluid.layer` → `fluid_layer`, `fluid.productType` → `fluid_product_type`,
+  `fluid.version` → `fluid_version`, plus a new `fluid_domain`, matching the
+  underscore spelling the other emitters use; DataHub was the only one using dots, so
+  a saved search, dashboard or ingestion rule keyed on the dotted names must be
+  updated, while structured properties keep their dotted `qualifiedName`, a different
+  namespace. Expect larger entity payloads too: with no `spec_source_base_url` set,
+  the dataset aspect carries `odcs_contract` and the DataProduct aspect
+  `fluid_contract` and `odps_spec` inline. (#596)
+- **The `agentPolicy` composite gate reports the reason its own docstring promised.**
+  `check_tool_call` documented tool denylist > tool allowlist > model denylist >
+  use-case denylist > model allowlist > use-case allowlist, then evaluated the whole
+  model stage before the use-case stage, so a request whose model was merely absent
+  from an allowlist and whose use case was explicitly denied reported
+  `not-in-allowedModels` where the prose above promised `in-deniedUseCases`.
+  Precedence is now data in `CHECK_ORDER`, pinned by the conformance vectors. No
+  verdict changes across 1,728 policy and request combinations, but 48 reason codes
+  differ, all `not-in-allowedModels` becoming `in-deniedUseCases` — operators routing
+  alerts or dashboards on those two strings should re-check their rules. (#568)
+- **Anticipated `forge_run` failures reached the IDE as "Error executing tool
+  forge_run" on MCP SDK 2.x.** All six raise sites used a bare `RuntimeError`, which
+  1.x passed through intact but 2.x treats as a crash, substituting that generic
+  string; the call still returned `isError: true`, so the only thing lost was the
+  part that helped — an operator on an IDE without the `sampling` capability got the
+  generic sentence instead of the message naming that capability and its two ways
+  out, `mode='blank'` or `fluid forge --agent --blank`. All six now raise the SDK's
+  `ToolError` through the new `_mcp_compat.get_tool_error()`, since the class moved
+  package between generations, with a function-local import so `mcp` stays off the
+  `fluid --help` cold path. `forge_run` is the only tool on that server that raises,
+  so this is the whole surface. (#602)
+- **Every schema is now validated with the dialect it declares.** `Draft7Validator`
+  was pinned at three call sites, and Draft 7 ignores keywords it does not recognise
+  rather than rejecting them, so `fluid validate-artifacts` reported ODCS documents
+  clean that the published standard rejects: the vendored ODCS 3.1.0 schema declares
+  2019-09 and guards nine objects with `unevaluatedProperties: false`, so a typo'd
+  key in a `servers[]` entry validated with zero errors, and `schema[].properties[]`
+  lost its `required: ["name"]` check. Both now fail, naming the offending key. The
+  change only tightens — 20 documents generated across ten example contracts validate
+  identically under both dialects, so only hand-authored or third-party artifacts can
+  newly go red. Two things went with it: the try/except around the old validator was
+  dead code, and the jsonschema probe no longer names the deprecated `RefResolver`,
+  an ImportError on which sets `JSONSCHEMA_AVAILABLE = False` and makes validation
+  skip rather than error. `extension_schemas.py` keeps Draft 7 deliberately. (#582)
+- **A GCP expose resolves to its target from the whole binding, not from
+  `binding.format` alone.** The emitter dispatched on five `format` spellings, two of
+  which appear in no shipped schema, while the one schema-valid Cloud Storage
+  spelling (`gcs_file`) matched none of them — so
+  `{platform: gcp, format: gcs_file, location: {bucket: acme-raw}}` validated clean
+  and emitted nothing, a silent no-op on a correctly auto-detected provider. One
+  resolver now decides: an explicit GCP `format` wins, otherwise the shape of
+  `binding.location` does (`dataset` to BigQuery, `bucket` to Cloud Storage, `topic`
+  to Pub/Sub), and `emit`, `emit_data`, `discover_imports` and the new validate-time
+  gate all route through it. `discover_imports` also lacked the emitter's exposeId
+  table-name fallback, so a brownfield apply would try to create a table that already
+  exists; and the AWS plugin filtered `exposes[]` against the literal `"aws"`, so
+  `platform: glue`, `s3`, `athena` or `redshift` auto-detected as AWS and were then
+  skipped by every AWS filter, emitting an empty module. (#580)
+- **`fluid verify` checks what `fluid apply` provisioned for a GCP binding, not what
+  the format string says.** Stage 9 dispatched on the literal
+  `binding.format == "bigquery_table"`, which matched the emitter until the emitter
+  stopped keying on `format` alone; after that
+  `{platform: gcp, format: csv, location: {project, dataset}}` — provisioned as a
+  BigQuery table — fell through to the local-file branch and returned `status: error`
+  with "no location.path declared", diagnosing a missing file for a table that
+  exists, and `error_count` fails the run with or without `--strict`. Verify now asks
+  the emitter's own resolver and addresses a BigQuery table by the name the emitter
+  used, where an expose with no `location.table` previously built `project.dataset.`
+  and looked for a table named `""`. A GCS bucket, Pub/Sub topic or Iceberg warehouse
+  reports `unsupported`, which is "not checked" rather than "check failed"; non-GCP
+  bindings, local files, Snowflake and the legacy dialect are unchanged. (#580)
+- **The ODCS `description` block is emitted as ODCS declares it.** ODCS models
+  `description` as an object of string fields (`purpose`, `limitations`, `usage`)
+  while FLUID models it as a single string, and only the importer type-checked: the
+  exporter wrapped unconditionally, so a `description` mapping came out as an object
+  where the schema declares a string. A mapping now passes through as siblings, a
+  string is still wrapped as `{purpose: <string>}`, and both the `odcs/` and per-port
+  `odps-bitol/*.odcs.yaml` outputs are fixed at once. Round-trips never saw it, since
+  only a caller rendering a document it had not imported reached the broken branch;
+  when it did, installs carrying the optional `vowl` validator
+  (`fluid-build[odcs-strict]`) aborted `fluid generate artifacts` and wrote no
+  artifacts at all. The old shape was already schema-invalid, so only a consumer
+  written against the bug breaks. (#585)
+- **`fluid apply` reaches Snowflake again when `SNOWFLAKE_ACCOUNT` is set.** From
+  `snowflakedb/snowflake` 2.x — the only major the generated module pins, `~> 2.0` —
+  the bare `account` field is gated behind the
+  `PROVIDER_CONFIGURATION_ACCOUNT_FALLBACK` experiment, and the provider errors the
+  moment it sees the legacy `SNOWFLAKE_ACCOUNT` variable whether or not the v2
+  organisation/account pair is present; the credential overlay split the legacy
+  variable into that pair but *added* it alongside, so every `tofu plan` failed.
+  Verified against a live account on provider 2.19.0 and OpenTofu 1.12.0, only the v2
+  pair with the legacy variable blanked plans successfully, which is what the overlay
+  now produces. **No contract or configuration change is needed:** an operator
+  setting `SNOWFLAKE_ACCOUNT` in the standard `<org>-<account>` form goes from
+  failing to working. A bare account locator with no organisation (`xy12345`)
+  deliberately keeps its legacy value so the provider's actionable error survives;
+  that operator sets the two v2 variables, or opts into the experiment. (#511)
+- **`pip install` on Python 3.10 produces a package that can import again.** litellm
+  1.98.0 imports `NotRequired` straight from `typing`, which landed there only in
+  3.11 (PEP 655), so merely importing litellm raises `ImportError` on 3.10 — while
+  litellm's own metadata still declares `requires_python ">=3.10,<3.15"`. litellm is
+  a core dependency and 3.10 is advertised in both `requires-python` and the
+  classifiers, so this broke installs, not just the red 3.10 leg of the matrix. The
+  pin is now split on an environment marker: `litellm>=1.83.7,<2` on 3.11 and newer,
+  `litellm>=1.83.7,<1.98` below it, bisected against real wheels. The `>=1.83.7`
+  floor is unchanged on both branches, so the CVSS 9.3 SQL-injection fix it exists
+  for stays in force and the compromised 1.82.7/1.82.8 artifacts stay excluded.
+  (#555)
+- **The emulated integration lane reported success while proving almost nothing.**
+  `integration-emulated-heavy.yml` selected 54 tests by marker and provisioned an
+  emulator for 3 of them: it started LocalStack but never the GCP emulator compose
+  stack, so 15 GCP tests skipped themselves inside a job named for them, and pytest
+  exited 0. Measured before/after on the same commit: **3 passed / 53 skipped → 17
+  passed / 38 skipped**, keyless, no token. The lane now starts the GCP stack it
+  advertises, and `scripts/ci/assert_lane_coverage.py` fails it unless every
+  provisioned area contributed a passing test. (#595)
+- **That lane had also not run at all since 2026-07-13.** Its
+  `ci:integration-emulated` label is stripped on every push by
+  `integration-label-guard.yml`, so the vouch had to be re-applied and re-approved
+  per push; the single run that reached the queue waited twelve days for a required
+  reviewer and was cancelled. It now runs nightly at 05:00 UTC unattended, keeping
+  the label for the pull-request path where a maintainer vouch is the point, and
+  `actionlint.yml` checks that the label condition and its guard both still exist,
+  since that is now the control gating un-reviewed PR code. (#595)
+- **The fourteen AWS `tofu apply` round-trips had never executed in CI, anywhere.**
+  `tests/iac/test_iac_aws_localstack_e2e.py` is the repo's strongest AWS evidence,
+  each round-trip independently verified through boto3, and `HONESTLY_TESTED.md` has
+  recorded it as passing since the file was written. The cause was structural rather
+  than a missing secret: the only workflow referencing the suite declares no
+  `environment:` on any job, so it could never read `LOCALSTACK_AUTH_TOKEN` and the
+  step always skipped. The suite now carries `pytest.mark.emulated_heavy` and is
+  selected into the heavy lane, taking `-m emulated_heavy` from 54 tests to 68 with a
+  matching `--require` in the lane-coverage guard. Running them for the first time
+  found two things: the lane's `docker run` omitted the `/var/run/docker.sock`
+  bind-mount LocalStack's Lambda runtime needs (3 failed / 11 passed before the
+  mount, 1 failed / 13 passed after), and the Lake Formation `GrantPermissions`
+  round-trip does not pass and never has, because LocalStack answers
+  `UnrecognizedClientException` even for a registered DataLakeAdmin — which is why a
+  file of fourteen tests has always been recorded as thirteen. That one is now
+  `xfail(strict=False)` with the upstream issue named in
+  `docs/upstream-issues/localstack-lakeformation-grant-auth.md`, kept unskipped so an
+  upstream fix reports xpass rather than going quiet. (#598)
+- **Release image: two CPython `tarfile` CVEs suppressed with justification.** Both
+  are fixed only in a CPython pre-release, so no stable base image clears them — and
+  0.14.1 published to PyPI while its GHCR job failed the grype gate on them.
+  `.grype.yaml` now records each with its reachability argument: the single
+  `extractall` call is guarded by `_safe_tar_members`, which raises on symlink and
+  hardlink members, and no streaming (`"r|"`) mode is used anywhere. Each entry
+  carries justification, EPSS and an explicit removal condition, so the release gate
+  no longer fails on an unfixable finding. (#501)
+- **The wrong legal entity no longer ships in the container image or on the docs
+  site.** 0.14.1 renamed the maintainer to Agentics Transformation Limited across
+  `LICENSE`, `NOTICE`, `pyproject.toml` and the docs, but two published surfaces were
+  missed because neither is a file a docs linter would open: `Dockerfile`'s
+  `org.opencontainers.image.vendor` label, so every image pushed to `ghcr.io` since
+  carried "Agentics Transformation Pty Ltd", and the footer of the GitHub Pages site.
+  Both now read Agentics Transformation Limited; PyPI metadata was already correct.
+  (#561)
+- **The Apache-2.0 notice is now complete in every source file that carries one.**
+  346 tracked files held a header truncated mid-boilerplate — 323 after the
+  `LICENSE-2.0` URL, 23 after "you may not use this file except in compliance…" —
+  dropping the warranty and liability disclaimer Apache-2.0's appendix asks to be
+  attached. No licence terms changed, and across all 358 files touched the diff
+  contains zero non-comment, non-blank lines. The cause was two scripts disagreeing
+  about what counts as a header: the checker grepped only for the copyright token in
+  the first five lines, so all 346 passed it while the writer re-completed them on
+  every run, which is how the CI job's own remediation advice turned a one-file fix
+  into a 361-file diff. The checker now validates every substantive line and names
+  the first missing clause per file; the writer emits PEP 8 spacing so a second run
+  is a no-op. (#493)
 
 ## [0.14.1] — 2026-08-03
 
@@ -2437,7 +2894,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.13.0...v0.13.1

@@ -49,7 +49,11 @@ from typing import Any, Dict, List
 
 import pytest
 
-from fluid_build.policy.sovereignty import SovereigntyValidator, validate_sovereignty
+from fluid_build.policy.sovereignty import (
+    UNCONSTRAINED_JURISDICTIONS,
+    SovereigntyValidator,
+    validate_sovereignty,
+)
 
 US_REGION = "us-east-1"
 EU_REGION = "eu-west-1"
@@ -220,9 +224,19 @@ def test_compliant_contract_passes_in_every_mode() -> None:
         assert [v for v in violations if v.severity == "error"] == []
 
 
-def test_global_jurisdiction_is_not_a_violation_anywhere() -> None:
+@pytest.mark.parametrize("jurisdiction", sorted(UNCONSTRAINED_JURISDICTIONS))
+def test_catch_all_jurisdiction_is_not_a_violation_anywhere(jurisdiction: str) -> None:
+    """Neither catch-all constrains where data may sit, in any mode.
+
+    "Multi-Region" is the one that used to fail. Check 3 compared the pinned
+    jurisdiction against the region's by equality and special-cased only
+    "Global", so a value meaning "several jurisdictions" could never equal any
+    real one. That was invisible while check 3 was hardcoded to "warning";
+    once the mode decides severity and strict is the default, it refused every
+    region a Multi-Region contract could name.
+    """
     for mode in ("strict", "advisory", "audit"):
-        doc = contract(enforcementMode=mode, jurisdiction="Global")
+        doc = contract(enforcementMode=mode, jurisdiction=jurisdiction)
         assert SovereigntyValidator().validate(doc)[0] is True
 
 

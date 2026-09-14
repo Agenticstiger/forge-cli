@@ -89,8 +89,8 @@ def test_catch_all_jurisdictions_are_inert(j: str) -> None:
 
     Multi-Region matters most: an equality predicate would refuse EVERY caller,
     since no caller is ever in a jurisdiction literally named "Multi-Region".
-    The provision-time checks special-case only "Global", so this is the one
-    place both are handled.
+    The provision-time jurisdiction check reads this same constant, so both
+    paths agree on what a catch-all means.
     """
     assert derive_caller_jurisdictions(contract(jurisdiction=j)) is None
 
