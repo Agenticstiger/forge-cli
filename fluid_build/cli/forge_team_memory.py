@@ -62,7 +62,7 @@ TEAM_MEMORY_TEMPLATE = """\
 # FLUID contracts.  Explicit CLI flags and interview answers always
 # take precedence over team memory.
 #
-# Docs: https://fluid-build.dev/docs/forge/team-memory
+# Docs: https://agenticstiger.github.io/forge_docs/advanced/forge-copilot-memory.html
 
 conventions:
   # Naming patterns applied to generated contracts.

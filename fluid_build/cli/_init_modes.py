@@ -552,7 +552,7 @@ def _finalise_template_product(
 
         contract_path.write_text(
             "# FLUID Data Product Contract\n"
-            "# Docs: https://fluid-build.dev/docs/contracts\n"
+            "# Docs: https://agenticstiger.github.io/forge_docs/concepts/contract.html\n"
             + yaml.dump(doc, default_flow_style=False, sort_keys=False, allow_unicode=True),
             encoding="utf-8",
         )

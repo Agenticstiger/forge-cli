@@ -29,7 +29,7 @@ non-zero.  Example printed output:
        contract.lock.yaml is out of date.
        Fix: run 'fluid bundle' and commit the updated contract.bundled.yaml
             and contract.lock.yaml.
-       Docs: https://fluid-build.dev/docs/fragments#lockfile
+       Docs: https://agenticstiger.github.io/forge_docs/cli/split.html
 
 The idea — and the shape — is borrowed from ``cargo``, ``rustc``, and
 ``git`` which all wrap their errors in a "how to recover" line.  Users

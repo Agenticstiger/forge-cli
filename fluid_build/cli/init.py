@@ -802,7 +802,7 @@ FLUID_GITIGNORE_BLOCK = """\
 # --- fluid-cli: engineer-personal state (never commit) -------------------
 # Receipts, logs, and per-engineer learning history live under .fluid/
 # but must not travel to other clones.  See
-# https://fluid-build.dev/docs/git-policy for the full matrix.
+# https://agenticstiger.github.io/forge_docs/cli/split.html for the full matrix.
 .fluid/init-receipt.json
 .fluid/forge-receipt.json
 .fluid/copilot-memory.json

@@ -42,7 +42,7 @@ from fluid_build.schema_manager import FluidSchemaManager
 
 LOG = logging.getLogger("fluid.cli.forge.contract_factory")
 
-DOCS_URL = "https://fluid-build.dev/docs/contracts"
+DOCS_URL = "https://agenticstiger.github.io/forge_docs/concepts/contract.html"
 
 
 def build_minimal_contract(
@@ -268,7 +268,7 @@ def create_and_validate_contract(
                     f"Delete {contract_path} and re-run 'fluid forge --blank', "
                     f"or manually edit the contract to add the missing keys."
                 ),
-                docs_url="https://fluid-build.dev/docs/contracts",
+                docs_url="https://agenticstiger.github.io/forge_docs/concepts/contract.html",
             )
             print_actionable_error(actionable, console=console)
         except Exception:  # noqa: BLE001 — defensive; never let errors printer crash
