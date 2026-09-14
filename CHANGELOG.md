@@ -9,12 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The emulated integration lane reported success while proving almost
+  nothing.** `integration-emulated-heavy.yml` selected 54 tests by marker and
+  provisioned an emulator for 3 of them: it started LocalStack but never the
+  GCP emulator compose stack, so 15 GCP tests skipped themselves inside a job
+  named for them, and pytest exited 0. Measured before/after on the same
+  commit: **3 passed / 53 skipped → 17 passed / 38 skipped**, keyless, no
+  token. The lane now starts the GCP stack it advertises, and
+  `scripts/ci/assert_lane_coverage.py` fails it unless every provisioned area
+  contributed a passing test.
+- **That lane had also not run at all since 2026-07-13.** Its
+  `ci:integration-emulated` label is stripped on every push by
+  `integration-label-guard.yml`, so the vouch had to be re-applied and
+  re-approved per push; the single run that reached the queue waited twelve
+  days for a required reviewer and was cancelled. It now runs nightly at
+  05:00 UTC unattended, keeping the label for the pull-request path where a
+  maintainer vouch is the point. `actionlint.yml` gained a check that the
+  label condition and its guard both still exist, since that is now the
+  control gating un-reviewed PR code.
+- **A missing `LOCALSTACK_AUTH_TOKEN` no longer passes silently on the
+  nightly.** The skip-clean behaviour stays for pull requests and manual runs;
+  on the cron a missing token fails with the `gh secret set` command that
+  fixes it. An auth token that silently expires is how a sibling lane in
+  another repo stayed dead across four commits.
+- **LocalStack image pinned to `2026.08.2`**, per the repo's
+  fully-pinned-container convention. It was tracking `stable`, which moved
+  while the lane was dormant.
+
 - **Release image: two CPython `tarfile` CVEs suppressed with justification.**
   Both are fixed only in CPython pre-releases, so no stable base image clears
   them. A curated `.grype.yaml` records each with its reachability argument —
   the single `extractall` call is guarded by `_safe_tar_members`, which raises
   on symlink and hardlink members, and no streaming (`"r|"`) mode is used
   anywhere — so the release gate no longer fails on an unfixable finding.
+
+### Added
+
+- **Snowflake is now exercised over the real wire protocol, keyless.**
+  `tests/providers/test_snowflake_server_emulated_happy_path.py` runs the
+  **unpatched** snowflake-connector-python against fakesnow's server
+  (`fakesnow[server]`, Apache-2.0) — real login, real query submission, real
+  result-set decoding, and `SnowflakeConnection._initialize_session`'s `USE`
+  statements reaching an endpoint for the first time. The existing in-process
+  `fakesnow.patch()` test could not cover any of that, because it replaces the
+  connector rather than talking to it. Runs on every PR including forks, at no
+  cost; LocalStack for Snowflake was considered and rejected as a separate
+  licence ($29–35/user/month) for what this covers at $0.
 
 ## [0.14.1] — 2026-08-03
 

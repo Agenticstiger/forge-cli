@@ -391,6 +391,8 @@ try:  # pragma: no cover — exercised at collection time
     from tests._infrastructure.emulator_fixtures import (  # noqa: F401
         bigquery_emulator_client,
         fakesnow_patch,
+        fakesnow_server,
+        fakesnow_server_target,
         moto_glue_client,
     )
 except ImportError:

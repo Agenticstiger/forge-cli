@@ -394,7 +394,11 @@ test-emulators = [
   # autogenerator e2e — `tofu`, a Go binary, needs a real HTTP endpoint
   # and cannot use moto's in-process `mock_aws`.
   "moto[glue,server]>=5",
-  "fakesnow>=0.9",
+  # ``[server]`` (starlette + uvicorn) serves fakesnow's Snowflake wire
+  # protocol on localhost, so the UNPATCHED connector can be exercised —
+  # see tests/providers/test_snowflake_server_emulated_happy_path.py.
+  # Without this extra that test skips, and the lane goes green proving less.
+  "fakesnow[server]>=0.9",
 ]
 
 # Heavy (Docker-based) integration-test emulators — Stage 2. These

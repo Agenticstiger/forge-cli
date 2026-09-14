@@ -225,3 +225,106 @@ def bigquery_emulator_client() -> Iterator[Any]:
         yield client
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+# ── Snowflake — fakesnow server mode (over the wire) ─────────────────────
+#
+# ``fakesnow_patch`` above replaces snowflake-connector-python in-process:
+# the connector's own internals never run. That proves forge-cli calls the
+# connector correctly, and nothing below it.
+#
+# fakesnow also ships a Starlette app speaking the real Snowflake HTTP
+# wire protocol (``fakesnow -s``; https://github.com/tekumara/fakesnow,
+# Apache-2.0). Served locally, the UNPATCHED connector performs a real
+# login request, submits real queries and decodes real result sets — so a
+# connector-version regression in any of those surfaces fails the test.
+#
+# What is still patched, and why: ``snowflake.connector.connect`` resolves
+# its URL from the account name (``<account>.snowflakecomputing.com``) and
+# offers no endpoint override, so the fixture injects ``host``/``port``/
+# ``protocol`` and nothing else. Every other argument forge-cli passes is
+# its own. This is transport redirection, not behaviour substitution.
+#
+# Fidelity ceiling, unchanged from in-process mode: fakesnow executes on
+# DuckDB and accepts a more liberal dialect than Snowflake. Snowflake SQL
+# correctness remains the job of the Stage-3 live suite.
+
+_FAKESNOW_SERVER_ACCOUNT = "forge_emulated"
+
+
+def _have_fakesnow_server() -> bool:
+    """Return True if fakesnow's optional server extra is importable."""
+    try:
+        import fakesnow.server  # noqa: F401
+        import uvicorn  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def requires_fakesnow_server(
+    reason: str = "fakesnow server extra not installed — pip install -e '.[test-emulators]'",
+) -> Any:
+    """Decorator skipping a test when fakesnow's server extra is unavailable."""
+    return pytest.mark.skipif(not _have_fakesnow_server(), reason=reason)
+
+
+@pytest.fixture(scope="session")
+def fakesnow_server() -> Iterator[int]:
+    """Serve fakesnow's Snowflake-wire-protocol app; yield the bound port.
+
+    Session-scoped: one uvicorn thread serves every test in the run. The
+    port is claimed from the OS rather than hard-coded so parallel CI jobs
+    on one runner cannot collide.
+    """
+    if not _have_fakesnow_server():
+        pytest.skip("fakesnow server extra not installed")
+
+    import socket
+    import threading
+    import time as _time
+
+    import fakesnow.server
+    import uvicorn
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    server = uvicorn.Server(
+        uvicorn.Config(fakesnow.server.app, host="127.0.0.1", port=port, log_level="error")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        for _ in range(100):
+            if server.started:
+                break
+            _time.sleep(0.1)
+        else:
+            pytest.skip("fakesnow server did not start within 10s")
+        yield port
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+@pytest.fixture
+def fakesnow_server_target(fakesnow_server: int, monkeypatch: Any) -> Iterator[str]:
+    """Point ``snowflake.connector.connect`` at the local fakesnow server.
+
+    Injects ``host``/``port``/``protocol`` only — see the module note above.
+    Yields the account name callers should pass to forge-cli.
+    """
+    import snowflake.connector
+
+    real_connect = snowflake.connector.connect
+
+    def _connect_to_emulator(*args: Any, **kwargs: Any) -> Any:
+        kwargs.update(host="127.0.0.1", port=fakesnow_server, protocol="http")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(snowflake.connector, "connect", _connect_to_emulator)
+    yield _FAKESNOW_SERVER_ACCOUNT
