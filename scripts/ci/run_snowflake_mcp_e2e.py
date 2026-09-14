@@ -173,9 +173,7 @@ async def _drive(*, label, bound_model_id, bound_use_case, expected) -> Dict[str
         actual = (
             "deny"
             if payload.get("error") == "AgentPolicyDenied"
-            else "allow"
-            if payload.get("error") is None
-            else "tool-error"
+            else "allow" if payload.get("error") is None else "tool-error"
         )
         return {
             "label": label,

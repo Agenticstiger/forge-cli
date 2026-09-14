@@ -47,6 +47,13 @@ pytestmark = [
     requires_fakesnow_server(),
 ]
 
+# fakesnow ignores credentials entirely — it is an emulator, and the fixture
+# forces the connection to loopback. The connector still requires SOME value to
+# build a login request, so this is an arbitrary placeholder, not a credential.
+# detect-secrets flags any `password=` literal on sight, which is the correct
+# default; this is the documented way to say "checked, and it is not one".
+_ANY_PASSWORD = "forge"  # pragma: allowlist secret
+
 
 def test_snowflake_connection_server_happy_path(fakesnow_server_target: str) -> None:
     """SnowflakeConnection over HTTP: connect -> create -> insert -> select."""
@@ -56,7 +63,7 @@ def test_snowflake_connection_server_happy_path(fakesnow_server_target: str) -> 
     schema = "PUBLIC"
 
     with SnowflakeConnection(
-        account=fakesnow_server_target, user="forge", password="forge"
+        account=fakesnow_server_target, user="forge", password=_ANY_PASSWORD
     ) as conn:
         conn.execute(f"CREATE DATABASE {database}")
         conn.execute(f"CREATE SCHEMA {database}.{schema}")
@@ -88,7 +95,7 @@ def test_session_context_pinning_survives_the_wire(fakesnow_server_target: str) 
     database = f"FORGE_SRV_CTX_{uuid.uuid4().hex[:8].upper()}"
 
     with SnowflakeConnection(
-        account=fakesnow_server_target, user="forge", password="forge"
+        account=fakesnow_server_target, user="forge", password=_ANY_PASSWORD
     ) as bootstrap:
         bootstrap.execute(f"CREATE DATABASE {database}")
         bootstrap.execute(f"CREATE SCHEMA {database}.PUBLIC")
@@ -97,7 +104,7 @@ def test_session_context_pinning_survives_the_wire(fakesnow_server_target: str) 
     with SnowflakeConnection(
         account=fakesnow_server_target,
         user="forge",
-        password="forge",
+        password=_ANY_PASSWORD,
         database=database,
         schema="PUBLIC",
     ) as conn:
