@@ -378,7 +378,7 @@ def register(subparsers: argparse._SubParsersAction):
     parser.add_argument(
         "--domain",
         help=f"Domain expertise agent ({domain_names}). "
-        "Custom: drop a YAML in .fluid/agents/ — see docs at https://fluid-build.dev/docs/forge/agents",
+        "Custom: drop a YAML in .fluid/agents/ — see docs at https://agenticstiger.github.io/forge_docs/cli/agents.html",
     )
     parser.add_argument(
         "--non-interactive",
@@ -1194,7 +1194,7 @@ def _run_blank_mode(args: Any, logger: logging.Logger) -> int:
 # Shared UI helpers
 # ---------------------------------------------------------------------------
 
-_DOCS_URL = "https://fluid-build.dev/docs/contracts"
+_DOCS_URL = "https://agenticstiger.github.io/forge_docs/concepts/contract.html"
 
 
 def _print_forge_next_steps(console: Any, args: Any, scan_root: Path) -> None:
