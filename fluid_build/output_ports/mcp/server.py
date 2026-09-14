@@ -967,6 +967,24 @@ class OutputPortMcpServer:
             "decision": "allow" if allowed else "deny",
             "reason": reason,
             "policySource": self.state.policy.policy_source,
+            # WHICH rules produced that decision, not just where they came from.
+            #
+            # `policySource` says "contract" or "cli"; it does not distinguish
+            # the contract before an allowedModels edit from the contract after
+            # it. So an audit record could say a call was denied for
+            # `not-in-allowedModels` without preserving what the allowlist
+            # actually was, and the decision could not be reconstructed once the
+            # contract moved on — which is most of the value of keeping the
+            # record at all.
+            #
+            # `policy_digest()` is `jcs-sha256:<hash>` over the effective rule
+            # set, RFC 8785-canonicalised so the same rules hash identically
+            # whichever way the YAML was formatted. Its own docstring already
+            # said "for the audit record"; it had simply never been wired to one.
+            #
+            # Computed per call rather than cached: 6us measured, and the policy
+            # is a frozen dataclass, so there is no staleness to trade against.
+            "policyDigest": self.state.policy.policy_digest(),
             "argumentSummary": _summarise_arguments(arguments),
             "runId": self.state.run_id,
         }
