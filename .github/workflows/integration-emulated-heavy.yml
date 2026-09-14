@@ -132,7 +132,14 @@ jobs:
           # Fully pinned, per the repo's container-image convention. `stable`
           # moved under this lane while it was dormant; an emulator that
           # upgrades itself is not a fixed baseline to test against.
+          # The docker socket is not optional once the IaC round-trips run
+          # here: LocalStack's Lambda runtime spawns a container per
+          # execution, and without the bind-mount `tofu apply` fails with
+          # "Error while creating lambda: Docker not available". Documented in
+          # docs/upstream-issues/localstack-lambda-docker-in-docker.md;
+          # verified locally 2026-09-14 that the mount is what fixes it.
           docker run -d --name fluid-localstack -p 4566:4566 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
             -e LOCALSTACK_AUTH_TOKEN="$LOCALSTACK_AUTH_TOKEN" \
             localstack/localstack:2026.08.2
           for i in $(seq 1 60); do
