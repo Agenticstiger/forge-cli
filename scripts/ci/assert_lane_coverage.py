@@ -51,7 +51,20 @@ def normalise(value: str) -> str:
     written as a real path missed every time — the guard reported an area as
     uncovered while its tests were passing. Both sides go through here.
     """
-    return value.replace(".py", "").replace(".", "/")
+    return value.removesuffix(".py").replace(".", "/")
+
+
+def _covers(needle: str, source: str) -> bool:
+    """True when ``source`` is the file ``needle`` names, or a test inside it.
+
+    Deliberately anchored rather than a substring test. A substring test is
+    satisfied by any path that merely EXTENDS the needle, so a file named
+    ``..._happy_path_stub.py`` would mark ``..._happy_path.py``'s area covered
+    while its emulator sat dead — the exact silent-green this script exists to
+    prevent. The only legitimate extension is pytest's class suffix, which
+    ``normalise`` renders as a ``/``-separated segment.
+    """
+    return source == needle or source.startswith(needle + "/")
 
 
 def passed_files(report: Path) -> list[str]:
@@ -90,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         if not needle:
             print(f"::error::malformed --require {requirement!r}; want LABEL=PATH")
             return 2
-        hits = sum(1 for f in files if normalise(needle) in f)
+        hits = sum(1 for f in files if _covers(normalise(needle), f))
         if hits:
             print(f"  OK   {label}: {hits} passing")
         else:

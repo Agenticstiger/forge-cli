@@ -32,6 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the cron a missing token fails with the `gh secret set` command that
   fixes it. An auth token that silently expires is how a sibling lane in
   another repo stayed dead across four commits.
+- **The lane-coverage guard could be satisfied by a file that merely extended the
+  needle.** It matched by substring, so a trivially-passing
+  `..._happy_path_stub.py` would have marked `..._happy_path.py`'s area covered
+  with no emulator running — the silent-green it exists to prevent. Matching is
+  now anchored. A second bug in the same function stripped `.py` globally rather
+  than as a suffix, mangling a dotted module like `tests.pytest_helpers` into
+  `teststest_helpers`; that one failed safe (a red lane) but would have produced
+  a baffling MISS eventually. Both pinned by tests.
+- **The label gate is now enforced by parsing the workflow, not grepping it.**
+  `scripts/ci/check_env_label_gate.py` replaces a whole-file `grep` that proved
+  only that the label expression appeared somewhere in the file. A third job
+  added later with `environment: integration-emulated` and no label condition
+  would have passed that grep while running on every pull request with the
+  secret in scope. Since the environment no longer carries a required-reviewer
+  rule, this gate is load-bearing, so it is tested rather than assumed.
 - **LocalStack image pinned to `2026.08.2`**, per the repo's
   fully-pinned-container convention. It was tracking `stable`, which moved
   while the lane was dormant.

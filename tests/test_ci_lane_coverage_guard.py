@@ -124,3 +124,30 @@ def test_a_malformed_requirement_is_a_usage_error(tmp_path: Path) -> None:
     """A typo'd --require must not silently assert nothing."""
     report = _report(tmp_path, '<testcase classname="tests.anything" name="t"/>')
     assert guard.main([str(report), "--require", "no-equals-sign"]) == 2
+
+
+def test_a_path_that_merely_extends_the_needle_does_not_count(tmp_path: Path) -> None:
+    """Anchored, not substring: `..._happy_path_stub.py` must not cover `..._happy_path.py`.
+
+    A substring test is satisfied by any path that extends the needle, so adding a
+    trivially-passing stub beside a real emulator test would mark its area covered
+    while the emulator sat dead — the exact silent-green this guard exists to stop.
+    """
+    report = _report(
+        tmp_path,
+        '<testcase classname="tests.providers.test_bigquery_emulated_happy_path_stub"'
+        ' name="test_trivial"/>',
+    )
+    assert guard.main([str(report), "--require", f"BigQuery={_BQ}"]) == 1
+
+
+def test_a_dotted_module_containing_py_is_not_mangled(tmp_path: Path) -> None:
+    """`.py` is a suffix to strip, not a substring to delete.
+
+    A global replace turned the classname `tests.pytest_helpers` into
+    `teststest_helpers`, which matches nothing. It failed safe (a red lane rather
+    than a green one), but it would have produced a baffling MISS one day.
+    """
+    assert guard.normalise("tests.pytest_helpers") == "tests/pytest_helpers"
+    report = _report(tmp_path, '<testcase classname="tests.pytest_helpers" name="test_thing"/>')
+    assert guard.main([str(report), "--require", "Helpers=tests/pytest_helpers.py"]) == 0
