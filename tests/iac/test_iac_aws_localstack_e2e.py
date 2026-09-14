@@ -66,6 +66,14 @@ pytestmark = [
     pytest.mark.provider,
     pytest.mark.aws,
     pytest.mark.slow,
+    # Stage 2, so the nightly heavy lane selects it. These fourteen round-trips
+    # are the repo's strongest AWS evidence and had never run in CI anywhere:
+    # iac-tests.yml is the only workflow that referenced them and it declares no
+    # `environment:`, so it cannot read LOCALSTACK_AUTH_TOKEN, which lives on the
+    # `integration-emulated` environment. integration-emulated-heavy.yml already
+    # has that environment, starts LocalStack, and installs OpenTofu — running
+    # them there costs one marker instead of widening the secret's scope.
+    pytest.mark.emulated_heavy,
 ]
 
 
@@ -106,10 +114,27 @@ def test_iceberg_on_glue_round_trip(localstack_project, localstack_endpoint):
     assert cols == {"event_id": "string", "occurred_at": "timestamp", "amount": "decimal(12,2)"}
 
 
+@pytest.mark.xfail(
+    reason=(
+        "LocalStack Pro rejects lakeformation:GrantPermissions with "
+        "UnrecognizedClientException even for a registered DataLakeAdmin, so "
+        "`tofu apply` cannot land aws_lakeformation_permissions. Documented in "
+        "docs/upstream-issues/localstack-lakeformation-grant-auth.md. Kept "
+        "unskipped so the day LocalStack fixes it, this reports xpass and we "
+        "notice."
+    ),
+    strict=False,
+)
 def test_cross_account_lf_grant_plus_s3_bucket_policy_round_trip(
     localstack_project, localstack_endpoint
 ):
     """Cross-account LF grant + S3 bucket policy apply cleanly on LocalStack.
+
+    Known-failing, and known-failing for longer than anyone noticed: this file
+    has fourteen tests and HONESTLY_TESTED.md has always recorded "13
+    round-trips" for it. Verified 2026-09-14 against LocalStack Pro
+    2026.08.2 — the other thirteen pass, this one does not, and the
+    arithmetic finally has an explanation.
 
     LocalStack's free tier does not enforce LF cross-account semantics
     end-to-end (RAM share + organization checks), but it DOES accept the

@@ -132,7 +132,14 @@ jobs:
           # Fully pinned, per the repo's container-image convention. `stable`
           # moved under this lane while it was dormant; an emulator that
           # upgrades itself is not a fixed baseline to test against.
+          # The docker socket is not optional once the IaC round-trips run
+          # here: LocalStack's Lambda runtime spawns a container per
+          # execution, and without the bind-mount `tofu apply` fails with
+          # "Error while creating lambda: Docker not available". Documented in
+          # docs/upstream-issues/localstack-lambda-docker-in-docker.md;
+          # verified locally 2026-09-14 that the mount is what fixes it.
           docker run -d --name fluid-localstack -p 4566:4566 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
             -e LOCALSTACK_AUTH_TOKEN="$LOCALSTACK_AUTH_TOKEN" \
             localstack/localstack:2026.08.2
           for i in $(seq 1 60); do
@@ -169,6 +176,14 @@ jobs:
         timeout-minutes: 15
         env:
           FLUID_LOCALSTACK_ENDPOINT: http://localhost:4566
+          # The IaC round-trips are triple-gated: `tofu` on PATH (installed
+          # above), LocalStack reachable, and this opt-in. AWS_* are
+          # LocalStack's conventional dummy credentials — NOT the emulator's
+          # own bypass; the auth token is what unlocks Glue and Lake Formation.
+          FLUID_IAC_LIVE_LOCALSTACK: "1"
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test  # pragma: allowlist secret
+          AWS_DEFAULT_REGION: us-east-1
           FLUID_IAC_LIVE_GCP_EMULATOR: "1"
           PUBSUB_EMULATOR_HOST: "localhost:8085"
           FLUID_GCP_BIGQUERY_EMULATOR: "http://localhost:9050"
@@ -186,6 +201,7 @@ jobs:
           )
           if [ "${{ steps.gate.outputs.localstack }}" = "true" ]; then
             requirements+=(--require "AWS LocalStack=tests/providers/test_aws_localstack_happy_path.py")
+            requirements+=(--require "AWS IaC round-trips=tests/iac/test_iac_aws_localstack_e2e.py")
           fi
           python scripts/ci/assert_lane_coverage.py emulated-heavy.xml "${requirements[@]}"
 
