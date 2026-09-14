@@ -44,6 +44,7 @@ import pytest
 from fluid_build.forge.core.bundle import build_bundle_tgz
 from fluid_build.forge.core.plan_digest import (
     PlanBindingError,
+    compute_contract_digest,
     compute_plan_digest,
     inject_digests,
     is_bundle_path,
@@ -657,3 +658,85 @@ class TestVerifyPlanBinding:
         with pytest.raises(PlanBindingError) as exc_info:
             verify_plan_binding(plan, bundle_path=None)
         assert exc_info.value.kind == "binding-mode-mismatch"
+
+
+# ---------------------------------------------------------------------------
+# compute_contract_digest
+# ---------------------------------------------------------------------------
+
+
+class TestComputeContractDigest:
+    """The cross-mesh federation primitive.
+
+    Its whole reason to exist is that two peers must agree on the digest
+    of the same contract even when their YAML is formatted differently —
+    so the properties pinned here are *canonicalisation* properties, not
+    just "returns a sha256 string".
+    """
+
+    def test_returns_prefixed_sha256(self):
+        digest = compute_contract_digest({"id": "orders"})
+        assert digest.startswith("sha256:")
+        assert len(digest) == len("sha256:") + 64
+
+    def test_key_order_does_not_change_the_digest(self):
+        a = {"fluidVersion": "0.7.3", "id": "orders", "exposes": [{"id": "o"}]}
+        b = {"exposes": [{"id": "o"}], "id": "orders", "fluidVersion": "0.7.3"}
+        assert compute_contract_digest(a) == compute_contract_digest(b)
+
+    def test_list_order_does_change_the_digest(self):
+        """Ordering of ``exposes``/``consumes`` is contract meaning, not
+        formatting — it must be part of the identity."""
+        a = {"exposes": [{"id": "a"}, {"id": "b"}]}
+        b = {"exposes": [{"id": "b"}, {"id": "a"}]}
+        assert compute_contract_digest(a) != compute_contract_digest(b)
+
+    def test_unicode_equivalent_strings_agree(self):
+        """NFC vs NFD encodings of the same accented text must not read
+        as upstream drift."""
+        composed = {"description": "caf\u00e9"}  # e-acute, one codepoint
+        decomposed = {"description": "cafe\u0301"}  # e + combining acute
+        # Escapes, not literals: a source-file normaliser must not be
+        # able to silently collapse these into one another.
+        assert composed != decomposed
+        assert compute_contract_digest(composed) == compute_contract_digest(decomposed)
+
+    def test_yaml_magic_word_keys_do_not_crash(self):
+        """PyYAML parses bare ``on``/``off``/``yes``/``no`` as bools, and
+        ``sort_keys=True`` cannot order a mixed bool/str key set. Shares
+        ``coerce_keys_to_str`` with the plan digest, so a contract using
+        those inside a free-form block still hashes."""
+        contract = {"options": {True: "a", "on": "b", 3: "c"}}
+        assert compute_contract_digest(contract).startswith("sha256:")
+
+    def test_nothing_is_masked_out(self):
+        """Unlike the plan digest, a contract has no derived or volatile
+        fields — a key that merely *shares a name* with a masked plan
+        field is still real contract content and must be hashed."""
+        base = {"id": "orders"}
+        for field in ("generated_at", "planDigest", "bundleDigest"):
+            assert compute_contract_digest({**base, field: "x"}) != compute_contract_digest(
+                base
+            ), f"{field} must not be masked out of the contract digest"
+
+    def test_is_deterministic_across_calls(self):
+        contract = {"id": "orders", "exposes": [{"id": "o", "fields": ["a", "b"]}]}
+        assert compute_contract_digest(contract) == compute_contract_digest(contract)
+
+    def test_rejects_raw_text(self):
+        """Passing unparsed YAML is the exact mistake this function
+        exists to prevent, so it fails loudly rather than hashing text."""
+        with pytest.raises(TypeError, match="parsed contract mapping"):
+            compute_contract_digest("id: orders\n")  # type: ignore[arg-type]
+
+    def test_rejects_non_mapping(self):
+        with pytest.raises(TypeError):
+            compute_contract_digest([{"id": "orders"}])  # type: ignore[arg-type]
+
+    def test_shares_canonicalisation_with_compute_plan_digest(self):
+        """Both digests route through ``_canonical_json``. A plan with no
+        masked fields and a contract with the same body must therefore
+        produce the same hash — the pin that keeps the two from drifting
+        into separate canonicalisation rules."""
+        body = {"id": "orders", "exposes": [{"id": "o"}]}
+        assert compute_contract_digest(body) == compute_plan_digest(body)

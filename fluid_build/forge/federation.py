@@ -83,8 +83,16 @@ import yaml
 # (169.254.0.0/16 — AWS/GCP metadata), loopback, unspecified, and
 # reserved ranges (and fails closed on DNS errors).
 from fluid_build._net import _hostname_is_private
+
+# Imported at module scope, NOT behind a try/except: the canonical
+# contract digest is the git backend's whole contract with its peers.
+# A guarded import that degraded to a raw-text hash would let two peers
+# formatting the same contract differently disagree *silently*, which is
+# exactly the drift ``upstreamDigest`` pinning exists to catch. Safe for
+# the light-CLI cold path — ``plan_digest`` imports stdlib only.
+from fluid_build.forge.core.plan_digest import compute_contract_digest
 from fluid_build.util.safe_http import MAX_REMOTE_BYTES
-from fluid_build.util.safe_yaml import MAX_YAML_BYTES, load_yaml_safe
+from fluid_build.util.safe_yaml import MAX_YAML_BYTES, UnsafeYamlError, load_yaml_safe
 
 LOG = logging.getLogger("fluid.forge.federation")
 
@@ -720,41 +728,47 @@ def _fetch_digest_via_git(
 
     1. **gitpython** (if installed) — clone (or open existing cache)
        the repo at ``workspace.endpoint``, read the file at the
-       resolved product path, and recompute its bundle digest via
+       resolved product path, and recompute its digest via
        :func:`fluid_build.forge.core.plan_digest.compute_contract_digest`.
     2. **shell-out to git** — for environments where gitpython isn't
        available; same logic, ``subprocess.run(["git", "clone", ...])``.
 
     The product path resolves from ``workspace.endpoint`` +
     ``product_id`` + the conventional file ``contract.fluid.yaml``.
+
+    The contract is **parsed and canonicalised** before hashing — never
+    hashed as raw text. Peers format the same contract differently (key
+    order, indentation, quoting, comments, CRLF), and a text hash would
+    make every one of those look like upstream drift. Returns ``None``
+    on an unreadable or malformed upstream contract, which the caller
+    escalates to a violation — federation fails closed, never on a
+    weaker digest.
     """
     contract_text = _git_read_contract(workspace, product_id)
     if not contract_text:
         return None
 
-    # Compute the canonical digest of the fetched contract.
     try:
-        from fluid_build.forge.core.plan_digest import compute_contract_digest
-    except Exception:  # pragma: no cover — defensive
-        # Fallback: hash the raw text. Operators paying attention will
-        # see the digest doesn't match local-bundle digests; the path
-        # is intentionally narrow (gitpython missing AND core helper
-        # unimportable both at once).
-        import hashlib
-
-        return "sha256:" + hashlib.sha256(contract_text.encode("utf-8")).hexdigest()
-
-    try:
-        contract = load_yaml_safe(contract_text) or {}
-        return compute_contract_digest(contract)
-    except Exception as exc:  # pragma: no cover — defensive
+        contract = load_yaml_safe(contract_text)
+    except (UnsafeYamlError, yaml.YAMLError) as exc:
         LOG.warning(
-            "federation_git_digest_failed: workspace=%s product=%s err=%s",
+            "federation_git_contract_unparseable: workspace=%s product=%s err=%s",
             workspace.id,
             product_id,
-            exc,
+            type(exc).__name__,
         )
         return None
+
+    if not isinstance(contract, Mapping):
+        LOG.warning(
+            "federation_git_contract_not_a_mapping: workspace=%s product=%s got=%s",
+            workspace.id,
+            product_id,
+            type(contract).__name__,
+        )
+        return None
+
+    return compute_contract_digest(contract)
 
 
 def _git_read_contract(workspace: FederatedWorkspace, product_id: str) -> Optional[str]:

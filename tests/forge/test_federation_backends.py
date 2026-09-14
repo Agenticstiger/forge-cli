@@ -29,6 +29,7 @@ Each test exercises:
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,6 +37,7 @@ import httpx
 import pytest
 import respx
 
+from fluid_build.forge.core.plan_digest import compute_contract_digest
 from fluid_build.forge.federation import (
     FederatedWorkspace,
     _fetch_digest_via_catalog,
@@ -44,6 +46,7 @@ from fluid_build.forge.federation import (
     fetch_federated_digest,
     store_cached_digest,
 )
+from fluid_build.util.safe_yaml import load_yaml_safe
 
 # The federation HTTP/catalog backends were migrated off
 # ``urllib.request.urlopen`` (which followed up to 10 redirects and
@@ -193,6 +196,13 @@ class TestGitBackend:
         return FederatedWorkspace(**defaults)
 
     def test_happy_path_uses_compute_contract_digest(self):
+        """The digest MUST be the canonical contract digest.
+
+        Asserting only ``startswith("sha256:")`` is not enough — the
+        raw-text fallback this file previously tolerated satisfied that
+        too. Pin the exact value against
+        :func:`compute_contract_digest` of the parsed contract.
+        """
         ws = self._ws()
         contract_text = "fluidVersion: 0.7.3\nid: external.orders\nexposes:\n  - id: orders\n"
         with patch(
@@ -200,7 +210,7 @@ class TestGitBackend:
             return_value=contract_text,
         ):
             result = _fetch_digest_via_git(ws, "external.orders", "1")
-        assert result is not None and result.startswith("sha256:")
+        assert result == compute_contract_digest(load_yaml_safe(contract_text))
 
     def test_missing_repo_returns_none(self):
         ws = self._ws()
@@ -344,3 +354,140 @@ class TestFetchFederatedDigestDispatch:
             assert fetch_federated_digest(ws_http, "p", "1", workspace_root=tmp_path) == "sha256:h"
             assert fetch_federated_digest(ws_cat, "p", "1", workspace_root=tmp_path) == "sha256:c"
             assert fetch_federated_digest(ws_git, "p", "1", workspace_root=tmp_path) == "sha256:g"
+
+
+# ──────────── Git backend: canonical-digest regression ─────────────────
+
+
+class TestGitBackendDigestIsCanonicalNotRawText:
+    """Regression pins for the git backend's digest algorithm.
+
+    ``_fetch_digest_via_git`` used to import a ``compute_contract_digest``
+    that did not exist anywhere in ``fluid_build``. The import was wrapped
+    in ``except Exception``, so it raised ImportError on *every* call and
+    silently fell through to ``sha256(contract_text)`` — a raw-text hash —
+    while the docstring and the call site both advertised the canonical
+    contract digest.
+
+    That divergence is invisible in a single workspace and only bites
+    across peers: two meshes holding the byte-for-byte *same meaning*
+    but different YAML formatting compute different digests, so
+    ``upstreamDigest`` pinning reports permanent phantom drift.
+
+    These tests fail if the raw-text branch (or any other
+    formatting-sensitive hash) ever comes back.
+    """
+
+    def _ws(self) -> FederatedWorkspace:
+        return FederatedWorkspace(
+            id="ext", kind="git_registry", endpoint="https://github.example/foo"
+        )
+
+    # The same contract, formatted three ways a real peer might write it:
+    # block vs flow style, quoted vs bare scalars, reordered keys,
+    # comments, and CRLF line endings.
+    _CANONICAL = (
+        "fluidVersion: 0.7.3\n"
+        "id: external.orders\n"
+        "exposes:\n"
+        "  - id: orders\n"
+        "    fields: [order_id, customer_id]\n"
+    )
+    _REFORMATTED = (
+        "# upstream peer formats its YAML differently\n"
+        "exposes:\n"
+        "- fields: ['order_id', \"customer_id\"]\n"
+        '  id: "orders"\n'
+        "id: 'external.orders'\n"
+        "fluidVersion: 0.7.3\n"
+    )
+    _CRLF = _CANONICAL.replace("\n", "\r\n")
+
+    def _digest_for(self, contract_text: str):
+        with patch(
+            "fluid_build.forge.federation._git_read_contract",
+            return_value=contract_text,
+        ):
+            return _fetch_digest_via_git(self._ws(), "external.orders", "1")
+
+    def test_compute_contract_digest_actually_exists(self):
+        """The symbol the git backend imports must be real.
+
+        This is the root-cause pin: the original bug was an import of a
+        name that was never defined, so ``fluid_build.forge.federation``
+        must expose the *same object* ``plan_digest`` defines.
+        """
+        from fluid_build.forge import federation as _fed
+
+        assert _fed.compute_contract_digest is compute_contract_digest
+
+    def test_digest_is_not_the_raw_text_hash(self):
+        """The old fallback hashed ``contract_text`` directly. Assert the
+        returned digest is NOT that value."""
+        raw_text_digest = "sha256:" + hashlib.sha256(self._CANONICAL.encode("utf-8")).hexdigest()
+        result = self._digest_for(self._CANONICAL)
+        assert result is not None
+        assert result != raw_text_digest, (
+            "git backend fell through to the raw-text hash — the canonical "
+            "contract digest is not being used"
+        )
+        assert result == compute_contract_digest(load_yaml_safe(self._CANONICAL))
+
+    def test_peers_formatting_the_same_contract_differently_agree(self):
+        """The invariant the canonical digest exists to provide."""
+        canonical = self._digest_for(self._CANONICAL)
+        reformatted = self._digest_for(self._REFORMATTED)
+        crlf = self._digest_for(self._CRLF)
+
+        assert canonical is not None
+        assert canonical == reformatted, (
+            "two peers holding the semantically identical contract must "
+            "agree on the digest regardless of YAML formatting"
+        )
+        assert canonical == crlf, "CRLF line endings must not perturb the digest"
+
+        # Sanity: a raw-text hash genuinely WOULD have disagreed, so the
+        # assertions above are not vacuous.
+        assert (
+            hashlib.sha256(self._CANONICAL.encode()).hexdigest()
+            != hashlib.sha256(self._REFORMATTED.encode()).hexdigest()
+        )
+
+    def test_real_content_change_still_changes_the_digest(self):
+        """Format-insensitivity must not become content-insensitivity."""
+        changed = self._CANONICAL.replace("customer_id", "customer_key")
+        assert self._digest_for(self._CANONICAL) != self._digest_for(changed)
+
+    def test_no_import_guard_swallows_a_missing_helper(self):
+        """A broken ``compute_contract_digest`` must fail loudly, never
+        degrade to a weaker digest.
+
+        Simulating the original failure mode: if the helper raises, the
+        error propagates instead of being traded for a raw-text hash.
+        """
+        with (
+            patch(
+                "fluid_build.forge.federation._git_read_contract",
+                return_value=self._CANONICAL,
+            ),
+            patch(
+                "fluid_build.forge.federation.compute_contract_digest",
+                side_effect=ImportError("boom"),
+            ),
+            pytest.raises(ImportError),
+        ):
+            _fetch_digest_via_git(self._ws(), "external.orders", "1")
+
+    @pytest.mark.parametrize(
+        "bad_text",
+        [
+            "fluidVersion: [unclosed\n",  # unparseable YAML
+            "just a bare scalar\n",  # parses, but not a mapping
+            "- a\n- b\n",  # parses to a list, not a mapping
+            "# only a comment\n",  # parses to None
+        ],
+    )
+    def test_malformed_upstream_fails_closed(self, bad_text: str):
+        """A malformed upstream contract yields ``None`` (escalated to a
+        violation by the caller) — never a fallback digest."""
+        assert self._digest_for(bad_text) is None
