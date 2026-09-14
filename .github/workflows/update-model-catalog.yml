@@ -19,21 +19,53 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Skip-clean when the API key is not configured, exactly as the Snowflake
+      # leg of integration.yml does and for the same reason: a weekly job that
+      # goes red because a secret was never set is not reporting a problem with
+      # this repository, it is reporting its own configuration — and a red run
+      # carrying no information is how a workflow stops being read at all.
+      #
+      # This one had NEVER succeeded. Every recorded run failed, no catalog
+      # update was ever produced, and ARTIFICIAL_ANALYSIS_API_KEY is absent —
+      # the repository has no secrets configured at all — so it could not have.
+      #
+      # Retiring it was the alternative. Keeping it costs nothing while skipped
+      # and starts working the moment somebody sets the key, which is the better
+      # of the two given the script and the pull-request wiring are both fine.
+      - name: Check for an Artificial Analysis API key
+        id: gate
+        env:
+          ARTIFICIAL_ANALYSIS_API_KEY: ${{ secrets.ARTIFICIAL_ANALYSIS_API_KEY }}
+        run: |
+          if [ -z "${ARTIFICIAL_ANALYSIS_API_KEY}" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ARTIFICIAL_ANALYSIS_API_KEY is not configured — skipping the catalog refresh. Set the secret to enable it."
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install dependencies
+        if: steps.gate.outputs.enabled == 'true'
         run: pip install httpx
 
       - name: Fetch latest model data
+        if: steps.gate.outputs.enabled == 'true'
         run: python scripts/update_model_catalog.py
         env:
           ARTIFICIAL_ANALYSIS_API_KEY: ${{ secrets.ARTIFICIAL_ANALYSIS_API_KEY }}
 
       - name: Check for catalog changes
         id: diff
+        if: steps.gate.outputs.enabled == 'true'
         run: |
           git diff --quiet fluid_build/cli/llm_models.json || echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Create PR if catalog changed
-        if: steps.diff.outputs.changed == 'true'
+        # Both conditions on purpose. A skipped `diff` step yields an empty
+        # output so the second alone would hold today, but that is a property
+        # of how Actions treats skipped steps rather than something this file
+        # states, and the next person to edit `diff` should not have to know it.
+        if: steps.gate.outputs.enabled == 'true' && steps.diff.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8.1.1
         with:
           title: 'chore: update LLM model catalog from Artificial Analysis'
