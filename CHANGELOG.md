@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] — 2026-09-15
+
+A front-door patch. Every fix here was already on `main` but landed *after* the
+`v0.15.0` tag, so none of it reached anyone who ran `pip install` — which is the
+whole reason this release exists.
+
+### Fixed
+
+- **`fluid --version` advertised a shipped feature as forthcoming.**
+  `next_milestone()` looped for a milestone with a future date, found none — the
+  bundled `roadmap.md` holds exactly two, both past — then fell through to
+  `return milestones[-1]` and the caller labelled it `next:`. The line read
+  `next: v1.5 · MCP Server · by Jun 11, 2026`, three months overdue, while the
+  MCP output port is a headline feature of the release printing it. `roadmap.md`
+  says so itself: "MCP Server (originally v1.5) shipped early". It now returns
+  `None` when every milestone is past and the teaser stops printing; every caller
+  already guarded on the empty string. No roadmap dates were invented. (#607)
+- **The banner claimed `forge-cli v1.0` while the package shipped 0.15.0**,
+  contradicting `fluid --version` two lines above it. It now reads the real
+  distribution version. (#607)
+- **The product did not link to its own documentation.** `fluid` and
+  `fluid --help` sent readers to `github.com/open-data-protocol/fluid` — the
+  *schema* repo — rather than the documentation site, and `fluid market --help`
+  deep-linked to a path that returns 404. The schema link is kept, relabelled
+  `Spec`, and repointed at the rendered spec site. (#607)
+- **The footer credited a domain with no DNS record.** `dig` returns nothing for
+  `dustlabs.co.za`, apex or www, while the package metadata, NOTICE and LICENSE
+  all name Agentics Transformation Limited. 0.14.1 corrected the published entity
+  across the distributed files and this string was missed. (#607)
+- **Every scaffolded contract carried a dead domain on line 2.** `fluid init`
+  wrote `# Docs: https://fluid-build.dev/docs/contracts` into the second line of
+  the first file a new user ever sees, and `fluid-build.dev` has no DNS record
+  either. Eight occurrences across six modules, each mapped to the page that
+  actually covers the topic rather than blanket-replaced; all six resulting URLs
+  return 200. (#609)
+
+### Changed
+
+- **The README is the PyPI project page** (`pyproject.toml` sets
+  `readme = "README.md"`) and cannot be edited after a version publishes. It was
+  698 lines, 26 headings and 10 badges, ~180 of them restating a CLI reference
+  that lives on the docs site. Now 372 lines, 11 headings, 6 badges, with every
+  claim carrying the command that proves it. The old "the only line that moves"
+  claim about swapping cloud is replaced by the measurable one: strip the
+  `binding:` block from the three platform contracts and the remainder hashes
+  identically. Sections that a reader could not reproduce — a Docker pull that
+  returns `unauthorized`, a provider `fluid providers` does not list — are gone
+  rather than softened. (#608)
+
+
 
 ## [0.15.0] — 2026-09-14
 
@@ -2894,7 +2944,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.13.1...v0.14.0
