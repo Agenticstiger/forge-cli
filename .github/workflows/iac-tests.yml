@@ -15,6 +15,24 @@ name: iac-tests
 # (Workload Identity Federation) entry points for their respective
 # clouds. No long-lived secrets stored anywhere.
 
+# ARMING THE STAGE 3 JOBS
+#
+# stage3-aws and stage3-gcp are gated on the IAC_STAGE3_ARMED repository
+# variable, not on their credentials. Secrets cannot gate a job-level `if:`,
+# so before this the scheduled run started both jobs, the OIDC and
+# workload-identity steps failed for want of credentials, and the workflow
+# went red. Every scheduled run failed for at least the eight days to
+# 2026-09-14, and probably far longer.
+#
+# Red for a reason nobody intends to fix is noise, and noise is how a real
+# failure hides. Unset, which is the default, these jobs now report skipped,
+# which is what they are. Set the variable to 'true' once the cloud
+# credentials exist and the nightly becomes meaningful again.
+#
+# Same mechanism as INTEGRATION_LIVE_ARMED in integration-live.yml and
+# INTEGRATION_CLOUD_ARMED in integration.yml. Stage 1 and Stage 2 are
+# unaffected: they need no credentials and run on every PR and push.
+
 on:
   pull_request:
     paths:
@@ -201,9 +219,11 @@ jobs:
     name: "Stage 3 — real AWS"
     runs-on: ubuntu-latest
     if: >
-      github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' &&
-       (inputs.stage == 'stage3-aws' || inputs.stage == 'stage3-all'))
+      vars.IAC_STAGE3_ARMED == 'true' && (
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' &&
+         (inputs.stage == 'stage3-aws' || inputs.stage == 'stage3-all'))
+      )
     env:
       AWS_REGION: eu-west-1
     steps:
@@ -252,9 +272,11 @@ jobs:
     name: "Stage 3 — real GCP"
     runs-on: ubuntu-latest
     if: >
-      github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' &&
-       (inputs.stage == 'stage3-gcp' || inputs.stage == 'stage3-all'))
+      vars.IAC_STAGE3_ARMED == 'true' && (
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' &&
+         (inputs.stage == 'stage3-gcp' || inputs.stage == 'stage3-all'))
+      )
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
