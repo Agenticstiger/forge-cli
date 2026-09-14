@@ -10,6 +10,29 @@ updates:
       prefix: "chore(deps)"
     labels:
       - dependencies
+    ignore:
+      # The mcp pin is deliberate, not stale. forge-cli supports SDK 1.x and
+      # 2.x behind one seam (fluid_build/_mcp_compat.py) and the pin stays
+      # <2.0 until that dual support has been audited end to end.
+      #
+      # Widening it is Phase 2 work, not a dependency bump. 2.x renamed model
+      # fields from camelCase to snake_case ON ATTRIBUTE ACCESS, which fails
+      # SILENTLY: a getattr for the old spelling returns the default, so
+      # errors read as success and schemas read as empty. Around a dozen read
+      # sites are affected. None of that surfaces as a test failure, so a
+      # green CI run on a widening PR is weak evidence rather than strong.
+      #
+      # Dependabot proposed the widening in #599 and the suite went red, which
+      # found one real 2.x defect (fixed in #602: tool errors were masked to
+      # "Error executing tool forge_run"). That is a good outcome, and it is
+      # still not a reason to widen.
+      #
+      # REMOVE THIS ENTRY at Phase 2, together with making the mcp drift
+      # canary's `latest` leg blocking instead of warn-only. Minor and patch
+      # updates inside 1.x are unaffected and keep arriving.
+      - dependency-name: mcp
+        update-types:
+          - version-update:semver-major
 
   - package-ecosystem: github-actions
     directory: /
