@@ -59,10 +59,29 @@ PROVIDER_CREATORS = {
 # Models we consider for flagship/balanced per provider.
 # The API returns many models; we only track the ones our adapters support.
 TRACKED_MODEL_PREFIXES = {
-    "openai": ["gpt-4", "gpt-3.5", "o1", "o3", "o4"],
+    # Generation-agnostic on purpose. This read ["gpt-4", "gpt-3.5", "o1",
+    # "o3", "o4"], which matches nothing OpenAI currently ships -- the live
+    # catalogue is gpt-5.x and gpt-6.x -- so the openai provider would have
+    # been silently skipped while the job reported success. An enumeration of
+    # model generations is a list that goes stale by design; a family prefix
+    # does not.
+    "openai": ["gpt-", "o1", "o3", "o4"],
     "anthropic": ["claude"],
     "gemini": ["gemini"],
 }
+
+#: Model families that share a provider prefix but are NOT callable through
+#: that provider's hosted API, so the adapters cannot use them whatever they
+#: score.
+#:
+#: `gpt-oss-*` is the concrete case and it is not hypothetical: it is
+#: open-weights, priced at $0.037/M against gpt-5.6-sol's $2.00/M, and scores
+#: 12.3 against 47.1. On "intelligence per dollar" that is an efficiency of 332
+#: versus 24, so it wins `balanced` and `routing` by a factor of fourteen while
+#: being four times less capable and unreachable by the OpenAI adapter. Cheap
+#: and uncallable beats good and callable under a pure ratio, which is why this
+#: list exists rather than a smarter formula.
+EXCLUDED_MODEL_MARKERS = ("gpt-oss",)
 
 # Capability defaults when the API doesn't provide them
 DEFAULT_CAPABILITIES = {
@@ -72,29 +91,95 @@ DEFAULT_CAPABILITIES = {
 }
 
 
+#: Where the model data comes from now, and why it moved.
+#:
+#: ``api.artificialanalysis.ai`` is GONE. Not unauthenticated -- undeployed:
+#: every path returns Vercel's ``DEPLOYMENT_NOT_FOUND`` while the product site
+#: itself serves 200. So the original fetch could not have worked with a key
+#: either, which is why this job never once succeeded.
+#:
+#: OpenRouter republishes Artificial Analysis's own index under
+#: ``benchmarks.artificial_analysis``, alongside pricing, from a public
+#: endpoint that needs no key at all. Same upstream numbers, same attribution
+#: owed, one less credential to hold.
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+#: OpenRouter lists priced variants of one model as separate ids --
+#: ``:batch`` at half price, ``:free`` at zero. They are the SAME model, so
+#: leaving them in hands "best intelligence per dollar" to whichever variant is
+#: cheapest and makes ``balanced`` a billing mode rather than a model choice.
+_VARIANT_SUFFIXES = (":batch", ":free", ":extended", ":thinking", ":online")
+
+
+def _normalise_openrouter(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Reshape OpenRouter's payload into the record ``pick_*`` already reads.
+
+    Adapting at this boundary rather than teaching the selection logic a second
+    schema: the ranking rules are the part worth keeping stable, and they are
+    unchanged by this move.
+    """
+    out: List[Dict[str, Any]] = []
+    for m in raw:
+        model_id = m.get("id") or ""
+        if "/" not in model_id or model_id.endswith(_VARIANT_SUFFIXES):
+            continue
+        creator, _, slug = model_id.partition("/")
+        if any(marker in slug for marker in EXCLUDED_MODEL_MARKERS):
+            continue
+        index = ((m.get("benchmarks") or {}).get("artificial_analysis") or {}).get(
+            "intelligence_index"
+        )
+        if index is None:
+            # No capability score means no basis for ranking. Dropping it is
+            # honest; keeping it at 0 would quietly rank it last on merit.
+            continue
+        # OpenRouter prices PER TOKEN as a string; the selection logic works in
+        # dollars per million.
+        try:
+            per_million = float((m.get("pricing") or {}).get("prompt") or 0) * 1_000_000
+        except (TypeError, ValueError):
+            continue
+        out.append(
+            {
+                "creator": {"slug": creator},
+                "api_model_id": slug,
+                "slug": slug,
+                "evaluations": {"intelligence_index": index},
+                "pricing": {"input_per_million_tokens": per_million},
+            }
+        )
+    return out
+
+
 def fetch_models_from_api(api_key: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
-    """Fetch model data from the Artificial Analysis API."""
+    """Fetch model data. ``api_key`` is accepted and unused -- none is needed.
+
+    Kept in the signature so the workflow's existing env wiring and any caller
+    passing one keep working rather than raising on an unexpected argument.
+    """
     try:
         import httpx
     except ImportError:
         print("httpx not installed — run: pip install httpx", file=sys.stderr)
         return None
 
-    headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
     try:
-        resp = httpx.get(
-            "https://api.artificialanalysis.ai/v0/models",
-            headers=headers,
-            timeout=30,
-        )
+        resp = httpx.get(OPENROUTER_MODELS_URL, timeout=30)
         resp.raise_for_status()
-        return resp.json().get("data", [])
+        models = _normalise_openrouter(resp.json().get("data", []))
     except Exception as exc:
-        print(f"Warning: Artificial Analysis API unavailable: {exc}", file=sys.stderr)
+        print(f"Warning: OpenRouter model API unavailable: {exc}", file=sys.stderr)
         return None
+
+    if not models:
+        # Reachable but useless: a 200 carrying nothing rankable must not be
+        # mistaken for "no models changed".
+        print(
+            "Warning: OpenRouter returned no models carrying an intelligence index.",
+            file=sys.stderr,
+        )
+        return None
+    return models
 
 
 def pick_flagship_and_balanced(
