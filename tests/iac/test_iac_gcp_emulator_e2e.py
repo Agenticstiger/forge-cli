@@ -62,6 +62,7 @@ outweigh the loss of a single apply-step check in Stage 2.
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, Dict
 
 import pytest
@@ -253,7 +254,17 @@ def test_emu_bigquery_sdk_create_read():
     from google.cloud import bigquery
 
     bq = gcp_emulator_bigquery_client()
-    dataset_id = f"{GCP_EMULATOR_PROJECT}.sdk_probe"
+    # Unique per run, matching the pattern in
+    # tests/providers/test_bigquery_emulated_happy_path.py. A fixed name
+    # made this test pass exactly ONCE per emulator container: goccy/
+    # bigquery-emulator answers a repeat create with
+    # ``internalError: dataset <id> is already created`` where real
+    # BigQuery answers 409 alreadyExists. ``exists_ok=True`` is
+    # implemented by catching the 409, so the client never saw an
+    # "already exists" — it saw a retryable server error, backed off,
+    # and burned the deadline. CI always passed it on a fresh container;
+    # running it twice locally hung for minutes and then failed.
+    dataset_id = f"{GCP_EMULATOR_PROJECT}.sdk_probe_{uuid.uuid4().hex[:8]}"
     table_id = f"{dataset_id}.events"
 
     ds = bigquery.Dataset(dataset_id)
@@ -275,7 +286,8 @@ def test_emu_gcs_sdk_create_read():
     """Emulator half: create a bucket via google-cloud-storage against
     the fake-gcs-server, read it back."""
     gcs = gcp_emulator_storage_client()
-    bucket_name = "fluid-emu-sdk-probe"
+    # Unique per run for the same reason as the BigQuery probe above.
+    bucket_name = f"fluid-emu-sdk-probe-{uuid.uuid4().hex[:8]}"
     # ``exists_ok`` idiom: get-or-create.
     try:
         bucket = gcs.get_bucket(bucket_name)
