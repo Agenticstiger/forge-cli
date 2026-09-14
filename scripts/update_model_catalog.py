@@ -83,12 +83,69 @@ TRACKED_MODEL_PREFIXES = {
 #: list exists rather than a smarter formula.
 EXCLUDED_MODEL_MARKERS = ("gpt-oss",)
 
-# Capability defaults when the API doesn't provide them
+# Per-provider fallback, used ONLY where litellm has no opinion. Until now this
+# was dead code -- defined, referenced nowhere -- while `build_catalog` carried
+# capability blocks forward from the previous file and never wrote new ones.
+#
+# `gemini.structured_output` was False here and litellm reports True for every
+# current Gemini model, which is the kind of drift a hand-maintained table
+# accumulates and the reason this is now the fallback rather than the source.
 DEFAULT_CAPABILITIES = {
     "openai": {"structured_output": True, "tool_use": True, "streaming": True},
     "anthropic": {"structured_output": True, "tool_use": True, "streaming": True},
-    "gemini": {"structured_output": False, "tool_use": True, "streaming": True},
+    "gemini": {"structured_output": True, "tool_use": True, "streaming": True},
 }
+
+#: litellm field -> our capability name, for the two it can answer.
+#:
+#: Coverage measured across all 3,923 entries of ``litellm.model_cost``:
+#: supports_response_schema 1444, supports_function_calling 2447. Both are
+#: present on every model this script currently selects.
+#:
+#: `streaming` is deliberately absent: ``supports_native_streaming`` appears on
+#: 251 entries, 6%, so litellm cannot answer it and pretending otherwise would
+#: turn silence into a False. All three providers stream over their chat APIs,
+#: so it comes from the table above.
+_LITELLM_CAPABILITY_FIELDS = {
+    "structured_output": "supports_response_schema",
+    "tool_use": "supports_function_calling",
+}
+
+
+def capabilities_for(provider: str, model_id: str) -> Dict[str, bool]:
+    """What a model can do, from litellm where it knows, the table where not.
+
+    litellm ships ``model_cost`` in-process -- already a dependency here, "the
+    canonical LLM backend" -- so this is a dict lookup, not a second network
+    call from a weekly job.
+
+    Absence is not False. litellm OMITS a flag it has no data for rather than
+    setting it false, so an absent key falls back to the provider default
+    instead of being read as "cannot". Getting that backwards would mark a
+    capable model incapable, and the consumer already fails closed:
+    ``model_catalog._model_has_capability`` returns False for any model it
+    cannot find, so a wrong False here is silent.
+    """
+    caps = dict(DEFAULT_CAPABILITIES.get(provider, {}))
+    try:
+        import litellm
+    except ImportError:
+        return caps
+
+    entry = litellm.model_cost.get(model_id)
+    if entry is None:
+        # litellm keys some models provider-qualified ("anthropic/claude-x").
+        entry = next(
+            (v for k, v in litellm.model_cost.items() if k.rsplit("/", 1)[-1] == model_id),
+            None,
+        )
+    if not isinstance(entry, dict):
+        return caps
+
+    for name, field in _LITELLM_CAPABILITY_FIELDS.items():
+        if field in entry:
+            caps[name] = bool(entry[field])
+    return caps
 
 
 #: Where the model data comes from now, and why it moved.
@@ -258,6 +315,33 @@ def build_catalog(api_models: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
         # Preserve existing models list + capabilities; API doesn't
         # provide per-model capability flags reliably, so we keep the
         # human-curated entries and only update flagship/balanced/routing.
+        #
+        # NEW: a model this script just PROMOTED also gets an entry, because
+        # until now it did not.
+        #
+        # The catalog names flagship / balanced / routing as bare ids, and
+        # `model_catalog._model_has_capability` looks those ids up in
+        # `models[]`, returning False for anything it cannot find. So promoting
+        # a model without adding its entry does not leave its capabilities
+        # unknown -- it asserts it has NONE. Measured before this change: all
+        # twelve selections across the three providers were absent from
+        # `models[]`, so the CLI would have disabled structured output and tool
+        # use for its own flagship, silently.
+        #
+        # It went unnoticed because the fetch never worked: the job could not
+        # promote anything, so nothing was ever missing.
+        listed = {m.get("id") for m in entry.get("models", [])}
+        for selected in (entry.get("flagship"), entry.get("balanced"), entry.get("routing")):
+            if selected and selected not in listed:
+                entry.setdefault("models", []).append(
+                    {
+                        "id": selected,
+                        "aliases": [],
+                        "capabilities": capabilities_for(provider, selected),
+                    }
+                )
+                listed.add(selected)
+
         providers_data[provider] = entry
 
     # Ollama is local — no API data, keep as-is

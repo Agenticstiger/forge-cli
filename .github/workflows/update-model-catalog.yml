@@ -30,8 +30,14 @@ jobs:
         with:
           python-version: '3.12'
 
+      # litellm alongside httpx: the script reads `litellm.model_cost`
+      # in-process for per-model capability flags. It is already a project
+      # dependency ("the canonical LLM backend"), but this job installs
+      # explicitly rather than the whole package, so it has to be named.
+      # Without it capabilities_for() falls back to the per-provider table --
+      # correct, but coarser than the data we already ship.
       - name: Install dependencies
-        run: pip install httpx
+        run: pip install httpx litellm
 
       # No API key. OpenRouter's model endpoint is public; the script explains
       # why the source moved off Artificial Analysis's own API.
