@@ -1,26 +1,62 @@
-# Stage 2 — admin-gated heavy emulated integration tests.
+# Stage 2 — heavy emulated integration tests.
 #
 # Docker-based emulators that are too heavy for the keyless community lane
 # (ci.yml `emulated-integration`, Stage 1):
-#   • bigquery-emulator (GCP) — keyless, but a Docker container;
-#   • LocalStack (AWS S3 + Glue) — needs a LOCALSTACK_AUTH_TOKEN, Docker.
+#   • GCP — goccy/bigquery-emulator + fsouza/fake-gcs-server + gcloud
+#     pubsub, via tests/iac/_gcp_emulator/docker-compose.yml. Keyless.
+#   • AWS — LocalStack (S3 + Glue). Needs LOCALSTACK_AUTH_TOKEN; Glue is a
+#     LocalStack Pro feature (Ultimate tier and above).
 #
-# Admin-gated the same way as the live lane (Stage 3): a maintainer applies
-# the `ci:integration-emulated` label and the job pauses for the
-# `integration-emulated` environment's required reviewer. integration-label-
-# guard.yml strips the label on each new push so the vouch must be renewed.
+# WHY THIS LANE RUNS NIGHTLY, NOT ON A LABEL AND NOT PER MERGE
+# ------------------------------------------------------------
+# It was label-gated + required-reviewer gated because emulated runs were
+# assumed to cost something. They do not: the repo is public, so standard
+# runners are free, and LocalStack removed its CI/CD build limits in March
+# 2026, so every paid plan runs unlimited in CI.
 #
-# `integration-emulated` is a SEPARATE environment from `integration-live`
-# — it holds only LOCALSTACK_AUTH_TOKEN, so approving an emulated run can
-# never expose the real cloud/LLM credentials.
+# The gate was not free, though. integration-label-guard.yml strips the
+# label on every push, so the vouch had to be re-applied and re-approved
+# per push; the one run that ever reached the queue sat unapproved for
+# twelve days and was cancelled. The lane proved nothing between
+# 2026-07-13 and now.
 #
-# The LocalStack half is skip-clean: with no LOCALSTACK_AUTH_TOKEN the
-# bigquery-emulator test still runs and the LocalStack test skips.
-name: Integration (emulated heavy, admin-gated)
+# Nightly rather than per-merge, deliberately. iac-tests.yml ALREADY runs
+# this same GCP emulator stack on every push to main (2-3 min, green), so
+# per-merge here would re-run covered ground; the only half it would add
+# is LocalStack. Against that: every run writes an `integration-emulated`
+# deployment record, and at ~19 merges a week that buries the environment
+# page this lane is meant to keep readable. Nightly puts ~3 merges between
+# runs — still cheap to bisect — for one record a day.
+#
+# Weekly would be too slow: ~19 merges between runs is not an attributable
+# failure. If that trade ever changes, this is a one-line edit to the cron.
+#
+# The `pull_request` path keeps the `ci:integration-emulated` label as its
+# maintainer vouch, re-vouched per push by integration-label-guard.yml;
+# that is the control that actually gates un-reviewed PR code, and
+# actionlint.yml enforces it. Use the label to prove a change here before
+# it merges, rather than waiting for the nightly.
+#
+# `integration-emulated` remains a SEPARATE environment from
+# `integration-live` — it holds only LOCALSTACK_AUTH_TOKEN, so this lane
+# can never reach the real cloud or LLM credentials.
+#
+# ANTI-SILENT-GREEN
+# -----------------
+# Every emulator test skips itself when its emulator is unreachable, which
+# is what keeps the suite laptop- and fork-runnable. The cost is a lane
+# that exits 0 having skipped what it advertises: this job selected 54
+# tests by marker, provisioned an emulator for 3, and reported success for
+# fourteen months. `scripts/ci/assert_lane_coverage.py` now fails the job
+# unless each area it provisioned actually contributed a passing test.
+name: Integration (emulated heavy)
 
 on:
   pull_request:
     types: [labeled, synchronize]
+  schedule:
+    # 05:00 UTC — clear of iac-tests (03:00) and integration.yml (04:00).
+    - cron: "0 5 * * *"
   workflow_dispatch:
 
 permissions:
@@ -32,10 +68,11 @@ concurrency:
 
 jobs:
   emulated-heavy:
-    name: Heavy emulated integration (bigquery-emulator + LocalStack)
+    name: Heavy emulated integration (GCP emulators + LocalStack)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     if: >-
+      github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'ci:integration-emulated')
     environment: integration-emulated
@@ -46,13 +83,29 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # Every test in tests/iac/test_iac_gcp_emulator_e2e.py is a `*_plan_clean`
+      # test: it shells out to `tofu init` + `tofu plan` to prove the emitted
+      # .tf.json is well-formed for the real google provider. Without the binary
+      # all ten skip themselves, and because they skip rather than fail, pytest
+      # still exits 0 — which is exactly how this lane went green while proving
+      # nothing. Same action SHA and tofu version as iac-tests.yml, deliberately:
+      # two lanes disagreeing about the provider version would be worse than
+      # neither running.
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
+        with:
+          tofu_version: 1.12.0
+
       - name: Install with heavy-emulator extras
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,test-emulators-heavy]"
 
       # Skip-clean: a secret cannot gate a job-level `if:`. With no token
-      # the LocalStack steps skip and only bigquery-emulator runs.
+      # the LocalStack steps skip and the GCP half still runs — EXCEPT on
+      # the nightly, where a missing token is the failure being looked
+      # for. A token that silently expires is how the sibling lane in
+      # command_center stayed dead across four commits.
       - name: Check for the LocalStack auth token
         id: gate
         env:
@@ -60,9 +113,15 @@ jobs:
         run: |
           if [ -n "$LOCALSTACK_AUTH_TOKEN" ]; then
             echo "localstack=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "::error::LOCALSTACK_AUTH_TOKEN is not set on the"
+            echo "::error::integration-emulated environment, so the AWS half"
+            echo "::error::of this lane cannot run. Set it with:"
+            echo "::error::  gh secret set LOCALSTACK_AUTH_TOKEN -R ${{ github.repository }} --env integration-emulated"
+            exit 1
           else
             echo "localstack=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::LOCALSTACK_AUTH_TOKEN not configured — running bigquery-emulator only; LocalStack tests will skip."
+            echo "::notice::LOCALSTACK_AUTH_TOKEN not configured — running the GCP half only; LocalStack tests will skip."
           fi
 
       - name: Start LocalStack
@@ -70,23 +129,69 @@ jobs:
         env:
           LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
         run: |
-          # Pin to an exact LocalStack version when arming this lane —
-          # the repo convention is fully-pinned container images.
+          # Fully pinned, per the repo's container-image convention. `stable`
+          # moved under this lane while it was dormant; an emulator that
+          # upgrades itself is not a fixed baseline to test against.
           docker run -d --name fluid-localstack -p 4566:4566 \
             -e LOCALSTACK_AUTH_TOKEN="$LOCALSTACK_AUTH_TOKEN" \
-            localstack/localstack:stable
+            localstack/localstack:2026.08.2
           for i in $(seq 1 60); do
             if curl -sf http://localhost:4566/_localstack/health >/dev/null 2>&1; then
               echo "LocalStack ready after ~$((i * 2))s"; break
             fi
             sleep 2
           done
+          curl -sf http://localhost:4566/_localstack/health || {
+            echo "::error::LocalStack did not become healthy within 120s."
+            docker logs fluid-localstack --tail=50 || true
+            exit 1
+          }
+
+      # Keyless — always. `-m emulated_heavy` selects the GCP emulator
+      # tiers, so the lane that names them has to provision them; without
+      # this they skipped silently inside a job called "bigquery-emulator".
+      - name: Start GCP emulators
+        run: |
+          docker compose -f tests/iac/_gcp_emulator/docker-compose.yml up -d
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9050/discovery/v1/apis/bigquery/v2/rest >/dev/null 2>&1; then
+              echo "bigquery-emulator ready after ~$((i * 2))s"; break
+            fi
+            sleep 2
+          done
+          curl -sf http://localhost:9050/discovery/v1/apis/bigquery/v2/rest >/dev/null || {
+            echo "::error::bigquery-emulator did not answer within 60s."
+            docker compose -f tests/iac/_gcp_emulator/docker-compose.yml logs --tail=50 || true
+            exit 1
+          }
 
       - name: Run heavy emulated integration tests
         timeout-minutes: 15
         env:
           FLUID_LOCALSTACK_ENDPOINT: http://localhost:4566
-        run: python -m pytest -v -m emulated_heavy
+          FLUID_IAC_LIVE_GCP_EMULATOR: "1"
+          PUBSUB_EMULATOR_HOST: "localhost:8085"
+          FLUID_GCP_BIGQUERY_EMULATOR: "http://localhost:9050"
+          FLUID_GCP_STORAGE_EMULATOR: "http://localhost:4443"
+        run: python -m pytest -v -m emulated_heavy --junitxml=emulated-heavy.xml
+
+      # pytest exits 0 on an all-skipped run. This does not.
+      - name: Assert the lane actually exercised its emulators
+        if: always()
+        run: |
+          requirements=(
+            --require "GCP emulator e2e=tests/iac/test_iac_gcp_emulator_e2e.py"
+            --require "GCP cross-project=tests/iac/test_iac_cross_project_gcp_emulator.py"
+            --require "BigQuery happy path=tests/providers/test_bigquery_emulated_happy_path.py"
+          )
+          if [ "${{ steps.gate.outputs.localstack }}" = "true" ]; then
+            requirements+=(--require "AWS LocalStack=tests/providers/test_aws_localstack_happy_path.py")
+          fi
+          python scripts/ci/assert_lane_coverage.py emulated-heavy.xml "${requirements[@]}"
+
+      - name: Stop GCP emulators
+        if: always()
+        run: docker compose -f tests/iac/_gcp_emulator/docker-compose.yml down || true
 
       - name: Stop LocalStack
         if: always() && steps.gate.outputs.localstack == 'true'
@@ -95,7 +200,7 @@ jobs:
   # ────────────────────────────────────────────────────────────────────
   # DataHub Quickstart lane — exercises the canonical DataHubRegistrar
   # against a real DataHub OSS GMS booted via the project's Docker
-  # Quickstart. Same admin-gate as the bigquery / LocalStack lane.
+  # Quickstart.
   #
   # Why a separate job (not folded into emulated-heavy above):
   #   - DataHub Quickstart is its own multi-container stack (GMS,
@@ -103,7 +208,7 @@ jobs:
   #     LocalStack on one runner peaks at ~12 GB RAM, which exceeds
   #     `ubuntu-latest`'s 7 GB limit.
   #   - Quickstart pull + boot is ~3-4 min on a cold runner; isolating
-  #     it lets the bigquery-emulator job finish independently and
+  #     it lets the GCP + LocalStack job finish independently and
   #     keeps the failure surface attributable.
   #
   # Secret-less. The `datahub` CLI exposes a self-contained Quickstart
@@ -117,6 +222,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     if: >-
+      github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'ci:integration-emulated')
     environment: integration-emulated
