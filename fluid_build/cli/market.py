@@ -417,7 +417,7 @@ def register(subparsers: argparse._SubParsersAction):
             "  fluid market --search 'customer analytics' --format json\n\n"
             "Supported catalogs: Google Data Catalog, AWS Glue, Azure Purview,\n"
             "Apache Atlas, DataHub, Collibra, Alation, custom REST.\n\n"
-            "Docs: https://github.com/open-data-protocol/fluid/blob/main/docs/market.md"
+            "Docs: https://agenticstiger.github.io/forge_docs/cli/market.html"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

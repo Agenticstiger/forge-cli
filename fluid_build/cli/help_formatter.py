@@ -123,7 +123,7 @@ def print_first_run_help(parser: argparse.ArgumentParser) -> None:
             "[bright_yellow]fluid import[/bright_yellow]                  Migrate from dbt/Terraform\n"
             "[bright_yellow]fluid --help[/bright_yellow]                  See all commands & options\n"
             "[bright_yellow]fluid <cmd> -h[/bright_yellow]                Help for a specific command\n\n"
-            "[dim]📚 Docs:[/dim]  [bright_cyan]https://github.com/open-data-protocol/fluid[/bright_cyan]",
+            "[dim]📚 Docs:[/dim]  [bright_cyan]https://agenticstiger.github.io/forge_docs/[/bright_cyan]",
             title="[bold bright_white]What's next?[/bold bright_white]",
             title_align="left",
             border_style="bright_white",
@@ -363,13 +363,23 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
     console.print(f"  {bar}")
 
     # ── Footer ──────────────────────────────────────────────────────
+    # Two pointers, not one. "Docs" used to carry the schema repository,
+    # which is where the contract JSON Schema lives, not where the
+    # documentation lives — so the product did not link to its own docs
+    # from its own front door. Docs now resolves to the docs site; the
+    # open-spec pointer survives on its own line under the label it always
+    # deserved, spelled the way README.md spells it. One URL per line so
+    # both fit an 80-column terminal without Rich wrapping them.
     console.print(
-        "  [dim]Docs[/dim]  [bright_cyan]https://github.com/open-data-protocol/fluid[/bright_cyan]   "
+        "  [dim]Docs[/dim]  [bright_cyan]https://agenticstiger.github.io/forge_docs/[/bright_cyan]"
+    )
+    console.print(
+        "  [dim]Spec[/dim]  [bright_cyan]https://open-data-protocol.github.io/fluid/[/bright_cyan]   "
         "[dim]│[/dim]   "
         "[dim]Health[/dim]  [bright_cyan]fluid doctor[/bright_cyan]"
     )
     console.print(
-        "  [dim italic]Made with ❤️  by DustLabs.co.za — building the future of declarative data engineering[/dim italic]"
+        "  [dim italic]Made with ❤️  by Agentics Transformation Limited — building the future of declarative data engineering[/dim italic]"
     )
     console.print()
 

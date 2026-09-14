@@ -80,12 +80,47 @@ def load_milestones() -> list[RoadmapMilestone]:
 
 
 def next_milestone(today: Optional[date] = None) -> Optional[RoadmapMilestone]:
+    """Return the earliest milestone still ahead of ``today``, or ``None``.
+
+    The ``None`` return is this function's whole contract, and it used to be
+    unreachable. The loop looked for the first milestone whose target date had
+    not yet passed; when every bundled milestone was in the past it fell
+    through to ``return milestones[-1]`` and handed the most recently
+    *shipped* milestone back to callers that label it ``next:``. Running the
+    published wheel on 2026-09-14 therefore printed
+    ``next: v1.5 . MCP Server . by Jun 11, 2026`` — a target date three months
+    gone, naming an output port that the very release printing the line
+    already ships.
+
+    Dropping the fallback is the fix, and the absence is deliberate. Both
+    callers (:func:`compact_next_line` and :func:`print_v2_banner`) already
+    treat ``None`` as "print nothing", as do the three call sites that consume
+    them, so an exhausted roadmap now drops the teaser line instead of
+    advertising delivered work as forthcoming. Reinstating a fallback would
+    mean either mislabelling a past milestone or inventing a future target
+    date; the bundled ``roadmap.md`` is the only place a real one can come
+    from, and when it gains a future milestone the line returns on its own.
+    """
     today = today or _today()
     for milestone in load_milestones():
         if milestone.target_date >= today:
             return milestone
-    milestones = load_milestones()
-    return milestones[-1] if milestones else None
+    return None
+
+
+def _package_version() -> str:
+    """Resolve the installed distribution version, looked up at call time.
+
+    The import is local rather than module-scope for two reasons. This module
+    is imported from ``fluid_build.cli.__init__`` while that package is still
+    initialising, so reaching for the root package at import time would add an
+    ordering constraint for no gain. And a late lookup means a test can
+    substitute ``fluid_build.__version__`` through the one public attribute
+    that owns it, rather than shadowing a name re-bound into this module.
+    """
+    from fluid_build import __version__
+
+    return str(__version__)
 
 
 def banner_enabled(surface: str, *, quiet: bool = False) -> bool:
@@ -130,7 +165,11 @@ def print_v2_banner(surface: str, *, quiet: bool = False) -> None:
     if milestone is None:
         return
     cprint("─────────────────────────────────────────────────────────────────────────")
-    cprint("  forge-cli v1.0  ·  Data-Model Forge is live")
+    # The version was the hardcoded literal "v1.0" while the package shipped
+    # 0.15.0, so the banner and ``fluid --version`` disagreed about the same
+    # binary in the same session. Read the distribution version instead: it is
+    # the only version number this process can actually attest to.
+    cprint(f"  forge-cli v{_package_version()}  ·  Data-Model Forge is live")
     cprint(
         f"  ▸ {milestone.version} ({milestone.title}) lands by "
         f"{milestone.target_date.strftime('%b %d, %Y')} — see fluid roadmap"
