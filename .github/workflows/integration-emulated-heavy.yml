@@ -169,6 +169,14 @@ jobs:
         timeout-minutes: 15
         env:
           FLUID_LOCALSTACK_ENDPOINT: http://localhost:4566
+          # The IaC round-trips are triple-gated: `tofu` on PATH (installed
+          # above), LocalStack reachable, and this opt-in. AWS_* are
+          # LocalStack's conventional dummy credentials — NOT the emulator's
+          # own bypass; the auth token is what unlocks Glue and Lake Formation.
+          FLUID_IAC_LIVE_LOCALSTACK: "1"
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
           FLUID_IAC_LIVE_GCP_EMULATOR: "1"
           PUBSUB_EMULATOR_HOST: "localhost:8085"
           FLUID_GCP_BIGQUERY_EMULATOR: "http://localhost:9050"
@@ -186,6 +194,7 @@ jobs:
           )
           if [ "${{ steps.gate.outputs.localstack }}" = "true" ]; then
             requirements+=(--require "AWS LocalStack=tests/providers/test_aws_localstack_happy_path.py")
+            requirements+=(--require "AWS IaC round-trips=tests/iac/test_iac_aws_localstack_e2e.py")
           fi
           python scripts/ci/assert_lane_coverage.py emulated-heavy.xml "${requirements[@]}"
 

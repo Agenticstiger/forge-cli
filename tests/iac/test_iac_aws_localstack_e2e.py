@@ -66,6 +66,14 @@ pytestmark = [
     pytest.mark.provider,
     pytest.mark.aws,
     pytest.mark.slow,
+    # Stage 2, so the nightly heavy lane selects it. These fourteen round-trips
+    # are the repo's strongest AWS evidence and had never run in CI anywhere:
+    # iac-tests.yml is the only workflow that referenced them and it declares no
+    # `environment:`, so it cannot read LOCALSTACK_AUTH_TOKEN, which lives on the
+    # `integration-emulated` environment. integration-emulated-heavy.yml already
+    # has that environment, starts LocalStack, and installs OpenTofu — running
+    # them there costs one marker instead of widening the secret's scope.
+    pytest.mark.emulated_heavy,
 ]
 
 
