@@ -259,7 +259,7 @@ updated.
   a contract could name. Check 3 now reads the same `UNCONSTRAINED_JURISDICTIONS`
   constant the query-time caller gate uses, so both paths agree on what a catch-all
   means. Enforcement is otherwise unchanged: a contract pinning `EU` with an expose
-  in `us-east-1` still fails under strict. (PR_PLACEHOLDER)
+  in `us-east-1` still fails under strict. (#606)
 - **The region→jurisdiction table is derived from the vendors' own data instead of
   hand-kept, and it had said London was in the EU.** 31 hand-typed regions mapped
   `eu-west-2` and `europe-west2` — both London — to `EU`, and `Global` was worse,
