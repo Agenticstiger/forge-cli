@@ -86,6 +86,32 @@ def attr(obj: Any, snake: str, camel: str, default: Any = None) -> Any:
     return getattr(obj, camel, default)
 
 
+def get_tool_error() -> type:
+    """Return the exception class a tool raises for an anticipated failure.
+
+    v2 draws a line v1 did not. Its own docstring: "Raise this from a tool
+    for a failure you saw coming: the call returns ``is_error=True`` with
+    your message in ``content``... Any other exception bar ``MCPError`` is
+    treated as a crash: the model sees only ``Error executing tool <name>``."
+
+    So a ``RuntimeError`` carrying an actionable message reaches the IDE
+    intact on v1 and is replaced by that generic string on v2. The failure is
+    silent in the direction that matters: the call still returns
+    ``isError=True``, so nothing looks broken, and the operator simply loses
+    the sentence telling them what to do about it.
+
+    The class also moved: ``mcp.server.fastmcp.exceptions`` on v1,
+    ``mcp.server.mcpserver.exceptions`` on v2.
+    """
+    if is_v2():
+        from mcp.server.mcpserver.exceptions import ToolError
+
+        return ToolError
+    from mcp.server.fastmcp.exceptions import ToolError  # type: ignore[no-redef]
+
+    return ToolError
+
+
 def get_server_api() -> tuple[type, type]:
     """Return ``(ServerCls, Context)`` for the high-level decorator API.
 
