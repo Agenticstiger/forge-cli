@@ -109,7 +109,7 @@ def _modules_handling_sdk_objects() -> list[Path]:
 def test_the_scan_actually_finds_the_sdk_modules() -> None:
     """Guard the guard: a broken detector would pass everything vacuously."""
     modules = _modules_handling_sdk_objects()
-    # Measured at 20 on 2026-09-14. The floor is deliberately below that so
+    # Measured at 21 on 2026-09-14. The floor is deliberately below that so
     # deleting one module does not fail the suite, but high enough that a
     # broken detector returning a handful cannot pass.
     assert len(modules) >= 15, (
