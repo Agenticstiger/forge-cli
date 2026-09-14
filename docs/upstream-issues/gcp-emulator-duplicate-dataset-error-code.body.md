@@ -22,7 +22,7 @@ client.create_dataset(ds, exists_ok=True)   # second run hangs here
 does, because the API answers a duplicate create with HTTP 409 and reason
 `duplicate` / `alreadyExists`, and the client catches exactly that:
 
-> `google/cloud/bigquery/client.py` — `except core_exceptions.Conflict: if not exists_ok: raise; return self.get_dataset(...)`
+> `google/cloud/bigquery/client.py`: `except core_exceptions.Conflict: if not exists_ok: raise; return self.get_dataset(...)`
 
 ## What happens instead
 
@@ -52,7 +52,7 @@ create, e.g.
  "errors": [{"reason": "duplicate", "message": "Already Exists: ..."}], "status": "ALREADY_EXISTS"}}
 ```
 
-`Table` creation is worth checking for the same thing — we did not get far
+`Table` creation is worth checking for the same thing, though we did not get far
 enough to confirm, because the dataset call fails first.
 
 ## Impact
@@ -65,3 +65,10 @@ reads as flakiness or as a network problem, not as an API-fidelity gap.
 ## Version
 
 `ghcr.io/goccy/bigquery-emulator:latest`, pulled 2026-09-14.
+
+## Possibly related
+
+#213 looks adjacent (it reports "already created" too) but the symptom there is
+non-deterministic and shows up after creating a couple of dozen datasets, where
+this one is deterministic on the second create of the same dataset. Might share
+a root cause, might not.
