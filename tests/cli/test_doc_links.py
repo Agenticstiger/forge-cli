@@ -44,7 +44,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from fluid_build import _error_catalog as cat
-from fluid_build._errors import _DOC_FALLBACK, _DOC_ROUTES, _DOC_SITE, doc_url
+from fluid_build._errors import _DOC_BASE, _DOC_FALLBACK, _DOC_ROUTES, doc_url
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 PACKAGE = REPO / "fluid_build"
@@ -65,7 +65,7 @@ RETIRED_HOSTS = frozenset(
     }
 )
 
-DOCS_HOST = urlsplit(_DOC_SITE).netloc
+DOCS_HOST = urlsplit(_DOC_BASE).netloc
 
 # `[` is excluded as well as `]`: these URLs sit inside rich markup like
 # `https://…[/dim]`, and a captured `[` makes urlsplit read the rest as an
@@ -142,9 +142,9 @@ def test_doc_url_never_invents_a_path():
         "troubleshooting#made-up-anchor",
     ):
         url = doc_url(topic)
-        assert url.startswith(_DOC_SITE + "/")
+        assert url.startswith(_DOC_BASE + "/")
         assert (
-            url.removeprefix(_DOC_SITE + "/") in known
+            url.removeprefix(_DOC_BASE + "/") in known
         ), f"topic {topic!r} produced an invented path: {url}"
 
 
@@ -153,7 +153,7 @@ def test_every_catalogued_event_lands_on_a_real_route():
     strays = {}
     for event in cat.catalogued_events():
         url = cat.docs_url_for(event)
-        route = url.removeprefix(_DOC_SITE + "/")
+        route = url.removeprefix(_DOC_BASE + "/")
         if route not in known:
             strays[event] = url
     assert strays == {}, f"events pointing off the route map: {strays}"
@@ -162,7 +162,7 @@ def test_every_catalogued_event_lands_on_a_real_route():
 @pytest.mark.parametrize("route", sorted(set(_DOC_ROUTES.values()) | {_DOC_FALLBACK}))
 def test_mapped_routes_are_shaped_like_docs_routes(route):
     """A VuePress route: a page or a directory index, relative, no placeholder."""
-    assert not route.startswith("/"), "routes join onto _DOC_SITE + '/'"
+    assert not route.startswith("/"), "routes join onto _DOC_BASE + '/'"
     assert "{" not in route and " " not in route, "not a template or a sentence"
     page = route.split("#", 1)[0]
     assert page.endswith(".html") or page.endswith(

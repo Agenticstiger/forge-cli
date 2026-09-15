@@ -42,9 +42,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-_DOC_SITE = "https://agenticstiger.github.io/forge_docs"
-# Re-exported by ``_error_catalog`` and asserted as a prefix by its tests.
-_DOC_BASE = _DOC_SITE
+# The docs site root. Re-exported by ``_error_catalog`` as ``DOC_BASE``, listed
+# in two ``__all__``s, and asserted as a URL prefix by four tests — a static
+# analyser that reads this module alone will report it unused; it is not.
+_DOC_BASE = "https://agenticstiger.github.io/forge_docs"
 
 # Topic -> a route the docs site ACTUALLY SERVES.
 #
@@ -90,7 +91,7 @@ def doc_url(topic: Optional[str] = None) -> str:
     Never composes a path out of an unknown topic: an unmapped topic is a page
     nobody has written, and guessing its URL is how a link rots invisibly.
     """
-    return f"{_DOC_SITE}/{_DOC_ROUTES.get(topic or '', _DOC_FALLBACK)}"
+    return f"{_DOC_BASE}/{_DOC_ROUTES.get(topic or '', _DOC_FALLBACK)}"
 
 
 @dataclass
