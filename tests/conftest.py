@@ -353,6 +353,55 @@ def _disable_ssrf_guard_for_unit_tests(request):
         yield
 
 
+# ── Catalog registrar registry isolation: no test may leak a registrar ──
+#
+# ``fluid_build.build_runners._catalog._REGISTRY`` is a process-global dict
+# with a public writer (``register_registrar``) and no un-register. It is the
+# FIRST thing both dispatchers consult — ``register_all`` and
+# ``register_all_payload`` return whatever is in it before they ever look at
+# env vars, ``target_configs`` or the backend spec. So membership in this dict
+# IS the definition of "this catalog target is configured", and it outranks
+# every knob a test can set.
+#
+# One test seeding it and forgetting to clean up therefore reconfigures every
+# later test in the same worker. That is not hypothetical: a test that seeded
+# an OpenMetadata registrar pointing at the respx placeholder host
+# ``https://openmetadata.test`` left it behind, and
+# ``test_unconfigured_publish_names_the_missing_setting`` — which configures
+# nothing and asserts the operator is told which setting is missing — resolved
+# that leaked registrar instead, issued a real HTTP PUT and failed with
+# ``[Errno 8] nodename nor servname provided, or not known``. The respx router
+# that made the host safe was function-scoped and had already been torn down.
+# It only showed up under some pytest-randomly orderings, because alphabetical
+# collection happens to run the victim first.
+#
+# Every cleanup for this registry in the suite is hand-written per test
+# (``orch._REGISTRY.pop(...)`` in a finally), so the invariant held only by
+# author discipline. Snapshot and restore around every test and the leak class
+# is dead regardless of which test forgets. Costs nothing for the vast
+# majority of tests, which never import the module.
+@pytest.fixture(autouse=True)
+def _isolate_catalog_registrar_registry():
+    import sys
+
+    module_name = "fluid_build.build_runners._catalog"
+    module = sys.modules.get(module_name)
+    # None means "not imported yet"; the registry is empty at import time, so
+    # a test that imports it mid-run must leave it empty again.
+    before = dict(module._REGISTRY) if module is not None else None
+
+    yield
+
+    module = sys.modules.get(module_name)
+    if module is None:  # pragma: no cover — nothing could have been seeded
+        return
+    try:
+        module._REGISTRY.clear()
+        module._REGISTRY.update(before or {})
+    except Exception:  # pragma: no cover — never fail teardown
+        pass
+
+
 # ── Source-aligned acquisition test infrastructure (Slice A) ────────────
 #
 # Re-export the shared fixtures from tests/_infrastructure/ so individual
