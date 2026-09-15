@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.3] — 2026-09-15
+
+`0.15.2` existed to stop the front door pointing at links that go nowhere. It
+missed the worse case: links that go somewhere, owned by someone else.
+`docs.fluid.io` resolves, returns 200, and belongs to an unrelated fintech, and
+`fluid validate` printed it into its own error output:
+
+```
+$ fluid validate contract.fluid.yaml
+  ❌ Unknown provider 'redshift'
+  📚 Docs: https://docs.fluid.io/providers
+```
+
 ### Fixed
 
 - **Shipped templates pointed at another company's documentation site.**
