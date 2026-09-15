@@ -66,7 +66,7 @@ _DOC_ROUTES = {
     "cost": "advanced/cost-tracking.html",
     "installation": "getting-started/",
     "providers": "cli/providers.html",
-    "secrets": "cli/secrets.html",
+    "secrets": "cli/secrets.html",  # pragma: allowlist secret
     "sovereignty": "concepts/sovereignty.html",
     "sovereignty#residency": "concepts/sovereignty.html",
     "supply-chain": "cli/verify-signature.html",
