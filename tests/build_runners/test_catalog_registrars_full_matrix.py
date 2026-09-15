@@ -225,9 +225,25 @@ class TestRegisterAllDispatcher:
     def test_register_all_routes_to_each_registered_target(
         self, datahub_mock, openmetadata_mock, monkeypatch
     ):
-        register_registrar("datahub", DataHubRegistrar(base_url="https://datahub.test"))
-        register_registrar(
-            "openmetadata", OpenMetadataRegistrar(base_url="https://openmetadata.test")
+        # ``register_registrar`` writes into the process-global
+        # ``_catalog._REGISTRY`` and there is no un-register, so a plain call
+        # here outlived this test. The respx routers that make
+        # ``*.test`` safe are function-scoped and died at teardown; the
+        # registrar objects did not. A later test that had configured
+        # nothing then resolved this live OpenMetadata registrar out of the
+        # registry (``register_all_payload`` consults it BEFORE
+        # ``build_registrar``) and dialled ``https://openmetadata.test`` for
+        # real. ``monkeypatch.setitem`` unwinds automatically, so the
+        # registrars now die with the routers.
+        from fluid_build.build_runners import _catalog as orch
+
+        monkeypatch.setitem(
+            orch._REGISTRY, "datahub", DataHubRegistrar(base_url="https://datahub.test")
+        )
+        monkeypatch.setitem(
+            orch._REGISTRY,
+            "openmetadata",
+            OpenMetadataRegistrar(base_url="https://openmetadata.test"),
         )
         plan = CatalogPlan(targets=["datahub", "openmetadata"])
         outcome = register_all(

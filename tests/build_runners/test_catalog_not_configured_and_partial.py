@@ -34,7 +34,8 @@ Two ways a publish told the operator the wrong thing:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+import socket
+from typing import Any, Dict, Iterator, List
 
 import pytest
 
@@ -78,6 +79,64 @@ _ENDPOINT_ENV = (
 def no_catalog_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in _ENDPOINT_ENV:
         monkeypatch.delenv(name, raising=False)
+
+
+class NetworkAccessForbidden(AssertionError):
+    """A test in this module tried to open a socket."""
+
+
+@pytest.fixture(autouse=True)
+def forbid_network(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """No test in this file may reach the network, and a breach says so.
+
+    Every test here is about a target that is NOT configured, so a publish
+    that opens a socket is by definition a bug — either the refusal path
+    broke, or a registrar leaked into the process-global
+    ``_catalog._REGISTRY`` from an earlier test and got resolved ahead of
+    ``build_registrar``. That leak really happened, and the symptom was
+    ``[Errno 8] nodename nor servname provided, or not known`` from a real
+    DNS lookup of ``openmetadata.test``: a failure mode that reads like
+    flaky infrastructure, takes a resolver timeout to arrive, and gets a
+    test marked flaky instead of read.
+
+    So: ban DNS and connect outright, and — because ``register_all_payload``
+    catches ``Exception`` and folds it into a ``RegistrationResult`` where a
+    raised guard could still be swallowed — record every attempt and fail
+    the test at teardown naming what was dialled.
+    """
+    attempts: List[str] = []
+
+    def _refuse(where: str, target: object) -> NetworkAccessForbidden:
+        attempts.append(f"{where} -> {target!r}")
+        return NetworkAccessForbidden(
+            f"network access is forbidden in this module ({where} -> {target!r}); "
+            "nothing here configures a catalog endpoint, so this means a registrar "
+            "leaked into fluid_build.build_runners._catalog._REGISTRY"
+        )
+
+    def _getaddrinfo(host: object, port: object, *_a: object, **_kw: object) -> None:
+        raise _refuse("socket.getaddrinfo", (host, port))
+
+    def _create_connection(address: object, *_a: object, **_kw: object) -> None:
+        raise _refuse("socket.create_connection", address)
+
+    def _connect(_self: object, address: object, *_a: object, **_kw: object) -> None:
+        raise _refuse("socket.socket.connect", address)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+    monkeypatch.setattr(socket, "create_connection", _create_connection)
+    monkeypatch.setattr(socket.socket, "connect", _connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", _connect)
+
+    yield
+
+    if attempts:
+        pytest.fail(
+            "a socket was opened by a test that configures no catalog endpoint: "
+            + "; ".join(attempts)
+            + " — check fluid_build.build_runners._catalog._REGISTRY for a "
+            "registrar leaked by an earlier test"
+        )
 
 
 # ---------------------------------------------------------------------------
