@@ -43,6 +43,13 @@ $ fluid validate no-such.fluid.yaml
 - **`fluid apply --help` printed a 404** (`.../blob/main/docs/apply.md` in the
   schema repo), and `fluid demo`'s failure panel sent bug reports to the schema
   repo's issue tracker rather than this project's (#612)
+- **The docs link wrapped mid-URL, which made it unclickable.** Found by running
+  the built wheel, not by reading the diff: Rich word-wraps at the terminal width,
+  so all three sites that print a `📖` link put a real newline inside the URL at 80
+  columns. The dead `forge.fluid.dev/ref/…` links this release replaces were short
+  enough to fit; the real routes are not, so fixing the destination without this
+  would have traded a link that went nowhere for a link you cannot click. All
+  three now pass `soft_wrap=True` (#612)
 
 ### Changed
 
