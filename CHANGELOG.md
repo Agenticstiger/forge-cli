@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   15 typed `FluidUserError` classes and all 54 catalogued events printed a `Docs:`
   line pointing at nothing. This is the third dead host found in the same family;
   the sweep that removed `fluid-build.dev` and `dustlabs.co.za` in 0.15.1 grepped
-  for *those* names, so a host that had never been grepped for survived it.
+  for *those* names, so a host that had never been grepped for survived it (#612)
 - **The docs path was composed out of the topic name**, which is the half a host
   swap would not have fixed. `f"{DOC_BASE}/{topic}"` produced a confident URL for
   every topic word whether or not a page existed, and eleven of the sixteen topics
@@ -22,14 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   34 of the 54 catalogued events. Topics now resolve through a map of routes the
   documentation site actually serves; an unmapped topic goes to the troubleshooting
   page instead of to a URL invented from its own name. All 24 resulting URLs
-  return 200, verified individually.
+  return 200, verified individually (#612)
 - **A scaffolded Airflow DAG shipped a dead link into the user's repository.**
   `fluid init` wrote `https://fluid.dev/docs/orchestration` into the generated
   DAG's `README.md`, so the link persisted in their project rather than scrolling
-  past in a terminal. Found by the new gate on its first run, not by a grep.
+  past in a terminal. Found by the new gate on its first run, not by a grep (#612)
 - **`fluid apply --help` printed a 404** (`.../blob/main/docs/apply.md` in the
   schema repo), and `fluid demo`'s failure panel sent bug reports to the schema
-  repo's issue tracker rather than this project's.
+  repo's issue tracker rather than this project's (#612)
 
 ### Changed
 
@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checked pointed at a nonexistent host. `tests/cli/test_doc_links.py` replaces it
   and asserts the two things that actually break — the host stops existing, and
   the path is invented rather than taken from a page somebody wrote. Each of its
-  assertions was verified by seeding the defect and watching it go red.
+  assertions was verified by seeding the defect and watching it go red (#612)
 
 ## [0.15.1] — 2026-09-15
 
