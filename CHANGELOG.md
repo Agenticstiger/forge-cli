@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.2] — 2026-09-15
+
+A second front-door patch, for the same reason as the first: the release notes for
+`0.15.1` announced that dead documentation domains had been cleaned up, and
+`0.15.1` shipped a third one. It was not a stray string — it was `_DOC_BASE`, the
+documented single source of truth, so **every** typed error and every catalogued
+event printed it. One mistyped filename was enough to see it:
+
+```
+$ fluid validate no-such.fluid.yaml
+   📖 https://forge.fluid.dev/ref/troubleshooting#err_contract_file_not_found
+```
+
+### Fixed
+
+- **Every typed error linked to a domain that does not exist.** `_DOC_BASE` was
+  `https://forge.fluid.dev/ref`, and `forge.fluid.dev` has no DNS record — so all
+  15 typed `FluidUserError` classes and all 54 catalogued events printed a `Docs:`
+  line pointing at nothing. This is the third dead host found in the same family;
+  the sweep that removed `fluid-build.dev` and `dustlabs.co.za` in 0.15.1 grepped
+  for *those* names, so a host that had never been grepped for survived it (#612)
+- **The docs path was composed out of the topic name**, which is the half a host
+  swap would not have fixed. `f"{DOC_BASE}/{topic}"` produced a confident URL for
+  every topic word whether or not a page existed, and eleven of the sixteen topics
+  in use had none — including `troubleshooting`, the fall-through destination for
+  34 of the 54 catalogued events. Topics now resolve through a map of routes the
+  documentation site actually serves; an unmapped topic goes to the troubleshooting
+  page instead of to a URL invented from its own name. All 24 resulting URLs
+  return 200, verified individually (#612)
+- **A scaffolded Airflow DAG shipped a dead link into the user's repository.**
+  `fluid init` wrote `https://fluid.dev/docs/orchestration` into the generated
+  DAG's `README.md`, so the link persisted in their project rather than scrolling
+  past in a terminal. Found by the new gate on its first run, not by a grep (#612)
+- **`fluid apply --help` printed a 404** (`.../blob/main/docs/apply.md` in the
+  schema repo), and `fluid demo`'s failure panel sent bug reports to the schema
+  repo's issue tracker rather than this project's (#612)
+- **The docs link wrapped mid-URL, which made it unclickable.** Found by running
+  the built wheel, not by reading the diff: Rich word-wraps at the terminal width,
+  so all three sites that print a `📖` link put a real newline inside the URL at 80
+  columns. The dead `forge.fluid.dev/ref/…` links this release replaces were short
+  enough to fit; the real routes are not, so fixing the destination without this
+  would have traded a link that went nowhere for a link you cannot click. All
+  three now pass `soft_wrap=True` (#612)
+
+### Changed
+
+- **`test_docs_urls_are_well_formed_under_doc_base` is gone**, because it could
+  not fail: "well formed" meant "starts with the base the builder had just
+  prefixed to it". It was green throughout the releases in which every URL it
+  checked pointed at a nonexistent host. `tests/cli/test_doc_links.py` replaces it
+  and asserts the two things that actually break — the host stops existing, and
+  the path is invented rather than taken from a page somebody wrote. Each of its
+  assertions was verified by seeding the defect and watching it go red (#612)
+
 ## [0.15.1] — 2026-09-15
 
 A front-door patch. Every fix here was already on `main` but landed *after* the

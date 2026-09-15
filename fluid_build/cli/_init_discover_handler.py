@@ -65,7 +65,7 @@ def run_discover(args, logger: logging.Logger, *, uri: str) -> int:
                 + "."
             ),
             fix="Use postgres://, mysql://, sqlite://, file://, s3://, https://, or http://.",
-            doc="https://forge.fluid.dev/ref/discover#schemes",
+            doc="https://agenticstiger.github.io/forge_docs/cli/init.html",
             extras={"uri": uri, "supported": sorted(_SCHEME_DEFAULTS.keys())},
         )
 

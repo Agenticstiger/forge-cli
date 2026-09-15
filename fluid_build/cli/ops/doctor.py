@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, List, Optional
 
-_DOC_BASE = "https://forge.fluid.dev/ops/doctor"
+_DOC_BASE = "https://agenticstiger.github.io/forge_docs/cli/doctor.html"
 
 
 class Severity(str, Enum):

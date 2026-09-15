@@ -63,10 +63,11 @@ def test_every_catalogued_event_has_a_docs_url():
     assert missing == [], f"catalogued events with no docs_url: {missing}"
 
 
-def test_docs_urls_are_well_formed_under_doc_base():
-    for event in cat.catalogued_events():
-        url = cat.docs_url_for(event)
-        assert url is not None and url.startswith(cat.DOC_BASE + "/")
+# `test_docs_urls_are_well_formed_under_doc_base` stood here and could not fail:
+# "well formed" meant "starts with the base the builder had just prefixed to it",
+# so it stayed green through a release in which every one of these URLs pointed
+# at a host that does not resolve. Replaced by tests/cli/test_doc_links.py, which
+# asserts the host and refuses a path invented from a topic name.
 
 
 # ── enrich() caller-wins semantics ──────────────────────────────────────────

@@ -458,7 +458,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                     context.console.print(f"  • {suggestion}")
             docs_url = getattr(e, "docs_url", None)
             if docs_url:
-                context.console.print(f"\n[cyan]📖 Documentation: {docs_url}[/cyan]")
+                # soft_wrap: a docs link is a URL, and Rich word-wraps at the terminal
+                # width, which puts a real newline INSIDE it. `_console.cprint_json`
+                # already exists for exactly this reason ("for prose that is what you
+                # want; for a serialized document it is a correctness bug"), and a URL
+                # is the same category. The dead `forge.fluid.dev/ref/...` links this
+                # replaced were short enough to fit in 80 columns; the real ones are
+                # not, so fixing the destination without this would trade a link that
+                # went nowhere for a link you cannot click.
+                context.console.print(
+                    f"\n[cyan]📖 Documentation: {docs_url}[/cyan]", soft_wrap=True
+                )
             return e.exit_code
 
         except KeyboardInterrupt:
