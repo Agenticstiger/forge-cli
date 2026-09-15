@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.2] — 2026-09-15
+
+A second front-door patch, for the same reason as the first: the release notes for
+`0.15.1` announced that dead documentation domains had been cleaned up, and
+`0.15.1` shipped a third one. It was not a stray string — it was `_DOC_BASE`, the
+documented single source of truth, so **every** typed error and every catalogued
+event printed it. One mistyped filename was enough to see it:
+
+```
+$ fluid validate no-such.fluid.yaml
+   📖 https://forge.fluid.dev/ref/troubleshooting#err_contract_file_not_found
+```
+
 ### Fixed
 
 - **Every typed error linked to a domain that does not exist.** `_DOC_BASE` was
