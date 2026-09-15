@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every typed error linked to a domain that does not exist.** `_DOC_BASE` was
+  `https://forge.fluid.dev/ref`, and `forge.fluid.dev` has no DNS record — so all
+  15 typed `FluidUserError` classes and all 54 catalogued events printed a `Docs:`
+  line pointing at nothing. This is the third dead host found in the same family;
+  the sweep that removed `fluid-build.dev` and `dustlabs.co.za` in 0.15.1 grepped
+  for *those* names, so a host that had never been grepped for survived it.
+- **The docs path was composed out of the topic name**, which is the half a host
+  swap would not have fixed. `f"{DOC_BASE}/{topic}"` produced a confident URL for
+  every topic word whether or not a page existed, and eleven of the sixteen topics
+  in use had none — including `troubleshooting`, the fall-through destination for
+  34 of the 54 catalogued events. Topics now resolve through a map of routes the
+  documentation site actually serves; an unmapped topic goes to the troubleshooting
+  page instead of to a URL invented from its own name. All 24 resulting URLs
+  return 200, verified individually.
+- **A scaffolded Airflow DAG shipped a dead link into the user's repository.**
+  `fluid init` wrote `https://fluid.dev/docs/orchestration` into the generated
+  DAG's `README.md`, so the link persisted in their project rather than scrolling
+  past in a terminal. Found by the new gate on its first run, not by a grep.
+- **`fluid apply --help` printed a 404** (`.../blob/main/docs/apply.md` in the
+  schema repo), and `fluid demo`'s failure panel sent bug reports to the schema
+  repo's issue tracker rather than this project's.
+
+### Changed
+
+- **`test_docs_urls_are_well_formed_under_doc_base` is gone**, because it could
+  not fail: "well formed" meant "starts with the base the builder had just
+  prefixed to it". It was green throughout the releases in which every URL it
+  checked pointed at a nonexistent host. `tests/cli/test_doc_links.py` replaces it
+  and asserts the two things that actually break — the host stops existing, and
+  the path is invented rather than taken from a page somebody wrote. Each of its
+  assertions was verified by seeding the defect and watching it go red.
+
 ## [0.15.1] — 2026-09-15
 
 A front-door patch. Every fix here was already on `main` but landed *after* the

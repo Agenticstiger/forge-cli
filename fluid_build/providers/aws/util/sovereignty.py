@@ -203,7 +203,7 @@ class SovereigntyValidator:
                 what=f"Unknown AWS region '{region}' — cannot determine jurisdiction",
                 why=f"region '{region}' is not in REGION_JURISDICTIONS; the deploy target's jurisdiction can't be verified.",
                 fix="Use an AWS region from the supported list, or update REGION_JURISDICTIONS to map this region.",
-                doc="https://forge.fluid.dev/ref/sovereignty",
+                doc="https://agenticstiger.github.io/forge_docs/concepts/sovereignty.html",
                 extras={"region": region},
             )
 

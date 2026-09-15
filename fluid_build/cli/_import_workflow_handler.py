@@ -46,7 +46,7 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
                 f"`fluid import {tool} <project-dir | workspace-id | "
                 f"pipeline-name | tap-config.json | manifest.json>`"
             ),
-            doc="https://forge.fluid.dev/ref/import",
+            doc="https://agenticstiger.github.io/forge_docs/cli/import.html",
             extras={"tool": tool},
         )
 
@@ -56,7 +56,7 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
             what=f"unknown importer tool: {tool}",
             why=f"`{tool}` is not in the registered importer set.",
             fix="Use one of: meltano | airbyte | dlt | singer | dbt.",
-            doc="https://forge.fluid.dev/ref/import",
+            doc="https://agenticstiger.github.io/forge_docs/cli/import.html",
             extras={"tool": tool, "supported": ["meltano", "airbyte", "dlt", "singer", "dbt"]},
         )
 
@@ -79,7 +79,7 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
                 "Check the source path/identifier and that the foreign tool's "
                 "config is well-formed."
             ),
-            doc=f"https://forge.fluid.dev/ref/import#{tool}",
+            doc="https://agenticstiger.github.io/forge_docs/cli/import.html",
             extras={"tool": tool, "source": source},
         ) from exc
 

@@ -292,7 +292,7 @@ To customize the DAG:
 - **Add lineage tracking**: Enable OpenLineage integration
 - **Monitor performance**: Use Airflow metrics
 
-For more information, see: https://fluid.dev/docs/orchestration
+For more information, see: https://agenticstiger.github.io/forge_docs/advanced/airflow.html
 """
 
     readme_path = dag_dir / "README.md"

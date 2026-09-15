@@ -767,7 +767,7 @@ def render_completion(
         "fluid apply --dry-run",
         "fluid forge --refine",
     ),
-    help_url: str = "https://forge.fluid.dev",
+    help_url: str = "https://agenticstiger.github.io/forge_docs/",
     console: Optional[Any] = None,
 ) -> None:
     """Print the success ritual after the user accepts the preview.

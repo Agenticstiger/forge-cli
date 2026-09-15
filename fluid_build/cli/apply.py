@@ -357,7 +357,7 @@ def register(subparsers: argparse._SubParsersAction):
             "  fluid apply                                    # CWD contract\n"
             "  fluid apply contract.fluid.yaml --env prod --yes\n"
             "  fluid apply contract.fluid.yaml --dry-run --verbose\n\n"
-            "Docs: https://github.com/open-data-protocol/fluid/blob/main/docs/apply.md"
+            "Docs: https://agenticstiger.github.io/forge_docs/cli/apply.html"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         # No prefix abbreviation on the platform's mutation command.

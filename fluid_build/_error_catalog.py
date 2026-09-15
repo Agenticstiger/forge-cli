@@ -51,6 +51,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
 from fluid_build._errors import _DOC_BASE as DOC_BASE  # single source of truth for the docs base
+from fluid_build._errors import doc_url
 
 
 def slug_for(event: str) -> str:
@@ -426,9 +427,7 @@ def _docs_url(event: str, topic: Optional[str]) -> str:
     An explicit ``topic`` points at a real doc section; otherwise the URL is a
     per-slug anchor on the canonical troubleshooting page.
     """
-    if topic:
-        return f"{DOC_BASE}/{topic}"
-    return f"{DOC_BASE}/troubleshooting#{slug_for(event).lower()}"
+    return doc_url(topic)
 
 
 def suggestions_for(event: str) -> List[str]:

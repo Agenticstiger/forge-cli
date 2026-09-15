@@ -42,7 +42,55 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-_DOC_BASE = "https://forge.fluid.dev/ref"
+_DOC_SITE = "https://agenticstiger.github.io/forge_docs"
+# Re-exported by ``_error_catalog`` and asserted as a prefix by its tests.
+_DOC_BASE = _DOC_SITE
+
+# Topic -> a route the docs site ACTUALLY SERVES.
+#
+# What this replaces was `f"{base}/{topic}"`, and both halves were wrong. The
+# base was `forge.fluid.dev`, which does not resolve — so all 54 catalogued
+# events and all 15 typed errors below printed a link to nothing. And composing
+# the path from a topic word manufactured a plausible URL whether or not anyone
+# had written that page, which is why swapping the host alone would only have
+# traded a dead domain for 404s: eleven of the sixteen topics had no page.
+#
+# `test_docs_urls_are_well_formed_under_doc_base` passed throughout, because
+# "well formed" meant "starts with the base the function had just prefixed".
+# Composition is what made a missing page indistinguishable from a real one, so
+# the fix is a map: a topic with no entry goes to the troubleshooting page
+# rather than to a URL invented from its own name.
+_DOC_ROUTES = {
+    # dedicated pages, where one exists
+    "capabilities": "advanced/capability-warnings.html",
+    "cost": "advanced/cost-tracking.html",
+    "installation": "getting-started/",
+    "providers": "cli/providers.html",
+    "secrets": "cli/secrets.html",
+    "sovereignty": "concepts/sovereignty.html",
+    "sovereignty#residency": "concepts/sovereignty.html",
+    "supply-chain": "cli/verify-signature.html",
+    # otherwise the reference page that documents these fifteen errors by name,
+    # anchored to the section the error is listed under
+    "acquisition": "advanced/typed-cli-errors.html#validation-schema",
+    "schema-evolution": "advanced/typed-cli-errors.html#validation-schema",
+    "installation#extras": "advanced/typed-cli-errors.html#capability-negotiation",
+    "troubleshooting#connectivity": "advanced/typed-cli-errors.html#connectivity-secrets",
+    "concurrency": "advanced/typed-cli-errors.html#pipeline-operations",
+    "dlq": "advanced/typed-cli-errors.html#pipeline-operations",
+    "replay": "advanced/typed-cli-errors.html#pipeline-operations",
+    "infra#drift": "advanced/typed-cli-errors.html#governance",
+}
+_DOC_FALLBACK = "advanced/production-troubleshooting.html"
+
+
+def doc_url(topic: Optional[str] = None) -> str:
+    """Absolute docs URL for ``topic``; the troubleshooting page when unmapped.
+
+    Never composes a path out of an unknown topic: an unmapped topic is a page
+    nobody has written, and guessing its URL is how a link rots invisibly.
+    """
+    return f"{_DOC_SITE}/{_DOC_ROUTES.get(topic or '', _DOC_FALLBACK)}"
 
 
 @dataclass
@@ -142,7 +190,7 @@ class SchemaValidationError(FluidUserError):
             where=where,
             why=f"The contract field {field_path} did not satisfy the v0.7.3 schema.",
             fix=f"Adjust {field_path} to match the schema. Run `fluid validate <contract>` for the full error list.",
-            doc=f"{_DOC_BASE}/acquisition",
+            doc=doc_url("acquisition"),
         )
 
 
@@ -169,7 +217,7 @@ class CapabilityMismatchError(FluidUserError):
                 suggestion
                 or f"Switch engine to one declaring {missing}, or remove from build.capabilities."
             ),
-            doc=f"{_DOC_BASE}/capabilities",
+            doc=doc_url("capabilities"),
         )
 
 
@@ -185,7 +233,7 @@ class SecretResolutionError(FluidUserError):
             what=f"failed to resolve secret `{ref}`",
             why=reason,
             fix=fix or "Configure the secret backend (vault, aws, gcp, azure, env) and retry.",
-            doc=f"{_DOC_BASE}/secrets",
+            doc=doc_url("secrets"),
         )
 
 
@@ -204,7 +252,7 @@ class SovereigntyViolationError(FluidUserError):
             fix=(
                 f"Use a connector image approved for {jurisdiction}, or update sovereignty.jurisdiction."
             ),
-            doc=f"{_DOC_BASE}/sovereignty",
+            doc=doc_url("sovereignty"),
         )
 
 
@@ -218,7 +266,7 @@ class ConnectivityProbeError(FluidUserError):
             what=f"connectivity probe failed: {target}",
             why=reason,
             fix="Check VPN / network policy / credentials. Run `fluid doctor --scope ingestion`.",
-            doc=f"{_DOC_BASE}/troubleshooting#connectivity",
+            doc=doc_url("troubleshooting#connectivity"),
         )
 
 
@@ -232,7 +280,7 @@ class PartialFailureError(FluidUserError):
             what="partial success: some streams failed",
             why=f"succeeded={succeeded}; failed={failed}.",
             fix="Inspect logs for failed streams (`fluid logs <product> --component build`) and replay (`fluid apply --replay --run-id last-failure`).",
-            doc=f"{_DOC_BASE}/replay",
+            doc=doc_url("replay"),
         )
 
 
@@ -249,7 +297,7 @@ class DLQOverflowError(FluidUserError):
                 "Inspect DLQ contents (`fluid logs <product> --component dlq`); fix upstream "
                 "data quality or raise the cap; rerun via `fluid apply --replay --include-dlq`."
             ),
-            doc=f"{_DOC_BASE}/dlq",
+            doc=doc_url("dlq"),
         )
 
 
@@ -268,7 +316,7 @@ class SchemaDriftError(FluidUserError):
                 "Review contract.exposes[].contract.schemaPolicy; if policy=evolve_safe, this is "
                 "expected. If strict/discover_and_freeze, update the contract or fix the source."
             ),
-            doc=f"{_DOC_BASE}/schema-evolution",
+            doc=doc_url("schema-evolution"),
         )
 
 
@@ -285,7 +333,7 @@ class BudgetExceededError(FluidUserError):
                 "Raise properties.cost.budget.monthly cap, or set onExceed=warn to allow runs to "
                 "proceed with an alert."
             ),
-            doc=f"{_DOC_BASE}/cost",
+            doc=doc_url("cost"),
         )
 
 
@@ -302,7 +350,7 @@ class LockHeldError(FluidUserError):
                 "Wait for the holder to finish, change concurrency.lock.onContended to 'queue', or "
                 "release manually if the holder is gone."
             ),
-            doc=f"{_DOC_BASE}/concurrency",
+            doc=doc_url("concurrency"),
         )
 
 
@@ -316,7 +364,7 @@ class StaleReplayError(FluidUserError):
             what=f"replay target {run_id} is past retention horizon",
             why=f"retention.runState={retention_horizon} elapsed; manifest no longer available.",
             fix="Pick a more recent run, or extend retention.runState.",
-            doc=f"{_DOC_BASE}/replay",
+            doc=doc_url("replay"),
         )
 
 
@@ -330,7 +378,7 @@ class MissingExtraError(FluidUserError):
             what=f"optional extra '{extra}' is not installed",
             why=f"the requested engine requires the '{extra}' extra; it isn't on the import path.",
             fix=install_hint,
-            doc=f"{_DOC_BASE}/installation#extras",
+            doc=doc_url("installation#extras"),
         )
 
 
@@ -344,7 +392,7 @@ class InfraDriftError(FluidUserError):
             what=f"infrastructure drift: {chart}",
             why=f"declared chart version={declared}; live cluster version={live}.",
             fix="Run `fluid plan <contract>` and review the Infrastructure section, then `fluid apply`.",
-            doc=f"{_DOC_BASE}/infra#drift",
+            doc=doc_url("infra#drift"),
         )
 
 
@@ -363,7 +411,7 @@ class ResidencyViolationError(FluidUserError):
                 "Use a destination in an allowed region, update sovereignty.dataResidency, or "
                 "obtain compliance approval before changing."
             ),
-            doc=f"{_DOC_BASE}/sovereignty#residency",
+            doc=doc_url("sovereignty#residency"),
         )
 
 
@@ -380,5 +428,5 @@ class SupplyChainViolationError(FluidUserError):
                 "Pin a Cosign-signed image with the configured public key, or update "
                 "sovereignty.allowedSigners."
             ),
-            doc=f"{_DOC_BASE}/supply-chain",
+            doc=doc_url("supply-chain"),
         )

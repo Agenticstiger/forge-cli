@@ -236,7 +236,7 @@ def _print_failure_panel(name: str, exc: Exception) -> None:
             f"  [bright_cyan]rm -rf {name}[/bright_cyan]   "
             "[dim]← remove the half-built project and try again[/dim]\n\n"
             "[dim]If it keeps failing, please open an issue with the error above\n"
-            "at https://github.com/open-data-protocol/fluid/issues[/dim]",
+            "at https://github.com/Agenticstiger/forge-cli/issues[/dim]",
             title="[bold bright_white]Something went wrong[/bold bright_white]",
             border_style="red",
             padding=(1, 2),
