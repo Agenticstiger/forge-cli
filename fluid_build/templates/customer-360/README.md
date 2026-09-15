@@ -452,13 +452,13 @@ This template showcases several production best practices:
 
 ## Resources
 
-- [FLUID Documentation](https://docs.fluid.io)
-- [RFM Analysis Guide](https://docs.fluid.io/guides/rfm-analysis)
-- [Customer Lifetime Value](https://docs.fluid.io/guides/clv-calculation)
-- [Airflow Integration](https://docs.fluid.io/integrations/airflow)
-- [Deployment Guide](https://docs.fluid.io/deployment)
-- [Best Practices](https://docs.fluid.io/best-practices)
+- [FLUID Documentation](https://agenticstiger.github.io/forge_docs/)
+- [RFM Analysis Guide](https://agenticstiger.github.io/forge_docs/)
+- [Customer Lifetime Value](https://agenticstiger.github.io/forge_docs/)
+- [Airflow Integration](https://agenticstiger.github.io/forge_docs/advanced/airflow.html)
+- [Deployment Guide](https://agenticstiger.github.io/forge_docs/cli/apply.html)
+- [Best Practices](https://agenticstiger.github.io/forge_docs/)
 
 ---
 
-**Questions?** Check our [Slack community](https://fluid-community.slack.com) or [GitHub Discussions](https://github.com/fluid-io/fluid/discussions)
+**Questions?** Check our [Slack community](https://github.com/Agenticstiger/forge-cli/discussions) or [GitHub Discussions](https://github.com/fluid-io/fluid/discussions)

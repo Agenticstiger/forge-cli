@@ -575,7 +575,7 @@ class ContractValidator:
                 f"Unknown provider '{self.provider_name}'",
                 "binding.platform",
                 suggestion=f"Valid providers are: {', '.join(supported)}",
-                documentation_url="https://docs.fluid.io/providers",
+                documentation_url="https://agenticstiger.github.io/forge_docs/cli/providers.html",
             )
             return
 
@@ -588,7 +588,7 @@ class ContractValidator:
                     f"Failed to connect to {self.provider_name}",
                     "binding.platform",
                     suggestion="Check your credentials and network connectivity. For GCP, ensure GOOGLE_APPLICATION_CREDENTIALS is set or run 'gcloud auth application-default login'",
-                    documentation_url="https://docs.fluid.io/validation/authentication",
+                    documentation_url="https://agenticstiger.github.io/forge_docs/cli/validate.html",
                 )
         except Exception as e:
             self.report.add_issue(
@@ -597,7 +597,7 @@ class ContractValidator:
                 f"Error connecting to {self.provider_name}: {str(e)}",
                 "binding.platform",
                 suggestion="Verify provider credentials are configured correctly and you have necessary permissions",
-                documentation_url="https://docs.fluid.io/validation/troubleshooting",
+                documentation_url="https://agenticstiger.github.io/forge_docs/advanced/production-troubleshooting.html",
             )
 
     def _validate_exposes(self) -> None:
@@ -984,7 +984,7 @@ class ContractValidator:
                 f"Incomplete BigQuery location: missing {', '.join(missing)}",
                 f"{path}.binding.location.properties",
                 suggestion=f"Add the following properties to binding.location.properties: {', '.join(missing)}",
-                documentation_url="https://docs.fluid.io/contracts/bindings/bigquery",
+                documentation_url="https://agenticstiger.github.io/forge_docs/providers/gcp.html",
             )
             return
 
@@ -1061,7 +1061,7 @@ class ContractValidator:
                             f"Validation drift detected: {drift_msg}",
                             path,
                             suggestion=suggestion,
-                            documentation_url="https://docs.fluid.io/validation/drift-detection",
+                            documentation_url="https://agenticstiger.github.io/forge_docs/cli/contract-validation.html",
                         )
                         LOG.warning(f"⚠️  Drift detected for {resource_name}: {drift_msg}")
                 except Exception as e:
@@ -1080,7 +1080,7 @@ class ContractValidator:
                 f"Failed to validate resource: {str(e)}",
                 path,
                 suggestion="Check provider credentials and network connectivity",
-                documentation_url="https://docs.fluid.io/validation/troubleshooting",
+                documentation_url="https://agenticstiger.github.io/forge_docs/advanced/production-troubleshooting.html",
             )
 
     def _validate_generic_resource(self, expose: Dict[str, Any], path: str) -> None:
@@ -1152,7 +1152,7 @@ class ContractValidator:
                             "Validation drift detected: {}".format(drift_result["message"]),
                             path,
                             suggestion="Review validation history to understand the drift",
-                            documentation_url="https://docs.fluid.io/validation/drift-detection",
+                            documentation_url="https://agenticstiger.github.io/forge_docs/cli/contract-validation.html",
                         )
                 except Exception as e:
                     LOG.warning("Failed to check drift: %s", e)

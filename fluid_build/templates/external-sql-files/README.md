@@ -179,9 +179,9 @@ SELECT * FROM discount_applications
 
 ## Resources
 
-- [FLUID SQL File Documentation](https://docs.fluid.io/sql-files)
-- [Jinja2 Template Guide](https://docs.fluid.io/jinja2)
-- [SQL Best Practices](https://docs.fluid.io/sql-best-practices)
+- [FLUID SQL File Documentation](https://agenticstiger.github.io/forge_docs/cli/contract.html)
+- [Jinja2 Template Guide](https://agenticstiger.github.io/forge_docs/cli/contract.html)
+- [SQL Best Practices](https://agenticstiger.github.io/forge_docs/)
 
 ---
 

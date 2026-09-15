@@ -411,7 +411,7 @@ fluid init schedule-demo --template scheduling
 
 - 📖 [DAG Generation Documentation](../../docs/docs/features/dag-generation.md)
 - 🎓 [Airflow Concepts](https://airflow.apache.org/docs/apache-airflow/stable/concepts/)
-- 💬 [Community Forum](https://community.fluiddata.io)
+- 💬 [Community Forum](https://github.com/Agenticstiger/forge-cli/discussions)
 - 🎥 [Video Tutorial](https://www.youtube.com/watch?v=...)
 
 ---

@@ -352,9 +352,9 @@ validations:
 
 ## Resources
 
-- [FLUID Validation Guide](https://docs.fluid.io/validations)
-- [Data Quality Frameworks](https://docs.fluid.io/data-quality)
-- [Monitoring Best Practices](https://docs.fluid.io/monitoring)
+- [FLUID Validation Guide](https://agenticstiger.github.io/forge_docs/cli/validate.html)
+- [Data Quality Frameworks](https://agenticstiger.github.io/forge_docs/recipes/add-a-quality-rule.html)
+- [Monitoring Best Practices](https://agenticstiger.github.io/forge_docs/concepts/quality-sla-lineage.html)
 
 ---
 

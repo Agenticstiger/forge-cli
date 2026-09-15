@@ -58,12 +58,37 @@ SHIPPED_SUFFIXES = (".py", ".md", ".yaml", ".yml", ".json", ".txt")
 # published once, and a resurrected dead link reads exactly like a live one.
 RETIRED_HOSTS = frozenset(
     {
+        # do not resolve
         "fluid-build.dev",
         "forge.fluid.dev",
         "fluid.dev",
         "dustlabs.co.za",
+        "fluiddata.io",
+        "docs.fluiddata.io",
+        "community.fluiddata.io",
+        # RESOLVE, AND ARE SOMEBODY ELSE'S. `docs.fluid.io` serves "Fluid
+        # Technical Docs - Financial system of the future", an unrelated
+        # fintech, and twelve shipped template READMEs pointed at it. A live
+        # foreign site sharing our product word is worse than a dead link: the
+        # reader has no way to tell they have left our documentation.
+        "fluid.io",
+        "docs.fluid.io",
+        # 404: the workspace does not exist
+        "fluid-community.slack.com",
     }
 )
+
+# Repositories that exist under the org. A first-party GitHub link naming
+# anything else is a typo, and `forge-docs` (hyphen) against `forge_docs`
+# (underscore) is exactly the one that shipped - a 404 inside the MCP output
+# port's own security warning.
+ORG = "github.com/Agenticstiger"
+ORG_REPOS = frozenset({"forge-cli", "forge_docs", "flux", "forge-cli-sdk"})
+
+# Tokens meaning "replace this" that render as a plausible address.
+# `github.com/yourusername/fluid-mono` does not look like a placeholder in a
+# rendered README; it looks like a link, and it 404s.
+PLACEHOLDER_TOKENS = ("yourusername", "your-org", "yourorg", "your-username")
 
 DOCS_HOST = urlsplit(_DOC_BASE).netloc
 
@@ -72,7 +97,13 @@ DOCS_HOST = urlsplit(_DOC_BASE).netloc
 # IPv6 literal and raise.
 URL_RE = re.compile(r"https?://[^\s\"'`)\[\]<>,;]+")
 # A docs link is one the CLI hands the user as "go and read this".
-DOC_LINK_RE = re.compile(r"""(?:doc|docs_url|help_url)\s*=\s*f?["'](https?://[^"']+)["']""")
+# `documentation_url` was absent here, and cli/contract_validation.py uses it
+# seven times - every one pointing at another company's docs site. A gate that
+# enumerates attribute names will always miss the next spelling somebody
+# invents; the retired-host and org-repo tests below do not depend on guessing.
+DOC_LINK_RE = re.compile(
+    r"""(?:doc|docs_url|documentation_url|help_url)\s*=\s*f?["'](https?://[^"']+)["']"""
+)
 
 
 def _shipped_files():
@@ -112,7 +143,15 @@ def test_no_retired_host_comes_back():
     )
 
 
-def test_every_docs_link_is_on_the_canonical_docs_host():
+# A docs link may legitimately point at a THIRD PARTY: a BigQuery validation
+# error links to cloud.google.com, and the market-catalog connectors carry sample
+# entries whose `documentation_url` is a customer's own Alation or Collibra. The
+# rule that matters is narrower than "everything is on our host": anything that
+# LOOKS like ours must BE ours. Three dead hosts all looked like ours.
+FIRST_PARTY_MARKERS = ("fluid", "forge", "agenticstiger")
+
+
+def test_every_first_party_docs_link_is_on_the_canonical_docs_host():
     """No second spelling of "the docs" — three dead hosts started this way."""
     offences = []
     for path in PACKAGE.rglob("*.py"):
@@ -121,7 +160,10 @@ def test_every_docs_link_is_on_the_canonical_docs_host():
         text = path.read_text(encoding="utf-8")
         for lineno, line in enumerate(text.splitlines(), 1):
             for url in DOC_LINK_RE.findall(line):
-                if urlsplit(url).netloc.lower() != DOCS_HOST:
+                host = urlsplit(url).netloc.lower()
+                if not any(m in host for m in FIRST_PARTY_MARKERS):
+                    continue  # plainly a third party; out of scope
+                if host != DOCS_HOST:
                     offences.append(f"{path.relative_to(REPO)}:{lineno} -> {url}")
     assert offences == [], f"user-facing docs links must be on {DOCS_HOST}:\n" + "\n".join(offences)
 
@@ -168,3 +210,53 @@ def test_mapped_routes_are_shaped_like_docs_routes(route):
     assert page.endswith(".html") or page.endswith(
         "/"
     ), f"{route!r} is neither a .html page nor a directory index"
+
+
+def test_first_party_github_links_name_a_repo_that_exists():
+    """A `github.com/Agenticstiger/<repo>` link must name a real repository.
+
+    Offline on purpose - a list, not the network - so it runs anywhere and
+    cannot flake. `forge-docs` shipped for the sake of one character.
+    """
+    offences = []
+    for path in _shipped_files():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for url in URL_RE.findall(line):
+                if ORG + "/" not in url:
+                    continue
+                repo = re.split(r"[/#?]", url.split(ORG + "/", 1)[1])[0]
+                # a clone URL legitimately ends `.git`
+                repo = repo[:-4] if repo.endswith(".git") else repo
+                if repo and repo not in ORG_REPOS:
+                    offences.append(
+                        f"{path.relative_to(REPO)}:{lineno} -> {url}  "
+                        f"(repo {repo!r} is not one of {sorted(ORG_REPOS)})"
+                    )
+    assert (
+        offences == []
+    ), "first-party GitHub links naming a repository that does not exist:\n" + "\n".join(offences)
+
+
+def test_no_placeholder_url_ships():
+    """A URL the reader is meant to replace must not render as a real address."""
+    offences = []
+    for path in _shipped_files():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for url in URL_RE.findall(line):
+                for token in PLACEHOLDER_TOKENS:
+                    if token in url.lower():
+                        offences.append(
+                            f"{path.relative_to(REPO)}:{lineno} -> {url}  "
+                            f"(placeholder {token!r})"
+                        )
+    assert offences == [], "placeholder URLs that render as real links, and 404:\n" + "\n".join(
+        offences
+    )

@@ -125,7 +125,7 @@ Refer to the provider-specific deployment documentation:
 
 - **Documentation**: [FLUID Docs](https://agenticstiger.github.io/forge_docs/)
 - **Community**: [Discussions](https://github.com/Agenticstiger/forge-cli/discussions)
-- **Issues**: [GitHub Issues](https://github.com/your-org/{project_name}/issues)
+- **Issues**: `https://github.com/<your-org>/{project_name}/issues` (replace `<your-org>` with yours)
 
 ---
 
