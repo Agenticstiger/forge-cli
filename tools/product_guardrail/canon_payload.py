@@ -9,10 +9,10 @@ reads them. A hand-edit here — a widened regex, an extra name, a relaxed rule 
 fails this repo's own CI, offline, on the pull request that made it. To change
 the vocabulary, edit tools/canon.py in the canon repo and re-emit.
 
-Emitted 2026-09-06.
+Emitted 2026-09-15.
 """
 
-CANON_ID = '785922bbdc3f88d382141b7728d2b8a561fe38b7bf8bf5ff23b76a8abf4c9993'
+CANON_ID = 'ff28e99a952b791210cf743af8eecb3117f5cdd51f0f92710061b72dd8ff0330'
 
 # Approved names. Exact casing is part of the name. `near` matches the
 # near-misses case-insensitively; anything it catches that is not the target

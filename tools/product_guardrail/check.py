@@ -237,12 +237,22 @@ def compute_canon_id(payload, payload_source=None, readme_source=None) -> str:
     # The emitter passes the text it is ABOUT to write; at that moment the
     # file on disk is still the previous version, so reading it would digest
     # the wrong bytes and every consumer would report a mismatch.
+    #
+    # The `Emitted <date>` line is excluded for the same reason, and that is
+    # not cosmetic: the emitter stamps TODAY, so while that line was hashed the
+    # digest was a function of the CALENDAR. Re-emitting with no vocabulary
+    # change moved the id, every vendored copy then read as out of date, and
+    # the daily fan-out asked for one pull request per product repo that would
+    # have changed a date and nothing else. Measured on 2026-09-15: the
+    # canonical payload and forge-cli's vendored copy differed in that line
+    # ALONE, and in the id it forced. The id now answers "is this the same
+    # vocabulary", which is the only question anyone asks it.
     raw_payload = (payload_source
                    if payload_source is not None
                    else _read_text(HERE / "canon_payload.py"))
     payload_src = normalise("\n".join(
         line for line in raw_payload.split("\n")
-        if not _CANON_ID_LINE.match(line)
+        if not _CANON_ID_LINE.match(line) and not _EMITTED_LINE.match(line)
     ))
 
     material = {
@@ -582,6 +592,11 @@ _WS = re.compile(r"\s+")
 # while the file was still certified authentic. sync_guardrail.py already
 # anchored properly; this is the same fix.
 _CANON_ID_LINE = re.compile(r"^CANON_ID\s*=\s*['\"][0-9a-f]{64}['\"]\s*$")
+# Anchored to a BARE ISO date, deliberately not to `^Emitted`. A line excluded
+# from the digest is a line nobody checks, so the pattern has to be narrow
+# enough that the exclusion cannot be used to smuggle anything past it:
+# `Emitted 2026-09-15. FooBrand is fine now.` does not match, and is hashed.
+_EMITTED_LINE = re.compile(r"^Emitted \d{4}-\d{2}-\d{2}\.$")
 
 
 def _norm(s: str) -> str:
@@ -1247,6 +1262,37 @@ def self_test(payload, profile):
     spans = spans_ts(ident_only, PRODUCT)
     if any(rule_names(payload, s, "p.tsx", profile.LOCALE) for s in spans):
         failures.append("  extractor ts: a bare identifier was flagged as copy")
+
+    # CANON_ID must be a function of the VOCABULARY, not of the calendar.
+    # Asserted in BOTH directions, because an exclusion that is too wide is as
+    # dangerous as a missing one: the emission date must NOT move the id, and
+    # any other line MUST. The first half of this was broken for nine days and
+    # nothing noticed, because a digest that changes still looks like a digest.
+    _payload_file = HERE / "canon_payload.py"
+    if not _payload_file.exists():
+        failures.append("  digest: canon_payload.py is missing")
+    else:
+        src = _read_text(_payload_file)
+        lines = src.split("\n")
+        if not any(_EMITTED_LINE.match(ln) for ln in lines):
+            failures.append(
+                "  digest: the payload carries no `Emitted <date>.` line, so "
+                "the exclusion that keeps the calendar out of the digest "
+                "cannot be proved here — re-emit from the canon repo")
+        else:
+            base = compute_canon_id(payload, payload_source=src)
+            redated = "\n".join("Emitted 1999-12-31." if _EMITTED_LINE.match(ln)
+                                else ln for ln in lines)
+            if compute_canon_id(payload, payload_source=redated) != base:
+                failures.append(
+                    "  digest: re-dating the payload changed CANON_ID — the id "
+                    "is a function of the calendar, so every vendored copy "
+                    "goes stale on its own and the fan-out cries wolf daily")
+            seeded = src + "\n# a line that is not the emission date\n"
+            if compute_canon_id(payload, payload_source=seeded) == base:
+                failures.append(
+                    "  digest: appending a line did NOT change CANON_ID — the "
+                    "payload body has stopped being covered by the digest")
 
     for g in profile.GRACE:
         if not g.get("reason") or not g.get("owner") or g.get("owner") == "unknown":
