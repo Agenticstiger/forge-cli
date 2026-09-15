@@ -176,8 +176,8 @@ fluid apply --local --clean  # Fresh start
 
 - 📖 [Full Contract Reference](../../docs/docs/cli/init.md)
 - 🎓 [Quickstart Tutorial](../../docs/docs/quickstart/001-hello-fluid.md)
-- 💬 [Community Forum](https://community.fluiddata.io)
-- 🐛 [Report Issues](https://github.com/yourusername/fluid-mono/issues)
+- 💬 [Community Forum](https://github.com/Agenticstiger/forge-cli/discussions)
+- 🐛 [Report Issues](https://github.com/Agenticstiger/forge-cli/issues)
 
 ---
 

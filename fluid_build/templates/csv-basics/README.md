@@ -246,7 +246,7 @@ Error: Cannot convert 'abc' to INTEGER
 
 - 📖 [Input Sources Documentation](../../docs/docs/features/inputs.md)
 - 🎓 [CSV Ingestion Best Practices](../../docs/docs/guides/csv-best-practices.md)
-- 💬 [Community Forum](https://community.fluiddata.io)
+- 💬 [Community Forum](https://github.com/Agenticstiger/forge-cli/discussions)
 
 ---
 

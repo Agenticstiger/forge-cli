@@ -437,7 +437,7 @@ def _run_serve(args, logger: logging.Logger) -> int:
             "⚠️  fluid mcp output-port: caller model_id is self-attested via "
             "MCP clientInfo. Do not expose this gateway over an untrusted "
             "network until P3 (OAuth/mTLS identity) ships. See "
-            "https://github.com/Agenticstiger/forge-docs#agent-policy.\n"
+            "https://agenticstiger.github.io/forge_docs/concepts/agent-policy.html\n"
         )
         sys.stderr.flush()
     if sys.stderr.isatty():

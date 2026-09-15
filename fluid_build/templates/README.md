@@ -127,6 +127,6 @@ done
 
 ## Support
 
-- Documentation: https://docs.fluiddata.io
-- GitHub: https://github.com/yourusername/fluid-mono
-- Issues: https://github.com/yourusername/fluid-mono/issues
+- Documentation: https://agenticstiger.github.io/forge_docs/
+- GitHub: https://github.com/Agenticstiger/forge-cli
+- Issues: https://github.com/Agenticstiger/forge-cli/issues

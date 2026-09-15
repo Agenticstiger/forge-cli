@@ -301,7 +301,7 @@ COALESCE(total_revenue / NULLIF(total_orders, 0), 0)
 
 - 📖 [SQL JOIN Documentation](../../docs/docs/guides/sql-joins.md)
 - 🎓 [Customer Analytics Patterns](../../docs/docs/patterns/customer-analytics.md)
-- 💬 [Community Forum](https://community.fluiddata.io)
+- 💬 [Community Forum](https://github.com/Agenticstiger/forge-cli/discussions)
 
 ---
 

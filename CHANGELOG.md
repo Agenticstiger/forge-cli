@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Shipped templates pointed at another company's documentation site.**
+  `docs.fluid.io` resolves and returns 200, and it belongs to an unrelated fintech
+  ("Contracts Overview | Fluid Technical Docs", "Financial system of the future").
+  Twelve template READMEs and seven `documentation_url=` values in
+  `contract_validation.py` sent users there. A dead host announces itself; a live
+  foreign site sharing our product word does not. 28 links repointed in total,
+  also covering `community.fluiddata.io` and `docs.fluiddata.io` (NXDOMAIN),
+  `fluid-community.slack.com` (404, no such workspace) and
+  `github.com/yourusername/fluid-mono`. Topics with no page go to the docs root
+  rather than to a URL invented from their own name; all 25 resulting first-party
+  URLs verified 200.
+- **`fluid mcp output-port` linked a repository that does not exist.**
+  `github.com/Agenticstiger/forge-docs` — a hyphen where the repository has an
+  underscore — inside the gateway's own warning about untrusted networks.
+- **The scaffolder wrote a 404 into the user's own README.**
+  `github.com/your-org/{project_name}/issues` substituted the project but not the
+  org. Now inline code with angle brackets, so it reads as a placeholder.
+
+### Changed
+
+- **The link gate missed all of the above, and now does not.** `documentation_url`
+  was absent from the attribute alternation; the retired-host list held four names
+  and none of this family; and the canonical-host rule ran over `.py` only, so 21
+  template README links were never examined. Two new assertions that do not depend
+  on guessing an attribute name: a first-party GitHub link must name a repository
+  that exists, and no URL may carry a placeholder token that renders as a real
+  address. The canonical-host rule is also now scoped to hosts containing
+  fluid/forge/agenticstiger — a BigQuery error rightly links to cloud.google.com,
+  and catalog connectors carry sample entries pointing at a customer's own Alation.
+
 ## [0.15.2] — 2026-09-15
 
 A second front-door patch, for the same reason as the first: the release notes for
