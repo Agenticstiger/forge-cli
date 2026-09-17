@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Every shipped contract now declares the current stable schema, `0.7.5`.**
+  All 13 templates under `fluid_build/templates/` and all 18 contracts under
+  `examples/` declared `0.7.2` — three stable versions behind — so a reader who
+  scaffolded one started on a contract that predated everything added in
+  `0.7.3`-`0.7.5`. 31 files. Each was validated at `0.7.5` individually before
+  the change and again after; zero failures. `0.7.5` and not `0.7.6`: 0.7.6 is
+  bundled but preview, and a scaffold is the first contract a user owns.
+
+  **Not included, deliberately.** Twelve code paths that CONSTRUCT a contract
+  (the five `fluid import` importers, `product new`, the discover emitter, the
+  streaming preview, the JDBC data-model scaffolder, the forge template builder)
+  pin `0.7.3` as a literal. They should read the newest stable version instead —
+  the same fix applied to the two serialisation fallbacks in the previous
+  release — but doing so turns ~22 tests red, because those tests validate
+  emitter output against a HARDCODED schema version and the schemas put `const`
+  on `fluidVersion`. That is a test-expectation refactor across ten files, not a
+  template bump, and it is scoped separately rather than bundled here.
+
 ### Fixed
 
 - **A shipped template did not validate, and nothing noticed.**

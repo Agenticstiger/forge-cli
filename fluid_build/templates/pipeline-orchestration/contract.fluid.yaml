@@ -1,4 +1,4 @@
-fluidVersion: 0.7.2
+fluidVersion: 0.7.5
 kind: DataProduct
 id: orchestration.complex_pipeline_v1
 name: Complex Pipeline Orchestration
