@@ -70,8 +70,20 @@ LOG = logging.getLogger("fluid.acquire.catalog.openmetadata")
 
 @dataclass
 class OpenMetadataRegistrar(CatalogRegistrar):
+    # Required, and first in the field order so it can have no default.
+    # It used to default to ``https://openmetadata.test`` — a hostname
+    # that exists only in this module's respx-mocked tests, because RFC
+    # 2606 reserves ``.test`` precisely so it never resolves. A registrar
+    # built without an endpoint therefore looked configured and failed on
+    # first publish with a DNS error, where the operator needed "you have
+    # not set FLUID_CATALOG_OPENMETADATA_URL". ``_build_openmetadata_registrar``
+    # already refuses to build one (``CatalogNotConfiguredError``); dropping
+    # the default closes the direct-construction path too, so a bare
+    # ``OpenMetadataRegistrar()`` is a TypeError rather than an object
+    # quietly aimed at a hostname. Every construction site passes
+    # ``base_url=`` by keyword, so the reorder is source-compatible.
+    base_url: str
     target: str = "openmetadata"
-    base_url: str = "https://openmetadata.test"
     api_token: Optional[str] = None
     timeout_seconds: int = 30
 

@@ -312,3 +312,15 @@ class TestGenerateDagHeader:
         assert "@daily" in header
         assert "Test Product" in header
         assert "analytics" in header
+
+    def test_header_version_falls_back_to_the_newest_bundled_schema(self):
+        """A contract declaring no ``fluidVersion`` used to be stamped with a
+        hardcoded "0.7.0". Assert against the lookup, never against a literal,
+        or this test goes stale the same way the code did."""
+        from fluid_build.schema_manager import FluidSchemaManager
+
+        gen = AirflowDAGGenerator(logger=LOG)
+        header = gen._generate_dag_header("my_dag", "@daily", {"name": "No version"})
+
+        assert f"v{FluidSchemaManager.latest_bundled_version()}" in header
+        assert "v0.7.0" not in header

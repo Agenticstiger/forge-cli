@@ -119,7 +119,16 @@ def fluid_to_odps_document(contract: Dict[str, Any]) -> Dict[str, Any]:
     / ``policies`` / ``slo``) and preserves full fidelity under
     ``x-fluid`` for round-tripping.
     """
-    fluid_version = contract.get("fluidVersion") or "0.7.3"
+    # Function-local: schema_manager pulls in jsonschema, and the CLI's
+    # startup budget (tests/perf/test_startup_budget.py) forbids that on
+    # the ``--help`` path.
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    # A contract that declares no version gets the newest bundled STABLE
+    # schema, which is what ``fluid validate`` assumes for the same
+    # document. Hardcoding the number here (it was "0.7.3") made this
+    # emitter disagree with the validator on every release since.
+    fluid_version = contract.get("fluidVersion") or FluidSchemaManager.latest_bundled_version()
     metadata = contract.get("metadata", {}) or {}
     owner = _owner_from_metadata(metadata)
     product_id = contract.get("id", "unknown_product")

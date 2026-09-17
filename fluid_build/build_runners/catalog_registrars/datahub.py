@@ -97,8 +97,14 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass
 class DataHubRegistrar(CatalogRegistrar):
+    # Required, and first in the field order so it can have no default —
+    # same reasoning as ``OpenMetadataRegistrar.base_url``: the old
+    # ``https://datahub.test`` placeholder is an RFC 2606 reserved name
+    # that only this module's respx-mocked tests can answer, so an
+    # unconfigured registrar built by hand reported a DNS failure instead
+    # of the missing FLUID_CATALOG_DATAHUB_URL / DATAHUB_GMS_URL setting.
+    base_url: str
     target: str = "datahub"
-    base_url: str = "https://datahub.test"
     api_token: Optional[str] = None
     timeout_seconds: int = 30
     # Base URL for spec source-of-truth documents. When set, the
