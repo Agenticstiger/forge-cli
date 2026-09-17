@@ -1,4 +1,4 @@
-fluidVersion: 0.7.2
+fluidVersion: 0.7.5
 kind: DataProduct
 id: analytics.web_multi_layer_v1
 name: Web Analytics - Medallion Architecture

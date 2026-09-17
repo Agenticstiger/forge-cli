@@ -1,4 +1,4 @@
-fluidVersion: "0.7.2"
+fluidVersion: "0.7.5"
 kind: DataProduct
 id: iot.telemetry.sensor_readings
 name: IoT Sensor Telemetry (Medallion Lake on S3 + Glue)
