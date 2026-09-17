@@ -23,14 +23,16 @@ mapped 1:1, what got defaulted, and what's unsupported.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
 import yaml
 
-from fluid_build.cli._errors import SchemaValidationError
+from fluid_build.cli._errors import FluidUserError, SchemaValidationError
 from fluid_build.cli.console import cprint
 from fluid_build.cli.import_workflow import get_importer
+from fluid_build.cli.import_workflow.airbyte import SERVER_URL_ENV as AIRBYTE_SERVER_URL_ENV
 
 
 def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Optional[str]) -> int:
@@ -61,6 +63,14 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
         )
 
     options = {"split_by": getattr(args, "split_by", None) or "project"}
+    # Endpoint precedence for `fluid import airbyte`: the flag first, then the
+    # environment. Resolved in the CLI layer because that is where both sources
+    # live. The importer keeps a refusal of its own for callers that never come
+    # through here, so neither layer can be the only thing standing between an
+    # unset setting and a socket.
+    server_url = getattr(args, "server_url", None) or os.environ.get(AIRBYTE_SERVER_URL_ENV)
+    if server_url:
+        options["server_url"] = server_url
 
     cprint(f"📥 Importing {tool} configuration from {source}…")
     try:
@@ -71,6 +81,13 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
         else:
             contract, report = importer.import_to_contract(source, options=options)
             contracts = [contract] if contract else []
+    except FluidUserError:
+        # Already a typed refusal in the house shape, and its `fix` is the
+        # specific one — "set --server-url or FLUID_IMPORT_AIRBYTE_URL", say.
+        # Re-wrapping would overwrite that with the generic "check the source
+        # path" line below, sending the reader to inspect a workspace id that
+        # was never the problem.
+        raise
     except Exception as exc:  # noqa: BLE001
         raise SchemaValidationError(
             what=f"{tool} import failed for {source}",
