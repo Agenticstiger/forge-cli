@@ -53,9 +53,12 @@ def pick_endpoint(config: Dict[str, Any], *fallback_keys: str, default: str = ""
 
     Tries ``endpoint`` first, then ``url``, then each name in
     ``fallback_keys`` (e.g. ``account_url`` for Snowflake). Returns
-    *default* when nothing is set so the registrar's own default —
-    typically a ``*.test`` URL used only by HTTP-mocked unit tests —
-    takes over.
+    *default* — an empty string unless the caller says otherwise — when
+    nothing is set. Callers are expected to treat that as "not
+    configured" and raise
+    :class:`~fluid_build.api.catalog_backend.CatalogNotConfiguredError`;
+    no registrar carries a placeholder endpoint to fall back on, because
+    a placeholder turns a missing setting into a DNS error.
     """
     for key in ("endpoint", "url", *fallback_keys):
         v = config.get(key)

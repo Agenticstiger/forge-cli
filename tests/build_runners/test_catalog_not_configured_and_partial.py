@@ -34,6 +34,7 @@ Two ways a publish told the operator the wrong thing:
 from __future__ import annotations
 
 import logging
+import re
 import socket
 from typing import Any, Dict, Iterator, List
 
@@ -249,3 +250,44 @@ def test_a_clean_publish_is_not_marked_partial(monkeypatch: pytest.MonkeyPatch) 
     assert result.succeeded is True
     assert "partial" not in result.metadata
     assert "odcs_contract_degraded" not in result.metadata
+
+
+# ---------------------------------------------------------------------------
+# the field default — the other half of the same defect
+# ---------------------------------------------------------------------------
+
+
+def test_a_registrar_cannot_be_built_without_an_endpoint() -> None:
+    """``build_registrar`` and the backend-spec factories both refuse, but
+    direct construction used to inherit the placeholder from the dataclass
+    field default and dial it. Requiring ``base_url`` closes that path."""
+    from fluid_build.build_runners.catalog_registrars.datahub import DataHubRegistrar
+    from fluid_build.build_runners.catalog_registrars.openmetadata import (
+        OpenMetadataRegistrar,
+    )
+
+    with pytest.raises(TypeError):
+        OpenMetadataRegistrar()  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        DataHubRegistrar()  # type: ignore[call-arg]
+
+
+def test_no_registrar_field_defaults_to_a_reserved_test_hostname() -> None:
+    """RFC 2606 reserves ``.test`` so it never resolves. A default carrying
+    one is what turns a missing setting into a DNS error on first publish —
+    including via a registrar that leaks into the process-global registry."""
+    import dataclasses
+
+    from fluid_build.build_runners.catalog_registrars.datahub import DataHubRegistrar
+    from fluid_build.build_runners.catalog_registrars.openmetadata import (
+        OpenMetadataRegistrar,
+    )
+
+    for cls in (OpenMetadataRegistrar, DataHubRegistrar):
+        for field in dataclasses.fields(cls):
+            if not isinstance(field.default, str):
+                continue
+            assert not re.search(r"\.test(?::\d+)?(?:/|$)", field.default), (
+                f"{cls.__name__}.{field.name} defaults to {field.default!r}, "
+                "a reserved hostname that can only fail"
+            )

@@ -106,16 +106,25 @@ class AirflowDAGGenerator:
 
     def _generate_dag_header(self, dag_id: str, schedule: str, contract: Dict[str, Any]) -> str:
         """Generate DAG definition header."""
+        # Function-local: schema_manager pulls in jsonschema, and the CLI's
+        # startup budget (tests/perf/test_startup_budget.py) forbids that on
+        # the ``--help`` path.
+        from ..schema_manager import FluidSchemaManager
+
         description = contract.get(
             "description", f"FLUID data product: {contract.get('name', dag_id)}"
         )
         name = contract.get("name", dag_id)
         domain = contract.get("domain", "unknown")
+        # Cosmetic: this lands in the generated DAG's docstring only. Still
+        # worth resolving dynamically, because the hardcoded "0.7.0" stamped
+        # every version-less contract with a schema version five releases old.
+        fluid_version = contract.get("fluidVersion") or FluidSchemaManager.latest_bundled_version()
 
         return f'''"""
 Airflow DAG for FLUID Data Product: {name}
 
-Auto-generated from FLUID contract v{contract.get("fluidVersion", "0.7.0")}
+Auto-generated from FLUID contract v{fluid_version}
 Generated at: {datetime.now().isoformat()}
 
 Domain: {domain}
