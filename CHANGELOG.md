@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A shipped template did not validate, and nothing noticed.**
+  `fluid init --template multiple-outputs` scaffolded a contract that `fluid
+  validate` rejected immediately: `metadata.layer: 'Multi-Layer'` is not in the
+  permitted set. It is a medallion demo exposing bronze, silver and gold outputs,
+  each already carrying its own per-expose layer label; the product-level value
+  was trying to say "spans layers", which the field cannot express. It now
+  declares `Gold`, the layer of the output a consumer actually reads.
+
+### Changed
+
+- **Every shipped template is now schema-validated in CI.** The existing tests
+  checked that scaffolding *produces* a `contract.fluid.yaml` and that the file
+  exists; none ever validated its content, which is how the above shipped through
+  every release. `tests/templates/test_shipped_templates_are_valid.py` asserts
+  both layers the CLI runs, in its order — and that matters, because
+  `validate_contract_file` returns `is_valid=True` on the broken template.
+  JSON-schema validation passes; the refusal comes from
+  `normalize_metadata_in_place`, reported separately as "metadata consistency".
+  A fence built on the obvious API alone would have passed on the one file we
+  knew was broken. It also refuses a template pinned to a preview schema.
+- **No shipped default may point at a host that can never resolve.**
+  `tests/test_no_reserved_tld_defaults.py` walks the AST of `fluid_build/` for
+  string defaults on RFC 2606 reserved names. Three shipped as runtime endpoints
+  — `openmetadata.test`, `datahub.test`, `airbyte.test` — each producing a DNS
+  error where a configuration error belonged, and each found by hand after
+  release. `.localhost` is deliberately permitted: five defaults use it
+  legitimately (the Command Centre and marketplace dev endpoints, the LocalStack
+  mocks), and a gate that fired on those would have been switched off. `tests/`
+  is unscanned, because test code *should* use `.test` hosts.
+
+### Fixed
+
 - **`fluid import airbyte` could not be pointed at an Airbyte instance.**
   `AirbyteImporter.server_url` defaulted to `https://airbyte.test`, and the
   importer registry constructs the class bare, so that placeholder was the

@@ -12,7 +12,7 @@ metadata:
   owner:
     team: analytics-platform
     email: analytics@company.com
-  layer: Multi-Layer
+  layer: Gold
 exposes:
 - exposeId: bronze_events
   title: 'Bronze: Raw Events'
