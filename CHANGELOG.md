@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fluid import airbyte` could not be pointed at an Airbyte instance.**
+  `AirbyteImporter.server_url` defaulted to `https://airbyte.test`, and the
+  importer registry constructs the class bare, so that placeholder was the
+  endpoint every real run dialled. RFC 2606 reserves `.test` precisely so it
+  never resolves, and no flag, environment variable or config key existed
+  anywhere to supply the right URL. The command failed with:
+
+  ```
+  why  cannot resolve hostname 'airbyte.test'
+  fix  Check the source path/identifier and that the foreign tool's config is well-formed.
+  ```
+
+  a DNS diagnostic, and a `fix` line sending the reader to inspect a workspace
+  id that was never the problem.
+
+  The endpoint now comes from `--server-url`, falling back to
+  `FLUID_IMPORT_AIRBYTE_URL` (parallel to the catalog convention
+  `FLUID_CATALOG_<NAME>_URL`). With neither set, the importer refuses by name
+  and does so *before* any client is constructed, so a missing setting costs no
+  socket and returns immediately instead of after a resolver timeout.
+
 ## [0.15.3] — 2026-09-15
 
 `0.15.2` existed to stop the front door pointing at links that go nowhere. It

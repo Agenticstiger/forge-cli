@@ -150,6 +150,15 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     parser.add_argument(
+        "--server-url",
+        dest="server_url",
+        default=None,
+        help=(
+            "Airbyte API base URL for `fluid import airbyte` (no default; "
+            "falls back to $FLUID_IMPORT_AIRBYTE_URL)"
+        ),
+    )
+    parser.add_argument(
         "--provider",
         choices=["local", "gcp", "snowflake", "aws", "azure"],
         default="local",
