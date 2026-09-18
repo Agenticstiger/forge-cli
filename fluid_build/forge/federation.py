@@ -105,6 +105,54 @@ FEDERATION_CACHE_DIRNAME = "federation"
 # chased silently. Where a redirect is genuinely expected the fetcher
 # uses an explicit small cap and re-runs the host gate on each hop.
 _FEDERATION_HTTP_TIMEOUT = 15.0
+
+#: Default wall-clock cap on each federated fetch subprocess
+#: (git clone/fetch/rev-parse).
+_FEDERATION_GIT_TIMEOUT_DEFAULT = 30.0
+
+
+def _federation_git_timeout() -> float:
+    """Per-git-operation timeout for a federated digest fetch.
+
+    ``fluid apply`` reaches another mesh to verify an upstream digest, so
+    an unresponsive registry must not be able to hang the apply. The
+    clone default used to be 60s per upstream, which across several
+    upstreams is minutes of an apply spent waiting on someone else's git
+    server.
+
+    Read per call rather than bound at import: a module-level constant
+    freezes whatever the environment held when the module first loaded,
+    so a value exported later in the process (or by a test) silently
+    does nothing while ``fluid doctor --env`` cheerfully reports it as
+    active. Same shape as ``iac/runner.py``'s tofu timeout.
+
+    Falls back to the default on a non-numeric or non-positive value --
+    a typo in an env var must not disable the bound it configures.
+    """
+    raw = os.environ.get("FLUID_FEDERATION_TIMEOUT_SECONDS")
+    if raw is None:
+        return _FEDERATION_GIT_TIMEOUT_DEFAULT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        LOG.warning(
+            "federation_timeout_invalid: FLUID_FEDERATION_TIMEOUT_SECONDS=%r "
+            "is not a number; using the %ss default",
+            raw,
+            _FEDERATION_GIT_TIMEOUT_DEFAULT,
+        )
+        return _FEDERATION_GIT_TIMEOUT_DEFAULT
+    if value <= 0:
+        LOG.warning(
+            "federation_timeout_invalid: FLUID_FEDERATION_TIMEOUT_SECONDS=%r "
+            "must be positive; using the %ss default",
+            raw,
+            _FEDERATION_GIT_TIMEOUT_DEFAULT,
+        )
+        return _FEDERATION_GIT_TIMEOUT_DEFAULT
+    return value
+
+
 _FEDERATION_MAX_REDIRECTS = 3
 
 # Opt-in allow-list for operators whose federation endpoint genuinely
@@ -931,7 +979,7 @@ def _git_clone_or_pull_via_shellout(*, auth_url: str, cache_dir: Path, workspace
                 ],
                 check=True,
                 capture_output=True,
-                timeout=60,
+                timeout=_federation_git_timeout(),
             )
         except (
             subprocess.CalledProcessError,
@@ -969,7 +1017,7 @@ def _git_clone_or_pull_via_shellout(*, auth_url: str, cache_dir: Path, workspace
                 ],
                 check=False,
                 capture_output=True,
-                timeout=30,
+                timeout=_federation_git_timeout(),
             )
             subprocess.run(
                 [
@@ -982,7 +1030,7 @@ def _git_clone_or_pull_via_shellout(*, auth_url: str, cache_dir: Path, workspace
                 ],
                 check=False,
                 capture_output=True,
-                timeout=15,
+                timeout=_federation_git_timeout(),
             )
         except (subprocess.TimeoutExpired, OSError) as exc:  # pragma: no cover
             # Don't include `exc` body — git error messages can echo the
@@ -1060,7 +1108,21 @@ def _read_first_existing_contract(
 
 @dataclass
 class FederatedConsumeViolation:
-    """One drift finding for a federated consumes[] entry."""
+    """One finding for a federated consumes[] entry.
+
+    ``kind`` separates *the upstream really did change* from *we could
+    not check it*, which callers must treat differently: drift is a
+    statement about the data, unreachability is a statement about the
+    network. Collapsing them would let a dead registry read as a clean
+    upstream (or a clean upstream read as drift), and the apply gate
+    words its warning off this field.
+
+    Values: ``"drift"`` (pinned and live digests differ), ``"unpinned"``
+    (federated upstream declared with no ``upstreamDigest``),
+    ``"unknown-workspace"`` (not in ``federation/upstreams.yaml``),
+    ``"unreachable"`` (the fetch itself failed), ``"not-wired"`` (no
+    fetcher for that workspace kind yet).
+    """
 
     consume_index: int
     upstream_workspace_id: str
@@ -1068,6 +1130,7 @@ class FederatedConsumeViolation:
     expected_digest: str
     actual_digest: str
     reason: str
+    kind: str = "drift"
 
 
 def validate_federated_consumes(
@@ -1128,6 +1191,7 @@ def validate_federated_consumes(
                         "via ``fluid forge`` against the upstream "
                         "workspace's contract."
                     ),
+                    kind="unpinned",
                 )
             )
             continue
@@ -1145,6 +1209,7 @@ def validate_federated_consumes(
                         f"federation/upstreams.yaml. Add it to the "
                         f"manifest before referencing in consumes[]."
                     ),
+                    kind="unknown-workspace",
                 )
             )
             continue
@@ -1155,7 +1220,40 @@ def validate_federated_consumes(
                 version,
                 workspace_root=workspace_root,
             )
-        except NotImplementedError as exc:
+        except Exception as exc:  # noqa: BLE001 - see below
+            if not isinstance(exc, NotImplementedError):
+                # A fetch failure is about the network, not the data. It
+                # must not abort the walk: raising here would discard
+                # violations already found for *other* upstreams and
+                # hand the caller a bare exception in their place, so
+                # one dead registry would mask real drift elsewhere.
+                # Recorded as its own row instead, so the caller can see
+                # exactly which upstream could not be reached and why.
+                LOG.warning(
+                    "federation_fetch_failed: workspace=%s product=%s err=%s: %s",
+                    ws_id,
+                    product_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                violations.append(
+                    FederatedConsumeViolation(
+                        consume_index=idx,
+                        upstream_workspace_id=str(ws_id),
+                        upstream_product_id=str(product_id or "?"),
+                        expected_digest=str(expected),
+                        actual_digest="",
+                        reason=(
+                            f"Could not reach federated upstream "
+                            f"{ws_id!r} to verify the pin "
+                            f"({type(exc).__name__}: {exc}). The pinned "
+                            f"digest was NOT checked -- this is not a "
+                            f"statement that the upstream is unchanged."
+                        ),
+                        kind="unreachable",
+                    )
+                )
+                continue
             # Skeleton mode — surface as a violation so apply doesn't
             # silently accept an unverified federated digest. Wiring
             # the real fetcher converts this to an actual comparison.
@@ -1167,6 +1265,7 @@ def validate_federated_consumes(
                     expected_digest=str(expected),
                     actual_digest="",
                     reason=(f"Federation fetcher for kind={ws.kind!r} not yet wired ({exc})."),
+                    kind="not-wired",
                 )
             )
             continue
@@ -1184,6 +1283,7 @@ def validate_federated_consumes(
                         f"``fluid forge`` to refresh the pin or "
                         f"investigate why the upstream changed."
                     ),
+                    kind="drift",
                 )
             )
     return violations

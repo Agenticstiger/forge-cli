@@ -174,6 +174,12 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "Per-`tofu` invocation wall-clock cap",
     ),
     (
+        "FLUID_FEDERATION_TIMEOUT_SECONDS",
+        "30s default",
+        "Per-git-operation cap when `fluid apply` fetches a federated "
+        "upstream digest; raise it for a genuinely large upstream repo",
+    ),
+    (
         "DBT_EXECUTABLE",
         "dbt discovered on PATH / venv",
         "Override the dbt binary or wrapper (e.g. `poetry run dbt`) used by "
