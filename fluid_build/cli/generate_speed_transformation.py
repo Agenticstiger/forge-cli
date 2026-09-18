@@ -817,7 +817,15 @@ def _run_dbt_parse_gate(output_dir: Path, logger: logging.Logger) -> bool:
     if (output_dir / "profiles.yml").exists():
         profiles_args = ["--profiles-dir", str(output_dir)]
 
-    if (output_dir / "packages.yml").exists() and not (output_dir / "dbt_packages").is_dir():
+    # ``--mesh-hub`` folds the package pins into ``dependencies.yml`` instead
+    # (dbt forbids both files coexisting -- see ``engines/dbt/packages_yml``),
+    # so gating on ``packages.yml`` alone silently skipped ``dbt deps`` for
+    # exactly the mesh projects that need it, and ``dbt parse`` then failed
+    # with "found N package(s) ... but only 0 package(s) installed".
+    _pins_declared = (output_dir / "packages.yml").exists() or (
+        output_dir / "dependencies.yml"
+    ).exists()
+    if _pins_declared and not (output_dir / "dbt_packages").is_dir():
         deps_command = [*command_prefix, "deps", "--project-dir", str(output_dir), *profiles_args]
         cprint(f"\n[cyan]Running `dbt deps` against {output_dir}[/cyan]")
         try:
