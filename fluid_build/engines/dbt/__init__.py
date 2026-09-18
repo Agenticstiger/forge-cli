@@ -52,6 +52,8 @@ class DbtEngine(TransformationEngine):
 
     name = "dbt"
     supported_patterns = ("hybrid-reference", "embedded-logic", "multi-stage")
+    #: dbt resolves consumes[] into models/sources.yml -- see engines/dbt/sources.py.
+    wires_consumes = True
 
     def generate(
         self,

@@ -344,6 +344,66 @@ def _resolve_contract_path(args: Any) -> Path:
     )
 
 
+def _warn_unwired_consumes(
+    contract: Dict[str, Any],
+    engine: Any,
+    engine_name: str,
+) -> List[str]:
+    """Say so when a declared upstream will not appear in the output.
+
+    ``consumes[]`` is the mesh edge -- the contract's statement of which
+    upstream data products this one is built from. Only the dbt engine
+    acts on it (emitting ``models/sources.yml``). Every other engine
+    generates from the build's own SQL and never looks at ``consumes[]``,
+    so a contract can declare three upstreams, generate cleanly, exit 0,
+    and produce artifacts that read from somewhere else entirely. The
+    shipped ``customer-360`` template is exactly that shape: three
+    ``consumes[]`` entries, ``engine: sql``, and not one of them in the
+    generated SQL.
+
+    Silence there is the worst available answer, because the contract
+    looks authoritative about lineage while the artifacts disagree with
+    it. This does not invent a wiring -- how a SQL or Spark job should
+    address a federated upstream is a real design decision, not
+    something to guess inside a warning -- it just refuses to let the
+    gap be invisible.
+
+    Returns the unwired product ids (for tests and callers); emits
+    nothing when the engine wires them or the contract declares none.
+    """
+    if getattr(engine, "wires_consumes", False):
+        return []
+    consumes = contract.get("consumes")
+    if not isinstance(consumes, list):
+        return []
+
+    unwired: List[str] = []
+    for entry in consumes:
+        if not isinstance(entry, dict):
+            continue
+        product_id = entry.get("productId")
+        if not product_id:
+            continue
+        expose_id = entry.get("exposeId")
+        unwired.append(f"{product_id}.{expose_id}" if expose_id else str(product_id))
+
+    if not unwired:
+        return []
+
+    logger = logging.getLogger("fluid.cli")
+    logger.warning(
+        "consumes_not_wired: the %r engine does not resolve consumes[] into a "
+        "read address, so %d declared upstream(s) do not appear in the generated "
+        "artifacts: %s. The generated code reads from whatever the build's own "
+        "SQL names. Point the build at these upstreams by hand, or generate with "
+        "the dbt engine, which emits them as sources.",
+        engine_name,
+        len(unwired),
+        ", ".join(unwired),
+    )
+    return unwired
+
+
 def _resolve_output_dir(args: Any, build: Dict[str, Any], engine_name: str) -> Path:
     """Determine the output directory."""
     if getattr(args, "output", None):
@@ -574,6 +634,8 @@ def _generate_single_build(
         output_dir = base_output / str(build_name)
     if engine_name == "dbt":
         engine_kwargs["output_dir"] = output_dir
+
+    _warn_unwired_consumes(contract, engine, engine_name)
 
     files = engine.generate(
         contract,
