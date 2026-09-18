@@ -44,13 +44,22 @@ def _safe_comment(value: Any) -> str:
     return " ".join(escape_for_docstring(value).split()) or "task"
 
 
-#: Jinja delimiters. ``bash_command`` is an Airflow ``template_field``, so
-#: Airflow re-renders it at TASK RUNTIME -- after this module's quoting is
-#: already baked in. ``shlex.quote`` wraps a value in ``'...'`` but does
-#: nothing to ``{{ ... }}``, and Jinja string escapes can synthesise a quote
-#: from a payload that contains none: ``{{ "\x27" }}; echo OWNED; #``
-#: renders to ``''; echo OWNED; #'`` and escapes the shell quoting.
-_JINJA_DELIMITERS = re.compile(r"\{\{|\}\}|\{%|%\}|\{#|#\}")
+#: Every Jinja construct -- ``{{ }}``, ``{% %}``, ``{# #}`` -- needs a brace,
+#: so stripping braces is sufficient AND cannot be spliced back together.
+#:
+#: Matching the two-character delimiters instead would be wrong: ``re.sub``
+#: makes ONE left-to-right, non-overlapping pass, so removing an inner pair
+#: rejoins the survivors into a NEW delimiter -- ``{}}{`` -> ``{{`` and
+#: ``}{{}`` -> ``}}``. A payload built that way reaches the rendered shell
+#: with live Jinja, defeating the whole defence.
+#:
+#: Why this matters at all: ``bash_command`` is an Airflow ``template_field``,
+#: so Airflow re-renders it at TASK RUNTIME -- after this module's quoting is
+#: baked in. ``shlex.quote`` wraps a value in ``'...'`` but does nothing to
+#: ``{{ ... }}``, and Jinja string escapes synthesise a quote from a payload
+#: containing none: ``{{ "\x27" }}; echo OWNED; #`` renders to
+#: ``''; echo OWNED; #'`` and escapes the shell quoting.
+_JINJA_BRACES = re.compile(r"[{}]")
 
 
 def _sh(value: Any) -> str:
@@ -58,19 +67,20 @@ def _sh(value: Any) -> str:
 
     Two steps, and the order matters:
 
-    1. Strip Jinja delimiters. Airflow re-renders ``bash_command`` as a Jinja
+    1. Strip braces, which removes every Jinja construct and cannot be
+       spliced back into one. Airflow re-renders ``bash_command`` as a Jinja
        template at task runtime, so a contract value carrying ``{{ ... }}``
        would be expanded *inside* the quotes added below -- after which the
        quoting no longer holds. No legitimate value here (a GCP project id, a
-       dataset, a principal, a role, a model name) contains a Jinja
-       delimiter, so removing them is safe and non-breaking.
+       dataset, a principal, a role, a model name) contains a brace, so
+       removing them is safe and non-breaking.
     2. ``shlex.quote`` the result, so the shell sees one inert token.
 
     Use this for every value that came from ``contract.fluid.yaml``. Do NOT
     use it for the generator's own ``{{ var.value.* }}`` defaults, which are
     authored here and are meant to be rendered.
     """
-    return shlex.quote(_JINJA_DELIMITERS.sub("", str(value)))
+    return shlex.quote(_JINJA_BRACES.sub("", str(value)))
 
 
 def _bash_task(task_id: str, comment: str, command: str) -> str:
@@ -318,7 +328,7 @@ dag = DAG(
             # branch rather than trusting it to be a well-formed command.
             command = _sh(script)
         else:
-            command = f"echo {shlex.quote(f'Run {build_id}')}"
+            command = f"echo {_sh(f'Run {build_id}')}"
 
         return _bash_task(task_id, f"Schedule task: {build_id}", command)
 

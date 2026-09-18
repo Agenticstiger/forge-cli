@@ -514,6 +514,13 @@ def test_schedule_task_script_is_shell_quoted_not_just_python_inert():
 #: to escape. This is the payload that defeats quoting-only defences.
 POC_JINJA_QUOTE = '{{ "\\x27" }}; touch /tmp/FLUID_PWNED; #'
 
+#: Same attack, but the delimiters are SPLICED: a single non-overlapping
+#: `re.sub` pass that removes two-character Jinja delimiters rejoins the
+#: survivors into new ones -- `{}}{` -> `{{` and `}{{}` -> `}}` -- so the
+#: payload arrives at the shell with live Jinja. This defeats a
+#: delimiter-matching strip; only stripping braces themselves survives it.
+POC_JINJA_SPLICED = '{}}{ "\\x27" }{{}; touch /tmp/FLUID_PWNED; #'
+
 
 def _bash_commands(code):
     """Every `bash_command=` value in the generated DAG, as Python sees it."""
@@ -550,6 +557,11 @@ def _render_like_airflow(command: str) -> str:
         {"exposeId": "e", "binding": {"location": {"project": POC_JINJA_QUOTE, "dataset": "d"}}},
         {"exposeId": "e", "binding": {"location": {"project": "p", "dataset": POC_JINJA_QUOTE}}},
         {"exposeId": "{{ dag.description }}"},
+        # Spliced variants -- these pass against a brace strip and FAIL
+        # against a delimiter-matching strip.
+        {"exposeId": POC_JINJA_SPLICED},
+        {"exposeId": "e", "binding": {"location": {"project": POC_JINJA_SPLICED, "dataset": "d"}}},
+        {"exposeId": "e", "binding": {"location": {"project": "p", "dataset": POC_JINJA_SPLICED}}},
     ],
 )
 def test_contract_value_cannot_inject_via_runtime_jinja_render(params):
@@ -587,3 +599,30 @@ def test_generator_authored_jinja_defaults_still_render():
         [{"actionId": "a1", "action": "provisionDataset", "provider": "gcp", "params": {}}]
     )
     assert any("var.value.gcp_project" in c for c in _bash_commands(code))
+
+
+@pytest.mark.parametrize("payload", [POC_JINJA_QUOTE, POC_JINJA_SPLICED])
+@pytest.mark.parametrize(
+    "action,params_key",
+    [
+        ("registerSchema", "schemaName"),
+        ("createView", "viewName"),
+        ("grantAccess", "principal"),
+        ("grantAccess", "role"),
+        ("scheduleTask", "buildId"),
+        ("scheduleTask", "script"),
+    ],
+)
+def test_every_bash_command_site_resists_runtime_jinja(action, params_key, payload):
+    """Every command-building branch, both payload shapes.
+
+    `scheduleTask`+`buildId` covers the else-branch that once used bare
+    `shlex.quote` instead of `_sh`; the spliced payload covers the
+    delimiter-rejoin bypass.
+    """
+    params = {"engine": "python", params_key: payload}
+    code = _dag_from_actions([{"actionId": "a1", "action": action, "params": params}])
+    for command in _bash_commands(code):
+        rendered = _render_like_airflow(command)
+        for token in shlex.split(rendered):
+            assert not token.startswith("touch"), f"escaped the quoting: {rendered}"
