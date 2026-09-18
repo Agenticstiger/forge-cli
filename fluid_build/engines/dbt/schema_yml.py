@@ -414,7 +414,10 @@ def _build_column_tests(
         if col_name in seen_cols:
             continue
         if tests:
-            columns.append({"name": col_name, tests_key: tests})
+            # Route through _nest_args like every other emit site: a dq rule
+            # whose selector names a column absent from contract.schema[]
+            # lands here, and emitting it flat is the exact shape v2 rejects.
+            columns.append({"name": col_name, tests_key: _nest_args(tests, capabilities)})
 
     return columns, model_tests
 

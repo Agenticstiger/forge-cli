@@ -177,3 +177,59 @@ def test_emitted_schema_yml_switches_shape_at_the_floor():
     # access moves under config on BOTH -- that one has no floor.
     for parsed in (legacy, modern):
         assert parsed["models"][0]["config"]["access"] == "public"
+
+
+def test_orphan_dq_column_tests_are_nested_too():
+    """A dq rule on a column absent from contract.schema[] lands on a separate
+    emit path, which originally skipped the nesting -- so one generated file
+    carried both shapes, and the flat one aborts a v2 parse of the whole
+    project.
+    """
+    import yaml
+
+    from fluid_build.engines.dbt._capabilities import MODERN
+    from fluid_build.engines.dbt.schema_yml import generate_schema_yml
+
+    contract = {
+        "fluidVersion": "0.7.5",
+        "id": "g.a.orders_v1",
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "table",
+                "contract": {
+                    "schema": [{"name": "status", "type": "STRING"}],
+                    "dq": {
+                        "rules": [
+                            # declared column -> the already-covered path
+                            {
+                                "id": "r1",
+                                "type": "uniqueness",
+                                "severity": "error",
+                                "selector": "status",
+                            },
+                            # NOT in schema[] -> the orphan-column path
+                            {
+                                "id": "r2",
+                                "type": "accuracy",
+                                "severity": "error",
+                                "selector": "not_in_schema",
+                                "operator": ">=",
+                                "threshold": 0.9,
+                            },
+                        ]
+                    },
+                },
+            }
+        ],
+    }
+    emitted = generate_schema_yml(contract, capabilities=MODERN)["models/marts/schema.yml"]
+    parsed = yaml.safe_load(emitted)
+    for column in parsed["models"][0].get("columns", []):
+        for test in column.get("data_tests", []) or column.get("tests", []) or []:
+            if isinstance(test, dict):
+                ((_name, body),) = test.items()
+                if isinstance(body, dict) and body:
+                    assert (
+                        "arguments" in body
+                    ), f"column {column['name']} emitted a flat test: {test}"
