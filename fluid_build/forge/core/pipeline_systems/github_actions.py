@@ -354,14 +354,6 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "name": "Generate Schedules",
                             "run": commands["generate_schedule"],
                         },
-                        {
-                            "name": "Check Transformation Drift",
-                            "run": commands["check_transformations"],
-                        },
-                        {
-                            "name": "Check Schedule Drift",
-                            "run": commands["check_schedules"],
-                        },
                     ],
                 },
                 "plan": {
@@ -406,7 +398,13 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         },
                         {
                             "name": "Run Tests",
-                            "run": "fluid test --type ${{ matrix.test-type }} --output test-results-${{ matrix.test-type }}.xml",
+                            "run": (
+                                'case "${{ matrix.test-type }}" in\n'
+                                "  contract) fluid contract-tests ${CONTRACT:-contract.fluid.yaml} ;;\n"
+                                "  unit)     fluid test ${CONTRACT:-contract.fluid.yaml} --no-data ;;\n"
+                                "  *)        fluid test ${CONTRACT:-contract.fluid.yaml} ;;\n"
+                                "esac"
+                            ),
                         },
                         {
                             "name": "Upload Test Results",
@@ -568,7 +566,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             # do not fail the job (parity with the prior step).
                             "continue-on-error": True,
                         },
-                        {"name": "FLUID Security Check", "run": "fluid validate --security-only"},
+                        {
+                            "name": "FLUID Security Check",
+                            "run": "fluid policy-check ${CONTRACT:-contract.fluid.yaml} --strict",
+                        },
                         {
                             "name": "Upload SARIF",
                             "uses": _pin_action("github/codeql-action/upload-sarif@v3"),
@@ -602,10 +603,15 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         {"name": "Checkout", "uses": _pin_action("actions/checkout@v4")},
                         {
                             "name": "Generate Compliance Report",
-                            "run": "fluid audit --compliance --output compliance-report.json",
+                            "run": "fluid policy-check ${CONTRACT:-contract.fluid.yaml} --format json --output compliance-report.json",
                         },
-                        {"name": "Check Data Lineage", "run": "fluid lineage --validate"},
-                        {"name": "Performance Benchmarks", "run": "fluid benchmark --baseline"},
+                        {
+                            "name": "Check Data Lineage",
+                            "run": (
+                                "fluid verify ${CONTRACT:-contract.fluid.yaml} "
+                                "--reconcile-lineage --warn-only"
+                            ),
+                        },
                         {
                             "name": "Upload Compliance Artifacts",
                             "uses": _pin_action("actions/upload-artifact@v4"),

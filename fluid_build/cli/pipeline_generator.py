@@ -511,6 +511,6 @@ def _show_next_steps(provider: str, output_dir: Path):
     cprint("  • fluid plan --output plan.json")
     cprint("  • fluid apply --plan plan.json")
     cprint("  • fluid test --coverage")
-    cprint("  • fluid viz-plan --output pipeline-viz.html")
+    cprint("  • fluid viz-plan plan.json --out pipeline-viz.html")
     cprint("  • fluid generate standard --format odps-v4.1 --out odps-catalog.json")
     cprint("  • fluid marketplace publish --catalog odps-catalog.json")

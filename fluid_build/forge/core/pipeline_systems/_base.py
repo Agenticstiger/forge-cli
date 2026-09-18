@@ -335,7 +335,8 @@ class BasePipelineTemplate:
             # native/local applies that never touch the OpenTofu engine.
             "apply": (
                 'if [ -n "$BUILD_ID" ]; then '
-                "fluid apply ${CONTRACT:-contract.fluid.yaml} --build $BUILD_ID "
+                "fluid apply ${CONTRACT:-contract.fluid.yaml} "
+                "--mode amend-and-build --build-id $BUILD_ID "
                 "--ensure-opentofu --yes; "
                 "else "
                 "fluid apply runtime/plan.json --ensure-opentofu --yes; "
@@ -368,21 +369,11 @@ class BasePipelineTemplate:
                 "fluid verify ${CONTRACT:-contract.fluid.yaml} --strict "
                 "--env ${FLUID_ENV:-dev} --out runtime/verify-report.json"
             ),
-            "test": "fluid test --coverage",
+            "test": "fluid test ${CONTRACT:-contract.fluid.yaml}",
             "contract_test": "fluid contract-tests ${CONTRACT:-contract.fluid.yaml}",
             "generate_transformation": "fluid generate speed-transformation",
             "generate_schedule": "fluid generate schedule",
-            "check_transformations": (
-                "if [ -f dbt_project.yml ] || [ -d models/ ]; then "
-                "fluid generate speed-transformation --check; "
-                "fi"
-            ),
-            "check_schedules": (
-                "if [ -d dags/ ] || [ -d pipelines/ ] || [ -d flows/ ]; then "
-                "fluid generate schedule --check; "
-                "fi"
-            ),
-            "visualize": "fluid viz-plan --output pipeline-viz.html && fluid viz-graph --output dependency-graph.png",
+            "visualize": "fluid viz-plan ${PLAN:-plan.json} --out pipeline-viz.html && fluid viz-graph --out dependency-graph.png",
             # Canonical key: ``publish_odps`` emits the LF/ODPI ODPS v4.1
             # JSON via the (non-deprecated) ``fluid generate standard
             # --format odps-v4.1`` path. The ``publish_opds`` alias below
@@ -518,7 +509,7 @@ class BasePipelineTemplate:
         tooling — but we DO emit:
 
         * a short shell body that exercises ``fluid`` 's own security
-          surface (``fluid validate --security-only``,
+          surface (``fluid policy-check``,
           ``fluid policy-apply``, ``fluid audit --compliance``), and
         * the canonical step name + comment-banner with the keywords
           (``security scan``, ``vulnerability``, ``policy``, ``audit``,
@@ -541,15 +532,16 @@ class BasePipelineTemplate:
         body = (
             "set -eu\n"
             "# FLUID security scan + compliance audit — advanced/enterprise tier.\n"
-            "# Surfaces: SAST signal (via fluid validate), policy check\n"
-            "# (via fluid policy-apply --mode dry-run), and audit / SBOM /\n"
-            "# vulnerability scan (via fluid audit + optional osv-scanner).\n"
-            "fluid validate --security-only || true\n"
+            "# Surfaces: policy violations (via fluid policy-check), policy\n"
+            "# binding dry-run (via fluid policy-apply --mode check), and an\n"
+            "# optional osv-scanner vulnerability scan.\n"
+            'fluid policy-check "${CONTRACT:-contract.fluid.yaml}" --strict || true\n'
             "if [ -f dist/artifacts/policy/bindings.json ]; then\n"
             "  fluid policy-apply dist/artifacts/policy/bindings.json "
-            '--mode dry-run --env "${FLUID_ENV:-dev}" || true\n'
+            "--mode check || true\n"
             "fi\n"
-            "fluid audit --compliance --output runtime/compliance-report.json || true\n"
+            'fluid policy-check "${CONTRACT:-contract.fluid.yaml}" --format json '
+            "--output runtime/compliance-report.json || true\n"
             "# Optional: OSV-Scanner vulnerability scan if the binary is on the runner.\n"
             "if command -v osv-scanner >/dev/null 2>&1; then\n"
             "  osv-scanner scan source -r . --format sarif "
