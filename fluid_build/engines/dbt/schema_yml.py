@@ -37,7 +37,7 @@ network.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import yaml
 
@@ -109,6 +109,39 @@ except ImportError:  # pragma: no cover
         return expose.get("contract")
 
 
+if TYPE_CHECKING:  # pragma: no cover
+    from ._capabilities import DbtCapabilities
+
+
+def _nest_args(tests: Any, capabilities: Optional["DbtCapabilities"]) -> Any:
+    """Apply the v2 ``arguments:`` nesting when the target engine honours it.
+
+    Gated because the nested form is a compile error below dbt-core 1.10.8
+    (``arguments:`` lands at 1.10.5 but behind a behaviour flag that only
+    defaults true at 1.10.8), while the flat form is merely deprecated on
+    1.x and a hard error on v2.
+    """
+    if not (capabilities and capabilities.nest_test_arguments) or not isinstance(tests, list):
+        return tests
+    return [_tm.nest_test_arguments(t) for t in tests]
+
+
+def _merge_model_config(model_def: Dict[str, Any], values: Dict[str, Any]) -> None:
+    """Merge ``values`` into ``model_def["config"]``, creating it if absent.
+
+    Several independent concerns now write model-level config -- ``access``
+    for dbt Mesh and ``contract.enforced`` for ``--model-contracts`` -- and
+    they run at different points in the emit. Assigning the dict wholesale
+    (as the contract path used to) drops whatever landed first, and nothing
+    downstream re-reads it, so the loss is silent.
+    """
+    config = model_def.get("config")
+    if not isinstance(config, dict):
+        config = {}
+        model_def["config"] = config
+    config.update(values)
+
+
 def generate_schema_yml(
     contract: Dict[str, Any],
     *,
@@ -116,6 +149,7 @@ def generate_schema_yml(
     model_contracts: bool = False,
     adapter: Optional[str] = None,
     tests_key: Optional[str] = None,
+    capabilities: Optional["DbtCapabilities"] = None,
 ) -> GenerationResult:
     """Generate ``schema.yml`` (dbt tests + Mesh ``access: public``)
     and, when ``mesh_hub`` is set, a companion ``dependencies.yml``.
@@ -172,7 +206,7 @@ def generate_schema_yml(
         dq_rules = dq.get("rules", []) if isinstance(dq, dict) else []
 
         columns, model_tests = _build_column_tests(
-            schema_cols, dq_rules, tests_key=resolved_tests_key
+            schema_cols, dq_rules, tests_key=resolved_tests_key, capabilities=capabilities
         )
 
         model_def: Dict[str, Any] = {"name": expose_id}
@@ -188,18 +222,29 @@ def generate_schema_yml(
         # Internal staging models — NOT in ``exposes[]`` — inherit
         # dbt's default ``access: protected`` so they stay private
         # to this project.
-        model_def["access"] = "public"
+        # ``access`` belongs under ``config:``. dbt v2 rejects the top-level
+        # spelling outright (dbt1060 UnusedConfigKey), and the authoritative
+        # v2 spec has no ``access`` on ``ModelProperties`` while ``ModelConfig``
+        # does. Ungated: measured to be honoured (promoted to ``node.access``
+        # in the manifest) on every dbt from 1.8.10 through 2.0.4, unlike the
+        # source-freshness move which needed a floor.
+        _merge_model_config(model_def, {"access": "public"})
 
         # Table-wide (``selector: "*"``) rules — and freshness rules, which
         # dbt can only express at model level — attach here, not as a dbt
         # column literally named ``*``.
         if model_tests:
-            model_def[resolved_tests_key] = model_tests
+            model_def[resolved_tests_key] = _nest_args(model_tests, capabilities)
 
         # Opt-in dbt model contract (build-time schema enforcement).
         if model_contracts:
             _apply_model_contract(
-                model_def, columns, schema_cols, adapter, tests_key=resolved_tests_key
+                model_def,
+                columns,
+                schema_cols,
+                adapter,
+                tests_key=resolved_tests_key,
+                capabilities=capabilities,
             )
 
         # Semantic versioning for public interfaces: read ``version``
@@ -255,6 +300,7 @@ def _apply_model_contract(
     adapter: Optional[str],
     *,
     tests_key: str = TESTS_KEY_LEGACY,
+    capabilities: Optional["DbtCapabilities"] = None,
 ) -> None:
     """Turn one emitted model into a dbt model contract (in place).
 
@@ -299,7 +345,10 @@ def _apply_model_contract(
     if _models._layer_materialization("marts") not in _CONSTRAINT_MATERIALIZATIONS:
         return
 
-    model_def["config"] = {"contract": {"enforced": True}}
+    # MERGE, never assign: ``access`` is already under ``config`` by the time
+    # this runs, and a wholesale assignment would drop it -- silently, since
+    # nothing downstream re-reads it.
+    _merge_model_config(model_def, {"contract": {"enforced": True}})
 
     for entry in columns:
         col = schema_by_name[entry["name"]]
@@ -321,7 +370,7 @@ def _apply_model_contract(
             # not_null data test (datacontract-cli's constraints/tests split).
             tests = [t for t in tests if t != "not_null"] if tests else tests
         if tests:
-            entry[tests_key] = tests
+            entry[tests_key] = _nest_args(tests, capabilities)
 
 
 def _build_column_tests(
@@ -329,6 +378,7 @@ def _build_column_tests(
     dq_rules: List[Dict[str, Any]],
     *,
     tests_key: str = TESTS_KEY_LEGACY,
+    capabilities: Optional["DbtCapabilities"] = None,
 ) -> tuple[List[Dict[str, Any]], List[Any]]:
     """Build dbt column + model test definitions from schema + DQ rules.
 
@@ -356,7 +406,7 @@ def _build_column_tests(
         if col.get("description"):
             col_entry["description"] = col["description"]
         if tests:
-            col_entry[tests_key] = tests
+            col_entry[tests_key] = _nest_args(tests, capabilities)
         columns.append(col_entry)
 
     # DQ rules on columns not in schema
@@ -364,7 +414,10 @@ def _build_column_tests(
         if col_name in seen_cols:
             continue
         if tests:
-            columns.append({"name": col_name, tests_key: tests})
+            # Route through _nest_args like every other emit site: a dq rule
+            # whose selector names a column absent from contract.schema[]
+            # lands here, and emitting it flat is the exact shape v2 rejects.
+            columns.append({"name": col_name, tests_key: _nest_args(tests, capabilities)})
 
     return columns, model_tests
 

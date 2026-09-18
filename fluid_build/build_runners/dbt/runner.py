@@ -326,7 +326,14 @@ _FUSION_BANNER_RE = re.compile(r"\bdbt[\s-]+fusion\b[^0-9]*([0-9][\w.+-]*)?", re
 # v1 multi-line: ``installed: 1.8.0``; pre-1.0: ``installed version: 0.21.1``.
 _CORE_INSTALLED_RE = re.compile(r"\binstalled(?:\s+version)?:\s*v?([0-9][\w.+-]*)", re.IGNORECASE)
 # Single bare banner line ``dbt 2.0.0`` (some Fusion builds drop "Fusion").
-_BARE_VERSION_RE = re.compile(r"^\s*dbt\s+v?([0-9][\w.+-]*)\s*$", re.IGNORECASE | re.MULTILINE)
+# ``dbt 2.0.1`` (the proprietary v2 build) and ``dbt-oss 2.0.4`` (the
+# Apache-2.0 build of the same v2 engine) both answer with a bare banner.
+# The ``-oss`` suffix is why this has to be optional: without it every
+# dbt-oss install classified as ("unknown", ""), and every capability gate
+# hanging off the detected engine silently took its most conservative branch.
+_BARE_VERSION_RE = re.compile(
+    r"^\s*dbt(?:-oss)?\s+v?([0-9][\w.+-]*)\s*$", re.IGNORECASE | re.MULTILINE
+)
 
 
 @functools.lru_cache(maxsize=None)

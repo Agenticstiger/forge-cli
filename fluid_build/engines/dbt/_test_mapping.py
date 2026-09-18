@@ -129,6 +129,43 @@ def unique_test() -> str:
     return "unique"
 
 
+#: Keys dbt v2 allows beside a generic test's name. Everything else is a
+#: test *input* and must move under ``arguments:``. From the authoritative v2
+#: spec (``fs-schema-dbt-yaml-files-v2.0.5.json``), ``CustomTestInner`` is
+#: ``additionalProperties: false`` over exactly this set.
+_TEST_RESERVED_KEYS = frozenset({"arguments", "column_name", "config", "description", "name"})
+
+
+def nest_test_arguments(entry: Any) -> Any:
+    """Move a generic test's inputs under ``arguments:``.
+
+    ``{"accepted_values": {"values": [...]}}`` becomes
+    ``{"accepted_values": {"arguments": {"values": [...]}}}``.
+
+    dbt v2 rejects the flat form outright (dbt1159 DbtYamlValidationError),
+    and dbt-core 1.12 already warns on it
+    (MissingArgumentsPropertyInGenericTestDeprecation) -- but the nested form
+    is a COMPILE ERROR below dbt-core 1.10.8, so callers must gate on the
+    resolved engine capability rather than always nesting. See
+    ``_capabilities`` for the measured floors.
+
+    Bare string tests (``not_null``) have no inputs and pass through. So do
+    entries already carrying ``arguments``. Mirrors dbt-autofix's
+    ``refactor_test_args`` (Apache-2.0), which moves every non-reserved key
+    the same way.
+    """
+    if not isinstance(entry, Mapping) or len(entry) != 1:
+        return entry
+    ((name, body),) = entry.items()
+    if not isinstance(body, Mapping) or "arguments" in body:
+        return entry
+    arguments = {k: v for k, v in body.items() if k not in _TEST_RESERVED_KEYS}
+    if not arguments:
+        return entry
+    reserved = {k: v for k, v in body.items() if k in _TEST_RESERVED_KEYS}
+    return {name: {**reserved, "arguments": arguments}}
+
+
 def accepted_values_test(values: Sequence[Any]) -> dict[str, Any]:
     """dbt built-in ``accepted_values`` with the declared value list."""
     return {"accepted_values": {"values": list(values)}}

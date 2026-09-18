@@ -255,6 +255,20 @@ class ReconcileReport:
 # ---------------------------------------------------------------------------
 
 
+def _config_access(model: Dict[str, Any]) -> Optional[str]:
+    """``config.access`` when ``config`` is a mapping, else ``None``.
+
+    The surrounding loop is defensive about malformed YAML at every other
+    read. An unguarded ``.get`` here raises AttributeError on a non-mapping
+    ``config:``, and ``fluid verify --reconcile-dbt`` catches that broadly --
+    so ONE malformed model turns the whole contract-vs-dbt drift gate into a
+    no-op and the exit code flips from 1 to 0 on a project that really has
+    drift. Fail-open on a gate is worse than the malformed input.
+    """
+    config = model.get("config")
+    return config.get("access") if isinstance(config, dict) else None
+
+
 def load_dbt_schema_models(
     project_dir: Path, *, logger: logging.Logger = LOG
 ) -> Dict[str, Dict[str, Any]]:
@@ -320,7 +334,12 @@ def load_dbt_schema_models(
                 source = yml.name
             models[str(name)] = {
                 "columns": columns,
-                "access": model.get("access"),
+                # dbt accepts ``access`` at the model level (legacy) or under
+                # ``config:`` (required by dbt v2, and what forge emits now).
+                # Reading only the legacy spot made this silently return None
+                # for every modern project, which disabled the
+                # public-model-not-in-exposes drift check below.
+                "access": model.get("access") or _config_access(model),
                 "source": source,
             }
     return models

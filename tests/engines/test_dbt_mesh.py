@@ -106,7 +106,7 @@ class TestAccessPublic:
         parsed = _parse_schema_yml(out)
         assert len(parsed["models"]) == 3
         for model in parsed["models"]:
-            assert model["access"] == "public", (
+            assert model["config"]["access"] == "public", (
                 f"Model {model['name']!r} missing access: public. "
                 "Every expose is a public output port of the data "
                 "product by definition — dbt Mesh requires this for "
@@ -128,7 +128,7 @@ class TestAccessPublic:
         out = generate_schema_yml(contract)
         parsed = _parse_schema_yml(out)
         model = parsed["models"][0]
-        assert model["access"] == "public"
+        assert model["config"]["access"] == "public"
         assert model["description"] == "Mart model #0"
         # DQ rules still generate column tests (regression guard).
         assert "columns" in model
@@ -161,7 +161,7 @@ class TestModelVersioning:
         assert "latest_version" not in model
         assert "versions" not in model
         # access: public still there — versioning is orthogonal.
-        assert model["access"] == "public"
+        assert model["config"]["access"] == "public"
 
 
 # -----------------------------------------------------------------------------
@@ -201,7 +201,7 @@ class TestMeshHub:
         assert "dependencies.yml" not in out
         # access: public still emitted because it's automatic.
         parsed = _parse_schema_yml(out)
-        assert parsed["models"][0]["access"] == "public"
+        assert parsed["models"][0]["config"]["access"] == "public"
 
 
 # -----------------------------------------------------------------------------
@@ -221,7 +221,7 @@ class TestMeshAnnotationsCoexist:
         parsed = _parse_schema_yml(out)
         assert len(parsed["models"]) == 2
         for model in parsed["models"]:
-            assert model["access"] == "public"
+            assert model["config"]["access"] == "public"
             assert model["latest_version"] == "1.0.0"
             assert "description" in model
             assert "columns" in model
