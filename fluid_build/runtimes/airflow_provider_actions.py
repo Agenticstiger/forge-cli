@@ -83,6 +83,49 @@ def _sh(value: Any) -> str:
     return shlex.quote(_JINJA_BRACES.sub("", str(value)))
 
 
+def _unique_task_identifiers(actions: List[Any]) -> Dict[str, str]:
+    """Map each raw ``actionId`` to a task identifier unique within this DAG.
+
+    ``sanitize_identifier`` is deliberately not injective -- ``a-b`` and
+    ``a.b`` both become ``a_b``. ``codegen_utils`` documents that as safe
+    because "the upstream duplicate-taskId validator already rejects
+    duplicate *raw* ids", but that validator (``validate_contract_for_export``)
+    runs only in the Snowflake and GCP providers, never on this path. So two
+    actions whose ids differ only in punctuation emitted two assignments to
+    the SAME variable: the second silently overwrote the first, and every
+    dependency edge pointed at the survivor. One declared task simply
+    disappeared from the DAG, with no error.
+
+    Sanitize, then suffix on collision -- the standard id-to-identifier
+    treatment. Airflow validates ``task_id`` and requires uniqueness within a
+    DAG for the same reason.
+
+    Raw duplicates are a contract-level mistake, but they are made distinct
+    here rather than raising: emitting both tasks is closer to what was
+    declared than dropping one, and this generator is not the place to start
+    rejecting contracts that previously worked.
+    """
+    identifiers: Dict[str, str] = {}
+    used: set = set()
+    logger = logging.getLogger(__name__)
+    for action in actions:
+        raw = getattr(action, "action_id", "") or ""
+        if raw in identifiers:
+            logger.warning(
+                "airflow: duplicate actionId %r -- emitting both tasks with "
+                "distinct identifiers; actionIds should be unique",
+                raw,
+            )
+        base = sanitize_identifier(raw)
+        candidate, suffix = base, 2
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        identifiers[raw] = candidate
+    return identifiers
+
+
 def _bash_task(task_id: str, comment: str, command: str) -> str:
     """Render a ``BashOperator`` block with both injection layers applied.
 
@@ -175,17 +218,22 @@ class AirflowDAGGenerator:
         dag_code = self._generate_dag_header(dag_id, schedule, contract)
         dag_code += "\n\n"
 
+        # One identifier per raw actionId, unique within this DAG:
+        # sanitize_identifier collapses `a-b` and `a.b` to the same
+        # name, which silently dropped a task.
+        task_identifiers = _unique_task_identifiers(actions)
+
         # Generate tasks
         task_definitions = []
         for action in actions:
-            task_def = self._generate_task(action)
+            task_def = self._generate_task(action, task_identifiers)
             task_definitions.append(task_def)
 
         dag_code += "\n\n".join(task_definitions)
         dag_code += "\n\n"
 
         # Generate dependencies
-        dag_code += self._generate_dependencies(actions)
+        dag_code += self._generate_dependencies(actions, task_identifiers)
 
         # Write to file if path provided
         if output_path:
@@ -258,11 +306,11 @@ dag = DAG(
     default_args=default_args
 )'''
 
-    def _generate_task(self, action) -> str:
+    def _generate_task(self, action, task_identifiers: Dict[str, str]) -> str:
         """Generate task definition for a provider action."""
         from ..forge.core.provider_actions import ActionType
 
-        task_id = sanitize_identifier(action.action_id)
+        task_id = task_identifiers[action.action_id]
 
         if action.action_type == ActionType.PROVISION_DATASET:
             return self._generate_provision_task(action, task_id)
@@ -369,16 +417,24 @@ dag = DAG(
 
         return _bash_task(task_id, str(description), command)
 
-    def _generate_dependencies(self, actions: List) -> str:
+    def _generate_dependencies(
+        self, actions: List, task_identifiers: Optional[Dict[str, str]] = None
+    ) -> str:
         """Generate task dependencies based on action.depends_on."""
+        # Derive the map when a caller omits it, so a direct call cannot
+        # silently fall back to the non-injective sanitize_identifier and
+        # reintroduce the collapsed-task bug.
+        if task_identifiers is None:
+            task_identifiers = _unique_task_identifiers(actions)
+
         dep_code = "# Task dependencies\n"
 
         for action in actions:
-            task_id = sanitize_identifier(action.action_id)
+            task_id = task_identifiers[action.action_id]
 
             if action.depends_on:
                 for dep in action.depends_on:
-                    dep_task_id = sanitize_identifier(dep)
+                    dep_task_id = task_identifiers.get(dep, sanitize_identifier(dep))
                     dep_code += f"{dep_task_id} >> {task_id}\n"
 
         if dep_code == "# Task dependencies\n":

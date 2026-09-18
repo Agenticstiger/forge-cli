@@ -61,11 +61,17 @@ def sanitize_identifier(name: str) -> str:
     if keyword.iskeyword(sanitized):
         sanitized += "_"
 
-    # NOTE: this mapping is intentionally not injective — two distinct raw
-    # ids (``a-b`` and ``a.b``) collapse to the same identifier. The
-    # upstream duplicate-taskId validator (codegen_utils.validate_contract_for_export
-    # / the schedulers' dup-id checks) already rejects duplicate *raw* ids,
-    # so a collision here cannot silently merge two declared tasks.
+    # NOTE: this mapping is NOT injective — two distinct raw ids (``a-b``
+    # and ``a.b``) collapse to the same identifier. Callers must make it
+    # unique themselves.
+    #
+    # This used to claim that ``validate_contract_for_export`` / the
+    # schedulers' dup-id checks made collisions harmless. They do not: that
+    # validator runs only in the Snowflake and GCP providers, so on the
+    # ``generate-airflow`` path two colliding ids emitted two assignments to
+    # the same variable and one declared task silently vanished from the DAG.
+    # See ``runtimes/airflow_provider_actions._unique_task_identifiers`` for
+    # the sanitize-then-suffix treatment callers should apply.
     return sanitized
 
 
