@@ -20,8 +20,56 @@ Supports all action types defined in FLUID 0.7.1 schema.
 """
 
 import logging
+import shlex
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+from ..providers.common.codegen_utils import (
+    escape_for_docstring,
+    py_str_literal,
+    sanitize_identifier,
+)
+
+
+def _safe_comment(value: Any) -> str:
+    """Collapse ``value`` to a single line for a generated ``#`` comment.
+
+    A ``#`` comment is terminated by a newline, so an embedded CR/LF in a
+    contract-supplied description would end the comment and put the
+    remainder of the value at module scope — executed when Airflow parses
+    the DAG. Collapsing whitespace is sufficient and keeps the comment
+    readable; the value is cosmetic, so it is not escaped further.
+    """
+    return " ".join(escape_for_docstring(value).split()) or "task"
+
+
+def _bash_task(task_id: str, comment: str, command: str) -> str:
+    """Render a ``BashOperator`` block with both injection layers applied.
+
+    Every ``bash_command`` in this module is built from
+    ``contract.fluid.yaml`` values, which are untrusted. Two independent
+    layers, mirroring ``cli/scaffold_composer._build_pipeline_bash_commands``:
+
+    1. Callers ``shlex.quote`` each interpolated *value* → at run time the
+       shell sees it as one inert token, never a metacharacter it executes.
+       Airflow's own docs are explicit that ``BashOperator`` "does not
+       perform any escaping or sanitization of the command".
+    2. ``py_str_literal`` (``repr``) on the *whole* command here → at
+       DAG-parse time it is a fully escaped Python literal, so an embedded
+       quote or newline cannot break out of ``bash_command=<literal>`` and
+       inject a top-level statement Airflow would run.
+
+    ``sanitize_identifier`` covers the third surface: ``task_id`` becomes a
+    Python *variable name*, so it must be a legal identifier.
+    """
+    ident = sanitize_identifier(task_id)
+    return f"""
+# {_safe_comment(comment)}
+{ident} = BashOperator(
+    task_id={py_str_literal(ident)},
+    bash_command={py_str_literal(command)},
+    dag=dag
+)"""
 
 
 class AirflowDAGGenerator:
@@ -161,7 +209,7 @@ dag = DAG(
         """Generate task definition for a provider action."""
         from ..forge.core.provider_actions import ActionType
 
-        task_id = action.action_id.replace("-", "_").replace(".", "_")
+        task_id = sanitize_identifier(action.action_id)
 
         if action.action_type == ActionType.PROVISION_DATASET:
             return self._generate_provision_task(action, task_id)
@@ -187,19 +235,16 @@ dag = DAG(
             location = params.get("binding", {}).get("location", {})
             project = location.get("project", "{{ var.value.gcp_project }}")
             dataset = location.get("dataset", expose_id)
-            command = f"bq mk --project_id={project} --dataset {dataset} || true"
+            command = (
+                f"bq mk --project_id={shlex.quote(str(project))} "
+                f"--dataset {shlex.quote(str(dataset))} || true"
+            )
         elif provider == "aws":
             command = "aws s3 mb s3://{{ var.value.s3_bucket }} || true"
         else:
-            command = f"echo 'Provision {expose_id} on {provider}'"
+            command = f"echo {shlex.quote(f'Provision {expose_id} on {provider}')}"
 
-        return f"""
-# Provision dataset: {expose_id}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="{command}",
-    dag=dag
-)"""
+        return _bash_task(task_id, f"Provision dataset: {expose_id}", command)
 
     def _generate_schedule_task(self, action, task_id: str) -> str:
         """Generate scheduled task (e.g., dbt run)."""
@@ -209,19 +254,20 @@ dag = DAG(
         build_id = params.get("buildId", "build")
 
         if engine == "dbt":
-            command = f"dbt run --models {script or build_id}"
+            # ``--select`` since dbt 0.21; ``--models`` warns on dbt-core 1.10
+            # (ModelParamUsageDeprecation) and is a hard error on dbt v2.
+            command = f"dbt run --select {shlex.quote(str(script or build_id))}"
         elif engine == "sql":
-            command = f"echo 'Execute SQL: {script}'"
+            command = f"echo {shlex.quote(f'Execute SQL: {script}')}"
+        elif script:
+            # An operator-authored ``script`` is a command line by design, so
+            # it is passed through rather than quoted -- but it still routes
+            # through ``_bash_task``, which keeps it inside a Python literal.
+            command = str(script)
         else:
-            command = script or f"echo 'Run {build_id}'"
+            command = f"echo {shlex.quote(f'Run {build_id}')}"
 
-        return f"""
-# Schedule task: {build_id}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="{command}",
-    dag=dag
-)"""
+        return _bash_task(task_id, f"Schedule task: {build_id}", command)
 
     def _generate_grant_task(self, action, task_id: str) -> str:
         """Generate access grant task."""
@@ -230,64 +276,46 @@ dag = DAG(
         role = params.get("role", "viewer")
         expose_id = params.get("exposeId", "unknown")
 
-        command = f"echo 'Grant {role} to {principal} on {expose_id}'"
+        command = f"echo {shlex.quote(f'Grant {role} to {principal} on {expose_id}')}"
 
-        return f"""
-# Grant access: {expose_id} to {principal}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="{command}",
-    dag=dag
-)"""
+        return _bash_task(task_id, f"Grant access: {expose_id} to {principal}", command)
 
     def _generate_register_schema_task(self, action, task_id: str) -> str:
         """Generate schema registration task."""
         params = action.params
         schema_name = params.get("schemaName", "unknown")
 
-        return f"""
-# Register schema: {schema_name}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="echo 'Register schema: {schema_name}'",
-    dag=dag
-)"""
+        command = f"echo {shlex.quote(f'Register schema: {schema_name}')}"
+
+        return _bash_task(task_id, f"Register schema: {schema_name}", command)
 
     def _generate_create_view_task(self, action, task_id: str) -> str:
         """Generate create view task."""
         params = action.params
         view_name = params.get("viewName", "unknown")
 
-        return f"""
-# Create view: {view_name}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="echo 'Create view: {view_name}'",
-    dag=dag
-)"""
+        command = f"echo {shlex.quote(f'Create view: {view_name}')}"
+
+        return _bash_task(task_id, f"Create view: {view_name}", command)
 
     def _generate_generic_task(self, action, task_id: str) -> str:
         """Generate generic task."""
         description = action.description or f"Execute {action.action_type.value}"
 
-        return f"""
-# {description}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="echo '{description}'",
-    dag=dag
-)"""
+        command = f"echo {shlex.quote(str(description))}"
+
+        return _bash_task(task_id, str(description), command)
 
     def _generate_dependencies(self, actions: List) -> str:
         """Generate task dependencies based on action.depends_on."""
         dep_code = "# Task dependencies\n"
 
         for action in actions:
-            task_id = action.action_id.replace("-", "_").replace(".", "_")
+            task_id = sanitize_identifier(action.action_id)
 
             if action.depends_on:
                 for dep in action.depends_on:
-                    dep_task_id = dep.replace("-", "_").replace(".", "_")
+                    dep_task_id = sanitize_identifier(dep)
                     dep_code += f"{dep_task_id} >> {task_id}\n"
 
         if dep_code == "# Task dependencies\n":

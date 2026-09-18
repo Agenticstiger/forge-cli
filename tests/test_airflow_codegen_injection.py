@@ -288,3 +288,132 @@ def test_benign_contract_still_produces_expected_operators():
     assert "load = SnowflakeOperator(" in code
     assert "sql='SELECT 1'" in code
     assert "task_id='load'" in code
+
+
+# ---------------------------------------------------------------------------
+# AirflowDAGGenerator (runtimes/airflow_provider_actions.py)
+#
+# This generator builds a ``BashOperator`` per providerAction. Every task
+# generator previously interpolated contract values straight into
+# ``bash_command="{command}"`` inside an f-string, so a quote in any of them
+# closed the Python literal and put the rest of the value at module scope --
+# executed by Airflow at DAG-parse time. The ``builds[].script`` vector
+# (``scheduleTask``) was the sharpest: it is passed through verbatim by design.
+# ---------------------------------------------------------------------------
+
+
+def _dag_from_actions(provider_actions):
+    from fluid_build.runtimes.airflow_provider_actions import AirflowDAGGenerator
+
+    contract = {
+        "id": "test.product.v1",
+        "kind": "DataProduct",
+        "fluidVersion": "0.7.5",
+        "providerActions": provider_actions,
+    }
+    return AirflowDAGGenerator().generate_dag(contract)
+
+
+@pytest.mark.parametrize(
+    "action,params",
+    [
+        ("scheduleTask", {"engine": "dbt", "script": POC_SQUOTE, "buildId": "b1"}),
+        ("scheduleTask", {"engine": "sql", "script": POC_SQL, "buildId": "b1"}),
+        ("scheduleTask", {"engine": "spark", "script": POC_SQUOTE, "buildId": "b1"}),
+        ("scheduleTask", {"engine": "dbt", "script": "", "buildId": POC_SQUOTE}),
+        ("provisionDataset", {"exposeId": POC_SQUOTE}),
+        ("grantAccess", {"principal": POC_SQUOTE, "role": "viewer", "exposeId": "e1"}),
+        ("grantAccess", {"principal": "p", "role": POC_SQL, "exposeId": "e1"}),
+        ("registerSchema", {"schemaName": POC_SQUOTE}),
+        ("createView", {"viewName": POC_SQUOTE}),
+        ("custom", {"customAction": POC_SQUOTE}),
+    ],
+)
+def test_provider_action_dag_is_injection_safe(action, params):
+    """Every params vector must survive only as inert string data."""
+    assert_inert(_dag_from_actions([{"actionId": "a1", "action": action, "params": params}]))
+
+
+def test_provision_task_gcp_location_is_injection_safe():
+    """``binding.location.project``/``dataset`` reach the bq command line."""
+    assert_inert(
+        _dag_from_actions(
+            [
+                {
+                    "actionId": "a1",
+                    "action": "provisionDataset",
+                    "provider": "gcp",
+                    "params": {
+                        "exposeId": "e1",
+                        "binding": {"location": {"project": POC_SQUOTE, "dataset": POC_SQL}},
+                    },
+                }
+            ]
+        )
+    )
+
+
+def test_action_id_and_depends_on_are_sanitised_identifiers():
+    """``actionId`` becomes a Python variable name on both the definition and
+    the ``a >> b`` dependency wiring -- a newline there is a statement."""
+    assert_inert(
+        _dag_from_actions(
+            [
+                {"actionId": POC_IDENT, "action": "registerSchema", "params": {"schemaName": "s"}},
+                {
+                    "actionId": "a2",
+                    "action": "createView",
+                    "params": {"viewName": "v"},
+                    "dependsOn": [POC_IDENT],
+                },
+            ]
+        )
+    )
+
+
+def test_description_comment_cannot_escape_into_code():
+    """``description`` renders into a ``#`` comment, which a newline ends."""
+    assert_inert(
+        _dag_from_actions(
+            [
+                {
+                    "actionId": "a1",
+                    "action": "custom",
+                    "description": "do a thing\nimport os; os.system('touch /tmp/PWNED4')",
+                    "params": {},
+                }
+            ]
+        )
+    )
+
+
+def test_schedule_task_emits_select_not_models():
+    """``--models`` warns on dbt-core 1.10 and is a hard error on dbt v2."""
+    code = _dag_from_actions(
+        [
+            {
+                "actionId": "a1",
+                "action": "scheduleTask",
+                "params": {"engine": "dbt", "script": "my_model", "buildId": "b1"},
+            }
+        ]
+    )
+    assert "--select" in code
+    assert "--models" not in code
+
+
+def test_benign_provider_action_dag_still_renders_operators():
+    """The escaping must not break the happy path."""
+    code = _dag_from_actions(
+        [
+            {
+                "actionId": "build-orders",
+                "action": "scheduleTask",
+                "params": {"engine": "dbt", "script": "orders", "buildId": "b1"},
+            }
+        ]
+    )
+    tree = assert_inert(code)
+    assert "BashOperator" in code
+    assert "build_orders = BashOperator" in code
+    assert isinstance(tree, ast.Module)
