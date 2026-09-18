@@ -476,32 +476,6 @@ class TestFetchTimeoutIsBounded:
             f"line(s) {untimed} -- an unresponsive upstream would hang the apply"
         )
 
-    def test_the_gitpython_path_is_bounded_too(self):
-        """gitpython is tried BEFORE the shell-out, so bounding only the
-        fallback leaves the path that actually runs (wherever gitpython
-        is installed) unbounded -- while `fluid doctor` advertises the
-        env var as the cap. gitpython spells it ``kill_after_timeout``.
-        """
-        import ast
-
-        src = (REPO_ROOT / "fluid_build" / "forge" / "federation.py").read_text(encoding="utf-8")
-        untimed = []
-        for node in ast.walk(ast.parse(src)):
-            if not isinstance(node, ast.Call):
-                continue
-            fn = node.func
-            if not isinstance(fn, ast.Attribute):
-                continue
-            if fn.attr not in {"clone_from", "fetch"}:
-                continue
-            if "kill_after_timeout" not in {k.arg for k in node.keywords}:
-                untimed.append((fn.attr, node.lineno))
-
-        assert not untimed, (
-            f"unbounded gitpython call(s) {untimed} -- gitpython is tried first, "
-            "so this is the path a hang would actually take"
-        )
-
 
 class TestSchemaPinsTheFederatedFields:
     """0.7.6 models the federated consume fields, and pins them together."""

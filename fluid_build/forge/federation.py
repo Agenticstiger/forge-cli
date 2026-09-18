@@ -864,20 +864,31 @@ def _git_read_contract(workspace: FederatedWorkspace, product_id: str) -> Option
 
     auth_url = _build_auth_url(workspace)
 
-    # Try gitpython first; fall back to shell-out if it isn't installed
-    # OR if the import-level operation fails (e.g. git binary missing).
-    used_gitpython = _git_clone_or_pull_via_gitpython(
+    # Shell-out, always. There used to be a gitpython-first path here, on
+    # the theory that in-process was tidier than a fork. It cannot be
+    # bounded, and `fluid apply` now depends on this call finishing.
+    #
+    # Measured against a TCP listener that accepts and never speaks (a
+    # dead git daemon), GitPython 3.1.62:
+    #
+    #   Repo.clone_from(url, dst, kill_after_timeout=3)  -> still running at 90s
+    #   subprocess.run([...], timeout=3)                 -> TimeoutExpired at 3.0s
+    #
+    # `kill_after_timeout` is *accepted* by clone_from -- it is in
+    # GitPython's execute_kwargs, so it is not rejected the way an unknown
+    # kwarg is -- but it does not kill the clone. Accepting a timeout it
+    # does not honour is worse than not offering one, because
+    # `fluid doctor` then advertises a cap that does not exist.
+    #
+    # This was the live path, not a latent one: GitPython arrives
+    # transitively via `dlt` (a declared ingestion engine), so a normal
+    # install has it and took the unbounded branch first.
+    #
+    # Nothing is lost by dropping it: GitPython shells out to the same
+    # `git` binary, so it was never a fallback for git being absent.
+    if not _git_clone_or_pull_via_shellout(
         auth_url=auth_url, cache_dir=cache_dir, workspace_id=workspace.id
-    )
-    if used_gitpython is None:
-        # gitpython unavailable or failed — fall through to shell-out.
-        ok = _git_clone_or_pull_via_shellout(
-            auth_url=auth_url, cache_dir=cache_dir, workspace_id=workspace.id
-        )
-        if not ok:
-            return None
-    elif used_gitpython is False:
-        # gitpython hit a real error, not just unavailability — abort.
+    ):
         return None
 
     return _read_first_existing_contract(cache_dir, workspace, product_id)
@@ -897,95 +908,6 @@ def _build_auth_url(workspace: FederatedWorkspace) -> str:
         if auth_url.startswith("https://") and "@" not in auth_url[8:].split("/", 1)[0]:
             auth_url = auth_url.replace("https://", f"https://x-access-token:{secret}@", 1)
     return auth_url
-
-
-def _git_clone_or_pull_via_gitpython(
-    *, auth_url: str, cache_dir: Path, workspace_id: str
-) -> Optional[bool]:
-    """Try the in-process gitpython path.
-
-    Return values:
-
-    * ``None`` — gitpython unavailable; caller falls back to shell-out.
-    * ``True`` — clone or pull succeeded.
-    * ``False`` — gitpython is installed but the operation failed (auth
-      reject, dead remote, etc.); caller should abort rather than
-      retry via shell-out (the failure mode is the same).
-    """
-    try:
-        from git import GitCommandError, Repo
-    except ImportError:
-        LOG.debug(
-            "federation_git_gitpython_unavailable: workspace=%s — falling back to shell-out",
-            workspace_id,
-        )
-        return None
-
-    try:
-        if not cache_dir.exists():
-            # ``kill_after_timeout`` is gitpython's equivalent of
-            # subprocess's ``timeout``. Without it this path -- the one
-            # tried FIRST -- is unbounded, so an apply could hang on a
-            # dead remote while `fluid doctor` advertised the env var
-            # below as the cap.
-            Repo.clone_from(
-                auth_url,
-                str(cache_dir),
-                depth=1,
-                kill_after_timeout=_federation_git_timeout(),
-            )
-            LOG.debug(
-                "federation_git_gitpython_cloned: workspace=%s dir=%s",
-                workspace_id,
-                cache_dir,
-            )
-        else:
-            repo = Repo(str(cache_dir))
-            # ``origin`` may not exist on a freshly initialised cache;
-            # tolerate that (the contract file already exists from a
-            # previous clone, which is fine — pull is best-effort).
-            try:
-                repo.remotes.origin.fetch(depth=1, kill_after_timeout=_federation_git_timeout())
-                repo.git.reset("--hard", "origin/HEAD")
-                LOG.debug(
-                    "federation_git_gitpython_refreshed: workspace=%s",
-                    workspace_id,
-                )
-            except (GitCommandError, AttributeError, ValueError) as exc:
-                # ``GitCommandError.__str__`` echoes the full command
-                # line, which in HTTPS mode embeds the auth token from
-                # the manifest's secret_ref
-                # (``https://x-access-token:<TOKEN>@host``). Log only
-                # the exception class — never the message body. The
-                # shell-out fallback already does this; mirror it here.
-                LOG.debug(
-                    "federation_git_gitpython_refresh_skipped: workspace=%s "
-                    "err=%s — using stale cache",
-                    workspace_id,
-                    type(exc).__name__,
-                )
-        return True
-    except GitCommandError as exc:
-        # See the note above — ``GitCommandError`` stringifies to the
-        # token-bearing clone URL. Surface only the class plus a static
-        # message; refuse to echo the command line.
-        LOG.warning(
-            "federation_git_gitpython_failed: workspace=%s err=%s — "
-            "git operation failed (authentication or remote error); "
-            "refusing to echo the command line",
-            workspace_id,
-            type(exc).__name__,
-        )
-        return False
-    except Exception as exc:  # pragma: no cover — defensive
-        # Non-git exceptions can still wrap the URL in their repr;
-        # stay class-only here too for consistency.
-        LOG.warning(
-            "federation_git_gitpython_unexpected: workspace=%s err=%s",
-            workspace_id,
-            type(exc).__name__,
-        )
-        return False
 
 
 def _git_clone_or_pull_via_shellout(*, auth_url: str, cache_dir: Path, workspace_id: str) -> bool:

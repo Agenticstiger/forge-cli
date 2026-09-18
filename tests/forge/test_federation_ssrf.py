@@ -224,53 +224,13 @@ class TestWorkspaceIdValidation:
 # ──────────────────── gitpython auth-token leak ─────────────────────────
 
 
-class TestGitpythonTokenLeak:
-    def test_gitcommanderror_message_not_logged(self, tmp_path, monkeypatch, caplog):
-        """A failed gitpython clone must log only the exception class —
-        never the GitCommandError body, which echoes the
-        ``x-access-token:<TOKEN>@host`` clone URL."""
-        from fluid_build.forge import federation as _fed
-
-        git_mod = pytest.importorskip("git")
-
-        ws = FederatedWorkspace(
-            id="ext",
-            kind="git_registry",
-            endpoint="https://github.example/repo",
-            auth_mode="github_token",
-            auth_secret_ref="GH_TOKEN",
-        )
-        monkeypatch.setenv("GH_TOKEN", "ghp_SUPERSECRETTOKEN")
-        monkeypatch.setattr(
-            "os.path.expanduser",
-            lambda p: str(tmp_path / "home_cache") if "~" in p else p,
-        )
-
-        # GitCommandError stringifies to a command line that embeds the
-        # token-bearing URL — simulate that exact shape.
-        leaky = git_mod.GitCommandError(
-            ["git", "clone", "https://x-access-token:ghp_SUPERSECRETTOKEN@github.example/repo"],
-            128,
-            b"fatal: Authentication failed",
-        )
-
-        # ``_git_clone_or_pull_via_gitpython`` does ``from git import
-        # Repo`` locally, so patch the attribute on the ``git`` module.
-        with patch.object(git_mod, "Repo") as mock_repo:
-            mock_repo.clone_from.side_effect = leaky
-            with caplog.at_level("WARNING"):
-                result = _fed._git_clone_or_pull_via_gitpython(
-                    auth_url="https://x-access-token:ghp_SUPERSECRETTOKEN@github.example/repo",
-                    cache_dir=tmp_path / "clone",
-                    workspace_id="ext",
-                )
-
-        assert result is False
-        all_log_text = " ".join(r.getMessage() for r in caplog.records)
-        assert "ghp_SUPERSECRETTOKEN" not in all_log_text
-        assert "x-access-token" not in all_log_text
-        # The class name + a static refusal message is what we DO log.
-        assert "GitCommandError" in all_log_text
+class TestGitTokenLeak:
+    # The gitpython token-leak case that used to live here is gone with the
+    # gitpython path itself (removed: its network calls cannot be bounded,
+    # and `fluid apply` depends on this finishing). No coverage is lost --
+    # shell-out is now the only git path, and the test below is its
+    # equivalent: CalledProcessError.__str__ echoes the full git argv, which
+    # in HTTPS mode carries the token-bearing clone URL.
 
     def test_shellout_clone_failure_does_not_log_token(self, tmp_path, caplog):
         """The shell-out fallback's clone-failed branch must log only the
