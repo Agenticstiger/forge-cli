@@ -342,7 +342,8 @@ class TestUnreachableUpstreamIsARowNotAnAbort:
                 }
             ]
         }
-        secret = "ghp_supersecrettoken"
+        # Not a real credential -- a canary this test asserts is NOT logged.
+        secret = "ghp_supersecrettoken"  # pragma: allowlist secret
         with patch(
             "fluid_build.forge.federation._federation_http_get",
             side_effect=RuntimeError(f"failed cloning https://{secret}@host/repo"),
