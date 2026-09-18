@@ -13,10 +13,10 @@ fluid init my-docs --template contract-documentation
 cd my-docs
 
 # Generate documentation
-fluid docs generate
+fluid docs --src . --out docs/
 
 # Start docs server
-fluid docs serve  # View at http://localhost:8000
+fluid docs --src . --out docs/   # then open docs/index.html
 ```
 
 ## What Gets Generated
@@ -92,17 +92,16 @@ Interactive docs with search, filtering, and lineage visualization.
 
 ```bash
 # Generate docs
-fluid docs generate
+fluid docs --src . --out docs/
 
-# Specific format
-fluid docs --out docs/
-fluid docs --out docs/
+# `fluid docs` emits a static HTML catalogue; there is no format switch.
+# `--src` is required -- without it the catalogue comes out empty.
 
-# Serve locally
-fluid docs --out docs/  # then open docs/index.html
+# Serve locally: generate, then open the file
+fluid docs --src . --out docs/   # then open docs/index.html
 
-# Deploy to S3/GCS
-fluid docs --out docs/  # then upload docs/ yourself
+# Publish: generate, then upload docs/ with your own tooling
+fluid docs --src . --out docs/
 ```
 
 ## Success Criteria

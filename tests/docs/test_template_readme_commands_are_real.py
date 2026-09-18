@@ -52,7 +52,10 @@ _OPAQUE = re.compile(r"\$\{[^}]*\}|\$[A-Za-z_]\w*|<[^>]+>")
 def _commands(markdown: str):
     """Yield each `fluid ...` invocation from the copy-pasteable blocks."""
     for block in _FENCE.findall(markdown):
-        for line in block.splitlines():
+        # A trailing backslash continues the command onto the next line; without
+        # joining these, the continuation's flags are never checked -- which is
+        # how `fluid apply ... \\\n  --account X` kept a non-existent flag.
+        for line in block.replace("\\\n", " ").splitlines():
             stripped = line.strip().lstrip("$ ").strip()
             if not stripped.startswith("fluid "):
                 continue
@@ -63,6 +66,8 @@ def _commands(markdown: str):
 
 def _defect(command: str):
     """Return `(kind, detail)` if the command would not run, else None."""
+    # Drop a trailing `# comment` so it is not parsed as an argument.
+    command = re.sub(r"\s+#.*$", "", command)
     normalised = _OPAQUE.sub("PLACEHOLDER", command)
     try:
         argv = shlex.split(normalised)[1:]
@@ -85,8 +90,9 @@ def _defect(command: str):
             if found:
                 return kind, found.group(1).strip()
         return None
-    unknown = [extra for extra in extras if extra.startswith("-")]
-    return ("unknown flag", " ".join(unknown)) if unknown else None
+    # ANY leftover token is a defect, not just a `-`-prefixed one: a stray
+    # positional is how `fluid docs generate` (no such subcommand) passed.
+    return ("unrecognised argument", " ".join(extras)) if extras else None
 
 
 def _template_readmes():

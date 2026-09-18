@@ -251,12 +251,15 @@ open http://localhost:8081
 ### Production Deployment
 
 ```bash
-# Deploy to production Airflow
+# Apply the contract against your production environment
 fluid apply contract.fluid.yaml --env prod --yes
 
-# Or deploy to cloud-managed Airflow
-fluid apply contract.fluid.yaml --env prod --yes  # GCP Cloud Composer
-fluid apply contract.fluid.yaml --env prod --yes      # AWS Managed Airflow
+# Generate the DAG file
+fluid generate schedule --scheduler airflow
+
+# forge generates the DAG; it does not install it. Copy dags/*.py into your
+# scheduler's DAG folder -- the GCS bucket for Cloud Composer, the S3 dags/
+# prefix for MWAA, or $AIRFLOW_HOME/dags for a self-managed Airflow.
 ```
 
 ## Expected Output
