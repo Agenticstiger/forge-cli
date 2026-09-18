@@ -260,13 +260,13 @@ gcp = [
   # optional; gated for 3.10+ environments where wheel support exists
   "google-cloud-iam>=2.15 ; python_version >= '3.10'",
   # optional runtime helpers (dbt) — also 3.10+ where ecosystem is healthiest
-  "dbt-bigquery>=1.7 ; python_version >= '3.10'",
+  "dbt-bigquery>=1.7,<2 ; python_version >= '3.10'",
 ]
 
 # Snowflake provider
 snowflake = [
   "snowflake-connector-python>=4.4",
-  "dbt-snowflake>=1.7 ; python_version >= '3.10'",
+  "dbt-snowflake>=1.7,<2 ; python_version >= '3.10'",
 ]
 
 # AWS provider (S3 / Glue / Athena). boto3 is lazy-imported by the

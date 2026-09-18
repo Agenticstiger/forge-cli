@@ -204,17 +204,17 @@ _MELTANO_SINK_PACKAGES: Dict[str, List[str]] = {
 # package. Versions pin to the dbt 1.7+ series (matches the lab's
 # A1/A2/B1/B2 dbt projects).
 _DBT_PLATFORM_ADAPTERS: Dict[str, List[str]] = {
-    "snowflake": ["dbt-snowflake>=1.7"],
-    "bigquery": ["dbt-bigquery>=1.7"],
-    "redshift": ["dbt-redshift>=1.7"],
-    "postgres": ["dbt-postgres>=1.7"],
-    "postgresql": ["dbt-postgres>=1.7"],
-    "databricks": ["dbt-databricks>=1.7"],
-    "spark": ["dbt-spark>=1.7"],
-    "duckdb": ["dbt-duckdb>=1.7"],
-    "athena": ["dbt-athena-community>=1.7"],
-    "trino": ["dbt-trino>=1.7"],
-    "clickhouse": ["dbt-clickhouse>=1.7"],
+    "snowflake": ["dbt-snowflake>=1.7,<2"],
+    "bigquery": ["dbt-bigquery>=1.7,<2"],
+    "redshift": ["dbt-redshift>=1.7,<2"],
+    "postgres": ["dbt-postgres>=1.7,<2"],
+    "postgresql": ["dbt-postgres>=1.7,<2"],
+    "databricks": ["dbt-databricks>=1.7,<2"],
+    "spark": ["dbt-spark>=1.7,<2"],
+    "duckdb": ["dbt-duckdb>=1.7,<2"],
+    "athena": ["dbt-athena-community>=1.7,<2"],
+    "trino": ["dbt-trino>=1.7,<2"],
+    "clickhouse": ["dbt-clickhouse>=1.7,<2"],
 }
 
 
@@ -335,7 +335,7 @@ def _resolve_meltano(source_kind: Optional[str], sink_platform: Optional[str]) -
 
 
 def _resolve_dbt(sink_platform: Optional[str]) -> EngineBootstrap:
-    packages: List[str] = ["dbt-core>=1.7"]
+    packages: List[str] = ["dbt-core>=1.7,<2"]
     notes: List[str] = []
     if sink_platform:
         adapter_pkgs = _DBT_PLATFORM_ADAPTERS.get(sink_platform)

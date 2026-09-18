@@ -1135,7 +1135,10 @@ class TestContainerizedDbtCommand:
         # single-quoted token — never appear as an unquoted shell command.
         import shlex as _shlex
 
-        expected_pkg = f"dbt-{hostile_adapter}"
+        # forge appends a `<2` cap to the adapter spec, so assert the
+        # security property -- the payload stays one inert token -- rather
+        # than an exact package string that a legitimate pin change breaks.
+        expected_pkg = f"dbt-{hostile_adapter}<2"
         assert _shlex.quote(expected_pkg) in script
         # A bare (unquoted) ``rm -rf`` would mean shell injection. The only
         # legitimate occurrence is inside the single-quoted package token.
@@ -1163,7 +1166,7 @@ class TestContainerizedDbtCommand:
                 None,
             )
             script = cmd[-1]
-            expected_pkg = f"dbt-{hostile}"
+            expected_pkg = f"dbt-{hostile}<2"
             # Single-quoting makes ``$`` and backticks literal to the shell.
             assert _shlex.quote(expected_pkg) in script
             assert expected_pkg in _shlex.split(script)

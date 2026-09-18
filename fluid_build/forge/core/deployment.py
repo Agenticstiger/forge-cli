@@ -305,7 +305,7 @@ class ProjectDeployer:
 
         if has_dbt:
             base_image = "python:3.10-slim"
-            install_cmd = "pip install dbt-core dbt-bigquery"
+            install_cmd = "pip install 'dbt-core<2' 'dbt-bigquery<2'"
         elif has_requirements:
             base_image = "python:3.10-slim"
             install_cmd = "pip install -r requirements.txt"
