@@ -11,7 +11,7 @@ Write comprehensive tests for FLUID contracts with unit tests, integration tests
 ```bash
 fluid init my-tested-pipeline --template testing-your-contract
 cd my-tested-pipeline
-fluid test  # Run all tests
+fluid test contract.fluid.yaml  # Run all tests
 ```
 
 ## Test Types
@@ -30,12 +30,12 @@ tests:
 
 ### Integration Tests
 ```bash
-fluid test --integration  # Test full pipeline
+fluid test contract.fluid.yaml  # Test full pipeline
 ```
 
 ### Validation Tests
 ```bash
-fluid test --validations  # Run all validations
+fluid test contract.fluid.yaml  # Run all validations
 ```
 
 ## Test Patterns
@@ -70,17 +70,14 @@ fluid test --validations  # Run all validations
 ## Running Tests
 
 ```bash
-# All tests
-fluid test
+# Run the contract's quality rules against live data
+fluid test contract.fluid.yaml
 
-# Specific test
-fluid test --name test_revenue_calculation
+# Structure-only (skips the live-data checks)
+fluid test contract.fluid.yaml --no-data
 
-# With coverage
-fluid test --coverage
-
-# Verbose output
-fluid test --verbose
+# Fail on warnings too
+fluid test contract.fluid.yaml --strict
 ```
 
 ## Success Criteria
@@ -89,7 +86,6 @@ fluid test --verbose
 - [ ] Unit tests pass
 - [ ] Edge cases covered
 - [ ] Validations tested
-- [ ] Test coverage > 80%
 
 ## Next Steps
 

@@ -34,11 +34,11 @@ cat data/orders.csv | head -5
 fluid validate
 
 # Run locally
-fluid apply --local
+fluid apply contract.fluid.yaml --yes
 
 # Query the results
-fluid query "SELECT * FROM customer_revenue ORDER BY total_revenue DESC"
-fluid query "SELECT * FROM vip_customers"
+python3 -c "import duckdb; print(duckdb.sql(\"SELECT * FROM 'output/customer_revenue.parquet' ORDER BY total_revenue DESC\"))"
+python3 -c "import duckdb; print(duckdb.sql(\"SELECT * FROM 'output/vip_customers.parquet'\"))"
 ```
 
 ## Sample Data Included

@@ -31,7 +31,7 @@ fluid init my-pipeline --template first-dag
 cd my-pipeline
 
 # Generate the Airflow DAG (this is the magic!)
-fluid generate-dag
+fluid generate schedule --scheduler airflow
 
 # Start local Airflow (requires Docker)
 docker compose --profile airflow up -d
@@ -228,7 +228,7 @@ monitoring:
 
 ```bash
 # 1. Generate DAG
-fluid generate-dag
+fluid generate schedule --scheduler airflow
 
 # 2. Start Airflow
 docker compose --profile airflow up -d
@@ -252,11 +252,11 @@ open http://localhost:8081
 
 ```bash
 # Deploy to production Airflow
-fluid deploy --env prod --provider airflow
+fluid apply contract.fluid.yaml --env prod --yes
 
 # Or deploy to cloud-managed Airflow
-fluid deploy --env prod --provider composer  # GCP Cloud Composer
-fluid deploy --env prod --provider mwaa      # AWS Managed Airflow
+fluid apply contract.fluid.yaml --env prod --yes  # GCP Cloud Composer
+fluid apply contract.fluid.yaml --env prod --yes      # AWS Managed Airflow
 ```
 
 ## Expected Output
@@ -349,7 +349,7 @@ docker compose logs airflow-worker
 python dags/sales_analytics_pipeline_dag.py
 
 # Re-generate DAG
-fluid generate-dag --force
+fluid generate schedule --scheduler airflow
 ```
 
 ## Comparison: Before vs After FLUID
@@ -372,7 +372,7 @@ fluid generate-dag --force
 ### After FLUID (0.7.1)
 
 1. Write contract.fluid.yaml (50 lines)
-2. Run `fluid generate-dag`
+2. Run `fluid generate schedule --scheduler airflow`
 
 **Time**: 15 minutes  
 **Maintenance**: Zero (DAG auto-syncs with contract)

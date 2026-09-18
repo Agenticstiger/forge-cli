@@ -45,10 +45,10 @@ cat data/products.csv
 fluid validate
 
 # Execute pipeline (some warnings expected)
-fluid apply --local
+fluid apply contract.fluid.yaml --yes
 
 # View quality report
-fluid query "SELECT * FROM data_quality_report"
+python3 -c "import duckdb; print(duckdb.sql(\"SELECT * FROM 'output/data_quality_report.parquet'\"))"
 ```
 
 ## Expected Output

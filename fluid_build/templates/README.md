@@ -12,7 +12,7 @@ fluid init --list
 fluid init my-project --template <template-name>
 
 # Get template details
-fluid init --info <template-name>
+fluid init --list-templates
 ```
 
 ## Available Templates

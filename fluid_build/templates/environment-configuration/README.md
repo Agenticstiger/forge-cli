@@ -43,7 +43,7 @@ echo "dotenv .env.dev" > .envrc
 direnv allow
 
 # Run pipeline
-fluid apply --local
+fluid apply contract.fluid.yaml --yes
 ```
 
 ## Environment Files
@@ -217,17 +217,17 @@ done
 # Test dev config
 export $(cat .env.dev | xargs)
 fluid validate
-fluid apply --local
+fluid apply contract.fluid.yaml --yes
 
 # Test staging config
 export $(cat .env.staging | xargs)
 fluid validate
-fluid deploy --target staging
+fluid apply contract.fluid.yaml --env staging --yes
 
 # Test prod config (dry-run)
 export $(cat .env.prod | xargs)
 fluid validate
-fluid deploy --target production --dry-run
+fluid apply contract.fluid.yaml --env prod --mode dry-run --yes
 ```
 
 ## Troubleshooting

@@ -95,14 +95,14 @@ Interactive docs with search, filtering, and lineage visualization.
 fluid docs generate
 
 # Specific format
-fluid docs generate --format markdown
-fluid docs generate --format html
+fluid docs --out docs/
+fluid docs --out docs/
 
 # Serve locally
-fluid docs serve --port 8000
+fluid docs --out docs/  # then open docs/index.html
 
 # Deploy to S3/GCS
-fluid docs deploy --target s3://docs-bucket/
+fluid docs --out docs/  # then upload docs/ yourself
 ```
 
 ## Success Criteria
