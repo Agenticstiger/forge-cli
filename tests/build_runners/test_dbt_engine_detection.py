@@ -406,3 +406,22 @@ class TestParseGateHonorsDbtExecutable:
         import logging
 
         assert gst._run_dbt_parse_gate(tmp_path, logging.getLogger("test")) is True
+
+
+def test_dbt_oss_banner_is_recognised_as_the_v2_engine():
+    """`dbt-oss` is the Apache-2.0 build of the v2 engine and answers with
+    `dbt-oss <ver>`, not the bare `dbt <ver>` the regex expected.
+
+    Before this was handled it returned ("unknown", ""), which sent every
+    capability gate hanging off the detected engine down its most
+    conservative branch -- so a dbt-oss user got the legacy YAML shapes that
+    v2 rejects outright.
+    """
+    from fluid_build.build_runners.dbt.runner import _parse_dbt_engine
+
+    assert _parse_dbt_engine("dbt-oss 2.0.4\n") == ("fusion", "2.0.4")
+    assert _parse_dbt_engine("dbt-oss 2.1.0\n") == ("fusion", "2.1.0")
+    # The proprietary build's bare banner must keep working.
+    assert _parse_dbt_engine("dbt 2.0.1\n") == ("fusion", "2.0.1")
+    # ...and a v1 banner must not be misread as v2.
+    assert _parse_dbt_engine("dbt 1.12.5\n") == ("core", "1.12.5")

@@ -1,0 +1,93 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The dbt capability floors, pinned to what was actually measured.
+
+Each expectation here corresponds to a real `dbt parse` / `dbt source
+freshness` run against that exact dbt version — see the module docstring of
+`fluid_build/engines/dbt/_capabilities.py` for the matrix. They are pinned as
+tests because two of the three shapes fail SILENTLY on older dbt: the project
+still parses, the contract's freshness promise just stops being honoured.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from fluid_build.engines.dbt._capabilities import (
+    FRESHNESS_CONFIG_FLOOR,
+    TEST_ARGUMENTS_FLOOR,
+    resolve_dbt_capabilities,
+)
+
+
+@pytest.mark.parametrize(
+    "version,arguments,freshness_config",
+    [
+        # Measured: arguments -> compile error; freshness config -> source skipped.
+        ("1.8.10", False, False),
+        # Measured: "loaded_at_field must be specified" -> config silently ignored.
+        ("1.9.11", False, False),
+        ("1.10.0", False, False),
+        # Measured: freshness config honoured here; arguments still gated behind
+        # require_generic_test_arguments_property, which defaults false.
+        ("1.10.5", False, True),
+        ("1.10.7", False, True),
+        # Measured: the behaviour flag defaults true from here.
+        ("1.10.8", True, True),
+        ("1.12.5", True, True),
+    ],
+)
+def test_core_floors_match_what_was_measured(version, arguments, freshness_config):
+    caps = resolve_dbt_capabilities("core", version)
+    assert caps.nest_test_arguments is arguments
+    assert caps.config_scoped_source_freshness is freshness_config
+
+
+def test_v2_gets_every_modern_shape():
+    """dbt v2 rejects all three legacy shapes outright, so none may be emitted."""
+    for version in ("2.0.4", "2.0.1", "2.0.0-preview.126"):
+        caps = resolve_dbt_capabilities("fusion", version)
+        assert caps.nest_test_arguments is True
+        assert caps.config_scoped_source_freshness is True
+
+
+@pytest.mark.parametrize("flavor,version", [("unknown", ""), (None, ""), ("core", "")])
+def test_undetectable_engine_falls_back_to_the_legacy_shapes(flavor, version):
+    """Legacy parses on every dbt 1.x; a v2 user has a v2 binary to detect."""
+    caps = resolve_dbt_capabilities(flavor, version)
+    assert caps.nest_test_arguments is False
+    assert caps.config_scoped_source_freshness is False
+
+
+def test_unparseable_version_does_not_crash_or_guess_high():
+    for junk in ("latest", "v", "not-a-version", "..", "1.x"):
+        caps = resolve_dbt_capabilities("core", junk)
+        assert caps.nest_test_arguments is False
+
+
+def test_prerelease_suffixes_compare_on_the_numeric_part():
+    assert resolve_dbt_capabilities("core", "1.10.8b1").nest_test_arguments is True
+    assert resolve_dbt_capabilities("core", "1.10.7rc2").nest_test_arguments is False
+
+
+def test_floors_are_the_measured_values():
+    """Guard against someone 'tidying' these to the documented numbers.
+
+    dbt's docs give the arguments floor as 1.10.5; measurement says the
+    behaviour flag only defaults true at 1.10.8, and 1.10.5/1.10.7 really do
+    fail. Do not relax these without re-running the matrix.
+    """
+    assert TEST_ARGUMENTS_FLOOR == (1, 10, 8)
+    assert FRESHNESS_CONFIG_FLOOR == (1, 10, 5)
