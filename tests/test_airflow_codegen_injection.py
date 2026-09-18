@@ -626,3 +626,75 @@ def test_every_bash_command_site_resists_runtime_jinja(action, params_key, paylo
         rendered = _render_like_airflow(command)
         for token in shlex.split(rendered):
             assert not token.startswith("touch"), f"escaped the quoting: {rendered}"
+
+
+# ---------------------------------------------------------------------------
+# sanitize_identifier is not injective: `a-b` and `a.b` both become `a_b`.
+# codegen_utils documents that as safe because an upstream duplicate-taskId
+# validator rejects duplicate raw ids -- but that validator
+# (validate_contract_for_export) runs only in the Snowflake and GCP providers,
+# never on this path. The result was two assignments to the same variable:
+# the second overwrote the first and one declared task vanished from the DAG.
+# ---------------------------------------------------------------------------
+
+
+def _assigned_task_names(code):
+    return [
+        t.id
+        for node in ast.walk(ast.parse(code))
+        for t in getattr(node, "targets", [])
+        if isinstance(node, ast.Assign) and isinstance(t, ast.Name)
+    ]
+
+
+@pytest.mark.parametrize(
+    "first,second",
+    [
+        ("load-orders", "load.orders"),  # punctuation only
+        ("a b", "a_b"),  # space vs underscore
+        ("x.y.z", "x-y-z"),
+    ],
+)
+def test_colliding_action_ids_still_emit_two_tasks(first, second):
+    code = _dag_from_actions(
+        [
+            {"actionId": first, "action": "registerSchema", "params": {"schemaName": "a"}},
+            {"actionId": second, "action": "createView", "params": {"viewName": "b"}},
+        ]
+    )
+    assert_inert(code)
+    names = [n for n in _assigned_task_names(code) if n not in ("dag", "default_args")]
+    assert len(names) == 2, f"a task was dropped: {names}"
+    assert len(set(names)) == 2, f"two tasks share one variable: {names}"
+
+
+def test_dependency_wiring_follows_the_disambiguated_names():
+    """Each edge must point at its own task, not all at the survivor."""
+    code = _dag_from_actions(
+        [
+            {"actionId": "load-orders", "action": "registerSchema", "params": {"schemaName": "a"}},
+            {"actionId": "load.orders", "action": "createView", "params": {"viewName": "b"}},
+            {
+                "actionId": "final",
+                "action": "registerSchema",
+                "params": {"schemaName": "c"},
+                "dependsOn": ["load-orders", "load.orders"],
+            },
+        ]
+    )
+    assert_inert(code)
+    edges = {line.strip() for line in code.splitlines() if ">>" in line}
+    assert len(edges) == 2, f"edges collapsed onto one task: {edges}"
+
+
+def test_benign_ids_are_unchanged():
+    """Disambiguation must not rename anything that did not collide."""
+    code = _dag_from_actions(
+        [
+            {"actionId": "build-orders", "action": "registerSchema", "params": {"schemaName": "a"}},
+            {"actionId": "grant-analysts", "action": "createView", "params": {"viewName": "b"}},
+        ]
+    )
+    names = set(_assigned_task_names(code))
+    assert {"build_orders", "grant_analysts"} <= names
+    assert not any(n.endswith("_2") for n in names)
