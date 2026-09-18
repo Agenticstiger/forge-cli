@@ -1837,47 +1837,89 @@ def run(args, logger: logging.Logger) -> int:
         # --- Cross-mesh federation digest gate (stage-7 apply gate) ---
         # When ``consumes[]`` declares an ``upstreamWorkspace``, the
         # federation validator fetches the live upstream digest and
-        # compares against the pinned ``upstreamDigest``. Drift produces
-        # a typed ``FederatedConsumeViolation`` per drifted row and we
-        # abort apply before any DDL — same loud-failure posture as the
-        # plan-binding gate. ``--no-verify-federation`` is the DR escape
-        # hatch (logged at WARNING).
+        # compares it against the pinned ``upstreamDigest``.
+        #
+        # This WARNS, it does not abort. Unlike the plan-binding gate --
+        # which compares two artifacts we produced ourselves and so can
+        # only disagree if one was tampered with -- this gate's verdict
+        # depends on somebody else's registry being up and honest. A hard
+        # failure would mean another team's git server going down blocks
+        # our production applies, and the first thing anyone would reach
+        # for is ``--no-verify-federation``, permanently. A warning that
+        # names the workspace keeps the signal and keeps the escape hatch
+        # unused. Enforcement becomes reasonable once the fetch path has
+        # a track record; the payload shape below is already the one an
+        # enforcing version would raise with.
         if not getattr(args, "no_verify_federation", False):
+            fed_violations = []
             try:
                 from fluid_build.forge.federation import validate_federated_consumes
 
                 fed_violations = validate_federated_consumes(contract, workspace_root=Path.cwd())
-            except Exception as exc:  # pragma: no cover — defensive
-                logger.debug(
-                    "federation_validate_skipped: err=%s — manifest absent or "
-                    "unreachable; treating as no-op",
+            except Exception as exc:  # noqa: BLE001 - gate must never break apply
+                # Reaching here means the validator itself failed, not
+                # that an upstream was unreachable (that is a violation
+                # row, below). A contract with no federated consumes
+                # returns an empty list without raising, and an absent
+                # ``federation/upstreams.yaml`` loads as an empty
+                # manifest -- so neither of the two normal quiet cases
+                # lands here, and this is worth saying out loud rather
+                # than swallowing at DEBUG the way it used to be.
+                logger.warning(
+                    "federation_gate_error: the federated-consumes check could not "
+                    "run (%s: %s). consumes[] pins were NOT verified for this apply.",
+                    type(exc).__name__,
                     exc,
                 )
-                fed_violations = []
             if fed_violations:
-                # Build a stable, machine-parseable error payload that
-                # mirrors PlanBindingError's contract so CI templates can
-                # match both gates with one regex.
-                first = fed_violations[0]
-                raise CLIError(
-                    1,
-                    "apply_consumes_drift",
-                    {
-                        "kind": "upstream-mismatch",
-                        "violations": [
-                            {
-                                "consume_index": v.consume_index,
-                                "upstream_workspace_id": v.upstream_workspace_id,
-                                "upstream_product_id": v.upstream_product_id,
-                                "expected_digest": v.expected_digest,
-                                "actual_digest": v.actual_digest,
-                                "reason": v.reason,
-                            }
-                            for v in fed_violations
-                        ],
-                        "first_violation": first.reason,
-                    },
+                # Stable, machine-parseable payload mirroring
+                # PlanBindingError's contract so CI templates can match
+                # both gates with one regex.
+                # Count by kind rather than picking two out of five:
+                # "unpinned", "unknown-workspace" and "not-wired" are
+                # violations too, and a summary that counts only drift
+                # and unreachability reports "0 drifted, 0 unreachable"
+                # while listing N findings.
+                counts: Dict[str, int] = {}
+                for v in fed_violations:
+                    counts[v.kind] = counts.get(v.kind, 0) + 1
+                breakdown = ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
+                payload = {
+                    "kind": "upstream-mismatch",
+                    "violations": [
+                        {
+                            "consume_index": v.consume_index,
+                            "upstream_workspace_id": v.upstream_workspace_id,
+                            "upstream_product_id": v.upstream_product_id,
+                            "expected_digest": v.expected_digest,
+                            "actual_digest": v.actual_digest,
+                            "reason": v.reason,
+                            "violation_kind": v.kind,
+                        }
+                        for v in fed_violations
+                    ],
+                    "first_violation": fed_violations[0].reason,
+                    "counts_by_kind": counts,
+                    "drift_count": counts.get("drift", 0),
+                    "unreachable_count": counts.get("unreachable", 0),
+                }
+                logger.warning(
+                    "apply_consumes_drift: %d federated consumes[] %s could not "
+                    "be confirmed in sync (%s). Applying anyway. Details: %s",
+                    len(fed_violations),
+                    "entry" if len(fed_violations) == 1 else "entries",
+                    breakdown,
+                    json.dumps(payload, sort_keys=True),
                 )
+                for v in fed_violations:
+                    logger.warning(
+                        "  consumes[%d] %s/%s [%s]: %s",
+                        v.consume_index,
+                        v.upstream_workspace_id,
+                        v.upstream_product_id,
+                        v.kind,
+                        v.reason,
+                    )
         else:
             logger.warning(
                 "--no-verify-federation: federation digest gate was SKIPPED. "

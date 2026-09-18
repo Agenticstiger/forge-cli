@@ -218,43 +218,25 @@ class TestGitBackend:
             result = _fetch_digest_via_git(ws, "external.orders", "1")
         assert result is None
 
-    def test_gitpython_path_is_tried_first(self, tmp_path: Path, monkeypatch):
-        """When gitpython is installed, ``_git_clone_or_pull_via_gitpython``
-        is called BEFORE the shell-out fallback. Pin the dispatch order
-        so a gitpython regression doesn't silently fall through to
-        shell-out (which has different error semantics)."""
-        from fluid_build.forge import federation as _fed
+    def test_git_fetch_always_goes_through_the_bounded_shellout(self, tmp_path: Path, monkeypatch):
+        """There is exactly one git path, and it is the one that can be
+        given a timeout.
 
-        ws = FederatedWorkspace(id="ext-gp", kind="git_registry", endpoint="https://example.com/r")
+        This replaces three tests that pinned a gitpython-first dispatch
+        order. That path was removed because it cannot be bounded, and
+        ``fluid apply`` depends on this call returning. Measured against a
+        TCP listener that accepts and never speaks, GitPython 3.1.62:
+        ``Repo.clone_from(..., kill_after_timeout=3)`` was still running at
+        90s, while ``subprocess.run([...], timeout=3)`` raised
+        TimeoutExpired at 3.0s. ``kill_after_timeout`` is *accepted* by
+        clone_from (it sits in GitPython's execute_kwargs, so it is not
+        rejected the way an unknown kwarg is) but it does not kill the
+        clone -- which is worse than offering no timeout at all, because
+        ``fluid doctor`` then advertises a cap that does not exist.
 
-        # Force the cache dir into tmp_path so the test doesn't clobber
-        # ~/.cache/fluid/federation-git on the developer's box.
-        monkeypatch.setattr(
-            "os.path.expanduser",
-            lambda p: str(tmp_path / "home_cache") if "~" in p else p,
-        )
-
-        with (
-            patch(
-                "fluid_build.forge.federation._git_clone_or_pull_via_gitpython",
-                return_value=True,
-            ) as mock_gp,
-            patch("fluid_build.forge.federation._git_clone_or_pull_via_shellout") as mock_sh,
-            patch(
-                "fluid_build.forge.federation._read_first_existing_contract",
-                return_value="fluidVersion: 0.7.3\nid: ext.x\n",
-            ),
-        ):
-            result = _fetch_digest_via_git(ws, "ext.x", "1")
-
-        assert mock_gp.called, "gitpython path must be tried first"
-        assert not mock_sh.called, "shell-out fallback must NOT be called when gitpython succeeds"
-        assert result is not None and result.startswith("sha256:")
-
-    def test_shellout_fallback_when_gitpython_unavailable(self, tmp_path: Path, monkeypatch):
-        """When gitpython returns None (not installed), shell-out
-        fallback runs. Pin the fall-through path so an environment
-        without gitpython still resolves federated digests."""
+        Nothing was lost: GitPython shells out to the same ``git`` binary,
+        so it was never a fallback for git being missing.
+        """
         ws = FederatedWorkspace(id="ext-sh", kind="git_registry", endpoint="https://example.com/r")
         monkeypatch.setattr(
             "os.path.expanduser",
@@ -262,10 +244,6 @@ class TestGitBackend:
         )
 
         with (
-            patch(
-                "fluid_build.forge.federation._git_clone_or_pull_via_gitpython",
-                return_value=None,
-            ) as mock_gp,
             patch(
                 "fluid_build.forge.federation._git_clone_or_pull_via_shellout",
                 return_value=True,
@@ -277,37 +255,51 @@ class TestGitBackend:
         ):
             result = _fetch_digest_via_git(ws, "ext.x", "1")
 
-        assert (
-            mock_gp.called and mock_sh.called
-        ), "Both gitpython AND shell-out must be exercised when gitpython is unavailable"
+        assert mock_sh.called, "the git backend must use the bounded shell-out path"
         assert result is not None and result.startswith("sha256:")
 
-    def test_gitpython_real_failure_aborts_no_shellout(self, tmp_path: Path, monkeypatch):
-        """When gitpython is installed but the clone fails (auth, dead
-        remote, etc.), we MUST NOT fall through to shell-out — the
-        failure mode would be identical and the operator should see
-        the gitpython error."""
+    def test_no_gitpython_network_call_is_reintroduced(self):
+        """Guard against the unbounded path coming back.
+
+        Any ``Repo.clone_from`` / ``origin.fetch`` in this module is a
+        network call GitPython gives no working way to bound, so it must
+        not reappear -- with or without a ``kill_after_timeout`` that does
+        nothing.
+        """
+        import ast
+        from pathlib import Path as _P
+
+        src = (
+            _P(__file__).resolve().parents[2] / "fluid_build" / "forge" / "federation.py"
+        ).read_text(encoding="utf-8")
+        offenders = [
+            node.lineno
+            for node in ast.walk(ast.parse(src))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"clone_from", "fetch"}
+        ]
+        assert not offenders, (
+            f"gitpython network call(s) reintroduced at line(s) {offenders} -- "
+            "these cannot be bounded; use _git_clone_or_pull_via_shellout"
+        )
+
+    def test_shellout_failure_aborts_without_a_digest(self, tmp_path: Path, monkeypatch):
+        """A failed clone must yield no digest -- federation fails closed,
+        never on a weaker or stale answer."""
         ws = FederatedWorkspace(
-            id="ext-gp-fail", kind="git_registry", endpoint="https://example.com/r"
+            id="ext-sh-fail", kind="git_registry", endpoint="https://example.com/r"
         )
         monkeypatch.setattr(
             "os.path.expanduser",
             lambda p: str(tmp_path / "home_cache") if "~" in p else p,
         )
 
-        with (
-            patch(
-                "fluid_build.forge.federation._git_clone_or_pull_via_gitpython",
-                return_value=False,
-            ) as mock_gp,
-            patch("fluid_build.forge.federation._git_clone_or_pull_via_shellout") as mock_sh,
+        with patch(
+            "fluid_build.forge.federation._git_clone_or_pull_via_shellout",
+            return_value=False,
         ):
-            result = _fetch_digest_via_git(ws, "ext.x", "1")
-
-        assert (
-            mock_gp.called and not mock_sh.called
-        ), "gitpython failure must NOT trigger shell-out fallback"
-        assert result is None
+            assert _fetch_digest_via_git(ws, "ext.x", "1") is None
 
 
 # ──────────────────── End-to-end: cache + dispatch ─────────────────────

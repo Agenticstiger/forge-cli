@@ -27,6 +27,7 @@ and assert apply.run raises ``CLIError(event="apply_consumes_drift")``.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -36,16 +37,53 @@ import pytest
 from fluid_build.cli._common import CLIError
 from fluid_build.forge.federation import FederatedConsumeViolation
 
+FEDERATED_CONTRACT_YAML = """fluidVersion: "0.7.6"
+kind: DataProduct
+id: ext.consumer
+name: External Consumer
+domain: sales
+metadata:
+  layer: Silver
+  productType: ADP
+  owner:
+    team: platform-team
+    email: platform@example.com
+consumes:
+  - productId: ext.upstream
+    exposeId: orders
+    upstreamWorkspace: telco
+    upstreamDigest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+exposes:
+  - exposeId: consumer_out
+    kind: table
+    version: "1.0.0"
+    binding:
+      platform: local
+      format: parquet
+      location:
+        database: silver
+        table: consumer_out
+    contract:
+      schema:
+        - name: id
+          type: integer
+          required: true
+"""
+
 
 @pytest.fixture
 def sample_args(tmp_path: Path):
     """Minimal argparse Namespace shape that gets us to the federation
     gate without errors from the upstream code paths."""
     contract_path = tmp_path / "contract.fluid.yaml"
+    # A COMPLETE, schema-valid 0.7.6 contract -- not a stub. The federated
+    # consume fields (``upstreamWorkspace``/``upstreamDigest``) are new in
+    # 0.7.6, so a 0.7.3 header fails additionalProperties on consumes[].
+    # Keeping this contract genuinely valid is what lets these tests run
+    # the REAL pre-apply schema gate rather than stubbing it out, so the
+    # gate and the schema stay honest about each other.
     contract_path.write_text(
-        "fluidVersion: 0.7.3\nid: ext.consumer\nconsumes:\n"
-        "  - productId: ext.upstream\n    upstreamWorkspace: telco\n"
-        "    upstreamDigest: sha256:STALE\n",
+        FEDERATED_CONTRACT_YAML,
         encoding="utf-8",
     )
     return SimpleNamespace(
@@ -67,9 +105,48 @@ def sample_args(tmp_path: Path):
     )
 
 
-def test_federation_gate_aborts_on_drift(monkeypatch, tmp_path, sample_args):
-    """When ``validate_federated_consumes`` returns a violation, apply
-    must raise CLIError before any DDL is emitted."""
+def _capture_warnings(name: str):
+    """Isolated WARNING capture on an explicit logger.
+
+    Deliberately not ``caplog``: it installs root-logger handlers, and
+    other tests in this suite install root-logger *filters*, so the two
+    interfere. Returns ``(logger, records, restore)``.
+    """
+    import logging
+
+    records: list = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    logger = logging.getLogger(name)
+    handler = _ListHandler(level=logging.WARNING)
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    prior = logger.propagate
+    logger.propagate = False
+
+    def restore():
+        logger.removeHandler(handler)
+        logger.propagate = prior
+
+    return logger, records, restore
+
+
+def test_federation_gate_warns_on_drift_and_does_not_abort(monkeypatch, tmp_path, sample_args):
+    """Drift WARNS; it does not abort the apply.
+
+    This gate's verdict depends on a *third party's* registry being
+    reachable and honest, unlike the plan-binding gate which compares
+    two artifacts we produced ourselves. Hard-failing here would let
+    another team's git outage block our production applies, and the
+    predictable response is a permanent ``--no-verify-federation``.
+    So: warn loudly, name the workspace, keep applying.
+
+    The escape hatch staying unused is the point -- assert the warning
+    is emitted AND that no ``apply_consumes_drift`` CLIError escapes.
+    """
     monkeypatch.chdir(tmp_path)
 
     violation = FederatedConsumeViolation(
@@ -79,45 +156,60 @@ def test_federation_gate_aborts_on_drift(monkeypatch, tmp_path, sample_args):
         expected_digest="sha256:STALE",
         actual_digest="sha256:LIVE",
         reason="cached drift detected",
+        kind="drift",
     )
 
-    # Sanity: the validator function exists at the documented path.
     from fluid_build.forge import federation as _fed
 
     assert hasattr(_fed, "validate_federated_consumes")
 
-    # Run apply.run with the validator stubbed to return our violation.
-    # The federation gate runs before downstream DDL emission, so we
-    # expect CLIError("apply_consumes_drift") to abort first.
-    import logging
-
     from fluid_build.cli import apply as apply_mod
 
-    # The federation contract uses ``upstreamWorkspace`` / ``upstreamDigest``
-    # consume fields that the bundled JSON schema does not yet model, so
-    # the new pre-apply schema gate would reject it first. Stub the gate —
-    # the unit under test here is the federation drift gate, not contract
-    # schema validity.
-    with (
-        patch(
+    logger, records, restore = _capture_warnings("fluid.test.federation_gate_warn")
+    try:
+        # NOTE: no ``_gate_contract_for_apply`` stub. The bundled 0.7.6
+        # schema now models ``upstreamWorkspace``/``upstreamDigest``, so
+        # this contract passes the real pre-apply schema gate. If that
+        # regresses, this test fails here -- which is the point.
+        with patch(
             "fluid_build.forge.federation.validate_federated_consumes",
             return_value=[violation],
-        ),
-        patch("fluid_build.cli.apply._gate_contract_for_apply"),
-    ):
-        with pytest.raises(CLIError) as exc_info:
-            apply_mod.run(sample_args, logging.getLogger("test"))
+        ):
+            try:
+                apply_mod.run(sample_args, logger)
+            except CLIError as exc:
+                assert exc.event != "apply_consumes_drift", (
+                    "federation drift must WARN, not abort -- got a CLIError "
+                    f"with event={exc.event!r}"
+                )
+            except Exception:
+                # apply fails later for unrelated reasons (no provider,
+                # no plan). Only the gate's behaviour is under test.
+                pass
+    finally:
+        restore()
 
-    err = exc_info.value
-    # Stable event-name for CI log parsers.
-    assert err.event == "apply_consumes_drift"
-    ctx = err.context or {}
-    assert ctx.get("kind") == "upstream-mismatch"
-    violations = ctx.get("violations") or []
-    assert len(violations) == 1
-    assert violations[0]["upstream_workspace_id"] == "telco"
-    assert violations[0]["expected_digest"] == "sha256:STALE"
-    assert violations[0]["actual_digest"] == "sha256:LIVE"
+    messages = [r.getMessage() for r in records]
+    drift_lines = [m for m in messages if "apply_consumes_drift" in m]
+    assert drift_lines, f"expected an apply_consumes_drift WARNING; got {messages!r}"
+
+    # The payload must stay machine-parseable: CI templates match this
+    # gate and the plan-binding gate with one regex, and a warning that
+    # only a human can read would silently drop federated drift out of
+    # every dashboard that watches for it.
+    blob = drift_lines[0]
+    payload = json.loads(blob[blob.index("{") :])
+    assert payload["kind"] == "upstream-mismatch"
+    assert payload["drift_count"] == 1
+    assert payload["unreachable_count"] == 0
+    assert payload["violations"][0]["upstream_workspace_id"] == "telco"
+    assert payload["violations"][0]["expected_digest"] == "sha256:STALE"
+    assert payload["violations"][0]["actual_digest"] == "sha256:LIVE"
+    assert payload["violations"][0]["violation_kind"] == "drift"
+
+    # The per-row line names the workspace so an operator reading the
+    # log knows *who* to chase without decoding JSON.
+    assert any("telco/ext.upstream" in m for m in messages), messages
 
 
 def test_federation_gate_bypassed_with_no_verify_federation(monkeypatch, tmp_path, sample_args):

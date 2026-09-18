@@ -239,20 +239,23 @@ class TestFederationViolationShape:
 
 
 # ---------------------------------------------------------------------------
-# 3. Apply gate — drift produces typed CLIError("apply_consumes_drift").
+# 3. Apply gate — drift produces a machine-parseable WARNING.
 # ---------------------------------------------------------------------------
 
 
 class TestApplyConsumesDriftErrorShape:
-    """The apply CLI must raise ``CLIError(event="apply_consumes_drift")``
-    with ``kind="upstream-mismatch"`` when the federation gate finds
-    drift. The error shape mirrors PlanBindingError so log parsers can
-    match both with one regex."""
+    """Federation drift WARNS with a payload shaped like
+    PlanBindingError's, so one log-parser regex matches both gates.
 
-    def test_apply_raises_typed_error_on_drift(self, tmp_path: Path, monkeypatch):
+    It does not abort: this gate's verdict depends on a third party's
+    registry being reachable, so a hard failure would let someone
+    else's outage block our applies and make ``--no-verify-federation``
+    permanent. See ``tests/forge/test_federation_apply_gate.py`` for the
+    end-to-end version of this against the real schema gate."""
+
+    def test_apply_warns_with_typed_payload_on_drift(self, tmp_path: Path, monkeypatch):
         """Stub the federation validator to return a synthetic violation;
-        confirm apply.run aborts with ``apply_consumes_drift`` BEFORE
-        any DDL is emitted."""
+        confirm apply.run logs the typed payload and keeps going."""
         from fluid_build.cli import apply as apply_cli
         from fluid_build.cli._common import CLIError
         from fluid_build.forge.federation import FederatedConsumeViolation
@@ -293,31 +296,54 @@ class TestApplyConsumesDriftErrorShape:
             reason="cached drift",
         )
 
+        import json
         import logging
 
-        logger = logging.getLogger("fluid.test")
+        logger = logging.getLogger("fluid.test.digest_pinning_shape")
+        records: list = []
 
-        # The contract uses ``upstreamWorkspace`` / ``upstreamDigest``
-        # consume fields not modelled by the bundled schema, so the new
-        # pre-apply schema gate is stubbed — the unit under test is the
-        # federation drift gate, not contract schema validity.
-        with (
-            patch(
-                "fluid_build.forge.federation.validate_federated_consumes",
-                return_value=[violation],
-            ),
-            patch("fluid_build.cli.apply._gate_contract_for_apply"),
-        ):
-            with pytest.raises(CLIError) as excinfo:
-                apply_cli.run(args, logger)
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
 
-        # The CLIError event must be the documented stable string.
-        assert excinfo.value.event == "apply_consumes_drift"
-        # And carry kind="upstream-mismatch" — same posture as
-        # PlanBindingError(kind="bundle-mismatch").
-        assert excinfo.value.context.get("kind") == "upstream-mismatch"
-        # Violations list propagates so CI parsers can render rich UX.
-        assert len(excinfo.value.context.get("violations", [])) == 1
+        handler = _Capture(level=logging.WARNING)
+        logger.addHandler(handler)
+        logger.setLevel(logging.WARNING)
+        prior_propagate = logger.propagate
+        logger.propagate = False
+
+        # The contract here is a deliberately minimal 0.7.3 stub, so the
+        # pre-apply schema gate is patched out to keep this test focused
+        # on the gate's payload shape. That the federated fields are
+        # genuinely schema-valid in 0.7.6 is proven end-to-end (with no
+        # such stub) in tests/forge/test_federation_apply_gate.py.
+        try:
+            with (
+                patch(
+                    "fluid_build.forge.federation.validate_federated_consumes",
+                    return_value=[violation],
+                ),
+                patch("fluid_build.cli.apply._gate_contract_for_apply"),
+            ):
+                try:
+                    apply_cli.run(args, logger)
+                except CLIError as exc:
+                    assert exc.event != "apply_consumes_drift", "drift must warn, not abort"
+                except Exception:
+                    # apply fails later on this stub contract; only the
+                    # gate's behaviour is under test here.
+                    pass
+        finally:
+            logger.removeHandler(handler)
+            logger.propagate = prior_propagate
+
+        drift = [m for m in (r.getMessage() for r in records) if "apply_consumes_drift" in m]
+        assert drift, f"expected an apply_consumes_drift WARNING; got {records!r}"
+        payload = json.loads(drift[0][drift[0].index("{") :])
+        # kind mirrors PlanBindingError(kind="bundle-mismatch") so one
+        # regex matches both gates.
+        assert payload["kind"] == "upstream-mismatch"
+        assert len(payload["violations"]) == 1
 
 
 class TestApplyNoVerifyFederationEscapeHatch:

@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -105,6 +106,59 @@ FEDERATION_CACHE_DIRNAME = "federation"
 # chased silently. Where a redirect is genuinely expected the fetcher
 # uses an explicit small cap and re-runs the host gate on each hop.
 _FEDERATION_HTTP_TIMEOUT = 15.0
+
+#: Default wall-clock cap on each federated fetch subprocess
+#: (git clone/fetch/rev-parse).
+_FEDERATION_GIT_TIMEOUT_DEFAULT = 30.0
+
+
+def _federation_git_timeout() -> float:
+    """Per-git-operation timeout for a federated digest fetch.
+
+    ``fluid apply`` reaches another mesh to verify an upstream digest, so
+    an unresponsive registry must not be able to hang the apply. The
+    clone default used to be 60s per upstream, which across several
+    upstreams is minutes of an apply spent waiting on someone else's git
+    server.
+
+    Read per call rather than bound at import: a module-level constant
+    freezes whatever the environment held when the module first loaded,
+    so a value exported later in the process (or by a test) silently
+    does nothing while ``fluid doctor --env`` cheerfully reports it as
+    active. Same shape as ``iac/runner.py``'s tofu timeout.
+
+    Falls back to the default on a non-numeric or non-positive value --
+    a typo in an env var must not disable the bound it configures.
+    """
+    raw = os.environ.get("FLUID_FEDERATION_TIMEOUT_SECONDS")
+    if raw is None:
+        return _FEDERATION_GIT_TIMEOUT_DEFAULT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        LOG.warning(
+            "federation_timeout_invalid: FLUID_FEDERATION_TIMEOUT_SECONDS=%r "
+            "is not a number; using the %ss default",
+            raw,
+            _FEDERATION_GIT_TIMEOUT_DEFAULT,
+        )
+        return _FEDERATION_GIT_TIMEOUT_DEFAULT
+    if not math.isfinite(value) or value <= 0:
+        # ``float()`` happily accepts "inf" and "nan". Both defeat the
+        # bound in opposite ways: ``timeout=inf`` never fires, and
+        # ``timeout=nan`` makes subprocess raise before git even starts.
+        # ``value <= 0`` alone catches neither (nan compares False to
+        # everything, inf is positive).
+        LOG.warning(
+            "federation_timeout_invalid: FLUID_FEDERATION_TIMEOUT_SECONDS=%r "
+            "must be a positive, finite number of seconds; using the %ss default",
+            raw,
+            _FEDERATION_GIT_TIMEOUT_DEFAULT,
+        )
+        return _FEDERATION_GIT_TIMEOUT_DEFAULT
+    return value
+
+
 _FEDERATION_MAX_REDIRECTS = 3
 
 # Opt-in allow-list for operators whose federation endpoint genuinely
@@ -118,6 +172,26 @@ _FEDERATION_HOST_ALLOWLIST_ENV = "FLUID_FEDERATION_HOST_ALLOWLIST"
 # Constrain it to a conservative slug so a tampered manifest row can't
 # smuggle ``../`` traversal or absolute-path segments into those sinks.
 _WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+class FederationFetchError(NotImplementedError):
+    """A federated digest fetch ran but came back with nothing.
+
+    Distinct from a plain :class:`NotImplementedError`, which means the
+    workspace ``kind`` has no fetcher at all. The two were previously the
+    same exception, so a partner mesh being *down* was reported to
+    operators as "fetcher for kind='http_registry' not yet wired" -- a
+    statement about missing FLUID code, sending them to read our source
+    instead of checking their own registry.
+
+    All three shipped backends return ``None`` rather than raising on a
+    timeout, 404, TLS error, auth rejection, SSRF block or failed clone,
+    so this is the exception a real outage actually produces -- the
+    common case, not the edge case.
+
+    Subclasses ``NotImplementedError`` deliberately: callers written
+    while the two were conflated still catch it.
+    """
 
 
 class FederationSsrfError(ValueError):
@@ -470,7 +544,7 @@ def fetch_federated_digest(
         )
 
     if fetched is None:
-        raise NotImplementedError(
+        raise FederationFetchError(
             f"Live fetch returned no digest for kind={kind} "
             f"(workspace={workspace.id}, product={product_id}@{version}). "
             f"Check endpoint reachability and product path."
@@ -790,20 +864,31 @@ def _git_read_contract(workspace: FederatedWorkspace, product_id: str) -> Option
 
     auth_url = _build_auth_url(workspace)
 
-    # Try gitpython first; fall back to shell-out if it isn't installed
-    # OR if the import-level operation fails (e.g. git binary missing).
-    used_gitpython = _git_clone_or_pull_via_gitpython(
+    # Shell-out, always. There used to be a gitpython-first path here, on
+    # the theory that in-process was tidier than a fork. It cannot be
+    # bounded, and `fluid apply` now depends on this call finishing.
+    #
+    # Measured against a TCP listener that accepts and never speaks (a
+    # dead git daemon), GitPython 3.1.62:
+    #
+    #   Repo.clone_from(url, dst, kill_after_timeout=3)  -> still running at 90s
+    #   subprocess.run([...], timeout=3)                 -> TimeoutExpired at 3.0s
+    #
+    # `kill_after_timeout` is *accepted* by clone_from -- it is in
+    # GitPython's execute_kwargs, so it is not rejected the way an unknown
+    # kwarg is -- but it does not kill the clone. Accepting a timeout it
+    # does not honour is worse than not offering one, because
+    # `fluid doctor` then advertises a cap that does not exist.
+    #
+    # This was the live path, not a latent one: GitPython arrives
+    # transitively via `dlt` (a declared ingestion engine), so a normal
+    # install has it and took the unbounded branch first.
+    #
+    # Nothing is lost by dropping it: GitPython shells out to the same
+    # `git` binary, so it was never a fallback for git being absent.
+    if not _git_clone_or_pull_via_shellout(
         auth_url=auth_url, cache_dir=cache_dir, workspace_id=workspace.id
-    )
-    if used_gitpython is None:
-        # gitpython unavailable or failed — fall through to shell-out.
-        ok = _git_clone_or_pull_via_shellout(
-            auth_url=auth_url, cache_dir=cache_dir, workspace_id=workspace.id
-        )
-        if not ok:
-            return None
-    elif used_gitpython is False:
-        # gitpython hit a real error, not just unavailability — abort.
+    ):
         return None
 
     return _read_first_existing_contract(cache_dir, workspace, product_id)
@@ -823,85 +908,6 @@ def _build_auth_url(workspace: FederatedWorkspace) -> str:
         if auth_url.startswith("https://") and "@" not in auth_url[8:].split("/", 1)[0]:
             auth_url = auth_url.replace("https://", f"https://x-access-token:{secret}@", 1)
     return auth_url
-
-
-def _git_clone_or_pull_via_gitpython(
-    *, auth_url: str, cache_dir: Path, workspace_id: str
-) -> Optional[bool]:
-    """Try the in-process gitpython path.
-
-    Return values:
-
-    * ``None`` — gitpython unavailable; caller falls back to shell-out.
-    * ``True`` — clone or pull succeeded.
-    * ``False`` — gitpython is installed but the operation failed (auth
-      reject, dead remote, etc.); caller should abort rather than
-      retry via shell-out (the failure mode is the same).
-    """
-    try:
-        from git import GitCommandError, Repo
-    except ImportError:
-        LOG.debug(
-            "federation_git_gitpython_unavailable: workspace=%s — falling back to shell-out",
-            workspace_id,
-        )
-        return None
-
-    try:
-        if not cache_dir.exists():
-            Repo.clone_from(auth_url, str(cache_dir), depth=1)
-            LOG.debug(
-                "federation_git_gitpython_cloned: workspace=%s dir=%s",
-                workspace_id,
-                cache_dir,
-            )
-        else:
-            repo = Repo(str(cache_dir))
-            # ``origin`` may not exist on a freshly initialised cache;
-            # tolerate that (the contract file already exists from a
-            # previous clone, which is fine — pull is best-effort).
-            try:
-                repo.remotes.origin.fetch(depth=1)
-                repo.git.reset("--hard", "origin/HEAD")
-                LOG.debug(
-                    "federation_git_gitpython_refreshed: workspace=%s",
-                    workspace_id,
-                )
-            except (GitCommandError, AttributeError, ValueError) as exc:
-                # ``GitCommandError.__str__`` echoes the full command
-                # line, which in HTTPS mode embeds the auth token from
-                # the manifest's secret_ref
-                # (``https://x-access-token:<TOKEN>@host``). Log only
-                # the exception class — never the message body. The
-                # shell-out fallback already does this; mirror it here.
-                LOG.debug(
-                    "federation_git_gitpython_refresh_skipped: workspace=%s "
-                    "err=%s — using stale cache",
-                    workspace_id,
-                    type(exc).__name__,
-                )
-        return True
-    except GitCommandError as exc:
-        # See the note above — ``GitCommandError`` stringifies to the
-        # token-bearing clone URL. Surface only the class plus a static
-        # message; refuse to echo the command line.
-        LOG.warning(
-            "federation_git_gitpython_failed: workspace=%s err=%s — "
-            "git operation failed (authentication or remote error); "
-            "refusing to echo the command line",
-            workspace_id,
-            type(exc).__name__,
-        )
-        return False
-    except Exception as exc:  # pragma: no cover — defensive
-        # Non-git exceptions can still wrap the URL in their repr;
-        # stay class-only here too for consistency.
-        LOG.warning(
-            "federation_git_gitpython_unexpected: workspace=%s err=%s",
-            workspace_id,
-            type(exc).__name__,
-        )
-        return False
 
 
 def _git_clone_or_pull_via_shellout(*, auth_url: str, cache_dir: Path, workspace_id: str) -> bool:
@@ -931,7 +937,7 @@ def _git_clone_or_pull_via_shellout(*, auth_url: str, cache_dir: Path, workspace
                 ],
                 check=True,
                 capture_output=True,
-                timeout=60,
+                timeout=_federation_git_timeout(),
             )
         except (
             subprocess.CalledProcessError,
@@ -969,7 +975,7 @@ def _git_clone_or_pull_via_shellout(*, auth_url: str, cache_dir: Path, workspace
                 ],
                 check=False,
                 capture_output=True,
-                timeout=30,
+                timeout=_federation_git_timeout(),
             )
             subprocess.run(
                 [
@@ -982,7 +988,7 @@ def _git_clone_or_pull_via_shellout(*, auth_url: str, cache_dir: Path, workspace
                 ],
                 check=False,
                 capture_output=True,
-                timeout=15,
+                timeout=_federation_git_timeout(),
             )
         except (subprocess.TimeoutExpired, OSError) as exc:  # pragma: no cover
             # Don't include `exc` body — git error messages can echo the
@@ -1060,7 +1066,21 @@ def _read_first_existing_contract(
 
 @dataclass
 class FederatedConsumeViolation:
-    """One drift finding for a federated consumes[] entry."""
+    """One finding for a federated consumes[] entry.
+
+    ``kind`` separates *the upstream really did change* from *we could
+    not check it*, which callers must treat differently: drift is a
+    statement about the data, unreachability is a statement about the
+    network. Collapsing them would let a dead registry read as a clean
+    upstream (or a clean upstream read as drift), and the apply gate
+    words its warning off this field.
+
+    Values: ``"drift"`` (pinned and live digests differ), ``"unpinned"``
+    (federated upstream declared with no ``upstreamDigest``),
+    ``"unknown-workspace"`` (not in ``federation/upstreams.yaml``),
+    ``"unreachable"`` (the fetch itself failed), ``"not-wired"`` (no
+    fetcher for that workspace kind yet).
+    """
 
     consume_index: int
     upstream_workspace_id: str
@@ -1068,6 +1088,7 @@ class FederatedConsumeViolation:
     expected_digest: str
     actual_digest: str
     reason: str
+    kind: str = "drift"
 
 
 def validate_federated_consumes(
@@ -1128,6 +1149,7 @@ def validate_federated_consumes(
                         "via ``fluid forge`` against the upstream "
                         "workspace's contract."
                     ),
+                    kind="unpinned",
                 )
             )
             continue
@@ -1145,6 +1167,7 @@ def validate_federated_consumes(
                         f"federation/upstreams.yaml. Add it to the "
                         f"manifest before referencing in consumes[]."
                     ),
+                    kind="unknown-workspace",
                 )
             )
             continue
@@ -1155,10 +1178,33 @@ def validate_federated_consumes(
                 version,
                 workspace_root=workspace_root,
             )
-        except NotImplementedError as exc:
-            # Skeleton mode — surface as a violation so apply doesn't
-            # silently accept an unverified federated digest. Wiring
-            # the real fetcher converts this to an actual comparison.
+        except Exception as exc:  # noqa: BLE001 - every failure becomes a row
+            if isinstance(exc, NotImplementedError) and not isinstance(exc, FederationFetchError):
+                # No fetcher for this workspace kind -- genuinely missing
+                # FLUID code, which is what "not wired" should mean.
+                violations.append(
+                    FederatedConsumeViolation(
+                        consume_index=idx,
+                        upstream_workspace_id=str(ws_id),
+                        upstream_product_id=str(product_id or "?"),
+                        expected_digest=str(expected),
+                        actual_digest="",
+                        reason=(f"Federation fetcher for kind={ws.kind!r} not yet wired ({exc})."),
+                        kind="not-wired",
+                    )
+                )
+                continue
+            # Everything else is a reachability failure: the fetch ran and
+            # could not produce a digest. It must not abort the walk --
+            # raising here would discard violations already found for
+            # *other* upstreams, so one dead registry would mask real
+            # drift elsewhere.
+            LOG.warning(
+                "federation_fetch_failed: workspace=%s product=%s err=%s",
+                ws_id,
+                product_id,
+                type(exc).__name__,
+            )
             violations.append(
                 FederatedConsumeViolation(
                     consume_index=idx,
@@ -1166,7 +1212,13 @@ def validate_federated_consumes(
                     upstream_product_id=str(product_id or "?"),
                     expected_digest=str(expected),
                     actual_digest="",
-                    reason=(f"Federation fetcher for kind={ws.kind!r} not yet wired ({exc})."),
+                    reason=(
+                        f"Could not reach federated upstream {ws_id!r} to "
+                        f"verify the pin ({type(exc).__name__}). The pinned "
+                        f"digest was NOT checked -- this is not a statement "
+                        f"that the upstream is unchanged."
+                    ),
+                    kind="unreachable",
                 )
             )
             continue
@@ -1184,6 +1236,7 @@ def validate_federated_consumes(
                         f"``fluid forge`` to refresh the pin or "
                         f"investigate why the upstream changed."
                     ),
+                    kind="drift",
                 )
             )
     return violations

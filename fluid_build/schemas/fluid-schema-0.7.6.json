@@ -2520,7 +2520,22 @@
         "labels": {
           "$ref": "#/$defs/labels",
           "description": "Consumption relationship labels."
+        },
+        "upstreamWorkspace": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Cross-mesh only. Id of the federated workspace that owns this upstream, as declared in federation/upstreams.yaml. Set it when the upstream lives in another mesh rather than this workspace; omit it for a local upstream, which is resolved by walking the workspace."
+        },
+        "upstreamDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "Cross-mesh only. The contract digest this product was composed against, as sha256:<64 hex>. `fluid apply` re-fetches the upstream's live digest and compares: a mismatch means the upstream changed since composition. Required whenever upstreamWorkspace is set."
         }
+      },
+      "dependentRequired": {
+        "upstreamWorkspace": [
+          "upstreamDigest"
+        ]
       }
     },
     "build": {

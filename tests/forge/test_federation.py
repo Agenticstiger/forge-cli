@@ -163,12 +163,19 @@ class TestValidateFederatedConsumes:
         assert len(violations) == 1
         assert "not declared" in violations[0].reason
 
-    def test_unwired_fetcher_surfaces_as_violation(self, tmp_path: Path):
-        """Skeleton-mode: the live-fetch backend raises
-        NotImplementedError, which the validator converts to a
-        violation so apply doesn't silently accept the unverified
-        digest. Wiring the real fetcher converts this to a real
-        compare path."""
+    def test_a_failed_fetch_surfaces_as_an_unreachable_violation(self, tmp_path: Path):
+        """A git_registry whose clone fails must surface as a violation,
+        so apply never silently accepts the unverified digest.
+
+        This used to assert the reason said "not yet wired". It does not:
+        the endpoint here is a real git_registry with a wired fetcher, and
+        what fails is the clone. The old wording was the bug -- an
+        operator whose partner mesh was simply down got told FLUID had
+        not implemented the backend, and went looking in our source
+        instead of at their registry. The violation is now labelled
+        `unreachable`; `not-wired` is reserved for a workspace kind that
+        genuinely has no fetcher (see
+        test_an_unrecognised_workspace_kind_is_still_not_wired)."""
         _write_manifest(
             tmp_path,
             {
@@ -192,7 +199,8 @@ class TestValidateFederatedConsumes:
         }
         violations = validate_federated_consumes(contract, workspace_root=tmp_path)
         assert len(violations) == 1
-        assert "not yet wired" in violations[0].reason
+        assert violations[0].kind == "unreachable"
+        assert "Could not reach" in violations[0].reason
 
     def test_cached_digest_short_circuits_to_compare(self, tmp_path: Path):
         """When the cache has the digest, the validator skips the
