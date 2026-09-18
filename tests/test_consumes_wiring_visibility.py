@@ -131,6 +131,54 @@ class TestTheShippedTemplateIsTheMotivatingCase:
 
         assert get_engine("sql").wires_consumes is False
 
+    def test_the_helper_is_actually_wired_into_generation(self, tmp_path, monkeypatch, caplog):
+        """Run the real CLI end-to-end and assert the warning reaches a user.
+
+        Every other test here calls `_warn_unwired_consumes` directly, which
+        proves the helper works and nothing about whether anything CALLS it.
+        Deleting the single line at the call site left all of them green --
+        the feature could be removed silently. This test fails if that line
+        goes, because it drives `fluid generate speed-transformation` over
+        the shipped customer-360 contract and looks for the warning.
+        """
+        import shutil
+
+        from fluid_build.cli import generate_speed_transformation as gst
+
+        workdir = tmp_path / "ws"
+        workdir.mkdir()
+        shutil.copy(CUSTOMER_360, workdir / "contract.fluid.yaml")
+        monkeypatch.chdir(workdir)
+
+        args = SimpleNamespace(
+            contract=str(workdir / "contract.fluid.yaml"),
+            output=str(workdir / "out"),
+            build_index=0,
+            model=None,
+            all_builds=False,
+            concurrency=1,
+            overwrite=True,
+            env=None,
+            list=False,
+            verbose=False,
+            quiet=True,
+            mesh_hub=None,
+            model_contracts=False,
+            dbt_tests_key="auto",
+            dbt_validate=False,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="fluid.cli"):
+            gst.run(args, logging.getLogger("fluid.cli.test"))
+
+        blob = " ".join(r.getMessage() for r in caplog.records)
+        assert "consumes_not_wired" in blob, (
+            "generation did not emit the unwired-consumes warning -- is the "
+            f"helper still called from run()? got: {blob[:400]}"
+        )
+        # and it names a real declared upstream, not just a count
+        assert "raw_customers_v1" in blob
+
     def test_dbt_engine_declares_that_it_wires_consumes(self):
         from fluid_build.engines import get_engine
 

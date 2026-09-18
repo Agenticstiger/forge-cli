@@ -348,6 +348,8 @@ def _warn_unwired_consumes(
     contract: Dict[str, Any],
     engine: Any,
     engine_name: str,
+    *,
+    build_id: Optional[str] = None,
 ) -> List[str]:
     """Say so when a declared upstream will not appear in the output.
 
@@ -362,11 +364,23 @@ def _warn_unwired_consumes(
     generated SQL.
 
     Silence there is the worst available answer, because the contract
-    looks authoritative about lineage while the artifacts disagree with
+    looks authoritative about lineage while nothing downstream consumes
     it. This does not invent a wiring -- how a SQL or Spark job should
     address a federated upstream is a real design decision, not
     something to guess inside a warning -- it just refuses to let the
     gap be invisible.
+
+    The warning claims only what this function can know: that the engine
+    never reads ``consumes[]``. It deliberately does NOT claim the
+    upstreams are absent from the emitted files, because it does not look
+    at them -- a build's hand-written SQL may well name the same table by
+    coincidence or by hand-wiring, and asserting otherwise would be a
+    statement this code has not checked.
+
+    Emitted once per build (with the build id), not once per contract:
+    under ``--all-builds`` different builds can use different engines, so
+    per-build really is the right granularity -- but each line names its
+    build so repeats are attributable rather than identical noise.
 
     Returns the unwired product ids (for tests and callers); emits
     nothing when the engine wires them or the contract declares none.
@@ -392,11 +406,12 @@ def _warn_unwired_consumes(
 
     logger = logging.getLogger("fluid.cli")
     logger.warning(
-        "consumes_not_wired: the %r engine does not resolve consumes[] into a "
-        "read address, so %d declared upstream(s) do not appear in the generated "
-        "artifacts: %s. The generated code reads from whatever the build's own "
-        "SQL names. Point the build at these upstreams by hand, or generate with "
-        "the dbt engine, which emits them as sources.",
+        "consumes_not_wired: build %s uses the %r engine, which never reads "
+        "consumes[], so nothing it generates is derived from the %d declared "
+        "upstream(s): %s. Whether the emitted code happens to reference them "
+        "depends entirely on what the build's own SQL names. Point the build at "
+        "them by hand, or use the dbt engine, which emits them as sources.",
+        build_id or "<unnamed>",
         engine_name,
         len(unwired),
         ", ".join(unwired),
@@ -635,7 +650,7 @@ def _generate_single_build(
     if engine_name == "dbt":
         engine_kwargs["output_dir"] = output_dir
 
-    _warn_unwired_consumes(contract, engine, engine_name)
+    _warn_unwired_consumes(contract, engine, engine_name, build_id=build.get("id"))
 
     files = engine.generate(
         contract,
