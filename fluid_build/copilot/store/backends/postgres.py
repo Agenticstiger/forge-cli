@@ -80,7 +80,8 @@ class PostgresBackend(Store):
 
     def _init_db(self) -> None:
         with self.conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 create table if not exists fluid_store (
                     namespace text not null,
                     key text not null,
@@ -91,7 +92,8 @@ class PostgresBackend(Store):
                     fluid_version text,
                     primary key (namespace, key)
                 )
-                """)
+                """
+            )
         self.conn.commit()
 
     # ------------------------------------------------------------------

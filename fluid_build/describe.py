@@ -21,7 +21,6 @@ Pattern adapted from `pulumi about --json` (flat object, top-level keys
 per category). See borrow-before-build receipts in the feat/forge-cc-alignment
 PR.
 """
-
 from __future__ import annotations
 
 import argparse

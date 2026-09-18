@@ -269,7 +269,8 @@ data/
         if db_type == "postgres":
             postgres_config = config.get("postgres", {})
 
-            services.append(f"""  postgres:
+            services.append(
+                f"""  postgres:
     image: postgres:13
     environment:
       POSTGRES_DB: {postgres_config.get("database", project_name)}
@@ -278,7 +279,8 @@ data/
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data""")
+      - postgres_data:/var/lib/postgresql/data"""
+            )
 
             app_service += "\n      - postgres"
 
