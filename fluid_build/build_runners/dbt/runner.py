@@ -542,9 +542,17 @@ def _build_containerized_dbt_command(
         return cmd
 
     bootstrap_image = os.getenv("DBT_BOOTSTRAP_IMAGE", "python:3.12-slim")
-    adapter_package = os.getenv("DBT_ADAPTER_PACKAGE") or f"dbt-{adapter}"
-    install_and_run = "python -m pip install --quiet {pkg} && {dbt_cmd}".format(
+    # Cap dbt-core below 2. Three adapters forge can install (duckdb,
+    # clickhouse, athena-community) declare NO dbt-core ceiling, so once
+    # dbt-core 2.0.0 leaves pre-release this bare install would pull the v2
+    # engine: a different distribution that needs Python >=3.11 and fetches
+    # its binary from a CDN at install time. An operator who wants that sets
+    # DBT_ADAPTER_PACKAGE explicitly.
+    adapter_package = os.getenv("DBT_ADAPTER_PACKAGE") or f"dbt-{adapter}<2"
+    pin_core = "" if os.getenv("DBT_ADAPTER_PACKAGE") else " 'dbt-core<2'"
+    install_and_run = "python -m pip install --quiet {pkg}{core} && {dbt_cmd}".format(
         pkg=shlex.quote(adapter_package),
+        core=pin_core,
         dbt_cmd=" ".join(shlex.quote(part) for part in ["dbt", *container_args]),
     )
     cmd.extend([bootstrap_image, "sh", "-lc", install_and_run])

@@ -93,20 +93,20 @@ class TestResolveEngineBootstrap:
 
     def test_dbt_snowflake(self):
         b = resolve_engine_bootstrap("dbt", sink_platform="snowflake")
-        assert "dbt-core>=1.7" in b.packages
-        assert "dbt-snowflake>=1.7" in b.packages
+        assert "dbt-core>=1.7,<2" in b.packages
+        assert "dbt-snowflake>=1.7,<2" in b.packages
 
     def test_dbt_bigquery(self):
         b = resolve_engine_bootstrap("dbt", sink_platform="bigquery")
-        assert "dbt-bigquery>=1.7" in b.packages
+        assert "dbt-bigquery>=1.7,<2" in b.packages
 
     def test_dbt_databricks(self):
         b = resolve_engine_bootstrap("dbt", sink_platform="databricks")
-        assert "dbt-databricks>=1.7" in b.packages
+        assert "dbt-databricks>=1.7,<2" in b.packages
 
     def test_dbt_unknown_platform_emits_note(self):
         b = resolve_engine_bootstrap("dbt", sink_platform="exotic_warehouse")
-        assert b.packages == ["dbt-core>=1.7"]
+        assert b.packages == ["dbt-core>=1.7,<2"]
         assert any("exotic_warehouse" in n for n in b.notes)
 
     def test_duckdb_standalone(self):
@@ -568,3 +568,39 @@ def test_every_emitter_skips_runtime_block_for_pure_python_engines(system_name):
     assert (
         "dlt[" in content or "dlt>" in content
     ), f"{system_name} did not include the dlt pip extras"
+
+
+def test_every_emitted_dbt_spec_caps_dbt_core_below_2():
+    """forge installs dbt into other people's CI and containers, so every spec
+    it emits must keep them on the Apache-2.0 1.x line unless they opt out.
+
+    Three adapters forge can install declare NO dbt-core ceiling of their own
+    (measured on PyPI 2026-09-18: dbt-duckdb `dbt-core>=1.8.0`, dbt-clickhouse
+    `dbt-core>=1.9`, dbt-athena-community declares none). Capping the adapter
+    alone therefore does not protect them -- `dbt-core<2` has to be in the
+    spec list too. dbt-core 2.x is a different distribution: it needs Python
+    >=3.11 and fetches its binary from a CDN at install time.
+    """
+    from fluid_build.forge.core.pipeline_systems._engine_specs import resolve_engine_bootstrap
+
+    sinks = [
+        None,
+        "snowflake",
+        "bigquery",
+        "redshift",
+        "postgres",
+        "databricks",
+        "spark",
+        "duckdb",
+        "athena",
+        "trino",
+        "clickhouse",
+    ]
+    for sink in sinks:
+        packages = resolve_engine_bootstrap("dbt", sink_platform=sink).packages
+        assert packages, f"{sink}: emitted no packages"
+        assert any(
+            p.startswith("dbt-core") for p in packages
+        ), f"{sink}: no explicit dbt-core pin, so an uncapped adapter decides the engine"
+        for spec in packages:
+            assert "<2" in spec, f"{sink}: uncapped spec {spec!r}"
