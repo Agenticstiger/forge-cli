@@ -270,10 +270,14 @@ dag = DAG(
         elif engine == "sql":
             command = f"echo {shlex.quote(f'Execute SQL: {script}')}"
         elif script:
-            # An operator-authored ``script`` is a command line by design, so
-            # it is passed through rather than quoted -- but it still routes
-            # through ``_bash_task``, which keeps it inside a Python literal.
-            command = str(script)
+            # ``script`` is NOT a schema field -- ``$defs.build`` sets
+            # ``additionalProperties: false`` and declares no ``script`` in any
+            # shipped schema (0.7.1-0.7.6), and this generator does not validate
+            # before emitting. The only shipped usage
+            # (examples/0.7.1/provider-actions-workflow.yaml) is a dbt *model
+            # identifier*, not a command line. So quote it like every other
+            # branch rather than trusting it to be a well-formed command.
+            command = shlex.quote(str(script))
         else:
             command = f"echo {shlex.quote(f'Run {build_id}')}"
 
