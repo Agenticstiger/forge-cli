@@ -180,7 +180,7 @@ class TestSchemaYmlDialect:
         out = generate_schema_yml(contract, model_contracts=True, tests_key="data_tests")
         doc = yaml.safe_load(out["models/marts/schema.yml"].split("\n\n", 1)[1])
         model = doc["models"][0]
-        assert model["config"] == {"contract": {"enforced": True}}
+        assert model["config"]["contract"] == {"enforced": True}
         cid = next(col for col in model["columns"] if col["name"] == "customer_id")
         # not_null moved to a build-time constraint; unique stays a data test
         # under the modern key.

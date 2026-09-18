@@ -27,6 +27,7 @@ from ..base import (
     ValidationIssue,
 )
 from ..registry import register_engine
+from ._capabilities import LEGACY, DbtCapabilities
 from .catalogs_yml import generate_catalogs_yml
 from .models import generate_models
 from .profiles import generate_profiles
@@ -65,6 +66,7 @@ class DbtEngine(TransformationEngine):
         mesh_hub: Optional[str] = None,
         model_contracts: bool = False,
         tests_key: Optional[str] = None,
+        capabilities: Optional[DbtCapabilities] = None,
     ) -> GenerationResult:
         """Generate the dbt project files for one build.
 
@@ -74,7 +76,15 @@ class DbtEngine(TransformationEngine):
         strict-parsing Fusion engine). Resolved at the CLI layer from the
         detected dbt binary; threaded here as a plain string because
         ``engines/`` must not import ``build_runners`` (import tiering).
+
+        ``capabilities`` says which of the v2-corrected YAML shapes the
+        target engine actually honours — see ``_capabilities``. It arrives
+        the same way and for the same tiering reason. ``None`` means "we
+        could not tell", which resolves to the legacy shapes: those parse on
+        every dbt 1.x, and a consumer really running v2 has a v2 binary on
+        PATH for the detector to find.
         """
+        caps = capabilities if capabilities is not None else LEGACY
         files: GenerationResult = {}
 
         # dbt_project.yml
@@ -96,6 +106,7 @@ class DbtEngine(TransformationEngine):
             schema_context=schema_context,
             workspace_root=workspace_root,
             tests_key=tests_key,
+            capabilities=caps,
         )
         if sources_content:
             files["models/sources.yml"] = sources_content
@@ -138,6 +149,7 @@ class DbtEngine(TransformationEngine):
                 model_contracts=model_contracts,
                 adapter=adapter,
                 tests_key=tests_key,
+                capabilities=caps,
             )
             files.update(schema_files)
         elif mesh_hub:

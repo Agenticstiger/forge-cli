@@ -17,6 +17,8 @@
 import json
 
 import pytest
+import copy
+
 import yaml
 from hypothesis import given
 from hypothesis import strategies as st
@@ -215,11 +217,40 @@ class TestSources:
         content = generate_sources(minimal_contract, workspace_root=tmp_path)
         data = yaml.safe_load(content)
         src = data["sources"][0]
-        assert "env_var('SNOWFLAKE_DATABASE')" in src["database"]
-        assert "env_var('SNOWFLAKE_STAGE_SCHEMA'" in src["schema"]
-        # identifier gets the uppercase fallback.
+        # The fallback must not assume Snowflake, and must not emit an
+        # env_var without a default: `{{ env_var('SNOWFLAKE_DATABASE') }}`
+        # is a HARD parse failure when unset, so any contract with an
+        # unresolvable upstream produced a dbt project that would not
+        # parse on ANY engine, v1 included. It now terminates in
+        # target.database, which dbt always resolves from the profile.
+        assert "target.database" in src["database"]
+        assert "SNOWFLAKE" not in src["database"]
+        assert "target.schema" in src["schema"]
+        assert "SNOWFLAKE" not in src["schema"]
+        # Only Snowflake upper-cases unquoted identifiers. This fixture is
+        # `platform: local`, where upper-casing breaks the reference -- DuckDB
+        # and BigQuery are case-sensitive.
         identifiers = {t.get("identifier") for t in src["tables"]}
-        assert "ORDERS" in identifiers or "CUSTOMERS" in identifiers
+        assert not any(i and i.isupper() for i in identifiers), identifiers
+
+    def test_fallback_is_platform_aware(self, minimal_contract, tmp_path, monkeypatch):
+        """A Snowflake contract still gets Snowflake overrides and casing.
+
+        The fallback used to hardcode Snowflake for every platform; making it
+        platform-aware must not lose the Snowflake behaviour it was right about.
+        """
+        monkeypatch.delenv("FLUID_UPSTREAM_CONTRACTS", raising=False)
+        contract = copy.deepcopy(minimal_contract)
+        contract["builds"][0]["execution"]["runtime"]["platform"] = "snowflake"
+        content = generate_sources(contract, workspace_root=tmp_path)
+        src = yaml.safe_load(content)["sources"][0]
+        assert "SNOWFLAKE_DATABASE" in src["database"]
+        assert "SNOWFLAKE_STAGE_SCHEMA" in src["schema"]
+        # ...and it still terminates in target.*, so an unset env var cannot
+        # turn into "Env var required but not provided" at parse time.
+        assert "target.database" in src["database"]
+        identifiers = {t.get("identifier") for t in src["tables"]}
+        assert any(i and i.isupper() for i in identifiers), identifiers
 
     def test_resolves_upstream_snowflake_binding(self, minimal_contract, tmp_path, monkeypatch):
         """When an upstream contract is found, sources.yml uses its real binding."""

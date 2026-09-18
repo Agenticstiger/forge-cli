@@ -320,7 +320,12 @@ def load_dbt_schema_models(
                 source = yml.name
             models[str(name)] = {
                 "columns": columns,
-                "access": model.get("access"),
+                # dbt accepts ``access`` at the model level (legacy) or under
+                # ``config:`` (required by dbt v2, and what forge emits now).
+                # Reading only the legacy spot made this silently return None
+                # for every modern project, which disabled the
+                # public-model-not-in-exposes drift check below.
+                "access": model.get("access") or (model.get("config") or {}).get("access"),
                 "source": source,
             }
     return models

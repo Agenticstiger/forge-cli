@@ -1096,7 +1096,11 @@ def _build_consumes(
 
 
 def _source_freshness(src: Dict[str, Any]) -> Optional[str]:
-    freshness = src.get("freshness") or {}
+    # dbt accepts ``freshness`` on the table (legacy) or under ``config:``
+    # (required by dbt v2, and what forge emits on engines that honour it).
+    # Reading only the legacy spot silently dropped the freshness promise
+    # when importing any modern project, including forge's own output.
+    freshness = src.get("freshness") or (src.get("config") or {}).get("freshness") or {}
     for key in ("error_after", "warn_after"):
         spec = freshness.get(key) or {}
         count = spec.get("count")

@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
@@ -51,6 +51,17 @@ _logger = logging.getLogger(__name__)
 
 # Adapters that compute source freshness from warehouse metadata tables and so
 # do NOT require a ``loaded_at_field`` (dbt >= 1.7). Mapped from the contract's
+#: Per-platform override env var for an unresolved upstream's database and
+#: schema. Absent platforms fall straight through to ``target.*``.
+_PLATFORM_SOURCE_ENV_VARS = {
+    "snowflake": ("SNOWFLAKE_DATABASE", "SNOWFLAKE_STAGE_SCHEMA"),
+    "bigquery": ("GCP_PROJECT", "BIGQUERY_DATASET"),
+    "gcp": ("GCP_PROJECT", "BIGQUERY_DATASET"),
+    "redshift": ("REDSHIFT_DATABASE", "REDSHIFT_SCHEMA"),
+    "athena": ("ATHENA_DATABASE", "ATHENA_SCHEMA"),
+    "aws": ("ATHENA_DATABASE", "ATHENA_SCHEMA"),
+}
+
 # ``binding.platform`` enum. Everything else (duckdb/local, postgres, kafka …)
 # needs an explicit ``loaded_at_field``; when none is derivable we omit the
 # whole ``freshness:`` block rather than emit one dbt would error on.
@@ -81,12 +92,93 @@ _FLUID_ENV_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _SHELL_ENV_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 
 
+if TYPE_CHECKING:  # pragma: no cover
+    from ._capabilities import DbtCapabilities
+
+
+def _put_freshness(
+    table_entry: Dict[str, Any],
+    capabilities: Optional["DbtCapabilities"],
+    *,
+    loaded_at_field: Optional[str] = None,
+    freshness: Any = None,
+) -> None:
+    """Attach freshness to a source table in the shape the engine honours.
+
+    dbt v2 rejects the top-level spelling (dbt1060 UnusedConfigKey) and the
+    authoritative v2 spec carries ``freshness``/``loaded_at_field`` on
+    ``TablesConfig``, not on the table itself. But the ``config:`` placement
+    is NOT safe to emit unconditionally: measured against real engines,
+
+        1.8.10   source skipped entirely
+        1.9.11   "loaded_at_field must be specified" -- config never read
+        1.10.0   same; parses clean, freshness quietly not honoured
+        1.10.5+  honoured
+
+    Below the floor the value lands in the manifest but ``dbt source
+    freshness`` never reads it, so emitting the modern shape everywhere
+    would silently drop the contract's freshness promise rather than fail.
+    """
+    modern = bool(capabilities and capabilities.config_scoped_source_freshness)
+    target = table_entry.setdefault("config", {}) if modern else table_entry
+    if loaded_at_field:
+        target["loaded_at_field"] = loaded_at_field
+    if freshness is not None:
+        target["freshness"] = freshness
+
+
+def _unresolved_upstream_placeholders(
+    platform: Optional[str], expose_id: Optional[str]
+) -> Dict[str, Optional[str]]:
+    """Placeholders for an upstream we could not resolve.
+
+    Two things this must not do, both of which it used to:
+
+    1. Assume Snowflake. It emitted ``SNOWFLAKE_DATABASE`` /
+       ``SNOWFLAKE_STAGE_SCHEMA`` for every platform, so a ``platform: local``
+       contract got Snowflake env vars.
+    2. Emit an env_var with no default. ``{{ env_var('SNOWFLAKE_DATABASE') }}``
+       is a HARD parse failure when unset -- "Env var required but not
+       provided" -- so any contract with an unresolvable upstream produced a
+       dbt project that would not parse on any engine, v1 included.
+
+    Both are fixed by terminating in ``target.database`` / ``target.schema``,
+    which dbt always resolves from the active profile, with a platform-
+    appropriate env var in front of it as the override.
+    """
+    env_db, env_schema = _PLATFORM_SOURCE_ENV_VARS.get((platform or "").lower(), (None, None))
+    db = (
+        "{{ env_var('FLUID_SOURCE_DATABASE', env_var('%s', target.database)) }}" % env_db
+        if env_db
+        else "{{ env_var('FLUID_SOURCE_DATABASE', target.database) }}"
+    )
+    schema = (
+        "{{ env_var('FLUID_SOURCE_SCHEMA', env_var('%s', target.schema)) }}" % env_schema
+        if env_schema
+        else "{{ env_var('FLUID_SOURCE_SCHEMA', target.schema) }}"
+    )
+    return {
+        "database_expr": db,
+        "schema_expr": schema,
+        # Only Snowflake upper-cases unquoted identifiers; BigQuery and DuckDB
+        # are case-sensitive, so upper-casing there breaks the reference.
+        "identifier": (
+            expose_id.upper()
+            if expose_id and (platform or "").lower() == "snowflake"
+            else expose_id
+        ),
+        "loaded_at_field": None,
+        "loaded_at_field_unverified": None,
+    }
+
+
 def generate_sources(
     contract: Dict[str, Any],
     *,
     schema_context: Optional[Dict[str, Any]] = None,
     workspace_root: Optional[Path] = None,
     tests_key: Optional[str] = None,
+    capabilities: Optional["DbtCapabilities"] = None,
 ) -> Optional[str]:
     """Generate ``sources.yml`` content from contract consumes.
 
@@ -113,7 +205,8 @@ def generate_sources(
 
     # Whether the consumer's target adapter can compute freshness from
     # warehouse metadata (so a ``loaded_at_field`` is optional).
-    metadata_capable = _target_platform(contract) in _METADATA_FRESHNESS_PLATFORMS
+    platform = _target_platform(contract)
+    metadata_capable = platform in _METADATA_FRESHNESS_PLATFORMS
 
     # Group tables by (database_expr, schema_expr) so multi-schema lineage
     # lands in separate dbt source blocks.
@@ -121,7 +214,7 @@ def generate_sources(
     order: List[Tuple[str, str]] = []
 
     for port in canonical:
-        resolved, expose = _resolve_binding(port, upstream_index)
+        resolved, expose = _resolve_binding(port, upstream_index, platform=platform)
         key = (resolved["database_expr"], resolved["schema_expr"])
         if key not in grouped:
             grouped[key] = []
@@ -152,12 +245,13 @@ def generate_sources(
                 # silently dropping the contract's freshness promise.
                 loaded_at_field = resolved.get("loaded_at_field_unverified")
             if loaded_at_field:
-                table_entry["loaded_at_field"] = loaded_at_field
-                table_entry["freshness"] = freshness
+                _put_freshness(
+                    table_entry, capabilities, loaded_at_field=loaded_at_field, freshness=freshness
+                )
             elif metadata_capable:
                 # No cursor column, but the adapter reads freshness from
                 # warehouse metadata — emit the block without loaded_at_field.
-                table_entry["freshness"] = freshness
+                _put_freshness(table_entry, capabilities, freshness=freshness)
             # else: duckdb/local etc. with no derivable column — omit the block
             # entirely so ``dbt source freshness`` doesn't error.
 
@@ -244,6 +338,8 @@ def generate_sources_from_logical_model(logical_model: Mapping[str, Any]) -> Opt
 def _resolve_binding(
     port: Mapping[str, Any],
     upstream_index: Mapping[str, Mapping[str, Any]],
+    *,
+    platform: Optional[str] = None,
 ) -> Tuple[Dict[str, Optional[str]], Optional[Mapping[str, Any]]]:
     """Resolve a consume to ``({database_expr, schema_expr, identifier,
     loaded_at_field}, matched_upstream_expose)``.
@@ -290,13 +386,7 @@ def _resolve_binding(
         product_id,
         expose_id,
     )
-    return {
-        "database_expr": "{{ env_var('SNOWFLAKE_DATABASE') }}",
-        "schema_expr": "{{ env_var('SNOWFLAKE_STAGE_SCHEMA', 'PUBLIC') }}",
-        "identifier": expose_id.upper() if expose_id else None,
-        "loaded_at_field": None,
-        "loaded_at_field_unverified": None,
-    }, None
+    return _unresolved_upstream_placeholders(platform, expose_id), None
 
 
 def _identifier_from_location(

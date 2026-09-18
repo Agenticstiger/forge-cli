@@ -204,7 +204,10 @@ class TestOptInDefault:
         assert "contract" not in content
         assert "data_type" not in content
         assert "constraints" not in content
-        assert "config" not in content
+        # `config:` always carries `access:` now, so assert on the
+        # contract key specifically rather than the container.
+        assert "contract:" not in content
+        assert "enforced" not in content
 
     def test_no_flag_is_byte_identical_to_explicit_false(self):
         contract = _contract(
@@ -230,9 +233,11 @@ class TestContractEmission:
     def test_contract_enforced_on_expose_model(self):
         out = generate_schema_yml(_contract(), model_contracts=True, adapter="duckdb")
         model = _parsed_model(out)
-        assert model["config"] == {"contract": {"enforced": True}}
+        assert model["config"]["contract"] == {"enforced": True}
+        # access shares the dict -- the contract write must MERGE, not assign
+        assert model["config"]["access"] == "public"
         # Mesh annotations coexist untouched.
-        assert model["access"] == "public"
+        assert model["config"]["access"] == "public"
 
     def test_every_schema_column_gets_adapter_correct_data_type(self):
         out = generate_schema_yml(_contract(), model_contracts=True, adapter="bigquery")
@@ -314,7 +319,7 @@ class TestContractSkipRules:
         )
         out = generate_schema_yml(contract, model_contracts=True, adapter="duckdb")
         model = _parsed_model(out)
-        assert "config" not in model
+        assert "contract" not in (model.get("config") or {})
         assert all("data_type" not in c for c in model["columns"])
         assert all("constraints" not in c for c in model["columns"])
         # The orphan's declared check is still emitted as a test.
@@ -328,7 +333,7 @@ class TestContractSkipRules:
         )
         out = generate_schema_yml(contract, model_contracts=True, adapter="duckdb")
         model = _parsed_model(out)
-        assert "config" not in model
+        assert "contract" not in (model.get("config") or {})
 
     def test_unsupported_materialization_skips_contract(self):
         """Contracts are only enforced on constraint-supporting
@@ -339,7 +344,7 @@ class TestContractSkipRules:
         with patch("fluid_build.engines.dbt.models._layer_materialization", return_value="view"):
             out = generate_schema_yml(_contract(), model_contracts=True, adapter="duckdb")
         model = _parsed_model(out)
-        assert "config" not in model
+        assert "contract" not in (model.get("config") or {})
         assert all("constraints" not in c for c in model["columns"])
         # Fallback path: not_null intent stays as a data test.
         assert "not_null" in _column(model, "customer_id")["tests"]
@@ -355,7 +360,9 @@ class TestEnginePlumbing:
         contract = _contract(platform="snowflake")
         files = DbtEngine().generate(contract, contract["builds"][0], model_contracts=True)
         model = yaml.safe_load(files["models/marts/schema.yml"])["models"][0]
-        assert model["config"] == {"contract": {"enforced": True}}
+        assert model["config"]["contract"] == {"enforced": True}
+        # access shares the dict -- the contract write must MERGE, not assign
+        assert model["config"]["access"] == "public"
         assert _column(model, "total_orders")["data_type"] == "number"  # snowflake
 
     def test_generate_bigquery_platform_yields_bigquery_types(self):
