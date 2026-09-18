@@ -417,3 +417,51 @@ def test_benign_provider_action_dag_still_renders_operators():
     assert "BashOperator" in code
     assert "build_orders = BashOperator" in code
     assert isinstance(tree, ast.Module)
+
+
+# ---------------------------------------------------------------------------
+# The DAG *header* is a second surface: dag_id, description, schedule, kind and
+# domain are all contract-derived and land in `DAG(...)` kwargs and a
+# triple-quoted docstring.
+# ---------------------------------------------------------------------------
+
+
+def _dag_from_contract(**contract_overrides):
+    from fluid_build.runtimes.airflow_provider_actions import AirflowDAGGenerator
+
+    contract = {
+        "id": "test.product.v1",
+        "kind": "DataProduct",
+        "fluidVersion": "0.7.5",
+        "providerActions": [
+            {"actionId": "a1", "action": "registerSchema", "params": {"schemaName": "s"}}
+        ],
+    }
+    contract.update(contract_overrides)
+    return AirflowDAGGenerator().generate_dag(contract)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"id": POC_SQUOTE},
+        {"description": POC_SQL},
+        {"description": POC_SQUOTE},
+        {"orchestration": {"schedule": POC_SQUOTE}},
+        {"kind": POC_SQUOTE},
+        {"domain": POC_SQUOTE},
+        {"name": POC_SQL},
+    ],
+)
+def test_dag_header_is_injection_safe(overrides):
+    assert_inert(_dag_from_contract(**overrides))
+
+
+def test_empty_dag_header_is_injection_safe():
+    """The no-actions placeholder DAG renders dag_id/schedule too."""
+    from fluid_build.runtimes.airflow_provider_actions import AirflowDAGGenerator
+
+    code = AirflowDAGGenerator().generate_dag(
+        {"id": POC_SQUOTE, "kind": "DataProduct", "fluidVersion": "0.7.5"}
+    )
+    assert_inert(code)

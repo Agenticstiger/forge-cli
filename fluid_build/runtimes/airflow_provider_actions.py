@@ -168,15 +168,25 @@ class AirflowDAGGenerator:
         # worth resolving dynamically, because the hardcoded "0.7.0" stamped
         # every version-less contract with a schema version five releases old.
         fluid_version = contract.get("fluidVersion") or FluidSchemaManager.latest_bundled_version()
+        kind = str(contract.get("kind", "DataProduct")).lower()
+
+        # The header is the second injection surface: every field below comes
+        # from the contract. Docstring fields route through
+        # ``escape_for_docstring`` (they must not be able to close the ``"""``
+        # delimiter) and every ``DAG(...)`` kwarg through ``py_str_literal``.
+        d_name = escape_for_docstring(name)
+        d_version = escape_for_docstring(fluid_version)
+        d_domain = escape_for_docstring(domain)
+        d_description = escape_for_docstring(description)
 
         return f'''"""
-Airflow DAG for FLUID Data Product: {name}
+Airflow DAG for FLUID Data Product: {d_name}
 
-Auto-generated from FLUID contract v{fluid_version}
+Auto-generated from FLUID contract v{d_version}
 Generated at: {datetime.now().isoformat()}
 
-Domain: {domain}
-Description: {description}
+Domain: {d_domain}
+Description: {d_description}
 """
 from airflow import DAG
 from airflow.operators.bash import BashOperator
@@ -196,12 +206,12 @@ default_args = {{
 
 # DAG definition
 dag = DAG(
-    dag_id="{dag_id}",
-    description="""{description}""",
-    schedule_interval="{schedule}",
+    dag_id={py_str_literal(dag_id)},
+    description={py_str_literal(description)},
+    schedule_interval={py_str_literal(schedule)},
     start_date=days_ago(1),
     catchup=False,
-    tags=["fluid", "data-product", "{contract.get("kind", "DataProduct").lower()}", "{domain}"],
+    tags=["fluid", "data-product", {py_str_literal(kind)}, {py_str_literal(domain)}],
     default_args=default_args
 )'''
 
@@ -340,8 +350,8 @@ from airflow.operators.bash import BashOperator
 from airflow.utils.dates import days_ago
 
 dag = DAG(
-    dag_id="{dag_id}",
-    schedule_interval="{schedule}",
+    dag_id={py_str_literal(dag_id)},
+    schedule_interval={py_str_literal(schedule)},
     start_date=days_ago(1),
     catchup=False,
     tags=["fluid", "placeholder"]
