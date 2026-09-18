@@ -510,7 +510,7 @@ class BasePipelineTemplate:
 
         * a short shell body that exercises ``fluid`` 's own security
           surface (``fluid policy-check``,
-          ``fluid policy-apply``, ``fluid audit --compliance``), and
+          ``fluid policy-apply``, ``fluid policy-check --format json``), and
         * the canonical step name + comment-banner with the keywords
           (``security scan``, ``vulnerability``, ``policy``, ``audit``,
           ``osv-scanner``, ``sast``) so CI assertions and operator search
