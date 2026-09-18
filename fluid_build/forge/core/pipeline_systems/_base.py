@@ -373,7 +373,15 @@ class BasePipelineTemplate:
             "contract_test": "fluid contract-tests ${CONTRACT:-contract.fluid.yaml}",
             "generate_transformation": "fluid generate speed-transformation",
             "generate_schedule": "fluid generate schedule",
-            "visualize": "fluid viz-plan ${PLAN:-plan.json} --out pipeline-viz.html && fluid viz-graph --out dependency-graph.png",
+            # ``PLAN`` must default to where the ``plan`` command above
+            # actually writes (runtime/plan.json), and ``viz-graph`` defaults
+            # to ``--format svg`` -- without an explicit png it writes SVG
+            # bytes into a .png.
+            "visualize": (
+                "fluid viz-plan ${PLAN:-runtime/plan.json} --out pipeline-viz.html "
+                "&& fluid viz-graph ${CONTRACT:-contract.fluid.yaml} "
+                "--format png --out dependency-graph.png"
+            ),
             # Canonical key: ``publish_odps`` emits the LF/ODPI ODPS v4.1
             # JSON via the (non-deprecated) ``fluid generate standard
             # --format odps-v4.1`` path. The ``publish_opds`` alias below
@@ -531,6 +539,10 @@ class BasePipelineTemplate:
         # ``|| true`` once the binary is on the runner.
         body = (
             "set -eu\n"
+            # Both outputs below land in runtime/, which nothing guarantees
+            # exists at this stage; `|| true` would otherwise swallow the
+            # redirect failure and leave the artifact upload empty.
+            "mkdir -p runtime\n"
             "# FLUID security scan + compliance audit — advanced/enterprise tier.\n"
             "# Surfaces: policy violations (via fluid policy-check), policy\n"
             "# binding dry-run (via fluid policy-apply --mode check), and an\n"
@@ -550,10 +562,10 @@ class BasePipelineTemplate:
         )
         comment_lines = [
             "Security + compliance audit (advanced/enterprise tier).",
-            "Runs SAST-style fluid validate, policy enforcement dry-run,",
-            "compliance audit + SBOM, and an optional OSV-Scanner",
-            "vulnerability scan. Any SCA scanner can replace it without",
-            "breaking the rest of the stage.",
+            "Runs fluid policy-check --strict, a policy-binding dry-run via",
+            "fluid policy-apply --mode check, a JSON compliance report, and",
+            "an optional OSV-Scanner vulnerability scan. Any SCA scanner can",
+            "replace it without breaking the rest of the stage.",
         ]
         return {
             "name": "Security and Compliance Audit",
