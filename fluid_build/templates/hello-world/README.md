@@ -28,10 +28,10 @@ cd my-first-project
 fluid validate
 
 # Run locally (uses DuckDB)
-fluid apply --local
+fluid apply contract.fluid.yaml --yes
 
 # Query the results
-fluid query "SELECT * FROM hello_message"
+python3 -c "import duckdb; print(duckdb.sql(\"SELECT * FROM 'output/hello_message.parquet'\"))"
 ```
 
 ## Expected Output
@@ -161,14 +161,14 @@ fluid validate --verbose
 ```bash
 # DuckDB is embedded - no setup needed!
 # If you see this error, try:
-fluid apply --local --clean  # Fresh start
+rm -rf output/ && fluid apply contract.fluid.yaml --yes  # Fresh start
 ```
 
 ## Success Criteria
 
 ✅ You can create a project with `fluid init`  
 ✅ Contract validates without errors  
-✅ `fluid apply --local` runs successfully  
+✅ `fluid apply contract.fluid.yaml --yes` runs successfully  
 ✅ You can query the `hello_message` table  
 ✅ You understand the three main sections of a contract  
 

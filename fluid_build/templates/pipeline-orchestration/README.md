@@ -23,7 +23,7 @@ fluid init my-orchestration --template pipeline-orchestration
 cd my-orchestration
 
 # Generate DAG
-fluid generate-dag --output dags/
+fluid generate schedule --scheduler airflow
 
 # Start Airflow
 docker-compose up -d
@@ -297,7 +297,7 @@ sla_minutes: 120  # Increase if needed
 **Solution**: Validate syntax
 ```bash
 # Check for errors
-fluid generate-dag --validate
+fluid generate schedule --scheduler airflow
 
 # View Airflow logs
 docker logs airflow-scheduler

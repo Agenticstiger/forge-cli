@@ -24,8 +24,8 @@ RAW DATA → BRONZE → SILVER → GOLD → VIEWS
 ```bash
 fluid init my-analytics --template multiple-outputs
 cd my-analytics
-fluid apply --local
-fluid query "SELECT * FROM conversion_funnel"
+fluid apply contract.fluid.yaml --yes
+python3 -c "import duckdb; print(duckdb.sql(\"SELECT * FROM 'output/conversion_funnel.parquet'\"))"
 ```
 
 ## 10 Outputs Created

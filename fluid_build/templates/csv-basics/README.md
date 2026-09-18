@@ -32,10 +32,10 @@ cat data/customers.csv | head -5
 fluid validate
 
 # Run locally
-fluid apply --local
+fluid apply contract.fluid.yaml --yes
 
 # Query the results
-fluid query "SELECT * FROM customers_clean ORDER BY total_purchases DESC LIMIT 5"
+python3 -c "import duckdb; print(duckdb.sql(\"SELECT * FROM 'output/customers_clean.parquet' ORDER BY total_purchases DESC LIMIT 5\"))"
 ```
 
 ## Sample Data Included
@@ -51,7 +51,7 @@ id,name,email,signup_date,status,total_purchases,last_purchase_date
 
 ## Expected Output
 
-After running `fluid apply --local`, you'll get a `customers_clean` table:
+After running `fluid apply contract.fluid.yaml --yes`, you'll get a `customers_clean` table:
 
 ```
 ┌─────────────┬─────────────────┬───────────────────────────┬──────────────┬─────────────────┬──────────────────┐

@@ -18,8 +18,8 @@ Master incremental data processing with watermark tracking, merge strategies, an
 ```bash
 fluid init my-incremental --template incremental-processing
 cd my-incremental
-fluid apply --local  # First run: full load
-fluid apply --local  # Subsequent runs: incremental
+fluid apply contract.fluid.yaml --yes  # First run: full load
+fluid apply contract.fluid.yaml --yes  # Subsequent runs: incremental
 ```
 
 ## How It Works
@@ -110,12 +110,12 @@ outputs:
 
 **Full Refresh** (first run or manual):
 ```bash
-fluid apply --local --full-refresh
+fluid apply contract.fluid.yaml --yes
 ```
 
 **Incremental** (default after first run):
 ```bash
-fluid apply --local  # Processes only new data
+fluid apply contract.fluid.yaml --yes  # Processes only new data
 ```
 
 ## Performance Benefits

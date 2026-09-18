@@ -55,20 +55,20 @@ head data/interactions.csv
 fluid validate
 
 # Execute pipeline locally
-fluid apply --local
+fluid apply contract.fluid.yaml --yes
 
 # Query results
-fluid query "SELECT * FROM customer_360_rfm ORDER BY customer_lifetime_value DESC LIMIT 5"
+python3 -c "import duckdb; print(duckdb.sql(\"SELECT * FROM 'output/customer_360_rfm.parquet' ORDER BY customer_lifetime_value DESC LIMIT 5\"))"
 ```
 
 ### 4. Generate Airflow DAG
 
 ```bash
 # Generate DAG from contract
-fluid generate-dag --output dags/
+fluid generate schedule --scheduler airflow
 
 # Start local Airflow (requires Docker)
-fluid airflow start
+# (start your own Airflow; forge only generates the DAG)
 
 # Access Airflow UI at http://localhost:8080
 # Username: admin, Password: admin
@@ -293,11 +293,11 @@ orchestration:
 export BIGQUERY_PROJECT="my-project"
 export BIGQUERY_DATASET="customer_analytics"
 
-# Deploy contract
-fluid deploy --target bigquery --project ${BIGQUERY_PROJECT}
+# Deploy contract (--provider selects the platform; --env is the overlay)
+fluid apply contract.fluid.yaml --provider gcp --env prod --yes
 
 # Generate and deploy DAG
-fluid generate-dag --output ~/airflow/dags/
+fluid generate schedule --scheduler airflow
 ```
 
 ### Option 2: Deploy to Snowflake
@@ -308,17 +308,16 @@ export SNOWFLAKE_ACCOUNT="abc12345"
 export SNOWFLAKE_DATABASE="ANALYTICS"
 export SNOWFLAKE_SCHEMA="CUSTOMER_360"
 
-# Deploy
-fluid deploy --target snowflake \
-  --account ${SNOWFLAKE_ACCOUNT} \
-  --database ${SNOWFLAKE_DATABASE}
+# Deploy. Account and database come from `fluid auth login snowflake`
+# and the contract's binding -- they are not `fluid apply` flags.
+fluid apply contract.fluid.yaml --provider snowflake --env prod --yes
 ```
 
 ### Option 3: Kubernetes with Airflow
 
 ```bash
 # Generate DAG
-fluid generate-dag --output ./dags/
+fluid generate schedule --scheduler airflow
 
 # Deploy to Kubernetes
 kubectl apply -f k8s/airflow-deployment.yaml
@@ -367,7 +366,7 @@ ls -la data/
 
 **Solution**: Check date calculations
 ```bash
-fluid query "SELECT MAX(order_date) FROM raw_orders"
+python3 -c "import duckdb; print(duckdb.sql(\"SELECT MAX(order_date) FROM 'output/raw_orders.parquet'\"))"
 # Ensure dates are recent relative to 'now'
 ```
 
@@ -386,9 +385,8 @@ docker exec airflow-scheduler ls /opt/airflow/dags/
 
 **Solution**: Run validations individually
 ```bash
-# Test each validation query
-fluid query --validation revenue_consistency
-fluid query --validation valid_rfm_scores
+# `fluid test` runs every rule in the contract; there is no per-rule selector.
+fluid test contract.fluid.yaml
 ```
 
 ## Success Criteria

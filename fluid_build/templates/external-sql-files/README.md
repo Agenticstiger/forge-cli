@@ -46,10 +46,10 @@ my-sales-analytics/
 fluid validate
 
 # Execute pipeline
-fluid apply --local
+fluid apply contract.fluid.yaml --yes
 
 # Query results
-fluid query "SELECT * FROM daily_sales_summary"
+python3 -c "import duckdb; print(duckdb.sql(\"SELECT * FROM 'output/daily_sales_summary.parquet'\"))"
 ```
 
 ## Expected Output
