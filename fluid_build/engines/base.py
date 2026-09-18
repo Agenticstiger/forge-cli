@@ -137,6 +137,35 @@ class TransformationEngine(ABC):
     #: Set to e.g. ``("gcp",)`` for GCP-only engines like Dataform.
     supported_platforms: Optional[Sequence[str]] = None
 
+    #: Whether :meth:`generate` turns the contract's ``consumes[]`` into a
+    #: read address in the emitted artifacts.
+    #:
+    #: ``consumes[]`` is the mesh edge: it is how a data product declares
+    #: which upstream products it is built from. Today only the dbt engine
+    #: acts on it (it emits ``models/sources.yml``); the others emit
+    #: artifacts that reference whatever the build's own SQL happens to
+    #: name, so a declared upstream is simply absent from the output and
+    #: generation still exits 0.
+    #:
+    #: That silence is the problem this flag exists to break. An engine
+    #: leaving it ``False`` gets a warning naming each unwired upstream,
+    #: so "the mesh edge was not wired" is visible at generate time rather
+    #: than discovered when the pipeline reads from the wrong place. Set
+    #: it ``True`` once an engine genuinely resolves ``consumes[]``.
+    #:
+    #: Prior art: dbt's adapter-capability system
+    #: (``dbt/adapters/capability.py`` -- ``Capability`` / ``CapabilitySupport``
+    #: / ``CapabilityDict``), which lets dbt-core ask an adapter whether it
+    #: supports a feature instead of assuming. Deliberately simplified here:
+    #: dbt's five-state ``Support`` enum (Unknown / Unsupported /
+    #: NotImplemented / Versioned / Full) plus ``first_version`` earns its
+    #: keep across many capabilities with version-dependent support, whereas
+    #: this is one capability that an engine either implements or does not.
+    #: A plain class attribute also keeps the existing shape of
+    #: ``supported_patterns`` / ``supported_platforms`` directly above.
+    #: If a second capability appears, adopt the dict.
+    wires_consumes: bool = False
+
     @abstractmethod
     def generate(
         self,

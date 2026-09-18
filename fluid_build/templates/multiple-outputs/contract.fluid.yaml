@@ -13,6 +13,7 @@ metadata:
     team: analytics-platform
     email: analytics@company.com
   layer: Gold
+  productType: CDP
 exposes:
 - exposeId: bronze_events
   title: 'Bronze: Raw Events'
