@@ -49,7 +49,7 @@ Every contract is delivered through an 11-stage pipeline. Each stage is a hard g
 | `replace` | auto-snapshot → `CREATE OR REPLACE TABLE` | — | **dropped**; backup retained |
 | `replace-and-build` | same as `replace` | `dbt run --full-refresh` | **dropped**; rebuilt |
 
-`--allow-data-loss` is required for `replace*` when `FLUID_ENV != dev` OR target has rows. `--no-verify-digest` is an emergency DR waiver for plan-binding checks (logged at WARNING level so audit trails catch it).
+`--allow-data-loss` is required for `replace*` when `FLUID_ENV != dev` OR target has rows. `--no-verify-plan-binding` is an emergency DR waiver for plan-binding checks (logged at WARNING level so audit trails catch it).
 
 ### Plan-Binding (Terraform-Style "Apply Consumes Exact Plan")
 
@@ -536,10 +536,36 @@ workspaces:
 ```
 
 `validate_federated_consumes` is wired into `cli/apply.py` as a
-stage-7 gate. Drift produces `CLIError(event="apply_consumes_drift",
-context={"kind": "upstream-mismatch", "violations": [...]})`. The
-`--no-verify-digest` flag is the DR escape hatch and logs at
-WARNING level so audit trails catch the override.
+stage-7 gate. It **warns; it does not abort**. Unlike plan-binding —
+which compares two artifacts forge produced itself, so a mismatch means
+tampering — this gate's verdict depends on someone else's registry being
+reachable and honest, and hard-failing would let another team's outage
+block production applies (making `--no-verify-federation` permanent).
+
+Findings are logged at WARNING under the event `apply_consumes_drift`
+with a JSON payload shaped like `PlanBindingError`'s, so one log-parser
+regex matches both gates:
+
+```json
+{"kind": "upstream-mismatch", "violations": [...], "first_violation": "...",
+ "counts_by_kind": {...}, "drift_count": 0, "unreachable_count": 0}
+```
+
+Each violation carries a `violation_kind`, which separates *the upstream
+really changed* from *we could not check it*:
+
+| kind | meaning |
+|---|---|
+| `drift` | pinned and live digests differ |
+| `unreachable` | the fetch failed — the pin was NOT verified |
+| `unpinned` | `upstreamWorkspace` set with no `upstreamDigest` |
+| `unknown-workspace` | not declared in `federation/upstreams.yaml` |
+| `not-wired` | no fetcher exists for that workspace `kind` |
+
+`--no-verify-federation` skips the gate entirely and logs at WARNING so
+audit trails catch the override. `FLUID_FEDERATION_TIMEOUT_SECONDS`
+(default 30s) bounds each git operation so an unresponsive upstream
+cannot hang an apply.
 
 ### Phase 2.6 — `from-source --source postgres|mysql|sqlite`
 

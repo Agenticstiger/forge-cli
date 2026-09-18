@@ -1875,8 +1875,15 @@ def run(args, logger: logging.Logger) -> int:
                 # Stable, machine-parseable payload mirroring
                 # PlanBindingError's contract so CI templates can match
                 # both gates with one regex.
-                drifted = [v for v in fed_violations if v.kind == "drift"]
-                unchecked = [v for v in fed_violations if v.kind == "unreachable"]
+                # Count by kind rather than picking two out of five:
+                # "unpinned", "unknown-workspace" and "not-wired" are
+                # violations too, and a summary that counts only drift
+                # and unreachability reports "0 drifted, 0 unreachable"
+                # while listing N findings.
+                counts: Dict[str, int] = {}
+                for v in fed_violations:
+                    counts[v.kind] = counts.get(v.kind, 0) + 1
+                breakdown = ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
                 payload = {
                     "kind": "upstream-mismatch",
                     "violations": [
@@ -1892,17 +1899,16 @@ def run(args, logger: logging.Logger) -> int:
                         for v in fed_violations
                     ],
                     "first_violation": fed_violations[0].reason,
-                    "drift_count": len(drifted),
-                    "unreachable_count": len(unchecked),
+                    "counts_by_kind": counts,
+                    "drift_count": counts.get("drift", 0),
+                    "unreachable_count": counts.get("unreachable", 0),
                 }
                 logger.warning(
-                    "apply_consumes_drift: %d federated consumes[] "
-                    "%s could not be confirmed in sync (%d drifted, %d "
-                    "unreachable). Applying anyway. Details: %s",
+                    "apply_consumes_drift: %d federated consumes[] %s could not "
+                    "be confirmed in sync (%s). Applying anyway. Details: %s",
                     len(fed_violations),
                     "entry" if len(fed_violations) == 1 else "entries",
-                    len(drifted),
-                    len(unchecked),
+                    breakdown,
                     json.dumps(payload, sort_keys=True),
                 )
                 for v in fed_violations:

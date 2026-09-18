@@ -54,6 +54,12 @@ from fluid_build.forge.federation import (
 
 pytestmark = pytest.mark.unit
 
+#: Resolve fixtures from the repo, not the process CWD -- these tests read
+#: source and schema files, and pytest is not always invoked from the root
+#: (an IDE runner, or `pytest <abs path>` from elsewhere, both break a bare
+#: relative path).
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 UPSTREAM_CONTRACT = {
     "fluidVersion": "0.7.6",
@@ -236,31 +242,126 @@ class TestUnreachableUpstreamIsARowNotAnAbort:
             ]
         }
 
-    def test_fetch_failure_becomes_an_unreachable_row(self, tmp_path: Path):
-        """A network error is reported, not raised, and is labelled
-        ``unreachable`` -- never silently conflated with a clean upstream."""
-        with patch(
-            "fluid_build.forge.federation.fetch_federated_digest",
-            side_effect=OSError("connection refused"),
-        ):
+    def test_a_real_outage_is_labelled_unreachable_not_not_wired(self, tmp_path: Path):
+        """Drive the REAL fetch path, stubbing only the HTTP transport.
+
+        This is the shape a live outage takes: all three backends return
+        None on a timeout / 404 / TLS error / auth reject / failed clone,
+        and `fetch_federated_digest` turns that None into an exception.
+        That exception used to be a bare NotImplementedError -- the same
+        one raised for a workspace kind with no fetcher at all -- so a
+        partner mesh being DOWN was reported to operators as "fetcher for
+        kind='http_registry' not yet wired": a claim about missing FLUID
+        code, sending them to read our source instead of checking their
+        own registry.
+
+        Patching `fetch_federated_digest` itself (as an earlier version of
+        this test did) hides exactly that bug, because it injects an
+        exception the production code never raises. So: stub the
+        transport, not the fetcher.
+        """
+        manifest = FederationManifest(
+            workspaces=[
+                FederatedWorkspace(
+                    id="partner", kind="http_registry", endpoint="https://partner.example.invalid"
+                )
+            ]
+        )
+        contract = {
+            "consumes": [
+                {
+                    "productId": "p.orders",
+                    "exposeId": "orders",
+                    "upstreamWorkspace": "partner",
+                    "upstreamDigest": "sha256:" + "a" * 64,
+                }
+            ]
+        }
+
+        with patch("fluid_build.forge.federation._federation_http_get", return_value=None):
             violations = validate_federated_consumes(
-                self._contract(), workspace_root=tmp_path, manifest=self._manifest()
+                contract, workspace_root=tmp_path, manifest=manifest
             )
 
-        assert len(violations) == 2
-        assert {v.kind for v in violations} == {"unreachable"}
-        assert all(v.actual_digest == "" for v in violations)
-        # The reason must not imply the upstream was checked and found equal.
-        assert all("NOT checked" in v.reason for v in violations)
+        assert len(violations) == 1
+        assert violations[0].kind == "unreachable", (
+            "a down registry must read as unreachable, not as unimplemented "
+            f"FLUID code; got kind={violations[0].kind!r}"
+        )
+        assert "NOT checked" in violations[0].reason
+        assert "not yet wired" not in violations[0].reason
+
+    def test_an_unrecognised_workspace_kind_is_still_not_wired(self, tmp_path: Path):
+        """The converse: a kind with genuinely no fetcher must keep saying
+        so, or the new label would swallow a real gap in our own code."""
+        manifest = FederationManifest(
+            workspaces=[
+                FederatedWorkspace(
+                    id="odd", kind="carrier_pigeon", endpoint="https://p.example.invalid"
+                )
+            ]
+        )
+        contract = {
+            "consumes": [
+                {
+                    "productId": "p.orders",
+                    "exposeId": "orders",
+                    "upstreamWorkspace": "odd",
+                    "upstreamDigest": "sha256:" + "a" * 64,
+                }
+            ]
+        }
+        violations = validate_federated_consumes(
+            contract, workspace_root=tmp_path, manifest=manifest
+        )
+        assert len(violations) == 1
+        assert violations[0].kind == "not-wired"
+
+    def test_the_unreachable_reason_does_not_echo_the_exception_body(self, tmp_path: Path):
+        """Only the exception CLASS goes into the reason and the log.
+
+        This module deliberately never logs git error bodies, because in
+        HTTPS mode they echo the clone URL with the manifest's auth token
+        embedded. The violation reason is operator-facing text that lands
+        in CI logs, so it follows the same rule.
+        """
+        manifest = FederationManifest(
+            workspaces=[
+                FederatedWorkspace(
+                    id="partner", kind="http_registry", endpoint="https://partner.example.invalid"
+                )
+            ]
+        )
+        contract = {
+            "consumes": [
+                {
+                    "productId": "p.orders",
+                    "exposeId": "orders",
+                    "upstreamWorkspace": "partner",
+                    "upstreamDigest": "sha256:" + "a" * 64,
+                }
+            ]
+        }
+        secret = "ghp_supersecrettoken"
+        with patch(
+            "fluid_build.forge.federation._federation_http_get",
+            side_effect=RuntimeError(f"failed cloning https://{secret}@host/repo"),
+        ):
+            violations = validate_federated_consumes(
+                contract, workspace_root=tmp_path, manifest=manifest
+            )
+
+        assert len(violations) == 1
+        assert secret not in violations[0].reason
 
     def test_one_unreachable_upstream_does_not_mask_drift_in_another(self, tmp_path: Path):
         """The regression this guards.
 
         The fetch call sat outside any per-row handler, so the first
-        network error propagated out of the whole walk -- discarding
-        violations already collected for other upstreams and handing the
-        caller a bare exception instead. One team's registry going down
-        would hide a genuine drifted pin somewhere else entirely.
+        failure propagated out of the whole walk -- discarding violations
+        already collected for other upstreams and handing the caller a
+        bare exception instead. One team's registry going down would hide
+        a genuine drifted pin somewhere else entirely.
         """
 
         def _fake(workspace, product_id, version="1", **kwargs):
@@ -295,9 +396,16 @@ class TestUnreachableUpstreamIsARowNotAnAbort:
 class TestFetchTimeoutIsBounded:
     """``fluid apply`` reaches another mesh; it must not be able to hang there."""
 
-    def test_git_timeout_defaults_to_thirty_seconds(self):
+    def test_git_timeout_defaults_to_thirty_seconds(self, monkeypatch):
+        """Pin the default with the env var explicitly cleared.
+
+        Without the delenv this asserts against whatever the developer
+        (or CI job) happens to export, so it fails for anyone who has
+        actually used the knob it documents.
+        """
         from fluid_build.forge.federation import _federation_git_timeout
 
+        monkeypatch.delenv("FLUID_FEDERATION_TIMEOUT_SECONDS", raising=False)
         assert _federation_git_timeout() == 30.0
 
     def test_git_timeout_is_env_overridable(self, monkeypatch):
@@ -314,7 +422,9 @@ class TestFetchTimeoutIsBounded:
         monkeypatch.setenv("FLUID_FEDERATION_TIMEOUT_SECONDS", "7")
         assert _federation_git_timeout() == 7.0
 
-    @pytest.mark.parametrize("bad", ["", "abc", "0", "-5", "nan-ish"])
+    @pytest.mark.parametrize(
+        "bad", ["", "abc", "0", "-5", "nan-ish", "inf", "nan", "-inf", "1e400"]
+    )
     def test_a_bad_override_falls_back_to_the_default(self, monkeypatch, bad: str):
         """A typo in the env var must not disable the bound it configures.
 
@@ -322,6 +432,12 @@ class TestFetchTimeoutIsBounded:
         ``subprocess.run(timeout=...)`` as a float() crash, or ``0``
         reaching it as "no timeout", would both turn a guard rail into
         the hang it exists to prevent.
+
+        ``inf`` and ``nan`` are the subtle pair: ``float()`` accepts both,
+        and a bare ``value <= 0`` check rejects neither (nan compares
+        False against everything, inf is positive). They then defeat the
+        bound in opposite directions -- ``timeout=inf`` never fires, and
+        ``timeout=nan`` makes subprocess raise before git starts.
         """
         from fluid_build.forge.federation import _federation_git_timeout
 
@@ -341,7 +457,7 @@ class TestFetchTimeoutIsBounded:
         """
         import ast
 
-        src = Path("fluid_build/forge/federation.py").read_text(encoding="utf-8")
+        src = (REPO_ROOT / "fluid_build" / "forge" / "federation.py").read_text(encoding="utf-8")
         untimed = []
         for node in ast.walk(ast.parse(src)):
             if not isinstance(node, ast.Call):
@@ -360,6 +476,32 @@ class TestFetchTimeoutIsBounded:
             f"line(s) {untimed} -- an unresponsive upstream would hang the apply"
         )
 
+    def test_the_gitpython_path_is_bounded_too(self):
+        """gitpython is tried BEFORE the shell-out, so bounding only the
+        fallback leaves the path that actually runs (wherever gitpython
+        is installed) unbounded -- while `fluid doctor` advertises the
+        env var as the cap. gitpython spells it ``kill_after_timeout``.
+        """
+        import ast
+
+        src = (REPO_ROOT / "fluid_build" / "forge" / "federation.py").read_text(encoding="utf-8")
+        untimed = []
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not isinstance(fn, ast.Attribute):
+                continue
+            if fn.attr not in {"clone_from", "fetch"}:
+                continue
+            if "kill_after_timeout" not in {k.arg for k in node.keywords}:
+                untimed.append((fn.attr, node.lineno))
+
+        assert not untimed, (
+            f"unbounded gitpython call(s) {untimed} -- gitpython is tried first, "
+            "so this is the path a hang would actually take"
+        )
+
 
 class TestSchemaPinsTheFederatedFields:
     """0.7.6 models the federated consume fields, and pins them together."""
@@ -367,7 +509,9 @@ class TestSchemaPinsTheFederatedFields:
     @staticmethod
     def _schema() -> dict:
         return json.loads(
-            Path("fluid_build/schemas/fluid-schema-0.7.6.json").read_text(encoding="utf-8")
+            (REPO_ROOT / "fluid_build" / "schemas" / "fluid-schema-0.7.6.json").read_text(
+                encoding="utf-8"
+            )
         )
 
     def test_dependent_required_is_enforceable_at_this_draft(self):
