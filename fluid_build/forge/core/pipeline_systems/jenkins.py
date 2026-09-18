@@ -621,7 +621,7 @@ pipeline {{
             // environment-block assignments as raw env vars — NOT
             // Groovy-ternary-concatenated into a single string. The
             // previous pattern set
-            //   APPLY_BUILD_FLAG = "--build " + params.APPLY_BUILD_ID
+            //   APPLY_BUILD_FLAG = "--mode amend-and-build --build-id " + params.APPLY_BUILD_ID
             // then expanded `${{APPLY_BUILD_FLAG}}` UNQUOTED in the sh
             // body, which IFS-word-splits on whitespace. A Jenkins user
             // with Build-With-Parameters permission could set
@@ -643,7 +643,7 @@ pipeline {{
             steps {{
                 sh '''{CD}set -eu
                     set -- runtime/plan.json --mode "$APPLY_MODE" --env "${{FLUID_ENV:-dev}}" --yes --ensure-opentofu --report runtime/apply-report.html
-                    if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then set -- "$@" --build "$APPLY_BUILD_ID_VAL"; fi
+                    if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then set -- "$@" --mode amend-and-build --build-id "$APPLY_BUILD_ID_VAL"; fi
                     if [ "${{ALLOW_DATA_LOSS:-false}}" = "true" ]; then set -- "$@" --allow-data-loss; fi
                     if [ "${{NO_VERIFY_DIGEST:-false}}" = "true" ]; then set -- "$@" --no-verify-plan-binding --no-verify-federation; fi
                     fluid apply "$@"'''

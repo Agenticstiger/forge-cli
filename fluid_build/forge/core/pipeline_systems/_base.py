@@ -327,8 +327,9 @@ class BasePipelineTemplate:
                 "--env ${FLUID_ENV:-dev}"
             ),
             "plan": "fluid plan ${CONTRACT:-contract.fluid.yaml} --out runtime/plan.json",
-            # --build is required for dbt hybrid-reference builds; the
-            # inline conditional keeps the template useful for both shapes.
+            # A build id needs `--mode amend-and-build` alongside
+            # `--build-id`: the id only FILTERS, it does not opt into running
+            # builds (`fluid apply --help`). The retired `--build` did both.
             # --ensure-opentofu lets a cloud apply provision a pinned,
             # SHA-256-verified `tofu` (no root/gpg) on a fresh runner; it is
             # idempotent (skips when tofu is present) and a no-op for
@@ -838,7 +839,8 @@ class BasePipelineTemplate:
                     '--env "${FLUID_ENV:-dev}" --yes --ensure-opentofu '
                     "--report runtime/apply-report.html; "
                     'if [ -n "${APPLY_BUILD_ID:-}" ]; then '
-                    'set -- "$@" --build "$APPLY_BUILD_ID"; fi; '
+                    'set -- "$@" --mode amend-and-build '
+                    '--build-id "$APPLY_BUILD_ID"; fi; '
                     'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]; then '
                     'set -- "$@" --allow-data-loss; fi; '
                     'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]; then '

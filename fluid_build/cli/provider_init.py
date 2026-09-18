@@ -46,14 +46,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Scaffold a new FLUID provider package",
         description="Generate a ready-to-develop provider package with tests, "
         "entry points, and SDK conformance harness.",
-        epilog=textwrap.dedent(
-            """\
+        epilog=textwrap.dedent("""\
             Examples:
               fluid provider-init databricks
               fluid provider-init azure --author "My Company" --description "Azure Synapse"
               fluid provider-init kafka --output-dir ~/projects
-        """
-        ),
+        """),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("name", help="Provider name (lowercase, e.g. 'databricks', 'azure')")
@@ -148,8 +146,7 @@ def _scaffold(root: Path, name: str, description: str, author: str) -> None:
 
 
 def _gen_pyproject(name: str, slug: str, pkg: str, desc: str, author: str, cls: str) -> str:
-    return textwrap.dedent(
-        f"""\
+    return textwrap.dedent(f"""\
         [build-system]
         requires = ["setuptools>=68.0"]
         build-backend = "setuptools.build_meta"
@@ -172,23 +169,19 @@ def _gen_pyproject(name: str, slug: str, pkg: str, desc: str, author: str, cls: 
 
         [tool.setuptools.packages.find]
         where = ["src"]
-    """
-    )
+    """)
 
 
 def _gen_init(cls: str) -> str:
-    return textwrap.dedent(
-        f"""\
+    return textwrap.dedent(f"""\
         from .provider import {cls}
 
         __all__ = ["{cls}"]
-    """
-    )
+    """)
 
 
 def _gen_provider(name: str, pkg: str, cls: str, desc: str, author: str) -> str:
-    return textwrap.dedent(
-        f"""\
+    return textwrap.dedent(f"""\
         \"\"\"
         {cls} — {desc}
         \"\"\"
@@ -279,13 +272,11 @@ def _gen_provider(name: str, pkg: str, cls: str, desc: str, author: str) -> str:
                     author="{author}",
                     tags=["{name}"],
                 )
-    """
-    )
+    """)
 
 
 def _gen_tests(name: str, pkg: str, cls: str) -> str:
-    return textwrap.dedent(
-        f"""\
+    return textwrap.dedent(f"""\
         \"\"\"Conformance tests for {cls}.\"\"\"
         import yaml
         from pathlib import Path
@@ -305,13 +296,11 @@ def _gen_tests(name: str, pkg: str, cls: str) -> str:
             provider_class = {cls}
             init_kwargs = {{"project": "test-project"}}
             sample_contracts = [_load_yaml("basic_contract.yaml")]
-    """
-    )
+    """)
 
 
 def _gen_contract_yaml(name: str) -> str:
-    return textwrap.dedent(
-        f"""\
+    return textwrap.dedent(f"""\
         fluidVersion: "{_latest_fluid_version()}"
         kind: DataProduct
         id: test.{name}_example
@@ -348,13 +337,11 @@ def _gen_contract_yaml(name: str) -> str:
                   required: true
                 - name: value
                   type: string
-    """
-    )
+    """)
 
 
 def _gen_readme(name: str, slug: str, cls: str, desc: str, author: str) -> str:
-    return textwrap.dedent(
-        f"""\
+    return textwrap.dedent(f"""\
         # fluid-provider-{slug}
 
         {desc}
@@ -393,5 +380,4 @@ def _gen_readme(name: str, slug: str, cls: str, desc: str, author: str) -> str:
         ## License
 
         See LICENSE file.
-    """
-    )
+    """)
