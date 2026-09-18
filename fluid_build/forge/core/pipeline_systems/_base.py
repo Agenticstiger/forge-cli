@@ -845,7 +845,7 @@ class BasePipelineTemplate:
                 command=(
                     "if [ -f dist/artifacts/policy/bindings.json ]; then "
                     "fluid policy-apply dist/artifacts/policy/bindings.json "
-                    '--mode enforce --env "${FLUID_ENV:-dev}"; '
+                    "--mode enforce; "
                     "fi"
                 ),
             ),
@@ -878,12 +878,10 @@ class BasePipelineTemplate:
                     'if [ -n "${PUBLISH_TARGETS:-}" ]; then '
                     'TARGETS=""; for t in $PUBLISH_TARGETS; do '
                     'TARGETS="$TARGETS --target $t"; done; '
-                    'fluid publish "${CONTRACT:-contract.fluid.yaml}" $TARGETS '
-                    '--env "${FLUID_ENV:-dev}"; '
+                    'fluid publish "${CONTRACT:-contract.fluid.yaml}" $TARGETS; '
                     "else "
                     'fluid publish "${CONTRACT:-contract.fluid.yaml}" '
-                    '--target "${CATALOG:-datamesh-manager}" '
-                    '--env "${FLUID_ENV:-dev}"; '
+                    '--target "${CATALOG:-datamesh-manager}"; '
                     "fi"
                 ),
             ),

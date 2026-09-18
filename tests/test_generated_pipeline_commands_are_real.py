@@ -46,8 +46,9 @@ from fluid_build.forge.core.pipeline_templates import (
     PipelineTemplateGenerator,
 )
 
-#: Keys whose values a CI runner executes as shell.
-_SHELL_KEYS = {"run", "script", "commands", "before_script", "after_script"}
+#: Keys whose values a CI runner executes as shell. CircleCI nests the real
+#: command a level deeper (``- run: {command: ...}``), hence ``command``.
+_SHELL_KEYS = {"run", "script", "commands", "before_script", "after_script", "command"}
 #: Shell operators that terminate one command.
 _SHELL_STOP = re.compile(r"&&|\|\||[;|\n]")
 #: ``${VAR}``, ``${VAR:-default}``, ``$VAR`` and ``${{ ci.expr }}``.
@@ -55,7 +56,13 @@ _SHELL_VAR = re.compile(r"\$\{\{[^}]*\}\}|\$\{[^}]*\}|\$[A-Za-z_]\w*")
 
 
 def _shell_snippets(node):
-    """Yield only the strings a CI runner actually executes."""
+    """Yield only the strings a CI runner actually executes.
+
+    Handles all three shapes in use: a plain string (GitHub ``run:``), a list
+    of strings (GitLab ``script:``), and a nested mapping (CircleCI
+    ``- run: {command: ...}``) -- the last of which an earlier version of this
+    scanner silently skipped, so CircleCI looked clean by not being read.
+    """
     if isinstance(node, dict):
         for key, value in node.items():
             if key in _SHELL_KEYS:
@@ -67,6 +74,12 @@ def _shell_snippets(node):
     elif isinstance(node, list):
         for item in node:
             yield from _shell_snippets(item)
+
+
+def _strip_groovy_comments(text: str) -> str:
+    """Remove ``/* ... */`` and ``// ...`` from Groovy source."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return "\n".join(re.sub(r"//.*$", "", line) for line in text.splitlines())
 
 
 def _fluid_invocations(snippet: str):
@@ -93,6 +106,12 @@ def _defect(command: str):
     if not argv:
         return None
 
+    # ``fluid schedule-sync "$@"`` is the tail of a `set -- "$@" --flag value`
+    # builder chain: its arguments are assembled by the surrounding shell, so a
+    # static "missing required argument" verdict here would be wrong. Unknown
+    # *flags* are still worth checking, so only the arity check is waived.
+    forwards_args = "$@" in command
+
     buffer = io.StringIO()
     try:
         with contextlib.redirect_stderr(buffer), contextlib.redirect_stdout(buffer):
@@ -106,6 +125,8 @@ def _defect(command: str):
         ):
             found = re.search(pattern, stderr)
             if found:
+                if kind == "missing required argument" and forwards_args:
+                    return None
                 return kind, found.group(1).strip()
         return None
     # ``parse_known_args`` returns unknown *positionals* too; only a stray
@@ -115,29 +136,54 @@ def _defect(command: str):
 
 
 def _generated_documents(provider, complexity):
+    """Yield ``(name, snippets)`` for every generated file.
+
+    YAML files are parsed so only true executable positions are read. Files
+    that are not YAML -- Jenkins emits a Groovy ``Jenkinsfile`` -- fall back to
+    raw text, which over-reads slightly but is far better than the previous
+    behaviour of skipping them entirely and reporting the system as clean.
+    """
     config = PipelineConfig(provider=provider, complexity=complexity)
     files = PipelineTemplateGenerator().generate_pipeline(config)
     for name, content in files.items():
-        if not name.endswith((".yml", ".yaml")):
-            continue
-        try:
-            document = yaml.safe_load(str(content))
-        except yaml.YAMLError:
-            continue  # templated YAML that is not valid standalone
-        if document is not None:
-            yield name, document
+        text = str(content)
+        if name.endswith((".yml", ".yaml")):
+            try:
+                # ``safe_load_all``: Tekton emits a multi-document stream, on
+                # which ``safe_load`` raises and an earlier version of this
+                # scanner skipped the whole file -- reporting the system clean
+                # because it had read nothing.
+                documents = [d for d in yaml.safe_load_all(text) if d is not None]
+            except yaml.YAMLError:
+                continue  # templated YAML that is not valid standalone
+            snippets = []
+            for document in documents:
+                snippets.extend(_shell_snippets(document))
+            if snippets:
+                yield name, snippets
+        elif "fluid " in text:
+            # Jenkins emits a Groovy Jenkinsfile, which is not YAML. Strip its
+            # comments so documentation prose mentioning a command is not read
+            # as a command.
+            yield name, _strip_groovy_comments(text).splitlines()
 
 
 @pytest.mark.parametrize("provider", list(PipelineProvider), ids=lambda p: p.name)
 @pytest.mark.parametrize("complexity", list(PipelineComplexity), ids=lambda c: c.name)
 def test_generated_pipeline_runs_only_real_fluid_commands(provider, complexity):
     defects = []
-    for name, document in _generated_documents(provider, complexity):
-        for snippet in _shell_snippets(document):
+    seen = 0
+    for name, snippets in _generated_documents(provider, complexity):
+        for snippet in snippets:
             for command in _fluid_invocations(snippet):
+                seen += 1
                 found = _defect(command)
                 if found:
                     defects.append(f"{name}: `{command}` -> {found[0]}: {found[1]}")
+    # Coverage guard: a green result must mean "read and checked", never
+    # "read nothing". A structural change to a template that moved commands
+    # out of the keys above would otherwise silently zero out this system.
+    assert seen, f"{provider.name}/{complexity.name}: no fluid commands found to check"
     assert not defects, "generated pipeline would fail at runtime:\n  " + "\n  ".join(defects)
 
 
