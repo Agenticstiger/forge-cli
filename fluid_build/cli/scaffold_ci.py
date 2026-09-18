@@ -96,8 +96,8 @@ apply:
   stage: apply
   when: manual
   script:
-    # --build is required for dbt hybrid-reference builds; harmless otherwise.
-    - if [ -n "$BUILD_ID" ]; then fluid apply $CONTRACT --build $BUILD_ID --yes; else fluid apply runtime/plan.json --yes; fi
+    # --mode amend-and-build opts into running builds; --build-id filters to one.
+    - if [ -n "$BUILD_ID" ]; then fluid apply $CONTRACT --mode amend-and-build --build-id $BUILD_ID --yes; else fluid apply runtime/plan.json --yes; fi
 airflow_sync:
   stage: deploy
   rules:
@@ -197,7 +197,7 @@ jobs:
       - name: Apply contract
         run: |
           if [ -n "${{ vars.BUILD_ID }}" ]; then
-            fluid apply ${{ env.CONTRACT }} --build ${{ vars.BUILD_ID }} --yes
+            fluid apply ${{ env.CONTRACT }} --mode amend-and-build --build-id ${{ vars.BUILD_ID }} --yes
           else
             fluid apply runtime/plan.json --yes
           fi
@@ -343,10 +343,10 @@ pipeline {
                 ok 'Apply'
             }
             steps {
-                // --build is required for dbt hybrid-reference builds; harmless otherwise.
+                // --mode amend-and-build opts into running builds; --build-id filters to one.
                 sh '''
                     if [ -n "$BUILD_ID" ]; then
-                        fluid apply $CONTRACT --build $BUILD_ID --yes
+                        fluid apply $CONTRACT --mode amend-and-build --build-id $BUILD_ID --yes
                     else
                         fluid apply runtime/plan.json --yes
                     fi

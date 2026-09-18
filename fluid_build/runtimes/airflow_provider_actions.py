@@ -20,8 +20,99 @@ Supports all action types defined in FLUID 0.7.1 schema.
 """
 
 import logging
+import re
+import shlex
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+from ..providers.common.codegen_utils import (
+    escape_for_docstring,
+    py_str_literal,
+    sanitize_identifier,
+)
+
+
+def _safe_comment(value: Any) -> str:
+    """Collapse ``value`` to a single line for a generated ``#`` comment.
+
+    A ``#`` comment is terminated by a newline, so an embedded CR/LF in a
+    contract-supplied description would end the comment and put the
+    remainder of the value at module scope — executed when Airflow parses
+    the DAG. Collapsing whitespace is sufficient and keeps the comment
+    readable; the value is cosmetic, so it is not escaped further.
+    """
+    return " ".join(escape_for_docstring(value).split()) or "task"
+
+
+#: Every Jinja construct -- ``{{ }}``, ``{% %}``, ``{# #}`` -- needs a brace,
+#: so stripping braces is sufficient AND cannot be spliced back together.
+#:
+#: Matching the two-character delimiters instead would be wrong: ``re.sub``
+#: makes ONE left-to-right, non-overlapping pass, so removing an inner pair
+#: rejoins the survivors into a NEW delimiter -- ``{}}{`` -> ``{{`` and
+#: ``}{{}`` -> ``}}``. A payload built that way reaches the rendered shell
+#: with live Jinja, defeating the whole defence.
+#:
+#: Why this matters at all: ``bash_command`` is an Airflow ``template_field``,
+#: so Airflow re-renders it at TASK RUNTIME -- after this module's quoting is
+#: baked in. ``shlex.quote`` wraps a value in ``'...'`` but does nothing to
+#: ``{{ ... }}``, and Jinja string escapes synthesise a quote from a payload
+#: containing none: ``{{ "\x27" }}; echo OWNED; #`` renders to
+#: ``''; echo OWNED; #'`` and escapes the shell quoting.
+_JINJA_BRACES = re.compile(r"[{}]")
+
+
+def _sh(value: Any) -> str:
+    """Quote a *contract-supplied* value for embedding in ``bash_command``.
+
+    Two steps, and the order matters:
+
+    1. Strip braces, which removes every Jinja construct and cannot be
+       spliced back into one. Airflow re-renders ``bash_command`` as a Jinja
+       template at task runtime, so a contract value carrying ``{{ ... }}``
+       would be expanded *inside* the quotes added below -- after which the
+       quoting no longer holds. No legitimate value here (a GCP project id, a
+       dataset, a principal, a role, a model name) contains a brace, so
+       removing them is safe and non-breaking.
+    2. ``shlex.quote`` the result, so the shell sees one inert token.
+
+    Use this for every value that came from ``contract.fluid.yaml``. Do NOT
+    use it for the generator's own ``{{ var.value.* }}`` defaults, which are
+    authored here and are meant to be rendered.
+    """
+    return shlex.quote(_JINJA_BRACES.sub("", str(value)))
+
+
+def _bash_task(task_id: str, comment: str, command: str) -> str:
+    """Render a ``BashOperator`` block with both injection layers applied.
+
+    Every ``bash_command`` in this module is built from
+    ``contract.fluid.yaml`` values, which are untrusted. Two independent
+    layers, mirroring ``cli/scaffold_composer._build_pipeline_bash_commands``:
+
+    1. Callers route each interpolated *value* through ``_sh`` → Jinja
+       delimiters are stripped and the result is ``shlex.quote``d, so the
+       shell sees one inert token at run time. Quoting ALONE is not
+       sufficient here: Airflow's docs are explicit that ``BashOperator``
+       "does not perform any escaping or sanitization of the command", and
+       ``bash_command`` is a ``template_field`` that Airflow re-renders at
+       task runtime -- which is why ``_sh`` strips Jinja first.
+    2. ``py_str_literal`` (``repr``) on the *whole* command here → at
+       DAG-parse time it is a fully escaped Python literal, so an embedded
+       quote or newline cannot break out of ``bash_command=<literal>`` and
+       inject a top-level statement Airflow would run.
+
+    ``sanitize_identifier`` covers the third surface: ``task_id`` becomes a
+    Python *variable name*, so it must be a legal identifier.
+    """
+    ident = sanitize_identifier(task_id)
+    return f"""
+# {_safe_comment(comment)}
+{ident} = BashOperator(
+    task_id={py_str_literal(ident)},
+    bash_command={py_str_literal(command)},
+    dag=dag
+)"""
 
 
 class AirflowDAGGenerator:
@@ -120,15 +211,25 @@ class AirflowDAGGenerator:
         # worth resolving dynamically, because the hardcoded "0.7.0" stamped
         # every version-less contract with a schema version five releases old.
         fluid_version = contract.get("fluidVersion") or FluidSchemaManager.latest_bundled_version()
+        kind = str(contract.get("kind", "DataProduct")).lower()
+
+        # The header is the second injection surface: every field below comes
+        # from the contract. Docstring fields route through
+        # ``escape_for_docstring`` (they must not be able to close the ``"""``
+        # delimiter) and every ``DAG(...)`` kwarg through ``py_str_literal``.
+        d_name = escape_for_docstring(name)
+        d_version = escape_for_docstring(fluid_version)
+        d_domain = escape_for_docstring(domain)
+        d_description = escape_for_docstring(description)
 
         return f'''"""
-Airflow DAG for FLUID Data Product: {name}
+Airflow DAG for FLUID Data Product: {d_name}
 
-Auto-generated from FLUID contract v{fluid_version}
+Auto-generated from FLUID contract v{d_version}
 Generated at: {datetime.now().isoformat()}
 
-Domain: {domain}
-Description: {description}
+Domain: {d_domain}
+Description: {d_description}
 """
 from airflow import DAG
 from airflow.operators.bash import BashOperator
@@ -148,12 +249,12 @@ default_args = {{
 
 # DAG definition
 dag = DAG(
-    dag_id="{dag_id}",
-    description="""{description}""",
-    schedule_interval="{schedule}",
+    dag_id={py_str_literal(dag_id)},
+    description={py_str_literal(description)},
+    schedule_interval={py_str_literal(schedule)},
     start_date=days_ago(1),
     catchup=False,
-    tags=["fluid", "data-product", "{contract.get("kind", "DataProduct").lower()}", "{domain}"],
+    tags=["fluid", "data-product", {py_str_literal(kind)}, {py_str_literal(domain)}],
     default_args=default_args
 )'''
 
@@ -161,7 +262,7 @@ dag = DAG(
         """Generate task definition for a provider action."""
         from ..forge.core.provider_actions import ActionType
 
-        task_id = action.action_id.replace("-", "_").replace(".", "_")
+        task_id = sanitize_identifier(action.action_id)
 
         if action.action_type == ActionType.PROVISION_DATASET:
             return self._generate_provision_task(action, task_id)
@@ -187,19 +288,22 @@ dag = DAG(
             location = params.get("binding", {}).get("location", {})
             project = location.get("project", "{{ var.value.gcp_project }}")
             dataset = location.get("dataset", expose_id)
-            command = f"bq mk --project_id={project} --dataset {dataset} || true"
+            # ``project``/``dataset`` default to generator-authored
+            # ``{{ var.value.* }}`` Jinja, which must survive to be rendered;
+            # a contract-supplied value must not.
+            # Only ``project``'s DEFAULT is generator-authored Jinja
+            # (``{{ var.value.gcp_project }}``) and must survive to be
+            # rendered. Everything else is contract-supplied -- including
+            # ``dataset``'s default, which is ``exposeId`` -- so it routes
+            # through ``_sh``.
+            project_expr = _sh(project) if "project" in location else shlex.quote(str(project))
+            command = f"bq mk --project_id={project_expr} --dataset {_sh(dataset)} || true"
         elif provider == "aws":
             command = "aws s3 mb s3://{{ var.value.s3_bucket }} || true"
         else:
-            command = f"echo 'Provision {expose_id} on {provider}'"
+            command = f"echo {_sh(f'Provision {expose_id} on {provider}')}"
 
-        return f"""
-# Provision dataset: {expose_id}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="{command}",
-    dag=dag
-)"""
+        return _bash_task(task_id, f"Provision dataset: {expose_id}", command)
 
     def _generate_schedule_task(self, action, task_id: str) -> str:
         """Generate scheduled task (e.g., dbt run)."""
@@ -209,19 +313,24 @@ dag = DAG(
         build_id = params.get("buildId", "build")
 
         if engine == "dbt":
-            command = f"dbt run --models {script or build_id}"
+            # ``--select`` since dbt 0.21; ``--models`` warns on dbt-core 1.10
+            # (ModelParamUsageDeprecation) and is a hard error on dbt v2.
+            command = f"dbt run --select {_sh(script or build_id)}"
         elif engine == "sql":
-            command = f"echo 'Execute SQL: {script}'"
+            command = f"echo {_sh(f'Execute SQL: {script}')}"
+        elif script:
+            # ``script`` is NOT a schema field -- ``$defs.build`` sets
+            # ``additionalProperties: false`` and declares no ``script`` in any
+            # shipped schema (0.7.1-0.7.6), and this generator does not validate
+            # before emitting. The only shipped usage
+            # (examples/0.7.1/provider-actions-workflow.yaml) is a dbt *model
+            # identifier*, not a command line. So quote it like every other
+            # branch rather than trusting it to be a well-formed command.
+            command = _sh(script)
         else:
-            command = script or f"echo 'Run {build_id}'"
+            command = f"echo {_sh(f'Run {build_id}')}"
 
-        return f"""
-# Schedule task: {build_id}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="{command}",
-    dag=dag
-)"""
+        return _bash_task(task_id, f"Schedule task: {build_id}", command)
 
     def _generate_grant_task(self, action, task_id: str) -> str:
         """Generate access grant task."""
@@ -230,64 +339,46 @@ dag = DAG(
         role = params.get("role", "viewer")
         expose_id = params.get("exposeId", "unknown")
 
-        command = f"echo 'Grant {role} to {principal} on {expose_id}'"
+        command = f"echo {_sh(f'Grant {role} to {principal} on {expose_id}')}"
 
-        return f"""
-# Grant access: {expose_id} to {principal}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="{command}",
-    dag=dag
-)"""
+        return _bash_task(task_id, f"Grant access: {expose_id} to {principal}", command)
 
     def _generate_register_schema_task(self, action, task_id: str) -> str:
         """Generate schema registration task."""
         params = action.params
         schema_name = params.get("schemaName", "unknown")
 
-        return f"""
-# Register schema: {schema_name}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="echo 'Register schema: {schema_name}'",
-    dag=dag
-)"""
+        command = f"echo {_sh(f'Register schema: {schema_name}')}"
+
+        return _bash_task(task_id, f"Register schema: {schema_name}", command)
 
     def _generate_create_view_task(self, action, task_id: str) -> str:
         """Generate create view task."""
         params = action.params
         view_name = params.get("viewName", "unknown")
 
-        return f"""
-# Create view: {view_name}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="echo 'Create view: {view_name}'",
-    dag=dag
-)"""
+        command = f"echo {_sh(f'Create view: {view_name}')}"
+
+        return _bash_task(task_id, f"Create view: {view_name}", command)
 
     def _generate_generic_task(self, action, task_id: str) -> str:
         """Generate generic task."""
         description = action.description or f"Execute {action.action_type.value}"
 
-        return f"""
-# {description}
-{task_id} = BashOperator(
-    task_id="{task_id}",
-    bash_command="echo '{description}'",
-    dag=dag
-)"""
+        command = f"echo {_sh(description)}"
+
+        return _bash_task(task_id, str(description), command)
 
     def _generate_dependencies(self, actions: List) -> str:
         """Generate task dependencies based on action.depends_on."""
         dep_code = "# Task dependencies\n"
 
         for action in actions:
-            task_id = action.action_id.replace("-", "_").replace(".", "_")
+            task_id = sanitize_identifier(action.action_id)
 
             if action.depends_on:
                 for dep in action.depends_on:
-                    dep_task_id = dep.replace("-", "_").replace(".", "_")
+                    dep_task_id = sanitize_identifier(dep)
                     dep_code += f"{dep_task_id} >> {task_id}\n"
 
         if dep_code == "# Task dependencies\n":
@@ -312,8 +403,8 @@ from airflow.operators.bash import BashOperator
 from airflow.utils.dates import days_ago
 
 dag = DAG(
-    dag_id="{dag_id}",
-    schedule_interval="{schedule}",
+    dag_id={py_str_literal(dag_id)},
+    schedule_interval={py_str_literal(schedule)},
     start_date=days_ago(1),
     catchup=False,
     tags=["fluid", "placeholder"]

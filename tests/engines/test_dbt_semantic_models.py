@@ -719,3 +719,70 @@ class TestAggregationTypeMapping:
         from fluid_build.engines.dbt.semantic_models import AGG_TO_METRICFLOW
 
         assert set(enum) == set(AGG_TO_METRICFLOW)
+
+
+# ---------------------------------------------------------------------------
+# A semantic model's ``model:`` key is ``ref('<exposeId>')``, but the intent /
+# multi-stage emitters name model files from *stage* names. When the two
+# disagree the ref dangles and `dbt parse` rejects the WHOLE project:
+#   Semantic_Model 'semantic_model.x.orders' depends on a node named 'orders'
+#   which was not found
+# ---------------------------------------------------------------------------
+
+
+def _staged_intent():
+    from fluid_build.engines.base import TransformationIntent
+
+    return TransformationIntent(
+        stages=[
+            {"name": "stg_orders", "sql": "select 1 as order_id", "layer": "staging"},
+            {"name": "fct_orders", "sql": "select * from x", "layer": "marts"},
+        ]
+    )
+
+
+def _emitted_refs(generated):
+    import re
+
+    return re.findall(r"ref\('([^']+)'\)", generated.get("models/semantic_models.yml") or "")
+
+
+def _model_basenames(generated):
+    return {p.rsplit("/", 1)[-1][: -len(".sql")] for p in generated if p.endswith(".sql")}
+
+
+def test_semantic_model_is_dropped_when_its_ref_target_was_not_emitted():
+    from fluid_build.engines.dbt import DbtEngine
+
+    contract = _contract(semantics=_semantics())
+    generated = DbtEngine().generate(
+        contract, contract["builds"][0], transformation_intent=_staged_intent()
+    )
+    # Stage names own the model files, so ref('orders') has no target.
+    assert _model_basenames(generated) == {"stg_orders", "fct_orders"}
+    assert _emitted_refs(generated) == [], "emitted a ref() to a model that does not exist"
+
+
+def test_semantic_model_survives_when_its_ref_target_is_emitted():
+    """The default path names the model after the expose, so it must be kept."""
+    from fluid_build.engines.dbt import DbtEngine
+
+    contract = _contract(semantics=_semantics())
+    generated = DbtEngine().generate(contract, contract["builds"][0])
+    refs = _emitted_refs(generated)
+    assert refs == ["orders"]
+    assert refs[0] in _model_basenames(generated)
+
+
+def test_every_emitted_semantic_ref_resolves_to_an_emitted_model():
+    """The invariant, stated directly: no generated project may contain a
+    semantic model whose ref target is absent."""
+    from fluid_build.engines.dbt import DbtEngine
+
+    for intent in (None, _staged_intent()):
+        contract = _contract(semantics=_semantics())
+        generated = DbtEngine().generate(
+            contract, contract["builds"][0], transformation_intent=intent
+        )
+        dangling = [r for r in _emitted_refs(generated) if r not in _model_basenames(generated)]
+        assert not dangling, f"dangling semantic refs {dangling} (intent={intent is not None})"

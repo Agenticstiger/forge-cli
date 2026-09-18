@@ -185,6 +185,13 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e ".[dev,local]" || pip install -e ".[dev]"
+          # dbt-duckdb pulls dbt-core, which puts a `dbt` binary on PATH.
+          # Without it tests/test_speed_transformation_dbt_e2e.py self-skips
+          # on shutil.which("dbt"), so the only test that runs a real
+          # `dbt parse` over a forge-generated project has never executed
+          # in CI. Capped below 2.0: dbt v2 is a separate, non-Apache-2.0
+          # distribution whose emitter differences are not what this tests.
+          pip install "dbt-core<2" dbt-duckdb
 
       # ── Tests (all Python versions, no coverage) ────────────────
       - name: Run tests
@@ -251,6 +258,13 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e ".[dev,local]" || pip install -e ".[dev]"
+          # dbt-duckdb pulls dbt-core, which puts a `dbt` binary on PATH.
+          # Without it tests/test_speed_transformation_dbt_e2e.py self-skips
+          # on shutil.which("dbt"), so the only test that runs a real
+          # `dbt parse` over a forge-generated project has never executed
+          # in CI. Capped below 2.0: dbt v2 is a separate, non-Apache-2.0
+          # distribution whose emitter differences are not what this tests.
+          pip install "dbt-core<2" dbt-duckdb
 
       # ── Tests + Coverage ────────────────────────────────────────
       - name: Run tests with coverage

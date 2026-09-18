@@ -327,15 +327,17 @@ class BasePipelineTemplate:
                 "--env ${FLUID_ENV:-dev}"
             ),
             "plan": "fluid plan ${CONTRACT:-contract.fluid.yaml} --out runtime/plan.json",
-            # --build is required for dbt hybrid-reference builds; the
-            # inline conditional keeps the template useful for both shapes.
+            # A build id needs `--mode amend-and-build` alongside
+            # `--build-id`: the id only FILTERS, it does not opt into running
+            # builds (`fluid apply --help`). The retired `--build` did both.
             # --ensure-opentofu lets a cloud apply provision a pinned,
             # SHA-256-verified `tofu` (no root/gpg) on a fresh runner; it is
             # idempotent (skips when tofu is present) and a no-op for
             # native/local applies that never touch the OpenTofu engine.
             "apply": (
                 'if [ -n "$BUILD_ID" ]; then '
-                "fluid apply ${CONTRACT:-contract.fluid.yaml} --build $BUILD_ID "
+                "fluid apply ${CONTRACT:-contract.fluid.yaml} "
+                "--mode amend-and-build --build-id $BUILD_ID "
                 "--ensure-opentofu --yes; "
                 "else "
                 "fluid apply runtime/plan.json --ensure-opentofu --yes; "
@@ -368,21 +370,19 @@ class BasePipelineTemplate:
                 "fluid verify ${CONTRACT:-contract.fluid.yaml} --strict "
                 "--env ${FLUID_ENV:-dev} --out runtime/verify-report.json"
             ),
-            "test": "fluid test --coverage",
+            "test": "fluid test ${CONTRACT:-contract.fluid.yaml}",
             "contract_test": "fluid contract-tests ${CONTRACT:-contract.fluid.yaml}",
             "generate_transformation": "fluid generate speed-transformation",
             "generate_schedule": "fluid generate schedule",
-            "check_transformations": (
-                "if [ -f dbt_project.yml ] || [ -d models/ ]; then "
-                "fluid generate speed-transformation --check; "
-                "fi"
+            # ``PLAN`` must default to where the ``plan`` command above
+            # actually writes (runtime/plan.json), and ``viz-graph`` defaults
+            # to ``--format svg`` -- without an explicit png it writes SVG
+            # bytes into a .png.
+            "visualize": (
+                "fluid viz-plan ${PLAN:-runtime/plan.json} --out pipeline-viz.html "
+                "&& fluid viz-graph ${CONTRACT:-contract.fluid.yaml} "
+                "--format png --out dependency-graph.png"
             ),
-            "check_schedules": (
-                "if [ -d dags/ ] || [ -d pipelines/ ] || [ -d flows/ ]; then "
-                "fluid generate schedule --check; "
-                "fi"
-            ),
-            "visualize": "fluid viz-plan --output pipeline-viz.html && fluid viz-graph --output dependency-graph.png",
             # Canonical key: ``publish_odps`` emits the LF/ODPI ODPS v4.1
             # JSON via the (non-deprecated) ``fluid generate standard
             # --format odps-v4.1`` path. The ``publish_opds`` alias below
@@ -518,8 +518,8 @@ class BasePipelineTemplate:
         tooling — but we DO emit:
 
         * a short shell body that exercises ``fluid`` 's own security
-          surface (``fluid validate --security-only``,
-          ``fluid policy-apply``, ``fluid audit --compliance``), and
+          surface (``fluid policy-check``,
+          ``fluid policy-apply``, ``fluid policy-check --format json``), and
         * the canonical step name + comment-banner with the keywords
           (``security scan``, ``vulnerability``, ``policy``, ``audit``,
           ``osv-scanner``, ``sast``) so CI assertions and operator search
@@ -540,16 +540,21 @@ class BasePipelineTemplate:
         # ``|| true`` once the binary is on the runner.
         body = (
             "set -eu\n"
+            # Both outputs below land in runtime/, which nothing guarantees
+            # exists at this stage; `|| true` would otherwise swallow the
+            # redirect failure and leave the artifact upload empty.
+            "mkdir -p runtime\n"
             "# FLUID security scan + compliance audit — advanced/enterprise tier.\n"
-            "# Surfaces: SAST signal (via fluid validate), policy check\n"
-            "# (via fluid policy-apply --mode dry-run), and audit / SBOM /\n"
-            "# vulnerability scan (via fluid audit + optional osv-scanner).\n"
-            "fluid validate --security-only || true\n"
+            "# Surfaces: policy violations (via fluid policy-check), policy\n"
+            "# binding dry-run (via fluid policy-apply --mode check), and an\n"
+            "# optional osv-scanner vulnerability scan.\n"
+            'fluid policy-check "${CONTRACT:-contract.fluid.yaml}" --strict || true\n'
             "if [ -f dist/artifacts/policy/bindings.json ]; then\n"
             "  fluid policy-apply dist/artifacts/policy/bindings.json "
-            '--mode dry-run --env "${FLUID_ENV:-dev}" || true\n'
+            "--mode check || true\n"
             "fi\n"
-            "fluid audit --compliance --output runtime/compliance-report.json || true\n"
+            'fluid policy-check "${CONTRACT:-contract.fluid.yaml}" --format json '
+            "--output runtime/compliance-report.json || true\n"
             "# Optional: OSV-Scanner vulnerability scan if the binary is on the runner.\n"
             "if command -v osv-scanner >/dev/null 2>&1; then\n"
             "  osv-scanner scan source -r . --format sarif "
@@ -558,10 +563,10 @@ class BasePipelineTemplate:
         )
         comment_lines = [
             "Security + compliance audit (advanced/enterprise tier).",
-            "Runs SAST-style fluid validate, policy enforcement dry-run,",
-            "compliance audit + SBOM, and an optional OSV-Scanner",
-            "vulnerability scan. Any SCA scanner can replace it without",
-            "breaking the rest of the stage.",
+            "Runs fluid policy-check --strict, a policy-binding dry-run via",
+            "fluid policy-apply --mode check, a JSON compliance report, and",
+            "an optional OSV-Scanner vulnerability scan. Any SCA scanner can",
+            "replace it without breaking the rest of the stage.",
         ]
         return {
             "name": "Security and Compliance Audit",
@@ -834,7 +839,8 @@ class BasePipelineTemplate:
                     '--env "${FLUID_ENV:-dev}" --yes --ensure-opentofu '
                     "--report runtime/apply-report.html; "
                     'if [ -n "${APPLY_BUILD_ID:-}" ]; then '
-                    'set -- "$@" --build "$APPLY_BUILD_ID"; fi; '
+                    'set -- "$@" --mode amend-and-build '
+                    '--build-id "$APPLY_BUILD_ID"; fi; '
                     'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]; then '
                     'set -- "$@" --allow-data-loss; fi; '
                     'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]; then '
@@ -853,7 +859,7 @@ class BasePipelineTemplate:
                 command=(
                     "if [ -f dist/artifacts/policy/bindings.json ]; then "
                     "fluid policy-apply dist/artifacts/policy/bindings.json "
-                    '--mode enforce --env "${FLUID_ENV:-dev}"; '
+                    "--mode enforce; "
                     "fi"
                 ),
             ),
@@ -886,12 +892,10 @@ class BasePipelineTemplate:
                     'if [ -n "${PUBLISH_TARGETS:-}" ]; then '
                     'TARGETS=""; for t in $PUBLISH_TARGETS; do '
                     'TARGETS="$TARGETS --target $t"; done; '
-                    'fluid publish "${CONTRACT:-contract.fluid.yaml}" $TARGETS '
-                    '--env "${FLUID_ENV:-dev}"; '
+                    'fluid publish "${CONTRACT:-contract.fluid.yaml}" $TARGETS; '
                     "else "
                     'fluid publish "${CONTRACT:-contract.fluid.yaml}" '
-                    '--target "${CATALOG:-datamesh-manager}" '
-                    '--env "${FLUID_ENV:-dev}"; '
+                    '--target "${CATALOG:-datamesh-manager}"; '
                     "fi"
                 ),
             ),

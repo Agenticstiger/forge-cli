@@ -257,18 +257,16 @@ class GitLabCITemplate(BasePipelineTemplate):
                     "script": [
                         commands["generate_transformation"],
                         commands["generate_schedule"],
-                        commands["check_transformations"],
-                        commands["check_schedules"],
                     ],
                 },
                 "unit-tests": {
                     "stage": "test",
-                    "script": ["fluid test --type unit"],
+                    "script": ["fluid test ${CONTRACT:-contract.fluid.yaml} --no-data"],
                     "artifacts": {"reports": {"junit": "test-results/unit.xml"}},
                 },
                 "integration-tests": {
                     "stage": "test",
-                    "script": ["fluid test --type integration"],
+                    "script": ["fluid test ${CONTRACT:-contract.fluid.yaml}"],
                     "artifacts": {"reports": {"junit": "test-results/integration.xml"}},
                 },
                 "plan": {
@@ -378,12 +376,18 @@ class GitLabCITemplate(BasePipelineTemplate):
             {
                 "security-scan": {
                     "stage": "security",
-                    "script": ["fluid validate --security-only", "osv-scanner scan source -r ."],
+                    "script": [
+                        "fluid policy-check ${CONTRACT:-contract.fluid.yaml} --strict",
+                        "osv-scanner scan source -r .",
+                    ],
                     "artifacts": {"reports": {"sast": "security-report.json"}},
                 },
                 "compliance-check": {
                     "stage": "security",
-                    "script": ["fluid audit --compliance"],
+                    "script": [
+                        "fluid policy-check ${CONTRACT:-contract.fluid.yaml} "
+                        "--format json --output compliance-report.json"
+                    ],
                     "artifacts": {"paths": ["compliance-report.json"]},
                     "only": ["main"],
                 },

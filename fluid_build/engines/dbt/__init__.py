@@ -158,7 +158,16 @@ class DbtEngine(TransformationEngine):
         # Graceful no-op when no expose carries semantics.
         from .semantic_models import generate_semantic_models
 
-        files.update(generate_semantic_models(contract))
+        # Pass the model names actually emitted above: a semantic model refs
+        # ``ref('<exposeId>')``, but the intent / multi-stage emitters name
+        # files from *stage* names, so on those paths the ref dangles and
+        # ``dbt parse`` rejects the whole project.
+        _emitted_model_names = {
+            path.rsplit("/", 1)[-1][: -len(".sql")]
+            for path in files
+            if path.startswith("models/") and path.endswith(".sql")
+        }
+        files.update(generate_semantic_models(contract, emitted_models=_emitted_model_names))
 
         # packages.yml — pin the dbt packages any emitted test/model actually
         # references (dbt_utils / dbt_expectations), so the project passes

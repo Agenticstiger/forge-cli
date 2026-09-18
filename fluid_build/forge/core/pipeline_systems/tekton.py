@@ -213,8 +213,12 @@ class TektonTemplate(BasePipelineTemplate):
                         )
         runtime_notes = self._engine_runtime_notes(config, indent="# ")
         notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
-        pipeline_yaml = banner + notes_block + yaml.dump(pipeline_doc, indent=2, sort_keys=False)
-        tasks_yaml = banner + notes_block + yaml.dump_all(stage_tasks, indent=2, sort_keys=False)
+        pipeline_yaml = (
+            banner + notes_block + yaml.dump(pipeline_doc, indent=2, width=4096, sort_keys=False)
+        )
+        tasks_yaml = (
+            banner + notes_block + yaml.dump_all(stage_tasks, indent=2, width=4096, sort_keys=False)
+        )
         return {
             "tekton/pipeline.yaml": pipeline_yaml,
             "tekton/tasks.yaml": tasks_yaml,
@@ -288,13 +292,13 @@ class TektonTemplate(BasePipelineTemplate):
                         existing_tasks_yaml.rstrip()
                         + "\n---\n"
                         + audit_comment
-                        + yaml.dump(audit_task, indent=2, sort_keys=False)
+                        + yaml.dump(audit_task, indent=2, width=4096, sort_keys=False)
                     )
                 else:
                     # Defensive fallback: emit a standalone audit
                     # tasks file if the main tasks.yaml is absent.
                     files["tekton/security-audit.yaml"] = audit_comment + yaml.dump(
-                        audit_task, indent=2, sort_keys=False
+                        audit_task, indent=2, width=4096, sort_keys=False
                     )
             return files
 
@@ -391,8 +395,12 @@ class TektonTemplate(BasePipelineTemplate):
         runtime_notes = self._engine_runtime_notes(config, indent="# ")
         notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
         files = {
-            "tekton/pipeline.yaml": banner + notes_block + yaml.dump(pipeline, indent=2),
-            "tekton/tasks.yaml": banner + notes_block + yaml.dump_all(task_definitions, indent=2),
+            "tekton/pipeline.yaml": banner
+            + notes_block
+            + yaml.dump(pipeline, indent=2, width=4096),
+            "tekton/tasks.yaml": banner
+            + notes_block
+            + yaml.dump_all(task_definitions, indent=2, width=4096),
         }
 
         return files

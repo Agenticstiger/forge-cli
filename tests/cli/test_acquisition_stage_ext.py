@@ -317,7 +317,10 @@ class TestScheduleSyncAcquisition:
         body = Path(airflow.artifact_path).read_text()
         assert '"0 */4 * * *"' in body
         assert "BashOperator" in body
-        assert "fluid apply contracts/bronze.orders.fluid.yaml --build ingest" in body
+        assert (
+            "fluid apply contracts/bronze.orders.fluid.yaml --mode amend-and-build --build-id ingest"
+            in body
+        )
 
     def test_dagster_and_prefect_emitted_when_requested(self, tmp_path: Path):
         artifacts = schedule_sync_acquisition(
@@ -361,7 +364,7 @@ class TestScheduleSyncAcquisition:
         artifacts = schedule_sync_acquisition(_base_contract(), tmp_path, orchestrators=["cron"])
         body = Path(artifacts[0].artifact_path).read_text()
         assert body.strip().endswith(
-            "0 */4 * * * fluid apply contracts/bronze.orders.fluid.yaml --build ingest"
+            "0 */4 * * * fluid apply contracts/bronze.orders.fluid.yaml --mode amend-and-build --build-id ingest"
         )
 
 

@@ -638,12 +638,29 @@ _TIME_SPINE_MODEL_DEF: Dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
-def generate_semantic_models(contract: Dict[str, Any]) -> GenerationResult:
+def generate_semantic_models(
+    contract: Dict[str, Any],
+    emitted_models: Optional[Set[str]] = None,
+) -> GenerationResult:
     """Emit ``models/semantic_models.yml`` from ``exposes[*].semantics``.
 
     Returns ``{}`` (graceful no-op) when no expose carries a semantics
     block — hand-authored contracts often lack one, and the generated
     project must stay byte-identical for them.
+
+    ``emitted_models`` is the set of model names this generation actually
+    wrote (basenames, no ``.sql``). A semantic model's ``model:`` key is
+    ``ref('<exposeId>')``, but the intent / multi-stage / embedded-logic
+    model emitters name their files from *stage* names, so on those paths
+    the ref points at a node that does not exist and ``dbt parse`` fails
+    the whole project::
+
+        Semantic_Model 'semantic_model.x.orders' depends on a node named
+        'orders' which was not found
+
+    When the caller supplies the emitted set, a semantic model whose ref
+    target is missing is dropped with a loud warning rather than poisoning
+    the project. Callers that pass nothing keep the previous behaviour.
     """
     semantic_models: List[Dict[str, Any]] = []
     all_metrics: List[Dict[str, Any]] = []
@@ -688,6 +705,17 @@ def generate_semantic_models(contract: Dict[str, Any]) -> GenerationResult:
                 )
         else:
             measures = _build_measures(semantics, used_names, time_dims, model_name)
+
+        if emitted_models is not None and expose_id not in emitted_models:
+            logger.warning(
+                "semantic_models: skipping expose %r — its ref('%s') target is not "
+                "among the emitted models (%s). Emitting it would make `dbt parse` "
+                "fail for the whole project.",
+                expose_id,
+                expose_id,
+                ", ".join(sorted(emitted_models)) or "none",
+            )
+            continue
 
         model_def: Dict[str, Any] = {
             "name": model_name,
