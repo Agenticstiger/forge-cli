@@ -14,11 +14,10 @@
 
 """Tests for the dbt transformation engine."""
 
+import copy
 import json
 
 import pytest
-import copy
-
 import yaml
 from hypothesis import given
 from hypothesis import strategies as st

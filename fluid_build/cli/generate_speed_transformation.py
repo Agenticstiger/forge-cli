@@ -521,6 +521,7 @@ def _generate_single_build(
     # via build_runners — an edge engines/ must not have.
     if engine_name == "dbt":
         engine_kwargs["tests_key"] = _resolve_dbt_tests_key(args, logger)
+        engine_kwargs["capabilities"] = _resolve_dbt_capabilities(logger)
         # A bare decimal type (``number`` / ``decimal``) resolves to scale 0
         # on Snowflake, so cents are silently truncated in the built table.
         # Surface it here — the fix is a contract edit (``number(12,2)``),
@@ -612,6 +613,38 @@ def _generate_single_build(
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
     return output_dir, files, engine_name
+
+
+def _resolve_dbt_capabilities(logger: logging.Logger) -> Any:
+    """Resolve which v2-corrected YAML shapes the target dbt engine honours.
+
+    Same seam as ``_resolve_dbt_tests_key``: the detection lives in
+    ``build_runners`` and the emitters in ``engines``, which may not import it
+    (import tiering), so the CLI resolves and passes the result down.
+
+    No dbt on PATH resolves to the legacy shapes, matching the tests-key
+    precedent -- they parse on every dbt 1.x, and a consumer actually running
+    v2 has a v2 binary for the detector to find.
+    """
+    from fluid_build.build_runners.dbt.runner import (
+        _detect_dbt_engine,
+        _resolve_dbt_executable,
+    )
+    from fluid_build.engines.dbt._capabilities import LEGACY, resolve_dbt_capabilities
+
+    dbt_bin = _resolve_dbt_executable()
+    if dbt_bin is None:
+        info(logger, "dbt_capabilities_resolved reason=no_dbt_binary shapes=legacy")
+        return LEGACY
+    flavor, version = _detect_dbt_engine(dbt_bin)
+    caps = resolve_dbt_capabilities(flavor, version)
+    info(
+        logger,
+        f"dbt_capabilities_resolved engine={flavor} version={version or '?'} "
+        f"nest_test_arguments={caps.nest_test_arguments} "
+        f"config_scoped_source_freshness={caps.config_scoped_source_freshness}",
+    )
+    return caps
 
 
 def _resolve_dbt_tests_key(args: Any, logger: logging.Logger) -> str:

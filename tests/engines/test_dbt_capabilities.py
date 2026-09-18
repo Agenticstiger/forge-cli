@@ -91,3 +91,89 @@ def test_floors_are_the_measured_values():
     """
     assert TEST_ARGUMENTS_FLOOR == (1, 10, 8)
     assert FRESHNESS_CONFIG_FLOOR == (1, 10, 5)
+
+
+# ---------------------------------------------------------------------------
+# The `arguments:` transform itself.
+# ---------------------------------------------------------------------------
+
+
+def test_nesting_moves_inputs_under_arguments():
+    from fluid_build.engines.dbt._test_mapping import nest_test_arguments as nest
+
+    assert nest({"accepted_values": {"values": [1, 2]}}) == {
+        "accepted_values": {"arguments": {"values": [1, 2]}}
+    }
+    assert nest({"relationships": {"to": "ref('x')", "field": "id"}}) == {
+        "relationships": {"arguments": {"to": "ref('x')", "field": "id"}}
+    }
+
+
+def test_nesting_leaves_reserved_keys_beside_arguments():
+    """`config`/`description` are dbt's, not test inputs.
+
+    Per the v2 spec CustomTestInner is additionalProperties:false over
+    {arguments, column_name, config, description, name} -- moving `config`
+    under `arguments` would make the document invalid.
+    """
+    from fluid_build.engines.dbt._test_mapping import nest_test_arguments as nest
+
+    assert nest({"t": {"config": {"severity": "warn"}, "threshold": 5}}) == {
+        "t": {"config": {"severity": "warn"}, "arguments": {"threshold": 5}}
+    }
+
+
+def test_nesting_is_idempotent_and_ignores_argumentless_tests():
+    from fluid_build.engines.dbt._test_mapping import nest_test_arguments as nest
+
+    already = {"accepted_values": {"arguments": {"values": [1]}}}
+    assert nest(already) == already
+    assert nest("not_null") == "not_null"  # bare string test
+    assert nest({"unique": {}}) == {"unique": {}}  # no inputs to move
+
+
+def test_emitted_schema_yml_switches_shape_at_the_floor():
+    """End-to-end: the emitter honours the capability, both ways.
+
+    Measured against real engines: the nested form is a compile error below
+    dbt-core 1.10.8, and the flat form is a hard error (dbt1159) on v2 -- so
+    emitting either unconditionally breaks someone.
+    """
+    import yaml
+
+    from fluid_build.engines.dbt._capabilities import LEGACY, MODERN
+    from fluid_build.engines.dbt.schema_yml import generate_schema_yml
+
+    contract = {
+        "fluidVersion": "0.7.5",
+        "id": "g.a.orders_v1",
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "table",
+                "contract": {
+                    "schema": [{"name": "status", "type": "STRING"}],
+                    "dq": {
+                        "rules": [
+                            {
+                                "id": "r1",
+                                "type": "uniqueness",
+                                "severity": "error",
+                                "selector": "status",
+                            }
+                        ]
+                    },
+                },
+            }
+        ],
+    }
+    legacy = yaml.safe_load(
+        generate_schema_yml(contract, capabilities=LEGACY)["models/marts/schema.yml"]
+    )
+    modern = yaml.safe_load(
+        generate_schema_yml(contract, capabilities=MODERN)["models/marts/schema.yml"]
+    )
+    assert "arguments" not in yaml.safe_dump(legacy)
+    # access moves under config on BOTH -- that one has no floor.
+    for parsed in (legacy, modern):
+        assert parsed["models"][0]["config"]["access"] == "public"
