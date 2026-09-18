@@ -15,6 +15,7 @@ labels:
   layer: gold
 metadata:
   layer: Gold
+  productType: CDP
   owner:
     team: customer-analytics
     email: customer-analytics@company.com
