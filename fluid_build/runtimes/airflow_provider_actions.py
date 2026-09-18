@@ -20,6 +20,7 @@ Supports all action types defined in FLUID 0.7.1 schema.
 """
 
 import logging
+import re
 import shlex
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -43,6 +44,35 @@ def _safe_comment(value: Any) -> str:
     return " ".join(escape_for_docstring(value).split()) or "task"
 
 
+#: Jinja delimiters. ``bash_command`` is an Airflow ``template_field``, so
+#: Airflow re-renders it at TASK RUNTIME -- after this module's quoting is
+#: already baked in. ``shlex.quote`` wraps a value in ``'...'`` but does
+#: nothing to ``{{ ... }}``, and Jinja string escapes can synthesise a quote
+#: from a payload that contains none: ``{{ "\x27" }}; echo OWNED; #``
+#: renders to ``''; echo OWNED; #'`` and escapes the shell quoting.
+_JINJA_DELIMITERS = re.compile(r"\{\{|\}\}|\{%|%\}|\{#|#\}")
+
+
+def _sh(value: Any) -> str:
+    """Quote a *contract-supplied* value for embedding in ``bash_command``.
+
+    Two steps, and the order matters:
+
+    1. Strip Jinja delimiters. Airflow re-renders ``bash_command`` as a Jinja
+       template at task runtime, so a contract value carrying ``{{ ... }}``
+       would be expanded *inside* the quotes added below -- after which the
+       quoting no longer holds. No legitimate value here (a GCP project id, a
+       dataset, a principal, a role, a model name) contains a Jinja
+       delimiter, so removing them is safe and non-breaking.
+    2. ``shlex.quote`` the result, so the shell sees one inert token.
+
+    Use this for every value that came from ``contract.fluid.yaml``. Do NOT
+    use it for the generator's own ``{{ var.value.* }}`` defaults, which are
+    authored here and are meant to be rendered.
+    """
+    return shlex.quote(_JINJA_DELIMITERS.sub("", str(value)))
+
+
 def _bash_task(task_id: str, comment: str, command: str) -> str:
     """Render a ``BashOperator`` block with both injection layers applied.
 
@@ -50,10 +80,13 @@ def _bash_task(task_id: str, comment: str, command: str) -> str:
     ``contract.fluid.yaml`` values, which are untrusted. Two independent
     layers, mirroring ``cli/scaffold_composer._build_pipeline_bash_commands``:
 
-    1. Callers ``shlex.quote`` each interpolated *value* → at run time the
-       shell sees it as one inert token, never a metacharacter it executes.
-       Airflow's own docs are explicit that ``BashOperator`` "does not
-       perform any escaping or sanitization of the command".
+    1. Callers route each interpolated *value* through ``_sh`` → Jinja
+       delimiters are stripped and the result is ``shlex.quote``d, so the
+       shell sees one inert token at run time. Quoting ALONE is not
+       sufficient here: Airflow's docs are explicit that ``BashOperator``
+       "does not perform any escaping or sanitization of the command", and
+       ``bash_command`` is a ``template_field`` that Airflow re-renders at
+       task runtime -- which is why ``_sh`` strips Jinja first.
     2. ``py_str_literal`` (``repr``) on the *whole* command here → at
        DAG-parse time it is a fully escaped Python literal, so an embedded
        quote or newline cannot break out of ``bash_command=<literal>`` and
@@ -245,14 +278,20 @@ dag = DAG(
             location = params.get("binding", {}).get("location", {})
             project = location.get("project", "{{ var.value.gcp_project }}")
             dataset = location.get("dataset", expose_id)
-            command = (
-                f"bq mk --project_id={shlex.quote(str(project))} "
-                f"--dataset {shlex.quote(str(dataset))} || true"
-            )
+            # ``project``/``dataset`` default to generator-authored
+            # ``{{ var.value.* }}`` Jinja, which must survive to be rendered;
+            # a contract-supplied value must not.
+            # Only ``project``'s DEFAULT is generator-authored Jinja
+            # (``{{ var.value.gcp_project }}``) and must survive to be
+            # rendered. Everything else is contract-supplied -- including
+            # ``dataset``'s default, which is ``exposeId`` -- so it routes
+            # through ``_sh``.
+            project_expr = _sh(project) if "project" in location else shlex.quote(str(project))
+            command = f"bq mk --project_id={project_expr} --dataset {_sh(dataset)} || true"
         elif provider == "aws":
             command = "aws s3 mb s3://{{ var.value.s3_bucket }} || true"
         else:
-            command = f"echo {shlex.quote(f'Provision {expose_id} on {provider}')}"
+            command = f"echo {_sh(f'Provision {expose_id} on {provider}')}"
 
         return _bash_task(task_id, f"Provision dataset: {expose_id}", command)
 
@@ -266,9 +305,9 @@ dag = DAG(
         if engine == "dbt":
             # ``--select`` since dbt 0.21; ``--models`` warns on dbt-core 1.10
             # (ModelParamUsageDeprecation) and is a hard error on dbt v2.
-            command = f"dbt run --select {shlex.quote(str(script or build_id))}"
+            command = f"dbt run --select {_sh(script or build_id)}"
         elif engine == "sql":
-            command = f"echo {shlex.quote(f'Execute SQL: {script}')}"
+            command = f"echo {_sh(f'Execute SQL: {script}')}"
         elif script:
             # ``script`` is NOT a schema field -- ``$defs.build`` sets
             # ``additionalProperties: false`` and declares no ``script`` in any
@@ -277,7 +316,7 @@ dag = DAG(
             # (examples/0.7.1/provider-actions-workflow.yaml) is a dbt *model
             # identifier*, not a command line. So quote it like every other
             # branch rather than trusting it to be a well-formed command.
-            command = shlex.quote(str(script))
+            command = _sh(script)
         else:
             command = f"echo {shlex.quote(f'Run {build_id}')}"
 
@@ -290,7 +329,7 @@ dag = DAG(
         role = params.get("role", "viewer")
         expose_id = params.get("exposeId", "unknown")
 
-        command = f"echo {shlex.quote(f'Grant {role} to {principal} on {expose_id}')}"
+        command = f"echo {_sh(f'Grant {role} to {principal} on {expose_id}')}"
 
         return _bash_task(task_id, f"Grant access: {expose_id} to {principal}", command)
 
@@ -299,7 +338,7 @@ dag = DAG(
         params = action.params
         schema_name = params.get("schemaName", "unknown")
 
-        command = f"echo {shlex.quote(f'Register schema: {schema_name}')}"
+        command = f"echo {_sh(f'Register schema: {schema_name}')}"
 
         return _bash_task(task_id, f"Register schema: {schema_name}", command)
 
@@ -308,7 +347,7 @@ dag = DAG(
         params = action.params
         view_name = params.get("viewName", "unknown")
 
-        command = f"echo {shlex.quote(f'Create view: {view_name}')}"
+        command = f"echo {_sh(f'Create view: {view_name}')}"
 
         return _bash_task(task_id, f"Create view: {view_name}", command)
 
@@ -316,7 +355,7 @@ dag = DAG(
         """Generate generic task."""
         description = action.description or f"Execute {action.action_type.value}"
 
-        command = f"echo {shlex.quote(str(description))}"
+        command = f"echo {_sh(description)}"
 
         return _bash_task(task_id, str(description), command)
 
