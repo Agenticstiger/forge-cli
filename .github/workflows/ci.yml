@@ -590,34 +590,9 @@ jobs:
   # binary is a hard error instead of a silent skip.
   # ──────────────────────────────────────────────────────────────
   dbt-v2-canary:
-    name: dbt v2 end-to-end (dbt-oss ${{ matrix.leg }})
+    name: dbt v2 end-to-end (dbt-oss)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Job-level, not step-level, and this is the whole point: the shell
-    # warn-wrapper below only covers the pytest step, while the two steps
-    # most exposed to an upstream release -- the unbounded `pip install
-    # --upgrade dbt-oss`, and the `grep -Eq '^dbt(-oss)? v?2\.'` banner
-    # assertion -- run before it. A dbt-oss 3.0.0, or any reworded version
-    # banner from a package that says its behaviour may change, would have
-    # killed the job two steps early and painted every open PR red. That is
-    # exactly what the pinned/latest split exists to prevent, so the whole
-    # `latest` leg is non-blocking.
-    continue-on-error: ${{ matrix.leg == 'latest' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # Same shape as mcp-sdk-drift above, for the same reason.
-        #
-        # "pinned" = a known-good v2 release. BLOCKING: if our emitter stops
-        #            parsing on a version that worked yesterday, that is our
-        #            regression and it must go red.
-        # "latest" = newest dbt-oss on PyPI. WARN-ONLY: dbt-oss is explicitly
-        #            beta (PyPI classifies it Development Status :: 3 - Alpha,
-        #            and its README says behaviour and on-disk formats may
-        #            change before the stable release). An upstream beta
-        #            release must not be able to paint every open PR red --
-        #            including docs-only ones -- so it warns and exits green.
-        leg: [pinned, latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -629,12 +604,16 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,local]"
+          # Pinned, and blocking. dbt-oss is beta (PyPI classifies it
+          # Development Status :: 3 - Alpha, and its README says behaviour and
+          # on-disk formats may change before the stable release), so a
+          # floating install would let an upstream release redden every open
+          # PR. Pinned means a failure here is OUR regression. Bump
+          # deliberately.
+          #
           # Deliberately no dbt-core: this job exists to run the v2 engine,
           # and a 1.x binary on PATH would shadow it.
-          case "${{ matrix.leg }}" in
-            pinned) python -m pip install "dbt-oss==2.0.5" ;;
-            latest) python -m pip install --upgrade dbt-oss ;;
-          esac
+          python -m pip install "dbt-oss==2.0.5"
       - name: Assert the binary really is v2
         # Guards against dbt-oss not providing `dbt`, or a transitive dep
         # dragging dbt-core 1.x in and winning on PATH -- either of which
@@ -649,27 +628,7 @@ jobs:
         env:
           FLUID_REQUIRE_DBT: "1"
         run: |
-          set -uo pipefail
-          if python -m pytest -v tests/test_speed_transformation_dbt_e2e.py 2>&1 | tee dbt-v2.log; then
-            echo "dbt v2 canary passed on the ${{ matrix.leg }} leg."
-            exit 0
-          fi
-          if [ "${{ matrix.leg }}" = "pinned" ]; then
-            echo "::error title=dbt v2 canary (pinned)::The forge-generated project stopped parsing on the pinned dbt-oss release. This is our regression, not upstream's."
-            exit 1
-          fi
-          # latest leg: warn loudly, exit green — never a red row.
-          echo "::warning title=dbt v2 canary (latest)::The forge-generated project fails to parse against the newest dbt-oss on PyPI. dbt-oss is beta; the pinned leg is the blocking one. Investigate before bumping the pin."
-          {
-            echo "### dbt v2 canary (latest) — warning only"
-            echo
-            echo "dbt-oss version: $(dbt --version | head -1)"
-            echo
-            echo '```'
-            tail -40 dbt-v2.log
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit 0
+          python -m pytest -v tests/test_speed_transformation_dbt_e2e.py
 
   # ──────────────────────────────────────────────────────────────
   # Stage 1 — keyless emulated provider integration. Free, secret-less,
