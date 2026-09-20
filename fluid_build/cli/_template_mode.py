@@ -1183,6 +1183,20 @@ def _generate_engine_artifacts(
             repository = f"{resolved_name}_project"
             build["repository"] = f"./{repository}"
 
+        # Same mesh-edge warning the `fluid generate transformation` path
+        # emits. There are exactly two engine.generate() call sites and the
+        # warning covered only the other one, so a contract authored through
+        # the copilot dropped its declared upstreams in silence -- the case
+        # the warning exists for. Imported function-locally to match the
+        # deferred-import convention this module already uses for
+        # ``get_engine`` above, and to keep the ``fluid --help`` cold path
+        # free of the generate-transformation module.
+        from fluid_build.cli.generate_speed_transformation import (
+            _warn_unwired_consumes,
+        )
+
+        _warn_unwired_consumes(contract, engine, resolved_name, build_id=build.get("id"))
+
         files = engine.generate(
             contract,
             build,
