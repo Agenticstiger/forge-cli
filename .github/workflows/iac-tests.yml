@@ -247,7 +247,12 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install --quiet --upgrade pip
           .venv/bin/pip install --quiet -e '.[dev]'
-          .venv/bin/pip install --quiet dbt-athena-community dbt-redshift
+          # Capped below 2.0 (see ci.yml). dbt-athena-community declares no
+          # dbt-core constraint at all, so without this the job floats onto
+          # whatever dbt-core resolves to -- and `dbt-core` already publishes
+          # 2.0.0rc*. dbt-redshift happens to cap itself at <2.0 today, but
+          # relying on a co-installed adapter's ceiling is not a constraint.
+          .venv/bin/pip install --quiet 'dbt-core<2' dbt-athena-community dbt-redshift
 
       # Keyless OIDC: GitHub Actions mints a short-lived token that
       # AWS STS exchanges for credentials via an IAM role's trust
@@ -298,7 +303,10 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install --quiet --upgrade pip
           .venv/bin/pip install --quiet -e '.[dev]'
-          .venv/bin/pip install --quiet dbt-bigquery
+          # Capped below 2.0 (see ci.yml). dbt-bigquery does declare
+          # `dbt-core<2.0` today; the explicit cap keeps every dbt install in
+          # this repo stating its own ceiling rather than inheriting one.
+          .venv/bin/pip install --quiet 'dbt-core<2' dbt-bigquery
 
       # Workload Identity Federation: GitHub Actions OIDC token →
       # GCP-side WIF provider → impersonates the test service account.
