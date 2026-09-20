@@ -39,10 +39,12 @@ the ceiling to be stated explicitly at every site.
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
 import pytest
 from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 pytestmark = pytest.mark.unit
@@ -58,7 +60,7 @@ _DBT_V2 = Version("2.0.0")
 #: `dbt-v2-canary` job exists precisely to run a v2 binary. The exemption is
 #: deliberately narrow: the line must pull no dbt-core-based package, or the
 #: ceiling is required as normal.
-_V2_DISTRIBUTIONS = {"dbt-oss", "dbt"}
+_V2_DISTRIBUTIONS = {canonicalize_name(n) for n in ("dbt-oss", "dbt")}
 
 
 def _logical_lines(text: str):
@@ -75,7 +77,18 @@ def _logical_lines(text: str):
     so an uncapped install would pass unseen. The lineno reported is the
     first physical line, which is where a reader should look.
     """
-    lines = text.splitlines()
+    # Comments are stripped per PHYSICAL line, BEFORE joining. Doing it after
+    # the join lets a comment that happens to end in a backslash swallow the
+    # real command below it:
+    #
+    #     # reflowed below \\
+    #     pip install dbt-duckdb
+    #
+    # joins to "# reflowed below  pip install dbt-duckdb", which then strips
+    # to nothing -- an uncapped install that the scan never sees. (The
+    # pre-rewrite line-oriented scan caught that one; the continuation
+    # support reintroduced it.)
+    lines = [ln.split("#", 1)[0] for ln in text.splitlines()]
     i = 0
     while i < len(lines):
         start_no = i + 1
@@ -88,16 +101,36 @@ def _logical_lines(text: str):
 
 
 def _dbt_requirements(line: str):
-    """Parse the dbt distributions this line installs into Requirements."""
+    """Parse the dbt distributions this line installs into Requirements.
+
+    Tokenised with :mod:`shlex`, i.e. the way the shell hands argv to pip.
+    Splitting on bare whitespace instead loses any requirement containing a
+    space -- and PEP 508 allows several that this repo already writes:
+
+        "dbt-core>=1.10, <2"                 -> specifier truncated to >=1.10
+        "dbt-core >=1.10,<2"                 -> specifier dropped entirely
+        "dbt-duckdb; python_version<'3.13'"  -> unparseable, line vanishes
+
+    All three then read as *uncapped* (or as no site at all), so the guard
+    either fails a correct pin with a message asserting the opposite, or --
+    worse -- reports green on a line it never saw. pyproject.toml already
+    pins dbt with markers (`dbt-bigquery>=1.7,<2 ; python_version >= '3.10'`),
+    so the marker spelling is the expected move, not an exotic one.
+    """
+    try:
+        tokens = shlex.split(line)
+    except ValueError:  # unbalanced quotes (shell interpolation, etc.)
+        tokens = line.replace('"', " ").replace("'", " ").split()
+
     reqs = []
-    for token in line.replace('"', " ").replace("'", " ").split():
+    for token in tokens:
         token = token.strip(",")
-        if not token.lower().startswith("dbt"):
+        if not token.lower().lstrip("\"'").startswith("dbt"):
             continue
         try:
             reqs.append(Requirement(token))
         except Exception:
-            continue  # not a requirement (a flag, a path, prose)
+            continue  # a flag, a path, or prose -- not a requirement
     return reqs
 
 
@@ -129,12 +162,21 @@ def test_the_scan_finds_the_known_dbt_install_sites():
     A green result that means "scanned nothing" is the failure this whole
     file exists to prevent.
     """
-    assert len(_SITES) >= 5, (
-        "expected at least the 5 known dbt install sites (2 in ci.yml, 1 in "
-        f"ai-provider-matrix.yml, 2 in iac-tests.yml); found {len(_SITES)}: "
-        f"{[(w, n) for w, n, _, _ in _SITES]}"
+    # Count the sites that are actually ASSERTED, not the raw total. The
+    # dbt-v2-canary job contributes two more install lines that the v2-only
+    # rule exempts, so a bare `len(_SITES) >= 5` would still pass after BOTH
+    # real ci.yml sites were deleted -- the exempt rows would cover for them.
+    asserted = [
+        (w, n)
+        for w, n, _, reqs in _SITES
+        if not ({canonicalize_name(r.name) for r in reqs} <= _V2_DISTRIBUTIONS)
+    ]
+    assert len(asserted) >= 5, (
+        "expected at least the 5 known dbt-core-bearing install sites (2 in "
+        "ci.yml, 1 in ai-provider-matrix.yml, 2 in iac-tests.yml); found "
+        f"{len(asserted)}: {asserted}"
     )
-    workflows = {name for name, _, _, _ in _SITES}
+    workflows = {name for name, _ in asserted}
     for expected in {"ci.yml", "ai-provider-matrix.yml", "iac-tests.yml"}:
         assert expected in workflows, f"{expected} no longer contributes a dbt install line"
 
@@ -145,11 +187,11 @@ def test_the_scan_finds_the_known_dbt_install_sites():
     ids=[f"{w}:{n}" for w, n, _, _ in _SITES],
 )
 def test_every_dbt_install_states_a_dbt_core_ceiling(workflow, lineno, line, reqs):
-    names = {r.name.lower() for r in reqs}
+    names = {canonicalize_name(r.name) for r in reqs}
     if names <= _V2_DISTRIBUTIONS:
         pytest.skip(f"installs only the v2 distribution(s) {sorted(names)}; no dbt-core to cap")
 
-    core = [r for r in reqs if r.name.lower() == "dbt-core"]
+    core = [r for r in reqs if canonicalize_name(r.name) == "dbt-core"]
     assert core, (
         f"{workflow}:{lineno} installs {sorted(names)} without naming dbt-core, so "
         "nothing states a ceiling and the adapters' own metadata decides:\n"

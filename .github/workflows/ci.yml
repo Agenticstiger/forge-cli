@@ -593,6 +593,16 @@ jobs:
     name: dbt v2 end-to-end (dbt-oss ${{ matrix.leg }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Job-level, not step-level, and this is the whole point: the shell
+    # warn-wrapper below only covers the pytest step, while the two steps
+    # most exposed to an upstream release -- the unbounded `pip install
+    # --upgrade dbt-oss`, and the `grep -Eq '^dbt(-oss)? v?2\.'` banner
+    # assertion -- run before it. A dbt-oss 3.0.0, or any reworded version
+    # banner from a package that says its behaviour may change, would have
+    # killed the job two steps early and painted every open PR red. That is
+    # exactly what the pinned/latest split exists to prevent, so the whole
+    # `latest` leg is non-blocking.
+    continue-on-error: ${{ matrix.leg == 'latest' }}
     strategy:
       fail-fast: false
       matrix:
