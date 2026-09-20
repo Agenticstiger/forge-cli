@@ -54,6 +54,30 @@ _MENTIONS_DBT = re.compile(r"(?<![\w-])dbt[\w-]*", re.IGNORECASE)
 #: An explicit dbt-core upper bound, in any of the quoting styles used here.
 _HAS_CEILING = re.compile(r"dbt-core\s*<\s*2")
 
+#: The dbt v2 distributions. A line installing only these is exempt: they ARE
+#: the v2 engine, so a dbt-core ceiling on them is meaningless -- and the
+#: `dbt-v2-canary` job exists precisely to run an uncapped v2 binary. The
+#: exemption is deliberately narrow: the line must pull no dbt-core-based
+#: package, or the ceiling is required as normal.
+_V2_DISTRIBUTIONS = {"dbt-oss", "dbt"}
+_DBT_PKG = re.compile(r"(?<![\w.-])(dbt[\w-]*)", re.IGNORECASE)
+
+
+def _dbt_packages(line: str):
+    """dbt distribution names installed by this line, sans version specifiers."""
+    names = set()
+    for token in line.replace('"', " ").replace("'", " ").split():
+        if not token.lower().startswith("dbt"):
+            continue
+        # strip a version specifier: dbt-core<2 -> dbt-core
+        names.add(re.split(r"[<>=!~\[]", token, 1)[0].rstrip(",").lower())
+    return names
+
+
+def _is_v2_only(line: str) -> bool:
+    pkgs = _dbt_packages(line)
+    return bool(pkgs) and pkgs <= _V2_DISTRIBUTIONS
+
 
 def _install_lines():
     """Yield (workflow, lineno, line) for every pip-install-of-dbt line.
@@ -91,6 +115,10 @@ def test_the_scan_finds_the_known_dbt_install_sites():
 
 @pytest.mark.parametrize("workflow,lineno,line", list(_install_lines()))
 def test_every_dbt_install_states_a_dbt_core_ceiling(workflow: str, lineno: int, line: str):
+    if _is_v2_only(line):
+        pytest.skip(
+            f"installs only the v2 distribution(s) {_dbt_packages(line)}; no dbt-core to cap"
+        )
     assert _HAS_CEILING.search(line), (
         f"{workflow}:{lineno} installs dbt without an explicit dbt-core ceiling:\n"
         f"    {line}\n"

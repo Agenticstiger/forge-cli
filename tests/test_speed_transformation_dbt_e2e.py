@@ -48,17 +48,29 @@ from fluid_build.cli.generate_speed_transformation import run as run_speed_trans
 #: evidence. The env var makes "dbt was supposed to be here" assertable.
 _REQUIRE_DBT = os.environ.get("FLUID_REQUIRE_DBT") == "1"
 
-if _REQUIRE_DBT and shutil.which("dbt") is None:  # pragma: no cover - CI guard
-    raise RuntimeError(
-        "FLUID_REQUIRE_DBT=1 but no `dbt` binary is on PATH. This leg exists "
-        "to run the dbt parse canary; skipping it silently is the failure it "
-        "is meant to prevent."
-    )
-
 pytestmark = pytest.mark.skipif(
     shutil.which("dbt") is None and not _REQUIRE_DBT,
     reason="dbt not installed; skipping end-to-end dbt parse gate test.",
 )
+
+
+def test_dbt_is_present_when_the_leg_requires_it() -> None:
+    """Fail -- loudly, and as a normal test -- when the canary cannot run.
+
+    Deliberately a test rather than a module-level ``raise``. A raise at
+    import time is a *collection* error, and pytest aborts the whole run on
+    one of those ("Interrupted: N errors during collection"), so setting
+    FLUID_REQUIRE_DBT=1 for any broader run without dbt installed would take
+    the entire suite down instead of reporting one failure. Verified: the
+    raise form stopped two unrelated test files from executing at all.
+    """
+    if not _REQUIRE_DBT:
+        pytest.skip("FLUID_REQUIRE_DBT not set; the canary is optional here.")
+    assert shutil.which("dbt") is not None, (
+        "FLUID_REQUIRE_DBT=1 but no `dbt` binary is on PATH. This leg exists to "
+        "run the dbt parse canary, and a silent skip is the exact failure it is "
+        "meant to prevent."
+    )
 
 
 def test_forge_generate_dbt_parse_dimensional(tmp_path: Path) -> None:
