@@ -573,6 +573,56 @@ jobs:
         run: python scripts/cleanup_local_test_artifacts.py
 
   # ──────────────────────────────────────────────────────────────
+  # dbt v2 canary. The `test` and `coverage-and-audit` jobs install
+  # `dbt-core<2` + dbt-duckdb, so they exercise the 1.x line only. Every
+  # claim this repo makes about dbt v2 / Fusion was otherwise asserted
+  # against fixture strings -- no CI job had ever run a v2 binary.
+  #
+  # dbt v2 ships as two distributions: `dbt` (proprietary) and `dbt-oss`
+  # (Apache-2.0). This installs dbt-oss, which provides a `dbt` binary
+  # reporting `dbt-oss <ver>` and carries its own adapters -- no
+  # dbt-duckdb, and deliberately NO dbt-core, so the 1.x engine cannot
+  # shadow it on PATH.
+  #
+  # FLUID_REQUIRE_DBT=1 is the point of the job: the e2e canary
+  # self-skips when `dbt` is absent, which is exactly how it sat unrun
+  # for so long while reporting green. With the flag set, a missing
+  # binary is a hard error instead of a silent skip.
+  # ──────────────────────────────────────────────────────────────
+  dbt-v2-canary:
+    name: dbt v2 end-to-end (dbt-oss)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install forge-cli and the dbt v2 engine
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,local]"
+          # No version cap here, and no dbt-core: this job exists to run
+          # whatever the current v2 line is.
+          python -m pip install dbt-oss
+      - name: Assert the binary really is v2
+        # Guards against dbt-oss silently not providing `dbt`, or a
+        # transitive dep dragging dbt-core 1.x in and winning on PATH --
+        # either of which would make the job below pass while testing
+        # the engine it was built to stop testing.
+        run: |
+          set -euo pipefail
+          dbt --version
+          dbt --version | head -1 | grep -Eq '^dbt(-oss)? v?2\.' \
+            || { echo "::error::expected a dbt 2.x binary; got: $(dbt --version | head -1)"; exit 1; }
+      - name: Run the dbt parse canary against v2
+        env:
+          FLUID_REQUIRE_DBT: "1"
+        run: |
+          python -m pytest -v tests/test_speed_transformation_dbt_e2e.py
+
+  # ──────────────────────────────────────────────────────────────
   # Stage 1 — keyless emulated provider integration. Free, secret-less,
   # runs on every PR including from forks. moto stands in for AWS,
   # fakesnow for Snowflake (both in-process — "light"). Heavy Docker

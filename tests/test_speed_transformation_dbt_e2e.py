@@ -28,6 +28,7 @@ default ``local`` platform — no cloud warehouse creds needed.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from argparse import Namespace
 from pathlib import Path
@@ -37,8 +38,25 @@ import pytest
 from fluid_build.cli.forge_data_model import run_from_intent_command
 from fluid_build.cli.generate_speed_transformation import run as run_speed_transformation
 
+#: Set by the CI legs that exist specifically to run this canary. When it is
+#: set, a missing ``dbt`` is a FAILURE, not a skip.
+#:
+#: This test is the only one that drives a real ``dbt parse`` over a
+#: forge-generated project, and for a long time no CI job installed dbt -- so
+#: it self-skipped on every run and reported as a pass. A canary that is
+#: never lit is worse than no canary, because the green tick is read as
+#: evidence. The env var makes "dbt was supposed to be here" assertable.
+_REQUIRE_DBT = os.environ.get("FLUID_REQUIRE_DBT") == "1"
+
+if _REQUIRE_DBT and shutil.which("dbt") is None:  # pragma: no cover - CI guard
+    raise RuntimeError(
+        "FLUID_REQUIRE_DBT=1 but no `dbt` binary is on PATH. This leg exists "
+        "to run the dbt parse canary; skipping it silently is the failure it "
+        "is meant to prevent."
+    )
+
 pytestmark = pytest.mark.skipif(
-    shutil.which("dbt") is None,
+    shutil.which("dbt") is None and not _REQUIRE_DBT,
     reason="dbt not installed; skipping end-to-end dbt parse gate test.",
 )
 
