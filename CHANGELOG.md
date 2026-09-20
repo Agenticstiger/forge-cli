@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Cross-mesh upstreams can be named and pinned in the contract (#626).**
+  A `consumes[]` entry could already reference a data product in another mesh,
+  but the contract had nowhere to say *which* mesh or *what the upstream looked
+  like when we composed against it*. `fluid apply` shipped a federation gate
+  that wanted both, so the only contracts that could reach it were ones that
+  failed `additionalProperties` first. Two optional fields on `consumeRef` in
+  the 0.7.6 preview schema — `upstreamWorkspace` (an id from
+  `federation/upstreams.yaml`) and `upstreamDigest` (`sha256:<64 hex>`) — with
+  `dependentRequired` tying them together, so declaring a federated upstream
+  without pinning a digest is refused at validate time rather than discovered at
+  apply time, where "no pin" would read as "no drift". That only bites because
+  the schema is drafted at 2020-12; under Draft 7 `dependentRequired` is
+  silently ignored, so the pin would *look* enforced while accepting anything —
+  there is a test pinning the draft for exactly that reason.
+
+- **An engine that ignores `consumes[]` now says so (#625).** `consumes[]` is the
+  mesh edge, and only the dbt engine acts on it (emitting `models/sources.yml`).
+  The other five — `sql`, `spark`, `glue`, `dataform`, `dataflow` — generate from
+  the build's own SQL and never read it, so a declared upstream was simply absent
+  from the output and generation still exited 0. Not hypothetical: the shipped
+  `customer-360` template declares three upstreams, uses `engine: sql`, and none
+  of them appears anywhere in the five files it generates. Engines now declare
+  `wires_consumes` and generation warns once per build, naming every upstream
+  that will not be wired. Deliberately a warning — contracts in this shape are
+  already out there, and it is a gap in what we generate, not an invalid
+  contract. It does **not** invent a wiring: how a SQL or Spark job should
+  address a federated upstream is a real per-engine design decision, and guessing
+  it inside a warning would be worse than the silence.
+
 ### Changed
 
 - **Every shipped contract now declares the current stable schema, `0.7.5`.**
@@ -27,18 +58,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on `fluidVersion`. That is a test-expectation refactor across ten files, not a
   template bump, and it is scoped separately rather than bundled here.
 
-### Fixed
-
-- **A shipped template did not validate, and nothing noticed.**
-  `fluid init --template multiple-outputs` scaffolded a contract that `fluid
-  validate` rejected immediately: `metadata.layer: 'Multi-Layer'` is not in the
-  permitted set. It is a medallion demo exposing bronze, silver and gold outputs,
-  each already carrying its own per-expose layer label; the product-level value
-  was trying to say "spans layers", which the field cannot express. It now
-  declares `Gold`, the layer of the output a consumer actually reads.
-
-### Changed
-
 - **Every shipped template is now schema-validated in CI.** The existing tests
   checked that scaffolding *produces* a `contract.fluid.yaml` and that the file
   exists; none ever validated its content, which is how the above shipped through
@@ -49,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `normalize_metadata_in_place`, reported separately as "metadata consistency".
   A fence built on the obvious API alone would have passed on the one file we
   knew was broken. It also refuses a template pinned to a preview schema.
+
 - **No shipped default may point at a host that can never resolve.**
   `tests/test_no_reserved_tld_defaults.py` walks the AST of `fluid_build/` for
   string defaults on RFC 2606 reserved names. Three shipped as runtime endpoints
@@ -59,7 +79,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mocks), and a gate that fired on those would have been switched off. `tests/`
   is unscanned, because test code *should* use `.test` hosts.
 
+- **`dbt-core` is capped below 2.0 everywhere forge installs dbt (#624).** dbt v2
+  is a separate, non-Apache-2.0 distribution published as `dbt` / `dbt-oss`, and
+  its emitter differences are distinct work from what these paths do. The runtime
+  container install, the engine specs and the CI legs now state the ceiling.
+  `DBT_ADAPTER_PACKAGE` still overrides it for anyone deliberately testing v2.
+
+- **The federated-digest gate warns instead of aborting the apply (#626).**
+  Unlike plan-binding — which compares two artifacts forge produced itself, so a
+  mismatch means tampering — this gate's verdict depends on a third party's
+  registry being reachable and honest. Hard-failing would let another team's git
+  outage block production applies, and the first thing anyone reaches for is
+  `--no-verify-federation`, permanently; a gate whose predictable outcome is its
+  own escape hatch protects nothing. Findings log at WARNING under
+  `apply_consumes_drift` with a payload shaped like `PlanBindingError`'s, so one
+  log-parser regex matches both gates. Each violation carries a
+  `violation_kind` — `drift` / `unreachable` / `unpinned` / `unknown-workspace` /
+  `not-wired` — separating *the upstream really changed* from *we could not
+  check it*. `FLUID_FEDERATION_TIMEOUT_SECONDS` (default 30s, listed in
+  `fluid doctor --env`) bounds each git operation.
+
 ### Fixed
+
+- **A shipped template did not validate, and nothing noticed.**
+  `fluid init --template multiple-outputs` scaffolded a contract that `fluid
+  validate` rejected immediately: `metadata.layer: 'Multi-Layer'` is not in the
+  permitted set. It is a medallion demo exposing bronze, silver and gold outputs,
+  each already carrying its own per-expose layer label; the product-level value
+  was trying to say "spans layers", which the field cannot express. It now
+  declares `Gold`, the layer of the output a consumer actually reads.
 
 - **`fluid import airbyte` could not be pointed at an Airbyte instance.**
   `AirbyteImporter.server_url` defaulted to `https://airbyte.test`, and the
@@ -81,6 +129,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FLUID_CATALOG_<NAME>_URL`). With neither set, the importer refuses by name
   and does so *before* any client is constructed, so a missing setting costs no
   socket and returns immediately instead of after a resolver timeout.
+
+- **Generated CI pipelines ran nine `fluid` commands that do not exist (#620).**
+  `fluid generate ci` writes pipelines that *other people's* CI executes, where a
+  bad flag fails in their logs and reads as a FLUID bug. Nine invocations were
+  wrong across all seven CI systems — `--check` flags that were never added,
+  `fluid audit` / `benchmark` / `lineage` which are not commands at all,
+  `viz-plan --output` where the flag is `--out` and `plan` is a required
+  positional. Several were unguarded: GitHub's `plan` job carries
+  `needs: generate`, so an exit 2 there skipped everything downstream. Replaced
+  with the real equivalents where one exists. The regression test parses every
+  emitted invocation against the real argparse tree; 16 of its 30 cases fail
+  without the change.
+
+- **Two `actionId`s differing only in punctuation dropped a task (#623).**
+  `sanitize_identifier` is deliberately not injective — `a-b` and `a.b` both
+  become `a_b` — so two distinct actions collapsed onto one Airflow task id and
+  one silently overwrote the other. Task identifiers are now uniquified with a
+  `_2` / `_3` suffix on collision.
+
+- **A forged contract with semantics emitted a dbt project that would not parse (#621).**
+  `generate_semantic_models` wrote `model: ref('<exposeId>')`, but the intent,
+  multi-stage and embedded-logic emitters name their files from *stage* names, so
+  the semantic model referenced a node nobody emitted and dbt rejected the whole
+  project. It now takes the set of model names generation actually wrote and
+  drops — loudly — any semantic model whose target is missing.
+
+- **The emitted dbt YAML now parses on dbt-core 1.8 through dbt-oss 2.0 (#621).**
+  Version floors were *measured* against a rig of nine dbt-core releases plus
+  dbt-oss 2.0.4 rather than taken from the docs — which mattered: the documented
+  floor for nested generic-test `arguments:` is 1.10.5, but 1.10.5 and 1.10.7
+  both fail and the real floor is 1.10.8, where the behaviour flag flips.
+  `access` and `freshness` under `config:` parse everywhere but are *silently
+  ignored* below 1.10.5, which only reading `target/manifest.json` revealed.
+
+- **`--mesh-hub` skipped the `dbt deps` step it depends on (#621).** The gate ran
+  `dbt deps` only when `packages.yml` existed, but under `--mesh-hub` the pins go
+  into `dependencies.yml` (dbt forbids both), so the one configuration that most
+  needed it never ran it.
+
+- **The shipped quickstart READMEs documented 36 commands that do not work (#622).**
+  Every template README is the first thing a new user follows. The guard walks
+  the fenced commands in each and parses them against the real argparse tree; a
+  permissive fence-tag rule matters — restricting to ` ```bash ` desynchronised
+  the pairing and hid 21 further defects.
+
+- **One unreachable upstream could hide drift in another (#626).** The federated
+  fetch sat outside any per-row handler, so the first network error propagated
+  out of the whole walk, discarding violations already collected for other
+  upstreams. One team's registry going down made a genuinely drifted pin
+  elsewhere invisible.
+
+- **A registry being down was reported as missing FLUID code (#626).** All three
+  fetch backends return `None` on timeout / 404 / TLS error / auth reject / SSRF
+  block / failed clone, and `fetch_federated_digest` turned that into a bare
+  `NotImplementedError` — the same exception used for "no fetcher for this
+  workspace kind". A partner mesh being *down* surfaced as "fetcher for
+  kind='http_registry' not yet wired", sending operators to read our source
+  instead of their registry, and `unreachable_count` read 0 exactly when an
+  upstream was unreachable.
+
+- **The federated git fetch could hang an apply indefinitely (#626).**
+  GitPython's `kill_after_timeout` is *accepted* by `Repo.clone_from` — it sits
+  in `execute_kwargs`, so it is not rejected the way an unknown kwarg is — and
+  ignored, because `_clone` passes `as_process=True` and the watchdog runs only
+  on the other branch. Measured against a TCP listener that accepts and never
+  speaks: `clone_from(..., kill_after_timeout=3)` was still running at 90s while
+  `subprocess.run([...], timeout=3)` raised at 3.0s. This was the live path, not
+  a latent one — GitPython arrives transitively via `dlt` and was tried *first*.
+  The gitpython path is removed; every federated fetch goes through the bounded
+  shell-out. Nothing is lost: GitPython shells out to the same `git` binary, so
+  it was never a fallback for git being missing.
+
+### Security
+
+- **A contract value could inject Python into a generated Airflow DAG (#620).**
+  `AirflowDAGGenerator` interpolated contract values straight into
+  `bash_command="{command}"` inside an f-string. A quote in any of them closed
+  the Python literal and put the rest of the value at module scope, where Airflow
+  executes it at DAG-parse time — no task run required. Seven vectors were
+  reachable from `contract.fluid.yaml`, `builds[].script` being the sharpest
+  (passed through verbatim by design). The DAG *header* was a second surface with
+  the same hole: `dag_id`, `description`, `schedule_interval` and the module
+  docstring. Values now route through `shlex.quote` at the shell layer,
+  `py_str_literal` at the Python-literal layer, and `sanitize_identifier`
+  wherever a value becomes a variable name — the pattern this repo already
+  documents and applies in `cli/scaffold_composer`.
 
 ## [0.15.3] — 2026-09-15
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -178,6 +179,67 @@ class TestTheShippedTemplateIsTheMotivatingCase:
         )
         # and it names a real declared upstream, not just a count
         assert "raw_customers_v1" in blob
+
+    def test_the_copilot_generate_path_is_wired_too(self, tmp_path, caplog):
+        """There are exactly TWO engine.generate() call sites; both must warn.
+
+        The first version of this feature wired only
+        ``generate_speed_transformation``. The copilot/template path in
+        ``_template_mode._generate_engine_artifacts`` calls the same engines
+        with the same contracts and warned about nothing, so a contract
+        authored through ``fluid forge`` dropped its declared upstreams in
+        exactly the silence this feature exists to break.
+
+        Driven through the real function with a stub engine rather than the
+        full copilot, which needs an LLM.
+        """
+        # ``forge_modes`` first: it and ``_template_mode`` import each
+        # other, and importing the latter cold trips the half-built module.
+        # Normal CLI startup goes through forge_modes, so this mirrors the
+        # real import order rather than working around it.
+        import fluid_build.cli.forge_modes  # noqa: F401
+        from fluid_build.cli import _template_mode as tm
+
+        contract = {
+            "id": "mesh.consumer",
+            "consumes": [
+                {"productId": "bronze.orders_v1", "exposeId": "orders"},
+            ],
+            "builds": [
+                {"id": "b1", "engine": "sql", "pattern": "embedded-logic", "properties": {}}
+            ],
+        }
+
+        class _StubEngine:
+            name = "sql"
+            wires_consumes = False
+
+            def validate(self, *a, **kw):
+                return []  # _generate_engine_artifacts gates generation on this
+
+            def generate(self, *a, **kw):
+                return {"out.sql": "SELECT 1"}
+
+        with (
+            patch("fluid_build.engines.get_engine", return_value=_StubEngine()),
+            patch("fluid_build.engines.has_engine", return_value=True),
+            caplog.at_level(logging.WARNING, logger="fluid.cli"),
+        ):
+            tm._generate_engine_artifacts(
+                contract,
+                target_dir=tmp_path,
+                context={"build_engine": "sql"},
+                discovery_report=None,
+                logger=logging.getLogger("fluid.cli.test"),
+                console=None,
+            )
+
+        blob = " ".join(r.getMessage() for r in caplog.records)
+        assert "consumes_not_wired" in blob, (
+            "the copilot generate path did not warn -- is _warn_unwired_consumes "
+            f"still called from _generate_engine_artifacts? got: {blob[:400]}"
+        )
+        assert "bronze.orders_v1" in blob
 
     def test_dbt_engine_declares_that_it_wires_consumes(self):
         from fluid_build.engines import get_engine

@@ -28,6 +28,7 @@ default ``local`` platform — no cloud warehouse creds needed.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from argparse import Namespace
 from pathlib import Path
@@ -37,10 +38,39 @@ import pytest
 from fluid_build.cli.forge_data_model import run_from_intent_command
 from fluid_build.cli.generate_speed_transformation import run as run_speed_transformation
 
+#: Set by the CI legs that exist specifically to run this canary. When it is
+#: set, a missing ``dbt`` is a FAILURE, not a skip.
+#:
+#: This test is the only one that drives a real ``dbt parse`` over a
+#: forge-generated project, and for a long time no CI job installed dbt -- so
+#: it self-skipped on every run and reported as a pass. A canary that is
+#: never lit is worse than no canary, because the green tick is read as
+#: evidence. The env var makes "dbt was supposed to be here" assertable.
+_REQUIRE_DBT = os.environ.get("FLUID_REQUIRE_DBT") == "1"
+
 pytestmark = pytest.mark.skipif(
-    shutil.which("dbt") is None,
+    shutil.which("dbt") is None and not _REQUIRE_DBT,
     reason="dbt not installed; skipping end-to-end dbt parse gate test.",
 )
+
+
+def test_dbt_is_present_when_the_leg_requires_it() -> None:
+    """Fail -- loudly, and as a normal test -- when the canary cannot run.
+
+    Deliberately a test rather than a module-level ``raise``. A raise at
+    import time is a *collection* error, and pytest aborts the whole run on
+    one of those ("Interrupted: N errors during collection"), so setting
+    FLUID_REQUIRE_DBT=1 for any broader run without dbt installed would take
+    the entire suite down instead of reporting one failure. Verified: the
+    raise form stopped two unrelated test files from executing at all.
+    """
+    if not _REQUIRE_DBT:
+        pytest.skip("FLUID_REQUIRE_DBT not set; the canary is optional here.")
+    assert shutil.which("dbt") is not None, (
+        "FLUID_REQUIRE_DBT=1 but no `dbt` binary is on PATH. This leg exists to "
+        "run the dbt parse canary, and a silent skip is the exact failure it is "
+        "meant to prevent."
+    )
 
 
 def test_forge_generate_dbt_parse_dimensional(tmp_path: Path) -> None:
