@@ -42,87 +42,129 @@ import re
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 pytestmark = pytest.mark.unit
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 
-#: A pip invocation that pulls in any dbt distribution.
 _PIP_INSTALL = re.compile(r"\bpip\s+install\b")
-_MENTIONS_DBT = re.compile(r"(?<![\w-])dbt[\w-]*", re.IGNORECASE)
-#: An explicit dbt-core upper bound, in any of the quoting styles used here.
-_HAS_CEILING = re.compile(r"dbt-core\s*<\s*2")
+_DBT_V2 = Version("2.0.0")
 
 #: The dbt v2 distributions. A line installing only these is exempt: they ARE
 #: the v2 engine, so a dbt-core ceiling on them is meaningless -- and the
-#: `dbt-v2-canary` job exists precisely to run an uncapped v2 binary. The
-#: exemption is deliberately narrow: the line must pull no dbt-core-based
-#: package, or the ceiling is required as normal.
+#: `dbt-v2-canary` job exists precisely to run a v2 binary. The exemption is
+#: deliberately narrow: the line must pull no dbt-core-based package, or the
+#: ceiling is required as normal.
 _V2_DISTRIBUTIONS = {"dbt-oss", "dbt"}
-_DBT_PKG = re.compile(r"(?<![\w.-])(dbt[\w-]*)", re.IGNORECASE)
 
 
-def _dbt_packages(line: str):
-    """dbt distribution names installed by this line, sans version specifiers."""
-    names = set()
+def _logical_lines(text: str):
+    """Yield (lineno, joined_line), collapsing backslash continuations.
+
+    A line-oriented scan is the obvious implementation and the wrong one: a
+    perfectly ordinary reflow --
+
+        pip install \\
+          dbt-duckdb
+
+    -- hides the install from a per-line regex entirely (the `pip install`
+    line names no dbt package; the `dbt-duckdb` line has no `pip install`),
+    so an uncapped install would pass unseen. The lineno reported is the
+    first physical line, which is where a reader should look.
+    """
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        start_no = i + 1
+        buf = lines[i]
+        while buf.rstrip().endswith("\\") and i + 1 < len(lines):
+            buf = buf.rstrip()[:-1] + " " + lines[i + 1].strip()
+            i += 1
+        yield start_no, buf
+        i += 1
+
+
+def _dbt_requirements(line: str):
+    """Parse the dbt distributions this line installs into Requirements."""
+    reqs = []
     for token in line.replace('"', " ").replace("'", " ").split():
+        token = token.strip(",")
         if not token.lower().startswith("dbt"):
             continue
-        # strip a version specifier: dbt-core<2 -> dbt-core
-        names.add(re.split(r"[<>=!~\[]", token, 1)[0].rstrip(",").lower())
-    return names
-
-
-def _is_v2_only(line: str) -> bool:
-    pkgs = _dbt_packages(line)
-    return bool(pkgs) and pkgs <= _V2_DISTRIBUTIONS
+        try:
+            reqs.append(Requirement(token))
+        except Exception:
+            continue  # not a requirement (a flag, a path, prose)
+    return reqs
 
 
 def _install_lines():
-    """Yield (workflow, lineno, line) for every pip-install-of-dbt line.
+    """Yield (workflow, lineno, line, reqs) for every pip-install-of-dbt line.
 
-    Comments are stripped first: the capping rationale above each site
-    names the packages, and a naive scan would read those as installs.
+    Comments are stripped first: the capping rationale above each site names
+    the packages, and a naive scan would read those as installs.
     """
     for wf in sorted(WORKFLOW_DIR.glob("*.yml")) + sorted(WORKFLOW_DIR.glob("*.yaml")):
-        for i, raw in enumerate(wf.read_text(encoding="utf-8").splitlines(), start=1):
+        for lineno, raw in _logical_lines(wf.read_text(encoding="utf-8")):
             line = raw.split("#", 1)[0]
             if not _PIP_INSTALL.search(line):
                 continue
-            if not _MENTIONS_DBT.search(line):
+            reqs = _dbt_requirements(line)
+            if not reqs:
                 continue
-            yield wf.name, i, line.strip()
+            yield wf.name, lineno, line.strip(), reqs
+
+
+_SITES = list(_install_lines())
 
 
 def test_the_scan_finds_the_known_dbt_install_sites():
     """Coverage guard.
 
-    Without this, deleting or renaming the workflows -- or a regex that
-    silently matches nothing -- would make the assertion below pass by
-    reading no lines at all. A green result that means "scanned nothing"
-    is the failure this whole file exists to prevent.
+    Without this, a renamed workflow -- or a regex that silently stops
+    matching -- makes the assertion below pass by reading no lines at all.
+    A green result that means "scanned nothing" is the failure this whole
+    file exists to prevent.
     """
-    found = list(_install_lines())
-    assert len(found) >= 5, (
+    assert len(_SITES) >= 5, (
         "expected at least the 5 known dbt install sites (2 in ci.yml, 1 in "
-        f"ai-provider-matrix.yml, 2 in iac-tests.yml); found {len(found)}: {found}"
+        f"ai-provider-matrix.yml, 2 in iac-tests.yml); found {len(_SITES)}: "
+        f"{[(w, n) for w, n, _, _ in _SITES]}"
     )
-    workflows = {name for name, _, _ in found}
+    workflows = {name for name, _, _, _ in _SITES}
     for expected in {"ci.yml", "ai-provider-matrix.yml", "iac-tests.yml"}:
         assert expected in workflows, f"{expected} no longer contributes a dbt install line"
 
 
-@pytest.mark.parametrize("workflow,lineno,line", list(_install_lines()))
-def test_every_dbt_install_states_a_dbt_core_ceiling(workflow: str, lineno: int, line: str):
-    if _is_v2_only(line):
-        pytest.skip(
-            f"installs only the v2 distribution(s) {_dbt_packages(line)}; no dbt-core to cap"
-        )
-    assert _HAS_CEILING.search(line), (
-        f"{workflow}:{lineno} installs dbt without an explicit dbt-core ceiling:\n"
+@pytest.mark.parametrize(
+    "workflow,lineno,line,reqs",
+    _SITES,
+    ids=[f"{w}:{n}" for w, n, _, _ in _SITES],
+)
+def test_every_dbt_install_states_a_dbt_core_ceiling(workflow, lineno, line, reqs):
+    names = {r.name.lower() for r in reqs}
+    if names <= _V2_DISTRIBUTIONS:
+        pytest.skip(f"installs only the v2 distribution(s) {sorted(names)}; no dbt-core to cap")
+
+    core = [r for r in reqs if r.name.lower() == "dbt-core"]
+    assert core, (
+        f"{workflow}:{lineno} installs {sorted(names)} without naming dbt-core, so "
+        "nothing states a ceiling and the adapters' own metadata decides:\n"
         f"    {line}\n"
-        "dbt-core publishes 2.0.0rc* already, and dbt-duckdb / "
-        "dbt-athena-community declare no upper bound, so this job would "
-        'float onto dbt v2. Add "dbt-core<2" to the install list.'
+        'Add "dbt-core<2" to the install list.'
+    )
+
+    #: `contains(prereleases=True)` matters: dbt-core publishes 2.0.0rc*, and a
+    #: specifier that admits the rc admits the release that follows it.
+    admits_v2 = [r for r in core if r.specifier.contains(_DBT_V2, prereleases=True)]
+    assert not admits_v2, (
+        f"{workflow}:{lineno} installs dbt-core with a specifier that admits 2.x "
+        f"({[str(r) for r in admits_v2]}):\n"
+        f"    {line}\n"
+        "dbt-core already publishes 2.0.0rc*, and dbt-duckdb / "
+        "dbt-athena-community declare no upper bound of their own, so this job "
+        'would float onto dbt v2. Use "dbt-core<2".'
     )
