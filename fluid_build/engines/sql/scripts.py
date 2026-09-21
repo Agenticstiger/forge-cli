@@ -47,15 +47,62 @@ _HEADER = (
 #: describe it as safe anywhere.
 STAGE_VIEW_DDL = "CREATE OR REPLACE VIEW {ref} AS\n{sql}\n;"
 
-#: A statement that already declares its own sink must not be wrapped.
-#: Skips leading whitespace and -- / /* */ comments, then requires the
-#: keyword at a word boundary, so ``-- create the daily view\nSELECT 1``
-#: is still a SELECT.
-_ALREADY_A_SINK = re.compile(
-    r"\A(?:\s|--[^\n]*\n|/\*.*?\*/)*"
-    r"(?:insert|create|merge|update|delete|copy|truncate|alter|drop|call|grant|revoke)\b",
-    re.IGNORECASE | re.DOTALL,
+#: Statements that declare their own sink. Such SQL must not be wrapped in a
+#: view -- it already says where its output goes.
+_SINK_KEYWORDS = frozenset(
+    {
+        "insert",
+        "create",
+        "merge",
+        "update",
+        "delete",
+        "copy",
+        "truncate",
+        "alter",
+        "drop",
+        "call",
+        "grant",
+        "revoke",
+    }
 )
+
+
+def _first_keyword(sql: str) -> str:
+    r"""The first word of ``sql``, skipping leading whitespace and comments.
+
+    Deliberately a scanner rather than a regex. The obvious pattern --
+    ``\A(?:\s|--[^\n]*\n|/\*.*?\*/)*(?:insert|create|...)\b`` -- is
+    exponential, because ``/\*.*?\*/`` under DOTALL is ambiguous inside a
+    starred alternation: ``/**//**/`` parses either as two comments or as one
+    whose body is ``*//*``, so a non-matching input explores every partition.
+    Measured on that pattern: 81 bytes took 135ms, 97 bytes 2.2s, 105 bytes
+    8.7s, and 113 bytes never returned. This SQL comes from a contract, and
+    contracts travel -- CodeQL flagged it as `py/redos`, correctly.
+
+    This visits each character at most once, so it is linear by construction.
+    """
+    index, length = 0, len(sql)
+    while index < length:
+        char = sql[index]
+        if char.isspace():
+            index += 1
+        elif sql.startswith("--", index):
+            newline = sql.find("\n", index)
+            index = length if newline == -1 else newline + 1
+        elif sql.startswith("/*", index):
+            close = sql.find("*/", index + 2)
+            index = length if close == -1 else close + 2
+        else:
+            break
+    end = index
+    while end < length and (sql[end].isalpha() or sql[end] == "_"):
+        end += 1
+    return sql[index:end].lower()
+
+
+def _already_a_sink(sql: str) -> bool:
+    """True when ``sql`` already writes to a target of its own."""
+    return _first_keyword(sql) in _SINK_KEYWORDS
 
 
 #: Anything interpolated into a ``--`` comment line. A newline in a contract
@@ -96,7 +143,7 @@ def _materialise(sql: str, output_name: Optional[str]) -> Tuple[str, Optional[st
     body = sql.strip().rstrip(";").rstrip()
     if not output_name:
         return body + "\n", "stage declares no output it exclusively owns"
-    if _ALREADY_A_SINK.match(body):
+    if _already_a_sink(body):
         return body + ";\n", "SQL already writes to its own target"
     try:
         ref = _view_ref(output_name)

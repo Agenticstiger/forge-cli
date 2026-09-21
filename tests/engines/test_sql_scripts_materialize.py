@@ -26,11 +26,13 @@ real DuckDB. This file pins the emitter's decisions.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from fluid_build.engines.base import TransformationIntent
 from fluid_build.engines.sql.scripts import (
-    _ALREADY_A_SINK,
+    _already_a_sink,
     _generate_from_intent,
     _generate_multi_stage,
     _view_ref,
@@ -246,7 +248,49 @@ class TestTheSinkPattern:
         ],
     )
     def test_classification(self, sql, is_sink):
-        assert bool(_ALREADY_A_SINK.match(sql)) is is_sink
+        assert _already_a_sink(sql) is is_sink
+
+    def test_an_unterminated_comment_does_not_swallow_the_keyword_check(self):
+        """The regex this replaced required a terminating newline on a `--`
+        comment, so an unterminated one at EOF fell through unmatched."""
+        assert _already_a_sink("-- no newline at eof") is False
+        assert _already_a_sink("/* never closed INSERT INTO t") is False
+
+    def test_it_is_linear_not_exponential(self):
+        r"""`/\*.*?\*/` under DOTALL inside a starred alternation is
+        ambiguous -- `/**//**/` parses as two comments or as one whose body
+        is `*//*` -- so a near-miss input explored every partition. Measured
+        on the pattern this replaced: 81 bytes 135ms, 97 bytes 2.2s, 105
+        bytes 8.7s, 113 bytes never returned. CodeQL flagged it `py/redos`,
+        and the SQL comes from a contract.
+
+        The payload is sized deliberately. Larger inputs make the vulnerable
+        form hang outright, and `pytest --timeout` is thread-based and cannot
+        interrupt a C-level `re.match` -- so a bigger payload would hang the
+        whole suite instead of failing this test. At 105 bytes the vulnerable
+        form still RETURNS, in ~8.7s, so the budget below actually fires.
+
+        The budget is not a performance target: the scanner does this in
+        ~0.01ms, so there are four orders of magnitude of headroom under the
+        3s bound and roughly 3x above it before a vulnerable form passes.
+        """
+        payload = "/**/" * 26 + "X"
+        start = time.perf_counter()
+        assert _already_a_sink(payload) is False
+        elapsed = time.perf_counter() - start
+        assert elapsed < 3.0, (
+            f"the sink check took {elapsed:.2f}s on {len(payload)} bytes and "
+            "has become superlinear again; the shape that exposes it is "
+            "empty block comments followed by a non-keyword"
+        )
+
+    def test_it_stays_linear_on_a_large_input(self):
+        """Separate from the budget test: this one would hang, not fail, if
+        the check regressed -- so it exists to show the scaling, not to gate."""
+        payload = "/**/" * 50_000 + "X"
+        start = time.perf_counter()
+        assert _already_a_sink(payload) is False
+        assert time.perf_counter() - start < 5.0
 
 
 class TestOrdering:
