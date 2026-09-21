@@ -131,7 +131,9 @@ class TestDigestMatchesTheFederationGate:
         before = capsys.readouterr().out.strip().splitlines()[-1]
 
         changed = json.loads(json.dumps(UPSTREAM))
-        changed["exposes"][0]["contract"]["schema"].append({"name": "customer_id", "type": "string"})
+        changed["exposes"][0]["contract"]["schema"].append(
+            {"name": "customer_id", "type": "string"}
+        )
         other = tmp_path / "changed.yaml"
         other.write_text(yaml.safe_dump(changed, sort_keys=True), encoding="utf-8")
         _run(["contract", "digest", str(other)], tmp_path)

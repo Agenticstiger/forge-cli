@@ -63,7 +63,9 @@ def _contract():
             {
                 "exposeId": "high_value_customers",
                 "kind": "table",
-                "contract": {"schema": [{"name": "customer_id", "type": "string", "required": True}]},
+                "contract": {
+                    "schema": [{"name": "customer_id", "type": "string", "required": True}]
+                },
             },
         ],
     }
