@@ -233,6 +233,18 @@ def _build_platform(build: Dict[str, Any]) -> str:
 
 
 def _declared_inputs(build: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Declared readers, if any.
+
+    In practice this is an embedded-logic-only field: ``multiStagePattern``
+    is ``additionalProperties: false`` and does not list ``parameters``, so a
+    multi-stage build declaring it does not validate. Read unconditionally
+    anyway -- the check costs nothing, and gating on pattern here would mean
+    the emitter silently disagreeing with the schema if that ever changes.
+
+    ``parameters`` itself is ``{"type": "object", "additionalProperties":
+    true}``, so ``inputs`` is an open-bag convention rather than a described
+    field: a typo does not fail validation, it just binds nothing.
+    """
     params = (build.get("properties") or {}).get("parameters") or {}
     return [i for i in (params.get("inputs") or []) if isinstance(i, dict)]
 
