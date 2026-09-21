@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from fluid_build.providers._duckdb_read import build_register_view_sql
 from fluid_build.providers._sql_safety import validate_ident
 
 from .._stages import resolve_stage_outputs
@@ -195,9 +197,116 @@ def generate_scripts(
         return _generate_from_intent(contract, transformation_intent)
 
     if pattern == "multi-stage":
-        return _generate_multi_stage(contract, build)
+        files = _generate_multi_stage(contract, build)
     else:
-        return _generate_embedded(contract, build)
+        files = _generate_embedded(contract, build)
+
+    inputs = _generate_inputs(contract, build)
+    if inputs:
+        earlier = sorted(k for k in files if k < _INPUTS_FILENAME)
+        if earlier:
+            _logger.warning(
+                "sql_inputs_file_not_first: %s sort(s) before %s, so the inputs "
+                "would not exist yet when they run",
+                earlier,
+                _INPUTS_FILENAME,
+            )
+        files = {**inputs, **files}
+    return files
+
+
+#: Declared inputs are bound here. ``00_`` so it sorts before ``01_<stage>``
+#: and before any build id -- checked against every filename the shipped
+#: templates and examples emit.
+_INPUTS_FILENAME = "00_inputs.sql"
+
+#: Where an emitted ``read_csv_auto``/``read_parquet`` actually means
+#: something. Mirrors ``build_runners/base.py::LOCAL_SQL_PLATFORMS``; kept as
+#: a literal because engines do not import build_runners (import tiering --
+#: the CLI resolves and passes down, per _resolve_dbt_capabilities).
+_LOCAL_PLATFORMS = frozenset({"", "local", "duckdb"})
+
+
+def _build_platform(build: Dict[str, Any]) -> str:
+    runtime = (build.get("execution") or {}).get("runtime") or {}
+    return str(runtime.get("platform") or "").lower()
+
+
+def _declared_inputs(build: Dict[str, Any]) -> List[Dict[str, Any]]:
+    params = (build.get("properties") or {}).get("parameters") or {}
+    return [i for i in (params.get("inputs") or []) if isinstance(i, dict)]
+
+
+def _generate_inputs(contract: Dict[str, Any], build: Dict[str, Any]) -> GenerationResult:
+    """Bind each declared ``parameters.inputs`` entry to a view.
+
+    The contract says which file backs which name, and the author's SQL then
+    says ``FROM <name>``. The local provider has always honoured this at
+    ``fluid apply`` time; the emitted script did not, so a generated project
+    that applies cleanly still failed on its own with
+    ``Table with name <name> does not exist``. Six shipped examples were in
+    that state. The statement is the provider's own, via
+    ``providers/_duckdb_read``, so the two cannot drift.
+
+    ``read_csv_auto`` / ``read_parquet`` are DuckDB's, and a declared local
+    file path only means anything on a local target, so a non-local platform
+    gets a warning and no file rather than SQL its engine cannot parse.
+    """
+    inputs = _declared_inputs(build)
+    if not inputs:
+        return {}
+
+    platform = _build_platform(build)
+    if platform not in _LOCAL_PLATFORMS:
+        _logger.warning(
+            "sql_inputs_not_bound_for_platform: %d declared input(s) left unbound "
+            "because platform %r is not local; the generated script will not "
+            "resolve them",
+            len(inputs),
+            platform,
+        )
+        return {}
+
+    lines: List[str] = []
+    bound = 0
+    for entry in inputs:
+        name = entry.get("name")
+        path = entry.get("path")
+        if not name or not path:
+            lines.append(
+                f"-- Not bound: input {_comment_safe(name or '<unnamed>')} "
+                "declares no name/path pair"
+            )
+            continue
+        try:
+            statement = build_register_view_sql(
+                str(name),
+                Path(str(path)),
+                str(entry.get("format") or "").lower(),
+                entry.get("options") if isinstance(entry.get("options"), dict) else None,
+            )
+        except ValueError as exc:
+            _logger.warning("sql_input_not_bindable: %s", exc)
+            lines.append(f"-- Not bound: {_comment_safe(exc)}")
+            continue
+        lines.append(f"-- {_comment_safe(name)} <- {_comment_safe(path)}")
+        lines.append(statement)
+        bound += 1
+
+    if not bound:
+        # A file of only comments has no executable statement, which reads as
+        # a generation that produced nothing. Say so instead of emitting it.
+        _logger.warning("sql_inputs_none_bindable: no declared input could be bound")
+        return {}
+
+    header = (
+        f"{_HEADER}-- Contract: {_comment_safe(contract.get('id', 'unknown'))}\n"
+        f"-- Binds {bound} declared input(s) from "
+        f"builds[].properties.parameters.inputs\n"
+        "-- Paths are resolved relative to the working directory the script "
+        "runs in.\n\n"
+    )
+    return {_INPUTS_FILENAME: header + "\n".join(lines) + "\n"}
 
 
 def _generate_embedded(
