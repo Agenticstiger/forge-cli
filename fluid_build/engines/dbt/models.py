@@ -210,6 +210,27 @@ def _generate_embedded(
 # ---------------------------------------------------------------------------
 
 
+def _stage_model_names(stages: Any) -> Dict[str, str]:
+    """Map each stage name to the dbt model it should emit.
+
+    The first declared output wins; a stage with none keeps its own name.
+    Only the FIRST output is used -- a stage declaring several still emits
+    one model today, and silently picking one of many would be worse than
+    the current behaviour, so the rest are left alone.
+    """
+    mapping: Dict[str, str] = {}
+    for stage in stages or []:
+        if not isinstance(stage, dict):
+            continue
+        name = stage.get("name")
+        if not name:
+            continue
+        outputs = stage.get("outputs") or []
+        first = next((o for o in outputs if isinstance(o, str) and o), None)
+        mapping[str(name)] = first or str(name)
+    return mapping
+
+
 def _generate_multi_stage(
     contract: Dict[str, Any],
     build: Dict[str, Any],
@@ -221,13 +242,35 @@ def _generate_multi_stage(
     properties = build.get("properties", {})
     stages = properties.get("stages", [])
 
+    # A stage's MODEL name is its first declared output, not its own name.
+    #
+    # `stages[].outputs` already carries the mapping this emitter needs,
+    # and ignoring it is the root cause of four separate symptoms:
+    #
+    #   * schema.yml declares models named after exposes, so dbt warns
+    #     dbt1089 and the contract's declared tests attach to nothing,
+    #   * semantic_models.yml refs dangle the same way (#621),
+    #   * `fluid verify --reconcile-dbt` reports model_missing_in_dbt,
+    #   * and the author's own SQL does not resolve -- customer-360 writes
+    #     `FROM customer_base` and `FROM customer_360_master`, which are
+    #     OUTPUT names, while the files were emitted as
+    #     `stage_1_customer_base.sql` / `stage_4_rfm_calculation.sql`.
+    #
+    # Naming the model after the output fixes all four at once and makes
+    # the emitted project say what the contract says.
+    model_names = _stage_model_names(stages)
+
     for stage in stages:
         if not isinstance(stage, dict):
             continue
 
         name = stage.get("name", "unnamed")
+        model_name = model_names.get(name, name)
         stage_sql = stage.get("properties", {}).get("sql", "")
-        depends_on = stage.get("dependsOn", [])
+        # dependsOn names STAGES; the refs emitted below must name MODELS.
+        depends_on = [model_names.get(d, d) for d in stage.get("dependsOn", [])]
+        # Layer still comes from the STAGE name: it picks the directory,
+        # and renaming a file should not silently relocate it.
         layer = _infer_layer(name)
         materialization = _layer_materialization(layer)
 
@@ -261,7 +304,7 @@ def _generate_multi_stage(
                 f"-- TODO: Add source references\n"
             )
 
-        files[f"models/{layer}/{name}.sql"] = content
+        files[f"models/{layer}/{model_name}.sql"] = content
 
     return files
 
@@ -278,8 +321,11 @@ def _generate_from_intent(
     """Generate full models from AI-produced TransformationIntent."""
     files: GenerationResult = {}
 
+    model_names = _stage_model_names(intent.stages)
+
     for stage in intent.stages:
         name = stage.get("name", "unnamed")
+        model_name = model_names.get(name, name)
         sql = stage.get("sql", "")
         layer = stage.get("layer", _infer_layer(name))
         materialization = _layer_materialization(layer)
@@ -294,7 +340,7 @@ def _generate_from_intent(
             f"-- TODO: AI could not generate SQL for stage '{name}'\n"
             f"select 1\n"
         )
-        files[f"models/{layer}/{name}.sql"] = content
+        files[f"models/{layer}/{model_name}.sql"] = content
 
     return files
 
