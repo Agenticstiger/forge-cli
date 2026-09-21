@@ -698,3 +698,287 @@ def test_benign_ids_are_unchanged():
     names = set(_assigned_task_names(code))
     assert {"build_orders", "grant_analysts"} <= names
     assert not any(n.endswith("_2") for n in names)
+
+
+# ---------------------------------------------------------------------------
+# AWS provider-local generator
+#
+# The AWS generator was the only one of the four Airflow emitters that never
+# imported ``codegen_utils``; it hand-quoted every value as ``'{value}'``. The
+# cases below pin both halves of the fix: the payload must stay inert, and the
+# emitted DAG must not reference a name it never defines (Airflow executes the
+# module at parse time, so a ``NameError`` breaks the DAG just as surely).
+# ---------------------------------------------------------------------------
+
+_PY_BUILTINS = set(dir(__builtins__)) | set(vars(__import__("builtins")))
+
+
+def _bound_names(tree: ast.Module) -> set:
+    """Every name the generated module binds at any scope."""
+    bound = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            bound.update((a.asname or a.name).split(".")[0] for a in node.names)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+            args = getattr(node, "args", None)
+            if args is not None:
+                bound.update(
+                    a.arg
+                    for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]
+                    + [args.vararg, args.kwarg]
+                    if a is not None
+                )
+        elif isinstance(node, ast.Lambda):
+            a = node.args
+            bound.update(
+                x.arg
+                for x in [*a.posonlyargs, *a.args, *a.kwonlyargs] + [a.vararg, a.kwarg]
+                if x is not None
+            )
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+    return bound
+
+
+def assert_no_undefined_names(code: str) -> None:
+    """Assert the generated module never loads a name it does not define.
+
+    Catches the whole class of "generated DAG explodes at Airflow parse time":
+    a missing ``from zoneinfo import ZoneInfo``, a helper function the emitter
+    calls but never emits, and raw JSON spliced in as a Python expression
+    (``true``/``false``/``null`` are not Python names).
+    """
+    tree = ast.parse(code)
+    bound = _bound_names(tree) | _PY_BUILTINS
+    undefined = sorted(
+        {
+            n.id
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in bound
+        }
+    )
+    assert not undefined, f"generated DAG references undefined names {undefined}\n---\n{code}"
+
+
+def _aws_contract(**orchestration):
+    base = {
+        "timezone": POC_SQUOTE,
+        "schedule": POC_SQUOTE,
+        "tasks": [
+            {
+                "taskId": POC_IDENT,
+                "type": "provider_action",
+                "action": "aws.athena.execute_query",
+                "params": {
+                    "query": POC_SQL,
+                    "database": POC_SQUOTE,
+                    "outputLocation": POC_SQL,
+                },
+            },
+            {
+                "taskId": "t_s3",
+                "type": "provider_action",
+                "action": "aws.s3.ensure_bucket",
+                "params": {"bucket": POC_SQL, "region": POC_SQUOTE},
+                "dependsOn": [POC_IDENT],
+            },
+            {
+                "taskId": "t_glue_db",
+                "type": "provider_action",
+                "action": "aws.glue.ensure_database",
+                "params": {"database": POC_SQL},
+            },
+            {
+                "taskId": "t_glue_tbl",
+                "type": "provider_action",
+                "action": "aws.glue.ensure_table",
+                "params": {
+                    "database": POC_SQL,
+                    "table": POC_SQUOTE,
+                    # a bool proves raw json.dumps splicing is gone: Python has
+                    # no bare ``true``
+                    "partitioned": True,
+                },
+            },
+            {
+                "taskId": "t_redshift",
+                "type": "provider_action",
+                "action": "aws.redshift.execute_statement",
+                "params": {"sql": POC_SQL, "clusterIdentifier": POC_SQUOTE},
+            },
+            {
+                "taskId": "t_lambda",
+                "type": "provider_action",
+                "action": "aws.lambda.invoke",
+                "params": {"functionName": POC_SQL, "payload": {"k": POC_SQL, "flag": False}},
+            },
+            {
+                "taskId": "t_fallback",
+                "type": "provider_action",
+                "action": "aws.unknown.thing",
+                "params": {"anything": POC_SQL, "nested": {"deep": True}},
+            },
+        ],
+    }
+    base.update(orchestration)
+    return {"id": POC_SQUOTE, "name": POC_SQL, "orchestration": base}
+
+
+def test_aws_codegen_is_injection_safe():
+    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
+
+    assert_inert(generate_airflow_dag(_aws_contract(), "123456789012", "eu-west-1"))
+
+
+def test_aws_taskflow_codegen_is_injection_safe():
+    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag_taskflow
+
+    assert_inert(generate_airflow_dag_taskflow(_aws_contract(), "123456789012", "eu-west-1"))
+
+
+def test_aws_codegen_emits_no_undefined_names():
+    """Classic path: ZoneInfo, the glue/provider helpers, and JSON booleans."""
+    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
+
+    assert_no_undefined_names(generate_airflow_dag(_aws_contract(), "123456789012", "eu-west-1"))
+
+
+def test_aws_taskflow_emits_no_undefined_names():
+    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag_taskflow
+
+    assert_no_undefined_names(
+        generate_airflow_dag_taskflow(_aws_contract(), "123456789012", "eu-west-1")
+    )
+
+
+def test_aws_benign_sql_with_apostrophe_still_parses():
+    """The bug users hit first: a perfectly ordinary quoted SQL literal.
+
+    ``WHERE c = 'a'`` closed the hand-written ``query='...'`` and produced a
+    DAG that would not parse — no attacker required.
+    """
+    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
+
+    contract = {
+        "id": "demo_product",
+        "name": "Demo",
+        "orchestration": {
+            "schedule": "0 2 * * *",
+            "timezone": "UTC",
+            "tasks": [
+                {
+                    "taskId": "q1",
+                    "type": "provider_action",
+                    "action": "aws.athena.execute_query",
+                    "params": {
+                        "query": "SELECT * FROM t WHERE c = 'a'",
+                        "database": "db",
+                        "outputLocation": "s3://b/o/",
+                    },
+                }
+            ],
+        },
+    }
+    code = generate_airflow_dag(contract, "123456789012", "eu-west-1")
+    tree = ast.parse(code)
+    # the SQL survives intact as inert data, quote and all
+    literals = {
+        n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+    assert "SELECT * FROM t WHERE c = 'a'" in literals
+
+
+def test_aws_round_trips_payload_as_inert_data():
+    """Escaping, not stripping: the payload must still be readable as data."""
+    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
+
+    code = generate_airflow_dag(_aws_contract(), "123456789012", "eu-west-1")
+    tree = ast.parse(code)
+    literals = {
+        n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+    assert POC_SQL in literals, "query payload was mangled rather than escaped"
+
+
+def test_aws_task_id_collisions_do_not_merge_tasks():
+    """``load-orders`` and ``load.orders`` must stay two distinct variables."""
+    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
+
+    contract = {
+        "id": "c",
+        "name": "c",
+        "orchestration": {
+            "tasks": [
+                {
+                    "taskId": "load-orders",
+                    "type": "provider_action",
+                    "action": "aws.s3.ensure_bucket",
+                    "params": {"bucket": "a"},
+                },
+                {
+                    "taskId": "load.orders",
+                    "type": "provider_action",
+                    "action": "aws.s3.ensure_bucket",
+                    "params": {"bucket": "b"},
+                },
+            ]
+        },
+    }
+    code = generate_airflow_dag(contract, "123456789012", "eu-west-1")
+    tree = assert_inert(code)
+    # Only module-level assignments: the emitted helper functions legitimately
+    # reuse local names such as ``client`` across their separate bodies.
+    assigned = [
+        t.id
+        for n in tree.body
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    ]
+    operator_vars = [n for n in assigned if n not in {"default_args", "dag", "logger"}]
+    assert len(set(operator_vars)) == len(operator_vars), f"task vars collided: {operator_vars}"
+    assert len(operator_vars) == 2, f"expected both tasks emitted, got {operator_vars}"
+
+
+def test_aws_dep_on_non_dag_task_is_skipped_not_synthesised():
+    """A dependsOn naming a filtered-out task must not invent a variable.
+
+    Only ``provider_action`` tasks reach the DAG. Synthesising a name for any
+    other dep either emitted an undefined name (``NameError`` at import kills
+    every task in the file) or, because ``sanitize_identifier`` is not
+    injective, silently wired the edge to a *different* real task.
+    """
+    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
+
+    contract = {
+        "id": "c",
+        "name": "c",
+        "orchestration": {
+            "tasks": [
+                {"taskId": "prep", "type": "python", "action": "noop", "params": {}},
+                {
+                    "taskId": "make_bucket",
+                    "type": "provider_action",
+                    "action": "aws.s3.ensure_bucket",
+                    "params": {"bucket": "b"},
+                    "dependsOn": ["prep"],
+                },
+            ]
+        },
+    }
+    code = generate_airflow_dag(contract, "123456789012", "eu-west-1")
+    assert_no_undefined_names(code)
+    assert "prep >>" not in code
+    assert "skipped" in code
+
+
+def test_aws_task_id_cannot_rebind_emitted_module_names():
+    """A taskId of ``dag`` must not overwrite the DAG object itself."""
+    from fluid_build.providers.aws.codegen.airflow import _unique_task_identifiers
+
+    m = _unique_task_identifiers([{"taskId": "dag"}, {"taskId": "_execute_provider_action"}])
+    assert m["dag"] != "dag"
+    assert m["_execute_provider_action"] != "_execute_provider_action"

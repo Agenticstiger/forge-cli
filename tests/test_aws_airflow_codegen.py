@@ -25,7 +25,6 @@ from fluid_build.providers.aws.codegen.airflow import (
     _generate_single_task,
     _generate_task_dependencies,
     _sanitize_dag_id,
-    _sanitize_task_id,
     generate_airflow_dag,
 )
 
@@ -48,10 +47,33 @@ class TestSanitizeDagId:
         assert _sanitize_dag_id("") == ""
 
 
-# ── _sanitize_task_id ───────────────────────────────────────────────
-class TestSanitizeTaskId:
-    def test_delegates_to_dag_id(self):
-        assert _sanitize_task_id("my task!") == _sanitize_dag_id("my task!")
+# ── task identifiers ────────────────────────────────────────────────
+class TestTaskIdentifiers:
+    """Task variable names come from the shared ``sanitize_identifier``.
+
+    The module-local ``_sanitize_task_id`` used to delegate to
+    ``_sanitize_dag_id``, which guards neither Python keywords nor a leading
+    digit -- both emit a ``SyntaxError`` in the generated DAG.
+    """
+
+    def test_uses_shared_sanitizer(self):
+        from fluid_build.providers.aws.codegen.airflow import _task_var
+        from fluid_build.providers.common.codegen_utils import sanitize_identifier
+
+        assert _task_var({"taskId": "my task!"}, None) == sanitize_identifier("my task!")
+
+    def test_keyword_and_leading_digit_are_legal_identifiers(self):
+        from fluid_build.providers.aws.codegen.airflow import _task_var
+
+        assert _task_var({"taskId": "class"}, None).isidentifier()
+        assert not _task_var({"taskId": "class"}, None) == "class"
+        assert _task_var({"taskId": "1st_task"}, None).isidentifier()
+
+    def test_collision_map_disambiguates(self):
+        from fluid_build.providers.aws.codegen.airflow import _unique_task_identifiers
+
+        m = _unique_task_identifiers([{"taskId": "load-orders"}, {"taskId": "load.orders"}])
+        assert len(set(m.values())) == 2, m
 
 
 # ── _convert_schedule ───────────────────────────────────────────────
