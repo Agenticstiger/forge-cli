@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -72,6 +73,18 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Output path. Default: overwrite --target after a one-line backup",
     )
     apply_p.set_defaults(cmd=COMMAND, func=_run_apply_suggestion)
+
+    digest_p = sub.add_parser(
+        "digest",
+        help="Print a contract's canonical sha256 digest (for consumes[].upstreamDigest)",
+    )
+    digest_p.add_argument("contract", help="Path to the contract YAML/JSON")
+    digest_p.add_argument(
+        "--json",
+        action="store_true",
+        help='Emit {"path": ..., "digest": ...} instead of the bare digest',
+    )
+    digest_p.set_defaults(cmd=COMMAND, func=_run_digest)
 
     migrate_p = sub.add_parser(
         "migrate-product-type",
@@ -192,6 +205,57 @@ def _twin_status(metadata: Dict[str, Any]) -> Tuple[str, str]:
         str(metadata.get("layer") or ""),
         str(metadata.get("productType") or ""),
     )
+
+
+def _run_digest(args, logger: logging.Logger) -> int:
+    """Print the canonical digest of a contract.
+
+    This exists because 0.7.6 made ``consumes[].upstreamDigest`` REQUIRED
+    whenever ``upstreamWorkspace`` is set, and then shipped no way to
+    obtain the value. ``compute_contract_digest`` was reachable only from
+    inside the federation fetcher, so a downstream author was told to pin
+    a digest they could not compute -- the schema demanded a number
+    nobody could produce.
+
+    The digest is over the PARSED, canonicalised contract, never the raw
+    bytes: peers format the same contract differently (key order, indent,
+    quoting, comments, CRLF) and a text hash would make every one of
+    those look like upstream drift. It is the same function ``fluid
+    apply``'s federation gate compares against, so what this prints is
+    exactly what that gate expects to see.
+    """
+    # Lazy import — keeps `fluid contract apply-suggestion` cold-start cheap.
+    from fluid_build.forge.core.plan_digest import compute_contract_digest
+
+    path = Path(args.contract)
+    if not path.is_file():
+        raise CLIError(1, "digest_contract_not_found", {"path": str(path)})
+
+    try:
+        contract = _load_contract(path)
+    except Exception as exc:
+        raise CLIError(
+            1, "digest_contract_unreadable", {"path": str(path), "error": str(exc)}
+        ) from exc
+
+    if not isinstance(contract, dict):
+        raise CLIError(
+            1,
+            "digest_contract_not_a_mapping",
+            {"path": str(path), "type": type(contract).__name__},
+        )
+
+    digest = compute_contract_digest(contract)
+
+    # Written to stdout rather than through ``cprint``: this is a value to
+    # be piped, not a message to be read, and the console layer is free to
+    # decorate. Same shape as ``cli/secrets.py::_emit``.
+    if getattr(args, "json", False):
+        json.dump({"path": str(path), "digest": digest}, sys.stdout, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(digest + "\n")
+    return 0
 
 
 def _run_migrate_product_type(args, logger: logging.Logger) -> int:
