@@ -566,8 +566,13 @@ jobs:
         # encoding="utf-8" (xsdOYJ6E). Running this job WITHOUT the env knobs
         # is the cross-platform proof that the CLI no longer needs them; a
         # static gate (tests/test_no_unencoded_text_io.py) keeps it that way.
+        env:
+          # This is the leg that exists to execute generated SQL, so a
+          # missing duckdb here is a red build, not a quiet skip. Everywhere
+          # else the `|| .[dev]` install fallback makes absence legitimate.
+          FLUID_REQUIRE_DUCKDB: "1"
         run: |
-          python -m pytest -v -m "integration and not slow" tests/test_e2e_local.py tests/test_e2e_local_apply.py tests/test_e2e_local_negative.py tests/providers/test_local_live_happy_path.py
+          python -m pytest -v -m "integration and not slow" tests/test_e2e_local.py tests/test_e2e_local_apply.py tests/test_e2e_local_negative.py tests/providers/test_local_live_happy_path.py tests/test_quickstart_templates_execute.py
       - name: Cleanup local artifacts (defensive)
         if: always()
         run: python scripts/cleanup_local_test_artifacts.py
