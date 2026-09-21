@@ -36,7 +36,11 @@ from __future__ import annotations
 
 import pytest
 
-from fluid_build.engines.dbt.models import _stage_model_names, generate_models
+from fluid_build.engines.dbt.models import (
+    _generate_multi_stage,
+    _stage_model_names,
+    generate_models,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -150,3 +154,63 @@ class TestTheMappingHelper:
         assert _stage_model_names([None, 42, "str", {}, {"outputs": ["x"]}]) == {}
         assert _stage_model_names(None) == {}
         assert _stage_model_names([]) == {}
+
+
+class TestCollidingOutputsLoseNoSql:
+    """Two stages may legitimately declare the same output -- an incremental
+    stage and its backfill twin, say. Emitted files are keyed by path, so
+    handing both the output name would silently drop one stage's SQL: the
+    exact failure this rename exists to end, reintroduced by the fix."""
+
+    CONTRACT = {"metadata": {"name": "x"}}
+
+    def _stages(self):
+        return [
+            {
+                "name": "stg_a",
+                "outputs": ["orders"],
+                "properties": {"sql": "select 1 as a"},
+            },
+            {
+                "name": "stg_b",
+                "outputs": ["orders"],
+                "properties": {"sql": "select 2 as b"},
+            },
+        ]
+
+    def test_both_stages_still_emit_a_file(self):
+        files = _generate_multi_stage(self.CONTRACT, {"properties": {"stages": self._stages()}})
+        assert sorted(files) == [
+            "models/staging/stg_a.sql",
+            "models/staging/stg_b.sql",
+        ]
+
+    def test_neither_stage_loses_its_sql(self):
+        files = _generate_multi_stage(self.CONTRACT, {"properties": {"stages": self._stages()}})
+        body = "\n".join(files.values())
+        assert "select 1 as a" in body
+        assert "select 2 as b" in body
+
+    def test_contested_stages_keep_their_own_names(self):
+        assert _stage_model_names(self._stages()) == {
+            "stg_a": "stg_a",
+            "stg_b": "stg_b",
+        }
+
+    def test_an_output_colliding_with_another_stages_name_is_contested_too(self):
+        """`orders` is claimed by the stage called `orders` (no outputs, so it
+        keeps its name) and by `stg_x`'s output. Counting declared outputs
+        alone would miss this one."""
+        assert _stage_model_names(
+            [{"name": "orders"}, {"name": "stg_x", "outputs": ["orders"]}]
+        ) == {"orders": "orders", "stg_x": "stg_x"}
+
+    def test_the_collision_is_logged_not_swallowed(self, caplog):
+        with caplog.at_level("WARNING"):
+            _stage_model_names(self._stages())
+        assert "dbt_stage_model_name_collision" in caplog.text
+        assert "stg_a" in caplog.text and "stg_b" in caplog.text
+
+    def test_an_uncontested_stage_alongside_a_contested_one_still_renames(self):
+        stages = self._stages() + [{"name": "stg_c", "outputs": ["customers"]}]
+        assert _stage_model_names(stages)["stg_c"] == "customers"
