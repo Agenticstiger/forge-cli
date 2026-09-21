@@ -203,6 +203,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A contract field could write files outside the output directory.**
+  `fluid generate transformation` built each output path as
+  `output_dir / rel_path` and called `mkdir(parents=True)` + `write_text` with
+  no confinement check. Engines derive those keys from contract fields — the
+  sql engine names each file `{NN}_{stages[].name}.sql`, the dbt engine builds
+  `models/{layer}/{model}.sql` — and `stages[].name` is an unconstrained
+  string in the schema. So a contract declaring
+  `name: ../../../../ESCAPED` passed `fluid validate` ("✅ Valid FLUID
+  contract") and the writer then landed the file four directories above
+  `--output`, outside the project entirely. Contracts travel: `fluid
+  federation` pulls them from other people's registries, so whoever runs
+  `generate` is not necessarily whoever wrote the contract. The sibling writer
+  in `cli/_template_mode.py` has carried this guard, and a comment describing
+  this exact attack, since the copilot hardening; this one never had it. Every
+  generated path is now resolved and checked against the output root *before
+  any file is written*, so a late-sorting offender cannot leave a half-written
+  project behind, and an escape raises `generated_path_outside_output_dir`
+  rather than being silently skipped — a dropped stage would yield a project
+  that looks generated but is missing a step.
+
 - **A contract value could inject Python into a generated Airflow DAG (#620).**
   `AirflowDAGGenerator` interpolated contract values straight into
   `bash_command="{command}"` inside an f-string. A quote in any of them closed

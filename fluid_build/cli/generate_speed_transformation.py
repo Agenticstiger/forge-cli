@@ -685,11 +685,59 @@ def _generate_single_build(
             )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    _confine_generated_paths(files, output_dir)
     for rel_path, content in sorted(files.items()):
         file_path = output_dir / rel_path
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
     return output_dir, files, engine_name
+
+
+def _confine_generated_paths(files: Dict[str, str], output_dir: Path) -> None:
+    """Reject any generated path that resolves outside ``output_dir``.
+
+    Engines build their output keys from contract fields -- the sql engine
+    names each file ``{NN}_{stages[].name}.sql``, the dbt engine builds
+    ``models/{layer}/{model}.sql``. ``stages[].name`` is an unconstrained
+    string in the schema, so ``fluid validate`` accepts
+    ``../../../../pwned`` and the writer would then land the file outside
+    the project entirely. Contracts travel -- federation pulls them from
+    other people's registries -- so whoever runs ``fluid generate`` is not
+    necessarily whoever wrote the contract.
+
+    Two deliberate choices:
+
+    * **Fail loud, do not skip.** A silently dropped stage yields a project
+      that looks generated but is missing a step.
+      ``cli/_template_mode.py`` skips-and-warns instead because its entries
+      are best-effort LLM output rather than the user's own declared
+      pipeline.
+    * **Check every key before writing any file.** An offending entry that
+      sorts last would otherwise leave the earlier files on disk.
+
+    ``Path.resolve()`` also collapses symlinks, and ``output_dir / key``
+    discards ``output_dir`` entirely when ``key`` is absolute -- both are
+    covered by comparing the resolved path against the resolved root.
+    """
+    output_root = output_dir.resolve()
+    for rel_path in sorted(files):
+        try:
+            (output_dir / rel_path).resolve().relative_to(output_root)
+        except ValueError:
+            raise CLIError(
+                1,
+                "generated_path_outside_output_dir",
+                {
+                    "path": rel_path,
+                    "output_dir": str(output_dir),
+                    "hint": (
+                        "A generated file path escapes the output directory. "
+                        "This normally means a contract field that becomes a "
+                        "filename (e.g. builds[].properties.stages[].name) "
+                        "contains path separators or '..'."
+                    ),
+                },
+            ) from None
 
 
 def _resolve_dbt_capabilities(logger: logging.Logger) -> Any:
