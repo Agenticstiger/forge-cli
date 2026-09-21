@@ -179,7 +179,7 @@ builds:
       name: stage_1_customer_base
       properties:
         sql: "SELECT \n  customer_id,\n  CONCAT(first_name, ' ', last_name) AS full_name,\n  LOWER(TRIM(email))\
-          \ AS email,\n  country,\n  industry,\n  signup_date,\n  CAST(julianday('now') - julianday(signup_date)\
+          \ AS email,\n  country,\n  industry,\n  signup_date,\n  CAST(DATE_DIFF('day', signup_date, CURRENT_DATE)\
           \ AS INTEGER) AS days_since_signup\nFROM read_csv_auto('data/customers.csv', header=true)\n"
     - dependsOn:
       - stage_1_customer_base
@@ -189,7 +189,7 @@ builds:
       properties:
         sql: "SELECT \n  customer_id,\n  COUNT(*) AS total_orders,\n  ROUND(SUM(amount), 2) AS total_revenue,\n\
           \  ROUND(AVG(amount), 2) AS avg_order_value,\n  MIN(order_date) AS first_purchase_date,\n  MAX(order_date)\
-          \ AS last_purchase_date,\n  CAST(julianday('now') - julianday(MAX(order_date)) AS INTEGER) AS\
+          \ AS last_purchase_date,\n  CAST(DATE_DIFF('day', MAX(order_date), CURRENT_DATE) AS INTEGER) AS\
           \ days_since_last_purchase\nFROM read_csv_auto('data/orders.csv', header=true)\nGROUP BY customer_id\n"
     - dependsOn:
       - stage_1_customer_base
