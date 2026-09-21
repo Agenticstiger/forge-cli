@@ -9,6 +9,7 @@ tags:
 - modular-sql
 - best-practices
 metadata:
+  productType: ADP
   owner:
     team: sales-analytics
     email: sales-analytics@company.com

@@ -86,12 +86,13 @@ emitter at `cli/discover/emitter.py` (which populates both fields).
 both fields.** The *forge* templates (`forge/templates/*.py`, used by
 `fluid forge --template`) do, via `forge/templates/_v073_builder.py`. The
 shipped *quickstart* contracts (`fluid_build/templates/*/contract.fluid.yaml`,
-used by `fluid init --template`) mostly populate NEITHER — only the two that
-declare `metadata.layer: Gold` carry `productType: CDP`; the other eleven
-declare no layer and no productType at all. That is valid (either field alone
-is sufficient, and neither is required) but it means a quickstart-derived
-product is unclassified in the mesh until its author sets one. Importers and
-fixtures are likewise partial. Provider tag emitters (AWS / GCP / Snowflake / forge)
+used by `fluid init --template`) now populate `productType` on 12 of 13, set
+from what each template actually reads: SDP for single-source ingests, ADP for
+the ones that join or derive, CDP for the two that declare `metadata.layer:
+Gold`. `hello-world` is deliberately left unclassified — it reads nothing real,
+and a Hello World shipping a Data Mesh classification invites cargo-culting it.
+Either field alone is sufficient and neither is required, so that is valid.
+Importers and fixtures are still partial. Provider tag emitters (AWS / GCP / Snowflake / forge)
 propagate both into cloud labels as `fluid_layer` + `fluid_product_type`
 (distinct keys, same canonical value). The marketplace surfaces both as
 facets and accepts `fluid market --product-type SDP|ADP|CDP` alongside

@@ -9,6 +9,7 @@ tags:
 - tutorial
 - csv-ingestion
 metadata:
+  productType: SDP
   owner:
     team: data-team
     email: data-team@company.com

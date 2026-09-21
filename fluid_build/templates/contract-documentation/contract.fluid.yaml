@@ -30,6 +30,7 @@ tags:
 - analytics
 - documentation
 metadata:
+  productType: SDP
   owner:
     team: data-engineering
     email: dataeng@example.com

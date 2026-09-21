@@ -10,6 +10,7 @@ tags:
 - airflow
 - tutorial
 metadata:
+  productType: ADP
   owner:
     team: analytics-team
     email: analytics-team@company.com

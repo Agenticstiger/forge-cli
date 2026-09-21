@@ -9,6 +9,7 @@ tags:
 - multi-env
 - deployment
 metadata:
+  productType: SDP
   owner:
     team: platform-engineering
     email: platform@company.com

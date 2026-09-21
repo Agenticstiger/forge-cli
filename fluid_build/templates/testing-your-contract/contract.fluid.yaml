@@ -9,6 +9,7 @@ tags:
 - validation
 - tutorial
 metadata:
+  productType: SDP
   owner:
     team: data-engineering
     email: data-eng@company.com
