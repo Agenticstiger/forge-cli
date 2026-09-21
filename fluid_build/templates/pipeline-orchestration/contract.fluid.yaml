@@ -94,7 +94,7 @@ builds:
       - sales_cleaned
       name: extract_sales
       properties:
-        sql: "SELECT \n  sale_id, UPPER(region) as region,\n  sale_date, amount,\n  category\nFROM read_csv_auto('data/sales.csv',\
+        sql: "SELECT \n  sale_id, UPPER(region) as region,\n  sale_date, amount,\n  product_category AS category\nFROM read_csv_auto('data/sales.csv',\
           \ header=true)\n"
     - outputs:
       - inventory_cleaned

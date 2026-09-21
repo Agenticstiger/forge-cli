@@ -126,7 +126,7 @@ builds:
           \ header=true) o\n    ON c.id = o.customer_id\n  GROUP BY\n    c.id, c.name, c.email, c.signup_date,\
           \ c.status\n)\nSELECT\n  customer_id,\n  customer_name,\n  email,\n  signup_date,\n  status,\n\
           \  total_orders,\n  total_revenue,\n  avg_order_value,\n  first_order_date,\n  last_order_date,\n\
-          \  CAST(julianday('now') - julianday(signup_date) AS INTEGER) AS days_as_customer,\n  CASE\n\
+          \  CAST(DATE_DIFF('day', signup_date, CURRENT_DATE) AS INTEGER) AS days_as_customer,\n  CASE\n\
           \    WHEN total_revenue >= 2000 THEN 'Platinum'\n    WHEN total_revenue >= 1000 THEN 'Gold'\n\
           \    WHEN total_revenue >= 500 THEN 'Silver'\n    WHEN total_revenue > 0 THEN 'Bronze'\n   \
           \ ELSE 'No Purchases'\n  END AS customer_tier\nFROM customer_orders\nORDER BY total_revenue\

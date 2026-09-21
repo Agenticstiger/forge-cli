@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BEHAVIOUR CHANGE: generated SQL scripts now create views.** The `sql`
+  engine emitted bare `SELECT` statements, so a script an operator ran
+  against a warehouse had no side effect. Each multi-stage script now carries
+  `CREATE OR REPLACE VIEW <output> AS …` and creates a relation in whatever
+  catalog the session points at. This is what makes the generated project
+  runnable at all — nothing previously created a relation under any name, so
+  a stage's `FROM <upstream's output>` could never resolve — but it is not a
+  drop-in: `OR REPLACE` drops grants on Snowflake and Databricks and makes
+  any Snowflake stream over the view stale, and replacing an existing *table*
+  of the same name fails loudly rather than converting it. Every emitted file
+  says which it is, in its header: `-- Materialises: <name>  (CREATE OR
+  REPLACE VIEW)` or `-- Not materialised: <reason>`. The single-stage
+  `embedded-logic` pattern is unchanged — it has no `outputs` to name a view
+  after and nothing downstream inside the contract to chain to.
+
 ### Added
 
 - **Cross-mesh upstreams can be named and pinned in the contract (#626).**
