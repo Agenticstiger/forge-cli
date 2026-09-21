@@ -157,6 +157,48 @@ class TestTheWriterItself:
             {"01_a.sql": "", "models/staging/b.sql": "", "deep/er/c.sql": ""}, out
         )
 
+    def test_two_keys_resolving_to_one_file_are_rejected(self, tmp_path):
+        """Escaping is not the only way to lose a file. `02_z/../01_a.sql`
+        stays INSIDE the output directory -- so the escape check passes --
+        but normalises onto `01_a.sql`, and the writer's sorted order then
+        silently replaces the first stage's SQL with the second's.
+
+        Reproduced on 1c7deb0b before this check existed: two stages in,
+        one file out, holding only the later stage's body."""
+        from fluid_build.cli import generate_speed_transformation as gst
+        from fluid_build.cli._common import CLIError
+
+        out = tmp_path / "out"
+        out.mkdir()
+        files = {"01_a.sql": "-- first\n", "02_z/../01_a.sql": "-- second\n"}
+        with pytest.raises(CLIError) as excinfo:
+            gst._confine_generated_paths(files, out)
+        assert excinfo.value.event == "generated_path_collision"
+        assert excinfo.value.context["collides_with"] == "01_a.sql"
+        assert list(out.rglob("*")) == [], "no file should have been written"
+
+    def test_the_escape_check_alone_would_not_have_caught_it(self, tmp_path):
+        """Pins WHY this needed its own check: the colliding key resolves
+        inside the output root, so the #634 confinement test passes it."""
+        from fluid_build.cli import generate_speed_transformation as gst
+
+        out = tmp_path / "out"
+        out.mkdir()
+        resolved = (out / "02_z/../01_a.sql").resolve()
+        assert resolved.is_relative_to(out.resolve())
+        assert resolved.name == "01_a.sql"
+
+    def test_distinct_nested_paths_are_not_a_collision(self, tmp_path):
+        """The dbt engine emits models/<layer>/<model>.sql -- same basename
+        in different layers must stay legal."""
+        from fluid_build.cli import generate_speed_transformation as gst
+
+        out = tmp_path / "out"
+        out.mkdir()
+        gst._confine_generated_paths(
+            {"models/staging/orders.sql": "", "models/marts/orders.sql": ""}, out
+        )
+
     def test_a_late_sorting_offender_leaves_no_partial_project(self, tmp_path):
         """Validation runs over every key BEFORE any file is written, so an
         entry that sorts last cannot leave earlier files on disk."""

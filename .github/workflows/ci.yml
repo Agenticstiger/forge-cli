@@ -572,7 +572,7 @@ jobs:
           # else the `|| .[dev]` install fallback makes absence legitimate.
           FLUID_REQUIRE_DUCKDB: "1"
         run: |
-          python -m pytest -v -m "integration and not slow" tests/test_e2e_local.py tests/test_e2e_local_apply.py tests/test_e2e_local_negative.py tests/providers/test_local_live_happy_path.py tests/test_quickstart_templates_execute.py
+          python -m pytest -v -m "integration and not slow" tests/test_e2e_local.py tests/test_e2e_local_apply.py tests/test_e2e_local_negative.py tests/providers/test_local_live_happy_path.py tests/test_quickstart_templates_execute.py tests/test_examples_execute.py
       - name: Cleanup local artifacts (defensive)
         if: always()
         run: python scripts/cleanup_local_test_artifacts.py

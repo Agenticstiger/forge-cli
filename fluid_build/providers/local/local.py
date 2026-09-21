@@ -37,6 +37,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from fluid_build.providers._duckdb_read import build_register_view_sql
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderMetadata
 
@@ -450,14 +451,29 @@ class LocalProvider(BaseProvider):
                     else:
                         self._log_warn("local_model_missing", {"model": model_path})
 
-        # If no inputs from build, collect from consumes (fallback)
-        if not inputs_spec:
-            for c in contract.get("consumes") or []:
-                p = c.get("path") or (c.get("location") or {}).get("path")
-                if p:
-                    inputs_spec.append(
-                        {"path": p, "table": c.get("id") or _guess_table_name_from_path(Path(p))}
-                    )
+        # consumes[] cannot be a fallback source of inputs, and saying so is
+        # more useful than pretending otherwise. This block used to read
+        # ``c["path"]`` / ``c["location"]["path"]`` / ``c["id"]``; the
+        # consumeRef schema is ``additionalProperties: false`` and permits
+        # none of them (only productId, exposeId, versionConstraint,
+        # qosExpectations, requiredPolicies, purpose, tags, labels,
+        # upstreamWorkspace, upstreamDigest), so it could never fire for a
+        # contract that validates. A consumeRef carries a LOGICAL address
+        # only; turning it into a physical one needs the upstream contract,
+        # which is tracked separately as the consumes[]-wiring work.
+        unbound = len(contract.get("consumes") or []) if not inputs_spec else 0
+        if unbound:
+            self._log_warn(
+                "local_consumes_not_bound",
+                {
+                    "count": unbound,
+                    "hint": (
+                        "consumes[] declares upstream products but carries no "
+                        "physical address. Declare the reader explicitly under "
+                        "builds[].properties.parameters.inputs to bind it."
+                    ),
+                },
+            )
 
         # Decide output — honour the declared path AND format from the first expose.
         # A contract that declares ``format: parquet`` at an ``output/*.parquet``
@@ -750,32 +766,11 @@ class LocalProvider(BaseProvider):
         if not is_glob and not path.exists():
             raise FileNotFoundError(f"Input file not found: {path}")
 
-        if fmt in {"csv", "tsv"} or path.suffix.lower() in {".csv", ".tsv"}:
-            delim = "," if (fmt != "tsv" and path.suffix.lower() != ".tsv") else "\t"
-            opt = {"AUTO_DETECT": True, "DELIM": delim}
-            opt.update({k.upper(): v for k, v in (options or {}).items()})
-            # The option KEY is a DuckDB named-parameter name interpolated as
-            # ``KEY:=value``. ``options`` is contract-supplied, so route each
-            # key through ``validate_ident`` (allowlist ``^[A-Za-z_]\w*$``,
-            # returns simple identifiers unchanged) to reject DDL smuggled via
-            # a key — the value already routes through ``quote_ansi_string_literal``.
-            opt_sql = ", ".join(
-                f"{validate_ident(k)}:="
-                f"{json.dumps(v) if not isinstance(v, str) else quote_ansi_string_literal(v)}"
-                for k, v in opt.items()
-            )
-            con.execute(
-                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_csv_auto({quote_ansi_string_literal(str(path))}, {opt_sql});"
-            )
-        elif fmt in {"parquet", "pq"} or path.suffix.lower() == ".parquet":
-            con.execute(
-                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_parquet({quote_ansi_string_literal(str(path))});"
-            )
-        else:
-            # try csv auto as fallback
-            con.execute(
-                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_csv_auto({quote_ansi_string_literal(str(path))});"
-            )
+        # The statement itself lives in ``providers/_duckdb_read`` because the
+        # sql engine writes the same one into its generated script. One copy:
+        # otherwise ``fluid apply`` and the emitted script drift, which is the
+        # split that left six shipped examples generating SQL that will not run.
+        con.execute(build_register_view_sql(table, path, fmt, options))
 
     # ------------------ COPY / materialize (helper) --------------------- #
 

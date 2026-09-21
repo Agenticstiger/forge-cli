@@ -718,11 +718,21 @@ def _confine_generated_paths(files: Dict[str, str], output_dir: Path) -> None:
     ``Path.resolve()`` also collapses symlinks, and ``output_dir / key``
     discards ``output_dir`` entirely when ``key`` is absolute -- both are
     covered by comparing the resolved path against the resolved root.
+
+    Escaping is not the only way a path can go wrong. Two DIFFERENT keys can
+    resolve to the SAME file while both stay inside the output directory:
+    ``02_z/../01_a.sql`` normalises onto ``01_a.sql``, the writer writes in
+    sorted order, and the second write silently replaces the first stage's
+    SQL. That is the same silent-loss class this function exists to prevent,
+    so a collision is rejected here too -- one place covering every engine,
+    rather than per-emitter name validation.
     """
     output_root = output_dir.resolve()
+    claimed: Dict[str, str] = {}
     for rel_path in sorted(files):
         try:
-            (output_dir / rel_path).resolve().relative_to(output_root)
+            resolved = (output_dir / rel_path).resolve()
+            resolved.relative_to(output_root)
         except ValueError:
             raise CLIError(
                 1,
@@ -738,6 +748,27 @@ def _confine_generated_paths(files: Dict[str, str], output_dir: Path) -> None:
                     ),
                 },
             ) from None
+
+        key = str(resolved)
+        if key in claimed:
+            raise CLIError(
+                1,
+                "generated_path_collision",
+                {
+                    "path": rel_path,
+                    "collides_with": claimed[key],
+                    "resolves_to": key,
+                    "hint": (
+                        "Two generated files resolve to the same path, so one "
+                        "would silently overwrite the other. This normally "
+                        "means two contract fields that become filenames "
+                        "(e.g. builds[].properties.stages[].name) are equal, "
+                        "or one contains path separators that normalise onto "
+                        "the other."
+                    ),
+                },
+            )
+        claimed[key] = rel_path
 
 
 def _resolve_dbt_capabilities(logger: logging.Logger) -> Any:
