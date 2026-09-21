@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Generated SQL scripts now bind the inputs the contract declares.** A
+  build declares which file backs which name under
+  `builds[].properties.parameters.inputs`, and the author's SQL then says
+  `FROM <name>`. `fluid apply` has always honoured that — the local provider
+  registers each input as a DuckDB view — but the *emitted* script did not,
+  so a project that applied cleanly still failed standalone with
+  `Catalog Error: Table with name <name> does not exist!`. Six worked
+  examples were in that state (02–06 and `local/high_value_churn`); measured
+  before and after, 0/6 of them produced a runnable script, now 6/6. The
+  statement is the provider's own, shared through
+  `providers/_duckdb_read.build_register_view_sql`, so `apply` and the
+  generated script cannot drift apart again.
+
+- **Two generated files could resolve to one path, silently losing a
+  stage.** The `#634` writer guard rejected paths that *escape* the output
+  directory but not two that land on the *same* file inside it: a stage
+  named `z/../01_a` normalises onto `01_a.sql`, and the later write replaced
+  the earlier stage's SQL with no diagnostic. Rejected now as
+  `generated_path_collision`, in the same place as the escape check, so it
+  covers every engine.
+
+- **`fluid apply` no longer implies `consumes[]` is wired when it is not.**
+  The local provider's fallback read `c["path"]` / `c["location"]["path"]` /
+  `c["id"]` from a consumeRef; the schema is `additionalProperties: false`
+  and permits none of them, so it could never fire for a contract that
+  validates. A consumeRef carries a logical address only. Applying a
+  contract whose `consumes[]` are unbound now says so, and names the field
+  that does bind a reader.
+
 ### Changed
 
 - **BEHAVIOUR CHANGE: generated SQL scripts now create views.** The `sql`
