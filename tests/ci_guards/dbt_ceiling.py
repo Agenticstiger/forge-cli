@@ -91,10 +91,17 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-#: The release a floating install must not be able to reach. Compared with
-#: ``prereleases=True`` because dbt-core already publishes 2.0.0rc6/rc7/rc8:
-#: a specifier that admits the release candidate admits what follows it.
-DBT_V2 = Version("2.0.0")
+#: The releases a floating install must not be able to reach.
+#:
+#: BOTH are checked, and the prerelease is not decoration. A normal ceiling
+#: (``<2``, ``<2.0``, ``<2.0.0``) already excludes 2.0.0rc8 without any help
+#: from us -- PEP 440 says an exclusive ``<V`` must not admit a prerelease of
+#: V. But an exclusion like ``dbt-core!=2.0.0``, which someone might
+#: reasonably write to dodge one bad release, blocks the final and leaves
+#: ``2.0.0rc8`` wide open. dbt-core publishes rc6/rc7/rc8 today, and
+#: ``pip install --pre`` would take one. Checking only the final release
+#: would call that specifier capped.
+DBT_V2_RELEASES: Tuple[Version, ...] = (Version("2.0.0"), Version("2.0.0rc8"))
 
 #: The dbt v2 distributions. A site installing ONLY these is exempt -- they
 #: *are* the v2 engine, so a dbt-core ceiling on them is meaningless, and
@@ -150,6 +157,15 @@ _LOCAL_EXTRAS = re.compile(r"^(?P<path>[^\[\]]*)\[(?P<extras>[^\]]+)\]$")
 _DBT_MENTION = re.compile(r"(?<![\w.-])dbt[\w-]*", re.IGNORECASE)
 
 
+def _admits_v2(requirement: Requirement) -> bool:
+    """True when this specifier can resolve to any dbt v2 release.
+
+    ``prereleases=True`` so the rc is actually considered; without it
+    packaging would skip prereleases and report ``!=2.0.0`` as capped.
+    """
+    return any(requirement.specifier.contains(v, prereleases=True) for v in DBT_V2_RELEASES)
+
+
 @dataclass(frozen=True)
 class InstallSite:
     """One pip invocation that pulls a dbt distribution."""
@@ -174,7 +190,7 @@ class InstallSite:
 
     def admitting_v2(self) -> List[Requirement]:
         """dbt requirements whose specifier still admits 2.0.0."""
-        return [r for r in self.requirements if r.specifier.contains(DBT_V2, prereleases=True)]
+        return [r for r in self.requirements if _admits_v2(r)]
 
     def dbt_core_requirements(self) -> List[Requirement]:
         return [r for r in self.requirements if canonicalize_name(r.name) == "dbt-core"]
@@ -415,7 +431,7 @@ def violations(sites: Iterable[InstallSite]) -> List[Tuple[InstallSite, str]]:
                     )
                 )
                 continue
-            admits = [r for r in core if r.specifier.contains(DBT_V2, prereleases=True)]
+            admits = [r for r in core if _admits_v2(r)]
             if admits:
                 found.append(
                     (

@@ -254,6 +254,19 @@ class TestPreviouslyFalseGreen:
             _, found = _verdict(tmp_path, body)
             assert found, f"{body!r} hid the install"
 
+    def test_a_specifier_that_blocks_the_final_but_admits_the_rc_is_caught(self, tmp_path):
+        """The release candidate is not decoration.
+
+        A normal ceiling (`<2`) already excludes 2.0.0rc8 without help --
+        PEP 440 says an exclusive `<V` must not admit a prerelease of V.
+        But `dbt-core!=2.0.0`, which someone might write to dodge one bad
+        release, blocks the final and leaves rc8 wide open, and dbt-core
+        publishes rc6/rc7/rc8 today. Checking only the final release
+        would call that capped.
+        """
+        _, found = _verdict(tmp_path, 'pip install "dbt-core!=2.0.0" dbt-duckdb')
+        assert found, "`!=2.0.0` still admits 2.0.0rc8, which `pip install --pre` would take"
+
     def test_underscore_spelling_is_canonicalised(self, tmp_path):
         _, found = _verdict(tmp_path, 'pip install "dbt_core<2" dbt-duckdb')
         assert not found, "dbt_core is the same distribution as dbt-core (PEP 503)"
