@@ -197,6 +197,44 @@ class TestParallelFanoutLatencyReduction:
             f"plan target ≥{_TARGET_REDUCTION:.0%}"
         )
 
+    #: "About one window, not two or three" -- half the serial time.
+    #:
+    #: Expressed as a fraction of the SAME machine's serial measurement
+    #: rather than as absolute milliseconds. The two budgets below used to
+    #: be `2 * _SLEEP_SECONDS` (200ms) compared against raw wall-clock,
+    #: which also contains thread-pool startup and scheduler latency --
+    #: unbounded on a shared CI runner. Measured failures: 228.9ms on the
+    #: 3.13 leg and 262.7ms / 406.5ms on 3.11, all while the code was
+    #: correct and the parallel path was genuinely overlapping. Two
+    #: triage cycles in two days.
+    #:
+    #: Taking serial as the yardstick cancels most of that: both runs pay
+    #: the same overhead on the same box. This is also how the sibling
+    #: 40%-reduction test has always worked, and that one has never flaked.
+    #:
+    #: HALF, not two-thirds. Two-thirds is exactly where a partially
+    #: serialized run lands, so it cannot distinguish one: with three
+    #: 100ms stubs and ~15ms of overhead, a healthy 3-worker run sits at
+    #: 115/315 = 0.365, while dropping the pool to 2 workers sits at
+    #: 215/315 = 0.683 -- a hair over a 0.667 bound, so whether it fails
+    #: is a coin flip on overhead. (Reviewed against a real max_workers=2
+    #: patch, it passed 3 runs in 7.) Half the serial time separates the
+    #: two by a clear margin in both directions, and is still far looser
+    #: than the sibling 40%-reduction bound.
+    _ONE_OF_THREE_WINDOWS = 0.5
+
+    def _measure_serial_baseline(self, monkeypatch) -> float:
+        """Serial wall-clock on THIS machine, right now."""
+        coordinator = StageCoordinator()
+        session = StageSession(
+            store=NullBackend(), capability_matrix={"critic_errors_trigger_repair": False}
+        )
+        logical = _make_logical(coordinator, session)
+        contract: Dict[str, Any] = {"id": "stub", "metadata": {"name": "orders"}}
+        monkeypatch.setenv("FLUID_COPILOT_PARALLEL_PHYSICAL", "0")
+        _patch_three_slow_agents(monkeypatch, _SLEEP_SECONDS)
+        return _measure_physical_run(coordinator, session, logical, contract)
+
     def test_parallel_path_exits_within_two_stage_windows(self, monkeypatch) -> None:
         """Stricter complement: even on noisy CI, the parallel run
         must fit inside the time budget of *two* stub stages — a
@@ -214,12 +252,14 @@ class TestParallelFanoutLatencyReduction:
         _patch_three_slow_agents(monkeypatch, _SLEEP_SECONDS)
         elapsed = _measure_physical_run(coordinator, session, logical, contract)
 
-        # 2 × _SLEEP_SECONDS is a generous ceiling: a fully
-        # parallel run finishes in ~1×, and any partial serialization
-        # would push toward 3×. The 2× threshold is in the middle.
-        ceiling = 2 * _SLEEP_SECONDS
+        # A fully parallel run finishes in ~1 of the 3 windows serial
+        # takes; partial serialization pushes it to 2 or 3. Half the
+        # serial time sits clear of both, measured on this machine.
+        serial = self._measure_serial_baseline(monkeypatch)
+        ceiling = serial * self._ONE_OF_THREE_WINDOWS
         assert elapsed < ceiling, (
             f"parallel run took {elapsed * 1000:.1f}ms; expected < {ceiling * 1000:.0f}ms "
+            f"(half this machine's serial {serial * 1000:.1f}ms) "
             "(suggests partial serialization regression)."
         )
 
@@ -263,10 +303,13 @@ class TestParallelFanoutLatencyReduction:
         _patch_three_slow_agents(monkeypatch, _SLEEP_SECONDS)
         elapsed = _measure_physical_run(coordinator, session, logical, contract)
 
-        # Same parallel ceiling as the dedicated parallel test —
-        # default behaviour must equal explicit parallel behaviour.
-        ceiling = 2 * _SLEEP_SECONDS
+        # Same relative ceiling as the dedicated parallel test — default
+        # behaviour must equal explicit parallel behaviour. Measured after
+        # the default run so the baseline cannot leak the env var into it.
+        serial = self._measure_serial_baseline(monkeypatch)
+        ceiling = serial * self._ONE_OF_THREE_WINDOWS
         assert elapsed < ceiling, (
             f"default-path run took {elapsed * 1000:.1f}ms; expected < {ceiling * 1000:.0f}ms "
+            f"(half this machine's serial {serial * 1000:.1f}ms) "
             "(suggests the default switched to serial)."
         )

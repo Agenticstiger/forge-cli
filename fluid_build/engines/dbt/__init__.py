@@ -136,6 +136,19 @@ class DbtEngine(TransformationEngine):
         )
         files.update(model_files)
 
+        # The model names this generation actually wrote. Both schema.yml and
+        # semantic_models.yml name their entries after the *expose*, while the
+        # intent / multi-stage / embedded-logic emitters name their files from
+        # *stage* names -- so on those paths both would describe models nobody
+        # emitted. dbt rejects the dangling semantic ref outright but only
+        # WARNS on the schema.yml one (NoNodeForYamlKey/dbt1089), which is why
+        # that half went unnoticed: the tests it declared silently never ran.
+        _emitted_model_names = {
+            path.rsplit("/", 1)[-1][: -len(".sql")]
+            for path in files
+            if path.startswith("models/") and path.endswith(".sql")
+        }
+
         # models/<layer>/schema.yml — per-model dbt tests. We skip this
         # when a modeling technique is set because the staged builder owns
         # the model set under that path; emitting a generic schema.yml here
@@ -152,6 +165,7 @@ class DbtEngine(TransformationEngine):
                 adapter=adapter,
                 tests_key=tests_key,
                 capabilities=caps,
+                emitted_models=_emitted_model_names,
             )
             files.update(schema_files)
         elif mesh_hub:
@@ -172,15 +186,9 @@ class DbtEngine(TransformationEngine):
         # Graceful no-op when no expose carries semantics.
         from .semantic_models import generate_semantic_models
 
-        # Pass the model names actually emitted above: a semantic model refs
-        # ``ref('<exposeId>')``, but the intent / multi-stage emitters name
-        # files from *stage* names, so on those paths the ref dangles and
-        # ``dbt parse`` rejects the whole project.
-        _emitted_model_names = {
-            path.rsplit("/", 1)[-1][: -len(".sql")]
-            for path in files
-            if path.startswith("models/") and path.endswith(".sql")
-        }
+        # Reuses the set computed above, before schema.yml: a semantic model
+        # refs ``ref('<exposeId>')`` and dbt rejects the project outright when
+        # that node is missing.
         files.update(generate_semantic_models(contract, emitted_models=_emitted_model_names))
 
         # packages.yml — pin the dbt packages any emitted test/model actually

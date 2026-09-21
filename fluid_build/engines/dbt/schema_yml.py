@@ -37,7 +37,10 @@ network.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+import logging
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 import yaml
 
@@ -150,6 +153,7 @@ def generate_schema_yml(
     adapter: Optional[str] = None,
     tests_key: Optional[str] = None,
     capabilities: Optional["DbtCapabilities"] = None,
+    emitted_models: Optional[Set[str]] = None,
 ) -> GenerationResult:
     """Generate ``schema.yml`` (dbt tests + Mesh ``access: public``)
     and, when ``mesh_hub`` is set, a companion ``dependencies.yml``.
@@ -179,6 +183,26 @@ def generate_schema_yml(
     ``"tests"`` (legacy, default — dbt-core <1.8 only understands this)
     or ``"data_tests"`` (dbt-core >=1.8 / required by Fusion). See the
     module-level note on :data:`TESTS_KEY_MODERN`.
+
+    ``emitted_models`` is the set of model names this generation actually
+    wrote. Entries here are named after the *expose*, but the intent,
+    multi-stage and embedded-logic emitters name their files from *stage*
+    names — so on those paths every entry describes a model nobody
+    emitted. dbt does not fail on that; it warns ``NoNodeForYamlKey
+    (dbt1089)`` and moves on, which means the column descriptions,
+    ``access: public`` configs and, worst of all, the **data tests** the
+    contract declared attach to nothing and silently never run. On the
+    shipped ``customer-360`` template that was 9 tests — ``unique``,
+    ``not_null``, email validation — reported as a passing project.
+
+    When the caller supplies the emitted set, an entry whose model is
+    missing is dropped with a loud warning rather than shipped as a
+    test suite that looks present and does nothing. Callers that pass
+    nothing keep the old behaviour, so this is additive.
+
+    Same defect and same remedy as ``generate_semantic_models``; the
+    ref-repointing question ("which stage *is* the expose?") is a
+    mapping decision that is still open, and is not guessed here.
     """
     resolved_tests_key = normalize_tests_key(tests_key)
     exposes = get_exposes(contract)
@@ -199,6 +223,39 @@ def generate_schema_yml(
         expose_id = get_expose_id(expose)
         if not expose_id:
             continue
+
+        # Warn -- but still emit -- when this entry describes a model the
+        # generation never wrote. dbt only WARNS on these (NoNodeForYamlKey
+        # / dbt1089), so the tests, descriptions and access configs below
+        # ship looking present and do nothing: the contract's declared
+        # data quality is silently inert.
+        #
+        # DROPPING the entry was the first instinct and is wrong here, at
+        # least by default. `fluid verify --reconcile-dbt` reconciles the
+        # contract's exposes against schema.yml, so removing the entry
+        # makes it report `model_missing_in_dbt` and go red on every
+        # multi-stage / intent / embedded-logic contract that exists
+        # today. That verdict is TRUE -- the model really is absent -- but
+        # it is a user-visible behaviour change to a shipped command,
+        # arriving as a side effect of a warning, and the underlying
+        # expose->stage mapping question is still open.
+        #
+        # So: make the silence audible, change nothing else. Whether to
+        # also drop (or repoint the entry at the emitted fact model) waits
+        # on that mapping decision.
+        if emitted_models is not None and expose_id not in emitted_models:
+            logger.warning(
+                "dbt_schema_yml_model_missing: schema.yml declares model %r but no "
+                "models/**/%s.sql was emitted, so dbt attaches its tests and column "
+                "docs to NOTHING and reports the project as passing "
+                "(NoNodeForYamlKey/dbt1089). "
+                "Emitted models: %s. This happens when the build names its "
+                "files from stage names while exposes[] names this one; the "
+                "expose->stage mapping is unresolved.",
+                expose_id,
+                expose_id,
+                sorted(emitted_models) or "(none)",
+            )
 
         contract_section = get_expose_contract(expose) or {}
         schema_cols = contract_section.get("schema", [])
