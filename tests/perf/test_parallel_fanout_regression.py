@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import patch
 
 import pytest
@@ -94,16 +94,49 @@ def _make_logical(coordinator: StageCoordinator, session: StageSession) -> Logic
     return result.logical
 
 
-def _patch_three_slow_agents(monkeypatch, sleep_seconds: float) -> None:
+def _relative(spans: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Spans in ms relative to the earliest start, for failure messages."""
+    if not spans:
+        return []
+    base = min(s for s, _ in spans)
+    return [(round((s - base) * 1000, 1), round((e - base) * 1000, 1)) for s, e in spans]
+
+
+def _all_three_overlapped(spans: List[Tuple[float, float]]) -> bool:
+    """True when all three stubs were in flight at the same instant.
+
+    ``max(start) < min(end)`` is exactly that: some moment lies inside
+    every interval. Deterministic, and indifferent to how fast or how
+    loaded the machine is -- which is the whole point of asking this way
+    rather than timing the total.
+    """
+    return len(spans) == 3 and max(s for s, _ in spans) < min(e for _, e in spans)
+
+
+def _patch_three_slow_agents(
+    monkeypatch, sleep_seconds: float, spans: Optional[List[Tuple[float, float]]] = None
+) -> None:
     """Patch all three physical-stage agents with delayed stubs.
 
     Each stub sleeps ``sleep_seconds`` to simulate one provider
     round-trip, then returns a Pydantic shape the coordinator's
     serial / parallel join logic accepts unchanged.
+
+    When ``spans`` is supplied each stub appends its own
+    ``(start, end)``. That is what lets the parallel tests ask the
+    question they actually mean -- "did these three run at the same
+    time?" -- instead of inferring it from total wall-clock, which on a
+    shared CI runner measures the runner.
     """
 
-    def fake_build_physical(self, sess, *, logical, contract, engine):
+    def _sleep_recording() -> None:
+        start = time.perf_counter()
         time.sleep(sleep_seconds)
+        if spans is not None:
+            spans.append((start, time.perf_counter()))
+
+    def fake_build_physical(self, sess, *, logical, contract, engine):
+        _sleep_recording()
         return PhysicalDraft(
             contract=contract,
             logical=logical,
@@ -112,11 +145,11 @@ def _patch_three_slow_agents(monkeypatch, sleep_seconds: float) -> None:
         )
 
     def fake_readme_run(self, logical, *, engine):
-        time.sleep(sleep_seconds)
+        _sleep_recording()
         return ReadmeDraft(readme_markdown="readme-agent-output")
 
     def fake_transformation_run(self, logical, *, engine):
-        time.sleep(sleep_seconds)
+        _sleep_recording()
         return TransformPlan(builds=[], additional_files={"from_transform_agent": "yes"})
 
     def fake_validator_run(
@@ -197,50 +230,27 @@ class TestParallelFanoutLatencyReduction:
             f"plan target ≥{_TARGET_REDUCTION:.0%}"
         )
 
-    #: "About one window, not two or three" -- half the serial time.
-    #:
-    #: Expressed as a fraction of the SAME machine's serial measurement
-    #: rather than as absolute milliseconds. The two budgets below used to
-    #: be `2 * _SLEEP_SECONDS` (200ms) compared against raw wall-clock,
-    #: which also contains thread-pool startup and scheduler latency --
-    #: unbounded on a shared CI runner. Measured failures: 228.9ms on the
-    #: 3.13 leg and 262.7ms / 406.5ms on 3.11, all while the code was
-    #: correct and the parallel path was genuinely overlapping. Two
-    #: triage cycles in two days.
-    #:
-    #: Taking serial as the yardstick cancels most of that: both runs pay
-    #: the same overhead on the same box. This is also how the sibling
-    #: 40%-reduction test has always worked, and that one has never flaked.
-    #:
-    #: HALF, not two-thirds. Two-thirds is exactly where a partially
-    #: serialized run lands, so it cannot distinguish one: with three
-    #: 100ms stubs and ~15ms of overhead, a healthy 3-worker run sits at
-    #: 115/315 = 0.365, while dropping the pool to 2 workers sits at
-    #: 215/315 = 0.683 -- a hair over a 0.667 bound, so whether it fails
-    #: is a coin flip on overhead. (Reviewed against a real max_workers=2
-    #: patch, it passed 3 runs in 7.) Half the serial time separates the
-    #: two by a clear margin in both directions, and is still far looser
-    #: than the sibling 40%-reduction bound.
-    _ONE_OF_THREE_WINDOWS = 0.5
+    def test_the_three_physical_stages_actually_overlap(self, monkeypatch) -> None:
+        """Did the three stages run at the same time? Asked directly.
 
-    def _measure_serial_baseline(self, monkeypatch) -> float:
-        """Serial wall-clock on THIS machine, right now."""
-        coordinator = StageCoordinator()
-        session = StageSession(
-            store=NullBackend(), capability_matrix={"critic_errors_trigger_repair": False}
-        )
-        logical = _make_logical(coordinator, session)
-        contract: Dict[str, Any] = {"id": "stub", "metadata": {"name": "orders"}}
-        monkeypatch.setenv("FLUID_COPILOT_PARALLEL_PHYSICAL", "0")
-        _patch_three_slow_agents(monkeypatch, _SLEEP_SECONDS)
-        return _measure_physical_run(coordinator, session, logical, contract)
+        This used to infer the answer from total wall-clock against a
+        budget, and that budget could not be made to work. An absolute
+        200ms ceiling measured the runner, not the code, and failed at
+        228.9ms / 262.7ms / 406.5ms while the fan-out was healthy. Making
+        it relative to the machine's own serial time then had to pick a
+        fraction, and there is no good one: two-thirds is exactly where a
+        2-worker pool lands (0.683 against a 0.667 bound -- a coin flip),
+        and half rejects a healthy run on a loaded runner (measured
+        156.9ms against a 152ms bound on the 3.13 leg). I tightened it
+        from two-thirds to half and turned a too-loose bound into a
+        too-tight one.
 
-    def test_parallel_path_exits_within_two_stage_windows(self, monkeypatch) -> None:
-        """Stricter complement: even on noisy CI, the parallel run
-        must fit inside the time budget of *two* stub stages — a
-        comfortable upper bound that still catches partial
-        serialization (where one of three stages runs after the
-        other two finish, dragging total time toward 2 × stage)."""
+        The property was never really about duration. Each stub now
+        records its own (start, end), and `max(start) < min(end)` says
+        some instant lay inside all three intervals -- which is what
+        "ran in parallel" means. Deterministic, and indifferent to how
+        loaded the machine is.
+        """
         coordinator = StageCoordinator()
         session = StageSession(
             store=NullBackend(), capability_matrix={"critic_errors_trigger_repair": False}
@@ -249,18 +259,14 @@ class TestParallelFanoutLatencyReduction:
         contract: Dict[str, Any] = {"id": "stub", "metadata": {"name": "orders"}}
 
         monkeypatch.setenv("FLUID_COPILOT_PARALLEL_PHYSICAL", "1")
-        _patch_three_slow_agents(monkeypatch, _SLEEP_SECONDS)
-        elapsed = _measure_physical_run(coordinator, session, logical, contract)
+        spans: List[Tuple[float, float]] = []
+        _patch_three_slow_agents(monkeypatch, _SLEEP_SECONDS, spans)
+        _measure_physical_run(coordinator, session, logical, contract)
 
-        # A fully parallel run finishes in ~1 of the 3 windows serial
-        # takes; partial serialization pushes it to 2 or 3. Half the
-        # serial time sits clear of both, measured on this machine.
-        serial = self._measure_serial_baseline(monkeypatch)
-        ceiling = serial * self._ONE_OF_THREE_WINDOWS
-        assert elapsed < ceiling, (
-            f"parallel run took {elapsed * 1000:.1f}ms; expected < {ceiling * 1000:.0f}ms "
-            f"(half this machine's serial {serial * 1000:.1f}ms) "
-            "(suggests partial serialization regression)."
+        assert _all_three_overlapped(spans), (
+            "the three physical stages did not overlap, so the fan-out ran "
+            "serially or only partially in parallel. Spans in ms from the "
+            f"first start: {_relative(spans)}"
         )
 
     def test_serial_path_takes_at_least_three_stage_windows(self, monkeypatch) -> None:
@@ -300,16 +306,12 @@ class TestParallelFanoutLatencyReduction:
         logical = _make_logical(coordinator, session)
         contract: Dict[str, Any] = {"id": "stub", "metadata": {"name": "orders"}}
 
-        _patch_three_slow_agents(monkeypatch, _SLEEP_SECONDS)
-        elapsed = _measure_physical_run(coordinator, session, logical, contract)
+        spans: List[Tuple[float, float]] = []
+        _patch_three_slow_agents(monkeypatch, _SLEEP_SECONDS, spans)
+        _measure_physical_run(coordinator, session, logical, contract)
 
-        # Same relative ceiling as the dedicated parallel test — default
-        # behaviour must equal explicit parallel behaviour. Measured after
-        # the default run so the baseline cannot leak the env var into it.
-        serial = self._measure_serial_baseline(monkeypatch)
-        ceiling = serial * self._ONE_OF_THREE_WINDOWS
-        assert elapsed < ceiling, (
-            f"default-path run took {elapsed * 1000:.1f}ms; expected < {ceiling * 1000:.0f}ms "
-            f"(half this machine's serial {serial * 1000:.1f}ms) "
-            "(suggests the default switched to serial)."
+        assert _all_three_overlapped(spans), (
+            "with FLUID_COPILOT_PARALLEL_PHYSICAL unset the three physical "
+            "stages did not overlap, so the default is no longer the parallel "
+            f"path. Spans in ms from the first start: {_relative(spans)}"
         )
