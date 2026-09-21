@@ -9,6 +9,7 @@ tags:
 - validation
 - products
 metadata:
+  productType: SDP
   owner:
     team: data-quality-team
     email: dq@company.com
