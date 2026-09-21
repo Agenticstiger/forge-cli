@@ -137,7 +137,12 @@ def convert_schedule_to_cron(schedule: str) -> str:
     """
     schedule_lower = schedule.lower().strip()
 
-    # Handle special keywords
+    # Handle special keywords. Both spellings are accepted: the ``@``-prefixed
+    # cron nickname, and the bare word. Several provider emitters carried local
+    # forks that only knew the bare form, so dropping it when they were
+    # consolidated onto this helper would silently turn ``weekly`` into the
+    # daily-at-02:00 default -- the exact failure the consolidation was meant
+    # to remove.
     keyword_map = {
         "@hourly": "0 * * * *",
         "@daily": "0 0 * * *",
@@ -146,6 +151,7 @@ def convert_schedule_to_cron(schedule: str) -> str:
         "@yearly": "0 0 1 1 *",
         "@annually": "0 0 1 1 *",
     }
+    keyword_map.update({k.lstrip("@"): v for k, v in list(keyword_map.items())})
 
     if schedule_lower in keyword_map:
         return keyword_map[schedule_lower]
