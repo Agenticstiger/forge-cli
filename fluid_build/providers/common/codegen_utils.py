@@ -19,6 +19,7 @@ Common functions for DAG/pipeline generation to reduce code duplication
 and ensure consistent behavior across AWS, GCP, and Snowflake providers.
 """
 
+import json
 import keyword
 import re
 from datetime import datetime
@@ -73,6 +74,25 @@ def sanitize_identifier(name: str) -> str:
     # See ``runtimes/airflow_provider_actions._unique_task_identifiers`` for
     # the sanitize-then-suffix treatment callers should apply.
     return sanitized
+
+
+def task_identifier(name: Any) -> str:
+    """Python identifier for a *contract-supplied* task / flow / op id.
+
+    :func:`sanitize_identifier` strips a leading digit, so ``2024_run`` and
+    ``9999_run`` both collapse to ``_run`` — two declared tasks landing on one
+    generated ``def``, with the second silently overwriting the first. That is
+    fine for generator-owned names, but contract ids are attacker-adjacent and
+    arbitrary, so prefix instead of stripping: distinct ids stay distinct.
+
+    Everything else (keyword guard, empty guard, non-identifier characters) is
+    still :func:`sanitize_identifier`'s job — this only changes the
+    leading-digit case.
+    """
+    raw = str(name or "")
+    if raw[:1].isdigit():
+        raw = f"task_{raw}"
+    return sanitize_identifier(raw)
 
 
 def py_str_literal(value: Any) -> str:
@@ -162,6 +182,58 @@ def convert_schedule_to_airflow(schedule: str) -> str:
 
     # Default to daily
     return "@daily"
+
+
+def json_literal(value: Any) -> str:
+    """Emit ``value`` as a Python *string literal* holding its JSON encoding.
+
+    Generated code wraps this in ``json.loads(...)`` to rebuild the mapping at
+    import time. Splicing ``json.dumps(value)`` straight into generated source
+    is wrong twice over: JSON ``true``/``false``/``null`` are not Python names,
+    so a boolean in the mapping makes the generated file raise ``NameError``;
+    and the raw text is an *expression*, so a crafted string inside the mapping
+    can inject code.
+
+    ``default=str`` keeps a YAML-parsed date from raising ``TypeError`` at
+    generation time. Keys are coerced before the dump because ``sort_keys=True``
+    compares keys directly, and a contract whose ``params`` mixes integer and
+    string keys (YAML permits both) would otherwise raise ``TypeError: '<' not
+    supported between instances of 'int' and 'str'``.
+
+    The coercion deliberately mirrors ``json.dumps``' own key handling rather
+    than calling ``str()``: ``str(True)`` is ``"True"`` but JSON spells it
+    ``"true"``. PyYAML implements YAML 1.1, where bare ``on:``/``off:``/
+    ``yes:``/``no:``/``~:`` keys parse to ``bool``/``None`` — ordinary contract
+    YAML, not a crafted input — so a naive ``str()`` would silently rename
+    those keys in the generated output.
+    """
+    return py_str_literal(json.dumps(_stringify_keys(value), sort_keys=True, default=str))
+
+
+def _json_key(key: Any) -> str:
+    """Coerce one mapping key exactly as ``json.dumps`` would.
+
+    Order matters: ``bool`` is a subclass of ``int``, so it has to be tested
+    first or ``True`` renders as ``"1"``.
+    """
+    if isinstance(key, str):
+        return key
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    if key is None:
+        return "null"
+    if isinstance(key, (int, float)):
+        return json.dumps(key)
+    return str(key)
+
+
+def _stringify_keys(value: Any) -> Any:
+    """Recursively coerce mapping keys to ``str`` so ``sort_keys`` cannot raise."""
+    if isinstance(value, dict):
+        return {_json_key(k): _stringify_keys(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_stringify_keys(v) for v in value]
+    return value
 
 
 def escape_for_docstring(value: Any) -> str:

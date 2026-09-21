@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 from fluid_build.providers.common.codegen_utils import (
     escape_for_docstring,
+    json_literal,
     py_str_literal,
     sanitize_identifier,
 )
@@ -111,21 +112,6 @@ def _unique_task_identifiers(tasks: List[Dict[str, Any]]) -> Dict[str, str]:
         used.add(candidate)
         identifiers[raw] = candidate
     return identifiers
-
-
-def _json_literal(value: Any) -> str:
-    """Emit ``value`` as a Python *string literal* holding its JSON encoding.
-
-    The generated DAG wraps this in ``json.loads(...)`` to rebuild the dict at
-    parse time. Splicing ``json.dumps(value)`` straight into the source (the
-    previous behaviour) is wrong twice over: JSON ``true``/``false``/``null``
-    are not Python names, so any boolean in ``params`` made the DAG raise
-    ``NameError`` on import; and the raw text was an *expression*, so a crafted
-    string inside the mapping could inject code. ``default=str`` matches the
-    GCP and Snowflake emitters, so a YAML-parsed date no longer raises
-    ``TypeError`` at generation time.
-    """
-    return py_str_literal(json.dumps(value, sort_keys=True, default=str))
 
 
 def generate_airflow_dag(contract: Dict[str, Any], account_id: str, region: str) -> str:
@@ -357,7 +343,7 @@ def _generate_glue_task(
     python_callable=lambda: _ensure_glue_table(
         database={py_str_literal(database)},
         table={py_str_literal(table)},
-        params=json.loads({_json_literal(params)}),
+        params=json.loads({json_literal(params)}),
         region={py_str_literal(region)}
     ),
     dag=dag,
@@ -448,7 +434,7 @@ def _generate_lambda_task(
         return f"""{var} = LambdaInvokeFunctionOperator(
     task_id={py_str_literal(task_id)},
     function_name={py_str_literal(function_name)},
-    payload={_json_literal(payload)},
+    payload={json_literal(payload)},
     aws_conn_id='aws_default',
     dag=dag,
 )"""
@@ -470,7 +456,7 @@ def _generate_python_task(
     task_id={py_str_literal(task_id)},
     python_callable=lambda: _execute_provider_action(
         action={py_str_literal(action)},
-        params=json.loads({_json_literal(params)}),
+        params=json.loads({json_literal(params)}),
         account_id={py_str_literal(account_id)},
         region={py_str_literal(region)}
     ),
@@ -798,12 +784,12 @@ def _generate_taskflow_dag(
                 tbl = params.get("table", "")
                 lines.append(
                     f"        _ensure_glue_table({py_str_literal(db)}, {py_str_literal(tbl)}, "
-                    f"json.loads({_json_literal(params)}), {py_str_literal(region)})"
+                    f"json.loads({json_literal(params)}), {py_str_literal(region)})"
                 )
             else:
                 lines.append(
                     f"        _execute_provider_action({py_str_literal(action)}, "
-                    f"json.loads({_json_literal(params)}), {py_str_literal(account_id)}, "
+                    f"json.loads({json_literal(params)}), {py_str_literal(account_id)}, "
                     f"{py_str_literal(region)})"
                 )
             lines.append(f"    {var}_result = {var}()")
@@ -814,7 +800,7 @@ def _generate_taskflow_dag(
             lines.append(f"    def {var}():")
             lines.append(
                 f"        _execute_provider_action({py_str_literal(action)}, "
-                f"json.loads({_json_literal(params)}), {py_str_literal(account_id)}, "
+                f"json.loads({json_literal(params)}), {py_str_literal(account_id)}, "
                 f"{py_str_literal(region)})"
             )
             lines.append(f"    {var}_result = {var}()")
