@@ -231,12 +231,32 @@ def _run_digest(args, logger: logging.Logger) -> int:
     if not path.is_file():
         raise CLIError(1, "digest_contract_not_found", {"path": str(path)})
 
+    # ``load_yaml_safe`` rather than ``_load_contract``: this command is
+    # pointed at UPSTREAM contracts -- vendored, freshly cloned, or fetched
+    # from another mesh -- so it parses input this repo does not control.
+    # The guarded loader caps size and alias expansion, which a bare
+    # ``yaml.safe_load`` does not; the federation gate whose digest this
+    # mirrors already uses it, and the two should not disagree about what
+    # is safe to read.
+    from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
+
     try:
-        contract = _load_contract(path)
+        contract = load_yaml_safe(path.read_text(encoding="utf-8"))
+    except UnsafeYamlError as exc:
+        raise CLIError(1, "digest_contract_unsafe", {"path": str(path), "error": str(exc)}) from exc
     except Exception as exc:
         raise CLIError(
             1, "digest_contract_unreadable", {"path": str(path), "error": str(exc)}
         ) from exc
+
+    # An empty or comment-only file parses to ``None``, and anywhere that
+    # coerces it with ``or {}`` would hand back a confident, schema-valid
+    # digest of ``{}`` -- sha256:44136fa3... -- for a file with nothing in
+    # it. A truncated download (``yq ... > upstream.yaml`` where yq failed)
+    # would then be pinned as if it were the upstream, and every later
+    # apply would compare against a digest that can never match.
+    if contract is None:
+        raise CLIError(1, "digest_contract_empty", {"path": str(path)})
 
     if not isinstance(contract, dict):
         raise CLIError(
@@ -244,6 +264,9 @@ def _run_digest(args, logger: logging.Logger) -> int:
             "digest_contract_not_a_mapping",
             {"path": str(path), "type": type(contract).__name__},
         )
+
+    if not contract:
+        raise CLIError(1, "digest_contract_empty", {"path": str(path)})
 
     digest = compute_contract_digest(contract)
 

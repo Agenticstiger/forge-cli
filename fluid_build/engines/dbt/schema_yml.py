@@ -224,17 +224,31 @@ def generate_schema_yml(
         if not expose_id:
             continue
 
-        # Drop entries describing a model this generation never wrote. dbt
-        # only WARNS on these (NoNodeForYamlKey / dbt1089), so the tests,
-        # descriptions and access configs below would ship looking present
-        # and do nothing. Loud, because a silently-inert test suite is the
-        # worst of the three outcomes -- worse than no tests, which at
-        # least does not claim coverage.
+        # Warn -- but still emit -- when this entry describes a model the
+        # generation never wrote. dbt only WARNS on these (NoNodeForYamlKey
+        # / dbt1089), so the tests, descriptions and access configs below
+        # ship looking present and do nothing: the contract's declared
+        # data quality is silently inert.
+        #
+        # DROPPING the entry was the first instinct and is wrong here, at
+        # least by default. `fluid verify --reconcile-dbt` reconciles the
+        # contract's exposes against schema.yml, so removing the entry
+        # makes it report `model_missing_in_dbt` and go red on every
+        # multi-stage / intent / embedded-logic contract that exists
+        # today. That verdict is TRUE -- the model really is absent -- but
+        # it is a user-visible behaviour change to a shipped command,
+        # arriving as a side effect of a warning, and the underlying
+        # expose->stage mapping question is still open.
+        #
+        # So: make the silence audible, change nothing else. Whether to
+        # also drop (or repoint the entry at the emitted fact model) waits
+        # on that mapping decision.
         if emitted_models is not None and expose_id not in emitted_models:
             logger.warning(
-                "dbt_schema_yml_model_missing: dropping the schema.yml entry for "
-                "%r -- no models/**/%s.sql was emitted, so dbt would attach its "
-                "tests and column docs to nothing (NoNodeForYamlKey/dbt1089). "
+                "dbt_schema_yml_model_missing: schema.yml declares model %r but no "
+                "models/**/%s.sql was emitted, so dbt attaches its tests and column "
+                "docs to NOTHING and reports the project as passing "
+                "(NoNodeForYamlKey/dbt1089). "
                 "Emitted models: %s. This happens when the build names its "
                 "files from stage names while exposes[] names this one; the "
                 "expose->stage mapping is unresolved.",
@@ -242,7 +256,6 @@ def generate_schema_yml(
                 expose_id,
                 sorted(emitted_models) or "(none)",
             )
-            continue
 
         contract_section = get_expose_contract(expose) or {}
         schema_cols = contract_section.get("schema", [])

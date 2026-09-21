@@ -79,18 +79,27 @@ def _models(files):
     return []
 
 
-class TestDanglingSchemaEntriesAreDropped:
-    def test_entries_without_an_emitted_model_are_dropped(self, caplog):
-        """The stage-named case: no expose has a model, so nothing ships."""
+class TestDanglingSchemaEntriesAreWarnedAbout:
+    def test_entries_without_an_emitted_model_are_warned_about(self, caplog):
+        """The stage-named case: the silence must become audible.
+
+        Deliberately a warning and NOT a drop. `fluid verify
+        --reconcile-dbt` reconciles the contract's exposes against
+        schema.yml, so removing the entry makes it report
+        `model_missing_in_dbt` and go red on every multi-stage contract
+        in existence. That verdict is true, but it is a user-visible
+        change to a shipped command arriving as a side effect, and the
+        expose->stage mapping question behind it is still open.
+        """
         stage_named = {"stg_customers", "fct_customer_360"}
 
         with caplog.at_level(logging.WARNING, logger="fluid_build.engines.dbt.schema_yml"):
             files = generate_schema_yml(_contract(), emitted_models=stage_named)
 
-        assert _models(files) == [], (
-            "entries naming models that were never emitted must not ship -- "
-            "dbt only warns on them, so their tests silently never run"
-        )
+        assert {m["name"] for m in _models(files)} == {
+            "customer_360_master",
+            "high_value_customers",
+        }, "entries must still ship; only the silence changes"
         blob = " ".join(r.getMessage() for r in caplog.records)
         assert "dbt_schema_yml_model_missing" in blob
         # Naming both the missing model and what WAS emitted is the point:
@@ -107,9 +116,12 @@ class TestDanglingSchemaEntriesAreDropped:
         names = {m["name"] for m in _models(files)}
         assert names == {"customer_360_master", "high_value_customers"}
 
-    def test_a_partial_match_keeps_only_what_exists(self):
-        files = generate_schema_yml(_contract(), emitted_models={"customer_360_master"})
-        assert {m["name"] for m in _models(files)} == {"customer_360_master"}
+    def test_a_partial_match_warns_only_about_the_missing_one(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="fluid_build.engines.dbt.schema_yml"):
+            generate_schema_yml(_contract(), emitted_models={"customer_360_master"})
+        warned = [r.getMessage() for r in caplog.records if "model_missing" in r.getMessage()]
+        assert len(warned) == 1, f"exactly one entry is missing its model; got {warned}"
+        assert "declares model 'high_value_customers'" in warned[0]
 
     def test_omitting_the_set_keeps_the_old_behaviour(self):
         """Additive: callers that pass nothing are unchanged.
@@ -151,7 +163,7 @@ class TestTheEngineActuallyPassesTheEmittedSet:
     straight back -- verified by mutation. This drives the real engine.
     """
 
-    def test_generated_project_has_no_dangling_schema_entries(self, tmp_path):
+    def test_generated_project_warns_about_dangling_schema_entries(self, tmp_path, caplog):
         from fluid_build.engines.dbt import DbtEngine
 
         contract = {
@@ -199,7 +211,8 @@ class TestTheEngineActuallyPassesTheEmittedSet:
             ],
         }
 
-        files = DbtEngine().generate(contract, contract["builds"][0], output_dir=tmp_path)
+        with caplog.at_level(logging.WARNING, logger="fluid_build.engines.dbt.schema_yml"):
+            files = DbtEngine().generate(contract, contract["builds"][0], output_dir=tmp_path)
 
         emitted = {
             path.rsplit("/", 1)[-1][: -len(".sql")]
@@ -208,8 +221,13 @@ class TestTheEngineActuallyPassesTheEmittedSet:
         }
         declared = {m["name"] for m in _models(files)}
         dangling = declared - emitted
-        assert not dangling, (
-            f"schema.yml declares models that were never emitted: {sorted(dangling)}. "
-            f"Emitted: {sorted(emitted)}. dbt only warns (dbt1089), so their tests "
-            "would silently never run."
+        # The entries still ship (see the class above for why), so what
+        # this pins is that the engine PASSES the emitted set through --
+        # removing `emitted_models=` from the call site restores the
+        # silence, and that is the regression worth catching.
+        assert dangling, "expected the stage/expose mismatch this fixture creates"
+        blob = " ".join(r.getMessage() for r in caplog.records)
+        assert "dbt_schema_yml_model_missing" in blob, (
+            "the engine did not warn -- is _warn/emitted_models still wired "
+            f"from engines/dbt/__init__.py? got: {blob[:300]}"
         )

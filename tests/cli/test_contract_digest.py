@@ -180,6 +180,52 @@ class TestFailureModes:
             _run(["contract", "digest", str(tmp_path / "nope.yaml")], tmp_path)
         assert exc.value.event == "digest_contract_not_found"
 
+    @pytest.mark.parametrize(
+        "body",
+        ["", "   \n\n", "# only a comment\n", "{}\n"],
+        ids=["empty", "whitespace", "comments-only", "empty-mapping"],
+    )
+    def test_an_empty_contract_is_refused_rather_than_digested(self, tmp_path, body):
+        """A digest of nothing is the most dangerous output this can produce.
+
+        `yq -o=yaml '.' upstream > upstream.yaml` truncates the file to
+        zero bytes the moment yq fails, and anything coercing the parse
+        with `or {}` would then print sha256:44136fa3... -- a confident,
+        schema-valid pin for a file with nothing in it. It matches the
+        `^sha256:[0-9a-f]{64}$` pattern, so `fluid validate` accepts it,
+        and every later apply compares against a digest that can never
+        match the real upstream.
+        """
+        from fluid_build.cli._common import CLIError
+
+        bad = tmp_path / "truncated.yaml"
+        bad.write_text(body, encoding="utf-8")
+        with pytest.raises(CLIError) as exc:
+            _run(["contract", "digest", str(bad)], tmp_path)
+        assert exc.value.event == "digest_contract_empty"
+
+    def test_an_alias_bomb_is_refused(self, tmp_path):
+        """This command is pointed at UPSTREAM contracts -- vendored or
+        freshly cloned -- so it parses input we do not control. It uses
+        the same guarded loader as the federation gate whose digest it
+        mirrors, rather than a bare `yaml.safe_load`."""
+        from fluid_build.cli._common import CLIError
+
+        bomb = tmp_path / "bomb.yaml"
+        bomb.write_text(
+            "a: &a [1,1,1,1,1,1,1,1,1]\n"
+            "b: &b [*a,*a,*a,*a,*a,*a,*a,*a,*a]\n"
+            "c: &c [*b,*b,*b,*b,*b,*b,*b,*b,*b]\n"
+            "d: &d [*c,*c,*c,*c,*c,*c,*c,*c,*c]\n"
+            "e: &e [*d,*d,*d,*d,*d,*d,*d,*d,*d]\n"
+            "f: &f [*e,*e,*e,*e,*e,*e,*e,*e,*e]\n"
+            "g: [*f,*f,*f,*f,*f,*f,*f,*f,*f]\n",  # >50 aliases: over the cap
+            encoding="utf-8",
+        )
+        with pytest.raises(CLIError) as exc:
+            _run(["contract", "digest", str(bomb)], tmp_path)
+        assert exc.value.event in {"digest_contract_unsafe", "digest_contract_unreadable"}
+
     def test_a_non_mapping_document_is_rejected(self, tmp_path):
         from fluid_build.cli._common import CLIError
 
