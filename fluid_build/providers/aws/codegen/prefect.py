@@ -32,7 +32,6 @@ runs on a plain ``import`` of the generated file — ``prefect deploy``, a
 Prefect worker, or a developer opening it in a REPL.
 """
 
-import json
 from datetime import datetime
 from datetime import timezone as dt_timezone
 from typing import Any, Dict, List
@@ -41,7 +40,6 @@ from fluid_build.providers.common.codegen_utils import (
     escape_for_docstring,
     json_literal,
     py_str_literal,
-    sanitize_identifier,
     task_identifier,
 )
 

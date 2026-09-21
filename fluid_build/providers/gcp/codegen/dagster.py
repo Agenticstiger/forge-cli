@@ -24,7 +24,6 @@ Supports:
 - Dataflow pipelines
 """
 
-import json
 from datetime import datetime
 from datetime import timezone as dt_timezone
 from typing import Any, Dict, List

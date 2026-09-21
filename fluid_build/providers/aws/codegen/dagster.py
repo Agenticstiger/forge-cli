@@ -24,7 +24,6 @@ Supports:
 - Type-safe ops
 """
 
-import json
 from datetime import datetime
 from datetime import timezone as dt_timezone
 from typing import Any, Dict, List
@@ -33,7 +32,6 @@ from fluid_build.providers.common.codegen_utils import (
     escape_for_docstring,
     json_literal,
     py_str_literal,
-    sanitize_identifier,
     task_identifier,
 )
 
