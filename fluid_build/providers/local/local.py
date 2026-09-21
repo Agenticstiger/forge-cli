@@ -451,14 +451,29 @@ class LocalProvider(BaseProvider):
                     else:
                         self._log_warn("local_model_missing", {"model": model_path})
 
-        # If no inputs from build, collect from consumes (fallback)
-        if not inputs_spec:
-            for c in contract.get("consumes") or []:
-                p = c.get("path") or (c.get("location") or {}).get("path")
-                if p:
-                    inputs_spec.append(
-                        {"path": p, "table": c.get("id") or _guess_table_name_from_path(Path(p))}
-                    )
+        # consumes[] cannot be a fallback source of inputs, and saying so is
+        # more useful than pretending otherwise. This block used to read
+        # ``c["path"]`` / ``c["location"]["path"]`` / ``c["id"]``; the
+        # consumeRef schema is ``additionalProperties: false`` and permits
+        # none of them (only productId, exposeId, versionConstraint,
+        # qosExpectations, requiredPolicies, purpose, tags, labels,
+        # upstreamWorkspace, upstreamDigest), so it could never fire for a
+        # contract that validates. A consumeRef carries a LOGICAL address
+        # only; turning it into a physical one needs the upstream contract,
+        # which is tracked separately as the consumes[]-wiring work.
+        unbound = len(contract.get("consumes") or []) if not inputs_spec else 0
+        if unbound:
+            self._log_warn(
+                "local_consumes_not_bound",
+                {
+                    "count": unbound,
+                    "hint": (
+                        "consumes[] declares upstream products but carries no "
+                        "physical address. Declare the reader explicitly under "
+                        "builds[].properties.parameters.inputs to bind it."
+                    ),
+                },
+            )
 
         # Decide output — honour the declared path AND format from the first expose.
         # A contract that declares ``format: parquet`` at an ``output/*.parquet``
