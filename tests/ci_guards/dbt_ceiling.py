@@ -85,8 +85,18 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import bashlex
-import tomllib
 import yaml
+
+try:  # Python 3.11+
+    import tomllib
+except ImportError:  # pragma: no cover - the 3.10 leg
+    # `tomli` is pinned into the [dev] extra for python_version < "3.11".
+    # Deliberately NOT degraded to `tomllib = None`: without TOML the
+    # extras cannot be resolved, four real install sites vanish from the
+    # scan, and the guard reports green on having read less than it
+    # claims. An ImportError here is the correct, loud outcome -- and the
+    # extras coverage floor would fail regardless.
+    import tomli as tomllib  # type: ignore[no-redef]
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
