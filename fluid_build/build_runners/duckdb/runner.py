@@ -148,6 +148,60 @@ def _apply_object_store_secret(con: Any, ctx: RunContext) -> None:
             LOG.warning("DuckDB CREATE SECRET (%s) failed: %s", scheme, type(exc).__name__)
 
 
+_URI_SCHEME_TO_SECRET_TYPE = {
+    "s3": "s3",
+    "gs": "gcs",
+    "gcs": "gcs",
+    "azure": "azure",
+    "abfss": "azure",
+}
+
+
+def _apply_destination_secret(con: Any, ctx: RunContext, dest_uri: str) -> None:
+    """Authenticate the WRITE using the ambient credential chain.
+
+    Only reached when the destination is an object store and the contract
+    carried no explicit ``connection.<scheme>`` block for it. The chain is the
+    same one the IaC planner already used to create the bucket, so this
+    authenticates the data write as the same identity that provisioned the
+    target rather than introducing a second notion of who we are.
+
+    Best effort, and deliberately so: an older duckdb without
+    ``PROVIDER credential_chain`` logs and continues, leaving the previous
+    env-var fallback in play.
+    """
+    scheme = dest_uri.split("://", 1)[0].lower()
+    secret_type = _URI_SCHEME_TO_SECRET_TYPE.get(scheme)
+    # Only S3. DuckDB's `gcs` secret is its S3-compatible one, so
+    # PROVIDER credential_chain there resolves the AWS chain and presents it to
+    # Google: accepted without complaint, then 403 with a misleading message.
+    # GCS wants HMAC key_id/secret and Azure wants its own, neither of which
+    # this path has, so they keep the previous env-var behaviour rather than
+    # being given a credential that cannot work.
+    if secret_type != "s3":
+        return
+    # An explicit block in the contract wins; do not overwrite it.
+    raw = dict(ctx.source.connection.raw or {})
+    if isinstance(raw.get(secret_type), dict):
+        return
+    region = _destination_region(ctx)
+    parts = ["TYPE " + secret_type, "PROVIDER credential_chain"]
+    if region and secret_type == "s3":
+        # quote_ansi_string_literal, not an f-string: `region` is contract input
+        # and this is SQL. Interpolating it raw let a schema-valid contract run
+        # stacked statements here — ATTACH, COPY out, LOAD an extension — and it
+        # runs before any data moves. The neighbouring CREATE SECRET path was
+        # already hardened against exactly this.
+        parts.append(f"REGION {quote_ansi_string_literal(str(region))}")
+    try:
+        con.execute("CREATE OR REPLACE SECRET __fluid_dest (" + ", ".join(parts) + ")")
+    except Exception as exc:  # noqa: BLE001
+        # As above: never log `exc` itself, DuckDB echoes statement text.
+        LOG.warning(
+            "DuckDB destination CREATE SECRET (%s) failed: %s", secret_type, type(exc).__name__
+        )
+
+
 # ── Reader dispatch ──────────────────────────────────────────────────────
 
 
@@ -327,6 +381,11 @@ _EXT_BY_KIND = {
 }
 
 
+def _dedupe(items: List[str]) -> List[str]:
+    seen: set = set()
+    return [x for x in items if not (x in seen or seen.add(x))]
+
+
 def _required_extensions(kind: str, uri: Optional[str]) -> List[str]:
     base = list(_EXT_BY_KIND.get(kind, []))
     if uri:
@@ -408,7 +467,14 @@ class DuckdbRunner:
         return ["data"]
 
     def _load_extensions(self, con: Any, ctx: RunContext) -> None:
-        for ext in _required_extensions(ctx.source.kind, ctx.source.connection.uri):
+        dest_uri = _binding_destination_uri(ctx)
+        exts = _required_extensions(ctx.source.kind, ctx.source.connection.uri)
+        if dest_uri:
+            # Writing to an object store needs the same extensions reading from
+            # one does. Derived from the destination because the source kind
+            # says nothing about where the rows are going.
+            exts = _dedupe(exts + _required_extensions("filesystem", dest_uri))
+        for ext in exts:
             try:
                 con.execute(f"INSTALL {ext}")
                 con.execute(f"LOAD {ext}")
@@ -417,6 +483,8 @@ class DuckdbRunner:
                 # echo statement text containing DSN-embedded credentials.
                 LOG.warning("DuckDB extension load failed (%s): %s", ext, type(exc).__name__)
         _apply_object_store_secret(con, ctx)
+        if dest_uri:
+            _apply_destination_secret(con, ctx, dest_uri)
         self._attach_external_databases(con, ctx)
 
     def _attach_external_databases(self, con: Any, ctx: RunContext) -> None:
@@ -546,7 +614,7 @@ def _run_post_land_hooks(
     if reader is None:
         return findings
 
-    con = duckdb.connect(":memory:")
+    con = _connect_for_destination(ctx)
     try:
         for stream_result in stream_results:
             if stream_result.state != RunState.SUCCEEDED:
@@ -663,7 +731,7 @@ def _enforce_late_arrival_split(
     budget_seconds = float(policy["allowed_lateness_seconds"])
 
     results: Dict[str, Dict[str, int]] = {}
-    con = duckdb.connect(":memory:")
+    con = _connect_for_destination(ctx)
     try:
         for stream_result in stream_results:
             if stream_result.state != RunState.SUCCEEDED:
@@ -671,7 +739,7 @@ def _enforce_late_arrival_split(
             stream_name = stream_result.name
             main_path = _resolve_destination_path(ctx, stream_name, fmt, out_dir)
             main_path_obj = Path(main_path)
-            if not main_path_obj.exists():
+            if not _artifact_exists(con, main_path, reader_func.split("(")[0]):
                 continue
             late_path_obj = main_path_obj.with_name(
                 main_path_obj.stem + "__late_events" + main_path_obj.suffix
@@ -893,7 +961,7 @@ def _persist_cursor_after_run(
         return False  # unsupported sink for cursor read-back
 
     quoted_path = quote_ansi_string_literal(out_path)
-    con = duckdb.connect(":memory:")
+    con = _connect_for_destination(ctx)
     try:
         row = con.execute(
             f"SELECT MAX({cursor_field_safe}) FROM {reader}({quoted_path})"
@@ -1179,16 +1247,21 @@ def _resolve_destination_path(
     expose has a single output. Returns a string so URI schemes
     (``s3://``, ``gs://``, ``azure://`` …) survive untouched — wrapping
     them in ``Path`` collapses ``s3://`` to ``s3:/`` which DuckDB can't
-    read. For local paths, behavior is unchanged: relative paths are
-    rooted under ``ctx.workdir`` and parent directories are created.
+    read. When the binding names a ``location.bucket``, the path is
+    BUCKET-RELATIVE and is composed into an object-store URI — see
+    ``_object_store_uri``. For local paths, behavior is unchanged:
+    relative paths are rooted under ``ctx.workdir`` and parent
+    directories are created.
     """
     expose = _find_first_expose(ctx)
     if expose is not None:
-        loc = expose.get("binding", {}).get("location", {}) or {}
+        binding = expose.get("binding", {}) or {}
+        loc = binding.get("location", {}) or {}
         path = loc.get("path")
         if path and len(ctx.source.streams) <= 1:
-            if _is_remote_uri(path):
-                return path
+            uri = path if _is_remote_uri(path) else _object_store_uri(binding, loc, path)
+            if uri is not None:
+                return _file_within_prefix(uri, loc, stream, sink_format)
             p = Path(path)
             if not p.is_absolute():
                 p = Path(ctx.workdir) / p
@@ -1196,6 +1269,181 @@ def _resolve_destination_path(
             return str(p)
     ext = {"parquet": "parquet", "csv": "csv", "json": "ndjson"}.get(sink_format, sink_format)
     return str(default_dir / f"{stream}.{ext}")
+
+
+# Object-store schemes by binding platform. Only these compose a URI from a
+# named bucket; every other platform keeps the previous local-path behaviour.
+# azure:// rather than abfss://: only the former is in _REMOTE_URI_SCHEMES and
+# only the former maps to the azure extension in _required_extensions, so
+# emitting abfss:// would compose a URI this same module then fails to
+# recognise or load an extension for. DuckDB's azure secret scope covers both.
+_OBJECT_STORE_SCHEMES = {"aws": "s3", "gcp": "gs", "azure": "azure"}
+
+
+def _object_store_uri(binding: Dict[str, Any], loc: Dict[str, Any], path: str) -> Optional[str]:
+    """``<scheme>://<bucket>/<path>`` when the binding names a bucket, else None.
+
+    WHY THIS EXISTS. ``providers/aws/util/warehouse.py`` calls itself "the sole
+    writer" of the ``s3://{bucket}/{path}`` string, and says why: "Routing both
+    paths through one function is what guarantees a binding can never resolve to
+    two different warehouses." This runner was a third reader of the same
+    binding and did not route through it. It took ``location.path`` alone and
+    ignored ``location.bucket``, so for
+
+        binding:
+          platform: aws
+          location: {bucket: acme-lake, path: bronze/orders/}
+
+    the Glue table's ``storage_descriptor.location`` became
+    ``s3://acme-lake/bronze/orders/`` while the data was written to
+    ``./bronze/orders`` on the local disk. The build reported success either
+    way, leaving a correct catalogue over an empty prefix: the exact
+    two-warehouses outcome that module exists to prevent.
+
+    Nor could a contract author work around it. Writing the full URI into
+    ``path`` fixes the data and breaks the catalogue, because the planner
+    prefixes the bucket unconditionally and yields
+    ``s3://acme-lake/s3://acme-lake/bronze/orders/``. No value of ``path``
+    satisfied both readers.
+
+    A binding with no bucket is unchanged and stays local. The
+    ``{account}-fluid-data`` fallback that ``normalize_location`` applies on the
+    IaC path is deliberately NOT applied here: inventing a bucket for a build
+    that never named one would move data off the machine on the strength of a
+    default, which is not a decision a default should make.
+    """
+    scheme = _OBJECT_STORE_SCHEMES.get(str(binding.get("platform") or "").lower())
+    if scheme is None:
+        return None
+    # Reuse the warehouse module's own ``{{ env.VAR }}`` resolution so a bucket
+    # spelled the same way in a contract resolves the same way in both readers.
+    from fluid_build.providers.aws.util.warehouse import resolve_env_templates
+
+    bucket = resolve_env_templates(loc.get("bucket"))
+    if not bucket or "{{" in str(bucket):
+        return None
+    # Always a prefix. `normalize_location` hands this same `path` to the
+    # planner as the table's location, so that is what it IS — whether or not
+    # the author happened to end it with a slash. Without this,
+    # `path: bronze/orders` wrote one object AT the table location instead of
+    # inside it, and the catalogue listed an empty prefix again: the original
+    # defect, one character away, and still reported as a success.
+    prefix = str(path).lstrip("/").rstrip("/")
+    return (
+        f"{scheme}://{str(bucket).strip('/')}/{prefix}/"
+        if prefix
+        else f"{scheme}://{str(bucket).strip('/')}/"
+    )
+
+
+_FILE_FORMAT_EXT = {"parquet": "parquet", "csv": "csv", "json": "ndjson"}
+
+
+def _file_within_prefix(uri: str, loc: Dict[str, Any], stream: str, sink_format: str) -> str:
+    """A URI ending in ``/`` names a PREFIX, so write a file inside it.
+
+    DuckDB's ``COPY ... TO '<uri>'`` writes one object at exactly that URI. Given
+    the prefix ``s3://bucket/bronze/orders/`` it therefore creates an object
+    whose key ends in a slash — legal S3, and invisible to anything that lists
+    the prefix looking for files. The Glue table generated from the SAME binding
+    points at that prefix, so the catalogue resolved to a table with no files in
+    it: ``read_parquet('.../orders/*.parquet')`` matches nothing while the rows
+    sit in an object named after the directory.
+
+    The file is named from ``location.table`` when the binding gives one, which
+    is the name the catalogue already uses for it, and from the stream
+    otherwise.
+    """
+    if not uri.endswith("/"):
+        return uri
+    # Only file formats get a file name. A table format (``bigquery_table``,
+    # ``snowflake_table`` …) does not name an object in a prefix, and inventing
+    # ``orders.bigquery_table`` would be worse than leaving the URI alone.
+    ext = _FILE_FORMAT_EXT.get(sink_format)
+    if ext is None:
+        return uri
+    base = str(loc.get("table") or stream)
+    return f"{uri}{base}.{ext}"
+
+
+def _connect_for_destination(ctx: RunContext) -> Any:
+    """A DuckDB connection that can READ back what this run wrote.
+
+    Three paths re-open the landed artifact on a connection of their own — the
+    incremental cursor read-back, the late-arrival split, and the post-land scan
+    — and each opened a bare ``duckdb.connect(":memory:")``. That is fine while
+    the destination is a local file and cannot read it at all once the binding
+    names a bucket: no httpfs, no secret.
+
+    It mattered most in the cursor read-back, which is called BEFORE the stream
+    is marked SUCCEEDED and inside its try: the COPY to S3 would succeed, the
+    read-back would raise, and the stream would be reported FAILED with the
+    cursor left unadvanced, so the next run re-read everything. The other two
+    swallow their errors, so they would simply have stopped doing their job —
+    no late-arrival split, and an empty PII scan that looks like a clean one.
+    """
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    dest = _binding_destination_uri(ctx)
+    if not dest:
+        return con
+    for ext in _required_extensions("filesystem", dest):
+        try:
+            con.execute(f"INSTALL {ext}")
+            con.execute(f"LOAD {ext}")
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("DuckDB extension load failed (%s): %s", ext, type(exc).__name__)
+    _apply_destination_secret(con, ctx, dest)
+    return con
+
+
+def _artifact_exists(con: Any, path: str, reader: str) -> bool:
+    """Whether the landed artifact is readable, for local paths and URIs alike.
+
+    ``Path("s3://b/k").exists()`` is always False — it collapses the scheme to
+    ``s3:/`` and asks the local filesystem — so the late-arrival split silently
+    skipped every stream once the destination became a URI.
+    """
+    if not _is_remote_uri(path):
+        return Path(path).exists()
+    try:
+        con.execute(f"SELECT 1 FROM {reader}({quote_ansi_string_literal(path)}) LIMIT 1").fetchone()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _binding_destination_uri(ctx: RunContext) -> Optional[str]:
+    """The object-store URI this run will WRITE to, or None for a local write.
+
+    Extension loading and credentials were both derived from the SOURCE only
+    (``_required_extensions(ctx.source.kind, ...)`` and
+    ``_apply_object_store_secret`` reading ``ctx.source.connection``), which is
+    correct for reading from an object store and silently insufficient for
+    writing to one. Acquiring Postgres into S3 loaded no ``httpfs`` and created
+    no secret, so the COPY reached S3 unauthenticated and came back 403.
+    """
+    expose = _find_first_expose(ctx)
+    if expose is None:
+        return None
+    binding = expose.get("binding", {}) or {}
+    loc = binding.get("location", {}) or {}
+    path = loc.get("path")
+    if not path or len(ctx.source.streams) > 1:
+        return None
+    if _is_remote_uri(path):
+        return path
+    return _object_store_uri(binding, loc, path)
+
+
+def _destination_region(ctx: RunContext) -> Optional[str]:
+    expose = _find_first_expose(ctx)
+    if expose is None:
+        return None
+    loc = (expose.get("binding", {}) or {}).get("location", {}) or {}
+    region = loc.get("region")
+    return str(region) if region else None
 
 
 def _find_first_expose(ctx: RunContext) -> Optional[Dict[str, Any]]:
