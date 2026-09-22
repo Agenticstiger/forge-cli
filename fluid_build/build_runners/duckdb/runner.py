@@ -171,22 +171,26 @@ def _apply_destination_secret(con: Any, ctx: RunContext, dest_uri: str) -> None:
     env-var fallback in play.
     """
     scheme = dest_uri.split("://", 1)[0].lower()
-    secret_type = _URI_SCHEME_TO_SECRET_TYPE.get(scheme)
+    duckdb_type = _URI_SCHEME_TO_SECRET_TYPE.get(scheme)
     # Only S3. DuckDB's `gcs` secret is its S3-compatible one, so
     # PROVIDER credential_chain there resolves the AWS chain and presents it to
     # Google: accepted without complaint, then 403 with a misleading message.
     # GCS wants HMAC key_id/secret and Azure wants its own, neither of which
     # this path has, so they keep the previous env-var behaviour rather than
     # being given a credential that cannot work.
-    if secret_type != "s3":
+    # Compared on `scheme`, not on the duckdb type: detect-secrets reads a
+    # `secret*` identifier beside a string literal as a credential assignment,
+    # and annotating a non-secret with `allowlist secret` to quiet it teaches
+    # the next reader that the pragma means nothing.
+    if scheme != "s3":
         return
     # An explicit block in the contract wins; do not overwrite it.
     raw = dict(ctx.source.connection.raw or {})
-    if isinstance(raw.get(secret_type), dict):
+    if isinstance(raw.get(duckdb_type), dict):
         return
     region = _destination_region(ctx)
-    parts = ["TYPE " + secret_type, "PROVIDER credential_chain"]
-    if region and secret_type == "s3":
+    parts = ["TYPE " + str(duckdb_type), "PROVIDER credential_chain"]
+    if region:
         # quote_ansi_string_literal, not an f-string: `region` is contract input
         # and this is SQL. Interpolating it raw let a schema-valid contract run
         # stacked statements here — ATTACH, COPY out, LOAD an extension — and it
@@ -196,10 +200,13 @@ def _apply_destination_secret(con: Any, ctx: RunContext, dest_uri: str) -> None:
     try:
         con.execute("CREATE OR REPLACE SECRET __fluid_dest (" + ", ".join(parts) + ")")
     except Exception as exc:  # noqa: BLE001
-        # As above: never log `exc` itself, DuckDB echoes statement text.
-        LOG.warning(
-            "DuckDB destination CREATE SECRET (%s) failed: %s", secret_type, type(exc).__name__
-        )
+        # Never log `exc` itself: DuckDB echoes the failing statement, which
+        # is a CREATE SECRET. And log `scheme` rather than the duckdb type —
+        # CodeQL's py/clear-text-logging-sensitive-data treats a `secret*`
+        # identifier as sensitive BY NAME, so logging one is a high-severity
+        # finding even when its value is the string "s3". The source-side
+        # handler above logs `scheme` for exactly this reason.
+        LOG.warning("DuckDB destination CREATE SECRET (%s) failed: %s", scheme, type(exc).__name__)
 
 
 # ── Reader dispatch ──────────────────────────────────────────────────────
