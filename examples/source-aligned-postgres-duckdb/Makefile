@@ -33,7 +33,7 @@ run: clean
 	@echo "→ fluid validate"
 	$(PY) -m fluid_build.cli validate contract.fluid.yaml
 	@echo "→ fluid apply (acquisition)"
-	$(PY) -m fluid_build.cli apply --build ingest_orders contract.fluid.yaml
+	$(PY) -m fluid_build.cli apply --mode amend-and-build --build-id ingest_orders contract.fluid.yaml --yes
 
 verify:
 	$(PY) verify.py
