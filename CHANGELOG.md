@@ -7,53 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+## [0.16.0] — 2026-09-23
 
-- **Generated SQL scripts now bind the inputs the contract declares.** A
-  build declares which file backs which name under
-  `builds[].properties.parameters.inputs`, and the author's SQL then says
-  `FROM <name>`. `fluid apply` has always honoured that — the local provider
-  registers each input as a DuckDB view — but the *emitted* script did not,
-  so a project that applied cleanly still failed standalone with
-  `Catalog Error: Table with name <name> does not exist!`. Six worked
-  examples were in that state (02–06 and `local/high_value_churn`); measured
-  before and after, 0/6 of them produced a runnable script, now 6/6. The
-  statement is the provider's own, shared through
-  `providers/_duckdb_read.build_register_view_sql`, so `apply` and the
-  generated script cannot drift apart again.
+### Security
 
-- **Two generated files could resolve to one path, silently losing a
-  stage.** The `#634` writer guard rejected paths that *escape* the output
-  directory but not two that land on the *same* file inside it: a stage
-  named `z/../01_a` normalises onto `01_a.sql`, and the later write replaced
-  the earlier stage's SQL with no diagnostic. Rejected now as
-  `generated_path_collision`, in the same place as the escape check, so it
-  covers every engine.
+- **A contract field could write files outside the output directory.**
+  `fluid generate transformation` built each output path as
+  `output_dir / rel_path` and called `mkdir(parents=True)` + `write_text` with
+  no confinement check. Engines derive those keys from contract fields — the
+  sql engine names each file `{NN}_{stages[].name}.sql`, the dbt engine builds
+  `models/{layer}/{model}.sql` — and `stages[].name` is an unconstrained
+  string in the schema. So a contract declaring
+  `name: ../../../../ESCAPED` passed `fluid validate` ("✅ Valid FLUID
+  contract") and the writer then landed the file four directories above
+  `--output`, outside the project entirely. Contracts travel: `fluid
+  federation` pulls them from other people's registries, so whoever runs
+  `generate` is not necessarily whoever wrote the contract. The sibling writer
+  in `cli/_template_mode.py` has carried this guard, and a comment describing
+  this exact attack, since the copilot hardening; this one never had it. Every
+  generated path is now resolved and checked against the output root *before
+  any file is written*, so a late-sorting offender cannot leave a half-written
+  project behind, and an escape raises `generated_path_outside_output_dir`
+  rather than being silently skipped — a dropped stage would yield a project
+  that looks generated but is missing a step.
 
-- **`fluid apply` no longer implies `consumes[]` is wired when it is not.**
-  The local provider's fallback read `c["path"]` / `c["location"]["path"]` /
-  `c["id"]` from a consumeRef; the schema is `additionalProperties: false`
-  and permits none of them, so it could never fire for a contract that
-  validates. A consumeRef carries a logical address only. Applying a
-  contract whose `consumes[]` are unbound now says so, and names the field
-  that does bind a reader.
-
-### Changed
-
-- **BEHAVIOUR CHANGE: generated SQL scripts now create views.** The `sql`
-  engine emitted bare `SELECT` statements, so a script an operator ran
-  against a warehouse had no side effect. Each multi-stage script now carries
-  `CREATE OR REPLACE VIEW <output> AS …` and creates a relation in whatever
-  catalog the session points at. This is what makes the generated project
-  runnable at all — nothing previously created a relation under any name, so
-  a stage's `FROM <upstream's output>` could never resolve — but it is not a
-  drop-in: `OR REPLACE` drops grants on Snowflake and Databricks and makes
-  any Snowflake stream over the view stale, and replacing an existing *table*
-  of the same name fails loudly rather than converting it. Every emitted file
-  says which it is, in its header: `-- Materialises: <name>  (CREATE OR
-  REPLACE VIEW)` or `-- Not materialised: <reason>`. The single-stage
-  `embedded-logic` pattern is unchanged — it has no `outputs` to name a view
-  after and nothing downstream inside the contract to chain to.
+- **A contract value could inject Python into a generated Airflow DAG (#620).**
+  `AirflowDAGGenerator` interpolated contract values straight into
+  `bash_command="{command}"` inside an f-string. A quote in any of them closed
+  the Python literal and put the rest of the value at module scope, where Airflow
+  executes it at DAG-parse time — no task run required. Seven vectors were
+  reachable from `contract.fluid.yaml`, `builds[].script` being the sharpest
+  (passed through verbatim by design). The DAG *header* was a second surface with
+  the same hole: `dag_id`, `description`, `schedule_interval` and the module
+  docstring. Values now route through `shlex.quote` at the shell layer,
+  `py_str_literal` at the Python-literal layer, and `sanitize_identifier`
+  wherever a value becomes a variable name — the pattern this repo already
+  documents and applies in `cli/scaffold_composer`.
 
 ### Added
 
@@ -87,6 +76,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it inside a warning would be worse than the silence.
 
 ### Changed
+
+- **BEHAVIOUR CHANGE: generated SQL scripts now create views.** The `sql`
+  engine emitted bare `SELECT` statements, so a script an operator ran
+  against a warehouse had no side effect. Each multi-stage script now carries
+  `CREATE OR REPLACE VIEW <output> AS …` and creates a relation in whatever
+  catalog the session points at. This is what makes the generated project
+  runnable at all — nothing previously created a relation under any name, so
+  a stage's `FROM <upstream's output>` could never resolve — but it is not a
+  drop-in: `OR REPLACE` drops grants on Snowflake and Databricks and makes
+  any Snowflake stream over the view stale, and replacing an existing *table*
+  of the same name fails loudly rather than converting it. Every emitted file
+  says which it is, in its header: `-- Materialises: <name>  (CREATE OR
+  REPLACE VIEW)` or `-- Not materialised: <reason>`. The single-stage
+  `embedded-logic` pattern is unchanged — it has no `outputs` to name a view
+  after and nothing downstream inside the contract to chain to.
 
 - **Every shipped contract now declares the current stable schema, `0.7.5`.**
   All 13 templates under `fluid_build/templates/` and all 18 contracts under
@@ -148,6 +152,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fluid doctor --env`) bounds each git operation.
 
 ### Fixed
+
+- **A binding that names a bucket now lands its data in that bucket.** The
+  DuckDB acquisition runner read `exposes[].binding.location.path` and ignored
+  `location.bucket`, while the AWS planner composes `s3://{bucket}/{path}` from
+  the same binding. So `{platform: aws, location: {bucket: acme-lake, path:
+  bronze/orders/}}` produced a Glue table pointing at
+  `s3://acme-lake/bronze/orders/` while the rows were written to
+  `./bronze/orders` on the local disk, and the build reported `Executed: 1,
+  Failed: 0` either way: a correct catalogue over an empty prefix. Nor could a
+  contract work around it, since putting the full URI in `path` fixed the data
+  and broke the catalogue (`s3://acme-lake/s3://acme-lake/bronze/orders/`). Six
+  faults had to go for `--env aws` to work at all: the path composition; the
+  destination's extensions and credentials, which were both derived from the
+  SOURCE, so the COPY went out unauthenticated and returned 403; an object
+  written *at* the prefix rather than inside it, invisible to anything listing
+  that prefix for files; three other connections (the incremental cursor
+  read-back, the late-arrival split, the post-land scan) that could not read a
+  bucket, the first of which runs before a stream is marked succeeded and so
+  turned a successful write into a FAILED run; `Path("s3://b/k").exists()`
+  always being False; and `fluid verify` dispatching on `format` rather than
+  platform, which sent an `aws`/`parquet` expose to the local-file branch.
+  Verified against a real AWS account: 10,172 rows readable through the Glue
+  table's own prefix. The combination was uncovered because the MinIO
+  end-to-end test points at a full `s3://…/orders.parquet` URI, the branch that
+  always worked. (#644)
+
+- **Generated SQL scripts now bind the inputs the contract declares.** A
+  build declares which file backs which name under
+  `builds[].properties.parameters.inputs`, and the author's SQL then says
+  `FROM <name>`. `fluid apply` has always honoured that — the local provider
+  registers each input as a DuckDB view — but the *emitted* script did not,
+  so a project that applied cleanly still failed standalone with
+  `Catalog Error: Table with name <name> does not exist!`. Six worked
+  examples were in that state (02–06 and `local/high_value_churn`); measured
+  before and after, 0/6 of them produced a runnable script, now 6/6. The
+  statement is the provider's own, shared through
+  `providers/_duckdb_read.build_register_view_sql`, so `apply` and the
+  generated script cannot drift apart again.
+
+- **Two generated files could resolve to one path, silently losing a
+  stage.** The `#634` writer guard rejected paths that *escape* the output
+  directory but not two that land on the *same* file inside it: a stage
+  named `z/../01_a` normalises onto `01_a.sql`, and the later write replaced
+  the earlier stage's SQL with no diagnostic. Rejected now as
+  `generated_path_collision`, in the same place as the escape check, so it
+  covers every engine.
+
+- **`fluid apply` no longer implies `consumes[]` is wired when it is not.**
+  The local provider's fallback read `c["path"]` / `c["location"]["path"]` /
+  `c["id"]` from a consumeRef; the schema is `additionalProperties: false`
+  and permits none of them, so it could never fire for a contract that
+  validates. A consumeRef carries a logical address only. Applying a
+  contract whose `consumes[]` are unbound now says so, and names the field
+  that does bind a reader.
 
 - **A shipped template did not validate, and nothing noticed.**
   `fluid init --template multiple-outputs` scaffolded a contract that `fluid
@@ -248,41 +306,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The gitpython path is removed; every federated fetch goes through the bounded
   shell-out. Nothing is lost: GitPython shells out to the same `git` binary, so
   it was never a fallback for git being missing.
-
-### Security
-
-- **A contract field could write files outside the output directory.**
-  `fluid generate transformation` built each output path as
-  `output_dir / rel_path` and called `mkdir(parents=True)` + `write_text` with
-  no confinement check. Engines derive those keys from contract fields — the
-  sql engine names each file `{NN}_{stages[].name}.sql`, the dbt engine builds
-  `models/{layer}/{model}.sql` — and `stages[].name` is an unconstrained
-  string in the schema. So a contract declaring
-  `name: ../../../../ESCAPED` passed `fluid validate` ("✅ Valid FLUID
-  contract") and the writer then landed the file four directories above
-  `--output`, outside the project entirely. Contracts travel: `fluid
-  federation` pulls them from other people's registries, so whoever runs
-  `generate` is not necessarily whoever wrote the contract. The sibling writer
-  in `cli/_template_mode.py` has carried this guard, and a comment describing
-  this exact attack, since the copilot hardening; this one never had it. Every
-  generated path is now resolved and checked against the output root *before
-  any file is written*, so a late-sorting offender cannot leave a half-written
-  project behind, and an escape raises `generated_path_outside_output_dir`
-  rather than being silently skipped — a dropped stage would yield a project
-  that looks generated but is missing a step.
-
-- **A contract value could inject Python into a generated Airflow DAG (#620).**
-  `AirflowDAGGenerator` interpolated contract values straight into
-  `bash_command="{command}"` inside an f-string. A quote in any of them closed
-  the Python literal and put the rest of the value at module scope, where Airflow
-  executes it at DAG-parse time — no task run required. Seven vectors were
-  reachable from `contract.fluid.yaml`, `builds[].script` being the sharpest
-  (passed through verbatim by design). The DAG *header* was a second surface with
-  the same hole: `dag_id`, `description`, `schedule_interval` and the module
-  docstring. Values now route through `shlex.quote` at the shell layer,
-  `py_str_literal` at the Python-literal layer, and `sanitize_identifier`
-  wherever a value becomes a variable name — the pattern this repo already
-  documents and applies in `cli/scaffold_composer`.
 
 ## [0.15.3] — 2026-09-15
 
@@ -3320,7 +3343,10 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.3...v0.16.0
+[0.15.3]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.2...v0.15.3
+[0.15.2]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.14.0...v0.14.1
