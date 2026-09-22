@@ -834,6 +834,25 @@ _GCP_BIGQUERY = "bigquery"
 _GCP_NO_VERIFIER = "no-verifier"
 
 
+_OBJECT_STORE_PLATFORMS = {"aws", "azure"}
+
+
+def _is_object_store_binding(binding: Optional[Dict[str, Any]]) -> bool:
+    """True when the binding writes to object storage rather than to disk.
+
+    Keyed on the binding naming a bucket, not on ``format``: ``parquet`` says
+    what the bytes are, never where they are. GCP is handled separately by
+    ``_gcp_provisioned_kind`` above and is deliberately not repeated here.
+    """
+    if not isinstance(binding, dict):
+        return False
+    platform = str(binding.get("platform") or "").lower()
+    if platform not in _OBJECT_STORE_PLATFORMS:
+        return False
+    location = binding.get("location")
+    return isinstance(location, dict) and bool(location.get("bucket"))
+
+
 def _gcp_provisioned_kind(binding: Any) -> str:
     """Classify a GCP binding by what the IaC emitter provisions for it.
 
@@ -1104,6 +1123,24 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 "error": (
                     f"No verifier for this GCP binding (format: {format_type or 'unset'}); "
                     "`fluid apply` provisions it, stage 9 does not reconcile it"
+                ),
+            }
+        elif _is_object_store_binding(expose_config.get("binding")):
+            # An AWS/Azure binding that names a bucket writes to object storage,
+            # so there is no file on this machine to open. Forge ships no
+            # verifier for it, which is "not checked", NOT "check failed" — the
+            # same distinction the GCP branch above draws, and for the same
+            # reason: a format of ``parquet`` says nothing about WHERE the
+            # object lives. Without this, an expose with
+            # ``platform: aws, format: parquet`` fell into the local-file branch
+            # and failed the run looking for ``bronze/orders/`` on disk.
+            binding = expose_config.get("binding") or {}
+            results[expose_name] = {
+                "status": "unsupported",
+                "error": (
+                    f"No verifier for this {binding.get('platform')} binding "
+                    f"(format: {format_type or 'unset'}); the object lives in "
+                    "the bucket the binding names, not on this machine"
                 ),
             }
         elif format_type in {"csv", "parquet", "pq", "local", ""}:
