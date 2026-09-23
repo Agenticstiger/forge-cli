@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] — 2026-09-23
+
+### Security
+
+- **The Docker image moves to Python 3.14, and 0.16.1 is the first release to
+  publish one since 0.15.3.** The v0.16.0 release job failed its Grype gate
+  (`--fail-on high --only-fixed`) on CVE-2026-82049, a High in the Python 3.13
+  interpreter whose fix is listed only from 3.14. The gate runs before the push,
+  so no vulnerable image reached GHCR — which also means no 0.16.0 image exists
+  there. Reproduced locally with the same Grype release CI pins (0.112.0) before
+  changing anything: the 3.13.15 image exits 2 with exactly that one High; the
+  3.14.7 image exits 0 with none. 3.14 was already in the classifiers and the
+  CI test matrix. The PyPI packages for 0.16.0 were unaffected; this release's
+  wheel and sdist are identical in content to 0.16.0's.
+
+### Changed
+
+- CI: five GitHub Actions bumps — docker/setup-buildx-action 4.4.1 (#636),
+  codecov/codecov-action 7.1.1 (#637), aws-actions/configure-aws-credentials
+  6.3.0 (#638), docker/build-push-action 7.4.0 (#639),
+  github/codeql-action/upload-sarif 4.38.1 (#640). Two of them change
+  `release.yml`, which only runs on a tag, so this release is their first run.
+
 ## [0.16.0] — 2026-09-23
 
 ### Security
@@ -3343,7 +3366,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.3...v0.16.0
 [0.15.3]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.2...v0.15.3
 [0.15.2]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.1...v0.15.2
