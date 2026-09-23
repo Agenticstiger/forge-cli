@@ -218,10 +218,10 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     "opentofu_region_moved": (
         [
             "If the resources should stay where they are, set the binding's location.region "
-            "to the region the error names",
+            + "to the region the error names",
             "If they should move, empty and remove them there first (tofu destroy in the "
-            "state directory the error names, with AWS_REGION set to the old region), "
-            "then apply again",
+            + "state directory the error names, with AWS_REGION set to the old region), "
+            + "then apply again",
         ],
         None,
     ),
