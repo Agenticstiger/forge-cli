@@ -1308,7 +1308,7 @@ def _resolve_destination_path(
     bq = _bigquery_target(ctx)
     if bq is not None:
         return str(_bigquery_staging_path(ctx, bq, sink_format))
-    expose = _find_first_expose(ctx)
+    expose = _build_expose(ctx)
     if expose is not None:
         binding = expose.get("binding", {}) or {}
         loc = binding.get("location", {}) or {}
@@ -1484,7 +1484,7 @@ def _binding_destination_uri(ctx: RunContext) -> Optional[str]:
     """
     if _bigquery_target(ctx) is not None:
         return None
-    expose = _find_first_expose(ctx)
+    expose = _build_expose(ctx)
     if expose is None:
         return None
     binding = expose.get("binding", {}) or {}
@@ -1498,7 +1498,7 @@ def _binding_destination_uri(ctx: RunContext) -> Optional[str]:
 
 
 def _destination_region(ctx: RunContext) -> Optional[str]:
-    expose = _find_first_expose(ctx)
+    expose = _build_expose(ctx)
     if expose is None:
         return None
     loc = (expose.get("binding", {}) or {}).get("location", {}) or {}
@@ -1514,7 +1514,7 @@ def _bigquery_target(ctx: RunContext) -> Optional[Dict[str, Any]]:
     binding that resolves to a BigQuery table used to COPY to its ``gs://``
     path, fail without keys, and never reach the table either way.
     """
-    expose = _find_first_expose(ctx)
+    expose = _build_expose(ctx)
     if expose is None:
         return None
     from .._bigquery_load import bigquery_load_target
@@ -1584,8 +1584,23 @@ def _refused_run(
     )
 
 
-def _find_first_expose(ctx: RunContext) -> Optional[Dict[str, Any]]:
+def _build_expose(ctx: RunContext) -> Optional[Dict[str, Any]]:
+    """The expose this build writes: the first one its ``outputs`` names.
+
+    This was ``exposes[0]`` whatever the build, so in a contract with two
+    builds the second wrote to the first one's destination. For a BigQuery
+    binding that meant truncating another build's table with this build's rows
+    and reporting success. A build that declares no outputs, or names none that
+    exists, keeps ``exposes[0]``, which every single-expose contract resolves
+    to anyway.
+    """
     exposes = ctx.contract.get("exposes") or []
+    build_id = getattr(ctx, "build_id", None)
+    build = next((b for b in ctx.contract.get("builds") or [] if b.get("id") == build_id), None)
+    outputs = set((build or {}).get("outputs") or [])
+    for expose in exposes:
+        if expose.get("exposeId") in outputs:
+            return expose
     return exposes[0] if exposes else None
 
 

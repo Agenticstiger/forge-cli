@@ -29,10 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emitted `"type": "VARCHAR"`. A miss now resolves through the ODCS BigQuery
   physical-type table (VARCHAR, CHAR and UUID to STRING, SMALLINT to INT64,
   TIMESTAMPTZ to TIMESTAMP, BLOB to BYTES), which agrees with every existing
-  entry, so no emit that was valid changes.
+  entry, so no emit that was valid changes. The multi-word spellings the
+  contract schema accepts (`double precision`, `timestamp with[out] time zone`)
+  map as well. Of the 82 spellings the schema's type pattern admits, only a bare
+  `array` still has no BigQuery form, because BigQuery arrays are REPEATED
+  columns of an element type the spelling does not name.
 - **`binding.location.project` is honoured.** It was ignored, so the dataset
   and table went to whatever project the environment named. It now goes on
-  both resources, and brownfield import ids name the same project.
+  both resources and on a shared pool's dataset lookup, and brownfield import
+  ids name the same project.
+- **A build writes to its own expose.** The DuckDB runner took the contract's
+  first expose whatever build was running, so in a contract with two builds
+  the second wrote to the first one's destination; with a BigQuery binding
+  that truncated the other build's table and reported success. It now takes
+  the expose the build's `outputs` names, and keeps the first expose only for
+  a build that names none.
 - **`fluid verify` compares BigQuery types by what they are.** BigQuery answers
   with legacy names (INTEGER, FLOAT, BOOLEAN) for what was created as INT64,
   FLOAT64 or BOOL, so a correct BOOL column was reported as drift, and verify's

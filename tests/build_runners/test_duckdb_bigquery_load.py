@@ -244,3 +244,68 @@ def test_a_local_binding_never_touches_bigquery(bq, tmp_path):
     assert _run(contract, tmp_path) == 0
     assert fake.calls == []
     assert out.exists()
+
+
+def _customers_build(tmp_path: Path) -> Dict[str, Any]:
+    src = tmp_path / "in_customers"
+    src.mkdir(exist_ok=True)
+    (src / "customers.csv").write_text("id,name\n1,Ada\n2,Lin\n", encoding="utf-8")
+    return {
+        "id": "ingest_customers",
+        "pattern": "acquisition",
+        "engine": "duckdb",
+        "capabilities": ["full_refresh"],
+        "properties": {
+            "source": {
+                "kind": "filesystem",
+                "connection": {"uri": str(src / "*.csv")},
+                "mode": "full_refresh",
+                "reader": {"format": "csv", "options": {"header": True}},
+            },
+            "sink": {"format": "parquet"},
+        },
+        "outputs": ["customers"],
+    }
+
+
+def test_each_build_loads_its_own_table(bq, tmp_path):
+    """The target was ``exposes[0]`` whatever the build, so the second build of
+    a two-build contract truncated the FIRST build's table with its own rows."""
+    fake = bq()
+    contract = _contract(tmp_path, _LOC)
+    contract["builds"].append(_customers_build(tmp_path))
+    contract["exposes"].append(
+        {
+            "exposeId": "customers",
+            "kind": "table",
+            "binding": {
+                "platform": "gcp",
+                "format": "bigquery_table",
+                "location": {**_LOC, "table": "customers", "path": "gs://acme-lake/c/"},
+            },
+            "contract": {"schema": [], "schemaPolicy": "discover_and_freeze"},
+        }
+    )
+    assert execute_duckdb_build(contract["builds"][1], contract, tmp_path, dry_run=False) == 0
+    loads = [c[1] for c in fake.calls if c[0] == "load"]
+    assert loads == ["acme-eu.bronze.customers"]
+
+
+def test_an_unrelated_first_expose_does_not_capture_the_build(bq, tmp_path):
+    """A local expose listed first used to take the rows, and the BigQuery
+    table the build names was never loaded, with the build reporting success."""
+    fake = bq()
+    contract = _contract(tmp_path, _LOC)
+    decoy = tmp_path / "decoy" / "decoy.parquet"
+    contract["exposes"].insert(
+        0,
+        {
+            "exposeId": "decoy",
+            "kind": "table",
+            "binding": {"platform": "local", "format": "parquet", "location": {"path": str(decoy)}},
+            "contract": {"schema": [], "schemaPolicy": "discover_and_freeze"},
+        },
+    )
+    assert _run(contract, tmp_path) == 0
+    assert [c[1] for c in fake.calls if c[0] == "load"] == ["acme-eu.bronze.orders"]
+    assert not decoy.exists()

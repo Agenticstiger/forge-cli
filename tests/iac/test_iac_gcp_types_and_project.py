@@ -123,3 +123,41 @@ def test_verify_compares_a_type_not_its_spelling(declared, reported):
 
 def test_verify_expects_the_type_the_iac_emitted_for_varchar():
     assert _bq_canonical_type(_bq_type("varchar")) == _bq_canonical_type("STRING")
+
+
+@pytest.mark.parametrize(
+    "spelling, expected",
+    [
+        ("double precision", "FLOAT64"),
+        ("timestamp with time zone", "TIMESTAMP"),
+        ("Timestamp  Without  Time Zone", "TIMESTAMP"),
+    ],
+)
+def test_the_multi_word_spellings_the_schema_accepts_map_too(spelling, expected):
+    """The contract schema's type pattern admits these; they were upper-cased
+    into "DOUBLE PRECISION" and "TIMESTAMP WITH TIME ZONE", which BigQuery
+    rejects."""
+    assert _bq_type(spelling) == expected
+
+
+def test_a_shared_datasets_lookup_names_the_bindings_project():
+    """Otherwise the data source reads the provider's default project while the
+    table is created in the binding's."""
+    contract = {
+        "id": "orders-adp",
+        "packaging": {"mode": "shared", "pool": "acme-pool"},
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "binding": {
+                    "platform": "gcp",
+                    "format": "bigquery_table",
+                    "location": {"project": "tenant-a", "dataset": "sales_pool", "table": "orders"},
+                },
+                "contract": {"schema": [{"name": "id", "type": "string"}]},
+            }
+        ],
+    }
+    data = get_iac_plugin("gcp").emit_data(contract)
+    (lookup,) = data["google_bigquery_dataset"].values()
+    assert lookup == {"dataset_id": "sales_pool", "project": "tenant-a"}
