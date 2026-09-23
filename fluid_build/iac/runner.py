@@ -258,6 +258,31 @@ def tofu_state_list(workdir: str, *, env: Optional[Mapping[str, str]] = None) ->
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
+def tofu_state_resources(
+    workdir: str, *, env: Optional[Mapping[str, str]] = None
+) -> List[Dict[str, Any]]:
+    """Resources in the CURRENT state, from ``tofu show -json`` (no refresh).
+
+    Read before planning, so a caller can compare what state recorded with what
+    the new module asks for. Best-effort like :func:`tofu_state_list`: ``[]``
+    for no state, an unreadable one, or a failed command.
+    """
+    result = _run(["show", "-json"], workdir=workdir, env=env, command="show-state")
+    if not result.ok:
+        return []
+    try:
+        doc = json.loads(result.stdout or "{}")
+    except ValueError:
+        return []
+    out: List[Dict[str, Any]] = []
+    stack = [((doc.get("values") or {}).get("root_module") or {})]
+    while stack:
+        mod = stack.pop()
+        out.extend(mod.get("resources") or [])
+        stack.extend(mod.get("child_modules") or [])
+    return out
+
+
 def tofu_prior_state_resources(
     workdir: str,
     *,

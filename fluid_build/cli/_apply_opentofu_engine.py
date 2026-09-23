@@ -144,6 +144,10 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     if not init.ok:
         raise CLIError(1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)})
 
+    # Pre-plan region guard. A module now pins the region its bindings name,
+    # and moving a contract's resources to it would not show as a destroy.
+    _guard_region_move(plugin, contract, str(workdir), env)
+
     # Pre-plan ownership-transition guard (RFC-packaging-modes.md file 10).
     # Runs BEFORE _adopt_existing — brownfield adoption is precisely the
     # mechanism that would re-own a shared pool — and before `tofu plan`,
@@ -441,6 +445,39 @@ def _adopt_existing(
             )
     if adopted:
         cprint(f"  brownfield:  adopted {adopted} pre-existing resource(s) into state")
+
+
+def _guard_region_move(
+    plugin: Any, contract: Mapping[str, Any], workdir: str, env: Mapping[str, str]
+) -> None:
+    """Fail closed when state holds this contract's resources in another region.
+
+    The provider now takes the region the bindings name, where it used to take
+    the environment's. A contract first applied from a shell in us-east-1 has
+    its resources there; re-applied with the region pinned to eu-west-1, the
+    refresh finds nothing in eu-west-1, drops the old resources from state as
+    drift and plans them as creates. No destroy is planned, so the data-loss
+    gate cannot fire, and the originals are left behind unmanaged. Reproduced
+    against an emulator before this guard existed.
+    """
+    from fluid_build.iac import provider_config
+
+    pinned = (provider_config(plugin, contract) or {}).get("region")
+    recorded_regions = getattr(plugin, "recorded_regions", None)
+    if not pinned or not callable(recorded_regions):
+        return
+    elsewhere = sorted(recorded_regions(runner.tofu_state_resources(workdir, env=env)) - {pinned})
+    if elsewhere:
+        raise CLIError(
+            1,
+            "opentofu_region_moved",
+            {
+                "error": f"state holds this contract's resources in {', '.join(elsewhere)}, "
+                f"but its bindings name {pinned}. Applying would create them again in "
+                f"{pinned} and leave the originals unmanaged",
+                "state": workdir,
+            },
+        )
 
 
 def _guard_packaging_transitions(

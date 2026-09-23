@@ -32,6 +32,7 @@ from fluid_build.iac import (
     IAC_PLUGINS,
     assemble_tofu_document,
     get_iac_plugin,
+    provider_config,
     provider_match,
     render_tofu_json,
 )
@@ -118,7 +119,7 @@ def run(args, logger: logging.Logger) -> int:
         actions = native_actions(contract, logger)
         resources = plugin.emit(contract, actions)
         count = sum(len(items) for items in resources.values())
-        provider_cfg = plugin.provider_block()
+        provider_cfg = provider_config(plugin, contract)
         document = assemble_tofu_document(
             required_providers=plugin.required_providers,
             resources=resources,

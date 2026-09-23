@@ -107,6 +107,19 @@ def render_tofu_json(document: Mapping[str, Any]) -> str:
     return json.dumps(_escape_tofu_literals(document), indent=2, sort_keys=True) + "\n"
 
 
+def provider_config(plugin: IacProviderPlugin, contract: Mapping[str, Any]) -> Dict[str, Any]:
+    """The ``provider {}`` settings for ``plugin``, given the contract being compiled.
+
+    ``provider_block`` is static, so a setting that depends on the contract,
+    such as the region every AWS binding names, has nowhere to go. A plugin that
+    needs one defines ``provider_block_for(contract)``; the rest are unchanged.
+    """
+    for_contract = getattr(plugin, "provider_block_for", None)
+    if callable(for_contract):
+        return for_contract(contract)
+    return plugin.provider_block()
+
+
 def build_module(
     plugin: IacProviderPlugin,
     contract: Mapping[str, Any],
@@ -121,7 +134,7 @@ def build_module(
     the plugin uses it to emit the schedule / orchestration resources that
     have no clean declarative form in ``exposes[]`` (see ``iac.base``).
     """
-    provider_cfg = plugin.provider_block()
+    provider_cfg = provider_config(plugin, contract)
     document = assemble_tofu_document(
         required_providers=plugin.required_providers,
         resources=plugin.emit(contract, actions),

@@ -215,6 +215,16 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Run 'fluid plan <contract>' and inspect the emitted plan for the failing action"],
         None,
     ),
+    "opentofu_region_moved": (
+        [
+            "If the resources should stay where they are, set the binding's location.region "
+            + "to the region the error names",
+            "If they should move, empty and remove them there first (tofu destroy in the "
+            + "state directory the error names, with AWS_REGION set to the old region), "
+            + "then apply again",
+        ],
+        None,
+    ),
     # ── AI / copilot ───────────────────────────────────────────────────────
     "copilot_missing_llm_api_key": (
         [

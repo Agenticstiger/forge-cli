@@ -49,7 +49,12 @@ from fluid_build.cli._common import (
     load_contract_with_overlay,
     resolve_env_templates_in_contract,
 )
-from fluid_build.iac import assemble_tofu_document, get_iac_plugin, render_tofu_json
+from fluid_build.iac import (
+    assemble_tofu_document,
+    get_iac_plugin,
+    provider_config,
+    render_tofu_json,
+)
 from fluid_build.iac.packaging import (
     CONTAINER_KINDS,
     LEGACY,
@@ -133,7 +138,7 @@ def _expected_module_bytes(contract_path: Path) -> tuple[str, bytes]:
     provider = generate_iac._resolve_provider(contract, "auto")
     plugin = get_iac_plugin(provider)
     resources = plugin.emit(contract, [])
-    provider_cfg = plugin.provider_block()
+    provider_cfg = provider_config(plugin, contract)
     document = assemble_tofu_document(
         required_providers=plugin.required_providers,
         resources=resources,

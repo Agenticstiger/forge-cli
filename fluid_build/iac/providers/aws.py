@@ -38,7 +38,9 @@ decides per container kind whether this contract owns the container:
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -56,6 +58,34 @@ from ..packaging import (
 )
 from ..provider_match import is_cloud
 from ..versions import required_providers
+
+LOG = logging.getLogger(__name__)
+
+# An AWS region code: eu-west-1, us-gov-west-1, ap-southeast-2. Anything else a
+# binding carries (a jurisdiction such as "EU", a Google region, an unresolved
+# "{{ env.AWS_REGION }}") must not become the provider's region; it used to be
+# ignored, and still is.
+_AWS_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+$")
+
+
+def recorded_regions(resources: Iterable[Mapping[str, Any]]) -> set:
+    """The AWS regions existing state places its resources in.
+
+    From each resource's ``region`` attribute, else the region field of its
+    ARN (``arn:aws:glue:us-east-1:...``). S3 bucket ARNs carry no region, and
+    are skipped rather than guessed.
+    """
+    found = set()
+    for res in resources:
+        values = res.get("values") or {}
+        region = values.get("region")
+        if not region:
+            parts = str(values.get("arn") or "").split(":")
+            region = parts[3] if len(parts) > 3 else ""
+        if region and _AWS_REGION_RE.match(str(region)):
+            found.add(str(region))
+    return found
+
 
 # Apply-time AWS account placeholder for the credential-free warehouse fallback.
 # Resolves at ``tofu apply`` so ``main.tf.json`` stays account-agnostic while
@@ -535,6 +565,45 @@ class AwsIacPlugin:
             "skip_region_validation": True,
         }
 
+    def recorded_regions(self, resources: Iterable[Mapping[str, Any]]) -> set:
+        """The regions existing state places resources in; see :func:`recorded_regions`."""
+        return recorded_regions(resources)
+
+    def provider_block_for(self, contract: Mapping[str, Any]) -> Dict[str, Any]:
+        """``provider_block``, plus the region the contract's AWS bindings name.
+
+        The provider took its region from the environment alone. A contract
+        bound to eu-west-1, applied from a shell whose default region was
+        us-east-1, created its bucket and Glue database in us-east-1 while the
+        sovereignty check passed for eu-west-1, and a teardown that looked in
+        eu-west-1 then reported them gone. The binding's region now goes on the
+        provider, so it wins over the environment. Only when every AWS binding
+        agrees: one provider block has one region, so a contract spanning two
+        keeps the environment's and is logged (per-resource ``region`` needs
+        provider v6).
+        """
+        cfg = dict(self.provider_block())
+        named = {
+            str(((e.get("binding") or {}).get("location") or {}).get("region"))
+            for e in contract.get("exposes") or []
+            if is_cloud(e.get("binding") or {}, "aws")
+            and ((e.get("binding") or {}).get("location") or {}).get("region")
+        }
+        regions = sorted(r for r in named if _AWS_REGION_RE.match(r))
+        if named - set(regions):
+            LOG.debug(
+                "aws_binding_region_not_a_region_code values=%s", sorted(named - set(regions))
+            )
+        if len(regions) == 1:
+            cfg["region"] = regions[0]
+        elif len(regions) > 1:
+            LOG.warning(
+                "aws_bindings_span_regions regions=%s: the provider region comes from the "
+                "environment",
+                ",".join(regions),
+            )
+        return cfg
+
 
 #: Bindings whose ``location.database`` field names a Glue catalog
 #: database (the mesh-interface case). For Redshift-flavoured formats
@@ -546,6 +615,20 @@ class AwsIacPlugin:
 _GLUE_CATALOG_FORMATS: frozenset = frozenset(
     {"iceberg", "parquet", "csv", "json", "avro", "orc", "delta"}
 )
+
+#: Hive storage classes per file format, for query engines (Athena, Spark)
+#: that read a Glue table through them. Iceberg is read through its metadata,
+#: not these, and is deliberately absent.
+_GLUE_HIVE_STORAGE: Dict[str, Dict[str, Any]] = {
+    "parquet": {
+        "input_format": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+        "output_format": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+        "ser_de_info": {
+            "serialization_library": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+            "parameters": {"serialization.format": "1"},
+        },
+    },
+}
 
 
 def _emit_referenced_containers(
@@ -627,6 +710,13 @@ def _emit_glue(
     # parameters again. Mirrors how the Glue Terraform Registry
     # examples model catalog metadata + descriptions in one resource.
     storage: Dict[str, Any] = {"columns": _columns(schema)}
+    # Athena reads a Glue table through the Hive input format and SerDe the
+    # table declares. Without them every query failed with HIVE_UNSUPPORTED_FORMAT
+    # "Unable to create input format", measured against real Athena, while the
+    # data sat correctly under the table's location. Parquet only: it is what the
+    # builds write, and the one checked live. The classes are the ones the
+    # aws_glue_catalog_table documentation uses for Parquet.
+    storage.update(_GLUE_HIVE_STORAGE.get(str(fmt or "").lower(), {}))
     # Single canonical warehouse writer (RFC §7): identical derivation to the
     # native planner.
     #

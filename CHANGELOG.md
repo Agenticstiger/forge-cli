@@ -49,6 +49,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   FLOAT64 or BOOL, so a correct BOOL column was reported as drift, and verify's
   own map had no `varchar`. Both sides now go through the IaC's type map and
   one normalisation.
+- **Athena can read the Glue tables forge-cli creates.** A Parquet table was
+  created with no Hive input format, output format or SerDe, so every Athena
+  query failed with `HIVE_UNSUPPORTED_FORMAT: Unable to create input format`
+  while the data sat correctly under the table's location. Parquet tables now
+  declare the `MapredParquetInputFormat` / `MapredParquetOutputFormat` /
+  `ParquetHiveSerDe` classes the `aws_glue_catalog_table` documentation uses.
+  Measured on real AWS: the same table, with those added, answered
+  `SELECT COUNT(*)` with the source's 10,172 rows. Iceberg (read through its
+  metadata) and the formats not verified live are unchanged.
+- **AWS resources are created in the region the contract names.** The provider
+  took its region from the environment only, so a contract bound to
+  `eu-west-1`, applied from a shell whose default was `us-east-1`, created its
+  bucket and Glue database in `us-east-1` while the sovereignty check passed
+  for `eu-west-1`. When every AWS binding names the same region it now goes on
+  the provider block and wins over the environment. A contract whose bindings
+  span regions keeps the environment's, with a warning, because one provider
+  block has one region. Only real region codes are pinned: a jurisdiction
+  (`EU`), a Google region, or an unresolved `{{ env.AWS_REGION }}` placeholder,
+  as some shipped examples carry, still leaves the region to the environment.
+- **`fluid apply` refuses to move resources between AWS regions silently.** A
+  contract applied before this release from a shell in another region has its
+  resources there. With the region now pinned, the refresh would drop them as
+  drift and the plan would create them again: no destroy is planned, so the
+  data-loss gate could not fire, and the originals would be left unmanaged.
+  Before planning, the apply now reads the regions its existing state records
+  and fails with `opentofu_region_moved` when they differ from the pinned one,
+  naming both. Reproduced against an emulator with the previous release, then
+  refused by this one through the real apply path.
 
 ## [0.16.1] — 2026-09-23
 
