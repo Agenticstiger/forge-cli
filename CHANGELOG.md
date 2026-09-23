@@ -49,6 +49,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   FLOAT64 or BOOL, so a correct BOOL column was reported as drift, and verify's
   own map had no `varchar`. Both sides now go through the IaC's type map and
   one normalisation.
+- **Athena can read the Glue tables forge-cli creates.** A Parquet table was
+  created with no Hive input format, output format or SerDe, so every Athena
+  query failed with `HIVE_UNSUPPORTED_FORMAT: Unable to create input format`
+  while the data sat correctly under the table's location. Parquet tables now
+  declare the `MapredParquetInputFormat` / `MapredParquetOutputFormat` /
+  `ParquetHiveSerDe` classes the `aws_glue_catalog_table` documentation uses.
+  Measured on real AWS: the same table, with those added, answered
+  `SELECT COUNT(*)` with the source's 10,172 rows. Iceberg (read through its
+  metadata) and the formats not verified live are unchanged.
+- **AWS resources are created in the region the contract names.** The provider
+  took its region from the environment only, so a contract bound to
+  `eu-west-1`, applied from a shell whose default was `us-east-1`, created its
+  bucket and Glue database in `us-east-1` while the sovereignty check passed
+  for `eu-west-1`. When every AWS binding names the same region it now goes on
+  the provider block and wins over the environment. A contract whose bindings
+  span regions keeps the environment's, with a warning, because one provider
+  block has one region. An existing deployment that was created in the wrong
+  region will plan a replacement, which the data-loss gate stops for review.
 
 ## [0.16.1] — 2026-09-23
 
