@@ -12,7 +12,12 @@
 # ============================================
 # Base stage — shared dependencies
 # ============================================
-FROM python:3.13-slim AS base
+# Python 3.14, not 3.13. The release Grype gate (--fail-on high --only-fixed)
+# failed v0.16.0 on CVE-2026-82049, High, in the 3.13 interpreter, with the fix
+# listed only from 3.14. The gate ran before the push, so no vulnerable image was
+# published, and therefore no 0.16.0 image was published at all. 3.14 is already
+# in pyproject's classifiers and in ci.yml's test matrix.
+FROM python:3.14-slim AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
