@@ -36,6 +36,7 @@ when it detects an acquisition build with ``engine: duckdb``.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 import time
@@ -1003,6 +1004,19 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     out_dir = Path(ctx.workdir) / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # A BigQuery binding lands the file locally and a load job moves it into
+    # the table (see ``_bigquery_load``). Refuse the shapes that path cannot
+    # load before any work runs, rather than land somewhere else and succeed.
+    bq_target = _bigquery_target(ctx)
+    if bq_target is not None:
+        from .._bigquery_load import unsupported_reason
+
+        reason = unsupported_reason(_mode_name(ctx), sink_format, len(streams_to_run))
+        if reason:
+            return _refused_run(
+                ctx, streams_to_run, started_at, t_start, f"bigquery load: {reason}"
+            )
+
     stream_results: List[StreamResult] = []
     failures = 0
     records_total = 0
@@ -1188,6 +1202,34 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
             # DSN content; don't include exc body or full traceback.
             LOG.warning("late_arrival_split_failed: %s", type(exc).__name__)
 
+    # BigQuery: the file is on local disk now; load it into the table. After
+    # the late-arrival split, so the rows loaded are the rows that stayed. A
+    # failed or short load fails the stream, and so the run and the apply.
+    bigquery_load: Dict[str, Any] = {}
+    if bq_target is not None and failures == 0 and stream_results:
+        from .._bigquery_load import load_file
+
+        for i, sr in enumerate(stream_results):
+            if sr.state is not RunState.SUCCEEDED:
+                continue
+            staged = _resolve_destination_path(ctx, sr.name, sink_format, out_dir)
+            try:
+                bigquery_load = load_file(
+                    staged,
+                    bq_target,
+                    mode=_mode_name(ctx),
+                    sink_format=sink_format,
+                    expected_rows=_count_file_rows(staged, sink_format),
+                    logger=LOG,
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                stream_results[i] = dataclasses.replace(
+                    sr,
+                    state=RunState.FAILED,
+                    error=f"bigquery load: {type(exc).__name__}: {exc}",
+                )
+
     # ``onError: fail`` mode — when ANY bad rows landed in the DLQ,
     # promote the run to FAILED so the run record reflects the issue.
     # The DLQ records are still on disk (audit trail intact); the
@@ -1223,6 +1265,8 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     # consumers see them without parsing logs.
     if pii_findings:
         facets["pii_findings"] = pii_findings
+    if bigquery_load:
+        facets["bigquery_load"] = bigquery_load
 
     return RunResult(
         run_id=ctx.run_id,
@@ -1258,9 +1302,13 @@ def _resolve_destination_path(
     BUCKET-RELATIVE and is composed into an object-store URI — see
     ``_object_store_uri``. For local paths, behavior is unchanged:
     relative paths are rooted under ``ctx.workdir`` and parent
-    directories are created.
+    directories are created. A BigQuery binding is not a file destination:
+    the file is staged locally for the load job, see ``_bigquery_target``.
     """
-    expose = _find_first_expose(ctx)
+    bq = _bigquery_target(ctx)
+    if bq is not None:
+        return str(_bigquery_staging_path(ctx, bq, sink_format))
+    expose = _build_expose(ctx)
     if expose is not None:
         binding = expose.get("binding", {}) or {}
         loc = binding.get("location", {}) or {}
@@ -1430,8 +1478,13 @@ def _binding_destination_uri(ctx: RunContext) -> Optional[str]:
     correct for reading from an object store and silently insufficient for
     writing to one. Acquiring Postgres into S3 loaded no ``httpfs`` and created
     no secret, so the COPY reached S3 unauthenticated and came back 403.
+
+    None for a BigQuery binding too: its file is staged locally and loaded by a
+    job, so the ``gs://`` path it may carry is never written to.
     """
-    expose = _find_first_expose(ctx)
+    if _bigquery_target(ctx) is not None:
+        return None
+    expose = _build_expose(ctx)
     if expose is None:
         return None
     binding = expose.get("binding", {}) or {}
@@ -1445,7 +1498,7 @@ def _binding_destination_uri(ctx: RunContext) -> Optional[str]:
 
 
 def _destination_region(ctx: RunContext) -> Optional[str]:
-    expose = _find_first_expose(ctx)
+    expose = _build_expose(ctx)
     if expose is None:
         return None
     loc = (expose.get("binding", {}) or {}).get("location", {}) or {}
@@ -1453,8 +1506,101 @@ def _destination_region(ctx: RunContext) -> Optional[str]:
     return str(region) if region else None
 
 
-def _find_first_expose(ctx: RunContext) -> Optional[Dict[str, Any]]:
+def _bigquery_target(ctx: RunContext) -> Optional[Dict[str, Any]]:
+    """The BigQuery table this build loads into, or None.
+
+    DuckDB cannot write to BigQuery, and cannot write to ``gs://`` with
+    Application Default Credentials (its ``gcs`` secret is HMAC only), so a
+    binding that resolves to a BigQuery table used to COPY to its ``gs://``
+    path, fail without keys, and never reach the table either way.
+    """
+    expose = _build_expose(ctx)
+    if expose is None:
+        return None
+    from .._bigquery_load import bigquery_load_target
+
+    return bigquery_load_target(expose.get("binding") or {}, expose)
+
+
+def _bigquery_staging_path(ctx: RunContext, target: Dict[str, Any], sink_format: str) -> Path:
+    """Where a BigQuery-bound build lands its file before the load.
+
+    Under ``.fluid/staging``, like the DLQ under ``.fluid``, and not ``out/``,
+    which is the local target's own output and would be overwritten.
+    """
+    ext = _FILE_FORMAT_EXT.get((sink_format or "parquet").lower(), sink_format)
+    build = _path_part(getattr(ctx, "build_id", None) or "build")
+    path = Path(ctx.workdir) / ".fluid" / "staging" / build / f"{_path_part(target['table'])}.{ext}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _path_part(value: Any) -> str:
+    """One safe path component: contract-supplied ids must not climb out of staging."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", str(value)) or "_"
+
+
+def _count_file_rows(path: str, sink_format: str) -> int:
+    """Rows in a landed file, read back rather than taken from the build count.
+
+    The late-arrival split can rewrite the file after the build counted it.
+    """
+    import duckdb
+
+    reader = {"parquet": "read_parquet", "csv": "read_csv_auto", "json": "read_json_auto"}[
+        sink_format
+    ]
+    con = duckdb.connect(":memory:")
+    try:
+        row = con.execute(
+            f"SELECT COUNT(*) FROM {reader}({quote_ansi_string_literal(path)})"
+        ).fetchone()
+    finally:
+        con.close()
+    return int(row[0]) if row else 0
+
+
+def _mode_name(ctx: RunContext) -> str:
+    mode = ctx.source.mode
+    return str(getattr(mode, "value", mode))
+
+
+def _refused_run(
+    ctx: RunContext, streams: List[str], started_at: Any, t_start: float, reason: str
+) -> RunResult:
+    """A FAILED result for a build refused before it ran, one stream record each."""
+    LOG.error("duckdb.refused %s", reason)
+    return RunResult(
+        run_id=ctx.run_id,
+        state=RunState.FAILED,
+        streams=[StreamResult(name=s, state=RunState.FAILED, error=reason) for s in streams],
+        started_at=started_at,
+        finished_at=utc_now_iso(),
+        records_total=0,
+        bytes_total=0,
+        dlq_records=0,
+        error=reason,
+        facets={"engine": "duckdb", "duration_seconds": time.time() - t_start},
+    )
+
+
+def _build_expose(ctx: RunContext) -> Optional[Dict[str, Any]]:
+    """The expose this build writes: the first one its ``outputs`` names.
+
+    This was ``exposes[0]`` whatever the build, so in a contract with two
+    builds the second wrote to the first one's destination. For a BigQuery
+    binding that meant truncating another build's table with this build's rows
+    and reporting success. A build that declares no outputs, or names none that
+    exists, keeps ``exposes[0]``, which every single-expose contract resolves
+    to anyway.
+    """
     exposes = ctx.contract.get("exposes") or []
+    build_id = getattr(ctx, "build_id", None)
+    build = next((b for b in ctx.contract.get("builds") or [] if b.get("id") == build_id), None)
+    outputs = set((build or {}).get("outputs") or [])
+    for expose in exposes:
+        if expose.get("exposeId") in outputs:
+            return expose
     return exposes[0] if exposes else None
 
 

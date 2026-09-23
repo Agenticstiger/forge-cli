@@ -217,8 +217,14 @@ def test_absent_path_falls_back_to_the_default(tmp_path, path):
     )
 
 
-def test_a_table_format_is_not_given_a_file_name(tmp_path):
-    """``orders.bigquery_table`` would be worse than leaving the prefix alone."""
+def test_a_bigquery_table_binding_stages_locally_not_to_gs(tmp_path):
+    """A BigQuery table is not a file destination. This used to resolve to the
+    binding's ``gs://`` prefix, which DuckDB cannot write with Application
+    Default Credentials and which no load ever read. The file is now staged
+    locally for the load job, under ``.fluid/staging`` rather than ``out/``,
+    which is the local target's own output."""
+    from fluid_build.build_runners.duckdb.runner import _binding_destination_uri
+
     ctx = _Ctx(
         {
             "platform": "gcp",
@@ -227,9 +233,10 @@ def test_a_table_format_is_not_given_a_file_name(tmp_path):
         },
         tmp_path,
     )
-    assert _resolve_destination_path(ctx, "public.orders", "bigquery_table", tmp_path) == (
-        "gs://acme-gcs/staging/orders/"
-    )
+    got = _resolve_destination_path(ctx, "public.orders", "parquet", tmp_path / "out")
+    assert got == str(tmp_path / ".fluid" / "staging" / "build" / "orders.parquet")
+    assert Path(got).parent.is_dir()
+    assert _binding_destination_uri(ctx) is None, "nothing is written to object storage"
 
 
 # ── The destination secret, which executes SQL ───────────────────────────
