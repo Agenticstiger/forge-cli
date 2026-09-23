@@ -65,8 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for `eu-west-1`. When every AWS binding names the same region it now goes on
   the provider block and wins over the environment. A contract whose bindings
   span regions keeps the environment's, with a warning, because one provider
-  block has one region. An existing deployment that was created in the wrong
-  region will plan a replacement, which the data-loss gate stops for review.
+  block has one region. Only real region codes are pinned: a jurisdiction
+  (`EU`), a Google region, or an unresolved `{{ env.AWS_REGION }}` placeholder,
+  as some shipped examples carry, still leaves the region to the environment.
+- **`fluid apply` refuses to move resources between AWS regions silently.** A
+  contract applied before this release from a shell in another region has its
+  resources there. With the region now pinned, the refresh would drop them as
+  drift and the plan would create them again: no destroy is planned, so the
+  data-loss gate could not fire, and the originals would be left unmanaged.
+  Before planning, the apply now reads the regions its existing state records
+  and fails with `opentofu_region_moved` when they differ from the pinned one,
+  naming both. Reproduced against an emulator with the previous release, then
+  refused by this one through the real apply path.
 
 ## [0.16.1] — 2026-09-23
 

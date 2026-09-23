@@ -116,3 +116,58 @@ def test_a_plugin_without_the_hook_is_unchanged():
     plugin = get_iac_plugin("gcp")
     assert not hasattr(plugin, "provider_block_for")
     assert provider_config(plugin, {"exposes": []}) == plugin.provider_block()
+
+
+@pytest.mark.parametrize("value", ["EU", "europe-west1", "{{ env.AWS_REGION }}", "eu west 1"])
+def test_a_value_that_is_not_a_region_code_is_not_pinned(value, monkeypatch):
+    """Shipped examples carry ``region: "{{ env.AWS_REGION }}"``, left literal
+    when the variable is unset; pinned, it failed ``tofu plan`` where the
+    environment's region used to apply."""
+    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
+    assert provider_config(get_iac_plugin("aws"), _contract(_expose(region=value))) == {}
+
+
+def test_recorded_regions_come_from_the_region_attribute_or_the_arn():
+    got = get_iac_plugin("aws").recorded_regions(
+        [
+            {"values": {"arn": "arn:aws:glue:us-east-1:123456789012:database/bronze"}},
+            {"values": {"region": "eu-west-1", "arn": "arn:aws:s3:::acme-lake"}},
+            {"values": {"arn": "arn:aws:s3:::no-region-in-a-bucket-arn"}},
+        ]
+    )
+    assert got == {"us-east-1", "eu-west-1"}
+
+
+class TestTheRegionMoveGuard:
+    """Moving existing resources to the pinned region would not plan a destroy:
+    the refresh drops them as drift and the plan creates them again, leaving
+    the originals unmanaged. Reproduced against an emulator; refused here."""
+
+    @staticmethod
+    def _guard(monkeypatch, state, contract):
+        from fluid_build.cli import _apply_opentofu_engine as engine
+
+        monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: state)
+        engine._guard_region_move(get_iac_plugin("aws"), contract, "/state/dir", {})
+
+    def test_state_in_another_region_is_refused(self, monkeypatch):
+        from fluid_build.cli._common import CLIError
+
+        state = [{"values": {"arn": "arn:aws:glue:us-east-1:123456789012:database/bronze"}}]
+        with pytest.raises(CLIError) as exc:
+            self._guard(monkeypatch, state, _contract(_expose(region="eu-west-1")))
+        assert exc.value.event == "opentofu_region_moved"
+        assert "us-east-1" in exc.value.context["error"]
+        assert "eu-west-1" in exc.value.context["error"]
+
+    def test_state_in_the_same_region_passes(self, monkeypatch):
+        state = [{"values": {"arn": "arn:aws:glue:eu-west-1:123456789012:database/bronze"}}]
+        self._guard(monkeypatch, state, _contract(_expose(region="eu-west-1")))
+
+    def test_no_state_passes(self, monkeypatch):
+        self._guard(monkeypatch, [], _contract(_expose(region="eu-west-1")))
+
+    def test_an_unpinned_contract_is_not_checked(self, monkeypatch):
+        """No region pinned means the environment decides, exactly as before."""
+        state = [{"values": {"arn": "arn:aws:glue:us-east-1:123456789012:database/bronze"}}]
+        self._guard(monkeypatch, state, _contract(_expose(region=None)))

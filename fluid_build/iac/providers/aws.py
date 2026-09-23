@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -59,6 +60,32 @@ from ..provider_match import is_cloud
 from ..versions import required_providers
 
 LOG = logging.getLogger(__name__)
+
+# An AWS region code: eu-west-1, us-gov-west-1, ap-southeast-2. Anything else a
+# binding carries (a jurisdiction such as "EU", a Google region, an unresolved
+# "{{ env.AWS_REGION }}") must not become the provider's region; it used to be
+# ignored, and still is.
+_AWS_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+$")
+
+
+def recorded_regions(resources: Iterable[Mapping[str, Any]]) -> set:
+    """The AWS regions existing state places its resources in.
+
+    From each resource's ``region`` attribute, else the region field of its
+    ARN (``arn:aws:glue:us-east-1:...``). S3 bucket ARNs carry no region, and
+    are skipped rather than guessed.
+    """
+    found = set()
+    for res in resources:
+        values = res.get("values") or {}
+        region = values.get("region")
+        if not region:
+            parts = str(values.get("arn") or "").split(":")
+            region = parts[3] if len(parts) > 3 else ""
+        if region and _AWS_REGION_RE.match(str(region)):
+            found.add(str(region))
+    return found
+
 
 # Apply-time AWS account placeholder for the credential-free warehouse fallback.
 # Resolves at ``tofu apply`` so ``main.tf.json`` stays account-agnostic while
@@ -538,6 +565,10 @@ class AwsIacPlugin:
             "skip_region_validation": True,
         }
 
+    def recorded_regions(self, resources: Iterable[Mapping[str, Any]]) -> set:
+        """The regions existing state places resources in; see :func:`recorded_regions`."""
+        return recorded_regions(resources)
+
     def provider_block_for(self, contract: Mapping[str, Any]) -> Dict[str, Any]:
         """``provider_block``, plus the region the contract's AWS bindings name.
 
@@ -552,14 +583,17 @@ class AwsIacPlugin:
         provider v6).
         """
         cfg = dict(self.provider_block())
-        regions = sorted(
-            {
-                str(((e.get("binding") or {}).get("location") or {}).get("region"))
-                for e in contract.get("exposes") or []
-                if is_cloud(e.get("binding") or {}, "aws")
-                and ((e.get("binding") or {}).get("location") or {}).get("region")
-            }
-        )
+        named = {
+            str(((e.get("binding") or {}).get("location") or {}).get("region"))
+            for e in contract.get("exposes") or []
+            if is_cloud(e.get("binding") or {}, "aws")
+            and ((e.get("binding") or {}).get("location") or {}).get("region")
+        }
+        regions = sorted(r for r in named if _AWS_REGION_RE.match(r))
+        if named - set(regions):
+            LOG.debug(
+                "aws_binding_region_not_a_region_code values=%s", sorted(named - set(regions))
+            )
         if len(regions) == 1:
             cfg["region"] = regions[0]
         elif len(regions) > 1:
