@@ -32,10 +32,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
-import duckdb
 import pytest
 
 from fluid_build.build_runners import _bigquery_load
+
+# The iac-tests job collects every file with no duckdb installed.
+duckdb = pytest.importorskip("duckdb")
 from fluid_build.build_runners.duckdb.runner import execute_duckdb_build
 
 
