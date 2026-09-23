@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2] — 2026-09-23
+
+Applying one contract to AWS and to Google Cloud now does what the contract
+says on both. How each part was checked: the Athena fix against a real AWS
+account; the region pin and the region-move guard against an emulator; the
+BigQuery load against a faked client, and not yet against real BigQuery.
+
 ### Fixed
 
 - **A BigQuery binding now lands its rows in the table, with no keys.** The
@@ -3437,7 +3444,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.2...HEAD
+[0.16.2]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.3...v0.16.0
 [0.15.3]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.2...v0.15.3
