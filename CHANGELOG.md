@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A BigQuery binding now lands its rows in the table, with no keys.** The
+  DuckDB build treated a `bigquery_table` binding's `location.path` as a file
+  destination and wrote Parquet to `gs://`, which DuckDB can only authenticate
+  to with HMAC keys, never Application Default Credentials; and even when that
+  write succeeded, nothing loaded the rows into the table `tofu apply` had just
+  created. The build now stages the file under `.fluid/staging/` (not `out/`,
+  which is the local target's output) and one `load_table_from_file` job moves
+  it into the declared table, passing the table's own schema and never creating
+  one. Authentication is the client's `google.auth.default()`, so gcloud ADC, a
+  VM's service account and Workload Identity Federation work with nothing to
+  configure. A load that fails, finds no table, or loads a different row count
+  from the file fails the build; so do the shapes this path cannot load (more
+  than one stream, a sink other than Parquet, a mode other than `full_refresh`
+  or `incremental_append`, a missing `gcp` extra), and they are refused before
+  any work runs. The pattern follows dlt's BigQuery destination.
+- **The BigQuery IaC emits types BigQuery accepts.** Any column type missing
+  from the map was upper-cased verbatim, so a contract read from Postgres
+  emitted `"type": "VARCHAR"`. A miss now resolves through the ODCS BigQuery
+  physical-type table (VARCHAR, CHAR and UUID to STRING, SMALLINT to INT64,
+  TIMESTAMPTZ to TIMESTAMP, BLOB to BYTES), which agrees with every existing
+  entry, so no emit that was valid changes.
+- **`binding.location.project` is honoured.** It was ignored, so the dataset
+  and table went to whatever project the environment named. It now goes on
+  both resources, and brownfield import ids name the same project.
+- **`fluid verify` compares BigQuery types by what they are.** BigQuery answers
+  with legacy names (INTEGER, FLOAT, BOOLEAN) for what was created as INT64,
+  FLOAT64 or BOOL, so a correct BOOL column was reported as drift, and verify's
+  own map had no `varchar`. Both sides now go through the IaC's type map and
+  one normalisation.
+
 ## [0.16.1] — 2026-09-23
 
 ### Security

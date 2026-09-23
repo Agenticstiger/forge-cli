@@ -125,8 +125,21 @@ _BQ_TABLE_IAM_ROLES = {
 
 
 def _bq_type(raw: Any) -> str:
-    base = str(raw or "STRING").strip().lower().split("(", 1)[0]
-    return _BQ_TYPES.get(base, str(raw).upper() if raw else "STRING")
+    base = str(raw or "STRING").strip().lower().split("(", 1)[0].strip()
+    hit = _BQ_TYPES.get(base)
+    if hit is not None:
+        return hit
+    # A source-native spelling (VARCHAR, SMALLINT, UUID, TIMESTAMPTZ ...) used to
+    # be upper-cased verbatim, which BigQuery rejects: a contract read from
+    # Postgres emitted ``"type": "VARCHAR"``. The ODCS physical-type table covers
+    # the FLUID column-type enum and agrees with every entry above, so this only
+    # changes the types that were invalid before.
+    from ...providers.odcs.mappers.types import fluid_to_physical
+
+    physical = fluid_to_physical(base, "gcp")
+    if physical:
+        return physical
+    return str(raw).upper() if raw else "STRING"
 
 
 def _bq_schema(schema: List[Mapping[str, Any]]) -> str:
@@ -507,15 +520,18 @@ class GcpIacPlugin:
             topic = loc.get("topic") if target is PUBSUB_TOPIC else None
 
             if dataset:
+                # ``_emit_bigquery`` puts the binding's project on the dataset
+                # and table, so the import id must name the same project.
+                bq_project = loc.get("project") or project
                 ds_key = safe_ident(f"{cid}_{dataset}")
-                ds_id = f"projects/{project}/datasets/{dataset}" if project else dataset
+                ds_id = f"projects/{bq_project}/datasets/{dataset}" if bq_project else dataset
                 if not placement.dataset_referenced:
                     _add(f"google_bigquery_dataset.{ds_key}", ds_id)
                 if table:
                     tbl_key = safe_ident(f"{cid}_{table}")
                     tbl_id = (
-                        f"projects/{project}/datasets/{dataset}/tables/{table}"
-                        if project
+                        f"projects/{bq_project}/datasets/{dataset}/tables/{table}"
+                        if bq_project
                         else f"{dataset}/{table}"
                     )
                     _add(f"google_bigquery_table.{tbl_key}", tbl_id)
@@ -567,6 +583,11 @@ def _emit_bigquery(
             "location": loc.get("region") or loc.get("location") or "US",
             "labels": labels,
         }
+        # The binding's project, when it names one, goes on the resource. It was
+        # ignored, so the project came only from the ambient environment and a
+        # binding for one project could provision into another.
+        if loc.get("project"):
+            dataset_body["project"] = loc["project"]
         # Access grants → the dataset ACL (mirrors the retired native
         # `iam.bind_bq_dataset`, which appended BigQuery access entries).
         access = _bq_access_entries(grants)
@@ -582,6 +603,8 @@ def _emit_bigquery(
         # Let `tofu destroy` clean the table — the spike applies and destroys.
         "deletion_protection": False,
     }
+    if loc.get("project"):
+        body["project"] = loc["project"]
     if is_view:
         body["view"] = {"query": loc.get("query", ""), "use_legacy_sql": False}
     elif schema:

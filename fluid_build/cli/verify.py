@@ -304,6 +304,18 @@ def assess_drift_severity(
     }
 
 
+# BigQuery answers ``get_table`` with legacy names (INTEGER, FLOAT, BOOLEAN,
+# RECORD) and accepts the standard ones (INT64, FLOAT64, BOOL, STRUCT) on
+# create, so one column has two spellings. Compare on one of them: a BOOL the
+# IaC declared came back BOOLEAN and was reported as drift.
+_BQ_TYPE_SYNONYMS = {"int64": "integer", "float64": "float", "bool": "boolean", "struct": "record"}
+
+
+def _bq_canonical_type(bq_type: Any) -> str:
+    name = str(bq_type or "").strip().lower()
+    return _BQ_TYPE_SYNONYMS.get(name, name)
+
+
 def verify_bigquery_table(
     project: str,
     dataset: str,
@@ -346,7 +358,7 @@ def verify_bigquery_table(
         actual_fields = {}
         for field in bq_table.schema:
             actual_fields[field.name] = {
-                "type": field.field_type.lower(),
+                "type": _bq_canonical_type(field.field_type),
                 "mode": field.mode.lower() if field.mode else "nullable",
             }
 
@@ -356,22 +368,12 @@ def verify_bigquery_table(
             field_name = field.get("name")
             field_type = field.get("type", "string").lower()
 
-            # Map FLUID types to BigQuery types
-            type_mapping = {
-                "string": "string",
-                "integer": "integer",
-                "int": "integer",
-                "float": "float",
-                "numeric": "numeric",
-                "boolean": "bool",
-                "bool": "bool",
-                "timestamp": "timestamp",
-                "date": "date",
-                "time": "time",
-                "datetime": "datetime",
-            }
+            # The type the IaC emitted for this column, so verify checks the
+            # table against what apply created. The old local table had no
+            # varchar, so a Postgres-sourced contract always "mismatched".
+            from fluid_build.iac.providers.gcp import _bq_type
 
-            bq_type = type_mapping.get(field_type, field_type)
+            bq_type = _bq_canonical_type(_bq_type(field_type))
             required = field.get("required", False)
 
             expected_fields[field_name] = {
