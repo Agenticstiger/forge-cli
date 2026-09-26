@@ -20,7 +20,8 @@ every run and the gate was always downgraded to a warning, so it could never
 fire. These tests pin the live comparison that replaced it:
 
 * local parquet read through DuckDB, a real file on disk;
-* a Glue table read through a real boto3 client under ``botocore`` 's Stubber;
+* a Glue table read through a real boto3 client under ``botocore`` 's Stubber
+  (skipped without boto3);
 * a BigQuery table read through a stubbed ``bigquery.Client``, with the real
   ``google-cloud-bigquery`` types when the ``gcp`` extra is installed and a
   stand-in for them when it is not (CI's test jobs install ``.[dev,local]``).
@@ -232,9 +233,14 @@ def built_providers(monkeypatch):
 
 @pytest.fixture
 def glue(monkeypatch):
-    """A real boto3 Glue client under Stubber, handed to the Glue inspector."""
-    import boto3
-    from botocore.stub import Stubber
+    """A real boto3 Glue client under Stubber, handed to the Glue inspector.
+
+    Skips without boto3, as the Athena verify tests do: botocore's Stubber is
+    the point, and CI's Python 3.10 leg has no boto3 (it arrives there only
+    through another package's dependencies).
+    """
+    boto3 = pytest.importorskip("boto3", reason="botocore's Stubber comes with the aws extra")
+    Stubber = pytest.importorskip("botocore.stub").Stubber
 
     from fluid_build.providers import aws_validation
 
@@ -601,6 +607,25 @@ def test_glue_table_matching_the_contract_is_no_drift(workspace, built_providers
     # Read where apply created it: the binding's region, not the global default.
     assert glue.sessions == [{"region_name": "eu-north-1"}]
     glue.stubber.assert_no_pending_responses()
+
+
+def test_glue_without_boto3_fails_the_gate_and_names_the_extra(
+    workspace, built_providers, monkeypatch
+):
+    """Runs everywhere: a Glue table that cannot be read is not one to create."""
+    from fluid_build.providers import aws_validation
+
+    # What the module sets when ``import boto3`` fails, so nothing can reach AWS.
+    monkeypatch.setattr(aws_validation, "BOTO3_AVAILABLE", False)
+    monkeypatch.setattr(aws_validation, "boto3", None)
+    contract = _write_contract(workspace, _contract(AWS_BINDING))
+
+    rc, event = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    expose = _report(workspace / "diff.json")["live"]["exposes"][0]
+    assert (rc, event) == (2, "diff_live_inspection_failed")
+    assert expose["status"] == "error"
+    assert "install the 'aws' extra" in expose["detail"]
 
 
 def test_glue_column_added_outside_the_contract_fails_the_gate(workspace, built_providers, glue):
