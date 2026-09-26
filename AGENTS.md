@@ -63,9 +63,11 @@ Stage 7 `fluid apply` re-verifies both before any DDL **or build**, on both engi
 - `apply_plan_mode_mismatch` — plan generated for a different mode
 - `apply_build_id_requires_build_mode` — `--build-id` with a mode that runs no build
 
+Generated pipelines therefore compute ONE effective mode for stages 6 and 7: `APPLY_MODE` (default `amend`), or `amend-and-build` when `APPLY_BUILD_ID` is set, passed as `fluid plan --mode` and `fluid apply --mode` alike (`_APPLY_EFFECTIVE_MODE_SH` in `pipeline_systems/_base.py`; the Jenkins template mirrors it).
+
 ### Environment and anchoring across stages
 
-- `fluid bundle --env <env>` freezes the overlay-applied contract and records `source: {contract, env, overlay}` in `MANIFEST.json` (outside the merkle root; `contract` is relative to the bundle's directory and is only trusted when it declares the bundled contract's `id`). Every later stage given `--env` on a bundle refuses a different env with `bundle_env_mismatch` (a bundle built without `--env` is accepted for `--env dev` when no dev overlay exists). `fluid generate artifacts` takes `--env` too.
+- `fluid bundle --env <env>` freezes the overlay-applied contract and records `source: {contract, env, overlay}` in `MANIFEST.json` (outside the merkle root; `contract` is relative to the bundle's directory and is only trusted when, with the recorded env's overlay applied, it declares the bundled contract's `id`, so an overlay may rename the product). Every later stage given `--env` on a bundle refuses a different env with `bundle_env_mismatch` (a bundle built without `--env` is accepted for `--env dev` when no dev overlay exists); `fluid validate` reports it as a `BUNDLE-ENV-MISMATCH` finding. `fluid generate artifacts` takes `--env` too, and on a raw contract materialises it with the same code as `fluid bundle --env`.
 - A relative `exposes[].binding.location.path` resolves against the SOURCE contract's directory in every writer and reader (build runners, the local provider, `fluid verify`), whatever directory the command runs from. For a bundle or a bundle-made plan that is the contract the MANIFEST records (`plan.json` carries it as `contract_metadata.source_contract`).
 - `--env` naming no overlay logs a WARNING (`overlay_not_found`, listing the overlays that exist); `dev` with none is the base contract (INFO).
 - `fluid apply --state-backend` defaults from `FLUID_STATE_BACKEND`; an explicit empty `--state-backend ""` forces local state.

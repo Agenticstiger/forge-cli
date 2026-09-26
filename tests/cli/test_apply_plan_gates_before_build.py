@@ -178,6 +178,31 @@ class TestPlanGatesRunBeforeBuilds:
         assert rb.call_args.kwargs.get("plan_data") == attested
 
 
+class TestUnreadablePlan:
+    """A plan.json that is not JSON is a typed exit 1, on every mode.
+
+    Loading the plan moved ahead of the build return, outside any handler,
+    so a truncated or non-UTF-8 file became "CLI unhandled exception" (exit
+    2) instead of the typed error both paths used to give.
+    """
+
+    @pytest.mark.parametrize("content", [b"{not json", b"\xff\xfe{}"], ids=["not-json", "not-utf8"])
+    @pytest.mark.parametrize("mode", ["amend", "amend-and-build"])
+    def test_malformed_plan_is_a_typed_error(
+        self, workspace: Path, content: bytes, mode: str
+    ) -> None:
+        plan = workspace / "runtime" / "broken.json"
+        plan.write_bytes(content)
+        args = _parse(["apply", "runtime/broken.json", "--mode", mode, "--yes"])
+        with mock.patch("fluid_build.build_runners.run_builds_from_args", return_value=0) as rb:
+            with pytest.raises(CLIError) as exc:
+                apply_run(args, LOG)
+        assert exc.value.event == "apply_plan_unreadable"
+        assert exc.value.exit_code == 1
+        assert Path(exc.value.context["path"]).name == "broken.json"
+        rb.assert_not_called()
+
+
 class TestBuildIdNeedsABuildMode:
     @pytest.mark.parametrize(
         "mode,extra",

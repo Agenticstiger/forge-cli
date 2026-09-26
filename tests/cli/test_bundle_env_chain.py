@@ -227,6 +227,18 @@ class TestValidateABundle:
         )
         assert rc == 0
 
+    def test_env_mismatch_is_a_finding_and_the_report_is_written(self, ws: Path) -> None:
+        # ``--report`` promises a JSON report whatever the status; the env
+        # check used to raise before the report existed, leaving CI none.
+        _bundle("runtime/bundle.tgz", env="aws")
+        argv = ["validate", "runtime/bundle.tgz", "--env", "useast", "--report", "runtime/r.json"]
+        assert validate_cmd.run(_parse(validate_cmd.register, argv), LOG) == 1
+        report = json.loads((ws / "runtime" / "r.json").read_text(encoding="utf-8"))
+        assert report["status"] == "fail"
+        errors = [i for i in report["issues"] if i["severity"] == "error"]
+        assert [i.get("code") for i in errors] == ["BUNDLE-ENV-MISMATCH"]
+        assert "'aws'" in errors[0]["message"] and "'useast'" in errors[0]["message"]
+
 
 class TestGenerateArtifactsEnv:
     @staticmethod
@@ -255,3 +267,37 @@ class TestGenerateArtifactsEnv:
         _bundle("runtime/bundle.tgz", env="aws")
         assert artifacts_cmd.run(self._args("runtime/bundle.tgz", "dist/b", "aws"), LOG) == 0
         assert _bindings("dist/b") == 4
+
+    def test_raw_contract_gives_the_bundles_artifacts_file_for_file(self, ws: Path) -> None:
+        # Singular ``build:`` is valid and ``fluid bundle`` freezes it as
+        # written; the normal loader rewrites it to ``builds:``. Stage 3 on
+        # the contract must emit what stage 3 on its bundle emits.
+        contract = ws / _C
+        contract.write_text(
+            contract.read_text(encoding="utf-8").replace(
+                "exposes:\n",
+                "build:\n"
+                "  id: make_rows\n"
+                "  description: Inline rows.\n"
+                "  pattern: embedded-logic\n"
+                "  engine: sql\n"
+                "  properties: {sql: \"SELECT 'a' AS subscription_id, 'x' AS status\"}\n"
+                "  outputs: [subscriptions]\n"
+                "exposes:\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        _bundle("runtime/bundle.tgz", env="aws")
+        assert artifacts_cmd.run(self._args("runtime/bundle.tgz", "dist/b", "aws"), LOG) == 0
+        assert artifacts_cmd.run(self._args(_C, "dist/c", "aws"), LOG) == 0
+
+        def tree(root: str) -> Dict[str, bytes]:
+            base = ws / root
+            return {
+                str(p.relative_to(base)): p.read_bytes() for p in base.rglob("*") if p.is_file()
+            }
+
+        from_bundle, from_contract = tree("dist/b"), tree("dist/c")
+        assert sorted(from_contract) == sorted(from_bundle)
+        assert [k for k in from_bundle if from_bundle[k] != from_contract[k]] == []

@@ -647,10 +647,10 @@ def register(subparsers: argparse._SubParsersAction):
     advanced_group.add_argument(
         "--state-backend",
         default=None,
-        help="OpenTofu remote state backend for cloud apply "
-        "(s3://bucket/key or gcs://bucket/prefix). Defaults to the "
-        "FLUID_STATE_BACKEND environment variable; with neither, state is "
-        "local under .fluid/iac/. An empty value forces local state.",
+        # Two lines at the help style's width, as before the env default:
+        # ``fluid apply --help`` sits at its line cap.
+        help="OpenTofu remote state (s3://bucket/key or gcs://bucket/prefix). "
+        'Default $FLUID_STATE_BACKEND, else local; "" forces local.',
     )
 
     p.set_defaults(cmd=COMMAND, func=run)
@@ -901,7 +901,14 @@ def _load_verified_plan(args, resolved_mode, logger: logging.Logger) -> Dict[str
     import copy as _copy
 
     logger.info("Loading pre-generated execution plan")
-    plan_data = read_json(args.contract)
+    try:
+        plan_data = read_json(args.contract)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # A typed exit 1, as before these gates moved here; letting it escape
+        # made a truncated or non-UTF-8 plan.json an "unhandled exception".
+        raise CLIError(
+            1, "apply_plan_unreadable", {"path": str(args.contract), "error": str(exc)}
+        ) from exc
     if not isinstance(plan_data, dict):
         raise CLIError(
             1,

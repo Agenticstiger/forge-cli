@@ -476,7 +476,11 @@ class TestJenkinsTemplateHardening:
         # outer string).
         assert 'cd "examples/demo" && fluid' in content
         assert 'cd "examples/demo" && fluid validate' in content
-        assert 'cd "examples/demo" && fluid plan' in content
+        # Stage 6 (plan) computes the same effective mode as stage 7 before
+        # calling ``fluid plan``, so its body starts with ``set -eu`` too.
+        plan_stage = content[content.index("stage('6 - plan')") :]
+        plan_sh = plan_stage[plan_stage.index("sh '''") : plan_stage.index("fluid plan")]
+        assert 'cd "examples/demo" && set -eu' in plan_sh
         # Stage 7 (apply) uses POSIX ``set --`` composition since the
         # security-hardening commit (auth-gate bypass via unquoted
         # ${APPLY_BUILD_FLAG} was closed by refactoring to if/then/fi).

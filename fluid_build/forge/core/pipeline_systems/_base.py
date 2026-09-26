@@ -64,6 +64,20 @@ def _pin_action(action_ref: str) -> str:
     return PINNED_ACTIONS.get(action_ref, action_ref)
 
 
+#: POSIX sh fragment that sets ``EFFECTIVE_MODE``: the one apply mode both
+#: stage 6 (``fluid plan --mode``) and stage 7 (``fluid apply --mode``) use.
+#: ``APPLY_MODE`` (default ``amend``), switched to ``amend-and-build`` when
+#: ``APPLY_BUILD_ID`` is set, because a build id only filters builds and
+#: needs a build mode to run one. ``fluid plan`` stamps the mode into
+#: plan.json and ``fluid apply`` refuses a plan made for another mode
+#: (``apply_plan_mode_mismatch``), so the two stages must compute it the
+#: same way. Every expansion is quoted: a parameter value stays one token.
+_APPLY_EFFECTIVE_MODE_SH = (
+    'EFFECTIVE_MODE="${APPLY_MODE:-amend}"; '
+    'if [ -n "${APPLY_BUILD_ID:-}" ]; then EFFECTIVE_MODE=amend-and-build; fi; '
+)
+
+
 try:
     import yaml
 except ImportError:
@@ -804,9 +818,17 @@ class BasePipelineTemplate:
                 display="plan",
                 toggle_param="RUN_STAGE_6_PLAN",
                 default_run=True,
+                # The plan records the mode it was made for, and stage 7's
+                # ``apply_plan_mode_mismatch`` gate refuses any other. So
+                # stage 6 computes the SAME effective mode as stage 7
+                # (``_APPLY_EFFECTIVE_MODE_SH``): a plan made without
+                # ``--mode`` could only ever be applied with ``amend``.
                 command=(
+                    "set -eu; "
+                    f"{_APPLY_EFFECTIVE_MODE_SH}"
                     'fluid plan "${CONTRACT:-contract.fluid.yaml}" '
-                    '--out runtime/plan.json --env "${FLUID_ENV:-dev}"'
+                    '--out runtime/plan.json --mode "$EFFECTIVE_MODE" '
+                    '--env "${FLUID_ENV:-dev}"'
                 ),
             ),
             StageSpec(
@@ -831,16 +853,20 @@ class BasePipelineTemplate:
                 # narrowly-scoped flags at the CLI).
                 command=(
                     "set -eu; "
+                    # One mode for the whole apply, the one stage 6 planned
+                    # for. Appending a second ``--mode amend-and-build`` when
+                    # APPLY_BUILD_ID is set used to override the first and
+                    # leave stage 6's plan made for a different mode.
+                    f"{_APPLY_EFFECTIVE_MODE_SH}"
                     # --ensure-opentofu provisions a pinned, SHA-256-verified
                     # `tofu` (no root/gpg) when a cloud apply needs it; it is
                     # idempotent (skips when tofu is present) and a no-op for
                     # native/local applies that never touch the OpenTofu engine.
-                    'set -- runtime/plan.json --mode "${APPLY_MODE:-amend}" '
+                    'set -- runtime/plan.json --mode "$EFFECTIVE_MODE" '
                     '--env "${FLUID_ENV:-dev}" --yes --ensure-opentofu '
                     "--report runtime/apply-report.html; "
                     'if [ -n "${APPLY_BUILD_ID:-}" ]; then '
-                    'set -- "$@" --mode amend-and-build '
-                    '--build-id "$APPLY_BUILD_ID"; fi; '
+                    'set -- "$@" --build-id "$APPLY_BUILD_ID"; fi; '
                     'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]; then '
                     'set -- "$@" --allow-data-loss; fi; '
                     'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]; then '

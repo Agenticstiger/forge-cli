@@ -30,7 +30,7 @@ from typing import Any, Dict
 
 import pytest
 
-from fluid_build._contract_loader import load_contract_with_overlay
+from fluid_build._contract_loader import load_contract_with_overlay, source_contract_dir
 from fluid_build.forge.core.bundle import (
     build_bundle_tgz,
     bundle_source_contract,
@@ -137,6 +137,86 @@ class TestSourceBlock:
         assert contract["id"] == "demo.src"
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any("does not record the environment" in r.getMessage() for r in warnings)
+
+
+class TestOverlayThatSetsTheId:
+    """An overlay may give a product an env-specific id.
+
+    The bundled contract then carries the OVERLAY's id, and the recorded
+    source file declares the base one. Comparing those two refused the one
+    contract the bundle was built from, so every stage anchored at the
+    bundle's directory instead (data landed under ``runtime/``).
+    """
+
+    def _staging_bundle(self, layout: Path) -> Path:
+        overlays = layout / "contracts" / "p" / "overlays"
+        overlays.mkdir()
+        (overlays / "staging.yaml").write_text("id: demo.src_staging\n", encoding="utf-8")
+        tgz = layout / "runtime" / "staging.tgz"
+        source = make_bundle_source(
+            layout / "contracts" / "p" / "contract.fluid.yaml",
+            tgz,
+            env="staging",
+            overlay_path=overlays / "staging.yaml",
+        )
+        staged = dict(_CONTRACT, id="demo.src_staging")
+        build_bundle_tgz(staged, tgz, contract_id="demo.src_staging", source=source)
+        return tgz
+
+    def test_the_recorded_contract_resolves_with_its_overlay_applied(self, layout: Path) -> None:
+        tgz = self._staging_bundle(layout)
+        assert (
+            bundle_source_contract(tgz)
+            == (layout / "contracts" / "p" / "contract.fluid.yaml").resolve()
+        )
+
+    def test_another_env_cannot_borrow_the_overlays_id(self, layout: Path) -> None:
+        # The staging overlay is what makes the ids agree: recorded as a
+        # different env, the same file is not the bundle's source.
+        tgz = self._staging_bundle(layout)
+        _rewrite_source(
+            tgz,
+            {"contract": "../contracts/p/contract.fluid.yaml", "env": "prod", "overlay": None},
+        )
+        assert bundle_source_contract(tgz) is None
+
+    @pytest.mark.parametrize("env", ["../p/overlays/staging", "overlays/../staging", 7])
+    def test_an_env_that_is_not_a_name_is_refused(self, layout: Path, env: Any) -> None:
+        tgz = self._staging_bundle(layout)
+        _rewrite_source(
+            tgz, {"contract": "../contracts/p/contract.fluid.yaml", "env": env, "overlay": None}
+        )
+        assert bundle_source_contract(tgz) is None
+
+
+class TestFallbackSaysWhichCheckFailed:
+    def test_an_id_mismatch_is_not_reported_as_unrecorded(
+        self, layout: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tgz = layout / "runtime" / "b.tgz"
+        build_bundle_tgz(_CONTRACT, tgz, contract_id="demo.src")
+        _rewrite_source(
+            tgz,
+            {"contract": "../contracts/other/contract.fluid.yaml", "env": None, "overlay": None},
+        )
+        caplog.set_level(logging.WARNING)
+        assert source_contract_dir(tgz, logging.getLogger("t")) == (layout / "runtime").resolve()
+        message = " ".join(r.getMessage() for r in caplog.records)
+        assert "declares id 'someone.else'" in message
+        assert "'demo.src'" in message
+        assert "does not record" not in message
+
+    def test_a_missing_contract_says_so(
+        self, layout: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tgz = layout / "runtime" / "b.tgz"
+        build_bundle_tgz(_CONTRACT, tgz, contract_id="demo.src")
+        _rewrite_source(
+            tgz, {"contract": "../contracts/gone/contract.fluid.yaml", "env": None, "overlay": None}
+        )
+        caplog.set_level(logging.WARNING)
+        source_contract_dir(tgz, logging.getLogger("t"))
+        assert "which no longer exists" in " ".join(r.getMessage() for r in caplog.records)
 
 
 class TestBindingPaths:

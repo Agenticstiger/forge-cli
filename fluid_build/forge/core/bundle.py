@@ -52,6 +52,7 @@ import os
 import re
 import tarfile
 import unicodedata
+from importlib import import_module
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -456,42 +457,81 @@ def read_bundle_source(tgz_path: Path) -> Optional[Dict[str, Any]]:
     return dict(source) if isinstance(source, dict) else None
 
 
+#: An environment name as a MANIFEST may record it: a plain name, never a
+#: path. It selects the overlay file whose ``id`` the recorded source
+#: contract is checked with, so a value like ``../../x`` must not be able to
+#: pick an arbitrary file for that check.
+_ENV_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
 def bundle_source_contract(
     tgz_path: Path, source: Optional[Mapping[str, Any]] = None
 ) -> Optional[Path]:
     """Resolve the source contract a bundle was built from, when it still exists.
 
+    The path half of :func:`resolve_bundle_source_contract`: ``None`` when the
+    recorded source cannot be used, for any of the reasons listed there.
+    """
+    return resolve_bundle_source_contract(tgz_path, source)[0]
+
+
+def resolve_bundle_source_contract(
+    tgz_path: Path, source: Optional[Mapping[str, Any]] = None
+) -> Tuple[Optional[Path], str]:
+    """Resolve the source contract a bundle was built from: ``(path, "")`` or ``(None, why)``.
+
     ``source`` defaults to :func:`read_bundle_source`. The ``source`` block is
     outside the merkle root, so it is a hint, checked here rather than
-    trusted. Returns ``None`` (the caller falls back, and says so) when:
+    trusted. The path is ``None`` (the caller falls back, and says why, using
+    the returned reason) when:
 
-    * the bundle records no source;
+    * the bundle records no source contract;
     * the recorded value is not a relative path to a ``.yaml`` / ``.yml`` /
-      ``.json`` file;
+      ``.json`` file, or the recorded env is not a plain environment name;
     * that file is no longer on disk (e.g. the bundle was copied out of its
       workspace);
-    * that file does not declare the same ``id`` as the contract INSIDE the
-      bundle (``contract.resolved.json``, which the merkle root covers). An
-      edited block therefore cannot point the anchor at an unrelated file's
-      directory, only at the contract the bundle was actually built from.
+    * that file, with the overlay ``fluid bundle --env`` applied for the
+      recorded env, does not declare the same ``id`` as the contract INSIDE
+      the bundle (``contract.resolved.json``, which the merkle root covers).
+      The overlay counts because an overlay may set an env-specific product
+      id. An edited block therefore cannot point the anchor at an unrelated
+      file's directory, only at the contract the bundle was built from.
     """
     tgz_path = Path(tgz_path)
     if source is None:
         source = read_bundle_source(tgz_path)
     rel = source.get("contract") if source else None
-    if not isinstance(rel, str) or not rel or "\x00" in rel:
-        return None
-    if PurePosixPath(rel).is_absolute() or PureWindowsPath(rel).is_absolute():
-        return None
-    if not rel.lower().endswith(_SOURCE_CONTRACT_SUFFIXES):
-        return None
+    if rel is None or rel == "":
+        return None, "does not record a source contract"
+    if (
+        not isinstance(rel, str)
+        or "\x00" in rel
+        or PurePosixPath(rel).is_absolute()
+        or PureWindowsPath(rel).is_absolute()
+        or not rel.lower().endswith(_SOURCE_CONTRACT_SUFFIXES)
+    ):
+        return None, (
+            f"records a source contract {rel!r} that is not a relative path to a "
+            ".yaml/.yml/.json file"
+        )
+    env = source.get("env") if source else None
+    if env is not None and not (isinstance(env, str) and _ENV_NAME_RE.match(env)):
+        return None, f"records an env {env!r} that is not an environment name"
     candidate = (tgz_path.resolve().parent / Path(*PurePosixPath(rel).parts)).resolve()
     if not candidate.is_file():
-        return None
+        return None, f"records source contract {candidate}, which no longer exists"
     bundled_id = _bundled_contract_id(tgz_path)
-    if bundled_id is None or _declared_contract_id(candidate) != bundled_id:
-        return None
-    return candidate
+    if bundled_id is None:
+        return None, "holds no contract id to check its recorded source contract against"
+    declared_id = _effective_contract_id(candidate, env)
+    if declared_id != bundled_id:
+        with_overlay = f" with its {env!r} overlay applied" if env else ""
+        return None, (
+            f"records source contract {candidate}, but that file declares id "
+            f"{declared_id!r}{with_overlay} while the bundled contract's id is "
+            f"{bundled_id!r}"
+        )
+    return candidate, ""
 
 
 def _bundled_contract_id(tgz_path: Path) -> Optional[str]:
@@ -518,6 +558,33 @@ def _declared_contract_id(path: Path) -> Optional[str]:
         return None
     ident = doc.get("id") if isinstance(doc, dict) else None
     return ident if isinstance(ident, str) and ident else None
+
+
+def _effective_contract_id(path: Path, env: Optional[str]) -> Optional[str]:
+    """The ``id`` ``fluid bundle <path> --env <env>`` bundles.
+
+    The file's own ``id``, unless the overlay for ``env`` (found by the same
+    search ``fluid bundle`` uses, :func:`fluid_build.loader.load_overlay_document`)
+    sets one: the overlay deep-merges over the base, so its scalar ``id``
+    wins. ``None`` when either file cannot be read.
+    """
+    ident = _declared_contract_id(path)
+    if not env:
+        return ident
+    # Resolved by name, never a literal import: ``fluid_build.loader`` reaches
+    # ``cli`` lazily, and ``_contract_loader`` (a leaf ``build_runners``
+    # imports) imports this module, so a static edge would land
+    # ``build_runners -> ... -> cli`` in the import-linter graph.
+    load_overlay_document = import_module("fluid_build.loader").load_overlay_document
+    try:
+        found = load_overlay_document(path, env)
+    except (OSError, UnicodeDecodeError, ValueError, RuntimeError, yaml.YAMLError):
+        return None
+    if found is not None:
+        overlay_id = found[1].get("id")
+        if isinstance(overlay_id, str) and overlay_id:
+            return overlay_id
+    return ident
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +676,7 @@ __all__ = [
     "extract_fragments",
     "make_bundle_source",
     "read_bundle_source",
+    "resolve_bundle_source_contract",
     "validate_manifest",
     "write_tgz",
 ]

@@ -51,7 +51,7 @@ import os
 import re
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class CLIError(Exception):
@@ -360,42 +360,67 @@ def source_contract_path(
 
     * a contract file: itself, resolved;
     * a bundle (``.tgz``): the source contract recorded in its MANIFEST, when
-      that file still exists;
+      that file still exists and declares the bundled contract's id;
     * a plan (``plan_data`` given): ``contract_metadata.source_contract`` when
       ``fluid plan`` recorded one (plans made from a bundle), else
       ``contract_metadata.source_path``, itself followed through the bundle
       when the plan was made from one.
 
-    Returns ``None`` when a bundle or plan records no source contract that
-    still exists; the caller picks its fallback (and says so).
+    Returns ``None`` when a bundle or plan records no usable source contract;
+    the caller picks its fallback and says why, with
+    :func:`resolve_source_contract`'s reason.
+    """
+    return resolve_source_contract(path, plan_data=plan_data)[0]
+
+
+def resolve_source_contract(
+    path: str | Path,
+    *,
+    plan_data: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Path], str]:
+    """:func:`source_contract_path`, plus why it is ``None``: ``(path, "")`` or ``(None, why)``.
+
+    ``why`` completes a sentence whose subject is ``path`` (e.g. "records
+    source contract X, which no longer exists"), so a fallback warning can
+    say which check failed instead of claiming nothing was recorded.
     """
     p = Path(path)
     if plan_data is not None:
-        meta = plan_data.get("contract_metadata") if isinstance(plan_data, dict) else None
-        if not isinstance(meta, dict):
-            return None
-        for key in ("source_contract", "source_path"):
-            recorded = meta.get(key)
-            if not isinstance(recorded, str) or not recorded:
-                continue
-            if _is_bundle_path(recorded):
-                resolved = source_contract_path(recorded) if Path(recorded).is_file() else None
-            else:
-                candidate = Path(recorded)
-                resolved = candidate.resolve() if candidate.is_file() else None
-            if resolved is not None:
-                return resolved
-        return None
+        return _resolve_plan_source_contract(plan_data)
     if _is_bundle_path(str(p)):
         import tarfile
 
-        from fluid_build.forge.core.bundle import bundle_source_contract
+        from fluid_build.forge.core.bundle import resolve_bundle_source_contract
 
         try:
-            return bundle_source_contract(p)
-        except (tarfile.TarError, OSError, ValueError):
-            return None
-    return p.resolve()
+            return resolve_bundle_source_contract(p)
+        except (tarfile.TarError, OSError, ValueError) as exc:
+            return None, f"could not be read ({exc})"
+    return p.resolve(), ""
+
+
+def _resolve_plan_source_contract(plan_data: Dict[str, Any]) -> Tuple[Optional[Path], str]:
+    """:func:`resolve_source_contract` for a plan: ``contract_metadata.source_contract``
+    (recorded for plans made from a bundle), else ``source_path``, followed
+    through the bundle when it names one."""
+    meta = plan_data.get("contract_metadata") if isinstance(plan_data, dict) else None
+    if not isinstance(meta, dict):
+        return None, "records no contract_metadata"
+    reasons: List[str] = []
+    for key in ("source_contract", "source_path"):
+        recorded = meta.get(key)
+        if not isinstance(recorded, str) or not recorded:
+            continue
+        if not Path(recorded).is_file():
+            reasons.append(f"records {key} {recorded}, which no longer exists")
+            continue
+        if not _is_bundle_path(recorded):
+            return Path(recorded).resolve(), ""
+        resolved, why = resolve_source_contract(recorded)
+        if resolved is not None:
+            return resolved, ""
+        reasons.append(f"records {key} {recorded}, a bundle that {why}")
+    return None, "; ".join(reasons) or "does not record a source contract"
 
 
 def source_contract_dir(
@@ -407,19 +432,20 @@ def source_contract_dir(
     """Directory relative ``binding.location.path`` values in ``path`` resolve against.
 
     :func:`source_contract_path`'s parent. When a bundle or plan records no
-    source contract that still exists, the input file's own directory, with
-    a WARNING, because a relative local path will then not land where the
-    contract's author meant.
+    usable source contract, the input file's own directory, with a WARNING
+    naming the check that failed, because a relative local path will then
+    not land where the contract's author meant.
     """
-    resolved = source_contract_path(path, plan_data=plan_data)
+    resolved, why = resolve_source_contract(path, plan_data=plan_data)
     if resolved is not None:
         return resolved.parent
     fallback = Path(path).resolve().parent
     (logger or logging.getLogger("fluid.loader")).warning(
-        "source_contract_unrecorded: %s does not record a source contract that still "
-        "exists; relative binding paths are anchored at %s instead. Re-create it with "
-        "the current `fluid bundle` / `fluid plan` from its workspace.",
+        "source_contract_unresolved: %s %s; relative binding paths are anchored at %s "
+        "instead. Re-create it with the current `fluid bundle` / `fluid plan` from its "
+        "workspace.",
         path,
+        why,
         fallback,
     )
     return fallback

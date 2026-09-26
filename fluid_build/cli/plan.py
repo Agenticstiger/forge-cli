@@ -373,12 +373,20 @@ def run(args, logger: logging.Logger) -> int:
             # belong. Record the source contract the bundle's MANIFEST names,
             # under planDigest, so apply anchors a bundle-planned build where
             # a contract-planned one lands (``source_contract_path``).
-            from fluid_build._contract_loader import source_contract_path
+            from fluid_build._contract_loader import resolve_source_contract
 
-            source_contract = source_contract_path(bundle_path)
+            source_contract, why = resolve_source_contract(bundle_path)
             meta = plan.get("contract_metadata")
             if source_contract is not None and isinstance(meta, dict):
                 meta["source_contract"] = str(source_contract)
+            elif source_contract is None:
+                logger.warning(
+                    "source_contract_unresolved: bundle %s %s; the plan records no "
+                    "source contract, so relative binding paths will be anchored at "
+                    "the bundle's directory when it is applied",
+                    bundle_path,
+                    why,
+                )
         try:
             plan = inject_digests(plan, bundle_path=bundle_path)
         except FileNotFoundError as exc:

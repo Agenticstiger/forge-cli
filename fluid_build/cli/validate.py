@@ -1359,17 +1359,13 @@ def _run_bundle_validation(
     writes a structured JSON report regardless of status (useful for CI
     artifact uploads even on pass).
     """
-    from fluid_build._contract_loader import check_bundle_env
     from fluid_build.forge.core.validators import validate_bundle
 
     strict = bool(getattr(args, "strict", False))
     fail_fast = bool(getattr(args, "fail_fast", False))
     report_path = getattr(args, "report", None)
 
-    # ``--env`` on a bundle must name the env the bundle was built for: the
-    # bundle is never re-overlaid, so a mismatch would validate a different
-    # contract than the operator asked about.
-    check_bundle_env(str(tgz_path), getattr(args, "env", None), logger)
+    env_issue = _bundle_env_issue(tgz_path, getattr(args, "env", None), logger)
 
     try:
         report = validate_bundle(
@@ -1380,6 +1376,9 @@ def _run_bundle_validation(
         )
     except Exception as exc:
         raise CLIError(2, "bundle_validation_failed", {"path": str(tgz_path), "error": str(exc)})
+    if env_issue is not None:
+        report.issues.insert(0, env_issue)
+        report.status = "fail"
 
     # Contract-level rules (sovereignty, agent policy, binding prerequisites,
     # packaging, semantics, composition, plugin validators) on the resolved
@@ -1437,6 +1436,33 @@ def _run_bundle_validation(
         cprint(f"   validation completed in {elapsed:.2f}s")
 
     return 0 if report.status == "pass" else 1
+
+
+def _bundle_env_issue(tgz_path: Path, env: Optional[str], logger: logging.Logger):
+    """``--env`` against the env the bundle was built for, as a report finding.
+
+    The bundle is never re-overlaid, so a mismatch would validate a different
+    contract than the operator asked about. It is a finding like any other
+    (``BUNDLE-ENV-MISMATCH``, error, exit 1), so ``--report`` still records it
+    and what else the bundle holds; raising used to leave CI with no report.
+    Returns ``None`` when the env matches (or none was asked for).
+    """
+    from fluid_build._contract_loader import check_bundle_env
+    from fluid_build.forge.core.validators import ValidationIssue
+
+    try:
+        check_bundle_env(str(tgz_path), env, logger)
+    except CLIError as exc:
+        if exc.event != "bundle_env_mismatch":
+            raise
+        return ValidationIssue(
+            file="MANIFEST.json",
+            validator="bundle-env",
+            severity="error",
+            message=str(exc.context.get("hint") or exc.event),
+            code="BUNDLE-ENV-MISMATCH",
+        )
+    return None
 
 
 def _bundle_contract_rule_issues(

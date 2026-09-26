@@ -128,6 +128,52 @@ class TestWritersAnchorAtTheContract:
         assert _landed(ws) == ["contracts/p/out/rows.parquet"]
 
 
+class TestAnEnvSpecificProductId:
+    """An overlay that sets ``id`` must not break anchoring.
+
+    ``fluid bundle --env staging`` with an overlay that renames the product
+    records the source contract, whose own file declares the base id. The
+    bundle-planned build used to anchor at ``runtime/`` and the contract's
+    verify then failed "Output file not found".
+    """
+
+    def test_bundle_plan_apply_verify_agree_on_the_path(self, ws: Path) -> None:
+        overlays = ws / "contracts" / "p" / "overlays"
+        overlays.mkdir()
+        (overlays / "staging.yaml").write_text("id: demo.gates_staging\n", encoding="utf-8")
+        bundle = ["bundle", _C, "--env", "staging", "--format", "tgz", "--out", "runtime/b.tgz"]
+        assert bundle_cmd.run(_parse(bundle_cmd.register, bundle), LOG) == 0
+        plan = [
+            "plan",
+            "runtime/b.tgz",
+            "--env",
+            "staging",
+            "--mode",
+            "amend-and-build",
+            "--out",
+            "runtime/plan.json",
+        ]
+        assert plan_cmd.run(_parse(plan_cmd.register, plan), LOG) == 0
+        planned = json.loads((ws / "runtime" / "plan.json").read_text(encoding="utf-8"))
+        assert planned["contract"]["id"] == "demo.gates_staging"
+        assert planned["contract_metadata"]["source_contract"] == str((ws / _C).resolve())
+        rc = _apply(
+            [
+                "runtime/plan.json",
+                "--bundle",
+                "runtime/b.tgz",
+                "--env",
+                "staging",
+                "--mode",
+                "amend-and-build",
+            ]
+        )
+        assert rc == 0
+        assert _landed(ws) == ["contracts/p/out/rows.parquet"]
+        verify = ["verify", _C, "--env", "staging", "--strict", "--out", "runtime/v.json"]
+        assert verify_cmd.run(_parse(verify_cmd.register, verify), LOG) == 0
+
+
 class TestVerifyReadsWhereTheWriterWrote:
     def _write_rows(self, ws: Path) -> None:
         out = ws / "contracts" / "p" / "out"

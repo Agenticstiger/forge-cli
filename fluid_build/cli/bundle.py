@@ -35,7 +35,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 try:
     import yaml  # type: ignore
@@ -197,6 +197,52 @@ def _has_refs(obj: Any) -> bool:
     return False
 
 
+def materialize_contract(
+    contract_path: str | Path,
+    env: Optional[str],
+    logger: logging.Logger,
+    *,
+    compile_logger: Optional[logging.Logger] = None,
+) -> Tuple[Dict[str, Any], Optional[Path]]:
+    """The document ``fluid bundle <contract> --env <env>`` freezes, and the overlay it merged.
+
+    ``$ref`` pointers resolved (:func:`compile_contract`), then the ``env``
+    overlay deep-merged on top, found by the same candidate search as every
+    other stage (``load_overlay_document``), with the same loud notice when
+    ``env`` names an overlay that does not exist. Nothing else: no alias or
+    ``build:`` -> ``builds:`` normalisation, and ``{{ env.* }}`` placeholders
+    stay unresolved. ``fluid generate artifacts <contract> --env`` calls this
+    too, so its artifacts are the ones the bundle would produce.
+
+    Raises what :func:`compile_contract` raises (``FileNotFoundError``,
+    :class:`RefResolutionError`, ...); the caller maps them to its exit codes.
+    """
+    compiled = compile_contract(contract_path, logger=compile_logger or logger)
+    overlay_path: Optional[Path] = None
+    if env:
+        from ..loader import _deep_merge, load_overlay_document, note_missing_overlay
+
+        found = load_overlay_document(contract_path, env)
+        if found is not None:
+            overlay_path, overlay = found
+            compiled = _deep_merge(dict(compiled), overlay)
+            logger.info("overlay_applied", extra={"overlay": str(overlay_path)})
+        else:
+            note_missing_overlay(contract_path, env, logger)
+    return compiled, overlay_path
+
+
+def bundle_contract_id(compiled: Dict[str, Any]) -> str:
+    """The ``contractId`` ``fluid bundle --format tgz`` records for ``compiled``."""
+    data_product = compiled.get("dataProduct")
+    return str(
+        compiled.get("id")
+        or compiled.get("name")
+        or (data_product.get("id") if isinstance(data_product, dict) else None)
+        or ""
+    )
+
+
 def _restores_logging_state(fn):
     """Snapshot + restore the loggers ``run`` may mutate.
 
@@ -328,25 +374,14 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         raw_contract = _parse_file(Path(contract_path).resolve())
         has_refs = _has_refs(raw_contract)
 
-        # Compile: resolve all $ref pointers
-        compiled = compile_contract(contract_path, logger=_compile_logger)
-
-        # Apply environment overlay on top (if requested). Same candidate
-        # search as every other stage (``load_overlay_document``), and the
-        # same loud notice when ``--env`` names an overlay that does not
-        # exist: a bundle is the root of trust for stages 2-9, so a silently
+        # Compile (resolve all $ref pointers), then apply the environment
+        # overlay on top when requested, with the same loud notice as every
+        # other stage when ``--env`` names an overlay that does not exist: a
+        # bundle is the root of trust for stages 2-9, so a silently
         # un-overlaid bundle poisons every one of them.
-        overlay_path = None
-        if env:
-            from ..loader import _deep_merge, load_overlay_document, note_missing_overlay
-
-            found = load_overlay_document(contract_path, env)
-            if found is not None:
-                overlay_path, overlay = found
-                compiled = _deep_merge(dict(compiled), overlay)
-                logger.info("overlay_applied", extra={"overlay": str(overlay_path)})
-            else:
-                note_missing_overlay(contract_path, env, logger)
+        compiled, overlay_path = materialize_contract(
+            contract_path, env, logger, compile_logger=_compile_logger
+        )
 
     except FileNotFoundError as e:
         sys.stderr.write(f"❌ File not found: {e}\n")
@@ -376,12 +411,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # them after the product makes them self-identifying in a shared
         # bin — matches how wheels / npm packages / OCI images are named.
         # Override by passing ``--out <explicit-path>``.
-        contract_id_raw = (
-            compiled.get("id")
-            or compiled.get("name")
-            or compiled.get("dataProduct", {}).get("id")
-            or ""
-        )
+        contract_id_raw = bundle_contract_id(compiled)
         if out == "-":
             if contract_id_raw:
                 default_name = f"{_slug(str(contract_id_raw))}.fluid.bundle.tgz"

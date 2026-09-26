@@ -529,20 +529,20 @@ def run_builds_from_args(
         # ``source_contract_path`` follows it to the contract the bundle's
         # MANIFEST records, so a bundle-planned build lands its data where a
         # contract-planned one does (it used to anchor at ``runtime/``).
-        from fluid_build._contract_loader import source_contract_path
+        from fluid_build._contract_loader import resolve_source_contract
 
         source_path_str = (plan_data.get("contract_metadata") or {}).get("source_path")
         if source_path_str:
-            source_path = source_contract_path(contract_path, plan_data=plan_data)
+            source_path, why = resolve_source_contract(contract_path, plan_data=plan_data)
             if source_path is not None:
                 LOG.info(f"Anchoring builds at source contract dir: {source_path.parent}")
                 contract_path = source_path
             else:
                 LOG.warning(
-                    "plan source_path %s no longer exists (or is a bundle that records "
-                    "no source contract); anchoring at plan dir %s (relative paths in "
-                    "builds may not resolve)",
-                    source_path_str,
+                    "source_contract_unresolved: plan %s %s; anchoring at plan dir %s "
+                    "(relative paths in builds may not resolve)",
+                    contract_path,
+                    why,
                     contract_path.parent,
                 )
         else:
@@ -580,18 +580,19 @@ def run_builds_from_args(
         if str(contract_path).lower().endswith((".tgz", ".tar.gz")):
             # A bundle's own directory is not where its contract lives:
             # anchor at the source contract its MANIFEST records.
-            from fluid_build._contract_loader import source_contract_path
+            from fluid_build._contract_loader import resolve_source_contract
 
-            bundle_source = source_contract_path(contract_path)
+            bundle_source, why = resolve_source_contract(contract_path)
             if bundle_source is not None:
                 LOG.info(f"Anchoring builds at source contract dir: {bundle_source.parent}")
                 contract_path = bundle_source
             else:
                 LOG.warning(
-                    "bundle %s records no source contract that still exists; anchoring "
-                    "builds at the bundle's directory %s (relative binding paths will not "
-                    "land where the contract's author meant)",
+                    "source_contract_unresolved: bundle %s %s; anchoring builds at the "
+                    "bundle's directory %s (relative binding paths will not land where "
+                    "the contract's author meant)",
                     contract_path,
+                    why,
                     contract_path.resolve().parent,
                 )
 

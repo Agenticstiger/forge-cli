@@ -136,34 +136,32 @@ def _fanout_input_for_env(
     * No ``env``: ``input_path`` unchanged (historical behaviour).
     * A bundle: unchanged, after :func:`check_bundle_env` proves it was built
       for ``env``. The bundle already carries the overlay-applied contract.
-    * A raw contract: the contract with its ``env`` overlay applied, written
-      as a deterministic bundle under ``tmpdir``, so stage 3 on a contract
-      sees the same merged document ``fluid bundle --env`` would have frozen
-      (the policy bindings of a cloud overlay, for one, only exist there).
+    * A raw contract: the document ``fluid bundle <contract> --env <env>``
+      freezes (:func:`fluid_build.cli.bundle.materialize_contract`, the same
+      code), written as a deterministic bundle under ``tmpdir``. So stage 3
+      on a contract emits the artifacts stage 3 on that bundle would (the
+      policy bindings of a cloud overlay, for one, only exist there).
     """
     if not env:
         return input_path
-    from fluid_build._contract_loader import (
-        _is_bundle_path,
-        check_bundle_env,
-        load_contract_with_overlay,
-    )
+    from fluid_build._contract_loader import _is_bundle_path, check_bundle_env
 
     if _is_bundle_path(str(input_path)):
         check_bundle_env(str(input_path), env, logger)
         return input_path
+    from fluid_build.cli.bundle import bundle_contract_id, materialize_contract
     from fluid_build.forge.core.bundle import build_bundle_tgz
 
     try:
-        merged = load_contract_with_overlay(str(input_path), env, logger)
+        merged, _overlay = materialize_contract(input_path, env, logger)
     except CLIError:
         raise
-    except Exception as exc:  # noqa: BLE001 — loader raises several types
+    except Exception as exc:  # noqa: BLE001 — compile/overlay raise several types
         raise CLIError(
             1, "contract_load_failed", {"path": str(input_path), "env": env, "error": str(exc)}
         )
     materialised = tmpdir / "contract.bundle.tgz"
-    build_bundle_tgz(merged, materialised, contract_id=str(merged.get("id") or ""))
+    build_bundle_tgz(merged, materialised, contract_id=bundle_contract_id(merged))
     return materialised
 
 
