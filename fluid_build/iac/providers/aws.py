@@ -1477,6 +1477,15 @@ def _emit_lf_account_settings(
         # ``aws_lakeformation_data_lake_settings`` is a singleton per
         # account+region. Use a stable resource name so re-applying with
         # the same contract is idempotent.
+        #
+        # AUTHORITATIVE, not additive: ``PutDataLakeSettings`` replaces the
+        # admin list with the one passed, and the provider clears every
+        # setting its configuration omits (create-database / create-table
+        # default permissions, trusted resource owners, parameters). Its
+        # destroy empties the admins. An admin missing from ``admins`` is
+        # removed on apply, the applying role included. The schema's
+        # ``governance.lakeFormation.admins`` description says so; the emit
+        # is unchanged.
         resources.setdefault("aws_lakeformation_data_lake_settings", {})[
             safe_ident(f"{cid}_lf_settings")
         ] = {
