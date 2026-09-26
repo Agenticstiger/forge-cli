@@ -670,18 +670,25 @@ def _inspect_local(
     base: ExposeLiveResult,
     contract_dir: Path,
 ) -> ExposeLiveResult:
+    from fluid_build.util.binding_paths import resolve_binding_path
+
     loc = binding.get("location") or {}
     raw_path = loc.get("path") or (loc.get("properties") or {}).get("path")
-    if not raw_path or "://" in str(raw_path):
+    # ``{{ env.NAME }}`` resolved first, as the build runner resolves it
+    # before it writes, so a variable holding a URI is a URI here too.
+    resolved = resolve_binding_path(str(raw_path), contract_dir) if raw_path else None
+    if not resolved or "://" in str(resolved):
         base.status = NOT_CHECKED
         base.detail = "the binding names no local file path"
         return base
     # Relative paths are rooted at the contract's directory: the DuckDB build
     # runner writes them under ``workdir = contract_dir``, and ``fluid
-    # validate`` reads them from there too.
-    path = Path(str(raw_path))
-    if not path.is_absolute():
-        path = contract_dir / path
+    # validate`` reads them from there too. Anchored before the template was
+    # resolved, a path under a shared directory named by a variable was read as
+    # a file under the contract directory with the template still in its name,
+    # which never exists, so every such target was "to be created" and the drift
+    # gate passed without reading it.
+    path = Path(str(resolved))
     base.target = str(path)
     if not path.exists():
         base.status = ABSENT
