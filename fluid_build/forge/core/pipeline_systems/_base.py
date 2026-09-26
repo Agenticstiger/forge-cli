@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
+from fluid_build._env_names import ENV_NAME_RULE, is_env_name
 from fluid_build.cli.console import cprint
 
 # SHA-pinned GitHub Actions for supply chain security.
@@ -123,22 +124,31 @@ def check_pipeline_workdir(workdir: str) -> str:
 
 
 def check_env_name(what: str, value: str) -> str:
-    """Return ``value`` if it is an overlay environment name.
+    """Return ``value`` if every stage's ``--env`` accepts it.
 
     FLUID_ENV names an overlay file and reaches ``--env`` in every stage, and
-    stage 3's scheduled DAGs pass it to ``fluid apply --env``: the grammar
-    those DAGs hold it to (:func:`validate_env_name`, reused rather than
-    copied) keeps a default from carrying a path, a space, a glob or a
-    newline into an overlay lookup or an unquoted ``--env ${FLUID_ENV:-...}``.
-    ``fluid generate ci --fluid-env-default`` also refuses what ``fluid publish
-    --env`` would.
+    two stages hold it to a grammar: stage 3's scheduled DAGs pass it to
+    ``fluid apply --env`` (:func:`validate_env_name`), and stage 10 is
+    ``fluid publish --env`` (:func:`fluid_build._env_names.is_env_name`).
+    Both are applied, reused rather than copied: a default either refuses
+    fails every build that runs on the defaults at that stage, stage 10 only
+    after stage 7 has applied. The net rule (letters, digits, '.', '_' and
+    '-', starting with a letter, at most 64 characters) also keeps a path, a
+    space, a glob or a newline out of an overlay lookup and out of an
+    unquoted ``--env ${FLUID_ENV:-...}``.
     """
     from fluid_build.schedulers.airflow.fluid_apply import ScheduleRenderError, validate_env_name
 
     try:
-        return validate_env_name(value)
+        validate_env_name(value)
     except ScheduleRenderError as exc:
         raise ValueError(f"{what} {value!r} is not an environment name: {exc}") from exc
+    if not is_env_name(value):
+        raise ValueError(
+            f"{what} {value!r} is not an environment name fluid publish --env accepts: "
+            f"{ENV_NAME_RULE}"
+        )
+    return value
 
 
 def sh_param(name: str, default: str, *, keep_blank: bool = False) -> str:
@@ -378,9 +388,12 @@ class PipelineConfig:
     diff_last_applied: bool = False
     # The ``FLUID_ENV`` default: the parameter's declared default and the
     # fallback of every shell read of it (``${FLUID_ENV:-<env>}``). ``None``
-    # keeps ``dev``. A build that gets no parameters (a Jenkins job's first
-    # build, its first after a restart re-seeded it) runs in it, and so does
-    # one an upstream trigger starts, which Jenkins runs with the defaults.
+    # (or blank) keeps ``dev``. A build that gets no parameters (a Jenkins
+    # job's first build, its first after a restart re-seeded it) runs in it,
+    # and so does one an upstream trigger starts, which Jenkins runs with the
+    # defaults. Generation raises ``ValueError`` unless every stage's
+    # ``--env`` accepts it (:func:`check_env_name`), however the config was
+    # built.
     fluid_env_default: Optional[str] = None
 
     def __post_init__(self):

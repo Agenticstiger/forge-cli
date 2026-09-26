@@ -629,23 +629,21 @@ def _check_fluid_env_default(raw: Optional[str]) -> Optional[str]:
     grammar: ``fluid generate artifacts`` (stage 3, whose scheduled DAGs run
     ``fluid apply --env``) and ``fluid publish`` (stage 10). A default one of
     the pipeline's own stages refuses would fail every build that runs on the
-    defaults, so it must be a name both accept (their validators, reused):
-    letters, digits, '.', '_' and '-', starting with a letter, at most 64
-    characters.
+    defaults, so it must be a name both accept: letters, digits, '.', '_' and
+    '-', starting with a letter, at most 64 characters. ``check_env_name``
+    applies both stages' validators, the same check ``PipelineConfig`` makes
+    whoever built it; this adds the refusal of blank and the CLI's error.
     """
     if raw is None:
         return None
     from fluid_build.forge.core.pipeline_systems._base import check_env_name
 
-    from .publish import _env_name
-
     value = raw.strip()
     try:
         if not value:
             raise ValueError("--fluid-env-default takes an environment name, not blank")
-        _env_name(value)
         return check_env_name("--fluid-env-default", value)
-    except (ValueError, argparse.ArgumentTypeError) as exc:
+    except ValueError as exc:
         raise CLIError(
             1,
             "generate_ci_fluid_env_default_invalid",

@@ -436,8 +436,8 @@ def test_a_parameterless_bundle_is_for_the_fluid_env_default(tmp_path, exported,
 
 
 #: Values a stage's ``--env`` would refuse, and whether a programmatic
-#: PipelineConfig refuses them too (the overlay-name rule; the CLI adds the
-#: one ``fluid publish --env`` holds it to).
+#: PipelineConfig refuses them too. It refuses everything the CLI does except
+#: blank, which it reads as unset (dev).
 _BAD_ENV_DEFAULTS = [
     ("", False),  # blank: the CLI refuses it, PipelineConfig reads it as unset
     ("   ", False),
@@ -451,8 +451,8 @@ _BAD_ENV_DEFAULTS = [
     ("a$(id)", True),
     ("pr\nod", True),
     ("1prod", True),  # stage 3's fluid generate artifacts --env refuses a leading digit
-    ("_prod", False),  # stage 10's fluid publish --env refuses a leading underscore
-    ("p" * 65, False),  # and more than 64 characters
+    ("_prod", True),  # stage 10's fluid publish --env refuses a leading underscore
+    ("p" * 65, True),  # and more than 64 characters
 ]
 
 
@@ -470,6 +470,53 @@ def test_a_fluid_env_default_a_stage_would_refuse_is_refused(
     if config_refuses:
         with pytest.raises(ValueError, match="not an environment name"):
             _jenkinsfile(fluid_env_default=bad)
+
+
+def _publish_accepts(env: str) -> bool:
+    """Whether stage 10's ``fluid publish`` parser takes ``--env=<env>``."""
+    from fluid_build.cli import publish
+
+    parser = argparse.ArgumentParser(prog="fluid")
+    publish.register(parser.add_subparsers())
+    try:
+        parser.parse_args([publish.COMMAND, "contract.fluid.yaml", f"--env={env}"])
+    except SystemExit:
+        return False
+    return True
+
+
+def _generate_artifacts_accepts(env: str) -> bool:
+    """Whether stage 3's ``fluid generate artifacts --env`` takes ``env``: the
+    rule its scheduled DAGs hold ``fluid apply --env`` to."""
+    from fluid_build.schedulers.airflow.fluid_apply import ScheduleRenderError, validate_env_name
+
+    try:
+        validate_env_name(env)
+    except ScheduleRenderError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    "env",
+    ["dev", "aws", "Prod-2.eu_west", "p" * 64, "p" * 65, "_prod", "1prod", "9", "-prod"]
+    + [".prod", "prod aws", "pr\nod", "../prod", "prod/x", "\u00e9t\u00e9"],
+)
+def test_a_config_takes_a_fluid_env_default_exactly_when_every_stage_does(env):
+    """Measured: ``PipelineConfig(fluid_env_default='_prod')`` built directly,
+    not through ``fluid generate ci``, wrote a Jenkinsfile whose build on the
+    defaults ran stages 1 to 9 (``fluid apply`` included) in ``_prod`` and then
+    exited 2 at stage 10, whose ``fluid publish --env`` refuses the name. The
+    config, not only the CLI, holds the default to both stages' validators."""
+    every_stage = _publish_accepts(env) and _generate_artifacts_accepts(env)
+    try:
+        content = _jenkinsfile(fluid_env_default=env)
+    except ValueError as exc:
+        assert not every_stage, exc
+        assert "not an environment name" in str(exc)
+    else:
+        assert every_stage, f"{env!r} generated, but a stage's --env refuses it"
+        assert _declared(content)["FLUID_ENV"] == env
 
 
 def test_the_option_is_on_the_command_line(repo, monkeypatch):

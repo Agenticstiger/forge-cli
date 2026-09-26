@@ -1016,6 +1016,18 @@ class TestFluidEnvDefaultAcrossSystems:
         }
         assert declared["FLUID_ENV"] == "staging"
 
+    @pytest.mark.parametrize("bad", ["_prod", "p" * 65], ids=["leading-underscore", "65-chars"])
+    @pytest.mark.parametrize("complexity", list(PipelineComplexity))
+    @pytest.mark.parametrize("provider", list(PipelineProvider))
+    def test_a_default_fluid_publish_refuses_is_refused(self, provider, complexity, bad):
+        """One config backs every system and shape, and so does the rule: a
+        default ``fluid publish --env`` refuses (a leading underscore, more
+        than 64 characters) fails generation for each, instead of the publish
+        stage of every build that runs on the defaults, after the apply."""
+        with pytest.raises(ValueError, match="fluid publish --env"):
+            self._files(provider, complexity, environments=["dev"], fluid_env_default=bad)
+        assert self._files(provider, complexity, fluid_env_default="p" * 64)
+
 
 # ---------------------------------------------------------------------------
 # Reference-only contract detection + git-prefix workdir resolution
