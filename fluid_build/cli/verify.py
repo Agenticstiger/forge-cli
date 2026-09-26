@@ -31,12 +31,12 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.cli.console import error as console_error
 from fluid_build.observability.tracing import traced_stage as _traced_stage
-from fluid_build.providers._sql_safety import validate_ident
+from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.providers.snowflake.util.config import resolve_env_templates
 from fluid_build.providers.snowflake.util.typefamily import (
     SNOWFLAKE_TYPE_FAMILIES,
@@ -159,7 +159,13 @@ Use Cases:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    p.add_argument("contract", help="Path to FLUID contract YAML file")
+    p.add_argument(
+        "contract",
+        help=(
+            "Path to FLUID contract YAML file, or a stage-1 bundle (.tgz). Relative "
+            "local output paths resolve against the source contract's directory."
+        ),
+    )
 
     p.add_argument(
         "--expose",
@@ -173,7 +179,8 @@ Use Cases:
         action="store_true",
         help=(
             "Exit non-zero on CRITICAL drift (missing fields, type mismatches, "
-            "region drift) and on verification errors. Non-critical drift "
+            "region drift, a local csv/parquet output whose columns differ from "
+            "the declared schema) and on verification errors. Non-critical drift "
             "(nullable-vs-required constraints, extra columns) is reported and "
             "downgraded to a warning — add --fail-on-warning to gate on those too."
         ),
@@ -739,6 +746,7 @@ def _verify_local_file(
     expose_name: str,
     expose_config: Dict[str, Any],
     format_type: str,
+    anchor_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Verify a local CSV or Parquet output file using DuckDB.
 
@@ -747,13 +755,28 @@ def _verify_local_file(
     mirrors the BigQuery/Snowflake approach: confirm the file exists and is
     readable, report row count and column names, and surface basic checks.
 
-    Returns a result dict compatible with the existing ``results`` loop below
-    (same shape as ``verify_bigquery_table`` and ``verify_snowflake_table``).
+    A relative ``location.path`` is resolved against ``anchor_dir``, the
+    directory of the SOURCE contract (``fluid_build.util.binding_paths``), the
+    same rule the build runner and the local provider write with. It used to
+    be resolved against the working directory, so ``fluid verify`` run from
+    the repo root reported "Output file not found" for a file the build had
+    just written next to the contract. ``anchor_dir=None`` keeps the
+    working-directory semantics.
+
+    The result carries ``kind: "local_file"`` and a ``severity`` block. Any
+    ``schema_structure`` mismatch is CRITICAL: the file IS the product, so a
+    declared column absent from it (or a column the contract does not
+    declare) is a broken output, the rule dbt applies to an enforced model
+    contract. That is what lets ``--strict`` fail on the one-column
+    placeholder an ``amend`` apply lands, which it used to downgrade.
     """
+    from fluid_build.util.binding_paths import resolve_binding_path
+
     # Resolve the file path from binding.location.path or location.path.
     binding = expose_config.get("binding") or {}
     loc = binding.get("location") or expose_config.get("location") or {}
     file_path_str = loc.get("path") or expose_config.get("path") or ""
+    file_path_str = resolve_binding_path(file_path_str, anchor_dir)
 
     if not file_path_str:
         return {
@@ -793,10 +816,15 @@ def _verify_local_file(
         import duckdb  # type: ignore[import]
 
         con = duckdb.connect(":memory:")
+        # A SQL string literal, not Python ``repr``: the path now carries the
+        # contract's directory, and ``repr`` switches to double quotes (a
+        # DuckDB identifier) or backslash escapes (literal in DuckDB) the
+        # moment a directory name holds a quote.
+        literal = quote_ansi_string_literal(file_path.as_posix())
         if actual_fmt == "parquet":
-            rel = con.sql(f"SELECT * FROM read_parquet({file_path.as_posix()!r})")
+            rel = con.sql(f"SELECT * FROM read_parquet({literal})")
         else:
-            rel = con.sql(f"SELECT * FROM read_csv_auto({file_path.as_posix()!r})")
+            rel = con.sql(f"SELECT * FROM read_csv_auto({literal})")
 
         row_count = rel.aggregate("count(*)").fetchone()[0]
         actual_columns = [col for col in rel.columns]
@@ -848,6 +876,7 @@ def _verify_local_file(
     )
 
     return {
+        "kind": "local_file",
         "status": overall_status,
         "exists": True,
         "format": actual_fmt,
@@ -855,7 +884,113 @@ def _verify_local_file(
         "row_count": row_count,
         "actual_columns": actual_columns,
         "dimensions": dimensions,
+        "severity": _local_file_severity(dimensions.get("schema_structure") or {}),
     }
+
+
+def _local_file_severity(structure: Dict[str, Any]) -> Dict[str, Any]:
+    """Severity for a local file's ``schema_structure`` dimension.
+
+    CRITICAL for any mismatch (see :func:`_verify_local_file`), SUCCESS
+    otherwise. Same keys as :func:`assess_drift_severity`, so the summary
+    and the ``--strict`` exit code treat it like every other verifier.
+    """
+    if structure.get("status") != "mismatch":
+        return assess_drift_severity([], [], [], [], True)
+    missing = list(structure.get("missing_fields") or [])
+    extra = list(structure.get("extra_fields") or [])
+    reasons = []
+    actions = []
+    if missing:
+        reasons.append(f"declared column(s) missing from the file: {', '.join(missing)}")
+        actions.append("Rebuild the output: the file does not carry the declared schema")
+    if extra:
+        reasons.append(f"column(s) in the file the contract does not declare: {', '.join(extra)}")
+        actions.append("Declare the extra columns in the contract, or drop them from the build")
+    return {
+        "level": "CRITICAL",
+        "impact": "HIGH",
+        "symbol": "🔴",
+        "remediation": "MANUAL_INTERVENTION_REQUIRED",
+        "reason": "; ".join(reasons) or "schema structure mismatch",
+        "actions": actions,
+    }
+
+
+def _count_verify_result(
+    expose_name: str,
+    status: str,
+    severity: Dict[str, Any],
+    downgraded_drift: List[str],
+) -> Tuple[int, int, int]:
+    """``(match, mismatch, critical)`` increments for one verified expose.
+
+    ``critical`` only ticks when the per-expose severity is CRITICAL (missing
+    fields, type mismatches, region drift, a local file whose columns do not
+    match the contract). WARNING / INFO drift still counts as a mismatch so
+    the summary stays accurate, and is appended to ``downgraded_drift`` for
+    the ``--strict`` downgrade message; ``--strict`` consults the critical
+    counter.
+    """
+    if status == "match":
+        return (1, 0, 0)
+    if severity.get("level") == "CRITICAL":
+        return (0, 1, 1)
+    downgraded_drift.append(
+        f"{expose_name}: {severity.get('reason', 'drift detected')} "
+        f"[{severity.get('level', 'UNKNOWN')}]"
+    )
+    return (0, 1, 0)
+
+
+def _render_local_file_result(result: Dict[str, Any], show_diffs: bool) -> None:
+    """Console view of a :func:`_verify_local_file` result.
+
+    Local files carry one checked dimension (``schema_structure``) plus a row
+    count. The warehouse view below reads ``metadata.num_rows`` and the
+    ``structure`` / ``types`` / ``constraints`` / ``location`` dimensions,
+    none of which a local result has, so it printed "Table Rows: 0" and three
+    FAIL lines for a file whose JSON report said match.
+    """
+    severity = result.get("severity") or {}
+    structure = (result.get("dimensions") or {}).get("schema_structure") or {}
+    cprint(
+        f"\n   {severity.get('symbol', '⚪')} Severity: {severity.get('level', 'UNKNOWN')} "
+        f"(Impact: {severity.get('impact', 'UNKNOWN')})"
+    )
+    cprint(f"   📁 File: {result.get('path', '?')} ({result.get('format', '?')})")
+    cprint(f"   📊 Rows: {int(result.get('row_count') or 0):,}")
+
+    cprint("\n   🔍 Dimension 1: Schema Structure")
+    actual_count = structure.get("actual_count", 0)
+    if "expected_count" not in structure:
+        cprint(
+            f"      ⚪ NOT CHECKED - {structure.get('note', 'no expected schema declared')} "
+            f"({actual_count} column(s) in the file)"
+        )
+    elif structure.get("status") == "match":
+        cprint(f"      ✅ PASS - All {structure['expected_count']} declared columns present")
+        if show_diffs:
+            cprint(f"         Columns: {', '.join(result.get('actual_columns') or [])}")
+    else:
+        missing = structure.get("missing_fields") or []
+        extra = structure.get("extra_fields") or []
+        expected = structure.get("expected_count", 0)
+        cprint("      ❌ FAIL - Schema structure mismatch")
+        cprint(f"         ✅ Matching: {expected - len(missing)}/{expected}")
+        if missing:
+            cprint(f"         ❌ Missing in file: {', '.join(missing)}")
+        if extra:
+            cprint(f"         ⚠️  Not declared in the contract: {', '.join(extra)}")
+    cprint(
+        "\n   ⚪ Data types, constraints, location: not checked for local files "
+        "(column names and row count only)"
+    )
+    cprint(f"\n   💡 Remediation: {severity.get('remediation', 'UNKNOWN')}")
+    cprint(f"      {severity.get('reason', '')}")
+    if show_diffs and severity.get("actions"):
+        for action in severity["actions"]:
+            cprint(f"      • {action}")
 
 
 #: What ``fluid apply`` provisions for a GCP-bound expose, as far as stage 9
@@ -969,6 +1104,15 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     contract_id = contract.get("id", "unknown")
     cprint(f"Contract ID: {contract_id}")
+
+    # Relative local paths and the run records the build wrote are anchored
+    # at the SOURCE contract's directory: the contract itself, or the one a
+    # bundle's MANIFEST records. One rule with the build runner and the
+    # local provider, so verify reads where apply wrote regardless of the
+    # directory either was launched from.
+    from fluid_build._contract_loader import source_contract_dir
+
+    anchor_dir = source_contract_dir(contract_path, logger)
 
     # Bug 6: detect reference-only mode once, used below to downgrade
     # "table not found" hard-errors to informational notices. The
@@ -1215,6 +1359,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 expose_name=expose_name,
                 expose_config=expose_config,
                 format_type=format_type,
+                anchor_dir=anchor_dir,
             )
         else:
             # NOT an ``error``: nothing failed, forge simply ships no verifier
@@ -1285,6 +1430,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # A verifier that knows its own target better (Glue + Athena) says so.
         target = result.get("target") or target
 
+        if result.get("kind") == "local_file":
+            target = result.get("path") or target
         cprint(f"\n📋 Verifying: {expose_name}")
         cprint(f"   Format: {format_type}")
         cprint(f"   Target: {target}")
@@ -1322,6 +1469,14 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         severity = result.get("severity", {})
         dimensions = result.get("dimensions", {})
         metadata = result.get("metadata", {})
+
+        if result.get("kind") == "local_file":
+            _render_local_file_result(result, bool(getattr(args, "show_diffs", False)))
+            _tally = _count_verify_result(expose_name, status, severity, downgraded_drift)
+            match_count += _tally[0]
+            mismatch_count += _tally[1]
+            critical_mismatch_count += _tally[2]
+            continue
 
         structure = dimensions.get("structure", {})
         types = dimensions.get("types", {})
@@ -1396,23 +1551,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             for action in severity["actions"]:
                 cprint(f"      • {action}")
 
-        # Update counts. ``critical_mismatch_count`` only ticks when
-        # the per-expose severity is CRITICAL (missing fields, type
-        # mismatches, region drift). WARNING-only constraint drift
-        # still counts toward ``mismatch_count`` so the summary remains
-        # accurate, but ``--strict`` consults the critical counter
-        # below.
-        if status == "match":
-            match_count += 1
-        else:
-            mismatch_count += 1
-            if severity.get("level") == "CRITICAL":
-                critical_mismatch_count += 1
-            else:
-                downgraded_drift.append(
-                    f"{expose_name}: {severity.get('reason', 'drift detected')} "
-                    f"[{severity.get('level', 'UNKNOWN')}]"
-                )
+        _tally = _count_verify_result(expose_name, status, severity, downgraded_drift)
+        match_count += _tally[0]
+        mismatch_count += _tally[1]
+        critical_mismatch_count += _tally[2]
 
     # ── Acquisition pattern: post-apply probes ─────────────────────────
     # When the contract has any ``pattern: acquisition`` builds, run the
@@ -1434,7 +1576,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             # Bug A4-3: use the contract file's parent directory, not cwd(),
             # so run-record lookup works when ``fluid verify`` is called with
             # an absolute contract path from a different working directory.
-            acq_results = verify_acquisition(contract, Path(contract_path).resolve().parent)
+            acq_results = verify_acquisition(contract, anchor_dir)
             for r in acq_results:
                 cprint(f"\n   Build: {r.product_id}/{r.build_id}")
                 for c in r.checks:
@@ -1463,7 +1605,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             cprint("\n" + "=" * 80)
             cprint("🔧 Transformation Post-Apply Probes (dbt)")
             cprint("=" * 80)
-            txf_results = verify_transformation(contract, Path(contract_path).resolve().parent)
+            txf_results = verify_transformation(contract, anchor_dir)
             for r in txf_results:
                 cprint(f"\n   Build: {r.product_id}/{r.build_id}")
                 for c in r.checks:

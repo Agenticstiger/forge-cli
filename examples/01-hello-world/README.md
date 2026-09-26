@@ -37,13 +37,13 @@ fluid apply    examples/01-hello-world/contract.fluid.yaml --provider local --mo
 ```text
 🔷 Build 'hello_transformation' (embedded-SQL / local DuckDB)
    ✅ Completed in 0.1s — 1 action(s) executed
-   📁 runtime/out/hello-world-v1.csv
+   📁 /path/to/forge-cli/examples/01-hello-world/runtime/out/hello-world-v1.csv
 ```
 
 Open the result:
 
 ```bash
-cat runtime/out/hello-world-v1.csv
+cat examples/01-hello-world/runtime/out/hello-world-v1.csv
 ```
 
 ```csv
@@ -61,7 +61,7 @@ The whole contract is [`contract.fluid.yaml`](contract.fluid.yaml):
   `SELECT`. There are no inputs, so it just emits one row.
 - **`exposes[]`** — declares the output port: a `local` CSV at
   `runtime/out/hello-world-v1.csv` with a typed `schema`. `apply` writes exactly that
-  path.
+  path, relative to this folder (the contract's directory).
 
 ## Next steps
 

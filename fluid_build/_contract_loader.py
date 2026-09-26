@@ -235,8 +235,14 @@ def load_contract_with_overlay(
     # binding). This unblocks ``fluid plan <bundle>.tgz`` and
     # ``fluid apply <bundle>.tgz``, and makes plan.py's bundleDigest
     # injection reachable via the real CLI.
+    #
+    # Because ``env`` is not re-applied, an ``env`` that disagrees with the
+    # one the bundle was built for is refused (``check_bundle_env``): it used
+    # to be ignored, so ``fluid plan base.tgz --env aws`` planned the base
+    # contract while the operator believed they were planning AWS.
     if _is_bundle_path(path):
         contract = _load_contract_from_bundle(path, logger)
+        check_bundle_env(path, env, logger)
         return _normalize_contract_aliases(contract)
 
     try:
@@ -269,6 +275,154 @@ def load_contract_with_overlay(
     # Coerce here so both schema forms behave identically end-to-end.
     contract = _normalize_singular_build_key(contract)
     return contract
+
+
+def check_bundle_env(path: str, env: Optional[str], logger: logging.Logger) -> None:
+    """Refuse an ``--env`` that disagrees with the environment a bundle was built for.
+
+    A bundle is frozen: :func:`load_contract_with_overlay` never re-applies an
+    overlay to one. So ``fluid plan bundle.tgz --env aws`` on a bundle built
+    WITHOUT ``--env aws`` used to plan the base contract while the operator
+    believed they were planning AWS. ``fluid bundle`` now records the env in
+    the MANIFEST ``source`` block; this compares the two and raises
+    ``CLIError(1, "bundle_env_mismatch")`` when they differ.
+
+    * No ``env`` requested, or ``path`` is not a bundle: nothing to check.
+    * Bundle records no env at all (built before the block existed): WARNING,
+      proceed — there is nothing to compare against.
+    * Bundle built with no env and ``env`` is ``dev``: accepted, because dev
+      is the base by convention — unless a dev overlay exists next to the
+      recorded source contract, in which case the bundle skipped it.
+    """
+    if not env or not _is_bundle_path(path):
+        return
+    import tarfile
+
+    from fluid_build.forge.core.bundle import bundle_source_contract, read_bundle_source
+
+    try:
+        source = read_bundle_source(Path(path))
+    except (tarfile.TarError, OSError, ValueError):
+        # Unreadable bundle: the loader's MANIFEST tamper gate reports that
+        # with a precise event; do not pre-empt it with a vaguer one here.
+        return
+    if source is None or "env" not in source:
+        logger.warning(
+            "bundle_env_unrecorded: %s does not record the environment it was built for, "
+            "and --env %r is never re-applied to a bundle. Rebuild it with "
+            "`fluid bundle <contract> --env <env> --format tgz` to have this checked.",
+            path,
+            env,
+        )
+        return
+    built = source.get("env")
+    if built == env:
+        return
+    loader = _imp("fluid_build.loader")
+    if built is None and env == loader.BASE_ENV_BY_CONVENTION and source.get("overlay") is None:
+        src_contract = bundle_source_contract(Path(path), source)
+        if src_contract is None or loader.load_overlay_document(src_contract, env) is None:
+            logger.info(
+                "bundle_env_base: %s was built without --env; --env %r is the base "
+                "contract by convention",
+                path,
+                env,
+            )
+            return
+    built_for = f"env {built!r}" if built else "no --env (the base contract)"
+    raise CLIError(
+        1,
+        "bundle_env_mismatch",
+        {
+            "bundle": str(path),
+            "bundle_env": built,
+            "requested_env": env,
+            "hint": (
+                f"the bundle was built for {built_for} but this stage was asked for "
+                f"env {env!r}. A bundle is never re-overlaid; rebuild it with "
+                f"`fluid bundle <contract> --env {env} --format tgz`, or pass the env "
+                "it was built for."
+            ),
+        },
+    )
+
+
+def source_contract_path(
+    path: str | Path,
+    *,
+    plan_data: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    """The source contract file relative binding paths in ``path`` are anchored to.
+
+    One answer for every input shape, so the stage that writes a local file
+    and the stage that reads it back agree on where a relative
+    ``binding.location.path`` lives (see ``fluid_build.util.binding_paths``):
+
+    * a contract file: itself, resolved;
+    * a bundle (``.tgz``): the source contract recorded in its MANIFEST, when
+      that file still exists;
+    * a plan (``plan_data`` given): ``contract_metadata.source_contract`` when
+      ``fluid plan`` recorded one (plans made from a bundle), else
+      ``contract_metadata.source_path``, itself followed through the bundle
+      when the plan was made from one.
+
+    Returns ``None`` when a bundle or plan records no source contract that
+    still exists; the caller picks its fallback (and says so).
+    """
+    p = Path(path)
+    if plan_data is not None:
+        meta = plan_data.get("contract_metadata") if isinstance(plan_data, dict) else None
+        if not isinstance(meta, dict):
+            return None
+        for key in ("source_contract", "source_path"):
+            recorded = meta.get(key)
+            if not isinstance(recorded, str) or not recorded:
+                continue
+            if _is_bundle_path(recorded):
+                resolved = source_contract_path(recorded) if Path(recorded).is_file() else None
+            else:
+                candidate = Path(recorded)
+                resolved = candidate.resolve() if candidate.is_file() else None
+            if resolved is not None:
+                return resolved
+        return None
+    if _is_bundle_path(str(p)):
+        import tarfile
+
+        from fluid_build.forge.core.bundle import bundle_source_contract
+
+        try:
+            return bundle_source_contract(p)
+        except (tarfile.TarError, OSError, ValueError):
+            return None
+    return p.resolve()
+
+
+def source_contract_dir(
+    path: str | Path,
+    logger: Optional[logging.Logger] = None,
+    *,
+    plan_data: Optional[Dict[str, Any]] = None,
+) -> Path:
+    """Directory relative ``binding.location.path`` values in ``path`` resolve against.
+
+    :func:`source_contract_path`'s parent. When a bundle or plan records no
+    source contract that still exists, the input file's own directory, with
+    a WARNING, because a relative local path will then not land where the
+    contract's author meant.
+    """
+    resolved = source_contract_path(path, plan_data=plan_data)
+    if resolved is not None:
+        return resolved.parent
+    fallback = Path(path).resolve().parent
+    (logger or logging.getLogger("fluid.loader")).warning(
+        "source_contract_unrecorded: %s does not record a source contract that still "
+        "exists; relative binding paths are anchored at %s instead. Re-create it with "
+        "the current `fluid bundle` / `fluid plan` from its workspace.",
+        path,
+        fallback,
+    )
+    return fallback
 
 
 # Alias → canonical mapping table, applied at contract-load time.

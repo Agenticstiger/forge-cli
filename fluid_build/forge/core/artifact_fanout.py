@@ -778,6 +778,17 @@ _DISPATCH = {
 # ---------------------------------------------------------------------------
 
 
+def project_relative_path(path: Path) -> Optional[str]:
+    """``path`` relative to the current directory, as POSIX; ``None`` outside it.
+
+    The default ``--contract-path`` of the schedule DAGs for a raw contract.
+    """
+    try:
+        return Path(path).resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return None
+
+
 def run_fanout(
     bundle_or_contract: Path,
     out_dir: Path,
@@ -841,12 +852,8 @@ def run_fanout(
 
     dag_contract_path = contract_path
     if dag_contract_path is None and not _is_tgz_input(bundle_or_contract):
-        try:
-            dag_contract_path = (
-                bundle_or_contract.resolve().relative_to(Path.cwd().resolve()).as_posix()
-            )
-        except ValueError:
-            dag_contract_path = None  # outside the project: defaulted, with a warning
+        # Outside the project: None, defaulted below with a warning.
+        dag_contract_path = project_relative_path(bundle_or_contract)
     overlay_env = None if _is_tgz_input(bundle_or_contract) else env
 
     # Extract bundle if applicable. ``resolved_contract`` is the file every

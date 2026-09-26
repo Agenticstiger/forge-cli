@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -104,11 +105,13 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
         "--env",
         default=None,
         help=(
-            "Environment the scheduled builds run against: every schedule DAG runs "
-            "``fluid apply --env <env>``. For a raw contract the schedule is rendered "
-            "with that overlay applied; a bundle must be built with the same --env. "
-            "Default: $FLUID_ENV, the variable the generated pipelines apply with; "
-            "when that is unset too, no --env (with a warning if the contract has "
+            "Environment the artifacts are for. A bundle must have been built for "
+            "it (``fluid bundle --env <env>``); a bundle built for another env is "
+            "refused, because a bundle is never re-overlaid. A raw contract gets the "
+            "overlay applied, exactly as ``fluid bundle --env <env>`` would. Every "
+            "schedule DAG runs ``fluid apply --env <env>``; for the DAGs the default "
+            "is $FLUID_ENV, the variable the generated pipelines apply with; when "
+            "that is unset too, no --env (with a warning if the contract has "
             "overlays). An empty --env '' means no --env."
         ),
     )
@@ -123,6 +126,45 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     p.set_defaults(generate_sub="artifacts", func=_run_from_generate)
+
+
+def _fanout_input_for_env(
+    input_path: Path, env: Optional[str], tmpdir: Path, logger: logging.Logger
+) -> Path:
+    """The file ``run_fanout`` should read so the artifacts describe ``env``.
+
+    * No ``env``: ``input_path`` unchanged (historical behaviour).
+    * A bundle: unchanged, after :func:`check_bundle_env` proves it was built
+      for ``env``. The bundle already carries the overlay-applied contract.
+    * A raw contract: the contract with its ``env`` overlay applied, written
+      as a deterministic bundle under ``tmpdir``, so stage 3 on a contract
+      sees the same merged document ``fluid bundle --env`` would have frozen
+      (the policy bindings of a cloud overlay, for one, only exist there).
+    """
+    if not env:
+        return input_path
+    from fluid_build._contract_loader import (
+        _is_bundle_path,
+        check_bundle_env,
+        load_contract_with_overlay,
+    )
+
+    if _is_bundle_path(str(input_path)):
+        check_bundle_env(str(input_path), env, logger)
+        return input_path
+    from fluid_build.forge.core.bundle import build_bundle_tgz
+
+    try:
+        merged = load_contract_with_overlay(str(input_path), env, logger)
+    except CLIError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — loader raises several types
+        raise CLIError(
+            1, "contract_load_failed", {"path": str(input_path), "env": env, "error": str(exc)}
+        )
+    materialised = tmpdir / "contract.bundle.tgz"
+    build_bundle_tgz(merged, materialised, contract_id=str(merged.get("id") or ""))
+    return materialised
 
 
 def _run_from_generate(args: argparse.Namespace, logger: logging.Logger) -> int:
@@ -141,16 +183,19 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     if not bundle_path.exists():
         raise CLIError(2, "generate_artifacts_input_missing", {"path": str(bundle_path)})
 
+    env = getattr(args, "env", None)
     try:
-        manifest = run_fanout(
-            bundle_path,
-            out_dir,
-            emit_raw=args.emit,
-            manifest_path=manifest_path,
-            logger=logger,
-            env=_schedule_env(args, logger),
-            contract_path=getattr(args, "contract_path", None),
-        )
+        with tempfile.TemporaryDirectory(prefix="fluid-artifacts-env-") as tmpdir:
+            fanout_input = _fanout_input_for_env(bundle_path, env, Path(tmpdir), logger)
+            manifest = run_fanout(
+                fanout_input,
+                out_dir,
+                emit_raw=args.emit,
+                manifest_path=manifest_path,
+                logger=logger,
+                env=_schedule_env(args, logger),
+                contract_path=_schedule_contract_path(args, bundle_path, fanout_input),
+            )
     except FanoutError as exc:
         # Surface emit-key context so the operator knows which generator failed.
         meta = {"error": str(exc)}
@@ -158,10 +203,28 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             meta["emit_key"] = exc.key
         raise CLIError(1, "generate_artifacts_failed", meta)
 
+    if env:
+        cprint(f"   env: {env}")
     cprint(f"✅ Artifacts written to {out_dir}")
     cprint(f"   MANIFEST digest: {manifest['digest']}")
     cprint(f"   files: {len(manifest.get('files', {}))}")
     return 0
+
+
+def _schedule_contract_path(
+    args: argparse.Namespace, input_path: Path, fanout_input: Path
+) -> Optional[str]:
+    """The ``--contract-path`` for schedule DAGs: the flag, else ``None``
+    (``run_fanout`` defaults it from its input), except that a raw contract
+    fanned out through a temporary ``--env`` bundle keeps its own
+    project-relative path; the temporary bundle records no location.
+    """
+    explicit = getattr(args, "contract_path", None)
+    if explicit is not None or fanout_input == input_path:
+        return explicit
+    from fluid_build.forge.core.artifact_fanout import project_relative_path
+
+    return project_relative_path(input_path)
 
 
 def _schedule_env(args: argparse.Namespace, logger: logging.Logger) -> Optional[str]:

@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Mapping
 
 from fluid_build.cli.console import cprint
 from fluid_build.iac import build_module, get_iac_plugin, runner
-from fluid_build.iac.backend import parse_backend
+from fluid_build.iac.backend import parse_backend, resolve_state_backend_spec
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.credentials import build_tofu_env, credential_report
 from fluid_build.iac.naming import safe_ident
@@ -104,7 +104,19 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     # ``contract`` selects the default state key: packaging-bearing contracts
     # get a per-contract key so two products sharing one state bucket cannot
     # clobber each other; legacy contracts keep the shared key (RFC file 7).
-    backend = parse_backend(getattr(args, "state_backend", None), contract)
+    #
+    # ``--state-backend`` defaults from ``FLUID_STATE_BACKEND`` (flag wins;
+    # an empty flag forces local state), so a CI job can keep state in a
+    # bucket instead of the workspace it wipes after every run.
+    backend_spec, backend_origin = resolve_state_backend_spec(getattr(args, "state_backend", None))
+    try:
+        backend = parse_backend(backend_spec, contract)
+    except ValueError as exc:
+        raise CLIError(
+            1,
+            "apply_state_backend_invalid",
+            {"source": backend_origin, "error": str(exc)},
+        )
     # Per-contract workdir + state: each contract owns an isolated ``tofu``
     # state, so applying contract B never plans to destroy contract A's
     # resources (they share the provider but not the state).
@@ -137,7 +149,10 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
 
     cprint(f"\nOpenTofu engine — provider: {provider}")
     cprint(f"  module:      {module_path}")
-    cprint(f"  state:       {('remote: ' + next(iter(backend))) if backend else 'local'}")
+    state_line = ("remote: " + next(iter(backend))) if backend else "local"
+    if backend_origin != "default":
+        state_line += f" (from {backend_origin})"
+    cprint(f"  state:       {state_line}")
     cprint(f"  credentials: {', '.join(present) if present else 'none detected in environment'}")
 
     init = runner.tofu_init(str(workdir), backend=backend is not None, env=env)

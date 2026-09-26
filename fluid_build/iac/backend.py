@@ -33,13 +33,46 @@ users and wants its own migration note) — see the RFC's open question 3.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional
+import os
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .naming import safe_ident
 from .packaging import LEGACY, PackagingError, resolve_packaging
 
 #: The pre-packaging default — one shared key for every contract.
 LEGACY_STATE_KEY = "fluid/terraform.tfstate"
+
+#: Environment variable ``fluid apply`` reads for the state backend when
+#: ``--state-backend`` is not on the command line. A CI job sets it once so
+#: OpenTofu state lives in a bucket rather than the workspace, which CI
+#: wipes after every run (a wiped local state re-plans every resource as
+#: new on the next run).
+STATE_BACKEND_ENV = "FLUID_STATE_BACKEND"
+
+
+def resolve_state_backend_spec(
+    flag_value: Optional[str], environ: Optional[Mapping[str, str]] = None
+) -> Tuple[Optional[str], str]:
+    """Pick the backend spec and say where it came from: ``(spec, origin)``.
+
+    Precedence is flag, then environment, then local state:
+
+    * ``--state-backend`` given (``flag_value`` is not ``None``) always wins.
+      An empty value is an explicit request for local state, so one job can
+      opt out of a ``FLUID_STATE_BACKEND`` its environment sets.
+    * otherwise a non-blank :data:`STATE_BACKEND_ENV`;
+    * otherwise ``(None, "default")``: local state.
+
+    ``origin`` is ``"--state-backend"``, ``"FLUID_STATE_BACKEND"`` or
+    ``"default"``, for messages. The spec itself is parsed by
+    :func:`parse_backend`.
+    """
+    if flag_value is not None:
+        return (flag_value.strip() or None, "--state-backend")
+    env_value = (os.environ if environ is None else environ).get(STATE_BACKEND_ENV, "")
+    if env_value and env_value.strip():
+        return (env_value.strip(), STATE_BACKEND_ENV)
+    return (None, "default")
 
 
 def default_state_key(contract: Optional[Mapping[str, Any]]) -> str:

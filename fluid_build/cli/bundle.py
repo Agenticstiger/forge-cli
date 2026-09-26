@@ -331,17 +331,22 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # Compile: resolve all $ref pointers
         compiled = compile_contract(contract_path, logger=_compile_logger)
 
-        # Apply environment overlay on top (if requested)
+        # Apply environment overlay on top (if requested). Same candidate
+        # search as every other stage (``load_overlay_document``), and the
+        # same loud notice when ``--env`` names an overlay that does not
+        # exist: a bundle is the root of trust for stages 2-9, so a silently
+        # un-overlaid bundle poisons every one of them.
+        overlay_path = None
         if env:
-            from ..loader import _deep_merge, _overlay_candidates
+            from ..loader import _deep_merge, load_overlay_document, note_missing_overlay
 
-            base_path = Path(contract_path)
-            for cand in _overlay_candidates(base_path, env):
-                if cand.exists():
-                    overlay = _parse_file(cand)
-                    compiled = _deep_merge(dict(compiled), overlay)
-                    logger.info("overlay_applied", extra={"overlay": str(cand)})
-                    break
+            found = load_overlay_document(contract_path, env)
+            if found is not None:
+                overlay_path, overlay = found
+                compiled = _deep_merge(dict(compiled), overlay)
+                logger.info("overlay_applied", extra={"overlay": str(overlay_path)})
+            else:
+                note_missing_overlay(contract_path, env, logger)
 
     except FileNotFoundError as e:
         sys.stderr.write(f"❌ File not found: {e}\n")
@@ -364,7 +369,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     # ── tgz branch: canonical deterministic bundle (stage-1 pipeline output) ──
     if fmt == "tgz":
-        from fluid_build.forge.core.bundle import _slug, build_bundle_tgz
+        from fluid_build.forge.core.bundle import _slug, build_bundle_tgz, make_bundle_source
 
         # Product-id defaulted output filename. Bundles travel outside the
         # product folder (CI artifact stores, S3, catalog publish). Naming
@@ -388,11 +393,22 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 f"   (derived from contract.id; override with --out <path>)\n"
             )
 
+        # Provenance for the downstream stages: where the source contract
+        # lives relative to the bundle (so a relative ``location.path`` is
+        # anchored at the contract's directory, as it is when the contract
+        # itself is the input) and which environment was applied (so
+        # ``plan`` / ``apply`` / ``verify --env X`` can refuse a bundle built
+        # for a different one). Recorded in MANIFEST.json, outside the
+        # merkle root: the digest still names the contract alone.
+        source = make_bundle_source(
+            Path(contract_path), Path(out), env=env, overlay_path=overlay_path
+        )
         try:
             digest = build_bundle_tgz(
                 compiled,
                 Path(out),
                 contract_id=str(contract_id_raw),
+                source=source,
             )
         except Exception as e:
             sys.stderr.write(f"❌ Bundle tgz build failed: {e}\n")
@@ -400,6 +416,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
         sys.stderr.write(f"✅ Bundle written to {out}\n")
         sys.stderr.write(f"   digest: {digest}\n")
+        if env:
+            applied = source.get("overlay") or "none (base contract)"
+            sys.stderr.write(f"   env: {env} (overlay: {applied})\n")
 
         # ── Optional: Sigstore cosign keyless signing ─────────────────
         # Runs after tgz emission so the digest is already stable. A

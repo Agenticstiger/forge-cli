@@ -57,9 +57,18 @@ Stage 6 `fluid plan` emits two cryptographic fields in `plan.json`:
 - `bundleDigest` — SHA-256 merkle root of the input bundle's MANIFEST. When input is a `.tgz` this pins the exact bundle.
 - `planDigest` — SHA-256 over the plan body (digest fields masked). Catches tampering between stages 6 and 7.
 
-Stage 7 `fluid apply` re-verifies both before any DDL. Mismatch → hard-fail with stable events:
+Stage 7 `fluid apply` re-verifies both before any DDL **or build**, on both engine paths, then checks the plan was generated for the requested `--mode` (so `fluid plan --mode X` must match `fluid apply --mode X`). Mismatch → hard-fail with stable events:
 - `apply_plan_digest_bundle_mismatch` — bundle was swapped after plan ran
 - `apply_plan_digest_plan_tamper` — plan body edited since stage 6
+- `apply_plan_mode_mismatch` — plan generated for a different mode
+- `apply_build_id_requires_build_mode` — `--build-id` with a mode that runs no build
+
+### Environment and anchoring across stages
+
+- `fluid bundle --env <env>` freezes the overlay-applied contract and records `source: {contract, env, overlay}` in `MANIFEST.json` (outside the merkle root; `contract` is relative to the bundle's directory and is only trusted when it declares the bundled contract's `id`). Every later stage given `--env` on a bundle refuses a different env with `bundle_env_mismatch` (a bundle built without `--env` is accepted for `--env dev` when no dev overlay exists). `fluid generate artifacts` takes `--env` too.
+- A relative `exposes[].binding.location.path` resolves against the SOURCE contract's directory in every writer and reader (build runners, the local provider, `fluid verify`), whatever directory the command runs from. For a bundle or a bundle-made plan that is the contract the MANIFEST records (`plan.json` carries it as `contract_metadata.source_contract`).
+- `--env` naming no overlay logs a WARNING (`overlay_not_found`, listing the overlays that exist); `dev` with none is the base contract (INFO).
+- `fluid apply --state-backend` defaults from `FLUID_STATE_BACKEND`; an explicit empty `--state-backend ""` forces local state.
 
 ### Install-Mode (Generated Jenkinsfiles)
 

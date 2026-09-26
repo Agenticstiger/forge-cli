@@ -31,8 +31,9 @@ CI-safe by construction:
   the ``[local]`` extra (``duckdb``) is not installed.
 * Fully isolated: the example folder is copied under a ``tmp_path`` workspace and
   ``fluid`` is invoked with ``cwd=tmp_path``, so the sample-data inputs resolve
-  and every output lands in ``tmp_path/runtime/`` — the source tree is never
-  touched and pytest cleans the tmp dir up.
+  and every output lands under the copied example folder (a relative
+  ``location.path`` resolves against the contract's directory) — the source
+  tree is never touched and pytest cleans the tmp dir up.
 
 Runs in the free ``ci.yml::duckdb-integration`` job, which selects on
 ``-m "integration and not slow"``.
@@ -151,9 +152,11 @@ def test_quickstart_example_validates_and_applies(
         f"exited {apply.returncode}\nstdout:\n{apply.stdout}\nstderr:\n{apply.stderr}"
     )
 
-    # 3) the promised artifact exists at the contract's declared output path.
+    # 3) the promised artifact exists at the contract's declared output path,
+    #    which is relative to the contract's own directory (not to the
+    #    directory ``fluid`` was launched from).
     declared = _output_path_from_contract(dst / "contract.fluid.yaml")
-    out_file = workspace / declared
+    out_file = dst / declared
     assert out_file.exists(), (
         f"expected output artifact not produced: {declared}\n" f"apply stdout:\n{apply.stdout}"
     )

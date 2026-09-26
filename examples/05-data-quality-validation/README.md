@@ -43,11 +43,11 @@ order_id,customer_id,order_date,amount,region,status
 ```text
 🔷 Build 'clean_sales' (embedded-SQL / local DuckDB)
    ✅ Completed in 0.1s — 1 action(s) executed
-   📁 runtime/out/validated-sales-v1.csv
+   📁 /path/to/forge-cli/examples/05-data-quality-validation/runtime/out/validated-sales-v1.csv
 ```
 
 ```bash
-cat runtime/out/validated-sales-v1.csv
+cat examples/05-data-quality-validation/runtime/out/validated-sales-v1.csv
 ```
 
 ```csv
@@ -81,7 +81,7 @@ WHERE customer_id IS NOT NULL
 
 Because the input schema marks `customer_id` and `order_date` as `required: false`, the
 raw CSV loads cleanly and the SQL — not the loader — decides what is publishable. The
-survivors are written to `runtime/out/validated-sales-v1.csv`.
+survivors are written to `runtime/out/validated-sales-v1.csv`, relative to this folder.
 
 ## Next steps
 

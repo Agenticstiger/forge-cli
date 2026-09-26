@@ -367,6 +367,18 @@ def run(args, logger: logging.Logger) -> int:
         # ``planDigest`` catches tampering of plan.json between stages 6 and
         # 7. Both are verified by ``fluid apply`` before any DDL runs.
         bundle_path: Path | None = Path(args.contract) if is_bundle_path(args.contract) else None
+        if bundle_path is not None:
+            # ``contract_metadata.source_path`` names the BUNDLE, whose
+            # directory is not where its relative ``location.path`` values
+            # belong. Record the source contract the bundle's MANIFEST names,
+            # under planDigest, so apply anchors a bundle-planned build where
+            # a contract-planned one lands (``source_contract_path``).
+            from fluid_build._contract_loader import source_contract_path
+
+            source_contract = source_contract_path(bundle_path)
+            meta = plan.get("contract_metadata")
+            if source_contract is not None and isinstance(meta, dict):
+                meta["source_contract"] = str(source_contract)
         try:
             plan = inject_digests(plan, bundle_path=bundle_path)
         except FileNotFoundError as exc:
