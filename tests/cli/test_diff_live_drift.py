@@ -23,6 +23,11 @@ fire. These tests pin the live comparison that replaced it:
 * a Glue table read through a real boto3 client under ``botocore`` 's Stubber;
 * a BigQuery table read through a stubbed ``bigquery.Client``.
 
+A local target is written by the build, so its differences are judged by the
+expose's ``schemaPolicy`` (``evolve_safe`` when unset); the tests that mean
+"changed by hand" declare ``strict``, as the demo contract does. A Glue or
+BigQuery table's columns are declared by the IaC, so any difference is drift.
+
 Nothing here reaches a cloud endpoint.
 """
 
@@ -122,7 +127,19 @@ BQ_COLUMNS = [
 # ---------------------------------------------------------------------------
 
 
-def _contract(binding: Dict[str, Any], *, schema=None, **top: Any) -> Dict[str, Any]:
+def _contract(
+    binding: Dict[str, Any],
+    *,
+    schema=None,
+    policy: Optional[str] = None,
+    overrides: Optional[Dict[str, str]] = None,
+    **top: Any,
+) -> Dict[str, Any]:
+    block: Dict[str, Any] = {"schema": SCHEMA if schema is None else schema}
+    if policy:
+        block["schemaPolicy"] = policy
+    if overrides:
+        block["evolutionOverrides"] = overrides
     doc: Dict[str, Any] = {
         "fluidVersion": "0.7.5",
         "kind": "DataProduct",
@@ -135,7 +152,7 @@ def _contract(binding: Dict[str, Any], *, schema=None, **top: Any) -> Dict[str, 
                 "exposeId": "subscriptions",
                 "kind": "table",
                 "binding": binding,
-                "contract": {"schema": SCHEMA if schema is None else schema},
+                "contract": block,
             }
         ],
     }
@@ -295,8 +312,8 @@ def bigquery(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _local_case(root: Path, select_sql: Optional[str]) -> Path:
-    contract = _write_contract(root, _contract(LOCAL_BINDING))
+def _local_case(root: Path, select_sql: Optional[str], *, policy: Optional[str] = None) -> Path:
+    contract = _write_contract(root, _contract(LOCAL_BINDING, policy=policy))
     if select_sql is not None:
         _write_parquet(root / "out" / "customer_subscriptions.parquet", select_sql)
     return contract
@@ -335,7 +352,7 @@ def test_local_parquet_matching_the_contract_is_no_drift(workspace, capsys):
 def test_local_parquet_changed_outside_the_contract_fails_the_gate(
     workspace, caplog, select_sql, column, reason
 ):
-    contract = _local_case(workspace, select_sql)
+    contract = _local_case(workspace, select_sql, policy="strict")
 
     with caplog.at_level(logging.WARNING):
         rc, event = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
@@ -361,7 +378,7 @@ def test_local_parquet_changed_outside_the_contract_fails_the_gate(
 def test_without_exit_on_drift_the_comparison_is_reported_and_exits_zero(
     workspace, select_sql, has_drift, columns
 ):
-    contract = _local_case(workspace, select_sql)
+    contract = _local_case(workspace, select_sql, policy="strict")
 
     rc, _ = _invoke(["diff", str(contract), "--out", "diff.json"])
 
@@ -386,7 +403,9 @@ def test_local_target_not_built_yet_is_to_be_created_not_drift(workspace, capsys
 def test_a_column_name_from_the_target_cannot_forge_gate_output(workspace, capsys):
     """Column names come from the target, which the contract does not control."""
     forged = "x\n  subscriptions [local] match\x1b[2K"
-    contract = _local_case(workspace, f'SELECT *, 1 AS "{forged}" FROM ({MATCHING_SELECT})')
+    contract = _local_case(
+        workspace, f'SELECT *, 1 AS "{forged}" FROM ({MATCHING_SELECT})', policy="strict"
+    )
 
     rc, _ = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
 
@@ -689,3 +708,622 @@ def test_nothing_inspectable_downgrades_the_gate_and_says_so(workspace, built_pr
     assert report["drift_source"] == "live"
     assert report["live"]["counts"]["not_checked"] == 1
     assert "diff_exit_on_drift_skipped" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# schemaPolicy: a build-written target is judged by the policy the build ran
+# ---------------------------------------------------------------------------
+
+
+def _source_contract(root: Path, policy: str) -> Path:
+    """A local product whose build copies ``src/subs.parquet`` to the target."""
+    doc = _contract(LOCAL_BINDING, schema=SCHEMA[:2] + [SCHEMA[3]], policy=policy)
+    doc["exposes"][0]["binding"] = {
+        "platform": "local",
+        "format": "parquet",
+        "location": {"path": "./out/subs.parquet"},
+    }
+    doc["builds"] = [
+        {
+            "id": "ingest",
+            "pattern": "acquisition",
+            "engine": "duckdb",
+            "properties": {
+                "source": {
+                    "kind": "filesystem",
+                    "connection": {"uri": "./src/subs.parquet"},
+                    "reader": {"format": "parquet"},
+                    "mode": "full_refresh",
+                    "streams": ["subs"],
+                },
+                "sink": {"format": "parquet"},
+            },
+            "outputs": ["subscriptions"],
+        }
+    ]
+    return _write_contract(root, doc)
+
+
+def test_apply_under_evolve_safe_then_diff_is_not_drift(workspace):
+    """The measured failure: ``fluid apply`` landed the column ``evolve_safe``
+    lets a build include, and the gate then failed on apply's own output."""
+    source = workspace / "src" / "subs.parquet"
+    _write_parquet(
+        source,
+        "SELECT 's1'::VARCHAR AS subscription_id, 'c1'::VARCHAR AS customer_id, "
+        "'active'::VARCHAR AS status",
+    )
+    contract = _source_contract(workspace, "evolve_safe")
+    apply = ["apply", str(contract), "--mode", "amend-and-build", "--yes"]
+    assert _invoke(apply) == (0, None)
+
+    # The source gains a column; apply lands it, as evolve_safe allows.
+    grown = workspace / "src" / "grown.parquet"
+    _write_parquet(grown, f"SELECT *, 'gold' AS plan_tier FROM '{source.as_posix()}'")
+    grown.replace(source)
+    assert _invoke(apply) == (0, None)
+
+    rc, event = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert (rc, event) == (0, None), "apply's own output is not drift"
+    assert expose["status"] == "evolved"
+    assert expose["schema_policy"] == "evolve_safe"
+    assert [
+        (c["column"], c["event"], c["action"], c["classification"]) for c in expose["columns"]
+    ] == [("plan_tier", "added", "include", "allowed")]
+
+
+@pytest.mark.parametrize(
+    ("policy", "overrides", "select_sql", "status", "action"),
+    [
+        (None, None, f"SELECT *, 'x' AS added FROM ({MATCHING_SELECT})", "evolved", "include"),
+        (
+            "evolve_safe",
+            None,
+            f"SELECT * EXCLUDE (status) FROM ({MATCHING_SELECT})",
+            "evolved",
+            "warn",
+        ),
+        (
+            "evolve_safe",
+            None,
+            f"SELECT * REPLACE (CAST(1 AS BIGINT) AS status) FROM ({MATCHING_SELECT})",
+            "drift",
+            "fail",
+        ),
+        (
+            "evolve_all",
+            None,
+            f"SELECT * REPLACE (CAST(1 AS BIGINT) AS status) FROM ({MATCHING_SELECT})",
+            "evolved",
+            "cast",
+        ),
+        (
+            "discover_and_freeze",
+            None,
+            f"SELECT *, 'x' AS added FROM ({MATCHING_SELECT})",
+            "drift",
+            "fail",
+        ),
+        (
+            "evolve_safe",
+            {"onAddedColumn": "fail"},
+            f"SELECT *, 'x' AS added FROM ({MATCHING_SELECT})",
+            "drift",
+            "fail",
+        ),
+    ],
+    ids=[
+        "default-added",
+        "evolve_safe-removed",
+        "evolve_safe-retyped",
+        "evolve_all-retyped",
+        "freeze-added",
+        "override-added",
+    ],
+)
+def test_local_differences_are_classified_by_the_expose_policy(
+    workspace, policy, overrides, select_sql, status, action
+):
+    contract = _write_contract(
+        workspace, _contract(LOCAL_BINDING, policy=policy, overrides=overrides)
+    )
+    _write_parquet(workspace / "out" / "customer_subscriptions.parquet", select_sql)
+
+    rc, _ = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert expose["status"] == status
+    assert [c["action"] for c in expose["columns"]] == [action]
+    assert rc == (1 if status == "drift" else 0)
+
+
+def test_glue_columns_are_the_iac_s_so_the_policy_does_not_excuse_them(
+    workspace, built_providers, glue
+):
+    """The build never changes a Glue table's columns; a column added there
+    was added by hand, whatever evolve_safe lets a build write."""
+    columns = GLUE_COLUMNS + [{"Name": "added_by_hand", "Type": "string"}]
+    glue.stubber.add_response("get_table", _glue_table(columns), GLUE_PARAMS)
+    contract = _write_contract(workspace, _contract(AWS_BINDING, policy="evolve_safe"))
+
+    rc, _ = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert rc == 1
+    assert expose["status"] == "drift"
+    assert expose["schema_policy"] is None
+
+
+def test_glue_column_names_match_without_case(workspace, built_providers, glue):
+    """Glue lower-cases every column name it stores."""
+    schema = SCHEMA + [{"name": "customerId", "type": "VARCHAR"}]
+    glue.stubber.add_response(
+        "get_table",
+        _glue_table(GLUE_COLUMNS + [{"Name": "customerid", "Type": "string"}]),
+        GLUE_PARAMS,
+    )
+    contract = _write_contract(workspace, _contract(AWS_BINDING, schema=schema, policy="strict"))
+
+    rc, event = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert (rc, event) == (0, None)
+    assert expose["status"] == "match"
+    assert expose["columns"] == []
+
+
+# ---------------------------------------------------------------------------
+# --last-applied: a change the contract made is pending, not drift
+# ---------------------------------------------------------------------------
+
+
+def _plan_file(root: Path, contract: Dict[str, Any]) -> Path:
+    """The shape ``fluid plan --out`` writes: the planned contract under ``contract``."""
+    path = root / "last-plan.json"
+    path.write_text(json.dumps({"format_version": 1, "contract": contract}), encoding="utf-8")
+    return path
+
+
+PLAN_TIER = {"name": "plan_tier", "type": "VARCHAR"}
+
+
+@pytest.mark.parametrize(
+    ("new_schema", "column", "reason"),
+    [
+        (SCHEMA + [PLAN_TIER], "plan_tier", "missing_in_target"),
+        ([c for c in SCHEMA if c["name"] != "status"], "status", "missing_in_contract"),
+        (
+            [dict(c, type="INTEGER") if c["name"] == "status" else c for c in SCHEMA],
+            "status",
+            "type_mismatch",
+        ),
+    ],
+    ids=["contract-added", "contract-removed", "contract-retyped"],
+)
+def test_a_contract_change_since_the_last_apply_is_pending_not_drift(
+    workspace, caplog, new_schema, column, reason
+):
+    _write_parquet(workspace / "out" / "customer_subscriptions.parquet", MATCHING_SELECT)
+    applied = _plan_file(workspace, _contract(LOCAL_BINDING, policy="strict"))
+    contract = _write_contract(
+        workspace, _contract(LOCAL_BINDING, schema=new_schema, policy="strict")
+    )
+
+    # Two-way, the contract is all there is to compare with: drift.
+    rc_two_way, _ = _invoke(["diff", str(contract), "--out", "two.json", "--exit-on-drift"])
+    with caplog.at_level(logging.DEBUG):
+        rc, event = _invoke(
+            [
+                "diff",
+                str(contract),
+                "--last-applied",
+                str(applied),
+                "--out",
+                "diff.json",
+                "--exit-on-drift",
+            ]
+        )
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert rc_two_way == 1
+    assert (rc, event) == (0, None), "the target is as the last apply left it"
+    assert expose["status"] == "pending"
+    assert expose["baseline"] == "last_applied"
+    assert [(c["column"], c["reason"], c["classification"]) for c in expose["columns"]] == [
+        (column, reason, "pending")
+    ]
+    assert "diff_live_changes_pending" in caplog.text
+
+
+def test_a_target_changed_since_the_last_apply_is_still_drift(workspace):
+    _write_parquet(
+        workspace / "out" / "customer_subscriptions.parquet",
+        f"SELECT *, 'x' AS added_by_hand FROM ({MATCHING_SELECT})",
+    )
+    doc = _contract(LOCAL_BINDING, schema=SCHEMA + [PLAN_TIER], policy="strict")
+    applied = _plan_file(workspace, _contract(LOCAL_BINDING, policy="strict"))
+    contract = _write_contract(workspace, doc)
+
+    rc, _ = _invoke(
+        [
+            "diff",
+            str(contract),
+            "--last-applied",
+            str(applied),
+            "--out",
+            "diff.json",
+            "--exit-on-drift",
+        ]
+    )
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert rc == 1
+    assert expose["status"] == "drift"
+    assert {c["column"]: c["classification"] for c in expose["columns"]} == {
+        "added_by_hand": "drift",
+        "plan_tier": "pending",
+    }
+
+
+def test_the_last_applied_policy_judges_what_builds_did_since(workspace):
+    """Builds since the last apply ran under its policy (evolve_safe), so a
+    column they included is not drift because the contract now says strict."""
+    _write_parquet(
+        workspace / "out" / "customer_subscriptions.parquet",
+        f"SELECT *, 'x' AS added FROM ({MATCHING_SELECT})",
+    )
+    applied = _plan_file(workspace, _contract(LOCAL_BINDING, policy="evolve_safe"))
+    contract = _write_contract(workspace, _contract(LOCAL_BINDING, policy="strict"))
+
+    rc, _ = _invoke(
+        [
+            "diff",
+            str(contract),
+            "--last-applied",
+            str(applied),
+            "--out",
+            "diff.json",
+            "--exit-on-drift",
+        ]
+    )
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert rc == 0
+    assert (expose["status"], expose["schema_policy"]) == ("evolved", "evolve_safe")
+
+
+def test_glue_contract_change_since_the_last_apply_is_pending(workspace, built_providers, glue):
+    glue.stubber.add_response("get_table", _glue_table(GLUE_COLUMNS), GLUE_PARAMS)
+    applied = _plan_file(workspace, _contract(AWS_BINDING))
+    contract = _write_contract(workspace, _contract(AWS_BINDING, schema=SCHEMA + [PLAN_TIER]))
+
+    rc, event = _invoke(
+        [
+            "diff",
+            str(contract),
+            "--last-applied",
+            str(applied),
+            "--out",
+            "diff.json",
+            "--exit-on-drift",
+        ]
+    )
+
+    assert (rc, event) == (0, None)
+    assert _report(workspace / "diff.json")["live"]["exposes"][0]["status"] == "pending"
+
+
+def test_a_missing_last_applied_is_the_first_run(workspace, caplog):
+    contract = _local_case(
+        workspace, f"SELECT *, 'x' AS extra FROM ({MATCHING_SELECT})", policy="strict"
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        rc, event = _invoke(
+            [
+                "diff",
+                str(contract),
+                "--last-applied",
+                str(workspace / "never-applied.json"),
+                "--out",
+                "diff.json",
+                "--exit-on-drift",
+            ]
+        )
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert (rc, event) == (1, None)
+    assert expose["baseline"] == "contract"
+    assert "diff_last_applied_not_found" in caplog.text
+
+
+def test_a_last_applied_file_with_no_contract_is_refused(workspace):
+    contract = _local_case(workspace, MATCHING_SELECT)
+    bogus = workspace / "bogus.json"
+    bogus.write_text(json.dumps({"results": []}), encoding="utf-8")
+
+    rc, event = _invoke(
+        [
+            "diff",
+            str(contract),
+            "--last-applied",
+            str(bogus),
+            "--out",
+            "diff.json",
+            "--exit-on-drift",
+        ]
+    )
+
+    assert (rc, event) == (2, "diff_last_applied_invalid")
+
+
+# ---------------------------------------------------------------------------
+# Where the cloud targets are read
+# ---------------------------------------------------------------------------
+
+
+def _no_region_aws() -> Dict[str, Any]:
+    binding = json.loads(json.dumps(AWS_BINDING))
+    del binding["location"]["region"]
+    return binding
+
+
+def test_glue_read_takes_aws_region_before_aws_default_region(
+    workspace, built_providers, glue, monkeypatch
+):
+    """The tofu AWS provider reads AWS_REGION first; boto3 reads only
+    AWS_DEFAULT_REGION, so the read went to another region than the apply."""
+    monkeypatch.setenv("AWS_REGION", "eu-north-1")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    glue.stubber.add_response("get_table", _glue_table(GLUE_COLUMNS), GLUE_PARAMS)
+    contract = _write_contract(workspace, _contract(_no_region_aws()))
+
+    rc, _ = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    assert rc == 0
+    assert glue.sessions == [{"region_name": "eu-north-1"}]
+    assert _report(workspace / "diff.json")["live"]["exposes"][0]["target"].endswith("(eu-north-1)")
+
+
+@pytest.fixture
+def no_gcp_project_env(monkeypatch):
+    for var in (
+        "GOOGLE_PROJECT",
+        "GOOGLE_CLOUD_PROJECT",
+        "GCLOUD_PROJECT",
+        "CLOUDSDK_CORE_PROJECT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _no_project_gcp() -> Dict[str, Any]:
+    binding = json.loads(json.dumps(GCP_BINDING))
+    del binding["location"]["project"]
+    return binding
+
+
+@pytest.mark.parametrize(
+    ("env", "argv_prefix", "project"),
+    [
+        ({"GOOGLE_PROJECT": "team-data-proj"}, [], "team-data-proj"),
+        ({}, ["--project", "team-data-proj"], "team-data-proj"),
+        ({"FLUID_PROJECT": "team-data-proj"}, [], "team-data-proj"),
+        ({"GOOGLE_CLOUD_PROJECT": "tofu-proj"}, ["--project", "plan-proj"], "tofu-proj"),
+    ],
+    ids=["GOOGLE_PROJECT", "--project", "FLUID_PROJECT", "env-before-flag"],
+)
+def test_bigquery_read_uses_the_project_apply_and_plan_use(
+    workspace, built_providers, bigquery, no_gcp_project_env, monkeypatch, env, argv_prefix, project
+):
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    contract = _write_contract(workspace, _contract(_no_project_gcp()))
+
+    _invoke([*argv_prefix, "diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    assert bigquery.requested == [f"{project}.demo_bronze.customer_subscriptions"]
+    assert bigquery.clients == [project]
+
+
+# ---------------------------------------------------------------------------
+# Types and formats the local reader must judge correctly
+# ---------------------------------------------------------------------------
+
+
+def test_a_local_column_retyped_into_a_type_the_family_table_lacks_is_drift(workspace):
+    """A list and an unsigned integer used to read as ``match``."""
+    contract = _local_case(
+        workspace,
+        f"SELECT * REPLACE ([status] AS status, CAST(1 AS UBIGINT) AS created_at) "
+        f"FROM ({MATCHING_SELECT})",
+    )
+
+    rc, _ = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert rc == 1
+    assert [(c["column"], c["reason"], c["target_type"]) for c in expose["columns"]] == [
+        ("created_at", "type_mismatch", "UBIGINT"),
+        ("status", "type_mismatch", "VARCHAR[]"),
+    ]
+
+
+def test_duckdb_spellings_of_a_declared_family_are_not_drift(workspace):
+    schema = SCHEMA + [
+        {"name": "n", "type": "integer"},
+        {"name": "tags", "type": "array<string>"},
+        {"name": "seen_at", "type": "TIMESTAMP"},
+    ]
+    contract = _write_contract(workspace, _contract(LOCAL_BINDING, schema=schema, policy="strict"))
+    _write_parquet(
+        workspace / "out" / "customer_subscriptions.parquet",
+        f"SELECT *, CAST(1 AS HUGEINT) AS n, ['a'] AS tags, "
+        f"CAST(TIMESTAMP '2026-01-01' AS TIMESTAMP_NS) AS seen_at FROM ({MATCHING_SELECT})",
+    )
+
+    rc, _ = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert rc == 0
+    assert expose["status"] == "match"
+
+
+@pytest.mark.parametrize("fmt", ["csv", "json"])
+def test_schema_less_files_compare_names_not_sniffed_types(workspace, fmt):
+    """DuckDB sniffs a VARCHAR column of digits back as BIGINT from CSV, and
+    date-like text back as DATE from CSV and JSON."""
+    path = workspace / "out" / f"customer_subscriptions.{fmt}"
+    binding = {"platform": "local", "format": fmt, "location": {"path": f"./out/{path.name}"}}
+    contract = _write_contract(workspace, _contract(binding, policy="strict"))
+    select = MATCHING_SELECT.replace("'c1'::VARCHAR", "'1001'::VARCHAR").replace(
+        "'active'::VARCHAR", "'2026-01-01'::VARCHAR"
+    )
+
+    import duckdb
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    options = "FORMAT 'csv', HEADER" if fmt == "csv" else "FORMAT 'json'"
+    con = duckdb.connect(":memory:")
+    con.execute(f"COPY ({select}) TO '{path.as_posix()}' ({options})")
+    rc_same, _ = _invoke(["diff", str(contract), "--out", "same.json", "--exit-on-drift"])
+    con.execute(f"COPY (SELECT *, 1 AS added FROM ({select})) TO '{path.as_posix()}' ({options})")
+    con.close()
+    rc_added, _ = _invoke(["diff", str(contract), "--out", "added.json", "--exit-on-drift"])
+
+    assert rc_same == 0
+    assert _report(workspace / "same.json")["live"]["exposes"][0]["status"] == "match"
+    assert rc_added == 1, "a column added to the file is still seen"
+    assert [
+        c["column"] for c in _report(workspace / "added.json")["live"]["exposes"][0]["columns"]
+    ] == ["added"]
+
+
+def test_a_duckdb_file_without_the_table_yet_is_to_be_created(workspace):
+    import duckdb
+
+    db = workspace / "warehouse.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE other_product AS SELECT 1 AS x")
+    con.close()
+    binding = {
+        "platform": "local",
+        "format": "parquet",
+        "location": {
+            "path": "./warehouse.duckdb",
+            "schema": "main",
+            "table": "customer_subscriptions",
+        },
+    }
+    contract = _write_contract(workspace, _contract(binding))
+
+    rc_absent, event = _invoke(["diff", str(contract), "--out", "absent.json", "--exit-on-drift"])
+    con = duckdb.connect(str(db))
+    con.execute(f"CREATE TABLE customer_subscriptions AS {MATCHING_SELECT}")
+    con.close()
+    rc_built, _ = _invoke(["diff", str(contract), "--out", "built.json", "--exit-on-drift"])
+
+    assert (rc_absent, event) == (0, None)
+    assert _report(workspace / "absent.json")["live"]["exposes"][0]["status"] == "absent"
+    assert rc_built == 0
+    assert _report(workspace / "built.json")["live"]["exposes"][0]["status"] == "match"
+
+
+# ---------------------------------------------------------------------------
+# Provider region and --state fallback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("env", "argv_prefix"),
+    [
+        ({}, ["--provider", "aws", "--region", "eu-north-1"]),
+        ({"FLUID_PROVIDER": "aws", "FLUID_REGION": "eu-north-1"}, []),
+    ],
+    ids=["global-flags", "FLUID_env"],
+)
+def test_an_explicit_provider_and_global_region_plan_and_compare(
+    workspace, glue, monkeypatch, env, argv_prefix
+):
+    """``main`` planned these; the diff sub-flag's default then dropped the
+    global region and the explicit provider skipped the binding's."""
+    monkeypatch.setenv("AWS_ACCOUNT_ID", "123456789012")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    glue.stubber.add_response("get_table", _glue_table(GLUE_COLUMNS), GLUE_PARAMS)
+    contract = _write_contract(workspace, _contract(AWS_BINDING, sovereignty=SOVEREIGNTY))
+
+    rc, event = _invoke(
+        [*argv_prefix, "diff", str(contract), "--out", "diff.json", "--exit-on-drift"]
+    )
+
+    assert (rc, event) == (0, None)
+    assert _report(workspace / "diff.json")["live"]["exposes"][0]["status"] == "match"
+
+
+def test_provider_region_precedence(workspace, built_providers, glue):
+    """diff --region, then the binding's (even with --provider), then the
+    global --region / FLUID_REGION; the global built-in default (a GCP region)
+    never reaches another cloud's provider."""
+    from fluid_build.cli import build_parser
+
+    aws_dir, bare_dir = workspace / "aws", workspace / "bare"
+    aws_dir.mkdir()
+    bare_dir.mkdir()
+    aws = _write_contract(aws_dir, _contract(AWS_BINDING))
+    bare = _write_contract(bare_dir, _contract(_no_region_aws()))
+    for _ in range(4):
+        glue.stubber.add_response("get_table", _glue_table(GLUE_COLUMNS), GLUE_PARAMS)
+
+    def _region(argv: List[str]) -> Optional[str]:
+        before = len(built_providers)
+        _invoke(argv)
+        assert len(built_providers) == before + 1
+        return built_providers[-1]["region"]
+
+    assert _region(["--provider", "aws", "diff", str(aws), "--out", "a.json"]) == "eu-north-1"
+    assert (
+        _region(
+            [
+                "--region",
+                "eu-west-1",
+                "diff",
+                str(aws),
+                "--region",
+                "eu-central-1",
+                "--out",
+                "b.json",
+            ]
+        )
+        == "eu-central-1"
+    )
+    assert build_parser().parse_args(["--region", "eu-west-1", "diff", "x.yaml"]).region == (
+        "eu-west-1"
+    )
+    assert _region(["--region", "eu-west-1", "diff", str(bare), "--out", "c.json"]) == "eu-west-1"
+    assert _region(["diff", str(bare), "--out", "d.json"]) is None
+
+
+def test_a_missing_state_file_falls_back_to_the_live_comparison(workspace, caplog):
+    contract = _local_case(
+        workspace, f"SELECT *, 'x' AS extra FROM ({MATCHING_SELECT})", policy="strict"
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        rc, event = _invoke(
+            [
+                "diff",
+                str(contract),
+                "--state",
+                str(workspace / "runtime" / "apply-report.json"),
+                "--out",
+                "diff.json",
+                "--exit-on-drift",
+            ]
+        )
+
+    report = _report(workspace / "diff.json")
+    assert (rc, event) == (1, None), "live drift, not a missing-file error"
+    assert report["drift_source"] == "live"
+    assert "diff_state_not_found" in caplog.text
