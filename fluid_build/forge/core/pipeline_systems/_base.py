@@ -147,13 +147,14 @@ def _needs_bundle(stage: int) -> str:
     )
 
 
-def _skip_after_dry_run(stage: int) -> str:
+def _skip_after_dry_run(stage: int, what: str) -> str:
     """POSIX sh (after ``MODE`` is set): end the stage when stage 7 ran as a
-    dry run, which applied nothing for the stage to check."""
+    dry run. A dry-run build writes nothing: not the target, the catalog or
+    the scheduler (whose DAG would apply for real)."""
     return (
         'if [ "$MODE" = dry-run ] && [ "${RUN_STAGE_7_APPLY:-true}" = "true" ]; then '
-        f'echo "stage {stage}: APPLY_MODE dry-run applied nothing, so there is nothing to '
-        'verify — skipped (set APPLY_MODE to amend or amend-and-build to apply and verify)"; '
+        f'echo "stage {stage}: APPLY_MODE dry-run applied nothing, so {what} — skipped '
+        '(APPLY_MODE amend or amend-and-build applies)"; '
         "exit 0; fi; "
     )
 
@@ -1129,7 +1130,7 @@ class BasePipelineTemplate:
                 # applied, so after a dry run (nothing applied) it is skipped.
                 command=(
                     f'set -eu; MODE="{p("APPLY_MODE")}"; '
-                    f"{_skip_after_dry_run(9)}{_needs_bundle(9)}"
+                    f"{_skip_after_dry_run(9, 'there is nothing to verify')}{_needs_bundle(9)}"
                     f"fluid verify {BUNDLE_PATH} --strict "
                     f"{env} --out runtime/verify-report.json"
                 ),
@@ -1144,13 +1145,19 @@ class BasePipelineTemplate:
                 # becomes ONE ``--target=<word>`` argv token (``set -f`` so a
                 # word is never a glob). The legacy single-target
                 # ``CATALOG`` variable is still read when it is unset.
+                # A word may not carry an endpoint (``name:https://...``): the
+                # runner's catalog credential would go to whatever it names.
+                # After a dry-run apply there is nothing applied to publish.
                 command=(
-                    "set -eu; mkdir -p runtime; "
+                    f'set -eu; MODE="{p("APPLY_MODE")}"; '
+                    f"{_skip_after_dry_run(10, 'there is no applied product to publish')}"
+                    "mkdir -p runtime; "
                     f'set -- "{p("CONTRACT")}" {env} --format json; '
                     "set -f; for t in ${PUBLISH_TARGETS:-${CATALOG:-"
                     f'{d["PUBLISH_TARGETS"]}'
-                    '}}; do set -- "$@" "--target=$t"; done; set +f; '
-                    'fluid publish "$@"'
+                    '}}; do case "$t" in *:*) echo "PUBLISH_TARGETS names catalogs, '
+                    'not endpoints" >&2; exit 2 ;; esac; set -- "$@" "--target=$t"; done; '
+                    'set +f; fluid publish "$@"'
                 ),
             ),
             StageSpec(
@@ -1166,7 +1173,8 @@ class BasePipelineTemplate:
                 # as stage 7 so empty params never reach argv. This is
                 # the security-hardened Jenkins stage-11 pattern.
                 command=(
-                    "set -eu; "
+                    f'set -eu; MODE="{p("APPLY_MODE")}"; '
+                    f"{_skip_after_dry_run(11, 'there is no applied product to schedule')}"
                     f'SCHEDULER_V="{p("SCHEDULER")}"; '
                     'if [ -z "$SCHEDULER_V" ]; then echo "SCHEDULER is blank: '
                     'no scheduler to sync to — skipping stage 11"; exit 0; fi; '

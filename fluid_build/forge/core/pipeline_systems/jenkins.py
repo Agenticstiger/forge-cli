@@ -482,6 +482,17 @@ class JenkinsTemplate(BasePipelineTemplate):
             f'[ "{v("RUN_STAGE_7_APPLY")}" = "true" ] && [ "{v("APPLY_MODE")}" = "dry-run" ]'
         )
 
+        def skip_after_dry_run(stage: int, what: str) -> List[str]:
+            # A dry-run build writes nothing: not the target, not the grants,
+            # not the catalog, not the scheduler (whose DAG would apply for real).
+            return [
+                f"if {dry_run_applied}; then",
+                f'  echo "stage {stage}: stage 7 ran as a dry run and applied nothing, so '
+                f'{what} — skipped (APPLY_MODE amend or amend-and-build applies)"',
+                "  exit 0",
+                "fi",
+            ]
+
         def when(num: int, extra: str = "") -> str:
             toggle_name = {spec.num: spec.toggle_param for spec in self._stage_specs(config)}[num]
             expression = _when_on(P[toggle_name])
@@ -746,11 +757,7 @@ EOM
         )
         stage9 = _sh_step(
             [
-                f"if {dry_run_applied}; then",
-                '  echo "stage 9: stage 7 ran as a dry run and applied nothing, so there is '
-                'nothing to verify — skipped (APPLY_MODE amend or amend-and-build applies)"',
-                "  exit 0",
-                "fi",
+                *skip_after_dry_run(9, "there is nothing to verify"),
                 "mkdir -p runtime",
                 _needs_bundle(9),
                 f"set -- {BUNDLE_PATH} {env_flag} --out runtime/verify-report.json",
@@ -762,13 +769,20 @@ EOM
         publish_env = f" {env_flag}" if config.publish_include_env else ""
         stage10 = _sh_step(
             [
+                *skip_after_dry_run(10, "there is no applied product to publish"),
                 "mkdir -p runtime",
                 f'set -- "{v("CONTRACT")}"{publish_env} --format json',
                 # PUBLISH_TARGETS is a space-separated list: each word is ONE
                 # `--target=<word>` argument, and `set -f` keeps a word from
-                # being a glob.
+                # being a glob. A word may not carry an endpoint
+                # (`name:https://...`): the agent's catalog credential
+                # (FLUID_API_KEY...) would go to whatever the parameter names.
                 "set -f",
-                f'for t in {v("PUBLISH_TARGETS")}; do set -- "$@" "--target=$t"; done',
+                f"for t in {v('PUBLISH_TARGETS')}; do",
+                '  case "$t" in *:*) echo "PUBLISH_TARGETS names catalogs, not endpoints: '
+                'set the endpoint on the agent (FLUID_CC_ENDPOINT...)" >&2; exit 2 ;; esac',
+                '  set -- "$@" "--target=$t"',
+                "done",
                 "set +f",
                 "rc=0",
                 'fluid publish "$@" > runtime/publish-report.json || rc=$?',
@@ -779,6 +793,7 @@ EOM
         )
         stage11 = _sh_step(
             [
+                *skip_after_dry_run(11, "there is no applied product to schedule"),
                 f'SCHEDULER_V="{v("SCHEDULER")}"',
                 'if [ -z "$SCHEDULER_V" ]; then',
                 '  echo "SCHEDULER is blank: no scheduler to sync to — skipping stage 11"',

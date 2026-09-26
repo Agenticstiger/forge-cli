@@ -417,9 +417,8 @@ def test_stage_10_publishes_json_to_the_registered_target_with_the_env():
         'set -- "${CONTRACT:-contract.fluid.yaml}" --env "${FLUID_ENV:-dev}" --format json'
         in stage10
     )
-    assert 'for t in ${PUBLISH_TARGETS:-fluid-command-center}; do set -- "$@" "--target=$t"' in (
-        stage10
-    )
+    assert "for t in ${PUBLISH_TARGETS:-fluid-command-center}; do" in stage10
+    assert 'set -- "$@" "--target=$t"' in stage10
     assert "command-center" not in stage10.replace("fluid-command-center", "")
     for var in ("FLUID_CC_ENDPOINT", "FLUID_API_KEY", "FLUID_CC_ORG_ID"):
         assert var in content[: content.index("pipeline {")], var
@@ -479,27 +478,68 @@ def test_a_relative_or_unsafe_scheduler_destination_default_is_refused(repo, mon
 # ── stages 8 and 9 after a dry run ────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    ("mode", "fluid_called"), [(None, False), ("dry-run", False), ("amend", True)]
-)
-def test_stage_9_verifies_only_an_apply_that_changed_something(tmp_path, mode, fluid_called):
-    stage9 = _stage(_jenkinsfile(), "9 - verify")
-    (body,) = _sh_bodies(stage9)
+def _run_stage_body(tmp_path: Path, label: str, env: Dict[str, str], **options: object):
+    """Run a stage's one ``sh`` body with a recording ``fluid`` stub."""
+    (body,) = _sh_bodies(_stage(_jenkinsfile(**options), label))
     stub = tmp_path / "bin"
-    stub.mkdir()
+    stub.mkdir(exist_ok=True)
     log = tmp_path / "called"
+    log.unlink(missing_ok=True)
     fluid = stub / "fluid"
     fluid.write_text(f"#!/bin/sh\necho \"$@\" > '{log}'\n", encoding="utf-8")
     fluid.chmod(fluid.stat().st_mode | stat.S_IXUSR)
-    (tmp_path / "runtime").mkdir()
+    (tmp_path / "runtime").mkdir(exist_ok=True)
     (tmp_path / "runtime" / "bundle.tgz").write_bytes(b"")
-    env = {"PATH": f"{stub}{os.pathsep}{os.environ['PATH']}"}
-    if mode:
-        env["APPLY_MODE"] = mode
-    subprocess.run(["sh", "-c", body], cwd=tmp_path, env=env, check=True)
-    assert log.exists() is fluid_called
-    if fluid_called:
-        assert log.read_text().split()[:2] == ["verify", "runtime/bundle.tgz"]
+    (tmp_path / "dist" / "artifacts" / "schedule" / "p").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "dist" / "artifacts" / "schedule" / "p" / "b_dag.py").write_text("")
+    proc = subprocess.run(
+        ["sh", "-c", body],
+        cwd=tmp_path,
+        env={"PATH": f"{stub}{os.pathsep}{os.environ['PATH']}", **env},
+        capture_output=True,
+        text=True,
+    )
+    return proc, (log.read_text().split() if log.exists() else None)
+
+
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        ("9 - verify", "verify"),
+        ("10 - publish", "publish"),
+        ("11 - schedule sync", "schedule-sync"),
+    ],
+)
+@pytest.mark.parametrize(("mode", "runs"), [(None, False), ("dry-run", False), ("amend", True)])
+def test_stages_9_to_11_act_only_on_an_apply_that_changed_something(
+    tmp_path, label, command, mode, runs
+):
+    """A dry-run build writes nothing: no verify of an apply that did not
+    happen, no catalog entry for it, no DAG that would apply it for real."""
+    env = {"APPLY_MODE": mode} if mode else {}
+    proc, argv = _run_stage_body(tmp_path, label, env, scheduler_default="airflow")
+    assert proc.returncode == 0, proc.stderr
+    assert (argv is not None) is runs
+    if runs:
+        assert argv[0] == command
+    else:
+        assert "applied nothing" in proc.stdout
+
+
+def test_a_publish_target_cannot_carry_an_endpoint(tmp_path):
+    """``name:endpoint`` would send the agent's catalog credential to whatever
+    a Build with Parameters user names."""
+    proc, argv = _run_stage_body(
+        tmp_path,
+        "10 - publish",
+        {
+            "APPLY_MODE": "amend",
+            "PUBLISH_TARGETS": "datahub fluid-command-center:https://evil.test",
+        },
+    )
+    assert proc.returncode == 2
+    assert argv is None
+    assert "names catalogs, not endpoints" in proc.stderr
 
 
 def test_stage_8_checks_rather_than_enforces_after_a_dry_run(tmp_path):
