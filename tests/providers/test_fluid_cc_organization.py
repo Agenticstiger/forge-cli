@@ -801,3 +801,51 @@ class TestJsonResults:
         lookups = [r for r in cc_stub.requests if r["path"] == "/api/v1/assets"]
         assert lookups
         assert all(r["headers"].get("x-organization-id") == ORG_A["id"] for r in lookups)
+
+
+# ---------------------------------------------------------------------------
+# An organization named by its slug (a committed per-product config)
+# ---------------------------------------------------------------------------
+
+
+class TestOrganizationBySlug:
+    def test_the_slug_picks_its_organization_among_several(self, cc_stub):
+        cc_stub.organizations = [ORG_A, ORG_B]
+
+        result = asyncio.run(_provider(cc_stub, organization="globex").publish(_asset()))
+
+        assert result.success, result.error
+        assert result.details["organization_id"] == ORG_B["id"]
+        (post,) = cc_stub.posts()
+        assert post["headers"]["x-organization-id"] == ORG_B["id"]
+
+    def test_a_slug_no_organization_carries_writes_nothing(self, cc_stub):
+        # Even with a single organization: a typo must not fall back to it.
+        cc_stub.organizations = [ORG_A]
+
+        result = asyncio.run(_provider(cc_stub, organization="acme-typo").publish(_asset()))
+
+        assert not result.success
+        assert result.details["error_code"] == "cc_organization_unresolved"
+        assert "acme-typo" in result.error
+        assert cc_stub.posts() == []
+
+    def test_an_id_wins_over_the_slug(self, cc_stub, monkeypatch):
+        cc_stub.organizations = [ORG_A, ORG_B]
+        monkeypatch.setenv("FLUID_CC_ORG_ID", ORG_A["id"])
+
+        result = asyncio.run(_provider(cc_stub, organization="globex").publish(_asset()))
+
+        assert result.success, result.error
+        assert result.details["organization_id"] == ORG_A["id"]
+        assert "/api/v1/organizations" not in cc_stub.paths()
+
+    def test_a_blank_env_id_still_refuses_before_the_slug(self, cc_stub, monkeypatch):
+        cc_stub.organizations = [ORG_A, ORG_B]
+        monkeypatch.setenv("FLUID_CC_ORG_ID", "  ")
+
+        result = asyncio.run(_provider(cc_stub, organization="globex").publish(_asset()))
+
+        assert not result.success
+        assert result.details["error_code"] == "cc_organization_id_blank"
+        assert cc_stub.posts() == []
