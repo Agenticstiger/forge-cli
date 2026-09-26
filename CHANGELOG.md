@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.4] — 2026-09-27
+
+A local data path that names its directory through an environment variable now
+means the same file for every stage. Checked by running the generated
+pipeline's stage commands for two chained products against a seeded Postgres,
+with the fix and without it.
+
+### Fixed
+
+- **`fluid verify` and `fluid diff` find a local file whose path uses
+  `{{ env.NAME }}`** (#661). The build runner resolved the placeholder before it
+  wrote, but the readers anchored the raw template, so stage 9 reported
+  `Output file not found: <contract dir>/{{ env.NAME }}/...` for a file stage 7
+  had just landed, and the drift gate called an existing table absent. This is
+  how two products in separate CI workspaces share a landed file (a shared data
+  directory named by a variable), so a chained downstream product's pipeline
+  failed at stage 9 and never published. The readers now resolve exactly as the
+  writer does, with one shared placeholder pattern.
+
 ## [0.16.3] — 2026-09-26
 
 The generated 11-stage pipeline now runs as generated and its gates check what
@@ -3530,7 +3549,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.3...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.4...HEAD
+[0.16.4]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.0...v0.16.1
