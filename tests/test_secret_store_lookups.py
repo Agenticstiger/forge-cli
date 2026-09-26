@@ -268,12 +268,13 @@ class TestResolverAsksEachStoreOnce:
         assert fake.secret_ids == ["snowflake/oauth_token"]
 
     def test_a_vault_store_is_asked_once_per_key(self, aws_region_only, monkeypatch):
-        from fluid_build.secrets import SecretConfig, SecretManager, SecretSource
+        SecretConfig = secrets_mod.SecretConfig
+        SecretSource = secrets_mod.SecretSource
 
         asked: List[str] = []
         in_vault = "snowflake/role"
 
-        class _VaultManager(SecretManager):
+        class _VaultManager(secrets_mod.SecretManager):
             def _retrieve_secret(self, secret_name: str) -> Optional[str]:
                 asked.append(secret_name)
                 return "from-vault" if secret_name == in_vault else None
