@@ -116,7 +116,7 @@ class TektonTemplate(BasePipelineTemplate):
         pipeline_tasks: List[Dict[str, Any]] = [
             {"name": "setup", "taskRef": {"name": "fluid-setup"}}
         ]
-        for i, spec in enumerate(self._stage_specs()):
+        for i, spec in enumerate(self._stage_specs(config)):
             task_name = f"fluid-stage-{spec.num}-{spec.slug.replace('_', '-')}"
             body = self._render_stage_command(spec, config)
             stage_tasks.append(
@@ -302,7 +302,7 @@ class TektonTemplate(BasePipelineTemplate):
                     )
             return files
 
-        commands = self._get_fluid_commands()
+        commands = self._get_fluid_commands(config)
         # Engine specs registry — per-engine pip extras + env vars
         # spliced into each Tekton Task's install script + step env.
         engine_pip = self._engine_pip_install_command(config)

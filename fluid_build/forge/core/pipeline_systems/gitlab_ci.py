@@ -84,7 +84,7 @@ class GitLabCITemplate(BasePipelineTemplate):
             variables[name] = default
 
         # Stages list — 1 setup stage + 11 pipeline stages.
-        stages = ["setup"] + [f"stage-{spec.num}" for spec in self._stage_specs()]
+        stages = ["setup"] + [f"stage-{spec.num}" for spec in self._stage_specs(config)]
 
         jobs: Dict[str, Any] = {}
 
@@ -101,7 +101,7 @@ class GitLabCITemplate(BasePipelineTemplate):
         }
 
         # 11 stage jobs
-        for spec in self._stage_specs():
+        for spec in self._stage_specs(config):
             body = self._render_stage_command(spec, config)
             rule_expr = (
                 f'$({spec.toggle_param}) == "true"'
@@ -139,7 +139,7 @@ class GitLabCITemplate(BasePipelineTemplate):
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate GitLab CI pipeline"""
 
-        commands = self._get_fluid_commands()
+        commands = self._get_fluid_commands(config)
         env_vars = self._get_common_environment_vars()
         # Engine specs registry — merge per-engine env vars (e.g.
         # AIRBYTE_PROJECT_DIR for engine='airbyte') so they reach every

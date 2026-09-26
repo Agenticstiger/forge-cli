@@ -115,7 +115,7 @@ class CircleCITemplate(BasePipelineTemplate):
                 "steps": ["checkout", {"run": {"command": setup_script}}],
             }
         }
-        for spec in self._stage_specs():
+        for spec in self._stage_specs(config):
             body = self._render_stage_command(spec, config)
             jobs[f"stage_{spec.num}_{spec.slug}"] = {
                 "docker": [{"image": "cimg/python:3.12"}],
@@ -136,7 +136,7 @@ class CircleCITemplate(BasePipelineTemplate):
         # Workflow with stage toggles as `when:` clauses
         workflow_jobs: List[Any] = ["setup"]
         prev_job = "setup"
-        for spec in self._stage_specs():
+        for spec in self._stage_specs(config):
             job_key = f"stage_{spec.num}_{spec.slug}"
             when_expr = f"<<pipeline.parameters.{spec.toggle_param.lower()}>>"
             if spec.num == 11:
@@ -187,7 +187,7 @@ class CircleCITemplate(BasePipelineTemplate):
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate CircleCI pipeline"""
 
-        commands = self._get_fluid_commands()
+        commands = self._get_fluid_commands(config)
         # Engine specs registry — splice per-engine pip extras into the
         # install step so every CircleCI job picks them up. Each job is
         # isolated (no shared state across CircleCI jobs), so the install

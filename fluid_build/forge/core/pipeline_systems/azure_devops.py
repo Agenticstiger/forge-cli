@@ -119,7 +119,7 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
         }
 
         stages: List[Dict[str, Any]] = [setup_stage]
-        for spec in self._stage_specs():
+        for spec in self._stage_specs(config):
             body = self._render_stage_command(spec, config)
             condition = f"eq(variables['{spec.toggle_param}'], 'true')"
             if spec.num == 11:
@@ -139,7 +139,7 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                         "Setup"
                         if spec.num == 1
                         else (
-                            f"Stage{spec.num - 1}{''.join(w.title() for w in self._stage_specs()[spec.num - 2].slug.split('_'))}"
+                            f"Stage{spec.num - 1}{''.join(w.title() for w in self._stage_specs(config)[spec.num - 2].slug.split('_'))}"
                         )
                     ),
                     "jobs": [
@@ -188,7 +188,7 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate Azure DevOps pipeline"""
 
-        commands = self._get_fluid_commands()
+        commands = self._get_fluid_commands(config)
         # Engine specs registry — per-engine pip extras + env vars,
         # consumed by every Azure DevOps job's install + variable blocks.
         engine_pip = self._engine_pip_install_command(config)

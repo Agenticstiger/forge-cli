@@ -87,6 +87,9 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             "FLUID_ENV",
             "APPLY_MODE",
             "APPLY_BUILD_ID",
+            # Stages 8 and 9 read it: after a dry-run apply there is nothing
+            # to enforce or verify.
+            "RUN_STAGE_7_APPLY",
             "ALLOW_DATA_LOSS",
             "NO_VERIFY_DIGEST",
             "PUBLISH_TARGETS",
@@ -145,7 +148,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                 "shell": "bash",
             },
         ]
-        for spec in self._stage_specs():
+        for spec in self._stage_specs(config):
             stage_body = self._render_stage_command(spec, config)
             step: Dict[str, Any] = {
                 "name": f"{spec.num} \u00b7 {spec.display}",
@@ -207,7 +210,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
     def _generate_basic_workflow(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate basic GitHub Actions workflow"""
 
-        commands = self._get_fluid_commands()
+        commands = self._get_fluid_commands(config)
         env_vars = self._get_common_environment_vars()
         # Engine specs registry — per-engine pip extras + runtime env
         # vars sourced from ``_engine_specs.py`` so adding a new engine
@@ -292,7 +295,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
     def _generate_standard_workflow(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate standard GitHub Actions workflow with multiple environments"""
 
-        commands = self._get_fluid_commands()
+        commands = self._get_fluid_commands(config)
         env_vars = self._get_common_environment_vars()
         env_vars.update(self._engine_runtime_env_vars(config))
         _install_cmd = self._install_command(config)
