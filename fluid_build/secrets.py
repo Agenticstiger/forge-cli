@@ -28,6 +28,7 @@ Secrets are cached in memory for the duration of the process.
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Optional
@@ -35,6 +36,12 @@ from typing import Any, Dict, Optional
 from .errors import AuthenticationError, ConfigurationError
 
 logger = logging.getLogger(__name__)
+
+# How long a SecretManager stops asking AWS Secrets Manager after AWS reported
+# no credentials at all. Borrowed from aws-secretsmanager-caching, which also
+# remembers a failed fetch and skips retrying until a delay passes: one CLI run
+# makes one attempt and one warning, and a long-lived process still retries.
+_AWS_NO_CREDENTIALS_BACKOFF_S = 300.0
 
 
 class SecretSource(Enum):
@@ -76,6 +83,11 @@ class SecretManager:
         self.config = config or SecretConfig(source=SecretSource.ENV)
         self._cache: Dict[str, str] = {}
         self._initialized = False
+        # Set when AWS reports it has no credentials at all. That is a fact
+        # about the process, not about one secret, so lookups before this
+        # monotonic deadline skip AWS instead of failing (and warning) once per
+        # secret name.
+        self._aws_skip_until = 0.0
 
     def get_secret(self, secret_name: str, required: bool = True) -> Optional[str]:
         """
@@ -171,9 +183,12 @@ class SecretManager:
 
     def _get_from_aws(self, secret_name: str) -> Optional[str]:
         """Get secret from AWS Secrets Manager"""
+        if time.monotonic() < self._aws_skip_until:
+            return None
+
         try:
             import boto3
-            from botocore.exceptions import ClientError
+            from botocore.exceptions import ClientError, NoCredentialsError
         except ImportError:
             raise ConfigurationError(
                 "AWS Secrets Manager requires boto3 package", suggestions=["pip install boto3"]
@@ -207,6 +222,15 @@ class SecretManager:
                 raise AuthenticationError(
                     f"Failed to access AWS Secrets Manager: {e}", original_error=e
                 )
+        except NoCredentialsError as e:
+            self._aws_skip_until = time.monotonic() + _AWS_NO_CREDENTIALS_BACKOFF_S
+            logger.warning(
+                "Failed to retrieve secret from AWS: %s. Not asking AWS Secrets Manager "
+                "again for %d seconds.",
+                e,
+                int(_AWS_NO_CREDENTIALS_BACKOFF_S),
+            )
+            return None
         except Exception as e:
             logger.warning(f"Failed to retrieve secret from AWS: {e}")
             return None
