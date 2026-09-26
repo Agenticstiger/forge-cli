@@ -388,14 +388,21 @@ class BaseCredentialResolver(ABC):
         """
         try:
             from ..errors import AuthenticationError, ConfigurationError
-            from ..secrets import get_secret
+            from ..secrets import SecretSource, get_secret_manager
         except ImportError:
             logger.debug("secrets backend unavailable, skipping Vault")
             return None
 
         secret_name = f"{self.provider}/{key}"
         try:
-            return get_secret(secret_name, required=False)
+            manager = get_secret_manager()
+            # ``get_secret_manager`` picks ONE store for the process. Unless it
+            # picked Vault, this step would repeat, verbatim, the lookup that
+            # ``_get_from_secret_manager`` makes against the same manager next,
+            # which is how every missing key cost two AWS Secrets Manager calls.
+            if manager is None or manager.config.source is not SecretSource.HASHICORP_VAULT:
+                return None
+            return manager.get_secret(secret_name, required=False)
         except (ConfigurationError, AuthenticationError, OSError) as e:
             logger.debug("Failed to read from Vault: %s", e)
             return None
@@ -410,7 +417,7 @@ class BaseCredentialResolver(ABC):
         """
         try:
             from ..errors import AuthenticationError, ConfigurationError
-            from ..secrets import get_secret_manager
+            from ..secrets import SecretSource, get_secret_manager
         except ImportError:
             logger.debug("secrets backend unavailable, skipping secret manager")
             return None
@@ -418,7 +425,8 @@ class BaseCredentialResolver(ABC):
         secret_name = f"{self.provider}/{key}"
         try:
             manager = get_secret_manager()
-            if manager is None:
+            # A Vault-backed manager was already asked by ``_get_from_vault``.
+            if manager is None or manager.config.source is SecretSource.HASHICORP_VAULT:
                 return None
             return manager.get_secret(secret_name, required=False)
         except (ConfigurationError, AuthenticationError, OSError) as e:

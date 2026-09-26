@@ -71,10 +71,14 @@ except Exception:  # pragma: no cover — defensive
     build_registrar_backed_provider = None  # type: ignore[assignment]
 
 
-# Native async providers (hand-wired — they don't fit the registrar shape)
+# Native async providers (hand-wired — they don't fit the registrar shape).
+# ``command-center`` is the name the ``fluid publish --target`` help and the
+# generated CI pipelines advertise; it is an alias, not a second catalog. Keep
+# these keys in step with ``config_manager.COMMAND_CENTER_CATALOG_NAMES``.
 CATALOG_PROVIDERS = {
     "fluid-command-center": FluidCommandCenterProvider,
     "fluid_cc": FluidCommandCenterProvider,
+    "command-center": FluidCommandCenterProvider,
 }
 
 # Auto-register every plug-in backend declared via register_catalog_backend.

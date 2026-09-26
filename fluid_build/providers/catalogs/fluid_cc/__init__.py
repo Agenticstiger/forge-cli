@@ -14,6 +14,6 @@
 
 """FLUID Command Center catalog provider"""
 
-from .provider import FluidCommandCenterProvider
+from .provider import CommandCenterOrganizationError, FluidCommandCenterProvider
 
-__all__ = ["FluidCommandCenterProvider"]
+__all__ = ["CommandCenterOrganizationError", "FluidCommandCenterProvider"]

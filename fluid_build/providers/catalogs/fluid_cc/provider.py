@@ -21,16 +21,82 @@ Includes:
 - Health checking before operations
 - Upsert logic (create or update)
 - Comprehensive error handling
+- Organization scoping (the ``X-Organization-Id`` header on every request)
 """
 
 import asyncio
+import os
+import re
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
+from fluid_build.errors import ConfigurationError
+
 from ...common import CircuitBreaker, get_auth_headers, metrics_collector
 from ..base import BaseCatalogProvider, CatalogAsset, PublishResult
+
+#: Header the Command Center reads the caller's organization from. Its asset
+#: create route refuses a request without it (400), because an asset belongs to
+#: exactly one organization and the server will not guess which.
+ORG_HEADER = "X-Organization-Id"
+
+#: Environment variable that names the organization id to publish into. It sits
+#: next to ``FLUID_CC_ENDPOINT`` and ``FLUID_API_KEY``; ``config_manager`` maps it
+#: onto the ``organization_id`` key of the catalog config.
+ORG_ID_ENV = "FLUID_CC_ORG_ID"
+
+# An organization id is sent verbatim as a header value, so it must be one
+# token of visible ASCII: no whitespace, no control characters (CR/LF would be
+# header injection), nothing a proxy could re-encode. The Command Center's ids
+# are UUID strings, well inside this. Matched with ``fullmatch``: a ``$``
+# anchor would accept a trailing newline.
+_ORG_ID_RE = re.compile(r"[\x21-\x7e]{1,128}")
+
+# Organization slugs and names come from the server and end up in log lines and
+# terminal output. ``_display`` drops anything that is not printable, so a name
+# cannot carry a newline or an escape sequence into either, and caps the length.
+_DISPLAY_MAX = 100
+
+
+class CommandCenterOrganizationError(ConfigurationError):
+    """The Command Center organization to publish into could not be settled.
+
+    Raised when no organization id is configured and the caller's credential
+    belongs to zero organizations or to more than one, when the organization
+    list cannot be read, or when a configured id is not a single header-safe
+    token. ``organizations`` carries what the Command Center returned
+    (``id``, ``slug``, ``name`` per entry) so a caller can render the choice.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        organizations: Optional[List[Dict[str, str]]] = None,
+        original_error: Optional[Exception] = None,
+    ) -> None:
+        self.organizations: List[Dict[str, str]] = list(organizations or [])
+        super().__init__(
+            message,
+            context={"organizations": self.organizations},
+            original_error=original_error,
+            suggestions=[
+                f"export {ORG_ID_ENV}=<organization id>",
+                "or set catalogs.fluid-command-center.organization_id in the FLUID config",
+            ],
+        )
+
+
+def _is_valid_org_id(value: str) -> bool:
+    return _ORG_ID_RE.fullmatch(value) is not None
+
+
+def _display(value: Any) -> str:
+    """A server-supplied label, reduced to printable characters for output."""
+    text = "".join(ch for ch in str(value or "") if ch.isprintable())
+    return text[:_DISPLAY_MAX]
 
 
 class FluidCommandCenterProvider(BaseCatalogProvider):
@@ -53,6 +119,158 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
             failure_threshold=config.get("circuit_breaker_threshold", 3),
             recovery_timeout=config.get("circuit_breaker_timeout", 60),
             expected_exception=httpx.HTTPError,
+        )
+
+        # Organization to scope every request to. Config wins over the env var
+        # here only because ``config_manager`` has already folded the env var
+        # into ``organization_id`` (env over file); the env fallback covers a
+        # provider built from a bare dict. Validated lazily, in
+        # ``resolve_organization_id``, so a bad value becomes a failed
+        # PublishResult rather than a crash while building the provider. A blank
+        # value (an empty CI parameter) counts as not set.
+        configured = config.get("organization_id") or os.environ.get(ORG_ID_ENV)
+        self._configured_org_id: Optional[str] = (
+            (str(configured).strip() or None) if configured else None
+        )
+        self._organization_id: Optional[str] = None
+
+    def _headers(self) -> Dict[str, str]:
+        """Auth headers plus ``X-Organization-Id`` once the organization is known."""
+        headers = get_auth_headers(self.endpoint, self.auth)
+        org_id = self._organization_id
+        if org_id is None and self._configured_org_id and _is_valid_org_id(self._configured_org_id):
+            org_id = self._configured_org_id
+        if org_id:
+            headers[ORG_HEADER] = org_id
+        return headers
+
+    async def resolve_organization_id(self) -> str:
+        """Settle which Command Center organization this provider writes into.
+
+        Order: ``organization_id`` in the catalog config, then
+        ``FLUID_CC_ORG_ID``; otherwise ask the Command Center which
+        organizations the credential belongs to (``GET /api/v1/organizations``)
+        and use the only one. Zero or several is a
+        :class:`CommandCenterOrganizationError` naming the slugs and ids, since
+        picking one silently could put the asset in the wrong tenant. The
+        answer is cached for the life of the provider.
+        """
+        if self._organization_id is not None:
+            return self._organization_id
+
+        if self._configured_org_id is not None:
+            if not _is_valid_org_id(self._configured_org_id):
+                raise CommandCenterOrganizationError(
+                    "The configured Command Center organization id is not a single "
+                    "token of visible ASCII (no spaces or control characters); "
+                    f"check {ORG_ID_ENV} or catalogs.fluid-command-center.organization_id."
+                )
+            self._organization_id = self._configured_org_id
+            return self._organization_id
+
+        organizations = await self._list_organizations()
+        if len(organizations) == 1:
+            only = organizations[0]
+            self.logger.info(
+                "Publishing into Command Center organization %s (%s), the only one "
+                "this credential belongs to",
+                only["slug"] or only["name"],
+                only["id"],
+            )
+            self._organization_id = only["id"]
+            return self._organization_id
+
+        if not organizations:
+            raise CommandCenterOrganizationError(
+                "The Command Center credential belongs to no organization, and an asset "
+                "must be created inside one. Add the user to an organization in the "
+                f"Command Center, or set {ORG_ID_ENV} to an organization id it is a "
+                "member of.",
+                organizations=organizations,
+            )
+
+        listing = ", ".join(f"{o['slug'] or o['name']} (id {o['id']})" for o in organizations)
+        raise CommandCenterOrganizationError(
+            f"The Command Center credential belongs to {len(organizations)} organizations "
+            f"and none was chosen: {listing}. Set {ORG_ID_ENV}=<id> or "
+            "catalogs.fluid-command-center.organization_id to pick one.",
+            organizations=organizations,
+        )
+
+    async def _list_organizations(self) -> List[Dict[str, str]]:
+        """The organizations the credential is an active member of.
+
+        ``GET /api/v1/organizations`` answers a JSON list of
+        ``OrganizationSummary`` objects (``id``, ``name``, ``slug``, ``role``,
+        ...). Entries whose id is not header-safe are dropped rather than sent,
+        and slugs and names keep only printable characters.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(
+                    f"{self.endpoint}/api/v1/organizations",
+                    headers=get_auth_headers(self.endpoint, self.auth),
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+                body = response.json()
+        except (httpx.HTTPError, ValueError) as e:
+            # The reason names the status or the exception type and message,
+            # never a header: the request carried the credential.
+            if isinstance(e, httpx.HTTPStatusError):
+                code = e.response.status_code
+                if code in (401, 403):
+                    raise CommandCenterOrganizationError(
+                        f"The Command Center rejected the credential (HTTP {code}) when "
+                        "listing its organizations; check the API key or token.",
+                        original_error=e,
+                    ) from e
+                reason = f"HTTP {code}"
+            else:
+                reason = f"{type(e).__name__}: {e}"
+            raise CommandCenterOrganizationError(
+                f"Could not list the Command Center organizations to choose one ({reason}). "
+                f"Set {ORG_ID_ENV} to the organization id to skip the lookup.",
+                original_error=e,
+            ) from e
+
+        if not isinstance(body, list):
+            raise CommandCenterOrganizationError(
+                "The Command Center answered GET /api/v1/organizations with something "
+                f"other than a list; set {ORG_ID_ENV} to the organization id instead."
+            )
+
+        organizations: List[Dict[str, str]] = []
+        for entry in body:
+            if not isinstance(entry, dict):
+                continue
+            org_id = entry.get("id")
+            if not isinstance(org_id, str) or not _is_valid_org_id(org_id):
+                continue
+            organizations.append(
+                {
+                    "id": org_id,
+                    "slug": _display(entry.get("slug")),
+                    "name": _display(entry.get("name")),
+                }
+            )
+        return organizations
+
+    def _organization_failure(
+        self, asset: CatalogAsset, error: CommandCenterOrganizationError
+    ) -> PublishResult:
+        """The failed result for a publish whose organization is unsettled."""
+        metrics_collector.record_publish_failure(self.name, "organization_unresolved")
+        self.logger.error(f"❌ {error.message}")
+        return PublishResult(
+            success=False,
+            catalog_id=self.name,
+            asset_id=asset.id,
+            error=error.message,
+            details={
+                "error_code": "cc_organization_unresolved",
+                "organizations": error.organizations,
+            },
         )
 
     async def publish(self, asset: CatalogAsset) -> PublishResult:
@@ -91,6 +309,14 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
             )
             metrics_collector.record_validation_error(error_msg)
             return result
+
+        # Settle the organization before the retry loop: it is configuration,
+        # not a transient fault, so retrying (and tripping the circuit breaker)
+        # would only repeat the same answer three times.
+        try:
+            await self.resolve_organization_id()
+        except CommandCenterOrganizationError as e:
+            return self._organization_failure(asset, e)
 
         # Retry with exponential backoff
         for attempt in range(self.max_retries):
@@ -181,7 +407,7 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
                 asset.contract_yaml.encode("utf-8")
             ).hexdigest()
 
-        headers = get_auth_headers(self.endpoint, self.auth)
+        headers = self._headers()
 
         # Debug: Log what we're sending
         import json as json_lib
@@ -224,6 +450,7 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
                     "operation": "update" if existing else "create",
                     "api_asset_id": result_data["id"],
                     "contract_id": asset.id,
+                    "organization_id": headers.get(ORG_HEADER),
                 },
             )
 
@@ -279,9 +506,14 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
         return await self.publish(asset)
 
     async def verify(self, asset_id: str) -> bool:
-        """Verify asset exists in catalog"""
+        """Verify asset exists in catalog (inside the resolved organization)"""
         try:
-            headers = get_auth_headers(self.endpoint, self.auth)
+            await self.resolve_organization_id()
+        except CommandCenterOrganizationError as e:
+            self.logger.error(f"Verification failed: {e.message}")
+            return False
+        try:
+            headers = self._headers()
             async with httpx.AsyncClient(timeout=10.0) as client:
                 # Try to find by contract ID
                 existing = await self._find_by_contract_id(client, headers, asset_id)
@@ -291,9 +523,15 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
             return False
 
     async def health_check(self) -> bool:
-        """Check if Command Center API is accessible"""
+        """Check if Command Center API is accessible
+
+        A reachability probe: it carries ``X-Organization-Id`` when the
+        organization is already known (configured, or resolved earlier) but
+        does not trigger the organization lookup itself, so an ambiguous
+        organization is reported as that, not as an unreachable endpoint.
+        """
         try:
-            headers = get_auth_headers(self.endpoint, self.auth)
+            headers = self._headers()
             async with httpx.AsyncClient(timeout=5.0) as client:
                 # Try to ping the API (GET /api/v1/assets with limit=1)
                 response = await client.get(

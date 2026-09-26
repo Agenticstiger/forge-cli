@@ -144,6 +144,7 @@ Configuration:
   Or use environment variables:
     FLUID_CC_ENDPOINT=https://catalog.company.com
     FLUID_API_KEY=fluid_xxxxx
+    FLUID_CC_ORG_ID=<org id>   (unset: the key's only org; several is an error)
 
 Authentication:
   API Key:    Set FLUID_API_KEY environment variable

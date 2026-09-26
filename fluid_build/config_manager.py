@@ -85,6 +85,16 @@ DEFAULT_CONFIG = {
 }
 
 
+# Every name ``fluid publish --target`` accepts for the Command Center. They
+# must match the keys that map to ``FluidCommandCenterProvider`` in
+# ``providers/catalogs/__init__.py::CATALOG_PROVIDERS`` (a test pins that); the
+# list lives here because importing the provider registry pulls in httpx, which
+# this module must not. An alias with no config block of its own reads the
+# canonical ``fluid-command-center`` block.
+COMMAND_CENTER_CATALOG_NAMES = ("fluid-command-center", "fluid_cc", "command-center")
+COMMAND_CENTER_CANONICAL_NAME = "fluid-command-center"
+
+
 def _set_auth_field(catalog_config: Dict[str, Any], field: str, value: str) -> None:
     """Set ``catalog_config['auth'][field] = value``, creating the dict if absent."""
     if "auth" not in catalog_config:
@@ -119,13 +129,17 @@ def _apply_catalog_env_overrides(catalog_name: str, catalog_config: Dict[str, An
        :func:`~fluid_build.api.catalog_backend.apply_env_overrides`
        so adding a new backend never requires editing this function.
     """
-    if catalog_name in ("fluid-command-center", "fluid_cc"):
+    if catalog_name in COMMAND_CENTER_CATALOG_NAMES:
         endpoint = _first_env("FLUID_CC_ENDPOINT", "FLUID_CATALOG_FLUID_CC_URL")
         if endpoint:
             catalog_config["endpoint"] = endpoint
         api_key = _first_env("FLUID_API_KEY", "FLUID_CATALOG_FLUID_CC_TOKEN")
         if api_key:
             _set_auth_field(catalog_config, "api_key", api_key)
+        # The organization the asset is created in (sent as X-Organization-Id).
+        org_id = _first_env("FLUID_CC_ORG_ID")
+        if org_id:
+            catalog_config["organization_id"] = org_id
         return
 
     if catalog_name in ("datamesh-manager", "entropy-data", "dmm"):
@@ -423,7 +437,10 @@ class FluidConfig:
         catalogs = self.get_section("catalogs")
 
         if catalog_name:
-            catalog_config = copy.deepcopy(catalogs.get(catalog_name, {}))
+            block = catalogs.get(catalog_name)
+            if block is None and catalog_name in COMMAND_CENTER_CATALOG_NAMES:
+                block = catalogs.get(COMMAND_CENTER_CANONICAL_NAME)
+            catalog_config = copy.deepcopy(block or {})
             _apply_catalog_env_overrides(catalog_name, catalog_config)
             return self._resolve_env_placeholders(catalog_config)
 
@@ -603,6 +620,7 @@ catalogs:
     auth:
       type: api_key  # api_key, bearer, or basic
       # api_key will be read from FLUID_API_KEY env var
+    # organization_id: <id>  # or FLUID_CC_ORG_ID; omitted = the only org the key belongs to
     enabled: true
     max_retries: 3
     timeout: 30.0
