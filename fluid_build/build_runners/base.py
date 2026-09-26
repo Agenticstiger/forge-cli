@@ -37,6 +37,7 @@ from typing import Any, Dict, Optional
 from fluid_build._console import cprint, success
 from fluid_build._console import error as console_error
 from fluid_build._contract_loader import CLIError, load_contract_with_overlay
+from fluid_build.util.binding_paths import ENV_PLACEHOLDER_RE
 
 LOG = logging.getLogger("fluid.build_runners")
 
@@ -44,7 +45,8 @@ LOG = logging.getLogger("fluid.build_runners")
 # ``os.environ`` at run time. Used by both the dbt profile generator and
 # the dbt command builder to expand author-supplied vars/resources
 # references.
-ENV_PLACEHOLDER_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+# The pattern itself lives in fluid_build/util/binding_paths.py, shared with
+# the readers of a landed file (verify, diff, the local provider).
 
 # Used by the dbt command-log renderer to decide whether the value of an
 # ``-e KEY=VALUE`` pair should be redacted. A structural hack: if the KEY

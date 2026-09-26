@@ -36,10 +36,28 @@ provider, the build runners and ``fluid verify``.
 from __future__ import annotations
 
 import copy
+import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Union
 
 PathLike = Union[str, Path]
+
+#: ``{{ env.NAME }}`` in a contract string. The build runners resolve these
+#: before they write (``build_runners/base.py`` imports this pattern), so a
+#: path is resolved the same way here before it is anchored: the stage that
+#: writes a local file and the stages that read it back (``fluid verify``,
+#: ``fluid diff``, the local provider) must name the same file.
+ENV_PLACEHOLDER_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+
+def resolve_env_placeholders_in_path(path: str) -> str:
+    """``path`` with each ``{{ env.NAME }}`` replaced by the variable's value.
+
+    A variable that is not set becomes the empty string, exactly as the build
+    runner resolves it when it writes, so reader and writer still agree.
+    """
+    return ENV_PLACEHOLDER_RE.sub(lambda m: os.getenv(m.group(1), ""), path)
 
 
 def is_remote_uri(path: str) -> bool:
@@ -50,14 +68,17 @@ def is_remote_uri(path: str) -> bool:
 def resolve_binding_path(path: Any, anchor_dir: Optional[PathLike]) -> Any:
     """Anchor a relative ``location.path`` at ``anchor_dir``.
 
-    Returns ``path`` unchanged when it is empty or not a string, when it is a
-    remote URI or already absolute, or when no anchor is known (``None`` keeps
-    the historical working-directory semantics for callers that have no
-    source contract to anchor to). Otherwise returns ``str(anchor_dir / path)``.
+    ``{{ env.NAME }}`` placeholders are resolved first, as the build runner
+    resolves them before it writes. Then the path is returned as it is when it
+    is empty or not a string, when it is a remote URI or already absolute, or
+    when no anchor is known (``None`` keeps the historical working-directory
+    semantics for callers that have no source contract to anchor to).
+    Otherwise returns ``str(anchor_dir / path)``.
     """
-    if not path or not isinstance(path, str) or anchor_dir is None:
+    if not path or not isinstance(path, str):
         return path
-    if is_remote_uri(path) or Path(path).is_absolute():
+    path = resolve_env_placeholders_in_path(path)
+    if anchor_dir is None or is_remote_uri(path) or Path(path).is_absolute():
         return path
     return str(Path(anchor_dir) / path)
 
@@ -90,4 +111,10 @@ def anchor_binding_paths(
     return anchored
 
 
-__all__ = ["anchor_binding_paths", "is_remote_uri", "resolve_binding_path"]
+__all__ = [
+    "ENV_PLACEHOLDER_RE",
+    "anchor_binding_paths",
+    "is_remote_uri",
+    "resolve_binding_path",
+    "resolve_env_placeholders_in_path",
+]
