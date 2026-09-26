@@ -623,6 +623,8 @@ catalogs:
       type: api_key  # api_key, bearer, or basic
       # api_key will be read from FLUID_API_KEY env var
     # organization_id: <id>  # or FLUID_CC_ORG_ID; omitted = the only org the key belongs to
+    # organization: <slug>   # the same organization by its slug, for a committed config;
+    #                        # an id above wins; a slug no organization carries is an error
     enabled: true
     max_retries: 3
     timeout: 30.0

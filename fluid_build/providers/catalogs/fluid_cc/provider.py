@@ -328,6 +328,12 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
         self._configured_org_id: Optional[str] = (
             (str(configured).strip() or None) if configured else None
         )
+        # ``organization`` names the organization by its slug, for a setting
+        # that has to be the same on every deployment (a committed per-product
+        # config): ids are generated per Command Center, slugs are chosen. An
+        # id, from the env var or ``organization_id``, still wins.
+        slug = config.get("organization")
+        self._configured_org_slug: Optional[str] = (str(slug).strip() or None) if slug else None
         self._organization_id: Optional[str] = None
 
         # ``fluid publish --force``: record a contract version even when the
@@ -396,6 +402,30 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
             return self._organization_id
 
         organizations, listed = await self._list_organizations()
+        if self._configured_org_slug is not None:
+            # By slug: exactly one of the credential's own organizations, or
+            # nothing. Never a fallback to the only one, so a typo in a
+            # committed config cannot publish into a different tenant.
+            matches = [o for o in organizations if o["slug"] == self._configured_org_slug]
+            if len(matches) == 1:
+                self._organization_id = matches[0]["id"]
+                self.logger.info(
+                    "Publishing into Command Center organization %s (%s), named by its slug",
+                    matches[0]["slug"],
+                    matches[0]["id"],
+                )
+                return self._organization_id
+            raise CommandCenterOrganizationError(
+                "catalogs.fluid-command-center.organization names the slug "
+                f"{_display(self._configured_org_slug)!r}, and "
+                + (
+                    "several of this credential's organizations carry it"
+                    if matches
+                    else "none of this credential's organizations carries it"
+                )
+                + f", so nothing was written. Its organizations: {_listing(organizations) or 'none'}.",
+                organizations=organizations,
+            )
         if len(organizations) < listed:
             # Some entries cannot be sent as a header. Counting only the rest
             # would call a survivor "the only one" for a credential that
