@@ -439,14 +439,21 @@ def _compare_live(
     logger: logging.Logger,
 ) -> "LiveDriftReport":
     """Read every expose's live target and compare it with the contract."""
+    from fluid_build._contract_loader import source_contract_dir
+
     from ._diff_live import compare_live
 
     exposes = contract.get("exposes") or []
     info(logger, "diff_live_comparing", exposes=len(exposes))
+    # Relative local paths are anchored at the SOURCE contract's directory,
+    # where the build writes them: the contract itself, or the one a bundle's
+    # MANIFEST records. The bundle's own directory (runtime/) would read an
+    # absent file, "to be created", and let a drifted target pass the gate.
+    anchor_dir = source_contract_dir(args.contract, logger)
     with _traced_span("diff.live", attributes={"fluid.diff.mode": "live"}) as span:
         report = compare_live(
             contract,
-            Path(args.contract).parent,
+            anchor_dir,
             last_applied=last_applied,
             default_project=getattr(args, "project", None),
         )
