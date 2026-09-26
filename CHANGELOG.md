@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.3] — 2026-09-26
+
+The generated 11-stage pipeline now runs as generated and its gates check what
+they claim. How each part was checked: the generated Jenkinsfile end to end in a
+throwaway Jenkins (stages 0-11, a parameterless first build, a restart) against a
+seeded Postgres and a stub Command Center; the Lake Formation bucket policy with a
+real `tofu plan` against moto; the Athena verifier and the live drift reads
+against stubbed AWS and Google clients; the publish changes against a stub
+server. None of it has run against a real AWS or Google account yet.
+
+### Fixed
+
+- **The generated Jenkins pipeline runs as generated** (#657). `CONTRACT`
+  defaults to the contract you generated from; stage 0 installs into a
+  workspace venv (the official Jenkins images are PEP 668 managed) and pins
+  `data-product-forge` to the generating version with the extras the contract's
+  base and overlays need (`--fluid-package-spec` overrides it); cleanup uses the
+  core `deleteDir()`, so no ws-cleanup plugin is needed; every parameter's
+  default is also its shell fallback, so a first build or a build after a
+  Jenkins restart is a correct build. Stages 1-9 run the documented bundle
+  chain: stage 1 bundles with `--env`, later stages read the bundle, stage 6
+  plans in the mode stage 7 applies, and `--build-id` goes only with a
+  `*-and-build` mode. Pip index parameters can no longer smuggle options.
+- **The structural gates check what they claim** (#654). A tampered `plan.json`
+  applied in a build mode used to exit 0: plan digest and mode are now checked
+  before any build, on both engines. `--build-id` with a mode that runs no build
+  is refused. The bundle records its source contract and env, and a stage asked
+  for a different env refuses it. Relative local paths resolve at the source
+  contract's directory in the build, the local provider and verify, so stage 9
+  finds what stage 7 wrote. `verify --strict` fails a local output whose columns
+  differ from the declared schema, and its console now matches its report.
+- **The Command Center publish creates its assets** (#651). It sends
+  `X-Organization-Id` from `FLUID_CC_ORG_ID` (or the caller's single
+  organization), so a first publish is no longer a 400; `command-center` is
+  accepted as the target name the docs use. A local-target verify no longer
+  asks AWS Secrets Manager for credentials 22 times.
+- **A Command Center product keeps its classification, env and versions**
+  (#656). Visibility comes from the contract, so a confidential product is no
+  longer published public; `fluid publish --env`; each publish records the
+  contract through `/api/v1/contracts/sync`; `--dry-run` shows the body and the
+  lineage edges it would create; a blank `FLUID_CC_ORG_ID` is an error.
+- **A Lake Formation grantee no longer gets a raw S3 bypass** (#658). The AWS
+  emitter gave every grantee an authoritative bucket-policy statement, so a
+  grantee in the same account could read the data straight from S3 around Lake
+  Formation. By default only grantees in another account get one;
+  `lakeFormation.bucketPolicy: none | cross-account | all-grantees` chooses. The
+  schema now says `admins` is authoritative.
+
+### Added
+
+- **`fluid verify` checks an S3+Glue binding** (#650): the Glue table's columns
+  against the contract, and an Athena `COUNT(*)` against the rows the same build
+  landed.
+- **The drift gate compares the live target** (#652): local files and DuckDB,
+  Glue and BigQuery tables. A target not created yet is not drift;
+  `--last-applied` tells a contract change from drift.
+- **Scheduled builds get an Airflow 3 DAG that runs `fluid apply`** (#653),
+  written into the artifacts where stage 11 syncs it; schedule-sync deletes only
+  within the product's own folder.
+- **`FLUID_STATE_BACKEND`** is the default for `apply --state-backend`; a
+  bucket-only value keys each contract's state apart (#654).
+- **A Command Center organization can be named by its slug** (#660):
+  `catalogs.fluid-command-center.organization: <slug>` in a FLUID config, for a
+  setting that must be the same on every deployment (ids are generated per
+  Command Center). An id still wins; a slug no organization carries writes
+  nothing.
+- `fluid generate ci` options: `--apply-mode-default`, `--schedule-sync-default`,
+  `--scheduler-default`, `--scheduler-destination-default`,
+  `--diff-last-applied` (needs the copyartifact plugin), `--fluid-package-spec`;
+  `--default-publish-target` now also sets the parameter's default (#657).
+
+### Changed
+
+Upgrading can change results, deliberately:
+
+- Relative local outputs land under the contract's directory, not the working
+  directory.
+- `verify --strict` fails on a schema-structure mismatch it used to downgrade.
+- `apply --build-id` with a non-build mode, and a plan/apply mode mismatch, now
+  fail.
+- A drift gate that could never fire now can.
+- Command Center products are private unless the contract says public.
+- Lake Formation bucket policies no longer name same-account grantees;
+  `bucketPolicy: all-grantees` restores the old output.
+- Regenerate committed pipelines (`fluid generate ci`) to pick up #657.
+
 ## [0.16.2] — 2026-09-23
 
 Applying one contract to AWS and to Google Cloud now does what the contract
@@ -3444,7 +3530,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.2...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.3...HEAD
+[0.16.3]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.15.3...v0.16.0
