@@ -172,7 +172,7 @@ def _write_contract(root: Path, contract: Dict[str, Any]) -> Path:
 
 
 def _write_parquet(path: Path, select_sql: str) -> None:
-    import duckdb
+    duckdb = pytest.importorskip("duckdb")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(":memory:")
@@ -1342,7 +1342,7 @@ def test_schema_less_files_compare_names_not_sniffed_types(workspace, fmt):
         "'active'::VARCHAR", "'2026-01-01'::VARCHAR"
     )
 
-    import duckdb
+    duckdb = pytest.importorskip("duckdb")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     options = "FORMAT 'csv', HEADER" if fmt == "csv" else "FORMAT 'json'"
@@ -1362,7 +1362,7 @@ def test_schema_less_files_compare_names_not_sniffed_types(workspace, fmt):
 
 
 def test_a_duckdb_file_without_the_table_yet_is_to_be_created(workspace):
-    import duckdb
+    duckdb = pytest.importorskip("duckdb")
 
     db = workspace / "warehouse.duckdb"
     con = duckdb.connect(str(db))
