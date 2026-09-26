@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 try:
     import yaml
@@ -486,8 +486,10 @@ class JenkinsTemplate(BasePipelineTemplate):
             # not the catalog, not the scheduler (whose DAG would apply for real).
             return [
                 f"if {dry_run_applied}; then",
-                f'  echo "stage {stage}: stage 7 ran as a dry run and applied nothing, so '
-                f'{what} — skipped (APPLY_MODE amend or amend-and-build applies)"',
+                (
+                    f'  echo "stage {stage}: stage 7 ran as a dry run and applied nothing, so '
+                    f'{what} — skipped (APPLY_MODE amend or amend-and-build applies)"'
+                ),
                 "  exit 0",
                 "fi",
             ]
@@ -522,10 +524,14 @@ class JenkinsTemplate(BasePipelineTemplate):
                         f'INDEX_URL="{v("FLUID_PIP_INDEX_URL")}"',
                         f'EXTRA_INDEX_URL="{v("FLUID_PIP_EXTRA_INDEX_URL")}"',
                         'if [ -n "$INDEX_URL" ]; then set -- "$@" "--index-url=$INDEX_URL"; fi',
-                        'if [ -n "$EXTRA_INDEX_URL" ]; then '
-                        'set -- "$@" "--extra-index-url=$EXTRA_INDEX_URL"; fi',
-                        f'if [ "{v("FLUID_ALLOW_PRERELEASE")}" = "true" ]; then '
-                        'set -- "$@" --pre; fi',
+                        (
+                            'if [ -n "$EXTRA_INDEX_URL" ]; then '
+                            'set -- "$@" "--extra-index-url=$EXTRA_INDEX_URL"; fi'
+                        ),
+                        (
+                            f'if [ "{v("FLUID_ALLOW_PRERELEASE")}" = "true" ]; then '
+                            'set -- "$@" --pre; fi'
+                        ),
                         f'"$FLUID_VENV/bin/python" -m pip install "$@" -- "{v("FLUID_PACKAGE_SPEC")}"',
                     ],
                     "",
@@ -609,8 +615,10 @@ EOM
             # not one the agent image already has on PATH.
             version_lines = [
                 'if [ "$(command -v fluid || true)" != "$FLUID_VENV/bin/fluid" ]; then',
-                '  echo "stage 0: the CLI first on PATH is $(command -v fluid || echo nothing), '
-                'not the one in $FLUID_VENV: the PATH entry of environment {} did not apply" >&2',
+                (
+                    '  echo "stage 0: the CLI first on PATH is $(command -v fluid || echo nothing), '
+                    'not the one in $FLUID_VENV: the PATH entry of environment {} did not apply" >&2'
+                ),
                 "  exit 1",
                 "fi",
             ]
@@ -619,8 +627,10 @@ EOM
                 # FLUID_ENV names an overlay file, and a baseline file below;
                 # refuse anything but a plain name before any stage uses it.
                 f'case "{v("FLUID_ENV")}" in',
-                '  .*|-*|*[!A-Za-z0-9_.-]*) echo "FLUID_ENV must be a plain environment name '
-                '([A-Za-z0-9_.-], not starting with . or -)" >&2; exit 2 ;;',
+                (
+                    '  .*|-*|*[!A-Za-z0-9_.-]*) echo "FLUID_ENV must be a plain environment name '
+                    '([A-Za-z0-9_.-], not starting with . or -)" >&2; exit 2 ;;'
+                ),
                 "esac",
                 *version_lines,
                 "fluid --version",
@@ -668,18 +678,22 @@ EOM
         stage3 = _sh_step(
             [
                 _needs_bundle(3),
-                f"fluid generate artifacts {BUNDLE_PATH} {env_flag} "
-                f'--contract-path "{project_contract}" '
-                f'--out dist/artifacts/ --emit "{v("GENERATE_EMIT")}"',
+                (
+                    f"fluid generate artifacts {BUNDLE_PATH} {env_flag} "
+                    f'--contract-path "{project_contract}" '
+                    f'--out dist/artifacts/ --emit "{v("GENERATE_EMIT")}"'
+                ),
             ],
             CD,
         )
         stage4 = _sh_step(
             [
                 "mkdir -p runtime",
-                "fluid validate-artifacts dist/artifacts/ "
-                "--manifest dist/artifacts/MANIFEST.json "
-                "--report runtime/validate-artifacts-report.json",
+                (
+                    "fluid validate-artifacts dist/artifacts/ "
+                    "--manifest dist/artifacts/MANIFEST.json "
+                    "--report runtime/validate-artifacts-report.json"
+                ),
             ],
             CD,
         )
@@ -692,9 +706,11 @@ EOM
         if last_applied:
             stage5_lines += [
                 f'BASELINE="{baseline_dir}/{v("FLUID_ENV")}.json"',
-                'if [ -f "$BASELINE" ]; then set -- "$@" --last-applied "$BASELINE"; '
-                'else echo "stage 5: the last successful build applied no plan for this env '
-                '(or there is none yet): comparing the target with the contract alone"; fi',
+                (
+                    'if [ -f "$BASELINE" ]; then set -- "$@" --last-applied "$BASELINE"; '
+                    'else echo "stage 5: the last successful build applied no plan for this env '
+                    '(or there is none yet): comparing the target with the contract alone"; fi'
+                ),
             ]
         stage5_lines.append('fluid diff "$@"')
         stage5 = _sh_step(stage5_lines, CD)
@@ -702,10 +718,14 @@ EOM
             [
                 "mkdir -p runtime",
                 _needs_bundle(6),
-                f"set -- {BUNDLE_PATH} {env_flag} "
-                f'--mode "{v("APPLY_MODE")}" --out runtime/plan.json',
-                f'if [ "{v("PLAN_HTML")}" = "true" ]; then '
-                'set -- "$@" --html runtime/plan.html; fi',
+                (
+                    f"set -- {BUNDLE_PATH} {env_flag} "
+                    f'--mode "{v("APPLY_MODE")}" --out runtime/plan.json'
+                ),
+                (
+                    f'if [ "{v("PLAN_HTML")}" = "true" ]; then '
+                    'set -- "$@" --html runtime/plan.html; fi'
+                ),
                 'fluid plan "$@"',
             ],
             CD,
@@ -714,12 +734,16 @@ EOM
             "mkdir -p runtime",
             _needs_bundle(7),
             f'MODE="{v("APPLY_MODE")}"',
-            f'set -- runtime/plan.json --bundle {BUNDLE_PATH} --mode "$MODE" {env_flag} '
-            "--yes --ensure-opentofu --report runtime/apply-report.html",
+            (
+                f'set -- runtime/plan.json --bundle {BUNDLE_PATH} --mode "$MODE" {env_flag} '
+                "--yes --ensure-opentofu --report runtime/apply-report.html"
+            ),
             apply_build_id_sh(v("APPLY_BUILD_ID")).strip(),
             f'if [ "{v("ALLOW_DATA_LOSS")}" = "true" ]; then set -- "$@" --allow-data-loss; fi',
-            f'if [ "{v("NO_VERIFY_DIGEST")}" = "true" ]; then '
-            'set -- "$@" --no-verify-plan-binding --no-verify-federation; fi',
+            (
+                f'if [ "{v("NO_VERIFY_DIGEST")}" = "true" ]; then '
+                'set -- "$@" --no-verify-plan-binding --no-verify-federation; fi'
+            ),
             'fluid apply "$@"',
         ]
         if last_applied:
@@ -737,8 +761,10 @@ EOM
                 "mkdir -p runtime",
                 f'POLICY_MODE="{v("POLICY_APPLY_MODE")}"',
                 f'if {dry_run_applied} && [ "$POLICY_MODE" = "enforce" ]; then',
-                '  echo "stage 8: stage 7 ran as a dry run and wrote nothing, so the bindings '
-                'are checked (--mode check), not enforced"',
+                (
+                    '  echo "stage 8: stage 7 ran as a dry run and wrote nothing, so the bindings '
+                    'are checked (--mode check), not enforced"'
+                ),
                 "  POLICY_MODE=check",
                 "fi",
                 "if [ -f dist/artifacts/policy/bindings.json ]; then",
@@ -778,8 +804,10 @@ EOM
                 # (FLUID_API_KEY...) would go to whatever the parameter names.
                 "set -f",
                 f"for t in {v('PUBLISH_TARGETS')}; do",
-                '  case "$t" in *:*) echo "PUBLISH_TARGETS names catalogs, not endpoints: '
-                'set the endpoint on the agent (FLUID_CC_ENDPOINT...)" >&2; exit 2 ;; esac',
+                (
+                    '  case "$t" in *:*) echo "PUBLISH_TARGETS names catalogs, not endpoints: '
+                    'set the endpoint on the agent (FLUID_CC_ENDPOINT...)" >&2; exit 2 ;; esac'
+                ),
                 '  set -- "$@" "--target=$t"',
                 "done",
                 "set +f",
@@ -798,19 +826,25 @@ EOM
                 '  echo "SCHEDULER is blank: no scheduler to sync to — skipping stage 11"',
                 "  exit 0",
                 "fi",
-                "if [ ! -d dist/artifacts/schedule ] || "
-                '[ -z "$(ls -A dist/artifacts/schedule 2>/dev/null)" ]; then',
-                '  echo "no dist/artifacts/schedule/ DAGs to sync — skipping stage 11 '
-                "(reference-only contract, stage 3 not run, or no scheduled build or "
-                'orchestration.engine)"',
+                (
+                    "if [ ! -d dist/artifacts/schedule ] || "
+                    '[ -z "$(ls -A dist/artifacts/schedule 2>/dev/null)" ]; then'
+                ),
+                (
+                    '  echo "no dist/artifacts/schedule/ DAGs to sync — skipping stage 11 '
+                    "(reference-only contract, stage 3 not run, or no scheduled build or "
+                    'orchestration.engine)"'
+                ),
                 "  exit 0",
                 "fi",
                 "mkdir -p runtime",
                 # --delete-scope product: this product's DAGs go to
                 # <destination>/<contract id>/ and nothing outside it is deleted,
                 # so every product's job can share one DAG root.
-                'set -- --scheduler "$SCHEDULER_V" --dags-dir dist/artifacts/schedule/ '
-                f"{env_flag} --delete-scope product --report runtime/schedule-sync-report.json",
+                (
+                    'set -- --scheduler "$SCHEDULER_V" --dags-dir dist/artifacts/schedule/ '
+                    f"{env_flag} --delete-scope product --report runtime/schedule-sync-report.json"
+                ),
                 f'DEST="{v("SCHEDULER_DESTINATION")}"',
                 'if [ -n "$DEST" ]; then set -- "$@" --destination "$DEST"; fi',
                 f'ENV_NAME="{v("SCHEDULER_ENVIRONMENT_NAME")}"',
@@ -906,8 +940,10 @@ EOM
                     "",
                     indent=" " * 12,
                 ),
-                f"            archiveArtifacts artifacts: '{_CI_STATE_DIR}/applied/*.json', "
-                "fingerprint: true, allowEmptyArchive: true",
+                (
+                    f"            archiveArtifacts artifacts: '{_CI_STATE_DIR}/applied/*.json', "
+                    "fingerprint: true, allowEmptyArchive: true"
+                ),
             ]
         post_success.append("            echo '✅ 11-stage pipeline completed successfully'")
         post_success_block = "\n".join(post_success)
