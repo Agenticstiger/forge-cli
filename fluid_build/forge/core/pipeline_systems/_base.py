@@ -318,10 +318,9 @@ class PipelineConfig:
     default_publish_target: Optional[str] = None
     # Generation defaults for the stage-9 verify strictness, the stage-10
     # publish toggle, and whether stage 10 passes ``--env`` to
-    # ``fluid publish`` (which takes it, so the catalog gets the contract
-    # the build applied, overlay included). These exist so scenario-specific
-    # launchpads can ask ``fluid generate ci`` to emit the intended default
-    # behavior directly instead of patching the generated Jenkinsfile text.
+    # ``fluid publish``. These exist so scenario-specific launchpads can ask
+    # ``fluid generate ci`` to emit the intended default behavior directly
+    # instead of patching the generated Jenkinsfile text.
     #
     # ``publish_include_env`` defaults to True: ``fluid publish --env`` loads
     # the contract with the same overlay stages 5-9 used, so a run for the
