@@ -22,7 +22,7 @@ the summary counts as *not checked* and ``--strict`` never fails on, so a
 pipeline could land nothing, or land it where no query engine could read it,
 and still go green.
 
-Three checks, each against the live account:
+Four checks, each against the live account:
 
 1. **The catalogue.** ``glue:GetTable`` must find the table, and its columns
    (storage-descriptor columns plus partition keys) must match the contract's
@@ -57,17 +57,22 @@ Three checks, each against the live account:
    is not agreement. The one exception is a reference-only contract with no
    run of its own to compare with: a pipeline outside forge owns the rows and
    may not have run yet, so the empty table is INFO, as a missing one is.
+4. **Masking.** For an expose with ``policy.privacy.masking`` rules, the same
+   query counts the non-null values of each masked column that do not have
+   their strategy's shape (``_verify_masking``); one is CRITICAL. Only counts
+   come back: the values that fail are the cleartext.
 
 The binding's ``{{ env.* }}`` templates are resolved with the resolver
 ``fluid apply`` runs before it emits (``resolve_env_templates_in_contract``),
 so verify looks for the table apply created; a database, table or bucket still
 templated after that is an error naming the variable.
 
-A missing column, a type change, a moved location, an empty table and a count
-that breaks the build's rule are CRITICAL, so ``--strict`` fails on them.
-Extra columns are INFO, as in every other verifier. Glue declares no
-nullability, so there is no catalogue constraint to drift and the constraints
-dimension says so rather than reporting a comparison it did not make.
+A missing column, a type change, a moved location, an empty table, a count
+that breaks the build's rule and an untreated masked value are CRITICAL, so
+``--strict`` fails on them. Extra columns are INFO, as in every other
+verifier. Glue declares no nullability, so there is no catalogue constraint to
+drift and the constraints dimension says so rather than reporting a comparison
+it did not make.
 
 **Where Athena writes the result.** Resolved in the order AWS SDK for pandas
 uses (``awswrangler.athena._utils._get_s3_output``): a workgroup with managed
@@ -128,7 +133,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 LOG = logging.getLogger("fluid.cli.verify.athena")
 
@@ -355,6 +360,21 @@ def _declared_fields(expose: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     return [f for f in raw if isinstance(f, Mapping) and f.get("name")]
 
 
+def _quotable_columns(glue_table: Mapping[str, Any]) -> List[str]:
+    """The table's column and partition-key names the queries may interpolate.
+
+    Only names ``_ATHENA_IDENT_RE`` admits: a column a masking rule names but
+    this leaves out is reported as not in the table rather than queried.
+    """
+    storage = glue_table.get("StorageDescriptor") or {}
+    names = [
+        str(column.get("Name") or "")
+        for column in list(storage.get("Columns") or [])
+        + list(glue_table.get("PartitionKeys") or [])
+    ]
+    return [name for name in names if _ATHENA_IDENT_RE.fullmatch(name)]
+
+
 def _compare_schema(
     glue_table: Mapping[str, Any], declared: List[Mapping[str, Any]]
 ) -> Dict[str, Any]:
@@ -570,13 +590,22 @@ def _count_rows(
     *,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
-) -> Tuple[int, Dict[str, Any]]:
+    extra: Sequence[str] = (),
+) -> Tuple[int, Dict[str, Any], List[int]]:
+    """``(rows, query facts, the value of each ``extra`` expression)``.
+
+    ``extra`` are more integer expressions over the same table, selected after
+    ``COUNT(*)`` in the same query: the masking checks (``_verify_masking``),
+    so they cost no second query, and a contract without masking rules sends
+    exactly the ``COUNT(*)`` it always did.
+    """
     # Identifier positions cannot be bound, so check before interpolating:
     # ``_ATHENA_IDENT_RE`` admits nothing that can close a double-quoted name.
     for name in (database, table):
         if not _ATHENA_IDENT_RE.fullmatch(name):
             raise AthenaVerifyError(f"{name!r} is not a quotable Athena identifier", exists=True)
-    sql = f'SELECT COUNT(*) FROM "{database}"."{table}"'
+    selected = ", ".join(["COUNT(*)", *extra])
+    sql = f'SELECT {selected} FROM "{database}"."{table}"'
 
     results = _results_location(athena, options, bucket, table_locations)
     request: Dict[str, Any] = {"QueryString": sql, "WorkGroup": options.workgroup}
@@ -625,6 +654,8 @@ def _count_rows(
     try:
         # Rows[0] is the header row Athena always returns for a SELECT.
         count = int(rows[1]["Data"][0]["VarCharValue"])
+        # count() and count_if() never return NULL, so every cell has a value.
+        extra_values = [int(rows[1]["Data"][1 + i]["VarCharValue"]) for i in range(len(extra))]
     except (IndexError, KeyError, TypeError, ValueError) as exc:
         raise AthenaVerifyError(
             f"Athena query {query_id} succeeded but returned no readable count", exists=True
@@ -637,7 +668,7 @@ def _count_rows(
         count,
         query["data_scanned_bytes"],
     )
-    return count, query
+    return count, query, extra_values
 
 
 # ── Run records ─────────────────────────────────────────────────────────
@@ -1149,6 +1180,11 @@ def _severity(
                 "Re-run the build and check its run record, then verify again",
             )
         )
+    from fluid_build.cli._verify_masking import severity_problem
+
+    masking_problem = severity_problem(dimensions.get("masking"))
+    if masking_problem is not None:
+        problems.append(masking_problem)
     if not problems:
         if dimensions["row_count"]["status"] == "info" and severity["level"] == "SUCCESS":
             return {
@@ -1249,10 +1285,16 @@ def verify_athena_expose(
     actual_location = str((glue_table.get("StorageDescriptor") or {}).get("Location") or "")
     dimensions = _catalogue_dimensions(schema, actual_location, expected_location, region)
 
+    # policy.privacy.masking: the shape of every masked column's values, counted
+    # in the same query (``_verify_masking``).
+    from fluid_build.cli._verify_masking import athena_plan
+
+    masking_selects, finish_masking = athena_plan(expose, _quotable_columns(glue_table))
+
     # The result must stay out of what Athena reads and of what the build writes.
     table_locations = [where for where in (actual_location, expected_location) if where]
     try:
-        count, query = _count_rows(
+        count, query, masking_values = _count_rows(
             athena,
             database,
             table,
@@ -1262,6 +1304,7 @@ def verify_athena_expose(
             region,
             sleep=sleep or time.sleep,
             monotonic=monotonic or time.monotonic,
+            extra=masking_selects,
         )
     except AthenaVerifyError as exc:
         return _error(str(exc), target=target, exists=True, dimensions=dimensions)
@@ -1281,11 +1324,15 @@ def verify_athena_expose(
         landed, info = None, {"source": "none", "note": "the run record could not be read"}
     row_count = _row_count_dimension(count, landed, info, table_id, reference_only=reference_only)
     dimensions["row_count"] = row_count
+    masking = finish_masking(masking_values)
+    if masking is not None:
+        dimensions["masking"] = masking
 
     severity = _severity(schema, dimensions, expected_location)
     has_issues = any(
         dimensions[name]["status"] == "fail"
-        for name in ("structure", "types", "location", "row_count")
+        for name in ("structure", "types", "location", "row_count", "masking")
+        if name in dimensions
     )
     created = glue_table.get("CreateTime")
     modified = glue_table.get("UpdateTime")

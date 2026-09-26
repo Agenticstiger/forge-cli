@@ -42,7 +42,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from fluid_build.api.runner import (
     RunContext,
@@ -69,6 +69,9 @@ from .._acquisition_common import (
     write_run_record,
 )
 from .._fingerprint import fingerprint_from_duckdb_describe
+
+if TYPE_CHECKING:
+    from .._masking import LandingMasker
 
 LOG = logging.getLogger("fluid.acquire.duckdb")
 
@@ -456,12 +459,20 @@ class DuckdbRunner:
     def fingerprint(self, ctx: RunContext) -> SchemaFingerprint:
         import duckdb
 
+        from .._masking import masked_column_types
+
         con = duckdb.connect(":memory:")
         try:
             self._load_extensions(con, ctx)
             select_sql = _select_for_first_stream(ctx)
             con.execute(f"CREATE TEMP VIEW _fp AS {select_sql}")
             rows = con.execute("DESCRIBE _fp").fetchall()
+            # What lands, not what the source holds: a masked column lands as
+            # the string its strategy makes of it (``_masking``), and the
+            # declared schema the gate compares with describes the landed table.
+            masked = masked_column_types(_build_expose(ctx))
+            if masked:
+                rows = [(row[0], masked.get(str(row[0]).lower(), row[1]), *row[2:]) for row in rows]
             return fingerprint_from_duckdb_describe(rows)
         finally:
             con.close()
@@ -991,15 +1002,39 @@ def _persist_cursor_after_run(
     return True
 
 
+def _landing_masker(ctx: RunContext) -> Optional["LandingMasker"]:
+    """The build's ``policy.privacy.masking`` as a :class:`LandingMasker`, or None.
+
+    Raises :class:`MaskingPolicyError` for a rule that cannot be applied as
+    written (an unset salt, ``k_anonymity``, a non-string declared type): the
+    caller refuses the run, since landing the column untreated is the one
+    outcome a masking rule rules out.
+    """
+    from .._masking import LandingMasker
+
+    cursor_field = ctx.source.cursor_field if ctx.source.mode in _INCREMENTAL_MODES else None
+    return LandingMasker.for_expose(_build_expose(ctx), cursor_field=cursor_field)
+
+
 def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     import duckdb
+
+    from .._masking import MaskingPolicyError
+
+    streams_to_run = list(ctx.source.streams) or runner._infer_streams(ctx)
+    # Before the schema gate, so a masked column declared with a type its
+    # strategy cannot produce is refused with that reason rather than reported
+    # as drift; and before anything connects, so a refused run touches nothing.
+    try:
+        masker = _landing_masker(ctx)
+    except MaskingPolicyError as exc:
+        return _refused_run(ctx, streams_to_run, utc_now_iso(), time.time(), f"masking: {exc}")
 
     # Shared run-opening chokepoint: timestamp + schema-evolution gate +
     # duration clock + the OpenLineage START event. duckdb previously
     # inlined the first three and therefore emitted no lineage at all,
     # even though it is the default engine.
     started_at, t_start = begin_acquisition_run(ctx, runner)
-    streams_to_run = list(ctx.source.streams) or runner._infer_streams(ctx)
     sink_format = (ctx.sink.format or "parquet").lower()
     out_dir = Path(ctx.workdir) / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1046,6 +1081,8 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     con = duckdb.connect(":memory:")
     try:
         runner._load_extensions(con, ctx)
+        if masker is not None:
+            masker.install(con)
         for stream in streams_to_run:
             t_stream = time.time()
             try:
@@ -1068,6 +1105,15 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
 
                 if ctx.sample_rows:
                     landed_sel = f"SELECT * FROM ({landed_sel}) LIMIT {int(ctx.sample_rows)}"
+
+                # Masking last, around everything else: the gates judge the
+                # source values, and every row that leaves (landed or DLQ) is
+                # treated. A rule naming a column this stream lacks fails the
+                # stream before its COPY runs.
+                masked_columns: Dict[str, str] = {}
+                if masker is not None:
+                    masked_columns = masker.landed_columns(con, sel, stream)
+                    landed_sel = masker.projection(landed_sel, masked_columns)
 
                 # Resolve binding location if present, else write under workdir.
                 out_path = _resolve_destination_path(ctx, stream, sink_format, out_dir)
@@ -1098,6 +1144,10 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 bad_records_for_stream = 0
                 if good_where:
                     bad_sel = f"SELECT * FROM ({sel}) WHERE {bad_where}"
+                    if masker is not None:
+                        # The DLQ is on disk too: it gets treated rows, never
+                        # the cleartext the landed file was spared.
+                        bad_sel = masker.projection(bad_sel, masked_columns)
                     try:
                         bad_rows = con.execute(bad_sel).fetchall()
                         bad_cols = [d[0] for d in con.description]
@@ -1286,6 +1336,9 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
         # The split moved rows out of the file the COPY wrote.
         rows_from = "write_before_late_arrival_split"
     facets["landed"] = _landed_facet(ctx, destinations, rows_from)
+    if masker is not None:
+        # Which columns were treated and how; variable names only, no secret.
+        facets["masking"] = masker.facet()
 
     return RunResult(
         run_id=ctx.run_id,

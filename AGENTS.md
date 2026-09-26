@@ -153,6 +153,7 @@ forge-cli/
 | Apply mode matrix | `fluid_build/forge/core/apply_modes.py` — `ApplyMode` enum + `check_data_loss_gate` + `resolve_mode_with_build_alias` |
 | Bundle builder | `fluid_build/forge/core/bundle.py` — deterministic tgz + MANIFEST + fragment extraction + `$source` sentinel |
 | Build runners | `fluid_build/build_runners/{dbt,python}/` — extracted from legacy `cli/execute.py` in Phase 1 |
+| Masking at landing | `fluid_build/build_runners/_masking.py` — the DuckDB runner applies `exposes[].policy.privacy.masking[]` inside the COPY (file, S3, BigQuery staging, DLQ); secrets only from env (`FLUID_PII_HASH_SECRET`, `FLUID_PII_TOKENIZATION_KEY`, `FLUID_PII_ENCRYPTION_SECRET_KEY`, or `params.saltEnv`/`keyEnv`), held in UDF closures, never in SQL; an unappliable rule refuses the build. `cli/_verify_masking.py` is stage 9's shape check (local DuckDB, Athena in the count query) |
 | CI template generator | `fluid_build/forge/core/pipeline_templates.py` — 7-system generator; Jenkins ships the full 11-stage parameterized template with `--install-mode {pypi,dev-source}` |
 | Forge (AI creation) | `fluid_build/forge/` (templates, generators, extensions) |
 | Log redaction (global) | `fluid_build/observability/secret_redactor.py` — `SecretRedactingFilter` wired into Python logging |
