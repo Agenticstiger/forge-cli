@@ -68,6 +68,11 @@ server. None of it has run against a real AWS or Google account yet.
   within the product's own folder.
 - **`FLUID_STATE_BACKEND`** is the default for `apply --state-backend`; a
   bucket-only value keys each contract's state apart (#654).
+- **A Command Center organization can be named by its slug** (#660):
+  `catalogs.fluid-command-center.organization: <slug>` in a FLUID config, for a
+  setting that must be the same on every deployment (ids are generated per
+  Command Center). An id still wins; a slug no organization carries writes
+  nothing.
 - `fluid generate ci` options: `--apply-mode-default`, `--schedule-sync-default`,
   `--scheduler-default`, `--scheduler-destination-default`,
   `--diff-last-applied` (needs the copyartifact plugin), `--fluid-package-spec`;
