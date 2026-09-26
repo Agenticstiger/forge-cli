@@ -54,7 +54,7 @@ import tarfile
 import unicodedata
 from importlib import import_module
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import yaml
 
