@@ -138,6 +138,7 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
   fluid generate ci --system circleci        # CircleCI
   fluid generate ci --system tekton          # Tekton (writes tekton/*.yaml)
   fluid generate ci --complexity advanced    # multi-env with approvals
+  fluid generate ci --system jenkins --fluid-env-default aws   # FLUID_ENV defaults to aws
   fluid generate ci --out .github/workflows/ci.yml   # single-file systems only
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -251,6 +252,19 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
             "installs into the workspace venv). Default: this forge-cli version, "
             "with the extras the contract's bindings need across its base and "
             "every overlay, e.g. 'data-product-forge[aws,local]==X.Y.Z'."
+        ),
+    )
+    p.add_argument(
+        "--fluid-env-default",
+        default=None,
+        metavar="ENV",
+        help=(
+            "Default of the pipeline's FLUID_ENV parameter (the overlay every stage "
+            "passes to --env) and the fallback every stage's read of it uses, so a "
+            "build with no parameters (a Jenkins job's first build, its first after "
+            "a restart, or one an upstream trigger starts, which Jenkins runs with "
+            "the defaults) runs in ENV. An environment name: letters, digits, '.', "
+            "'_' and '-', starting with a letter (default: dev)."
         ),
     )
     p.add_argument(
@@ -606,6 +620,45 @@ def _check_scheduler_destination(raw: str, scheduler: str) -> str:
     return raw
 
 
+def _check_fluid_env_default(raw: Optional[str]) -> Optional[str]:
+    """``--fluid-env-default``, refused at generation time when a stage would
+    refuse it at run time. ``None`` when the option is not given: the pipeline
+    keeps ``dev``. A blank value is refused rather than read as ``dev``.
+
+    Every stage passes FLUID_ENV to ``--env``, and two of them hold it to a
+    grammar: ``fluid generate artifacts`` (stage 3, whose scheduled DAGs run
+    ``fluid apply --env``) and ``fluid publish`` (stage 10). A default one of
+    the pipeline's own stages refuses would fail every build that runs on the
+    defaults, so it must be a name both accept (their validators, reused):
+    letters, digits, '.', '_' and '-', starting with a letter, at most 64
+    characters.
+    """
+    if raw is None:
+        return None
+    from fluid_build.forge.core.pipeline_systems._base import check_env_name
+
+    from .publish import _env_name
+
+    value = raw.strip()
+    try:
+        if not value:
+            raise ValueError("--fluid-env-default takes an environment name, not blank")
+        _env_name(value)
+        return check_env_name("--fluid-env-default", value)
+    except (ValueError, argparse.ArgumentTypeError) as exc:
+        raise CLIError(
+            1,
+            "generate_ci_fluid_env_default_invalid",
+            {
+                "error": str(exc),
+                "hint": (
+                    "use letters, digits, '.', '_' and '-', starting with a letter "
+                    "(at most 64 characters): every stage passes it to --env"
+                ),
+            },
+        )
+
+
 def _echo_pipeline_summary(config: Any, jenkins_plugins: Optional[List[str]]) -> None:
     """What the generated pipeline installs and, for Jenkins, the plugins it needs."""
     from fluid_build import __version__
@@ -781,6 +834,7 @@ def run(args, logger: logging.Logger) -> int:
                 {"hint": "--fluid-package-spec takes a pip requirement, not blank or an option"},
             )
         schedule_sync_default_arg = getattr(args, "schedule_sync_default", None)
+        fluid_env_default = _check_fluid_env_default(getattr(args, "fluid_env_default", None))
 
         config = PipelineConfig(
             provider=provider,
@@ -795,6 +849,7 @@ def run(args, logger: logging.Logger) -> int:
             scheduler_default=scheduler_default,
             scheduler_destination_default=scheduler_destination,
             diff_last_applied=bool(getattr(args, "diff_last_applied", None)),
+            fluid_env_default=fluid_env_default,
             generates_artifacts=generates_artifacts,
             install_mode=install_mode,
             default_publish_target=default_publish_target,

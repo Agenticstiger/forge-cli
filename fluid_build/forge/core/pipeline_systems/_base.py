@@ -122,6 +122,25 @@ def check_pipeline_workdir(workdir: str) -> str:
     return workdir
 
 
+def check_env_name(what: str, value: str) -> str:
+    """Return ``value`` if it is an overlay environment name.
+
+    FLUID_ENV names an overlay file and reaches ``--env`` in every stage, and
+    stage 3's scheduled DAGs pass it to ``fluid apply --env``: the grammar
+    those DAGs hold it to (:func:`validate_env_name`, reused rather than
+    copied) keeps a default from carrying a path, a space, a glob or a
+    newline into an overlay lookup or an unquoted ``--env ${FLUID_ENV:-...}``.
+    ``fluid generate ci --fluid-env-default`` also refuses what ``fluid publish
+    --env`` would.
+    """
+    from fluid_build.schedulers.airflow.fluid_apply import ScheduleRenderError, validate_env_name
+
+    try:
+        return validate_env_name(value)
+    except ScheduleRenderError as exc:
+        raise ValueError(f"{what} {value!r} is not an environment name: {exc}") from exc
+
+
 def sh_param(name: str, default: str, *, keep_blank: bool = False) -> str:
     """The POSIX expansion of pipeline parameter ``name`` with its declared default.
 
@@ -357,6 +376,12 @@ class PipelineConfig:
     # "pending" rather than drift. Jenkins only; needs the copyartifact
     # plugin, which is why it is off unless asked for.
     diff_last_applied: bool = False
+    # The ``FLUID_ENV`` default: the parameter's declared default and the
+    # fallback of every shell read of it (``${FLUID_ENV:-<env>}``). ``None``
+    # keeps ``dev``. A build that gets no parameters (a Jenkins job's first
+    # build, its first after a restart re-seeded it) runs in it, and so does
+    # one an upstream trigger starts, which Jenkins runs with the defaults.
+    fluid_env_default: Optional[str] = None
 
     def __post_init__(self):
         if self.environments is None:
@@ -583,12 +608,19 @@ class BasePipelineTemplate:
             ),
         }
         # The contract ``fluid generate ci`` was given is every command's
-        # fallback for CONTRACT, not the literal default name.
-        contract = self._pipeline_defaults(config)["CONTRACT"]
-        fallback = sh_param("CONTRACT", contract)
-        return {
-            k: v.replace("${CONTRACT:-contract.fluid.yaml}", fallback) for k, v in commands.items()
+        # fallback for CONTRACT, not the literal default name, and the
+        # FLUID_ENV default is every command's fallback for FLUID_ENV.
+        d = self._pipeline_defaults(config)
+        fallbacks = {
+            "${CONTRACT:-contract.fluid.yaml}": sh_param("CONTRACT", d["CONTRACT"]),
+            "${FLUID_ENV:-dev}": sh_param("FLUID_ENV", d["FLUID_ENV"]),
         }
+        rendered: Dict[str, str] = {}
+        for key, command in commands.items():
+            for literal, fallback in fallbacks.items():
+                command = command.replace(literal, fallback)
+            rendered[key] = command
+        return rendered
 
     def _get_common_environment_vars(self) -> Dict[str, str]:
         """Get common environment variables"""
@@ -948,9 +980,10 @@ class BasePipelineTemplate:
         spec = opt("fluid_package_spec", "") or default_fluid_package_spec(
             getattr(config, "package_extras", None)
         )
+        fluid_env = check_env_name("FLUID_ENV default", opt("fluid_env_default", "dev"))
         defaults = {
             "CONTRACT": opt("contract_path", "contract.fluid.yaml"),
-            "FLUID_ENV": "dev",
+            "FLUID_ENV": fluid_env,
             "APPLY_MODE": apply_mode,
             "APPLY_BUILD_ID": opt("apply_build_id_default", ""),
             "ALLOW_DATA_LOSS": "false",
@@ -1241,8 +1274,9 @@ class BasePipelineTemplate:
         sh — wrapping in parentheses would spawn a subshell and prevent
         ``set -eu`` from propagating to parent shell flags.
 
-        Each sh body uses ``"${CONTRACT:-contract.fluid.yaml}"`` +
-        ``"${FLUID_ENV:-dev}"`` defaults so Build Now works without the
+        Each sh body reads CONTRACT and FLUID_ENV with their declared
+        defaults as fallbacks (``"${CONTRACT:-<contract>}"``,
+        ``"${FLUID_ENV:-<env>}"``) so Build Now works without the
         operator pre-setting every env var. Credential-bearing env vars
         (SNOWFLAKE_*, AWS_*, DMM_*) are NOT defaulted here — they come
         from the CI system's secret store per the credential banner.

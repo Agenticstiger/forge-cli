@@ -980,6 +980,43 @@ class TestGeneratedContractEnvAcrossSystems:
         )
 
 
+class TestFluidEnvDefaultAcrossSystems:
+    """``--fluid-env-default`` reaches every system the way Jenkins gets it:
+    the FLUID_ENV parameter's default (the shared ``_eleven_stage_parameters``
+    table) and every shell fallback, in the shared stage specs and in the
+    legacy command set alike. No ``${FLUID_ENV:-dev}`` survives it."""
+
+    @staticmethod
+    def _files(provider, complexity, **kwargs):
+        cfg = PipelineConfig(provider=provider, complexity=complexity, **kwargs)
+        return PipelineTemplateGenerator().generate_pipeline(cfg)
+
+    @pytest.mark.parametrize("complexity", list(PipelineComplexity))
+    @pytest.mark.parametrize("provider", list(PipelineProvider))
+    def test_every_fallback_moves_to_the_default(self, provider, complexity):
+        default = self._files(provider, complexity)
+        staging = self._files(provider, complexity, fluid_env_default="staging")
+        assert set(staging) == set(default)
+        for path, content in staging.items():
+            assert "${FLUID_ENV:-dev}" not in content, path
+            assert content.count("${FLUID_ENV:-staging}") == default[path].count(
+                "${FLUID_ENV:-dev}"
+            ), path
+
+    @pytest.mark.parametrize("provider", list(PipelineProvider))
+    def test_the_parameter_table_declares_the_default(self, provider):
+        cfg = PipelineConfig(
+            provider=provider,
+            complexity=PipelineComplexity.STANDARD,
+            fluid_env_default="staging",
+        )
+        template = PipelineTemplateGenerator().templates[provider]
+        declared = {
+            name: default for name, _k, default, _d in template._eleven_stage_parameters(cfg)
+        }
+        assert declared["FLUID_ENV"] == "staging"
+
+
 # ---------------------------------------------------------------------------
 # Reference-only contract detection + git-prefix workdir resolution
 # ---------------------------------------------------------------------------
