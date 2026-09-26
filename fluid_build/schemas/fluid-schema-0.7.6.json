@@ -619,7 +619,7 @@
           "$ref": "#/$defs/binding"
         },
         "lifecycle": {
-          "$ref": "#/$defs/lifecycle"
+          "$ref": "#/$defs/exposeLifecycle"
         },
         "observability": {
           "$ref": "#/$defs/observability"
@@ -1592,6 +1592,32 @@
         "packaging": {
           "$ref": "#/$defs/packaging",
           "description": "NEW in v0.7.6: Per-exposure packaging override — key-wise precedence over the contract-wide top-level `packaging` block (binding.packaging > packaging > absent-legacy)."
+        },
+        "encryption": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "NEW in v0.7.6: Encryption at rest for an AWS S3 binding. Absent: nothing is emitted and S3's default encryption (SSE-S3) applies to new objects.",
+          "properties": {
+            "kms": {
+              "type": "string",
+              "default": "product",
+              "anyOf": [
+                {
+                  "enum": [
+                    "product",
+                    "none"
+                  ]
+                },
+                {
+                  "pattern": "^alias/[A-Za-z0-9/_-]{1,250}$"
+                },
+                {
+                  "pattern": "^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:(key|alias)/[A-Za-z0-9/_-]{1,250}$"
+                }
+              ],
+              "description": "NEW in v0.7.6: The KMS key the bucket's objects are encrypted with (SSE-KMS with an S3 Bucket Key). 'product' (the default): `fluid apply` creates a customer managed key for each bucket this product owns (aws_kms_key, rotation on, alias alias/fluid/<contract id>/<bucket>) and makes it the bucket's default encryption (aws_s3_bucket_server_side_encryption_configuration). Its key policy lets the account's IAM policies decide who may use it (the KMS default statement for the account root) and, when the binding carries governance.lakeFormation, lets the Lake Formation service-linked role AWSServiceRoleForLakeFormationDataAccess encrypt and decrypt, matched by aws:PrincipalArn so the role need not exist yet. A principal querying through Athena with credentials Lake Formation vends then needs no KMS permission of its own; a grantee in another account that the bucket policy lets read the objects directly (governance.lakeFormation.bucketPolicy) is also allowed kms:Decrypt, through S3 only. The writer (the identity the build runs as) needs kms:GenerateDataKey and kms:Decrypt from IAM. `tofu destroy` deletes the alias and schedules the key for deletion after 7 days, the minimum KMS allows; kms:CancelKeyDeletion recovers it until then. Dropping the block, or naming another key, removes the product key while the bucket keeps the objects encrypted under it, which become unreadable once the deletion window ends unless they are rewritten or the deletion is cancelled; `fluid apply` refuses that plan without --allow-data-loss. On a shared (pool) bucket the bucket's default encryption is the pool owner's, so 'product' is refused there. 'alias/<name>' or a key or alias ARN: an existing key, made the default encryption of a bucket this product owns, and on a pool bucket only checked; its key policy is its owner's, and must let the Lake Formation role use it when the location is registered (an AWS managed key such as alias/aws/s3 cannot be used with that role, and is refused with registerLocation). 'none': nothing is emitted. `fluid verify` checks that the objects under the binding's prefix are SSE-KMS with that key."
+            }
+          }
         }
       }
     },
@@ -2009,6 +2035,58 @@
           "description": "Lifecycle labels for governance."
         }
       }
+    },
+    "exposeLifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/lifecycleState",
+          "description": "Unified lifecycle state vocabulary."
+        },
+        "retention": {
+          "$ref": "#/$defs/isoDuration",
+          "description": "How long this expose's data is kept (ISO-8601 duration, e.g. P30D, P7Y). A declaration unless `expire` is true. With `expire: true` on an AWS S3 binding, `fluid apply` expires the objects under the binding's prefix this long after they are written. Years and months are counted as 365 and 30 days, and a part of a day rounds up to a whole one."
+        },
+        "expire": {
+          "type": "boolean",
+          "default": false,
+          "description": "NEW in v0.7.6: Delete stored data once it is older than `retention`. Default false, so a contract that declares a retention period does not start deleting data when forge-cli is upgraded. Honoured by the AWS emitter on an S3 binding (other platforms do not apply it yet): `fluid apply` writes one rule per expose into the bucket's aws_s3_bucket_lifecycle_configuration, filtered to the binding's prefix (location.path, else {database}/{table}/; a binding with neither is refused, so no rule ever expires a whole bucket). The rule expires the current version `retention` after it is written, removes a noncurrent version (on a versioning-enabled bucket) one day after it stops being current, and aborts an incomplete multipart upload after 7 days or the retention period if shorter. The lifecycle configuration is AUTHORITATIVE for the whole bucket: S3 keeps one per bucket, so rules that `fluid apply` did not write are replaced. It is therefore written only for a bucket this product owns; on a shared (pool) bucket (packaging) nothing is written, the pool's owner must hold the rule, and `fluid verify` checks that an enabled rule covering the prefix expires objects after exactly this period. Objects already older than the period when the rule is first applied are expired on S3's next lifecycle run, typically within a day. Removing `expire` later deletes the lifecycle configuration, which `fluid apply` refuses without --allow-data-loss (it refuses every plan that removes a resource); `tofu destroy` deletes it."
+        },
+        "deprecationPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "noticePeriod": {
+              "$ref": "#/$defs/isoDuration"
+            },
+            "contact": {
+              "type": "string"
+            },
+            "replacement": {
+              "type": "string",
+              "description": "Reference to replacement data product or expose."
+            },
+            "tags": {
+              "$ref": "#/$defs/tags",
+              "description": "Deprecation policy tags."
+            },
+            "labels": {
+              "$ref": "#/$defs/labels",
+              "description": "Deprecation policy labels."
+            }
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Lifecycle tags for automation."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Lifecycle labels for governance."
+        }
+      },
+      "description": "NEW in v0.7.6: An expose's lifecycle. The same fields as the contract-root lifecycle, plus `expire`, which is only meaningful where there is storage to expire."
     },
     "docs": {
       "type": "object",

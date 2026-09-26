@@ -57,6 +57,13 @@ Three checks, each against the live account:
    is not agreement. The one exception is a reference-only contract with no
    run of its own to compare with: a pipeline outside forge owns the rows and
    may not have run yet, so the empty table is INFO, as a missing one is.
+4. **The storage policies**, when the expose declares them: the bucket's
+   lifecycle rule for the prefix expires objects after the contract's
+   ``lifecycle.retention`` (with ``expire: true``), and the objects under the
+   prefix are SSE-KMS with the key ``binding.encryption.kms`` names. See
+   ``_verify_storage_policy.py``. When the result goes to the binding-bucket
+   default below and the binding declares a key, Athena encrypts the result
+   with that key (``EncryptionConfiguration`` SSE_KMS).
 
 The binding's ``{{ env.* }}`` templates are resolved with the resolver
 ``fluid apply`` runs before it emits (``resolve_env_templates_in_contract``),
@@ -570,6 +577,7 @@ def _count_rows(
     *,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
+    results_kms_key: Optional[str] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     # Identifier positions cannot be bound, so check before interpolating:
     # ``_ATHENA_IDENT_RE`` admits nothing that can close a double-quoted name.
@@ -582,6 +590,16 @@ def _count_rows(
     request: Dict[str, Any] = {"QueryString": sql, "WorkGroup": options.workgroup}
     if results.send:
         request["ResultConfiguration"] = {"OutputLocation": results.send}
+    encrypt_result = bool(results_kms_key) and results.source == "binding-bucket"
+    if encrypt_result:
+        # The default location is forge-cli's own, under the binding's bucket,
+        # so the result gets the key the binding declares for that bucket
+        # rather than whatever the bucket's default happens to be. A location
+        # someone else chose keeps its own encryption settings.
+        request["ResultConfiguration"]["EncryptionConfiguration"] = {
+            "EncryptionOption": "SSE_KMS",
+            "KmsKey": results_kms_key,
+        }
 
     query: Dict[str, Any] = {
         "workgroup": options.workgroup,
@@ -592,6 +610,8 @@ def _count_rows(
     }
     if results.note:
         query["output_location_note"] = results.note
+    if encrypt_result:
+        query["output_encryption"] = {"option": "SSE_KMS", "kms_key": results_kms_key}
     query_id = str(athena.start_query_execution(**request)["QueryExecutionId"])
     query["query_execution_id"] = query_id
     LOG.info(
@@ -1149,6 +1169,9 @@ def _severity(
                 "Re-run the build and check its run record, then verify again",
             )
         )
+    for name, action in _STORAGE_ACTIONS.items():
+        if (dimensions.get(name) or {}).get("status") == "fail":
+            problems.append((dimensions[name]["message"], action))
     if not problems:
         if dimensions["row_count"]["status"] == "info" and severity["level"] == "SUCCESS":
             return {
@@ -1169,6 +1192,19 @@ def _severity(
         "reason": "; ".join(([severity["reason"]] if already else []) + [p[0] for p in problems]),
         "actions": (list(severity["actions"]) if already else []) + [p[1] for p in problems],
     }
+
+
+#: What to do about a failed storage dimension (see ``_verify_storage_policy.py``).
+_STORAGE_ACTIONS = {
+    "retention": (
+        "Re-apply so the bucket's lifecycle rule matches lifecycle.retention, or, on a "
+        "shared bucket, ask its owner for the rule"
+    ),
+    "encryption": (
+        "Re-apply so the bucket's default encryption is the declared key, then rewrite "
+        "the objects written before it (S3 does not re-encrypt existing objects)"
+    ),
+}
 
 
 # ── Entry point ─────────────────────────────────────────────────────────
@@ -1248,6 +1284,13 @@ def verify_athena_expose(
     schema = _compare_schema(glue_table, _declared_fields(expose))
     actual_location = str((glue_table.get("StorageDescriptor") or {}).get("Location") or "")
     dimensions = _catalogue_dimensions(schema, actual_location, expected_location, region)
+    # Retention and encryption at rest, when the expose declares them.
+    from fluid_build.cli._verify_storage_policy import storage_policy
+
+    storage = storage_policy(
+        expose_id, expose, binding, contract=contract, region=region, factory=factory
+    )
+    dimensions.update(storage.dimensions)
 
     # The result must stay out of what Athena reads and of what the build writes.
     table_locations = [where for where in (actual_location, expected_location) if where]
@@ -1262,6 +1305,7 @@ def verify_athena_expose(
             region,
             sleep=sleep or time.sleep,
             monotonic=monotonic or time.monotonic,
+            results_kms_key=storage.kms_key_arn,
         )
     except AthenaVerifyError as exc:
         return _error(str(exc), target=target, exists=True, dimensions=dimensions)
@@ -1285,11 +1329,11 @@ def verify_athena_expose(
     severity = _severity(schema, dimensions, expected_location)
     has_issues = any(
         dimensions[name]["status"] == "fail"
-        for name in ("structure", "types", "location", "row_count")
+        for name in ("structure", "types", "location", "row_count", *storage.dimensions)
     )
     created = glue_table.get("CreateTime")
     modified = glue_table.get("UpdateTime")
-    return {
+    result: Dict[str, Any] = {
         "status": "mismatch" if has_issues else "match",
         "exists": True,
         "table_id": table_id,
@@ -1304,3 +1348,9 @@ def verify_athena_expose(
         },
         "athena": query,
     }
+    if storage.errors:
+        # A declared policy that could not be checked is unproven, not passed:
+        # an error, which fails verify with or without --strict.
+        result["status"] = "error"
+        result["error"] = "; ".join(storage.errors)
+    return result

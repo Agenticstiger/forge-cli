@@ -33,6 +33,13 @@ decides per container kind whether this contract owns the container:
   validate``). A referenced bucket carries **no** ``force_destroy``, and the
   grants it does emit narrow to the binding's ``location.path`` prefix so a
   tenant cannot reach another tenant's objects in the pool.
+
+**Retention and encryption at rest** (fluid-schema 0.7.6). An expose's
+``lifecycle {retention, expire: true}`` becomes a prefix-scoped rule in the
+bucket's ``aws_s3_bucket_lifecycle_configuration``; ``binding.encryption.kms``
+becomes the bucket's default SSE-KMS, with a KMS key and alias per product and
+bucket for ``kms: product``. Both are written only for a bucket this product
+owns. See the section at the end of this module and ``aws_storage.py``.
 """
 
 from __future__ import annotations
@@ -41,7 +48,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import yaml
@@ -59,6 +66,8 @@ from ..packaging import (
 )
 from ..provider_match import is_cloud
 from ..versions import required_providers
+from . import aws_storage
+from .aws_storage import Retention
 
 LOG = logging.getLogger(__name__)
 
@@ -382,6 +391,10 @@ class AwsIacPlugin:
             # Only fires when the binding carries a governance.lakeFormation
             # block — every existing AWS contract is unaffected.
             _emit_lakeformation(resources, binding, loc, fmt, cid, tags, placement=placement)
+        # Retention (exposes[].lifecycle) and encryption at rest
+        # (binding.encryption), per bucket this product owns. Nothing is
+        # added for a contract that declares neither.
+        _emit_storage_policies(resources, contract, cid)
         # Glue ETL jobs / Step Functions / the Lambda schedule path —
         # the planner's build & orchestration ops.
         _emit_from_actions(resources, actions, cid)
@@ -425,11 +438,19 @@ class AwsIacPlugin:
         # so downstream resources can ``tofu_ref`` ``account_id`` off it.
         # ...and whenever a binding's warehouse falls back to the
         # ``{account}-fluid-data`` bucket, whose token references this source.
-        if _contract_uses_lakeformation(contract) or _references_caller_account(contract):
+        # ...and whenever a product KMS key's policy names the account.
+        storage = _storage_by_bucket(contract, cid)
+        if (
+            _contract_uses_lakeformation(contract)
+            or _references_caller_account(contract)
+            or any(s.product_key for s in storage.values())
+        ):
             data.setdefault("aws_caller_identity", {})["fluid_lf_caller"] = {}
         # A ``cross-account`` LF bucket policy filters its grantees at plan
         # time against that same caller identity.
         _emit_lf_bucket_policy_data(data, contract, cid)
+        # The key policy of each product KMS key.
+        _emit_product_key_policy_data(data, storage)
         return data
 
     def credential_env(self, env: Mapping[str, str]) -> Dict[str, str]:
@@ -1981,3 +2002,467 @@ def _emit_lakeformation(
             }
             filter_key = safe_ident(f"{cid}_lf_filter_{table}_{filter_name}")
             resources.setdefault("aws_lakeformation_data_cells_filter", {})[filter_key] = body
+
+
+# ---------------------------------------------------------------------------
+# Retention and encryption at rest — emit
+# ---------------------------------------------------------------------------
+#
+# What each exposure asks for is derived in ``aws_storage`` (shared with
+# ``fluid verify``); this section turns it into resources, per bucket, because
+# both S3 controls are per bucket:
+#
+#   * ``exposes[].lifecycle {retention, expire: true}`` → one rule per exposure,
+#     filtered to its prefix, in the bucket's single
+#     ``aws_s3_bucket_lifecycle_configuration``;
+#   * ``binding.encryption.kms`` → the bucket's
+#     ``aws_s3_bucket_server_side_encryption_configuration`` (SSE-KMS with an S3
+#     Bucket Key), plus, for ``product``, an ``aws_kms_key`` and
+#     ``aws_kms_alias`` and the key policy's ``aws_iam_policy_document``.
+#
+# Both S3 resources are AUTHORITATIVE for the whole bucket ("S3 Buckets only
+# support a single lifecycle configuration", terraform-provider-aws; the same
+# holds for the default encryption), so they are written only for a bucket
+# this product owns. On a shared pool they would replace the pool owner's and
+# every other tenant's configuration, so nothing is written there: the pool
+# owner holds the lifecycle rule and the default key, and ``fluid verify``
+# checks them against the contract. The resource shapes follow
+# cloudposse/terraform-aws-s3-bucket (``lifecycle.tf``) and
+# terraform-aws-modules/terraform-aws-kms (the ``Default`` key-policy statement).
+
+
+@dataclass
+class _BucketStorage:
+    """What one bucket this product owns carries, gathered over its exposures."""
+
+    #: The contract's bucket value, exactly as :func:`_emit_s3` keys it.
+    bucket: str
+    bucket_key: str
+    tags: Dict[str, str]
+    rules: List[Retention] = field(default_factory=list)
+    #: ``(prefix, retention days or None, label)`` of every AWS exposure landing here.
+    landings: List[Tuple[str, Optional[int], str]] = field(default_factory=list)
+    #: ``product``, an existing key's alias / ARN, or ``None`` (not declared).
+    kms: Optional[str] = None
+    kms_from: str = ""
+    lakeformation: bool = False
+    registers_location: bool = False
+    bucket_policy: Optional[_LfBucketPolicy] = None
+
+    @property
+    def product_key(self) -> bool:
+        return self.kms == aws_storage.KMS_PRODUCT
+
+    @property
+    def key_res(self) -> str:
+        """Key of the ``aws_kms_key`` / ``aws_kms_alias`` for this bucket."""
+        return safe_ident(f"{self.bucket_key}_kms")
+
+    def add(
+        self,
+        label: str,
+        loc: Mapping[str, Any],
+        retention: Optional[Retention],
+        encryption: Optional[aws_storage.Encryption],
+    ) -> None:
+        """Record one exposure landing in this bucket."""
+        self.landings.append(
+            (aws_storage.data_prefix(loc), retention.days if retention else None, label)
+        )
+        if retention is not None:
+            self.rules.append(retention)
+        if encryption is None:
+            return
+        if self.kms is not None and self.kms != encryption.kms:
+            raise UnsupportedBindingError(
+                "encryption-conflict",
+                f"{self.kms_from} and {label} write into the bucket {self.bucket!r} but "
+                f"declare different binding.encryption.kms values ({self.kms!r} and "
+                f"{encryption.kms!r}); a bucket has one default encryption.",
+                ("Declare the same kms on every expose that writes into the bucket.",),
+            )
+        self.kms, self.kms_from = encryption.kms, label
+
+
+def _storage_by_bucket(
+    contract: Mapping[str, Any], cid: str, *, log: bool = False
+) -> Dict[str, _BucketStorage]:
+    """Every bucket this product owns that an exposure asks retention or encryption of.
+
+    THE one walk, shared by :meth:`AwsIacPlugin.emit` (the resources) and
+    :meth:`AwsIacPlugin.emit_data` (the key policies), so the two halves agree
+    on which keys exist. Buckets that no exposure asks anything of are left
+    out, which is what keeps every existing contract's emit unchanged. ``log``
+    is set by the emit only, so a shared bucket's notice is logged once.
+    """
+    packaging = resolve_packaging(contract)
+    owned: Dict[str, _BucketStorage] = {}
+    for index, exposure in enumerate(contract.get("exposes") or []):
+        binding = exposure.get("binding") or {}
+        if not is_cloud(binding, "aws"):
+            continue
+        retention = aws_storage.retention_for(exposure, index)
+        encryption = aws_storage.encryption_for(binding)
+        loc = binding.get("location") or {}
+        bucket = loc.get("bucket")
+        label = f"exposes[{_expose_id(exposure) or index}]"
+        if not bucket:
+            _require_bucket(label, retention, encryption)
+            continue
+        placement = _placement(packaging, exposure)
+        if placement.bucket_referenced:
+            _shared_bucket_storage(label, str(bucket), retention, encryption, log=log)
+            continue
+        state = owned.setdefault(
+            str(bucket),
+            _BucketStorage(
+                bucket=str(bucket),
+                bucket_key=safe_ident(f"{cid}_{bucket}"),
+                tags=_tags_for({"managed_by": "fluid", "fluid_contract": cid}, placement),
+            ),
+        )
+        state.add(label, loc, retention, encryption)
+        gov = (binding.get("governance") or {}).get("lakeFormation") or {}
+        state.lakeformation = state.lakeformation or bool(gov)
+        state.registers_location = state.registers_location or bool(gov.get("registerLocation"))
+        bucket_policy = _lf_bucket_policy(
+            binding, loc, binding.get("format") or "parquet", cid, placement=placement
+        )
+        if bucket_policy is not None:
+            # The same slot :func:`_emit_lf_bucket_policy` fills: one per bucket,
+            # the last exposure's wins.
+            state.bucket_policy = bucket_policy
+    for state in owned.values():
+        _check_retention_overlaps(state)
+        _check_key_usable_by_lakeformation(state)
+    return {bucket: s for bucket, s in owned.items() if s.rules or s.kms is not None}
+
+
+def _require_bucket(
+    label: str,
+    retention: Optional[Retention],
+    encryption: Optional[aws_storage.Encryption],
+) -> None:
+    """Retention and encryption apply to a bucket; a binding without one cannot have them."""
+    if retention is None and encryption is None:
+        return
+    raise UnsupportedBindingError(
+        "storage-requires-bucket",
+        f"{label} asks for "
+        + ("retention" if retention else "encryption at rest")
+        + " but its binding names no location.bucket, so there is no bucket this product "
+        "owns to apply it to.",
+        ("Add binding.location.bucket.",),
+    )
+
+
+def _shared_bucket_storage(
+    label: str,
+    bucket: str,
+    retention: Optional[Retention],
+    encryption: Optional[aws_storage.Encryption],
+    *,
+    log: bool,
+) -> None:
+    """A shared (pool) bucket: nothing is written, and ``product`` cannot work."""
+    if encryption is not None and encryption.product_key:
+        raise PackagingError(
+            "shared-bucket-encryption",
+            f"{label} declares binding.encryption.kms: product on the shared (pool) bucket "
+            f"{bucket!r}. A product key only takes effect as the bucket's default "
+            "encryption, which is authoritative for the whole bucket and belongs to the "
+            "pool's owner; it would re-key every other tenant's new objects. Name the "
+            "pool's key (kms: alias/<name> or its ARN) so `fluid verify` checks the "
+            "objects use it, or declare the bucket `isolated` if this product owns it.",
+        )
+    if not log:
+        return
+    if retention is not None:
+        LOG.warning(
+            "aws_shared_bucket_retention_not_emitted bucket=%s prefix=%s days=%d rule=%s: "
+            "a lifecycle configuration is authoritative for the whole bucket, so the pool's "
+            "owner must hold this rule; fluid verify checks it",
+            bucket,
+            retention.prefix,
+            retention.days,
+            retention.rule_id,
+        )
+    if encryption is not None:
+        LOG.info(
+            "aws_shared_bucket_encryption_not_emitted bucket=%s: the pool's default "
+            "encryption is its owner's; fluid verify checks the objects use the declared key",
+            bucket,
+        )
+
+
+def _check_retention_overlaps(state: _BucketStorage) -> None:
+    """Refuse a rule that would expire another exposure's objects on another schedule.
+
+    S3 applies every enabled rule whose filter matches, and the earliest
+    expiration wins, so a rule on ``bronze/`` also expires what an exposure
+    landing under ``bronze/orders/`` declared it keeps longer, or forever.
+    Rule ids must also be unique within the configuration.
+    """
+    seen: Dict[str, str] = {}
+    for rule in state.rules:
+        if rule.rule_id in seen:
+            raise UnsupportedBindingError(
+                "retention-overlap",
+                f"two exposes on the bucket {state.bucket!r} would both write the lifecycle "
+                f"rule {rule.rule_id!r}; expose ids must be unique.",
+                ("Give every expose a distinct exposeId.",),
+            )
+        seen[rule.rule_id] = rule.prefix
+        for prefix, days, label in state.landings:
+            if prefix.startswith(rule.prefix) and days != rule.days:
+                kept = f"{days} day(s)" if days is not None else "no retention period"
+                raise UnsupportedBindingError(
+                    "retention-overlap",
+                    f"{label} lands under {prefix!r}, inside the prefix {rule.prefix!r} that the "
+                    f"lifecycle rule {rule.rule_id} expires after {rule.days} day(s), but "
+                    f"{label} declares {kept} with expire; S3 would expire its objects on "
+                    "the other expose's schedule.",
+                    (
+                        "Give the two exposes prefixes that do not contain each other.",
+                        "Or declare the same lifecycle.retention and expire on both.",
+                    ),
+                )
+
+
+def _check_key_usable_by_lakeformation(state: _BucketStorage) -> None:
+    """An AWS managed key cannot be used by the service-linked role forge-cli registers with."""
+    if state.kms is None or state.product_key or not state.registers_location:
+        return
+    name = state.kms.split(":", 5)[5] if state.kms.startswith("arn:") else state.kms
+    if name in aws_storage.AWS_MANAGED_S3_ALIASES:
+        raise UnsupportedBindingError(
+            "encryption-aws-managed-key",
+            f"{state.kms_from} encrypts the bucket {state.bucket!r} with the AWS managed key "
+            f"{state.kms!r} and registers the location with Lake Formation, which forge-cli "
+            "does with the service-linked role. Lake Formation cannot use that role on a "
+            "location encrypted with an AWS managed key (LF developer guide, Registering an "
+            "encrypted Amazon S3 location).",
+            (
+                "Use kms: product, or a customer managed key whose policy lets "
+                "AWSServiceRoleForLakeFormationDataAccess use it.",
+            ),
+        )
+
+
+def _emit_storage_policies(
+    resources: Dict[str, Any], contract: Mapping[str, Any], cid: str
+) -> None:
+    """Emit the lifecycle rules and default encryption of every owned bucket that asks."""
+    for state in _storage_by_bucket(contract, cid, log=True).values():
+        bucket_ref = _s3_bucket_ref(state.bucket_key, referenced=False)
+        if state.rules:
+            _emit_bucket_lifecycle(resources, state, bucket_ref)
+        if state.kms is not None:
+            _emit_bucket_encryption(resources, state, bucket_ref, cid)
+
+
+def _lifecycle_rule(rule_id: str, prefix: str, days: int) -> Dict[str, Any]:
+    return {
+        "id": rule_id,
+        "status": "Enabled",
+        # Always a filter: with neither ``filter`` nor ``prefix`` the provider
+        # defaults the rule to the whole bucket.
+        "filter": [{"prefix": prefix}],
+        "expiration": [{"days": days}],
+        "noncurrent_version_expiration": [{"noncurrent_days": aws_storage.NONCURRENT_VERSION_DAYS}],
+        "abort_incomplete_multipart_upload": [
+            {"days_after_initiation": min(days, aws_storage.ABORT_INCOMPLETE_UPLOAD_DAYS)}
+        ],
+    }
+
+
+def _emit_bucket_lifecycle(
+    resources: Dict[str, Any], state: _BucketStorage, bucket_ref: TofuExpr
+) -> None:
+    """One ``aws_s3_bucket_lifecycle_configuration`` per owned bucket, one rule per exposure.
+
+    Plus a rule for ``fluid verify``'s own Athena results prefix under the
+    bucket (``aws_storage.VERIFY_RESULTS_PREFIX``): the configuration replaces
+    any rule an operator put there, and those result files are counts over this
+    product's data, so they are kept no longer than the shortest period
+    declared on the bucket.
+    """
+    rules = [_lifecycle_rule(r.rule_id, r.prefix, r.days) for r in state.rules]
+    rules.append(
+        _lifecycle_rule(
+            "fluid-verify-athena-results",
+            aws_storage.VERIFY_RESULTS_PREFIX,
+            min(r.days for r in state.rules),
+        )
+    )
+    resources.setdefault("aws_s3_bucket_lifecycle_configuration", {})[state.bucket_key] = {
+        "bucket": bucket_ref,
+        "rule": rules,
+    }
+
+
+def _emit_bucket_encryption(
+    resources: Dict[str, Any], state: _BucketStorage, bucket_ref: TofuExpr, cid: str
+) -> None:
+    """The bucket's default SSE-KMS, and the product key when ``kms`` is ``product``."""
+    kms_key: Any
+    if state.product_key:
+        key_res = state.key_res
+        resources.setdefault("aws_kms_key", {})[key_res] = {
+            # Contract-derived text stays a plain string; the renderer escapes it.
+            "description": f"FLUID data product {cid}: objects in s3://{state.bucket}",
+            "enable_key_rotation": True,
+            # ``tofu destroy`` schedules the deletion; 7 is KMS's minimum.
+            "deletion_window_in_days": aws_storage.KEY_DELETION_WINDOW_DAYS,
+            "policy": tofu_ref(f"data.aws_iam_policy_document.{key_res}_policy.json"),
+            "tags": state.tags,
+        }
+        resources.setdefault("aws_kms_alias", {})[key_res] = {
+            "name": aws_storage.product_key_alias(cid, state.bucket),
+            "target_key_id": tofu_ref(f"aws_kms_key.{key_res}.key_id"),
+        }
+        kms_key = tofu_ref(f"aws_kms_key.{key_res}.arn")
+    else:
+        # An existing key named by the contract: a plain, escaped string.
+        kms_key = state.kms
+    resources.setdefault("aws_s3_bucket_server_side_encryption_configuration", {})[
+        state.bucket_key
+    ] = {
+        "bucket": bucket_ref,
+        "rule": [
+            {
+                "apply_server_side_encryption_by_default": [
+                    {"sse_algorithm": "aws:kms", "kms_master_key_id": kms_key}
+                ],
+                # An S3 Bucket Key: S3 asks KMS for a bucket-level data key
+                # instead of one per object, which cuts KMS requests.
+                "bucket_key_enabled": True,
+            }
+        ],
+    }
+
+
+#: The Lake Formation service-linked role, the role forge-cli registers
+#: locations with (``use_service_linked_role`` on ``aws_lakeformation_resource``).
+_LF_SERVICE_LINKED_ROLE = (
+    "role/aws-service-role/lakeformation.amazonaws.com/AWSServiceRoleForLakeFormationDataAccess"
+)
+
+#: What that role needs on a customer managed key: the "Allow use of the key"
+#: actions in the LF developer guide (*Registering an encrypted Amazon S3
+#: location*).
+_LF_KEY_ACTIONS = [
+    "kms:Encrypt",
+    "kms:Decrypt",
+    "kms:ReEncrypt*",
+    "kms:GenerateDataKey*",
+    "kms:DescribeKey",
+]
+
+
+def _emit_product_key_policy_data(data: Dict[str, Any], storage: Mapping[str, Any]) -> None:
+    """The ``aws_iam_policy_document`` of each product key.
+
+    * ``EnableIamPolicies``: the KMS default key policy, ``kms:*`` for the
+      account root, which hands the decision to the account's IAM policies
+      (the writer and anyone else the account authorises).
+    * ``AllowLakeFormationDataAccess``, when the bucket carries
+      ``governance.lakeFormation``: the actions the LF guide lists for the
+      service-linked role. Lake Formation assumes that role and vends its
+      scoped-down credentials to Athena, so "you don't have to grant
+      permissions on the KMS key to principals accessing underlying data ...
+      with integrated services such as Amazon Athena" (LF guide, *Registering
+      an encrypted Amazon S3 location across AWS accounts*). The role is
+      matched by ``aws:PrincipalArn`` under ``Principal: *`` rather than
+      named as the principal, because KMS refuses a key policy whose principal
+      does not exist yet, and the role only exists once Lake Formation has
+      registered a location with it (the pattern the IAM Identity Center guide
+      uses for roles that are re-created). ``aws:PrincipalArn`` is the role's
+      ARN, path included, for every session of the role.
+    * the bucket policy's readers, when there is one: a grantee that
+      :func:`_lf_bucket_policy` lets read the objects straight from S3 cannot
+      decrypt them without the key, and one in another account can only be
+      allowed by this policy. ``kms:Decrypt`` only, and only through S3. The
+      same grantee filter as the bucket policy, evaluated at plan time.
+
+    Account-derived text is interpolated; contract-derived text (grantee ARNs)
+    stays a plain string the renderer escapes.
+    """
+    account = tofu_ref("data.aws_caller_identity.fluid_lf_caller.account_id")
+    for state in storage.values():
+        if not state.product_key:
+            continue
+        statements: List[Dict[str, Any]] = [
+            {
+                "sid": "EnableIamPolicies",
+                "effect": "Allow",
+                "principals": [
+                    {"type": "AWS", "identifiers": [TofuExpr(f"arn:aws:iam::{account}:root")]}
+                ],
+                "actions": ["kms:*"],
+                "resources": ["*"],
+            }
+        ]
+        if state.lakeformation:
+            statements.append(
+                {
+                    "sid": "AllowLakeFormationDataAccess",
+                    "effect": "Allow",
+                    "principals": [{"type": "AWS", "identifiers": ["*"]}],
+                    "actions": list(_LF_KEY_ACTIONS),
+                    "resources": ["*"],
+                    "condition": [
+                        {
+                            "test": "ArnEquals",
+                            "variable": "aws:PrincipalArn",
+                            "values": [
+                                TofuExpr(f"arn:aws:iam::{account}:{_LF_SERVICE_LINKED_ROLE}")
+                            ],
+                        }
+                    ],
+                }
+            )
+        document: Dict[str, Any] = {"statement": statements}
+        if state.bucket_policy is not None:
+            _add_bucket_policy_readers(document, state.bucket_policy)
+        data.setdefault("aws_iam_policy_document", {})[f"{state.key_res}_policy"] = document
+
+
+def _add_bucket_policy_readers(document: Dict[str, Any], bp: _LfBucketPolicy) -> None:
+    """Let the bucket policy's readers decrypt, through S3 only.
+
+    ``all-grantees`` names every grantee in a static statement; the default
+    ``cross-account`` iterates over the same plan-time map of other-account
+    grantees the bucket policy's own ``dynamic`` statements use.
+    """
+    reader: Dict[str, Any] = {
+        "effect": "Allow",
+        "actions": ["kms:Decrypt"],
+        "resources": ["*"],
+        "condition": {
+            "test": "StringLike",
+            "variable": "kms:ViaService",
+            "values": ["s3.*.amazonaws.com"],
+        },
+    }
+    if bp.mode == _LF_BUCKET_POLICY_ALL_GRANTEES:
+        document["statement"].append(
+            {
+                "sid": "AllowBucketPolicyReaders",
+                "principals": [{"type": "AWS", "identifiers": list(bp.principals)}],
+                **reader,
+            }
+        )
+        return
+    document["dynamic"] = {
+        "statement": [
+            {
+                "for_each": tofu_ref(_lf_other_account_grantees(bp)),
+                "content": {
+                    "sid": TofuExpr("FluidLfKmsRead" + tofu_ref("statement.key")),
+                    "principals": {"type": "AWS", "identifiers": [tofu_ref("statement.value")]},
+                    **reader,
+                },
+            }
+        ]
+    }

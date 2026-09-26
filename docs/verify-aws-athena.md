@@ -27,6 +27,8 @@ region:
 | Athena can read it | `SELECT COUNT(*)` through Athena, polled until it finishes or the timeout passes | query FAILED, CANCELLED or timed out: error (always exit 1); a timed-out query is stopped, and the error says so only when the stop succeeded |
 | It serves what the build landed | the count against the run records of the acquisition build that writes the expose (see below) | CRITICAL |
 | It is not empty | a count of 0, with or without a run record | CRITICAL; in a reference-only contract with no run of its own to compare with, INFO (see below) |
+| The bucket expires the data on the contract's schedule (only with `exposes[].lifecycle {retention, expire: true}`) | `s3:GetLifecycleConfiguration`: the enabled rules whose filter is a plain prefix covering the binding's prefix; the earliest `Expiration.Days` among them, which is what S3 applies, against `retention` in days | no such rule, or another number of days: CRITICAL; the configuration cannot be read: error |
+| The objects are encrypted with the declared key (only with `binding.encryption`, `kms` other than `none`) | the key resolved with `kms:DescribeKey` (the product key by its alias `alias/fluid/<contract id>/<bucket>`, an alias or ARN as written), then `s3:HeadObject` on every object under the prefix, up to 1000 | an object that is not `aws:kms` with that key, or a key that does not exist: CRITICAL, naming the objects; no object yet: INFO; a call that fails: error |
 
 CRITICAL fails `fluid verify --strict`; INFO fails only with `--fail-on-warning`.
 An error fails `fluid verify` with or without `--strict`. Glue columns declare
@@ -142,6 +144,16 @@ the prefix expires them. The JSON report records the location used and
 why (`results.<expose>.athena.output_location_source`: `workgroup-managed`,
 `workgroup-enforced`, `override`, `workgroup` or `binding-bucket`).
 
+When the result goes to the binding-bucket default and the binding declares a
+KMS key (`binding.encryption`), the query asks Athena to encrypt the result
+with that key (`ResultConfiguration.EncryptionConfiguration`, `SSE_KMS`), and
+the report records it as `athena.output_encryption`. That location is
+forge-cli's own; one chosen by the workgroup or the override keeps its own
+encryption settings. When `fluid apply` writes a lifecycle configuration for
+the bucket (retention with `expire: true`), the configuration replaces every
+rule on the bucket, so it carries a rule for `.fluid/athena-results/` too,
+expiring the result files at the shortest retention declared on the bucket.
+
 boto3 comes from the `aws` extra: `pip install 'data-product-forge[aws]'`.
 Without it the check is an error that names the extra.
 
@@ -214,3 +226,13 @@ database and table replaced by the binding's:
   table.
 * When the result goes to a workgroup or override location, grant the
   `WriteTheResult` actions there instead of on `.fluid/athena-results/`.
+* With a declared retention, add `s3:GetLifecycleConfiguration` on the bucket.
+* With a declared key, add `kms:DescribeKey` on it, and, since the result
+  under the binding's bucket is encrypted with it, `kms:GenerateDataKey` and
+  `kms:Decrypt`. The `ReadTheData` statement's `s3:GetObject` covers
+  `HeadObject`, which reads the encryption without decrypting anything. When
+  the prefix is registered with Lake Formation, Athena reads the data with
+  credentials Lake Formation vends and the key policy `fluid apply` writes
+  lets the Lake Formation role decrypt, so reading needs no KMS permission of
+  its own; without registration, reading through Athena needs `kms:Decrypt`
+  on the key.
