@@ -631,11 +631,31 @@ def _validate_contract_for_version(
     schema_manager: FluidSchemaManager,
     logger: logging.Logger,
 ) -> ValidationResult:
-    import fluid_build.cli.validate as _self
-
     validation_result = schema_manager.validate_contract(
         contract, schema_version=target_version, strict=args.strict, offline_only=args.offline
     )
+    _run_contract_rules(contract, target_version, validation_result, args, logger)
+    return validation_result
+
+
+def _run_contract_rules(
+    contract: dict,
+    target_version: Optional[SchemaVersion],
+    validation_result: ValidationResult,
+    args,
+    logger: logging.Logger,
+) -> None:
+    """The contract-level rules ``fluid validate`` runs after JSON-Schema.
+
+    Governance (sovereignty, agent policy), metadata consistency, binding
+    prerequisites, packaging, semantics and composition. Split out of
+    :func:`_validate_contract_for_version` so the bundle path runs exactly
+    the same rules on the resolved contract a bundle carries: it used to run
+    JSON-Schema only, so a bundle whose overlay pinned a denied region
+    validated clean while the same contract validated with ``--env`` failed.
+    Findings are appended to ``validation_result``.
+    """
+    import fluid_build.cli.validate as _self
 
     # FLUID 0.7.1+ governance validation
     if target_version and target_version >= _self.SchemaVersion.parse("0.7.1"):
@@ -899,8 +919,6 @@ def _validate_contract_for_version(
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Composition rule check skipped: {exc}")
-
-    return validation_result
 
 
 def _validate_with_version_fallback(
@@ -1347,6 +1365,8 @@ def _run_bundle_validation(
     fail_fast = bool(getattr(args, "fail_fast", False))
     report_path = getattr(args, "report", None)
 
+    env_issue = _bundle_env_issue(tgz_path, getattr(args, "env", None), logger)
+
     try:
         report = validate_bundle(
             tgz_path,
@@ -1356,6 +1376,21 @@ def _run_bundle_validation(
         )
     except Exception as exc:
         raise CLIError(2, "bundle_validation_failed", {"path": str(tgz_path), "error": str(exc)})
+    if env_issue is not None:
+        report.issues.insert(0, env_issue)
+        report.status = "fail"
+
+    # Contract-level rules (sovereignty, agent policy, binding prerequisites,
+    # packaging, semantics, composition, plugin validators) on the resolved
+    # contract the bundle carries — the same rules the contract path runs.
+    # Skipped when the MANIFEST gate already failed: there is no trustworthy
+    # contract to run them on, and the tamper finding is the answer.
+    manifest_ok = not any(i.code == "MANIFEST-TAMPER" for i in report.issues)
+    if manifest_ok and not (fail_fast and report.status == "fail"):
+        report.issues.extend(_bundle_contract_rule_issues(tgz_path, args, schema_manager, logger))
+        has_error = any(i.severity == "error" for i in report.issues)
+        has_warning = any(i.severity == "warning" for i in report.issues)
+        report.status = "fail" if has_error or (strict and has_warning) else "pass"
 
     # Print a compact summary to stderr (stdout is reserved for --format json).
     out_format = getattr(args, "format", "text")
@@ -1401,6 +1436,111 @@ def _run_bundle_validation(
         cprint(f"   validation completed in {elapsed:.2f}s")
 
     return 0 if report.status == "pass" else 1
+
+
+def _bundle_env_issue(tgz_path: Path, env: Optional[str], logger: logging.Logger):
+    """``--env`` against the env the bundle was built for, as a report finding.
+
+    The bundle is never re-overlaid, so a mismatch would validate a different
+    contract than the operator asked about. It is a finding like any other
+    (``BUNDLE-ENV-MISMATCH``, error, exit 1), so ``--report`` still records it
+    and what else the bundle holds; raising used to leave CI with no report.
+    Returns ``None`` when the env matches (or none was asked for).
+    """
+    from fluid_build._contract_loader import check_bundle_env
+    from fluid_build.forge.core.validators import ValidationIssue
+
+    try:
+        check_bundle_env(str(tgz_path), env, logger)
+    except CLIError as exc:
+        if exc.event != "bundle_env_mismatch":
+            raise
+        return ValidationIssue(
+            file="MANIFEST.json",
+            validator="bundle-env",
+            severity="error",
+            message=str(exc.context.get("hint") or exc.event),
+            code="BUNDLE-ENV-MISMATCH",
+        )
+    return None
+
+
+def _bundle_contract_rule_issues(
+    tgz_path: Path,
+    args: argparse.Namespace,
+    schema_manager: FluidSchemaManager,
+    logger: logging.Logger,
+) -> list:
+    """Run :func:`_run_contract_rules` + plugin validators on a bundle's contract.
+
+    Returns ``ValidationIssue`` rows (validator ``contract``) for the bundle
+    report. The rules that consult the filesystem (composition's workspace
+    walk, the overlay-packaging check) are pointed at the SOURCE contract the
+    bundle records, with the env it was built with — so they answer exactly
+    as ``fluid validate <contract> --env <env>`` would. When the bundle
+    records no source that still exists, those two rules run without it.
+    """
+    import copy as _copy
+
+    import fluid_build.cli.validate as _self
+    from fluid_build._contract_loader import (
+        _load_contract_from_bundle,
+        _normalize_contract_aliases,
+        source_contract_path,
+    )
+    from fluid_build.forge.core.bundle import read_bundle_source
+    from fluid_build.forge.core.validators import ValidationIssue
+
+    try:
+        contract = _normalize_contract_aliases(_load_contract_from_bundle(str(tgz_path), logger))
+    except CLIError as exc:
+        return [
+            ValidationIssue(
+                file="contract.resolved.yaml",
+                validator="contract",
+                severity="error",
+                message=f"could not load the resolved contract: {exc.event} {exc.context}",
+                code="CONTRACT-LOAD",
+            )
+        ]
+
+    target_version, _auto = _determine_target_version(contract, args, schema_manager, logger)
+    result = _self.ValidationResult(is_valid=True, schema_version=target_version)
+
+    rule_args = _copy.copy(args)
+    source_contract = source_contract_path(tgz_path)
+    try:
+        source = read_bundle_source(tgz_path) or {}
+    except Exception:  # noqa: BLE001 — provenance is advisory here
+        source = {}
+    rule_args.contract = str(source_contract) if source_contract is not None else None
+    rule_args.env = source.get("env") if source_contract is not None else None
+
+    _run_contract_rules(contract, target_version, result, rule_args, logger)
+    _run_extension_validators(contract, result, logger)
+    _run_role_validators(contract, result, logger)
+
+    issues = [
+        ValidationIssue(
+            file="contract.resolved.yaml",
+            validator="contract",
+            severity="error",
+            message=msg,
+            code="CONTRACT-RULE",
+        )
+        for msg in result.errors
+    ]
+    issues.extend(
+        ValidationIssue(
+            file="contract.resolved.yaml",
+            validator="contract",
+            severity="warning",
+            message=msg,
+            code="CONTRACT-RULE",
+        )
+        for msg in result.warnings
+    )
+    return issues
 
 
 def _load_contract_for_workspace(

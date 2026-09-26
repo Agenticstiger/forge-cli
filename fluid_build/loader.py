@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -27,9 +28,11 @@ except Exception:  # pragma: no cover
 
 
 __all__ = [
+    "available_overlay_envs",
     "load_contract",
     "load_with_overlay",
     "compile_contract",
+    "note_missing_overlay",
     "parse_contract_text",
 ]
 
@@ -431,6 +434,92 @@ def _overlay_candidates(contract_path: Path, env: str) -> Tuple[Path, ...]:
     )
 
 
+#: The environment that is the base contract by convention: ``--env dev``
+#: with no dev overlay is expected, not a mistake.
+BASE_ENV_BY_CONVENTION = "dev"
+
+_OVERLAY_SUFFIXES = (".yaml", ".yml", ".json")
+
+
+def available_overlay_envs(contract_path: str | Path) -> List[str]:
+    """Environment names that DO have an overlay next to ``contract_path``.
+
+    Covers the two unambiguous candidate shapes of :func:`_overlay_candidates`
+    (``overlays/<env>.<ext>`` and ``<contract-stem>.<env>.<ext>``). The bare
+    ``<dir>/<env>.<ext>`` shape is not listed: any YAML file beside the
+    contract would match it, and naming unrelated files as "overlays" would
+    mislead more than it helps.
+    """
+    base = Path(contract_path)
+    d = base.parent
+    stem = base.stem
+    envs: Set[str] = set()
+    overlays_dir = d / "overlays"
+    if overlays_dir.is_dir():
+        for entry in overlays_dir.iterdir():
+            if entry.is_file() and entry.suffix.lower() in _OVERLAY_SUFFIXES:
+                envs.add(entry.stem)
+    prefix = f"{stem}."
+    if d.is_dir():
+        for entry in d.iterdir():
+            name = entry.name
+            if not entry.is_file() or not name.startswith(prefix):
+                continue
+            suffix = entry.suffix.lower()
+            if suffix not in _OVERLAY_SUFFIXES:
+                continue
+            middle = name[len(prefix) : -len(suffix)]
+            if middle and "." not in middle:
+                envs.add(middle)
+    return sorted(envs)
+
+
+#: (resolved contract path, env) pairs already reported by
+#: :func:`note_missing_overlay` in this process. Tests reset it with
+#: ``_NOTED_MISSING_OVERLAYS.clear()``.
+_NOTED_MISSING_OVERLAYS: Set[Tuple[str, str]] = set()
+_NOTED_MISSING_OVERLAYS_LOCK = threading.Lock()
+
+
+def note_missing_overlay(
+    contract_path: str | Path, env: str, logger: Optional[logging.Logger] = None
+) -> None:
+    """Report that ``env`` matched no overlay for ``contract_path``, once.
+
+    WARNING for any env but :data:`BASE_ENV_BY_CONVENTION`, naming the env and
+    the overlays that do exist, because the caller is about to use the base
+    contract where it asked for an environment. INFO for ``dev``, which is
+    the base by convention. Emitted once per (contract, env) per process —
+    one command loads the same contract several times.
+    """
+    log = logger or LOG
+    contract_key = str(Path(contract_path).resolve())
+    with _NOTED_MISSING_OVERLAYS_LOCK:
+        if (contract_key, env) in _NOTED_MISSING_OVERLAYS:
+            return
+        _NOTED_MISSING_OVERLAYS.add((contract_key, env))
+    if env == BASE_ENV_BY_CONVENTION:
+        log.info(
+            "overlay_base_env: --env %r has no overlay for %s; using the base contract "
+            "(%s is the base by convention)",
+            env,
+            contract_key,
+            env,
+            extra={"event": "overlay_base_env", "env": env},
+        )
+        return
+    existing = available_overlay_envs(contract_key)
+    log.warning(
+        "overlay_not_found: --env %r matched no overlay for %s, so the BASE contract is "
+        "used unchanged. Overlays that exist: %s. Add an overlay for it under overlays/ "
+        "or pass one of the existing environments.",
+        env,
+        contract_key,
+        ", ".join(existing) if existing else "none",
+        extra={"event": "overlay_not_found", "env": env, "available_envs": existing},
+    )
+
+
 def load_contract(path: str | Path, *, resolve_refs: bool = True) -> Dict[str, Any]:
     """
     Load a single FLUID contract file (JSON or YAML).
@@ -511,8 +600,10 @@ def load_with_overlay(
                     return merged
                 except Exception as e:
                     raise RuntimeError(f"Failed to apply overlay {cand}: {e}") from e
-        # No overlay found – log at INFO (not ERROR) to avoid noisy runs
-        log.debug("overlay_not_found", extra={"env": env})
+        # No overlay found. This used to be a DEBUG line, so ``--env prod``
+        # with a typo'd or missing overlay silently deployed the BASE
+        # contract at the default log level. Say so, once per contract/env.
+        note_missing_overlay(base_path, env, log)
         return base
 
     # No env → return base as-is

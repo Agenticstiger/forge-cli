@@ -32,11 +32,11 @@ Inputs: [`customers.csv`](customers.csv) (5 customers) and [`orders.csv`](orders
 ```text
 🔷 Build 'customer_summary' (embedded-SQL / local DuckDB)
    ✅ Completed in 0.1s — 1 action(s) executed
-   📁 runtime/out/customer-analytics-v1.csv
+   📁 /path/to/forge-cli/examples/03-multi-source-join/runtime/out/customer-analytics-v1.csv
 ```
 
 ```bash
-cat runtime/out/customer-analytics-v1.csv
+cat examples/03-multi-source-join/runtime/out/customer-analytics-v1.csv
 ```
 
 ```csv
@@ -59,7 +59,8 @@ In [`contract.fluid.yaml`](contract.fluid.yaml):
   and `orders` tables in DuckDB.
 - **`properties.sql`** `LEFT JOIN`s orders onto customers, `GROUP BY`s per customer, and
   uses `CASE` expressions so a customer with no orders still appears (with zeros).
-- **`exposes[]`** publishes the joined result to `runtime/out/customer-analytics-v1.csv`.
+- **`exposes[]`** publishes the joined result to `runtime/out/customer-analytics-v1.csv`
+  (relative to this folder).
 
 ## Next steps
 

@@ -399,8 +399,7 @@ def register(subparsers: argparse._SubParsersAction):
         default=None,  # resolved by parse_mode; None = amend
         help=(
             "DDL/DML strategy: dry-run | create-only | amend (default) | "
-            "amend-and-build | replace | replace-and-build. See docs/apply.md "
-            "for the full matrix."
+            "amend-and-build | replace | replace-and-build. See docs/apply.md."
         ),
     )
     mode_group.add_argument(
@@ -646,8 +645,13 @@ def register(subparsers: argparse._SubParsersAction):
     )
     advanced_group.add_argument(
         "--state-backend",
-        help="OpenTofu remote state backend for cloud apply "
-        "(s3://bucket/key or gcs://bucket/prefix)",
+        default=None,
+        # Three lines, paid for by one off --mode: ``fluid apply --help`` stays
+        # at main's 96 lines, which FLUID_LOG_LEVEL=DEBUG takes to the cap of
+        # 100 (tests/test_cli_help_style.py).
+        help="OpenTofu remote state (s3://bucket/key or gcs://bucket/prefix). "
+        "Default $FLUID_STATE_BACKEND (bucket only: keys per contract, fluid/<id>/, "
+        'unlike the flag), else local; "" forces local.',
     )
 
     p.set_defaults(cmd=COMMAND, func=run)
@@ -840,6 +844,115 @@ def _verify_plan_digests(
         )
 
 
+def _check_plan_mode(plan_data: Dict[str, Any], resolved_mode) -> None:
+    """Refuse a ``plan.json`` applied with a mode other than the one it was made for.
+
+    ``fluid plan x.yaml --mode X --out p.json`` records the mode it was
+    generated for (``None`` = mode-unaware). ``fluid apply p.json --mode Y``
+    must match it; ``amend`` and ``None`` are treated as the same additive
+    default. Otherwise an additive apply would run against a plan generated
+    for replace, or a build against a plan that never planned one.
+    """
+    recorded_mode = plan_data.get("mode")
+    requested_mode_value = resolved_mode.value if resolved_mode is not None else None
+    _amend_aliases = {None, "amend"}
+    requested_norm = None if requested_mode_value in _amend_aliases else requested_mode_value
+    recorded_norm = None if recorded_mode in _amend_aliases else recorded_mode
+    if requested_norm != recorded_norm:
+        raise CLIError(
+            1,
+            "apply_plan_mode_mismatch",
+            {
+                "plan_mode": recorded_mode,
+                "requested_mode": requested_mode_value,
+                "hint": (
+                    "the plan was generated for "
+                    f"mode={recorded_mode!r} but apply requested "
+                    f"mode={requested_mode_value!r}. Re-run "
+                    f"``fluid plan <contract> --mode {requested_mode_value}`` "
+                    "to produce a mode-aware plan, or change "
+                    "``--mode`` on apply to match."
+                ),
+            },
+        )
+
+
+def _load_verified_plan(args, resolved_mode, logger: logging.Logger) -> Dict[str, Any]:
+    """Load ``plan.json`` and run every stage-7 plan gate on it, before anything runs.
+
+    Returns a deep copy of the plan exactly as the digest check attested it;
+    every consumer downstream (the native provider dispatch AND the build
+    runner) must use this copy rather than re-reading the file, so the
+    structure that drives DDL or a build is provably the one that was
+    checked (TOCTOU).
+
+    The gates, in order:
+
+    1. plan-binding (``planDigest`` + ``bundleDigest``), see
+       :func:`_verify_plan_digests`. The bundle a bound plan pins is located
+       once, here (``--bundle`` or a single sibling ``.tgz``), and written
+       back to ``args.bundle`` so the OpenTofu engine re-verifies against
+       the SAME bundle instead of running a second, different discovery.
+    2. plan/apply mode match, see :func:`_check_plan_mode`.
+
+    Both used to run only on the native, non-build branch of ``run()``, after
+    the ``needs_build`` early return, so ``--mode amend-and-build`` executed a
+    tampered plan's builds while ``--mode amend`` refused the same file.
+    """
+    import copy as _copy
+
+    logger.info("Loading pre-generated execution plan")
+    try:
+        plan_data = read_json(args.contract)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # A typed exit 1, as before these gates moved here; letting it escape
+        # made a truncated or non-UTF-8 plan.json an "unhandled exception".
+        raise CLIError(
+            1, "apply_plan_unreadable", {"path": str(args.contract), "error": str(exc)}
+        ) from exc
+    if not isinstance(plan_data, dict):
+        raise CLIError(
+            1,
+            "apply_plan_unreadable",
+            {"path": str(args.contract), "error": "plan.json root is not an object"},
+        )
+    bundle_path = _resolve_bundle_path(plan_data, args, logger)
+    _verify_plan_digests(plan_data, args, logger, bundle_path=bundle_path)
+    if bundle_path is not None and not getattr(args, "bundle", None):
+        args.bundle = str(bundle_path)
+    verified_plan_data = _copy.deepcopy(plan_data)
+    _check_plan_mode(verified_plan_data, resolved_mode)
+    return verified_plan_data
+
+
+def _check_build_id_mode(build_id: Optional[str], resolved_mode) -> None:
+    """``--build-id`` filters the build phase, so it needs a mode that has one.
+
+    With ``amend`` / ``replace`` / ``create-only`` / ``dry-run`` there is no
+    build to filter: the flag used to be accepted and silently dropped, so an
+    operator who asked for one build got a DDL-only apply and exit 0. Refuse
+    it instead of guessing, and never let it change the mode.
+    """
+    from fluid_build.forge.core.apply_modes import needs_build
+
+    # argparse hands over ``str`` or ``None``; anything else is not an
+    # operator-supplied id (``parse_mode`` treats non-strings the same way).
+    if isinstance(build_id, str) and build_id and not needs_build(resolved_mode):
+        raise CLIError(
+            1,
+            "apply_build_id_requires_build_mode",
+            {
+                "build_id": build_id,
+                "mode": resolved_mode.value,
+                "hint": (
+                    "--build-id selects which build runs, and --mode "
+                    f"{resolved_mode.value} runs no build. Pass --mode amend-and-build "
+                    "(or replace-and-build) to run that build, or drop --build-id."
+                ),
+            },
+        )
+
+
 def _render_apply_result(
     *,
     success: bool,
@@ -1008,6 +1121,7 @@ def _run_simple_apply(
     execution_id: str,
     start_time: float,
     logger: logging.Logger,
+    plan_data: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Execute the simple (direct-provider) apply path.
 
@@ -1090,6 +1204,14 @@ def _run_simple_apply(
 
     logger.info(f"Detected provider: {provider_name}, project: {project}")
     provider = build_provider(provider_name, project, region, logger)
+    if provider_name == "local":
+        # One anchoring rule for a relative ``binding.location.path``: the
+        # SOURCE contract's directory, as the build runner and ``fluid
+        # verify`` use. The local provider used to write it relative to the
+        # working directory, so verify from another directory missed it.
+        from fluid_build._contract_loader import source_contract_dir
+
+        provider.anchor_dir = source_contract_dir(args.contract, logger, plan_data=plan_data)
 
     # Get actions from contract — pass the resolved apply mode so
     # destructive modes (replace / replace-and-build) trigger
@@ -1513,6 +1635,7 @@ def run(args, logger: logging.Logger) -> int:
         raise CLIError(1, "apply_mode_invalid", {"error": str(exc)})
 
     resolved_build_id = getattr(args, "build_id", None)
+    _check_build_id_mode(resolved_build_id, resolved_mode)
 
     # ``--dry-run`` flag still supported as a CLI ergonomic alias for
     # ``--mode dry-run``; the canonical form is the mode value. Normalize
@@ -1540,6 +1663,18 @@ def run(args, logger: logging.Logger) -> int:
         env=args.env,
         dry_run=effective_dry_run,
         mode=resolved_mode.value,
+    )
+
+    # --- Plan gates (11-stage pipeline stage 7) ---
+    # A ``plan.json`` input is digest-verified and mode-checked HERE, ahead
+    # of engine dispatch and of the ``needs_build`` early returns on both
+    # engine paths. Every later consumer uses ``verified_plan_data``.
+    verified_plan_data: Optional[Dict[str, Any]] = None
+    if args.contract.endswith(".json"):
+        verified_plan_data = _load_verified_plan(args, resolved_mode, logger)
+    # The build runner takes the attested plan instead of re-reading the file.
+    plan_kwargs: Dict[str, Any] = (
+        {"plan_data": verified_plan_data} if verified_plan_data is not None else {}
     )
 
     # --- Data-loss safety gate (11-stage pipeline stage 7) ---
@@ -1613,7 +1748,7 @@ def run(args, logger: logging.Logger) -> int:
             args.build_id = resolved_build_id
             from fluid_build.build_runners import run_builds_from_args
 
-            return run_builds_from_args(args, logger, force_run=True)
+            return run_builds_from_args(args, logger, force_run=True, **plan_kwargs)
         return rc
 
     try:
@@ -1636,81 +1771,23 @@ def run(args, logger: logging.Logger) -> int:
             args.build_id = resolved_build_id
             from fluid_build.build_runners import run_builds_from_args
 
-            return run_builds_from_args(args, logger, force_run=True)
+            return run_builds_from_args(args, logger, force_run=True, **plan_kwargs)
 
         # Load contract or execution plan
-        if args.contract.endswith(".json"):
-            # Load pre-generated execution plan
-            logger.info("Loading pre-generated execution plan")
-            plan_data = read_json(args.contract)
-
-            # --- Plan-binding verification (stage-7 apply gate) ---
-            # Before ANY DDL runs, re-verify the plan's ``planDigest``
-            # (catches tampering between stages 6 and 7) AND, when the plan
-            # carries a non-empty ``bundleDigest``, the bundle it was bound
-            # to (from --bundle or an auto-discovered sibling .tgz). A
-            # non-empty bundleDigest with no bundle available fails closed.
-            # ``--no-verify-plan-binding`` waives the gate for emergencies.
-            _verify_plan_digests(
-                plan_data,
-                args,
-                logger,
-                bundle_path=_resolve_bundle_path(plan_data, args, logger),
-            )
-
-            # SECURITY (TOCTOU): re-verification snapshot.
-            # ``_verify_plan_digests`` just proved the planDigest over
-            # ``plan_data`` as loaded. Capture a deep copy of that
-            # exact, attested structure NOW, before any downstream code
-            # runs. ``verified_plan_data`` is the frozen reference: it
-            # is what the digest covered and nothing mutates it.
-            # Provider dispatch derives the contract from this copy
-            # (see ``contract = verified_plan_data.get("contract")``
-            # below), so the structure that actually drives DDL is
-            # provably the one that was digest-checked — not a sibling
-            # alias that could have been swapped between verify and
-            # use. Operator-supplied ``--config-override`` is still
-            # applied afterwards (that is an explicit apply-time input,
-            # not plan tampering), but it mutates a child of this
-            # verified copy, never the loaded ``plan_data``.
-            import copy as _copy
-
-            verified_plan_data = _copy.deepcopy(plan_data)
+        if verified_plan_data is not None:
+            # The plan was loaded, digest-verified (plan-binding) and
+            # mode-checked by ``_load_verified_plan`` at the top of ``run()``,
+            # before engine dispatch and before the build early returns.
+            #
+            # SECURITY (TOCTOU): ``verified_plan_data`` is the deep copy of
+            # exactly the structure the planDigest covered. Provider dispatch
+            # derives the contract from it (``contract = plan_data.get(...)``
+            # below), so what drives DDL is provably what was digest-checked,
+            # never a re-read of the file. Operator-supplied
+            # ``--config-override`` is still applied afterwards (an explicit
+            # apply-time input, not plan tampering) and mutates a child of
+            # this copy only.
             plan_data = verified_plan_data
-
-            # --- Plan/apply mode-mismatch gate ---
-            # ``fluid plan x.yaml --output p.json`` records the mode it
-            # was generated for (None = mode-unaware). When the operator
-            # then runs ``fluid apply p.json --mode X``, the recorded
-            # mode must match (or be unrecorded for the additive
-            # default). Otherwise we'd silently run an additive apply
-            # against a plan generated for replace, or vice-versa.
-            recorded_mode = plan_data.get("mode")
-            requested_mode_value = resolved_mode.value if resolved_mode is not None else None
-            # Normalize: treat ``amend`` and ``None`` as compatible
-            # (default; mode-unaware plans applied with default mode).
-            _amend_aliases = {None, "amend"}
-            requested_norm = (
-                None if requested_mode_value in _amend_aliases else requested_mode_value
-            )
-            recorded_norm = None if recorded_mode in _amend_aliases else recorded_mode
-            if requested_norm != recorded_norm:
-                raise CLIError(
-                    1,
-                    "apply_plan_mode_mismatch",
-                    {
-                        "plan_mode": recorded_mode,
-                        "requested_mode": requested_mode_value,
-                        "hint": (
-                            "the plan was generated for "
-                            f"mode={recorded_mode!r} but apply requested "
-                            f"mode={requested_mode_value!r}. Re-run "
-                            f"``fluid plan <contract> --mode {requested_mode_value}`` "
-                            "to produce a mode-aware plan, or change "
-                            "``--mode`` on apply to match."
-                        ),
-                    },
-                )
 
             contract = plan_data.get("contract", {})
 
@@ -1944,6 +2021,7 @@ def run(args, logger: logging.Logger) -> int:
                 execution_id=execution_id,
                 start_time=start_time,
                 logger=logger,
+                plan_data=verified_plan_data,
             )
 
         # Complex orchestration mode — extracted to _run_orchestrated_apply().

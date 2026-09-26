@@ -590,21 +590,25 @@ pipeline {{
         // ═════════════════════════════════════════════════════════════
         stage('6 - plan') {{
             when {{ expression {{ return params.RUN_STAGE_6_PLAN }} }}
-            // Pass APPLY_MODE through to plan so plan.json's recorded
-            // ``mode`` matches what Stage 7 will request. The
-            // apply-side mode-mismatch gate (apply.py:apply_plan_mode_mismatch)
-            // requires plan.mode == apply.mode (only None ↔ amend is
-            // normalized as compatible). Without this, every non-amend
-            // APPLY_MODE — including the ``dry-run`` default — would
-            // generate a mode-less plan and trip the gate at apply time.
+            // Plan for the SAME mode Stage 7 applies, so plan.json's
+            // recorded ``mode`` matches. The apply-side mode-mismatch
+            // gate (apply.py:apply_plan_mode_mismatch) requires
+            // plan.mode == apply.mode (only None ↔ amend is normalized
+            // as compatible), and runs before any build. EFFECTIVE_MODE
+            // is computed here exactly as in Stage 7: APPLY_MODE, or
+            // amend-and-build when APPLY_BUILD_ID is set.
             environment {{
-                PLAN_HTML_FLAG = "${{params.PLAN_HTML ? '--html' : ''}}"
-                APPLY_MODE     = "${{params.APPLY_MODE}}"
+                PLAN_HTML_FLAG     = "${{params.PLAN_HTML ? '--html' : ''}}"
+                APPLY_MODE         = "${{params.APPLY_MODE}}"
+                APPLY_BUILD_ID_VAL = "${{params.APPLY_BUILD_ID}}"
             }}
             steps {{
-                sh '''{CD}fluid plan "${{CONTRACT:-contract.fluid.yaml}}" \\
+                sh '''{CD}set -eu
+                    EFFECTIVE_MODE="${{APPLY_MODE:-amend}}"
+                    if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then EFFECTIVE_MODE=amend-and-build; fi
+                    fluid plan "${{CONTRACT:-contract.fluid.yaml}}" \\
                            --out runtime/plan.json ${{PLAN_HTML_FLAG}} \\
-                           --mode "$APPLY_MODE" \\
+                           --mode "$EFFECTIVE_MODE" \\
                            --env "${{FLUID_ENV:-dev}}"'''
                 archiveArtifacts artifacts: '{P}runtime/plan.json,{P}runtime/plan.html', fingerprint: true, allowEmptyArchive: true
             }}
@@ -641,9 +645,12 @@ pipeline {{
                 NO_VERIFY_DIGEST = "${{params.NO_VERIFY_DIGEST}}"
             }}
             steps {{
+                // One --mode, the one Stage 6 planned for (see there).
                 sh '''{CD}set -eu
-                    set -- runtime/plan.json --mode "$APPLY_MODE" --env "${{FLUID_ENV:-dev}}" --yes --ensure-opentofu --report runtime/apply-report.html
-                    if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then set -- "$@" --mode amend-and-build --build-id "$APPLY_BUILD_ID_VAL"; fi
+                    EFFECTIVE_MODE="${{APPLY_MODE:-amend}}"
+                    if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then EFFECTIVE_MODE=amend-and-build; fi
+                    set -- runtime/plan.json --mode "$EFFECTIVE_MODE" --env "${{FLUID_ENV:-dev}}" --yes --ensure-opentofu --report runtime/apply-report.html
+                    if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then set -- "$@" --build-id "$APPLY_BUILD_ID_VAL"; fi
                     if [ "${{ALLOW_DATA_LOSS:-false}}" = "true" ]; then set -- "$@" --allow-data-loss; fi
                     if [ "${{NO_VERIFY_DIGEST:-false}}" = "true" ]; then set -- "$@" --no-verify-plan-binding --no-verify-federation; fi
                     fluid apply "$@"'''

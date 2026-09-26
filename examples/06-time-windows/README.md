@@ -32,11 +32,11 @@ The input [`daily_sales.csv`](daily_sales.csv) holds 18 line items spanning 14 d
 ```text
 🔷 Build 'sales_time_series' (embedded-SQL / local DuckDB)
    ✅ Completed in 0.1s — 1 action(s) executed
-   📁 runtime/out/sales-time-series-v1.csv
+   📁 /path/to/forge-cli/examples/06-time-windows/runtime/out/sales-time-series-v1.csv
 ```
 
 ```bash
-cat runtime/out/sales-time-series-v1.csv
+cat examples/06-time-windows/runtime/out/sales-time-series-v1.csv
 ```
 
 ```csv
@@ -60,7 +60,7 @@ In [`contract.fluid.yaml`](contract.fluid.yaml):
 - A `rolling_metrics` CTE layers on the window functions (3-day and 7-day moving averages,
   running total, and `LAG(…, 1)` / `LAG(…, 7)` for the comparisons).
 - The final `SELECT` adds calendar fields and the `trend_indicator`, then publishes to
-  `runtime/out/sales-time-series-v1.csv`.
+  `runtime/out/sales-time-series-v1.csv` (relative to this folder).
 
 ## Next steps
 

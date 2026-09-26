@@ -176,10 +176,24 @@ class LocalProvider(BaseProvider):
         region: Optional[str] = None,
         logger: Optional[Any] = None,
         persist: bool = False,
+        anchor_dir: Optional[PathLike] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(project=project, region=region, logger=logger, **kwargs)
         self.persist = persist  # Enable persistent DuckDB at ~/.fluid/local.db
+        # Directory a relative ``exposes[].binding.location.path`` resolves
+        # against: the SOURCE contract's directory (``fluid_build.util.
+        # binding_paths``). ``None`` keeps the historical working-directory
+        # semantics for callers that have no source contract to anchor to.
+        self.anchor_dir: Optional[Path] = Path(anchor_dir) if anchor_dir else None
+
+    def _anchored(self, contract: Dict[str, Any]) -> Dict[str, Any]:
+        """``contract`` with its relative expose paths anchored at :attr:`anchor_dir`."""
+        if self.anchor_dir is None or not isinstance(contract, dict):
+            return contract
+        from fluid_build.util.binding_paths import anchor_binding_paths
+
+        return anchor_binding_paths(contract, self.anchor_dir)
 
     def _get_db_path(self) -> str:
         """Get database path - persistent, session-scoped, or in-memory."""
@@ -240,6 +254,7 @@ class LocalProvider(BaseProvider):
             List of actions ready for apply()
         """
         self._log_info("local_plan_start", {"contract_id": contract.get("id"), "mode": mode})
+        contract = self._anchored(contract)
 
         # Import planner (lazy to avoid circular import)
         from .planner import plan_actions, validate_plan
@@ -410,6 +425,7 @@ class LocalProvider(BaseProvider):
         # Import contract utilities for version-agnostic access
         from fluid_build.util.contract import get_primary_build
 
+        contract = self._anchored(contract)
         build = get_primary_build(contract)
         sql_text: Optional[str] = None
         inputs_spec: List[Any] = []
@@ -522,9 +538,32 @@ class LocalProvider(BaseProvider):
                 tbl = validate_ident(inputs_spec[0].get("table") or "t")
                 sql_text = f"SELECT * FROM {tbl}"
             else:
+                existing = self._existing_outputs(output_paths)
+                if existing:
+                    # No SQL and no inputs: the only thing left to write is a
+                    # one-row ``demo_col`` placeholder, and the declared output
+                    # already holds data (an acquisition build lands it). Now
+                    # that a relative path resolves at the contract's directory,
+                    # that is the file the build wrote; never replace it with a
+                    # placeholder.
+                    self._log_warn(
+                        "local_placeholder_refused",
+                        {"outputs": existing, "reason": "declared output exists; no SQL"},
+                    )
+                    return [{"op": "noop", "skipped": True, "reason": "placeholder_refused"}]
                 sql_text = "SELECT 1 AS demo_col"
 
         return [{"op": "sql", "sql": sql_text, "inputs": inputs_spec, "outputs": output_paths}]
+
+    @staticmethod
+    def _existing_outputs(output_paths: List[Any]) -> List[str]:
+        """The output paths in ``output_paths`` that already exist on disk."""
+        found: List[str] = []
+        for spec in output_paths:
+            raw = spec.get("path") if isinstance(spec, dict) else spec
+            if raw and Path(str(raw)).exists():
+                found.append(str(raw))
+        return found
 
     def _demo_action(self) -> Dict[str, Any]:
         return {"op": "copy", "out": "runtime/out/demo_artifact.csv"}
@@ -816,6 +855,15 @@ class LocalProvider(BaseProvider):
                 raise FileNotFoundError(f"copy src not found: {src}")
             data = src.read_bytes()
             dst.write_bytes(data)
+        elif dst.exists():
+            # Nothing to copy or materialize from, and the destination
+            # already holds data (a build wrote it): writing the
+            # ``id,value`` placeholder would destroy it. Report and skip.
+            self._log_warn(
+                "local_placeholder_refused",
+                {"i": idx, "dst": str(dst), "reason": "destination exists; no source"},
+            )
+            return {"op": "noop", "dst": str(dst), "skipped": True}
         else:
             dst.write_text("id,value\n1,materialized\n", encoding="utf-8")
 

@@ -52,8 +52,9 @@ import os
 import re
 import tarfile
 import unicodedata
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from importlib import import_module
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import yaml
 
@@ -173,6 +174,7 @@ def build_manifest(
     *,
     contract_id: str = "",
     generator: str = "fluid bundle",
+    source: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Compute ``MANIFEST.json`` contents for a set of files.
 
@@ -180,6 +182,13 @@ def build_manifest(
     to be json-serialised. The merkle root is SHA-256 over the sorted
     ``"<path>:<hash>\\n"`` sequence — simple, deterministic, easy to
     reproduce with shell tools (``sha256sum | sort | sha256sum``).
+
+    ``source`` (optional) is the provenance block :func:`make_bundle_source`
+    builds: where the source contract lives relative to the bundle, and which
+    environment overlay was applied. It is metadata about the bundle, not
+    bundle content, so it is deliberately OUTSIDE the merkle root — the
+    digest still identifies the resolved contract alone, and two bundles of
+    the same contract written to different directories keep one digest.
     """
     per_file: Dict[str, str] = {}
     for path in sorted(files.keys()):
@@ -188,13 +197,16 @@ def build_manifest(
     merkle_input = "".join(f"{path}:{digest}\n" for path, digest in per_file.items())
     merkle = "sha256:" + hashlib.sha256(merkle_input.encode("utf-8")).hexdigest()
 
-    return {
+    manifest: Dict[str, Any] = {
         "version": MANIFEST_VERSION,
         "generator": generator,
         "contractId": contract_id,
         "files": per_file,
         "digest": merkle,
     }
+    if source is not None:
+        manifest["source"] = dict(source)
+    return manifest
 
 
 def write_tgz(out_path: Path, files: Dict[str, bytes]) -> None:
@@ -349,11 +361,13 @@ def build_bundle_tgz(
     out_path: Path,
     *,
     contract_id: str = "",
+    source: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Full pipeline: extract fragments, serialize, write deterministic tgz.
 
     Returns the merkle root digest (``sha256:...``) — the same value
     downstream stages compare against when verifying the bundle.
+    ``source`` is recorded in ``MANIFEST.json`` (see :func:`build_manifest`).
     """
     rewritten, sources = extract_fragments(resolved_contract)
 
@@ -369,12 +383,208 @@ def build_bundle_tgz(
 
     # MANIFEST carries the hash of every file above. Written last inside the
     # tar so it's the authoritative record.
-    manifest = build_manifest(files, contract_id=contract_id)
+    manifest = build_manifest(files, contract_id=contract_id, source=source)
     manifest_bytes = _canonicalize_json(manifest)
     files["MANIFEST.json"] = manifest_bytes
 
     write_tgz(out_path, files)
     return str(manifest["digest"])
+
+
+# ---------------------------------------------------------------------------
+# Source provenance (MANIFEST ``source`` block)
+# ---------------------------------------------------------------------------
+
+#: Suffixes a recorded source contract may carry. Anything else in a
+#: MANIFEST's ``source.contract`` is not a contract and is ignored.
+_SOURCE_CONTRACT_SUFFIXES = (".yaml", ".yml", ".json")
+
+
+def make_bundle_source(
+    contract_path: Path,
+    out_path: Path,
+    *,
+    env: Optional[str] = None,
+    overlay_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Build the MANIFEST ``source`` block for a bundle written to ``out_path``.
+
+    ``contract`` is the source contract's path RELATIVE to the directory the
+    bundle is written to (POSIX separators), so the block is the same on
+    every checkout of the same tree and survives the workspace moving —
+    an absolute path would differ per CI agent. ``env`` is the ``--env`` the
+    bundle was built with (``None`` when none was given) and ``overlay`` the
+    overlay file actually merged, relative to the contract's directory
+    (``None`` when no overlay was applied).
+
+    Downstream stages use it to anchor relative ``binding.location.path``
+    values at the source contract's directory and to refuse an ``--env`` that
+    disagrees with the environment the bundle was built for.
+    """
+    contract_abs = Path(contract_path).resolve()
+    out_dir = Path(out_path).resolve().parent
+    try:
+        contract_rel: Optional[str] = Path(os.path.relpath(contract_abs, out_dir)).as_posix()
+    except ValueError:
+        # Different drives on Windows: no relative path exists. Recording an
+        # absolute one would make the MANIFEST machine-specific, so record
+        # nothing and let readers fall back to the bundle's own directory.
+        contract_rel = None
+    overlay_rel: Optional[str] = None
+    if overlay_path is not None:
+        try:
+            overlay_rel = Path(
+                os.path.relpath(Path(overlay_path).resolve(), contract_abs.parent)
+            ).as_posix()
+        except ValueError:
+            overlay_rel = Path(overlay_path).name
+    return {"contract": contract_rel, "env": env or None, "overlay": overlay_rel}
+
+
+def read_bundle_source(tgz_path: Path) -> Optional[Dict[str, Any]]:
+    """Return the MANIFEST ``source`` block, or ``None`` for a bundle without one.
+
+    Bundles written before the block existed (and bundles built by callers
+    that pass no ``source``) return ``None``. Reads through the bounded
+    member reader; raises ``ValueError`` / ``tarfile.TarError`` on a bundle
+    that is not a readable tgz.
+    """
+    with tarfile.open(tgz_path, mode="r:gz") as tar:
+        if "MANIFEST.json" not in tar.getnames():
+            return None
+        manifest = json.loads(read_tar_member_bounded(tar, "MANIFEST.json").decode("utf-8"))
+    source = manifest.get("source") if isinstance(manifest, dict) else None
+    return dict(source) if isinstance(source, dict) else None
+
+
+#: An environment name as a MANIFEST may record it: a plain name, never a
+#: path. It selects the overlay file whose ``id`` the recorded source
+#: contract is checked with, so a value like ``../../x`` must not be able to
+#: pick an arbitrary file for that check.
+_ENV_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def bundle_source_contract(
+    tgz_path: Path, source: Optional[Mapping[str, Any]] = None
+) -> Optional[Path]:
+    """Resolve the source contract a bundle was built from, when it still exists.
+
+    The path half of :func:`resolve_bundle_source_contract`: ``None`` when the
+    recorded source cannot be used, for any of the reasons listed there.
+    """
+    return resolve_bundle_source_contract(tgz_path, source)[0]
+
+
+def resolve_bundle_source_contract(
+    tgz_path: Path, source: Optional[Mapping[str, Any]] = None
+) -> Tuple[Optional[Path], str]:
+    """Resolve the source contract a bundle was built from: ``(path, "")`` or ``(None, why)``.
+
+    ``source`` defaults to :func:`read_bundle_source`. The ``source`` block is
+    outside the merkle root, so it is a hint, checked here rather than
+    trusted. The path is ``None`` (the caller falls back, and says why, using
+    the returned reason) when:
+
+    * the bundle records no source contract;
+    * the recorded value is not a relative path to a ``.yaml`` / ``.yml`` /
+      ``.json`` file, or the recorded env is not a plain environment name;
+    * that file is no longer on disk (e.g. the bundle was copied out of its
+      workspace);
+    * that file, with the overlay ``fluid bundle --env`` applied for the
+      recorded env, does not declare the same ``id`` as the contract INSIDE
+      the bundle (``contract.resolved.json``, which the merkle root covers).
+      The overlay counts because an overlay may set an env-specific product
+      id. An edited block therefore cannot point the anchor at an unrelated
+      file's directory, only at the contract the bundle was built from.
+    """
+    tgz_path = Path(tgz_path)
+    if source is None:
+        source = read_bundle_source(tgz_path)
+    rel = source.get("contract") if source else None
+    if rel is None or rel == "":
+        return None, "does not record a source contract"
+    if (
+        not isinstance(rel, str)
+        or "\x00" in rel
+        or PurePosixPath(rel).is_absolute()
+        or PureWindowsPath(rel).is_absolute()
+        or not rel.lower().endswith(_SOURCE_CONTRACT_SUFFIXES)
+    ):
+        return None, (
+            f"records a source contract {rel!r} that is not a relative path to a "
+            ".yaml/.yml/.json file"
+        )
+    env = source.get("env") if source else None
+    if env is not None and not (isinstance(env, str) and _ENV_NAME_RE.match(env)):
+        return None, f"records an env {env!r} that is not an environment name"
+    candidate = (tgz_path.resolve().parent / Path(*PurePosixPath(rel).parts)).resolve()
+    if not candidate.is_file():
+        return None, f"records source contract {candidate}, which no longer exists"
+    bundled_id = _bundled_contract_id(tgz_path)
+    if bundled_id is None:
+        return None, "holds no contract id to check its recorded source contract against"
+    declared_id = _effective_contract_id(candidate, env)
+    if declared_id != bundled_id:
+        with_overlay = f" with its {env!r} overlay applied" if env else ""
+        return None, (
+            f"records source contract {candidate}, but that file declares id "
+            f"{declared_id!r}{with_overlay} while the bundled contract's id is "
+            f"{bundled_id!r}"
+        )
+    return candidate, ""
+
+
+def _bundled_contract_id(tgz_path: Path) -> Optional[str]:
+    """``id`` of the resolved contract inside the bundle (merkle-covered)."""
+    try:
+        with tarfile.open(tgz_path, mode="r:gz") as tar:
+            if "contract.resolved.json" not in tar.getnames():
+                return None
+            doc = json.loads(read_tar_member_bounded(tar, "contract.resolved.json"))
+    except (tarfile.TarError, OSError, ValueError, KeyError):
+        return None
+    ident = doc.get("id") if isinstance(doc, dict) else None
+    return ident if isinstance(ident, str) and ident else None
+
+
+def _declared_contract_id(path: Path) -> Optional[str]:
+    """Top-level string ``id`` a contract file declares, or ``None``."""
+    from fluid_build.util.safe_yaml import load_yaml_safe
+
+    try:
+        text = path.read_text(encoding="utf-8")
+        doc = json.loads(text) if path.suffix.lower() == ".json" else load_yaml_safe(text)
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError):
+        return None
+    ident = doc.get("id") if isinstance(doc, dict) else None
+    return ident if isinstance(ident, str) and ident else None
+
+
+def _effective_contract_id(path: Path, env: Optional[str]) -> Optional[str]:
+    """The ``id`` ``fluid bundle <path> --env <env>`` bundles.
+
+    The file's own ``id``, unless the overlay for ``env`` (found by the same
+    search ``fluid bundle`` uses, :func:`fluid_build.loader.load_overlay_document`)
+    sets one: the overlay deep-merges over the base, so its scalar ``id``
+    wins. ``None`` when either file cannot be read.
+    """
+    ident = _declared_contract_id(path)
+    if not env:
+        return ident
+    # Resolved by name, never a literal import: ``fluid_build.loader`` reaches
+    # ``cli`` lazily, and ``_contract_loader`` (a leaf ``build_runners``
+    # imports) imports this module, so a static edge would land
+    # ``build_runners -> ... -> cli`` in the import-linter graph.
+    load_overlay_document = import_module("fluid_build.loader").load_overlay_document
+    try:
+        found = load_overlay_document(path, env)
+    except (OSError, UnicodeDecodeError, ValueError, RuntimeError, yaml.YAMLError):
+        return None
+    if found is not None:
+        overlay_id = found[1].get("id")
+        if isinstance(overlay_id, str) and overlay_id:
+            return overlay_id
+    return ident
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +672,11 @@ __all__ = [
     "MANIFEST_VERSION",
     "build_bundle_tgz",
     "build_manifest",
+    "bundle_source_contract",
     "extract_fragments",
+    "make_bundle_source",
+    "read_bundle_source",
+    "resolve_bundle_source_contract",
     "validate_manifest",
     "write_tgz",
 ]

@@ -36,11 +36,11 @@ Inputs: [`customers.csv`](customers.csv) (6 customers) and
 ```text
 🔷 Build 'customer_revenue_metrics' (embedded-SQL / local DuckDB)
    ✅ Completed in 0.1s — 1 action(s) executed
-   📁 runtime/out/customer-revenue-analysis-v1.csv
+   📁 /path/to/forge-cli/examples/04-external-sql-files/runtime/out/customer-revenue-analysis-v1.csv
 ```
 
 ```bash
-cat runtime/out/customer-revenue-analysis-v1.csv
+cat examples/04-external-sql-files/runtime/out/customer-revenue-analysis-v1.csv
 ```
 
 ```csv
@@ -62,7 +62,7 @@ follow below the head shown above.
   `SELECT` that `LEFT JOIN`s the metrics back onto every customer.
 - [`contract.fluid.yaml`](contract.fluid.yaml) declares the two CSV inputs and embeds that
   query under `properties.sql`, then publishes to
-  `runtime/out/customer-revenue-analysis-v1.csv`.
+  `runtime/out/customer-revenue-analysis-v1.csv` (relative to this folder).
 
 ## Next steps
 

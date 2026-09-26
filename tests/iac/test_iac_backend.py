@@ -51,6 +51,115 @@ class TestParseBackend:
             parse_backend("s3://")
 
 
+class TestNothingInASpecIsEchoedThatCouldBeASecret:
+    """``fluid apply`` prints the resolved state location and reports a
+    spec it cannot use; neither may carry a credential or forge a line."""
+
+    SECRET = "NotARealSecret"  # pragma: allowlist secret
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            "s3://AKIAEXAMPLE:NotARealSecret@bucket/key",  # pragma: allowlist secret
+            "gcs://user:NotARealSecret@bucket",  # pragma: allowlist secret
+            "https://user:NotARealSecret@example.com/state",  # pragma: allowlist secret
+            "s3:/NotARealSecret@bucket",
+        ],
+    )
+    def test_a_spec_with_userinfo_is_refused_without_echoing_it(self, spec):
+        with pytest.raises(ValueError) as exc:
+            parse_backend(spec)
+        assert self.SECRET not in str(exc.value)
+
+    def test_an_unsupported_scheme_is_still_named(self):
+        with pytest.raises(ValueError, match="scheme 'azurerm'"):
+            parse_backend("azurerm://container/key")
+
+    @pytest.mark.parametrize(
+        "spec", ["s3://bucket/k\n  state:       local", "gcs://bucket/p\rx", "s3://b/k\x1b[2J"]
+    )
+    def test_a_control_character_in_a_key_or_prefix_is_refused(self, spec):
+        with pytest.raises(ValueError, match="control character"):
+            parse_backend(spec)
+
+
+class TestPerContractDefault:
+    """``per_contract_default``: what ``fluid apply`` asks for when the spec
+    came from ``FLUID_STATE_BACKEND``."""
+
+    CONTRACT = {"id": "bronze.customer_subscriptions", "exposes": []}
+
+    def test_s3_default_key_is_per_contract_without_packaging(self):
+        block = parse_backend("s3://state", self.CONTRACT, per_contract_default=True)
+        assert block == {
+            "s3": {
+                "bucket": "state",
+                "key": "fluid/bronze.customer_subscriptions/terraform.tfstate",
+            }
+        }
+
+    def test_gcs_default_prefix_is_per_contract_without_packaging(self):
+        block = parse_backend("gcs://state", self.CONTRACT, per_contract_default=True)
+        assert block == {
+            "gcs": {"bucket": "state", "prefix": "fluid/bronze.customer_subscriptions"}
+        }
+
+    #: Schema-valid ids that differ only in ``.``, ``-`` and ``_``, or in a
+    #: leading or trailing ``_``. Measured before: all four got
+    #: ``fluid/bronze_customer_subscriptions/terraform.tfstate``, one state.
+    NEAR_IDS = (
+        "bronze.customer-subscriptions",
+        "bronze.customer_subscriptions",
+        "bronze_customer.subscriptions",
+        "_bronze.customer_subscriptions_",
+    )
+
+    @pytest.mark.parametrize("spec", ["s3://state", "gcs://state"])
+    def test_ids_that_differ_only_in_separators_get_different_states(self, spec):
+        blocks = [
+            parse_backend(spec, {"id": cid, "exposes": []}, per_contract_default=True)
+            for cid in self.NEAR_IDS
+        ]
+        places = [b.get("s3", {}).get("key") or b["gcs"]["prefix"] for b in blocks]
+        assert len(set(places)) == len(self.NEAR_IDS), places
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        [None, "", "a/b", "../x", ".hidden", "trailing-", "a b", "a\n", "id\u00e9", 7],
+    )
+    def test_an_id_that_cannot_name_a_state_is_refused(self, bad_id):
+        with pytest.raises(ValueError, match="cannot name its own state"):
+            parse_backend("s3://state", {"id": bad_id}, per_contract_default=True)
+        with pytest.raises(ValueError, match="cannot name its own state"):
+            parse_backend("gcs://state", {"id": bad_id}, per_contract_default=True)
+
+    def test_an_explicit_key_needs_no_usable_id(self):
+        contract = {"id": "a/b"}
+        assert parse_backend("s3://state/k.tfstate", contract, per_contract_default=True) == {
+            "s3": {"bucket": "state", "key": "k.tfstate"}
+        }
+        assert parse_backend("gcs://state/p", contract, per_contract_default=True) == {
+            "gcs": {"bucket": "state", "prefix": "p"}
+        }
+
+    def test_an_explicit_key_or_prefix_still_wins(self):
+        assert parse_backend("s3://state/k.tfstate", self.CONTRACT, per_contract_default=True) == {
+            "s3": {"bucket": "state", "key": "k.tfstate"}
+        }
+        assert parse_backend("gcs://state/p", self.CONTRACT, per_contract_default=True) == {
+            "gcs": {"bucket": "state", "prefix": "p"}
+        }
+
+    def test_without_it_a_contract_without_packaging_keeps_the_legacy_key(self):
+        assert parse_backend("s3://state", self.CONTRACT)["s3"]["key"] == "fluid/terraform.tfstate"
+        assert parse_backend("gcs://state", self.CONTRACT) == {"gcs": {"bucket": "state"}}
+
+    def test_a_malformed_packaging_block_still_gets_a_per_contract_key(self):
+        contract = dict(self.CONTRACT, packaging="not-a-mapping")
+        block = parse_backend("s3://state", contract, per_contract_default=True)
+        assert block["s3"]["key"] == "fluid/bronze.customer_subscriptions/terraform.tfstate"
+
+
 class TestBackendInDocument:
     def test_backend_block_lands_in_terraform(self):
         doc = assemble_tofu_document(

@@ -57,9 +57,20 @@ Stage 6 `fluid plan` emits two cryptographic fields in `plan.json`:
 - `bundleDigest` — SHA-256 merkle root of the input bundle's MANIFEST. When input is a `.tgz` this pins the exact bundle.
 - `planDigest` — SHA-256 over the plan body (digest fields masked). Catches tampering between stages 6 and 7.
 
-Stage 7 `fluid apply` re-verifies both before any DDL. Mismatch → hard-fail with stable events:
+Stage 7 `fluid apply` re-verifies both before any DDL **or build**, on both engine paths, then checks the plan was generated for the requested `--mode` (so `fluid plan --mode X` must match `fluid apply --mode X`). Mismatch → hard-fail with stable events:
 - `apply_plan_digest_bundle_mismatch` — bundle was swapped after plan ran
 - `apply_plan_digest_plan_tamper` — plan body edited since stage 6
+- `apply_plan_mode_mismatch` — plan generated for a different mode
+- `apply_build_id_requires_build_mode` — `--build-id` with a mode that runs no build
+
+Generated pipelines therefore compute ONE effective mode for stages 6 and 7: `APPLY_MODE` (default `amend`), or `amend-and-build` when `APPLY_BUILD_ID` is set, passed as `fluid plan --mode` and `fluid apply --mode` alike (`_APPLY_EFFECTIVE_MODE_SH` in `pipeline_systems/_base.py`; the Jenkins template mirrors it).
+
+### Environment and anchoring across stages
+
+- `fluid bundle --env <env>` freezes the overlay-applied contract and records `source: {contract, env, overlay}` in `MANIFEST.json` (outside the merkle root; `contract` is relative to the bundle's directory and is only trusted when, with the recorded env's overlay applied, it declares the bundled contract's `id`, so an overlay may rename the product). Every later stage given `--env` on a bundle refuses a different env with `bundle_env_mismatch` (a bundle built without `--env` is accepted for `--env dev` when no dev overlay exists); `fluid validate` reports it as a `BUNDLE-ENV-MISMATCH` finding. `fluid generate artifacts` takes `--env` too, and on a raw contract materialises it with the same code as `fluid bundle --env`.
+- A relative `exposes[].binding.location.path` resolves against the SOURCE contract's directory in every writer and reader (build runners, the local provider, `fluid verify`), whatever directory the command runs from. For a bundle or a bundle-made plan that is the contract the MANIFEST records (`plan.json` carries it as `contract_metadata.source_contract`).
+- `--env` naming no overlay logs a WARNING (`overlay_not_found`, listing the overlays that exist); `dev` with none is the base contract (INFO).
+- `fluid apply --state-backend` defaults from `FLUID_STATE_BACKEND`; an explicit empty `--state-backend ""` forces local state. A `FLUID_STATE_BACKEND` that names only a bucket (`s3://bucket`, `gcs://bucket`) keys every contract's state apart (S3 key `fluid/<id>/terraform.tfstate`, GCS prefix `fluid/<id>`, the id exactly as written), packaging block or not, because one CI job applies every product with it. Not `safe_ident(id)`: it folds `.` and `-` into `_`, so distinct valid ids would share a state; an id outside the FLUID identifier grammar is refused (`apply_state_backend_invalid`). The flag keeps its old default: `fluid/<safe_ident(id)>/terraform.tfstate` for a contract with a `packaging` block, the shared `fluid/terraform.tfstate` otherwise. A key or prefix in either one is used as given. The apply output's `state:` line prints the resolved object (`remote: s3://bucket/key (from FLUID_STATE_BACKEND)`), and given back as `--state-backend` that value selects the same state. A bucket name outside `[A-Za-z0-9._-]` is refused without being echoed. Generated pipelines never pass `--state-backend` (a test holds them to it), so the variable's per-contract keys apply.
 
 ### Install-Mode (Generated Jenkinsfiles)
 

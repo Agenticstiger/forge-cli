@@ -39,11 +39,11 @@ customer_id,name,email,signup_date,status
 ```text
 🔷 Build 'clean_customers' (embedded-SQL / local DuckDB)
    ✅ Completed in 0.1s — 1 action(s) executed
-   📁 runtime/out/customer-clean-v1.csv
+   📁 /path/to/forge-cli/examples/02-csv-to-data-product/runtime/out/customer-clean-v1.csv
 ```
 
 ```bash
-cat runtime/out/customer-clean-v1.csv
+cat examples/02-csv-to-data-product/runtime/out/customer-clean-v1.csv
 ```
 
 ```csv
@@ -65,7 +65,7 @@ In [`contract.fluid.yaml`](contract.fluid.yaml):
   FLUID loads it into DuckDB as the `customers_raw` table.
 - **`properties.sql`** normalizes the fields and keeps only `status = 'active'`.
 - **`exposes[]`** publishes the cleaned table to `runtime/out/customer-clean-v1.csv`
-  with its own output schema.
+  (relative to this folder) with its own output schema.
 
 ## Next steps
 
