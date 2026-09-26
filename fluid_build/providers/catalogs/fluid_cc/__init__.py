@@ -14,6 +14,14 @@
 
 """FLUID Command Center catalog provider"""
 
-from .provider import CommandCenterOrganizationError, FluidCommandCenterProvider
+from .provider import (
+    CommandCenterCredentialMissingError,
+    CommandCenterOrganizationError,
+    FluidCommandCenterProvider,
+)
 
-__all__ = ["CommandCenterOrganizationError", "FluidCommandCenterProvider"]
+__all__ = [
+    "CommandCenterCredentialMissingError",
+    "CommandCenterOrganizationError",
+    "FluidCommandCenterProvider",
+]

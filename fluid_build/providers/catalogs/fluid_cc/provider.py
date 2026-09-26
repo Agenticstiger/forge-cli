@@ -28,7 +28,7 @@ import asyncio
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -65,10 +65,14 @@ class CommandCenterOrganizationError(ConfigurationError):
 
     Raised when no organization id is configured and the caller's credential
     belongs to zero organizations or to more than one, when the organization
-    list cannot be read, or when a configured id is not a single header-safe
-    token. ``organizations`` carries what the Command Center returned
-    (``id``, ``slug``, ``name`` per entry) so a caller can render the choice.
+    list cannot be read or lists an id that cannot be sent, or when a
+    configured id is not a single header-safe token. ``organizations`` carries
+    the usable entries the Command Center returned (``id``, ``slug``, ``name``
+    per entry) so a caller can render the choice.
     """
+
+    #: ``details.error_code`` of the failed publish or verify result.
+    error_code = "cc_organization_unresolved"
 
     def __init__(
         self,
@@ -76,17 +80,34 @@ class CommandCenterOrganizationError(ConfigurationError):
         *,
         organizations: Optional[List[Dict[str, str]]] = None,
         original_error: Optional[Exception] = None,
+        suggestions: Optional[List[str]] = None,
     ) -> None:
         self.organizations: List[Dict[str, str]] = list(organizations or [])
         super().__init__(
             message,
             context={"organizations": self.organizations},
             original_error=original_error,
-            suggestions=[
+            suggestions=suggestions
+            or [
                 f"export {ORG_ID_ENV}=<organization id>",
                 "or set catalogs.fluid-command-center.organization_id in the FLUID config",
             ],
         )
+
+    def result_details(self) -> Dict[str, Any]:
+        """The ``PublishResult.details`` a failed publish or verify carries."""
+        return {"error_code": self.error_code, "organizations": self.organizations}
+
+
+class CommandCenterCredentialMissingError(CommandCenterOrganizationError):
+    """No Command Center credential is configured.
+
+    Raised before the organization lookup instead of sending it anonymously:
+    the Command Center answers that request, and every asset create, with 401,
+    which would read as a rejected credential when none was sent.
+    """
+
+    error_code = "cc_credential_missing"
 
 
 def _is_valid_org_id(value: str) -> bool:
@@ -97,6 +118,32 @@ def _display(value: Any) -> str:
     """A server-supplied label, reduced to printable characters for output."""
     text = "".join(ch for ch in str(value or "") if ch.isprintable())
     return text[:_DISPLAY_MAX]
+
+
+def _listing(organizations: List[Dict[str, str]]) -> str:
+    """``slug (id ...)`` for each organization, for an error message."""
+    return ", ".join(f"{o['slug'] or o['name']} (id {o['id']})" for o in organizations)
+
+
+def _lookup_failure(error: Exception) -> str:
+    """What a failed ``GET /api/v1/organizations`` is reported as.
+
+    The HTTP status or the exception type, never the exception's message:
+    httpx refuses an illegal header value (an API key read from a file with
+    its newline) with a ``LocalProtocolError`` that quotes the value, and a
+    status error quotes the request URL.
+    """
+    code = error.response.status_code if isinstance(error, httpx.HTTPStatusError) else None
+    if code in (401, 403):
+        return (
+            f"The Command Center rejected the credential (HTTP {code}) when listing its "
+            "organizations; check the API key or token."
+        )
+    reason = f"HTTP {code}" if code is not None else type(error).__name__
+    return (
+        f"Could not list the Command Center organizations to choose one ({reason}). "
+        f"Set {ORG_ID_ENV} to the organization id to skip the lookup."
+    )
 
 
 class FluidCommandCenterProvider(BaseCatalogProvider):
@@ -168,7 +215,20 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
             self._organization_id = self._configured_org_id
             return self._organization_id
 
-        organizations = await self._list_organizations()
+        organizations, listed = await self._list_organizations()
+        if len(organizations) < listed:
+            # Some entries cannot be sent as a header. Counting only the rest
+            # would call a survivor "the only one" for a credential that
+            # belongs to several, so nothing is picked.
+            raise CommandCenterOrganizationError(
+                f"The Command Center lists {listed} organization entries for this credential "
+                f"and {listed - len(organizations)} of them cannot be sent as {ORG_HEADER} "
+                "(the id is not a single token of visible ASCII), so none was chosen. "
+                f"Usable: {_listing(organizations) or 'none'}. Set {ORG_ID_ENV}=<id> or "
+                "catalogs.fluid-command-center.organization_id to pick one.",
+                organizations=organizations,
+            )
+
         if len(organizations) == 1:
             only = organizations[0]
             self.logger.info(
@@ -189,50 +249,51 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
                 organizations=organizations,
             )
 
-        listing = ", ".join(f"{o['slug'] or o['name']} (id {o['id']})" for o in organizations)
         raise CommandCenterOrganizationError(
             f"The Command Center credential belongs to {len(organizations)} organizations "
-            f"and none was chosen: {listing}. Set {ORG_ID_ENV}=<id> or "
+            f"and none was chosen: {_listing(organizations)}. Set {ORG_ID_ENV}=<id> or "
             "catalogs.fluid-command-center.organization_id to pick one.",
             organizations=organizations,
         )
 
-    async def _list_organizations(self) -> List[Dict[str, str]]:
+    async def _list_organizations(self) -> Tuple[List[Dict[str, str]], int]:
         """The organizations the credential is an active member of.
 
         ``GET /api/v1/organizations`` answers a JSON list of
         ``OrganizationSummary`` objects (``id``, ``name``, ``slug``, ``role``,
-        ...). Entries whose id is not header-safe are dropped rather than sent,
-        and slugs and names keep only printable characters.
+        ...). Returns the entries whose id is header-safe, with slugs and
+        names reduced to printable characters, and how many entries the
+        server listed in all, so the caller can tell a dropped entry from a
+        missing one.
         """
+        headers = get_auth_headers(self.endpoint, self.auth)
+        if not (headers.get("X-API-Key") or headers.get("Authorization")):
+            raise CommandCenterCredentialMissingError(
+                "No Command Center credential is configured, so its organizations cannot "
+                "be listed and no asset can be created. Set FLUID_API_KEY (or "
+                "FLUID_BEARER_TOKEN with auth type bearer).",
+                suggestions=[
+                    "export FLUID_API_KEY=<Command Center API key>",
+                    "or set catalogs.fluid-command-center.auth.api_key in the FLUID config",
+                ],
+            )
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.get(
                     f"{self.endpoint}/api/v1/organizations",
-                    headers=get_auth_headers(self.endpoint, self.auth),
+                    headers=headers,
                     timeout=10.0,
                 )
                 response.raise_for_status()
                 body = response.json()
-        except (httpx.HTTPError, ValueError) as e:
-            # The reason names the status or the exception type and message,
-            # never a header: the request carried the credential.
-            if isinstance(e, httpx.HTTPStatusError):
-                code = e.response.status_code
-                if code in (401, 403):
-                    raise CommandCenterOrganizationError(
-                        f"The Command Center rejected the credential (HTTP {code}) when "
-                        "listing its organizations; check the API key or token.",
-                        original_error=e,
-                    ) from e
-                reason = f"HTTP {code}"
-            else:
-                reason = f"{type(e).__name__}: {e}"
-            raise CommandCenterOrganizationError(
-                f"Could not list the Command Center organizations to choose one ({reason}). "
-                f"Set {ORG_ID_ENV} to the organization id to skip the lookup.",
-                original_error=e,
-            ) from e
+        except Exception as e:
+            # Every failure is the typed error, so ``verify`` answers False and
+            # ``publish`` a failed result instead of raising: an unparseable
+            # endpoint raises ``httpx.InvalidURL`` and an out-of-range port an
+            # ``ExceptionGroup``, neither of them an ``httpx.HTTPError``. The
+            # exception is not kept as the cause, because ``str()`` of a
+            # FluidError and a traceback both print it (see ``_lookup_failure``).
+            raise CommandCenterOrganizationError(_lookup_failure(e)) from None
 
         if not isinstance(body, list):
             raise CommandCenterOrganizationError(
@@ -254,23 +315,20 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
                     "name": _display(entry.get("name")),
                 }
             )
-        return organizations
+        return organizations, len(body)
 
     def _organization_failure(
         self, asset: CatalogAsset, error: CommandCenterOrganizationError
     ) -> PublishResult:
         """The failed result for a publish whose organization is unsettled."""
-        metrics_collector.record_publish_failure(self.name, "organization_unresolved")
+        metrics_collector.record_publish_failure(self.name, error.error_code)
         self.logger.error(f"❌ {error.message}")
         return PublishResult(
             success=False,
             catalog_id=self.name,
             asset_id=asset.id,
             error=error.message,
-            details={
-                "error_code": "cc_organization_unresolved",
-                "organizations": error.organizations,
-            },
+            details=error.result_details(),
         )
 
     async def publish(self, asset: CatalogAsset) -> PublishResult:

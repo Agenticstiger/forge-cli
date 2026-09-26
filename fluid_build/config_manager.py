@@ -137,7 +137,9 @@ def _apply_catalog_env_overrides(catalog_name: str, catalog_config: Dict[str, An
         if api_key:
             _set_auth_field(catalog_config, "api_key", api_key)
         # The organization the asset is created in (sent as X-Organization-Id).
-        org_id = _first_env("FLUID_CC_ORG_ID")
+        # Stripped first: a blank CI parameter is "not set", and must not
+        # replace an organization_id from the config file.
+        org_id = (_first_env("FLUID_CC_ORG_ID") or "").strip()
         if org_id:
             catalog_config["organization_id"] = org_id
         return

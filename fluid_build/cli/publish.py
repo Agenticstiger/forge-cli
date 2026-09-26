@@ -41,7 +41,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_json
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
 try:
@@ -251,6 +251,36 @@ The publish command enables the full data product lifecycle: develop → deploy 
     p.set_defaults(cmd=COMMAND, func=run)
 
 
+async def _unsettled_command_center(
+    provider: object, catalog_name: str, asset_id: str
+) -> Optional[PublishResult]:
+    """The failed verify result for a Command Center whose organization (or
+    credential) cannot be settled, with the error_code a publish carries.
+
+    ``None`` when it can be settled or the target is another catalog. Without
+    this, ``verify()`` answers False and the asset is reported as missing.
+    """
+    from fluid_build.providers.catalogs import PublishResult
+    from fluid_build.providers.catalogs.fluid_cc import (
+        CommandCenterOrganizationError,
+        FluidCommandCenterProvider,
+    )
+
+    if not isinstance(provider, FluidCommandCenterProvider):
+        return None
+    try:
+        await provider.resolve_organization_id()
+    except CommandCenterOrganizationError as e:
+        return PublishResult(
+            success=False,
+            catalog_id=catalog_name,
+            asset_id=asset_id,
+            error=e.message,
+            details={"verified": False, "operation": "verify", **e.result_details()},
+        )
+    return None
+
+
 async def publish_contract(
     contract_path: Path,
     catalog_name: str,
@@ -365,6 +395,9 @@ async def publish_contract(
 
     # Verify-only mode
     if verify_only:
+        unsettled = await _unsettled_command_center(provider, catalog_name, asset.id)
+        if unsettled is not None:
+            return unsettled
         exists = await provider.verify(asset.id)
         return PublishResult(
             success=exists,
@@ -488,6 +521,16 @@ def format_results(
                     output.append(f"  Error: {r.error}")
             output.append("=" * 80)
             return "\n".join(output)
+
+
+def _print_results(output: str, format: str) -> None:
+    """Print formatted results. A JSON or YAML document is written verbatim:
+    through the Rich console it was hard-wrapped at 80 columns inside string
+    literals when piped, and a CI step could not parse it."""
+    if format in ("json", "yaml"):
+        cprint_json(output)
+    else:
+        cprint(output)
 
 
 def _run_catalog_adapters(contract_paths, args, logger: logging.Logger) -> List[PublishResult]:
@@ -707,7 +750,7 @@ async def run_async(args, logger: logging.Logger) -> int:
     # Display results
     output = format_results(results, args.format, console)
     if output:
-        cprint(output)
+        _print_results(output, args.format)
 
     # Show metrics if requested
     if args.show_metrics:

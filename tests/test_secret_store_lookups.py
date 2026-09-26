@@ -271,11 +271,12 @@ class TestResolverAsksEachStoreOnce:
         from fluid_build.secrets import SecretConfig, SecretManager, SecretSource
 
         asked: List[str] = []
+        in_vault = "snowflake/role"
 
         class _VaultManager(SecretManager):
             def _retrieve_secret(self, secret_name: str) -> Optional[str]:
                 asked.append(secret_name)
-                return "from-vault" if secret_name == "snowflake/role" else None
+                return "from-vault" if secret_name == in_vault else None
 
         manager = _VaultManager(SecretConfig(source=SecretSource.HASHICORP_VAULT))
         monkeypatch.setattr(secrets_mod, "_global_manager", manager)

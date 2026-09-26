@@ -45,7 +45,7 @@ from fluid_build.providers.catalogs.fluid_cc import FluidCommandCenterProvider
 # The wire contract, spelled out rather than imported, so these tests pin what
 # the Command Center reads and not whatever the provider happens to export.
 ORG_HEADER = "X-Organization-Id"
-API_KEY = "fluid_test_key_not_a_secret"
+API_KEY = "fluid_test_key_not_a_secret"  # pragma: allowlist secret
 ORG_A = {"id": "0b6f6c3e-org-a", "name": "Acme", "slug": "acme", "role": "owner"}
 ORG_B = {"id": "5d1e2f4a-org-b", "name": "Globex", "slug": "globex", "role": "member"}
 
@@ -105,7 +105,9 @@ def _handler_for(stub: _StubCommandCenter):
 
         def do_GET(self) -> None:  # noqa: N802 — http.server naming
             entry = self._record()
-            if not self._authenticated():
+            # The asset search takes an optional user (``get_optional_user``),
+            # so an anonymous caller gets an answer; everything else is 401.
+            if entry["path"] != "/api/v1/assets" and not self._authenticated():
                 return self._send(401, {"detail": "Not authenticated"})
             if entry["path"] == "/api/v1/organizations":
                 if stub.organizations_status != 200:
@@ -135,6 +137,18 @@ def _handler_for(stub: _StubCommandCenter):
     return Handler
 
 
+# Command Center settings a developer's shell or a CI job may export. Every
+# fixture here clears them, so what a test sees is only what it sets.
+_AMBIENT_CC_ENV = (
+    "FLUID_CC_ORG_ID",
+    "FLUID_CC_ENDPOINT",
+    "FLUID_CATALOG_FLUID_CC_URL",
+    "FLUID_API_KEY",
+    "FLUID_CATALOG_FLUID_CC_TOKEN",
+    "FLUID_BEARER_TOKEN",
+)
+
+
 @pytest.fixture
 def cc_stub(monkeypatch):
     # Loopback only: no proxy may sit between the provider and the stub, and no
@@ -146,12 +160,7 @@ def cc_stub(monkeypatch):
         "http_proxy",
         "https_proxy",
         "all_proxy",
-        "FLUID_CC_ORG_ID",
-        "FLUID_CC_ENDPOINT",
-        "FLUID_CATALOG_FLUID_CC_URL",
-        "FLUID_API_KEY",
-        "FLUID_CATALOG_FLUID_CC_TOKEN",
-        "FLUID_BEARER_TOKEN",
+        *_AMBIENT_CC_ENV,
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -372,20 +381,47 @@ class TestOrganizationIdIsHeaderSafe:
         assert not result.success
         assert result.details["error_code"] == "cc_organization_unresolved"
 
-    def test_server_listed_ids_that_are_not_header_safe_are_ignored(self, cc_stub):
-        cc_stub.organizations = [
-            {"id": "evil\r\nX-Injected: 1", "slug": "evil", "name": "Evil"},
-            # A trailing newline must not slip past the check either.
-            {"id": "evil-trailing\n", "slug": "evil2", "name": "Evil 2"},
-            ORG_A,
-        ]
+    @pytest.mark.parametrize(
+        "unusable",
+        [
+            [{"id": "org-a b", "slug": "alpha", "name": "Alpha"}],
+            [
+                {"id": "evil\r\nX-Injected: 1", "slug": "evil", "name": "Evil"},
+                # A trailing newline must not slip past the check either.
+                {"id": "evil-trailing\n", "slug": "evil2", "name": "Evil 2"},
+            ],
+            ["not-an-object"],
+        ],
+    )
+    def test_an_unsendable_listed_id_blocks_the_automatic_choice(self, cc_stub, unusable):
+        """The credential belongs to more than one organization, so dropping
+        the unsendable entries must not make the survivor "the only one"."""
+        cc_stub.organizations = [*unusable, ORG_A]
+
+        result = asyncio.run(_provider(cc_stub).publish(_asset()))
+
+        assert not result.success
+        assert cc_stub.posts() == []
+        assert result.details["error_code"] == "cc_organization_unresolved"
+        assert f"lists {len(unusable) + 1} organization entries" in result.error
+        assert f"acme (id {ORG_A['id']})" in result.error
+        assert "FLUID_CC_ORG_ID" in result.error
+        assert [o["id"] for o in result.details["organizations"]] == [ORG_A["id"]]
+        for request in cc_stub.requests:
+            assert "x-injected" not in request["headers"], request
+            assert "x-organization-id" not in request["headers"], request
+
+    def test_naming_the_organization_still_works_when_the_list_has_unsendable_ids(
+        self, cc_stub, monkeypatch
+    ):
+        cc_stub.organizations = [{"id": "evil\r\nX-Injected: 1", "slug": "evil"}, ORG_A]
+        monkeypatch.setenv("FLUID_CC_ORG_ID", ORG_A["id"])
 
         result = asyncio.run(_provider(cc_stub).publish(_asset()))
 
         assert result.success, result.error
         (post,) = cc_stub.posts()
         assert post["headers"]["x-organization-id"] == ORG_A["id"]
-        assert all("x-injected" not in r["headers"] for r in cc_stub.requests)
 
 
 class TestVerifyIsScoped:
@@ -405,6 +441,73 @@ class TestVerifyIsScoped:
         assert asyncio.run(_provider(cc_stub).verify("bronze.x")) is False
         assert "/api/v1/assets" not in cc_stub.paths()
 
+    @pytest.mark.parametrize("endpoint", ["http://[::1", "http://127.0.0.1:99999"])
+    def test_verify_against_a_broken_endpoint_is_false_not_a_raise(self, endpoint):
+        # httpx raises InvalidURL for the first and an ExceptionGroup for the
+        # second; neither is an httpx.HTTPError.
+        provider = FluidCommandCenterProvider(
+            {"endpoint": endpoint, "auth": {"type": "api_key", "api_key": API_KEY}}
+        )
+
+        assert asyncio.run(provider.verify("bronze.customer_subscriptions")) is False
+
+
+# ---------------------------------------------------------------------------
+# No credential, and a credential httpx refuses to send
+# ---------------------------------------------------------------------------
+
+
+class TestCredential:
+    def test_no_credential_is_reported_as_that_and_nothing_is_listed(self, cc_stub):
+        cc_stub.organizations = [ORG_A]
+
+        result = asyncio.run(_provider(cc_stub, auth={"type": "api_key"}).publish(_asset()))
+
+        assert not result.success
+        assert result.details["error_code"] == "cc_credential_missing"
+        assert "No Command Center credential is configured" in result.error
+        assert "FLUID_API_KEY" in result.error
+        assert "rejected" not in result.error
+        # The anonymous health probe is answered (as the real asset search
+        # is); the organization list is never asked for without a credential.
+        assert "/api/v1/organizations" not in cc_stub.paths()
+        assert cc_stub.posts() == []
+
+    def test_a_bearer_token_counts_as_a_credential(self, cc_stub):
+        cc_stub.organizations = [ORG_A]
+        provider = _provider(cc_stub, auth={"type": "bearer", "token": "not-the-api-key"})
+
+        result = asyncio.run(provider.publish(_asset()))
+
+        # The stub only accepts the API key, so the list is refused: that is a
+        # rejected credential, not a missing one.
+        assert not result.success
+        assert result.details["error_code"] == "cc_organization_unresolved"
+        assert "rejected the credential (HTTP 401)" in result.error
+        assert cc_stub.paths().count("/api/v1/organizations") == 1
+
+    def test_an_illegal_header_value_is_never_quoted(self, cc_stub, caplog):
+        # A key read from a file with its newline: httpx refuses the header
+        # with a LocalProtocolError whose message quotes the whole value.
+        from fluid_build.providers.catalogs.fluid_cc import CommandCenterOrganizationError
+
+        caplog.set_level(logging.DEBUG, logger="fluid_build")
+        provider = _provider(cc_stub, auth={"type": "api_key", "api_key": f"{API_KEY}\n"})
+
+        with pytest.raises(CommandCenterOrganizationError) as excinfo:
+            asyncio.run(provider.resolve_organization_id())
+        assert cc_stub.requests == []  # refused before anything was sent
+        assert "LocalProtocolError" in excinfo.value.message
+        # ``str()`` of a FluidError appends its cause, and a traceback prints a
+        # chained exception: neither may carry the credential.
+        assert API_KEY not in str(excinfo.value)
+        assert excinfo.value.__cause__ is None and excinfo.value.__suppress_context__
+
+        assert asyncio.run(provider.verify("bronze.customer_subscriptions")) is False
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("LocalProtocolError" in m for m in messages), messages
+        assert not [m for m in messages if API_KEY in m]
+
 
 # ---------------------------------------------------------------------------
 # ``command-center`` is the name the help text and the generated pipelines use
@@ -413,7 +516,8 @@ class TestVerifyIsScoped:
 
 @pytest.fixture
 def isolated_config(tmp_path, monkeypatch):
-    """A FluidConfig that reads no user or project config file."""
+    """A FluidConfig that reads no user or project config file, and no Command
+    Center setting from the environment the tests were started in."""
     home = tmp_path / "home"
     home.mkdir()
     work = tmp_path / "work"
@@ -422,7 +526,60 @@ def isolated_config(tmp_path, monkeypatch):
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     monkeypatch.chdir(work)
     monkeypatch.delenv("FLUID_SECRETS_FILE", raising=False)
+    for var in _AMBIENT_CC_ENV:
+        monkeypatch.delenv(var, raising=False)
     return work
+
+
+@pytest.fixture
+def ambient_cc_env(monkeypatch):
+    """What a CI job that exports the Command Center settings looks like.
+
+    Request it before ``isolated_config``: fixtures are set up in argument
+    order, so these are in the environment when ``isolated_config`` runs.
+    """
+    monkeypatch.setenv("FLUID_CC_ORG_ID", "org-from-ci-env")
+    monkeypatch.setenv("FLUID_CC_ENDPOINT", "https://cc.ci.example.test")
+    monkeypatch.setenv("FLUID_API_KEY", API_KEY)
+    monkeypatch.setenv("FLUID_BEARER_TOKEN", API_KEY)
+
+
+_CONTRACT_YAML = "\n".join(
+    [
+        'fluidVersion: "0.7.5"',
+        "kind: DataProduct",
+        "id: bronze.customer_subscriptions",
+        "name: Customer Subscriptions",
+        "description: Subscriptions from the SID source",
+        "domain: Customer",
+        "metadata:",
+        "  layer: Bronze",
+        "  owner:",
+        "    team: data-platform",
+        "    email: data-platform@example.com",
+        "exposes:",
+        "  - exposeId: subscriptions",
+        "    kind: table",
+        "    binding:",
+        "      platform: local",
+        "      format: parquet",
+        "      location:",
+        "        path: out/customer_subscriptions.parquet",
+        "",
+    ]
+)
+
+
+def _publish_cli(work, *argv: str) -> int:
+    """Run ``fluid publish <contract> *argv`` in-process; returns the exit code."""
+    from fluid_build.cli import publish
+
+    contract = work / "contract.fluid.yaml"
+    contract.write_text(_CONTRACT_YAML, encoding="utf-8")
+    parser = argparse.ArgumentParser()
+    publish.register(parser.add_subparsers())
+    args = parser.parse_args(["publish", str(contract), *argv])
+    return asyncio.run(publish.run_async(args, logging.getLogger("test")))
 
 
 class TestCommandCenterAlias:
@@ -473,54 +630,156 @@ class TestCommandCenterAlias:
         monkeypatch.setenv("FLUID_CC_ORG_ID", "from-env")
         assert FluidConfig().get_catalog_config("command-center")["organization_id"] == ("from-env")
 
+    def test_the_callers_command_center_env_does_not_reach_these_tests(
+        self, ambient_cc_env, isolated_config
+    ):
+        from fluid_build.config_manager import FluidConfig
+
+        cfg = FluidConfig().get_catalog_config("command-center")
+
+        assert "organization_id" not in cfg
+        assert cfg["endpoint"] != "https://cc.ci.example.test"
+        assert "api_key" not in cfg.get("auth", {})
+
+    @pytest.mark.parametrize("blank", ["", "  ", "\t"])
+    def test_a_blank_env_org_id_keeps_the_config_file_value(
+        self, isolated_config, monkeypatch, blank
+    ):
+        from fluid_build.config_manager import FluidConfig
+
+        (isolated_config / ".fluidrc.yaml").write_text(
+            "catalogs:\n  fluid-command-center:\n    organization_id: from-file\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("FLUID_CC_ORG_ID", blank)
+
+        cfg = FluidConfig().get_catalog_config("command-center")
+
+        assert cfg["organization_id"] == "from-file"
+
     def test_fluid_publish_target_command_center_creates_the_asset(
         self, cc_stub, isolated_config, monkeypatch
     ):
-        from fluid_build.cli import publish
-
         cc_stub.organizations = [ORG_A, ORG_B]
         monkeypatch.setenv("FLUID_CC_ENDPOINT", cc_stub.url)
         monkeypatch.setenv("FLUID_API_KEY", API_KEY)
         monkeypatch.setenv("FLUID_CC_ORG_ID", ORG_A["id"])
 
-        contract = isolated_config / "contract.fluid.yaml"
-        contract.write_text(
-            "\n".join(
-                [
-                    'fluidVersion: "0.7.5"',
-                    "kind: DataProduct",
-                    "id: bronze.customer_subscriptions",
-                    "name: Customer Subscriptions",
-                    "description: Subscriptions from the SID source",
-                    "domain: Customer",
-                    "metadata:",
-                    "  layer: Bronze",
-                    "  owner:",
-                    "    team: data-platform",
-                    "    email: data-platform@example.com",
-                    "exposes:",
-                    "  - exposeId: subscriptions",
-                    "    kind: table",
-                    "    binding:",
-                    "      platform: local",
-                    "      format: parquet",
-                    "      location:",
-                    "        path: out/customer_subscriptions.parquet",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
-
-        parser = argparse.ArgumentParser()
-        publish.register(parser.add_subparsers())
-        args = parser.parse_args(
-            ["publish", str(contract), "--target", "command-center", "--format", "json"]
-        )
-
-        code = asyncio.run(publish.run_async(args, logging.getLogger("test")))
+        code = _publish_cli(isolated_config, "--target", "command-center", "--format", "json")
 
         assert code == 0
         (post,) = cc_stub.posts()
         assert post["headers"]["x-organization-id"] == ORG_A["id"]
         assert post["body"]["metadata"]["fluid_contract_id"] == "bronze.customer_subscriptions"
+
+    def test_fluid_publish_with_a_blank_env_org_id_uses_the_config_file_org(
+        self, cc_stub, isolated_config, monkeypatch
+    ):
+        """A blank CI parameter must not replace the file's id on its way to
+        being ignored, which left no id at all and failed on a credential in
+        two organizations."""
+        cc_stub.organizations = [ORG_A, ORG_B]
+        (isolated_config / ".fluidrc.yaml").write_text(
+            f"catalogs:\n  fluid-command-center:\n    organization_id: {ORG_B['id']}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("FLUID_CC_ENDPOINT", cc_stub.url)
+        monkeypatch.setenv("FLUID_API_KEY", API_KEY)
+        monkeypatch.setenv("FLUID_CC_ORG_ID", "  ")
+
+        code = _publish_cli(isolated_config, "--target", "command-center", "--format", "json")
+
+        assert code == 0
+        assert "/api/v1/organizations" not in cc_stub.paths()
+        (post,) = cc_stub.posts()
+        assert post["headers"]["x-organization-id"] == ORG_B["id"]
+
+
+# ---------------------------------------------------------------------------
+# What a CI step reads: the --format json document, verify-only included
+# ---------------------------------------------------------------------------
+
+
+def _json_output(capsys) -> List[Dict[str, Any]]:
+    """The publish results document ``fluid publish --format json`` printed."""
+    return json.loads(capsys.readouterr().out)
+
+
+class TestJsonResults:
+    @pytest.fixture(autouse=True)
+    def _piped(self, monkeypatch, capsys):
+        # Output captured as a pipe at the default width: through Rich, a long
+        # value was hard-wrapped at 80 columns inside its JSON string.
+        monkeypatch.delenv("COLUMNS", raising=False)
+        capsys.readouterr()
+
+    def test_the_json_document_parses_when_an_error_is_long(
+        self, cc_stub, isolated_config, monkeypatch, capsys
+    ):
+        cc_stub.organizations = [ORG_A, ORG_B]
+        monkeypatch.setenv("FLUID_CC_ENDPOINT", cc_stub.url)
+        monkeypatch.setenv("FLUID_API_KEY", API_KEY)
+
+        code = _publish_cli(isolated_config, "--target", "command-center", "--format", "json")
+
+        assert code == 1
+        (result,) = _json_output(capsys)
+        assert len(result["error"]) > 80
+        assert result["details"]["error_code"] == "cc_organization_unresolved"
+        assert cc_stub.posts() == []
+
+    def test_verify_only_names_an_unresolved_organization_with_its_error_code(
+        self, cc_stub, isolated_config, monkeypatch, capsys
+    ):
+        cc_stub.organizations = [ORG_A, ORG_B]
+        monkeypatch.setenv("FLUID_CC_ENDPOINT", cc_stub.url)
+        monkeypatch.setenv("FLUID_API_KEY", API_KEY)
+
+        code = _publish_cli(
+            isolated_config, "--target", "command-center", "--verify-only", "--format", "json"
+        )
+
+        assert code == 1
+        (result,) = _json_output(capsys)
+        assert result["error"] != "Asset not found in catalog"
+        assert "globex" in result["error"] and "FLUID_CC_ORG_ID" in result["error"]
+        assert result["details"]["error_code"] == "cc_organization_unresolved"
+        assert result["details"]["operation"] == "verify"
+        assert result["details"]["verified"] is False
+        assert [o["id"] for o in result["details"]["organizations"]] == [ORG_A["id"], ORG_B["id"]]
+        assert "/api/v1/assets" not in cc_stub.paths()
+
+    def test_verify_only_with_no_credential_says_so(
+        self, cc_stub, isolated_config, monkeypatch, capsys
+    ):
+        cc_stub.organizations = [ORG_A]
+        monkeypatch.setenv("FLUID_CC_ENDPOINT", cc_stub.url)
+
+        code = _publish_cli(
+            isolated_config, "--target", "command-center", "--verify-only", "--format", "json"
+        )
+
+        assert code == 1
+        (result,) = _json_output(capsys)
+        assert result["details"]["error_code"] == "cc_credential_missing"
+        assert "FLUID_API_KEY" in result["error"]
+        assert cc_stub.requests == []
+
+    def test_verify_only_with_a_settled_organization_still_verifies(
+        self, cc_stub, isolated_config, monkeypatch, capsys
+    ):
+        cc_stub.organizations = [ORG_A]
+        monkeypatch.setenv("FLUID_CC_ENDPOINT", cc_stub.url)
+        monkeypatch.setenv("FLUID_API_KEY", API_KEY)
+
+        code = _publish_cli(
+            isolated_config, "--target", "command-center", "--verify-only", "--format", "json"
+        )
+
+        assert code == 1  # the stub holds no assets
+        (result,) = _json_output(capsys)
+        assert result["error"] == "Asset not found in catalog"
+        assert result["details"] == {"verified": False, "operation": "verify"}
+        lookups = [r for r in cc_stub.requests if r["path"] == "/api/v1/assets"]
+        assert lookups
+        assert all(r["headers"].get("x-organization-id") == ORG_A["id"] for r in lookups)
