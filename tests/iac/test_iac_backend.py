@@ -51,6 +51,38 @@ class TestParseBackend:
             parse_backend("s3://")
 
 
+class TestNothingInASpecIsEchoedThatCouldBeASecret:
+    """``fluid apply`` prints the resolved state location and reports a
+    spec it cannot use; neither may carry a credential or forge a line."""
+
+    SECRET = "NotARealSecret"  # pragma: allowlist secret
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            "s3://AKIAEXAMPLE:NotARealSecret@bucket/key",  # pragma: allowlist secret
+            "gcs://user:NotARealSecret@bucket",  # pragma: allowlist secret
+            "https://user:NotARealSecret@example.com/state",  # pragma: allowlist secret
+            "s3:/NotARealSecret@bucket",
+        ],
+    )
+    def test_a_spec_with_userinfo_is_refused_without_echoing_it(self, spec):
+        with pytest.raises(ValueError) as exc:
+            parse_backend(spec)
+        assert self.SECRET not in str(exc.value)
+
+    def test_an_unsupported_scheme_is_still_named(self):
+        with pytest.raises(ValueError, match="scheme 'azurerm'"):
+            parse_backend("azurerm://container/key")
+
+    @pytest.mark.parametrize(
+        "spec", ["s3://bucket/k\n  state:       local", "gcs://bucket/p\rx", "s3://b/k\x1b[2J"]
+    )
+    def test_a_control_character_in_a_key_or_prefix_is_refused(self, spec):
+        with pytest.raises(ValueError, match="control character"):
+            parse_backend(spec)
+
+
 class TestPerContractDefault:
     """``per_contract_default``: what ``fluid apply`` asks for when the spec
     came from ``FLUID_STATE_BACKEND``."""

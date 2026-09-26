@@ -64,6 +64,10 @@ _CONTRACT_ID_RE = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?")
 #: so the state location ``fluid apply`` prints can carry no credential.
 _BUCKET_RE = re.compile(r"[A-Za-z0-9._-]+")
 
+#: Control characters: refused in a key or prefix, which ``fluid apply``
+#: prints on its state line (a newline there would forge a line of output).
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 #: Environment variable ``fluid apply`` reads for the state backend when
 #: ``--state-backend`` is not on the command line. A CI job sets it once so
 #: OpenTofu state lives in a bucket rather than the workspace, which CI
@@ -166,7 +170,8 @@ def parse_backend(
 
     The backend block carries no credentials — ``tofu`` reads those from
     the environment (``AWS_*`` / ``GOOGLE_*``). A bucket name holding
-    anything but ``[A-Za-z0-9._-]`` is refused without being echoed.
+    anything but ``[A-Za-z0-9._-]``, a key or prefix holding a control
+    character, and an unsupported spec are refused without echoing the spec.
     """
     if not spec:
         return None
@@ -177,6 +182,7 @@ def parse_backend(
         if not bucket:
             raise ValueError(f"s3 backend spec needs a bucket: {spec!r}")
         _check_bucket(bucket, "s3")
+        _check_path(key, "s3", "key")
         if not key:
             key = default_state_key(contract, per_contract=per_contract_default)
         return {"s3": {"bucket": bucket, "key": key}}
@@ -186,6 +192,7 @@ def parse_backend(
         if not bucket:
             raise ValueError(f"gcs backend spec needs a bucket: {spec!r}")
         _check_bucket(bucket, "gcs")
+        _check_path(prefix, "gcs", "prefix")
         block: Dict[str, Any] = {"gcs": {"bucket": bucket}}
         if not prefix:
             # The GCS backend namespaces by object *prefix*, not a full key;
@@ -198,7 +205,11 @@ def parse_backend(
             block["gcs"]["prefix"] = prefix
         return block
 
-    raise ValueError(f"unsupported state backend {spec!r} — use s3:// or gcs://")
+    # Only the scheme is named: the rest of a spec in the wrong form may be a
+    # URL with a credential in it.
+    scheme, sep, _ = spec.partition("://")
+    named = f"scheme {scheme!r}" if sep and scheme.isalnum() else "spec"
+    raise ValueError(f"unsupported state backend {named} — use s3:// or gcs://")
 
 
 def _check_bucket(bucket: str, scheme: str) -> None:
@@ -208,6 +219,11 @@ def _check_bucket(bucket: str, scheme: str) -> None:
             f"{scheme} backend bucket may only hold [A-Za-z0-9._-]; credentials "
             "never go in the spec (tofu reads them from the environment)"
         )
+
+
+def _check_path(value: str, scheme: str, what: str) -> None:
+    if _CONTROL_RE.search(value):
+        raise ValueError(f"{scheme} backend {what} may not hold a control character")
 
 
 def backend_location(block: Mapping[str, Any]) -> str:
