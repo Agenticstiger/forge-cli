@@ -25,8 +25,9 @@ WHAT THIS PROVES
 ----------------
 1. forge **emits** correct cross-account configuration — an
    ``aws_lakeformation_permissions`` naming the account-B principal, and
-   the companion ``aws_s3_bucket_policy`` (LF alone never authorises
-   object-byte reads) — on a *shared pool* bucket, prefix-scoped to the
+   the companion ``aws_s3_bucket_policy``, kept because the principal is in
+   another account than the one applying (``bucketPolicy: cross-account``,
+   the default) — on a *shared pool* bucket, prefix-scoped to the
    binding's ``location.path`` so the grant cannot reach another tenant.
 2. forge **applies** it: ``tofu apply`` against the emulator lands every
    resource, and both accounts' APIs read the artifacts back.
@@ -87,7 +88,7 @@ import json
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import pytest
 
@@ -193,6 +194,11 @@ def _reset() -> None:
         requests.post(f"{ENDPOINT}/_localstack/state/reset", timeout=20)
     except Exception:  # noqa: BLE001 - best-effort isolation
         pass
+
+
+def _as_list(value: Any) -> List[Any]:
+    """A policy element that may be a bare string or a list, as a list."""
+    return [value] if isinstance(value, str) else list(value)
 
 
 def _cross_account_contract(
@@ -369,8 +375,9 @@ class TestCrossAccountArtifactsLand:
     """Emit → ``tofu apply`` → read back through the live AWS APIs."""
 
     def test_bucket_policy_names_the_account_b_principal(self, applied_stack):
-        """The companion bucket policy — LF alone never authorises object
-        reads, so a cross-account consumer is broken without this."""
+        """The companion bucket policy keeps the account-B principal: it is in
+        another account than the one applying, so the default filter keeps it
+        (a consumer reading the bytes through IAM needs it)."""
         _contract, _resources = applied_stack
         policy = json.loads(_client("s3", KEY_A).get_bucket_policy(Bucket=POOL_BUCKET)["Policy"])
         sids = {s["Sid"]: s for s in policy["Statement"]}
@@ -378,7 +385,10 @@ class TestCrossAccountArtifactsLand:
         get_stmt = sids["FluidLfBucketGet0"]
         assert get_stmt["Principal"]["AWS"] == CONSUMER_ARN
         assert get_stmt["Effect"] == "Allow"
-        assert get_stmt["Action"] == ["s3:GetObject"]
+        # The default (cross-account) policy is rendered by
+        # aws_iam_policy_document, which writes a one-item list as a bare
+        # string; IAM reads both forms alike.
+        assert _as_list(get_stmt["Action"]) == ["s3:GetObject"]
         # Prefix-scoped, NOT `/*` — a pool grant must not reach other tenants.
         assert get_stmt["Resource"] == f"arn:aws:s3:::{POOL_BUCKET}/{OWN_PREFIX}*"
 
@@ -386,7 +396,7 @@ class TestCrossAccountArtifactsLand:
         assert list_stmt["Principal"]["AWS"] == CONSUMER_ARN
         # ListBucket is inherently bucket-wide, so it must carry the
         # s3:prefix condition or account B could enumerate every tenant.
-        assert list_stmt["Condition"]["StringLike"]["s3:prefix"] == [f"{OWN_PREFIX}*"]
+        assert _as_list(list_stmt["Condition"]["StringLike"]["s3:prefix"]) == [f"{OWN_PREFIX}*"]
 
     def test_lake_formation_permission_granted_to_account_b(self, applied_stack):
         contract, _resources = applied_stack
@@ -507,6 +517,12 @@ class TestCrossAccountS3Authorization:
         contract = _cross_account_contract(
             database="mesh_silver_authz", table="orders", bucket=AUTHZ_BUCKET
         )
+        # `all-grantees` writes the statements out literally, so the document
+        # can be put below without a plan. Every grantee here is in account B,
+        # so it is exactly the set the default `cross-account` filter keeps at
+        # plan time (pinned in tests/iac/test_iac_lakeformation_bucket_policy.py).
+        lake_formation = contract["exposes"][0]["binding"]["governance"]["lakeFormation"]
+        lake_formation["bucketPolicy"] = "all-grantees"
         resources = get_iac_plugin("aws").emit(contract)
         policy_doc = next(iter(resources["aws_s3_bucket_policy"].values()))["policy"]
 

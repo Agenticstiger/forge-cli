@@ -98,6 +98,18 @@ jobs:
       - name: Stage 1 — tofu validate (creds-free)
         run: .venv/bin/python -m pytest tests/iac/test_iac_tofu_validate.py -q
 
+      # The Lake Formation bucket-policy filter is only decided when `tofu plan`
+      # reads the caller identity, so it is proven by a real plan against moto's
+      # STS. Installed after the unit step so the extra cannot change what that
+      # step runs; the coverage assert fails the step if the file only skipped.
+      - name: Stage 1 — Lake Formation bucket-policy plan (tofu plan vs moto, creds-free)
+        run: |
+          .venv/bin/pip install --quiet -e '.[dev,test-emulators]'
+          .venv/bin/python -m pytest tests/iac/test_iac_lakeformation_bucket_policy_plan.py \
+            -q --junitxml=lf-bucket-policy-plan.xml
+          .venv/bin/python scripts/ci/assert_lane_coverage.py lf-bucket-policy-plan.xml \
+            --require "LF bucket-policy plan=tests/iac/test_iac_lakeformation_bucket_policy_plan.py"
+
   # -------------------------------------------------------------------
   # Stage 2 — docker emulators. PR + push.
   # -------------------------------------------------------------------

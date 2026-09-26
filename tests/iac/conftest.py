@@ -1271,18 +1271,15 @@ def aws_cross_account_iceberg_contract(
 ) -> Dict[str, Any]:
     """Iceberg-on-Glue contract with an LF grant to a non-deployer principal.
 
-    Any IAM-principal LF grant on a Glue-catalog-backed S3 binding
-    triggers BOTH:
+    An IAM-principal LF grant on a Glue-catalog-backed S3 binding emits:
 
       * ``aws_lakeformation_permissions`` granting SELECT/DESCRIBE
-      * ``aws_s3_bucket_policy`` granting s3:GetObject + s3:ListBucket
-
-    The pairing is automatic — the canonical AWS LF cross-account pattern
-    (the aws-lakeformation-best-practices cross-account FAQ + Komminar's
-    Terraform article both spell it out: LF alone does not authorise
-    object-byte reads; a bucket-policy companion is required). No
-    opt-in flag — emitting both is correct for in-account principals
-    too (the bucket policy is additive on top of their IAM read).
+      * ``aws_s3_bucket_policy`` granting s3:GetObject + s3:ListBucket, by
+        default only for a principal in another account than the one
+        applying (``bucketPolicy: cross-account``, decided at plan time).
+        A same-account principal gets no statement: it would let the
+        principal read the objects straight from S3, around Lake
+        Formation's filters.
     """
     return {
         "id": cid,

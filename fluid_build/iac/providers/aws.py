@@ -42,12 +42,13 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import yaml
 
 from ...providers._sql_safety import quote_string_literal, validate_ident
 from ...providers.aws.util import warehouse as _warehouse
+from ..base import UnsupportedBindingError
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
 from ..packaging import (
@@ -398,7 +399,9 @@ class AwsIacPlugin:
         Also emits ``aws_caller_identity`` when any Lake Formation
         resource references the caller's account ID (data-cells filters
         and certain LF grants need ``catalog_id``). The data source is
-        a no-op when not referenced.
+        a no-op when not referenced. A Lake Formation bucket policy in the
+        default ``cross-account`` mode also gets one ``aws_arn`` per grantee
+        and an ``aws_iam_policy_document`` (see :func:`_lf_bucket_policy`).
 
         Under a ``shared`` packaging mode this additionally looks up the pool
         S3 bucket rather than declaring it, so ``tofu`` never plans to create,
@@ -424,6 +427,9 @@ class AwsIacPlugin:
         # ``{account}-fluid-data`` bucket, whose token references this source.
         if _contract_uses_lakeformation(contract) or _references_caller_account(contract):
             data.setdefault("aws_caller_identity", {})["fluid_lf_caller"] = {}
+        # A ``cross-account`` LF bucket policy filters its grantees at plan
+        # time against that same caller identity.
+        _emit_lf_bucket_policy_data(data, contract, cid)
         return data
 
     def credential_env(self, env: Mapping[str, str]) -> Dict[str, str]:
@@ -1411,6 +1417,8 @@ def _wire_aws_deps(resources: Dict[str, Any], cid: str) -> None:
 #         binding's ``s3://<bucket>/<path>``,
 #     ``grants[]`` → one ``aws_lakeformation_permissions`` per principal
 #         (with ``columns`` choosing ``table_with_columns`` vs ``table``),
+#         plus, per ``bucketPolicy``, an ``aws_s3_bucket_policy`` for the
+#         grantees in OTHER accounts (see :func:`_lf_bucket_policy`),
 #     ``tags{}`` → one ``aws_lakeformation_resource_lf_tags`` per table,
 #     ``rowFilter`` → one ``aws_lakeformation_data_cells_filter``.
 #
@@ -1477,6 +1485,15 @@ def _emit_lf_account_settings(
         # ``aws_lakeformation_data_lake_settings`` is a singleton per
         # account+region. Use a stable resource name so re-applying with
         # the same contract is idempotent.
+        #
+        # AUTHORITATIVE, not additive: ``PutDataLakeSettings`` replaces the
+        # admin list with the one passed, and the provider clears every
+        # setting its configuration omits (create-database / create-table
+        # default permissions, trusted resource owners, parameters). Its
+        # destroy empties the admins. An admin missing from ``admins`` is
+        # removed on apply, the applying role included. The schema's
+        # ``governance.lakeFormation.admins`` description says so; the emit
+        # is unchanged.
         resources.setdefault("aws_lakeformation_data_lake_settings", {})[
             safe_ident(f"{cid}_lf_settings")
         ] = {
@@ -1491,6 +1508,308 @@ def _emit_lf_account_settings(
         ] = {
             "key": str(tag_key),
             "values": list(tag_values),
+        }
+
+
+def _lf_location(loc: Mapping[str, Any], placement: _Placement) -> Tuple[Optional[str], str]:
+    """The ``(bucket, path)`` one exposure's Lake Formation resources target.
+
+    The bucket is resolved through the same derivation the ``data.aws_s3_bucket``
+    lookup uses (:func:`_referenced_bucket_name` for a pool; ``normalize_location``
+    otherwise). PR2 resolved it only inside the ``registerLocation`` branch, so a
+    grants-only binding keyed the bucket policy off the raw contract value while
+    the lookup used the resolved name.
+
+    ``default_path=False`` keeps LF's register-the-prefix semantics (no
+    ``{db}/{table}/`` default), which is what the raw ``location.path`` read
+    already gave. The gate stays on the RAW value: an exposure that declares no
+    bucket at all gets ``None`` here — it must never acquire the
+    ``{account}-fluid-data`` fallback through this path.
+    """
+    path = (loc.get("path") or "").lstrip("/")
+    if not loc.get("bucket"):
+        return None, path
+    if placement.bucket_referenced:
+        return _referenced_bucket_name(loc), path
+    bucket, _ = _warehouse.normalize_location(
+        loc, account_ref=_CALLER_ACCOUNT_TOKEN, default_path=False
+    )
+    return bucket, path
+
+
+# ``binding.governance.lakeFormation.bucketPolicy`` (fluid-schema 0.7.6): which
+# ``grants[]`` principals get a statement in the companion ``aws_s3_bucket_policy``.
+_LF_BUCKET_POLICY_CROSS_ACCOUNT = "cross-account"  # the default
+_LF_BUCKET_POLICY_NONE = "none"
+_LF_BUCKET_POLICY_ALL_GRANTEES = "all-grantees"
+_LF_BUCKET_POLICY_MODES = (
+    _LF_BUCKET_POLICY_CROSS_ACCOUNT,
+    _LF_BUCKET_POLICY_NONE,
+    _LF_BUCKET_POLICY_ALL_GRANTEES,
+)
+
+
+@dataclass(frozen=True)
+class _LfBucketPolicy:
+    """The bucket-policy half of one exposure's LF grants (see :func:`_lf_bucket_policy`)."""
+
+    mode: str
+    #: Key of the ``aws_s3_bucket_policy`` resource, and of its policy-document
+    #: data source in ``cross-account`` mode.
+    policy_key: str
+    bucket_ref: TofuExpr
+    bucket_arn: str
+    object_arn: str
+    #: ``s3:prefix`` values ListBucket is narrowed to on a shared pool, else ``()``.
+    list_prefixes: Tuple[str, ...]
+    principals: Tuple[str, ...]
+
+    def grantee_key(self, index: int) -> str:
+        """Key of the ``data.aws_arn`` that parses grantee ``index``'s ARN."""
+        return f"{self.policy_key}_grantee_{index}"
+
+
+def _lf_bucket_policy_mode(gov: Mapping[str, Any]) -> str:
+    """The binding's ``bucketPolicy`` value; an unknown value fails closed."""
+    mode = gov.get("bucketPolicy")
+    if mode is None:
+        return _LF_BUCKET_POLICY_CROSS_ACCOUNT
+    if mode not in _LF_BUCKET_POLICY_MODES:
+        raise UnsupportedBindingError(
+            "lakeformation-bucket-policy",
+            f"governance.lakeFormation.bucketPolicy is {mode!r}; it must be one of "
+            + ", ".join(repr(m) for m in _LF_BUCKET_POLICY_MODES)
+            + ".",
+            (
+                "Omit bucketPolicy (or set 'cross-account') to give only grantees in "
+                "other AWS accounts a bucket-policy statement.",
+                "Set 'none' when the location is registered with Lake Formation and "
+                "every reader goes through Lake Formation.",
+                "Set 'all-grantees' only to restore the old policy, which also lets "
+                "same-account grantees read the objects straight from S3.",
+            ),
+        )
+    return str(mode)
+
+
+def _lf_bucket_principals(gov: Mapping[str, Any]) -> List[str]:
+    """The ``grants[]`` principals that are bucket-policy candidates, in grant order.
+
+    The same grant filter as the ``aws_lakeformation_permissions`` loop (a grant
+    without a principal or permissions emits nothing, so it gets no statement),
+    narrowed to ``arn:`` principals.
+    """
+    principals: List[str] = []
+    for grant in gov.get("grants") or []:
+        principal = grant.get("principal")
+        if not grant.get("permissions") or not isinstance(principal, str):
+            continue
+        if principal.startswith("arn:"):
+            principals.append(principal)
+    return principals
+
+
+def _lf_bucket_policy(
+    binding: Mapping[str, Any],
+    loc: Mapping[str, Any],
+    fmt: str,
+    cid: str,
+    *,
+    placement: _Placement = _LEGACY_PLACEMENT,
+) -> Optional[_LfBucketPolicy]:
+    """The ``aws_s3_bucket_policy`` one exposure's LF grants need, or ``None``.
+
+    THE one derivation, shared by :meth:`AwsIacPlugin.emit` (the resource) and
+    :meth:`AwsIacPlugin.emit_data` (its data sources), so the two halves can
+    never disagree about keys, grantees or ARNs.
+
+    SECURITY. A bucket-policy ``Allow`` lets its principal read the objects
+    straight from S3, and a direct read skips everything Lake Formation
+    enforces: column, row and cell filters, and revocation. Lake Formation
+    itself needs no such statement: an integrated engine (Athena, EMR, Glue,
+    Redshift Spectrum) reads a registered location with credentials Lake
+    Formation vends, and "users don't need to update their Amazon S3 bucket
+    policies" (AWS LF developer guide, *Storage access management*). What the
+    statement is for is a reader in ANOTHER account whose access to the bytes
+    still runs through IAM, e.g. an unregistered location. So ``bucketPolicy``:
+
+    * ``cross-account`` (default): statements only for grantees whose ARN
+      names an account other than the one running ``tofu``. That account is
+      only known at plan time, so the filter is emitted as HCL: each grantee's
+      ARN is parsed by a ``data.aws_arn`` and compared with
+      ``data.aws_caller_identity.fluid_lf_caller.account_id``; the statements
+      come from a ``data.aws_iam_policy_document`` with ``dynamic`` blocks,
+      and the resource gets ``count = 0`` when no grantee is left, because
+      the policy is authoritative and an empty one would still replace every
+      other statement on the bucket. No account is ever guessed from the
+      environment.
+    * ``none``: no bucket policy at all.
+    * ``all-grantees``: a statement for every ``arn:`` grantee — the emit
+      before this field existed, byte for byte.
+
+    ``None`` when there is no ``governance.lakeFormation`` block, the format is
+    not Glue-catalog-backed, no database or bucket is bound, no grant names an
+    ``arn:`` principal, or the mode is ``none``.
+    """
+    gov = (binding.get("governance") or {}).get("lakeFormation") or {}
+    if not gov:
+        return None
+    if str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS or not loc.get("database"):
+        return None
+    mode = _lf_bucket_policy_mode(gov)
+    principals = _lf_bucket_principals(gov)
+    bucket, path = _lf_location(loc, placement)
+    if not principals or not bucket or mode == _LF_BUCKET_POLICY_NONE:
+        return None
+    # A pool bucket's grants MUST be prefix-scoped — without a path the
+    # statements degrade to the whole bucket and this authoritative policy also
+    # replaces the platform team's own. Fail closed.
+    _require_pool_prefix(placement, path, what="governance.lakeFormation.grants[]")
+    return _LfBucketPolicy(
+        mode=mode,
+        policy_key=safe_ident(f"{cid}_lf_bucket_policy_{bucket}"),
+        bucket_ref=_s3_bucket_ref(
+            safe_ident(f"{cid}_{bucket}"), referenced=placement.bucket_referenced
+        ),
+        bucket_arn=f"arn:aws:s3:::{bucket}",
+        # ListBucket targets the bucket ARN itself; GetObject targets the
+        # per-object ARN under the configured path prefix (or everything if
+        # no path).
+        object_arn=f"arn:aws:s3:::{bucket}/{path}*" if path else f"arn:aws:s3:::{bucket}/*",
+        # ListBucket is inherently bucket-scoped, so on a shared pool it is
+        # narrowed with the standard ``s3:prefix`` condition — otherwise this
+        # product's consumers could enumerate every other tenant's keys in the
+        # pool. ``path`` is guaranteed non-empty here by ``_require_pool_prefix``.
+        list_prefixes=(f"{path}*",) if placement.bucket_referenced else (),
+        principals=tuple(principals),
+    )
+
+
+def _lf_other_account_grantees(bp: _LfBucketPolicy) -> str:
+    """HCL map ``{"<grantee index>" = <arn>}`` of the grantees NOT in the applying account.
+
+    Only emitter-controlled text goes in: ``safe_ident`` keys and literal
+    attribute names. The ARNs themselves stay in the ``data.aws_arn`` blocks,
+    as plain strings the renderer escapes, so a contract cannot inject an
+    interpolation through this expression.
+    """
+    grantees = ", ".join(f"data.aws_arn.{bp.grantee_key(i)}" for i in range(len(bp.principals)))
+    return (
+        f"{{for i, g in [{grantees}] : tostring(i) => g.arn "
+        "if g.account != data.aws_caller_identity.fluid_lf_caller.account_id}"
+    )
+
+
+def _emit_lf_bucket_policy(resources: Dict[str, Any], bp: _LfBucketPolicy) -> None:
+    """Emit the ``aws_s3_bucket_policy`` resource for one exposure's LF grants.
+
+    One resource per bucket; a later exposure on the same bucket overwrites an
+    earlier one's, because there is exactly one ``aws_s3_bucket_policy`` slot
+    per bucket.
+
+    NOTE (v2): ``aws_s3_bucket_policy`` is authoritative for the whole bucket,
+    so two products sharing one pool would each rewrite the other's policy on
+    every apply. The prefix-scoped statements keep each grant narrow, but a
+    tenancy registry that detects the collision is RFC v2 work — flagged, not
+    silently accepted.
+    """
+    body: Dict[str, Any] = {"bucket": bp.bucket_ref}
+    if bp.mode == _LF_BUCKET_POLICY_ALL_GRANTEES:
+        statements: List[Dict[str, Any]] = []
+        for sid_idx, principal in enumerate(bp.principals):
+            list_statement: Dict[str, Any] = {
+                "Sid": f"FluidLfBucketList{sid_idx}",
+                "Effect": "Allow",
+                "Principal": {"AWS": principal},
+                "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                "Resource": bp.bucket_arn,
+            }
+            if bp.list_prefixes:
+                list_statement["Condition"] = {"StringLike": {"s3:prefix": list(bp.list_prefixes)}}
+            statements.append(list_statement)
+            statements.append(
+                {
+                    "Sid": f"FluidLfBucketGet{sid_idx}",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": principal},
+                    "Action": ["s3:GetObject"],
+                    "Resource": bp.object_arn,
+                }
+            )
+        body["policy"] = json.dumps(
+            {"Version": "2012-10-17", "Statement": statements},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    else:
+        # cross-account: the statements are built at plan time by the policy
+        # document :func:`_emit_lf_bucket_policy_data` declares; no instance
+        # at all when every grantee is in the applying account.
+        body["count"] = tofu_ref(f"length({_lf_other_account_grantees(bp)}) > 0 ? 1 : 0")
+        body["policy"] = tofu_ref(f"data.aws_iam_policy_document.{bp.policy_key}.json")
+    resources.setdefault("aws_s3_bucket_policy", {})[bp.policy_key] = body
+
+
+def _emit_lf_bucket_policy_data(
+    data: Dict[str, Any], contract: Mapping[str, Any], cid: str
+) -> None:
+    """Declare the data sources a ``cross-account`` LF bucket policy reads.
+
+    Walks the exposures exactly as :meth:`AwsIacPlugin.emit` does and asks
+    :func:`_lf_bucket_policy` the same question, so every ``data.`` reference
+    :func:`_emit_lf_bucket_policy` writes has its declaration here. Per bucket
+    policy: one ``aws_arn`` per grantee (the provider's own ARN parser supplies
+    ``.account``) and one ``aws_iam_policy_document`` whose ``dynamic``
+    statements iterate only over the grantees in other accounts. Nothing is
+    added for ``all-grantees`` or ``none``.
+    """
+    packaging = resolve_packaging(contract)
+    for exposure in contract.get("exposes") or []:
+        binding = exposure.get("binding") or {}
+        if not is_cloud(binding, "aws"):
+            continue
+        bp = _lf_bucket_policy(
+            binding,
+            binding.get("location") or {},
+            binding.get("format") or "parquet",
+            cid,
+            placement=_placement(packaging, exposure),
+        )
+        if bp is None or bp.mode != _LF_BUCKET_POLICY_CROSS_ACCOUNT:
+            continue
+        arns = data.setdefault("aws_arn", {})
+        for index, principal in enumerate(bp.principals):
+            arns[bp.grantee_key(index)] = {"arn": principal}
+        grantees = tofu_ref(_lf_other_account_grantees(bp))
+        list_content: Dict[str, Any] = {
+            # ``statement.key`` is the grantee's index, so a Sid names the
+            # same grantee as the all-grantees policy does.
+            "sid": TofuExpr("FluidLfBucketList" + tofu_ref("statement.key")),
+            "effect": "Allow",
+            "principals": {"type": "AWS", "identifiers": [tofu_ref("statement.value")]},
+            "actions": ["s3:ListBucket", "s3:GetBucketLocation"],
+            "resources": [bp.bucket_arn],
+        }
+        if bp.list_prefixes:
+            list_content["condition"] = {
+                "test": "StringLike",
+                "variable": "s3:prefix",
+                "values": list(bp.list_prefixes),
+            }
+        get_content: Dict[str, Any] = {
+            "sid": TofuExpr("FluidLfBucketGet" + tofu_ref("statement.key")),
+            "effect": "Allow",
+            "principals": {"type": "AWS", "identifiers": [tofu_ref("statement.value")]},
+            "actions": ["s3:GetObject"],
+            "resources": [bp.object_arn],
+        }
+        data.setdefault("aws_iam_policy_document", {})[bp.policy_key] = {
+            "dynamic": {
+                "statement": [
+                    {"for_each": grantees, "content": list_content},
+                    {"for_each": grantees, "content": get_content},
+                ]
+            }
         }
 
 
@@ -1526,27 +1845,7 @@ def _emit_lakeformation(
     if not database:
         return
 
-    # Resolve the bucket ONCE, up front, through the same derivation the
-    # ``data.aws_s3_bucket`` lookup uses (:func:`_referenced_bucket_name` for a
-    # pool; ``normalize_location`` otherwise) — PR2 resolved it only inside the
-    # ``registerLocation`` branch, so a grants-only binding keyed the bucket
-    # policy off the raw contract value while the lookup used the resolved name.
-    #
-    # ``default_path=False`` keeps LF's register-the-prefix semantics (no
-    # ``{db}/{table}/`` default), which is what the raw ``location.path`` read
-    # already gave. The gate stays on the RAW value: an exposure that declares
-    # no bucket at all emits nothing here, exactly as before — it must never
-    # acquire the ``{account}-fluid-data`` fallback through this path.
-    raw_bucket = loc.get("bucket")
-    bucket: Optional[str] = None
-    path = (loc.get("path") or "").lstrip("/")
-    if raw_bucket:
-        if placement.bucket_referenced:
-            bucket = _referenced_bucket_name(loc)
-        else:
-            bucket, _ = _warehouse.normalize_location(
-                loc, account_ref=_CALLER_ACCOUNT_TOKEN, default_path=False
-            )
+    bucket, path = _lf_location(loc, placement)
 
     # 1. Register the S3 location with Lake Formation.
     if gov.get("registerLocation") and bucket:
@@ -1564,18 +1863,6 @@ def _emit_lakeformation(
 
     db_key = safe_ident(f"{cid}_{database}")
     table_key = safe_ident(f"{cid}_{database}_{table}") if table else None
-
-    # Collected during the grant loop, drained after into a single
-    # aws_s3_bucket_policy resource per bucket. A consumer asking for
-    # genuine cross-account read needs BOTH the LF permission (catalog
-    # read) AND a bucket policy (object read on the underlying S3
-    # storage); for in-account principals the bucket policy is benign
-    # (additive on top of IAM). The aws-lakeformation-best-practices
-    # cross-account FAQ and the canonical Terraform pattern by Komminar
-    # both spell this out: LF alone is not sufficient. So we always
-    # emit the policy when LF grants reference IAM principals — no
-    # opt-in flag needed.
-    bucket_principals: List[str] = []
 
     # 2. Principal grants. Each grant becomes one aws_lakeformation_permissions
     #    resource targeting either .table or .table_with_columns (when
@@ -1621,73 +1908,11 @@ def _emit_lakeformation(
         body_key = safe_ident(f"{cid}_lf_grant_{table or database}_{idx}")
         resources.setdefault("aws_lakeformation_permissions", {})[body_key] = body
 
-        # Every IAM-principal LF grant on a Glue-catalog-backed S3
-        # binding gets a matching bucket-policy statement. For
-        # cross-account principals this is REQUIRED (LF alone doesn't
-        # authorise object reads); for in-account principals it's
-        # additive (they already have IAM read). One resource per
-        # bucket — drained after the loop.
-        if isinstance(principal, str) and principal.startswith("arn:"):
-            bucket_principals.append(principal)
-
-    # 2b. S3 bucket policy — one resource per bucket, statements for
-    #     every LF-grant principal. We deliberately overwrite any
-    #     existing fluid-emitted bucket policy on the same bucket
-    #     because there is exactly one aws_s3_bucket_policy slot per
-    #     bucket — multiple LF grants on the same exposure share one
-    #     policy doc.
-    if bucket_principals and bucket:
-        # A pool bucket's grants MUST be prefix-scoped — without a path the
-        # statements below degrade to the whole bucket and this authoritative
-        # policy also replaces the platform team's own. Fail closed.
-        _require_pool_prefix(placement, path, what="governance.lakeFormation.grants[]")
-        bucket_key = safe_ident(f"{cid}_{bucket}")
-        bucket_arn = f"arn:aws:s3:::{bucket}"
-        # ListBucket targets the bucket ARN itself; GetObject targets
-        # the per-object ARN under the configured path prefix (or
-        # everything if no path).
-        object_arn = f"arn:aws:s3:::{bucket}/{path}*" if path else f"arn:aws:s3:::{bucket}/*"
-        statements: List[Dict[str, Any]] = []
-        for sid_idx, p in enumerate(bucket_principals):
-            list_statement: Dict[str, Any] = {
-                "Sid": f"FluidLfBucketList{sid_idx}",
-                "Effect": "Allow",
-                "Principal": {"AWS": p},
-                "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
-                "Resource": bucket_arn,
-            }
-            if placement.bucket_referenced:
-                # ListBucket is inherently bucket-scoped, so on a shared pool
-                # it is narrowed with the standard ``s3:prefix`` condition —
-                # otherwise this product's consumers could enumerate every
-                # other tenant's keys in the pool. ``path`` is guaranteed
-                # non-empty here by ``_require_pool_prefix`` above.
-                list_statement["Condition"] = {"StringLike": {"s3:prefix": [f"{path}*"]}}
-            statements.append(list_statement)
-            statements.append(
-                {
-                    "Sid": f"FluidLfBucketGet{sid_idx}",
-                    "Effect": "Allow",
-                    "Principal": {"AWS": p},
-                    "Action": ["s3:GetObject"],
-                    "Resource": object_arn,
-                }
-            )
-        policy_doc = json.dumps(
-            {"Version": "2012-10-17", "Statement": statements},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        policy_key = safe_ident(f"{cid}_lf_bucket_policy_{bucket}")
-        # NOTE (v2): ``aws_s3_bucket_policy`` is authoritative for the whole
-        # bucket, so two products sharing one pool would each rewrite the
-        # other's policy on every apply. The prefix-scoped statements above
-        # keep each grant narrow, but a tenancy registry that detects the
-        # collision is RFC v2 work — flagged, not silently accepted.
-        resources.setdefault("aws_s3_bucket_policy", {})[policy_key] = {
-            "bucket": _s3_bucket_ref(bucket_key, referenced=placement.bucket_referenced),
-            "policy": policy_doc,
-        }
+    # 2b. The S3 bucket policy for the grantees above — by default only those
+    #     in another AWS account. See :func:`_lf_bucket_policy`.
+    bucket_policy = _lf_bucket_policy(binding, loc, fmt, cid, placement=placement)
+    if bucket_policy is not None:
+        _emit_lf_bucket_policy(resources, bucket_policy)
 
     # 3. LF-tag associations on the table (LF-TBAC).
     tag_assoc = gov.get("tags") or {}

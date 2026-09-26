@@ -5585,7 +5585,7 @@
           "properties": {
             "admins": {
               "type": "array",
-              "description": "IAM principal ARNs (roles or users) granted Lake Formation admin privileges. Emitted as aws_lakeformation_data_lake_settings.admins. Idempotent: re-applying with the same set is a no-op; principals not listed are NOT removed (LF resource semantics preserve other admins).",
+              "description": "IAM principal ARNs (roles or users) granted Lake Formation admin privileges. Emitted as aws_lakeformation_data_lake_settings.admins. AUTHORITATIVE, not additive: Lake Formation's PutDataLakeSettings replaces the account's admin list with the one sent, so an admin NOT listed here is REMOVED on apply. List every principal that must stay a data lake admin, including the role or user that runs the apply: left out, it loses Lake Formation admin on that apply, and the Lake Formation grants and registrations that need an admin can then fail. The terraform-provider-aws resource also clears the data lake settings its configuration omits, and this block sets only the admins, so the account's create-database and create-table default permissions (the IAMAllowedPrincipals default for new databases and tables), trusted resource owners and parameters are cleared too. Destroying the resource empties the admin list and resets CROSS_ACCOUNT_VERSION to 1. Re-applying the same list is a no-op.",
               "items": {
                 "type": "string",
                 "pattern": "^arn:aws[a-z0-9-]*:iam::"
@@ -5622,6 +5622,16 @@
               "type": "boolean",
               "default": false,
               "description": "When true, emit aws_lakeformation_resource that registers the binding's S3 path with Lake Formation. Required before LF can manage access to objects under that path."
+            },
+            "bucketPolicy": {
+              "type": "string",
+              "enum": [
+                "cross-account",
+                "none",
+                "all-grantees"
+              ],
+              "default": "cross-account",
+              "description": "NEW in v0.7.6: Which grants[] principals get a statement in the aws_s3_bucket_policy emitted beside the grants (s3:ListBucket and s3:GetBucketLocation on the bucket, s3:GetObject under location.path). A statement lets its principal read the objects straight from S3, which skips Lake Formation's column, row and cell filters and its revocations. 'cross-account' (the default): only principals whose ARN names an AWS account other than the one running the apply, decided at plan time against the caller identity; same-account grantees get no statement, since on a registered location Lake Formation vends them credentials. 'none': no bucket policy at all; the tightest setting when the location is registered (registerLocation) and every reader, cross-account ones included, queries through a Lake Formation integrated engine, or when the bucket policy is managed elsewhere. 'all-grantees': every grantee, same-account included, which is the output before this field existed and reopens the direct S3 read path. An emitted aws_s3_bucket_policy is authoritative: it replaces every other statement on the bucket. When no grantee is left none is emitted."
             },
             "grants": {
               "type": "array",
