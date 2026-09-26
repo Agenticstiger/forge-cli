@@ -21,7 +21,9 @@ fire. These tests pin the live comparison that replaced it:
 
 * local parquet read through DuckDB, a real file on disk;
 * a Glue table read through a real boto3 client under ``botocore`` 's Stubber;
-* a BigQuery table read through a stubbed ``bigquery.Client``.
+* a BigQuery table read through a stubbed ``bigquery.Client``, with the real
+  ``google-cloud-bigquery`` types when the ``gcp`` extra is installed and a
+  stand-in for them when it is not (CI's test jobs install ``.[dev,local]``).
 
 A local target is written by the build, so its differences are judged by the
 expose's ``schemaPolicy`` (``evolve_safe`` when unset); the tests that mean
@@ -33,10 +35,12 @@ Nothing here reaches a cloud endpoint.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -243,7 +247,7 @@ def glue(monkeypatch):
     client = boto3.session.Session(
         region_name="eu-north-1",
         aws_access_key_id="testing",
-        aws_secret_access_key="testing",
+        aws_secret_access_key="testing",  # pragma: allowlist secret
     ).client("glue")
     stubber = Stubber(client)
     sessions: List[Dict[str, Any]] = []
@@ -275,14 +279,131 @@ def _glue_table(columns: List[Dict[str, str]]) -> Dict[str, Any]:
 GLUE_PARAMS = {"DatabaseName": "demo_bronze", "Name": "customer_subscriptions"}
 
 
-@pytest.fixture
-def bigquery(monkeypatch):
-    """A stub ``bigquery.Client``: answers ``get_table`` from ``state``."""
-    from google.cloud.bigquery import SchemaField
+_BQ_VALIDATION = "fluid_build.providers.bigquery_validation"
 
+
+def _google_sdk_stand_in() -> Dict[str, ModuleType]:
+    """The parts of ``google-cloud-bigquery`` that ``bigquery_validation`` reaches.
+
+    ``Client`` is replaced by the ``bigquery`` fixture before anything calls
+    it. ``SchemaField`` carries the four attributes the provider reads, with
+    the SDK's upper-casing of the type. The exceptions keep the SDK's
+    hierarchy, which is what lets the provider read ``NotFound`` as a table
+    not created yet and re-raise ``Forbidden``.
+    """
+
+    class GoogleAPICallError(Exception):
+        pass
+
+    class ClientError(GoogleAPICallError):
+        pass
+
+    class NotFound(ClientError):
+        pass
+
+    class Forbidden(ClientError):
+        pass
+
+    class SchemaField:
+        def __init__(
+            self,
+            name: str,
+            field_type: str,
+            mode: str = "NULLABLE",
+            description: Optional[str] = None,
+        ) -> None:
+            self.name = name
+            self.field_type = field_type.upper()
+            self.mode = mode
+            self.description = description
+
+    class Client:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("the stand-in SDK builds no client; the fixture replaces it")
+
+    exceptions = ModuleType("google.api_core.exceptions")
+    for cls in (GoogleAPICallError, ClientError, NotFound, Forbidden):
+        setattr(exceptions, cls.__name__, cls)
+    api_core = ModuleType("google.api_core")
+    api_core.exceptions = exceptions
+    bigquery = ModuleType("google.cloud.bigquery")
+    bigquery.SchemaField = SchemaField
+    bigquery.Client = Client
+    cloud = ModuleType("google.cloud")
+    cloud.bigquery = bigquery
+    modules = {
+        "google.api_core": api_core,
+        "google.api_core.exceptions": exceptions,
+        "google.cloud": cloud,
+        "google.cloud.bigquery": bigquery,
+    }
+    if importlib.util.find_spec("google") is None:
+        root = ModuleType("google")
+        root.api_core = api_core
+        root.cloud = cloud
+        modules["google"] = root
+    return modules
+
+
+@pytest.fixture
+def fresh_bigquery_validation():
+    """``bigquery_validation`` is imported afresh in this test, and that copy
+    is forgotten afterwards.
+
+    The module binds the ``google`` SDK when it is imported. A copy bound to
+    the stand-in, or cached from an earlier test, would otherwise answer for
+    the SDK in a later test on the same worker that expects something else.
+    """
+    import fluid_build.providers as package
+
+    saved_module = sys.modules.pop(_BQ_VALIDATION, None)
+    saved_attr = vars(package).pop("bigquery_validation", None)
+    yield
+    sys.modules.pop(_BQ_VALIDATION, None)
+    vars(package).pop("bigquery_validation", None)
+    if saved_module is not None:
+        sys.modules[_BQ_VALIDATION] = saved_module
+    if saved_attr is not None:
+        package.bigquery_validation = saved_attr
+
+
+@pytest.fixture
+def google_sdk(monkeypatch, fresh_bigquery_validation):
+    """``SchemaField`` and the exceptions the BigQuery cases raise.
+
+    The real SDK when the ``gcp`` extra is installed; otherwise the stand-in,
+    placed in ``sys.modules`` for this test only. Without it every BigQuery
+    case here errored at setup in CI and none of them ran.
+    """
+    try:
+        from google.api_core import exceptions
+        from google.cloud.bigquery import SchemaField
+
+        return SimpleNamespace(SchemaField=SchemaField, exceptions=exceptions)
+    except ImportError:
+        pass
+    modules = _google_sdk_stand_in()
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return SimpleNamespace(
+        SchemaField=modules["google.cloud.bigquery"].SchemaField,
+        exceptions=modules["google.api_core.exceptions"],
+    )
+
+
+@pytest.fixture
+def bigquery(monkeypatch, google_sdk):
+    """A stub ``bigquery.Client``: answers ``get_table`` from ``state``."""
     from fluid_build.providers import bigquery_validation
 
-    state = SimpleNamespace(columns=list(BQ_COLUMNS), error=None, clients=[], requested=[])
+    SchemaField = google_sdk.SchemaField
+    state = SimpleNamespace(
+        columns=list(BQ_COLUMNS),
+        error=None,
+        clients=[],
+        requested=[],
+        exceptions=google_sdk.exceptions,
+    )
 
     class _Client:
         def __init__(self, project=None, **_kwargs: Any) -> None:
@@ -625,9 +746,7 @@ def test_bigquery_legacy_type_spelling_is_not_drift(workspace, built_providers, 
 
 
 def test_bigquery_table_not_created_yet_is_to_be_created(workspace, built_providers, bigquery):
-    from google.api_core import exceptions as google_exceptions
-
-    bigquery.error = google_exceptions.NotFound("Not found: Table northwind-demo:demo_bronze.x")
+    bigquery.error = bigquery.exceptions.NotFound("Not found: Table northwind-demo:demo_bronze.x")
     contract = _write_contract(workspace, _contract(GCP_BINDING))
 
     rc, event = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
@@ -639,15 +758,34 @@ def test_bigquery_table_not_created_yet_is_to_be_created(workspace, built_provid
 
 
 def test_bigquery_forbidden_is_not_read_as_absent(workspace, built_providers, bigquery):
-    from google.api_core import exceptions as google_exceptions
-
-    bigquery.error = google_exceptions.Forbidden("Access Denied: Table northwind-demo")
+    bigquery.error = bigquery.exceptions.Forbidden("Access Denied: Table northwind-demo")
     contract = _write_contract(workspace, _contract(GCP_BINDING))
 
     rc, event = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
 
     assert (rc, event) == (2, "diff_live_inspection_failed")
     assert _report(workspace / "diff.json")["live"]["exposes"][0]["status"] == "error"
+
+
+def test_bigquery_without_the_gcp_extra_fails_the_gate_and_names_it(
+    workspace, built_providers, fresh_bigquery_validation, monkeypatch
+):
+    """A table that cannot be read is not a table that does not exist."""
+    for name in (
+        "google.api_core",
+        "google.api_core.exceptions",
+        "google.cloud",
+        "google.cloud.bigquery",
+    ):
+        monkeypatch.setitem(sys.modules, name, None)
+    contract = _write_contract(workspace, _contract(GCP_BINDING))
+
+    rc, event = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    expose = _report(workspace / "diff.json")["live"]["exposes"][0]
+    assert (rc, event) == (2, "diff_live_inspection_failed")
+    assert expose["status"] == "error"
+    assert "install the 'gcp' extra" in expose["detail"]
 
 
 def test_bigquery_table_id_that_would_change_the_request_path_is_refused(
@@ -674,9 +812,7 @@ def test_an_uninspectable_target_wins_over_drift_elsewhere(
 ):
     """OpenTofu's rule: an operation that failed returns its failure status
     before ``-detailed-exitcode`` looks at the diff."""
-    from google.api_core import exceptions as google_exceptions
-
-    bigquery.error = google_exceptions.Forbidden("denied")
+    bigquery.error = bigquery.exceptions.Forbidden("denied")
     glue.stubber.add_response(
         "get_table",
         _glue_table(GLUE_COLUMNS + [{"Name": "rogue", "Type": "int"}]),
