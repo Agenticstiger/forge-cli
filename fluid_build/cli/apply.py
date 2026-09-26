@@ -399,8 +399,7 @@ def register(subparsers: argparse._SubParsersAction):
         default=None,  # resolved by parse_mode; None = amend
         help=(
             "DDL/DML strategy: dry-run | create-only | amend (default) | "
-            "amend-and-build | replace | replace-and-build. See docs/apply.md "
-            "for the full matrix."
+            "amend-and-build | replace | replace-and-build. See docs/apply.md."
         ),
     )
     mode_group.add_argument(
@@ -647,12 +646,12 @@ def register(subparsers: argparse._SubParsersAction):
     advanced_group.add_argument(
         "--state-backend",
         default=None,
-        # Kept short: ``fluid apply --help`` is a few lines under its cap
-        # (tests/test_cli_help_style.py).
+        # Three lines, paid for by one off --mode: ``fluid apply --help`` stays
+        # at main's 96 lines, which FLUID_LOG_LEVEL=DEBUG takes to the cap of
+        # 100 (tests/test_cli_help_style.py).
         help="OpenTofu remote state (s3://bucket/key or gcs://bucket/prefix). "
-        'Default $FLUID_STATE_BACKEND, else local; "" forces local. Given a bucket '
-        "only, the variable keys state per contract (fluid/<id>/) while the flag "
-        "keeps its old default key.",
+        "Default $FLUID_STATE_BACKEND (bucket only: keys per contract, fluid/<id>/, "
+        'unlike the flag), else local; "" forces local.',
     )
 
     p.set_defaults(cmd=COMMAND, func=run)

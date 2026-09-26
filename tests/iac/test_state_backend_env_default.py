@@ -336,8 +336,19 @@ def test_the_flag_help_says_how_the_two_forms_key_a_bucket() -> None:
     action = next(a for a in sub._actions if "--state-backend" in a.option_strings)
     help_text = " ".join((action.help or "").split())
     assert "$FLUID_STATE_BACKEND" in help_text
-    assert "per contract (fluid/<id>/)" in help_text
-    assert "the flag keeps its old default key" in help_text
+    assert "$FLUID_STATE_BACKEND (bucket only: keys per contract, fluid/<id>/" in help_text
+    assert "unlike the flag" in help_text
+
+
+def test_apply_help_still_fits_its_cap_with_debug_logging(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``tests/cli/conftest.py`` sets FLUID_LOG_LEVEL=DEBUG, which prints four
+    registration lines before the help; a worker that inherits it measures
+    ``fluid apply --help`` four lines longer. The longer --state-backend help
+    must not push it over the cap there."""
+    from tests.test_cli_help_style import _HELP_LINE_CAP, _help_output
+
+    monkeypatch.setenv("FLUID_LOG_LEVEL", "DEBUG")
+    assert len(_help_output("apply").splitlines()) <= _HELP_LINE_CAP
 
 
 # ── The generated pipelines leave the state backend to the variable ──────
