@@ -647,10 +647,12 @@ def register(subparsers: argparse._SubParsersAction):
     advanced_group.add_argument(
         "--state-backend",
         default=None,
-        # Two lines at the help style's width, as before the env default:
-        # ``fluid apply --help`` sits at its line cap.
+        # Kept short: ``fluid apply --help`` is a few lines under its cap
+        # (tests/test_cli_help_style.py).
         help="OpenTofu remote state (s3://bucket/key or gcs://bucket/prefix). "
-        'Default $FLUID_STATE_BACKEND, else local; "" forces local.',
+        'Default $FLUID_STATE_BACKEND, else local; "" forces local. Given a bucket '
+        "only, the variable keys state per contract (fluid/<id>/) while the flag "
+        "keeps its old default key.",
     )
 
     p.set_defaults(cmd=COMMAND, func=run)

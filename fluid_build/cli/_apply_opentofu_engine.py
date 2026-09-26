@@ -36,6 +36,7 @@ from fluid_build.cli.console import cprint
 from fluid_build.iac import build_module, get_iac_plugin, runner
 from fluid_build.iac.backend import (
     STATE_BACKEND_ENV,
+    backend_location,
     parse_backend,
     resolve_state_backend_spec,
 )
@@ -159,7 +160,10 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
 
     cprint(f"\nOpenTofu engine — provider: {provider}")
     cprint(f"  module:      {module_path}")
-    state_line = ("remote: " + next(iter(backend))) if backend else "local"
+    # The resolved object, not just the backend type: the same bucket-only
+    # spec keys state differently from the flag and from FLUID_STATE_BACKEND,
+    # and a run that lands on an empty state re-plans every resource as new.
+    state_line = ("remote: " + backend_location(backend)) if backend else "local"
     if backend_origin != "default":
         state_line += f" (from {backend_origin})"
     cprint(f"  state:       {state_line}")

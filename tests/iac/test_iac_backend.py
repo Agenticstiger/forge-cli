@@ -62,14 +62,52 @@ class TestPerContractDefault:
         assert block == {
             "s3": {
                 "bucket": "state",
-                "key": "fluid/bronze_customer_subscriptions/terraform.tfstate",
+                "key": "fluid/bronze.customer_subscriptions/terraform.tfstate",
             }
         }
 
     def test_gcs_default_prefix_is_per_contract_without_packaging(self):
         block = parse_backend("gcs://state", self.CONTRACT, per_contract_default=True)
         assert block == {
-            "gcs": {"bucket": "state", "prefix": "fluid/bronze_customer_subscriptions"}
+            "gcs": {"bucket": "state", "prefix": "fluid/bronze.customer_subscriptions"}
+        }
+
+    #: Schema-valid ids that differ only in ``.``, ``-`` and ``_``, or in a
+    #: leading or trailing ``_``. Measured before: all four got
+    #: ``fluid/bronze_customer_subscriptions/terraform.tfstate``, one state.
+    NEAR_IDS = (
+        "bronze.customer-subscriptions",
+        "bronze.customer_subscriptions",
+        "bronze_customer.subscriptions",
+        "_bronze.customer_subscriptions_",
+    )
+
+    @pytest.mark.parametrize("spec", ["s3://state", "gcs://state"])
+    def test_ids_that_differ_only_in_separators_get_different_states(self, spec):
+        blocks = [
+            parse_backend(spec, {"id": cid, "exposes": []}, per_contract_default=True)
+            for cid in self.NEAR_IDS
+        ]
+        places = [b.get("s3", {}).get("key") or b["gcs"]["prefix"] for b in blocks]
+        assert len(set(places)) == len(self.NEAR_IDS), places
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        [None, "", "a/b", "../x", ".hidden", "trailing-", "a b", "a\n", "id\u00e9", 7],
+    )
+    def test_an_id_that_cannot_name_a_state_is_refused(self, bad_id):
+        with pytest.raises(ValueError, match="cannot name its own state"):
+            parse_backend("s3://state", {"id": bad_id}, per_contract_default=True)
+        with pytest.raises(ValueError, match="cannot name its own state"):
+            parse_backend("gcs://state", {"id": bad_id}, per_contract_default=True)
+
+    def test_an_explicit_key_needs_no_usable_id(self):
+        contract = {"id": "a/b"}
+        assert parse_backend("s3://state/k.tfstate", contract, per_contract_default=True) == {
+            "s3": {"bucket": "state", "key": "k.tfstate"}
+        }
+        assert parse_backend("gcs://state/p", contract, per_contract_default=True) == {
+            "gcs": {"bucket": "state", "prefix": "p"}
         }
 
     def test_an_explicit_key_or_prefix_still_wins(self):
@@ -87,7 +125,7 @@ class TestPerContractDefault:
     def test_a_malformed_packaging_block_still_gets_a_per_contract_key(self):
         contract = dict(self.CONTRACT, packaging="not-a-mapping")
         block = parse_backend("s3://state", contract, per_contract_default=True)
-        assert block["s3"]["key"] == "fluid/bronze_customer_subscriptions/terraform.tfstate"
+        assert block["s3"]["key"] == "fluid/bronze.customer_subscriptions/terraform.tfstate"
 
 
 class TestBackendInDocument:
