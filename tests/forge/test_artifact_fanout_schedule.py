@@ -37,6 +37,7 @@ import pytest
 from fluid_build.cli import generate_artifacts
 from fluid_build.cli._common import CLIError
 from tests.cli._schedule_dag_fixtures import (
+    DEMO_AWS_OVERLAY,
     DEMO_CONTRACT,
     DEMO_CONTRACT_PATH,
     load_dag,
@@ -49,6 +50,12 @@ DAG_REL = "schedule/bronze.customer_subscriptions/ingest_subscriptions_dag.py"
 #: An aws overlay that also moves the schedule, so the DAG shows which
 #: contract it was rendered from.
 AWS_SCHEDULE_OVERLAY = "builds:\n  - execution:\n      trigger:\n        schedule: '30 1 * * *'\n"
+
+#: The demo contract without its cron trigger, so stage 3 renders no DAG.
+UNSCHEDULED_CONTRACT = DEMO_CONTRACT.replace(
+    '    execution:\n      trigger:\n        type: schedule\n        schedule: "0 */4 * * *"\n', ""
+)
+assert "schedule" not in UNSCHEDULED_CONTRACT
 
 
 @pytest.fixture(autouse=True)
@@ -249,6 +256,54 @@ class TestTheGate:
             )
         assert exc.value.event == "generate_artifacts_failed"
         assert exc.value.context["emit_key"] == "schedule"
+
+
+class TestADerivedPathIsCheckedOnlyWhereADagCarriesIt:
+    """Only a schedule DAG carries the contract's project-relative path, so
+    only a DAG that is rendered holds it to the DAG path grammar.
+
+    Measured before: ``--env aws`` on a raw contract in ``contracts/my
+    product/`` failed stage 3 with the explicit ``--contract-path`` check,
+    though the contract schedules nothing and the same command without
+    ``--env`` wrote six files. The path derived for the temporary ``--env``
+    bundle went through the check meant for the flag.
+    """
+
+    @staticmethod
+    def _project(root: Path, rel: str, contract: str) -> None:
+        path = root / rel
+        (path.parent / "overlays").mkdir(parents=True)
+        path.write_text(contract, encoding="utf-8")
+        (path.parent / "overlays" / "aws.yaml").write_text(DEMO_AWS_OVERLAY, encoding="utf-8")
+
+    @pytest.mark.parametrize("folder", ["my product", ".hidden"])
+    @pytest.mark.parametrize("emit", [None, "odcs"])
+    def test_an_unscheduled_contract_there_gets_its_artifacts_under_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, folder: str, emit: Any
+    ) -> None:
+        rel = f"contracts/{folder}/contract.fluid.yaml"
+        self._project(tmp_path, rel, UNSCHEDULED_CONTRACT)
+        argv = [rel, "--out", "dist/artifacts", "--env", "aws"]
+        if emit is not None:
+            argv += ["--emit", emit]
+        assert _stage3(tmp_path, monkeypatch, *argv) == 0
+        out = tmp_path / "dist" / "artifacts"
+        written = json.loads((out / "MANIFEST.json").read_text())["files"]
+        assert written
+        assert not (out / "schedule").exists()
+        if emit is not None:
+            assert all(name.startswith("odcs/") for name in written)
+
+    def test_a_scheduled_contract_there_still_fails_where_its_dag_is_rendered(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rel = "contracts/my product/contract.fluid.yaml"
+        self._project(tmp_path, rel, DEMO_CONTRACT)
+        with pytest.raises(CLIError) as exc:
+            _stage3(tmp_path, monkeypatch, rel, "--out", "dist/artifacts", "--env", "aws")
+        assert exc.value.event == "generate_artifacts_failed"
+        assert exc.value.context["emit_key"] == "schedule"
+        assert not list((tmp_path / "dist" / "artifacts").rglob("*.py"))
 
 
 def _warned(caplog: pytest.LogCaptureFixture) -> bool:

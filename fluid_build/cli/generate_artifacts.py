@@ -200,7 +200,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 manifest_path=manifest_path,
                 logger=logger,
                 env=_schedule_env(args, logger),
-                contract_path=_schedule_contract_path(args, bundle_path, fanout_input),
+                contract_path=getattr(args, "contract_path", None),
+                # A temporary --env bundle records no location; the DAGs still
+                # run the contract that was given.
+                source_path=None if fanout_input == bundle_path else bundle_path,
             )
     except FanoutError as exc:
         # Surface emit-key context so the operator knows which generator failed.
@@ -215,22 +218,6 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     cprint(f"   MANIFEST digest: {manifest['digest']}")
     cprint(f"   files: {len(manifest.get('files', {}))}")
     return 0
-
-
-def _schedule_contract_path(
-    args: argparse.Namespace, input_path: Path, fanout_input: Path
-) -> Optional[str]:
-    """The ``--contract-path`` for schedule DAGs: the flag, else ``None``
-    (``run_fanout`` defaults it from its input), except that a raw contract
-    fanned out through a temporary ``--env`` bundle keeps its own
-    project-relative path; the temporary bundle records no location.
-    """
-    explicit = getattr(args, "contract_path", None)
-    if explicit is not None or fanout_input == input_path:
-        return explicit
-    from fluid_build.forge.core.artifact_fanout import project_relative_path
-
-    return project_relative_path(input_path)
 
 
 def _schedule_env(args: argparse.Namespace, logger: logging.Logger) -> Optional[str]:

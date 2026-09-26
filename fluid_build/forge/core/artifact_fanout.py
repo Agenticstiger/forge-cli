@@ -798,6 +798,7 @@ def run_fanout(
     logger: logging.Logger,
     env: Optional[str] = None,
     contract_path: Optional[str] = None,
+    source_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Top-level orchestrator called from the ``generate-artifacts`` CLI.
 
@@ -817,6 +818,13 @@ def run_fanout(
     record where its contract lives. For a raw contract the schedule is also
     rendered with the ``env`` overlay applied, as ``fluid apply --env`` will
     see it; a bundle was overlaid by stage 1, so build it with the same env.
+
+    ``source_path`` is the raw contract a ``.tgz`` input was made from
+    (``generate artifacts --env`` on a raw contract fans out through a
+    temporary bundle). It only supplies the default ``contract_path``, the
+    way a raw-contract input does. A path derived like that is not held to
+    the explicit ``contract_path`` check up front: only a schedule DAG
+    carries it, and rendering one checks it.
 
     Returns a dict matching the on-disk MANIFEST.json written next to the
     artifacts (same schema Phase-2 bundle MANIFEST uses — callers can
@@ -851,9 +859,15 @@ def run_fanout(
             shutil.rmtree(target)
 
     dag_contract_path = contract_path
-    if dag_contract_path is None and not _is_tgz_input(bundle_or_contract):
-        # Outside the project: None, defaulted below with a warning.
-        dag_contract_path = project_relative_path(bundle_or_contract)
+    if dag_contract_path is None:
+        # A raw contract locates itself, as does the one a temporary --env
+        # bundle came from; a bundle records no location. Outside the
+        # project: None, defaulted below with a warning.
+        source = source_path
+        if source is None and not _is_tgz_input(bundle_or_contract):
+            source = bundle_or_contract
+        if source is not None:
+            dag_contract_path = project_relative_path(source)
     overlay_env = None if _is_tgz_input(bundle_or_contract) else env
 
     # Extract bundle if applicable. ``resolved_contract`` is the file every
