@@ -42,7 +42,7 @@ resolution:
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, List, Mapping
 
 import pytest
 
@@ -51,6 +51,8 @@ from fluid_build.iac.packaging import PackagingError
 from fluid_build.iac.providers.aws import AwsIacPlugin
 from fluid_build.iac.providers.gcp import GcpIacPlugin
 from fluid_build.iac.providers.snowflake import SnowflakeIacPlugin
+
+from ._lf_bucket_policy import only_policy, policy_statements
 
 pytestmark = pytest.mark.unit
 
@@ -224,13 +226,23 @@ class TestAwsPackagingEmit:
             AwsIacPlugin().emit(contract)
         assert excinfo.value.kind == "shared-bucket-requires-path"
 
-    def test_shared_bucket_grants_never_reach_the_whole_pool(self):
+    @pytest.mark.parametrize("bucket_policy", [None, "all-grantees"], ids=["default", "all"])
+    def test_shared_bucket_grants_never_reach_the_whole_pool(self, bucket_policy):
         # The property behind the regression above, asserted on the emitted
         # policy: no statement may target the bucket root or an unscoped
-        # object wildcard.
-        resources = AwsIacPlugin().emit(_aws_contract(SHARED))
+        # object wildcard. Held for both statement-bearing bucketPolicy
+        # modes: the default builds its statements at plan time from a
+        # policy document, all-grantees writes them out literally.
+        contract = _aws_contract(SHARED)
+        if bucket_policy:
+            lf = contract["exposes"][0]["binding"]["governance"]["lakeFormation"]
+            lf["bucketPolicy"] = bucket_policy
+        plugin = AwsIacPlugin()
+        resources = plugin.emit(contract)
+        statements = policy_statements(only_policy(resources), plugin.emit_data(contract))
+        assert statements, "the cross-account grantee must have candidate statements"
         pool_root_wildcard = "arn:aws:s3:::acme-iot-lake/*"
-        for statement in _policy_statements(next(iter(resources["aws_s3_bucket_policy"].values()))):
+        for statement in statements:
             resource = statement["Resource"]
             # The bucket-root wildcard reaches every tenant; the prefixed
             # form (`…/telemetry/*`) is the scoped one we want.
@@ -250,11 +262,14 @@ class TestAwsPackagingEmit:
         assert "aws_s3_bucket_policy" in resources
 
     def test_bucket_policy_targets_the_lookup_and_scopes_list_to_the_prefix(self):
-        resources = AwsIacPlugin().emit(_aws_contract(SHARED))
-        policy = next(iter(resources["aws_s3_bucket_policy"].values()))
+        plugin = AwsIacPlugin()
+        contract = _aws_contract(SHARED)
+        policy = only_policy(plugin.emit(contract))
         assert policy["bucket"] == "${data.aws_s3_bucket.telemetry_sdp_acme_iot_lake.id}"
         list_stmt = next(
-            s for s in _policy_statements(policy) if s["Sid"].startswith("FluidLfBucketList")
+            s
+            for s in policy_statements(policy, plugin.emit_data(contract))
+            if s["Sid"].startswith("FluidLfBucketList")
         )
         assert list_stmt["Condition"] == {"StringLike": {"s3:prefix": ["telemetry/*"]}}
 
@@ -271,10 +286,12 @@ class TestAwsPackagingEmit:
         assert "aws_glue_catalog_database" in resources
         table = resources["aws_glue_catalog_table"]["telemetry_sdp_iot_pool_telemetry"]
         assert "fluid_pool" not in table["parameters"]
-        # ``aws_caller_identity`` is the pre-existing Lake Formation lookup;
-        # packaging adds no container data sources for a LEGACY contract.
+        # ``aws_caller_identity`` is the pre-existing Lake Formation lookup,
+        # and ``aws_arn`` + ``aws_iam_policy_document`` build the default
+        # (cross-account) bucket policy for the LF grant; packaging adds no
+        # container data sources for a LEGACY contract.
         data = plugin.emit_data(contract)
-        assert set(data) == {"aws_caller_identity"}
+        assert set(data) == _LF_DATA_SOURCES
 
     def test_per_container_override_shares_the_bucket_but_owns_the_database(self):
         plugin = AwsIacPlugin()
@@ -288,10 +305,10 @@ class TestAwsPackagingEmit:
         assert "aws_glue_catalog_database" in resources
 
 
-def _policy_statements(policy: Mapping[str, Any]) -> list:
-    import json
-
-    return json.loads(policy["policy"])["Statement"]
+#: The data sources the base AWS contract's Lake Formation block needs by itself:
+#: the caller identity, plus the per-grantee ARN parse and the policy document
+#: of its default (cross-account) bucket policy. None of them is a container.
+_LF_DATA_SOURCES = {"aws_caller_identity", "aws_arn", "aws_iam_policy_document"}
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +537,36 @@ class TestSnowflakePackagingEmit:
 # Cross-provider correctness: no dangling references
 # ---------------------------------------------------------------------------
 
-_REF_RE = re.compile(r"\$\{((?:data\.)?[A-Za-z0-9_]+\.[A-Za-z0-9_]+)\.")
+# An address anywhere inside an interpolation, not only at its start: a
+# ``count`` such as ``${length({for g in [data.aws_arn.a, ...] : ...})}``
+# references ``data.aws_arn.a`` without an attribute. A data-source address is
+# recognised bare; a resource address needs its ``.attr`` so a local such as
+# ``g.arn`` or ``statement.key`` is not mistaken for one.
+_REF_RE = re.compile(
+    r"(?<![\w.])(data\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+|[A-Za-z0-9_]+\.[A-Za-z0-9_]+(?=\.[A-Za-z_]))"
+)
+
+
+def _interpolations(text: str) -> List[str]:
+    """Every ``${...}`` body in ``text``, braces balanced; ``$${`` is a literal."""
+    bodies: List[str] = []
+    start = text.find("${")
+    while start != -1:
+        if start > 0 and text[start - 1] == "$":
+            start = text.find("${", start + 2)
+            continue
+        depth, index = 0, start + 1
+        while index < len(text):
+            if text[index] == "{":
+                depth += 1
+            elif text[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            index += 1
+        bodies.append(text[start + 2 : index])
+        start = text.find("${", index)
+    return bodies
 
 
 def _declared_addresses(resources: Mapping[str, Any], data: Mapping[str, Any]) -> set:
@@ -531,7 +577,8 @@ def _declared_addresses(resources: Mapping[str, Any], data: Mapping[str, Any]) -
 
 def _referenced_addresses(obj: Any, found: set) -> set:
     if isinstance(obj, str):
-        found.update(_REF_RE.findall(obj))
+        for body in _interpolations(obj):
+            found.update(_REF_RE.findall(body))
     elif isinstance(obj, Mapping):
         for value in obj.values():
             _referenced_addresses(value, found)
@@ -720,9 +767,9 @@ class TestIsolatedIsTodaysShape:
         aws = AwsIacPlugin()
         assert "aws_s3_bucket" in aws.emit(_aws_contract(ISOLATED))
         assert "aws_glue_catalog_database" in aws.emit(_aws_contract(ISOLATED))
-        # No container is looked up — the only data source is the
-        # pre-existing Lake Formation caller identity.
-        assert set(aws.emit_data(_aws_contract(ISOLATED))) == {"aws_caller_identity"}
+        # No container is looked up — the only data sources are the Lake
+        # Formation ones (caller identity + the default bucket policy's).
+        assert set(aws.emit_data(_aws_contract(ISOLATED))) == _LF_DATA_SOURCES
 
         gcp = GcpIacPlugin()
         assert "google_bigquery_dataset" in gcp.emit(_gcp_contract(ISOLATED))

@@ -42,7 +42,8 @@ Markers declared in `pyproject.toml`.
 | Stage 3 idempotency | `tests/iac/test_iac_aws_real_idempotency_e2e.py` | ✅ (see Stage 3 §) |
 | Stage 3 replace mode | `tests/iac/test_iac_aws_real_replace_e2e.py` | ✅ data-loss gate verified |
 | Stage 3 brownfield | _file claimed but absent — see "deferred" §_ | ❌ deferred (`discover_imports()` returns `[]` so any test would be a no-op) |
-| Stage 3 cross-account proxy | `tests/iac/test_iac_aws_real_cross_account_e2e.py` | ✅ 2/2 — consumer role assumes + LF + S3 bucket policy + Athena SELECT; un-granted principal correctly denied. **Zero new schema fields** — uses the existing `binding.governance.lakeFormation.grants[]` block; bucket policy is paired automatically with any IAM-principal grant. |
+| Stage 3 cross-account proxy | `tests/iac/test_iac_aws_real_cross_account_e2e.py` | ✅ 2/2 before `bucketPolicy` existed — consumer role assumes + LF + S3 bucket policy + Athena SELECT; un-granted principal correctly denied. The consumer is in the deployer's account, so under the new default (`bucketPolicy: cross-account`) it gets **no** bucket-policy statement and the test now asserts that; that version has **not yet been re-run live**. Uses the existing `binding.governance.lakeFormation.grants[]` block. |
+| Stage 1 LF bucket-policy modes | `tests/iac/test_iac_lakeformation_bucket_policy.py`, `tests/iac/test_iac_lakeformation_bucket_policy_plan.py`, `tests/iac/test_iac_tofu_validate.py::test_lakeformation_bucket_policy_modes_pass_tofu_validate` | ✅ — the three `bucketPolicy` modes rendered (all-grantees byte-identical to the previous emit), `tofu validate` of each, and a real `tofu plan` against moto's STS proving the default keeps a cross-account grantee's statements and plans no bucket policy for a same-account one. |
 | Stage 2 cross-account (two-account LocalStack) | `tests/integration/test_iac_cross_account_localstack.py` | ✅ 10 tests, gated on `FLUID_IAC_LIVE_XACCT=1` + a second LocalStack Pro carrying `lakeformation`. Producer stack applies in account A (`000000000000`); every grant names a role in account B (`222222222222`) — LocalStack derives the account from the access-key id. Verified live: LF permission + LF prefix-registration + `aws_s3_bucket_policy` all land and read back; the shared-**pool** bucket is referenced via `data.aws_s3_bucket`, its `GetObject` grant is scoped to `location.path` and its `ListBucket` carries the `s3:prefix` condition. Under `ENFORCE_IAM=1` the emitted bucket policy is proven to be the **deciding** access control: with a deliberately broad identity policy on the account-B role, the granted prefix reads and the sibling tenant's prefix is denied — and widening only the bucket policy flips that denial (causal control). **Still NOT proven here**: LF cross-account *authorization* (LocalStack rejects `GrantPermissions` under IAM enforcement even for a registered `DataLakeAdmin` — `docs/upstream-issues/localstack-lakeformation-grant-auth.md`), and cross-account Glue catalog sharing (no AWS RAM in LocalStack; account B gets `EntityNotFoundException`, which is state isolation, not a denial). |
 | Stage 1 Glue catalog enrichment | `tests/iac/test_iac_aws.py::TestAwsGlueCatalogEnrichment` (6) + `test_iac_tofu_validate.py[aws]` | ✅ — `aws_glue_catalog_table.description` + per-column comments + fluid_layer/fluid_product_type/fluid_domain/fluid_version/fluid_contract/forge.pii.<col> parameters, absorbed from the retired `GlueCatalogRegistrar`. **Zero new schema fields** — reads existing `description`/`metadata.description`/`metadata.layer`/`metadata.productType`/`domain`/`fluidVersion`/`column.tags[]`/`column.description`. |
 | Stage 3 Glue catalog enrichment | `tests/iac/test_iac_aws_real_e2e.py::test_real_iceberg_on_glue_round_trip` | ✅ live — Description + Parameters + per-column Comments + `forge.pii.amount` verified via boto3 GetTable |
@@ -88,8 +89,9 @@ follow-up scope. None block the current branch from shipping.
   IAM-grant LOGIC is covered end-to-end via Stage 3 same-account /
   same-project proxies — with **zero new contract-schema fields**:
   - AWS uses the existing `binding.governance.lakeFormation.grants[]`
-    block. Any IAM-principal grant automatically pairs with an
-    `aws_s3_bucket_policy` for the same principal — no opt-in flag.
+    block. An IAM-principal grant pairs with an `aws_s3_bucket_policy`
+    statement, by default only when the principal is in another account
+    than the one applying (`bucketPolicy`, fluid-schema 0.7.6).
   - GCP uses the existing `metadata.policies` surface. SA emails from
     other projects are accepted verbatim via BQ's `user_by_email`
     field on the dataset's embedded `access[]` block.
@@ -240,7 +242,7 @@ fields:
 
 | Capability | Reads from |
 |---|---|
-| Cross-account S3 access | `binding.governance.lakeFormation.grants[].principal` (LF block); bucket policy is paired automatically with any IAM-principal grant — no opt-in flag |
+| Cross-account S3 access | `binding.governance.lakeFormation.grants[].principal` (LF block); a bucket-policy statement is paired with each grantee in another account (`bucketPolicy: cross-account`, the default; `none` / `all-grantees` in fluid-schema 0.7.6) |
 | Cross-project BQ access | `metadata.policies` (existing) → dataset `access[]` via `_bq_access_entries` — ⚠️ **but see the note below: `metadata.policies` does not pass `fluid validate`** |
 | Glue catalog enrichment | `description` / `metadata.{description,layer,productType}` / `domain` / `fluidVersion` / `column.{description,tags}` |
 | Snowflake catalog enrichment | same set as Glue |

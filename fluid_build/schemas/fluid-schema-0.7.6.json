@@ -5623,6 +5623,16 @@
               "default": false,
               "description": "When true, emit aws_lakeformation_resource that registers the binding's S3 path with Lake Formation. Required before LF can manage access to objects under that path."
             },
+            "bucketPolicy": {
+              "type": "string",
+              "enum": [
+                "cross-account",
+                "none",
+                "all-grantees"
+              ],
+              "default": "cross-account",
+              "description": "NEW in v0.7.6: Which grants[] principals get a statement in the aws_s3_bucket_policy emitted beside the grants (s3:ListBucket and s3:GetBucketLocation on the bucket, s3:GetObject under location.path). A statement lets its principal read the objects straight from S3, which skips Lake Formation's column, row and cell filters and its revocations. 'cross-account' (the default): only principals whose ARN names an AWS account other than the one running the apply, decided at plan time against the caller identity; same-account grantees get no statement, since on a registered location Lake Formation vends them credentials. 'none': no bucket policy at all; the tightest setting when the location is registered (registerLocation) and every reader, cross-account ones included, queries through a Lake Formation integrated engine, or when the bucket policy is managed elsewhere. 'all-grantees': every grantee, same-account included, which is the output before this field existed and reopens the direct S3 read path. An emitted aws_s3_bucket_policy is authoritative: it replaces every other statement on the bucket. When no grantee is left none is emitted."
+            },
             "grants": {
               "type": "array",
               "description": "Principal-based LF grants on this exposure's database/table. Each entry maps a principal to a permission set (and optional column projection). Emitted as aws_lakeformation_permissions resources. Field idiom adapted from ODCS v3 roles[] (principal + access-type), bound to IAM ARNs since LF is cloud-specific.",

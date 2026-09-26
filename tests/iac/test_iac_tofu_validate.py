@@ -488,17 +488,74 @@ def test_cross_account_emit_passes_tofu_validate(cloud, tmp_path):
     if plugin is None:
         pytest.skip(f"no IaC plugin registered for {cloud}")
 
-    (tmp_path / "main.tf.json").write_text(build_module(plugin, _CROSS_ACCOUNT_CONTRACTS[cloud]))
+    _assert_tofu_validates(tmp_path, build_module(plugin, _CROSS_ACCOUNT_CONTRACTS[cloud]))
 
-    _tofu_init_or_skip(tmp_path)
+
+def _assert_tofu_validates(workdir, module: str) -> None:
+    """``tofu init`` + ``tofu validate`` one rendered module in ``workdir``."""
+    (workdir / "main.tf.json").write_text(module)
+
+    _tofu_init_or_skip(workdir)
 
     validate = subprocess.run(
         [_TOFU, "validate", "-no-color"],
-        cwd=tmp_path,
+        cwd=workdir,
         capture_output=True,
         text=True,
     )
     assert validate.returncode == 0, validate.stderr or validate.stdout
+
+
+def _lf_bucket_policy_contract(bucket_policy, packaging):
+    """A same-account and a cross-account LF grantee on one bucket."""
+    lake_formation = {
+        "registerLocation": True,
+        "grants": [
+            {"principal": "arn:aws:iam::111111111111:role/same", "permissions": ["SELECT"]},
+            {"principal": "arn:aws:iam::222222222222:role/other", "permissions": ["SELECT"]},
+        ],
+    }
+    if bucket_policy is not None:
+        lake_formation["bucketPolicy"] = bucket_policy
+    contract = {
+        "id": "demo.aws.lfbp",
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "binding": {
+                    "platform": "aws",
+                    "format": "parquet",
+                    "location": {
+                        "database": "demo",
+                        "table": "orders",
+                        "bucket": "demo-fluid-lfbp",
+                        "path": "orders/",
+                    },
+                    "governance": {"lakeFormation": lake_formation},
+                },
+                "contract": {"schema": [{"name": "id", "type": "integer", "required": True}]},
+            }
+        ],
+    }
+    if packaging is not None:
+        contract["packaging"] = packaging
+    return contract
+
+
+@pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
+@pytest.mark.parametrize(
+    "packaging", [None, {"mode": "shared", "pool": "demo-pool"}], ids=["owned", "pool"]
+)
+@pytest.mark.parametrize(
+    "bucket_policy", [None, "none", "all-grantees"], ids=["cross-account", "none", "all"]
+)
+def test_lakeformation_bucket_policy_modes_pass_tofu_validate(bucket_policy, packaging, tmp_path):
+    """Every ``bucketPolicy`` mode renders a module real ``tofu`` accepts —
+    in particular the default's ``aws_arn`` / ``aws_iam_policy_document``
+    data sources, its ``dynamic "statement"`` blocks and the ``count`` on
+    ``aws_s3_bucket_policy``, which the dict-level tests cannot type-check."""
+    module = build_module(IAC_PLUGINS["aws"], _lf_bucket_policy_contract(bucket_policy, packaging))
+    _assert_tofu_validates(tmp_path, module)
 
 
 # Snowflake Horizon declarative tag governance was scoped OUT in the
