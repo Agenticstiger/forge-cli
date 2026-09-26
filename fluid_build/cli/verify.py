@@ -1179,6 +1179,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 contract=contract,
                 workdir=Path(contract_path).resolve().parent,
                 options=options_from_args(args),
+                reference_only=reference_only,
             )
         elif _is_object_store_binding(expose_config.get("binding")):
             # An AWS/Azure binding that names a bucket writes to object storage,
@@ -1303,7 +1304,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 # be compared, so we report nothing either way. This
                 # mirrors how ``fluid diff`` treats a missing baseline.
                 continue
-            cprint(f"   ❌ Error: {result.get('error', 'Unknown error')}")
+            # Not markup: a message such as "pip install 'data-product-forge[aws]'"
+            # lost its ``[aws]`` to Rich, which read it as a style tag.
+            cprint(f"   ❌ Error: {result.get('error', 'Unknown error')}", markup=False)
             error_count += 1
             continue
 
@@ -1326,7 +1329,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         cprint(f"\n   {severity_symbol} Severity: {severity_level} (Impact: {severity_impact})")
         cprint(f"   📊 Table Rows: {metadata.get('num_rows', 0):,}")
         if metadata.get("row_count_detail"):
-            cprint(f"      {metadata['row_count_detail']}")
+            cprint(f"      {metadata['row_count_detail']}", markup=False)
 
         # Dimension 1: Schema Structure
         cprint("\n   🔍 Dimension 1: Schema Structure")

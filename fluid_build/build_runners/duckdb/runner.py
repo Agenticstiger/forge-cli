@@ -1020,6 +1020,10 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     stream_results: List[StreamResult] = []
     failures = 0
     records_total = 0
+    # Where each stream's rows went, and whether every count is the write's
+    # own; recorded as ``facets.landed`` (see ``_landed_facet``).
+    destinations: Dict[str, str] = {}
+    counted_at_write = True
 
     # DLQ writer — created lazily on first bad-row hit so contracts
     # without quality gates pay zero overhead. Quality config comes
@@ -1070,14 +1074,24 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 copy_template = _build_copy_destination(out_path, sink_format)
                 copy_sql = copy_template.format(select=landed_sel)
                 LOG.info("duckdb.run stream=%s sql_chars=%d", stream, len(copy_sql))
-                con.execute(copy_sql)
-                # Count rows landed (best-effort via COUNT on the same select).
-                try:
-                    row = con.execute(f"SELECT COUNT(*) FROM ({landed_sel})").fetchone()
-                    n = row[0] if row is not None else 0
-                except Exception:
-                    n = 0
+                # ``COPY ... TO`` answers with the rows it wrote (its ``Count``
+                # column). That is what landed. A second ``COUNT(*)`` over the
+                # select re-reads the source, which a live database may have
+                # changed since, and a table holding exactly what the COPY
+                # wrote then failed verify against the larger number.
+                written = con.execute(copy_sql).fetchone()
+                if written is not None and isinstance(written[0], int):
+                    n = written[0]
+                else:
+                    counted_at_write = False
+                    # Best-effort via COUNT on the same select.
+                    try:
+                        row = con.execute(f"SELECT COUNT(*) FROM ({landed_sel})").fetchone()
+                        n = row[0] if row is not None else 0
+                    except Exception:
+                        n = 0
                 records_total += int(n)
+                destinations[stream] = _recorded_destination(out_path, ctx.workdir)
 
                 # Route bad rows to DLQ — only when gates declared AND
                 # the run actually rejected something.
@@ -1267,6 +1281,11 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
         facets["pii_findings"] = pii_findings
     if bigquery_load:
         facets["bigquery_load"] = bigquery_load
+    rows_from = "write" if counted_at_write else "source_count"
+    if any(split.get("late") for split in late_arrival_split_results.values()):
+        # The split moved rows out of the file the COPY wrote.
+        rows_from = "write_before_late_arrival_split"
+    facets["landed"] = _landed_facet(ctx, destinations, rows_from)
 
     return RunResult(
         run_id=ctx.run_id,
@@ -1419,6 +1438,38 @@ def _file_within_prefix(uri: str, loc: Dict[str, Any], stream: str, sink_format:
         return uri
     base = str(loc.get("table") or stream)
     return f"{uri}{base}.{ext}"
+
+
+def _recorded_destination(out_path: str, workdir: Any) -> str:
+    """``out_path`` as the run record keeps it: a URI as is, a local file
+    relative to the contract directory when it is under it.
+
+    Relative, because the record's facets also travel in the OpenLineage event,
+    and an absolute path would carry the machine's home directory with it.
+    """
+    if _is_remote_uri(out_path):
+        return out_path
+    try:
+        return Path(out_path).resolve().relative_to(Path(workdir).resolve()).as_posix()
+    except (OSError, ValueError):
+        return out_path
+
+
+def _landed_facet(ctx: RunContext, destinations: Dict[str, str], rows_from: str) -> Dict[str, Any]:
+    """``facets.landed``: what this run put where, for ``fluid verify``.
+
+    One contract directory holds the runs of every target its overlays select,
+    so ``records_total`` alone does not say which table it describes. With
+    this, verify compares a table only with runs that landed in it
+    (``destinations``, stream to URI or contract-relative path), knows whether
+    the run replaced the table or added to it (``mode``), and knows what
+    ``records_total`` is (``rows_from``): what the writes reported writing
+    (``write``), a second read of the source (``source_count``), or what the
+    writes reported before the late-arrival split moved rows out of the file
+    (``write_before_late_arrival_split``). Only ``write`` is a count of what
+    the destination holds.
+    """
+    return {"mode": _mode_name(ctx), "rows_from": rows_from, "destinations": dict(destinations)}
 
 
 def _connect_for_destination(ctx: RunContext) -> Any:
