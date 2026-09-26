@@ -34,7 +34,11 @@ from typing import Any, Dict, List, Mapping
 
 from fluid_build.cli.console import cprint
 from fluid_build.iac import build_module, get_iac_plugin, runner
-from fluid_build.iac.backend import parse_backend, resolve_state_backend_spec
+from fluid_build.iac.backend import (
+    STATE_BACKEND_ENV,
+    parse_backend,
+    resolve_state_backend_spec,
+)
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.credentials import build_tofu_env, credential_report
 from fluid_build.iac.naming import safe_ident
@@ -107,10 +111,16 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     #
     # ``--state-backend`` defaults from ``FLUID_STATE_BACKEND`` (flag wins;
     # an empty flag forces local state), so a CI job can keep state in a
-    # bucket instead of the workspace it wipes after every run.
+    # bucket instead of the workspace it wipes after every run. That job
+    # applies every product with the one value, so a bucket-only value keys
+    # state per contract for all of them, packaging block or not.
     backend_spec, backend_origin = resolve_state_backend_spec(getattr(args, "state_backend", None))
     try:
-        backend = parse_backend(backend_spec, contract)
+        backend = parse_backend(
+            backend_spec,
+            contract,
+            per_contract_default=backend_origin == STATE_BACKEND_ENV,
+        )
     except ValueError as exc:
         raise CLIError(
             1,

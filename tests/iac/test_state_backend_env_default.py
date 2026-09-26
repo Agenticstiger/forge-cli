@@ -67,10 +67,14 @@ exposes:
 
 
 def _apply_and_read_backend(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, flag: Optional[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    flag: Optional[str],
+    contract_text: str = _CONTRACT,
 ) -> tuple:
     contract = tmp_path / "contract.fluid.yaml"
-    contract.write_text(_CONTRACT, encoding="utf-8")
+    contract.write_text(contract_text, encoding="utf-8")
     monkeypatch.setattr(engine.runner, "tofu_path", lambda: "/usr/bin/tofu")
     monkeypatch.setattr(engine.runner, "require_tofu_version", lambda *a, **k: None)
     printed: list = []
@@ -158,3 +162,51 @@ def test_an_unusable_env_value_is_a_typed_error_naming_its_source(
         engine.apply_via_opentofu(args, logging.getLogger("test.state_backend"))
     assert exc.value.event == "apply_state_backend_invalid"
     assert exc.value.context["source"] == "FLUID_STATE_BACKEND"
+
+
+# ── A bucket-only FLUID_STATE_BACKEND keys state per contract ────────────
+#
+# One CI job sets the variable once and applies every product with it. The
+# demo's contracts carry no ``packaging`` block, so the flag's default (the
+# shared legacy key) would give them all one OpenTofu state, and each apply
+# would plan to destroy the resources the others had created.
+
+#: A second product, applied by the same job; no ``packaging`` block either.
+_OTHER_CONTRACT = _CONTRACT.replace("id: demo.state", "id: demo.other_state").replace(
+    "table: rows", "table: other_rows"
+)
+
+
+def test_a_bucket_only_env_value_gives_each_contract_its_own_s3_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FLUID_STATE_BACKEND", "s3://ci-state")
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    first, _ = _apply_and_read_backend(tmp_path / "a", monkeypatch, flag=None)
+    second, _ = _apply_and_read_backend(
+        tmp_path / "b", monkeypatch, flag=None, contract_text=_OTHER_CONTRACT
+    )
+    assert first == {"s3": {"bucket": "ci-state", "key": "fluid/demo_state/terraform.tfstate"}}
+    assert second == {
+        "s3": {"bucket": "ci-state", "key": "fluid/demo_other_state/terraform.tfstate"}
+    }
+
+
+@pytest.mark.parametrize("spec", ["gcs://ci-state", "gcs://ci-state/"])
+def test_a_bucket_only_env_value_gives_each_contract_its_own_gcs_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spec: str
+) -> None:
+    monkeypatch.setenv("FLUID_STATE_BACKEND", spec)
+    backend, _ = _apply_and_read_backend(tmp_path, monkeypatch, flag=None)
+    assert backend == {"gcs": {"bucket": "ci-state", "prefix": "fluid/demo_state"}}
+
+
+def test_the_flag_keeps_the_shared_legacy_key_for_a_contract_without_packaging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existing ``--state-backend s3://bucket`` users have state at the legacy
+    key; moving it would re-plan every resource as new."""
+    monkeypatch.delenv("FLUID_STATE_BACKEND", raising=False)
+    backend, _ = _apply_and_read_backend(tmp_path, monkeypatch, flag="s3://ci-state")
+    assert backend == {"s3": {"bucket": "ci-state", "key": "fluid/terraform.tfstate"}}

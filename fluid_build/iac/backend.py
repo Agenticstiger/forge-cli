@@ -29,6 +29,13 @@ without one keeps the legacy key byte-for-byte (which is what
 ``tests/iac/test_iac_packaging_default_pin.py`` pins). Flipping the default
 for *everyone* is a deliberate follow-up (it relocates state for existing
 users and wants its own migration note) — see the RFC's open question 3.
+
+A spec taken from :data:`STATE_BACKEND_ENV` is the exception. One CI job sets
+it once for every product it applies, so the legacy key would put all of them
+in one state, and each apply would plan to destroy the resources of the
+others. When it names no key, every contract gets the per-contract key,
+packaging block or not. The variable is new, so no state lives at a legacy
+key it chose.
 """
 
 from __future__ import annotations
@@ -75,12 +82,15 @@ def resolve_state_backend_spec(
     return (None, "default")
 
 
-def default_state_key(contract: Optional[Mapping[str, Any]]) -> str:
+def default_state_key(contract: Optional[Mapping[str, Any]], *, per_contract: bool = False) -> str:
     """The default state key for ``contract`` — legacy unless packaging is declared.
 
     Returns :data:`LEGACY_STATE_KEY` when ``contract`` is ``None`` or resolves
     to the ``packaging.LEGACY`` sentinel, and the per-contract
     ``fluid/<safe_ident(id)>/terraform.tfstate`` otherwise.
+    ``per_contract=True`` skips the packaging test: any contract gets its own
+    key (the spec came from :data:`STATE_BACKEND_ENV`; see the module
+    docstring).
 
     A malformed ``packaging`` block falls back to the legacy key rather than
     raising: this runs *before* the emit path, which resolves the same block
@@ -90,18 +100,22 @@ def default_state_key(contract: Optional[Mapping[str, Any]]) -> str:
     """
     if contract is None:
         return LEGACY_STATE_KEY
-    try:
-        resolution = resolve_packaging(contract)
-    except PackagingError:
-        return LEGACY_STATE_KEY
-    if resolution is LEGACY:
-        return LEGACY_STATE_KEY
+    if not per_contract:
+        try:
+            resolution = resolve_packaging(contract)
+        except PackagingError:
+            return LEGACY_STATE_KEY
+        if resolution is LEGACY:
+            return LEGACY_STATE_KEY
     cid = safe_ident(contract.get("id") or contract.get("name") or "contract")
     return f"fluid/{cid}/terraform.tfstate"
 
 
 def parse_backend(
-    spec: Optional[str], contract: Optional[Mapping[str, Any]] = None
+    spec: Optional[str],
+    contract: Optional[Mapping[str, Any]] = None,
+    *,
+    per_contract_default: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Parse a backend spec into a ``terraform.backend`` block.
 
@@ -113,7 +127,9 @@ def parse_backend(
     An explicit key / prefix in the spec always wins. When the spec omits
     one, ``contract`` (optional) selects the default via
     :func:`default_state_key` — per-contract for packaging-bearing
-    contracts, the shared legacy key otherwise.
+    contracts, the shared legacy key otherwise. ``per_contract_default``
+    gives every contract its own default (``fluid apply`` sets it for a spec
+    from :data:`STATE_BACKEND_ENV`).
 
     The backend block carries no credentials — ``tofu`` reads those from
     the environment (``AWS_*`` / ``GOOGLE_*``).
@@ -126,7 +142,8 @@ def parse_backend(
         bucket, _, key = spec[len("s3://") :].partition("/")
         if not bucket:
             raise ValueError(f"s3 backend spec needs a bucket: {spec!r}")
-        return {"s3": {"bucket": bucket, "key": key or default_state_key(contract)}}
+        default_key = default_state_key(contract, per_contract=per_contract_default)
+        return {"s3": {"bucket": bucket, "key": key or default_key}}
 
     if spec.startswith("gcs://"):
         bucket, _, prefix = spec[len("gcs://") :].partition("/")
@@ -138,7 +155,7 @@ def parse_backend(
             # derive it from the same per-contract default (sans filename) so
             # both backends isolate identically. Legacy contracts emit no
             # prefix at all, exactly as before.
-            default = default_state_key(contract)
+            default = default_state_key(contract, per_contract=per_contract_default)
             prefix = default.rsplit("/", 1)[0] if default != LEGACY_STATE_KEY else ""
         if prefix:
             block["gcs"]["prefix"] = prefix

@@ -51,6 +51,45 @@ class TestParseBackend:
             parse_backend("s3://")
 
 
+class TestPerContractDefault:
+    """``per_contract_default``: what ``fluid apply`` asks for when the spec
+    came from ``FLUID_STATE_BACKEND``."""
+
+    CONTRACT = {"id": "bronze.customer_subscriptions", "exposes": []}
+
+    def test_s3_default_key_is_per_contract_without_packaging(self):
+        block = parse_backend("s3://state", self.CONTRACT, per_contract_default=True)
+        assert block == {
+            "s3": {
+                "bucket": "state",
+                "key": "fluid/bronze_customer_subscriptions/terraform.tfstate",
+            }
+        }
+
+    def test_gcs_default_prefix_is_per_contract_without_packaging(self):
+        block = parse_backend("gcs://state", self.CONTRACT, per_contract_default=True)
+        assert block == {
+            "gcs": {"bucket": "state", "prefix": "fluid/bronze_customer_subscriptions"}
+        }
+
+    def test_an_explicit_key_or_prefix_still_wins(self):
+        assert parse_backend("s3://state/k.tfstate", self.CONTRACT, per_contract_default=True) == {
+            "s3": {"bucket": "state", "key": "k.tfstate"}
+        }
+        assert parse_backend("gcs://state/p", self.CONTRACT, per_contract_default=True) == {
+            "gcs": {"bucket": "state", "prefix": "p"}
+        }
+
+    def test_without_it_a_contract_without_packaging_keeps_the_legacy_key(self):
+        assert parse_backend("s3://state", self.CONTRACT)["s3"]["key"] == "fluid/terraform.tfstate"
+        assert parse_backend("gcs://state", self.CONTRACT) == {"gcs": {"bucket": "state"}}
+
+    def test_a_malformed_packaging_block_still_gets_a_per_contract_key(self):
+        contract = dict(self.CONTRACT, packaging="not-a-mapping")
+        block = parse_backend("s3://state", contract, per_contract_default=True)
+        assert block["s3"]["key"] == "fluid/bronze_customer_subscriptions/terraform.tfstate"
+
+
 class TestBackendInDocument:
     def test_backend_block_lands_in_terraform(self):
         doc = assemble_tofu_document(
