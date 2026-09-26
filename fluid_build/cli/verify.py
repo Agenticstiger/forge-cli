@@ -227,6 +227,37 @@ Use Cases:
         ),
     )
 
+    # AWS S3+Glue bindings are verified through Glue and an Athena COUNT(*);
+    # see fluid_build/cli/_verify_athena.py and docs/verify-aws-athena.md (IAM).
+    # Each flag falls back to its env var.
+    p.add_argument(
+        "--athena-output-location",
+        dest="athena_output_location",
+        metavar="S3_URI",
+        help=(
+            "Where Athena writes the row-count query result (env "
+            "FLUID_ATHENA_OUTPUT_LOCATION). Default: the workgroup's configured "
+            "location, else s3://<binding bucket>/.fluid/athena-results/. A "
+            "workgroup that enforces its own location always wins."
+        ),
+    )
+    p.add_argument(
+        "--athena-workgroup",
+        dest="athena_workgroup",
+        metavar="NAME",
+        help="Athena workgroup for the row-count query (env FLUID_ATHENA_WORKGROUP; default primary)",
+    )
+    p.add_argument(
+        "--athena-timeout",
+        dest="athena_timeout",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "Stop the Athena row-count query and fail after this long "
+            "(env FLUID_ATHENA_TIMEOUT_SECONDS; default 300)"
+        ),
+    )
+
     p.add_argument("--env", help="Environment overlay file")
 
     p.set_defaults(func=run)
@@ -855,6 +886,16 @@ def _is_object_store_binding(binding: Optional[Dict[str, Any]]) -> bool:
     return isinstance(location, dict) and bool(location.get("bucket"))
 
 
+def _is_glue_table_binding(binding: Any) -> bool:
+    """True for an AWS binding ``fluid apply`` provisions as S3 files + a Glue table.
+
+    Imported lazily for the same reason as ``_gcp_provisioned_kind``.
+    """
+    from fluid_build.cli._verify_athena import is_athena_verifiable
+
+    return is_athena_verifiable(binding)
+
+
 def _gcp_provisioned_kind(binding: Any) -> str:
     """Classify a GCP binding by what the IaC emitter provisions for it.
 
@@ -1127,6 +1168,18 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                     "`fluid apply` provisions it, stage 9 does not reconcile it"
                 ),
             }
+        elif _is_glue_table_binding(expose_config.get("binding")):
+            # S3 files behind a Glue table: Glue says what the table is, an
+            # Athena COUNT(*) says what it serves. See _verify_athena.py.
+            from fluid_build.cli._verify_athena import options_from_args, verify_athena_expose
+
+            results[expose_name] = verify_athena_expose(
+                expose_name,
+                expose_config,
+                contract=contract,
+                workdir=Path(contract_path).resolve().parent,
+                options=options_from_args(args),
+            )
         elif _is_object_store_binding(expose_config.get("binding")):
             # An AWS/Azure binding that names a bucket writes to object storage,
             # so there is no file on this machine to open. Forge ships no
@@ -1221,6 +1274,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 target = f"{project}.{dataset}.{table}"
         else:
             target = properties.get("target", "N/A")
+        # A verifier that knows its own target better (Glue + Athena) says so.
+        target = result.get("target") or target
 
         cprint(f"\n📋 Verifying: {expose_name}")
         cprint(f"   Format: {format_type}")
@@ -1270,6 +1325,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
         cprint(f"\n   {severity_symbol} Severity: {severity_level} (Impact: {severity_impact})")
         cprint(f"   📊 Table Rows: {metadata.get('num_rows', 0):,}")
+        if metadata.get("row_count_detail"):
+            cprint(f"      {metadata['row_count_detail']}")
 
         # Dimension 1: Schema Structure
         cprint("\n   🔍 Dimension 1: Schema Structure")
