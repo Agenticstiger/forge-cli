@@ -1499,6 +1499,7 @@ def test_the_bindings_region_wins_over_the_environment(tmp_path, aws, monkeypatc
     aws.table()
     aws.counts(42)
     code, report = _verify(tmp_path, contract)
+    assert code == 0, report["results"]["subscriptions"]
     assert set(aws.requested) == {("glue", "sa-east-1"), ("athena", "sa-east-1")}
 
 
