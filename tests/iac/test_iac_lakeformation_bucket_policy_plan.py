@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -146,14 +147,24 @@ def _plan(contract: Dict[str, Any], workdir: Path, endpoint: str, env: Dict[str,
     (workdir / "main.tf.json").write_text(build_module(get_iac_plugin("aws"), contract))
     (workdir / "provider.tf.json").write_text(json.dumps(_provider_override(endpoint)))
     tofu = runner.tofu_path()
-    for args in (
-        ["init", "-backend=false", "-input=false", "-no-color"],
-        ["plan", "-input=false", "-no-color", "-out=plan.bin"],
-    ):
-        done = subprocess.run(
+
+    def run(*args: str) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(
             [tofu, *args], cwd=workdir, env=env, capture_output=True, text=True, timeout=600
         )
-        assert done.returncode == 0, f"tofu {args[0]} failed:\n{done.stdout}\n{done.stderr}"
+
+    # A plugin cache shared by several pytest-xdist workers is not safe for
+    # concurrent installs: OpenTofu refuses the per-provider lock ("unable to
+    # acquire file lock ... resource deadlock avoided") instead of waiting.
+    # That is contention, not a module error, so it is retried.
+    for attempt in range(4):
+        done = run("init", "-backend=false", "-input=false", "-no-color")
+        if done.returncode == 0 or "unable to acquire file lock" not in done.stdout + done.stderr:
+            break
+        time.sleep(2 * (attempt + 1))
+    assert done.returncode == 0, f"tofu init failed:\n{done.stdout}\n{done.stderr}"
+    done = run("plan", "-input=false", "-no-color", "-out=plan.bin")
+    assert done.returncode == 0, f"tofu plan failed:\n{done.stdout}\n{done.stderr}"
     shown = subprocess.run(
         [tofu, "show", "-json", "plan.bin"],
         cwd=workdir,
