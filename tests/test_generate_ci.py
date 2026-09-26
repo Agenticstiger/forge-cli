@@ -307,6 +307,16 @@ class TestGenerateCIJenkins:
         content = (tmp_path / "Jenkinsfile").read_text()
         assert "name: 'RUN_STAGE_10_PUBLISH', defaultValue: true" in content
 
+    def test_stage_10_publishes_with_the_env_by_default(self, tmp_path, monkeypatch):
+        """``fluid publish`` takes ``--env``, so stage 10 publishes the overlay
+        stages 5-9 used instead of the base contract."""
+        monkeypatch.chdir(tmp_path)
+        assert generate_ci_run(_make_args(), _logger) == 0
+        content = (tmp_path / "Jenkinsfile").read_text()
+        stage_10 = content[content.index("stage('10 - publish')") :]
+        stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
+        assert '--env "${FLUID_ENV:-dev}"' in stage_10
+
     def test_publish_include_env_override_omits_stage_10_env_flag(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(publish_include_env=False), _logger) == 0

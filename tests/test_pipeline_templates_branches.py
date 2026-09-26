@@ -131,10 +131,9 @@ class TestPipelineConfig:
         )
         assert cfg.verify_strict_default is True
         assert cfg.publish_stage_default is False
-        # publish_include_env default is False because `fluid publish`
-        # does not accept `--env`; emitting it would make Stage 10 die
-        # with `unrecognized arguments: --env dev`.
-        assert cfg.publish_include_env is False
+        # `fluid publish --env` loads the same overlay stages 5-9 used, so
+        # stage 10 passes it by default.
+        assert cfg.publish_include_env is True
 
 
 # ── BasePipelineTemplate tests ──────────────────────────────────────
@@ -570,19 +569,36 @@ class TestJenkinsTemplateHardening:
         assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS} \\' not in stage_10
         assert '--env "${FLUID_ENV:-dev}"' not in stage_10
 
-    def test_publish_stage_default_omits_env_flag(self):
-        # Default (no publish_include_env passed) MUST omit --env on
-        # `fluid publish`, because the CLI doesn't accept --env. When
-        # the default emitted --env, every Stage 10 build that ran
-        # publish died with `unrecognized arguments: --env dev`.
+    def test_publish_stage_default_passes_the_env(self):
+        # Default (no publish_include_env passed): stage 10 publishes the
+        # contract with the overlay stages 5-9 used. Without it an aws run
+        # published the base contract's local binding.
         content = self._jenkinsfile()
         stage_10 = content[content.index("stage('10 - publish')") :]
         stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
-        assert '--env "${FLUID_ENV:-dev}"' not in stage_10
+        assert '--env "${FLUID_ENV:-dev}"' in stage_10
+
+    def test_publish_stage_passes_a_hostile_env_as_one_argument(self, tmp_path):
+        """The rendered stage-10 ``sh`` body, run with a ``fluid`` stub."""
+        import re
+        import shutil
+
+        if shutil.which("sh") is None:
+            pytest.skip("needs a POSIX shell")
+        from tests.cli.test_publish_target_flag import _run_rendered_publish
+
+        content = self._jenkinsfile()
+        stage_10 = content[content.index("stage('10 - publish')") :]
+        stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
+        body = re.search(r"sh \'\'\'(.*?)\'\'\'", stage_10, re.S).group(1)
+        _run_rendered_publish(
+            tmp_path,
+            body,
+            {"PUBLISH_TARGETS": "command-center"},
+            ["publish", "c.yaml", "--target", "command-center", "--env"],
+        )
 
     def test_publish_stage_can_opt_in_to_env_flag(self):
-        # Operators who wrap `fluid publish` with a custom CLI alias
-        # that accepts --env can opt in via publish_include_env=True.
         content = self._jenkinsfile(publish_include_env=True)
         stage_10 = content[content.index("stage('10 - publish')") :]
         stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]

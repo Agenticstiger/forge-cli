@@ -142,11 +142,11 @@ def test_run_catalog_adapters_skips_when_none(monkeypatch):
     from fluid_build.cli import publish as V
 
     monkeypatch.setattr(PM, "has_plugins", lambda group: False)
-    # load_contract must NOT be called when nothing is installed.
+    # No contract may be loaded when nothing is installed.
     called = {"load": 0}
-    import fluid_build.loader as loader
-
-    monkeypatch.setattr(loader, "load_contract", lambda p: called.__setitem__("load", 1))
+    monkeypatch.setattr(
+        V, "load_contract_with_overlay", lambda p, env, log: called.__setitem__("load", 1)
+    )
 
     class _Args:
         dry_run = False
@@ -161,9 +161,7 @@ def test_run_catalog_adapters_dispatches(monkeypatch):
     from fluid_build.cli import publish as V
 
     monkeypatch.setattr(PM, "has_plugins", lambda group: True)
-    import fluid_build.loader as loader
-
-    monkeypatch.setattr(loader, "load_contract", lambda p: {"id": "loaded"})
+    monkeypatch.setattr(V, "load_contract_with_overlay", lambda p, env, log: {"id": "loaded"})
 
     seen = []
     monkeypatch.setattr(
@@ -185,10 +183,10 @@ def test_run_catalog_adapters_dispatches(monkeypatch):
 
 def _patch_adapters(monkeypatch, summaries):
     """Install a fake catalog-adapter dispatch returning ``summaries``."""
-    import fluid_build.loader as loader
+    from fluid_build.cli import publish as V
 
     monkeypatch.setattr(PM, "has_plugins", lambda group: True)
-    monkeypatch.setattr(loader, "load_contract", lambda p: {"id": "prod.a"})
+    monkeypatch.setattr(V, "load_contract_with_overlay", lambda p, env, log: {"id": "prod.a"})
     monkeypatch.setattr(
         PM,
         "dispatch_catalog_adapters",

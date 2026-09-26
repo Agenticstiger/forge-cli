@@ -207,13 +207,12 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         default=None,
         help=(
             "Whether the generated Jenkins Stage 10 command includes "
-            '``--env \\"${FLUID_ENV:-dev}\\"`` on ``fluid publish``. '
-            "Default is FALSE because ``fluid publish`` does not accept "
-            "``--env``; including it makes Stage 10 die with "
-            "``unrecognized arguments: --env dev``. Pass "
-            "``--publish-include-env`` to opt in (operators who wrap "
-            "``fluid publish`` with a custom CLI that does accept --env). "
-            "Only the Jenkins template consumes this today."
+            '``--env \\"${FLUID_ENV:-dev}\\"`` on ``fluid publish``, so the '
+            "catalog gets the contract with the overlay stages 5-9 used. "
+            "Default is TRUE. Pass ``--no-publish-include-env`` when the "
+            "pipeline installs a fluid CLI older than ``fluid publish --env``, "
+            "which rejects the flag. Only the Jenkins template consumes this "
+            "today; the other systems always pass --env."
         ),
     )
     p.add_argument(
@@ -559,7 +558,7 @@ def run(args, logger: logging.Logger) -> int:
                 False if publish_stage_default_arg is None else bool(publish_stage_default_arg)
             ),
             publish_include_env=(
-                False if publish_include_env_arg is None else bool(publish_include_env_arg)
+                True if publish_include_env_arg is None else bool(publish_include_env_arg)
             ),
         )
         files = PipelineTemplateGenerator().generate_pipeline(config)

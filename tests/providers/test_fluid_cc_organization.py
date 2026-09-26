@@ -72,7 +72,8 @@ class _StubCommandCenter:
         return [r["path"] for r in self.requests if method is None or r["method"] == method]
 
     def posts(self) -> List[Dict[str, Any]]:
-        return [r for r in self.requests if r["method"] == "POST"]
+        """The asset creates (``POST /api/v1/assets``)."""
+        return [r for r in self.requests if r["method"] == "POST" and r["path"] == "/api/v1/assets"]
 
 
 def _handler_for(stub: _StubCommandCenter):
@@ -121,6 +122,9 @@ def _handler_for(stub: _StubCommandCenter):
             entry = self._record()
             if not self._authenticated():
                 return self._send(401, {"detail": "Not authenticated"})
+            if entry["path"] == "/api/v1/contracts/sync":
+                # Recorded after every create; these tests look at the create.
+                return self._send(200, {"is_valid": True, "errors": [], "warnings": []})
             if entry["path"] != "/api/v1/assets":
                 return self._send(404, {"detail": "Not Found"})
             org = self.headers.get(ORG_HEADER)
@@ -333,16 +337,31 @@ class TestOrganizationHeader:
         assert API_KEY not in result.error
         assert cc_stub.posts() == []
 
-    def test_a_blank_env_org_id_counts_as_unset(self, cc_stub, monkeypatch):
+    @pytest.mark.parametrize("blank", ["", "   ", "\t"])
+    def test_a_blank_env_org_id_is_refused_not_resolved(self, cc_stub, monkeypatch, blank):
+        """Set but blank is an empty CI binding, not a request for the default:
+        the credential's only organization is not looked up or used."""
         cc_stub.organizations = [ORG_A]
-        monkeypatch.setenv("FLUID_CC_ORG_ID", "   ")
+        monkeypatch.setenv("FLUID_CC_ORG_ID", blank)
 
         result = asyncio.run(_provider(cc_stub).publish(_asset()))
 
-        assert result.success, result.error
-        assert cc_stub.paths().count("/api/v1/organizations") == 1
-        (post,) = cc_stub.posts()
-        assert post["headers"]["x-organization-id"] == ORG_A["id"]
+        assert not result.success
+        assert result.details["error_code"] == "cc_organization_id_blank"
+        assert "FLUID_CC_ORG_ID is set but blank" in result.error
+        assert "/api/v1/organizations" not in cc_stub.paths()
+        assert cc_stub.posts() == []
+
+    def test_a_blank_env_org_id_beats_a_configured_organization(self, cc_stub, monkeypatch):
+        cc_stub.organizations = [ORG_A, ORG_B]
+        monkeypatch.setenv("FLUID_CC_ORG_ID", " ")
+
+        result = asyncio.run(_provider(cc_stub, organization_id=ORG_B["id"]).publish(_asset()))
+
+        assert not result.success
+        assert result.details["error_code"] == "cc_organization_id_blank"
+        assert cc_stub.posts() == []
+        assert asyncio.run(_provider(cc_stub, organization_id=ORG_B["id"]).verify("x")) is False
 
     def test_server_labels_reach_the_error_without_control_characters(self, cc_stub):
         cc_stub.organizations = [
@@ -672,12 +691,12 @@ class TestCommandCenterAlias:
         assert post["headers"]["x-organization-id"] == ORG_A["id"]
         assert post["body"]["metadata"]["fluid_contract_id"] == "bronze.customer_subscriptions"
 
-    def test_fluid_publish_with_a_blank_env_org_id_uses_the_config_file_org(
+    def test_fluid_publish_with_a_blank_env_org_id_fails_even_with_a_config_file_org(
         self, cc_stub, isolated_config, monkeypatch
     ):
-        """A blank CI parameter must not replace the file's id on its way to
-        being ignored, which left no id at all and failed on a credential in
-        two organizations."""
+        """A CI job whose organization binding came up empty must fail, not
+        publish into whichever organization the repository's config file
+        names: that file is shared by every estate the job runs for."""
         cc_stub.organizations = [ORG_A, ORG_B]
         (isolated_config / ".fluidrc.yaml").write_text(
             f"catalogs:\n  fluid-command-center:\n    organization_id: {ORG_B['id']}\n",
@@ -689,10 +708,9 @@ class TestCommandCenterAlias:
 
         code = _publish_cli(isolated_config, "--target", "command-center", "--format", "json")
 
-        assert code == 0
+        assert code == 1
         assert "/api/v1/organizations" not in cc_stub.paths()
-        (post,) = cc_stub.posts()
-        assert post["headers"]["x-organization-id"] == ORG_B["id"]
+        assert cc_stub.posts() == []
 
 
 # ---------------------------------------------------------------------------

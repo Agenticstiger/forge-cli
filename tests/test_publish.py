@@ -94,7 +94,7 @@ class TestPublishContract:
         from fluid_build.cli import publish as pub_mod
 
         with (
-            patch.object(pub_mod, "load_contract", side_effect=ValueError("bad yaml")),
+            patch.object(pub_mod, "load_contract_with_overlay", side_effect=ValueError("bad yaml")),
             patch.object(pub_mod, "FluidConfig"),
         ):
             result = _run(
@@ -117,7 +117,7 @@ class TestPublishContract:
         config = MagicMock()
         config.get_catalog_config.return_value = None
 
-        with patch.object(pub_mod, "load_contract", return_value={"id": "test"}):
+        with patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}):
             result = _run(
                 pub_mod.publish_contract(
                     contract_path=contract_path,
@@ -138,7 +138,7 @@ class TestPublishContract:
         config = MagicMock()
         config.get_catalog_config.return_value = {"enabled": False}
 
-        with patch.object(pub_mod, "load_contract", return_value={"id": "test"}):
+        with patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}):
             result = _run(
                 pub_mod.publish_contract(
                     contract_path=contract_path,
@@ -160,7 +160,7 @@ class TestPublishContract:
         config.get_catalog_config.return_value = {"enabled": True}
 
         with (
-            patch.object(pub_mod, "load_contract", return_value={"id": "test"}),
+            patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}),
             patch.object(pub_mod, "get_catalog_provider", side_effect=RuntimeError("no driver")),
         ):
             result = _run(
@@ -190,7 +190,7 @@ class TestPublishContract:
         config.get_catalog_config.return_value = {"enabled": True}
 
         with (
-            patch.object(pub_mod, "load_contract", return_value={"id": "test"}),
+            patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}),
             patch.object(pub_mod, "get_catalog_provider", return_value=provider),
         ):
             result = _run(
@@ -221,7 +221,7 @@ class TestPublishContract:
         config.get_catalog_config.return_value = {"enabled": True}
 
         with (
-            patch.object(pub_mod, "load_contract", return_value={"id": "test"}),
+            patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}),
             patch.object(pub_mod, "get_catalog_provider", return_value=provider),
         ):
             result = _run(
@@ -252,7 +252,7 @@ class TestPublishContract:
         config.get_catalog_config.return_value = {"enabled": True}
 
         with (
-            patch.object(pub_mod, "load_contract", return_value={"id": "test"}),
+            patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}),
             patch.object(pub_mod, "get_catalog_provider", return_value=provider),
         ):
             result = _run(
@@ -283,7 +283,7 @@ class TestPublishContract:
         config.get_catalog_config.return_value = {"enabled": True}
 
         with (
-            patch.object(pub_mod, "load_contract", return_value={"id": "test"}),
+            patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}),
             patch.object(pub_mod, "get_catalog_provider", return_value=provider),
         ):
             result = _run(
@@ -315,7 +315,7 @@ class TestPublishContract:
         config.get_catalog_config.return_value = {"enabled": True}
 
         with (
-            patch.object(pub_mod, "load_contract", return_value={"id": "test"}),
+            patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}),
             patch.object(pub_mod, "get_catalog_provider", return_value=provider),
         ):
             result = _run(
@@ -342,7 +342,7 @@ class TestPublishContract:
         config.get_catalog_config.return_value = {"enabled": True}
 
         with (
-            patch.object(pub_mod, "load_contract", return_value={"id": "test"}),
+            patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}),
             patch.object(pub_mod, "get_catalog_provider", return_value=provider),
         ):
             result = _run(
@@ -818,7 +818,7 @@ class TestRunAsyncPublishFlow:
         config.get_catalog_config.return_value = {"enabled": True}
 
         with (
-            patch.object(pub_mod, "load_contract", return_value={"id": "test"}),
+            patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}),
             patch.object(pub_mod, "get_catalog_provider", return_value=provider),
         ):
             loop = asyncio.new_event_loop()
@@ -855,7 +855,7 @@ class TestRunAsyncPublishFlow:
         config.get_catalog_config.return_value = {"enabled": True}
 
         with (
-            patch.object(pub_mod, "load_contract", return_value={"id": "test"}),
+            patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}),
             patch.object(pub_mod, "get_catalog_provider", return_value=provider),
         ):
             loop = asyncio.new_event_loop()
@@ -891,7 +891,7 @@ class TestRunAsyncPublishFlow:
         config.get_catalog_config.return_value = {"enabled": True}
 
         with (
-            patch.object(pub_mod, "load_contract", return_value={"id": "test"}),
+            patch.object(pub_mod, "load_contract_with_overlay", return_value={"id": "test"}),
             patch.object(pub_mod, "get_catalog_provider", return_value=provider),
         ):
             loop = asyncio.new_event_loop()
