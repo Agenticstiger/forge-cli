@@ -39,10 +39,12 @@ from fluid_build.cli._common import CLIError
 
 @pytest.fixture()
 def dags_dir(tmp_path: Path) -> Path:
-    """A real directory with one file so the emptiness check passes."""
+    """A real directory laid out the way ``fluid generate artifacts`` writes
+    it: one product directory holding one DAG, so the emptiness check passes
+    and the default ``--delete-scope product`` has a product to mirror."""
     d = tmp_path / "schedule"
-    d.mkdir()
-    (d / "dag_one.py").write_text("# stub dag\n", encoding="utf-8")
+    (d / "prod_a").mkdir(parents=True)
+    (d / "prod_a" / "dag_one.py").write_text("# stub dag\n", encoding="utf-8")
     return d
 
 
@@ -367,8 +369,8 @@ class TestAirflowDispatch:
         assert len(results) == 1
         argv = results[0]["argv"]
         assert argv[:3] == ["/bin/aws", "s3", "sync"]
-        assert argv[3].endswith("/schedule/")
-        assert argv[4] == "s3://bucket/dags/"
+        assert argv[3].endswith("/schedule/prod_a/")
+        assert argv[4] == "s3://bucket/dags/prod_a/"
         assert "--delete" in argv
 
     def test_gs_destination_builds_gsutil_argv(self, dags_dir):
@@ -540,8 +542,8 @@ class TestAirflowDispatch:
                 "--exclude",
                 ".git/",
                 "--",
-                str(dags_dir).rstrip("/") + "/",
-                "./",
+                str(dags_dir).rstrip("/") + "/prod_a/",
+                "./prod_a/",
             ],
             ["/bin/git", "add", "--", "."],
             ["/bin/git", "status", "--porcelain"],

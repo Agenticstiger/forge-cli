@@ -47,6 +47,16 @@ Security posture (high level — detailed notes inline at each touchpoint):
 * ``--dry-run`` short-circuits before subprocess invocation and emits
   the (redacted) planned argv. Nothing about the underlying system
   state changes.
+* Deleting at the destination is scoped (``--delete-scope``, default
+  ``product``). Each top-level directory of ``--dags-dir`` is one product's
+  DAGs (``fluid generate artifacts`` writes ``schedule/<product-id>/``) and is
+  mirrored into the same-named directory of the destination, so stale DAGs
+  are removed there and nowhere else: a shared DAG root keeps every other
+  product's files. ``destination`` mirrors the whole ``--dags-dir`` onto the
+  destination and deletes everything else in it; ``none`` copies and
+  deletes nothing. This applies to the transports that delete (file, ssh,
+  git+ssh, s3 and gs for airflow; s3 for mwaa); az, scp, composer,
+  astronomer, prefect and dagster never delete and ignore it.
 
 CLI surface::
 
@@ -57,6 +67,7 @@ CLI surface::
                         [--location <region>]                # composer GCP region
                         [--workspace <name>]                 # prefect / dagster-cloud
                         [--env <dev|stg|prd>]
+                        [--delete-scope {product|destination|none}]  # default product
                         [--dry-run]
                         [--timeout <seconds>]                # per-subprocess, default 600, hard cap 3600
                         [--report <path>]                    # JSON result summary
@@ -73,7 +84,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from fluid_build.cli._common import CLIError
@@ -114,6 +125,17 @@ _AIRFLOW_URL_SCHEMES = {
 _DEFAULT_TIMEOUT = 600
 _MAX_TIMEOUT = 3600
 
+# ``--delete-scope`` values; see the module docstring.
+_DELETE_SCOPES = ("product", "destination", "none")
+_DEFAULT_DELETE_SCOPE = "product"
+
+# A product directory's name is appended to the destination path or URL, so
+# it gets the strict identifier grammar with no leading ``.`` (no ``..``, no
+# hidden directories) and no leading ``-`` (no option smuggling).
+_SCOPE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}$")
+# Bytecode caches are not DAGs and are never mirrored.
+_IGNORED_SCOPE_DIRS = frozenset({"__pycache__"})
+
 
 # -----------------------------------------------------------------------------
 # argparse registration
@@ -132,9 +154,14 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         ),
         epilog=(
             "Examples:\n"
-            "  # Airflow, local filesystem destination (rsync)\n"
+            "  # Airflow, local filesystem destination (rsync). Each product directory\n"
+            "  # under --dags-dir is mirrored into /opt/airflow/dags/<product-id>/;\n"
+            "  # other products' DAGs in /opt/airflow/dags/ are left alone.\n"
             "  fluid schedule-sync --scheduler airflow --dags-dir dist/artifacts/schedule/ \\\n"
             "                      --destination /opt/airflow/dags/\n\n"
+            "  # A destination this product owns alone: mirror onto all of it\n"
+            "  fluid schedule-sync --scheduler airflow --dags-dir dags/ \\\n"
+            "                      --destination /opt/airflow/dags/ --delete-scope destination\n\n"
             "  # Airflow, S3 destination (aws s3 sync)\n"
             "  fluid schedule-sync --scheduler airflow --dags-dir dist/artifacts/schedule/ \\\n"
             "                      --destination s3://my-airflow-bucket/dags/\n\n"
@@ -194,6 +221,21 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--env",
         default=os.environ.get("FLUID_ENV", "dev"),
         help="Logical deployment env tag for logging/report (default: $FLUID_ENV or dev).",
+    )
+    p.add_argument(
+        "--delete-scope",
+        choices=list(_DELETE_SCOPES),
+        default=_DEFAULT_DELETE_SCOPE,
+        help=(
+            "Where stale DAGs may be deleted at the destination. 'product' (default): "
+            "every top-level directory of --dags-dir is one product's DAGs and is "
+            "mirrored into the same-named directory of the destination; nothing "
+            "outside those directories is touched, and loose files at the top of "
+            "--dags-dir are refused. 'destination': mirror --dags-dir onto the whole "
+            "destination, deleting everything else there (only for a destination "
+            "this product owns alone). 'none': copy, delete nothing. Applies to "
+            "file, ssh, git+ssh, s3 and gs destinations; the others never delete."
+        ),
     )
     p.add_argument(
         "--dry-run",
@@ -438,6 +480,101 @@ def _validate_destination(raw: str, scheduler: str) -> Tuple[str, Optional[str]]
     return (scheme, raw)
 
 
+def _delete_scope(args: argparse.Namespace) -> str:
+    scope = getattr(args, "delete_scope", None) or _DEFAULT_DELETE_SCOPE
+    if scope not in _DELETE_SCOPES:  # defensive: argparse choices enforce this
+        raise CLIError(
+            2,
+            "schedule_sync_invalid_delete_scope",
+            {"value": scope, "allowed": list(_DELETE_SCOPES)},
+        )
+    return str(scope)
+
+
+def _product_scopes(dags_dir: Path) -> List[str]:
+    """The product directories at the top of ``dags_dir``, sorted.
+
+    Refuses a loose file (there is no product directory to confine its
+    deletions to), a symlink (rsync would follow it on the way out) and a
+    name that is not a plain identifier.
+    """
+    scopes: List[str] = []
+    loose: List[str] = []
+    for entry in sorted(dags_dir.iterdir(), key=lambda p: p.name):
+        if entry.is_dir() and entry.name in _IGNORED_SCOPE_DIRS:
+            continue
+        if entry.is_symlink():
+            raise CLIError(
+                2,
+                "schedule_sync_dags_dir_symlink",
+                {"path": str(entry), "hint": "product directories must be real directories"},
+            )
+        if not entry.is_dir():
+            loose.append(entry.name)
+            continue
+        if not _SCOPE_NAME_RE.fullmatch(entry.name):
+            raise CLIError(
+                2,
+                "schedule_sync_invalid_product_dir",
+                {
+                    "name": entry.name,
+                    "hint": "must match ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$",
+                },
+            )
+        scopes.append(entry.name)
+    if loose or not scopes:
+        raise CLIError(
+            2,
+            "schedule_sync_dags_dir_not_product_scoped",
+            {
+                "dags_dir": str(dags_dir),
+                "loose_files": loose[:10],
+                "hint": (
+                    "--delete-scope product (the default) mirrors each top-level "
+                    "directory of --dags-dir into the same-named directory of the "
+                    "destination, so it never deletes another product's DAGs. Put the "
+                    "files in a <product-id>/ directory (fluid generate artifacts does; "
+                    "for fluid generate schedule use -o <dags-dir>/<product-id>/), "
+                    "or pass --delete-scope none to copy without deleting, or "
+                    "--delete-scope destination to mirror onto (and delete everything "
+                    "else in) the whole destination"
+                ),
+            },
+        )
+    return scopes
+
+
+def _sync_units(dags_dir: Path, args: argparse.Namespace) -> List[Tuple[str, str, bool]]:
+    """``(source, destination suffix, delete)`` for each sync a deleting transport runs.
+
+    The suffix is appended to the destination root: ``""`` for the whole
+    destination, ``"<product-id>/"`` for a product directory.
+    """
+    source = str(dags_dir).rstrip("/") + "/"
+    scope = _delete_scope(args)
+    if scope == "destination":
+        return [(source, "", True)]
+    if scope == "none":
+        return [(source, "", False)]
+    return [(f"{source}{name}/", f"{name}/", True) for name in _product_scopes(dags_dir)]
+
+
+def _under(root: str, suffix: str) -> str:
+    """``root`` itself for an empty suffix, else ``root/<suffix>``."""
+    return root if not suffix else root.rstrip("/") + "/" + suffix
+
+
+def _run_units(argvs: List[List[str]], args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """Run each argv in turn; stop at the first failure."""
+    results: List[Dict[str, Any]] = []
+    for argv in argvs:
+        result = _run_subprocess(argv, timeout=args.timeout, dry_run=args.dry_run)
+        results.append(result)
+        if result["exit_code"] != 0:
+            break
+    return results
+
+
 def _clamp_timeout(raw: int) -> int:
     if raw < 1:
         raise CLIError(2, "schedule_sync_timeout_nonpositive", {"value": raw})
@@ -640,6 +777,9 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
     scheme, dest = _validate_destination(args.destination or "", args.scheduler)
 
     trailing_slash_src = str(dags_dir).rstrip("/") + "/"
+    # Refuse an unscoped --dags-dir before anything runs, for every
+    # transport that deletes at the destination.
+    units = _sync_units(dags_dir, args) if scheme in ("s3", "gs", "file", "ssh", "git+ssh") else []
 
     def _git_ssh_dispatch(dest: str) -> List[Dict]:
         git = _which_or_raise("git")
@@ -662,6 +802,19 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
                 f"user.email={author_email}",
             ]
         commit_argv = [git, *commit_author_argv, "commit", "-m", commit_message]
+        rsync_argvs = [
+            [
+                rsync,
+                "-av",
+                *(["--delete"] if delete else []),
+                "--exclude",
+                ".git/",
+                "--",
+                source,
+                _under("./", suffix),
+            ]
+            for source, suffix, delete in units
+        ]
 
         def _planned(clone_dir: str) -> List[Dict]:
             return [
@@ -670,20 +823,14 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
                     timeout=args.timeout,
                     dry_run=True,
                 ),
-                _run_subprocess_with_cwd(
-                    [
-                        rsync,
-                        "-av",
-                        "--delete",
-                        "--exclude",
-                        ".git/",
-                        "--",
-                        trailing_slash_src,
-                        "./",
-                    ],
-                    cwd=clone_dir,
-                    timeout=args.timeout,
-                    dry_run=True,
+                *(
+                    _run_subprocess_with_cwd(
+                        argv,
+                        cwd=clone_dir,
+                        timeout=args.timeout,
+                        dry_run=True,
+                    )
+                    for argv in rsync_argvs
                 ),
                 _run_subprocess_with_cwd(
                     [git, "add", "--", "."],
@@ -727,16 +874,7 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
                 return results
 
             for argv in (
-                [
-                    rsync,
-                    "-av",
-                    "--delete",
-                    "--exclude",
-                    ".git/",
-                    "--",
-                    trailing_slash_src,
-                    "./",
-                ],
+                *rsync_argvs,
                 [git, "add", "--", "."],
             ):
                 result = _run_subprocess_with_cwd(
@@ -805,13 +943,42 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
         # ``--delete`` itself as a pathname, so DO NOT add it here.
         # The hyphen-netloc rejection above is the sole defence for this
         # branch (s3:// bucket names never start with '-' per AWS rules).
-        argv = [binary, "s3", "sync", trailing_slash_src, dest, "--delete"]
+        dest = _require_dispatch_destination(dest, scheme)
+        return _run_units(
+            [
+                [
+                    binary,
+                    "s3",
+                    "sync",
+                    source,
+                    _under(dest, suffix),
+                    *(["--delete"] if delete else []),
+                ]
+                for source, suffix, delete in units
+            ],
+            args,
+        )
     elif scheme == "gs":
         binary = _which_or_raise("gsutil")
         # gsutil rsync: same analysis as aws s3. gs:// bucket names per
         # Google rules never start with '-'; netloc-hyphen rejection
         # covers this branch.
-        argv = [binary, "-m", "rsync", "-r", "-d", trailing_slash_src, dest]
+        dest = _require_dispatch_destination(dest, scheme)
+        return _run_units(
+            [
+                [
+                    binary,
+                    "-m",
+                    "rsync",
+                    "-r",
+                    *(["-d"] if delete else []),
+                    source,
+                    _under(dest, suffix),
+                ]
+                for source, suffix, delete in units
+            ],
+            args,
+        )
     elif scheme == "az":
         binary = _which_or_raise("az")
         # az://<container>/<path> → --destination <container> --destination-path <path>
@@ -852,18 +1019,26 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
         local_dest = dest
         if local_dest.startswith("file://"):
             local_dest = local_dest[len("file://") :]
-        # --delete is deliberate: Airflow expects DAG removal to propagate.
+        # --delete is deliberate: Airflow expects DAG removal to propagate,
+        # inside the scope ``--delete-scope`` allows (see _sync_units).
         # ``--`` end-of-options before the positional src / dest so a
         # future change to _validate_destination that lets a leading-'-'
         # path slip through still doesn't smuggle an rsync option.
-        argv = [
-            binary,
-            "-av",
-            "--delete",
-            "--",
-            trailing_slash_src,
-            local_dest.rstrip("/") + "/",
-        ]
+        root = local_dest.rstrip("/") + "/"
+        return _run_units(
+            [
+                [
+                    binary,
+                    "-av",
+                    *(["--delete"] if delete else []),
+                    "--",
+                    source,
+                    _under(root, suffix),
+                ]
+                for source, suffix, delete in units
+            ],
+            args,
+        )
     elif scheme == "ssh":
         binary = _which_or_raise("rsync")
         # rsync over ssh: ssh://user@host/path → user@host:/path
@@ -872,16 +1047,23 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
         if not parsed.netloc:
             raise CLIError(2, "schedule_sync_ssh_missing_host", {"destination": dest})
         remote_target = f"{parsed.netloc}:{parsed.path or '/'}"
-        argv = [
-            binary,
-            "-av",
-            "--delete",
-            "-e",
-            "ssh",
-            "--",
-            trailing_slash_src,
-            remote_target.rstrip("/") + "/",
-        ]
+        root = remote_target.rstrip("/") + "/"
+        return _run_units(
+            [
+                [
+                    binary,
+                    "-av",
+                    *(["--delete"] if delete else []),
+                    "-e",
+                    "ssh",
+                    "--",
+                    source,
+                    _under(root, suffix),
+                ]
+                for source, suffix, delete in units
+            ],
+            args,
+        )
     elif scheme == "scp":
         binary = _which_or_raise("scp")
         # scp://user@host/path → user@host:/path
@@ -922,16 +1104,16 @@ def _mwaa_dispatch(dags_dir: Path, args) -> List[Dict]:
                 "hint": "MWAA reads DAGs from a managed S3 bucket",
             },
         )
+    units = _sync_units(dags_dir, args)
     binary = _which_or_raise("aws")
-    argv = [
-        binary,
-        "s3",
-        "sync",
-        str(dags_dir).rstrip("/") + "/",
-        dest,
-        "--delete",
-    ]
-    return [_run_subprocess(argv, timeout=args.timeout, dry_run=args.dry_run)]
+    dest = _require_dispatch_destination(dest, scheme)
+    return _run_units(
+        [
+            [binary, "s3", "sync", source, _under(dest, suffix), *(["--delete"] if delete else [])]
+            for source, suffix, delete in units
+        ],
+        args,
+    )
 
 
 def _composer_dispatch(dags_dir: Path, args) -> List[Dict]:
@@ -1232,9 +1414,11 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
         )
 
     dispatcher = _DISPATCHERS[args.scheduler]
+    delete_scope = _delete_scope(args)
     cprint(
         f"[schedule-sync] scheduler={args.scheduler} "
-        f"dags-dir={dags_dir} env={args.env} dry-run={args.dry_run}",
+        f"dags-dir={dags_dir} env={args.env} delete-scope={delete_scope} "
+        f"dry-run={args.dry_run}",
         markup=False,
     )
 
@@ -1299,6 +1483,7 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
         "scheduler": args.scheduler,
         "env": args.env,
         "dags_dir": str(dags_dir),
+        "delete_scope": delete_scope,
         "dry_run": args.dry_run,
         "results": results,
         "overall_exit": overall_exit,

@@ -34,10 +34,10 @@ from fluid_build.forge.core.artifact_fanout import (
     EMIT_KEYS,
     REFERENCE_ONLY_SKIP,
     FanoutError,
-    _contract_has_orchestration_engine,
     _contract_is_reference_only,
     _emit_policies,
     _expose_level_policies,
+    _schedule_skip_reason,
     parse_emit_set,
     run_fanout,
 )
@@ -135,8 +135,8 @@ class TestParseEmitSet:
         """B6 regression: a reference-only build pattern must NOT strip
         ``schedule`` or ``policies``. Those emit keys describe orchestration
         and access control, both independent of where the transformation
-        logic lives. ``schedule`` is gated separately on
-        ``orchestration.engine`` inside run_fanout."""
+        logic lives. ``schedule`` is gated separately inside run_fanout
+        (``orchestration.engine`` or a build's cron trigger)."""
         out = parse_emit_set(
             "odps-bitol,odcs,schedule,policies",
             reference_only=True,
@@ -207,20 +207,20 @@ class TestContractInspectionHelpers:
         c.write_text("not: valid: yaml: [\n")
         assert _contract_is_reference_only(c) is False
 
-    def test_orchestration_engine_detected(self, tmp_path):
-        c = tmp_path / "c.yaml"
-        c.write_text("orchestration:\n  engine: airflow\n")
-        assert _contract_has_orchestration_engine(c) is True
+    def test_orchestration_engine_detected(self):
+        assert _schedule_skip_reason({"orchestration": {"engine": "airflow"}}) is None
 
-    def test_orchestration_engine_missing(self, tmp_path):
-        c = tmp_path / "c.yaml"
-        c.write_text("kind: DataProduct\n")
-        assert _contract_has_orchestration_engine(c) is False
+    def test_orchestration_engine_missing(self):
+        assert (
+            _schedule_skip_reason({"kind": "DataProduct"})
+            == "generate_artifacts_skip_schedule_no_engine"
+        )
 
-    def test_orchestration_engine_empty_string_treated_as_absent(self, tmp_path):
-        c = tmp_path / "c.yaml"
-        c.write_text("orchestration:\n  engine: ''\n")
-        assert _contract_has_orchestration_engine(c) is False
+    def test_orchestration_engine_empty_string_treated_as_absent(self):
+        assert (
+            _schedule_skip_reason({"orchestration": {"engine": ""}})
+            == "generate_artifacts_skip_schedule_no_engine"
+        )
 
 
 # ---------------------------------------------------------------------------

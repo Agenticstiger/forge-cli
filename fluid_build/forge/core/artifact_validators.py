@@ -24,8 +24,7 @@ validators:
     odps-bitol/*.yaml      → JSON Schema (vendored ODPS-Bitol v1.0.0, Bitol)
     opds/*.opds.json       → JSON Schema (vendored OPDS v4.1, LF/ODPI)
     odps/*.opds.json       → (back-compat alias of opds/) same OPDS v4.1 check
-    schedule/dags/*.py     → py_compile
-    schedule/flows/*.py    → py_compile
+    schedule/<product-id>/*.py → py_compile (DAGs and flows)
     policy/bindings.json   → key-check + OPA conftest (optional)
     <dir>/dbt/             → dbt parse (optional, for speed-transformation output)
 

@@ -56,7 +56,10 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "  fluid generate artifacts dist/product.fluid.bundle.tgz \\\n"
             "      --out dist/artifacts/\n"
             "  fluid generate artifacts bundle.tgz --emit odps-bitol,odcs\n"
-            "  fluid generate artifacts contract.fluid.yaml --out /tmp/art  # dev shortcut\n\n"
+            "  fluid generate artifacts contract.fluid.yaml --out /tmp/art  # dev shortcut\n"
+            "  # schedule DAGs that run `fluid apply --env aws` on the Airflow worker\n"
+            "  fluid generate artifacts runtime/bundle.tgz --env aws \\\n"
+            "      --contract-path contracts/orders/contract.fluid.yaml\n\n"
             "Note: --emit dbt is NOT supported. dbt projects are execution artifacts;\n"
             "use `fluid generate speed-transformation` instead.\n"
         ),
@@ -95,6 +98,26 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "that stage-4 ``fluid validate artifacts`` re-verifies."
         ),
     )
+    p.add_argument(
+        "--env",
+        default=None,
+        help=(
+            "Environment the scheduled builds run against: every schedule DAG runs "
+            "``fluid apply --env <env>``. For a raw contract the schedule is rendered "
+            "with that overlay applied; a bundle must be built with the same --env. "
+            "Default: no --env."
+        ),
+    )
+    p.add_argument(
+        "--contract-path",
+        default=None,
+        help=(
+            "The contract's path relative to the project directory, which schedule "
+            "DAGs append to $FLUID_PROJECT_DIR on the Airflow worker. Default: the "
+            "input's path relative to the current directory for a raw contract; "
+            "contract.fluid.yaml (with a warning) for a bundle."
+        ),
+    )
     p.set_defaults(generate_sub="artifacts", func=_run_from_generate)
 
 
@@ -121,6 +144,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             emit_raw=args.emit,
             manifest_path=manifest_path,
             logger=logger,
+            env=getattr(args, "env", None),
+            contract_path=getattr(args, "contract_path", None),
         )
     except FanoutError as exc:
         # Surface emit-key context so the operator knows which generator failed.

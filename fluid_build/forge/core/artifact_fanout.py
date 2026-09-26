@@ -32,9 +32,9 @@ Output layout (full default emit set)::
     ├── odcs/product.odcs.<exposeId>.yaml   # ODCS v3.1.0 (bitol-io) — one per exposed port
     ├── odps-bitol/<product>.odps.yaml      # ODPS-Bitol v1.0.0 (bitol-io)
     ├── opds/<product>.opds.json            # OPDS v4.1 (LF/ODPI) — schema-validated
-    ├── schedule/
-    │   ├── dags/<product>_dag.py           # Airflow (Path A)
-    │   └── flows/<product>_flow.py         # Prefect (Path A)
+    ├── schedule/<product-id>/             # one directory per product, so
+    │   └── <build-id>_dag.py               #   schedule-sync never deletes
+    │                                       #   another product's DAGs (Path A)
     └── policy/bindings.json                # compiled IAM/GRANT bindings
 
 Note on terminology: **OPDS** is fluid's name for the Linux Foundation / ODPI
@@ -57,9 +57,12 @@ governs only HOW the transformation logic runs — it does NOT gate any
 emit key here. ODCS/ODPS describe the output *schema*, ``policy``
 describes *access control*, and ``schedule`` describes *orchestration*;
 all three are independent of where the transformation code lives (B6).
-``schedule`` is gated on the genuine signal — the presence of
-``orchestration.engine`` — and ``policies`` emits an (empty, warned)
-bindings file when the contract declares no access policy.
+``schedule`` is gated on the genuine signal: an ``orchestration.engine``
+(other than ``none``), or a build that declares
+``execution.trigger.schedule``, which defaults to Airflow and renders a DAG
+per build that runs ``fluid apply --mode amend-and-build --build-id <id>``
+(:mod:`fluid_build.schedulers.airflow.fluid_apply`). ``policies`` emits an
+(empty, warned) bindings file when the contract declares no access policy.
 
 Upstream specs:
 
@@ -82,6 +85,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import yaml
 
+from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
 from fluid_build.forge.core.bundle import _slug, build_manifest, validate_manifest
 from fluid_build.util.safe_yaml import load_yaml_safe
 
@@ -134,7 +138,7 @@ DEFAULT_EMIT: Tuple[str, ...] = (
 # (hybrid-reference / reference / external-reference) means the
 # transformation *logic* is owned externally — it says nothing about the
 # product's catalog schema, access policy, or orchestration. ``schedule``
-# is gated separately and correctly on ``orchestration.engine``;
+# is gated separately (``orchestration.engine`` or a build trigger);
 # ``policies`` emits a warned, empty bindings file when no access policy
 # is declared. Previously this set was ``("schedule", "policies")``,
 # which dropped both even when the contract explicitly requested them and
@@ -266,25 +270,54 @@ def _contract_is_reference_only(contract_path: Path) -> bool:
     return False
 
 
-def _contract_has_orchestration_engine(contract_path: Path) -> bool:
-    """True when the contract declares ``orchestration.engine`` — the gate
-    for whether ``fluid generate schedule`` can actually emit something.
+def _load_schedule_contract(
+    contract_path: Path, overlay_env: Optional[str], logger: logging.Logger
+) -> Optional[Dict[str, Any]]:
+    """The contract as ``fluid generate schedule`` will see it, or ``None``.
 
-    Without this check, default ``--emit schedule`` hard-fails on any
-    contract that doesn't use a scheduler (which is most local-dev /
-    hello-world products). Auto-skip mirrors the reference-only pattern:
-    emit only what the contract is actually configured for.
+    Loaded through the same loader (overlay, ``$ref`` resolution and alias
+    normalisation included) so the gate below and the renderer agree on
+    which builds carry a trigger. ``None`` when it cannot be read: the gate
+    then skips ``schedule`` exactly as an unreadable contract always has.
     """
+    from fluid_build._contract_loader import load_contract_with_overlay
+
     try:
-        with open(contract_path, "r", encoding="utf-8") as fh:
-            contract = load_yaml_safe(fh) or {}
-    except (OSError, yaml.YAMLError):
-        return False
+        contract = load_contract_with_overlay(str(contract_path), overlay_env, logger)
+    except Exception:  # noqa: BLE001 - an unreadable contract skips schedule
+        return None
+    return contract if isinstance(contract, dict) else None
+
+
+def _orchestration_engine(contract: Dict[str, Any]) -> str:
     orchestration = contract.get("orchestration")
     if not isinstance(orchestration, dict):
-        return False
+        return ""
     engine = orchestration.get("engine")
-    return bool(engine and str(engine).strip())
+    return str(engine).strip() if engine else ""
+
+
+def _schedule_skip_reason(contract: Optional[Dict[str, Any]]) -> Optional[str]:
+    """``None`` when the contract gets schedule artifacts, else the skip event.
+
+    The rule: an ``orchestration.engine`` emits (``none`` opts out), and so
+    does a contract with no engine whose builds declare
+    ``execution.trigger.schedule``; Airflow renders those. Anything else has
+    nothing to schedule, and hard-failing on it would block stage 3 for the
+    hello-world / local-dev majority of products.
+    """
+    if contract is None:
+        return "generate_artifacts_skip_schedule_no_engine"
+    engine = _orchestration_engine(contract)
+    if engine == "none":
+        return "generate_artifacts_skip_schedule_engine_none"
+    if engine:
+        return None
+    from fluid_build.schedulers.airflow.fluid_apply import has_scheduled_builds
+
+    if has_scheduled_builds(contract):
+        return None
+    return "generate_artifacts_skip_schedule_no_engine"
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +339,7 @@ def parse_emit_set(
     key — ``REFERENCE_ONLY_SKIP`` is empty. ODCS/ODPS (schema),
     ``policy`` (access control) and ``schedule`` (orchestration) are all
     independent of where the transformation logic lives. ``schedule`` is
-    gated separately on ``orchestration.engine`` inside ``run_fanout``.
+    gated separately inside ``run_fanout`` (``_schedule_skip_reason``).
     The ``reference_only`` parameter is retained for API stability and to
     give a future genuinely-pattern-dependent emit key a place to hook.
     """
@@ -474,20 +507,68 @@ def _emit_odcs(contract_path: Path, out_dir: Path, logger: logging.Logger) -> Li
     ]
 
 
-def _emit_schedule(contract_path: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:
-    """DAG/flow emission via ``generate schedule``. Invokes the CLI helper
-    with a namespace that points at our ``<out>/schedule/`` subdir."""
-    from fluid_build.cli import generate_schedule
+def _emit_schedule(
+    contract_path: Path,
+    out_dir: Path,
+    logger: logging.Logger,
+    *,
+    contract: Optional[Dict[str, Any]] = None,
+    overlay_env: Optional[str] = None,
+    env: Optional[str] = None,
+    dag_contract_path: Optional[str] = None,
+) -> List[Path]:
+    """DAG/flow emission via ``generate schedule`` into ``<out>/schedule/<product-id>/``.
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # generate_schedule.run() writes to output_dir; we observe what landed
-    # there afterwards to compute the MANIFEST.
+    ``env`` is the ``--env`` a ``fluid apply`` DAG passes on every run.
+    ``overlay_env`` is the overlay applied while rendering: the same env for a
+    raw contract, ``None`` for a bundle, which stage 1 already overlaid.
+    ``dag_contract_path`` is the contract's path relative to
+    ``$FLUID_PROJECT_DIR`` on the worker. ``contract`` is the already-loaded
+    contract (:func:`_load_schedule_contract`), when the caller has it.
+    """
+    from fluid_build.cli import generate_schedule
+    from fluid_build.schedulers.airflow import fluid_apply
+
+    if contract is None:
+        contract = _load_schedule_contract(contract_path, overlay_env, logger)
+    if contract is None:
+        raise FanoutError(f"cannot read the contract at {contract_path}", key="schedule")
+    raw_id: Any = contract.get("id")
+    try:
+        product_id = validate_identifier(raw_id, kind="contract.id")
+    except IdentifierViolation as exc:
+        raise FanoutError(f"cannot scope schedule artifacts: {exc}", key="schedule") from exc
+
+    if dag_contract_path is None:
+        if fluid_apply.uses_fluid_apply_dags(contract, engine=_orchestration_engine(contract)):
+            logger.warning(
+                "generate_artifacts_schedule_contract_path_defaulted",
+                extra={
+                    "contract_path": fluid_apply.DEFAULT_CONTRACT_PATH,
+                    "hint": (
+                        "the input does not say where the contract lives in the project; "
+                        "pass --contract-path with its path relative to the project directory"
+                    ),
+                },
+            )
+        dag_contract_path = fluid_apply.DEFAULT_CONTRACT_PATH
+
+    # One directory per product: stage 11 (``schedule-sync``, default
+    # ``--delete-scope product``) mirrors it into the same-named directory of
+    # the scheduler's DAG root, so deleting stale DAGs never reaches another
+    # product's files there.
+    scope_dir = out_dir / product_id
+    scope_dir.mkdir(parents=True, exist_ok=True)
     args = argparse.Namespace(
         contract=str(contract_path),
-        env=None,
+        env=overlay_env,
+        dag_env=env,
+        dag_contract_path=dag_contract_path,
         scheduler=None,
-        output_dir=str(out_dir),
-        list=False,
+        output=str(scope_dir),
+        overwrite=True,
+        list_schedulers=False,
+        verbose=False,
     )
     rc = generate_schedule.run(args, logger)
     if rc != 0:
@@ -495,9 +576,12 @@ def _emit_schedule(contract_path: Path, out_dir: Path, logger: logging.Logger) -
             f"generate schedule failed (exit {rc})",
             key="schedule",
         )
-    # List all files under out_dir (recursive) — matches what the schedule
-    # generator actually wrote.
-    return sorted(p for p in out_dir.rglob("*") if p.is_file())
+    files = sorted(p for p in out_dir.rglob("*") if p.is_file())
+    if not files:
+        # Nothing to schedule after all: leave no empty product directory
+        # for stage 11 to mirror (and so empty) at the scheduler.
+        shutil.rmtree(out_dir)
+    return files
 
 
 def _expose_level_policies(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -646,6 +730,8 @@ def run_fanout(
     emit_raw: Optional[str],
     manifest_path: Optional[Path],
     logger: logging.Logger,
+    env: Optional[str] = None,
+    contract_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Top-level orchestrator called from the ``generate-artifacts`` CLI.
 
@@ -653,6 +739,15 @@ def run_fanout(
     Bundle input is extracted to a tmp dir + MANIFEST re-verified; raw-
     contract input is read directly (useful for iterating without
     re-bundling, but not the CI path).
+
+    ``env`` and ``contract_path`` only shape the schedule emitter: the
+    ``--env`` and the project-relative contract path each scheduled
+    ``fluid apply`` run uses. ``contract_path`` defaults to the input's path
+    relative to the current directory for a raw contract, and to
+    ``contract.fluid.yaml`` (with a warning) for a bundle, which does not
+    record where its contract lives. For a raw contract the schedule is also
+    rendered with the ``env`` overlay applied, as ``fluid apply --env`` will
+    see it; a bundle was overlaid by stage 1, so build it with the same env.
 
     Returns a dict matching the on-disk MANIFEST.json written next to the
     artifacts (same schema Phase-2 bundle MANIFEST uses — callers can
@@ -666,6 +761,18 @@ def run_fanout(
             key=None,
         )
 
+    # Both values end up in every schedule DAG (and ``env`` names an overlay
+    # file), so refuse a bad one before anything is removed or written.
+    from fluid_build.schedulers.airflow import fluid_apply
+
+    try:
+        if env is not None:
+            fluid_apply.validate_env_name(env)
+        if contract_path is not None:
+            contract_path = fluid_apply.validate_contract_path(contract_path)
+    except fluid_apply.ScheduleRenderError as exc:
+        raise FanoutError(str(exc), key="schedule") from exc
+
     # Clean slate — blow away pre-existing outputs so stale files don't
     # survive into the MANIFEST. The caller owns out_dir; we only remove
     # subdirs we generate into.
@@ -674,26 +781,42 @@ def run_fanout(
         if target.exists():
             shutil.rmtree(target)
 
-    # Extract bundle if applicable.
+    dag_contract_path = contract_path
+    if dag_contract_path is None and not _is_tgz_input(bundle_or_contract):
+        try:
+            dag_contract_path = (
+                bundle_or_contract.resolve().relative_to(Path.cwd().resolve()).as_posix()
+            )
+        except ValueError:
+            dag_contract_path = None  # outside the project: defaulted, with a warning
+    overlay_env = None if _is_tgz_input(bundle_or_contract) else env
+
+    # Extract bundle if applicable. ``resolved_contract`` is the file every
+    # emitter reads (the extracted ``contract.resolved.yaml`` for a bundle).
     with tempfile.TemporaryDirectory(prefix="fluid-artifacts-") as tmpdir:
         if _is_tgz_input(bundle_or_contract):
-            contract_path = _extract_bundle(bundle_or_contract, Path(tmpdir))
+            resolved_contract = _extract_bundle(bundle_or_contract, Path(tmpdir))
         else:
-            contract_path = bundle_or_contract
+            resolved_contract = bundle_or_contract
 
-        reference_only = _contract_is_reference_only(contract_path)
-        has_scheduler = _contract_has_orchestration_engine(contract_path)
+        reference_only = _contract_is_reference_only(resolved_contract)
         emits = parse_emit_set(emit_raw, reference_only=reference_only, logger=logger)
 
-        # Auto-skip schedule when the contract doesn't declare orchestration.engine.
-        # Hard-failing on "no scheduler configured" for every non-scheduled product
-        # would block `fluid generate artifacts` on the hello-world / local-dev
-        # majority of products.
-        if "schedule" in emits and not has_scheduler:
+        schedule_contract: Optional[Dict[str, Any]] = None
+        schedule_skip: Optional[str] = None
+        if "schedule" in emits:
+            schedule_contract = _load_schedule_contract(resolved_contract, overlay_env, logger)
+            schedule_skip = _schedule_skip_reason(schedule_contract)
+        if "schedule" in emits and schedule_skip is not None:
             logger.info(
-                "generate_artifacts_skip_schedule_no_engine",
+                schedule_skip,
                 extra={
-                    "hint": "contract has no orchestration.engine; set one to emit DAG/flow artifacts"
+                    "hint": (
+                        "orchestration.engine is none"
+                        if schedule_skip.endswith("_engine_none")
+                        else "contract has no orchestration.engine and no build declares "
+                        "execution.trigger.schedule; add either to emit DAG/flow artifacts"
+                    )
                 },
             )
             emits = [k for k in emits if k != "schedule"]
@@ -703,7 +826,18 @@ def run_fanout(
         for key in emits:
             subdir_name, fn = _DISPATCH[key]
             subdir = out_dir / subdir_name
-            files = fn(contract_path, subdir, logger)
+            if key == "schedule":
+                files = _emit_schedule(
+                    resolved_contract,
+                    subdir,
+                    logger,
+                    contract=schedule_contract,
+                    overlay_env=overlay_env,
+                    env=env,
+                    dag_contract_path=dag_contract_path,
+                )
+            else:
+                files = fn(resolved_contract, subdir, logger)
             written.extend(files)
 
     # Build MANIFEST across all emitted files (bytes from disk — matches
