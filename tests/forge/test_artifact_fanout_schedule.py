@@ -166,6 +166,9 @@ class TestTheDemoDagReachesTheManifest:
         loaded = load_dag((tmp_path / "dist" / "artifacts" / DAG_REL).read_text(), monkeypatch)
         assert loaded.dag["schedule"] == "30 1 * * *"
         assert loaded.namespace["FLUID_ENV_NAME"] == "aws"
+        # Fanned out through a temporary --env bundle, the DAG still runs the
+        # contract it was given, not the bundle default.
+        assert loaded.namespace["CONTRACT_PATH"] == DEMO_CONTRACT_PATH
 
 
 class TestTheGate:
@@ -220,9 +223,32 @@ class TestTheGate:
                 "--env",
                 "broken",
             )
+        # ``--env`` on a raw contract applies the overlay before any emitter
+        # runs, with the code ``fluid bundle --env`` uses, so it fails there.
+        assert exc.value.event == "contract_load_failed"
+        assert exc.value.context["env"] == "broken"
+        assert not (tmp_path / "dist" / "artifacts" / DAG_REL).exists()
+
+    def test_a_bad_env_is_refused_before_any_overlay_is_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The overlay search turns ``--env`` into a file name."""
+        write_project(tmp_path)
+        # What ``overlays/../../elsewhere.yaml`` would read: not YAML, so a
+        # read would fail as contract_load_failed rather than be refused.
+        (tmp_path / "contracts" / "elsewhere.yaml").write_text("[unclosed\n", encoding="utf-8")
+        with pytest.raises(CLIError) as exc:
+            _stage3(
+                tmp_path,
+                monkeypatch,
+                DEMO_CONTRACT_PATH,
+                "--out",
+                "dist/artifacts",
+                "--env",
+                "../../elsewhere",
+            )
         assert exc.value.event == "generate_artifacts_failed"
         assert exc.value.context["emit_key"] == "schedule"
-        assert "broken" in exc.value.context["error"]
 
 
 def _warned(caplog: pytest.LogCaptureFixture) -> bool:

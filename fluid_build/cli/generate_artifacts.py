@@ -144,6 +144,14 @@ def _fanout_input_for_env(
     """
     if not env:
         return input_path
+    # ``run_fanout`` refuses a bad env before anything is written; the overlay
+    # search below turns ``env`` into a file name, so refuse it first here.
+    from fluid_build.schedulers.airflow import fluid_apply
+
+    try:
+        fluid_apply.validate_env_name(env)
+    except fluid_apply.ScheduleRenderError as exc:
+        raise CLIError(1, "generate_artifacts_failed", {"error": str(exc), "emit_key": "schedule"})
     from fluid_build._contract_loader import _is_bundle_path, check_bundle_env
 
     if _is_bundle_path(str(input_path)):
