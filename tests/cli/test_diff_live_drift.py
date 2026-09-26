@@ -360,17 +360,17 @@ def fresh_bigquery_validation():
     the stand-in, or cached from an earlier test, would otherwise answer for
     the SDK in a later test on the same worker that expects something else.
     """
-    import fluid_build.providers as package
+    from fluid_build import providers
 
     saved_module = sys.modules.pop(_BQ_VALIDATION, None)
-    saved_attr = vars(package).pop("bigquery_validation", None)
+    saved_attr = vars(providers).pop("bigquery_validation", None)
     yield
     sys.modules.pop(_BQ_VALIDATION, None)
-    vars(package).pop("bigquery_validation", None)
+    vars(providers).pop("bigquery_validation", None)
     if saved_module is not None:
         sys.modules[_BQ_VALIDATION] = saved_module
     if saved_attr is not None:
-        package.bigquery_validation = saved_attr
+        providers.bigquery_validation = saved_attr
 
 
 @pytest.fixture
