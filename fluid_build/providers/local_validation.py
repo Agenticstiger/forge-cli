@@ -39,6 +39,7 @@ from fluid_build.providers.validation_provider import (
     ValidationProvider,
     ValidationResult,
 )
+from fluid_build.util.binding_paths import resolve_binding_path
 
 LOG = logging.getLogger("fluid.providers.local_validation")
 
@@ -325,9 +326,10 @@ class LocalValidationProvider(ValidationProvider):
         if not path:
             return None
 
-        # Resolve relative to base_dir
-        resolved = Path(self.base_dir) / path
-        return str(resolved)
+        # Resolve relative to base_dir, after ``{{ env.NAME }}`` is resolved the
+        # way the build runner resolves it before it writes (see
+        # ``fluid_build.util.binding_paths``); an absolute result is kept as is.
+        return str(resolve_binding_path(str(path), self.base_dir))
 
     @staticmethod
     def _extract_expected_fields(resource_spec: Dict[str, Any]) -> List[FieldSchema]:

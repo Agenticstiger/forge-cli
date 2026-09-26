@@ -515,6 +515,37 @@ def test_without_exit_on_drift_the_comparison_is_reported_and_exits_zero(
     assert [c["column"] for c in report["live"]["exposes"][0]["columns"]] == columns
 
 
+@pytest.mark.parametrize(
+    ("select_sql", "rc", "status"),
+    [
+        (MATCHING_SELECT, 0, "match"),
+        (f"SELECT *, 'x' AS rogue_col FROM ({MATCHING_SELECT})", 1, "drift"),
+    ],
+    ids=["match", "drift"],
+)
+def test_a_path_named_through_an_env_variable_is_read_where_the_build_wrote_it(
+    workspace, monkeypatch, select_sql, rc, status
+):
+    """A local path under a shared directory named by a variable
+    (``{{ env.NAME }}/...``) is where the build runner writes, after it resolves
+    the placeholder. Anchored raw at the contract directory, the target read
+    as absent, "to be created", before and after the build, so a drifted file
+    passed ``--exit-on-drift`` without being read."""
+    shared = workspace / "shared-data"
+    monkeypatch.setenv("FLUID_TEST_LAKE", str(shared))
+    binding = {**LOCAL_BINDING, "location": {"path": "{{ env.FLUID_TEST_LAKE }}/subs.parquet"}}
+    (workspace / "product").mkdir()
+    contract = _write_contract(workspace / "product", _contract(binding, policy="strict"))
+    _write_parquet(shared / "subs.parquet", select_sql)
+
+    got, event = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert expose["status"] == status
+    assert expose["target"] == str(shared / "subs.parquet")
+    assert (got, event) == (rc, None)
+
+
 def _bundle(contract: Path, out: Path) -> Path:
     rc, event = _invoke(
         ["bundle", str(contract), "--env", "dev", "--format", "tgz", "--out", str(out)]
