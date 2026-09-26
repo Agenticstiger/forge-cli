@@ -193,7 +193,7 @@ def _create_project_agent_loop(
         CopilotGenerationError,
         resolve_llm_config,
     )
-    from fluid_build.util.workspace import find_workspace_root
+    from fluid_build.cli.workspace_config import find_workspace_root
 
     try:
         llm_config = copilot_options.get("llm_config")

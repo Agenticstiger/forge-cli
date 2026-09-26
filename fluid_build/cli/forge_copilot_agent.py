@@ -390,14 +390,14 @@ class CopilotAgentBase(CopilotProjectMemoryMixin, CopilotLegacyScaffoldMixin, AI
         team_memory_payload = None
         try:
             from fluid_build.cli.forge_team_memory import load_team_memory
-            from fluid_build.util.workspace import find_workspace_root
+            from fluid_build.cli.workspace_config import find_workspace_root
 
             ws_root = find_workspace_root(Path.cwd()) or Path.cwd()
             tm = load_team_memory(ws_root)
             if tm is not None:
                 team_memory_payload = tm.to_prompt_payload()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:  # noqa: BLE001 — team memory is optional; never block generation
+            LOG.debug("team_memory_load_failed", exc_info=True)
 
         return self._generate_copilot_artifacts_dependency(
             context,
