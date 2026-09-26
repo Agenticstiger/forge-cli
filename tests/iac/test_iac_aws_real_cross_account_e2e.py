@@ -14,25 +14,24 @@
 
 """Stage 3 — cross-account/cross-principal proxy on real AWS.
 
-Cross-account access on AWS requires TWO things landing together:
+An LF grant emits two things:
 
   * ``aws_lakeformation_permissions`` — grants the consumer principal
     catalog-level SELECT on the Glue table.
-  * ``aws_s3_bucket_policy`` — grants the consumer principal
-    ``s3:GetObject`` on the underlying bucket. The LF permission alone
-    is NOT sufficient because LF authorises catalog metadata reads
-    only; Athena's object-byte reads still need IAM permission on
-    the consumer side. The aws-lakeformation-best-practices
-    cross-account FAQ and the canonical Terraform pattern (Komminar)
-    both spell this out.
+  * ``aws_s3_bucket_policy`` — grants ``s3:GetObject`` on the underlying
+    prefix, by default ONLY to grantees in another account than the one
+    applying (``bucketPolicy: cross-account``). A same-account grantee
+    gets no statement: on a registered location Athena reads the bytes
+    with credentials Lake Formation vends, and a bucket-policy Allow
+    would let the grantee read them straight from S3 instead, skipping
+    Lake Formation's filters and revocations.
 
-This file verifies that BOTH pieces land correctly and authorise an
-Athena read by an *assumed* IAM role (the consumer), proving the
-IAM-grant logic works end-to-end. Two tests:
+This file verifies both halves on real AWS. Tests:
 
   * ``test_real_cross_account_consumer_can_select`` — positive: the
-    consumer role assumes successfully, Athena START_QUERY_EXECUTION
-    on the granted table SUCCEEDS.
+    consumer role (same account as the deployer) is NOT in any bucket
+    policy, and Athena START_QUERY_EXECUTION on the granted table still
+    SUCCEEDS through Lake Formation.
   * ``test_real_cross_principal_without_grant_denied`` — negative: a
     different bootstrap role (``spectrum``) that did NOT get a grant
     is denied at LF / Glue when it tries to query the same table.
@@ -114,15 +113,13 @@ def _wait_query(athena, exec_id: str, *, timeout: float = 60.0) -> Dict[str, Any
 def _xacc_iceberg_contract(
     bucket: str, db: str, table: str, grantee: str, cid: str
 ) -> Dict[str, Any]:
-    """An Iceberg-on-Glue contract that grants SELECT + S3 read to ``grantee``.
+    """An Iceberg-on-Glue contract that grants LF SELECT to ``grantee``.
 
-    Any IAM-principal LF grant on a Glue-S3 binding automatically
-    emits BOTH:
+    An IAM-principal LF grant on a Glue-S3 binding emits:
       * aws_lakeformation_permissions (catalog SELECT/DESCRIBE)
-      * aws_s3_bucket_policy (s3:GetObject + s3:ListBucket on the bucket)
-
-    Zero schema-side opt-in flag — the pairing is intrinsic to the
-    canonical AWS LF cross-account pattern.
+      * aws_s3_bucket_policy (s3:GetObject + s3:ListBucket on the prefix),
+        by default only when ``grantee`` is in another account than the
+        deployer's (``bucketPolicy: cross-account``)
     """
     contract = aws_iceberg_contract(bucket, database=db, table=table, cid=cid)
     contract["exposes"][0]["binding"]["governance"] = {
@@ -140,16 +137,15 @@ def _xacc_iceberg_contract(
 
 
 def test_real_cross_account_consumer_can_select(aws_real_project, aws_account):
-    """Apply: contract granting LF SELECT + S3 read to the consumer role.
+    """Apply: contract granting LF SELECT to the consumer role.
     STS-assume the consumer role + run an Athena SELECT — query SUCCEEDS.
 
     This is the headline test: a non-deployer IAM principal, granted
-    ONLY through the contract's LF grant (which automatically pairs
-    with a bucket policy), can read the table without needing any
-    prior admin access. The cross-account boundary is collapsed onto
-    a single account (consumer role in the same account as producer),
-    but the IAM-grant LOGIC tested is identical to a true cross-account
-    setup.
+    ONLY through the contract's LF grant, can read the table without
+    needing any prior admin access. The consumer role is in the
+    deployer's account, so the default ``bucketPolicy: cross-account``
+    gives it NO bucket-policy statement: the read goes through Lake
+    Formation's credential vending on the registered location.
     """
     consumer_arn = aws_real_role_arn("consumer")
     bucket = aws_real_project.name("xacc-b")
@@ -162,14 +158,12 @@ def test_real_cross_account_consumer_can_select(aws_real_project, aws_account):
     )
     aws_real_project.apply_ok(contract)
 
-    # Sanity: the bucket policy landed with the consumer principal.
-    s3 = aws_real_boto("s3")
-    pol = s3.get_bucket_policy(Bucket=bucket)
-    import json as _json
-
-    pol_doc = _json.loads(pol["Policy"])
-    principals = {s["Principal"]["AWS"] for s in pol_doc["Statement"]}
-    assert consumer_arn in principals, f"consumer ARN not in bucket policy — got {principals}"
+    # The same-account consumer must NOT be in the bucket policy: a statement
+    # there would let it read the objects straight from S3, around LF.
+    principals = _bucket_policy_principals(bucket)
+    assert (
+        consumer_arn not in principals
+    ), f"same-account consumer ARN leaked into the bucket policy — got {principals}"
 
     # Sanity: the LF grant exists for the consumer.
     lf = aws_real_boto("lakeformation")
@@ -179,7 +173,7 @@ def test_real_cross_account_consumer_can_select(aws_real_project, aws_account):
     ).get("PrincipalResourcePermissions", [])
     assert perms, f"no LF perms found for consumer on {glue_db}.{table}"
 
-    # Give LF + bucket-policy + Glue catalog a moment to converge.
+    # Give LF + Glue catalog a moment to converge.
     time.sleep(8)
 
     # Assume the consumer role and run Athena MSCK + SELECT through ITS
@@ -247,15 +241,30 @@ def test_real_cross_principal_without_grant_denied(aws_real_project, aws_account
     )
 
     # And the bucket-policy must not contain spectrum either.
-    import json as _json
-
-    s3 = aws_real_boto("s3")
-    pol = s3.get_bucket_policy(Bucket=bucket)
-    pol_doc = _json.loads(pol["Policy"])
-    principals = {s["Principal"]["AWS"] for s in pol_doc["Statement"]}
+    principals = _bucket_policy_principals(bucket)
     assert (
         spectrum_arn not in principals
     ), f"spectrum ARN leaked into bucket policy — got {principals}"
+
+
+def _bucket_policy_principals(bucket: str) -> set:
+    """The principals the bucket's policy names; empty when it has none.
+
+    Under the default ``bucketPolicy: cross-account`` a contract whose
+    grantees are all in the applying account emits no bucket policy at all,
+    so ``GetBucketPolicy`` answers ``NoSuchBucketPolicy``.
+    """
+    import json as _json
+
+    from botocore.exceptions import ClientError
+
+    try:
+        pol = aws_real_boto("s3").get_bucket_policy(Bucket=bucket)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "NoSuchBucketPolicy":
+            return set()
+        raise
+    return {s["Principal"]["AWS"] for s in _json.loads(pol["Policy"])["Statement"]}
 
 
 def _is_authz_failure(reason: str) -> bool:
@@ -337,13 +346,9 @@ def test_real_cross_account_grant_carries_external_arn(aws_real_project, aws_acc
         external_arn in external_in_lf
     ), f"external ARN absent from LF perms — got {sorted(external_in_lf)}"
 
-    # The S3 bucket policy must contain the external ARN.
-    import json as _json
-
-    s3 = aws_real_boto("s3")
-    pol = s3.get_bucket_policy(Bucket=bucket)
-    pol_doc = _json.loads(pol["Policy"])
-    principals = {s["Principal"]["AWS"] for s in pol_doc["Statement"]}
+    # The S3 bucket policy must contain the external ARN: it is in another
+    # account, so the default cross-account filter keeps its statements.
+    principals = _bucket_policy_principals(bucket)
     assert (
         external_arn in principals
     ), f"external ARN absent from bucket policy — got {sorted(principals)}"

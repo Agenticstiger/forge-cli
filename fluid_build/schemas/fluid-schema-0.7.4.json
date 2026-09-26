@@ -5280,7 +5280,7 @@
           "properties": {
             "admins": {
               "type": "array",
-              "description": "IAM principal ARNs (roles or users) granted Lake Formation admin privileges. Emitted as aws_lakeformation_data_lake_settings.admins. Idempotent: re-applying with the same set is a no-op; principals not listed are NOT removed (LF resource semantics preserve other admins).",
+              "description": "IAM principal ARNs (roles or users) granted Lake Formation admin privileges. Emitted as aws_lakeformation_data_lake_settings.admins. AUTHORITATIVE, not additive: Lake Formation's PutDataLakeSettings replaces the account's admin list with the one sent, so an admin NOT listed here is REMOVED on apply. List every principal that must stay a data lake admin, including the role or user that runs the apply: left out, it loses Lake Formation admin on that apply, and the Lake Formation grants and registrations that need an admin can then fail. The terraform-provider-aws resource also clears the data lake settings its configuration omits, and this block sets only the admins, so the account's create-database and create-table default permissions (the IAMAllowedPrincipals default for new databases and tables), trusted resource owners and parameters are cleared too. Destroying the resource empties the admin list and resets CROSS_ACCOUNT_VERSION to 1. Re-applying the same list is a no-op.",
               "items": {
                 "type": "string",
                 "pattern": "^arn:aws[a-z0-9-]*:iam::"

@@ -23,18 +23,20 @@ The full ladder is exercised in:
                             (``test_iac_aws_real_cross_account_e2e.py``,
                              ``test_iac_gcp_real_cross_project_e2e.py``).
 
-**Zero new schema fields** — the cross-account / cross-project
-capabilities reuse the contract surface that already exists:
+The cross-account / cross-project capabilities reuse the contract
+surface that already exists:
 
   * AWS: ``binding.governance.lakeFormation.grants[].principal``
     already accepts arbitrary IAM ARNs (the v0.7.3 schema's principal
     pattern is ``^arn:aws[a-z0-9-]*:iam::`` which matches any account
-    number). Any LF grant on a Glue-catalog-backed S3 binding ALSO
-    triggers an ``aws_s3_bucket_policy`` for the same principal — LF
-    alone does not authorise object reads (see the AWS LF
-    cross-account FAQ + Komminar's Terraform article). The bucket
-    policy is benign for in-account principals (additive on top of
-    their IAM read).
+    number). An LF grant on a Glue-catalog-backed S3 binding also gets
+    a companion ``aws_s3_bucket_policy`` statement, by default ONLY
+    when the grantee is in another account than the one applying,
+    decided at plan time (``bucketPolicy: cross-account``, fluid-schema
+    0.7.6). A same-account grantee gets none: a bucket-policy Allow
+    would let it read the objects straight from S3 and skip Lake
+    Formation's filters. ``tests/iac/test_iac_lakeformation_bucket_policy*.py``
+    pin the modes; this file pins the cross-account shape.
   * GCP: cross-project SAs ride the existing ``metadata.policies``
     surface. ``_bq_access_entries`` already maps the policy entries
     to ``user_by_email`` on the dataset's ``access[]`` block, and BQ's
@@ -51,6 +53,8 @@ import pytest
 from fluid_build.iac import get_iac_plugin
 from fluid_build.schema_manager import FluidSchemaManager
 
+from ._lf_bucket_policy import policy_statements
+
 pytestmark = [pytest.mark.unit, pytest.mark.provider]
 
 
@@ -59,7 +63,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.provider]
 
 def _aws_contract(*, principal: str, bucket: str = "fluid-iactest-xacc-demo"):
     """Contract with a single LF grant. The bucket policy is emitted
-    automatically — no opt-in flag exists in the schema."""
+    automatically; ``bucketPolicy`` (0.7.6) only narrows or widens it."""
     return {
         "fluidVersion": "0.7.3",
         "kind": "DataProduct",
@@ -135,9 +139,10 @@ def _gcp_contract(policies):
 
 
 class TestAwsCrossAccountEmit:
-    """Any IAM-principal LF grant on a Glue-S3 binding automatically
-    emits a matching ``aws_s3_bucket_policy``. Zero new schema fields
-    — uses the existing ``governance.lakeFormation.grants[]`` block."""
+    """An IAM-principal LF grant on a Glue-S3 binding emits a matching
+    ``aws_s3_bucket_policy`` whose statements are kept for grantees in
+    other accounts. Uses the existing ``governance.lakeFormation.grants[]``
+    block."""
 
     def test_lf_grant_lands_in_principal(self):
         contract = _aws_contract(principal="arn:aws:iam::222222222222:role/consumer")
@@ -149,7 +154,8 @@ class TestAwsCrossAccountEmit:
 
     def test_lf_grant_emits_companion_bucket_policy(self):
         contract = _aws_contract(principal="arn:aws:iam::222222222222:role/consumer")
-        res = get_iac_plugin("aws").emit(contract, [])
+        plugin = get_iac_plugin("aws")
+        res = plugin.emit(contract, [])
         policies = res.get("aws_s3_bucket_policy", {})
         assert (
             len(policies) == 1
@@ -158,9 +164,10 @@ class TestAwsCrossAccountEmit:
         assert body["bucket"].startswith(
             "${aws_s3_bucket."
         ), f"bucket should be a tofu ref; got {body['bucket']!r}"
-        doc = json.loads(body["policy"])
-        assert doc["Version"] == "2012-10-17"
-        stmts = {s["Sid"]: s for s in doc["Statement"]}
+        # Default mode: a plan-time filter keeps the statement only for a
+        # grantee outside the applying account.
+        assert "data.aws_caller_identity.fluid_lf_caller.account_id" in body["count"]
+        stmts = {s["Sid"]: s for s in policy_statements(body, plugin.emit_data(contract, []))}
         assert "FluidLfBucketList0" in stmts
         assert "FluidLfBucketGet0" in stmts
         # List on the bucket ARN; Get on the per-object ARN.
@@ -185,20 +192,21 @@ class TestAwsCrossAccountEmit:
                 "permissions": ["SELECT"],
             }
         )
-        res = get_iac_plugin("aws").emit(contract, [])
+        plugin = get_iac_plugin("aws")
+        res = plugin.emit(contract, [])
         policies = res.get("aws_s3_bucket_policy", {})
         # Single policy resource — one per bucket — with statements for both principals.
         assert len(policies) == 1
         body = next(iter(policies.values()))
-        doc = json.loads(body["policy"])
-        sids = sorted(s["Sid"] for s in doc["Statement"])
+        statements = policy_statements(body, plugin.emit_data(contract, []))
+        sids = sorted(s["Sid"] for s in statements)
         assert sids == [
             "FluidLfBucketGet0",
             "FluidLfBucketGet1",
             "FluidLfBucketList0",
             "FluidLfBucketList1",
         ]
-        principals = {s["Principal"]["AWS"] for s in doc["Statement"]}
+        principals = {s["Principal"]["AWS"] for s in statements}
         assert principals == {
             "arn:aws:iam::222222222222:role/consumer-a",
             "arn:aws:iam::333333333333:role/consumer-b",
@@ -214,10 +222,9 @@ class TestAwsCrossAccountEmit:
         assert "aws_lakeformation_permissions" not in res
 
     def test_schema_validates_lf_grant_without_extra_fields(self):
-        # The contract used by these tests has ZERO new fields — the LF
-        # grant block was already in the 0.7.3 schema. Confirm the
-        # contract validates cleanly so the schema delta really is
-        # nothing more than the existing LF surface.
+        # The contract used by these tests has no field newer than the LF
+        # grant block of the 0.7.3 schema. Confirm it still validates, so
+        # a 0.7.3 contract keeps working unchanged.
         contract = _aws_contract(principal="arn:aws:iam::222222222222:role/consumer")
         result = FluidSchemaManager().validate_contract(contract)
         assert result.is_valid, (

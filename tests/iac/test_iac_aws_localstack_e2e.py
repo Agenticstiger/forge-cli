@@ -172,7 +172,11 @@ def test_cross_account_lf_grant_plus_s3_bucket_policy_round_trip(
     assert principals == {
         "arn:aws:iam::222222222222:role/consumer-role"
     }, f"cross-account principal not in policy doc; got {principals}"
-    actions = {a for s in stmts for a in s["Action"]}
+    # The default (cross-account) policy is rendered by aws_iam_policy_document,
+    # which writes a one-item Action as a bare string; IAM reads both forms alike.
+    actions = {
+        a for s in stmts for a in ([s["Action"]] if isinstance(s["Action"], str) else s["Action"])
+    }
     assert {"s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"} <= actions
 
 
