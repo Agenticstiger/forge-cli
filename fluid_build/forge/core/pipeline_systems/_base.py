@@ -109,6 +109,19 @@ def check_pipeline_literal(what: str, value: str) -> str:
     return value
 
 
+def check_pipeline_workdir(workdir: str) -> str:
+    """``check_pipeline_literal`` for the workdir, which is also written into
+    ``archiveArtifacts`` patterns: a glob character or a comma there would
+    archive files the pipeline did not write, or split the pattern list."""
+    check_pipeline_literal("workdir", workdir)
+    if re.search(r"[*?,\[\]]", workdir):
+        raise ValueError(
+            f"workdir {workdir!r} contains a glob character or a comma, which an "
+            "archiveArtifacts pattern would read as a pattern"
+        )
+    return workdir
+
+
 def sh_param(name: str, default: str, *, keep_blank: bool = False) -> str:
     """The POSIX expansion of pipeline parameter ``name`` with its declared default.
 
@@ -1240,7 +1253,7 @@ class BasePipelineTemplate:
             # The workdir is written between double quotes into a shell
             # body: refuse (at generation time) anything that could end the
             # quoting or expand, rather than escaping it.
-            workdir = check_pipeline_literal("workdir", config.workdir)
+            workdir = check_pipeline_workdir(config.workdir)
             body = f'cd "{workdir}" && {body}'
         return body
 

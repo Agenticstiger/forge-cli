@@ -569,6 +569,12 @@ def test_the_generated_file_has_no_groovy_escape_in_a_shell_body():
         assert "\\" not in body
 
 
+@pytest.mark.parametrize("workdir", ['a"b', "a$(id)", "a*", "a,b", "a\\b"])
+def test_a_workdir_the_file_cannot_carry_literally_is_refused(workdir):
+    with pytest.raises(ValueError, match="workdir"):
+        _jenkinsfile(workdir=workdir)
+
+
 def test_every_shell_body_is_posix_sh():
     """Jenkins runs ``sh`` with /bin/sh (dash on Debian): no bash arrays or [[ ]]."""
     for body in _sh_bodies(_jenkinsfile(diff_last_applied=True)):

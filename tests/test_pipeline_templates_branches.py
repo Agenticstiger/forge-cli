@@ -1093,7 +1093,7 @@ class TestStageSpecsHelper:
         at generation time: escaping one character left ``$(...)`` and
         backquotes expanding inside the generated ``cd "..."``."""
         bt = self._bt()
-        for workdir in ('odd"dir', "x$(id)", "a`b`", "c\\d"):
+        for workdir in ('odd"dir', "x$(id)", "a`b`", "c\\d", "d*", "e,f"):
             with pytest.raises(ValueError, match="workdir"):
                 bt._render_stage_command(bt._stage_specs()[0], self._cfg(workdir=workdir))
 

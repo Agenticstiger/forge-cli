@@ -43,7 +43,6 @@ except ImportError:
 
 from ._base import (
     APPLY_MODES,
-    BUILD_APPLY_MODES,
     BUNDLE_PATH,
     PINNED_ACTIONS,
     SCHEDULERS,
@@ -54,7 +53,7 @@ from ._base import (
     StageSpec,
     _pin_action,
     apply_build_id_sh,
-    check_pipeline_literal,
+    check_pipeline_workdir,
     sh_param,
 )
 from ._engine_specs import (
@@ -464,7 +463,7 @@ class JenkinsTemplate(BasePipelineTemplate):
         # its declared default, never by Groovy interpolation.
         workdir = (config.workdir or "").strip("/")
         if workdir:
-            check_pipeline_literal("workdir", workdir)
+            check_pipeline_workdir(workdir)
         CD = f'cd "{workdir}" && ' if workdir else ""
         # Archive patterns are rooted at the SCM root (the Jenkins workspace),
         # so every glob gets the workdir prefix. ``allowEmptyArchive: true``
