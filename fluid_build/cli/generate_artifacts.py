@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
+from typing import Optional
 
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.console import cprint
@@ -105,7 +107,9 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "Environment the scheduled builds run against: every schedule DAG runs "
             "``fluid apply --env <env>``. For a raw contract the schedule is rendered "
             "with that overlay applied; a bundle must be built with the same --env. "
-            "Default: no --env."
+            "Default: $FLUID_ENV, the variable the generated pipelines apply with; "
+            "when that is unset too, no --env (with a warning if the contract has "
+            "overlays). An empty --env '' means no --env."
         ),
     )
     p.add_argument(
@@ -144,7 +148,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             emit_raw=args.emit,
             manifest_path=manifest_path,
             logger=logger,
-            env=getattr(args, "env", None),
+            env=_schedule_env(args, logger),
             contract_path=getattr(args, "contract_path", None),
         )
     except FanoutError as exc:
@@ -158,3 +162,22 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     cprint(f"   MANIFEST digest: {manifest['digest']}")
     cprint(f"   files: {len(manifest.get('files', {}))}")
     return 0
+
+
+def _schedule_env(args: argparse.Namespace, logger: logging.Logger) -> Optional[str]:
+    """The ``--env`` baked into schedule DAGs: the flag, else ``$FLUID_ENV``.
+
+    The generated pipelines apply with ``--env "${FLUID_ENV:-dev}"`` (stage
+    7), so reading the same variable keeps a scheduled run on the target the
+    pipeline applied to when stage 3 is not given ``--env``. An empty
+    ``FLUID_ENV`` counts as unset, as it does in ``${FLUID_ENV:-dev}``. An
+    empty ``--env ''`` is returned as ``""``: no ``--env``, on purpose, so the
+    fanout does not warn about it.
+    """
+    explicit = getattr(args, "env", None)
+    if explicit is not None:
+        return str(explicit)
+    from_env = os.environ.get("FLUID_ENV") or None
+    if from_env is not None:
+        logger.info("generate_artifacts_schedule_env_from_fluid_env", extra={"env": from_env})
+    return from_env

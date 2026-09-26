@@ -170,6 +170,15 @@ class TestProductScopeIsTheDefault:
             (argv,) = _dispatch(flat, destination=destination)
             assert "--delete" not in argv
 
+    def test_refuses_a_loose_file_next_to_product_directories(self, two_products: Path) -> None:
+        (two_products / "stray_dag.py").write_text("# dag\n", encoding="utf-8")
+        for scheduler, destination, _flag in DELETING:
+            with pytest.raises(CLIError) as exc:
+                _dispatch(two_products, scheduler=scheduler, destination=destination)
+            assert exc.value.exit_code == 2, destination
+            assert exc.value.event == "schedule_sync_dags_dir_not_product_scoped"
+            assert exc.value.context["loose_files"] == ["stray_dag.py"]
+
     def test_refuses_a_symlinked_product_directory(
         self, two_products: Path, tmp_path: Path
     ) -> None:

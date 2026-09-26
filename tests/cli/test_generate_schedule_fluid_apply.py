@@ -26,19 +26,24 @@ the build's schedule.
 from __future__ import annotations
 
 import argparse
+import ast
+import json
 import logging
 import os
+import zoneinfo
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Set
 
 import pytest
 import yaml
 
+import fluid_build
 from fluid_build.cli import generate_schedule
 from tests.cli._schedule_dag_fixtures import (
     DEMO_CONTRACT,
     DEMO_CONTRACT_PATH,
     load_dag,
+    python_stub,
     run_task,
     write_project,
 )
@@ -118,6 +123,7 @@ class TestTheDemoContractGetsADagThatDoesTheWork:
                 "AIRFLOW__CORE__FERNET_KEY": "fernet-secret",
                 "AIRFLOW_CONN_WAREHOUSE": "postgresql://u:p@h/db",
                 "UNRELATED_TOKEN": "tok",
+                "VIRTUAL_ENV": "/home/airflow/.local",
                 "EXTRA_ONE": "kept",
                 "FLUID_DAG_ENV_PASSTHROUGH": "EXTRA_ONE",
                 # Not a shell identifier: bash passes it on without listing it.
@@ -144,6 +150,7 @@ class TestTheDemoContractGetsADagThatDoesTheWork:
             "AIRFLOW__CORE__FERNET_KEY",
             "AIRFLOW_CONN_WAREHOUSE",
             "UNRELATED_TOKEN",
+            "VIRTUAL_ENV",
             "db.password",
         ):
             assert dropped not in run.env, dropped
@@ -261,10 +268,22 @@ class TestNothingSecretOrExecutableIsTemplated:
         [
             {"build_id": 'ingest"; import os; os.system("id") #'},
             {"build_id": "../../etc/passwd"},
+            {"build_id": "ingest_subscriptions\n"},
             {"contract_id": "x'); import os #"},
+            {"contract_id": "bronze.customer_subscriptions\n"},
             {"trigger": {"schedule": "0 * * * *'); import os #"}},
             {"trigger": {"schedule": "{{ var.value.cron }}"}},
             {"trigger": {"schedule": "every four hours"}},
+            {"trigger": {"schedule": "0 * * * $(id)"}},
+            # Measured: each exited 0 and wrote a DAG that Airflow 3.3.2 refused
+            # to import (AirflowTimetableInvalid / "Invalid day_of_week value").
+            {"trigger": {"schedule": "99 * * * *"}},
+            {"trigger": {"schedule": "foo bar baz qux quux"}},
+            {"trigger": {"schedule": "0 */4 * * MON#9"}},
+            # Loads, but croniter never finds a next run for it.
+            {"trigger": {"schedule": "0 0 1 * MON#2"}},
+            # Quartz puts seconds first, croniter last: refused, not guessed.
+            {"trigger": {"schedule": "0 0 */4 * * *"}},
             {"trigger": {"timezone": "UTC'), __import__('os').system('id') #"}},
             {"trigger": {"timezone": "Mars/Olympus_Mons"}},
         ],
@@ -281,6 +300,10 @@ class TestNothingSecretOrExecutableIsTemplated:
         [
             ("--env", "aws;id"),
             ("--env", "{{ var.value.env }}"),
+            # ``$`` matched before a final newline: 'aws\n' was baked into
+            # the DAG, and fluid apply found no overlay named that.
+            ("--env", "aws\n"),
+            ("--contract-path", DEMO_CONTRACT_PATH + "\n"),
             ("--contract-path", "../../etc/passwd"),
             ("--contract-path", "/etc/passwd"),
             ("--contract-path", "contracts/$(id)/contract.fluid.yaml"),
@@ -333,3 +356,262 @@ class TestTriggerSemantics:
             "hourly_cron_key_dag.py",
             "nightly_dag.py",
         ]
+
+    def test_retries_are_capped_at_ten(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        write_project(tmp_path, _contract(execution={"retries": {"maxAttempts": 50}}))
+        assert _generate(tmp_path, monkeypatch) == 0
+        loaded = load_dag((tmp_path / "out" / DAG_FILE).read_text(), monkeypatch)
+        assert loaded.dag["default_args"]["retries"] == 10
+
+    @pytest.mark.parametrize(
+        "cron",
+        [
+            "0 */4 * * *",
+            "*/15 9-17 * * MON-FRI",
+            "30 2 1,15 jan-jun ?",
+            "0 0 L * *",
+            "0 6 ? * mon#1",
+            "0 0 * * 7",
+            "50-10 22-2 * dec-feb fri-mon",
+        ],
+    )
+    def test_crons_airflow_accepts_are_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cron: str
+    ) -> None:
+        write_project(tmp_path, _contract(trigger={"schedule": cron}))
+        assert _generate(tmp_path, monkeypatch) == 0
+        loaded = load_dag((tmp_path / "out" / DAG_FILE).read_text(), monkeypatch)
+        assert loaded.dag["schedule"] == cron
+
+    def test_the_timezone_grammar_holds_where_zoneinfo_cannot_judge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A host with no tz database: every lookup misses and no zone is
+        # listed, so only the grammar stands between the contract and the DAG.
+        def missing(key: str) -> None:
+            raise zoneinfo.ZoneInfoNotFoundError(key)
+
+        monkeypatch.setattr(zoneinfo, "ZoneInfo", missing)
+        monkeypatch.setattr(zoneinfo, "available_timezones", set)
+        write_project(tmp_path, _contract(trigger={"timezone": "UTC'); import os #"}))
+        assert _generate(tmp_path, monkeypatch) == 2
+        assert not (tmp_path / "out").exists()
+
+        project = tmp_path / "plain"
+        write_project(project, _contract(trigger={"timezone": "Europe/Paris"}))
+        assert _generate(project, monkeypatch) == 0
+
+
+def _literal_connection(contract: str = DEMO_CONTRACT) -> str:
+    """The demo contract with a connection that names no variable at all."""
+    doc = yaml.safe_load(contract)
+    doc["builds"][0]["properties"]["source"]["connection"] = {
+        "host": "db.internal",
+        "port": 5432,
+        "database": "app",
+        "user": "fluid",
+    }
+    return yaml.safe_dump(doc, sort_keys=False)
+
+
+#: Variables the ``fluid apply`` code path reads that a scheduled run does not
+#: need, so the worker environment does not pass them.
+NOT_PASSED = {
+    "PRODUCTION": "only chooses a --safe-mode tip in the CLI banner",
+    "SOURCE_DATE_EPOCH": "tar mtimes for `fluid bundle`, which a scheduled apply never runs",
+    "USERPROFILE": "the Windows home directory; the DAG task runs under bash",
+    "VIRTUAL_ENV": (
+        "names the worker's own environment (Airflow's, in the apache/airflow image), "
+        "which fluid's python runner would then run builds with"
+    ),
+}
+
+_ENV_READERS = {"os.getenv", "getenv", "os.environ.get", "environ.get", "os.environ.pop"}
+_ENV_READERS |= {"os.environ.setdefault", "_env_int"}
+
+
+def _apply_path_modules() -> List[Path]:
+    """Every fluid_build module ``fluid apply`` can import: the static import
+    closure of the apply command, of every build runner and of every provider
+    (runners and providers are imported by name at run time)."""
+    package = Path(fluid_build.__file__).parent
+    root = package.parent
+
+    def to_file(module: str) -> Any:
+        base = root.joinpath(*module.split("."))
+        for candidate in (base / "__init__.py", base.with_suffix(".py")):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    todo = [package / "cli" / "apply.py"]
+    for sub in ("build_runners", "providers"):
+        todo.extend((package / sub).rglob("*.py"))
+    seen: Set[Path] = set()
+    while todo:
+        path = todo.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        parts = list(path.relative_to(root).with_suffix("").parts)
+        pkg = parts[:-1]
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            names: List[str] = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                base = pkg[: len(pkg) - node.level + 1] if node.level else []
+                module = ".".join(base + ([node.module] if node.module else []))
+                names = [module] + [f"{module}.{alias.name}" for alias in node.names]
+            for name in names:
+                if not name.startswith("fluid_build"):
+                    continue
+                dotted = name.split(".")
+                for depth in range(1, len(dotted) + 1):
+                    found = to_file(".".join(dotted[:depth]))
+                    if found is not None and found not in seen:
+                        todo.append(found)
+    return sorted(seen)
+
+
+def _env_names_read(paths: List[Path]) -> Set[str]:
+    """Literal variable names read through os.environ / os.getenv (or the
+    catalog registrars' ``_env`` helpers) in *paths*."""
+
+    def literal(node: ast.AST) -> Any:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    names: Set[str] = set()
+    for path in paths:
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            found: List[Any] = []
+            if isinstance(node, ast.Call) and node.args:
+                reader = ast.unparse(node.func)
+                if reader == "_env":  # _env(*names): the first one set wins
+                    found = [literal(arg) for arg in node.args]
+                elif reader in _ENV_READERS:  # any later argument is a default
+                    found = [literal(node.args[0])]
+            elif isinstance(node, ast.Subscript) and ast.unparse(node.value) == "os.environ":
+                found = [literal(node.slice)]
+            elif (
+                isinstance(node, ast.Compare)
+                and isinstance(node.ops[0], (ast.In, ast.NotIn))
+                and ast.unparse(node.comparators[0]) == "os.environ"
+            ):
+                found = [literal(node.left)]
+            names.update(n for n in found if isinstance(n, str) and n.isidentifier())
+    return names
+
+
+class TestTheWorkerPassesWhatFluidReads:
+    """Measured: a contract that names its password as ``secretRef:
+    env://PGPASSWORD`` (schema-valid, and what the schema recommends) got a
+    DAG whose run started fluid without PGPASSWORD, and fluid's resolver
+    failed with "environment variable not set". The dbt profiles read
+    PGPASSWORD, REDSHIFT_* and ATHENA_* straight from the environment and
+    were dropped too."""
+
+    @pytest.mark.parametrize("name", ["PGPASSWORD", "ORDERS_DB_PASSWORD"])
+    def test_a_secret_ref_resolves_on_the_worker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        templated = 'password: "{{ env.PGPASSWORD }}"'  # pragma: allowlist secret
+        contract = DEMO_CONTRACT.replace(templated, f'secretRef: "env://{name}"')
+        write_project(tmp_path, contract)
+        assert _generate(tmp_path, monkeypatch) == 0
+        loaded = load_dag((tmp_path / "out" / DAG_FILE).read_text(), monkeypatch)
+        assert name in loaded.namespace["CONTRACT_ENV_NAMES"].split()
+
+        resolve = (
+            "from fluid_build.build_runners._acquisition_common import resolve_secret_ref\n"
+            f"ok = resolve_secret_ref('env://{name}') == 'pg-secret'\n"
+            "(RECORD / 'resolved').write_text(str(ok))\n"
+        )
+        run = run_task(
+            loaded.tasks[0],
+            tmp_path,
+            {"FLUID_PROJECT_DIR": str(tmp_path), name: "pg-secret"},
+            stub=python_stub(resolve),
+        )
+        assert run.returncode == 0, run.stderr
+        assert (tmp_path / "record" / "resolved").read_text() == "True"
+
+    def test_a_dbt_postgres_build_gets_its_connection_from_the_worker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        dbt_build = {
+            "id": "transform_orders",
+            "pattern": "embedded-logic",
+            "engine": "dbt",
+            "execution": {
+                "trigger": {"type": "schedule", "schedule": "0 3 * * *"},
+                "runtime": {"platform": "postgres", "resources": {"schema": "analytics"}},
+            },
+        }
+        write_project(tmp_path, _contract(builds=[dbt_build]))
+        assert _generate(tmp_path, monkeypatch) == 0
+        loaded = load_dag((tmp_path / "out" / "transform_orders_dag.py").read_text(), monkeypatch)
+        assert loaded.namespace["CONTRACT_ENV_NAMES"] == ""
+
+        profile = (
+            "import json, yaml\n"
+            "from fluid_build.build_runners.dbt.profiles import _build_generated_dbt_profile\n"
+            "build = yaml.safe_load(open(sys.argv[2]))['builds'][0]\n"
+            "profile = _build_generated_dbt_profile(build, {'profile': 'orders'})\n"
+            "(RECORD / 'profile.json').write_text(json.dumps(profile))\n"
+        )
+        run = run_task(
+            loaded.tasks[0],
+            tmp_path,
+            {
+                "FLUID_PROJECT_DIR": str(tmp_path),
+                "PGHOST": "db.internal",
+                "PGPORT": "5433",
+                "PGUSER": "fluid",
+                "PGPASSWORD": "pg-secret",  # pragma: allowlist secret
+                "PGDATABASE": "warehouse",
+                "PGSSLMODE": "require",
+            },
+            stub=python_stub(profile),
+        )
+        assert run.returncode == 0, run.stderr
+        written = json.loads((tmp_path / "record" / "profile.json").read_text())
+        assert written["orders"]["outputs"]["dev"] == {
+            "type": "postgres",
+            "host": "db.internal",
+            "user": "fluid",
+            "password": "pg-secret",  # pragma: allowlist secret
+            "port": 5433,
+            "dbname": "warehouse",
+            "schema": "analytics",
+            "threads": 4,
+            "sslmode": "require",
+        }
+
+    def test_every_variable_the_apply_path_reads_reaches_fluid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        read = _env_names_read(_apply_path_modules())
+        # The scan found the code it is meant to read, and every exception
+        # is still something fluid reads.
+        assert {"PGPASSWORD", "REDSHIFT_PASSWORD", "VAULT_TOKEN", "AWS_REGION"} <= read
+        assert set(NOT_PASSED) <= read
+
+        write_project(tmp_path, _literal_connection())
+        assert _generate(tmp_path, monkeypatch) == 0
+        loaded = load_dag((tmp_path / "out" / DAG_FILE).read_text(), monkeypatch)
+        assert loaded.namespace["CONTRACT_ENV_NAMES"] == ""
+        worker = {name: "C" for name in read if name not in ("PATH", "HOME")}
+        run = run_task(loaded.tasks[0], tmp_path, {**worker, "FLUID_PROJECT_DIR": str(tmp_path)})
+        assert run.returncode == 0, run.stderr
+        dropped = sorted(read - set(NOT_PASSED) - set(run.env))
+        assert not dropped, (
+            f"fluid reads {dropped} but a scheduled run would not pass them: add them to "
+            "PASSTHROUGH_PREFIXES or PASSTHROUGH_NAMES in "
+            "fluid_build/schedulers/airflow/fluid_apply.py, or to NOT_PASSED here with "
+            "the reason a scheduled apply does not need them"
+        )

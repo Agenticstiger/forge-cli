@@ -196,7 +196,29 @@ env > "$FLUID_RECORD/env"
 """
 
 
-def run_task(task: Dict[str, Any], tmp_path: Path, worker_env: Dict[str, str]) -> TaskRun:
+def python_stub(body: str) -> str:
+    """A ``fluid`` stub that runs *body* with this interpreter (so with
+    fluid_build importable) after recording argv, cwd and environment the
+    way :data:`FLUID_STUB` does. *body* sees ``RECORD``, a ``Path``."""
+    return (
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "RECORD = Path(os.environ['FLUID_RECORD'])\n"
+        "(RECORD / 'argv').write_text('\\n'.join(sys.argv[1:]) + '\\n')\n"
+        "(RECORD / 'cwd').write_text(os.getcwd() + '\\n')\n"
+        "(RECORD / 'env').write_text(''.join(f'{k}={v}\\n' for k, v in os.environ.items()))\n"
+        + body
+    )
+
+
+def run_task(
+    task: Dict[str, Any],
+    tmp_path: Path,
+    worker_env: Dict[str, str],
+    *,
+    stub: str = FLUID_STUB,
+) -> TaskRun:
     """Run a BashOperator task's command the way Airflow does."""
     bash = shutil.which("bash")
     if bash is None:
@@ -205,9 +227,9 @@ def run_task(task: Dict[str, Any], tmp_path: Path, worker_env: Dict[str, str]) -
     record.mkdir(exist_ok=True)
     bin_dir = tmp_path / "worker-bin"
     bin_dir.mkdir(exist_ok=True)
-    stub = bin_dir / "fluid"
-    stub.write_text(FLUID_STUB, encoding="utf-8")
-    stub.chmod(0o755)
+    stub_file = bin_dir / "fluid"
+    stub_file.write_text(stub, encoding="utf-8")
+    stub_file.chmod(0o755)
 
     env = {
         "PATH": os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"]),

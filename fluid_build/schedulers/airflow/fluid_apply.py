@@ -37,17 +37,23 @@ Rendering rules:
   values (build id, env, contract path) reach it only as environment
   variables set through ``env=`` with ``append_env=True`` and are expanded
   inside double quotes, which is what the Airflow docs recommend for values
-  that did not come from the DAG author. They are also validated to a grammar
-  with no quotes, ``$``, ``{``, ``%``, ``#`` or whitespace, so neither the
-  shell nor Airflow's Jinja rendering of ``bash_command`` and ``env`` can
-  interpret them.
+  that did not come from the DAG author. They are also validated, whole
+  string, to a grammar with no quotes, ``$``, ``{``, ``%``, ``#`` or
+  whitespace (a trailing newline included), so neither the shell nor
+  Airflow's Jinja rendering of ``bash_command`` and ``env`` can interpret
+  them.
 * No secret is ever written into the DAG. The env dict holds ids and the
-  NAMES of the ``{{ env.X }}`` variables the contract reads; the values
-  come from the worker's environment at run time. fluid is started with
-  ``env -i`` and only the variables ``fluid apply`` needs; a name starting
-  ``AIRFLOW`` never passes, even when the contract asks for it, so the
-  Airflow worker's own secrets (``AIRFLOW__*``, ``AIRFLOW_CONN_*``, the
-  Fernet key) never reach the fluid process.
+  NAMES of the variables the contract reads (``{{ env.X }}``, ``${X}``,
+  ``secretRef: env://X``); the values come from the worker's environment at
+  run time. fluid is started with ``env -i`` and only the variables
+  ``fluid apply`` reads (:data:`PASSTHROUGH_PREFIXES`,
+  :data:`PASSTHROUGH_NAMES`); a name starting ``AIRFLOW`` never passes, even
+  when the contract asks for it, so the Airflow worker's own secrets
+  (``AIRFLOW__*``, ``AIRFLOW_CONN_*``, the Fernet key) never reach the fluid
+  process.
+* The cron is checked to the grammar croniter, Airflow's cron parser,
+  accepts (see :func:`_validate_schedule`), so a schedule Airflow would
+  refuse fails generation instead of the DAG import.
 * ``skip_on_exit_code=None``: a fluid exit status of 99 must fail the task,
   not mark it skipped.
 * ``max_active_runs=1`` and ``catchup=False``: two applies of one build never
@@ -62,7 +68,7 @@ from __future__ import annotations
 import re
 import zoneinfo
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
 from fluid_build.providers.common.codegen_utils import py_str_literal
@@ -85,27 +91,51 @@ PROJECT_DIR_ENV = "FLUID_PROJECT_DIR"
 DEFAULT_RETRIES = 3
 MAX_RETRIES = 10
 
-#: Variable families that reach ``fluid apply`` from the worker environment:
-#: fluid's own settings and the credentials of the platforms it deploys to.
-PASSTHROUGH_FAMILIES = (
-    "FLUID",
-    "AWS",
-    "GOOGLE",
-    "GCP",
-    "GCLOUD",
-    "CLOUDSDK",
-    "AZURE",
-    "ARM",
-    "SNOWFLAKE",
-    "DATABRICKS",
-    "DBT",
-    "TF",
-    "OPENLINEAGE",
-    "OTEL",
+#: Name prefixes of the variables that reach ``fluid apply`` from the worker
+#: environment. With :data:`PASSTHROUGH_NAMES` this is the registry of what
+#: fluid reads from its environment while it applies and builds: a test scans
+#: every module ``fluid apply`` imports (build runners and providers included)
+#: and fails on a variable it reads that neither lets through, so a new
+#: ``os.getenv`` cannot be silently dropped on the worker.
+PASSTHROUGH_PREFIXES = (
+    # fluid's own settings (FLUID_STATE_BACKEND, FLUID_SECRETS_FILE, ...)
+    "FLUID_",
+    # cloud and warehouse credentials, projects and regions
+    "AWS_",
+    "GOOGLE_",
+    "GCP_",
+    "GCLOUD_",
+    "CLOUDSDK_",
+    "AZURE_",
+    "ARM_",
+    "SNOWFLAKE_",
+    "DATABRICKS_",
+    # libpq (PGHOST, PGPASSWORD, PGSSLMODE, ...) and the dbt profiles built
+    # for postgres, redshift and athena
+    "PG",
+    "POSTGRES_",
+    "REDSHIFT_",
+    "ATHENA_",
+    # vault:// secretRefs (VAULT_ADDR, VAULT_TOKEN)
+    "VAULT_",
+    # build engines and catalog registration
+    "DBT_",
+    "DLT_",
+    "DATAHUB_",
+    "DMM_",
+    "ODCS_",
+    "ODPS_",
+    "TF_",
+    "OPENLINEAGE_",
+    "OTEL_",
 )
 
 #: Individual variables that reach ``fluid apply``: process basics, locale,
-#: CA bundles and proxies.
+#: CA bundles, proxies, and the few unprefixed names fluid reads.
+#: ``VIRTUAL_ENV`` is left out on purpose: on a worker it names Airflow's
+#: environment (the apache/airflow image sets it to ``/home/airflow/.local``),
+#: and fluid's python runner would then run builds with Airflow's interpreter
+#: instead of the one fluid runs under.
 PASSTHROUGH_NAMES = (
     "PATH",
     "HOME",
@@ -127,6 +157,11 @@ PASSTHROUGH_NAMES = (
     "http_proxy",
     "https_proxy",
     "no_proxy",
+    "GLUE_ROLE_ARN",
+    "S3_STAGING_DIR",
+    "S3_DATA_DIR",
+    "GOOG_SERVICE_ACCOUNT_NAME",
+    "TESTCONTAINERS_HOST_OVERRIDE",
 )
 
 # Airflow's dag_id grammar is ``^[\w.-]+$`` with a 250 character cap.
@@ -135,13 +170,51 @@ _MAX_DAG_ID = 250
 _CRON_PRESETS = frozenset(
     {"@once", "@hourly", "@daily", "@weekly", "@monthly", "@yearly", "@annually", "@midnight"}
 )
-_CRON_FIELD_RE = re.compile(r"^[0-9A-Za-z*/,?#\-]+$")
-_TIMEZONE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_+\-]*(?:/[A-Za-z0-9_+\-]+){0,3}$")
-_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*$")
+# The five cron fields as croniter, which Airflow validates every cron
+# schedule with, reads them: (name, lowest, highest, names). Day of week 7 is
+# Sunday, like 0.
+_CRON_FIELDS: Tuple[Tuple[str, int, int, Dict[str, int]], ...] = (
+    ("minute", 0, 59, {}),
+    ("hour", 0, 23, {}),
+    ("day of month", 1, 31, {}),
+    (
+        "month",
+        1,
+        12,
+        {
+            name: number
+            for number, name in enumerate(
+                ("jan", "feb", "mar", "apr", "may", "jun")
+                + ("jul", "aug", "sep", "oct", "nov", "dec"),
+                start=1,
+            )
+        },
+    ),
+    (
+        "day of week",
+        0,
+        7,
+        {
+            name: number
+            for number, name in enumerate(("sun", "mon", "tue", "wed", "thu", "fri", "sat"))
+        },
+    ),
+)
+_DAY_OF_MONTH, _DAY_OF_WEEK = 2, 4
+_CRON_NUMBER_RE = re.compile(r"[0-9]{1,2}")
+_CRON_STEP_RE = re.compile(r"[1-9][0-9]{0,2}")
+_CRON_NTH = frozenset("12345")
+_TIMEZONE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+\-]*(?:/[A-Za-z0-9_+\-]+){0,3}")
+_PATH_SEGMENT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*")
 _MAX_CONTRACT_PATH = 512
-# Same placeholder grammar the providers resolve (``{{ env.NAME }}``),
-# restricted to names a shell can hold.
+# The three ways a contract names a variable fluid reads, restricted to names
+# a shell can hold: the ``{{ env.NAME }}`` placeholder the loader and providers
+# resolve, the ``${NAME}`` placeholder the schema documents (dbt sources turn
+# it into ``env_var``), and an ``env://NAME`` secretRef, which
+# ``resolve_secret_ref`` reads straight from the environment.
 _ENV_TEMPLATE_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+_SHELL_TEMPLATE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_ENV_SECRET_REF_RE = re.compile(r"\s*env\s*://\s*([A-Za-z_][A-Za-z0-9_]*)\s*", re.IGNORECASE)
 
 
 class ScheduleRenderError(ValueError):
@@ -214,7 +287,53 @@ def uses_fluid_apply_dags(contract: Dict[str, Any], *, engine: Optional[str]) ->
     )
 
 
+def _cron_value_ok(token: str, index: int) -> bool:
+    _, low, high, names = _CRON_FIELDS[index]
+    if _CRON_NUMBER_RE.fullmatch(token):
+        return low <= int(token) <= high
+    return token in names
+
+
+def _cron_element_ok(element: str, index: int) -> bool:
+    """One comma-separated element: ``*``, ``N``, ``N-M``, any of those with
+    ``/step``, ``L`` (last day of the month) or ``DAY#n`` (nth weekday)."""
+    if index == _DAY_OF_MONTH and element == "l":
+        return True
+    if index == _DAY_OF_WEEK and "#" in element:
+        day, _, nth = element.partition("#")
+        return _cron_value_ok(day, index) and nth in _CRON_NTH
+    base, slash, step = element.partition("/")
+    if slash and not _CRON_STEP_RE.fullmatch(step):
+        return False
+    if base == "*":
+        return True
+    low, dash, high = base.partition("-")
+    return _cron_value_ok(low, index) and (not dash or _cron_value_ok(high, index))
+
+
+def _cron_field_ok(field: str, index: int) -> bool:
+    text = field.lower()
+    if text == "?":
+        # croniter takes ``?`` alone, and only for the two day fields.
+        return index in (_DAY_OF_MONTH, _DAY_OF_WEEK)
+    elements = text.split(",")
+    # croniter refuses a day-of-week list that mixes ``DAY#n`` with plain days.
+    if index == _DAY_OF_WEEK and 0 < sum("#" in e for e in elements) < len(elements):
+        return False
+    return all(_cron_element_ok(e, index) for e in elements)
+
+
 def _validate_schedule(value: Any, build_id: str) -> str:
+    """Return the trigger's cron, or raise when Airflow would not load it.
+
+    Airflow parses a cron ``schedule=`` with croniter and refuses the whole
+    DAG file when it does not parse, so a schedule is checked here to the
+    same grammar: an Airflow preset, or five fields within their ranges
+    (month and weekday names, ``*``, lists, ranges, steps, ``?``, ``L`` in
+    the day of month, ``DAY#1``..``DAY#5`` in the day of week). A sixth
+    field is refused: croniter reads it as seconds, a Quartz cron puts the
+    seconds first, and the two disagree on when the build runs.
+    """
     if not isinstance(value, str):
         raise ScheduleRenderError(
             f"build {build_id!r}: trigger schedule must be a string, got {type(value).__name__}"
@@ -223,20 +342,39 @@ def _validate_schedule(value: Any, build_id: str) -> str:
     if text.lower() in _CRON_PRESETS:
         return text.lower()
     fields = text.split()
-    if len(fields) not in (5, 6) or not all(_CRON_FIELD_RE.match(f) for f in fields):
+    if len(fields) != len(_CRON_FIELDS):
         raise ScheduleRenderError(
-            f"build {build_id!r}: trigger schedule {value!r} is not a cron expression "
-            "(5 or 6 fields) or an Airflow preset such as @daily"
+            f"build {build_id!r}: trigger schedule {value!r} is not a five-field cron "
+            "expression (minute hour day-of-month month day-of-week) or an Airflow preset "
+            "such as @daily"
+        )
+    for index, field in enumerate(fields):
+        if not _cron_field_ok(field, index):
+            raise ScheduleRenderError(
+                f"build {build_id!r}: trigger schedule {value!r}: {field!r} is not a valid "
+                f"{_CRON_FIELDS[index][0]} field (values {_CRON_FIELDS[index][1]}-"
+                f"{_CRON_FIELDS[index][2]})"
+            )
+    # croniter parses ``DAY#n`` next to a day of month, then never finds a
+    # next run, so the scheduler fails on it after the DAG has loaded.
+    if "#" in fields[_DAY_OF_WEEK] and fields[_DAY_OF_MONTH] not in ("*", "?"):
+        raise ScheduleRenderError(
+            f"build {build_id!r}: trigger schedule {value!r}: a DAY#n day of week needs "
+            "* or ? as the day of month"
         )
     return " ".join(fields)
 
 
 def _validate_timezone(value: Any, build_id: str) -> str:
     tz = "UTC" if value in (None, "") else value
-    if not isinstance(tz, str) or not _TIMEZONE_RE.match(tz):
+    if not isinstance(tz, str) or not _TIMEZONE_RE.fullmatch(tz):
         raise ScheduleRenderError(f"build {build_id!r}: trigger timezone {value!r} is not valid")
     try:
         zoneinfo.ZoneInfo(tz)
+    except ValueError as exc:  # ZoneInfoNotFoundError is a KeyError, not this
+        raise ScheduleRenderError(
+            f"build {build_id!r}: trigger timezone {tz!r} is not an IANA zone"
+        ) from exc
     except zoneinfo.ZoneInfoNotFoundError as exc:
         # A host without a tz database cannot judge; Airflow will.
         if zoneinfo.available_timezones():
@@ -274,8 +412,8 @@ def scheduled_builds(contract: Dict[str, Any]) -> List[ScheduledBuild]:
             continue
         raw_id: Any = build.get("id")
         try:
-            build_id = validate_identifier(raw_id, kind="build.id")
-        except IdentifierViolation as exc:
+            build_id = validate_id(raw_id, kind="build.id")
+        except ScheduleRenderError as exc:
             raise ScheduleRenderError(
                 f"a scheduled build needs a valid id for --build-id: {exc}"
             ) from exc
@@ -293,9 +431,11 @@ def scheduled_builds(contract: Dict[str, Any]) -> List[ScheduledBuild]:
 
 
 def contract_env_names(contract: Any) -> List[str]:
-    """Names of the ``{{ env.NAME }}`` variables the contract reads, sorted.
+    """Names of the variables the contract tells fluid to read, sorted.
 
-    Names only; values are read on the worker at run time.
+    ``{{ env.NAME }}`` and ``${NAME}`` placeholders anywhere in the contract,
+    and ``env://NAME`` secretRefs. Names only; values are read on the worker
+    at run time.
     """
     names: Set[str] = set()
     stack: List[Any] = [contract]
@@ -305,8 +445,12 @@ def contract_env_names(contract: Any) -> List[str]:
             stack.extend(node.values())
         elif isinstance(node, list):
             stack.extend(node)
-        elif isinstance(node, str) and "{{" in node:
+        elif isinstance(node, str):
             names.update(_ENV_TEMPLATE_RE.findall(node))
+            names.update(_SHELL_TEMPLATE_RE.findall(node))
+            secret_ref = _ENV_SECRET_REF_RE.fullmatch(node)
+            if secret_ref:
+                names.add(secret_ref.group(1))
     return sorted(names)
 
 
@@ -324,7 +468,7 @@ def validate_contract_path(raw: Any) -> str:
             f"contract path {raw!r} must be a relative POSIX path inside the project"
         )
     parts = [p for p in raw.split("/") if p not in ("", ".")]
-    if not parts or not all(_PATH_SEGMENT_RE.match(p) for p in parts):
+    if not parts or not all(_PATH_SEGMENT_RE.fullmatch(p) for p in parts):
         raise ScheduleRenderError(
             f"contract path {raw!r} may only hold segments of [A-Za-z0-9_.-] that do "
             "not start with '.' or '-'"
@@ -332,12 +476,25 @@ def validate_contract_path(raw: Any) -> str:
     return "/".join(parts)
 
 
-def validate_env_name(raw: Any) -> str:
-    """Validate the overlay env the scheduled run passes to ``--env``."""
+def validate_id(raw: Any, *, kind: str) -> str:
+    """:func:`validate_identifier`, refusing a trailing newline as well.
+
+    The shared grammar ends in ``$``, which also matches before a final
+    ``\\n``; an id or env that carries one names nothing fluid can find
+    (``--env 'aws\\n'`` silently applies no overlay).
+    """
     try:
-        return validate_identifier(raw, kind="env")
+        value = validate_identifier(raw, kind=kind)
     except IdentifierViolation as exc:
         raise ScheduleRenderError(str(exc)) from exc
+    if "\n" in value:
+        raise ScheduleRenderError(f"{kind} {raw!r} is not a valid identifier (it holds a newline)")
+    return value
+
+
+def validate_env_name(raw: Any) -> str:
+    """Validate the overlay env the scheduled run passes to ``--env``."""
+    return validate_id(raw, kind="env")
 
 
 def dag_id_for(product_id: str, build_id: str) -> str:
@@ -360,7 +517,7 @@ def dag_filename_for(build_id: str) -> str:
 # Rendering
 # ---------------------------------------------------------------------------
 
-_FAMILY_PATTERN = "|".join(f"{family}_*" for family in PASSTHROUGH_FAMILIES)
+_PREFIX_PATTERN = "|".join(f"{prefix}*" for prefix in PASSTHROUGH_PREFIXES)
 
 # Static: identical in every DAG, and free of contract-derived text. Must not
 # contain ``{{``, ``{%`` or ``{#`` (Airflow renders it as a Jinja template)
@@ -382,7 +539,7 @@ BASH_SCRIPT_LINES = (
     # Airflow's own namespace never passes, even when a contract's
     # ``{{ env.X }}`` or FLUID_DAG_ENV_PASSTHROUGH names it.
     "    AIRFLOW*) continue ;;",
-    f"    {_FAMILY_PATTERN}) ;;",
+    f"    {_PREFIX_PATTERN}) ;;",
     '    *) case "$keep" in *" $name "*) ;; *) continue ;; esac ;;',
     "  esac",
     '  pass+=("$name=${!name}")',
@@ -434,8 +591,8 @@ _DAG_DOC = (
     "- The credentials the apply needs are in the worker environment. Only\n"
     "  these reach the fluid process:\n"
     "\n" + _wrap(list(PASSTHROUGH_NAMES), "    ") + "\n\n"
-    "  the families\n"
-    "\n" + _wrap([f"{family}_*" for family in PASSTHROUGH_FAMILIES], "    ") + "\n\n"
+    "  every name matching\n"
+    "\n" + _wrap([f"{prefix}*" for prefix in PASSTHROUGH_PREFIXES], "    ") + "\n\n"
     "  the variables the contract reads (CONTRACT_ENV_NAMES), and any names\n"
     "  listed, space separated, in FLUID_DAG_ENV_PASSTHROUGH. fluid starts with\n"
     "  nothing else, and never with a variable whose name starts AIRFLOW.\n"
@@ -530,10 +687,7 @@ def render_fluid_apply_dags(
     path relative to ``$FLUID_PROJECT_DIR``.
     """
     raw_id: Any = contract.get("id")
-    try:
-        product_id = validate_identifier(raw_id, kind="contract.id")
-    except IdentifierViolation as exc:
-        raise ScheduleRenderError(str(exc)) from exc
+    product_id = validate_id(raw_id, kind="contract.id")
     env_value = validate_env_name(env) if env else None
     rel_path = validate_contract_path(contract_path)
     env_names = contract_env_names(contract)
@@ -561,8 +715,8 @@ __all__ = [
     "BASH_SCRIPT_LINES",
     "DEFAULT_CONTRACT_PATH",
     "DEFAULT_ENGINE",
-    "PASSTHROUGH_FAMILIES",
     "PASSTHROUGH_NAMES",
+    "PASSTHROUGH_PREFIXES",
     "PROJECT_DIR_ENV",
     "ScheduleRenderError",
     "ScheduledBuild",
@@ -577,4 +731,5 @@ __all__ = [
     "uses_fluid_apply_dags",
     "validate_contract_path",
     "validate_env_name",
+    "validate_id",
 ]

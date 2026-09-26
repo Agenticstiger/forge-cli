@@ -30,7 +30,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 import pytest
 
@@ -45,6 +45,16 @@ from tests.cli._schedule_dag_fixtures import (
 
 LOG = logging.getLogger("test.artifact_fanout_schedule")
 DAG_REL = "schedule/bronze.customer_subscriptions/ingest_subscriptions_dag.py"
+
+#: An aws overlay that also moves the schedule, so the DAG shows which
+#: contract it was rendered from.
+AWS_SCHEDULE_OVERLAY = "builds:\n  - execution:\n      trigger:\n        schedule: '30 1 * * *'\n"
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_fluid_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stage 3 reads $FLUID_ENV when --env is absent; start every test without it."""
+    monkeypatch.delenv("FLUID_ENV", raising=False)
 
 
 def _stage3(project: Path, monkeypatch: pytest.MonkeyPatch, *argv: str) -> int:
@@ -149,8 +159,7 @@ class TestTheDemoDagReachesTheManifest:
         # An overlay that moves the schedule: the DAG must run on the one
         # ``fluid apply --env aws`` will see.
         (contract.parent / "overlays" / "aws.yaml").write_text(
-            "builds:\n  - execution:\n      trigger:\n        schedule: '30 1 * * *'\n",
-            encoding="utf-8",
+            AWS_SCHEDULE_OVERLAY, encoding="utf-8"
         )
         argv = (DEMO_CONTRACT_PATH, "--out", "dist/artifacts", "--env", "aws")
         assert _stage3(tmp_path, monkeypatch, *argv) == 0
@@ -172,7 +181,9 @@ class TestTheGate:
         [
             ("--env", "aws;rm -rf ."),
             ("--env", "../../overlays/x"),
+            ("--env", "aws\n"),
             ("--contract-path", "../outside/contract.fluid.yaml"),
+            ("--contract-path", DEMO_CONTRACT_PATH + "\n"),
         ],
     )
     def test_a_bad_env_or_path_is_refused_before_old_artifacts_are_removed(
@@ -189,3 +200,99 @@ class TestTheGate:
         assert exc.value.event == "generate_artifacts_failed"
         assert exc.value.context["emit_key"] == "schedule"
         assert previous.read_text() == "kept\n"
+
+    def test_a_malformed_overlay_fails_stage_3_instead_of_dropping_the_schedule(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Measured: rc 0, "files: 5", no DAG, and a skip event claiming the
+        # contract had no engine and no trigger.
+        contract = write_project(tmp_path)
+        (contract.parent / "overlays" / "broken.yaml").write_text(
+            "exposes:\n  - binding: [unclosed\n", encoding="utf-8"
+        )
+        with pytest.raises(CLIError) as exc:
+            _stage3(
+                tmp_path,
+                monkeypatch,
+                DEMO_CONTRACT_PATH,
+                "--out",
+                "dist/artifacts",
+                "--env",
+                "broken",
+            )
+        assert exc.value.event == "generate_artifacts_failed"
+        assert exc.value.context["emit_key"] == "schedule"
+        assert "broken" in exc.value.context["error"]
+
+
+def _warned(caplog: pytest.LogCaptureFixture) -> bool:
+    return any(
+        r.getMessage() == "generate_artifacts_schedule_env_defaulted" for r in caplog.records
+    )
+
+
+class TestTheEnvMatchesThePipelines:
+    """Measured: the generated pipelines apply with ``--env "${FLUID_ENV:-dev}"``
+    while stage 3 ran without ``--env``, so the DAG applied the base contract
+    (platform local, not aws) with no warning."""
+
+    def test_without_env_stage_3_uses_fluid_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        contract = write_project(tmp_path)
+        (contract.parent / "overlays" / "aws.yaml").write_text(
+            AWS_SCHEDULE_OVERLAY, encoding="utf-8"
+        )
+        monkeypatch.setenv("FLUID_ENV", "aws")
+        assert _stage3(tmp_path, monkeypatch, DEMO_CONTRACT_PATH, "--out", "dist/artifacts") == 0
+        loaded = load_dag((tmp_path / "dist" / "artifacts" / DAG_REL).read_text(), monkeypatch)
+        assert loaded.namespace["FLUID_ENV_NAME"] == "aws"
+        assert loaded.dag["schedule"] == "30 1 * * *"
+
+    def test_the_flag_beats_fluid_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        write_project(tmp_path)
+        monkeypatch.setenv("FLUID_ENV", "gcp")
+        argv = (DEMO_CONTRACT_PATH, "--out", "dist/artifacts", "--env", "aws")
+        assert _stage3(tmp_path, monkeypatch, *argv) == 0
+        loaded = load_dag((tmp_path / "dist" / "artifacts" / DAG_REL).read_text(), monkeypatch)
+        assert loaded.namespace["FLUID_ENV_NAME"] == "aws"
+
+    @pytest.mark.parametrize("fluid_env", [None, ""])
+    def test_no_env_for_a_contract_with_overlays_warns(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        fluid_env: Any,
+    ) -> None:
+        write_project(tmp_path)
+        if fluid_env is not None:
+            monkeypatch.setenv("FLUID_ENV", fluid_env)
+        with caplog.at_level(logging.WARNING, logger=LOG.name):
+            assert (
+                _stage3(tmp_path, monkeypatch, DEMO_CONTRACT_PATH, "--out", "dist/artifacts") == 0
+            )
+        assert _warned(caplog)
+        loaded = load_dag((tmp_path / "dist" / "artifacts" / DAG_REL).read_text(), monkeypatch)
+        assert loaded.namespace["FLUID_ENV_NAME"] == ""
+
+    def test_no_env_is_quiet_without_overlays_or_when_asked_for(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        plain = tmp_path / "plain"
+        write_project(plain, overlay=False)
+        with caplog.at_level(logging.WARNING, logger=LOG.name):
+            assert _stage3(plain, monkeypatch, DEMO_CONTRACT_PATH, "--out", "dist/artifacts") == 0
+        assert not _warned(caplog)
+
+        overlaid = tmp_path / "overlaid"
+        write_project(overlaid)
+        monkeypatch.setenv("FLUID_ENV", "aws")
+        argv = (DEMO_CONTRACT_PATH, "--out", "dist/artifacts", "--env", "")
+        with caplog.at_level(logging.WARNING, logger=LOG.name):
+            assert _stage3(overlaid, monkeypatch, *argv) == 0
+        assert not _warned(caplog)
+        dag = overlaid / "dist" / "artifacts" / DAG_REL
+        assert load_dag(dag.read_text(), monkeypatch).namespace["FLUID_ENV_NAME"] == ""

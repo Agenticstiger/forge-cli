@@ -10,7 +10,7 @@ builds:
     execution:
       trigger:
         type: schedule          # or no type at all
-        schedule: "0 */4 * * *" # `cron:` is accepted too
+        schedule: "0 */4 * * *" # `cron:` is accepted too; five fields or a preset
         timezone: Europe/Paris  # default UTC
       retries:
         maxAttempts: 4          # Airflow retries = maxAttempts - 1 (default 3, max 10)
@@ -48,6 +48,32 @@ dist/artifacts/schedule/<contract id>/<build id>_dag.py
 The DAG is hashed into `dist/artifacts/MANIFEST.json` like every other
 artifact, and a rerun of stage 3 replaces it.
 
+Stage 3 fails (exit 1, `generate_artifacts_failed`, `emit_key: schedule`)
+rather than skip the schedule when the contract reads but does not load,
+for example a malformed overlay for the `--env` given. Only a contract file
+that cannot be read at all skips it (`generate_artifacts_skip_schedule_unreadable`).
+
+### The schedule
+
+`schedule` is an Airflow preset (`@once @hourly @daily @weekly @monthly
+@yearly @annually @midnight`) or a five-field cron, checked to the grammar
+Airflow parses it with (croniter), so a schedule Airflow would refuse fails
+generation (exit 2) instead of the DAG import:
+
+| Field | Values |
+|---|---|
+| minute | 0-59 |
+| hour | 0-23 |
+| day of month | 1-31, `L` (last day), `?` |
+| month | 1-12, `JAN`-`DEC` |
+| day of week | 0-7 (0 and 7 are Sunday), `SUN`-`SAT`, `DAY#1`..`DAY#5`, `?` |
+
+Each field takes `*`, lists, ranges (a range may wrap: `22-2`) and `/step`.
+`DAY#n` needs `*` or `?` as the day of month: croniter parses the pair and
+then never finds a next run. A six-field cron is refused, because croniter
+reads the sixth field as seconds while Quartz puts seconds first. `W`, `LW`,
+`L` in the day of week and `H` are not supported.
+
 ## What each run executes
 
 ```bash
@@ -64,7 +90,7 @@ Fixed when the DAG is generated:
 
 | Value | Stage 3 flag | Default |
 |---|---|---|
-| `--env` | `--env <env>` | none: the flag is left out |
+| `--env` | `--env <env>` | `$FLUID_ENV`, the variable the generated pipelines apply with (`--env "${FLUID_ENV:-dev}"`); when that is unset or empty, no `--env`, with the warning `generate_artifacts_schedule_env_defaulted` if the input is a bundle or the contract has overlays. `--env ''` means no `--env`, without the warning |
 | contract path | `--contract-path <path>` | the input's path relative to the current directory; `contract.fluid.yaml` (with a warning) for a bundle |
 | schedule, timezone, retries | from the build's trigger | |
 
@@ -88,15 +114,29 @@ Read on the worker at run time:
 ### The environment fluid sees
 
 Nothing secret is written into the DAG file. It holds ids, the contract
-path, the env name and the *names* of the `{{ env.NAME }}` variables the
-contract reads. fluid is started through `env -i` with only:
+path, the env name and the *names* of the variables the contract reads.
+fluid is started through `env -i` with only:
 
 - `PATH HOME USER LOGNAME LANG LANGUAGE LC_ALL LC_CTYPE TZ TMPDIR`, the CA
-  bundle variables and the proxy variables;
-- the `FLUID_* AWS_* GOOGLE_* GCP_* GCLOUD_* CLOUDSDK_* AZURE_* ARM_*
-  SNOWFLAKE_* DATABRICKS_* DBT_* TF_* OPENLINEAGE_* OTEL_*` families;
-- the variables the contract reads through `{{ env.NAME }}`;
+  bundle variables, the proxy variables, and
+  `GLUE_ROLE_ARN S3_STAGING_DIR S3_DATA_DIR GOOG_SERVICE_ACCOUNT_NAME
+  TESTCONTAINERS_HOST_OVERRIDE`;
+- every name matching `FLUID_* AWS_* GOOGLE_* GCP_* GCLOUD_* CLOUDSDK_*
+  AZURE_* ARM_* SNOWFLAKE_* DATABRICKS_* PG* POSTGRES_* REDSHIFT_* ATHENA_*
+  VAULT_* DBT_* DLT_* DATAHUB_* DMM_* ODCS_* ODPS_* TF_* OPENLINEAGE_*
+  OTEL_*` (`PG*` is libpq's `PGHOST`, `PGPASSWORD`, `PGSSLMODE` and the rest);
+- the variables the contract names through `{{ env.NAME }}`, `${NAME}` or a
+  `secretRef: env://NAME`;
 - the names in `FLUID_DAG_ENV_PASSTHROUGH`.
+
+That list is what fluid itself reads while it applies and builds: a test
+scans every module `fluid apply` imports (the build runners and providers
+included) and fails when one reads a variable the list would drop. A dbt
+project's own `env_var()` calls, or dlt's `SOURCES__*` / `DESTINATION__*`
+settings, are not fluid's to know: name those in `FLUID_DAG_ENV_PASSTHROUGH`.
+`VIRTUAL_ENV` is not passed: on a worker it names Airflow's environment (the
+apache/airflow image sets it), and fluid's python runner would run builds
+with that interpreter instead of its own.
 
 A name starting `AIRFLOW` never passes, even when the contract or
 `FLUID_DAG_ENV_PASSTHROUGH` names it, so the Airflow worker's own
