@@ -196,14 +196,14 @@ class PipelineConfig:
     # launchpads can ask ``fluid generate ci`` to emit the intended default
     # behavior directly instead of patching the generated Jenkinsfile text.
     #
-    # ``publish_include_env`` defaults to False because ``fluid publish``
-    # does NOT accept ``--env``; including it makes Stage 10 die with
-    # ``unrecognized arguments: --env dev``. Operators who add ``--env``
-    # support to ``fluid publish`` (or wrap it via a custom CLI alias) can
-    # opt in via ``--publish-include-env`` at generate time.
+    # ``publish_include_env`` defaults to True: ``fluid publish --env`` loads
+    # the contract with the same overlay stages 5-9 used, so a run for the
+    # aws overlay publishes the aws binding. ``--no-publish-include-env``
+    # keeps the old command for a CLI older than ``fluid publish --env``,
+    # which rejects the flag with ``unrecognized arguments: --env dev``.
     verify_strict_default: bool = True
     publish_stage_default: bool = False
-    publish_include_env: bool = False
+    publish_include_env: bool = True
 
     def __post_init__(self):
         if self.environments is None:
@@ -414,10 +414,14 @@ class BasePipelineTemplate:
                 'if [ -n "$DMM_API_URL" ] || [ -n "$PUBLISH_TARGETS" ]; then '
                 'if [ -n "$PUBLISH_TARGETS" ]; then '
                 'TARGETS=""; for t in $PUBLISH_TARGETS; do TARGETS="$TARGETS --target $t"; done; '
-                "fluid publish ${CONTRACT:-contract.fluid.yaml} $TARGETS; "
+                # ``--env`` is quoted: unquoted, a FLUID_ENV holding spaces
+                # word-splits into extra flags (``--target cc:<endpoint>``
+                # would send the API key elsewhere).
+                "fluid publish ${CONTRACT:-contract.fluid.yaml} $TARGETS "
+                '--env "${FLUID_ENV:-dev}"; '
                 "else "
                 "fluid publish ${CONTRACT:-contract.fluid.yaml} "
-                "--target ${CATALOG:-datamesh-manager}; "
+                '--target ${CATALOG:-datamesh-manager} --env "${FLUID_ENV:-dev}"; '
                 "fi; "
                 "fi"
             ),
@@ -892,10 +896,11 @@ class BasePipelineTemplate:
                     'if [ -n "${PUBLISH_TARGETS:-}" ]; then '
                     'TARGETS=""; for t in $PUBLISH_TARGETS; do '
                     'TARGETS="$TARGETS --target $t"; done; '
-                    'fluid publish "${CONTRACT:-contract.fluid.yaml}" $TARGETS; '
+                    'fluid publish "${CONTRACT:-contract.fluid.yaml}" $TARGETS '
+                    '--env "${FLUID_ENV:-dev}"; '
                     "else "
                     'fluid publish "${CONTRACT:-contract.fluid.yaml}" '
-                    '--target "${CATALOG:-datamesh-manager}"; '
+                    '--target "${CATALOG:-datamesh-manager}" --env "${FLUID_ENV:-dev}"; '
                     "fi"
                 ),
             ),
