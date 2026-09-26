@@ -12,22 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generated stage 6 plans for the mode generated stage 7 applies.
+"""Generated stages 1, 6 and 7 run the documented chain, and agree on the mode.
 
-``fluid plan`` stamps the mode into plan.json and ``fluid apply`` refuses a
-plan made for another one (``apply_plan_mode_mismatch``), before any build.
-The generators did not agree with themselves: the shared stage 6
-(``_stage_specs``, what Tekton, GitHub Actions, GitLab, Azure DevOps,
-Bitbucket and CircleCI render) planned with no ``--mode``, and both stage 7s
-appended a second ``--mode amend-and-build`` whenever APPLY_BUILD_ID was set.
-So every build run, and every non-amend APPLY_MODE, failed at stage 7.
+Stage 1 bundles the contract with ``--env``; stage 6 plans that bundle for
+APPLY_MODE; stage 7 applies stage 6's plan with ``--bundle`` in the same
+mode. ``fluid plan`` stamps the mode into plan.json and ``fluid apply``
+refuses a plan made for another one (``apply_plan_mode_mismatch``), before
+any build, and refuses ``--build-id`` with a mode that runs no build
+(``apply_build_id_requires_build_mode``). So the mode is APPLY_MODE as
+given, never rewritten to fit a build id, and the build id is passed only
+with a build mode.
 
-Each case runs the RENDERED stage-6 and stage-7 shell bodies with ``sh``,
-with the CI system's parameters in the environment and a ``fluid`` stub on
+Each case runs the RENDERED stage bodies with ``sh``, with the CI system's
+parameters in the environment the way it exports them (Jenkins exports each
+build parameter as a variable of the same name) and a ``fluid`` stub on
 PATH that records its argv, then replays each recorded argv through the real
 ``fluid`` entry point (``fluid_build.cli.main``) in a workspace holding a
-small local contract. Jenkins' parameters are routed through the stage's own
-``environment {}`` block, as Jenkins does.
+small local contract. The parameterless case exports nothing: a Jenkins
+job's first build, and its first after a restart re-seeded it, runs so, and
+every stage must then fall back to the defaults the parameters declare.
 """
 
 from __future__ import annotations
@@ -39,7 +42,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 import pytest
 import yaml
@@ -91,72 +94,59 @@ _MODES = ["dry-run", "create-only", "amend", "amend-and-build", "replace", "repl
 _BUILD_MODES = {"amend-and-build", "replace-and-build"}
 
 
-def _tekton_stages() -> Dict[int, Tuple[Dict[str, str], str]]:
-    """Stage 6/7 ``script:`` bodies from the rendered Tekton tasks (``_stage_specs``).
+def _config(provider: PipelineProvider, **kwargs: object) -> PipelineConfig:
+    return PipelineConfig(
+        provider=provider,
+        complexity=PipelineComplexity.STANDARD,
+        contract_path=_C,
+        apply_build_id_default="make_rows",
+        **kwargs,
+    )
 
-    The shared stage specs read ``APPLY_MODE`` / ``APPLY_BUILD_ID`` from the
-    environment directly (GitHub Actions maps them at job level), so the
-    parameter-to-environment mapping is the identity.
-    """
-    cfg = PipelineConfig(provider=PipelineProvider.TEKTON, complexity=PipelineComplexity.STANDARD)
-    files = PipelineTemplateGenerator().generate_pipeline(cfg)
-    identity = {
-        name: name
-        for name in ("APPLY_MODE", "APPLY_BUILD_ID", "ALLOW_DATA_LOSS", "NO_VERIFY_DIGEST")
-    }
-    stages: Dict[int, Tuple[Dict[str, str], str]] = {}
+
+def _tekton_stages(**kwargs: object) -> Dict[int, str]:
+    """Stage 1/6/7 ``script:`` bodies from the rendered Tekton tasks (``_stage_specs``)."""
+    files = PipelineTemplateGenerator().generate_pipeline(
+        _config(PipelineProvider.TEKTON, **kwargs)
+    )
+    stages: Dict[int, str] = {}
     for doc in yaml.safe_load_all(files["tekton/tasks.yaml"]):
         for step in ((doc or {}).get("spec") or {}).get("steps") or []:
-            if step.get("name") in ("stage-6", "stage-7"):
-                stages[int(step["name"][-1])] = (identity, step["script"])
-    assert set(stages) == {6, 7}
+            match = re.fullmatch(r"stage-(\d+)", step.get("name") or "")
+            if match and int(match.group(1)) in (1, 6, 7):
+                stages[int(match.group(1))] = step["script"]
+    assert set(stages) == {1, 6, 7}
     return stages
 
 
-_JENKINS_PARAM = re.compile(r'^\s*(\w+)\s*=\s*"\$\{params\.(\w+)\}"\s*$', re.M)
-_JENKINS_TERNARY = re.compile(
-    r"^\s*(\w+)\s*=\s*\"\$\{params\.(\w+) \? '([^']*)' : '([^']*)'\}\"\s*$", re.M
-)
-
-
-def _jenkins_stages() -> Dict[int, Tuple[Dict[str, str], str]]:
-    """Stage 6/7 ``sh '''...'''`` bodies from the rendered Jenkinsfile, with each
-    stage's ``environment {}`` mapping (env var -> Jenkins parameter)."""
-    cfg = PipelineConfig(provider=PipelineProvider.JENKINS, complexity=PipelineComplexity.BASIC)
-    content = PipelineTemplateGenerator().generate_pipeline(cfg)["Jenkinsfile"]
-    stages: Dict[int, Tuple[Dict[str, str], str]] = {}
-    for num, label in ((6, "6 - plan"), (7, "7 - apply")):
+def _jenkins_stages(**kwargs: object) -> Dict[int, str]:
+    """Stage 1/6/7 ``sh '''...'''`` bodies from the rendered Jenkinsfile."""
+    content = PipelineTemplateGenerator().generate_pipeline(
+        _config(PipelineProvider.JENKINS, **kwargs)
+    )["Jenkinsfile"]
+    stages: Dict[int, str] = {}
+    for num, label in ((1, "1 - bundle"), (6, "6 - plan"), (7, "7 - apply")):
         body = content[content.index(f"stage('{label}')") :]
-        env_block = body[body.index("environment {\n") : body.index("steps {")]
-        mapping = {var: param for var, param in _JENKINS_PARAM.findall(env_block)}
-        for var, param, if_true, if_false in _JENKINS_TERNARY.findall(env_block):
-            mapping[var] = f"{param}?{if_true}:{if_false}"
+        # No stage re-assigns parameters in an ``environment {}`` block: the
+        # shell reads the variables Jenkins exports, with their defaults.
+        assert "environment {" not in body[: body.index("steps {")]
         sh_start = body.index("sh '''") + len("sh '''")
-        stages[num] = (mapping, body[sh_start : body.index("'''", sh_start)])
+        stages[num] = body[sh_start : body.index("'''", sh_start)]
     return stages
 
 
-def _stage_env(mapping: Dict[str, str], params: Dict[str, object]) -> Dict[str, str]:
-    env: Dict[str, str] = {}
-    for var, param in mapping.items():
-        if "?" in param:  # ``params.X ? 'a' : 'b'``
-            name, choices = param.split("?", 1)
-            if_true, if_false = choices.split(":", 1)
-            env[var] = if_true if params.get(name) else if_false
-        else:
-            value = params.get(param, "")
-            env[var] = str(value).lower() if isinstance(value, bool) else str(value)
-    return env
+def _exported(params: Dict[str, object]) -> Dict[str, str]:
+    """Parameters as a CI system exports them to the shell."""
+    return {k: str(v).lower() if isinstance(v, bool) else str(v) for k, v in params.items()}
 
 
 @pytest.fixture
 def ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    for var in ("FLUID_ENV", "APPLY_MODE", "APPLY_BUILD_ID", "APPLY_BUILD_ID_VAL", "CONTRACT"):
+    for var in ("FLUID_ENV", "APPLY_MODE", "APPLY_BUILD_ID", "CONTRACT"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.chdir(tmp_path)
     (tmp_path / "contracts" / "p").mkdir(parents=True)
     (tmp_path / _C).write_text(_CONTRACT, encoding="utf-8")
-    (tmp_path / "runtime").mkdir()
     stub_dir = tmp_path / "stub-bin"
     stub_dir.mkdir()
     stub = stub_dir / "fluid"
@@ -172,13 +162,13 @@ def ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _run_stage(ws: Path, script: str, env: Dict[str, str]) -> List[str]:
     """Run one rendered stage body with ``sh``; return the argv it gave ``fluid``."""
-    log = ws / "runtime" / "fluid-argv.jsonl"
+    log = ws / "fluid-argv.jsonl"
     log.unlink(missing_ok=True)
     shell_env = {
         "PATH": f"{ws / 'stub-bin'}{os.pathsep}{os.environ.get('PATH', '')}",
         "HOME": os.environ.get("HOME", str(ws)),
+        "WORKSPACE": str(ws),
         "FLUID_ARGV_LOG": str(log),
-        "CONTRACT": _C,
         **env,
     }
     subprocess.run(["sh", "-c", script], cwd=ws, env=shell_env, check=True)
@@ -187,10 +177,33 @@ def _run_stage(ws: Path, script: str, env: Dict[str, str]) -> List[str]:
     return calls[0]
 
 
-def _last_mode(argv: List[str]) -> str:
-    modes = [argv[i + 1] for i, tok in enumerate(argv[:-1]) if tok == "--mode"]
-    assert modes, argv
-    return modes[-1]  # argparse: the last occurrence wins
+def _flag(argv: List[str], name: str) -> Optional[str]:
+    values = [argv[i + 1] for i, tok in enumerate(argv[:-1]) if tok == name]
+    assert len(values) <= 1, argv  # one --mode, one --build-id: nothing overridden
+    return values[0] if values else None
+
+
+def _run_chain(ws: Path, stages: Dict[int, str], env: Dict[str, str]) -> List[str]:
+    """Stages 1, 6, 7 through the stub, each replayed for real; stage 7's argv."""
+    bundle_argv = _run_stage(ws, stages[1], env)
+    assert bundle_argv[:2] == ["bundle", _C]
+    assert _flag(bundle_argv, "--env") == env.get("FLUID_ENV", "dev")
+    assert fluid_main(bundle_argv) == 0
+
+    plan_argv = _run_stage(ws, stages[6], env)
+    assert plan_argv[:2] == ["plan", "runtime/bundle.tgz"]
+    assert fluid_main(plan_argv) == 0
+
+    apply_argv = _run_stage(ws, stages[7], env)
+    assert apply_argv[:2] == ["apply", "runtime/plan.json"]
+    assert _flag(apply_argv, "--bundle") == "runtime/bundle.tgz"
+    planned_for = json.loads((ws / "runtime" / "plan.json").read_text(encoding="utf-8"))
+    # The plan was made from the bundle (bound), for the mode apply runs
+    # (``None`` and ``amend`` are the same additive default).
+    assert planned_for.get("bundleDigest")
+    assert (planned_for["mode"] or "amend") == _flag(apply_argv, "--mode")
+    assert fluid_main(apply_argv) == 0
+    return apply_argv
 
 
 @pytest.mark.parametrize("build_id", ["", "make_rows"], ids=["no-build-id", "build-id"])
@@ -207,27 +220,50 @@ def test_generated_plan_and_apply_agree_on_the_mode(
         "NO_VERIFY_DIGEST": False,
         "PLAN_HTML": False,
     }
+    apply_argv = _run_chain(ws, stages, _exported(params))
 
-    plan_mapping, plan_script = stages[6]
-    plan_argv = _run_stage(ws, plan_script, _stage_env(plan_mapping, params))
-    assert plan_argv[0] == "plan"
-    assert fluid_main(plan_argv) == 0
-    planned_for = json.loads((ws / "runtime" / "plan.json").read_text(encoding="utf-8"))["mode"]
-
-    apply_mapping, apply_script = stages[7]
-    apply_argv = _run_stage(ws, apply_script, _stage_env(apply_mapping, params))
-    assert apply_argv[0] == "apply"
-    applied_as = _last_mode(apply_argv)
-
-    # The plan was made for the mode apply runs (``None`` and ``amend`` are
-    # the same additive default), and apply accepts it.
-    assert (planned_for or "amend") == applied_as, (plan_argv, apply_argv)
-    assert fluid_main(apply_argv) == 0
-
+    # APPLY_MODE as given: a build id never turns a mode into a build mode.
+    assert _flag(apply_argv, "--mode") == apply_mode
     landed = ws / "contracts" / "p" / "out" / "rows.parquet"
-    if applied_as in _BUILD_MODES:
+    if apply_mode in _BUILD_MODES:
         assert duckdb.sql(f"SELECT count(*) FROM '{landed}'").fetchone() == (1,)
-    if build_id:
-        # A build id only means something with a build mode.
-        assert applied_as in _BUILD_MODES
-        assert apply_argv[apply_argv.index("--build-id") + 1] == build_id
+    # A build id reaches ``fluid apply`` only with a build mode.
+    expected_build_id = build_id if (build_id and apply_mode in _BUILD_MODES) else None
+    assert _flag(apply_argv, "--build-id") == expected_build_id
+
+
+@pytest.mark.parametrize(
+    ("system", "apply_mode_default", "expected_mode"),
+    [
+        ("jenkins", None, "dry-run"),
+        ("jenkins", "amend-and-build", "amend-and-build"),
+        ("tekton", None, "amend"),
+        ("tekton", "amend-and-build", "amend-and-build"),
+    ],
+)
+def test_a_parameterless_run_uses_the_declared_defaults(
+    ws: Path, system: str, apply_mode_default: Optional[str], expected_mode: str
+) -> None:
+    """No parameter exported at all: the contract, the env, the mode and the
+    build id all come from the defaults the parameters declare."""
+    render = _tekton_stages if system == "tekton" else _jenkins_stages
+    stages = render(apply_mode_default=apply_mode_default)
+    apply_argv = _run_chain(ws, stages, {})
+    assert _flag(apply_argv, "--mode") == expected_mode
+    assert _flag(apply_argv, "--env") == "dev"
+    expected_build_id = "make_rows" if expected_mode in _BUILD_MODES else None
+    assert _flag(apply_argv, "--build-id") == expected_build_id
+    landed = ws / "contracts" / "p" / "out" / "rows.parquet"
+    if expected_mode in _BUILD_MODES:
+        assert duckdb.sql(f"SELECT count(*) FROM '{landed}'").fetchone() == (1,)
+    if expected_mode == "dry-run":
+        assert not landed.exists()  # a dry run writes nothing
+
+
+def test_a_blank_build_id_parameter_runs_every_build(ws: Path) -> None:
+    """APPLY_BUILD_ID deliberately set to blank is kept blank (``${X-default}``),
+    not replaced by its default: ``--mode amend-and-build`` with no filter."""
+    stages = _jenkins_stages(apply_mode_default="amend-and-build")
+    apply_argv = _run_chain(ws, stages, {"APPLY_BUILD_ID": ""})
+    assert _flag(apply_argv, "--mode") == "amend-and-build"
+    assert _flag(apply_argv, "--build-id") is None

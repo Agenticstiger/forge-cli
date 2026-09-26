@@ -33,7 +33,9 @@ Per-system classes live in sibling modules
 each CI system's quirks stay contained and the file count is bounded.
 """
 
+import functools
 import json
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -64,18 +66,130 @@ def _pin_action(action_ref: str) -> str:
     return PINNED_ACTIONS.get(action_ref, action_ref)
 
 
-#: POSIX sh fragment that sets ``EFFECTIVE_MODE``: the one apply mode both
-#: stage 6 (``fluid plan --mode``) and stage 7 (``fluid apply --mode``) use.
-#: ``APPLY_MODE`` (default ``amend``), switched to ``amend-and-build`` when
-#: ``APPLY_BUILD_ID`` is set, because a build id only filters builds and
-#: needs a build mode to run one. ``fluid plan`` stamps the mode into
-#: plan.json and ``fluid apply`` refuses a plan made for another mode
-#: (``apply_plan_mode_mismatch``), so the two stages must compute it the
-#: same way. Every expansion is quoted: a parameter value stays one token.
-_APPLY_EFFECTIVE_MODE_SH = (
-    'EFFECTIVE_MODE="${APPLY_MODE:-amend}"; '
-    'if [ -n "${APPLY_BUILD_ID:-}" ]; then EFFECTIVE_MODE=amend-and-build; fi; '
+#: The six ``fluid apply --mode`` values, in the order the pipelines list them.
+APPLY_MODES: Tuple[str, ...] = (
+    "dry-run",
+    "create-only",
+    "amend",
+    "amend-and-build",
+    "replace",
+    "replace-and-build",
 )
+#: The modes that run the contract's builds, and so the only ones
+#: ``fluid apply --build-id`` accepts (``apply_build_id_requires_build_mode``).
+BUILD_APPLY_MODES: Tuple[str, ...] = ("amend-and-build", "replace-and-build")
+#: Stage 11 schedulers (``fluid schedule-sync --scheduler``).
+SCHEDULERS: Tuple[str, ...] = ("airflow", "mwaa", "composer", "astronomer", "prefect", "dagster")
+#: The PyPI distribution the pipelines install.
+FLUID_PACKAGE_NAME = "data-product-forge"
+#: Stage 1 writes the bundle here; stages 2, 3, 5, 6, 7 and 9 read it.
+BUNDLE_PATH = "runtime/bundle.tgz"
+
+#: Characters a generator-supplied value may not contain, because it is
+#: written into a POSIX ``"${NAME:-<value>}"`` expansion inside a Groovy or
+#: YAML string: ``$`` and backquote expand, ``"`` ends the quoting, ``}`` ends
+#: the expansion, ``'`` ends a Groovy literal and ``\`` escapes in both.
+_UNSAFE_LITERAL = re.compile(r"[$`\"'\\{}\x00-\x1f\x7f]")
+
+
+def check_pipeline_literal(what: str, value: str) -> str:
+    """Return ``value`` if it can be written into a generated pipeline as is.
+
+    Generator options (``--fluid-package-spec``, ``--scheduler-destination-default``,
+    the contract path) become shell fallbacks and parameter defaults in the
+    generated file, so a value that could expand, end the quoting or escape
+    is refused at generation time rather than escaped: none of the values
+    these options take legitimately contains one.
+    """
+    if _UNSAFE_LITERAL.search(value):
+        raise ValueError(
+            f"{what} {value!r} contains a character the generated pipeline cannot "
+            "carry literally ($, `, \", ', \\, {, } or a control character)"
+        )
+    return value
+
+
+def check_pipeline_workdir(workdir: str) -> str:
+    """``check_pipeline_literal`` for the workdir, which is also written into
+    ``archiveArtifacts`` patterns: a glob character or a comma there would
+    archive files the pipeline did not write, or split the pattern list."""
+    check_pipeline_literal("workdir", workdir)
+    if re.search(r"[*?,\[\]]", workdir):
+        raise ValueError(
+            f"workdir {workdir!r} contains a glob character or a comma, which an "
+            "archiveArtifacts pattern would read as a pattern"
+        )
+    return workdir
+
+
+def sh_param(name: str, default: str, *, keep_blank: bool = False) -> str:
+    """The POSIX expansion of pipeline parameter ``name`` with its declared default.
+
+    A CI system does not always export its parameters to the shell: Jenkins
+    runs a job's first build, and the first build after the job lost its
+    parameter definitions (a restart that re-seeds jobs from job-dsl or JCasC),
+    with none, and a scheduled or webhook run of the other systems may not set
+    them either. So every read of a parameter falls back to the value its
+    declaration defaults to, rendered from the same value. ``keep_blank``
+    keeps a value the operator deliberately set to blank (``${NAME-default}``);
+    otherwise blank also means the default (``${NAME:-default}``).
+    """
+    check_pipeline_literal(f"default of {name}", default)
+    return "${" + name + ("-" if keep_blank else ":-") + default + "}"
+
+
+def default_fluid_package_spec(extras: Optional[List[str]] = None) -> str:
+    """``data-product-forge[<extras>]==<this version>``: the CLI that generated
+    the pipeline, with the extras its contract needs. A pipeline that installs
+    whatever PyPI has at run time runs commands, flags and gates it was not
+    generated for."""
+    from fluid_build import __version__
+
+    wanted = sorted({e.strip() for e in (extras or []) if e and e.strip()})
+    suffix = f"[{','.join(wanted)}]" if wanted else ""
+    return f"{FLUID_PACKAGE_NAME}{suffix}=={__version__}"
+
+
+def _needs_bundle(stage: int) -> str:
+    """POSIX sh: fail with a reason when stage 1's bundle is missing, rather
+    than with the reading command's bare "not found"."""
+    return (
+        f"if [ ! -f {BUNDLE_PATH} ]; then "
+        f'echo "stage {stage} reads {BUNDLE_PATH}, which stage 1 writes; '
+        'run stage 1 in the same build" >&2; exit 1; fi; '
+    )
+
+
+def _skip_after_dry_run(stage: int, what: str) -> str:
+    """POSIX sh (after ``MODE`` is set): end the stage when stage 7 ran as a
+    dry run. A dry-run build writes nothing: not the target, the catalog or
+    the scheduler (whose DAG would apply for real)."""
+    return (
+        'if [ "$MODE" = dry-run ] && [ "${RUN_STAGE_7_APPLY:-true}" = "true" ]; then '
+        f'echo "stage {stage}: APPLY_MODE dry-run applied nothing, so {what} — skipped '
+        '(APPLY_MODE amend or amend-and-build applies)"; '
+        "exit 0; fi; "
+    )
+
+
+def apply_build_id_sh(build_id_expansion: str) -> str:
+    """POSIX sh (after ``MODE`` and ``set --`` are set): append ``--build-id``
+    only when the mode runs builds, and say so when a build id is ignored.
+
+    ``fluid apply`` refuses ``--build-id`` with any other mode
+    (``apply_build_id_requires_build_mode``), and the mode is never
+    rewritten to fit the id: the plan stage 6 made is for APPLY_MODE, and
+    ``fluid apply`` refuses a plan made for a different mode.
+    """
+    modes = "|".join(BUILD_APPLY_MODES)
+    return (
+        f'BUILD_ID="{build_id_expansion}"; '
+        f'case "$MODE" in {modes}) '
+        'if [ -n "$BUILD_ID" ]; then set -- "$@" --build-id "$BUILD_ID"; fi ;; '
+        '*) if [ -n "$BUILD_ID" ]; then echo "APPLY_BUILD_ID is not passed on: '
+        'APPLY_MODE $MODE runs no build (amend-and-build and replace-and-build do)"; fi ;; '
+        "esac; "
+    )
 
 
 try:
@@ -194,21 +308,19 @@ class PipelineConfig:
     # default, which preserves the original ``${PUBLISH_TARGETS}`` (no
     # fallback) form — matches behaviour before this flag was added.
     #
-    # Set this (via ``fluid generate ci --default-publish-target X``) when
-    # you expect the first Pipeline-from-SCM build Jenkins auto-triggers
-    # to publish to a specific catalog. On that first build, the
-    # ``parameters { }`` block's defaults are parsed but NOT exported as
-    # env vars, so ``${PUBLISH_TARGETS}`` is empty; without this
-    # fallback the CLI would use its built-in ``fluid-command-center``
-    # default, which may not be reachable. Common values:
+    # Set this (via ``fluid generate ci --default-publish-target X``) to
+    # make X the ``PUBLISH_TARGETS`` parameter's default AND the shell
+    # fallback every stage-10 read of it uses (a Jenkins job's first build,
+    # and its first after it lost its parameter definitions, runs with no
+    # parameters exported to the shell). ``None`` keeps
+    # ``datamesh-manager``. Common values: ``fluid-command-center``,
     # ``datamesh-manager``, ``horizon``, ``datahub``, ``collibra``.
-    # Only the Jenkins template consumes this today.
     default_publish_target: Optional[str] = None
-    # Jenkins-only generation defaults for the stage-9 verify strictness,
-    # stage-10 publish toggle, and whether stage 10 passes an explicit
-    # ``--env`` flag to ``fluid publish``. These exist so scenario-specific
-    # launchpads can ask ``fluid generate ci`` to emit the intended default
-    # behavior directly instead of patching the generated Jenkinsfile text.
+    # Generation defaults for the stage-9 verify strictness, the stage-10
+    # publish toggle, and whether stage 10 passes ``--env`` to
+    # ``fluid publish``. These exist so scenario-specific launchpads can ask
+    # ``fluid generate ci`` to emit the intended default behavior directly
+    # instead of patching the generated Jenkinsfile text.
     #
     # ``publish_include_env`` defaults to True: ``fluid publish --env`` loads
     # the contract with the same overlay stages 5-9 used, so a run for the
@@ -218,6 +330,33 @@ class PipelineConfig:
     verify_strict_default: bool = True
     publish_stage_default: bool = False
     publish_include_env: bool = True
+    # The contract the pipeline builds, relative to ``workdir`` (the CONTRACT
+    # parameter's default and every stage's fallback for it). ``fluid
+    # generate ci`` sets it to the contract it was given.
+    contract_path: str = "contract.fluid.yaml"
+    # The stage-0 ``FLUID_PACKAGE_SPEC`` default. ``None``: this version of
+    # forge-cli with ``package_extras`` (``default_fluid_package_spec``).
+    fluid_package_spec: Optional[str] = None
+    # Extras of ``data-product-forge`` the contract needs, across its base
+    # and every overlay (``fluid generate ci`` reads them from the bindings).
+    package_extras: Optional[List[str]] = None
+    # The ``APPLY_MODE`` default. ``None`` keeps each system's own: dry-run
+    # for Jenkins, amend for the shared stage specs.
+    apply_mode_default: Optional[str] = None
+    # The ``APPLY_BUILD_ID`` default: the contract's build when it has
+    # exactly one. Passed to ``fluid apply`` only with a build mode.
+    apply_build_id_default: str = ""
+    # Stage 11 defaults: the RUN_STAGE_11_SCHEDULE_SYNC toggle, the scheduler
+    # and its destination (the shared DAG root; schedule-sync writes each
+    # product into its own ``<root>/<contract id>/`` and deletes only there).
+    schedule_sync_default: bool = False
+    scheduler_default: str = ""
+    scheduler_destination_default: str = ""
+    # Stage 5 reads the plan the last successful build applied for the same
+    # env (``fluid diff --last-applied``), so a change the contract makes is
+    # "pending" rather than drift. Jenkins only; needs the copyartifact
+    # plugin, which is why it is off unless asked for.
+    diff_last_applied: bool = False
 
     def __post_init__(self):
         if self.environments is None:
@@ -233,6 +372,9 @@ class PipelineConfig:
 
         if self.custom_steps is None:
             self.custom_steps = []
+
+        if self.package_extras is None:
+            self.package_extras = []
 
 
 class PipelineTemplateGenerator:
@@ -320,7 +462,7 @@ class BasePipelineTemplate:
             "matrix_builds": True,
         }
 
-    def _get_fluid_commands(self) -> Dict[str, str]:
+    def _get_fluid_commands(self, config: Optional["PipelineConfig"] = None) -> Dict[str, str]:
         """Get standard FLUID commands for different stages.
 
         Contract-path commands use the POSIX parameter-expansion default
@@ -331,7 +473,7 @@ class BasePipelineTemplate:
         when unset, ``apply`` falls through to the plan-file branch for
         non-dbt contracts.
         """
-        return {
+        commands = {
             "validate": "fluid validate ${CONTRACT:-contract.fluid.yaml}",
             # 11-stage pipeline stage 5 — drift gate. Runs BEFORE plan so the
             # plan is never computed against a drifted baseline. --exit-on-drift
@@ -439,6 +581,13 @@ class BasePipelineTemplate:
                 "fi; "
                 "fi"
             ),
+        }
+        # The contract ``fluid generate ci`` was given is every command's
+        # fallback for CONTRACT, not the literal default name.
+        contract = self._pipeline_defaults(config)["CONTRACT"]
+        fallback = sh_param("CONTRACT", contract)
+        return {
+            k: v.replace("${CONTRACT:-contract.fluid.yaml}", fallback) for k, v in commands.items()
         }
 
     def _get_common_environment_vars(self) -> Dict[str, str]:
@@ -632,6 +781,9 @@ class BasePipelineTemplate:
             f"{p}    AWS       → AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or OIDC role)",
             f"{p}    Azure     → AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID",
             f"{p}    Catalog   → DMM_API_URL / DMM_API_KEY (only if using `fluid publish`)",
+            f"{p}    Command Center → FLUID_CC_ENDPOINT (base URL) / FLUID_API_KEY (sent as",
+            f"{p}                X-API-Key) / FLUID_CC_ORG_ID (the organization; optional when",
+            f"{p}                the key belongs to exactly one) for `--target fluid-command-center`",
             f"{p}  See ``fluid_build.credentials.resolver`` for the full resolver chain.",
             f"{p}",
             f"{p}How to surface them in {ci_system_name}:",
@@ -741,20 +893,89 @@ class BasePipelineTemplate:
     # ------------------------------------------------------------------
     # 11-stage pipeline helpers (Phase 7-rest)
     #
-    # ``_stage_specs()`` returns the canonical, provider-neutral list of
-    # the 11 pipeline stages. Every CI-system subclass iterates this list
+    # ``_stage_specs(config)`` returns the canonical, provider-neutral list
+    # of the 11 pipeline stages. Every CI-system subclass iterates this list
     # and wraps ``_render_stage_command(spec, config)`` in its native
     # primitive (GitHub Actions step, GitLab job, Azure stage, etc.).
     #
     # Keeping the command strings here — not in each subclass — ensures
     # that upgrading the canonical contract (e.g. "stage 6 now passes a
     # new flag") propagates to every CI system without N-way drift.
-    # JenkinsTemplate predates this helper and keeps its own inline
-    # renderer for historical reasons; the two are kept in lockstep via
-    # the assertions in ``tests/test_pipeline_templates_branches.py``.
+    # JenkinsTemplate renders its own Groovy, but runs the same chain with
+    # the same defaults (``_pipeline_defaults``), which the tests in
+    # ``tests/forge/core/pipeline_systems/`` hold the two to.
     # ------------------------------------------------------------------
 
-    def _stage_specs(self) -> List["StageSpec"]:
+    #: The ``APPLY_MODE`` default when ``PipelineConfig.apply_mode_default``
+    #: is unset. Jenkins keeps its own (dry-run).
+    system_apply_mode_default = "amend"
+
+    #: Parameters an operator may deliberately set to blank: their shell
+    #: fallback applies only when the parameter is unset (``${X-default}``).
+    #: For every other one a blank value also means the default.
+    keep_blank_parameters = frozenset(
+        {
+            "APPLY_BUILD_ID",
+            "SCHEDULER",
+            "SCHEDULER_DESTINATION",
+            "SCHEDULER_ENVIRONMENT_NAME",
+            "SCHEDULER_LOCATION",
+            "SCHEDULER_WORKSPACE",
+            "FLUID_PIP_INDEX_URL",
+            "FLUID_PIP_EXTRA_INDEX_URL",
+        }
+    )
+
+    def _pipeline_defaults(self, config: Optional["PipelineConfig"] = None) -> Dict[str, str]:
+        """The default of every parameter a stage reads.
+
+        One table, rendered into the parameter declarations AND into every
+        shell read of the parameter (``sh_param``), so a run that gets no
+        parameters (a Jenkins job's first build, or its first after a
+        restart re-seeded it) runs exactly what the declarations say.
+        """
+
+        def opt(name: str, fallback: str) -> str:
+            value = getattr(config, name, None) if config is not None else None
+            return value.strip() if isinstance(value, str) and value.strip() else fallback
+
+        apply_mode = opt("apply_mode_default", self.system_apply_mode_default)
+        if apply_mode not in APPLY_MODES:
+            raise ValueError(f"apply mode default {apply_mode!r} is not one of {APPLY_MODES}")
+        scheduler = opt("scheduler_default", "")
+        if scheduler and scheduler not in SCHEDULERS:
+            raise ValueError(f"scheduler default {scheduler!r} is not one of {SCHEDULERS}")
+        spec = opt("fluid_package_spec", "") or default_fluid_package_spec(
+            getattr(config, "package_extras", None)
+        )
+        defaults = {
+            "CONTRACT": opt("contract_path", "contract.fluid.yaml"),
+            "FLUID_ENV": "dev",
+            "APPLY_MODE": apply_mode,
+            "APPLY_BUILD_ID": opt("apply_build_id_default", ""),
+            "ALLOW_DATA_LOSS": "false",
+            "NO_VERIFY_DIGEST": "false",
+            "PUBLISH_TARGETS": opt("default_publish_target", "datamesh-manager"),
+            "SCHEDULER": scheduler,
+            "SCHEDULER_DESTINATION": opt("scheduler_destination_default", ""),
+            "SCHEDULER_ENVIRONMENT_NAME": "",
+            "SCHEDULER_LOCATION": "",
+            "SCHEDULER_WORKSPACE": "",
+            "SCHEDULE_SYNC_DRY_RUN": "false",
+            "FLUID_PACKAGE_SPEC": spec,
+            "FLUID_PIP_INDEX_URL": "",
+            "FLUID_PIP_EXTRA_INDEX_URL": "",
+            "FLUID_ALLOW_PRERELEASE": "false",
+        }
+        for name, value in defaults.items():
+            check_pipeline_literal(f"default of {name}", value)
+        return defaults
+
+    def _sh(self, name: str, defaults: Dict[str, str]) -> str:
+        """``sh_param`` for ``name`` with its default from ``defaults``."""
+        return sh_param(name, defaults[name], keep_blank=name in self.keep_blank_parameters)
+
+    def _stage_specs(self, config: Optional["PipelineConfig"] = None) -> List["StageSpec"]:
         """Return the 11 pipeline stages in order.
 
         Toggle defaults follow the same semantics Jenkins uses:
@@ -765,7 +986,18 @@ class BasePipelineTemplate:
         Stage 3 (generate artifacts) is controlled by the subclass's
         :attr:`config.generates_artifacts` rather than the static default
         here — the subclass applies the override when rendering.
+
+        The chain: stage 1 bundles the contract with its env overlay, and
+        stages 2, 3, 5, 6 and 9 read that bundle, so each checks the same
+        frozen document stage 7 applies. Stage 7 applies stage 6's plan
+        with ``--bundle``. Stage 10 publishes the contract with ``--env``
+        (the catalog records the contract as authored, overlay applied).
         """
+        d = self._pipeline_defaults(config)
+        p = functools.partial(self._sh, defaults=d)
+        env = f'--env "{p("FLUID_ENV")}"'
+        workdir = (getattr(config, "workdir", None) or "").strip("/") if config else ""
+        project_contract = f"{workdir}/{p('CONTRACT')}" if workdir else p("CONTRACT")
         return [
             StageSpec(
                 num=1,
@@ -774,8 +1006,9 @@ class BasePipelineTemplate:
                 toggle_param="RUN_STAGE_1_BUNDLE",
                 default_run=True,
                 command=(
-                    'fluid bundle "${CONTRACT:-contract.fluid.yaml}" '
-                    "--format tgz --out runtime/bundle.tgz"
+                    "set -eu; mkdir -p runtime; "
+                    f'fluid bundle "{p("CONTRACT")}" {env} '
+                    f"--format tgz --out {BUNDLE_PATH}"
                 ),
             ),
             StageSpec(
@@ -784,7 +1017,7 @@ class BasePipelineTemplate:
                 display="validate",
                 toggle_param="RUN_STAGE_2_VALIDATE",
                 default_run=True,
-                command=('fluid validate "${CONTRACT:-contract.fluid.yaml}" --strict'),
+                command=(f"set -eu; {_needs_bundle(2)}fluid validate {BUNDLE_PATH} {env} --strict"),
             ),
             StageSpec(
                 num=3,
@@ -792,9 +1025,13 @@ class BasePipelineTemplate:
                 display="generate artifacts",
                 toggle_param="RUN_STAGE_3_GENERATE_ARTIFACTS",
                 default_run=True,  # overridden by config.generates_artifacts at render time
+                # ``--contract-path``: the path the scheduled DAG applies,
+                # relative to the checkout (FLUID_PROJECT_DIR on the worker).
+                # A bundle does not record it.
                 command=(
-                    'fluid generate artifacts "${CONTRACT:-contract.fluid.yaml}" '
-                    "--out dist/artifacts/"
+                    f"set -eu; {_needs_bundle(3)}"
+                    f"fluid generate artifacts {BUNDLE_PATH} {env} "
+                    f'--contract-path "{project_contract}" --out dist/artifacts/'
                 ),
             ),
             StageSpec(
@@ -812,8 +1049,9 @@ class BasePipelineTemplate:
                 toggle_param="RUN_STAGE_5_DIFF",
                 default_run=True,
                 command=(
-                    'fluid diff "${CONTRACT:-contract.fluid.yaml}" '
-                    '--exit-on-drift --env "${FLUID_ENV:-dev}"'
+                    f"set -eu; {_needs_bundle(5)}"
+                    f"fluid diff {BUNDLE_PATH} --exit-on-drift {env} "
+                    "--out runtime/diff-report.json"
                 ),
             ),
             StageSpec(
@@ -824,15 +1062,11 @@ class BasePipelineTemplate:
                 default_run=True,
                 # The plan records the mode it was made for, and stage 7's
                 # ``apply_plan_mode_mismatch`` gate refuses any other. So
-                # stage 6 computes the SAME effective mode as stage 7
-                # (``_APPLY_EFFECTIVE_MODE_SH``): a plan made without
-                # ``--mode`` could only ever be applied with ``amend``.
+                # stage 6 plans for APPLY_MODE, the one mode stage 7 applies.
                 command=(
-                    "set -eu; "
-                    f"{_APPLY_EFFECTIVE_MODE_SH}"
-                    'fluid plan "${CONTRACT:-contract.fluid.yaml}" '
-                    '--out runtime/plan.json --mode "$EFFECTIVE_MODE" '
-                    '--env "${FLUID_ENV:-dev}"'
+                    f'set -eu; {_needs_bundle(6)}MODE="{p("APPLY_MODE")}"; '
+                    f"fluid plan {BUNDLE_PATH} "
+                    f'--out runtime/plan.json --mode "$MODE" {env}'
                 ),
             ),
             StageSpec(
@@ -855,22 +1089,20 @@ class BasePipelineTemplate:
                 # plan-binding gate and the federation upstream-digest
                 # gate together (the digest gate is split into two
                 # narrowly-scoped flags at the CLI).
+                #
+                # The mode is APPLY_MODE as given, never rewritten: a build
+                # id reaches ``--build-id`` only with a build mode, which is
+                # the only place ``fluid apply`` accepts one.
                 command=(
-                    "set -eu; "
-                    # One mode for the whole apply, the one stage 6 planned
-                    # for. Appending a second ``--mode amend-and-build`` when
-                    # APPLY_BUILD_ID is set used to override the first and
-                    # leave stage 6's plan made for a different mode.
-                    f"{_APPLY_EFFECTIVE_MODE_SH}"
+                    f'set -eu; {_needs_bundle(7)}MODE="{p("APPLY_MODE")}"; '
                     # --ensure-opentofu provisions a pinned, SHA-256-verified
                     # `tofu` (no root/gpg) when a cloud apply needs it; it is
                     # idempotent (skips when tofu is present) and a no-op for
                     # native/local applies that never touch the OpenTofu engine.
-                    'set -- runtime/plan.json --mode "$EFFECTIVE_MODE" '
-                    '--env "${FLUID_ENV:-dev}" --yes --ensure-opentofu '
+                    f'set -- runtime/plan.json --bundle {BUNDLE_PATH} --mode "$MODE" '
+                    f"{env} --yes --ensure-opentofu "
                     "--report runtime/apply-report.html; "
-                    'if [ -n "${APPLY_BUILD_ID:-}" ]; then '
-                    'set -- "$@" --build-id "$APPLY_BUILD_ID"; fi; '
+                    f"{apply_build_id_sh(p('APPLY_BUILD_ID'))}"
                     'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]; then '
                     'set -- "$@" --allow-data-loss; fi; '
                     'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]; then '
@@ -886,10 +1118,16 @@ class BasePipelineTemplate:
                 default_run=True,
                 # Self-gates on bindings.json existence so reference-only
                 # contracts (that delegate policy upstream) skip cleanly.
+                # After a dry-run apply the bindings are checked, not
+                # enforced: a dry run writes nothing, access bindings included.
                 command=(
+                    f'set -eu; MODE="{p("APPLY_MODE")}"; POLICY_MODE=enforce; '
+                    'if [ "$MODE" = dry-run ]; then POLICY_MODE=check; '
+                    'echo "APPLY_MODE dry-run applied nothing: policy bindings are checked, '
+                    'not enforced"; fi; '
                     "if [ -f dist/artifacts/policy/bindings.json ]; then "
-                    "fluid policy-apply dist/artifacts/policy/bindings.json "
-                    "--mode enforce; "
+                    'set -- dist/artifacts/policy/bindings.json --mode "$POLICY_MODE"; '
+                    'fluid policy-apply "$@"; '
                     "fi"
                 ),
             ),
@@ -900,12 +1138,13 @@ class BasePipelineTemplate:
                 toggle_param="RUN_STAGE_9_VERIFY",
                 default_run=True,
                 # ``fluid verify`` accepts ``--out``, NOT ``--report``
-                # (the latter is apply's flag). Generated stage-9 commands
-                # used the wrong flag historically; fixed in this revision
-                # so generated CI YAML actually runs.
+                # (the latter is apply's flag). It reconciles what stage 7
+                # applied, so after a dry run (nothing applied) it is skipped.
                 command=(
-                    'fluid verify "${CONTRACT:-contract.fluid.yaml}" --strict '
-                    '--env "${FLUID_ENV:-dev}" --out runtime/verify-report.json'
+                    f'set -eu; MODE="{p("APPLY_MODE")}"; '
+                    f"{_skip_after_dry_run(9, 'there is nothing to verify')}{_needs_bundle(9)}"
+                    f"fluid verify {BUNDLE_PATH} --strict "
+                    f"{env} --out runtime/verify-report.json"
                 ),
             ),
             StageSpec(
@@ -914,20 +1153,23 @@ class BasePipelineTemplate:
                 display="publish",
                 toggle_param="RUN_STAGE_10_PUBLISH",
                 default_run=False,  # opt-in — typically branch-gated to main
-                # ``PUBLISH_TARGETS`` is a space-separated list the shell
-                # expands into ``--target X --target Y ...``. Falls back
-                # to ``--target ${CATALOG:-datamesh-manager}`` so legacy
-                # single-target config keeps working.
+                # ``PUBLISH_TARGETS`` is a space-separated list; each word
+                # becomes ONE ``--target=<word>`` argv token (``set -f`` so a
+                # word is never a glob). The legacy single-target
+                # ``CATALOG`` variable is still read when it is unset.
+                # A word may not carry an endpoint (``name:https://...``): the
+                # runner's catalog credential would go to whatever it names.
+                # After a dry-run apply there is nothing applied to publish.
                 command=(
-                    'if [ -n "${PUBLISH_TARGETS:-}" ]; then '
-                    'TARGETS=""; for t in $PUBLISH_TARGETS; do '
-                    'TARGETS="$TARGETS --target $t"; done; '
-                    'fluid publish "${CONTRACT:-contract.fluid.yaml}" $TARGETS '
-                    '--env "${FLUID_ENV:-dev}"; '
-                    "else "
-                    'fluid publish "${CONTRACT:-contract.fluid.yaml}" '
-                    '--target "${CATALOG:-datamesh-manager}" --env "${FLUID_ENV:-dev}"; '
-                    "fi"
+                    f'set -eu; MODE="{p("APPLY_MODE")}"; '
+                    f"{_skip_after_dry_run(10, 'there is no applied product to publish')}"
+                    "mkdir -p runtime; "
+                    f'set -- "{p("CONTRACT")}" {env} --format json; '
+                    "set -f; for t in ${PUBLISH_TARGETS:-${CATALOG:-"
+                    f'{d["PUBLISH_TARGETS"]}'
+                    '}}; do case "$t" in *:*) echo "PUBLISH_TARGETS names catalogs, '
+                    'not endpoints" >&2; exit 2 ;; esac; set -- "$@" "--target=$t"; done; '
+                    'set +f; fluid publish "$@"'
                 ),
             ),
             StageSpec(
@@ -943,7 +1185,11 @@ class BasePipelineTemplate:
                 # as stage 7 so empty params never reach argv. This is
                 # the security-hardened Jenkins stage-11 pattern.
                 command=(
-                    "set -eu; "
+                    f'set -eu; MODE="{p("APPLY_MODE")}"; '
+                    f"{_skip_after_dry_run(11, 'there is no applied product to schedule')}"
+                    f'SCHEDULER_V="{p("SCHEDULER")}"; '
+                    'if [ -z "$SCHEDULER_V" ]; then echo "SCHEDULER is blank: '
+                    'no scheduler to sync to — skipping stage 11"; exit 0; fi; '
                     # Self-gate: skip cleanly when there's nothing to
                     # sync. Three cases are collapsed into one INFO-
                     # level skip: (a) reference-only contract where
@@ -962,11 +1208,14 @@ class BasePipelineTemplate:
                     "— skipping stage 11 (reference-only contract, "
                     "stage 3 not run, or no orchestration.engine "
                     'configured)"; exit 0; fi; '
-                    'set -- --scheduler "$SCHEDULER" '
+                    # ``--delete-scope product``: deletion stays inside
+                    # ``<destination>/<contract id>/``, so products sharing
+                    # one DAG root never remove each other's DAGs.
+                    'set -- --scheduler "$SCHEDULER_V" '
                     "--dags-dir dist/artifacts/schedule/ "
-                    '--env "${FLUID_ENV:-dev}"; '
-                    'if [ -n "${SCHEDULER_DESTINATION:-}" ]; then '
-                    'set -- "$@" --destination "$SCHEDULER_DESTINATION"; fi; '
+                    f"{env} --delete-scope product; "
+                    f'DEST="{p("SCHEDULER_DESTINATION")}"; '
+                    'if [ -n "$DEST" ]; then set -- "$@" --destination "$DEST"; fi; '
                     'if [ -n "${SCHEDULER_ENVIRONMENT_NAME:-}" ]; then '
                     'set -- "$@" --environment-name "$SCHEDULER_ENVIRONMENT_NAME"; fi; '
                     'if [ -n "${SCHEDULER_LOCATION:-}" ]; then '
@@ -1000,11 +1249,11 @@ class BasePipelineTemplate:
         """
         body = spec.command
         if config.workdir:
-            # Escape double-quotes in workdir just in case (defence in
-            # depth — argparse rejects most garbage upstream, but the
-            # generated file is ultimately shell-interpreted).
-            safe_workdir = config.workdir.replace('"', '\\"')
-            body = f'cd "{safe_workdir}" && {body}'
+            # The workdir is written between double quotes into a shell
+            # body: refuse (at generation time) anything that could end the
+            # quoting or expand, rather than escaping it.
+            workdir = check_pipeline_workdir(config.workdir)
+            body = f'cd "{workdir}" && {body}'
         return body
 
     def _stage_default_run(self, spec: "StageSpec", config: "PipelineConfig") -> bool:
@@ -1018,6 +1267,10 @@ class BasePipelineTemplate:
         """
         if spec.slug == "generate_artifacts":
             return bool(config.generates_artifacts)
+        if spec.slug == "publish":
+            return bool(getattr(config, "publish_stage_default", False))
+        if spec.slug == "schedule_sync":
+            return bool(getattr(config, "schedule_sync_default", False))
         return spec.default_run
 
     def _render_install_setup(self, config: "PipelineConfig") -> str:
@@ -1063,23 +1316,26 @@ class BasePipelineTemplate:
                 "fluid_build import failed; check /forge-cli-src' >&2 && exit 3)\n"
                 "fluid --version" + engine_install
             )
-        # pypi mode — TestPyPI overrides + optional --pre
+        # pypi mode — TestPyPI overrides + optional --pre. Each value is ONE
+        # argv token (``set --``): the index URLs used to be concatenated into
+        # a string and re-parsed by ``sh -c``, so a value could add pip
+        # options or run commands. ``--`` ends pip's options, so the package
+        # spec cannot be one either.
+        spec = self._sh("FLUID_PACKAGE_SPEC", self._pipeline_defaults(config))
         return (
             "set -eu\n"
             "python -m pip install --upgrade pip\n"
-            'INDEX_FLAGS=""\n'
+            "set -- --quiet\n"
             'if [ -n "${FLUID_PIP_INDEX_URL:-}" ]; then\n'
-            '  INDEX_FLAGS="--index-url \\"${FLUID_PIP_INDEX_URL}\\""\n'
+            '  set -- "$@" "--index-url=$FLUID_PIP_INDEX_URL"\n'
             "fi\n"
             'if [ -n "${FLUID_PIP_EXTRA_INDEX_URL:-}" ]; then\n'
-            '  INDEX_FLAGS="$INDEX_FLAGS --extra-index-url \\"${FLUID_PIP_EXTRA_INDEX_URL}\\""\n'
+            '  set -- "$@" "--extra-index-url=$FLUID_PIP_EXTRA_INDEX_URL"\n'
             "fi\n"
-            'PRE_FLAG=""\n'
             'if [ "${FLUID_ALLOW_PRERELEASE:-false}" = "true" ]; then\n'
-            '  PRE_FLAG="--pre"\n'
+            '  set -- "$@" --pre\n'
             "fi\n"
-            'SPEC="${FLUID_PACKAGE_SPEC:-data-product-forge}"\n'
-            'sh -c "python -m pip install $INDEX_FLAGS $PRE_FLAG $SPEC"\n'
+            f'python -m pip install "$@" -- "{spec}"\n'
             "fluid --version" + engine_install
         )
 
@@ -1094,7 +1350,8 @@ class BasePipelineTemplate:
         env-var form every CI system accepts.
         """
         return {
-            spec.toggle_param: self._stage_default_run(spec, config) for spec in self._stage_specs()
+            spec.toggle_param: self._stage_default_run(spec, config)
+            for spec in self._stage_specs(config)
         }
 
     def _eleven_stage_parameters(self, config: "PipelineConfig") -> List[Tuple[str, str, str, str]]:
@@ -1110,25 +1367,27 @@ class BasePipelineTemplate:
         ``workflow_dispatch.inputs``, GitLab ``variables:``, Azure
         DevOps ``parameters:``, etc.). Keeping one list here avoids
         6-way drift — adding / renaming a parameter flows to every
-        system automatically.
+        system automatically. The defaults are ``_pipeline_defaults``,
+        the same values every stage command falls back to.
         """
+        d = self._pipeline_defaults(config)
         params: List[Tuple[str, str, str, str]] = [
             # Global
             (
                 "CONTRACT",
                 "string",
-                "contract.fluid.yaml",
+                d["CONTRACT"],
                 "Contract path relative to workspace (or workdir when set).",
             ),
             (
                 "FLUID_ENV",
                 "string",
-                "dev",
+                d["FLUID_ENV"],
                 "Environment overlay (dev | staging | prod).",
             ),
         ]
         # 11 stage toggles
-        for spec in self._stage_specs():
+        for spec in self._stage_specs(config):
             params.append(
                 (
                     spec.toggle_param,
@@ -1142,26 +1401,28 @@ class BasePipelineTemplate:
             [
                 (
                     "APPLY_MODE",
-                    "choice:dry-run,create-only,amend,amend-and-build,replace,replace-and-build",
-                    "amend",
-                    "Stage 7: apply mode. ``replace*`` variants require ALLOW_DATA_LOSS=true.",
+                    "choice:" + ",".join(APPLY_MODES),
+                    d["APPLY_MODE"],
+                    "Stage 6 plans and stage 7 applies this mode. ``replace*`` variants "
+                    "require ALLOW_DATA_LOSS=true.",
                 ),
                 (
                     "APPLY_BUILD_ID",
                     "string",
-                    "",
-                    "Stage 7: build ID for amend-and-build / replace-and-build. Empty skips.",
+                    d["APPLY_BUILD_ID"],
+                    "Stage 7: build to run with amend-and-build / replace-and-build "
+                    "(blank runs every build). Not passed with any other mode.",
                 ),
                 (
                     "ALLOW_DATA_LOSS",
                     "boolean",
-                    "false",
+                    d["ALLOW_DATA_LOSS"],
                     "Stage 7: gate for replace / replace-and-build modes.",
                 ),
                 (
                     "NO_VERIFY_DIGEST",
                     "boolean",
-                    "false",
+                    d["NO_VERIFY_DIGEST"],
                     "Stage 7: emergency escape — waives BOTH the plan-binding "
                     "and federation upstream-digest gates "
                     "(--no-verify-plan-binding --no-verify-federation). Audit log flag.",
@@ -1169,43 +1430,44 @@ class BasePipelineTemplate:
                 (
                     "PUBLISH_TARGETS",
                     "string",
-                    "datamesh-manager",
+                    d["PUBLISH_TARGETS"],
                     "Stage 10: space-separated catalog targets.",
                 ),
                 (
                     "SCHEDULER",
-                    "choice:,airflow,mwaa,composer,astronomer,prefect,dagster",
-                    "",
+                    "choice:," + ",".join(SCHEDULERS),
+                    d["SCHEDULER"],
                     "Stage 11: scheduler target. Blank = no-op.",
                 ),
                 (
                     "SCHEDULER_DESTINATION",
                     "string",
-                    "",
-                    "Stage 11: airflow/mwaa destination URL (s3:, gs:, az:, ssh:, scp:, file:).",
+                    d["SCHEDULER_DESTINATION"],
+                    "Stage 11: airflow/mwaa DAG root (s3:, gs:, az:, ssh:, scp:, file:); "
+                    "each product syncs into <root>/<contract id>/.",
                 ),
                 (
                     "SCHEDULER_ENVIRONMENT_NAME",
                     "string",
-                    "",
+                    d["SCHEDULER_ENVIRONMENT_NAME"],
                     "Stage 11: composer env name or astronomer deployment name.",
                 ),
                 (
                     "SCHEDULER_LOCATION",
                     "string",
-                    "",
+                    d["SCHEDULER_LOCATION"],
                     "Stage 11: GCP region for composer.",
                 ),
                 (
                     "SCHEDULER_WORKSPACE",
                     "string",
-                    "",
+                    d["SCHEDULER_WORKSPACE"],
                     "Stage 11: prefect workspace or dagster-cloud deployment name.",
                 ),
                 (
                     "SCHEDULE_SYNC_DRY_RUN",
                     "boolean",
-                    "false",
+                    d["SCHEDULE_SYNC_DRY_RUN"],
                     "Stage 11: --dry-run (log planned subprocess argv without executing).",
                 ),
             ]
@@ -1217,25 +1479,26 @@ class BasePipelineTemplate:
                     (
                         "FLUID_PACKAGE_SPEC",
                         "string",
-                        "data-product-forge",
-                        "pip package spec. Pin with 'data-product-forge==X.Y.Z'.",
+                        d["FLUID_PACKAGE_SPEC"],
+                        "pip package spec. Defaults to the forge-cli version that generated "
+                        "this pipeline, with the extras its contract needs.",
                     ),
                     (
                         "FLUID_PIP_INDEX_URL",
                         "string",
-                        "",
+                        d["FLUID_PIP_INDEX_URL"],
                         "Primary pip index. Blank = stable PyPI; set TestPyPI URL for pilot builds.",
                     ),
                     (
                         "FLUID_PIP_EXTRA_INDEX_URL",
                         "string",
-                        "",
+                        d["FLUID_PIP_EXTRA_INDEX_URL"],
                         "Fallback pip index for transitive deps.",
                     ),
                     (
                         "FLUID_ALLOW_PRERELEASE",
                         "boolean",
-                        "false",
+                        d["FLUID_ALLOW_PRERELEASE"],
                         "Pass pip --pre (pulls alpha/rc releases).",
                     ),
                 ]

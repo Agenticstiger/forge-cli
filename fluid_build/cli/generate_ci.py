@@ -39,11 +39,44 @@ import argparse
 import logging
 import os
 import subprocess
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from ._common import CLIError
 from ._io import atomic_write
 from ._logging import info
+
+#: ``fluid apply --mode`` values and stage-11 schedulers, for the option
+#: choices (kept here so ``--help`` does not import the template modules).
+APPLY_MODE_CHOICES = (
+    "dry-run",
+    "create-only",
+    "amend",
+    "amend-and-build",
+    "replace",
+    "replace-and-build",
+)
+SCHEDULER_CHOICES = ("airflow", "mwaa", "composer", "astronomer", "prefect", "dagster")
+
+#: Reading the contract and its overlays for the pipeline's defaults is not
+#: news: only the loader's warnings reach the console.
+_SCAN_LOG = logging.getLogger("fluid_build.cli.generate_ci.contract_scan")
+_SCAN_LOG.setLevel(logging.WARNING)
+
+#: ``data-product-forge`` extra each binding platform (and engine) needs.
+_PLATFORM_EXTRAS: Dict[str, str] = {
+    "local": "local",
+    "duckdb": "local",
+    "aws": "aws",
+    "s3": "aws",
+    "glue": "aws",
+    "athena": "aws",
+    "gcp": "gcp",
+    "bigquery": "gcp",
+    "gcs": "gcp",
+    "snowflake": "snowflake",
+    "databricks": "databricks",
+}
 
 # Lazy-imported inside ``run`` so ``register_subcommand`` doesn't drag
 # the full pipeline_templates module in for ``--help`` invocations.
@@ -149,9 +182,10 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         default="pypi",
         help=(
             "How the generated Jenkinsfile installs fluid at build time:\n"
-            "  pypi (default)  production. `pip install data-product-forge`\n"
-            "                  from stable PyPI. Override the package spec\n"
-            "                  via FLUID_PACKAGE_SPEC env var at build time.\n"
+            "  pypi (default)  production. Stage 0 installs FLUID_PACKAGE_SPEC\n"
+            "                  (this forge-cli version, see --fluid-package-spec)\n"
+            "                  into a venv in the workspace; override it at\n"
+            "                  build time with the FLUID_PACKAGE_SPEC parameter.\n"
             "  dev-source      lab / contributor only. Installs from a\n"
             "                  /forge-cli-src bind mount in the Jenkins\n"
             "                  container. Fails LOUD if the mount is\n"
@@ -165,20 +199,13 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         default=None,
         metavar="TARGET",
         help=(
-            "Opt-in fallback catalog target baked into Stage 10's\n"
-            "publish shell as ``${PUBLISH_TARGETS:-<TARGET>}``. When\n"
-            "omitted (the default), Stage 10 emits the bare\n"
-            "``${PUBLISH_TARGETS}`` form with no shell fallback.\n"
-            "\n"
-            "Matters for the first Pipeline-from-SCM build Jenkins\n"
-            "auto-triggers after a job is created: the parameters\n"
-            "block's defaults are not exported as env vars to that\n"
-            "first build, so without this flag the CLI publishes to\n"
-            "its built-in default (``fluid-command-center``) which\n"
-            "may not be reachable. Pick the value that matches your\n"
-            "team's primary catalog (e.g. ``datamesh-manager``,\n"
-            "``horizon``, ``datahub``, ``collibra``).\n"
-            "Only the Jenkins template consumes this today."
+            "Default of the PUBLISH_TARGETS parameter, and the fallback\n"
+            "Stage 10 reads when a build has no parameters (a Jenkins\n"
+            "job's first build, or its first after a restart that\n"
+            "re-seeded it). Default: datamesh-manager. Pick the value\n"
+            "that matches your team's primary catalog (e.g.\n"
+            "``fluid-command-center``, ``datamesh-manager``, ``horizon``,\n"
+            "``datahub``, ``collibra``)."
         ),
     )
     p.add_argument(
@@ -213,6 +240,61 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
             "pipeline installs a fluid CLI older than ``fluid publish --env``, "
             "which rejects the flag. Only the Jenkins template consumes this "
             "today; the other systems always pass --env."
+        ),
+    )
+    p.add_argument(
+        "--fluid-package-spec",
+        default=None,
+        metavar="SPEC",
+        help=(
+            "Default of the pipeline's FLUID_PACKAGE_SPEC parameter (what stage 0 "
+            "installs into the workspace venv). Default: this forge-cli version, "
+            "with the extras the contract's bindings need across its base and "
+            "every overlay, e.g. 'data-product-forge[aws,local]==X.Y.Z'."
+        ),
+    )
+    p.add_argument(
+        "--apply-mode-default",
+        choices=list(APPLY_MODE_CHOICES),
+        default=None,
+        help=(
+            "Default of APPLY_MODE, the mode stage 6 plans and stage 7 applies. "
+            "Default: dry-run for Jenkins, amend for the other systems."
+        ),
+    )
+    p.add_argument(
+        "--schedule-sync-default",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Default of RUN_STAGE_11_SCHEDULE_SYNC (default: false).",
+    )
+    p.add_argument(
+        "--scheduler-default",
+        choices=list(SCHEDULER_CHOICES),
+        default=None,
+        help="Default of SCHEDULER, stage 11's scheduler (default: blank, no-op).",
+    )
+    p.add_argument(
+        "--scheduler-destination-default",
+        default=None,
+        metavar="URL",
+        help=(
+            "Default of SCHEDULER_DESTINATION: the shared DAG root (s3://, gs://, "
+            "az://, ssh://, scp://, git+ssh://, file:// or an absolute path). "
+            "Stage 11 writes this product into <root>/<contract id>/ and deletes "
+            "only there (--delete-scope product), so every product's pipeline "
+            "can share one root."
+        ),
+    )
+    p.add_argument(
+        "--diff-last-applied",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Jenkins: give stage 5 the plan the last successful build applied "
+            "(fluid diff --last-applied), copied from that build's artifacts, so "
+            "a schema change the contract makes is 'pending' rather than drift. "
+            "Needs the copyartifact plugin (default: off)."
         ),
     )
     p.add_argument(
@@ -270,12 +352,12 @@ def _echo_install_mode_summary(install_mode: str, out_path: Optional[str]) -> No
     if install_mode == "pypi":
         cprint(f"[install-mode: pypi] Jenkinsfile written -> {dest}", markup=False)
         cprint(
-            "  |- Jenkins installs: pip install data-product-forge (stable PyPI)",
+            "  |- Jenkins installs FLUID_PACKAGE_SPEC into $WORKSPACE/.fluid-venv (stage 0)",
             markup=False,
         )
         cprint("  |  Override at build time via these Jenkins parameters:", markup=False)
         cprint(
-            "  |    FLUID_PACKAGE_SPEC        = 'data-product-forge==X.Y.Z'  (pin version)",
+            "  |    FLUID_PACKAGE_SPEC        = 'data-product-forge==X.Y.Z'  (another version)",
             markup=False,
         )
         cprint(
@@ -411,6 +493,148 @@ def _git_prefix() -> Optional[str]:
     return prefix or None
 
 
+def _git_toplevel(directory: Path) -> Optional[Path]:
+    """The root of the git work tree holding ``directory``, or None."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
+def _pipeline_location(contract_arg: str) -> Tuple[Optional[str], str]:
+    """``(workdir, contract)``: where the pipeline runs, and the contract from there.
+
+    Jenkins (and every CI system) runs from the checkout root. When the
+    contract is under the current directory, the pipeline ``cd``s to that
+    directory (its path in the repository, ``git rev-parse --show-prefix``)
+    and names the contract relative to it, so generating from the repository
+    root and from the contract's own directory both give a pipeline that
+    builds the contract given. When it is not (``../x/contract.fluid.yaml``,
+    or an absolute path elsewhere), the pipeline runs from the root of the
+    contract's repository and names it from there.
+    """
+    cwd = Path.cwd().resolve()
+    given = Path(contract_arg)
+    resolved = (given if given.is_absolute() else cwd / given).resolve()
+    try:
+        return _git_prefix(), resolved.relative_to(cwd).as_posix()
+    except ValueError:
+        pass
+    top = _git_toplevel(resolved.parent)
+    if top is None:
+        raise CLIError(
+            1,
+            "generate_ci_contract_outside_workdir",
+            {
+                "contract": contract_arg,
+                "hint": (
+                    "the contract is neither under the current directory nor in a git "
+                    "repository; run `fluid generate ci` from a directory that contains it"
+                ),
+            },
+        )
+    return None, resolved.relative_to(top).as_posix()
+
+
+def _contract_documents(contract_path: str) -> List[Dict[str, Any]]:
+    """The contract, and the contract under each overlay beside it."""
+    try:
+        from fluid_build.loader import available_overlay_envs, load_with_overlay
+
+        documents = [load_with_overlay(contract_path, None, _SCAN_LOG)]
+        for env in available_overlay_envs(contract_path):
+            documents.append(load_with_overlay(contract_path, env, _SCAN_LOG))
+    except Exception:
+        # Unreadable contract: no extras beyond what the caller asks for.
+        return []
+    return [d for d in documents if isinstance(d, dict)]
+
+
+def _contract_package_extras(contract_path: str) -> List[str]:
+    """``data-product-forge`` extras the contract's bindings and engines need,
+    across its base and every overlay (a pipeline can run any of them)."""
+    extras = set()
+    for document in _contract_documents(contract_path):
+        for expose in document.get("exposes") or []:
+            binding = expose.get("binding") if isinstance(expose, dict) else None
+            platform = binding.get("platform") if isinstance(binding, dict) else None
+            if isinstance(platform, str) and platform.lower() in _PLATFORM_EXTRAS:
+                extras.add(_PLATFORM_EXTRAS[platform.lower()])
+        for build in document.get("builds") or []:
+            engine = build.get("engine") if isinstance(build, dict) else None
+            if isinstance(engine, str) and engine.lower() in _PLATFORM_EXTRAS:
+                extras.add(_PLATFORM_EXTRAS[engine.lower()])
+    return sorted(extras)
+
+
+def _single_build_id(contract_path: str) -> str:
+    """The contract's build id when it declares exactly one build, else ""."""
+    documents = _contract_documents(contract_path)
+    if not documents:
+        return ""
+    builds = documents[0].get("builds") or []
+    if isinstance(builds, list) and len(builds) == 1 and isinstance(builds[0], dict):
+        build_id = builds[0].get("id")
+        if isinstance(build_id, str):
+            return build_id
+    return ""
+
+
+def _check_scheduler_destination(raw: str, scheduler: str) -> str:
+    """``--scheduler-destination-default``, refused at generation time the way
+    ``fluid schedule-sync`` would refuse it at run time. A relative path would
+    resolve against whichever directory the stage runs in, so it must be
+    absolute or a URL."""
+    from .schedule_sync import _validate_destination
+
+    raw = raw.strip()
+    if "://" not in raw and not raw.startswith("/"):
+        raise CLIError(
+            1,
+            "generate_ci_scheduler_destination_relative",
+            {"destination": raw, "hint": "give an absolute path or a URL (file:///...)"},
+        )
+    _validate_destination(raw, scheduler or "airflow")
+    return raw
+
+
+def _echo_pipeline_summary(config: Any, jenkins_plugins: Optional[List[str]]) -> None:
+    """What the generated pipeline installs and, for Jenkins, the plugins it needs."""
+    from fluid_build import __version__
+    from fluid_build.cli.console import cprint
+    from fluid_build.forge.core.pipeline_systems._base import default_fluid_package_spec
+
+    spec = config.fluid_package_spec or default_fluid_package_spec(config.package_extras)
+    cprint(f"  |- FLUID_PACKAGE_SPEC default: {spec}", markup=False)
+    if not config.fluid_package_spec and _is_development_version(__version__):
+        cprint(
+            f"  |  NOTE: {__version__} is a development build, which PyPI does not have: "
+            "pass --fluid-package-spec (a wheel, a VCS URL or a release) for a pipeline "
+            "that can install it.",
+            markup=False,
+        )
+    if jenkins_plugins is not None:
+        cprint(f"  |- Jenkins plugins required: {', '.join(jenkins_plugins)}", markup=False)
+
+
+def _is_development_version(version: str) -> bool:
+    try:
+        from packaging.version import Version
+
+        parsed = Version(version)
+    except Exception:
+        return True
+    return parsed.is_devrelease or parsed.local is not None
+
+
 def run(args, logger: logging.Logger) -> int:
     try:
         from fluid_build.forge.core.pipeline_templates import (
@@ -509,6 +733,7 @@ def run(args, logger: logging.Logger) -> int:
             )
 
         contract_path = getattr(args, "contract", None) or "contract.fluid.yaml"
+        workdir, pipeline_contract = _pipeline_location(contract_path)
         no_generate_flag = bool(getattr(args, "no_generate_artifacts", False))
         generates_artifacts = not (no_generate_flag or _contract_is_reference_only(contract_path))
 
@@ -540,10 +765,36 @@ def run(args, logger: logging.Logger) -> int:
         # to ``host.docker.internal`` (Docker Desktop) or the bridge IP.
         runner_host_override = getattr(args, "runner_host_override", "") or ""
 
+        scheduler_default = getattr(args, "scheduler_default", None) or ""
+        raw_destination = getattr(args, "scheduler_destination_default", None) or ""
+        scheduler_destination = (
+            _check_scheduler_destination(raw_destination, scheduler_default)
+            if raw_destination.strip()
+            else ""
+        )
+        raw_spec = getattr(args, "fluid_package_spec", None)
+        fluid_package_spec = raw_spec.strip() if isinstance(raw_spec, str) else ""
+        if raw_spec is not None and (not fluid_package_spec or fluid_package_spec[0] == "-"):
+            raise CLIError(
+                1,
+                "generate_ci_package_spec_invalid",
+                {"hint": "--fluid-package-spec takes a pip requirement, not blank or an option"},
+            )
+        schedule_sync_default_arg = getattr(args, "schedule_sync_default", None)
+
         config = PipelineConfig(
             provider=provider,
             complexity=complexity,
-            workdir=_git_prefix(),
+            workdir=workdir,
+            contract_path=pipeline_contract,
+            fluid_package_spec=fluid_package_spec or None,
+            package_extras=_contract_package_extras(contract_path),
+            apply_mode_default=getattr(args, "apply_mode_default", None),
+            apply_build_id_default=_single_build_id(contract_path),
+            schedule_sync_default=bool(schedule_sync_default_arg),
+            scheduler_default=scheduler_default,
+            scheduler_destination_default=scheduler_destination,
+            diff_last_applied=bool(getattr(args, "diff_last_applied", None)),
             generates_artifacts=generates_artifacts,
             install_mode=install_mode,
             default_publish_target=default_publish_target,
@@ -561,7 +812,12 @@ def run(args, logger: logging.Logger) -> int:
                 True if publish_include_env_arg is None else bool(publish_include_env_arg)
             ),
         )
-        files = PipelineTemplateGenerator().generate_pipeline(config)
+        try:
+            files = PipelineTemplateGenerator().generate_pipeline(config)
+        except ValueError as exc:
+            # A generator option (or the contract's path) the pipeline cannot
+            # carry: refused before anything is written.
+            raise CLIError(1, "generate_ci_invalid_option", {"error": str(exc)})
         if not files:
             raise CLIError(
                 1,
@@ -619,8 +875,11 @@ def run(args, logger: logging.Logger) -> int:
         # consume the install-mode flag (currently Jenkins only); for
         # other systems it's a no-op.
         if canonical == "jenkins":
+            from fluid_build.forge.core.pipeline_systems.jenkins import JenkinsTemplate
+
             primary_path = out_override or primary
             _echo_install_mode_summary(install_mode, primary_path)
+            _echo_pipeline_summary(config, JenkinsTemplate.required_plugins(config))
 
         return 0
     except CLIError:

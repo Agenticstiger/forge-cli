@@ -515,6 +515,49 @@ def test_without_exit_on_drift_the_comparison_is_reported_and_exits_zero(
     assert [c["column"] for c in report["live"]["exposes"][0]["columns"]] == columns
 
 
+def _bundle(contract: Path, out: Path) -> Path:
+    rc, event = _invoke(
+        ["bundle", str(contract), "--env", "dev", "--format", "tgz", "--out", str(out)]
+    )
+    assert (rc, event) == (0, None)
+    return out
+
+
+def test_a_bundle_reads_the_target_where_the_source_contract_puts_it(workspace):
+    """Stage 5 of the generated pipelines diffs ``runtime/bundle.tgz``. A
+    relative local path is the build's, at the SOURCE contract's directory:
+    read from the bundle's own directory (``runtime/``) the target looked
+    absent, "to be created", and a drifted target passed the gate."""
+    contract = _local_case(
+        workspace, f"SELECT *, 'x' AS rogue_col FROM ({MATCHING_SELECT})", policy="strict"
+    )
+    bundle = _bundle(contract, workspace / "runtime" / "bundle.tgz")
+
+    rc, event = _invoke(
+        ["diff", str(bundle), "--env", "dev", "--out", "diff.json", "--exit-on-drift"]
+    )
+
+    report = _report(workspace / "diff.json")
+    (expose,) = report["live"]["exposes"]
+    assert expose["status"] == "drift"
+    assert [(c["column"], c["reason"]) for c in expose["columns"]] == [
+        ("rogue_col", "missing_in_contract")
+    ]
+    assert (rc, event) == (1, None)
+
+
+def test_a_bundle_of_a_matching_target_is_no_drift(workspace):
+    contract = _local_case(workspace, MATCHING_SELECT, policy="strict")
+    bundle = _bundle(contract, workspace / "runtime" / "bundle.tgz")
+
+    rc, event = _invoke(
+        ["diff", str(bundle), "--env", "dev", "--out", "diff.json", "--exit-on-drift"]
+    )
+
+    assert (rc, event) == (0, None)
+    assert _report(workspace / "diff.json")["live"]["exposes"][0]["status"] == "match"
+
+
 def test_local_target_not_built_yet_is_to_be_created_not_drift(workspace, capsys):
     contract = _local_case(workspace, None)
 

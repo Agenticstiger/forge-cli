@@ -472,24 +472,16 @@ class TestJenkinsTemplateHardening:
         # CD prefix appears inside each sh block. Every sh uses the
         # triple-single ``sh '''...'''`` Groovy form so the cd prefix
         # can safely use double-quoted paths (safe within single-quoted
-        # outer string).
-        assert 'cd "examples/demo" && fluid' in content
-        assert 'cd "examples/demo" && fluid validate' in content
-        # Stage 6 (plan) computes the same effective mode as stage 7 before
-        # calling ``fluid plan``, so its body starts with ``set -eu`` too.
-        plan_stage = content[content.index("stage('6 - plan')") :]
-        plan_sh = plan_stage[plan_stage.index("sh '''") : plan_stage.index("fluid plan")]
-        assert 'cd "examples/demo" && set -eu' in plan_sh
-        # Stage 7 (apply) uses POSIX ``set --`` composition since the
-        # security-hardening commit (auth-gate bypass via unquoted
-        # ${APPLY_BUILD_FLAG} was closed by refactoring to if/then/fi).
-        # The workdir prefix now applies to ``set -eu`` rather than
-        # directly to ``fluid apply``; the ``fluid apply "$@"`` on the
-        # last line of the set-- chain is what invokes the CLI.
-        assert 'cd "examples/demo" && set -eu' in content, (
-            "stage 7 sh body must start with 'cd <workdir> && set -eu' "
-            "to preserve workdir semantics under the POSIX set-- pattern"
-        )
+        # outer string), and every body then runs under ``set -eu``.
+        import re
+
+        bodies = re.findall(r"sh '''(.*?)'''", content, re.S)
+        fluid_bodies = [b for b in bodies if re.search(r"\bfluid\s", b)]
+        assert len(fluid_bodies) >= 12  # stage 0's version check + stages 1-11
+        for body in fluid_bodies:
+            assert body.startswith('cd "examples/demo" && set -eu'), body[:80]
+        assert 'fluid validate "$@"' in content
+        assert 'fluid plan "$@"' in content
         assert 'fluid apply "$@"' in content
 
     def test_workdir_prefixes_archive_patterns(self):
@@ -555,7 +547,7 @@ class TestJenkinsTemplateHardening:
 
     def test_verify_strict_default_can_be_overridden(self):
         content = self._jenkinsfile(verify_strict_default=False)
-        assert "name: 'VERIFY_STRICT',      defaultValue: false" in content
+        assert "name: 'VERIFY_STRICT', defaultValue: false" in content
 
     def test_publish_stage_default_can_be_overridden(self):
         content = self._jenkinsfile(publish_stage_default=True)
@@ -565,8 +557,8 @@ class TestJenkinsTemplateHardening:
         content = self._jenkinsfile(publish_include_env=False)
         stage_10 = content[content.index("stage('10 - publish')") :]
         stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
-        assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS}' in stage_10
-        assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS} \\' not in stage_10
+        assert 'set -- "${CONTRACT:-contract.fluid.yaml}" --format json' in stage_10
+        assert 'fluid publish "$@"' in stage_10
         assert '--env "${FLUID_ENV:-dev}"' not in stage_10
 
     def test_publish_stage_default_passes_the_env(self):
@@ -579,23 +571,56 @@ class TestJenkinsTemplateHardening:
         assert '--env "${FLUID_ENV:-dev}"' in stage_10
 
     def test_publish_stage_passes_a_hostile_env_as_one_argument(self, tmp_path):
-        """The rendered stage-10 ``sh`` body, run with a ``fluid`` stub."""
+        """The rendered stage-10 ``sh`` body, run with a ``fluid`` stub: a
+        FLUID_ENV holding spaces, a second ``--target`` and command
+        substitutions reaches ``fluid`` as the one value of ``--env``."""
         import re
         import shutil
+        import subprocess
 
         if shutil.which("sh") is None:
             pytest.skip("needs a POSIX shell")
-        from tests.cli.test_publish_target_flag import _run_rendered_publish
+        from tests.cli.test_publish_target_flag import _HOSTILE_ENV
 
         content = self._jenkinsfile()
         stage_10 = content[content.index("stage('10 - publish')") :]
         stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
         body = re.search(r"sh \'\'\'(.*?)\'\'\'", stage_10, re.S).group(1)
-        _run_rendered_publish(
-            tmp_path,
-            body,
-            {"PUBLISH_TARGETS": "command-center"},
-            ["publish", "c.yaml", "--target", "command-center", "--env"],
+        stub = tmp_path / "fluid"
+        stub.write_text('#!/bin/sh\nfor a in "$@"; do printf \'%s\\n\' "$a"; done\n')
+        stub.chmod(0o755)
+        env = {
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "CONTRACT": "c.yaml",
+            "FLUID_ENV": _HOSTILE_ENV,
+            "APPLY_MODE": "amend",  # a dry-run build publishes nothing
+            "PUBLISH_TARGETS": "fluid-command-center",
+        }
+        out = subprocess.run(
+            ["sh", "-c", body], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30
+        )
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.splitlines() == [
+            "publish",
+            "c.yaml",
+            "--env",
+            _HOSTILE_ENV,
+            "--format",
+            "json",
+            "--target=fluid-command-center",
+        ]
+        assert not list(tmp_path.glob("pwned*"))
+
+    def test_publish_stage_passes_env_by_default(self):
+        # ``fluid publish`` takes ``--env``: by default stage 10 publishes
+        # the contract with the overlay stage 7 applied, so the catalog
+        # records the binding the build used, not the base contract's.
+        content = self._jenkinsfile()
+        stage_10 = content[content.index("stage('10 - publish')") :]
+        stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
+        assert (
+            'set -- "${CONTRACT:-contract.fluid.yaml}" --env "${FLUID_ENV:-dev}" '
+            "--format json" in stage_10
         )
 
     def test_publish_stage_can_opt_in_to_env_flag(self):
@@ -629,8 +654,11 @@ class TestJenkinsTemplateHardening:
         content = self._jenkinsfile()
         # Unambiguous marker in stage name — operator sees it in UI.
         assert "stage('0 — Bootstrap FLUID [pypi]')" in content
-        # pypi mode's pip install sees FLUID_PACKAGE_SPEC with default.
-        assert '"${FLUID_PACKAGE_SPEC:-data-product-forge}"' in content
+        # pypi mode's pip install sees FLUID_PACKAGE_SPEC with its default:
+        # the forge-cli version that generated the file.
+        from fluid_build import __version__
+
+        assert f'-- "${{FLUID_PACKAGE_SPEC:-data-product-forge=={__version__}}}"' in content
         # dev-source branch must NOT appear in pypi mode — clean separation.
         assert "/forge-cli-src" not in content
         # pypi mode exposes the index-URL override parameters so TestPyPI
@@ -678,12 +706,14 @@ class TestJenkinsTemplateHardening:
         consumes them via shell-level env expansion; no Groovy rebuild."""
         content = self._jenkinsfile()
         # The shell consumes the 3 pip params.
-        assert "${FLUID_PIP_INDEX_URL:-}" in content
-        assert "${FLUID_PIP_EXTRA_INDEX_URL:-}" in content
+        assert 'INDEX_URL="${FLUID_PIP_INDEX_URL-}"' in content
+        assert 'EXTRA_INDEX_URL="${FLUID_PIP_EXTRA_INDEX_URL-}"' in content
         assert '"${FLUID_ALLOW_PRERELEASE:-false}" = "true"' in content
-        # --index-url is only emitted when FLUID_PIP_INDEX_URL is set.
-        assert "INDEX_FLAGS=" in content
-        assert "--index-url " in content
+        # --index-url is only emitted when FLUID_PIP_INDEX_URL is set, and
+        # as ONE argument: the value can never add pip options.
+        assert 'set -- "$@" "--index-url=$INDEX_URL"' in content
+        assert 'set -- "$@" "--extra-index-url=$EXTRA_INDEX_URL"' in content
+        assert "INDEX_FLAGS" not in content
 
 
 class TestJenkinsTemplateStage11ScheduleSync:
@@ -736,19 +766,23 @@ class TestJenkinsTemplateStage11ScheduleSync:
         assert "SCHEDULER_WORKSPACE" in content
         assert "SCHEDULE_SYNC_DRY_RUN" in content
 
-    def test_stage_11_routes_params_through_environment_block(self):
-        """Injection defence: every scheduler param must be threaded
-        via ``environment { ... }``. If any param were Groovy-interpolated
-        directly into the sh string, a quote in the value could break
-        out of the wrapper and become an argv position of its own."""
-        content = self._jenkinsfile()
-        # The env block assignments are the canonical hand-off point.
-        assert 'SCHEDULER = "${params.SCHEDULER}"' in content
-        assert 'SCHEDULER_DESTINATION = "${params.SCHEDULER_DESTINATION}"' in content
-        assert 'SCHEDULER_ENVIRONMENT_NAME = "${params.SCHEDULER_ENVIRONMENT_NAME}"' in content
-        assert 'SCHEDULER_LOCATION = "${params.SCHEDULER_LOCATION}"' in content
-        assert 'SCHEDULER_WORKSPACE = "${params.SCHEDULER_WORKSPACE}"' in content
-        assert 'SCHEDULE_SYNC_DRY_RUN = "${params.SCHEDULE_SYNC_DRY_RUN}"' in content
+    def test_stage_11_reads_params_from_the_environment_with_their_defaults(self):
+        """Injection defence: every scheduler param reaches the shell as the
+        environment variable Jenkins exports for it, never Groovy-
+        interpolated into the sh string, and each read falls back to the
+        default the parameter declares (a parameterless build exports none)."""
+        content = self._jenkinsfile(
+            scheduler_default="airflow", scheduler_destination_default="file:///dags"
+        )
+        sh_body = self._extract_stage_sh_body(content, "11 - schedule sync")
+        assert "${params." not in sh_body
+        assert 'SCHEDULER_V="${SCHEDULER-airflow}"' in sh_body
+        assert 'DEST="${SCHEDULER_DESTINATION-file:///dags}"' in sh_body
+        assert 'ENV_NAME="${SCHEDULER_ENVIRONMENT_NAME-}"' in sh_body
+        assert 'LOCATION="${SCHEDULER_LOCATION-}"' in sh_body
+        assert 'WORKSPACE_NAME="${SCHEDULER_WORKSPACE-}"' in sh_body
+        assert "defaultValue: 'file:///dags'" in content
+        assert "choices: ['airflow', ''," in content
 
     def test_stage_11_sh_body_uses_posix_set_dash_dash(self):
         """The sh body must build argv via POSIX ``set --`` (not bash
@@ -758,24 +792,32 @@ class TestJenkinsTemplateStage11ScheduleSync:
         ``_validate_destination`` / ``_validate_safe_ident``."""
         content = self._jenkinsfile()
         assert "set -eu" in content
-        assert "set -- --scheduler " in content
+        assert 'set -- --scheduler "$SCHEDULER_V" ' in content
+        # Deletion stays inside this product's directory of the DAG root.
+        assert "--delete-scope product" in content
         # Each optional flag is appended conditionally via if/then/fi
         # (not ``[ ... ] && ...`` — that interacts badly with set -e).
-        assert 'if [ -n "${SCHEDULER_DESTINATION:-}" ];' in content
-        assert 'if [ -n "${SCHEDULER_ENVIRONMENT_NAME:-}" ];' in content
-        assert 'if [ -n "${SCHEDULER_LOCATION:-}" ];' in content
-        assert 'if [ -n "${SCHEDULER_WORKSPACE:-}" ];' in content
+        assert 'if [ -n "$DEST" ]; then set -- "$@" --destination "$DEST"; fi' in content
+        assert 'if [ -n "$ENV_NAME" ]; then set -- "$@" --environment-name "$ENV_NAME"' in content
+        assert 'if [ -n "$LOCATION" ]; then set -- "$@" --location "$LOCATION"; fi' in content
+        assert 'if [ -n "$WORKSPACE_NAME" ]; then' in content
         assert 'if [ "${SCHEDULE_SYNC_DRY_RUN:-false}" = "true" ];' in content
         # Final invocation uses "$@" so each accumulated argv token is
         # passed as-is — no shell word-splitting of user input.
         assert 'fluid schedule-sync "$@"' in content
 
-    def test_stage_11_gated_by_both_run_flag_and_scheduler_trim(self):
-        """The when{} clause must require BOTH RUN_STAGE_11_SCHEDULE_SYNC
-        AND a non-blank SCHEDULER. A blank scheduler with the run flag
-        on is a misconfiguration, not a pipeline intent."""
+    def test_stage_11_gated_by_run_flag_and_skips_a_blank_scheduler(self):
+        """The when{} clause gates on RUN_STAGE_11_SCHEDULE_SYNC (its declared
+        default when the build has no parameters); a blank SCHEDULER is a
+        clean, logged skip in the shell, not a silent when{} skip."""
         content = self._jenkinsfile()
-        assert "params.RUN_STAGE_11_SCHEDULE_SYNC && params.SCHEDULER?.trim()" in content
+        assert (
+            "return (params.RUN_STAGE_11_SCHEDULE_SYNC == null ? false "
+            ": params.RUN_STAGE_11_SCHEDULE_SYNC.toString() == 'true')" in content
+        )
+        sh_body = self._extract_stage_sh_body(content, "11 - schedule sync")
+        assert 'if [ -z "$SCHEDULER_V" ]; then' in sh_body
+        assert "SCHEDULER is blank" in sh_body
 
     def test_stage_11_self_gates_on_schedule_dags_dir(self):
         """Stage 11 must self-gate on ``dist/artifacts/schedule/`` the way
@@ -898,8 +940,9 @@ class TestJenkinsTemplateStage11ScheduleSync:
         )
         # Pattern fingerprints that MUST appear:
         assert "set -eu" in sh_body
-        assert "set -- runtime/plan.json" in sh_body
-        assert 'if [ -n "${APPLY_BUILD_ID_VAL:-}" ]' in sh_body
+        assert "set -- runtime/plan.json --bundle runtime/bundle.tgz" in sh_body
+        assert 'BUILD_ID="${APPLY_BUILD_ID-}"' in sh_body
+        assert 'set -- "$@" --build-id "$BUILD_ID"' in sh_body
         assert 'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]' in sh_body
         assert 'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]' in sh_body
         # The single NO_VERIFY_DIGEST CI knob now appends BOTH
@@ -909,46 +952,19 @@ class TestJenkinsTemplateStage11ScheduleSync:
         assert "--no-verify-digest" not in sh_body
         assert 'fluid apply "$@"' in sh_body
 
-    def test_stage_7_routes_params_through_plain_environment_block(self):
-        """The env block must carry raw param values — NOT Groovy
-        ternary-concatenated strings. The fix is the boundary between
-        Groovy interpolation (safe inside env assignments) and shell
-        interpretation (safe because we quote every $VAR expansion)."""
+    def test_stage_7_reads_raw_params_from_the_environment(self):
+        """Stage 7 reads each parameter as the raw environment variable
+        Jenkins exports for it — no Groovy ternary concatenation anywhere,
+        and no per-stage ``environment {}`` re-assignment. The boundary is
+        shell interpretation, safe because every $VAR expansion is quoted."""
         content = self._jenkinsfile()
         marker = "stage('7 - apply')"
-        assert marker in content
-        tail = content[content.index(marker) :]
-        # Isolate the stage-7 environment{} block via brace-depth
-        # counting (the first `}` could be the closer of `${VAR}` inside
-        # an assignment, not the closer of the environment block itself).
-        # Use "environment {\n" to skip any literal `environment {}` in
-        # a comment; the real block opens a brace then a newline.
-        env_start = tail.find("environment {\n")
-        depth = 0
-        i = env_start
-        env_end = None
-        while i < len(tail):
-            c = tail[i]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    env_end = i + 1
-                    break
-            i += 1
-        assert env_end is not None, "could not find closing `}` of stage 7 environment block"
-        env_block = tail[env_start:env_end]
-        # Raw values — good:
-        assert 'APPLY_BUILD_ID_VAL = "${params.APPLY_BUILD_ID}"' in env_block
-        assert 'APPLY_MODE = "${params.APPLY_MODE}"' in env_block
-        assert 'ALLOW_DATA_LOSS = "${params.ALLOW_DATA_LOSS}"' in env_block
-        assert 'NO_VERIFY_DIGEST = "${params.NO_VERIFY_DIGEST}"' in env_block
-        # Ternary concatenation — must not reappear:
-        assert "? '--build '" not in env_block, (
-            "Stage 7 env block regressed to ternary concatenation — "
-            "unquoted expansion downstream would reintroduce the auth-"
-            "gate bypass."
+        stage = content[content.index(marker) : content.index("stage('8 - policy apply')")]
+        assert "environment {" not in stage
+        assert "${params." not in stage
+        assert "? '--build '" not in stage, (
+            "Stage 7 regressed to ternary concatenation — unquoted expansion "
+            "downstream would reintroduce the auth-gate bypass."
         )
 
 
@@ -1071,15 +1087,15 @@ class TestStageSpecsHelper:
         body = bt._render_stage_command(bt._stage_specs()[0], self._cfg())
         assert 'cd "' not in body
 
-    def test_render_escapes_double_quotes_in_workdir(self):
-        """Defence-in-depth: if someone constructs a PipelineConfig
-        with a workdir containing a double-quote (argparse rejects
-        this for user input, but programmatic callers could), the
-        renderer escapes it so the generated ``cd`` doesn't break
-        out of its quoting."""
+    def test_render_refuses_a_workdir_that_could_break_its_quoting(self):
+        """Defence-in-depth: a PipelineConfig built programmatically with a
+        workdir holding a double-quote (or ``$``, a backquote...) is refused
+        at generation time: escaping one character left ``$(...)`` and
+        backquotes expanding inside the generated ``cd "..."``."""
         bt = self._bt()
-        body = bt._render_stage_command(bt._stage_specs()[0], self._cfg(workdir='odd"dir'))
-        assert 'cd "odd\\"dir" && ' in body
+        for workdir in ('odd"dir', "x$(id)", "a`b`", "c\\d", "d*", "e,f"):
+            with pytest.raises(ValueError, match="workdir"):
+                bt._render_stage_command(bt._stage_specs()[0], self._cfg(workdir=workdir))
 
     def test_stage_3_off_for_reference_only_contracts(self):
         """Stage 3 (generate artifacts) is the one spec whose default
@@ -1105,11 +1121,12 @@ class TestStageSpecsHelper:
         bt = self._bt()
         s7 = next(s for s in bt._stage_specs() if s.num == 7)
         assert "set -eu" in s7.command
-        assert "set -- runtime/plan.json" in s7.command
+        assert "set -- runtime/plan.json --bundle runtime/bundle.tgz" in s7.command
         # The explicit APPLY_* env-var references mean CI systems
         # must route Build-With-Parameters values through env, not
         # through template interpolation.
-        assert 'if [ -n "${APPLY_BUILD_ID:-}" ]' in s7.command
+        assert 'BUILD_ID="${APPLY_BUILD_ID-}"' in s7.command
+        assert 'set -- "$@" --build-id "$BUILD_ID"' in s7.command
         assert 'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]' in s7.command
         assert 'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]' in s7.command
         # The single NO_VERIFY_DIGEST CI knob appends BOTH narrowly-
@@ -1129,7 +1146,8 @@ class TestStageSpecsHelper:
         scheduler-variant params."""
         bt = self._bt()
         s11 = next(s for s in bt._stage_specs() if s.num == 11)
-        assert 'set -- --scheduler "$SCHEDULER"' in s11.command
+        assert 'SCHEDULER_V="${SCHEDULER-}"' in s11.command
+        assert 'set -- --scheduler "$SCHEDULER_V"' in s11.command
         for var in (
             "SCHEDULER_DESTINATION",
             "SCHEDULER_ENVIRONMENT_NAME",
@@ -1155,17 +1173,13 @@ class TestStageSpecsHelper:
         assert "CATALOG:-datamesh-manager" in s10.command
         assert "--target" in s10.command
 
-    def test_jenkins_stage_10_default_publish_target_opt_in(self):
-        """``config.default_publish_target`` is opt-in. When unset,
-        Stage 10's Jenkinsfile shell uses the bare ``${PUBLISH_TARGETS}``
-        form — matching behaviour before the flag was introduced — so
-        existing pipelines keep rendering identically.
-
-        When set to a non-empty value the shell switches to
-        ``${PUBLISH_TARGETS:-<value>}``, giving the first
-        Pipeline-from-SCM build Jenkins auto-triggers a sane fallback
-        before the ``parameters { }`` block's defaults are exported as
-        env vars. Whitespace-only values are treated as unset."""
+    def test_jenkins_stage_10_default_publish_target(self):
+        """``config.default_publish_target`` sets the PUBLISH_TARGETS
+        parameter's default AND stage 10's shell fallback,
+        ``${PUBLISH_TARGETS:-<value>}``: the first Pipeline-from-SCM build
+        Jenkins runs (and the first after a restart re-seeded the job)
+        exports no parameters. Unset or whitespace-only keeps
+        ``datamesh-manager`` for both."""
         from fluid_build.forge.core.pipeline_templates import (
             JenkinsTemplate,
             PipelineComplexity,
@@ -1181,26 +1195,18 @@ class TestStageSpecsHelper:
             )
             return JenkinsTemplate().generate(cfg)["Jenkinsfile"]
 
-        # Unset / None -> bare form (backwards compatible default).
-        # The template's doc-comment legitimately mentions
-        # ``${PUBLISH_TARGETS:-X}`` as an example — only the actual
-        # shell ``for t in ...`` line should be asserted against.
-        bare = _render(None)
-        assert "for t in ${PUBLISH_TARGETS}" in bare
-        assert "for t in ${PUBLISH_TARGETS:-" not in bare
-
-        # Whitespace-only -> treated as unset.
-        whitespace = _render("   ")
-        assert "for t in ${PUBLISH_TARGETS}" in whitespace
-        assert "for t in ${PUBLISH_TARGETS:-" not in whitespace
-
-        # Opt-in with specific catalog -> shell fallback injected.
-        opted = _render("datamesh-manager")
-        assert "for t in ${PUBLISH_TARGETS:-datamesh-manager}" in opted
-
-        # Arbitrary catalog names are accepted verbatim.
-        horizon = _render("horizon")
-        assert "for t in ${PUBLISH_TARGETS:-horizon}" in horizon
+        for configured, expected in (
+            (None, "datamesh-manager"),
+            ("   ", "datamesh-manager"),
+            ("fluid-command-center", "fluid-command-center"),
+            ("horizon", "horizon"),
+        ):
+            content = _render(configured)
+            assert f"for t in ${{PUBLISH_TARGETS:-{expected}}}; do" in content
+            assert f"name: 'PUBLISH_TARGETS', defaultValue: '{expected}'" in content
+            # Each word is ONE --target=<word> argument, never a glob.
+            assert 'set -- "$@" "--target=$t"' in content
+            assert "set -f" in content
 
     def test_stage_8_self_gates_on_bindings_json(self):
         """Stage 8 (policy apply) is a no-op when bindings.json is
@@ -1213,19 +1219,24 @@ class TestStageSpecsHelper:
 
     def test_every_stage_has_sensible_contract_fallback(self):
         """Every stage that references a contract path uses the
-        ``${CONTRACT:-contract.fluid.yaml}`` fallback so Build Now
-        works without the operator pre-setting CONTRACT. Stages that
-        operate on bundle.tgz / plan.json / dist/artifacts don't need
-        this (they use fixed paths)."""
+        ``${CONTRACT:-<contract>}`` fallback so Build Now works without
+        the operator pre-setting CONTRACT; the contract is the one the
+        config names. The stages after the bundle read the bundle stage 1
+        wrote (a frozen document for one env), not the contract."""
         bt = self._bt()
-        contract_ref_stages = {"bundle", "validate", "diff", "plan", "verify", "publish"}
-        for s in bt._stage_specs():
-            if s.slug in contract_ref_stages:
-                assert "${CONTRACT:-contract.fluid.yaml}" in s.command, (
-                    f"stage {s.num} ({s.slug}) references contract but "
-                    "doesn't use the ${CONTRACT:-contract.fluid.yaml} "
-                    "fallback — Build Now would fail without a pre-set env var"
-                )
+        cfg = self._cfg(contract_path="contracts/p/contract.fluid.yaml")
+        specs = {s.slug: s for s in bt._stage_specs(cfg)}
+        for slug in ("bundle", "publish"):
+            assert "${CONTRACT:-contracts/p/contract.fluid.yaml}" in specs[slug].command, slug
+        for slug in ("validate", "generate_artifacts", "diff", "plan", "verify"):
+            assert "runtime/bundle.tgz" in specs[slug].command, slug
+        for slug in ("validate", "diff", "plan", "verify"):
+            assert "${CONTRACT" not in specs[slug].command, slug
+        # Stage 3 names the contract only for the scheduled DAG to apply.
+        assert (
+            '--contract-path "${CONTRACT:-contracts/p/contract.fluid.yaml}"'
+            in specs["generate_artifacts"].command
+        )
 
 
 class TestElevenStagePortsAllSystems:

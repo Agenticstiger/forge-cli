@@ -102,7 +102,7 @@ class BitbucketTemplate(BasePipelineTemplate):
                 }
             }
         )
-        for spec in self._stage_specs():
+        for spec in self._stage_specs(config):
             body = self._render_stage_command(spec, config)
             # Gate at shell level — Bitbucket custom pipelines don't
             # expose per-step when: clauses. The ``|| echo`` branch
@@ -148,7 +148,7 @@ class BitbucketTemplate(BasePipelineTemplate):
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate Bitbucket pipeline"""
 
-        commands = self._get_fluid_commands()
+        commands = self._get_fluid_commands(config)
         # Engine specs registry — per-engine pip extras, env vars,
         # runtime notes. Each Bitbucket step is isolated so pip install
         # repeats; ``_install_cmd`` keeps that consistent.

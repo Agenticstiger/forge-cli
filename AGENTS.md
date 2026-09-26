@@ -76,12 +76,19 @@ Generated pipelines therefore compute ONE effective mode for stages 6 and 7: `AP
 
 `fluid generate ci --system jenkins --install-mode {pypi,dev-source}` picks how the GENERATED Jenkinsfile installs fluid at build time:
 
-- **`pypi`** (default, production) — single `pip install data-product-forge` from stable PyPI. Exposes 4 build-time Jenkins params so operators swap TestPyPI / private mirror / pin a version from the "Build with Parameters" dialog:
-  - `FLUID_PACKAGE_SPEC` (pin: `data-product-forge==X.Y.Z`)
+- **`pypi`** (default, production) — stage 0 creates `$WORKSPACE/.fluid-venv` (`python3 -m venv`; PEP 668 agents refuse a bare `pip install`), installs `FLUID_PACKAGE_SPEC` into it with `"$FLUID_VENV/bin/python" -m pip`, and every stage runs `fluid` from it (`FLUID_VENV` and `PATH` in the pipeline's `environment {}`; stage 0 fails if `PATH` does not find that `fluid` first). Exposes 4 build-time Jenkins params so operators swap TestPyPI / private mirror / another version from the "Build with Parameters" dialog, each passed to pip as ONE argument (`--index-url=<value>`, `--` before the spec):
+  - `FLUID_PACKAGE_SPEC` (default: the forge-cli that generated the file with the extras the contract's bindings need across its base and every overlay, e.g. `data-product-forge[aws,gcp,local]==X.Y.Z`; `fluid generate ci --fluid-package-spec` sets another)
   - `FLUID_PIP_INDEX_URL` (e.g. `https://test.pypi.org/simple/`)
   - `FLUID_PIP_EXTRA_INDEX_URL` (fallback for transitive deps)
   - `FLUID_ALLOW_PRERELEASE` (pip `--pre` for alpha/rc releases)
 - **`dev-source`** (lab/contributor) — sets `PYTHONPATH=/forge-cli-src` so imports resolve LIVE from a bind-mounted forge-cli checkout. Fails LOUD with the exact docker-compose line to add if the mount is missing — no silent fallback to PyPI.
+
+### The generated Jenkinsfile
+
+- **Contract and workdir.** Generated from the repository root, `CONTRACT` defaults to the path given and the stages run at the checkout root; generated from the contract's directory (as `make pipelines` does), every `sh` starts `cd "<that directory>" && set -eu` and `CONTRACT` defaults to the file name. A contract outside the current directory is named from its repository root.
+- **One table of parameters.** Every `parameters {}` default is also the fallback every shell read of that parameter uses (`${NAME:-default}`, or `${NAME-default}` where blank is meaningful: `APPLY_BUILD_ID`, `SCHEDULER*`, the index URLs), because Jenkins runs a job's first build, and its first after a restart re-seeded the job from job-dsl/JCasC, with no parameters exported. Stage toggles' `when {}` fall back the same way.
+- **The chain.** Stage 1 `fluid bundle --env`; stages 2, 3, 5, 6 and 9 read `runtime/bundle.tgz`; stage 6 plans for `APPLY_MODE`, stage 7 applies `runtime/plan.json --bundle runtime/bundle.tgz` in that mode (never rewritten), with `--build-id` only when the mode is `*-and-build`. A `dry-run` build writes nothing: after a dry-run apply stage 8 checks the bindings instead of enforcing them, and stages 9, 10 and 11 are skipped. Stage 10 is `fluid publish <contract> --env <env> --format json --target=<each of PUBLISH_TARGETS>` (a word carrying an endpoint, `name:https://...`, is refused: the agent's catalog credential would go to it), its document archived as `runtime/publish-report.json`. The workspace is removed with the core `deleteDir()` in `post { cleanup }`.
+- **Generator defaults** (safe unless given): `--apply-mode-default` (dry-run), `APPLY_BUILD_ID` = the contract's build when it has exactly one, `--publish-stage-default`, `--default-publish-target` (the parameter's default too), `--schedule-sync-default`, `--scheduler-default`, `--scheduler-destination-default` (the shared DAG root, absolute or a URL; stage 11 passes `--delete-scope product`), `--diff-last-applied` (stage 5 gets `--last-applied` from the plan the last successful build applied for the same env, via the copyartifact plugin: `copyArtifacts` from `lastSuccessful()` and `copyArtifactPermission` for the job itself; off by default so the file needs only `workflow-aggregator` and `git`). The banner and the `fluid generate ci` output list the plugins.
 
 ---
 

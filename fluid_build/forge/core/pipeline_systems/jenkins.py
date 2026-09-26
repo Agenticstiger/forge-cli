@@ -22,7 +22,8 @@ quirks stay contained. Inherits the 11-stage rendering scaffold from
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 try:
     import yaml
@@ -41,19 +42,119 @@ except ImportError:
     yaml = _YamlFallback()  # type: ignore[assignment]
 
 from ._base import (
+    APPLY_MODES,
+    BUNDLE_PATH,
     PINNED_ACTIONS,
+    SCHEDULERS,
     BasePipelineTemplate,
     PipelineComplexity,
     PipelineConfig,
     PipelineProvider,
     StageSpec,
     _pin_action,
+    apply_build_id_sh,
+    check_pipeline_workdir,
+    sh_param,
 )
 from ._engine_specs import (
     render_bootstrap_shell_section,
     render_runner_env_vars,
     render_runtime_notes,
 )
+
+#: Jenkins lists APPLY_MODE's choices in this order, the default moved first.
+_JENKINS_APPLY_MODE_ORDER: Tuple[str, ...] = (
+    "dry-run",
+    "amend",
+    "create-only",
+    "amend-and-build",
+    "replace",
+    "replace-and-build",
+)
+assert sorted(_JENKINS_APPLY_MODE_ORDER) == sorted(APPLY_MODES)
+
+#: Where stage 7 records the plan it applied (one file per env), and where
+#: stage 0 puts the one the last successful build recorded. Workspace-root
+#: relative; stage 0 removes the directory first, so a file committed there
+#: can never pose as a baseline.
+_CI_STATE_DIR = ".fluid-ci"
+
+_STEP_INDENT = " " * 16
+
+
+@dataclass(frozen=True)
+class _Param:
+    """One Jenkins build parameter: its declaration and its shell fallback."""
+
+    name: str
+    kind: str  # "boolean" | "string" | "choice"
+    default: str
+    description: str
+    choices: Tuple[str, ...] = ()
+    keep_blank: bool = False
+
+    def sh(self) -> str:
+        return sh_param(self.name, self.default, keep_blank=self.keep_blank)
+
+    def declaration(self) -> str:
+        desc = _groovy_sq(self.description)
+        if self.kind == "boolean":
+            return (
+                f"booleanParam(name: '{self.name}', defaultValue: {self.default},\n"
+                f"                     description: {desc})"
+            )
+        if self.kind == "choice":
+            # Jenkins' default for a choice parameter is its first choice.
+            ordered = [self.default] + [c for c in self.choices if c != self.default]
+            listed = ", ".join(_groovy_sq(c) for c in ordered)
+            return (
+                f"choice(name: '{self.name}',\n"
+                f"               choices: [{listed}],\n"
+                f"               description: {desc})"
+            )
+        return (
+            f"string(name: '{self.name}', defaultValue: {_groovy_sq(self.default)},\n"
+            f"               description: {desc})"
+        )
+
+
+def _groovy_sq(text: str) -> str:
+    """A Groovy single-quoted string literal."""
+    return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _when_on(param: _Param) -> str:
+    """Declarative ``when`` expression for a boolean parameter, with its default.
+
+    Declarative fills ``params`` with the declared defaults even when a build
+    carries no parameters, but a job-level parameter of the same name (job-dsl)
+    may be a string, so the value is compared as text and a missing one is the
+    default.
+    """
+    return (
+        f"(params.{param.name} == null ? {param.default} "
+        f": params.{param.name}.toString() == 'true')"
+    )
+
+
+def _sh_step(lines: List[str], cd: str, indent: str = _STEP_INDENT) -> str:
+    """One ``sh '''...'''`` step running ``lines`` under ``set -eu``.
+
+    The body is a Groovy ``'''`` string: ``$`` stays literal for the shell, but
+    a backslash would be a Groovy escape, so none is allowed.
+    """
+    for line in lines:
+        if "\\" in line or "'''" in line:
+            raise ValueError(f"shell line cannot sit in a Groovy ''' string: {line!r}")
+    body = "\n".join(f"{indent}    {line}" for line in lines)
+    return f"{indent}sh '''{cd}set -eu\n{body}'''"
+
+
+def _needs_bundle(stage: int) -> str:
+    return (
+        f'if [ ! -f {BUNDLE_PATH} ]; then echo "stage {stage} reads {BUNDLE_PATH}, '
+        'which stage 1 writes: run stage 1 in the same build" >&2; exit 1; fi'
+    )
 
 
 class JenkinsTemplate(BasePipelineTemplate):
@@ -70,14 +171,25 @@ class JenkinsTemplate(BasePipelineTemplate):
 
     * **Structural dry-run** (bundle → validate → generate → validate
       artifacts → diff → plan → apply ``--mode dry-run``) — zero
-      warehouse writes. Safe for every PR.
+      warehouse writes (stage 8 only checks the bindings, stage 9 has
+      nothing to verify). Safe for every PR. The default.
     * **Schema deploy** (above + apply ``--mode amend`` + policy-apply
       + verify). Stage 10 publish and stage 11 schedule-sync off.
     * **Full productionization** (all 11 stages on, apply
-      ``--mode amend-and-build`` with a specific BUILD_ID, publish to a
-      list of catalogs, schedule-sync DAGs to the scheduler).
+      ``--mode amend-and-build`` with the contract's build id, publish to
+      a list of catalogs, schedule-sync DAGs to the scheduler).
     * **Destructive replace** (apply ``--mode replace`` +
       ``ALLOW_DATA_LOSS=true``). Auto-snapshot before drop.
+
+    The chain: stage 1 bundles the contract with ``--env``; stages 2, 3,
+    5, 6 and 9 read that bundle; stage 6 plans for the APPLY_MODE stage 7
+    applies, and stage 7 applies stage 6's plan with ``--bundle``. Stage
+    10 publishes the contract with ``--env``.
+
+    Parameters come from one table (``_parameters``): its values are the
+    ``parameters {}`` defaults AND every shell's fallback, because Jenkins
+    runs a job's first build, and its first after it lost its parameter
+    definitions, with no parameters in the environment.
 
     Back-compat: the legacy ``generates_artifacts: False`` (reference-only
     contracts) and ``workdir: "..."`` (subfolder checkout) config flags
@@ -86,10 +198,240 @@ class JenkinsTemplate(BasePipelineTemplate):
     when workdir is set.
     """
 
+    system_apply_mode_default = "dry-run"
+
     def __init__(self):
         super().__init__()
         self.provider_name = "Jenkins"
         self.file_extensions = [".groovy"]
+
+    # ── Parameter table ─────────────────────────────────────────────────
+
+    def _parameters(self, config: PipelineConfig) -> Dict[str, _Param]:
+        """Every build parameter, in declaration order, with its default."""
+        d = self._pipeline_defaults(config)
+        keep = self.keep_blank_parameters
+        install_mode = config.install_mode or "pypi"
+        rows: List[_Param] = [
+            _Param(
+                "CONTRACT",
+                "string",
+                d["CONTRACT"],
+                "Contract path relative to the workspace (or workdir when set).",
+            ),
+            _Param(
+                "FLUID_ENV",
+                "string",
+                d["FLUID_ENV"],
+                "Environment overlay (dev | staging | prod | ...). Stage 1 bundles the "
+                "contract with it; every later stage checks the bundle is for it.",
+            ),
+        ]
+        if install_mode == "pypi":
+            rows += [
+                _Param(
+                    "FLUID_PACKAGE_SPEC",
+                    "string",
+                    d["FLUID_PACKAGE_SPEC"],
+                    "Package spec stage 0 installs into the workspace venv. Defaults to the "
+                    "forge-cli that generated this file, with the extras its contract needs.",
+                ),
+                _Param(
+                    "FLUID_PIP_INDEX_URL",
+                    "string",
+                    d["FLUID_PIP_INDEX_URL"],
+                    "Primary pip index. Leave blank for stable PyPI; set "
+                    "'https://test.pypi.org/simple/' for TestPyPI pilot builds, or your "
+                    "private mirror URL.",
+                    keep_blank=True,
+                ),
+                _Param(
+                    "FLUID_PIP_EXTRA_INDEX_URL",
+                    "string",
+                    d["FLUID_PIP_EXTRA_INDEX_URL"],
+                    "Fallback pip index. Usually 'https://pypi.org/simple/' when PRIMARY "
+                    "points at TestPyPI so transitive deps still resolve.",
+                    keep_blank=True,
+                ),
+                _Param(
+                    "FLUID_ALLOW_PRERELEASE",
+                    "boolean",
+                    d["FLUID_ALLOW_PRERELEASE"],
+                    "Pass pip --pre (pulls alpha/rc releases). Leave false in prod.",
+                ),
+            ]
+        toggles = {spec.num: spec for spec in self._stage_specs(config)}
+
+        def toggle(num: int, description: str) -> _Param:
+            spec = toggles[num]
+            on = self._stage_default_run(spec, config)
+            return _Param(spec.toggle_param, "boolean", "true" if on else "false", description)
+
+        rows += [
+            toggle(
+                1, "Stage 1: deterministic tgz bundle + MANIFEST.json (SHA-256), for FLUID_ENV."
+            ),
+            toggle(
+                2,
+                "Stage 2: validators on the bundle (schema + contract rules + sqlglot + openapi).",
+            ),
+            _Param(
+                "VALIDATE_STRICT",
+                "boolean",
+                "true",
+                "Stage 2: --strict (any validator error fails the pipeline).",
+            ),
+            toggle(
+                3,
+                "Stage 3: ODCS + ODPS-Bitol + schedule + policy fanout from the bundle. "
+                "Off for reference-only contracts.",
+            ),
+            _Param(
+                "GENERATE_EMIT",
+                "string",
+                "odcs,odps-bitol,schedule,policies",
+                "Stage 3 --emit list (comma-separated). dbt excluded by design (execution artifact).",
+            ),
+            toggle(4, "Stage 4: re-verify MANIFEST SHA-256 + per-format schema validators."),
+            toggle(5, "Stage 5: compare the bundled contract with the live target (drift gate)."),
+            _Param(
+                "DIFF_EXIT_ON_DRIFT",
+                "boolean",
+                "true",
+                "Stage 5: --exit-on-drift (hard-fail if drift detected).",
+            ),
+            toggle(6, "Stage 6: plan the bundle for APPLY_MODE; emits bundleDigest + planDigest."),
+            _Param(
+                "PLAN_HTML",
+                "boolean",
+                "true",
+                "Stage 6: also write runtime/plan.html, a visualization of the plan.",
+            ),
+            toggle(
+                7,
+                "Stage 7: apply stage 6's plan with the bundle (mode matrix; "
+                "plan-binding cryptographically verified).",
+            ),
+            _Param(
+                "APPLY_MODE",
+                "choice",
+                d["APPLY_MODE"],
+                "Stages 6 and 7: the mode planned and applied. dry-run = render only (safe); "
+                "amend = additive; *-and-build also runs the contract's builds; replace = "
+                "DROP+CREATE (requires ALLOW_DATA_LOSS in non-dev).",
+                choices=_JENKINS_APPLY_MODE_ORDER,
+            ),
+            _Param(
+                "APPLY_BUILD_ID",
+                "string",
+                d["APPLY_BUILD_ID"],
+                "Stage 7: the build amend-and-build / replace-and-build runs (blank runs "
+                "every build). Not passed with any other mode.",
+                keep_blank="APPLY_BUILD_ID" in keep,
+            ),
+            _Param(
+                "ALLOW_DATA_LOSS",
+                "boolean",
+                d["ALLOW_DATA_LOSS"],
+                "Stage 7: gate waiver for --mode replace* in non-dev or when target has rows.",
+            ),
+            _Param(
+                "NO_VERIFY_DIGEST",
+                "boolean",
+                d["NO_VERIFY_DIGEST"],
+                "Stage 7: DR emergency escape — waives BOTH the plan-binding and federation "
+                "upstream-digest gates (--no-verify-plan-binding --no-verify-federation). "
+                "Use only when the original bundle / upstreams are unreachable.",
+            ),
+            toggle(
+                8,
+                "Stage 8: enforce IAM/GRANT bindings (self-gated on bindings.json presence; "
+                "checked, not enforced, after a dry-run apply).",
+            ),
+            _Param(
+                "POLICY_APPLY_MODE",
+                "choice",
+                "enforce",
+                "Stage 8: enforce = apply GRANTs; check = dry-run / PR report only.",
+                choices=("enforce", "check"),
+            ),
+            toggle(
+                9,
+                "Stage 9: post-apply reconciliation of the bundle vs the live target "
+                "(skipped after a dry-run apply).",
+            ),
+            _Param(
+                "VERIFY_STRICT",
+                "boolean",
+                "true" if config.verify_strict_default else "false",
+                "Stage 9: --strict (fail on any schema mismatch, including silent type coercions).",
+            ),
+            toggle(
+                10,
+                "Stage 10: push catalog artifacts to one or more targets. Opt-in — typically "
+                "gated to main branch.",
+            ),
+            _Param(
+                "PUBLISH_TARGETS",
+                "string",
+                d["PUBLISH_TARGETS"],
+                "Stage 10: space-separated publish targets (fluid-command-center datahub "
+                "datamesh-manager collibra ...).",
+            ),
+            toggle(
+                11,
+                "Stage 11: push generated DAGs to scheduler (airflow / mwaa / composer / "
+                "astronomer / prefect / dagster).",
+            ),
+            _Param(
+                "SCHEDULER",
+                "choice",
+                d["SCHEDULER"],
+                "Stage 11 scheduler target. Blank = no-op.",
+                choices=("",) + SCHEDULERS,
+                keep_blank=True,
+            ),
+            _Param(
+                "SCHEDULER_DESTINATION",
+                "string",
+                d["SCHEDULER_DESTINATION"],
+                "Stage 11: airflow/mwaa DAG root. Supports s3://, gs://, az://, ssh://, scp://, "
+                "file:// or a bare path; this product's DAGs go to <root>/<contract id>/ and "
+                "nothing outside that directory is deleted. Required for airflow + mwaa; "
+                "ignored for composer / astronomer / prefect / dagster.",
+                keep_blank=True,
+            ),
+            _Param(
+                "SCHEDULER_ENVIRONMENT_NAME",
+                "string",
+                d["SCHEDULER_ENVIRONMENT_NAME"],
+                "Stage 11: composer environment name or astronomer deployment name.",
+                keep_blank=True,
+            ),
+            _Param(
+                "SCHEDULER_LOCATION",
+                "string",
+                d["SCHEDULER_LOCATION"],
+                "Stage 11: GCP region for composer (e.g. europe-west1, us-central1).",
+                keep_blank=True,
+            ),
+            _Param(
+                "SCHEDULER_WORKSPACE",
+                "string",
+                d["SCHEDULER_WORKSPACE"],
+                "Stage 11: prefect workspace or dagster-cloud deployment name.",
+                keep_blank=True,
+            ),
+            _Param(
+                "SCHEDULE_SYNC_DRY_RUN",
+                "boolean",
+                d["SCHEDULE_SYNC_DRY_RUN"],
+                "Stage 11: --dry-run (log the planned subprocess argv without executing).",
+            ),
+        ]
+        return {row.name: row for row in rows}
+
+    # ── Rendering ───────────────────────────────────────────────────────
 
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate the 11-stage parameterized Jenkinsfile.
@@ -97,86 +439,106 @@ class JenkinsTemplate(BasePipelineTemplate):
         Returns a ``{"Jenkinsfile": <content>}`` dict matching the
         ``BasePipelineTemplate`` contract.
         """
+        install_mode = config.install_mode or "pypi"
+        if install_mode not in ("pypi", "dev-source"):
+            # Defensive: unknown install_mode. Caller passed something
+            # we don't support — raise NOW (at generate time) rather
+            # than emit a broken Jenkinsfile that confuses CI later.
+            raise ValueError(
+                f"Unknown install_mode {install_mode!r} — expected 'pypi' or 'dev-source'"
+            )
+        P = self._parameters(config)
+
+        def v(name: str) -> str:
+            """The shell read of parameter ``name``, with its declared default."""
+            return P[name].sh()
 
         # ``cd "<workdir>" && `` prefix for every sh block when the
         # contract lives in a subfolder of the SCM checkout. Jenkins
         # checks out at repo root; fluid needs to run from the contract
         # folder. Every sh block uses the triple-single ``sh '''...'''``
         # form so double-quoted paths inside don't collide with outer
-        # string delimiters, and Jenkins params reach the shell via
-        # env-var injection (``${APPLY_MODE}`` etc.) rather than Groovy
-        # interpolation.
-        CD = f'cd "{config.workdir}" && ' if config.workdir else ""
-
+        # string delimiters, and Jenkins params reach the shell as the
+        # environment variables Jenkins exports for them, each read with
+        # its declared default, never by Groovy interpolation.
+        workdir = (config.workdir or "").strip("/")
+        if workdir:
+            check_pipeline_workdir(workdir)
+        CD = f'cd "{workdir}" && ' if workdir else ""
         # Archive patterns are rooted at the SCM root (the Jenkins workspace),
         # so every glob gets the workdir prefix. ``allowEmptyArchive: true``
         # on every archiveArtifacts handles reference-only contracts that
         # legitimately produce no plan.json / artifacts/ / reports.
-        P = f"{config.workdir}/" if config.workdir else ""
-
-        # Reference-only contracts (pattern: hybrid-reference) delegate
-        # generation to upstream — omit stage 3 entirely in that case.
-        stage_3_enabled_default = "true" if config.generates_artifacts else "false"
-
-        # Stage 10 ``PUBLISH_TARGETS`` rendering.
-        #
-        # Default (``config.default_publish_target is None``): emit the
-        # bare ``${PUBLISH_TARGETS}`` form — same as before this flag
-        # existed.
-        #
-        # Opt-in (``--default-publish-target X``): emit the
-        # ``${PUBLISH_TARGETS:-X}`` shell-level fallback so the very
-        # first Pipeline-from-SCM build Jenkins auto-triggers
-        # (before the parameters block is exported as env vars)
-        # still publishes to the intended catalog.
-        _pub_target = (config.default_publish_target or "").strip()
-        PUBLISH_TARGETS_EXPANSION = (
-            f"PUBLISH_TARGETS:-{_pub_target}" if _pub_target else "PUBLISH_TARGETS"
-        )
-        verify_strict_default = "true" if config.verify_strict_default else "false"
-        publish_stage_default = "true" if config.publish_stage_default else "false"
-        publish_command = (
-            '''fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS} \\
-                         --env "${FLUID_ENV:-dev}"'''
-            if config.publish_include_env
-            else """fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS}"""
+        W = f"{workdir}/" if workdir else ""
+        env_flag = f'--env "{v("FLUID_ENV")}"'
+        # The DAG stage 3 renders applies this path relative to the checkout
+        # (FLUID_PROJECT_DIR on the Airflow worker); a bundle does not record it.
+        project_contract = f"{W}{v('CONTRACT')}"
+        last_applied = bool(config.diff_last_applied)
+        applied_dir = f"$WORKSPACE/{_CI_STATE_DIR}/applied"
+        baseline_dir = f"$WORKSPACE/{_CI_STATE_DIR}/last-applied"
+        dry_run_applied = (
+            f'[ "{v("RUN_STAGE_7_APPLY")}" = "true" ] && [ "{v("APPLY_MODE")}" = "dry-run" ]'
         )
 
-        # --- Install-mode dispatch --------------------------------------
-        # Pick the Setup stage's pip-install shell body based on
-        # ``config.install_mode``. The generated Jenkinsfile carries only
-        # the logic for the selected mode — no runtime branching, no dead
-        # fallback code. This keeps production Jenkinsfiles short + clean.
-        install_mode = config.install_mode or "pypi"
+        def skip_after_dry_run(stage: int, what: str) -> List[str]:
+            # A dry-run build writes nothing: not the target, not the bindings,
+            # not the catalog, not the scheduler (whose DAG would apply for real).
+            return [
+                f"if {dry_run_applied}; then",
+                (
+                    f'  echo "stage {stage}: stage 7 ran as a dry run and applied nothing, so '
+                    f'{what} — skipped (APPLY_MODE amend or amend-and-build applies)"'
+                ),
+                "  exit 0",
+                "fi",
+            ]
+
+        def when(num: int, extra: str = "") -> str:
+            toggle_name = {spec.num: spec.toggle_param for spec in self._stage_specs(config)}[num]
+            expression = _when_on(P[toggle_name])
+            if extra:
+                expression = f"{expression} && {extra}"
+            return f"            when {{ expression {{ return {expression} }} }}"
+
+        # ── Stage 0: install ────────────────────────────────────────────
         if install_mode == "pypi":
-            setup_install_sh = """                // Install the fluid CLI from stable PyPI. Four Jenkins
-                // parameters let operators override from the Build-With-
-                // Parameters dialog without editing Groovy:
-                //   FLUID_PACKAGE_SPEC         package spec (name + optional version
-                //                              pin, e.g. 'data-product-forge==X.Y.Z')
-                //   FLUID_PIP_INDEX_URL        primary index (leave blank for stable
-                //                              PyPI; set 'https://test.pypi.org/simple/'
-                //                              for TestPyPI pilot builds)
-                //   FLUID_PIP_EXTRA_INDEX_URL  fallback index (usually pypi.org/simple
-                //                              when PRIMARY points at TestPyPI, so
-                //                              transitive deps still resolve)
-                //   FLUID_ALLOW_PRERELEASE     'true' → add --pre (alpha/rc releases);
-                //                              leave 'false' for stable-only in prod
-                sh '''set -e
-                      INDEX_FLAGS=""
-                      if [ -n "${FLUID_PIP_INDEX_URL:-}" ]; then
-                        INDEX_FLAGS="--index-url ${FLUID_PIP_INDEX_URL}"
-                      fi
-                      if [ -n "${FLUID_PIP_EXTRA_INDEX_URL:-}" ]; then
-                        INDEX_FLAGS="${INDEX_FLAGS} --extra-index-url ${FLUID_PIP_EXTRA_INDEX_URL}"
-                      fi
-                      PRE_FLAG=""
-                      if [ "${FLUID_ALLOW_PRERELEASE:-false}" = "true" ]; then
-                        PRE_FLAG="--pre"
-                      fi
-                      pip install --quiet --upgrade ${PRE_FLAG} ${INDEX_FLAGS} \\
-                        "${FLUID_PACKAGE_SPEC:-data-product-forge}"'''"""
-        elif install_mode == "dev-source":
+            setup_install = (
+                "                // Install the fluid CLI into a virtual environment in the\n"
+                "                // workspace (PEP 668 agents refuse a bare `pip install`), and\n"
+                "                // run every later stage from it: FLUID_VENV and PATH in the\n"
+                "                // pipeline's environment {} block. Four parameters override\n"
+                "                // the install from the Build-With-Parameters dialog:\n"
+                "                //   FLUID_PACKAGE_SPEC         package spec (defaults to the\n"
+                "                //                              forge-cli that generated this file)\n"
+                "                //   FLUID_PIP_INDEX_URL        primary index (blank = PyPI)\n"
+                "                //   FLUID_PIP_EXTRA_INDEX_URL  fallback index\n"
+                "                //   FLUID_ALLOW_PRERELEASE     'true' → add --pre\n"
+                "                // Each value is ONE pip argument (set --, `--opt=value`, and\n"
+                "                // `--` before the spec): a value cannot add pip options.\n"
+                + _sh_step(
+                    [
+                        'rm -rf "$FLUID_VENV"',
+                        'python3 -m venv "$FLUID_VENV"',
+                        "set -- --quiet --disable-pip-version-check",
+                        f'INDEX_URL="{v("FLUID_PIP_INDEX_URL")}"',
+                        f'EXTRA_INDEX_URL="{v("FLUID_PIP_EXTRA_INDEX_URL")}"',
+                        'if [ -n "$INDEX_URL" ]; then set -- "$@" "--index-url=$INDEX_URL"; fi',
+                        (
+                            'if [ -n "$EXTRA_INDEX_URL" ]; then '
+                            'set -- "$@" "--extra-index-url=$EXTRA_INDEX_URL"; fi'
+                        ),
+                        (
+                            f'if [ "{v("FLUID_ALLOW_PRERELEASE")}" = "true" ]; then '
+                            'set -- "$@" --pre; fi'
+                        ),
+                        f'"$FLUID_VENV/bin/python" -m pip install "$@" -- "{v("FLUID_PACKAGE_SPEC")}"',
+                    ],
+                    "",
+                )
+            )
+            pip_executable = '"$FLUID_VENV/bin/python" -m pip'
+        else:
             # install-mode=dev-source uses PYTHONPATH=/forge-cli-src to
             # point Python at the bind mount LIVE — no pip install. That
             # sidesteps a pile of wheel-cache / stale-file bugs that made
@@ -184,7 +546,7 @@ class JenkinsTemplate(BasePipelineTemplate):
             # The PYTHONPATH export happens in the pipeline-level
             # ``environment {}`` block (added below in dev-source mode),
             # so every downstream sh step inherits it automatically.
-            setup_install_sh = """                sh '''set -e
+            setup_install = """                sh '''set -e
                       if [ ! -d /forge-cli-src ] || [ ! -f /forge-cli-src/pyproject.toml ]; then
                         cat >&2 <<EOM
 
@@ -219,27 +581,7 @@ EOM
                       # which keeps the console script and only overrides via PYTHONPATH.
                       python -c "import fluid_build" || (echo 'FATAL: fluid_build import failed; check /forge-cli-src bind mount' >&2 && exit 3)
                       echo "install-mode=dev-source — fluid command via the installed console script; imports resolve from /forge-cli-src via PYTHONPATH"'''"""
-        else:
-            # Defensive: unknown install_mode. Caller passed something
-            # we don't support — raise NOW (at generate time) rather
-            # than emit a broken Jenkinsfile that confuses CI later.
-            raise ValueError(
-                f"Unknown install_mode {install_mode!r} — expected 'pypi' or 'dev-source'"
-            )
-
-        # PYTHONPATH differs per install mode:
-        # - pypi: ``.`` (current workspace). fluid installed via pip,
-        #   which places everything under site-packages — no need to
-        #   add the bind mount.
-        # - dev-source: ``/forge-cli-src`` (the bind mount). This lets
-        #   ``import fluid_build`` resolve LIVE against the host source,
-        #   bypassing pip's wheel cache + stale-file pitfalls. Every sh
-        #   step in every stage inherits this (Jenkins expands
-        #   ``environment {}`` as env vars for every sh invocation).
-        if install_mode == "dev-source":
-            pythonpath_value = "/forge-cli-src"
-        else:
-            pythonpath_value = "."
+            pip_executable = "pip"
 
         # ── Engine-aware bootstrap (uses the shared registry) ─────────────
         # Pulls per-engine pip extras from
@@ -248,10 +590,12 @@ EOM
         # reused across every CI emitter (github_actions, gitlab_ci,
         # tekton, …). Empty string when the contract has no engine
         # declared (engine-agnostic Jenkinsfile, no extras installed).
+        # In pypi mode it installs into the workspace venv.
         engine_bootstrap_sh = render_bootstrap_shell_section(
             engine=getattr(config, "engine", None),
             source_kind=getattr(config, "source_kind", None),
             sink_platform=getattr(config, "sink_platform", None),
+            pip_executable=pip_executable,
             indent="                      ",  # matches sh ''' ''' nesting
         )
         # Wrap in a single ``sh '''...'''`` step so it runs as ONE shell
@@ -265,20 +609,300 @@ EOM
         else:
             engine_bootstrap_step = ""
 
+        version_lines = []
+        if install_mode == "pypi":
+            # The fluid every later stage runs must be the one just installed,
+            # not one the agent image already has on PATH.
+            version_lines = [
+                'if [ "$(command -v fluid || true)" != "$FLUID_VENV/bin/fluid" ]; then',
+                (
+                    '  echo "stage 0: the CLI first on PATH is $(command -v fluid || echo nothing), '
+                    'not the one in $FLUID_VENV: the PATH entry of environment {} did not apply" >&2'
+                ),
+                "  exit 1",
+                "fi",
+            ]
+        version_step = _sh_step(
+            [
+                # FLUID_ENV names an overlay file, and a baseline file below;
+                # refuse anything but a plain name before any stage uses it.
+                f'case "{v("FLUID_ENV")}" in',
+                (
+                    '  .*|-*|*[!A-Za-z0-9_.-]*) echo "FLUID_ENV must be a plain environment name '
+                    '([A-Za-z0-9_.-], not starting with . or -)" >&2; exit 2 ;;'
+                ),
+                "esac",
+                *version_lines,
+                "fluid --version",
+            ],
+            CD,
+        )
+        baseline_fetch = ""
+        if last_applied:
+            baseline_fetch = (
+                "\n                // Stage 5's baseline: the plan the last successful build\n"
+                "                // applied for each env, from that build's own artifacts\n"
+                "                // (copyartifact plugin; optional, so a first run has none).\n"
+                "                // The directory is emptied first: a file committed to the\n"
+                "                // repository at that path must never pose as a baseline.\n"
+                f"                sh 'rm -rf \"$WORKSPACE/{_CI_STATE_DIR}\"'\n"
+                "                script {\n"
+                "                    copyArtifacts(projectName: env.JOB_NAME,\n"
+                "                                  selector: lastSuccessful(),\n"
+                f"                                  filter: '{_CI_STATE_DIR}/applied/*.json',\n"
+                f"                                  target: '{_CI_STATE_DIR}/last-applied',\n"
+                "                                  flatten: true,\n"
+                "                                  optional: true,\n"
+                "                                  fingerprintArtifacts: true)\n"
+                "                }"
+            )
+
+        # ── Stages 1-11 ─────────────────────────────────────────────────
+        stage1 = _sh_step(
+            [
+                "mkdir -p runtime",
+                f'fluid bundle "{v("CONTRACT")}" {env_flag} --format tgz --out {BUNDLE_PATH}',
+            ],
+            CD,
+        )
+        stage2 = _sh_step(
+            [
+                "mkdir -p runtime",
+                _needs_bundle(2),
+                f"set -- {BUNDLE_PATH} {env_flag} --report runtime/validate-report.json",
+                f'if [ "{v("VALIDATE_STRICT")}" = "true" ]; then set -- "$@" --strict; fi',
+                'fluid validate "$@"',
+            ],
+            CD,
+        )
+        stage3 = _sh_step(
+            [
+                _needs_bundle(3),
+                (
+                    f"fluid generate artifacts {BUNDLE_PATH} {env_flag} "
+                    f'--contract-path "{project_contract}" '
+                    f'--out dist/artifacts/ --emit "{v("GENERATE_EMIT")}"'
+                ),
+            ],
+            CD,
+        )
+        stage4 = _sh_step(
+            [
+                "mkdir -p runtime",
+                (
+                    "fluid validate-artifacts dist/artifacts/ "
+                    "--manifest dist/artifacts/MANIFEST.json "
+                    "--report runtime/validate-artifacts-report.json"
+                ),
+            ],
+            CD,
+        )
+        stage5_lines = [
+            "mkdir -p runtime",
+            _needs_bundle(5),
+            f"set -- {BUNDLE_PATH} {env_flag} --out runtime/diff-report.json",
+            f'if [ "{v("DIFF_EXIT_ON_DRIFT")}" = "true" ]; then set -- "$@" --exit-on-drift; fi',
+        ]
+        if last_applied:
+            stage5_lines += [
+                f'BASELINE="{baseline_dir}/{v("FLUID_ENV")}.json"',
+                (
+                    'if [ -f "$BASELINE" ]; then set -- "$@" --last-applied "$BASELINE"; '
+                    'else echo "stage 5: the last successful build applied no plan for this env '
+                    '(or there is none yet): comparing the target with the contract alone"; fi'
+                ),
+            ]
+        stage5_lines.append('fluid diff "$@"')
+        stage5 = _sh_step(stage5_lines, CD)
+        stage6 = _sh_step(
+            [
+                "mkdir -p runtime",
+                _needs_bundle(6),
+                (
+                    f"set -- {BUNDLE_PATH} {env_flag} "
+                    f'--mode "{v("APPLY_MODE")}" --out runtime/plan.json'
+                ),
+                (
+                    f'if [ "{v("PLAN_HTML")}" = "true" ]; then '
+                    'set -- "$@" --html runtime/plan.html; fi'
+                ),
+                'fluid plan "$@"',
+            ],
+            CD,
+        )
+        stage7_lines = [
+            "mkdir -p runtime",
+            _needs_bundle(7),
+            f'MODE="{v("APPLY_MODE")}"',
+            (
+                f'set -- runtime/plan.json --bundle {BUNDLE_PATH} --mode "$MODE" {env_flag} '
+                "--yes --ensure-opentofu --report runtime/apply-report.html"
+            ),
+            apply_build_id_sh(v("APPLY_BUILD_ID")).strip(),
+            f'if [ "{v("ALLOW_DATA_LOSS")}" = "true" ]; then set -- "$@" --allow-data-loss; fi',
+            (
+                f'if [ "{v("NO_VERIFY_DIGEST")}" = "true" ]; then '
+                'set -- "$@" --no-verify-plan-binding --no-verify-federation; fi'
+            ),
+            'fluid apply "$@"',
+        ]
+        if last_applied:
+            stage7_lines += [
+                # Recorded only once apply succeeded (set -e), and only when
+                # it changed the target: a dry run applied nothing.
+                'if [ "$MODE" != "dry-run" ]; then',
+                f'  mkdir -p "{applied_dir}"',
+                f'  cp runtime/plan.json "{applied_dir}/{v("FLUID_ENV")}.json"',
+                "fi",
+            ]
+        stage7 = _sh_step(stage7_lines, CD)
+        stage8 = _sh_step(
+            [
+                "mkdir -p runtime",
+                f'POLICY_MODE="{v("POLICY_APPLY_MODE")}"',
+                f'if {dry_run_applied} && [ "$POLICY_MODE" = "enforce" ]; then',
+                (
+                    '  echo "stage 8: stage 7 ran as a dry run and wrote nothing, so the bindings '
+                    'are checked (--mode check), not enforced"'
+                ),
+                "  POLICY_MODE=check",
+                "fi",
+                "if [ -f dist/artifacts/policy/bindings.json ]; then",
+                '  set -- dist/artifacts/policy/bindings.json --mode "$POLICY_MODE"',
+                '  if fluid policy-apply "$@" > runtime/policy-apply-report.json 2>&1; then',
+                "    cat runtime/policy-apply-report.json",
+                "  else",
+                "    cat runtime/policy-apply-report.json; exit 1",
+                "  fi",
+                "else",
+                '  echo "no dist/artifacts/policy/bindings.json — skipping stage 8"',
+                "fi",
+            ],
+            CD,
+        )
+        stage9 = _sh_step(
+            [
+                *skip_after_dry_run(9, "there is nothing to verify"),
+                "mkdir -p runtime",
+                _needs_bundle(9),
+                f"set -- {BUNDLE_PATH} {env_flag} --out runtime/verify-report.json",
+                f'if [ "{v("VERIFY_STRICT")}" = "true" ]; then set -- "$@" --strict; fi',
+                'fluid verify "$@"',
+            ],
+            CD,
+        )
+        publish_env = f" {env_flag}" if config.publish_include_env else ""
+        stage10 = _sh_step(
+            [
+                *skip_after_dry_run(10, "there is no applied product to publish"),
+                "mkdir -p runtime",
+                f'set -- "{v("CONTRACT")}"{publish_env} --format json',
+                # PUBLISH_TARGETS is a space-separated list: each word is ONE
+                # `--target=<word>` argument, and `set -f` keeps a word from
+                # being a glob. A word may not carry an endpoint
+                # (`name:https://...`): the agent's catalog credential
+                # (FLUID_API_KEY...) would go to whatever the parameter names.
+                "set -f",
+                f"for t in {v('PUBLISH_TARGETS')}; do",
+                (
+                    '  case "$t" in *:*) echo "PUBLISH_TARGETS names catalogs, not endpoints: '
+                    'set the endpoint on the agent (FLUID_CC_ENDPOINT...)" >&2; exit 2 ;; esac'
+                ),
+                '  set -- "$@" "--target=$t"',
+                "done",
+                "set +f",
+                "rc=0",
+                'fluid publish "$@" > runtime/publish-report.json || rc=$?',
+                "cat runtime/publish-report.json",
+                'exit "$rc"',
+            ],
+            CD,
+        )
+        stage11 = _sh_step(
+            [
+                *skip_after_dry_run(11, "there is no applied product to schedule"),
+                f'SCHEDULER_V="{v("SCHEDULER")}"',
+                'if [ -z "$SCHEDULER_V" ]; then',
+                '  echo "SCHEDULER is blank: no scheduler to sync to — skipping stage 11"',
+                "  exit 0",
+                "fi",
+                (
+                    "if [ ! -d dist/artifacts/schedule ] || "
+                    '[ -z "$(ls -A dist/artifacts/schedule 2>/dev/null)" ]; then'
+                ),
+                (
+                    '  echo "no dist/artifacts/schedule/ DAGs to sync — skipping stage 11 '
+                    "(reference-only contract, stage 3 not run, or no scheduled build or "
+                    'orchestration.engine)"'
+                ),
+                "  exit 0",
+                "fi",
+                "mkdir -p runtime",
+                # --delete-scope product: this product's DAGs go to
+                # <destination>/<contract id>/ and nothing outside it is deleted,
+                # so every product's job can share one DAG root.
+                (
+                    'set -- --scheduler "$SCHEDULER_V" --dags-dir dist/artifacts/schedule/ '
+                    f"{env_flag} --delete-scope product --report runtime/schedule-sync-report.json"
+                ),
+                f'DEST="{v("SCHEDULER_DESTINATION")}"',
+                'if [ -n "$DEST" ]; then set -- "$@" --destination "$DEST"; fi',
+                f'ENV_NAME="{v("SCHEDULER_ENVIRONMENT_NAME")}"',
+                'if [ -n "$ENV_NAME" ]; then set -- "$@" --environment-name "$ENV_NAME"; fi',
+                f'LOCATION="{v("SCHEDULER_LOCATION")}"',
+                'if [ -n "$LOCATION" ]; then set -- "$@" --location "$LOCATION"; fi',
+                f'WORKSPACE_NAME="{v("SCHEDULER_WORKSPACE")}"',
+                'if [ -n "$WORKSPACE_NAME" ]; then set -- "$@" --workspace "$WORKSPACE_NAME"; fi',
+                f'if [ "{v("SCHEDULE_SYNC_DRY_RUN")}" = "true" ]; then set -- "$@" --dry-run; fi',
+                'fluid schedule-sync "$@"',
+            ],
+            CD,
+        )
+
+        # ── Pipeline-level blocks ───────────────────────────────────────
+        parameters_block = (
+            "\n    parameters {\n"
+            + "\n".join(f"        {p.declaration()}" for p in P.values())
+            + "\n    }"
+        )
+
+        options_lines = [
+            "        disableConcurrentBuilds()",
+            "        buildDiscarder(logRotator(numToKeepStr: '20'))",
+        ]
+        if last_applied:
+            options_lines += [
+                "        // copyartifact runs in Production mode: a job may copy its own",
+                "        // artifacts (stage 0's baseline) only when it says so.",
+                '        copyArtifactPermission("/${env.JOB_NAME}")',
+            ]
+
+        env_lines = [
+            "        FLUID_LOG_LEVEL = 'INFO'",
+            "        FLUID_CONFIG_PATH = './fluid_config'",
+        ]
+        if install_mode == "pypi":
+            env_lines += [
+                "        // Stage 0 installs fluid here; every stage runs it from here.",
+                '        FLUID_VENV = "${env.WORKSPACE}/.fluid-venv"',
+                '        PATH = "${env.WORKSPACE}/.fluid-venv/bin:${env.PATH}"',
+            ]
+        else:
+            # dev-source: imports resolve LIVE from the bind mount, so every
+            # sh step in every stage inherits PYTHONPATH (Jenkins expands
+            # ``environment {}`` as env vars for every sh invocation).
+            env_lines.append("        PYTHONPATH = '/forge-cli-src'")
         # Container-runtime env vars (e.g. FLUID_RUNNER_HOST_OVERRIDE).
         # Same pattern: shared registry → CI-emitter-agnostic dict →
         # Jenkins ``environment {}`` block. Empty dict → no extra lines.
-        runner_env_lines = []
         for key, value in render_runner_env_vars(
             runner_host_override=getattr(config, "runner_host_override", "") or "",
             engine=getattr(config, "engine", None),
         ).items():
             # Jenkins env-block syntax: ``KEY = 'value'`` (single-quoted
             # so values with literal $ aren't expanded).
-            runner_env_lines.append(f"        {key} = '{value}'")
-        runner_env_block = "\n".join(runner_env_lines)
-        if runner_env_block:
-            runner_env_block = "\n" + runner_env_block + "\n"
+            env_lines.append(f"        {key} = {_groovy_sq(str(value))}")
+        env_block = "\n".join(env_lines)
 
         # Per-engine runtime notes (docker socket, external services, ...).
         # Sourced from the same registry as engine_bootstrap_step + runner
@@ -299,136 +923,33 @@ EOM
         else:
             runtime_notes_block = ""
 
-        # Install-mode-specific Jenkins parameters. pypi mode exposes
-        # pip-install overrides (package spec, index URLs, prerelease
-        # toggle) so operators can swap TestPyPI in without editing
-        # Groovy. dev-source mode has no such overrides — it always
-        # installs from the bind mount and fails loud if it's missing.
-        if install_mode == "pypi":
-            install_mode_parameters = """
-        // ── Install overrides (pypi mode only) ──────────────────────
-        // Default = stable PyPI, no prerelease. Override for pilot /
-        // private-index / pinned-version builds.
-        string(name: 'FLUID_PACKAGE_SPEC',
-               defaultValue: 'data-product-forge',
-               description: 'Package spec for pip. Pin a version via \\'data-product-forge==X.Y.Z\\'.')
-        string(name: 'FLUID_PIP_INDEX_URL',
-               defaultValue: '',
-               description: 'Primary pip index. Leave blank for stable PyPI; set \\'https://test.pypi.org/simple/\\' for TestPyPI pilot builds, or your private mirror URL.')
-        string(name: 'FLUID_PIP_EXTRA_INDEX_URL',
-               defaultValue: '',
-               description: 'Fallback pip index. Usually \\'https://pypi.org/simple/\\' when PRIMARY points at TestPyPI so transitive deps still resolve.')
-        booleanParam(name: 'FLUID_ALLOW_PRERELEASE', defaultValue: false,
-                     description: 'Pass pip --pre (pulls alpha/rc releases). Leave false in prod.')"""
-        else:
-            install_mode_parameters = ""
+        post_success = []
+        if last_applied:
+            post_success = [
+                "            // Carry forward every env's applied plan this build did not",
+                "            // replace, so the next build's baseline is the last apply per env",
+                "            // even when this one applied nothing.",
+                _sh_step(
+                    [
+                        f'mkdir -p "{applied_dir}"',
+                        f'for f in "{baseline_dir}"/*.json; do',
+                        '  [ -f "$f" ] || continue',
+                        f'  [ -f "{applied_dir}/$(basename "$f")" ] || cp "$f" "{applied_dir}/"',
+                        "done",
+                    ],
+                    "",
+                    indent=" " * 12,
+                ),
+                (
+                    f"            archiveArtifacts artifacts: '{_CI_STATE_DIR}/applied/*.json', "
+                    "fingerprint: true, allowEmptyArchive: true"
+                ),
+            ]
+        post_success.append("            echo '✅ 11-stage pipeline completed successfully'")
+        post_success_block = "\n".join(post_success)
 
-        # Parameter block — every stage gets a boolean toggle + per-stage
-        # config. Operators trigger "Build with Parameters" in the Jenkins
-        # UI to pick a subset of the 11-stage pipeline without editing Groovy.
-        # Choice order + defaults match the HTML design doc (perfect-pipeline).
-        parameters_block = f"""
-    parameters {{
-        // ── Global ──────────────────────────────────────────────────
-        string(name: 'CONTRACT',  defaultValue: 'contract.fluid.yaml',
-               description: 'Contract path relative to the workspace (or workdir when set).')
-        string(name: 'FLUID_ENV', defaultValue: 'dev',
-               description: 'Environment overlay (dev | staging | prod | ...).'){install_mode_parameters}
-
-        // ── Stage 1 — bundle ────────────────────────────────────────
-        booleanParam(name: 'RUN_STAGE_1_BUNDLE',  defaultValue: true,
-                     description: 'Stage 1: deterministic tgz bundle + MANIFEST.json (SHA-256).')
-        // BUNDLE_FORMAT is intentionally not a parameter: Stages 4 (validate
-        // artifacts), 6 (plan → bundleDigest), and 7 (apply → plan-binding
-        // verification) all require the tgz MANIFEST.json. yaml/json bundles
-        // are valid for `fluid bundle` but would break every downstream stage
-        // in this pipeline. Operators who need a single-file YAML resolve
-        // should run `fluid bundle --format yaml` out-of-band.
-
-        // ── Stage 2 — validate ─────────────────────────────────────
-        booleanParam(name: 'RUN_STAGE_2_VALIDATE', defaultValue: true,
-                     description: 'Stage 2: extension-routed validators (schema + sqlglot + openapi).')
-        booleanParam(name: 'VALIDATE_STRICT',      defaultValue: true,
-                     description: 'Stage 2: --strict (any validator error fails the pipeline).')
-
-        // ── Stage 3 — generate artifacts ───────────────────────────
-        booleanParam(name: 'RUN_STAGE_3_GENERATE_ARTIFACTS', defaultValue: {stage_3_enabled_default},
-                     description: 'Stage 3: ODCS + ODPS-Bitol + schedule + policy fanout. Off for reference-only contracts.')
-        string(name: 'GENERATE_EMIT',
-               defaultValue: 'odcs,odps-bitol,schedule,policies',
-               description: 'Stage 3 --emit list (comma-separated). dbt excluded by design (execution artifact).')
-
-        // ── Stage 4 — validate artifacts ───────────────────────────
-        booleanParam(name: 'RUN_STAGE_4_VALIDATE_ARTIFACTS', defaultValue: true,
-                     description: 'Stage 4: re-verify MANIFEST SHA-256 + per-format schema validators.')
-
-        // ── Stage 5 — diff (drift gate) ────────────────────────────
-        booleanParam(name: 'RUN_STAGE_5_DIFF',  defaultValue: true,
-                     description: 'Stage 5: compare contract vs live warehouse schema.')
-        booleanParam(name: 'DIFF_EXIT_ON_DRIFT', defaultValue: true,
-                     description: 'Stage 5: --exit-on-drift (hard-fail if drift detected).')
-
-        // ── Stage 6 — plan ─────────────────────────────────────────
-        booleanParam(name: 'RUN_STAGE_6_PLAN', defaultValue: true,
-                     description: 'Stage 6: compute DDL operations; emits bundleDigest + planDigest.')
-        booleanParam(name: 'PLAN_HTML',        defaultValue: true,
-                     description: 'Stage 6: emit HTML visualization of the plan.')
-
-        // ── Stage 7 — apply ────────────────────────────────────────
-        booleanParam(name: 'RUN_STAGE_7_APPLY', defaultValue: true,
-                     description: 'Stage 7: execute DDL (mode matrix; plan-binding cryptographically verified).')
-        choice(name: 'APPLY_MODE',
-               choices: ['dry-run', 'amend', 'create-only', 'amend-and-build', 'replace', 'replace-and-build'],
-               description: 'Stage 7 mode. dry-run = render only (safe); amend = default additive; replace = DROP+CREATE (requires ALLOW_DATA_LOSS in non-dev).')
-        string(name: 'APPLY_BUILD_ID', defaultValue: '',
-               description: 'Stage 7: required for amend-and-build / replace-and-build (dbt build ID from contract builds[]).')
-        booleanParam(name: 'ALLOW_DATA_LOSS', defaultValue: false,
-                     description: 'Stage 7: gate waiver for --mode replace* in non-dev or when target has rows.')
-        booleanParam(name: 'NO_VERIFY_DIGEST', defaultValue: false,
-                     description: 'Stage 7: DR emergency escape — waives BOTH the plan-binding and federation upstream-digest gates (--no-verify-plan-binding --no-verify-federation). Use only when the original bundle / upstreams are unreachable.')
-
-        // ── Stage 8 — policy apply ─────────────────────────────────
-        booleanParam(name: 'RUN_STAGE_8_POLICY_APPLY', defaultValue: true,
-                     description: 'Stage 8: enforce IAM/GRANT bindings (self-gated on bindings.json presence).')
-        choice(name: 'POLICY_APPLY_MODE',
-               choices: ['enforce', 'check'],
-               description: 'Stage 8: enforce = apply GRANTs; check = dry-run / PR report only.')
-
-        // ── Stage 9 — verify ───────────────────────────────────────
-        booleanParam(name: 'RUN_STAGE_9_VERIFY', defaultValue: true,
-                     description: 'Stage 9: post-apply reconciliation vs live warehouse.')
-        booleanParam(name: 'VERIFY_STRICT',      defaultValue: {verify_strict_default},
-                     description: 'Stage 9: --strict (fail on any schema mismatch, including silent type coercions).')
-
-        // ── Stage 10 — publish ─────────────────────────────────────
-        booleanParam(name: 'RUN_STAGE_10_PUBLISH', defaultValue: {publish_stage_default},
-                     description: 'Stage 10: push catalog artifacts to one or more targets. Opt-in — typically gated to main branch.')
-        string(name: 'PUBLISH_TARGETS',
-               defaultValue: 'datamesh-manager',
-               description: 'Stage 10: space-separated publish targets (command-center datahub datamesh-manager collibra ...).')
-
-        // ── Stage 11 — schedule sync (Path A) ──────────────────────
-        booleanParam(name: 'RUN_STAGE_11_SCHEDULE_SYNC', defaultValue: false,
-                     description: 'Stage 11: push generated DAGs to scheduler (airflow / mwaa / composer / astronomer / prefect / dagster).')
-        choice(name: 'SCHEDULER',
-               choices: ['', 'airflow', 'mwaa', 'composer', 'astronomer', 'prefect', 'dagster'],
-               description: 'Stage 11 scheduler target. Blank = no-op.')
-        string(name: 'SCHEDULER_DESTINATION',
-               defaultValue: '',
-               description: 'Stage 11: airflow/mwaa destination URL. Supports s3://, gs://, az://, ssh://, scp://, file:// or a bare path. Required for airflow + mwaa; ignored for composer / astronomer / prefect / dagster.')
-        string(name: 'SCHEDULER_ENVIRONMENT_NAME',
-               defaultValue: '',
-               description: 'Stage 11: composer environment name or astronomer deployment name.')
-        string(name: 'SCHEDULER_LOCATION',
-               defaultValue: '',
-               description: 'Stage 11: GCP region for composer (e.g. europe-west1, us-central1).')
-        string(name: 'SCHEDULER_WORKSPACE',
-               defaultValue: '',
-               description: 'Stage 11: prefect workspace or dagster-cloud deployment name.')
-        booleanParam(name: 'SCHEDULE_SYNC_DRY_RUN',
-                     defaultValue: false,
-                     description: 'Stage 11: --dry-run (log the planned subprocess argv without executing).')
-    }}"""
+        stage3_when = when(3)
+        stage4_when = when(4, f"fileExists('{W}dist/artifacts/MANIFEST.json')")
 
         jenkins_pipeline = f"""
 pipeline {{
@@ -437,14 +958,11 @@ pipeline {{
     agent any
 
     options {{
-        disableConcurrentBuilds()
-        buildDiscarder(logRotator(numToKeepStr: '20'))
+{chr(10).join(options_lines)}
     }}
 {parameters_block}{runtime_notes_block}
     environment {{
-        FLUID_LOG_LEVEL = 'INFO'
-        FLUID_CONFIG_PATH = './fluid_config'
-        PYTHONPATH = '{pythonpath_value}'{runner_env_block}
+{env_block}
         // ── Provider credential bindings (pick ONE pattern) ──────
         // See the top-of-file banner for the full env-var list per
         // provider.
@@ -466,6 +984,7 @@ pipeline {{
         //                  AWS_SECRET_ACCESS_KEY = credentials('aws-secret-key')
         //
         // Catalog publish (only if using `fluid publish`):
+        //   FLUID_API_KEY = credentials('command-center-api-key')
         //   DMM_API_URL = credentials('dmm-api-url')
         //   DMM_API_KEY = credentials('dmm-api-key')
     }}
@@ -473,40 +992,36 @@ pipeline {{
     stages {{
         stage('0 — Bootstrap FLUID [{install_mode}]') {{
             steps {{
-{setup_install_sh}
+{setup_install}
 {engine_bootstrap_step}
-                sh '''{CD}fluid --version'''
+{version_step}{baseline_fetch}
             }}
         }}
 
         // ═════════════════════════════════════════════════════════════
         // Stage 1 — bundle (structural)
-        // Deterministic .tgz + MANIFEST.json (SHA-256 merkle root).
-        // Root of trust for every downstream stage.
+        // Deterministic .tgz + MANIFEST.json (SHA-256 merkle root) of the
+        // contract with its FLUID_ENV overlay. Root of trust for every
+        // downstream stage: 2, 3, 5, 6 and 9 read it, 7 applies with it.
         // ═════════════════════════════════════════════════════════════
         stage('1 - bundle') {{
-            when {{ expression {{ return params.RUN_STAGE_1_BUNDLE }} }}
+{when(1)}
             steps {{
-                sh '''{CD}mkdir -p runtime
-                       fluid bundle "${{CONTRACT:-contract.fluid.yaml}}" --format tgz --out runtime/bundle.tgz'''
-                archiveArtifacts artifacts: '{P}runtime/bundle.tgz', fingerprint: true, allowEmptyArchive: true
+{stage1}
+                archiveArtifacts artifacts: '{W}{BUNDLE_PATH}', fingerprint: true, allowEmptyArchive: true
             }}
         }}
 
         // ═════════════════════════════════════════════════════════════
         // Stage 2 — validate (structural)
-        // Extension-routed: schema + sqlglot (SQL) + openapi-spec-validator.
-        // Fail early, fail loud.
+        // Extension-routed: schema + contract rules + sqlglot (SQL) +
+        // openapi-spec-validator, on the bundle. Fail early, fail loud.
         // ═════════════════════════════════════════════════════════════
         stage('2 - validate') {{
-            when {{ expression {{ return params.RUN_STAGE_2_VALIDATE }} }}
-            environment {{
-                VALIDATE_STRICT_FLAG = "${{params.VALIDATE_STRICT ? '--strict' : ''}}"
-            }}
+{when(2)}
             steps {{
-                sh '''{CD}fluid validate "${{CONTRACT:-contract.fluid.yaml}}" ${{VALIDATE_STRICT_FLAG}} \\
-                           --report runtime/validate-report.json'''
-                archiveArtifacts artifacts: '{P}runtime/validate-report.json', fingerprint: true, allowEmptyArchive: true
+{stage2}
+                archiveArtifacts artifacts: '{W}runtime/validate-report.json', fingerprint: true, allowEmptyArchive: true
             }}
         }}
 
@@ -516,12 +1031,10 @@ pipeline {{
         // Auto-skipped for hybrid-reference contracts.
         // ═════════════════════════════════════════════════════════════
         stage('3 - generate artifacts') {{
-            when {{ expression {{ return params.RUN_STAGE_3_GENERATE_ARTIFACTS }} }}
+{stage3_when}
             steps {{
-                sh '''{CD}fluid generate artifacts "${{CONTRACT:-contract.fluid.yaml}}" \\
-                         --out dist/artifacts/ \\
-                         --emit "${{GENERATE_EMIT}}"'''
-                archiveArtifacts artifacts: '{P}dist/artifacts/**/*', fingerprint: true, allowEmptyArchive: true
+{stage3}
+                archiveArtifacts artifacts: '{W}dist/artifacts/**/*', fingerprint: true, allowEmptyArchive: true
             }}
         }}
 
@@ -544,42 +1057,24 @@ pipeline {{
             // The ``fileExists`` check runs at Groovy-pipeline-
             // evaluation time; if the path is missing we no-op the
             // stage so stages 5-11 can still run.
-            when {{
-                expression {{
-                    return params.RUN_STAGE_4_VALIDATE_ARTIFACTS \
-                        && fileExists('{P}dist/artifacts/MANIFEST.json')
-                }}
-            }}
+{stage4_when}
             steps {{
-                sh '''{CD}fluid validate-artifacts dist/artifacts/ \\
-                         --manifest dist/artifacts/MANIFEST.json \\
-                         --report runtime/validate-artifacts-report.json'''
-                archiveArtifacts artifacts: '{P}runtime/validate-artifacts-report.json', fingerprint: true, allowEmptyArchive: true
+{stage4}
+                archiveArtifacts artifacts: '{W}runtime/validate-artifacts-report.json', fingerprint: true, allowEmptyArchive: true
             }}
         }}
 
         // ═════════════════════════════════════════════════════════════
         // Stage 5 — diff (drift gate)
-        // Live warehouse vs contract. --exit-on-drift forces a human
-        // decision before plan proceeds against a drifted baseline.
+        // Live target vs the bundled contract. --exit-on-drift forces a
+        // human decision before plan proceeds against a drifted baseline.
         // ═════════════════════════════════════════════════════════════
         stage('5 - diff (drift gate)') {{
-            when {{ expression {{ return params.RUN_STAGE_5_DIFF }} }}
-            // SECURITY: argument-smuggling defence (match stages 7, 9, 11).
-            environment {{
-                DIFF_EXIT_ON_DRIFT_VAL = "${{params.DIFF_EXIT_ON_DRIFT}}"
-            }}
+{when(5)}
             steps {{
                 // ``fluid diff`` takes ``--out``, NOT ``--report``.
-                // Pre-fix the template emitted ``--report`` which made
-                // every stage-5 invocation fail with
-                // ``unrecognized arguments: --report`` before any
-                // drift comparison could run.
-                sh '''{CD}set -eu
-                    set -- "${{CONTRACT:-contract.fluid.yaml}}" --env "${{FLUID_ENV:-dev}}" --out runtime/diff-report.json
-                    if [ "${{DIFF_EXIT_ON_DRIFT_VAL:-false}}" = "true" ]; then set -- "$@" --exit-on-drift; fi
-                    fluid diff "$@"'''
-                archiveArtifacts artifacts: '{P}runtime/diff-report.json', fingerprint: true, allowEmptyArchive: true
+{stage5}
+                archiveArtifacts artifacts: '{W}runtime/diff-report.json', fingerprint: true, allowEmptyArchive: true
             }}
         }}
 
@@ -589,28 +1084,13 @@ pipeline {{
         // Terraform-style "apply consumes exact plan" binding.
         // ═════════════════════════════════════════════════════════════
         stage('6 - plan') {{
-            when {{ expression {{ return params.RUN_STAGE_6_PLAN }} }}
-            // Plan for the SAME mode Stage 7 applies, so plan.json's
-            // recorded ``mode`` matches. The apply-side mode-mismatch
-            // gate (apply.py:apply_plan_mode_mismatch) requires
-            // plan.mode == apply.mode (only None ↔ amend is normalized
-            // as compatible), and runs before any build. EFFECTIVE_MODE
-            // is computed here exactly as in Stage 7: APPLY_MODE, or
-            // amend-and-build when APPLY_BUILD_ID is set.
-            environment {{
-                PLAN_HTML_FLAG     = "${{params.PLAN_HTML ? '--html' : ''}}"
-                APPLY_MODE         = "${{params.APPLY_MODE}}"
-                APPLY_BUILD_ID_VAL = "${{params.APPLY_BUILD_ID}}"
-            }}
+{when(6)}
             steps {{
-                sh '''{CD}set -eu
-                    EFFECTIVE_MODE="${{APPLY_MODE:-amend}}"
-                    if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then EFFECTIVE_MODE=amend-and-build; fi
-                    fluid plan "${{CONTRACT:-contract.fluid.yaml}}" \\
-                           --out runtime/plan.json ${{PLAN_HTML_FLAG}} \\
-                           --mode "$EFFECTIVE_MODE" \\
-                           --env "${{FLUID_ENV:-dev}}"'''
-                archiveArtifacts artifacts: '{P}runtime/plan.json,{P}runtime/plan.html', fingerprint: true, allowEmptyArchive: true
+                // Plan for the SAME mode stage 7 applies: plan.json records
+                // it, and ``fluid apply`` refuses a plan made for another
+                // (apply_plan_mode_mismatch), before any build.
+{stage6}
+                archiveArtifacts artifacts: '{W}runtime/plan.json,{W}runtime/plan.html', fingerprint: true, allowEmptyArchive: true
             }}
         }}
 
@@ -620,41 +1100,21 @@ pipeline {{
         // ALLOW_DATA_LOSS when FLUID_ENV != dev or target has rows.
         // ═════════════════════════════════════════════════════════════
         stage('7 - apply') {{
-            when {{ expression {{ return params.RUN_STAGE_7_APPLY }} }}
-            // SECURITY: user-supplied params routed through plain
-            // environment-block assignments as raw env vars — NOT
-            // Groovy-ternary-concatenated into a single string. The
-            // previous pattern set
-            //   APPLY_BUILD_FLAG = "--mode amend-and-build --build-id " + params.APPLY_BUILD_ID
-            // then expanded `${{APPLY_BUILD_FLAG}}` UNQUOTED in the sh
-            // body, which IFS-word-splits on whitespace. A Jenkins user
-            // with Build-With-Parameters permission could set
-            //   APPLY_BUILD_ID="x --allow-data-loss --no-verify-plan-binding"
-            // → the value split into 3 argv tokens → `fluid apply` saw
-            // --allow-data-loss and --no-verify-plan-binding even when the
-            // Jenkins booleans ALLOW_DATA_LOSS and NO_VERIFY_DIGEST were
-            // false. Auth-gate bypass.
-            //
-            // Fix: env vars carry raw values; POSIX `set --` + if/then/fi
-            // composes argv so each "$VAR" expansion is one argv token.
-            // This matches the stage-11 pattern hardened in commit 8673544.
-            environment {{
-                APPLY_BUILD_ID_VAL = "${{params.APPLY_BUILD_ID}}"
-                APPLY_MODE = "${{params.APPLY_MODE}}"
-                ALLOW_DATA_LOSS = "${{params.ALLOW_DATA_LOSS}}"
-                NO_VERIFY_DIGEST = "${{params.NO_VERIFY_DIGEST}}"
-            }}
+{when(7)}
+            // SECURITY: parameters reach the shell as the environment
+            // variables Jenkins exports for them, never Groovy-
+            // concatenated into the script: a pattern that expanded
+            //   "--mode amend-and-build --build-id " + params.APPLY_BUILD_ID
+            // unquoted let APPLY_BUILD_ID="x --allow-data-loss" add argv
+            // tokens (auth-gate bypass). POSIX `set --` + if/then/fi
+            // composes argv so each "$VAR" expansion is one token.
             steps {{
-                // One --mode, the one Stage 6 planned for (see there).
-                sh '''{CD}set -eu
-                    EFFECTIVE_MODE="${{APPLY_MODE:-amend}}"
-                    if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then EFFECTIVE_MODE=amend-and-build; fi
-                    set -- runtime/plan.json --mode "$EFFECTIVE_MODE" --env "${{FLUID_ENV:-dev}}" --yes --ensure-opentofu --report runtime/apply-report.html
-                    if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then set -- "$@" --build-id "$APPLY_BUILD_ID_VAL"; fi
-                    if [ "${{ALLOW_DATA_LOSS:-false}}" = "true" ]; then set -- "$@" --allow-data-loss; fi
-                    if [ "${{NO_VERIFY_DIGEST:-false}}" = "true" ]; then set -- "$@" --no-verify-plan-binding --no-verify-federation; fi
-                    fluid apply "$@"'''
-                archiveArtifacts artifacts: '{P}runtime/apply-report.html', fingerprint: true, allowEmptyArchive: true
+{stage7}
+                // `fluid apply --report` writes runtime/apply-report.html for the
+                // modes that apply DDL; a *-and-build mode hands over to the
+                // build runner, whose record of each run is the JSON under the
+                // source contract's .fluid/runs/.
+                archiveArtifacts artifacts: '{W}runtime/apply-report.html,{W}**/.fluid/runs/**/*.json', fingerprint: true, allowEmptyArchive: true
             }}
         }}
 
@@ -666,22 +1126,12 @@ pipeline {{
         // Self-gated on dist/artifacts/policy/bindings.json existence.
         // ═════════════════════════════════════════════════════════════
         stage('8 - policy apply') {{
-            when {{ expression {{ return params.RUN_STAGE_8_POLICY_APPLY }} }}
+{when(8)}
             steps {{
-                // ``fluid policy-apply`` does NOT accept a --report
-                // flag — pre-fix the template emitted one anyway, so
-                // when bindings.json DID exist, the command failed
-                // loud with ``unrecognized arguments: --report``.
-                // Policy-apply's report output goes to stdout; if a
-                // JSON report is needed, capture stdout to the file
-                // via shell redirection.
-                sh '''{CD}if [ -f dist/artifacts/policy/bindings.json ]; then \\
-                         fluid policy-apply dist/artifacts/policy/bindings.json \\
-                           --mode "${{POLICY_APPLY_MODE:-enforce}}" \\
-                           > runtime/policy-apply-report.json 2>&1 || \\
-                         {{ cat runtime/policy-apply-report.json; exit 1; }}; \\
-                       else echo "no dist/artifacts/policy/bindings.json — skipping stage 8"; fi'''
-                archiveArtifacts artifacts: '{P}runtime/policy-apply-report.json', fingerprint: true, allowEmptyArchive: true
+                // ``fluid policy-apply`` does NOT accept a --report flag;
+                // its report goes to stdout, captured to the file.
+{stage8}
+                archiveArtifacts artifacts: '{W}runtime/policy-apply-report.json', fingerprint: true, allowEmptyArchive: true
             }}
         }}
 
@@ -691,55 +1141,25 @@ pipeline {{
         // (TIMESTAMP_NTZ → LTZ, Redshift length truncations, etc.).
         // ═════════════════════════════════════════════════════════════
         stage('9 - verify') {{
-            when {{ expression {{ return params.RUN_STAGE_9_VERIFY }} }}
-            // SECURITY: same argument-smuggling defence as stage 7 —
-            // route VERIFY_STRICT through a plain env var and compose
-            // argv via POSIX set -- + if/then/fi rather than Groovy-
-            // ternary-concatenating + unquoted env expansion. A
-            // malicious VERIFY_STRICT=true Jenkins boolean is safe
-            // anyway (it's just a toggle), but the pattern keeps the
-            // defence consistent across all stages that take
-            // parameters.
-            environment {{
-                VERIFY_STRICT_VAL = "${{params.VERIFY_STRICT}}"
-            }}
+{when(9)}
             steps {{
-                // ``fluid verify`` takes ``--out``, NOT ``--report``
-                // (fixed in this batch — previously emitted --report
-                // which failed with ``unrecognized arguments`` on
-                // every invocation).
-                sh '''{CD}set -eu
-                    set -- "${{CONTRACT:-contract.fluid.yaml}}" --env "${{FLUID_ENV:-dev}}" --out runtime/verify-report.json
-                    if [ "${{VERIFY_STRICT_VAL:-false}}" = "true" ]; then set -- "$@" --strict; fi
-                    fluid verify "$@"'''
-                archiveArtifacts artifacts: '{P}runtime/verify-report.json', fingerprint: true, allowEmptyArchive: true
+                // ``fluid verify`` takes ``--out``, NOT ``--report``.
+{stage9}
+                archiveArtifacts artifacts: '{W}runtime/verify-report.json', fingerprint: true, allowEmptyArchive: true
             }}
         }}
 
         // ═════════════════════════════════════════════════════════════
         // Stage 10 — publish (publication)
         // Multi-target catalog publisher. Push to CC / DMM / DataHub /
-        // Collibra / Alation / marketplace / blob storage.
+        // Collibra / Alation / marketplace / blob storage. The result
+        // document (`--format json`) is archived.
         // ═════════════════════════════════════════════════════════════
         stage('10 - publish') {{
-            when {{ expression {{ return params.RUN_STAGE_10_PUBLISH }} }}
+{when(10)}
             steps {{
-                // PUBLISH_TARGETS is a space-separated string; shell
-                // iterates it word-split into a list of --target flags.
-                // The ``${{PUBLISH_TARGETS:-X}}`` shell fallback (opt-in
-                // via ``fluid generate ci --default-publish-target X``)
-                // protects the first Pipeline-from-SCM build Jenkins
-                // auto-triggers: the ``parameters {{ }}`` block isn't
-                // exported as env vars on that first run, so without a
-                // shell fallback the CLI's built-in target
-                // (``fluid-command-center``) is used — which may not be
-                // reachable. When no fallback is configured the bare
-                // ``${{PUBLISH_TARGETS}}`` form is emitted.
-                sh '''{CD}TARGET_FLAGS=""; \\
-                       for t in ${{{PUBLISH_TARGETS_EXPANSION}}}; do \\
-                         TARGET_FLAGS="${{TARGET_FLAGS}} --target $t"; \\
-                       done; \\
-                       {publish_command}'''
+{stage10}
+                archiveArtifacts artifacts: '{W}runtime/publish-report.json', fingerprint: true, allowEmptyArchive: true
             }}
         }}
 
@@ -750,92 +1170,36 @@ pipeline {{
         // Stage 7 via SchedulePlanner.
         // ═════════════════════════════════════════════════════════════
         stage('11 - schedule sync') {{
-            when {{
-                expression {{ return params.RUN_STAGE_11_SCHEDULE_SYNC && params.SCHEDULER?.trim() }}
-            }}
-            // Thread user-supplied params through the environment rather
-            // than Groovy-interpolating them into the sh string. Jenkins
-            // quotes env values safely; passing via the environment +
-            // bash array construction below is injection-proof — a
-            // malicious param value reaches our CLI as a single argv
-            // token and is rejected there by _validate_destination /
-            // _validate_safe_ident.
-            environment {{
-                SCHEDULER = "${{params.SCHEDULER}}"
-                SCHEDULER_DESTINATION = "${{params.SCHEDULER_DESTINATION}}"
-                SCHEDULER_ENVIRONMENT_NAME = "${{params.SCHEDULER_ENVIRONMENT_NAME}}"
-                SCHEDULER_LOCATION = "${{params.SCHEDULER_LOCATION}}"
-                SCHEDULER_WORKSPACE = "${{params.SCHEDULER_WORKSPACE}}"
-                SCHEDULE_SYNC_DRY_RUN = "${{params.SCHEDULE_SYNC_DRY_RUN}}"
-            }}
+{when(11)}
             steps {{
                 // Use POSIX `set --` rather than bash arrays so this runs
                 // under Jenkins's default `/bin/sh` invocation. Each $VAR
                 // is quoted — one argv token per expansion — so a
                 // malicious value stays a single token that our CLI then
                 // rejects in _validate_destination / _validate_safe_ident.
-                // Use if/then/fi rather than `[ ] && …` because the
-                // `set -e` interaction with `&&` short-circuits is shell-
-                // dependent and can trip on the first false test.
-                // Self-gate on the presence of generated DAG files —
-                // mirrors stage 8's bindings.json gate. Three failure
-                // shapes are collapsed into a single clean skip with
-                // guidance:
-                //
-                //  * ``dist/artifacts/schedule/`` missing entirely —
-                //    contract is reference-only (builds[].pattern =
-                //    hybrid-reference / reference / external-reference)
-                //    so ``fluid generate artifacts`` auto-skipped the
-                //    ``schedule`` emitter. Nothing to sync; this is
-                //    the most common case for A1 / A2 variants.
-                //
-                //  * ``dist/artifacts/schedule/`` exists but is empty —
-                //    stage 3 ran but the contract has no
-                //    ``orchestration.engine`` configured so the schedule
-                //    emitter produced no DAGs. Still a valid "nothing
-                //    to sync" state for Path-B contracts.
-                //
-                //  * stage 3 never ran (``RUN_STAGE_3_GENERATE_ARTIFACTS=
-                //    false``) so there's no ``dist/artifacts/`` tree
-                //    at all. Safe to skip.
-                //
-                // Without this gate, fluid schedule-sync hard-fails with
-                // ``schedule_sync_dags_dir_missing`` / ``_empty`` (CLI
-                // exit 2, config error) and the whole pipeline is
-                // FAILURE — even though the pre-stage-11 work (bundle
-                // → apply → verify) succeeded. That's wrong for
-                // reference-only pipelines which are the default
-                // shape on A1 / A2. Direct CLI users of
-                // ``fluid schedule-sync`` still get the strict
-                // hard-fail so typos in ``--dags-dir`` surface loud.
-                sh '''{CD}set -eu
-                    if [ ! -d dist/artifacts/schedule ] || [ -z "$(ls -A dist/artifacts/schedule 2>/dev/null)" ]; then
-                        echo "no dist/artifacts/schedule/ DAGs to sync — skipping stage 11 (reference-only contract, stage 3 not run, or no orchestration.engine configured)"
-                        exit 0
-                    fi
-                    set -- --scheduler "$SCHEDULER" --dags-dir dist/artifacts/schedule/ --env "${{FLUID_ENV:-dev}}"
-                    if [ -n "${{SCHEDULER_DESTINATION:-}}" ];      then set -- "$@" --destination "$SCHEDULER_DESTINATION"; fi
-                    if [ -n "${{SCHEDULER_ENVIRONMENT_NAME:-}}" ]; then set -- "$@" --environment-name "$SCHEDULER_ENVIRONMENT_NAME"; fi
-                    if [ -n "${{SCHEDULER_LOCATION:-}}" ];         then set -- "$@" --location "$SCHEDULER_LOCATION"; fi
-                    if [ -n "${{SCHEDULER_WORKSPACE:-}}" ];        then set -- "$@" --workspace "$SCHEDULER_WORKSPACE"; fi
-                    if [ "${{SCHEDULE_SYNC_DRY_RUN:-false}}" = "true" ]; then set -- "$@" --dry-run; fi
-                    fluid schedule-sync "$@"'''
+                // Self-gated on a scheduler and on generated DAG files
+                // (reference-only contracts, stage 3 not run, or no
+                // scheduled build): nothing to sync is not a failure.
+{stage11}
+                archiveArtifacts artifacts: '{W}runtime/schedule-sync-report.json', fingerprint: true, allowEmptyArchive: true
             }}
         }}
     }}
 
     post {{
-        always {{
-            cleanWs()
-        }}
         success {{
-            echo '✅ 11-stage pipeline completed successfully'
+{post_success_block}
         }}
         failure {{
             echo '❌ 11-stage pipeline failed — check stage view for gate that fired'
         }}
         unstable {{
             echo '⚠ 11-stage pipeline unstable — some stages warned but did not hard-fail'
+        }}
+        cleanup {{
+            // deleteDir() is a core Pipeline step (no plugin), and
+            // `cleanup` runs after every other post condition.
+            deleteDir()
         }}
     }}
 }}
@@ -853,4 +1217,47 @@ pipeline {{
                 "`environment {}` block."
             ),
         )
-        return {"Jenkinsfile": banner + jenkins_pipeline}
+        return {"Jenkinsfile": banner + self._jenkins_banner(config) + jenkins_pipeline}
+
+    def _jenkins_banner(self, config: PipelineConfig) -> str:
+        """What this Jenkinsfile needs from Jenkins and its agent."""
+        from fluid_build import __version__
+
+        lines = [
+            f"Generated by forge-cli {__version__} (`fluid generate ci --system jenkins`).",
+            "",
+            "Jenkins plugins it needs:",
+            "  " + ", ".join(self.required_plugins(config)),
+            "  (the workspace is removed with the core deleteDir() step, so no",
+            "  ws-cleanup)",
+        ]
+        if config.diff_last_applied:
+            lines += [
+                "  copyartifact: stage 0 copies the plan the last successful build",
+                "  applied for each env, stage 5's `fluid diff --last-applied`",
+                "  baseline, from that build's own artifacts.",
+            ]
+        lines += [""]
+        if (config.install_mode or "pypi") == "pypi":
+            lines += [
+                "Agent: python3 with the venv module (stage 0 installs FLUID_PACKAGE_SPEC",
+                "into $WORKSPACE/.fluid-venv and every stage runs fluid from there),",
+                "and rsync for a file:// or ssh:// stage-11 destination.",
+                "",
+            ]
+        lines += [
+            "Every parameter below has a default, and every stage reads it with the",
+            "same default as its fallback: Jenkins runs a job's first build, and its",
+            "first after the job lost its parameter definitions (a restart that",
+            "re-seeds jobs from job-dsl or JCasC), with no parameters exported.",
+            "",
+        ]
+        return "".join(f"// {line}".rstrip() + "\n" for line in lines)
+
+    @staticmethod
+    def required_plugins(config: PipelineConfig) -> List[str]:
+        """The Jenkins plugins (update-center ids) the generated file needs."""
+        plugins = ["workflow-aggregator", "git"]
+        if config.diff_last_applied:
+            plugins.append("copyartifact")
+        return plugins

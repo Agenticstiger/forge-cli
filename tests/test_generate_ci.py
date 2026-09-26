@@ -248,19 +248,16 @@ class TestGenerateCIJenkins:
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(), _logger) == 0
 
-    def test_default_publish_target_omitted_emits_bare_form(self, tmp_path, monkeypatch):
-        """Without ``--default-publish-target``, Stage 10's shell uses
-        the bare ``${PUBLISH_TARGETS}`` form — backwards-compatible with
-        every Jenkinsfile generated before the flag existed.
-
-        We check the actual shell-loop line rather than a bare substring
-        because the surrounding groovy comment block legitimately
-        documents the opt-in ``${PUBLISH_TARGETS:-X}`` example."""
+    def test_default_publish_target_omitted_keeps_datamesh_manager(self, tmp_path, monkeypatch):
+        """Without ``--default-publish-target``, PUBLISH_TARGETS defaults
+        to ``datamesh-manager``, and Stage 10's shell falls back to the same
+        value when a build carries no parameters (a job's first build, or
+        its first after a restart re-seeded it)."""
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
-        assert "for t in ${PUBLISH_TARGETS}" in content
-        assert "for t in ${PUBLISH_TARGETS:-" not in content
+        assert "for t in ${PUBLISH_TARGETS:-datamesh-manager}; do" in content
+        assert "name: 'PUBLISH_TARGETS', defaultValue: 'datamesh-manager'" in content
 
     def test_default_publish_target_opt_in_emits_shell_fallback(self, tmp_path, monkeypatch):
         """With ``--default-publish-target datamesh-manager``, Stage 10's
@@ -269,9 +266,14 @@ class TestGenerateCIJenkins:
         the parameters block is exported as env vars) still publishes
         to the intended catalog."""
         monkeypatch.chdir(tmp_path)
-        assert generate_ci_run(_make_args(default_publish_target="datamesh-manager"), _logger) == 0
+        assert (
+            generate_ci_run(_make_args(default_publish_target="fluid-command-center"), _logger) == 0
+        )
         content = (tmp_path / "Jenkinsfile").read_text()
-        assert "for t in ${PUBLISH_TARGETS:-datamesh-manager}" in content
+        assert "for t in ${PUBLISH_TARGETS:-fluid-command-center}" in content
+        # The parameter's own default is the same value (it used to stay
+        # datamesh-manager, so Build with Parameters offered another target).
+        assert "name: 'PUBLISH_TARGETS', defaultValue: 'fluid-command-center'" in content
 
     def test_default_publish_target_accepts_arbitrary_catalog(self, tmp_path, monkeypatch):
         """The flag isn't hard-coded to datamesh-manager — operators on
@@ -292,14 +294,13 @@ class TestGenerateCIJenkins:
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(default_publish_target="   "), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
-        assert "for t in ${PUBLISH_TARGETS}" in content
-        assert "for t in ${PUBLISH_TARGETS:-" not in content
+        assert "for t in ${PUBLISH_TARGETS:-datamesh-manager}; do" in content
 
     def test_verify_strict_default_override_flips_parameter_default(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(verify_strict_default=False), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
-        assert "name: 'VERIFY_STRICT',      defaultValue: false" in content
+        assert "name: 'VERIFY_STRICT', defaultValue: false" in content
 
     def test_publish_stage_default_override_flips_parameter_default(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -321,8 +322,7 @@ class TestGenerateCIJenkins:
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(publish_include_env=False), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
-        assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS}' in content
-        assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS} \\' not in content
+        assert 'set -- "${CONTRACT:-contract.fluid.yaml}" --format json' in content
         stage_10 = content[content.index("stage('10 - publish')") :]
         stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
         assert '--env "${FLUID_ENV:-dev}"' not in stage_10
@@ -629,10 +629,15 @@ class _JenkinsPipeline:
 
             self.stages.append(stage)
 
-        # Detect global post { always { cleanWs() } } — search from the end
-        # of the content (after all stages close).
+        # Detect the global workspace cleanup: the legacy
+        # ``post { always { cleanWs() } }`` (ws-cleanup plugin), or the
+        # core ``deleteDir()`` in ``post { cleanup { } }``, which runs after
+        # every other post condition.
+        post = content[content.rfind("post {") :] if "post {" in content else ""
         if re.search(r"post\s*\{[^}]*always\s*\{[^}]*cleanWs\(\)", content, re.DOTALL):
             self.global_post_always.append("cleanWs()")
+        elif re.search(r"cleanup\s*\{[^}]*deleteDir\(\)", post, re.DOTALL):
+            self.global_post_always.append("deleteDir()")
 
 
 class _SimulatedJenkinsRunner:
