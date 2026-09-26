@@ -482,7 +482,7 @@ class JenkinsTemplate(BasePipelineTemplate):
         )
 
         def skip_after_dry_run(stage: int, what: str) -> List[str]:
-            # A dry-run build writes nothing: not the target, not the grants,
+            # A dry-run build writes nothing: not the target, not the bindings,
             # not the catalog, not the scheduler (whose DAG would apply for real).
             return [
                 f"if {dry_run_applied}; then",

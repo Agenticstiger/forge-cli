@@ -1120,7 +1120,7 @@ class BasePipelineTemplate:
                 # Self-gates on bindings.json existence so reference-only
                 # contracts (that delegate policy upstream) skip cleanly.
                 # After a dry-run apply the bindings are checked, not
-                # enforced: a dry run writes nothing, grants included.
+                # enforced: a dry run writes nothing, access bindings included.
                 command=(
                     f'set -eu; MODE="{p("APPLY_MODE")}"; POLICY_MODE=enforce; '
                     'if [ "$MODE" = dry-run ]; then POLICY_MODE=check; '
