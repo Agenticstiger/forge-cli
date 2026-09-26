@@ -21,7 +21,71 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+#: The only classification a catalog may show to everyone. The FLUID schema's
+#: ``metadata.classification`` enum is ``public | internal | confidential |
+#: restricted`` and ``exposes[].policy.classification`` spells the same four
+#: capitalised; other standards leave the label free-form (ODCS: "can be
+#: anything"). So visibility is an allowlist of one: any other label, and no
+#: label at all, is not public.
+PUBLIC_CLASSIFICATION = "public"
+
+
+def _label(value: Any) -> Optional[str]:
+    """A declared classification label, lower-cased, or None when there is none."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    return text or None
+
+
+def contract_classification(contract: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """The data classification a contract declares, and the field it came from.
+
+    Returns ``(label, field)``, with the label lower-cased, or ``(None, None)``
+    when the contract declares none.
+
+    ``metadata.classification`` (FLUID 0.7.3+) is the product's own label and
+    wins. Without it the exposes decide: each one's ``policy.classification``,
+    else its legacy ``sensitivity``. The product is labelled ``public`` only
+    when every expose says so. The first expose that declares anything else
+    decides the label; when one declares nothing and none is non-public, the
+    product has no label. A product is never more visible than its most
+    guarded port.
+    """
+    if not isinstance(contract, dict):
+        return None, None
+    metadata = contract.get("metadata")
+    if isinstance(metadata, dict):
+        label = _label(metadata.get("classification"))
+        if label:
+            return label, "metadata.classification"
+
+    exposes = contract.get("exposes")
+    if not isinstance(exposes, list) or not exposes:
+        return None, None
+    first_public: Optional[Tuple[str, str]] = None
+    undeclared = False
+    for index, expose in enumerate(exposes):
+        if not isinstance(expose, dict):
+            undeclared = True
+            continue
+        policy = expose.get("policy")
+        label = _label(policy.get("classification")) if isinstance(policy, dict) else None
+        where = f"exposes[{index}].policy.classification"
+        if label is None:
+            label = _label(expose.get("sensitivity"))
+            where = f"exposes[{index}].sensitivity"
+        if label is None:
+            undeclared = True
+        elif label != PUBLIC_CLASSIFICATION:
+            return label, where
+        elif first_public is None:
+            first_public = (label, where)
+    if undeclared or first_public is None:
+        return None, None
+    return first_public
 
 
 @dataclass
@@ -47,6 +111,17 @@ class CatalogAsset:
     schema: Optional[List[Dict[str, Any]]] = None  # From exposes[0].contract.schema
     sensitivity: str = "internal"  # internal, public, confidential
     contract_yaml: Optional[str] = None  # Raw YAML content of the contract file
+    # The contract's declared classification, lower-cased (see
+    # ``contract_classification``); None when it declares none. Catalogs decide
+    # visibility from this, never from ``sensitivity``, whose "internal"
+    # default cannot tell a declared label from a missing one.
+    classification: Optional[str] = None
+    # The ``--env`` overlay the contract was loaded with; None for the base contract.
+    environment: Optional[str] = None
+    # Where the contract came from (git commit, repo URL, branch, file path,
+    # deployer), for catalogs that record contract versions. Keys are the
+    # Command Center's ``ContractSync`` field names; unknown facts are absent.
+    provenance: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -169,6 +244,8 @@ class BaseCatalogProvider(ABC):
             # Extract sensitivity
             sensitivity = first_expose.get("sensitivity", "internal")
 
+        classification, _ = contract_classification(contract)
+
         return CatalogAsset(
             id=contract.get("id", contract.get("name", "unknown")),
             name=contract["name"],
@@ -184,6 +261,7 @@ class BaseCatalogProvider(ABC):
             location=location,
             schema=schema,
             sensitivity=sensitivity,
+            classification=classification,
         )
 
     def validate_asset(self, asset: CatalogAsset) -> tuple[bool, Optional[str]]:
