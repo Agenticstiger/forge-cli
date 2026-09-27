@@ -270,8 +270,14 @@ class TestTeamMemoryBounds:
     def test_file_at_the_size_cap_still_loads(self, tmp_path):
         from fluid_build.cli import forge_team_memory as ftm
 
-        head = "conventions:\n  defaults:\n    provider: gcp\n"
-        _write_team_memory(tmp_path, head + "#" * (ftm._MAX_FILE_BYTES - len(head)))
+        head = b"conventions:\n  defaults:\n    provider: gcp\n"
+        # Bytes, not text: newline translation on Windows would push the file
+        # past the cap and turn this boundary test into the oversized one.
+        (tmp_path / ".fluid").mkdir()
+        (tmp_path / ".fluid" / "team-memory.yaml").write_bytes(
+            head + b"#" * (ftm._MAX_FILE_BYTES - len(head))
+        )
+        assert (tmp_path / ".fluid" / "team-memory.yaml").stat().st_size == ftm._MAX_FILE_BYTES
 
         tm = load_team_memory(tmp_path)
 
