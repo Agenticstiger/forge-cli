@@ -213,7 +213,10 @@ def _detect_providers() -> Dict[str, str]:
         providers["local"] = "available"
 
         try:
-            from fluid_build.providers.gcp import GCPProvider
+            # ``GcpProvider`` is bound only when the real provider loaded; with
+            # its dependencies missing the package registers a stub under
+            # another name, so this import fails and reports "not installed".
+            from fluid_build.providers.gcp import GcpProvider  # noqa: F401
 
             providers["gcp"] = "available"
         except ImportError:

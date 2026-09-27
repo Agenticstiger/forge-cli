@@ -54,8 +54,10 @@ class CommandCenterConnector(BaseCatalogConnector):
     async def _connect_impl(self) -> bool:
         """Connect to Command Center catalog"""
         try:
-            # Import here to avoid circular dependency
-            from ._command_center import get_command_center_client
+            # Import here to avoid circular dependency. The client lives in
+            # ``fluid_build.cli``, one package up: a relative ``._command_center``
+            # would name ``market_catalogs._command_center``, which does not exist.
+            from fluid_build.cli._command_center import get_command_center_client
 
             cc = get_command_center_client(logger=self.logger)
 

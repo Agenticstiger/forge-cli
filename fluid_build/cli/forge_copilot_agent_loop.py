@@ -547,7 +547,7 @@ def run_copilot_agent_loop(
         suggestions=[
             "The model may be stuck in a tool-call loop",
             "Try with a different model or use the default single-shot flow",
-            "Set FLUID_COPILOT_AGENT_LOOP=0 to disable agent mode",
+            "Drop --agent-loop, or set FLUID_COPILOT_AGENT_LOOP=0, to disable agent mode",
         ],
     )
 

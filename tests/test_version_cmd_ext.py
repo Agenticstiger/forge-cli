@@ -16,6 +16,8 @@
 
 import argparse
 import logging
+import sys
+import types
 from unittest.mock import Mock, patch
 
 from fluid_build.cli.version_cmd import (
@@ -91,6 +93,26 @@ class TestDetectProviders:
         providers = _detect_providers()
         for k, v in providers.items():
             assert isinstance(v, str)
+
+    # ``fluid_build.providers.gcp`` binds ``GcpProvider`` when the real
+    # provider loads, and registers ``_GcpProviderStub`` (no ``GcpProvider``)
+    # when its dependencies are missing. The probe used to import
+    # ``GCPProvider``, a name the package never defines, so it reported
+    # "not installed" in both states.
+
+    def test_gcp_available_when_the_real_provider_loads(self, monkeypatch):
+        loaded = types.ModuleType("fluid_build.providers.gcp")
+        loaded.GcpProvider = type("GcpProvider", (), {})  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "fluid_build.providers.gcp", loaded)
+
+        assert _detect_providers()["gcp"] == "available"
+
+    def test_gcp_not_installed_when_only_the_stub_is_registered(self, monkeypatch):
+        stubbed = types.ModuleType("fluid_build.providers.gcp")
+        stubbed._GcpProviderStub = type("_GcpProviderStub", (), {})  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "fluid_build.providers.gcp", stubbed)
+
+        assert _detect_providers()["gcp"] == "not installed"
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from textwrap import dedent
 
@@ -143,6 +144,145 @@ class TestLoadTeamMemory:
         tm = load_team_memory(tmp_path)
         assert tm is not None
         assert len(tm.decisions) <= 10
+
+
+def _write_team_memory(root: Path, text: str) -> None:
+    (root / ".fluid").mkdir(exist_ok=True)
+    (root / ".fluid" / "team-memory.yaml").write_text(text, encoding="utf-8")
+
+
+def _alias_bomb(levels: int, *, under: str) -> str:
+    """A small YAML file whose anchors expand tenfold per level."""
+    lines = ["x0: &x0 [" + ",".join(['"aaaaaaaa"'] * 10) + "]"]
+    for i in range(1, levels):
+        lines.append(f"x{i}: &x{i} [" + ",".join([f"*x{i - 1}"] * 10) + "]")
+    return "\n".join(lines) + "\n" + under.replace("ALIAS", f"*x{levels - 1}") + "\n"
+
+
+class TestTeamMemoryBounds:
+    """What one team-memory file can put into the LLM prompt is bounded.
+
+    The file is committed to git, so its content comes from every committer,
+    and it now reaches the prompt. ``str()`` of a nested value expanded every
+    YAML alias inside it: a 417-byte file produced a 12 MB prompt payload.
+    """
+
+    @pytest.mark.parametrize(
+        "under",
+        [
+            "conventions:\n  naming:\n    product_prefix: ALIAS",
+            "conventions:\n  defaults:\n    domain: ALIAS",
+            "decisions:\n  - decision: ALIAS\n    rationale: ALIAS",
+            "vocabulary:\n  entities:\n    - ALIAS\n    - customer_id",
+        ],
+    )
+    def test_yaml_alias_expansion_cannot_inflate_the_payload(self, tmp_path, under):
+        text = _alias_bomb(6, under=under)
+        assert len(text) < 1024
+        _write_team_memory(tmp_path, text)
+
+        tm = load_team_memory(tmp_path)
+
+        assert tm is not None
+        assert len(json.dumps(tm.to_prompt_payload())) < 1024
+
+    def test_nested_values_are_dropped_and_scalars_kept(self, tmp_path):
+        _write_team_memory(
+            tmp_path,
+            dedent(
+                """\
+                conventions:
+                  naming:
+                    product_prefix: acme
+                    layers: [bronze, silver]
+                  defaults:
+                    provider: gcp
+                    owner: {team: data}
+                    retries: 3
+                    strict: true
+                vocabulary:
+                  entities:
+                    - customer_id
+                    - [nested, list]
+                    - {nested: map}
+                """
+            ),
+        )
+
+        tm = load_team_memory(tmp_path)
+
+        assert tm is not None
+        assert tm.naming == {"product_prefix": "acme"}
+        assert tm.defaults == {"provider": "gcp", "retries": "3", "strict": "True"}
+        assert tm.vocabulary_entities == ["customer_id"]
+
+    def test_blank_values_are_unset_not_the_string_none(self, tmp_path):
+        _write_team_memory(
+            tmp_path,
+            "conventions:\n  defaults:\n    provider: local\n    domain:\n    owner_team: ''\n",
+        )
+
+        tm = load_team_memory(tmp_path)
+
+        assert tm is not None
+        assert tm.defaults == {"provider": "local"}
+
+    def test_unquoted_decision_date_is_kept_as_text(self, tmp_path):
+        _write_team_memory(tmp_path, "decisions:\n  - date: 2026-03-15\n    decision: Use dbt\n")
+
+        tm = load_team_memory(tmp_path)
+
+        assert tm is not None
+        assert tm.decisions == [{"date": "2026-03-15", "decision": "Use dbt", "rationale": ""}]
+
+    def test_lists_maps_and_strings_are_capped(self, tmp_path):
+        from fluid_build.cli import forge_team_memory as ftm
+
+        long_value = "v" * (ftm._MAX_STRING_CHARS + 100)
+        content = {
+            "conventions": {
+                "naming": {f"key_{i}": long_value for i in range(ftm._MAX_ENTRIES + 20)},
+            },
+            "decisions": [{"decision": long_value, "rationale": long_value}],
+            "vocabulary": {"entities": [f"entity_{i}" for i in range(ftm._MAX_ENTRIES + 20)]},
+        }
+        _write_team_memory(tmp_path, yaml.safe_dump(content))
+
+        tm = load_team_memory(tmp_path)
+
+        assert tm is not None
+        assert len(tm.naming) == ftm._MAX_ENTRIES
+        assert all(len(v) == ftm._MAX_STRING_CHARS for v in tm.naming.values())
+        assert tm.vocabulary_entities == [f"entity_{i}" for i in range(ftm._MAX_ENTRIES)]
+        assert len(tm.decisions[0]["decision"]) == ftm._MAX_STRING_CHARS
+        assert len(tm.decisions[0]["rationale"]) == ftm._MAX_STRING_CHARS
+
+    def test_oversized_file_is_skipped(self, tmp_path, caplog):
+        from fluid_build.cli import forge_team_memory as ftm
+
+        padding = "#" * ftm._MAX_FILE_BYTES
+        _write_team_memory(tmp_path, "conventions:\n  defaults:\n    provider: gcp\n" + padding)
+
+        with caplog.at_level("WARNING", logger="fluid.cli.forge.team_memory"):
+            assert load_team_memory(tmp_path) is None
+        assert "larger than" in caplog.text
+
+    def test_file_at_the_size_cap_still_loads(self, tmp_path):
+        from fluid_build.cli import forge_team_memory as ftm
+
+        head = "conventions:\n  defaults:\n    provider: gcp\n"
+        _write_team_memory(tmp_path, head + "#" * (ftm._MAX_FILE_BYTES - len(head)))
+
+        tm = load_team_memory(tmp_path)
+
+        assert tm is not None
+        assert tm.defaults == {"provider": "gcp"}
+
+    def test_invalid_utf8_is_a_parse_failure_not_a_crash(self, tmp_path):
+        (tmp_path / ".fluid").mkdir()
+        (tmp_path / ".fluid" / "team-memory.yaml").write_bytes(b"conventions: \xff\xfe\n")
+
+        assert load_team_memory(tmp_path) is None
 
 
 class TestTeamMemoryDataclass:
