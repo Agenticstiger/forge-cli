@@ -308,6 +308,7 @@ def test_the_workspace_is_removed_with_the_core_deleteDir_step():
             "scheduler_destination_default": "file:///opt/airflow/dags",
             "contract_path": "contracts/p/contract.fluid.yaml",
             "diff_last_applied": True,
+            "fluid_env_default": "aws",
         },
     ],
     ids=["defaults", "demo-options"],
@@ -388,6 +389,147 @@ def test_stages_2_3_5_6_9_read_the_bundle_stage_1_made_for_the_env():
         assert command in _stage(content, label), label
     stage7 = _stage(content, "7 - apply")
     assert "set -- runtime/plan.json --bundle runtime/bundle.tgz --mode" in stage7
+
+
+# ── (5b) FLUID_ENV defaults to --fluid-env-default ───────────────────────
+
+
+def test_the_fluid_env_default_is_the_parameter_default_and_every_fallback(repo, monkeypatch):
+    """An upstream trigger starts the build with the declared defaults, and a
+    first or post-restart build exports no parameters: both run in the env
+    ``--fluid-env-default`` names, never in dev."""
+    product = repo / "contracts" / "customer_subscriptions"
+    content = _generate(product, "contract.fluid.yaml", monkeypatch, fluid_env_default="aws")
+    assert _declared(content)["FLUID_ENV"] == "aws"
+    reads = re.findall(r"\$\{FLUID_ENV(:-|-)([^}]*)\}", "\n".join(_sh_bodies(content)))
+    # Stage 0's name check and stages 1, 2, 3, 5, 6, 7, 9, 10 and 11 (4 and 8
+    # take no --env): every one falls back to aws.
+    assert len(reads) == 10
+    assert set(reads) == {(":-", "aws")}
+    assert "FLUID_ENV:-dev" not in content
+
+
+def test_without_the_option_only_dev_is_the_default(repo, monkeypatch):
+    """No option: the file ``--fluid-env-default dev`` gives. The option
+    changes the FLUID_ENV default and its fallbacks, and nothing else."""
+    product = repo / "contracts" / "customer_subscriptions"
+    default = _generate(product, "contract.fluid.yaml", monkeypatch)
+    assert _declared(default)["FLUID_ENV"] == "dev"
+    assert _generate(product, "contract.fluid.yaml", monkeypatch, fluid_env_default=None) == default
+    assert (
+        _generate(product, "contract.fluid.yaml", monkeypatch, fluid_env_default="dev") == default
+    )
+    staging = _generate(product, "contract.fluid.yaml", monkeypatch, fluid_env_default="staging")
+    assert staging == default.replace("${FLUID_ENV:-dev}", "${FLUID_ENV:-staging}").replace(
+        "name: 'FLUID_ENV', defaultValue: 'dev'", "name: 'FLUID_ENV', defaultValue: 'staging'"
+    )
+    assert staging != default
+
+
+@pytest.mark.parametrize(("exported", "env"), [({}, "aws"), ({"FLUID_ENV": "gcp"}, "gcp")])
+def test_a_parameterless_bundle_is_for_the_fluid_env_default(tmp_path, exported, env):
+    """Stage 1 run with no parameters bundles for the default; a FLUID_ENV the
+    build was given still wins."""
+    proc, argv = _run_stage_body(tmp_path, "1 - bundle", exported, fluid_env_default="aws")
+    assert proc.returncode == 0, proc.stderr
+    assert argv is not None and argv[argv.index("--env") + 1] == env
+
+
+#: Values a stage's ``--env`` would refuse, and whether a programmatic
+#: PipelineConfig refuses them too. It refuses everything the CLI does except
+#: blank, which it reads as unset (dev).
+_BAD_ENV_DEFAULTS = [
+    ("", False),  # blank: the CLI refuses it, PipelineConfig reads it as unset
+    ("   ", False),
+    ("../prod", True),
+    ("overlays/prod", True),
+    ("-prod", True),
+    (".prod", True),
+    ("prod aws", True),
+    ("prod;id", True),
+    ("prod*", True),
+    ("a$(id)", True),
+    ("pr\nod", True),
+    ("1prod", True),  # stage 3's fluid generate artifacts --env refuses a leading digit
+    ("_prod", True),  # stage 10's fluid publish --env refuses a leading underscore
+    ("p" * 65, True),  # and more than 64 characters
+]
+
+
+@pytest.mark.parametrize(("bad", "config_refuses"), _BAD_ENV_DEFAULTS)
+def test_a_fluid_env_default_a_stage_would_refuse_is_refused(
+    repo, monkeypatch, bad, config_refuses
+):
+    from fluid_build.cli._common import CLIError
+
+    product = repo / "contracts" / "customer_subscriptions"
+    with pytest.raises(CLIError) as exc:
+        _generate(product, "contract.fluid.yaml", monkeypatch, fluid_env_default=bad)
+    assert exc.value.event == "generate_ci_fluid_env_default_invalid"
+    assert not (product / "Jenkinsfile").exists()
+    if config_refuses:
+        with pytest.raises(ValueError, match="not an environment name"):
+            _jenkinsfile(fluid_env_default=bad)
+
+
+def _publish_accepts(env: str) -> bool:
+    """Whether stage 10's ``fluid publish`` parser takes ``--env=<env>``."""
+    from fluid_build.cli import publish
+
+    parser = argparse.ArgumentParser(prog="fluid")
+    publish.register(parser.add_subparsers())
+    try:
+        parser.parse_args([publish.COMMAND, "contract.fluid.yaml", f"--env={env}"])
+    except SystemExit:
+        return False
+    return True
+
+
+def _generate_artifacts_accepts(env: str) -> bool:
+    """Whether stage 3's ``fluid generate artifacts --env`` takes ``env``: the
+    rule its scheduled DAGs hold ``fluid apply --env`` to."""
+    from fluid_build.schedulers.airflow.fluid_apply import ScheduleRenderError, validate_env_name
+
+    try:
+        validate_env_name(env)
+    except ScheduleRenderError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    "env",
+    ["dev", "aws", "Prod-2.eu_west", "p" * 64, "p" * 65, "_prod", "1prod", "9", "-prod"]
+    + [".prod", "prod aws", "pr\nod", "../prod", "prod/x", "\u00e9t\u00e9"],
+)
+def test_a_config_takes_a_fluid_env_default_exactly_when_every_stage_does(env):
+    """Measured: ``PipelineConfig(fluid_env_default='_prod')`` built directly,
+    not through ``fluid generate ci``, wrote a Jenkinsfile whose build on the
+    defaults ran stages 1 to 9 (``fluid apply`` included) in ``_prod`` and then
+    exited 2 at stage 10, whose ``fluid publish --env`` refuses the name. The
+    config, not only the CLI, holds the default to both stages' validators."""
+    every_stage = _publish_accepts(env) and _generate_artifacts_accepts(env)
+    try:
+        content = _jenkinsfile(fluid_env_default=env)
+    except ValueError as exc:
+        assert not every_stage, exc
+        assert "not an environment name" in str(exc)
+    else:
+        assert every_stage, f"{env!r} generated, but a stage's --env refuses it"
+        assert _declared(content)["FLUID_ENV"] == env
+
+
+def test_the_option_is_on_the_command_line(repo, monkeypatch):
+    from fluid_build.cli import main as fluid_main
+
+    product = repo / "contracts" / "customer_subscriptions"
+    monkeypatch.chdir(product)
+    argv = ["generate", "ci", "contract.fluid.yaml", "--system", "jenkins", "--out", "Jenkinsfile"]
+    assert fluid_main([*argv, "--fluid-env-default", "aws"]) == 0
+    assert _declared((product / "Jenkinsfile").read_text(encoding="utf-8"))["FLUID_ENV"] == "aws"
+    (product / "Jenkinsfile").unlink()
+    assert fluid_main([*argv, "--fluid-env-default", "../aws"]) != 0
+    assert not (product / "Jenkinsfile").exists()
 
 
 # ── (6) the archive steps read what the stages write ─────────────────────

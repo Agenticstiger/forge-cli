@@ -38,10 +38,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from fluid_build._env_names import ENV_NAME_RULE, is_env_name
 from fluid_build.cli.console import cprint, cprint_json
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
@@ -96,17 +96,15 @@ logger = logging.getLogger(__name__)
 
 # An ``--env`` names an overlay file (``overlays/<env>.yaml`` next to the
 # contract) and is recorded in the catalog, so it must be a plain name: no path
-# separator can walk the overlay lookup out of the contract's directory.
-_ENV_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+# separator can walk the overlay lookup out of the contract's directory. The
+# grammar lives in ``fluid_build._env_names``, where the pipeline generator
+# reads it too: a generated pipeline's FLUID_ENV default is held to it.
 
 
 def _env_name(value: str) -> str:
     """argparse ``type`` for ``--env``: a plain environment name."""
-    if not _ENV_NAME_RE.fullmatch(value):
-        raise argparse.ArgumentTypeError(
-            f"invalid environment name {value!r}: use letters, digits, '.', '_' and '-' "
-            "(at most 64 characters, starting with a letter or digit)"
-        )
+    if not is_env_name(value):
+        raise argparse.ArgumentTypeError(f"invalid environment name {value!r}: {ENV_NAME_RULE}")
     return value
 
 
@@ -383,7 +381,7 @@ async def publish_contract(
         logger.info(f"📄 Loading contract: {contract_path}")
 
     # The CLI checks --env in argparse; a programmatic caller gets the same rule.
-    if env is not None and not _ENV_NAME_RE.fullmatch(env):
+    if env is not None and not is_env_name(env):
         return PublishResult(
             success=False,
             catalog_id=catalog_name,
