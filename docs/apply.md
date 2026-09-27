@@ -126,6 +126,62 @@ builds:
 `{{ env.X }}` placeholders are resolved before any engine sees the SQL, for
 both apply inputs (a `.fluid.yaml` path and a `plan.json`).
 
+### What a DuckDB embedded-SQL build reads, and where it lands
+
+On the DuckDB engine (`local` / `duckdb` / unset), each `consumes[]` entry is
+a view the SQL reads, named by its `exposeId`:
+
+```yaml
+consumes:
+  - productId: bronze.customer_subscriptions
+    exposeId: subscriptions          # ← the view name
+builds:
+  - id: summarize
+    pattern: embedded-logic
+    engine: duckdb
+    properties:
+      sql: SELECT product_id, status, COUNT(*) AS n FROM subscriptions GROUP BY 1, 2
+```
+
+* **Which contract.** The one declaring `id: <productId>` under the nearest
+  directory above this contract that holds `fluid.workspace.yaml`, plus any
+  root in `FLUID_UPSTREAM_CONTRACTS` (four levels deep, `contract.fluid.yaml`
+  or `.json`; VCS, venv and output directories such as `dist/`, `runtime/`,
+  `.fluid/` are skipped). An id declared by two files fails the build naming
+  both.
+* **Which binding.** The upstream is loaded with the same `--env` overlay as
+  this run (for a bundle input without `--env`, the env its MANIFEST records),
+  so `--env aws` reads the upstream's aws binding. Overlays keep patching only
+  `exposes[].binding`; the SQL is the same on every target.
+* **Which relation.** A local binding reads its `location.path`, relative to
+  the UPSTREAM contract's directory. An AWS binding naming a `location.bucket`
+  and `location.path` reads `s3://<bucket>/<path>/*.<ext>`, the prefix the
+  duckdb acquisition runner writes into and the Glue table `fluid apply`
+  declares for it. A warehouse table, a stream, or a GCS/Azure prefix is an
+  `UnreadableBindingError` naming the platform. A `{{ env.X }}` in the upstream
+  binding with `X` unset is an error, not an empty string.
+* **Explicit inputs win.** A `properties.parameters.inputs` entry whose `name`
+  equals the `exposeId` binds that view by hand, and the entry is not resolved
+  at all: that is how a federated upstream, or one this engine cannot read, is
+  still bound.
+* **Nothing silent.** An entry that is neither resolved nor covered fails the
+  build before the SQL runs, naming the productId and where it looked. The
+  resolved `productId` / `exposeId` / `uri` are printed and kept in the
+  provider's `runtime/out/local_apply_log.jsonl`; this path writes no run
+  record and emits no OpenLineage event.
+
+When the first expose's binding is an AWS object-store binding
+(`platform: aws`, `location.bucket` + `location.path`, `format` parquet, csv
+or json), the result is written to the object the acquisition runner writes
+for that binding: `s3://<bucket>/<path>/<location.table or exposeId>.<ext>`,
+inside the Glue table's location, so `fluid verify --env aws` counts it.
+S3 access uses the ambient AWS credential chain and the binding's region;
+`AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` point it (and the acquisition
+runner) at an S3-compatible store such as MinIO. A local binding is
+unchanged. An expose declaring `policy.privacy.masking` is refused
+(`MaskingNotAppliedError`): this path does not apply masking, and cleartext
+must not land silently.
+
 ### Skipped builds are not success
 
 If every build in a build-augmented mode was skipped — a missing dbt

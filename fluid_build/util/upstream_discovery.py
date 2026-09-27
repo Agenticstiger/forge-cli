@@ -42,17 +42,19 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import AbstractSet, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import yaml
 
 from fluid_build.util.safe_yaml import MAX_YAML_BYTES, UnsafeYamlError, load_yaml_safe
 
 __all__ = [
+    "BUILD_OUTPUT_DIRS",
     "IGNORED_DIRS",
     "CONTRACT_FILENAMES",
     "collect_search_roots",
     "discover_upstream_products",
+    "index_contract_paths",
     "project_upstream_for_prompt",
 ]
 
@@ -74,6 +76,29 @@ IGNORED_DIRS = frozenset(
         ".pytest_cache",
         ".mypy_cache",
         "generated",
+    }
+)
+
+#: What a walk made for a BUILD also skips: directories forge-cli, a CI job or
+#: an installed forge-cli write into. A copy of a contract left in one of them
+#: (a venv's ``site-packages/fluid_build/templates``, a ``dist/`` artifact
+#: tree) would otherwise be a second contract declaring the same id, and a
+#: build must refuse an id declared twice rather than pick one.
+BUILD_OUTPUT_DIRS = frozenset(
+    {
+        "dist",
+        "build",
+        "out",
+        "runtime",
+        ".fluid",
+        ".fluid-ci",
+        ".fluid-venv",
+        ".fluid-workspace",
+        "venv",
+        "site-packages",
+        ".ruff_cache",
+        ".hg",
+        ".svn",
     }
 )
 
@@ -129,7 +154,13 @@ def collect_search_roots(
     return roots
 
 
-def _iter_contracts(root: Path, max_depth: int = 4, _depth: int = 0):
+def _iter_contracts(
+    root: Path,
+    max_depth: int = 4,
+    _depth: int = 0,
+    *,
+    ignored: AbstractSet[str] = IGNORED_DIRS,
+) -> Iterator[Path]:
     """Yield ``contract.fluid.yaml`` paths under *root*, depth-limited."""
     try:
         entries = sorted(root.iterdir())
@@ -140,9 +171,37 @@ def _iter_contracts(root: Path, max_depth: int = 4, _depth: int = 0):
             continue
         if entry.is_file() and entry.name in CONTRACT_FILENAMES:
             yield entry
-        elif entry.is_dir() and entry.name not in IGNORED_DIRS:
+        elif entry.is_dir() and entry.name not in ignored:
             if max_depth == -1 or _depth < max_depth:
-                yield from _iter_contracts(entry, max_depth, _depth + 1)
+                yield from _iter_contracts(entry, max_depth, _depth + 1, ignored=ignored)
+
+
+def _read_discovered_contract(contract_path: Path) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Parse one DISCOVERED contract file: ``(document, "")`` or ``(None, reason)``.
+
+    SECURITY (billion-laughs / oversized-YAML DoS): these contracts are
+    DISCOVERED by walking the workspace (+ pulled mesh repos via
+    FLUID_UPSTREAM_CONTRACTS) — the user did NOT explicitly name them, so a
+    hostile upstream contract must not be able to OOM generation of a
+    different product.
+
+    stat-before-read: ``load_yaml_safe``'s byte cap only fires AFTER the whole
+    file is in memory, so a multi-GB file would already have OOM'd us before
+    the cap ran. Stat the file FIRST and skip oversized ones — mirrors the
+    stat-before-read in ``forge/federation.py::_read_first_existing_contract``
+    and reuses the same :data:`MAX_YAML_BYTES` ceiling. ``load_yaml_safe``
+    remains the parse path (defence in depth: alias-bomb + cap).
+    """
+    try:
+        size = contract_path.stat().st_size
+        if size > MAX_YAML_BYTES:
+            return None, f"{size} bytes > {MAX_YAML_BYTES} cap"
+        data = load_yaml_safe(contract_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError, UnsafeYamlError) as exc:
+        return None, str(exc)
+    if not isinstance(data, Mapping):
+        return None, "not a mapping"
+    return dict(data), ""
 
 
 def discover_upstream_products(
@@ -163,39 +222,58 @@ def discover_upstream_products(
     index: Dict[str, Dict[str, Any]] = {}
     for root in roots:
         for contract_path in _iter_contracts(root, max_depth=max_depth):
-            try:
-                # SECURITY (billion-laughs / oversized-YAML DoS): these
-                # contracts are DISCOVERED by walking the workspace (+ pulled
-                # mesh repos via FLUID_UPSTREAM_CONTRACTS) — the user did NOT
-                # explicitly name them, so a hostile upstream contract must
-                # not be able to OOM generation of a different product.
-                #
-                # stat-before-read: ``load_yaml_safe``'s byte cap only fires
-                # AFTER the whole file is in memory, so a multi-GB file would
-                # already have OOM'd us before the cap ran. Stat the file
-                # FIRST and skip oversized ones — mirrors the stat-before-read
-                # in ``forge/federation.py::_read_first_existing_contract`` and
-                # reuses the same :data:`MAX_YAML_BYTES` ceiling. ``load_yaml_safe``
-                # remains the parse path (defence in depth: alias-bomb + cap).
-                if contract_path.stat().st_size > MAX_YAML_BYTES:
-                    _logger.debug(
-                        "upstream: skipping %s (%s bytes > %s cap)",
-                        contract_path,
-                        contract_path.stat().st_size,
-                        MAX_YAML_BYTES,
-                    )
-                    continue
-                data = load_yaml_safe(contract_path.read_text(encoding="utf-8"))
-            except (OSError, yaml.YAMLError, UnsafeYamlError) as exc:
-                _logger.debug("upstream: skipping %s (%s)", contract_path, exc)
-                continue
-            if not isinstance(data, Mapping):
+            data, reason = _read_discovered_contract(contract_path)
+            if data is None:
+                _logger.debug("upstream: skipping %s (%s)", contract_path, reason)
                 continue
             contract_id = data.get("id")
             if not contract_id or not isinstance(contract_id, str):
                 continue
-            index[contract_id] = dict(data)
+            index[contract_id] = data
     return index
+
+
+def index_contract_paths(
+    roots: Iterable[Path],
+    *,
+    max_depth: int = 4,
+    ignored: AbstractSet[str] = IGNORED_DIRS | BUILD_OUTPUT_DIRS,
+) -> Tuple[Dict[str, List[Path]], List[Tuple[Path, str]]]:
+    """Every contract file under *roots*, keyed by the ``id`` it declares.
+
+    The same walk and the same guarded read as :func:`discover_upstream_products`,
+    for a caller that must not guess: a build resolving ``consumes[].productId``
+    to the contract that owns it. Two differences follow from that:
+
+    * an id maps to EVERY file declaring it (a file reached from two roots is
+      listed once), so the caller can refuse an id found twice instead of
+      taking whichever the walk met last;
+    * the files that could not be read are returned as ``(path, reason)``, so
+      "no contract declares this id" can say which files it could not look in.
+
+    ``ignored`` defaults to :data:`IGNORED_DIRS` plus :data:`BUILD_OUTPUT_DIRS`.
+    """
+    index: Dict[str, List[Path]] = {}
+    skipped: List[Tuple[Path, str]] = []
+    seen: set = set()
+    for root in roots:
+        for contract_path in _iter_contracts(root, max_depth=max_depth, ignored=ignored):
+            try:
+                key = contract_path.resolve()
+            except (OSError, RuntimeError):
+                key = contract_path
+            if key in seen:
+                continue
+            seen.add(key)
+            data, reason = _read_discovered_contract(contract_path)
+            if data is None:
+                skipped.append((contract_path, reason))
+                continue
+            contract_id = data.get("id")
+            if not contract_id or not isinstance(contract_id, str):
+                continue
+            index.setdefault(contract_id, []).append(contract_path)
+    return index, skipped
 
 
 def project_upstream_for_prompt(

@@ -28,19 +28,23 @@ module exists to close.
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any, Dict, Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, Optional, Union
 
 from ._sql_safety import quote_ansi_string_literal, validate_ident
 
 _CSV_SUFFIXES = {".csv", ".tsv"}
+_JSON_FORMATS = {"json", "ndjson", "jsonl"}
+_JSON_SUFFIXES = {".json", ".ndjson", ".jsonl"}
 
 
 def build_register_view_sql(
     table: str,
-    path: Path,
+    path: Union[str, Path],
     fmt: str,
     options: Optional[Dict[str, Any]] = None,
+    *,
+    quote_identifier: bool = False,
 ) -> str:
     """Return ``CREATE OR REPLACE VIEW <table> AS SELECT * FROM read_*(...)``.
 
@@ -49,12 +53,22 @@ def build_register_view_sql(
     helpers -- identifiers through :func:`validate_ident`, the path through
     :func:`quote_ansi_string_literal`.
 
+    ``path`` may be an object-store URI (``s3://bucket/prefix/*.parquet``) as a
+    ``str``: a ``Path`` would fold ``s3://`` into ``s3:/``, which DuckDB cannot
+    read. ``quote_identifier`` emits the view name double-quoted, so a name
+    that is a SQL keyword (``order``) still registers; it has passed
+    :func:`validate_ident` first, so it can hold no quote to escape.
+
     Format is taken from ``fmt`` first and the suffix second, matching what
-    the local provider has always done; anything unrecognised falls back to
-    ``read_csv_auto``, which is DuckDB's own most forgiving reader.
+    the local provider has always done; ``json`` / ``ndjson`` read through
+    ``read_json_auto`` (newline-delimited, what the duckdb runner lands);
+    anything unrecognised falls back to ``read_csv_auto``, which is DuckDB's
+    own most forgiving reader.
     """
-    suffix = path.suffix.lower()
+    suffix = (path.suffix if isinstance(path, Path) else PurePosixPath(path).suffix).lower()
     ident = validate_ident(table)
+    if quote_identifier:
+        ident = f'"{ident}"'
     literal = quote_ansi_string_literal(str(path))
 
     if fmt in {"csv", "tsv"} or suffix in _CSV_SUFFIXES:
@@ -76,5 +90,8 @@ def build_register_view_sql(
 
     if fmt in {"parquet", "pq"} or suffix == ".parquet":
         return f"CREATE OR REPLACE VIEW {ident} AS SELECT * FROM read_parquet({literal});"
+
+    if fmt in _JSON_FORMATS or suffix in _JSON_SUFFIXES:
+        return f"CREATE OR REPLACE VIEW {ident} AS SELECT * FROM read_json_auto({literal});"
 
     return f"CREATE OR REPLACE VIEW {ident} AS SELECT * FROM read_csv_auto({literal});"

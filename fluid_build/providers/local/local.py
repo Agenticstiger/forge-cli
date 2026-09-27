@@ -119,6 +119,28 @@ def _has_glob(path: Path) -> bool:
     return any(ch in s for ch in ("*", "?", "["))
 
 
+def _is_s3_uri(path: str) -> bool:
+    return path[:5].lower() == "s3://"
+
+
+def _s3_bucket_regions(specs: Iterable[Any]) -> Dict[str, Optional[str]]:
+    """``{bucket: region}`` for every ``s3://`` input or output spec.
+
+    A spec's ``region`` is the binding's ``location.region``. The first spec
+    that names a region for a bucket sets it: one bucket lives in one region.
+    """
+    buckets: Dict[str, Optional[str]] = {}
+    for spec in specs:
+        raw = spec.get("path") if isinstance(spec, dict) else spec
+        if not isinstance(raw, str) or not _is_s3_uri(raw):
+            continue
+        bucket = raw.split("://", 1)[1].split("/", 1)[0]
+        region = spec.get("region") if isinstance(spec, dict) else None
+        if bucket and not buckets.get(bucket):
+            buckets[bucket] = str(region) if region else None
+    return buckets
+
+
 def _guess_table_name_from_path(p: Path) -> str:
     stem = re.sub(r"[^A-Za-z0-9_]+", "_", p.stem)
     return stem or "t"
@@ -691,6 +713,10 @@ class LocalProvider(BaseProvider):
         con.execute("PRAGMA threads=4;")
 
         inputs = action.get("inputs") or action.get("tables") or []
+        outputs = action.get("outputs") or action.get("out") or []
+        if isinstance(outputs, (str, Path)):
+            outputs = [outputs]
+        self._attach_object_stores(con, [*inputs, *outputs])
         reg_info = self._register_inputs(con, inputs)
 
         # Log with redacted SQL (in case it contains sensitive data)
@@ -737,21 +763,10 @@ class LocalProvider(BaseProvider):
                     "local_sql_create_table_warn", {"table": output_table, "error": str(e)}
                 )
 
-        outputs = action.get("outputs") or action.get("out") or []
-        if isinstance(outputs, (str, Path)):
-            outputs = [outputs]
-
         written: List[str] = []
         if outputs:
             for out_spec in outputs:
-                p, fmt = self._normalize_output(out_spec)
-
-                # Retry write operations (can fail with I/O errors)
-                def _write_with_retry():
-                    self._write_relation(rel, p, fmt)
-
-                with_retry(_write_with_retry, logger=self.logger, max_attempts=3)
-                written.append(str(p))
+                written.append(self._write_output(con, rel, out_spec))
         else:
             p = Path(f"runtime/out/preview_{idx}.csv")
 
@@ -788,28 +803,132 @@ class LocalProvider(BaseProvider):
                 self._register_one(con, table, path, fmt, options=None)
                 info.append({"table": table, "path": str(path), "format": fmt or "auto"})
             elif isinstance(item, dict):
-                path = Path(str(item.get("path", "")))
-                table = str(item.get("table") or _guess_table_name_from_path(path))
-                fmt = str(item.get("format") or _ext(path) or "csv").lower()
-                options = item.get("options") or {}
-                self._register_one(con, table, path, fmt, options)
-                info.append({"table": table, "path": str(path), "format": fmt, "options": options})
+                info.append(self._register_mapping_input(con, item))
             else:
                 raise TypeError(f"Unsupported input spec: {item!r}")
         return info
 
+    def _register_mapping_input(self, con: Any, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Register one ``{path, table?, format?, options?, quoted?}`` input spec."""
+        raw = str(item.get("path", ""))
+        # An ``s3://`` URI stays a string: ``Path`` folds ``s3://`` into
+        # ``s3:/``, which DuckDB cannot read. Only S3, whose access
+        # ``_attach_object_stores`` sets up: any other scheme (``http://``,
+        # ``gs://``) still takes the local-file path and its existence check,
+        # rather than a fetch from a URL a contract names.
+        path: Union[str, Path] = raw if _is_s3_uri(raw) else Path(raw)
+        table = str(item.get("table") or _guess_table_name_from_path(Path(raw)))
+        fmt = str(item.get("format") or _ext(Path(raw)) or "csv").lower()
+        options = item.get("options") or {}
+        self._register_one(
+            con, table, path, fmt, options, quote_identifier=bool(item.get("quoted"))
+        )
+        entry: Dict[str, Any] = {
+            "table": table,
+            "path": str(path),
+            "format": fmt,
+            "options": options,
+        }
+        # A consumes[]-resolved input says which upstream it is, so the apply
+        # log records the lineage that ran, not just a path.
+        if item.get("productId"):
+            entry.update(productId=item["productId"], exposeId=item.get("exposeId"), uri=str(path))
+        return entry
+
     def _register_one(
-        self, con: Any, table: str, path: Path, fmt: str, options: Optional[Dict[str, Any]]
+        self,
+        con: Any,
+        table: str,
+        path: Union[str, Path],
+        fmt: str,
+        options: Optional[Dict[str, Any]],
+        *,
+        quote_identifier: bool = False,
     ) -> None:
-        is_glob = _has_glob(path)
-        if not is_glob and not path.exists():
+        # Existence is checked for a local file only. An object-store URI is
+        # checked by DuckDB when the view is created, which fails on a glob
+        # that matches nothing, so an empty upstream prefix still fails here.
+        if isinstance(path, Path) and not _has_glob(path) and not path.exists():
             raise FileNotFoundError(f"Input file not found: {path}")
 
         # The statement itself lives in ``providers/_duckdb_read`` because the
         # sql engine writes the same one into its generated script. One copy:
         # otherwise ``fluid apply`` and the emitted script drift, which is the
         # split that left six shipped examples generating SQL that will not run.
-        con.execute(build_register_view_sql(table, path, fmt, options))
+        con.execute(
+            build_register_view_sql(table, path, fmt, options, quote_identifier=quote_identifier)
+        )
+
+    def _attach_object_stores(self, con: Any, specs: Iterable[Any]) -> None:
+        """Load httpfs and authenticate each bucket an input or output names.
+
+        Reuses the duckdb acquisition runner's own helper, so a build reads an
+        upstream's objects, and lands its own, with the same extensions and the
+        same ambient-credential-chain secret that runner writes them with. One
+        secret per bucket, scoped to it, carrying that spec's ``region``.
+        """
+        buckets = _s3_bucket_regions(specs)
+        if not buckets:
+            return
+        from fluid_build.build_runners.duckdb.runner import attach_object_store
+
+        for n, (bucket, region) in enumerate(sorted(buckets.items())):
+            attach_object_store(
+                con,
+                f"s3://{bucket}/",
+                region=region,
+                scope=f"s3://{bucket}",
+                name=f"__fluid_s3_{n}",
+            )
+
+    def _write_output(self, con: Any, rel: Any, out_spec: Any) -> str:
+        """Write the result to one output spec, with retry; return where it went.
+
+        An ``s3://`` spec is ``COPY``-ed to that object (``_copy_relation_to_uri``);
+        anything else is a local file, as it always was.
+        """
+        remote = self._remote_output(out_spec)
+        if remote is not None:
+            uri, remote_fmt = remote
+
+            def _copy_with_retry():
+                self._copy_relation_to_uri(con, rel, uri, remote_fmt)
+
+            with_retry(_copy_with_retry, logger=self.logger, max_attempts=3)
+            return uri
+        p, fmt = self._normalize_output(out_spec)
+
+        # Retry write operations (can fail with I/O errors)
+        def _write_with_retry():
+            self._write_relation(rel, p, fmt)
+
+        with_retry(_write_with_retry, logger=self.logger, max_attempts=3)
+        return str(p)
+
+    @staticmethod
+    def _remote_output(out_spec: Any) -> Optional[Tuple[str, str]]:
+        """``(uri, format)`` for an ``s3://`` output spec, else ``None``."""
+        raw = out_spec.get("path") if isinstance(out_spec, dict) else out_spec
+        if not isinstance(raw, str) or not _is_s3_uri(raw):
+            return None
+        fmt = str((out_spec.get("format") if isinstance(out_spec, dict) else "") or "parquet")
+        return raw, fmt.lower()
+
+    def _copy_relation_to_uri(self, con: Any, rel: Any, uri: str, fmt: str) -> None:
+        """``COPY`` the result to an object-store URI, as the duckdb runner lands one.
+
+        The statement is the runner's own (``_build_copy_destination``), so an
+        embedded-SQL build writes the same bytes, format options included, as
+        an acquisition build landing the same binding.
+        """
+        from fluid_build.build_runners.duckdb.runner import _build_copy_destination
+
+        view = "__fluid_embedded_result"
+        rel.create_view(view, replace=True)
+        # ``replace`` on the first ``{select}``, not ``str.format``: the quoted
+        # URI follows it in the template and may itself hold braces.
+        template = _build_copy_destination(uri, fmt)
+        con.execute(template.replace("{select}", f"SELECT * FROM {view}", 1))
 
     # ------------------ COPY / materialize (helper) --------------------- #
 
