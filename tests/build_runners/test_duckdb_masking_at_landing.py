@@ -36,7 +36,11 @@ import pytest
 
 duckdb = pytest.importorskip("duckdb")
 
+from fluid_build.api.conformance.runner import assert_openlineage_shape  # noqa: E402
+from fluid_build.api.lineage import RunEventType  # noqa: E402
+from fluid_build.build_runners import _lineage as lineage_module  # noqa: E402
 from fluid_build.build_runners import _masking as m  # noqa: E402
+from fluid_build.build_runners._lineage import BufferedLineageEmitter, encode_event  # noqa: E402
 from fluid_build.build_runners.duckdb.runner import execute_duckdb_build  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -315,6 +319,58 @@ def test_without_masking_rules_the_copy_is_exactly_what_it_was(tmp_path, monkeyp
     assert "REPLACE" not in copy and "__fluid_mask_" not in copy
     assert "masking" not in record["facets"]
     assert _landed(tmp_path / "out" / "subs.parquet")[0]["msisdn"] == "+46701234567"
+
+
+# ── Lineage ─────────────────────────────────────────────────────────────
+
+
+def _lineage(tmp_path: Path, monkeypatch, contract: Dict[str, Any]) -> tuple[int, List[Any]]:
+    """Run the build with a buffered OpenLineage emitter; return (rc, events)."""
+    buffered = BufferedLineageEmitter()
+    monkeypatch.setattr(lineage_module, "resolve_lineage_emitter", lambda: buffered)
+    rc, _ = _run(tmp_path, contract)
+    return rc, list(buffered.events)
+
+
+def _refusing_contract(tmp_path: Path, monkeypatch, refusal: str) -> Dict[str, Any]:
+    if refusal == "unset salt":
+        monkeypatch.delenv(m.DEFAULT_SALT_ENV)
+        return _contract(tmp_path, [HASH_MSISDN])
+    if refusal == "k_anonymity":
+        return _contract(tmp_path, [{"column": "zip", "strategy": "k_anonymity"}])
+    return _contract(
+        tmp_path,
+        [{"column": "id", "strategy": "hash"}],
+        schema=[{"name": "id", "type": "INTEGER"}],
+        schema_policy="strict",
+    )
+
+
+@pytest.mark.parametrize("refusal", ["unset salt", "k_anonymity", "non-string declared type"])
+def test_a_refused_masking_run_emits_start_before_its_fail(tmp_path, monkeypatch, refusal):
+    """A refusal is refused before the run opens, but it is still a run.
+
+    The FAIL that ``execute_duckdb_build`` emits for it needs a START with the
+    same runId, as every other outcome has, or a lineage backend shows a run
+    that ended without starting.
+    """
+    rc, events = _lineage(tmp_path, monkeypatch, _refusing_contract(tmp_path, monkeypatch, refusal))
+    assert rc == 1
+    assert not (tmp_path / "out" / "subs.parquet").exists(), "something landed"
+    assert [e.event_type for e in events] == [RunEventType.START, RunEventType.FAIL]
+    encoded = [encode_event(e) for e in events]
+    for event in encoded:
+        assert_openlineage_shape(event)
+    assert len({e["run"]["runId"] for e in encoded}) == 1
+
+
+def test_a_treated_run_emits_start_and_complete_with_no_secret_in_either(tmp_path, monkeypatch):
+    rc, events = _lineage(tmp_path, monkeypatch, _contract(tmp_path, DEFAULT_RULES))
+    assert rc == 0
+    assert [e.event_type for e in events] == [RunEventType.START, RunEventType.COMPLETE]
+    text = json.dumps([encode_event(e) for e in events])
+    for secret in SECRETS + CLEARTEXT:
+        assert secret not in text
 
 
 # ── Secrets ─────────────────────────────────────────────────────────────

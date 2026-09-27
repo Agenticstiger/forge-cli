@@ -62,6 +62,7 @@ from fluid_build.providers._sql_safety import (
 
 from .._acquisition_common import (
     begin_acquisition_run,
+    emit_start_lineage_event,
     emit_terminal_lineage_event,
     finalize_run_result,
     resolve_connection_secrets,
@@ -1025,10 +1026,14 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     # Before the schema gate, so a masked column declared with a type its
     # strategy cannot produce is refused with that reason rather than reported
     # as drift; and before anything connects, so a refused run touches nothing.
+    # A refused run is still a run on the lineage stream: it gets the START
+    # that ``begin_acquisition_run`` would have emitted, so the FAIL that
+    # ``execute_duckdb_build`` emits for it is not an orphan.
     try:
         masker = _landing_masker(ctx)
     except MaskingPolicyError as exc:
-        return _refused_run(ctx, streams_to_run, utc_now_iso(), time.time(), f"masking: {exc}")
+        started_at = emit_start_lineage_event(ctx)
+        return _refused_run(ctx, streams_to_run, started_at, time.time(), f"masking: {exc}")
 
     # Shared run-opening chokepoint: timestamp + schema-evolution gate +
     # duration clock + the OpenLineage START event. duckdb previously
