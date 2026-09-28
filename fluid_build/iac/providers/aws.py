@@ -1925,13 +1925,32 @@ def _emit_lakeformation(
         cols = grant.get("columns")
         excluded = grant.get("excludedColumns")
         if (cols or excluded) and table_key:
+            if cols and excluded:
+                # One block cannot hold both: Lake Formation takes either a column
+                # list or a column wildcard (with its exclusions), never the two.
+                raise UnsupportedBindingError(
+                    "lakeformation-grant-columns",
+                    f"governance.lakeFormation.grants[{idx}] sets both columns and "
+                    "excludedColumns; they are mutually exclusive.",
+                    (
+                        "Keep columns to grant only the listed columns.",
+                        "Keep excludedColumns to grant every column except the listed ones.",
+                    ),
+                )
             twc: Dict[str, Any] = {
                 "database_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.database_name"),
                 "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
             }
             if cols:
+                # An allow-list: never a wildcard beside it.
                 twc["column_names"] = list(cols)
-            if excluded:
+            else:
+                # Every column except these. hashicorp/aws: "If excluded_column_names
+                # is included, wildcard must be set to true"; without it `tofu plan`
+                # fails "Missing required argument" (`tofu validate` does not, as the
+                # table name is unknown until plan). The provider also reads the grant
+                # back with wildcard = true, so this is what keeps the plan clean.
+                twc["wildcard"] = True
                 twc["excluded_column_names"] = list(excluded)
             body["table_with_columns"] = [twc]
         elif table_key:
