@@ -41,6 +41,7 @@ Glue storage checks (``_verify_storage_policy.py``).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 LOG = logging.getLogger("fluid.cli.verify.bigquery_governance")
@@ -49,6 +50,20 @@ LOG = logging.getLogger("fluid.cli.verify.bigquery_governance")
 DATACATALOG_API = "https://datacatalog.googleapis.com/v1"
 
 SessionFactory = Callable[[], Any]
+
+#: The variable python-bigquery reads for an emulator endpoint. No emulator
+#: serves Data Catalog, so under it the policy tags' readers cannot be read.
+_BIGQUERY_EMULATOR_HOST = "BIGQUERY_EMULATOR_HOST"
+
+
+def _catalog_unreachable() -> Optional[str]:
+    """Why Data Catalog cannot be asked here, or ``None`` when it can."""
+    if os.environ.get(_BIGQUERY_EMULATOR_HOST, "").strip():
+        return (
+            f"{_BIGQUERY_EMULATOR_HOST} points BigQuery at an emulator, and no emulator "
+            "serves Data Catalog, where the policy tags' readers are"
+        )
+    return None
 
 
 def default_session() -> Any:
@@ -154,13 +169,20 @@ def _catalog_json(session: Any, method: str, url: str) -> Mapping[str, Any]:
     return body if isinstance(body, Mapping) else {}
 
 
-def _column_access_dimension(bq_table: Any, groups: List[Any], session: Any) -> Dict[str, Any]:
-    from fluid_build.iac.providers.gcp_governance import FINE_GRAINED_READER_ROLE
+def _column_access_dimension(
+    bq_table: Any, groups: List[Any], session_factory: SessionFactory
+) -> Dict[str, Any]:
+    """Every restricted column's tag, then (through Data Catalog) each tag's readers.
 
+    The tags are on the table, so a column that carries none is reported from
+    the table alone. The Data Catalog session is opened only for a tag whose
+    readers must be read: it used to be opened first, so a table with no tags
+    at all, checked where no credentials were (the BigQuery emulator), was an
+    error about credentials instead of the failure it is.
+    """
     fields = {getattr(f, "name", None): f for f in (getattr(bq_table, "schema", None) or [])}
     problems: List[str] = []
-    checked: List[Dict[str, Any]] = []
-    taxonomies: Dict[str, bool] = {}
+    tagged: List[Tuple[Any, Dict[str, List[str]]]] = []
     for group in groups:
         by_tag: Dict[str, List[str]] = {}
         for column in group.columns:
@@ -174,6 +196,62 @@ def _column_access_dimension(bq_table: Any, groups: List[Any], session: Any) -> 
                 )
                 continue
             by_tag.setdefault(str(names[0]), []).append(column)
+        tagged.append((group, by_tag))
+    if not any(by_tag for _, by_tag in tagged):
+        return _column_access_result(problems, [])
+
+    unreachable = _catalog_unreachable()
+    session: Any = None
+    if unreachable is None:
+        try:
+            session = session_factory()
+        except Exception as exc:  # noqa: BLE001 — reported, with what was found
+            unreachable = f"no Data Catalog session: {type(exc).__name__}: {exc}"
+    if unreachable is not None:
+        note = f"the readers of the tagged columns were not checked: {unreachable}"
+        if problems:
+            # What the table shows is conclusive; say what could not be read.
+            return _column_access_result(problems + [note], [])
+        if _catalog_unreachable() is not None:
+            return {
+                "status": "unsupported",
+                "tags": [],
+                "message": (
+                    "Column restrictions: every restricted column carries a policy tag; " + note
+                ),
+            }
+        raise _CatalogError(unreachable)
+    try:
+        return _column_access_readers(tagged, problems, session)
+    except _CatalogError as exc:
+        if not problems:
+            raise
+        return _column_access_result(
+            problems + [f"the readers of the tagged columns were not all checked: {exc}"], []
+        )
+
+
+def _column_access_result(problems: List[str], checked: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "status": "fail" if problems else "pass",
+        "tags": checked,
+        "message": (
+            "Column restrictions: " + "; ".join(problems)
+            if problems
+            else "Column restrictions: every restricted column is readable only by its readers"
+        ),
+    }
+
+
+def _column_access_readers(
+    tagged: List[Tuple[Any, Dict[str, List[str]]]], problems: List[str], session: Any
+) -> Dict[str, Any]:
+    """Each tag's fine-grained readers against the group's, and its taxonomy's enforcement."""
+    from fluid_build.iac.providers.gcp_governance import FINE_GRAINED_READER_ROLE
+
+    checked: List[Dict[str, Any]] = []
+    taxonomies: Dict[str, bool] = {}
+    for group, by_tag in tagged:
         for tag, columns in by_tag.items():
             policy = _catalog_json(session, "POST", f"{DATACATALOG_API}/{tag}:getIamPolicy")
             members: set[str] = set()
@@ -205,15 +283,7 @@ def _column_access_dimension(bq_table: Any, groups: List[Any], session: Any) -> 
                         "control, so its policy tags restrict no one"
                     )
             checked.append({"tag": tag, "columns": columns, "readers": sorted(members)})
-    return {
-        "status": "fail" if problems else "pass",
-        "tags": checked,
-        "message": (
-            "Column restrictions: " + "; ".join(problems)
-            if problems
-            else "Column restrictions: every restricted column is readable only by its readers"
-        ),
-    }
+    return _column_access_result(problems, checked)
 
 
 def governance_dimensions(
@@ -286,8 +356,7 @@ def governance_dimensions(
         )
         if not groups:
             return None
-        session = (session_factory or default_session)()
-        return _column_access_dimension(bq_table, groups, session)
+        return _column_access_dimension(bq_table, groups, session_factory or default_session)
 
     attempt("retention", retention)
     attempt("encryption", encryption)

@@ -291,6 +291,83 @@ def test_a_catalog_that_cannot_be_read_is_an_error_not_a_pass():
     assert "HTTP 403" in dims["columnRestrictions"]["message"]
 
 
+# ── where Data Catalog cannot be reached ─────────────────────────────────
+#
+# Measured on the BigQuery emulator (goccy, BIGQUERY_EMULATOR_HOST, no ADC): a
+# table with no policy tag on its restricted column was reported "error:
+# DefaultCredentialsError", because the Data Catalog session was opened before
+# the tags were read. The missing tag is the finding.
+
+
+def _no_credentials() -> Any:
+    raise RuntimeError("DefaultCredentialsError: Your default credentials were not found")
+
+
+def _dims_without_a_session(contract: Dict[str, Any], table: Any) -> Dict[str, Any]:
+    return bqgov.governance_dimensions(
+        contract["exposes"][0],
+        contract=contract,
+        bq_dataset=_dataset(),
+        bq_table=table,
+        project=PROJECT,
+        session_factory=_no_credentials,
+    )
+
+
+def test_a_missing_tag_fails_without_asking_data_catalog(monkeypatch):
+    monkeypatch.delenv("BIGQUERY_EMULATOR_HOST", raising=False)
+    contract = _contract(policy=copy.deepcopy(GOVERNED["policy"]))
+    opened: List[int] = []
+
+    def factory() -> Any:
+        opened.append(1)
+        return _Catalog([PLATFORM, PIPELINE])
+
+    dims = bqgov.governance_dimensions(
+        contract["exposes"][0],
+        contract=contract,
+        bq_dataset=_dataset(),
+        bq_table=_table(tag=None),
+        project=PROJECT,
+        session_factory=factory,
+    )
+    assert dims["columnRestrictions"]["status"] == "fail"
+    assert "column msisdn carries no policy tag" in dims["columnRestrictions"]["message"]
+    assert opened == []
+
+
+@pytest.mark.parametrize("emulator", ["http://127.0.0.1:9050", ""])
+def test_a_missing_tag_is_the_finding_where_there_are_no_credentials(monkeypatch, emulator):
+    monkeypatch.setenv("BIGQUERY_EMULATOR_HOST", emulator)
+    contract = _contract(policy=copy.deepcopy(GOVERNED["policy"]))
+    dims = _dims_without_a_session(contract, _table(tag=None))
+    assert dims["columnRestrictions"]["status"] == "fail"
+    assert "carries no policy tag" in dims["columnRestrictions"]["message"]
+    assert "DefaultCredentialsError" not in dims["columnRestrictions"]["message"]
+
+
+def test_on_the_emulator_a_tagged_column_s_readers_are_not_verifiable(monkeypatch):
+    monkeypatch.setenv("BIGQUERY_EMULATOR_HOST", "http://127.0.0.1:9050")
+    contract = _contract(policy=copy.deepcopy(GOVERNED["policy"]))
+    catalog = _Catalog([PLATFORM, PIPELINE])
+    dims = _dims(contract, _table(), _dataset(), catalog)
+    dimension = dims["columnRestrictions"]
+    assert dimension["status"] == "unsupported"
+    assert "every restricted column carries a policy tag" in dimension["message"]
+    assert "no emulator serves Data Catalog" in dimension["message"]
+    assert catalog.calls == []
+    assert bqgov.governance_errors(dims) == []
+    assert bqgov.governance_problems(dims) == []
+
+
+def test_off_the_emulator_a_tagged_column_without_credentials_is_still_an_error(monkeypatch):
+    monkeypatch.delenv("BIGQUERY_EMULATOR_HOST", raising=False)
+    contract = _contract(policy=copy.deepcopy(GOVERNED["policy"]))
+    dims = _dims_without_a_session(contract, _table())
+    assert dims["columnRestrictions"]["status"] == "error"
+    assert "DefaultCredentialsError" in dims["columnRestrictions"]["message"]
+
+
 # ── through verify_bigquery_table ────────────────────────────────────────
 
 
