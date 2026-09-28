@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-09-28
+
+One contract now deploys to AWS and to GCP through its `--env` overlays and is
+governed the same on both. Found by an offline verification of the demo's three
+products on 0.16.5: the two clouds shared one OpenTofu state, silver and gold
+could not build on GCP, and every GCP policy but the grants was dropped without
+a word. Measured with the real providers against moto and the goccy BigQuery
+emulator; the live GCP apply is the proof still to come.
+
 ### Upgrade notes
 
 - **The first `fluid schedule-sync` after upgrading must retire the old DAG
@@ -21,6 +30,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete those DAG files at the destination once. `--delete-scope destination`
   removes the old directory with the rest of what the sync does not ship.
   The report's `superseded_scopes` records which case applied.
+- **Remote state moves to a per-provider key on the first apply.**
+  `fluid/<id>/<provider>/terraform.tfstate` replaces `fluid/<id>/terraform.tfstate`.
+  The apply copies the old state with OpenTofu's own migration
+  (`tofu init -force-copy`) and leaves the source untouched. A shared key that
+  already holds another cloud's resources is refused
+  (`state_shared_with_another_provider`) instead of planned for destruction.
+- **A GCP dataset's grants stop being authoritative.** They are
+  `google_bigquery_dataset_iam_member` resources now. The first apply on a
+  dataset whose state holds the old `access` list revokes, once, the entries no
+  member covers, and prints them (see `docs/governance-parity.md`).
+
+### Added
+
+- **Governance parity on GCP** (#674). Each policy is one contract field,
+  enforced natively on both clouds and checked by `fluid verify`:
+  retention (`lifecycle.expire`) as daily partitions that expire, never a
+  table TTL; `binding.encryption.kms: product` as a key ring and a 90-day
+  rotating key per product and dataset, granted to the BigQuery service agent;
+  `policy.authz.columnRestrictions` as a Data Catalog taxonomy with fine-grained
+  access control and policy tags, and on AWS as each Lake Formation grant's
+  excluded columns. `docs/governance-parity.md` has the table.
+- **`binding.principals`** (#674). An overlay maps the contract's logical
+  principals to the identities they are on that cloud (one, a list, or `[]`).
+  With the block present an unmapped principal is refused; on GCP a placeholder
+  principal (a reserved domain, or not an IAM member at all) is refused either
+  way, since BigQuery refuses an access entry for an identity that does not exist.
+- **Embedded-SQL builds read and land BigQuery** (#673). A `consumes[]` entry
+  whose upstream is a gcp `bigquery_table` resolves to that table, and a build
+  whose expose is one loads its result through the acquisition runner's own
+  load (`WRITE_TRUNCATE`, `CREATE_NEVER`), failing on a short load. Naive
+  timestamps load as UTC `TIMESTAMP`, never `DATETIME`.
+- **`fluid verify` checks BigQuery data** (#673): `row_count` against the
+  build's run records and `masking` of the declared columns, as it already did
+  on Glue and Athena.
+- **`fluid apply` reports each run to the Command Center** (#676), best effort
+  and without the credential or any tofu output ever leaving as data.
+
+### Fixed
+
+- **One contract on aws and gcp no longer shares one state** (#676), so a gcp
+  apply can never plan the destruction of the aws product.
+- **Sovereignty fails closed on GCP** (#676). A binding with no region is
+  refused instead of landing in `US`, `fluid generate iac` checks the region,
+  `location.location` is checked like `location.region`, and the generated
+  stage 6 runs `fluid plan --check-sovereignty`.
+- **Stage 8 no longer crashes on a gcp build** (#676): `fluid policy-apply`
+  raised a `TypeError` from its own log call.
+- **The aws and gcp DAGs of one product no longer collide** (#676): the env is
+  in the dag id and the schedule scope.
+- **`--env gcp` with no gcp overlay is refused** (#676) when the workspace's
+  `expected-environments` lists gcp for the product, instead of quietly
+  running the base. A contract's own `environments` block only warns.
+- **A BigQuery load runs where its table is** (#676, #673), never at a guessed
+  `US`, and on the emulator it takes no real credential and checks the loaded
+  rows by count when the job reports none.
 
 ## [0.16.7] — 2026-09-28
 
@@ -3697,7 +3761,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.7...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.7...v0.17.0
 [0.16.7]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.6...v0.16.7
 [0.16.6]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.5...v0.16.6
 [0.16.5]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.4...v0.16.5
