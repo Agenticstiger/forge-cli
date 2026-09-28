@@ -34,6 +34,8 @@ from ._common import (
 from ._logging import info, warn
 
 if TYPE_CHECKING:
+    from fluid_build.iac.drift import StateDriftReport
+
     from ._diff_live import LiveDriftReport
 
 COMMAND = "diff"
@@ -58,7 +60,10 @@ def register(subparsers: argparse._SubParsersAction):
             "the contract against actual provider resources (default). With "
             "--state it compares against that prior apply report; without it, "
             "it reads each expose's live target (local file, Glue table, "
-            "BigQuery table) and compares its columns with the contract; "
+            "BigQuery table) and compares its columns with the contract, and, "
+            "for a cloud contract whose `fluid apply` state is reachable, "
+            "refreshes that state and reports what changed outside the apply "
+            "(drift) apart from what the next apply will change (pending); "
             "(2) version diff — when --baseline is set, compares the positional "
             "contract (new) against the baseline contract (old) for breaking-"
             "change classification. The two modes are mutually exclusive."
@@ -113,6 +118,37 @@ def register(subparsers: argparse._SubParsersAction):
         help=(
             "drift mode: do not read the live targets. Without --state there is "
             "then no baseline, and --exit-on-drift is downgraded to a warning"
+        ),
+    )
+    # The live check also refreshes the state ``fluid apply`` keeps for a
+    # cloud contract, when that state is reachable from here; these name it
+    # the way ``fluid apply`` does.
+    p.add_argument(
+        "--state-backend",
+        default=None,
+        help=(
+            "the remote state `fluid apply` used (s3://bucket/key, gcs://bucket/"
+            'prefix; default $FLUID_STATE_BACKEND, else local; "" forces local)'
+        ),
+    )
+    p.add_argument(
+        "--workspace-dir",
+        metavar="DIR",
+        default=None,
+        help="the directory `fluid apply` ran in, for its local state (default: .)",
+    )
+    p.add_argument(
+        "--no-state-drift",
+        dest="state_drift",
+        action="store_false",
+        help="drift mode: compare the live targets only, not the apply's state",
+    )
+    p.add_argument(
+        "--ensure-opentofu",
+        action="store_true",
+        help=(
+            "if the apply's state is reachable and `tofu` is missing, provision the "
+            "pinned, SHA-256-verified build `fluid apply --ensure-opentofu` uses"
         ),
     )
 
@@ -235,6 +271,7 @@ def run(args, logger: logging.Logger) -> int:
         actual_resources: Set[str] = set()
         has_baseline = False
         live_report = None
+        state_report = None
         if args.state and Path(args.state).exists():
             info(logger, "diff_loading_state", state_file=args.state)
             state = read_json(args.state)
@@ -246,6 +283,7 @@ def run(args, logger: logging.Logger) -> int:
             if args.state:
                 info(logger, "diff_state_not_found", state_file=args.state, fallback="live")
             live_report = _compare_live(contract, _load_last_applied(args, logger), args, logger)
+            state_report = _compare_state(contract, args, logger)
         else:
             # Bug 5b: ``info(logger, message, **payload)`` — the second
             # positional param is named ``message``. Passing
@@ -286,7 +324,7 @@ def run(args, logger: logging.Logger) -> int:
         # ``drift_source``.
         if live_report is not None:
             drift_source = "live"
-            has_drift = live_report.has_drift
+            has_drift = live_report.has_drift or bool(state_report and state_report.has_drift)
         else:
             drift_source = "state" if has_baseline else "none"
             has_drift = len(added) > 0 or len(removed) > 0
@@ -310,12 +348,14 @@ def run(args, logger: logging.Logger) -> int:
         }
         if live_report is not None:
             drift_report["live"] = live_report.to_dict()
+        if state_report is not None:
+            drift_report["state_drift"] = state_report.to_dict()
 
         # Write report
         write_json(args.out, drift_report)
 
         if live_report is not None:
-            return _finish_live(live_report, args, logger)
+            return _finish_live(live_report, args, logger, state_report)
 
         # Log summary
         if drift_report["summary"]["has_drift"]:
@@ -462,8 +502,57 @@ def _compare_live(
     return report
 
 
+def _compare_state(
+    contract: Dict[str, Any], args: argparse.Namespace, logger: logging.Logger
+) -> "StateDriftReport":
+    """Refresh the apply's OpenTofu state and classify it (see ``_diff_state``).
+
+    ``not_checked`` with the reason when there is no state to read, or when
+    ``--no-state-drift`` asked for the live comparison alone.
+    """
+    from fluid_build.iac.drift import NOT_CHECKED
+    from fluid_build.iac.drift import StateDriftReport as _Report
+
+    from ._diff_state import check_state_drift
+
+    if not getattr(args, "state_drift", True):
+        return _Report(status=NOT_CHECKED, detail="--no-state-drift")
+    with _traced_span("diff.state", attributes={"fluid.diff.mode": "state"}) as span:
+        report = check_state_drift(contract, args, logger)
+        span.set_attribute("fluid.diff.state.status", report.status)
+        for status, count in report.counts().items():
+            span.set_attribute(f"fluid.diff.state.{status}", count)
+    return report
+
+
+def _raise_if_state_failed(state: Optional["StateDriftReport"], args: argparse.Namespace) -> None:
+    """``--exit-on-drift`` over a state pass that could not compare: exit 2.
+
+    Checked after the live targets' own failures and before any drift, for
+    the reason ``_finish_live`` gives: a comparison that could not finish
+    might have found drift too.
+    """
+    if state is None or not state.has_errors:
+        return
+    raise CLIError(
+        EXIT_INSPECTION_FAILED,
+        "diff_state_inspection_failed",
+        {
+            "state": state.state,
+            "detail": (
+                "--exit-on-drift could not refresh the apply's state, so it "
+                "cannot say there is no drift; see the report's state_drift"
+            ),
+            "out": args.out,
+        },
+    )
+
+
 def _finish_live(
-    report: "LiveDriftReport", args: argparse.Namespace, logger: logging.Logger
+    report: "LiveDriftReport",
+    args: argparse.Namespace,
+    logger: logging.Logger,
+    state: Optional["StateDriftReport"] = None,
 ) -> int:
     """Print and log the live comparison, then decide the exit code.
 
@@ -477,10 +566,15 @@ def _finish_live(
     created"), one that differs only as its ``schemaPolicy`` allows
     (``evolved``), and one the contract changed since the last apply
     (``pending``) are not drift.
+
+    ``state`` is the pass over the apply's OpenTofu state. Its drift and its
+    failure count exactly as a live target's do; ``not_checked`` changes
+    nothing, so a contract with no reachable state gates as it always did.
     """
     from fluid_build.cli.console import cprint
 
     from . import _diff_live as live
+    from . import _diff_state
 
     # Expose ids and paths come from the contract, column names and inspector
     # errors from the target, so they are printed as plain text (never Rich
@@ -504,6 +598,10 @@ def _finish_live(
             _say(f"      - {col.human()}")
         if result.detail and result.status not in (live.MATCH, live.ABSENT):
             _say(f"      {result.detail}")
+    if state is not None:
+        _diff_state.render(state, _say)
+        _diff_state.log(state, logger, out=args.out)
+    state_clean = _diff_state.is_clean(state)
 
     for result in report.with_status(live.ABSENT):
         info(logger, "diff_live_target_absent", expose=result.expose_id, target=result.target)
@@ -552,7 +650,7 @@ def _finish_live(
             ),
             out=args.out,
         )
-    elif not errors:
+    elif not errors and state_clean:
         info(
             logger,
             "diff_no_drift",
@@ -576,9 +674,10 @@ def _finish_live(
                 "out": args.out,
             },
         )
-    if drifted:
+    _raise_if_state_failed(state, args)
+    if drifted or not state_clean:
         return EXIT_DRIFT
-    if report.compared == 0:
+    if report.compared == 0 and not (state and state.checked):
         warn(
             logger,
             "diff_exit_on_drift_skipped",
