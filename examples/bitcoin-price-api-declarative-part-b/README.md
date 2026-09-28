@@ -251,7 +251,6 @@ bq show --format=prettyjson <<YOUR_PROJECT_HERE>>:crypto_data.bitcoin_prices | j
 
 **What does NOT get created automatically (requires additional configuration)**:
 - IAM policies (requires `policy-compile` + manual Terraform apply)
-- Column-level access control (requires BigQuery Policy Tags - paid tier)
 - Row-level security (requires BigQuery authorized views - paid tier)
 - Data masking (requires BigQuery DLP - paid tier)
 
@@ -450,8 +449,29 @@ policy:
 - Supports compliance requirements (e.g., GDPR Article 25 - data minimization)
 
 **Implementation:**
-- Free tier: Document only (not enforced)
-- Paid tier: Use BigQuery Policy Tags + Data Catalog
+- `fluid apply` writes a Data Catalog taxonomy and a policy tag on the two
+  columns, and grants the tag's fine-grained reader role to the expose's
+  readers, never to the interns (needs the Data Catalog API; see
+  [governance parity](../../docs/governance-parity.md)).
+
+**Mapping the principals:** the readers and the interns group are logical
+names. The binding maps each to the identity it is on GCP, and once
+`binding.principals` is present every principal the expose names must be
+mapped (fluid-schema 0.7.6):
+
+```yaml
+binding:
+  platform: gcp
+  principals:
+    group:data-analytics@company.com: group:data-analytics@example.com
+    "serviceAccount:looker@<<YOUR_PROJECT_HERE>>.iam.gserviceaccount.com": serviceAccount:looker@example.com
+    group:interns@company.com: group:interns@example.com
+    # ...one entry per reader
+```
+
+The `example.com` identities are placeholders to replace with your own. An
+unmapped `<<YOUR_PROJECT_HERE>>` principal is refused at `fluid validate`,
+since BigQuery would refuse it at apply.
 
 ### 5. Privacy Controls (Row-Level Security)
 

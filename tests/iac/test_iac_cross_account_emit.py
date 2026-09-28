@@ -238,10 +238,14 @@ class TestAwsCrossAccountEmit:
 
 class TestGcpCrossProjectEmit:
     """Cross-project SA access uses the existing ``metadata.policies``
-    surface — no new schema fields. The plugin's ``_bq_access_entries``
-    helper maps each policy entry to a ``user_by_email`` row on the
-    dataset's ``access[]`` block, and BQ accepts cross-project SA
-    emails via the ``user_by_email`` field."""
+    surface — no new schema fields. Each policy entry becomes a
+    non-authoritative ``google_bigquery_dataset_iam_member`` (it was a row of
+    the dataset's authoritative ``access[]`` block), and BigQuery accepts a
+    service account of another project as a dataset member."""
+
+    @staticmethod
+    def _members(res):
+        return {m["member"] for m in (res.get("google_bigquery_dataset_iam_member") or {}).values()}
 
     def test_cross_project_sa_lands_in_dataset_access(self):
         contract = _gcp_contract(
@@ -255,12 +259,10 @@ class TestGcpCrossProjectEmit:
             }
         )
         res = get_iac_plugin("gcp").emit(contract, [])
-        ds = next(iter(res["google_bigquery_dataset"].values()))
-        access = ds.get("access") or []
-        emails = {e.get("user_by_email") for e in access if "user_by_email" in e}
+        members = self._members(res)
         assert (
-            "consumer@other-project.iam.gserviceaccount.com" in emails
-        ), f"cross-project SA not in dataset.access[] — got {access}"
+            "serviceAccount:consumer@other-project.iam.gserviceaccount.com" in members
+        ), f"cross-project SA is not a dataset member — got {members}"
 
     def test_multiple_principals_emit_multiple_access_entries(self):
         contract = _gcp_contract(
@@ -275,19 +277,18 @@ class TestGcpCrossProjectEmit:
             }
         )
         res = get_iac_plugin("gcp").emit(contract, [])
-        ds = next(iter(res["google_bigquery_dataset"].values()))
-        emails = {e.get("user_by_email") for e in ds.get("access", []) if "user_by_email" in e}
-        assert emails == {
-            "consumer-a@p1.iam.gserviceaccount.com",
-            "consumer-b@p2.iam.gserviceaccount.com",
+        assert self._members(res) == {
+            "serviceAccount:consumer-a@p1.iam.gserviceaccount.com",
+            "serviceAccount:consumer-b@p2.iam.gserviceaccount.com",
         }
 
     def test_no_policies_no_access_block(self):
         contract = _gcp_contract({})
         res = get_iac_plugin("gcp").emit(contract, [])
         ds = next(iter(res["google_bigquery_dataset"].values()))
-        # No access[] when no policies — existing behaviour preserved.
+        # No access[] and no members when no policies — existing behaviour preserved.
         assert "access" not in ds
+        assert not self._members(res)
 
     # Note: ``metadata.policies`` is read by the existing GCP plugin
     # (``_bq_access_entries`` → dataset.access[] block) but is NOT in

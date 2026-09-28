@@ -39,6 +39,18 @@ as written. ``safe_ident`` would not do there: it folds ``.`` and ``-`` into
 ``_``, so ``a.b``, ``a-b`` and ``a_b``, all valid ids, would share one state
 again. An id outside the FLUID identifier grammar cannot key a state and is
 refused. The variable is new, so no state lives at a key it chose before.
+
+**The provider is part of the default key.** One contract deployed to two
+clouds through overlays (``--env aws`` and ``--env gcp``) is one id, so a key
+made of the id alone put the aws and the gcp apply in one state: each plan
+then read the other cloud's resources as orphans to destroy, and
+``--allow-data-loss`` would have destroyed them. Every per-contract default is
+now ``fluid/<id>/<provider>/terraform.tfstate`` (the GCS prefix
+``fluid/<id>/<provider>``) when the caller names the provider, as ``fluid
+apply`` always does. The shared legacy key ``fluid/terraform.tfstate`` is
+unchanged, and so is an explicit key in the spec. State the previous default
+wrote is moved by :mod:`fluid_build.iac.state_migration`, with OpenTofu's own
+``init -migrate-state``; :func:`legacy_default_backend` names where it was.
 """
 
 from __future__ import annotations
@@ -67,6 +79,11 @@ _BUCKET_RE = re.compile(r"[A-Za-z0-9._-]+")
 #: Control characters: refused in a key or prefix, which ``fluid apply``
 #: prints on its state line (a newline there would forge a line of output).
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+#: What a provider name in a state key may hold: the IaC plugin names
+#: (``aws``, ``gcp``, ``snowflake``, ``confluent``) and nothing that could add
+#: a path segment or a control character to the key.
+_PROVIDER_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 #: Environment variable ``fluid apply`` reads for the state backend when
 #: ``--state-backend`` is not on the command line. A CI job sets it once so
@@ -101,12 +118,23 @@ def resolve_state_backend_spec(
     return (None, "default")
 
 
-def default_state_key(contract: Optional[Mapping[str, Any]], *, per_contract: bool = False) -> str:
+def default_state_key(
+    contract: Optional[Mapping[str, Any]],
+    *,
+    per_contract: bool = False,
+    provider: Optional[str] = None,
+) -> str:
     """The default state key for ``contract`` — legacy unless packaging is declared.
 
     Returns :data:`LEGACY_STATE_KEY` when ``contract`` is ``None`` or resolves
     to the ``packaging.LEGACY`` sentinel, and the per-contract
     ``fluid/<safe_ident(id)>/terraform.tfstate`` otherwise.
+
+    ``provider`` (``fluid apply`` passes the one it resolved) adds a segment to
+    every per-contract key, ``fluid/<id>/<provider>/terraform.tfstate``, so the
+    same contract applied to two clouds keeps two states (see the module
+    docstring). The legacy shared key never takes it. A provider name outside
+    ``[a-z][a-z0-9_-]*`` is a ``ValueError``.
 
     ``per_contract=True`` (the spec came from :data:`STATE_BACKEND_ENV`; see
     the module docstring) skips the packaging test and keys every contract by
@@ -123,8 +151,9 @@ def default_state_key(contract: Optional[Mapping[str, Any]], *, per_contract: bo
     """
     if contract is None:
         return LEGACY_STATE_KEY
+    segment = "" if provider is None else f"{_state_provider(provider)}/"
     if per_contract:
-        return f"fluid/{_state_id(contract)}/terraform.tfstate"
+        return f"fluid/{_state_id(contract)}/{segment}terraform.tfstate"
     try:
         resolution = resolve_packaging(contract)
     except PackagingError:
@@ -132,7 +161,17 @@ def default_state_key(contract: Optional[Mapping[str, Any]], *, per_contract: bo
     if resolution is LEGACY:
         return LEGACY_STATE_KEY
     cid = safe_ident(contract.get("id") or contract.get("name") or "contract")
-    return f"fluid/{cid}/terraform.tfstate"
+    return f"fluid/{cid}/{segment}terraform.tfstate"
+
+
+def _state_provider(provider: str) -> str:
+    """``provider``, once it is proven to be one safe key segment."""
+    if isinstance(provider, str) and _PROVIDER_RE.fullmatch(provider):
+        return provider
+    raise ValueError(
+        f"provider {provider!r} cannot name a state key segment "
+        "([a-z][a-z0-9_-]*, at most 32 characters)"
+    )
 
 
 def _state_id(contract: Mapping[str, Any]) -> str:
@@ -153,6 +192,7 @@ def parse_backend(
     contract: Optional[Mapping[str, Any]] = None,
     *,
     per_contract_default: bool = False,
+    provider: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Parse a backend spec into a ``terraform.backend`` block.
 
@@ -167,6 +207,8 @@ def parse_backend(
     contracts, the shared legacy key otherwise. ``per_contract_default``
     gives every contract its own default, keyed by its id as written
     (``fluid apply`` sets it for a spec from :data:`STATE_BACKEND_ENV`).
+    ``provider`` puts the provider into every per-contract default (see
+    :func:`default_state_key`); an explicit key or prefix is never changed.
 
     The backend block carries no credentials — ``tofu`` reads those from
     the environment (``AWS_*`` / ``GOOGLE_*``). A bucket name holding
@@ -184,7 +226,7 @@ def parse_backend(
         _check_bucket(bucket, "s3")
         _check_path(key, "s3", "key")
         if not key:
-            key = default_state_key(contract, per_contract=per_contract_default)
+            key = default_state_key(contract, per_contract=per_contract_default, provider=provider)
         return {"s3": {"bucket": bucket, "key": key}}
 
     if spec.startswith("gcs://"):
@@ -199,7 +241,9 @@ def parse_backend(
             # derive it from the same per-contract default (sans filename) so
             # both backends isolate identically. Legacy contracts emit no
             # prefix at all, exactly as before.
-            default = default_state_key(contract, per_contract=per_contract_default)
+            default = default_state_key(
+                contract, per_contract=per_contract_default, provider=provider
+            )
             prefix = default.rsplit("/", 1)[0] if default != LEGACY_STATE_KEY else ""
         if prefix:
             block["gcs"]["prefix"] = prefix
@@ -210,6 +254,31 @@ def parse_backend(
     scheme, sep, _ = spec.partition("://")
     named = f"scheme {scheme!r}" if sep and scheme.isalnum() else "spec"
     raise ValueError(f"unsupported state backend {named} — use s3:// or gcs://")
+
+
+def legacy_default_backend(
+    spec: Optional[str],
+    contract: Optional[Mapping[str, Any]],
+    *,
+    per_contract_default: bool,
+    provider: str,
+) -> Optional[Dict[str, Any]]:
+    """Where the default state was before the provider joined the key, or None.
+
+    The block :func:`parse_backend` returned for the same spec and contract
+    without ``provider``: ``fluid/<id>/terraform.tfstate`` (GCS prefix
+    ``fluid/<id>``). ``None`` when there is nothing to migrate from: local
+    state, an explicit key or prefix (never changed, so never moved), or a
+    default that did not change (the shared legacy key). Raises
+    ``ValueError`` exactly where :func:`parse_backend` does.
+    """
+    legacy = parse_backend(spec, contract, per_contract_default=per_contract_default)
+    current = parse_backend(
+        spec, contract, per_contract_default=per_contract_default, provider=provider
+    )
+    if legacy is None or current is None or legacy == current:
+        return None
+    return legacy
 
 
 def _check_bucket(bucket: str, scheme: str) -> None:

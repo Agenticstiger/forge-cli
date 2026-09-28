@@ -46,6 +46,8 @@ from typing import Any, Callable, Dict, List, Optional
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
+from ._apply_cc_report import reports_apply_run
+
 # Rich imports for enhanced output
 try:
     from rich.console import Console
@@ -1553,6 +1555,7 @@ def _run_orchestrated_apply(
 
 
 @_traced_stage("apply")
+@reports_apply_run
 def run(args, logger: logging.Logger) -> int:
     """
     Main execution function for the apply command

@@ -383,12 +383,78 @@ def _bq_canonical_type(bq_type: Any) -> str:
     return _BQ_TYPE_SYNONYMS.get(name, name)
 
 
+def _bigquery_binding_location(
+    expose_config: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """``(binding, location)`` of a BigQuery expose, named as the build's load names it.
+
+    ``{{ env.* }}`` is resolved as ``fluid apply`` resolves it
+    (``_verify_athena._resolved_binding``), and a location with no project
+    takes the environment's (``_bigquery_load.bigquery_load_target``), so
+    verify reads the table the build loaded rather than a literal template.
+    """
+    from fluid_build.build_runners._bigquery_load import bigquery_load_target
+    from fluid_build.cli._verify_athena import _resolved_binding
+
+    binding = _resolved_binding(expose_config.get("binding", {}))
+    location = dict(binding.get("location", {}) or {})
+    load_target = bigquery_load_target(binding, expose_config)
+    if load_target is not None and not location.get("project"):
+        location["project"] = load_target.get("project") or ""
+    return binding, location
+
+
+def _render_table_rows(metadata: Dict[str, Any]) -> None:
+    """The row count line; ``num_rows`` is None when the table reports none
+    (the goccy emulator, a table whose metadata has no count) and nothing
+    counted it."""
+    num_rows = metadata.get("num_rows")
+    if isinstance(num_rows, int):
+        cprint(f"   📊 Table Rows: {num_rows:,}")
+    else:
+        cprint("   📊 Table Rows: unknown (the table reports no row count)")
+    if metadata.get("row_count_detail"):
+        cprint(f"      {metadata['row_count_detail']}", markup=False)
+
+
+def _bigquery_verify_client(bigquery: Any, project: str) -> Tuple[Any, str]:
+    """``(client, project)``: the binding's project, else the client's own.
+
+    A binding with no project (and no ``GOOGLE_PROJECT`` & co.) is loaded into
+    the client's own project, ADC's: ``_bigquery_load.load_file`` names the
+    table from ``client.project``. ``Client(project="")`` keeps the empty
+    string rather than resolving one, so ``None`` is passed and the project
+    read back.
+    """
+    from fluid_build.build_runners._bigquery_load import bigquery_client
+
+    client = bigquery_client(bigquery, project or None)
+    return client, project or str(getattr(client, "project", "") or "")
+
+
+def _no_bigquery_project(dataset: str, table: str) -> Dict[str, Any]:
+    return {
+        "status": "error",
+        "error": (
+            f"No project for {dataset}.{table}: the binding names none, and neither "
+            "GOOGLE_PROJECT / GOOGLE_CLOUD_PROJECT nor the credentials supply one"
+        ),
+        "exists": False,
+    }
+
+
 def verify_bigquery_table(
     project: str,
     dataset: str,
     table: str,
     expected_schema: List[Dict[str, Any]],
     expected_region: Optional[str] = None,
+    *,
+    expose: Optional[Dict[str, Any]] = None,
+    contract: Optional[Dict[str, Any]] = None,
+    workdir: Optional[Path] = None,
+    reference_only: bool = False,
+    catalog_session_factory: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Verify BigQuery table with multi-dimensional analysis.
@@ -398,11 +464,23 @@ def verify_bigquery_table(
       2. Data Types (field types)
       3. Constraints (nullable/required modes)
       4. Location (region/location)
+      5. Retention, encryption and column restrictions, when ``expose`` declares
+         them (``_verify_bigquery_governance.py``)
+
+    With ``expose`` (what ``fluid verify`` passes), two more from one count
+    query (``_verify_bigquery``): ``row_count`` held to the build's run
+    records, and ``masking`` for each ``policy.privacy.masking`` rule.
+
+    The client is ``_bigquery_load.bigquery_client``'s: ADC, or anonymous
+    against ``BIGQUERY_EMULATOR_HOST``.
     """
     try:
-        from google.cloud import bigquery
+        from fluid_build.build_runners._bigquery_load import _bigquery_module
 
-        client = bigquery.Client(project=project)
+        bigquery = _bigquery_module()
+        client, project = _bigquery_verify_client(bigquery, project)
+        if not project:
+            return _no_bigquery_project(dataset, table)
         table_id = f"{project}.{dataset}.{table}"
 
         # Check if table exists
@@ -509,7 +587,25 @@ def verify_bigquery_table(
             missing_fields or extra_fields or type_mismatches or mode_mismatches or not region_match
         )
 
-        return {
+        # Retention, encryption and column access, when the expose declares them.
+        governance: Dict[str, Dict[str, Any]] = {}
+        # #674 runs these only for an expose with a binding; the row count and
+        # masking dimensions below (#673) run for every expose.
+        if expose is not None and expose.get("binding"):
+            from fluid_build.cli import _verify_bigquery_governance as _bq_gov
+
+            governance = _bq_gov.governance_dimensions(
+                expose,
+                contract=contract or {},
+                bq_dataset=bq_dataset,
+                bq_table=bq_table,
+                project=project,
+                session_factory=catalog_session_factory,
+            )
+            severity = _bq_gov.with_governance_severity(severity, governance)
+            has_issues = has_issues or any(d["status"] == "fail" for d in governance.values())
+
+        result: Dict[str, Any] = {
             "status": "mismatch" if has_issues else "match",
             "exists": True,
             "table_id": table_id,
@@ -544,6 +640,28 @@ def verify_bigquery_table(
                 "modified": bq_table.modified.isoformat() if bq_table.modified else None,
             },
         }
+        if expose is not None:
+            from fluid_build.cli._verify_bigquery import add_data_dimensions
+
+            add_data_dimensions(
+                result,
+                client=client,
+                bigquery=bigquery,
+                bq_table=bq_table,
+                expose=expose,
+                contract=contract or {},
+                workdir=workdir or Path.cwd(),
+                reference_only=reference_only,
+                location=bq_dataset.location,
+            )
+        if governance:
+            result["dimensions"].update(governance)
+            unchecked = _bq_gov.governance_errors(governance)
+            if unchecked:
+                # A declared policy that could not be checked is unproven, not passed.
+                result["status"] = "error"
+                result["error"] = "; ".join([e for e in (result.get("error"), *unchecked) if e])
+        return result
 
     except Exception as e:
         LOG.error(f"Error verifying table {table}: {e}")
@@ -1314,8 +1432,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             # Get properties from either 'properties' or 'binding.location'
             properties = expose_config.get("properties", {})
             if not properties:
-                binding = expose_config.get("binding", {})
-                location = binding.get("location", {})
+                binding, location = _bigquery_binding_location(expose_config)
                 # Build target from binding
                 project = location.get("project", "")
                 dataset = location.get("dataset", "")
@@ -1370,6 +1487,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 table=table,
                 expected_schema=fields,
                 expected_region=region,
+                expose=expose_config,
+                contract=contract,
+                workdir=anchor_dir,
+                reference_only=reference_only,
             )
 
             results[expose_name] = result
@@ -1613,9 +1734,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         severity_impact = severity.get("impact", "UNKNOWN")
 
         cprint(f"\n   {severity_symbol} Severity: {severity_level} (Impact: {severity_impact})")
-        cprint(f"   📊 Table Rows: {metadata.get('num_rows', 0):,}")
-        if metadata.get("row_count_detail"):
-            cprint(f"      {metadata['row_count_detail']}", markup=False)
+        _render_table_rows(metadata)
 
         # Dimension 1: Schema Structure
         cprint("\n   🔍 Dimension 1: Schema Structure")
@@ -1669,7 +1788,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             cprint(f"      ❌ FAIL - {location.get('message', 'Location mismatch')}")
 
         # Dimension 5: Masking, when the expose declares policy.privacy.masking
-        # and the verifier checked it (the Glue + Athena one does).
+        # and the verifier checked it (the Glue + Athena and BigQuery ones do).
         if dimensions.get("masking") is not None:
             _render_masking_dimension(dimensions["masking"], "pass", "\n   🔍 Dimension 5: Masking")
 

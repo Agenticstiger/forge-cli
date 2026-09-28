@@ -155,9 +155,11 @@ class TestGateAgreesWithTheEmitters:
     # `location: us-east-1` — an AWS region, which is not a valid GCS
     # location. They are why the gate cannot be a zero-resource check alone,
     # and why it belongs on the provider/binding pair rather than the output.
+    # (``aws-glue-data-lake/contract-iceberg.fluid.yaml`` left the set when the GCP
+    # emitter began refusing an unmapped principal that is not an IAM member: its
+    # ``role:data-analyst`` would have become ``group:role:data-analyst``.)
     _WRONG_CLOUD_EMITS = {
         ("aws-glue-data-lake/contract-etl-job.fluid.yaml", "gcp"),
-        ("aws-glue-data-lake/contract-iceberg.fluid.yaml", "gcp"),
         ("aws-iceberg-lakehouse/contract.fluid.yaml", "gcp"),
     }
 

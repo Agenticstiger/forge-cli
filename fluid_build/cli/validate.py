@@ -809,6 +809,23 @@ def _run_contract_rules(
             if args.verbose:
                 info(logger, f"GCP binding check skipped: {exc}")
 
+        # --- Governance a cloud binding cannot apply (refused at apply) ----
+        # Unmapped or placeholder principals, column restrictions nothing
+        # enforces, a key reference for the wrong cloud: the same derivations
+        # `fluid apply` refuses them with, reported here at stage 2.
+        try:
+            from fluid_build.iac.governance_validation import validate_governance
+
+            gov_errors, gov_warnings = validate_governance(contract)
+            for msg in gov_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in gov_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Governance binding check skipped: {exc}")
+
         # --- pgvector vector output-port binding checks ---------------------
         # A pgvector-bound expose (binding.platform: pgvector) needs a vector
         # dimension and non-colliding embeddings-table names — surface a clean

@@ -251,6 +251,11 @@ gcp = [
   "google-auth>=2.29",
   "google-auth-oauthlib>=1.2",
   "google-cloud-bigquery>=3.20",
+  # An embedded-SQL build on DuckDB reads an upstream BigQuery table through
+  # python-bigquery's Arrow pages (``RowIterator.to_arrow_iterable``) into
+  # Parquet (build_runners/_bigquery_read.py). python-bigquery itself only pulls
+  # pyarrow in through its ``pandas`` / ``bqstorage`` extras, so it is named here.
+  "pyarrow>=14",
   "google-cloud-storage>=2.16",
   # V1.5 — Dataplex metadata source catalog. Optional within the
   # gcp extra so users wanting BigQuery alone don't pay for the
@@ -403,6 +408,11 @@ dev = [
   # ``cli/__init__.py`` at import time) and that the tier-0
   # ``fluid_build._net`` leaf module stays free of fluid_build upstreams.
   "import-linter>=2.0",
+  # The BigQuery read/load tests for embedded-SQL builds (tests/build_runners/
+  # test_embedded_sql_bigquery.py) stream Arrow batches through a fake client;
+  # the unit lanes install ``.[dev,local]``, which has no pyarrow, so without
+  # it those tests would skip in CI instead of running.
+  "pyarrow>=14",
 ]
 
 # Light (in-process) integration-test emulators — Stage 1. moto mocks the

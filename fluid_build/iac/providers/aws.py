@@ -55,6 +55,7 @@ import yaml
 
 from ...providers._sql_safety import quote_string_literal, validate_ident
 from ...providers.aws.util import warehouse as _warehouse
+from .. import column_access
 from ..base import UnsupportedBindingError
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
@@ -370,13 +371,17 @@ class AwsIacPlugin:
         # resource_lf_tags association references them.
         _emit_lf_account_settings(resources, contract, cid, base_tags)
 
-        for exposure in contract.get("exposes") or []:
+        for index, exposure in enumerate(contract.get("exposes") or []):
             binding = exposure.get("binding") or {}
             if not is_cloud(binding, "aws"):
                 continue
             loc = binding.get("location") or {}
             fmt = binding.get("format") or "parquet"
             schema = (exposure.get("contract") or {}).get("schema") or []
+            # The contract's column restrictions, as each Lake Formation grant's
+            # excluded columns (``iac/column_access.py``); refused when nothing
+            # on this binding could enforce them.
+            exclusions = lf_column_exclusions(exposure, binding, index)
             placement = _placement(packaging, exposure)
             tags = _tags_for(base_tags, placement)
             _emit_glue(
@@ -386,12 +391,21 @@ class AwsIacPlugin:
             _emit_kinesis(resources, loc, cid, tags)
             _emit_redshift_serverless(resources, loc, cid, tags)
             _emit_redshift_external_schema(resources, loc, cid, tags)
-            _check_lf_grant_columns(binding, loc, fmt, schema)
+            _check_lf_grant_columns(binding, loc, fmt, schema, exclusions or {})
             # Per-exposure Lake Formation: location registration,
             # principal grants, LF-tag associations, row/column filters.
             # Only fires when the binding carries a governance.lakeFormation
             # block — every existing AWS contract is unaffected.
-            _emit_lakeformation(resources, binding, loc, fmt, cid, tags, placement=placement)
+            _emit_lakeformation(
+                resources,
+                binding,
+                loc,
+                fmt,
+                cid,
+                tags,
+                placement=placement,
+                exclusions=exclusions or {},
+            )
         # Retention (exposes[].lifecycle) and encryption at rest
         # (binding.encryption), per bucket this product owns. Nothing is
         # added for a contract that declares neither.
@@ -1991,6 +2005,73 @@ def _emit_lf_bucket_policy_data(
         }
 
 
+def lf_column_exclusions(
+    exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int = 0
+) -> Optional[Dict[int, Tuple[str, ...]]]:
+    """``column_access.lf_exclusions``, refused where no Lake Formation grant can carry it.
+
+    The exclusions reach a grant only as ``table_with_columns`` on a Glue-catalog
+    table, so a restriction on another format, or on a binding that names no
+    database and table, would be dropped by :func:`_emit_lakeformation`.
+    """
+    exclusions = column_access.lf_exclusions(exposure, binding, index)
+    loc = binding.get("location") or {}
+    fmt = str(binding.get("format") or "parquet")
+    if exclusions is not None and (
+        fmt.lower() not in _GLUE_CATALOG_FORMATS or not loc.get("database") or not loc.get("table")
+    ):
+        raise UnsupportedBindingError(
+            "column-restriction-unenforceable",
+            f"exposes[{exposure.get('exposeId') or index}] restricts columns, but its {fmt} "
+            "binding names no Glue table; the AWS emitter enforces column restrictions "
+            "through Lake Formation grants on a Glue-catalog table (location.database and "
+            "location.table), and without one they would not reach the grants.",
+            ("Restrict the columns of the Glue table expose instead.",),
+        )
+    if exclusions:
+        _refuse_grants_left_no_column(exposure, binding, exclusions, index)
+    return exclusions
+
+
+def _refuse_grants_left_no_column(
+    exposure: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    exclusions: Mapping[int, Tuple[str, ...]],
+    index: int,
+) -> None:
+    """Refuse a read grant whose principal the column restrictions leave no column.
+
+    The grant's excluded columns would be every column of the table, and
+    :func:`_emit_lakeformation` would write a column wildcard that excludes all
+    of them: the same grant :func:`_check_lf_grant_columns` refuses when it is
+    written by hand as ``excludedColumns``. Run here, where ``fluid validate``
+    and the emitter both derive the exclusions, so stage 2 refuses it too.
+    """
+    declared = {
+        str(col.get("name"))
+        for col in ((exposure.get("contract") or {}).get("schema") or [])
+        if isinstance(col, Mapping) and col.get("name")
+    }
+    if not declared:
+        return
+    grants = ((binding.get("governance") or {}).get("lakeFormation") or {}).get("grants") or []
+    for idx, excluded in sorted(exclusions.items()):
+        if not declared <= set(excluded):
+            continue
+        principal = grants[idx].get("principal") if idx < len(grants) else None
+        raise UnsupportedBindingError(
+            "lakeformation-grant-columns",
+            f"exposes[{exposure.get('exposeId') or index}] "
+            f"governance.lakeFormation.grants[{idx}] gives {principal} read access, but "
+            "the contract's column restrictions let it read no column of the table, so "
+            "the grant would give it nothing to read.",
+            (
+                "Remove the grant if the principal should read nothing.",
+                "Allow it at least one column in policy.authz.columnRestrictions.",
+            ),
+        )
+
+
 def _emit_lakeformation(
     resources: Dict[str, Any],
     binding: Mapping[str, Any],
@@ -2000,9 +2081,15 @@ def _emit_lakeformation(
     tags: Dict[str, str],
     *,
     placement: _Placement = _LEGACY_PLACEMENT,
+    exclusions: Optional[Mapping[int, Tuple[str, ...]]] = None,
 ) -> None:
     """Emit per-exposure LF resources. No-op when the binding has no
     ``governance.lakeFormation`` block.
+
+    ``exclusions`` is ``column_access.lf_exclusions``: for each grant index, the
+    columns the contract's ``policy.authz.columnRestrictions`` do not let that
+    grant's principal read. They become the grant's ``excluded_column_names``;
+    a hand-written ``excludedColumns`` was checked to agree with them.
 
     Under a REFERENCED bucket the grants narrow to the binding's
     ``location.path`` prefix rather than the bucket root (RFC §Security —
@@ -2058,7 +2145,7 @@ def _emit_lakeformation(
         if gp:
             body["permissions_with_grant_option"] = list(gp)
         cols = grant.get("columns")
-        excluded = grant.get("excludedColumns")
+        excluded = (exclusions or {}).get(idx) or grant.get("excludedColumns")
         if (cols or excluded) and table_key:
             if cols and excluded:
                 # One block cannot hold both: Lake Formation takes either a column
@@ -2204,6 +2291,7 @@ def _check_lf_grant_columns(
     loc: Mapping[str, Any],
     fmt: str,
     schema: List[Mapping[str, Any]],
+    exclusions: Optional[Mapping[int, Tuple[str, ...]]] = None,
 ) -> None:
     """Refuse a Lake Formation grant whose ``columns`` / ``excludedColumns`` name a
     column the table does not have, or exclude every column it has, or that sits
@@ -2215,6 +2303,8 @@ def _check_lf_grant_columns(
     plan`` passes any name. A misspelt exclusion is the dangerous one: the grant
     becomes a column wildcard that still includes the column it meant to hide.
     Only a binding whose grants are emitted against a Glue table is checked.
+    ``exclusions`` are the ones the column restrictions derive
+    (:func:`lf_column_exclusions`): what the emitter writes, so what is checked.
     """
     gov = (binding.get("governance") or {}).get("lakeFormation") or {}
     if not gov or str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS:
@@ -2225,7 +2315,7 @@ def _check_lf_grant_columns(
     limited: List[int] = []
     for idx, grant in enumerate(gov.get("grants") or []):
         cols = list(grant.get("columns") or [])
-        excluded = list(grant.get("excludedColumns") or [])
+        excluded = list((exclusions or {}).get(idx) or grant.get("excludedColumns") or [])
         unknown = [c for c in cols + excluded if c not in declared]
         if unknown:
             raise UnsupportedBindingError(
