@@ -248,11 +248,18 @@ class TestGcpIam:
                 ]
             )
         )
-        access = next(iter(res["google_bigquery_dataset"].values()))["access"]
-        assert {e["role"] for e in access} == {"READER", "WRITER"}
-        # '@' -> user_by_email; bare name -> group_by_email
-        assert {"role": "READER", "user_by_email": "alice@example.com"} in access
-        assert {"role": "READER", "group_by_email": "data-team"} in access
+        # Non-authoritative members, not the dataset's authoritative ``access``
+        # list, which replaced every entry the dataset had.
+        assert "access" not in next(iter(res["google_bigquery_dataset"].values()))
+        members = res["google_bigquery_dataset_iam_member"].values()
+        assert {m["role"] for m in members} == {
+            "roles/bigquery.dataViewer",
+            "roles/bigquery.dataEditor",
+        }
+        pairs = {(m["role"], m["member"]) for m in members}
+        # '@' -> user; bare name -> group, as the legacy surface always inferred.
+        assert ("roles/bigquery.dataViewer", "user:alice@example.com") in pairs
+        assert ("roles/bigquery.dataViewer", "group:data-team") in pairs
 
     def test_gcs_bucket_gets_iam_members(self):
         res = _gcp().emit(
@@ -290,6 +297,7 @@ class TestGcpIam:
             )
         )
         assert "access" not in next(iter(res["google_bigquery_dataset"].values()))
+        assert "google_bigquery_dataset_iam_member" not in res
         assert "google_storage_bucket_iam_member" not in res
 
 

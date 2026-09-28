@@ -55,6 +55,7 @@ import yaml
 
 from ...providers._sql_safety import quote_string_literal, validate_ident
 from ...providers.aws.util import warehouse as _warehouse
+from .. import column_access
 from ..base import UnsupportedBindingError
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
@@ -370,13 +371,17 @@ class AwsIacPlugin:
         # resource_lf_tags association references them.
         _emit_lf_account_settings(resources, contract, cid, base_tags)
 
-        for exposure in contract.get("exposes") or []:
+        for index, exposure in enumerate(contract.get("exposes") or []):
             binding = exposure.get("binding") or {}
             if not is_cloud(binding, "aws"):
                 continue
             loc = binding.get("location") or {}
             fmt = binding.get("format") or "parquet"
             schema = (exposure.get("contract") or {}).get("schema") or []
+            # The contract's column restrictions, as each Lake Formation grant's
+            # excluded columns (``iac/column_access.py``); refused when nothing
+            # on this binding could enforce them.
+            exclusions = lf_column_exclusions(exposure, binding, index)
             placement = _placement(packaging, exposure)
             tags = _tags_for(base_tags, placement)
             _emit_glue(
@@ -390,7 +395,16 @@ class AwsIacPlugin:
             # principal grants, LF-tag associations, row/column filters.
             # Only fires when the binding carries a governance.lakeFormation
             # block — every existing AWS contract is unaffected.
-            _emit_lakeformation(resources, binding, loc, fmt, cid, tags, placement=placement)
+            _emit_lakeformation(
+                resources,
+                binding,
+                loc,
+                fmt,
+                cid,
+                tags,
+                placement=placement,
+                exclusions=exclusions or {},
+            )
         # Retention (exposes[].lifecycle) and encryption at rest
         # (binding.encryption), per bucket this product owns. Nothing is
         # added for a contract that declares neither.
@@ -1856,6 +1870,32 @@ def _emit_lf_bucket_policy_data(
         }
 
 
+def lf_column_exclusions(
+    exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int = 0
+) -> Optional[Dict[int, Tuple[str, ...]]]:
+    """``column_access.lf_exclusions``, refused where no Lake Formation grant can carry it.
+
+    The exclusions reach a grant only as ``table_with_columns`` on a Glue-catalog
+    table, so a restriction on another format, or on a binding that names no
+    database and table, would be dropped by :func:`_emit_lakeformation`.
+    """
+    exclusions = column_access.lf_exclusions(exposure, binding, index)
+    loc = binding.get("location") or {}
+    fmt = str(binding.get("format") or "parquet")
+    if exclusions is not None and (
+        fmt.lower() not in _GLUE_CATALOG_FORMATS or not loc.get("database") or not loc.get("table")
+    ):
+        raise UnsupportedBindingError(
+            "column-restriction-unenforceable",
+            f"exposes[{exposure.get('exposeId') or index}] restricts columns, but its {fmt} "
+            "binding names no Glue table; the AWS emitter enforces column restrictions "
+            "through Lake Formation grants on a Glue-catalog table (location.database and "
+            "location.table), and without one they would not reach the grants.",
+            ("Restrict the columns of the Glue table expose instead.",),
+        )
+    return exclusions
+
+
 def _emit_lakeformation(
     resources: Dict[str, Any],
     binding: Mapping[str, Any],
@@ -1865,9 +1905,15 @@ def _emit_lakeformation(
     tags: Dict[str, str],
     *,
     placement: _Placement = _LEGACY_PLACEMENT,
+    exclusions: Optional[Mapping[int, Tuple[str, ...]]] = None,
 ) -> None:
     """Emit per-exposure LF resources. No-op when the binding has no
     ``governance.lakeFormation`` block.
+
+    ``exclusions`` is ``column_access.lf_exclusions``: for each grant index, the
+    columns the contract's ``policy.authz.columnRestrictions`` do not let that
+    grant's principal read. They become the grant's ``excluded_column_names``;
+    a hand-written ``excludedColumns`` was checked to agree with them.
 
     Under a REFERENCED bucket the grants narrow to the binding's
     ``location.path`` prefix rather than the bucket root (RFC §Security —
@@ -1923,7 +1969,7 @@ def _emit_lakeformation(
         if gp:
             body["permissions_with_grant_option"] = list(gp)
         cols = grant.get("columns")
-        excluded = grant.get("excludedColumns")
+        excluded = (exclusions or {}).get(idx) or grant.get("excludedColumns")
         if (cols or excluded) and table_key:
             twc: Dict[str, Any] = {
                 "database_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.database_name"),
@@ -1933,6 +1979,13 @@ def _emit_lakeformation(
                 twc["column_names"] = list(cols)
             if excluded:
                 twc["excluded_column_names"] = list(excluded)
+                if not cols:
+                    # The provider requires column_names or wildcard ("If
+                    # excluded_column_names is included, wildcard must be set to
+                    # true", terraform-provider-aws lakeformation_permissions);
+                    # without it every excludedColumns grant failed `tofu plan`
+                    # with "one of column_names, wildcard must be specified".
+                    twc["wildcard"] = True
             body["table_with_columns"] = [twc]
         elif table_key:
             body["table"] = [

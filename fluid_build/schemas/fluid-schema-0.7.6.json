@@ -1184,26 +1184,29 @@
             },
             "columnRestrictions": {
               "type": "array",
-              "description": "Column-level access control.",
+              "description": "Column-level access control. A column named in any restriction is restricted. 'deny': the principal may not read the columns. 'allow': the columns are readable only by the principals an allow names. A deny beats an allow, and a restriction never grants access: the readers are the expose's readers. Principals are logical and resolve through binding.principals. NEW in v0.7.6 (the field itself is older): `fluid apply` enforces it. GCP BigQuery: a Data Catalog taxonomy per product and dataset with fine-grained access control, a policy tag per set of restricted columns that share their readers, attached through the table schema's policyTags, and roles/datacatalog.categoryFineGrainedReader for exactly the accessPolicy read grantees allowed to read them (a denied principal gets an access error on the columns). AWS: each governance.lakeFormation grant with SELECT excludes the restricted columns its principal may not read (table_with_columns.excluded_column_names); a grant's hand-written excludedColumns must agree, and a binding with no Lake Formation grants is refused. `fluid verify` checks the policy tags and their readers on GCP, and the principals' Lake Formation permissions on AWS.",
               "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                   "principal": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "Logical principal the restriction applies to, written as in accessPolicy (e.g. group:analysts@company.example); binding.principals maps it per cloud."
                   },
                   "columns": {
                     "type": "array",
                     "items": {
                       "type": "string"
-                    }
+                    },
+                    "description": "Columns of this expose's schema."
                   },
                   "access": {
                     "type": "string",
                     "enum": [
                       "allow",
                       "deny"
-                    ]
+                    ],
+                    "description": "deny: the principal may not read the columns. allow: only the principals an allow names may read them."
                   },
                   "tags": {
                     "$ref": "#/$defs/tags",
@@ -1626,7 +1629,7 @@
         "encryption": {
           "type": "object",
           "additionalProperties": false,
-          "description": "NEW in v0.7.6: Encryption at rest for an AWS S3 binding. Absent: nothing is emitted and S3's default encryption (SSE-S3) applies to new objects.",
+          "description": "NEW in v0.7.6: Encryption at rest for an AWS S3 binding or a GCP BigQuery binding. Absent: nothing is emitted, and the cloud's default applies: SSE-S3 for new S3 objects, Google-managed keys for BigQuery.",
           "properties": {
             "kms": {
               "type": "string",
@@ -1643,13 +1646,125 @@
                 },
                 {
                   "pattern": "^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:(key|alias)/[A-Za-z0-9/_-]{1,250}$"
+                },
+                {
+                  "pattern": "^projects/[a-z0-9.:-]{1,100}/locations/[a-z0-9-]{1,63}/keyRings/[A-Za-z0-9_-]{1,63}/cryptoKeys/[A-Za-z0-9_-]{1,63}$"
                 }
               ],
-              "description": "NEW in v0.7.6: The KMS key the bucket's objects are encrypted with (SSE-KMS with an S3 Bucket Key). 'product' (the default): `fluid apply` creates a customer managed key for each bucket this product owns (aws_kms_key, rotation on, alias alias/fluid/<contract id>/<bucket>) and makes it the bucket's default encryption (aws_s3_bucket_server_side_encryption_configuration). Its key policy lets the account's IAM policies decide who may use it (the KMS default statement for the account root) and, when the binding carries governance.lakeFormation, lets the Lake Formation service-linked role AWSServiceRoleForLakeFormationDataAccess encrypt and decrypt, matched by aws:PrincipalArn so the role need not exist yet. A principal querying through Athena with credentials Lake Formation vends then needs no KMS permission of its own; a grantee in another account that the bucket policy lets read the objects directly (governance.lakeFormation.bucketPolicy) is also allowed kms:Decrypt, through S3 only. The writer (the identity the build runs as) needs kms:GenerateDataKey and kms:Decrypt from IAM. `tofu destroy` deletes the alias and schedules the key for deletion after 7 days, the minimum KMS allows; kms:CancelKeyDeletion recovers it until then. Dropping the block, or naming another key, removes the product key while the bucket keeps the objects encrypted under it, which become unreadable once the deletion window ends unless they are rewritten or the deletion is cancelled; `fluid apply` refuses that plan without --allow-data-loss. On a shared (pool) bucket the bucket's default encryption is the pool owner's, so 'product' is refused there. 'alias/<name>' or a key or alias ARN: an existing key, looked up at plan time (data aws_kms_key, so the identity running `fluid apply` needs kms:DescribeKey on it) and made the default encryption of a bucket this product owns by its key ARN, since S3 resolves an alias in the account of whoever writes; the plan fails unless the key is Enabled and a symmetric encryption key (SYMMETRIC_DEFAULT). On a pool bucket it is only checked. Its key policy is its owner's, and must let the Lake Formation role use it when the location is registered: an AWS managed key cannot be used with that role, so alias/aws/s3 is refused with registerLocation, and the plan fails for any key that is not customer managed. 'none': nothing is emitted. `fluid verify` checks that the key is Enabled and that the objects under the binding's prefix are SSE-KMS with it."
+              "description": "NEW in v0.7.6: The KMS key the bucket's objects are encrypted with (SSE-KMS with an S3 Bucket Key). 'product' (the default): `fluid apply` creates a customer managed key for each bucket this product owns (aws_kms_key, rotation on, alias alias/fluid/<contract id>/<bucket>) and makes it the bucket's default encryption (aws_s3_bucket_server_side_encryption_configuration). Its key policy lets the account's IAM policies decide who may use it (the KMS default statement for the account root) and, when the binding carries governance.lakeFormation, lets the Lake Formation service-linked role AWSServiceRoleForLakeFormationDataAccess encrypt and decrypt, matched by aws:PrincipalArn so the role need not exist yet. A principal querying through Athena with credentials Lake Formation vends then needs no KMS permission of its own; a grantee in another account that the bucket policy lets read the objects directly (governance.lakeFormation.bucketPolicy) is also allowed kms:Decrypt, through S3 only. The writer (the identity the build runs as) needs kms:GenerateDataKey and kms:Decrypt from IAM. `tofu destroy` deletes the alias and schedules the key for deletion after 7 days, the minimum KMS allows; kms:CancelKeyDeletion recovers it until then. Dropping the block, or naming another key, removes the product key while the bucket keeps the objects encrypted under it, which become unreadable once the deletion window ends unless they are rewritten or the deletion is cancelled; `fluid apply` refuses that plan without --allow-data-loss. On a shared (pool) bucket the bucket's default encryption is the pool owner's, so 'product' is refused there. 'alias/<name>' or a key or alias ARN: an existing key, looked up at plan time (data aws_kms_key, so the identity running `fluid apply` needs kms:DescribeKey on it) and made the default encryption of a bucket this product owns by its key ARN, since S3 resolves an alias in the account of whoever writes; the plan fails unless the key is Enabled and a symmetric encryption key (SYMMETRIC_DEFAULT). On a pool bucket it is only checked. Its key policy is its owner's, and must let the Lake Formation role use it when the location is registered: an AWS managed key cannot be used with that role, so alias/aws/s3 is refused with registerLocation, and the plan fails for any key that is not customer managed. 'none': nothing is emitted. `fluid verify` checks that the key is Enabled and that the objects under the binding's prefix are SSE-KMS with it. On a gcp binding (fluid-schema 0.7.6, BigQuery tables): 'product' creates a Cloud KMS key ring and crypto key for each dataset this product writes (google_kms_key_ring fluid-<contract id>-<dataset> and google_kms_crypto_key 'bigquery', in the dataset's location, EU and US mapping to the europe and us key locations, rotated every 90 days), grants the project's BigQuery service agent roles/cloudkms.cryptoKeyEncrypterDecrypter on it, and makes it the dataset's default_encryption_configuration and the table's encryption_configuration. The project must have the Cloud KMS API (cloudkms.googleapis.com) enabled. A key ring and key cannot be deleted on GCP: `tofu destroy` removes them from state and schedules the key's versions for destruction (30 days by default), and a later apply adopts the same names. 'projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>': an existing key in the dataset's location, used as given; its owner grants the BigQuery service agent. 'none': Google-managed keys. An alias/... or arn:... value is refused on a gcp binding, and a Cloud KMS name on an aws binding. Adding a key to a table that exists replaces the table (BigQuery cannot re-key it in place), so `fluid apply` refuses that plan without --allow-data-loss; the next build lands the data again. `fluid verify` checks kmsKeyName on the dataset and the table."
+            }
+          }
+        },
+        "principals": {
+          "type": "object",
+          "description": "NEW in v0.7.6: Maps the contract's LOGICAL principals (accessPolicy.grants[].principal and exposes[].policy.authz.columnRestrictions[].principal, keyed exactly as the contract writes them) to the identities they stand for on this binding's platform, so the base contract stays cloud-neutral and each environment's overlay binds it. On gcp an identity is an IAM member (user:, group:, serviceAccount: or domain:); on aws an IAM principal ARN. A value is one identity or a list; [] says the principal has no identity on this cloud, and nothing is granted to it there. When the block is present, every principal the contract names for this expose must be a key: an unmapped one is refused, never emitted as written. Without the block the principals are used as written, except that a GCP principal in a reserved top-level domain (.example, .test, .invalid, .localhost) is refused as a placeholder. Modelled on ODCS v3's roles[] bound per server (servers[].roles) and on dbt grants resolved per target.",
+          "propertyNames": {
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true
+              }
+            ]
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "platform": {
+                "const": "gcp"
+              }
+            },
+            "required": [
+              "platform"
+            ]
+          },
+          "then": {
+            "properties": {
+              "encryption": {
+                "properties": {
+                  "kms": {
+                    "not": {
+                      "pattern": "^(alias/|arn:)"
+                    }
+                  }
+                }
+              },
+              "principals": {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^(user|group|serviceAccount|domain):\\S+$"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "pattern": "^(user|group|serviceAccount|domain):\\S+$"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "platform": {
+                "const": "aws"
+              }
+            },
+            "required": [
+              "platform"
+            ]
+          },
+          "then": {
+            "properties": {
+              "encryption": {
+                "properties": {
+                  "kms": {
+                    "not": {
+                      "pattern": "^projects/"
+                    }
+                  }
+                }
+              },
+              "principals": {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^arn:aws[a-z0-9-]*:iam::"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "pattern": "^arn:aws[a-z0-9-]*:iam::"
+                      }
+                    }
+                  ]
+                }
+              }
             }
           }
         }
-      }
+      ]
     },
     "bindingLocation": {
       "type": "object",
@@ -1766,7 +1881,7 @@
           "items": {
             "type": "string"
           },
-          "description": "NEW in v0.7.5: Iceberg partition columns — a FLUID abstraction over the Iceberg PARTITIONED BY / PartitionSpec (maps to iceberg.tables.default-partition-by)."
+          "description": "NEW in v0.7.5: Iceberg partition columns — a FLUID abstraction over the Iceberg PARTITIONED BY / PartitionSpec (maps to iceberg.tables.default-partition-by). On a gcp BigQuery table with exposes[].lifecycle.expire: true (fluid-schema 0.7.6), one DATE, TIMESTAMP or DATETIME column to partition by (time_partitioning.field); without it the table is partitioned by ingestion time."
         }
       }
     },
@@ -2076,12 +2191,12 @@
         },
         "retention": {
           "$ref": "#/$defs/isoDuration",
-          "description": "How long this expose's data is kept (ISO-8601 duration, e.g. P30D, P7Y). A declaration unless `expire` is true. With `expire: true` on an AWS S3 binding, `fluid apply` expires the objects under the binding's prefix this long after they are written. Years and months are counted as 365 and 30 days, and a part of a day rounds up to a whole one."
+          "description": "How long this expose's data is kept (ISO-8601 duration, e.g. P30D, P7Y). A declaration unless `expire` is true. With `expire: true` on an AWS S3 binding, `fluid apply` expires the objects under the binding's prefix this long after they are written; on a GCP BigQuery table it deletes each daily partition this long after its day ends. Years and months are counted as 365 and 30 days, and a part of a day rounds up to a whole one."
         },
         "expire": {
           "type": "boolean",
           "default": false,
-          "description": "NEW in v0.7.6: Delete stored data once it is older than `retention`. Default false, so a contract that declares a retention period does not start deleting data when forge-cli is upgraded. Honoured by the AWS emitter on an S3 binding (other platforms do not apply it yet): `fluid apply` writes one rule per expose into the bucket's aws_s3_bucket_lifecycle_configuration, filtered to the binding's prefix (location.path, else {database}/{table}/; a binding with neither is refused, so no rule ever expires a whole bucket). The rule expires the current version `retention` after it is written, removes a noncurrent version (on a versioning-enabled bucket) one day after it stops being current, and aborts an incomplete multipart upload after 7 days or the retention period if shorter. The lifecycle configuration is AUTHORITATIVE for the whole bucket: S3 keeps one per bucket, so rules that `fluid apply` did not write are replaced. It is therefore written only for a bucket this product owns; on a shared (pool) bucket (packaging) nothing is written, the pool's owner must hold the rule, and `fluid verify` checks that an enabled rule covering the prefix expires objects after exactly this period. Objects already older than the period when the rule is first applied are expired on S3's next lifecycle run, typically within a day. Removing `expire` later deletes the lifecycle configuration, which `fluid apply` refuses without --allow-data-loss (it refuses every plan that removes a resource); `tofu destroy` deletes it."
+          "description": "NEW in v0.7.6: Delete stored data once it is older than `retention`. Default false, so a contract that declares a retention period does not start deleting data when forge-cli is upgraded. Honoured by the AWS emitter on an S3 binding and by the GCP emitter on a BigQuery table; on a gcp binding that is not a BigQuery table (GCS, Pub/Sub, Iceberg storage) it is refused rather than dropped. AWS: `fluid apply` writes one rule per expose into the bucket's aws_s3_bucket_lifecycle_configuration, filtered to the binding's prefix (location.path, else {database}/{table}/; a binding with neither is refused, so no rule ever expires a whole bucket). The rule expires the current version `retention` after it is written, removes a noncurrent version (on a versioning-enabled bucket) one day after it stops being current, and aborts an incomplete multipart upload after 7 days or the retention period if shorter. The lifecycle configuration is AUTHORITATIVE for the whole bucket: S3 keeps one per bucket, so rules that `fluid apply` did not write are replaced. It is therefore written only for a bucket this product owns; on a shared (pool) bucket (packaging) nothing is written, the pool's owner must hold the rule, and `fluid verify` checks that an enabled rule covering the prefix expires objects after exactly this period. Objects already older than the period when the rule is first applied are expired on S3's next lifecycle run, typically within a day. Removing `expire` later deletes the lifecycle configuration, which `fluid apply` refuses without --allow-data-loss (it refuses every plan that removes a resource); `tofu destroy` deletes it. GCP (fluid-schema 0.7.6): the BigQuery table is partitioned by day (time_partitioning type DAY, on binding.location.partitionBy when it names one date or timestamp column, else by ingestion time) with expiration_ms = `retention` in days, so BigQuery deletes each partition that long after its day ends and never a row sooner; it is never a whole-table expiration, which would delete the product. BigQuery cannot partition a table that exists, so adding `expire` to a live table replaces it: `fluid apply` refuses that plan without --allow-data-loss, and the next build lands the data again. A later change of `retention` is an in-place update. Removing `expire` from a live table removes the partitioning's replacement trigger, which `fluid apply` also refuses without --allow-data-loss; BigQuery cannot un-partition a table, so to keep data longer set a longer `retention` instead. `fluid verify` checks the live table's partition expiration."
         },
         "deprecationPolicy": {
           "type": "object",

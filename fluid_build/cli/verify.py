@@ -389,6 +389,10 @@ def verify_bigquery_table(
     table: str,
     expected_schema: List[Dict[str, Any]],
     expected_region: Optional[str] = None,
+    *,
+    expose: Optional[Dict[str, Any]] = None,
+    contract: Optional[Dict[str, Any]] = None,
+    catalog_session_factory: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Verify BigQuery table with multi-dimensional analysis.
@@ -398,6 +402,8 @@ def verify_bigquery_table(
       2. Data Types (field types)
       3. Constraints (nullable/required modes)
       4. Location (region/location)
+      5. Retention, encryption and column restrictions, when ``expose`` declares
+         them (``_verify_bigquery_governance.py``)
     """
     try:
         from google.cloud import bigquery
@@ -509,7 +515,23 @@ def verify_bigquery_table(
             missing_fields or extra_fields or type_mismatches or mode_mismatches or not region_match
         )
 
-        return {
+        # Retention, encryption and column access, when the expose declares them.
+        governance: Dict[str, Dict[str, Any]] = {}
+        if expose is not None:
+            from fluid_build.cli import _verify_bigquery_governance as _bq_gov
+
+            governance = _bq_gov.governance_dimensions(
+                expose,
+                contract=contract or {},
+                bq_dataset=bq_dataset,
+                bq_table=bq_table,
+                project=project,
+                session_factory=catalog_session_factory,
+            )
+            severity = _bq_gov.with_governance_severity(severity, governance)
+            has_issues = has_issues or any(d["status"] == "fail" for d in governance.values())
+
+        result: Dict[str, Any] = {
             "status": "mismatch" if has_issues else "match",
             "exists": True,
             "table_id": table_id,
@@ -544,6 +566,14 @@ def verify_bigquery_table(
                 "modified": bq_table.modified.isoformat() if bq_table.modified else None,
             },
         }
+        if governance:
+            result["dimensions"].update(governance)
+            unchecked = _bq_gov.governance_errors(governance)
+            if unchecked:
+                # A declared policy that could not be checked is unproven, not passed.
+                result["status"] = "error"
+                result["error"] = "; ".join(unchecked)
+        return result
 
     except Exception as e:
         LOG.error(f"Error verifying table {table}: {e}")
@@ -1370,6 +1400,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 table=table,
                 expected_schema=fields,
                 expected_region=region,
+                expose=expose_config if expose_config.get("binding") else None,
+                contract=contract,
             )
 
             results[expose_name] = result

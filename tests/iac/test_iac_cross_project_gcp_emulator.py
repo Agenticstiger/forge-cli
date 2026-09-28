@@ -138,9 +138,9 @@ def _xproj_contract(dataset: str, *consumer_sas: str) -> Dict[str, Any]:
     """A producer-project contract granting BQ read to SAs in other projects.
 
     Cross-project access rides the existing ``metadata.policies`` surface —
-    the GCP plugin's ``_bq_access_entries`` maps each principal to a
-    ``user_by_email`` row on the dataset's ``access[]`` block. Zero new
-    schema fields.
+    the GCP plugin makes each principal a ``google_bigquery_dataset_iam_member``,
+    which the provider adds to the dataset's ``access[]`` as a ``userByEmail``
+    row. Zero new schema fields.
     """
     return {
         "fluidVersion": "0.7.6",
@@ -178,12 +178,35 @@ def _xproj_contract(dataset: str, *consumer_sas: str) -> Dict[str, Any]:
     }
 
 
+#: The basic dataset roles, as BigQuery reports them in ``access[]``
+#: (terraform-provider-google ``iam_bigquery_dataset.go``: the API changes these
+#: IAM roles to the legacy names).
+_LEGACY_ROLES = {
+    "roles/bigquery.dataOwner": "OWNER",
+    "roles/bigquery.dataEditor": "WRITER",
+    "roles/bigquery.dataViewer": "READER",
+}
+
+
 def _emitted_access_block(contract: Mapping[str, Any]) -> List[Dict[str, str]]:
-    """Run the real GCP emitter and return the dataset's ``access[]`` block."""
+    """Run the real GCP emitter; the ``access[]`` rows its dataset grants become.
+
+    The emitter writes each grant as a non-authoritative
+    ``google_bigquery_dataset_iam_member`` (it used to be a row of the
+    dataset's authoritative ``access[]`` block). The provider adds each member
+    to the dataset's access list, as ``userByEmail`` for ``user:`` and
+    ``serviceAccount:`` and ``groupByEmail`` for ``group:``
+    (``iamMemberToAccess``); this replays that mapping in the provider's
+    snake_case, so the round-trip below still drives the emitter's own output.
+    """
     module = json.loads(build_module(get_iac_plugin("gcp"), contract))
-    datasets = module["resource"]["google_bigquery_dataset"]
-    body = next(iter(datasets.values()))
-    return body.get("access", [])
+    members = module["resource"].get("google_bigquery_dataset_iam_member") or {}
+    rows = []
+    for body in members.values():
+        kind, _, email = body["member"].partition(":")
+        field = "group_by_email" if kind == "group" else "user_by_email"
+        rows.append({"role": _LEGACY_ROLES.get(body["role"], body["role"]), field: email})
+    return rows
 
 
 def _tf_access_to_bq_api(entries: List[Dict[str, str]]) -> List[Dict[str, str]]:

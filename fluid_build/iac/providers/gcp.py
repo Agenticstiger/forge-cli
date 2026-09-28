@@ -52,15 +52,17 @@ from ..access import (
     role_grants,
 )
 from ..importer import ImportBlock
-from ..naming import safe_ident, tofu_ref
+from ..naming import TofuExpr, safe_ident, tofu_ref
 from ..packaging import (
     ContainerDecision,
     PackagingError,
     PackagingResolution,
     resolve_packaging,
 )
+from ..principals import gcp_grants
 from ..provider_match import is_cloud
 from ..versions import required_providers
+from . import gcp_governance as _gov
 
 # FLUID column type → BigQuery type (best-effort; unknown types upper-cased).
 _BQ_TYPES = {
@@ -151,9 +153,9 @@ def _bq_type(raw: Any) -> str:
     return str(raw).upper() if raw else "STRING"
 
 
-def _bq_schema(schema: List[Mapping[str, Any]]) -> str:
-    """FLUID contract schema → BigQuery schema JSON string."""
-    fields = [
+def _bq_fields(schema: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """FLUID contract schema → BigQuery schema fields."""
+    return [
         {
             "name": col.get("name"),
             "type": _bq_type(col.get("type")),
@@ -162,11 +164,47 @@ def _bq_schema(schema: List[Mapping[str, Any]]) -> str:
         }
         for col in schema or []
     ]
-    return json.dumps(fields, sort_keys=True)
+
+
+def _bq_schema(schema: List[Mapping[str, Any]]) -> str:
+    """FLUID contract schema → BigQuery schema JSON string."""
+    return json.dumps(_bq_fields(schema), sort_keys=True)
+
+
+def _literal(value: Any) -> Any:
+    """``value`` with OpenTofu interpolation neutralised, as the renderer does it."""
+    if isinstance(value, str):
+        return value.replace("${", "$${").replace("%{", "%%{")
+    return value
+
+
+def _bq_schema_with_policy_tags(
+    schema: List[Mapping[str, Any]], tags: Mapping[str, Any]
+) -> TofuExpr:
+    """The schema JSON with each restricted column's ``policyTags`` (dbt's ``policy_tags``).
+
+    The tag's name is only known at apply, so it is an interpolation inside the
+    JSON string, and the string must reach OpenTofu unescaped. Every string that
+    came from the contract is escaped here instead, exactly as the renderer would
+    escape the whole value, so a column description still cannot inject one.
+    """
+    fields = []
+    for field in _bq_fields(schema):
+        escaped = {key: _literal(value) for key, value in field.items()}
+        tag = tags.get(field.get("name") or "")
+        if tag is not None:
+            escaped["policyTags"] = {"names": [str(tag)]}
+        fields.append(escaped)
+    return TofuExpr(json.dumps(fields, sort_keys=True))
 
 
 def _bq_access_entries(grants: Sequence[AccessGrant]) -> List[Dict[str, str]]:
     """Normalized grants → a ``google_bigquery_dataset`` ``access`` block.
+
+    No longer emitted: that block is AUTHORITATIVE for the dataset's whole ACL, so
+    the grants are ``google_bigquery_dataset_iam_member`` resources now
+    (:func:`_emit_dataset_iam`). Kept, with its field choice, for callers outside
+    the emitter.
 
     The BigQuery field is chosen from the grant's **declared** principal
     type rather than guessed from the string. The previous heuristic
@@ -338,16 +376,28 @@ class GcpIacPlugin:
         # resource. Read from the schema-valid `accessPolicy` surface, with
         # the deprecated (schema-invalid) `metadata.policies` appended for
         # back-compat — see `iac/access.py` for why that split exists.
-        grants = normalize_access_grants(contract)
+        contract_grants = normalize_access_grants(contract)
         packaging = resolve_packaging(contract)
 
-        for exposure in contract.get("exposes") or []:
+        for index, exposure in enumerate(contract.get("exposes") or []):
             binding = exposure.get("binding") or {}
             target = resolve_gcp_target(binding)
             loc = binding.get("location") or {}
             schema = (exposure.get("contract") or {}).get("schema") or []
             placement = _placement(packaging, exposure)
             labels = _labels_for(base_labels, placement)
+            # The contract's principals are logical: each GCP expose's binding maps
+            # them to real IAM members (``binding.principals``), and an unmapped or
+            # placeholder principal is refused rather than written into IAM.
+            grants = (
+                gcp_grants(
+                    contract_grants,
+                    binding,
+                    where=f"exposes[{_expose_id(exposure) or index}] accessPolicy",
+                )
+                if target in _GRANTED_TARGETS
+                else contract_grants
+            )
             if target in (BIGQUERY_TABLE, BIGQUERY_VIEW):
                 _emit_bigquery(
                     resources,
@@ -359,8 +409,14 @@ class GcpIacPlugin:
                     is_view=(target == BIGQUERY_VIEW),
                     grants=grants,
                     placement=placement,
+                    governance=_bigquery_governance(
+                        contract, exposure, index, cid, is_view=(target == BIGQUERY_VIEW)
+                    ),
                 )
-            elif target == GCS_BUCKET:
+                continue
+            if target is not None:
+                _gov.refuse_unsupported_target(exposure, index, target)
+            if target == GCS_BUCKET:
                 # An expose that NAMES the bucket as its port (``format:
                 # gcs_bucket``) owns it. One resolved from the location shape
                 # merely cites the container its files live in, so a declared
@@ -404,9 +460,11 @@ class GcpIacPlugin:
         """
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
         packaging = resolve_packaging(contract)
+        # The BigQuery service agent a product key is granted to, whatever the
+        # packaging: looked up by the same derivation ``_emit_bigquery_key`` uses.
+        data: Dict[str, Dict[str, Any]] = _service_agent_lookups(contract, cid)
         if packaging.is_legacy:
-            return {}
-        data: Dict[str, Dict[str, Any]] = {}
+            return data
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
             # Resolve through the same chokepoint :meth:`emit` uses — the two
@@ -560,12 +618,257 @@ class GcpIacPlugin:
                 topic_id = f"projects/{project}/topics/{topic}" if project else topic
                 _add(f"google_pubsub_topic.{topic_key}", topic_id)
 
+            if dataset and target in (BIGQUERY_TABLE, BIGQUERY_VIEW):
+                # A Cloud KMS key ring and key cannot be deleted: after a destroy
+                # they still exist, so a re-apply must adopt them, not 409.
+                encryption = _gov.encryption_for(binding, _gov.dataset_location(loc))
+                if encryption is not None and encryption.product_key:
+                    kms_project = loc.get("project") or project
+                    ident = _kms_ident(cid, dataset)
+                    ring = _gov.product_key_ring(cid, dataset)
+                    # The provider's documented import ids; without a project it
+                    # takes the provider's own.
+                    if kms_project:
+                        ring_id = (
+                            f"projects/{kms_project}/locations/{encryption.location}"
+                            f"/keyRings/{ring}"
+                        )
+                        key_id = f"{ring_id}/cryptoKeys/{_gov.PRODUCT_KEY_NAME}"
+                    else:
+                        ring_id = f"{encryption.location}/{ring}"
+                        key_id = f"{ring_id}/{_gov.PRODUCT_KEY_NAME}"
+                    _add(f"google_kms_key_ring.{ident}", ring_id)
+                    _add(f"google_kms_crypto_key.{ident}", key_id)
+
         return blocks
 
     def provider_block(self) -> Dict[str, Any]:
         """No static provider configuration — the ``hashicorp/google``
         provider self-configures from the environment."""
         return {}
+
+
+@dataclass(frozen=True)
+class _BqGovernance:
+    """What one BigQuery expose asks of retention, encryption and column access.
+
+    Derived by ``gcp_governance`` (shared with ``fluid verify``); empty for every
+    contract that declares none of them, whose emit is then what it was before.
+    """
+
+    retention: Optional[_gov.BqRetention] = None
+    encryption: Optional[_gov.BqEncryption] = None
+    tags: Tuple[_gov.TagGroup, ...] = ()
+
+
+_NO_GOVERNANCE = _BqGovernance()
+
+#: Targets whose emitters write the contract's access grants.
+_GRANTED_TARGETS = frozenset({"bigquery_table", "bigquery_view", "gcs_bucket", "iceberg"})
+
+
+def _bigquery_governance(
+    contract: Mapping[str, Any],
+    exposure: Mapping[str, Any],
+    index: int,
+    cid: str,
+    *,
+    is_view: bool,
+) -> _BqGovernance:
+    """The governance one BigQuery expose declares; refuses what cannot be applied."""
+    _gov.validate_bigquery_governance(contract, exposure, index, is_view=is_view)
+    binding = exposure.get("binding") or {}
+    loc = binding.get("location") or {}
+    where = f"exposes[{_expose_id(exposure) or index}].binding"
+    return _BqGovernance(
+        retention=_gov.retention_for(exposure, index, is_view=is_view),
+        encryption=_gov.encryption_for(binding, _gov.dataset_location(loc), where=where),
+        tags=(
+            ()
+            if is_view
+            else tuple(
+                _gov.tag_groups(
+                    contract,
+                    exposure,
+                    cid,
+                    str(loc.get("dataset") or "default"),
+                    _bq_table_name(exposure, loc),
+                    index,
+                )
+            )
+        ),
+    )
+
+
+def _service_agent_lookups(contract: Mapping[str, Any], cid: str) -> Dict[str, Dict[str, Any]]:
+    """``data.google_bigquery_default_service_account`` for each product key.
+
+    Mirrors :func:`_emit_bigquery_key` (same targets, same derivation), so every
+    ``${data...email}`` the key's IAM member names is declared, and nothing else is.
+    """
+    lookups: Dict[str, Any] = {}
+    for exposure in contract.get("exposes") or []:
+        binding = exposure.get("binding") or {}
+        if resolve_gcp_target(binding) not in (BIGQUERY_TABLE, BIGQUERY_VIEW):
+            continue
+        loc = binding.get("location") or {}
+        try:
+            encryption = _gov.encryption_for(binding, _gov.dataset_location(loc))
+        except Exception:  # noqa: BLE001 — ``emit`` refuses it with the reason
+            continue
+        if encryption is None or not encryption.product_key:
+            continue
+        body: Dict[str, Any] = {}
+        if loc.get("project"):
+            body["project"] = loc["project"]
+        lookups.setdefault(_kms_ident(cid, str(loc.get("dataset") or "default")), body)
+    return {"google_bigquery_default_service_account": lookups} if lookups else {}
+
+
+def _kms_ident(cid: str, dataset: str) -> str:
+    """The resource-name stem of the product key for ``dataset`` (ring, key, IAM, lookup)."""
+    return safe_ident(f"{cid}_{dataset}_kms")
+
+
+def _emit_bigquery_key(
+    resources: Dict[str, Any],
+    encryption: Optional[_gov.BqEncryption],
+    cid: str,
+    dataset: str,
+    loc: Mapping[str, Any],
+    labels: Dict[str, str],
+) -> Tuple[Optional[Any], List[str]]:
+    """``(kms_key_name, depends_on)`` for the dataset and table; ``(None, [])`` for none.
+
+    ``product``: a key ring and a crypto key in the dataset's location, with 90-day
+    rotation, and ``roles/cloudkms.cryptoKeyEncrypterDecrypter`` on the key for the
+    project's BigQuery service agent (``data.google_bigquery_default_service_account``,
+    the provider's documented way to name it), which BigQuery encrypts and decrypts
+    as. The dataset and table wait for that grant: BigQuery checks it can use the key
+    when the table is created. An existing key is named as given; its owner grants
+    the service agent.
+    """
+    if encryption is None:
+        return None, []
+    if not encryption.product_key:
+        return encryption.kms, []
+    ident = _kms_ident(cid, dataset)
+    ring: Dict[str, Any] = {
+        "name": _gov.product_key_ring(cid, dataset),
+        "location": encryption.location,
+    }
+    if loc.get("project"):
+        ring["project"] = loc["project"]
+    resources.setdefault("google_kms_key_ring", {}).setdefault(ident, ring)
+    resources.setdefault("google_kms_crypto_key", {}).setdefault(
+        ident,
+        {
+            "name": _gov.PRODUCT_KEY_NAME,
+            "key_ring": tofu_ref(f"google_kms_key_ring.{ident}.id"),
+            "purpose": "ENCRYPT_DECRYPT",
+            "rotation_period": _gov.KEY_ROTATION_PERIOD,
+            "labels": labels,
+        },
+    )
+    resources.setdefault("google_kms_crypto_key_iam_member", {}).setdefault(
+        ident,
+        {
+            "crypto_key_id": tofu_ref(f"google_kms_crypto_key.{ident}.id"),
+            "role": _gov.KMS_ENCRYPTER_ROLE,
+            "member": TofuExpr(
+                "serviceAccount:"
+                + tofu_ref(f"data.google_bigquery_default_service_account.{ident}.email")
+            ),
+        },
+    )
+    return tofu_ref(f"google_kms_crypto_key.{ident}.id"), [
+        f"google_kms_crypto_key_iam_member.{ident}"
+    ]
+
+
+def _emit_policy_tags(
+    resources: Dict[str, Any],
+    tags: Sequence[_gov.TagGroup],
+    cid: str,
+    dataset: str,
+    table: str,
+    loc: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """The taxonomy, one policy tag per group and its readers; ``{column: tag name}``.
+
+    The taxonomy (one per product and dataset, in the dataset's location, since a
+    tag applies only to tables in its own location) has fine-grained access control
+    on, so a column carrying one of its tags is readable only by a principal with
+    ``roles/datacatalog.categoryFineGrainedReader`` on the tag. That role is granted,
+    one ``google_data_catalog_policy_tag_iam_member`` each, to exactly the readers
+    ``column_access`` derives; a denied principal gets an access error on the column
+    (``SELECT * EXCEPT (...)`` still works for it).
+    """
+    if not tags:
+        return {}
+    taxonomy = safe_ident(f"{cid}_{dataset}_taxonomy")
+    body: Dict[str, Any] = {
+        "display_name": _gov.taxonomy_display_name(cid, dataset),
+        "description": (
+            f"Column-level access for the data product {cid} in dataset {dataset}, "
+            "written by fluid apply from its column restrictions."
+        ),
+        "activated_policy_types": ["FINE_GRAINED_ACCESS_CONTROL"],
+        "region": _gov.taxonomy_region(_gov.dataset_location(loc)),
+    }
+    if loc.get("project"):
+        body["project"] = loc["project"]
+    resources.setdefault("google_data_catalog_taxonomy", {}).setdefault(taxonomy, body)
+    refs: Dict[str, Any] = {}
+    for group in tags:
+        resources.setdefault("google_data_catalog_policy_tag", {})[group.key] = {
+            "taxonomy": tofu_ref(f"google_data_catalog_taxonomy.{taxonomy}.id"),
+            "display_name": group.display_name,
+            "description": (
+                f"Restricted columns {', '.join(group.columns)} of {table}: readable only "
+                "by the principals granted the fine-grained reader role on this tag."
+            ),
+        }
+        name = tofu_ref(f"google_data_catalog_policy_tag.{group.key}.name")
+        for member in group.readers:
+            resources.setdefault("google_data_catalog_policy_tag_iam_member", {})[
+                safe_ident(f"{group.key}_{member}")
+            ] = {
+                "policy_tag": name,
+                "role": _gov.FINE_GRAINED_READER_ROLE,
+                "member": member,
+            }
+        for column in group.columns:
+            refs[column] = name
+    return refs
+
+
+def _emit_dataset_iam(
+    resources: Dict[str, Any],
+    grants: Sequence[AccessGrant],
+    ds_ref: Any,
+    cid: str,
+    dataset: str,
+    loc: Mapping[str, Any],
+) -> None:
+    """One non-authoritative ``google_bigquery_dataset_iam_member`` per role and member.
+
+    This was an authoritative ``access`` list on the dataset: it replaced every
+    entry the dataset had (its default owners, the pipeline's own, any grant made
+    elsewhere) with exactly the contract's, and it carried the contract's
+    principals as written. A member resource adds its binding and leaves the rest,
+    and its principal is the binding's mapped identity (``iac/principals.py``). The
+    provider names the caveat: dataset IAM resources rewrite the access list without
+    authorized-view entries, which forge-cli does not emit.
+    """
+    for role, grant in role_grants(grants, _BQ_TABLE_IAM_ROLES):
+        member = _gcs_member(grant)
+        body: Dict[str, Any] = {"dataset_id": ds_ref, "role": role, "member": member}
+        if loc.get("project"):
+            body["project"] = loc["project"]
+        resources.setdefault("google_bigquery_dataset_iam_member", {})[
+            safe_ident(f"{cid}_{dataset}_{role}_{member}")
+        ] = body
 
 
 def _emit_bigquery(
@@ -579,23 +882,24 @@ def _emit_bigquery(
     is_view: bool,
     grants: Sequence[AccessGrant],
     placement: _Placement = _LEGACY_PLACEMENT,
+    governance: Optional[_BqGovernance] = None,
 ) -> None:
+    gov = governance or _NO_GOVERNANCE
     dataset = loc.get("dataset") or "default"
     table = _bq_table_name(exposure, loc)
     ds_name = safe_ident(f"{cid}_{dataset}")
     tbl_name = safe_ident(f"{cid}_{table}")
+    kms_key, kms_deps = _emit_bigquery_key(resources, gov.encryption, cid, dataset, loc, labels)
 
     if placement.dataset_referenced:
         # Shared pool dataset: looked up (see ``emit_data``), never created.
-        # The dataset-level ``access[]`` block is deliberately NOT emitted —
-        # it is authoritative in the BigQuery API, so a tenant writing it
-        # would replace the pool's entire ACL and evict its other tenants.
-        # The same grants move down to table level instead.
+        # The grants move down to table level, and its default key stays its
+        # owner's: only the table this product creates carries the key.
         ds_ref: Any = tofu_ref(f"data.google_bigquery_dataset.{ds_name}.dataset_id")
     else:
         dataset_body: Dict[str, Any] = {
             "dataset_id": dataset,
-            "location": loc.get("region") or loc.get("location") or "US",
+            "location": _gov.dataset_location(loc),
             "labels": labels,
         }
         # The binding's project, when it names one, goes on the resource. It was
@@ -603,13 +907,12 @@ def _emit_bigquery(
         # binding for one project could provision into another.
         if loc.get("project"):
             dataset_body["project"] = loc["project"]
-        # Access grants → the dataset ACL (mirrors the retired native
-        # `iam.bind_bq_dataset`, which appended BigQuery access entries).
-        access = _bq_access_entries(grants)
-        if access:
-            dataset_body["access"] = access
+        if kms_key is not None:
+            dataset_body["default_encryption_configuration"] = {"kms_key_name": kms_key}
+            dataset_body["depends_on"] = list(kms_deps)
         resources.setdefault("google_bigquery_dataset", {}).setdefault(ds_name, dataset_body)
         ds_ref = tofu_ref(f"google_bigquery_dataset.{ds_name}.dataset_id")
+        _emit_dataset_iam(resources, grants, ds_ref, cid, dataset, loc)
 
     body: Dict[str, Any] = {
         "dataset_id": ds_ref,
@@ -622,11 +925,22 @@ def _emit_bigquery(
         body["project"] = loc["project"]
     if is_view:
         body["view"] = {"query": loc.get("query", ""), "use_legacy_sql": False}
+    elif gov.tags:
+        body["schema"] = _bq_schema_with_policy_tags(
+            schema, _emit_policy_tags(resources, gov.tags, cid, dataset, table, loc)
+        )
     elif schema:
         body["schema"] = _bq_schema(schema)
+    if kms_key is not None and not is_view:
+        # ForceNew in the provider: adding a key to a live table replaces it, which
+        # the data-loss gate refuses without --allow-data-loss.
+        body["encryption_configuration"] = {"kms_key_name": kms_key}
+        body["depends_on"] = list(kms_deps)
+    if gov.retention is not None:
+        _partition_table(resources, body, tbl_name, gov.retention)
     resources.setdefault("google_bigquery_table", {})[tbl_name] = body
 
-    # Table-level IAM replaces the suppressed dataset ACL under shared mode:
+    # Table-level IAM replaces the dataset grants under shared mode:
     # the same principals, the same intent, the narrowest scope that still
     # grants it (RFC §Security — "GCP grants move to table level").
     if placement.dataset_referenced:
@@ -643,11 +957,38 @@ def _emit_bigquery(
 
     # Cross-project access needs no new schema fields: declare the consumer
     # in ``accessPolicy.grants[]`` as
-    # ``serviceAccount:consumer@other-project.iam.gserviceaccount.com`` and
-    # the email lands in BQ's ``user_by_email`` field on the dataset's
-    # ``access[]`` block. (``accessPolicy`` is the schema-valid surface;
-    # ``metadata.policies`` also emits but fails ``fluid validate`` — see
-    # ``iac/access.py``.)
+    # ``serviceAccount:consumer@other-project.iam.gserviceaccount.com`` (or map
+    # a logical principal to it in ``binding.principals``) and it becomes a
+    # ``google_bigquery_dataset_iam_member`` on the dataset. (``accessPolicy`` is
+    # the schema-valid surface; ``metadata.policies`` also emits but fails
+    # ``fluid validate`` — see ``iac/access.py``.)
+
+
+def _partition_table(
+    resources: Dict[str, Any],
+    body: Dict[str, Any],
+    tbl_name: str,
+    retention: _gov.BqRetention,
+) -> None:
+    """Daily partitions expiring ``retention`` after their day, and the replace trigger.
+
+    Partition expiration, not ``expiration_time``: a table TTL would delete the
+    product. See ``gcp_governance.partition_trigger_input`` for why the table's
+    replacement is triggered by a ``terraform_data`` (the OpenTofu documentation's
+    ``replace_triggered_by`` pattern for a plain value).
+    """
+    partitioning: Dict[str, Any] = {
+        "type": _gov.PARTITION_TYPE,
+        "expiration_ms": retention.expiration_ms,
+    }
+    if retention.field:
+        partitioning["field"] = retention.field
+    body["time_partitioning"] = partitioning
+    trigger = safe_ident(f"{tbl_name}_partitioning")
+    resources.setdefault("terraform_data", {})[trigger] = {
+        "input": _gov.partition_trigger_input(retention)
+    }
+    body["lifecycle"] = {"replace_triggered_by": [f"terraform_data.{trigger}"]}
 
 
 #: ``binding.format`` values marking an Iceberg-table expose. Matches the
