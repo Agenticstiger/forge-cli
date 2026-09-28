@@ -603,19 +603,33 @@ def _retention_kms_contract(kms, bucket_policy):
         ("product", "cross-account"),
         ("product", "all-grantees"),
         ("alias/platform/lake", None),
+        ("alias/platform/lake", "cross-account"),
     ],
-    ids=["product", "product-lf-cross-account", "product-lf-all-grantees", "existing-key"],
+    ids=[
+        "product",
+        "product-lf-cross-account",
+        "product-lf-all-grantees",
+        "existing-key",
+        "existing-key-lf",
+    ],
 )
 def test_retention_and_kms_pass_tofu_validate(kms, bucket_policy, tmp_path):
     """The lifecycle configuration, the KMS key + alias, the bucket's default
     SSE-KMS and the key policy's ``aws_iam_policy_document`` (static
-    statements beside a ``dynamic`` one) are accepted by real ``tofu``."""
+    statements beside a ``dynamic`` one) are accepted by real ``tofu``; for an
+    existing key, the ``data.aws_kms_key`` lookup and the preconditions on its
+    attributes too."""
     module = build_module(IAC_PLUGINS["aws"], _retention_kms_contract(kms, bucket_policy))
     # A module without the resources would validate too, and prove nothing.
-    resources = json.loads(module)["resource"]
+    document = json.loads(module)
+    resources = document["resource"]
     assert "aws_s3_bucket_lifecycle_configuration" in resources
     assert "aws_s3_bucket_server_side_encryption_configuration" in resources
     assert ("aws_kms_key" in resources) == (kms == "product")
+    [sse] = resources["aws_s3_bucket_server_side_encryption_configuration"].values()
+    preconditions = (sse.get("lifecycle") or {}).get("precondition") or []
+    assert len(preconditions) == (0 if kms == "product" else 3 if bucket_policy else 2)
+    assert ("aws_kms_key" in document.get("data", {})) == (kms != "product")
     _assert_tofu_validates(tmp_path, module)
 
 

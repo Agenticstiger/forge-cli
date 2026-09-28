@@ -448,13 +448,56 @@ class TestExistingKey:
             "arn:aws:kms:eu-north-1:111111111111:alias/platform/lake",
         ],
     )
-    def test_the_named_key_becomes_the_default_and_no_key_is_created(self, kms):
+    def test_the_named_key_becomes_the_default_by_its_arn_and_no_key_is_created(self, kms):
         resources, data = _emit(_contract(_expose(expire=None, encryption={"kms": kms})))
         assert "aws_kms_key" not in resources and "aws_kms_alias" not in resources
+        # Looked up at plan time, as written; S3 is handed the key ARN, which
+        # AWS recommends: an alias resolves in the account of whoever writes.
+        assert data["aws_kms_key"] == {KEY: {"key_id": kms}}
         sse = resources["aws_s3_bucket_server_side_encryption_configuration"][BUCKET_KEY]
         default = sse["rule"][0]["apply_server_side_encryption_by_default"][0]
-        assert default == {"sse_algorithm": "aws:kms", "kms_master_key_id": kms}
+        assert default == {
+            "sse_algorithm": "aws:kms",
+            "kms_master_key_id": f"${{data.aws_kms_key.{KEY}.arn}}",
+        }
         assert "aws_iam_policy_document" not in data
+
+    @staticmethod
+    def _preconditions(resources: Dict[str, Any]) -> Dict[str, str]:
+        sse = resources["aws_s3_bucket_server_side_encryption_configuration"][BUCKET_KEY]
+        return {p["condition"]: p["error_message"] for p in sse["lifecycle"]["precondition"]}
+
+    def test_the_key_must_be_enabled_and_symmetric(self):
+        resources, _ = _emit(
+            _contract(_expose(expire=None, encryption={"kms": "alias/platform/lake"}))
+        )
+        checks = self._preconditions(resources)
+        assert list(checks) == [
+            f'${{data.aws_kms_key.{KEY}.key_state == "Enabled"}}',
+            f'${{data.aws_kms_key.{KEY}.customer_master_key_spec == "SYMMETRIC_DEFAULT"}}',
+        ]
+        enabled = checks[f'${{data.aws_kms_key.{KEY}.key_state == "Enabled"}}']
+        assert "alias/platform/lake" in enabled and "kms:CancelKeyDeletion" in enabled
+
+    def test_with_lake_formation_the_key_must_be_customer_managed(self):
+        # The AWS managed key named by its key ARN passes the name check; the
+        # plan-time lookup sees what the key is.
+        aws_managed = "arn:aws:kms:eu-north-1:111111111111:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+        contract = _contract(
+            _expose(expire=None, encryption={"kms": aws_managed}, lake_formation=_grants(OTHER))
+        )
+        resources, data = _emit(contract)
+        checks = self._preconditions(resources)
+        manager = f'${{data.aws_kms_key.{KEY}.key_manager == "CUSTOMER"}}'
+        assert manager in checks
+        assert "AWS managed key" in checks[manager] and "Lake Formation" in checks[manager]
+        assert data["aws_kms_key"] == {KEY: {"key_id": aws_managed}}
+
+    def test_a_product_key_is_not_looked_up(self):
+        resources, data = _emit(_contract(_expose(expire=None, encryption={})))
+        assert "aws_kms_key" not in data
+        sse = resources["aws_s3_bucket_server_side_encryption_configuration"][BUCKET_KEY]
+        assert "lifecycle" not in sse
 
     def test_the_aws_managed_key_is_refused_with_lake_formation(self):
         contract = _contract(
@@ -498,8 +541,66 @@ class TestEncryptionOnASharedPool:
         contract = _contract(
             _expose(expire=None, encryption={"kms": "alias/pool/lake"}), packaging=self.POOL
         )
-        resources, _ = _emit(contract)
+        resources, data = _emit(contract)
         assert "aws_s3_bucket_server_side_encryption_configuration" not in resources
+        assert "aws_kms_key" not in data
+
+
+# ---------------------------------------------------------------------------
+# Brownfield: an adopted bucket's configurations are adopted with it
+# ---------------------------------------------------------------------------
+
+
+class TestBrownfieldImports:
+    LIFECYCLE = f"aws_s3_bucket_lifecycle_configuration.{BUCKET_KEY}"
+    SSE = f"aws_s3_bucket_server_side_encryption_configuration.{BUCKET_KEY}"
+
+    @staticmethod
+    def _imports(contract: Dict[str, Any]) -> Dict[str, str]:
+        return {b.to: b.id for b in AwsIacPlugin().discover_imports(contract)}
+
+    @pytest.fixture(autouse=True)
+    def _no_catalog_lookup(self, monkeypatch):
+        # discover_imports asks STS for the Glue catalog id otherwise.
+        monkeypatch.setenv("AWS_ACCOUNT_ID", "111111111111")
+
+    def test_the_lifecycle_and_encryption_are_imported_with_the_bucket(self):
+        imports = self._imports(_contract(_expose(encryption={})))
+        # By the bucket name, as the bucket itself is.
+        assert imports[f"aws_s3_bucket.{BUCKET_KEY}"] == "acme-lake"
+        assert imports[self.LIFECYCLE] == "acme-lake"
+        assert imports[self.SSE] == "acme-lake"
+
+    def test_every_import_is_a_resource_the_emit_writes(self):
+        contract = _contract(_expose(encryption={"kms": "alias/platform/lake"}))
+        resources, _ = _emit(contract)
+        emitted = {f"{kind}.{name}" for kind, named in resources.items() for name in named}
+        assert set(self._imports(contract)) <= emitted
+
+    @pytest.mark.parametrize(
+        "exposure, lifecycle, sse",
+        [
+            pytest.param(_expose(expire=None), False, False, id="neither"),
+            pytest.param(_expose(), True, False, id="retention-only"),
+            pytest.param(_expose(expire=None, encryption={}), False, True, id="encryption-only"),
+            pytest.param(
+                _expose(expire=None, encryption={"kms": "none"}), False, False, id="kms-none"
+            ),
+        ],
+    )
+    def test_only_what_the_emit_writes_is_imported(self, exposure, lifecycle, sse):
+        imports = self._imports(_contract(exposure))
+        assert (self.LIFECYCLE in imports) is lifecycle
+        assert (self.SSE in imports) is sse
+
+    def test_a_shared_pools_configurations_are_never_imported(self):
+        # They are the pool owner's: importing them would re-own them.
+        contract = _contract(
+            _expose(encryption={"kms": "alias/pool/lake"}),
+            packaging={"mode": "shared", "pool": "acme-pool"},
+        )
+        imports = self._imports(contract)
+        assert not any("lifecycle" in a or "encryption" in a for a in imports)
 
 
 # ---------------------------------------------------------------------------
@@ -518,14 +619,18 @@ class TestContractTextStaysInert:
         assert "${file(" not in live
         assert '$${file(\\"/etc/hosts\\")}' in rendered
 
-    def test_every_interpolation_is_one_the_emitter_built(self):
+    @pytest.mark.parametrize("kms", ["product", "alias/platform/lake"])
+    def test_every_interpolation_is_one_the_emitter_built(self, kms):
         rendered = build_module(
-            AwsIacPlugin(), _contract(_expose(encryption={}, lake_formation=_grants(OTHER)))
+            AwsIacPlugin(),
+            _contract(_expose(encryption={"kms": kms}, lake_formation=_grants(OTHER))),
         )
         live = re.findall(r"(?<!\$)\$\{([^}]*)\}", rendered.replace("$${", ""))
         allowed = re.compile(
             r"^(data\.)?aws_[a-z_0-9]+\.[A-Za-z0-9_]+\.[a-z_]+$|^statement\.(key|value)$"
             r"|^length\(|^\{for i, g in "
+            # The existing key's preconditions: an attribute against a constant.
+            r'|^data\.aws_kms_key\.[A-Za-z0-9_]+\.[a-z_]+ == \\"[A-Za-z_]+\\"$'
         )
         assert live and all(allowed.match(expr) for expr in live), live
 

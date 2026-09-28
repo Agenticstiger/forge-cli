@@ -23,11 +23,16 @@ region:
   prefix covering the binding's prefix, and the earliest ``Expiration.Days``
   among them (S3 applies the earliest), must equal the contract's period in
   days. No such rule, or another number of days, fails. A rule filtered by tag
-  or object size covers only some objects and is not counted.
+  or object size, or scoped to a narrower prefix inside the binding's, covers
+  only some objects and cannot apply the retention; one that expires them
+  sooner than the period cuts it short for those objects, and fails too.
 * ``encryption`` — ``binding.encryption.kms``. The key is resolved with
   ``kms:DescribeKey`` (the product key by its alias, an alias or ARN as
-  written), then every object under the prefix, up to
-  :data:`MAX_OBJECTS_CHECKED`, must answer ``s3:HeadObject`` with
+  written) and must be ``Enabled``: S3 can neither write nor read an SSE-KMS
+  object under a disabled key or one pending deletion, and a key pending
+  deletion is brought back with ``kms:CancelKeyDeletion``, never by a
+  re-apply, which would create a new key. Then every object under the prefix,
+  up to :data:`MAX_OBJECTS_CHECKED`, must answer ``s3:HeadObject`` with
   ``ServerSideEncryption: aws:kms`` and that key's ARN. An object with SSE-S3 or
   another key fails, and names the object.
 
@@ -80,25 +85,64 @@ def _why(exc: BaseException) -> str:
     return _error_code(exc) or type(exc).__name__
 
 
-def _rule_prefix(rule: Mapping[str, Any]) -> Optional[str]:
-    """The prefix a rule applies to, or ``None`` when it applies to only some objects there.
+def _rule_scope(rule: Mapping[str, Any]) -> Optional[Tuple[str, bool]]:
+    """``(prefix, every object)``: the prefix a rule applies under, and whether to all of it.
 
-    ``Filter: {}`` and a missing filter are the whole bucket (``""``); a rule
-    whose filter also names tags or object sizes covers a subset and is not
-    counted as applying the retention to the prefix.
+    ``Filter: {}`` and a missing filter are the whole bucket (``""``). A filter
+    that also names tags or object sizes (``Tag``, ``ObjectSizeGreaterThan``,
+    ``ObjectSizeLessThan``, or those inside ``And``) applies to only some of the
+    objects under its prefix: ``False``. ``None`` for a filter this cannot read.
     """
     if "Filter" not in rule:
-        return str(rule.get("Prefix") or "")
+        return str(rule.get("Prefix") or ""), True
     rule_filter = rule.get("Filter") or {}
     if not isinstance(rule_filter, Mapping):
         return None
-    if set(rule_filter) <= {"Prefix"}:
-        return str(rule_filter.get("Prefix") or "")
-    conjunction = rule_filter.get("And")
-    if set(rule_filter) == {"And"} and isinstance(conjunction, Mapping):
-        if set(conjunction) <= {"Prefix"}:
-            return str(conjunction.get("Prefix") or "")
-    return None
+    conditions = rule_filter.get("And") if "And" in rule_filter else rule_filter
+    if not isinstance(conditions, Mapping):
+        return None
+    every = set(rule_filter) <= {"Prefix", "And"} and set(conditions) <= {"Prefix"}
+    return str(conditions.get("Prefix") or ""), every
+
+
+@dataclass(frozen=True)
+class _Rule:
+    """An enabled lifecycle rule that expires objects after a number of days."""
+
+    id: str
+    prefix: str
+    days: int
+    #: Whether it applies to every object under ``prefix`` (no tag or size filter).
+    every: bool
+
+    def describe(self) -> Dict[str, Any]:
+        return {"id": self.id, "prefix": self.prefix, "days": self.days, "every": self.every}
+
+
+def _expiring_rules(rules: List[Mapping[str, Any]]) -> List[_Rule]:
+    found: List[_Rule] = []
+    for rule in rules:
+        if rule.get("Status") != "Enabled":
+            continue
+        scope = _rule_scope(rule)
+        days = (rule.get("Expiration") or {}).get("Days")
+        if scope is None or days is None:
+            continue
+        found.append(_Rule(str(rule.get("ID") or ""), scope[0], int(days), scope[1]))
+    return found
+
+
+def _sooner(rule: _Rule, prefix: str, days: int) -> bool:
+    """Whether ``rule`` deletes some objects under ``prefix`` before ``days``.
+
+    S3 applies every enabled rule whose filter matches an object, and the
+    earliest expiration wins. A rule filtered by tag or size on the prefix, or
+    on a narrower prefix inside it, cannot apply the retention (it misses the
+    other objects) but can still cut it short for the objects it does match.
+    """
+    reaches = prefix.startswith(rule.prefix) or rule.prefix.startswith(prefix)
+    covers_all = rule.every and prefix.startswith(rule.prefix)
+    return reaches and not covers_all and rule.days < days
 
 
 def _retention_dimension(s3: Any, bucket: str, retention: Any) -> Dict[str, Any]:
@@ -114,48 +158,57 @@ def _retention_dimension(s3: Any, bucket: str, retention: Any) -> Dict[str, Any]
                 "message": f"Could not read the lifecycle configuration of {bucket}: {_why(exc)}",
             }
         rules = []
-    covering: List[Tuple[str, str, int]] = []
-    for rule in rules:
-        if rule.get("Status") != "Enabled":
-            continue
-        prefix = _rule_prefix(rule)
-        days = (rule.get("Expiration") or {}).get("Days")
-        if prefix is None or days is None or not retention.prefix.startswith(prefix):
-            continue
-        covering.append((str(rule.get("ID") or ""), prefix, int(days)))
-    if not covering:
-        return {
-            "status": "fail",
-            "expected": expected,
-            "actual": {"rules": []},
-            "message": (
-                f"No enabled lifecycle rule expires the objects under {target}; the contract "
-                f"keeps them {retention.period} ({retention.days} day(s)) and then expires them"
-            ),
-        }
-    rule_id, prefix, days = min(covering, key=lambda c: c[2])
-    actual = {
-        "days": days,
-        "rule": rule_id,
-        "rule_prefix": prefix,
-        "rules": [{"id": i, "prefix": p, "days": d} for i, p, d in covering],
+    expiring = _expiring_rules(rules)
+    # The rules that apply the retention: every object under the prefix.
+    covering = [r for r in expiring if r.every and retention.prefix.startswith(r.prefix)]
+    # The rules that cut it short for some of those objects.
+    sooner = [r for r in expiring if _sooner(r, retention.prefix, retention.days)]
+    problems: List[str] = []
+    actual: Dict[str, Any] = {
+        "rules": [r.describe() for r in covering],
+        "sooner": [r.describe() for r in sooner],
     }
-    if days != retention.days:
-        return {
+    if not covering:
+        problems.append(
+            f"No enabled lifecycle rule expires the objects under {target}; the contract "
+            f"keeps them {retention.period} ({retention.days} day(s)) and then expires them"
+        )
+    else:
+        applied = min(covering, key=lambda r: r.days)
+        actual.update(days=applied.days, rule=applied.id, rule_prefix=applied.prefix)
+        if applied.days != retention.days:
+            problems.append(
+                f"The objects under {target} expire after {applied.days} day(s) (lifecycle rule "
+                f"{applied.id or 'without an ID'} on {applied.prefix or 'the whole bucket'!r}); "
+                f"the contract says {retention.period} ({retention.days} day(s))"
+            )
+    for rule in sooner:
+        # One prefix contains the other; the objects both reach are under the longer.
+        reached = f"s3://{bucket}/{max(rule.prefix, retention.prefix, key=len)}"
+        which = reached if rule.every else f"{reached} that match its tag or object-size filter"
+        problems.append(
+            f"Lifecycle rule {rule.id or 'without an ID'} expires the objects under {which} "
+            f"after {rule.days} day(s), sooner than the contract's {retention.period} "
+            f"({retention.days} day(s))"
+        )
+    if problems:
+        failed: Dict[str, Any] = {
             "status": "fail",
             "expected": expected,
             "actual": actual,
-            "message": (
-                f"The objects under {target} expire after {days} day(s) (lifecycle rule "
-                f"{rule_id or 'without an ID'} on {prefix or 'the whole bucket'!r}); the "
-                f"contract says {retention.period} ({retention.days} day(s))"
-            ),
+            "message": "; ".join(problems),
         }
+        if sooner:
+            failed["reason"] = "sooner-rule"
+        return failed
     return {
         "status": "pass",
         "expected": expected,
         "actual": actual,
-        "message": f"The objects under {target} expire after {days} day(s) (rule {rule_id})",
+        "message": (
+            f"The objects under {target} expire after {actual['days']} day(s) "
+            f"(rule {actual['rule']})"
+        ),
     }
 
 
@@ -201,13 +254,58 @@ def _objects_not_under(s3: Any, bucket: str, keys: List[str], key_arn: str) -> L
     return wrong
 
 
+def _key_state_dimension(
+    key_ref: str, metadata: Mapping[str, Any], expected: Mapping[str, Any], target: str
+) -> Optional[Dict[str, Any]]:
+    """The failure for a key S3 cannot use, or ``None`` when its state is ``Enabled``.
+
+    A key that exists is not a key that works: S3 refuses every write and read
+    of an SSE-KMS object whose key is disabled or pending deletion, and once a
+    key pending deletion is deleted its objects can never be read again. The
+    ``reason`` picks the remedy (``_verify_athena._STORAGE_ACTIONS``): a key
+    pending deletion must be brought back with ``kms:CancelKeyDeletion``, since
+    re-applying would create a new key and leave the objects under this one.
+    """
+    state = str(metadata.get("KeyState") or "")
+    if state == "Enabled":
+        return None
+    arn = str(metadata.get("Arn") or key_ref)
+    reason = _KEY_STATE_REASONS.get(state, "key-not-enabled")
+    when = metadata.get("DeletionDate")
+    deleted_on = (
+        f", and is deleted on {when.isoformat() if hasattr(when, 'isoformat') else when}"
+        if when and reason == "key-pending-deletion"
+        else ""
+    )
+    return {
+        "status": "fail",
+        "reason": reason,
+        "expected": {**expected, "kms_key_arn": arn, "key_state": "Enabled"},
+        "actual": {"key_state": state or None, "deletion_date": str(when) if when else None},
+        "message": (
+            f"The KMS key {key_ref} ({arn}) is {state or 'in no reported state'}, not Enabled"
+            f"{deleted_on}: S3 cannot encrypt new objects under {target} with it, "
+            "nor decrypt the ones it already encrypted"
+        ),
+    }
+
+
+#: ``KeyState`` values with a remedy of their own (``_verify_athena._STORAGE_ACTIONS``).
+_KEY_STATE_REASONS = {
+    "PendingDeletion": "key-pending-deletion",
+    "PendingReplicaDeletion": "key-pending-deletion",
+    "Disabled": "key-disabled",
+}
+
+
 def _encryption_dimension(
     s3: Any, kms: Any, bucket: str, prefix: str, key_ref: str
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     target = f"s3://{bucket}/{prefix}"
     expected: Dict[str, Any] = {"sse": "aws:kms", "kms_key": key_ref}
     try:
-        key_arn = str(kms.describe_key(KeyId=key_ref)["KeyMetadata"]["Arn"])
+        metadata = kms.describe_key(KeyId=key_ref)["KeyMetadata"]
+        key_arn = str(metadata["Arn"])
     except Exception as exc:  # noqa: BLE001 — every AWS failure is reported, not raised
         if _error_code(exc) == "NotFoundException":
             return {
@@ -220,6 +318,11 @@ def _encryption_dimension(
             "expected": expected,
             "message": f"Could not resolve the KMS key {key_ref}: {_why(exc)}",
         }, None
+    unusable = _key_state_dimension(key_ref, metadata, expected, target)
+    if unusable is not None:
+        # Nothing Athena could write under this key either, so it is not
+        # offered for the result.
+        return unusable, None
     expected["kms_key_arn"] = key_arn
     try:
         keys, more = _list_keys(s3, bucket, prefix)

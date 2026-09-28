@@ -62,7 +62,9 @@ _KMS_ARN_RE = re.compile(
 #: a location encrypted with an AWS managed key ("you can't use the Lake
 #: Formation service-linked role. You must use a custom role", LF developer
 #: guide, *Registering an encrypted Amazon S3 location*), and forge-cli
-#: registers with the service-linked role.
+#: registers with the service-linked role. A name check only: the same key
+#: named by its key ARN is caught at plan time, by a precondition on the
+#: looked-up key's ``key_manager`` (``aws._existing_key_preconditions``).
 AWS_MANAGED_S3_ALIASES = frozenset({"alias/aws/s3"})
 
 #: A product key is scheduled for deletion this many days after ``tofu

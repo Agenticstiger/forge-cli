@@ -1207,9 +1207,7 @@ def _severity(
     masking_problem = severity_problem(dimensions.get("masking"))
     if masking_problem is not None:
         problems.append(masking_problem)
-    for name, action in _STORAGE_ACTIONS.items():
-        if (dimensions.get(name) or {}).get("status") == "fail":
-            problems.append((dimensions[name]["message"], action))
+    problems.extend(_storage_problems(dimensions))
     if not problems:
         if dimensions["row_count"]["status"] == "info" and severity["level"] == "SUCCESS":
             return {
@@ -1232,20 +1230,67 @@ def _severity(
     }
 
 
-#: What to do about a failed storage dimension (see ``_verify_storage_policy.py``).
+#: What to do about a failed storage dimension (see ``_verify_storage_policy.py``),
+#: by dimension, or by ``<dimension>:<reason>`` when the failure names a reason.
 _STORAGE_ACTIONS = {
     "retention": (
         "Re-apply so the bucket's lifecycle rule matches lifecycle.retention, or, on a "
         "shared bucket, ask its owner for the rule"
     ),
+    "retention:sooner-rule": (
+        "Remove or narrow the lifecycle rule that expires objects under the prefix sooner "
+        "than lifecycle.retention (on a bucket this product owns, a re-apply replaces the "
+        "whole lifecycle configuration, that rule included); on a shared bucket, ask its "
+        "owner"
+    ),
     "encryption": (
         "Re-apply so the bucket's default encryption is the declared key, then rewrite "
         "the objects written before it (S3 does not re-encrypt existing objects)"
     ),
+    # A re-apply is the wrong remedy for a key pending deletion: it creates a
+    # new key and leaves every object under the dying one, unreadable for good
+    # once the deletion date passes.
+    "encryption:key-pending-deletion": (
+        "Cancel the key's scheduled deletion before its deletion date "
+        "(kms:CancelKeyDeletion, e.g. aws kms cancel-key-deletion --key-id <key ARN>), "
+        "then enable it again (kms:EnableKey); do not re-apply, which would create a new "
+        "key and strand the objects already encrypted under this one"
+    ),
+    "encryption:key-disabled": (
+        "Enable the key again (kms:EnableKey, e.g. aws kms enable-key --key-id <key ARN>)"
+    ),
+    "encryption:key-not-enabled": (
+        "Bring the key back to the Enabled state (see its KeyState in kms:DescribeKey and "
+        "the KMS key states table); until then S3 can neither write nor read its objects"
+    ),
 }
 
 
+def _storage_problems(dimensions: Mapping[str, Any]) -> List[Tuple[str, str]]:
+    """``(message, action)`` for every failed storage dimension."""
+    problems: List[Tuple[str, str]] = []
+    for name in ("retention", "encryption"):
+        dimension = dimensions.get(name) or {}
+        if dimension.get("status") != "fail":
+            continue
+        reason = dimension.get("reason")
+        action = _STORAGE_ACTIONS.get(f"{name}:{reason}") or _STORAGE_ACTIONS[name]
+        problems.append((str(dimension["message"]), action))
+    return problems
+
+
 # ── Entry point ─────────────────────────────────────────────────────────
+
+
+def _with_storage_failures(message: str, dimensions: Mapping[str, Any]) -> str:
+    """``message``, plus each failed storage dimension and what to do about it.
+
+    An error prints its message and nothing else, and a failed storage check is
+    often why the query failed: a bucket whose default key is disabled or
+    pending deletion refuses the result Athena writes under it.
+    """
+    problems = _storage_problems(dimensions)
+    return "; ".join([message, *(f"{what}. {action}" for what, action in problems)])
 
 
 def _error(message: str, *, target: str, exists: Optional[bool], **extra: Any) -> Dict[str, Any]:
@@ -1353,10 +1398,15 @@ def verify_athena_expose(
             results_kms_key=storage.kms_key_arn,
         )
     except AthenaVerifyError as exc:
-        return _error(str(exc), target=target, exists=True, dimensions=dimensions)
+        return _error(
+            _with_storage_failures(str(exc), dimensions),
+            target=target,
+            exists=True,
+            dimensions=dimensions,
+        )
     except Exception as exc:  # noqa: BLE001 — every AWS failure is reported, not raised
         return _error(
-            f"Athena could not count {table_id}: {exc}",
+            _with_storage_failures(f"Athena could not count {table_id}: {exc}", dimensions),
             target=target,
             exists=True,
             dimensions=dimensions,
@@ -1401,5 +1451,5 @@ def verify_athena_expose(
         # A declared policy that could not be checked is unproven, not passed:
         # an error, which fails verify with or without --strict.
         result["status"] = "error"
-        result["error"] = "; ".join(storage.errors)
+        result["error"] = _with_storage_failures("; ".join(storage.errors), dimensions)
     return result

@@ -449,8 +449,10 @@ class AwsIacPlugin:
         # A ``cross-account`` LF bucket policy filters its grantees at plan
         # time against that same caller identity.
         _emit_lf_bucket_policy_data(data, contract, cid)
-        # The key policy of each product KMS key.
+        # The key policy of each product KMS key, and the lookup of each
+        # existing key a binding names.
         _emit_product_key_policy_data(data, storage)
+        _emit_existing_key_data(data, storage)
         return data
 
     def credential_env(self, env: Mapping[str, str]) -> Dict[str, str]:
@@ -475,6 +477,9 @@ class AwsIacPlugin:
             (catalog_id = AWS account id; required by the provider)
           * ``aws_glue_catalog_table`` — ``{catalog_id}:{database}:{name}``
           * ``aws_s3_bucket`` — bucket name
+          * ``aws_s3_bucket_lifecycle_configuration`` and
+            ``aws_s3_bucket_server_side_encryption_configuration`` — bucket
+            name, when the emit writes them (retention, encryption at rest)
           * ``aws_kinesis_stream`` — stream name
           * ``aws_redshiftserverless_namespace`` — namespace name
 
@@ -557,6 +562,23 @@ class AwsIacPlugin:
             if namespace:
                 ns_key = safe_ident(f"{cid}_{namespace}")
                 _add(f"aws_redshiftserverless_namespace.{ns_key}", namespace)
+
+        # The bucket's lifecycle and default-encryption configurations, for
+        # exactly the owned buckets the emit writes them on. Each is one
+        # authoritative object per bucket: without the import an adopted
+        # bucket's plan shows ``+ create`` while S3 silently replaces the
+        # operator's lifecycle rules and default key; imported, the plan shows
+        # the in-place change. Provider id is the bucket name for both. A
+        # bucket with no lifecycle configuration fails its import, which
+        # ``_adopt_existing`` tolerates; every bucket has a default encryption.
+        for state in _storage_by_bucket(contract, cid).values():
+            if state.rules:
+                _add(f"aws_s3_bucket_lifecycle_configuration.{state.bucket_key}", state.bucket)
+            if state.kms is not None:
+                _add(
+                    f"aws_s3_bucket_server_side_encryption_configuration.{state.bucket_key}",
+                    state.bucket,
+                )
 
         return blocks
 
@@ -2018,7 +2040,9 @@ def _emit_lakeformation(
 #   * ``binding.encryption.kms`` → the bucket's
 #     ``aws_s3_bucket_server_side_encryption_configuration`` (SSE-KMS with an S3
 #     Bucket Key), plus, for ``product``, an ``aws_kms_key`` and
-#     ``aws_kms_alias`` and the key policy's ``aws_iam_policy_document``.
+#     ``aws_kms_alias`` and the key policy's ``aws_iam_policy_document``; for an
+#     existing key, a ``data.aws_kms_key`` whose ARN S3 is given and whose
+#     manager, state and spec the configuration's preconditions check.
 #
 # Both S3 resources are AUTHORITATIVE for the whole bucket ("S3 Buckets only
 # support a single lifecycle configuration", terraform-provider-aws; the same
@@ -2029,6 +2053,11 @@ def _emit_lakeformation(
 # checks them against the contract. The resource shapes follow
 # cloudposse/terraform-aws-s3-bucket (``lifecycle.tf``) and
 # terraform-aws-modules/terraform-aws-kms (the ``Default`` key-policy statement).
+#
+# On a bucket this product adopts (brownfield), both are imported with it
+# (:meth:`AwsIacPlugin.discover_imports`), so the plan shows the operator's
+# rules and default encryption being changed in place rather than a create
+# that silently replaces them.
 
 
 @dataclass
@@ -2230,7 +2259,13 @@ def _check_retention_overlaps(state: _BucketStorage) -> None:
 
 
 def _check_key_usable_by_lakeformation(state: _BucketStorage) -> None:
-    """An AWS managed key cannot be used by the service-linked role forge-cli registers with."""
+    """An AWS managed key cannot be used by the service-linked role forge-cli registers with.
+
+    The early refusal, by name, before any plan. It cannot see the AWS managed
+    key named by its key ARN; the plan-time precondition on
+    ``data.aws_kms_key``'s ``key_manager`` does
+    (:func:`_existing_key_preconditions`).
+    """
     if state.kms is None or state.product_key or not state.registers_location:
         return
     name = state.kms.split(":", 5)[5] if state.kms.startswith("arn:") else state.kms
@@ -2323,11 +2358,13 @@ def _emit_bucket_encryption(
         }
         kms_key = tofu_ref(f"aws_kms_key.{key_res}.arn")
     else:
-        # An existing key named by the contract: a plain, escaped string.
-        kms_key = state.kms
-    resources.setdefault("aws_s3_bucket_server_side_encryption_configuration", {})[
-        state.bucket_key
-    ] = {
+        # An existing key named by the contract, looked up at plan time
+        # (:func:`_emit_existing_key_data`) and handed to S3 by its key ARN:
+        # AWS recommends the full ARN, because S3 resolves an alias or a bare
+        # key id in the account of whoever writes the object, which for a
+        # writer in another account is not the key the contract named.
+        kms_key = tofu_ref(f"data.aws_kms_key.{state.key_res}.arn")
+    sse: Dict[str, Any] = {
         "bucket": bucket_ref,
         "rule": [
             {
@@ -2340,6 +2377,63 @@ def _emit_bucket_encryption(
             }
         ],
     }
+    if not state.product_key:
+        sse["lifecycle"] = {"precondition": _existing_key_preconditions(state)}
+    resources.setdefault("aws_s3_bucket_server_side_encryption_configuration", {})[
+        state.bucket_key
+    ] = sse
+
+
+def _existing_key_preconditions(state: _BucketStorage) -> List[Dict[str, Any]]:
+    """What the named key must be for S3, and Lake Formation, to use it; checked at plan.
+
+    The name check in :func:`_check_key_usable_by_lakeformation` refuses
+    ``alias/aws/s3`` early, but a name is not the key: the AWS managed key
+    named by its key ARN passes it. ``data.aws_kms_key`` reads what the key
+    is, so the plan fails, before anything is written, when:
+
+    * the location is registered with Lake Formation and the key is AWS
+      managed (``key_manager``): Lake Formation cannot use its service-linked
+      role on such a location (LF developer guide, *Registering an encrypted
+      Amazon S3 location*);
+    * the key is not ``Enabled``: S3 refuses every write and read under a key
+      that is disabled or pending deletion;
+    * the key is not a symmetric encryption key: S3 default encryption takes
+      only ``SYMMETRIC_DEFAULT`` keys.
+
+    The key named in the messages is contract text, validated by
+    ``aws_storage.encryption_for``, and stays a plain string the renderer
+    escapes; only the conditions, built here, are interpolated.
+    """
+    key = f"data.aws_kms_key.{state.key_res}"
+    named = f"The KMS key {state.kms} ({state.kms_from}, bucket {state.bucket})"
+    checks: List[Tuple[str, str]] = []
+    if state.registers_location:
+        checks.append(
+            (
+                f'{key}.key_manager == "CUSTOMER"',
+                f"{named} is an AWS managed key, and the location is registered with Lake "
+                "Formation, which cannot use its service-linked role on a location encrypted "
+                "with an AWS managed key. Use kms: product, or a customer managed key whose "
+                "policy lets AWSServiceRoleForLakeFormationDataAccess use it.",
+            )
+        )
+    checks.append(
+        (
+            f'{key}.key_state == "Enabled"',
+            f"{named} is not Enabled: S3 can neither write nor read objects under a key that "
+            "is disabled or pending deletion. Enable it (kms:EnableKey), or cancel its "
+            "scheduled deletion (kms:CancelKeyDeletion) and then enable it.",
+        )
+    )
+    checks.append(
+        (
+            f'{key}.customer_master_key_spec == "SYMMETRIC_DEFAULT"',
+            f"{named} is not a symmetric encryption key (SYMMETRIC_DEFAULT), the only kind "
+            "S3 default encryption accepts.",
+        )
+    )
+    return [{"condition": tofu_ref(cond), "error_message": message} for cond, message in checks]
 
 
 #: The Lake Formation service-linked role, the role forge-cli registers
@@ -2426,6 +2520,22 @@ def _emit_product_key_policy_data(data: Dict[str, Any], storage: Mapping[str, An
         if state.bucket_policy is not None:
             _add_bucket_policy_readers(document, state.bucket_policy)
         data.setdefault("aws_iam_policy_document", {})[f"{state.key_res}_policy"] = document
+
+
+def _emit_existing_key_data(data: Dict[str, Any], storage: Mapping[str, Any]) -> None:
+    """A ``data.aws_kms_key`` for each existing key a bucket's default encryption names.
+
+    Read at plan time with ``kms:DescribeKey``, which the applying principal
+    therefore needs on that key. Its ``arn`` is what S3 is given
+    (:func:`_emit_bucket_encryption`) and its ``key_manager``, ``key_state``
+    and ``customer_master_key_spec`` are what the preconditions check
+    (:func:`_existing_key_preconditions`). ``key_id`` is contract text, a plain
+    string the renderer escapes.
+    """
+    for state in storage.values():
+        if state.kms is None or state.product_key:
+            continue
+        data.setdefault("aws_kms_key", {})[state.key_res] = {"key_id": state.kms}
 
 
 def _add_bucket_policy_readers(document: Dict[str, Any], bp: _LfBucketPolicy) -> None:

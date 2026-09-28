@@ -28,13 +28,18 @@ region:
 | It serves what the build landed | the count against the run records of the acquisition build that writes the expose (see below) | CRITICAL |
 | It is not empty | a count of 0, with or without a run record | CRITICAL; in a reference-only contract with no run of its own to compare with, INFO (see below) |
 | Masked columns landed treated | for an expose with `policy.privacy.masking`, the same query counts each masked column's non-null values that lack their strategy's shape (`count_if(... NOT regexp_like(..., '\A(?:<shape>)\z'))`): 64 lowercase hex for `hash`, 32 for `tokenize`, `aesgcm:v1:` and base64url for `encrypt`, the kept characters around `*` for `mask` | one such value: CRITICAL. Only counts leave the query, never a value. A masked column the Glue table lacks, and `k_anonymity` (refused at landing, no per-value shape), fail too |
-| The bucket expires the data on the contract's schedule (only with `exposes[].lifecycle {retention, expire: true}`) | `s3:GetLifecycleConfiguration`: the enabled rules whose filter is a plain prefix covering the binding's prefix; the earliest `Expiration.Days` among them, which is what S3 applies, against `retention` in days | no such rule, or another number of days: CRITICAL; the configuration cannot be read: error |
-| The objects are encrypted with the declared key (only with `binding.encryption`, `kms` other than `none`) | the key resolved with `kms:DescribeKey` (the product key by its alias `alias/fluid/<contract id>/<bucket>`, an alias or ARN as written), then `s3:HeadObject` on every object under the prefix, up to 1000 | an object that is not `aws:kms` with that key, or a key that does not exist: CRITICAL, naming the objects; no object yet: INFO; a call that fails: error |
+| The bucket expires the data on the contract's schedule (only with `exposes[].lifecycle {retention, expire: true}`) | `s3:GetLifecycleConfiguration`: the enabled rules whose filter is a plain prefix covering the binding's prefix; the earliest `Expiration.Days` among them, which is what S3 applies, against `retention` in days. Also every enabled rule that reaches only some of those objects (a `Tag`, `ObjectSizeGreaterThan` or `ObjectSizeLessThan` filter, alone or in `And`, or a narrower prefix inside the binding's) and expires them in fewer days | no such rule, or another number of days: CRITICAL; a rule that expires some objects sooner: CRITICAL, naming the rule, with its own remedy (remove or narrow it); the configuration cannot be read: error |
+| The objects are encrypted with the declared key (only with `binding.encryption`, `kms` other than `none`) | the key resolved with `kms:DescribeKey` (the product key by its alias `alias/fluid/<contract id>/<bucket>`, an alias or ARN as written), which must answer `KeyState: Enabled`, then `s3:HeadObject` on every object under the prefix, up to 1000 | a key that is disabled, pending deletion or in any other state: CRITICAL, with the remedy for that state (for `PendingDeletion`, `kms:CancelKeyDeletion` then `kms:EnableKey`: a re-apply would create a new key and strand the objects under this one); an object that is not `aws:kms` with that key, or a key that does not exist: CRITICAL, naming the objects; no object yet: INFO; a call that fails: error |
 
 CRITICAL fails `fluid verify --strict`; INFO fails only with `--fail-on-warning`.
-An error fails `fluid verify` with or without `--strict`. Glue columns declare
-no nullability, so the constraints dimension has nothing to compare and says so
-in the JSON report.
+An error fails `fluid verify` with or without `--strict`. When the count query
+fails, or a storage check could not run, the error also names each storage
+check that failed and its remedy: a bucket whose default key is disabled or
+pending deletion refuses the result Athena writes under it, so the key's state
+is usually why.
+
+Glue columns declare no nullability, so the constraints dimension has nothing
+to compare and says so in the JSON report.
 
 A reference-only contract (a `builds[].pattern` of `reference`,
 `hybrid-reference` or `external-reference`) leaves the rows to a pipeline

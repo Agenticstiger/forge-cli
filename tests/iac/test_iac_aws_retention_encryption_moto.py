@@ -85,14 +85,25 @@ _SKIP_REASON = "needs `tofu` on PATH + moto server extra (pip install 'moto[glue
 
 @pytest.fixture
 def moto_endpoint() -> Iterator[str]:
-    """A moto server per test: the apply test mutates what it serves."""
+    """A moto server per test: the apply test mutates what it serves.
+
+    The server runs in this process and moto's records are process-wide, so
+    they are reset first: a bucket or key another test left behind would
+    otherwise be there too.
+    """
+    import urllib.request
+
     from moto.server import ThreadedMotoServer
 
     server = ThreadedMotoServer(port=0, verbose=False)
     server.start()
     try:
         _, port = server.get_host_and_port()
-        yield f"http://127.0.0.1:{port}"
+        endpoint = f"http://127.0.0.1:{port}"
+        reset = urllib.request.Request(f"{endpoint}/moto-api/reset", method="POST")
+        with urllib.request.urlopen(reset, timeout=30) as answered:  # noqa: S310 — local moto
+            assert answered.status == 200
+        yield endpoint
     finally:
         server.stop()
 
@@ -132,6 +143,7 @@ def _contract(
     grantees: Optional[List[str]] = None,
     retention: bool = True,
     encryption: bool = True,
+    kms: str = "product",
 ) -> Dict[str, Any]:
     binding: Dict[str, Any] = {
         "platform": "aws",
@@ -145,7 +157,7 @@ def _contract(
         },
     }
     if encryption:
-        binding["encryption"] = {"kms": "product"}
+        binding["encryption"] = {"kms": kms}
     if grantees:
         binding["governance"] = {
             "lakeFormation": {
@@ -195,6 +207,17 @@ def _plan(workdir: Path, env: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
     """``tofu plan``; the planned changes by address."""
     done = _tofu(workdir, env, "plan", "-input=false", "-no-color", "-out=plan.bin")
     assert done.returncode == 0, f"tofu plan failed:\n{done.stdout}\n{done.stderr}"
+    return _shown(workdir, env)
+
+
+def _refused_plan(workdir: Path, env: Dict[str, str]) -> str:
+    """``tofu plan`` that must fail; its output, one line per message."""
+    done = _tofu(workdir, env, "plan", "-input=false", "-no-color")
+    assert done.returncode != 0, f"tofu plan should have failed:\n{done.stdout}"
+    return " ".join((done.stdout + done.stderr).split()).replace("│ ", "")
+
+
+def _shown(workdir: Path, env: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
     shown = _tofu(workdir, env, "show", "-json", "plan.bin")
     assert shown.returncode == 0, shown.stderr
     return {c["address"]: c for c in json.loads(shown.stdout)["resource_changes"]}
@@ -360,3 +383,151 @@ def test_apply_lands_objects_encrypted_and_verify_holds_the_bucket_to_the_contra
         )
         assert destroyed.returncode == 0, destroyed.stdout + destroyed.stderr
     assert bucket not in [b["Name"] for b in s3.list_buckets()["Buckets"]]
+
+
+# ---------------------------------------------------------------------------
+# An existing key: looked up at plan time, handed to S3 by its ARN
+# ---------------------------------------------------------------------------
+
+SSE = "aws_s3_bucket_server_side_encryption_configuration.retention_moto_retention_moto_lake"
+
+
+def _moto_kms_backend() -> Any:
+    """The moto server's own KMS records (it runs in this process), to set what
+    its API cannot."""
+    from moto.kms.models import kms_backends
+
+    return kms_backends[ACCOUNT][REGION]
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_an_existing_key_named_by_alias_reaches_s3_as_its_arn(tmp_path, moto_endpoint, tofu_env):
+    kms = _boto("kms", moto_endpoint)
+    key = kms.create_key(Description="the platform's lake key")["KeyMetadata"]
+    kms.create_alias(AliasName="alias/platform/lake", TargetKeyId=key["KeyId"])
+    _write(_contract(kms="alias/platform/lake"), tmp_path, moto_endpoint)
+    _init(tmp_path, tofu_env)
+
+    planned = _plan(tmp_path, tofu_env)
+
+    [rule] = planned[SSE]["change"]["after"]["rule"]
+    # The ARN, not the alias: S3 resolves an alias in the writer's account.
+    assert rule["apply_server_side_encryption_by_default"] == [
+        {"sse_algorithm": "aws:kms", "kms_master_key_id": key["Arn"]}
+    ]
+    assert not any(address.startswith("aws_kms_key.") for address in planned)
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_a_key_s3_cannot_use_fails_the_plan(tmp_path, moto_endpoint, tofu_env):
+    kms = _boto("kms", moto_endpoint)
+    pending = kms.create_key()["KeyMetadata"]
+    kms.schedule_key_deletion(KeyId=pending["KeyId"], PendingWindowInDays=7)
+    asymmetric = kms.create_key(KeySpec="RSA_2048", KeyUsage="ENCRYPT_DECRYPT")["KeyMetadata"]
+    _write(_contract(kms=pending["Arn"]), tmp_path, moto_endpoint)
+    _init(tmp_path, tofu_env)
+    for arn, refusal, remedy in (
+        (pending["Arn"], "is not Enabled", "kms:CancelKeyDeletion"),
+        (asymmetric["Arn"], "is not a symmetric encryption key (SYMMETRIC_DEFAULT)", "S3"),
+    ):
+        _write(_contract(kms=arn), tmp_path, moto_endpoint)
+
+        output = _refused_plan(tmp_path, tofu_env)
+
+        assert "Resource precondition failed" in output, output
+        named = f"The KMS key {arn} (exposes[orders], bucket retention-moto-lake) {refusal}"
+        assert named in output, output
+        assert remedy in output
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_the_aws_managed_key_named_by_its_arn_is_refused_with_lake_formation(
+    tmp_path, moto_endpoint, tofu_env
+):
+    # The name check refuses alias/aws/s3, but the same key named by its key
+    # ARN passes it; the plan-time lookup sees the key manager. moto records
+    # every key as customer managed, so its record of alias/aws/s3 is told the
+    # truth.
+    kms = _boto("kms", moto_endpoint)
+    managed = kms.describe_key(KeyId="alias/aws/s3")["KeyMetadata"]
+    _moto_kms_backend().keys[managed["KeyId"]].key_manager = "AWS"
+    assert kms.describe_key(KeyId=managed["Arn"])["KeyMetadata"]["KeyManager"] == "AWS"
+    _write(_contract(kms=managed["Arn"], grantees=[OTHER]), tmp_path, moto_endpoint)
+    _init(tmp_path, tofu_env)
+
+    output = _refused_plan(tmp_path, tofu_env)
+
+    assert "Resource precondition failed" in output
+    assert "is an AWS managed key, and the location is registered with Lake Formation" in output
+
+    # Without the registration the AWS managed key is a valid default.
+    _write(_contract(kms=managed["Arn"]), tmp_path, moto_endpoint)
+    planned = _plan(tmp_path, tofu_env)
+    [rule] = planned[SSE]["change"]["after"]["rule"]
+    assert rule["apply_server_side_encryption_by_default"][0]["kms_master_key_id"] == managed["Arn"]
+
+
+# ---------------------------------------------------------------------------
+# Brownfield: the operator's configurations are changed in place, not replaced
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_an_adopted_bucket_shows_its_lifecycle_and_encryption_changed_in_place(
+    tmp_path, moto_endpoint, tofu_env, monkeypatch
+):
+    """``fluid apply``'s own adoption (``_adopt_existing``), then the plan.
+
+    Without the configurations among the import candidates the plan shows
+    ``+ create`` for both, and applying it replaces the operator's lifecycle
+    rules and default encryption without the plan ever showing them.
+    """
+    import logging
+
+    from fluid_build.cli._apply_opentofu_engine import _adopt_existing
+
+    # The Glue import ids need the account; this keeps discover_imports off STS.
+    monkeypatch.setenv("AWS_ACCOUNT_ID", ACCOUNT)
+    bucket = "retention-moto-lake"
+    s3 = _boto("s3", moto_endpoint)
+    s3.create_bucket(Bucket=bucket)
+    operator_rule = {
+        "ID": "operator-logs",
+        "Filter": {"Prefix": "logs/"},
+        "Status": "Enabled",
+        "Expiration": {"Days": 365},
+    }
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket, LifecycleConfiguration={"Rules": [operator_rule]}
+    )
+    s3.put_bucket_encryption(
+        Bucket=bucket,
+        ServerSideEncryptionConfiguration={
+            "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]
+        },
+    )
+    contract = _contract()
+    _write(contract, tmp_path, moto_endpoint)
+    _init(tmp_path, tofu_env)
+
+    _adopt_existing(
+        get_iac_plugin("aws"), contract, [], str(tmp_path), tofu_env, logging.getLogger(__name__)
+    )
+    planned = _plan(tmp_path, tofu_env)
+
+    lifecycle = planned[LIFECYCLE]["change"]
+    assert lifecycle["actions"] == ["update"]
+    # The plan shows the operator's rule going, which is the review it owes.
+    assert [r["id"] for r in lifecycle["before"]["rule"]] == ["operator-logs"]
+    assert [r["id"] for r in lifecycle["after"]["rule"]] == [
+        "fluid-retention-orders",
+        "fluid-verify-athena-results",
+    ]
+    encryption = planned[SSE]["change"]
+    assert encryption["actions"] == ["update"]
+    [before] = encryption["before"]["rule"]
+    assert before["apply_server_side_encryption_by_default"][0]["sse_algorithm"] == "AES256"
+    assert planned["aws_s3_bucket.retention_moto_retention_moto_lake"]["change"]["actions"] in (
+        ["no-op"],
+        ["update"],
+    )
