@@ -91,6 +91,23 @@ matches the live table will therefore plan clean — including under
 
 `fluid verify --strict` is the gate — it exits non-zero on a type mismatch.
 
+**Drift against the apply's own state.** `fluid diff` (and `fluid verify
+--state-drift`) run the refresh `fluid apply` runs, without applying: from
+the same workdir and backend (`--workspace-dir`, `--state-backend`,
+`FLUID_STATE_BACKEND`), they emit the apply's module, run `tofu plan
+-detailed-exitcode` and read the saved plan back. A resource the refresh
+found changed outside the apply, in an attribute the plan would put back,
+is drift and fails `--exit-on-drift`; a change the plan makes with nothing
+changed outside behind it is pending (the contract moved). What the refresh
+sees in attributes the module does not declare (computed read-backs,
+settings the contract does not manage) is reported, not gated: the exit
+code alone is not used, because `-refresh-only` reports those on a clean
+apply. State cannot see what the build writes into the containers (object
+contents, object-level encryption) or a shared pool the contract only
+references; the per-expose SDK checks stay for those. With no state
+reachable (no apply ran here, `local` contracts, no `tofu`), the pass says
+so and the SDK checks are the whole answer, as before.
+
 ---
 
 ## Build execution details

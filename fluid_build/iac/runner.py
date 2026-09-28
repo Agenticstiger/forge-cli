@@ -224,6 +224,47 @@ def tofu_plan(
     )
 
 
+#: ``tofu plan -detailed-exitcode``: succeeded with a non-empty diff.
+PLAN_HAS_CHANGES = 2
+
+
+def tofu_plan_detailed(
+    workdir: str, *, out_file: str, env: Optional[Mapping[str, str]] = None
+) -> TofuResult:
+    """``tofu plan -detailed-exitcode -out=<out_file>``, for reading, not applying.
+
+    The exit code is 0 for no changes, 1 for an error and
+    :data:`PLAN_HAS_CHANGES` for changes (opentofu.org/docs/cli/commands/plan),
+    so a caller must read ``returncode`` rather than ``ok``. The plan refreshes
+    every managed object first and writes nothing to state; the saved file is
+    read back with :func:`tofu_show_plan`.
+    """
+    return _run(
+        ["plan", "-input=false", "-no-color", "-detailed-exitcode", f"-out={out_file}"],
+        workdir=workdir,
+        env=env,
+        command="plan-detailed",
+    )
+
+
+def tofu_show_plan(
+    workdir: str, *, plan_file: str, env: Optional[Mapping[str, str]] = None
+) -> Optional[Dict[str, Any]]:
+    """The saved plan as ``tofu show -json`` prints it, or ``None``.
+
+    ``None`` for a failed command or output that is not one JSON object, so
+    a caller can tell "no plan to read" from an empty one.
+    """
+    result = _run(["show", "-json", plan_file], workdir=workdir, env=env, command="show-plan")
+    if not result.ok:
+        return None
+    try:
+        payload = json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def tofu_apply(
     workdir: str, *, plan_file: str = "tfplan", env: Optional[Mapping[str, str]] = None
 ) -> TofuResult:

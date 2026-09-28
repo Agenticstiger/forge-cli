@@ -225,12 +225,41 @@ Use Cases:
         ),
     )
 
+    # Opt-in, not automatic like ``fluid diff``'s: verify is the post-apply
+    # data check (schema, masking, row counts) and runs as the last stage of
+    # every generated pipeline, so an implicit init + refresh of every managed
+    # resource would change its runtime and its failure surface everywhere.
+    p.add_argument(
+        "--state-drift",
+        dest="state_drift",
+        action="store_true",
+        help=(
+            "Also refresh the state `fluid apply` keeps for a cloud contract and "
+            "fail on resources changed outside the apply (as `fluid diff` does; "
+            "--warn-only downgrades). Skipped, with a note, when no state is reachable."
+        ),
+    )
+    p.add_argument(
+        "--state-backend",
+        default=None,
+        help=(
+            "With --state-drift: the remote state `fluid apply` used (default "
+            '$FLUID_STATE_BACKEND, else local; "" forces local)'
+        ),
+    )
+    p.add_argument(
+        "--workspace-dir",
+        metavar="DIR",
+        default=None,
+        help="With --state-drift: the directory `fluid apply` ran in (default: .)",
+    )
+
     p.add_argument(
         "--warn-only",
         action="store_true",
         help=(
-            "Downgrade --reconcile-dbt / --reconcile-lineage drift to a warning "
-            "(exit 0). Reports the drift but does not fail the build."
+            "Downgrade --reconcile-dbt / --reconcile-lineage / --state-drift drift "
+            "to a warning (exit 0). Reports the drift but does not fail the build."
         ),
     )
 
@@ -1105,6 +1134,62 @@ def _gcp_provisioned_kind(binding: Any) -> str:
     return _GCP_NO_VERIFIER if target else ""
 
 
+def _state_drift_section(
+    contract: Dict[str, Any], args: argparse.Namespace, logger: logging.Logger
+) -> Optional[Any]:
+    """``--state-drift``: the pass ``fluid diff`` runs over the apply's state.
+
+    ``None`` when the flag is not given. Printed as plain text: resource
+    addresses and attribute paths come from the cloud, never Rich markup.
+    """
+    if not getattr(args, "state_drift", False):
+        return None
+    from fluid_build.cli import _diff_state
+    from fluid_build.cli._diff_live import printable
+
+    cprint("\n" + "=" * 80)
+    cprint("🧭 Apply State Drift")
+    cprint("=" * 80)
+    report = _diff_state.check_state_drift(contract, args, logger)
+    _diff_state.render(report, lambda text: cprint(printable(text), markup=False, soft_wrap=True))
+    _diff_state.log(report, logger, out=getattr(args, "out", None))
+    return report
+
+
+def _state_drift_fails(report: Optional[Any], args: argparse.Namespace) -> bool:
+    """Does the ``--state-drift`` result fail the run?
+
+    Opt-in like ``--reconcile-dbt``: the operator asked for the check, so its
+    drift fails on its own and ``--warn-only`` downgrades it. A state that is
+    there but could not be refreshed fails as every other "could not check"
+    does; no reachable state is the note the section printed.
+    """
+    if report is None:
+        return False
+    if report.has_errors:
+        console_error(
+            "The apply's state could not be refreshed, so --state-drift cannot say "
+            "there is no drift (the Apply State Drift section above says why)."
+        )
+        return True
+    if not report.has_drift:
+        return False
+    from fluid_build.iac.drift import DRIFT
+
+    n_drifted = len(report.with_status(DRIFT))
+    if getattr(args, "warn_only", False):
+        warning(
+            f"--warn-only: {n_drifted} resource(s) changed outside the apply — "
+            "not failing the build."
+        )
+        return False
+    console_error(
+        f"{n_drifted} resource(s) changed outside the apply. Re-apply the "
+        "contract to put them back, or change the contract, or pass --warn-only."
+    )
+    return True
+
+
 @_traced_stage("verify")
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Main verify command execution"""
@@ -1703,6 +1788,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             warning(f"Contract↔published-lineage reconciliation skipped: {exc}")
             lineage_report = None
 
+    # ── Apply-state drift (opt-in via --state-drift) ───────────────────────
+    # The same pass ``fluid diff`` runs: refresh the OpenTofu state the apply
+    # keeps and report what changed outside it. Opt-in (see the flag).
+    state_report = _state_drift_section(contract, args, logger)
+
     # Summary
     cprint("\n" + "=" * 80)
     cprint("📊 Verification Summary")
@@ -1741,6 +1831,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             report["reconcile"] = reconcile_report.to_dict()
         if lineage_report is not None:
             report["reconcile_lineage"] = lineage_report.to_dict()
+        if state_report is not None:
+            report["state_drift"] = state_report.to_dict()
 
         output_path = Path(args.out)
         with open(output_path, "w", encoding="utf-8") as f:
@@ -1793,6 +1885,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 f"{n_critical} critical lineage drift(s) detected — "
                 "add --strict to gate CI on this."
             )
+
+    if _state_drift_fails(state_report, args):
+        return 1
 
     # ``error_count`` ALWAYS fails, --strict or not. An error is not "we
     # checked and found drift" — it is "we could not check at all" (auth
