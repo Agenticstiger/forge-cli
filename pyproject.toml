@@ -244,6 +244,11 @@ odcs-strict = [
 local = [
   "duckdb>=1.0",
   "pandas>=2.2",
+  # Named here, not left to arrive through pandas: masking at landing
+  # registers DuckDB Python UDFs, DuckDB's create_function needs numpy
+  # (duckdb/duckdb#17052), and the duckdb wheel lists numpy only under its
+  # own `all` extra. The floor is the one pandas 2.2 already sets on 3.10.
+  "numpy>=1.22.4",
 ]
 
 # GCP provider (install only when needed)
@@ -430,6 +435,10 @@ test-emulators = [
   # see tests/providers/test_snowflake_server_emulated_happy_path.py.
   # Without this extra that test skips, and the lane goes green proving less.
   "fakesnow[server]>=0.9",
+  # fakesnow depends on duckdb and not on numpy, so this extra alone makes
+  # the DuckDB runner importable without what its masking UDFs need (see the
+  # `local` extra).
+  "numpy>=1.22.4",
 ]
 
 # Heavy (Docker-based) integration-test emulators — Stage 2. These

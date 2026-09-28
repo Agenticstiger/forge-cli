@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -311,6 +312,22 @@ def test_a_masked_column_declared_with_a_non_string_type_is_refused_not_reported
     assert "declares 'id' as INTEGER" in record["streams"][0]["error"]
 
 
+def test_a_duckdb_without_numpy_refuses_the_run_naming_the_extra(tmp_path, monkeypatch):
+    """``pip install duckdb`` or dbt-duckdb alone gives a DuckDB with no numpy.
+
+    Its create_function then fails with "'numpy' is required for this
+    operation", which is how 12 tests failed in a CI run whose install fell
+    back to ``.[dev]``. The run is refused before it opens instead, saying what
+    to install.
+    """
+    monkeypatch.setitem(sys.modules, "numpy", None)
+    record = _refused(tmp_path, _contract(tmp_path, DEFAULT_RULES))
+    error = record["streams"][0]["error"]
+    assert error.startswith("masking: ")
+    assert "numpy" in error and "pip install 'data-product-forge[local]'" in error
+    assert "is required for this operation" not in error, "DuckDB's own error surfaced"
+
+
 def test_without_masking_rules_the_copy_is_exactly_what_it_was(tmp_path, monkeypatch):
     statements = _record_statements(monkeypatch)
     rc, record = _run(tmp_path, _contract(tmp_path))
@@ -338,6 +355,9 @@ def _refusing_contract(tmp_path: Path, monkeypatch, refusal: str) -> Dict[str, A
         return _contract(tmp_path, [HASH_MSISDN])
     if refusal == "k_anonymity":
         return _contract(tmp_path, [{"column": "zip", "strategy": "k_anonymity"}])
+    if refusal == "no numpy":
+        monkeypatch.setitem(sys.modules, "numpy", None)
+        return _contract(tmp_path, [HASH_MSISDN])
     return _contract(
         tmp_path,
         [{"column": "id", "strategy": "hash"}],
@@ -346,7 +366,9 @@ def _refusing_contract(tmp_path: Path, monkeypatch, refusal: str) -> Dict[str, A
     )
 
 
-@pytest.mark.parametrize("refusal", ["unset salt", "k_anonymity", "non-string declared type"])
+@pytest.mark.parametrize(
+    "refusal", ["unset salt", "k_anonymity", "non-string declared type", "no numpy"]
+)
 def test_a_refused_masking_run_emits_start_before_its_fail(tmp_path, monkeypatch, refusal):
     """A refusal is refused before the run opens, but it is still a run.
 

@@ -68,8 +68,9 @@ MIN_SCRIPTS = 30
 MIN_MATERIALISED_VIEWS = 25
 
 #: Set by the CI leg that exists to run this gate. When set, a missing
-#: duckdb is a FAILURE, not a skip -- the `test` job installs
-#: `.[dev,local] || .[dev]`, so duckdb can legitimately be absent there.
+#: duckdb is a FAILURE, not a skip -- a `.[dev]` install (a contributor's,
+#: or a lane without the local extra) has no duckdb, so elsewhere it can
+#: legitimately be absent.
 _REQUIRE_DUCKDB = os.environ.get("FLUID_REQUIRE_DUCKDB") == "1"
 
 

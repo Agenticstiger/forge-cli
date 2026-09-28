@@ -115,6 +115,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import importlib
 import logging
 import os
 import re
@@ -254,6 +255,12 @@ class MaskingTypeIncompatible(MaskingPolicyError):
     """The contract declares a masked column with a type a treated value cannot have."""
 
     code = "masking_type_incompatible"
+
+
+class MaskingDependencyMissing(MaskingPolicyError):
+    """DuckDB is installed without numpy, so it cannot register the landing UDFs."""
+
+    code = "masking_dependency_missing"
 
 
 # ── Rules ───────────────────────────────────────────────────────────────
@@ -650,6 +657,30 @@ def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def require_udf_dependencies() -> None:
+    """Refuse, naming the extra to install, when DuckDB cannot register the UDFs.
+
+    DuckDB's ``create_function`` needs numpy even for a native (row at a time)
+    UDF, and the ``duckdb`` wheel lists numpy only under its ``all`` extra, so an
+    environment whose DuckDB came from ``pip install duckdb`` or ``dbt-duckdb``
+    has none. Without this check the run fails at :meth:`LandingMasker.install` with DuckDB's own
+    "'numpy' is required for this operation", after the run has opened.
+    Upstream: duckdb/duckdb#17052 (the requirement arrived in 1.2.2) and
+    duckdb/duckdb-python#538 (an open PR that would limit it to vectorized
+    UDFs). ``import numpy`` is what DuckDB itself attempts, so a numpy that is
+    installed but broken is refused here too, with its own error.
+    """
+    try:
+        importlib.import_module("numpy")
+    except ImportError as exc:
+        raise MaskingDependencyMissing(
+            f"masking at landing needs numpy, which could not be imported ({exc}): DuckDB "
+            "applies each masking strategy as a Python UDF, and its create_function requires "
+            "numpy, which the duckdb package does not install. Install the local extra: "
+            "pip install 'data-product-forge[local]'. Nothing was landed."
+        ) from exc
+
+
 @dataclass
 class LandingMasker:
     """The masking a build applies: rules plus the functions that apply them.
@@ -704,8 +735,10 @@ class LandingMasker:
 
         DuckDB's default null handling passes NULL through untouched. ``encrypt``
         is registered with ``side_effects`` so DuckDB never folds two calls
-        into one: each value gets its own nonce.
+        into one: each value gets its own nonce. Without numpy this raises
+        :class:`MaskingDependencyMissing` before registering anything.
         """
+        require_udf_dependencies()
         for index, rule in enumerate(self.rules):
             con.create_function(
                 self._udf_name(index),

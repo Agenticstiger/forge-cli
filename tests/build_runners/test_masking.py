@@ -25,9 +25,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
+import sys
+from pathlib import Path
 from typing import Any, Dict, List
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    import tomli as tomllib
+
 import pytest
+from packaging.requirements import Requirement
 
 from fluid_build.build_runners import _masking as m
 
@@ -450,3 +458,60 @@ def test_nulls_pass_through_untreated_and_encrypt_is_never_folded():
     assert null is None
     assert first != second  # one nonce per value, even for equal inputs
     assert re.fullmatch(masker.rules[0].shape or "", first)
+
+
+# ── What the UDFs need ──────────────────────────────────────────────────
+
+
+def test_the_extras_that_put_duckdb_on_the_path_declare_numpy():
+    """``local`` names duckdb; ``test-emulators`` gets it through fakesnow.
+
+    Neither duckdb nor fakesnow depends on numpy, and a CI install once lost
+    pandas (the only route numpy had into ``local``) while dbt-duckdb put
+    duckdb back, so every masking test failed on DuckDB's own error.
+    """
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    extras = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
+    ]
+    for extra in ("local", "test-emulators"):
+        names = {Requirement(spec).name for spec in extras[extra]}
+        assert "numpy" in names, f"the {extra!r} extra does not declare numpy"
+
+
+def _without_numpy(monkeypatch) -> None:
+    # ``None`` in sys.modules makes ``import numpy`` raise ImportError, which is
+    # also what makes DuckDB's create_function refuse in a fresh process.
+    monkeypatch.setitem(sys.modules, "numpy", None)
+
+
+def test_without_numpy_the_refusal_names_the_extra_to_install(monkeypatch):
+    _without_numpy(monkeypatch)
+    with pytest.raises(m.MaskingDependencyMissing) as info:
+        m.require_udf_dependencies()
+    message = str(info.value)
+    assert "numpy" in message
+    assert "pip install 'data-product-forge[local]'" in message
+    assert info.value.code == "masking_dependency_missing"
+    assert isinstance(info.value, m.MaskingPolicyError), "the runner refuses on this base class"
+
+
+def test_with_numpy_there_is_nothing_to_refuse():
+    pytest.importorskip("numpy")
+    m.require_udf_dependencies()
+
+
+def test_without_numpy_install_refuses_before_registering_anything(monkeypatch):
+    class _Connection:
+        def __init__(self) -> None:
+            self.registered: List[str] = []
+
+        def create_function(self, name: str, *args: Any, **kwargs: Any) -> None:
+            self.registered.append(name)
+
+    masker = _masker([{"column": "v", "strategy": "mask"}])
+    con = _Connection()
+    _without_numpy(monkeypatch)
+    with pytest.raises(m.MaskingDependencyMissing, match=r"data-product-forge\[local\]"):
+        masker.install(con)
+    assert con.registered == []

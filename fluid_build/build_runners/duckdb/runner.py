@@ -1136,14 +1136,20 @@ def _landing_masker(ctx: RunContext) -> Optional["LandingMasker"]:
     """The build's ``policy.privacy.masking`` as a :class:`LandingMasker`, or None.
 
     Raises :class:`MaskingPolicyError` for a rule that cannot be applied as
-    written (an unset salt, ``k_anonymity``, a non-string declared type): the
-    caller refuses the run, since landing the column untreated is the one
-    outcome a masking rule rules out.
+    written (an unset salt, ``k_anonymity``, a non-string declared type), or
+    when DuckDB cannot register the UDFs because numpy is missing: the caller
+    refuses the run, since landing the column untreated is the one outcome a
+    masking rule rules out.
     """
-    from .._masking import LandingMasker
+    from .._masking import LandingMasker, require_udf_dependencies
 
     cursor_field = ctx.source.cursor_field if ctx.source.mode in _INCREMENTAL_MODES else None
-    return LandingMasker.for_expose(_build_expose(ctx), cursor_field=cursor_field)
+    masker = LandingMasker.for_expose(_build_expose(ctx), cursor_field=cursor_field)
+    if masker is not None:
+        # Here rather than only in ``masker.install``, so the refusal comes
+        # before anything connects and names the extra to install.
+        require_udf_dependencies()
+    return masker
 
 
 def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
