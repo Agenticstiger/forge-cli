@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The first `fluid schedule-sync` after upgrading must retire the old DAG
   of each env.** An env's Airflow DAGs now live in `<product-id>__<env>/` with
-  dag id `<product>__<env>__<build>`; 0.16.6 and earlier wrote them to
+  dag id `<product>__<env>__<build>`; 0.16.7 and earlier wrote them to
   `<product-id>/` as `<product>__<build>`. Left in place, the old DAG runs
   beside the new one, and both apply the same product against the same state.
   With `--delete-scope product` (the default) to a local path or a `git+ssh`

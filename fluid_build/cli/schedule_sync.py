@@ -58,7 +58,7 @@ Security posture (high level — detailed notes inline at each touchpoint):
   git+ssh, s3 and gs for airflow; s3 for mwaa); az, scp, composer,
   astronomer, prefect and dagster never delete and ignore it.
 * An env's DAGs are ``<product-id>__<env>/`` (dag ids
-  ``<product>__<env>__<build>``); forge-cli 0.16.6 and earlier wrote them to
+  ``<product>__<env>__<build>``); forge-cli 0.16.7 and earlier wrote them to
   ``<product-id>/`` as ``<product>__<build>``. Under ``--delete-scope product``
   the first sync after the upgrade retires those old DAGs, the ones rendered
   for the same product and env, where the destination can be read here (a
@@ -576,7 +576,7 @@ def _under(root: str, suffix: str) -> str:
 # Retiring the DAGs an env's scope replaced
 # -----------------------------------------------------------------------------
 #
-# forge-cli 0.16.6 and earlier wrote a product's DAGs to ``<product>/`` with
+# forge-cli 0.16.7 and earlier wrote a product's DAGs to ``<product>/`` with
 # dag_id ``<product>__<build>``, whatever the ``--env``. Now an env's DAGs are
 # ``<product>__<env>/`` with dag_id ``<product>__<env>__<build>``
 # (``fluid_apply.schedule_scope_for`` / ``dag_id_for``). ``--delete-scope
@@ -719,7 +719,7 @@ def _report_superseded_scopes(dags_dir: Path, args: argparse.Namespace) -> List[
             continue
         cprint(
             f"[schedule-sync] note: {current}/ now holds {product}'s DAGs for env {env}. "
-            f"forge-cli 0.16.6 and earlier synced them to {product}/ with dag ids "
+            f"forge-cli 0.16.7 and earlier synced them to {product}/ with dag ids "
             f"{product}__<build>, and this destination cannot be read here to retire "
             f"those. Delete {product}/'s DAG files for env {env} at the destination once "
             f"(each is a DAG whose FLUID_ENV_NAME is {env!r}), or Airflow runs "

@@ -281,7 +281,7 @@ class TestSharedDagRootWithRealRsync:
 
 # ── The DAG an env's directory replaced ───────────────────────────────────
 #
-# forge-cli 0.16.6 and earlier synced a product's DAGs to ``<product>/`` with
+# forge-cli 0.16.7 and earlier synced a product's DAGs to ``<product>/`` with
 # dag id ``<product>__<build>``, whatever the env. An env's DAGs now live in
 # ``<product>__<env>/`` as ``<product>__<env>__<build>``, and ``--delete-scope
 # product`` mirrors only that directory. Measured on the demo's bronze product:
