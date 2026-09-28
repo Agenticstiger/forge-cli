@@ -20,7 +20,9 @@ The table verify reads is named the way the load names it
 (`build_runners/_bigquery_load.py::bigquery_load_target`): `{{ env.X }}` in the
 binding is resolved as `fluid apply` resolves it, and a binding with no
 `project` uses `GOOGLE_PROJECT` / `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT` /
-`CLOUDSDK_CORE_PROJECT`, then Application Default Credentials' own.
+`CLOUDSDK_CORE_PROJECT`, then the client's own (Application Default
+Credentials'), exactly as the load does. With none of them, verify is an error
+naming the table, not a lookup of `.<dataset>.<table>`.
 
 | Check | How | Result when it fails |
 |---|---|---|
@@ -28,7 +30,7 @@ binding is resolved as `fluid apply` resolves it, and a binding with no
 | Columns match the contract | the table's schema against `contract.schema`, types folded through the type map `fluid apply` declares them with | missing column / changed type: CRITICAL; extra column: INFO |
 | Required / nullable | the table's field modes | WARNING |
 | Location | the dataset's location against the binding's region | CRITICAL |
-| It serves what the build loaded | `SELECT COUNT(*)` of the table, against the run records of the acquisition build that writes the expose (below) | CRITICAL |
+| It serves what the build loaded | `SELECT COUNT(*)` of the table, against the run records of the build that writes the expose, acquisition or embedded SQL (below) | CRITICAL |
 | It is not empty | a count of 0 | CRITICAL; in a reference-only contract with no run of its own, INFO |
 | Masked columns landed treated | for an expose with `policy.privacy.masking`, the same query counts each masked column's non-null values that lack their strategy's shape: `COUNTIF(col IS NOT NULL AND NOT REGEXP_CONTAINS(CAST(col AS STRING), @shape))`, the shape anchored `\A(?:...)\z` and bound as a query parameter | one such value: CRITICAL. Only counts leave the query, never a value |
 
@@ -49,8 +51,12 @@ the same contract directory) and is passed over. The newest run that may be
 this table's is compared: equal for `full_refresh`, at least the sum since the
 last full load for `incremental_append`. A failed run, or one whose record
 does not parse, is not a count to hold the table to, and the count is then
-reported without a gate. An embedded-SQL build writes no run record, so its
-table is counted and must not be empty, and is not compared.
+reported without a gate. An embedded-SQL build on DuckDB that loads a BigQuery
+table records its run the same way (`facets.bigquery_load`, `full_refresh`,
+the rows the load landed), so a silver or gold table is held to its last load
+exactly as bronze is. A failed embedded-SQL run is recorded without
+`bigquery_load`, and the count is reported without a gate until the next run
+succeeds.
 
 ### Emulators
 

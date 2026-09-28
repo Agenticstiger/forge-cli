@@ -171,11 +171,19 @@ class FakeBigQuery:
         self.tables[table_id] = {"schema": schema, "data": data}
 
 
+#: What the fake hands out for ``AnonymousCredentials``: the unit lanes install
+#: ``.[dev,local]``, which has no google-auth, so the real class is not imported.
+ANONYMOUS = SimpleNamespace(kind="anonymous")
+
+
 @pytest.fixture
 def bq(monkeypatch):
     def install(**kw) -> FakeBigQuery:
         fake = FakeBigQuery(**kw)
         monkeypatch.setattr(_bigquery_load, "_bigquery_module", lambda: fake.module)
+        monkeypatch.setattr(
+            _bigquery_load, "_anonymous_credentials", lambda: ANONYMOUS, raising=False
+        )
         return fake
 
     return install
@@ -334,7 +342,8 @@ def _build(contract: Dict[str, Any], root: Path) -> int:
 # ── Reads ───────────────────────────────────────────────────────────────
 
 
-def test_a_bigquery_upstream_resolves_to_its_table_not_its_gs_path(tmp_path):
+def test_a_bigquery_upstream_resolves_to_its_table_not_its_gs_path(bq, tmp_path):
+    bq()
     root = _workspace(tmp_path / "ws")
     contract = _load(root)
     [r], covered, _ = resolve_consumes(
@@ -346,7 +355,8 @@ def test_a_bigquery_upstream_resolves_to_its_table_not_its_gs_path(tmp_path):
     assert r.view == "subscriptions"
 
 
-def test_the_upstream_project_is_resolved_from_the_environment(tmp_path, monkeypatch):
+def test_the_upstream_project_is_resolved_from_the_environment(bq, tmp_path, monkeypatch):
+    bq()
     root = _workspace(tmp_path / "ws")
     overlay = root / "contracts" / "customer_subscriptions" / "overlays" / "gcp.yaml"
     _dump(
@@ -528,22 +538,33 @@ def test_a_second_bigquery_output_is_refused(bq, tmp_path):
         {"exposeId": "extra", "kind": "table", "binding": _gcp_binding("demo_silver", "extra")}
     )
     contract["builds"][0]["outputs"] = ["status_summary", "extra"]
-    with pytest.raises(EmbeddedSqlLandingError, match="one table"):
+    with pytest.raises(EmbeddedSqlLandingError, match="one (result|table)"):
         plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="gcp")
 
 
-def test_a_failed_load_fails_the_build(bq, tmp_path):
+def test_a_failed_load_fails_the_build(bq, tmp_path, capsys):
     fake = bq(load_error=RuntimeError("quota exceeded"))
     _seed(fake)
     root = _workspace(tmp_path / "ws")
     assert _build(_load(root), root) == 1
+    # The load was attempted (the build got past reading and the SQL), it
+    # failed loudly, and the table was left as it was.
+    [load] = fake.loads
+    assert load["table"] == SILVER_TABLE
+    out = " ".join(capsys.readouterr().out.split())
+    assert f"BigQuery load into {SILVER_TABLE} failed" in out and "quota exceeded" in out
+    assert fake.tables[SILVER_TABLE]["data"].num_rows == 0
 
 
-def test_a_short_load_fails_the_build(bq, tmp_path):
+def test_a_short_load_fails_the_build(bq, tmp_path, capsys):
     fake = bq(output_rows=lambda data: data.num_rows - 1)
     _seed(fake)
     root = _workspace(tmp_path / "ws")
     assert _build(_load(root), root) == 1
+    [load] = fake.loads
+    assert load["table"] == SILVER_TABLE
+    out = " ".join(capsys.readouterr().out.split())
+    assert f"loaded 3 rows into {SILVER_TABLE}, but the landed file holds 4" in out
 
 
 # ── The load itself: timestamps, and a job with no row count ────────────
@@ -670,6 +691,13 @@ def test_an_append_on_an_emulator_is_held_to_the_rows_it_added(bq, tmp_path, mon
 # ── The client: anonymous against an emulator, ADC otherwise ────────────
 
 
+def test_an_emulator_client_is_handed_anonymous_credentials(bq, monkeypatch):
+    monkeypatch.setenv("BIGQUERY_EMULATOR_HOST", "http://127.0.0.1:9")
+    fake = bq()
+    _bigquery_load.bigquery_client(fake.module, "forge-emulated")
+    assert fake.clients == [{"project": "forge-emulated", "credentials": ANONYMOUS}]
+
+
 def test_an_emulator_client_sends_no_credentials(monkeypatch):
     bigquery = pytest.importorskip("google.cloud.bigquery")
     from google.auth.credentials import AnonymousCredentials
@@ -698,3 +726,304 @@ def test_the_plan_prints_the_bigquery_read_and_load(bq, tmp_path, capsys):
     assert f"lands BigQuery table {SILVER_TABLE}" in out
     assert f"read 5 row(s) from BigQuery table {BRONZE_TABLE}" in out
     assert f"loaded 4 row(s) into BigQuery table {SILVER_TABLE}" in out
+
+
+# ── Sovereignty: the locations the reads and the load actually use ─────
+#
+# PR review, measured on this branch before the fix: an EU-only silver whose
+# gcp overlay named no region planned its read from europe-west1 and its load
+# into "US" (the IaC default), and the build loaded there, rc 0. On main the
+# same build stopped earlier (UnreadableBindingError), so the copy was new.
+
+_EU_ONLY = {
+    "jurisdiction": "EU",
+    "allowedRegions": ["eu-north-1", "eu-west-1", "europe-west1"],
+    "dataResidency": True,
+    "crossBorderTransfer": False,
+}
+
+
+def _sovereign(root: Path, sovereignty: Dict[str, Any]) -> Dict[str, Any]:
+    contract = _load(root)
+    contract["sovereignty"] = dict(sovereignty)
+    return contract
+
+
+def _no_region(dataset: str, table: str) -> Dict[str, Any]:
+    binding = _gcp_binding(dataset, table)
+    del binding["location"]["region"]
+    return binding
+
+
+def test_a_sovereign_landing_with_no_region_is_refused_before_any_read(bq, tmp_path):
+    fake = bq()
+    _seed(fake)
+    root = _workspace(
+        tmp_path / "ws", silver_binding=_no_region("demo_silver", "subscription_status_summary")
+    )
+    contract = _sovereign(root, _EU_ONLY)
+    with pytest.raises(EmbeddedSqlLandingError, match="names no region") as err:
+        plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="gcp")
+    assert err.value.code == "EmbeddedSqlSovereigntyError"
+    assert "not in allowedRegions" in err.value.why  # US is not an allowed region either
+    assert _build(contract, root) == 1
+    assert fake.loads == [] and fake.queries == []
+
+
+def test_a_sovereign_upstream_with_no_region_is_refused(bq, tmp_path):
+    fake = bq()
+    _seed(fake)
+    root = _workspace(tmp_path / "ws")
+    overlay = root / "contracts" / "customer_subscriptions" / "overlays" / "gcp.yaml"
+    _dump(overlay, {"exposes": [{"binding": _no_region("demo_bronze", "customer_subscriptions")}]})
+    contract = _sovereign(root, _EU_ONLY)
+    with pytest.raises(EmbeddedSqlLandingError) as err:
+        plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="gcp")
+    assert err.value.code == "EmbeddedSqlSovereigntyError"
+    assert f"{BRONZE_TABLE} names no region" in err.value.why
+    # Read from US, landed in europe-west1, crossBorderTransfer false.
+    assert "crossBorderTransfer is false" in err.value.why
+    assert _build(contract, root) == 1 and fake.loads == []
+
+
+@pytest.mark.parametrize(
+    "region, fragment",
+    [
+        ("us-central1", "not in allowedRegions"),
+        ("europe-west2", "is in UK, not the required jurisdiction EU"),
+    ],
+)
+def test_a_sovereign_landing_outside_the_contract_is_refused(bq, tmp_path, region, fragment):
+    bq()
+    binding = _gcp_binding("demo_silver", "subscription_status_summary")
+    binding["location"]["region"] = region
+    root = _workspace(tmp_path / "ws", silver_binding=binding)
+    sovereignty = dict(_EU_ONLY)
+    if region == "europe-west2":
+        sovereignty["allowedRegions"] = [*_EU_ONLY["allowedRegions"], "europe-west2"]
+    contract = _sovereign(root, sovereignty)
+    with pytest.raises(EmbeddedSqlLandingError) as err:
+        plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="gcp")
+    assert err.value.code == "EmbeddedSqlSovereigntyError"
+    assert fragment in err.value.why
+
+
+def test_an_eu_read_and_an_eu_load_meet_the_contract(bq, tmp_path, capsys):
+    fake = bq()
+    _seed(fake)
+    root = _workspace(tmp_path / "ws")
+    contract = _sovereign(root, _EU_ONLY)
+    io_plan = plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="gcp")
+    assert io_plan.warnings == []
+    assert _build(contract, root) == 0
+    assert [load["location"] for load in fake.loads] == ["europe-west1"]
+    assert "sovereignty" not in capsys.readouterr().out
+
+
+def test_the_eu_multi_region_counts_as_eu(bq, tmp_path):
+    bq()
+    binding = _gcp_binding("demo_silver", "subscription_status_summary")
+    binding["location"]["region"] = "EU"
+    root = _workspace(tmp_path / "ws", silver_binding=binding)
+    contract = _sovereign(root, {**_EU_ONLY, "allowedRegions": ["EU", "europe-west1"]})
+    io_plan = plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="gcp")
+    assert io_plan.bigquery_landing.location == "EU" and io_plan.warnings == []
+
+
+def test_an_advisory_contract_warns_and_builds(bq, tmp_path, capsys):
+    fake = bq()
+    _seed(fake)
+    root = _workspace(
+        tmp_path / "ws", silver_binding=_no_region("demo_silver", "subscription_status_summary")
+    )
+    contract = _sovereign(root, {**_EU_ONLY, "enforcementMode": "advisory"})
+    io_plan = plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="gcp")
+    assert any("names no region" in w for w in io_plan.warnings)
+    assert _build(contract, root) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "sovereignty: expose status_summary: BigQuery table" in out
+
+
+def test_a_contract_without_sovereignty_is_unchanged(bq, tmp_path):
+    """No sovereignty block, no check: the default location stays the IaC's."""
+    bq()
+    root = _workspace(
+        tmp_path / "ws", silver_binding=_no_region("demo_silver", "subscription_status_summary")
+    )
+    contract = _load(root)
+    io_plan = plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="gcp")
+    assert io_plan.bigquery_landing.location == "US" and io_plan.warnings == []
+
+
+# ── A landing that is one of the build's own inputs ────────────────────
+#
+# PR review, measured before the fix: silver's overlay named bronze's table,
+# and the SQL kept the active rows. The build returned rc 0 and bronze went
+# from 5 rows to 3: a WRITE_TRUNCATE of another product's table, which no
+# --allow-data-loss gate sees.
+
+
+@pytest.mark.parametrize(
+    "dataset, table, project",
+    [
+        ("demo_bronze", "customer_subscriptions", "northwind-demo"),
+        ("Demo_Bronze", "Customer_Subscriptions", "NORTHWIND-DEMO"),
+        # A project left to the client may be the upstream's: refused, not assumed.
+        ("demo_bronze", "customer_subscriptions", ""),
+    ],
+)
+def test_a_landing_into_an_input_table_is_refused(bq, tmp_path, dataset, table, project):
+    fake = bq()
+    _seed(fake)
+    binding = _gcp_binding(dataset, table, project=project)
+    if not project:
+        del binding["location"]["project"]
+    root = _workspace(tmp_path / "ws", silver_binding=binding)
+    silver = _silver_dir(root) / "contract.fluid.yaml"
+    doc = yaml.safe_load(silver.read_text())
+    doc["builds"][0]["properties"]["sql"] = "SELECT * FROM subscriptions WHERE status = 'active'"
+    _dump(silver, doc)
+    contract = _load(root)
+    with pytest.raises(EmbeddedSqlLandingError, match="which consumes bronze"):
+        plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="gcp")
+    assert _build(contract, root) == 1
+    assert fake.loads == []
+    assert fake.tables[BRONZE_TABLE]["data"].num_rows == 5
+
+
+def test_a_landing_in_another_project_with_the_same_names_is_not_an_input(bq, tmp_path):
+    bq()
+    binding = _gcp_binding("demo_bronze", "customer_subscriptions", project="acme-silver")
+    root = _workspace(tmp_path / "ws", silver_binding=binding)
+    contract = _load(root)
+    io_plan = plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="gcp")
+    assert io_plan.bigquery_landing.table_id == "acme-silver.demo_bronze.customer_subscriptions"
+
+
+def test_an_s3_landing_inside_an_input_prefix_is_refused(tmp_path):
+    """The AWS form of the same mistake: the object would become rows of bronze's table."""
+    aws = {
+        "platform": "aws",
+        "format": "parquet",
+        "location": {"bucket": "lake", "path": "bronze/customer_subscriptions/"},
+    }
+    root = _workspace(tmp_path / "ws", silver_binding=aws)
+    for name in ("customer_subscriptions", "subscription_status_summary"):
+        (root / "contracts" / name / "overlays" / "gcp.yaml").rename(
+            root / "contracts" / name / "overlays" / "aws.yaml"
+        )
+    _dump(
+        root / "contracts" / "customer_subscriptions" / "overlays" / "aws.yaml",
+        {"exposes": [{"binding": aws}]},
+    )
+    contract = _load(root, env="aws")
+    with pytest.raises(EmbeddedSqlLandingError, match="inside s3://lake/bronze/"):
+        plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="aws")
+
+
+# ── Further outputs this path never lands ───────────────────────────────
+#
+# PR review, measured before the fix: a second output bound to a GCS prefix
+# planned without complaint, and the build returned rc 0 with nothing written
+# for it. Only a second BigQuery output was refused.
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        {
+            "platform": "gcp",
+            "format": "parquet",
+            "location": {"bucket": "lake", "path": "gs://l/x/"},
+        },
+        {"platform": "aws", "format": "parquet", "location": {"bucket": "lake", "path": "x/"}},
+        {"platform": "local", "format": "parquet", "location": {"path": "s3://lake/x/"}},
+        _gcp_binding("demo_silver", "extra"),
+    ],
+)
+def test_a_further_remote_output_is_refused(bq, tmp_path, binding):
+    fake = bq()
+    _seed(fake)
+    root = _workspace(tmp_path / "ws")
+    contract = _load(root)
+    contract["exposes"].append({"exposeId": "extra", "kind": "table", "binding": binding})
+    contract["builds"][0]["outputs"] = ["status_summary", "extra"]
+    # A second BigQuery output was already refused ("loads its result into one
+    # table"); the others were planned and silently not landed.
+    with pytest.raises(EmbeddedSqlLandingError, match="one (result|table)"):
+        plan_embedded_sql_io(contract, contract["builds"][0], _silver_dir(root), env="gcp")
+    assert _build(contract, root) == 1 and fake.loads == []
+
+
+def test_a_further_local_output_is_warned_about_not_dropped_silently(bq, tmp_path, capsys):
+    fake = bq()
+    _seed(fake)
+    root = _workspace(tmp_path / "ws")
+    contract = _load(root)
+    contract["exposes"].append(
+        {
+            "exposeId": "extra",
+            "kind": "table",
+            "binding": {"platform": "local", "format": "parquet", "location": {"path": "x.pq"}},
+        }
+    )
+    contract["builds"][0]["outputs"] = ["status_summary", "extra"]
+    assert _build(contract, root) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "extra is not written by this build" in out
+    assert [load["table"] for load in fake.loads] == [SILVER_TABLE]
+
+
+# ── The run record fluid verify holds the table to ──────────────────────
+
+
+def _records(root: Path) -> List[Dict[str, Any]]:
+    import json
+
+    runs = _silver_dir(root) / ".fluid" / "runs" / SILVER / "summarize_subscription_status" / "runs"
+    return [json.loads(p.read_text()) for p in sorted(runs.glob("*.json"))]
+
+
+def test_a_bigquery_landing_is_recorded_as_a_run(bq, tmp_path):
+    fake = bq()
+    _seed(fake)
+    root = _workspace(tmp_path / "ws")
+    assert _build(_load(root), root) == 0
+    [record] = _records(root)
+    assert record["state"] == "succeeded" and record["records_total"] == 4
+    load = record["facets"]["bigquery_load"]
+    assert (load["table"], load["rows"]) == (SILVER_TABLE, 4)
+    assert record["facets"]["landed"]["mode"] == "full_refresh"
+    assert record["facets"]["landed"]["rows_from"] == "write"
+    assert fake.tables[SILVER_TABLE]["data"].num_rows == 4
+
+
+def test_a_failed_load_is_recorded_as_a_failed_run_without_a_count(bq, tmp_path):
+    fake = bq(load_error=RuntimeError("quota exceeded"))
+    _seed(fake)
+    root = _workspace(tmp_path / "ws")
+    assert _build(_load(root), root) == 1
+    [record] = _records(root)
+    assert record["state"] == "failed" and "bigquery_load" not in record["facets"]
+    assert "quota exceeded" in record["error"]
+
+
+def test_the_recorded_run_is_the_count_the_bigquery_verifier_holds_the_table_to(bq, tmp_path):
+    """Writer and reader agree: the run the build records is the one verify compares."""
+    from fluid_build.cli._verify_athena import _landed_rows
+    from fluid_build.cli._verify_bigquery import _loaded_into
+
+    fake = bq()
+    _seed(fake)
+    root = _workspace(tmp_path / "ws")
+    contract = _load(root)
+    assert _build(contract, root) == 0
+    landed, info = _landed_rows(
+        contract,
+        "status_summary",
+        _silver_dir(root),
+        SILVER_TABLE,
+        wrote_into=_loaded_into,
+        embedded_sql_records=True,
+    )
+    assert (landed, info["rule"], info["build_id"]) == (4, "equal", "summarize_subscription_status")

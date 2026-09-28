@@ -238,7 +238,32 @@ the binding is never written to. A failed or short load fails the build. Any
 other landing this path cannot write, a `gs://` or other non-S3 URI, a GCS
 bucket, an Azure, Snowflake or Databricks binding, is refused
 (`EmbeddedSqlLandingError`) before the SQL runs, instead of being written to a
-local file of that name.
+local file of that name. The load is recorded as a run under
+`.fluid/runs/<product>/<build>/runs/`, the way the acquisition load is, so
+`fluid verify` holds the table's count to the rows it landed.
+
+Also refused before anything is read (`EmbeddedSqlLandingError`):
+
+* a landing that resolves to one of the build's own inputs: a BigQuery table
+  the build reads (names compared case-insensitively; a project left to the
+  client matches any), or an S3 object inside a prefix it reads. The load
+  replaces the table, so it would overwrite another product's rows, and no
+  `--allow-data-loss` is ever asked for a data write;
+* a further expose named in the build's `outputs` and bound to a cloud store
+  or a warehouse (an aws, gcp, azure, snowflake or databricks binding, or any
+  remote URI): this path lands only the first expose. A further local expose
+  or output port is not written either, and the build prints a warning.
+
+When the contract declares `sovereignty` and the build reads or loads a
+BigQuery table, the locations those reads and the load actually use are held
+to it by `fluid validate`'s rules (`EmbeddedSqlSovereigntyError`): every
+BigQuery binding must name its region (without one it is `US`, the IaC's
+default), the landing must be outside `deniedRegions`, inside
+`allowedRegions` and in the declared `jurisdiction`, and, with `dataResidency`
+and no `crossBorderTransfer` (the schema's defaults), every input must be in
+the landing's jurisdiction. BigQuery's `EU` and `US` multi-regions count as
+EU and US. `enforcementMode: strict` (the default) refuses, `advisory` warns,
+`audit` logs.
 
 BigQuery reads and loads authenticate with Application Default Credentials
 (gcloud ADC, an attached service account, or a Workload Identity Federation

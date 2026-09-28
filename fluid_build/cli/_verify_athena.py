@@ -852,6 +852,7 @@ def _landed_rows(
     table_location: str,
     *,
     wrote_into: Optional[WroteInto] = None,
+    embedded_sql_records: bool = False,
 ) -> Tuple[Optional[int], Dict[str, Any]]:
     """What the landing build's runs put in ``table_location``, when a record says.
 
@@ -860,11 +861,15 @@ def _landed_rows(
     else is reported with the reason and never gates. ``wrote_into`` decides
     which runs landed in the table: by ``facets.landed.destinations`` here,
     by ``facets.bigquery_load.table`` for a BigQuery table
-    (``_verify_bigquery``).
+    (``_verify_bigquery``). With ``embedded_sql_records`` (the BigQuery
+    verifier), an embedded-SQL build's runs are read too: its BigQuery load
+    records what it landed as an acquisition run does
+    (``_embedded_sql_io.write_bigquery_run_record``).
     """
     wrote_into = wrote_into or _wrote_into
     from fluid_build.build_runners._acquisition_common import is_acquisition_build
     from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
+    from fluid_build.build_runners.base import is_embedded_sql_build
 
     builds = _landing_builds(contract, expose_id)
     if not builds:
@@ -876,7 +881,8 @@ def _landed_rows(
             "note": f"{len(builds)} builds write this expose ({ids}); no single run to compare",
         }
     build = builds[0]
-    if not is_acquisition_build(dict(build)):
+    counted_embedded_sql = embedded_sql_records and is_embedded_sql_build(dict(build))
+    if not is_acquisition_build(dict(build)) and not counted_embedded_sql:
         # A transformation's run record counts what its engine ran: the dbt
         # runner's records_total is the number of nodes in run_results.json.
         return None, {

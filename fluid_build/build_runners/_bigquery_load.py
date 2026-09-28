@@ -99,9 +99,15 @@ def bigquery_client(bigquery: Any, project: Optional[str]) -> Any:
     """
     if emulator_host() is None:
         return bigquery.Client(project=project)
+    return bigquery.Client(project=project, credentials=_anonymous_credentials())
+
+
+def _anonymous_credentials() -> Any:
+    """``google.auth``'s ``AnonymousCredentials``, imported on first use. Tests replace this,
+    as they replace :func:`_bigquery_module`, so the unit lanes need no Google library."""
     from google.auth.credentials import AnonymousCredentials
 
-    return bigquery.Client(project=project, credentials=AnonymousCredentials())
+    return AnonymousCredentials()
 
 
 def _bigquery_module() -> Any:

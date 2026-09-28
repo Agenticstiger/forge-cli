@@ -65,10 +65,17 @@ _SCHEMA = [
 class FakeBigQuery:
     """A table's metadata, and a query engine for the verifier's count query."""
 
-    def __init__(self, rows: List[tuple], *, query_error: Optional[Exception] = None):
+    def __init__(
+        self,
+        rows: List[tuple],
+        *,
+        query_error: Optional[Exception] = None,
+        adc_project: Optional[str] = "adc-project",
+    ):
         self.rows = rows
         self.sql: List[str] = []
         self.params: List[Any] = []
+        self.tables_read: List[str] = []
         fake = self
 
         class QueryJobConfig:
@@ -86,9 +93,15 @@ class FakeBigQuery:
 
         class Client:
             def __init__(self, project=None, credentials=None):
-                self.project = project
+                # As google-cloud-core: only None falls back to the default
+                # (ADC's); an empty string is kept as the project.
+                self.project = adc_project if project is None else project
 
             def get_table(self, table_id):
+                fake.tables_read.append(table_id)
+                if table_id.startswith("."):
+                    # python-bigquery on a table id with no project.
+                    raise ValueError("Could not determine project ID")
                 return SimpleNamespace(schema=_SCHEMA, num_rows=None, created=None, modified=None)
 
             def get_dataset(self, ref):
@@ -198,13 +211,14 @@ def _run_record(
     rows: int,
     table: Optional[str] = TABLE_ID,
     state: str = "succeeded",
+    build_id: str = "ingest_subscriptions",
 ) -> None:
     facets: Dict[str, Any] = {
         "landed": {"mode": "full_refresh", "rows_from": "write", "destinations": {}}
     }
     if table is not None:
         facets["bigquery_load"] = {"table": table, "rows": rows, "job_id": "j"}
-    path = tmp_path / ".fluid" / "runs" / PRODUCT / "ingest_subscriptions" / "runs"
+    path = tmp_path / ".fluid" / "runs" / PRODUCT / build_id / "runs"
     path.mkdir(parents=True, exist_ok=True)
     (path / f"{run_id}.json").write_text(
         json.dumps({"run_id": run_id, "state": state, "records_total": rows, "facets": facets}),
@@ -371,3 +385,69 @@ def test_verify_resolves_the_project_the_way_the_load_does(tmp_path, monkeypatch
         run(_args(path, strict=False), _LOG)
     assert seen["project"] == "acme-eu-demo"
     assert seen["expose"]["exposeId"] == "subscriptions"
+
+
+# ── The project, when the binding names none ────────────────────────────
+#
+# PR review: the load and the read name the table from ``client.project``
+# (ADC's when nothing else names one), but verify passed ``project=""``, which
+# the client keeps, and looked up ``.demo_bronze.customer_subscriptions``.
+
+
+def test_a_binding_with_no_project_is_verified_in_the_clients_project(bq, tmp_path):
+    fake = bq([("s1", HASHED)])
+    result = verify_bigquery_table("", "demo_bronze", "customer_subscriptions", [], "europe-west1")
+    assert fake.tables_read == ["adc-project.demo_bronze.customer_subscriptions"]
+    assert result["exists"] is True
+    assert result["table_id"] == "adc-project.demo_bronze.customer_subscriptions"
+
+
+def test_no_project_anywhere_is_an_error_naming_the_table(bq, tmp_path):
+    fake = bq([("s1", HASHED)], adc_project=None)
+    result = verify_bigquery_table("", "demo_bronze", "customer_subscriptions", [], "europe-west1")
+    assert result["status"] == "error"
+    assert "No project for demo_bronze.customer_subscriptions" in result["error"]
+    assert fake.tables_read == []
+
+
+# ── An embedded-SQL build's load is held to, as an acquisition load is ──
+
+
+def _embedded_sql_contract() -> Dict[str, Any]:
+    contract = _contract()
+    contract["builds"] = [
+        {
+            "id": "summarize",
+            "pattern": "embedded-logic",
+            "engine": "duckdb",
+            "properties": {"sql": "SELECT * FROM upstream"},
+            "outputs": ["subscriptions"],
+        }
+    ]
+    return contract
+
+
+def _record_embedded_sql_load(tmp_path: Path, rows: int) -> None:
+    """The record an embedded-SQL build writes after its load: the acquisition
+    load's shape (``_embedded_sql_io.write_bigquery_run_record``; the build
+    side is pinned in ``tests/build_runners/test_embedded_sql_bigquery.py``)."""
+    _run_record(tmp_path, "20260928T000001Z", rows=rows, build_id="summarize")
+
+
+def test_an_embedded_sql_table_is_held_to_the_rows_its_load_landed(bq, tmp_path):
+    contract = _embedded_sql_contract()
+    _record_embedded_sql_load(tmp_path, rows=2)
+    bq([("s1", HASHED), ("s2", HASHED)])
+    rc = _verify(tmp_path, contract)["dimensions"]["row_count"]
+    assert (rc["status"], rc["actual"], rc["expected"]) == ("pass", 2, 2)
+    assert rc["compared_with"]["rule"] == "equal"
+    assert rc["compared_with"]["build_id"] == "summarize"
+
+
+def test_an_embedded_sql_table_short_of_its_load_fails_as_critical(bq, tmp_path):
+    contract = _embedded_sql_contract()
+    _record_embedded_sql_load(tmp_path, rows=3)
+    bq([("s1", HASHED), ("s2", HASHED)])
+    result = _verify(tmp_path, contract)
+    assert result["dimensions"]["row_count"]["status"] == "fail"
+    assert result["severity"]["level"] == "CRITICAL"

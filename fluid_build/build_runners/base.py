@@ -352,7 +352,7 @@ def _print_embedded_sql_io(io: Any) -> None:
             f'   ⬅ consumes {r.product_id}/{r.expose_id} as view "{r.view}": {r.uri}',
             markup=False,
         )
-    if io.inputs:
+    if io.inputs and io.bigquery_landing is None:
         cprint(
             "     (no run record or lineage event on this path: the resolved inputs are "
             "listed here and in runtime/out/local_apply_log.jsonl)",
@@ -364,9 +364,12 @@ def _print_embedded_sql_io(io: Any) -> None:
         cprint(
             f"   ➡ lands BigQuery table {io.bigquery_landing.table_id} "
             f"({io.bigquery_landing.location}): staged as Parquet, then one load job "
-            "(WRITE_TRUNCATE)",
+            "(WRITE_TRUNCATE), recorded in the build's run record",
             markup=False,
         )
+    for warning in getattr(io, "warnings", None) or []:
+        cprint(f"   ⚠️  {warning}", markup=False)
+        LOG.warning("embedded_sql_plan_warning %s", warning)
 
 
 def _print_action_errors(results: List[Dict[str, Any]], io: Any) -> None:
@@ -678,8 +681,15 @@ def _run_local_sql(
     """
     import time
 
+    from ._acquisition_common import utc_now_iso
+
     build_id = build.get("id", "unknown")
     staged_inputs: List[Path] = []
+    # A BigQuery landing is recorded as a run, as the acquisition load is, so
+    # ``fluid verify`` holds the table to the rows it landed.
+    planned_landing = io.bigquery_landing if io is not None else None
+    outcome: Dict[str, Any] = {}
+    started_at = utc_now_iso()
     try:
         from fluid_build.providers.local.local import LocalProvider
 
@@ -707,21 +717,52 @@ def _run_local_sql(
             for p in written_files:
                 cprint(f"   📁 {p}")
             if io is not None and io.bigquery_landing is not None:
-                return _load_bigquery_result(io.bigquery_landing, build_id)
+                return _load_bigquery_result(io.bigquery_landing, build_id, outcome)
             return 0
         else:
             cprint(f"   ❌ Failed: {failed} action(s) failed")
             _print_action_errors(result.get("results") or [], io)
+            outcome["error"] = f"{failed} action(s) failed"
             return 1
     except Exception as exc:
         cprint(f"   ❌ Embedded-SQL build '{build_id}' error: {_redacted(exc)}")
         LOG.exception("embedded_sql_build_error build_id=%s", build_id)
+        outcome["error"] = _redacted(exc)
         return 1
     finally:
         if staged_inputs:
             from ._embedded_sql_io import remove_staged
 
             remove_staged(staged_inputs)
+        if planned_landing is not None:
+            _record_bigquery_run(
+                build, contract, contract_dir, planned_landing, started_at, outcome
+            )
+
+
+def _record_bigquery_run(
+    build: Dict[str, Any],
+    contract: Dict[str, Any],
+    contract_dir: Path,
+    landing: Any,
+    started_at: str,
+    outcome: Dict[str, Any],
+) -> None:
+    """Write the run record of a BigQuery-landing build; never changes the build's result."""
+    from ._embedded_sql_io import write_bigquery_run_record
+
+    facts = outcome.get("facts")
+    error = outcome.get("error") or (None if facts else "the build did not reach the load")
+    try:
+        run_id = write_bigquery_run_record(
+            contract, build, contract_dir, landing, started_at=started_at, facts=facts, error=error
+        )
+    except Exception as exc:  # noqa: BLE001 - reported; the load's outcome stands
+        cprint(f"   ⚠️  the run record could not be written: {_redacted(exc)}", markup=False)
+        LOG.warning("embedded_sql_run_record_failed error=%s", type(exc).__name__)
+        return
+    if run_id is not None:
+        LOG.info("embedded_sql_run_recorded build_id=%s run_id=%s", build.get("id"), run_id)
 
 
 def _stage_bigquery(io: Any, contract_dir: Path, build_id: Any) -> Tuple[Any, List[Path]]:
@@ -738,8 +779,11 @@ def _stage_bigquery(io: Any, contract_dir: Path, build_id: Any) -> Tuple[Any, Li
     return io, staged
 
 
-def _load_bigquery_result(landing: Any, build_id: Any) -> int:
-    """Load the staged result into its BigQuery table; 0 only when the rows arrived."""
+def _load_bigquery_result(landing: Any, build_id: Any, outcome: Dict[str, Any]) -> int:
+    """Load the staged result into its BigQuery table; 0 only when the rows arrived.
+
+    ``outcome`` gets the load's facts, or its error, for the run record.
+    """
     from ._embedded_sql_io import load_bigquery_landing
 
     try:
@@ -747,7 +791,9 @@ def _load_bigquery_result(landing: Any, build_id: Any) -> int:
     except Exception as exc:  # noqa: BLE001 - a failed or short load fails the build
         cprint(f"   ❌ BigQuery load into {landing.table_id} failed: {_redacted(exc)}")
         LOG.error("embedded_sql_bigquery_load_failed build_id=%s", build_id)
+        outcome["error"] = _redacted(exc)
         return 1
+    outcome["facts"] = facts
     cprint(
         f"   ⬆ loaded {int(facts['rows']):,} row(s) into BigQuery table {facts['table']} "
         f"(job {facts.get('job_id')}, rows from {facts.get('rows_from')})",

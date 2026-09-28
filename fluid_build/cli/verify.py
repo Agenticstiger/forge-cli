@@ -417,6 +417,32 @@ def _render_table_rows(metadata: Dict[str, Any]) -> None:
         cprint(f"      {metadata['row_count_detail']}", markup=False)
 
 
+def _bigquery_verify_client(bigquery: Any, project: str) -> Tuple[Any, str]:
+    """``(client, project)``: the binding's project, else the client's own.
+
+    A binding with no project (and no ``GOOGLE_PROJECT`` & co.) is loaded into
+    the client's own project, ADC's: ``_bigquery_load.load_file`` names the
+    table from ``client.project``. ``Client(project="")`` keeps the empty
+    string rather than resolving one, so ``None`` is passed and the project
+    read back.
+    """
+    from fluid_build.build_runners._bigquery_load import bigquery_client
+
+    client = bigquery_client(bigquery, project or None)
+    return client, project or str(getattr(client, "project", "") or "")
+
+
+def _no_bigquery_project(dataset: str, table: str) -> Dict[str, Any]:
+    return {
+        "status": "error",
+        "error": (
+            f"No project for {dataset}.{table}: the binding names none, and neither "
+            "GOOGLE_PROJECT / GOOGLE_CLOUD_PROJECT nor the credentials supply one"
+        ),
+        "exists": False,
+    }
+
+
 def verify_bigquery_table(
     project: str,
     dataset: str,
@@ -446,10 +472,12 @@ def verify_bigquery_table(
     against ``BIGQUERY_EMULATOR_HOST``.
     """
     try:
-        from fluid_build.build_runners._bigquery_load import _bigquery_module, bigquery_client
+        from fluid_build.build_runners._bigquery_load import _bigquery_module
 
         bigquery = _bigquery_module()
-        client = bigquery_client(bigquery, project)
+        client, project = _bigquery_verify_client(bigquery, project)
+        if not project:
+            return _no_bigquery_project(dataset, table)
         table_id = f"{project}.{dataset}.{table}"
 
         # Check if table exists

@@ -21,7 +21,8 @@ are the two dimensions the Glue + Athena verifier already reports
 (``_verify_athena``), by the same rules, from one GoogleSQL query:
 
 * **row_count.** ``SELECT COUNT(*)`` of the table, held to the run records of
-  the acquisition build that lands the expose, by the mode the run recorded
+  the build that lands the expose (an acquisition build, or an embedded-SQL
+  build whose load records its run the same way), by the mode the run recorded
   (equal for ``full_refresh``, at least the sum since the last full load for
   ``incremental_append``, reported for anything else). A run counts as this
   table's when its ``facets.bigquery_load`` names the table: the load the
@@ -170,7 +171,14 @@ def add_data_dimensions(
         result["error"] = f"BigQuery could not count {table_id}: {exc}"
         return result
     try:
-        landed, info = _landed_rows(contract, expose_id, workdir, table_id, wrote_into=_loaded_into)
+        landed, info = _landed_rows(
+            contract,
+            expose_id,
+            workdir,
+            table_id,
+            wrote_into=_loaded_into,
+            embedded_sql_records=True,
+        )
     except Exception as exc:  # noqa: BLE001 - an unreadable record is not a count
         LOG.warning("verify_bigquery_run_record_unreadable error=%s", type(exc).__name__)
         landed, info = None, {"source": "none", "note": "the run record could not be read"}

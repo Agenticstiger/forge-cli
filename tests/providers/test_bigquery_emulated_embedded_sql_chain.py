@@ -425,7 +425,16 @@ def test_one_contract_per_product_builds_the_same_rows_on_local_and_on_bigquery(
 
     # fluid verify --env gcp --strict: bronze passes, row count and masking.
     assert _verify(paths["bronze"]) == 0
+    # Silver and gold are held to the rows their loads landed, as bronze is:
+    # the embedded-SQL build records its load in a run record.
+    capsys.readouterr()
     assert _verify(paths["silver"]) == 0
+    assert _verify(paths["gold"]) == 0
+    report = " ".join(capsys.readouterr().out.split())
+    assert (
+        f"{len(local_silver):,} rows, equal to what build summarize_subscription_status" in report
+    )
+    assert f"{len(local_gold):,} rows, equal to what build identify_retention_candidates" in report
 
     # One cleartext msisdn in the table, and --strict fails.
     first = bronze[1][0]
