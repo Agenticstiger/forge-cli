@@ -128,8 +128,13 @@ class TestRendering:
     def test_a_restriction_becomes_the_grants_excluded_columns(self):
         grants = _grants(_contract(restrictions=DENY, principals=MAPPED))
         assert _excluded(grants[ANALYST]) == ["customer_id", "msisdn"]
+        # A derived exclusion makes the grant column-limited, so it carries SELECT
+        # alone like a hand-written one (#679): Lake Formation refuses DESCRIBE to
+        # a principal holding a partial SELECT.
+        assert grants[ANALYST]["permissions"] == ["SELECT"]
         # The steward may read everything: a plain table grant, as before.
         assert "table" in grants[STEWARD] and "table_with_columns" not in grants[STEWARD]
+        assert grants[STEWARD]["permissions"] == ["SELECT", "DESCRIBE"]
 
     def test_the_hand_written_exclusion_keeps_working_without_a_restriction(self):
         grants = _grants(_contract(analyst_excluded=["customer_id", "msisdn"]))
