@@ -352,7 +352,7 @@ def _print_embedded_sql_io(io: Any) -> None:
             f'   ⬅ consumes {r.product_id}/{r.expose_id} as view "{r.view}": {r.uri}',
             markup=False,
         )
-    if io.inputs:
+    if io.inputs and io.bigquery_landing is None:
         cprint(
             "     (no run record or lineage event on this path: the resolved inputs are "
             "listed here and in runtime/out/local_apply_log.jsonl)",
@@ -360,6 +360,16 @@ def _print_embedded_sql_io(io: Any) -> None:
         )
     if io.landing is not None:
         cprint(f"   ➡ lands {io.landing.uri}", markup=False)
+    if io.bigquery_landing is not None:
+        cprint(
+            f"   ➡ lands BigQuery table {io.bigquery_landing.table_id} "
+            f"({io.bigquery_landing.location}): staged as Parquet, then one load job "
+            "(WRITE_TRUNCATE), recorded in the build's run record",
+            markup=False,
+        )
+    for warning in getattr(io, "warnings", None) or []:
+        cprint(f"   ⚠️  {warning}", markup=False)
+        LOG.warning("embedded_sql_plan_warning %s", warning)
 
 
 def _print_action_errors(results: List[Dict[str, Any]], io: Any) -> None:
@@ -399,6 +409,12 @@ def _bind_embedded_sql_io(actions: List[Dict[str, Any]], io: Any) -> None:
         ]
         if io.landing is not None:
             action["outputs"] = [io.landing.as_output_spec()]
+        if io.bigquery_landing is not None:
+            # The staged file the load reads, never the binding's own
+            # location.path (a gs:// staging prefix is not a local file).
+            if io.bigquery_landing.staged is None:
+                raise RuntimeError("the BigQuery landing was not staged before the SQL ran")
+            action["outputs"] = [{"path": io.bigquery_landing.staged, "format": "parquet"}]
 
 
 def _local_sql_actions(
@@ -552,8 +568,15 @@ def _execute_embedded_sql_build(
     runs, and so does one naming this contract's own id. The
     result lands in S3 when the first expose is an AWS object-store binding,
     at the object the duckdb acquisition runner would write for it; a local
-    binding is unchanged. An expose declaring ``policy.privacy.masking`` is
-    refused on this path, which does not apply it.
+    binding is unchanged. An entry resolving to a GCP ``bigquery_table`` is
+    read through the BigQuery API into a staged Parquet file first, and a
+    first expose bound to one is loaded into that table by one load job after
+    the SQL (``_embedded_sql_io.stage_bigquery_io`` /
+    ``load_bigquery_landing``); a failed or short load fails the build. Any
+    other landing this path cannot write (a ``gs://`` path, a GCS bucket,
+    another warehouse) is refused before the SQL runs. An expose declaring
+    ``policy.privacy.masking`` is refused on this path, which does not apply
+    it.
 
     Returns 0 on success, 1 on failure.
     """
@@ -577,12 +600,9 @@ def _execute_embedded_sql_build(
     cprint(f"🔷 Build '{build_id}' (embedded-SQL / {engine_label})")
 
     io = None
-    # Only a build carrying inline SQL reads the views: one without it (a
-    # multi-stage ``engine: sql`` build) keeps the provider's old handling.
-    has_inline_sql = bool(str((build.get("properties") or {}).get("sql") or "").strip())
-    if platform in LOCAL_SQL_PLATFORMS and has_inline_sql:
-        io = _plan_duckdb_io(unresolved_contract, build, contract_dir, env=env)
-        if io is None:
+    if platform in LOCAL_SQL_PLATFORMS:
+        planned, io = _plan_local_sql(unresolved_contract, build, contract_dir, env=env)
+        if not planned:
             return 1
 
     if dry_run:
@@ -617,8 +637,64 @@ def _execute_embedded_sql_build(
             LOG.exception("embedded_sql_build_error build_id=%s", build_id)
             return 1
 
+    return _run_local_sql(build, contract, contract_dir, io)
+
+
+def _plan_local_sql(
+    unresolved_contract: Dict[str, Any],
+    build: Dict[str, Any],
+    contract_dir: Path,
+    *,
+    env: Optional[str],
+) -> Tuple[bool, Any]:
+    """``(planned, io)`` for a build on the local DuckDB engine; ``planned`` False if refused.
+
+    Only a build carrying inline SQL reads the views (``io``): one without it
+    (a multi-stage ``engine: sql`` build) keeps the provider's old handling,
+    except that a first expose it would write as a local file of the wrong
+    kind (a BigQuery table, a ``gs://`` path) is refused.
+    """
+    has_inline_sql = bool(str((build.get("properties") or {}).get("sql") or "").strip())
+    if has_inline_sql:
+        io = _plan_duckdb_io(unresolved_contract, build, contract_dir, env=env)
+        return io is not None, io
+    from fluid_build._errors import FluidUserError
+
+    from ._embedded_sql_io import refuse_unlandable_first_expose
+
+    try:
+        refuse_unlandable_first_expose(unresolved_contract)
+    except FluidUserError as exc:
+        _print_typed_error(exc)
+        LOG.error("embedded_sql_io_refused build_id=%s code=%s", build.get("id"), exc.code)
+        return False, None
+    return True, None
+
+
+def _run_local_sql(
+    build: Dict[str, Any], contract: Dict[str, Any], contract_dir: Path, io: Any
+) -> int:
+    """Run the build on the local provider's DuckDB; 0 on success, 1 on failure.
+
+    A BigQuery upstream is staged first and its copy removed afterwards; a
+    BigQuery landing is loaded after the SQL, and a failed load fails the build.
+    """
+    import time
+
+    from ._acquisition_common import utc_now_iso
+
+    build_id = build.get("id", "unknown")
+    staged_inputs: List[Path] = []
+    # A BigQuery landing is recorded as a run, as the acquisition load is, so
+    # ``fluid verify`` holds the table to the rows it landed.
+    planned_landing = io.bigquery_landing if io is not None else None
+    outcome: Dict[str, Any] = {}
+    started_at = utc_now_iso()
     try:
         from fluid_build.providers.local.local import LocalProvider
+
+        if io is not None and (io.bigquery_inputs or io.bigquery_landing is not None):
+            io, staged_inputs = _stage_bigquery(io, contract_dir, build_id)
 
         # ``anchor_dir``: a relative ``location.path`` lands under the
         # source contract's directory, the same place the acquisition
@@ -640,15 +716,90 @@ def _execute_embedded_sql_build(
                     written_files.extend(r.get("written", []))
             for p in written_files:
                 cprint(f"   📁 {p}")
+            if io is not None and io.bigquery_landing is not None:
+                return _load_bigquery_result(io.bigquery_landing, build_id, outcome)
             return 0
         else:
             cprint(f"   ❌ Failed: {failed} action(s) failed")
             _print_action_errors(result.get("results") or [], io)
+            outcome["error"] = f"{failed} action(s) failed"
             return 1
     except Exception as exc:
         cprint(f"   ❌ Embedded-SQL build '{build_id}' error: {_redacted(exc)}")
         LOG.exception("embedded_sql_build_error build_id=%s", build_id)
+        outcome["error"] = _redacted(exc)
         return 1
+    finally:
+        if staged_inputs:
+            from ._embedded_sql_io import remove_staged
+
+            remove_staged(staged_inputs)
+        if planned_landing is not None:
+            _record_bigquery_run(
+                build, contract, contract_dir, planned_landing, started_at, outcome
+            )
+
+
+def _record_bigquery_run(
+    build: Dict[str, Any],
+    contract: Dict[str, Any],
+    contract_dir: Path,
+    landing: Any,
+    started_at: str,
+    outcome: Dict[str, Any],
+) -> None:
+    """Write the run record of a BigQuery-landing build; never changes the build's result."""
+    from ._embedded_sql_io import write_bigquery_run_record
+
+    facts = outcome.get("facts")
+    error = outcome.get("error") or (None if facts else "the build did not reach the load")
+    try:
+        run_id = write_bigquery_run_record(
+            contract, build, contract_dir, landing, started_at=started_at, facts=facts, error=error
+        )
+    except Exception as exc:  # noqa: BLE001 - reported; the load's outcome stands
+        cprint(f"   ⚠️  the run record could not be written: {_redacted(exc)}", markup=False)
+        LOG.warning("embedded_sql_run_record_failed error=%s", type(exc).__name__)
+        return
+    if run_id is not None:
+        LOG.info("embedded_sql_run_recorded build_id=%s run_id=%s", build.get("id"), run_id)
+
+
+def _stage_bigquery(io: Any, contract_dir: Path, build_id: Any) -> Tuple[Any, List[Path]]:
+    """Read every BigQuery upstream into a staged Parquet file, printing each read."""
+    from ._embedded_sql_io import stage_bigquery_io
+
+    io, staged, reads = stage_bigquery_io(io, contract_dir, build_id, logger=LOG)
+    for read in reads:
+        cprint(
+            f'   ⬇ read {int(read["rows"]):,} row(s) from BigQuery table {read["table"]} '
+            f'for view "{read["view"]}"',
+            markup=False,
+        )
+    return io, staged
+
+
+def _load_bigquery_result(landing: Any, build_id: Any, outcome: Dict[str, Any]) -> int:
+    """Load the staged result into its BigQuery table; 0 only when the rows arrived.
+
+    ``outcome`` gets the load's facts, or its error, for the run record.
+    """
+    from ._embedded_sql_io import load_bigquery_landing
+
+    try:
+        facts = load_bigquery_landing(landing, logger=LOG)
+    except Exception as exc:  # noqa: BLE001 - a failed or short load fails the build
+        cprint(f"   ❌ BigQuery load into {landing.table_id} failed: {_redacted(exc)}")
+        LOG.error("embedded_sql_bigquery_load_failed build_id=%s", build_id)
+        outcome["error"] = _redacted(exc)
+        return 1
+    outcome["facts"] = facts
+    cprint(
+        f"   ⬆ loaded {int(facts['rows']):,} row(s) into BigQuery table {facts['table']} "
+        f"(job {facts.get('job_id')}, rows from {facts.get('rows_from')})",
+        markup=False,
+    )
+    return 0
 
 
 def _manifest_env(path: Any) -> Optional[str]:
