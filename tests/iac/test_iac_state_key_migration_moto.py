@@ -30,7 +30,10 @@ old object left in place, a second apply that moves nothing, a wiped
 workdir (CI) as well as a kept one, the data-loss gate still closed after
 the move, another provider's state at the old key left alone, a state of
 two clouds refused, and a new key that already holds state never
-overwritten.
+overwritten. And the read-only paths: ``fluid apply --dry-run`` (the
+generated Jenkins default) and the ``fluid diff`` / ``verify --state-drift``
+pass plan against the old key while the move is pending and write nothing;
+the dry-run used to copy the state and write the new key.
 
 Skipped unless ``tofu`` is on PATH and moto's ``server`` extra is installed.
 """
@@ -137,6 +140,10 @@ def _object(endpoint: str, key: str) -> Dict[str, Any]:
     return json.loads(body)
 
 
+def _addresses(state: Dict[str, Any]) -> list:
+    return sorted((r["mode"], r["type"], r["name"]) for r in state["resources"])
+
+
 def _keys(endpoint: str) -> set:
     listing = _s3(endpoint).list_objects_v2(Bucket=_STATE_BUCKET)
     return {o["Key"] for o in listing.get("Contents", [])}
@@ -201,9 +208,10 @@ def _apply_as_the_old_release(contract_path: Path, root: Path) -> None:
     _apply(contract_path, root, state_backend=f"s3://{_STATE_BUCKET}/{_LEGACY_KEY}")
 
 
-def _upgraded_plan(contract_path: Path, root: Path, monkeypatch) -> None:
+def _upgraded_apply(contract_path: Path, root: Path, monkeypatch, *, dry_run=False) -> None:
+    """The first apply of the upgraded release (a real one moves the state)."""
     monkeypatch.setenv("FLUID_STATE_BACKEND", f"s3://{_STATE_BUCKET}")
-    _apply(contract_path, root, dry_run=True)
+    _apply(contract_path, root, dry_run=dry_run)
 
 
 def _block(key: str) -> Dict[str, Any]:
@@ -244,7 +252,7 @@ def test_the_old_state_moves_and_the_plan_after_it_changes_nothing(
         shutil.rmtree(tmp_path / ".fluid")
     capsys.readouterr()
 
-    _upgraded_plan(contract, tmp_path, monkeypatch)
+    _upgraded_apply(contract, tmp_path, monkeypatch)
 
     # The console wraps long lines; the checks read the text unwrapped.
     printed = capsys.readouterr().out.replace("\n", "")
@@ -252,16 +260,71 @@ def test_the_old_state_moves_and_the_plan_after_it_changes_nothing(
     assert f"state move:  moved {len(old['resources'])} resource(s)" in printed
     assert "tofu plan: +0 ~0 -0" in printed
     moved = _object(moto, _AWS_KEY)
-    # OpenTofu writes the copy under a fresh lineage; the resources are the same.
-    assert moved["resources"] == old["resources"]
+    # The same resources (the move verified them exactly before the apply,
+    # whose refresh then rewrote the object at the new key).
+    assert _addresses(moved) == _addresses(old)
     # Never lost: the old object is left exactly where it was.
     assert _object(moto, _LEGACY_KEY) == old
 
-    # The next apply finds its state at the new key and moves nothing.
-    _upgraded_plan(contract, tmp_path, monkeypatch)
+    # The next run finds its state at the new key and moves nothing.
+    _upgraded_apply(contract, tmp_path, monkeypatch, dry_run=True)
     again = capsys.readouterr().out.replace("\n", "")
     assert "state move:" not in again
     assert "tofu plan: +0 ~0 -0" in again
+
+
+def test_a_dry_run_moves_nothing_and_plans_on_the_old_key(moto, tmp_path, monkeypatch, capsys):
+    """``fluid apply --dry-run`` is plan only: while the move is pending it
+    reads the old key, writes no object, and leaves the move to the first
+    real apply. It used to copy the state (measured: the new key appeared)."""
+    contract = _write(tmp_path, _contract())
+    _apply_as_the_old_release(contract, tmp_path)
+    old = _object(moto, _LEGACY_KEY)
+    before = _keys(moto)
+    capsys.readouterr()
+
+    _upgraded_apply(contract, tmp_path, monkeypatch, dry_run=True)
+
+    printed = capsys.readouterr().out.replace("\n", "")
+    assert _keys(moto) == before, f"a dry-run wrote {sorted(_keys(moto) - before)}"
+    assert _object(moto, _LEGACY_KEY) == old
+    assert f"read from s3://{_STATE_BUCKET}/{_LEGACY_KEY}" in printed
+    assert "tofu plan: +0 ~0 -0" in printed
+    assert "dry-run: plan only" in printed
+
+    # The first real apply, from the same (kept) workdir, does the move.
+    _upgraded_apply(contract, tmp_path, monkeypatch)
+    after = capsys.readouterr().out.replace("\n", "")
+    assert f"state move:  moved {len(old['resources'])} resource(s)" in after
+    assert "tofu plan: +0 ~0 -0" in after
+    assert _addresses(_object(moto, _AWS_KEY)) == _addresses(old)
+    assert _object(moto, _LEGACY_KEY) == old
+
+
+def test_the_drift_pass_reads_the_old_key_while_the_move_is_pending(moto, tmp_path, monkeypatch):
+    """``fluid diff`` / ``verify --state-drift`` before any upgraded apply: the
+    real state, at the old key, with every resource in it, and nothing written.
+    Pointed at the new key instead, the pass found an empty state and said
+    ``not_checked``, a silent pass for a contract whose resources exist."""
+    from fluid_build.cli import _diff_state
+
+    contract_path = _write(tmp_path, _contract())
+    _apply_as_the_old_release(contract_path, tmp_path)
+    old = _object(moto, _LEGACY_KEY)
+    before = _keys(moto)
+    monkeypatch.setenv("FLUID_STATE_BACKEND", f"s3://{_STATE_BUCKET}")
+    args = argparse.Namespace(provider=None, state_backend=None, workspace_dir=str(tmp_path))
+
+    report = _diff_state.check_state_drift(
+        yaml.safe_load(contract_path.read_text(encoding="utf-8")), args, _LOG
+    )
+
+    assert report.status == "checked", report.detail
+    assert report.state == f"remote: s3://{_STATE_BUCKET}/{_LEGACY_KEY}"
+    managed = [r for r in old["resources"] if r.get("mode") == "managed"]
+    assert len(report.resources) == len(managed)
+    assert not report.has_drift
+    assert _keys(moto) == before
 
 
 def test_the_data_loss_gate_still_closes_after_the_move(moto, tmp_path, monkeypatch):

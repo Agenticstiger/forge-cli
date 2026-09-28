@@ -500,6 +500,10 @@ def _base_platforms(contract: Mapping[str, Any]) -> List[str]:
     return out
 
 
+#: How :func:`declared_environments` names the contract's own block.
+CONTRACT_ENVIRONMENTS_BLOCK = "the contract's environments block"
+
+
 def declared_environments(
     contract_path: str | Path, contract: Mapping[str, Any]
 ) -> List[Tuple[str, List[str]]]:
@@ -514,7 +518,7 @@ def declared_environments(
     found: List[Tuple[str, List[str]]] = []
     environments = contract.get("environments")
     if isinstance(environments, dict) and environments:
-        found.append(("the contract's environments block", [str(k) for k in environments]))
+        found.append((CONTRACT_ENVIRONMENTS_BLOCK, [str(k) for k in environments]))
     try:
         from .util.workspace_root import WORKSPACE_CONFIG_FILENAME, find_workspace_root
 
@@ -546,13 +550,19 @@ def declared_environments(
 def refuse_declared_missing_overlay(
     contract_path: str | Path, env: str, contract: Mapping[str, Any]
 ) -> None:
-    """Refuse ``--env <env>`` with no overlay when the product declares ``env``.
+    """Refuse ``--env <env>`` with no overlay when the workspace expects ``env``.
 
     Without an overlay the base contract is used unchanged, which for a
     declared environment means deploying it as if it were that environment
     (measured: silver ``--env gcp`` validated and planned the local base,
-    rc=0). The base-by-convention ``dev`` and an env the base contract is
-    already bound to (``local`` for a local base) are the base, and pass.
+    rc=0). The declaration that refuses is the workspace's
+    ``expected-environments``: a statement that this product has one overlay
+    per environment. The contract's own ``environments`` block does not
+    refuse. It is schema-valid, forge-cli applies nothing from it, and
+    refusing on it broke contracts that validated before, so
+    :func:`note_missing_overlay` names it in its warning instead. The
+    base-by-convention ``dev`` and an env the base contract is already bound
+    to (``local`` for a local base) are the base, and pass.
     """
     if env == BASE_ENV_BY_CONVENTION:
         return
@@ -560,6 +570,8 @@ def refuse_declared_missing_overlay(
     if env in platforms:
         return
     for source, envs in declared_environments(contract_path, contract):
+        if source == CONTRACT_ENVIRONMENTS_BLOCK:
+            continue
         if env in envs:
             from ._contract_loader import CLIError
 
@@ -602,8 +614,10 @@ def note_missing_overlay(
     once per (contract, env) per process — one command loads the same
     contract several times.
 
-    ``contract`` (the base) enables the refusal: an env the product declares
-    (:func:`refuse_declared_missing_overlay`) is an error, every time.
+    ``contract`` (the base) enables the refusal: an env the workspace
+    expects (:func:`refuse_declared_missing_overlay`) is an error, every
+    time. An env only the contract's ``environments`` block names is said in
+    the warning.
     """
     log = logger or LOG
     if contract is not None:
@@ -625,19 +639,28 @@ def note_missing_overlay(
         return
     existing = available_overlay_envs(contract_key)
     platforms = _base_platforms(contract) if contract is not None else []
+    environments = contract.get("environments") if contract is not None else None
+    in_block = isinstance(environments, dict) and env in environments
     log.warning(
         "overlay_not_found: --env %r matched no overlay for %s, so the BASE contract is "
-        "used unchanged%s. Overlays that exist: %s. Add an overlay for it under overlays/ "
+        "used unchanged%s.%s Overlays that exist: %s. Add an overlay for it under overlays/ "
         "or pass one of the existing environments.",
         env,
         contract_key,
         f" (it binds to {', '.join(platforms)}, not to {env!r})" if platforms else "",
+        (
+            f" The contract's environments block names {env!r}, but forge-cli applies "
+            "nothing from that block; an overlay is what changes a binding."
+            if in_block
+            else ""
+        ),
         ", ".join(existing) if existing else "none",
         extra={
             "event": "overlay_not_found",
             "env": env,
             "available_envs": existing,
             "base_platforms": platforms,
+            "declared_in_environments_block": in_block,
         },
     )
 

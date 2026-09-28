@@ -111,6 +111,29 @@ class ApplyRunReport:
 
     # -- filled by the apply engine ------------------------------------
 
+    def identify(
+        self,
+        *,
+        contract: Mapping[str, Any],
+        provider: Optional[str] = None,
+        environment: Optional[str] = None,
+    ) -> None:
+        """What the run is for, as soon as the engine knows it; registers nothing.
+
+        A run refused before :meth:`begin` (a sovereignty refusal in the
+        emitter, a provider that cannot be resolved) is then still reported
+        with its product, contract version and platform.
+        """
+        try:
+            if environment:
+                self.environment = environment
+            self.metadata.update(_contract_facts(contract))
+            if provider:
+                self.provider = provider
+                self.metadata["platform"] = provider
+        except Exception as exc:  # noqa: BLE001 - reporting never fails an apply
+            _LOG.debug("command center report: identify failed: %s", type(exc).__name__)
+
     def begin(
         self,
         *,
@@ -163,6 +186,11 @@ class ApplyRunReport:
         self._finished = True
         try:
             if not self._began:
+                if not self.metadata.get("product_id"):
+                    # Refused before the engine read the contract (plan
+                    # binding, a declared env with no overlay): the base
+                    # document still says which product this run was for.
+                    self.metadata.update(_base_contract_facts(self.contract_path))
                 self._register()
             reporter = self._reporter
             if reporter is None:
@@ -276,6 +304,37 @@ def _contract_facts(contract: Mapping[str, Any]) -> Dict[str, Any]:
     except Exception:  # noqa: BLE001 - a hash is a join key, not required
         pass
     return facts
+
+
+def _base_contract_facts(contract_path: Optional[str]) -> Dict[str, Any]:
+    """Identity facts from the base contract (or a plan's embedded one), no overlay.
+
+    For a run that failed before the engine loaded the contract, possibly
+    because its overlay could not be applied. The product id and versions
+    are the base's (an overlay rebinds, it does not rename). No contract
+    hash: the Command Center keys versions by the hash of the compiled
+    contract, which this run never produced.
+    """
+    if not contract_path:
+        return {}
+    try:
+        if contract_path.endswith(".json"):
+            import json
+
+            with open(contract_path, encoding="utf-8") as handle:
+                plan = json.load(handle)
+            contract = plan.get("contract") if isinstance(plan, dict) else None
+        else:
+            from fluid_build.loader import load_contract
+
+            contract = load_contract(contract_path)
+    except Exception:  # noqa: BLE001 - an unreadable contract is simply not described
+        return {}
+    if not isinstance(contract, Mapping):
+        return {}
+    facts = _contract_facts(contract)
+    facts.pop("contract_hash", None)
+    return {k: v for k, v in facts.items() if v is not None}
 
 
 def _command_center_config(logger: logging.Logger):

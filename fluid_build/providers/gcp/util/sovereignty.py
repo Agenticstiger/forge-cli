@@ -78,7 +78,10 @@ def resource_placements(resources: Mapping[str, Any]) -> List[Placement]:
     """``(address, location)`` for every emitted resource that names one.
 
     ``resources`` is the plugin's ``{type: {name: body}}``. A value that is an
-    OpenTofu reference (``${...}``) is not a place and is skipped.
+    OpenTofu reference (``${...}``) is not a place and is skipped. A Pub/Sub
+    topic has no ``location``: where its messages are stored is its
+    ``message_storage_policy.allowed_persistence_regions``, one placement
+    per region.
     """
     out: List[Placement] = []
     for rtype, by_name in (resources or {}).items():
@@ -89,9 +92,27 @@ def resource_placements(resources: Mapping[str, Any]) -> List[Placement]:
                 continue
             for key in ("location", "region"):
                 value = body.get(key)
-                if isinstance(value, str) and value and not value.startswith("${"):
-                    out.append((f"{rtype}.{name}", value))
+                if _is_place(value):
+                    out.append((f"{rtype}.{name}", str(value)))
                     break
+            for region in _persistence_regions(body):
+                out.append((f"{rtype}.{name}", region))
+    return out
+
+
+def _is_place(value: Any) -> bool:
+    return isinstance(value, str) and bool(value) and not value.startswith("${")
+
+
+def _persistence_regions(body: Mapping[str, Any]) -> List[str]:
+    """``message_storage_policy.allowed_persistence_regions`` (block as object or list)."""
+    policy = body.get("message_storage_policy")
+    blocks = policy if isinstance(policy, list) else [policy]
+    out: List[str] = []
+    for block in blocks:
+        if isinstance(block, Mapping):
+            regions = block.get("allowed_persistence_regions") or []
+            out.extend(str(r) for r in regions if _is_place(r))
     return out
 
 
@@ -120,7 +141,11 @@ def gcp_sovereignty_violations(
     everything = unplaced_gcp_exposes(contract) + list(placements)
     if not everything:
         return []
-    _, violations = SovereigntyValidator().check_placements(sovereignty, everything)
+    # Every placement here is a GCP one, so a jurisdiction the table cannot
+    # resolve is refused under strict, as for any cloud region (check 3).
+    _, violations = SovereigntyValidator().check_placements(
+        sovereignty, everything, region_placed={where for where, _ in everything}
+    )
     return violations
 
 

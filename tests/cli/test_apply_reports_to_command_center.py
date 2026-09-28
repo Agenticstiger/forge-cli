@@ -374,3 +374,101 @@ def test_a_private_address_is_refused_before_the_credential_is_sent(
     assert _apply(product) == 0
     assert called == []
     assert "private or metadata address" in " ".join(capsys.readouterr().out.split())
+
+
+# ── A run refused before the engine registered it still names its product ──
+
+
+def test_a_sovereignty_refusal_is_reported_with_its_product(product, tofu, cc, monkeypatch):
+    """The gcp overlay loses its region under a strict policy: the emitter
+    refuses before the run is registered, and the run still says whose it is."""
+    from fluid_build._errors import SovereigntyViolationError
+
+    url, recorder = cc
+    _configure(monkeypatch, url)
+    doc = yaml.safe_load(product.read_text(encoding="utf-8"))
+    doc["sovereignty"] = {
+        "jurisdiction": "EU",
+        "allowedRegions": ["europe-west1"],
+        "enforcementMode": "strict",
+    }
+    product.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    overlay = product.parent / "overlays" / "gcp.yaml"
+    placed = yaml.safe_load(overlay.read_text(encoding="utf-8"))
+    placed["exposes"][0]["binding"]["location"].pop("region")
+    overlay.write_text(yaml.safe_dump(placed), encoding="utf-8")
+
+    with pytest.raises(SovereigntyViolationError):
+        _apply(product)
+
+    (post,) = _by(recorder, "POST")
+    (patch,) = _by(recorder, "PATCH")
+    assert post["body"]["provider"] == "gcp"
+    assert post["body"]["environment"] == "gcp"
+    metadata = post["body"]["metadata"]
+    assert metadata["product_id"] == "bronze.customer_subscriptions"
+    assert metadata["contract_version"] == "1.4.0"
+    assert metadata["platform"] == "gcp"
+    assert metadata["contract_hash"]
+    assert patch["body"]["status"] == "failed"
+    assert patch["body"]["result"]["error_event"] == "SovereigntyViolationError"
+
+
+def test_a_run_refused_before_the_contract_loads_names_the_base_product(
+    product, tofu, cc, monkeypatch
+):
+    """``--env prod`` that the workspace expects, with no prod overlay: the
+    loader refuses, and the run is still attached to the product."""
+    url, recorder = cc
+    _configure(monkeypatch, url)
+    (product.parent / "fluid.workspace.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workspace": {"name": "cc"},
+                "expected-environments": {"bronze.customer_subscriptions": ["gcp", "prod"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    from fluid_build import loader
+    from fluid_build.cli import build_parser
+
+    loader._NOTED_MISSING_OVERLAYS.clear()
+    args = build_parser().parse_args(
+        ["apply", str(product), "--env", "prod", "--yes", "--no-verify-federation"]
+    )
+    with pytest.raises(CLIError) as exc:
+        args.func(args, _LOG)
+    assert exc.value.event == "overlay_declared_but_missing"
+
+    (post,) = _by(recorder, "POST")
+    (patch,) = _by(recorder, "PATCH")
+    metadata = post["body"]["metadata"]
+    assert metadata["product_id"] == "bronze.customer_subscriptions"
+    assert metadata["contract_version"] == "1.4.0"
+    assert post["body"]["environment"] == "prod"
+    # No platform (no overlay settled one) and no hash of a contract never compiled.
+    assert "contract_hash" not in metadata
+    assert post["body"]["provider"] is None
+    assert patch["body"]["result"]["error_event"] == "overlay_declared_but_missing"
+
+
+def test_a_provider_that_cannot_be_resolved_is_reported_with_its_product(
+    product, tofu, cc, monkeypatch
+):
+    """``--provider aws`` against the gcp overlay: refused while the apply
+    picks its engine, before the engine runs; the base names the product."""
+    url, recorder = cc
+    _configure(monkeypatch, url)
+
+    with pytest.raises(CLIError) as exc:
+        _apply(product, "--provider", "aws")
+    assert exc.value.event == "generate_iac_provider_mismatch"
+
+    (post,) = _by(recorder, "POST")
+    metadata = post["body"]["metadata"]
+    assert metadata["product_id"] == "bronze.customer_subscriptions"
+    assert metadata["contract_version"] == "1.4.0"
+    assert "platform" not in metadata
+    assert "contract_hash" not in metadata
+    assert post["body"]["environment"] == "gcp"

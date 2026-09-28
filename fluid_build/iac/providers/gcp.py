@@ -1023,10 +1023,17 @@ def _emit_pubsub(
 ) -> None:
     topic = loc.get("topic") or f"{cid}-topic"
     topic_res = safe_ident(f"{cid}_{topic}")
-    resources.setdefault("google_pubsub_topic", {})[topic_res] = {
-        "name": topic,
-        "labels": labels,
-    }
+    body: Dict[str, Any] = {"name": topic, "labels": labels}
+    # The binding's region is where the topic's messages may be stored:
+    # hashicorp/google ``google_pubsub_topic.message_storage_policy``
+    # (``allowed_persistence_regions``). It was dropped, so a topic bound to
+    # europe-west1 under an EU-only sovereignty block passed validate and
+    # stored messages wherever Pub/Sub chose. The GCP sovereignty hook reads
+    # the same field back (``resource_placements``).
+    region = loc.get("region") or loc.get("location")
+    if region:
+        body["message_storage_policy"] = {"allowed_persistence_regions": [str(region)]}
+    resources.setdefault("google_pubsub_topic", {})[topic_res] = body
     subscription = loc.get("subscription")
     if subscription:
         resources.setdefault("google_pubsub_subscription", {})[

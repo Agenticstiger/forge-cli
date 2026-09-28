@@ -49,6 +49,8 @@ from fluid_build.iac.state_migration import (
     PENDING,
     StateMigrationError,
     StateReconciliation,
+    other_clouds,
+    read_state,
     records_backend,
 )
 from fluid_build.iac.state_migration import reconcile_state_key as _reconcile_state
@@ -72,6 +74,14 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
 
     contract = _load_contract(args, logger)
     provider = _resolve_provider(contract, getattr(args, "provider", None) or "auto")
+    report = current_report()
+    if report is not None:
+        # Known from here on, so a refusal before the run is registered (a
+        # sovereignty refusal in the emitter, an init that fails) still
+        # reaches the Command Center with its product, version and platform.
+        # A run refused earlier is described from the base contract instead
+        # (``ApplyRunReport.finish``).
+        report.identify(contract=contract, provider=provider, environment=_applied_env(args))
 
     plugin = get_iac_plugin(provider)
     if plugin is None:
@@ -141,7 +151,6 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     # The Command Center hears about the run now that the product, the
     # provider and the environment are known (best effort; see
     # cli/_apply_cc_report.py). Addresses and counts only, never tofu output.
-    report = current_report()
     if report is not None:
         report.begin(
             contract=contract,
@@ -159,11 +168,35 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     if not init.ok:
         raise CLIError(1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)})
 
-    # State a previous release kept at the key without the provider moves to
-    # this provider's key (OpenTofu's own ``init -migrate-state``), so the
-    # first apply after the upgrade does not plan every resource as new
-    # (see ``iac.state_migration``). Before anything reads the state.
-    reconcile_state_key(target, provider, env, logger, migrate=True)
+    dry_run = bool(getattr(args, "dry_run", False))
+    if dry_run:
+        # A dry-run is plan only and writes no state, so it never moves any
+        # either: while the move is pending it plans against the old key, the
+        # read-only path ``fluid diff`` takes (``read_target``). The copy is
+        # left to the first real apply, which a plan-only CI role with
+        # read-only state access never runs.
+        read = read_target(target, provider, env, logger)
+        if read is not target:
+            target = read
+            module, actions = emit_module(plugin, contract, target, logger)
+            module_path.write_text(module, encoding="utf-8")
+            init = runner.tofu_init(str(workdir), backend=True, env=env, reconfigure=True)
+            if not init.ok:
+                raise CLIError(
+                    1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)}
+                )
+    else:
+        # State a previous release kept at the key without the provider moves
+        # to this provider's key (OpenTofu's own ``init -migrate-state``), so
+        # the first apply after the upgrade does not plan every resource as
+        # new (see ``iac.state_migration``). Before anything reads the state.
+        reconcile_state_key(target, provider, env, logger, migrate=True)
+
+    # One state, two clouds: a key that does not name the provider (the
+    # shared ``fluid/terraform.tfstate`` a bucket-only --state-backend gives a
+    # contract without packaging, or an explicit key used for both) can hold
+    # the other cloud's resources, which this plan would destroy.
+    guard_state_shared_with_another_cloud(target, provider, env)
 
     # Pre-plan region guard. A module now pins the region its bindings name,
     # and moving a contract's resources to it would not show as a destroy.
@@ -241,7 +274,7 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
             **changes,
         )
 
-    if bool(getattr(args, "dry_run", False)):
+    if dry_run:
         cprint("\ndry-run: plan only — not applying.")
         info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
         return 0
@@ -444,6 +477,57 @@ def reconcile_state_key(
             resources=outcome.resources,
         )
     return outcome
+
+
+def _key_names_provider(backend: Mapping[str, Any], provider: str) -> bool:
+    """True when the backend's key (or GCS prefix) has ``provider`` as a path segment."""
+    if "s3" in backend:
+        path = str((backend.get("s3") or {}).get("key") or "")
+    elif "gcs" in backend:
+        path = str((backend.get("gcs") or {}).get("prefix") or "")
+    else:
+        return False
+    return provider in path.split("/")
+
+
+def guard_state_shared_with_another_cloud(
+    target: StateTarget, provider: str, env: Mapping[str, str]
+) -> None:
+    """Refuse a remote state whose key names no provider and holds another cloud's resources.
+
+    The per-provider default keys (``fluid/<id>/<provider>/...``) cannot be
+    shared by two clouds, and local state lives in a per-provider workdir, so
+    only a remote key that does not name the provider is read (one ``tofu
+    state pull``). Whose resources they are is the migration's own rule
+    (``state_migration.other_clouds``). Without this, the gcp plan on a key
+    the aws apply wrote reads the aws resources as orphans, and
+    ``--allow-data-loss`` destroys them.
+    """
+    if target.backend is None or _key_names_provider(target.backend, provider):
+        return
+    location = backend_location(target.backend)
+    try:
+        doc = read_state(target.workdir, env)
+    except StateMigrationError as exc:
+        raise CLIError(1, exc.code, {"error": str(exc), "state": location})
+    others = sorted(other_clouds(doc.resources, provider))
+    if not others:
+        return
+    raise CLIError(
+        1,
+        "state_shared_with_another_provider",
+        {
+            "error": (
+                f"{location} holds resources of the {', '.join(others)} provider, and this is "
+                f"the {provider} apply: its plan would read them as orphans to destroy. Give "
+                "each provider its own state, with a key that names the provider in "
+                "--state-backend (for example fluid/<id>/<provider>/terraform.tfstate) or a "
+                f"bucket-only {STATE_BACKEND_ENV}, which keys state by contract and provider"
+            ),
+            "state": location,
+            "providers": others,
+        },
+    )
 
 
 def read_target(

@@ -21,9 +21,10 @@
 * Stage 6: the generated plan stage did not run ``--check-sovereignty``, for
   any CI system, so a strict sovereignty violation first failed at apply.
 * ``--env gcp`` with no gcp overlay applied the local base unchanged with a
-  warning (measured: silver validate and plan rc 0). When the product
-  declares gcp (its ``environments`` block, or the workspace's
-  ``expected-environments``, which fluid-demo-env keeps) it is now an error.
+  warning (measured: silver validate and plan rc 0). When the workspace's
+  ``expected-environments`` (which fluid-demo-env keeps) declares gcp for the
+  product it is now an error. The contract's own ``environments`` block only
+  warns: forge-cli applies nothing from it.
 """
 
 from __future__ import annotations
@@ -253,12 +254,35 @@ def test_an_undeclared_env_still_warns_and_says_what_the_base_binds_to(silver, c
     assert "it binds to local, not to 'prod'" in record.getMessage()
 
 
-def test_the_contract_s_own_environments_block_declares_too(silver):
-    from fluid_build._contract_loader import CLIError
+def test_the_contract_s_own_environments_block_warns_and_does_not_refuse(silver, caplog):
+    """A schema-valid ``environments`` block keeps validating, as on 0.16.5.
+
+    forge-cli applies nothing from that block, so refusing on it offered one
+    fix only: deleting a valid declaration. Only the workspace's
+    ``expected-environments`` refuses; the block is named in the warning.
+    """
     from fluid_build.loader import load_with_overlay
 
-    doc = dict(_SILVER, environments={"staging": {}})
+    doc = dict(_SILVER, environments={"staging": {}, "prod": {}})
     silver.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
-    with pytest.raises(CLIError) as exc:
-        load_with_overlay(silver, "staging")
-    assert exc.value.context["declared_by"] == "the contract's environments block"
+    caplog.set_level(logging.WARNING, logger="fluid.loader")
+    base = load_with_overlay(silver, "staging")
+    assert base["exposes"][0]["binding"]["platform"] == "local"
+    (record,) = [r for r in caplog.records if "overlay_not_found" in r.getMessage()]
+    assert "environments block names 'staging'" in record.getMessage()
+    assert record.declared_in_environments_block is True
+
+
+def test_validate_env_named_only_by_the_environments_block_passes(tmp_path, monkeypatch):
+    """No workspace, an ``environments`` block, no overlays: rc 0, with a warning."""
+    from fluid_build import loader
+    from fluid_build.cli import main
+
+    loader._NOTED_MISSING_OVERLAYS.clear()
+    path = tmp_path / "contract.fluid.yaml"
+    path.write_text(
+        yaml.safe_dump(dict(_SILVER, environments={"staging": {}, "prod": {}}), sort_keys=False),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    assert main(["validate", str(path), "--env", "prod"]) == 0

@@ -206,6 +206,7 @@ def tofu_init(
     env: Optional[Mapping[str, str]] = None,
     reconfigure: bool = False,
     force_copy: bool = False,
+    plugin_dir: Optional[str] = None,
 ):
     """``tofu init`` — install providers (and initialise the backend).
 
@@ -215,6 +216,9 @@ def tofu_init(
     copy the recorded backend's state into the module's backend without a
     prompt, overwriting whatever the destination holds (OpenTofu
     ``backendMigrateState_s_s``), so a caller checks the destination first.
+    ``plugin_dir`` passes ``-plugin-dir``: providers come only from that
+    directory, "as if it had been configured as a ``filesystem_mirror``"
+    (opentofu.org/docs/cli/commands/init), so nothing is downloaded.
     """
     args = ["init", "-input=false", "-no-color"]
     if not backend:
@@ -223,6 +227,8 @@ def tofu_init(
         args.append("-reconfigure")
     if force_copy:
         args.append("-force-copy")
+    if plugin_dir:
+        args.append(f"-plugin-dir={plugin_dir}")
     return _run(args, workdir=workdir, env=env, command="init")
 
 

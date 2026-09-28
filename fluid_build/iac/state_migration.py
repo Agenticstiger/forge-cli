@@ -31,8 +31,26 @@ states where the backend supports locking and leaves the source untouched
 ``backendMigrateState_s_s``). The copy is checked afterwards by reading it
 back: the same resources, since OpenTofu gives a copy into an empty
 destination a fresh lineage. Terragrunt's ``backend migrate`` wraps the same
-step for a renamed unit; this is that idea without the wrapper. The scratch
-directory holds no provider, so the step downloads nothing.
+step for a renamed unit; this is that idea without the wrapper.
+
+**What the scratch ``tofu init`` installs.** OpenTofu's init installs every
+provider the *state* names, not only the module's: a ``{"terraform": {}}``
+module beside a state naming ``hashicorp/null`` installed the latest
+``hashicorp/null`` (measured, tofu 1.12), and for an aws state that is the
+latest ``hashicorp/aws``, not the pinned ``~> 5.0``. The probe runs on every
+apply whose new key is still empty (every ``--dry-run`` while a move is
+pending, every gcp run while the old key holds the aws state), so it installs
+nothing: ``-plugin-dir`` names an empty directory, the init stops at its
+provider step after its backend step recorded the old backend, and the state
+is pulled from exactly that recorded backend (checked, never assumed).
+Attribution needs the document, not the providers. Should a future OpenTofu
+not record the backend first, the probe falls back to a plain init, which
+may install, rather than fail. The apply's own ``.terraform/providers`` is
+never the plugin directory: with a plugin cache configured its entries link
+into the cache, and an init reading them as a mirror broke the workdir
+(measured: "no package for hashicorp/aws 5.100.0 cached"). The copy itself,
+once per contract, installs what the old state names at the plugin's own
+pins (``required_providers`` of the IaC plugin), never the latest.
 
 **Never lose it, never guess.** ``-force-copy`` overwrites a destination that
 holds state (the same OpenTofu function skips its confirmation), so the copy
@@ -63,7 +81,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Set, Tuple
 
 from . import runner
 from .backend import backend_location
@@ -179,20 +197,13 @@ def classify(resources: Iterable[Mapping[str, Any]], provider: str) -> Tuple[str
     ``detail`` names the owner for ``"other"`` and the reason for
     ``"ambiguous"``. See the module docstring for the rule.
     """
-    from .registry import IAC_PLUGINS
-
     sources = state_sources(resources)
-    by_plugin = {name: plugin_sources(name) for name in IAC_PLUGINS}
-    by_plugin.setdefault(provider, plugin_sources(provider))
+    by_plugin = _sources_by_plugin(provider)
     known = frozenset().union(*by_plugin.values())
     unknown = sources - known
     if unknown:
         return "ambiguous", "providers no forge-cli IaC plugin emits: " + ", ".join(sorted(unknown))
-    owners = set()
-    for name, mine in by_plugin.items():
-        exclusive = mine - frozenset().union(*(s for n, s in by_plugin.items() if n != name))
-        if sources & exclusive:
-            owners.add(name)
+    owners = _owners(sources, by_plugin)
     if owners == {provider} and sources <= by_plugin[provider]:
         return "mine", provider
     if len(owners) == 1 and provider not in owners:
@@ -202,6 +213,35 @@ def classify(resources: Iterable[Mapping[str, Any]], provider: str) -> Tuple[str
     if len(owners) > 1:
         return "ambiguous", "resources of several clouds (" + ", ".join(sorted(owners)) + ")"
     return "ambiguous", "only providers no single cloud owns (" + ", ".join(sorted(sources)) + ")"
+
+
+def other_clouds(resources: Iterable[Mapping[str, Any]], provider: str) -> FrozenSet[str]:
+    """The IaC plugins other than ``provider`` whose own resources the state holds.
+
+    A resource counts for a plugin when its provider source is one no other
+    plugin emits (``hashicorp/google`` is gcp's; ``hashicorp/null`` is no
+    one's), the rule :func:`classify` attributes a state by.
+    """
+    by_plugin = _sources_by_plugin(provider)
+    return frozenset(_owners(state_sources(resources), by_plugin) - {provider})
+
+
+def _sources_by_plugin(provider: str) -> Dict[str, FrozenSet[str]]:
+    from .registry import IAC_PLUGINS
+
+    by_plugin = {name: plugin_sources(name) for name in IAC_PLUGINS}
+    by_plugin.setdefault(provider, plugin_sources(provider))
+    return by_plugin
+
+
+def _owners(sources: FrozenSet[str], by_plugin: Mapping[str, FrozenSet[str]]) -> Set[str]:
+    """Plugins owning a source in ``sources`` that no other plugin emits."""
+    owners: Set[str] = set()
+    for name, mine in by_plugin.items():
+        exclusive = mine - frozenset().union(*(s for n, s in by_plugin.items() if n != name))
+        if sources & exclusive:
+            owners.add(name)
+    return owners
 
 
 def reconcile_state_key(
@@ -220,7 +260,8 @@ def reconcile_state_key(
     ``current``: the new key is read there, so an apply whose state is
     already at the new key pays one ``tofu state pull`` and nothing else.
     Only a new key with no state brings the scratch directory (and its
-    ``tofu init``, which installs the providers the old state names) in.
+    ``tofu init -plugin-dir``, which installs nothing) in; only a move
+    installs, at the plugin's pins.
     ``current`` and ``legacy`` are ``terraform.backend`` blocks
     (:func:`.backend.parse_backend`). Returns what was found; raises
     :class:`StateMigrationError` when the old state cannot be attributed or
@@ -233,8 +274,7 @@ def reconcile_state_key(
     if now.exists:
         return StateReconciliation(CURRENT, legacy, current)
     with tempfile.TemporaryDirectory(prefix="fluid-state-") as tmp:
-        legacy_dir = Path(tmp) / "legacy"
-        old = _probe(legacy_dir, legacy, env)
+        old = _probe(Path(tmp), legacy, env)
         if not old.exists or not old.resources:
             return StateReconciliation(NOTHING, legacy, current)
         verdict, detail = classify(old.resources, provider)
@@ -263,8 +303,21 @@ def reconcile_state_key(
                 f"{backend_location(current)} received a different state while this apply "
                 f"was about to move {backend_location(legacy)} there; nothing was moved",
             )
-        _write_backend(legacy_dir, current)
-        init = runner.tofu_init(str(legacy_dir), env=env, force_copy=True)
+        # The copy starts from a directory initialised on the old key, whose
+        # module pins the providers the old state names to the plugin's own
+        # versions (see the module docstring).
+        move_dir = Path(tmp) / "move"
+        pins = plugin_pins(provider, state_sources(old.resources))
+        _write_backend(move_dir, legacy, pins)
+        first = runner.tofu_init(str(move_dir), env=env)
+        if not first.ok:
+            raise StateMigrationError(
+                "state_migration_failed",
+                f"could not initialise on {backend_location(legacy)} to move it: "
+                + _tail(first.stderr or first.stdout),
+            )
+        _write_backend(move_dir, current, pins)
+        init = runner.tofu_init(str(move_dir), env=env, force_copy=True)
         if not init.ok:
             raise StateMigrationError(
                 "state_migration_failed",
@@ -288,22 +341,67 @@ def reconcile_state_key(
         return result
 
 
-def _write_backend(workdir: Path, backend: Mapping[str, Any]) -> None:
+def _write_backend(
+    workdir: Path,
+    backend: Mapping[str, Any],
+    required_providers: Optional[Mapping[str, Any]] = None,
+) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
-    doc = {"terraform": {"backend": dict(backend)}}
+    terraform: Dict[str, Any] = {"backend": dict(backend)}
+    if required_providers:
+        terraform["required_providers"] = dict(required_providers)
+    doc = {"terraform": terraform}
     (workdir / "main.tf.json").write_text(json.dumps(doc, indent=2), encoding="utf-8")
 
 
-def _probe(workdir: Path, backend: Mapping[str, Any], env: Mapping[str, str]) -> StateDoc:
-    """Initialise a provider-less module on ``backend`` and pull its state."""
-    _write_backend(workdir, backend)
-    init = runner.tofu_init(str(workdir), env=env)
+def plugin_pins(provider: str, sources: Iterable[str]) -> Dict[str, Dict[str, str]]:
+    """``provider``'s ``required_providers`` entries for the given ``namespace/type`` sources."""
+    from .registry import get_iac_plugin
+
+    wanted = {str(s).lower() for s in sources}
+    required = getattr(get_iac_plugin(provider), "required_providers", None) or {}
+    return {
+        name: dict(spec)
+        for name, spec in required.items()
+        if str(spec.get("source", "")).lower() in wanted
+    }
+
+
+def _probe(tmp: Path, backend: Mapping[str, Any], env: Mapping[str, str]) -> StateDoc:
+    """``backend``'s state, read with nothing installed (see the module docstring).
+
+    ``tofu init -plugin-dir`` with an empty directory: a state that names a
+    provider stops the init after the backend step, and the state is read
+    only when the init is shown to have recorded ``backend``. Otherwise a
+    plain init in a fresh directory is tried, as before; its failure is the
+    error.
+    """
+    empty = tmp / "no-providers"
+    empty.mkdir(parents=True, exist_ok=True)
+    probe_dir = tmp / "legacy"
+    _write_backend(probe_dir, backend)
+    init = runner.tofu_init(str(probe_dir), env=env, plugin_dir=str(empty))
+    if init.ok or records_backend(probe_dir, backend):
+        return _pull(probe_dir, env)
+    plain_dir = tmp / "legacy-plain"
+    _write_backend(plain_dir, backend)
+    init = runner.tofu_init(str(plain_dir), env=env)
     if not init.ok:
         raise StateMigrationError(
             "state_migration_probe_failed",
             f"could not read {backend_location(backend)}: " + _tail(init.stderr or init.stdout),
         )
-    return _pull(workdir, env)
+    return _pull(plain_dir, env)
+
+
+def read_state(workdir: Path, env: Mapping[str, str]) -> StateDoc:
+    """The state ``workdir``'s initialised backend holds (``tofu state pull``).
+
+    Raises :class:`StateMigrationError` (``state_migration_probe_failed``)
+    when it cannot be read; the error carries stderr only, never the
+    document.
+    """
+    return _pull(Path(workdir), env)
 
 
 def _pull(workdir: Path, env: Mapping[str, str]) -> StateDoc:
