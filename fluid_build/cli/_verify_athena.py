@@ -22,7 +22,7 @@ the summary counts as *not checked* and ``--strict`` never fails on, so a
 pipeline could land nothing, or land it where no query engine could read it,
 and still go green.
 
-Four checks, each against the live account:
+Five checks, each against the live account:
 
 1. **The catalogue.** ``glue:GetTable`` must find the table, and its columns
    (storage-descriptor columns plus partition keys) must match the contract's
@@ -61,6 +61,13 @@ Four checks, each against the live account:
    query counts the non-null values of each masked column that do not have
    their strategy's shape (``_verify_masking``); one is CRITICAL. Only counts
    come back: the values that fail are the cleartext.
+5. **The storage policies**, when the expose declares them: the bucket's
+   lifecycle rule for the prefix expires objects after the contract's
+   ``lifecycle.retention`` (with ``expire: true``), and the objects under the
+   prefix are SSE-KMS with the key ``binding.encryption.kms`` names. See
+   ``_verify_storage_policy.py``. When the result goes to the binding-bucket
+   default below and the binding declares a key, Athena encrypts the result
+   with that key (``EncryptionConfiguration`` SSE_KMS).
 
 The binding's ``{{ env.* }}`` templates are resolved with the resolver
 ``fluid apply`` runs before it emits (``resolve_env_templates_in_contract``),
@@ -591,13 +598,16 @@ def _count_rows(
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
     extra: Sequence[str] = (),
+    results_kms_key: Optional[str] = None,
 ) -> Tuple[int, Dict[str, Any], List[int]]:
     """``(rows, query facts, the value of each ``extra`` expression)``.
 
     ``extra`` are more integer expressions over the same table, selected after
     ``COUNT(*)`` in the same query: the masking checks (``_verify_masking``),
     so they cost no second query, and a contract without masking rules sends
-    exactly the ``COUNT(*)`` it always did.
+    exactly the ``COUNT(*)`` it always did. ``results_kms_key`` is the key the
+    binding declares; a result written to the binding-bucket default is
+    encrypted with it.
     """
     # Identifier positions cannot be bound, so check before interpolating:
     # ``_ATHENA_IDENT_RE`` admits nothing that can close a double-quoted name.
@@ -611,6 +621,16 @@ def _count_rows(
     request: Dict[str, Any] = {"QueryString": sql, "WorkGroup": options.workgroup}
     if results.send:
         request["ResultConfiguration"] = {"OutputLocation": results.send}
+    encrypt_result = bool(results_kms_key) and results.source == "binding-bucket"
+    if encrypt_result:
+        # The default location is forge-cli's own, under the binding's bucket,
+        # so the result gets the key the binding declares for that bucket
+        # rather than whatever the bucket's default happens to be. A location
+        # someone else chose keeps its own encryption settings.
+        request["ResultConfiguration"]["EncryptionConfiguration"] = {
+            "EncryptionOption": "SSE_KMS",
+            "KmsKey": results_kms_key,
+        }
 
     query: Dict[str, Any] = {
         "workgroup": options.workgroup,
@@ -621,6 +641,8 @@ def _count_rows(
     }
     if results.note:
         query["output_location_note"] = results.note
+    if encrypt_result:
+        query["output_encryption"] = {"option": "SSE_KMS", "kms_key": results_kms_key}
     query_id = str(athena.start_query_execution(**request)["QueryExecutionId"])
     query["query_execution_id"] = query_id
     LOG.info(
@@ -1185,6 +1207,7 @@ def _severity(
     masking_problem = severity_problem(dimensions.get("masking"))
     if masking_problem is not None:
         problems.append(masking_problem)
+    problems.extend(_storage_problems(dimensions))
     if not problems:
         if dimensions["row_count"]["status"] == "info" and severity["level"] == "SUCCESS":
             return {
@@ -1207,7 +1230,75 @@ def _severity(
     }
 
 
+#: What to do about a failed storage dimension (see ``_verify_storage_policy.py``),
+#: by dimension, or by ``<dimension>:<reason>`` when the failure names a reason.
+_STORAGE_ACTIONS = {
+    "retention": (
+        "Re-apply so the bucket's lifecycle rule matches lifecycle.retention, or, on a "
+        "shared bucket, ask its owner for the rule"
+    ),
+    "retention:sooner-rule": (
+        "Remove or narrow the lifecycle rule that expires objects under the prefix sooner "
+        "than lifecycle.retention (on a bucket this product owns, a re-apply replaces the "
+        "whole lifecycle configuration, that rule included); on a shared bucket, ask its "
+        "owner"
+    ),
+    # No rule applies the retention as declared, and another cuts it short.
+    "retention:mismatch-and-sooner-rule": (
+        "Re-apply so the bucket's lifecycle rule matches lifecycle.retention; on a bucket "
+        "this product owns, the re-apply replaces the whole lifecycle configuration, so it "
+        "also removes the rule that expires objects under the prefix sooner. On a shared "
+        "bucket, ask its owner for a rule that matches lifecycle.retention, and to remove "
+        "or narrow the rule that expires objects under the prefix sooner"
+    ),
+    "encryption": (
+        "Re-apply so the bucket's default encryption is the declared key, then rewrite "
+        "the objects written before it (S3 does not re-encrypt existing objects)"
+    ),
+    # A re-apply is the wrong remedy for a key pending deletion: it creates a
+    # new key and leaves every object under the dying one, unreadable for good
+    # once the deletion date passes.
+    "encryption:key-pending-deletion": (
+        "Cancel the key's scheduled deletion before its deletion date "
+        "(kms:CancelKeyDeletion, e.g. aws kms cancel-key-deletion --key-id <key ARN>), "
+        "then enable it again (kms:EnableKey); do not re-apply, which would create a new "
+        "key and strand the objects already encrypted under this one"
+    ),
+    "encryption:key-disabled": (
+        "Enable the key again (kms:EnableKey, e.g. aws kms enable-key --key-id <key ARN>)"
+    ),
+    "encryption:key-not-enabled": (
+        "Bring the key back to the Enabled state (see its KeyState in kms:DescribeKey and "
+        "the KMS key states table); until then S3 can neither write nor read its objects"
+    ),
+}
+
+
+def _storage_problems(dimensions: Mapping[str, Any]) -> List[Tuple[str, str]]:
+    """``(message, action)`` for every failed storage dimension."""
+    problems: List[Tuple[str, str]] = []
+    for name in ("retention", "encryption"):
+        dimension = dimensions.get(name) or {}
+        if dimension.get("status") != "fail":
+            continue
+        reason = dimension.get("reason")
+        action = _STORAGE_ACTIONS.get(f"{name}:{reason}") or _STORAGE_ACTIONS[name]
+        problems.append((str(dimension["message"]), action))
+    return problems
+
+
 # ── Entry point ─────────────────────────────────────────────────────────
+
+
+def _with_storage_failures(message: str, dimensions: Mapping[str, Any]) -> str:
+    """``message``, plus each failed storage dimension and what to do about it.
+
+    An error prints its message and nothing else, and a failed storage check is
+    often why the query failed: a bucket whose default key is disabled or
+    pending deletion refuses the result Athena writes under it.
+    """
+    problems = _storage_problems(dimensions)
+    return "; ".join([message, *(f"{what}. {action}" for what, action in problems)])
 
 
 def _error(message: str, *, target: str, exists: Optional[bool], **extra: Any) -> Dict[str, Any]:
@@ -1284,6 +1375,13 @@ def verify_athena_expose(
     schema = _compare_schema(glue_table, _declared_fields(expose))
     actual_location = str((glue_table.get("StorageDescriptor") or {}).get("Location") or "")
     dimensions = _catalogue_dimensions(schema, actual_location, expected_location, region)
+    # Retention and encryption at rest, when the expose declares them.
+    from fluid_build.cli._verify_storage_policy import storage_policy
+
+    storage = storage_policy(
+        expose_id, expose, binding, contract=contract, region=region, factory=factory
+    )
+    dimensions.update(storage.dimensions)
 
     # policy.privacy.masking: the shape of every masked column's values, counted
     # in the same query (``_verify_masking``).
@@ -1305,12 +1403,18 @@ def verify_athena_expose(
             sleep=sleep or time.sleep,
             monotonic=monotonic or time.monotonic,
             extra=masking_selects,
+            results_kms_key=storage.kms_key_arn,
         )
     except AthenaVerifyError as exc:
-        return _error(str(exc), target=target, exists=True, dimensions=dimensions)
+        return _error(
+            _with_storage_failures(str(exc), dimensions),
+            target=target,
+            exists=True,
+            dimensions=dimensions,
+        )
     except Exception as exc:  # noqa: BLE001 — every AWS failure is reported, not raised
         return _error(
-            f"Athena could not count {table_id}: {exc}",
+            _with_storage_failures(f"Athena could not count {table_id}: {exc}", dimensions),
             target=target,
             exists=True,
             dimensions=dimensions,
@@ -1331,12 +1435,12 @@ def verify_athena_expose(
     severity = _severity(schema, dimensions, expected_location)
     has_issues = any(
         dimensions[name]["status"] == "fail"
-        for name in ("structure", "types", "location", "row_count", "masking")
+        for name in ("structure", "types", "location", "row_count", "masking", *storage.dimensions)
         if name in dimensions
     )
     created = glue_table.get("CreateTime")
     modified = glue_table.get("UpdateTime")
-    return {
+    result: Dict[str, Any] = {
         "status": "mismatch" if has_issues else "match",
         "exists": True,
         "table_id": table_id,
@@ -1351,3 +1455,9 @@ def verify_athena_expose(
         },
         "athena": query,
     }
+    if storage.errors:
+        # A declared policy that could not be checked is unproven, not passed:
+        # an error, which fails verify with or without --strict.
+        result["status"] = "error"
+        result["error"] = _with_storage_failures("; ".join(storage.errors), dimensions)
+    return result
