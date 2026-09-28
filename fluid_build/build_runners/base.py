@@ -723,6 +723,64 @@ def _run_env(args: argparse.Namespace, plan_data: Optional[Dict[str, Any]] = Non
     return None
 
 
+def _apply_report() -> Any:
+    """The running ``fluid apply``'s Command Center report, or ``None``."""
+    try:
+        from fluid_build.cli._apply_cc_report import current_report
+
+        return current_report()
+    except Exception:  # noqa: BLE001 - reporting never fails a build
+        return None
+
+
+def _runs_dir(contract_dir: Path, product_id: str, build_id: str) -> Optional[Path]:
+    """Where a build's run records are (``FileStateStore``), for ids the store accepts."""
+    from ._ids import IdentifierViolation, validate_identifier
+
+    try:
+        validate_identifier(product_id, kind="contract.id")
+        validate_identifier(build_id, kind="build.id")
+    except IdentifierViolation:
+        return None
+    return contract_dir / ".fluid" / "runs" / product_id / build_id / "runs"
+
+
+def _run_ids(contract_dir: Path, product_id: str, build_id: str) -> Set[str]:
+    """The run ids a build has recorded so far."""
+    runs = _runs_dir(contract_dir, product_id, build_id)
+    try:
+        return {p.stem for p in runs.glob("*.json")} if runs and runs.is_dir() else set()
+    except OSError:
+        return set()
+
+
+def _report_build(
+    report: Any,
+    contract_dir: Path,
+    product_id: str,
+    build_id: str,
+    result: int,
+    runs_before: Optional[Set[str]],
+) -> None:
+    """Record one build on ``report``, with the newest run record it wrote, if any.
+
+    Run ids sort by time (``generate_run_id``), so the newest id this build
+    added is its run. Nothing is read when no ``fluid apply`` report is open.
+    """
+    if report is None:
+        return
+    run: Optional[Dict[str, Any]] = None
+    runs = _runs_dir(contract_dir, product_id, build_id)
+    added = sorted(_run_ids(contract_dir, product_id, build_id) - (runs_before or set()))
+    if runs is not None and added:
+        try:
+            loaded = json.loads((runs / f"{added[-1]}.json").read_text(encoding="utf-8"))
+            run = loaded if isinstance(loaded, dict) else None
+        except (OSError, ValueError):
+            run = None
+    report.record_build(build_id=build_id, status="succeeded" if result == 0 else "failed", run=run)
+
+
 def run_builds_from_args(
     args: argparse.Namespace,
     logger: logging.Logger,
@@ -909,11 +967,18 @@ def run_builds_from_args(
         if _b.get("id"):
             validate_identifier(_b["id"], kind="build.id")
 
+    # The ``fluid apply`` run report this build phase belongs to, if any
+    # (``cli/_apply_cc_report.py``): each build is recorded on it.
+    report = _apply_report()
+    product_id = str(contract.get("id") or "")
+
     # Filter builds if specific ID requested
     if args.build_id:
         builds = [b for b in builds if b.get("id") == args.build_id]
         if not builds:
             LOG.error(f"Build not found: {args.build_id}")
+            if report is not None:
+                report.build_failed(f"build_not_found:{args.build_id}")
             return 1
 
     # The overlay env the contract above was loaded with, decided once and
@@ -936,6 +1001,7 @@ def run_builds_from_args(
 
     for build in builds:
         build_id = build.get("id", "unknown")
+        runs_before = _run_ids(contract_path.parent, product_id, build_id) if report else None
 
         if is_acquisition_build(build):
             sample_rows = getattr(args, "sample_rows", None)
@@ -946,6 +1012,7 @@ def run_builds_from_args(
                 dry_run=args.dry_run,
                 sample_rows=sample_rows,
             )
+            _report_build(report, contract_path.parent, product_id, build_id, result, runs_before)
             if result == 0:
                 total_executed += 1
             else:
@@ -987,6 +1054,8 @@ def run_builds_from_args(
                 expected = (contract_path.parent / repository / "dbt_project.yml").resolve()
                 cprint(f"\n⚠️  Build '{build_id}' - dbt project not found: {expected}")
                 total_skipped += 1
+                if report is not None:
+                    report.record_build(build_id=build_id, status="skipped")
                 continue
 
             result = execute_dbt_build(
@@ -1019,6 +1088,8 @@ def run_builds_from_args(
                     "For Python builds, create the script at the expected path above."
                 )
                 total_skipped += 1
+                if report is not None:
+                    report.record_build(build_id=build_id, status="skipped")
                 continue
 
             # Execute build
@@ -1033,6 +1104,7 @@ def run_builds_from_args(
                 force_run=force_run,
             )
 
+        _report_build(report, contract_path.parent, product_id, build_id, result, runs_before)
         if result == 0:
             total_executed += 1
         else:
@@ -1067,6 +1139,8 @@ def run_builds_from_args(
                 total_skipped,
             )
             return 0
+        if report is not None:
+            report.build_failed("builds_all_skipped")
         console_error(
             f"Every build was skipped ({total_skipped}/{len(builds)}) — nothing "
             "was transformed and no rows were produced. Fix the missing build "

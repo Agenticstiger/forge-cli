@@ -472,3 +472,128 @@ def test_a_provider_that_cannot_be_resolved_is_reported_with_its_product(
     assert "platform" not in metadata
     assert "contract_hash" not in metadata
     assert post["body"]["environment"] == "gcp"
+
+
+# ── A build-augmented apply reports its builds ────────────────────────────
+#
+# Measured against a stub Command Center on the integration branch: `fluid
+# apply --mode amend-and-build` on a silver product whose build loaded 28 rows
+# into BigQuery was closed with an infra-only result (planned and applied
+# changes, resources) in phase "apply", and a bronze run whose load failed was
+# closed "failed" with no error event and no error message.
+
+_BUILD_ID = "summarise_subscriptions"
+_LOADED_TABLE = "northwind-demo.demo_bronze.customer_subscriptions"
+
+
+def _with_build(product: Path) -> Path:
+    doc = yaml.safe_load(product.read_text(encoding="utf-8"))
+    doc["builds"] = [
+        {
+            "id": _BUILD_ID,
+            "pattern": "embedded-logic",
+            "engine": "sql",
+            "properties": {"sql": "SELECT 1 AS subscription_id"},
+        }
+    ]
+    product.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    return product
+
+
+@pytest.fixture
+def build(monkeypatch) -> Dict[str, Any]:
+    """The embedded-SQL build, answered: it writes the run record a BigQuery load writes."""
+    from fluid_build.build_runners import base
+
+    behaviour: Dict[str, Any] = {"rc": 0, "calls": 0}
+
+    def _execute(build, contract, contract_dir, **_kwargs):
+        behaviour["calls"] += 1
+        runs = Path(contract_dir) / ".fluid" / "runs" / contract["id"] / build["id"] / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        ok = behaviour["rc"] == 0
+        record: Dict[str, Any] = {
+            "run_id": f"01RUN{behaviour['calls']:08d}",
+            "state": "succeeded" if ok else "failed",
+            "records_total": 28 if ok else 0,
+            "facets": {"engine": "duckdb", "pattern": "embedded-logic"},
+        }
+        if ok:
+            record["facets"]["bigquery_load"] = {"table": _LOADED_TABLE, "rows": 28}
+            record["facets"]["landed"] = {
+                "mode": "full_refresh",
+                "rows_from": "write",
+                "destinations": {"subscriptions": f"bigquery://{_LOADED_TABLE}"},
+            }
+        (runs / f"{record['run_id']}.json").write_text(json.dumps(record), encoding="utf-8")
+        return behaviour["rc"]
+
+    monkeypatch.setattr(base, "_execute_embedded_sql_build", _execute)
+    return behaviour
+
+
+def test_a_build_augmented_apply_reports_each_build_and_what_it_landed(
+    product, tofu, build, cc, monkeypatch
+):
+    url, recorder = cc
+    _configure(monkeypatch, url)
+    _with_build(product)
+
+    assert _apply(product, "--mode", "amend-and-build") == 0
+    assert build["calls"] == 1
+
+    (post,) = _by(recorder, "POST")
+    (patch,) = _by(recorder, "PATCH")
+    assert post["body"]["metadata"]["mode"] == "amend-and-build"
+    update = patch["body"]
+    assert update["status"] == "success"
+    assert update["current_phase"] == "build"
+    assert update.get("error_message") is None
+    result = update["result"]
+    assert result["applied_changes"] == {"add": 2, "change": 0, "remove": 0}
+    assert result["builds"] == [
+        {
+            "build_id": _BUILD_ID,
+            "status": "succeeded",
+            "run_id": "01RUN00000001",
+            "table": _LOADED_TABLE,
+            "rows": 28,
+            "destinations": {"subscriptions": f"bigquery://{_LOADED_TABLE}"},
+        }
+    ]
+    assert "error_event" not in result
+
+
+def test_a_failed_build_is_reported_with_its_build_id(product, tofu, build, cc, monkeypatch):
+    url, recorder = cc
+    _configure(monkeypatch, url)
+    _with_build(product)
+    build["rc"] = 1
+
+    assert _apply(product, "--mode", "amend-and-build") == 1
+
+    (patch,) = _by(recorder, "PATCH")
+    update = patch["body"]
+    assert update["status"] == "failed"
+    assert update["current_phase"] == "build"
+    assert update["error_message"] == f"fluid apply failed: build_failed:{_BUILD_ID}"
+    result = update["result"]
+    assert result["error_event"] == f"build_failed:{_BUILD_ID}"
+    assert result["exit_code"] == 1
+    (reported,) = result["builds"]
+    assert reported == {"build_id": _BUILD_ID, "status": "failed", "run_id": "01RUN00000001"}
+
+
+def test_a_build_id_that_is_not_in_the_contract_is_the_reason(
+    product, tofu, build, cc, monkeypatch
+):
+    url, recorder = cc
+    _configure(monkeypatch, url)
+    _with_build(product)
+
+    assert _apply(product, "--mode", "amend-and-build", "--build-id", "no_such_build") == 1
+
+    (patch,) = _by(recorder, "PATCH")
+    assert patch["body"]["result"]["error_event"] == "build_not_found:no_such_build"
+    assert patch["body"]["current_phase"] == "build"
+    assert build["calls"] == 0

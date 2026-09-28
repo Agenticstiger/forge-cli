@@ -39,7 +39,12 @@ Center would store it untagged, where no read path shows it.
 the contract hash the Command Center keys contract versions by, the
 ``--env`` it was applied for, the provider, the apply mode, the state
 location, the planned and applied change counts and the address of every
-resource the module declares, and the timings. **Never a secret**: no header,
+resource the module declares, and the timings. A build-augmented apply
+(``--mode amend-and-build`` / ``replace-and-build``) adds each build it ran:
+its id, how it ended, and, from the run record the build wrote, the run id,
+the table it loaded and the rows it landed (``facets.bigquery_load``,
+``facets.landed``, ``records_total``). Its phase is ``build``, and a failed
+build names itself in the error event (``build_failed:<build id>``). **Never a secret**: no header,
 no environment value, no tofu output (its text can carry attribute values);
 a failure is reported by its typed event name and exit code only.
 
@@ -108,6 +113,8 @@ class ApplyRunReport:
         self._disabled_reason: Optional[str] = None
         self._began = False
         self._finished = False
+        #: Why the build phase failed (``build_failed:<id>``), when it did.
+        self._build_event: Optional[str] = None
 
     # -- filled by the apply engine ------------------------------------
 
@@ -177,6 +184,32 @@ class ApplyRunReport:
             }
         )
 
+    def record_build(
+        self,
+        *,
+        build_id: str,
+        status: str,
+        run: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """One build of a build-augmented apply: ``succeeded``, ``failed`` or ``skipped``.
+
+        ``run`` is the run record the build wrote, if it wrote one; only its
+        id, the table it loaded, where it landed and the rows are kept.
+        """
+        try:
+            entry: Dict[str, Any] = {"build_id": str(build_id), "status": str(status)}
+            entry.update(_build_facts(run))
+            self.result.setdefault("builds", []).append(entry)
+            if status == "failed":
+                self.build_failed(f"build_failed:{build_id}")
+        except Exception as exc:  # noqa: BLE001 - reporting never fails an apply
+            _LOG.debug("command center report: record_build failed: %s", type(exc).__name__)
+
+    def build_failed(self, event: str) -> None:
+        """The build phase failed for ``event``; the first reason is the one reported."""
+        if not self._build_event:
+            self._build_event = str(event)
+
     # -- the run's end -------------------------------------------------
 
     def finish(self, status: str, *, event: Optional[str] = None, exit_code: int = 0) -> None:
@@ -203,13 +236,22 @@ class ApplyRunReport:
                 "duration_seconds": duration,
             }
             result = dict(self.result, exit_code=int(exit_code), **timings)
+            if not event and status != "success":
+                # A build that failed returns an exit code, not an exception.
+                event = self._build_event
             if event:
                 result["error_event"] = str(event)
+            if self.result.get("dry_run"):
+                phase = "plan"
+            elif self.result.get("builds") or self._build_event:
+                phase = "build"
+            else:
+                phase = "apply"
             reporter.update_execution(
                 self.execution_id,
                 status=status,
                 progress=100.0,
-                current_phase="plan" if self.result.get("dry_run") else "apply",
+                current_phase=phase,
                 error_message=(f"fluid apply failed: {event}" if event else None),
                 result=result,
             )
@@ -283,6 +325,33 @@ class ApplyRunReport:
             cprint(line)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _build_facts(run: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """The run id, the loaded table, the landed destinations and rows of a run record.
+
+    Nothing else from the record: its facets can carry engine output.
+    """
+    if not isinstance(run, Mapping):
+        return {}
+    facts: Dict[str, Any] = {}
+    if run.get("run_id"):
+        facts["run_id"] = str(run["run_id"])
+    facets = run.get("facets") if isinstance(run.get("facets"), Mapping) else {}
+    load = facets.get("bigquery_load")
+    if isinstance(load, Mapping):
+        if load.get("table"):
+            facts["table"] = str(load["table"])
+        if isinstance(load.get("rows"), int):
+            facts["rows"] = int(load["rows"])
+    landed = facets.get("landed")
+    destinations = landed.get("destinations") if isinstance(landed, Mapping) else None
+    if isinstance(destinations, Mapping) and destinations:
+        facts["destinations"] = {str(k): str(v) for k, v in destinations.items()}
+    succeeded = str(run.get("state") or "").lower() == "succeeded"
+    if "rows" not in facts and succeeded and isinstance(run.get("records_total"), int):
+        facts["rows"] = int(run["records_total"])
+    return facts
 
 
 def _contract_facts(contract: Mapping[str, Any]) -> Dict[str, Any]:
