@@ -192,6 +192,18 @@ class TestPrincipals:
         error = _refusal(_contract(principals={**MAPPING, PLATFORM: identity}))
         assert error.kind == "principal-invalid"
 
+    def test_an_env_template_in_an_identity_validates_as_it_will_emit(self):
+        """``fluid validate`` does not resolve ``{{ env.* }}``; apply resolves it first."""
+        templated = (
+            "serviceAccount:fluid-pipeline@{{ env.FLUID_DEMO_GCP_PROJECT }}.iam.gserviceaccount.com"
+        )
+        contract = _contract(principals={**MAPPING, PIPELINE: templated})
+        assert validate_governance(contract) == ([], [])
+        members = {
+            m["member"] for m in _resources(contract)["google_bigquery_dataset_iam_member"].values()
+        }
+        assert templated in members
+
     def test_a_placeholder_mapped_to_a_placeholder_is_still_refused(self):
         error = _refusal(_contract(principals={**MAPPING, PLATFORM: "group:x@corp.test"}))
         assert error.kind == "principal-placeholder"
@@ -722,6 +734,14 @@ class TestSchema:
         contract["exposes"][0]["binding"]["platform"] = platform
         errors = self._errors(contract)
         assert errors and all("principals" in e for e in errors), errors
+
+    def test_a_templated_identity_passes_the_schema(self):
+        contract = self._schema_contract(
+            principals={
+                PIPELINE: "serviceAccount:p@{{ env.FLUID_DEMO_GCP_PROJECT }}.iam.gserviceaccount.com"
+            }
+        )
+        assert self._errors(contract) == []
 
     def test_principals_are_0_7_6_only(self):
         contract = self._schema_contract(principals=MAPPING)

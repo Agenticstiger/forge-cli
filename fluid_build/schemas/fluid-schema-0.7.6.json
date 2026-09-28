@@ -1707,13 +1707,13 @@
                   "anyOf": [
                     {
                       "type": "string",
-                      "pattern": "^(user|group|serviceAccount|domain):\\S+$"
+                      "pattern": "^(user|group|serviceAccount|domain):.+$"
                     },
                     {
                       "type": "array",
                       "items": {
                         "type": "string",
-                        "pattern": "^(user|group|serviceAccount|domain):\\S+$"
+                        "pattern": "^(user|group|serviceAccount|domain):.+$"
                       }
                     }
                   ]

@@ -81,6 +81,12 @@ _GCP_DOMAIN_MEMBER_RE = re.compile(r"domain:[A-Za-z0-9.-]+")
 #: (the schema's pattern; the rest may carry an ``{{ env.* }}`` template).
 _AWS_PRINCIPAL_RE = re.compile(r"arn:aws[a-z0-9-]*:iam::\S+")
 
+#: An ``{{ env.NAME }}`` template, which ``fluid apply`` resolves before the emitter
+#: runs and ``fluid validate`` does not: an identity is checked with each template
+#: standing in for one plain segment, so ``serviceAccount:x@{{ env.P }}.iam...``
+#: validates as it will emit.
+_ENV_TEMPLATE_RE = re.compile(r"\{\{\s*env\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}")
+
 #: Platforms this module resolves identities for.
 GCP = "gcp"
 AWS = "aws"
@@ -154,10 +160,16 @@ def _reserved_tld(identity: str) -> Optional[str]:
     return tld if tld in RESERVED_TLDS else None
 
 
+def _shape(identity: str) -> str:
+    """``identity`` with each ``{{ env.* }}`` template replaced by a plain segment."""
+    return _ENV_TEMPLATE_RE.sub("env", identity)
+
+
 def _gcp_identity(identity: str, *, raw: str, where: str, mapped: bool = True) -> str:
     member = logical_key(identity)
+    shape = _shape(member)
     if mapped and not (
-        _GCP_EMAIL_MEMBER_RE.fullmatch(member) or _GCP_DOMAIN_MEMBER_RE.fullmatch(member)
+        _GCP_EMAIL_MEMBER_RE.fullmatch(shape) or _GCP_DOMAIN_MEMBER_RE.fullmatch(shape)
     ):
         raise UnsupportedBindingError(
             "principal-invalid",
@@ -169,7 +181,7 @@ def _gcp_identity(identity: str, *, raw: str, where: str, mapped: bool = True) -
                 "serviceAccount:pipeline@your-project.iam.gserviceaccount.com.",
             ),
         )
-    tld = _reserved_tld(member)
+    tld = _reserved_tld(shape)
     if tld:
         raise UnsupportedBindingError(
             "principal-placeholder",
@@ -187,7 +199,7 @@ def _gcp_identity(identity: str, *, raw: str, where: str, mapped: bool = True) -
 
 
 def _aws_identity(identity: str, *, raw: str, where: str, mapped: bool = True) -> str:
-    if not _AWS_PRINCIPAL_RE.fullmatch(identity):
+    if not _AWS_PRINCIPAL_RE.fullmatch(_shape(identity)):
         raise UnsupportedBindingError(
             "principal-invalid",
             f"{where}: principal {raw!r} resolves to {identity!r}, which is not an IAM "
