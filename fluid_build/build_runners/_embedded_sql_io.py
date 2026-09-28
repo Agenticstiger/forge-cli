@@ -337,8 +337,11 @@ def _base_tables(node: Any, ctes: FrozenSet[str], found: Set[str]) -> None:
 
     ``node`` is DuckDB's serialized parse tree (``json_serialize_sql``). A
     query node's ``cte_map`` puts its CTE names in scope for everything below
-    it, the CTE bodies included; an unqualified reference to one of them is the
-    CTE, not a relation this build has to provide.
+    it; an unqualified reference to one of them is the CTE, not a relation this
+    build has to provide. The exception is a CTE's own body: DuckDB binds
+    ``WITH s AS (SELECT * FROM s)`` to the relation ``s``, so a CTE's own name
+    is out of scope there unless the body is recursive (a
+    ``RECURSIVE_CTE_NODE``, which names itself in ``cte_name``).
     """
     if isinstance(node, list):
         for item in node:
@@ -346,17 +349,26 @@ def _base_tables(node: Any, ctes: FrozenSet[str], found: Set[str]) -> None:
         return
     if not isinstance(node, dict):
         return
+    if node.get("type") == "RECURSIVE_CTE_NODE":
+        own = str(node.get("cte_name") or "").casefold()
+        if own:
+            ctes = ctes | frozenset({own})
     cte_map = node.get("cte_map")
     if isinstance(cte_map, dict):
-        names = {str(e.get("key") or "").casefold() for e in cte_map.get("map") or []}
-        ctes = ctes | frozenset(names)
+        entries = [e for e in cte_map.get("map") or [] if isinstance(e, dict)]
+        names = frozenset(str(e.get("key") or "").casefold() for e in entries)
+        for entry in entries:
+            own = str(entry.get("key") or "").casefold()
+            _base_tables(entry.get("value"), ctes | (names - {own}), found)
+        ctes = ctes | names
     if node.get("type") == "BASE_TABLE":
         name = str(node.get("table_name") or "").casefold()
         qualified = bool(node.get("schema_name") or node.get("catalog_name"))
         if name and (qualified or name not in ctes):
             found.add(name)
-    for value in node.values():
-        _base_tables(value, ctes, found)
+    for key, value in node.items():
+        if key != "cte_map":
+            _base_tables(value, ctes, found)
 
 
 def relations_read(sql: str) -> Optional[FrozenSet[str]]:

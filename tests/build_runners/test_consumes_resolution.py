@@ -1181,6 +1181,14 @@ def test_only_the_entries_the_sql_reads_must_resolve(tmp_path, printed):
         ("SELECT * FROM read_parquet('/no/such/*.parquet') p JOIN hv USING (id)", {"hv"}),
         ("WITH subscriptions AS (SELECT 1 AS a) SELECT * FROM subscriptions", set()),
         ("WITH a AS (SELECT * FROM Subscriptions) SELECT * FROM a", {"subscriptions"}),
+        # DuckDB binds a CTE's own name in its body to the relation, not the CTE.
+        ("WITH s AS (SELECT * FROM s WHERE k > 0) SELECT * FROM s", {"s"}),
+        ("WITH r AS (SELECT 1), s AS (SELECT * FROM r) SELECT * FROM s", set()),
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) "
+            "SELECT * FROM r JOIN deg ON TRUE",
+            {"deg"},
+        ),
         ("SELECT * FROM o WHERE k IN (SELECT k FROM deg)", {"o", "deg"}),
         ('SELECT COUNT(*) FROM "order"', {"order"}),
         ("SELECT * FROM read_csv('http://127.0.0.1:1/x.csv')", set()),
