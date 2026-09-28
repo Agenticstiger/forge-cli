@@ -57,6 +57,13 @@ Security posture (high level — detailed notes inline at each touchpoint):
   deletes nothing. This applies to the transports that delete (file, ssh,
   git+ssh, s3 and gs for airflow; s3 for mwaa); az, scp, composer,
   astronomer, prefect and dagster never delete and ignore it.
+* An env's DAGs are ``<product-id>__<env>/`` (dag ids
+  ``<product>__<env>__<build>``); forge-cli 0.16.7 and earlier wrote them to
+  ``<product-id>/`` as ``<product>__<build>``. Under ``--delete-scope product``
+  the first sync after the upgrade retires those old DAGs, the ones rendered
+  for the same product and env, where the destination can be read here (a
+  local path, a git+ssh clone). Every other transport prints the one step
+  left to do, and the report lists each case (``superseded_scopes``).
 
 CLI surface::
 
@@ -76,6 +83,7 @@ CLI surface::
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import logging
 import os
@@ -564,6 +572,195 @@ def _under(root: str, suffix: str) -> str:
     return root if not suffix else root.rstrip("/") + "/" + suffix
 
 
+# -----------------------------------------------------------------------------
+# Retiring the DAGs an env's scope replaced
+# -----------------------------------------------------------------------------
+#
+# forge-cli 0.16.7 and earlier wrote a product's DAGs to ``<product>/`` with
+# dag_id ``<product>__<build>``, whatever the ``--env``. Now an env's DAGs are
+# ``<product>__<env>/`` with dag_id ``<product>__<env>__<build>``
+# (``fluid_apply.schedule_scope_for`` / ``dag_id_for``). ``--delete-scope
+# product`` mirrors only the new directory, so the first sync after the
+# upgrade left the old DAG in place beside the new one: two DAGs applying the
+# same product at the same minute (measured on the demo lab, whose Airflow
+# unpauses a DAG as it parses it). The old ones are retired where this command
+# can read the destination (a local path, and the clone of a git+ssh one), and
+# named in a note everywhere else.
+
+#: The module-level names a rendered DAG file assigns (``fluid_apply.render_dag``).
+_DAG_FACT_NAMES = ("PRODUCT_ID", "BUILD_ID", "FLUID_ENV_NAME")
+#: A DAG file name the retirement acts on: a plain module name.
+_DAG_FILE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}\.py$")
+
+
+def _dag_facts(path: Path) -> Optional[Dict[str, str]]:
+    """``PRODUCT_ID``, ``BUILD_ID``, ``FLUID_ENV_NAME`` and ``dag_id`` of a rendered DAG.
+
+    Read from the file's syntax tree, never by importing it. ``None`` for any
+    file that is not one ``fluid generate`` renders.
+    """
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1_000_000:
+            return None
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return None
+    facts: Dict[str, str] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in _DAG_FACT_NAMES
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            facts[node.targets[0].id] = node.value.value
+        elif isinstance(node, ast.With):
+            for item in node.items:
+                call = item.context_expr
+                if not (isinstance(call, ast.Call) and getattr(call.func, "id", None) == "DAG"):
+                    continue
+                for keyword in call.keywords:
+                    value = keyword.value
+                    if (
+                        keyword.arg == "dag_id"
+                        and isinstance(value, ast.Constant)
+                        and isinstance(value.value, str)
+                    ):
+                        facts["dag_id"] = value.value
+    return facts if set(_DAG_FACT_NAMES) | {"dag_id"} <= set(facts) else None
+
+
+def _replaced_scopes(dags_dir: Path) -> List[Tuple[str, str, str]]:
+    """``(env scope, the scope it replaced, env)`` for each ``<product>__<env>/`` directory.
+
+    A directory is an env's scope when every DAG in it was rendered for that
+    product and env, under the env's directory name and dag id.
+    """
+    out: List[Tuple[str, str, str]] = []
+    for scope in sorted(p for p in dags_dir.iterdir() if p.is_dir() and not p.is_symlink()):
+        dags = [_dag_facts(f) for f in sorted(scope.glob("*.py"))]
+        if not dags or any(d is None for d in dags):
+            continue
+        products = {d["PRODUCT_ID"] for d in dags if d}
+        envs = {d["FLUID_ENV_NAME"] for d in dags if d}
+        if len(products) != 1 or len(envs) != 1:
+            continue
+        (product,), (env,) = products, envs
+        if not env or scope.name != f"{product}__{env}":
+            continue
+        if all(d and d["dag_id"] == f"{product}__{env}__{d['BUILD_ID']}" for d in dags):
+            out.append((scope.name, product, env))
+    return out
+
+
+def _superseded_dags(directory: Path, product: str, env: str) -> List[str]:
+    """The files in ``directory`` that are ``product``'s DAGs for ``env`` under the old id.
+
+    Only a DAG rendered for this product and this env, whose dag id carries no
+    env, qualifies: an env-less DAG (``FLUID_ENV_NAME = ''``), another env's
+    and any file that is not a rendered DAG stay.
+    """
+    if directory.is_symlink() or not directory.is_dir():
+        return []
+    out: List[str] = []
+    for path in sorted(directory.iterdir()):
+        if not _DAG_FILE_RE.fullmatch(path.name):
+            continue
+        facts = _dag_facts(path)
+        if (
+            facts is not None
+            and facts["PRODUCT_ID"] == product
+            and facts["FLUID_ENV_NAME"] == env
+            and facts["dag_id"] == f"{product}__{facts['BUILD_ID']}"
+        ):
+            out.append(path.name)
+    return out
+
+
+#: The transports whose destination this command can read, and so retire in.
+_RETIRING_SCHEMES = ("file", "git+ssh")
+#: The transports that mirror with deletion (``--delete-scope destination``
+#: deletes the old directory itself there).
+_DELETING_SCHEMES = ("s3", "gs", "file", "ssh", "git+ssh")
+
+
+def _report_superseded_scopes(dags_dir: Path, args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """Each env directory that replaced an old one, and whether the old DAGs were retired.
+
+    Where this command cannot read the destination, the one step that is left
+    to do is printed: without it the old DAG keeps running beside the new one.
+    """
+    try:
+        replaced = _replaced_scopes(dags_dir)
+    except OSError:
+        return []
+    if not replaced:
+        return []
+    scope = _delete_scope(args)
+    scheme = None
+    if args.scheduler in ("airflow", "mwaa") and args.destination:
+        try:
+            scheme, _dest = _validate_destination(args.destination, args.scheduler)
+        except CLIError:
+            scheme = None
+    if args.scheduler == "mwaa":
+        scheme = "s3"
+    retired_here = (
+        args.scheduler == "airflow" and scheme in _RETIRING_SCHEMES and scope == "product"
+    )
+    mirrored = scope == "destination" and scheme in _DELETING_SCHEMES
+    out: List[Dict[str, Any]] = []
+    for current, product, env in replaced:
+        handled = retired_here or mirrored
+        out.append({"scope": current, "replaces": product, "env": env, "old_dags_retired": handled})
+        if handled:
+            continue
+        cprint(
+            f"[schedule-sync] note: {current}/ now holds {product}'s DAGs for env {env}. "
+            f"forge-cli 0.16.7 and earlier synced them to {product}/ with dag ids "
+            f"{product}__<build>, and this destination cannot be read here to retire "
+            f"those. Delete {product}/'s DAG files for env {env} at the destination once "
+            f"(each is a DAG whose FLUID_ENV_NAME is {env!r}), or Airflow runs "
+            f"{product}__<build> beside {product}__{env}__<build>.",
+            markup=False,
+        )
+    return out
+
+
+def _retire_argvs(
+    rsync: str, root: Path, dest_root: str, replaced: List[Tuple[str, str, str]], empty: str
+) -> List[List[str]]:
+    """An ``rsync --delete`` from an empty directory, filtered to the superseded DAGs.
+
+    ``root`` is where the destination can be read (a local path, or the
+    git+ssh clone); ``dest_root`` is how rsync names it. Only the files
+    :func:`_superseded_dags` names are deleted: everything else in the old
+    directory is excluded, and rsync never deletes an excluded file. ``-r``,
+    not ``-a``: the old directory keeps its own mode and times, not the
+    empty source's (a private temporary directory).
+    """
+    argvs: List[List[str]] = []
+    for _scope, product, env in replaced:
+        names = _superseded_dags(root / product, product, env)
+        if not names:
+            continue
+        argvs.append(
+            [
+                rsync,
+                "-rv",
+                "--delete",
+                *[f"--include=/{name}" for name in names],
+                "--exclude=*",
+                "--",
+                empty.rstrip("/") + "/",
+                _under(dest_root, f"{product}/"),
+            ]
+        )
+    return argvs
+
+
 def _run_units(argvs: List[List[str]], args: argparse.Namespace) -> List[Dict[str, Any]]:
     """Run each argv in turn; stop at the first failure."""
     results: List[Dict[str, Any]] = []
@@ -873,8 +1070,16 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
             if clone_result["exit_code"] != 0:
                 return results
 
+            empty = str(Path(tmp) / "empty")
+            Path(empty).mkdir()
+            retire = (
+                _retire_argvs(rsync, Path(clone_dir), "./", _replaced_scopes(dags_dir), empty)
+                if _delete_scope(args) == "product"
+                else []
+            )
             for argv in (
                 *rsync_argvs,
+                *retire,
                 [git, "add", "--", "."],
             ):
                 result = _run_subprocess_with_cwd(
@@ -1025,20 +1230,29 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
         # future change to _validate_destination that lets a leading-'-'
         # path slip through still doesn't smuggle an rsync option.
         root = local_dest.rstrip("/") + "/"
-        return _run_units(
-            [
+        with tempfile.TemporaryDirectory(prefix="fluid-schedule-sync-empty-") as empty:
+            # The DAGs an env's directory replaced, once each env's own
+            # directory is in place (see _replaced_scopes).
+            retire = (
+                _retire_argvs(binary, Path(root), root, _replaced_scopes(dags_dir), empty)
+                if _delete_scope(args) == "product"
+                else []
+            )
+            return _run_units(
                 [
-                    binary,
-                    "-av",
-                    *(["--delete"] if delete else []),
-                    "--",
-                    source,
-                    _under(root, suffix),
+                    [
+                        binary,
+                        "-av",
+                        *(["--delete"] if delete else []),
+                        "--",
+                        source,
+                        _under(root, suffix),
+                    ]
+                    for source, suffix, delete in units
                 ]
-                for source, suffix, delete in units
-            ],
-            args,
-        )
+                + retire,
+                args,
+            )
     elif scheme == "ssh":
         binary = _which_or_raise("rsync")
         # rsync over ssh: ssh://user@host/path → user@host:/path
@@ -1423,6 +1637,7 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
     )
 
     results = dispatcher(dags_dir, args)
+    superseded = _report_superseded_scopes(dags_dir, args)
 
     # ── Acquisition pattern: emit per-orchestrator artifacts ────────────
     # When the contract carries a Bronze ``pattern: acquisition`` build,
@@ -1486,6 +1701,7 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
         "delete_scope": delete_scope,
         "dry_run": args.dry_run,
         "results": results,
+        "superseded_scopes": superseded,
         "overall_exit": overall_exit,
     }
 

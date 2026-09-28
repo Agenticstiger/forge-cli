@@ -17,9 +17,9 @@ Command Center configuration.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import yaml
 
@@ -53,6 +53,11 @@ class CommandCenterConfig:
     retry_attempts: int = 3
     batch_size: int = 100  # logs/metrics per batch
     flush_interval: int = 5  # seconds
+    #: Extra request headers: the ``Authorization`` a bearer credential needs
+    #: and the ``X-Organization-Id`` the Command Center scopes a run to. Set
+    #: by callers that authenticate the way ``fluid publish`` does
+    #: (``cli/_apply_cc_report.py``); never read from a file here.
+    headers: Dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_environment(cls) -> "CommandCenterConfig":
@@ -128,7 +133,8 @@ class CommandCenterConfig:
         Returns:
             True if URL and API key are set, False otherwise
         """
-        return bool(self.enabled and self.url and self.api_key)
+        credential = self.api_key or self.headers.get("Authorization")
+        return bool(self.enabled and self.url and credential)
 
     def __repr__(self) -> str:
         # Mask API key for security
@@ -136,7 +142,9 @@ class CommandCenterConfig:
         if self.api_key:
             visible_prefix = self.api_key[:4]
             masked_key = f"{visible_prefix}***REDACTED***"
+        # Header names only: an Authorization value is a credential.
         return (
             f"CommandCenterConfig(url={self.url}, api_key={masked_key}, "
-            f"enabled={self.enabled}, timeout={self.timeout})"
+            f"enabled={self.enabled}, timeout={self.timeout}, "
+            f"headers={sorted(self.headers)})"
         )

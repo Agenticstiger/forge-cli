@@ -225,13 +225,19 @@ class CommandCenterReporter:
         # Circuit breaker
         self.circuit_breaker = CircuitBreaker(failure_threshold=5, timeout=60, success_threshold=1)
 
+        #: What the worker managed to deliver, for a caller that has to say
+        #: whether the run reached the Command Center (the queue is async).
+        self.stats: Dict[str, int] = {"sent": 0, "failed": 0}
+
         # Session for connection pooling
         self.session: Optional[Any] = None
         if self.enabled and requests:
             self.session = requests.Session()
-            self.session.headers.update(
-                {"X-API-Key": config.api_key, "Content-Type": "application/json"}
-            )
+            headers = {"Content-Type": "application/json"}
+            if config.api_key:
+                headers["X-API-Key"] = config.api_key
+            headers.update(config.headers or {})
+            self.session.headers.update(headers)
 
     def start(self):
         """Start background worker thread."""
@@ -477,7 +483,17 @@ class CommandCenterReporter:
 
             response.raise_for_status()
             logger.debug(f"Command Center: {method} {endpoint} → {response.status_code}")
+            self.stats["sent"] += 1
 
         except Exception as e:
-            logger.warning(f"Failed to send event to Command Center: {e}")
+            self.stats["failed"] += 1
+            # The type and the status only: a requests exception's text
+            # repeats the URL, and nothing here needs the response body.
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            logger.warning(
+                "Failed to send event to Command Center: %s %s -> %s",
+                method,
+                endpoint,
+                status or type(e).__name__,
+            )
             raise

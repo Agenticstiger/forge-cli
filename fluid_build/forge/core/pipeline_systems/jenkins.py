@@ -718,9 +718,11 @@ EOM
             [
                 "mkdir -p runtime",
                 _needs_bundle(6),
+                # --check-sovereignty: a strict sovereignty violation fails the
+                # plan stage, before stage 7 reaches a cloud.
                 (
                     f"set -- {BUNDLE_PATH} {env_flag} "
-                    f'--mode "{v("APPLY_MODE")}" --out runtime/plan.json'
+                    f'--mode "{v("APPLY_MODE")}" --out runtime/plan.json --check-sovereignty'
                 ),
                 (
                     f'if [ "{v("PLAN_HTML")}" = "true" ]; then '

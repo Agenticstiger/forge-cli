@@ -32,7 +32,7 @@ Output layout (full default emit set)::
     ├── odcs/product.odcs.<exposeId>.yaml   # ODCS v3.1.0 (bitol-io) — one per exposed port
     ├── odps-bitol/<product>.odps.yaml      # ODPS-Bitol v1.0.0 (bitol-io)
     ├── opds/<product>.opds.json            # OPDS v4.1 (LF/ODPI) — schema-validated
-    ├── schedule/<product-id>/             # one directory per product, so
+    ├── schedule/<product-id>[__<env>]/    # one directory per product, so
     │   └── <build-id>_dag.py               #   schedule-sync never deletes
     │                                       #   another product's DAGs (Path A)
     └── policy/bindings.json                # compiled IAM/GRANT bindings
@@ -558,7 +558,7 @@ def _emit_schedule(
     dag_contract_path: Optional[str] = None,
     warn_no_env: bool = False,
 ) -> List[Path]:
-    """DAG/flow emission via ``generate schedule`` into ``<out>/schedule/<product-id>/``.
+    """DAG/flow emission via ``generate schedule`` into ``<out>/schedule/<product-id>[__<env>]/``.
 
     ``env`` is the ``--env`` a ``fluid apply`` DAG passes on every run.
     ``overlay_env`` is the overlay applied while rendering: the same env for a
@@ -608,11 +608,13 @@ def _emit_schedule(
             )
         dag_contract_path = fluid_apply.DEFAULT_CONTRACT_PATH
 
-    # One directory per product: stage 11 (``schedule-sync``, default
+    # One directory per product and env: stage 11 (``schedule-sync``, default
     # ``--delete-scope product``) mirrors it into the same-named directory of
     # the scheduler's DAG root, so deleting stale DAGs never reaches another
-    # product's files there.
-    scope_dir = out_dir / product_id
+    # product's files there, nor the same product's DAGs for another env (an
+    # aws and a gcp pipeline syncing to one Airflow). ``<product>`` with no
+    # env, ``<product>__<env>`` with one.
+    scope_dir = out_dir / fluid_apply.schedule_scope_for(product_id, env or None)
     scope_dir.mkdir(parents=True, exist_ok=True)
     args = argparse.Namespace(
         contract=str(contract_path),
