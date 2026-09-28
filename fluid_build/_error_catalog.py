@@ -307,6 +307,14 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
+    "generate_iac_aws_account_required": (
+        [
+            "Set AWS_ACCOUNT_ID to the account the module will be applied in, then re-run "
+            "'fluid generate iac' (it never looks the account up in AWS)",
+            "'fluid apply' resolves the account itself and needs no AWS_ACCOUNT_ID",
+        ],
+        None,
+    ),
     "generate_ci_failed": (
         [
             "Check the --system value is a supported CI provider and the contract validates",

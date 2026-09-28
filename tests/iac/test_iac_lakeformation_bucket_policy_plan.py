@@ -19,6 +19,11 @@ which grantee is "in the applying account" depends on the credentials
 ``tofu`` runs with. So the emit carries the filter as HCL, and the only proof
 that it keeps and drops the right statements is a plan that evaluates it.
 
+The same plans prove the two other halves of the bucket policy that only a
+plan evaluates: two exposes on one bucket share one policy, with a statement
+for each prefix, and on the ``{account}-fluid-data`` fallback bucket the Lake
+Formation location and the policy name the applying account.
+
 A moto ``ThreadedMotoServer`` answers ``sts:GetCallerIdentity`` for
 ``data.aws_caller_identity`` (moto's account is ``123456789012``); the
 ``aws_arn`` and ``aws_iam_policy_document`` data sources are computed by the
@@ -141,8 +146,10 @@ def _contract(grantees: List[str], bucket_policy: Optional[str] = None) -> Dict[
     }
 
 
-def _plan(contract: Dict[str, Any], workdir: Path, endpoint: str, env: Dict[str, str]):
-    """``tofu init`` + ``plan``; the planned ``aws_s3_bucket_policy`` instances by address."""
+def _planned_changes(
+    contract: Dict[str, Any], workdir: Path, endpoint: str, env: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """``tofu init`` + ``plan``; every planned resource change."""
     workdir.mkdir(parents=True, exist_ok=True)
     (workdir / "main.tf.json").write_text(build_module(get_iac_plugin("aws"), contract))
     (workdir / "provider.tf.json").write_text(json.dumps(_provider_override(endpoint)))
@@ -174,10 +181,14 @@ def _plan(contract: Dict[str, Any], workdir: Path, endpoint: str, env: Dict[str,
         timeout=600,
         check=True,
     )
-    changes = json.loads(shown.stdout)["resource_changes"]
+    return list(json.loads(shown.stdout)["resource_changes"])
+
+
+def _plan(contract: Dict[str, Any], workdir: Path, endpoint: str, env: Dict[str, str]):
+    """The planned ``aws_s3_bucket_policy`` instances by address, policies parsed."""
     return {
         change["address"]: json.loads(change["change"]["after"]["policy"])
-        for change in changes
+        for change in _planned_changes(contract, workdir, endpoint, env)
         if change["type"] == "aws_s3_bucket_policy" and change["change"]["actions"] == ["create"]
     }
 
@@ -219,3 +230,95 @@ class TestTheFilterAtPlanTime:
     def test_none_plans_no_bucket_policy(self, tmp_path, moto_endpoint, tofu_env):
         planned = _plan(_contract([SAME, OTHER], "none"), tmp_path, moto_endpoint, tofu_env)
         assert planned == {}
+
+
+def _two_zones(
+    raw: List[str], curated: List[str], bucket_policy: Optional[str] = None
+) -> Dict[str, Any]:
+    """Two exposes on the bucket ``lf-plan-lake``, as in examples/aws-medallion-lake."""
+    contract = _contract(raw, bucket_policy)
+    contract["exposes"][0]["binding"]["location"]["path"] = "raw/"
+    zone = _contract(curated, bucket_policy)["exposes"][0]
+    zone["exposeId"] = "curated"
+    zone["binding"]["location"].update({"path": "curated/", "database": "silver"})
+    contract["exposes"].append(zone)
+    return contract
+
+
+def _statements(policy: Dict[str, Any]) -> Dict[str, Any]:
+    return {s["Sid"]: (s["Principal"]["AWS"], s["Resource"]) for s in policy["Statement"]}
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+class TestOneBucketTwoExposesAtPlanTime:
+    """Each expose used to emit the bucket's policy under the same key, so the
+    second replaced the first and ``raw/`` lost its cross-account statements."""
+
+    def test_both_prefixes_keep_their_cross_account_statements(
+        self, tmp_path, moto_endpoint, tofu_env
+    ):
+        planned = _plan(_two_zones([SAME, OTHER], [OTHER]), tmp_path, moto_endpoint, tofu_env)
+        assert list(planned) == [f"{POLICY}[0]"], "one policy for the one bucket"
+        assert _statements(planned[f"{POLICY}[0]"]) == {
+            "FluidLfBucketList1": (OTHER, "arn:aws:s3:::lf-plan-lake"),
+            "FluidLfBucketGet1": (OTHER, "arn:aws:s3:::lf-plan-lake/raw/*"),
+            "FluidLfBucketList2": (OTHER, "arn:aws:s3:::lf-plan-lake"),
+            "FluidLfBucketGet2": (OTHER, "arn:aws:s3:::lf-plan-lake/curated/*"),
+        }
+
+    def test_same_account_grantees_on_both_exposes_plan_no_policy(
+        self, tmp_path, moto_endpoint, tofu_env
+    ):
+        planned = _plan(_two_zones([SAME], [SAME]), tmp_path, moto_endpoint, tofu_env)
+        assert planned == {}
+
+    def test_all_grantees_writes_both_prefixes(self, tmp_path, moto_endpoint, tofu_env):
+        contract = _two_zones([SAME], [OTHER], "all-grantees")
+        planned = _plan(contract, tmp_path, moto_endpoint, tofu_env)
+        assert list(planned) == [POLICY]
+        assert _statements(planned[POLICY]) == {
+            "FluidLfBucketList0": (SAME, "arn:aws:s3:::lf-plan-lake"),
+            "FluidLfBucketGet0": (SAME, "arn:aws:s3:::lf-plan-lake/raw/*"),
+            "FluidLfBucketList1": (OTHER, "arn:aws:s3:::lf-plan-lake"),
+            "FluidLfBucketGet1": (OTHER, "arn:aws:s3:::lf-plan-lake/curated/*"),
+        }
+
+
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+class TestTheFallbackBucketAtPlanTime:
+    """An unresolved ``location.bucket`` falls back to ``{account}-fluid-data``.
+    The Lake Formation location was planned as the literal
+    ``arn:aws:s3:::${data.aws_caller_identity...}-fluid-data/...``, and a
+    bucket policy failed the plan with "Reference to undeclared resource"."""
+
+    ACCOUNT_BUCKET = f"{APPLYING_ACCOUNT}-fluid-data"
+
+    @pytest.fixture(autouse=True)
+    def _unset(self, monkeypatch):
+        monkeypatch.delenv("FLUID_TEST_LF_PLAN_BUCKET", raising=False)
+
+    def _fallback(self, bucket_policy: Optional[str] = None) -> Dict[str, Any]:
+        contract = _contract([OTHER], bucket_policy)
+        contract["exposes"][0]["binding"]["location"][
+            "bucket"
+        ] = "{{ env.FLUID_TEST_LF_PLAN_BUCKET }}"
+        return contract
+
+    @pytest.mark.parametrize("bucket_policy", [None, "all-grantees"])
+    def test_the_location_and_the_policy_name_the_applying_account(
+        self, bucket_policy, tmp_path, moto_endpoint, tofu_env
+    ):
+        changes = _planned_changes(self._fallback(bucket_policy), tmp_path, moto_endpoint, tofu_env)
+        by_type: Dict[str, List[Dict[str, Any]]] = {}
+        for change in changes:
+            by_type.setdefault(change["type"], []).append(change["change"]["after"])
+        assert [r["arn"] for r in by_type["aws_lakeformation_resource"]] == [
+            f"arn:aws:s3:::{self.ACCOUNT_BUCKET}/orders/"
+        ]
+        (policy,) = by_type["aws_s3_bucket_policy"]
+        assert policy["bucket"] == self.ACCOUNT_BUCKET
+        resources = {s["Resource"] for s in json.loads(policy["policy"])["Statement"]}
+        assert resources == {
+            f"arn:aws:s3:::{self.ACCOUNT_BUCKET}",
+            f"arn:aws:s3:::{self.ACCOUNT_BUCKET}/orders/*",
+        }
