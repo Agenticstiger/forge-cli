@@ -180,7 +180,7 @@ class TestGenerateIacByteIdentity:
         # Pin determinism: the native planner is best-effort (credentials-
         # dependent) — force the no-actions path on BOTH sides so the pin
         # never depends on the developer's cloud environment.
-        monkeypatch.setattr(generate_iac, "native_actions", lambda contract, logger: [])
+        monkeypatch.setattr(generate_iac, "native_actions", lambda contract, logger, **_: [])
         try:
             _, expected = _expected_module_bytes(path)
         except CLIError as exc:
@@ -210,7 +210,7 @@ class TestResolverIsWiredAtTheEntryPoint:
     ):
         example = REPO_ROOT / "examples" / "aws-s3-glue-athena" / "contract.fluid.yaml"
         assert example.is_file()
-        monkeypatch.setattr(generate_iac, "native_actions", lambda contract, logger: [])
+        monkeypatch.setattr(generate_iac, "native_actions", lambda contract, logger, **_: [])
         seen = []
 
         def spy(contract):
@@ -247,7 +247,7 @@ class TestResolverIsWiredAtTheEntryPoint:
         }
         path = tmp_path / "contract.fluid.yaml"
         path.write_text(yaml.safe_dump(contract), encoding="utf-8")
-        monkeypatch.setattr(generate_iac, "native_actions", lambda contract, logger: [])
+        monkeypatch.setattr(generate_iac, "native_actions", lambda contract, logger, **_: [])
         with pytest.raises(CLIError) as excinfo:
             _run_generate_iac(path, tmp_path / "out")
         assert "pool" in str((excinfo.value.context or {}).get("error", ""))

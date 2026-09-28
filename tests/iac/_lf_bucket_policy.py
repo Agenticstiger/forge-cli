@@ -19,10 +19,11 @@
 * ``all-grantees`` puts a static JSON document on the ``aws_s3_bucket_policy``.
 * ``cross-account`` (the default) points the resource at a
   ``data.aws_iam_policy_document`` whose ``dynamic "statement"`` blocks
-  iterate over the grantees in other accounts, decided at plan time. The
-  helper expands those blocks for EVERY grantee, i.e. the candidate
-  statements before the plan-time filter runs, which is the set the
-  prefix-scoping assertions must hold for.
+  iterate over the grantees in other accounts, decided at plan time: a
+  pair of blocks per exposure on the bucket, each over that exposure's
+  grantees. The helper expands those blocks for EVERY grantee, i.e. the
+  candidate statements before the plan-time filter runs, which is the set
+  the prefix-scoping assertions must hold for.
 
 Both come back in the static document's form and order, so a test can assert
 one property across both modes.
@@ -36,6 +37,8 @@ from typing import Any, Dict, List, Mapping
 
 _DOC_REF = re.compile(r"^\$\{data\.aws_iam_policy_document\.([A-Za-z0-9_]+)\.json\}$")
 _ARN_REF = re.compile(r"data\.aws_arn\.([A-Za-z0-9_]+)")
+#: ``tostring(i)`` for an exposure's grantees numbered from 0, ``tostring(i + N)`` from N.
+_FIRST = re.compile(r"tostring\(i(?: \+ (\d+))?\)")
 
 
 def policy_statements(
@@ -47,27 +50,37 @@ def policy_statements(
         return list(json.loads(policy["policy"])["Statement"])
     assert data is not None, "a cross-account policy needs emit_data() to be read"
     document = data["aws_iam_policy_document"][match.group(1)]
-    blocks = document["dynamic"]["statement"]
-    grantee_keys = _ARN_REF.findall(blocks[0]["for_each"])
-    arns = [data["aws_arn"][key]["arn"] for key in grantee_keys]
+    # Consecutive blocks over the same grantees are one exposure's pair.
+    groups: List[List[Mapping[str, Any]]] = []
+    for block in document["dynamic"]["statement"]:
+        if groups and groups[-1][0]["for_each"] == block["for_each"]:
+            groups[-1].append(block)
+        else:
+            groups.append([block])
     statements: List[Dict[str, Any]] = []
-    for index, arn in enumerate(arns):
-        for block in blocks:
-            content = block["content"]
-            resources = list(content["resources"])
-            statement: Dict[str, Any] = {
-                "Sid": content["sid"].replace("${statement.key}", str(index)),
-                "Effect": content["effect"],
-                "Principal": {content["principals"]["type"]: arn},
-                "Action": list(content["actions"]),
-                "Resource": resources[0] if len(resources) == 1 else resources,
-            }
-            condition = content.get("condition")
-            if condition:
-                statement["Condition"] = {
-                    condition["test"]: {condition["variable"]: list(condition["values"])}
+    for group in groups:
+        for_each = group[0]["for_each"]
+        first = _FIRST.search(for_each)
+        assert first is not None, f"no grantee index in {for_each}"
+        offset = int(first.group(1) or 0)
+        arns = [data["aws_arn"][key]["arn"] for key in _ARN_REF.findall(for_each)]
+        for position, arn in enumerate(arns):
+            for block in group:
+                content = block["content"]
+                resources = list(content["resources"])
+                statement: Dict[str, Any] = {
+                    "Sid": content["sid"].replace("${statement.key}", str(offset + position)),
+                    "Effect": content["effect"],
+                    "Principal": {content["principals"]["type"]: arn},
+                    "Action": list(content["actions"]),
+                    "Resource": resources[0] if len(resources) == 1 else resources,
                 }
-            statements.append(statement)
+                condition = content.get("condition")
+                if condition:
+                    statement["Condition"] = {
+                        condition["test"]: {condition["variable"]: list(condition["values"])}
+                    }
+                statements.append(statement)
     return statements
 
 

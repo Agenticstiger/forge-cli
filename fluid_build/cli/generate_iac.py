@@ -44,6 +44,12 @@ from ._logging import info
 
 _PROVIDER_CHOICES = ["auto", *sorted(IAC_PLUGINS)]
 
+#: The AWS account the native planner is given when ``fluid generate iac`` runs
+#: without ``AWS_ACCOUNT_ID`` (see :func:`native_actions`). Shaped to pass the
+#: planner's own name checks (it becomes part of bucket names), and never an
+#: account id, so a module that would carry it is refused rather than written.
+UNSET_AWS_ACCOUNT = "fluid-aws-account-id-unset"
+
 
 def register_subcommand(subparsers: argparse._SubParsersAction):
     """Register as a subcommand of ``fluid generate``."""
@@ -116,7 +122,7 @@ def run(args, logger: logging.Logger) -> int:
         logger.debug("packaging resolved: legacy=%s pool=%s", packaging.is_legacy, packaging.pool)
         provider = _resolve_provider(contract, getattr(args, "provider", "auto"))
         plugin = get_iac_plugin(provider)
-        actions = native_actions(contract, logger)
+        actions = native_actions(contract, logger, offline=True)
         resources = plugin.emit(contract, actions)
         count = sum(len(items) for items in resources.values())
         provider_cfg = provider_config(plugin, contract)
@@ -127,11 +133,13 @@ def run(args, logger: logging.Logger) -> int:
             # `.tf.json` keys the provider block by the provider's local name.
             provider={plugin.name: provider_cfg} if provider_cfg else None,
         )
+        rendered = render_tofu_json(document)
+        _refuse_an_unset_aws_account(rendered)
         out_dir = getattr(args, "out", None) or "runtime/iac"
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, "main.tf.json")
         with open(out_path, "w", encoding="utf-8") as f:
-            f.write(render_tofu_json(document))
+            f.write(rendered)
     except CLIError:
         raise
     except UnsupportedBindingError as exc:
@@ -186,6 +194,32 @@ def run(args, logger: logging.Logger) -> int:
     if getattr(args, "shadow", False):
         _print_shadow_report(contract, plugin, logger)
     return 0
+
+
+def _refuse_an_unset_aws_account(rendered: str) -> None:
+    """Refuse a module that would carry :data:`UNSET_AWS_ACCOUNT`.
+
+    The emitter's own account references are ``data.aws_caller_identity``
+    lookups that ``tofu`` resolves at plan time; only the native planner's
+    actions (Lambda, EventBridge and Step Functions ARNs, for instance) spell
+    the account out. When they reach the module and no account was given,
+    the module is refused, naming ``AWS_ACCOUNT_ID``, rather than written with
+    a placeholder where the account belongs.
+    """
+    if UNSET_AWS_ACCOUNT not in rendered:
+        return
+    raise CLIError(
+        1,
+        "generate_iac_aws_account_required",
+        {
+            "error": (
+                "the module names the AWS account (in the ARNs of the resources the "
+                "contract's orchestration plans), and AWS_ACCOUNT_ID is not set.\n"
+                "  `fluid generate iac` never asks AWS for the account. Set "
+                "AWS_ACCOUNT_ID to the account the module will be applied in, then re-run."
+            )
+        },
+    )
 
 
 def _validate_with_tofu(out_dir: str) -> None:
@@ -318,7 +352,7 @@ def _resolve_provider(contract, requested: str) -> str:
     return cloud
 
 
-def native_actions(contract, logger: logging.Logger) -> list:
+def native_actions(contract, logger: logging.Logger, *, offline: bool = False) -> list:
     """Best-effort native ``provider.plan()`` actions for the contract.
 
     The OpenTofu emitter consumes these to translate the schedule /
@@ -334,12 +368,25 @@ def native_actions(contract, logger: logging.Logger) -> list:
     apply path kept announcing three actions for a contract that owns
     exactly one leaf table — while ``tofu`` correctly planned ``+1``.
     This is the apply-side chokepoint, matching ``cli/plan.py``'s.
+
+    ``offline`` is set by ``fluid generate iac``, which must reach no cloud
+    API. The AWS provider resolves a missing account with
+    ``sts:GetCallerIdentity`` over whatever credentials the machine has, so
+    without ``AWS_ACCOUNT_ID`` it is given :data:`UNSET_AWS_ACCOUNT` instead:
+    the planner (and its sovereignty check) still runs, and :func:`run`
+    refuses a module that would carry the placeholder. ``fluid apply`` leaves
+    it unset and resolves the account as before.
     """
     try:
         from ._common import build_provider, resolve_provider_from_contract
 
         name, loc = resolve_provider_from_contract(contract)
-        native = build_provider(name, loc.get("project"), loc.get("region"), logger)
+        account = loc.get("project")
+        # The provider name as ``build_provider`` resolves it.
+        provider = (name or os.getenv("FLUID_PROVIDER") or "").strip().lower().replace("-", "_")
+        if offline and provider == "aws" and not account and not os.getenv("AWS_ACCOUNT_ID"):
+            account = UNSET_AWS_ACCOUNT
+        native = build_provider(name, account, loc.get("region"), logger)
         if hasattr(native, "plan"):
             return _drop_referenced_container_actions(contract, list(native.plan(contract)), logger)
     except Exception as exc:  # noqa: BLE001 — native planner is best-effort
@@ -421,7 +468,7 @@ def _print_shadow_report(contract, plugin, logger: logging.Logger) -> None:
     """Run shadow-compare and print the native↔OpenTofu parity report."""
     from fluid_build.iac import shadow_compare
 
-    actions = native_actions(contract, logger)
+    actions = native_actions(contract, logger, offline=True)
     if not actions:
         cprint(
             "\nShadow-compare: native planner produced no actions "
