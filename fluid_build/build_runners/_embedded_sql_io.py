@@ -43,9 +43,13 @@ each entry is resolved the way the upstream itself would be deployed:
    through the duckdb acquisition runner's own key rule
    (``_object_store_uri``), read as the glob of that prefix's files of the
    binding format, which is also what the Glue table ``fluid apply`` declares
-   for the binding serves. Anything this engine cannot read (a warehouse
-   table, a stream, a GCS or Azure prefix) is an :class:`UnreadableBindingError`
-   naming the platform.
+   for the binding serves; a GCP ``bigquery_table`` binding as that table,
+   named by the IaC's own rule (``_bigquery_load.bigquery_load_target``, the
+   table ``fluid apply`` created and the upstream's build loads), read
+   through the BigQuery API into a staged Parquet file when the build runs
+   (``_bigquery_read``). Anything else this engine cannot read (another
+   warehouse's table, a stream, a GCS or Azure prefix) is an
+   :class:`UnreadableBindingError` naming the platform.
 
 Each entry the SQL reads becomes one DuckDB view named by its ``exposeId``, a
 quoted identifier that must pass ``validate_ident``. What the SQL reads is
@@ -65,10 +69,16 @@ about to overwrite.
 **Lands.** When the first expose's binding is an AWS object-store binding, the
 result is written to exactly the object the acquisition runner writes for that
 binding (``_object_store_uri`` + ``_file_within_prefix``), inside the prefix
-the Glue table points at, so ``fluid verify --env aws`` counts it. A local
-binding is unchanged. An expose declaring ``policy.privacy.masking`` is
-refused: this path does not apply masking, and cleartext must not land
-silently.
+the Glue table points at, so ``fluid verify --env aws`` counts it. When it is
+a GCP ``bigquery_table`` binding, the result is staged as Parquet under the
+build's ``.fluid/staging`` and one load job moves it into that table
+(``_bigquery_load.load_file``, the acquisition runner's own load), whatever
+``location.path`` the binding also carries: a ``gs://`` path there is not a
+file this path writes. A local binding is unchanged. Any other landing (a
+``gs://`` or other non-S3 URI, a GCS bucket, another warehouse) is refused
+with :class:`EmbeddedSqlLandingError` rather than written to a local file of
+that name. An expose declaring ``policy.privacy.masking`` is refused: this
+path does not apply masking, and cleartext must not land silently.
 
 Borrowed, not built:
 
@@ -180,6 +190,11 @@ class ResolvedInput:
     platform: str
     contract_path: Path
     region: Optional[str] = None
+    #: A BigQuery upstream: its ``project.dataset.table`` (the project empty
+    #: when the client's own is used), read into ``read_path`` before the SQL.
+    table: Optional[str] = None
+    #: The local Parquet file a BigQuery upstream was staged into.
+    read_path: Optional[str] = None
 
     @property
     def view(self) -> str:
@@ -188,20 +203,28 @@ class ResolvedInput:
 
     def as_input_spec(self) -> Dict[str, Any]:
         """The local provider's input spec (``_register_inputs``) for this entry."""
+        if self.table is not None and self.read_path is None:
+            raise RuntimeError(
+                f"{_entry(self.product_id, self.expose_id)}: BigQuery table {self.table} "
+                "was not staged before the SQL ran"
+            )
         spec: Dict[str, Any] = {
             "table": self.view,
-            "path": self.uri,
-            "format": self.format,
+            "path": self.read_path or self.uri,
+            "format": "parquet" if self.read_path else self.format,
             "quoted": True,
             "productId": self.product_id,
             "exposeId": self.expose_id,
         }
-        if self.region:
+        if self.region and self.table is None:
             spec["region"] = self.region
         return spec
 
     def record(self) -> Dict[str, str]:
-        return {"productId": self.product_id, "exposeId": self.expose_id, "uri": self.uri}
+        rec = {"productId": self.product_id, "exposeId": self.expose_id, "uri": self.uri}
+        if self.read_path:
+            rec["staged"] = self.read_path
+        return rec
 
 
 @dataclass(frozen=True)
@@ -239,6 +262,36 @@ class Landing:
         return spec
 
 
+@dataclass(frozen=True)
+class BigQueryLanding:
+    """The BigQuery table an embedded-SQL build loads its result into.
+
+    ``project`` is ``None`` when neither the binding nor the environment names
+    one, and the client's own is used, as the acquisition runner's load does.
+    ``staged`` is the local Parquet file the SQL writes and the load reads,
+    set when the build runs.
+    """
+
+    project: Optional[str]
+    dataset: str
+    table: str
+    location: str
+    staged: Optional[str] = None
+
+    @property
+    def table_id(self) -> str:
+        return f"{self.project or '<default project>'}.{self.dataset}.{self.table}"
+
+    def load_target(self) -> Dict[str, Any]:
+        """The target ``_bigquery_load.load_file`` takes."""
+        return {
+            "project": self.project,
+            "dataset": self.dataset,
+            "table": self.table,
+            "location": self.location,
+        }
+
+
 @dataclass
 class EmbeddedSqlIO:
     """Everything :func:`plan_embedded_sql_io` decided, before any SQL runs."""
@@ -248,6 +301,11 @@ class EmbeddedSqlIO:
     lineage_only: List[LineageOnlyInput] = field(default_factory=list)
     landing: Optional[Landing] = None
     workspace_root: Optional[Path] = None
+    bigquery_landing: Optional[BigQueryLanding] = None
+
+    @property
+    def bigquery_inputs(self) -> List[ResolvedInput]:
+        return [r for r in self.inputs if r.table is not None]
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -472,6 +530,21 @@ def _unreadable(where: str, platform: str, fmt: str, detail: str) -> UnreadableB
     )
 
 
+def _require_bigquery_reader(where: str) -> None:
+    """Refuse a BigQuery upstream before any SQL runs when it cannot be read here."""
+    from ._bigquery_read import missing_dependency
+
+    problem = missing_dependency()
+    if problem:
+        raise UnreadableBindingError(
+            what=f"{where}: the upstream is a BigQuery table, and this install cannot read one",
+            why=problem,
+            fix="Install the gcp extra where this build runs: pip install 'data-product-forge[gcp]'",
+            doc=doc_url(),
+            extras={"platform": "gcp", "format": "bigquery_table"},
+        )
+
+
 def _read_uri(path: str, platform: str, fmt: str, where: str) -> Tuple[str, str, str]:
     """A binding whose ``location.path`` is already a URI: only ``s3://`` reads."""
     from .duckdb.runner import _FILE_FORMAT_EXT
@@ -555,6 +628,41 @@ def _read_s3_prefix(
     if prefix is None:  # pragma: no cover - a resolved bucket always composes
         raise _unreadable(where, "aws", fmt, "location.bucket did not resolve")
     return f"{prefix}*.{_FILE_FORMAT_EXT[fmt]}", fmt, "aws"
+
+
+#: The ``binding.location`` keys a BigQuery table is named by.
+_BIGQUERY_LOCATION_KEYS = ("project", "dataset", "table", "view", "region", "location")
+
+
+def _bigquery_target(expose: Mapping[str, Any], where: str) -> Optional[Dict[str, Any]]:
+    """The BigQuery table ``expose`` is bound to, or ``None`` when it is not one.
+
+    Named by the IaC's own rule (``_bigquery_load.bigquery_load_target``, which
+    reads ``iac/providers/gcp.py``), so this is the table ``fluid apply``
+    created and the acquisition runner loads. ``{{ env.* }}`` in the naming
+    keys is resolved first, refusing an unset or credential-shaped variable
+    (:func:`_resolve_env`), and the project falls back to the environment
+    (``GOOGLE_PROJECT`` and friends) as the load's does.
+    """
+    from ._bigquery_load import bigquery_load_target
+
+    raw_binding = expose.get("binding")
+    binding: Mapping[str, Any] = raw_binding if isinstance(raw_binding, Mapping) else {}
+    raw_loc = binding.get("location")
+    loc: Mapping[str, Any] = raw_loc if isinstance(raw_loc, Mapping) else {}
+    if bigquery_load_target(binding, expose) is None:
+        return None
+    resolved_loc: Dict[str, Any] = dict(loc)
+    for key in _BIGQUERY_LOCATION_KEYS:
+        if loc.get(key):
+            resolved_loc[key] = _resolve_env(
+                loc.get(key), field_name=f"location.{key}", where=where
+            )
+    return bigquery_load_target({**dict(binding), "location": resolved_loc}, expose)
+
+
+def _bigquery_table_id(target: Mapping[str, Any]) -> str:
+    return f"{target.get('project') or ''}.{target['dataset']}.{target['table']}"
 
 
 def _read_location(
@@ -812,6 +920,26 @@ def _bind_consumes(
         upstream, expose = _upstream_expose(
             upstream_path, product_id, expose_id, env, logger or LOG
         )
+        where = _entry(product_id, expose_id)
+        bigquery = _bigquery_target(expose, where)
+        if bigquery is not None:
+            # Before the location.path check: a bigquery_table binding may also
+            # carry a gs:// staging path, which is not where the table's rows are.
+            _require_bigquery_reader(where)
+            table_id = _bigquery_table_id(bigquery)
+            bound.resolved.append(
+                ResolvedInput(
+                    product_id=product_id,
+                    expose_id=expose_id,
+                    uri=f"bigquery://{table_id.lstrip('.')}",
+                    format="bigquery_table",
+                    platform="gcp",
+                    contract_path=upstream_path,
+                    region=str(bigquery["location"]),
+                    table=table_id,
+                )
+            )
+            continue
         uri, fmt, platform, region = _read_location(
             expose,
             upstream_path,
@@ -901,6 +1029,229 @@ def refuse_unapplied_masking(contract: Mapping[str, Any], build: Mapping[str, An
         )
 
 
+#: ``binding.platform`` values whose storage this path cannot write, and whose
+#: expose the local provider would otherwise write as a local file: another
+#: cloud's object store or a warehouse. A gcp ``bigquery_table`` is checked
+#: before this, and lands through a load job; a GCS bucket or any other gcp
+#: resource does not. Platforms another stage delivers from the landed file
+#: (an output port such as pgvector) keep the local write.
+_UNLANDABLE_PLATFORMS = frozenset({"gcp", "azure", "snowflake", "databricks"})
+
+
+def _refuse_unlandable(binding: Mapping[str, Any], path: Any, platform: str, where: str) -> None:
+    """Refuse a landing this path would otherwise write to a local file.
+
+    The local provider writes whatever ``location.path`` it is given to the
+    local filesystem, so a ``gs://`` path became a file named ``gs:/...`` and a
+    GCS or other-cloud binding a local file, and the build reported success
+    with nothing where the contract said it would be.
+    """
+    fmt = _normalize_format(binding.get("format")) or "unset"
+    text = str(path or "")
+    scheme = text.split("://", 1)[0].lower() if is_remote_uri(text) else ""
+    if scheme and scheme != "s3":
+        raise EmbeddedSqlLandingError(
+            what=f"{where}: the embedded-SQL path cannot land in a {scheme}:// location",
+            why=(
+                f"The binding (platform {platform or 'unset'!r}, format {fmt!r}) names {text}. "
+                "This path writes a local file, an S3 object, or loads a BigQuery table, and "
+                "the local writer would have created a file named after that URI instead."
+            ),
+            fix=(
+                "Bind the expose as a gcp bigquery_table (it is loaded through a load job), "
+                "an aws bucket prefix, or a local path, or land it with another engine."
+            ),
+            doc=doc_url(),
+            extras={"platform": platform or "unset", "format": fmt, "scheme": scheme},
+        )
+    if platform in _UNLANDABLE_PLATFORMS:
+        raise EmbeddedSqlLandingError(
+            what=f"{where}: the embedded-SQL path cannot land a {platform} binding ({fmt})",
+            why=(
+                "This path writes a local file, an S3 object for an aws binding naming a "
+                "bucket, or loads a gcp bigquery_table; a "
+                f"{platform} binding of format {fmt!r} is none of them, and writing it as a "
+                "local file would report success with nothing where the contract says."
+            ),
+            fix=("Bind the expose as one of those, or land it with an engine for that platform."),
+            doc=doc_url(),
+            extras={"platform": platform, "format": fmt},
+        )
+
+
+def _require_bigquery_writer(where: str) -> None:
+    from ._bigquery_read import missing_dependency
+
+    problem = missing_dependency()
+    if problem:
+        raise EmbeddedSqlLandingError(
+            what=f"{where}: the expose is a BigQuery table, and this install cannot load one",
+            why=problem,
+            fix="Install the gcp extra where this build runs: pip install 'data-product-forge[gcp]'",
+            doc=doc_url(),
+        )
+
+
+def bigquery_landing(
+    contract: Mapping[str, Any], build: Mapping[str, Any]
+) -> Optional[BigQueryLanding]:
+    """The BigQuery table the result is loaded into, or ``None`` when it lands elsewhere.
+
+    The first expose, as for every landing here (the local provider writes
+    exposes[0]). A further expose the build names in ``outputs`` that is a
+    BigQuery table is refused: nothing would load it, and the build would
+    report success without it.
+    """
+    exposes = _landed_exposes(contract, build)
+    if not exposes:
+        return None
+    for extra in exposes[1:]:
+        extra_id = str(extra.get("exposeId") or extra.get("id") or "?")
+        if _bigquery_target(extra, f"expose {extra_id}") is not None:
+            raise EmbeddedSqlLandingError(
+                what=(
+                    f"expose {extra_id}: the embedded-SQL path loads its result into one "
+                    "table, the first expose's"
+                ),
+                why=(
+                    f"The build names {extra_id!r} in outputs and binds it to a BigQuery "
+                    "table, which nothing would load."
+                ),
+                fix="Land one expose per embedded-SQL build, or give this one its own build.",
+                doc=doc_url(),
+                extras={"exposeId": extra_id},
+            )
+    expose = exposes[0]
+    expose_id = str(expose.get("exposeId") or expose.get("id") or "result")
+    where = f"expose {expose_id}"
+    target = _bigquery_target(expose, where)
+    if target is None:
+        return None
+    _require_bigquery_writer(where)
+    return BigQueryLanding(
+        project=target.get("project") or None,
+        dataset=str(target["dataset"]),
+        table=str(target["table"]),
+        location=str(target["location"]),
+    )
+
+
+def bigquery_staging_dir(contract_dir: Path, build_id: Any) -> Path:
+    """``.fluid/staging/<build>`` beside the contract, where the acquisition
+    runner stages a BigQuery-bound file too (``_bigquery_staging_path``)."""
+    from .duckdb.runner import _path_part
+
+    return Path(contract_dir) / ".fluid" / "staging" / _path_part(build_id or "build")
+
+
+def stage_bigquery_io(
+    io: EmbeddedSqlIO, contract_dir: Path, build_id: Any, *, logger: logging.Logger
+) -> Tuple[EmbeddedSqlIO, List[Path], List[Dict[str, Any]]]:
+    """Read each BigQuery upstream into a local Parquet file; name the result's staged file.
+
+    Returns ``(io with every BigQuery input staged and the landing's staged
+    path set, the staged input files, one fact per table read)``. The caller
+    removes the staged inputs after the build: they are copies of another
+    product's table.
+    """
+    import dataclasses
+
+    from ._bigquery_read import stage_table
+    from .duckdb.runner import _path_part
+
+    root = bigquery_staging_dir(contract_dir, build_id)
+    staged: List[Path] = []
+    reads: List[Dict[str, Any]] = []
+    inputs: List[ResolvedInput] = []
+    try:
+        for r in io.inputs:
+            if r.table is None:
+                inputs.append(r)
+                continue
+            dest = root / "inputs" / f"{_path_part(r.expose_id)}.parquet"
+            staged.append(dest)
+            reads.append({**stage_table(r.table, dest, logger=logger), "view": r.view})
+            inputs.append(dataclasses.replace(r, read_path=str(dest)))
+    except Exception:
+        remove_staged(staged)
+        raise
+    landing = io.bigquery_landing
+    if landing is not None:
+        landing = dataclasses.replace(
+            landing, staged=str(root / f"{_path_part(landing.table)}.parquet")
+        )
+    return dataclasses.replace(io, inputs=inputs, bigquery_landing=landing), staged, reads
+
+
+def remove_staged(paths: Sequence[Path]) -> None:
+    """Delete staged upstream copies; a file already gone is not an error."""
+    for path in paths:
+        try:
+            Path(path).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:  # pragma: no cover - reported, never raised
+            LOG.warning("embedded_sql_staged_input_not_removed path=%s error=%s", path, exc)
+
+
+def load_bigquery_landing(landing: BigQueryLanding, *, logger: logging.Logger) -> Dict[str, Any]:
+    """Load the staged result into its table: the acquisition runner's own load.
+
+    ``WRITE_TRUNCATE``: the embedded-SQL result replaces the table, as it
+    replaces the local file or the S3 object on the other targets. The count
+    the load is held to is read back from the staged file.
+    """
+    from ._bigquery_load import load_file
+    from .duckdb.runner import _count_file_rows
+
+    if landing.staged is None:
+        raise EmbeddedSqlLandingError(
+            what=f"BigQuery table {landing.table_id}: the result was not staged",
+            why="The load reads the staged Parquet file the SQL writes, and none was named.",
+            fix="Report this: the build must stage the result before it loads it.",
+            doc=doc_url(),
+        )
+    return load_file(
+        landing.staged,
+        landing.load_target(),
+        mode="full_refresh",
+        sink_format="parquet",
+        expected_rows=_count_file_rows(landing.staged, "parquet"),
+        logger=logger,
+    )
+
+
+def refuse_unlandable_first_expose(contract: Mapping[str, Any]) -> None:
+    """For a DuckDB SQL build with no inline SQL: refuse what it would land locally.
+
+    Such a build keeps the provider's old handling (no consumes resolution and
+    no remote landing), so a BigQuery table, a GCS path or another platform's
+    binding would be written as a local file of that name.
+    """
+    exposes = [e for e in contract.get("exposes") or [] if isinstance(e, Mapping)]
+    if not exposes:
+        return
+    expose = exposes[0]
+    expose_id = str(expose.get("exposeId") or expose.get("id") or "result")
+    where = f"expose {expose_id}"
+    binding = expose.get("binding") if isinstance(expose.get("binding"), Mapping) else {}
+    if _bigquery_target(expose, where) is not None:
+        raise EmbeddedSqlLandingError(
+            what=f"{where}: only a build with inline properties.sql loads a BigQuery table",
+            why=(
+                "This build has no inline SQL, so it runs the provider's multi-stage path, "
+                "which writes local files and would land nothing in the table."
+            ),
+            fix="Give the build its SQL in properties.sql.",
+            doc=doc_url(),
+        )
+    raw_loc = binding.get("location")
+    loc: Mapping[str, Any] = raw_loc if isinstance(raw_loc, Mapping) else {}
+    _refuse_unlandable(
+        binding, loc.get("path"), str(binding.get("platform") or "").strip().lower(), where
+    )
+
+
 def object_store_landing(
     contract: Mapping[str, Any], build: Mapping[str, Any]
 ) -> Optional[Landing]:
@@ -917,6 +1268,11 @@ def object_store_landing(
     the stream (``_file_within_prefix``). A ``path`` that is already an
     ``s3://`` URI is used as the runner uses it. No bucket, or no path, keeps
     the local write, as it does in the runner.
+
+    ``None`` for a BigQuery table too, which :func:`bigquery_landing` lands.
+    A landing this path cannot perform (another URI scheme, a platform that is
+    neither local, aws nor a BigQuery table) is refused
+    (:func:`_refuse_unlandable`) instead of becoming a local file.
     """
     from .duckdb.runner import _file_within_prefix, _object_store_uri
 
@@ -927,16 +1283,19 @@ def object_store_landing(
     binding = expose.get("binding") if isinstance(expose.get("binding"), Mapping) else {}
     raw_loc = binding.get("location")
     loc: Mapping[str, Any] = raw_loc if isinstance(raw_loc, Mapping) else {}
+    expose_id = str(expose.get("exposeId") or expose.get("id") or "result")
+    where = f"expose {expose_id}"
+    if _bigquery_target(expose, where) is not None:
+        return None  # a BigQuery table: :func:`bigquery_landing` loads it
     raw_path = loc.get("path")
+    platform = str(binding.get("platform") or "").strip().lower()
+    _refuse_unlandable(binding, raw_path, platform, where)
     if not raw_path:
         return None
-    platform = str(binding.get("platform") or "").strip().lower()
     names_bucket = platform == "aws" and bool(loc.get("bucket"))
     if not names_bucket and not is_remote_uri(str(raw_path)):
         return None  # a local binding: unchanged
 
-    expose_id = str(expose.get("exposeId") or expose.get("id") or "result")
-    where = f"expose {expose_id}"
     path = str(_resolve_env(raw_path, field_name="location.path", where=where))
     resolved_loc: Dict[str, Any] = {
         **dict(loc),
@@ -946,7 +1305,10 @@ def object_store_landing(
     region = _resolve_env(loc.get("region"), field_name="location.region", where=where)
     uri: Optional[str]
     if is_remote_uri(path):
-        uri = path if path.lower().startswith("s3://") else None
+        # A resolved path that is still a non-S3 URI is refused like one written
+        # out: the local provider would write a file named "gs:/..." instead.
+        _refuse_unlandable(binding, path, platform, where)
+        uri = path
     else:
         resolved_loc["bucket"] = _resolve_env(
             loc.get("bucket"), field_name="location.bucket", where=where
@@ -985,6 +1347,7 @@ def plan_embedded_sql_io(
     :func:`object_store_landing`); ``build`` may be either.
     """
     refuse_unapplied_masking(contract, build)
+    bq_landing = bigquery_landing(contract, build)
     landing = object_store_landing(contract, build)
     bound = _bind_consumes(contract, build, contract_dir, env=env, logger=logger)
     return EmbeddedSqlIO(
@@ -993,10 +1356,12 @@ def plan_embedded_sql_io(
         lineage_only=bound.lineage_only,
         landing=landing,
         workspace_root=bound.workspace_root,
+        bigquery_landing=bq_landing,
     )
 
 
 __all__ = [
+    "BigQueryLanding",
     "ConsumesResolutionError",
     "CoveredInput",
     "EmbeddedSqlIO",
@@ -1007,10 +1372,16 @@ __all__ = [
     "MaskingNotAppliedError",
     "ResolvedInput",
     "UnreadableBindingError",
+    "bigquery_landing",
+    "bigquery_staging_dir",
     "explicit_input_names",
+    "load_bigquery_landing",
     "object_store_landing",
     "plan_embedded_sql_io",
     "refuse_unapplied_masking",
+    "refuse_unlandable_first_expose",
     "relations_read",
+    "remove_staged",
     "resolve_consumes",
+    "stage_bigquery_io",
 ]

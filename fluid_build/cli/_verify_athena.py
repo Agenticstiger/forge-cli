@@ -802,8 +802,15 @@ def _run_total(record: Mapping[str, Any]) -> Optional[int]:
     return total if total >= 0 else None
 
 
+#: ``(record, table location) -> landed there: yes, no, or unknown``.
+WroteInto = Callable[[Optional[Mapping[str, Any]], str], Optional[bool]]
+
+
 def _landed_since_full_load(
-    records: List[Optional[Dict[str, Any]]], table_location: str
+    records: List[Optional[Dict[str, Any]]],
+    table_location: str,
+    *,
+    wrote_into: Optional[WroteInto] = None,
 ) -> Tuple[int, List[str], bool]:
     """Rows the runs since the last full load put in the table, those runs, and
     whether the walk reached that full load.
@@ -818,10 +825,11 @@ def _landed_since_full_load(
     floor, because an append removes no row; it is the whole floor only when the
     walk reached a full load.
     """
+    wrote_into = wrote_into or _wrote_into
     total = 0
     runs: List[str] = []
     for record in records:
-        wrote = _wrote_into(record, table_location)
+        wrote = wrote_into(record, table_location)
         if wrote is False:
             continue
         if record is None or wrote is None:
@@ -838,14 +846,23 @@ def _landed_since_full_load(
 
 
 def _landed_rows(
-    contract: Mapping[str, Any], expose_id: str, workdir: Path, table_location: str
+    contract: Mapping[str, Any],
+    expose_id: str,
+    workdir: Path,
+    table_location: str,
+    *,
+    wrote_into: Optional[WroteInto] = None,
 ) -> Tuple[Optional[int], Dict[str, Any]]:
     """What the landing build's runs put in ``table_location``, when a record says.
 
     Compared only for an acquisition build, and only with a run that recorded
     landing its rows in this table and counting them at the write. Anything
-    else is reported with the reason and never gates.
+    else is reported with the reason and never gates. ``wrote_into`` decides
+    which runs landed in the table: by ``facets.landed.destinations`` here,
+    by ``facets.bigquery_load.table`` for a BigQuery table
+    (``_verify_bigquery``).
     """
+    wrote_into = wrote_into or _wrote_into
     from fluid_build.build_runners._acquisition_common import is_acquisition_build
     from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
 
@@ -885,7 +902,7 @@ def _landed_rows(
     # Runs that landed in another target (a local run from the same directory)
     # never touched this table, so the newest run that may have is the one.
     skipped = 0
-    while skipped < len(records) and _wrote_into(records[skipped], table_location) is False:
+    while skipped < len(records) and wrote_into(records[skipped], table_location) is False:
         skipped += 1
     if skipped == len(records):
         return None, {
@@ -912,7 +929,7 @@ def _landed_rows(
     }
     if skipped:
         info["other_target_runs_skipped"] = skipped
-    if _wrote_into(record, table_location) is None:
+    if wrote_into(record, table_location) is None:
         info["source"] = "none"
         info["note"] = (
             f"run {record.get('run_id')} does not record where it landed its rows, so it "
@@ -936,7 +953,7 @@ def _landed_rows(
         return None, info
     if info["rule"] == RULE_AT_LEAST_CUMULATIVE:
         total, info["runs"], info["reached_full_load"] = _landed_since_full_load(
-            records[skipped:], table_location
+            records[skipped:], table_location, wrote_into=wrote_into
         )
     return total, info
 
@@ -965,32 +982,37 @@ def _row_count_dimension(
     table_id: str,
     *,
     reference_only: bool = False,
+    engine: str = "Athena",
 ) -> Dict[str, Any]:
-    """``status`` is ``pass``, ``fail`` (CRITICAL) or ``info`` (reported, never gated)."""
+    """``status`` is ``pass``, ``fail`` (CRITICAL) or ``info`` (reported, never gated).
+
+    ``engine`` names what counted the rows in the messages (``BigQuery`` for
+    ``_verify_bigquery``, which holds a table to its runs by the same rules).
+    """
     run = _runs_phrase(info)
     rule = info.get("rule")
     if count == 0 and landed is None and reference_only:
         # Bug 6's case with the table present: apply creates the Glue table,
         # and the pipeline that owns the rows may not have run yet.
         message = (
-            f"Athena counted 0 rows in {table_id}; not gated, because the contract is "
+            f"{engine} counted 0 rows in {table_id}; not gated, because the contract is "
             "reference-only and the pipeline that owns the table may not have written it yet"
         )
         status = "info"
     elif count == 0:
-        message = f"Athena counted 0 rows in {table_id}"
+        message = f"{engine} counted 0 rows in {table_id}"
         if landed is not None:
             message += f"; {run} landed {landed:,}"
         status = "fail"
     elif landed is not None and rule == RULE_EQUAL and count != landed:
         message = (
-            f"Athena counted {count:,} rows in {table_id}; {run} landed {landed:,} "
+            f"{engine} counted {count:,} rows in {table_id}; {run} landed {landed:,} "
             "and is a full refresh"
         )
         status = "fail"
     elif landed is not None and rule == RULE_AT_LEAST_CUMULATIVE and count < landed:
         message = (
-            f"Athena counted {count:,} rows in {table_id}; {run} landed {landed:,} "
+            f"{engine} counted {count:,} rows in {table_id}; {run} landed {landed:,} "
             f"{_since_phrase(info)}, and an append removes no row, so the table holds "
             "fewer rows than its runs landed"
         )

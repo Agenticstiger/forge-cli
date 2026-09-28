@@ -33,7 +33,10 @@ which the build refuses and which has no per-value shape to check.
 
 Local files are checked with DuckDB's ``regexp_full_match`` (RE2); S3+Glue
 tables with Athena's ``regexp_like`` anchored with ``\\A(?:...)\\z``, in the
-same query that counts the rows (``_verify_athena._count_rows``). Trino's
+same query that counts the rows (``_verify_athena._count_rows``); BigQuery
+tables with GoogleSQL's ``REGEXP_CONTAINS`` (RE2, which also finds rather than
+matches) under the same anchors, each pattern a query parameter, in the query
+that counts the table (``_verify_bigquery``). Trino's
 ``regexp_like`` finds rather than matches ("the pattern only needs to be
 contained within string"), and in the Java pattern syntax it documents ``$``
 also matches before a final line terminator, so ``^...$`` would pass
@@ -154,11 +157,15 @@ def _plan(
     untreated: Callable[[str, Any], str],
     ok: str,
     bad: str,
+    quote: Callable[[str], str] = _quote,
 ) -> Tuple[List[str], Finish]:
     """``(select expressions, finish)``: two per queryable rule, the column's
     non-null count and ``untreated(quoted column, rule)``, the count of its
     values without the rule's shape. Rules that cannot be queried get their
-    entry without a query."""
+    entry without a query. ``quote`` is the dialect's identifier quoting:
+    double quotes for DuckDB and Athena, backticks for GoogleSQL, where a
+    double-quoted name is a string literal and ``count("msisdn")`` would
+    count every row."""
     rules, problem = declared_rules(expose)
     present = {c.lower(): c for c in columns}
     entries: List[Optional[Dict[str, Any]]] = []
@@ -169,7 +176,7 @@ def _plan(
         entry = _unchecked(rule, actual is not None, where)
         entries.append(entry)
         if entry is None and actual is not None:
-            ident = _quote(actual)
+            ident = quote(actual)
             selects += [f"count({ident})", untreated(ident, rule)]
             queried.append((len(entries) - 1, rule))
 
@@ -246,6 +253,43 @@ def athena_plan(
         ok=ATHENA_OK,
         bad=ATHENA_BAD,
     )
+
+
+# ── BigQuery ────────────────────────────────────────────────────────────
+
+
+def bigquery_plan(
+    expose: Mapping[str, Any], table_columns: Sequence[str]
+) -> Tuple[List[str], List[Tuple[str, str]], Finish]:
+    """``(select expressions, (parameter, pattern) pairs, finish)`` for the count query.
+
+    As :func:`athena_plan`, in GoogleSQL: backtick-quoted columns, and
+    ``REGEXP_CONTAINS`` against a named STRING parameter holding the anchored
+    shape, so no pattern is spliced into the SQL. Column names come from the
+    live table's schema.
+    """
+    from fluid_build.build_runners._bigquery_load import quote_bq_ident
+
+    params: List[Tuple[str, str]] = []
+
+    def untreated(ident: str, rule: Any) -> str:
+        name = f"fluid_mask_shape_{len(params)}"
+        params.append((name, athena_regex(rule.shape)))
+        return (
+            f"COUNTIF({ident} IS NOT NULL AND NOT "
+            f"REGEXP_CONTAINS(CAST({ident} AS STRING), @{name}))"
+        )
+
+    selects, finish = _plan(
+        expose,
+        table_columns,
+        where="the BigQuery table",
+        untreated=untreated,
+        ok=ATHENA_OK,
+        bad=ATHENA_BAD,
+        quote=quote_bq_ident,
+    )
+    return selects, params, finish
 
 
 def severity_problem(masking: Optional[Mapping[str, Any]]) -> Optional[Tuple[str, str]]:
