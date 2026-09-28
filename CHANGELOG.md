@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.5] — 2026-09-28
+
+The policies an AWS contract declares now reach AWS, a chained product reads
+what its `consumes[]` names, and the drift gate reads the apply's own OpenTofu
+state. How it was checked: real `tofu plan` / `apply` / `destroy` runs against
+moto (S3, KMS, STS, Glue), DuckDB builds landing into a moto S3 server, and a
+three-product chain built from a seeded Postgres. Not run against a real AWS
+account in these changes' tests: moto enforces neither key policies nor Lake
+Formation, so Athena reading an SSE-KMS location through Lake Formation
+credentials rests on the AWS documentation.
+
+### Added
+
+- **Retention and encryption at rest reach S3, and `fluid verify` checks them**
+  (#666). `exposes[].lifecycle.expire: true` turns the existing
+  `lifecycle.retention` period into an S3 lifecycle rule scoped to the expose's
+  prefix; without `expire` the period stays a declaration, as before.
+  `binding.encryption.kms` (`product`, `none`, `alias/<name>` or a key ARN)
+  gives SSE-KMS with a bucket key. `product` creates a rotated key and alias
+  per product and bucket; an existing key must be enabled and symmetric, and
+  customer managed when Lake Formation registers the location, or the plan
+  fails before anything is written. Both are written only on a bucket the
+  product owns. A bucket that already carries lifecycle rules or SSE is
+  adopted, not recreated. `fluid verify` reads the live lifecycle rules and
+  the key state and heads the objects, and fails when the rule, the key or an
+  object's encryption differs from the contract. Both fields are in
+  fluid-schema 0.7.6 only, so a contract needs `fluidVersion: "0.7.6"` to use
+  them.
+- **The DuckDB runner lands masked columns treated** (#667).
+  `exposes[].policy.privacy.masking[]` with `hash`, `mask`, `tokenize` or
+  `encrypt` is applied inside the `COPY`, after the quality gates, so the local
+  file, the S3 object, the BigQuery staging file and the DLQ all hold treated
+  values. `hash` is a salted SHA-256 (salt from `params.saltEnv`, default
+  `FLUID_PII_HASH_SECRET`, at least 16 bytes) and equals the same expression in
+  DuckDB and Athena, so joins still work. `k_anonymity` is refused rather than
+  skipped. `fluid verify` fails a masked column that lands in cleartext.
+- **An embedded-SQL build on DuckDB reads what its `consumes[]` names and lands
+  on its AWS binding** (#669). Each entry the SQL reads becomes a view named by
+  its `exposeId`, over the upstream contract's own binding under the same
+  `--env` overlay (found under the nearest `fluid.workspace.yaml`, or a
+  `FLUID_UPSTREAM_CONTRACTS` root). DuckDB's parser decides what the SQL reads;
+  entries it does not read stay lineage only. A result whose binding is an S3
+  bucket and path is written to the object the acquisition runner would write
+  for that binding. `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` now reach
+  DuckDB's S3 secret, so a chain runs against MinIO or moto with AWS bindings.
+- **`fluid diff` reads the apply's OpenTofu state** (#671). It emits the module
+  the apply would emit and runs `tofu plan -detailed-exitcode` against the
+  apply's own state and backend, so a tag or setting changed by hand, or a Glue
+  table deleted by hand, fails `--exit-on-drift` where the SDK comparison saw a
+  match or "absent, to be created". It writes no state and leaves the apply's
+  workdir as it found it. With no reachable state it reports `not_checked` and
+  the SDK comparison is the whole answer, as before. New flags:
+  `--state-backend`, `--workspace-dir`, `--no-state-drift`, `--ensure-opentofu`.
+- **`fluid generate ci --fluid-env-default ENV`** (#664) sets the env a build on
+  the defaults runs in: a job chained by an upstream trigger, a first build and
+  a first build after a restart all ran in `dev` whatever the pipeline was for.
+
+### Changed
+
+- On the DuckDB inline-SQL path, a `consumes[]` entry the SQL reads must
+  resolve from the workspace or be bound by an explicit input of the same
+  name; it used to be ignored with a warning (#669). Contracts that read their
+  upstream by path in the SQL, or bind inputs under other names, keep building.
+  An entry naming the building contract's own id is refused.
+- `fluid plan --env X` records `contract_metadata.env: X` in `plan.json`, under
+  `planDigest`. `fluid apply plan.json` without `--env` uses it, and a
+  contradicting `--env` fails with `plan_env_mismatch` before any build (#669).
+- With `AWS_ENDPOINT_URL[_S3]` set, a DuckDB `CREATE SECRET` that fails now
+  fails the run (`ObjectStoreEndpointError`) instead of sending reads and
+  writes to AWS (#669).
+- The local provider's error text is redacted in the build output, in
+  `runtime/out/local_apply_log.jsonl` and in its retry log lines (#669).
+
+### Fixed
+
+- **The live drift check reads a `{{ env.NAME }}` path where the build wrote
+  it** (#665). #661 fixed `fluid verify`; `fluid diff` still anchored the raw
+  template, called the file absent, and so passed a drifted file.
+- **`fluid contract-tests` runs its comparison** (#670). It imported a function
+  that does not exist and its fallback returned "compatible" for every
+  contract. The fallback `plan`, `apply` and graph commands a broken install
+  registered, which wrote a made-up plan and exited 0, now fail loud. A test
+  holds every internal import to a module and name that exist.
+- **The agent loop and team memory find the workspace root** (#668). `fluid
+  forge --agent-loop` crashed on a missing import before starting, and
+  `.fluid/team-memory.yaml` was never read; team memory in the prompt is now
+  bounded. The Command Center catalog connector and `fluid version`'s GCP
+  check had the same kind of import and are repointed.
+
 ## [0.16.4] — 2026-09-27
 
 A local data path that names its directory through an environment variable now
@@ -3549,7 +3638,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.4...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.5...HEAD
+[0.16.5]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.4...v0.16.5
 [0.16.4]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.1...v0.16.2
