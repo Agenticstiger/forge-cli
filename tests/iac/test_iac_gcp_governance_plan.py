@@ -297,7 +297,7 @@ def test_a_table_replacement_is_still_gated_next_to_a_revocation(tmp_path, fake,
     contract = _with_readers("readers@corp-a.com")
     contract["exposes"][0]["lifecycle"] = {"retention": "P30D", "expire": True}
     _write(contract, tmp_path, fake.endpoint)
-    _summary, (data_changes, revoked) = _data_bearing(tmp_path, tofu_env)
+    _, (data_changes, revoked) = _data_bearing(tmp_path, tofu_env)
     assert len(revoked) == 1
     assert data_changes["remove"] == 1  # the table's replacement
     assert _data_loss_blocked(data_changes, allow_data_loss=False)
