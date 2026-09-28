@@ -38,24 +38,50 @@ def _message(exc: UnsupportedBindingError) -> str:
     return f"{exc} {remedy}".strip()
 
 
+def _lf_grants(binding: Mapping[str, Any]) -> List[Any]:
+    governance = binding.get("governance") if isinstance(binding, Mapping) else None
+    lake = governance.get("lakeFormation") if isinstance(governance, Mapping) else None
+    grants = lake.get("grants") if isinstance(lake, Mapping) else None
+    return list(grants) if isinstance(grants, list) else []
+
+
 def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
-    """``(errors, warnings)`` for the contract's cloud bindings."""
+    """``(errors, warnings)`` for the contract's cloud bindings.
+
+    Each binding is dispatched on its platform first: an ``aws`` binding is checked
+    against what the AWS emitter writes, whatever its format resolves to on GCP
+    (``resolve_gcp_target`` resolves an Iceberg format with a bucket to GCP Iceberg
+    storage on any platform).
+    """
     from .providers import gcp as _gcp
     from .providers import gcp_governance as _gov
 
     errors: List[str] = []
     warnings: List[str] = []
     grants = normalize_access_grants(contract)
-    aws_bindings = 0
+    unenforced: List[str] = []
+    try:
+        _gov.refuse_mixed_dataset_encryption(contract)
+    except UnsupportedBindingError as exc:
+        errors.append(_message(exc))
     for index, exposure in enumerate(contract.get("exposes") or []):
         if not isinstance(exposure, Mapping):
             continue
         binding = exposure.get("binding") or {}
         if not isinstance(binding, Mapping):
             continue
-        target = _gcp.resolve_gcp_target(binding)
         try:
             principal_map(binding)
+            if is_cloud(binding, "aws"):
+                from .providers.aws import lf_column_exclusions
+
+                lf_column_exclusions(exposure, binding, index)
+                if not _lf_grants(binding):
+                    unenforced.append(str(exposure.get("exposeId") or index))
+                continue
+            if not _gov.gcp_owned(binding):
+                continue
+            target = _gcp.resolve_gcp_target(binding)
             if target in (_gcp.BIGQUERY_TABLE, _gcp.BIGQUERY_VIEW):
                 _gov.validate_bigquery_governance(
                     contract, exposure, index, is_view=(target == _gcp.BIGQUERY_VIEW)
@@ -64,18 +90,18 @@ def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
                 _gov.refuse_unsupported_target(exposure, index, target)
                 if target in (_gcp.GCS_BUCKET, _gcp.ICEBERG_STORAGE):
                     gcp_grants(grants, binding, where=f"exposes[{index}] accessPolicy")
-            elif is_cloud(binding, "aws"):
-                from .providers.aws import lf_column_exclusions
-
-                aws_bindings += 1
-                lf_column_exclusions(exposure, binding, index)
         except UnsupportedBindingError as exc:
             errors.append(_message(exc))
-    if aws_bindings and grants:
+    if grants and unenforced:
+        # Only here is the contract's access intent unenforced on AWS: a binding
+        # with Lake Formation grants is how the aws overlay says who reads, and
+        # warning for it too failed `fluid validate --strict` for every contract
+        # that carries accessPolicy for its gcp deployment.
         warnings.append(
-            "accessPolicy.grants are not emitted for aws bindings: on AWS, access is the "
-            "binding's governance.lakeFormation.grants (column restrictions narrow those "
-            "grants). The grants apply on gcp bindings, through binding.principals."
+            f"accessPolicy.grants are not enforced on aws binding(s) {', '.join(unenforced)}: "
+            "the AWS emitter does not write accessPolicy, and these bindings declare no "
+            "governance.lakeFormation.grants, the AWS form of who may read the table. Add "
+            "them to the aws overlay's binding (column restrictions then narrow them)."
         )
     return errors, warnings
 

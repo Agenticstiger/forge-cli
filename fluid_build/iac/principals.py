@@ -31,11 +31,13 @@ Rules, the same on every cloud:
   never emitted as written: a placeholder in an access list is either rejected by
   the cloud or, worse, granted to whoever owns that name.
 * Without it, the principal is used as written (every contract before this field
-  keeps emitting what it emitted), except that on GCP a principal in a reserved
-  top-level domain (``.example``, ``.test``, ``.invalid``, ``.localhost``: RFC 2606
-  section 2 and RFC 6761) is refused as a placeholder (``principal-placeholder``).
-  No real identity can have one, and BigQuery refuses an access entry for an
-  identity that does not exist.
+  keeps emitting what it emitted, when that was a real identity), except that on
+  GCP a placeholder is refused (``principal-placeholder``): a principal in a
+  reserved top-level domain (``.example``, ``.test``, ``.invalid``, ``.localhost``:
+  RFC 2606 section 2 and RFC 6761), which no real identity can have, and one that
+  is not an IAM member at all (no domain, as ``group:data-platform`` or a bare
+  ``analysts``, or a prefix IAM does not know, as ``role:analyst``). BigQuery and
+  Cloud Storage refuse an access entry for either, so it was never a working grant.
 * Every mapped identity is checked for the platform's shape: an IAM member
   (``user:``, ``group:``, ``serviceAccount:``, ``domain:``) on GCP, an IAM ARN on
   AWS (``principal-invalid``). On AWS an unmapped principal must already be an ARN,
@@ -168,9 +170,29 @@ def _shape(identity: str) -> str:
 def _gcp_identity(identity: str, *, raw: str, where: str, mapped: bool = True) -> str:
     member = logical_key(identity)
     shape = _shape(member)
-    if mapped and not (
+    iam_shaped = bool(
         _GCP_EMAIL_MEMBER_RE.fullmatch(shape) or _GCP_DOMAIN_MEMBER_RE.fullmatch(shape)
-    ):
+    )
+    if not mapped and not iam_shaped:
+        # Unmapped and not an IAM member (no domain, or a prefix IAM does not
+        # know, such as ``role:``): it can only be a logical name, and BigQuery
+        # and Cloud Storage refuse it at apply. Refused here instead, like a
+        # reserved-TLD placeholder.
+        raise UnsupportedBindingError(
+            "principal-placeholder",
+            f"{where}: principal {raw!r} is not a GCP IAM member (user:, group: or "
+            "serviceAccount: with an email address, or domain:), and this binding's "
+            "binding.principals does not map it, so it can only be a logical name. "
+            f"Emitted as written it would be {member!r}, which the cloud refuses.",
+            (
+                "Map the logical principal in this environment's binding.principals to the "
+                "real group or service account it stands for, e.g. "
+                f"principals: {{'{raw}': 'group:data-platform@yourcompany.com'}}.",
+                "Or write it in accessPolicy as the IAM member itself, e.g. "
+                "group:data-platform@yourcompany.com.",
+            ),
+        )
+    if not iam_shaped:
         raise UnsupportedBindingError(
             "principal-invalid",
             f"{where}: principal {raw!r} resolves to {identity!r}, which is not a GCP IAM "
@@ -249,8 +271,8 @@ def resolve_principal(
             )
     elif platform == GCP:
         # Unmapped: the principal as written, exactly as every contract before
-        # ``binding.principals`` emitted it (no shape check, so a legacy bare
-        # group name still emits); only a placeholder is refused.
+        # ``binding.principals`` emitted it; a placeholder (a reserved TLD, or no
+        # IAM member shape at all) is refused.
         split = _split_principal(key)
         identities = (f"{split[1]}:{split[0]}",) if split else (key,)
     else:

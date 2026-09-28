@@ -55,6 +55,7 @@ from fluid_build.iac import (
     provider_config,
     render_tofu_json,
 )
+from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.packaging import (
     CONTAINER_KINDS,
     LEGACY,
@@ -184,6 +185,16 @@ class TestGenerateIacByteIdentity:
             _, expected = _expected_module_bytes(path)
         except CLIError as exc:
             pytest.skip(f"not a single-cloud contract ({exc.event})")
+        except UnsupportedBindingError as refused:
+            # The emitter refuses this contract (part-b's reader is still the
+            # unfilled ``<<YOUR_PROJECT_HERE>>`` placeholder): the wired path must
+            # refuse it the same way and write nothing.
+            with pytest.raises(CLIError) as wired:
+                _run_generate_iac(path, tmp_path)
+            assert wired.value.event == "unsupported_binding"
+            assert wired.value.context["kind"] == refused.kind
+            assert not (tmp_path / "main.tf.json").exists()
+            return
         actual = _run_generate_iac(path, tmp_path)
         assert actual == expected, (
             f"{path.relative_to(REPO_ROOT)}: `fluid generate iac` output changed "

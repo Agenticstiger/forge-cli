@@ -813,3 +813,435 @@ exposes:
         )
         result = self._validate(tmp_path, extra)
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+# ── One base contract, two overlays: fluid validate --strict on each cloud ──
+
+
+class TestOneContractValidatesStrictOnBothClouds:
+    """The demo's shape: accessPolicy in the base for GCP, Lake Formation on AWS.
+
+    ``fluid validate --strict`` is stage 2 of every generated Jenkinsfile
+    (``VALIDATE_STRICT:-true``) and fails on any warning. A warning that
+    ``accessPolicy`` is not emitted on aws, given for every aws binding, failed the
+    demo's three AWS pipelines while the aws overlay's Lake Formation grants were
+    the AWS form of the same access.
+    """
+
+    _BASE = """\
+fluidVersion: "0.7.6"
+kind: DataProduct
+id: bronze.customer_subscriptions
+name: Customer Subscriptions
+metadata:
+  owner:
+    team: data-platform
+accessPolicy:
+  grants:
+    - principal: group:data-platform@northwind.example
+      permissions: [read, select, query]
+    - principal: serviceAccount:fluid-pipeline@northwind.example
+      permissions: [read, write, insert]
+exposes:
+  - exposeId: subscriptions
+    kind: table
+    binding:
+      platform: local
+      format: parquet
+      location:
+        path: data/customer_subscriptions.parquet
+    contract:
+      schema:
+        - name: subscription_id
+          type: VARCHAR
+          required: true
+        - name: msisdn
+          type: VARCHAR
+"""
+
+    _AWS = """\
+exposes:
+  - binding:
+      platform: aws
+      format: parquet
+      location:
+        database: demo_bronze
+        table: customer_subscriptions
+        bucket: northwind-demo-lake
+        path: bronze/customer_subscriptions/
+        region: eu-north-1
+{governance}
+"""
+
+    _LF = """\
+      governance:
+        lakeFormation:
+          registerLocation: true
+          grants:
+            - principal: arn:aws:iam::111111111111:role/fluid-demo-lab-steward
+              permissions: [SELECT, DESCRIBE]
+            - principal: arn:aws:iam::111111111111:role/fluid-demo-lab-analyst
+              permissions: [SELECT, DESCRIBE]
+              excludedColumns: [msisdn]"""
+
+    _GCP = """\
+exposes:
+  - binding:
+      platform: gcp
+      format: bigquery_table
+      location:
+        project: northwind-demo
+        dataset: demo_bronze
+        table: customer_subscriptions
+        region: europe-west1
+      principals:
+        group:data-platform@northwind.example: group:data-platform@northwind.com
+        serviceAccount:fluid-pipeline@northwind.example: serviceAccount:fluid-pipeline@northwind-demo.iam.gserviceaccount.com
+"""
+
+    def _validate(self, tmp_path, env: str, governance: str = _LF):
+        import sys
+
+        (tmp_path / "overlays").mkdir()
+        (tmp_path / "contract.fluid.yaml").write_text(self._BASE, encoding="utf-8")
+        (tmp_path / "overlays" / "aws.yaml").write_text(
+            self._AWS.format(governance=governance), encoding="utf-8"
+        )
+        (tmp_path / "overlays" / "gcp.yaml").write_text(self._GCP, encoding="utf-8")
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "fluid_build.cli",
+                "validate",
+                str(tmp_path / "contract.fluid.yaml"),
+                "--env",
+                env,
+                "--strict",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+        )
+
+    @pytest.mark.parametrize("env", ["aws", "gcp"])
+    def test_the_base_contract_passes_strict_on_each_cloud(self, tmp_path, env):
+        result = self._validate(tmp_path, env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "not enforced" not in result.stdout
+
+    def test_an_aws_binding_with_no_lake_formation_grant_is_warned(self, tmp_path):
+        """The one case where the contract's access intent is unenforced on AWS."""
+        result = self._validate(tmp_path, "aws", governance="")
+        out = " ".join(result.stdout.split())
+        assert result.returncode != 0
+        assert "not enforced on aws binding(s) subscriptions" in out
+
+
+# ── Column restrictions: the expose's own readers ────────────────────────
+
+
+def _restricted(
+    *, readers: Optional[List[str]] = None, grants: Optional[List[Dict[str, Any]]] = None, **kw
+) -> Dict[str, Any]:
+    contract = _contract(
+        restrictions=[
+            {"principal": "group:interns@company.com", "columns": ["msisdn"], "access": "deny"}
+        ],
+        **kw,
+    )
+    contract["accessPolicy"]["grants"] = grants or []
+    if readers is not None:
+        contract["exposes"][0]["policy"]["authz"]["readers"] = readers
+    return contract
+
+
+def _tag_readers(res: Dict[str, Any]) -> set:
+    return {
+        m["member"] for m in (res.get("google_data_catalog_policy_tag_iam_member") or {}).values()
+    }
+
+
+class TestRestrictionReaders:
+    def test_a_deny_for_one_group_leaves_the_exposes_other_readers_reading(self):
+        """``policy.authz.readers`` are readers too; a deny for interns was a tag with none."""
+        res = _resources(
+            _restricted(readers=["group:analytics@company.com", "group:finance@company.com"])
+        )
+        assert _tag_readers(res) == {"group:analytics@company.com", "group:finance@company.com"}
+
+    def test_authz_readers_and_access_policy_readers_are_both_readers(self):
+        res = _resources(
+            _restricted(
+                readers=["group:analytics@company.com"],
+                grants=[{"principal": "group:bi@company.com", "permissions": ["read"]}],
+            )
+        )
+        assert _tag_readers(res) == {"group:analytics@company.com", "group:bi@company.com"}
+
+    def test_authz_readers_are_mapped_through_binding_principals(self):
+        res = _resources(
+            _restricted(
+                readers=[ANALYSTS],
+                principals={
+                    ANALYSTS: "group:analysts@northwind.com",
+                    "group:interns@company.com": [],
+                },
+            )
+        )
+        assert _tag_readers(res) == {"group:analysts@northwind.com"}
+
+    def test_a_restriction_with_no_reader_at_all_is_refused_not_a_locked_column(self):
+        error = _refusal(_restricted())
+        assert error.kind == "column-restriction-no-readers"
+        errors, _ = validate_governance(_restricted())
+        assert any("unreadable by everyone" in e for e in errors)
+
+    @pytest.mark.parametrize(
+        "example, readers",
+        [
+            (
+                "examples/policy-examples/customer-profiles-contract.yaml",
+                {"group:data-analysts@company.com", "group:data-scientists@company.com"},
+            ),
+            (
+                "examples/bitcoin-price-api-declarative-part-c/contract.fluid.yaml",
+                {"group:data-analysts@company.com", "group:data-engineers@company.com"},
+            ),
+        ],
+    )
+    def test_the_shipped_examples_keep_their_readers(self, example, readers):
+        import pathlib
+
+        import yaml
+
+        path = pathlib.Path(__file__).resolve().parents[2] / example
+        res = _resources(yaml.safe_load(path.read_text(encoding="utf-8")))
+        assert res["google_data_catalog_policy_tag"]
+        assert _tag_readers(res) == readers
+
+    def test_an_example_reader_left_as_a_placeholder_is_refused(self):
+        """part-b's looker reader is ``serviceAccount:looker@<<YOUR_PROJECT_HERE>>...``."""
+        import pathlib
+
+        import yaml
+
+        path = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "examples/bitcoin-price-api-declarative-part-b/contract.fluid.yaml"
+        )
+        error = _refusal(yaml.safe_load(path.read_text(encoding="utf-8")))
+        assert error.kind == "principal-placeholder"
+        assert "<<YOUR_PROJECT_HERE>>" in str(error)
+
+
+# ── IAM resource names: one per member, whatever it folds to ─────────────
+
+
+def test_principals_that_fold_to_one_name_keep_one_grant_each():
+    """``safe_ident`` gave data.eng@, data-eng@ and data_eng@ one resource name."""
+    groups = [f"group:data{sep}eng@corp.com" for sep in (".", "-", "_")]
+    contract = _contract(
+        restrictions=[
+            {"principal": "group:blocked@corp.com", "columns": ["msisdn"], "access": "deny"}
+        ]
+    )
+    contract["accessPolicy"]["grants"] = [
+        {"principal": g, "permissions": ["read"]} for g in groups + ["group:blocked@corp.com"]
+    ]
+    res = _resources(contract)
+    dataset_members = [m["member"] for m in res["google_bigquery_dataset_iam_member"].values()]
+    assert sorted(dataset_members) == sorted(groups + ["group:blocked@corp.com"])
+    assert _tag_readers(res) == set(groups)
+    assert len(res["google_data_catalog_policy_tag_iam_member"]) == 3
+
+
+# ── Platform first: an AWS Iceberg binding is the AWS emitter's ──────────
+
+
+def _aws_iceberg(**expose: Any) -> Dict[str, Any]:
+    return {
+        "fluidVersion": "0.7.6",
+        "id": "sales.lakehouse",
+        "accessPolicy": {"grants": [{"principal": PLATFORM, "permissions": ["read"]}]},
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "binding": {
+                    "platform": "aws",
+                    "format": "iceberg",
+                    "location": {
+                        "bucket": "acme-sales-lakehouse",
+                        "database": "sales",
+                        "table": "orders",
+                        "path": "iceberg/sales/orders/",
+                        "region": "eu-west-1",
+                    },
+                    "encryption": {"kms": "product"},
+                    **expose.pop("binding", {}),
+                },
+                "lifecycle": {"retention": "P30D", "expire": True},
+                "contract": {"schema": [{"name": "id", "type": "string"}]},
+                **expose,
+            }
+        ],
+    }
+
+
+class TestAwsIcebergIsValidatedAsAws:
+    def test_retention_encryption_and_a_logical_principal_are_not_refused_as_gcp(self):
+        errors, warnings = validate_governance(_aws_iceberg())
+        assert errors == []
+        assert any("not enforced on aws binding(s) orders" in w for w in warnings)
+
+    def test_a_column_restriction_goes_through_the_lake_formation_check(self):
+        contract = _aws_iceberg(
+            policy={
+                "authz": {
+                    "columnRestrictions": [
+                        {"principal": "arn:aws:iam::1:role/x", "columns": ["id"], "access": "deny"}
+                    ]
+                }
+            }
+        )
+        errors, _ = validate_governance(contract)
+        assert any("declares no governance.lakeFormation.grants" in e for e in errors)
+        assert not any("GCP" in e for e in errors)
+
+
+# ── Unmapped principals that are not IAM members ─────────────────────────
+
+
+@pytest.mark.parametrize(
+    "principal",
+    ["group:data-platform", "analysts", "role:analyst"],
+    ids=["no-domain", "bare", "role"],
+)
+def test_an_unmapped_principal_that_is_not_an_iam_member_is_refused(principal):
+    contract = _contract()
+    contract["accessPolicy"]["grants"] = [{"principal": principal, "permissions": ["read"]}]
+    assert _refusal(contract).kind == "principal-placeholder"
+    errors, _ = validate_governance(contract)
+    assert any("is not a GCP IAM member" in e for e in errors)
+
+
+# ── One dataset, one key ─────────────────────────────────────────────────
+
+
+def _two_in_one_dataset(
+    first: Optional[Dict[str, Any]], second: Optional[Dict[str, Any]], *, view: bool = False
+):
+    contract = _contract(principals=MAPPING)
+    one = contract["exposes"][0]
+    other = copy.deepcopy(one)
+    other["exposeId"] = "summary"
+    other["binding"]["location"]["table"] = "summary"
+    if view:
+        other["binding"]["format"] = "bigquery_view"
+        other["binding"]["location"]["query"] = "SELECT 1"
+    for exposure, block in ((one, first), (other, second)):
+        exposure["binding"].pop("encryption", None)
+        if block is not None:
+            exposure["binding"]["encryption"] = block
+    contract["exposes"] = [other, one] if view else [one, other]
+    return contract
+
+
+class TestOneDatasetOneKey:
+    @pytest.mark.parametrize("order", ["keyed-first", "unkeyed-first"])
+    def test_a_keyed_and_an_unkeyed_table_in_one_dataset_are_refused(self, order):
+        pair = ({"kms": "product"}, None) if order == "keyed-first" else (None, {"kms": "product"})
+        contract = _two_in_one_dataset(*pair)
+        assert _refusal(contract).kind == "encryption-kms-mixed-dataset"
+        errors, _ = validate_governance(contract)
+        assert any("different encryption" in e for e in errors)
+
+    def test_tables_with_the_same_key_share_the_dataset_default(self):
+        res = _resources(_two_in_one_dataset({"kms": "product"}, {"kms": "product"}))
+        dataset = res["google_bigquery_dataset"][f"{CID}_demo_gold"]
+        assert "default_encryption_configuration" in dataset
+        keys = {
+            json.dumps(t.get("encryption_configuration"))
+            for t in res["google_bigquery_table"].values()
+        }
+        assert len(keys) == 1 and "null" not in keys
+
+    def test_an_unkeyed_view_emitted_first_does_not_drop_the_datasets_key(self):
+        """The dataset body used to be the first expose's, so its default key depended on order."""
+        res = _resources(_two_in_one_dataset({"kms": "product"}, None, view=True))
+        dataset = res["google_bigquery_dataset"][f"{CID}_demo_gold"]
+        assert dataset["default_encryption_configuration"] == {
+            "kms_key_name": f"${{google_kms_crypto_key.{CID}_demo_gold_kms.id}}"
+        }
+        assert dataset["depends_on"] == [f"google_kms_crypto_key_iam_member.{CID}_demo_gold_kms"]
+
+
+# ── Retention on a partition column is event-time age ────────────────────
+
+
+def test_retention_on_a_partition_column_is_said_to_count_from_its_date(caplog):
+    """BigQuery expires a partition relative to its date, not to when rows landed."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="fluid_build.iac.providers.gcp_governance"):
+        _resources(
+            _contract(
+                principals=MAPPING,
+                lifecycle={"retention": "P30D", "expire": True},
+                partition_by=["created_at"],
+            )
+        )
+    assert any("bigquery_retention_event_time" in r.getMessage() for r in caplog.records)
+    import pathlib
+
+    schema = json.loads(
+        (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "fluid_build/schemas/fluid-schema-0.7.6.json"
+        ).read_text(encoding="utf-8")
+    )
+    text = " ".join(
+        [
+            schema["$defs"]["bindingLocation"]["properties"]["partitionBy"]["description"],
+            schema["$defs"]["exposeLifecycle"]["properties"]["expire"]["description"],
+        ]
+    )
+    assert "backfill" in text and "date in that column" in text
+
+
+# ── A restriction's tags and labels reach the policy tag ─────────────────
+
+
+def test_restriction_tags_and_labels_are_written_on_the_policy_tag():
+    contract = _contract(
+        principals=MAPPING,
+        restrictions=[
+            {
+                "principal": ANALYSTS,
+                "columns": ["msisdn"],
+                "access": "deny",
+                "tags": ["sensitive-financial-data"],
+                "labels": {"reason": "pii"},
+            }
+        ],
+    )
+    (tag,) = _resources(contract)["google_data_catalog_policy_tag"].values()
+    assert "Tags: sensitive-financial-data." in tag["description"]
+    assert "Labels: reason=pii." in tag["description"]
+
+
+def test_a_restriction_label_cannot_become_an_interpolation():
+    contract = _contract(
+        principals=MAPPING,
+        restrictions=[
+            {
+                "principal": ANALYSTS,
+                "columns": ["msisdn"],
+                "access": "deny",
+                "labels": {"reason": '${file("/etc/passwd")}'},
+            }
+        ],
+    )
+    rendered = build_module(get_iac_plugin("gcp"), contract)
+    assert '$${file(\\"/etc/passwd\\")}' in rendered
+    assert '"${file' not in rendered and " ${file" not in rendered

@@ -40,6 +40,7 @@ decides per container kind whether this contract owns the container:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -378,6 +379,9 @@ class GcpIacPlugin:
         # back-compat — see `iac/access.py` for why that split exists.
         contract_grants = normalize_access_grants(contract)
         packaging = resolve_packaging(contract)
+        # One key per dataset: an unkeyed table in a keyed dataset would be
+        # replaced on every apply (``gcp_governance.refuse_mixed_dataset_encryption``).
+        _gov.refuse_mixed_dataset_encryption(contract)
 
         for index, exposure in enumerate(contract.get("exposes") or []):
             binding = exposure.get("binding") or {}
@@ -415,6 +419,9 @@ class GcpIacPlugin:
                 )
                 continue
             if target is not None:
+                # Whatever the binding's platform: this emitter is about to write
+                # the resource, so a policy it would drop is refused here.
+                # (``fluid validate`` dispatches an aws binding to the AWS checks.)
                 _gov.refuse_unsupported_target(exposure, index, target)
             if target == GCS_BUCKET:
                 # An expose that NAMES the bucket as its port (``format:
@@ -647,6 +654,146 @@ class GcpIacPlugin:
         provider self-configures from the environment."""
         return {}
 
+    def reconcile_state(
+        self, module: Dict[str, Any], state: Sequence[Mapping[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Patch ``module`` for datasets an older forge-cli applied; see
+        :func:`reconcile_legacy_dataset_access`."""
+        return reconcile_legacy_dataset_access(module, state)
+
+
+#: BigQuery's basic dataset roles by the legacy name its access list reports.
+_LEGACY_DATASET_ROLES = {
+    "roles/bigquery.dataOwner": "OWNER",
+    "roles/bigquery.dataEditor": "WRITER",
+    "roles/bigquery.dataViewer": "READER",
+}
+
+#: IAM member prefix → the ``access`` entry field BigQuery files it under.
+_ACCESS_FIELDS = {
+    "user": "user_by_email",
+    "serviceAccount": "user_by_email",
+    "group": "group_by_email",
+    "domain": "domain",
+}
+
+#: ``access`` entry fields that name something other than one principal.
+_NON_PRINCIPAL_ACCESS_FIELDS = ("special_group", "iam_member", "view", "dataset", "routine")
+
+
+def _access_principal(entry: Mapping[str, Any]) -> Optional[Tuple[str, str, str]]:
+    """``(role, field, identity)`` for an entry the old emitter could have written."""
+    if any(entry.get(field) for field in _NON_PRINCIPAL_ACCESS_FIELDS):
+        return None
+    named = [(f, entry.get(f)) for f in ("user_by_email", "group_by_email", "domain")]
+    named = [(f, v) for f, v in named if v]
+    if len(named) != 1 or not entry.get("role"):
+        return None
+    role = str(entry["role"])
+    field, identity = named[0]
+    return _LEGACY_DATASET_ROLES.get(role, role), field, str(identity).lower()
+
+
+def _module_access_entry(entry: Mapping[str, Any]) -> Dict[str, Any]:
+    """A state ``access`` entry as module JSON: its non-empty fields and blocks.
+
+    Read from state, so every string is escaped as the renderer escapes contract
+    text: nothing read back from the cloud can become an interpolation.
+    """
+
+    def escaped(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {k: escaped(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [escaped(v) for v in value]
+        return _literal(value)
+
+    return {k: escaped(v) for k, v in entry.items() if v not in (None, "", [], {})}
+
+
+def reconcile_legacy_dataset_access(
+    module: Dict[str, Any], state: Sequence[Mapping[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Revoke, once, the grants a dataset's old authoritative access list held.
+
+    forge-cli 0.16.5 and earlier wrote a dataset's grants as its ``access`` list, which is
+    authoritative: the provider replaced the dataset's whole ACL with it. Grants are
+    ``google_bigquery_dataset_iam_member`` resources now, and the module no longer
+    sets ``access``, which the provider keeps as Computed: an entry the old list held
+    and no member resource covers (a principal removed in the same change, or a
+    logical principal ``binding.principals`` now maps to another identity) would stay
+    on the dataset, unmanaged, and no later plan would show it (measured with
+    provider 6.50.0; terraform-provider-google issue 8165: removing every ``access``
+    block plans nothing).
+
+    For a dataset in ``state`` with a non-empty ``access`` and no member resource yet
+    (the module the old emitter applied), this sets the module's ``access`` for this
+    one apply to the state's entries less those stale ones, so the provider revokes
+    them; the member resources, which depend on the dataset, are created after it.
+    The next run finds the member resources in state and leaves ``access`` unset
+    again. Only entries of the old emitter's shape (a role and one user, group or
+    domain) can be stale; special groups, views and routines are kept as they are.
+    For that one apply the list is authoritative, as it was on every apply before:
+    it is what state recorded at the last apply, so an entry added by hand since
+    then is removed, as the old module removed it.
+
+    Returns one record per dataset patched, with the entries revoked. A dataset whose
+    every entry is stale cannot be reconciled this way (an empty ``access`` plans
+    nothing), and is returned with ``"blocked": True`` for the caller to refuse.
+    """
+    resources = module.get("resource") or {}
+    datasets = resources.get("google_bigquery_dataset") or {}
+    members = resources.get("google_bigquery_dataset_iam_member") or {}
+    in_state = {
+        str(r.get("name")): r
+        for r in state
+        if r.get("type") == "google_bigquery_dataset" and r.get("mode", "managed") == "managed"
+    }
+    # A dataset any member resource already names has been applied by this emitter.
+    migrated = {
+        (r.get("values") or {}).get("dataset_id")
+        for r in state
+        if r.get("type") == "google_bigquery_dataset_iam_member"
+    }
+    reports: List[Dict[str, Any]] = []
+    for name, body in datasets.items():
+        if not isinstance(body, dict) or "access" in body or name not in in_state:
+            continue
+        values = in_state[name].get("values") or {}
+        access = [e for e in values.get("access") or [] if isinstance(e, Mapping)]
+        dataset_id = values.get("dataset_id")
+        if not access or dataset_id in migrated:
+            continue
+        ref = tofu_ref(f"google_bigquery_dataset.{name}.dataset_id")
+        desired: set[Tuple[str, str, str]] = set()
+        for member in members.values():
+            if not isinstance(member, Mapping) or member.get("dataset_id") != ref:
+                continue
+            head, _, identity = str(member.get("member") or "").partition(":")
+            field = _ACCESS_FIELDS.get(head)
+            role = _LEGACY_DATASET_ROLES.get(str(member.get("role")), str(member.get("role")))
+            if field:
+                desired.add((role, field, identity.lower()))
+        stale = []
+        for entry in access:
+            principal = _access_principal(entry)
+            if principal is not None and principal not in desired:
+                stale.append(entry)
+        if not stale:
+            continue
+        kept = [_module_access_entry(e) for e in access if e not in stale]
+        prefix = {"user_by_email": "user", "group_by_email": "group", "domain": "domain"}
+        revoked = [
+            f"{p[0]} {prefix[p[1]]}:{p[2]}"
+            for p in (_access_principal(e) for e in stale)
+            if p is not None
+        ]
+        report = {"dataset": dataset_id or name, "revoked": revoked, "blocked": not kept}
+        if kept:
+            body["access"] = kept
+        reports.append(report)
+    return reports
+
 
 @dataclass(frozen=True)
 class _BqGovernance:
@@ -824,15 +971,14 @@ def _emit_policy_tags(
         resources.setdefault("google_data_catalog_policy_tag", {})[group.key] = {
             "taxonomy": tofu_ref(f"google_data_catalog_taxonomy.{taxonomy}.id"),
             "display_name": group.display_name,
-            "description": (
-                f"Restricted columns {', '.join(group.columns)} of {table}: readable only "
-                "by the principals granted the fine-grained reader role on this tag."
-            ),
+            # The restrictions' own tags and labels ride here: a policy tag has no
+            # labels of its own, and they must not be dropped.
+            "description": f"{table}: {group.description}",
         }
         name = tofu_ref(f"google_data_catalog_policy_tag.{group.key}.name")
         for member in group.readers:
             resources.setdefault("google_data_catalog_policy_tag_iam_member", {})[
-                safe_ident(f"{group.key}_{member}")
+                _iam_key(group.key, member, role=_gov.FINE_GRAINED_READER_ROLE)
             ] = {
                 "policy_tag": name,
                 "role": _gov.FINE_GRAINED_READER_ROLE,
@@ -841,6 +987,20 @@ def _emit_policy_tags(
         for column in group.columns:
             refs[column] = name
     return refs
+
+
+def _iam_key(stem: str, member: str, *, role: str) -> str:
+    """A resource name for one role and member that no other member can share.
+
+    ``safe_ident`` folds every character it cannot keep into ``_``, so
+    ``group:data.eng@x``, ``group:data-eng@x`` and ``group:data_eng@x`` shared one
+    name and the last written silently replaced the other two grants. The readable
+    stem is kept and a hash of the exact role and member made unique, the pattern
+    Terraform modules use for ``for_each`` keys over IAM lists (an md5 of
+    member/resource/role; sha256 here).
+    """
+    digest = hashlib.sha256(f"{role}\n{member}".encode("utf-8")).hexdigest()[:10]
+    return f"{safe_ident(f'{stem}_{member}')}_{digest}"
 
 
 def _emit_dataset_iam(
@@ -867,7 +1027,7 @@ def _emit_dataset_iam(
         if loc.get("project"):
             body["project"] = loc["project"]
         resources.setdefault("google_bigquery_dataset_iam_member", {})[
-            safe_ident(f"{cid}_{dataset}_{role}_{member}")
+            _iam_key(f"{cid}_{dataset}_{role}", member, role=role)
         ] = body
 
 
@@ -910,7 +1070,15 @@ def _emit_bigquery(
         if kms_key is not None:
             dataset_body["default_encryption_configuration"] = {"kms_key_name": kms_key}
             dataset_body["depends_on"] = list(kms_deps)
-        resources.setdefault("google_bigquery_dataset", {}).setdefault(ds_name, dataset_body)
+        existing = resources.setdefault("google_bigquery_dataset", {}).setdefault(
+            ds_name, dataset_body
+        )
+        if existing is not dataset_body and kms_key is not None:
+            # A dataset another expose created first (an unkeyed view, say) still
+            # takes the key: the default key must not depend on expose order.
+            # ``refuse_mixed_dataset_encryption`` has made every key here agree.
+            existing.setdefault("default_encryption_configuration", {"kms_key_name": kms_key})
+            existing.setdefault("depends_on", list(kms_deps))
         ds_ref = tofu_ref(f"google_bigquery_dataset.{ds_name}.dataset_id")
         _emit_dataset_iam(resources, grants, ds_ref, cid, dataset, loc)
 

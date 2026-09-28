@@ -46,6 +46,74 @@ class TestDataLossGate:
     def test_additive_plan_never_blocked(self):
         assert engine._data_loss_blocked({"add": 5, "change": 1, "remove": 0}, False) is False
 
+    def test_a_revoked_grant_or_policy_tag_is_not_counted(self):
+        removals = [
+            ("google_bigquery_dataset_iam_member.a", "google_bigquery_dataset_iam_member"),
+            ("google_data_catalog_policy_tag.t", "google_data_catalog_policy_tag"),
+            ("aws_lakeformation_permissions.p", "aws_lakeformation_permissions"),
+        ]
+        counted, revoked = engine._data_bearing_changes(
+            {"add": 0, "change": 0, "remove": 3}, removals
+        )
+        assert counted["remove"] == 0 and len(revoked) == 3
+        assert engine._data_loss_blocked(counted, False) is False
+
+    def test_a_table_or_a_key_grant_is_still_counted(self):
+        removals = [
+            ("google_bigquery_table.t", "google_bigquery_table"),
+            ("google_kms_crypto_key_iam_member.k", "google_kms_crypto_key_iam_member"),
+        ]
+        counted, revoked = engine._data_bearing_changes(
+            {"add": 1, "change": 0, "remove": 2}, removals
+        )
+        assert counted["remove"] == 2 and revoked == []
+
+
+class TestReconcileWithState:
+    """The engine's side of the GCP plugin's one-time access-list reconciliation."""
+
+    class _Plugin:
+        def __init__(self, reports):
+            self.reports = reports
+
+        def reconcile_state(self, module, state):
+            module["patched"] = True
+            return self.reports
+
+    def test_a_patched_module_is_written_back(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: [{"x": 1}])
+        path = tmp_path / "main.tf.json"
+        path.write_text("{}", encoding="utf-8")
+        reports = [{"dataset": "sales", "revoked": ["READER group:gone@x.com"], "blocked": False}]
+        got = engine._reconcile_with_state(
+            self._Plugin(reports), path, str(tmp_path), {}, logging.getLogger("test")
+        )
+        assert got == reports
+        assert json.loads(path.read_text(encoding="utf-8")) == {"patched": True}
+
+    def test_a_list_that_cannot_be_narrowed_refuses_the_apply(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: [{"x": 1}])
+        path = tmp_path / "main.tf.json"
+        path.write_text("{}", encoding="utf-8")
+        reports = [{"dataset": "sales", "revoked": ["READER group:gone@x.com"], "blocked": True}]
+        with pytest.raises(CLIError) as refused:
+            engine._reconcile_with_state(
+                self._Plugin(reports), path, str(tmp_path), {}, logging.getLogger("test")
+            )
+        assert refused.value.event == "opentofu_dataset_access_unreconciled"
+        assert "group:gone@x.com" in refused.value.context["error"]
+        assert path.read_text(encoding="utf-8") == "{}"
+
+    def test_no_state_is_a_no_op(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: [])
+        path = tmp_path / "main.tf.json"
+        path.write_text("{}", encoding="utf-8")
+        plugin = self._Plugin([{"dataset": "d", "revoked": [], "blocked": True}])
+        assert (
+            engine._reconcile_with_state(plugin, path, str(tmp_path), {}, logging.getLogger("t"))
+            == []
+        )
+
 
 class TestLoadContract:
     def test_loads_yaml_contract(self):
@@ -192,6 +260,8 @@ class TestPerContractState:
         # subprocess shells so this test keeps focusing on the workdir
         # layout invariant it owns.
         monkeypatch.setattr(engine.runner, "tofu_state_list", lambda *a, **k: [])
+        # The GCP plugin's one-time access-list reconciliation reads the state too.
+        monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: [])
         monkeypatch.setattr(
             engine.runner,
             "tofu_import",

@@ -137,6 +137,10 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     # and moving a contract's resources to it would not show as a destroy.
     _guard_region_move(plugin, contract, str(workdir), env)
 
+    # A dataset an older forge-cli applied with an authoritative access list has
+    # its stale grants revoked once, before its grants become member resources.
+    _reconcile_with_state(plugin, module_path, str(workdir), env, logger)
+
     # Pre-plan ownership-transition guard (RFC-packaging-modes.md file 10).
     # Runs BEFORE _adopt_existing — brownfield adoption is precisely the
     # mechanism that would re-own a shared pool — and before `tofu plan`,
@@ -153,6 +157,14 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
         raise CLIError(1, "opentofu_plan_failed", {"error": _tail(plan.stderr or plan.stdout)})
     changes = runner.change_summary(plan)
     cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
+    # Revoking a grant destroys a member resource and loses no data: only the
+    # removals of data-bearing resources reach the data-loss gate.
+    data_changes, revoked = _data_bearing_changes(changes, runner.planned_removals(plan))
+    if revoked:
+        cprint(
+            f"  {len(revoked)} access grant(s) or policy tag(s) removed (access revoked, no "
+            "data lost; not gated): " + ", ".join(revoked)
+        )
 
     # Report what the plan's ``lifecycle.ignore_changes`` deliberately hides.
     # Without this, a contract whose column types no longer match the live
@@ -164,22 +176,22 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     # Data-loss gate — `tofu` has no CTAS/CLONE data snapshot (see
     # AUTOGEN_SPIKE.md, risk R1), so a destructive plan fails closed.
     allow_data_loss = bool(getattr(args, "allow_data_loss", False))
-    if _data_loss_blocked(changes, allow_data_loss):
+    if _data_loss_blocked(data_changes, allow_data_loss):
         raise CLIError(
             1,
             "opentofu_data_loss_gate",
             {
-                "error": f"plan destroys {changes['remove']} resource(s); `tofu` does not "
+                "error": f"plan destroys {data_changes['remove']} resource(s); `tofu` does not "
                 "snapshot data — re-run with --allow-data-loss to proceed"
             },
         )
-    if allow_data_loss and int(changes.get("remove", 0)) > 0:
+    if allow_data_loss and int(data_changes.get("remove", 0)) > 0:
         # Audit-trail: every destructive apply through the override is
         # logged at WARNING so CI log-scrapers + operators have a
         # paper-trail. Matches the same posture as the native engine's
         # _verify_plan_binding bypass warning.
         cprint(
-            f"\n  ⚠️  --allow-data-loss: {changes['remove']} resource(s) will be "
+            f"\n  ⚠️  --allow-data-loss: {data_changes['remove']} resource(s) will be "
             "DESTROYED and no pre-replace snapshot is taken — this engine has "
             "no CTAS/CLONE step, so `fluid rollback` will have no restore point."
         )
@@ -188,7 +200,7 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
             "will be destroyed by `tofu apply` with NO pre-replace snapshot "
             "(`fluid rollback` has no restore point). Provider: %s. Plan changes: "
             "+%d ~%d -%d.",
-            int(changes.get("remove", 0)),
+            int(data_changes.get("remove", 0)),
             provider,
             changes["add"],
             changes["change"],
@@ -198,7 +210,7 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
             logger,
             "opentofu_destructive_gate_override",
             provider=provider,
-            resources_to_destroy=int(changes.get("remove", 0)),
+            resources_to_destroy=int(data_changes.get("remove", 0)),
             **changes,
         )
 
@@ -684,6 +696,101 @@ def _report_suppressed_drift(
         "materialized types. Run `fluid verify --strict` to gate on it."
     )
     warn(logger, "opentofu_suppressed_drift_reported", tables=[r["table"] for r in drift])
+
+
+#: Resource types whose destroy revokes access and deletes no data: a member grant,
+#: a Lake Formation permission, a policy tag or its taxonomy. Removing one is how a
+#: contract revokes a reader or lifts a column restriction, so the data-loss gate
+#: does not count it (it did, and a revocation needed --allow-data-loss, the flag
+#: that also lets the same plan drop tables). The same split policy-as-code gates
+#: over ``tofu show -json`` make by resource type (OPA's Terraform tutorial weighs
+#: deletes per type). A key's IAM grant is not here: without it BigQuery cannot
+#: decrypt the table.
+ACCESS_ONLY_RESOURCE_TYPES = frozenset(
+    {
+        "google_bigquery_dataset_iam_member",
+        "google_bigquery_table_iam_member",
+        "google_storage_bucket_iam_member",
+        "google_data_catalog_policy_tag_iam_member",
+        "google_data_catalog_policy_tag",
+        "google_data_catalog_taxonomy",
+        "aws_lakeformation_permissions",
+    }
+)
+
+
+def _data_bearing_changes(
+    changes: Mapping[str, int], removals: List[Tuple[str, str]]
+) -> Tuple[Dict[str, int], List[str]]:
+    """``(changes with only data-bearing removals, addresses of access-only removals)``.
+
+    Fails closed: when the plan's per-resource events do not account for every
+    removal in its summary (an older ``tofu``, a truncated stream), every removal
+    counts, as before.
+    """
+    counted = {key: int(changes.get(key, 0)) for key in ("add", "change", "remove")}
+    if len(removals) != counted["remove"]:
+        return counted, []
+    revoked = [addr for addr, kind in removals if kind in ACCESS_ONLY_RESOURCE_TYPES]
+    counted["remove"] -= len(revoked)
+    return counted, revoked
+
+
+def _reconcile_with_state(
+    plugin: Any,
+    module_path: Path,
+    workdir: str,
+    env: Mapping[str, str],
+    logger: logging.Logger,
+    *,
+    announce: bool = True,
+) -> List[Dict[str, Any]]:
+    """Let the plugin patch the written module against the current state.
+
+    Optional plugin capability ``reconcile_state(module, state_resources)``: the GCP
+    plugin uses it once per dataset an older forge-cli applied with an authoritative
+    access list, so a grant the contract no longer makes is revoked rather than left
+    unmanaged (``iac/providers/gcp.py::reconcile_legacy_dataset_access``). A no-op for
+    a fresh workdir and for plugins without it. ``fluid diff`` calls it too
+    (``announce=False``), so its plan shows the revocation the apply will make.
+    """
+    reconcile = getattr(plugin, "reconcile_state", None)
+    if not callable(reconcile):
+        return []
+    state = runner.tofu_state_resources(workdir, env=env)
+    if not state:
+        return []
+    module = json.loads(module_path.read_text(encoding="utf-8"))
+    reports = reconcile(module, state)
+    if not reports:
+        return []
+    blocked = [r for r in reports if r.get("blocked")]
+    if blocked:
+        raise CLIError(
+            1,
+            "opentofu_dataset_access_unreconciled",
+            {
+                "error": "state holds dataset(s) an older forge-cli applied with an "
+                "authoritative access list, and every entry of it is a grant the contract "
+                "no longer makes, so it cannot be narrowed in place: "
+                + "; ".join(f"{r['dataset']}: {', '.join(r['revoked'])}" for r in blocked),
+                "remediation": [
+                    "Revoke those entries on the dataset (bq update or the console), or "
+                    "keep one of them in accessPolicy for this apply, then re-run."
+                ],
+            },
+        )
+    module_path.write_text(json.dumps(module, indent=2), encoding="utf-8")
+    if not announce:
+        return reports
+    for report in reports:
+        cprint(
+            f"\n  dataset {report['dataset']}: its access list was written by an older "
+            "forge-cli; this apply revokes the entries no grant of the contract covers: "
+            + ", ".join(report["revoked"])
+        )
+    warn(logger, "gcp_dataset_access_reconciled", datasets=reports)
+    return reports
 
 
 def _data_loss_blocked(changes: Mapping[str, int], allow_data_loss: bool) -> bool:

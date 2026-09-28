@@ -250,3 +250,161 @@ def test_adding_a_key_to_a_live_table_plans_its_replacement_and_rekeys_the_datas
     assert fake.tables[(PROJECT, "sales", "orders")]["encryptionConfiguration"] == {
         "kmsKeyName": KEY
     }
+
+
+# ── Revoking a grant is not data loss ────────────────────────────────────
+
+MEMBERS = "google_bigquery_dataset_iam_member"
+
+
+def _with_readers(*readers: str) -> Dict[str, Any]:
+    contract = _contract()
+    contract["exposes"][0]["binding"].pop("principals")
+    contract["accessPolicy"]["grants"] = [
+        {"principal": f"group:{r}", "permissions": ["read"]} for r in readers
+    ]
+    return contract
+
+
+def _data_bearing(workdir: Path, env: Dict[str, str]):
+    from fluid_build.cli._apply_opentofu_engine import _data_bearing_changes
+
+    plan = runner.tofu_plan(str(workdir), out_file="tfplan", env=env)
+    assert plan.ok, plan.stderr or plan.stdout
+    summary = runner.change_summary(plan)
+    return summary, _data_bearing_changes(summary, runner.planned_removals(plan))
+
+
+@pytest.mark.skipif(_SKIP, reason="needs `tofu` on PATH")
+def test_revoking_a_reader_passes_the_data_loss_gate(tmp_path, fake, tofu_env):
+    """A removed grant is a member destroy: counted, it needed --allow-data-loss."""
+    _live(_with_readers("readers@corp-a.com", "departed@corp-a.com"), tmp_path, fake, tofu_env)
+    _write(_with_readers("readers@corp-a.com"), tmp_path, fake.endpoint)
+    summary, (data_changes, revoked) = _data_bearing(tmp_path, tofu_env)
+    assert summary["remove"] == 1
+    assert _data_loss_blocked(summary, allow_data_loss=False)  # what the gate saw before
+    assert data_changes["remove"] == 0
+    assert not _data_loss_blocked(data_changes, allow_data_loss=False)
+    assert len(revoked) == 1 and revoked[0].startswith(f"{MEMBERS}.")
+    _apply(tmp_path, tofu_env)
+    access = json.dumps(fake.datasets[(PROJECT, "sales")]["access"])
+    assert "departed@corp-a.com" not in access and "readers@corp-a.com" in access
+
+
+@pytest.mark.skipif(_SKIP, reason="needs `tofu` on PATH")
+def test_a_table_replacement_is_still_gated_next_to_a_revocation(tmp_path, fake, tofu_env):
+    _live(_with_readers("readers@corp-a.com", "departed@corp-a.com"), tmp_path, fake, tofu_env)
+    contract = _with_readers("readers@corp-a.com")
+    contract["exposes"][0]["lifecycle"] = {"retention": "P30D", "expire": True}
+    _write(contract, tmp_path, fake.endpoint)
+    _summary, (data_changes, revoked) = _data_bearing(tmp_path, tofu_env)
+    assert len(revoked) == 1
+    assert data_changes["remove"] == 1  # the table's replacement
+    assert _data_loss_blocked(data_changes, allow_data_loss=False)
+
+
+def test_removals_the_plan_does_not_itemise_all_count():
+    """Fail closed: an event stream that misses a removal gates every removal."""
+    from fluid_build.cli._apply_opentofu_engine import _data_bearing_changes
+
+    changes = {"add": 0, "change": 0, "remove": 2}
+    counted, revoked = _data_bearing_changes(changes, [(f"{MEMBERS}.a", MEMBERS)])
+    assert counted["remove"] == 2 and revoked == []
+
+
+# ── From an older forge-cli's authoritative access list ──────────────────
+
+
+def _main_module(contract: Dict[str, Any]) -> str:
+    """What forge-cli 0.16.5 emitted: the grants as the dataset's authoritative ``access``."""
+    from fluid_build.iac.access import normalize_access_grants
+    from fluid_build.iac.providers.gcp import _bq_access_entries
+
+    module = json.loads(build_module(get_iac_plugin("gcp"), contract))
+    resources = module["resource"]
+    resources.pop(MEMBERS)
+    (dataset,) = resources["google_bigquery_dataset"].values()
+    dataset["access"] = _bq_access_entries(normalize_access_grants(contract))
+    return json.dumps(module)
+
+
+@pytest.mark.skipif(_SKIP, reason="needs `tofu` on PATH")
+def test_a_grant_removed_while_leaving_the_authoritative_list_is_revoked(tmp_path, fake, tofu_env):
+    """Measured without the reconciliation: plan +1 ~0 -0, departed@ kept READER, re-plan clean.
+
+    The provider keeps ``access`` as Computed once the module stops setting it, so
+    an entry the old list held and no member resource covers was never revoked.
+    """
+    import logging
+
+    from fluid_build.cli._apply_opentofu_engine import _reconcile_with_state
+
+    before = _with_readers("readers@corp-a.com", "departed@corp-a.com")
+    _write(before, tmp_path, fake.endpoint)
+    (tmp_path / "main.tf.json").write_text(_main_module(before))
+    _init(tmp_path, tofu_env)
+    _plan(tmp_path, tofu_env)
+    _apply(tmp_path, tofu_env)
+    live = json.dumps(fake.datasets[(PROJECT, "sales")]["access"])
+    assert "departed@corp-a.com" in live
+
+    _write(_with_readers("readers@corp-a.com"), tmp_path, fake.endpoint)
+    reports = _reconcile_with_state(
+        get_iac_plugin("gcp"),
+        tmp_path / "main.tf.json",
+        str(tmp_path),
+        tofu_env,
+        logging.getLogger("test"),
+    )
+    assert reports == [
+        {"dataset": "sales", "revoked": ["READER group:departed@corp-a.com"], "blocked": False}
+    ]
+    plan = _plan(tmp_path, tofu_env)
+    assert _actions(plan, DATASET) == ["update"]
+    assert plan["summary"]["remove"] == 0
+    _apply(tmp_path, tofu_env)
+    live = json.dumps(fake.datasets[(PROJECT, "sales")]["access"])
+    assert "departed@corp-a.com" not in live and "readers@corp-a.com" in live
+
+    # The next run finds the member resources in state and leaves ``access`` unset.
+    _write(_with_readers("readers@corp-a.com"), tmp_path, fake.endpoint)
+    assert (
+        _reconcile_with_state(
+            get_iac_plugin("gcp"),
+            tmp_path / "main.tf.json",
+            str(tmp_path),
+            tofu_env,
+            logging.getLogger("test"),
+        )
+        == []
+    )
+    assert _plan(tmp_path, tofu_env)["summary"] == {"add": 0, "change": 0, "remove": 0}
+
+
+@pytest.mark.skipif(_SKIP, reason="needs `tofu` on PATH")
+def test_an_unchanged_contract_leaving_the_authoritative_list_revokes_nothing(
+    tmp_path, fake, tofu_env
+):
+    import logging
+
+    from fluid_build.cli._apply_opentofu_engine import _reconcile_with_state
+
+    contract = _with_readers("readers@corp-a.com")
+    _write(contract, tmp_path, fake.endpoint)
+    (tmp_path / "main.tf.json").write_text(_main_module(contract))
+    _init(tmp_path, tofu_env)
+    _plan(tmp_path, tofu_env)
+    _apply(tmp_path, tofu_env)
+    _write(contract, tmp_path, fake.endpoint)
+    assert (
+        _reconcile_with_state(
+            get_iac_plugin("gcp"),
+            tmp_path / "main.tf.json",
+            str(tmp_path),
+            tofu_env,
+            logging.getLogger("test"),
+        )
+        == []
+    )
+    plan = _plan(tmp_path, tofu_env)
+    assert plan["summary"]["remove"] == 0

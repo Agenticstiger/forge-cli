@@ -31,7 +31,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 # Per-command wall-clock cap. A hung ``tofu`` (e.g., an unauthenticated
 # interactive auth prompt that ``-input=false`` did not catch, or a cloud
@@ -372,6 +372,26 @@ def tofu_import(
         env=env,
         command="import",
     )
+
+
+def planned_removals(result: TofuResult) -> List[Tuple[str, str]]:
+    """``(address, resource type)`` of every resource a plan deletes or replaces.
+
+    Read from the ``planned_change`` events of ``tofu plan -json`` (OpenTofu's
+    machine-readable UI: ``change.action`` is ``delete`` or ``replace`` for the two
+    that remove an object). The ``change_summary`` event's ``remove`` counts the
+    same resources, so a caller can tell which of them hold data.
+    """
+    out: List[Tuple[str, str]] = []
+    for event in result.events:
+        if event.get("type") != "planned_change":
+            continue
+        change = event.get("change") or {}
+        if change.get("action") not in ("delete", "replace"):
+            continue
+        resource = change.get("resource") or {}
+        out.append((str(resource.get("addr") or ""), str(resource.get("resource_type") or "")))
+    return out
 
 
 def change_summary(result: TofuResult) -> Dict[str, int]:

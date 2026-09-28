@@ -355,3 +355,48 @@ def test_verify_bigquery_table_errors_when_a_policy_cannot_be_checked(monkeypatc
     )
     assert result["status"] == "error"
     assert "HTTP 500" in result["error"]
+
+
+# ── through `fluid verify` itself ────────────────────────────────────────
+
+
+def test_fluid_verify_checks_the_governance_of_a_gcp_expose(tmp_path, monkeypatch):
+    """``verify.run`` must hand the expose and the contract to the BigQuery check.
+
+    Without them every governance dimension is skipped and a table with no
+    retention, key or policy tag passes: the call site is the only wiring.
+    """
+    import argparse
+    import json
+    import logging
+
+    import yaml
+
+    from fluid_build.cli import verify
+
+    contract = _contract(**copy.deepcopy(GOVERNED))
+    contract.update(fluidVersion="0.7.6", kind="DataProduct", name="Retention candidates")
+    contract["metadata"] = {"owner": {"team": "data-platform"}}
+    path = tmp_path / "contract.fluid.yaml"
+    path.write_text(yaml.safe_dump(contract), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    table, dataset = _table(partitioning=None), _dataset()
+    monkeypatch.setattr(bigquery, "Client", lambda project=None: _Client(table, dataset))
+    monkeypatch.setattr(bqgov, "default_session", lambda: _Catalog([PLATFORM, PIPELINE]))
+    out = tmp_path / "report.json"
+    args = argparse.Namespace(
+        contract=str(path),
+        expose_id=None,
+        strict=True,
+        fail_on_warning=False,
+        out=str(out),
+        show_diffs=False,
+        env=None,
+    )
+    code = verify.run(args, logging.getLogger("test"))
+    result = json.loads(out.read_text(encoding="utf-8"))["results"]["candidates"]
+    assert {"retention", "encryption", "columnRestrictions"} <= set(result["dimensions"])
+    assert result["dimensions"]["retention"]["status"] == "fail"
+    assert result["dimensions"]["encryption"]["status"] == "pass"
+    assert result["dimensions"]["columnRestrictions"]["status"] == "pass"
+    assert code != 0

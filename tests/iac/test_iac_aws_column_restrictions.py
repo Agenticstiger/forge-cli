@@ -433,3 +433,49 @@ def test_verify_errors_when_it_cannot_see_the_contracts_own_grants(moto_endpoint
     unseen = _check(contract, moto_endpoint)
     assert unseen["status"] == "error"
     assert STEWARD in unseen["message"] and "Lake Formation administrator" in unseen["message"]
+
+
+class _ListedPermissions:
+    """A Lake Formation client whose ListPermissions returns what it is given."""
+
+    def __init__(self, entries: List[Dict[str, Any]]) -> None:
+        self.entries = entries
+
+    def list_permissions(self, **_kwargs: Any) -> Dict[str, Any]:
+        return {"PrincipalResourcePermissions": self.entries}
+
+
+def _entry(principal: str, resource: Dict[str, Any], *permissions: str) -> Dict[str, Any]:
+    return {
+        "Principal": {"DataLakePrincipalIdentifier": principal},
+        "Resource": resource,
+        "Permissions": list(permissions or ("SELECT",)),
+    }
+
+
+def test_a_database_wide_select_to_a_denied_principal_fails_verify():
+    """``Table: {TableWildcard: {}}`` reaches every column of every table in the database."""
+    contract = _contract(restrictions=DENY, principals=MAPPED)
+    exposure = contract["exposes"][0]
+    own = [
+        _entry(STEWARD, _lf_table(), "SELECT", "DESCRIBE"),
+        _entry(
+            ANALYST, _lf_table(ColumnWildcard={"ExcludedColumnNames": ["customer_id", "msisdn"]})
+        ),
+    ]
+
+    def check(extra: List[Dict[str, Any]]) -> Dict[str, Any]:
+        client = _ListedPermissions(own + extra)
+        dimension = column_restrictions_dimension(
+            "candidates", exposure, exposure["binding"], region=REGION, factory=lambda *_: client
+        )
+        assert dimension is not None
+        return dimension
+
+    assert check([])["status"] == "pass"
+    wildcard = {"Table": {"DatabaseName": "demo_gold", "TableWildcard": {}}}
+    failed = check([_entry(ANALYST, wildcard)])
+    assert failed["status"] == "fail"
+    assert f"{ANALYST} can read customer_id, msisdn" in failed["message"]
+    elsewhere = {"Table": {"DatabaseName": "other_db", "TableWildcard": {}}}
+    assert check([_entry(ANALYST, elsewhere)])["status"] == "pass"

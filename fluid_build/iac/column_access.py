@@ -34,9 +34,11 @@ The semantics, the same on both clouds:
   (an allow list per column); a column with no ``allow`` is readable by every reader
   of the expose.
 * A deny beats an allow. A restriction never grants access: the readers are
-  intersected with the expose's readers (``accessPolicy`` read grants on GCP, the
-  Lake Formation ``SELECT`` grants on AWS), and an allowed principal that is not a
-  reader is reported, not added.
+  intersected with the expose's readers (on GCP the ``accessPolicy`` read grants and
+  the expose's own ``policy.authz.readers``; on AWS the Lake Formation ``SELECT``
+  grants), and an allowed principal that is not a reader is reported, not added.
+  With no reader at all a restriction is refused on both clouds: it would lock the
+  columns for everyone, not only for the principals it names.
 
 Principals are logical and resolve through ``binding.principals``
 (:mod:`fluid_build.iac.principals`), so the same restriction names the analyst role
@@ -69,6 +71,10 @@ class Restriction:
     principal: str
     columns: Tuple[str, ...]
     access: str
+    #: The rule's ``tags`` and ``labels``: descriptive, carried to the cloud object
+    #: that holds the restriction where it has room for them (GCP's policy tag).
+    tags: Tuple[str, ...] = ()
+    labels: Tuple[Tuple[str, str], ...] = ()
 
 
 def _where(exposure: Mapping[str, Any], index: int) -> str:
@@ -136,8 +142,37 @@ def restrictions_for(exposure: Mapping[str, Any], index: int = 0) -> Tuple[Restr
                 "nothing would be protected.",
                 ("Name columns of exposes[].contract.schema, or add the columns to it.",),
             )
-        out.append(Restriction(principal=principal.strip(), columns=tuple(columns), access=access))
+        tags = entry.get("tags") or ()
+        labels = entry.get("labels") or {}
+        out.append(
+            Restriction(
+                principal=principal.strip(),
+                columns=tuple(columns),
+                access=access,
+                tags=tuple(str(t) for t in tags) if isinstance(tags, (list, tuple)) else (),
+                labels=(
+                    tuple(sorted((str(k), str(v)) for k, v in labels.items()))
+                    if isinstance(labels, Mapping)
+                    else ()
+                ),
+            )
+        )
     return tuple(out)
+
+
+def authz_readers(exposure: Mapping[str, Any]) -> Tuple[str, ...]:
+    """``exposes[].policy.authz.readers``: the expose's own readers, logical principals.
+
+    Readers a column restriction narrows, alongside the ``accessPolicy`` read grants.
+    No emitter grants them anything: their access to the table is managed elsewhere,
+    and a restriction must not take a column away from them unless it names them.
+    """
+    policy = exposure.get("policy") if isinstance(exposure, Mapping) else None
+    authz = policy.get("authz") if isinstance(policy, Mapping) else None
+    raw = authz.get("readers") if isinstance(authz, Mapping) else None
+    if not isinstance(raw, list):
+        return ()
+    return tuple(r.strip() for r in raw if isinstance(r, str) and r.strip())
 
 
 def restricted_columns(
@@ -322,6 +357,7 @@ __all__ = [
     "DENY",
     "LF_READ_PERMISSIONS",
     "Restriction",
+    "authz_readers",
     "column_readers",
     "lf_exclusions",
     "lf_expected_exclusions",

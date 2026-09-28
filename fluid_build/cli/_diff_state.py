@@ -184,7 +184,12 @@ def _plan_and_classify(
     from fluid_build.iac import runner
     from fluid_build.iac.credentials import build_tofu_env
 
-    from ._apply_opentofu_engine import _guard_region_move, _tail, emit_module
+    from ._apply_opentofu_engine import (
+        _guard_region_move,
+        _reconcile_with_state,
+        _tail,
+        emit_module,
+    )
 
     workdir: Path = target.workdir
     location = target.location
@@ -212,6 +217,9 @@ def _plan_and_classify(
         # call that "deleted outside the apply".
         try:
             _guard_region_move(plugin, contract, str(workdir), env)
+            # The apply's one-time revocation of an older access list's stale
+            # grants, so this plan shows what the apply will do.
+            _reconcile_with_state(plugin, module_path, str(workdir), env, logger, announce=False)
         except CLIError as exc:
             return _error(_cli_error_text(exc), location)
 

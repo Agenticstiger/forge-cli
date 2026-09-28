@@ -26,10 +26,16 @@ the contract fields are the same, so one contract is governed alike on both clou
 partitioned by day, on the column ``binding.location.partitionBy`` names (one
 DATE, TIMESTAMP or DATETIME column) or, without one, by ingestion time; each
 partition is deleted ``retention`` after its day ends (BigQuery counts from the
-partition boundary), so no row is deleted before the declared period, as with
-the S3 rule. dbt-bigquery's ``partition_by`` + ``partition_expiration_days`` is the
-same pair. BigQuery cannot partition an existing table, so adding it replaces the
-table (see :func:`partition_trigger_input`).
+partition boundary, not from when the rows were written). Without ``partitionBy``
+the partition day is the day the rows landed, so no row is deleted sooner than
+``retention`` after it was written: the S3 rule's semantics, and the parity default.
+With ``partitionBy`` the day is the column's value, so retention is the age of the
+event, not of the load: a backfill of rows whose date is already older than
+``retention`` lands in expired partitions and BigQuery deletes it at once, which
+the S3 rule (counting from the write) never does. Naming the column is the opt-in
+to that; the emitter logs it. dbt-bigquery's ``partition_by`` +
+``partition_expiration_days`` is the same pair. BigQuery cannot partition an
+existing table, so adding it replaces the table (see :func:`partition_trigger_input`).
 
 **Encryption** is ``binding.encryption.kms``: ``product`` (the default when the block
 is present) is a Cloud KMS key this product creates in the dataset's location
@@ -52,6 +58,7 @@ those readers. The resource shapes follow cloud-foundation-fabric's
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -59,9 +66,12 @@ from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
-from ..column_access import column_readers, restrictions_for
+from ..column_access import authz_readers, column_readers, restrictions_for
 from ..naming import safe_ident
 from ..principals import GCP, gcp_grants, principal_map, resolve_principal
+from ..provider_match import canonical_cloud
+
+LOG = logging.getLogger(__name__)
 
 #: ``binding.encryption.kms`` values that are not a key reference.
 KMS_PRODUCT = "product"
@@ -139,6 +149,24 @@ class TagGroup:
     columns: Tuple[str, ...]
     #: IAM members granted the fine-grained reader role on the tag.
     readers: Tuple[str, ...]
+    #: The ``tags`` and ``labels`` of the restrictions naming these columns, for the
+    #: policy tag's description (a policy tag has no labels of its own).
+    rule_tags: Tuple[str, ...] = ()
+    rule_labels: Tuple[Tuple[str, str], ...] = ()
+
+    @property
+    def description(self) -> str:
+        """The policy tag's description: what it restricts, and the rules' tags."""
+        text = (
+            f"Restricted columns {', '.join(self.columns)}: readable only by the principals "
+            "granted the fine-grained reader role on this tag."
+        )
+        if self.rule_tags:
+            text += f" Tags: {', '.join(self.rule_tags)}."
+        if self.rule_labels:
+            text += " Labels: " + ", ".join(f"{k}={v}" for k, v in self.rule_labels) + "."
+        # Data Catalog allows at most 2000 bytes.
+        return _bounded(text, 1900)
 
 
 def _where(exposure: Mapping[str, Any], index: int) -> str:
@@ -292,6 +320,16 @@ def retention_for(
                 ),
             )
         field = columns[0]
+        LOG.info(
+            "bigquery_retention_event_time %s: partitioned by %s, so each row expires %s "
+            "after the date in %s, not after it was written (a backfill of older rows is "
+            "deleted at once). Drop binding.location.partitionBy to count from landing, "
+            "as the S3 rule does.",
+            where,
+            field,
+            period,
+            field,
+        )
     return BqRetention(period=str(period), days=days, field=field)
 
 
@@ -365,13 +403,29 @@ def encryption_for(
 
 
 def expose_readers(
-    contract: Mapping[str, Any], binding: Mapping[str, Any], *, where: str
+    contract: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    *,
+    where: str,
+    exposure: Optional[Mapping[str, Any]] = None,
+    readers_where: str = "policy.authz.readers",
 ) -> FrozenSet[str]:
-    """Every IAM member that reads the expose: the ``accessPolicy`` read grants, mapped."""
+    """Every IAM member that reads the expose, mapped through ``binding.principals``.
+
+    The ``accessPolicy`` read grants (which the emitter grants on the dataset) and
+    the expose's own ``policy.authz.readers`` (which it does not: their table access
+    is managed elsewhere). Both are readers a restriction narrows; leaving the second
+    out gave a restricted column no reader at all, so a deny for one group locked it
+    for everyone.
+    """
     members: set[str] = set()
     for grant in gcp_grants(normalize_access_grants(contract), binding, where=where):
         if READ_VERBS & set(grant.permissions):
             members.add(f"{grant.principal_type}:{grant.principal}")
+    if exposure is not None:
+        mapping = principal_map(binding)
+        for reader in authz_readers(exposure):
+            members.update(resolve_principal(reader, mapping, platform=GCP, where=readers_where))
     return frozenset(members)
 
 
@@ -394,19 +448,48 @@ def tag_groups(
     def resolve(principal: str) -> Tuple[str, ...]:
         return resolve_principal(principal, mapping, platform=GCP, where=where)
 
-    readers = expose_readers(contract, binding, where=f"{_where(exposure, index)} accessPolicy")
+    readers = expose_readers(
+        contract,
+        binding,
+        where=f"{_where(exposure, index)} accessPolicy",
+        exposure=exposure,
+        readers_where=f"{_where(exposure, index)}.policy.authz.readers",
+    )
+    if not readers:
+        # The AWS emitter refuses a restriction with no Lake Formation grant to
+        # narrow; the GCP one would attach a policy tag nobody may read, so a deny
+        # for one principal would lock the columns for every principal.
+        raise UnsupportedBindingError(
+            "column-restriction-no-readers",
+            f"{where} restricts columns, but the expose has no reader on this gcp binding: "
+            "no accessPolicy grant with read, select or query and no policy.authz.readers. "
+            "A policy tag is readable only by the readers it names, so the restricted "
+            "columns would be unreadable by everyone, not only by the principals the "
+            "restrictions name.",
+            (
+                "Add the expose's readers: accessPolicy grants with read (forge-cli grants "
+                "them on the dataset), or policy.authz.readers for readers whose table "
+                "access is managed elsewhere.",
+                "Or remove the restriction.",
+            ),
+        )
     by_column = column_readers(exposure, restrictions, resolve, readers, where=where)
     grouped: Dict[FrozenSet[str], List[str]] = {}
     for column, allowed in by_column.items():
         grouped.setdefault(allowed, []).append(column)
     groups: List[TagGroup] = []
     for allowed, columns in grouped.items():
+        rules = [r for r in restrictions if set(r.columns) & set(columns)]
+        rule_tags = tuple(dict.fromkeys(t for r in rules for t in r.tags))
+        rule_labels = tuple(sorted({pair for r in rules for pair in r.labels}))
         groups.append(
             TagGroup(
                 key=safe_ident(f"{cid}_{dataset}_{table}_{columns[0]}"),
                 display_name=_display(f"{table} {' '.join(columns)}"),
                 columns=tuple(columns),
                 readers=tuple(sorted(allowed)),
+                rule_tags=rule_tags,
+                rule_labels=rule_labels,
             )
         )
     return groups
@@ -430,6 +513,66 @@ def validate_bigquery_governance(
             (),
         )
     tag_groups(contract, exposure, "c", "d", "t", index)
+
+
+def gcp_owned(binding: Mapping[str, Any]) -> bool:
+    """Is ``binding`` one the GCP emitter owns: platform gcp, or no cloud named at all?
+
+    ``resolve_gcp_target`` resolves an explicit format (``iceberg``, say) whatever the
+    platform, so an AWS Iceberg binding resolves to GCP Iceberg storage. Governance
+    is dispatched on the platform first: an ``aws`` binding is the AWS emitter's,
+    and its policies are checked against what that emitter writes.
+    """
+    if not isinstance(binding, Mapping):
+        return False
+    cloud = canonical_cloud(binding.get("platform")) or canonical_cloud(binding.get("provider"))
+    return cloud in ("", GCP)
+
+
+def refuse_mixed_dataset_encryption(contract: Mapping[str, Any]) -> None:
+    """Refuse BigQuery tables of one dataset that declare different keys.
+
+    The dataset's default key is the key of the tables in it: BigQuery gives a table
+    created without one the dataset's default. A table declared unkeyed in a keyed
+    dataset therefore gets the key, the provider then plans removing it, and
+    ``encryption_configuration`` is ForceNew, so every later plan replaces the table
+    (terraform-provider-google issue 26193, whose workaround is the same key on the
+    table). With the unkeyed table first, the dataset got no default at all and
+    ``fluid verify`` failed it on every run. One dataset, one key. A view stores no
+    rows and carries no key, so an unkeyed view is left out; a keyed one sets the
+    dataset's default and must agree too.
+    """
+    from .gcp import BIGQUERY_TABLE, BIGQUERY_VIEW, resolve_gcp_target
+
+    seen: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for index, exposure in enumerate(contract.get("exposes") or []):
+        if not isinstance(exposure, Mapping):
+            continue
+        binding = exposure.get("binding") or {}
+        target = resolve_gcp_target(binding) if gcp_owned(binding) else None
+        if target not in (BIGQUERY_TABLE, BIGQUERY_VIEW):
+            continue
+        loc = binding.get("location") or {}
+        where = _where(exposure, index)
+        encryption = encryption_for(binding, dataset_location(loc), where=f"{where}.binding")
+        key = encryption.kms if encryption is not None else KMS_NONE
+        if target == BIGQUERY_VIEW and encryption is None:
+            continue
+        dataset = (str(loc.get("project") or ""), str(loc.get("dataset") or "default"))
+        first = seen.setdefault(dataset, (key, where))
+        if first[0] != key:
+            raise UnsupportedBindingError(
+                "encryption-kms-mixed-dataset",
+                f"{where} and {first[1]} are BigQuery tables in dataset {dataset[1]!r} with "
+                f"different encryption (kms: {key!r} and {first[0]!r}). The dataset's "
+                "default key is the key of every table in it: BigQuery gives an unkeyed "
+                "table the default, and the provider would then replace that table on "
+                "every apply.",
+                (
+                    "Declare the same binding.encryption on every table of the dataset.",
+                    "Or put the tables with a different key in a dataset of their own.",
+                ),
+            )
 
 
 def refuse_unsupported_target(exposure: Mapping[str, Any], index: int, target: str) -> None:
@@ -469,10 +612,12 @@ __all__ = [
     "dataset_location",
     "encryption_for",
     "expose_readers",
+    "gcp_owned",
     "kms_location",
     "partition_trigger_input",
     "product_key_name",
     "product_key_ring",
+    "refuse_mixed_dataset_encryption",
     "refuse_unsupported_target",
     "retention_for",
     "tag_groups",
