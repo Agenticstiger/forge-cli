@@ -57,7 +57,6 @@ are logged, not raised). Every step below swallows its own errors.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import functools
 import logging
 import os
@@ -69,10 +68,6 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 _LOG = logging.getLogger(__name__)
 
-#: The report of the ``fluid apply`` running in this context, if any.
-_CURRENT: contextvars.ContextVar[Optional["ApplyRunReport"]] = contextvars.ContextVar(
-    "fluid_apply_cc_report", default=None
-)
 
 _OFF_VALUES = {"0", "false", "no", "off"}
 
@@ -81,8 +76,13 @@ _NOT_CONFIGURED = "no Command Center is configured"
 
 
 def current_report() -> Optional["ApplyRunReport"]:
-    """The report the running ``fluid apply`` fills, or ``None``."""
-    return _CURRENT.get()
+    """The report the running ``fluid apply`` fills, or ``None``.
+
+    Held in ``observability.apply_run``, where ``build_runners`` reads it too.
+    """
+    from fluid_build.observability.apply_run import current_apply_run
+
+    return current_apply_run()
 
 
 def _utc_now() -> str:
@@ -511,10 +511,15 @@ def reports_apply_run(fn: Callable[..., int]) -> Callable[..., int]:
 
     @functools.wraps(fn)
     def wrapper(args: Any, logger: logging.Logger) -> int:
+        from fluid_build.observability.apply_run import (
+            reset_current_apply_run,
+            set_current_apply_run,
+        )
+
         from ._common import CLIError
 
         report = ApplyRunReport(args, logger)
-        token = _CURRENT.set(report)
+        token = set_current_apply_run(report)
         try:
             rc = fn(args, logger)
         except CLIError as exc:
@@ -527,6 +532,6 @@ def reports_apply_run(fn: Callable[..., int]) -> Callable[..., int]:
             report.finish("success" if rc == 0 else "failed", exit_code=rc)
             return rc
         finally:
-            _CURRENT.reset(token)
+            reset_current_apply_run(token)
 
     return wrapper

@@ -723,16 +723,6 @@ def _run_env(args: argparse.Namespace, plan_data: Optional[Dict[str, Any]] = Non
     return None
 
 
-def _apply_report() -> Any:
-    """The running ``fluid apply``'s Command Center report, or ``None``."""
-    try:
-        from fluid_build.cli._apply_cc_report import current_report
-
-        return current_report()
-    except Exception:  # noqa: BLE001 - reporting never fails a build
-        return None
-
-
 def _runs_dir(contract_dir: Path, product_id: str, build_id: str) -> Optional[Path]:
     """Where a build's run records are (``FileStateStore``), for ids the store accepts."""
     from ._ids import IdentifierViolation, validate_identifier
@@ -808,6 +798,10 @@ def run_builds_from_args(
     root): the contract itself, the contract a bundle's MANIFEST records, or
     the contract a plan records (through its bundle when it was planned from
     one). See :func:`fluid_build._contract_loader.source_contract_path`.
+
+    Each build is recorded on the running ``fluid apply``'s Command Center
+    report, when there is one (``observability.apply_run``): its status and
+    the run record it wrote, and why the build phase failed.
     """
     # Deferred imports to avoid circular import at module-load time:
     # base.py -> python.runner -> base.py (for _resolve_env_placeholders).
@@ -967,9 +961,10 @@ def run_builds_from_args(
         if _b.get("id"):
             validate_identifier(_b["id"], kind="build.id")
 
-    # The ``fluid apply`` run report this build phase belongs to, if any
-    # (``cli/_apply_cc_report.py``): each build is recorded on it.
-    report = _apply_report()
+    # The running ``fluid apply``'s run report, if any: each build is recorded on it.
+    from fluid_build.observability.apply_run import current_apply_run
+
+    report = current_apply_run()
     product_id = str(contract.get("id") or "")
 
     # Filter builds if specific ID requested
