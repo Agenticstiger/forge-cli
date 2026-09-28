@@ -96,10 +96,13 @@ jobs:
         with:
           tofu_version: 1.12.0
 
+      # ``local`` brings DuckDB: the embedded-SQL chain on the bigquery-emulator
+      # runs its SQL there. Without it that test skips, and the lane-coverage
+      # assert below fails the job.
       - name: Install with heavy-emulator extras
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,test-emulators-heavy]"
+          python -m pip install -e ".[dev,test-emulators-heavy,local]"
 
       # Skip-clean: a secret cannot gate a job-level `if:`. With no token
       # the LocalStack steps skip and the GCP half still runs — EXCEPT on
@@ -198,6 +201,7 @@ jobs:
             --require "GCP emulator e2e=tests/iac/test_iac_gcp_emulator_e2e.py"
             --require "GCP cross-project=tests/iac/test_iac_cross_project_gcp_emulator.py"
             --require "BigQuery happy path=tests/providers/test_bigquery_emulated_happy_path.py"
+            --require "BigQuery embedded-SQL chain=tests/providers/test_bigquery_emulated_embedded_sql_chain.py"
           )
           if [ "${{ steps.gate.outputs.localstack }}" = "true" ]; then
             requirements+=(--require "AWS LocalStack=tests/providers/test_aws_localstack_happy_path.py")

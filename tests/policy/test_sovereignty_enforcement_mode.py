@@ -240,18 +240,53 @@ def test_catch_all_jurisdiction_is_not_a_violation_anywhere(jurisdiction: str) -
         assert SovereigntyValidator().validate(doc)[0] is True
 
 
-def test_unknown_region_does_not_block_under_strict() -> None:
-    """An unmappable region is 'cannot tell', not 'violates'.
+def test_unknown_region_on_a_cloud_blocks_under_strict() -> None:
+    """An unmappable cloud region under a strict jurisdiction is refused.
 
-    Deliberately unchanged. Failing closed here would be defensible for a
-    sovereignty control, but it would break every contract using a region the
-    vendored table does not carry, so it is a separate decision rather than a
-    side effect of this fix.
+    This used to be a warning ("cannot tell" is not "violates"), which failed
+    open: the GCP table lagged Google by nine regions and the ASIA
+    multi-region, so an EU-only strict contract validated and emitted
+    me-central2. On an aws / gcp / azure binding strict now refuses a
+    jurisdiction it cannot show; advisory still warns.
     """
     doc = contract(region="mars-central-1", enforcementMode="strict", jurisdiction="EU")
     is_valid, violations = SovereigntyValidator().validate(doc)
+    assert is_valid is False
+    (finding,) = _jurisdiction_findings(violations)
+    assert finding.severity == "error"
+    assert "sovereignty.allowedRegions" in (finding.suggestion or "")
+
+    advisory = contract(region="mars-central-1", enforcementMode="advisory", jurisdiction="EU")
+    is_valid, violations = SovereigntyValidator().validate(advisory)
     assert is_valid is True
-    assert any(v.severity == "warning" for v in violations)
+    assert [v.severity for v in _jurisdiction_findings(violations)] == ["warning"]
+
+
+def _jurisdiction_findings(violations: List[Any]) -> List[Any]:
+    """Check 3's findings (check 4 adds its own "no known jurisdiction" warning)."""
+    return [v for v in violations if "does not match required jurisdiction" in v.message]
+
+
+def test_an_unknown_region_named_in_allowed_regions_still_only_warns() -> None:
+    """The operator vouched for it: the one way to use a region the table lacks."""
+    doc = contract(
+        region="mars-central-1",
+        enforcementMode="strict",
+        jurisdiction="EU",
+        allowedRegions=["mars-central-1"],
+    )
+    is_valid, violations = SovereigntyValidator().validate(doc)
+    assert is_valid is True
+    assert [v.severity for v in _jurisdiction_findings(violations)] == ["warning"]
+
+
+def test_an_unknown_region_off_the_clouds_still_only_warns() -> None:
+    """A platform whose region is not a cloud region keeps the warning."""
+    doc = contract(region="mars-central-1", enforcementMode="strict", jurisdiction="EU")
+    doc["exposes"][0]["binding"]["platform"] = "snowflake"
+    is_valid, violations = SovereigntyValidator().validate(doc)
+    assert is_valid is True
+    assert [v.severity for v in _jurisdiction_findings(violations)] == ["warning"]
 
 
 def test_explicit_deny_is_an_error_in_every_mode() -> None:

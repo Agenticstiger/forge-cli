@@ -368,8 +368,18 @@ class GcpIacPlugin:
     )
 
     def emit(
-        self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()
+        self,
+        contract: Mapping[str, Any],
+        actions: Iterable[Mapping[str, Any]] = (),
+        *,
+        enforce_sovereignty: bool = True,
     ) -> Dict[str, Any]:
+        """The contract's GCP resources, refused when they land outside its sovereignty.
+
+        ``enforce_sovereignty=False`` returns them unchecked, for a caller that
+        runs the same check itself and reports it (``GcpProvider.validate_sovereignty``,
+        what ``fluid plan --check-sovereignty`` reads).
+        """
         resources: Dict[str, Dict[str, Any]] = {}
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
         base_labels = {"managed_by": "fluid", "fluid_contract": cid}
@@ -451,6 +461,18 @@ class GcpIacPlugin:
         # planner already interpreted the loose `execution.trigger`
         # surface into structured `run.*` / `scheduler.*` / `ps.*` ops.
         _emit_from_actions(resources, actions, cid)
+        # The GCP sovereignty hook, where the data lands: every location an
+        # emitted resource carries (a region the binding left to a default
+        # included) and each gcp expose that names no region. A refusal is
+        # raised before any module exists, for `fluid apply` and `fluid
+        # generate iac` alike (providers/gcp/util/sovereignty.py).
+        from ...providers.gcp.util.sovereignty import (
+            enforce_gcp_sovereignty,
+            resource_placements,
+        )
+
+        if enforce_sovereignty:
+            enforce_gcp_sovereignty(contract, resource_placements(resources))
         return resources
 
     def emit_data(
@@ -1521,10 +1543,17 @@ def _emit_pubsub(
 ) -> None:
     topic = loc.get("topic") or f"{cid}-topic"
     topic_res = safe_ident(f"{cid}_{topic}")
-    resources.setdefault("google_pubsub_topic", {})[topic_res] = {
-        "name": topic,
-        "labels": labels,
-    }
+    body: Dict[str, Any] = {"name": topic, "labels": labels}
+    # The binding's region is where the topic's messages may be stored:
+    # hashicorp/google ``google_pubsub_topic.message_storage_policy``
+    # (``allowed_persistence_regions``). It was dropped, so a topic bound to
+    # europe-west1 under an EU-only sovereignty block passed validate and
+    # stored messages wherever Pub/Sub chose. The GCP sovereignty hook reads
+    # the same field back (``resource_placements``).
+    region = loc.get("region") or loc.get("location")
+    if region:
+        body["message_storage_policy"] = {"allowed_persistence_regions": [str(region)]}
+    resources.setdefault("google_pubsub_topic", {})[topic_res] = body
     subscription = loc.get("subscription")
     if subscription:
         resources.setdefault("google_pubsub_subscription", {})[

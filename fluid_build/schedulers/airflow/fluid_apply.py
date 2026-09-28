@@ -497,14 +497,34 @@ def validate_env_name(raw: Any) -> str:
     return validate_id(raw, kind="env")
 
 
-def dag_id_for(product_id: str, build_id: str) -> str:
-    dag_id = f"{product_id}__{build_id}"
+def dag_id_for(product_id: str, build_id: str, env: Optional[str] = None) -> str:
+    """``<product>__<build>``, or ``<product>__<env>__<build>`` for an env's DAG.
+
+    The env is part of the id because one contract deployed to two clouds
+    (``--env aws`` and ``--env gcp`` overlays) is one product id: both DAGs
+    had the same id, and in one Airflow the second to parse replaced the
+    first. Airflow keys run history on the id, so an env-bound DAG from an
+    earlier release starts a new history under its new id.
+    """
+    dag_id = f"{product_id}__{env}__{build_id}" if env else f"{product_id}__{build_id}"
     if len(dag_id) > _MAX_DAG_ID:
         raise ScheduleRenderError(
             f"dag_id {dag_id!r} exceeds Airflow's {_MAX_DAG_ID}-character limit; "
             "shorten the contract or build id"
         )
     return dag_id
+
+
+def schedule_scope_for(product_id: str, env: Optional[str] = None) -> str:
+    """The directory an env's DAGs live in, under the schedule artifacts root.
+
+    ``<product>`` with no env, ``<product>__<env>`` with one. ``fluid
+    schedule-sync --delete-scope product`` mirrors each such directory onto
+    the same-named one at the scheduler, deleting what the source lacks, so
+    the aws and the gcp DAGs of one product need a directory each or each
+    sync deletes the other's.
+    """
+    return f"{product_id}__{env}" if env else product_id
 
 
 def dag_filename_for(build_id: str) -> str:
@@ -644,7 +664,7 @@ def render_dag(
         ")\n"
         "\n"
         "with DAG(\n"
-        f"    dag_id={lit(dag_id_for(product_id, build.build_id))},\n"
+        f"    dag_id={lit(dag_id_for(product_id, build.build_id, env))},\n"
         f"    description={lit(f'fluid apply {product_id} --build-id {build.build_id}')},\n"
         "    schedule=SCHEDULE,\n"
         "    start_date=pendulum.datetime(2026, 1, 1, tz=TIMEZONE),\n"
@@ -727,6 +747,7 @@ __all__ = [
     "has_scheduled_builds",
     "render_dag",
     "render_fluid_apply_dags",
+    "schedule_scope_for",
     "scheduled_builds",
     "uses_fluid_apply_dags",
     "validate_contract_path",

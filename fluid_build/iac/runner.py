@@ -199,12 +199,47 @@ def _run(
     )
 
 
-def tofu_init(workdir: str, *, backend: bool = True, env: Optional[Mapping[str, str]] = None):
-    """``tofu init`` — install providers (and initialise the backend)."""
+def tofu_init(
+    workdir: str,
+    *,
+    backend: bool = True,
+    env: Optional[Mapping[str, str]] = None,
+    reconfigure: bool = False,
+    force_copy: bool = False,
+    plugin_dir: Optional[str] = None,
+):
+    """``tofu init`` — install providers (and initialise the backend).
+
+    ``reconfigure`` passes ``-reconfigure``: take the module's backend as
+    given and ignore the one ``.terraform/`` recorded, moving no state.
+    ``force_copy`` passes ``-force-copy``, which implies ``-migrate-state``:
+    copy the recorded backend's state into the module's backend without a
+    prompt, overwriting whatever the destination holds (OpenTofu
+    ``backendMigrateState_s_s``), so a caller checks the destination first.
+    ``plugin_dir`` passes ``-plugin-dir``: providers come only from that
+    directory, "as if it had been configured as a ``filesystem_mirror``"
+    (opentofu.org/docs/cli/commands/init), so nothing is downloaded.
+    """
     args = ["init", "-input=false", "-no-color"]
     if not backend:
         args.append("-backend=false")
+    if reconfigure:
+        args.append("-reconfigure")
+    if force_copy:
+        args.append("-force-copy")
+    if plugin_dir:
+        args.append(f"-plugin-dir={plugin_dir}")
     return _run(args, workdir=workdir, env=env, command="init")
+
+
+def tofu_state_pull(workdir: str, *, env: Optional[Mapping[str, str]] = None) -> TofuResult:
+    """``tofu state pull`` — the backend's current state document, as JSON text.
+
+    A key that holds no state prints a document with an empty ``lineage``
+    and serial 0 (measured on OpenTofu 1.12 against an S3 backend), not an
+    error; see :mod:`fluid_build.iac.state_migration` for how that is read.
+    """
+    return _run(["state", "pull"], workdir=workdir, env=env, command="state-pull")
 
 
 def tofu_validate(workdir: str, *, env: Optional[Mapping[str, str]] = None) -> TofuResult:
