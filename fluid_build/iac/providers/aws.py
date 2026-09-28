@@ -1460,7 +1460,9 @@ def _wire_aws_deps(resources: Dict[str, Any], cid: str) -> None:
 #     ``registerLocation`` → ``aws_lakeformation_resource`` on the
 #         binding's ``s3://<bucket>/<path>``,
 #     ``grants[]`` → one ``aws_lakeformation_permissions`` per principal
-#         (with ``columns`` choosing ``table_with_columns`` vs ``table``),
+#         (with ``columns`` choosing ``table_with_columns`` vs ``table``; a
+#         ``table_with_columns`` grant carries SELECT only, see
+#         :func:`_lf_column_grant_permissions`),
 #         plus, per ``bucketPolicy``, an ``aws_s3_bucket_policy`` for the
 #         grantees in OTHER accounts (see :func:`_lf_bucket_policy`),
 #     ``tags{}`` → one ``aws_lakeformation_resource_lf_tags`` per table,
@@ -1910,7 +1912,7 @@ def _emit_lakeformation(
 
     # 2. Principal grants. Each grant becomes one aws_lakeformation_permissions
     #    resource targeting either .table or .table_with_columns (when
-    #    columns / excludedColumns is set).
+    #    columns / excludedColumns is set, and then with SELECT only).
     for idx, grant in enumerate(gov.get("grants") or []):
         principal = grant.get("principal")
         perms = list(grant.get("permissions") or [])
@@ -1953,6 +1955,12 @@ def _emit_lakeformation(
                 # back with wildcard = true, so this is what keeps the plan clean.
                 twc["wildcard"] = True
                 twc["excluded_column_names"] = list(excluded)
+            # SELECT only; nothing is split onto a table grant for the same
+            # principal. See _lf_column_grant_permissions.
+            body["permissions"], column_option = _lf_column_grant_permissions(idx, perms, gp or ())
+            body.pop("permissions_with_grant_option", None)
+            if column_option:
+                body["permissions_with_grant_option"] = column_option
             body["table_with_columns"] = [twc]
         elif table_key:
             body["table"] = [
@@ -2103,6 +2111,76 @@ def _check_lf_grant_columns(
                     "Leave at least one column out of excludedColumns.",
                 ),
             )
+
+
+#: The one permission a column-limited (``TableWithColumns``) Lake Formation
+#: resource takes. AWS LF developer guide, *Lake Formation permissions
+#: reference*: "Table with column filter — Permission: SELECT"; API reference,
+#: ``TableWithColumnsResource``: "This object is only used when granting a SELECT
+#: permission."
+_LF_COLUMN_PERMISSION = "SELECT"
+
+#: Asked for beside a column limit, and already held through the column-limited
+#: SELECT, so it is not sent at all. Same page: a principal with SELECT "can view
+#: a table in the Data Catalog", restricted to the granted columns, and "You can't
+#: grant DESCRIBE to a user who has partial select on a table", so it cannot move
+#: to a separate table grant either.
+_LF_HELD_THROUGH_COLUMN_SELECT = frozenset({"DESCRIBE"})
+
+
+def _lf_column_grant_permissions(
+    idx: int, permissions: Iterable[str], grant_option: Iterable[str]
+) -> Tuple[List[str], List[str]]:
+    """``(permissions, permissions_with_grant_option)`` for a column-limited grant.
+
+    THE one place a ``table_with_columns`` grant's permissions are decided:
+    whatever supplies the columns (``columns``, ``excludedColumns``, or a
+    derivation from the contract's policy) goes through it.
+
+    Lake Formation takes only ``SELECT`` on a column-limited resource and answers
+    anything else with ``InvalidInputException: Permissions modification is
+    invalid`` at apply; ``tofu plan`` and moto accept it. So:
+
+    * ``SELECT`` (and its grant option) stays on the column resource;
+    * ``DESCRIBE`` is dropped: the column-limited ``SELECT`` already lets the
+      principal see the table (its granted columns), and Lake Formation refuses
+      ``DESCRIBE`` on the table to a principal that holds a partial ``SELECT``;
+    * any other permission is refused here: ``ALTER``, ``DROP``, ``DELETE`` and
+      ``INSERT`` cannot be granted to a principal with a column-limited
+      ``SELECT`` on the same table, and ``ALL`` would reach the columns the limit
+      withholds;
+    * a column limit with no ``SELECT`` is refused: it would limit nothing.
+    """
+    asked = [str(p).upper() for p in permissions]
+    regrant = [str(p).upper() for p in grant_option]
+    where = f"governance.lakeFormation.grants[{idx}]"
+    held = {_LF_COLUMN_PERMISSION} | _LF_HELD_THROUGH_COLUMN_SELECT
+    table_level = sorted({p for p in asked + regrant if p not in held})
+    if table_level:
+        raise UnsupportedBindingError(
+            "lakeformation-grant-columns",
+            f"{where} limits columns and also asks for {table_level}. Lake Formation "
+            "takes only SELECT on a column-limited grant, and will not grant "
+            "ALTER, DROP, DELETE or INSERT on the table to a principal holding a "
+            "column-limited SELECT on it (ALL would reach the withheld columns), so the "
+            "apply would fail with 'Permissions modification is invalid'.",
+            (
+                "Keep only SELECT (and DESCRIBE, which it carries) on the column-limited grant.",
+                "Grant the other permissions to a principal that has no column limit.",
+            ),
+        )
+    if _LF_COLUMN_PERMISSION not in asked:
+        raise UnsupportedBindingError(
+            "lakeformation-grant-columns",
+            f"{where} limits columns but does not grant SELECT. A column limit applies "
+            "only to SELECT, and Lake Formation takes no column list for DESCRIBE.",
+            (
+                "Add SELECT to grant the listed columns.",
+                "Remove columns and excludedColumns to grant DESCRIBE on the whole table.",
+            ),
+        )
+    kept_option = [_LF_COLUMN_PERMISSION] if _LF_COLUMN_PERMISSION in regrant else []
+    return [_LF_COLUMN_PERMISSION], kept_option
 
 
 # ---------------------------------------------------------------------------
