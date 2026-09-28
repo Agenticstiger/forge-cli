@@ -19,7 +19,7 @@ import json
 import logging
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 try:
     import yaml  # type: ignore
@@ -481,18 +481,133 @@ _NOTED_MISSING_OVERLAYS: Set[Tuple[str, str]] = set()
 _NOTED_MISSING_OVERLAYS_LOCK = threading.Lock()
 
 
+#: The ``fluid.workspace.yaml`` key that names, per product, the environments
+#: it is deployed to (``{product: [env, ...]}``, the product being the
+#: contract's directory name or its id). Written by workspaces whose own gate
+#: checks one overlay per environment (fluid-demo-env's ``make targets``);
+#: read here so ``--env`` for a declared environment cannot fall back to the
+#: base contract.
+EXPECTED_ENVIRONMENTS_KEY = "expected-environments"
+
+
+def _base_platforms(contract: Mapping[str, Any]) -> List[str]:
+    out: List[str] = []
+    for expose in contract.get("exposes") or []:
+        binding = expose.get("binding") if isinstance(expose, dict) else None
+        platform = binding.get("platform") if isinstance(binding, dict) else None
+        if platform and str(platform) not in out:
+            out.append(str(platform))
+    return out
+
+
+def declared_environments(
+    contract_path: str | Path, contract: Mapping[str, Any]
+) -> List[Tuple[str, List[str]]]:
+    """``[(source, envs)]``: where this product's environments are declared.
+
+    Two declarations are read: the contract's own ``environments`` block
+    (schema ``$defs.environmentConfig``, one key per environment), and the
+    workspace's ``expected-environments`` entry for this product, looked up
+    by the contract's directory name, then by its id. Unreadable or absent
+    declarations are simply not listed.
+    """
+    found: List[Tuple[str, List[str]]] = []
+    environments = contract.get("environments")
+    if isinstance(environments, dict) and environments:
+        found.append(("the contract's environments block", [str(k) for k in environments]))
+    try:
+        from .util.workspace_root import WORKSPACE_CONFIG_FILENAME, find_workspace_root
+
+        base = Path(contract_path).resolve()
+        root = find_workspace_root(base.parent)
+        if root is None:
+            return found
+        workspace = _parse_file(root / WORKSPACE_CONFIG_FILENAME)
+    except Exception:  # noqa: BLE001 - an unreadable workspace declares nothing
+        return found
+    if not isinstance(workspace, dict):
+        return found
+    block = workspace.get(EXPECTED_ENVIRONMENTS_KEY)
+    if not isinstance(block, dict):
+        return found
+    for key in (base.parent.name, contract.get("id")):
+        envs = block.get(key) if isinstance(key, str) else None
+        if isinstance(envs, list):
+            found.append(
+                (
+                    f"{WORKSPACE_CONFIG_FILENAME} {EXPECTED_ENVIRONMENTS_KEY} ({key})",
+                    [str(e) for e in envs],
+                )
+            )
+            break
+    return found
+
+
+def refuse_declared_missing_overlay(
+    contract_path: str | Path, env: str, contract: Mapping[str, Any]
+) -> None:
+    """Refuse ``--env <env>`` with no overlay when the product declares ``env``.
+
+    Without an overlay the base contract is used unchanged, which for a
+    declared environment means deploying it as if it were that environment
+    (measured: silver ``--env gcp`` validated and planned the local base,
+    rc=0). The base-by-convention ``dev`` and an env the base contract is
+    already bound to (``local`` for a local base) are the base, and pass.
+    """
+    if env == BASE_ENV_BY_CONVENTION:
+        return
+    platforms = _base_platforms(contract)
+    if env in platforms:
+        return
+    for source, envs in declared_environments(contract_path, contract):
+        if env in envs:
+            from ._contract_loader import CLIError
+
+            refusal = CLIError(
+                1,
+                "overlay_declared_but_missing",
+                {
+                    "env": env,
+                    "contract": str(Path(contract_path)),
+                    "declared_by": source,
+                    "base_platforms": platforms,
+                    "available_envs": available_overlay_envs(contract_path),
+                    "error": (
+                        f"--env {env!r} has no overlay, but {source} declares {env!r} an "
+                        f"environment of this product, so the base contract (bound to "
+                        f"{', '.join(platforms) or 'nothing'}) would be used as if it were "
+                        f"{env!r}. Add overlays/{env}.yaml, or remove {env!r} from {source}"
+                    ),
+                },
+            )
+            # ``str()`` of the error is its sentence, not just the event: most
+            # callers wrap a load failure as ``{"error": str(e)}``.
+            refusal.args = (refusal.context["error"],)
+            raise refusal
+
+
 def note_missing_overlay(
-    contract_path: str | Path, env: str, logger: Optional[logging.Logger] = None
+    contract_path: str | Path,
+    env: str,
+    logger: Optional[logging.Logger] = None,
+    *,
+    contract: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Report that ``env`` matched no overlay for ``contract_path``, once.
 
-    WARNING for any env but :data:`BASE_ENV_BY_CONVENTION`, naming the env and
-    the overlays that do exist, because the caller is about to use the base
-    contract where it asked for an environment. INFO for ``dev``, which is
-    the base by convention. Emitted once per (contract, env) per process —
-    one command loads the same contract several times.
+    WARNING for any env but :data:`BASE_ENV_BY_CONVENTION`, naming the env,
+    the overlays that do exist and the platforms the base binds to, because
+    the caller is about to use the base contract where it asked for an
+    environment. INFO for ``dev``, which is the base by convention. Emitted
+    once per (contract, env) per process — one command loads the same
+    contract several times.
+
+    ``contract`` (the base) enables the refusal: an env the product declares
+    (:func:`refuse_declared_missing_overlay`) is an error, every time.
     """
     log = logger or LOG
+    if contract is not None:
+        refuse_declared_missing_overlay(contract_path, env, contract)
     contract_key = str(Path(contract_path).resolve())
     with _NOTED_MISSING_OVERLAYS_LOCK:
         if (contract_key, env) in _NOTED_MISSING_OVERLAYS:
@@ -509,14 +624,21 @@ def note_missing_overlay(
         )
         return
     existing = available_overlay_envs(contract_key)
+    platforms = _base_platforms(contract) if contract is not None else []
     log.warning(
         "overlay_not_found: --env %r matched no overlay for %s, so the BASE contract is "
-        "used unchanged. Overlays that exist: %s. Add an overlay for it under overlays/ "
+        "used unchanged%s. Overlays that exist: %s. Add an overlay for it under overlays/ "
         "or pass one of the existing environments.",
         env,
         contract_key,
+        f" (it binds to {', '.join(platforms)}, not to {env!r})" if platforms else "",
         ", ".join(existing) if existing else "none",
-        extra={"event": "overlay_not_found", "env": env, "available_envs": existing},
+        extra={
+            "event": "overlay_not_found",
+            "env": env,
+            "available_envs": existing,
+            "base_platforms": platforms,
+        },
     )
 
 
@@ -603,7 +725,7 @@ def load_with_overlay(
         # No overlay found. This used to be a DEBUG line, so ``--env prod``
         # with a typo'd or missing overlay silently deployed the BASE
         # contract at the default log level. Say so, once per contract/env.
-        note_missing_overlay(base_path, env, log)
+        note_missing_overlay(base_path, env, log, contract=base)
         return base
 
     # No env → return base as-is

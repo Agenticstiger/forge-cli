@@ -151,8 +151,17 @@ class _Tofu:
         from fluid_build.cli import _apply_opentofu_engine as engine
 
         monkeypatch.setattr(engine, "native_actions", lambda contract, logger: [])
+        # Moving a pre-provider-key state (``iac.state_migration``) is not
+        # under test here: nothing to move.
+        from fluid_build.iac.state_migration import CURRENT, StateReconciliation
 
-    def _init(self, workdir, *, backend=True, env=None):
+        monkeypatch.setattr(
+            engine,
+            "_reconcile_state",
+            lambda **kw: StateReconciliation(CURRENT, kw["legacy"], kw["current"]),
+        )
+
+    def _init(self, workdir, *, backend=True, env=None, reconfigure=False, force_copy=False):
         self.calls.append(f"init backend={backend}")
         self.module_during_run = (Path(workdir) / "main.tf.json").read_text(encoding="utf-8")
         return runner.TofuResult("init", 0, "", "")
@@ -351,7 +360,7 @@ def test_the_state_backend_is_resolved_as_apply_resolves_it(workspace, monkeypat
     assert _invoke(["diff", str(contract), "--out", str(out)]) == (0, None)
     assert tofu.calls[0] == "init backend=True"
     assert '"s3"' in tofu.module_during_run
-    assert _state(out)["state"] == f"remote: s3://team-state/fluid/{CID}/terraform.tfstate"
+    assert _state(out)["state"] == f"remote: s3://team-state/fluid/{CID}/aws/terraform.tfstate"
     # The module the pass wrote into a fresh workdir is not left there.
     assert not (_workdir(workspace) / "main.tf.json").exists()
 

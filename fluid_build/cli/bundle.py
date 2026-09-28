@@ -228,7 +228,7 @@ def materialize_contract(
             compiled = _deep_merge(dict(compiled), overlay)
             logger.info("overlay_applied", extra={"overlay": str(overlay_path)})
         else:
-            note_missing_overlay(contract_path, env, logger)
+            note_missing_overlay(contract_path, env, logger, contract=compiled)
     return compiled, overlay_path
 
 

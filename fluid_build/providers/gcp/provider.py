@@ -186,6 +186,12 @@ class GcpProvider(BaseProvider):
                 # Older planner signature without mode kwarg.
                 actions = plan_actions(contract, self.project, self.region, self.logger)
 
+            # Sovereignty, the way AwsProvider.plan does it: a refusal raised
+            # here reaches `fluid apply` / `fluid generate iac` through
+            # native_actions, which re-raises a sovereignty veto instead of
+            # treating it as "planner unavailable".
+            self._validate_sovereignty(contract, actions)
+
             self.info_kv(
                 event="plan_completed",
                 contract_id=contract.get("id"),
@@ -195,9 +201,35 @@ class GcpProvider(BaseProvider):
 
             return actions
 
+        except ProviderError:
+            raise
         except Exception as e:
             self.err_kv(event="plan_failed", contract_id=contract.get("id"), error=str(e))
             raise ProviderError(f"Failed to plan GCP deployment: {e}") from e
+
+    def _validate_sovereignty(
+        self, contract: Mapping[str, Any], actions: List[Dict[str, Any]]
+    ) -> None:
+        """Refuse a planned placement outside ``contract.sovereignty``.
+
+        Checks each gcp expose's binding region (none is a finding under
+        strict) and every ``location`` / ``region`` a planned action carries:
+        where the planner fell back to a default (``US`` for a dataset, this
+        provider's region for a scheduler job or a staging bucket), that
+        default is what gets checked. See ``util/sovereignty.py``.
+        """
+        if not contract.get("sovereignty"):
+            return
+        from fluid_build._errors import ResidencyViolationError, SovereigntyViolationError
+
+        from .util.sovereignty import action_placements, enforce_gcp_sovereignty
+
+        try:
+            enforce_gcp_sovereignty(contract, action_placements(actions), logger=self.logger)
+        except (SovereigntyViolationError, ResidencyViolationError) as e:
+            self.err_kv(event="sovereignty_violation", error=str(e))
+            raise ProviderError(str(e)) from e
+        self.info_kv(event="sovereignty_validated", region=self.region)
 
     def apply(self, actions: List[Dict[str, Any]], **kwargs: Any) -> ApplyResult:
         """Native GCP apply is retired — GCP uses the OpenTofu engine.

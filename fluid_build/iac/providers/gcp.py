@@ -388,6 +388,17 @@ class GcpIacPlugin:
         # planner already interpreted the loose `execution.trigger`
         # surface into structured `run.*` / `scheduler.*` / `ps.*` ops.
         _emit_from_actions(resources, actions, cid)
+        # The GCP sovereignty hook, where the data lands: every location an
+        # emitted resource carries (a region the binding left to a default
+        # included) and each gcp expose that names no region. A refusal is
+        # raised before any module exists, for `fluid apply` and `fluid
+        # generate iac` alike (providers/gcp/util/sovereignty.py).
+        from ...providers.gcp.util.sovereignty import (
+            enforce_gcp_sovereignty,
+            resource_placements,
+        )
+
+        enforce_gcp_sovereignty(contract, resource_placements(resources))
         return resources
 
     def emit_data(

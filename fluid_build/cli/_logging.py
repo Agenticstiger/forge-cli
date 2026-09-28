@@ -38,19 +38,36 @@ def setup_logging(level: str = "INFO", file: str | None = None) -> logging.Logge
     return logger
 
 
+#: The envelope keys every event carries. A payload key of the same name is
+#: kept as ``extra_<key>`` instead of replacing the envelope's (the event
+#: name is ``message``; a provider result with its own ``message`` would
+#: otherwise have renamed the event).
+_ENVELOPE_KEYS = frozenset({"time", "level", "name", "message"})
+
+
 def _event(level: str, name: str, payload: Dict[str, Any]) -> str:
+    # Renamed, not dropped: the pattern of WebbPulse/webbpulse-python#129
+    # (``extra_<key>`` for an ``extra`` key that collides with a LogRecord
+    # attribute). structlog's hynek/structlog#842 drops such keys instead,
+    # which would lose the provider's own explanation here.
+    fields = {(f"extra_{k}" if k in _ENVELOPE_KEYS else k): v for k, v in payload.items()}
     return json.dumps(
         {
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "level": level,
             "name": "fluid.cli",
             "message": name,
-            **payload,
+            **fields,
         }
     )
 
 
-def info(logger: logging.Logger, message: str, **payload: Any) -> None:
+# ``logger`` and ``message`` are positional-only (PEP 570), so a payload may
+# carry keys of those names: ``info(logger, "policy_apply_result", **res)``
+# raised ``TypeError: info() got multiple values for argument 'message'``
+# for every provider whose result has a ``message`` (GCP's policy applier
+# does), and failed stage 8 of every generated gcp pipeline.
+def info(logger: logging.Logger, message: str, /, **payload: Any) -> None:
     """Emit a structured INFO event to the log sink.
 
     Routed at DEBUG level for the human-facing console handler so the
@@ -67,7 +84,7 @@ def info(logger: logging.Logger, message: str, **payload: Any) -> None:
     logger.debug(_event("INFO", message, payload))
 
 
-def warn(logger: logging.Logger, message: str, **payload: Any) -> None:
+def warn(logger: logging.Logger, message: str, /, **payload: Any) -> None:
     """Emit a structured WARNING event — stays at WARNING level.
 
     Warnings are user-relevant ("we didn't break, but you should know
@@ -76,5 +93,5 @@ def warn(logger: logging.Logger, message: str, **payload: Any) -> None:
     logger.warning(_event("WARNING", message, payload))
 
 
-def error(logger: logging.Logger, message: str, **payload: Any) -> None:
+def error(logger: logging.Logger, message: str, /, **payload: Any) -> None:
     logger.error(_event("ERROR", message, payload))

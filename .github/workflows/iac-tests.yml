@@ -132,6 +132,15 @@ jobs:
             -q -p no:randomly --junitxml=state-drift.xml
           .venv/bin/python scripts/ci/assert_lane_coverage.py state-drift.xml \
             --require "state drift=tests/iac/test_iac_state_drift_moto.py"
+      # The default state key names the provider, and the first apply after the
+      # upgrade moves the old key's state with `tofu init -migrate-state`. Only a
+      # real apply, move and plan prove the plan after it changes nothing.
+      - name: Stage 1 — per-provider state key and its migration (tofu vs moto, creds-free)
+        run: |
+          .venv/bin/python -m pytest tests/iac/test_iac_state_key_migration_moto.py \
+            -q -p no:randomly --junitxml=state-key-migration.xml
+          .venv/bin/python scripts/ci/assert_lane_coverage.py state-key-migration.xml \
+            --require "state key migration=tests/iac/test_iac_state_key_migration_moto.py"
 
   # -------------------------------------------------------------------
   # Stage 2 — docker emulators. PR + push.
