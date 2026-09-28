@@ -1,4 +1,4 @@
-fluidVersion: "0.7.1"
+fluidVersion: "0.7.5"
 kind: DataProduct
 id: analytics.data_lake.sales_iceberg
 name: Sales Iceberg Table
@@ -48,6 +48,23 @@ exposes:
         bucket: "{{ env.DATA_LAKE_BUCKET }}"
         path: iceberg/sales/curated/
         region: "{{ env.AWS_REGION }}"
+
+      # accessPolicy is the cloud-neutral intent, and the AWS emitter does
+      # not write it: on AWS these Lake Formation grants enforce it, one per
+      # accessPolicy grant (read/select/query -> SELECT + DESCRIBE, write/create
+      # -> INSERT, update/delete -> DELETE: an Iceberg UPDATE or MERGE rewrites
+      # data files, so it needs INSERT and DELETE), on a location registered
+      # with Lake Formation.
+      # Set AWS_ACCOUNT_ID to the account that owns the roles before
+      # generating or applying the module.
+      governance:
+        lakeFormation:
+          registerLocation: true
+          grants:
+            - principal: "arn:aws:iam::{{ env.AWS_ACCOUNT_ID }}:role/data-analyst"
+              permissions: [SELECT, DESCRIBE]
+            - principal: "arn:aws:iam::{{ env.AWS_ACCOUNT_ID }}:role/data-engineer"
+              permissions: [SELECT, INSERT, DELETE, DESCRIBE]
 
     iceberg:
       writeFormat: parquet

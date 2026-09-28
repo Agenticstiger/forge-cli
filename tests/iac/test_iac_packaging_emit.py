@@ -345,10 +345,15 @@ class TestGcpPackagingEmit:
         assert member["role"] == "roles/bigquery.dataViewer"
         assert member["member"] == "user:analytics@acme.com"
 
-    def test_isolated_dataset_keeps_the_dataset_acl(self):
+    def test_isolated_dataset_keeps_the_dataset_grant(self):
         resources = GcpIacPlugin().emit(_gcp_contract(ISOLATED))
         dataset = resources["google_bigquery_dataset"]["orders_adp_sales_pool"]
-        assert dataset["access"] == [{"role": "READER", "user_by_email": "analytics@acme.com"}]
+        # A non-authoritative dataset member, not the authoritative access list.
+        assert "access" not in dataset
+        members = list(resources["google_bigquery_dataset_iam_member"].values())
+        assert [(m["role"], m["member"]) for m in members] == [
+            ("roles/bigquery.dataViewer", "user:analytics@acme.com")
+        ]
         assert "google_bigquery_table_iam_member" not in resources
 
     def test_shared_bucket_is_a_data_source_with_no_force_destroy(self):

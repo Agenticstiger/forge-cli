@@ -22,7 +22,7 @@ metadata:
     team: web-analytics
     email: web-analytics@example.com
 
-# ─── Access Policy (compiled into IAM / Lake Formation grants) ─────
+# ─── Access Policy (enforced on AWS by the binding's Lake Formation grants) ─
 
 accessPolicy:
   grants:
@@ -55,6 +55,21 @@ exposes:
         bucket: acme-web-analytics-lake
         path: curated/web_analytics/pageviews/
         region: us-east-1
+
+      # accessPolicy is the cloud-neutral intent, and the AWS emitter does
+      # not write it: on AWS these Lake Formation grants enforce it, one per
+      # accessPolicy grant (read/select -> SELECT + DESCRIBE, write/create ->
+      # INSERT), on a location registered with Lake Formation.
+      # Set AWS_ACCOUNT_ID to the account that owns the roles before
+      # generating or applying the module.
+      governance:
+        lakeFormation:
+          registerLocation: true
+          grants:
+            - principal: "arn:aws:iam::{{ env.AWS_ACCOUNT_ID }}:role/analysts"
+              permissions: [SELECT, DESCRIBE]
+            - principal: "arn:aws:iam::{{ env.AWS_ACCOUNT_ID }}:role/etl"
+              permissions: [SELECT, INSERT, DESCRIBE]
 
     contract:
       schema:
