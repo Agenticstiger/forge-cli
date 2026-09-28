@@ -15,6 +15,9 @@ Part of the **[FLUID examples](../README.md)**. · AWS provider · offline-revie
 - An `iceberg:` management block — snapshot retention (bounded time-travel
   history) and compaction (keeps the small-files problem in check). Values
   follow community norms: 5-day retention, 256 MB target file size.
+- Lake Formation grants in the binding that enforce the `accessPolicy` on
+  AWS: SELECT for the analysts, and SELECT, INSERT and DELETE for the ETL
+  role, which an Iceberg `UPDATE`, `DELETE` or `MERGE` needs.
 
 ## Prerequisites
 
@@ -40,6 +43,15 @@ cat /tmp/aws-iceberg/main.tf.json
 | `aws_glue_catalog_database.…sales` | Glue Data Catalog | The `sales` database |
 | `aws_glue_catalog_table.…orders` | Glue Data Catalog | Iceberg `orders` table (`table_type = ICEBERG`) |
 | `aws_s3_bucket.…acme_sales_lakehouse` | Amazon S3 | Backing object store |
+| `aws_lakeformation_resource.…` | Lake Formation | Registers the table's S3 prefix |
+| `aws_lakeformation_permissions.…` | Lake Formation | Two grants: the `accessPolicy` reader and writer, as IAM roles |
+| `aws_s3_bucket_policy.…` | Amazon S3 | Direct-read statements for grantees in another account only; with the example's same-account roles it plans `count = 0` |
+
+The grant ARNs read `{{ env.AWS_ACCOUNT_ID }}`. Set it to the account that
+owns the roles before `fluid generate iac` if you will run `tofu validate`
+or `plan` on the module, and before `fluid apply`: left unset, the ARN stays
+unresolved and the AWS provider refuses it. Applying the Lake Formation
+resources needs a Lake Formation administrator.
 
 Confirm the Iceberg wiring in the emitted module:
 

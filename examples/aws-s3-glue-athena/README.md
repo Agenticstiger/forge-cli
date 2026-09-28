@@ -12,8 +12,10 @@ Part of the **[FLUID examples](../README.md)**. · AWS provider · offline-revie
   catalog natively — an **Athena-queryable** table with no extra resource.
 - **Parquet** as the on-disk format, the single biggest lever on Athena scan
   cost (columnar + compressed ≈ an order of magnitude cheaper than raw text).
-- An `accessPolicy` block that downstream compiles into IAM / Lake Formation
-  grants, and a `contract.quality[]` block of inline SQL assertions.
+- An `accessPolicy` block, the cloud-neutral statement of who reads and who
+  writes, enforced on AWS by the binding's `governance.lakeFormation` grants
+  (the AWS emitter does not write `accessPolicy` itself), and a
+  `contract.quality[]` block of inline SQL assertions.
 
 ## Prerequisites
 
@@ -37,16 +39,23 @@ cat /tmp/aws-lake/main.tf.json
 
 ## What gets generated
 
-`fluid generate iac` emits a credential-free `main.tf.json` with three resources:
+`fluid generate iac` emits a credential-free `main.tf.json` with these resources:
 
 | Resource | AWS service | Purpose |
 |----------|-------------|---------|
 | `aws_glue_catalog_database.…web_analytics` | Glue Data Catalog | The `web_analytics` database |
 | `aws_glue_catalog_table.…pageviews` | Glue Data Catalog | The `pageviews` table + column schema |
 | `aws_s3_bucket.…acme_web_analytics_lake` | Amazon S3 | Backing object store (curated zone) |
+| `aws_lakeformation_resource.…` | Lake Formation | Registers the table's S3 prefix |
+| `aws_lakeformation_permissions.…` | Lake Formation | Two grants: the `accessPolicy` reader and writer, as IAM roles |
+| `aws_s3_bucket_policy.…` | Amazon S3 | Direct-read statements for grantees in another account only; with the example's same-account roles it plans `count = 0` |
 
 Apply it with OpenTofu (`tofu init && tofu apply`) once you have AWS
-credentials — or apply through FLUID with `fluid apply`.
+credentials — or apply through FLUID with `fluid apply`. Set `AWS_ACCOUNT_ID`
+to the account that owns the roles before generating a module you will
+validate, plan or apply: the grant ARNs read it (`{{ env.AWS_ACCOUNT_ID }}`),
+and left unset the ARN stays unresolved and the AWS provider refuses it. The
+Lake Formation resources need a Lake Formation administrator to apply them.
 
 ## Architecture
 

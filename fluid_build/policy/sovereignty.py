@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import AbstractSet, Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 from ._common import iter_exposes
 
@@ -182,6 +182,8 @@ def region_jurisdiction_map() -> Mapping[str, str]:
     for provider in ("aws", "gcp", "azure"):
         table.update(_load_vendored(provider))
     table.update(SovereigntyValidator.VENDORED_CORRECTIONS)
+    table.update(_gcp_locations_not_vendored())
+    table.update(_MULTI_REGION_JURISDICTIONS)
     table.update(_load_botocore_aws())
     # Read-only: the cached object is shared process-wide (and re-exported by
     # providers/aws/util/sovereignty.py), so a stray mutation anywhere would
@@ -370,12 +372,38 @@ class SovereigntyValidator:
         Returns:
             (is_valid, violations) - is_valid=False means BLOCK deployment in strict mode
         """
-        violations = []
-
         # Extract sovereignty config (optional in 0.7.1)
         sovereignty = contract.get("sovereignty")
         if not sovereignty:
             return True, []  # No sovereignty constraints = always valid
+        return self.check_placements(
+            sovereignty,
+            contract_placements(contract),
+            region_placed=region_placed_exposes(contract),
+        )
+
+    def check_placements(
+        self,
+        sovereignty: Mapping[str, Any],
+        placements: Sequence[Tuple[str, Optional[str]]],
+        *,
+        region_placed: AbstractSet[str] = frozenset(),
+    ) -> Tuple[bool, List[SovereigntyViolation]]:
+        """Evaluate ``sovereignty`` against each ``(where, region)`` placement.
+
+        :meth:`validate` passes the contract's own bindings
+        (:func:`contract_placements`); a provider hook passes the places its
+        emitted resources actually land (the GCP plugin passes every resource
+        ``location``), so a region the provider filled in by default is
+        checked where it is used. A placement whose region is ``None`` is a
+        binding on a region-placed platform that names none.
+
+        ``region_placed`` names the placements (their ``where``) that sit on a
+        :data:`REGION_PLACED_PLATFORMS` cloud. For those, a strict
+        jurisdiction refuses a region whose jurisdiction cannot be resolved
+        (check 3); elsewhere that stays a warning.
+        """
+        violations = []
 
         # Defaults MUST mirror the JSON schema's declared ``default`` keys
         # (``$defs.sovereignty`` in fluid-schema-0.7.x.json). They previously
@@ -397,16 +425,36 @@ class SovereigntyValidator:
             "crossBorderTransfer", DEFAULT_CROSS_BORDER_TRANSFER
         )
 
-        # Validate each expose's binding location
-        for expose in iter_exposes(contract):
-            binding = expose.get("binding", {})
-            location = binding.get("location", {})
-            region = location.get("region")
-
+        # Validate each place the contract puts data
+        for expose_id, region in placements:
+            # Check 0: a region-placed binding that names no region. It used
+            # to be skipped ("no region, nothing to check"), which failed OPEN:
+            # validate and ``plan --check-sovereignty`` printed PASS while the
+            # platform picked the region itself (BigQuery: the US multi-region,
+            # measured on an EU-only contract). The mode decides, like check 2:
+            # strict refuses, advisory warns, audit logs.
             if not region:
-                continue  # No region specified, skip validation
-
-            expose_id = expose.get("exposeId", "unknown")
+                violations.append(
+                    SovereigntyViolation(
+                        severity=severity_for(enforcement_mode),
+                        message=(
+                            "Binding declares no region, so where its data lives cannot "
+                            "be checked against the sovereignty policy (the platform "
+                            "would choose)"
+                        ),
+                        expose_id=expose_id,
+                        region_expected=allowed_regions or None,
+                        suggestion=(
+                            "Set binding.location.region"
+                            + (
+                                f" to one of: {', '.join(allowed_regions)}"
+                                if allowed_regions
+                                else ""
+                            )
+                        ),
+                    )
+                )
+                continue
 
             # Check 1: Denied regions — deliberately an error in EVERY mode.
             #
@@ -448,25 +496,42 @@ class SovereigntyValidator:
             if jurisdiction and jurisdiction not in UNCONSTRAINED_JURISDICTIONS:
                 region_jurisdiction = region_jurisdiction_map().get(region, "Unknown")
                 if region_jurisdiction != jurisdiction and region_jurisdiction != "Global":
-                    # "Unknown" is an inability to evaluate, not a violation, and
-                    # the two must not be conflated: a region the vendored table
-                    # does not carry says nothing about where it actually is.
-                    # Escalating it under strict would fail closed on every
-                    # contract using an unmapped region — defensible for a
-                    # sovereignty control, but a separate decision with its own
-                    # blast radius, not a side effect of making enforcementMode
-                    # mean what the schema says. Check 4 already draws this exact
-                    # line and refuses to let one Unknown agree with another.
+                    # "Unknown" is an inability to evaluate, not a violation: a
+                    # region the table does not carry says nothing about where
+                    # it is. On a cloud region (aws / gcp / azure) under
+                    # strict, though, a jurisdiction the policy cannot show is
+                    # a place it cannot allow: the GCP table lagged Google by
+                    # nine regions and the ASIA multi-region, and each went
+                    # through validate and `generate iac` with a warning
+                    # (me-central2 on an EU-only contract, measured). So
+                    # strict refuses it there, unless the operator vouched for
+                    # the region by naming it in allowedRegions. Advisory and
+                    # audit, and every other platform, keep the warning.
+                    # Check 4 still refuses to let one Unknown agree with
+                    # another.
                     unresolvable = region_jurisdiction == "Unknown"
+                    fail_closed = (
+                        unresolvable
+                        and enforcement_mode is EnforcementMode.STRICT
+                        and expose_id in region_placed
+                        and region not in allowed_regions
+                    )
                     violations.append(
                         SovereigntyViolation(
                             severity=(
-                                "warning" if unresolvable else severity_for(enforcement_mode)
+                                "warning"
+                                if unresolvable and not fail_closed
+                                else severity_for(enforcement_mode)
                             ),
                             message=f"Region '{region}' (jurisdiction: {region_jurisdiction}) "
                             f"does not match required jurisdiction: {jurisdiction}",
                             expose_id=expose_id,
-                            suggestion=f"Consider using regions in {jurisdiction} jurisdiction",
+                            suggestion=(
+                                f"Use a region in the {jurisdiction} jurisdiction; if "
+                                f"'{region}' is one, name it in sovereignty.allowedRegions"
+                                if fail_closed
+                                else f"Consider using regions in {jurisdiction} jurisdiction"
+                            ),
                         )
                     )
 
@@ -489,11 +554,9 @@ class SovereigntyValidator:
         # than being silently folded into a jurisdiction comparison.
         if data_residency and not cross_border_transfer:
             baseline: Any = _UNSET
-            for exp in iter_exposes(contract):
-                exp_region = exp.get("binding", {}).get("location", {}).get("region")
+            for exp_id, exp_region in placements:
                 if not exp_region:
                     continue
-                exp_id = exp.get("exposeId", "unknown")
                 exp_jurisdiction = region_jurisdiction_map().get(exp_region, "Unknown")
 
                 if exp_jurisdiction == "Unknown":
@@ -550,6 +613,111 @@ class SovereigntyValidator:
         is_valid = not has_errors
 
         return is_valid, violations
+
+
+#: Platforms whose bindings put data in a cloud region: a binding on one of
+#: these with a sovereignty block and no region is a finding (check 0), not a
+#: skip. Other platforms (``local`` above all, and those whose region lives
+#: outside the binding) keep the old behaviour: no region, nothing checked.
+REGION_PLACED_PLATFORMS = frozenset({"aws", "gcp", "azure"})
+
+#: Multi-region locations the vendored region table does not carry. BigQuery
+#: and Cloud Storage both name their multi-regions ``US`` (data centres in the
+#: United States) and ``EU`` (data centres in EU member states); left unmapped
+#: they resolved "Unknown", so the ``US`` a GCP binding with no region used to
+#: land in could not fail a ``jurisdiction: EU`` check.
+_MULTI_REGION_JURISDICTIONS = {"US": "US", "EU": "EU", "us": "US", "eu": "EU"}
+
+
+#: GCP locations the vendored dataset (dgl/cloud-regions) does not carry, by
+#: the countries their data centres are in, from Google's own location lists
+#: (docs.cloud.google.com/bigquery/docs/locations and
+#: /storage/docs/locations, read 2026-09-28). Kept here, not patched into the
+#: ODbL csv, for the reason ``VENDORED_CORRECTIONS`` gives. A location
+#: resolves only when every country it spans is in one jurisdiction: the
+#: dual-regions EUR5 (Belgium + London), EUR7 (London + Frankfurt) and EUR8
+#: (Frankfurt + Zürich) span two and stay Unknown, as does the ASIA
+#: multi-region ("data centres in Asia", several countries), which a strict
+#: jurisdiction then refuses on a cloud region (check 3).
+_GCP_LOCATION_COUNTRIES: Dict[str, Tuple[str, ...]] = {
+    "africa-south1": ("za",),  # Johannesburg
+    "asia-southeast3": ("th",),  # Bangkok
+    "europe-north2": ("se",),  # Stockholm
+    "europe-west10": ("de",),  # Berlin
+    "europe-west12": ("it",),  # Turin
+    "me-central1": ("qa",),  # Doha
+    "me-central2": ("sa",),  # Dammam
+    "me-west1": ("il",),  # Tel Aviv
+    "northamerica-south1": ("mx",),  # Mexico
+    # Cloud Storage predefined dual-regions (either case is accepted).
+    "asia1": ("jp",),  # Tokyo + Osaka
+    "eur4": ("fi", "nl"),  # Finland + Netherlands
+    "eur5": ("be", "uk"),  # Belgium + London
+    "eur7": ("uk", "de"),  # London + Frankfurt
+    "eur8": ("de", "ch"),  # Frankfurt + Zürich
+    "nam4": ("us",),  # Iowa + South Carolina
+}
+
+
+def _gcp_locations_not_vendored() -> Dict[str, str]:
+    """``location -> jurisdiction`` for :data:`_GCP_LOCATION_COUNTRIES`."""
+    resolved: Dict[str, str] = {}
+    for location, countries in _GCP_LOCATION_COUNTRIES.items():
+        found = {SovereigntyValidator.COUNTRY_JURISDICTIONS.get(c) for c in countries}
+        jurisdiction = found.pop() if len(found) == 1 else None
+        if jurisdiction is None:
+            continue
+        resolved[location] = jurisdiction
+        if location.isalnum():  # a dual-region code: EUR4 and eur4 alike
+            resolved[location.upper()] = jurisdiction
+    return resolved
+
+
+def region_placed_exposes(contract: Mapping[str, Any]) -> FrozenSet[str]:
+    """``exposeId`` of every expose bound to a :data:`REGION_PLACED_PLATFORMS` cloud."""
+    out: Set[str] = set()
+    for expose in iter_exposes(dict(contract)):
+        binding = expose.get("binding") or {}
+        if isinstance(binding, Mapping):
+            if str(binding.get("platform") or "").lower() in REGION_PLACED_PLATFORMS:
+                out.add(str(expose.get("exposeId", "unknown")))
+    return frozenset(out)
+
+
+def binding_region(binding: Mapping[str, Any]) -> Optional[str]:
+    """The region a binding places its data in, read where its emitter reads it.
+
+    ``location.region``, and for GCP also ``location.location``: the GCP
+    emitter falls back to it (``iac/providers/gcp.py``), so a check that read
+    ``region`` alone never saw a BigQuery dataset placed through ``location``.
+    """
+    location = binding.get("location") if isinstance(binding, Mapping) else None
+    if not isinstance(location, Mapping):
+        return None
+    region = location.get("region")
+    if not region and str(binding.get("platform") or "").lower() == "gcp":
+        region = location.get("location")
+    return str(region) if region else None
+
+
+def contract_placements(contract: Mapping[str, Any]) -> List[Tuple[str, Optional[str]]]:
+    """``(exposeId, region)`` for each expose the sovereignty checks evaluate.
+
+    An expose with a region is always listed. One without is listed with
+    ``None`` only on a :data:`REGION_PLACED_PLATFORMS` platform, where the
+    region is the platform's to pick; any other binding with no region is
+    left out, as before.
+    """
+    out: List[Tuple[str, Optional[str]]] = []
+    for expose in iter_exposes(dict(contract)):
+        binding = expose.get("binding") or {}
+        if not isinstance(binding, Mapping):
+            continue
+        region = binding_region(binding)
+        platform = str(binding.get("platform") or "").lower()
+        if region or platform in REGION_PLACED_PLATFORMS:
+            out.append((str(expose.get("exposeId", "unknown")), region))
+    return out
 
 
 def validate_sovereignty(contract: Dict[str, Any]) -> Tuple[bool, List[str]]:

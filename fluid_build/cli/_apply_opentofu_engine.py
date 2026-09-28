@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -38,13 +38,24 @@ from fluid_build.iac import build_module, get_iac_plugin, runner
 from fluid_build.iac.backend import (
     STATE_BACKEND_ENV,
     backend_location,
+    legacy_default_backend,
     parse_backend,
     resolve_state_backend_spec,
 )
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.credentials import build_tofu_env, credential_report
 from fluid_build.iac.naming import safe_ident
+from fluid_build.iac.state_migration import (
+    PENDING,
+    StateMigrationError,
+    StateReconciliation,
+    other_clouds,
+    read_state,
+    records_backend,
+)
+from fluid_build.iac.state_migration import reconcile_state_key as _reconcile_state
 
+from ._apply_cc_report import current_report
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
 from ._logging import info, warn
 from .generate_iac import _resolve_provider, native_actions
@@ -63,6 +74,14 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
 
     contract = _load_contract(args, logger)
     provider = _resolve_provider(contract, getattr(args, "provider", None) or "auto")
+    report = current_report()
+    if report is not None:
+        # Known from here on, so a refusal before the run is registered (a
+        # sovereignty refusal in the emitter, an init that fails) still
+        # reaches the Command Center with its product, version and platform.
+        # A run refused earlier is described from the base contract instead
+        # (``ApplyRunReport.finish``).
+        report.identify(contract=contract, provider=provider, environment=_applied_env(args))
 
     plugin = get_iac_plugin(provider)
     if plugin is None:
@@ -129,13 +148,63 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     cprint(f"  state:       {state_line}")
     cprint(f"  credentials: {', '.join(present) if present else 'none detected in environment'}")
 
-    init = runner.tofu_init(str(workdir), backend=backend is not None, env=env)
+    # The Command Center hears about the run now that the product, the
+    # provider and the environment are known (best effort; see
+    # cli/_apply_cc_report.py). Addresses and counts only, never tofu output.
+    if report is not None:
+        report.begin(
+            contract=contract,
+            provider=provider,
+            environment=_applied_env(args),
+            state=target.location,
+        )
+
+    init = runner.tofu_init(
+        str(workdir),
+        backend=backend is not None,
+        env=env,
+        reconfigure=recorded_legacy_backend(target),
+    )
     if not init.ok:
         raise CLIError(1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)})
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    if dry_run:
+        # A dry-run is plan only and writes no state, so it never moves any
+        # either: while the move is pending it plans against the old key, the
+        # read-only path ``fluid diff`` takes (``read_target``). The copy is
+        # left to the first real apply, which a plan-only CI role with
+        # read-only state access never runs.
+        read = read_target(target, provider, env, logger)
+        if read is not target:
+            target = read
+            module, actions = emit_module(plugin, contract, target, logger)
+            module_path.write_text(module, encoding="utf-8")
+            init = runner.tofu_init(str(workdir), backend=True, env=env, reconfigure=True)
+            if not init.ok:
+                raise CLIError(
+                    1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)}
+                )
+    else:
+        # State a previous release kept at the key without the provider moves
+        # to this provider's key (OpenTofu's own ``init -migrate-state``), so
+        # the first apply after the upgrade does not plan every resource as
+        # new (see ``iac.state_migration``). Before anything reads the state.
+        reconcile_state_key(target, provider, env, logger, migrate=True)
+
+    # One state, two clouds: a key that does not name the provider (the
+    # shared ``fluid/terraform.tfstate`` a bucket-only --state-backend gives a
+    # contract without packaging, or an explicit key used for both) can hold
+    # the other cloud's resources, which this plan would destroy.
+    guard_state_shared_with_another_cloud(target, provider, env)
 
     # Pre-plan region guard. A module now pins the region its bindings name,
     # and moving a contract's resources to it would not show as a destroy.
     _guard_region_move(plugin, contract, str(workdir), env)
+
+    # A dataset an older forge-cli applied with an authoritative access list has
+    # its stale grants revoked once, before its grants become member resources.
+    _reconcile_with_state(plugin, module_path, str(workdir), env, logger)
 
     # Pre-plan ownership-transition guard (RFC-packaging-modes.md file 10).
     # Runs BEFORE _adopt_existing — brownfield adoption is precisely the
@@ -153,6 +222,22 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
         raise CLIError(1, "opentofu_plan_failed", {"error": _tail(plan.stderr or plan.stdout)})
     changes = runner.change_summary(plan)
     cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
+    if report is not None:
+        report.record_infra(
+            planned=changes,
+            applied=None,
+            resources=_module_addresses(module),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+
+    # Revoking a grant destroys a member resource and loses no data: only the
+    # removals of data-bearing resources reach the data-loss gate.
+    data_changes, revoked = _data_bearing_changes(changes, runner.planned_removals(plan))
+    if revoked:
+        cprint(
+            f"  {len(revoked)} access grant(s) or policy tag(s) removed (access revoked, no "
+            "data lost; not gated): " + ", ".join(revoked)
+        )
 
     # Report what the plan's ``lifecycle.ignore_changes`` deliberately hides.
     # Without this, a contract whose column types no longer match the live
@@ -164,22 +249,22 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     # Data-loss gate — `tofu` has no CTAS/CLONE data snapshot (see
     # AUTOGEN_SPIKE.md, risk R1), so a destructive plan fails closed.
     allow_data_loss = bool(getattr(args, "allow_data_loss", False))
-    if _data_loss_blocked(changes, allow_data_loss):
+    if _data_loss_blocked(data_changes, allow_data_loss):
         raise CLIError(
             1,
             "opentofu_data_loss_gate",
             {
-                "error": f"plan destroys {changes['remove']} resource(s); `tofu` does not "
+                "error": f"plan destroys {data_changes['remove']} resource(s); `tofu` does not "
                 "snapshot data — re-run with --allow-data-loss to proceed"
             },
         )
-    if allow_data_loss and int(changes.get("remove", 0)) > 0:
+    if allow_data_loss and int(data_changes.get("remove", 0)) > 0:
         # Audit-trail: every destructive apply through the override is
         # logged at WARNING so CI log-scrapers + operators have a
         # paper-trail. Matches the same posture as the native engine's
         # _verify_plan_binding bypass warning.
         cprint(
-            f"\n  ⚠️  --allow-data-loss: {changes['remove']} resource(s) will be "
+            f"\n  ⚠️  --allow-data-loss: {data_changes['remove']} resource(s) will be "
             "DESTROYED and no pre-replace snapshot is taken — this engine has "
             "no CTAS/CLONE step, so `fluid rollback` will have no restore point."
         )
@@ -188,7 +273,7 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
             "will be destroyed by `tofu apply` with NO pre-replace snapshot "
             "(`fluid rollback` has no restore point). Provider: %s. Plan changes: "
             "+%d ~%d -%d.",
-            int(changes.get("remove", 0)),
+            int(data_changes.get("remove", 0)),
             provider,
             changes["add"],
             changes["change"],
@@ -198,11 +283,11 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
             logger,
             "opentofu_destructive_gate_override",
             provider=provider,
-            resources_to_destroy=int(changes.get("remove", 0)),
+            resources_to_destroy=int(data_changes.get("remove", 0)),
             **changes,
         )
 
-    if bool(getattr(args, "dry_run", False)):
+    if dry_run:
         cprint("\ndry-run: plan only — not applying.")
         info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
         return 0
@@ -225,9 +310,43 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
         record(applied)
 
     cprint(f"\n  tofu apply complete: +{applied['add']} ~{applied['change']} -{applied['remove']}")
+    if report is not None:
+        report.record_infra(
+            planned=changes, applied=applied, resources=_module_addresses(module), dry_run=False
+        )
 
     info(logger, "opentofu_apply_ok", provider=provider, **applied)
     return 0
+
+
+def _applied_env(args) -> Optional[str]:
+    """The overlay env this apply is for: ``--env``, else the bundle's own."""
+    env = getattr(args, "env", None)
+    if env:
+        return str(env)
+    bundle = getattr(args, "bundle", None)
+    if not bundle:
+        return None
+    try:
+        from fluid_build.forge.core.bundle import read_bundle_source
+
+        source = read_bundle_source(Path(bundle)) or {}
+    except Exception:  # noqa: BLE001 - the env is a report field, not a gate
+        return None
+    return str(source["env"]) if source.get("env") else None
+
+
+def _module_addresses(module_text: str) -> List[str]:
+    """``type.name`` of every resource the emitted module declares."""
+    try:
+        doc = json.loads(module_text)
+    except ValueError:
+        return []
+    out: List[str] = []
+    for rtype, by_name in sorted((doc.get("resource") or {}).items()):
+        if isinstance(by_name, dict):
+            out.extend(f"{rtype}.{name}" for name in sorted(by_name))
+    return out
 
 
 @dataclass(frozen=True)
@@ -239,6 +358,9 @@ class StateTarget:
     backend: Optional[Dict[str, Any]]
     #: ``--state-backend``, ``FLUID_STATE_BACKEND`` or ``default``.
     origin: str
+    #: Where a release before the provider-keyed default kept this state, when
+    #: that differs from ``backend`` (``iac.backend.legacy_default_backend``).
+    legacy_backend: Optional[Dict[str, Any]] = None
 
     @property
     def location(self) -> str:
@@ -269,12 +391,21 @@ def resolve_state_target(args, contract: Mapping[str, Any], provider: str) -> St
     # bucket instead of the workspace it wipes after every run. That job
     # applies every product with the one value, so a bucket-only value keys
     # state per contract for all of them, packaging block or not.
+    #
+    # The provider is part of every per-contract default key, so one contract
+    # applied to aws and to gcp (``--env`` overlays) keeps two states: with
+    # one, each cloud's plan read the other's resources as orphans to destroy.
     backend_spec, backend_origin = resolve_state_backend_spec(getattr(args, "state_backend", None))
+    per_contract = backend_origin == STATE_BACKEND_ENV
     try:
         backend = parse_backend(
             backend_spec,
             contract,
-            per_contract_default=backend_origin == STATE_BACKEND_ENV,
+            per_contract_default=per_contract,
+            provider=provider,
+        )
+        legacy = legacy_default_backend(
+            backend_spec, contract, per_contract_default=per_contract, provider=provider
         )
     except ValueError as exc:
         raise CLIError(
@@ -292,7 +423,139 @@ def resolve_state_target(args, contract: Mapping[str, Any], provider: str) -> St
         / provider
         / safe_ident(contract.get("id") or "contract")
     )
-    return StateTarget(workdir=workdir, backend=backend, origin=backend_origin)
+    return StateTarget(
+        workdir=workdir, backend=backend, origin=backend_origin, legacy_backend=legacy
+    )
+
+
+def recorded_legacy_backend(target: StateTarget) -> bool:
+    """True when the workdir's ``.terraform/`` recorded the pre-provider-key backend.
+
+    A plain ``tofu init`` stops there with "Backend configuration changed";
+    the caller inits with ``-reconfigure`` instead, and :func:`reconcile_state_key`
+    moves the state, so nothing is left behind.
+    """
+    return target.legacy_backend is not None and records_backend(
+        target.workdir, target.legacy_backend
+    )
+
+
+def reconcile_state_key(
+    target: StateTarget,
+    provider: str,
+    env: Mapping[str, str],
+    logger: logging.Logger,
+    *,
+    migrate: bool,
+) -> Optional[StateReconciliation]:
+    """Bring state a previous release kept without the provider in its key along.
+
+    Runs after the workdir's ``tofu init`` on ``target.backend``.
+    ``migrate=True`` (``fluid apply``) copies it with ``tofu init
+    -migrate-state``; ``migrate=False`` (the read-only drift pass) only
+    reports it, and :func:`read_target` then points the read at the old key.
+    ``None`` when there is no old key to look at.
+    """
+    if target.backend is None or target.legacy_backend is None:
+        return None
+    try:
+        outcome = _reconcile_state(
+            workdir=target.workdir,
+            current=target.backend,
+            legacy=target.legacy_backend,
+            provider=provider,
+            env=env,
+            migrate=migrate,
+            logger=logger,
+        )
+    except StateMigrationError as exc:
+        raise CLIError(
+            1,
+            exc.code,
+            {
+                "error": str(exc),
+                "state": backend_location(target.backend),
+                "legacy_state": backend_location(target.legacy_backend),
+            },
+        )
+    line = outcome.summary()
+    if line:
+        cprint(f"  state move:  {line}")
+        info(
+            logger,
+            "opentofu_state_key_reconciled",
+            outcome=outcome.outcome,
+            state=backend_location(target.backend),
+            legacy_state=backend_location(target.legacy_backend),
+            resources=outcome.resources,
+        )
+    return outcome
+
+
+def _key_names_provider(backend: Mapping[str, Any], provider: str) -> bool:
+    """True when the backend's key (or GCS prefix) has ``provider`` as a path segment."""
+    if "s3" in backend:
+        path = str((backend.get("s3") or {}).get("key") or "")
+    elif "gcs" in backend:
+        path = str((backend.get("gcs") or {}).get("prefix") or "")
+    else:
+        return False
+    return provider in path.split("/")
+
+
+def guard_state_shared_with_another_cloud(
+    target: StateTarget, provider: str, env: Mapping[str, str]
+) -> None:
+    """Refuse a remote state whose key names no provider and holds another cloud's resources.
+
+    The per-provider default keys (``fluid/<id>/<provider>/...``) cannot be
+    shared by two clouds, and local state lives in a per-provider workdir, so
+    only a remote key that does not name the provider is read (one ``tofu
+    state pull``). Whose resources they are is the migration's own rule
+    (``state_migration.other_clouds``). Without this, the gcp plan on a key
+    the aws apply wrote reads the aws resources as orphans, and
+    ``--allow-data-loss`` destroys them.
+    """
+    if target.backend is None or _key_names_provider(target.backend, provider):
+        return
+    location = backend_location(target.backend)
+    try:
+        doc = read_state(target.workdir, env)
+    except StateMigrationError as exc:
+        raise CLIError(1, exc.code, {"error": str(exc), "state": location})
+    others = sorted(other_clouds(doc.resources, provider))
+    if not others:
+        return
+    raise CLIError(
+        1,
+        "state_shared_with_another_provider",
+        {
+            "error": (
+                f"{location} holds resources of the {', '.join(others)} provider, and this is "
+                f"the {provider} apply: its plan would read them as orphans to destroy. Give "
+                "each provider its own state, with a key that names the provider in "
+                "--state-backend (for example fluid/<id>/<provider>/terraform.tfstate) or a "
+                f"bucket-only {STATE_BACKEND_ENV}, which keys state by contract and provider"
+            ),
+            "state": location,
+            "providers": others,
+        },
+    )
+
+
+def read_target(
+    target: StateTarget, provider: str, env: Mapping[str, str], logger: logging.Logger
+) -> StateTarget:
+    """The target a read-only caller reads: the old key while its move is pending.
+
+    Call after the workdir's init on ``target.backend``. When this returns a
+    different target, the caller re-emits the module on its backend and
+    re-inits with ``-reconfigure``.
+    """
+    outcome = reconcile_state_key(target, provider, env, logger, migrate=False)
+    if outcome is None or outcome.outcome != PENDING:
+        return target
+    return replace(target, backend=dict(outcome.legacy))
 
 
 def emit_module(
@@ -684,6 +947,101 @@ def _report_suppressed_drift(
         "materialized types. Run `fluid verify --strict` to gate on it."
     )
     warn(logger, "opentofu_suppressed_drift_reported", tables=[r["table"] for r in drift])
+
+
+#: Resource types whose destroy revokes access and deletes no data: a member grant,
+#: a Lake Formation permission, a policy tag or its taxonomy. Removing one is how a
+#: contract revokes a reader or lifts a column restriction, so the data-loss gate
+#: does not count it (it did, and a revocation needed --allow-data-loss, the flag
+#: that also lets the same plan drop tables). The same split policy-as-code gates
+#: over ``tofu show -json`` make by resource type (OPA's Terraform tutorial weighs
+#: deletes per type). A key's IAM grant is not here: without it BigQuery cannot
+#: decrypt the table.
+ACCESS_ONLY_RESOURCE_TYPES = frozenset(
+    {
+        "google_bigquery_dataset_iam_member",
+        "google_bigquery_table_iam_member",
+        "google_storage_bucket_iam_member",
+        "google_data_catalog_policy_tag_iam_member",
+        "google_data_catalog_policy_tag",
+        "google_data_catalog_taxonomy",
+        "aws_lakeformation_permissions",
+    }
+)
+
+
+def _data_bearing_changes(
+    changes: Mapping[str, int], removals: List[Tuple[str, str]]
+) -> Tuple[Dict[str, int], List[str]]:
+    """``(changes with only data-bearing removals, addresses of access-only removals)``.
+
+    Fails closed: when the plan's per-resource events do not account for every
+    removal in its summary (an older ``tofu``, a truncated stream), every removal
+    counts, as before.
+    """
+    counted = {key: int(changes.get(key, 0)) for key in ("add", "change", "remove")}
+    if len(removals) != counted["remove"]:
+        return counted, []
+    revoked = [addr for addr, kind in removals if kind in ACCESS_ONLY_RESOURCE_TYPES]
+    counted["remove"] -= len(revoked)
+    return counted, revoked
+
+
+def _reconcile_with_state(
+    plugin: Any,
+    module_path: Path,
+    workdir: str,
+    env: Mapping[str, str],
+    logger: logging.Logger,
+    *,
+    announce: bool = True,
+) -> List[Dict[str, Any]]:
+    """Let the plugin patch the written module against the current state.
+
+    Optional plugin capability ``reconcile_state(module, state_resources)``: the GCP
+    plugin uses it once per dataset an older forge-cli applied with an authoritative
+    access list, so a grant the contract no longer makes is revoked rather than left
+    unmanaged (``iac/providers/gcp.py::reconcile_legacy_dataset_access``). A no-op for
+    a fresh workdir and for plugins without it. ``fluid diff`` calls it too
+    (``announce=False``), so its plan shows the revocation the apply will make.
+    """
+    reconcile = getattr(plugin, "reconcile_state", None)
+    if not callable(reconcile):
+        return []
+    state = runner.tofu_state_resources(workdir, env=env)
+    if not state:
+        return []
+    module = json.loads(module_path.read_text(encoding="utf-8"))
+    reports = reconcile(module, state)
+    if not reports:
+        return []
+    blocked = [r for r in reports if r.get("blocked")]
+    if blocked:
+        raise CLIError(
+            1,
+            "opentofu_dataset_access_unreconciled",
+            {
+                "error": "state holds dataset(s) an older forge-cli applied with an "
+                "authoritative access list, and every entry of it is a grant the contract "
+                "no longer makes, so it cannot be narrowed in place: "
+                + "; ".join(f"{r['dataset']}: {', '.join(r['revoked'])}" for r in blocked),
+                "remediation": [
+                    "Revoke those entries on the dataset (bq update or the console), or "
+                    "keep one of them in accessPolicy for this apply, then re-run."
+                ],
+            },
+        )
+    module_path.write_text(json.dumps(module, indent=2), encoding="utf-8")
+    if not announce:
+        return reports
+    for report in reports:
+        cprint(
+            f"\n  dataset {report['dataset']}: its access list was written by an older "
+            "forge-cli; this apply revokes the entries no grant of the contract covers: "
+            + ", ".join(report["revoked"])
+        )
+    warn(logger, "gcp_dataset_access_reconciled", datasets=reports)
+    return reports
 
 
 def _data_loss_blocked(changes: Mapping[str, int], allow_data_loss: bool) -> bool:

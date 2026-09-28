@@ -137,6 +137,31 @@ jobs:
             -q -p no:randomly --junitxml=state-drift.xml
           .venv/bin/python scripts/ci/assert_lane_coverage.py state-drift.xml \
             --require "state drift=tests/iac/test_iac_state_drift_moto.py"
+      # The default state key names the provider, and the first apply after the
+      # upgrade moves the old key's state with `tofu init -migrate-state`. Only a
+      # real apply, move and plan prove the plan after it changes nothing.
+      - name: Stage 1 — per-provider state key and its migration (tofu vs moto, creds-free)
+        run: |
+          .venv/bin/python -m pytest tests/iac/test_iac_state_key_migration_moto.py \
+            -q -p no:randomly --junitxml=state-key-migration.xml
+          .venv/bin/python scripts/ci/assert_lane_coverage.py state-key-migration.xml \
+            --require "state key migration=tests/iac/test_iac_state_key_migration_moto.py"
+      # Governance parity (retention, CMEK, column restrictions, mapped
+      # principals): tofu validate of each governed GCP shape; a real plan and
+      # apply with terraform-provider-google against an in-process stand-in for
+      # the BigQuery REST API (the goccy emulator crashes the provider on
+      # apply), which is where the data-loss gate decides; and the Lake
+      # Formation excluded columns planned against moto. Fails if a file only
+      # skipped.
+      - name: Stage 1 — governance parity (tofu vs BigQuery stand-in and moto, creds-free)
+        run: |
+          .venv/bin/python -m pytest tests/iac/test_iac_gcp_governance_plan.py \
+            tests/iac/test_iac_aws_column_restrictions.py tests/iac/test_iac_gcp_governance.py \
+            -q -p no:randomly --junitxml=governance-parity.xml
+          .venv/bin/python scripts/ci/assert_lane_coverage.py governance-parity.xml \
+            --require "GCP governance plan=tests/iac/test_iac_gcp_governance_plan.py" \
+            --require "AWS column restrictions=tests/iac/test_iac_aws_column_restrictions.py" \
+            --require "GCP governance validate=tests/iac/test_iac_gcp_governance.py"
 
   # -------------------------------------------------------------------
   # Stage 2 — docker emulators. PR + push.

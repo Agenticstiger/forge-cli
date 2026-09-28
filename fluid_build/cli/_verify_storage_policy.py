@@ -401,6 +401,14 @@ def storage_policy(
     result = StoragePolicy()
     loc = binding.get("location") or {}
     bucket = str(loc.get("bucket") or "")
+    # policy.authz.columnRestrictions, checked against Lake Formation's permissions.
+    from fluid_build.cli._verify_lf_columns import column_restrictions_dimension
+
+    columns = column_restrictions_dimension(
+        expose_id, expose, binding, region=region, factory=factory
+    )
+    if columns is not None:
+        result.dimensions["columnRestrictions"] = columns
     try:
         retention = aws_storage.retention_for(
             {"exposeId": expose_id, "lifecycle": expose.get("lifecycle"), "binding": binding}

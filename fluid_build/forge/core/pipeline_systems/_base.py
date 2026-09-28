@@ -520,7 +520,14 @@ class BasePipelineTemplate:
                 "fluid diff ${CONTRACT:-contract.fluid.yaml} --exit-on-drift "
                 "--env ${FLUID_ENV:-dev}"
             ),
-            "plan": "fluid plan ${CONTRACT:-contract.fluid.yaml} --out runtime/plan.json",
+            # --check-sovereignty: the plan stage runs the contract's own
+            # sovereignty policy (the provider hook, else the policy engine)
+            # and a strict violation fails it, before stage 7 touches a cloud.
+            # A contract with no sovereignty block prints NOT CHECKED and passes.
+            "plan": (
+                "fluid plan ${CONTRACT:-contract.fluid.yaml} --out runtime/plan.json "
+                "--check-sovereignty"
+            ),
             # A build id needs `--mode amend-and-build` alongside
             # `--build-id`: the id only FILTERS, it does not opt into running
             # builds (`fluid apply --help`). The retired `--build` did both.
@@ -1109,10 +1116,12 @@ class BasePipelineTemplate:
                 # The plan records the mode it was made for, and stage 7's
                 # ``apply_plan_mode_mismatch`` gate refuses any other. So
                 # stage 6 plans for APPLY_MODE, the one mode stage 7 applies.
+                # --check-sovereignty makes a strict sovereignty violation fail
+                # the plan stage, before stage 7 reaches a cloud.
                 command=(
                     f'set -eu; {_needs_bundle(6)}MODE="{p("APPLY_MODE")}"; '
                     f"fluid plan {BUNDLE_PATH} "
-                    f'--out runtime/plan.json --mode "$MODE" {env}'
+                    f'--out runtime/plan.json --mode "$MODE" {env} --check-sovereignty'
                 ),
             ),
             StageSpec(

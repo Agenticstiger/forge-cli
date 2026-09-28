@@ -184,7 +184,14 @@ def _plan_and_classify(
     from fluid_build.iac import runner
     from fluid_build.iac.credentials import build_tofu_env
 
-    from ._apply_opentofu_engine import _guard_region_move, _tail, emit_module
+    from ._apply_opentofu_engine import (
+        _guard_region_move,
+        _reconcile_with_state,
+        _tail,
+        emit_module,
+        read_target,
+        recorded_legacy_backend,
+    )
 
     workdir: Path = target.workdir
     location = target.location
@@ -200,18 +207,45 @@ def _plan_and_classify(
 
         env = build_tofu_env()
         env.update(plugin.credential_env(env))
-        init = runner.tofu_init(str(workdir), backend=target.backend is not None, env=env)
+        init = runner.tofu_init(
+            str(workdir),
+            backend=target.backend is not None,
+            env=env,
+            reconfigure=recorded_legacy_backend(target),
+        )
         if not init.ok:
             return _error(
                 "OpenTofu could not initialise the apply's workdir: "
                 + _tail(init.stderr or init.stdout, _MAX_DETAIL_CHARS),
                 location,
             )
+        # State a previous release kept at the key without the provider is
+        # read where it is until ``fluid apply`` moves it: this pass writes
+        # no state, and a drift gate that runs before the first upgraded
+        # apply must still see the real one.
+        try:
+            read = read_target(target, plugin.name, env, logger)
+        except CLIError as exc:
+            return _error(_cli_error_text(exc), location)
+        if read is not target:
+            target, location = read, read.location
+            module, _actions = emit_module(plugin, contract, target, logger)
+            module_path.write_text(module, encoding="utf-8")
+            init = runner.tofu_init(str(workdir), backend=True, env=env, reconfigure=True)
+            if not init.ok:
+                return _error(
+                    "OpenTofu could not initialise the apply's workdir on the old state key: "
+                    + _tail(init.stderr or init.stdout, _MAX_DETAIL_CHARS),
+                    location,
+                )
         # The apply refuses to run when state holds the contract's resources in
         # another region; the refresh would find them gone and this pass would
         # call that "deleted outside the apply".
         try:
             _guard_region_move(plugin, contract, str(workdir), env)
+            # The apply's one-time revocation of an older access list's stale
+            # grants, so this plan shows what the apply will do.
+            _reconcile_with_state(plugin, module_path, str(workdir), env, logger, announce=False)
         except CLIError as exc:
             return _error(_cli_error_text(exc), location)
 
