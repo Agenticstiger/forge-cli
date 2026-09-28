@@ -68,6 +68,10 @@ sources each IaC plugin requires:
   an operator decides. Moving the wrong state is the one mistake that cannot
   be undone by the next apply.
 
+OpenTofu's built-in provider (``terraform.io/builtin/terraform``, which
+``terraform_data`` belongs to) is left out of the attribution: it names no
+cloud, so a state is attributed by its other resources.
+
 A read-only caller (``fluid diff``, ``fluid verify --state-drift``) asks with
 ``migrate=False`` and reads the old key while the move is pending, so a drift
 gate that runs before the first upgraded apply still sees the real state.
@@ -81,7 +85,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 
 from . import runner
 from .backend import backend_location
@@ -177,7 +181,17 @@ def plugin_sources(provider: str) -> FrozenSet[str]:
 
 
 def state_sources(resources: Iterable[Mapping[str, Any]]) -> FrozenSet[str]:
-    """``namespace/type`` of every provider the state's resources name."""
+    """``namespace/type`` of every provider the state's resources name.
+
+    OpenTofu's built-in provider (``terraform.io/builtin/terraform``: the
+    ``terraform_data`` resource, the ``terraform_remote_state`` data source)
+    is not one: it ships inside the binary, any module can use it, and it
+    says nothing about which cloud a state is. The GCP plugin writes a
+    ``terraform_data`` beside a partitioned table (the trigger that replaces
+    it when its partitioning changes), and counted as a provider no plugin
+    emits it made every such gcp state "ambiguous", refusing the move and
+    with it every apply, dry-run and diff on the product.
+    """
     found = set()
     for resource in resources:
         match = _PROVIDER_ADDR_RE.search(str(resource.get("provider") or ""))
@@ -187,8 +201,15 @@ def state_sources(resources: Iterable[Mapping[str, Any]]) -> FrozenSet[str]:
             found.add("<unreadable>")
             continue
         parts = match.group(1).lower().split("/")
+        if _is_builtin(parts):
+            continue
         found.add("/".join(parts[-2:]))
     return frozenset(found)
+
+
+def _is_builtin(parts: List[str]) -> bool:
+    """``terraform.io/builtin/<type>``: a provider compiled into OpenTofu itself."""
+    return len(parts) >= 3 and parts[-3] == "terraform.io" and parts[-2] == "builtin"
 
 
 def classify(resources: Iterable[Mapping[str, Any]], provider: str) -> Tuple[str, str]:
@@ -197,7 +218,10 @@ def classify(resources: Iterable[Mapping[str, Any]], provider: str) -> Tuple[str
     ``detail`` names the owner for ``"other"`` and the reason for
     ``"ambiguous"``. See the module docstring for the rule.
     """
+    resources = list(resources)
     sources = state_sources(resources)
+    if resources and not sources:
+        return "ambiguous", "only OpenTofu built-in resources, which name no cloud"
     by_plugin = _sources_by_plugin(provider)
     known = frozenset().union(*by_plugin.values())
     unknown = sources - known

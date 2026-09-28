@@ -518,3 +518,55 @@ def test_a_real_apply_asks_for_the_move(monkeypatch, tmp_path):
     seen = _engine_until_the_guard(monkeypatch, tmp_path, dry_run=False)
     assert seen["migrate"] is True
     assert len(seen["inits"]) == 1
+
+
+# ── OpenTofu's built-in provider names no cloud ──────────────────────────
+#
+# The GCP plugin writes a ``terraform_data`` beside a table whose partitions
+# expire (``lifecycle.retention`` with ``expire: true``): the trigger that
+# replaces the table when its partitioning changes. OpenTofu records it under
+# ``provider["terraform.io/builtin/terraform"]``. Read as a provider no plugin
+# emits, it made the legacy state of every such gcp product "ambiguous", and
+# the refusal blocked apply, dry-run and diff (measured on the integration of
+# the governance branch with this one).
+
+_BUILTIN = 'provider["terraform.io/builtin/terraform"]'
+_GCP_LEGACY_WITH_TRIGGER = _state(
+    "55555555-eeee",
+    _resource("google_bigquery_dataset", "hunt_retention", _GOOGLE),
+    _resource("google_bigquery_table", "hunt_retention_events", _GOOGLE),
+    _resource("terraform_data", "hunt_retention_events_partitioning", _BUILTIN),
+)
+
+
+def test_a_gcp_state_holding_the_partition_trigger_is_the_gcp_apply_s():
+    resources = _GCP_LEGACY_WITH_TRIGGER["resources"]
+    assert mig.classify(resources, "gcp") == ("mine", "gcp")
+    assert mig.classify(resources, "aws")[0] == "other"
+    assert mig.other_clouds(resources, "aws") == frozenset({"gcp"})
+
+
+def test_a_state_of_only_built_in_resources_is_still_not_guessed():
+    verdict, detail = mig.classify([_resource("terraform_data", "t", _BUILTIN)], "gcp")
+    assert verdict == "ambiguous"
+    assert "built-in" in detail
+
+
+def test_the_gcp_state_with_the_trigger_is_moved_and_nothing_pins_the_built_in(fake, tmp_path):
+    moved = _state("66666666-ffff", *_GCP_LEGACY_WITH_TRIGGER["resources"])
+    tofu = fake([_EMPTY, _EMPTY, moved], legacy=_GCP_LEGACY_WITH_TRIGGER)
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    outcome = mig.reconcile_state_key(
+        workdir=workdir,
+        current={"s3": {"bucket": "b", "key": "fluid/p/gcp/terraform.tfstate"}},
+        legacy=_LEGACY,
+        provider="gcp",
+        env={},
+        migrate=True,
+    )
+    assert outcome.outcome == mig.MIGRATED
+    assert outcome.resources == 3
+    assert len(tofu.copies) == 1
+    pinned = tofu.modules["move-copy"]["terraform"].get("required_providers") or {}
+    assert [spec["source"] for spec in pinned.values()] == ["hashicorp/google"]
