@@ -299,12 +299,17 @@ class BigQueryLanding:
         return f"{self.project or '<default project>'}.{self.dataset}.{self.table}"
 
     def load_target(self) -> Dict[str, Any]:
-        """The target ``_bigquery_load.load_file`` takes."""
+        """The target ``_bigquery_load.load_file`` takes.
+
+        An undeclared region passes no location, so the job runs where the
+        table itself is (``load_file`` reads the table's own), never in the
+        IaC's default guessed on the table's behalf.
+        """
         return {
             "project": self.project,
             "dataset": self.dataset,
             "table": self.table,
-            "location": self.location,
+            "location": self.location if self.region_declared else None,
         }
 
 
@@ -649,6 +654,10 @@ def _read_s3_prefix(
     return f"{prefix}*.{_FILE_FORMAT_EXT[fmt]}", fmt, "aws"
 
 
+#: The dataset location ``iac/providers/gcp.py::_emit_bigquery`` gives a
+#: binding that names no region.
+_IAC_DEFAULT_BIGQUERY_LOCATION = "US"
+
 #: The ``binding.location`` keys a BigQuery table is named by.
 _BIGQUERY_LOCATION_KEYS = ("project", "dataset", "table", "view", "region", "location")
 
@@ -679,11 +688,15 @@ def _bigquery_target(expose: Mapping[str, Any], where: str) -> Optional[Dict[str
             )
     target = bigquery_load_target({**dict(binding), "location": resolved_loc}, expose)
     if target is not None:
-        # ``bigquery_load_target`` falls back to ``US``, the IaC's own default;
-        # a sovereignty check must know the location was not declared.
-        target["location_declared"] = bool(
-            resolved_loc.get("region") or resolved_loc.get("location")
-        )
+        declared = bool(resolved_loc.get("region") or resolved_loc.get("location"))
+        # ``bigquery_load_target`` names no location for a binding that
+        # declares none, so the load job runs where the table is
+        # (``BigQueryLanding.load_target``). The sovereignty checks reason
+        # about the dataset ``_emit_bigquery`` creates for such a binding,
+        # which is the IaC's own default, ``US``; they must also know the
+        # location was not declared.
+        target["location"] = target.get("location") or _IAC_DEFAULT_BIGQUERY_LOCATION
+        target["location_declared"] = declared
     return target
 
 
@@ -1251,9 +1264,7 @@ def remove_staged(paths: Sequence[Path]) -> None:
     """Delete staged upstream copies; a file already gone is not an error."""
     for path in paths:
         try:
-            Path(path).unlink()
-        except FileNotFoundError:
-            pass
+            Path(path).unlink(missing_ok=True)
         except OSError as exc:  # pragma: no cover - reported, never raised
             LOG.warning("embedded_sql_staged_input_not_removed path=%s error=%s", path, exc)
 
