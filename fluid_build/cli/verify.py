@@ -1134,7 +1134,6 @@ def _gcp_provisioned_kind(binding: Any) -> str:
     return _GCP_NO_VERIFIER if target else ""
 
 
-@_traced_stage("verify")
 def _state_drift_section(
     contract: Dict[str, Any], args: argparse.Namespace, logger: logging.Logger
 ) -> Optional[Any]:
@@ -1191,6 +1190,7 @@ def _state_drift_fails(report: Optional[Any], args: argparse.Namespace) -> bool:
     return True
 
 
+@_traced_stage("verify")
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Main verify command execution"""
 

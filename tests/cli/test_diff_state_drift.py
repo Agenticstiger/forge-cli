@@ -463,3 +463,48 @@ def test_verify_state_drift_without_state_is_a_note(verify_contract, monkeypatch
     code, _ = _verify(verify_contract, monkeypatch, none, "--state-drift")
     assert code == 0
     assert "State drift check: not run (no apply state here)" in capsys.readouterr().out
+
+
+class _Span:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.attrs: Dict[str, Any] = {}
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attrs[key] = value
+
+    def set_status(self, _status: Any) -> None:
+        return None
+
+    def __enter__(self) -> "_Span":
+        return self
+
+    def __exit__(self, *_exc: Any) -> bool:
+        return False
+
+
+class _Tracer:
+    def __init__(self) -> None:
+        self.spans: List[_Span] = []
+
+    def start_as_current_span(self, name: str) -> _Span:
+        self.spans.append(_Span(name))
+        return self.spans[-1]
+
+
+def test_verify_with_tracing_on_opens_one_verify_span_around_the_whole_run(
+    verify_contract, monkeypatch
+):
+    """With OpenTelemetry on, ``fluid verify --state-drift`` is one ``fluid.verify``
+    span around ``run``: the stage span carries run's exit code, and the state
+    pass (which returns a report, not an exit code) is not a stage of its own."""
+    tracer = _Tracer()
+    monkeypatch.setattr("fluid_build.observability.tracing._get_tracer", lambda: tracer)
+    monkeypatch.setenv("FLUID_RUN_ID", "run-under-test")
+
+    code, _ = _verify(verify_contract, monkeypatch, _drifted(), "--state-drift")
+
+    assert code == 1
+    assert [span.name for span in tracer.spans] == ["fluid.verify"]
+    assert tracer.spans[0].attrs["fluid.exit_code"] == 1
+    assert tracer.spans[0].attrs["fluid.run_id"] == "run-under-test"
