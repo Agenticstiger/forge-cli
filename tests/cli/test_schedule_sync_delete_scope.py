@@ -277,3 +277,237 @@ class TestSharedDagRootWithRealRsync:
         )
         assert schedule_sync.run(args) == 0
         assert sorted(p.name for p in root.iterdir()) == ["new.product", "orders"]
+
+
+# ── The DAG an env's directory replaced ───────────────────────────────────
+#
+# forge-cli 0.16.6 and earlier synced a product's DAGs to ``<product>/`` with
+# dag id ``<product>__<build>``, whatever the env. An env's DAGs now live in
+# ``<product>__<env>/`` as ``<product>__<env>__<build>``, and ``--delete-scope
+# product`` mirrors only that directory. Measured on the demo's bronze product:
+# after the first sync on the new release the destination held both DAGs, each
+# ``FLUID_ENV_NAME = 'aws'`` and ``SCHEDULE = '0 */4 * * *'``, so Airflow ran two
+# ``fluid apply --env aws`` of one product against one state at the same minute.
+
+_PRODUCT = "bronze.customer_subscriptions"
+_BUILD = "ingest_subscriptions"
+
+
+def _dag(env: str, *, legacy: bool = False, build: str = _BUILD) -> str:
+    from fluid_build.schedulers.airflow import fluid_apply
+
+    text = fluid_apply.render_dag(
+        product_id=_PRODUCT,
+        build=fluid_apply.ScheduledBuild(
+            build_id=build, schedule="0 */4 * * *", timezone="UTC", retries=1
+        ),
+        env=env or None,
+        contract_path="contracts/customer_subscriptions/contract.fluid.yaml",
+        env_names=[],
+    )
+    if legacy and env:
+        # What 0.16.6 rendered: the same file, with no env in its dag id.
+        new_id = fluid_apply.py_str_literal(f"{_PRODUCT}__{env}__{build}")
+        assert text.count(new_id) == 1
+        text = text.replace(new_id, fluid_apply.py_str_literal(f"{_PRODUCT}__{build}"))
+    return text
+
+
+def _env_artifacts(tmp_path: Path, env: str = "aws") -> Path:
+    """``schedule/`` as stage 3 now writes it for ``--env <env>``."""
+    dags = tmp_path / "dist" / "artifacts" / "schedule"
+    scope = dags / f"{_PRODUCT}__{env}"
+    scope.mkdir(parents=True)
+    (scope / f"{_BUILD}_dag.py").write_text(_dag(env), encoding="utf-8")
+    return dags
+
+
+def _upgraded_root(tmp_path: Path) -> Path:
+    """The lab's DAG root after a sync by 0.16.6, plus what must survive the retirement."""
+    root = tmp_path / "airflow-dags"
+    old = root / _PRODUCT
+    old.mkdir(parents=True)
+    (old / f"{_BUILD}_dag.py").write_text(_dag("aws", legacy=True), encoding="utf-8")
+    (old / "removed_build_dag.py").write_text(
+        _dag("aws", legacy=True, build="removed_build"), encoding="utf-8"
+    )
+    # Not this env's, not a legacy id, not a DAG: all stay.
+    (old / "gcp_only_dag.py").write_text(
+        _dag("gcp", legacy=True, build="gcp_only"), encoding="utf-8"
+    )
+    (old / "envless_dag.py").write_text(_dag("", build="envless"), encoding="utf-8")
+    (old / "notes.py").write_text("# someone's helper\n", encoding="utf-8")
+    (root / "billing").mkdir()
+    (root / "billing" / "billing_dag.py").write_text("# theirs\n", encoding="utf-8")
+    return root
+
+
+def _unwrapped(text: str) -> str:
+    """The console wraps long lines; compare without whitespace."""
+    return "".join(text.split())
+
+
+def _dag_ids(root: Path) -> List[str]:
+    return sorted(
+        facts["dag_id"]
+        for path in root.rglob("*.py")
+        if (facts := schedule_sync._dag_facts(path)) is not None
+    )
+
+
+class TestTheDagAnEnvDirectoryReplaced:
+    def test_the_scope_and_the_old_dags_are_read_from_the_dag_files(self, tmp_path: Path) -> None:
+        dags = _env_artifacts(tmp_path)
+        assert schedule_sync._replaced_scopes(dags) == [(f"{_PRODUCT}__aws", _PRODUCT, "aws")]
+        root = _upgraded_root(tmp_path)
+        assert schedule_sync._superseded_dags(root / _PRODUCT, _PRODUCT, "aws") == [
+            f"{_BUILD}_dag.py",
+            "removed_build_dag.py",
+        ]
+        # A directory of the old layout, or of anything else, replaces nothing.
+        assert schedule_sync._replaced_scopes(root) == []
+
+    def test_the_dry_run_plans_the_retirement_after_the_sync(self, tmp_path: Path) -> None:
+        dags = _env_artifacts(tmp_path)
+        root = _upgraded_root(tmp_path)
+        argvs = _dispatch(dags, destination=str(root))
+        dest = f"{root.resolve()}/"
+        assert argvs[0] == [
+            "/bin/rsync",
+            "-av",
+            "--delete",
+            "--",
+            f"{dags}/{_PRODUCT}__aws/",
+            f"{dest}{_PRODUCT}__aws/",
+        ]
+        retire = argvs[1]
+        assert retire[:3] == ["/bin/rsync", "-rv", "--delete"]
+        assert retire[3:6] == [
+            f"--include=/{_BUILD}_dag.py",
+            "--include=/removed_build_dag.py",
+            "--exclude=*",
+        ]
+        assert retire[-1] == f"{dest}{_PRODUCT}/"
+        assert len(argvs) == 2
+        assert (root / _PRODUCT / f"{_BUILD}_dag.py").exists(), "a dry run deleted"
+
+    @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+    def test_the_first_sync_after_the_upgrade_retires_the_old_dag(self, tmp_path: Path) -> None:
+        dags = _env_artifacts(tmp_path)
+        root = _upgraded_root(tmp_path)
+        report = tmp_path / "report.json"
+        mode = (root / _PRODUCT).stat().st_mode
+
+        args = _args(
+            dags_dir=str(dags), destination=str(root), dry_run=False, env="aws", report=str(report)
+        )
+        assert schedule_sync.run(args) == 0
+
+        assert _dag_ids(root) == sorted(
+            [
+                f"{_PRODUCT}__aws__{_BUILD}",
+                f"{_PRODUCT}__envless",
+                f"{_PRODUCT}__gcp_only",
+            ]
+        )
+        assert (root / _PRODUCT / "notes.py").exists()
+        assert (root / "billing" / "billing_dag.py").exists()
+        assert (root / _PRODUCT).stat().st_mode == mode
+        import json
+
+        recorded = json.loads(report.read_text(encoding="utf-8"))["superseded_scopes"]
+        assert recorded == [
+            {
+                "scope": f"{_PRODUCT}__aws",
+                "replaces": _PRODUCT,
+                "env": "aws",
+                "old_dags_retired": True,
+            }
+        ]
+
+        # The next sync finds nothing left to retire.
+        assert len(_dispatch(dags, destination=str(root))) == 1
+
+    def test_none_scope_retires_nothing_and_says_what_is_left(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        dags = _env_artifacts(tmp_path)
+        root = _upgraded_root(tmp_path)
+        args = _args(dags_dir=str(dags), destination=str(root), delete_scope="none")
+        with patch.object(schedule_sync, "_which_or_raise", side_effect=_which):
+            assert schedule_sync.run(args) == 0
+        out = _unwrapped(capsys.readouterr().out)
+        assert "--include=/" not in out
+        assert _unwrapped(f"Delete {_PRODUCT}/'s DAG files for env aws") in out
+
+    @pytest.mark.parametrize(
+        "scheduler,destination",
+        [
+            ("airflow", "s3://b/dags/"),
+            ("airflow", "gs://b/dags/"),
+            ("airflow", "ssh://u@host/opt/dags"),
+            ("mwaa", "s3://mwaa/dags/"),
+        ],
+    )
+    def test_a_destination_that_cannot_be_read_here_gets_the_step_to_take(
+        self, tmp_path: Path, scheduler: str, destination: str, capsys
+    ) -> None:
+        dags = _env_artifacts(tmp_path)
+        report = tmp_path / "report.json"
+        args = _args(
+            dags_dir=str(dags), scheduler=scheduler, destination=destination, report=str(report)
+        )
+        with patch.object(schedule_sync, "_which_or_raise", side_effect=_which):
+            assert schedule_sync.run(args) == 0
+        out = _unwrapped(capsys.readouterr().out)
+        assert "--include=/" not in out
+        assert _unwrapped(f"{_PRODUCT}__<build> beside {_PRODUCT}__aws__<build>") in out
+        assert '"old_dags_retired": false' in report.read_text(encoding="utf-8")
+
+    def test_mirroring_the_whole_destination_needs_no_note(self, tmp_path: Path, capsys) -> None:
+        dags = _env_artifacts(tmp_path)
+        args = _args(dags_dir=str(dags), destination="s3://b/dags/", delete_scope="destination")
+        with patch.object(schedule_sync, "_which_or_raise", side_effect=_which):
+            assert schedule_sync.run(args) == 0
+        assert "note:" not in capsys.readouterr().out
+
+    def test_a_git_ssh_destination_retires_in_its_clone_before_the_commit(
+        self, tmp_path: Path
+    ) -> None:
+        dags = _env_artifacts(tmp_path)
+        upgraded = _upgraded_root(tmp_path)
+        args = _args(
+            dags_dir=str(dags),
+            destination="git+ssh://git@example.com/org/dags.git",
+            dry_run=False,
+        )
+        cwd_calls: List[List[str]] = []
+
+        def _result(argv: List[str]) -> Dict[str, Any]:
+            return {"argv": argv, "exit_code": 0, "stdout_tail": " M x", "stderr_tail": ""}
+
+        def _clone(argv: List[str], **_kwargs: Any) -> Dict[str, Any]:
+            # The clone holds what the last sync by 0.16.6 pushed.
+            shutil.copytree(upgraded, argv[-1])
+            return _result(argv)
+
+        def _in_clone(argv: List[str], *, cwd: str, **_kwargs: Any) -> Dict[str, Any]:
+            cwd_calls.append(argv)
+            return _result(argv)
+
+        with (
+            patch.object(schedule_sync, "_which_or_raise", side_effect=_which),
+            patch.object(schedule_sync, "_run_subprocess", side_effect=_clone),
+            patch.object(schedule_sync, "_run_subprocess_with_cwd", side_effect=_in_clone),
+        ):
+            schedule_sync._airflow_dispatch(dags, args)
+
+        assert [argv[:2] for argv in cwd_calls[:3]] == [
+            ["/bin/rsync", "-av"],
+            ["/bin/rsync", "-rv"],
+            ["/bin/git", "add"],
+        ]
+        retire = cwd_calls[1]
+        assert retire[-1] == f"./{_PRODUCT}/"
+        assert f"--include=/{_BUILD}_dag.py" in retire
+        assert "--include=/envless_dag.py" not in retire
