@@ -112,11 +112,13 @@ def test_a_forgiven_install_is_found(script):
         # Installs only when missing; a failed install still fails the step.
         'python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml',
         # The retry this repo uses instead: the SAME install, and a loud end.
-        "for attempt in 1 2 3; do\n"
-        '  pip install -e ".[dev,local]" && break\n'
-        '  if [ "$attempt" -eq 3 ]; then exit 1; fi\n'
-        "  sleep 30\n"
-        "done",
+        (
+            "for attempt in 1 2 3; do\n"
+            '  pip install -e ".[dev,local]" && break\n'
+            '  if [ "$attempt" -eq 3 ]; then exit 1; fi\n'
+            "  sleep 30\n"
+            "done"
+        ),
         'if ! pip install -e .; then echo "::error::install failed"; exit 1; fi',
         # A separator ends the and-or list: only `echo` is forgiven here.
         "pip install -e .; echo done || true",
