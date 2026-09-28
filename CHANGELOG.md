@@ -22,6 +22,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removes the old directory with the rest of what the sync does not ship.
   The report's `superseded_scopes` records which case applied.
 
+## [0.16.7] — 2026-09-28
+
+A Lake Formation grant that hides columns now applies on AWS, not only plans.
+Found when the demo's AWS chain on 0.16.6 reached `tofu apply`: Lake Formation
+refused the analyst's grant with `InvalidInputException: Permissions
+modification is invalid`. moto does not check Lake Formation's permission
+rules, so no emulator test could have caught it; the fix follows AWS's
+permissions reference, and the live apply is the proof still to come.
+
+### Fixed
+
+- **A column-limited Lake Formation grant carries only `SELECT`** (#679).
+  Lake Formation takes only `SELECT` on a column-filtered table ("This object
+  is only used when granting a SELECT permission"), and refuses `DESCRIBE` to a
+  principal holding a partial `SELECT`. forge-cli sent `[DESCRIBE, SELECT]`
+  with `excludedColumns` or `columns`, so the apply failed. A column-limited
+  grant now emits `SELECT` alone: the principal still sees the table's
+  metadata for the permitted columns, because Lake Formation implies
+  `DESCRIBE` with the `SELECT`. A column limit next to `ALTER`, `DROP`,
+  `INSERT`, `DELETE` or `ALL`, or with no `SELECT`, is refused at emit, since
+  Lake Formation refuses those beside a partial `SELECT`. Grant addresses are
+  unchanged.
+
 ## [0.16.6] — 2026-09-28
 
 A Lake Formation grant that hides columns from a principal now plans. Found
@@ -3674,7 +3697,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.6...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.7...HEAD
+[0.16.7]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.6...v0.16.7
 [0.16.6]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.5...v0.16.6
 [0.16.5]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.4...v0.16.5
 [0.16.4]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.3...v0.16.4
