@@ -112,6 +112,16 @@ jobs:
           .venv/bin/python scripts/ci/assert_lane_coverage.py lf-bucket-policy-plan.xml \
             --require "LF bucket-policy plan=tests/iac/test_iac_lakeformation_bucket_policy_plan.py"
 
+      # Retention and encryption at rest: the key policy is only evaluated at
+      # plan time, and the lifecycle rule, default SSE-KMS, key rotation and the
+      # key's scheduled deletion only exist after a real apply / destroy, so
+      # both run against moto (S3, KMS, STS). Fails if the file only skipped.
+      - name: Stage 1 — retention + KMS plan/apply/destroy (tofu vs moto, creds-free)
+        run: |
+          .venv/bin/python -m pytest tests/iac/test_iac_aws_retention_encryption_moto.py \
+            -q --junitxml=retention-kms-moto.xml
+          .venv/bin/python scripts/ci/assert_lane_coverage.py retention-kms-moto.xml \
+            --require "retention + KMS moto=tests/iac/test_iac_aws_retention_encryption_moto.py"
       # `fluid diff` refreshes the apply's OpenTofu state: a real apply, then
       # the refresh plan, against moto. Whether a clean apply reads as no drift
       # depends on what the provider reads back, so only a real run proves it.

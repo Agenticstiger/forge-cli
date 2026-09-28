@@ -18,17 +18,16 @@ from __future__ import annotations
 import argparse
 import atexit
 import importlib
-import json
 import logging
 import os
 import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import error as console_error
 
-# Import shared utilities
-from ._common import build_provider, load_contract_with_overlay
+# Import shared utilities. ``build_provider`` is no longer used here; it stays
+# importable from this module because existing tests patch it at this path.
+from ._common import CLIError, build_provider, load_contract_with_overlay  # noqa: F401
 
 LOG = logging.getLogger("fluid.cli")
 
@@ -138,89 +137,6 @@ def validate_contract_obj(contract: Dict[str, Any]) -> Tuple[bool, Optional[str]
 
 
 # -------------------------
-# Planner + Fallback plan
-# -------------------------
-def plan_contract(contract: Dict[str, Any], provider_name: Optional[str]) -> Dict[str, Any]:
-    """Use fluid_build.planner.plan_actions if available; else a reasonable fallback plan."""
-    try:
-        planner = _imp("fluid_build.planner")
-        plan_actions = getattr(planner, "plan_actions", None)
-        if plan_actions:
-            return plan_actions(contract, provider_name)  # type: ignore[no-any-return]
-    except Exception as e:
-        LOG.warning("planner_unavailable_using_fallback", extra={"error": str(e), "actions": 2})
-
-    # Fallback: simple, deterministic actions
-    exposes = contract.get("exposes", []) or []
-    target = exposes[0] if exposes else {}
-    location = target.get("location") or {}
-    fmt = (location.get("format") if isinstance(location, dict) else None) or ""
-
-    actions: List[Dict[str, Any]] = []
-    # Basic dataset + table ensures
-    props = (location.get("properties", {}) or {}) if isinstance(location, dict) else {}
-    dataset = props.get("dataset")
-    table = props.get("table")
-    if dataset:
-        actions.append({"op": "ensure_dataset", "name": dataset})
-    if table:
-        actions.append(
-            {
-                "op": "ensure_table",
-                "dataset": dataset,
-                "table": table,
-                "schema": target.get("schema"),
-            }
-        )
-
-    # If local/file, add a demo artifact copy to show something tangible
-    if fmt in ("file", "local_file"):
-        out_dir = Path("runtime/out")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        actions.append(
-            {
-                "op": "copy",
-                "src": "demo_artifact.csv",
-                "dst": str(out_dir / "demo_artifact.csv"),
-                "optional": True,
-            }
-        )
-
-    return {"actions": actions, "provider": (provider_name or "unknown")}
-
-
-# -------------------------
-# Small IO helpers
-# -------------------------
-def _write_json(path: str, obj: Any) -> None:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(obj, indent=2), encoding="utf-8")
-
-
-def _print_json(obj: Any) -> None:
-    try:
-        # Rich pretty JSON if available (stderr console kept by main)
-        from rich.console import Console  # type: ignore
-
-        Console().print_json(data=obj)
-    except Exception:
-        sys.stdout.write(json.dumps(obj, indent=2) + "\n")
-
-
-# -------------------------
-# Export / Render helpers
-# -------------------------
-def _provider_supports_render(provider: Any) -> bool:
-    try:
-        caps = provider.capabilities()
-        return bool(caps.get("render"))
-    except Exception:
-        # Fallback heuristic: exporters usually identify as odps/opds
-        return getattr(provider, "name", "").lower() in {"odps", "opds"}
-
-
-# -------------------------
 # Command implementations
 # -------------------------
 def cmd_validate_run(args: argparse.Namespace, logger: logging.Logger) -> int:
@@ -234,183 +150,38 @@ def cmd_validate_run(args: argparse.Namespace, logger: logging.Logger) -> int:
     return 0
 
 
-def cmd_plan_run(args: argparse.Namespace, logger: logging.Logger) -> int:
-    contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
-    plan = plan_contract(contract, getattr(args, "provider", None))
-    if not plan or not isinstance(plan, dict):
-        logger.warning(
-            "planner_fallback_stub",
-            extra={"actions": len(plan.get("actions", [])) if isinstance(plan, dict) else 0},
+def _register_unavailable(
+    sp: argparse._SubParsersAction, command: str, help_text: str, module: str, exc: BaseException
+) -> None:
+    """Register *command* so that running it says why it cannot run.
+
+    Called when the command's own module failed to import. The fallbacks that
+    stood in here used to plan through ``fluid_build.planner`` and draw the
+    graph through ``fluid_build.visualize``. Neither module exists, so the
+    stand-ins wrote a made-up plan (and ``apply`` applied it) or a two-node
+    graph, and exited 0 on a broken install.
+
+    The parser accepts any arguments (no option prefix is recognised), so a
+    call carrying the real command's flags still reaches the error below
+    instead of an argparse usage message.
+    """
+    reason = f"{type(exc).__name__}: {exc}"
+    p = sp.add_parser(
+        command,
+        help=f"{help_text} (unavailable: fluid_build.cli.{module} failed to import)",
+        prefix_chars="\x01",
+        add_help=False,
+    )
+    p.add_argument("argv", nargs="*")
+
+    def _unavailable(args: argparse.Namespace, logger: logging.Logger) -> int:
+        raise CLIError(
+            1,
+            "command_unavailable",
+            {"command": command, "module": f"fluid_build.cli.{module}", "error": reason},
         )
-    _write_json(args.out, plan)
-    logger.info("plan_ok", extra={"out": args.out, "actions": len(plan.get("actions", []))})
-    return 0
 
-
-def cmd_apply_run(args: argparse.Namespace, logger: logging.Logger) -> int:
-    """
-    If the provider is an exporter (supports render()), treat apply as an export.
-    Otherwise: plan → provider.apply(actions). Print to stdout when --out -.
-    """
-    contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
-    provider = build_provider(
-        getattr(args, "provider", None),
-        getattr(args, "project", None),
-        getattr(args, "region", None),
-        logger,
-    )
-
-    # Exporter path (e.g., odps/opds)
-    if _provider_supports_render(provider):
-        out = getattr(args, "out", "-")
-        result = provider.render(contract, out=out if out else "-", fmt=None)
-        if out == "-" or not out:
-            _print_json(result)
-            logger.info("apply_ok", extra={"result": "stdout"})
-        else:
-            _write_json(out, result)
-            logger.info("apply_ok", extra={"result": "written", "path": out})
-        return 0
-
-    # Normal plan+apply
-    plan = plan_contract(contract, getattr(args, "provider", None))
-    actions = plan.get("actions", [])
-
-    # Prefer provider.apply(actions)
-    if hasattr(provider, "apply"):
-        apply_result = provider.apply(actions)  # expected ApplyResult or dict
-        # Normalize for stdout write
-        if hasattr(apply_result, "to_json"):
-            payload = json.loads(apply_result.to_json())
-        else:
-            payload = apply_result
-    else:
-        # Legacy minimal protocol
-        applied = 0
-        for i, a in enumerate(actions):
-            if a.get("op") == "copy":
-                try:
-                    dst = Path(a["dst"])
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    src = Path(a["src"])
-                    if not src.exists():
-                        dst.write_text("demo,data\n", encoding="utf-8")
-                    else:
-                        dst.write_bytes(src.read_bytes())
-                    applied += 1
-                except Exception as e:
-                    logger.error("local_copy_failed", extra={"i": i, "error": str(e)})
-        payload = {
-            "provider": getattr(provider, "name", "local"),
-            "applied": applied,
-            "failed": len(actions) - applied,
-            "results": [],
-        }
-
-    out = getattr(args, "out", None)
-    if out and out != "-":
-        _write_json(out, payload)
-        logger.info("apply_ok", extra={"result": "written", "path": out})
-    else:
-        _print_json(payload)
-        logger.info("apply_ok", extra={"result": "stdout"})
-    return 0
-
-
-def cmd_graph_run(args: argparse.Namespace, logger: logging.Logger) -> int:
-    # Try to import a graph helper; otherwise write a trivial DOT
-    try:
-        graph = _imp("fluid_build.visualize")
-        emit_dot = getattr(graph, "emit_contract_dot", None)
-        if emit_dot:
-            contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
-            dot = emit_dot(contract)  # type: ignore[call-arg]
-            if args.out == "-":
-                sys.stdout.write(dot)
-            else:
-                Path(args.out).write_text(dot, encoding="utf-8")
-            logger.info("graph_ok", extra={"out": args.out})
-            return 0
-    except Exception as e:
-        logger.warning("graph_helper_missing", extra={"error": str(e)})
-
-    # fallback DOT
-    dot = 'digraph G { rankdir=LR; "contract" -> "expose"; }'
-    if args.out == "-":
-        sys.stdout.write(dot)
-    else:
-        Path(args.out).write_text(dot, encoding="utf-8")
-    logger.info("graph_ok_fallback", extra={"out": args.out})
-    return 0
-
-
-def cmd_visualize_plan_run(args: argparse.Namespace, logger: logging.Logger) -> int:
-    """
-    Build a quick plan graph (PNG + HTML) from a CONTRACT (more useful than DOT-in/DOT-out).
-    Requires graphviz `dot`. Falls back to minimal HTML if missing.
-    """
-    try:
-        import graphviz  # noqa: F401
-
-        has_dot = True
-    except Exception as e:
-        logger.warning("graphviz_missing", extra={"error": str(e)})
-        has_dot = False
-
-    # Build actions from contract to be consistent with provider behavior
-    contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
-    plan = plan_contract(contract, getattr(args, "provider", None))
-    actions = plan.get("actions", [])
-
-    # Emit DOT
-    dot_lines = [
-        "digraph plan {",
-        "  rankdir=LR;",
-        '  node [shape=box, style="rounded,filled", fillcolor="#eef2ff"];',
-    ]
-    for i, a in enumerate(actions):
-        label = a.get("op", "op")
-        dot_lines.append(f"  n{i} [label={json.dumps(label)} tooltip={json.dumps(json.dumps(a))}];")
-        if i > 0:
-            dot_lines.append(f"  n{i - 1} -> n{i};")
-    dot_lines.append("}")
-    dot_src = "\n".join(dot_lines)
-
-    out_dir = Path(args.out or "runtime/plan_viz")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "plan.dot").write_text(dot_src, encoding="utf-8")
-
-    if has_dot:
-        try:
-            from subprocess import PIPE, run
-
-            png = out_dir / "plan.png"
-            run(
-                ["dot", "-Tpng", str(out_dir / "plan.dot"), "-o", str(png)],
-                check=True,
-                stdout=PIPE,
-                stderr=PIPE,
-            )
-            html = out_dir / "index.html"
-            html.write_text(
-                "<!doctype html><meta charset='utf-8'><title>FLUID Plan</title>"
-                "<h1>Plan</h1><p><img src='plan.png' alt='plan graph'></p>",
-                encoding="utf-8",
-            )
-            logger.info("visualize_plan_ok", extra={"out": str(out_dir)})
-            return 0
-        except Exception as e:
-            logger.error("visualize_plan_failed", extra={"error": str(e)})
-            # fall through to minimal HTML
-
-    # Minimal HTML fallback
-    (out_dir / "index.html").write_text(
-        "<!doctype html><meta charset='utf-8'><title>FLUID Plan</title>"
-        "<h1>Plan DOT</h1><pre>" + dot_src + "</pre>",
-        encoding="utf-8",
-    )
-    logger.info("visualize_plan_ok_fallback", extra={"out": str(out_dir)})
-    return 0
+    p.set_defaults(cmd=command, func=_unavailable)
 
 
 # -------------------------
@@ -629,52 +400,38 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
             v.add_argument("--env")
             v.set_defaults(func=cmd_validate_run)
 
-    # plan (enhanced → fallback)
+    # plan (a stub that reports the import error when the module is broken)
     if is_command_enabled("plan"):
         try:
             from . import plan
 
             plan.register(sp)
         except ImportError as e:
-            LOG.debug("enhanced_plan_unavailable_using_fallback: %s", e)
-            pl = sp.add_parser("plan", help="Create an execution plan for a contract")
-            pl.add_argument("contract")
-            pl.add_argument("--env")
-            pl.add_argument("--out", required=True)
-            pl.set_defaults(func=cmd_plan_run)
+            LOG.warning("plan_module_unavailable: %s", e)
+            _register_unavailable(sp, "plan", "Create an execution plan for a contract", "plan", e)
 
     # ship (UX hardening — validate → bundle → plan → apply macro)
     _try_register(sp, "ship", "ship")
 
-    # apply (enhanced → fallback)
+    # apply (a stub that reports the import error when the module is broken)
     if is_command_enabled("apply"):
         try:
             from . import apply
 
             apply.register(sp)
         except ImportError as e:
-            LOG.debug("enhanced_apply_unavailable_using_fallback: %s", e)
-            ap = sp.add_parser(
-                "apply", help="Apply a contract (or export if provider supports render)"
-            )
-            ap.add_argument("contract")
-            ap.add_argument("--env")
-            ap.add_argument("--out", default="-")
-            ap.set_defaults(func=cmd_apply_run)
+            LOG.warning("apply_module_unavailable: %s", e)
+            _register_unavailable(sp, "apply", "Apply a contract", "apply", e)
 
-    # viz-graph (enhanced → fallback)
+    # viz-graph (a stub that reports the import error when the module is broken)
     if is_command_enabled("graph"):
         try:
             from . import viz_graph
 
             viz_graph.register(sp)
         except ImportError as e:
-            LOG.debug("enhanced_viz_graph_unavailable_using_fallback: %s", e)
-            gr = sp.add_parser("graph", help="Emit Graphviz DOT of the contract DAG")
-            gr.add_argument("contract")
-            gr.add_argument("--env")
-            gr.add_argument("--out", default="-")
-            gr.set_defaults(func=cmd_graph_run)
+            LOG.warning("viz_graph_module_unavailable: %s", e)
+            _register_unavailable(sp, "viz-graph", "Render the contract as a graph", "viz_graph", e)
 
     # --- Simple registrations (profile-gated via _try_register) ---
     # ``fluid execute`` was deleted when build_runners landed. Its engine code

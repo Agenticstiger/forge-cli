@@ -21,6 +21,7 @@ syntax and provider-schema correctness — it needs no cloud credentials
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 
@@ -555,6 +556,80 @@ def test_lakeformation_bucket_policy_modes_pass_tofu_validate(bucket_policy, pac
     data sources, its ``dynamic "statement"`` blocks and the ``count`` on
     ``aws_s3_bucket_policy``, which the dict-level tests cannot type-check."""
     module = build_module(IAC_PLUGINS["aws"], _lf_bucket_policy_contract(bucket_policy, packaging))
+    _assert_tofu_validates(tmp_path, module)
+
+
+def _retention_kms_contract(kms, bucket_policy):
+    """Retention plus encryption at rest, with and without Lake Formation readers."""
+    binding = {
+        "platform": "aws",
+        "format": "parquet",
+        "location": {
+            "database": "demo",
+            "table": "orders",
+            "bucket": "demo-fluid-retention",
+            "path": "orders/",
+        },
+        "encryption": {"kms": kms},
+    }
+    if bucket_policy is not None:
+        binding["governance"] = {
+            "lakeFormation": {
+                "registerLocation": True,
+                "bucketPolicy": bucket_policy,
+                "grants": [
+                    {"principal": "arn:aws:iam::222222222222:role/other", "permissions": ["SELECT"]}
+                ],
+            }
+        }
+    return {
+        "id": "demo.aws.retention",
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "lifecycle": {"retention": "P30D", "expire": True},
+                "binding": binding,
+                "contract": {"schema": [{"name": "id", "type": "integer", "required": True}]},
+            }
+        ],
+    }
+
+
+@pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
+@pytest.mark.parametrize(
+    "kms, bucket_policy",
+    [
+        ("product", None),
+        ("product", "cross-account"),
+        ("product", "all-grantees"),
+        ("alias/platform/lake", None),
+        ("alias/platform/lake", "cross-account"),
+    ],
+    ids=[
+        "product",
+        "product-lf-cross-account",
+        "product-lf-all-grantees",
+        "existing-key",
+        "existing-key-lf",
+    ],
+)
+def test_retention_and_kms_pass_tofu_validate(kms, bucket_policy, tmp_path):
+    """The lifecycle configuration, the KMS key + alias, the bucket's default
+    SSE-KMS and the key policy's ``aws_iam_policy_document`` (static
+    statements beside a ``dynamic`` one) are accepted by real ``tofu``; for an
+    existing key, the ``data.aws_kms_key`` lookup and the preconditions on its
+    attributes too."""
+    module = build_module(IAC_PLUGINS["aws"], _retention_kms_contract(kms, bucket_policy))
+    # A module without the resources would validate too, and prove nothing.
+    document = json.loads(module)
+    resources = document["resource"]
+    assert "aws_s3_bucket_lifecycle_configuration" in resources
+    assert "aws_s3_bucket_server_side_encryption_configuration" in resources
+    assert ("aws_kms_key" in resources) == (kms == "product")
+    [sse] = resources["aws_s3_bucket_server_side_encryption_configuration"].values()
+    preconditions = (sse.get("lifecycle") or {}).get("precondition") or []
+    assert len(preconditions) == (0 if kms == "product" else 3 if bucket_policy else 2)
+    assert ("aws_kms_key" in document.get("data", {})) == (kms != "product")
     _assert_tofu_validates(tmp_path, module)
 
 

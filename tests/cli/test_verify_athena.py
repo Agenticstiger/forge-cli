@@ -34,6 +34,7 @@ test still runs.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import logging
 import os
@@ -65,6 +66,11 @@ DATA_LOCATION = "s3://northwind-demo-lake/bronze/customer_subscriptions/"
 DATA_FILE = DATA_LOCATION + "customer_subscriptions.parquet"
 DEFAULT_RESULTS = "s3://northwind-demo-lake/.fluid/athena-results/"
 COUNT_SQL = 'SELECT COUNT(*) FROM "demo_bronze"."customer_subscriptions"'
+DATA_PREFIX = "bronze/customer_subscriptions/"
+# The key ``fluid apply`` creates for the demo bucket under ``kms: product``
+# (``aws_storage.product_key_alias``), and the ARN KMS answers for it.
+PRODUCT_KEY_ALIAS = "alias/fluid/bronze_customer_subscriptions/northwind-demo-lake"
+PRODUCT_KEY_ARN = "arn:aws:kms:eu-north-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
 
 # The demo contract (fluid-demo-env contracts/customer_subscriptions), trimmed
 # to what verify reads: an acquisition build whose output is the expose, and a
@@ -155,19 +161,23 @@ def _no_real_aws(monkeypatch):
 
 
 class _Aws:
-    """Stubbed Glue and Athena clients handed out by a patched ``boto3.client``."""
+    """Stubbed Glue, Athena, S3 and KMS clients handed out by a patched ``boto3.client``."""
 
     def __init__(self) -> None:
         creds = {"aws_access_key_id": "testing", "aws_secret_access_key": "testing"}
         self.glue = boto3.client("glue", region_name=REGION, **creds)
         self.athena = boto3.client("athena", region_name=REGION, **creds)
+        self.s3 = boto3.client("s3", region_name=REGION, **creds)
+        self.kms = boto3.client("kms", region_name=REGION, **creds)
         self.glue_stub = Stubber(self.glue)
         self.athena_stub = Stubber(self.athena)
+        self.s3_stub = Stubber(self.s3)
+        self.kms_stub = Stubber(self.kms)
         self.requested: List[tuple] = []
 
     def client(self, service: str, *args: Any, **kwargs: Any) -> Any:
         self.requested.append((service, kwargs.get("region_name")))
-        return {"glue": self.glue, "athena": self.athena}[service]
+        return {"glue": self.glue, "athena": self.athena, "s3": self.s3, "kms": self.kms}[service]
 
     # Glue ------------------------------------------------------------------
     def table(
@@ -211,11 +221,20 @@ class _Aws:
         )
 
     def start(
-        self, output_location: Optional[str] = DEFAULT_RESULTS, workgroup="primary", sql=COUNT_SQL
+        self,
+        output_location: Optional[str] = DEFAULT_RESULTS,
+        workgroup="primary",
+        sql=COUNT_SQL,
+        kms_key: Optional[str] = None,
     ):
         expected: Dict[str, Any] = {"QueryString": sql, "WorkGroup": workgroup}
         if output_location is not None:
             expected["ResultConfiguration"] = {"OutputLocation": output_location}
+        if kms_key is not None:
+            expected["ResultConfiguration"]["EncryptionConfiguration"] = {
+                "EncryptionOption": "SSE_KMS",
+                "KmsKey": kms_key,
+            }
         self.athena_stub.add_response(
             "start_query_execution", {"QueryExecutionId": "q-1"}, expected
         )
@@ -259,18 +278,76 @@ class _Aws:
         self.state("SUCCEEDED")
         self.count(rows)
 
+    # S3 and KMS (the storage checks) --------------------------------------
+    def lifecycle(self, rules: Optional[List[Dict[str, Any]]] = None) -> None:
+        if rules is None:
+            self.s3_stub.add_client_error(
+                "get_bucket_lifecycle_configuration",
+                service_error_code="NoSuchLifecycleConfiguration",
+                expected_params={"Bucket": "northwind-demo-lake"},
+            )
+            return
+        self.s3_stub.add_response(
+            "get_bucket_lifecycle_configuration",
+            {"Rules": rules},
+            {"Bucket": "northwind-demo-lake"},
+        )
+
+    def key(
+        self,
+        alias: str = PRODUCT_KEY_ALIAS,
+        arn: Optional[str] = PRODUCT_KEY_ARN,
+        state: str = "Enabled",
+        **metadata: Any,
+    ) -> None:
+        if arn is None:
+            self.kms_stub.add_client_error(
+                "describe_key",
+                service_error_code="NotFoundException",
+                expected_params={"KeyId": alias},
+            )
+            return
+        self.kms_stub.add_response(
+            "describe_key",
+            {
+                "KeyMetadata": {
+                    "KeyId": arn.rsplit("/", 1)[1],
+                    "Arn": arn,
+                    "KeyState": state,
+                    **metadata,
+                }
+            },
+            {"KeyId": alias},
+        )
+
+    def objects(self, heads: Dict[str, Dict[str, Any]]) -> None:
+        """The prefix's listing, then one ``HeadObject`` answer per key, in key order."""
+        self.s3_stub.add_response(
+            "list_objects_v2",
+            {"Contents": [{"Key": key} for key in heads], "IsTruncated": False},
+            {"Bucket": "northwind-demo-lake", "Prefix": DATA_PREFIX, "MaxKeys": 1000},
+        )
+        for key, head in heads.items():
+            self.s3_stub.add_response(
+                "head_object", head, {"Bucket": "northwind-demo-lake", "Key": key}
+            )
+
+    @property
+    def stubs(self) -> List[Any]:
+        return [self.glue_stub, self.athena_stub, self.s3_stub, self.kms_stub]
+
     def __enter__(self) -> "_Aws":
-        self.glue_stub.activate()
-        self.athena_stub.activate()
+        for stub in self.stubs:
+            stub.activate()
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        self.glue_stub.deactivate()
-        self.athena_stub.deactivate()
+        for stub in self.stubs:
+            stub.deactivate()
 
     def assert_all_called(self) -> None:
-        self.glue_stub.assert_no_pending_responses()
-        self.athena_stub.assert_no_pending_responses()
+        for stub in self.stubs:
+            stub.assert_no_pending_responses()
 
 
 @pytest.fixture
@@ -1642,10 +1719,10 @@ MASKED_COUNT_SQL = (
 )
 
 
-def _masked_counts(aws: "_Aws", rows: int, cells: List[int]) -> None:
+def _masked_counts(aws: "_Aws", rows: int, cells: List[int], **start: Any) -> None:
     """The happy query, answering ``COUNT(*)`` and each masking expression."""
     aws.workgroup()
-    aws.start(sql=MASKED_COUNT_SQL)
+    aws.start(sql=MASKED_COUNT_SQL, **start)
     aws.state("SUCCEEDED")
     header = [{"VarCharValue": f"_col{i}"} for i in range(1 + len(cells))]
     values = [{"VarCharValue": str(v)} for v in [rows, *cells]]
@@ -1746,3 +1823,514 @@ def test_without_masking_rules_the_count_query_is_unchanged(tmp_path, aws):
     assert code == 0
     assert "masking" not in report["results"]["subscriptions"]["dimensions"]
     aws.assert_all_called()
+
+
+# ── Retention and encryption at rest ────────────────────────────────────
+#
+# The demo contract with the storage policies declared: a 30-day retention the
+# bucket expires (``exposes[].lifecycle``, fluid-schema 0.7.6) and the product
+# KMS key (``binding.encryption``). ``fluid apply`` writes the rule and the key;
+# verify reads them back. See ``_verify_storage_policy.py``.
+
+STORAGE_CONTRACT = CONTRACT.replace('fluidVersion: "0.7.5"', 'fluidVersion: "0.7.6"').replace(
+    "  - exposeId: subscriptions\n    kind: table\n",
+    "  - exposeId: subscriptions\n    kind: table\n"
+    "    lifecycle: {retention: P30D, expire: true}\n",
+)
+STORAGE_OVERLAY = AWS_OVERLAY + "      encryption: {kms: product}\n"
+DATA_KEY = DATA_PREFIX + "customer_subscriptions.parquet"
+KMS_HEAD = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": PRODUCT_KEY_ARN}
+
+
+def _rule(prefix: str = DATA_PREFIX, days: int = 30, **extra: Any) -> Dict[str, Any]:
+    rule: Dict[str, Any] = {
+        "ID": "fluid-retention-subscriptions",
+        "Filter": {"Prefix": prefix},
+        "Status": "Enabled",
+        "Expiration": {"Days": days},
+    }
+    rule.update(extra)
+    return rule
+
+
+def _storage(tmp_path: Path, overlay: str = STORAGE_OVERLAY) -> Path:
+    assert STORAGE_CONTRACT != CONTRACT
+    _write_run_record(tmp_path, 10172)
+    return _write_contract(tmp_path, overlay=overlay, contract=STORAGE_CONTRACT)
+
+
+def test_the_storage_policies_are_checked_and_the_result_uses_the_key(tmp_path, aws):
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle([_rule()])
+    aws.key()
+    aws.objects({DATA_KEY: KMS_HEAD})
+    # The result goes under the binding's own bucket, so it gets the product key.
+    aws.counts(10172, kms_key=PRODUCT_KEY_ARN)
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    assert code == 0, result
+    assert result["status"] == "match"
+    retention = result["dimensions"]["retention"]
+    assert retention["status"] == "pass"
+    assert retention["expected"] == {"days": 30, "period": "P30D", "prefix": DATA_PREFIX}
+    assert retention["actual"]["rule"] == "fluid-retention-subscriptions"
+    encryption = result["dimensions"]["encryption"]
+    assert encryption["status"] == "pass"
+    assert encryption["expected"]["kms_key_arn"] == PRODUCT_KEY_ARN
+    assert encryption["actual"]["objects_checked"] == 1
+    assert result["athena"]["output_encryption"] == {
+        "option": "SSE_KMS",
+        "kms_key": PRODUCT_KEY_ARN,
+    }
+    assert ("s3", REGION) in aws.requested and ("kms", REGION) in aws.requested
+    aws.assert_all_called()
+
+
+def test_nothing_declared_asks_s3_and_kms_nothing(tmp_path, aws):
+    contract = _write_contract(tmp_path)
+    _write_run_record(tmp_path, 10172)
+    aws.table()
+    aws.counts(10172)
+
+    code, report = _verify(tmp_path, contract)
+
+    assert code == 0
+    assert "retention" not in report["results"]["subscriptions"]["dimensions"]
+    assert {service for service, _ in aws.requested} == {"glue", "athena"}
+
+
+@pytest.mark.parametrize(
+    "rules, days",
+    [
+        pytest.param([_rule(days=90)], 90, id="another-period"),
+        # S3 applies the earliest expiration: a whole-bucket rule wins.
+        pytest.param([_rule(), _rule(prefix="", days=7, ID="platform-sweep")], 7, id="earlier"),
+        pytest.param([_rule(prefix="bronze/", days=1), _rule()], 1, id="parent-prefix"),
+    ],
+)
+def test_a_lifecycle_that_expires_on_another_schedule_fails_strict(tmp_path, aws, rules, days):
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle(rules)
+    aws.key()
+    aws.objects({DATA_KEY: KMS_HEAD})
+    aws.counts(10172, kms_key=PRODUCT_KEY_ARN)
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    assert code == 1
+    assert result["status"] == "mismatch"
+    assert result["severity"]["level"] == "CRITICAL"
+    retention = result["dimensions"]["retention"]
+    assert retention["status"] == "fail"
+    assert retention["actual"]["days"] == days
+    assert "the contract says P30D (30 day(s))" in retention["message"]
+
+
+@pytest.mark.parametrize(
+    "rules",
+    [
+        pytest.param(None, id="no-configuration"),
+        pytest.param([_rule(prefix="silver/")], id="another-prefix"),
+        pytest.param([_rule(Status="Disabled")], id="disabled"),
+        pytest.param(
+            [
+                {
+                    "ID": "tagged",
+                    "Filter": {
+                        "And": {"Prefix": DATA_PREFIX, "Tags": [{"Key": "t", "Value": "1"}]}
+                    },
+                    "Status": "Enabled",
+                    "Expiration": {"Days": 30},
+                }
+            ],
+            id="only-tagged-objects",
+        ),
+        pytest.param(
+            [
+                {
+                    "ID": "versions",
+                    "Filter": {"Prefix": DATA_PREFIX},
+                    "Status": "Enabled",
+                    "NoncurrentVersionExpiration": {"NoncurrentDays": 30},
+                }
+            ],
+            id="no-current-expiration",
+        ),
+    ],
+)
+def test_no_rule_that_expires_the_prefix_fails(tmp_path, aws, rules):
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle(rules)
+    aws.key()
+    aws.objects({DATA_KEY: KMS_HEAD})
+    aws.counts(10172, kms_key=PRODUCT_KEY_ARN)
+
+    code, report = _verify(tmp_path, contract)
+
+    retention = report["results"]["subscriptions"]["dimensions"]["retention"]
+    assert code == 1
+    assert retention["status"] == "fail"
+    assert retention["message"].startswith("No enabled lifecycle rule expires the objects under")
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        pytest.param({"ServerSideEncryption": "AES256"}, id="sse-s3"),
+        pytest.param(
+            {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": PRODUCT_KEY_ARN[:-4] + "ffff"},
+            id="another-key",
+        ),
+    ],
+)
+def test_an_object_not_under_the_key_fails_and_is_named(tmp_path, aws, head):
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle([_rule()])
+    aws.key()
+    late = DATA_PREFIX + "late.parquet"
+    aws.objects({DATA_KEY: KMS_HEAD, late: head})
+    aws.counts(10172, kms_key=PRODUCT_KEY_ARN)
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    encryption = result["dimensions"]["encryption"]
+    assert code == 1
+    assert result["severity"]["level"] == "CRITICAL"
+    assert encryption["status"] == "fail"
+    assert [w["key"] for w in encryption["actual"]["wrong"]] == [late]
+    assert late in encryption["message"] and "1 of 2 object(s)" in encryption["message"]
+
+
+def test_a_product_key_that_does_not_exist_fails_and_the_result_is_not_keyed(tmp_path, aws):
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle([_rule()])
+    aws.key(arn=None)
+    aws.counts(10172)  # no key resolved, so no EncryptionConfiguration
+
+    code, report = _verify(tmp_path, contract)
+
+    encryption = report["results"]["subscriptions"]["dimensions"]["encryption"]
+    assert code == 1
+    assert encryption["status"] == "fail"
+    assert PRODUCT_KEY_ALIAS in encryption["message"]
+    aws.assert_all_called()
+
+
+def test_an_existing_key_is_resolved_as_written(tmp_path, aws):
+    contract = _storage(
+        tmp_path, overlay=AWS_OVERLAY + "      encryption: {kms: alias/platform/lake}\n"
+    )
+    aws.table()
+    aws.lifecycle([_rule()])
+    aws.key(alias="alias/platform/lake")
+    aws.objects({DATA_KEY: KMS_HEAD})
+    aws.counts(10172, kms_key=PRODUCT_KEY_ARN)
+
+    code, report = _verify(tmp_path, contract)
+
+    assert code == 0, report["results"]["subscriptions"]
+    aws.assert_all_called()
+
+
+def test_an_empty_prefix_has_no_object_to_check_and_says_so(tmp_path, aws):
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle([_rule()])
+    aws.key()
+    aws.objects({})
+    aws.counts(10172, kms_key=PRODUCT_KEY_ARN)
+
+    code, report = _verify(tmp_path, contract)
+
+    encryption = report["results"]["subscriptions"]["dimensions"]["encryption"]
+    assert encryption["status"] == "info"
+    assert encryption["actual"] == {"objects_checked": 0}
+    assert code == 0
+
+
+def test_an_unreadable_lifecycle_is_an_error_even_without_strict(tmp_path, aws):
+    # A declared policy nobody could check is unproven, not passed.
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.s3_stub.add_client_error(
+        "get_bucket_lifecycle_configuration",
+        service_error_code="AccessDenied",
+        expected_params={"Bucket": "northwind-demo-lake"},
+    )
+    aws.key()
+    aws.objects({DATA_KEY: KMS_HEAD})
+    aws.counts(10172, kms_key=PRODUCT_KEY_ARN)
+
+    code, report = _verify(tmp_path, contract, strict=False)
+
+    result = report["results"]["subscriptions"]
+    assert code == 1
+    assert result["status"] == "error"
+    assert "AccessDenied" in result["error"]
+    assert result["dimensions"]["retention"]["status"] == "error"
+    assert result["dimensions"]["encryption"]["status"] == "pass"
+
+
+def test_a_result_location_someone_else_chose_keeps_its_own_encryption(tmp_path, aws):
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle([_rule()])
+    aws.key()
+    aws.objects({DATA_KEY: KMS_HEAD})
+    aws.counts(10172, output_location="s3://analyst-results/fluid/")
+
+    code, report = _verify(tmp_path, contract, athena_output_location="s3://analyst-results/fluid")
+
+    assert code == 0
+    assert "output_encryption" not in report["results"]["subscriptions"]["athena"]
+    aws.assert_all_called()
+
+
+# ── A key that exists but does not work ─────────────────────────────────
+#
+# DescribeKey answering is not the key working: S3 refuses every write and read
+# of an SSE-KMS object whose key is disabled or pending deletion, and a key
+# pending deletion must be brought back with kms:CancelKeyDeletion. A re-apply
+# would create a new key and strand the objects under the dying one.
+
+
+@pytest.mark.parametrize(
+    "state, reason, remedy",
+    [
+        pytest.param(
+            "PendingDeletion", "key-pending-deletion", "kms:CancelKeyDeletion", id="pending"
+        ),
+        pytest.param("Disabled", "key-disabled", "kms:EnableKey", id="disabled"),
+        pytest.param("PendingImport", "key-not-enabled", "Enabled state", id="other"),
+    ],
+)
+def test_a_key_that_is_not_enabled_fails_with_its_own_remedy(tmp_path, aws, state, reason, remedy):
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle([_rule()])
+    aws.key(state=state, DeletionDate=dt.datetime(2026, 10, 5, tzinfo=dt.timezone.utc))
+    # No object is read under a key that cannot be used, and Athena is not
+    # asked to encrypt its result with it.
+    aws.counts(10172)
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    encryption = result["dimensions"]["encryption"]
+    assert code == 1
+    assert encryption["status"] == "fail"
+    assert encryption["reason"] == reason
+    assert encryption["actual"]["key_state"] == state
+    assert f"is {state}, not Enabled" in encryption["message"]
+    assert result["severity"]["level"] == "CRITICAL"
+    [action] = [a for a in result["severity"]["actions"] if "key" in a.lower()]
+    assert remedy in action
+    assert "output_encryption" not in result["athena"]
+    aws.assert_all_called()
+
+
+def test_a_key_pending_deletion_is_not_fixed_by_a_re_apply(tmp_path, aws):
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle([_rule()])
+    aws.key(state="PendingDeletion", DeletionDate=dt.datetime(2026, 10, 5, tzinfo=dt.timezone.utc))
+    aws.counts(10172)
+
+    code, report = _verify(tmp_path, contract)
+
+    encryption = report["results"]["subscriptions"]["dimensions"]["encryption"]
+    [action] = [
+        a
+        for a in report["results"]["subscriptions"]["severity"]["actions"]
+        if "CancelKeyDeletion" in a
+    ]
+    assert not action.startswith("Re-apply")
+    assert "do not re-apply" in action
+    assert "is deleted on 2026-10-05" in encryption["message"]
+
+
+def test_the_key_state_reaches_the_error_when_athena_cannot_write_under_it(tmp_path, aws):
+    # A bucket whose default key is pending deletion refuses the result Athena
+    # writes, and an error prints only its message: the cause must be in it.
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle([_rule()])
+    aws.key(state="PendingDeletion")
+    aws.workgroup()
+    aws.start()
+    aws.state("FAILED", reason="KMS.KMSInvalidStateException writing the result")
+
+    code, report = _verify(tmp_path, contract, strict=False)
+
+    result = report["results"]["subscriptions"]
+    assert code == 1
+    assert result["status"] == "error"
+    assert "KMSInvalidStateException" in result["error"]
+    assert "is PendingDeletion, not Enabled" in result["error"]
+    assert "kms:CancelKeyDeletion" in result["error"]
+
+
+def test_a_masked_expose_with_storage_policies_gets_both_in_one_query(tmp_path, aws):
+    # Masking (#667) and the storage checks share the count query: its SQL
+    # carries the masking expressions and its result the declared key.
+    masked = _MASKED_CONTRACT.replace('fluidVersion: "0.7.5"', 'fluidVersion: "0.7.6"').replace(
+        "  - exposeId: subscriptions\n    kind: table\n",
+        "  - exposeId: subscriptions\n    kind: table\n"
+        "    lifecycle: {retention: P30D, expire: true}\n",
+    )
+    assert "expire: true" in masked and "masking:" in masked
+    _write_run_record(tmp_path, 10172)
+    contract = _write_contract(tmp_path, overlay=STORAGE_OVERLAY, contract=masked)
+    aws.table()
+    aws.lifecycle([_rule()])
+    aws.key()
+    aws.objects({DATA_KEY: KMS_HEAD})
+    _masked_counts(aws, 10172, [9000, 0, 10172, 0], kms_key=PRODUCT_KEY_ARN)
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    assert code == 0, result
+    assert result["dimensions"]["masking"]["status"] == "pass"
+    assert result["dimensions"]["retention"]["status"] == "pass"
+    assert result["dimensions"]["encryption"]["status"] == "pass"
+    assert result["athena"]["output_encryption"]["kms_key"] == PRODUCT_KEY_ARN
+    aws.assert_all_called()
+
+
+# ── Lifecycle rules that cut the retention short ────────────────────────
+#
+# S3 applies every enabled rule whose filter matches an object, and the
+# earliest expiration wins. A rule filtered by tag or size, or scoped to a
+# narrower prefix, cannot apply the retention, but one that expires sooner
+# deletes the objects it matches before the contract's period.
+
+_TAG = [{"Key": "tier", "Value": "scratch"}]
+
+
+def _filtered(rule_filter: Dict[str, Any], days: int, rule_id: str = "platform") -> Dict[str, Any]:
+    return {"ID": rule_id, "Filter": rule_filter, "Status": "Enabled", "Expiration": {"Days": days}}
+
+
+@pytest.mark.parametrize(
+    "extra, reached",
+    [
+        pytest.param(
+            _filtered({"And": {"Prefix": DATA_PREFIX, "Tags": _TAG}}, 7),
+            DATA_PREFIX,
+            id="tag-on-the-prefix",
+        ),
+        pytest.param(_filtered({"Tag": _TAG[0]}, 7), DATA_PREFIX, id="tag-on-the-bucket"),
+        pytest.param(
+            _filtered({"ObjectSizeGreaterThan": 1048576}, 7), DATA_PREFIX, id="size-on-the-bucket"
+        ),
+        pytest.param(
+            _filtered({"And": {"Prefix": "bronze/", "ObjectSizeLessThan": 128}}, 7),
+            DATA_PREFIX,
+            id="size-on-a-parent-prefix",
+        ),
+        pytest.param(
+            _filtered({"Prefix": DATA_PREFIX + "tmp/"}, 7),
+            DATA_PREFIX + "tmp/",
+            id="a-narrower-prefix",
+        ),
+        pytest.param(
+            _filtered({"And": {"Prefix": DATA_PREFIX + "tmp/", "Tags": _TAG}}, 7),
+            DATA_PREFIX + "tmp/",
+            id="tag-on-a-narrower-prefix",
+        ),
+    ],
+)
+def test_a_rule_that_expires_some_objects_sooner_fails(tmp_path, aws, extra, reached):
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle([_rule(), extra])
+    aws.key()
+    aws.objects({DATA_KEY: KMS_HEAD})
+    aws.counts(10172, kms_key=PRODUCT_KEY_ARN)
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    retention = result["dimensions"]["retention"]
+    assert code == 1
+    assert retention["status"] == "fail"
+    assert retention["reason"] == "sooner-rule"
+    # The rule that applies the retention still does, at 30 days.
+    assert retention["actual"]["days"] == 30
+    assert [r["id"] for r in retention["actual"]["sooner"]] == ["platform"]
+    assert f"under s3://northwind-demo-lake/{reached}" in retention["message"]
+    assert "after 7 day(s), sooner than the contract's P30D" in retention["message"]
+    [action] = [a for a in result["severity"]["actions"] if "sooner" in a]
+    assert action.startswith("Remove or narrow the lifecycle rule")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param(
+            _filtered({"And": {"Prefix": DATA_PREFIX, "Tags": _TAG}}, 90), id="tag-but-later"
+        ),
+        pytest.param(_filtered({"Prefix": DATA_PREFIX + "tmp/"}, 30), id="narrower-same-period"),
+        pytest.param(_filtered({"Tag": _TAG[0]}, 7, "x") | {"Status": "Disabled"}, id="disabled"),
+        pytest.param(_filtered({"Prefix": "silver/"}, 1), id="another-prefix"),
+        pytest.param(
+            _filtered({"And": {"Prefix": "silver/", "Tags": _TAG}}, 1), id="tag-on-another-prefix"
+        ),
+    ],
+)
+def test_a_rule_that_cannot_cut_the_retention_short_is_ignored(tmp_path, aws, extra):
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle([_rule(), extra])
+    aws.key()
+    aws.objects({DATA_KEY: KMS_HEAD})
+    aws.counts(10172, kms_key=PRODUCT_KEY_ARN)
+
+    code, report = _verify(tmp_path, contract)
+
+    retention = report["results"]["subscriptions"]["dimensions"]["retention"]
+    assert code == 0, retention
+    assert retention["status"] == "pass"
+    assert retention["actual"]["sooner"] == []
+
+
+@pytest.mark.parametrize(
+    "applying, shown",
+    [
+        pytest.param([], "No enabled lifecycle rule expires the objects under", id="no-rule"),
+        pytest.param([_rule(days=90)], "expire after 90 day(s)", id="another-period"),
+    ],
+)
+def test_a_sooner_rule_and_a_retention_not_applied_get_both_remedies(
+    tmp_path, aws, applying, shown
+):
+    # Two problems, two things to do: removing the sooner rule alone still
+    # leaves the objects without the contract's retention.
+    contract = _storage(tmp_path)
+    aws.table()
+    aws.lifecycle([*applying, _filtered({"And": {"Prefix": DATA_PREFIX, "Tags": _TAG}}, 7)])
+    aws.key()
+    aws.objects({DATA_KEY: KMS_HEAD})
+    aws.counts(10172, kms_key=PRODUCT_KEY_ARN)
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    retention = result["dimensions"]["retention"]
+    assert code == 1
+    assert retention["reason"] == "mismatch-and-sooner-rule"
+    assert shown in retention["message"]
+    assert "sooner than the contract's P30D" in retention["message"]
+    [action] = [a for a in result["severity"]["actions"] if "lifecycle" in a]
+    assert action.startswith("Re-apply so the bucket's lifecycle rule matches lifecycle.retention")
+    assert "remove or narrow the rule that expires objects under the prefix sooner" in action

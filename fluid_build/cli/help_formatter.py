@@ -663,11 +663,11 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
         ),
     ),
     "contract-tests": (
-        "Run schema compatibility and consumer-impact tests against a contract baseline.",
+        "Compare a contract's exposed schemas with a saved baseline; any column change fails.",
         (
-            "  fluid contract-tests contract.fluid.yaml\n"
-            "  fluid contract-tests contract.fluid.yaml --baseline schema-v1.json\n"
-            "  fluid contract-tests contract.fluid.yaml --env staging"
+            "  fluid contract-tests contract.fluid.yaml --write-baseline baseline.schema.json\n"
+            "  fluid contract-tests contract.fluid.yaml --baseline baseline.schema.json\n"
+            "  fluid contract-tests contract.fluid.yaml --baseline baseline.schema.json --env staging"
         ),
     ),
     "test": (
