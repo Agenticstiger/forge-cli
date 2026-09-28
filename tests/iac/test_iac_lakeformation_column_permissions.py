@@ -27,7 +27,16 @@ invalid``. The AWS LF developer guide (*Lake Formation permissions reference*):
   Catalog", restricted to the granted columns;
 * "A principal with the SELECT permission on a subset of columns in a table
   cannot be granted the ALTER, DROP, DELETE, or INSERT permission on that
-  table", so those are refused at emit rather than split out.
+  table", so those are refused at emit rather than split out, and so is a
+  second grant for the same principal on the same table.
+
+The grant option: the permissions reference says "When granting SELECT, you
+can't include the grant option if column filtering is applied", the console
+page offers it under simple column-based access, and *Data filtering
+limitations* settles it: "To grant SELECT with the grant option and column
+filtering, you must use an include list, not an exclude list." So SELECT's
+grant option is kept beside ``columns`` and refused beside ``excludedColumns``.
+DESCRIBE's grant option is refused beside either: no resource can carry it.
 
 A separate ``table`` grant would also never settle in OpenTofu: hashicorp/aws
 reads a ``table_with_columns`` grant back through a ``Table`` listing and keeps
@@ -42,6 +51,7 @@ emulator tests passed. So the emitted JSON is the proof here, and
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -177,31 +187,32 @@ class TestAColumnLimitedGrantCarriesSelectOnly:
         (body,) = grants.values()
         assert body["permissions"] == ["SELECT"]
 
-    def test_selects_grant_option_is_kept_and_describes_is_dropped(self):
+    def test_selects_grant_option_is_kept_beside_an_include_list(self):
+        # Data filtering limitations: the grant option with column filtering
+        # needs "an include list, not an exclude list".
         contract = _contract(
-            [
-                _grant(
-                    ANALYST,
-                    ["SELECT", "DESCRIBE"],
-                    excluded=["msisdn"],
-                    grant_option=["SELECT", "DESCRIBE"],
-                )
-            ]
+            [_grant(AUDITOR, ["SELECT", "DESCRIBE"], columns=["id"], grant_option=["SELECT"])]
         )
         (body,) = _emitted(contract).values()
         assert body["permissions"] == ["SELECT"]
         assert body["permissions_with_grant_option"] == ["SELECT"]
+        assert body["table_with_columns"][0]["column_names"] == ["id"]
 
-    def test_a_describe_only_grant_option_leaves_no_grant_option(self):
-        contract = _contract(
-            [
-                _grant(
-                    ANALYST, ["SELECT", "DESCRIBE"], excluded=["msisdn"], grant_option=["DESCRIBE"]
-                )
-            ]
-        )
-        (body,) = _emitted(contract).values()
-        assert "permissions_with_grant_option" not in body
+    def test_a_describe_dropped_beside_a_column_limit_is_logged(self, caplog):
+        # Lake Formation implies DESCRIBE with the SELECT ("If a user has other
+        # Lake Formation permissions on a ... table ..., DESCRIBE is implicitly
+        # granted"), so nothing is lost, but the plan differs from the contract.
+        with caplog.at_level(logging.INFO, logger="fluid_build.iac.providers.aws"):
+            _emitted(DEMO)
+        logged = [r.getMessage() for r in caplog.records if "lf_column_grant_describe" in r.msg]
+        assert len(logged) == 2, logged
+        assert any("grants[1]" in m and ANALYST in m for m in logged), logged
+        assert any("grants[2]" in m and AUDITOR in m for m in logged), logged
+
+    def test_nothing_is_logged_for_a_select_only_column_grant(self, caplog):
+        with caplog.at_level(logging.INFO, logger="fluid_build.iac.providers.aws"):
+            _emitted(_contract([_grant(ANALYST, ["SELECT"], excluded=["msisdn"])]))
+        assert not [r for r in caplog.records if "lf_column_grant_describe" in r.msg]
 
     def test_the_demo_contract_is_schema_valid(self):
         result = FluidSchemaManager().validate_contract(DEMO)
@@ -246,3 +257,69 @@ class TestWhatLakeFormationWouldRefuseIsRefusedAtEmit:
         (body,) = _emitted(contract).values()
         assert body["permissions"] == ["SELECT", "ALTER", "INSERT", "DESCRIBE"]
         assert "table" in body and "table_with_columns" not in body
+
+    @pytest.mark.parametrize("permissions", [["SELECT"], ["SELECT", "DESCRIBE"]])
+    def test_selects_grant_option_beside_an_exclude_list(self, permissions):
+        contract = _contract(
+            [_grant(ANALYST, permissions, excluded=["msisdn"], grant_option=["SELECT"])]
+        )
+        assert FluidSchemaManager().validate_contract(contract).is_valid
+        error = _refusal(contract)
+        assert error.kind == "lakeformation-grant-columns"
+        assert "grants[0]" in str(error) and "exclude" in str(error)
+
+    @pytest.mark.parametrize("limit", ["excluded", "columns"])
+    @pytest.mark.parametrize("grant_option", [["DESCRIBE"], ["SELECT", "DESCRIBE"]])
+    def test_describes_grant_option_beside_a_column_limit(self, limit, grant_option):
+        # Nothing can carry it: table_with_columns takes SELECT only, and a
+        # DESCRIBE on the table is refused to a principal holding a partial SELECT.
+        cols = {"excluded": ["msisdn"]} if limit == "excluded" else {"columns": ["id"]}
+        contract = _contract(
+            [_grant(ANALYST, ["SELECT", "DESCRIBE"], grant_option=grant_option, **cols)]
+        )
+        assert FluidSchemaManager().validate_contract(contract).is_valid
+        error = _refusal(contract)
+        assert error.kind == "lakeformation-grant-columns"
+        assert "grants[0]" in str(error) and "DESCRIBE" in str(error)
+
+
+class TestOneGrantPerPrincipalBesideAColumnLimit:
+    """A second grant for the column-limited principal on the same table.
+
+    Lake Formation refuses DESCRIBE, ALTER, DROP, DELETE and INSERT on the table to
+    a principal holding a partial SELECT; a table-level SELECT or ALL would read the
+    columns the limit withholds; and hashicorp/aws reads a ``table_with_columns``
+    grant back through the principal's whole listing on the table, so a pair never
+    plans clean. The contract cannot express the pair, whichever grant comes first.
+    """
+
+    @pytest.mark.parametrize(
+        "other",
+        [
+            _grant(ANALYST, ["DESCRIBE"]),
+            _grant(ANALYST, ["INSERT"]),
+            _grant(ANALYST, ["SELECT"]),
+            _grant(ANALYST, ["SELECT"], columns=["id"]),
+        ],
+        ids=["describe", "insert", "select", "second-column-limit"],
+    )
+    @pytest.mark.parametrize("column_grant_first", [False, True])
+    def test_is_refused(self, other, column_grant_first):
+        column_grant = _grant(ANALYST, ["SELECT"], excluded=["msisdn"])
+        grants = [column_grant, other] if column_grant_first else [other, column_grant]
+        contract = _contract([_grant(STEWARD, ["SELECT", "DESCRIBE"]), *grants])
+        assert FluidSchemaManager().validate_contract(contract).is_valid
+        error = _refusal(contract)
+        assert error.kind == "lakeformation-grant-columns"
+        assert "grants[1]" in str(error) and "grants[2]" in str(error), str(error)
+        assert ANALYST in str(error)
+
+    def test_a_grant_with_no_permissions_is_not_a_second_grant(self):
+        # The emitter writes nothing for it, so there is no pair.
+        contract = _contract(
+            [_grant(ANALYST, []), _grant(ANALYST, ["SELECT"], excluded=["msisdn"])]
+        )
+        assert sorted(_emitted(contract)) == ["lf_columns_lf_grant_customers_1"]
+
+    def test_other_principals_beside_a_column_limit_are_untouched(self):
+        assert len(_emitted(DEMO)) == 3
