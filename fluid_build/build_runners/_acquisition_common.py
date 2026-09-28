@@ -154,15 +154,30 @@ def begin_acquisition_run(ctx: Any, runner: Any) -> Tuple[str, float]:
     engine lineage at once, the same leverage pattern already used for
     replay (``_state.set_cursor``) and late-arrival policy.
     """
+    started_at = utc_now_iso()
+    enforce_schema_policy_or_raise(ctx, runner)
+    t_start = time.time()
+    emit_start_lineage_event(ctx, started_at=started_at)
+    return started_at, t_start
+
+
+def emit_start_lineage_event(ctx: Any, *, started_at: Optional[str] = None) -> str:
+    """Emit the OpenLineage START event for ``ctx``'s run and return its time.
+
+    :func:`begin_acquisition_run` emits it once the schema gate has passed. A
+    runner that refuses a run before opening it (the duckdb runner refuses a
+    masking policy it cannot apply before the gate and before anything
+    connects) calls this directly, so the FAIL that
+    :func:`emit_terminal_lineage_event` then emits has a START with the same
+    runId, as every other outcome does.
+    """
     from fluid_build.api.lineage import RunEventType
 
     from ._lineage import emit_run_event
 
-    started_at = utc_now_iso()
-    enforce_schema_policy_or_raise(ctx, runner)
-    t_start = time.time()
-    emit_run_event(ctx, event_type=RunEventType.START, event_time=started_at)
-    return started_at, t_start
+    event_time = started_at or utc_now_iso()
+    emit_run_event(ctx, event_type=RunEventType.START, event_time=event_time)
+    return event_time
 
 
 def failed_run_result(ctx: Any, *, engine: str, started_at: str, t_start: float, err: str) -> Any:

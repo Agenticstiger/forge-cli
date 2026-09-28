@@ -1044,9 +1044,12 @@ def _forge_project_creation_core(
     context = rc.context
     copilot_options = rc.copilot_options
     perf_stats = rc.perf_stats
-    use_agent_loop = bool(get_cli_arg_fn(args, "agent_loop", False)) or bool(
-        os.environ.get("FLUID_COPILOT_AGENT_LOOP")
-    )
+    # Parsed as a boolean, not by presence: ``FLUID_COPILOT_AGENT_LOOP=0`` is
+    # the documented way to turn the loop off, and a bare ``bool()`` of the
+    # string turned it on.
+    use_agent_loop = bool(get_cli_arg_fn(args, "agent_loop", False)) or os.environ.get(
+        "FLUID_COPILOT_AGENT_LOOP", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     if scaffold_template:
         success_result = copilot.create_project(

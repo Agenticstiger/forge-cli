@@ -822,12 +822,18 @@ def _verify_local_file(
         # moment a directory name holds a quote.
         literal = quote_ansi_string_literal(file_path.as_posix())
         if actual_fmt == "parquet":
-            rel = con.sql(f"SELECT * FROM read_parquet({literal})")
+            relation_sql = f"SELECT * FROM read_parquet({literal})"
         else:
-            rel = con.sql(f"SELECT * FROM read_csv_auto({literal})")
+            relation_sql = f"SELECT * FROM read_csv_auto({literal})"
+        rel = con.sql(relation_sql)
 
         row_count = rel.aggregate("count(*)").fetchone()[0]
         actual_columns = [col for col in rel.columns]
+        # Did the columns policy.privacy.masking names land treated? Counts only:
+        # a value that fails the check is cleartext and stays out of the report.
+        from fluid_build.cli._verify_masking import local_dimension
+
+        masking = local_dimension(con, relation_sql, actual_columns, expose_config)
         con.close()
     except Exception as exc:
         return {
@@ -871,6 +877,9 @@ def _verify_local_file(
             "actual_count": len(actual_columns),
         }
 
+    if masking is not None:
+        dimensions["masking"] = masking
+
     overall_status = (
         "match" if all(d.get("status") == "match" for d in dimensions.values()) else "mismatch"
     )
@@ -884,23 +893,31 @@ def _verify_local_file(
         "row_count": row_count,
         "actual_columns": actual_columns,
         "dimensions": dimensions,
-        "severity": _local_file_severity(dimensions.get("schema_structure") or {}),
+        "severity": _local_file_severity(dimensions.get("schema_structure") or {}, masking),
     }
 
 
-def _local_file_severity(structure: Dict[str, Any]) -> Dict[str, Any]:
-    """Severity for a local file's ``schema_structure`` dimension.
+def _local_file_severity(
+    structure: Dict[str, Any], masking: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Severity for a local file's ``schema_structure`` and ``masking`` dimensions.
 
     CRITICAL for any mismatch (see :func:`_verify_local_file`), SUCCESS
     otherwise. Same keys as :func:`assess_drift_severity`, so the summary
     and the ``--strict`` exit code treat it like every other verifier.
     """
-    if structure.get("status") != "mismatch":
+    from fluid_build.cli._verify_masking import severity_problem
+
+    masking_problem = severity_problem(masking)
+    if structure.get("status") != "mismatch" and masking_problem is None:
         return assess_drift_severity([], [], [], [], True)
     missing = list(structure.get("missing_fields") or [])
     extra = list(structure.get("extra_fields") or [])
     reasons = []
     actions = []
+    if masking_problem is not None:
+        reasons.append(masking_problem[0])
+        actions.append(masking_problem[1])
     if missing:
         reasons.append(f"declared column(s) missing from the file: {', '.join(missing)}")
         actions.append("Rebuild the output: the file does not carry the declared schema")
@@ -982,15 +999,37 @@ def _render_local_file_result(result: Dict[str, Any], show_diffs: bool) -> None:
             cprint(f"         ❌ Missing in file: {', '.join(missing)}")
         if extra:
             cprint(f"         ⚠️  Not declared in the contract: {', '.join(extra)}")
+    masking = (result.get("dimensions") or {}).get("masking")
+    if masking is not None:
+        _render_masking_dimension(masking, "match", "\n   🔍 Dimension 2: Masking")
     cprint(
         "\n   ⚪ Data types, constraints, location: not checked for local files "
-        "(column names and row count only)"
+        "(column names, row count and masked-value shapes only)"
     )
     cprint(f"\n   💡 Remediation: {severity.get('remediation', 'UNKNOWN')}")
     cprint(f"      {severity.get('reason', '')}")
     if show_diffs and severity.get("actions"):
         for action in severity["actions"]:
             cprint(f"      • {action}")
+
+
+def _render_masking_dimension(masking: Dict[str, Any], ok: str, heading: str) -> None:
+    """Console view of the masking dimension (``_verify_masking``): counts, never values."""
+    cprint(heading)
+    if masking.get("status") == ok:
+        cprint(f"      ✅ PASS - {masking.get('message', '')}", markup=False)
+        return
+    cprint("      ❌ FAIL - masked column(s) did not land treated")
+    columns = masking.get("columns") or []
+    if not columns:
+        cprint(f"         {masking.get('message', '')}", markup=False)
+    for entry in columns:
+        icon = "✅" if entry.get("status") == "pass" else "❌"
+        cprint(
+            f"         {icon} {entry.get('column')} ({entry.get('strategy')}): "
+            f"{entry.get('message', '')}",
+            markup=False,
+        )
 
 
 #: What ``fluid apply`` provisions for a GCP-bound expose, as far as stage 9
@@ -1543,6 +1582,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             cprint(f"      ✅ PASS - Location: {location.get('actual', 'N/A')}")
         else:
             cprint(f"      ❌ FAIL - {location.get('message', 'Location mismatch')}")
+
+        # Dimension 5: Masking, when the expose declares policy.privacy.masking
+        # and the verifier checked it (the Glue + Athena one does).
+        if dimensions.get("masking") is not None:
+            _render_masking_dimension(dimensions["masking"], "pass", "\n   🔍 Dimension 5: Masking")
 
         # Remediation guidance
         cprint(f"\n   💡 Remediation: {severity.get('remediation', 'UNKNOWN')}")
