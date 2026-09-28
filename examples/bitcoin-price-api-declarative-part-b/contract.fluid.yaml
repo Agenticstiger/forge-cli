@@ -1,4 +1,4 @@
-fluidVersion: "0.7.5"
+fluidVersion: "0.7.6"
 kind: DataProduct
 id: crypto.bitcoin_prices_gcp_governed
 name: Bitcoin Price Index (FLUID Declarative + Governance)
@@ -87,6 +87,19 @@ exposes:
         dataset: crypto_data
         table: bitcoin_prices
         region: europe-west3  # GDPR-compliant EU region
+
+      # The readers and the restricted principal under policy.authz are
+      # logical names. binding.principals (fluid-schema 0.7.6) maps each to
+      # the identity it is on this GCP binding; once the block is present,
+      # fluid refuses any of them it does not map. The example.com
+      # identities are documentation placeholders: replace them with your
+      # own groups and service account, as you replace <<YOUR_PROJECT_HERE>>.
+      principals:
+        group:data-analytics@company.com: group:data-analytics@example.com
+        group:finance-team@company.com: group:finance-team@example.com
+        group:trading-desk@company.com: group:trading-desk@example.com
+        "serviceAccount:looker@<<YOUR_PROJECT_HERE>>.iam.gserviceaccount.com": serviceAccount:looker@example.com
+        group:interns@company.com: group:interns@example.com
     
     # GOVERNANCE POLICIES (schema-compliant)
     policy:
@@ -108,7 +121,9 @@ exposes:
           - serviceAccount:data-pipeline@<<YOUR_PROJECT_HERE>>.iam.gserviceaccount.com
           - group:data-engineering@company.com
         
-        # Column-level access control (example - not enforced in free tier)
+        # Column-level access control: fluid apply enforces it with a Data
+        # Catalog policy tag the readers above may read and interns may not
+        # (needs the Data Catalog API; see docs/governance-parity.md)
         columnRestrictions:
           - principal: "group:interns@company.com"
             columns:

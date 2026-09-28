@@ -53,6 +53,21 @@ exposes:
         path: raw/iot/sensor_readings/
         region: us-east-1
 
+      # accessPolicy is the cloud-neutral intent, and the AWS emitter does
+      # not write it: on AWS each zone's Lake Formation grants enforce it,
+      # one per accessPolicy grant (read/select -> SELECT + DESCRIBE,
+      # write/create -> INSERT), on the zone's prefix registered with Lake
+      # Formation. Set AWS_ACCOUNT_ID to the account that owns the roles
+      # before generating or applying the module.
+      governance:
+        lakeFormation:
+          registerLocation: true
+          grants:
+            - principal: "arn:aws:iam::{{ env.AWS_ACCOUNT_ID }}:role/analysts"
+              permissions: [SELECT, DESCRIBE]
+            - principal: "arn:aws:iam::{{ env.AWS_ACCOUNT_ID }}:role/iot-ingest"
+              permissions: [SELECT, INSERT, DESCRIBE]
+
     contract:
       schema:
         - name: device_id
@@ -91,6 +106,16 @@ exposes:
         bucket: acme-iot-lake
         path: curated/iot/sensor_readings/
         region: us-east-1
+
+      # The same accessPolicy, enforced on the Silver prefix.
+      governance:
+        lakeFormation:
+          registerLocation: true
+          grants:
+            - principal: "arn:aws:iam::{{ env.AWS_ACCOUNT_ID }}:role/analysts"
+              permissions: [SELECT, DESCRIBE]
+            - principal: "arn:aws:iam::{{ env.AWS_ACCOUNT_ID }}:role/iot-ingest"
+              permissions: [SELECT, INSERT, DESCRIBE]
 
     contract:
       schema:

@@ -21,7 +21,10 @@ offline** (no AWS account, no credentials, no network, no ``tofu``):
   2. Compile through ``fluid generate iac`` into a credential-free
      ``main.tf.json`` whose resources are exactly the AWS services the
      example claims to exercise (Glue Data Catalog + S3; Athena reads the
-     Glue catalog natively, so it needs no distinct resource).
+     Glue catalog natively, so it needs no distinct resource), plus the Lake
+     Formation grants that enforce the contract's ``accessPolicy`` on AWS
+     (the AWS emitter does not write ``accessPolicy`` itself, and ``fluid
+     validate --strict`` refuses an aws binding that leaves it unenforced).
 
 Both steps run in-process against the real CLI entry point
 (``fluid_build.cli.main``) in an isolated ``tmp_path``. The ``_no_aws``
@@ -58,6 +61,12 @@ AWS_EXAMPLES: Dict[str, Dict[str, Any]] = {
             "aws_glue_catalog_database": 1,
             "aws_glue_catalog_table": 1,
             "aws_s3_bucket": 1,
+            # accessPolicy, enforced: one registered location, a grant per
+            # accessPolicy principal, and the cross-account bucket policy
+            # (count = 0 at plan: every grantee is in the applying account).
+            "aws_lakeformation_resource": 1,
+            "aws_lakeformation_permissions": 2,
+            "aws_s3_bucket_policy": 1,
         },
         "iceberg": False,
     },
@@ -67,6 +76,12 @@ AWS_EXAMPLES: Dict[str, Dict[str, Any]] = {
             "aws_glue_catalog_database": 1,
             "aws_glue_catalog_table": 1,
             "aws_s3_bucket": 1,
+            # accessPolicy, enforced: one registered location, a grant per
+            # accessPolicy principal, and the cross-account bucket policy
+            # (count = 0 at plan: every grantee is in the applying account).
+            "aws_lakeformation_resource": 1,
+            "aws_lakeformation_permissions": 2,
+            "aws_s3_bucket_policy": 1,
         },
         "iceberg": True,
     },
@@ -78,6 +93,11 @@ AWS_EXAMPLES: Dict[str, Dict[str, Any]] = {
             "aws_glue_catalog_database": 2,
             "aws_glue_catalog_table": 2,
             "aws_s3_bucket": 1,
+            # Each zone registers its prefix and grants the same two
+            # principals; the shared bucket has one bucket-policy resource.
+            "aws_lakeformation_resource": 2,
+            "aws_lakeformation_permissions": 4,
+            "aws_s3_bucket_policy": 1,
         },
         "iceberg": False,
     },
@@ -142,8 +162,12 @@ def test_contract_targets_aws(example: str) -> None:
 
 @pytest.mark.parametrize("example", EXAMPLE_IDS)
 def test_contract_validates_offline(example: str, _no_aws: None) -> None:
-    """``fluid validate --offline`` accepts the contract (exit 0)."""
-    rc = main(["validate", str(_contract_path(example)), "--offline", "--quiet"])
+    """``fluid validate --offline --strict`` accepts the contract (exit 0).
+
+    Strict, because an aws binding whose ``accessPolicy`` no Lake Formation
+    grant enforces is a warning, and a shipped example must not carry one.
+    """
+    rc = main(["validate", str(_contract_path(example)), "--offline", "--quiet", "--strict"])
     assert rc == 0, f"{example}: fluid validate returned {rc}"
 
 

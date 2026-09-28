@@ -16,6 +16,9 @@ Part of the **[FLUID examples](../README.md)**. · AWS provider · offline-revie
   **Parquet** in the `curated/` prefix, with inline quality assertions.
 - Both zones are cataloged in the Glue Data Catalog (separate `iot_bronze` /
   `iot_silver` databases) so Athena can query either.
+- One `accessPolicy` for the product, enforced on AWS by Lake Formation
+  grants in each zone's binding: the analysts read both zones, the ingest
+  role writes them.
 
 The raw shape is illustrated by [`sample_raw_readings.csv`](sample_raw_readings.csv)
 (the Bronze objects on S3 look like this — FLUID does not load it; it is here to
@@ -47,6 +50,15 @@ cat /tmp/aws-medallion/main.tf.json
 | `aws_glue_catalog_database.…iot_silver` | Glue Data Catalog | Silver database |
 | `aws_glue_catalog_table.…sensor_readings` | Glue Data Catalog | Silver curated table (Parquet) |
 | `aws_s3_bucket.…acme_iot_lake` | Amazon S3 | Shared object store (raw/ + curated/ prefixes) |
+| `aws_lakeformation_resource.…` | Lake Formation | Registers each zone's S3 prefix (raw/ and curated/) |
+| `aws_lakeformation_permissions.…` | Lake Formation | Four grants, two per zone: the `accessPolicy` reader and writer, as IAM roles |
+| `aws_s3_bucket_policy.…` | Amazon S3 | Direct-read statements for grantees in another account only; with the example's same-account roles it plans `count = 0` |
+
+The grant ARNs read `{{ env.AWS_ACCOUNT_ID }}`. Set it to the account that
+owns the roles before `fluid generate iac` if you will run `tofu validate`
+or `plan` on the module, and before `fluid apply`: left unset, the ARN stays
+unresolved and the AWS provider refuses it. Applying the Lake Formation
+resources needs a Lake Formation administrator.
 
 ## Architecture
 

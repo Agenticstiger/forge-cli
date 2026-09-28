@@ -1295,6 +1295,11 @@ _STORAGE_ACTIONS = {
     "encryption:key-disabled": (
         "Enable the key again (kms:EnableKey, e.g. aws kms enable-key --key-id <key ARN>)"
     ),
+    "columnRestrictions": (
+        "Re-apply so each Lake Formation grant excludes the columns the contract restricts "
+        "from its principal, and revoke any SELECT granted outside the contract that reaches "
+        "them (including one to IAM_ALLOWED_PRINCIPALS on the table)"
+    ),
     "encryption:key-not-enabled": (
         "Bring the key back to the Enabled state (see its KeyState in kms:DescribeKey and "
         "the KMS key states table); until then S3 can neither write nor read its objects"
@@ -1305,7 +1310,7 @@ _STORAGE_ACTIONS = {
 def _storage_problems(dimensions: Mapping[str, Any]) -> List[Tuple[str, str]]:
     """``(message, action)`` for every failed storage dimension."""
     problems: List[Tuple[str, str]] = []
-    for name in ("retention", "encryption"):
+    for name in ("retention", "encryption", "columnRestrictions"):
         dimension = dimensions.get(name) or {}
         if dimension.get("status") != "fail":
             continue

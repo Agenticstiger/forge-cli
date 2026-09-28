@@ -216,7 +216,7 @@ class TestGcpIam:
     _POLICIES = {
         "policies": {
             "analysts": {
-                "principals": ["alice@example.com", "data-team"],
+                "principals": ["alice@example.com", "data-team@corp-a.com"],
                 "permissions": ["read"],
             },
             "writers": {
@@ -248,11 +248,46 @@ class TestGcpIam:
                 ]
             )
         )
-        access = next(iter(res["google_bigquery_dataset"].values()))["access"]
-        assert {e["role"] for e in access} == {"READER", "WRITER"}
-        # '@' -> user_by_email; bare name -> group_by_email
-        assert {"role": "READER", "user_by_email": "alice@example.com"} in access
-        assert {"role": "READER", "group_by_email": "data-team"} in access
+        # Non-authoritative members, not the dataset's authoritative ``access``
+        # list, which replaced every entry the dataset had.
+        assert "access" not in next(iter(res["google_bigquery_dataset"].values()))
+        members = res["google_bigquery_dataset_iam_member"].values()
+        assert {m["role"] for m in members} == {
+            "roles/bigquery.dataViewer",
+            "roles/bigquery.dataEditor",
+        }
+        pairs = {(m["role"], m["member"]) for m in members}
+        # '@' -> user, as the legacy surface always inferred (it cannot tell a
+        # group address from a user's; accessPolicy declares the type).
+        assert ("roles/bigquery.dataViewer", "user:alice@example.com") in pairs
+        assert ("roles/bigquery.dataViewer", "user:data-team@corp-a.com") in pairs
+
+    @pytest.mark.parametrize(
+        "binding",
+        [
+            {"format": "bigquery_table", "location": {"dataset": "d", "table": "t"}},
+            {"format": "gcs_bucket", "location": {"bucket": "my-bucket"}},
+        ],
+        ids=["bigquery", "gcs"],
+    )
+    def test_a_bare_legacy_name_is_refused_not_emitted(self, binding):
+        """A bare name was inferred ``group:data-team``, which no cloud accepts.
+
+        BigQuery refuses a ``groupByEmail`` that is not an address and IAM a
+        ``group:`` member without one, so the grant never applied; it is refused
+        at plan now, with the fix, instead of failing at apply.
+        """
+        from fluid_build.iac.base import UnsupportedBindingError
+
+        contract = {
+            "id": "analytics.demo",
+            "metadata": {"policies": {"a": {"principals": ["data-team"], "permissions": ["read"]}}},
+            "exposes": [{"exposeId": "t", "binding": binding}],
+        }
+        with pytest.raises(UnsupportedBindingError) as caught:
+            _gcp().emit(contract)
+        assert caught.value.kind == "principal-placeholder"
+        assert "group:data-team" in str(caught.value)
 
     def test_gcs_bucket_gets_iam_members(self):
         res = _gcp().emit(
@@ -272,7 +307,7 @@ class TestGcpIam:
         }
         member_strs = {m["member"] for m in members}
         assert "user:alice@example.com" in member_strs
-        assert "group:data-team" in member_strs
+        assert "user:data-team@corp-a.com" in member_strs
         assert "serviceAccount:svc@proj.iam.gserviceaccount.com" in member_strs
 
     def test_no_policies_means_no_iam(self):
@@ -290,6 +325,7 @@ class TestGcpIam:
             )
         )
         assert "access" not in next(iter(res["google_bigquery_dataset"].values()))
+        assert "google_bigquery_dataset_iam_member" not in res
         assert "google_storage_bucket_iam_member" not in res
 
 

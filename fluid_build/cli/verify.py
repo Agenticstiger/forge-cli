@@ -454,6 +454,7 @@ def verify_bigquery_table(
     contract: Optional[Dict[str, Any]] = None,
     workdir: Optional[Path] = None,
     reference_only: bool = False,
+    catalog_session_factory: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Verify BigQuery table with multi-dimensional analysis.
@@ -463,6 +464,8 @@ def verify_bigquery_table(
       2. Data Types (field types)
       3. Constraints (nullable/required modes)
       4. Location (region/location)
+      5. Retention, encryption and column restrictions, when ``expose`` declares
+         them (``_verify_bigquery_governance.py``)
 
     With ``expose`` (what ``fluid verify`` passes), two more from one count
     query (``_verify_bigquery``): ``row_count`` held to the build's run
@@ -584,6 +587,24 @@ def verify_bigquery_table(
             missing_fields or extra_fields or type_mismatches or mode_mismatches or not region_match
         )
 
+        # Retention, encryption and column access, when the expose declares them.
+        governance: Dict[str, Dict[str, Any]] = {}
+        # #674 runs these only for an expose with a binding; the row count and
+        # masking dimensions below (#673) run for every expose.
+        if expose is not None and expose.get("binding"):
+            from fluid_build.cli import _verify_bigquery_governance as _bq_gov
+
+            governance = _bq_gov.governance_dimensions(
+                expose,
+                contract=contract or {},
+                bq_dataset=bq_dataset,
+                bq_table=bq_table,
+                project=project,
+                session_factory=catalog_session_factory,
+            )
+            severity = _bq_gov.with_governance_severity(severity, governance)
+            has_issues = has_issues or any(d["status"] == "fail" for d in governance.values())
+
         result: Dict[str, Any] = {
             "status": "mismatch" if has_issues else "match",
             "exists": True,
@@ -633,6 +654,13 @@ def verify_bigquery_table(
                 reference_only=reference_only,
                 location=bq_dataset.location,
             )
+        if governance:
+            result["dimensions"].update(governance)
+            unchecked = _bq_gov.governance_errors(governance)
+            if unchecked:
+                # A declared policy that could not be checked is unproven, not passed.
+                result["status"] = "error"
+                result["error"] = "; ".join([e for e in (result.get("error"), *unchecked) if e])
         return result
 
     except Exception as e:
