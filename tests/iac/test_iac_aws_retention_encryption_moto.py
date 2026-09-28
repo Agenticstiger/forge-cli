@@ -426,9 +426,22 @@ def test_a_key_s3_cannot_use_fails_the_plan(tmp_path, moto_endpoint, tofu_env):
     asymmetric = kms.create_key(KeySpec="RSA_2048", KeyUsage="ENCRYPT_DECRYPT")["KeyMetadata"]
     _write(_contract(kms=pending["Arn"]), tmp_path, moto_endpoint)
     _init(tmp_path, tofu_env)
-    for arn, refusal, remedy in (
-        (pending["Arn"], "is not Enabled", "kms:CancelKeyDeletion"),
-        (asymmetric["Arn"], "is not a symmetric encryption key (SYMMETRIC_DEFAULT)", "S3"),
+    not_enabled = "is not Enabled"
+    not_symmetric = "is not a symmetric encryption key (SYMMETRIC_DEFAULT)"
+    for arn, refusal, remedy, other in (
+        (
+            pending["Arn"],
+            not_enabled,
+            "or cancel its scheduled deletion (kms:CancelKeyDeletion) and then enable it.",
+            not_symmetric,
+        ),
+        (
+            asymmetric["Arn"],
+            not_symmetric,
+            "the only kind S3 default encryption accepts. Name a symmetric encryption key, "
+            "or use kms: product.",
+            not_enabled,
+        ),
     ):
         _write(_contract(kms=arn), tmp_path, moto_endpoint)
 
@@ -437,7 +450,10 @@ def test_a_key_s3_cannot_use_fails_the_plan(tmp_path, moto_endpoint, tofu_env):
         assert "Resource precondition failed" in output, output
         named = f"The KMS key {arn} (exposes[orders], bucket retention-moto-lake) {refusal}"
         assert named in output, output
-        assert remedy in output
+        # The remedy of this refusal, which no resource address or other
+        # error text contains; and only this key's own precondition fails.
+        assert remedy in output, output
+        assert other not in output, output
 
 
 @pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)

@@ -2430,7 +2430,8 @@ def _existing_key_preconditions(state: _BucketStorage) -> List[Dict[str, Any]]:
         (
             f'{key}.customer_master_key_spec == "SYMMETRIC_DEFAULT"',
             f"{named} is not a symmetric encryption key (SYMMETRIC_DEFAULT), the only kind "
-            "S3 default encryption accepts.",
+            "S3 default encryption accepts. Name a symmetric encryption key, or use "
+            "kms: product.",
         )
     )
     return [{"condition": tofu_ref(cond), "error_message": message} for cond, message in checks]

@@ -163,6 +163,8 @@ def _retention_dimension(s3: Any, bucket: str, retention: Any) -> Dict[str, Any]
     covering = [r for r in expiring if r.every and retention.prefix.startswith(r.prefix)]
     # The rules that cut it short for some of those objects.
     sooner = [r for r in expiring if _sooner(r, retention.prefix, retention.days)]
+    # What is wrong with the rule that should apply the retention (none, or
+    # another number of days), apart from the rules that cut it short.
     problems: List[str] = []
     actual: Dict[str, Any] = {
         "rules": [r.describe() for r in covering],
@@ -182,6 +184,7 @@ def _retention_dimension(s3: Any, bucket: str, retention: Any) -> Dict[str, Any]
                 f"{applied.id or 'without an ID'} on {applied.prefix or 'the whole bucket'!r}); "
                 f"the contract says {retention.period} ({retention.days} day(s))"
             )
+    mismatch = bool(problems)
     for rule in sooner:
         # One prefix contains the other; the objects both reach are under the longer.
         reached = f"s3://{bucket}/{max(rule.prefix, retention.prefix, key=len)}"
@@ -198,8 +201,11 @@ def _retention_dimension(s3: Any, bucket: str, retention: Any) -> Dict[str, Any]
             "actual": actual,
             "message": "; ".join(problems),
         }
+        # The reason picks the remedy (``_verify_athena._STORAGE_ACTIONS``);
+        # no reason is the re-apply. Both problems need both remedies:
+        # removing the sooner rule alone leaves the retention unapplied.
         if sooner:
-            failed["reason"] = "sooner-rule"
+            failed["reason"] = "mismatch-and-sooner-rule" if mismatch else "sooner-rule"
         return failed
     return {
         "status": "pass",

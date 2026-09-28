@@ -478,6 +478,12 @@ class TestExistingKey:
         ]
         enabled = checks[f'${{data.aws_kms_key.{KEY}.key_state == "Enabled"}}']
         assert "alias/platform/lake" in enabled and "kms:CancelKeyDeletion" in enabled
+        # Each refusal says what to do, not only what is wrong.
+        symmetric = checks[
+            f'${{data.aws_kms_key.{KEY}.customer_master_key_spec == "SYMMETRIC_DEFAULT"}}'
+        ]
+        assert "alias/platform/lake" in symmetric
+        assert symmetric.endswith("Name a symmetric encryption key, or use kms: product.")
 
     def test_with_lake_formation_the_key_must_be_customer_managed(self):
         # The AWS managed key named by its key ARN passes the name check; the

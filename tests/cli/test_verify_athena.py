@@ -2304,18 +2304,33 @@ def test_a_rule_that_cannot_cut_the_retention_short_is_ignored(tmp_path, aws, ex
     assert retention["actual"]["sooner"] == []
 
 
-def test_a_sooner_tagged_rule_fails_even_without_a_rule_that_applies_the_retention(tmp_path, aws):
+@pytest.mark.parametrize(
+    "applying, shown",
+    [
+        pytest.param([], "No enabled lifecycle rule expires the objects under", id="no-rule"),
+        pytest.param([_rule(days=90)], "expire after 90 day(s)", id="another-period"),
+    ],
+)
+def test_a_sooner_rule_and_a_retention_not_applied_get_both_remedies(
+    tmp_path, aws, applying, shown
+):
+    # Two problems, two things to do: removing the sooner rule alone still
+    # leaves the objects without the contract's retention.
     contract = _storage(tmp_path)
     aws.table()
-    aws.lifecycle([_filtered({"And": {"Prefix": DATA_PREFIX, "Tags": _TAG}}, 7)])
+    aws.lifecycle([*applying, _filtered({"And": {"Prefix": DATA_PREFIX, "Tags": _TAG}}, 7)])
     aws.key()
     aws.objects({DATA_KEY: KMS_HEAD})
     aws.counts(10172, kms_key=PRODUCT_KEY_ARN)
 
     code, report = _verify(tmp_path, contract)
 
-    retention = report["results"]["subscriptions"]["dimensions"]["retention"]
+    result = report["results"]["subscriptions"]
+    retention = result["dimensions"]["retention"]
     assert code == 1
-    assert retention["reason"] == "sooner-rule"
-    assert retention["message"].startswith("No enabled lifecycle rule expires the objects under")
+    assert retention["reason"] == "mismatch-and-sooner-rule"
+    assert shown in retention["message"]
     assert "sooner than the contract's P30D" in retention["message"]
+    [action] = [a for a in result["severity"]["actions"] if "lifecycle" in a]
+    assert action.startswith("Re-apply so the bucket's lifecycle rule matches lifecycle.retention")
+    assert "remove or narrow the rule that expires objects under the prefix sooner" in action

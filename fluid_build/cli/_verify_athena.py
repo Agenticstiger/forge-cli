@@ -1243,6 +1243,14 @@ _STORAGE_ACTIONS = {
         "whole lifecycle configuration, that rule included); on a shared bucket, ask its "
         "owner"
     ),
+    # No rule applies the retention as declared, and another cuts it short.
+    "retention:mismatch-and-sooner-rule": (
+        "Re-apply so the bucket's lifecycle rule matches lifecycle.retention; on a bucket "
+        "this product owns, the re-apply replaces the whole lifecycle configuration, so it "
+        "also removes the rule that expires objects under the prefix sooner. On a shared "
+        "bucket, ask its owner for a rule that matches lifecycle.retention, and to remove "
+        "or narrow the rule that expires objects under the prefix sooner"
+    ),
     "encryption": (
         "Re-apply so the bucket's default encryption is the declared key, then rewrite "
         "the objects written before it (S3 does not re-encrypt existing objects)"
