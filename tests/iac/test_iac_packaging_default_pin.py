@@ -186,9 +186,9 @@ class TestGenerateIacByteIdentity:
         except CLIError as exc:
             pytest.skip(f"not a single-cloud contract ({exc.event})")
         except UnsupportedBindingError as refused:
-            # The emitter refuses this contract (part-b's reader is still the
-            # unfilled ``<<YOUR_PROJECT_HERE>>`` placeholder): the wired path must
-            # refuse it the same way and write nothing.
+            # The emitter refuses this contract (an unmapped placeholder
+            # principal, say): the wired path must refuse it the same way and
+            # write nothing.
             with pytest.raises(CLIError) as wired:
                 _run_generate_iac(path, tmp_path)
             assert wired.value.event == "unsupported_binding"
