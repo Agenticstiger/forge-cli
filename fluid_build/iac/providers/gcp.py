@@ -716,7 +716,7 @@ def reconcile_legacy_dataset_access(
 ) -> List[Dict[str, Any]]:
     """Revoke, once, the grants a dataset's old authoritative access list held.
 
-    forge-cli 0.16.5 and earlier wrote a dataset's grants as its ``access`` list, which is
+    forge-cli 0.16.6 and earlier wrote a dataset's grants as its ``access`` list, which is
     authoritative: the provider replaced the dataset's whole ACL with it. Grants are
     ``google_bigquery_dataset_iam_member`` resources now, and the module no longer
     sets ``access``, which the provider keeps as Computed: an entry the old list held

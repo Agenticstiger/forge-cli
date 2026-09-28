@@ -104,13 +104,18 @@ jobs:
       # reads the caller identity, so it is proven by a real plan against moto's
       # STS. Installed after the unit step so the extra cannot change what that
       # step runs; the coverage assert fails the step if the file only skipped.
-      - name: Stage 1 — Lake Formation bucket-policy plan (tofu plan vs moto, creds-free)
+      # The column-grant file rides the same step: `tofu validate` passes a
+      # table_with_columns block the provider refuses at plan, so only a plan
+      # proves it, and the assert fails the step if it only skipped.
+      - name: Stage 1 — Lake Formation bucket-policy + column-grant plans (tofu plan vs moto, creds-free)
         run: |
           .venv/bin/pip install --quiet -e '.[dev,test-emulators]'
           .venv/bin/python -m pytest tests/iac/test_iac_lakeformation_bucket_policy_plan.py \
+            tests/iac/test_iac_lakeformation_column_grants_plan.py \
             -q --junitxml=lf-bucket-policy-plan.xml
           .venv/bin/python scripts/ci/assert_lane_coverage.py lf-bucket-policy-plan.xml \
-            --require "LF bucket-policy plan=tests/iac/test_iac_lakeformation_bucket_policy_plan.py"
+            --require "LF bucket-policy plan=tests/iac/test_iac_lakeformation_bucket_policy_plan.py" \
+            --require "LF column-grant plan=tests/iac/test_iac_lakeformation_column_grants_plan.py"
 
       # Retention and encryption at rest: the key policy is only evaluated at
       # plan time, and the lifecycle rule, default SSE-KMS, key rotation and the

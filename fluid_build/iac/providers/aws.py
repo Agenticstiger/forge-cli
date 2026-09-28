@@ -391,6 +391,7 @@ class AwsIacPlugin:
             _emit_kinesis(resources, loc, cid, tags)
             _emit_redshift_serverless(resources, loc, cid, tags)
             _emit_redshift_external_schema(resources, loc, cid, tags)
+            _check_lf_grant_columns(binding, loc, fmt, schema)
             # Per-exposure Lake Formation: location registration,
             # principal grants, LF-tag associations, row/column filters.
             # Only fires when the binding carries a governance.lakeFormation
@@ -1971,21 +1972,33 @@ def _emit_lakeformation(
         cols = grant.get("columns")
         excluded = (exclusions or {}).get(idx) or grant.get("excludedColumns")
         if (cols or excluded) and table_key:
+            if cols and excluded:
+                # One block cannot hold both: Lake Formation takes either a column
+                # list or a column wildcard (with its exclusions), never the two.
+                raise UnsupportedBindingError(
+                    "lakeformation-grant-columns",
+                    f"governance.lakeFormation.grants[{idx}] sets both columns and "
+                    "excludedColumns; they are mutually exclusive.",
+                    (
+                        "Keep columns to grant only the listed columns.",
+                        "Keep excludedColumns to grant every column except the listed ones.",
+                    ),
+                )
             twc: Dict[str, Any] = {
                 "database_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.database_name"),
                 "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
             }
             if cols:
+                # An allow-list: never a wildcard beside it.
                 twc["column_names"] = list(cols)
-            if excluded:
+            else:
+                # Every column except these. hashicorp/aws: "If excluded_column_names
+                # is included, wildcard must be set to true"; without it `tofu plan`
+                # fails "Missing required argument" (`tofu validate` does not, as the
+                # table name is unknown until plan). The provider also reads the grant
+                # back with wildcard = true, so this is what keeps the plan clean.
+                twc["wildcard"] = True
                 twc["excluded_column_names"] = list(excluded)
-                if not cols:
-                    # The provider requires column_names or wildcard ("If
-                    # excluded_column_names is included, wildcard must be set to
-                    # true", terraform-provider-aws lakeformation_permissions);
-                    # without it every excludedColumns grant failed `tofu plan`
-                    # with "one of column_names, wildcard must be specified".
-                    twc["wildcard"] = True
             body["table_with_columns"] = [twc]
         elif table_key:
             body["table"] = [
@@ -1995,6 +2008,19 @@ def _emit_lakeformation(
                 }
             ]
         else:
+            if cols or excluded:
+                # A database grant has no columns, so the limit would be dropped
+                # without a word, and an exclusion is what keeps a column hidden.
+                raise UnsupportedBindingError(
+                    "lakeformation-grant-columns",
+                    f"governance.lakeFormation.grants[{idx}] limits columns, but the binding "
+                    "names no location.table, so the grant would be on the database "
+                    f"{database!r} and the column limit would be dropped.",
+                    (
+                        "Set location.table to the Glue table the columns belong to.",
+                        "Remove columns and excludedColumns to grant on the database.",
+                    ),
+                )
             # Database-level grant when no table is bound.
             body["database"] = [
                 {"name": _glue_db_ref(db_key, database, referenced=placement.database_referenced)}
@@ -2077,6 +2103,52 @@ def _emit_lakeformation(
             }
             filter_key = safe_ident(f"{cid}_lf_filter_{table}_{filter_name}")
             resources.setdefault("aws_lakeformation_data_cells_filter", {})[filter_key] = body
+
+
+def _check_lf_grant_columns(
+    binding: Mapping[str, Any],
+    loc: Mapping[str, Any],
+    fmt: str,
+    schema: List[Mapping[str, Any]],
+) -> None:
+    """Refuse a Lake Formation grant whose ``columns`` / ``excludedColumns`` name a
+    column the table does not have, or exclude every column it has.
+
+    :func:`_emit_lakeformation` writes those names into ``table_with_columns`` on
+    the Glue table that :func:`_emit_glue` creates from ``schema``, and ``tofu
+    plan`` passes any name. A misspelt exclusion is the dangerous one: the grant
+    becomes a column wildcard that still includes the column it meant to hide.
+    Only a binding whose grants are emitted against a Glue table is checked.
+    """
+    gov = (binding.get("governance") or {}).get("lakeFormation") or {}
+    if not gov or str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS:
+        return
+    if not loc.get("database") or not loc.get("table"):
+        return
+    declared = [col.get("name") for col in schema or []]
+    for idx, grant in enumerate(gov.get("grants") or []):
+        cols = list(grant.get("columns") or [])
+        excluded = list(grant.get("excludedColumns") or [])
+        unknown = [c for c in cols + excluded if c not in declared]
+        if unknown:
+            raise UnsupportedBindingError(
+                "lakeformation-grant-columns",
+                f"governance.lakeFormation.grants[{idx}] names the columns {unknown}, which "
+                "the expose's contract.schema does not declare, so the Glue table has no "
+                "such column. A misspelt excludedColumns entry would leave the real column "
+                "readable.",
+                ("Name columns of exposes[].contract.schema, or add the column to it.",),
+            )
+        if excluded and set(declared) <= set(excluded):
+            raise UnsupportedBindingError(
+                "lakeformation-grant-columns",
+                f"governance.lakeFormation.grants[{idx}] excludes every column of the table, "
+                "so it would grant no column to read.",
+                (
+                    "Remove the grant if the principal should read nothing.",
+                    "Leave at least one column out of excludedColumns.",
+                ),
+            )
 
 
 # ---------------------------------------------------------------------------

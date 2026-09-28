@@ -231,7 +231,7 @@ keep data longer, set a longer `retention` instead.
   columns, and `fluid verify`'s Lake Formation check runs against moto's stored grants
   (`tests/iac/test_iac_aws_column_restrictions.py`).
 * The same stand-in shows a revoked reader plans one member destroy that the gate
-  lets through, and that moving from 0.16.5's authoritative access list to member
+  lets through, and that moving from the authoritative access list of 0.16.6 and earlier to member
   resources revokes a grant removed in the same change and then plans clean.
 * **Not proven**: anything against real BigQuery, Cloud KMS, Data Catalog or Lake
   Formation. No emulator enforces IAM, policy tags or keys: that a denied principal's

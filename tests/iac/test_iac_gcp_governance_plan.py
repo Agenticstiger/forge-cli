@@ -316,7 +316,7 @@ def test_removals_the_plan_does_not_itemise_all_count():
 
 
 def _main_module(contract: Dict[str, Any]) -> str:
-    """What forge-cli 0.16.5 emitted: the grants as the dataset's authoritative ``access``."""
+    """What forge-cli 0.16.6 and earlier emitted: the grants as the dataset's ``access``."""
     from fluid_build.iac.access import normalize_access_grants
     from fluid_build.iac.providers.gcp import _bq_access_entries
 
