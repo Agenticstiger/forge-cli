@@ -37,6 +37,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from fluid_build.observability.secret_redactor import redact_secret_text, redact_value
 from fluid_build.providers._duckdb_read import build_register_view_sql
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderMetadata
@@ -385,10 +386,16 @@ class LocalProvider(BaseProvider):
                 results.append({"i": idx, "status": "ok", **res})
             except Exception as e:
                 error_count += 1
+                # The error text can carry a value the SQL was templated with
+                # (``CAST('{{ env.X }}' AS INTEGER)`` echoes X's value), and the
+                # result is printed by the build runner and appended to
+                # ``runtime/out/local_apply_log.jsonl``: both get it redacted.
+                error_text = redact_secret_text(str(e))
                 self._log_error(
-                    "local_apply_action_error", {"i": idx, "error": str(e), "action": action}
+                    "local_apply_action_error",
+                    {"i": idx, "error": error_text, "action": redact_value(action)},
                 )
-                results.append({"i": idx, "status": "error", "error": str(e)})
+                results.append({"i": idx, "status": "error", "error": error_text})
 
         summary = ApplyResult(
             provider="local",
@@ -536,15 +543,14 @@ class LocalProvider(BaseProvider):
                 declared_fmt = "csv"
 
             if out_path:
-                # Coerce the extension to match the declared format so we write
-                # to the exact path the contract specifies.
-                out_path_obj = Path(out_path)
-                if declared_fmt == "parquet" and out_path_obj.suffix.lower() not in {
-                    ".parquet",
-                    ".pq",
-                }:
-                    # Contract declares parquet but path has wrong/no extension.
-                    out_path = str(out_path_obj.with_suffix(".parquet"))
+                # The file name and format come from the one helper the
+                # consumes[] reader also uses (``local_provider_landing``), so
+                # a downstream build reads this file where, and as what, it was
+                # written: a parquet binding whose path lacks the suffix gets
+                # ``.parquet``, and any non-parquet format is written as CSV.
+                from fluid_build.util.binding_paths import local_provider_landing
+
+                out_path, declared_fmt = local_provider_landing(str(out_path), fmt_raw)
                 output_paths = [{"path": out_path, "format": declared_fmt}]
             else:
                 cid = contract.get("id") or "product"

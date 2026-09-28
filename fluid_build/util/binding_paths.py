@@ -39,7 +39,7 @@ import copy
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Union
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 PathLike = Union[str, Path]
 
@@ -111,10 +111,42 @@ def anchor_binding_paths(
     return anchored
 
 
+_PARQUET_ALIASES = frozenset({"parquet", "pq"})
+_PARQUET_SUFFIXES = frozenset({".parquet", ".pq"})
+
+
+def local_provider_landing(path: str, declared_format: Any) -> Tuple[str, str]:
+    """``(path, format)`` of the file the local provider writes for a local binding.
+
+    The one statement of the local provider's rule, used by the writer
+    (``LocalProvider._derive_actions_from_contract``, which every embedded-SQL
+    build on DuckDB lands through) and by the reader that reads that file back
+    as an upstream (``build_runners._embedded_sql_io``). They used to carry
+    their own copies and disagreed: ``format: parquet`` at ``out/orders`` was
+    written to ``out/orders.parquet`` and read at ``out/orders``, and
+    ``format: json`` was written as CSV and read as JSON.
+
+    * ``parquet`` (or ``pq``) is written as parquet, and a path without a
+      ``.parquet`` / ``.pq`` suffix gets ``.parquet`` in place of its suffix.
+    * Anything else, an unset format included, is written as CSV at the path
+      as declared, whatever its suffix.
+
+    ``path`` is already anchored (``resolve_binding_path``); this decides only
+    the file name and the format.
+    """
+    fmt = str(declared_format or "").strip().lower()
+    if fmt not in _PARQUET_ALIASES:
+        return path, "csv"
+    if Path(path).suffix.lower() in _PARQUET_SUFFIXES:
+        return path, "parquet"
+    return str(Path(path).with_suffix(".parquet")), "parquet"
+
+
 __all__ = [
     "ENV_PLACEHOLDER_RE",
     "anchor_binding_paths",
     "is_remote_uri",
+    "local_provider_landing",
     "resolve_binding_path",
     "resolve_env_placeholders_in_path",
 ]

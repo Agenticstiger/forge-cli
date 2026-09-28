@@ -39,16 +39,13 @@ builds:
               THEN 0.8
             ELSE 0.2
           END AS churn_risk
-        FROM hv_customers AS h
-        JOIN bb_degradations AS d ON h.customer_id = d.customer_id;
-      # Each input is named by the consumes[] entry it binds: an explicit
-      # input wins over resolving that entry from the workspace, which is
-      # what lets this example run without its two upstream contracts.
+        FROM hv AS h
+        JOIN deg AS d ON h.customer_id = d.customer_id;
       parameters:
         inputs:
-          - name: "hv_customers"
+          - name: "hv"
             path: "examples/local/high_value_churn/data/high_value_customers.csv"
-          - name: "bb_degradations"
+          - name: "deg"
             path: "examples/local/high_value_churn/data/broadband_degradations.csv"
     execution:
       trigger:

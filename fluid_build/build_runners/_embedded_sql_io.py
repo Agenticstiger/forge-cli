@@ -36,7 +36,10 @@ each entry is resolved the way the upstream itself would be deployed:
    keep patching only ``exposes[].binding``; the SQL never changes.
 3. **Pick the expose** by ``exposeId`` and compute its READ uri: a local path
    anchored at the UPSTREAM contract's directory
-   (``util.binding_paths.resolve_binding_path``); an AWS object-store binding
+   (``util.binding_paths.resolve_binding_path``), with the file name and format
+   the local provider writes it under when an embedded-SQL build of the
+   upstream lands it (``util.binding_paths.local_provider_landing``, the
+   writer's own rule); an AWS object-store binding
    through the duckdb acquisition runner's own key rule
    (``_object_store_uri``), read as the glob of that prefix's files of the
    binding format, which is also what the Glue table ``fluid apply`` declares
@@ -44,12 +47,20 @@ each entry is resolved the way the upstream itself would be deployed:
    table, a stream, a GCS or Azure prefix) is an :class:`UnreadableBindingError`
    naming the platform.
 
-Each entry becomes one DuckDB view named by its ``exposeId``, a quoted
-identifier that must pass ``validate_ident``. An explicit
+Each entry the SQL reads becomes one DuckDB view named by its ``exposeId``, a
+quoted identifier that must pass ``validate_ident``. What the SQL reads is
+decided by DuckDB's own parser (:func:`relations_read`): an entry whose
+``exposeId`` names no relation in the query is LINEAGE ONLY, as every entry was
+before this module, and is not resolved (a contract that binds its inputs under
+other names, or reads its upstream by path in the SQL, keeps building). When
+the parser cannot tell (a statement it does not serialize, a syntax error),
+every entry is treated as read. An explicit
 ``builds[].properties.parameters.inputs`` entry of the same name WINS and the
 entry is not resolved at all: that is how a federated upstream, or one this
-engine cannot read, is still bound. An entry that is neither resolved nor
-covered fails the build before any SQL runs.
+engine cannot read, is still bound. An entry the SQL reads that is neither
+resolved nor covered fails the build before any SQL runs, and so does one
+naming the building contract's own id, which would read the file this build is
+about to overwrite.
 
 **Lands.** When the first expose's binding is an AWS object-store binding, the
 result is written to exactly the object the acquisition runner writes for that
@@ -80,16 +91,18 @@ Borrowed, not built:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build._errors import FluidUserError, doc_url
 from fluid_build.util.binding_paths import (
     ENV_PLACEHOLDER_RE,
     is_remote_uri,
+    local_provider_landing,
     resolve_binding_path,
 )
 
@@ -201,6 +214,17 @@ class CoveredInput:
 
 
 @dataclass(frozen=True)
+class LineageOnlyInput:
+    """A ``consumes[]`` entry the SQL does not read: recorded, not resolved."""
+
+    product_id: str
+    expose_id: str
+
+    def as_consume(self) -> Dict[str, str]:
+        return {"productId": self.product_id, "exposeId": self.expose_id}
+
+
+@dataclass(frozen=True)
 class Landing:
     """The object-store object an embedded-SQL build writes its result to."""
 
@@ -221,6 +245,7 @@ class EmbeddedSqlIO:
 
     inputs: List[ResolvedInput] = field(default_factory=list)
     covered: List[CoveredInput] = field(default_factory=list)
+    lineage_only: List[LineageOnlyInput] = field(default_factory=list)
     landing: Optional[Landing] = None
     workspace_root: Optional[Path] = None
 
@@ -307,6 +332,76 @@ def explicit_input_names(build: Mapping[str, Any]) -> Dict[str, str]:
     return names
 
 
+def _base_tables(node: Any, ctes: FrozenSet[str], found: Set[str]) -> None:
+    """Collect the ``BASE_TABLE`` names under ``node`` that no CTE in scope shadows.
+
+    ``node`` is DuckDB's serialized parse tree (``json_serialize_sql``). A
+    query node's ``cte_map`` puts its CTE names in scope for everything below
+    it, the CTE bodies included; an unqualified reference to one of them is the
+    CTE, not a relation this build has to provide.
+    """
+    if isinstance(node, list):
+        for item in node:
+            _base_tables(item, ctes, found)
+        return
+    if not isinstance(node, dict):
+        return
+    cte_map = node.get("cte_map")
+    if isinstance(cte_map, dict):
+        names = {str(e.get("key") or "").casefold() for e in cte_map.get("map") or []}
+        ctes = ctes | frozenset(names)
+    if node.get("type") == "BASE_TABLE":
+        name = str(node.get("table_name") or "").casefold()
+        qualified = bool(node.get("schema_name") or node.get("catalog_name"))
+        if name and (qualified or name not in ctes):
+            found.add(name)
+    for value in node.values():
+        _base_tables(value, ctes, found)
+
+
+def relations_read(sql: str) -> Optional[FrozenSet[str]]:
+    """The casefolded names of the relations ``sql`` reads, or ``None`` if unknown.
+
+    Parsed, never bound, by DuckDB's own parser (``json_serialize_sql``, the
+    grammar the query will run under), on a connection with external access
+    off. ``duckdb.get_table_names`` is not usable here: on DuckDB 1.5 it BINDS
+    the query, so it reads the files a ``read_parquet(...)`` names (and fetches
+    a URL one names), raises for a ``JOIN ... USING`` against a view that is
+    not registered yet, and raises for a glob that matches nothing, which is
+    exactly the SQL of a contract that reads its upstream by path.
+
+    ``None`` when the parser cannot say: a statement it does not serialize
+    (anything but SELECT, e.g. ``PIVOT``), a syntax error, or no SQL. The
+    caller then treats every consumes entry as read, as it did before.
+    """
+    if not str(sql or "").strip():
+        return None
+    try:
+        import duckdb
+
+        con = duckdb.connect(
+            ":memory:",
+            config={
+                "enable_external_access": False,
+                "autoinstall_known_extensions": False,
+                "autoload_known_extensions": False,
+            },
+        )
+        try:
+            row = con.execute("SELECT json_serialize_sql(?)", [str(sql)]).fetchone()
+        finally:
+            con.close()
+        doc = json.loads(row[0]) if row and row[0] else {}
+    except Exception as exc:  # noqa: BLE001 - "cannot tell" is the answer
+        LOG.debug("embedded_sql_relations_unparsed: %s", type(exc).__name__)
+        return None
+    if not isinstance(doc, dict) or doc.get("error") or "statements" not in doc:
+        return None
+    found: Set[str] = set()
+    _base_tables(doc["statements"], frozenset(), found)
+    return frozenset(found)
+
+
 def _search_roots(contract_dir: Path) -> Tuple[Optional[Path], List[Path]]:
     """The workspace root above ``contract_dir`` and every root to walk."""
     from fluid_build.util.upstream_discovery import collect_search_roots
@@ -377,10 +472,34 @@ def _read_uri(path: str, platform: str, fmt: str, where: str) -> Tuple[str, str,
     return uri, fmt, "aws"
 
 
+def _landed_by_local_provider(upstream: Mapping[str, Any], expose: Mapping[str, Any]) -> bool:
+    """Whether the local provider writes ``expose``: an embedded-SQL build lands it.
+
+    That provider writes the FIRST expose of a contract with an embedded-SQL
+    build on DuckDB (``base._execute_embedded_sql_build``), under its own file
+    name and format rule. Any other local expose (an acquisition build's, or a
+    file nothing in the workspace builds) is where and as what it is declared.
+    """
+    from .base import LOCAL_SQL_PLATFORMS, embedded_sql_platform, is_embedded_sql_build
+
+    exposes = [e for e in upstream.get("exposes") or [] if isinstance(e, Mapping)]
+    if not exposes or exposes[0] is not expose:
+        return False
+    builds = [b for b in upstream.get("builds") or [] if isinstance(b, dict)]
+    return any(
+        is_embedded_sql_build(b) and embedded_sql_platform(b) in LOCAL_SQL_PLATFORMS for b in builds
+    )
+
+
 def _read_local(
-    path: Optional[str], fmt: str, upstream_path: Path, where: str
+    path: Optional[str], fmt: str, upstream_path: Path, where: str, *, local_provider: bool
 ) -> Tuple[str, str, str]:
-    """A local binding: its path, anchored at the UPSTREAM contract's directory."""
+    """A local binding: its path, anchored at the UPSTREAM contract's directory.
+
+    With ``local_provider`` (the local provider writes it), the file name and
+    format are that writer's (``local_provider_landing``): a parquet binding
+    at ``out/orders`` is ``out/orders.parquet``, and a ``json`` one is CSV.
+    """
     from .duckdb.runner import _FILE_FORMAT_EXT
 
     if not path:
@@ -391,7 +510,10 @@ def _read_local(
             doc=doc_url(),
         )
     local = str(resolve_binding_path(path, upstream_path.parent))
-    fmt = fmt if fmt in FILE_FORMATS else (_format_from_suffix(local) or "csv")
+    if local_provider:
+        local, fmt = local_provider_landing(local, fmt)
+    else:
+        fmt = fmt if fmt in FILE_FORMATS else (_format_from_suffix(local) or "csv")
     if Path(local).is_dir():
         local = str(Path(local) / f"*.{_FILE_FORMAT_EXT[fmt]}")
     return local, fmt, "local"
@@ -424,7 +546,7 @@ def _read_s3_prefix(
 
 
 def _read_location(
-    expose: Mapping[str, Any], upstream_path: Path, where: str
+    expose: Mapping[str, Any], upstream_path: Path, where: str, *, local_provider: bool = False
 ) -> Tuple[str, str, str, Optional[str]]:
     """``(uri, format, platform, region)`` the upstream expose is READ from."""
     raw_binding = expose.get("binding")
@@ -439,7 +561,10 @@ def _read_location(
     if path and is_remote_uri(path):
         return (*_read_uri(path, platform, fmt, where), region)
     if platform in _LOCAL_PLATFORMS:
-        return (*_read_local(path, fmt, upstream_path, where), None)
+        return (
+            *_read_local(path, fmt, upstream_path, where, local_provider=local_provider),
+            None,
+        )
     if platform == "aws":
         return (*_read_s3_prefix(binding, loc, path, fmt, where), region)
     raise _unreadable(where, platform, fmt, f"platform {platform}")
@@ -508,10 +633,19 @@ def _claim_view(product_id: str, expose_id: str, views: Dict[str, str]) -> None:
 
 
 def _split_covered(
-    entries: Sequence[Mapping[str, Any]], explicit: Mapping[str, str]
-) -> Tuple[List[CoveredInput], List[Tuple[str, str]]]:
-    """``(covered, pending)``: the entries an explicit input binds, and the rest."""
+    entries: Sequence[Mapping[str, Any]],
+    explicit: Mapping[str, str],
+    read: Optional[FrozenSet[str]],
+) -> Tuple[List[CoveredInput], List[LineageOnlyInput], List[Tuple[str, str]]]:
+    """``(covered, lineage_only, pending)`` of the consumes entries.
+
+    COVERED: an explicit input binds the name. LINEAGE ONLY: the SQL reads no
+    relation of that name (``read`` is :func:`relations_read`; ``None`` means
+    it could not tell, and then nothing is lineage only). PENDING: the rest,
+    which must resolve.
+    """
     covered: List[CoveredInput] = []
+    lineage_only: List[LineageOnlyInput] = []
     pending: List[Tuple[str, str]] = []
     views: Dict[str, str] = {}
     for entry in entries:
@@ -519,9 +653,32 @@ def _split_covered(
         if expose_id.casefold() in explicit:
             covered.append(CoveredInput(product_id, expose_id, explicit[expose_id.casefold()]))
             continue
+        if read is not None and expose_id.casefold() not in read:
+            lineage_only.append(LineageOnlyInput(product_id, expose_id))
+            continue
         _claim_view(product_id, expose_id, views)
         pending.append((product_id, expose_id))
-    return covered, pending
+    return covered, lineage_only, pending
+
+
+def _refuse_self_consume(contract: Mapping[str, Any], pending: Sequence[Tuple[str, str]]) -> None:
+    """A build never reads its own product: it would read what it is about to overwrite."""
+    own = str(contract.get("id") or "").strip()
+    for product_id, expose_id in pending:
+        if own and product_id == own:
+            raise ConsumesResolutionError(
+                what=f"{_entry(product_id, expose_id)}: the contract consumes its own id",
+                why=(
+                    f"{own!r} is this contract. Resolving the entry would read the file this "
+                    "build is about to overwrite, so the result would depend on the previous run."
+                ),
+                fix=(
+                    "Consume the upstream product this data comes from instead. "
+                    + _EXPLICIT_INPUT_FIX.format(name=expose_id)
+                ),
+                doc=doc_url(),
+                extras={"productId": product_id},
+            )
 
 
 @dataclass(frozen=True)
@@ -569,8 +726,8 @@ def _upstream_contract(ws: _Workspace, product_id: str, expose_id: str) -> Path:
 
 def _upstream_expose(
     upstream_path: Path, product_id: str, expose_id: str, env: Optional[str], log: logging.Logger
-) -> Mapping[str, Any]:
-    """The upstream's expose ``expose_id``, as this run's ``env`` overlay leaves it."""
+) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """``(upstream contract, its expose expose_id)``, as this run's ``env`` overlay leaves them."""
     from fluid_build._contract_loader import load_contract_with_overlay
 
     where = _entry(product_id, expose_id)
@@ -600,47 +757,56 @@ def _upstream_expose(
             fix="Name one of those exposes in exposeId.",
             doc=doc_url(),
         )
-    return expose
+    return upstream, expose
 
 
-def resolve_consumes(
+@dataclass
+class _Bound:
+    """What :func:`_bind_consumes` decided for each consumes entry."""
+
+    resolved: List[ResolvedInput] = field(default_factory=list)
+    covered: List[CoveredInput] = field(default_factory=list)
+    lineage_only: List[LineageOnlyInput] = field(default_factory=list)
+    workspace_root: Optional[Path] = None
+
+
+def _bind_consumes(
     contract: Mapping[str, Any],
     build: Mapping[str, Any],
     contract_dir: Path,
     *,
-    env: Optional[str] = None,
-    logger: Optional[logging.Logger] = None,
-) -> Tuple[List[ResolvedInput], List[CoveredInput], Optional[Path]]:
-    """Bind every ``consumes[]`` entry, or raise :class:`ConsumesResolutionError`.
-
-    Returns ``(resolved, covered, workspace_root)``. An entry whose ``exposeId``
-    names an explicit ``builds[].properties.parameters.inputs`` entry is
-    COVERED: the explicit input wins on the name collision and the entry is
-    not resolved at all. Every other entry must resolve; the first that does
-    not raises, naming its productId and where it looked, so the SQL never
-    runs with an input missing.
-    """
+    env: Optional[str],
+    logger: Optional[logging.Logger],
+) -> _Bound:
     from fluid_build.util.upstream_discovery import index_contract_paths
 
     entries = [c for c in contract.get("consumes") or [] if isinstance(c, Mapping)]
     if not entries:
-        return [], [], None
+        return _Bound()
     env = _validated_env(env)
-    covered, pending = _split_covered(entries, explicit_input_names(build))
+    props = build.get("properties") if isinstance(build.get("properties"), Mapping) else {}
+    read = relations_read(str((props or {}).get("sql") or ""))
+    covered, lineage_only, pending = _split_covered(entries, explicit_input_names(build), read)
+    bound = _Bound(covered=covered, lineage_only=lineage_only)
     if not pending:
-        return [], covered, None
+        return bound
+    _refuse_self_consume(contract, pending)
 
     root, roots = _search_roots(contract_dir)
     index, skipped = index_contract_paths(roots)
     ws = _Workspace(Path(contract_dir), root, roots, index, skipped)
-    resolved: List[ResolvedInput] = []
     for product_id, expose_id in pending:
         upstream_path = _upstream_contract(ws, product_id, expose_id)
-        expose = _upstream_expose(upstream_path, product_id, expose_id, env, logger or LOG)
-        uri, fmt, platform, region = _read_location(
-            expose, upstream_path, _entry(product_id, expose_id)
+        upstream, expose = _upstream_expose(
+            upstream_path, product_id, expose_id, env, logger or LOG
         )
-        resolved.append(
+        uri, fmt, platform, region = _read_location(
+            expose,
+            upstream_path,
+            _entry(product_id, expose_id),
+            local_provider=_landed_by_local_provider(upstream, expose),
+        )
+        bound.resolved.append(
             ResolvedInput(
                 product_id=product_id,
                 expose_id=expose_id,
@@ -651,7 +817,31 @@ def resolve_consumes(
                 region=region,
             )
         )
-    return resolved, covered, root
+    bound.workspace_root = root
+    return bound
+
+
+def resolve_consumes(
+    contract: Mapping[str, Any],
+    build: Mapping[str, Any],
+    contract_dir: Path,
+    *,
+    env: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[List[ResolvedInput], List[CoveredInput], Optional[Path]]:
+    """Bind every ``consumes[]`` entry the SQL reads, or raise :class:`ConsumesResolutionError`.
+
+    Returns ``(resolved, covered, workspace_root)``. An entry whose ``exposeId``
+    names an explicit ``builds[].properties.parameters.inputs`` entry is
+    COVERED: the explicit input wins on the name collision and the entry is
+    not resolved at all. An entry whose ``exposeId`` names no relation the
+    build's SQL reads (:func:`relations_read`) is lineage only and is not
+    resolved either (:func:`plan_embedded_sql_io` reports those). Every other
+    entry must resolve; the first that does not raises, naming its productId
+    and where it looked, so the SQL never runs with an input missing.
+    """
+    bound = _bind_consumes(contract, build, contract_dir, env=env, logger=logger)
+    return bound.resolved, bound.covered, bound.workspace_root
 
 
 # ── Landing ─────────────────────────────────────────────────────────────
@@ -784,11 +974,13 @@ def plan_embedded_sql_io(
     """
     refuse_unapplied_masking(contract, build)
     landing = object_store_landing(contract, build)
-    inputs, covered, workspace_root = resolve_consumes(
-        contract, build, contract_dir, env=env, logger=logger
-    )
+    bound = _bind_consumes(contract, build, contract_dir, env=env, logger=logger)
     return EmbeddedSqlIO(
-        inputs=inputs, covered=covered, landing=landing, workspace_root=workspace_root
+        inputs=bound.resolved,
+        covered=bound.covered,
+        lineage_only=bound.lineage_only,
+        landing=landing,
+        workspace_root=bound.workspace_root,
     )
 
 
@@ -799,6 +991,7 @@ __all__ = [
     "EmbeddedSqlLandingError",
     "FILE_FORMATS",
     "Landing",
+    "LineageOnlyInput",
     "MaskingNotAppliedError",
     "ResolvedInput",
     "UnreadableBindingError",
@@ -806,5 +999,6 @@ __all__ = [
     "object_store_landing",
     "plan_embedded_sql_io",
     "refuse_unapplied_masking",
+    "relations_read",
     "resolve_consumes",
 ]

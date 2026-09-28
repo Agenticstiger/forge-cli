@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
+from fluid_build._errors import FluidUserError, doc_url
 from fluid_build.api.runner import (
     RunContext,
     RunnerCapability,
@@ -245,6 +246,13 @@ def _s3_endpoint_override() -> List[str]:
     return parts
 
 
+@dataclass
+class ObjectStoreEndpointError(FluidUserError):
+    """An ``AWS_ENDPOINT_URL`` override is set, but DuckDB could not be pointed at it."""
+
+    code: str = "ObjectStoreEndpointError"
+
+
 def create_s3_credential_chain_secret(
     con: Any,
     *,
@@ -261,7 +269,14 @@ def create_s3_credential_chain_secret(
     a build reading two buckets in two regions signs each with its own region.
     Returns whether the secret was created; a failure is logged and swallowed,
     as it always was, leaving the env-var fallback in play.
+
+    Except with an endpoint override (``AWS_ENDPOINT_URL[_S3]``): the secret is
+    the only thing that points DuckDB at the S3-compatible store, so without it
+    the reads and writes that follow go to AWS itself, with whatever
+    credentials the environment holds. That raises
+    :class:`ObjectStoreEndpointError` instead.
     """
+    endpoint = _s3_endpoint_override()
     parts = ["TYPE s3", "PROVIDER credential_chain"]
     if region:
         # quote_ansi_string_literal, not an f-string: `region` is contract input
@@ -270,7 +285,7 @@ def create_s3_credential_chain_secret(
         # runs before any data moves. The neighbouring CREATE SECRET path was
         # already hardened against exactly this.
         parts.append(f"REGION {quote_ansi_string_literal(str(region))}")
-    parts.extend(_s3_endpoint_override())
+    parts.extend(endpoint)
     if scope:
         parts.append(f"SCOPE {quote_ansi_string_literal(str(scope))}")
     try:
@@ -283,6 +298,22 @@ def create_s3_credential_chain_secret(
         # finding even when its value is the string "s3". The source-side
         # handler above logs `scheme` for exactly this reason.
         LOG.warning("DuckDB destination CREATE SECRET (%s) failed: %s", "s3", type(exc).__name__)
+        if endpoint:
+            # Only the exception class, for the same reason as the log line.
+            raise ObjectStoreEndpointError(
+                what=("AWS_ENDPOINT_URL is set, but DuckDB's S3 access could not be pointed at it"),
+                why=(
+                    f"CREATE SECRET failed ({type(exc).__name__}), and that secret is what "
+                    "carries the endpoint: without it every read and write would go to AWS "
+                    "itself instead of the store the endpoint names."
+                ),
+                fix=(
+                    "Make the DuckDB httpfs and aws extensions loadable here (install them "
+                    "while online, or set a local extension_directory), or unset "
+                    "AWS_ENDPOINT_URL / AWS_ENDPOINT_URL_S3 to use AWS."
+                ),
+                doc=doc_url(),
+            ) from None
         return False
     return True
 

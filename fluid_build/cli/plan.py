@@ -387,6 +387,15 @@ def run(args, logger: logging.Logger) -> int:
                     bundle_path,
                     why,
                 )
+        # The overlay env the embedded contract was loaded with, under
+        # planDigest. ``fluid apply plan.json`` builds that contract, and a
+        # build's consumes[] upstreams must be read with the same overlay
+        # (``build_runners.base._run_env``); it used to read their base
+        # bindings unless apply was given --env again. No env, no key.
+        planned_env = _planned_env(args, bundle_path)
+        plan_meta = plan.get("contract_metadata")
+        if planned_env and isinstance(plan_meta, dict):
+            plan_meta["env"] = planned_env
         try:
             plan = inject_digests(plan, bundle_path=bundle_path)
         except FileNotFoundError as exc:
@@ -505,6 +514,26 @@ def run(args, logger: logging.Logger) -> int:
         raise
     except Exception as e:
         raise CLIError(1, "planner_failed", context={"error": str(e)})
+
+
+def _planned_env(args: argparse.Namespace, bundle_path: Optional[Path]) -> Optional[str]:
+    """The overlay env the planned contract carries: a bundle's own, else ``--env``.
+
+    A bundle is never re-overlaid (``load_contract_with_overlay``), so its
+    MANIFEST's env is the one its contract carries; ``check_bundle_env`` has
+    already refused an ``--env`` that contradicts it.
+    """
+    requested = getattr(args, "env", None) or None
+    if bundle_path is not None:
+        try:
+            from fluid_build.forge.core.bundle import read_bundle_source
+
+            source = read_bundle_source(bundle_path)
+        except Exception:  # noqa: BLE001 - inject_digests reports an unreadable bundle
+            source = None
+        if source and source.get("env"):
+            return str(source["env"])
+    return str(requested) if requested else None
 
 
 def _report_sovereignty(
