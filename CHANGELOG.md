@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.6] — 2026-09-28
+
+A Lake Formation grant that hides columns from a principal now plans. Found
+when the demo's first AWS chain run with column grants failed at the drift
+gate on 0.16.5; checked with `tofu plan` against moto on the three demo
+products (bronze and gold failed on 0.16.5, all three plan clean now).
+
+### Fixed
+
+- **A Lake Formation grant with `excludedColumns` sets `wildcard = true`**
+  (#675). forge-cli emitted `table_with_columns` with `excluded_column_names`
+  and no `wildcard`, which the AWS provider rejects at plan ("one of
+  `column_names`, `wildcard` must be specified"), so `fluid diff` and
+  `fluid apply --env aws` failed for any contract hiding a column from a
+  grantee. `tofu validate` did not catch it, because the table names are
+  references that are unknown at validate time. A column allow-list emits
+  `column_names` and never a wildcard, and a grant with neither keeps the
+  table block. A grant naming both is refused, as are excluded columns the
+  schema does not have (a typo used to open every column), and column limits
+  on a binding with no table are refused rather than dropped.
+
 ## [0.16.5] — 2026-09-28
 
 The policies an AWS contract declares now reach AWS, a chained product reads
@@ -3638,7 +3659,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.5...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.6...HEAD
+[0.16.6]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.5...v0.16.6
 [0.16.5]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.4...v0.16.5
 [0.16.4]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.2...v0.16.3
