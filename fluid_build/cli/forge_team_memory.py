@@ -37,6 +37,7 @@ __all__ = [
     "scaffold_team_memory",
 ]
 
+import datetime
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +51,15 @@ TEAM_MEMORY_FILENAME = "team-memory.yaml"
 
 # Maximum items to keep from decisions list to avoid prompt bloat.
 _MAX_DECISIONS = 10
+
+# Bounds on what one team-memory file can put into the LLM prompt. The file
+# is shared through git, so its content comes from every committer, and YAML
+# anchors let a few hundred bytes stand for megabytes once a nested value is
+# turned into text. Only scalar values are kept, and every map, list and
+# string is capped.
+_MAX_FILE_BYTES = 64 * 1024
+_MAX_ENTRIES = 50  # per naming / defaults map and per vocabulary list
+_MAX_STRING_CHARS = 500  # per key, value, vocabulary term or decision field
 
 # Template scaffolded on `fluid init` or when the user creates a new workspace.
 TEAM_MEMORY_TEMPLATE = """\
@@ -163,28 +173,95 @@ class TeamMemory:
         return ", ".join(parts) if parts else "empty"
 
 
-def _clean_string_list(raw: Any) -> List[str]:
-    """Normalize a YAML value to a list of non-empty strings."""
-    if not raw:
+_SCALAR_TYPES = (str, bool, int, float, datetime.date)
+
+
+def _scalar_text(value: Any) -> Optional[str]:
+    """Return a YAML scalar as stripped, length-capped text.
+
+    ``None`` for null, empty text, and anything that is not a scalar. Lists
+    and maps are refused rather than stringified: ``str()`` of a nested value
+    expands every YAML alias inside it, which is how a 417-byte file became a
+    12 MB prompt.
+    """
+    if not isinstance(value, _SCALAR_TYPES):
+        return None
+    text = str(value).strip()
+    return text[:_MAX_STRING_CHARS] if text else None
+
+
+def _is_nested(value: Any) -> bool:
+    """A set value that is not a scalar (a list or a map): refused, and reported."""
+    return value is not None and not isinstance(value, _SCALAR_TYPES)
+
+
+def _clean_string_list(raw: Any, *, label: str, notes: List[str]) -> List[str]:
+    """Normalize a YAML value to at most ``_MAX_ENTRIES`` non-empty strings."""
+    if not isinstance(raw, list):
         return []
-    if isinstance(raw, list):
-        return [str(item).strip() for item in raw if str(item or "").strip()]
-    return []
+    nested = sum(1 for item in raw if _is_nested(item))
+    if nested:
+        notes.append(f"{label}: dropped {nested} nested item(s)")
+    items = [text for text in (_scalar_text(item) for item in raw) if text]
+    if len(items) > _MAX_ENTRIES:
+        notes.append(f"{label}: kept the first {_MAX_ENTRIES} of {len(items)}")
+    return items[:_MAX_ENTRIES]
+
+
+def _clean_scalar_map(raw: Any, *, label: str, notes: List[str]) -> Dict[str, str]:
+    """Normalize a YAML mapping to at most ``_MAX_ENTRIES`` scalar entries.
+
+    A null or empty value (``domain:`` left blank) is an unset entry and is
+    skipped quietly; it used to come through as the string ``"None"``.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    nested = sum(1 for key, value in raw.items() if _is_nested(key) or _is_nested(value))
+    if nested:
+        notes.append(f"{label}: dropped {nested} nested value(s)")
+    out: Dict[str, str] = {}
+    for raw_key, raw_value in raw.items():
+        key, value = _scalar_text(raw_key), _scalar_text(raw_value)
+        if key is None or value is None:
+            continue
+        if len(out) == _MAX_ENTRIES:
+            notes.append(f"{label}: kept the first {_MAX_ENTRIES} entries")
+            break
+        out[key] = value
+    return out
+
+
+def _read_bounded(path: Path) -> Optional[str]:
+    """Read *path* as UTF-8, or ``None`` when it is over ``_MAX_FILE_BYTES``."""
+    with path.open("rb") as handle:
+        data = handle.read(_MAX_FILE_BYTES + 1)
+    if len(data) > _MAX_FILE_BYTES:
+        return None
+    return data.decode("utf-8")
 
 
 def load_team_memory(workspace_root: Path) -> Optional[TeamMemory]:
     """Load team memory from ``.fluid/team-memory.yaml``.
 
     Returns ``None`` if the file does not exist.  Logs a warning and
-    returns ``None`` on parse/validation errors (fail-open).
+    returns ``None`` on parse/validation errors (fail-open), and on a file
+    larger than ``_MAX_FILE_BYTES``.  Only scalar values are kept, and maps,
+    lists and strings are capped (see ``_MAX_ENTRIES`` and
+    ``_MAX_STRING_CHARS``), because the result is sent to the LLM.
     """
     path = workspace_root / ".fluid" / TEAM_MEMORY_FILENAME
     if not path.exists():
         return None
 
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (yaml.YAMLError, OSError) as exc:
+        text = _read_bounded(path)
+        if text is None:
+            LOG.warning(
+                "Team memory at %s is larger than %d bytes (skipping)", path, _MAX_FILE_BYTES
+            )
+            return None
+        raw = yaml.safe_load(text)
+    except (yaml.YAMLError, OSError, UnicodeDecodeError) as exc:
         LOG.warning("Could not parse team memory at %s: %s", path, exc)
         return None
 
@@ -204,33 +281,47 @@ def load_team_memory(workspace_root: Path) -> Optional[TeamMemory]:
     if not isinstance(defaults, dict):
         defaults = {}
 
+    notes: List[str] = []
+
     raw_decisions = raw.get("decisions") or []
     if not isinstance(raw_decisions, list):
         raw_decisions = []
     decisions = []
     for entry in raw_decisions[:_MAX_DECISIONS]:
-        if isinstance(entry, dict) and entry.get("decision"):
-            decisions.append(
-                {
-                    "date": str(entry.get("date", "")),
-                    "decision": str(entry["decision"]),
-                    "rationale": str(entry.get("rationale", "")),
-                }
-            )
+        if not isinstance(entry, dict):
+            continue
+        decision = _scalar_text(entry.get("decision"))
+        if decision is None:
+            continue
+        decisions.append(
+            {
+                "date": _scalar_text(entry.get("date")) or "",
+                "decision": decision,
+                "rationale": _scalar_text(entry.get("rationale")) or "",
+            }
+        )
 
     vocabulary = raw.get("vocabulary") or {}
     if not isinstance(vocabulary, dict):
         vocabulary = {}
 
     tm = TeamMemory(
-        naming={str(k): str(v) for k, v in naming.items()},
-        defaults={str(k): str(v) for k, v in defaults.items()},
+        naming=_clean_scalar_map(naming, label="conventions.naming", notes=notes),
+        defaults=_clean_scalar_map(defaults, label="conventions.defaults", notes=notes),
         decisions=decisions,
-        vocabulary_entities=_clean_string_list(vocabulary.get("entities")),
-        vocabulary_measures=_clean_string_list(vocabulary.get("measures")),
-        vocabulary_dimensions=_clean_string_list(vocabulary.get("dimensions")),
+        vocabulary_entities=_clean_string_list(
+            vocabulary.get("entities"), label="vocabulary.entities", notes=notes
+        ),
+        vocabulary_measures=_clean_string_list(
+            vocabulary.get("measures"), label="vocabulary.measures", notes=notes
+        ),
+        vocabulary_dimensions=_clean_string_list(
+            vocabulary.get("dimensions"), label="vocabulary.dimensions", notes=notes
+        ),
         source_path=str(path),
     )
+    if notes:
+        LOG.warning("Team memory at %s was trimmed: %s", path, "; ".join(notes))
     LOG.info("Loaded team memory from %s (%s)", path, tm.summary_line())
     return tm
 
