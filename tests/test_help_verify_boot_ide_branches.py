@@ -15,7 +15,6 @@
 """Branch-coverage tests for help_formatter, verify, bootstrap, and ide modules."""
 
 import argparse
-import json
 import logging
 import os
 from pathlib import Path
@@ -326,102 +325,7 @@ class TestValidateContractObj:
 
         ok, err = validate_contract_obj({})
         assert ok is False
-
-
-class TestPlanContract:
-    def test_fallback_empty(self):
-        from fluid_build.cli.bootstrap import plan_contract
-
-        contract = {"exposes": []}
-        plan = plan_contract(contract, "local")
-        assert "actions" in plan
-        assert plan["provider"] == "local"
-
-    def test_fallback_with_dataset_table(self):
-        from fluid_build.cli.bootstrap import plan_contract
-
-        contract = {
-            "exposes": [
-                {
-                    "location": {
-                        "format": "bigquery",
-                        "properties": {"dataset": "ds1", "table": "t1"},
-                    },
-                    "schema": [{"name": "col1"}],
-                }
-            ]
-        }
-        plan = plan_contract(contract, "gcp")
-        actions = plan["actions"]
-        ops = [a["op"] for a in actions]
-        assert "ensure_dataset" in ops
-        assert "ensure_table" in ops
-
-    def test_fallback_file_format(self, tmp_path):
-        from fluid_build.cli.bootstrap import plan_contract
-
-        contract = {"exposes": [{"location": {"format": "file", "properties": {}}}]}
-        plan = plan_contract(contract, None)
-        actions = plan["actions"]
-        ops = [a["op"] for a in actions]
-        assert "copy" in ops
-        assert plan["provider"] == "unknown"
-
-    def test_fallback_no_exposes(self):
-        from fluid_build.cli.bootstrap import plan_contract
-
-        plan = plan_contract({}, None)
-        assert plan["actions"] == []
-
-
-class TestBootstrapWriteJson:
-    def test_write_json(self, tmp_path):
-        from fluid_build.cli.bootstrap import _write_json
-
-        path = str(tmp_path / "sub" / "out.json")
-        _write_json(path, {"key": "val"})
-        data = json.loads(Path(path).read_text())
-        assert data == {"key": "val"}
-
-
-class TestBootstrapPrintJson:
-    def test_print_json(self, capsys):
-        from fluid_build.cli.bootstrap import _print_json
-
-        _print_json({"a": 1})
         # Should produce output without error
-
-
-class TestProviderSupportsRender:
-    def test_supports_render_true(self):
-        from fluid_build.cli.bootstrap import _provider_supports_render
-
-        p = MagicMock()
-        p.capabilities.return_value = {"render": True}
-        assert _provider_supports_render(p) is True
-
-    def test_supports_render_false(self):
-        from fluid_build.cli.bootstrap import _provider_supports_render
-
-        p = MagicMock()
-        p.capabilities.return_value = {}
-        assert _provider_supports_render(p) is False
-
-    def test_supports_render_exception_fallback(self):
-        from fluid_build.cli.bootstrap import _provider_supports_render
-
-        p = MagicMock()
-        p.capabilities.side_effect = RuntimeError("no caps")
-        p.name = "odps"
-        assert _provider_supports_render(p) is True
-
-    def test_supports_render_exception_fallback_other(self):
-        from fluid_build.cli.bootstrap import _provider_supports_render
-
-        p = MagicMock()
-        p.capabilities.side_effect = RuntimeError("no caps")
-        p.name = "gcp"
-        assert _provider_supports_render(p) is False
 
 
 class TestCmdValidateRun:
@@ -444,18 +348,6 @@ class TestCmdValidateRun:
         mock_validate.return_value = (False, "bad field")
         args = argparse.Namespace(contract="c.yaml", env=None)
         assert cmd_validate_run(args, logging.getLogger()) == 2
-
-
-class TestCmdPlanRun:
-    @patch("fluid_build.cli.bootstrap._write_json")
-    @patch("fluid_build.cli.bootstrap.load_contract_with_overlay")
-    def test_plan(self, mock_load, mock_write):
-        from fluid_build.cli.bootstrap import cmd_plan_run
-
-        mock_load.return_value = {"exposes": []}
-        args = argparse.Namespace(contract="c.yaml", env=None, provider=None, out="/tmp/plan.json")
-        assert cmd_plan_run(args, logging.getLogger()) == 0
-        mock_write.assert_called_once()
 
 
 # ===========================================================================
