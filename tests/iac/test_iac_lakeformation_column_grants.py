@@ -23,6 +23,10 @@ block from its columns:
   ``excluded_column_names``. The hashicorp/aws docs: "If
   ``excluded_column_names`` is included, ``wildcard`` must be set to ``true``".
 
+A grant that sets both, names a column the schema does not declare, excludes
+every column, or limits columns on a binding with no ``location.table`` is
+refused at emit, because ``tofu plan`` accepts each of them.
+
 The excluded shape used to go out without the wildcard, and ``tofu plan``
 refused it ("Missing required argument"). ``tofu validate`` passed it, because
 the block's table name is a reference that is unknown until plan, so only a
@@ -64,7 +68,10 @@ def _grant(
     return grant
 
 
-def _contract(grants: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _contract(grants: List[Dict[str, Any]], *, table: bool = True) -> Dict[str, Any]:
+    location = {"bucket": "acme-lake", "path": "crm/customers/", "database": "crm"}
+    if table:
+        location["table"] = "customers"
     return {
         "fluidVersion": "0.7.6",
         "kind": "DataProduct",
@@ -78,12 +85,7 @@ def _contract(grants: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "binding": {
                     "platform": "aws",
                     "format": "parquet",
-                    "location": {
-                        "bucket": "acme-lake",
-                        "path": "crm/customers/",
-                        "database": "crm",
-                        "table": "customers",
-                    },
+                    "location": location,
                     "governance": {"lakeFormation": {"registerLocation": True, "grants": grants}},
                 },
                 "contract": {
@@ -166,3 +168,71 @@ class TestEdges:
             AwsIacPlugin().emit(contract)
         assert refused.value.kind == "lakeformation-grant-columns"
         assert "grants[0]" in str(refused.value)
+
+
+def _refusal(contract: Dict[str, Any]) -> UnsupportedBindingError:
+    with pytest.raises(UnsupportedBindingError) as refused:
+        AwsIacPlugin().emit(contract)
+    return refused.value
+
+
+class TestColumnNamesAreChecked:
+    """A column name ``tofu plan`` cannot check is checked at emit.
+
+    The plan accepts any name in ``table_with_columns``. Against the schema that
+    creates the Glue table, a misspelt exclusion is a column wildcard that still
+    includes the column it meant to hide.
+    """
+
+    def test_a_misspelt_exclusion_is_refused(self):
+        contract = _contract([_grant(ANALYST, excluded=["msisdnn"])])
+        # The schema cannot see it: the names are free strings.
+        assert FluidSchemaManager().validate_contract(contract).is_valid
+        error = _refusal(contract)
+        assert error.kind == "lakeformation-grant-columns"
+        assert "grants[0]" in str(error) and "'msisdnn'" in str(error)
+
+    def test_an_allow_list_naming_a_column_the_table_lacks_is_refused(self):
+        error = _refusal(_contract([_grant(AUDITOR, columns=["id", "nope"])]))
+        assert error.kind == "lakeformation-grant-columns"
+        assert "'nope'" in str(error) and "'id'" not in str(error)
+
+    def test_excluding_every_column_is_refused(self):
+        error = _refusal(_contract([_grant(ANALYST, excluded=["id", "msisdn", "status"])]))
+        assert error.kind == "lakeformation-grant-columns"
+        assert "every column" in str(error)
+
+    def test_the_second_grant_is_named(self):
+        contract = _contract([_grant(STEWARD), _grant(ANALYST, excluded=["msisdn", "x"])])
+        assert "grants[1]" in str(_refusal(contract))
+
+    def test_excluding_all_but_one_column_is_kept(self):
+        body = _grants(_contract([_grant(ANALYST, excluded=["id", "msisdn"])]))[ANALYST]
+        assert body["table_with_columns"][0]["excluded_column_names"] == ["id", "msisdn"]
+
+
+class TestNoTable:
+    """A binding with no ``location.table`` grants on the database, which has no
+    columns: a column limit there would be dropped, so it is refused."""
+
+    @pytest.mark.parametrize(
+        "grant",
+        [
+            _grant(ANALYST, excluded=["msisdn"]),
+            _grant(AUDITOR, columns=["id"]),
+            _grant(ANALYST, columns=["id"], excluded=["msisdn"]),
+        ],
+        ids=["excluded", "columns", "both"],
+    )
+    def test_a_column_limit_is_refused(self, grant):
+        contract = _contract([grant], table=False)
+        assert FluidSchemaManager().validate_contract(contract).is_valid
+        error = _refusal(contract)
+        assert error.kind == "lakeformation-grant-columns"
+        assert "location.table" in str(error)
+
+    def test_a_grant_with_no_column_limit_is_still_a_database_grant(self):
+        contract = _contract([{"principal": STEWARD, "permissions": ["DESCRIBE"]}], table=False)
+        body = _grants(contract)[STEWARD]
+        assert body["database"] == [{"name": "${aws_glue_catalog_database.lf_columns_crm.name}"}]
+        assert "table" not in body and "table_with_columns" not in body
