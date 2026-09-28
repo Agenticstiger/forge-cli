@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **The first `fluid schedule-sync` after upgrading must retire the old DAG
+  of each env.** An env's Airflow DAGs now live in `<product-id>__<env>/` with
+  dag id `<product>__<env>__<build>`; 0.16.6 and earlier wrote them to
+  `<product-id>/` as `<product>__<build>`. Left in place, the old DAG runs
+  beside the new one, and both apply the same product against the same state.
+  With `--delete-scope product` (the default) to a local path or a `git+ssh`
+  repository, the sync retires them itself: it deletes from `<product-id>/`
+  only the DAGs rendered for the same product and env under the old id, and
+  keeps any other file. For every other transport it prints the step to take:
+  delete those DAG files at the destination once. `--delete-scope destination`
+  removes the old directory with the rest of what the sync does not ship.
+  The report's `superseded_scopes` records which case applied.
+
 ## [0.16.6] — 2026-09-28
 
 A Lake Formation grant that hides columns from a principal now plans. Found
