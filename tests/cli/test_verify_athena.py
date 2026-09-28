@@ -1678,6 +1678,139 @@ def test_an_append_floor_that_reaches_no_full_load_says_it_may_be_partial(tmp_pa
     assert "since the last full load" not in row_count["message"]
 
 
+# ── Masking ─────────────────────────────────────────────────────────────
+#
+# An expose with policy.privacy.masking gets its masked columns' values
+# checked in the same query as the count: per column, the non-null values and
+# the ones without the strategy's shape. Only counts come back.
+
+_MASKED_CONTRACT = CONTRACT.replace(
+    "    contract:\n      schema:\n",
+    "    policy:\n"
+    "      privacy:\n"
+    "        masking:\n"
+    "          - {column: msisdn, strategy: hash}\n"
+    "          - {column: customer_id, strategy: mask, params: {keepLast: 2}}\n"
+    "    contract:\n      schema:\n",
+)
+_HASH_RE = "'\\A(?:[0-9a-f]{64})\\z'"
+_MASK_RE = "'\\A(?:\\*+[\\s\\S]{2}|\\**)\\z'"
+MASKED_COUNT_SQL = (
+    'SELECT COUNT(*), count("msisdn"), '
+    f'count_if("msisdn" IS NOT NULL AND NOT regexp_like(CAST("msisdn" AS varchar), {_HASH_RE})), '
+    'count("customer_id"), '
+    'count_if("customer_id" IS NOT NULL AND NOT '
+    f'regexp_like(CAST("customer_id" AS varchar), {_MASK_RE})) '
+    'FROM "demo_bronze"."customer_subscriptions"'
+)
+
+
+def _masked_counts(aws: "_Aws", rows: int, cells: List[int]) -> None:
+    """The happy query, answering ``COUNT(*)`` and each masking expression."""
+    aws.workgroup()
+    aws.start(sql=MASKED_COUNT_SQL)
+    aws.state("SUCCEEDED")
+    header = [{"VarCharValue": f"_col{i}"} for i in range(1 + len(cells))]
+    values = [{"VarCharValue": str(v)} for v in [rows, *cells]]
+    aws.athena_stub.add_response(
+        "get_query_results",
+        {"ResultSet": {"Rows": [{"Data": header}, {"Data": values}]}},
+        {"QueryExecutionId": "q-1", "MaxResults": 2},
+    )
+
+
+def test_masked_columns_are_checked_in_the_count_query(tmp_path, aws):
+    assert _MASKED_CONTRACT != CONTRACT
+    contract = _write_contract(tmp_path, contract=_MASKED_CONTRACT)
+    _write_run_record(tmp_path, 10172)
+    aws.table()
+    _masked_counts(aws, 10172, [9000, 0, 10172, 0])
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    assert code == 0, result
+    masking = result["dimensions"]["masking"]
+    assert masking["status"] == "pass"
+    assert [(c["column"], c["non_null"], c["offending"]) for c in masking["columns"]] == [
+        ("msisdn", 9000, 0),
+        ("customer_id", 10172, 0),
+    ]
+    aws.assert_all_called()
+
+
+def test_cleartext_in_a_masked_athena_column_fails_strict(tmp_path, aws, capsys):
+    contract = _write_contract(tmp_path, contract=_MASKED_CONTRACT)
+    _write_run_record(tmp_path, 10172)
+    aws.table()
+    _masked_counts(aws, 10172, [9000, 9000, 10172, 0])
+
+    code, report = _verify(tmp_path, contract)
+
+    result = report["results"]["subscriptions"]
+    assert code == 1
+    assert result["status"] == "mismatch"
+    assert result["severity"]["level"] == "CRITICAL"
+    assert "msisdn" in result["severity"]["reason"]
+    msisdn = result["dimensions"]["masking"]["columns"][0]
+    assert (msisdn["status"], msisdn["offending"]) == ("fail", 9000)
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Dimension 5: Masking" in out and "9,000 of 9,000" in out
+
+
+def test_a_masked_column_the_glue_table_lacks_fails_without_being_queried(tmp_path, aws):
+    """Querying a column Glue does not have fails the whole count; it is
+    reported as not in the table instead, and the count still runs."""
+    contract = _write_contract(
+        tmp_path, contract=_MASKED_CONTRACT.replace("column: msisdn", "column: imsi")
+    )
+    _write_run_record(tmp_path, 10172)
+    aws.table()
+    aws.workgroup()
+    aws.start(
+        sql=(
+            'SELECT COUNT(*), count("customer_id"), '
+            'count_if("customer_id" IS NOT NULL AND NOT '
+            f'regexp_like(CAST("customer_id" AS varchar), {_MASK_RE})) '
+            'FROM "demo_bronze"."customer_subscriptions"'
+        )
+    )
+    aws.state("SUCCEEDED")
+    aws.athena_stub.add_response(
+        "get_query_results",
+        {
+            "ResultSet": {
+                "Rows": [
+                    {"Data": [{"VarCharValue": "_col0"}] * 3},
+                    {"Data": [{"VarCharValue": v} for v in ("10172", "10172", "0")]},
+                ]
+            }
+        },
+        {"QueryExecutionId": "q-1", "MaxResults": 2},
+    )
+
+    code, report = _verify(tmp_path, contract)
+
+    masking = report["results"]["subscriptions"]["dimensions"]["masking"]
+    assert code == 1
+    imsi = masking["columns"][0]
+    assert imsi["column"] == "imsi" and "not in the Glue table" in imsi["message"]
+    aws.assert_all_called()
+
+
+def test_without_masking_rules_the_count_query_is_unchanged(tmp_path, aws):
+    """Pinned by every test above that uses COUNT_SQL; stated once on its own."""
+    contract = _write_contract(tmp_path)
+    aws.table()
+    aws.counts(5)  # the Stubber rejects any other QueryString
+
+    code, report = _verify(tmp_path, contract)
+
+    assert code == 0
+    assert "masking" not in report["results"]["subscriptions"]["dimensions"]
+    aws.assert_all_called()
+
+
 # ── Retention and encryption at rest ────────────────────────────────────
 #
 # The demo contract with the storage policies declared: a 30-day retention the

@@ -30,6 +30,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from fluid_build.cli import forge_modes as fm
 
 _LOG = logging.getLogger("test.forge.run_context")
@@ -172,3 +174,51 @@ def test_project_creation_core_returns_1_when_creation_fails():
             rc, Path("unused"), None, get_cli_arg_fn=lambda a, k, d=None: d
         )
     assert rc_code == 1
+
+
+def _creation_path(monkeypatch, env_value, *, agent_loop_flag=False):
+    """Which creation helper ``_forge_project_creation_core`` picks."""
+    if env_value is None:
+        monkeypatch.delenv("FLUID_COPILOT_AGENT_LOOP", raising=False)
+    else:
+        monkeypatch.setenv("FLUID_COPILOT_AGENT_LOOP", env_value)
+    rc = fm.ForgeRunContext(
+        args=SimpleNamespace(agent_loop=agent_loop_flag),
+        logger=_LOG,
+        console=None,
+        copilot=object(),
+        is_non_interactive=True,
+        run_start=0.0,
+        active_run_id=None,
+        context={},
+        perf_stats={},
+        copilot_options={},
+    )
+    calls = []
+    with (
+        patch.object(
+            fm, "_create_project_agent_loop", side_effect=lambda **_: calls.append("agent_loop")
+        ),
+        patch.object(
+            fm, "_create_project_minimal", side_effect=lambda **_: calls.append("minimal")
+        ),
+    ):
+        fm._forge_project_creation_core(rc, Path("unused"), None, get_cli_arg_fn=_arg)
+    return calls
+
+
+# ``FLUID_COPILOT_AGENT_LOOP`` was read with ``bool(os.environ.get(...))``, so
+# any non-empty value, including the ``=0`` the loop's own error message
+# suggests for turning it off, selected the agent loop.
+@pytest.mark.parametrize("value", [None, "", "0", "false", "False", "no", "off", " 0 "])
+def test_agent_loop_env_off_values_take_the_minimal_path(monkeypatch, value):
+    assert _creation_path(monkeypatch, value) == ["minimal"]
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", " 1 "])
+def test_agent_loop_env_on_values_take_the_agent_loop(monkeypatch, value):
+    assert _creation_path(monkeypatch, value) == ["agent_loop"]
+
+
+def test_agent_loop_flag_wins_over_an_off_env_value(monkeypatch):
+    assert _creation_path(monkeypatch, "0", agent_loop_flag=True) == ["agent_loop"]

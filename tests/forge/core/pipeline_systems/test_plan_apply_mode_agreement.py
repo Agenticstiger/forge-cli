@@ -183,11 +183,13 @@ def _flag(argv: List[str], name: str) -> Optional[str]:
     return values[0] if values else None
 
 
-def _run_chain(ws: Path, stages: Dict[int, str], env: Dict[str, str]) -> List[str]:
+def _run_chain(
+    ws: Path, stages: Dict[int, str], env: Dict[str, str], default_env: str = "dev"
+) -> List[str]:
     """Stages 1, 6, 7 through the stub, each replayed for real; stage 7's argv."""
     bundle_argv = _run_stage(ws, stages[1], env)
     assert bundle_argv[:2] == ["bundle", _C]
-    assert _flag(bundle_argv, "--env") == env.get("FLUID_ENV", "dev")
+    assert _flag(bundle_argv, "--env") == env.get("FLUID_ENV", default_env)
     assert fluid_main(bundle_argv) == 0
 
     plan_argv = _run_stage(ws, stages[6], env)
@@ -267,3 +269,39 @@ def test_a_blank_build_id_parameter_runs_every_build(ws: Path) -> None:
     apply_argv = _run_chain(ws, stages, {"APPLY_BUILD_ID": ""})
     assert _flag(apply_argv, "--mode") == "amend-and-build"
     assert _flag(apply_argv, "--build-id") is None
+
+
+_STAGING_OVERLAY = """\
+exposes:
+  - binding:
+      location:
+        path: ./out/staging/rows.parquet
+"""
+
+
+@pytest.mark.parametrize("system", ["tekton", "jenkins"])
+@pytest.mark.parametrize(
+    "exported",
+    [{}, {"FLUID_ENV": "staging"}],
+    ids=["parameterless", "declared-defaults"],
+)
+def test_a_run_on_defaults_applies_the_fluid_env_default(
+    ws: Path, system: str, exported: Dict[str, str]
+) -> None:
+    """``fluid generate ci --fluid-env-default staging``: a build that gets no
+    parameters (a Jenkins job's first build, its first after a restart) and one
+    that gets the declared defaults (what an upstream trigger starts) both
+    bundle, plan and apply the staging overlay, not the base contract."""
+    (ws / "contracts" / "p" / "overlays").mkdir()
+    (ws / "contracts" / "p" / "overlays" / "staging.yaml").write_text(
+        _STAGING_OVERLAY, encoding="utf-8"
+    )
+    render = _tekton_stages if system == "tekton" else _jenkins_stages
+    stages = render(apply_mode_default="amend-and-build", fluid_env_default="staging")
+    apply_argv = _run_chain(ws, stages, exported, default_env="staging")
+    assert _flag(apply_argv, "--env") == "staging"
+    out = ws / "contracts" / "p" / "out"
+    assert duckdb.sql(f"SELECT count(*) FROM '{out / 'staging' / 'rows.parquet'}'").fetchone() == (
+        1,
+    )
+    assert not (out / "rows.parquet").exists()  # the base binding was not applied

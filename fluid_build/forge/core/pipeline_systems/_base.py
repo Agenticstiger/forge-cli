@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
+from fluid_build._env_names import ENV_NAME_RULE, is_env_name
 from fluid_build.cli.console import cprint
 
 # SHA-pinned GitHub Actions for supply chain security.
@@ -120,6 +121,34 @@ def check_pipeline_workdir(workdir: str) -> str:
             "archiveArtifacts pattern would read as a pattern"
         )
     return workdir
+
+
+def check_env_name(what: str, value: str) -> str:
+    """Return ``value`` if every stage's ``--env`` accepts it.
+
+    FLUID_ENV names an overlay file and reaches ``--env`` in every stage, and
+    two stages hold it to a grammar: stage 3's scheduled DAGs pass it to
+    ``fluid apply --env`` (:func:`validate_env_name`), and stage 10 is
+    ``fluid publish --env`` (:func:`fluid_build._env_names.is_env_name`).
+    Both are applied, reused rather than copied: a default either refuses
+    fails every build that runs on the defaults at that stage, stage 10 only
+    after stage 7 has applied. The net rule (letters, digits, '.', '_' and
+    '-', starting with a letter, at most 64 characters) also keeps a path, a
+    space, a glob or a newline out of an overlay lookup and out of an
+    unquoted ``--env ${FLUID_ENV:-...}``.
+    """
+    from fluid_build.schedulers.airflow.fluid_apply import ScheduleRenderError, validate_env_name
+
+    try:
+        validate_env_name(value)
+    except ScheduleRenderError as exc:
+        raise ValueError(f"{what} {value!r} is not an environment name: {exc}") from exc
+    if not is_env_name(value):
+        raise ValueError(
+            f"{what} {value!r} is not an environment name fluid publish --env accepts: "
+            f"{ENV_NAME_RULE}"
+        )
+    return value
 
 
 def sh_param(name: str, default: str, *, keep_blank: bool = False) -> str:
@@ -357,6 +386,15 @@ class PipelineConfig:
     # "pending" rather than drift. Jenkins only; needs the copyartifact
     # plugin, which is why it is off unless asked for.
     diff_last_applied: bool = False
+    # The ``FLUID_ENV`` default: the parameter's declared default and the
+    # fallback of every shell read of it (``${FLUID_ENV:-<env>}``). ``None``
+    # (or blank) keeps ``dev``. A build that gets no parameters (a Jenkins
+    # job's first build, its first after a restart re-seeded it) runs in it,
+    # and so does one an upstream trigger starts, which Jenkins runs with the
+    # defaults. Generation raises ``ValueError`` unless every stage's
+    # ``--env`` accepts it (:func:`check_env_name`), however the config was
+    # built.
+    fluid_env_default: Optional[str] = None
 
     def __post_init__(self):
         if self.environments is None:
@@ -583,12 +621,19 @@ class BasePipelineTemplate:
             ),
         }
         # The contract ``fluid generate ci`` was given is every command's
-        # fallback for CONTRACT, not the literal default name.
-        contract = self._pipeline_defaults(config)["CONTRACT"]
-        fallback = sh_param("CONTRACT", contract)
-        return {
-            k: v.replace("${CONTRACT:-contract.fluid.yaml}", fallback) for k, v in commands.items()
+        # fallback for CONTRACT, not the literal default name, and the
+        # FLUID_ENV default is every command's fallback for FLUID_ENV.
+        d = self._pipeline_defaults(config)
+        fallbacks = {
+            "${CONTRACT:-contract.fluid.yaml}": sh_param("CONTRACT", d["CONTRACT"]),
+            "${FLUID_ENV:-dev}": sh_param("FLUID_ENV", d["FLUID_ENV"]),
         }
+        rendered: Dict[str, str] = {}
+        for key, command in commands.items():
+            for literal, fallback in fallbacks.items():
+                command = command.replace(literal, fallback)
+            rendered[key] = command
+        return rendered
 
     def _get_common_environment_vars(self) -> Dict[str, str]:
         """Get common environment variables"""
@@ -948,9 +993,10 @@ class BasePipelineTemplate:
         spec = opt("fluid_package_spec", "") or default_fluid_package_spec(
             getattr(config, "package_extras", None)
         )
+        fluid_env = check_env_name("FLUID_ENV default", opt("fluid_env_default", "dev"))
         defaults = {
             "CONTRACT": opt("contract_path", "contract.fluid.yaml"),
-            "FLUID_ENV": "dev",
+            "FLUID_ENV": fluid_env,
             "APPLY_MODE": apply_mode,
             "APPLY_BUILD_ID": opt("apply_build_id_default", ""),
             "ALLOW_DATA_LOSS": "false",
@@ -1241,8 +1287,9 @@ class BasePipelineTemplate:
         sh — wrapping in parentheses would spawn a subshell and prevent
         ``set -eu`` from propagating to parent shell flags.
 
-        Each sh body uses ``"${CONTRACT:-contract.fluid.yaml}"`` +
-        ``"${FLUID_ENV:-dev}"`` defaults so Build Now works without the
+        Each sh body reads CONTRACT and FLUID_ENV with their declared
+        defaults as fallbacks (``"${CONTRACT:-<contract>}"``,
+        ``"${FLUID_ENV:-<env>}"``) so Build Now works without the
         operator pre-setting every env var. Credential-bearing env vars
         (SNOWFLAKE_*, AWS_*, DMM_*) are NOT defaulted here — they come
         from the CI system's secret store per the credential banner.

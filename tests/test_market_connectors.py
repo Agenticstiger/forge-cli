@@ -1027,3 +1027,67 @@ class TestBuildSearchFiltersExtra:
         args = _make_test_args(status="active")
         f = build_search_filters(args)
         assert f.status == DataProductStatus.ACTIVE
+
+
+# ---------------------------------------------------------------------------
+# CommandCenterConnector._connect_impl (the real import, not a mocked class)
+# ---------------------------------------------------------------------------
+
+
+class TestCommandCenterConnectorConnect:
+    """``_connect_impl`` reaches ``fluid_build.cli._command_center``.
+
+    The connector moved from ``cli/market.py`` into ``cli/market_catalogs/``
+    with its relative ``from ._command_center import ...`` unchanged. From the
+    new package that names ``market_catalogs._command_center``, which does not
+    exist, so every connect logged "Failed to import Command Center client"
+    and returned False. The engine test above swaps the whole connector class
+    for a mock, so the real import never ran under test.
+    """
+
+    _URL = "https://cc.example.test/api/v1/data-products"
+
+    def _client(self, *, catalog=True):
+        cc = MagicMock()
+        cc.available = True
+        cc.features.catalog = catalog
+        cc.get_catalog_url.return_value = self._URL
+        return cc
+
+    def _connect(self, cc):
+        from fluid_build.cli.market_catalogs.command_center import CommandCenterConnector
+
+        connector = CommandCenterConnector({}, logging.getLogger("test_cc_connector"))
+        # aiohttp is only a transitive dependency; stub it so this test pins
+        # the client import, not whether aiohttp happens to be installed.
+        fake_aiohttp = MagicMock()
+        with (
+            patch(
+                "fluid_build.cli._command_center.get_command_center_client",
+                return_value=cc,
+            ) as factory,
+            patch.dict("sys.modules", {"aiohttp": fake_aiohttp}),
+        ):
+            ok = _run(connector._connect_impl())
+        return ok, connector, factory, fake_aiohttp
+
+    def test_connects_through_the_cli_command_center_client(self, caplog):
+        cc = self._client()
+        with caplog.at_level(logging.INFO, logger="test_cc_connector"):
+            ok, connector, factory, fake_aiohttp = self._connect(cc)
+
+        assert "Failed to import Command Center client" not in caplog.text
+        assert ok is True
+        factory.assert_called_once()
+        assert connector.cc_client is cc
+        assert connector.base_url == self._URL
+        assert connector.session is fake_aiohttp.ClientSession.return_value
+
+    def test_catalog_unavailable_is_reported_as_such(self, caplog):
+        with caplog.at_level(logging.INFO, logger="test_cc_connector"):
+            ok, _connector, factory, _aiohttp = self._connect(self._client(catalog=False))
+
+        assert ok is False
+        factory.assert_called_once()
+        assert "Failed to import Command Center client" not in caplog.text
+        assert "Command Center catalog not available" in caplog.text

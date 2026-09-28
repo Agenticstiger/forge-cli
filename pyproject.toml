@@ -657,6 +657,10 @@ ignore_missing_imports = true
 # pins that every entry resolves to a real source file.
 [[tool.mypy.overrides]]
 module = [
+    # Masking at landing and its verify check: they decide whether cleartext
+    # lands and whether a pipeline notices, so a silent Any is a silent leak.
+    "fluid_build.build_runners._masking",
+    "fluid_build.cli._verify_masking",
     "fluid_build.cli.security",
     "fluid_build.credentials.encrypted_store",
     "fluid_build.observability.secret_redactor",
@@ -813,14 +817,17 @@ source_modules = [
   "fluid_build._error_catalog",
   "fluid_build._console",
   "fluid_build._contract_loader",
+  "fluid_build._env_names",
 ]
 forbidden_modules = [
   "fluid_build.cli",
   "fluid_build.build_runners",
 ]
-# These four leaves are the shared home for the error catalog, the
+# The first four leaves are the shared home for the error catalog, the
 # console renderer, and the contract loader — imported by BOTH ``cli``
-# and ``build_runners``. They must never import either package back, or
+# and ``build_runners``; ``_env_names`` (the ``fluid publish --env``
+# grammar, stdlib-only) is shared by ``cli.publish`` and ``forge``'s
+# pipeline generator. They must never import either package back, or
 # the ``build_runners → cli`` edge above re-forms indirectly (and a
 # ``cli → leaf → cli`` self-loop would defeat the point). ``_contract_loader``
 # legitimately reaches ``forge`` / ``observability`` / ``providers`` and
