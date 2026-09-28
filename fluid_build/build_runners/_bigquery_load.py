@@ -125,7 +125,11 @@ def bigquery_load_target(
     """The table a binding loads into, or None when it is not a BigQuery table.
 
     Resolved with the IaC's own helpers, so the load names the dataset, table
-    and location ``_emit_bigquery`` created.
+    and location ``_emit_bigquery`` created. A binding that names no region
+    gives ``location: None``, never a guessed ``US``: :func:`load_file` then
+    runs the job where the table itself is (its ``location``), which is the
+    only place a load job can run. The guessed default could send a job for
+    an EU table to the US multi-region.
     """
     from ..iac.providers.gcp import BIGQUERY_TABLE, _bq_table_name, resolve_gcp_target
 
@@ -139,7 +143,7 @@ def bigquery_load_target(
         "project": project,
         "dataset": loc.get("dataset") or "default",
         "table": _bq_table_name(expose, loc),
-        "location": loc.get("region") or loc.get("location") or "US",
+        "location": loc.get("region") or loc.get("location") or None,
     }
 
 
@@ -284,10 +288,13 @@ def load_file(
     # Never create: the table is the IaC's, and a load that made its own would
     # carry the file's schema, not the contract's.
     table = client.get_table(table_id)
+    # The job runs where the table is: the binding's region when it names
+    # one, otherwise the table's own location, read above, never a default.
+    location = target.get("location") or getattr(table, "location", None)
     appending = _WRITE_DISPOSITION[mode] == "WRITE_APPEND"
     before: Optional[int] = None
     if appending and emulator_host() is not None:
-        before = _count_table(client, table_id, target["location"])
+        before = _count_table(client, table_id, location)
     job_config = bigquery.LoadJobConfig(
         source_format=_SOURCE_FORMAT[sink_format],
         write_disposition=_WRITE_DISPOSITION[mode],
@@ -298,7 +305,7 @@ def load_file(
     try:
         with open(upload or path, "rb") as fh:
             job = client.load_table_from_file(
-                fh, table_id, job_config=job_config, location=target["location"]
+                fh, table_id, job_config=job_config, location=location
             )
         job.result()
     finally:
@@ -311,10 +318,10 @@ def load_file(
     if job.output_rows is not None:
         loaded = int(job.output_rows)
     elif not appending:
-        loaded = _count_table(client, table_id, target["location"])
+        loaded = _count_table(client, table_id, location)
         rows_from = "count_after_load"
     elif before is not None:
-        loaded = _count_table(client, table_id, target["location"]) - before
+        loaded = _count_table(client, table_id, location) - before
         rows_from = "count_after_load"
     else:
         raise BigQueryLoadError(

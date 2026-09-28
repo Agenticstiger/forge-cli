@@ -46,6 +46,9 @@ from tests.cli._schedule_dag_fixtures import (
 
 LOG = logging.getLogger("test.artifact_fanout_schedule")
 DAG_REL = "schedule/bronze.customer_subscriptions/ingest_subscriptions_dag.py"
+#: An env's DAGs get a directory of their own (``<product>__<env>``), so an aws
+#: and a gcp pipeline syncing to one Airflow never delete each other's DAG.
+DAG_REL_AWS = "schedule/bronze.customer_subscriptions__aws/ingest_subscriptions_dag.py"
 
 #: An aws overlay that also moves the schedule, so the DAG shows which
 #: contract it was rendered from.
@@ -140,7 +143,7 @@ class TestTheDemoDagReachesTheManifest:
             )
             == 0
         )
-        dag = tmp_path / "dist" / "artifacts" / DAG_REL
+        dag = tmp_path / "dist" / "artifacts" / DAG_REL_AWS
         loaded = load_dag(dag.read_text(), monkeypatch)
         assert loaded.namespace["FLUID_ENV_NAME"] == "aws"
         assert loaded.namespace["CONTRACT_PATH"] == DEMO_CONTRACT_PATH
@@ -170,7 +173,7 @@ class TestTheDemoDagReachesTheManifest:
         )
         argv = (DEMO_CONTRACT_PATH, "--out", "dist/artifacts", "--env", "aws")
         assert _stage3(tmp_path, monkeypatch, *argv) == 0
-        loaded = load_dag((tmp_path / "dist" / "artifacts" / DAG_REL).read_text(), monkeypatch)
+        loaded = load_dag((tmp_path / "dist" / "artifacts" / DAG_REL_AWS).read_text(), monkeypatch)
         assert loaded.dag["schedule"] == "30 1 * * *"
         assert loaded.namespace["FLUID_ENV_NAME"] == "aws"
         # Fanned out through a temporary --env bundle, the DAG still runs the
@@ -326,7 +329,7 @@ class TestTheEnvMatchesThePipelines:
         )
         monkeypatch.setenv("FLUID_ENV", "aws")
         assert _stage3(tmp_path, monkeypatch, DEMO_CONTRACT_PATH, "--out", "dist/artifacts") == 0
-        loaded = load_dag((tmp_path / "dist" / "artifacts" / DAG_REL).read_text(), monkeypatch)
+        loaded = load_dag((tmp_path / "dist" / "artifacts" / DAG_REL_AWS).read_text(), monkeypatch)
         assert loaded.namespace["FLUID_ENV_NAME"] == "aws"
         assert loaded.dag["schedule"] == "30 1 * * *"
 
@@ -337,7 +340,7 @@ class TestTheEnvMatchesThePipelines:
         monkeypatch.setenv("FLUID_ENV", "gcp")
         argv = (DEMO_CONTRACT_PATH, "--out", "dist/artifacts", "--env", "aws")
         assert _stage3(tmp_path, monkeypatch, *argv) == 0
-        loaded = load_dag((tmp_path / "dist" / "artifacts" / DAG_REL).read_text(), monkeypatch)
+        loaded = load_dag((tmp_path / "dist" / "artifacts" / DAG_REL_AWS).read_text(), monkeypatch)
         assert loaded.namespace["FLUID_ENV_NAME"] == "aws"
 
     @pytest.mark.parametrize("fluid_env", [None, ""])

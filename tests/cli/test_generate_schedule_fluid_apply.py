@@ -419,6 +419,10 @@ def _literal_connection(contract: str = DEMO_CONTRACT) -> str:
 #: Variables the ``fluid apply`` code path reads that a scheduled run does not
 #: need, so the worker environment does not pass them.
 NOT_PASSED = {
+    "JENKINS_URL": (
+        "only tags a Command Center run report as a Jenkins run; a scheduled run is not one"
+    ),
+    "ProgramData": "the Windows system config directory; the DAG task runs under bash",
     "PRODUCTION": "only chooses a --safe-mode tip in the CLI banner",
     "SOURCE_DATE_EPOCH": "tar mtimes for `fluid bundle`, which a scheduled apply never runs",
     "USERPROFILE": "the Windows home directory; the DAG task runs under bash",
