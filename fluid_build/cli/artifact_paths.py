@@ -76,6 +76,8 @@ __all__ = [
 import os
 from pathlib import Path
 
+from fluid_build.util.workspace_root import WORKSPACE_CONFIG_FILENAME
+
 # ---------------------------------------------------------------------------
 # Envelope
 # ---------------------------------------------------------------------------
@@ -121,9 +123,11 @@ def user_personal_memory_path() -> Path:
 # Workspace scope — <workspace>/
 # ---------------------------------------------------------------------------
 
-#: The visible, committed workspace config file at the workspace root.
-#: Kept as-is for backward compatibility with every repo in the wild.
-WORKSPACE_CONFIG_FILENAME: str = "fluid.workspace.yaml"
+#: ``WORKSPACE_CONFIG_FILENAME`` (``fluid.workspace.yaml``), the visible,
+#: committed workspace config file at the workspace root, is imported above
+#: from ``util.workspace_root`` (stdlib only, like this module), where
+#: ``find_workspace_root`` lives for the build runners, which may not import
+#: ``cli``. Re-exported here so this stays the registry of names.
 
 #: The hidden state directory at the workspace root.  Same name as the
 #: user-level directory by design (``.fluid``), but always referenced through

@@ -38,12 +38,14 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
+from fluid_build._errors import FluidUserError, doc_url
 from fluid_build.api.runner import (
     RunContext,
     RunnerCapability,
@@ -193,8 +195,89 @@ def _apply_destination_secret(con: Any, ctx: RunContext, dest_uri: str) -> None:
     raw = dict(ctx.source.connection.raw or {})
     if isinstance(raw.get(duckdb_type), dict):
         return
-    region = _destination_region(ctx)
-    parts = ["TYPE " + str(duckdb_type), "PROVIDER credential_chain"]
+    create_s3_credential_chain_secret(con, region=_destination_region(ctx))
+
+
+#: The AWS SDKs' endpoint-override variables, the service-specific one first
+#: (AWS SDKs and Tools reference guide, "Service-specific endpoints").
+_S3_ENDPOINT_ENV_VARS = ("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+
+
+def _s3_endpoint_override() -> List[str]:
+    """``CREATE SECRET`` parts for an ``AWS_ENDPOINT_URL[_S3]`` override, else ``[]``.
+
+    boto3 and the OpenTofu ``hashicorp/aws`` provider both honour these
+    variables, and they are how an S3-compatible store (MinIO, moto) stands in
+    for S3. DuckDB's ``credential_chain`` provider does not read them (measured
+    on duckdb 1.5.5: the secret keeps ``endpoint=s3.amazonaws.com``), so with
+    the variable set ``fluid apply`` provisioned the bucket in the emulator
+    while the rows went to AWS. ODCS names the same knob ``endpointUrl`` on an
+    ``s3`` server for the same reason.
+
+    ``AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true`` turns the override off, as it
+    does in the SDKs. Path-style addressing unless the host is AWS's own: an
+    S3-compatible store rarely has the wildcard DNS virtual-hosted style needs.
+    """
+    from urllib.parse import urlparse
+
+    if os.environ.get("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "").strip().lower() == "true":
+        return []
+    raw = next(
+        (
+            os.environ[var].strip()
+            for var in _S3_ENDPOINT_ENV_VARS
+            if os.environ.get(var, "").strip()
+        ),
+        "",
+    )
+    if not raw:
+        return []
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or "@" in parsed.netloc:
+        # Not echoed: a URL carrying userinfo would put a password in the log.
+        LOG.warning("AWS_ENDPOINT_URL override ignored: not an http(s) URL naming a host")
+        return []
+    parts = [
+        f"ENDPOINT {quote_ansi_string_literal(parsed.netloc)}",
+        f"USE_SSL {'true' if parsed.scheme == 'https' else 'false'}",
+    ]
+    if not parsed.hostname.lower().endswith(".amazonaws.com"):
+        parts.append("URL_STYLE 'path'")
+    return parts
+
+
+@dataclass
+class ObjectStoreEndpointError(FluidUserError):
+    """An ``AWS_ENDPOINT_URL`` override is set, but DuckDB could not be pointed at it."""
+
+    code: str = "ObjectStoreEndpointError"
+
+
+def create_s3_credential_chain_secret(
+    con: Any,
+    *,
+    region: Optional[str] = None,
+    scope: Optional[str] = None,
+    name: str = "__fluid_dest",
+) -> bool:
+    """Authenticate DuckDB's S3 access with the ambient AWS credential chain.
+
+    The one place this runner, and every other DuckDB caller that reads or
+    writes the S3 objects it lands (the embedded-SQL build path), creates the
+    ``PROVIDER credential_chain`` secret. ``region`` is the binding's
+    ``location.region``; ``scope`` limits the secret to one ``s3://bucket`` so
+    a build reading two buckets in two regions signs each with its own region.
+    Returns whether the secret was created; a failure is logged and swallowed,
+    as it always was, leaving the env-var fallback in play.
+
+    Except with an endpoint override (``AWS_ENDPOINT_URL[_S3]``): the secret is
+    the only thing that points DuckDB at the S3-compatible store, so without it
+    the reads and writes that follow go to AWS itself, with whatever
+    credentials the environment holds. That raises
+    :class:`ObjectStoreEndpointError` instead.
+    """
+    endpoint = _s3_endpoint_override()
+    parts = ["TYPE s3", "PROVIDER credential_chain"]
     if region:
         # quote_ansi_string_literal, not an f-string: `region` is contract input
         # and this is SQL. Interpolating it raw let a schema-valid contract run
@@ -202,16 +285,62 @@ def _apply_destination_secret(con: Any, ctx: RunContext, dest_uri: str) -> None:
         # runs before any data moves. The neighbouring CREATE SECRET path was
         # already hardened against exactly this.
         parts.append(f"REGION {quote_ansi_string_literal(str(region))}")
+    parts.extend(endpoint)
+    if scope:
+        parts.append(f"SCOPE {quote_ansi_string_literal(str(scope))}")
     try:
-        con.execute("CREATE OR REPLACE SECRET __fluid_dest (" + ", ".join(parts) + ")")
+        con.execute(f"CREATE OR REPLACE SECRET {validate_ident(name)} (" + ", ".join(parts) + ")")
     except Exception as exc:  # noqa: BLE001
         # Never log `exc` itself: DuckDB echoes the failing statement, which
-        # is a CREATE SECRET. And log `scheme` rather than the duckdb type —
-        # CodeQL's py/clear-text-logging-sensitive-data treats a `secret*`
-        # identifier as sensitive BY NAME, so logging one is a high-severity
+        # is a CREATE SECRET. And log the literal scheme rather than any
+        # `secret*` identifier: CodeQL's py/clear-text-logging-sensitive-data
+        # treats one as sensitive BY NAME, so logging it is a high-severity
         # finding even when its value is the string "s3". The source-side
         # handler above logs `scheme` for exactly this reason.
-        LOG.warning("DuckDB destination CREATE SECRET (%s) failed: %s", scheme, type(exc).__name__)
+        LOG.warning("DuckDB destination CREATE SECRET (%s) failed: %s", "s3", type(exc).__name__)
+        if endpoint:
+            # Only the exception class, for the same reason as the log line.
+            raise ObjectStoreEndpointError(
+                what=("AWS_ENDPOINT_URL is set, but DuckDB's S3 access could not be pointed at it"),
+                why=(
+                    f"CREATE SECRET failed ({type(exc).__name__}), and that secret is what "
+                    "carries the endpoint: without it every read and write would go to AWS "
+                    "itself instead of the store the endpoint names."
+                ),
+                fix=(
+                    "Make the DuckDB httpfs and aws extensions loadable here (install them "
+                    "while online, or set a local extension_directory), or unset "
+                    "AWS_ENDPOINT_URL / AWS_ENDPOINT_URL_S3 to use AWS."
+                ),
+                doc=doc_url(),
+            ) from None
+        return False
+    return True
+
+
+def attach_object_store(
+    con: Any,
+    uri: str,
+    *,
+    region: Optional[str] = None,
+    scope: Optional[str] = None,
+    name: str = "__fluid_dest",
+) -> None:
+    """Make ``uri`` readable and writable on ``con``: extensions, then credentials.
+
+    The extensions are the ones this runner loads for the same URI
+    (:func:`_required_extensions`); the credentials are
+    :func:`create_s3_credential_chain_secret`, and only for ``s3://``, for the
+    reason :func:`_apply_destination_secret` gives for GCS and Azure.
+    """
+    for ext in _required_extensions("filesystem", uri):
+        try:
+            con.execute(f"INSTALL {ext}")
+            con.execute(f"LOAD {ext}")
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("DuckDB extension load failed (%s): %s", ext, type(exc).__name__)
+    if uri.lower().startswith("s3://"):
+        create_s3_credential_chain_secret(con, region=region, scope=scope, name=name)
 
 
 # ── Reader dispatch ──────────────────────────────────────────────────────

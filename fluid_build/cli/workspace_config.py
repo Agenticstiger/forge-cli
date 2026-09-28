@@ -48,6 +48,10 @@ from fluid_build.cli.artifact_paths import (
     WORKSPACE_STATE_DIRNAME,
 )
 
+# Lives in ``util`` so the build runners can use it (they may not import
+# ``cli``); re-exported here, where every CLI caller imports it from.
+from fluid_build.util.workspace_root import find_workspace_root
+
 LOG = logging.getLogger("fluid.cli.workspace_config")
 
 #: Canonical workspace-config filename. Defined in
@@ -115,18 +119,6 @@ class DiscoveredProduct:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
-
-def find_workspace_root(start: Optional[Path] = None) -> Optional[Path]:
-    """Walk up from *start* looking for ``fluid.workspace.yaml``.
-
-    Returns the directory containing the file, or ``None``.
-    """
-    current = (start or Path.cwd()).resolve()
-    for parent in [current, *current.parents]:
-        if (parent / WORKSPACE_FILENAME).is_file():
-            return parent
-    return None
 
 
 def load_workspace_config(root: Optional[Path] = None) -> WorkspaceDefaults:

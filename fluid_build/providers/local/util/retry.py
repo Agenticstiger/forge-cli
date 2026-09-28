@@ -28,6 +28,7 @@ from functools import wraps
 from typing import Any, Callable, List, Optional, Type
 
 from fluid_build.errors import CircuitBreakerOpenError
+from fluid_build.observability.secret_redactor import redact_secret_text
 
 
 class RetryableError(Exception):
@@ -186,7 +187,7 @@ def with_retry(
             if not is_retryable_error(e):
                 if logger:
                     logger.warning(
-                        f"Non-retryable error encountered: {e}",
+                        f"Non-retryable error encountered: {redact_secret_text(str(e))}",
                         extra={
                             "attempt": attempt,
                             "error_type": type(e).__name__,
@@ -199,7 +200,7 @@ def with_retry(
             if attempt == max_attempts:
                 if logger:
                     logger.error(
-                        f"All retry attempts exhausted. Last error: {e}",
+                        f"All retry attempts exhausted. Last error: {redact_secret_text(str(e))}",
                         extra={
                             "attempt": attempt,
                             "max_attempts": max_attempts,
@@ -218,7 +219,7 @@ def with_retry(
 
             if logger:
                 logger.warning(
-                    f"Attempt {attempt} failed, retrying in {delay:.2f}s: {e}",
+                    f"Attempt {attempt} failed, retrying in {delay:.2f}s: {redact_secret_text(str(e))}",
                     extra={
                         "attempt": attempt,
                         "max_attempts": max_attempts,

@@ -32,7 +32,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fluid_build._console import cprint, success
 from fluid_build._console import error as console_error
@@ -320,11 +320,197 @@ def _execute_embedded_sql_build_snowflake(
     return 0
 
 
+def _print_typed_error(exc: Any) -> None:
+    """A ``FluidUserError`` as the build output shows it: what, why, fix."""
+    cprint(f"   ❌ {exc.what}", markup=False)
+    cprint(f"      why: {exc.why}", markup=False)
+    cprint(f"      fix: {exc.fix}", markup=False)
+
+
+def _print_embedded_sql_io(io: Any) -> None:
+    """The consumes[] bindings and the landing, printed before the SQL runs.
+
+    This path writes no run record and emits no lineage event, so the build
+    output (and the provider's ``runtime/out/local_apply_log.jsonl``, which
+    records each input's productId/exposeId/uri) is where the resolved
+    lineage is kept.
+    """
+    for c in io.covered:
+        cprint(
+            f"   ⬅ consumes {c.product_id}/{c.expose_id}: explicit input "
+            f"'{c.input_name}' wins (properties.parameters.inputs)",
+            markup=False,
+        )
+    for lin in io.lineage_only:
+        cprint(
+            f"   ⬅ consumes {lin.product_id}/{lin.expose_id}: lineage only, the SQL reads "
+            f"no relation named {lin.expose_id!r}, so it is not resolved",
+            markup=False,
+        )
+    for r in io.inputs:
+        cprint(
+            f'   ⬅ consumes {r.product_id}/{r.expose_id} as view "{r.view}": {r.uri}',
+            markup=False,
+        )
+    if io.inputs:
+        cprint(
+            "     (no run record or lineage event on this path: the resolved inputs are "
+            "listed here and in runtime/out/local_apply_log.jsonl)",
+            markup=False,
+        )
+    if io.landing is not None:
+        cprint(f"   ➡ lands {io.landing.uri}", markup=False)
+
+
+def _print_action_errors(results: List[Dict[str, Any]], io: Any) -> None:
+    """Why each failed provider action failed, and, with resolved inputs, what to check.
+
+    The provider only logs ``local_apply_action_error``; without this the build
+    output said "1 action(s) failed" and nothing else. An upstream that has not
+    landed yet reads as a missing file (or, in S3, a glob matching nothing).
+    """
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
+    for r in results:
+        if r.get("status") == "error" and r.get("error"):
+            # Redacted: an error can quote a value the SQL was templated with.
+            cprint(f"      {redact_secret_text(str(r['error']))}", markup=False)
+    if io is not None and io.inputs:
+        products = ", ".join(sorted({r.product_id for r in io.inputs}))
+        cprint(
+            f"      (if a consumes input above does not exist, its upstream has not landed "
+            f"there yet: build {products} first, with the same --env)",
+            markup=False,
+        )
+
+
+def _bind_embedded_sql_io(actions: List[Dict[str, Any]], io: Any) -> None:
+    """Give the provider's SQL action the resolved inputs and the landing.
+
+    Explicit ``parameters.inputs`` come first and keep their names; a consumes
+    entry they cover was never resolved, so no two inputs share a view.
+    """
+    for action in actions:
+        if (action.get("op") or "").lower() not in {"sql", "query", "execute_sql"}:
+            continue
+        action["inputs"] = [
+            *(action.get("inputs") or []),
+            *(r.as_input_spec() for r in io.inputs),
+        ]
+        if io.landing is not None:
+            action["outputs"] = [io.landing.as_output_spec()]
+
+
+def _local_sql_actions(
+    provider: Any, contract: Dict[str, Any], build: Dict[str, Any], io: Any
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """``(mini_contract, actions)`` the local provider runs for this one build.
+
+    The build is wrapped as a mini-contract so ``_derive_actions_from_contract``
+    finds its inputs and outputs. With ``io`` (the DuckDB inline-SQL path),
+    every consumes entry the SQL reads was resolved or covered by an explicit
+    input; only the lineage-only entries (the SQL reads no relation of their
+    name) reach the provider, which warns about them as it always did
+    (``local_consumes_not_bound``). Its SQL action is bound to the resolved
+    views and the landing.
+    """
+    consumes = (
+        [c.as_consume() for c in io.lineage_only]
+        if io is not None
+        else contract.get("consumes", [])
+    )
+    mini_contract = {
+        "id": contract.get("id", "product"),
+        "builds": [build],
+        "consumes": consumes,
+        "exposes": contract.get("exposes", []),
+    }
+    actions = provider._derive_actions_from_contract(mini_contract)
+    if io is not None:
+        _bind_embedded_sql_io(actions, io)
+    return mini_contract, actions
+
+
+def _plan_duckdb_io(
+    contract: Dict[str, Any],
+    build: Dict[str, Any],
+    contract_dir: Path,
+    *,
+    env: Optional[str],
+) -> Any:
+    """What a DuckDB inline-SQL build reads and lands, printed; ``None`` if refused.
+
+    ``contract`` is the one ``{{ env.* }}`` templates are still in (see
+    ``_embedded_sql_io.object_store_landing``). A refusal is printed as the
+    typed error's what / why / fix, and the build must then return 1 before
+    anything runs.
+    """
+    from fluid_build._errors import FluidUserError
+
+    from ._embedded_sql_io import plan_embedded_sql_io
+
+    build_id = build.get("id", "unknown")
+    try:
+        io = plan_embedded_sql_io(contract, build, contract_dir, env=env, logger=LOG)
+    except FluidUserError as exc:
+        _print_typed_error(exc)
+        LOG.error("embedded_sql_io_refused build_id=%s code=%s", build_id, exc.code)
+        return None
+    _print_embedded_sql_io(io)
+    if io.inputs:
+        LOG.debug(
+            "embedded_sql_consumes_resolved build_id=%s inputs=%s",
+            build_id,
+            json.dumps([r.record() for r in io.inputs]),
+        )
+    return io
+
+
+def _register_placeholder_secrets(*values: Any) -> None:
+    """Register the value of every credential-named ``{{ env.X }}`` in ``values``.
+
+    The runtime path resolves every placeholder, secrets included, into the
+    SQL the provider runs, and an engine error can quote that SQL back
+    (``CAST('{{ env.PARTNER_API_TOKEN }}' AS INTEGER)`` fails naming the
+    value). Registered, the value is masked by exact match wherever the shared
+    redactor runs: the build output, the provider's apply log, and every log
+    line the CLI's redacting filter sees. Names follow the redactor's own
+    predicate (``is_sensitive_key_name``).
+    """
+    from fluid_build.observability.secret_redactor import is_sensitive_key_name, register_secret
+
+    names: Set[str] = set()
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, str):
+            names.update(m.group(1) for m in ENV_PLACEHOLDER_RE.finditer(value))
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                _walk(item)
+
+    for value in values:
+        _walk(value)
+    for name in sorted(names):
+        if is_sensitive_key_name(name) and os.environ.get(name):
+            register_secret(os.environ[name])
+
+
+def _redacted(exc: BaseException) -> str:
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
+    return redact_secret_text(str(exc))
+
+
 def _execute_embedded_sql_build(
     build: Dict[str, Any],
     contract: Dict[str, Any],
     contract_dir: Path,
     dry_run: bool = False,
+    *,
+    env: Optional[str] = None,
 ) -> int:
     """Execute an embedded-SQL build on the runtime platform it declares.
 
@@ -354,14 +540,34 @@ def _execute_embedded_sql_build(
     identical, and mirrors what ``_execute_acquisition_build`` already does
     on the runtime path.
 
+    On the DuckDB engine, ``consumes[]`` is resolved to the relations the
+    upstream products land (``_embedded_sql_io.resolve_consumes``): each entry
+    the SQL reads becomes a view named by its ``exposeId``, read from the
+    upstream's binding under the same ``env`` overlay this run uses. An entry
+    the SQL does not read (no relation of that name) is lineage only, as it
+    was before, and is not resolved. An explicit
+    ``properties.parameters.inputs`` entry with the same name WINS on the
+    collision, and the entry is then not resolved at all. An entry the SQL
+    reads that is neither resolved nor covered fails the build before the SQL
+    runs, and so does one naming this contract's own id. The
+    result lands in S3 when the first expose is an AWS object-store binding,
+    at the object the duckdb acquisition runner would write for it; a local
+    binding is unchanged. An expose declaring ``policy.privacy.masking`` is
+    refused on this path, which does not apply it.
+
     Returns 0 on success, 1 on failure.
     """
     import time
 
     build_id = build.get("id", "unknown")
+    # Kept before resolution: the S3 landing refuses a bucket or path whose
+    # ``{{ env.X }}`` is unset instead of resolving it to "" (a local write).
+    unresolved_contract = contract
     # Runtime path: resolve every placeholder, secrets included — the value
     # stays in process memory and is never serialised to a catalog. See the
-    # secrets note in ``_execute_acquisition_build``.
+    # secrets note in ``_execute_acquisition_build``. Credential-named ones are
+    # registered with the redactor first, so an error quoting one is masked.
+    _register_placeholder_secrets(build, contract)
     build = _resolve_env_placeholders(build)
     contract = _resolve_env_placeholders(contract)
     platform = embedded_sql_platform(build)
@@ -369,6 +575,15 @@ def _execute_embedded_sql_build(
     cprint(f"\n{'─' * 60}")
     engine_label = "local DuckDB" if platform in LOCAL_SQL_PLATFORMS else platform
     cprint(f"🔷 Build '{build_id}' (embedded-SQL / {engine_label})")
+
+    io = None
+    # Only a build carrying inline SQL reads the views: one without it (a
+    # multi-stage ``engine: sql`` build) keeps the provider's old handling.
+    has_inline_sql = bool(str((build.get("properties") or {}).get("sql") or "").strip())
+    if platform in LOCAL_SQL_PLATFORMS and has_inline_sql:
+        io = _plan_duckdb_io(unresolved_contract, build, contract_dir, env=env)
+        if io is None:
+            return 1
 
     if dry_run:
         props = build.get("properties") or {}
@@ -398,7 +613,7 @@ def _execute_embedded_sql_build(
                 cprint(f"   ✅ Completed in {round(time.time() - t0, 2)}s on Snowflake")
             return rc
         except Exception as exc:
-            cprint(f"   ❌ Embedded-SQL build '{build_id}' error: {exc}")
+            cprint(f"   ❌ Embedded-SQL build '{build_id}' error: {_redacted(exc)}")
             LOG.exception("embedded_sql_build_error build_id=%s", build_id)
             return 1
 
@@ -410,16 +625,7 @@ def _execute_embedded_sql_build(
         # runners write and ``fluid verify`` reads (it used to land under
         # whatever directory ``fluid apply`` was launched from).
         provider = LocalProvider(project="local", region="local", anchor_dir=contract_dir)
-        # Derive actions from the single build; wrap the build as a
-        # mini-contract so _derive_actions_from_contract can find inputs
-        # and outputs.
-        mini_contract = {
-            "id": contract.get("id", "product"),
-            "builds": [build],
-            "consumes": contract.get("consumes", []),
-            "exposes": contract.get("exposes", []),
-        }
-        actions = provider._derive_actions_from_contract(mini_contract)
+        mini_contract, actions = _local_sql_actions(provider, contract, build, io)
         t0 = time.time()
         result = provider.apply(actions=actions, plan={"contract": mini_contract})
         elapsed = round(time.time() - t0, 2)
@@ -437,11 +643,84 @@ def _execute_embedded_sql_build(
             return 0
         else:
             cprint(f"   ❌ Failed: {failed} action(s) failed")
+            _print_action_errors(result.get("results") or [], io)
             return 1
     except Exception as exc:
-        cprint(f"   ❌ Embedded-SQL build '{build_id}' error: {exc}")
+        cprint(f"   ❌ Embedded-SQL build '{build_id}' error: {_redacted(exc)}")
         LOG.exception("embedded_sql_build_error build_id=%s", build_id)
         return 1
+
+
+def _manifest_env(path: Any) -> Optional[str]:
+    """The env a bundle's MANIFEST records (``fluid bundle --env``), or ``None``."""
+    if not path or not str(path).lower().endswith((".tgz", ".tar.gz")):
+        return None
+    try:
+        from fluid_build.forge.core.bundle import read_bundle_source
+
+        source = read_bundle_source(Path(str(path)))
+    except Exception:  # noqa: BLE001 - an unreadable bundle is reported elsewhere
+        return None
+    env = source.get("env") if source else None
+    return str(env) if env else None
+
+
+def _plan_env(plan_data: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The overlay env a plan's contract was loaded with, as the plan records it.
+
+    ``contract_metadata.env``, which ``fluid plan`` writes under planDigest. A
+    plan written before that key existed but made from a bundle links the
+    bundle by ``contract_metadata.source_path``: its MANIFEST records the env.
+    """
+    meta = plan_data.get("contract_metadata") if isinstance(plan_data, dict) else None
+    if not isinstance(meta, dict):
+        return None
+    env = meta.get("env")
+    if isinstance(env, str) and env:
+        return env
+    return _manifest_env(meta.get("source_path"))
+
+
+def _run_env(args: argparse.Namespace, plan_data: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """The overlay env this run loaded its contract with.
+
+    ``--env`` when given. Otherwise, for a ``plan.json`` (``plan_data``), the
+    env the plan records (:func:`_plan_env`): the contract embedded in a plan
+    was overlaid when it was planned, so ``fluid apply plan.json`` without
+    ``--env`` runs in that env. For a bundle input (or ``--bundle``), the env
+    its MANIFEST records, because a bundle carries its overlay already applied
+    and is never re-overlaid.
+
+    Raises ``CLIError(plan_env_mismatch)`` when ``--env`` disagrees with the env
+    the plan records: the plan's contract carries the recorded env's bindings,
+    so reading the upstreams with another env would mix two targets.
+    """
+    requested = getattr(args, "env", None) or None
+    recorded = _plan_env(plan_data) if plan_data is not None else None
+    if requested and recorded and str(requested) != recorded:
+        raise CLIError(
+            1,
+            "plan_env_mismatch",
+            {
+                "plan": str(getattr(args, "contract", "")),
+                "plan_env": recorded,
+                "requested_env": str(requested),
+                "hint": (
+                    f"the plan was made with --env {recorded} and carries that overlay; "
+                    f"apply it with --env {recorded} (or without --env), or re-plan with "
+                    f"--env {requested}."
+                ),
+            },
+        )
+    if requested:
+        return str(requested)
+    if recorded:
+        return recorded
+    for candidate in (getattr(args, "contract", None), getattr(args, "bundle", None)):
+        env = _manifest_env(candidate)
+        if env:
+            return env
+    return None
 
 
 def run_builds_from_args(
@@ -637,6 +916,11 @@ def run_builds_from_args(
             LOG.error(f"Build not found: {args.build_id}")
             return 1
 
+    # The overlay env the contract above was loaded with, decided once and
+    # before any build runs: a plan's recorded env that ``--env`` contradicts
+    # is refused here, not after a first build has landed.
+    run_env = _run_env(args, plan_data if str(args.contract).endswith(".json") else None)
+
     cprint(f"\n{'=' * 80}")
     cprint("🚀 FLUID Build Runner")
     cprint(f"{'=' * 80}")
@@ -694,6 +978,7 @@ def run_builds_from_args(
                 contract,
                 contract_path.parent,
                 dry_run=args.dry_run,
+                env=run_env,
             )
         elif is_dbt_build(build):
             project_dir = resolve_dbt_project_path(contract_path, build)
