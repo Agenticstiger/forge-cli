@@ -16,6 +16,12 @@ End-to-end data lake on AWS using Glue for cataloging, ETL, and Iceberg tables.
 - AWS account with Glue, S3, and IAM permissions
 - `fluid` CLI installed (`pip install data-product-forge`)
 - AWS credentials configured (`aws configure` or env vars)
+- `DATA_LAKE_BUCKET`, `AWS_REGION` and `AWS_ACCOUNT_ID` set: the contracts
+  read them as `{{ env.* }}`
+- For `contract-database` and `contract-iceberg`, a Lake Formation
+  administrator to apply them: their `accessPolicy` is enforced on AWS by
+  the Lake Formation grants in the binding (the AWS emitter does not write
+  `accessPolicy` itself), on a location registered with Lake Formation
 
 ## Quick Start
 

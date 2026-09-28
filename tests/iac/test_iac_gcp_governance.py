@@ -1008,6 +1008,16 @@ class TestRestrictionReaders:
                 "examples/bitcoin-price-api-declarative-part-c/contract.fluid.yaml",
                 {"group:data-analysts@company.com", "group:data-engineers@company.com"},
             ),
+            (
+                # Mapped through binding.principals; the denied interns are no reader.
+                "examples/bitcoin-price-api-declarative-part-b/contract.fluid.yaml",
+                {
+                    "group:data-analytics@example.com",
+                    "group:finance-team@example.com",
+                    "group:trading-desk@example.com",
+                    "serviceAccount:looker@example.com",
+                },
+            ),
         ],
     )
     def test_the_shipped_examples_keep_their_readers(self, example, readers):
@@ -1021,7 +1031,11 @@ class TestRestrictionReaders:
         assert _tag_readers(res) == readers
 
     def test_an_example_reader_left_as_a_placeholder_is_refused(self):
-        """part-b's looker reader is ``serviceAccount:looker@<<YOUR_PROJECT_HERE>>...``."""
+        """part-b's looker reader is ``serviceAccount:looker@<<YOUR_PROJECT_HERE>>...``.
+
+        The example maps it in ``binding.principals``; without that block it is
+        emitted as written, which is the placeholder the emitter refuses.
+        """
         import pathlib
 
         import yaml
@@ -1030,7 +1044,13 @@ class TestRestrictionReaders:
             pathlib.Path(__file__).resolve().parents[2]
             / "examples/bitcoin-price-api-declarative-part-b/contract.fluid.yaml"
         )
-        error = _refusal(yaml.safe_load(path.read_text(encoding="utf-8")))
+        contract = yaml.safe_load(path.read_text(encoding="utf-8"))
+        binding = contract["exposes"][0]["binding"]
+        assert "serviceAccount:looker@<<YOUR_PROJECT_HERE>>.iam.gserviceaccount.com" in (
+            binding["principals"]
+        )
+        del binding["principals"]
+        error = _refusal(contract)
         assert error.kind == "principal-placeholder"
         assert "<<YOUR_PROJECT_HERE>>" in str(error)
 
