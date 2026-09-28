@@ -182,9 +182,32 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        env:
+          # `--timeout` for every pip call in this step (pip's documented
+          # PIP_<LONG_NAME> mapping). The default is 15s; pip retries each
+          # request 5 times on top of it.
+          PIP_TIMEOUT: "30"
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev,local]" || pip install -e ".[dev]"
+          # The SAME install, retried; never a smaller one. This line used to
+          # end in `|| pip install -e ".[dev]"`. In run 36409456157 (PR #675,
+          # 2026-09-28) PyPI read-timed out six times on
+          # /simple/python-dateutil/, pip reported that as ResolutionImpossible,
+          # the fallback installed .[dev] without pandas or numpy, dbt-duckdb
+          # below then installed duckdb, and 12 masking tests failed on
+          # DuckDB's "'numpy' is required" instead of this step failing. The
+          # loop also covers what pip's own retries do not: a download that
+          # stalls mid-body is not retried (pypa/pip#12383).
+          # tests/test_ci_install_fallback.py fails on any `pip install ... ||`.
+          for attempt in 1 2 3; do
+            pip install -e ".[dev,local]" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::pip install -e .[dev,local] failed 3 times; this is an install failure, not a test failure."
+              exit 1
+            fi
+            echo "::warning::pip install -e .[dev,local] failed (attempt ${attempt}/3); retrying in 30s."
+            sleep 30
+          done
           # dbt-duckdb pulls dbt-core, which puts a `dbt` binary on PATH.
           # Without it tests/test_speed_transformation_dbt_e2e.py self-skips
           # on shutil.which("dbt"), so the only test that runs a real
@@ -255,9 +278,21 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        env:
+          # Same pip timeout and retried install as the test matrix (see the
+          # comments there).
+          PIP_TIMEOUT: "30"
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev,local]" || pip install -e ".[dev]"
+          for attempt in 1 2 3; do
+            pip install -e ".[dev,local]" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::pip install -e .[dev,local] failed 3 times; this is an install failure, not a test failure."
+              exit 1
+            fi
+            echo "::warning::pip install -e .[dev,local] failed (attempt ${attempt}/3); retrying in 30s."
+            sleep 30
+          done
           # dbt-duckdb pulls dbt-core, which puts a `dbt` binary on PATH.
           # Without it tests/test_speed_transformation_dbt_e2e.py self-skips
           # on shutil.which("dbt"), so the only test that runs a real
@@ -400,9 +435,20 @@ jobs:
       - name: Install fluid-build + pinned MCP SDK
         env:
           MCP_LEG: ${{ matrix.mcp-version }}
+          # Same pip timeout and retried install as the test matrix (see the
+          # comments there).
+          PIP_TIMEOUT: "30"
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev,local]" || pip install -e ".[dev]"
+          for attempt in 1 2 3; do
+            pip install -e ".[dev,local]" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::pip install -e .[dev,local] failed 3 times; this is an install failure, not a test failure."
+              exit 1
+            fi
+            echo "::warning::pip install -e .[dev,local] failed (attempt ${attempt}/3); retrying in 30s."
+            sleep 30
+          done
           case "${{ matrix.mcp-version }}" in
             # Keep the range-max constraint in sync with pyproject.toml.
             range-max) pip install --upgrade "mcp>=1.20,<3.0" ;;
@@ -568,8 +614,8 @@ jobs:
         # static gate (tests/test_no_unencoded_text_io.py) keeps it that way.
         env:
           # This is the leg that exists to execute generated SQL, so a
-          # missing duckdb here is a red build, not a quiet skip. Everywhere
-          # else the `|| .[dev]` install fallback makes absence legitimate.
+          # missing duckdb here is a red build, not a quiet skip. Elsewhere
+          # absence is legitimate: a contributor's `.[dev]` install has none.
           FLUID_REQUIRE_DUCKDB: "1"
         run: |
           python -m pytest -v -m "integration and not slow" tests/test_e2e_local.py tests/test_e2e_local_apply.py tests/test_e2e_local_negative.py tests/providers/test_local_live_happy_path.py tests/test_quickstart_templates_execute.py tests/test_examples_execute.py
