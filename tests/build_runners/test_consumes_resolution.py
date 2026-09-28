@@ -326,11 +326,13 @@ def test_a_json_upstream_prefix_globs_the_files_the_runner_names_ndjson(tmp_path
 @pytest.mark.parametrize(
     "binding, platform",
     [
+        # A BigQuery table is read (tests/build_runners/test_embedded_sql_bigquery.py);
+        # a GCS prefix of files is still not.
         (
             {
                 "platform": "gcp",
-                "format": "bigquery_table",
-                "location": {"project": "p", "dataset": "d", "table": "t"},
+                "format": "parquet",
+                "location": {"bucket": "b", "path": "gs://b/bronze/cs/"},
             },
             "gcp",
         ),

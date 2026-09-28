@@ -192,7 +192,15 @@ builds:
   non-parquet format is CSV, which is what that provider writes). An AWS
   binding naming a `location.bucket` and `location.path` reads
   `s3://<bucket>/<path>/*.<ext>`, the prefix the duckdb acquisition runner
-  writes into and the Glue table `fluid apply` declares for it. A warehouse table, a stream, or a GCS/Azure prefix is an
+  writes into and the Glue table `fluid apply` declares for it. A GCP
+  `bigquery_table` binding reads that table (`<project>.<dataset>.<table>`, the
+  one `fluid apply` created, whatever `gs://` path the binding also carries):
+  when the build runs, the table is read through the BigQuery API
+  (`tabledata.list` pages, streamed) into a Parquet file under the build's
+  `.fluid/staging/<build>/inputs/`, the view reads that file, and the file is
+  removed after the build. A BigQuery `TIMESTAMP` reads as a DuckDB `TIMESTAMP`
+  holding the UTC wall clock, which is what the same SQL reads on the local and
+  aws targets. Another warehouse's table, a stream, or a GCS/Azure prefix is an
   `UnreadableBindingError` naming the platform. A `{{ env.X }}` in the upstream
   binding with `X` unset is an error, not an empty string.
 * **Explicit inputs win.** A `properties.parameters.inputs` entry whose `name`
@@ -221,6 +229,49 @@ and writing AWS itself. A local binding is
 unchanged. An expose declaring `policy.privacy.masking` is refused
 (`MaskingNotAppliedError`): this path does not apply masking, and cleartext
 must not land silently.
+
+When the first expose's binding is a GCP `bigquery_table`, the result is
+written as Parquet under `.fluid/staging/<build>/` and one load job moves it
+into that table (`WRITE_TRUNCATE`, `CREATE_NEVER`, the table's own schema),
+the load the duckdb acquisition runner performs; a `gs://` `location.path` on
+the binding is never written to. A failed or short load fails the build. Any
+other landing this path cannot write, a `gs://` or other non-S3 URI, a GCS
+bucket, an Azure, Snowflake or Databricks binding, is refused
+(`EmbeddedSqlLandingError`) before the SQL runs, instead of being written to a
+local file of that name. The load is recorded as a run under
+`.fluid/runs/<product>/<build>/runs/`, the way the acquisition load is, so
+`fluid verify` holds the table's count to the rows it landed.
+
+Also refused before anything is read (`EmbeddedSqlLandingError`):
+
+* a landing that resolves to one of the build's own inputs: a BigQuery table
+  the build reads (names compared case-insensitively; a project left to the
+  client matches any), or an S3 object inside a prefix it reads. The load
+  replaces the table, so it would overwrite another product's rows, and no
+  `--allow-data-loss` is ever asked for a data write;
+* a further expose named in the build's `outputs` and bound to a cloud store
+  or a warehouse (an aws, gcp, azure, snowflake or databricks binding, or any
+  remote URI): this path lands only the first expose. A further local expose
+  or output port is not written either, and the build prints a warning.
+
+When the contract declares `sovereignty` and the build reads or loads a
+BigQuery table, the locations those reads and the load actually use are held
+to it by `fluid validate`'s rules (`EmbeddedSqlSovereigntyError`): every
+BigQuery binding must name its region (without one it is `US`, the IaC's
+default), the landing must be outside `deniedRegions`, inside
+`allowedRegions` and in the declared `jurisdiction`, and, with `dataResidency`
+and no `crossBorderTransfer` (the schema's defaults), every input must be in
+the landing's jurisdiction. BigQuery's `EU` and `US` multi-regions count as
+EU and US. `enforcementMode: strict` (the default) refuses, `advisory` warns,
+`audit` logs.
+
+BigQuery reads and loads authenticate with Application Default Credentials
+(gcloud ADC, an attached service account, or a Workload Identity Federation
+`external_account` file in `GOOGLE_APPLICATION_CREDENTIALS`). With
+`BIGQUERY_EMULATOR_HOST` set they go to that emulator with anonymous
+credentials, so no real token is sent to it. A load job that reports no row
+count (the goccy emulator's never do) is checked by counting the table after
+the load, never assumed.
 
 ### Skipped builds are not success
 
