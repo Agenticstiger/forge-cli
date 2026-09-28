@@ -27,6 +27,7 @@ region:
 | Athena can read it | `SELECT COUNT(*)` through Athena, polled until it finishes or the timeout passes | query FAILED, CANCELLED or timed out: error (always exit 1); a timed-out query is stopped, and the error says so only when the stop succeeded |
 | It serves what the build landed | the count against the run records of the acquisition build that writes the expose (see below) | CRITICAL |
 | It is not empty | a count of 0, with or without a run record | CRITICAL; in a reference-only contract with no run of its own to compare with, INFO (see below) |
+| Masked columns landed treated | for an expose with `policy.privacy.masking`, the same query counts each masked column's non-null values that lack their strategy's shape (`count_if(... NOT regexp_like(..., '\A(?:<shape>)\z'))`): 64 lowercase hex for `hash`, 32 for `tokenize`, `aesgcm:v1:` and base64url for `encrypt`, the kept characters around `*` for `mask` | one such value: CRITICAL. Only counts leave the query, never a value. A masked column the Glue table lacks, and `k_anonymity` (refused at landing, no per-value shape), fail too |
 
 CRITICAL fails `fluid verify --strict`; INFO fails only with `--fail-on-warning`.
 An error fails `fluid verify` with or without `--strict`. Glue columns declare

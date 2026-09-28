@@ -657,6 +657,10 @@ ignore_missing_imports = true
 # pins that every entry resolves to a real source file.
 [[tool.mypy.overrides]]
 module = [
+    # Masking at landing and its verify check: they decide whether cleartext
+    # lands and whether a pipeline notices, so a silent Any is a silent leak.
+    "fluid_build.build_runners._masking",
+    "fluid_build.cli._verify_masking",
     "fluid_build.cli.security",
     "fluid_build.credentials.encrypted_store",
     "fluid_build.observability.secret_redactor",
