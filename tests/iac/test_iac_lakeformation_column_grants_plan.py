@@ -230,6 +230,35 @@ class TestTheEmittedModulePlans:
         assert analyst["name"] == auditor["name"] == "customers"
         assert auditor["wildcard"] is False
 
+    def test_a_column_limited_grant_plans_select_only(self, tmp_path, moto_endpoint, tofu_env):
+        # Lake Formation takes only SELECT on table_with_columns ("Permissions
+        # modification is invalid" otherwise); the plan and moto take anything, so
+        # the planned values are what is checked. The analyst asked for SELECT and
+        # DESCRIBE; DESCRIBE comes with the column-limited SELECT and is not sent.
+        module = _emitted()
+        _write(module, tmp_path, moto_endpoint)
+        _init(tmp_path, tofu_env)
+        done = _prove(tmp_path, tofu_env, "-out=plan.bin")
+        assert done.returncode == 0, f"tofu plan failed:\n{done.stdout}\n{done.stderr}"
+        shown = _tofu(tmp_path, tofu_env, "show", "-json", "plan.bin")
+        assert shown.returncode == 0, shown.stderr
+        changes = [
+            change
+            for change in json.loads(shown.stdout)["resource_changes"]
+            if change["type"] == "aws_lakeformation_permissions"
+        ]
+        # One resource per grant: nothing split off for the same principal.
+        assert len(changes) == 3
+        by_principal = {change["change"]["after"]["principal"]: change for change in changes}
+        for principal in (ANALYST, AUDITOR):
+            after = by_principal[principal]["change"]["after"]
+            assert after["table_with_columns"], after
+            assert after["permissions"] == ["SELECT"], after
+        assert sorted(by_principal[STEWARD]["change"]["after"]["permissions"]) == [
+            "DESCRIBE",
+            "SELECT",
+        ]
+
 
 @pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
 class TestValidateIsNotTheProof:
