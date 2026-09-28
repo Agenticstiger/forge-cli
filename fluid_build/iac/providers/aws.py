@@ -391,7 +391,7 @@ class AwsIacPlugin:
             _emit_kinesis(resources, loc, cid, tags)
             _emit_redshift_serverless(resources, loc, cid, tags)
             _emit_redshift_external_schema(resources, loc, cid, tags)
-            _check_lf_grant_columns(binding, loc, fmt, schema)
+            _check_lf_grant_columns(binding, loc, fmt, schema, exclusions or {})
             # Per-exposure Lake Formation: location registration,
             # principal grants, LF-tag associations, row/column filters.
             # Only fires when the binding carries a governance.lakeFormation
@@ -1894,7 +1894,48 @@ def lf_column_exclusions(
             "location.table), and without one they would not reach the grants.",
             ("Restrict the columns of the Glue table expose instead.",),
         )
+    if exclusions:
+        _refuse_grants_left_no_column(exposure, binding, exclusions, index)
     return exclusions
+
+
+def _refuse_grants_left_no_column(
+    exposure: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    exclusions: Mapping[int, Tuple[str, ...]],
+    index: int,
+) -> None:
+    """Refuse a read grant whose principal the column restrictions leave no column.
+
+    The grant's excluded columns would be every column of the table, and
+    :func:`_emit_lakeformation` would write a column wildcard that excludes all
+    of them: the same grant :func:`_check_lf_grant_columns` refuses when it is
+    written by hand as ``excludedColumns``. Run here, where ``fluid validate``
+    and the emitter both derive the exclusions, so stage 2 refuses it too.
+    """
+    declared = {
+        str(col.get("name"))
+        for col in ((exposure.get("contract") or {}).get("schema") or [])
+        if isinstance(col, Mapping) and col.get("name")
+    }
+    if not declared:
+        return
+    grants = ((binding.get("governance") or {}).get("lakeFormation") or {}).get("grants") or []
+    for idx, excluded in sorted(exclusions.items()):
+        if not declared <= set(excluded):
+            continue
+        principal = grants[idx].get("principal") if idx < len(grants) else None
+        raise UnsupportedBindingError(
+            "lakeformation-grant-columns",
+            f"exposes[{exposure.get('exposeId') or index}] "
+            f"governance.lakeFormation.grants[{idx}] gives {principal} read access, but "
+            "the contract's column restrictions let it read no column of the table, so "
+            "the grant would give it nothing to read.",
+            (
+                "Remove the grant if the principal should read nothing.",
+                "Allow it at least one column in policy.authz.columnRestrictions.",
+            ),
+        )
 
 
 def _emit_lakeformation(
@@ -2110,6 +2151,7 @@ def _check_lf_grant_columns(
     loc: Mapping[str, Any],
     fmt: str,
     schema: List[Mapping[str, Any]],
+    exclusions: Optional[Mapping[int, Tuple[str, ...]]] = None,
 ) -> None:
     """Refuse a Lake Formation grant whose ``columns`` / ``excludedColumns`` name a
     column the table does not have, or exclude every column it has.
@@ -2119,6 +2161,8 @@ def _check_lf_grant_columns(
     plan`` passes any name. A misspelt exclusion is the dangerous one: the grant
     becomes a column wildcard that still includes the column it meant to hide.
     Only a binding whose grants are emitted against a Glue table is checked.
+    ``exclusions`` are the ones the column restrictions derive
+    (:func:`lf_column_exclusions`): what the emitter writes, so what is checked.
     """
     gov = (binding.get("governance") or {}).get("lakeFormation") or {}
     if not gov or str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS:
@@ -2128,7 +2172,7 @@ def _check_lf_grant_columns(
     declared = [col.get("name") for col in schema or []]
     for idx, grant in enumerate(gov.get("grants") or []):
         cols = list(grant.get("columns") or [])
-        excluded = list(grant.get("excludedColumns") or [])
+        excluded = list((exclusions or {}).get(idx) or grant.get("excludedColumns") or [])
         unknown = [c for c in cols + excluded if c not in declared]
         if unknown:
             raise UnsupportedBindingError(

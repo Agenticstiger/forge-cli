@@ -192,6 +192,52 @@ class TestRendering:
         errors, _ = validate_governance(contract)
         assert any("names no Glue table" in e for e in errors), errors
 
+    # A grant the restrictions leave with no column. Hand-written as
+    # excludedColumns it was refused ("excludes every column of the table"), but
+    # derived from columnRestrictions it was emitted: a column wildcard that
+    # excludes every column (measured on the integration with 0.16.6's #675).
+    ALL_COLUMNS = ["customer_id", "status", "msisdn"]
+
+    @pytest.mark.parametrize(
+        "restrictions, principals",
+        [
+            ([{"principal": LOGICAL_ANALYSTS, "columns": ALL_COLUMNS, "access": "deny"}], MAPPED),
+            ([{"principal": STEWARD, "columns": ALL_COLUMNS, "access": "allow"}], None),
+        ],
+        ids=["denied-every-column", "allowed-to-someone-else-only"],
+    )
+    def test_restrictions_that_leave_a_reader_no_column_are_refused(self, restrictions, principals):
+        contract = _contract(restrictions=restrictions, principals=principals)
+        error = _refusal(contract)
+        assert error.kind == "lakeformation-grant-columns"
+        assert f"grants[1] gives {ANALYST} read access" in str(error)
+        assert "read no column of the table" in str(error)
+        errors, _ = validate_governance(contract)
+        assert any("read no column of the table" in e for e in errors), errors
+
+    def test_restrictions_that_leave_a_reader_one_column_still_emit(self):
+        deny = [{"principal": LOGICAL_ANALYSTS, "columns": self.ALL_COLUMNS[:2], "access": "deny"}]
+        grants = _grants(_contract(restrictions=deny, principals=MAPPED))
+        twc = grants[ANALYST]["table_with_columns"][0]
+        assert twc["wildcard"] is True
+        assert twc["excluded_column_names"] == ["customer_id", "status"]
+
+    def test_the_grant_check_reads_the_derived_exclusions(self):
+        from fluid_build.iac.providers.aws import _check_lf_grant_columns
+
+        contract = _contract()
+        exposure = contract["exposes"][0]
+        binding = exposure["binding"]
+        schema = exposure["contract"]["schema"]
+        with pytest.raises(UnsupportedBindingError) as raised:
+            _check_lf_grant_columns(
+                binding, binding["location"], "parquet", schema, {1: tuple(self.ALL_COLUMNS)}
+            )
+        assert "excludes every column of the table" in str(raised.value)
+        with pytest.raises(UnsupportedBindingError) as raised:
+            _check_lf_grant_columns(binding, binding["location"], "parquet", schema, {1: ("x",)})
+        assert "['x']" in str(raised.value)
+
     def test_fluid_validate_reports_the_refusal(self):
         errors, _ = validate_governance(
             _contract(restrictions=DENY, principals=MAPPED, analyst_excluded=["msisdn"])
