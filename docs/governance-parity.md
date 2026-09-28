@@ -98,6 +98,24 @@ principal set (who sees masked values rather than an error) that the contract ha
 field for, and a column masked at landing (`policy.privacy.masking`) would be hashed
 twice.
 
+## Dataset grants are no longer authoritative
+
+The grants were an authoritative `access` list on the dataset: it replaced every
+entry the dataset had, including the ones BigQuery gives a new dataset (the project's
+owners, writers and readers, and its creator), and anything granted elsewhere. They
+are `google_bigquery_dataset_iam_member` resources now, which add their own binding
+and leave the rest. The consequences:
+
+* A principal holding a basic role on the project (Viewer, Editor, Owner) keeps the
+  dataset access BigQuery's default entries give it. Restricted columns stay
+  protected by their policy tags whatever the dataset grants; keep basic roles off
+  projects that hold restricted data.
+* A grant made outside the contract is no longer removed by the next apply.
+  `fluid verify` reports a fine-grained reader granted outside the contract; dataset
+  grants are not verified yet.
+* The provider rewrites the dataset's access list without authorized-view entries
+  when it adds a member; forge-cli emits none.
+
 ## Changes a live table cannot take in place
 
 BigQuery cannot partition an existing table, and the provider replaces a table whose
@@ -114,7 +132,7 @@ partitioning's shape. Changing `retention` later is an in-place update of
 also refuses without `--allow-data-loss`; BigQuery cannot un-partition a table, so to
 keep data longer, set a longer `retention` instead.
 
-## Prerequisites on GCP
+## Prerequisites
 
 * The Cloud KMS API (`cloudkms.googleapis.com`) and the Data Catalog API
   (`datacatalog.googleapis.com`) enabled on the project, for keys and policy tags.
@@ -128,6 +146,10 @@ keep data longer, set a longer `retention` instead.
 * `fluid verify`'s column check calls the Data Catalog API with Application Default
   Credentials, and needs `datacatalog.taxonomies.get` and
   `datacatalog.taxonomies.getIamPolicy`.
+* On AWS, `fluid verify`'s Lake Formation check lists the table permissions the
+  caller can see, so it must run as a Lake Formation administrator. When the
+  contract's own grants are not in the listing, it reports an error rather than a
+  pass.
 
 ## What is proven, and what is not
 

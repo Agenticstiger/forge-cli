@@ -73,6 +73,9 @@ _GCP_KEY_RE = re.compile(
     r"keyRings/(?P<ring>[A-Za-z0-9_-]{1,63})/cryptoKeys/(?P<key>[A-Za-z0-9_-]{1,63})"
 )
 
+#: A Cloud KMS / BigQuery location id (``europe-west1``, ``us``, ``europe``).
+_LOCATION_RE = re.compile(r"[a-z0-9-]{1,63}")
+
 #: A product key rotates to a new primary version every 90 days, the period CIS
 #: GCP 1.10 and terraform-google-modules/kms's examples use.
 KEY_ROTATION_PERIOD = "7776000s"
@@ -323,6 +326,16 @@ def encryption_for(
     location = kms_location(bq_location)
     if kms == KMS_NONE:
         return None
+    if not _LOCATION_RE.fullmatch(location):
+        # The location becomes a path segment of the key ring's import id, so a
+        # value that is not a location must not reach it (it could name another
+        # project's key ring for the apply to adopt).
+        raise UnsupportedBindingError(
+            "encryption-kms-location",
+            f"{where}.location.region is {bq_location!r}, which is not a BigQuery "
+            "location, so no Cloud KMS location can be derived for its key.",
+            ("Set binding.location.region to the dataset's location, e.g. europe-west1.",),
+        )
     if kms == KMS_PRODUCT:
         return BqEncryption(kms=KMS_PRODUCT, location=location)
     text = kms if isinstance(kms, str) else ""

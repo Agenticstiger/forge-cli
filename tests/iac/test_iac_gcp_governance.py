@@ -375,6 +375,16 @@ class TestEncryption:
         table = res["google_bigquery_table"][f"{CID}_retention_candidates"]
         assert table["encryption_configuration"] == {"kms_key_name": key}
 
+    def test_a_region_that_is_not_a_location_never_reaches_the_key_import_id(self):
+        contract = _contract(
+            principals=MAPPING,
+            encryption={"kms": "product"},
+            region="europe-west1/keyRings/other/../../../projects/victim",
+        )
+        assert _refusal(contract).kind == "encryption-kms-location"
+        with pytest.raises(UnsupportedBindingError):
+            get_iac_plugin("gcp").discover_imports(contract)
+
     def test_an_existing_key_in_another_location_is_refused(self):
         key = "projects/sec/locations/us-central1/keyRings/shared/cryptoKeys/gold"
         error = _refusal(_contract(principals=MAPPING, encryption={"kms": key}))

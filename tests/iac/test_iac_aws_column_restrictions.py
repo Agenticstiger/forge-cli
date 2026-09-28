@@ -365,15 +365,8 @@ def _lf_table(**columns: Any) -> Dict[str, Any]:
     return {"TableWithColumns": {**ref, **columns}}
 
 
-@pytest.mark.skipif(not _have_moto_server(), reason=_SKIP_REASON)
-def test_verify_reads_lake_formation_and_fails_on_a_grant_outside_the_contract(moto_endpoint):
-    """moto's Lake Formation stores grants; verify reads them as the real API returns them.
-
-    (moto cannot read back a column-level grant for the provider, so the grants
-    here are made through the API directly, as the apply would.)
-    """
-    contract = _contract(restrictions=DENY, principals=MAPPED)
-    lf = _boto("lakeformation", moto_endpoint)
+def _grant_as_apply_would(lf: Any) -> None:
+    """The two grants the emitted module makes, made through the API."""
     lf.grant_permissions(
         Principal={"DataLakePrincipalIdentifier": STEWARD},
         Resource=_lf_table(),
@@ -384,6 +377,18 @@ def test_verify_reads_lake_formation_and_fails_on_a_grant_outside_the_contract(m
         Resource=_lf_table(ColumnWildcard={"ExcludedColumnNames": ["customer_id", "msisdn"]}),
         Permissions=["SELECT"],
     )
+
+
+@pytest.mark.skipif(not _have_moto_server(), reason=_SKIP_REASON)
+def test_verify_reads_lake_formation_and_fails_on_a_grant_outside_the_contract(moto_endpoint):
+    """moto's Lake Formation stores grants; verify reads them as the real API returns them.
+
+    (moto cannot read back a column-level grant for the provider, so the grants
+    here are made through the API directly, as the apply would.)
+    """
+    contract = _contract(restrictions=DENY, principals=MAPPED)
+    lf = _boto("lakeformation", moto_endpoint)
+    _grant_as_apply_would(lf)
     passed = _check(contract, moto_endpoint)
     assert passed["status"] == "pass", passed
     assert set(passed["checked"]) == {ANALYST, "IAM_ALLOWED_PRINCIPALS"}
@@ -404,6 +409,7 @@ def test_verify_fails_when_the_table_still_grants_iam_allowed_principals(moto_en
     """Lake Formation's default for a new table lets any IAM principal read every column."""
     contract = _contract(restrictions=DENY, principals=MAPPED)
     lf = _boto("lakeformation", moto_endpoint)
+    _grant_as_apply_would(lf)
     lf.grant_permissions(
         Principal={"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"},
         Resource=_lf_table(),
@@ -412,3 +418,18 @@ def test_verify_fails_when_the_table_still_grants_iam_allowed_principals(moto_en
     failed = _check(contract, moto_endpoint)
     assert failed["status"] == "fail"
     assert "IAM_ALLOWED_PRINCIPALS can read customer_id, msisdn" in failed["message"]
+
+
+@pytest.mark.skipif(not _have_moto_server(), reason=_SKIP_REASON)
+def test_verify_errors_when_it_cannot_see_the_contracts_own_grants(moto_endpoint):
+    """A caller that sees only part of the permissions must not read as a pass."""
+    contract = _contract(restrictions=DENY, principals=MAPPED)
+    lf = _boto("lakeformation", moto_endpoint)
+    lf.grant_permissions(
+        Principal={"DataLakePrincipalIdentifier": ANALYST},
+        Resource=_lf_table(ColumnWildcard={"ExcludedColumnNames": ["customer_id", "msisdn"]}),
+        Permissions=["SELECT"],
+    )
+    unseen = _check(contract, moto_endpoint)
+    assert unseen["status"] == "error"
+    assert STEWARD in unseen["message"] and "Lake Formation administrator" in unseen["message"]

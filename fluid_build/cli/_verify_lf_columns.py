@@ -133,6 +133,32 @@ def column_restrictions_dimension(
                 f"({_error_code(exc) or type(exc).__name__})"
             ),
         }
+    # ListPermissions shows only what the caller may see, so a caller that is not a
+    # Lake Formation administrator gets a partial listing, and an absent grant
+    # would read as a pass. The grants the contract makes must be visible, or the
+    # listing cannot be trusted.
+    grantees = {
+        str(g.get("principal"))
+        for g in ((binding.get("governance") or {}).get("lakeFormation") or {}).get("grants") or ()
+        if isinstance(g, Mapping) and g.get("principal")
+    }
+    visible = {
+        (entry.get("Principal") or {}).get("DataLakePrincipalIdentifier")
+        for entry in permissions
+        if _readable(entry.get("Resource") or {}, database, table) is not None
+    }
+    unseen = sorted(grantees - visible)
+    if unseen:
+        return {
+            "status": "error",
+            "message": (
+                f"Column restrictions: lakeformation:ListPermissions shows no permission on "
+                f"{database}.{table} for {', '.join(unseen)}, which the contract grants; "
+                "either the apply has not run or the verifying identity cannot see every "
+                "permission (it must be a Lake Formation administrator), so the check "
+                "cannot be trusted"
+            ),
+        }
     problems: List[str] = []
     checked: Dict[str, List[str]] = {}
     for principal, forbidden in expected.items():
