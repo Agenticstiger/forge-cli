@@ -69,7 +69,11 @@ def bigquery_load_target(
     """The table a binding loads into, or None when it is not a BigQuery table.
 
     Resolved with the IaC's own helpers, so the load names the dataset, table
-    and location ``_emit_bigquery`` created.
+    and location ``_emit_bigquery`` created. A binding that names no region
+    gives ``location: None``, never a guessed ``US``: :func:`load_file` then
+    runs the job where the table itself is (its ``location``), which is the
+    only place a load job can run. The guessed default could send a job for
+    an EU table to the US multi-region.
     """
     from ..iac.providers.gcp import BIGQUERY_TABLE, _bq_table_name, resolve_gcp_target
 
@@ -83,7 +87,7 @@ def bigquery_load_target(
         "project": project,
         "dataset": loc.get("dataset") or "default",
         "table": _bq_table_name(expose, loc),
-        "location": loc.get("region") or loc.get("location") or "US",
+        "location": loc.get("region") or loc.get("location") or None,
     }
 
 
@@ -139,10 +143,11 @@ def load_file(
         create_disposition="CREATE_NEVER",
         schema=table.schema,
     )
+    # The job runs where the table is: the binding's region when it names
+    # one, otherwise the table's own location, read above, never a default.
+    location = target.get("location") or getattr(table, "location", None)
     with open(path, "rb") as fh:
-        job = client.load_table_from_file(
-            fh, table_id, job_config=job_config, location=target["location"]
-        )
+        job = client.load_table_from_file(fh, table_id, job_config=job_config, location=location)
     job.result()
     loaded = int(job.output_rows or 0)
     if loaded != expected_rows:

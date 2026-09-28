@@ -35,6 +35,7 @@ import pytest
 
 from fluid_build.cli import _apply_opentofu_engine as engine
 from fluid_build.cli._common import CLIError
+from fluid_build.iac.state_migration import CURRENT, StateReconciliation
 
 pytestmark = [pytest.mark.unit]
 
@@ -84,6 +85,13 @@ def _apply_and_read_backend(
         return SimpleNamespace(ok=False, stderr="stub: tofu init not run", stdout="")
 
     monkeypatch.setattr(engine.runner, "tofu_init", _init_stops_here)
+    # The move of a pre-provider-key state (``iac.state_migration``) runs its
+    # own ``tofu init``; it is not under test here and finds nothing to move.
+    monkeypatch.setattr(
+        engine,
+        "_reconcile_state",
+        lambda **kw: StateReconciliation(CURRENT, kw["legacy"], kw["current"]),
+    )
     args = argparse.Namespace(
         contract=str(contract),
         env=None,
@@ -187,9 +195,9 @@ def test_a_bucket_only_env_value_gives_each_contract_its_own_s3_key(
     second, _ = _apply_and_read_backend(
         tmp_path / "b", monkeypatch, flag=None, contract_text=_OTHER_CONTRACT
     )
-    assert first == {"s3": {"bucket": "ci-state", "key": "fluid/demo.state/terraform.tfstate"}}
+    assert first == {"s3": {"bucket": "ci-state", "key": "fluid/demo.state/aws/terraform.tfstate"}}
     assert second == {
-        "s3": {"bucket": "ci-state", "key": "fluid/demo.other_state/terraform.tfstate"}
+        "s3": {"bucket": "ci-state", "key": "fluid/demo.other_state/aws/terraform.tfstate"}
     }
 
 
@@ -199,7 +207,7 @@ def test_a_bucket_only_env_value_gives_each_contract_its_own_gcs_prefix(
 ) -> None:
     monkeypatch.setenv("FLUID_STATE_BACKEND", spec)
     backend, _ = _apply_and_read_backend(tmp_path, monkeypatch, flag=None)
-    assert backend == {"gcs": {"bucket": "ci-state", "prefix": "fluid/demo.state"}}
+    assert backend == {"gcs": {"bucket": "ci-state", "prefix": "fluid/demo.state/aws"}}
 
 
 def test_the_flag_keeps_the_shared_legacy_key_for_a_contract_without_packaging(
@@ -227,8 +235,8 @@ def test_ids_the_old_key_folded_together_get_their_own_state(
         flag=None,
         contract_text=_CONTRACT.replace("id: demo.state", "id: demo_state"),
     )
-    assert dotted["s3"]["key"] == "fluid/demo.state/terraform.tfstate"
-    assert underscored["s3"]["key"] == "fluid/demo_state/terraform.tfstate"
+    assert dotted["s3"]["key"] == "fluid/demo.state/aws/terraform.tfstate"
+    assert underscored["s3"]["key"] == "fluid/demo_state/aws/terraform.tfstate"
 
 
 def test_an_id_that_cannot_key_a_state_is_a_typed_error_naming_the_variable(
@@ -278,7 +286,7 @@ def test_the_state_line_names_the_object_each_form_resolved_to(
         "  state:       remote: s3://ci-state/fluid/terraform.tfstate (from --state-backend)"
     ]
     assert env_lines == [
-        "  state:       remote: s3://ci-state/fluid/demo.state/terraform.tfstate"
+        "  state:       remote: s3://ci-state/fluid/demo.state/aws/terraform.tfstate"
         " (from FLUID_STATE_BACKEND)"
     ]
 
