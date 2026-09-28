@@ -29,8 +29,9 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from fluid_build.cli.console import cprint
 from fluid_build.iac import build_module, get_iac_plugin, runner
@@ -106,52 +107,11 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
             {"error": str(exc)},
         )
 
-    # ``contract`` selects the default state key: packaging-bearing contracts
-    # get a per-contract key so two products sharing one state bucket cannot
-    # clobber each other; legacy contracts keep the shared key (RFC file 7).
-    #
-    # ``--state-backend`` defaults from ``FLUID_STATE_BACKEND`` (flag wins;
-    # an empty flag forces local state), so a CI job can keep state in a
-    # bucket instead of the workspace it wipes after every run. That job
-    # applies every product with the one value, so a bucket-only value keys
-    # state per contract for all of them, packaging block or not.
-    backend_spec, backend_origin = resolve_state_backend_spec(getattr(args, "state_backend", None))
-    try:
-        backend = parse_backend(
-            backend_spec,
-            contract,
-            per_contract_default=backend_origin == STATE_BACKEND_ENV,
-        )
-    except ValueError as exc:
-        raise CLIError(
-            1,
-            "apply_state_backend_invalid",
-            {"source": backend_origin, "error": str(exc)},
-        )
-    # Per-contract workdir + state: each contract owns an isolated ``tofu``
-    # state, so applying contract B never plans to destroy contract A's
-    # resources (they share the provider but not the state).
-    workdir = (
-        Path(getattr(args, "workspace_dir", None) or ".")
-        / ".fluid"
-        / "iac"
-        / provider
-        / safe_ident(contract.get("id") or "contract")
-    )
+    target = resolve_state_target(args, contract, provider)
+    backend, backend_origin, workdir = target.backend, target.origin, target.workdir
     workdir.mkdir(parents=True, exist_ok=True)
     module_path = workdir / "main.tf.json"
-    actions = native_actions(contract, logger)
-    try:
-        module = build_module(plugin, contract, actions=actions, backend=backend)
-    except UnsupportedBindingError as exc:
-        # The emitter refused to substitute a different resource kind for the
-        # declared binding. Surface it as a typed CLI error rather than a
-        # traceback — and, critically, before anything reaches the warehouse.
-        raise CLIError(
-            1,
-            "unsupported_binding",
-            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
-        )
+    module, actions = emit_module(plugin, contract, target, logger)
     module_path.write_text(module, encoding="utf-8")
 
     env = build_tofu_env()
@@ -268,6 +228,90 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
 
     info(logger, "opentofu_apply_ok", provider=provider, **applied)
     return 0
+
+
+@dataclass(frozen=True)
+class StateTarget:
+    """Where ``fluid apply`` keeps one contract's OpenTofu workdir and state."""
+
+    workdir: Path
+    #: The ``terraform.backend`` block, or ``None`` for local state in ``workdir``.
+    backend: Optional[Dict[str, Any]]
+    #: ``--state-backend``, ``FLUID_STATE_BACKEND`` or ``default``.
+    origin: str
+
+    @property
+    def location(self) -> str:
+        """The state's location, as the apply prints it."""
+        if self.backend:
+            return "remote: " + backend_location(self.backend)
+        return f"local: {self.workdir / LOCAL_STATE_FILE}"
+
+
+#: Where the local backend keeps state inside the workdir (``tofu`` default).
+LOCAL_STATE_FILE = "terraform.tfstate"
+
+
+def resolve_state_target(args, contract: Mapping[str, Any], provider: str) -> StateTarget:
+    """The workdir and backend ``fluid apply`` uses for ``contract``.
+
+    One resolution for every command that reads the apply's state (``fluid
+    diff`` and ``fluid verify --state-drift`` too), so a reader can never look
+    at a different state from the one the apply wrote. Raises the apply's own
+    ``apply_state_backend_invalid`` for a spec it cannot use.
+    """
+    # ``contract`` selects the default state key: packaging-bearing contracts
+    # get a per-contract key so two products sharing one state bucket cannot
+    # clobber each other; legacy contracts keep the shared key (RFC file 7).
+    #
+    # ``--state-backend`` defaults from ``FLUID_STATE_BACKEND`` (flag wins;
+    # an empty flag forces local state), so a CI job can keep state in a
+    # bucket instead of the workspace it wipes after every run. That job
+    # applies every product with the one value, so a bucket-only value keys
+    # state per contract for all of them, packaging block or not.
+    backend_spec, backend_origin = resolve_state_backend_spec(getattr(args, "state_backend", None))
+    try:
+        backend = parse_backend(
+            backend_spec,
+            contract,
+            per_contract_default=backend_origin == STATE_BACKEND_ENV,
+        )
+    except ValueError as exc:
+        raise CLIError(
+            1,
+            "apply_state_backend_invalid",
+            {"source": backend_origin, "error": str(exc)},
+        )
+    # Per-contract workdir + state: each contract owns an isolated ``tofu``
+    # state, so applying contract B never plans to destroy contract A's
+    # resources (they share the provider but not the state).
+    workdir = (
+        Path(getattr(args, "workspace_dir", None) or ".")
+        / ".fluid"
+        / "iac"
+        / provider
+        / safe_ident(contract.get("id") or "contract")
+    )
+    return StateTarget(workdir=workdir, backend=backend, origin=backend_origin)
+
+
+def emit_module(
+    plugin: Any, contract: Mapping[str, Any], target: StateTarget, logger: logging.Logger
+) -> Tuple[str, List[Any]]:
+    """``(main.tf.json text, native actions)`` the apply emits for ``contract``."""
+    actions = native_actions(contract, logger)
+    try:
+        module = build_module(plugin, contract, actions=actions, backend=target.backend)
+    except UnsupportedBindingError as exc:
+        # The emitter refused to substitute a different resource kind for the
+        # declared binding. Surface it as a typed CLI error rather than a
+        # traceback — and, critically, before anything reaches the warehouse.
+        raise CLIError(
+            1,
+            "unsupported_binding",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        )
+    return module, actions
 
 
 @contextmanager

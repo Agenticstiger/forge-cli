@@ -38,6 +38,8 @@ on:
     paths:
       - "fluid_build/iac/**"
       - "fluid_build/cli/_apply_opentofu_engine.py"
+      - "fluid_build/cli/_diff_state.py"
+      - "fluid_build/cli/diff.py"
       - "fluid_build/build_runners/dbt/**"
       - "tests/iac/**"
       - ".github/workflows/iac-tests.yml"
@@ -109,6 +111,17 @@ jobs:
             -q --junitxml=lf-bucket-policy-plan.xml
           .venv/bin/python scripts/ci/assert_lane_coverage.py lf-bucket-policy-plan.xml \
             --require "LF bucket-policy plan=tests/iac/test_iac_lakeformation_bucket_policy_plan.py"
+
+      # `fluid diff` refreshes the apply's OpenTofu state: a real apply, then
+      # the refresh plan, against moto. Whether a clean apply reads as no drift
+      # depends on what the provider reads back, so only a real run proves it.
+      # The emulator extra is already installed by the step above.
+      - name: Stage 1 — state drift (fluid diff reads the apply's state vs moto, creds-free)
+        run: |
+          .venv/bin/python -m pytest tests/iac/test_iac_state_drift_moto.py \
+            -q -p no:randomly --junitxml=state-drift.xml
+          .venv/bin/python scripts/ci/assert_lane_coverage.py state-drift.xml \
+            --require "state drift=tests/iac/test_iac_state_drift_moto.py"
 
   # -------------------------------------------------------------------
   # Stage 2 — docker emulators. PR + push.
