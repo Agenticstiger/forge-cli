@@ -602,11 +602,16 @@ def _report_sovereignty(
             return False
 
     # No usable provider verdict — fall back to the built-in policy engine.
-    reason = (
-        f"the {pname} provider has no sovereignty hook"
-        if hook_provider is not None
-        else "no provider could be built for this contract"
-    )
+    if hook_provider is None:
+        reason = "no provider could be built for this contract"
+    else:
+        from fluid_build.cli.hooks import has_hook
+
+        reason = (
+            f"the {pname} provider's sovereignty hook gave no verdict"
+            if has_hook(hook_provider, "validate_sovereignty")
+            else f"the {pname} provider has no sovereignty hook"
+        )
 
     sovereignty = contract.get("sovereignty") or {}
     if not isinstance(sovereignty, dict) or not sovereignty:

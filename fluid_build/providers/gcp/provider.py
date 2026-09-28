@@ -231,6 +231,57 @@ class GcpProvider(BaseProvider):
             raise ProviderError(str(e)) from e
         self.info_kv(event="sovereignty_validated", region=self.region)
 
+    def validate_sovereignty(self, contract: Mapping[str, Any]) -> Optional[List[str]]:
+        """``fluid plan --check-sovereignty``: what ``fluid apply`` would refuse, and why.
+
+        Stage 7 checks sovereignty twice, both where the data lands: this
+        provider's planned actions (:meth:`_validate_sovereignty`) and every
+        resource the OpenTofu plugin emits (``GcpIacPlugin.emit``: the dataset,
+        and the KMS key ring and Data Catalog taxonomy governance adds). The
+        plan stage used to run only the policy engine over the bindings, so a
+        placement the emitter derived passed stage 6 and was refused at stage
+        7. This runs the same placements through the same engine, plus the
+        engine's own contract-level checks, and returns every error-severity
+        finding (``where: message``); a warning or an info finding is logged,
+        as apply logs it, and does not block.
+
+        ``None`` (no verdict) for a contract with no ``sovereignty`` block, so
+        the plan reports NOT CHECKED rather than a pass. A planner or emitter
+        that cannot run raises; ``run_validate_sovereignty`` reads that as no
+        verdict too, and the plan falls back to the policy engine.
+        """
+        if not contract.get("sovereignty"):
+            return None
+        from fluid_build.iac import get_iac_plugin
+        from fluid_build.iac.plan_packaging import filter_referenced_container_actions
+        from fluid_build.policy.sovereignty import SovereigntyValidator
+
+        from .util.sovereignty import (
+            action_placements,
+            gcp_sovereignty_violations,
+            resource_placements,
+        )
+
+        actions = plan_actions(contract, self.project, self.region, self.logger)
+        # What apply emits from: the planned actions less the creations a
+        # shared pool already holds (``generate_iac.native_actions``).
+        kept, _dropped = filter_referenced_container_actions(contract, list(actions))
+        resources = get_iac_plugin("gcp").emit(contract, kept, enforce_sovereignty=False)
+
+        _ok, found = SovereigntyValidator().validate(dict(contract))
+        found = list(found)
+        found += gcp_sovereignty_violations(contract, action_placements(actions))
+        found += gcp_sovereignty_violations(contract, resource_placements(resources))
+        errors: List[str] = []
+        for v in found:
+            line = f"{v.expose_id}: {v.message}"
+            if v.severity == "error":
+                if line not in errors:
+                    errors.append(line)
+            else:
+                self.warn_kv(event="sovereignty_finding", severity=v.severity, finding=line)
+        return errors
+
     def apply(self, actions: List[Dict[str, Any]], **kwargs: Any) -> ApplyResult:
         """Native GCP apply is retired — GCP uses the OpenTofu engine.
 

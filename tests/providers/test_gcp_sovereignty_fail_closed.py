@@ -331,3 +331,142 @@ def test_a_load_with_no_region_runs_where_the_table_is(tmp_path, monkeypatch):
         str(landed), target, mode=mode, sink_format=sink, expected_rows=1, logger=_LOG
     )
     assert calls == ["europe-west1"]
+
+
+# ── A key ring and a taxonomy in a BigQuery multi-region ──────────────────
+#
+# Measured on the integration of this branch with the governance one: a
+# contract with ``allowedRegions: [EU]`` and an ``EU`` dataset emits its CMEK
+# key ring in the Cloud KMS location ``europe`` and its policy-tag taxonomy in
+# the Data Catalog location ``eu``. ``fluid validate --strict`` and ``fluid plan
+# --check-sovereignty`` passed, and ``fluid generate iac`` / ``fluid apply``
+# refused both ("Region 'europe' not in allowed regions list", "(jurisdiction:
+# Unknown)"). They are the dataset's own place.
+
+_EU_ONLY = {"jurisdiction": "EU", "allowedRegions": ["EU"], "enforcementMode": "strict"}
+
+
+def _multi_region_contract(region: str) -> Dict[str, Any]:
+    contract = _contract(dict(_BQ, region=region))
+    contract["sovereignty"] = dict(_EU_ONLY)
+    return contract
+
+
+def _governed(dataset_location: str, ring: str, taxonomy: str) -> Dict[str, Any]:
+    return {
+        "google_bigquery_dataset": {"d": {"location": dataset_location}},
+        "google_kms_key_ring": {"k": {"name": "ring", "location": ring}},
+        "google_data_catalog_taxonomy": {"t": {"display_name": "tax", "region": taxonomy}},
+    }
+
+
+def test_a_key_ring_and_a_taxonomy_are_placed_at_their_datasets_multi_region():
+    from fluid_build.providers.gcp.util.sovereignty import resource_placements
+
+    assert resource_placements(_governed("EU", "europe", "eu")) == [
+        ("google_bigquery_dataset.d", "EU"),
+        ("google_kms_key_ring.k", "EU"),
+        ("google_data_catalog_taxonomy.t", "EU"),
+    ]
+    assert resource_placements(_governed("US", "us", "us"))[1:] == [
+        ("google_kms_key_ring.k", "US"),
+        ("google_data_catalog_taxonomy.t", "US"),
+    ]
+    # Spelled as the dataset spells it, so ``allowedRegions: [eu]`` agrees too.
+    assert {p for _, p in resource_placements(_governed("eu", "europe", "eu"))} == {"eu"}
+    # A regional key ring or taxonomy is where it says.
+    assert resource_placements(_governed("europe-west1", "europe-west1", "europe-west1")) == [
+        ("google_bigquery_dataset.d", "europe-west1"),
+        ("google_kms_key_ring.k", "europe-west1"),
+        ("google_data_catalog_taxonomy.t", "europe-west1"),
+    ]
+
+
+def test_an_eu_datasets_key_ring_and_taxonomy_pass_an_eu_only_strict_policy():
+    from fluid_build.providers.gcp.util.sovereignty import (
+        enforce_gcp_sovereignty,
+        resource_placements,
+    )
+
+    contract = _multi_region_contract("EU")
+    enforce_gcp_sovereignty(contract, resource_placements(_governed("EU", "europe", "eu")))
+    # With only a jurisdiction, ``europe`` used to resolve to none (strict refuses).
+    contract["sovereignty"] = {"jurisdiction": "EU", "enforcementMode": "strict"}
+    enforce_gcp_sovereignty(contract, resource_placements(_governed("EU", "europe", "eu")))
+
+
+def test_a_us_datasets_key_ring_and_taxonomy_are_still_refused_under_an_eu_policy():
+    from fluid_build.providers.gcp.util.sovereignty import (
+        enforce_gcp_sovereignty,
+        resource_placements,
+    )
+
+    with pytest.raises(SovereigntyViolationError) as exc:
+        enforce_gcp_sovereignty(
+            _multi_region_contract("US"), resource_placements(_governed("US", "us", "us"))
+        )
+    assert "google_kms_key_ring.k: Region 'US' not in allowed regions list" in exc.value.what
+    assert "(jurisdiction: US)" in exc.value.what
+
+
+# ── fluid plan --check-sovereignty runs what fluid apply runs ─────────────
+
+
+def _hook(contract: Dict[str, Any]):
+    from fluid_build.providers.gcp.provider import GcpProvider
+
+    return GcpProvider(project="northwind-demo", region="europe-west1").validate_sovereignty(
+        contract
+    )
+
+
+def test_the_plan_hook_checks_the_resources_the_emitter_places(monkeypatch):
+    """A place only the emitter derives is refused at stage 6, as at stage 7."""
+    from fluid_build.iac.providers.gcp import GcpIacPlugin
+
+    real_emit = GcpIacPlugin.emit
+
+    def emit_with_a_key_ring(self, contract, actions=(), **kwargs):
+        resources = real_emit(self, contract, actions, **kwargs)
+        resources["google_kms_key_ring"] = {"k": {"name": "ring", "location": "asia"}}
+        return resources
+
+    monkeypatch.setattr(GcpIacPlugin, "emit", emit_with_a_key_ring)
+    contract = _contract(dict(_BQ, region="europe-west1"))
+    errors = _hook(contract)
+    assert errors and all(e.startswith("google_kms_key_ring.k: ") for e in errors)
+    assert any("Region 'asia' not in allowed regions list" in e for e in errors)
+
+
+@pytest.mark.parametrize(
+    "location, mode",
+    [
+        (dict(_BQ), "strict"),
+        (dict(_BQ, region="us-central1"), "strict"),
+        (dict(_BQ, location="us-central1"), "strict"),
+        (dict(_BQ, region="europe-west1"), "strict"),
+        (dict(_BQ), "advisory"),
+        (dict(_BQ, region="us-central1"), "audit"),
+    ],
+)
+def test_the_plan_hook_refuses_exactly_what_the_emitter_refuses(location, mode):
+    contract = _contract(location, mode=mode)
+    try:
+        _emit(contract)
+        refused = False
+    except SovereigntyViolationError:
+        refused = True
+    assert bool(_hook(contract)) is refused
+
+
+def test_the_plan_hook_gives_no_verdict_without_a_policy():
+    assert _hook(_contract(dict(_BQ), sovereignty=False)) is None
+
+
+def test_plan_check_sovereignty_reports_the_gcp_hook(workspace, capsys):
+    contract = _multi_region_contract("EU")
+    path = _write(workspace, contract)
+    rc = _cli("plan", str(path), "--out", str(workspace / "plan.json"), "--check-sovereignty")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Sovereignty check: PASS  — source: gcp provider hook" in out

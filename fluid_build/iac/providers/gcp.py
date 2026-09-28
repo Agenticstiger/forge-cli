@@ -329,8 +329,18 @@ class GcpIacPlugin:
     )
 
     def emit(
-        self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()
+        self,
+        contract: Mapping[str, Any],
+        actions: Iterable[Mapping[str, Any]] = (),
+        *,
+        enforce_sovereignty: bool = True,
     ) -> Dict[str, Any]:
+        """The contract's GCP resources, refused when they land outside its sovereignty.
+
+        ``enforce_sovereignty=False`` returns them unchecked, for a caller that
+        runs the same check itself and reports it (``GcpProvider.validate_sovereignty``,
+        what ``fluid plan --check-sovereignty`` reads).
+        """
         resources: Dict[str, Dict[str, Any]] = {}
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
         base_labels = {"managed_by": "fluid", "fluid_contract": cid}
@@ -398,7 +408,8 @@ class GcpIacPlugin:
             resource_placements,
         )
 
-        enforce_gcp_sovereignty(contract, resource_placements(resources))
+        if enforce_sovereignty:
+            enforce_gcp_sovereignty(contract, resource_placements(resources))
         return resources
 
     def emit_data(

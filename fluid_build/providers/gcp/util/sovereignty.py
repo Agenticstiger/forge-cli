@@ -45,7 +45,7 @@ which is what ``advisory`` and ``audit`` mean.
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.policy.sovereignty import (
     SovereigntyValidator,
@@ -74,6 +74,21 @@ def unplaced_gcp_exposes(contract: Mapping[str, Any]) -> List[Placement]:
     return out
 
 
+#: Services that name BigQuery's two multi-regions in their own vocabulary, by
+#: resource type: ``{their location id: the BigQuery multi-region}``. A key
+#: for a dataset in ``EU`` must be in the Cloud KMS location ``europe``
+#: (``us`` for ``US``; the BigQuery CMEK guide), and the taxonomy whose policy
+#: tags restrict its columns in the Data Catalog location ``eu`` (``us``).
+#: Read as themselves, those ids failed ``allowedRegions: [EU]`` and, under a
+#: strict jurisdiction, resolved to none, so the key ring and the taxonomy of
+#: an EU dataset were refused at apply after validate and plan passed. They
+#: are the dataset's own place, and are checked as it.
+_BIGQUERY_MULTI_REGION_ALIASES: Mapping[str, Mapping[str, str]] = {
+    "google_kms_key_ring": {"europe": "eu", "us": "us"},
+    "google_data_catalog_taxonomy": {"eu": "eu", "us": "us"},
+}
+
+
 def resource_placements(resources: Mapping[str, Any]) -> List[Placement]:
     """``(address, location)`` for every emitted resource that names one.
 
@@ -81,8 +96,11 @@ def resource_placements(resources: Mapping[str, Any]) -> List[Placement]:
     OpenTofu reference (``${...}``) is not a place and is skipped. A Pub/Sub
     topic has no ``location``: where its messages are stored is its
     ``message_storage_policy.allowed_persistence_regions``, one placement
-    per region.
+    per region. A KMS key ring or a Data Catalog taxonomy in one of
+    BigQuery's multi-regions is placed at that multi-region, spelled as the
+    emitted dataset spells it (:data:`_BIGQUERY_MULTI_REGION_ALIASES`).
     """
+    spellings = _multi_region_spellings(resources)
     out: List[Placement] = []
     for rtype, by_name in (resources or {}).items():
         if not isinstance(by_name, Mapping):
@@ -93,11 +111,30 @@ def resource_placements(resources: Mapping[str, Any]) -> List[Placement]:
             for key in ("location", "region"):
                 value = body.get(key)
                 if _is_place(value):
-                    out.append((f"{rtype}.{name}", str(value)))
+                    out.append((f"{rtype}.{name}", _as_placed(rtype, str(value), spellings)))
                     break
             for region in _persistence_regions(body):
                 out.append((f"{rtype}.{name}", region))
     return out
+
+
+def _multi_region_spellings(resources: Mapping[str, Any]) -> Dict[str, str]:
+    """``{"eu" | "us": location}`` as the emitted BigQuery datasets spell each multi-region."""
+    out: Dict[str, str] = {}
+    datasets = (resources or {}).get("google_bigquery_dataset")
+    for body in (datasets or {}).values() if isinstance(datasets, Mapping) else ():
+        value = body.get("location") if isinstance(body, Mapping) else None
+        if _is_place(value) and str(value).lower() in ("eu", "us"):
+            out.setdefault(str(value).lower(), str(value))
+    return out
+
+
+def _as_placed(rtype: str, value: str, spellings: Mapping[str, str]) -> str:
+    """``value``, or the BigQuery multi-region it names for ``rtype``."""
+    multi = _BIGQUERY_MULTI_REGION_ALIASES.get(rtype, {}).get(value.lower())
+    if multi is None:
+        return value
+    return spellings.get(multi, multi.upper())
 
 
 def _is_place(value: Any) -> bool:
