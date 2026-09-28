@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.7] — 2026-09-28
+
+A Lake Formation grant that hides columns now applies on AWS, not only plans.
+Found when the demo's AWS chain on 0.16.6 reached `tofu apply`: Lake Formation
+refused the analyst's grant with `InvalidInputException: Permissions
+modification is invalid`. moto does not check Lake Formation's permission
+rules, so no emulator test could have caught it; the fix follows AWS's
+permissions reference, and the live apply is the proof still to come.
+
+### Fixed
+
+- **A column-limited Lake Formation grant carries only `SELECT`** (#679).
+  Lake Formation takes only `SELECT` on a column-filtered table ("This object
+  is only used when granting a SELECT permission"), and refuses `DESCRIBE` to a
+  principal holding a partial `SELECT`. forge-cli sent `[DESCRIBE, SELECT]`
+  with `excludedColumns` or `columns`, so the apply failed. A column-limited
+  grant now emits `SELECT` alone: the principal still sees the table's
+  metadata for the permitted columns, because Lake Formation implies
+  `DESCRIBE` with the `SELECT`. A column limit next to `ALTER`, `DROP`,
+  `INSERT`, `DELETE` or `ALL`, or with no `SELECT`, is refused at emit, since
+  Lake Formation refuses those beside a partial `SELECT`. Grant addresses are
+  unchanged.
+
+## [0.16.6] — 2026-09-28
+
+A Lake Formation grant that hides columns from a principal now plans. Found
+when the demo's first AWS chain run with column grants failed at the drift
+gate on 0.16.5; checked with `tofu plan` against moto on the three demo
+products (bronze and gold failed on 0.16.5, all three plan clean now).
+
+### Fixed
+
+- **A Lake Formation grant with `excludedColumns` sets `wildcard = true`**
+  (#675). forge-cli emitted `table_with_columns` with `excluded_column_names`
+  and no `wildcard`, which the AWS provider rejects at plan ("one of
+  `column_names`, `wildcard` must be specified"), so `fluid diff` and
+  `fluid apply --env aws` failed for any contract hiding a column from a
+  grantee. `tofu validate` did not catch it, because the table names are
+  references that are unknown at validate time. A column allow-list emits
+  `column_names` and never a wildcard, and a grant with neither keeps the
+  table block. A grant naming both is refused, as are excluded columns the
+  schema does not have (a typo used to open every column), and column limits
+  on a binding with no table are refused rather than dropped.
+
 ## [0.16.5] — 2026-09-28
 
 The policies an AWS contract declares now reach AWS, a chained product reads
@@ -3638,7 +3682,9 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.5...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.7...HEAD
+[0.16.7]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.6...v0.16.7
+[0.16.6]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.5...v0.16.6
 [0.16.5]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.4...v0.16.5
 [0.16.4]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.2...v0.16.3
