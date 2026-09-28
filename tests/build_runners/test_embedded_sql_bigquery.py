@@ -855,6 +855,19 @@ def test_a_contract_without_sovereignty_is_unchanged(bq, tmp_path):
     assert io_plan.bigquery_landing.location == "US" and io_plan.warnings == []
 
 
+def test_an_undeclared_landing_loads_where_the_table_is(bq, tmp_path):
+    """The plan reasons about the IaC's default location, but the load job
+    names none, so it runs where the table itself is, never a guessed US."""
+    fake = bq()
+    _seed(fake)
+    root = _workspace(
+        tmp_path / "ws", silver_binding=_no_region("demo_silver", "subscription_status_summary")
+    )
+    contract = _load(root)
+    assert _build(contract, root) == 0
+    assert [load["location"] for load in fake.loads] == [None]
+
+
 # ── A landing that is one of the build's own inputs ────────────────────
 #
 # PR review, measured before the fix: silver's overlay named bronze's table,

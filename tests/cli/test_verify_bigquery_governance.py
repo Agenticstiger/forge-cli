@@ -26,6 +26,7 @@ goccy's does not implement policy tags or CMEK, and nothing here needs a network
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -380,6 +381,13 @@ class _Client:
 
     def get_dataset(self, _dataset_id: str) -> Any:
         return self._dataset
+
+    def query(self, sql: str, job_config: Any = None, location: Any = None) -> Any:
+        # verify_bigquery_table with an expose also counts the table (the
+        # row_count and masking dimensions): one row, a non-empty count, then
+        # zero for each masking check the query selects.
+        row = SimpleNamespace(values=lambda: (3, *([0] * sql.count("COUNTIF("))))
+        return SimpleNamespace(job_id="job_1", result=lambda timeout=None: [row])
 
 
 def _verify(monkeypatch, contract, table, dataset, catalog) -> Dict[str, Any]:
