@@ -129,6 +129,13 @@ everything inside the allowed directories is declarable. DuckDB checks each
 expanded file after resolving symlinks, so a matched symlink that points
 outside the directory is refused.
 
+A `[`, `?` or `*` in the name of a directory that exists, such as a project
+checked out under `Proj [old]/`, is part of that name, not a wildcard:
+`customers.csv` declared there grants that file. DuckDB tries such a name as a
+pattern first, so if it also matches a sibling directory (`Proj o/`), DuckDB
+reads the sibling. The sibling is not granted, so that read is refused. Rename
+the directory in that case.
+
 ### Reading a file outside the contract's directory
 
 The operator allows its directory; the contract then declares the file:

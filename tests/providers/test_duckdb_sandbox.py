@@ -26,6 +26,9 @@ from __future__ import annotations
 
 import ast
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator, List
 from unittest.mock import patch
@@ -58,6 +61,10 @@ def layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Dict[str, Path]:
     and stands in for ``$HOME``: whatever the SQL would read from there is what
     the sandbox has to refuse.
     """
+    return _make_layout(tmp_path, monkeypatch)
+
+
+def _make_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Dict[str, Path]:
     contract_dir = tmp_path / "product"
     data = contract_dir / "data"
     data.mkdir(parents=True)
@@ -645,6 +652,147 @@ def test_a_glob_over_many_files_grants_one_directory(tmp_path, monkeypatch):
 
     assert allow.dirs == (str(tmp_path / "data"),)
     assert allow.paths == ()
+
+
+# ── a wildcard character in a directory the contract did not declare ─────
+#
+# The callers join the contract's directory, the working directory or $HOME in
+# front of a declared path. A '[', '?' or '*' in one of those is part of a
+# directory's name, not a pattern the contract wrote: read as one, the path was
+# cut to the directory above it and refused as outside the contract, so every
+# input and output of a contract in 'Proj [old]/' failed.
+
+# DuckDB cannot open a database file under a '?' (it reads one as a URL query),
+# so '?' is in the grant test only, not in the builds.
+_WILDCARD_DIRS = ["Proj [old]", "p*", "p[1]"]
+
+
+@pytest.fixture(params=_WILDCARD_DIRS)
+def wildcard_layout(request, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Dict[str, Path]:
+    """:func:`layout`, under a directory whose name holds a wildcard character."""
+    monkeypatch.delenv("FLUID_DUCKDB_ALLOWED_DIRS", raising=False)
+    root = tmp_path / request.param
+    root.mkdir()
+    return _make_layout(root, monkeypatch)
+
+
+@pytest.mark.parametrize("declared", ["data/orders.csv", "{contract}/data/orders.csv"])
+def test_a_contract_under_a_wildcard_directory_builds(declared, wildcard_layout, printed):
+    path = declared.format(contract=wildcard_layout["contract_dir"])
+
+    rc = _build_declaring(wildcard_layout, "SELECT sum(amount) AS s FROM d", path)
+
+    assert rc == 0, printed
+    out = wildcard_layout["contract_dir"] / "out" / "result.csv"
+    assert out.read_text(encoding="utf-8").splitlines() == ["s", "30"]
+
+
+def test_local_apply_under_a_wildcard_directory_reads_and_writes(wildcard_layout):
+    """The local provider's actions pass absolute paths, the directory joined in."""
+    from fluid_build.providers.local.local import LocalProvider
+
+    contract_dir = wildcard_layout["contract_dir"]
+    provider = LocalProvider(project="local", region="local", anchor_dir=contract_dir)
+    out = contract_dir / "runtime" / "out" / "r.csv"
+    actions = [
+        {"op": "load_data", "path": str(contract_dir / "data" / "orders.csv"), "table_name": "o"},
+        {"op": "sql", "sql": "SELECT count(*) AS n FROM o", "outputs": [str(out)]},
+    ]
+
+    results = provider.apply(actions=actions)["results"]
+
+    assert [r["status"] for r in results] == ["ok", "ok"], [r.get("error") for r in results]
+    assert out.read_text(encoding="utf-8").splitlines() == ["n", "2"]
+
+
+@pytest.mark.parametrize("name", [*_WILDCARD_DIRS, "p?"])
+def test_a_wildcard_directory_is_granted_as_a_directory_not_a_pattern(name, tmp_path, monkeypatch):
+    monkeypatch.delenv("FLUID_DUCKDB_ALLOWED_DIRS", raising=False)
+    project = tmp_path / name / "p"
+    (project / "data").mkdir(parents=True)
+    (project / "customers.csv").write_text("a\n1\n", encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    # Relative to the working directory, to ``base``, or already absolute.
+    for allow in (
+        DuckDBAllowlist.none().with_declared("customers.csv", within=[project]),
+        DuckDBAllowlist.none().with_declared("customers.csv", within=[project], base=project),
+        DuckDBAllowlist.none().with_declared(str(project / "customers.csv"), within=[project]),
+        DuckDBAllowlist.none().with_locations("customers.csv"),
+    ):
+        assert allow.paths == (str(project / "customers.csv"),)
+        assert allow.dirs == ()
+    # A glob the contract wrote is still a glob, cut at its own wildcard.
+    allow = DuckDBAllowlist.none().with_declared("data/*.csv", within=[project])
+    assert allow.dirs == (str(project / "data"),)
+    # So is a last component, even one a file has as its literal name: DuckDB
+    # reads what 'a[1].csv' matches ('a1.csv'), and the directory holds both.
+    (project / "data" / "a[1].csv").write_text("a\n1\n", encoding="utf-8")
+    allow = DuckDBAllowlist.none().with_declared("data/a[1].csv", within=[project])
+    assert allow.dirs == (str(project / "data"),)
+    # An output not written yet: the file, not the directory above the project.
+    allow = DuckDBAllowlist.none().with_declared("out/x.csv", within=[project])
+    assert allow.paths == (str(project / "out" / "x.csv"),)
+    # $HOME with a '[' in it.
+    monkeypatch.setenv("HOME", str(project))
+    allow = DuckDBAllowlist.none().with_declared("~/customers.csv", within=[project])
+    assert allow.paths == (str(project / "customers.csv"),)
+
+
+def test_a_wildcard_directory_grants_nothing_beside_it(tmp_path, monkeypatch):
+    """Read literally, the directory is narrower than the pattern, never wider."""
+    monkeypatch.delenv("FLUID_DUCKDB_ALLOWED_DIRS", raising=False)
+    project, sibling = tmp_path / "p [x]", tmp_path / "p x"
+    project.mkdir()
+    sibling.mkdir()
+    (project / "f.csv").write_text("a\n1\n", encoding="utf-8")
+    (sibling / "f.csv").write_text(f"a\n{SECRET}\n", encoding="utf-8")
+    (tmp_path / "secret.csv").write_text(f"a\n{SECRET}\n", encoding="utf-8")
+
+    allow = DuckDBAllowlist.none().with_declared("f.csv", within=[project], base=project)
+    assert allow.paths == (str(project / "f.csv"),)
+    con = secure_duckdb_connect(allow=allow)
+    try:
+        # DuckDB matches 'p [x]' as a pattern first, so it reads 'p x': refused.
+        with pytest.raises(duckdb.PermissionException):
+            con.execute(f"SELECT * FROM read_csv('{project}/f.csv')").fetchall()
+        with pytest.raises(duckdb.PermissionException):
+            con.execute(f"SELECT * FROM read_csv('{tmp_path}/secret.csv')").fetchall()
+    finally:
+        con.close()
+    # A wildcard-named directory read literally is still resolved before it is confined.
+    (project / "[l]").symlink_to(tmp_path)
+    escapes = ("../secret.csv", "../*.csv", "../p x/f.csv", "*/../../secret.csv", "[l]/secret.csv")
+    for escape in escapes:
+        with pytest.raises(DuckDBSandboxError, match="outside the directories"):
+            DuckDBAllowlist.none().with_declared(escape, within=[project], base=project)
+
+
+def test_the_readme_commands_build_from_a_wildcard_directory(tmp_path):
+    """The reported case: examples/02, run as its README says, from 'repo [old]/'."""
+    workspace = tmp_path / "repo [old]"
+    example = REPO_ROOT / "examples" / "02-csv-to-data-product"
+    target = workspace / "examples" / example.name
+    target.parent.mkdir(parents=True)
+    shutil.copytree(example, target)
+    env = {k: v for k, v in os.environ.items() if k != "FLUID_DUCKDB_ALLOWED_DIRS"}
+    contract = f"examples/{example.name}/contract.fluid.yaml"
+    command = ["apply", contract, "--provider", "local", "--mode", "amend-and-build", "--yes"]
+
+    run = subprocess.run(
+        [sys.executable, "-m", "fluid_build.cli", *command],
+        cwd=workspace,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+    )
+
+    assert run.returncode == 0, f"stdout:\n{run.stdout}\nstderr:\n{run.stderr}"
+    out = target / "runtime" / "out" / "customer-clean-v1.csv"
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 5  # header + 4 rows
 
 
 def test_allowlist_entries_are_deduplicated_in_linear_time():

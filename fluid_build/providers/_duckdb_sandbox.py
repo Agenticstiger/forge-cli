@@ -154,12 +154,19 @@ def is_remote_location(location: str) -> bool:
     return bool(match and match.group("scheme").lower() in _REMOTE_SCHEMES)
 
 
+def _first_glob(location: str, start: int = 0) -> Optional[int]:
+    return next(
+        (i for i in range(start, len(location)) if location[i] in _GLOB_CHARS),
+        None,
+    )
+
+
 def _static_prefix(location: str) -> Tuple[str, bool]:
     """``location`` cut before its first glob segment, and whether it had one.
 
     Either separator ends a segment, so a Windows path globs as a POSIX one.
     """
-    first = next((i for i, ch in enumerate(location) if ch in _GLOB_CHARS), None)
+    first = _first_glob(location)
     if first is None:
         return location, False
     cut = max(location.rfind("/", 0, first), location.rfind("\\", 0, first))
@@ -272,7 +279,7 @@ class DuckDBAllowlist:
         self, path: str, *, roots: Optional[Tuple[str, ...]], declared: str
     ) -> "DuckDBAllowlist":
         """Grant one absolute local ``path``; with ``roots``, only inside them."""
-        prefix, globbed = _static_prefix(path)
+        prefix, globbed = _local_glob_prefix(path)
         if roots is not None:
             _confine(prefix, roots, declared)
         if globbed or Path(prefix).is_dir():
@@ -284,6 +291,37 @@ class DuckDBAllowlist:
             # and DuckDB refuses a file in it whose realpath leads out.
             return self.with_dirs(prefix)
         return self.with_paths(prefix)
+
+
+def _local_glob_prefix(path: str) -> Tuple[str, bool]:
+    """Absolute local ``path`` cut before its first glob segment, and whether it had one.
+
+    A directory that exists under its literal name is a directory, not a
+    pattern: ``Proj [old]`` in a contract's directory, the working directory
+    or ``$HOME`` is where the contract lives, and the callers join it in
+    before this sees the path. Cut there, ``customers.csv`` would be confined
+    (and refused) as the directory above the project. DuckDB matches such a
+    component as a pattern first and opens it literally when nothing matches;
+    a sibling the pattern does match (``Proj o``) is not granted, so that read
+    is refused rather than widened. The last component stays a pattern even
+    when a file has that literal name: DuckDB reads its matches (``a1.csv``
+    for ``a[1].csv``), and the directory granted holds both.
+    """
+    start = 0
+    while True:
+        first = _first_glob(path, start)
+        if first is None:
+            return path, False
+        end = min(
+            (i for i in (path.find("/", first), path.find("\\", first)) if i >= 0),
+            default=-1,
+        )
+        if end < 0 or not os.path.lexists(path[:end]):
+            cut = max(path.rfind("/", 0, first), path.rfind("\\", 0, first))
+            if cut < 0:
+                return ".", True
+            return path[:cut] or path[: cut + 1], True
+        start = end
 
 
 def _absolute(raw: str, base: Optional[PathLike]) -> str:
