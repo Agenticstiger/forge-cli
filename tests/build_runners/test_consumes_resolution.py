@@ -610,7 +610,8 @@ def test_an_explicit_input_wins_over_the_resolved_upstream(tmp_path, printed):
     root = _workspace(tmp_path / "ws")
     bronze = _bronze(root)
     _parquet(bronze.parent / "out" / "customer_subscriptions.parquet")
-    hand = _parquet(tmp_path / "hand" / "subs.parquet", rows=[("p9", "active")])
+    # In the workspace: a declared input outside it is refused (DuckDB sandbox).
+    hand = _parquet(root / "hand" / "subs.parquet", rows=[("p9", "active")])
     _dump(
         root / "contracts/customers/contract.fluid.yaml",
         {
@@ -1440,7 +1441,7 @@ def test_a_local_upstream_is_read_where_and_how_the_local_writer_wrote_it(
     tmp_path, printed, fmt, path
 ):
     root = _workspace(tmp_path / "ws")
-    seed = tmp_path / "seed.csv"
+    seed = root / "seed.csv"  # in the workspace, where a declared input may be
     seed.write_text("product_id,status\np1,active\np1,active\np2,ended\n")
     bronze = {
         "fluidVersion": "0.7.5",
@@ -1567,7 +1568,7 @@ def test_a_failed_action_never_prints_or_records_a_resolved_secret(
     secret = "sk-live-SUPERSECRET-0123456789"  # pragma: allowlist secret
     monkeypatch.setenv("PARTNER_API_TOKEN", secret)
     root = _workspace(tmp_path / "ws")
-    data = _parquet(tmp_path / "hand" / "subs.parquet")
+    data = _parquet(root / "hand" / "subs.parquet")
     build = _silver_build(
         sql="SELECT * FROM subscriptions WHERE 1 = CAST('{{ env.PARTNER_API_TOKEN }}' AS INTEGER)",
         inputs=[{"name": "subscriptions", "path": str(data)}],

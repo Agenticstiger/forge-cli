@@ -338,9 +338,12 @@ class TestLocalProviderOutputFormat:
         else:
             assert not str(out_spec).endswith(".parquet")
 
-    def test_parquet_apply_creates_parquet_file(self, tmp_path: Path):
+    def test_parquet_apply_creates_parquet_file(self, tmp_path: Path, monkeypatch):
         """End-to-end: apply writes actual parquet bytes."""
         pytest.importorskip("duckdb")
+        # Run from the project directory: without a contract directory the
+        # sandbox confines declared outputs to the working directory.
+        monkeypatch.chdir(tmp_path)
         import duckdb
 
         from fluid_build.providers.local.local import LocalProvider

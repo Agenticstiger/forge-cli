@@ -60,6 +60,31 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
 * DuckDB 1.5 does not resolve ``..`` inside a remote URL, so a remote prefix
   (``s3://bucket/data/``) bounds the bucket or host, not the path within it.
   Remote prefixes are granted only for a location the contract declares.
+* A location the contract DECLARES (an input, an output, a source URI) is
+  granted to its SQL, so a declaration is itself a request for access.
+  :meth:`DuckDBAllowlist.with_declared` grants one only inside the roots its
+  call site names (the contract's directory, its workspace, the run's scratch
+  directory) or a directory the operator lists in ``FLUID_DUCKDB_ALLOWED_DIRS``
+  (:data:`OPERATOR_DIRS_ENV`); a contract field cannot widen that. Both sides
+  are compared after ``realpath``, because DuckDB realpaths allowlist entries
+  too: an in-repo symlink to ``/`` would otherwise grant the host. A glob is
+  granted as its own pattern plus the files it matches, never the directory
+  above its first wildcard.
+* Autoloading is off, so a function from an extension the call site did not
+  load (``sqlite_scan``, ``read_xlsx``, ``ST_Read``, ``delta_scan``,
+  ``iceberg_scan``) is not in the catalog. :func:`is_sandbox_refusal` treats
+  that error as a refusal.
+* The ``sqlite``, ``postgres`` and ``mysql`` scanners open files and sockets
+  through their own client libraries, not through DuckDB's file system, so
+  neither ``allowed_directories`` nor ``enable_external_access`` bounds them:
+  once ``sqlite`` is loaded, ``sqlite_scan`` / ``ATTACH ... (TYPE sqlite)``
+  open any SQLite file the process can read, and once ``postgres`` is loaded,
+  ``postgres_scan`` reaches any host the process can. Only the engine's own
+  SQL runs on a connection that loads them; contract SQL never does.
+* DuckDB shares one database instance per file per process, and the lock is
+  instance-wide: a second connection to a file database that is already open
+  cannot be sandboxed, and is refused with :class:`DuckDBSandboxError`. Each
+  call site closes its connection before the next opens the same file.
 * The DuckDB docs call these settings defense-in-depth, "not a substitute for
   proper sandboxing": a multi-tenant host still runs each contract in its own
   container.
@@ -74,6 +99,7 @@ References:
 
 from __future__ import annotations
 
+import glob as _glob
 import os
 import re
 from dataclasses import dataclass
@@ -91,6 +117,11 @@ PathLike = Union[str, "os.PathLike[str]"]
 
 #: Oldest DuckDB whose ``allowed_directories`` resolves ``./..`` and symlinks.
 MIN_DUCKDB_VERSION: Tuple[int, int, int] = (1, 5, 0)
+
+#: Operator-only widening: directories (``os.pathsep``-separated) where a
+#: contract may also declare inputs and outputs. An environment variable, not a
+#: contract field, so the author of the contract cannot set it.
+OPERATOR_DIRS_ENV = "FLUID_DUCKDB_ALLOWED_DIRS"
 
 _GLOB_CHARS = frozenset("*?[")
 _REMOTE_RE = re.compile(r"^(?P<scheme>[a-z][a-z0-9+.-]*)://(?P<host>[^/?#]+)(?P<path>/[^?#]*)?$")
@@ -168,13 +199,14 @@ class DuckDBAllowlist:
     ) -> "DuckDBAllowlist":
         """Also allow each location a contract DECLARES it reads or writes.
 
-        A URL grants its directory prefix (cut before any glob); a local glob
-        grants the directory above its first wildcard; an existing directory
-        grants itself; anything else grants that one file. A leading ``~`` is
-        expanded as DuckDB expands it, and a relative local path is resolved
-        against ``base`` (else the working directory, where DuckDB would
-        resolve it). This is how a declared input stays readable
-        while the SQL next to it reaches nothing else.
+        For a location the operator names (a ``fluid discover`` argument); a
+        location a CONTRACT declares goes through :meth:`with_declared`, which
+        also confines it. A URL grants its directory prefix (cut before any
+        glob); a local glob grants its own pattern and the files it matches
+        now; an existing directory grants itself; anything else grants that
+        one file. A leading ``~`` is expanded as DuckDB expands it, and a
+        relative local path is resolved against ``base`` (else the working
+        directory, where DuckDB would resolve it).
         """
         out = self
         for location in locations:
@@ -193,18 +225,147 @@ class DuckDBAllowlist:
                     prefix = prefix.rsplit("/", 1)[0] + "/"
                 out = out.with_remote(prefix)
                 continue
-            # '~' as DuckDB itself would expand it (home_directory is $HOME).
-            path = Path(raw).expanduser()
-            if base is not None and not path.is_absolute():
-                path = Path(base) / path
-            prefix, globbed = _static_prefix(str(path))
-            if globbed:
-                out = out.with_dirs(prefix)
-            elif Path(prefix).is_dir():
-                out = out.with_dirs(prefix)
-            else:
-                out = out.with_paths(prefix)
+            out = out._with_local(_absolute(raw, base), roots=None, declared=raw)
         return out
+
+    def with_declared(
+        self,
+        *locations: Optional[PathLike],
+        within: Iterable[Optional[PathLike]],
+        base: Optional[PathLike] = None,
+    ) -> "DuckDBAllowlist":
+        """Also allow each location a CONTRACT declares, inside ``within`` only.
+
+        A declared input or output is granted to the contract's SQL, so the
+        declaration must not be a way to read the host: each local location
+        must resolve (``realpath``, as DuckDB resolves allowlist entries) inside
+        one of ``within`` (the call site's own roots, such as the contract's
+        directory and its workspace) or a directory the operator lists in
+        ``FLUID_DUCKDB_ALLOWED_DIRS``; anything else raises
+        :class:`DuckDBSandboxError`. A glob is granted as its pattern plus the
+        files it matches, each of which must resolve inside those roots too (a
+        matched symlink cannot reach out). A relative path is resolved against
+        ``base``, else the working directory, which is where DuckDB opens it.
+        A URL is granted as :meth:`with_locations` grants it.
+        """
+        roots = _confinement_roots(within)
+        out = self
+        for location in locations:
+            if location is None or str(location) == "":
+                continue
+            raw = os.fspath(location)
+            if is_remote_location(raw):
+                out = out.with_locations(raw)
+                continue
+            out = out._with_local(_absolute(raw, base), roots=roots, declared=raw)
+        return out
+
+    def _with_local(
+        self, path: str, *, roots: Optional[Tuple[str, ...]], declared: str
+    ) -> "DuckDBAllowlist":
+        """Grant one absolute local ``path``; with ``roots``, only inside them."""
+        prefix, globbed = _static_prefix(path)
+        if roots is not None:
+            _confine(prefix, roots, declared)
+        if not globbed:
+            if Path(prefix).is_dir():
+                return self.with_dirs(prefix)
+            return self.with_paths(prefix)
+        # DuckDB checks the pattern itself, then each file it expands to: the
+        # pattern and today's matches are granted, the directory is not.
+        matches = sorted(m for m in _glob.glob(path, recursive=True) if not os.path.isdir(m))
+        if roots is not None:
+            for match in matches:
+                _confine(match, roots, declared)
+        return self.with_paths(path, *matches)
+
+
+def _absolute(raw: str, base: Optional[PathLike]) -> str:
+    """``raw`` with ``~`` expanded as DuckDB expands it, made absolute at ``base``."""
+    # '~' as DuckDB itself would expand it (home_directory is $HOME).
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path(base if base is not None else os.getcwd()) / path
+    # Lexically normalised first, so '<root>/*/../../etc/x' is confined as the
+    # '/etc/x' it names rather than as the '<root>' its glob prefix suggests.
+    return os.path.normpath(str(path))
+
+
+def _is_within(real: str, root: str) -> bool:
+    return real == root or real.startswith(_with_sep(root))
+
+
+def operator_allowed_dirs() -> Tuple[str, ...]:
+    """The directories ``FLUID_DUCKDB_ALLOWED_DIRS`` adds, each ``realpath``-ed.
+
+    Set by whoever runs the engine (``FLUID_DUCKDB_ALLOWED_DIRS=/shared/ref``),
+    never by a contract. A relative entry, or one that resolves to the
+    filesystem root, is refused rather than guessed at.
+    """
+    out: list = []
+    for part in os.environ.get(OPERATOR_DIRS_ENV, "").split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        expanded = os.path.expanduser(part)
+        if not os.path.isabs(expanded):
+            raise _sandbox_error(
+                what=f"{OPERATOR_DIRS_ENV} entry {part!r} is not an absolute path",
+                why="A relative entry would mean a different directory in every working directory.",
+                fix=f"Set {OPERATOR_DIRS_ENV} to absolute directories, separated by {os.pathsep!r}.",
+            )
+        real = os.path.realpath(expanded)
+        if real == os.path.realpath(os.sep):
+            raise _sandbox_error(
+                what=f"{OPERATOR_DIRS_ENV} entry {part!r} is the filesystem root",
+                why="Allowing '/' lets a contract declare, and so read, every file.",
+                fix="List the directories contracts may read and write, not '/'.",
+            )
+        if real not in out:
+            out.append(real)
+    return tuple(out)
+
+
+def _confinement_roots(within: Iterable[Optional[PathLike]]) -> Tuple[str, ...]:
+    roots: list = []
+    for root in [*within, *operator_allowed_dirs()]:
+        if root is None or str(root) == "":
+            continue
+        real = os.path.realpath(os.path.expanduser(os.fspath(root)))
+        if real == os.path.realpath(os.sep):
+            raise _sandbox_error(
+                what="A declared-location root is the filesystem root",
+                why="Confining declarations to '/' confines nothing.",
+                fix="Confine declarations to the contract's directory and workspace.",
+            )
+        if real not in roots:
+            roots.append(real)
+    return tuple(roots)
+
+
+def _confine(candidate: str, roots: Tuple[str, ...], declared: str) -> None:
+    """Refuse ``candidate`` (from the declared ``declared``) outside every root."""
+    real = os.path.realpath(candidate)
+    if any(_is_within(real, root) for root in roots):
+        return
+    where = ", ".join(roots) if roots else "none"
+    raise _sandbox_error(
+        what=(
+            f"The contract declares {declared!r} ({real}), outside the directories it may "
+            f"read and write ({where}). The operator can allow a directory with "
+            f"{OPERATOR_DIRS_ENV}."
+        ),
+        why=(
+            "A declared input, output or source is granted to the contract's SQL. "
+            "Granted anywhere, a contract could read any file on this host (credentials, "
+            "/proc, another tenant's data) just by declaring it."
+        ),
+        fix=(
+            "Move the file under the contract's directory or its workspace, or, as the "
+            f"operator, list its directory in {OPERATOR_DIRS_ENV} "
+            f"(separated by {os.pathsep!r})."
+        ),
+    )
 
 
 def _new(existing: Tuple[str, ...], candidates: Iterable[str]) -> Tuple[str, ...]:
@@ -235,7 +396,10 @@ def _local(value: PathLike) -> str:
             fix="Grant it with DuckDBAllowlist.with_remote (or with_locations).",
         )
     resolved = os.path.normpath(os.path.abspath(raw))
-    if resolved == os.path.abspath(os.sep):
+    # DuckDB realpaths each entry, so a symlink to '/' is the root too.
+    if resolved == os.path.abspath(os.sep) or os.path.realpath(resolved) == os.path.realpath(
+        os.sep
+    ):
         raise _sandbox_error(
             what="DuckDB allowlist entry is the filesystem root",
             why="Allowing '/' allows every file, which is no sandbox at all.",
@@ -326,17 +490,31 @@ def secure_duckdb_connect(
     takes scalar start-up options (``threads``, ``TimeZone``), which cannot be
     changed once the configuration is locked.
 
-    Raises :class:`DuckDBSandboxError` for an older DuckDB or a bad allowlist
-    entry; whatever ``duckdb.connect``, an extension or ``before_lock`` raises
+    Raises :class:`DuckDBSandboxError` for an older DuckDB, a bad allowlist
+    entry, or a file ``database`` this process already has open (its one
+    shared instance is locked, so this connection could not be confined to
+    ``allow``); whatever ``duckdb.connect``, an extension or ``before_lock`` raises
     is raised as it is, with the connection closed.
     """
     import duckdb
 
     _require_supported(duckdb)
     target = os.fspath(database)
-    con = duckdb.connect(target, read_only=read_only, config=dict(config or {}))
     try:
-        con.execute("SET allow_persistent_secrets = false")
+        con = duckdb.connect(target, read_only=read_only, config=dict(config or {}))
+    except duckdb.Error as exc:
+        if "same database file with a different configuration" in str(exc):
+            raise _already_open(target) from exc
+        raise
+    try:
+        try:
+            con.execute("SET allow_persistent_secrets = false")
+        except duckdb.Error as exc:
+            # The first statement on a fresh connection: locked already means
+            # this joined another connection's locked instance of the file.
+            if "configuration has been locked" in str(exc):
+                raise _already_open(target) from exc
+            raise
         con.execute("SET allow_community_extensions = false")
         for ext in extensions:
             name = validate_ident(str(ext))
@@ -365,6 +543,31 @@ def secure_duckdb_connect(
     return con
 
 
+def _already_open(target: str) -> DuckDBSandboxError:
+    return _sandbox_error(
+        what=f"DuckDB database {target!r} is already open in this process",
+        why=(
+            "DuckDB shares one instance per database file within a process, and the "
+            "sandbox locks that instance's configuration, so a second connection to an "
+            "open file cannot be sandboxed with its own allowlist."
+        ),
+        fix=(
+            "Close the other connection to this file first, or give this run its own "
+            "database file."
+        ),
+    )
+
+
+def is_unloaded_function(exc: BaseException) -> bool:
+    """Whether ``exc`` is a function whose extension autoloading would have loaded.
+
+    DuckDB's catalog error: ``Table Function with name "sqlite_scan" is not in
+    the catalog, but it exists in the sqlite_scanner extension``.
+    """
+    text = str(exc)
+    return "but it exists in the" in text and "extension" in text
+
+
 def is_sandbox_refusal(exc: BaseException) -> bool:
     """Whether ``exc`` is DuckDB refusing a path or setting the sandbox denies."""
     try:
@@ -375,30 +578,51 @@ def is_sandbox_refusal(exc: BaseException) -> bool:
         return True
     # Under the lock no SQL can SET a setting back, nor pull in an extension
     # (autoloading is off): DuckDB's own advice to do either cannot be taken.
+    # ``read_csv('https://...')`` says "requires the extension"; a function such
+    # as ``sqlite_scan`` "is not in the catalog, but it exists in the
+    # sqlite_scanner extension".
     text = str(exc)
     return isinstance(exc, duckdb.Error) and (
-        "configuration has been locked" in text or "requires the extension" in text
+        "configuration has been locked" in text
+        or "requires the extension" in text
+        or is_unloaded_function(exc)
     )
 
 
-def sandbox_refusal_hint(allow: DuckDBAllowlist) -> str:
-    """One sentence naming what the refused SQL could have read instead."""
+def sandbox_refusal_hint(allow: DuckDBAllowlist, refusal: Optional[BaseException] = None) -> str:
+    """One sentence naming what the refused SQL could have read instead.
+
+    With the ``refusal`` itself, a function from an extension that was not
+    loaded is named as such rather than as a path to declare.
+    """
+    if refusal is not None and is_unloaded_function(refusal):
+        return (
+            "DuckDB refused it: contract SQL runs with extension autoloading off and "
+            "cannot INSTALL or LOAD one, so functions from extensions the engine does not "
+            "load (sqlite_scan, read_xlsx, ST_Read, delta_scan, iceberg_scan) are not "
+            "available. Read the data as CSV, Parquet or JSON, or land it with an "
+            "acquisition build first."
+        )
     granted = [*allow.dirs, *allow.paths, *allow.remote_prefixes]
     where = ", ".join(granted) if granted else "nothing (in-memory only)"
     return (
         "DuckDB refused it: contract SQL may only read and write the locations the "
         f"contract declares and its own directory ({where}). Declare the file as an "
-        "input, or move it under the contract's directory."
+        "input under the contract's directory or workspace, or move it there "
+        f"(the operator can allow another directory with {OPERATOR_DIRS_ENV})."
     )
 
 
 __all__ = [
     "MIN_DUCKDB_VERSION",
+    "OPERATOR_DIRS_ENV",
     "DuckDBAllowlist",
     "DuckDBSandboxError",
     "duckdb_version",
     "is_remote_location",
     "is_sandbox_refusal",
+    "is_unloaded_function",
+    "operator_allowed_dirs",
     "sandbox_refusal_hint",
     "secure_duckdb_connect",
 ]

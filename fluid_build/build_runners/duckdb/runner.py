@@ -563,25 +563,44 @@ def _run_streams(ctx: RunContext) -> List[str]:
     return list(ctx.source.streams) or DuckdbRunner()._infer_streams(ctx)
 
 
+def _declared_roots(ctx: RunContext) -> List[Any]:
+    """Where a declared source or landing may be: the contract's directory and workspace.
+
+    ``DuckDBAllowlist.with_declared`` adds the operator's
+    ``FLUID_DUCKDB_ALLOWED_DIRS``; the contract itself cannot add a root.
+    """
+    from fluid_build.util.workspace_root import find_workspace_root
+
+    return [ctx.workdir, find_workspace_root(Path(ctx.workdir))]
+
+
 def _grant_source(allow: DuckDBAllowlist, ctx: RunContext, streams: List[str]) -> DuckDBAllowlist:
     """``allow`` plus where a filesystem / http source reads from.
 
     A database source needs no grant: postgres is scanned through its DSN, and
     mysql / sqlite are attached before the lock (``_attach_external_databases``).
+    A local source is granted only inside :func:`_declared_roots` (a glob as
+    the files it matches): the contract names it, so naming ``~/.ssh/*`` must
+    not make it readable.
     """
     if ctx.source.kind not in {"filesystem", "http"}:
         return allow
     uri = dict(ctx.source.connection.raw).get("uri")
     # ``_select_for_stream`` reads ``uri or stream``: without a uri, the stream
     # names the file.
-    return allow.with_locations(*([uri] if uri else streams))
+    return allow.with_declared(*([uri] if uri else streams), within=_declared_roots(ctx))
 
 
 def _grant_destination(
     allow: DuckDBAllowlist, ctx: RunContext, streams: List[str], sink_format: str
 ) -> DuckDBAllowlist:
-    """``allow`` plus each stream's landed file and its late-arrival sibling."""
+    """``allow`` plus each stream's landed file and its late-arrival sibling.
+
+    Confined like the source: a landing path the contract declares outside
+    :func:`_declared_roots` would let it write anywhere on the host.
+    """
     out_dir = Path(ctx.workdir) / "out"
+    within = _declared_roots(ctx)
     for stream in streams:
         dest = _resolve_destination_path(ctx, stream, sink_format, out_dir)
         if _is_remote_uri(dest):
@@ -589,7 +608,7 @@ def _grant_destination(
             continue
         main = Path(dest)
         late = main.with_name(main.stem + "__late_events" + main.suffix)
-        allow = allow.with_paths(main, late)
+        allow = allow.with_declared(str(main), str(late), within=within)
     return allow
 
 

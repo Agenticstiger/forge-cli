@@ -55,6 +55,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
+    DuckDBSandboxError,
     is_sandbox_refusal,
     sandbox_refusal_hint,
     secure_duckdb_connect,
@@ -129,15 +130,22 @@ def _output_specs(outputs: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _action_allowlist(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> DuckDBAllowlist:
-    """Exactly what one action declares: each input file and each output file."""
+    """Exactly what one action declares: each input file and each output file.
+
+    Each must resolve inside the working directory (where the action's
+    relative paths resolve) or a directory the operator lists in
+    ``FLUID_DUCKDB_ALLOWED_DIRS``: a declared file is granted to the action's
+    SQL, so declaring ``~/.aws/credentials`` must not make it readable.
+    """
+    within = [Path.cwd()]
     allow = DuckDBAllowlist.none()
     for cfg in inputs.values():
         if isinstance(cfg, dict) and cfg.get("path"):
             files = _glob_all(_as_list(cfg["path"]))
-            allow = allow.with_paths(*(str(Path(f).resolve()) for f in files))
+            allow = allow.with_declared(*(str(Path(f).absolute()) for f in files), within=within)
     for spec in _output_specs(outputs):
         if spec.get("path"):
-            allow = allow.with_paths(Path(str(spec["path"])).resolve())
+            allow = allow.with_declared(str(Path(str(spec["path"])).absolute()), within=within)
     return allow
 
 
@@ -388,9 +396,26 @@ def apply_action(action: Dict[str, Any], ctx) -> None:
         raise LocalProviderError(f"Action '{rid}' missing outputs block")
 
     # Connect to DuckDB, confined to what this action declares
-    allow = _action_allowlist(inputs, outputs)
+    try:
+        allow = _action_allowlist(inputs, outputs)
+    except DuckDBSandboxError as e:
+        raise LocalProviderError(f"Action '{rid}': {e}") from e
     con = _connect_duckdb(allow)
+    # Closed on every path: with FLUID_LOCAL_DUCKDB_PATH set, a connection left
+    # open by a failure holds the file's locked instance and refuses the next.
+    try:
+        _run_action_sql(con, rid, sql, inputs, outputs, allow, ctx)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
 
+
+def _run_action_sql(
+    con, rid: str, sql: str, inputs: Dict[str, Any], outputs: Dict[str, Any], allow, ctx
+) -> None:
+    """Register the inputs, run the SQL and write the outputs on ``con``."""
     # Register inputs
     for alias, cfg in inputs.items():
         _register_input(con, alias, cfg)
@@ -399,8 +424,9 @@ def apply_action(action: Dict[str, Any], ctx) -> None:
     try:
         rel = _execute_sql(con, sql)
     except LocalProviderError as e:
-        if is_sandbox_refusal(e.__cause__ or e):
-            raise LocalProviderError(f"{e} {sandbox_refusal_hint(allow)}") from e
+        refused = e.__cause__ or e
+        if is_sandbox_refusal(refused):
+            raise LocalProviderError(f"{e} {sandbox_refusal_hint(allow, refused)}") from e
         raise
 
     # Write output(s)
@@ -421,11 +447,6 @@ def apply_action(action: Dict[str, Any], ctx) -> None:
             total += max(rc, 0)
             LOGGER.info(json_log("apply_action_output", rows=rc, path=path or "(dry-run)"))
         LOGGER.info(json_log("apply_action_outputs_total", rows=total))
-
-    try:
-        con.close()
-    except Exception:
-        pass
 
 
 # -------------------------

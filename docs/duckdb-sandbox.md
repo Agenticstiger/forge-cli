@@ -36,8 +36,8 @@ The same SQL reading the contract's own data builds as before:
 
 | Where the SQL runs | It can read and write |
 |---|---|
-| Embedded-SQL build on the local DuckDB engine (`builds[].properties.sql`) | the contract's directory, the FLUID workspace it sits in (`fluid.workspace.yaml`), `./runtime`, the run's scratch directory, each declared `parameters.inputs[].path`, each resolved `consumes[]` upstream, the expose's landing path, and the `s3://` prefixes those name |
-| DuckDB acquisition build (`pattern: acquisition`, `engine: duckdb`) | the contract's directory, the declared `source.connection.uri` (or stream paths), and each stream's landing file; a `mysql` / `sqlite` source is attached before the sandbox closes |
+| Embedded-SQL build on the local DuckDB engine (`builds[].properties.sql`) | the contract's directory, the FLUID workspace it sits in (`fluid.workspace.yaml`), `./runtime`, the run's scratch directory, each declared `parameters.inputs[].path`, each resolved `consumes[]` upstream, the expose's landing path, and the `s3://` prefixes those name. A declared local path counts only [inside the allowed directories](#declared-locations-stay-inside-the-allowed-directories) |
+| DuckDB acquisition build (`pattern: acquisition`, `engine: duckdb`) | the contract's directory, the declared `source.connection.uri` (or stream paths), and each stream's landing file, each inside the allowed directories; a `mysql` / `sqlite` source is attached before the sandbox closes |
 | `fluid validate` quality rules, `fluid verify`, `fluid diff` | the one file being checked |
 | `fluid contract-tests` local actions | each declared input file and each output file |
 | Discovery (`fluid forge data-model from-source`, `discover`) | the one file or URL being introspected; a JDBC source is attached first |
@@ -52,11 +52,71 @@ Everything else is refused, including:
 - a URL (`http://`, `https://`, `s3://` ...) the contract does not declare;
 - `ATTACH` of another database file, `COPY ... TO` / `COPY ... FROM` elsewhere;
 - `INSTALL` / `LOAD` of an extension, and any `SET` (the configuration is locked,
-  so `SET enable_external_access = true` is refused too).
+  so `SET enable_external_access = true` is refused too);
+- a function from an extension the engine does not load for that build:
+  `sqlite_scan`, `read_xlsx`, `ST_Read`, `delta_scan`, `iceberg_scan`. DuckDB
+  used to load these on first use; with autoloading off they are not in the
+  catalog, even for a file inside the contract's directory. Read the data as
+  CSV, Parquet or JSON, or land it with an acquisition build first.
 
-## Reading a file outside the contract's directory
+## Declared locations stay inside the allowed directories
 
-Declare it, so it is part of the contract rather than hidden in the SQL:
+Each declared input and output is granted to the build's SQL, and whoever
+writes the contract writes the declarations. So a declaration grants a local
+path only inside these directories:
+
+- the contract's directory and the FLUID workspace it sits in;
+- `./runtime` and the run's scratch directory;
+- the upstream roots in `FLUID_UPSTREAM_CONTRACTS`;
+- the directories the operator lists in `FLUID_DUCKDB_ALLOWED_DIRS`.
+
+Anything else is refused before any SQL runs. Declaring an innocuous glob in
+`$HOME` does not make `~/.aws/credentials` readable:
+
+```yaml
+    properties:
+      sql: SELECT content FROM read_text('~/.aws/credentials')
+      parameters:
+        inputs:
+          - name: d
+            path: /home/me/*.csv
+```
+
+```console
+$ fluid apply contract.fluid.yaml --mode amend-and-build --yes
+🔷 Build 'summarise' (embedded-SQL / local DuckDB)
+   ❌ Failed: 1 action(s) failed
+      The contract declares '/home/me/*.csv' (/home/me), outside the directories it
+      may read and write (/work/orders, /work/orders/runtime, /tmp/fluid_yc3ryr57).
+      The operator can allow a directory with FLUID_DUCKDB_ALLOWED_DIRS.
+```
+
+Both sides are compared after resolving symlinks, as DuckDB resolves them: a
+symlink inside the contract's directory that points at `/` grants nothing. A
+relative declared path is resolved where DuckDB opens it, the working
+directory, and is confined the same way, so `path: ./*.py` cannot grant a
+server's working directory.
+
+What a declaration grants, once allowed:
+
+| Declared | Granted |
+|---|---|
+| a file (`/shared/reference/rates.csv`) | that file |
+| a glob (`data/*.csv`, `landing/**/*.parquet`) | the pattern and the files it matches when the run starts; not the directory |
+| a directory (`data/`) | everything under it |
+| an `s3://` URL | its prefix (see the limits below) |
+
+A glob's files are checked one by one, so a matched symlink that points
+outside the allowed directories is refused.
+
+### Reading a file outside the contract's directory
+
+The operator allows its directory; the contract then declares the file:
+
+```console
+$ export FLUID_DUCKDB_ALLOWED_DIRS=/shared/reference   # ':'-separated, absolute
+$ fluid apply contract.fluid.yaml --mode amend-and-build --yes
+```
 
 ```yaml
     properties:
@@ -67,9 +127,14 @@ Declare it, so it is part of the contract rather than hidden in the SQL:
             path: /shared/reference/rates.csv
 ```
 
-The declared file becomes readable; its neighbours do not. A product inside a
-FLUID workspace can also read its sibling products' files by path, and a
-`consumes[]` entry resolves to the upstream's landed file.
+The declared file becomes readable. Its neighbours in `/shared/reference` do
+not, unless the contract declares them too (or declares a glob or the
+directory, which grant what the table above says). `FLUID_DUCKDB_ALLOWED_DIRS`
+is read from the environment of the process that runs the engine; no contract
+field can set it. A relative entry, or `/`, is refused.
+
+A product inside a FLUID workspace can also read its sibling products' files by
+path, and a `consumes[]` entry resolves to the upstream's landed file.
 
 ## How it works
 
@@ -105,9 +170,24 @@ guide gives.
 - **A remote prefix bounds the bucket, not the path.** DuckDB 1.5 does not
   resolve `..` inside a URL, so a declared `s3://bucket/landing/` also lets
   the SQL reach other keys in that bucket with the same credentials.
-- **A source database is reachable.** When a build reads from Postgres, MySQL
-  or SQLite, the SQL can query that database; a Postgres source also leaves
-  `postgres_scan` loaded.
+- **A loaded database scanner is not bounded by the allowlist.** The `sqlite`,
+  `postgres` and `mysql` extensions open files and sockets through their own
+  client libraries, not through DuckDB's file system, so neither
+  `allowed_directories` nor `enable_external_access` limits them. On a
+  connection that loads `sqlite` (an acquisition build with a SQLite source),
+  `sqlite_scan` and `ATTACH ... (TYPE sqlite)` can open any SQLite file the
+  process can read. On one that loads `postgres`, `postgres_scan` can connect
+  to any host the process can reach, the Command Center's own database
+  included. The engine loads them only for an acquisition build's declared
+  source, discovery and the copilot's sample-rows tool, whose SQL the engine
+  builds from validated identifiers; contract SQL never runs on such a
+  connection (`test_contract_sql_runs_on_a_connection_with_no_database_scanner`).
+- **One open connection per database file.** DuckDB shares one instance per
+  database file within a process, and the sandbox locks that instance. A second
+  connection to a file that is already open is refused (`DuckDB database ...
+  is already open in this process`). Each call site closes its connection,
+  failures included. Two MCP DuckDB drivers bound to the same `.duckdb` file
+  in one process, or two concurrent `persist=True` local runs, hit this.
 - **Persistent DuckDB secrets are off.** Secrets saved in
   `~/.duckdb/stored_secrets` are no longer loaded; object-store builds use the
   credential-chain secret the engine creates.

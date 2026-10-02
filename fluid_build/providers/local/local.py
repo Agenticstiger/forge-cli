@@ -267,21 +267,29 @@ class LocalProvider(BaseProvider):
         location the actions declare: an input file, an output file, an
         ``s3://`` prefix. A contract's SQL that names any other path,
         ``/etc/passwd`` or ``~/.aws/credentials``, is refused by DuckDB.
-        """
-        session = getattr(self, "_session_db", None)
-        workspace = None
-        if self.anchor_dir is not None:
-            from fluid_build.util.workspace_root import find_workspace_root
 
-            # A contract inside a FLUID workspace (``fluid.workspace.yaml``) may
-            # read its sibling products' files by path, as consumes[] does.
-            workspace = find_workspace_root(self.anchor_dir)
-        allow = DuckDBAllowlist.none().with_dirs(
-            self.anchor_dir,
-            workspace,
-            Path("runtime").resolve(),
-            Path(session).parent if session else None,
-        )
+        A declared location is granted only inside those directories (plus
+        the upstream roots in ``FLUID_UPSTREAM_CONTRACTS`` and the operator's
+        ``FLUID_DUCKDB_ALLOWED_DIRS``): the contract's author writes the
+        declaration, so it must not be a way to grant the host
+        (``DuckDBAllowlist.with_declared``). A relative declared path is
+        resolved where DuckDB opens it, the working directory, and is confined
+        all the same.
+        """
+        from fluid_build.util.upstream_discovery import collect_search_roots
+        from fluid_build.util.workspace_root import find_workspace_root
+
+        session = getattr(self, "_session_db", None)
+        scratch = Path(session).parent if session else None
+        runtime = Path("runtime").resolve()
+        # Without a contract directory (a bare ``apply`` of actions), the
+        # working directory stands in for it, as it does for relative paths.
+        anchor = self.anchor_dir if self.anchor_dir is not None else Path.cwd()
+        # A contract inside a FLUID workspace (``fluid.workspace.yaml``) may
+        # read its sibling products' files by path, as consumes[] does.
+        workspace = find_workspace_root(self.anchor_dir) if self.anchor_dir is not None else None
+        allow = DuckDBAllowlist.none().with_dirs(self.anchor_dir, workspace, runtime, scratch)
+        within = [anchor, runtime, scratch, *collect_search_roots(workspace)]
         for spec in specs:
             raw = spec.get("path") if isinstance(spec, dict) else spec
             if not raw:
@@ -289,7 +297,7 @@ class LocalProvider(BaseProvider):
             raw = str(raw)
             # Only s3:// is remote here (``_register_mapping_input``): any other
             # string is a local path, as ``Path`` reads it.
-            allow = allow.with_locations(raw if _is_s3_uri(raw) else Path(raw))
+            allow = allow.with_declared(raw if _is_s3_uri(raw) else str(Path(raw)), within=within)
         return allow
 
     def _connect(self, specs: Iterable[Any] = (), *, config: Optional[Dict[str, Any]] = None):
@@ -753,6 +761,10 @@ class LocalProvider(BaseProvider):
 
         con = self._connect([path])
 
+        # Closed on every path: every action of the run shares one session
+        # database, and a connection left open (an exception's traceback keeps
+        # it alive) holds that file's locked instance, which refuses the next
+        # action's sandboxed connection.
         try:
             # Use retry logic for table registration (can fail with I/O errors)
             def _register_with_retry():
@@ -790,6 +802,8 @@ class LocalProvider(BaseProvider):
                 {"i": idx, "error": str(e), "path": str(path), "table": table_name},
             )
             raise
+        finally:
+            con.close()
 
     # ----------------------- SQL (DuckDB) execution --------------------- #
 
@@ -810,6 +824,24 @@ class LocalProvider(BaseProvider):
         # Threads set at connect: the sandbox locks the configuration, so a
         # ``PRAGMA threads`` afterwards is refused.
         con = self._connect([*inputs, *outputs], config={"threads": 4})
+        # Closed on every path, a failure included (see _run_load_data_action):
+        # otherwise one failing SQL action fails every later action of the run.
+        try:
+            return self._run_sql_on(con, idx, action, sql, inputs, outputs, start_time)
+        finally:
+            con.close()
+
+    def _run_sql_on(
+        self,
+        con: Any,
+        idx: int,
+        action: Dict[str, Any],
+        sql: str,
+        inputs: List[Any],
+        outputs: List[Any],
+        start_time: float,
+    ) -> Dict[str, Any]:
+        """The body of :meth:`_run_sql_action`, on a connection it closes."""
         reg_info = self._register_inputs(con, inputs)
 
         # Log with redacted SQL (in case it contains sensitive data)
@@ -832,22 +864,22 @@ class LocalProvider(BaseProvider):
             rel = with_retry(_execute_sql, logger=self.logger, max_attempts=3)
 
         except Exception as e:
-            # A path outside the sandbox: say what the SQL may read instead.
-            error: Exception = e
-            if is_sandbox_refusal(e):
-                error = PermissionError(f"{e} {sandbox_refusal_hint(self._last_allow)}")
             self._log_error(
                 "local_sql_error",
                 {
                     "i": idx,
-                    "error": str(error),
+                    "error": str(e),
                     "sql_preview": redacted_sql[:500],
                     "duration_ms": duration_ms(start_time),
                 },
             )
-            if error is not e:
-                raise error from e
-            raise
+            if not is_sandbox_refusal(e):
+                raise
+            # A path outside the sandbox: say what the SQL may read instead.
+            # Raised from a helper, so this frame keeps no reference to the new
+            # error (an error -> traceback -> frame -> error cycle would keep
+            # the connection alive until the cyclic GC runs).
+            raise self._sandbox_refusal(e) from e
 
         # If an output_table is specified, persist the result as a DuckDB table
         # so downstream materialize/copy steps can reference it.
@@ -891,6 +923,10 @@ class LocalProvider(BaseProvider):
             },
         )
         return {"op": "sql", "written": written, "rows": rowcount, "inputs": reg_info}
+
+    def _sandbox_refusal(self, refused: BaseException) -> PermissionError:
+        """``refused`` as a PermissionError that names what the SQL may read instead."""
+        return PermissionError(f"{refused} {sandbox_refusal_hint(self._last_allow, refused)}")
 
     def _register_inputs(self, con: Any, inputs: Iterable[Any]) -> List[Dict[str, Any]]:
         info: List[Dict[str, Any]] = []
@@ -1046,9 +1082,14 @@ class LocalProvider(BaseProvider):
         if source_table:
             try:
                 con = self._connect([dst])
-                rel = con.sql(f"SELECT * FROM {validate_ident(source_table)}")
-                self._write_relation(rel, dst, fmt)
-                rowcount = rel.count("*").fetchone()[0] if hasattr(rel, "count") else -1
+                try:
+                    rel = con.sql(f"SELECT * FROM {validate_ident(source_table)}")
+                    self._write_relation(rel, dst, fmt)
+                    rowcount = rel.count("*").fetchone()[0] if hasattr(rel, "count") else -1
+                    del rel
+                finally:
+                    # Closed on every path (see _run_load_data_action).
+                    con.close()
                 self._log_info(
                     "local_materialize_done",
                     {"i": idx, "dst": str(dst), "source": source_table, "rows": rowcount},
