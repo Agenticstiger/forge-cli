@@ -517,6 +517,15 @@ def _effective_ref_root(
         # Those are unusable roots too, and take the same path below.
         root = Path(explicit).expanduser().resolve()
         if not root.is_dir():
+            # Python 3.13 stopped raising from a non-strict resolve() on a
+            # symlink loop (it returns the path instead), so ask strictly: a
+            # loop or an untraversable parent then reads "cannot be resolved"
+            # on every version, while a plain missing directory stays
+            # "is not a directory".
+            try:
+                Path(explicit).expanduser().resolve(strict=True)
+            except FileNotFoundError:
+                pass
             problem = f"{origin}={explicit!r} is not a directory (resolved to {root})"
         elif not contract_dir.is_relative_to(root):
             problem = (
