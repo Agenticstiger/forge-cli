@@ -14,7 +14,7 @@
 
 """The one confinement check every external ``$ref`` goes through.
 
-A contract is untrusted input: the Command Center runs ``fluid validate`` /
+A contract is untrusted input: a service runs ``fluid validate`` /
 ``plan`` / ``bundle`` on contracts users upload. Composing a file into the
 contract and then echoing the contract back (``bundle`` prints it, ``validate``
 quotes it in errors) turns an unconfined ``$ref`` into a read of any
@@ -91,8 +91,8 @@ class RefConfinementError(RefResolutionError):
     Subclasses :class:`RefResolutionError`, so every existing
     ``except RefResolutionError`` (``fluid bundle``, the contract loader's
     ``contract_load_failed`` path) handles it unchanged. The attributes let a
-    caller such as the Command Center report the offending ref without
-    parsing the message.
+    caller that runs other people's contracts report the offending ref
+    without parsing the message.
 
     ``ignored_ref_root_env`` is the ``FLUID_REF_ROOT`` value the loader
     ignored for this contract (it could not be resolved, was not a directory,

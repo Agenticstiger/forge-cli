@@ -72,9 +72,8 @@ the file it was written in:
 `fluid validate` exits 1 and `fluid bundle` exits 2. The check runs before the
 target is opened, so the error is the same whether or not the target exists.
 
-**Why.** Contracts are often untrusted input: a platform such as the FLUID
-Command Center runs `fluid validate` and `fluid bundle` on contracts its users
-upload. Without the root, a contract could compose any YAML or JSON file the
+**Why.** Contracts are often untrusted input: a service or CI job may run
+`fluid validate` and `fluid bundle` on contracts its users upload. Without the root, a contract could compose any YAML or JSON file the
 process can read into itself, and `fluid bundle` would print it back.
 
 ---
