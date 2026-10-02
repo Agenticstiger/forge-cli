@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-10-03
+
+A contract can no longer make the engine read the machine it runs on.
+- `$ref` composes only files inside the contract's own directory tree.
+- Contract SQL runs inside DuckDB's own sandbox.
+- A new public API loads a contract exactly as `fluid plan` sees it.
+
+These changes matter most for services, CI jobs and shared hosts that run
+contracts other people wrote.
+
+### Upgrade notes
+
+- **`$ref` is confined to the root contract's directory tree** (#687).
+  - URL refs (`file://` included) and absolute paths are refused.
+  - `..` and symlink escapes are refused after resolution.
+  - Monorepos that shared fragments across products with `$ref:
+    ../other-product/…` must widen the root. Set `FLUID_REF_ROOT` to a directory
+    holding the products and their shared fragments (for example the repository
+    root), or pass `ref_root=` to `load_contract` / `load_with_overlay` /
+    `compile_contract`.
+  - A `FLUID_REF_ROOT` that does not contain the contract is ignored for that
+    contract, with a `ref_root_env_ignored` warning.
+  - See `docs/contract-refs.md`.
+- **Bundled OpenAPI fragments with an external `$ref` fail `fluid validate`**
+  with `OAS-REF-EXTERNAL` (#687).
+  - `file://` and `http(s)://` refs used to be followed by
+    openapi-spec-validator. They are now reported, not followed.
+  - A relative ref was already reported as unresolvable (`OAS001`), and now
+    reads `OAS-REF-EXTERNAL`.
+  - A `$ref` key inside an `example`, `examples.*.value` or `x-*` payload is
+    reported too.
+  - So a bundle that validated before can now fail if it holds a resolvable
+    `file://` or `http(s)://` ref, or a `$ref` key in such a payload. Inline the
+    schemas or rename the key.
+- **Contract SQL can read only what the run may read** (#689). That is:
+  - the contract's directory and its FLUID workspace
+  - `./runtime`
+  - the run's scratch directory
+  - the locations the contract declares, and only those inside the same roots
+  - any directory the operator lists in `FLUID_DUCKDB_ALLOWED_DIRS` (absolute
+    paths, `:`-separated)
+
+  Consequences:
+  - A declared input, output or acquisition source outside those roots is
+    refused before any SQL runs. This includes absolute landing paths such as
+    `/data/landing/*.csv`. Acquisition builds have narrower roots than
+    embedded-SQL builds.
+  - A declared glob grants the directory above its first wildcard, because
+    DuckDB re-expands it at read time. That directory must itself be inside the
+    allowed roots.
+  - See `docs/duckdb-sandbox.md`.
+- **Contract SQL can no longer read `http(s)://`, `gs://` or Azure URLs**,
+  declared or not; only declared `s3://` locations are reachable (#689). Land
+  remote data with an acquisition build (`source.kind: http`) first.
+- **`SET` / `PRAGMA` statements that change a DuckDB setting fail in contract
+  SQL** with "the configuration has been locked" (#689). This covers
+  `memory_limit`, `threads`, `TimeZone` and similar. Remove them.
+- **Functions DuckDB used to autoload no longer work in contract SQL** (#689):
+  `sqlite_scan`, `read_xlsx`, `ST_Read`, `delta_scan`, `iceberg_scan`. Read CSV,
+  Parquet or JSON instead, or land the data with an acquisition build.
+- **`duckdb>=1.5.0`** is required by the `local` extra (#689). Older versions
+  let `<dir>/./../` and symlinks escape the allowlist.
+- A file DuckDB database already open in the same process can no longer be
+  opened a second time. It raises a clear `DuckDBSandboxError` instead of
+  sharing the instance.
+
+### Security
+
+- `$ref` resolution refuses remote, absolute and escaping targets, before it
+  tests whether the target exists (#687).
+- `fluid validate` no longer hands a bundled OpenAPI fragment with an external
+  `$ref` to openapi-spec-validator, which followed `file://` and `http(s)://`
+  refs. It reports `OAS-REF-EXTERNAL` instead (#687).
+- Every DuckDB connection in the engine goes through one helper,
+  `secure_duckdb_connect` (#689). It applies DuckDB's built-in sandbox:
+  - `allowed_directories` / `allowed_paths`
+  - `enable_external_access = false`
+  - autoload and autoinstall off, no persistent secrets, no community extensions
+  - `lock_configuration = true`
+
+  Each action's connection is closed even when the action fails. A guard test
+  fails if a new `duckdb.connect` bypasses the helper.
+- The legacy local-provider module `fluid_build.contract_tests`, which no
+  `fluid` command uses, confines each action's DuckDB connection to the files
+  that action declares, under the working directory or a
+  `FLUID_DUCKDB_ALLOWED_DIRS` directory (#689). `fluid contract-tests` does not
+  run DuckDB and is unchanged.
+
+### Added
+
+- `fluid_build.api.load_contract`, `load_contract_from_text` and
+  `load_contract_from_dict` (#688). They return a `LoadedContract` whose
+  `contract` is the dict `fluid plan` plans, after parsing, `$ref` composition,
+  the env overlay and the engine's alias and legacy-`build:` rewrites, plus its
+  plan-digest canonicalisation. Failures raise a typed `ContractLoadError`. The
+  `fluid_build.api` version is 1.1. See `docs/CONTRACT_LOADING_API.md`.
+
 ## [0.17.0] — 2026-09-28
 
 One contract now deploys to AWS and to GCP through its `--env` overlays and is
@@ -3761,7 +3858,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.7...v0.17.0
 [0.16.7]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.6...v0.16.7
 [0.16.6]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.5...v0.16.6
