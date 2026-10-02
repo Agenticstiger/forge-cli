@@ -93,6 +93,12 @@ class RefConfinementError(RefResolutionError):
     ``contract_load_failed`` path) handles it unchanged. The attributes let a
     caller such as the Command Center report the offending ref without
     parsing the message.
+
+    ``ignored_ref_root_env`` is the ``FLUID_REF_ROOT`` value the loader
+    ignored for this contract (it was not a directory, or did not contain the
+    contract), or ``None`` when the variable was unset or applied. A non-None
+    value means the variable did NOT widen this contract's root, whatever the
+    caller's environment says.
     """
 
     def __init__(
@@ -103,12 +109,14 @@ class RefConfinementError(RefResolutionError):
         pointer: str,
         source: Optional[str] = None,
         root: Optional[str] = None,
+        ignored_ref_root_env: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.ref = ref
         self.pointer = pointer
         self.source = source
         self.root = root
+        self.ignored_ref_root_env = ignored_ref_root_env
 
 
 def format_pointer(parts: Sequence[Union[str, int]]) -> str:
@@ -139,6 +147,7 @@ def confine_ref(
     pointer: str = "",
     source: Optional[Path] = None,
     root_hint: str = "",
+    ignored_ref_root_env: Optional[str] = None,
 ) -> Path:
     """Return the resolved target of an external ``$ref``, or refuse it.
 
@@ -152,6 +161,8 @@ def confine_ref(
         pointer: JSON pointer of the ``$ref`` node inside *source*.
         source: The file containing the ref, for the message.
         root_hint: Appended to the escape message (how to widen the root).
+        ignored_ref_root_env: Recorded on the error unchanged: the
+            ``FLUID_REF_ROOT`` value the caller ignored for this document.
 
     Raises:
         RefConfinementError: the ref is a URL, an absolute path, escapes
@@ -166,6 +177,7 @@ def confine_ref(
             pointer=pointer,
             source=str(source) if source is not None else None,
             root=str(root) if root is not None else None,
+            ignored_ref_root_env=ignored_ref_root_env,
         )
 
     if file_part.startswith("//") or (

@@ -125,9 +125,16 @@ Rules for the wider root:
   ```
 
   Refs that stay in that directory resolve as usual, and refs that leave it
-  fail as escapes. A `FLUID_REF_ROOT` left in your shell, or set once for a
-  service that also loads uploaded contracts from temp directories, never
-  widens or breaks another contract.
+  fail as escapes. The warning is logged once per contract directory and
+  value in a process, so every such escape error also says that
+  `FLUID_REF_ROOT` was ignored for this contract, and why.
+
+  For a contract outside `FLUID_REF_ROOT` the variable is ignored, so it
+  cannot break or widen that contract. Every contract inside it is widened,
+  with no warning: a value left set in your shell widens every contract under
+  it, and a service whose upload directory sits under its `FLUID_REF_ROOT`
+  widens every uploaded contract. Scope the variable to one command instead
+  of exporting it.
 - `ref_root=` is set by the caller for one contract, so it is strict: a
   `ref_root` that is not a directory or does not contain the contract raises
   `RefResolutionError`, naming `ref_root`.
@@ -149,9 +156,11 @@ Set `FLUID_REF_ROOT` (or `ref_root=`) to the repository root, or to the
 narrowest directory that holds the products and their shared fragments:
 
 ```bash
-export FLUID_REF_ROOT="$(git rev-parse --show-toplevel)"
-fluid validate products/orders/contract.fluid.yaml
+FLUID_REF_ROOT="$(git rev-parse --show-toplevel)" fluid validate products/orders/contract.fluid.yaml
 ```
+
+Set it per command, as above, rather than with `export`: an exported value
+widens every contract under it that you load later in that shell.
 
 Contracts whose refs stay inside their own directory need no change.
 
@@ -173,7 +182,13 @@ except RefConfinementError as err:
     print(err.pointer)  # '/exposes/0/policy'
     print(err.source)   # file that contains the ref
     print(err.root)     # the ref root it escaped
+    print(err.ignored_ref_root_env)  # FLUID_REF_ROOT value ignored for this
+                                     # contract, or None
 ```
+
+`ignored_ref_root_env` is set when `FLUID_REF_ROOT` is set but did not apply
+to this contract (it is not a directory, or does not contain the contract).
+The root is then the contract's own directory, whatever the environment says.
 
 ---
 

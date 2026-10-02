@@ -20,7 +20,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Set, Tuple, Union
 
 from fluid_build.util.ref_confinement import (
     REF_ROOT_ENV,
@@ -281,6 +281,8 @@ def _resolve_refs(
     base_dir: Path,
     *,
     ref_root: Optional[Path] = None,
+    root_hint: str = _REF_ROOT_HINT,
+    ignored_ref_root_env: Optional[str] = None,
     _source: Optional[Path] = None,
     _loc: Tuple[Union[str, int], ...] = (),
     _seen: Optional[Set[str]] = None,
@@ -306,7 +308,10 @@ def _resolve_refs(
         layer, for callers that widen ``ref_root``.
       - Circular reference detection (tracks resolved absolute paths)
       - Depth limit (``_MAX_REF_DEPTH``) to prevent runaway recursion
-      - Clear error messages naming the ref and its JSON pointer
+      - Clear error messages naming the ref and its JSON pointer.
+        ``root_hint`` ends an escape message; ``ignored_ref_root_env`` is
+        recorded on every :class:`RefConfinementError`. Both come from
+        :func:`_effective_ref_root` and are held for nested refs too.
     """
     if _depth > _MAX_REF_DEPTH:
         raise RefResolutionError(
@@ -343,7 +348,8 @@ def _resolve_refs(
             root=root,
             pointer=format_pointer(_loc),
             source=_source,
-            root_hint=_REF_ROOT_HINT,
+            root_hint=root_hint,
+            ignored_ref_root_env=ignored_ref_root_env,
         )
 
         # Defense in depth (F3): system directories stay blocked even when a
@@ -404,6 +410,8 @@ def _resolve_refs(
             resolved,
             ref_path.parent,
             ref_root=root,
+            root_hint=root_hint,
+            ignored_ref_root_env=ignored_ref_root_env,
             _source=ref_path,
             _loc=_pointer_parts(pointer),
             _seen=_seen,
@@ -421,6 +429,8 @@ def _resolve_refs(
                 v,
                 base_dir,
                 ref_root=root,
+                root_hint=root_hint,
+                ignored_ref_root_env=ignored_ref_root_env,
                 _source=_source,
                 _loc=(*_loc, k),
                 _seen=_seen,
@@ -436,6 +446,8 @@ def _resolve_refs(
                 item,
                 base_dir,
                 ref_root=root,
+                root_hint=root_hint,
+                ignored_ref_root_env=ignored_ref_root_env,
                 _source=_source,
                 _loc=(*_loc, i),
                 _seen=_seen,
@@ -448,11 +460,23 @@ def _resolve_refs(
     return obj
 
 
+class _RefRoot(NamedTuple):
+    """What :func:`_effective_ref_root` decided; each field is the
+    :func:`_resolve_refs` keyword argument of the same name."""
+
+    ref_root: Path
+    #: Ends an escape error: how to widen the root, or, when
+    #: ``FLUID_REF_ROOT`` was ignored, that it was and why.
+    root_hint: str = _REF_ROOT_HINT
+    #: The ignored ``FLUID_REF_ROOT`` value, else ``None``.
+    ignored_ref_root_env: Optional[str] = None
+
+
 def _effective_ref_root(
     contract_path: Path,
     contract: Any,
     ref_root: Optional[Union[str, Path]],
-) -> Path:
+) -> _RefRoot:
     """The directory every ``$ref`` of *contract* must stay inside.
 
     Default: the directory of the root contract file (symlinks resolved).
@@ -475,6 +499,9 @@ def _effective_ref_root(
       WARNING, and the contract gets the default root: exactly the root it
       would get with the variable unset, so the fallback widens nothing and
       refs that leave the contract's directory still fail, as escapes.
+      Those escape errors say the variable was ignored and why, on every
+      load: the WARNING is logged once per process, and in a service it
+      reaches the server log, not the caller.
     """
     contract_dir = contract_path.resolve().parent
     if ref_root is not None:
@@ -482,7 +509,7 @@ def _effective_ref_root(
     else:
         explicit, origin = os.environ.get(REF_ROOT_ENV, "").strip(), REF_ROOT_ENV
     if not explicit or next(iter_external_refs(contract), None) is None:
-        return contract_dir
+        return _RefRoot(contract_dir)
     root = Path(explicit).expanduser().resolve()
     if not root.is_dir():
         problem = f"{origin}={explicit!r} is not a directory (resolved to {root})"
@@ -492,11 +519,20 @@ def _effective_ref_root(
             f"(resolved to {root}); the ref root must contain the contract"
         )
     else:
-        return root
+        return _RefRoot(root)
     if origin != REF_ROOT_ENV:
         raise RefResolutionError(problem)
     _note_ref_root_env_ignored(contract_dir, explicit, problem)
-    return contract_dir
+    return _RefRoot(
+        contract_dir,
+        root_hint=(
+            f"{REF_ROOT_ENV} is set but was ignored for this contract: {problem}. "
+            f"To compose fragments from a wider tree, set {REF_ROOT_ENV} to a "
+            f"directory that contains the contract or pass ref_root= to the "
+            f"loader; see docs/contract-refs.md."
+        ),
+        ignored_ref_root_env=explicit,
+    )
 
 
 #: (contract directory, FLUID_REF_ROOT value) pairs already reported by
@@ -560,7 +596,14 @@ def compile_contract(
 
     log.info("compile_start", extra={"path": str(p)})
     root = _effective_ref_root(p, contract, ref_root)
-    compiled = _resolve_refs(contract, p.parent, ref_root=root, _source=p)
+    compiled = _resolve_refs(
+        contract,
+        p.parent,
+        ref_root=root.ref_root,
+        root_hint=root.root_hint,
+        ignored_ref_root_env=root.ignored_ref_root_env,
+        _source=p,
+    )
     log.info("compile_done", extra={"path": str(p)})
     return compiled
 
@@ -848,7 +891,14 @@ def load_contract(
     if resolve_refs:
         source = p.resolve()
         root = _effective_ref_root(p, contract, ref_root)
-        contract = _resolve_refs(contract, source.parent, ref_root=root, _source=source)
+        contract = _resolve_refs(
+            contract,
+            source.parent,
+            ref_root=root.ref_root,
+            root_hint=root.root_hint,
+            ignored_ref_root_env=root.ignored_ref_root_env,
+            _source=source,
+        )
     return contract
 
 

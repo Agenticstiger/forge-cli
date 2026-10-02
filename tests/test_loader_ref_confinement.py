@@ -377,6 +377,58 @@ class TestEnvRootOutsideTheContract:
         assert Path(exc.value.root) == contract.resolve().parent
         assert SECRET not in str(exc.value)
 
+    @pytest.mark.parametrize("env_root", ["elsewhere", "missing"])
+    @pytest.mark.parametrize("entry", ["load_contract", "compile_contract", "load_with_overlay"])
+    def test_every_escape_error_explains_the_ignored_env_root(
+        self, tmp_path, monkeypatch, caplog, entry, env_root
+    ):
+        """The WARNING is logged once per process, and a service's log is not
+        its caller. So each escape error says the variable was ignored and
+        why, and does not tell the user to set a variable that is set."""
+        (tmp_path / "elsewhere").mkdir()
+        _write(tmp_path / "outside" / "secret.yaml", {"api_key": SECRET})
+        proj = tmp_path / "proj"
+        # The escape is in a fragment: the explanation follows nested refs.
+        _write(proj / "fragments" / "labels.yaml", {"$ref": "../../outside/secret.yaml"})
+        contract = _contract(proj, "./fragments/labels.yaml")
+        value = str(tmp_path / env_root)
+        monkeypatch.setenv(REF_ROOT_ENV, value)
+        errors = []
+        with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+            for _ in range(2):
+                with pytest.raises(RefConfinementError, match="escapes the ref root") as exc:
+                    getattr(loader, entry)(contract)
+                errors.append(exc.value)
+        # The second load logged nothing, so its error is the only explanation.
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert events.count("ref_root_env_ignored") == 1
+        for err in errors:
+            message = str(err)
+            assert f"{REF_ROOT_ENV} is set but was ignored for this contract" in message
+            assert f"{REF_ROOT_ENV}={value!r}" in message
+            reason = "is not a directory" if env_root == "missing" else "is outside"
+            assert reason in message
+            assert f"set {REF_ROOT_ENV} to that directory" not in message
+            assert err.ignored_ref_root_env == value
+            assert Path(err.root) == contract.resolve().parent
+            assert SECRET not in message
+
+    def test_escape_without_a_fallback_keeps_the_widening_hint(self, tmp_path, monkeypatch):
+        _write(tmp_path / "outside" / "secret.yaml", {"api_key": SECRET})
+        contract = _contract(tmp_path / "proj", "../outside/secret.yaml")
+        monkeypatch.delenv(REF_ROOT_ENV, raising=False)
+        with pytest.raises(RefConfinementError) as unset:
+            load_contract(contract)
+        # Set and applied: it widened the root, so it was not ignored.
+        repo = tmp_path / "proj"
+        monkeypatch.setenv(REF_ROOT_ENV, str(repo))
+        with pytest.raises(RefConfinementError) as applied:
+            load_contract(contract)
+        for err in (unset.value, applied.value):
+            assert f"set {REF_ROOT_ENV} to that directory" in str(err)
+            assert "was ignored" not in str(err)
+            assert err.ignored_ref_root_env is None
+
     def test_warning_is_emitted_once_per_contract_and_value(self, tmp_path, monkeypatch, caplog):
         (tmp_path / "elsewhere").mkdir()
         contract = self._fragment_contract(tmp_path)
