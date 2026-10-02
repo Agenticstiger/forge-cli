@@ -43,7 +43,7 @@ from fluid_build.loader import (
     load_with_overlay,
 )
 
-SECRET = "SUPER-SECRET-VALUE"
+SECRET = "SUPER-SECRET-VALUE"  # pragma: allowlist secret
 
 
 def _write(path: Path, data) -> Path:
