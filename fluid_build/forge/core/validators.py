@@ -46,6 +46,11 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 import yaml
 
 from fluid_build.forge.core.bundle import SOURCE_SENTINEL, validate_manifest
+from fluid_build.util.ref_confinement import (
+    RefConfinementError,
+    confine_ref,
+    iter_external_refs,
+)
 from fluid_build.util.safe_yaml import load_yaml_safe
 
 LOG = logging.getLogger("fluid.forge.core.validators")
@@ -253,6 +258,25 @@ def validate_sql(
     return issues
 
 
+def _external_openapi_ref_issues(path: str, spec: Any) -> List[ValidationIssue]:
+    """One ``OAS-REF-EXTERNAL`` error per ``$ref`` that leaves the document."""
+    issues: List[ValidationIssue] = []
+    for pointer, ref in iter_external_refs(spec):
+        try:
+            confine_ref(ref, ref.split("#", 1)[0], base_dir=None, root=None, pointer=pointer)
+        except RefConfinementError as exc:
+            issues.append(
+                ValidationIssue(
+                    file=path,
+                    validator="openapi-spec-validator",
+                    severity="error",
+                    message=str(exc),
+                    code="OAS-REF-EXTERNAL",
+                )
+            )
+    return issues
+
+
 def validate_openapi(
     path: str,
     content: bytes,
@@ -294,7 +318,15 @@ def validate_openapi(
             )
         ]
 
-    issues: List[ValidationIssue] = []
+    # openapi-spec-validator follows external ``$ref``s through its default
+    # handlers — ``file://`` reads a host file (whose values then surface in
+    # the validation error) and ``http(s)://`` makes a request. A bundled
+    # fragment has no directory of its own, so the shared confinement check
+    # allows only same-document ``#/...`` refs; anything else is reported
+    # and the validator is not called on this fragment.
+    issues = _external_openapi_ref_issues(path, spec)
+    if issues:
+        return issues
     try:
         # validate_spec (legacy) and validate (current) both exist; prefer
         # whichever is available without importing an exact entry point.

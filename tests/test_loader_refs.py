@@ -334,7 +334,9 @@ class TestResolveRefsPathVariants:
     """Path variation edge cases."""
 
     def test_parent_directory_traversal(self, tmp_path):
-        """Ref with ../ to a sibling directory."""
+        """Ref with ../ to a sibling directory resolves only once the caller
+        widens the ref root to a directory holding both; by default the
+        contract's own directory is the root and the ref is refused."""
         dir_a = tmp_path / "a"
         dir_b = tmp_path / "b"
         dir_a.mkdir()
@@ -343,7 +345,9 @@ class TestResolveRefsPathVariants:
         _write_yaml(dir_b / "shared.yaml", {"data": "from_sibling"})
         _write_yaml(dir_a / "contract.yaml", {"section": {"$ref": "../b/shared.yaml"}})
 
-        result = load_contract(dir_a / "contract.yaml")
+        with pytest.raises(RefResolutionError, match="escapes the ref root"):
+            load_contract(dir_a / "contract.yaml")
+        result = load_contract(dir_a / "contract.yaml", ref_root=tmp_path)
         assert result["section"]["data"] == "from_sibling"
 
     def test_yml_extension(self, tmp_path):
@@ -921,7 +925,11 @@ class TestLoadWithOverlayListMerge:
 class TestRefResolverPlatformAwareBlocking:
     """The ``$ref`` resolver must reject refs that traverse into a
     system directory, using the same platform-aware deny set as the
-    rest of the CLI (``cli/security.py``)."""
+    rest of the CLI (``cli/security.py``).
+
+    Confinement to the ref root now refuses these first; the traversal
+    tests widen the root to the filesystem anchor so they still prove
+    the deny list is a working second layer for a caller that opts in."""
 
     def test_absolute_ref_still_rejected(self, tmp_path):
         """An absolute ``$ref`` path is rejected outright (relative-only
@@ -939,8 +947,11 @@ class TestRefResolverPlatformAwareBlocking:
         climb = "/".join([".."] * depth)
         ref = f"./{climb}/etc/passwd" if climb else "./etc/passwd"
         tree = {"section": {"$ref": ref}}
-        with pytest.raises(RefResolutionError, match="blocked system path"):
+        with pytest.raises(RefResolutionError, match="escapes the ref root"):
             _resolve_refs(tree, tmp_path)
+        anchor = Path(tmp_path.resolve().anchor)
+        with pytest.raises(RefResolutionError, match="blocked system path"):
+            _resolve_refs(tree, tmp_path, ref_root=anchor)
 
     @pytest.mark.skipif(
         not sys.platform.startswith("darwin"),
@@ -959,15 +970,15 @@ class TestRefResolverPlatformAwareBlocking:
         ref = f"./{climb}/private/etc/passwd" if climb else "./private/etc/passwd"
         tree = {"section": {"$ref": ref}}
         with pytest.raises(RefResolutionError, match="blocked system path"):
-            _resolve_refs(tree, tmp_path)
+            _resolve_refs(tree, tmp_path, ref_root=Path("/"))
 
     def test_legitimate_sibling_ref_still_allowed(self, tmp_path):
-        """F3 must not over-block: a normal relative ``../sibling/``
-        ref inside the project tree still resolves (monorepo layouts)."""
+        """F3 must not over-block: a ``../sibling/`` ref inside a widened
+        ref root (the monorepo opt-in) still resolves."""
         sibling = tmp_path / "shared"
         _write_yaml(sibling / "common.yaml", {"classification": "Internal"})
         product = tmp_path / "product"
         product.mkdir()
         tree = {"policy": {"$ref": "../shared/common.yaml"}}
-        result = _resolve_refs(tree, product)
+        result = _resolve_refs(tree, product, ref_root=tmp_path)
         assert result["policy"]["classification"] == "Internal"
