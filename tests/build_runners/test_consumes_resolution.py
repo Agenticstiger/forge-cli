@@ -1139,9 +1139,13 @@ def test_the_high_value_churn_example_builds_as_it_did_before_consumes_resolved(
 
 
 def test_sql_that_reads_its_upstream_by_path_keeps_building(tmp_path, printed, caplog):
-    """The old workaround: consumes[] for lineage, the file named in the SQL."""
+    """The old workaround: consumes[] for lineage, the file named in the SQL.
+
+    The file is inside the workspace: the DuckDB sandbox grants the workspace a
+    contract sits in, and refuses a path outside it (the next test).
+    """
     root = _workspace(tmp_path / "ws")  # no upstream contract anywhere
-    data = _parquet(tmp_path / "shared" / "cs.parquet")
+    data = _parquet(root / "shared" / "cs.parquet")
     build = _silver_build(
         sql=(
             "SELECT product_id, status, COUNT(*) AS subscription_count "
@@ -1155,6 +1159,17 @@ def test_sql_that_reads_its_upstream_by_path_keeps_building(tmp_path, printed, c
     assert _read(out) == [("p1", "active", 2), ("p2", "ended", 1)]
     assert "local_consumes_not_bound" in caplog.text, "the old warning is kept for it"
     assert any("lineage only" in line for line in printed), printed
+
+
+def test_sql_that_reads_a_file_outside_the_workspace_by_path_is_refused(tmp_path, printed):
+    """Contract SQL reaches the workspace and what the contract declares, no more."""
+    root = _workspace(tmp_path / "ws")
+    data = _parquet(tmp_path / "elsewhere" / "cs.parquet")
+    build = _silver_build(sql=f"SELECT * FROM read_parquet('{data}')")
+    contract = _silver(root, build=build)
+    assert _run(root, contract) == 1
+    assert any("Permission Error" in line for line in printed), printed
+    assert not (_silver_dir(root) / "out" / "subscription_status_summary.parquet").exists()
 
 
 def test_only_the_entries_the_sql_reads_must_resolve(tmp_path, printed):

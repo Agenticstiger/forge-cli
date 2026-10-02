@@ -960,9 +960,14 @@ def _verify_local_file(
 
     # Introspect with DuckDB.
     try:
-        import duckdb  # type: ignore[import]
+        from fluid_build.providers._duckdb_sandbox import (
+            DuckDBAllowlist,
+            secure_duckdb_connect,
+        )
 
-        con = duckdb.connect(":memory:")
+        # The masking check below runs SQL built from the contract: it reads
+        # the one file being verified and nothing else.
+        con = secure_duckdb_connect(allow=DuckDBAllowlist.none().with_paths(file_path))
         # A SQL string literal, not Python ``repr``: the path now carries the
         # contract's directory, and ``repr`` switches to double quotes (a
         # DuckDB identifier) or backslash escapes (literal in DuckDB) the

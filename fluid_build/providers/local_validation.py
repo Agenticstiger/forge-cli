@@ -26,6 +26,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.providers.quality_engine import (
     execute_quality_checks,
@@ -111,6 +112,18 @@ class LocalValidationProvider(ValidationProvider):
                 )
         return self._duckdb
 
+    def _connect(
+        self, database: str = ":memory:", *, allow: DuckDBAllowlist, read_only: bool = False
+    ):
+        """A sandboxed DuckDB confined to ``allow`` (see ``_duckdb_sandbox``).
+
+        Every connection this provider opens goes through here: the quality
+        rules it runs are contract input, so each reaches the one file it
+        checks and nothing else.
+        """
+        self._get_duckdb()
+        return secure_duckdb_connect(database, allow=allow, read_only=read_only)
+
     @property
     def provider_name(self) -> str:
         return "local"
@@ -118,8 +131,7 @@ class LocalValidationProvider(ValidationProvider):
     def validate_connection(self) -> bool:
         """Local provider is always reachable."""
         try:
-            duckdb = self._get_duckdb()
-            conn = duckdb.connect(":memory:")
+            conn = self._connect(allow=DuckDBAllowlist.none())
             conn.execute("SELECT 1")
             conn.close()
             return True
@@ -137,13 +149,13 @@ class LocalValidationProvider(ValidationProvider):
             if not path.exists():
                 return None
 
-            duckdb = self._get_duckdb()
-            conn = duckdb.connect(":memory:")
+            ext = path.suffix.lower()
+            abs_path = str(path.resolve())
+            # The one file this introspects; a .duckdb file is opened read-only
+            # below, and the sandbox grants a read-only database file itself.
+            conn = self._connect(allow=DuckDBAllowlist.none().with_paths(abs_path))
 
             try:
-                ext = path.suffix.lower()
-                abs_path = str(path.resolve())
-
                 # DuckDB native database file — connect and query the table directly
                 if ext in (".duckdb", ".db"):
                     binding = resource_spec.get("binding", {})
@@ -157,7 +169,7 @@ class LocalValidationProvider(ValidationProvider):
                     # malicious schema/table never reaches a query (fail-closed).
                     table_ref = _build_duckdb_table_ref(schema_name, table_name)
                     conn.close()
-                    conn = duckdb.connect(abs_path, read_only=True)
+                    conn = self._connect(abs_path, allow=DuckDBAllowlist.none(), read_only=True)
                     describe_sql = f"DESCRIBE SELECT * FROM {table_ref}"
                     rows = conn.execute(describe_sql).fetchall()
                     fields: List[FieldSchema] = []
@@ -384,7 +396,6 @@ class LocalValidationProvider(ValidationProvider):
             ]
         ext = path.suffix.lower()
         abs_path = str(path.resolve())
-        duckdb = self._get_duckdb()
 
         # DuckDB native database: connect directly and query the bound table
         if ext in (".duckdb", ".db"):
@@ -420,7 +431,7 @@ class LocalValidationProvider(ValidationProvider):
                         path="exposes[].binding.location",
                     )
                 ]
-            conn = duckdb.connect(abs_path, read_only=True)
+            conn = self._connect(abs_path, allow=DuckDBAllowlist.none(), read_only=True)
             try:
 
                 def _exec(sql):
@@ -452,7 +463,8 @@ class LocalValidationProvider(ValidationProvider):
                 )
             ]
         table_ref = "{fn}({p})".format(fn=read_fn, p=quote_ansi_string_literal(abs_path))
-        conn = duckdb.connect(":memory:")
+        # The rules are contract input: they reach the file they check, no other.
+        conn = self._connect(allow=DuckDBAllowlist.none().with_paths(abs_path))
         try:
 
             def _exec(sql):

@@ -56,6 +56,7 @@ from fluid_build.api.runner import (
 )
 from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.source import AcquisitionMode
+from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 from fluid_build.providers._sql_safety import (
     build_libpq_dsn,
     quote_ansi_string_literal,
@@ -548,6 +549,60 @@ def _required_extensions(kind: str, uri: Optional[str]) -> List[str]:
     return out
 
 
+# ── Sandbox ──────────────────────────────────────────────────────────────
+#
+# Every connection this runner opens goes through ``secure_duckdb_connect``.
+# The SQL it runs is assembled from the contract (reader options, quality-gate
+# predicates, incremental filters, the masking projection), so each connection
+# reaches the contract's directory and the locations the build declares, and
+# nothing else on the host. Extensions, ATTACHes and secrets are set up in
+# ``before_lock``: once the configuration is locked none can be added.
+
+
+def _run_streams(ctx: RunContext) -> List[str]:
+    return list(ctx.source.streams) or DuckdbRunner()._infer_streams(ctx)
+
+
+def _grant_source(allow: DuckDBAllowlist, ctx: RunContext, streams: List[str]) -> DuckDBAllowlist:
+    """``allow`` plus where a filesystem / http source reads from.
+
+    A database source needs no grant: postgres is scanned through its DSN, and
+    mysql / sqlite are attached before the lock (``_attach_external_databases``).
+    """
+    if ctx.source.kind not in {"filesystem", "http"}:
+        return allow
+    uri = dict(ctx.source.connection.raw).get("uri")
+    # ``_select_for_stream`` reads ``uri or stream``: without a uri, the stream
+    # names the file.
+    return allow.with_locations(*([uri] if uri else streams))
+
+
+def _grant_destination(
+    allow: DuckDBAllowlist, ctx: RunContext, streams: List[str], sink_format: str
+) -> DuckDBAllowlist:
+    """``allow`` plus each stream's landed file and its late-arrival sibling."""
+    out_dir = Path(ctx.workdir) / "out"
+    for stream in streams:
+        dest = _resolve_destination_path(ctx, stream, sink_format, out_dir)
+        if _is_remote_uri(dest):
+            allow = allow.with_locations(dest)
+            continue
+        main = Path(dest)
+        late = main.with_name(main.stem + "__late_events" + main.suffix)
+        allow = allow.with_paths(main, late)
+    return allow
+
+
+def _run_allowlist(
+    ctx: RunContext, streams: List[str], sink_format: Optional[str] = None
+) -> DuckDBAllowlist:
+    """The contract's directory, the declared source, and the declared landing."""
+    allow = _grant_source(DuckDBAllowlist.none().with_dirs(ctx.workdir), ctx, streams)
+    if sink_format is None:
+        return allow
+    return _grant_destination(allow, ctx, streams, sink_format)
+
+
 # ── Runner ───────────────────────────────────────────────────────────────
 
 
@@ -587,13 +642,15 @@ class DuckdbRunner:
         return _execute(ctx, self)
 
     def fingerprint(self, ctx: RunContext) -> SchemaFingerprint:
-        import duckdb
-
         from .._masking import masked_column_types
 
-        con = duckdb.connect(":memory:")
+        # Reads the source only: the destination is not granted.
+        con = secure_duckdb_connect(
+            ":memory:",
+            allow=_run_allowlist(ctx, _run_streams(ctx)),
+            before_lock=lambda c: self._load_extensions(c, ctx),
+        )
         try:
-            self._load_extensions(con, ctx)
             select_sql = _select_for_first_stream(ctx)
             con.execute(f"CREATE TEMP VIEW _fp AS {select_sql}")
             rows = con.execute("DESCRIBE _fp").fetchall()
@@ -1218,9 +1275,12 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     dlq_writer: Optional[DLQWriter] = None
     dlq_total_records = 0
 
-    con = duckdb.connect(":memory:")
+    con = secure_duckdb_connect(
+        ":memory:",
+        allow=_run_allowlist(ctx, streams_to_run, sink_format),
+        before_lock=lambda c: runner._load_extensions(c, ctx),
+    )
     try:
-        runner._load_extensions(con, ctx)
         if masker is not None:
             masker.install(con)
         for stream in streams_to_run:
@@ -1681,20 +1741,26 @@ def _connect_for_destination(ctx: RunContext) -> Any:
     swallow their errors, so they would simply have stopped doing their job —
     no late-arrival split, and an empty PII scan that looks like a clean one.
     """
-    import duckdb
-
-    con = duckdb.connect(":memory:")
     dest = _binding_destination_uri(ctx)
-    if not dest:
-        return con
-    for ext in _required_extensions("filesystem", dest):
-        try:
-            con.execute(f"INSTALL {ext}")
-            con.execute(f"LOAD {ext}")
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("DuckDB extension load failed (%s): %s", ext, type(exc).__name__)
-    _apply_destination_secret(con, ctx, dest)
-    return con
+
+    def _prepare(con: Any) -> None:
+        if not dest:
+            return
+        for ext in _required_extensions("filesystem", dest):
+            try:
+                con.execute(f"INSTALL {ext}")
+                con.execute(f"LOAD {ext}")
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("DuckDB extension load failed (%s): %s", ext, type(exc).__name__)
+        _apply_destination_secret(con, ctx, dest)
+
+    # Reads back (and the late-arrival split rewrites) what this run landed,
+    # and nothing else: the source is not granted here.
+    sink_format = (ctx.sink.format or "parquet").lower()
+    allow = _grant_destination(
+        DuckDBAllowlist.none().with_dirs(ctx.workdir), ctx, _run_streams(ctx), sink_format
+    )
+    return secure_duckdb_connect(":memory:", allow=allow, before_lock=_prepare)
 
 
 def _artifact_exists(con: Any, path: str, reader: str) -> bool:
@@ -1789,12 +1855,10 @@ def _count_file_rows(path: str, sink_format: str) -> int:
 
     The late-arrival split can rewrite the file after the build counted it.
     """
-    import duckdb
-
     reader = {"parquet": "read_parquet", "csv": "read_csv_auto", "json": "read_json_auto"}[
         sink_format
     ]
-    con = duckdb.connect(":memory:")
+    con = secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none().with_paths(path))
     try:
         row = con.execute(
             f"SELECT COUNT(*) FROM {reader}({quote_ansi_string_literal(path)})"

@@ -53,6 +53,13 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from fluid_build.providers._duckdb_sandbox import (
+    DuckDBAllowlist,
+    is_sandbox_refusal,
+    sandbox_refusal_hint,
+    secure_duckdb_connect,
+)
+
 LOGGER = logging.getLogger("fluid.provider.local")
 
 # -------------------------
@@ -95,17 +102,43 @@ def _require_duckdb():
         ) from e
 
 
-def _connect_duckdb():
+def _connect_duckdb(allow: Optional[DuckDBAllowlist] = None):
+    """A sandboxed DuckDB that may touch only ``allow`` (nothing, by default).
+
+    The action's SQL is contract input, so the connection reaches the files the
+    action declares (``_action_allowlist``) and no others.
+    """
     # Allow persistent db file for debugging/local exploration:
     # FLUID_LOCAL_DUCKDB_PATH=/tmp/fluid_local.duckdb
     _require_duckdb()
-    import duckdb  # type: ignore
 
     db_path = os.environ.get("FLUID_LOCAL_DUCKDB_PATH", ":memory:")
     try:
-        return duckdb.connect(db_path, read_only=False)
+        return secure_duckdb_connect(
+            db_path, allow=allow if allow is not None else DuckDBAllowlist.none()
+        )
     except Exception as e:
         raise LocalProviderError(f"Failed to connect to duckdb at '{db_path}': {e}") from e
+
+
+def _output_specs(outputs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if isinstance(outputs, dict) and "path" in outputs:
+        return [outputs]
+    targets = outputs.get("targets", []) if isinstance(outputs, dict) else []
+    return [t for t in targets if isinstance(t, dict)] if isinstance(targets, list) else []
+
+
+def _action_allowlist(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> DuckDBAllowlist:
+    """Exactly what one action declares: each input file and each output file."""
+    allow = DuckDBAllowlist.none()
+    for cfg in inputs.values():
+        if isinstance(cfg, dict) and cfg.get("path"):
+            files = _glob_all(_as_list(cfg["path"]))
+            allow = allow.with_paths(*(str(Path(f).resolve()) for f in files))
+    for spec in _output_specs(outputs):
+        if spec.get("path"):
+            allow = allow.with_paths(Path(str(spec["path"])).resolve())
+    return allow
 
 
 def _register_input(con, alias: str, cfg: Dict[str, Any]) -> str:
@@ -354,15 +387,21 @@ def apply_action(action: Dict[str, Any], ctx) -> None:
     if not outputs:
         raise LocalProviderError(f"Action '{rid}' missing outputs block")
 
-    # Connect to DuckDB
-    con = _connect_duckdb()
+    # Connect to DuckDB, confined to what this action declares
+    allow = _action_allowlist(inputs, outputs)
+    con = _connect_duckdb(allow)
 
     # Register inputs
     for alias, cfg in inputs.items():
         _register_input(con, alias, cfg)
 
     # Execute SQL
-    rel = _execute_sql(con, sql)
+    try:
+        rel = _execute_sql(con, sql)
+    except LocalProviderError as e:
+        if is_sandbox_refusal(e.__cause__ or e):
+            raise LocalProviderError(f"{e} {sandbox_refusal_hint(allow)}") from e
+        raise
 
     # Write output(s)
     # We support a single output dict or a dict with 'path' etc.

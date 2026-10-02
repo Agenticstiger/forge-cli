@@ -119,18 +119,24 @@ class JdbcDiscoverer(Discoverer):
         }
 
     def _introspect(self, conn: dict) -> List[DiscoveredStream]:
-        import duckdb
+        from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 
         dsn = build_libpq_dsn(conn, database_key=self.config.database_dsn_key)
         alias = self.config.attach_alias
+        attach_sql = (
+            f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE {self.config.attach_type})"
+        )
 
-        con = duckdb.connect(":memory:")
+        # The source is attached before the sandbox locks; the catalog queries
+        # after it reach that database and no file or URL.
+        con = secure_duckdb_connect(
+            ":memory:",
+            allow=DuckDBAllowlist.none(),
+            extensions=[self.config.extension],
+            before_lock=lambda c: c.execute(attach_sql),
+        )
         streams: List[DiscoveredStream] = []
         try:
-            con.execute(f"INSTALL {self.config.extension}; LOAD {self.config.extension};")
-            con.execute(
-                f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE {self.config.attach_type})"
-            )
 
             filter_fn = self.config.table_filter or _default_table_filter
             where = filter_fn(conn, quote_ansi_string_literal)

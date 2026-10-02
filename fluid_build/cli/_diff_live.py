@@ -644,14 +644,13 @@ def _duckdb_table_exists(path: Path, schema_name: str, table: str) -> bool:
     checked by the provider's own allowlist first and are bound as
     parameters, never spliced into the SQL.
     """
-    import duckdb
-
+    from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
     from fluid_build.providers.local_validation import _build_duckdb_table_ref
 
     _build_duckdb_table_ref(schema_name, table)
     # Only the catalog is read, so the connection gets no file or network
     # access beyond the database file itself.
-    con = duckdb.connect(str(path), read_only=True, config={"enable_external_access": False})
+    con = secure_duckdb_connect(path, allow=DuckDBAllowlist.none(), read_only=True)
     try:
         row = con.execute(
             "SELECT count(*) FROM information_schema.tables "

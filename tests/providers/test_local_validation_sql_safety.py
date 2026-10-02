@@ -60,7 +60,7 @@ class _SpyConnection:
 
 
 class _ExplodingDuckDB:
-    """Stand-in duckdb module.
+    """Stand-in for the provider's sandboxed ``_connect``.
 
     The harmless first ``connect(":memory:")`` is allowed (it carries no
     user-controlled identifier) but returns a connection whose ``execute``
@@ -104,7 +104,7 @@ class TestGetResourceSchemaInjection:
     def test_malicious_table_never_opens_db(self, tmp_path, monkeypatch):
         provider = LocalValidationProvider({"base_dir": str(tmp_path)})
         # Force any DB access to fail loudly — the guard must run first.
-        monkeypatch.setattr(provider, "_get_duckdb", lambda: _ExplodingDuckDB())
+        monkeypatch.setattr(provider, "_connect", _ExplodingDuckDB.connect)
         spec = _duckdb_resource_spec(tmp_path, schema="main", table=MALICIOUS_TABLE)
 
         # The outer handler re-raises validation failures as a clean Exception;
@@ -117,7 +117,7 @@ class TestGetResourceSchemaInjection:
 
     def test_malicious_schema_never_opens_db(self, tmp_path, monkeypatch):
         provider = LocalValidationProvider({"base_dir": str(tmp_path)})
-        monkeypatch.setattr(provider, "_get_duckdb", lambda: _ExplodingDuckDB())
+        monkeypatch.setattr(provider, "_connect", _ExplodingDuckDB.connect)
         spec = _duckdb_resource_spec(tmp_path, schema=MALICIOUS_SCHEMA, table="orders")
 
         with pytest.raises(Exception) as exc_info:
@@ -157,7 +157,7 @@ class TestGetResourceSchemaInjection:
 class TestRunQualityChecksInjection:
     def test_malicious_table_returns_issue_without_query(self, tmp_path, monkeypatch):
         provider = LocalValidationProvider({"base_dir": str(tmp_path)})
-        monkeypatch.setattr(provider, "_get_duckdb", lambda: _ExplodingDuckDB())
+        monkeypatch.setattr(provider, "_connect", _ExplodingDuckDB.connect)
         spec = _duckdb_resource_spec(tmp_path, schema="main", table=MALICIOUS_TABLE)
 
         # run_quality_checks fails closed by returning an error ValidationIssue
@@ -169,7 +169,7 @@ class TestRunQualityChecksInjection:
 
     def test_malicious_schema_returns_issue_without_query(self, tmp_path, monkeypatch):
         provider = LocalValidationProvider({"base_dir": str(tmp_path)})
-        monkeypatch.setattr(provider, "_get_duckdb", lambda: _ExplodingDuckDB())
+        monkeypatch.setattr(provider, "_connect", _ExplodingDuckDB.connect)
         spec = _duckdb_resource_spec(tmp_path, schema=MALICIOUS_SCHEMA, table="orders")
 
         issues = provider.run_quality_checks(spec, rules=[{"type": "not_null", "column": "id"}])

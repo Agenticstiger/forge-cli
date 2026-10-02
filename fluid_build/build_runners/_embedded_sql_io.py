@@ -471,16 +471,10 @@ def relations_read(sql: str) -> Optional[FrozenSet[str]]:
     if not str(sql or "").strip():
         return None
     try:
-        import duckdb
+        from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 
-        con = duckdb.connect(
-            ":memory:",
-            config={
-                "enable_external_access": False,
-                "autoinstall_known_extensions": False,
-                "autoload_known_extensions": False,
-            },
-        )
+        # Parsed only, never bound or run: no file, URL or extension at all.
+        con = secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none())
         try:
             row = con.execute("SELECT json_serialize_sql(?)", [str(sql)]).fetchone()
         finally:
