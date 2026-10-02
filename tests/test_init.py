@@ -583,18 +583,19 @@ class TestInitLocalDb:
             with patch.dict("sys.modules", {"duckdb": None}):
                 init_local_db(tmp_path, "local", logger)
 
-    def test_duckdb_available_creates_db_dir(self, tmp_path, logger, monkeypatch):
+    def test_duckdb_available_creates_db_dir(self, tmp_path, logger):
+        pytest.importorskip("duckdb")
         from fluid_build.cli.init import init_local_db
 
-        mock_conn = MagicMock()
-        mock_duckdb = MagicMock()
-        mock_duckdb.connect.return_value = mock_conn
-        monkeypatch.delitem(sys.modules, "duckdb", raising=False)
-        with patch.dict("sys.modules", {"duckdb": mock_duckdb}):
-            with patch("fluid_build.cli.init.RICH_AVAILABLE", False):
-                init_local_db(tmp_path, "local", logger)
-        mock_duckdb.connect.assert_called_once()
-        mock_conn.close.assert_called_once()
+        # The connection is the sandboxed one (providers/_duckdb_sandbox), which
+        # refuses a stand-in duckdb module it cannot version-check: a real one.
+        with patch("fluid_build.cli.init.RICH_AVAILABLE", False):
+            init_local_db(tmp_path, "local", logger)
+        db = tmp_path / ".fluid" / "db.duckdb"
+        assert db.is_file()
+        import duckdb
+
+        duckdb.connect(str(db)).close()  # closed by init: reopening is not locked out
 
 
 # ===========================================================================

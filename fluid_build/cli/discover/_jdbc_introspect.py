@@ -618,19 +618,23 @@ def introspect_jdbc(
             f"Invalid schema filter: {schema_filter!r}. " "Must match ``[A-Za-z_][A-Za-z0-9_]*``."
         )
 
-    con = duckdb.connect(":memory:")
+    from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
+
+    attach = {
+        "postgres": _attach_string_postgres,
+        "mysql": _attach_string_mysql,
+        "sqlite": _attach_string_sqlite,
+    }.get(kind)
+    # Install + load the extension (duckdb caches the binary, so this is fast
+    # on a second run) and ATTACH the source before the sandbox locks; the
+    # introspection queries after it reach that database and no file or URL.
+    con = secure_duckdb_connect(
+        ":memory:",
+        allow=DuckDBAllowlist.none(),
+        extensions=[kind] if attach is not None else [],
+        before_lock=(lambda c: c.execute(attach(args, alias))) if attach is not None else None,
+    )
     try:
-        # Install + load the extension. duckdb caches the binary so
-        # this is fast on second run.
-        if kind == "postgres":
-            con.execute("INSTALL postgres; LOAD postgres;")
-            con.execute(_attach_string_postgres(args, alias))
-        elif kind == "mysql":
-            con.execute("INSTALL mysql; LOAD mysql;")
-            con.execute(_attach_string_mysql(args, alias))
-        elif kind == "sqlite":
-            con.execute("INSTALL sqlite; LOAD sqlite;")
-            con.execute(_attach_string_sqlite(args, alias))
 
         # Enumerate via duckdb's union ``information_schema`` view,
         # filtered to our attached database. Postgres + MySQL each

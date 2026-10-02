@@ -349,11 +349,13 @@ class TestApplyAction:
         except LocalProviderError:
             pass  # numpy/pandas not installed
 
-    def test_invalid_targets(self, tmp_path):
+    def test_invalid_targets(self, tmp_path, monkeypatch):
         try:
             import duckdb
         except ImportError:
             pytest.skip("duckdb not installed")
+        # Declared inputs must be under the working directory (DuckDB sandbox).
+        monkeypatch.chdir(tmp_path)
         csv_in = tmp_path / "in.csv"
         csv_in.write_text("x\n1")
 

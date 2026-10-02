@@ -58,6 +58,7 @@ FLUID Forge includes several built-in security measures:
 - **Credential redaction** — secrets are redacted from logs and plan output
 - **Provider auth isolation** — each provider manages its own authentication boundary
 - **Policy-as-code** — governance rules compile to native cloud IAM before deployment
+- **`$ref` confinement** — a contract's `$ref`s may only name files inside the contract's own directory tree (symlinks resolved); URLs and absolute paths are refused. Widening the root is an explicit opt-in (`FLUID_REF_ROOT` / `ref_root=`). See [docs/contract-refs.md](docs/contract-refs.md).
 
 ## Plugin Trust Model
 

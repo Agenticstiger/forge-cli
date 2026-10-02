@@ -216,22 +216,24 @@ class DuckDBDriver(EngineDriver):
         if self._connection is not None:
             return self._connection
         try:
-            import duckdb  # type: ignore[import-not-found]
+            import duckdb  # type: ignore[import-not-found]  # noqa: F401
         except ImportError as exc:  # pragma: no cover - depends on optional dep
             raise UnsupportedBindingError(
                 "duckdb is not installed; install via the 'local' extra: "
                 "pip install 'data-product-forge[local]'"
             ) from exc
+        from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
+
         target = str(self._db_file) if self._db_file is not None else ":memory:"
+        # The bound file (if any) and nothing else: a query the MCP port
+        # compiles cannot reach another file, URL or database.
+        allow = DuckDBAllowlist.none().with_paths(self._path)
         # DuckDB read-only mode protects against accidental writes
         # even though every advertised tool is SELECT-only. Skip
         # read-only when the target is in-memory because a fresh
         # in-memory instance is empty and would refuse the table-load
         # below.
-        if target == ":memory:":
-            connection = duckdb.connect(database=":memory:")
-        else:
-            connection = duckdb.connect(database=target, read_only=True)
+        connection = secure_duckdb_connect(target, allow=allow, read_only=target != ":memory:")
         self._configure_connection(connection)
         self._connection = connection
         return connection

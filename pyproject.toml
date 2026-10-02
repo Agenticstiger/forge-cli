@@ -242,7 +242,11 @@ odcs-strict = [
 
 # Local provider (DuckDB)
 local = [
-  "duckdb>=1.0",
+  # 1.5.0, not 1.0: every connection runs contract SQL inside DuckDB's sandbox
+  # (fluid_build/providers/_duckdb_sandbox.py). allowed_directories arrived in
+  # 1.2; up to 1.4.3 '<dir>/./../' escaped it, and through 1.4.x a symlink in
+  # an allowed directory did. 1.5.0 resolves both; the helper refuses older.
+  "duckdb>=1.5.0",
   "pandas>=2.2",
   # Named here, not left to arrive through pandas: masking at landing
   # registers DuckDB Python UDFs, DuckDB's create_function needs numpy

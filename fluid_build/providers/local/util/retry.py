@@ -67,6 +67,13 @@ def is_retryable_error(exception: Exception) -> bool:
     if isinstance(exception, NonRetryableError):
         return False
 
+    # A DuckDB sandbox refusal is permanent: retrying only re-runs SQL that was
+    # refused (and its message, a path, can match a pattern below by accident).
+    from fluid_build.providers._duckdb_sandbox import is_sandbox_refusal
+
+    if is_sandbox_refusal(exception):
+        return False
+
     exception_str = str(exception).lower()
     exception_type = type(exception).__name__.lower()
 

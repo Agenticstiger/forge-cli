@@ -39,6 +39,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fluid_build.observability.secret_redactor import redact_secret_text, redact_value
 from fluid_build.providers._duckdb_read import build_register_view_sql
+from fluid_build.providers._duckdb_sandbox import (
+    DuckDBAllowlist,
+    is_sandbox_refusal,
+    sandbox_refusal_hint,
+    secure_duckdb_connect,
+    unaliased_dir,
+)
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderMetadata
 
@@ -218,6 +225,111 @@ class LocalProvider(BaseProvider):
 
         return anchor_binding_paths(contract, self.anchor_dir)
 
+    # ------------------------- Sandboxed DuckDB ------------------------- #
+
+    @staticmethod
+    def _declared_io(action: Dict[str, Any]) -> List[Any]:
+        """Every location ``action`` declares it reads or writes through DuckDB."""
+        op = (action.get("op") or action.get("type") or "").lower().strip()
+        found: List[Any] = []
+        if op in {"sql", "query", "execute_sql"}:
+            for key in ("inputs", "tables", "outputs", "out"):
+                value = action.get(key) or []
+                found.extend(value if isinstance(value, list) else [value])
+        elif op == "load_data":
+            found.append(action.get("path"))
+        elif op in {"copy", "materialize"}:
+            found.append(action.get("dst") or action.get("out") or action.get("path"))
+        return [spec for spec in found if spec]
+
+    def _declare_run_io(self, actions: Iterable[Dict[str, Any]]) -> None:
+        """Record what every action of this run declares, before any SQL runs.
+
+        One apply shares one session database, so a view one action registers
+        over a file is read again by a later action's SQL: every connection of
+        the run gets the run's whole declared allowlist, not just its own.
+        """
+        specs: List[Any] = []
+        for action in actions:
+            flat = dict(action)
+            payload = flat.pop("payload", None)
+            if isinstance(payload, dict):
+                for key, value in payload.items():
+                    flat.setdefault(key, value)
+            specs.extend(self._declared_io(flat))
+        self._run_io = specs
+
+    def _allowlist(self, specs: Iterable[Any]) -> DuckDBAllowlist:
+        """What this provider's SQL may touch, and nothing else.
+
+        The source contract's directory (``anchor_dir``) and the FLUID
+        workspace it sits in, the run's session scratch directory,
+        ``./runtime`` (where previews and default outputs land), and each
+        location the actions declare: an input file, an output file, an
+        ``s3://`` prefix. A contract's SQL that names any other path,
+        ``/etc/passwd`` or ``~/.aws/credentials``, is refused by DuckDB.
+        ``./runtime`` is left out when it is a symlink that leads outside the
+        contract's directory and workspace (:func:`unaliased_dir`).
+
+        A declared location is granted only inside those directories (plus
+        the upstream roots in ``FLUID_UPSTREAM_CONTRACTS`` and the operator's
+        ``FLUID_DUCKDB_ALLOWED_DIRS``): the contract's author writes the
+        declaration, so it must not be a way to grant the host
+        (``DuckDBAllowlist.with_declared``). A relative declared path is
+        resolved where DuckDB opens it, the working directory, and is confined
+        all the same.
+        """
+        from fluid_build.util.upstream_discovery import collect_search_roots
+        from fluid_build.util.workspace_root import find_workspace_root
+
+        session = getattr(self, "_session_db", None)
+        scratch = Path(session).parent if session else None
+        # Without a contract directory (a bare ``apply`` of actions), the
+        # working directory stands in for it, as it does for relative paths.
+        anchor = self.anchor_dir if self.anchor_dir is not None else Path.cwd()
+        # A contract inside a FLUID workspace (``fluid.workspace.yaml``) may
+        # read its sibling products' files by path, as consumes[] does.
+        workspace = find_workspace_root(self.anchor_dir) if self.anchor_dir is not None else None
+        # ``./runtime`` is in the working directory, usually the contract's
+        # own, so the contract's repository can ship it as a symlink
+        # (``runtime -> ../../..``). Granted only where its name says it is, or
+        # inside the contract's directory or workspace; otherwise not at all.
+        runtime = unaliased_dir("runtime", within=[anchor, workspace])
+        if runtime is None:
+            self._log_warn(
+                "local_runtime_not_granted",
+                {"runtime": str(Path("runtime").absolute()), "reason": "symlink_leads_out"},
+            )
+        allow = DuckDBAllowlist.none().with_dirs(self.anchor_dir, workspace, runtime, scratch)
+        within = [anchor, runtime, scratch, *collect_search_roots(workspace)]
+        for spec in specs:
+            raw = spec.get("path") if isinstance(spec, dict) else spec
+            if not raw:
+                continue
+            raw = str(raw)
+            # Only s3:// is remote here (``_register_mapping_input``): any other
+            # string is a local path, as ``Path`` reads it.
+            allow = allow.with_declared(raw if _is_s3_uri(raw) else str(Path(raw)), within=within)
+        return allow
+
+    def _connect(self, specs: Iterable[Any] = (), *, config: Optional[Dict[str, Any]] = None):
+        """The provider's one way to DuckDB: sandboxed to :meth:`_allowlist`.
+
+        ``specs`` are the calling action's own declared locations, added to the
+        run's (:meth:`_declare_run_io`). The S3 buckets among them get their
+        extensions and credential secret before the configuration is locked.
+        """
+        _Duck.get()
+        all_specs = [*getattr(self, "_run_io", []), *specs]
+        allow = self._allowlist(all_specs)
+        self._last_allow = allow
+        return secure_duckdb_connect(
+            self._get_db_path(),
+            allow=allow,
+            config=config,
+            before_lock=lambda con: self._attach_object_stores(con, all_specs),
+        )
+
     def _get_db_path(self) -> str:
         """Get database path - persistent, session-scoped, or in-memory."""
         if self.persist:
@@ -378,6 +490,7 @@ class LocalProvider(BaseProvider):
                 ]
 
         # ---- Execute ----
+        self._declare_run_io(a for a in norm_actions if isinstance(a, dict))
         results: List[Dict[str, Any]] = []
         error_count = 0
         for idx, action in enumerate(norm_actions):
@@ -642,8 +755,6 @@ class LocalProvider(BaseProvider):
         Supports: CSV, TSV, Parquet, JSON, JSONL
         Handles: Globs, schemas, custom options, retries on transient errors
         """
-        duckdb = _Duck.get()
-
         path = action.get("path")
         table_name = action.get("table_name") or action.get("resource_id")
         fmt = action.get("format", "csv")
@@ -660,9 +771,12 @@ class LocalProvider(BaseProvider):
         if not _has_glob(path_obj) and not path_obj.exists():
             raise FileNotFoundError(f"Input file not found: {path}")
 
-        db_path = self._get_db_path()
-        con = duckdb.connect(database=db_path)
+        con = self._connect([path])
 
+        # Closed on every path: every action of the run shares one session
+        # database, and a connection left open (an exception's traceback keeps
+        # it alive) holds that file's locked instance, which refuses the next
+        # action's sandboxed connection.
         try:
             # Use retry logic for table registration (can fail with I/O errors)
             def _register_with_retry():
@@ -700,12 +814,13 @@ class LocalProvider(BaseProvider):
                 {"i": idx, "error": str(e), "path": str(path), "table": table_name},
             )
             raise
+        finally:
+            con.close()
 
     # ----------------------- SQL (DuckDB) execution --------------------- #
 
     def _run_sql_action(self, idx: int, action: Dict[str, Any]) -> Dict[str, Any]:
         """Execute SQL with retry logic, persistent DB, and enhanced logging."""
-        duckdb = _Duck.get()
         start_time = time.time()
 
         sql = action.get("sql") or action.get("query")
@@ -714,15 +829,31 @@ class LocalProvider(BaseProvider):
 
         _mkdir("runtime/out")
 
-        db_path = self._get_db_path()
-        con = duckdb.connect(database=db_path)
-        con.execute("PRAGMA threads=4;")
-
         inputs = action.get("inputs") or action.get("tables") or []
         outputs = action.get("outputs") or action.get("out") or []
         if isinstance(outputs, (str, Path)):
             outputs = [outputs]
-        self._attach_object_stores(con, [*inputs, *outputs])
+        # Threads set at connect: the sandbox locks the configuration, so a
+        # ``PRAGMA threads`` afterwards is refused.
+        con = self._connect([*inputs, *outputs], config={"threads": 4})
+        # Closed on every path, a failure included (see _run_load_data_action):
+        # otherwise one failing SQL action fails every later action of the run.
+        try:
+            return self._run_sql_on(con, idx, action, sql, inputs, outputs, start_time)
+        finally:
+            con.close()
+
+    def _run_sql_on(
+        self,
+        con: Any,
+        idx: int,
+        action: Dict[str, Any],
+        sql: str,
+        inputs: List[Any],
+        outputs: List[Any],
+        start_time: float,
+    ) -> Dict[str, Any]:
+        """The body of :meth:`_run_sql_action`, on a connection it closes."""
         reg_info = self._register_inputs(con, inputs)
 
         # Log with redacted SQL (in case it contains sensitive data)
@@ -754,7 +885,13 @@ class LocalProvider(BaseProvider):
                     "duration_ms": duration_ms(start_time),
                 },
             )
-            raise
+            if not is_sandbox_refusal(e):
+                raise
+            # A path outside the sandbox: say what the SQL may read instead.
+            # Raised from a helper, so this frame keeps no reference to the new
+            # error (an error -> traceback -> frame -> error cycle would keep
+            # the connection alive until the cyclic GC runs).
+            raise self._sandbox_refusal(e) from e
 
         # If an output_table is specified, persist the result as a DuckDB table
         # so downstream materialize/copy steps can reference it.
@@ -798,6 +935,10 @@ class LocalProvider(BaseProvider):
             },
         )
         return {"op": "sql", "written": written, "rows": rowcount, "inputs": reg_info}
+
+    def _sandbox_refusal(self, refused: BaseException) -> PermissionError:
+        """``refused`` as a PermissionError that names what the SQL may read instead."""
+        return PermissionError(f"{refused} {sandbox_refusal_hint(self._last_allow, refused)}")
 
     def _register_inputs(self, con: Any, inputs: Iterable[Any]) -> List[Dict[str, Any]]:
         info: List[Dict[str, Any]] = []
@@ -952,12 +1093,15 @@ class LocalProvider(BaseProvider):
         fmt = (action.get("format") or _ext(dst) or "csv").lower()
         if source_table:
             try:
-                duckdb = _Duck.get()
-                db_path = self._get_db_path()
-                con = duckdb.connect(database=db_path)
-                rel = con.sql(f"SELECT * FROM {validate_ident(source_table)}")
-                self._write_relation(rel, dst, fmt)
-                rowcount = rel.count("*").fetchone()[0] if hasattr(rel, "count") else -1
+                con = self._connect([dst])
+                try:
+                    rel = con.sql(f"SELECT * FROM {validate_ident(source_table)}")
+                    self._write_relation(rel, dst, fmt)
+                    rowcount = rel.count("*").fetchone()[0] if hasattr(rel, "count") else -1
+                    del rel
+                finally:
+                    # Closed on every path (see _run_load_data_action).
+                    con.close()
                 self._log_info(
                     "local_materialize_done",
                     {"i": idx, "dst": str(dst), "source": source_table, "rows": rowcount},
