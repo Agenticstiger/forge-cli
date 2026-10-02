@@ -40,8 +40,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
 
-import fluid_build.api as api
-from fluid_build import _contract_loader
+from fluid_build import _contract_loader, api
 from fluid_build._contract_loader import load_contract_with_overlay
 from fluid_build.api import ContractLoadError, LoadedContract
 from fluid_build.api import contract as contract_api
