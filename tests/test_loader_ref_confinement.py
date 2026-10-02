@@ -339,6 +339,30 @@ class TestRefRootOptIn:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(params=["unknown_user", "symlink_loop", "untraversable_parent"])
+def unresolvable_root(request, tmp_path) -> str:
+    """A ref-root value whose resolution raises (RuntimeError,
+    PermissionError) rather than returning a path that merely is not a
+    directory."""
+    kind = request.param
+    if kind == "unknown_user":
+        if os.name == "nt":  # expanduser guesses a sibling profile dir there
+            pytest.skip("~user expansion does not fail on Windows")
+        return "~nosuchuser-fluid-ref-root-xyz/repo"
+    if kind == "symlink_loop":
+        _symlink(tmp_path / "loopA", tmp_path / "loopB", is_dir=True)
+        _symlink(tmp_path / "loopB", tmp_path / "loopA", is_dir=True)
+        return str(tmp_path / "loopA")
+    if os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+        pytest.skip("chmod 000 does not deny traversal here")
+    locked = tmp_path / "locked"
+    (locked / "inner").mkdir(parents=True)
+    locked.chmod(0)
+    # Restore traversal so tmp_path cleanup can remove it.
+    request.addfinalizer(lambda: locked.chmod(0o700))
+    return str(locked / "inner")
+
+
 class TestEnvRootOutsideTheContract:
     """A ``FLUID_REF_ROOT`` set once (a shell, a service container) applies to
     every contract the process loads. One that does not contain the contract,
@@ -507,30 +531,6 @@ class TestEnvRootOutsideTheContract:
         assert exc.value.ignored_ref_root_env == value
         assert Path(exc.value.root) == contract.resolve().parent
         assert SECRET not in str(exc.value)
-
-
-@pytest.fixture(params=["unknown_user", "symlink_loop", "untraversable_parent"])
-def unresolvable_root(request, tmp_path) -> str:
-    """A ref-root value whose resolution raises (RuntimeError,
-    PermissionError) rather than returning a path that merely is not a
-    directory."""
-    kind = request.param
-    if kind == "unknown_user":
-        if os.name == "nt":  # expanduser guesses a sibling profile dir there
-            pytest.skip("~user expansion does not fail on Windows")
-        return "~nosuchuser-fluid-ref-root-xyz/repo"
-    if kind == "symlink_loop":
-        _symlink(tmp_path / "loopA", tmp_path / "loopB", is_dir=True)
-        _symlink(tmp_path / "loopB", tmp_path / "loopA", is_dir=True)
-        return str(tmp_path / "loopA")
-    if os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0):
-        pytest.skip("chmod 000 does not deny traversal here")
-    locked = tmp_path / "locked"
-    (locked / "inner").mkdir(parents=True)
-    locked.chmod(0)
-    # Restore traversal so tmp_path cleanup can remove it.
-    request.addfinalizer(lambda: locked.chmod(0o700))
-    return str(locked / "inner")
 
     def test_env_root_containing_the_contract_still_widens_without_warning(
         self, tmp_path, monkeypatch, caplog
