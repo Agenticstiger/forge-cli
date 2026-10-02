@@ -525,6 +525,8 @@ def _effective_ref_root(
             try:
                 Path(explicit).expanduser().resolve(strict=True)
             except FileNotFoundError:
+                # A plain missing directory is reported as "not a directory"
+                # just below; only a loop or a permission failure raises on.
                 pass
             problem = f"{origin}={explicit!r} is not a directory (resolved to {root})"
         elif not contract_dir.is_relative_to(root):
