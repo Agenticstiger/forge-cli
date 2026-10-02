@@ -19,7 +19,7 @@ predicates, masking checks) and DuckDB runs it with the privileges of the
 process. Unconfined, that SQL reads any file the process can:
 ``read_csv('/etc/passwd')``, ``read_text('~/.aws/credentials')``, ``glob('/')``,
 ``ATTACH`` of another database, ``COPY ... TO`` anywhere, an ``https://`` URL.
-A Command Center that runs a user's contract would hand that user its host.
+A service that runs a user's contract would hand that user its host.
 
 :func:`secure_duckdb_connect` applies DuckDB's own sandbox, in the order the
 DuckDB docs give ("Securing DuckDB", introduced in 1.2):

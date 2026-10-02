@@ -205,7 +205,7 @@ guide gives.
   `sqlite_scan` and `ATTACH ... (TYPE sqlite)` can open any SQLite file the
   process can read; the declared source file itself is confined before it is
   attached (see above). On one that loads `postgres`, `postgres_scan` can connect
-  to any host the process can reach, the Command Center's own database
+  to any host the process can reach, the hosting service's own database
   included. The engine loads them only for an acquisition build's declared
   source, discovery and the copilot's sample-rows tool, whose SQL the engine
   builds from validated identifiers; contract SQL never runs on such a
@@ -221,5 +221,5 @@ guide gives.
   credential-chain secret the engine creates.
 - **Defense in depth, not isolation.** DuckDB describes these settings as "not
   a substitute for proper sandboxing". A service that runs other people's
-  contracts (the Command Center, a shared CI runner) should still run each one
+  contracts (a multi-tenant service, a shared CI runner) should still run each one
   in its own container.
