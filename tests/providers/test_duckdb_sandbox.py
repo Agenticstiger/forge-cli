@@ -45,7 +45,7 @@ from fluid_build.providers._duckdb_sandbox import (  # noqa: E402
     secure_duckdb_connect,
 )
 
-SECRET = "TOP-SECRET-VALUE-0451"
+SECRET = "TOP-SECRET-VALUE-0451"  # pragma: allowlist secret
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = REPO_ROOT / "fluid_build"
 
@@ -1170,7 +1170,7 @@ def test_settings_read_back_as_locked_down(tmp_path):
     assert settings["lock_configuration"] == "true"
     assert settings["autoload_known_extensions"] == "false"
     assert settings["autoinstall_known_extensions"] == "false"
-    assert settings["allow_persistent_secrets"] == "false"
+    assert settings["allow_persistent_secrets"] == "false"  # pragma: allowlist secret
     assert settings["allow_community_extensions"] == "false"
     assert str(tmp_path) in settings["allowed_directories"]
 

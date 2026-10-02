@@ -75,7 +75,7 @@ Env vars:
 * ``FLUID_FORGE_DB_TOOLS`` — ``1``/``true`` to expose the tool (default off →
   ABSENT from ``get_tool_definitions``).
 * ``FLUID_FORGE_DB_URI`` — the ``default`` connection's URI, e.g.
-  ``postgresql://user:pass@host:5432/db`` / ``mysql://user:pass@host/db`` /
+  ``postgresql://user:$PASSWORD@host:5432/db`` / ``mysql://user:$PASSWORD@host/db`` /
   ``sqlite:////abs/path.db``.
 * ``FLUID_FORGE_DB_URI_<NAME>`` — a named connection reachable via
   ``connection=<name>`` (case-insensitive; the alias is upper-cased).
