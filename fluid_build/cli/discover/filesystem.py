@@ -88,18 +88,29 @@ def _format_for(path: str) -> str:
 
 
 def _columns_for(path: str, fmt: str) -> List[DiscoveredColumn]:
-    import duckdb
+    from fluid_build.providers._duckdb_sandbox import (
+        DuckDBAllowlist,
+        is_remote_location,
+        secure_duckdb_connect,
+    )
+    from fluid_build.providers._sql_safety import quote_ansi_string_literal
 
-    con = duckdb.connect(":memory:")
+    reader = {"csv": "read_csv_auto", "parquet": "read_parquet", "json": "read_json_auto"}.get(fmt)
+    if reader is None:
+        return []
+    # The one location being discovered. A URL needs its filesystem extension
+    # loaded before the sandbox locks (autoloading is off from then on).
+    remote = is_remote_location(path)
+    extensions: List[str] = []
+    if remote:
+        extensions = ["azure"] if path.lower().startswith(("azure://", "az://")) else ["httpfs"]
+    con = secure_duckdb_connect(
+        ":memory:",
+        allow=DuckDBAllowlist.none().with_locations(path),
+        extensions=extensions,
+    )
     try:
-        if fmt == "csv":
-            sql = f"SELECT * FROM read_csv_auto('{path}') LIMIT 0"
-        elif fmt == "parquet":
-            sql = f"SELECT * FROM read_parquet('{path}') LIMIT 0"
-        elif fmt == "json":
-            sql = f"SELECT * FROM read_json_auto('{path}') LIMIT 0"
-        else:
-            return []
+        sql = f"SELECT * FROM {reader}({quote_ansi_string_literal(path)}) LIMIT 0"
         con.execute(sql)
         descr = con.description or []
         return [DiscoveredColumn(name=c[0], type=str(c[1]), nullable=True) for c in descr]

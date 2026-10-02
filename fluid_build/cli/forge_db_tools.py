@@ -75,7 +75,7 @@ Env vars:
 * ``FLUID_FORGE_DB_TOOLS`` — ``1``/``true`` to expose the tool (default off →
   ABSENT from ``get_tool_definitions``).
 * ``FLUID_FORGE_DB_URI`` — the ``default`` connection's URI, e.g.
-  ``postgresql://user:pass@host:5432/db`` / ``mysql://user:pass@host/db`` /
+  ``postgresql://user:$PASSWORD@host:5432/db`` / ``mysql://user:$PASSWORD@host/db`` /
   ``sqlite:////abs/path.db``.
 * ``FLUID_FORGE_DB_URI_<NAME>`` — a named connection reachable via
   ``connection=<name>`` (case-insensitive; the alias is upper-cased).
@@ -336,22 +336,24 @@ def _fetch_sample_rows(arguments: Dict[str, Any], env: Mapping[str, str]) -> Dic
     sql = f"SELECT * FROM {ref} LIMIT {applied_limit}"
 
     try:
-        import duckdb
+        import duckdb  # noqa: F401 - the install hint below
     except ImportError:
         return {
             "error": "DuckDbNotInstalled",
             "message": "fetch_sample_rows requires duckdb (pip install 'fluid-build[local]').",
         }
+    from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 
-    con = duckdb.connect(":memory:")
+    con = None
     try:
-        if kind == "postgres":
-            con.execute("INSTALL postgres; LOAD postgres;")
-        elif kind == "mysql":
-            con.execute("INSTALL mysql; LOAD mysql;")
-        else:
-            con.execute("INSTALL sqlite; LOAD sqlite;")
-        con.execute(attach)
+        # The source is attached before the sandbox locks; the SELECT that
+        # follows then reaches that database and no file or URL.
+        con = secure_duckdb_connect(
+            ":memory:",
+            allow=DuckDBAllowlist.none(),
+            extensions=[{"postgres": "postgres", "mysql": "mysql"}.get(kind, "sqlite")],
+            before_lock=lambda c: c.execute(attach),
+        )
         cur = con.execute(sql)
         raw_columns = [str(d[0]) for d in (cur.description or [])]
         raw_rows = cur.fetchall()
@@ -364,7 +366,8 @@ def _fetch_sample_rows(arguments: Dict[str, Any], env: Mapping[str, str]) -> Dic
             "message": f"fetch_sample_rows could not read {table!r} — see server logs",
         }
     finally:
-        con.close()
+        if con is not None:
+            con.close()
 
     # Second row ceiling (belt-and-suspenders, mirrors Command Center's
     # nl_query: LIMIT rewrite AND a fetch ceiling): even if the SQL LIMIT were

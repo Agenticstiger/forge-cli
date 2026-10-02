@@ -132,13 +132,16 @@ class TestDLQWriterPerf:
 
 
 class TestDuckdbRunnerPerf:
-    def test_duckdb_csv_to_parquet_100_rows_under_5s(self, tmp_path: Path):
+    def test_duckdb_csv_to_parquet_100_rows_under_5s(self, tmp_path: Path, monkeypatch):
         """The classic 'first sync' UX budget: CSV → Parquet for 100 rows
         in under 5 s. This is the time-to-first-value floor declared in
         the design doc. Includes import + extension load + COPY.
         """
         from fluid_build.build_runners.duckdb.runner import execute_duckdb_build
 
+        # The source and landing sit beside, not under, the run's workdir: the
+        # operator allows that directory, as the DuckDB sandbox requires.
+        monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(tmp_path))
         in_dir = tmp_path / "in"
         in_dir.mkdir()
         csv = in_dir / "perf.csv"

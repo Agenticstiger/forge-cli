@@ -53,6 +53,14 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from fluid_build.providers._duckdb_sandbox import (
+    DuckDBAllowlist,
+    DuckDBSandboxError,
+    is_sandbox_refusal,
+    sandbox_refusal_hint,
+    secure_duckdb_connect,
+)
+
 LOGGER = logging.getLogger("fluid.provider.local")
 
 # -------------------------
@@ -95,17 +103,50 @@ def _require_duckdb():
         ) from e
 
 
-def _connect_duckdb():
+def _connect_duckdb(allow: Optional[DuckDBAllowlist] = None):
+    """A sandboxed DuckDB that may touch only ``allow`` (nothing, by default).
+
+    The action's SQL is contract input, so the connection reaches the files the
+    action declares (``_action_allowlist``) and no others.
+    """
     # Allow persistent db file for debugging/local exploration:
     # FLUID_LOCAL_DUCKDB_PATH=/tmp/fluid_local.duckdb
     _require_duckdb()
-    import duckdb  # type: ignore
 
     db_path = os.environ.get("FLUID_LOCAL_DUCKDB_PATH", ":memory:")
     try:
-        return duckdb.connect(db_path, read_only=False)
+        return secure_duckdb_connect(
+            db_path, allow=allow if allow is not None else DuckDBAllowlist.none()
+        )
     except Exception as e:
         raise LocalProviderError(f"Failed to connect to duckdb at '{db_path}': {e}") from e
+
+
+def _output_specs(outputs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if isinstance(outputs, dict) and "path" in outputs:
+        return [outputs]
+    targets = outputs.get("targets", []) if isinstance(outputs, dict) else []
+    return [t for t in targets if isinstance(t, dict)] if isinstance(targets, list) else []
+
+
+def _action_allowlist(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> DuckDBAllowlist:
+    """Exactly what one action declares: each input file and each output file.
+
+    Each must resolve inside the working directory (where the action's
+    relative paths resolve) or a directory the operator lists in
+    ``FLUID_DUCKDB_ALLOWED_DIRS``: a declared file is granted to the action's
+    SQL, so declaring ``~/.aws/credentials`` must not make it readable.
+    """
+    within = [Path.cwd()]
+    allow = DuckDBAllowlist.none()
+    for cfg in inputs.values():
+        if isinstance(cfg, dict) and cfg.get("path"):
+            files = _glob_all(_as_list(cfg["path"]))
+            allow = allow.with_declared(*(str(Path(f).absolute()) for f in files), within=within)
+    for spec in _output_specs(outputs):
+        if spec.get("path"):
+            allow = allow.with_declared(str(Path(str(spec["path"])).absolute()), within=within)
+    return allow
 
 
 def _register_input(con, alias: str, cfg: Dict[str, Any]) -> str:
@@ -354,15 +395,39 @@ def apply_action(action: Dict[str, Any], ctx) -> None:
     if not outputs:
         raise LocalProviderError(f"Action '{rid}' missing outputs block")
 
-    # Connect to DuckDB
-    con = _connect_duckdb()
+    # Connect to DuckDB, confined to what this action declares
+    try:
+        allow = _action_allowlist(inputs, outputs)
+    except DuckDBSandboxError as e:
+        raise LocalProviderError(f"Action '{rid}': {e}") from e
+    con = _connect_duckdb(allow)
+    # Closed on every path: with FLUID_LOCAL_DUCKDB_PATH set, a connection left
+    # open by a failure holds the file's locked instance and refuses the next.
+    try:
+        _run_action_sql(con, rid, sql, inputs, outputs, allow, ctx)
+    finally:
+        try:
+            con.close()
+        except Exception:  # the action's own outcome is what the caller needs
+            LOGGER.debug("closing the DuckDB connection of action %r failed", rid, exc_info=True)
 
+
+def _run_action_sql(
+    con, rid: str, sql: str, inputs: Dict[str, Any], outputs: Dict[str, Any], allow, ctx
+) -> None:
+    """Register the inputs, run the SQL and write the outputs on ``con``."""
     # Register inputs
     for alias, cfg in inputs.items():
         _register_input(con, alias, cfg)
 
     # Execute SQL
-    rel = _execute_sql(con, sql)
+    try:
+        rel = _execute_sql(con, sql)
+    except LocalProviderError as e:
+        refused = e.__cause__ or e
+        if is_sandbox_refusal(refused):
+            raise LocalProviderError(f"{e} {sandbox_refusal_hint(allow, refused)}") from e
+        raise
 
     # Write output(s)
     # We support a single output dict or a dict with 'path' etc.
@@ -382,11 +447,6 @@ def apply_action(action: Dict[str, Any], ctx) -> None:
             total += max(rc, 0)
             LOGGER.info(json_log("apply_action_output", rows=rc, path=path or "(dry-run)"))
         LOGGER.info(json_log("apply_action_outputs_total", rows=total))
-
-    try:
-        con.close()
-    except Exception:
-        pass
 
 
 # -------------------------

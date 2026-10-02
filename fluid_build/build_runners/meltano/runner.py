@@ -484,11 +484,12 @@ def write_records_to_duckdb(
     like ``"orders; DROP TABLE secrets; --"`` is rejected at the boundary
     rather than executed.
     """
-    import duckdb
+    from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 
     dataset = validate_ident(dataset)
     duckdb_path.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(duckdb_path))
+    # Records arrive as values, so the database file is all this touches.
+    con = secure_duckdb_connect(duckdb_path, allow=DuckDBAllowlist.none())
     try:
         con.execute(f"CREATE SCHEMA IF NOT EXISTS {dataset}")
         counts: Dict[str, int] = {}

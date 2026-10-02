@@ -1200,13 +1200,16 @@ def init_local_db(project_dir: Path, provider: str, logger: logging.Logger):
         return  # Only for local provider
 
     try:
-        import duckdb
+        import duckdb  # noqa: F401 - absent duckdb is the ImportError below
+
+        from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 
         db_dir = project_dir / ".fluid"
         db_dir.mkdir(exist_ok=True)
 
         db_path = db_dir / "db.duckdb"
-        conn = duckdb.connect(str(db_path))
+        # Creates the file and closes it: no SQL runs, so no access is granted.
+        conn = secure_duckdb_connect(db_path, allow=DuckDBAllowlist.none())
         conn.close()
 
         if RICH_AVAILABLE:

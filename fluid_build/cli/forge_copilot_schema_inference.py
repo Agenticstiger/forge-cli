@@ -373,9 +373,12 @@ def _read_parquet_metadata_pyarrow(path: Path) -> Dict[str, Any]:
 
 
 def _read_parquet_metadata_duckdb(path: Path) -> Dict[str, Any]:
-    import duckdb
+    import duckdb  # noqa: F401 - absent duckdb raises ImportError for the caller
 
-    connection = duckdb.connect()
+    from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
+
+    # The sample file and nothing else.
+    connection = secure_duckdb_connect(allow=DuckDBAllowlist.none().with_paths(path))
     try:
         rows = connection.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(path)]).fetchall()
     finally:

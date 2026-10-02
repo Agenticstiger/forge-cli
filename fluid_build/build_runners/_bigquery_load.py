@@ -195,12 +195,19 @@ def utc_adjusted_copy(path: str, schema: Any) -> Optional[str]:
     wanted = {name.lower(): name for name in _timestamp_columns(schema)}
     if not wanted:
         return None
-    import duckdb
+    from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 
-    con = duckdb.connect(":memory:")
+    base, _ext = os.path.splitext(str(path))
+    out = f"{base}.bq-load.parquet"
+    # The landed file and its UTC-adjusted copy beside it, nothing else. Read
+    # as UTC (set at connect: the sandbox locks the configuration): the cast
+    # below turns the naive wall clock into an instant.
+    con = secure_duckdb_connect(
+        ":memory:",
+        allow=DuckDBAllowlist.none().with_paths(path, out),
+        config={"TimeZone": "UTC"},
+    )
     try:
-        # Read as UTC: the cast below turns the naive wall clock into an instant.
-        con.execute("SET TimeZone = 'UTC'")
         described = con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(path)]).fetchall()
         naive = [
             str(row[0])
@@ -212,8 +219,6 @@ def utc_adjusted_copy(path: str, schema: Any) -> Optional[str]:
         replaced = ", ".join(
             f"CAST({_quote_ident(c)} AS TIMESTAMPTZ) AS {_quote_ident(c)}" for c in naive
         )
-        base, _ext = os.path.splitext(str(path))
-        out = f"{base}.bq-load.parquet"
         # A path is not a bindable parameter in COPY ... TO; quote it as a literal.
         target = "'" + out.replace("'", "''") + "'"
         con.execute(

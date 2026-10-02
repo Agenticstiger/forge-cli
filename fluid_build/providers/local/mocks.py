@@ -198,12 +198,19 @@ class SnowflakeDuckDBMock:
     def connect(self) -> Any:
         """Connect to mock Snowflake (DuckDB)."""
         try:
-            import duckdb
+            import duckdb  # noqa: F401 - the ImportError below is the install hint
 
-            self._con = duckdb.connect(self.db_path)
+            from fluid_build.providers._duckdb_sandbox import (
+                DuckDBAllowlist,
+                secure_duckdb_connect,
+            )
 
-            # Set up Snowflake-like configuration
-            self._con.execute("SET TimeZone='UTC'")
+            # The mock runs whatever SQL it is handed, so it gets no file or
+            # network access beyond its own database file. TimeZone is set at
+            # connect: the sandbox locks the configuration afterwards.
+            self._con = secure_duckdb_connect(
+                self.db_path, allow=DuckDBAllowlist.none(), config={"TimeZone": "UTC"}
+            )
 
             # Create standard Snowflake schemas if they don't exist
             self._con.execute("CREATE SCHEMA IF NOT EXISTS INFORMATION_SCHEMA")
