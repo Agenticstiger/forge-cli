@@ -1024,11 +1024,15 @@ def test_with_an_env_a_base_that_fails_to_load_keeps_its_own_event(tmp_path: Pat
     assert events == ["contract_not_found", "contract_parse_failed", "contract_ref_unresolved"]
 
 
-def test_a_plain_value_error_that_is_not_a_root_check_is_contract_load_failed(
+def test_a_nul_byte_in_a_ref_is_a_ref_error_not_a_root_check(
     tmp_path: Path,
 ) -> None:
-    """``Path.resolve`` raises a plain ``ValueError`` for a ``$ref`` holding a NUL
-    byte. Only the loader's root checks mean ``contract_not_a_mapping``."""
+    """A ``$ref`` holding a NUL byte cannot be resolved as a path. The ref
+    confinement check reports that as a typed ref error, through both forms,
+    and it is never ``contract_not_a_mapping``: only the loader's root checks
+    mean that."""
+    from fluid_build.loader import RefResolutionError
+
     contract_path = tmp_path / "contract.fluid.yaml"
     contract_path.write_text('id: x\nname: base\nmeta: {"$ref": "./a\\0b.yaml"}\n', "utf-8")
 
@@ -1039,9 +1043,10 @@ def test_a_plain_value_error_that_is_not_a_root_check_is_contract_load_failed(
             {"id": "x", "meta": {"$ref": "./a\x00b.yaml"}}, base_dir=tmp_path
         )
 
-    assert from_file.value.event == "contract_load_failed"
-    assert from_dict.value.event == "contract_load_failed"
-    assert isinstance(from_file.value.__cause__, ValueError)
+    for raised in (from_file.value, from_dict.value):
+        assert raised.event == "contract_ref_unresolved"
+        assert raised.event != "contract_not_a_mapping"
+        assert isinstance(raised.__cause__, RefResolutionError)
 
 
 def test_a_path_no_file_can_have_is_contract_not_found(tmp_path: Path) -> None:
