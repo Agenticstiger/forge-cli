@@ -20,11 +20,24 @@ deprecation window is required for any breaking change.
 
 Anything outside ``fluid_build.api`` is internal and may change without
 notice. Anything inside is governed.
+
+Consumers that need a contract exactly as ``fluid plan`` sees it (a
+control plane comparing a contract to a plan, CI tooling, editors) use
+:func:`load_contract` and its in-memory siblings from ``.contract``
+(added in 1.1).
 """
 
 from __future__ import annotations
 
 from .catalog import CatalogRegistrar, RegistrationResult
+from .contract import (
+    ContractLoadError,
+    ContractOrigin,
+    LoadedContract,
+    load_contract,
+    load_contract_from_dict,
+    load_contract_from_text,
+)
 from .cost import BudgetCap, ChargebackTag, CostTracker
 from .hooks import HookChain, HookResult, PreLandHook
 from .lineage import DatasetFacet, LineageEmitter, RunEvent
@@ -42,7 +55,7 @@ from .source import (
 )
 from .state import Cursor, RunLock, StateStore, Watermark
 
-__api_version__ = "1.0"
+__api_version__ = "1.1"
 
 __all__ = [
     "__api_version__",
@@ -96,4 +109,11 @@ __all__ = [
     # security
     "ImageSignatureVerifier",
     "SovereigntyChecker",
+    # contract loading (1.1)
+    "LoadedContract",
+    "ContractLoadError",
+    "ContractOrigin",
+    "load_contract",
+    "load_contract_from_text",
+    "load_contract_from_dict",
 ]

@@ -26,7 +26,7 @@ import inspect
 
 import fluid_build.api as api
 
-EXPECTED_API_VERSION = "1.0"
+EXPECTED_API_VERSION = "1.1"
 
 EXPECTED_ALL = {
     "__api_version__",
@@ -80,6 +80,13 @@ EXPECTED_ALL = {
     # security
     "ImageSignatureVerifier",
     "SovereigntyChecker",
+    # contract loading (added in 1.1)
+    "LoadedContract",
+    "ContractLoadError",
+    "ContractOrigin",
+    "load_contract",
+    "load_contract_from_text",
+    "load_contract_from_dict",
 }
 
 
