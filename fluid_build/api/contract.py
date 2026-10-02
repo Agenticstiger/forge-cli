@@ -96,14 +96,15 @@ class ContractLoadError(Exception):
 
     ``event`` is a stable snake_case identity, safe to route on:
 
-    * ``contract_not_found``: the contract (or a file it names) does not exist;
+    * ``contract_not_found``: the contract (or a file it names) does not exist,
+      or ``path`` / ``base_dir`` cannot name a file (a NUL byte);
     * ``contract_parse_failed``: the text is not valid JSON/YAML (or not
       UTF-8);
     * ``contract_not_a_mapping``: the document root, or the overlay root, is
       not an object;
     * ``contract_ref_unresolved``: a ``$ref`` could not be resolved
       (missing target, cycle, blocked path, bad pointer);
-    * ``contract_env_invalid``: ``env`` is not an environment name (see
+    * ``contract_env_invalid``: ``env`` is not a single path component (see
       :func:`load_contract`);
     * ``contract_overlay_needs_base_dir``: an in-memory load was given an
       overlay and a document with file ``$ref`` values but no ``base_dir``,
@@ -111,7 +112,8 @@ class ContractLoadError(Exception):
     * ``contract_not_serialisable``: raised by :attr:`LoadedContract.digest`
       for a contract JSON cannot represent (an unquoted YAML date, a set,
       binary, a self-referencing alias); ``fluid plan`` cannot write it either;
-    * ``contract_load_failed``: any other loader failure;
+    * ``contract_load_failed``: any other loader failure, including a document
+      that contains itself through a YAML alias;
     * any event the engine's loader raises itself, passed through unchanged
       (for example ``overlay_declared_but_missing``, ``bundle_not_found``,
       ``bundle_env_mismatch``, ``bundle_manifest_invalid``).
@@ -209,26 +211,26 @@ def load_contract(
     no symlink) is not applied to ``path``: a library caller chooses its
     paths. The ``$ref`` resolver's own confinement applies in full.
 
-    ``env`` is a name, never a path: it must match the grammar ``fluid
-    publish --env`` accepts (letters, digits, ``.``, ``_``, ``-``, starting
-    with a letter or digit, at most 64 characters), or the load is refused
-    with ``contract_env_invalid`` before any file is read. The engine builds
-    overlay paths from it (``overlays/<env>.yaml`` and so on), so an env
-    such as ``../x`` or ``/abs/x`` would otherwise merge a file outside the
-    contract's directory into the result. ``None`` means no env; ``""`` is
-    refused rather than read as ``None``.
+    ``env`` is a name, never a path. The engine builds overlay paths from it
+    (``overlays/<env>.yaml`` and so on), so an env such as ``../x`` or
+    ``/abs/x`` would merge a file outside the contract's directory into the
+    result. An env that is not a single path component is therefore refused
+    with ``contract_env_invalid`` before any file is read: one holding ``/``,
+    ``\\`` or a NUL, an absolute or drive-qualified one, ``.``, ``..``, and
+    ``""`` (refused rather than read as ``None``). Every other string loads
+    as ``fluid plan --env`` loads it. ``None`` means no env.
 
     Raises:
         ContractLoadError: the contract could not be loaded.
     """
-    from fluid_build import _contract_loader, _env_names
+    from fluid_build import _contract_loader
 
     log = logger or LOG
-    resolved = Path(os.fspath(path)).resolve()
-    if env is not None and not _env_names.is_env_name(env):
+    resolved = _resolve_input_path(path, "contract path")
+    if env is not None and not _is_env_component(env):
         raise ContractLoadError(
             "contract_env_invalid",
-            f"env {env!r} is not an environment name: {_env_names.ENV_NAME_RULE}",
+            f"env {env!r} is not an environment name: {_ENV_RULE}",
             path=resolved,
         )
     try:
@@ -360,13 +362,20 @@ def load_contract_from_dict(
     contract: Dict[str, Any] = copy.deepcopy(dict(document))
     files: Tuple[Path, ...] = ()
     if base_dir is not None:
-        base = Path(os.fspath(base_dir)).resolve()
+        base = _resolve_input_path(base_dir, "base_dir")
         # ``loader.load_contract`` does exactly this after parsing the file.
         try:
             contract = loader._resolve_refs(contract, base)
         except Exception as exc:  # noqa: BLE001 - mapped to one typed error
             raise _as_load_error(exc, base) from exc
         files = tuple(_walk_ref_files(document, base))
+    else:
+        # The resolver rebuilds every dict and list it passes through, so in
+        # the engine no two places in the base contract share one object
+        # (``deepcopy`` keeps YAML alias sharing). Without that, the overlay
+        # merge and the rewrites below, which change nodes in place, would
+        # reach every alias of the node they change.
+        contract = _unshare(contract)
     if overlay is not None:
         contract = _replay_overlay(
             contract, copy.deepcopy(dict(overlay)), composed=base_dir is not None, log=log
@@ -383,6 +392,79 @@ def load_contract_from_dict(
 
 
 # ── helpers ────────────────────────────────────────────────────────────
+
+#: :func:`_is_env_component` in words, for ``contract_env_invalid``.
+_ENV_RULE = (
+    "an env names an overlay file next to the contract, so it must be one path "
+    "component: not empty, not '.' or '..', no '/', '\\' or NUL, not absolute or drive-qualified"
+)
+
+
+def _is_env_component(env: Any) -> bool:
+    """True when ``env`` keeps every overlay path the engine builds from it in the
+    contract's directory.
+
+    Only what makes ``env`` a path is refused, so every other name loads as
+    ``fluid plan --env`` loads it (``_staging``, ``prod+eu``, a long name).
+    Both separators are refused on every platform, so one env means the same
+    thing everywhere.
+    """
+    if not isinstance(env, str) or env in ("", ".", ".."):
+        return False
+    if "\x00" in env or "/" in env or "\\" in env:
+        return False
+    return not (os.path.isabs(env) or os.path.splitdrive(env)[0])
+
+
+def _resolve_input_path(value: PathLike, what: str) -> Path:
+    """``value`` made absolute; a path the OS cannot hold is ``contract_not_found``."""
+    try:
+        return Path(os.fspath(value)).resolve()
+    except (OSError, ValueError, RuntimeError) as exc:
+        # ``ValueError``: a NUL byte. ``RuntimeError``: a symlink loop
+        # (Python < 3.13). No file can exist at such a path.
+        raise ContractLoadError(
+            "contract_not_found", f"the {what} {value!r} cannot name a file: {exc}"
+        ) from exc
+
+
+def _unshare(node: Any) -> Any:
+    """``node`` with every dict and list rebuilt, so no two places share one object.
+
+    What ``loader._resolve_refs`` does to the trees it walks, without its
+    recursion: iterative, so depth costs no stack. A container that contains
+    itself (a self-referencing YAML alias) cannot be rebuilt; the engine's
+    resolver fails on it too, and so does this, with ``contract_load_failed``.
+    """
+    if not isinstance(node, (dict, list)):
+        return node
+    root: Any = {} if isinstance(node, dict) else []
+    on_path: Set[int] = set()
+    stack: List[Tuple[Any, Any]] = [(node, root)]
+    while stack:
+        source, target = stack.pop()
+        if target is None:  # every child of ``source`` is rebuilt
+            on_path.discard(id(source))
+            continue
+        if id(source) in on_path:
+            raise ContractLoadError(
+                "contract_load_failed",
+                "the contract contains itself through a YAML alias, so it cannot be "
+                "loaded (the engine's loader fails on it too)",
+            )
+        on_path.add(id(source))
+        stack.append((source, None))
+        items = source.items() if isinstance(source, dict) else enumerate(source)
+        for key, value in items:
+            child = value
+            if isinstance(value, (dict, list)):
+                child = {} if isinstance(value, dict) else []
+                stack.append((value, child))
+            if isinstance(target, dict):
+                target[key] = child
+            else:
+                target.append(child)
+    return root
 
 
 def _replay_overlay(
@@ -451,12 +533,30 @@ def _is_syntax_error(exc: BaseException) -> bool:
     return any(isinstance(e, syntax) for e in _cause_chain(exc))
 
 
+#: How the loader words its root checks (``_parse_file``,
+#: ``parse_contract_text``, ``load_with_overlay``, ``load_overlay_document``),
+#: each a plain ``ValueError``. Only these mean ``contract_not_a_mapping``:
+#: other plain ``ValueError``s reach the loader too (``Path.resolve`` on a
+#: ``$ref`` holding a NUL byte), and are not about the root.
+_ROOT_CHECK_MESSAGES: Tuple[str, ...] = (
+    "YAML root must be an object/dict",
+    "Overlay root must be an object/dict",
+    "contract root must be an object/dict",
+)
+
+
+def _is_root_check(exc: BaseException) -> bool:
+    """True when the loader refused a contract or overlay root that is not an object."""
+    return any(
+        type(e) is ValueError and str(e).startswith(_ROOT_CHECK_MESSAGES) for e in _cause_chain(exc)
+    )
+
+
 def _parse_error(exc: BaseException) -> ContractLoadError:
     """:func:`loader.parse_contract_text`'s failure as a typed error."""
-    if _is_syntax_error(exc) or not any(isinstance(e, ValueError) for e in _cause_chain(exc)):
-        return ContractLoadError("contract_parse_failed", str(exc))
-    # The parser's only other ValueError: a root that is not an object.
-    return ContractLoadError("contract_not_a_mapping", str(exc))
+    if not _is_syntax_error(exc) and _is_root_check(exc):
+        return ContractLoadError("contract_not_a_mapping", str(exc))
+    return ContractLoadError("contract_parse_failed", str(exc))
 
 
 def _as_load_error(exc: BaseException, path: Path) -> ContractLoadError:
@@ -475,11 +575,7 @@ def _as_load_error(exc: BaseException, path: Path) -> ContractLoadError:
         return ContractLoadError("contract_ref_unresolved", str(exc), path=path)
     if _is_syntax_error(exc):
         return ContractLoadError("contract_parse_failed", str(exc), path=path)
-    if any(type(e) is ValueError for e in _cause_chain(exc)):
-        # The loader's own plain ``ValueError``s are its root checks: "YAML
-        # root must be an object/dict" (``_parse_file``, for the contract or
-        # an overlay) and "Overlay root must be an object/dict". The text
-        # path maps the same condition through :func:`_parse_error`.
+    if _is_root_check(exc):
         return ContractLoadError("contract_not_a_mapping", str(exc), path=path)
     return ContractLoadError("contract_load_failed", str(exc), path=path)
 

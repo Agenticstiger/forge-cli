@@ -23,19 +23,22 @@ loaded.files      # (contract.fluid.yaml, parts/orders.yaml, overlays/prod.yaml)
 loaded.overlay    # Path(".../overlays/prod.yaml")
 ```
 
-`env` is an environment *name*, the grammar `fluid publish --env` accepts:
-letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 64
-characters. Anything else is refused before a file is read:
+`env` is an environment *name*, never a path. The engine turns `env` into
+overlay paths (`overlays/<env>.yaml`, `<env>.json`, …), so an env holding `..`
+or an absolute path would merge whichever `.yaml`/`.yml`/`.json` file it named
+into the returned contract. An env that is not a single path component is
+refused before a file is read:
 
 ```python
 load_contract("contracts/orders/contract.fluid.yaml", env="../../home/me/.docker/config")
 # ContractLoadError: contract_env_invalid
 ```
 
-The engine turns `env` into overlay paths (`overlays/<env>.yaml`, `<env>.json`,
-…), so without this check an env holding `..` or an absolute path would merge
-whichever `.yaml`/`.yml`/`.json` file it named into the returned contract. Pass
-`None` for no env; `""` is refused, not read as `None`.
+Refused: `""` (not read as `None`), `.`, `..`, anything holding `/`, `\` or a
+NUL byte, and an absolute or drive-qualified (`C:prod`) name. Every other
+string loads exactly as `fluid plan --env` loads it, including names `fluid
+publish --env` would not accept (`_staging`, `prod+eu`, a name longer than 64
+characters). Pass `None` for no env.
 
 A `fluid bundle` archive loads the same way, and is refused for an env it was
 not built for, as on the CLI:
@@ -156,7 +159,7 @@ references rather than `#/...` pointers in a contract that has overlays.
 Loads a contract file or a bundle through `fluid plan`'s own loader. `path` is
 resolved to an absolute path first, as `fluid plan` does. The CLI's gate on
 operator-typed paths (no `..`, no symlink) is not applied to `path`; a library
-caller chooses its own paths. `env` must be an environment name (see the
+caller chooses its own paths. `env` must be a single path component (see the
 example above) or `None`; anything else raises `contract_env_invalid`.
 
 ### `load_contract_from_text(text, *, suffix=".yaml", base_dir=None, overlay=None, logger=None) -> LoadedContract`
@@ -191,14 +194,14 @@ there is one, and the engine's exception as `__cause__`:
 
 | `event` | When |
 |---|---|
-| `contract_not_found` | The contract file does not exist. |
+| `contract_not_found` | The contract file does not exist, or `path` / `base_dir` cannot name a file (it holds a NUL byte). |
 | `contract_parse_failed` | The text is not valid JSON/YAML, is not UTF-8, or trips the YAML size/anchor guard. |
 | `contract_not_a_mapping` | The document (or overlay) root is not an object, from a file or from text. |
 | `contract_ref_unresolved` | A `$ref` target is missing, cyclic, blocked, or its pointer does not resolve. |
-| `contract_env_invalid` | `env` is not an environment name (it is a path, holds `/` or `..`, is empty, or is too long). |
+| `contract_env_invalid` | `env` is not a single path component: it is empty, `.` or `..`, holds `/`, `\` or NUL, or is absolute or drive-qualified. |
 | `contract_overlay_needs_base_dir` | In-memory form: `overlay` given for a document with file `$ref` values but no `base_dir`. |
 | `contract_not_serialisable` | Raised by `.digest`: the contract holds a value JSON cannot represent (an unquoted YAML date, a set, binary, a self-referencing alias). `fluid plan` cannot write it either; quote the value. |
-| `contract_load_failed` | Any other loader failure. |
+| `contract_load_failed` | Any other loader failure, including a document that contains itself through a YAML alias (the engine fails on it too). |
 | *engine event* | Passed through unchanged, e.g. `overlay_declared_but_missing`, `bundle_not_found` (a `.tgz` path that does not exist), `bundle_env_mismatch`, `bundle_manifest_invalid`. |
 
 ## Stability
@@ -220,9 +223,14 @@ How each form keeps that promise:
   fixed sequence: `$ref` resolution, the overlay merge and the auto-bundle
   step's decision to drop it, then the loader's rewrites by name. The tests
   pin them to the file form on the same fixtures, and a guard test parses the
-  engine loader's source and fails when it gains, loses or reorders a step
-  the in-memory forms replay. A new engine step therefore turns the build red
-  until the in-memory forms replay it too; it cannot drift in silently.
+  engine loader's source (`load_contract_with_overlay`) and fails when it
+  gains, loses or reorders a call that takes `contract` (positionally or by
+  keyword), or changes `contract` any other way (an assignment that is not a
+  known step, an item or attribute write, a method call, `del`). A new step
+  there turns the build red until the in-memory forms replay it too. The
+  guard reads that one function: a change inside a function it calls
+  (`load_with_overlay`, the `$ref` resolver, a rewrite itself) is caught only
+  where the fixtures exercise it.
 
 Do not import the helpers in `fluid_build._contract_loader` (for example
 `_normalize_contract_aliases` / `_normalize_singular_build_key`) to reproduce

@@ -36,7 +36,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -524,8 +524,10 @@ def test_non_mapping_inputs_fail_typed() -> None:
 # ── env is a name, never a path ─────────────────────────────────────────
 
 
-@pytest.mark.parametrize("shape", ["absolute", "parent", "empty", "separator"])
-def test_env_must_be_an_environment_name(ws: Path, shape: str) -> None:
+@pytest.mark.parametrize(
+    "shape", ["absolute", "parent", "empty", "separator", "backslash", "nul", "dot", "dotdot"]
+)
+def test_env_must_be_a_single_path_component(ws: Path, shape: str) -> None:
     """The engine builds overlay paths from ``env`` (``<dir>/<env>.json`` among
     them), so an absolute or ``..`` env would merge a file from anywhere into
     the returned contract. The API refuses it before reading a file."""
@@ -538,6 +540,10 @@ def test_env_must_be_an_environment_name(ws: Path, shape: str) -> None:
         "parent": "../elsewhere/creds",
         "empty": "",
         "separator": "prod/eu",
+        "backslash": "..\\elsewhere\\creds",
+        "nul": "prod\x00",
+        "dot": ".",
+        "dotdot": "..",
     }[shape]
 
     with pytest.raises(ContractLoadError) as err:
@@ -547,11 +553,21 @@ def test_env_must_be_an_environment_name(ws: Path, shape: str) -> None:
     assert err.value.path == contract_path.resolve()
 
 
-def test_a_valid_env_name_still_selects_its_overlay(ws: Path) -> None:
+# Names ``fluid plan --env`` loads although ``fluid publish --env`` refuses
+# them: the API refuses only what makes an env a path, so it loads them too.
+_ENVS_PLAN_LOADS = ("prod", "Prod.eu-1_a", "_staging", "prod+eu", "eu prod", "e" * 65)
+
+
+@pytest.mark.parametrize("env", _ENVS_PLAN_LOADS)
+def test_every_env_plan_loads_selects_its_overlay(ws: Path, env: str) -> None:
     contract_path = _write(ws, _CASES["composed"])
-    for env in ("prod", "Prod.eu-1_a"):
-        (contract_path.parent / "overlays" / f"{env}.yaml").write_text(_PROD_OVERLAY, "utf-8")
-        assert api.load_contract(contract_path, env=env).contract["name"] == "Orders (prod)"
+    (contract_path.parent / "overlays" / f"{env}.yaml").write_text(_PROD_OVERLAY, "utf-8")
+
+    loaded = api.load_contract(contract_path, env=env)
+
+    assert loaded.contract == load_contract_with_overlay(str(contract_path), env, LOG)
+    assert loaded.contract["name"] == "Orders (prod)"
+    assert loaded.overlay == (contract_path.parent / "overlays" / f"{env}.yaml").resolve()
 
 
 # ── the in-memory overlay follows the engine's auto-bundle step ─────────
@@ -632,18 +648,158 @@ def test_in_memory_overlay_logs_to_the_callers_logger() -> None:
     assert [getattr(r, "event", None) for r in records] == ["contract_overlay_not_applied"]
 
 
+# ── YAML aliases: shared in the parse, separate in the engine ───────────
+
+# The engine's ``$ref`` resolver rebuilds every dict and list of the base
+# contract, so a node a YAML alias shares is two objects by the time the
+# overlay merge and the rewrites change nodes in place. ``deepcopy`` keeps
+# the sharing; without ``base_dir`` the in-memory forms must break it too.
+_ALIASED: Dict[str, Dict[str, str]] = {
+    # The overlay patches one alias of a shared node.
+    "overlay_merge": {
+        "contract.fluid.yaml": _ALIASES + "extensions: {a: &x {k: 1}, b: *x}\n",
+        "overlays/prod.yaml": "extensions: {a: {k: 2}}\n",
+    },
+    # The alias rewrite changes ``exposes[0].binding``; its alias in an open
+    # block is not a binding, and the engine leaves it as written.
+    "alias_rewrite": {
+        "contract.fluid.yaml": _ALIASES.replace("    binding:\n", "    binding: &b\n")
+        + "extensions: {copy: *b}\n",
+        "overlays/prod.yaml": "name: Orders (prod)\n",
+    },
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_ALIASED))
+def test_in_memory_form_without_base_dir_unshares_yaml_aliases(ws: Path, shape: str) -> None:
+    contract_path = _write(ws, _ALIASED[shape])
+    text = contract_path.read_text("utf-8")
+    overlay = load_yaml_safe((contract_path.parent / "overlays" / "prod.yaml").read_text("utf-8"))
+    planned = _plan(contract_path, ws / "plan.json", "prod")["contract"]
+    from_file = api.load_contract(contract_path, env="prod")
+
+    from_text = api.load_contract_from_text(text, overlay=overlay)
+
+    assert from_file.contract == planned
+    assert from_text.contract == from_file.contract
+    assert from_text.digest == from_file.digest
+    if shape == "overlay_merge":
+        assert from_text.contract["extensions"] == {"a": {"k": 2}, "b": {"k": 1}}
+    else:
+        assert from_text.contract["exposes"][0]["binding"]["format"] == "iceberg"
+        assert from_text.contract["extensions"]["copy"]["format"] == "iceberg_table"
+    # No overlay at all: the rewrite alone must not reach the alias either.
+    assert api.load_contract_from_text(text).digest == api.load_contract(contract_path).digest
+
+
+def test_aliases_inside_an_overlay_stay_shared_as_in_the_engine(ws: Path) -> None:
+    """The engine parses an overlay file without the resolver, so sharing *inside*
+    the overlay survives the merge, and a rewrite reaches every alias of the
+    node it changes. The in-memory forms keep it the same way. (The base has
+    no ``exposes``, so the merge places the overlay's own node.)"""
+    contract_path = _write(
+        ws,
+        {
+            "contract.fluid.yaml": "id: x\nname: Orders\n",
+            "overlays/prod.yaml": (
+                "exposes:\n  - exposeId: e\n    binding: &b {platform: aws, format: kafka}\n"
+                "extensions: {copy: *b}\n"
+            ),
+        },
+    )
+    overlay = load_yaml_safe((contract_path.parent / "overlays" / "prod.yaml").read_text("utf-8"))
+    from_file = api.load_contract(contract_path, env="prod")
+
+    from_text = api.load_contract_from_text(contract_path.read_text("utf-8"), overlay=overlay)
+
+    assert from_file.contract["extensions"]["copy"]["format"] == "kafka_topic"
+    assert from_text.contract == from_file.contract
+    assert from_text.digest == from_file.digest
+
+
+def test_a_document_that_contains_itself_fails_as_the_engine_fails(ws: Path) -> None:
+    contract_path = _write(ws, {"contract.fluid.yaml": _ALIASES + "extensions: &e {self: *e}\n"})
+    with pytest.raises(ContractLoadError) as from_file:
+        api.load_contract(contract_path)
+
+    with pytest.raises(ContractLoadError) as from_text:
+        api.load_contract_from_text(contract_path.read_text("utf-8"))
+
+    assert from_file.value.event == "contract_load_failed"
+    assert from_text.value.event == from_file.value.event
+
+
+def test_unsharing_is_iterative_and_keeps_order() -> None:
+    deep: Dict[str, Any] = {}
+    node = deep
+    for _ in range(5000):  # far past the interpreter's recursion limit
+        node["n"] = {}
+        node = node["n"]
+    shared = {"z": 1, "a": [1, {"k": "v"}]}
+    document = {"id": "x", "deep": deep, "p": shared, "q": shared, "r": [shared, shared]}
+
+    copied = contract_api._unshare(document)
+
+    depth, node, original = 0, copied["deep"], deep
+    while node:  # walked, not compared: ``==`` itself recurses
+        assert node is not original and list(node) == ["n"]
+        depth, node, original = depth + 1, node["n"], original["n"]
+    assert depth == 5000
+    assert {k: v for k, v in copied.items() if k != "deep"} == {
+        k: v for k, v in document.items() if k != "deep"
+    }
+    assert list(copied) == list(document) and list(copied["p"]) == ["z", "a"]
+    containers = [copied["p"], copied["q"], copied["r"][0], copied["r"][1]]
+    assert len({id(c) for c in containers}) == 4
+    assert len({id(c["a"]) for c in containers}) == 4
+
+
 # ── the in-memory replay cannot fall behind the engine loader ───────────
 
 
-def _engine_post_load_steps() -> List[str]:
-    """Calls ``load_contract_with_overlay`` makes on ``contract``, in source order,
-    outside its bundle branch (the in-memory forms never load a bundle)."""
-    tree = ast.parse(inspect.getsource(_contract_loader.load_contract_with_overlay))
+_ENGINE_SOURCE = inspect.getsource(_contract_loader.load_contract_with_overlay)
+
+
+def _is_contract(node: ast.AST) -> bool:
+    return isinstance(node, ast.Name) and node.id == "contract"
+
+
+def _rooted_at_contract(node: ast.AST) -> bool:
+    while isinstance(node, (ast.Subscript, ast.Attribute)):
+        node = node.value
+    return _is_contract(node)
+
+
+def _callee(node: ast.Call) -> str:
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return func.id if isinstance(func, ast.Name) else ast.dump(func)
+
+
+def _engine_post_load_effects(source: str = _ENGINE_SOURCE) -> Tuple[List[str], List[str]]:
+    """What ``load_contract_with_overlay`` does to ``contract``, in source order,
+    outside its bundle branch (the in-memory forms never load a bundle).
+
+    Returns ``(steps, writes)``. ``steps``: every call handed ``contract``,
+    positionally or by keyword. ``writes``: every statement that changes
+    ``contract``, as the callee whose result is assigned to it, or as
+    ``<...>`` for any other change (an assignment from a non-call, an item or
+    attribute write, an augmented assignment, ``del``, a method call on it).
+    """
+    tree = ast.parse(source)
     function = tree.body[0]
     assert isinstance(function, ast.FunctionDef)
     steps: List[str] = []
+    writes: List[str] = []
 
-    class _Calls(ast.NodeVisitor):
+    def _record_write(target: ast.AST, value: Optional[ast.AST]) -> None:
+        if _is_contract(target):
+            writes.append(_callee(value) if isinstance(value, ast.Call) else "<assign>")
+        elif _rooted_at_contract(target):
+            writes.append("<item or attribute write>")
+
+    class _Effects(ast.NodeVisitor):
         def visit_If(self, node: ast.If) -> None:
             test = node.test
             if isinstance(test, ast.Call) and getattr(test.func, "id", "") == "_is_bundle_path":
@@ -652,12 +808,45 @@ def _engine_post_load_steps() -> List[str]:
 
         def visit_Call(self, node: ast.Call) -> None:
             self.generic_visit(node)  # inner calls first: they run first
-            if any(isinstance(a, ast.Name) and a.id == "contract" for a in node.args):
-                func = node.func
-                steps.append(func.attr if isinstance(func, ast.Attribute) else func.id)
+            func = node.func
+            if isinstance(func, ast.Attribute) and _rooted_at_contract(func.value):
+                writes.append(f"<method call {func.attr}>")
+            if any(_is_contract(a) for a in node.args) or any(
+                _is_contract(k.value) for k in node.keywords
+            ):
+                steps.append(_callee(node))
 
-    _Calls().visit(function)
-    return steps
+        def visit_Assign(self, node: ast.Assign) -> None:
+            self.generic_visit(node)
+            for target in node.targets:
+                _record_write(target, node.value)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            self.generic_visit(node)
+            _record_write(node.target, node.value)
+
+        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+            self.generic_visit(node)
+            _record_write(node.target, node.value)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            self.generic_visit(node)
+            if _rooted_at_contract(node.target):
+                writes.append("<augmented assignment>")
+
+        def visit_Delete(self, node: ast.Delete) -> None:
+            self.generic_visit(node)
+            if any(_rooted_at_contract(t) for t in node.targets):
+                writes.append("<del>")
+
+    _Effects().visit(function)
+    return steps, writes
+
+
+# The engine loads (``load_with_overlay``, or ``load_contract`` for a loader
+# without it), then runs the auto-bundle step and the rewrites.
+_EXPECTED_STEPS = ["_auto_bundle_if_needed", *contract_api._ENGINE_REWRITES]
+_EXPECTED_WRITES = ["load_with_overlay", "load_contract", *_EXPECTED_STEPS]
 
 
 def test_in_memory_forms_replay_every_engine_loader_step() -> None:
@@ -665,12 +854,37 @@ def test_in_memory_forms_replay_every_engine_loader_step() -> None:
     (``_replay_overlay`` for the auto-bundle decision, then
     ``_ENGINE_REWRITES`` by name). A step added to, removed from or moved in
     the engine fails here until the in-memory forms follow it."""
-    assert _engine_post_load_steps() == [
-        "_auto_bundle_if_needed",
-        *contract_api._ENGINE_REWRITES,
-    ]
+    assert _engine_post_load_effects() == (_EXPECTED_STEPS, _EXPECTED_WRITES)
     for name in contract_api._ENGINE_REWRITES:
         assert callable(getattr(_contract_loader, name))
+
+
+@pytest.mark.parametrize(
+    "added",
+    [
+        "contract = _normalize_new(contract)",
+        "contract = resolve_contract_env_templates(value=contract)",
+        "_mutate_in_place(contract=contract)",
+        "contract = {**contract, 'x': 1}",
+        "contract = dict(contract, x=1)",
+        "contract['x'] = 1",
+        "contract['a']['b'] = 1",
+        "contract.update(x=1)",
+        "contract['a'].setdefault('b', 1)",
+        "contract |= {'x': 1}",
+        "del contract['x']",
+        "_ = (contract := {})",
+        "contract: dict = {}",
+    ],
+)
+def test_the_step_guard_sees_every_way_the_engine_can_change_the_contract(added: str) -> None:
+    """Negative control for the guard above: the engine's real source, with one
+    more change to ``contract`` before it returns, no longer matches."""
+    head, sep, tail = _ENGINE_SOURCE.rpartition("    return contract\n")
+    assert sep, "the engine loader no longer ends with `return contract`"
+    mutated = f"{head}    {added}\n{sep}{tail}"
+
+    assert _engine_post_load_effects(mutated) != (_EXPECTED_STEPS, _EXPECTED_WRITES)
 
 
 # ── typed failures, file form ───────────────────────────────────────────
@@ -695,6 +909,38 @@ def test_a_list_root_overlay_is_contract_not_a_mapping(ws: Path) -> None:
     with pytest.raises(ContractLoadError) as err:
         api.load_contract(contract_path, env="prod")
     assert err.value.event == "contract_not_a_mapping"
+
+
+def test_a_plain_value_error_that_is_not_a_root_check_is_contract_load_failed(
+    tmp_path: Path,
+) -> None:
+    """``Path.resolve`` raises a plain ``ValueError`` for a ``$ref`` holding a NUL
+    byte. Only the loader's root checks mean ``contract_not_a_mapping``."""
+    contract_path = tmp_path / "contract.fluid.yaml"
+    contract_path.write_text('id: x\nname: base\nmeta: {"$ref": "./a\\0b.yaml"}\n', "utf-8")
+
+    with pytest.raises(ContractLoadError) as from_file:
+        api.load_contract(contract_path)
+    with pytest.raises(ContractLoadError) as from_dict:
+        api.load_contract_from_dict(
+            {"id": "x", "meta": {"$ref": "./a\x00b.yaml"}}, base_dir=tmp_path
+        )
+
+    assert from_file.value.event == "contract_load_failed"
+    assert from_dict.value.event == "contract_load_failed"
+    assert isinstance(from_file.value.__cause__, ValueError)
+
+
+def test_a_path_no_file_can_have_is_contract_not_found(tmp_path: Path) -> None:
+    with pytest.raises(ContractLoadError) as from_path:
+        api.load_contract(f"{tmp_path}/c\x00.fluid.yaml")
+    with pytest.raises(ContractLoadError) as from_base_dir:
+        api.load_contract_from_dict({"id": "x"}, base_dir=f"{tmp_path}/d\x00")
+
+    for err in (from_path, from_base_dir):
+        assert err.value.event == "contract_not_found"
+        assert err.value.path is None
+        assert isinstance(err.value.__cause__, ValueError)
 
 
 def test_a_file_that_is_not_utf8_is_contract_parse_failed(tmp_path: Path) -> None:
