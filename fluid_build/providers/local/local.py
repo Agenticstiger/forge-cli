@@ -44,6 +44,7 @@ from fluid_build.providers._duckdb_sandbox import (
     is_sandbox_refusal,
     sandbox_refusal_hint,
     secure_duckdb_connect,
+    unaliased_dir,
 )
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderMetadata
@@ -267,6 +268,8 @@ class LocalProvider(BaseProvider):
         location the actions declare: an input file, an output file, an
         ``s3://`` prefix. A contract's SQL that names any other path,
         ``/etc/passwd`` or ``~/.aws/credentials``, is refused by DuckDB.
+        ``./runtime`` is left out when it is a symlink that leads outside the
+        contract's directory and workspace (:func:`unaliased_dir`).
 
         A declared location is granted only inside those directories (plus
         the upstream roots in ``FLUID_UPSTREAM_CONTRACTS`` and the operator's
@@ -281,13 +284,22 @@ class LocalProvider(BaseProvider):
 
         session = getattr(self, "_session_db", None)
         scratch = Path(session).parent if session else None
-        runtime = Path("runtime").resolve()
         # Without a contract directory (a bare ``apply`` of actions), the
         # working directory stands in for it, as it does for relative paths.
         anchor = self.anchor_dir if self.anchor_dir is not None else Path.cwd()
         # A contract inside a FLUID workspace (``fluid.workspace.yaml``) may
         # read its sibling products' files by path, as consumes[] does.
         workspace = find_workspace_root(self.anchor_dir) if self.anchor_dir is not None else None
+        # ``./runtime`` is in the working directory, usually the contract's
+        # own, so the contract's repository can ship it as a symlink
+        # (``runtime -> ../../..``). Granted only where its name says it is, or
+        # inside the contract's directory or workspace; otherwise not at all.
+        runtime = unaliased_dir("runtime", within=[anchor, workspace])
+        if runtime is None:
+            self._log_warn(
+                "local_runtime_not_granted",
+                {"runtime": str(Path("runtime").absolute()), "reason": "symlink_leads_out"},
+            )
         allow = DuckDBAllowlist.none().with_dirs(self.anchor_dir, workspace, runtime, scratch)
         within = [anchor, runtime, scratch, *collect_search_roots(workspace)]
         for spec in specs:

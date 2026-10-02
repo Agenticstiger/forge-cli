@@ -343,17 +343,113 @@ def test_acquisition_reads_its_declared_source_and_nothing_beside_it(layout, mon
     finally:
         con.close()
 
-    # The source glob grants the files it matches, not the landing directory.
+    # The source glob grants the operator-allowed landing directory it names,
+    # and nothing outside it.
     from fluid_build.build_runners.duckdb.runner import _run_allowlist, _run_streams
 
-    (landing / "notes.txt").write_text(f"{SECRET}\n", encoding="utf-8")
     src = secure_duckdb_connect(allow=_run_allowlist(ctx, _run_streams(ctx)))
     try:
         assert src.execute(f"SELECT count(*) FROM read_csv('{landing}/*.csv')").fetchone() == (1,)
         with pytest.raises(duckdb.PermissionException):
-            src.execute(f"SELECT content FROM read_text('{landing}/notes.txt')")
+            src.execute(f"SELECT content FROM read_text('{layout['outside']}/secret.csv')")
     finally:
         src.close()
+
+
+@pytest.mark.parametrize(
+    "arrival",
+    [
+        # macOS writes AppleDouble '._x' files on exFAT / SMB volumes; DuckDB's
+        # glob matches them, Python's glob does not.
+        pytest.param("._orders.csv", id="dotfile"),
+        pytest.param("late.csv", id="lands_after_the_grant"),
+    ],
+)
+def test_an_operator_allowed_landing_glob_reads_every_file_duckdb_expands(
+    arrival, layout, monkeypatch
+):
+    """A glob granted as the files a grant-time listing found failed the whole
+    read on any file DuckDB's own expansion adds: a dotfile, or a file that
+    landed between building the allowlist and running the query."""
+    from fluid_build.build_runners._acquisition_common import build_acquisition_run_context
+    from fluid_build.build_runners.duckdb.runner import (
+        _run_allowlist,
+        _run_streams,
+        execute_duckdb_build,
+    )
+
+    landing = layout["tmp"] / "landing"
+    landing.mkdir()
+    (landing / "orders.csv").write_text("id,amount\n1,10\n", encoding="utf-8")
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(landing))
+    out = layout["contract_dir"] / "out" / "orders.parquet"
+    contract = _acquisition_contract(str(landing / "*.csv"), out)
+
+    if arrival.startswith("."):
+        (landing / arrival).write_text("id,amount\n2,20\n", encoding="utf-8")
+        assert execute_duckdb_build(contract["builds"][0], contract, layout["contract_dir"]) == 0
+        assert duckdb.connect().execute(f"SELECT count(*) FROM '{out}'").fetchone() == (2,)
+        return
+
+    ctx = build_acquisition_run_context(contract["builds"][0], contract, layout["contract_dir"])
+    con = secure_duckdb_connect(allow=_run_allowlist(ctx, _run_streams(ctx)))
+    try:
+        (landing / arrival).write_text("id,amount\n2,20\n", encoding="utf-8")
+        assert con.execute(f"SELECT count(*) FROM read_csv('{landing}/*.csv')").fetchone() == (2,)
+    finally:
+        con.close()
+
+
+def test_a_sqlite_source_outside_the_allowed_directories_is_refused(layout, monkeypatch):
+    """The sqlite scanner opens files through its own library, which DuckDB's
+    allowlist never bounds, so the declared source path was attached wherever
+    it pointed: any SQLite file on the host could be landed."""
+    import sqlite3
+
+    from fluid_build.build_runners.duckdb.runner import execute_duckdb_build
+
+    try:
+        probe = duckdb.connect()
+        probe.execute("INSTALL sqlite; LOAD sqlite")
+        probe.close()
+    except duckdb.Error:
+        pytest.skip("the sqlite extension is not installable here (offline)")
+
+    def contract_for(db: Path, out: Path) -> Dict[str, Any]:
+        contract = _acquisition_contract("unused", out)
+        contract["builds"][0]["properties"]["source"] = {
+            "kind": "sqlite",
+            "connection": {"path": str(db)},
+            "streams": ["cookies"],
+            "mode": "full_refresh",
+        }
+        return contract
+
+    def seed(db: Path, value: str) -> None:
+        with sqlite3.connect(db) as seeded:
+            seeded.execute("CREATE TABLE cookies (v TEXT)")
+            seeded.execute("INSERT INTO cookies VALUES (?)", (value,))
+
+    cookies = layout["outside"] / "Cookies"  # the fixture's $HOME
+    seed(cookies, SECRET)
+    stolen = layout["contract_dir"] / "out" / "stolen.parquet"
+    contract = contract_for(cookies, stolen)
+    with pytest.raises(DuckDBSandboxError, match="FLUID_DUCKDB_ALLOWED_DIRS"):
+        execute_duckdb_build(contract["builds"][0], contract, layout["contract_dir"])
+    assert not stolen.exists()
+
+    # A sqlite file in the contract's directory still lands.
+    own = layout["contract_dir"] / "data" / "app.sqlite"
+    seed(own, "fine")
+    landed = layout["contract_dir"] / "out" / "own.parquet"
+    contract = contract_for(own, landed)
+    assert execute_duckdb_build(contract["builds"][0], contract, layout["contract_dir"]) == 0
+    assert duckdb.connect().execute(f"SELECT v FROM '{landed}'").fetchall() == [("fine",)]
+
+    # The operator can allow the directory the outside file sits in.
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(layout["outside"]))
+    contract = contract_for(cookies, stolen)
+    assert execute_duckdb_build(contract["builds"][0], contract, layout["contract_dir"]) == 0
 
 
 def test_a_sandbox_refusal_is_not_retried():
@@ -466,16 +562,23 @@ def test_a_symlink_in_the_contract_to_root_grants_nothing(layout, printed):
     assert SECRET not in "\n".join(printed)
 
 
-def test_an_operator_allowed_glob_grants_its_files_not_its_directory(
+def test_an_operator_allowed_glob_grants_nothing_outside_the_operators_directory(
     layout, home_secrets, printed, monkeypatch
 ):
-    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(home_secrets))
+    shared = home_secrets / "shared"
+    shared.mkdir()
+    (shared / "decoy.csv").write_text("a\n1\n", encoding="utf-8")
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(shared))
 
-    assert _build_declaring(layout, "SELECT * FROM d", f"{home_secrets}/decoy*.csv") == 0, printed
+    assert _build_declaring(layout, "SELECT * FROM d", f"{shared}/decoy*.csv") == 0, printed
     out = layout["contract_dir"] / "out" / "result.csv"
     assert out.read_text(encoding="utf-8").splitlines() == ["a", "1"]
 
-    assert _build_declaring(layout, _READ_CREDENTIALS, f"{home_secrets}/decoy*.csv") == 1
+    # $HOME holds the operator's directory; the glob does not grant $HOME.
+    assert _build_declaring(layout, _READ_CREDENTIALS, f"{shared}/decoy*.csv") == 1
+    assert SECRET not in _written_text(layout["contract_dir"])
+    # Nor does a glob whose directory is above the operator's.
+    assert _build_declaring(layout, _READ_CREDENTIALS, f"{home_secrets}/sha*/decoy.csv") == 1
     assert SECRET not in _written_text(layout["contract_dir"])
 
 
@@ -496,24 +599,132 @@ def test_a_declared_output_outside_the_contract_is_refused(layout, printed):
     assert not target.exists()
 
 
-def test_with_declared_confines_each_glob_match(tmp_path, monkeypatch):
-    """A match that is a symlink out of the roots is refused, not granted."""
+def test_a_declared_glob_cannot_read_through_a_matched_symlink(tmp_path, monkeypatch):
+    """A glob grants its directory; a file in it that is a symlink out of the
+    roots is refused by DuckDB, which checks each expanded file's realpath."""
     monkeypatch.delenv("FLUID_DUCKDB_ALLOWED_DIRS", raising=False)
     root, outside = tmp_path / "root", tmp_path / "outside"
     (root / "data").mkdir(parents=True)
     outside.mkdir()
     (root / "data" / "a.csv").write_text("a\n1\n", encoding="utf-8")
-    (outside / "s.csv").write_text(f"s\n{SECRET}\n", encoding="utf-8")
+    (outside / "s.csv").write_text(f"a\n{SECRET}\n", encoding="utf-8")
 
     allow = DuckDBAllowlist.none().with_declared("data/*.csv", within=[root], base=root)
-    assert allow.paths == (f"{root}/data/*.csv", f"{root}/data/a.csv")
-    assert allow.dirs == ()
+    assert allow.dirs == (str(root / "data"),)
+    assert allow.paths == ()
     con = secure_duckdb_connect(allow=allow)
-    assert con.execute(f"SELECT * FROM read_csv('{root}/data/*.csv')").fetchall() == [(1,)]
+    try:
+        assert con.execute(f"SELECT * FROM read_csv('{root}/data/*.csv')").fetchall() == [(1,)]
+        (root / "data" / "b.csv").symlink_to(outside / "s.csv")
+        for sql in (
+            f"SELECT * FROM read_csv('{root}/data/*.csv')",
+            f"SELECT * FROM read_csv('{root}/data/b.csv')",
+        ):
+            with pytest.raises(duckdb.PermissionException):
+                con.execute(sql).fetchall()
+    finally:
+        con.close()
 
-    (root / "data" / "b.csv").symlink_to(outside / "s.csv")
+    # A glob whose directory is itself a symlink out of the roots is refused.
+    (root / "away").symlink_to(outside)
     with pytest.raises(DuckDBSandboxError, match="outside the directories"):
-        DuckDBAllowlist.none().with_declared("data/*.csv", within=[root], base=root)
+        DuckDBAllowlist.none().with_declared("away/*.csv", within=[root], base=root)
+
+
+def test_a_glob_over_many_files_grants_one_directory(tmp_path, monkeypatch):
+    """Granting each match made the allowlist quadratic in the file count and
+    rebuilt it on every action's connection (20,000 files: ~15 s each)."""
+    monkeypatch.delenv("FLUID_DUCKDB_ALLOWED_DIRS", raising=False)
+    for part in range(20):
+        day = tmp_path / "data" / f"dt={part}"
+        day.mkdir(parents=True)
+        for i in range(100):
+            (day / f"part-{i}.csv").write_text("id\n1\n", encoding="utf-8")
+
+    allow = DuckDBAllowlist.none().with_declared(f"{tmp_path}/data/**/*.csv", within=[tmp_path])
+
+    assert allow.dirs == (str(tmp_path / "data"),)
+    assert allow.paths == ()
+
+
+def test_allowlist_entries_are_deduplicated_in_linear_time():
+    """De-duplicating against a tuple and a list was O(n^2)."""
+    import time
+
+    entries = [f"/data/f{i}.csv" for i in range(40_000)]
+    started = time.perf_counter()
+    added = sandbox._new(tuple(entries[:20_000]), [*entries, *entries])
+    elapsed = time.perf_counter() - started
+
+    assert added == tuple(entries[20_000:])
+    assert elapsed < 1.0, f"{elapsed:.1f}s to de-duplicate {len(entries)} entries"
+    allow = DuckDBAllowlist.none().with_paths(*entries[:100], *entries[:100])
+    assert allow.with_paths(*entries[:100]).paths == tuple(entries[:100])
+
+
+@pytest.mark.parametrize("target", ["../..", "{home}"])
+def test_a_symlinked_runtime_does_not_grant_where_it_points(target, tmp_path, monkeypatch, printed):
+    """``./runtime`` is in the working directory, the contract's own in the
+    usual ``cd product && fluid apply``, so the contract's repository could
+    ship ``runtime -> ../..`` and have DuckDB grant $HOME (it realpaths each
+    allowlist entry)."""
+    from fluid_build.build_runners.base import _execute_embedded_sql_build
+
+    home = tmp_path / "home"
+    (home / ".aws").mkdir(parents=True)
+    (home / ".aws" / "credentials").write_text(f"[default]\nkey = {SECRET}\n", encoding="utf-8")
+    contract_dir = home / "src" / "product"
+    contract_dir.mkdir(parents=True)
+    (contract_dir / "runtime").symlink_to(target.format(home=home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("FLUID_DUCKDB_ALLOWED_DIRS", raising=False)
+    monkeypatch.delenv("FLUID_UPSTREAM_CONTRACTS", raising=False)
+    monkeypatch.chdir(contract_dir)
+
+    out = contract_dir / "out" / "result.csv"
+    contract = _contract(_READ_CREDENTIALS, out)
+    assert _execute_embedded_sql_build(contract["builds"][0], contract, contract_dir) == 1
+    assert not out.exists() or SECRET not in out.read_text(encoding="utf-8")
+    assert SECRET not in "\n".join(printed)
+
+    # The local provider's other DuckDB call site (ducksql.apply_sql), too.
+    from fluid_build.providers.local import ducksql
+
+    granted: List[DuckDBAllowlist] = []
+
+    def capture(database: Any = ":memory:", *, allow: DuckDBAllowlist, **kwargs: Any) -> Any:
+        granted.append(allow)
+        return secure_duckdb_connect(database, allow=allow, **kwargs)
+
+    monkeypatch.setattr(ducksql, "secure_duckdb_connect", capture)
+    assert ducksql.apply_sql([]) == []
+    con = secure_duckdb_connect(allow=granted[0])
+    try:
+        with pytest.raises(duckdb.PermissionException):
+            con.execute(_READ_CREDENTIALS).fetchall()
+    finally:
+        con.close()
+
+    # The same build without the symlink still writes its own output.
+    (contract_dir / "runtime").unlink()
+    contract = _contract("SELECT 1 AS a", out)
+    assert _execute_embedded_sql_build(contract["builds"][0], contract, contract_dir) == 0
+
+
+def test_a_runtime_symlink_inside_the_contract_is_still_granted(tmp_path, monkeypatch):
+    from fluid_build.providers._duckdb_sandbox import unaliased_dir
+    from fluid_build.providers.local.local import LocalProvider
+
+    contract_dir = tmp_path / "product"
+    (contract_dir / "build" / "runtime").mkdir(parents=True)
+    (contract_dir / "runtime").symlink_to("build/runtime")
+    monkeypatch.chdir(contract_dir)
+    monkeypatch.delenv("FLUID_DUCKDB_ALLOWED_DIRS", raising=False)
+
+    assert unaliased_dir("runtime") is None
+    assert unaliased_dir("runtime", within=[contract_dir]) == str(contract_dir / "runtime")
+    provider = LocalProvider(project="local", region="local", anchor_dir=contract_dir)
+    assert str(contract_dir / "runtime") in provider._allowlist([]).dirs
 
 
 @pytest.mark.parametrize("entry", ["relative/dir", "/"])
@@ -845,13 +1056,10 @@ def test_declared_locations_grant_the_narrowest_thing(tmp_path):
         "gs://whole-bucket",
         "s3://b2/*.parquet",
     )
-    # A glob grants its own pattern and what it matches (nothing yet), never
-    # the directory above its first wildcard.
-    assert allow.paths == (
-        str(tmp_path / "file.csv"),
-        f"{tmp_path}/landing/*/part-*.parquet",
-    )
-    assert allow.dirs == (str(tmp_path / "dir"),)
+    # A glob grants the directory above its first wildcard: DuckDB's own
+    # expansion adds files a listing now would miss (dotfiles, later arrivals).
+    assert allow.paths == (str(tmp_path / "file.csv"),)
+    assert allow.dirs == (str(tmp_path / "dir"), str(tmp_path / "landing"))
     assert allow.remote_prefixes == (
         "s3://bucket/bronze/orders/",
         "https://host/data/",

@@ -56,7 +56,11 @@ from fluid_build.api.runner import (
 )
 from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.source import AcquisitionMode
-from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
+from fluid_build.providers._duckdb_sandbox import (
+    DuckDBAllowlist,
+    confine_declared,
+    secure_duckdb_connect,
+)
 from fluid_build.providers._sql_safety import (
     build_libpq_dsn,
     quote_ansi_string_literal,
@@ -578,10 +582,11 @@ def _grant_source(allow: DuckDBAllowlist, ctx: RunContext, streams: List[str]) -
     """``allow`` plus where a filesystem / http source reads from.
 
     A database source needs no grant: postgres is scanned through its DSN, and
-    mysql / sqlite are attached before the lock (``_attach_external_databases``).
+    mysql / sqlite are attached before the lock (``_attach_external_databases``),
+    a sqlite file only inside :func:`_declared_roots` (``confine_declared``).
     A local source is granted only inside :func:`_declared_roots` (a glob as
-    the files it matches): the contract names it, so naming ``~/.ssh/*`` must
-    not make it readable.
+    the directory above its first wildcard): the contract names it, so naming
+    ``~/.ssh/*`` must not make it readable.
     """
     if ctx.source.kind not in {"filesystem", "http"}:
         return allow
@@ -730,6 +735,11 @@ class DuckdbRunner:
         Best-effort: if the connection DSN is malformed or the upstream
         is unreachable, the ATTACH raises and the runner surfaces the
         error in the per-stream try/except.
+
+        A sqlite file is confined to :func:`_declared_roots` plus the
+        operator's ``FLUID_DUCKDB_ALLOWED_DIRS`` first, and refused with
+        ``DuckDBSandboxError`` outside them: the sqlite scanner is not bounded
+        by the sandbox's allowlist, so nothing else would stop it.
         """
         kind = ctx.source.kind
         if kind in ("mysql", "mariadb"):
@@ -749,8 +759,14 @@ class DuckdbRunner:
             path = conn.get("uri") or conn.get("path") or conn.get("database") or ""
             if not path:
                 raise ValueError("sqlite source requires connection.uri, .path, or .database")
+            # The sqlite scanner opens the file through its own client library,
+            # which allowed_directories never bounds: this confinement is the
+            # only check on it. Without it a contract could land any SQLite
+            # file on the host (a browser's cookie store, another app's data).
+            # The checked realpath is what is attached.
+            real = confine_declared(str(path), within=_declared_roots(ctx))
             alias = _sqlite_alias_for_build(ctx.build_id)
-            con.execute(f"ATTACH {quote_ansi_string_literal(str(path))} AS {alias} (TYPE sqlite)")
+            con.execute(f"ATTACH {quote_ansi_string_literal(real)} AS {alias} (TYPE sqlite)")
 
 
 def _select_for_first_stream(ctx: RunContext) -> str:

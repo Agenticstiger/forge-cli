@@ -37,7 +37,7 @@ The same SQL reading the contract's own data builds as before:
 | Where the SQL runs | It can read and write |
 |---|---|
 | Embedded-SQL build on the local DuckDB engine (`builds[].properties.sql`) | the contract's directory, the FLUID workspace it sits in (`fluid.workspace.yaml`), `./runtime`, the run's scratch directory, each declared `parameters.inputs[].path`, each resolved `consumes[]` upstream, the expose's landing path, and the `s3://` prefixes those name. A declared local path counts only [inside the allowed directories](#declared-locations-stay-inside-the-allowed-directories) |
-| DuckDB acquisition build (`pattern: acquisition`, `engine: duckdb`) | the contract's directory, the declared `source.connection.uri` (or stream paths), and each stream's landing file, each inside the allowed directories; a `mysql` / `sqlite` source is attached before the sandbox closes |
+| DuckDB acquisition build (`pattern: acquisition`, `engine: duckdb`) | the contract's directory, the declared `source.connection.uri` (or stream paths), and each stream's landing file, each inside the allowed directories. A `mysql` source is attached before the sandbox closes; so is a `sqlite` source, and its file must also be inside the allowed directories |
 | `fluid validate` quality rules, `fluid verify`, `fluid diff` | the one file being checked |
 | `fluid contract-tests` local actions | each declared input file and each output file |
 | Discovery (`fluid forge data-model from-source`, `discover`) | the one file or URL being introspected; a JDBC source is attached first |
@@ -66,7 +66,9 @@ writes the contract writes the declarations. So a declaration grants a local
 path only inside these directories:
 
 - the contract's directory and the FLUID workspace it sits in;
-- `./runtime` and the run's scratch directory;
+- `./runtime` and the run's scratch directory (`./runtime` only when it is a
+  real directory, or a symlink into the contract's directory or workspace; see
+  below);
 - the upstream roots in `FLUID_UPSTREAM_CONTRACTS`;
 - the directories the operator lists in `FLUID_DUCKDB_ALLOWED_DIRS`.
 
@@ -97,17 +99,35 @@ relative declared path is resolved where DuckDB opens it, the working
 directory, and is confined the same way, so `path: ./*.py` cannot grant a
 server's working directory.
 
+`./runtime` is granted by convention, not by a declaration, and it sits in the
+working directory, which is usually the contract's own. A repository that
+ships `runtime` as a symlink out of itself (`runtime -> ../../..`, which is
+`$HOME` for a clone at `~/src/repo/product`) does not get that directory
+granted: the symlink is ignored with a `local_runtime_not_granted` warning, and
+SQL that reads or writes under it is refused.
+
+A SQLite source (`source.kind: sqlite`) is confined the same way, and refused
+with the same `FLUID_DUCKDB_ALLOWED_DIRS` message outside the allowed
+directories. This check is the only one on it: the sqlite scanner opens the
+file through its own library, which DuckDB's allowlist does not bound.
+
 What a declaration grants, once allowed:
 
 | Declared | Granted |
 |---|---|
 | a file (`/shared/reference/rates.csv`) | that file |
-| a glob (`data/*.csv`, `landing/**/*.parquet`) | the pattern and the files it matches when the run starts; not the directory |
+| a glob (`data/*.csv`, `landing/**/*.parquet`) | the directory above its first wildcard (`data/`, `landing/`), which must itself be inside the allowed directories |
 | a directory (`data/`) | everything under it |
 | an `s3://` URL | its prefix (see the limits below) |
 
-A glob's files are checked one by one, so a matched symlink that points
-outside the allowed directories is refused.
+A glob grants its directory, not the files it matches when the run starts,
+because DuckDB expands it again when the SQL runs: that expansion includes
+dotfiles (macOS `._orders.csv` on an exFAT or SMB volume) and files that landed
+after the run started, and DuckDB refuses the whole read if any one of them is
+not granted. The directory is no wider than the declaration could already be:
+everything inside the allowed directories is declarable. DuckDB checks each
+expanded file after resolving symlinks, so a matched symlink that points
+outside the directory is refused.
 
 ### Reading a file outside the contract's directory
 
@@ -129,7 +149,7 @@ $ fluid apply contract.fluid.yaml --mode amend-and-build --yes
 
 The declared file becomes readable. Its neighbours in `/shared/reference` do
 not, unless the contract declares them too (or declares a glob or the
-directory, which grant what the table above says). `FLUID_DUCKDB_ALLOWED_DIRS`
+directory, which grant `/shared/reference` itself, as the table above says). `FLUID_DUCKDB_ALLOWED_DIRS`
 is read from the environment of the process that runs the engine; no contract
 field can set it. A relative entry, or `/`, is refused.
 
@@ -176,7 +196,8 @@ guide gives.
   `allowed_directories` nor `enable_external_access` limits them. On a
   connection that loads `sqlite` (an acquisition build with a SQLite source),
   `sqlite_scan` and `ATTACH ... (TYPE sqlite)` can open any SQLite file the
-  process can read. On one that loads `postgres`, `postgres_scan` can connect
+  process can read; the declared source file itself is confined before it is
+  attached (see above). On one that loads `postgres`, `postgres_scan` can connect
   to any host the process can reach, the Command Center's own database
   included. The engine loads them only for an acquisition build's declared
   source, discovery and the copilot's sample-rows tool, whose SQL the engine

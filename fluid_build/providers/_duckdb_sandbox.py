@@ -68,8 +68,16 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
   (:data:`OPERATOR_DIRS_ENV`); a contract field cannot widen that. Both sides
   are compared after ``realpath``, because DuckDB realpaths allowlist entries
   too: an in-repo symlink to ``/`` would otherwise grant the host. A glob is
-  granted as its own pattern plus the files it matches, never the directory
-  above its first wildcard.
+  granted as the directory above its first wildcard, which must itself resolve
+  inside those roots: the contract could declare any file there anyway, and
+  DuckDB expands a glob to files a grant-time listing would miss (dotfiles,
+  files that land after the grant), then checks each one's realpath against
+  the directory, so a matched symlink that leads out is refused at read time.
+* A directory the engine grants by convention rather than by declaration
+  (the local provider's ``./runtime``) sits in a working directory the
+  contract's repository may supply, so it may be a symlink to ``$HOME``.
+  :func:`unaliased_dir` grants it only where its name says it is, or inside
+  the call site's roots.
 * Autoloading is off, so a function from an extension the call site did not
   load (``sqlite_scan``, ``read_xlsx``, ``ST_Read``, ``delta_scan``,
   ``iceberg_scan``) is not in the catalog. :func:`is_sandbox_refusal` treats
@@ -99,7 +107,6 @@ References:
 
 from __future__ import annotations
 
-import glob as _glob
 import os
 import re
 from dataclasses import dataclass
@@ -181,17 +188,17 @@ class DuckDBAllowlist:
 
     def with_dirs(self, *dirs: Optional[PathLike]) -> "DuckDBAllowlist":
         """Also allow everything under each directory in ``dirs`` (``None`` skipped)."""
-        added = _new(self.dirs, (_local(d) for d in dirs if d is not None and str(d) != ""))
+        added = _new(self.dirs, (d for d in dirs if d is not None and str(d) != ""), _local)
         return DuckDBAllowlist(self.dirs + added, self.paths, self.remote_prefixes)
 
     def with_paths(self, *paths: Optional[PathLike]) -> "DuckDBAllowlist":
         """Also allow each single file in ``paths`` (``None`` skipped)."""
-        added = _new(self.paths, (_local(p) for p in paths if p is not None and str(p) != ""))
+        added = _new(self.paths, (p for p in paths if p is not None and str(p) != ""), _local)
         return DuckDBAllowlist(self.dirs, self.paths + added, self.remote_prefixes)
 
     def with_remote(self, *prefixes: Optional[str]) -> "DuckDBAllowlist":
         """Also allow each URL prefix (``s3://bucket/``, ``https://host/data/``)."""
-        added = _new(self.remote_prefixes, (_remote(p) for p in prefixes if p))
+        added = _new(self.remote_prefixes, (p for p in prefixes if p), _remote)
         return DuckDBAllowlist(self.dirs, self.paths, self.remote_prefixes + added)
 
     def with_locations(
@@ -202,11 +209,11 @@ class DuckDBAllowlist:
         For a location the operator names (a ``fluid discover`` argument); a
         location a CONTRACT declares goes through :meth:`with_declared`, which
         also confines it. A URL grants its directory prefix (cut before any
-        glob); a local glob grants its own pattern and the files it matches
-        now; an existing directory grants itself; anything else grants that
-        one file. A leading ``~`` is expanded as DuckDB expands it, and a
-        relative local path is resolved against ``base`` (else the working
-        directory, where DuckDB would resolve it).
+        glob); a local glob grants the directory above its first wildcard; an
+        existing directory grants itself; anything else grants that one file.
+        A leading ``~`` is expanded as DuckDB expands it, and a relative local
+        path is resolved against ``base`` (else the working directory, where
+        DuckDB would resolve it).
         """
         out = self
         for location in locations:
@@ -242,10 +249,11 @@ class DuckDBAllowlist:
         one of ``within`` (the call site's own roots, such as the contract's
         directory and its workspace) or a directory the operator lists in
         ``FLUID_DUCKDB_ALLOWED_DIRS``; anything else raises
-        :class:`DuckDBSandboxError`. A glob is granted as its pattern plus the
-        files it matches, each of which must resolve inside those roots too (a
-        matched symlink cannot reach out). A relative path is resolved against
-        ``base``, else the working directory, which is where DuckDB opens it.
+        :class:`DuckDBSandboxError`. A glob is granted as the directory above
+        its first wildcard, which must resolve inside those roots: everything
+        in it is declarable already, and DuckDB refuses a matched symlink that
+        leads out of it. A relative path is resolved against ``base``, else
+        the working directory, which is where DuckDB opens it.
         A URL is granted as :meth:`with_locations` grants it.
         """
         roots = _confinement_roots(within)
@@ -267,17 +275,15 @@ class DuckDBAllowlist:
         prefix, globbed = _static_prefix(path)
         if roots is not None:
             _confine(prefix, roots, declared)
-        if not globbed:
-            if Path(prefix).is_dir():
-                return self.with_dirs(prefix)
-            return self.with_paths(prefix)
-        # DuckDB checks the pattern itself, then each file it expands to: the
-        # pattern and today's matches are granted, the directory is not.
-        matches = sorted(m for m in _glob.glob(path, recursive=True) if not os.path.isdir(m))
-        if roots is not None:
-            for match in matches:
-                _confine(match, roots, declared)
-        return self.with_paths(path, *matches)
+        if globbed or Path(prefix).is_dir():
+            # A glob grants the directory above its first wildcard, not the
+            # files a listing finds now: DuckDB's own expansion includes
+            # dotfiles (``._x.csv``) and files that land after the grant, and
+            # checks every one, so a grant of only today's matches fails the
+            # whole read. With ``roots``, that directory is confined (above),
+            # and DuckDB refuses a file in it whose realpath leads out.
+            return self.with_dirs(prefix)
+        return self.with_paths(prefix)
 
 
 def _absolute(raw: str, base: Optional[PathLike]) -> str:
@@ -368,11 +374,73 @@ def _confine(candidate: str, roots: Tuple[str, ...], declared: str) -> None:
     )
 
 
-def _new(existing: Tuple[str, ...], candidates: Iterable[str]) -> Tuple[str, ...]:
-    """``candidates`` not already in ``existing``, in order, each once."""
+def confine_declared(
+    location: PathLike,
+    *,
+    within: Iterable[Optional[PathLike]],
+    base: Optional[PathLike] = None,
+) -> str:
+    """The ``realpath`` of a declared local ``location``, refused outside ``within``.
+
+    For a location the engine opens itself rather than grants to the SQL, such
+    as a SQLite source it ``ATTACH``es before the lock: the sqlite scanner opens
+    files through its own client library, so ``allowed_directories`` never
+    bounds it, and this check is the only one. Confined as
+    :meth:`DuckDBAllowlist.with_declared` confines (``within`` plus
+    ``FLUID_DUCKDB_ALLOWED_DIRS``); a relative ``location`` is resolved against
+    ``base``, else the working directory. Open the returned path, the one that
+    was checked.
+    """
+    raw = os.fspath(location)
+    absolute = _absolute(raw, base)
+    _confine(absolute, _confinement_roots(within), raw)
+    return os.path.realpath(absolute)
+
+
+def unaliased_dir(path: PathLike, *, within: Iterable[Optional[PathLike]] = ()) -> Optional[str]:
+    """``path`` as an absolute directory to grant, or ``None`` if it is an alias.
+
+    For a directory the engine grants by convention, not because the contract
+    declared it: the local provider's ``./runtime``. It is resolved in the
+    working directory, which is usually the contract's own, so the contract's
+    repository can ship ``runtime`` as a symlink (``runtime -> ../../..``) and,
+    because DuckDB realpaths allowlist entries, have ``$HOME`` granted. Returned
+    only when its realpath is where its name says it is (the realpath of its
+    parent, joined with its name) or inside one of ``within``; otherwise
+    ``None``, and the caller grants nothing for it.
+    """
+    lexical = os.path.normpath(os.path.abspath(os.fspath(path)))
+    real = os.path.realpath(lexical)
+    parent, name = os.path.split(lexical)
+    if real == os.path.join(os.path.realpath(parent), name):
+        return lexical
+    for root in within:
+        if root is None or str(root) == "":
+            continue
+        real_root = os.path.realpath(os.path.expanduser(os.fspath(root)))
+        if real_root != os.path.realpath(os.sep) and _is_within(real, real_root):
+            return lexical
+    return None
+
+
+def _new(
+    existing: Tuple[str, ...],
+    candidates: Iterable[Any],
+    normalize: Callable[[Any], str] = str,
+) -> Tuple[str, ...]:
+    """``candidates``, each ``normalize``-d, not already in ``existing``; in order, each once.
+
+    Linear: a glob or a long declaration list must not make the allowlist
+    quadratic. A candidate already granted verbatim is not normalised again.
+    """
+    seen = set(existing)
     out: list = []
-    for item in candidates:
-        if item not in existing and item not in out:
+    for raw in candidates:
+        if isinstance(raw, str) and raw in seen:
+            continue
+        item = normalize(raw)
+        if item not in seen:
+            seen.add(item)
             out.append(item)
     return tuple(out)
 
@@ -618,6 +686,7 @@ __all__ = [
     "OPERATOR_DIRS_ENV",
     "DuckDBAllowlist",
     "DuckDBSandboxError",
+    "confine_declared",
     "duckdb_version",
     "is_remote_location",
     "is_sandbox_refusal",
@@ -625,4 +694,5 @@ __all__ = [
     "operator_allowed_dirs",
     "sandbox_refusal_hint",
     "secure_duckdb_connect",
+    "unaliased_dir",
 ]

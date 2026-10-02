@@ -17,7 +17,7 @@ import pathlib
 
 from fluid_build.util.contract import get_expose_id, get_expose_kind, get_expose_location
 
-from .._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
+from .._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect, unaliased_dir
 from ..base import ApplyResult, PlanAction
 
 try:
@@ -50,9 +50,11 @@ def apply_sql(actions, dry_run=False):
     if duckdb is None:
         return [ApplyResult(False, "duckdb not installed. pip install duckdb", error="missing_dep")]
     # The SQL is the expose's own (contract input) and the CSV is written by
-    # pandas, so DuckDB reaches only the local workspace, ``./runtime``.
+    # pandas, so DuckDB reaches only the local workspace, ``./runtime``, and
+    # only when it is no symlink out of the working directory (a contract's
+    # repository could ship ``runtime -> ../../..`` to have $HOME granted).
     con = secure_duckdb_connect(
-        ":memory:", allow=DuckDBAllowlist.none().with_dirs(pathlib.Path("runtime").resolve())
+        ":memory:", allow=DuckDBAllowlist.none().with_dirs(unaliased_dir("runtime"))
     )
     for a in actions:
         if a.resource_type != "sql.to_csv":
