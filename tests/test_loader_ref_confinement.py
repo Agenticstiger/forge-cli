@@ -24,6 +24,7 @@ layout on disk and goes through the public loader entry points (or the real
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -32,6 +33,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from fluid_build import loader
 from fluid_build.loader import (
     REF_ROOT_ENV,
     RefConfinementError,
@@ -286,21 +288,29 @@ class TestRefRootOptIn:
         with pytest.raises(RefConfinementError):
             load_contract(contract)
 
-    def test_root_that_does_not_contain_the_contract_is_rejected(self, tmp_path, monkeypatch):
+    def test_ref_root_argument_that_does_not_contain_the_contract_is_rejected(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv(REF_ROOT_ENV, raising=False)
         contract = self._monorepo(tmp_path)
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
-        monkeypatch.setenv(REF_ROOT_ENV, str(elsewhere))
         with pytest.raises(RefResolutionError, match="the ref root must contain the contract"):
-            load_contract(contract)
+            load_contract(contract, ref_root=elsewhere)
 
-    def test_root_that_is_not_a_directory_is_rejected(self, tmp_path, monkeypatch):
+    def test_ref_root_argument_that_is_not_a_directory_is_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(REF_ROOT_ENV, raising=False)
         contract = self._monorepo(tmp_path)
-        with pytest.raises(RefResolutionError, match="is not a directory"):
+        with pytest.raises(RefResolutionError, match="ref_root=.* is not a directory"):
             load_contract(contract, ref_root=tmp_path / "missing")
-        monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path / "missing"))
-        with pytest.raises(RefResolutionError, match=f"{REF_ROOT_ENV}=.* is not a directory"):
-            load_contract(contract)
+
+    def test_ref_root_argument_wins_over_a_usable_env_var(self, tmp_path, monkeypatch):
+        contract = self._monorepo(tmp_path)
+        monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path))
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        with pytest.raises(RefResolutionError, match="the ref root must contain the contract"):
+            load_contract(contract, ref_root=elsewhere)
 
     def test_stale_env_var_does_not_break_ref_free_contracts(self, tmp_path, monkeypatch):
         monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path / "missing"))
@@ -312,6 +322,81 @@ class TestRefRootOptIn:
         monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path))
         with pytest.raises(RefConfinementError, match="is a URL"):
             load_contract(contract)
+
+
+# ---------------------------------------------------------------------------
+# FLUID_REF_ROOT is process-wide: it must not break contracts outside it
+# ---------------------------------------------------------------------------
+
+
+class TestEnvRootOutsideTheContract:
+    """A ``FLUID_REF_ROOT`` set once (a shell, a service container) applies to
+    every contract the process loads. One that does not contain the contract,
+    or is not a directory, is ignored for that contract with a WARNING, and
+    the contract gets the default root. ``ref_root=`` stays strict (above)."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_warning_state(self):
+        loader._NOTED_REF_ROOT_ENV_IGNORED.clear()
+        yield
+        loader._NOTED_REF_ROOT_ENV_IGNORED.clear()
+
+    @staticmethod
+    def _fragment_contract(tmp: Path) -> Path:
+        """A contract whose only ref stays in its own directory, like the
+        ``examples/0.7.1/bitcoin-multifile`` contract."""
+        proj = tmp / "uploads" / "c1"
+        _write(proj / "fragments" / "labels.yaml", {"team": "orders"})
+        return _contract(proj, "./fragments/labels.yaml")
+
+    @pytest.mark.parametrize("env_root", ["elsewhere", "missing"])
+    @pytest.mark.parametrize("entry", ["load_contract", "compile_contract", "load_with_overlay"])
+    def test_contract_outside_the_env_root_loads_with_the_default_root(
+        self, tmp_path, monkeypatch, caplog, entry, env_root
+    ):
+        (tmp_path / "elsewhere").mkdir()
+        contract = self._fragment_contract(tmp_path)
+        monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path / env_root))
+        with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+            result = getattr(loader, entry)(contract)
+        assert result["labels"] == {"team": "orders"}
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert [getattr(r, "event", None) for r in warnings] == ["ref_root_env_ignored"]
+        message = warnings[0].getMessage()
+        assert f"{REF_ROOT_ENV}=" in message
+        assert str(contract.resolve().parent) in message
+
+    def test_fallback_is_the_default_root_not_a_wider_one(self, tmp_path, monkeypatch):
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        _write(tmp_path / "outside" / "secret.yaml", {"api_key": SECRET})
+        contract = _contract(tmp_path / "proj", "../outside/secret.yaml")
+        monkeypatch.setenv(REF_ROOT_ENV, str(elsewhere))
+        with pytest.raises(RefConfinementError, match="escapes the ref root") as exc:
+            load_contract(contract)
+        assert Path(exc.value.root) == contract.resolve().parent
+        assert SECRET not in str(exc.value)
+
+    def test_warning_is_emitted_once_per_contract_and_value(self, tmp_path, monkeypatch, caplog):
+        (tmp_path / "elsewhere").mkdir()
+        contract = self._fragment_contract(tmp_path)
+        monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path / "elsewhere"))
+        with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+            load_contract(contract)
+            load_with_overlay(contract)
+            compile_contract(contract)
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert events.count("ref_root_env_ignored") == 1
+
+    def test_env_root_containing_the_contract_still_widens_without_warning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        _write(tmp_path / "shared" / "policy.yaml", {"classification": "Internal"})
+        contract = _contract(tmp_path / "products" / "orders", "../../shared/policy.yaml")
+        monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path))
+        with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+            assert load_contract(contract)["labels"] == {"classification": "Internal"}
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 # ---------------------------------------------------------------------------
@@ -385,3 +470,20 @@ class TestCli:
         contract = _write(proj / "contract.fluid.yaml", _VALID_CONTRACT)
         result = _fluid("validate", str(contract), cwd=proj, env_extra={REF_ROOT_ENV: str(tmp)})
         assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_env_root_elsewhere_does_not_break_a_contract_with_local_fragments(self, layout):
+        """``FLUID_REF_ROOT`` set for another tree (e.g. once, in a service
+        container) must not fail an unrelated contract whose refs stay in its
+        own directory."""
+        tmp, proj = layout
+        _write(proj / "fragments" / "labels.yaml", {"team": "orders"})
+        contract = _write(
+            proj / "contract.fluid.yaml",
+            {**_VALID_CONTRACT, "labels": {"$ref": "./fragments/labels.yaml"}},
+        )
+        result = _fluid(
+            "validate", str(contract), cwd=proj, env_extra={REF_ROOT_ENV: str(tmp / "outside")}
+        )
+        out = " ".join((result.stdout + result.stderr).split())
+        assert result.returncode == 0, out
+        assert "contract_load_failed" not in out

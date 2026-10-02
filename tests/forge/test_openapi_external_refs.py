@@ -108,3 +108,46 @@ def test_real_validator_never_reads_the_file(tmp_path):
     issues = validate_openapi("s.json", _spec(target.as_uri()), strict=False)
     assert [i.code for i in issues] == ["OAS-REF-EXTERNAL"]
     assert "12345" not in issues[0].message
+
+
+def _component_spec(schema: dict) -> bytes:
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "t", "version": "1"},
+        "paths": {},
+        "components": {"schemas": {"Doc": schema}},
+    }
+    return json.dumps(spec).encode()
+
+
+_EXTERNAL = "https://json-schema.org/draft/2020-12/schema"
+
+
+@pytest.mark.parametrize(
+    "schema, pointer",
+    [
+        # Data-valued positions: openapi-spec-validator 0.9.0 does not follow a
+        # ``$ref`` here. Still rejected, by a documented blanket rule (below).
+        ({"type": "object", "example": {"$ref": _EXTERNAL}}, "/components/schemas/Doc/example"),
+        ({"type": "object", "x-meta": {"$ref": _EXTERNAL}}, "/components/schemas/Doc/x-meta"),
+        # Schema positions that share those names: the validator DOES follow
+        # these, so skipping ``example`` / ``x-*`` keys by name would let them
+        # through to it.
+        (
+            {"type": "object", "properties": {"example": {"$ref": _EXTERNAL}}},
+            "/components/schemas/Doc/properties/example",
+        ),
+        (
+            {"type": "object", "properties": {"x-meta": {"$ref": _EXTERNAL}}},
+            "/components/schemas/Doc/properties/x-meta",
+        ),
+    ],
+    ids=["example-payload", "x-extension-payload", "property-named-example", "property-named-x"],
+)
+def test_ref_key_is_rejected_wherever_it_appears(fake_validator, schema, pointer):
+    """A ``$ref`` key anywhere in the fragment is an external ref
+    (docs/contract-refs.md, "OpenAPI fragments inside a bundle")."""
+    issues = validate_openapi("sources/openapi/x.json", _component_spec(schema), strict=False)
+    assert fake_validator == []
+    assert [i.code for i in issues] == ["OAS-REF-EXTERNAL"]
+    assert f"JSON pointer '{pointer}'" in issues[0].message

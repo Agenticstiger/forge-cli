@@ -107,17 +107,53 @@ contract = load_contract("repo/products/orders/contract.fluid.yaml", ref_root="r
 
 Rules for the wider root:
 
-- It must be an existing directory that contains the root contract. If it
-  does not, the command fails and names the setting it came from.
+- It widens the root only for a contract inside it, and only if it is an
+  existing directory.
+- `FLUID_REF_ROOT` applies to every contract the process loads, so it is
+  ignored for a contract outside it (or when it is not a directory). That
+  contract gets the default root, its own directory, and a warning says so:
+
+  ```bash
+  FLUID_REF_ROOT=repo fluid validate /tmp/upload-1234/contract.fluid.yaml
+  ```
+
+  ```text
+  ref_root_env_ignored: contract /tmp/upload-1234/contract.fluid.yaml is outside
+  FLUID_REF_ROOT='repo' (…); the ref root must contain the contract. Ignoring it
+  for this contract: its $refs are confined to the contract's own directory
+  /tmp/upload-1234 (the default).
+  ```
+
+  Refs that stay in that directory resolve as usual, and refs that leave it
+  fail as escapes. A `FLUID_REF_ROOT` left in your shell, or set once for a
+  service that also loads uploaded contracts from temp directories, never
+  widens or breaks another contract.
+- `ref_root=` is set by the caller for one contract, so it is strict: a
+  `ref_root` that is not a directory or does not contain the contract raises
+  `RefResolutionError`, naming `ref_root`.
 - A blank `FLUID_REF_ROOT` counts as unset: the default root applies.
-- It is only consulted when the contract has a ref to another file, so a
-  `FLUID_REF_ROOT` left in your shell does not affect other contracts.
+- It is only consulted when the contract has a ref to another file.
 - It widens the root and nothing else. URLs and absolute paths are still
   refused, and refs that resolve into system directories (`/etc`, `/proc`,
   `/private/etc` on macOS, …) are still blocked.
 
 Set it to the narrowest directory that works. Setting it to `/` turns the
 confinement off.
+
+### Upgrading: `../` refs to another product's fragments
+
+Before the ref root existed, a relative ref could climb out of the contract's
+directory, so monorepos shared fragments with `$ref: ../other-product/…`.
+Those refs now fail with `escapes the ref root` until the root is widened.
+Set `FLUID_REF_ROOT` (or `ref_root=`) to the repository root, or to the
+narrowest directory that holds the products and their shared fragments:
+
+```bash
+export FLUID_REF_ROOT="$(git rev-parse --show-toplevel)"
+fluid validate products/orders/contract.fluid.yaml
+```
+
+Contracts whose refs stay inside their own directory need no change.
 
 ---
 
@@ -150,3 +186,22 @@ fragment has no directory. Only same-document refs
 reported as an `OAS-REF-EXTERNAL` error, and openapi-spec-validator is not
 run on that fragment. If it were run, it would follow `file://` and
 `http(s)://` refs. Inline the referenced schemas under `components` instead.
+
+This applies to a `$ref` key anywhere in the fragment, including inside
+`example`, `examples.*.value` and `x-*` extension payloads, which the
+validator treats as data:
+
+```yaml
+components:
+  schemas:
+    Doc:
+      type: object
+      example:
+        $ref: https://json-schema.org/draft/2020-12/schema   # OAS-REF-EXTERNAL
+```
+
+Those keys are not skipped because the same names are also used for schemas.
+`properties: {example: {$ref: …}}` declares a property called `example`, and
+openapi-spec-validator does follow that `$ref`. If an example payload has to
+contain a `$ref`, rename the key in the payload (for example `ref`) or drop
+the example.

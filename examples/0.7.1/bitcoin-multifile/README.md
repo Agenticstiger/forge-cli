@@ -48,6 +48,35 @@ fluid apply contract.fluid.yaml --yes
 |---------|-----|
 | **Team ownership** | Security team owns `access-policy.yaml`, compliance owns `sovereignty.yaml` |
 | **Independent versioning** | Add a new expose without touching governance configs |
-| **Reusable fragments** | `sovereignty.yaml` can be `$ref`'d by every EU data product |
+| **Reusable fragments** | `sovereignty.yaml` can be `$ref`'d by every EU data product, once `FLUID_REF_ROOT` names a directory that holds them all ([below](#sharing-a-fragment-with-another-product)) |
 | **Smaller diffs** | PRs touch only the fragment that changed |
 | **The engine stays simple** | validate/plan/apply always receive one resolved document |
+
+## Sharing a fragment with another product
+
+A `$ref` may only name a file inside the root contract's directory, so this
+contract can reach anything under `bitcoin-multifile/` and nothing outside it.
+A second product that wants the same `sovereignty.yaml` has to step outside
+its own directory, and that is refused by default:
+
+```yaml
+# examples/0.7.1/eu-orders/contract.fluid.yaml
+sovereignty:
+  $ref: ../bitcoin-multifile/fragments/sovereignty.yaml
+```
+
+```text
+❌ Validation error: contract_load_failed
+   error: $ref '../bitcoin-multifile/fragments/sovereignty.yaml' at JSON pointer
+   '/sovereignty' in …/eu-orders/contract.fluid.yaml escapes the ref root …/eu-orders …
+```
+
+Widen the root to a directory that contains both products:
+
+```bash
+FLUID_REF_ROOT=examples/0.7.1 fluid validate examples/0.7.1/eu-orders/contract.fluid.yaml
+```
+
+From Python, pass `ref_root="examples/0.7.1"` to `load_contract`. See
+[Widening the root](../../../docs/contract-refs.md#widening-the-root-monorepos)
+for the rules.

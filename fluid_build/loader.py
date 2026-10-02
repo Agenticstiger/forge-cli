@@ -461,8 +461,20 @@ def _effective_ref_root(
     contract itself must live inside the wider root. A blank variable counts
     as unset (the confined default), never as "no confinement".
 
-    The opt-in is only consulted when the contract has an external ref, so a
-    stale ``FLUID_REF_ROOT`` in a shell cannot break ref-free contracts.
+    The opt-in is only consulted when the contract has an external ref.
+
+    The two sources fail differently when the root is unusable (not a
+    directory, or does not contain the contract):
+
+    * ``ref_root=`` is a choice the caller made for THIS contract, so it is a
+      :class:`RefResolutionError`.
+    * ``FLUID_REF_ROOT`` is process-wide: set once in a shell or a service
+      container, it applies to every contract that process loads, most of
+      which live elsewhere (a platform materialises each uploaded contract
+      in a fresh temp directory). It is ignored for such a contract, with a
+      WARNING, and the contract gets the default root: exactly the root it
+      would get with the variable unset, so the fallback widens nothing and
+      refs that leave the contract's directory still fail, as escapes.
     """
     contract_dir = contract_path.resolve().parent
     if ref_root is not None:
@@ -473,13 +485,46 @@ def _effective_ref_root(
         return contract_dir
     root = Path(explicit).expanduser().resolve()
     if not root.is_dir():
-        raise RefResolutionError(f"{origin}={explicit!r} is not a directory (resolved to {root})")
-    if not contract_dir.is_relative_to(root):
-        raise RefResolutionError(
+        problem = f"{origin}={explicit!r} is not a directory (resolved to {root})"
+    elif not contract_dir.is_relative_to(root):
+        problem = (
             f"contract {contract_path} is outside {origin}={explicit!r} "
             f"(resolved to {root}); the ref root must contain the contract"
         )
-    return root
+    else:
+        return root
+    if origin != REF_ROOT_ENV:
+        raise RefResolutionError(problem)
+    _note_ref_root_env_ignored(contract_dir, explicit, problem)
+    return contract_dir
+
+
+#: (contract directory, FLUID_REF_ROOT value) pairs already reported by
+#: :func:`_note_ref_root_env_ignored` in this process — one command loads the
+#: same contract several times. Tests reset it with ``.clear()``.
+_NOTED_REF_ROOT_ENV_IGNORED: Set[Tuple[str, str]] = set()
+_NOTED_REF_ROOT_ENV_IGNORED_LOCK = threading.Lock()
+
+
+def _note_ref_root_env_ignored(contract_dir: Path, value: str, problem: str) -> None:
+    """WARN, once per (contract directory, value), that ``FLUID_REF_ROOT``
+    does not apply to this contract and the default root is used."""
+    key = (str(contract_dir), value)
+    with _NOTED_REF_ROOT_ENV_IGNORED_LOCK:
+        if key in _NOTED_REF_ROOT_ENV_IGNORED:
+            return
+        _NOTED_REF_ROOT_ENV_IGNORED.add(key)
+    LOG.warning(
+        "ref_root_env_ignored: %s. Ignoring it for this contract: its $refs are "
+        "confined to the contract's own directory %s (the default).",
+        problem,
+        contract_dir,
+        extra={
+            "event": "ref_root_env_ignored",
+            "ref_root_env": value,
+            "contract_dir": str(contract_dir),
+        },
+    )
 
 
 def compile_contract(
