@@ -39,8 +39,14 @@ What "as plan sees it" covers, in the engine's order:
 5. a legacy singular ``build:`` rewritten to ``builds: [build]``.
 
 This module only composes the engine's functions; it adds no rewrite of its
-own. ``tests/api/test_contract_load.py`` pins its output to the ``contract``
-of a real ``fluid plan`` run, so the two cannot drift apart unnoticed.
+own. :func:`load_contract` calls the engine's loader itself, so a new step
+there reaches it with no change here. The in-memory forms have no file to
+hand that loader, so they replay its steps: the auto-bundle decision (which
+drops an overlay when a ``$ref`` survives), then the rewrites named in
+:data:`_ENGINE_REWRITES`. ``tests/api/test_contract_load.py`` pins the file
+form to the ``contract`` of a real ``fluid plan`` run, pins the in-memory
+forms to the file form, and parses the engine loader's source to fail when
+it gains a step the in-memory forms do not replay.
 
 Part of the governed ``fluid_build.api`` surface: SemVer applies through
 ``fluid_build.api.__api_version__``.
@@ -75,6 +81,15 @@ PathLike = Union[str, "os.PathLike[str]"]
 # never descends further than the resolver it describes.
 _MAX_REF_DEPTH = 20
 
+#: The rewrites ``_contract_loader.load_contract_with_overlay`` applies after
+#: its auto-bundle step, in its order, each ``contract -> contract``. The
+#: in-memory forms replay exactly these, by name; a guard test parses the
+#: engine function and fails when its sequence and this tuple differ.
+_ENGINE_REWRITES: Tuple[str, ...] = (
+    "_normalize_contract_aliases",
+    "_normalize_singular_build_key",
+)
+
 
 class ContractLoadError(Exception):
     """A contract could not be loaded.
@@ -82,14 +97,24 @@ class ContractLoadError(Exception):
     ``event`` is a stable snake_case identity, safe to route on:
 
     * ``contract_not_found``: the contract (or a file it names) does not exist;
-    * ``contract_parse_failed``: the text is not valid JSON/YAML;
-    * ``contract_not_a_mapping``: the document root is not an object;
+    * ``contract_parse_failed``: the text is not valid JSON/YAML (or not
+      UTF-8);
+    * ``contract_not_a_mapping``: the document root, or the overlay root, is
+      not an object;
     * ``contract_ref_unresolved``: a ``$ref`` could not be resolved
       (missing target, cycle, blocked path, bad pointer);
+    * ``contract_env_invalid``: ``env`` is not an environment name (see
+      :func:`load_contract`);
+    * ``contract_overlay_needs_base_dir``: an in-memory load was given an
+      overlay and a document with file ``$ref`` values but no ``base_dir``,
+      so whether the engine would apply the overlay cannot be decided;
+    * ``contract_not_serialisable``: raised by :attr:`LoadedContract.digest`
+      for a contract JSON cannot represent (an unquoted YAML date, a set,
+      binary, a self-referencing alias); ``fluid plan`` cannot write it either;
     * ``contract_load_failed``: any other loader failure;
     * any event the engine's loader raises itself, passed through unchanged
-      (for example ``overlay_declared_but_missing``, ``bundle_env_mismatch``,
-      ``bundle_manifest_invalid``).
+      (for example ``overlay_declared_but_missing``, ``bundle_not_found``,
+      ``bundle_env_mismatch``, ``bundle_manifest_invalid``).
 
     The underlying exception is chained as ``__cause__``.
     """
@@ -109,8 +134,11 @@ class LoadedContract:
     reference to it, and mutating it changes no later load.
     """
 
-    #: The contract dict, equal to ``plan.json``'s ``contract`` for the same
-    #: input and env.
+    #: The contract dict the engine plans for the same input and env. Equal to
+    #: ``plan.json``'s ``contract`` once non-string keys are written as
+    #: strings, as ``plan.json`` writes them: a YAML ``on:`` / ``no:`` / ``1:``
+    #: key in an open block stays a ``bool`` / ``int`` here, as it is inside
+    #: the engine. Compare contracts with :attr:`digest`, which coerces keys.
     contract: Dict[str, Any]
     #: ``"file"``, ``"bundle"`` (a ``fluid bundle`` ``.tgz``) or ``"memory"``.
     origin: ContractOrigin
@@ -134,17 +162,34 @@ class LoadedContract:
 
     @property
     def digest(self) -> str:
-        """``sha256:<hex>`` of ``contract`` under the plan digest's canonicalisation.
+        """``sha256:<hex>`` of the *planned* ``contract``, canonicalised as ``planDigest`` is.
 
-        The same function (``forge.core.plan_digest.compute_contract_digest``)
-        and the same canonical JSON ``planDigest`` hashes, so two inputs with
-        equal digests are one contract to ``fluid plan``: formatting, comments,
-        key order, quoting, Unicode normal form, an alias beside its canonical
-        value and a legacy ``build:`` beside ``builds:`` do not count.
+        Computed with ``forge.core.plan_digest.compute_contract_digest`` over
+        ``contract``, the normalised, composed and overlaid dict. Two inputs
+        with equal digests are one contract to ``fluid plan``: formatting,
+        comments, key order, quoting, Unicode normal form, an alias beside its
+        canonical value and a legacy ``build:`` beside ``builds:`` do not
+        count.
+
+        It is **not** the value ``fluid contract digest`` prints or a
+        federation ``upstreamDigest`` pins: those hash the file as parsed,
+        before any rewrite, ``$ref`` or overlay, so they differ whenever the
+        file uses one.
+
+        Raises:
+            ContractLoadError: ``contract_not_serialisable`` when JSON cannot
+                represent ``contract`` (``fluid plan`` fails on it too).
         """
         from fluid_build.forge.core.plan_digest import compute_contract_digest
 
-        return compute_contract_digest(self.contract)
+        try:
+            return compute_contract_digest(self.contract)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ContractLoadError(
+                "contract_not_serialisable",
+                f"the contract cannot be written as JSON, so it has no digest: {exc}",
+                path=self.source,
+            ) from exc
 
 
 def load_contract(
@@ -161,16 +206,31 @@ def load_contract(
     (``bundle_env_mismatch``), exactly as on the CLI.
 
     The operator-path gate the CLI applies to its own arguments (no ``..``,
-    no symlink) is not applied: a library caller chooses its paths. The
-    ``$ref`` resolver's own confinement applies in full.
+    no symlink) is not applied to ``path``: a library caller chooses its
+    paths. The ``$ref`` resolver's own confinement applies in full.
+
+    ``env`` is a name, never a path: it must match the grammar ``fluid
+    publish --env`` accepts (letters, digits, ``.``, ``_``, ``-``, starting
+    with a letter or digit, at most 64 characters), or the load is refused
+    with ``contract_env_invalid`` before any file is read. The engine builds
+    overlay paths from it (``overlays/<env>.yaml`` and so on), so an env
+    such as ``../x`` or ``/abs/x`` would otherwise merge a file outside the
+    contract's directory into the result. ``None`` means no env; ``""`` is
+    refused rather than read as ``None``.
 
     Raises:
         ContractLoadError: the contract could not be loaded.
     """
-    from fluid_build import _contract_loader
+    from fluid_build import _contract_loader, _env_names
 
     log = logger or LOG
     resolved = Path(os.fspath(path)).resolve()
+    if env is not None and not _env_names.is_env_name(env):
+        raise ContractLoadError(
+            "contract_env_invalid",
+            f"env {env!r} is not an environment name: {_env_names.ENV_NAME_RULE}",
+            path=resolved,
+        )
     try:
         contract = _contract_loader.load_contract_with_overlay(str(resolved), env, log)
     except Exception as exc:  # noqa: BLE001 - every failure is mapped to one typed error
@@ -224,6 +284,7 @@ def load_contract_from_text(
     suffix: str = ".yaml",
     base_dir: Optional[PathLike] = None,
     overlay: Optional[Mapping[str, Any]] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> LoadedContract:
     """Parse contract ``text`` and load it as :func:`load_contract` would load that file.
 
@@ -238,7 +299,8 @@ def load_contract_from_text(
 
     Raises:
         ContractLoadError: ``contract_parse_failed``, ``contract_not_a_mapping``,
-            or a ``$ref`` failure when ``base_dir`` is given.
+            ``contract_overlay_needs_base_dir``, or a ``$ref`` failure when
+            ``base_dir`` is given.
     """
     from fluid_build import loader
 
@@ -246,7 +308,7 @@ def load_contract_from_text(
         document = loader.parse_contract_text(text, suffix=suffix)
     except Exception as exc:  # noqa: BLE001 - mapped to one typed error
         raise _parse_error(exc) from exc
-    return load_contract_from_dict(document, base_dir=base_dir, overlay=overlay)
+    return load_contract_from_dict(document, base_dir=base_dir, overlay=overlay, logger=logger)
 
 
 def load_contract_from_dict(
@@ -254,6 +316,7 @@ def load_contract_from_dict(
     *,
     base_dir: Optional[PathLike] = None,
     overlay: Optional[Mapping[str, Any]] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> LoadedContract:
     """Load an already-parsed contract ``document`` as the engine would.
 
@@ -263,15 +326,25 @@ def load_contract_from_dict(
       place, listed in ``unresolved_refs``.
     * ``overlay`` given: deep-merged over the base after ``$ref`` resolution,
       with the engine's merge (dicts key by key, lists of objects by
-      position, anything else replaced), as an overlay file is.
+      position, anything else replaced), as an overlay file is. Exactly as
+      in the engine, the overlay is **not** applied when it holds a ``$ref``
+      or when the merged contract still holds one (a same-document ``#/...``
+      pointer): ``fluid plan --env`` plans the base in that shape, so this
+      returns the base and logs a ``contract_overlay_not_applied`` WARNING.
+      Without ``base_dir``, a document holding file ``$ref`` values leaves
+      that decision open (it depends on what the fragments hold), so an
+      overlay is then refused with ``contract_overlay_needs_base_dir``.
 
     ``document`` and ``overlay`` are never modified.
 
     Raises:
-        ContractLoadError: ``contract_not_a_mapping``, or a ``$ref`` failure
-            when ``base_dir`` is given.
+        ContractLoadError: ``contract_not_a_mapping``,
+            ``contract_overlay_needs_base_dir``, or a ``$ref`` failure when
+            ``base_dir`` is given.
     """
     from fluid_build import _contract_loader, loader
+
+    log = logger or LOG
 
     if not isinstance(document, Mapping):
         raise ContractLoadError(
@@ -295,11 +368,12 @@ def load_contract_from_dict(
             raise _as_load_error(exc, base) from exc
         files = tuple(_walk_ref_files(document, base))
     if overlay is not None:
-        # ``loader.load_with_overlay``'s merge of an overlay file.
-        contract = loader._deep_merge(dict(contract), copy.deepcopy(dict(overlay)))
+        contract = _replay_overlay(
+            contract, copy.deepcopy(dict(overlay)), composed=base_dir is not None, log=log
+        )
     # ``_contract_loader.load_contract_with_overlay``'s rewrites, in its order.
-    contract = _contract_loader._normalize_contract_aliases(contract)
-    contract = _contract_loader._normalize_singular_build_key(contract)
+    for rewrite in _ENGINE_REWRITES:
+        contract = getattr(_contract_loader, rewrite)(contract)
     return LoadedContract(
         contract=contract,
         origin="memory",
@@ -309,6 +383,46 @@ def load_contract_from_dict(
 
 
 # ── helpers ────────────────────────────────────────────────────────────
+
+
+def _replay_overlay(
+    contract: Dict[str, Any],
+    overlay: Dict[str, Any],
+    *,
+    composed: bool,
+    log: logging.Logger,
+) -> Dict[str, Any]:
+    """The engine's overlay merge plus its auto-bundle decision, for a parsed overlay.
+
+    ``loader.load_with_overlay`` deep-merges the overlay; then
+    ``_contract_loader._auto_bundle_if_needed`` sees a ``$ref`` left in the
+    merged contract (from the overlay, or a same-document pointer) and
+    reloads the base file, which drops the overlay. ``contract`` is that
+    reloaded base when ``composed`` (its file references were resolved
+    against ``base_dir``), so dropping the overlay means returning it.
+    """
+    from fluid_build import _contract_loader, loader
+
+    if not _contract_loader._has_ref_pointers(overlay):
+        if not composed and any(loader._parse_ref(ref)[0] for ref in _ref_values(contract)):
+            raise ContractLoadError(
+                "contract_overlay_needs_base_dir",
+                "the document holds file $ref values and no base_dir was given, so "
+                "whether the engine applies the overlay cannot be decided: pass "
+                "base_dir (the contract's directory) to load it as fluid plan does",
+            )
+        # ``_deep_merge`` mutates nested dicts of its base: merge into a copy,
+        # so the un-overlaid contract survives if the overlay is dropped.
+        merged = loader._deep_merge(copy.deepcopy(contract), overlay)
+        if not _contract_loader._has_ref_pointers(merged):
+            return merged
+    log.warning(
+        "contract_overlay_not_applied: the overlay was not merged, because the "
+        "overlay or the contract holds a $ref; `fluid plan --env` plans the base "
+        "contract in this shape too",
+        extra={"event": "contract_overlay_not_applied"},
+    )
+    return contract
 
 
 def _cause_chain(exc: BaseException) -> List[BaseException]:
@@ -321,12 +435,13 @@ def _cause_chain(exc: BaseException) -> List[BaseException]:
 
 
 def _is_syntax_error(exc: BaseException) -> bool:
-    """True when the JSON/YAML parser (or its size/anchor guard) rejected the text."""
+    """True when the text could not be decoded, or the JSON/YAML parser (or its
+    size/anchor guard) rejected it."""
     import json
 
     from fluid_build.util.safe_yaml import UnsafeYamlError
 
-    syntax: Tuple[type, ...] = (json.JSONDecodeError, UnsafeYamlError)
+    syntax: Tuple[type, ...] = (json.JSONDecodeError, UnsafeYamlError, UnicodeError)
     try:
         import yaml
 
@@ -360,6 +475,12 @@ def _as_load_error(exc: BaseException, path: Path) -> ContractLoadError:
         return ContractLoadError("contract_ref_unresolved", str(exc), path=path)
     if _is_syntax_error(exc):
         return ContractLoadError("contract_parse_failed", str(exc), path=path)
+    if any(type(e) is ValueError for e in _cause_chain(exc)):
+        # The loader's own plain ``ValueError``s are its root checks: "YAML
+        # root must be an object/dict" (``_parse_file``, for the contract or
+        # an overlay) and "Overlay root must be an object/dict". The text
+        # path maps the same condition through :func:`_parse_error`.
+        return ContractLoadError("contract_not_a_mapping", str(exc), path=path)
     return ContractLoadError("contract_load_failed", str(exc), path=path)
 
 

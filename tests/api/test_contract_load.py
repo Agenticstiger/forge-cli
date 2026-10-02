@@ -28,8 +28,10 @@ change to the engine's loader that this API does not follow fails here.
 from __future__ import annotations
 
 import argparse
+import ast
 import builtins
 import copy
+import inspect
 import json
 import logging
 import os
@@ -39,11 +41,13 @@ from typing import Any, Callable, Dict, List, Optional
 import pytest
 
 import fluid_build.api as api
+from fluid_build import _contract_loader
 from fluid_build._contract_loader import load_contract_with_overlay
 from fluid_build.api import ContractLoadError, LoadedContract
+from fluid_build.api import contract as contract_api
 from fluid_build.cli import bundle as bundle_cmd
 from fluid_build.cli import plan as plan_cmd
-from fluid_build.forge.core.plan_digest import compute_contract_digest
+from fluid_build.forge.core.plan_digest import coerce_keys_to_str, compute_contract_digest
 from fluid_build.util.safe_yaml import load_yaml_safe
 
 pytestmark = [pytest.mark.unit]
@@ -515,3 +519,234 @@ def test_non_mapping_inputs_fail_typed() -> None:
     with pytest.raises(ContractLoadError) as err:
         api.load_contract_from_dict({"id": "x"}, overlay=["nope"])  # type: ignore[arg-type]
     assert err.value.event == "contract_not_a_mapping"
+
+
+# ── env is a name, never a path ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize("shape", ["absolute", "parent", "empty", "separator"])
+def test_env_must_be_an_environment_name(ws: Path, shape: str) -> None:
+    """The engine builds overlay paths from ``env`` (``<dir>/<env>.json`` among
+    them), so an absolute or ``..`` env would merge a file from anywhere into
+    the returned contract. The API refuses it before reading a file."""
+    contract_path = _write(ws / "ws", _CASES["aliases"])
+    secret = ws / "elsewhere" / "creds.json"
+    secret.parent.mkdir()
+    secret.write_text('{"auths": {"registry": {"auth": "c2VjcmV0"}}}', encoding="utf-8")
+    env = {
+        "absolute": str(secret.with_suffix("")),
+        "parent": "../elsewhere/creds",
+        "empty": "",
+        "separator": "prod/eu",
+    }[shape]
+
+    with pytest.raises(ContractLoadError) as err:
+        api.load_contract(contract_path, env=env)
+
+    assert err.value.event == "contract_env_invalid"
+    assert err.value.path == contract_path.resolve()
+
+
+def test_a_valid_env_name_still_selects_its_overlay(ws: Path) -> None:
+    contract_path = _write(ws, _CASES["composed"])
+    for env in ("prod", "Prod.eu-1_a"):
+        (contract_path.parent / "overlays" / f"{env}.yaml").write_text(_PROD_OVERLAY, "utf-8")
+        assert api.load_contract(contract_path, env=env).contract["name"] == "Orders (prod)"
+
+
+# ── the in-memory overlay follows the engine's auto-bundle step ─────────
+
+# Two shapes in which ``fluid plan --env prod`` drops the overlay, because a
+# ``$ref`` survives the merge and the auto-bundle step reloads the base file.
+_OVERLAY_DROPPED: Dict[str, Dict[str, str]] = {
+    # A same-document pointer in the base contract (in an open block, so the
+    # contract still plans).
+    "same_document_pointer": {
+        "contract.fluid.yaml": _ALIASES + 'extensions: {n: 1, copy: {"$ref": "#/extensions/n"}}\n',
+        "overlays/prod.yaml": "name: Orders (prod)\n",
+    },
+    # A ``$ref`` inside the overlay itself.
+    "ref_in_overlay": {
+        **_CASES["composed"],
+        "overlays/prod.yaml": 'name: Orders (prod)\ndescription: {"$ref": "./parts/d.yaml"}\n',
+        "parts/d.yaml": "text: prod\n",
+    },
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_OVERLAY_DROPPED))
+def test_in_memory_overlay_matches_the_file_form_when_the_engine_drops_it(
+    ws: Path, shape: str, caplog: Any
+) -> None:
+    contract_path = _write(ws, _OVERLAY_DROPPED[shape])
+    planned = _plan(contract_path, ws / "plan.json", "prod")["contract"]
+    overlay = load_yaml_safe((contract_path.parent / "overlays" / "prod.yaml").read_text("utf-8"))
+    from_file = api.load_contract(contract_path, env="prod")
+
+    with caplog.at_level(logging.WARNING, logger="fluid.api.contract"):
+        caplog.clear()
+        from_text = api.load_contract_from_text(
+            contract_path.read_text("utf-8"), base_dir=contract_path.parent, overlay=overlay
+        )
+
+    assert from_file.contract == planned
+    assert from_text.contract == from_file.contract
+    assert from_text.digest == from_file.digest
+    dropped = from_file.contract["name"] == "Orders"
+    warned = any("contract_overlay_not_applied" in r.getMessage() for r in caplog.records)
+    assert warned is dropped
+
+
+def test_in_memory_overlay_without_base_dir_follows_a_same_document_pointer(ws: Path) -> None:
+    """No file ``$ref``: the engine's decision is knowable without a directory."""
+    contract_path = _write(ws, _OVERLAY_DROPPED["same_document_pointer"])
+    overlay = load_yaml_safe((contract_path.parent / "overlays" / "prod.yaml").read_text("utf-8"))
+
+    from_text = api.load_contract_from_text(contract_path.read_text("utf-8"), overlay=overlay)
+
+    assert from_text.contract == api.load_contract(contract_path, env="prod").contract
+
+
+def test_in_memory_overlay_without_base_dir_refuses_an_undecidable_document() -> None:
+    """With file ``$ref`` values unresolved, whether the engine applies the overlay
+    depends on what the fragments hold; the API says so instead of guessing."""
+    with pytest.raises(ContractLoadError) as err:
+        api.load_contract_from_text(_COMPOSED, overlay=load_yaml_safe(_PROD_OVERLAY))
+    assert err.value.event == "contract_overlay_needs_base_dir"
+
+
+def test_in_memory_overlay_logs_to_the_callers_logger() -> None:
+    records: List[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    mine = logging.getLogger("test.api.contract_load.caller")
+    mine.addHandler(_Collect())
+    document = {"id": "x", "name": "base", "defs": {"n": 1}, "d": {"$ref": "#/defs/n"}}
+
+    loaded = api.load_contract_from_dict(document, overlay={"name": "prod"}, logger=mine)
+
+    assert loaded.contract["name"] == "base"
+    assert [getattr(r, "event", None) for r in records] == ["contract_overlay_not_applied"]
+
+
+# ── the in-memory replay cannot fall behind the engine loader ───────────
+
+
+def _engine_post_load_steps() -> List[str]:
+    """Calls ``load_contract_with_overlay`` makes on ``contract``, in source order,
+    outside its bundle branch (the in-memory forms never load a bundle)."""
+    tree = ast.parse(inspect.getsource(_contract_loader.load_contract_with_overlay))
+    function = tree.body[0]
+    assert isinstance(function, ast.FunctionDef)
+    steps: List[str] = []
+
+    class _Calls(ast.NodeVisitor):
+        def visit_If(self, node: ast.If) -> None:
+            test = node.test
+            if isinstance(test, ast.Call) and getattr(test.func, "id", "") == "_is_bundle_path":
+                return
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            self.generic_visit(node)  # inner calls first: they run first
+            if any(isinstance(a, ast.Name) and a.id == "contract" for a in node.args):
+                func = node.func
+                steps.append(func.attr if isinstance(func, ast.Attribute) else func.id)
+
+    _Calls().visit(function)
+    return steps
+
+
+def test_in_memory_forms_replay_every_engine_loader_step() -> None:
+    """The file form calls the engine loader; the in-memory forms replay its steps
+    (``_replay_overlay`` for the auto-bundle decision, then
+    ``_ENGINE_REWRITES`` by name). A step added to, removed from or moved in
+    the engine fails here until the in-memory forms follow it."""
+    assert _engine_post_load_steps() == [
+        "_auto_bundle_if_needed",
+        *contract_api._ENGINE_REWRITES,
+    ]
+    for name in contract_api._ENGINE_REWRITES:
+        assert callable(getattr(_contract_loader, name))
+
+
+# ── typed failures, file form ───────────────────────────────────────────
+
+
+def test_a_yaml_list_root_file_is_contract_not_a_mapping(tmp_path: Path) -> None:
+    """The same input gives the same event through the file and text forms."""
+    listed = tmp_path / "list.fluid.yaml"
+    listed.write_text("- a\n- b\n", encoding="utf-8")
+
+    with pytest.raises(ContractLoadError) as err:
+        api.load_contract(listed)
+
+    assert err.value.event == "contract_not_a_mapping"
+    with pytest.raises(ContractLoadError) as text_err:
+        api.load_contract_from_text(listed.read_text("utf-8"))
+    assert text_err.value.event == err.value.event
+
+
+def test_a_list_root_overlay_is_contract_not_a_mapping(ws: Path) -> None:
+    contract_path = _write(ws, {**_CASES["aliases"], "overlays/prod.yaml": "- a\n"})
+    with pytest.raises(ContractLoadError) as err:
+        api.load_contract(contract_path, env="prod")
+    assert err.value.event == "contract_not_a_mapping"
+
+
+def test_a_file_that_is_not_utf8_is_contract_parse_failed(tmp_path: Path) -> None:
+    """``UnicodeDecodeError`` is a ``ValueError``; it is still a parse failure."""
+    binary = tmp_path / "binary.fluid.yaml"
+    binary.write_bytes(b"id: \xff\xfe\n")
+    with pytest.raises(ContractLoadError) as err:
+        api.load_contract(binary)
+    assert err.value.event == "contract_parse_failed"
+
+
+def test_a_missing_bundle_is_the_engines_bundle_not_found(tmp_path: Path) -> None:
+    with pytest.raises(ContractLoadError) as err:
+        api.load_contract(tmp_path / "absent.tgz")
+    assert err.value.event == "bundle_not_found"
+
+
+# ── keys and the digest ─────────────────────────────────────────────────
+
+
+def test_a_magic_word_key_equals_plan_once_keys_are_strings(ws: Path) -> None:
+    """``plan.json`` writes keys as strings; ``contract`` keeps the engine's
+    ``bool`` key. The documented equation holds after that coercion, and the
+    digest agrees without it."""
+    contract_path = _write(ws, {"contract.fluid.yaml": _ALIASES + "extensions: {on: x}\n"})
+    planned = _plan(contract_path, ws / "plan.json")["contract"]
+
+    loaded = api.load_contract(contract_path)
+
+    assert loaded.contract["extensions"] == {True: "x"}
+    assert coerce_keys_to_str(loaded.contract) == planned
+    assert loaded.digest == compute_contract_digest(planned)
+    assert api.load_contract_from_text(_ALIASES + "extensions: {on: x}\n").digest == loaded.digest
+
+
+def test_digest_of_an_unserialisable_contract_fails_typed(ws: Path) -> None:
+    contract_path = _write(
+        ws, {"contract.fluid.yaml": _ALIASES + "extensions: {created: 2024-01-01}\n"}
+    )
+    loaded = api.load_contract(contract_path)  # loading is fine; plan is not
+
+    with pytest.raises(ContractLoadError) as err:
+        _ = loaded.digest
+
+    assert err.value.event == "contract_not_serialisable"
+    assert err.value.path == contract_path.resolve()
+    assert isinstance(err.value.__cause__, TypeError)
+
+
+def test_digest_is_the_planned_contracts_not_the_raw_files(ws: Path) -> None:
+    """Documented: ``.digest`` hashes the normalised contract, so it differs
+    from ``fluid contract digest`` (the raw parse) whenever a rewrite applies."""
+    contract_path = _write(ws, _CASES["aliases"])
+    raw = compute_contract_digest(load_yaml_safe(contract_path.read_text("utf-8")))
+    assert api.load_contract(contract_path).digest != raw
