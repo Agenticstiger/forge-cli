@@ -1034,8 +1034,10 @@ def test_contract_sql_runs_on_a_connection_with_no_database_scanner(layout, prin
 def _with_extension(name: str) -> Any:
     try:
         return secure_duckdb_connect(allow=DuckDBAllowlist.none(), extensions=[name])
-    except duckdb.Error:
-        pytest.skip(f"the {name} extension is not installable here (offline)")
+    except duckdb.Error as exc:
+        raise pytest.skip.Exception(
+            f"the {name} extension is not installable here (offline)"
+        ) from exc
 
 
 def test_a_loaded_sqlite_scanner_is_not_bounded_by_the_allowlist(tmp_path):

@@ -408,8 +408,8 @@ def apply_action(action: Dict[str, Any], ctx) -> None:
     finally:
         try:
             con.close()
-        except Exception:
-            pass
+        except Exception:  # the action's own outcome is what the caller needs
+            LOGGER.debug("closing the DuckDB connection of action %r failed", rid, exc_info=True)
 
 
 def _run_action_sql(
