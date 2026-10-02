@@ -95,8 +95,8 @@ class RefConfinementError(RefResolutionError):
     parsing the message.
 
     ``ignored_ref_root_env`` is the ``FLUID_REF_ROOT`` value the loader
-    ignored for this contract (it was not a directory, or did not contain the
-    contract), or ``None`` when the variable was unset or applied. A non-None
+    ignored for this contract (it could not be resolved, was not a directory,
+    or did not contain the contract), or ``None`` when the variable was unset or applied. A non-None
     value means the variable did NOT widen this contract's root, whatever the
     caller's environment says.
     """

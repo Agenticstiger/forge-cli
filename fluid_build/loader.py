@@ -487,8 +487,8 @@ def _effective_ref_root(
 
     The opt-in is only consulted when the contract has an external ref.
 
-    The two sources fail differently when the root is unusable (not a
-    directory, or does not contain the contract):
+    The two sources fail differently when the root is unusable (cannot be
+    resolved, is not a directory, or does not contain the contract):
 
     * ``ref_root=`` is a choice the caller made for THIS contract, so it is a
       :class:`RefResolutionError`.
@@ -500,8 +500,8 @@ def _effective_ref_root(
       would get with the variable unset, so the fallback widens nothing and
       refs that leave the contract's directory still fail, as escapes.
       Those escape errors say the variable was ignored and why, on every
-      load: the WARNING is logged once per process, and in a service it
-      reaches the server log, not the caller.
+      load: the WARNING is logged once per value per process, and in a
+      service it reaches the server log, not the caller.
     """
     contract_dir = contract_path.resolve().parent
     if ref_root is not None:
@@ -510,16 +510,24 @@ def _effective_ref_root(
         explicit, origin = os.environ.get(REF_ROOT_ENV, "").strip(), REF_ROOT_ENV
     if not explicit or next(iter_external_refs(contract), None) is None:
         return _RefRoot(contract_dir)
-    root = Path(explicit).expanduser().resolve()
-    if not root.is_dir():
-        problem = f"{origin}={explicit!r} is not a directory (resolved to {root})"
-    elif not contract_dir.is_relative_to(root):
-        problem = (
-            f"contract {contract_path} is outside {origin}={explicit!r} "
-            f"(resolved to {root}); the ref root must contain the contract"
-        )
-    else:
-        return _RefRoot(root)
+    try:
+        # A stale value can fail to resolve at all: ``~gone/repo`` for a
+        # user that no longer exists, a symlink loop, or a parent the
+        # process cannot traverse (``is_dir`` does not swallow EACCES).
+        # Those are unusable roots too, and take the same path below.
+        root = Path(explicit).expanduser().resolve()
+        if not root.is_dir():
+            problem = f"{origin}={explicit!r} is not a directory (resolved to {root})"
+        elif not contract_dir.is_relative_to(root):
+            problem = (
+                f"contract {contract_path} is outside {origin}={explicit!r} "
+                f"(resolved to {root}); the ref root must contain the contract"
+            )
+        else:
+            return _RefRoot(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        # The problem is followed by ". ..." in the warning and the hint.
+        problem = f"{origin}={explicit!r} cannot be resolved: {str(exc).rstrip('.')}"
     if origin != REF_ROOT_ENV:
         raise RefResolutionError(problem)
     _note_ref_root_env_ignored(contract_dir, explicit, problem)
@@ -535,24 +543,28 @@ def _effective_ref_root(
     )
 
 
-#: (contract directory, FLUID_REF_ROOT value) pairs already reported by
-#: :func:`_note_ref_root_env_ignored` in this process — one command loads the
-#: same contract several times. Tests reset it with ``.clear()``.
-_NOTED_REF_ROOT_ENV_IGNORED: Set[Tuple[str, str]] = set()
+#: FLUID_REF_ROOT values already reported by :func:`_note_ref_root_env_ignored`
+#: in this process. Keyed on the value alone, not the contract directory: a
+#: service loads each upload from a fresh temp directory, so a per-directory
+#: key would grow without bound and log once per upload. The escape errors
+#: of every later contract carry their own explanation (``root_hint``).
+#: Tests reset it with ``.clear()``.
+_NOTED_REF_ROOT_ENV_IGNORED: Set[str] = set()
 _NOTED_REF_ROOT_ENV_IGNORED_LOCK = threading.Lock()
 
 
 def _note_ref_root_env_ignored(contract_dir: Path, value: str, problem: str) -> None:
-    """WARN, once per (contract directory, value), that ``FLUID_REF_ROOT``
-    does not apply to this contract and the default root is used."""
-    key = (str(contract_dir), value)
+    """WARN, once per ``FLUID_REF_ROOT`` value per process, that it does not
+    apply to this contract and the default root is used."""
     with _NOTED_REF_ROOT_ENV_IGNORED_LOCK:
-        if key in _NOTED_REF_ROOT_ENV_IGNORED:
+        if value in _NOTED_REF_ROOT_ENV_IGNORED:
             return
-        _NOTED_REF_ROOT_ENV_IGNORED.add(key)
+        _NOTED_REF_ROOT_ENV_IGNORED.add(value)
     LOG.warning(
         "ref_root_env_ignored: %s. Ignoring it for this contract: its $refs are "
-        "confined to the contract's own directory %s (the default).",
+        "confined to the contract's own directory %s (the default). Logged once "
+        "per value in this process; a later contract it is ignored for gets no "
+        "warning, but its escape errors say the variable was ignored and why.",
         problem,
         contract_dir,
         extra={

@@ -110,8 +110,10 @@ Rules for the wider root:
 - It widens the root only for a contract inside it, and only if it is an
   existing directory.
 - `FLUID_REF_ROOT` applies to every contract the process loads, so it is
-  ignored for a contract outside it (or when it is not a directory). That
-  contract gets the default root, its own directory, and a warning says so:
+  ignored for a contract outside it, and when it is not a directory or cannot
+  be resolved at all (a `~user` that no longer exists, a symlink loop, a
+  parent the process cannot enter). That contract gets the default root, its
+  own directory, and a warning says so:
 
   ```bash
   FLUID_REF_ROOT=repo fluid validate /tmp/upload-1234/contract.fluid.yaml
@@ -121,12 +123,15 @@ Rules for the wider root:
   ref_root_env_ignored: contract /tmp/upload-1234/contract.fluid.yaml is outside
   FLUID_REF_ROOT='repo' (…); the ref root must contain the contract. Ignoring it
   for this contract: its $refs are confined to the contract's own directory
-  /tmp/upload-1234 (the default).
+  /tmp/upload-1234 (the default). Logged once per value in this process; a
+  later contract it is ignored for gets no warning, but its escape errors say
+  the variable was ignored and why.
   ```
 
   Refs that stay in that directory resolve as usual, and refs that leave it
-  fail as escapes. The warning is logged once per contract directory and
-  value in a process, so every such escape error also says that
+  fail as escapes. The warning is logged once per value in a process, not
+  once per contract, so a service that loads each upload from a fresh
+  directory logs it once. Every such escape error therefore also says that
   `FLUID_REF_ROOT` was ignored for this contract, and why.
 
   For a contract outside `FLUID_REF_ROOT` the variable is ignored, so it
@@ -136,8 +141,8 @@ Rules for the wider root:
   widens every uploaded contract. Scope the variable to one command instead
   of exporting it.
 - `ref_root=` is set by the caller for one contract, so it is strict: a
-  `ref_root` that is not a directory or does not contain the contract raises
-  `RefResolutionError`, naming `ref_root`.
+  `ref_root` that cannot be resolved, is not a directory, or does not contain
+  the contract raises `RefResolutionError`, naming `ref_root`.
 - A blank `FLUID_REF_ROOT` counts as unset: the default root applies.
 - It is only consulted when the contract has a ref to another file.
 - It widens the root and nothing else. URLs and absolute paths are still
@@ -187,7 +192,8 @@ except RefConfinementError as err:
 ```
 
 `ignored_ref_root_env` is set when `FLUID_REF_ROOT` is set but did not apply
-to this contract (it is not a directory, or does not contain the contract).
+to this contract (it cannot be resolved, is not a directory, or does not
+contain the contract).
 The root is then the contract's own directory, whatever the environment says.
 
 ---

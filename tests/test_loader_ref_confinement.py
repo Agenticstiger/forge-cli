@@ -304,6 +304,16 @@ class TestRefRootOptIn:
         with pytest.raises(RefResolutionError, match="ref_root=.* is not a directory"):
             load_contract(contract, ref_root=tmp_path / "missing")
 
+    def test_ref_root_argument_that_cannot_be_resolved_is_a_ref_resolution_error(
+        self, tmp_path, monkeypatch, unresolvable_root
+    ):
+        """Not a raw RuntimeError / PermissionError that an
+        ``except RefResolutionError`` handler would miss."""
+        monkeypatch.delenv(REF_ROOT_ENV, raising=False)
+        contract = self._monorepo(tmp_path)
+        with pytest.raises(RefResolutionError, match="ref_root=.* cannot be resolved"):
+            load_contract(contract, ref_root=unresolvable_root)
+
     def test_ref_root_argument_wins_over_a_usable_env_var(self, tmp_path, monkeypatch):
         contract = self._monorepo(tmp_path)
         monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path))
@@ -429,7 +439,7 @@ class TestEnvRootOutsideTheContract:
             assert "was ignored" not in str(err)
             assert err.ignored_ref_root_env is None
 
-    def test_warning_is_emitted_once_per_contract_and_value(self, tmp_path, monkeypatch, caplog):
+    def test_warning_is_emitted_once_per_value(self, tmp_path, monkeypatch, caplog):
         (tmp_path / "elsewhere").mkdir()
         contract = self._fragment_contract(tmp_path)
         monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path / "elsewhere"))
@@ -439,6 +449,88 @@ class TestEnvRootOutsideTheContract:
             compile_contract(contract)
         events = [getattr(r, "event", None) for r in caplog.records]
         assert events.count("ref_root_env_ignored") == 1
+
+    def test_uploads_in_fresh_directories_warn_once_and_stay_bounded(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A service with ``FLUID_REF_ROOT`` set once loads each upload from a
+        fresh temp directory. One WARNING per value, and one remembered key,
+        however many uploads; each escape error still explains itself."""
+        (tmp_path / "elsewhere").mkdir()
+        _write(tmp_path / "outside" / "secret.yaml", {"api_key": SECRET})
+        value = str(tmp_path / "elsewhere")
+        monkeypatch.setenv(REF_ROOT_ENV, value)
+        with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+            for i in range(5):
+                upload = tmp_path / "uploads" / f"upload-{i}"
+                _write(upload / "fragments" / "labels.yaml", {"team": f"t{i}"})
+                ok = _contract(upload, "./fragments/labels.yaml")
+                assert load_contract(ok)["labels"] == {"team": f"t{i}"}
+                bad = _contract(upload, "../../../outside/secret.yaml", name="bad.yaml")
+                with pytest.raises(RefConfinementError) as exc:
+                    load_contract(bad)
+                assert f"{REF_ROOT_ENV} is set but was ignored for this contract" in str(exc.value)
+                assert exc.value.ignored_ref_root_env == value
+        events = [getattr(r, "event", None) for r in caplog.records]
+        assert events.count("ref_root_env_ignored") == 1
+        assert len(loader._NOTED_REF_ROOT_ENV_IGNORED) == 1
+
+    def test_env_root_that_cannot_be_resolved_falls_back(
+        self, tmp_path, monkeypatch, caplog, unresolvable_root
+    ):
+        """A stale value can be broken past "not a directory": resolving it
+        raises (RuntimeError / PermissionError). It must still be ignored
+        with the warning, not fail every contract with a file ``$ref``."""
+        value = unresolvable_root
+        contract = self._fragment_contract(tmp_path)
+        monkeypatch.setenv(REF_ROOT_ENV, value)
+        for entry in ("load_contract", "compile_contract", "load_with_overlay"):
+            loader._NOTED_REF_ROOT_ENV_IGNORED.clear()
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+                result = getattr(loader, entry)(contract)
+            assert result["labels"] == {"team": "orders"}
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert [getattr(r, "event", None) for r in warnings] == ["ref_root_env_ignored"]
+            assert f"{REF_ROOT_ENV}={value!r}" in warnings[0].getMessage()
+
+    def test_unresolvable_env_root_escape_error_explains_it(
+        self, tmp_path, monkeypatch, unresolvable_root
+    ):
+        value = unresolvable_root
+        _write(tmp_path / "outside" / "secret.yaml", {"api_key": SECRET})
+        contract = _contract(tmp_path / "proj", "../outside/secret.yaml")
+        monkeypatch.setenv(REF_ROOT_ENV, value)
+        with pytest.raises(RefConfinementError, match="escapes the ref root") as exc:
+            load_contract(contract)
+        assert f"{REF_ROOT_ENV} is set but was ignored for this contract" in str(exc.value)
+        assert exc.value.ignored_ref_root_env == value
+        assert Path(exc.value.root) == contract.resolve().parent
+        assert SECRET not in str(exc.value)
+
+
+@pytest.fixture(params=["unknown_user", "symlink_loop", "untraversable_parent"])
+def unresolvable_root(request, tmp_path) -> str:
+    """A ref-root value whose resolution raises (RuntimeError,
+    PermissionError) rather than returning a path that merely is not a
+    directory."""
+    kind = request.param
+    if kind == "unknown_user":
+        if os.name == "nt":  # expanduser guesses a sibling profile dir there
+            pytest.skip("~user expansion does not fail on Windows")
+        return "~nosuchuser-fluid-ref-root-xyz/repo"
+    if kind == "symlink_loop":
+        _symlink(tmp_path / "loopA", tmp_path / "loopB", is_dir=True)
+        _symlink(tmp_path / "loopB", tmp_path / "loopA", is_dir=True)
+        return str(tmp_path / "loopA")
+    if os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+        pytest.skip("chmod 000 does not deny traversal here")
+    locked = tmp_path / "locked"
+    (locked / "inner").mkdir(parents=True)
+    locked.chmod(0)
+    # Restore traversal so tmp_path cleanup can remove it.
+    request.addfinalizer(lambda: locked.chmod(0o700))
+    return str(locked / "inner")
 
     def test_env_root_containing_the_contract_still_widens_without_warning(
         self, tmp_path, monkeypatch, caplog
