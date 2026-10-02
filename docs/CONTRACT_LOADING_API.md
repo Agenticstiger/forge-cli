@@ -35,10 +35,12 @@ load_contract("contracts/orders/contract.fluid.yaml", env="../../home/me/.docker
 ```
 
 Refused: `""` (not read as `None`), `.`, `..`, anything holding `/`, `\` or a
-NUL byte, and an absolute or drive-qualified (`C:prod`) name. Every other
-string loads exactly as `fluid plan --env` loads it, including names `fluid
-publish --env` would not accept (`_staging`, `prod+eu`, a name longer than 64
-characters). Pass `None` for no env.
+NUL byte (so any absolute path), and a drive-qualified name (`C:prod`). The rule
+is the same on every platform: `C:prod` is refused on Linux and macOS too, so
+one env never means two things. Every other string loads exactly as
+`fluid plan --env` loads it, including names `fluid publish --env` would not
+accept (`_staging`, `prod+eu`, a name longer than 64 characters). Pass `None`
+for no env.
 
 A `fluid bundle` archive loads the same way, and is refused for an env it was
 not built for, as on the CLI:
@@ -196,9 +198,9 @@ there is one, and the engine's exception as `__cause__`:
 |---|---|
 | `contract_not_found` | The contract file does not exist, or `path` / `base_dir` cannot name a file (it holds a NUL byte). |
 | `contract_parse_failed` | The text is not valid JSON/YAML, is not UTF-8, or trips the YAML size/anchor guard. |
-| `contract_not_a_mapping` | The document (or overlay) root is not an object, from a file or from text. |
+| `contract_not_a_mapping` | The document (or overlay) root is not an object, from a file (with or without `env`, an overlay or not) or from text. |
 | `contract_ref_unresolved` | A `$ref` target is missing, cyclic, blocked, or its pointer does not resolve. |
-| `contract_env_invalid` | `env` is not a single path component: it is empty, `.` or `..`, holds `/`, `\` or NUL, or is absolute or drive-qualified. |
+| `contract_env_invalid` | `env` is not a single path component: it is empty, `.` or `..`, holds `/`, `\` or NUL, or is drive-qualified (`C:prod`, on every platform). |
 | `contract_overlay_needs_base_dir` | In-memory form: `overlay` given for a document with file `$ref` values but no `base_dir`. |
 | `contract_not_serialisable` | Raised by `.digest`: the contract holds a value JSON cannot represent (an unquoted YAML date, a set, binary, a self-referencing alias). `fluid plan` cannot write it either; quote the value. |
 | `contract_load_failed` | Any other loader failure, including a document that contains itself through a YAML alias (the engine fails on it too). |
@@ -224,13 +226,16 @@ How each form keeps that promise:
   step's decision to drop it, then the loader's rewrites by name. The tests
   pin them to the file form on the same fixtures, and a guard test parses the
   engine loader's source (`load_contract_with_overlay`) and fails when it
-  gains, loses or reorders a call that takes `contract` (positionally or by
-  keyword), or changes `contract` any other way (an assignment that is not a
-  known step, an item or attribute write, a method call, `del`). A new step
-  there turns the build red until the in-memory forms replay it too. The
-  guard reads that one function: a change inside a function it calls
-  (`load_with_overlay`, the `$ref` resolver, a rewrite itself) is caught only
-  where the fixtures exercise it.
+  gains, loses or reorders a call that takes `contract` or a part of it
+  (positionally or by keyword), changes `contract` any other way (an
+  assignment that is not a known step, an item or attribute write, a method
+  call, `del`, a rebinding), returns anything but `contract`, or reads
+  `contract` anywhere else (an alias, a loop over it, a container holding
+  it). It does not decide whether such a read changes the contract: it fails
+  on it, so a new step there turns the build red until the in-memory forms
+  replay it too. The guard reads that one function, outside its bundle
+  branch: a change inside a function it calls (`load_with_overlay`, the `$ref`
+  resolver, a rewrite itself) is caught only where the fixtures exercise it.
 
 Do not import the helpers in `fluid_build._contract_loader` (for example
 `_normalize_contract_aliases` / `_normalize_singular_build_key`) to reproduce

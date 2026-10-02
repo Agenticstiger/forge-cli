@@ -525,7 +525,8 @@ def test_non_mapping_inputs_fail_typed() -> None:
 
 
 @pytest.mark.parametrize(
-    "shape", ["absolute", "parent", "empty", "separator", "backslash", "nul", "dot", "dotdot"]
+    "shape",
+    ["absolute", "parent", "empty", "separator", "backslash", "nul", "dot", "dotdot", "drive"],
 )
 def test_env_must_be_a_single_path_component(ws: Path, shape: str) -> None:
     """The engine builds overlay paths from ``env`` (``<dir>/<env>.json`` among
@@ -544,6 +545,9 @@ def test_env_must_be_a_single_path_component(ws: Path, shape: str) -> None:
         "nul": "prod\x00",
         "dot": ".",
         "dotdot": "..",
+        # A plain file name on POSIX, a drive-relative path on Windows: refused
+        # on every platform, so one env never names two different files.
+        "drive": "C:prod",
     }[shape]
 
     with pytest.raises(ContractLoadError) as err:
@@ -781,17 +785,30 @@ def _engine_post_load_effects(source: str = _ENGINE_SOURCE) -> Tuple[List[str], 
     """What ``load_contract_with_overlay`` does to ``contract``, in source order,
     outside its bundle branch (the in-memory forms never load a bundle).
 
-    Returns ``(steps, writes)``. ``steps``: every call handed ``contract``,
-    positionally or by keyword. ``writes``: every statement that changes
-    ``contract``, as the callee whose result is assigned to it, or as
-    ``<...>`` for any other change (an assignment from a non-call, an item or
-    attribute write, an augmented assignment, ``del``, a method call on it).
+    Returns ``(steps, writes)``. ``steps``: every call handed ``contract`` or a
+    part of it (``contract["builds"]``), positionally or by keyword.
+    ``writes``: every statement that changes ``contract``, as the callee whose
+    result is assigned to it, or as ``<...>`` for any other change (an
+    assignment from a non-call, an item or attribute write, an augmented
+    assignment, ``del``, a method call on it, a rebinding as a loop or tuple
+    target), any return of something other than ``contract`` itself, and any
+    other read of ``contract``: an alias, a part of it passed on, a loop over
+    it, a container or expression holding it. A read is accounted for only as
+    a whole-``contract`` argument of a call (listed in ``steps``) or as the
+    returned value; anything else could change the contract unseen, so it is
+    reported, and the guard fails closed.
     """
     tree = ast.parse(source)
     function = tree.body[0]
     assert isinstance(function, ast.FunctionDef)
+    parents = {
+        child: parent for parent in ast.walk(function) for child in ast.iter_child_nodes(parent)
+    }
     steps: List[str] = []
     writes: List[str] = []
+
+    def _argument(node: ast.AST) -> ast.AST:
+        return node.value if isinstance(node, ast.Starred) else node
 
     def _record_write(target: ast.AST, value: Optional[ast.AST]) -> None:
         if _is_contract(target):
@@ -811,8 +828,8 @@ def _engine_post_load_effects(source: str = _ENGINE_SOURCE) -> Tuple[List[str], 
             func = node.func
             if isinstance(func, ast.Attribute) and _rooted_at_contract(func.value):
                 writes.append(f"<method call {func.attr}>")
-            if any(_is_contract(a) for a in node.args) or any(
-                _is_contract(k.value) for k in node.keywords
+            if any(_rooted_at_contract(_argument(a)) for a in node.args) or any(
+                _rooted_at_contract(k.value) for k in node.keywords
             ):
                 steps.append(_callee(node))
 
@@ -839,6 +856,32 @@ def _engine_post_load_effects(source: str = _ENGINE_SOURCE) -> Tuple[List[str], 
             if any(_rooted_at_contract(t) for t in node.targets):
                 writes.append("<del>")
 
+        def visit_Return(self, node: ast.Return) -> None:
+            self.generic_visit(node)
+            if node.value is None or not _is_contract(node.value):
+                writes.append("<return of something other than contract>")
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if node.id != "contract":
+                return
+            parent = parents[node]
+            if isinstance(node.ctx, ast.Store):
+                # A plain or annotated assignment, a walrus or an augmented
+                # assignment is recorded above; any other binding is not.
+                if not isinstance(
+                    parent, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign)
+                ):
+                    writes.append("<rebinding>")
+                return
+            if isinstance(node.ctx, ast.Del):
+                return  # recorded by ``visit_Delete``
+            whole_argument = (isinstance(parent, ast.Call) and node in parent.args) or isinstance(
+                parent, ast.keyword
+            )
+            if whole_argument or isinstance(parent, ast.Return):
+                return
+            writes.append("<other read of contract>")
+
     _Effects().visit(function)
     return steps, writes
 
@@ -863,6 +906,17 @@ def test_in_memory_forms_replay_every_engine_loader_step() -> None:
     "added",
     [
         "contract = _normalize_new(contract)",
+        "_normalize_builds_in_place(contract['builds'])",
+        "_normalize_x(builds=contract['builds'])",
+        "_normalize_x(*contract['builds'])",
+        "c = contract\n    c['x'] = 1",
+        "c = contract['builds']\n    c.append({})",
+        "for b in contract['builds']:\n        b['x'] = 1",
+        "[b.update(x=1) for b in contract['builds']]",
+        "_mutate_all([contract])",
+        "for contract in [{}]:\n        pass",
+        "contract, _ = {}, None",
+        "if contract.get('x'):\n        pass",
         "contract = resolve_contract_env_templates(value=contract)",
         "_mutate_in_place(contract=contract)",
         "contract = {**contract, 'x': 1}",
@@ -883,6 +937,20 @@ def test_the_step_guard_sees_every_way_the_engine_can_change_the_contract(added:
     head, sep, tail = _ENGINE_SOURCE.rpartition("    return contract\n")
     assert sep, "the engine loader no longer ends with `return contract`"
     mutated = f"{head}    {added}\n{sep}{tail}"
+
+    assert _engine_post_load_effects(mutated) != (_EXPECTED_STEPS, _EXPECTED_WRITES)
+
+
+@pytest.mark.parametrize(
+    "returned",
+    ["{**contract, 'x': 1}", "dict(contract, x=1)", "_normalize_new(contract)", "None", ""],
+)
+def test_the_step_guard_sees_a_changed_return(returned: str) -> None:
+    """Negative control: the engine's real source returning anything but
+    ``contract`` itself no longer matches."""
+    head, sep, tail = _ENGINE_SOURCE.rpartition("    return contract\n")
+    assert sep, "the engine loader no longer ends with `return contract`"
+    mutated = f"{head}    return {returned}".rstrip() + f"\n{tail}"
 
     assert _engine_post_load_effects(mutated) != (_EXPECTED_STEPS, _EXPECTED_WRITES)
 
@@ -909,6 +977,52 @@ def test_a_list_root_overlay_is_contract_not_a_mapping(ws: Path) -> None:
     with pytest.raises(ContractLoadError) as err:
         api.load_contract(contract_path, env="prod")
     assert err.value.event == "contract_not_a_mapping"
+
+
+@pytest.mark.parametrize(
+    "root", ['[{"a": 1}]', '[{"a": 1, "b": 2}]', '[["k", "v"]]', "[]", "1", "null", "ref"]
+)
+def test_a_json_root_that_is_not_an_object_is_contract_not_a_mapping_with_or_without_an_overlay(
+    tmp_path: Path, root: str
+) -> None:
+    """The loader checks a YAML root but not a JSON one (nor one a root ``$ref``
+    composes), and merges an overlay into ``dict(base)``: a list root then
+    loads as a dict, or fails with a message that names no root. One file,
+    one event, whether or not an overlay exists for the env."""
+    contract_path = tmp_path / "c.json"
+    if root == "ref":
+        (tmp_path / "frag.json").write_text('[{"a": 1}]', encoding="utf-8")
+        root = '{"$ref": "./frag.json"}'
+    contract_path.write_text(root, encoding="utf-8")
+    (tmp_path / "overlays").mkdir()
+    (tmp_path / "overlays" / "prod.yaml").write_text("x: 1\n", encoding="utf-8")
+
+    for env in (None, "prod", "staging"):  # no env, an overlay, no overlay
+        with pytest.raises(ContractLoadError) as err:
+            api.load_contract(contract_path, env=env)
+        assert (err.value.event, err.value.path) == (
+            "contract_not_a_mapping",
+            contract_path.resolve(),
+        ), env
+
+
+def test_with_an_env_a_base_that_fails_to_load_keeps_its_own_event(tmp_path: Path) -> None:
+    """The root check before an overlay merge reads the base first; a base that
+    cannot be read still fails with the event the engine's load gives it."""
+    (tmp_path / "overlays").mkdir()
+    (tmp_path / "overlays" / "prod.yaml").write_text("x: 1\n", encoding="utf-8")
+    broken = tmp_path / "broken.json"
+    broken.write_text("[1,", encoding="utf-8")
+    dangling = tmp_path / "dangling.json"
+    dangling.write_text('{"id": "x", "m": {"$ref": "./absent.yaml"}}', encoding="utf-8")
+
+    events = []
+    for contract_path in (tmp_path / "absent.json", broken, dangling):
+        with pytest.raises(ContractLoadError) as err:
+            api.load_contract(contract_path, env="prod")
+        events.append(err.value.event)
+
+    assert events == ["contract_not_found", "contract_parse_failed", "contract_ref_unresolved"]
 
 
 def test_a_plain_value_error_that_is_not_a_root_check_is_contract_load_failed(

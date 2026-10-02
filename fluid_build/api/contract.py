@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import ntpath
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -216,9 +217,10 @@ def load_contract(
     ``/abs/x`` would merge a file outside the contract's directory into the
     result. An env that is not a single path component is therefore refused
     with ``contract_env_invalid`` before any file is read: one holding ``/``,
-    ``\\`` or a NUL, an absolute or drive-qualified one, ``.``, ``..``, and
-    ``""`` (refused rather than read as ``None``). Every other string loads
-    as ``fluid plan --env`` loads it. ``None`` means no env.
+    ``\\`` or a NUL (so every absolute one), a drive-qualified one (``C:prod``,
+    on every platform), ``.``, ``..``, and ``""`` (refused rather than read as
+    ``None``). Every other string loads as ``fluid plan --env`` loads it.
+    ``None`` means no env.
 
     Raises:
         ContractLoadError: the contract could not be loaded.
@@ -233,6 +235,8 @@ def load_contract(
             f"env {env!r} is not an environment name: {_ENV_RULE}",
             path=resolved,
         )
+    if env is not None and not _contract_loader._is_bundle_path(str(resolved)):
+        _refuse_a_base_root_the_overlay_merge_would_coerce(resolved)
     try:
         contract = _contract_loader.load_contract_with_overlay(str(resolved), env, log)
     except Exception as exc:  # noqa: BLE001 - every failure is mapped to one typed error
@@ -240,11 +244,7 @@ def load_contract(
     if not isinstance(contract, dict):
         # A JSON file whose root is an array loads without error and then
         # fails somewhere inside the planner; say so here instead.
-        raise ContractLoadError(
-            "contract_not_a_mapping",
-            f"the contract root must be an object, got {type(contract).__name__}",
-            path=resolved,
-        )
+        raise _not_a_mapping(contract, resolved)
 
     if _contract_loader._is_bundle_path(str(resolved)):
         return LoadedContract(
@@ -396,7 +396,7 @@ def load_contract_from_dict(
 #: :func:`_is_env_component` in words, for ``contract_env_invalid``.
 _ENV_RULE = (
     "an env names an overlay file next to the contract, so it must be one path "
-    "component: not empty, not '.' or '..', no '/', '\\' or NUL, not absolute or drive-qualified"
+    "component: not empty, not '.' or '..', no '/', '\\' or NUL, not drive-qualified ('C:prod')"
 )
 
 
@@ -406,14 +406,47 @@ def _is_env_component(env: Any) -> bool:
 
     Only what makes ``env`` a path is refused, so every other name loads as
     ``fluid plan --env`` loads it (``_staging``, ``prod+eu``, a long name).
-    Both separators are refused on every platform, so one env means the same
-    thing everywhere.
+    The rule does not depend on the platform, so one env means the same thing
+    everywhere: both separators are refused, which also refuses every absolute
+    path, and a Windows drive (``C:prod``) is found with ``ntpath`` on every
+    platform, not with ``os.path``, which finds none on POSIX.
     """
     if not isinstance(env, str) or env in ("", ".", ".."):
         return False
     if "\x00" in env or "/" in env or "\\" in env:
         return False
-    return not (os.path.isabs(env) or os.path.splitdrive(env)[0])
+    return not ntpath.splitdrive(env)[0]
+
+
+def _not_a_mapping(root: Any, path: Path) -> ContractLoadError:
+    return ContractLoadError(
+        "contract_not_a_mapping",
+        f"the contract root must be an object, got {type(root).__name__}",
+        path=path,
+    )
+
+
+def _refuse_a_base_root_the_overlay_merge_would_coerce(contract_path: Path) -> None:
+    """Raise ``contract_not_a_mapping`` when the base ``load_with_overlay`` merges is
+    not an object.
+
+    The loader checks a YAML root, but not a JSON one (or one a root ``$ref``
+    composes). With an overlay present it merges into ``dict(base)``, which
+    turns a list root into a dict (``[["k", "v"]]``, ``[{"a": 1, "b": 2}]``,
+    ``[]``) or fails with a message that names no root, so the same file
+    would load, or fail with ``contract_load_failed``, only because an
+    overlay exists. Without an env, :func:`load_contract`'s post-load check
+    catches it.
+    """
+    from fluid_build import loader
+
+    try:
+        # The base exactly as ``load_with_overlay`` reads it, ``$ref`` composed.
+        base = loader.load_contract(contract_path)
+    except Exception:  # noqa: BLE001 - the engine's own load raises it, typed there
+        return
+    if not isinstance(base, dict):
+        raise _not_a_mapping(base, contract_path)
 
 
 def _resolve_input_path(value: PathLike, what: str) -> Path:
