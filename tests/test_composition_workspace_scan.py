@@ -400,9 +400,13 @@ def test_for_contract_perf_bound_shallow_path(tmp_path, monkeypatch):
     ancestor walk runs; the hard cap + dot-dir pruning keep it bounded.
     """
     # A workspace dir holding the contract + its upstreams, with no
-    # boundary marker — the ancestor walk will run from here.
-    ws = tmp_path / "shallow_ws"
-    ws.mkdir()
+    # boundary marker — the ancestor walk will run from here. It sits
+    # _MAX_ANCESTOR_LEVELS below tmp_path, so the capped walk ends at
+    # tmp_path: the scan still crosses marker-less ancestors up to the cap,
+    # but never reaches pytest's shared per-worker temp root, whose size
+    # depends on how many contract-writing tests ran before this one.
+    ws = tmp_path / "l1" / "l2" / "shallow_ws"
+    ws.mkdir(parents=True)
     consumes = []
     for i in range(9):
         pid = f"raw.upstream_{i}"
@@ -418,6 +422,12 @@ def test_for_contract_perf_bound_shallow_path(tmp_path, monkeypatch):
     elapsed = time.perf_counter() - start
 
     assert out == []
+    # The walk stopped at the cap, inside this test's own tree.
+    from fluid_build.forge.product_types import _MAX_ANCESTOR_LEVELS, _resolve_scan_roots
+
+    roots = _resolve_scan_roots(None, target)
+    assert len(roots) == _MAX_ANCESTOR_LEVELS + 1
+    assert roots[-1] == tmp_path
     # Deliberately generous bound — cf. tests/perf/test_ux_performance_budgets.py
     # ("catch regressions, not police absolute speed"). The historical
     # BUG-VALIDATE-SLOW took *tens of seconds* because the ancestor walk
