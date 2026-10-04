@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fluid diff`'s live check reads the target a `{{ env.* }}` binding resolves to.**
+  It read the placeholder itself. A BigQuery binding whose project is
+  `{{ env.FLUID_GCP_PROJECT }}` was refused as an invalid id ("the binding's BigQuery
+  project, dataset or table is not a valid id"), so `--exit-on-drift`, stage 5 of the
+  generated pipelines, failed on every build of a product whose `fluid apply` and
+  `fluid verify` read the real table. The live check now resolves the contract, and
+  the last applied one, the way the state check, `fluid apply` and `fluid verify` do.
+  Found on the first real GCP run of a gcp overlay that names its project through the
+  environment.
+
 ## [0.18.0] — 2026-10-03
 
 A contract can no longer make the engine read the machine it runs on.
