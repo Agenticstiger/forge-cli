@@ -817,6 +817,30 @@ def test_bigquery_table_matching_the_contract_is_no_drift(workspace, built_provi
     assert bigquery.requested == ["northwind-demo.demo_bronze.customer_subscriptions"]
 
 
+@pytest.mark.parametrize("from_bundle", [False, True], ids=["contract", "bundle"])
+def test_bigquery_project_named_through_an_env_variable_is_read_resolved(
+    workspace, built_providers, bigquery, monkeypatch, from_bundle
+):
+    """A gcp overlay names its project ``{{ env.NAME }}``, and ``fluid apply``,
+    ``plan`` and ``verify`` read the table it resolves to. The live check read
+    the placeholder itself as the project, refused it as an invalid id, and so
+    failed ``--exit-on-drift`` on every build of a product whose apply had just
+    succeeded. Stage 5 of the generated pipelines diffs ``runtime/bundle.tgz``,
+    so the bundle is checked too."""
+    monkeypatch.setenv("FLUID_TEST_GCP_PROJECT", "northwind-demo")
+    location = {**GCP_BINDING["location"], "project": "{{ env.FLUID_TEST_GCP_PROJECT }}"}
+    contract = _write_contract(workspace, _contract({**GCP_BINDING, "location": location}))
+    target = _bundle(contract, workspace / "bundle.tgz") if from_bundle else contract
+
+    rc, event = _invoke(["diff", str(target), "--out", "diff.json", "--exit-on-drift"])
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert expose["status"] == "match", expose
+    assert expose["target"] == "bigquery:northwind-demo.demo_bronze.customer_subscriptions"
+    assert (rc, event) == (0, None)
+    assert bigquery.requested == ["northwind-demo.demo_bronze.customer_subscriptions"]
+
+
 def test_bigquery_column_retyped_outside_the_contract_fails_the_gate(
     workspace, built_providers, bigquery
 ):

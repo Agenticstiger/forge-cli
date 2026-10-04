@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import os
 import time
@@ -28,6 +29,7 @@ from ._common import (
     build_provider,
     load_contract_with_overlay,
     read_json,
+    resolve_env_templates_in_contract,
     resolve_provider_from_contract,
     write_json,
 )
@@ -483,6 +485,16 @@ def _compare_live(
 
     from ._diff_live import compare_live
 
+    # ``{{ env.* }}`` resolved first, as ``fluid apply`` resolves the contract
+    # before it emits, ``fluid verify`` before it reads, and the state check
+    # here before it compares (``_diff_state``). Unresolved, a BigQuery binding
+    # whose project is ``{{ env.FLUID_GCP_PROJECT }}`` was read with the
+    # placeholder as its project, refused as an invalid id, and failed
+    # ``--exit-on-drift`` on every build of a product whose apply had just
+    # read the real table.
+    contract = resolve_env_templates_in_contract(copy.deepcopy(dict(contract)))
+    if last_applied is not None:
+        last_applied = resolve_env_templates_in_contract(copy.deepcopy(dict(last_applied)))
     exposes = contract.get("exposes") or []
     info(logger, "diff_live_comparing", exposes=len(exposes))
     # Relative local paths are anchored at the SOURCE contract's directory,
