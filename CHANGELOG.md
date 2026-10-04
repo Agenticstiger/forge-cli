@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] — 2026-10-05
+
+`fluid diff --exit-on-drift` reads a BigQuery target whose project is named
+through the environment. On 0.18.0 the drift gate, stage 5 of the generated
+pipelines, failed every build of such a product, while `fluid apply` and
+`fluid verify` read the real table. Found on the first run of a gcp overlay
+against real BigQuery.
+
 ### Fixed
 
-- **`fluid diff`'s live check reads the target a `{{ env.* }}` binding resolves to.**
+- **`fluid diff`'s live check reads the target a `{{ env.* }}` binding resolves to** (#692).
   It read the placeholder itself. A BigQuery binding whose project is
   `{{ env.FLUID_GCP_PROJECT }}` was refused as an invalid id ("the binding's BigQuery
   project, dataset or table is not a valid id"), so `--exit-on-drift`, stage 5 of the
