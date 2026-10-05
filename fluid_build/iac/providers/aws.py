@@ -49,7 +49,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
@@ -57,6 +57,7 @@ from ...providers._sql_safety import quote_string_literal, validate_ident
 from ...providers.aws.util import warehouse as _warehouse
 from .. import column_access
 from ..base import UnsupportedBindingError
+from ..governance_labels import governance_labels
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
 from ..packaging import (
@@ -65,7 +66,9 @@ from ..packaging import (
     PackagingResolution,
     resolve_packaging,
 )
+from ..principals import AWS, principal_map, resolve_principal
 from ..provider_match import is_cloud
+from ..row_access import RowFilter, row_filters_for
 from ..versions import required_providers
 from . import aws_storage
 from .aws_storage import Retention
@@ -118,6 +121,27 @@ def _has_custom_aws_endpoint() -> bool:
     return any(
         key == "AWS_ENDPOINT_URL" or key.startswith("AWS_ENDPOINT_URL_") for key in os.environ
     )
+
+
+def _emulator_catalog_id() -> Dict[str, Any]:
+    """``{"catalog_id": <the caller's account>}`` for a Glue database or table on an emulator.
+
+    terraform-provider-aws 6 makes a Glue database's id ``<catalog id>:<name>``
+    (a table's ``<catalog id>:<database>:<name>``), the catalog id being the
+    resource's ``catalog_id`` or else the provider's account id, and refuses
+    to read back an id with an empty catalog ("unexpected format for ID
+    (:sales), expected catalog-id:database-name";
+    hashicorp/terraform-provider-aws#31626). On an emulator the provider
+    skips requesting the account id (:meth:`AwsIacPlugin.provider_block`),
+    which it must, because given one, provider 6.23 and later read a bucket's
+    tags through S3 Control at ``<account>.<endpoint>``, which neither moto
+    nor LocalStack routes (hashicorp/terraform-provider-aws#45292). So the
+    catalog id comes from ``data.aws_caller_identity``, which the emulator
+    answers. On real AWS this is ``{}``: the module is unchanged.
+    """
+    if not _has_custom_aws_endpoint():
+        return {}
+    return {"catalog_id": tofu_ref("data.aws_caller_identity.fluid_lf_caller.account_id")}
 
 
 def _resolve_catalog_id() -> str:
@@ -382,10 +406,26 @@ class AwsIacPlugin:
             # excluded columns (``iac/column_access.py``); refused when nothing
             # on this binding could enforce them.
             exclusions = lf_column_exclusions(exposure, binding, index)
+            # The contract's row filters, each on the read grant of its principal,
+            # and the protected views its masked principals read (Lake Formation
+            # cannot mask): ``lf_row_filters`` / ``lf_masked_views``.
+            row_filters = lf_row_filters(exposure, binding, index)
+            masked_views = lf_masked_views(exposure, binding, index, exclusions or {}, row_filters)
             placement = _placement(packaging, exposure)
-            tags = _tags_for(base_tags, placement)
+            # The contract's governance labels (classification, jurisdiction,
+            # regulation, its own labels) under fluid's own two, which win.
+            gov_labels = governance_labels(contract, exposure)
+            tags = _tags_for({**gov_labels, **base_tags}, placement)
             _emit_glue(
-                resources, loc, fmt, schema, cid, tags, contract=contract, placement=placement
+                resources,
+                loc,
+                fmt,
+                schema,
+                cid,
+                tags,
+                contract=contract,
+                placement=placement,
+                labels=gov_labels,
             )
             _emit_s3(resources, loc, cid, tags, placement=placement)
             _emit_kinesis(resources, loc, cid, tags)
@@ -405,6 +445,8 @@ class AwsIacPlugin:
                 tags,
                 placement=placement,
                 exclusions=exclusions or {},
+                row_filters=row_filters,
+                masked_views=masked_views,
             )
         # Retention (exposes[].lifecycle) and encryption at rest
         # (binding.encryption), per bucket this product owns. Nothing is
@@ -460,10 +502,13 @@ class AwsIacPlugin:
         # ``{account}-fluid-data`` bucket, whose token references this source.
         # ...and whenever a product KMS key's policy names the account.
         storage = _storage_by_bucket(contract, cid)
+        # ...and on an emulator, where it is every Glue resource's catalog id
+        # (see :func:`_emulator_catalog_id`).
         if (
             _contract_uses_lakeformation(contract)
             or _references_caller_account(contract)
             or any(s.product_key for s in storage.values())
+            or _has_custom_aws_endpoint()
         ):
             data.setdefault("aws_caller_identity", {})["fluid_lf_caller"] = {}
         # A ``cross-account`` LF bucket policy filters its grantees at plan
@@ -622,7 +667,9 @@ class AwsIacPlugin:
 
         Gated on :func:`_has_custom_aws_endpoint`, so real-AWS applies are
         byte-for-byte unchanged (no provider block emitted). Mirrors
-        LocalStack's documented Terraform provider setup.
+        LocalStack's documented Terraform provider setup. Without the account
+        id, provider 6 builds Glue ids with an empty catalog, so each Glue
+        database and table names its catalog (:func:`_emulator_catalog_id`).
         """
         if not _has_custom_aws_endpoint():
             return {}
@@ -745,6 +792,7 @@ def _emit_glue(
     *,
     contract: Optional[Mapping[str, Any]] = None,
     placement: _Placement = _LEGACY_PLACEMENT,
+    labels: Optional[Mapping[str, str]] = None,
 ) -> None:
     database = loc.get("database")
     if not database:
@@ -764,6 +812,7 @@ def _emit_glue(
             db_name,
             {
                 "name": database,
+                **_emulator_catalog_id(),
                 "lifecycle": {"ignore_changes": ["parameters"]},
             },
         )
@@ -831,6 +880,11 @@ def _emit_glue(
         # block, which is what keeps the byte-parity pin green.
         if placement.pool:
             parameters["fluid_pool"] = str(placement.pool)
+        # The contract's governance labels (classification, jurisdiction, regulation
+        # and its own labels; ``iac/governance_labels.py``), beside fluid's own
+        # parameters, which they never overwrite: ``classification`` is the format.
+        for key, value in (labels or {}).items():
+            parameters.setdefault(key, value)
         # Column-level tags from the contract's ``schema[].tags`` field
         # (already in v0.7.3 — ``$defs.column.properties.tags``). Emitted
         # as the legacy ``forge.pii.<col>`` Glue parameter the retired
@@ -882,6 +936,7 @@ def _emit_glue(
     }
     if description:
         table_body["description"] = description
+    table_body.update(_emulator_catalog_id())
 
     resources.setdefault("aws_glue_catalog_table", {})[
         safe_ident(f"{cid}_{database}_{table}")
@@ -1233,7 +1288,7 @@ def _emit_s3_notification(resources: Dict[str, Any], action: Mapping[str, Any], 
 #
 # There is NO first-party resource in `hashicorp/aws` for
 # `CREATE EXTERNAL SCHEMA ... FROM DATA CATALOG`. The community pattern
-# (and the only one that works with the `hashicorp/aws ~> 5.0` pin) is a
+# (and the only one that works with the `hashicorp/aws ~> 6.0` pin) is a
 # `null_resource` + `provisioner.local-exec` calling the `redshift-data`
 # API. The plugin emits this bridge and orders it after the workgroup +
 # the upstream Glue catalog database via an explicit `depends_on` (see
@@ -2033,6 +2088,212 @@ def lf_column_exclusions(
     return exclusions
 
 
+def lf_row_filters(
+    exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int = 0
+) -> Dict[int, RowFilter]:
+    """``{grant index: row filter}``: the contract's row filters on their principals' grants.
+
+    A filter's principal resolves through ``binding.principals`` to its IAM identities;
+    each read grant held by one of them carries the filter (:func:`_emit_lakeformation`
+    grants it on a data cells filter instead of the table). A filter with no read grant
+    to carry it is refused: Lake Formation would let nobody read less.
+    """
+    filters = row_filters_for(exposure, index)
+    if not filters:
+        return {}
+    where = f"exposes[{exposure.get('exposeId') or index}].policy.authz.rowFilters"
+    gov = (binding.get("governance") or {}).get("lakeFormation") or {}
+    grants = gov.get("grants") if isinstance(gov, Mapping) else None
+    loc = binding.get("location") or {}
+    if not grants or not loc.get("table"):
+        raise UnsupportedBindingError(
+            "row-filter-unenforceable",
+            f"{where} filters rows, but this aws binding has no governance.lakeFormation "
+            "grants on a Glue table to carry the filter, so nothing would enforce it.",
+            ("Grant the filtered principal SELECT in governance.lakeFormation.grants.",),
+        )
+    mapping = principal_map(binding)
+    out: Dict[int, RowFilter] = {}
+    for flt in filters:
+        identities = set(resolve_principal(flt.principal, mapping, platform=AWS, where=where))
+        held = [
+            i
+            for i, g in enumerate(grants)
+            if isinstance(g, Mapping)
+            and str(g.get("principal") or "") in identities
+            and column_access.LF_READ_PERMISSIONS & set(g.get("permissions") or ())
+        ]
+        if not held:
+            raise UnsupportedBindingError(
+                "row-filter-unenforceable",
+                f"{where} filters {flt.principal}, but no governance.lakeFormation grant reads "
+                "the table as it, so the filter would narrow nothing.",
+                ("Grant the principal SELECT, or remove the filter.",),
+            )
+        for i in held:
+            out[i] = flt
+    return out
+
+
+@dataclass(frozen=True)
+class _LfMaskedView:
+    """A protected Glue Data Catalog view that returns masked columns to one principal."""
+
+    principal: str
+    name: str
+    sql: str
+    definer: str
+    validation_connection: str
+
+
+def _athena_mask(column_sql: str, rule: str) -> str:
+    """The column masked by ``rule``, in Athena SQL, as BigQuery's rule of the same name.
+
+    ``XXXXX`` and the last (or first) four characters, a value of four characters or
+    fewer hashed (SHA-256, hex) instead, and NULL kept NULL; ``nullify`` is NULL.
+    """
+    if rule == "nullify":
+        return "CAST(NULL AS varchar)"
+    shown = (
+        f"concat('XXXXX', substr({column_sql}, -4))"
+        if rule == "last_four"
+        else f"concat(substr({column_sql}, 1, 4), 'XXXXX')"
+    )
+    return (
+        f"CASE WHEN {column_sql} IS NULL THEN NULL "
+        f"WHEN length({column_sql}) <= 4 THEN to_hex(sha256(to_utf8({column_sql}))) "
+        f"ELSE {shown} END"
+    )
+
+
+_STRING_TYPES = frozenset({"string", "varchar", "text", "char"})
+
+
+def _grant_raw_columns(
+    grant: Mapping[str, Any],
+    schema: Sequence[Mapping[str, Any]],
+    derived_exclusions: Optional[Sequence[str]],
+) -> set:
+    """The columns a Lake Formation grant lets its principal read raw from the table.
+
+    A protected view reads the table as its definer, so whatever it selects its reader
+    reads, whatever the reader's own grant allows: the view must select no column the
+    grant does not. A ``columns:`` list is the grant's allow list; otherwise every
+    column less its exclusions, derived or written as ``excludedColumns`` (the two
+    agree, or the emit is refused), as :func:`_emit_lakeformation` grants them.
+    """
+    declared = {str(c.get("name")) for c in schema if c.get("name")}
+    listed = grant.get("columns")
+    if listed:
+        return declared & {str(c) for c in listed}
+    excluded = derived_exclusions or grant.get("excludedColumns") or ()
+    return declared - {str(c) for c in excluded}
+
+
+def lf_masked_views(
+    exposure: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    index: int,
+    exclusions: Mapping[int, Tuple[str, ...]],
+    row_filters: Mapping[int, RowFilter],
+) -> List[_LfMaskedView]:
+    """The protected views the expose's masked principals read (Lake Formation cannot mask).
+
+    One view per read grant whose principal ``access: mask`` names: every column the
+    principal may read raw, plus its masked columns through :func:`_athena_mask`, and
+    its row filter as the view's ``WHERE``, since the view reads the table as its
+    definer. The definer and the Athena validation connection are the binding's
+    ``governance.lakeFormation.maskedViews`` (``definer``, ``validationConnection``):
+    without them a mask is refused, never dropped.
+    """
+    restrictions = column_access.restrictions_for(exposure, index)
+    if not restrictions or not any(r.access == column_access.MASK for r in restrictions):
+        return []
+    where = f"exposes[{exposure.get('exposeId') or index}].policy.authz.columnRestrictions"
+    gov = (binding.get("governance") or {}).get("lakeFormation") or {}
+    grants = gov.get("grants") or []
+    views_cfg = gov.get("maskedViews") if isinstance(gov, Mapping) else None
+    definer = (views_cfg or {}).get("definer") if isinstance(views_cfg, Mapping) else None
+    connection = (
+        (views_cfg or {}).get("validationConnection") if isinstance(views_cfg, Mapping) else None
+    )
+    if not definer or not connection:
+        raise UnsupportedBindingError(
+            "column-mask-unenforceable",
+            f"{where} masks columns, but Lake Formation cannot mask, and this aws binding "
+            "declares no governance.lakeFormation.maskedViews (definer, validationConnection) "
+            "for the protected view that would return them masked.",
+            (
+                "Add governance.lakeFormation.maskedViews: definer (an IAM role Glue and Lake "
+                "Formation may assume) and validationConnection (a VIEW_VALIDATION_ATHENA Glue "
+                "connection).",
+                "Or deny the columns instead of masking them.",
+            ),
+        )
+    loc = binding.get("location") or {}
+    database, table = loc.get("database"), loc.get("table")
+    mapping = principal_map(binding)
+
+    def resolve(principal: str) -> Tuple[str, ...]:
+        return resolve_principal(principal, mapping, platform=AWS, where=where)
+
+    readers = frozenset(
+        str(g.get("principal"))
+        for g in grants
+        if isinstance(g, Mapping)
+        and g.get("principal")
+        and column_access.LF_READ_PERMISSIONS & set(g.get("permissions") or ())
+    )
+    masks = column_access.column_masks(exposure, restrictions, resolve, readers, where=where)
+    schema = [
+        c for c in ((exposure.get("contract") or {}).get("schema") or []) if isinstance(c, Mapping)
+    ]
+    types = {str(c.get("name")): str(c.get("type") or "").lower() for c in schema}
+    for column in masks:
+        if masks[column][0] != "nullify" and types.get(column) not in _STRING_TYPES:
+            raise UnsupportedBindingError(
+                "column-mask-type",
+                f"{where} masks {column} ({types.get(column) or 'no type'}) by "
+                f"{masks[column][0]}, which masks text; the protected view on AWS returns it "
+                "as a string.",
+                ("Mask a string column, or use mask: nullify.",),
+            )
+    views: List[_LfMaskedView] = []
+    for i, grant in enumerate(grants):
+        principal = str(grant.get("principal") or "") if isinstance(grant, Mapping) else ""
+        mine = [c for c, (_rule, ids) in masks.items() if principal in ids]
+        if not mine:
+            continue
+        raw = _grant_raw_columns(grant, schema, exclusions.get(i)) - set(mine)
+        select = []
+        for col in schema:
+            name = str(col.get("name"))
+            if name not in mine and name not in raw:
+                continue
+            quoted = f'"{validate_ident(name)}"'
+            select.append(
+                f"{_athena_mask(quoted, masks[name][0])} AS {quoted}" if name in mine else quoted
+            )
+        sql = (
+            f"SELECT {', '.join(select)} FROM "
+            f'"{validate_ident(str(database))}"."{validate_ident(str(table))}"'
+        )
+        flt = row_filters.get(i)
+        if flt is not None:
+            sql += f" WHERE {flt.where}"
+        suffix = "" if len(views) == 0 else f"_{len(views) + 1}"
+        views.append(
+            _LfMaskedView(
+                principal=principal,
+                name=f"{table}_masked{suffix}",
+                sql=sql,
+                definer=str(definer),
+                validation_connection=str(connection),
+            )
+        )
+    return views
+
+
 def _refuse_grants_left_no_column(
     exposure: Mapping[str, Any],
     binding: Mapping[str, Any],
@@ -2082,9 +2343,19 @@ def _emit_lakeformation(
     *,
     placement: _Placement = _LEGACY_PLACEMENT,
     exclusions: Optional[Mapping[int, Tuple[str, ...]]] = None,
+    row_filters: Optional[Mapping[int, RowFilter]] = None,
+    masked_views: Sequence["_LfMaskedView"] = (),
 ) -> None:
     """Emit per-exposure LF resources. No-op when the binding has no
     ``governance.lakeFormation`` block.
+
+    ``row_filters`` is :func:`lf_row_filters`: a grant that carries one reads through a
+    data cells filter (the filter's predicate, and the grant's excluded columns as its
+    column wildcard's exclusions), so its ``SELECT`` is granted on the filter, not on
+    the table. ``masked_views`` is :func:`lf_masked_views`: each becomes a protected
+    Glue Data Catalog view (``VIRTUAL_VIEW``, SECURITY DEFINER), its definer is
+    granted ``SELECT`` with grant option on the table and ``CREATE_TABLE`` and
+    ``DESCRIBE`` on the database, and its principal ``SELECT`` and ``DESCRIBE`` on the view.
 
     ``exclusions`` is ``column_access.lf_exclusions``: for each grant index, the
     columns the contract's ``policy.authz.columnRestrictions`` do not let that
@@ -2146,6 +2417,12 @@ def _emit_lakeformation(
             body["permissions_with_grant_option"] = list(gp)
         cols = grant.get("columns")
         excluded = (exclusions or {}).get(idx) or grant.get("excludedColumns")
+        flt = (row_filters or {}).get(idx)
+        if flt is not None and table_key:
+            _emit_lf_filtered_grant(
+                resources, cid, table, table_key, idx, principal, flt, cols, excluded
+            )
+            continue
         if (cols or excluded) and table_key:
             if cols and excluded:
                 # One block cannot hold both: Lake Formation takes either a column
@@ -2266,24 +2543,148 @@ def _emit_lakeformation(
                 # because LF requires one of these and "wildcard" is the
                 # natural row-only-filter behaviour.
                 col_block = {"column_wildcard": [{}]}
-            body = {
-                "table_data": [
-                    {
-                        "table_catalog_id": tofu_ref(
-                            "data.aws_caller_identity.fluid_lf_caller.account_id"
-                        ),
-                        "database_name": tofu_ref(
-                            f"aws_glue_catalog_table.{table_key}.database_name"
-                        ),
-                        "table_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
-                        "name": filter_name,
-                        "row_filter": [{"filter_expression": row_expr}],
-                        **col_block,
-                    }
-                ]
-            }
             filter_key = safe_ident(f"{cid}_lf_filter_{table}_{filter_name}")
-            resources.setdefault("aws_lakeformation_data_cells_filter", {})[filter_key] = body
+            resources.setdefault("aws_lakeformation_data_cells_filter", {})[filter_key] = {
+                "table_data": [_lf_filter_table_data(table_key, filter_name, row_expr, col_block)]
+            }
+
+    # 5. The protected views masked principals read: Lake Formation cannot mask.
+    if masked_views and table_key:
+        _emit_lf_masked_views(resources, cid, database, table, table_key, masked_views)
+
+
+def _lf_filter_table_data(
+    table_key: str, name: str, row_expr: str, col_block: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """An ``aws_lakeformation_data_cells_filter``'s ``table_data`` on the product's table."""
+    return {
+        "table_catalog_id": tofu_ref("data.aws_caller_identity.fluid_lf_caller.account_id"),
+        "database_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.database_name"),
+        "table_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
+        "name": name,
+        "row_filter": [{"filter_expression": row_expr}],
+        **col_block,
+    }
+
+
+def _emit_lf_filtered_grant(
+    resources: Dict[str, Any],
+    cid: str,
+    table: str,
+    table_key: str,
+    idx: int,
+    principal: str,
+    flt: RowFilter,
+    cols: Any,
+    excluded: Any,
+) -> None:
+    """Grant ``idx`` read through the contract's row filter: a data cells filter holding
+    the predicate and the grant's excluded columns, and ``SELECT`` on the filter, never
+    on the table."""
+    if cols:
+        raise UnsupportedBindingError(
+            "lakeformation-grant-columns",
+            f"governance.lakeFormation.grants[{idx}] lists columns, and the contract's "
+            f"row filter {flt.name} filters its principal: a data cells filter takes "
+            "excluded columns, not a column list.",
+            ("Restrict its columns with policy.authz.columnRestrictions instead.",),
+        )
+    filter_key = safe_ident(f"{cid}_lf_rows_{table}_{flt.name}")
+    columns_block: Dict[str, Any] = {
+        "column_wildcard": [{"excluded_column_names": list(excluded)} if excluded else {}]
+    }
+    resources.setdefault("aws_lakeformation_data_cells_filter", {})[filter_key] = {
+        "table_data": [_lf_filter_table_data(table_key, flt.name, flt.where, columns_block)]
+    }
+    # SELECT only, as on a column-limited grant: on the filter, never the table.
+    resources.setdefault("aws_lakeformation_permissions", {})[
+        safe_ident(f"{cid}_lf_grant_{table}_{idx}")
+    ] = {
+        "principal": principal,
+        "permissions": ["SELECT"],
+        "data_cells_filter": [
+            {
+                "database_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.database_name"),
+                "table_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
+                "table_catalog_id": tofu_ref("data.aws_caller_identity.fluid_lf_caller.account_id"),
+                "name": flt.name,
+            }
+        ],
+        "depends_on": [f"aws_lakeformation_data_cells_filter.{filter_key}"],
+    }
+
+
+def _emit_lf_masked_views(
+    resources: Dict[str, Any],
+    cid: str,
+    database: str,
+    table: str,
+    table_key: str,
+    masked_views: Sequence["_LfMaskedView"],
+) -> None:
+    """Each masked view as a protected Glue Data Catalog view (``VIRTUAL_VIEW``, run as its
+    definer), the definer's grants it is validated with, and its principal's grant."""
+    db_ref = tofu_ref(f"aws_glue_catalog_table.{table_key}.database_name")
+    tbl_ref = tofu_ref(f"aws_glue_catalog_table.{table_key}.name")
+    perms_res = resources.setdefault("aws_lakeformation_permissions", {})
+    for view in masked_views:
+        definer_table = safe_ident(f"{cid}_lf_view_definer_{table}_{view.definer}")
+        definer_db = safe_ident(f"{cid}_lf_view_definer_db_{database}_{view.definer}")
+        perms_res.setdefault(
+            definer_table,
+            {
+                "principal": view.definer,
+                "permissions": ["SELECT"],
+                "permissions_with_grant_option": ["SELECT"],
+                "table": [{"database_name": db_ref, "name": tbl_ref}],
+            },
+        )
+        # Lake Formation's prerequisites for a view: its definer holds SELECT with the
+        # grant option on every table it reads and CREATE_TABLE on the view's database.
+        perms_res.setdefault(
+            definer_db,
+            {
+                "principal": view.definer,
+                "permissions": ["CREATE_TABLE", "DESCRIBE"],
+                "database": [{"name": db_ref}],
+            },
+        )
+        view_key = safe_ident(f"{cid}_{database}_{view.name}")
+        resources.setdefault("aws_glue_catalog_table", {})[view_key] = {
+            "name": view.name,
+            "database_name": db_ref,
+            **_emulator_catalog_id(),
+            "table_type": "VIRTUAL_VIEW",
+            "view_definition": [
+                {
+                    "definer": view.definer,
+                    "is_protected": True,
+                    "representations": [
+                        {
+                            "dialect": "ATHENA",
+                            "dialect_version": "3",
+                            "validation_connection": view.validation_connection,
+                            "view_original_text": view.sql,
+                        }
+                    ],
+                }
+            ],
+            # Glue validates the view as its definer, so the definer's grants first.
+            "depends_on": [
+                f"aws_lakeformation_permissions.{definer_table}",
+                f"aws_lakeformation_permissions.{definer_db}",
+            ],
+        }
+        perms_res[safe_ident(f"{cid}_lf_view_grant_{view.name}")] = {
+            "principal": view.principal,
+            "permissions": ["SELECT", "DESCRIBE"],
+            "table": [
+                {
+                    "database_name": db_ref,
+                    "name": tofu_ref(f"aws_glue_catalog_table.{view_key}.name"),
+                }
+            ],
+        }
 
 
 def _check_lf_grant_columns(

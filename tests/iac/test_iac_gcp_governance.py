@@ -528,7 +528,7 @@ class TestColumnRestrictions:
         "restriction, fragment",
         [
             ({"principal": ANALYSTS, "columns": ["nope"], "access": "deny"}, "does not declare"),
-            ({"principal": ANALYSTS, "columns": ["msisdn"]}, "must be 'allow' or 'deny'"),
+            ({"principal": ANALYSTS, "columns": ["msisdn"]}, "must be 'allow', 'deny' or 'mask'"),
             ({"columns": ["msisdn"], "access": "deny"}, "names no principal"),
             ({"principal": ANALYSTS, "columns": [], "access": "deny"}, "must list the columns"),
         ],

@@ -37,7 +37,7 @@ step for a renamed unit; this is that idea without the wrapper.
 provider the *state* names, not only the module's: a ``{"terraform": {}}``
 module beside a state naming ``hashicorp/null`` installed the latest
 ``hashicorp/null`` (measured, tofu 1.12), and for an aws state that is the
-latest ``hashicorp/aws``, not the pinned ``~> 5.0``. The probe runs on every
+latest ``hashicorp/aws``, not the pinned ``~> 6.0``. The probe runs on every
 apply whose new key is still empty (every ``--dry-run`` while a move is
 pending, every gcp run while the old key holds the aws state), so it installs
 nothing: ``-plugin-dir`` names an empty directory, the init stops at its

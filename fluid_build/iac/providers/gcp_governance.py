@@ -53,6 +53,25 @@ share their readers, attached through the table schema's ``policyTags`` (dbt's
 ``policy_tags``), and ``roles/datacatalog.categoryFineGrainedReader`` for exactly
 those readers. The resource shapes follow cloud-foundation-fabric's
 ``data-catalog-policy-tag`` module.
+
+**Masking** is a restriction with ``access: mask`` (fluid-schema 0.7.6): the masked
+columns get a policy tag of their own (a tag's data policy applies to every column
+the tag carries, so they never share one with a denied column), a data policy on it
+(``google_bigquery_datapolicy_data_policy``, ``DATA_MASKING_POLICY`` with the rule's
+predefined expression), and ``roles/bigquerydatapolicy.maskedReader`` on the data
+policy for exactly the masked principals. A masked principal reads the same column,
+masked; a fine-grained reader of the tag reads it raw (BigQuery's column data
+masking). The grant takes a minute or two to apply.
+
+**Row filters** are ``exposes[].policy.authz.rowFilters`` through ``iac/row_access.py``:
+a row access policy per filter (``google_bigquery_row_access_policy``), and one that
+selects every row (``TRUE``) for every other reader and writer of the expose, since a
+principal no row access policy names reads no row (BigQuery row-level security).
+
+**Labels**: the contract's and the expose's ``labels``, and its classification,
+jurisdiction and regulatory framework, go onto the dataset, table and key
+(:func:`governance_labels`), so the regulation is on the resource and can be found
+there, not only in the contract.
 """
 
 from __future__ import annotations
@@ -66,10 +85,12 @@ from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
-from ..column_access import authz_readers, column_readers, restrictions_for
+from ..column_access import authz_readers, column_masks, column_readers, restrictions_for
+from ..governance_labels import governance_labels
 from ..naming import safe_ident
 from ..principals import GCP, gcp_grants, principal_map, resolve_principal
 from ..provider_match import canonical_cloud
+from ..row_access import row_filters_for
 
 LOG = logging.getLogger(__name__)
 
@@ -98,6 +119,24 @@ KMS_ENCRYPTER_ROLE = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
 
 #: What a principal needs on a policy tag to read the columns it is attached to.
 FINE_GRAINED_READER_ROLE = "roles/datacatalog.categoryFineGrainedReader"
+
+#: Lets a principal read a policy tag's columns masked, by the tag's data policy.
+MASKED_READER_ROLE = "roles/bigquerydatapolicy.maskedReader"
+
+#: The longest data policy id BigQuery takes. It refuses a longer one ("should only contain
+#: letters, numbers and underscores while under 200 characters"; measured 5 October 2026:
+#: 200 characters accepted, 300 refused).
+DATA_POLICY_ID_MAX = 199
+
+#: ``columnRestrictions[].mask`` rule -> BigQuery data policy ``predefined_expression``.
+MASK_EXPRESSIONS = {
+    "last_four": "LAST_FOUR_CHARACTERS",
+    "first_four": "FIRST_FOUR_CHARACTERS",
+    "nullify": "ALWAYS_NULL",
+}
+
+#: The row access policy that lets every reader no filter names read every row.
+ALL_ROWS_POLICY_ID = "fluid_all_rows"
 
 #: Only DAY partitions are emitted: the one granularity retention in days maps onto.
 PARTITION_TYPE = "DAY"
@@ -153,6 +192,23 @@ class TagGroup:
     #: policy tag's description (a policy tag has no labels of its own).
     rule_tags: Tuple[str, ...] = ()
     rule_labels: Tuple[Tuple[str, str], ...] = ()
+    #: The masking rule of a masked group (one of ``column_access.MASK_RULES``).
+    mask: Optional[str] = None
+    #: IAM members granted the masked reader role on the group's data policy.
+    masked_readers: Tuple[str, ...] = ()
+
+    @property
+    def data_policy_id(self) -> str:
+        """The data policy's id: ``[A-Za-z0-9_]``, unique in the project and location.
+
+        A longer id than BigQuery takes keeps its first characters and ends in a hash of
+        the whole, so two long ids stay distinct.
+        """
+        ident = safe_ident(f"{self.key}_mask")
+        if len(ident) <= DATA_POLICY_ID_MAX:
+            return ident
+        digest = hashlib.sha256(ident.encode("utf-8")).hexdigest()[:12]
+        return f"{ident[: DATA_POLICY_ID_MAX - len(digest) - 1]}_{digest}"
 
     @property
     def description(self) -> str:
@@ -161,6 +217,11 @@ class TagGroup:
             f"Restricted columns {', '.join(self.columns)}: readable only by the principals "
             "granted the fine-grained reader role on this tag."
         )
+        if self.mask:
+            text += (
+                f" Masked ({self.mask}) for the principals granted the masked reader role on "
+                f"its data policy {self.data_policy_id}."
+            )
         if self.rule_tags:
             text += f" Tags: {', '.join(self.rule_tags)}."
         if self.rule_labels:
@@ -409,6 +470,7 @@ def expose_readers(
     where: str,
     exposure: Optional[Mapping[str, Any]] = None,
     readers_where: str = "policy.authz.readers",
+    any_grant: bool = False,
 ) -> FrozenSet[str]:
     """Every IAM member that reads the expose, mapped through ``binding.principals``.
 
@@ -416,11 +478,11 @@ def expose_readers(
     the expose's own ``policy.authz.readers`` (which it does not: their table access
     is managed elsewhere). Both are readers a restriction narrows; leaving the second
     out gave a restricted column no reader at all, so a deny for one group locked it
-    for everyone.
+    for everyone. With ``any_grant``, every member with a grant of any verb.
     """
     members: set[str] = set()
     for grant in gcp_grants(normalize_access_grants(contract), binding, where=where):
-        if READ_VERBS & set(grant.permissions):
+        if any_grant or READ_VERBS & set(grant.permissions):
             members.add(f"{grant.principal_type}:{grant.principal}")
     if exposure is not None:
         mapping = principal_map(binding)
@@ -474,11 +536,15 @@ def tag_groups(
             ),
         )
     by_column = column_readers(exposure, restrictions, resolve, readers, where=where)
-    grouped: Dict[FrozenSet[str], List[str]] = {}
+    masks = column_masks(exposure, restrictions, resolve, readers, where=where)
+    # A tag's data policy masks every column the tag carries, so a masked column
+    # shares a tag only with columns masked alike for the same principals.
+    grouped: Dict[Tuple[FrozenSet[str], Optional[str], FrozenSet[str]], List[str]] = {}
     for column, allowed in by_column.items():
-        grouped.setdefault(allowed, []).append(column)
+        rule, masked = masks.get(column, (None, frozenset()))
+        grouped.setdefault((allowed, rule, masked), []).append(column)
     groups: List[TagGroup] = []
-    for allowed, columns in grouped.items():
+    for (allowed, rule, masked), columns in grouped.items():
         rules = [r for r in restrictions if set(r.columns) & set(columns)]
         rule_tags = tuple(dict.fromkeys(t for r in rules for t in r.tags))
         rule_labels = tuple(sorted({pair for r in rules for pair in r.labels}))
@@ -490,9 +556,107 @@ def tag_groups(
                 readers=tuple(sorted(allowed)),
                 rule_tags=rule_tags,
                 rule_labels=rule_labels,
+                mask=rule,
+                masked_readers=tuple(sorted(masked)),
             )
         )
     return groups
+
+
+@dataclass(frozen=True)
+class RowPolicy:
+    """One BigQuery row access policy of a table."""
+
+    #: Resource-name stem, unique in the module.
+    key: str
+    policy_id: str
+    predicate: str
+    grantees: Tuple[str, ...]
+
+
+def expose_members(
+    contract: Mapping[str, Any], exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int
+) -> FrozenSet[str]:
+    """Every IAM member with any grant on the expose, readers and writers alike.
+
+    The members a row access policy must name for them to see rows: a writer's own
+    checks (``fluid verify``, the drift gate) read the table too.
+    """
+    at = _where(exposure, index)
+    return expose_readers(
+        contract,
+        binding,
+        where=f"{at} accessPolicy",
+        exposure=exposure,
+        readers_where=f"{at}.policy.authz.readers",
+        any_grant=True,
+    )
+
+
+def row_policies(
+    contract: Mapping[str, Any],
+    exposure: Mapping[str, Any],
+    cid: str,
+    table: str,
+    index: int = 0,
+) -> List[RowPolicy]:
+    """The row access policies one table's row filters become, filters first.
+
+    Each filter's grantees are every identity of its principal, whatever it holds on
+    the expose: a row access policy never grants the table, so naming an identity
+    narrows only what it reads through whichever grant it has, a writer's included
+    (``roles/bigquery.dataEditor`` reads rows too). The last policy selects every row
+    for every other member with a grant on the expose, and never for an identity a
+    filter names: BigQuery shows a principal the union of the policies naming it, so
+    a filtered identity in it would read every row.
+    """
+    filters = row_filters_for(exposure, index)
+    if not filters:
+        return []
+    binding = exposure.get("binding") or {}
+    where = f"{_where(exposure, index)}.policy.authz.rowFilters"
+    mapping = principal_map(binding)
+    members = expose_members(contract, exposure, binding, index)
+    out: List[RowPolicy] = []
+    filtered: set[str] = set()
+    for flt in filters:
+        identities = set(resolve_principal(flt.principal, mapping, platform=GCP, where=where))
+        filtered.update(identities)
+        if not identities:
+            LOG.info(
+                "row_filter_no_identity %s principal=%s: binding.principals maps it to no "
+                "identity on GCP, so there is no one to filter",
+                where,
+                flt.principal,
+            )
+            continue
+        if not identities & members:
+            LOG.warning(
+                "row_filter_principal_without_grant %s principal=%s: the contract grants it "
+                "nothing on this expose; the filter narrows what it reads through any other "
+                "grant",
+                where,
+                flt.principal,
+            )
+        out.append(
+            RowPolicy(
+                key=safe_ident(f"{cid}_{table}_{flt.name}"),
+                policy_id=flt.name,
+                predicate=flt.where,
+                grantees=tuple(sorted(identities)),
+            )
+        )
+    rest = sorted(members - filtered)
+    if rest:
+        out.append(
+            RowPolicy(
+                key=safe_ident(f"{cid}_{table}_{ALL_ROWS_POLICY_ID}"),
+                policy_id=ALL_ROWS_POLICY_ID,
+                predicate="TRUE",
+                grantees=tuple(rest),
+            )
+        )
+    return out
 
 
 def validate_bigquery_governance(
@@ -510,6 +674,13 @@ def validate_bigquery_governance(
             "column-restriction-view",
             f"{where}.policy.authz.columnRestrictions is set on a BigQuery view; policy tags "
             "attach to table columns, so restrict the columns of the table the view reads.",
+            (),
+        )
+    if row_filters_for(exposure, index) and is_view:
+        raise UnsupportedBindingError(
+            "row-filter-view",
+            f"{where}.policy.authz.rowFilters is set on a BigQuery view; row access policies "
+            "attach to tables, so filter the rows of the table the view reads.",
             (),
         )
     tag_groups(contract, exposure, "c", "d", "t", index)
@@ -578,8 +749,9 @@ def refuse_mixed_dataset_encryption(contract: Mapping[str, Any]) -> None:
 def refuse_unsupported_target(exposure: Mapping[str, Any], index: int, target: str) -> None:
     """A GCP expose that is not a BigQuery table must not carry a policy it would drop.
 
-    The GCS, Pub/Sub and Iceberg-storage emitters write no lifecycle rule, key or column
-    control, so a contract asking for one there is refused rather than applied without it.
+    The GCS, Pub/Sub and Iceberg-storage emitters write no lifecycle rule, key, column
+    control or row filter, so a contract asking for one there is refused rather than
+    applied without it.
     """
     where = _where(exposure, index)
     binding = exposure.get("binding") or {}
@@ -591,6 +763,8 @@ def refuse_unsupported_target(exposure: Mapping[str, Any], index: int, target: s
         asked.append("binding.encryption")
     if restrictions_for(exposure, index):
         asked.append("policy.authz.columnRestrictions")
+    if row_filters_for(exposure, index):
+        asked.append("policy.authz.rowFilters")
     if asked:
         raise UnsupportedBindingError(
             "gcp-governance-unsupported-target",
@@ -603,16 +777,22 @@ def refuse_unsupported_target(exposure: Mapping[str, Any], index: int, target: s
 __all__ = [
     "BqEncryption",
     "BqRetention",
+    "ALL_ROWS_POLICY_ID",
     "FINE_GRAINED_READER_ROLE",
     "KEY_ROTATION_PERIOD",
     "KMS_ENCRYPTER_ROLE",
+    "MASKED_READER_ROLE",
+    "MASK_EXPRESSIONS",
     "PARTITION_TYPE",
     "PRODUCT_KEY_NAME",
+    "RowPolicy",
     "TagGroup",
     "dataset_location",
     "encryption_for",
+    "expose_members",
     "expose_readers",
     "gcp_owned",
+    "governance_labels",
     "kms_location",
     "partition_trigger_input",
     "product_key_name",
@@ -620,6 +800,7 @@ __all__ = [
     "refuse_mixed_dataset_encryption",
     "refuse_unsupported_target",
     "retention_for",
+    "row_policies",
     "tag_groups",
     "taxonomy_display_name",
     "taxonomy_region",

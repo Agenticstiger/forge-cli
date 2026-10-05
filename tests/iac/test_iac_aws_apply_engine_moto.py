@@ -18,10 +18,11 @@ These tests drive the real CLI entrypoint (``apply_via_opentofu``) — not
 just the plugin — so the full pipeline is exercised: contract → ``.tf.json``
 → ``tofu init/plan/apply``, including the data-loss gate and ``--dry-run``.
 
-A moto ``ThreadedMotoServer`` provides the AWS API surface; a sidecar
-``provider.tf.json`` aiming the AWS provider at moto is dropped into the
+A moto ``ThreadedMotoServer`` provides the AWS API surface, named by
+``AWS_ENDPOINT_URL`` so the plugin emits its module for an emulator; a sidecar
+``provider_override.tf.json`` aiming each service at moto is dropped into the
 engine's own workdir (``<workspace_dir>/.fluid/iac/aws/<id>/``) before
-apply, so ``tofu init`` merges it with the plugin's credential-free
+apply, so ``tofu init`` merges it into the plugin's credential-free
 ``main.tf.json``. Skipped unless ``tofu`` is on PATH and moto's ``server``
 extra is installed.
 """
@@ -68,8 +69,13 @@ _SKIP_REASON = "needs `tofu` on PATH + moto server extra (pip install 'moto[serv
 
 
 @pytest.fixture
-def moto_endpoint() -> Iterator[str]:
+def moto_endpoint(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     """Start a fresh moto AWS server and clear its process-wide state.
+
+    ``AWS_ENDPOINT_URL`` names it, as an emulator user sets it, so the engine
+    compiles the module for an emulator: provider 6 needs each Glue resource's
+    catalog id there (``aws._emulator_catalog_id``), since the provider skips
+    requesting the account id.
 
     moto's ``ThreadedMotoServer`` shares state with every other moto
     process-level mock — stopping and starting a new server does NOT clear
@@ -84,6 +90,7 @@ def moto_endpoint() -> Iterator[str]:
     try:
         _, port = server.get_host_and_port()
         endpoint = f"http://127.0.0.1:{port}"
+        monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)
         # Reset before yielding — also covers state leaked in by a previous
         # test running in the same process.
         with contextlib.suppress(Exception):
@@ -178,13 +185,14 @@ def _apply_args(contract_path: Path, workspace_dir: Path, **overrides) -> argpar
 
 
 def _drop_moto_provider_sidecar(workspace_dir: Path, contract_id: str, endpoint: str) -> Path:
-    """Drop ``provider.tf.json`` into the apply engine's workdir BEFORE the
-    engine runs — ``tofu init`` merges every ``*.tf.json`` in the directory,
-    so this overlays the moto endpoint + dummy creds onto the plugin's
-    credential-free ``main.tf.json``."""
+    """Drop ``provider_override.tf.json`` into the apply engine's workdir BEFORE
+    the engine runs. An override file merges into the provider block the plugin
+    emits for an emulator (a second plain ``provider "aws"`` block would be a
+    duplicate configuration), overlaying the moto endpoint per service and the
+    dummy creds onto the credential-free ``main.tf.json``."""
     workdir = workspace_dir / ".fluid" / "iac" / "aws" / safe_ident(contract_id)
     workdir.mkdir(parents=True, exist_ok=True)
-    sidecar = workdir / "provider.tf.json"
+    sidecar = workdir / "provider_override.tf.json"
     sidecar.write_text(json.dumps(_provider_override(endpoint)), encoding="utf-8")
     return workdir
 

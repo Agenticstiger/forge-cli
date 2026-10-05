@@ -24,6 +24,13 @@ that principal's ``SELECT`` (or ``ALL``) permissions on this table reaches one o
 them: a table-level grant (every column), a column list naming it, or a column
 wildcard that does not exclude it. So a grant made outside the contract is caught
 too. A mismatch is CRITICAL; a check that could not run is an error.
+
+A grant on a data cells filter (how a contract's ``policy.authz.rowFilters`` reach
+Lake Formation) counts too: ``ListPermissions`` with ``ResourceType: TABLE`` does not
+return those, so they are listed apart, and each filter's own columns
+(``GetDataCellsFilter``: its column list, or its column wildcard and exclusions)
+are what the grant reaches. A filter that cannot be read reaches every column, so a
+check that cannot see it fails rather than passes.
 """
 
 from __future__ import annotations
@@ -36,12 +43,65 @@ LOG = logging.getLogger("fluid.cli.verify.lf_columns")
 ClientFactory = Callable[[str, str], Any]
 
 
-def _readable(resource: Mapping[str, Any], database: str, table: str) -> Optional[Set[str]]:
+def _column_spec(spec: Mapping[str, Any]) -> Set[str]:
+    """A grant's or filter's ``ColumnNames``, or its ``ColumnWildcard`` as ``{"*", "-excluded"}``.
+
+    Neither is every column (``{"*"}``).
+    """
+    if spec.get("ColumnNames"):
+        return set(spec["ColumnNames"])
+    wildcard = spec.get("ColumnWildcard") or {}
+    return {"*", *(f"-{c}" for c in (wildcard.get("ExcludedColumnNames") or ()))}
+
+
+def _filter_columns(
+    lf: Any, ref: Mapping[str, Any], cache: Dict[tuple, Optional[Set[str]]]
+) -> Set[str]:
+    """The columns a data cells filter reaches, read once per filter; every column if unreadable."""
+    key = (
+        ref.get("TableCatalogId"),
+        ref.get("DatabaseName"),
+        ref.get("TableName"),
+        ref.get("Name"),
+    )
+    if key not in cache:
+        try:
+            got = (
+                lf.get_data_cells_filter(
+                    TableCatalogId=ref.get("TableCatalogId"),
+                    DatabaseName=ref.get("DatabaseName"),
+                    TableName=ref.get("TableName"),
+                    Name=ref.get("Name"),
+                ).get("DataCellsFilter")
+                or {}
+            )
+        except Exception as exc:  # noqa: BLE001 — fail closed below
+            LOG.warning("verify_lf_columns could not read data cells filter %s: %s", key, exc)
+            got = None
+        cache[key] = None if got is None else _column_spec(got)
+    found = cache[key]
+    return {"*"} if found is None else found
+
+
+def _readable(
+    resource: Mapping[str, Any],
+    database: str,
+    table: str,
+    lf: Any = None,
+    filters: Optional[Dict[tuple, Optional[Set[str]]]] = None,
+) -> Optional[Set[str]]:
     """Columns of ``database.table`` this permission's resource reaches; ``None`` for none.
 
     The empty set with the ``"*"`` member means every column.
     """
     whole = {"*"}
+    if "DataCellsFilter" in resource:
+        ref = resource.get("DataCellsFilter") or {}
+        if ref.get("DatabaseName") != database or ref.get("TableName") != table:
+            return None
+        if lf is None:
+            return whole
+        return _filter_columns(lf, ref, filters if filters is not None else {})
     if "Table" in resource:
         ref = resource.get("Table") or {}
         if ref.get("DatabaseName") != database:
@@ -53,12 +113,7 @@ def _readable(resource: Mapping[str, Any], database: str, table: str) -> Optiona
         ref = resource.get("TableWithColumns") or {}
         if ref.get("DatabaseName") != database or ref.get("Name") != table:
             return None
-        if ref.get("ColumnNames"):
-            return set(ref["ColumnNames"])
-        wildcard = ref.get("ColumnWildcard")
-        if wildcard is not None:
-            return {"*", *(f"-{c}" for c in (wildcard.get("ExcludedColumnNames") or ()))}
-        return whole
+        return _column_spec(ref)
     return None
 
 
@@ -85,8 +140,26 @@ def _table_permissions(lf: Any) -> List[Mapping[str, Any]]:
         entries.extend(page.get("PrincipalResourcePermissions") or [])
         token = page.get("NextToken")
         if not token:
-            return entries
+            break
         kwargs["NextToken"] = token
+    # Grants on data cells filters are not TABLE permissions: an unfiltered listing
+    # returns them, as ``Resource.DataCellsFilter``.
+    kwargs = {}
+    try:
+        while True:
+            page = lf.list_permissions(**kwargs)
+            entries.extend(
+                e
+                for e in page.get("PrincipalResourcePermissions") or []
+                if "DataCellsFilter" in (e.get("Resource") or {})
+            )
+            token = page.get("NextToken")
+            if not token:
+                break
+            kwargs["NextToken"] = token
+    except Exception as exc:  # noqa: BLE001 — the TABLE listing still stands
+        LOG.warning("verify_lf_columns could not list data cells filter grants: %s", exc)
+    return entries
 
 
 def column_restrictions_dimension(
@@ -142,10 +215,11 @@ def column_restrictions_dimension(
         for g in ((binding.get("governance") or {}).get("lakeFormation") or {}).get("grants") or ()
         if isinstance(g, Mapping) and g.get("principal")
     }
+    filters: Dict[tuple, Optional[Set[str]]] = {}
     visible = {
         (entry.get("Principal") or {}).get("DataLakePrincipalIdentifier")
         for entry in permissions
-        if _readable(entry.get("Resource") or {}, database, table) is not None
+        if _readable(entry.get("Resource") or {}, database, table, lf, filters) is not None
     }
     unseen = sorted(grantees - visible)
     if unseen:
@@ -169,7 +243,7 @@ def column_restrictions_dimension(
                 continue
             if not LF_READ_PERMISSIONS & set(entry.get("Permissions") or ()):
                 continue
-            readable = _readable(entry.get("Resource") or {}, database, table)
+            readable = _readable(entry.get("Resource") or {}, database, table, lf, filters)
             if readable is None:
                 continue
             leaked.extend(c for c in _leaks(readable, list(forbidden)) if c not in leaked)

@@ -16,13 +16,20 @@ contract needs `fluidVersion: "0.7.6"` to validate with them.
 | **Retention**: `exposes[].lifecycle {retention, expire: true}` | One S3 lifecycle rule per expose, filtered to the binding's prefix, expiring objects `retention` after they are written (`aws_s3_bucket_lifecycle_configuration`). | Daily partitions that expire `retention` after their day ends: `google_bigquery_table.time_partitioning {type: DAY, expiration_ms}`, by ingestion time, or on `binding.location.partitionBy` when it names one date or timestamp column (see "Retention counts from the partition's date" below). Never a table expiration, which would delete the product. | AWS: the enabled prefix rule's `Expiration.Days`, and no rule that expires sooner. GCP: the table's partition type, field and `expirationMs`, and that the table itself has no `expirationTime`. |
 | **Encryption at rest**: `binding.encryption.kms` | `product`: a KMS key per bucket (`aws_kms_key`, rotation on, alias `alias/fluid/<id>/<bucket>`) as the bucket's default SSE-KMS. `alias/...` or an ARN: that key. `none`: SSE-S3. | `product`: a key ring and key per dataset (`google_kms_key_ring` `fluid-<id>-<dataset>`, `google_kms_crypto_key` `bigquery`, 90-day rotation) in the dataset's location, `roles/cloudkms.cryptoKeyEncrypterDecrypter` for the BigQuery service agent (`google_kms_crypto_key_iam_member`), used as the dataset's `default_encryption_configuration` and the table's `encryption_configuration`. `projects/.../cryptoKeys/...`: that key. `none`: Google-managed keys. Every table of one dataset must declare the same key (see "One dataset, one key"). | AWS: the key is `Enabled`, and the objects under the prefix are SSE-KMS with it. GCP: `kmsKeyName` of the table, and of the dataset's default when the product owns the dataset. |
 | **Column restrictions**: `exposes[].policy.authz.columnRestrictions` | Each Lake Formation grant with `SELECT` excludes the restricted columns its principal may not read (`aws_lakeformation_permissions.table_with_columns.excluded_column_names`, with `wildcard`). | A Data Catalog taxonomy per product and dataset with fine-grained access control (`google_data_catalog_taxonomy`), a policy tag per set of restricted columns that share their readers (`google_data_catalog_policy_tag`), attached through the table schema's `policyTags`, and `roles/datacatalog.categoryFineGrainedReader` for exactly the allowed readers (`google_data_catalog_policy_tag_iam_member`). The restrictions' `tags` and `labels` go into the policy tag's description. | AWS: `lakeformation:ListPermissions` on tables; no `SELECT` of a denied principal, of a read grantee, or of `IAM_ALLOWED_PRINCIPALS` reaches a column it may not read, including grants made outside the contract. GCP: every restricted column carries a tag, the tag's fine-grained readers are exactly the derived set (a denied principal, or one granted outside the contract, fails), and the taxonomy enforces fine-grained access control. |
+| **Column masking**: `columnRestrictions[] {access: mask, mask: last_four \| first_four \| nullify}` | Lake Formation cannot mask. The masked principal's grant excludes the masked columns from the table, as a deny does, and a protected multi-dialect Glue Data Catalog view returns them masked (`aws_glue_catalog_table`, `table_type = VIRTUAL_VIEW`, `view_definition {is_protected, definer, representations {dialect = ATHENA, validation_connection}}`, named `<table>_masked`): exactly the columns the principal's own grant reads raw (its `columns` list, or every column less its exclusions), the masked ones through the same rule in Athena SQL, and the principal's row filter as the view's `WHERE`. The view reads the table as its definer, so it selects nothing the grant does not. The definer gets `SELECT` with grant option on the table and `CREATE_TABLE` and `DESCRIBE` on the database (Lake Formation's view prerequisites), the principal `SELECT` and `DESCRIBE` on the view. Needs `governance.lakeFormation.maskedViews {definer, validationConnection}`. | The masked columns get a policy tag of their own with a BigQuery data policy on it (`google_bigquery_datapolicy_data_policy`, `DATA_MASKING_POLICY`, predefined `LAST_FOUR_CHARACTERS`, `FIRST_FOUR_CHARACTERS` or `ALWAYS_NULL`) and `roles/bigquerydatapolicy.maskedReader` on the data policy for the masked principals (`google_bigquery_datapolicy_data_policy_iam_member`). The tag's fine-grained readers read the clear value. | AWS: the masked principal's table grant excludes the masked columns (the column check above). GCP: the masked tag's fine-grained readers are exactly the derived set. Not checked yet: the data policy and its masked readers, and the view's SQL. |
+| **Row filters**: `exposes[].policy.authz.rowFilters[] {principal, where, name?}` | A Lake Formation data cells filter per filter (`aws_lakeformation_data_cells_filter`, `row_filter.filter_expression` the predicate, `column_wildcard.excluded_column_names` the principal's excluded columns), and the principal's `SELECT` granted on the filter instead of the table. | A row access policy per filter (`google_bigquery_row_access_policy`, `filter_predicate` the predicate, `grantees` every identity of the principal, whatever it holds: a writer reads rows too), and one more, `fluid_all_rows` (`TRUE`), for every other principal the expose grants anything to, never for a filtered one, since BigQuery shows a principal no policy names no row at all and the union of those that do. | AWS: the column check reads a grant made on a data cells filter, so a filtered principal's excluded columns are still checked. Not checked yet: the filter expression on AWS, and the row access policies on GCP. |
+| **Governance labels**: `labels`, `exposes[].labels`, `dataClassification`, `sovereignty {jurisdiction, regulatoryFramework, dataResidency}` | The same keys as AWS tags on the bucket and the key, and as parameters on the Glue table. | GCP labels on the dataset, the table and the key: the contract's and the expose's labels, and `fluid_classification`, `fluid_jurisdiction`, `fluid_regulation` (the frameworks joined), `fluid_residency`. | Not checked yet. |
 | **Access grants**: `accessPolicy.grants[]` | Not emitted: on AWS, access is the binding's `governance.lakeFormation.grants`. `fluid validate` warns only for an aws binding with no Lake Formation grants, where the contract's access intent is unenforced. | One non-authoritative `google_bigquery_dataset_iam_member` per role and member (and `google_storage_bucket_iam_member` for GCS), with the logical principal mapped to its GCP identity. | Not checked yet on either cloud. |
 
 A policy that a binding cannot apply is refused at `fluid validate`, `fluid plan` and
 `fluid apply`, never dropped: retention, a key or a column restriction on a GCP
 binding that is not a BigQuery table (GCS, Pub/Sub, Iceberg storage), a column
 restriction on an AWS binding with no Lake Formation grants or on a non-Glue format,
-an AWS key reference on GCP and a Cloud KMS key name on AWS.
+an AWS key reference on GCP and a Cloud KMS key name on AWS, a mask on an AWS binding
+with no `maskedViews` (`column-mask-unenforceable`), a text mask on a column that is
+not a string (`column-mask-type`), a row filter whose principal holds no Lake
+Formation read grant (`row-filter-unenforceable`), and a row filter on a BigQuery view
+(`row-filter-view`) or on a GCP binding that is not a BigQuery table.
 
 ## Logical principals and `binding.principals`
 
@@ -85,7 +92,11 @@ The pattern follows ODCS v3, which declares `roles[]` once and binds them per se
 * A column named in any restriction is restricted.
 * `deny`: the principal may not read the columns.
 * `allow`: the columns are readable only by the principals an `allow` names.
-* A deny beats an allow. A restriction never grants access: the readers are the
+* `mask` (with `mask: last_four`, `first_four` or `nullify`): the principal reads the
+  columns masked, never clear. A masked principal is denied the raw column, so on
+  every check that counts readers it counts as denied. A rule needs `access: mask`, a
+  mask needs its rule, and a column has one rule.
+* A deny beats an allow and a mask. A restriction never grants access: the readers are the
   expose's readers. On GCP they are the `accessPolicy` read grantees and the
   expose's own `policy.authz.readers` (whose table access is managed elsewhere, so
   only the fine-grained reader role on the tag is granted to them); on AWS, the Lake
@@ -103,12 +114,77 @@ The pattern follows ODCS v3, which declares `roles[]` once and binds them per se
   (`column-restriction-conflict`).
 
 On GCP a denied principal gets an access error on the restricted columns;
-`SELECT * EXCEPT (customer_id, msisdn)` still works for it. BigQuery dynamic data
-masking (`google_bigquery_datapolicy_data_policy`, SHA-256 or nullify, for principals
-holding `roles/bigquerydatapolicy.maskedReader`) is not emitted yet. It needs a third
-principal set (who sees masked values rather than an error) that the contract has no
-field for, and a column masked at landing (`policy.privacy.masking`) would be hashed
-twice.
+`SELECT * EXCEPT (customer_id, msisdn)` still works for it.
+
+## Masking: the platform's, and the landing's
+
+`access: mask` is the platform masking a column at read time, for its principal only;
+the stored value is clear and its other readers read it. `policy.privacy.masking` is
+the build hashing (or tokenizing) the value before it lands, so nobody reads it clear.
+A contract can carry both on two columns of one value, as a column kept clear for its
+stewards and masked for analysts, beside a salted hash every reader may join on.
+Masking a column that `privacy.masking` already hashes would mask the hash.
+
+* **GCP**: BigQuery's predefined rules. `last_four` is `LAST_FOUR_CHARACTERS`
+  (`XXXXX` and the last four characters), `first_four` is `FIRST_FOUR_CHARACTERS`,
+  `nullify` is `ALWAYS_NULL`. The data policy is attached to the policy tag of the
+  masked columns, so the columns' fine-grained readers read the clear value and the
+  masked readers read the masked one. A principal with neither is refused, as for a
+  deny. BigQuery applies a new masked reader about a minute or two after the grant.
+  A data policy id longer than BigQuery takes (it refuses 200 characters or more) keeps
+  its first characters and ends in a hash of the whole.
+* **AWS**: Lake Formation has no masking, so the masked value comes from a protected
+  Glue Data Catalog view (Lake Formation's multi-dialect views, run as their
+  definer). The view returns the rule's value in Athena SQL:
+  `concat('XXXXX', substr(c, -4))` for `last_four`, the first four and `XXXXX` for
+  `first_four`, `NULL` for `nullify`, and NULL stays NULL. A value of four characters
+  or fewer is returned as its SHA-256, since its last four characters would be all of
+  it. The principal keeps its grant on the table, without the masked columns.
+* The view needs, per account: an Athena workgroup, a Glue connection of type
+  `VIEW_VALIDATION_ATHENA` naming it (`validationConnection`), and a definer role
+  that Glue and Lake Formation may assume (`sts:AssumeRole` and `sts:SetContext` for
+  `glue.amazonaws.com` and `lakeformation.amazonaws.com`). The identity running
+  `fluid apply` needs `iam:PassRole` on the definer and `glue:PassConnection` on the
+  connection. A validated view carries no storage descriptor.
+* The view is created by terraform-provider-aws 6 (`aws_glue_catalog_table`
+  `view_definition`, which 5.x does not have), which forge-cli pins as `~> 6.0`.
+
+## Row filters
+
+`exposes[].policy.authz.rowFilters[]` names a principal and one SQL boolean
+expression over the expose's columns; that principal reads only the rows it
+selects. A reader no filter names reads every row, and a principal has one filter
+per expose. The predicate is parsed (sqlglot) before it is written into a policy: a
+statement separator, a comment, a subquery or a column the schema does not declare is
+refused. Write it NULL-aware: `is_suppressed = false` drops the rows where the column
+is NULL, which `(is_suppressed IS NULL OR is_suppressed = false)` keeps.
+
+```yaml
+policy:
+  authz:
+    rowFilters:
+      - principal: group:analysts@northwind.example
+        name: analysts_consented
+        where: consent_data_analytics = true AND (is_suppressed IS NULL OR is_suppressed = false)
+```
+
+* **GCP**: a row access policy per filter, naming every identity of its principal,
+  whatever the principal holds (a row access policy never grants the table, and a
+  writer's `roles/bigquery.dataEditor` reads rows), and `fluid_all_rows` (`FILTER USING
+  (TRUE)`) for every other principal the expose grants anything to, the pipeline's
+  identity included, because BigQuery shows a principal that no row access policy
+  names no row at all. A filtered identity is never in `fluid_all_rows`: BigQuery
+  shows a principal the union of the policies naming it.
+* **AWS**: a data cells filter per filter; the principal's `SELECT` is granted on the
+  filter, with the principal's excluded columns as its column wildcard's exclusions,
+  instead of on the table. The masked view of a filtered principal applies the same
+  predicate, since the view reads the table as its definer.
+* **A build keeps them.** BigQuery removes every row access policy of a table that a
+  `WRITE_TRUNCATE` load writes, so a full-refresh build loads with
+  `WRITE_TRUNCATE_DATA`, which replaces the rows and keeps the table's policies, tags
+  and partitioning (measured on BigQuery, 5 October 2026, on an unpartitioned and on a
+  DAY-partitioned table with a partition expiration). It is the disposition dlt's
+  BigQuery destination uses for the same reason.
 
 ## Dataset grants are no longer authoritative
 
@@ -208,6 +284,10 @@ keep data longer, set a longer `retention` instead.
   (create key rings and keys, set their IAM), `roles/datacatalog.categoryAdmin`
   (taxonomies, tags and their IAM), and `bigquery.datasets.update` on the datasets
   (dataset IAM members).
+* For masking and row filters on GCP: the BigQuery Data Policy API
+  (`bigquerydatapolicy.googleapis.com`) enabled, and `bigquery.dataPolicies.*` and
+  `bigquery.rowAccessPolicies.*` for the identity running `fluid apply`.
+  `roles/bigquery.dataOwner` on the project carries both.
 * A key ring and a crypto key cannot be deleted on GCP. `tofu destroy` removes them
   from state and schedules the key's versions for destruction (30 days by default);
   the next apply adopts the same names (`discover_imports`).
@@ -252,6 +332,22 @@ keep data longer, set a longer `retention` instead.
     "User has neither fine-grained reader nor masked get permission to get data
     protected by policy tag … on column …", not the documented "does not have
     permission to access policy tag".
+* **Masking and row filters, measured by hand**, 5 October 2026, on the same lab's
+  customer profile table, with the resources this release emits made by hand:
+  * BigQuery: a `LAST_FOUR_CHARACTERS` data policy on a policy tag, the analyst a
+    masked reader, read `XXXXX` and the last four digits, and the steward, a
+    fine-grained reader, read the number.
+  * AWS: a protected Glue view with the Athena expression above returned every row
+    masked to the analyst, who was still refused the column on the table.
+  * AWS: a data cells filter with the NULL-aware consent predicate returned 752 of
+    10,172 rows to the analyst.
+  * BigQuery: a `WRITE_TRUNCATE` load removed a table's row access policy and the
+    table then showed every row; a `WRITE_TRUNCATE_DATA` load kept it.
+* `tofu plan` with terraform-provider-aws 6.67 against the live state of the lab's
+  eleven AWS products planned no change for any of them, with only the provider pin
+  moved from `~> 5.0`.
+* **Not proven yet**: an apply of the masking, row filter and label resources exactly
+  as forge-cli emits them, on either cloud.
 * **Not proven**: the Lake Formation half against a real account as 0.17.0 derives it
   from `columnRestrictions`. The grant shape it emits (excluded columns beside
   `wildcard`) was applied and enforced on a real account from 0.16.6, written by hand

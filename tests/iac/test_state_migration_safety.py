@@ -260,10 +260,10 @@ def test_a_probe_that_cannot_initialise_at_all_is_an_error_not_an_empty_state(fa
 
 def test_the_move_installs_what_the_old_state_names_at_the_plugin_s_pins(fake, tmp_path):
     """Once per contract, the copy's init installs providers: the pinned
-    ``~> 5.0`` aws, not the latest, and only what the state names."""
+    ``~> 6.0`` aws, not the latest, and only what the state names."""
     tofu = fake([_EMPTY, _EMPTY, _state("55555555-eeee", *_OLD["resources"])])
     assert _reconcile(tmp_path).outcome == mig.MIGRATED
-    want = {"aws": {"source": "hashicorp/aws", "version": "~> 5.0"}}
+    want = {"aws": {"source": "hashicorp/aws", "version": "~> 6.0"}}
     assert tofu.modules["move"]["terraform"]["required_providers"] == want
     assert tofu.modules["move"]["terraform"]["backend"] == _LEGACY
     assert tofu.modules["move-copy"]["terraform"]["required_providers"] == want

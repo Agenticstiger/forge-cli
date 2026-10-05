@@ -44,10 +44,12 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
+from unittest import mock
 
 import pytest
 
@@ -187,9 +189,19 @@ def _tofu(workdir: Path, env: Dict[str, str], *args: str) -> "subprocess.Complet
 
 
 def _write(contract: Dict[str, Any], workdir: Path, endpoint: str) -> None:
+    """The module as forge-cli emits it for an emulator, with moto's routing as its provider.
+
+    Emitted with ``AWS_ENDPOINT_URL`` set, as an emulator user runs it: the provider skips
+    requesting the account id, so each Glue resource names its catalog
+    (``aws._emulator_catalog_id``); provider 6 refuses to read back a Glue id with an empty
+    one. The emitted provider block is replaced by this file's, which routes each service to
+    moto, so there is one provider configuration.
+    """
     workdir.mkdir(parents=True, exist_ok=True)
-    (workdir / "main.tf.json").write_text(build_module(get_iac_plugin("aws"), contract))
-    (workdir / "provider.tf.json").write_text(json.dumps(_provider_override(endpoint)))
+    with mock.patch.dict(os.environ, {"AWS_ENDPOINT_URL": endpoint}):
+        module = json.loads(build_module(get_iac_plugin("aws"), contract))
+    module["provider"] = _provider_override(endpoint)["provider"]
+    (workdir / "main.tf.json").write_text(json.dumps(module, indent=2))
 
 
 def _init(workdir: Path, env: Dict[str, str]) -> None:
