@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.2] — 2026-10-05
+
+`fluid diff --exit-on-drift` passes for a silver or gold whose gcp overlay names its
+project through the environment. 0.18.1 fixed the live check, and the bronze then
+passed, but `fluid diff` still planned with the project as written. The GCP planner
+refused it while wrapping the product's SQL build.
+
 ### Fixed
 
-- **`fluid diff` plans the contract it resolved, not the one as written.** 0.18.1
+- **`fluid diff` plans the contract it resolved, not the one as written** (#696). 0.18.1
   resolved `{{ env.* }}` for the live check only. `fluid diff` still built the provider
   from the binding's project as written, and planned with it. For a gcp binding whose
   project is `{{ env.FLUID_GCP_PROJECT }}`, the GCP planner then refused the placeholder
@@ -19,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with no SQL build, passed. The contract is now resolved once, as soon as it is
   loaded, the way `fluid plan` and `fluid apply` read it. Found on the demo lab's GCP
   chain on 0.18.1.
+
+### Documentation
+
+- **`docs/governance-parity.md` states the GCP half as measured** (#694): applied,
+  verified and queried as each principal against real BigQuery, Cloud KMS and Data Catalog
+  on 4 October 2026. What stays unproven is narrowed to the Lake Formation half as 0.17.0
+  derives it.
 
 ## [0.18.1] — 2026-10-05
 
