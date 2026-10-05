@@ -123,6 +123,27 @@ def _has_custom_aws_endpoint() -> bool:
     )
 
 
+def _emulator_catalog_id() -> Dict[str, Any]:
+    """``{"catalog_id": <the caller's account>}`` for a Glue database or table on an emulator.
+
+    terraform-provider-aws 6 makes a Glue database's id ``<catalog id>:<name>``
+    (a table's ``<catalog id>:<database>:<name>``), the catalog id being the
+    resource's ``catalog_id`` or else the provider's account id, and refuses
+    to read back an id with an empty catalog ("unexpected format for ID
+    (:sales), expected catalog-id:database-name";
+    hashicorp/terraform-provider-aws#31626). On an emulator the provider
+    skips requesting the account id (:meth:`AwsIacPlugin.provider_block`),
+    which it must, because given one, provider 6.23 and later read a bucket's
+    tags through S3 Control at ``<account>.<endpoint>``, which neither moto
+    nor LocalStack routes (hashicorp/terraform-provider-aws#45292). So the
+    catalog id comes from ``data.aws_caller_identity``, which the emulator
+    answers. On real AWS this is ``{}``: the module is unchanged.
+    """
+    if not _has_custom_aws_endpoint():
+        return {}
+    return {"catalog_id": tofu_ref("data.aws_caller_identity.fluid_lf_caller.account_id")}
+
+
 def _resolve_catalog_id() -> str:
     """Resolve the AWS account id for Glue catalog import ids.
 
@@ -481,10 +502,13 @@ class AwsIacPlugin:
         # ``{account}-fluid-data`` bucket, whose token references this source.
         # ...and whenever a product KMS key's policy names the account.
         storage = _storage_by_bucket(contract, cid)
+        # ...and on an emulator, where it is every Glue resource's catalog id
+        # (see :func:`_emulator_catalog_id`).
         if (
             _contract_uses_lakeformation(contract)
             or _references_caller_account(contract)
             or any(s.product_key for s in storage.values())
+            or _has_custom_aws_endpoint()
         ):
             data.setdefault("aws_caller_identity", {})["fluid_lf_caller"] = {}
         # A ``cross-account`` LF bucket policy filters its grantees at plan
@@ -643,7 +667,9 @@ class AwsIacPlugin:
 
         Gated on :func:`_has_custom_aws_endpoint`, so real-AWS applies are
         byte-for-byte unchanged (no provider block emitted). Mirrors
-        LocalStack's documented Terraform provider setup.
+        LocalStack's documented Terraform provider setup. Without the account
+        id, provider 6 builds Glue ids with an empty catalog, so each Glue
+        database and table names its catalog (:func:`_emulator_catalog_id`).
         """
         if not _has_custom_aws_endpoint():
             return {}
@@ -786,6 +812,7 @@ def _emit_glue(
             db_name,
             {
                 "name": database,
+                **_emulator_catalog_id(),
                 "lifecycle": {"ignore_changes": ["parameters"]},
             },
         )
@@ -909,6 +936,7 @@ def _emit_glue(
     }
     if description:
         table_body["description"] = description
+    table_body.update(_emulator_catalog_id())
 
     resources.setdefault("aws_glue_catalog_table", {})[
         safe_ident(f"{cid}_{database}_{table}")
@@ -2604,6 +2632,7 @@ def _emit_lf_masked_views(
         resources.setdefault("aws_glue_catalog_table", {})[view_key] = {
             "name": view.name,
             "database_name": db_ref,
+            **_emulator_catalog_id(),
             "table_type": "VIRTUAL_VIEW",
             "view_definition": [
                 {

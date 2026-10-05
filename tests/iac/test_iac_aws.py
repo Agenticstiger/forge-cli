@@ -204,6 +204,27 @@ class TestAwsProviderBlock:
         assert aws["skip_metadata_api_check"] is True
         assert aws["skip_region_validation"] is True
 
+    def test_on_an_emulator_each_glue_resource_names_its_catalog(self, monkeypatch):
+        """Provider 6 builds a Glue id from the catalog; with the account id skipped it was
+        ``:<name>``, which 6.x refuses to read back (hashicorp/terraform-provider-aws#31626)."""
+        self._clear_endpoint_env(monkeypatch)
+        monkeypatch.setenv("AWS_ENDPOINT_URL", "http://localhost:4566")
+        c = _contract([_glue_exposure(database="d", table="t", bucket="b")])
+        doc = json.loads(build_module(_aws(), c))
+        ref = "${data.aws_caller_identity.fluid_lf_caller.account_id}"
+        (db,) = doc["resource"]["aws_glue_catalog_database"].values()
+        (table,) = doc["resource"]["aws_glue_catalog_table"].values()
+        assert db["catalog_id"] == ref and table["catalog_id"] == ref
+        assert "fluid_lf_caller" in doc["data"]["aws_caller_identity"]
+
+    def test_on_real_aws_no_glue_resource_names_its_catalog(self, monkeypatch):
+        self._clear_endpoint_env(monkeypatch)
+        c = _contract([_glue_exposure(database="d", table="t", bucket="b")])
+        doc = json.loads(build_module(_aws(), c))
+        (db,) = doc["resource"]["aws_glue_catalog_database"].values()
+        (table,) = doc["resource"]["aws_glue_catalog_table"].values()
+        assert "catalog_id" not in db and "catalog_id" not in table
+
     def test_per_service_endpoint_also_triggers_compat(self, monkeypatch):
         self._clear_endpoint_env(monkeypatch)
         monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "http://localhost:4566")
