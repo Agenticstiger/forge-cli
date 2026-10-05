@@ -227,6 +227,14 @@ def run(args, logger: logging.Logger) -> int:
         # Drift mode (contract-vs-live-warehouse) — the original behaviour.
         # Load contract and generate desired state
         contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
+        # ``{{ env.* }}`` resolved once, here, before the provider is built from
+        # the binding and plans the contract: as ``fluid plan`` and ``fluid
+        # apply`` read it. Resolved only for the live check (0.18.1), a gcp
+        # binding whose project is ``{{ env.FLUID_GCP_PROJECT }}`` still built
+        # the GCP provider with the placeholder as its project, and the planner
+        # refused it ("Invalid GCP project ID") wrapping an embedded-SQL build
+        # into ``CREATE OR REPLACE TABLE <project>...``: every silver and gold.
+        contract = resolve_env_templates_in_contract(copy.deepcopy(dict(contract)))
 
         # Bug 5a: infer the provider from ``binding.platform`` when the
         # operator didn't pass ``--provider`` and ``FLUID_PROVIDER`` env

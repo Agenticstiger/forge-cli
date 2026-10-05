@@ -841,6 +841,43 @@ def test_bigquery_project_named_through_an_env_variable_is_read_resolved(
     assert bigquery.requested == ["northwind-demo.demo_bronze.customer_subscriptions"]
 
 
+@pytest.mark.parametrize("from_bundle", [False, True], ids=["contract", "bundle"])
+def test_a_sql_built_product_named_through_an_env_variable_is_planned_resolved(
+    workspace, built_providers, bigquery, monkeypatch, from_bundle
+):
+    """A silver or gold whose gcp overlay names its project ``{{ env.NAME }}``.
+    ``fluid diff`` plans the contract before it compares, and the GCP planner
+    wraps an embedded-SQL build into ``CREATE OR REPLACE TABLE <project>...``,
+    validating the project first. The plan ran on the contract as written, so
+    the placeholder itself was refused ("Invalid GCP project ID") and the gate
+    failed with diff_failed, on every build after the first, while ``fluid
+    plan`` and ``fluid apply`` resolve it. A bronze, with no SQL build, passed.
+    ``built_providers`` stands in for the provider, so what is pinned is the
+    project ``fluid diff`` builds it with: the real GCP planner refuses any other."""
+    monkeypatch.setenv("FLUID_TEST_GCP_PROJECT", "northwind-demo")
+    location = {**GCP_BINDING["location"], "project": "{{ env.FLUID_TEST_GCP_PROJECT }}"}
+    builds = [
+        {
+            "id": "summarise",
+            "pattern": "embedded-logic",
+            "engine": "sql",
+            "properties": {"sql": "SELECT 1 AS subscription_id"},
+            "outputs": ["subscriptions"],
+        }
+    ]
+    contract = _write_contract(
+        workspace, _contract({**GCP_BINDING, "location": location}, builds=builds)
+    )
+    target = _bundle(contract, workspace / "bundle.tgz") if from_bundle else contract
+
+    rc, event = _invoke(["diff", str(target), "--out", "diff.json", "--exit-on-drift"])
+
+    assert (rc, event) == (0, None)
+    assert [c["project"] for c in built_providers] == ["northwind-demo"]
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert expose["target"] == "bigquery:northwind-demo.demo_bronze.customer_subscriptions"
+
+
 def test_bigquery_column_retyped_outside_the_contract_fails_the_gate(
     workspace, built_providers, bigquery
 ):

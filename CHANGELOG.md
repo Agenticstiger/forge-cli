@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fluid diff` plans the contract it resolved, not the one as written.** 0.18.1
+  resolved `{{ env.* }}` for the live check only. `fluid diff` still built the provider
+  from the binding's project as written, and planned with it. For a gcp binding whose
+  project is `{{ env.FLUID_GCP_PROJECT }}`, the GCP planner then refused the placeholder
+  ("Invalid GCP project ID") while wrapping an embedded-SQL build into
+  `CREATE OR REPLACE TABLE <project>...`. So `--exit-on-drift`, stage 5 of the
+  generated pipelines, failed with `diff_failed` for every silver and gold. A bronze,
+  with no SQL build, passed. The contract is now resolved once, as soon as it is
+  loaded, the way `fluid plan` and `fluid apply` read it. Found on the demo lab's GCP
+  chain on 0.18.1.
+
 ## [0.18.1] — 2026-10-05
 
 `fluid diff --exit-on-drift` reads a BigQuery target whose project is named
