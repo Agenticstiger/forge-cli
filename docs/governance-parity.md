@@ -233,8 +233,26 @@ keep data longer, set a longer `retention` instead.
 * The same stand-in shows a revoked reader plans one member destroy that the gate
   lets through, and that moving from the authoritative access list of 0.16.6 and earlier to member
   resources revokes a grant removed in the same change and then plans clean.
-* **Not proven**: anything against real BigQuery, Cloud KMS, Data Catalog or Lake
-  Formation. No emulator enforces IAM, policy tags or keys: that a denied principal's
-  query is refused, that the BigQuery service agent can use the key, and that a load
-  into a policy-tagged column succeeds for the pipeline's identity rest on the
-  providers' documentation.
+* **Measured against real Google Cloud**, 4 October 2026, on 0.18.0. In a demo lab, two
+  lineage chains of eleven products were applied with `fluid apply --env gcp` from
+  generated Jenkins pipelines, as a deploy service account reached by Workload Identity
+  Federation:
+  * Every apply created its dataset, key ring and key, its table with daily partitions
+    that expire after the retention, its dataset IAM members, and a policy tag on each
+    restricted column.
+  * Every load into a policy-tagged column succeeded for the pipeline's identity.
+  * Consumers read their upstreams bound to BigQuery from BigQuery.
+  * The BigQuery service agent used each product's key: every load and query ran
+    against a CMEK table.
+  * Every `fluid verify` passed its retention, encryption and columnRestrictions
+    dimensions against the live platform.
+  * Querying as each principal: a denied principal's query of a restricted column is
+    refused by that column's tag, a reader the restriction leaves reads it, and a
+    principal with no dataset grant is refused the table. BigQuery's refusal reads
+    "User has neither fine-grained reader nor masked get permission to get data
+    protected by policy tag … on column …", not the documented "does not have
+    permission to access policy tag".
+* **Not proven**: the Lake Formation half against a real account as 0.17.0 derives it
+  from `columnRestrictions`. The grant shape it emits (excluded columns beside
+  `wildcard`) was applied and enforced on a real account from 0.16.6, written by hand
+  in the overlay.
