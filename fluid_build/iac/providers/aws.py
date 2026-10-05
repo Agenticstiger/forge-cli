@@ -2169,6 +2169,27 @@ def _athena_mask(column_sql: str, rule: str) -> str:
 _STRING_TYPES = frozenset({"string", "varchar", "text", "char"})
 
 
+def _grant_raw_columns(
+    grant: Mapping[str, Any],
+    schema: Sequence[Mapping[str, Any]],
+    derived_exclusions: Optional[Sequence[str]],
+) -> set:
+    """The columns a Lake Formation grant lets its principal read raw from the table.
+
+    A protected view reads the table as its definer, so whatever it selects its reader
+    reads, whatever the reader's own grant allows: the view must select no column the
+    grant does not. A ``columns:`` list is the grant's allow list; otherwise every
+    column less its exclusions, derived or written as ``excludedColumns`` (the two
+    agree, or the emit is refused), as :func:`_emit_lakeformation` grants them.
+    """
+    declared = {str(c.get("name")) for c in schema if c.get("name")}
+    listed = grant.get("columns")
+    if listed:
+        return declared & {str(c) for c in listed}
+    excluded = derived_exclusions or grant.get("excludedColumns") or ()
+    return declared - {str(c) for c in excluded}
+
+
 def lf_masked_views(
     exposure: Mapping[str, Any],
     binding: Mapping[str, Any],
@@ -2243,11 +2264,11 @@ def lf_masked_views(
         mine = [c for c, (_rule, ids) in masks.items() if principal in ids]
         if not mine:
             continue
-        hidden = set(exclusions.get(i) or ()) - set(mine)
+        raw = _grant_raw_columns(grant, schema, exclusions.get(i)) - set(mine)
         select = []
         for col in schema:
             name = str(col.get("name"))
-            if name in hidden:
+            if name not in mine and name not in raw:
                 continue
             quoted = f'"{validate_ident(name)}"'
             select.append(

@@ -602,10 +602,13 @@ def row_policies(
 ) -> List[RowPolicy]:
     """The row access policies one table's row filters become, filters first.
 
-    Each filter's grantees are its principal's identities that read the expose; the
-    last policy selects every row for every other member with a grant on the expose.
-    A filter whose principal reads nothing is reported and left out: a row access
-    policy never grants the table.
+    Each filter's grantees are every identity of its principal, whatever it holds on
+    the expose: a row access policy never grants the table, so naming an identity
+    narrows only what it reads through whichever grant it has, a writer's included
+    (``roles/bigquery.dataEditor`` reads rows too). The last policy selects every row
+    for every other member with a grant on the expose, and never for an identity a
+    filter names: BigQuery shows a principal the union of the policies naming it, so
+    a filtered identity in it would read every row.
     """
     filters = row_filters_for(exposure, index)
     if not filters:
@@ -613,36 +616,37 @@ def row_policies(
     binding = exposure.get("binding") or {}
     where = f"{_where(exposure, index)}.policy.authz.rowFilters"
     mapping = principal_map(binding)
-    readers = expose_readers(
-        contract,
-        binding,
-        where=f"{_where(exposure, index)} accessPolicy",
-        exposure=exposure,
-        readers_where=f"{_where(exposure, index)}.policy.authz.readers",
-    )
+    members = expose_members(contract, exposure, binding, index)
     out: List[RowPolicy] = []
     filtered: set[str] = set()
     for flt in filters:
         identities = set(resolve_principal(flt.principal, mapping, platform=GCP, where=where))
-        grantees = sorted(identities & readers)
-        if not grantees:
-            LOG.warning(
-                "row_filter_not_a_reader %s principal=%s: no identity of it reads the expose, so "
-                "the filter has no one to narrow",
+        filtered.update(identities)
+        if not identities:
+            LOG.info(
+                "row_filter_no_identity %s principal=%s: binding.principals maps it to no "
+                "identity on GCP, so there is no one to filter",
                 where,
                 flt.principal,
             )
             continue
-        filtered.update(identities)
+        if not identities & members:
+            LOG.warning(
+                "row_filter_principal_without_grant %s principal=%s: the contract grants it "
+                "nothing on this expose; the filter narrows what it reads through any other "
+                "grant",
+                where,
+                flt.principal,
+            )
         out.append(
             RowPolicy(
                 key=safe_ident(f"{cid}_{table}_{flt.name}"),
                 policy_id=flt.name,
                 predicate=flt.where,
-                grantees=tuple(grantees),
+                grantees=tuple(sorted(identities)),
             )
         )
-    rest = sorted(expose_members(contract, exposure, binding, index) - filtered)
+    rest = sorted(members - filtered)
     if rest:
         out.append(
             RowPolicy(
@@ -670,6 +674,13 @@ def validate_bigquery_governance(
             "column-restriction-view",
             f"{where}.policy.authz.columnRestrictions is set on a BigQuery view; policy tags "
             "attach to table columns, so restrict the columns of the table the view reads.",
+            (),
+        )
+    if row_filters_for(exposure, index) and is_view:
+        raise UnsupportedBindingError(
+            "row-filter-view",
+            f"{where}.policy.authz.rowFilters is set on a BigQuery view; row access policies "
+            "attach to tables, so filter the rows of the table the view reads.",
             (),
         )
     tag_groups(contract, exposure, "c", "d", "t", index)
@@ -738,8 +749,9 @@ def refuse_mixed_dataset_encryption(contract: Mapping[str, Any]) -> None:
 def refuse_unsupported_target(exposure: Mapping[str, Any], index: int, target: str) -> None:
     """A GCP expose that is not a BigQuery table must not carry a policy it would drop.
 
-    The GCS, Pub/Sub and Iceberg-storage emitters write no lifecycle rule, key or column
-    control, so a contract asking for one there is refused rather than applied without it.
+    The GCS, Pub/Sub and Iceberg-storage emitters write no lifecycle rule, key, column
+    control or row filter, so a contract asking for one there is refused rather than
+    applied without it.
     """
     where = _where(exposure, index)
     binding = exposure.get("binding") or {}
@@ -751,6 +763,8 @@ def refuse_unsupported_target(exposure: Mapping[str, Any], index: int, target: s
         asked.append("binding.encryption")
     if restrictions_for(exposure, index):
         asked.append("policy.authz.columnRestrictions")
+    if row_filters_for(exposure, index):
+        asked.append("policy.authz.rowFilters")
     if asked:
         raise UnsupportedBindingError(
             "gcp-governance-unsupported-target",

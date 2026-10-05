@@ -303,6 +303,42 @@ class TestGcp:
         assert policies["fluid_all_rows"]["filter_predicate"] == "TRUE"
         assert set(policies["fluid_all_rows"]["grantees"]) == {GCP_MAP[STEWARDS], GCP_MAP[PIPELINE]}
 
+    def test_a_write_only_filtered_principal_reads_only_its_rows(self):
+        """A writer reads rows too (roles/bigquery.dataEditor): left out of its own filter it
+        landed in fluid_all_rows, and BigQuery would have shown it every row."""
+        contract = _gcp(row_filters=[{"principal": PIPELINE, "where": "consent = true"}])
+        contract["accessPolicy"]["grants"][2]["permissions"] = ["write", "insert"]
+        res = _gcp_resources(contract)
+        policies = {p["policy_id"]: p for p in res["google_bigquery_row_access_policy"].values()}
+        assert policies["fluid_pipeline_rows"]["grantees"] == [GCP_MAP[PIPELINE]]
+        assert GCP_MAP[PIPELINE] not in policies["fluid_all_rows"]["grantees"]
+
+    def test_a_filtered_principal_with_no_grant_is_still_filtered(self):
+        """Granted elsewhere (a project role), it reads only the rows its filter selects."""
+        contract = _gcp(row_filters=[CONSENT])
+        grants = contract["accessPolicy"]["grants"]
+        contract["accessPolicy"]["grants"] = [g for g in grants if g["principal"] != ANALYSTS]
+        res = _gcp_resources(contract)
+        policies = {p["policy_id"]: p for p in res["google_bigquery_row_access_policy"].values()}
+        assert policies["analysts_consented"]["grantees"] == [GCP_MAP[ANALYSTS]]
+        assert GCP_MAP[ANALYSTS] not in policies["fluid_all_rows"]["grantees"]
+
+    def test_a_row_filter_on_a_view_is_refused_not_dropped(self):
+        contract = _gcp(row_filters=[CONSENT])
+        contract["exposes"][0]["binding"]["format"] = "bigquery_view"
+        with pytest.raises(UnsupportedBindingError) as raised:
+            _gcp_resources(contract)
+        assert raised.value.kind == "row-filter-view"
+
+    def test_a_row_filter_on_a_gcs_expose_is_refused_not_dropped(self):
+        contract = _gcp(row_filters=[CONSENT])
+        binding = contract["exposes"][0]["binding"]
+        binding.update(format="gcs_bucket", location={"bucket": "lake"})
+        with pytest.raises(UnsupportedBindingError) as raised:
+            _gcp_resources(contract)
+        assert raised.value.kind == "gcp-governance-unsupported-target"
+        assert "policy.authz.rowFilters" in str(raised.value)
+
     def test_the_contracts_governance_labels_reach_dataset_table_and_key(self):
         res = _gcp_resources(_gcp())
         for kind in ("google_bigquery_dataset", "google_bigquery_table"):
@@ -380,6 +416,35 @@ class TestAws:
         assert view_grant and view_grant[0]["permissions"] == ["SELECT", "DESCRIBE"]
         flt = next(iter(res["aws_lakeformation_data_cells_filter"].values()))["table_data"][0]
         assert "msisdn" in flt["column_wildcard"][0]["excluded_column_names"]
+
+    def test_a_masked_view_selects_only_the_columns_its_readers_grant_lists(self):
+        """The view reads the table as its definer: a reader whose grant lists its columns
+        read every other column raw through it, a denied one included."""
+        deny_score = {"principal": ANALYSTS, "columns": ["score"], "access": "deny"}
+        contract = _aws([MASK_MSISDN, deny_score])
+        grant = contract["exposes"][0]["binding"]["governance"]["lakeFormation"]["grants"][1]
+        grant.update(permissions=["SELECT"], columns=["consent", "suppressed"])
+        res = _aws_resources(contract)
+        (view,) = [
+            t
+            for t in res["aws_glue_catalog_table"].values()
+            if t.get("table_type") == "VIRTUAL_VIEW"
+        ]
+        sql = view["view_definition"][0]["representations"][0]["view_original_text"]
+        assert '"consent"' in sql and '"suppressed"' in sql
+        assert "concat('XXXXX', substr(\"msisdn\", -4))" in sql
+        for raw in ("customer_id", "msisdn_hash", "score"):
+            assert f'"{raw}"' not in sql, raw
+
+    def test_a_masked_view_never_selects_a_column_the_grant_excludes(self):
+        res = _aws_resources(_aws([MASK_MSISDN, DENY_ID]))
+        (view,) = [
+            t
+            for t in res["aws_glue_catalog_table"].values()
+            if t.get("table_type") == "VIRTUAL_VIEW"
+        ]
+        sql = view["view_definition"][0]["representations"][0]["view_original_text"]
+        assert '"customer_id"' not in sql and '"msisdn_hash"' in sql
 
     def test_a_mask_without_a_view_definer_is_refused(self):
         error = _refusal("aws", _aws([MASK_MSISDN], masked_views=False))
