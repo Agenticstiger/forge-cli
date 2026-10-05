@@ -73,6 +73,11 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
   DuckDB expands a glob to files a grant-time listing would miss (dotfiles,
   files that land after the grant), then checks each one's realpath against
   the directory, so a matched symlink that leads out is refused at read time.
+* ``COPY ... TO`` a local file that already exists writes ``tmp_<name>``
+  beside it and renames that into place (DuckDB's ``USE_TMP_FILE``), so a
+  call site that grants the file it writes as a single path also grants
+  :func:`copy_tmp_path`, confined as the file is. Without it only the first
+  write lands, unless a granted directory happens to hold both.
 * A directory the engine grants by convention rather than by declaration
   (the local provider's ``./runtime``) sits in a working directory the
   contract's repository may supply, so it may be a symlink to ``$HOME``.
@@ -435,6 +440,17 @@ def confine_declared(
     return os.path.realpath(absolute)
 
 
+def copy_tmp_path(path: PathLike) -> str:
+    """The file DuckDB's ``COPY ... TO path`` writes first when ``path`` exists.
+
+    ``tmp_<name>`` in the same directory, renamed over ``path`` once written
+    (``plan_copy_to_file.cpp``, DuckDB 1.5). DuckDB does this for a local file
+    that exists; never for a URL, ``PARTITION_BY`` or ``PER_THREAD_OUTPUT``.
+    """
+    head, name = os.path.split(os.fspath(path))
+    return os.path.join(head, "tmp_" + name)
+
+
 def unaliased_dir(path: PathLike, *, within: Iterable[Optional[PathLike]] = ()) -> Optional[str]:
     """``path`` as an absolute directory to grant, or ``None`` if it is an alias.
 
@@ -725,6 +741,7 @@ __all__ = [
     "DuckDBAllowlist",
     "DuckDBSandboxError",
     "confine_declared",
+    "copy_tmp_path",
     "duckdb_version",
     "is_remote_location",
     "is_sandbox_refusal",

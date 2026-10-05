@@ -59,6 +59,7 @@ from fluid_build.api.source import AcquisitionMode
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
     confine_declared,
+    copy_tmp_path,
     secure_duckdb_connect,
 )
 from fluid_build.providers._sql_safety import (
@@ -602,7 +603,12 @@ def _grant_destination(
     """``allow`` plus each stream's landed file and its late-arrival sibling.
 
     Confined like the source: a landing path the contract declares outside
-    :func:`_declared_roots` would let it write anywhere on the host.
+    :func:`_declared_roots` would let it write anywhere on the host. Each file
+    comes with the ``tmp_`` sibling a COPY over it writes first
+    (:func:`copy_tmp_path`), confined the same way. The contract's directory
+    is granted whole, so there the sibling was always allowed; a landing
+    anywhere else is granted file by file, and without the sibling every run
+    after the first was refused, and the late-arrival split on every run.
     """
     out_dir = Path(ctx.workdir) / "out"
     within = _declared_roots(ctx)
@@ -613,7 +619,9 @@ def _grant_destination(
             continue
         main = Path(dest)
         late = main.with_name(main.stem + "__late_events" + main.suffix)
-        allow = allow.with_declared(str(main), str(late), within=within)
+        allow = allow.with_declared(
+            str(main), str(late), copy_tmp_path(main), copy_tmp_path(late), within=within
+        )
     return allow
 
 
