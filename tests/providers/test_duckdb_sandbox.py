@@ -407,6 +407,117 @@ def test_an_operator_allowed_landing_glob_reads_every_file_duckdb_expands(
         con.close()
 
 
+def _count(path: Path) -> int:
+    con = duckdb.connect()
+    try:
+        return con.execute(f"SELECT count(*) FROM '{path}'").fetchone()[0]
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("root", ["operator", "workspace"])
+def test_a_landing_outside_the_contract_directory_is_replaced_on_every_run(
+    root, layout, monkeypatch
+):
+    """Outside the contract's directory a landing is granted as its file, and a
+    ``COPY ... TO`` over an existing file writes DuckDB's ``tmp_`` sibling first
+    (``copy_tmp_path``). With the file alone granted, the first run landed and
+    every run after it was refused on that sibling."""
+    from fluid_build.build_runners.duckdb.runner import execute_duckdb_build
+
+    shared = layout["tmp"] / "shared"
+    if root == "operator":
+        monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(shared))
+    else:
+        monkeypatch.delenv("FLUID_DUCKDB_ALLOWED_DIRS", raising=False)
+        (layout["tmp"] / "fluid.workspace.yaml").write_text(
+            "workspace: {name: lab}\n", encoding="utf-8"
+        )
+    landing = shared / "orders"
+    landing.mkdir(parents=True)
+    out = landing / "orders.parquet"
+    source = layout["contract_dir"] / "data" / "orders.csv"
+    contract = _acquisition_contract(str(source), out)
+
+    for rows in (2, 3):
+        source.write_text(
+            "id,amount\n" + "".join(f"{i},10\n" for i in range(rows)), encoding="utf-8"
+        )
+        assert execute_duckdb_build(contract["builds"][0], contract, layout["contract_dir"]) == 0
+        assert _count(out) == rows
+    # Written beside the file and renamed into place: nothing is left behind.
+    assert [p.name for p in landing.iterdir()] == ["orders.parquet"]
+
+
+def test_the_late_arrival_split_rewrites_an_operator_allowed_landing(layout, monkeypatch):
+    """The split COPYs the landed file again without its late rows, and the late
+    rows to the ``__late_events`` file. The first is a COPY over an existing
+    file on every run, the second from the second run on. Refused, the split
+    logged a warning and the run still succeeded, late rows and all."""
+    from fluid_build.build_runners.duckdb.runner import execute_duckdb_build
+
+    shared = layout["tmp"] / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(shared))
+    out = shared / "orders.parquet"
+    late = shared / "orders__late_events.parquet"
+    source = layout["contract_dir"] / "data" / "events.csv"
+    contract = _acquisition_contract(str(source), out)
+    build = contract["builds"][0]
+    build["properties"]["source"]["watermark"] = {
+        "strategy": "high_water_mark",
+        "allowedLateness": "PT1H",
+    }
+    contract["exposes"][0]["contract"] = {
+        "schema": [{"name": "id", "type": "INTEGER"}, {"name": "event_time", "type": "TIMESTAMP"}]
+    }
+
+    on_time = "1,2026-09-25 10:00:00\n2,2026-09-25 10:00:00\n"
+    # One late row, then two: the second run must replace the late file the
+    # first one wrote.
+    for late_rows in (1, 2):
+        source.write_text(
+            "id,event_time\n"
+            + on_time
+            + "".join(f"{9 + i},2026-09-20 10:00:00\n" for i in range(late_rows)),
+            encoding="utf-8",
+        )
+        assert execute_duckdb_build(build, contract, layout["contract_dir"]) == 0
+        assert (_count(out), _count(late)) == (2, late_rows)
+    assert sorted(p.name for p in shared.iterdir()) == sorted([out.name, late.name])
+
+
+def test_the_copy_sibling_is_one_more_file_confined_like_the_landing(layout, monkeypatch):
+    """Granted as single files beside the landing, never as its directory, and
+    confined as the landing is: a planted ``tmp_`` symlink that leads out of
+    the operator's directory is refused, not granted."""
+    from fluid_build.build_runners._acquisition_common import build_acquisition_run_context
+    from fluid_build.build_runners.duckdb.runner import _run_allowlist, _run_streams
+
+    shared = layout["tmp"] / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(shared))
+    out = shared / "orders.parquet"
+    contract = _acquisition_contract(str(layout["contract_dir"] / "data" / "orders.csv"), out)
+    ctx = build_acquisition_run_context(contract["builds"][0], contract, layout["contract_dir"])
+
+    allow = _run_allowlist(ctx, _run_streams(ctx), "parquet")
+    assert sorted(p for p in allow.paths if Path(p).parent == shared) == [
+        str(shared / name)
+        for name in (
+            "orders.parquet",
+            "orders__late_events.parquet",
+            "tmp_orders.parquet",
+            "tmp_orders__late_events.parquet",
+        )
+    ]
+    assert not any(Path(d).is_relative_to(shared) for d in allow.dirs)
+
+    (shared / "tmp_orders.parquet").symlink_to(layout["outside"] / "secret.csv")
+    with pytest.raises(DuckDBSandboxError, match="FLUID_DUCKDB_ALLOWED_DIRS"):
+        _run_allowlist(ctx, _run_streams(ctx), "parquet")
+
+
 def test_a_sqlite_source_outside_the_allowed_directories_is_refused(layout, monkeypatch):
     """The sqlite scanner opens files through its own library, which DuckDB's
     allowlist never bounds, so the declared source path was attached wherever
@@ -1216,6 +1327,34 @@ def test_declared_locations_grant_the_narrowest_thing(tmp_path):
         "gs://whole-bucket/",
         "s3://b2/",
     )
+
+
+def test_copy_tmp_path_names_the_file_duckdb_writes_before_it_replaces_one(tmp_path):
+    """Pinned against the installed DuckDB: granted the file alone, a second
+    ``COPY ... TO`` it is refused on exactly the path ``copy_tmp_path`` names;
+    granted both, it replaces the file and leaves nothing beside it."""
+    target = tmp_path / "orders.parquet"
+    only_target = DuckDBAllowlist.none().with_paths(target)
+
+    def copy(allow: DuckDBAllowlist, value: int) -> None:
+        con = secure_duckdb_connect(allow=allow)
+        try:
+            con.execute(f"COPY (SELECT {value} AS v) TO '{target}' (FORMAT parquet)")
+        finally:
+            con.close()
+
+    copy(only_target, 1)  # nothing to replace yet, so no sibling
+    with pytest.raises(duckdb.PermissionException) as refused:
+        copy(only_target, 2)
+    assert sandbox.copy_tmp_path(target) in str(refused.value)
+
+    copy(only_target.with_paths(sandbox.copy_tmp_path(target)), 3)
+    con = duckdb.connect()
+    try:
+        assert con.execute(f"SELECT v FROM '{target}'").fetchall() == [(3,)]
+    finally:
+        con.close()
+    assert [p.name for p in tmp_path.iterdir()] == ["orders.parquet"]
 
 
 @pytest.mark.parametrize("version", ["1.4.4", "1.4.3", "1.2.2", "0.10.0", "garbage", None])

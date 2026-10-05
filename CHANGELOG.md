@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A DuckDB landing outside the contract's directory lands on every run, not only the
+  first** (#699). Since 0.18.0 (#689) a landing outside the contract's directory, in a
+  directory the operator lists in `FLUID_DUCKDB_ALLOWED_DIRS` or elsewhere in the
+  workspace, is granted to the run as its file and its `__late_events` file. DuckDB's
+  `COPY ... TO` over a file that exists writes `tmp_<name>` beside it and renames that
+  into place, so the first run landed and every later one failed with "Permission Error:
+  Cannot access file .../tmp_<name>". The late-arrival split rewrites the file the run
+  has just landed, so for such a landing it failed on every run, logged a warning, and
+  the build still succeeded with the late rows left in the file. Each landed file and its
+  `__late_events` file are now granted with their `tmp_` siblings, confined as the files
+  are. Found on the demo lab on 0.18.2.
+
 ## [0.18.2] — 2026-10-05
 
 `fluid diff --exit-on-drift` passes for a silver or gold whose gcp overlay names its
