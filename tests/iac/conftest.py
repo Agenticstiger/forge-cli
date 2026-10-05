@@ -71,6 +71,14 @@ from fluid_build.iac import (
 )
 from fluid_build.iac.credentials import build_tofu_env
 
+from ._moto_s3 import keep_create_bucket_tags
+
+# moto's CreateBucket drops the tags of its request body, which terraform-provider-aws
+# 6.23+ tags a bucket with; S3 keeps them (tests/iac/_moto_s3.py). Patched once per
+# process, before any moto server starts.
+keep_create_bucket_tags()
+
+
 # ---------------------------------------------------------------------------
 # tofu init resilience — tolerate transient provider-registry outages
 # ---------------------------------------------------------------------------
