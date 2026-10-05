@@ -356,7 +356,10 @@ class TestAws:
         assert any(
             g.get("permissions_with_grant_option") == ["SELECT"] and "table" in g for g in definer
         )
-        assert any(g["permissions"] == ["DESCRIBE"] and "database" in g for g in definer)
+        # Lake Formation's view prerequisites: CREATE_TABLE on the view's database.
+        assert any(
+            g["permissions"] == ["CREATE_TABLE", "DESCRIBE"] and "database" in g for g in definer
+        )
         view_grant = [
             g for g in grants if g["principal"] == ANALYST_ARN and "masked" in str(g.get("table"))
         ]

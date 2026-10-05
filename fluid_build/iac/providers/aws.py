@@ -2305,8 +2305,8 @@ def _emit_lakeformation(
     column wildcard's exclusions), so its ``SELECT`` is granted on the filter, not on
     the table. ``masked_views`` is :func:`lf_masked_views`: each becomes a protected
     Glue Data Catalog view (``VIRTUAL_VIEW``, SECURITY DEFINER), its definer is
-    granted ``SELECT`` with grant option on the table and ``DESCRIBE`` on the
-    database, and its principal ``SELECT`` and ``DESCRIBE`` on the view.
+    granted ``SELECT`` with grant option on the table and ``CREATE_TABLE`` and
+    ``DESCRIBE`` on the database, and its principal ``SELECT`` and ``DESCRIBE`` on the view.
 
     ``exclusions`` is ``column_access.lf_exclusions``: for each grant index, the
     columns the contract's ``policy.authz.columnRestrictions`` do not let that
@@ -2590,11 +2590,13 @@ def _emit_lf_masked_views(
                 "table": [{"database_name": db_ref, "name": tbl_ref}],
             },
         )
+        # Lake Formation's prerequisites for a view: its definer holds SELECT with the
+        # grant option on every table it reads and CREATE_TABLE on the view's database.
         perms_res.setdefault(
             definer_db,
             {
                 "principal": view.definer,
-                "permissions": ["DESCRIBE"],
+                "permissions": ["CREATE_TABLE", "DESCRIBE"],
                 "database": [{"name": db_ref}],
             },
         )
