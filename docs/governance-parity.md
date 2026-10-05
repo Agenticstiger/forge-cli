@@ -130,6 +130,8 @@ Masking a column that `privacy.masking` already hashes would mask the hash.
   masked columns, so the columns' fine-grained readers read the clear value and the
   masked readers read the masked one. A principal with neither is refused, as for a
   deny. BigQuery applies a new masked reader about a minute or two after the grant.
+  A data policy id longer than BigQuery takes (it refuses 200 characters or more) keeps
+  its first characters and ends in a hash of the whole.
 * **AWS**: Lake Formation has no masking, so the masked value comes from a protected
   Glue Data Catalog view (Lake Formation's multi-dialect views, run as their
   definer). The view returns the rule's value in Athena SQL:

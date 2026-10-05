@@ -253,6 +253,26 @@ class TestGcp:
         assert GCP_MAP[ANALYSTS] not in raw, "a masked principal never reads the raw column"
         assert GCP_MAP[STEWARDS] in raw
 
+    def test_a_data_policy_id_stays_under_bigquery_s_limit(self):
+        """BigQuery refuses a data policy id of 200 characters or more (measured: 300 refused)."""
+        import dataclasses
+
+        from fluid_build.iac.providers import gcp_governance as gov
+
+        short = gov.TagGroup(
+            key="silver_customer_customer_profile_360_tga_silver_customer_profile_360_x",
+            display_name="msisdn",
+            columns=("msisdn",),
+            readers=(),
+            mask="last_four",
+        )
+        assert short.data_policy_id == f"{short.key}_mask", "a short id is unchanged"
+        long_a = dataclasses.replace(short, key="p" * 250 + "_a")
+        long_b = dataclasses.replace(short, key="p" * 250 + "_b")
+        assert len(long_a.data_policy_id) <= gov.DATA_POLICY_ID_MAX
+        assert long_a.data_policy_id != long_b.data_policy_id, "two long ids stay distinct"
+        assert long_a.data_policy_id.replace("_", "").isalnum()
+
     def test_the_hashed_column_stays_readable(self):
         res = _gcp_resources(_gcp([DENY_ID, MASK_MSISDN]))
         table = next(iter(res["google_bigquery_table"].values()))

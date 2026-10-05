@@ -123,6 +123,11 @@ FINE_GRAINED_READER_ROLE = "roles/datacatalog.categoryFineGrainedReader"
 #: Lets a principal read a policy tag's columns masked, by the tag's data policy.
 MASKED_READER_ROLE = "roles/bigquerydatapolicy.maskedReader"
 
+#: The longest data policy id BigQuery takes. It refuses a longer one ("should only contain
+#: letters, numbers and underscores while under 200 characters"; measured 5 October 2026:
+#: 200 characters accepted, 300 refused).
+DATA_POLICY_ID_MAX = 199
+
 #: ``columnRestrictions[].mask`` rule -> BigQuery data policy ``predefined_expression``.
 MASK_EXPRESSIONS = {
     "last_four": "LAST_FOUR_CHARACTERS",
@@ -194,8 +199,16 @@ class TagGroup:
 
     @property
     def data_policy_id(self) -> str:
-        """The data policy's id: ``[A-Za-z0-9_]``, unique in the project and location."""
-        return safe_ident(f"{self.key}_mask")
+        """The data policy's id: ``[A-Za-z0-9_]``, unique in the project and location.
+
+        A longer id than BigQuery takes keeps its first characters and ends in a hash of
+        the whole, so two long ids stay distinct.
+        """
+        ident = safe_ident(f"{self.key}_mask")
+        if len(ident) <= DATA_POLICY_ID_MAX:
+            return ident
+        digest = hashlib.sha256(ident.encode("utf-8")).hexdigest()[:12]
+        return f"{ident[: DATA_POLICY_ID_MAX - len(digest) - 1]}_{digest}"
 
     @property
     def description(self) -> str:
