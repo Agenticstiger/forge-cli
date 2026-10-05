@@ -33,6 +33,13 @@ The semantics, the same on both clouds:
 * ``allow``: the columns are readable only by the principals an ``allow`` names
   (an allow list per column); a column with no ``allow`` is readable by every reader
   of the expose.
+* ``mask`` (with ``mask: last_four | first_four | nullify``): the principal reads the
+  columns masked by the platform, never their raw values. For the raw read it is
+  denied, so it is in no column's reader set; :func:`column_masks` says which
+  columns it reads masked, and by which rule (GCP: a data policy on the columns'
+  policy tag and ``roles/bigquerydatapolicy.maskedReader``; AWS: Lake Formation cannot
+  mask, so a protected Glue Data Catalog view returns them masked). A deny beats a
+  mask, and a mask beats an allow for the principal it names; one column has one rule.
 * A deny beats an allow. A restriction never grants access: the readers are
   intersected with the expose's readers (on GCP the ``accessPolicy`` read grants and
   the expose's own ``policy.authz.readers``; on AWS the Lake Formation ``SELECT``
@@ -59,6 +66,14 @@ LOG = logging.getLogger(__name__)
 
 ALLOW = "allow"
 DENY = "deny"
+MASK = "mask"
+
+#: The masking rules ``access: mask`` takes, cloud-neutral: ``last_four`` returns
+#: ``XXXXX`` and the value's last four characters, ``first_four`` its first four and
+#: ``XXXXX``, and ``nullify`` NULL (BigQuery's LAST_FOUR_CHARACTERS,
+#: FIRST_FOUR_CHARACTERS and ALWAYS_NULL; a value of four characters or fewer is
+#: hashed by the first two, on each platform in its own encoding).
+MASK_RULES = ("last_four", "first_four", "nullify")
 
 #: Lake Formation permissions that let a principal read a table's rows.
 LF_READ_PERMISSIONS = frozenset({"SELECT", "ALL"})
@@ -75,11 +90,18 @@ class Restriction:
     #: that holds the restriction where it has room for them (GCP's policy tag).
     tags: Tuple[str, ...] = ()
     labels: Tuple[Tuple[str, str], ...] = ()
+    #: The masking rule of an ``access: mask`` restriction (one of :data:`MASK_RULES`).
+    mask: Optional[str] = None
+
+
+def policy_where(exposure: Mapping[str, Any], index: int, field: str) -> str:
+    """``exposes[<id>].policy.authz.<field>``, where a refusal points in the contract."""
+    expose_id = exposure.get("exposeId") or exposure.get("id") or index
+    return f"exposes[{expose_id}].policy.authz.{field}"
 
 
 def _where(exposure: Mapping[str, Any], index: int) -> str:
-    expose_id = exposure.get("exposeId") or exposure.get("id") or index
-    return f"exposes[{expose_id}].policy.authz.columnRestrictions"
+    return policy_where(exposure, index, "columnRestrictions")
 
 
 def restrictions_for(exposure: Mapping[str, Any], index: int = 0) -> Tuple[Restriction, ...]:
@@ -124,16 +146,18 @@ def restrictions_for(exposure: Mapping[str, Any], index: int = 0) -> Tuple[Restr
                 f"{at} must list the columns it restricts.",
                 ("Set columns to one or more column names of this expose's schema.",),
             )
-        if access not in (ALLOW, DENY):
+        if access not in (ALLOW, DENY, MASK):
             raise UnsupportedBindingError(
                 "column-restriction",
-                f"{at}.access is {entry.get('access')!r}; it must be 'allow' or 'deny', so "
-                "the cloud can be told which way the restriction goes.",
+                f"{at}.access is {entry.get('access')!r}; it must be 'allow', 'deny' or "
+                "'mask', so the cloud can be told which way the restriction goes.",
                 (
-                    "Set access: deny to hide the columns from the principal, or allow to make "
-                    "the principal one of the columns' only readers.",
+                    "Set access: deny to hide the columns from the principal, allow to make "
+                    "the principal one of the columns' only readers, or mask (with a mask "
+                    "rule) to let it read them masked.",
                 ),
             )
+        mask = _mask_rule(entry, access, at)
         unknown = [c for c in columns if c not in declared]
         if unknown:
             raise UnsupportedBindingError(
@@ -155,9 +179,52 @@ def restrictions_for(exposure: Mapping[str, Any], index: int = 0) -> Tuple[Restr
                     if isinstance(labels, Mapping)
                     else ()
                 ),
+                mask=mask,
             )
         )
+    _refuse_two_rules_for_a_column(out, where)
     return tuple(out)
+
+
+def _mask_rule(entry: Mapping[str, Any], access: str, at: str) -> Optional[str]:
+    """An ``access: mask`` restriction's rule; ``None`` for any other access.
+
+    A mask needs its rule, and a rule on a restriction that does not mask is refused,
+    since it would mask nothing.
+    """
+    mask = entry.get("mask")
+    if access == MASK and mask not in MASK_RULES:
+        raise UnsupportedBindingError(
+            "column-restriction",
+            f"{at} masks its columns with {mask!r}; access: mask needs a mask rule, one "
+            f"of {', '.join(MASK_RULES)}, so the platform knows what to return.",
+            ("Set mask: last_four (or first_four, or nullify).",),
+        )
+    if access != MASK and mask is not None:
+        raise UnsupportedBindingError(
+            "column-restriction",
+            f"{at} sets mask: {mask!r} on an access: {access} restriction, which masks "
+            "nothing: only access: mask reads columns masked.",
+            ("Set access: mask, or remove mask.",),
+        )
+    return mask if access == MASK else None
+
+
+def _refuse_two_rules_for_a_column(restrictions: Sequence[Restriction], where: str) -> None:
+    """A column has one masking rule: the one its policy tag (GCP) or view (AWS) applies."""
+    rules: Dict[str, str] = {}
+    for restriction in restrictions:
+        if restriction.mask is None:
+            continue
+        for column in restriction.columns:
+            if rules.setdefault(column, restriction.mask) != restriction.mask:
+                raise UnsupportedBindingError(
+                    "column-restriction",
+                    f"{where} masks {column} by {rules[column]!r} and by "
+                    f"{restriction.mask!r}; a column has one masking rule, the one its "
+                    "policy tag (GCP) or view (AWS) applies.",
+                    ("Mask the column by one rule for every principal that reads it masked.",),
+                )
 
 
 def authz_readers(exposure: Mapping[str, Any]) -> Tuple[str, ...]:
@@ -203,6 +270,7 @@ def column_readers(
     denied: Dict[str, set[str]] = {}
     for restriction in restrictions:
         identities = set(resolve(restriction.principal))
+        # A masked principal never reads the raw column: for this set it is denied.
         target = allowed if restriction.access == ALLOW else denied
         for column in restriction.columns:
             target.setdefault(column, set()).update(identities)
@@ -223,6 +291,52 @@ def column_readers(
         else:
             base = set(readers)
         out[column] = frozenset(base - denied.get(column, set()))
+    return out
+
+
+def column_masks(
+    exposure: Mapping[str, Any],
+    restrictions: Sequence[Restriction],
+    resolve: Callable[[str], Tuple[str, ...]],
+    readers: FrozenSet[str],
+    *,
+    where: str,
+) -> Dict[str, Tuple[str, FrozenSet[str]]]:
+    """``{masked column: (rule, identities that read it masked)}``, in schema order.
+
+    The identities are the readers an ``access: mask`` names, less any a ``deny`` on the
+    same column names (a deny beats a mask). A masked principal that is not a reader
+    is reported, not added: a restriction never grants access. A column whose masked
+    identities are all denied, or none of them readers, is left out.
+    """
+    masked: Dict[str, set[str]] = {}
+    rule: Dict[str, str] = {}
+    denied: Dict[str, set[str]] = {}
+    for restriction in restrictions:
+        identities = set(resolve(restriction.principal))
+        for column in restriction.columns:
+            if restriction.access == MASK and restriction.mask:
+                masked.setdefault(column, set()).update(identities)
+                rule[column] = restriction.mask
+            elif restriction.access == DENY:
+                denied.setdefault(column, set()).update(identities)
+    out: Dict[str, Tuple[str, FrozenSet[str]]] = {}
+    for column in restricted_columns(exposure, restrictions):
+        if column not in masked:
+            continue
+        not_readers = sorted(masked[column] - readers)
+        if not_readers:
+            LOG.warning(
+                "column_mask_not_a_reader %s column=%s identities=%s: a restriction never "
+                "grants access, so these identities, which have no read grant on the expose, "
+                "still cannot read the column, masked or not",
+                where,
+                column,
+                not_readers,
+            )
+        identities = frozenset((masked[column] & readers) - denied.get(column, set()))
+        if identities:
+            out[column] = (rule[column], identities)
     return out
 
 
@@ -335,7 +449,8 @@ def lf_expected_exclusions(
     for i, columns in exclusions.items():
         expected.setdefault(str(grants[i].get("principal")), set()).update(columns)
     for restriction in restrictions:
-        if restriction.access != DENY:
+        # A masked principal must not read the raw column either: it reads the view.
+        if restriction.access not in (DENY, MASK):
             continue
         for identity in resolve_principal(
             restriction.principal, mapping, platform=AWS, where=where
@@ -356,8 +471,11 @@ __all__ = [
     "ALLOW",
     "DENY",
     "LF_READ_PERMISSIONS",
+    "MASK",
+    "MASK_RULES",
     "Restriction",
     "authz_readers",
+    "column_masks",
     "column_readers",
     "lf_exclusions",
     "lf_expected_exclusions",

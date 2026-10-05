@@ -17,7 +17,7 @@
 The contract-shape gate for the AWS / Iceberg / Redshift mesh path. Each
 representative contract — Iceberg-on-Glue, Redshift Serverless, the
 external-schema bridge, and the full data-mesh dual-port scenario — must
-compile to a module the real provider schemas (``hashicorp/aws ~> 5.0``
+compile to a module the real provider schemas (``hashicorp/aws ~> 6.0``
 + ``hashicorp/null ~> 3.0``) accept.
 
 Needs ``tofu`` on PATH and registry network access (``tofu init`` downloads

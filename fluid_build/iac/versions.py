@@ -32,7 +32,7 @@ REQUIRED_TOFU_VERSION = ">= 1.6"
 #: ``Snowflake-Labs`` org to the official ``snowflakedb`` org at v2.
 PROVIDER_PINS: Dict[str, Dict[str, str]] = {
     "google": {"source": "hashicorp/google", "version": "~> 6.0"},
-    "aws": {"source": "hashicorp/aws", "version": "~> 5.0"},
+    "aws": {"source": "hashicorp/aws", "version": "~> 6.0"},
     "snowflake": {"source": "snowflakedb/snowflake", "version": "~> 2.0"},
     # Confluent Cloud — Tableflow (managed Kafka→Iceberg) + Glue catalog /
     # provider integration. The managed control plane owns compaction +

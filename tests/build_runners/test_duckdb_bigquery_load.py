@@ -163,7 +163,7 @@ def test_the_built_file_is_loaded_into_the_declared_table(bq, tmp_path):
     assert table_id == "acme-eu.bronze.orders"
     assert location == "europe-west1"
     assert cfg["source_format"] == "PARQUET"
-    assert cfg["write_disposition"] == "WRITE_TRUNCATE"
+    assert cfg["write_disposition"] == "WRITE_TRUNCATE_DATA", "keeps row access policies"
     assert cfg["create_disposition"] == "CREATE_NEVER", "the table is the IaC's"
     assert cfg["schema"] == ["the-declared-schema"], "the table's own schema, not the file's"
     staged = tmp_path / ".fluid" / "staging" / "ingest_orders" / "orders.parquet"
@@ -310,3 +310,33 @@ def test_an_unrelated_first_expose_does_not_capture_the_build(bq, tmp_path):
     assert _run(contract, tmp_path) == 0
     assert [c[1] for c in fake.calls if c[0] == "load"] == ["acme-eu.bronze.orders"]
     assert not decoy.exists()
+
+
+# ── A full refresh keeps the table's row access policies ───────────────
+#
+# Measured on BigQuery, 5 October 2026: a WRITE_TRUNCATE load removed the
+# table's row access policy and the table showed every row; a
+# WRITE_TRUNCATE_DATA load kept it. BigQuery documents the first ("operations
+# that use the WRITE_TRUNCATE write disposition remove all existing row access
+# policies"), so every build would have undone the row filters tofu apply made.
+
+
+def test_a_full_refresh_keeps_the_table_s_row_access_policies(monkeypatch):
+    monkeypatch.delenv(_bigquery_load.EMULATOR_HOST_ENV, raising=False)
+    assert _bigquery_load.write_disposition("full_refresh") == "WRITE_TRUNCATE_DATA"
+    assert _bigquery_load.write_disposition("incremental_append") == "WRITE_APPEND"
+
+
+def test_no_mode_loads_with_a_disposition_that_drops_row_access_policies(monkeypatch):
+    monkeypatch.delenv(_bigquery_load.EMULATOR_HOST_ENV, raising=False)
+    for mode in _bigquery_load._WRITE_DISPOSITION:
+        assert _bigquery_load.write_disposition(mode) != "WRITE_TRUNCATE", mode
+
+
+def test_on_an_emulator_a_full_refresh_is_write_truncate(monkeypatch):
+    """goccy/bigquery-emulator appends for a disposition it does not know
+    (``server/handler.go`` handles WRITE_TRUNCATE and WRITE_EMPTY), so a full
+    refresh there would double the table; it has no row access policy to keep."""
+    monkeypatch.setenv(_bigquery_load.EMULATOR_HOST_ENV, "localhost:9050")
+    assert _bigquery_load.write_disposition("full_refresh") == "WRITE_TRUNCATE"
+    assert _bigquery_load.write_disposition("incremental_append") == "WRITE_APPEND"

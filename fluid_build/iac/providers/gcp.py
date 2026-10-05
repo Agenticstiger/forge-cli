@@ -399,7 +399,11 @@ class GcpIacPlugin:
             loc = binding.get("location") or {}
             schema = (exposure.get("contract") or {}).get("schema") or []
             placement = _placement(packaging, exposure)
-            labels = _labels_for(base_labels, placement)
+            # The contract's governance labels (its classification, jurisdiction,
+            # regulation and own labels) under fluid's own two, which win.
+            labels = _labels_for(
+                {**_gov.governance_labels(contract, exposure), **base_labels}, placement
+            )
             # The contract's principals are logical: each GCP expose's binding maps
             # them to real IAM members (``binding.principals``), and an unmapped or
             # placeholder principal is refused rather than written into IAM.
@@ -828,6 +832,7 @@ class _BqGovernance:
     retention: Optional[_gov.BqRetention] = None
     encryption: Optional[_gov.BqEncryption] = None
     tags: Tuple[_gov.TagGroup, ...] = ()
+    row_policies: Tuple[_gov.RowPolicy, ...] = ()
 
 
 _NO_GOVERNANCE = _BqGovernance()
@@ -864,6 +869,13 @@ def _bigquery_governance(
                     _bq_table_name(exposure, loc),
                     index,
                 )
+            )
+        ),
+        row_policies=(
+            ()
+            if is_view
+            else tuple(
+                _gov.row_policies(contract, exposure, cid, _bq_table_name(exposure, loc), index)
             )
         ),
     )
@@ -972,6 +984,10 @@ def _emit_policy_tags(
     one ``google_data_catalog_policy_tag_iam_member`` each, to exactly the readers
     ``column_access`` derives; a denied principal gets an access error on the column
     (``SELECT * EXCEPT (...)`` still works for it).
+
+    A masked group's tag also gets a data policy (``DATA_MASKING_POLICY`` with the rule's
+    predefined expression), in the taxonomy's location, and the masked reader role on
+    it for exactly the group's masked principals: they read the column masked.
     """
     if not tags:
         return {}
@@ -1006,9 +1022,67 @@ def _emit_policy_tags(
                 "role": _gov.FINE_GRAINED_READER_ROLE,
                 "member": member,
             }
+        if group.mask:
+            _emit_data_policy(resources, group, name, body["region"], loc)
         for column in group.columns:
             refs[column] = name
     return refs
+
+
+def _emit_row_policies(
+    resources: Dict[str, Any],
+    policies: Sequence[_gov.RowPolicy],
+    ds_ref: Any,
+    tbl_name: str,
+    project: Optional[str],
+) -> None:
+    """A ``google_bigquery_row_access_policy`` per row policy of the table."""
+    for policy in policies:
+        row: Dict[str, Any] = {
+            "dataset_id": ds_ref,
+            "table_id": tofu_ref(f"google_bigquery_table.{tbl_name}.table_id"),
+            "policy_id": policy.policy_id,
+            "filter_predicate": policy.predicate,
+            "grantees": list(policy.grantees),
+        }
+        if project:
+            row["project"] = project
+        resources.setdefault("google_bigquery_row_access_policy", {})[policy.key] = row
+
+
+def _emit_data_policy(
+    resources: Dict[str, Any],
+    group: _gov.TagGroup,
+    tag_name: Any,
+    region: str,
+    loc: Mapping[str, Any],
+) -> None:
+    """A masked group's data policy on its tag, and its masked readers."""
+    dp_id = group.data_policy_id
+    body: Dict[str, Any] = {
+        "location": region,
+        "data_policy_id": dp_id,
+        "policy_tag": tag_name,
+        "data_policy_type": "DATA_MASKING_POLICY",
+        "data_masking_policy": {"predefined_expression": _gov.MASK_EXPRESSIONS[group.mask]},
+    }
+    if loc.get("project"):
+        body["project"] = loc["project"]
+    resources.setdefault("google_bigquery_datapolicy_data_policy", {})[dp_id] = body
+    for member in group.masked_readers:
+        iam: Dict[str, Any] = {
+            "location": region,
+            "data_policy_id": tofu_ref(
+                f"google_bigquery_datapolicy_data_policy.{dp_id}.data_policy_id"
+            ),
+            "role": _gov.MASKED_READER_ROLE,
+            "member": member,
+        }
+        if loc.get("project"):
+            iam["project"] = loc["project"]
+        resources.setdefault("google_bigquery_datapolicy_data_policy_iam_member", {})[
+            _iam_key(dp_id, member, role=_gov.MASKED_READER_ROLE)
+        ] = iam
 
 
 def _iam_key(stem: str, member: str, *, role: str) -> str:
@@ -1129,6 +1203,7 @@ def _emit_bigquery(
     if gov.retention is not None:
         _partition_table(resources, body, tbl_name, gov.retention)
     resources.setdefault("google_bigquery_table", {})[tbl_name] = body
+    _emit_row_policies(resources, gov.row_policies, ds_ref, tbl_name, loc.get("project"))
 
     # Table-level IAM replaces the dataset grants under shared mode:
     # the same principals, the same intent, the narrowest scope that still

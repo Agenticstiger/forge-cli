@@ -40,6 +40,21 @@ table's ``TIMESTAMP``: the mapping python-bigquery itself uses
 ``DATETIME`` the naive one). The wall-clock value is read as UTC, which is how
 BigQuery reads a zone-less timestamp literal too.
 
+**Row access policies.** A full refresh is ``WRITE_TRUNCATE_DATA``, not
+``WRITE_TRUNCATE``. BigQuery documents that "operations that use the
+``WRITE_TRUNCATE`` write disposition remove all existing row access policies"
+(row-level security, "Limitations"), so every build would have dropped the
+row filters ``tofu apply`` had just made, and each filtered principal would
+have read every row until the next apply. ``WRITE_TRUNCATE_DATA`` replaces
+the rows and keeps the table: its schema, policy tags and row access
+policies. It is the disposition dlt's BigQuery destination loads with for
+the same reason (``truncate-and-insert`` with ``enable_atomic_replace``).
+Measured on BigQuery, 5 October 2026: after a ``WRITE_TRUNCATE`` load the
+table had no row access policy and showed every row; after a
+``WRITE_TRUNCATE_DATA`` load it kept its policy, and on a DAY-partitioned
+table with a partition expiration it replaced the rows of every partition
+and kept the partitioning and the expiration.
+
 **Emulators.** With ``BIGQUERY_EMULATOR_HOST`` set, python-bigquery already
 sends every request to that host, but it still resolves Application Default
 Credentials first: with none it raises, and with some it sends a real OAuth
@@ -47,7 +62,11 @@ token to a local emulator. :func:`bigquery_client` passes
 ``AnonymousCredentials`` instead, the way goccy/bigquery-emulator documents
 its clients. The goccy emulator also reports no ``outputRows`` for a load
 job, so a load whose job reports no count is checked by counting the table
-afterwards; it is never taken as zero rows loaded, nor as success.
+afterwards; it is never taken as zero rows loaded, nor as success. Its load
+handler knows ``WRITE_TRUNCATE`` and ``WRITE_EMPTY`` and appends for any
+other disposition (goccy/bigquery-emulator ``server/handler.go``), so a full
+refresh on an emulator is ``WRITE_TRUNCATE``: it has no row access policy to
+keep.
 """
 
 from __future__ import annotations
@@ -57,8 +76,9 @@ import os
 from typing import Any, Dict, Mapping, Optional
 
 # Write disposition per source mode. The other modes (merge, dedup, CDC) need a
-# MERGE this path does not do, and are refused rather than approximated.
-_WRITE_DISPOSITION = {"full_refresh": "WRITE_TRUNCATE", "incremental_append": "WRITE_APPEND"}
+# MERGE this path does not do, and are refused rather than approximated. A full
+# refresh keeps the table's row access policies (see "Row access policies").
+_WRITE_DISPOSITION = {"full_refresh": "WRITE_TRUNCATE_DATA", "incremental_append": "WRITE_APPEND"}
 _SOURCE_FORMAT = {"parquet": "PARQUET"}
 
 # The project order ``terraform-provider-google`` reads, so the load goes to the
@@ -85,6 +105,19 @@ def emulator_host() -> Optional[str]:
     """The BigQuery emulator endpoint this process is pointed at, if any."""
     host = os.environ.get(EMULATOR_HOST_ENV, "").strip()
     return host or None
+
+
+def write_disposition(mode: str) -> str:
+    """The load job's write disposition for ``mode``.
+
+    ``WRITE_TRUNCATE_DATA`` for a full refresh, which keeps the table's row
+    access policies, except on an emulator: goccy/bigquery-emulator appends for
+    a disposition it does not know, and it has no row access policy to keep.
+    """
+    disposition = _WRITE_DISPOSITION[mode]
+    if disposition == "WRITE_TRUNCATE_DATA" and emulator_host() is not None:
+        return "WRITE_TRUNCATE"
+    return disposition
 
 
 def bigquery_client(bigquery: Any, project: Optional[str]) -> Any:
@@ -272,15 +305,16 @@ def load_file(
 
     The table's own schema is passed to the job. Without it, a Parquet file
     whose columns are all optional cannot load into REQUIRED columns
-    (googleapis/python-bigquery#2373), and ``WRITE_TRUNCATE`` would replace
+    (googleapis/python-bigquery#2373), and a truncating load would replace
     the declared schema with the file's. A ``TIMESTAMP`` column the file holds
     as a naive timestamp is loaded from a UTC-adjusted copy
-    (:func:`utc_adjusted_copy`).
+    (:func:`utc_adjusted_copy`). A full refresh is ``WRITE_TRUNCATE_DATA``
+    (:func:`write_disposition`), so the table keeps its row access policies.
 
     The count is the job's ``outputRows``. A job that reports none (the goccy
-    emulator never does) is checked by counting the table: for
-    ``WRITE_TRUNCATE`` the table must then hold exactly the file's rows, and
-    for ``WRITE_APPEND`` it must have grown by them, which needs the count
+    emulator never does) is checked by counting the table: after a full
+    refresh the table must hold exactly the file's rows, and after
+    ``WRITE_APPEND`` it must have grown by them, which needs the count
     before the load; that is taken on an emulator only, and a real job with no
     count and no earlier count is refused rather than assumed.
     """
@@ -302,7 +336,7 @@ def load_file(
         before = _count_table(client, table_id, location)
     job_config = bigquery.LoadJobConfig(
         source_format=_SOURCE_FORMAT[sink_format],
-        write_disposition=_WRITE_DISPOSITION[mode],
+        write_disposition=write_disposition(mode),
         create_disposition="CREATE_NEVER",
         schema=table.schema,
     )

@@ -143,7 +143,14 @@ class FakeBigQuery:
                 if load_error is not None:
                     raise load_error
                 entry = fake.tables[table_id]
-                if job_config.write_disposition == "WRITE_TRUNCATE" or not entry["data"].num_rows:
+                if (
+                    job_config.write_disposition
+                    in (
+                        "WRITE_TRUNCATE",
+                        "WRITE_TRUNCATE_DATA",
+                    )
+                    or not entry["data"].num_rows
+                ):
                     entry["data"] = data
                 else:
                     entry["data"] = pa.concat_tables([entry["data"], data])
@@ -401,7 +408,7 @@ def test_the_sql_reads_the_bigquery_rows_and_lands_them_in_bigquery(bq, tmp_path
     [load] = fake.loads
     assert load["table"] == SILVER_TABLE
     assert load["location"] == "europe-west1"
-    assert load["config"]["write_disposition"] == "WRITE_TRUNCATE"
+    assert load["config"]["write_disposition"] == "WRITE_TRUNCATE_DATA", "keeps row access policies"
     assert load["config"]["create_disposition"] == "CREATE_NEVER"
     # Nothing was written to a local file named after the binding's gs:// path.
     assert _gs_files(tmp_path) == []

@@ -364,7 +364,7 @@ def _print_embedded_sql_io(io: Any) -> None:
         cprint(
             f"   ➡ lands BigQuery table {io.bigquery_landing.table_id} "
             f"({io.bigquery_landing.location}): staged as Parquet, then one load job "
-            "(WRITE_TRUNCATE), recorded in the build's run record",
+            "(WRITE_TRUNCATE_DATA), recorded in the build's run record",
             markup=False,
         )
     for warning in getattr(io, "warnings", None) or []:

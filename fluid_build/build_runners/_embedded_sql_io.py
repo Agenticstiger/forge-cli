@@ -1266,8 +1266,9 @@ def remove_staged(paths: Sequence[Path]) -> None:
 def load_bigquery_landing(landing: BigQueryLanding, *, logger: logging.Logger) -> Dict[str, Any]:
     """Load the staged result into its table: the acquisition runner's own load.
 
-    ``WRITE_TRUNCATE``: the embedded-SQL result replaces the table, as it
-    replaces the local file or the S3 object on the other targets. The count
+    ``WRITE_TRUNCATE_DATA``: the embedded-SQL result replaces the table's rows,
+    as it replaces the local file or the S3 object on the other targets, and
+    the table keeps its schema, policy tags and row access policies. The count
     the load is held to is read back from the staged file.
     """
     from ._bigquery_load import load_file
@@ -1312,7 +1313,7 @@ def write_bigquery_run_record(
     landed, as bronze is: ``records_total`` is the load's count, which
     :func:`load_bigquery_landing` has already held to the staged file's rows
     (``rows_from: write``), and the mode is ``full_refresh`` (the load is
-    ``WRITE_TRUNCATE``). It is dbt's pattern too: ``run_results.json`` keeps
+    ``WRITE_TRUNCATE_DATA``). It is dbt's pattern too: ``run_results.json`` keeps
     each node's ``relation_name`` and ``adapter_response.rows_affected``.
 
     A failed run is recorded without ``bigquery_load``: whether it changed
@@ -1496,8 +1497,8 @@ def refuse_landing_into_input(io: EmbeddedSqlIO) -> None:
     resolve to rather than on product ids: :func:`_refuse_self_consume` already
     refuses a contract consuming its own id, but an overlay naming an
     upstream's table (a typo, or two products left to the ``default``
-    dataset with the same expose id) passed it, and the build's
-    ``WRITE_TRUNCATE`` replaced another product's rows with its query result.
+    dataset with the same expose id) passed it, and the build's full-refresh
+    load replaced another product's rows with its query result.
     That is a data write, not a planned delete, so ``--allow-data-loss`` is
     never asked. An S3 landing inside the prefix an input reads is refused for
     the same reason: the object would become rows of that product's table.
@@ -1518,7 +1519,7 @@ def _refuse_loading_an_input(bq: BigQueryLanding, inputs: Sequence[ResolvedInput
                 f"{bq.table_id}, which {_entry(r.product_id, r.expose_id)} reads"
             ),
             why=(
-                f"The load replaces the table (WRITE_TRUNCATE), so {r.product_id}'s rows "
+                f"The load replaces the table's rows (WRITE_TRUNCATE_DATA), so {r.product_id}'s rows "
                 "would be overwritten with this build's query result."
             ),
             fix=(

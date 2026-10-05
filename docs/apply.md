@@ -232,7 +232,8 @@ must not land silently.
 
 When the first expose's binding is a GCP `bigquery_table`, the result is
 written as Parquet under `.fluid/staging/<build>/` and one load job moves it
-into that table (`WRITE_TRUNCATE`, `CREATE_NEVER`, the table's own schema),
+into that table (`WRITE_TRUNCATE_DATA`, which keeps the table's row access policies,
+`CREATE_NEVER`, the table's own schema),
 the load the duckdb acquisition runner performs; a `gs://` `location.path` on
 the binding is never written to. A failed or short load fails the build. Any
 other landing this path cannot write, a `gs://` or other non-S3 URI, a GCS
