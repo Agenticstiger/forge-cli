@@ -7,8 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-10-06
+
+A contract can now say that a principal reads a column masked rather than not at all,
+and which rows a principal reads, in fields that name no cloud (fluid-schema 0.7.6).
+GCP and AWS each enforce them in their own terms, and a binding that cannot is refused.
+The AWS provider moves to terraform-provider-aws 6.
+
+### Added
+
+- **Column masking: `columnRestrictions[] {access: mask, mask: last_four | first_four |
+  nullify}`** (#700). On GCP the masked columns get a policy tag of their own with a
+  BigQuery data policy (`LAST_FOUR_CHARACTERS`, `FIRST_FOUR_CHARACTERS`, `ALWAYS_NULL`),
+  and `roles/bigquerydatapolicy.maskedReader` for the masked principals; the tag's
+  fine-grained readers read the clear value. On AWS, where Lake Formation cannot mask,
+  the principal's grant excludes the masked columns from the table. A protected Glue
+  Data Catalog view, `<table>_masked`, returns them masked by the same rule, and selects
+  nothing the principal's own grant does not. It needs
+  `governance.lakeFormation.maskedViews {definer, validationConnection}`, and is refused
+  without it (`column-mask-unenforceable`).
+- **Row filters: `exposes[].policy.authz.rowFilters[] {principal, where, name?}`** (#700).
+  The predicate is parsed before it is written into a policy: a statement separator, a
+  comment, a subquery or an undeclared column is refused. On GCP each filter is a row
+  access policy naming every identity of its principal, and `fluid_all_rows` (`TRUE`)
+  names every other principal the expose grants anything to. On AWS each filter is a
+  Lake Formation data cells filter, and the principal's `SELECT` is granted on it. A
+  filter on a BigQuery view, on a GCP binding that is not a BigQuery table, or on an
+  AWS binding with no Lake Formation read grant is refused.
+- **Governance labels** (#700). The contract's and the expose's labels, and its
+  classification, jurisdiction, regulatory frameworks and residency, land as GCP labels
+  on the dataset, table and key, and as AWS tags on the bucket and key and parameters
+  on the Glue table.
+
+### Changed
+
+- **terraform-provider-aws `~> 6.0`** (#700), for the view definition 5.x does not
+  have. With only the pin moved, eleven applied AWS products planned no change on 6.67.
+  Provider 6.23 and later read a bucket's tags through S3 Control
+  (`s3:ListTagsForResource`), which the applying identity needs.
+- **A full-refresh BigQuery load is `WRITE_TRUNCATE_DATA`** (#700). `WRITE_TRUNCATE`
+  removes every row access policy of the table it writes, so each build would have
+  undone the row filters the apply had just made. `WRITE_TRUNCATE_DATA` replaces the rows
+  and keeps the table's policies, policy tags and partitioning (measured on BigQuery).
+  An emulator keeps `WRITE_TRUNCATE`, since goccy appends for a disposition it does not
+  know.
+
 ### Fixed
 
+- **On an emulator, each Glue database, table and masked view names its catalog**
+  (#700). Provider 6 refuses to read back a Glue id with an empty catalog, and an
+  emulator skips requesting the account id, so every Glue resource applied against
+  LocalStack or moto failed right after its create.
 - **A DuckDB landing outside the contract's directory lands on every run, not only the
   first** (#699). Since 0.18.0 (#689) a landing outside the contract's directory, in a
   directory the operator lists in `FLUID_DUCKDB_ALLOWED_DIRS` or elsewhere in the
@@ -3919,7 +3968,10 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.18.2...v0.19.0
+[0.18.2]: https://github.com/Agenticstiger/forge-cli/compare/v0.18.1...v0.18.2
+[0.18.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.7...v0.17.0
 [0.16.7]: https://github.com/Agenticstiger/forge-cli/compare/v0.16.6...v0.16.7
