@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI: the emulated-heavy lane runs a real Kafka Connect worker (cp-kafka-connect 7.9.10
+  with the Apache Iceberg sink 1.9.2) against a real Lakekeeper (v0.13.6, credentials
+  vended over STS from an S3-compatible store). It streams records through the config
+  forge derives for `catalog: lakekeeper`, shows that a config carrying both
+  `iceberg.catalog.type` and `catalog-impl` fails on the worker, and shows forge's Glue
+  config gets past that check. `assert_lane_coverage.py` fails the job if every test
+  skipped. Run it locally with `FLUID_TEST_LAKEKEEPER=1` (Docker required).
+
 - CI: `release.yml` can publish through a TestPyPI outage. A manual run with
   `skip_testpypi: true` skips the TestPyPI upload and its install check and
   publishes the existing tag straight to PyPI; `verify-pypi` still installs and
