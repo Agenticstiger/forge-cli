@@ -89,10 +89,11 @@ def _restore_ddl_for_snapshot(snapshot_meta: Mapping[str, Any], provider: str) -
     """Build the DDL ``cli/rollback.py`` will run to restore the snapshot.
 
     Delegates to ``provider.restore_ddl(snapshot)`` — every in-tree
-    provider owns its restore semantics (Snowflake CLONE, BigQuery
-    CTAS, AWS S3-prefix copy, Redshift transactional CTAS). Adding a
-    new provider is a single subclass override, not a central
-    if/elif edit here.
+    provider owns its restore semantics (Snowflake CLONE, AWS S3-prefix
+    copy, Redshift transactional CTAS; BigQuery records none, because
+    ``fluid rollback`` restores it with a data-only query job that keeps
+    the table and its governance). Adding a new provider is a single
+    subclass override, not a central if/elif edit here.
 
     Returns ``[]`` when no DDL applies — the rollback CLI surfaces
     that as a typed ``rollback_provider_unsupported`` error.

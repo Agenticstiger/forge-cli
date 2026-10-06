@@ -21,7 +21,7 @@ fluid apply contract.fluid.yaml --mode amend --yes
 | `create-only` | `CREATE IF NOT EXISTS`, fails if the target exists | no | untouched | no |
 | `amend` *(default)* | additive — `ALTER … ADD COLUMN IF NOT EXISTS`; views `CREATE OR REPLACE` | no | preserved; new columns `NULL` | no |
 | `amend-and-build` | same as `amend` | yes | preserved; transforms re-run | no |
-| `replace` | drop + recreate the target | no | **dropped** | **yes** |
+| `replace` | drop + recreate the target (native engine; see [the OpenTofu engine](#apply-engines-and-what-that-changes)) | no | **dropped** | **yes** |
 | `replace-and-build` | same as `replace` | yes (`dbt --full-refresh`) | **dropped**, then rebuilt | **yes** |
 
 `--mode` defaults to `amend`. `--dry-run` is an ergonomic alias for
@@ -64,8 +64,8 @@ The engine is resolved per provider — there is no user-facing switch.
 | `aws`, `gcp`, `snowflake`, `confluent` | OpenTofu (`.tf.json` + `tofu init/plan/apply`) |
 | `local` | native in-process apply |
 
-Two mode behaviours differ by engine. Both are reported at run time, but
-know them before you plan a destructive change:
+Three mode behaviours differ by engine. Know them before you plan a
+destructive change:
 
 **1. No pre-replace snapshot on the OpenTofu engine.** The native path
 plans a pre-flight zero-copy snapshot (`<target>__backup_<ts>`) and records
@@ -90,6 +90,36 @@ matches the live table will therefore plan clean — including under
 ```
 
 `fluid verify --strict` is the gate — it exits non-zero on a type mismatch.
+
+**3. `replace` provisions what `amend` provisions.** The OpenTofu engine
+emits the same module in every mode, so `--mode replace` drops and
+recreates nothing by itself: it adds the data-loss gate and the drift
+report to a normal `tofu apply`. A table is replaced only when `tofu`
+plans it (a change the platform cannot make in place, such as partitioning
+an existing BigQuery table or giving it a key), which the gate refuses
+without `--allow-data-loss`. On GCP a replaced table comes back with its
+governance in the same apply: its policy tags are in the table's schema,
+and its row access policies and table-level grants, which BigQuery deletes
+with the table, are recreated with it (`replace_triggered_by`; see
+[governance parity](governance-parity.md#changes-a-live-table-cannot-take-in-place)).
+
+`replace-and-build` then runs the builds as a full refresh. dbt gets
+`--full-refresh`. An embedded-SQL build into BigQuery lands with one
+`WRITE_TRUNCATE_DATA` load into the existing table, which replaces the
+rows and keeps the table, its policy tags and its row access policies.
+dbt does not: dbt-bigquery materialises a `table` model (and, under
+`--full-refresh`, an `incremental` one) with `create or replace table`,
+which drops the row access policies and, unless the dbt project re-applies
+them, the policy tags `tofu` made. That is a known gap; see
+[governance parity](governance-parity.md).
+
+`fluid rollback` restores a BigQuery table the same way it keeps it: one
+query job, `SELECT * FROM <backup>` into the live table with
+`WRITE_TRUNCATE_DATA` and `CREATE_NEVER`, never `CREATE OR REPLACE TABLE`.
+The restoring identity must read the whole backup: a row access policy
+that shows it only some rows makes the rollback refuse
+(`rollback_bigquery_backup_filtered`), and a policy-tagged column needs
+Fine-Grained Reader on its tag.
 
 **Drift against the apply's own state.** `fluid diff` (and `fluid verify
 --state-drift`) run the refresh `fluid apply` runs, without applying: from
