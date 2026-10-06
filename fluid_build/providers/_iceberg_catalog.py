@@ -93,11 +93,6 @@ class CatalogKind:
     snowflake_catalog_type: Optional[str]
     #: ``binding.location`` keys a streaming sink needs for this catalog.
     sink_requires: Tuple[str, ...] = ()
-    #: The warehouse is a warehouse/catalog NAME, never an object-store URI.
-    warehouse_is_name: bool = False
-    #: Path the catalog serves its REST API under (Lakekeeper mounts
-    #: ``/catalog``), or ``None`` when the catalog prescribes none.
-    uri_suffix: Optional[str] = None
 
     @property
     def speaks_rest(self) -> bool:

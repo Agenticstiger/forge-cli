@@ -126,10 +126,6 @@ class TestTableIntegrity:
         assert info.speaks_rest
         assert set(info.sink_requires) == {"uri", "warehouse"}
 
-    def test_generic_rest_accepts_a_uri_warehouse(self):
-        # iceberg-rest-fixture and Tabular take an s3:// warehouse.
-        assert not catalog_kind_info("rest").warehouse_is_name
-
 
 class TestKindPrecedence:
     @pytest.mark.parametrize(

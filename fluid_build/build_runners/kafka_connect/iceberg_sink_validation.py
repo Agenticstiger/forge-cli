@@ -38,9 +38,6 @@ Snowflake-managed table for the same expose. Per sink build:
   IaC read only the expose;
 * every ``binding.location`` key in the row's ``sink_requires`` must be set
   (Glue keeps its advisory region warning: the warehouse falls back);
-* a catalog that addresses its warehouse by NAME (Lakekeeper, Polaris, Unity)
-  must not be given an object-store URI, and one that mounts its REST API
-  under a path (Lakekeeper's ``/catalog``) should have it in ``uri``;
 * the runtime must ship the catalog's client (the stock Apache Iceberg Kafka
   Connect runtime has no Nessie client);
 * an operator override must not move the warehouse away from the binding, nor
@@ -78,7 +75,6 @@ from ...providers._iceberg_catalog import (
     catalog_kind_info,
     iceberg_catalog_kind,
     iceberg_sink_exposes,
-    is_object_store_uri,
     known_catalog_kinds,
     resolve_iceberg_catalog,
 )
@@ -326,9 +322,7 @@ def _check_catalog(
     for key in info.sink_requires:
         if not loc.get(key):
             suffix = (
-                " (the catalog name)"
-                if key == "warehouse" and (info.warehouse_is_name or info.family == FAMILY_REST)
-                else ""
+                " (the catalog name)" if key == "warehouse" and info.family == FAMILY_REST else ""
             )
             errors.append(
                 f"iceberg sink (build {bid!r}): {kind} catalog requires "
@@ -338,28 +332,6 @@ def _check_catalog(
         warnings.append(
             f"iceberg sink (build {bid!r}): glue catalog without binding.location.region; "
             "the connector needs iceberg.catalog.client.region"
-        )
-
-    # A name-addressed catalog owns the storage location: handed an s3:// URI
-    # as ``warehouse`` it looks up a warehouse literally called that and the
-    # REST client's /v1/config fails before the first commit. HARD.
-    warehouse = loc.get("warehouse")
-    if info.warehouse_is_name and is_object_store_uri(warehouse):
-        errors.append(
-            f"iceberg sink (build {bid!r}): {kind} addresses a warehouse by NAME "
-            '(e.g. "analytics" or "<project-id>/<name>"), not an object-store URI; '
-            f"binding.location.warehouse is {warehouse!r}"
-        )
-
-    # Lakekeeper mounts the Iceberg REST API under ``/catalog``; a bare host
-    # sends the client's GET /v1/config to a path that does not serve it.
-    # Advisory: a reverse proxy may legitimately rewrite the path.
-    uri = str(loc.get("uri") or "")
-    if info.uri_suffix and uri and not uri.rstrip("/").endswith(info.uri_suffix):
-        warnings.append(
-            f"iceberg sink (build {bid!r}): binding.location.uri {uri!r} does not end in "
-            f"{info.uri_suffix!r}; {kind} serves the Iceberg REST API under "
-            f"<host>{info.uri_suffix}"
         )
 
     # The stock Apache Iceberg Kafka Connect runtime bundles the AWS, GCP and
