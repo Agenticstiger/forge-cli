@@ -14,13 +14,15 @@
 
 """Validate-time gate for the governance a cloud binding cannot apply.
 
-``fluid generate iac``, ``fluid plan`` and ``fluid apply`` refuse a principal that
-is unmapped or a placeholder, a column restriction nothing on the binding enforces,
-a Cloud KMS key on AWS or an AWS key on GCP, and retention or encryption on a GCP
-target that is not a BigQuery table. This runs the SAME derivations
-(``iac/providers/gcp_governance.py``, ``iac/column_access.py``,
-``iac/principals.py``) so ``fluid validate`` reports each refusal at stage 2, with
-the same message, instead of at apply. The same shape as ``validate_gcp_binding``.
+``fluid generate iac`` and ``fluid apply`` (and the state check of ``fluid diff``,
+which emits the same module) refuse a principal that is unmapped or a placeholder, a
+column restriction, mask or row filter nothing on the binding enforces, a Cloud KMS
+key on AWS or an AWS key on GCP, and retention or encryption on a GCP target that is
+not a BigQuery table; ``fluid plan`` does not run the emitter. This runs the SAME
+derivations (``iac/providers/gcp_governance.py``, ``lf_governance`` in
+``iac/providers/aws.py``, ``iac/column_access.py``, ``iac/principals.py``) so
+``fluid validate`` reports each refusal at stage 2, with the same message, instead of
+at apply. The same shape as ``validate_gcp_binding``.
 """
 
 from __future__ import annotations
@@ -43,6 +45,25 @@ def _lf_grants(binding: Mapping[str, Any]) -> List[Any]:
     lake = governance.get("lakeFormation") if isinstance(governance, Mapping) else None
     grants = lake.get("grants") if isinstance(lake, Mapping) else None
     return list(grants) if isinstance(grants, list) else []
+
+
+def _aws_refusal(exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int) -> str:
+    """What the AWS emitter's ``lf_governance`` refuses this expose with, or ``""``.
+
+    A name the masked view's SQL cannot quote raises a plain ``ValueError``
+    (``validate_ident``), on which the emitter stops too. It is reported here as the
+    expose's error: escaping, it would end :func:`validate_governance`, and
+    ``fluid validate`` would report no governance finding at all.
+    """
+    from .providers.aws import lf_governance
+
+    try:
+        lf_governance(exposure, binding, index)
+    except UnsupportedBindingError as exc:
+        return _message(exc)
+    except ValueError as exc:
+        return f"exposes[{exposure.get('exposeId') or index}]: {exc}"
+    return ""
 
 
 def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
@@ -73,10 +94,10 @@ def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
         try:
             principal_map(binding)
             if is_cloud(binding, "aws"):
-                from .providers.aws import lf_column_exclusions
-
-                lf_column_exclusions(exposure, binding, index)
-                if not _lf_grants(binding):
+                refusal = _aws_refusal(exposure, binding, index)
+                if refusal:
+                    errors.append(refusal)
+                elif not _lf_grants(binding):
                     unenforced.append(str(exposure.get("exposeId") or index))
                 continue
             if not _gov.gcp_owned(binding):
