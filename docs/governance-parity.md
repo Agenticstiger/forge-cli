@@ -20,6 +20,7 @@ contract needs `fluidVersion: "0.7.6"` to validate with them.
 | **Row filters**: `exposes[].policy.authz.rowFilters[] {principal, where, name?}` | A Lake Formation data cells filter per filter (`aws_lakeformation_data_cells_filter`, `row_filter.filter_expression` the predicate, `column_wildcard.excluded_column_names` the principal's excluded columns), and the principal's `SELECT` granted on the filter instead of the table. Only on a Glue-catalog table (format `iceberg`, `parquet`, `csv`, `json`, `avro`, `orc` or `delta`, with `location.database` and `location.table`): on a Redshift or Kinesis binding the filter is refused. | A row access policy per filter (`google_bigquery_row_access_policy`, `filter_predicate` the predicate, `grantees` every identity of the principal, whatever it holds: a writer reads rows too), and one more, `fluid_all_rows` (`TRUE`), for every other principal the expose grants anything to, never for a filtered one, since BigQuery shows a principal no policy names no row at all and the union of those that do. | AWS: the column check reads a grant made on a data cells filter, so a filtered principal's excluded columns are still checked. Not checked yet: the filter expression on AWS, and the row access policies on GCP. |
 | **Governance labels**: `labels`, `exposes[].labels`, `dataClassification`, `sovereignty {jurisdiction, regulatoryFramework, dataResidency}` | The same keys as AWS tags on the bucket and the key, and as parameters on the Glue table. | GCP labels on the dataset, the table and the key: the contract's and the expose's labels, and `fluid_classification`, `fluid_jurisdiction`, `fluid_regulation` (the frameworks joined), `fluid_residency`. | Not checked yet. |
 | **Access grants**: `accessPolicy.grants[]` | Not emitted: on AWS, access is the binding's `governance.lakeFormation.grants`. `fluid validate` warns only for an aws binding with no Lake Formation grants, where the contract's access intent is unenforced. | One non-authoritative `google_bigquery_dataset_iam_member` per role and member (and `google_storage_bucket_iam_member` for GCS), with the logical principal mapped to its GCP identity. | Not checked yet on either cloud. |
+| **Lake Formation tags** (AWS only): `binding.governance.lakeFormation.tags`, and `governance.lakeFormation.tagDefinitions` for the tags the contract creates | One `aws_lakeformation_lf_tag` per defined key, and one `aws_lakeformation_resource_lf_tags` per table with the binding's tags. The association names each tag the contract defines by reference (`key = aws_lakeformation_lf_tag.<name>.key`, the provider's documented pattern), so it waits for the tag with no `depends_on`, and a value must be one of its tag's values. A key the contract does not define is a tag the platform owns: associated by its literal key, with no reference (see "Lake Formation tags the platform owns" below). | Not applicable: these are AWS binding fields. | Not checked yet. |
 
 A policy that a binding cannot apply is refused, never dropped: at `fluid validate`
 (stage 2), and again by the emitter at `fluid generate iac`, `fluid apply` and the
@@ -33,7 +34,11 @@ key reference on GCP and a Cloud KMS key name on AWS, a mask on an AWS binding w
 string (`column-mask-type`), a row filter on an AWS binding that names no Glue-catalog
 table, such as a Redshift or Kinesis format, or one whose principal holds no Lake
 Formation read grant (`row-filter-unenforceable`), and a row filter on a BigQuery view
-(`row-filter-view`) or on a GCP binding that is not a BigQuery table.
+(`row-filter-view`) or on a GCP binding that is not a BigQuery table, a Lake Formation
+tag value that the contract's definition of the tag does not allow
+(`lakeformation-tag-value`), a tag definition with no values or two that would be one
+resource, such as `a-b` and `a_b` (`lakeformation-tag-definition`), and Lake Formation
+tags on a binding that names no Glue table (`lakeformation-tag-association`).
 
 ## Logical principals and `binding.principals`
 
@@ -309,6 +314,26 @@ is unknown in the plan only when a new table is created, so they are recreated w
 the table and left alone by an in-place update. Their replacement adds removals the
 data-loss gate counts, but only in a plan that already replaces the table.
 
+## Lake Formation tags the platform owns
+
+AWS recommends one LF-tag ontology per account: a data steward or the platform
+creates the tag keys and their values, and each domain is given `ASSOCIATE` on them
+to tag its own tables. A contract follows either model, per key:
+
+* A key in `governance.lakeFormation.tagDefinitions` is a tag the contract creates.
+  The apply creates it, and the association names it by reference
+  (`key = aws_lakeformation_lf_tag.<name>.key`), so OpenTofu creates the tag first and
+  removes the association first on destroy. The association's value must be one of
+  its values (compared case-insensitively, as Lake Formation stores
+  keys and values lower-cased). Do not also create that key anywhere else in the
+  account.
+* A key in a binding's `governance.lakeFormation.tags` that the contract does not
+  define is a tag the platform owns. It is associated by its literal key, with no
+  reference and no warning, and a destroy leaves the tag in place. It must already exist in the account, and the identity
+  running `fluid apply` needs `ASSOCIATE` on it. terraform-provider-aws has no data
+  source for an LF-tag, so nothing checks the key or the value before apply: Lake
+  Formation does, at apply.
+
 ## Prerequisites
 
 * The Cloud KMS API (`cloudkms.googleapis.com`) and the Data Catalog API
@@ -331,6 +356,8 @@ data-loss gate counts, but only in a plan that already replaces the table.
   caller can see, so it must run as a Lake Formation administrator. When the
   contract's own grants are not in the listing, it reports an error rather than a
   pass.
+* On AWS, a Lake Formation tag the platform owns must exist before `fluid apply`,
+  and the identity running it needs `ASSOCIATE` on the tag.
 
 ## What is proven, and what is not
 
@@ -349,6 +376,18 @@ data-loss gate counts, but only in a plan that already replaces the table.
 * The same stand-in shows a revoked reader plans one member destroy that the gate
   lets through, and that moving from the authoritative access list of 0.16.6 and earlier to member
   resources revokes a grant removed in the same change and then plans clean.
+* `tofu validate` accepts a Lake Formation tag association on a tag the platform owns,
+  alone and beside a tag the contract defines (`tests/iac/test_iac_lakeformation_tags.py`).
+  Before, it failed with "Reference to undeclared resource".
+* A real `tofu apply` and `tofu plan` against moto
+  (`tests/iac/test_iac_lakeformation_tags_moto.py`): an association applied as 0.19.0
+  emitted it, with literal keys and `depends_on`, plans no change once it names its
+  tags by reference; a tag the platform created beforehand is associated beside one
+  the contract creates, reads back from Lake Formation and survives the destroy; and a
+  platform-owned key that does not exist fails the apply with
+  `EntityNotFoundException`. moto checks that an associated key exists, not that its
+  value is one of the tag's values, so a wrong value on a platform-owned tag is not
+  proven to fail.
 * **Measured against real Google Cloud**, 4 October 2026, on 0.18.0. In a demo lab, two
   lineage chains of eleven products were applied with `fluid apply --env gcp` from
   generated Jenkins pipelines, as a deploy service account reached by Workload Identity
@@ -402,6 +441,8 @@ data-loss gate counts, but only in a plan that already replaces the table.
     ("Cannot replace a table with a different partitioning spec").
 * **Not proven yet**: an apply of the masking, row filter and label resources exactly
   as forge-cli emits them, on either cloud.
+* **Not proven**: associating a tag the platform owns on a real account, and how Lake
+  Formation treats a value whose case differs from the tag's.
 * **Not proven**: the Lake Formation half against a real account as 0.17.0 derives it
   from `columnRestrictions`. The grant shape it emits (excluded columns beside
   `wildcard`) was applied and enforced on a real account from 0.16.6, written by hand

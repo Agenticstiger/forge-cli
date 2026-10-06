@@ -15,9 +15,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   smoke-tests it from PyPI. Only a manual run can skip, never a tag push. Every job
   now builds the tag's commit, also when a manual run starts from `main`, and the
   quality gate checks `ci.yml` on that commit.
+- CI: on a manual run, `release.yml`'s quality gate refuses a start ref that does not
+  contain the tag's commit, or that GitHub cannot compare with it, and names a tag that
+  does not exist. The SLSA provenance and PyPI's Sigstore attestations name the commit
+  the run started from, not the one it built, so a tag `main` does not contain would
+  have been attested as `main`. When the start ref is not the tag, the gate warns that
+  the provenance names it. A tag after #702 is dispatched with `--ref vX.Y.Z`, which
+  makes the provenance name the tag.
+- CI: the GHCR image and the GitHub Release now wait for PyPI and follow only an upload
+  it accepted. They ran beside `publish-pypi` and ignored its result, so a refused upload
+  (for example "file already exists" on a re-dispatched tag) still cut a release and
+  moved the GHCR `latest` tag. The release takes the quality gate's validated tag name.
 
 ### Fixed
 
+- **A Lake Formation tag the contract does not define is associated, and the module
+  validates.** A key in a binding's `governance.lakeFormation.tags` with no
+  `governance.lakeFormation.tagDefinitions` entry got a `depends_on` on an
+  `aws_lakeformation_lf_tag` the module never declared, so `tofu validate` and
+  `fluid apply` failed with "Reference to undeclared resource". Such a key is now a
+  tag the platform owns: associated as written, with no `depends_on`, no warning and no
+  refusal. It must already exist in the account, and the identity running `fluid apply`
+  needs `ASSOCIATE` on it. A key the contract defines is named by reference,
+  `key = aws_lakeformation_lf_tag.<name>.key`, the provider's documented pattern,
+  instead of a `depends_on` edge, so the association still waits for the tag. The
+  reference evaluates to the same key, so an association applied from 0.19.0 plans no
+  change (applied and planned against moto).
+  Refused at `fluid validate` and at emit, where each used to fail at apply or be
+  dropped: a value the contract's definition of the tag does not allow, compared
+  case-insensitively (`lakeformation-tag-value`); a definition with no values, or two
+  that would be one resource name, such as `a-b` and `a_b`
+  (`lakeformation-tag-definition`); and tags on a binding that names no Glue table
+  (`lakeformation-tag-association`). The `tags` and `tagDefinitions` descriptions in
+  fluid-schema 0.7.3 to 0.7.6 say so.
 - **A BigQuery replace or rollback keeps the table's governance.** Nothing forge-cli
   runs recreates a governed BigQuery table any more. `CREATE OR REPLACE TABLE … AS
   SELECT`, which BigQuery documents drops every row access policy, and whose SELECT

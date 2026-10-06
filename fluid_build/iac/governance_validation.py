@@ -17,10 +17,13 @@
 ``fluid generate iac`` and ``fluid apply`` (and the state check of ``fluid diff``,
 which emits the same module) refuse a principal that is unmapped or a placeholder, a
 column restriction, mask or row filter nothing on the binding enforces, a Cloud KMS
-key on AWS or an AWS key on GCP, and retention or encryption on a GCP target that is
-not a BigQuery table; ``fluid plan`` does not run the emitter. This runs the SAME
-derivations (``iac/providers/gcp_governance.py``, ``lf_governance`` in
-``iac/providers/aws.py``, ``iac/column_access.py``, ``iac/principals.py``) so
+key on AWS or an AWS key on GCP, retention or encryption on a GCP target that is not
+a BigQuery table, and a Lake Formation tag the module cannot create or associate as
+declared (a definition with no values, two definitions that are one resource, a
+value the contract's definition of the tag does not allow, tags on a binding with no
+Glue table); ``fluid plan`` does not run the emitter. This runs the SAME derivations
+(``iac/providers/gcp_governance.py``, ``lf_governance`` and ``lf_tag_associations``
+in ``iac/providers/aws.py``, ``iac/column_access.py``, ``iac/principals.py``) so
 ``fluid validate`` reports each refusal at stage 2, with the same message, instead of
 at apply. The same shape as ``validate_gcp_binding``.
 """
@@ -47,18 +50,38 @@ def _lf_grants(binding: Mapping[str, Any]) -> List[Any]:
     return list(grants) if isinstance(grants, list) else []
 
 
-def _aws_refusal(exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int) -> str:
-    """What the AWS emitter's ``lf_governance`` refuses this expose with, or ``""``.
+def _lf_tag_definition_errors(contract: Mapping[str, Any]) -> List[str]:
+    """The refusal of the contract's LF-tag definitions, which the AWS emitter creates
+    once for the whole contract; none for a contract with no expose bound to AWS."""
+    from .providers.aws import lf_tag_definitions
+
+    for exposure in contract.get("exposes") or []:
+        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
+        if isinstance(binding, Mapping) and is_cloud(binding, "aws"):
+            try:
+                lf_tag_definitions(contract)
+            except UnsupportedBindingError as exc:
+                return [_message(exc)]
+            break
+    return []
+
+
+def _aws_refusal(
+    contract: Mapping[str, Any], exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int
+) -> str:
+    """What the AWS emitter refuses this expose with, or ``""``: ``lf_governance``,
+    then ``lf_tag_associations``, in the emitter's order.
 
     A name the masked view's SQL cannot quote raises a plain ``ValueError``
     (``validate_ident``), on which the emitter stops too. It is reported here as the
     expose's error: escaping, it would end :func:`validate_governance`, and
     ``fluid validate`` would report no governance finding at all.
     """
-    from .providers.aws import lf_governance
+    from .providers.aws import lf_governance, lf_tag_associations
 
     try:
         lf_governance(exposure, binding, index)
+        lf_tag_associations(contract, exposure, binding, index)
     except UnsupportedBindingError as exc:
         return _message(exc)
     except ValueError as exc:
@@ -85,6 +108,7 @@ def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
         _gov.refuse_mixed_dataset_encryption(contract)
     except UnsupportedBindingError as exc:
         errors.append(_message(exc))
+    errors.extend(_lf_tag_definition_errors(contract))
     for index, exposure in enumerate(contract.get("exposes") or []):
         if not isinstance(exposure, Mapping):
             continue
@@ -94,7 +118,7 @@ def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
         try:
             principal_map(binding)
             if is_cloud(binding, "aws"):
-                refusal = _aws_refusal(exposure, binding, index)
+                refusal = _aws_refusal(contract, exposure, binding, index)
                 if refusal:
                     errors.append(refusal)
                 elif not _lf_grants(binding):
