@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CI: `release.yml` can publish through a TestPyPI outage. A manual run with
+  `skip_testpypi: true` skips the TestPyPI upload and its install check and
+  publishes the existing tag straight to PyPI; `verify-pypi` still installs and
+  smoke-tests it from PyPI. Only a manual run can skip, never a tag push. Every job
+  now builds the tag's commit, also when a manual run starts from `main`, and the
+  quality gate checks `ci.yml` on that commit.
+
 ## [0.19.0] — 2026-10-06
 
 A contract can now say that a principal reads a column masked rather than not at all,
