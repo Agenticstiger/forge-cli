@@ -18,13 +18,16 @@
 terraform-provider-google (the emulator returns a dataset without ``selfLink``,
 and ``resource_bigquery_dataset.go`` asserts it is a string), so the emulator
 cannot hold the state a governance test needs. This server stores exactly what
-the provider sends for datasets and tables and returns it with the output-only
-fields the provider reads (ids, ``selfLink``, ``etag``, timestamps), and a new
-dataset gets the default access entries BigQuery gives one (the project's owners,
-writers and readers, and the creator). Nothing else is emulated: no query, no
-load, no IAM evaluation, no Cloud KMS and no Data Catalog. What it proves is what
-the real provider and ``tofu`` plan for a live table, which is where the
-data-loss gate decides; what BigQuery itself accepts is not proven here.
+the provider sends for datasets, tables, a table's row access policies and its IAM
+policy, and returns it with the output-only fields the provider reads (ids,
+``selfLink``, ``etag``, timestamps), and a new dataset gets the default access
+entries BigQuery gives one (the project's owners, writers and readers, and the
+creator). Deleting a table deletes its row access policies and its IAM policy, as
+BigQuery does, and a new table under the same id starts with neither. Nothing else is
+emulated: no query, no load, no IAM evaluation, no Cloud KMS and no Data Catalog.
+What it proves is what the real provider and ``tofu`` plan for a live table, which
+is where the data-loss gate decides; what BigQuery itself accepts is not proven
+here.
 
 The provider is pointed at it with ``bigquery_custom_endpoint`` and a dummy
 ``access_token``, so no credential and no Google endpoint is involved.
@@ -43,6 +46,12 @@ from urllib.parse import urlparse
 
 _DATASET_RE = re.compile(r"^/bigquery/v2/projects/([^/]+)/datasets/?([^/]*)$")
 _TABLE_RE = re.compile(r"^/bigquery/v2/projects/([^/]+)/datasets/([^/]+)/tables/?([^/]*)$")
+_ROW_POLICY_RE = re.compile(
+    r"^/bigquery/v2/projects/([^/]+)/datasets/([^/]+)/tables/([^/]+)/rowAccessPolicies/?([^/]*)$"
+)
+_TABLE_IAM_RE = re.compile(
+    r"^/bigquery/v2/projects/([^/]+)/datasets/([^/]+)/tables/([^/:]+):(getIamPolicy|setIamPolicy)$"
+)
 
 #: What BigQuery puts on a dataset created without ``access`` (BigQuery
 #: documentation, "Dataset access": the project's basic roles and the creator).
@@ -71,11 +80,16 @@ def _legacy_access(dataset: Dict[str, Any]) -> None:
 
 
 class FakeBigQuery:
-    """Datasets and tables by ``(project, dataset[, table])``; every request is logged."""
+    """Datasets, tables and their policies by ``(project, dataset[, table])``; every
+    request is logged."""
 
     def __init__(self) -> None:
         self.datasets: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.tables: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        #: Row access policies by table, then by policy id.
+        self.row_policies: Dict[Tuple[str, str, str], Dict[str, Dict[str, Any]]] = {}
+        #: A table's IAM policy (``bindings``), by table.
+        self.table_iam: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self.requests: List[Tuple[str, str]] = []
         self._lock = threading.Lock()
         self._server: Optional[ThreadingHTTPServer] = None
@@ -162,6 +176,12 @@ class FakeBigQuery:
         body["etag"] = f"etag-{now}"
 
     def _route(self, method: str, path: str, body: Dict[str, Any]) -> Tuple[int, Any]:
+        match = _ROW_POLICY_RE.match(path)
+        if match:
+            return self._row_policy(method, *match.groups(), body)
+        match = _TABLE_IAM_RE.match(path)
+        if match:
+            return self._table_iam(method, *match.groups(), body)
         match = _TABLE_RE.match(path)
         if match:
             return self._table(method, *match.groups(), body)
@@ -246,9 +266,70 @@ class FakeBigQuery:
             self.tables[key] = merged
             return 200, merged
         if method == "DELETE":
+            # BigQuery deletes the table's row access policies and IAM policy with it.
             del self.tables[key]
+            self.row_policies.pop(key, None)
+            self.table_iam.pop(key, None)
             return 204, None
         return self._not_found(path_of(method, project, dataset, table))
+
+    def _row_policy(
+        self,
+        method: str,
+        project: str,
+        dataset: str,
+        table: str,
+        policy: str,
+        body: Dict[str, Any],
+    ) -> Any:
+        key = (project, dataset, table)
+        if key not in self.tables:
+            return self._not_found(f"Table {project}:{dataset}.{table}")
+        policies = self.row_policies.setdefault(key, {})
+        if method == "POST" and not policy:
+            ref = dict(body.get("rowAccessPolicyReference") or {})
+            ref.update(projectId=project, datasetId=dataset, tableId=table)
+            policy_id = ref.get("policyId") or ""
+            if policy_id in policies:
+                return 409, {"error": {"code": 409, "message": "Already Exists"}}
+            stored = copy.deepcopy(body)
+            stored["rowAccessPolicyReference"] = ref
+            self._stamp(stored)
+            policies[policy_id] = stored
+            return 200, stored
+        if method == "GET" and not policy:
+            return 200, {"rowAccessPolicies": list(policies.values())}
+        if policy not in policies:
+            return self._not_found(f"Row access policy {policy} on {project}:{dataset}.{table}")
+        if method == "GET":
+            return 200, policies[policy]
+        if method in ("PUT", "PATCH"):
+            stored = policies[policy]
+            merged = dict(stored) if method == "PATCH" else {}
+            merged.update(copy.deepcopy(body))
+            merged["rowAccessPolicyReference"] = stored["rowAccessPolicyReference"]
+            merged["creationTime"] = stored["creationTime"]
+            self._stamp(merged)
+            policies[policy] = merged
+            return 200, merged
+        if method == "DELETE":
+            del policies[policy]
+            return 204, None
+        return self._not_found(path_of(method, project, dataset, table, policy))
+
+    def _table_iam(
+        self, method: str, project: str, dataset: str, table: str, verb: str, body: Dict[str, Any]
+    ) -> Any:
+        key = (project, dataset, table)
+        if key not in self.tables:
+            return self._not_found(f"Table {project}:{dataset}.{table}")
+        if method != "POST":
+            return self._not_found(path_of(method, project, dataset, f"{table}:{verb}"))
+        if verb == "setIamPolicy":
+            stored = copy.deepcopy(body.get("policy") or {})
+            stored["etag"] = f"etag-{int(time.time() * 1000)}"
+            self.table_iam[key] = stored
+        return 200, self.table_iam.get(key, {"etag": "etag-empty"})
 
 
 def path_of(method: str, *parts: str) -> str:
