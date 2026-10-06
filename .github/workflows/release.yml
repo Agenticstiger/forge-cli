@@ -180,13 +180,14 @@ jobs:
                 // Provenance (the SLSA attestation and PyPI's Sigstore ones) is
                 // built from the run's OIDC claims, so it names the ref and sha
                 // the run started from, not the commit checked out. Refuse a
-                // start ref that does not contain the tag's commit.
+                // start ref that does not contain the tag's commit. A compare
+                // error (404 for commits with no history in common) is refused.
                 const { data: cmp } = await github.rest.repos.compareCommitsWithBasehead({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   basehead: `${sha}...${context.sha}`,
                   per_page: 1,
-                });
+                }).catch((err) => ({ data: { status: `error: ${err.message}` } }));
                 if (cmp.status !== "ahead" && cmp.status !== "identical") {
                   core.setFailed(
                     `Tag ${tag} (${sha}) is not an ancestor of ${context.ref} (${context.sha}): ` +

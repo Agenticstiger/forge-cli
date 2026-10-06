@@ -440,9 +440,8 @@ def test_normal_path_also_waits_for_pypi(path: str, downstream: str) -> None:
     hang off `verify-testpypi`, so they run beside `publish-pypi` and ignore its
     result. A job's `needs` is static, so adding publish-pypi for the outage path
     makes the job wait for it on BOTH paths; waiting and then ignoring the result
-    is the worst of both. This test encodes the recommended choice (wait and
-    gate on every path, as pypa/pipx and pytest do); drop it only if the
-    maintainer chooses to keep the normal path concurrent."""
+    is the worst of both. The project's decision is to wait and gate on every
+    path, as pypa/pipx and pytest do; this test holds it."""
     got = _after_pypi_failure(path)
     assert got[downstream] == "skipped", f"{downstream} ran although publish-pypi failed ({path})"
 
@@ -450,6 +449,46 @@ def test_normal_path_also_waits_for_pypi(path: str, downstream: str) -> None:
 @pytest.mark.parametrize("path", list(_PATHS))
 def test_verify_pypi_follows_a_successful_pypi_upload(path: str) -> None:
     assert _after_pypi_failure(path)["verify-pypi"] == "skipped"
+
+
+def _ok(got: dict[str, str], job: str) -> bool:
+    return got[job] == "success"
+
+
+# When each job must run, from the results of the jobs before it and whether
+# the run skips TestPyPI. A job that runs when its rule is false acts on a step
+# that failed or never ran; one skipped when its rule is true is over-gated.
+_RUNS_WHEN = {
+    "quality-gate": lambda got, skip: True,
+    "build": lambda got, skip: _ok(got, "quality-gate"),
+    "publish-testpypi": lambda got, skip: not skip and _ok(got, "build"),
+    "verify-testpypi": lambda got, skip: not skip and _ok(got, "publish-testpypi"),
+    "publish-pypi": lambda got, skip: _ok(got, "build") and (skip or _ok(got, "verify-testpypi")),
+    "verify-pypi": lambda got, skip: _ok(got, "publish-pypi"),
+    "docker": lambda got, skip: _ok(got, "publish-pypi"),
+    "github-release": lambda got, skip: _ok(got, "publish-pypi"),
+}
+
+
+def test_every_job_has_a_rule() -> None:
+    assert set(_RUNS_WHEN) == set(_jobs())
+
+
+@pytest.mark.parametrize("path", list(_PATHS))
+@pytest.mark.parametrize("failing", [None, *_jobs()])
+def test_every_job_runs_exactly_when_its_rule_holds(path: str, failing: str | None) -> None:
+    """B in full, for every job. The tests above look only for a direct need
+    that FAILED, so they miss a condition that rules out nothing else, such as
+    `needs.publish-pypi.result != 'failure'`: when TestPyPI fails, publish-pypi
+    is SKIPPED, and that condition would still cut a GitHub Release and move
+    GHCR `latest` for a version PyPI never received."""
+    got = _simulate(_jobs(), fail=failing, **_PATHS[path])
+    wrong = [
+        f"{job} {'ran' if got[job] != 'skipped' else 'was skipped'}"
+        for job, rule in _RUNS_WHEN.items()
+        if (got[job] != "skipped") is not rule(got, _PATHS[path]["skip"])
+    ]
+    assert not wrong, f"{path}, {failing or 'nothing'} failing: {wrong} in {got}"
 
 
 # --------------------------------------------------------------------------
@@ -495,19 +534,18 @@ const core = {
   notice: () => {}, info: () => {},
   warning: (m) => { out.warnings.push(String(m)); },
 };
+// Octokit throws a RequestError carrying the HTTP status.
+const missing = () => Object.assign(new Error(fx.missing.message), { status: fx.missing.status });
 const github = { rest: {
   repos: {
     getCommit: async ({ ref }) => {
       calls.push(["getCommit", ref]);
-      if (!(ref in fx.refs)) {
-        // Octokit throws a RequestError carrying the HTTP status.
-        throw Object.assign(new Error(fx.missing.message), { status: fx.missing.status });
-      }
+      if (!(ref in fx.refs)) throw missing();
       return { data: { sha: fx.refs[ref] } };
     },
     compareCommitsWithBasehead: async ({ basehead }) => {
       calls.push(["compare", basehead]);
-      if (!(basehead in fx.compare)) throw new Error("no fixture for " + basehead);
+      if (!(basehead in fx.compare)) throw missing();
       return { data: { status: fx.compare[basehead] } };
     },
   },
@@ -540,13 +578,24 @@ def _git(repo: Path, *args: str) -> str:
         "GIT_COMMITTER_NAME": "t",
         "GIT_COMMITTER_EMAIL": "t@t",
     }
+    # A developer's commit.gpgsign=true would make every commit ask for a key.
     return subprocess.run(
-        ["git", *args], cwd=repo, env=env, check=True, capture_output=True, text=True
+        ["git", "-c", "commit.gpgsign=false", *args],
+        cwd=repo,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 
-def _status(repo: Path, base: str, head: str) -> str:
-    """The `status` GitHub's compare API reports for base...head."""
+def _status(repo: Path, base: str, head: str) -> str | None:
+    """The `status` GitHub's compare API reports for base...head, or None
+    where it answers 404: commits with no history in common."""
+    try:
+        _git(repo, "merge-base", base, head)
+    except subprocess.CalledProcessError:
+        return None
     ahead = int(_git(repo, "rev-list", "--count", f"{base}..{head}"))
     behind = int(_git(repo, "rev-list", "--count", f"{head}..{base}"))
     if not ahead and not behind:
@@ -556,7 +605,8 @@ def _status(repo: Path, base: str, head: str) -> str:
 
 @pytest.fixture(scope="module")
 def history(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
-    """main: c1 - c2 - c3.  feature: c1 - f1 (diverged from main)."""
+    """main: c1 - c2 - c3.  feature: c1 - f1 (diverged from main).
+    orphan: o1 (no history in common with main)."""
     repo = tmp_path_factory.mktemp("repo")
     _git(repo, "init", "-q", "-b", "main")
     shas: dict[str, str] = {}
@@ -566,6 +616,9 @@ def history(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     _git(repo, "checkout", "-q", "-b", "feature", shas["c1"])
     _git(repo, "commit", "-q", "--allow-empty", "-m", "f1")
     shas["f1"] = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "--orphan", "orphan")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "o1")
+    shas["o1"] = _git(repo, "rev-parse", "HEAD")
     shas["_repo"] = str(repo)
     return shas
 
@@ -584,14 +637,17 @@ def _run_gate(
     """Run the real quality-gate `commit` step. `start` is the commit the run
     starts from (context.sha): main's head for `--ref main`, the tag's own
     commit for `--ref vX.Y.Z` or a tag push. `tag_commit=None` is a tag that
-    does not exist; `missing` is what GitHub answers for it."""
+    does not exist; `missing` is what GitHub answers for it, and for a compare
+    of commits with no history in common."""
     repo = Path(history["_repo"])
     step = next(s for s in _steps("quality-gate") if s.get("id") == "commit")
     ctx_sha = history[start]
     refs, compare = {}, {}
     if tag_commit is not None:
         refs[f"refs/tags/{tag}"] = history[tag_commit]
-        compare[f"{history[tag_commit]}...{ctx_sha}"] = _status(repo, history[tag_commit], ctx_sha)
+        status = _status(repo, history[tag_commit], ctx_sha)
+        if status:
+            compare[f"{history[tag_commit]}...{ctx_sha}"] = status
     fixture = {
         "script": step["with"]["script"],
         "refs": refs,
@@ -685,13 +741,16 @@ def test_gate_names_a_tag_that_does_not_exist(history, tmp_path, missing) -> Non
     [
         ("f1", "c3", "diverged"),  # tag on a branch main does not contain
         ("c3", "c2", "behind"),  # tag newer than the ref the run started from
+        ("o1", "c3", "Not Found"),  # no history in common: the compare fails
     ],
 )
 def test_gate_refuses_a_start_ref_that_does_not_contain_the_tag(
     history, tmp_path, tag_commit: str, start: str, status: str
 ) -> None:
     """A: the build would be of the tag's commit while provenance names the
-    start ref's, a commit the artifact was never built from."""
+    start ref's, a commit the artifact was never built from. A compare that
+    fails (GitHub's 404 for commits with no history in common, or an outage)
+    fails closed, not open and not with a bare error thrown out of the step."""
     got = _run_gate(
         history,
         tmp_path,
@@ -700,7 +759,7 @@ def test_gate_refuses_a_start_ref_that_does_not_contain_the_tag(
         tag_commit=tag_commit,
         start=start,
     )
-    assert got["failed"], f"gate passed a {status} tag: {got}"
+    assert got["failed"] and "threw" not in got, f"gate passed a {status} tag: {got}"
     assert "sha" not in got["outputs"], got
     # It names the tag, both commits and the status, and says what to do.
     for part in ("v1.0.0", history[tag_commit], history[start], status, "--ref v1.0.0"):

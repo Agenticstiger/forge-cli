@@ -178,7 +178,8 @@ gh workflow run release.yml --ref main -f tag=vX.Y.Z -f skip_testpypi=true
 The provenance then names `main` at its head when the run started, and the quality gate
 says so in a warning. The gate refuses a start ref that does not contain the tag's
 commit, such as `main` for a tag on another branch, or a ref older than the tag. It also
-refuses a tag that does not exist, and names it.
+refuses, and names the tag, when the tag does not exist or GitHub cannot compare the two
+commits.
 
 ## Provisioning a new cloud test account
 

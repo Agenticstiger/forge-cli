@@ -16,11 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now builds the tag's commit, also when a manual run starts from `main`, and the
   quality gate checks `ci.yml` on that commit.
 - CI: on a manual run, `release.yml`'s quality gate refuses a start ref that does not
-  contain the tag's commit, and names a tag that does not exist. The SLSA provenance
-  and PyPI's Sigstore attestations name the commit the run started from, not the one it
-  built, so a tag `main` does not contain would have been attested as `main`. When the
-  start ref is not the tag, the gate warns that the provenance names it. A tag after
-  #702 is dispatched with `--ref vX.Y.Z`, which makes the provenance name the tag.
+  contain the tag's commit, or that GitHub cannot compare with it, and names a tag that
+  does not exist. The SLSA provenance and PyPI's Sigstore attestations name the commit
+  the run started from, not the one it built, so a tag `main` does not contain would
+  have been attested as `main`. When the start ref is not the tag, the gate warns that
+  the provenance names it. A tag after #702 is dispatched with `--ref vX.Y.Z`, which
+  makes the provenance name the tag.
 - CI: the GHCR image and the GitHub Release now wait for PyPI and follow only an upload
   it accepted. They ran beside `publish-pypi` and ignored its result, so a refused upload
   (for example "file already exists" on a re-dispatched tag) still cut a release and
