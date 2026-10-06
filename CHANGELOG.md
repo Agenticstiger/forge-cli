@@ -16,6 +16,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now builds the tag's commit, also when a manual run starts from `main`, and the
   quality gate checks `ci.yml` on that commit.
 
+### Fixed
+
+- **A row filter on an AWS binding that is not a Glue-catalog table is refused, not
+  dropped.** On AWS a row filter is a Lake Formation data cells filter on a Glue table,
+  and the emitter writes no Lake Formation resource for any other format. So
+  `rowFilters` on a `redshift_serverless`, `redshift_table`, `redshift_external_schema`
+  or Kinesis binding, or on a Glue format with no `location.database`, passed
+  `fluid validate`, and `fluid generate iac` and `fluid apply` wrote the Redshift
+  namespace and workgroup with no filter and reported success. It is now refused
+  (`row-filter-unenforceable`), and the message names the formats that can carry a
+  filter. A mask or a deny on such a binding was already refused
+  (`column-restriction-unenforceable`), and still is.
+- **`fluid validate` reports every row-filter and mask refusal the AWS emitter makes.**
+  For an aws binding it ran only the column-restriction check, so a row filter with no
+  Lake Formation read grant or with an unmapped principal, a mask with no
+  `maskedViews`, a text mask on a column that is not a string, and a masked view over
+  a name its SQL cannot quote all passed stage 2 and failed first at
+  `fluid generate iac` or `fluid apply`. Both now run the same derivation
+  (`lf_governance`) and refuse with the same message.
+
+### Documentation
+
+- `docs/governance-parity.md` said these refusals happen at `fluid plan`. `fluid plan`
+  never runs the emitter: they happen at `fluid validate`, `fluid generate iac`,
+  `fluid apply` and the state check of `fluid diff`.
+
 ## [0.19.0] — 2026-10-06
 
 A contract can now say that a principal reads a column masked rather than not at all,

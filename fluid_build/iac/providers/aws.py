@@ -403,14 +403,12 @@ class AwsIacPlugin:
             fmt = binding.get("format") or "parquet"
             schema = (exposure.get("contract") or {}).get("schema") or []
             # The contract's column restrictions, as each Lake Formation grant's
-            # excluded columns (``iac/column_access.py``); refused when nothing
-            # on this binding could enforce them.
-            exclusions = lf_column_exclusions(exposure, binding, index)
-            # The contract's row filters, each on the read grant of its principal,
-            # and the protected views its masked principals read (Lake Formation
-            # cannot mask): ``lf_row_filters`` / ``lf_masked_views``.
-            row_filters = lf_row_filters(exposure, binding, index)
-            masked_views = lf_masked_views(exposure, binding, index, exclusions or {}, row_filters)
+            # excluded columns (``iac/column_access.py``), its row filters, each on
+            # the read grant of its principal, and the protected views its masked
+            # principals read (Lake Formation cannot mask); each refused when
+            # nothing on this binding could enforce it. ``fluid validate`` runs the
+            # same :func:`lf_governance`, so it refuses what this would.
+            exclusions, row_filters, masked_views = lf_governance(exposure, binding, index)
             placement = _placement(packaging, exposure)
             # The contract's governance labels (classification, jurisdiction,
             # regulation, its own labels) under fluid's own two, which win.
@@ -2096,16 +2094,29 @@ def lf_row_filters(
     A filter's principal resolves through ``binding.principals`` to its IAM identities;
     each read grant held by one of them carries the filter (:func:`_emit_lakeformation`
     grants it on a data cells filter instead of the table). A filter with no read grant
-    to carry it is refused: Lake Formation would let nobody read less.
+    to carry it is refused: Lake Formation would let nobody read less. So is a filter on
+    a binding that names no Glue-catalog table (a Redshift or Kinesis format, or no
+    ``location.database``), where :func:`_emit_lakeformation` writes nothing at all.
     """
     filters = row_filters_for(exposure, index)
     if not filters:
         return {}
     where = f"exposes[{exposure.get('exposeId') or index}].policy.authz.rowFilters"
+    loc = binding.get("location") or {}
+    fmt = str(binding.get("format") or "parquet")
+    if fmt.lower() not in _GLUE_CATALOG_FORMATS or not loc.get("database") or not loc.get("table"):
+        formats = sorted(_GLUE_CATALOG_FORMATS)
+        raise UnsupportedBindingError(
+            "row-filter-unenforceable",
+            f"{where} filters rows, but its {fmt} binding names no Glue-catalog table; the "
+            "AWS emitter enforces row filters only as Lake Formation data cells filters on "
+            f"one, a binding of format {', '.join(formats[:-1])} or {formats[-1]} with a "
+            "location.database and location.table. It would not be enforced.",
+            ("Move the filter to such an expose, or remove it from this one.",),
+        )
     gov = (binding.get("governance") or {}).get("lakeFormation") or {}
     grants = gov.get("grants") if isinstance(gov, Mapping) else None
-    loc = binding.get("location") or {}
-    if not grants or not loc.get("table"):
+    if not grants:
         raise UnsupportedBindingError(
             "row-filter-unenforceable",
             f"{where} filters rows, but this aws binding has no governance.lakeFormation "
@@ -2292,6 +2303,22 @@ def lf_masked_views(
             )
         )
     return views
+
+
+def lf_governance(
+    exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int = 0
+) -> Tuple[Optional[Dict[int, Tuple[str, ...]]], Dict[int, RowFilter], List[_LfMaskedView]]:
+    """``(exclusions, row_filters, masked_views)``: one aws expose's Lake Formation policy.
+
+    :func:`lf_column_exclusions`, :func:`lf_row_filters` and :func:`lf_masked_views`, in
+    that order, as :meth:`AwsIacPlugin.emit` writes them, raising whatever it would.
+    ``fluid validate`` runs this too (``iac/governance_validation.py``), so each refusal
+    is reported at stage 2 with the emitter's own message, never first at apply.
+    """
+    exclusions = lf_column_exclusions(exposure, binding, index)
+    row_filters = lf_row_filters(exposure, binding, index)
+    masked_views = lf_masked_views(exposure, binding, index, exclusions or {}, row_filters)
+    return exclusions, row_filters, masked_views
 
 
 def _refuse_grants_left_no_column(
