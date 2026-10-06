@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- An AWS contract that declared `location.catalog` other than `glue` (for example
+  `rest`, `iceberg_rest`, `polaris`, `unity`, `nessie` or `lakekeeper`) on an Iceberg
+  expose holds a Glue database and table in its OpenTofu state that earlier releases
+  created for it. `fluid apply` now stops before planning with
+  `iceberg_catalog_move_blocked` and prints the `tofu state rm` commands that release
+  them, instead of planning to destroy them: destroying a Glue database deletes every
+  table in it. The resources stay in AWS; run the commands, then apply again.
+
 ### Changed
 
 - CI: `release.yml` can publish through a TestPyPI outage. A manual run with
@@ -28,6 +38,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moved the GHCR `latest` tag. The release takes the quality gate's validated tag name.
 
 ### Fixed
+
+- **A Kafka Connect Iceberg sink on AWS Glue starts.** The derived connector config set
+  both `iceberg.catalog.type` and `iceberg.catalog.catalog-impl`, and Apache Iceberg's
+  `CatalogUtil` refuses that ("both type and catalog-impl are set"), so the sink failed
+  at startup. It now sets `catalog-impl` or `type`, never both, as the Debezium Server
+  sink already did. `fluid validate` also refuses an `iceberg_catalog_overrides` or
+  hand-written sink config that would add the other key back.
+- **Every emitter reads `location.catalog` the same way.** The streaming sinks, dbt
+  `catalogs.yml`, the Snowflake, AWS and Confluent IaC, the native AWS planner, `fluid
+  policy compile`, `fluid diff` and `fluid test` each classified the free-string value by
+  hand, and disagreed: `catalog: lakekeeper` streamed over REST while dbt wrote a
+  Snowflake-managed table and the AWS IaC created a Glue table of the same name. One
+  table in `providers/_iceberg_catalog.py` now classifies it; spellings fold case and
+  `-`/`_` (`iceberg-rest` is `rest`, `snowflake` is `snowflake-managed`).
+  - AWS: an Iceberg expose in another catalog gets its S3 bucket but no Glue database,
+    table, import, Glue IAM grant or Lake Formation resource, and `fluid diff` and
+    `fluid test` no longer look for it in Glue. `governance.lakeFormation`, column
+    restrictions and row filters on such an expose are refused at `fluid validate` and
+    at apply, by catalog name, instead of being emitted against a Glue table that does
+    not exist. An absent catalog or `catalog: glue` emits exactly what it did.
+  - Snowflake: `lakekeeper` and the `iceberg-rest` spelling are external catalogs
+    (`catalog_type: iceberg_rest`, no EXTERNAL VOLUME), and `fluid validate` no longer
+    demands an `s3://` or `gs://` warehouse for them. `hive`, `jdbc`, `hadoop` and
+    `dynamodb`, which Snowflake has no catalog integration for, are a validate error and
+    are left out of `catalogs.yml` instead of becoming a Snowflake-managed table.
+  - dbt-bigquery: an expose naming a catalog other than `bigquery` is left out of
+    `catalogs.yml` with a warning instead of becoming a BigLake table.
+  - Confluent Tableflow: a `location.catalog` other than `glue` is a validate error; it
+    was ignored and the table was published to Glue.
+  - `catalog: dynamodb` reaches Iceberg as `catalog-impl` (`DynamoDbCatalog`); Iceberg
+    has no `dynamodb` type.
+- **`fluid validate` refuses an Iceberg catalog value it does not know**, and lists the
+  accepted ones. The emitters used to fall back differently, so a typo split one table
+  across catalogs. `fluid apply` on AWS refuses it too (`unknown-iceberg-catalog`).
+- **The streaming-sink checks cover every catalog.** `uri` and `warehouse` were required
+  only for the literal `rest`; every REST catalog (and Nessie) now needs them. A
+  `sink.catalog` that disagrees with the expose's catalog is refused, since dbt and the
+  IaC read only the expose. A warehouse override equal to the REST binding's warehouse
+  no longer warns that "the static Glue table may differ". The Kafka Connect runner and
+  the embedded Debezium Server runner run the same checks before they create anything.
+- **A crash in an Iceberg or Confluent gate fails `fluid validate`.** It was printed only
+  with `--verbose`, and the contract passed unchecked.
+- **`fluid validate` catches two `catalog: snowflake` Iceberg exposes that derive one
+  EXTERNAL VOLUME on different storage**, instead of `fluid apply` failing mid-emit.
+- **`fluid policy compile` grants an Iceberg table where its catalog lives.** Every
+  Iceberg expose off GCP compiled to AWS S3 and Glue grants, whatever its platform. A
+  Snowflake-managed table now compiles to Snowflake grants, and a table in another
+  catalog gets no Glue grant and a warning to enforce access in that catalog.
 
 - **A Lake Formation tag the contract does not define is associated, and the module
   validates.** A key in a binding's `governance.lakeFormation.tags` with no

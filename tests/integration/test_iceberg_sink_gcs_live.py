@@ -178,8 +178,10 @@ def test_iceberg_sink_writes_to_gcs(tmp_path: Path):
         if not wait_for_http("http://localhost:8181/v1/config"):
             pytest.skip("iceberg-rest catalog did not come up within timeout")
 
-        # create the namespace over REST before the sink writes (RFC §14: the
-        # connector auto-creates the TABLE but not the NAMESPACE).
+        # create the namespace over REST before writing: the writer here is
+        # pyiceberg (no Kafka Connect sink runs in this test), and its
+        # create_table needs an existing namespace. The Apache sink creates the
+        # namespace itself on auto-create since Iceberg 1.6.0 (RFC §6.8 #6).
         urllib.request.urlopen(  # noqa: S310 — localhost emulator
             urllib.request.Request(
                 "http://localhost:8181/v1/namespaces",

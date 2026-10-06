@@ -23,13 +23,18 @@ should be written at all.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 import pytest
 import yaml
 
 from fluid_build.engines.dbt.catalogs_yml import generate_catalogs_yml
-from fluid_build.providers._iceberg_catalog import iceberg_external_volume_name
+from fluid_build.providers._iceberg_catalog import (
+    iceberg_external_volume_name,
+    is_glue_cataloged,
+    resolve_iceberg_catalog,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -44,8 +49,10 @@ def _contract(
     catalog: Optional[str] = None,
     database: str = "ANALYTICS",
     contract_id: str = "gold.orders",
+    platform: str = "snowflake",
+    **extra_location: Any,
 ) -> Dict[str, Any]:
-    location: Dict[str, Any] = {"database": database, "table": "ORDERS"}
+    location: Dict[str, Any] = {"database": database, "table": "ORDERS", **extra_location}
     if catalog:
         location["catalog"] = catalog
     return {
@@ -59,7 +66,7 @@ def _contract(
                 "exposeId": "orders",
                 "kind": "table",
                 "binding": {
-                    "platform": "snowflake",
+                    "platform": platform,
                     "format": fmt,
                     "location": location,
                 },
@@ -151,6 +158,186 @@ class TestExternalRestCatalog:
     def test_non_glue_rest_omits_the_glue_only_property(self):
         integration = _integration(generate_catalogs_yml(_contract(catalog="polaris"), _build()))
         assert "catalog_linked_database_type" not in integration.get("adapter_properties", {})
+
+
+class TestSnowflakeCatalogKinds:
+    """Snowflake's catalog type is the kind table's ``snowflake_catalog_type``.
+
+    Before the table, this emitter kept its own lower-cased set, so
+    ``catalog: lakekeeper`` (and any non-canonical spelling) fell through to
+    ``built_in``: dbt wrote a Snowflake-managed table while the streaming sink
+    committed the same name to Lakekeeper over REST.
+    """
+
+    @pytest.mark.parametrize(
+        "catalog", ["lakekeeper", "Lakekeeper", "iceberg-rest", "ICEBERG_REST"]
+    )
+    def test_rest_family_spellings_map_to_iceberg_rest(self, catalog):
+        integration = _integration(generate_catalogs_yml(_contract(catalog=catalog), _build()))
+        assert integration["catalog_type"] == "iceberg_rest"
+        assert "external_volume" not in integration
+        props = integration["adapter_properties"]
+        assert props["catalog_linked_database"] == "ANALYTICS"
+        assert "catalog_linked_database_type" not in props
+
+    def test_lakekeeper_agrees_with_the_streaming_sink(self):
+        """The originating bug, end to end: both writers must mean a REST catalog."""
+        contract = _contract(catalog="lakekeeper")
+        binding = contract["exposes"][0]["binding"]
+        assert resolve_iceberg_catalog(binding, contract=contract).catalog_type == "rest"
+        integration = _integration(generate_catalogs_yml(contract, _build()))
+        assert integration["catalog_type"] == "iceberg_rest"
+
+    @pytest.mark.parametrize(
+        "catalog", ["snowflake", "Snowflake", "snowflake_managed", "snowflake-managed"]
+    )
+    def test_snowflake_spellings_are_built_in(self, catalog):
+        contract = _contract(catalog=catalog)
+        integration = _integration(generate_catalogs_yml(contract, _build()))
+        assert integration["catalog_type"] == "built_in"
+        assert integration["external_volume"] == iceberg_external_volume_name(
+            contract, contract["exposes"][0]["binding"]
+        )
+
+    def test_unknown_kind_keeps_the_built_in_fallback(self):
+        """Historic fallback, kept so a typo does not silently flip the table
+        to a catalog-linked database; ``fluid validate`` reports the value."""
+        integration = _integration(
+            generate_catalogs_yml(_contract(catalog="not-a-catalog"), _build())
+        )
+        assert integration["catalog_type"] == "built_in"
+        assert integration["external_volume"]
+
+    @pytest.mark.parametrize("catalog", ["hive", "HIVE", "jdbc", "hadoop", "dynamodb"])
+    def test_catalog_snowflake_cannot_reach_writes_no_file(self, catalog):
+        """No Snowflake catalog integration exists for these. ``built_in``
+        would have dbt create a second, Snowflake-managed table under the name
+        the Hive metastore (or JDBC / Hadoop / DynamoDB catalog) owns."""
+        assert generate_catalogs_yml(_contract(catalog=catalog), _build()) is None
+
+    def test_unreachable_expose_is_omitted_beside_a_reachable_one(self):
+        contract = _contract(catalog="hive")
+        managed = {**contract["exposes"][0], "exposeId": "managed"}
+        managed["binding"] = {**managed["binding"], "location": {"database": "A", "table": "B"}}
+        contract["exposes"].append(managed)
+        doc = _parse(generate_catalogs_yml(contract, _build()))
+        assert [c["name"] for c in doc["catalogs"]] == ["managed_catalog"]
+        assert doc["catalogs"][0]["write_integrations"][0]["catalog_type"] == "built_in"
+
+    def test_omission_is_logged_with_the_way_out(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="fluid_build.engines.dbt.catalogs_yml"):
+            generate_catalogs_yml(_contract(catalog="hive"), _build())
+        message = caplog.text
+        assert "'orders'" in message and "'hive'" in message
+        assert "lakekeeper" in message and "omit location.catalog" in message
+
+    @pytest.mark.parametrize(
+        "platform, catalog",
+        [
+            ("aws", None),
+            ("aws", "glue"),
+            ("aws", "lakekeeper"),
+            ("snowflake", None),
+            ("snowflake", "GLUE"),
+            ("snowflake", "polaris"),
+        ],
+    )
+    def test_glue_link_type_tracks_the_aws_iac(self, platform, catalog):
+        """The AWS IaC creates a Glue table exactly when ``is_glue_cataloged``.
+
+        dbt on Snowflake must reach that same table through a Glue
+        catalog-linked database. An absent catalog on ``platform: aws`` used
+        to emit ``built_in`` with a volume that nothing creates (the Snowflake
+        IaC only serves ``platform: snowflake`` exposes).
+        """
+        contract = _contract(catalog=catalog, platform=platform)
+        binding = contract["exposes"][0]["binding"]
+        integration = _integration(generate_catalogs_yml(contract, _build()))
+        props = integration.get("adapter_properties", {})
+        is_glue_link = props.get("catalog_linked_database_type") == "glue"
+        assert is_glue_link == is_glue_cataloged(binding)
+        if is_glue_link:
+            assert integration["catalog_type"] == "iceberg_rest"
+
+
+class TestBigQueryCatalogKinds:
+    """``biglake_metastore`` is dbt-bigquery's only catalog type.
+
+    It cannot redirect a model to an external Iceberg catalog, so emitting it
+    for ``catalog: lakekeeper`` had dbt create a BigLake table under the name
+    the streaming sink commits to in Lakekeeper.
+    """
+
+    @staticmethod
+    def _contract(catalog: Optional[str] = None) -> Dict[str, Any]:
+        return _contract(catalog=catalog, platform="gcp", bucket="lake", path="p")
+
+    @pytest.mark.parametrize(
+        "catalog", ["lakekeeper", "Lakekeeper", "rest", "iceberg_rest", "glue", "not-a-catalog"]
+    )
+    def test_non_biglake_catalog_writes_no_file(self, catalog):
+        assert generate_catalogs_yml(self._contract(catalog), _build("gcp")) is None
+
+    @pytest.mark.parametrize("catalog", ["bigquery", "BigQuery", "BIGQUERY"])
+    def test_biglake_spellings_are_byte_identical_to_absent(self, catalog):
+        absent = generate_catalogs_yml(self._contract(), _build("gcp"))
+        assert generate_catalogs_yml(self._contract(catalog), _build("gcp")) == absent
+        assert "catalog_type: biglake_metastore" in absent
+
+    def test_lakekeeper_expose_is_omitted_beside_a_biglake_one(self):
+        contract = self._contract("lakekeeper")
+        biglake = {**contract["exposes"][0], "exposeId": "biglake"}
+        biglake["binding"] = {
+            **biglake["binding"],
+            "location": {"dataset": "d", "table": "T", "bucket": "lake"},
+        }
+        contract["exposes"].append(biglake)
+        doc = _parse(generate_catalogs_yml(contract, _build("gcp")))
+        assert [c["name"] for c in doc["catalogs"]] == ["biglake_catalog"]
+
+    def test_omission_is_logged_with_the_way_out(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="fluid_build.engines.dbt.catalogs_yml"):
+            generate_catalogs_yml(self._contract("lakekeeper"), _build("gcp"))
+        assert "dbt-bigquery" in caplog.text and "'lakekeeper'" in caplog.text
+
+
+class TestByteIdenticalShapes:
+    """Golden pins for the shapes the catalog-kind table must not move."""
+
+    _PREFIX = (
+        "# Generated by fluid generate. Do not edit manually.\n"
+        "# Regenerate with: fluid generate\n\n"
+        "catalogs:\n"
+        "- name: orders_catalog\n"
+        "  active_write_integration: orders_write_integration\n"
+        "  write_integrations:\n"
+        "  - name: orders_write_integration\n"
+    )
+
+    def test_snowflake_absent_catalog(self):
+        assert generate_catalogs_yml(_contract(), _build()) == self._PREFIX + (
+            "    table_format: iceberg\n"
+            "    catalog_type: built_in\n"
+            "    external_volume: FLUID_GOLD_ORDERS_VOL\n"
+        )
+
+    def test_snowflake_glue_catalog(self):
+        assert generate_catalogs_yml(_contract(catalog="glue"), _build()) == self._PREFIX + (
+            "    table_format: iceberg\n"
+            "    catalog_type: iceberg_rest\n"
+            "    adapter_properties:\n"
+            "      catalog_linked_database: ANALYTICS\n"
+            "      catalog_linked_database_type: glue\n"
+        )
+
+    def test_bigquery_absent_catalog(self):
+        contract = _contract(platform="gcp", bucket="lake", path="p")
+        assert generate_catalogs_yml(contract, _build("gcp")) == self._PREFIX + (
+            "    external_volume: gs://lake/p\n"
+            "    table_format: iceberg\n"
+            "    file_format: parquet\n"
+            "    catalog_type: biglake_metastore\n"
+        )
 
 
 class TestEmitsNothingWhenItShould:

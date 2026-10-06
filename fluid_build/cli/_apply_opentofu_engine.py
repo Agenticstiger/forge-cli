@@ -215,6 +215,11 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
         contract, str(workdir), env, args, logger, plugin=plugin, actions=actions
     )
 
+    # Pre-plan Iceberg catalog-move guard: Glue resources an older forge-cli
+    # created for an Iceberg table that lives in Lakekeeper / a REST catalog
+    # would otherwise be planned for DESTROY (iac/catalog_moves.py).
+    _guard_catalog_moves(plugin, contract, provider, str(workdir), env, logger, actions=actions)
+
     _adopt_existing(plugin, contract, actions, str(workdir), env, logger)
 
     plan = runner.tofu_plan(str(workdir), env=env)
@@ -886,6 +891,55 @@ def _guard_packaging_transitions(
             containers=[t.as_event() for t in adoptions],
             count=len(adoptions),
         )
+
+
+def _guard_catalog_moves(
+    plugin: Any,
+    contract: Mapping[str, Any],
+    provider: str,
+    workdir: str,
+    env: Mapping[str, str],
+    logger: logging.Logger,
+    *,
+    actions: Any = (),
+) -> None:
+    """Fail closed when the plan would destroy Glue resources of an Iceberg table
+    that now lives in another catalog.
+
+    Thin CLI adapter over ``iac.catalog_moves.guard_catalog_moves``, the shape
+    of :func:`_guard_packaging_transitions`: detection and remediation text live
+    in ``iac/``, and this side owns the ``CLIError`` and the audit event.
+
+    A no-op off AWS, for every contract without an AWS Iceberg expose in a
+    non-Glue catalog (checked before the state is even listed), and for a
+    fresh workdir. A probe that fails is logged and skipped rather than failing
+    the apply: the data-loss gate still stands behind it.
+    """
+    if provider != "aws":
+        return
+    from fluid_build.iac.catalog_moves import (
+        CatalogMoveError,
+        guard_catalog_moves,
+        moved_iceberg_exposes,
+    )
+
+    if not moved_iceberg_exposes(contract):
+        return
+    state = runner.tofu_state_list(workdir, env=env)
+    if not state:
+        return
+    try:
+        guard_catalog_moves(plugin, contract, state, workdir=workdir, actions=actions)
+    except CatalogMoveError as exc:
+        # Structured audit event BEFORE the raise, as for a packaging transition.
+        info(logger, "iceberg_catalog_move_blocked", **exc.event_fields())
+        raise CLIError(
+            1,
+            "iceberg_catalog_move_blocked",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        )
+    except Exception as exc:  # defensive: a failed probe must not fail the apply
+        logger.debug("opentofu: catalog-move probe failed: %s", exc)
 
 
 def _report_suppressed_drift(

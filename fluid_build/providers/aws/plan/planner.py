@@ -50,6 +50,36 @@ def _resolve_env_templates(value: str) -> str:
     return re.sub(r"\{\{\s*env\.(\S+?)\s*\}\}", _replacer, value)
 
 
+def _glue_cataloged(binding: Mapping[str, Any]) -> bool:
+    """Does this AWS binding's table live in the Glue Data Catalog?
+
+    False only for an Iceberg binding whose ``location.catalog`` names a
+    non-Glue catalog (``lakekeeper``, ``rest``, ``nessie``...). That table is
+    created and owned by its catalog, so a Glue database and Glue Iceberg table
+    for it would be a second, metadata-less claim on the same name: the bug
+    class where ``catalog: lakekeeper`` streamed over REST while the AWS plan
+    still provisioned a Glue table. An absent catalog on AWS is Glue, so every
+    existing contract plans exactly as before.
+
+    Reads the one classification every emitter shares
+    (``providers/_iceberg_catalog.is_glue_cataloged``), imported lazily as
+    ``_plan_exposures`` does its format helpers. A non-mapping ``location`` (a
+    malformed contract this planner already tolerates) counts as no catalog.
+    """
+    from fluid_build.providers._iceberg_catalog import is_glue_cataloged
+
+    location = binding.get("location")
+    if not isinstance(location, Mapping):
+        location = {}
+    return is_glue_cataloged({**binding, "location": location})
+
+
+def _declared_catalog(binding: Mapping[str, Any]) -> Any:
+    """``location.catalog`` as written, for log events (``None`` when absent)."""
+    location = binding.get("location")
+    return location.get("catalog") if isinstance(location, Mapping) else None
+
+
 class AwsPlanner(BasePlanner):
     """AWS-specific planner — wires the 6-phase scaffold to the
     Glue / S3 / Athena / Redshift phase functions below.
@@ -224,7 +254,29 @@ def _plan_infrastructure(
         platform = binding.get("platform", "").lower()
 
         # Handle different binding formats
-        if platform in ["aws", "glue", "athena"]:
+        if platform in ["aws", "glue", "athena"] and not _glue_cataloged(binding):
+            # A non-Glue Iceberg catalog owns its namespace, so no Glue
+            # database (and no ``{account}-fluid-data`` fallback bucket, which
+            # exists only to back that database). A bucket the binding names
+            # is still the table's storage, and the IaC emitter creates it too.
+            location = binding.get("location") or {}
+            raw_bucket = (
+                location.get("bucket") if isinstance(location, dict) else None
+            ) or binding.get("bucket")
+            bucket_name = _resolve_env_templates(raw_bucket) if raw_bucket else None
+            if bucket_name and "{{" not in bucket_name and bucket_name not in buckets_created:
+                actions.append(
+                    {
+                        "op": "s3.ensure_bucket",
+                        "id": f"bucket_{bucket_name}",
+                        "bucket": bucket_name,
+                        "region": region,
+                        "tags": _get_resource_tags(contract),
+                    }
+                )
+                buckets_created.add(bucket_name)
+
+        elif platform in ["aws", "glue", "athena"]:
             # Ensure Glue database exists (support nested and flat formats)
             location = binding.get("location") or {}
             database = location.get("database") if isinstance(location, dict) else None
@@ -347,7 +399,22 @@ def _plan_iam_policies(
             continue
         platform = binding.get("platform", "").lower()
 
-        if platform in ["aws", "glue", "athena"]:
+        if platform in ["aws", "glue", "athena"] and not _glue_cataloged(binding):
+            # No Glue database exists for a non-Glue Iceberg table, so a Glue
+            # IAM binding would grant on nothing while the catalog that owns
+            # the table stays ungoverned. Say so rather than skip silently;
+            # the catalog's own authorization is where these policies apply.
+            logger.warning(
+                format_event(
+                    "glue_iam_binding_skipped",
+                    expose=exposure.get("exposeId") or exposure.get("id"),
+                    catalog=_declared_catalog(binding),
+                    reason="the table lives in a non-Glue Iceberg catalog; "
+                    "enforce metadata.policies in that catalog",
+                )
+            )
+
+        elif platform in ["aws", "glue", "athena"]:
             database = binding.get("database")
 
             if database:
@@ -496,7 +563,18 @@ def _plan_exposures(
         platform = binding.get("platform", "").lower()
         contract_schema = exposure.get("contract", {}).get("schema", [])
 
-        if platform in ["aws", "glue", "athena"]:
+        if platform in ["aws", "glue", "athena"] and not _glue_cataloged(binding):
+            # The table lives in its own Iceberg catalog (Lakekeeper, a REST
+            # catalog...), whose writer creates it: no Glue Iceberg table here.
+            logger.debug(
+                format_event(
+                    "glue_table_skipped",
+                    expose=exposure_id,
+                    catalog=_declared_catalog(binding),
+                )
+            )
+
+        elif platform in ["aws", "glue", "athena"]:
             location = binding.get("location", {})
             database = location.get("database") or binding.get("database")
             table = location.get("table") or binding.get("table")

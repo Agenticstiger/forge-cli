@@ -324,3 +324,99 @@ def test_properties_key_escapes_separators():
     assert _escape_properties_key("debezium.sink.iceberg.warehouse") == (
         "debezium.sink.iceberg.warehouse"
     )
+
+
+# ── runner preflight: fail closed BEFORE application.properties is written ──
+#
+# The embedded runner runs the same checks as `fluid validate` right before it
+# derives the sink, so a sink the validator rejects never boots a server.
+
+_LAKEKEEPER_NO_URI = {
+    "platform": "local",
+    "format": "iceberg",
+    "location": {
+        "database": "bronze",
+        "table": "orders",
+        "catalog": "lakekeeper",
+        "warehouse": "analytics",
+    },
+}
+
+
+def _props_path(contract: Dict[str, Any], tmp_path: Path) -> Path:
+    return tmp_path / ".fluid" / "debezium" / contract["id"] / "ingest" / "application.properties"
+
+
+def _run_embedded(contract: Dict[str, Any], tmp_path: Path):
+    from fluid_build.build_runners._acquisition_common import build_acquisition_run_context
+    from fluid_build.build_runners.debezium.runner import DebeziumRunner
+
+    ctx = build_acquisition_run_context(contract["builds"][0], contract, tmp_path)
+    return DebeziumRunner().run(ctx)
+
+
+@pytest.mark.parametrize(
+    "sink, binding, expected",
+    [
+        (
+            {"type": "iceberg"},
+            _LAKEKEEPER_NO_URI,
+            "lakekeeper catalog requires binding.location.uri",
+        ),
+        (
+            # a hand-written `type` merged over the derived Glue catalog-impl
+            {"type": "iceberg", "iceberg_sink_enabled": True, "config": {"type": "rest"}},
+            None,
+            "would carry both type",
+        ),
+    ],
+    ids=["missing-uri", "type-and-impl"],
+)
+def test_embedded_preflight_fails_before_writing_config(tmp_path: Path, sink, binding, expected):
+    from fluid_build.api.runner import RunState
+
+    contract = _contract(sink=sink, binding=binding)
+    result = _run_embedded(contract, tmp_path)
+    assert result.state == RunState.FAILED
+    assert expected in (result.error or ""), result.error
+    assert "iceberg sink preflight failed" in result.error
+    assert not _props_path(contract, tmp_path).exists()
+
+    assert execute_debezium_build(contract["builds"][0], contract, tmp_path, dry_run=False) == 1
+    assert not _props_path(contract, tmp_path).exists()
+
+
+def test_embedded_complete_lakekeeper_derives_rest(tmp_path: Path):
+    binding = {
+        **_LAKEKEEPER_NO_URI,
+        "location": {**_LAKEKEEPER_NO_URI["location"], "uri": "http://lakekeeper:8181/catalog"},
+    }
+    text = _props_text(_contract(sink={"type": "iceberg"}, binding=binding), tmp_path)
+    assert "debezium.sink.iceberg.type=rest" in text
+    assert "debezium.sink.iceberg.uri=http://lakekeeper:8181/catalog" in text
+    assert "debezium.sink.iceberg.warehouse=analytics" in text
+    assert "debezium.sink.iceberg.catalog-impl=" not in text
+
+
+def test_embedded_handwritten_config_skips_the_preflight(tmp_path: Path):
+    # Derivation is OFF for a hand-written config, so nothing is derived from
+    # the binding and the file stays what the operator wrote.
+    contract = _contract(
+        sink={"type": "iceberg", "config": {"catalog.name": "rest"}}, binding=_LAKEKEEPER_NO_URI
+    )
+    text = _props_text(contract, tmp_path)
+    assert "debezium.sink.iceberg.catalog.name=rest" in text
+
+
+def test_bring_your_own_mode_is_not_preflighted(kafka_connect_mock, tmp_path: Path):
+    # bring-your-own creates only the SOURCE connector; no sink is derived, so an
+    # incomplete Iceberg binding is not this build's concern.
+    contract = _contract(sink={"type": "iceberg"}, binding=_LAKEKEEPER_NO_URI)
+    contract["builds"][0]["properties"]["debezium"] = {
+        "deployment": {"mode": "bring-your-own", "server_url": "http://kafka-connect.test:8083"},
+        "status_timeout_seconds": 1,
+        "poll_interval_seconds": 0.01,
+    }
+    rc = execute_debezium_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+    assert rc == 0
+    assert "create" in kafka_connect_mock.calls

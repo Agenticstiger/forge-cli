@@ -19,7 +19,14 @@ from __future__ import annotations
 import pytest
 
 from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
+    iceberg_sink_preflight,
     validate_iceberg_sink,
+)
+from fluid_build.providers._iceberg_catalog import (
+    FAMILY_REST,
+    canonical_catalog_kind,
+    catalog_kind_info,
+    known_catalog_kinds,
 )
 
 pytestmark = [pytest.mark.unit]
@@ -191,3 +198,393 @@ def test_confluent_expose_not_treated_as_kc_sink_target():
     # correctly reports "no iceberg expose" rather than a bogus rest-catalog error
     assert any("no expose with binding.format=iceberg" in e for e in errs)
     assert not any("rest catalog requires" in e for e in errs)
+
+
+# ── table-driven catalog checks (one classification for every emitter) ──────
+#
+# Before the shared kind table this validator checked only the literal "rest",
+# so `catalog: lakekeeper` skipped every check, streamed over REST, and dbt
+# wrote a Snowflake-managed table for the same expose. Every case below derives
+# its expectation from the table row, so a new kind is covered by construction.
+
+CANONICAL_KINDS = sorted({canonical_catalog_kind(k) for k in known_catalog_kinds()})
+REQUIRING_KINDS = [k for k in CANONICAL_KINDS if catalog_kind_info(k).sink_requires]
+COMPLETE = {"uri": "http://lakekeeper:8181/catalog", "warehouse": "analytics"}
+
+
+def _loc_binding(catalog=None, *, platform="local", **location):
+    loc = {"database": "default", "table": "events", **location}
+    if catalog is not None:
+        loc["catalog"] = catalog
+    return {"platform": platform, "format": "iceberg", "location": loc}
+
+
+def _sink_contract(binding, *, sink=None, kc=None, engine="kafka-connect", debezium=None):
+    """A one-build contract whose sink block, engine and runtime props vary."""
+    props = {
+        "source": {"kind": "postgres", "mode": "incremental_append"},
+        "sink": {"format": "iceberg", **(sink or {})},
+    }
+    if engine == "debezium":
+        props["debezium"] = debezium if debezium is not None else {}
+    else:
+        props["kafka-connect"] = kc or {}
+    return {
+        "id": "b.x",
+        "builds": [
+            {"id": "ingest", "pattern": "acquisition", "engine": engine, "properties": props}
+        ],
+        "exposes": [{"exposeId": "events", "kind": "table", "binding": binding}],
+    }
+
+
+def _embedded(sink_block=None):
+    return {"deployment": {"mode": "embedded"}, "server": {"sink": sink_block or {}}}
+
+
+@pytest.mark.parametrize("kind", REQUIRING_KINDS)
+@pytest.mark.parametrize("missing", ["uri", "warehouse"])
+def test_every_requiring_kind_demands_its_location_keys(kind, missing):
+    row = catalog_kind_info(kind)
+    location = {k: v for k, v in COMPLETE.items() if k != missing}
+    errs = _errs(_sink_contract(_loc_binding(kind, **location)))
+    demanded = [e for e in errs if f"{kind} catalog requires binding.location.{missing}" in e]
+    assert bool(demanded) == (missing in row.sink_requires), errs
+
+
+@pytest.mark.parametrize("kind", [k for k in CANONICAL_KINDS if k not in REQUIRING_KINDS])
+def test_kinds_requiring_nothing_demand_nothing(kind):
+    errs = _errs(_sink_contract(_loc_binding(kind, platform="aws", bucket="lake")))
+    assert not any("catalog requires" in e for e in errs), errs
+
+
+@pytest.mark.parametrize("kind", ["rest", "lakekeeper", "polaris", "unity"])
+def test_rest_family_warehouse_message_names_the_catalog_name(kind):
+    assert catalog_kind_info(kind).family == FAMILY_REST
+    errs = _errs(_sink_contract(_loc_binding(kind, uri="http://c:8181/catalog")))
+    assert any(
+        f"{kind} catalog requires binding.location.warehouse (the catalog name)" in e for e in errs
+    ), errs
+
+
+def test_complete_lakekeeper_is_clean():
+    assert validate_iceberg_sink(_sink_contract(_loc_binding("lakekeeper", **COMPLETE))) == (
+        [],
+        [],
+    )
+
+
+def test_lakekeeper_used_to_skip_every_check():
+    # The bug: no uri and no warehouse, and the old literal-"rest" check passed it.
+    errs = _errs(_sink_contract(_loc_binding("lakekeeper")))
+    assert any("lakekeeper catalog requires binding.location.uri" in e for e in errs)
+    assert any("lakekeeper catalog requires binding.location.warehouse" in e for e in errs)
+
+
+# ── sink.catalog must agree with the expose (dbt + IaC read only the expose) ──
+
+
+@pytest.mark.parametrize(
+    "sink_catalog, binding",
+    [
+        # AWS expose with no catalog is Glue (the platform default).
+        ("lakekeeper", _loc_binding(None, platform="aws", bucket="lake", region="us-east-1")),
+        ("rest", _loc_binding("lakekeeper", **COMPLETE)),
+        ("nessie", _loc_binding("rest", uri="http://c:8181", warehouse="s3://b/w")),
+    ],
+)
+def test_sink_catalog_disagreeing_with_expose_errors(sink_catalog, binding):
+    errs = _errs(_sink_contract(binding, sink={"catalog": sink_catalog}))
+    hit = [e for e in errs if "disagrees with the expose's catalog" in e]
+    assert hit, errs
+    assert f"binding.location.catalog: {canonical_catalog_kind(sink_catalog)}" in hit[0]
+
+
+def test_disagreement_names_the_platform_default_when_expose_has_no_catalog():
+    binding = _loc_binding(None, platform="aws", bucket="lake", region="us-east-1")
+    errs = _errs(_sink_contract(binding, sink={"catalog": "lakekeeper"}))
+    assert any("'glue'" in e and "platform default" in e for e in errs), errs
+
+
+@pytest.mark.parametrize(
+    "sink_catalog, location_catalog",
+    [
+        ("iceberg-rest", "rest"),
+        ("ICEBERG_REST", "rest"),
+        ("rest", "iceberg_rest"),
+        ("snowflake", "snowflake_managed"),
+        ("Lakekeeper", "lakekeeper"),
+    ],
+)
+def test_aliases_of_the_same_catalog_agree(sink_catalog, location_catalog):
+    binding = _loc_binding(location_catalog, **COMPLETE)
+    errs = _errs(_sink_contract(binding, sink={"catalog": sink_catalog}))
+    assert not any("disagrees" in e for e in errs), errs
+
+
+# ── unknown kinds are refused, never guessed ────────────────────────────────
+
+
+@pytest.mark.parametrize("where", ["location", "sink"])
+def test_unknown_kind_errors_naming_value_and_listing_kinds(where):
+    if where == "location":
+        contract = _sink_contract(_loc_binding("lakekeper", **COMPLETE))
+    else:
+        contract = _sink_contract(
+            _loc_binding("lakekeeper", **COMPLETE), sink={"catalog": "gravitino"}
+        )
+    errs = _errs(contract)
+    unknown = [e for e in errs if "unknown Iceberg catalog" in e]
+    assert len(unknown) == 1, errs
+    value, field = (
+        ("'lakekeper'", "binding.location.catalog")
+        if where == "location"
+        else (
+            "'gravitino'",
+            "sink.catalog",
+        )
+    )
+    assert value in unknown[0] and field in unknown[0]
+    for kind in known_catalog_kinds():
+        assert kind in unknown[0]
+    # No per-kind guesses about a row that does not exist, and a typo is never
+    # offered back as the remedy.
+    assert not any("catalog requires" in e for e in errs)
+    assert not any("disagrees" in e for e in errs)
+
+
+def test_generic_rest_accepts_an_object_store_warehouse():
+    # Plain REST catalogs (the apache/iceberg-rest-fixture) take an s3:// warehouse.
+    binding = _loc_binding("rest", uri="http://iceberg:8181", warehouse="s3://bucket/warehouse/")
+    assert validate_iceberg_sink(_sink_contract(binding)) == ([], [])
+
+
+# ── runtime support: the stock KC runtime has no Nessie client ──────────────
+
+
+def test_nessie_on_kafka_connect_warns_about_the_missing_runtime_jar():
+    binding = _loc_binding("nessie", uri="http://nessie:19120/api/v2", warehouse="s3://b/w")
+    errors, warnings = validate_iceberg_sink(_sink_contract(binding))
+    assert errors == []
+    assert any("does not bundle iceberg-nessie" in w for w in warnings), warnings
+
+
+def test_nessie_on_debezium_server_has_no_kafka_connect_warning():
+    binding = _loc_binding("nessie", uri="http://nessie:19120/api/v2", warehouse="s3://b/w")
+    contract = _sink_contract(binding, engine="debezium", debezium=_embedded())
+    assert not any("iceberg-nessie" in w for w in _warns(contract))
+
+
+# ── check 5: the warehouse override compares against the RESOLVED warehouse ─
+
+
+def test_rest_override_equal_to_binding_warehouse_is_clean():
+    # Regression: the override was compared against the Glue writer's
+    # s3://<bucket>/<db>/<table>/ even for REST, so a MATCHING override "diverged".
+    binding = _loc_binding("lakekeeper", **COMPLETE)
+    kc = {"iceberg_catalog_overrides": {"iceberg.catalog.warehouse": "analytics"}}
+    assert validate_iceberg_sink(_sink_contract(binding, kc=kc)) == ([], [])
+
+
+def test_rest_override_divergence_names_kind_and_not_glue():
+    binding = _loc_binding("lakekeeper", **COMPLETE)
+    kc = {"iceberg_catalog_overrides": {"iceberg.catalog.warehouse": "other"}}
+    warns = _warns(_sink_contract(binding, kc=kc))
+    hit = [w for w in warns if "diverges from the binding warehouse" in w]
+    assert len(hit) == 1, warns
+    assert "lakekeeper catalog" in hit[0]
+    assert "Glue" not in hit[0]
+
+
+def test_glue_override_divergence_message_is_unchanged():
+    # Byte-identical for Glue on AWS: the text operators and tooling already see.
+    warns = _warns(
+        _contract(kc={"iceberg_catalog_overrides": {"iceberg.catalog.warehouse": "s3://other/"}})
+    )
+    assert warns == [
+        "iceberg sink (build 'ingest'): iceberg_catalog_overrides warehouse 's3://other/' "
+        "diverges from the binding warehouse 's3://lake/s/o/'; the connector will use the "
+        "override but the static Glue table may differ"
+    ]
+
+
+def test_glue_region_warning_is_unchanged():
+    binding = {
+        "platform": "aws",
+        "format": "iceberg",
+        "location": {"database": "s", "table": "o", "bucket": "lake"},
+    }
+    assert _warns(_contract(binding=binding)) == [
+        "iceberg sink (build 'ingest'): glue catalog without binding.location.region; "
+        "the connector needs iceberg.catalog.client.region"
+    ]
+
+
+def test_missing_required_warehouse_is_not_also_reported_as_divergence():
+    binding = _loc_binding("lakekeeper", uri="http://c:8181/catalog")
+    kc = {"iceberg_catalog_overrides": {"iceberg.catalog.warehouse": "analytics"}}
+    errors, warnings = validate_iceberg_sink(_sink_contract(binding, kc=kc))
+    assert any("requires binding.location.warehouse" in e for e in errors)
+    assert not any("diverges" in w for w in warnings)
+
+
+# ── check 6: type XOR catalog-impl (CatalogUtil refuses both) ───────────────
+
+_GLUE_AWS = _loc_binding(None, platform="aws", bucket="lake", region="us-east-1")
+_REST = _loc_binding("rest", uri="http://iceberg:8181", warehouse="s3://b/w")
+
+
+@pytest.mark.parametrize(
+    "binding, kc, conflict",
+    [
+        # derived Glue catalog-impl + an override type
+        (_GLUE_AWS, {"iceberg_catalog_overrides": {"iceberg.catalog.type": "rest"}}, True),
+        # derived REST type + an override catalog-impl
+        (_REST, {"iceberg_catalog_overrides": {"iceberg.catalog.catalog-impl": "x.Y"}}, True),
+        # presence is what CatalogUtil checks: an empty value still trips it
+        (_GLUE_AWS, {"iceberg_catalog_overrides": {"iceberg.catalog.type": ""}}, True),
+        # overriding the SAME key the deriver emits is fine
+        (_GLUE_AWS, {"iceberg_catalog_overrides": {"iceberg.catalog.catalog-impl": "x.Y"}}, False),
+        (_REST, {"iceberg_catalog_overrides": {"iceberg.catalog.type": "rest"}}, False),
+        # a hand-written sink config merged over a derived one (opt-in)
+        (
+            _GLUE_AWS,
+            {
+                "iceberg_sink_enabled": True,
+                "sink_connector_config": {"iceberg.catalog.type": "glue"},
+            },
+            True,
+        ),
+        # derivation OFF: catalog overrides are never applied, only the hand-written map
+        (
+            _GLUE_AWS,
+            {
+                "sink_connector_config": {"topics": "t"},
+                "iceberg_catalog_overrides": {"iceberg.catalog.type": "rest"},
+            },
+            False,
+        ),
+        (
+            _GLUE_AWS,
+            {
+                "sink_connector_config": {
+                    "iceberg.catalog.type": "glue",
+                    "iceberg.catalog.catalog-impl": "x.Y",
+                }
+            },
+            True,
+        ),
+    ],
+)
+def test_overrides_must_not_set_both_catalog_selectors(binding, kc, conflict):
+    errs = _errs(_sink_contract(binding, kc=kc))
+    hit = [e for e in errs if "would carry both" in e]
+    assert bool(hit) == conflict, errs
+    if conflict:
+        assert "iceberg.catalog.type" in hit[0] and "iceberg.catalog.catalog-impl" in hit[0]
+        assert "CatalogUtil" in hit[0]
+
+
+def test_debezium_server_selector_conflict_uses_bare_keys():
+    contract = _sink_contract(
+        _GLUE_AWS,
+        engine="debezium",
+        debezium=_embedded({"iceberg_sink_enabled": True, "config": {"type": "rest"}}),
+    )
+    hit = [e for e in _errs(contract) if "would carry both" in e]
+    assert len(hit) == 1
+    assert "type (from debezium.server.sink.config)" in hit[0]
+    assert "catalog-impl (from the derived glue catalog config)" in hit[0]
+
+
+# ── Debezium: only a build that derives a sink is checked ───────────────────
+
+_BROKEN = _loc_binding("lakekeeper")  # no uri, no warehouse
+
+
+@pytest.mark.parametrize("mode", ["bring-your-own", "managed", None])
+def test_debezium_source_only_modes_draw_no_sink_findings(mode):
+    debezium = {"deployment": {"mode": mode}} if mode else {}
+    contract = _sink_contract(_BROKEN, engine="debezium", debezium=debezium)
+    assert validate_iceberg_sink(contract) == ([], [])
+    contract["exposes"] = []  # not even the missing-expose join applies
+    assert validate_iceberg_sink(contract) == ([], [])
+
+
+def test_debezium_embedded_iceberg_sink_is_checked():
+    contract = _sink_contract(_BROKEN, engine="debezium", debezium=_embedded())
+    assert any("lakekeeper catalog requires binding.location.uri" in e for e in _errs(contract))
+
+
+def test_debezium_embedded_deriving_build_is_checked_without_sink_format():
+    # The Debezium runner derives from server.sink.type and never reads
+    # sink.format, so selecting by sink.format alone let this build skip.
+    contract = _sink_contract(_BROKEN, engine="debezium", debezium=_embedded())
+    contract["builds"][0]["properties"].pop("sink")
+    assert any("lakekeeper catalog requires binding.location.uri" in e for e in _errs(contract))
+
+
+def test_debezium_embedded_non_iceberg_server_sink_is_not_checked():
+    contract = _sink_contract(
+        _BROKEN, engine="debezium", debezium=_embedded({"type": "s3", "config": {"a": "b"}})
+    )
+    assert validate_iceberg_sink(contract) == ([], [])
+
+
+@pytest.mark.parametrize("enabled", [None, True])
+def test_debezium_embedded_warehouse_override_is_cross_checked(enabled):
+    sink_block = {"config": {"warehouse": "s3://elsewhere/wh"}}
+    if enabled is not None:
+        sink_block["iceberg_sink_enabled"] = enabled
+    contract = _sink_contract(_GLUE_AWS, engine="debezium", debezium=_embedded(sink_block))
+    warns = [w for w in _warns(contract) if "diverges from the binding warehouse" in w]
+    assert len(warns) == 1
+    assert warns[0].startswith(
+        "iceberg sink (build 'ingest'): debezium.server.sink.config warehouse 's3://elsewhere/wh'"
+    )
+    assert "static Glue table" in warns[0]
+
+
+def test_debezium_embedded_matching_warehouse_override_is_clean():
+    sink_block = {
+        "iceberg_sink_enabled": True,
+        "config": {"warehouse": "s3://lake/default/events/"},
+    }
+    contract = _sink_contract(_GLUE_AWS, engine="debezium", debezium=_embedded(sink_block))
+    assert not any("diverges" in w for w in _warns(contract))
+
+
+# ── runner preflight: ONE build's errors, warnings logged ───────────────────
+
+
+def test_preflight_selects_only_the_named_build():
+    contract = _sink_contract(_loc_binding("lakekeeper", **COMPLETE))
+    bad = contract["builds"][0]
+    bad["properties"]["kafka-connect"] = {"streamingSink": {"upsertMode": True}}
+    good = {**bad, "id": "good", "properties": {**bad["properties"], "kafka-connect": {}}}
+    contract["builds"].append(good)
+    # `fluid validate` sees the one defect ...
+    assert len(_errs(contract)) == 1
+    # ... and each runner sees only its own build's.
+    msg = iceberg_sink_preflight(contract, "ingest")
+    assert msg is not None and "build 'ingest'" in msg and "upsertMode" in msg
+    assert iceberg_sink_preflight(contract, "good") is None
+
+
+def test_preflight_clean_build_returns_none_and_logs_warnings(caplog):
+    binding = _loc_binding("nessie", uri="http://nessie:19120/api/v2", warehouse="s3://b/w")
+    with caplog.at_level("WARNING", logger="fluid.acquire.iceberg_sink"):
+        assert iceberg_sink_preflight(_sink_contract(binding), "ingest") is None
+    assert any("iceberg-nessie" in r.getMessage() for r in caplog.records)
+
+
+def test_preflight_ignores_unknown_build_ids():
+    assert iceberg_sink_preflight(_sink_contract(_BROKEN), "not-this-one") is None
+
+
+def test_preflight_matches_the_run_context_id_of_an_id_less_build():
+    contract = _sink_contract(_BROKEN)
+    del contract["builds"][0]["id"]
+    # build_acquisition_run_context ids it "unknown"; the message keeps "?".
+    msg = iceberg_sink_preflight(contract, "unknown")
+    assert msg is not None and "build '?'" in msg

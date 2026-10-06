@@ -27,6 +27,7 @@ from fluid_build.iac.shadow import (
     native_logical_resources,
     opentofu_logical_resources,
 )
+from fluid_build.providers.aws.plan.planner import plan_actions
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider]
 
@@ -127,3 +128,65 @@ class TestShadowCompare:
         )
         assert "aws" in report.summary()
         assert "cutover-safe" in report.summary()
+
+
+def _iceberg_contract(**catalog):
+    return {
+        "id": "analytics.lake",
+        "name": "Lake",
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "table",
+                "binding": {
+                    "platform": "aws",
+                    "format": "iceberg",
+                    "location": {
+                        "database": "sales",
+                        "table": "orders",
+                        "bucket": "lake",
+                        **catalog,
+                    },
+                },
+                "contract": {"schema": [{"name": "order_id", "type": "string"}]},
+            }
+        ],
+    }
+
+
+def _glue_resources(resources):
+    return {r for r in resources if r.kind in ("database", "table")}
+
+
+class TestIcebergCatalogParity:
+    """Both engines agree on WHO owns an Iceberg table: Glue, or its catalog.
+
+    ``catalog: lakekeeper`` used to stream over REST while both engines
+    provisioned a Glue table for the same name. Each engine now reads the
+    shared ``is_glue_cataloged`` classification; this pins that they read it
+    the same way, from the real native planner output (not a hand-written
+    action list), so one engine cannot drift back to Glue alone.
+    """
+
+    def test_absent_catalog_both_engines_plan_the_glue_table(self):
+        contract = _iceberg_contract()
+        native = native_logical_resources(plan_actions(contract, "123456789012", "us-east-1"))
+        tf = opentofu_logical_resources(contract, get_iac_plugin("aws"))
+        expected = {LogicalResource("database", "sales"), LogicalResource("table", "orders")}
+        assert _glue_resources(native) == _glue_resources(tf) == expected
+
+    @pytest.mark.parametrize("catalog", ["lakekeeper", "LakeKeeper", "iceberg_rest", "polaris"])
+    def test_non_glue_catalog_neither_engine_plans_glue(self, catalog):
+        contract = _iceberg_contract(
+            catalog=catalog, uri="http://lakekeeper:8181/catalog", warehouse="demo"
+        )
+        native_actions = plan_actions(contract, "123456789012", "us-east-1")
+        report = shadow_compare(
+            contract, plugin=get_iac_plugin("aws"), native_actions=native_actions
+        )
+        native = native_logical_resources(native_actions)
+        tf = opentofu_logical_resources(contract, get_iac_plugin("aws"), native_actions)
+        assert _glue_resources(native) == set()
+        assert _glue_resources(tf) == set(), f"OpenTofu still plans Glue for {catalog!r}"
+        # The declared bucket is the table's storage: both engines keep it.
+        assert LogicalResource("bucket", "lake") in report.matched

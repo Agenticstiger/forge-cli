@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ._sql_safety import validate_ident
@@ -36,41 +37,286 @@ from .aws.util.warehouse import get_iceberg_warehouse
 # Apache Iceberg runtime class names (pinned to the connector surface validated
 # in the OSS spike — RFC §14). Bumping the Iceberg runtime may change these.
 GLUE_CATALOG_IMPL = "org.apache.iceberg.aws.glue.GlueCatalog"
+DYNAMODB_CATALOG_IMPL = "org.apache.iceberg.aws.dynamodb.DynamoDbCatalog"
 S3_FILE_IO = "org.apache.iceberg.aws.s3.S3FileIO"
 GCS_FILE_IO = "org.apache.iceberg.gcp.gcs.GCSFileIO"
 ADLS_FILE_IO = "org.apache.iceberg.azure.adlsv2.ADLSFileIO"
 
-# Iceberg catalog types the runtime recognizes for ``iceberg.catalog.type``.
-# Anything else (polaris / snowflake-managed / unity — all REST-fronted) maps to
-# ``rest`` so the connector talks to it over the REST protocol.
-_KNOWN_CATALOG_TYPES = frozenset(
-    {"rest", "hive", "hadoop", "jdbc", "nessie", "bigquery", "dynamodb"}
+# ---------------------------------------------------------------------------
+# Catalog kinds — THE one classification every emitter reads
+# ---------------------------------------------------------------------------
+#
+# ``binding.location.catalog`` (and ``sink.catalog``) is a free string, and
+# before this table four emitters each classified it by hand: the sink
+# deriver mapped unknown kinds to ``rest``, dbt ``catalogs.yml`` and the
+# Snowflake IaC mapped them to Snowflake-managed, the sink validator checked
+# only the literal ``rest``, and the AWS IaC ignored the catalog and emitted a
+# Glue table for every Iceberg expose. ``catalog: lakekeeper`` therefore
+# streamed over REST while dbt wrote a Snowflake-managed table. One row per
+# kind, and every consumer derives its answer from the row.
+#
+# The shape borrows dbt-adapters' ``_V2_TO_V1_TYPE`` hook (a user-facing kind
+# mapped to each emitter's wire value, identity by default; dbt-snowflake
+# impl.py) and Airbyte's typed Polaris preset (REST on the wire, but the
+# warehouse is a catalog NAME). Wire values come only from Apache Iceberg's
+# ``CatalogUtil`` set (hadoop/hive/rest/glue/nessie/jdbc/bigquery): no engine
+# or SDK has a ``lakekeeper`` type, and CatalogUtil throws on one.
+
+#: AWS Glue Data Catalog through the native ``GlueCatalog``.
+FAMILY_GLUE = "glue"
+#: The Iceberg REST protocol: ``uri`` + ``warehouse`` (a catalog name).
+FAMILY_REST = "rest"
+#: A runtime-native, non-REST client (Nessie's own API, Hive metastore, JDBC...).
+FAMILY_NATIVE = "native"
+#: Snowflake's built-in (Horizon) catalog over a Snowflake EXTERNAL VOLUME.
+FAMILY_SNOWFLAKE_MANAGED = "snowflake-managed"
+#: A value this table does not know. ``fluid validate`` rejects it.
+FAMILY_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class CatalogKind:
+    """What one ``location.catalog`` value means to every emitter."""
+
+    name: str
+    family: str
+    #: ``iceberg.catalog.type`` (Kafka Connect) / ``type`` (Debezium Server).
+    #: Mutually exclusive with ``catalog_impl``: Iceberg's ``CatalogUtil``
+    #: throws when both are set.
+    runtime_type: Optional[str]
+    #: ``catalog-impl`` for a catalog the runtime has no ``type`` for.
+    catalog_impl: Optional[str]
+    #: dbt ``catalogs.yml`` on Snowflake: ``iceberg_rest`` (a catalog external
+    #: to Snowflake, reached through a catalog integration), ``built_in``
+    #: (Snowflake-managed), or ``None`` when Snowflake has no integration for
+    #: it. The Snowflake IaC emitter partitions on the same column.
+    snowflake_catalog_type: Optional[str]
+    #: ``binding.location`` keys a streaming sink needs for this catalog.
+    sink_requires: Tuple[str, ...] = ()
+    #: The warehouse is a warehouse/catalog NAME, never an object-store URI.
+    warehouse_is_name: bool = False
+    #: Path the catalog serves its REST API under (Lakekeeper mounts
+    #: ``/catalog``), or ``None`` when the catalog prescribes none.
+    uri_suffix: Optional[str] = None
+
+    @property
+    def speaks_rest(self) -> bool:
+        """Does the writer reach this catalog over the Iceberg REST protocol?"""
+        return self.runtime_type == "rest"
+
+
+_REST_REQUIRES = ("uri", "warehouse")
+
+_CATALOG_KINDS: Mapping[str, CatalogKind] = MappingProxyType(
+    {
+        k.name: k
+        for k in (
+            CatalogKind("glue", FAMILY_GLUE, None, GLUE_CATALOG_IMPL, "iceberg_rest"),
+            CatalogKind("rest", FAMILY_REST, "rest", None, "iceberg_rest", _REST_REQUIRES),
+            CatalogKind(
+                "lakekeeper",
+                FAMILY_REST,
+                "rest",
+                None,
+                "iceberg_rest",
+                _REST_REQUIRES,
+            ),
+            CatalogKind(
+                "polaris",
+                FAMILY_REST,
+                "rest",
+                None,
+                "iceberg_rest",
+                _REST_REQUIRES,
+            ),
+            CatalogKind(
+                "unity",
+                FAMILY_REST,
+                "rest",
+                None,
+                "iceberg_rest",
+                _REST_REQUIRES,
+            ),
+            # Native NessieCatalog for the sinks (uri ends /api/v1|v2, the
+            # warehouse is an object-store location), while Snowflake reaches
+            # Nessie through its Iceberg REST endpoint. The stock Apache Kafka
+            # Connect runtime does not bundle iceberg-nessie.
+            CatalogKind("nessie", FAMILY_NATIVE, "nessie", None, "iceberg_rest", _REST_REQUIRES),
+            # BigLake metastore. ``type=bigquery`` exists in Iceberg >= 1.10.
+            CatalogKind("bigquery", FAMILY_NATIVE, "bigquery", None, "iceberg_rest"),
+            CatalogKind("hive", FAMILY_NATIVE, "hive", None, None),
+            CatalogKind("jdbc", FAMILY_NATIVE, "jdbc", None, None, ("uri",)),
+            CatalogKind("hadoop", FAMILY_NATIVE, "hadoop", None, None, ("warehouse",)),
+            # CatalogUtil has no ``dynamodb`` type: it is reached by impl only.
+            CatalogKind("dynamodb", FAMILY_NATIVE, None, DYNAMODB_CATALOG_IMPL, None),
+            # Horizon over an EXTERNAL VOLUME; a streaming writer reaches it
+            # through Snowflake's Iceberg REST endpoint.
+            CatalogKind(
+                "snowflake-managed",
+                FAMILY_SNOWFLAKE_MANAGED,
+                "rest",
+                None,
+                "built_in",
+                _REST_REQUIRES,
+            ),
+        )
+    }
 )
 
-#: ``location.catalog`` values that mean "a catalog EXTERNAL to Snowflake".
-#: THE shared predicate for the two halves of the dbt Iceberg loop: the dbt
-#: ``catalogs.yml`` emitter maps these to ``catalog_type: iceberg_rest`` and
-#: everything else to ``built_in``; the Snowflake IaC emitter must partition
-#: identically or one side references infrastructure the other never creates
-#: (a ``catalog: snowflake`` binding, say, must be Snowflake-managed to BOTH).
-EXTERNAL_ICEBERG_CATALOGS = frozenset(
-    {"glue", "polaris", "unity", "rest", "iceberg_rest", "nessie"}
+#: Accepted spellings for a canonical kind (after case and ``-``/``_`` folding).
+_CATALOG_ALIASES: Mapping[str, str] = MappingProxyType(
+    {"iceberg-rest": "rest", "snowflake": "snowflake-managed"}
 )
+
+#: A value outside the table. Emitters keep their historic fallbacks for it
+#: (REST for a sink, Snowflake-managed for dbt) and ``fluid validate`` refuses it.
+_UNKNOWN_KIND = CatalogKind("", FAMILY_UNKNOWN, "rest", None, "built_in")
+
+
+def _fold(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", "-")
+
+
+def canonical_catalog_kind(value: Any) -> str:
+    """The canonical kind for a ``catalog`` value: ``""`` when absent, the
+    table's name for a known kind or alias, else the folded value as given."""
+    folded = _fold(value)
+    return _CATALOG_ALIASES.get(folded, folded)
+
+
+def catalog_kind_info(value: Any) -> CatalogKind:
+    """The table row for ``value`` (any spelling), or the UNKNOWN row."""
+    return _CATALOG_KINDS.get(canonical_catalog_kind(value), _UNKNOWN_KIND)
+
+
+def known_catalog_kinds() -> Tuple[str, ...]:
+    """Every accepted spelling, canonical names first — for error messages."""
+    return tuple(sorted(_CATALOG_KINDS)) + tuple(sorted(_CATALOG_ALIASES))
+
+
+def default_catalog_kind(binding: Mapping[str, Any]) -> str:
+    """The kind an Iceberg binding gets when it names none: Glue on AWS,
+    Snowflake-managed on Snowflake, a REST catalog anywhere else.
+
+    GCP is the one platform where an absent catalog means two things: the
+    streaming sink has always written a REST catalog there, while dbt-bigquery
+    and the GCP IaC create a BigLake table. Changing the default would change
+    every existing GCP sink's ``iceberg.catalog.type`` (and ``bigquery`` needs
+    Iceberg >= 1.10, newer than the published Kafka Connect sink), so the
+    BigQuery paths read only an EXPLICIT ``location.catalog`` instead.
+    """
+    from ..iac.provider_match import canonical_cloud
+
+    cloud = canonical_cloud(binding.get("platform"))
+    if cloud == "aws":
+        return "glue"
+    if cloud == "snowflake":
+        return "snowflake-managed"
+    return "rest"
+
+
+def binding_catalog_kind(binding: Mapping[str, Any]) -> str:
+    """The canonical kind of an expose binding: ``location.catalog``, else the
+    platform default. What dbt and the IaC emitters read."""
+    loc = binding.get("location") or {}
+    return canonical_catalog_kind(loc.get("catalog")) or default_catalog_kind(binding)
+
+
+def iceberg_catalog_kind(binding: Mapping[str, Any], sink: Any = None) -> str:
+    """The canonical kind a streaming sink writes through: ``sink.catalog``,
+    then ``location.catalog``, then the platform default.
+
+    ``sink`` may be a ``SinkSpec`` or the raw ``sink`` mapping. ``fluid
+    validate`` refuses a ``sink.catalog`` that disagrees with the expose,
+    because dbt and the IaC emitters read only the expose.
+    """
+    if isinstance(sink, Mapping):
+        explicit = sink.get("catalog")
+    else:
+        explicit = getattr(sink, "catalog", None) if sink is not None else None
+    return canonical_catalog_kind(explicit) or binding_catalog_kind(binding)
+
+
+#: ``binding.format`` spellings that mean Iceberg (mirrors the sink validator).
+_ICEBERG_FORMATS = frozenset({"iceberg", "iceberg-table"})
+
+
+def is_iceberg_format(fmt: Any) -> bool:
+    return _fold(fmt) in _ICEBERG_FORMATS
+
+
+def is_glue_cataloged(binding: Mapping[str, Any]) -> bool:
+    """Is this binding's table registered in AWS Glue?
+
+    Any non-Iceberg format Glue catalogs (parquet, csv, ...) is; an Iceberg
+    table is only when its catalog is Glue. A Lakekeeper or other REST-catalog
+    table lives in that catalog, so a static Glue table for it would be a
+    second, metadata-less claim on the same name.
+    """
+    if not is_iceberg_format(binding.get("format")):
+        return True
+    return binding_catalog_kind(binding) == "glue"
+
+
+#: ``location.catalog`` values that mean "a catalog EXTERNAL to Snowflake"
+#: (every spelling, aliases included). Derived from the table: the dbt
+#: ``catalogs.yml`` emitter maps these to ``catalog_type: iceberg_rest`` and
+#: the Snowflake IaC emitter skips the EXTERNAL VOLUME for them, so both read
+#: :func:`catalog_kind_info` rather than hand-maintaining a list.
+EXTERNAL_ICEBERG_CATALOGS = frozenset(
+    {n for n, k in _CATALOG_KINDS.items() if k.snowflake_catalog_type == "iceberg_rest"}
+    | {
+        a
+        for a, n in _CATALOG_ALIASES.items()
+        if _CATALOG_KINDS[n].snowflake_catalog_type == "iceberg_rest"
+    }
+    | {"iceberg_rest"}
+)
+
+
+def iceberg_sink_exposes(contract: Mapping[str, Any]) -> Tuple[Mapping[str, Any], ...]:
+    """The exposes a self-managed streaming sink can write to, in order.
+
+    An Iceberg-format expose that is not on ``platform: confluent`` (a
+    Confluent Tableflow expose is a MANAGED output its own plugin owns). The
+    runners and ``fluid validate`` both select through this, so the expose a
+    sink writes to is the one the validator checks.
+    """
+    return tuple(
+        e
+        for e in (contract.get("exposes") or [])
+        if isinstance(e, Mapping)
+        and isinstance(e.get("binding") or {}, Mapping)
+        and is_iceberg_format((e.get("binding") or {}).get("format"))
+        and _fold((e.get("binding") or {}).get("platform")) != "confluent"
+    )
 
 
 def find_iceberg_expose_binding(contract: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """The expose ``binding`` carrying the Iceberg-table identity for a sink.
 
     Shared by the Kafka-Connect and Debezium-Server runners so both resolve the
-    SAME table identity (the RFC zero-drift spine). A simple ``format=iceberg``
-    lookup; the validated build->expose join (build.outputs / exposeId) lands
-    with the plan-time validator (RFC §6.8 #5).
+    SAME table identity (the RFC zero-drift spine): the first of
+    :func:`iceberg_sink_exposes`. The validated build->expose join
+    (build.outputs / exposeId) lands with the plan-time validator (RFC §6.8 #5).
     """
-    for exposure in contract.get("exposes") or []:
-        binding = exposure.get("binding") or {}
-        if str(binding.get("format") or "").lower() == "iceberg":
-            return binding
-    return None
+    exposes = iceberg_sink_exposes(contract)
+    return dict(exposes[0].get("binding") or {}) if exposes else None
+
+
+#: Object-store URI schemes, and the Iceberg ``FileIO`` each one needs. THE one
+#: scheme list: the resolver picks a FileIO from it and the sink validator
+#: refuses a name-only warehouse that carries one.
+_OBJECT_STORE_FILE_IO = (
+    (("s3://", "s3a://", "s3n://"), S3_FILE_IO),
+    (("gs://", "gcs://"), GCS_FILE_IO),
+    (("abfs://", "abfss://"), ADLS_FILE_IO),
+)
+
+
+def is_object_store_uri(value: Any) -> bool:
+    """Does ``value`` carry an object-store scheme (s3://, gs://, abfss://...)?"""
+    return _io_impl_for_warehouse(str(value or "")) is not None
 
 
 def _io_impl_for_warehouse(warehouse: str) -> Optional[str]:
@@ -80,14 +326,13 @@ def _io_impl_for_warehouse(warehouse: str) -> Optional[str]:
     works-in-REST-demo-fails-on-cloud trap). REST / Nessie / Hive catalogs can
     front any cloud, so the FileIO follows the WAREHOUSE scheme, not the catalog
     kind: ``s3://`` -> S3FileIO, ``gs://`` -> GCSFileIO, ``abfss://`` -> ADLSFileIO.
+    A warehouse NAME (Lakekeeper, Polaris) gets none: the catalog vends the
+    table's FileIO configuration with its metadata.
     """
     w = (warehouse or "").lower()
-    if w.startswith(("s3://", "s3a://", "s3n://")):
-        return S3_FILE_IO
-    if w.startswith(("gs://", "gcs://")):
-        return GCS_FILE_IO
-    if w.startswith(("abfs://", "abfss://")):
-        return ADLS_FILE_IO
+    for schemes, file_io in _OBJECT_STORE_FILE_IO:
+        if w.startswith(schemes):
+            return file_io
     return None
 
 
@@ -95,25 +340,17 @@ def _io_impl_for_warehouse(warehouse: str) -> Optional[str]:
 class ResolvedIcebergCatalog:
     """Canonical, provider-neutral Iceberg-table identity for a binding."""
 
-    catalog_type: str  # "glue" | "rest" | "nessie" | "hive" | ...
+    catalog_type: str  # wire type: "glue" | "rest" | "nessie" | "hive" | ...
     warehouse: str  # s3://|gs://|abfss:// path (glue/object-store) or catalog name (rest)
     fq_table: str  # "<database>.<table>"
-    catalog_impl: Optional[str] = None  # GlueCatalog for glue
+    catalog_impl: Optional[str] = None  # GlueCatalog for glue; XOR with catalog_type on the wire
     io_impl: Optional[str] = None  # S3 / GCS / ADLS FileIO per warehouse scheme
     region: Optional[str] = None
     uri: Optional[str] = None  # REST catalog endpoint
     id_columns: Tuple[str, ...] = ()  # -> iceberg.tables.default-id-columns
     partition_by: Tuple[str, ...] = ()  # -> iceberg.tables.default-partition-by
     extra_catalog_props: Mapping[str, str] = field(default_factory=dict)
-
-
-def _catalog_kind(binding: Mapping[str, Any], sink: Any, loc: Mapping[str, Any]) -> str:
-    """glue / rest, in precedence: explicit sink.catalog > location.catalog >
-    platform default (aws -> glue, else rest)."""
-    explicit = (getattr(sink, "catalog", None) if sink is not None else None) or loc.get("catalog")
-    if explicit:
-        return str(explicit).lower()
-    return "glue" if str(binding.get("platform") or "").lower() == "aws" else "rest"
+    kind: str = ""  # canonical catalog kind ("lakekeeper", "glue", ...)
 
 
 def _id_columns(contract: Optional[Mapping[str, Any]]) -> Tuple[str, ...]:
@@ -144,12 +381,13 @@ def resolve_iceberg_catalog(
     database = loc.get("database") or binding.get("database")
     table = loc.get("table") or binding.get("table")
     fq_table = f"{database}.{table}"
-    kind = _catalog_kind(binding, sink, loc)
+    kind = iceberg_catalog_kind(binding, sink)
+    info = catalog_kind_info(kind)
 
     partition_by = tuple(getattr(sink, "partition_by", None) or loc.get("partitionBy") or ())
     id_columns = _id_columns(contract)
 
-    if kind == "glue":
+    if info.family == FAMILY_GLUE:
         return ResolvedIcebergCatalog(
             catalog_type="glue",
             warehouse=get_iceberg_warehouse(loc, account_ref=account_ref),
@@ -159,23 +397,26 @@ def resolve_iceberg_catalog(
             region=loc.get("region"),
             id_columns=id_columns,
             partition_by=partition_by,
+            kind=kind,
         )
 
-    # Non-Glue catalog: REST / Nessie / Hive / Polaris / Snowflake Open Catalog /
-    # Unity (all REST-fronted) over any cloud storage. ``catalog_type`` is the
-    # kind when the runtime recognizes it (nessie / hive / rest / ...), else REST;
-    # the FileIO follows the WAREHOUSE scheme so GCS (gs://) and ADLS (abfss://)
-    # work, not just S3 (RFC §6.3 — PR7's REST + GCP profiles).
+    # Non-Glue catalog over any cloud storage. The wire type comes from the
+    # table (Lakekeeper / Polaris / Unity / Snowflake are all ``rest``; an
+    # unknown kind keeps the historic REST fallback, and ``fluid validate``
+    # refuses it). The FileIO follows the WAREHOUSE scheme so GCS (gs://) and
+    # ADLS (abfss://) work, not just S3 (RFC §6.3 — PR7's REST + GCP profiles).
     warehouse = loc.get("warehouse") or ""
     return ResolvedIcebergCatalog(
-        catalog_type=kind if kind in _KNOWN_CATALOG_TYPES else "rest",
+        catalog_type=info.runtime_type or kind,
         warehouse=warehouse,
         fq_table=fq_table,
+        catalog_impl=info.catalog_impl,
         uri=loc.get("uri"),
         io_impl=_io_impl_for_warehouse(warehouse),
         region=loc.get("region"),
         id_columns=id_columns,
         partition_by=partition_by,
+        kind=kind,
     )
 
 
