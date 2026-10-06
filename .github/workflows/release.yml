@@ -26,18 +26,19 @@
 #
 #   quality-gate
 #       └─ build
-#           └─ publish-testpypi          (always, every tag; + Sigstore)
-#               └─ verify-testpypi       (always; install + smoke from TestPyPI)
-#                   ├─ publish-pypi      (stable only; gated by verify-testpypi)
-#                   │       └─ verify-pypi    (final smoke from real PyPI)
-#                   ├─ docker            (after TestPyPI verify, regardless
-#                   └─ github-release     of stable/pre)
+#           └─ publish-testpypi          (every tag; + Sigstore)
+#               └─ verify-testpypi       (install + smoke from TestPyPI)
+#                   └─ publish-pypi      (every tag, stable and pre; + Sigstore)
+#                       ├─ verify-pypi   (final smoke from real PyPI)
+#                       ├─ docker        (only once PyPI accepted the upload)
+#                       └─ github-release
 #
 # All tags (stable and pre-release) promote to PyPI after the TestPyPI
 # install smoke passes. Pre-releases are PEP 440 pre-release versions
 # (a / b / rc / .dev) so `pip install data-product-forge` skips them by
 # default — only `pip install --pre` or an explicit `==X.Y.ZrcN` pin
-# picks them up.
+# picks them up. The GHCR image and the GitHub Release follow PyPI: when
+# PyPI refuses the upload, neither is published.
 #
 # Wheel version comes from the git tag via setuptools-scm — no static
 # `version = "..."` literal in pyproject.toml to drift.
@@ -46,10 +47,16 @@
 # upload and its install check and publishes straight to PyPI, so a release
 # is not held hostage by a TestPyPI incident. The tag must already exist and
 # its commit's ci.yml must be green, as for any release. Every job builds and
-# publishes the tag's commit, never the branch the run was started from, so
-# the workflow can be dispatched from main for an existing tag:
+# publishes the tag's commit, never the branch the run was started from. The
+# provenance, though, names the commit the run started from: the attestations
+# are built from the run's OIDC claims. So start the run from the tag itself:
 #
-#   gh workflow run release.yml --ref main -f tag=vX.Y.Z -f skip_testpypi=true
+#   gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z -f skip_testpypi=true
+#
+# A tag cut before this input existed (v0.19.0 and earlier) has no skip_testpypi
+# in its own release.yml, so it is dispatched with --ref main instead. The gate
+# refuses a start ref that does not contain the tag's commit, and warns that
+# the provenance names the start ref when it is not the tag.
 #
 # verify-pypi (install + smoke from real PyPI) still runs; it is the only
 # index install check on that path.
@@ -91,7 +98,8 @@ jobs:
   # Branch protection on `main` already requires `ci.yml` to pass before
   # merge, so the commit we're tagging has been exercised end-to-end.
   # This gate just validates the tag shape and confirms the commit's
-  # CI run concluded successfully. ~10 seconds.
+  # CI run concluded successfully. On a manual run it also checks that the
+  # ref the run started from contains the tag's commit. ~10 seconds.
   # ──────────────────────────────────────────────────────────────
   quality-gate:
     name: Quality Gate
@@ -151,14 +159,46 @@ jobs:
           script: |
             // The commit being released is the tag's. A tag push runs on it; a
             // manual run may start from a branch (main), so resolve the tag.
+            const tag = process.env.TAG;
             let sha = context.sha;
             if (context.eventName === "workflow_dispatch") {
-              const { data: commit } = await github.rest.repos.getCommit({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                ref: `refs/tags/${process.env.TAG}`,
-              });
-              sha = commit.sha;
+              try {
+                const { data: commit } = await github.rest.repos.getCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `refs/tags/${tag}`,
+                });
+                sha = commit.sha;
+              } catch (err) {
+                core.setFailed(
+                  `Could not resolve tag ${tag} to a commit: ${err.message}. ` +
+                  `A manual run releases an existing tag: check it was pushed (git push origin ${tag}).`,
+                );
+                return;
+              }
+              if (sha !== context.sha) {
+                // Provenance (the SLSA attestation and PyPI's Sigstore ones) is
+                // built from the run's OIDC claims, so it names the ref and sha
+                // the run started from, not the commit checked out. Refuse a
+                // start ref that does not contain the tag's commit.
+                const { data: cmp } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  basehead: `${sha}...${context.sha}`,
+                  per_page: 1,
+                });
+                if (cmp.status !== "ahead" && cmp.status !== "identical") {
+                  core.setFailed(
+                    `Tag ${tag} (${sha}) is not an ancestor of ${context.ref} (${context.sha}): ` +
+                    `compare status '${cmp.status}'. Dispatch with --ref ${tag}.`,
+                  );
+                  return;
+                }
+                core.warning(
+                  `Provenance will name ${context.ref}@${context.sha}, not ${tag}@${sha}. ` +
+                  `Dispatch with --ref ${tag} to make it name the tag.`,
+                );
+              }
             }
             const { data: runs } = await github.rest.actions.listWorkflowRuns({
               owner: context.repo.owner,
@@ -384,7 +424,7 @@ jobs:
           echo "TestPyPI package verified successfully"
 
   # ──────────────────────────────────────────────────────────────
-  # 3b. Publish to PyPI — stable tags only, gated by TestPyPI verify.
+  # 3b. Publish to PyPI — every tag, gated by TestPyPI verify.
   # ──────────────────────────────────────────────────────────────
   publish-pypi:
     name: Publish to PyPI
@@ -476,21 +516,18 @@ jobs:
           echo "PyPI package verified successfully"
 
   # ──────────────────────────────────────────────────────────────
-  # 4. GitHub Release with changelog and artifacts (after TestPyPI verify).
+  # 4. GitHub Release with changelog and artifacts (after PyPI accepted it).
   # ──────────────────────────────────────────────────────────────
   github-release:
     name: GitHub Release
-    needs: [quality-gate, build, verify-testpypi]
-    # Normally gated on the TestPyPI install check. On the outage path
-    # (skip_testpypi) that job is skipped on purpose, so the condition names
-    # it explicitly: GitHub skips a job whose needs were skipped unless its
-    # `if` calls a status function, here !cancelled().
-    if: >-
-      ${{ !cancelled()
-      && needs.quality-gate.result == 'success'
-      && needs.build.result == 'success'
-      && (needs.verify-testpypi.result == 'success'
-      || (needs.verify-testpypi.result == 'skipped' && needs.quality-gate.outputs.skip_testpypi == 'true')) }}
+    needs: [quality-gate, build, publish-pypi]
+    # Announces only what PyPI accepted: a rejected upload (for example "file
+    # already exists" on a re-dispatched tag) must not cut a release.
+    # publish-pypi's own condition already requires the TestPyPI install check,
+    # or the outage path. The status functions are spelled out because the
+    # implicit success() is false when any ancestor was skipped, and on the
+    # outage path the TestPyPI jobs are.
+    if: ${{ !cancelled() && needs.quality-gate.result == 'success' && needs.build.result == 'success' && needs.publish-pypi.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -586,7 +623,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.quality-gate.outputs.tag }}
           name: "FLUID Build ${{ needs.quality-gate.outputs.version }}"
           body_path: release-notes.md
           prerelease: ${{ needs.quality-gate.outputs.is_prerelease == 'true' }}
@@ -595,21 +632,14 @@ jobs:
             sbom.cdx.json
 
   # ──────────────────────────────────────────────────────────────
-  # 5. Build and push Docker image to GHCR
+  # 5. Build and push Docker image to GHCR (after PyPI accepted it)
   # ──────────────────────────────────────────────────────────────
   docker:
     name: Docker Image (GHCR)
-    needs: [quality-gate, build, verify-testpypi]
-    # Normally gated on the TestPyPI install check. On the outage path
-    # (skip_testpypi) that job is skipped on purpose, so the condition names
-    # it explicitly: GitHub skips a job whose needs were skipped unless its
-    # `if` calls a status function, here !cancelled().
-    if: >-
-      ${{ !cancelled()
-      && needs.quality-gate.result == 'success'
-      && needs.build.result == 'success'
-      && (needs.verify-testpypi.result == 'success'
-      || (needs.verify-testpypi.result == 'skipped' && needs.quality-gate.outputs.skip_testpypi == 'true')) }}
+    needs: [quality-gate, build, publish-pypi]
+    # Moves the GHCR X.Y.Z, X.Y, <profile>-latest and latest tags only for a
+    # version PyPI accepted. Gated like github-release, for the same reasons.
+    if: ${{ !cancelled() && needs.quality-gate.result == 'success' && needs.build.result == 'success' && needs.publish-pypi.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

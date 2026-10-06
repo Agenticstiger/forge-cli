@@ -127,6 +127,8 @@ forge-cli's `release.yml` is already wired with:
 - Sigstore attestations + SLSA build provenance on every artifact
 - Pre-release tags (containing `a/b/rc/dev`) promote to PyPI too, as PEP 440 pre-releases
   that `pip install` skips unless asked for one
+- The GHCR image and the GitHub Release only once PyPI has accepted the upload: when
+  `publish-pypi` fails, neither is published
 
 To cut a release:
 
@@ -134,33 +136,49 @@ To cut a release:
 # Pre-release for validation
 git tag v0.7.8a1
 git push origin v0.7.8a1
-# → publishes to TestPyPI only
+# → TestPyPI, its install check, then PyPI as a pre-release
+# → then the GHCR image's alpha-latest tag and a GitHub pre-release
 
-# After TestPyPI smoke passes, cut the stable
+# Once the pre-release checks out, cut the stable
 git tag v0.7.8
 git push origin v0.7.8
-# → publishes to TestPyPI, then waits at the `pypi` environment gate
-# → maintainer clicks "Approve" in GitHub Actions UI
-# → publishes to real PyPI
+# → TestPyPI, its install check, then PyPI; nothing waits for an approval
+# → then the GHCR image (0.7.8, 0.7, stable-latest, latest) and the GitHub Release
 ```
 
-The `quality-gate` job at the start of `release.yml` checks that the tag matches `vX.Y.Z` and that `ci.yml` is green on the tagged commit. It does NOT re-run lint or pytest — `ci.yml` is the source of truth for those.
+The `quality-gate` job at the start of `release.yml` checks that the tag matches `vX.Y.Z` and that `ci.yml` is green on the tagged commit. On a manual run it also resolves the tag to its commit and checks that the ref the run started from contains that commit. It does NOT re-run lint or pytest — `ci.yml` is the source of truth for those.
 
 ### When TestPyPI is down
 
 A TestPyPI incident (for example its trusted-publishing endpoint answering 503) fails
 `publish-testpypi`, and nothing reaches PyPI. Re-run the failed jobs once TestPyPI is
-back. If it stays down, publish the existing tag straight to PyPI from a manual run:
+back. If it stays down, publish the existing tag straight to PyPI from a manual run
+started from the tag itself:
+
+```bash
+gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z -f skip_testpypi=true
+```
+
+The run skips the TestPyPI upload and `verify-testpypi`; `verify-pypi` is then the only
+install check from an index. Every job builds and publishes the tag's commit, and the
+quality gate checks `ci.yml` on that commit. A tag push never skips TestPyPI.
+
+The provenance names the commit the run started from, not the one it built. The SLSA
+build provenance and PyPI's Sigstore attestations are made from the run's OIDC claims,
+its `ref` and `sha`, not from the checkout. Starting from the tag makes the two agree.
+
+A run uses the `release.yml` of the ref it starts from, so `--ref vX.Y.Z` works only for
+a tag whose own `release.yml` has `skip_testpypi`: every tag after 63f3b40 (#702). For
+v0.19.0 and older, start from `main`:
 
 ```bash
 gh workflow run release.yml --ref main -f tag=vX.Y.Z -f skip_testpypi=true
 ```
 
-The run skips the TestPyPI upload and `verify-testpypi`; `verify-pypi` is then the only
-install check from an index. Every job builds and publishes the tag's commit, not
-`main`'s, and the quality gate checks `ci.yml` on that commit. The run's attestations
-name the workflow at `main`, because that is where the run started. A tag push never
-skips TestPyPI.
+The provenance then names `main` at its head when the run started, and the quality gate
+says so in a warning. The gate refuses a start ref that does not contain the tag's
+commit, such as `main` for a tag on another branch, or a ref older than the tag. It also
+refuses a tag that does not exist, and names it.
 
 ## Provisioning a new cloud test account
 
