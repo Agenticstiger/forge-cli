@@ -563,11 +563,11 @@ new AsyncFunction("github", "context", "core", fx.script)(github, fx.context, co
 
 def _node() -> str:
     node = shutil.which("node")
-    if node:
-        return node
-    if os.environ.get("CI"):
-        pytest.fail("node is required in CI: the quality-gate script runs under it")
-    pytest.skip("node not installed")
+    if not node:
+        if os.environ.get("CI"):
+            pytest.fail("node is required in CI: the quality-gate script runs under it")
+        pytest.skip("node not installed")
+    return node
 
 
 def _git(repo: Path, *args: str) -> str:
