@@ -137,6 +137,17 @@ jobs:
             -q -p no:randomly --junitxml=state-drift.xml
           .venv/bin/python scripts/ci/assert_lane_coverage.py state-drift.xml \
             --require "state drift=tests/iac/test_iac_state_drift_moto.py"
+      # Lake Formation tags: a tag the contract defines is named by reference, one
+      # the platform owns by its literal key. Only a real apply and plan show that
+      # an association applied with depends_on plans no change under the
+      # reference, and that a platform-owned tag is associated and survives the
+      # destroy. Fails if the file only skipped.
+      - name: Stage 1 — Lake Formation tags apply + plan (tofu vs moto, creds-free)
+        run: |
+          .venv/bin/python -m pytest tests/iac/test_iac_lakeformation_tags_moto.py \
+            -q -p no:randomly --junitxml=lf-tags-moto.xml
+          .venv/bin/python scripts/ci/assert_lane_coverage.py lf-tags-moto.xml \
+            --require "LF tags moto=tests/iac/test_iac_lakeformation_tags_moto.py"
       # The default state key names the provider, and the first apply after the
       # upgrade moves the old key's state with `tofu init -migrate-state`. Only a
       # real apply, move and plan prove the plan after it changes nothing.

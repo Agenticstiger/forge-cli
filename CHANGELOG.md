@@ -29,6 +29,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Lake Formation tag the contract does not define is associated, and the module
+  validates.** A key in a binding's `governance.lakeFormation.tags` with no
+  `governance.lakeFormation.tagDefinitions` entry got a `depends_on` on an
+  `aws_lakeformation_lf_tag` the module never declared, so `tofu validate` and
+  `fluid apply` failed with "Reference to undeclared resource". Such a key is now a
+  tag the platform owns: associated as written, with no `depends_on`, no warning and no
+  refusal. It must already exist in the account, and the identity running `fluid apply`
+  needs `ASSOCIATE` on it. A key the contract defines is named by reference,
+  `key = aws_lakeformation_lf_tag.<name>.key`, the provider's documented pattern,
+  instead of a `depends_on` edge, so the association still waits for the tag. The
+  reference evaluates to the same key, so an association applied from 0.19.0 plans no
+  change (applied and planned against moto).
+  Refused at `fluid validate` and at emit, where each used to fail at apply or be
+  dropped: a value the contract's definition of the tag does not allow, compared
+  case-insensitively (`lakeformation-tag-value`); a definition with no values, or two
+  that would be one resource name, such as `a-b` and `a_b`
+  (`lakeformation-tag-definition`); and tags on a binding that names no Glue table
+  (`lakeformation-tag-association`). The `tags` and `tagDefinitions` descriptions in
+  fluid-schema 0.7.3 to 0.7.6 say so.
 - **A row filter on an AWS binding that is not a Glue-catalog table is refused, not
   dropped.** On AWS a row filter is a Lake Formation data cells filter on a Glue table,
   and the emitter writes no Lake Formation resource for any other format. So
