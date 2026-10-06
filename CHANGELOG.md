@@ -30,6 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sink writes BigLake. Set `catalog: bigquery`, or the REST kind your catalog is. A
   hand-written sink config must then select that same catalog.
 
+### Added
+
+- **`catalog: lakekeeper` is checked as Lakekeeper.** A Lakekeeper, Polaris or Unity
+  catalog addresses its warehouse by NAME (`analytics`, or `<project-id>/<name>` on
+  Lakekeeper), so `fluid validate` refuses an object-store URI there, and warns when a
+  Lakekeeper `uri` does not end in `/catalog`, where Lakekeeper serves its Iceberg REST
+  API. Schema 0.7.6 (preview) accepts `lakekeeper` and `polaris` in `sink.catalog`;
+  0.7.5 is unchanged.
+
 ### Changed
 
 - CI: the emulated-heavy lane runs a real Kafka Connect worker (cp-kafka-connect 7.9.10

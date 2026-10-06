@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Schema surface for the Iceberg catalog kinds.
+"""Schema surface for the Iceberg catalog kinds (Lakekeeper, Polaris).
 
-``location.catalog`` is a free string the kind table in
-``providers/_iceberg_catalog.py`` classifies, and ``sink.catalog`` is an enum.
-These tests pin the schema's enum and prose to the table rather than to a
-hand-kept list, so a kind the table does not know cannot pass the schema.
+``sink.catalog`` is an enum, and before the open 0.7.6 preview it had no
+``lakekeeper`` or ``polaris`` member, so a build could name the catalog only
+on the expose's free-string ``location.catalog``. 0.7.6 accepts both; 0.7.5
+is GA and frozen, so it keeps refusing them. The kind table in
+``providers/_iceberg_catalog.py`` is the source of truth, so these tests also
+pin the schema's enum and prose to it rather than to a hand-kept list.
 """
 
 from __future__ import annotations
@@ -110,6 +112,23 @@ def test_base_contract_is_valid(version: str) -> None:
     assert result.is_valid, result.errors
 
 
+@pytest.mark.parametrize("catalog", ["lakekeeper", "polaris"])
+def test_preview_accepts_the_new_sink_catalogs(catalog: str) -> None:
+    contract = _contract("0.7.6", sink_catalog=catalog, location=dict(_LAKEKEEPER_LOCATION))
+    contract["exposes"][0]["binding"]["location"]["catalog"] = catalog
+    result = _validate(contract, "0.7.6")
+    assert result.is_valid, f"0.7.6 refused sink.catalog {catalog!r}: {result.errors}"
+
+
+@pytest.mark.parametrize("catalog", ["lakekeeper", "polaris"])
+def test_ga_075_still_refuses_them(catalog: str) -> None:
+    """0.7.5 is released and frozen: widening its enum would change what an
+    already-published schema accepts."""
+    result = _validate(_contract("0.7.5", sink_catalog=catalog), "0.7.5")
+    assert not result.is_valid
+    assert any("sink.catalog" in e and catalog in e for e in result.errors), result.errors
+
+
 @pytest.mark.parametrize("version", ["0.7.5", "0.7.6"])
 def test_location_catalog_lakekeeper_is_a_free_string(version: str) -> None:
     contract = _contract(version, location=dict(_LAKEKEEPER_LOCATION))
@@ -135,3 +154,4 @@ def test_location_catalog_description_lists_every_kind() -> None:
     canonical = [k for k in known_catalog_kinds() if canonical_catalog_kind(k) == k]
     missing = [k for k in canonical if k not in description]
     assert missing == [], f"location.catalog description omits {missing}"
+    assert "/catalog" in description  # where Lakekeeper serves its REST API

@@ -214,6 +214,7 @@ def test_confluent_expose_not_treated_as_kc_sink_target():
 
 CANONICAL_KINDS = sorted({canonical_catalog_kind(k) for k in known_catalog_kinds()})
 REQUIRING_KINDS = [k for k in CANONICAL_KINDS if catalog_kind_info(k).sink_requires]
+NAME_ADDRESSED_KINDS = [k for k in CANONICAL_KINDS if catalog_kind_info(k).warehouse_is_name]
 COMPLETE = {"uri": "http://lakekeeper:8181/catalog", "warehouse": "analytics"}
 
 
@@ -358,9 +359,51 @@ def test_unknown_kind_errors_naming_value_and_listing_kinds(where):
     assert not any("disagrees" in e for e in errs)
 
 
+# ── name-addressed warehouses and the Lakekeeper /catalog mount ─────────────
+
+
+@pytest.mark.parametrize("kind", NAME_ADDRESSED_KINDS)
+@pytest.mark.parametrize(
+    "warehouse", ["s3://lake/wh", "gs://lake/wh", "abfss://c@a.dfs.core.windows.net/w"]
+)
+def test_name_addressed_kind_rejects_object_store_warehouse(kind, warehouse):
+    binding = _loc_binding(kind, uri="http://c:8181/catalog", warehouse=warehouse)
+    errs = _errs(_sink_contract(binding))
+    assert any(f"{kind} addresses a warehouse by NAME" in e and warehouse in e for e in errs), errs
+
+
+@pytest.mark.parametrize("warehouse", ["analytics", "0190a7c2-project/analytics"])
+def test_name_addressed_kind_accepts_a_name(warehouse):
+    binding = _loc_binding("lakekeeper", uri="http://c:8181/catalog", warehouse=warehouse)
+    assert not any("by NAME" in e for e in _errs(_sink_contract(binding)))
+
+
 def test_generic_rest_accepts_an_object_store_warehouse():
     # Plain REST catalogs (the apache/iceberg-rest-fixture) take an s3:// warehouse.
     binding = _loc_binding("rest", uri="http://iceberg:8181", warehouse="s3://bucket/warehouse/")
+    assert validate_iceberg_sink(_sink_contract(binding)) == ([], [])
+
+
+@pytest.mark.parametrize(
+    "uri, warns",
+    [
+        ("http://lakekeeper:8181", True),
+        ("http://lakekeeper:8181/", True),
+        ("http://lakekeeper:8181/api", True),
+        ("http://lakekeeper:8181/catalog", False),
+        ("http://lakekeeper:8181/catalog/", False),
+    ],
+)
+def test_lakekeeper_uri_without_catalog_mount_warns(uri, warns):
+    binding = _loc_binding("lakekeeper", uri=uri, warehouse="analytics")
+    errors, warnings = validate_iceberg_sink(_sink_contract(binding))
+    assert errors == []
+    hit = [w for w in warnings if "serves the Iceberg REST API under <host>/catalog" in w]
+    assert bool(hit) == warns, warnings
+
+
+def test_uri_suffix_warning_is_lakekeeper_only():
+    binding = _loc_binding("polaris", uri="http://polaris:8181/api", warehouse="analytics")
     assert validate_iceberg_sink(_sink_contract(binding)) == ([], [])
 
 
@@ -581,10 +624,10 @@ def test_preflight_selects_only_the_named_build():
 
 
 def test_preflight_clean_build_returns_none_and_logs_warnings(caplog):
-    binding = _loc_binding("nessie", uri="http://nessie:19120/api/v2", warehouse="s3://b/w")
+    binding = _loc_binding("lakekeeper", uri="http://lakekeeper:8181", warehouse="analytics")
     with caplog.at_level("WARNING", logger="fluid.acquire.iceberg_sink"):
         assert iceberg_sink_preflight(_sink_contract(binding), "ingest") is None
-    assert any("iceberg-nessie" in r.getMessage() for r in caplog.records)
+    assert any("/catalog" in r.getMessage() for r in caplog.records)
 
 
 def test_preflight_ignores_unknown_build_ids():

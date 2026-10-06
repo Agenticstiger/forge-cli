@@ -360,21 +360,17 @@ def test_runner_preflight_warning_logs_and_still_deploys(kafka_connect_mock, tmp
     contract = _iceberg_contract()
     contract["exposes"][0]["binding"] = {
         **_LAKEKEEPER_NO_URI,
-        "location": {
-            **_LAKEKEEPER_NO_URI["location"],
-            "catalog": "nessie",
-            "uri": "http://nessie:19120/api/v2",
-            "warehouse": "s3://lake/warehouse",
-        },
+        "location": {**_LAKEKEEPER_NO_URI["location"], "uri": "http://lakekeeper:8181"},
     }
     with caplog.at_level("WARNING", logger="fluid.acquire.kafka_connect"):
         rc = execute_kafka_connect_build(contract["builds"][0], contract, tmp_path)
     assert rc == 0
-    assert any("iceberg-nessie" in r.getMessage() for r in caplog.records)
+    assert any("<host>/catalog" in r.getMessage() for r in caplog.records)
     cfg = kafka_connect_mock.connectors["src-sink"]["config"]
-    assert cfg["iceberg.catalog.type"] == "nessie"
+    assert cfg["iceberg.catalog.type"] == "rest"
     assert "iceberg.catalog.catalog-impl" not in cfg
-    assert cfg["iceberg.catalog.uri"] == "http://nessie:19120/api/v2"
+    assert cfg["iceberg.catalog.uri"] == "http://lakekeeper:8181"
+    assert cfg["iceberg.catalog.warehouse"] == "analytics"
 
 
 def test_complete_lakekeeper_streams_over_rest(kafka_connect_mock, tmp_path):
