@@ -188,12 +188,31 @@ policy:
   filter, with the principal's excluded columns as its column wildcard's exclusions,
   instead of on the table. The masked view of a filtered principal applies the same
   predicate, since the view reads the table as its definer.
-* **A build keeps them.** BigQuery removes every row access policy of a table that a
-  `WRITE_TRUNCATE` load writes, so a full-refresh build loads with
+* **An embedded-SQL build keeps them.** BigQuery removes every row access policy of a
+  table that a `WRITE_TRUNCATE` load writes, so a full-refresh build loads with
   `WRITE_TRUNCATE_DATA`, which replaces the rows and keeps the table's policies, tags
   and partitioning (measured on BigQuery, 5 October 2026, on an unpartitioned and on a
   DAY-partitioned table with a partition expiration). It is the disposition dlt's
   BigQuery destination uses for the same reason.
+* **A replace and a rollback keep them.** Nothing forge-cli runs recreates a governed
+  BigQuery table. `fluid rollback` restores one with a single query job, `SELECT * FROM
+  <backup>` into the live table with `WRITE_TRUNCATE_DATA` and `CREATE_NEVER`; it was
+  `CREATE OR REPLACE TABLE … AS SELECT`, which BigQuery documents drops every row
+  access policy of the table, and whose SELECT schema carried no policy tag. It refuses
+  a backup the restoring identity cannot read in full, which would otherwise restore
+  only the rows a policy shows it. The GCP planner's replace plans the same query job
+  for a SQL build, keeps the table definition planned, and backs the table up with a
+  zero-copy `CREATE SNAPSHOT TABLE … CLONE`, not the plain copy it made, which had no
+  policy and no tag.
+* **Known gap: dbt still recreates the table.** dbt-bigquery materialises a `table`
+  model with `create or replace table`, in every build mode, and an `incremental` model
+  the same way under `--mode replace-and-build`, where forge-cli passes `--full-refresh`.
+  That runs after `tofu apply` made the row access policies and policy tags: the row
+  access policies are dropped, and the policy tags too unless the dbt project re-applies
+  them (`persist_docs` with `policy_tags`, which dbt does after the replace). Until the
+  next `fluid apply`, every principal a filter or a restriction limits reads every row
+  and column of a table a dbt build recreated. forge-cli does not change dbt's
+  materialisation yet; that is a follow-up.
 
 ## Dataset grants are no longer authoritative
 
@@ -285,6 +304,16 @@ partitioning's shape. Changing `retention` later is an in-place update of
 also refuses without `--allow-data-loss`; BigQuery cannot un-partition a table, so to
 keep data longer, set a longer `retention` instead.
 
+A replaced table comes back governed. BigQuery deletes a table's row access policies
+and its IAM policy with the table, and `tofu` did not see it in the same apply: a row
+access policy's `table_id` is the same string before and after, so it planned the
+policies as unchanged and the new table stood with none (and, in a shared dataset,
+without its table-level grants) until the next apply. Each row access policy and
+table IAM member now has `lifecycle.replace_triggered_by` on the table's `id`, which
+is unknown in the plan only when a new table is created, so they are recreated with
+the table and left alone by an in-place update. Their replacement adds removals the
+data-loss gate counts, but only in a plan that already replaces the table.
+
 ## Lake Formation tags the platform owns
 
 AWS recommends one LF-tag ontology per account: a data steward or the platform
@@ -337,7 +366,10 @@ to tag its own tables. A contract follows either model, per key:
   in-process stand-in for the BigQuery REST API, shows adding retention or a key to a
   live table plans its replacement (the data-loss gate refuses it), a new retention is
   in place, the governed table then plans clean, and the dataset's own access entries
-  survive the grants (`tests/iac/test_iac_gcp_governance_plan.py`).
+  survive the grants (`tests/iac/test_iac_gcp_governance_plan.py`). The stand-in
+  deletes a table's row access policies and IAM policy with it, as BigQuery does: a
+  replaced table gets both back in the same apply, and an in-place update (a label, a
+  new retention) leaves them.
 * A real `tofu plan` against moto accepts the Lake Formation grants with excluded
   columns, and `fluid verify`'s Lake Formation check runs against moto's stored grants
   (`tests/iac/test_iac_aws_column_restrictions.py`).
@@ -389,6 +421,24 @@ to tag its own tables. A contract follows either model, per key:
 * `tofu plan` with terraform-provider-aws 6.67 against the live state of the lab's
   eleven AWS products planned no change for any of them, with only the provider pin
   moved from `~> 5.0`.
+* **The replace and the rollback, measured on BigQuery**, 6 October 2026, on a
+  temporary DAY-partitioned table with a row access policy and a policy-tagged column,
+  driven through forge-cli's own planner action and `fluid rollback` code:
+  * the pre-replace `CREATE SNAPSHOT TABLE … CLONE` copied both row access policies and
+    the policy tag to the snapshot (not the partition expiration, as BigQuery
+    documents);
+  * the replace's `WRITE_TRUNCATE_DATA` query job, and the rollback's restore from the
+    snapshot, each kept the row access policy, the policy tag, the partitioning and
+    the partition expiration; afterwards a reader with only the filtered policy saw 2
+    of 3 rows and was refused the tagged column;
+  * the query job maps the SELECT's columns by name, not by position, and a missing
+    NULLABLE column lands as NULL;
+  * an identity without full row access or Fine-Grained Reader is refused both the
+    replace job and the restore (403): it fails closed and changes nothing;
+  * the control, the old `CREATE OR REPLACE TABLE … AS SELECT` on an unpartitioned
+    copy, dropped the row access policy and the policy tag, and every row and the
+    tagged column became readable. On a partitioned table BigQuery refuses it outright
+    ("Cannot replace a table with a different partitioning spec").
 * **Not proven yet**: an apply of the masking, row filter and label resources exactly
   as forge-cli emits them, on either cloud.
 * **Not proven**: associating a tag the platform owns on a real account, and how Lake

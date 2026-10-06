@@ -48,6 +48,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`lakeformation-tag-definition`); and tags on a binding that names no Glue table
   (`lakeformation-tag-association`). The `tags` and `tagDefinitions` descriptions in
   fluid-schema 0.7.3 to 0.7.6 say so.
+- **A BigQuery replace or rollback keeps the table's governance.** Nothing forge-cli
+  runs recreates a governed BigQuery table any more. `CREATE OR REPLACE TABLE … AS
+  SELECT`, which BigQuery documents drops every row access policy, and whose SELECT
+  schema has no policy tag, left every filtered or restricted principal reading every
+  row and column until the next apply. dbt's `table` materialisation still does (a
+  known gap, documented in `docs/governance-parity.md`).
+  - `fluid rollback` restores with one query job, `SELECT * FROM <backup>` into the
+    live table with `WRITE_TRUNCATE_DATA` and `CREATE_NEVER` (`WRITE_TRUNCATE` on an
+    emulator). The destination is a table reference built from the validated
+    identifiers, and the recorded `ddl[]` is still never run. A backup the restoring
+    identity cannot read in full, because a row access policy shows it only some rows,
+    is refused (`rollback_bigquery_backup_filtered`) instead of restoring that subset.
+  - `GcpProvider.restore_ddl` records no restore SQL, as AWS does.
+  - The GCP planner's replace emits a SQL build as the SELECT with a structured
+    destination and `WRITE_TRUNCATE_DATA` / `CREATE_NEVER`, keeps the table's
+    `bq.ensure_table`, and backs the table up with a zero-copy
+    `CREATE SNAPSHOT TABLE … CLONE` that expires after 30 days, not a plain copy with
+    no policy and no tag. SQL that names its own sink passes through as before.
+  - When `tofu` replaces a BigQuery table (partitioning or a key added to a live
+    table), its row access policies and table IAM members are recreated with it in
+    the same apply (`lifecycle.replace_triggered_by` on the table's `id`). BigQuery
+    deletes them with the table, and `tofu` planned them as unchanged. An in-place
+    update of the table leaves them alone, so a label change still needs no
+    `--allow-data-loss`.
 - **A row filter on an AWS binding that is not a Glue-catalog table is refused, not
   dropped.** On AWS a row filter is a Lake Formation data cells filter on a Glue table,
   and the emitter writes no Lake Formation resource for any other format. So

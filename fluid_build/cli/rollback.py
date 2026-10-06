@@ -30,8 +30,10 @@ CLI surface::
 Per-provider restore semantics:
 - **Snowflake** — ``CREATE OR REPLACE DATABASE <db> CLONE <backup_name>``
   (zero-copy, reverses the original CLONE used for backup).
-- **BigQuery** — NotImplementedError with actionable message. Follow-up
-  work: ``bq cp --force <backup_dataset> <dataset>`` per table.
+- **BigQuery** — one query job, ``SELECT * FROM <backup>`` into the live
+  table with ``WRITE_TRUNCATE_DATA`` and ``CREATE_NEVER``: the rows are
+  replaced, the table and its governance (policy tags, row access policies,
+  partitioning) are kept.
 - **Redshift** — NotImplementedError with actionable message. Follow-up
   work: ``TRUNCATE <table>; INSERT INTO <table> SELECT * FROM
   <backup_table>;`` inside a transaction.
@@ -498,22 +500,44 @@ def _restore_snowflake(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, 
 
 
 def _restore_bigquery(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, Any]:
-    """Restore a BigQuery product via CTAS, reconstructed from validated IDs.
+    """Restore a BigQuery table's rows from its backup, and keep the table.
 
-    BigQuery has no zero-copy CLONE for arbitrary backups, so the restore is
-    ``CREATE OR REPLACE TABLE <orig> AS SELECT * FROM <backup>`` (atomic, so
-    the live table is never left half-restored).
+    The restore is one query job: ``SELECT * FROM <backup>`` with the live table
+    as its destination, ``WRITE_TRUNCATE_DATA`` and ``CREATE_NEVER``. BigQuery
+    replaces the rows as one atomic step and keeps the existing table: it
+    "overwrites the data, but keeps the constraints and schema of the existing
+    table" (REST reference, ``JobConfigurationQuery.writeDisposition``), so the
+    schema's column policy tags (column-level security and data masking) stay as
+    ``tofu apply`` made them, and it is not the ``WRITE_TRUNCATE`` BigQuery
+    documents removes every row access policy (a ``WRITE_TRUNCATE_DATA`` load kept
+    them, measured on BigQuery on 5 October 2026). It was ``CREATE OR REPLACE
+    TABLE <orig> AS SELECT * FROM <backup>``, and BigQuery documents that
+    replacing a table that way drops all of its row access policies; the new
+    table took its schema from the SELECT, so the policy tags went too, and every
+    filtered or restricted reader read every row and column until the next
+    apply. The disposition and the client are the load path's
+    (``build_runners/_bigquery_load.py``, after dlt's BigQuery destination):
+    ``WRITE_TRUNCATE`` on an emulator, which has no policy to keep.
+
+    The backup is read as the restoring identity. A row access policy that
+    filters it for that identity would restore a subset and delete the rest, so
+    the rows it can read are counted against the backup's own row count first,
+    and a restore that would lose rows is refused before anything is written.
+    Reading a column with a policy tag needs Fine-Grained Reader on the tag;
+    without it the job fails and the table is left as it was.
 
     SECURITY: the on-disk state file (``.fluid/rollback-state.json``) is
     attacker-authorable — the module docstring invites operators to commit it
     as an audit trail, so it is reviewed as a data blob, not byte-audited SQL.
-    The baked ``snapshot["ddl"]`` is therefore NEVER executed: the statement
-    is REBUILT here from ``location`` components that each pass
+    The baked ``snapshot["ddl"]`` is therefore NEVER executed: the query is
+    REBUILT here from ``location`` components that each pass
     ``_validated_bq_fqn``, so a tampered ddl[] (e.g. ``DROP TABLE prod``)
-    cannot smuggle arbitrary DDL past a benign-looking location. Mirrors the
-    apply-time writer ``GcpProvider.restore_ddl``. Returns the usual
-    ``{status, provider, ddl, ...}`` contract.
+    cannot smuggle arbitrary SQL past a benign-looking location, and the
+    destination is a ``TableReference`` of the same validated identifiers,
+    never SQL. Returns the usual ``{status, provider, ddl, ...}`` contract,
+    ``ddl`` being the query the restore runs.
     """
+    from fluid_build.build_runners import _bigquery_load
     from fluid_build.providers.gcp.plan.planner import _validated_bq_fqn
 
     location = snapshot.get("location") or {}
@@ -547,13 +571,13 @@ def _restore_bigquery(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, A
                 ),
             },
         )
-    # SECURITY: reconstruct the restore DDL from the VALIDATED identifiers
-    # instead of replaying snapshot["ddl"] verbatim. The state file is
-    # attacker-authorable, so a tampered ddl[] with a benign location could
-    # otherwise execute arbitrary SQL (DROP/DELETE/GRANT) under the operator's
-    # credentials. We ONLY ever run the single, structurally-safe
-    # ``CREATE OR REPLACE TABLE <orig> AS SELECT * FROM <backup>`` built from
-    # FQNs that passed _validated_bq_fqn; the baked ddl[] is never executed.
+    # SECURITY: reconstruct the restore from the VALIDATED identifiers instead
+    # of replaying snapshot["ddl"] verbatim. The state file is attacker-
+    # authorable, so a tampered ddl[] with a benign location could otherwise
+    # execute arbitrary SQL (DROP/DELETE/GRANT) under the operator's
+    # credentials. We ONLY ever run ``SELECT * FROM <backup>`` built from an FQN
+    # that passed _validated_bq_fqn, into a destination built from identifiers
+    # that passed it too; the baked ddl[] is never executed.
     try:
         orig_fqn = _validated_bq_fqn(raw_project, raw_dataset, raw_table)
         backup_fqn = _validated_bq_fqn(raw_project, raw_dataset, raw_backup)
@@ -572,21 +596,42 @@ def _restore_bigquery(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, A
             },
         ) from exc
 
-    ddl_statements = [f"CREATE OR REPLACE TABLE {orig_fqn} AS SELECT * FROM {backup_fqn}"]
-    ddl = ddl_statements[0] + ";"
+    query = f"SELECT * FROM {backup_fqn}"
+    write_disposition = _bigquery_load.write_disposition("full_refresh")
+    create_disposition = "CREATE_NEVER"
+    plan = {
+        "provider": "bigquery",
+        "ddl": query,
+        "destination": orig_fqn,
+        "write_disposition": write_disposition,
+        "create_disposition": create_disposition,
+        "project": raw_project,
+        "backup_name": raw_backup,
+    }
     cprint(
-        "[rollback] bigquery CTAS restore plan:\n    "
-        + "\n    ".join(stmt + ";" for stmt in ddl_statements),
+        "[rollback] bigquery restore plan (rows only; the table, its policy tags "
+        "and its row access policies are kept):\n"
+        f"    {query};\n"
+        f"    destination {orig_fqn}, {write_disposition}, {create_disposition}",
         markup=False,
     )
     if dry_run:
-        return {
-            "status": "dry_run",
-            "provider": "bigquery",
-            "ddl": ddl,
-            "project": raw_project,
-            "backup_name": raw_backup,
-        }
+        return {"status": "dry_run", **plan}
+    validated = {
+        "project": raw_project,
+        "dataset": raw_dataset,
+        "table": raw_table,
+        "backup": raw_backup,
+        "backup_fqn": backup_fqn,
+    }
+    provider_result = _run_bigquery_restore(validated, plan)
+    return {"status": "restored", **plan, "provider_result": provider_result}
+
+
+def _run_bigquery_restore(ids: Dict[str, str], plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Run the restore :func:`_restore_bigquery` planned, from the identifiers it validated."""
+    from fluid_build.build_runners import _bigquery_load
+
     # Execute via the BigQuery client. Imported lazily so non-BigQuery
     # rollbacks don't pay the google-cloud-bigquery import cost (mirrors
     # the lazy SnowflakeProvider import in _restore_snowflake and the
@@ -607,27 +652,72 @@ def _restore_bigquery(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, A
             },
         ) from exc
 
-    client = bigquery.Client(project=raw_project)
-    last_result: Any = None
-    for stmt in ddl_statements:
-        try:
-            job = client.query(stmt)
-            last_result = job.result()  # blocks until the statement completes
-        except Exception as exc:  # pragma: no cover - defensive
-            raise CLIError(
-                2,
-                "rollback_bigquery_execute_failed",
-                {"error": str(exc), "ddl": stmt},
-            ) from exc
+    client = _bigquery_load.bigquery_client(bigquery, ids["project"])
+    dataset_ref = bigquery.DatasetReference(ids["project"], ids["dataset"])
+    readable: Optional[int] = None
+    if _bigquery_load.emulator_host() is None:
+        readable = _readable_backup_rows(
+            client,
+            bigquery.TableReference(dataset_ref, ids["backup"]),
+            f"{ids['project']}.{ids['dataset']}.{ids['backup']}",
+            ids["backup_fqn"],
+        )
+    query = plan["ddl"]
+    job_config = bigquery.QueryJobConfig(
+        destination=bigquery.TableReference(dataset_ref, ids["table"]),
+        write_disposition=plan["write_disposition"],
+        create_disposition=plan["create_disposition"],
+    )
+    try:
+        job = client.query(query, job_config=job_config)
+        job.result()  # blocks until the job completes
+    except Exception as exc:  # pragma: no cover - defensive
+        raise CLIError(
+            2,
+            "rollback_bigquery_execute_failed",
+            {"error": str(exc), "ddl": query, "destination": plan["destination"]},
+        ) from exc
+    return {"status": "ok", "job_id": getattr(job, "job_id", None), "rows": readable}
 
-    return {
-        "status": "restored",
-        "provider": "bigquery",
-        "ddl": ddl,
-        "project": raw_project,
-        "backup_name": raw_backup,
-        "provider_result": {"status": "ok", "statements": len(ddl_statements)},
-    }
+
+def _readable_backup_rows(client: Any, backup_ref: Any, backup_id: str, backup_fqn: str) -> int:
+    """The backup's rows, refused unless the restoring identity can read every one.
+
+    A row access policy on the backup (BigQuery supports row-level security on
+    table snapshots) shows the identity only the rows it is granted, and
+    ``WRITE_TRUNCATE_DATA`` would then replace the table with them. ``num_rows``
+    is the table's own count, which no policy filters.
+    """
+    from fluid_build.build_runners import _bigquery_load
+
+    try:
+        stored = client.get_table(backup_ref).num_rows
+        readable = _bigquery_load._count_table(client, backup_id, None)
+    except Exception as exc:
+        raise CLIError(
+            2,
+            "rollback_bigquery_execute_failed",
+            {"error": str(exc), "ddl": f"SELECT COUNT(*) FROM {backup_fqn}"},
+        ) from exc
+    if stored is None or readable < int(stored):
+        raise CLIError(
+            2,
+            "rollback_bigquery_backup_filtered",
+            {
+                "backup": backup_fqn,
+                "rows": stored,
+                "readable": readable,
+                "hint": (
+                    "the identity running the rollback cannot read every row of the "
+                    "backup (a row access policy filters it), so restoring would "
+                    "replace the table with only those rows. Nothing was written. "
+                    "Run the rollback as an identity a TRUE row access policy covers "
+                    "(fluid apply's fluid_all_rows covers each reader and writer of "
+                    "the expose that no row filter names)."
+                ),
+            },
+        )
+    return readable
 
 
 def _restore_redshift(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, Any]:

@@ -23,7 +23,9 @@ must stay an in-place change. Only a real plan against real state shows that.
 The state is made by a real ``tofu apply`` against ``_fake_bigquery.FakeBigQuery``,
 an in-process stand-in for the BigQuery REST API (the goccy emulator crashes the
 provider on apply). It also shows the dataset grants are added to the dataset's
-access list, not written over it. No Google credential or endpoint is involved.
+access list, not written over it, and that a replaced table gets back, in the same
+apply, the row access policies and table grants BigQuery deletes with it (the fake
+deletes them too). No Google credential or endpoint is involved.
 
 Not proven here: what real BigQuery accepts (a load into a policy-tagged column,
 the service agent's use of the key), Cloud KMS and Data Catalog resources (the
@@ -408,3 +410,108 @@ def test_an_unchanged_contract_leaving_the_authoritative_list_revokes_nothing(
     )
     plan = _plan(tmp_path, tofu_env)
     assert plan["summary"]["remove"] == 0
+
+
+# ── What BigQuery deletes with a table comes back with it ─────────────────
+
+ROW_POLICIES = "google_bigquery_row_access_policy"
+TABLE_MEMBERS = "google_bigquery_table_iam_member"
+ANALYSTS = "group:analysts@company.example"
+
+
+def _row_filtered(**kwargs: Any) -> Dict[str, Any]:
+    """The plan contract with a row filter: the analysts read the consented rows."""
+    contract = _contract(**kwargs)
+    exposure = contract["exposes"][0]
+    exposure["binding"]["principals"][ANALYSTS] = "group:analysts@fluid-fake.test-corp.com"
+    exposure["contract"]["schema"].append({"name": "consent", "type": "boolean"})
+    exposure["policy"] = {
+        "authz": {
+            "rowFilters": [
+                {"principal": ANALYSTS, "name": "analysts_consented", "where": "consent = true"}
+            ]
+        }
+    }
+    contract["accessPolicy"]["grants"].append({"principal": ANALYSTS, "permissions": ["read"]})
+    return contract
+
+
+def _addresses(plan: Dict[str, Any], kind: str) -> List[str]:
+    return sorted(a for a in plan["changes"] if a.startswith(f"{kind}."))
+
+
+@pytest.mark.skipif(_SKIP, reason="needs `tofu` on PATH")
+def test_a_replaced_table_gets_its_row_access_policies_back(tmp_path, fake, tofu_env):
+    """BigQuery deletes a table's row access policies with the table. Before
+    ``replace_triggered_by``, tofu planned them as unchanged (their ``table_id``
+    is the same string), and the new table stood with none: every reader the
+    filter restricts read every row until the next apply."""
+    _live(_row_filtered(), tmp_path, fake, tofu_env)
+    key = (PROJECT, "sales", "orders")
+    assert sorted(fake.row_policies[key]) == ["analysts_consented", "fluid_all_rows"]
+
+    _write(_row_filtered(retention="P30D"), tmp_path, fake.endpoint)
+    plan = _plan(tmp_path, tofu_env)
+    assert _actions(plan, TABLE) == ["delete", "create"]
+    policies = _addresses(plan, ROW_POLICIES)
+    assert len(policies) == 2
+    for address in policies:
+        assert _actions(plan, address) == ["delete", "create"], address
+    # Still gated: the table's replacement loses its rows.
+    assert _data_loss_blocked(plan["summary"], allow_data_loss=False)
+
+    _apply(tmp_path, tofu_env)
+    assert sorted(fake.row_policies[key]) == ["analysts_consented", "fluid_all_rows"]
+    consented = fake.row_policies[key]["analysts_consented"]
+    assert consented["filterPredicate"] == "consent = true"
+    assert consented["grantees"] == ["group:analysts@fluid-fake.test-corp.com"]
+
+
+@pytest.mark.skipif(_SKIP, reason="needs `tofu` on PATH")
+@pytest.mark.parametrize("change", ["retention-period", "label"])
+def test_an_in_place_table_update_leaves_its_row_access_policies(tmp_path, fake, tofu_env, change):
+    """The trigger is the table's ``id``, not the table: a reference to the resource
+    fires on every update too, and a new label then replaced both policies, two
+    removals the data-loss gate refuses without --allow-data-loss."""
+    _live(_row_filtered(retention="P30D"), tmp_path, fake, tofu_env)
+    after = _row_filtered(retention="P90D" if change == "retention-period" else "P30D")
+    if change == "label":
+        after["labels"] = {"team": "sales"}
+    _write(after, tmp_path, fake.endpoint)
+    plan = _plan(tmp_path, tofu_env)
+    assert _actions(plan, TABLE) == ["update"]
+    for address in _addresses(plan, ROW_POLICIES):
+        assert _actions(plan, address) == ["no-op"], address
+    assert plan["summary"]["remove"] == 0
+    assert not _data_loss_blocked(plan["summary"], allow_data_loss=False)
+
+
+def _shared(**kwargs: Any) -> Dict[str, Any]:
+    """The plan contract in a platform-owned dataset: its grants are table IAM members."""
+    contract = _contract(**kwargs)
+    contract["packaging"] = {"mode": "shared", "pool": "sales-pool"}
+    return contract
+
+
+@pytest.mark.skipif(_SKIP, reason="needs `tofu` on PATH")
+def test_a_replaced_table_in_a_shared_dataset_gets_its_grants_back(tmp_path, fake, tofu_env):
+    """BigQuery deletes a table's IAM policy with the table, so the readers a
+    shared dataset grants at table level lost their access to the new one."""
+    fake._route(
+        "POST",
+        f"/bigquery/v2/projects/{PROJECT}/datasets",
+        {"datasetReference": {"datasetId": "sales"}, "location": "europe-west1"},
+    )
+    _live(_shared(), tmp_path, fake, tofu_env)
+    key = (PROJECT, "sales", "orders")
+    reader = "group:readers@fluid-fake.test-corp.com"
+    assert any(reader in b.get("members", []) for b in fake.table_iam[key].get("bindings", []))
+
+    _write(_shared(retention="P30D"), tmp_path, fake.endpoint)
+    plan = _plan(tmp_path, tofu_env)
+    assert _actions(plan, TABLE) == ["delete", "create"]
+    (member,) = _addresses(plan, TABLE_MEMBERS)
+    assert _actions(plan, member) == ["delete", "create"]
+
+    _apply(tmp_path, tofu_env)
+    assert any(reader in b.get("members", []) for b in fake.table_iam[key].get("bindings", []))

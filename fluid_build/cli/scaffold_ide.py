@@ -186,6 +186,13 @@ Top-level keys an agent must know:
 `--allow-data-loss` is required for `replace*` when `FLUID_ENV != dev` OR target
 has rows. Never bypass without explicit user confirmation.
 
+The `replace` rows are the native engine's. On the OpenTofu engine (aws, gcp,
+snowflake, confluent) `replace` applies the same module as `amend` behind the
+data-loss gate. A BigQuery table is never recreated to replace its rows: a
+replace or a `fluid rollback` writes them with a `WRITE_TRUNCATE_DATA` query
+job, which keeps the table's policy tags and row access policies. dbt's `table`
+materialisation still recreates the table. See `docs/apply.md`.
+
 ## Plan-binding (Terraform-style "apply consumes exact plan")
 
 `fluid plan` emits two cryptographic fields into `plan.json`:

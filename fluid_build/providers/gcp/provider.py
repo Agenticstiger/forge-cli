@@ -96,34 +96,19 @@ class GcpProvider(BaseProvider):
         }
 
     def restore_ddl(self, snapshot: Mapping[str, Any]) -> List[str]:
-        """BigQuery restore via CTAS (BigQuery has no CLONE).
+        """BigQuery has no restore DDL to record: returns ``[]``, as AWS does.
 
-        ``CREATE OR REPLACE TABLE <orig> AS SELECT * FROM <backup>``
-        is atomic. Storage cost applies (the backup is a real copy
-        of the data, not a metadata pointer).
-
-        Every component of both fully-qualified names is validated
-        before interpolation: the project component via the GCP
-        project-ID shape check, and the dataset / table components via
-        ``_sql_safety.validate_ident``. Invalid snapshot metadata yields
-        an empty DDL list rather than an unsafe statement.
+        ``fluid rollback`` restores a BigQuery table with a data-only query job
+        (``cli/rollback.py::_restore_bigquery``): ``SELECT * FROM <backup>``
+        into the live table with ``WRITE_TRUNCATE_DATA`` and ``CREATE_NEVER``,
+        which replaces the rows and keeps the table, its column policy tags and
+        its row access policies. No SQL statement does that. The recipe this
+        recorded was ``CREATE OR REPLACE TABLE <orig> AS SELECT * FROM
+        <backup>``, which drops every row access policy and every policy tag of
+        the table, and the rollback never ran the recorded ``ddl[]`` anyway: it
+        rebuilds the job from the validated ``location``.
         """
-        from .plan.planner import _validated_bq_fqn
-
-        location = snapshot.get("location") or {}
-        db = location.get("database")
-        sch = location.get("schema")
-        tbl = location.get("table")
-        backup = location.get("backup_table") or snapshot.get("backup_name")
-        if not (db and sch and tbl and backup):
-            return []
-        try:
-            orig_fqn = _validated_bq_fqn(db, sch, tbl)
-            backup_fqn = _validated_bq_fqn(db, sch, backup)
-        except ValueError as exc:
-            self.warn_kv(event="restore_ddl_invalid_identifier", error=str(exc))
-            return []
-        return [f"CREATE OR REPLACE TABLE {orig_fqn} AS SELECT * FROM {backup_fqn}"]
+        return []
 
     def cleanup_backups(self, snapshots: List[Mapping[str, Any]]) -> None:
         """Drop BigQuery backup tables (best-effort)."""
@@ -167,10 +152,13 @@ class GcpProvider(BaseProvider):
         - IAM policy bindings
 
         The optional ``mode`` argument carries the apply-time mode.
-        For destructive modes (``replace`` / ``replace-and-build``)
-        the BigQuery actions emit ``CREATE OR REPLACE TABLE … AS SELECT``
-        instead of additive ``INSERT INTO``, with a pre-flight backup
-        CTAS for rollback.
+        For destructive modes (``replace`` / ``replace-and-build``) a SQL
+        build replaces only its target's rows (the SELECT, a structured
+        destination and ``WRITE_TRUNCATE_DATA``) instead of the additive
+        ``INSERT INTO``, the table definition stays planned, and a
+        pre-flight ``CREATE SNAPSHOT TABLE`` backs each table up for
+        rollback. Nothing recreates the table, so its policy tags and row
+        access policies are kept.
         """
         self.debug_kv(
             event="plan_started",

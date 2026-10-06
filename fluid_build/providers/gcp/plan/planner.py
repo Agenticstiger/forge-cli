@@ -44,8 +44,9 @@ def _validate_bq_project(project: str) -> str:
 
     Returns the project ID unchanged when valid; raises ``ValueError``
     otherwise. ``project`` flows into a backtick-quoted BigQuery FQN in
-    CTAS / INSERT DDL — backticked or not, an unvetted value is an
-    injection vector, so the project component is allowlisted by shape.
+    snapshot / INSERT / SELECT statements — backticked or not, an unvetted
+    value is an injection vector, so the project component is allowlisted
+    by shape.
     """
     if not isinstance(project, str) or not _GCP_PROJECT_RE.match(project):
         raise ValueError(f"Invalid GCP project ID: {project!r}")
@@ -130,24 +131,27 @@ def plan_actions(
     Generate GCP actions from FLUID contract.
 
     Back-compat shim — constructs a :class:`GcpPlanner` and calls
-    :meth:`GcpPlanner.plan`. The 6-phase ordering, destructive-mode
-    handling, and CTAS backup emission live in
+    :meth:`GcpPlanner.plan`. The 6-phase ordering and destructive-mode
+    routing live in
     :class:`fluid_build.providers._planner_base.BasePlanner` so the
     GCP provider stays in lockstep with Snowflake / AWS.
 
     Phase order (set by ``BasePlanner.plan``):
     1. Infrastructure — datasets and buckets.
     2. IAM — service-account bindings, custom roles.
-    3. Replace snapshots — pre-flight CTAS per bigquery_table
-       (destructive modes only).
+    3. Replace snapshots — pre-flight ``CREATE SNAPSHOT TABLE`` per
+       bigquery_table (destructive modes only).
     4. Expose — tables, APIs, streams.
     5. Build — dbt / Dataform / SQL transforms.
     6. Schedule — Composer DAGs / Cloud Scheduler.
 
-    For destructive modes (``replace`` / ``replace-and-build``),
-    SQL builds emit ``CREATE OR REPLACE TABLE … AS SELECT`` (BigQuery's
-    atomic replace) and a pre-flight CTAS backup is emitted per
-    ``bigquery_table`` expose for rollback.
+    For destructive modes (``replace`` / ``replace-and-build``), a SQL
+    build replaces only its target's rows: the action carries the SELECT,
+    a structured ``destination`` and ``WRITE_TRUNCATE_DATA`` /
+    ``CREATE_NEVER`` for a query job, never ``CREATE OR REPLACE TABLE``,
+    which drops the table's row access policies and policy tags. The
+    table stays planned (``bq.ensure_table``), and a zero-copy snapshot
+    of each ``bigquery_table`` expose is taken first for rollback.
 
     Args:
         contract: FLUID contract specification
@@ -391,8 +395,9 @@ def _plan_build_transformations(
 
     Sets up dbt, Dataform, or other transformation engines. When
     ``is_destructive`` is True, the action is stamped with
-    ``mode="replace"`` so the dbt executor adds ``--full-refresh``
-    and SQL transforms emit ``CREATE OR REPLACE TABLE … AS SELECT``.
+    ``mode="replace"`` so the dbt executor adds ``--full-refresh``,
+    and a SQL transform into a BigQuery table replaces that table's rows
+    (:func:`_bq_build_for_target`), keeping the table and its governance.
     """
     actions = []
     apply_mode = "replace" if is_destructive else "amend"
@@ -419,9 +424,10 @@ def _plan_build_transformations(
     # Inline-SQL build path (mirrors the Snowflake planner's
     # ``_plan_build`` SQL emission). For each ``builds[]`` entry with
     # ``properties.sql`` AND outputs targeting a ``bigquery_table``
-    # expose, emit ``bq.sql.execute`` actions wrapping the SQL into
-    # INSERT INTO (additive) or CREATE OR REPLACE TABLE … AS SELECT
-    # (destructive). Multi-output builds emit one action per output.
+    # expose, emit ``bq.sql.execute`` actions that write the SQL into it:
+    # INSERT INTO (additive), or the SELECT as a query job that replaces
+    # the table's rows (destructive). Multi-output builds emit one action
+    # per output.
     for build_idx, build_entry in enumerate(contract.get("builds", []) or []):
         if not isinstance(build_entry, Mapping):
             continue
@@ -436,8 +442,8 @@ def _plan_build_transformations(
             outputs = [None]
         build_id = build_entry.get("id", f"build_{build_idx}")
         for out_id in outputs:
-            wrapped = (
-                _bq_wrap_sql_for_target(
+            statement = (
+                _bq_build_for_target(
                     sql_text=sql_text,
                     contract=contract,
                     target_output_id=out_id,
@@ -445,7 +451,7 @@ def _plan_build_transformations(
                     is_destructive=is_destructive,
                 )
                 if out_id
-                else sql_text
+                else {"sql": sql_text}
             )
             action_id = build_id if len(outputs) == 1 else f"{build_id}__{out_id}"
             actions.append(
@@ -454,7 +460,7 @@ def _plan_build_transformations(
                     "op": "bq.sql.execute",
                     "phase": "build",
                     "project": project,
-                    "sql": wrapped,
+                    **statement,
                     "mode": apply_mode,
                     "comment": build_entry.get("description") or build_entry.get("name"),
                 }
@@ -465,21 +471,11 @@ def _plan_build_transformations(
     return actions
 
 
-def _bq_wrap_sql_for_target(
-    *,
-    sql_text: str,
-    contract: Mapping[str, Any],
-    target_output_id: str,
-    default_project: str,
-    is_destructive: bool,
-) -> str:
-    """Wrap a build's SQL with INSERT or CTAS for a BigQuery target.
-
-    Mirrors :func:`fluid_build.providers.snowflake.plan.planner._wrap_sql_for_target`
-    using BigQuery's backtick-quoted identifier syntax. Pass-through
-    when the target expose isn't a ``bigquery_table`` binding or when
-    the SQL already declares its own sink (INSERT/CREATE/MERGE/etc).
-    """
+def _bq_build_target(
+    contract: Mapping[str, Any], target_output_id: str, default_project: str
+) -> Optional[tuple]:
+    """``(project, dataset, table)`` of the ``bigquery_table`` expose a build output
+    names, or None when it names none (or one without a dataset)."""
     target_expose = next(
         (
             ex
@@ -490,29 +486,88 @@ def _bq_wrap_sql_for_target(
         None,
     )
     if target_expose is None:
-        return sql_text
+        return None
     binding = target_expose.get("binding") or {}
     if (binding.get("format") or "").lower() not in (
         "bigquery_table",
         "bigquery-table",
     ):
-        return sql_text
+        return None
     location = binding.get("location") or {}
     proj = location.get("project") or default_project
     dataset = location.get("dataset") or location.get("schema")
     table = location.get("table") or target_output_id
     if not (proj and dataset and table):
-        return sql_text
+        return None
+    return proj, dataset, table
+
+
+#: How a destructive SQL build writes its BigQuery target: a query job that
+#: replaces the rows of the table ``tofu apply`` owns, never creates one
+#: (``build_runners/_bigquery_load.py`` loads with the same two).
+_REPLACE_ROWS_DISPOSITIONS = {
+    "write_disposition": "WRITE_TRUNCATE_DATA",
+    "create_disposition": "CREATE_NEVER",
+}
+
+
+def _bq_build_for_target(
+    *,
+    sql_text: str,
+    contract: Mapping[str, Any],
+    target_output_id: str,
+    default_project: str,
+    is_destructive: bool,
+) -> Dict[str, Any]:
+    """The action fields that write a build's SQL into its BigQuery target.
+
+    Additive: ``{"sql": "INSERT INTO <fqn> <body>"}``. Destructive: the SELECT
+    itself, the target as a structured ``destination`` (``project``,
+    ``dataset``, ``table``, each validated) and the query job's
+    ``WRITE_TRUNCATE_DATA`` / ``CREATE_NEVER``. BigQuery then replaces the
+    rows of the existing table and keeps the table: it "overwrites the data,
+    but keeps the constraints and schema of the existing table" (REST
+    reference, ``JobConfigurationQuery.writeDisposition``), so the schema's
+    policy tags stay, and the row access policies, which ``CREATE OR REPLACE
+    TABLE … AS SELECT`` (what this emitted) drops, are not touched. That is
+    the dlt BigQuery destination's atomic replace, extended from a load job to
+    a query job; the table and its governance stay the IaC's.
+
+    Mirrors :func:`fluid_build.providers.snowflake.plan.planner._wrap_sql_for_target`
+    using BigQuery's backtick-quoted identifier syntax. Pass-through
+    (``{"sql": sql_text}``, untouched) when the target expose isn't a
+    ``bigquery_table`` binding or when the SQL already declares its own sink
+    (INSERT/CREATE/MERGE/etc).
+    """
+    target = _bq_build_target(contract, target_output_id, default_project)
+    if target is None:
+        return {"sql": sql_text}
+    proj, dataset, table = target
     upper_head = sql_text.lstrip().upper()[:32]
     for kw in ("INSERT", "CREATE", "MERGE", "UPDATE", "DELETE", "COPY", "TRUNCATE"):
         if upper_head.startswith(kw):
-            return sql_text
+            return {"sql": sql_text}
     body = sql_text.rstrip().rstrip(";")
-    # Validate every component of the FQN before it lands in DDL/DML.
+    # Validate every component of the FQN before it lands in DML or in the
+    # destination a query job is given.
     fqn = _validated_bq_fqn(proj, dataset, table)
     if is_destructive:
-        return f"CREATE OR REPLACE TABLE {fqn} AS\n{body}"
-    return f"INSERT INTO {fqn}\n{body}"
+        return {
+            "sql": body,
+            "destination": {"project": proj, "dataset": dataset, "table": table},
+            **_REPLACE_ROWS_DISPOSITIONS,
+        }
+    return {"sql": f"INSERT INTO {fqn}\n{body}"}
+
+
+#: How long a pre-replace table snapshot is kept. The copy it replaces had no
+#: expiry and was deleted only when the rollback state pruned it
+#: (``cli/_rollback_writer.py``, the last 20 per env and product); a snapshot
+#: is a table to ``GcpProvider.cleanup_backups`` too, so the pruning still
+#: deletes it, and the expiry bounds one the pruning never reaches. There is no
+#: GCP setting for it; thirty days is the backup retention the Snowflake
+#: provider's configuration defaults to (``BackupConfig.backup_retention``).
+_SNAPSHOT_RETENTION_DAYS = 30
 
 
 def _plan_replace_snapshots(
@@ -521,23 +576,25 @@ def _plan_replace_snapshots(
     region: str,
     logger: logging.Logger,
 ) -> List[Dict[str, Any]]:
-    """Pre-flight CTAS backups for ``--mode replace`` against BigQuery.
+    """Pre-flight table snapshots for ``--mode replace`` against BigQuery.
 
     For each ``bigquery_table`` expose, emit an action that runs
-    ``CREATE TABLE IF NOT EXISTS <backup> AS SELECT * FROM <orig>``
-    BEFORE the destructive replace fires. BigQuery has no CLONE so the
-    backup is a real copy (storage cost applies); the
-    ``IF NOT EXISTS`` guard keeps re-runs idempotent.
+    ``CREATE SNAPSHOT TABLE IF NOT EXISTS <backup> CLONE <orig>
+    OPTIONS(expiration_timestamp = ...)`` BEFORE the destructive replace
+    fires: BigQuery's zero-copy, read-only backup, billed only for the data
+    that later changes in the base table ("Introduction to table
+    snapshots"). It was ``CREATE TABLE … AS SELECT * FROM <orig>``, a full
+    copy with no row access policy and no policy tag, readable in full by
+    every reader of the dataset, justified here by "BigQuery has no CLONE"
+    (it has). It expires after :data:`_SNAPSHOT_RETENTION_DAYS`, or when
+    the rollback-state pruning drops it; ``fluid rollback`` restores from
+    it with a data-only query job. ``IF NOT EXISTS`` keeps re-runs
+    idempotent.
 
-    The action carries a ``rollback_snapshot`` marker so apply.py's
-    ``_rollback_writer`` can record the snapshot in
-    ``.fluid/rollback-state.json`` for ``fluid rollback``.
-
-    Skips exposes whose source table doesn't exist yet (first-run
-    replace) — the IF NOT EXISTS gate also covers the pre-existence
-    case but BigQuery raises if the SOURCE is absent. The backup
-    action is marked ``allow_failure: True`` so a missing source on
-    first-run replace soft-skips rather than aborting the plan.
+    The ``rollback_snapshot`` marker lets ``_rollback_writer`` record the
+    snapshot in ``.fluid/rollback-state.json``. BigQuery raises when the
+    SOURCE does not exist yet (first-run replace), so the action is
+    ``allow_failure: True`` and soft-skips rather than aborting the plan.
     """
     import time as _time
 
@@ -560,10 +617,14 @@ def _plan_replace_snapshots(
             continue
         backup = f"BACKUP_{table}_{backup_ts}"
         # Validate every FQN component (project shape + dataset/table
-        # identifiers) before the CTAS backup statement is emitted.
+        # identifiers) before the snapshot statement is emitted.
         backup_fqn = _validated_bq_fqn(proj, dataset, backup)
         source_fqn = _validated_bq_fqn(proj, dataset, table)
-        sql = f"CREATE TABLE IF NOT EXISTS {backup_fqn} AS SELECT * FROM {source_fqn}"
+        sql = (
+            f"CREATE SNAPSHOT TABLE IF NOT EXISTS {backup_fqn} CLONE {source_fqn} "
+            "OPTIONS(expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), "
+            f"INTERVAL {_SNAPSHOT_RETENTION_DAYS} DAY))"
+        )
         actions.append(
             {
                 "id": f"snapshot_{expose.get('exposeId')}",
@@ -601,33 +662,17 @@ def _plan_exposures(
     """
     Plan data product exposure actions.
 
-    Creates tables, views, APIs, streams, etc. When ``is_destructive``
-    is True and the expose is a target of a SQL build (listed in
-    ``builds[].outputs``), the ensure_table step is skipped because
-    the build's CREATE OR REPLACE TABLE handles materialisation.
+    Creates tables, views, APIs, streams, etc. ``is_destructive`` changes
+    nothing here: a destructive SQL build replaces only its target's rows
+    (:func:`_bq_build_for_target`), so the table, with the policy tags in
+    its schema, stays planned in every mode. It used to be skipped for a
+    SQL-build target, left to a ``CREATE OR REPLACE TABLE`` that dropped
+    the table's governance.
     """
     actions = []
-    # Build the set of expose ids targeted by SQL builds; their
-    # ensure_table is skipped under destructive modes.
-    sql_build_targets: set = set()
-    if is_destructive:
-        for build_entry in contract.get("builds", []) or []:
-            if not isinstance(build_entry, Mapping):
-                continue
-            outputs = build_entry.get("outputs") or []
-            if outputs and (
-                build_entry.get("sql") or (build_entry.get("properties") or {}).get("sql")
-            ):
-                sql_build_targets.update(outputs)
-
     for exposure in contract.get("exposes", []):
         exposure_id = exposure.get("id") or exposure.get("exposeId")
         exposure.get("type") or exposure.get("kind")
-
-        # Skip ensure_table for destructive-mode SQL-build targets —
-        # CREATE OR REPLACE TABLE in the build phase materialises them.
-        if is_destructive and exposure_id in sql_build_targets:
-            continue
 
         # Support both old and new structures
         location = exposure.get("location", {})

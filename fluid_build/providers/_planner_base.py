@@ -19,14 +19,19 @@ the same 6-phase ordering:
 
 1. **Infrastructure** — datasets / databases / schemas / buckets.
 2. **IAM** — roles, grants, masking + row-access policies.
-3. **Replace snapshots** — pre-flight backups (CLONE / CTAS / S3 copy)
-   emitted only for destructive modes (``replace`` / ``replace-and-build``).
+3. **Replace snapshots** — pre-flight backups (Snowflake CLONE, BigQuery
+   table snapshot, S3 copy) emitted only for destructive modes
+   (``replace`` / ``replace-and-build``).
 4. **Expose** — the actual data products (tables / views / streams)
    the contract publishes. Runs BEFORE build so SQL transforms have
-   their target table to write into (additive ``INSERT INTO`` mode).
+   their target table to write into.
 5. **Build** — transformations: dbt / Dataform / SQL / stored procedures /
-   tasks / UDFs. Destructive mode emits ``CREATE OR REPLACE TABLE …
-   AS SELECT``; additive emits ``INSERT INTO``.
+   tasks / UDFs. Additive mode emits ``INSERT INTO``. Destructive mode
+   replaces the target's rows, each provider its own way: Snowflake emits
+   ``CREATE OR REPLACE TABLE … AS SELECT``; GCP emits the SELECT as a
+   ``WRITE_TRUNCATE_DATA`` query job into the existing table, because
+   recreating a BigQuery table drops its row access policies and policy
+   tags.
 6. **Schedule** — task orchestration, pipes, Cloud Scheduler / Composer.
 
 Before this module the scaffold lived as a copy-pasted ``plan_actions``
@@ -114,8 +119,9 @@ class BasePlanner:
 
         Phase 3 (replace_snapshots) is skipped for additive modes.
         Phases 4 (expose) + 5 (build) receive the ``is_destructive``
-        flag so they can route between ``CREATE OR REPLACE TABLE …
-        AS SELECT`` (destructive) and ``INSERT INTO`` (additive).
+        flag so they can route between a replace of the target's rows
+        (destructive; see the module docstring for each provider's) and
+        ``INSERT INTO`` (additive).
         """
         is_destructive = is_destructive_mode(mode)
         actions: List[Dict[str, Any]] = []
@@ -157,8 +163,9 @@ class BasePlanner:
     ) -> List[Dict[str, Any]]:
         """Phase 4 — exposed data products (tables, views, streams).
 
-        ``is_destructive=True`` typically suppresses the ensure_table
-        action because Phase 5's CREATE OR REPLACE handles materialisation.
+        ``is_destructive=True`` lets a provider whose Phase 5 recreates the
+        table (Snowflake's ``CREATE OR REPLACE``) skip its ensure_table. One
+        that replaces only the rows (GCP) keeps the table planned.
         """
         return []
 
@@ -170,8 +177,9 @@ class BasePlanner:
     ) -> List[Dict[str, Any]]:
         """Phase 5 — SQL transformations (dbt / Dataform / stored procs).
 
-        ``is_destructive=True`` switches from ``INSERT INTO`` to
-        ``CREATE OR REPLACE TABLE … AS SELECT``.
+        ``is_destructive=True`` switches from ``INSERT INTO`` to a replace
+        of the target's rows (Snowflake: ``CREATE OR REPLACE TABLE … AS
+        SELECT``; GCP: a ``WRITE_TRUNCATE_DATA`` query job).
         """
         return []
 

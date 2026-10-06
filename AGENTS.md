@@ -51,6 +51,8 @@ Every contract is delivered through an 11-stage pipeline. Each stage is a hard g
 
 `--allow-data-loss` is required for `replace*` when `FLUID_ENV != dev` OR target has rows. `--no-verify-plan-binding` is an emergency DR waiver for plan-binding checks (logged at WARNING level so audit trails catch it).
 
+The `replace` rows describe the native engine. On the OpenTofu engine (aws, gcp, snowflake, confluent) `replace` emits the same module as `amend` and adds the data-loss gate; a table is replaced only where `tofu` plans it, and on GCP its row access policies and table grants are recreated with it (`replace_triggered_by`). A BigQuery table is never recreated to replace its rows: the planner's replace and `fluid rollback` run a `WRITE_TRUNCATE_DATA` query job into the existing table (a `CREATE OR REPLACE TABLE` drops its row access policies and policy tags), and the pre-replace backup is a `CREATE SNAPSHOT TABLE … CLONE`. dbt's `table` materialisation still recreates a governed table (known gap; `docs/governance-parity.md`). See `docs/apply.md`.
+
 ### Plan-Binding (Terraform-Style "Apply Consumes Exact Plan")
 
 Stage 6 `fluid plan` emits two cryptographic fields in `plan.json`:

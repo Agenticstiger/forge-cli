@@ -1029,6 +1029,29 @@ def _emit_policy_tags(
     return refs
 
 
+def _replaced_with_table(tbl_name: str) -> Dict[str, Any]:
+    """The ``lifecycle`` of a resource BigQuery deletes with the table ``tbl_name``.
+
+    Deleting a table deletes its row access policies and its IAM policy (BigQuery's
+    row-level security introduction says so for the policies), and the table that
+    replaces it starts with neither. ``tofu`` cannot see that in the same apply: the
+    policy's ``table_id`` is the same string before and after, so it planned the
+    policy as unchanged and the new table stood ungoverned until the next apply.
+    ``replace_triggered_by`` recreates it with the table.
+
+    It names the table's ``id``, not the table: a reference to the resource also
+    fires on every in-place update, so a new label replaced every row access policy
+    of the table, removals the data-loss gate refuses without ``--allow-data-loss``.
+    The ``id`` keeps its value through an update and is unknown in the plan only
+    when a new table is created, which is exactly a replacement. (``creation_time``
+    would say the same, but ``tofu validate`` checks a ``replace_triggered_by``
+    attribute against the schema of the resource that carries it, and a table IAM
+    member has no ``creation_time``.) Measured with ``tofu`` 1.12 and
+    terraform-provider-google 6.50 against ``tests/iac/_fake_bigquery.py``.
+    """
+    return {"replace_triggered_by": [f"google_bigquery_table.{tbl_name}.id"]}
+
+
 def _emit_row_policies(
     resources: Dict[str, Any],
     policies: Sequence[_gov.RowPolicy],
@@ -1036,7 +1059,10 @@ def _emit_row_policies(
     tbl_name: str,
     project: Optional[str],
 ) -> None:
-    """A ``google_bigquery_row_access_policy`` per row policy of the table."""
+    """A ``google_bigquery_row_access_policy`` per row policy of the table.
+
+    Each is recreated when the table is (:func:`_replaced_with_table`).
+    """
     for policy in policies:
         row: Dict[str, Any] = {
             "dataset_id": ds_ref,
@@ -1044,6 +1070,7 @@ def _emit_row_policies(
             "policy_id": policy.policy_id,
             "filter_predicate": policy.predicate,
             "grantees": list(policy.grantees),
+            "lifecycle": _replaced_with_table(tbl_name),
         }
         if project:
             row["project"] = project
@@ -1218,6 +1245,8 @@ def _emit_bigquery(
                 "table_id": tofu_ref(f"google_bigquery_table.{tbl_name}.table_id"),
                 "role": role,
                 "member": member,
+                # BigQuery deletes a table's IAM policy with the table.
+                "lifecycle": _replaced_with_table(tbl_name),
             }
 
     # Cross-project access needs no new schema fields: declare the consumer
@@ -1810,26 +1839,56 @@ def _emit_planned_subscription(
     ] = body
 
 
+def _module_table(
+    resources: Mapping[str, Any], cid: str, dataset: Any, table: Any
+) -> Optional[str]:
+    """The name of this module's ``google_bigquery_table`` for ``dataset.table``, if any.
+
+    Derived the way :func:`_emit_bigquery` names the table and its dataset, and
+    checked against what it wrote, so a planned grant on another product's table
+    is never tied to this one.
+    """
+    name = safe_ident(f"{cid}_{table}")
+    body = (resources.get("google_bigquery_table") or {}).get(name)
+    if not body or body.get("table_id") != table:
+        return None
+    ds_name = safe_ident(f"{cid}_{dataset}")
+    if body.get("dataset_id") == tofu_ref(f"data.google_bigquery_dataset.{ds_name}.dataset_id"):
+        return name
+    owned = (resources.get("google_bigquery_dataset") or {}).get(ds_name) or {}
+    if (
+        body.get("dataset_id") == tofu_ref(f"google_bigquery_dataset.{ds_name}.dataset_id")
+        and owned.get("dataset_id") == dataset
+    ):
+        return name
+    return None
+
+
 def _emit_bq_table_iam(resources: Dict[str, Any], action: Mapping[str, Any], cid: str) -> None:
     """``iam.bind_bq_table`` → ``google_bigquery_table_iam_member`` (table-scoped IAM).
 
     Dataset-level IAM is folded into the dataset ``access`` block by the
-    ``exposes[]`` walk; this adds the finer table-level grants.
+    ``exposes[]`` walk; this adds the finer table-level grants. A grant on a
+    table this module declares is recreated with it (:func:`_replaced_with_table`).
     """
     dataset = action.get("dataset")
     table = action.get("table")
     if not (dataset and table):
         return
+    tbl_name = _module_table(resources, cid, dataset, table)
     action_grants = grants_from_legacy_policies(action.get("policies"))
     for role, grant in role_grants(action_grants, _BQ_TABLE_IAM_ROLES):
         member = _gcs_member(grant)
         name = safe_ident(f"{cid}_{dataset}_{table}_{role}_{member}")
-        resources.setdefault("google_bigquery_table_iam_member", {})[name] = {
+        body: Dict[str, Any] = {
             "dataset_id": dataset,
             "table_id": table,
             "role": role,
             "member": member,
         }
+        if tbl_name is not None:
+            body["lifecycle"] = _replaced_with_table(tbl_name)
+        resources.setdefault("google_bigquery_table_iam_member", {})[name] = body
 
 
 def _emit_composer_dag(resources: Dict[str, Any], action: Mapping[str, Any], cid: str) -> None:

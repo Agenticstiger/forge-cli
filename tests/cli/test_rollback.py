@@ -509,10 +509,11 @@ def _bq_snap(*, provider="bigquery", backup_name="subscriber360_bak_1", **loc_ov
     """Build a canonical BigQuery rollback snapshot.
 
     Mirrors what providers/gcp/plan/planner.py emits: location carries the
-    project/dataset/table/backup_table, and ``ddl[]`` is the pre-baked CTAS
-    restore statement (``CREATE OR REPLACE TABLE <orig> AS SELECT * FROM
-    <backup>``). ``provider`` defaults to "bigquery" but a REAL apply records
-    "gcp" (GcpProvider.name) — pass provider="gcp" to exercise the dispatch.
+    project/dataset/table/backup_table. ``ddl[]`` is what an older forge-cli
+    recorded (``CREATE OR REPLACE TABLE <orig> AS SELECT * FROM <backup>``);
+    the restore never runs it. ``provider`` defaults to "bigquery" but a REAL
+    apply records "gcp" (GcpProvider.name) — pass provider="gcp" to exercise
+    the dispatch.
     """
     location = {
         "database": "myproj",
@@ -537,14 +538,58 @@ def _bq_snap(*, provider="bigquery", backup_name="subscriber360_bak_1", **loc_ov
     }
 
 
+_BQ_RESTORE_QUERY = "SELECT * FROM `myproj.telco.subscriber360_bak_1`"
+
+
+def _mock_bigquery(*, rows=3, readable=3):
+    """A ``google.cloud.bigquery`` stand-in injected through ``sys.modules``.
+
+    The backup holds ``rows`` rows (``Table.num_rows``, which no row access
+    policy filters) and its ``COUNT(*)`` reads ``readable`` of them. Hermetic
+    whether or not google-cloud-bigquery is installed.
+    """
+    mock_bq = MagicMock()
+    mock_client = MagicMock()
+    mock_bq.Client.return_value = mock_client
+    mock_client.get_table.return_value.num_rows = rows
+
+    def query(sql, **_kwargs):
+        job = MagicMock()
+        job.job_id = "job_restore"
+        job.result.return_value = [{"f0_": readable}] if "COUNT(*)" in sql else []
+        return job
+
+    mock_client.query.side_effect = query
+    google_cloud_mod = MagicMock()
+    google_cloud_mod.bigquery = mock_bq
+    modules = {
+        "google": MagicMock(),
+        "google.cloud": google_cloud_mod,
+        "google.cloud.bigquery": mock_bq,
+    }
+    return patch.dict(sys.modules, modules), mock_bq, mock_client
+
+
+@pytest.fixture
+def _no_emulator(monkeypatch):
+    monkeypatch.delenv("BIGQUERY_EMULATOR_HOST", raising=False)
+
+
+@pytest.mark.usefixtures("_no_emulator")
 class TestRestoreBigQuery:
-    def test_dry_run_returns_ddl_without_client(self):
-        """Dry-run returns the baked CTAS DDL and never constructs a client."""
-        result = rollback._restore_bigquery(_bq_snap(), dry_run=True)
+    def test_dry_run_returns_the_query_job_without_client(self):
+        """Dry-run returns the data-only restore and never constructs a client."""
+        modules, mock_bq, _ = _mock_bigquery()
+        with modules:
+            result = rollback._restore_bigquery(_bq_snap(), dry_run=True)
+        mock_bq.Client.assert_not_called()
         assert result["status"] == "dry_run"
         assert result["provider"] == "bigquery"
-        assert "CREATE OR REPLACE TABLE" in result["ddl"]
-        assert _bq_snap()["backup_name"] in result["ddl"]
+        assert result["ddl"] == _BQ_RESTORE_QUERY
+        assert result["destination"] == "`myproj.telco.subscriber360`"
+        assert result["write_disposition"] == "WRITE_TRUNCATE_DATA"
+        assert result["create_disposition"] == "CREATE_NEVER"
+        assert "CREATE OR REPLACE" not in json.dumps(result)
 
     def test_missing_project_raises(self):
         snap = _bq_snap()
@@ -562,80 +607,119 @@ class TestRestoreBigQuery:
             rollback._restore_bigquery(snap, dry_run=False)
 
     def test_missing_ddl_is_ignored_and_reconstructed(self):
-        """SECURITY: the baked ddl[] is no longer trusted. A snapshot without
-        it still restores, because the CTAS is reconstructed from the
-        validated location identifiers."""
+        """SECURITY: the baked ddl[] is not trusted. A snapshot without it still
+        restores, because the query is rebuilt from the validated location."""
         snap = _bq_snap()
         snap.pop("ddl")
         result = rollback._restore_bigquery(snap, dry_run=True)
         assert result["status"] == "dry_run"
-        assert "CREATE OR REPLACE TABLE" in result["ddl"]
-        assert "AS SELECT * FROM" in result["ddl"]
+        assert result["ddl"] == _BQ_RESTORE_QUERY
 
     def test_malicious_ddl_is_not_executed(self):
         """SECURITY (regression for the verbatim-ddl[]-replay finding): a
         tampered ddl[] with a benign location must NOT execute the attacker's
-        SQL — only the safe CTAS rebuilt from validated identifiers runs."""
+        SQL — only the restore rebuilt from validated identifiers runs."""
         snap = _bq_snap()
         snap["ddl"] = [
             "DROP TABLE `myproj.prod.billing`",
             "DELETE FROM `myproj.prod.users`",
         ]
-        mock_bq = MagicMock()
-        mock_client = MagicMock()
-        mock_bq.Client.return_value = mock_client
-        google_cloud_mod = MagicMock()
-        google_cloud_mod.bigquery = mock_bq
-        with patch.dict(
-            sys.modules,
-            {
-                "google": MagicMock(),
-                "google.cloud": google_cloud_mod,
-                "google.cloud.bigquery": mock_bq,
-            },
-        ):
+        modules, _, mock_client = _mock_bigquery()
+        with modules:
             result = rollback._restore_bigquery(snap, dry_run=False)
         assert result["status"] == "restored"
         executed = [c.args[0] for c in mock_client.query.call_args_list]
-        assert len(executed) == 1
-        assert executed[0].startswith("CREATE OR REPLACE TABLE")
-        assert "AS SELECT * FROM" in executed[0]
+        assert executed == [
+            "SELECT COUNT(*) FROM `myproj`.`telco`.`subscriber360_bak_1`",
+            _BQ_RESTORE_QUERY,
+        ]
         assert all("DROP" not in s and "DELETE" not in s for s in executed)
 
-    def test_invalid_identifier_refused(self):
-        """The state file is attacker-authorable; a tampered dataset with
-        SQL metacharacters must be refused before any DDL executes."""
-        snap = _bq_snap(schema="ds; DROP TABLE x")
-        with pytest.raises(CLIError, match="rollback_bigquery_invalid_identifier"):
-            rollback._restore_bigquery(snap, dry_run=False)
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("schema", "ds; DROP TABLE x"),
+            ("table", "t` ; DROP TABLE x; --"),
+            ("backup_table", "b`; GRANT ALL"),
+            ("database", "Proj With Spaces"),
+        ],
+    )
+    def test_invalid_identifier_refused_before_any_client(self, field, value):
+        """The state file is attacker-authorable; a tampered location value with
+        SQL metacharacters is refused before a client exists or a job runs."""
+        modules, mock_bq, mock_client = _mock_bigquery()
+        with modules:
+            with pytest.raises(CLIError, match="rollback_bigquery_invalid_identifier"):
+                rollback._restore_bigquery(_bq_snap(**{field: value}), dry_run=False)
+        mock_bq.Client.assert_not_called()
+        mock_client.query.assert_not_called()
 
-    def test_live_restore_invokes_client(self):
-        """Non-dry-run constructs bigquery.Client(project=...) and runs each
-        baked statement through it. The SDK is injected via sys.modules so the
-        test is hermetic regardless of whether google-cloud-bigquery is installed.
-        """
-        snap = _bq_snap()
-        mock_bq = MagicMock()
-        mock_client = MagicMock()
-        mock_bq.Client.return_value = mock_client
-        google_cloud_mod = MagicMock()
-        google_cloud_mod.bigquery = mock_bq
-        with patch.dict(
-            sys.modules,
-            {
-                "google": MagicMock(),
-                "google.cloud": google_cloud_mod,
-                "google.cloud.bigquery": mock_bq,
-            },
-        ):
-            result = rollback._restore_bigquery(snap, dry_run=False)
+    def test_live_restore_replaces_the_rows_and_keeps_the_table(self):
+        """One query job into the live table, ``WRITE_TRUNCATE_DATA`` and
+        ``CREATE_NEVER``: never ``CREATE OR REPLACE TABLE``, which BigQuery
+        documents drops every row access policy (and whose SELECT schema has
+        no policy tags). The destination is a TableReference, not SQL."""
+        modules, mock_bq, mock_client = _mock_bigquery()
+        with modules:
+            result = rollback._restore_bigquery(_bq_snap(), dry_run=False)
         assert result["status"] == "restored"
         assert result["provider"] == "bigquery"
+        assert result["provider_result"] == {"status": "ok", "job_id": "job_restore", "rows": 3}
         mock_bq.Client.assert_called_once_with(project="myproj")
-        assert mock_client.query.call_count == 1
-        executed = mock_client.query.call_args_list[0].args[0]
-        assert executed.startswith("CREATE OR REPLACE TABLE")
-        assert "AS SELECT * FROM" in executed
+        mock_bq.DatasetReference.assert_called_once_with("myproj", "telco")
+        dataset_ref = mock_bq.DatasetReference.return_value
+        assert mock_bq.TableReference.call_args_list[-1].args == (dataset_ref, "subscriber360")
+        mock_bq.QueryJobConfig.assert_called_once_with(
+            destination=mock_bq.TableReference.return_value,
+            write_disposition="WRITE_TRUNCATE_DATA",
+            create_disposition="CREATE_NEVER",
+        )
+        restore = mock_client.query.call_args_list[-1]
+        assert restore.args == (_BQ_RESTORE_QUERY,)
+        assert restore.kwargs == {"job_config": mock_bq.QueryJobConfig.return_value}
+        assert not any(
+            "CREATE OR REPLACE" in c.args[0].upper() for c in mock_client.query.call_args_list
+        )
+
+    def test_a_backup_the_identity_reads_only_partly_is_refused(self):
+        """A row access policy on the backup (BigQuery supports row-level security
+        on table snapshots) shows the restoring identity some rows: ``WRITE_TRUNCATE_DATA``
+        would replace the table with them. Refused before anything is written."""
+        modules, _, mock_client = _mock_bigquery(rows=3, readable=2)
+        with modules:
+            with pytest.raises(CLIError, match="rollback_bigquery_backup_filtered") as raised:
+                rollback._restore_bigquery(_bq_snap(), dry_run=False)
+        assert raised.value.context["rows"] == 3
+        assert raised.value.context["readable"] == 2
+        executed = [c.args[0] for c in mock_client.query.call_args_list]
+        assert executed == ["SELECT COUNT(*) FROM `myproj`.`telco`.`subscriber360_bak_1`"]
+
+    def test_a_backup_with_no_row_count_is_refused(self):
+        """Fail closed: without the backup's own count, a filtered read cannot be told
+        from a whole one."""
+        modules, _, mock_client = _mock_bigquery(rows=None, readable=3)
+        with modules:
+            with pytest.raises(CLIError, match="rollback_bigquery_backup_filtered"):
+                rollback._restore_bigquery(_bq_snap(), dry_run=False)
+        assert len(mock_client.query.call_args_list) == 1
+
+    def test_on_an_emulator_the_restore_truncates_with_no_credentials(self, monkeypatch):
+        """goccy/bigquery-emulator appends for a disposition it does not know and
+        has no row access policy to keep: ``WRITE_TRUNCATE``, anonymous
+        credentials, and no row count (it reports none to compare)."""
+        from fluid_build.build_runners import _bigquery_load
+
+        monkeypatch.setenv("BIGQUERY_EMULATOR_HOST", "http://localhost:9050")
+        anonymous = object()
+        monkeypatch.setattr(_bigquery_load, "_anonymous_credentials", lambda: anonymous)
+        modules, mock_bq, mock_client = _mock_bigquery()
+        with modules:
+            result = rollback._restore_bigquery(_bq_snap(), dry_run=False)
+        assert result["write_disposition"] == "WRITE_TRUNCATE"
+        assert result["provider_result"]["rows"] is None
+        mock_bq.Client.assert_called_once_with(project="myproj", credentials=anonymous)
+        assert mock_bq.QueryJobConfig.call_args.kwargs["write_disposition"] == "WRITE_TRUNCATE"
+        assert [c.args[0] for c in mock_client.query.call_args_list] == [_BQ_RESTORE_QUERY]
 
     def test_provider_unavailable_raises(self):
         """If google-cloud-bigquery isn't importable, surface a typed

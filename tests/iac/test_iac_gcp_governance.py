@@ -600,6 +600,60 @@ def test_fluid_validate_reports_each_refusal_at_stage_2():
     ) == ([], [])
 
 
+# ── What BigQuery deletes with a table is recreated with it ───────────────
+
+CONSENT = {"principal": ANALYSTS, "name": "analysts_consented", "where": "status = 'active'"}
+_TRIGGER = {"replace_triggered_by": [f"{TABLE}.id"]}
+
+
+def _row_filtered(**kwargs: Any) -> Dict[str, Any]:
+    contract = _contract(principals=MAPPING, **kwargs)
+    contract["exposes"][0].setdefault("policy", {}).setdefault("authz", {})["rowFilters"] = [
+        dict(CONSENT)
+    ]
+    return contract
+
+
+def _shared_dataset() -> Dict[str, Any]:
+    contract = _contract(principals=MAPPING)
+    contract["packaging"] = {"mode": "shared", "pool": "northwind-pool"}
+    return contract
+
+
+def test_each_row_access_policy_is_recreated_with_its_table():
+    """BigQuery deletes a table's row access policies with it; tofu, seeing the same
+    ``table_id``, kept them in state and the new table stood unfiltered."""
+    policies = _resources(_row_filtered())["google_bigquery_row_access_policy"]
+    assert len(policies) == 2
+    for policy in policies.values():
+        assert policy["lifecycle"] == _TRIGGER
+
+
+def test_each_table_grant_in_a_shared_dataset_is_recreated_with_its_table():
+    members = _resources(_shared_dataset())["google_bigquery_table_iam_member"]
+    assert members
+    for member in members.values():
+        assert member["lifecycle"] == _TRIGGER
+
+
+def test_a_planned_table_grant_follows_the_table_only_when_this_module_declares_it():
+    """``iam.bind_bq_table`` names its table as plain strings; it is tied to the table
+    resource only when that resource is this module's table of the same dataset."""
+    plugin = get_iac_plugin("gcp")
+    policies = {"readers": {"principals": ["analyst@example.com"], "permissions": ["read"]}}
+
+    def members(dataset: str, table: str) -> List[Dict[str, Any]]:
+        action = {"op": "iam.bind_bq_table", "dataset": dataset, "table": table}
+        resources = plugin.emit(_contract(principals=MAPPING), [{**action, "policies": policies}])
+        return list(resources["google_bigquery_table_iam_member"].values())
+
+    (own,) = members("demo_gold", "retention_candidates")
+    assert own["lifecycle"] == _TRIGGER
+    for dataset, table in (("demo_gold", "other_table"), ("other_dataset", "retention_candidates")):
+        (other,) = members(dataset, table)
+        assert "lifecycle" not in other, (dataset, table)
+
+
 # ── tofu validate ─────────────────────────────────────────────────────────
 
 _TOFU = shutil.which("tofu")
@@ -610,7 +664,14 @@ _TOFU = shutil.which("tofu")
 @pytest.mark.skipif(_TOFU is None, reason="tofu not on PATH")
 @pytest.mark.parametrize(
     "shape",
-    ["all", "existing-key-partition-column", "grants-only", "multi-region-product-key"],
+    [
+        "all",
+        "existing-key-partition-column",
+        "grants-only",
+        "multi-region-product-key",
+        "row-filters",
+        "shared-dataset",
+    ],
 )
 def test_governed_modules_pass_tofu_validate(shape, tmp_path):
     from tests.iac.test_iac_tofu_validate import _tofu_init_or_skip
@@ -633,6 +694,13 @@ def test_governed_modules_pass_tofu_validate(shape, tmp_path):
         "multi-region-product-key": lambda: _contract(
             principals=MAPPING, encryption={"kms": "product"}, region="EU"
         ),
+        # The row access policies' and the table grants' replace_triggered_by:
+        # ``tofu validate`` checks its attribute against the carrying resource.
+        "row-filters": lambda: _row_filtered(
+            lifecycle={"retention": "P90D", "expire": True},
+            restrictions=TestColumnRestrictions.DENY,
+        ),
+        "shared-dataset": _shared_dataset,
     }[shape]()
     (tmp_path / "main.tf.json").write_text(
         build_module(get_iac_plugin("gcp"), copy.deepcopy(contract))
