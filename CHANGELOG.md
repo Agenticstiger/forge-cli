@@ -16,6 +16,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now builds the tag's commit, also when a manual run starts from `main`, and the
   quality gate checks `ci.yml` on that commit.
 
+### Fixed
+
+- **A Lake Formation tag the contract does not define is associated, and the module
+  validates.** A key in a binding's `governance.lakeFormation.tags` with no
+  `governance.lakeFormation.tagDefinitions` entry got a `depends_on` on an
+  `aws_lakeformation_lf_tag` the module never declared, so `tofu validate`, `fluid plan`
+  and `fluid apply` failed with "Reference to undeclared resource". Such a key is now a
+  tag the platform owns: associated as written, with no `depends_on`, no warning and no
+  refusal. It must already exist in the account, and the identity running `fluid apply`
+  needs `ASSOCIATE` on it. The association still waits for the tags the contract
+  defines, and a contract that defines every tag it associates emits the same module.
+  Refused at `fluid validate` and at emit, where each used to fail at apply or be
+  dropped: a value the contract's definition of the tag does not allow, compared
+  case-insensitively (`lakeformation-tag-value`); a definition with no values, or two
+  that would be one resource name, such as `a-b` and `a_b`
+  (`lakeformation-tag-definition`); and tags on a binding that names no Glue table
+  (`lakeformation-tag-association`). The `tags` and `tagDefinitions` descriptions in
+  fluid-schema 0.7.3 to 0.7.6 say so.
+
 ## [0.19.0] — 2026-10-06
 
 A contract can now say that a principal reads a column masked rather than not at all,

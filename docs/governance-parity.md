@@ -20,6 +20,7 @@ contract needs `fluidVersion: "0.7.6"` to validate with them.
 | **Row filters**: `exposes[].policy.authz.rowFilters[] {principal, where, name?}` | A Lake Formation data cells filter per filter (`aws_lakeformation_data_cells_filter`, `row_filter.filter_expression` the predicate, `column_wildcard.excluded_column_names` the principal's excluded columns), and the principal's `SELECT` granted on the filter instead of the table. | A row access policy per filter (`google_bigquery_row_access_policy`, `filter_predicate` the predicate, `grantees` every identity of the principal, whatever it holds: a writer reads rows too), and one more, `fluid_all_rows` (`TRUE`), for every other principal the expose grants anything to, never for a filtered one, since BigQuery shows a principal no policy names no row at all and the union of those that do. | AWS: the column check reads a grant made on a data cells filter, so a filtered principal's excluded columns are still checked. Not checked yet: the filter expression on AWS, and the row access policies on GCP. |
 | **Governance labels**: `labels`, `exposes[].labels`, `dataClassification`, `sovereignty {jurisdiction, regulatoryFramework, dataResidency}` | The same keys as AWS tags on the bucket and the key, and as parameters on the Glue table. | GCP labels on the dataset, the table and the key: the contract's and the expose's labels, and `fluid_classification`, `fluid_jurisdiction`, `fluid_regulation` (the frameworks joined), `fluid_residency`. | Not checked yet. |
 | **Access grants**: `accessPolicy.grants[]` | Not emitted: on AWS, access is the binding's `governance.lakeFormation.grants`. `fluid validate` warns only for an aws binding with no Lake Formation grants, where the contract's access intent is unenforced. | One non-authoritative `google_bigquery_dataset_iam_member` per role and member (and `google_storage_bucket_iam_member` for GCS), with the logical principal mapped to its GCP identity. | Not checked yet on either cloud. |
+| **Lake Formation tags** (AWS only): `binding.governance.lakeFormation.tags`, and `governance.lakeFormation.tagDefinitions` for the tags the contract creates | One `aws_lakeformation_lf_tag` per defined key, and one `aws_lakeformation_resource_lf_tags` per table with the binding's tags. The association waits for the tags the contract defines (`depends_on`), and a value must be one of its tag's values. A key the contract does not define is a tag the platform owns: associated as written, with no `depends_on` (see "Lake Formation tags the platform owns" below). | Not applicable: these are AWS binding fields. | Not checked yet. |
 
 A policy that a binding cannot apply is refused at `fluid validate`, `fluid plan` and
 `fluid apply`, never dropped: retention, a key or a column restriction on a GCP
@@ -28,8 +29,12 @@ restriction on an AWS binding with no Lake Formation grants or on a non-Glue for
 an AWS key reference on GCP and a Cloud KMS key name on AWS, a mask on an AWS binding
 with no `maskedViews` (`column-mask-unenforceable`), a text mask on a column that is
 not a string (`column-mask-type`), a row filter whose principal holds no Lake
-Formation read grant (`row-filter-unenforceable`), and a row filter on a BigQuery view
-(`row-filter-view`) or on a GCP binding that is not a BigQuery table.
+Formation read grant (`row-filter-unenforceable`), a row filter on a BigQuery view
+(`row-filter-view`) or on a GCP binding that is not a BigQuery table, a Lake Formation
+tag value that the contract's definition of the tag does not allow
+(`lakeformation-tag-value`), a tag definition with no values or two that would be one
+resource, such as `a-b` and `a_b` (`lakeformation-tag-definition`), and Lake Formation
+tags on a binding that names no Glue table (`lakeformation-tag-association`).
 
 ## Logical principals and `binding.principals`
 
@@ -276,6 +281,24 @@ partitioning's shape. Changing `retention` later is an in-place update of
 also refuses without `--allow-data-loss`; BigQuery cannot un-partition a table, so to
 keep data longer, set a longer `retention` instead.
 
+## Lake Formation tags the platform owns
+
+AWS recommends one LF-tag ontology per account: a data steward or the platform
+creates the tag keys and their values, and each domain is given `ASSOCIATE` on them
+to tag its own tables. A contract follows either model, per key:
+
+* A key in `governance.lakeFormation.tagDefinitions` is a tag the contract creates.
+  The apply creates it, the association waits for it, and the association's value
+  must be one of its values (compared case-insensitively, as Lake Formation stores
+  keys and values lower-cased). Do not also create that key anywhere else in the
+  account.
+* A key in a binding's `governance.lakeFormation.tags` that the contract does not
+  define is a tag the platform owns. It is associated as written, with no
+  `depends_on` and no warning. It must already exist in the account, and the identity
+  running `fluid apply` needs `ASSOCIATE` on it. terraform-provider-aws has no data
+  source for an LF-tag, so nothing checks the key or the value before apply: Lake
+  Formation does, at apply.
+
 ## Prerequisites
 
 * The Cloud KMS API (`cloudkms.googleapis.com`) and the Data Catalog API
@@ -298,6 +321,8 @@ keep data longer, set a longer `retention` instead.
   caller can see, so it must run as a Lake Formation administrator. When the
   contract's own grants are not in the listing, it reports an error rather than a
   pass.
+* On AWS, a Lake Formation tag the platform owns must exist before `fluid apply`,
+  and the identity running it needs `ASSOCIATE` on the tag.
 
 ## What is proven, and what is not
 
@@ -313,6 +338,9 @@ keep data longer, set a longer `retention` instead.
 * The same stand-in shows a revoked reader plans one member destroy that the gate
   lets through, and that moving from the authoritative access list of 0.16.6 and earlier to member
   resources revokes a grant removed in the same change and then plans clean.
+* `tofu validate` accepts a Lake Formation tag association on a tag the platform owns,
+  alone and beside a tag the contract defines (`tests/iac/test_iac_lakeformation_tags.py`).
+  Before, it failed with "Reference to undeclared resource".
 * **Measured against real Google Cloud**, 4 October 2026, on 0.18.0. In a demo lab, two
   lineage chains of eleven products were applied with `fluid apply --env gcp` from
   generated Jenkins pipelines, as a deploy service account reached by Workload Identity
@@ -348,6 +376,8 @@ keep data longer, set a longer `retention` instead.
   moved from `~> 5.0`.
 * **Not proven yet**: an apply of the masking, row filter and label resources exactly
   as forge-cli emits them, on either cloud.
+* **Not proven**: associating a tag the platform owns on a real account, and how Lake
+  Formation treats a value whose case differs from the tag's.
 * **Not proven**: the Lake Formation half against a real account as 0.17.0 derives it
   from `columnRestrictions`. The grant shape it emits (excluded columns beside
   `wildcard`) was applied and enforced on a real account from 0.16.6, written by hand

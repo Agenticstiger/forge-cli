@@ -5894,7 +5894,7 @@
             },
             "tagDefinitions": {
               "type": "object",
-              "description": "LF-TBAC tag-key definitions. Each entry is a tag key mapped to its allowed string values. Emitted as one aws_lakeformation_lf_tag per key; values are the tag's allowed-values list. Field idiom borrowed from OpenMetadata's classification-label model — see ODCS roles + OpenMetadata data contracts spec.",
+              "description": "LF-TBAC tag-key definitions. Each entry is a tag key mapped to its allowed string values. Emitted as one aws_lakeformation_lf_tag per key; values are the tag's allowed-values list. The apply CREATES every tag defined here, so a key defined here must not also be created elsewhere: not by a platform bootstrap, another contract or by hand in the same account. A tag owned outside the contract is not defined here, and a binding's governance.lakeFormation.tags can still associate it. An association with a key defined here waits for the tag, and its value must be one of the tag's values, compared case-insensitively because Lake Formation stores keys and values lower-cased. A key with no values is refused, and so are two keys that would be one resource name, such as a-b and a_b. Field idiom borrowed from OpenMetadata's classification-label model — see ODCS roles + OpenMetadata data contracts spec.",
               "additionalProperties": {
                 "type": "array",
                 "items": {
@@ -5999,7 +5999,7 @@
             },
             "tags": {
               "type": "object",
-              "description": "LF-tag (TBAC) associations applied to this table. Keys must reference tag definitions declared in the contract's top-level governance.lakeFormation.tagDefinitions. Emitted as aws_lakeformation_resource_lf_tags.",
+              "description": "LF-tag (TBAC) associations applied to this table, as tag key to value. Emitted as aws_lakeformation_resource_lf_tags; a key whose value is empty is not associated. A key defined in the contract's top-level governance.lakeFormation.tagDefinitions is a tag this contract creates: the association waits for it, and the value must be one of the tag's values. A key the contract does not define is a tag owned outside the contract, such as a platform's central LF-tag ontology: it must already exist in the account, the principal that runs the apply needs the Lake Formation ASSOCIATE permission on it, and only Lake Formation checks its key and value, at apply. A key the contract defines must not also be created elsewhere. Refused when the binding names no Glue table (location.database and location.table).",
               "additionalProperties": {
                 "type": "string"
               }

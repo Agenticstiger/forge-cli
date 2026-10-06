@@ -391,8 +391,8 @@ class AwsIacPlugin:
 
         # Account-level Lake Formation settings: admins + LF-tag
         # definitions. Emitted once per contract, before per-exposure
-        # resources so the LF tag-definitions exist before any
-        # resource_lf_tags association references them.
+        # resources, so a resource_lf_tags association can tell the tags
+        # this module creates (and waits for) from those it does not.
         _emit_lf_account_settings(resources, contract, cid, base_tags)
 
         for index, exposure in enumerate(contract.get("exposes") or []):
@@ -411,6 +411,9 @@ class AwsIacPlugin:
             # cannot mask): ``lf_row_filters`` / ``lf_masked_views``.
             row_filters = lf_row_filters(exposure, binding, index)
             masked_views = lf_masked_views(exposure, binding, index, exclusions or {}, row_filters)
+            # The binding's LF-tag associations, each value checked against the
+            # contract's definition of its tag when it has one: ``lf_tag_associations``.
+            lf_tags = lf_tag_associations(contract, exposure, binding, index)
             placement = _placement(packaging, exposure)
             # The contract's governance labels (classification, jurisdiction,
             # regulation, its own labels) under fluid's own two, which win.
@@ -447,6 +450,7 @@ class AwsIacPlugin:
                 exclusions=exclusions or {},
                 row_filters=row_filters,
                 masked_views=masked_views,
+                lf_tags=lf_tags,
             )
         # Retention (exposes[].lifecycle) and encryption at rest
         # (binding.encryption), per bucket this product owns. Nothing is
@@ -1525,8 +1529,8 @@ def _wire_aws_deps(resources: Dict[str, Any], cid: str) -> None:
 #     per-exposure emit. Honours top-level ``governance.lakeFormation``:
 #     ``admins`` → ``aws_lakeformation_data_lake_settings``,
 #     ``tagDefinitions`` → one ``aws_lakeformation_lf_tag`` per key.
-#     Must run before per-resource ``resource_lf_tags`` associations so
-#     the tag keys exist for the association to reference.
+#     Must run before per-resource ``resource_lf_tags`` associations, which
+#     wait for the tags it wrote (see :func:`lf_tag_definitions`).
 #
 #   * ``_emit_lakeformation`` — fires per AWS exposure. Honours
 #     ``binding.governance.lakeFormation``:
@@ -1538,16 +1542,18 @@ def _wire_aws_deps(resources: Dict[str, Any], cid: str) -> None:
 #         :func:`_lf_column_grant_permissions`),
 #         plus, per ``bucketPolicy``, an ``aws_s3_bucket_policy`` for the
 #         grantees in OTHER accounts (see :func:`_lf_bucket_policy`),
-#     ``tags{}`` → one ``aws_lakeformation_resource_lf_tags`` per table,
+#     ``tags{}`` → one ``aws_lakeformation_resource_lf_tags`` per table
+#         (see :func:`lf_tag_associations`), naming a tag the contract defines
+#         or one owned outside the contract,
 #     ``rowFilter`` → one ``aws_lakeformation_data_cells_filter``.
 #
 # Design notes:
 #   - LF resources are emitted alongside the Glue catalog table they
 #     reference; OpenTofu's value-reference edges (``${aws_glue_catalog_table
 #     .{...}.name}``) provide the ordering, no manual ``depends_on``
-#     needed. Where a reference would be circular (e.g. tag definitions
-#     vs tag associations from different exposures), explicit
-#     ``depends_on`` is set.
+#     needed. A tag association names its tag keys as literals, so it
+#     gets an explicit ``depends_on`` on the tags this module defines, and
+#     none for a tag owned outside the contract (its resource is not here).
 #   - Empty governance blocks emit nothing — every existing contract
 #     stays at zero LF surface area.
 #   - LF is Glue-catalog-backed, so the per-exposure emit only fires for
@@ -1598,7 +1604,6 @@ def _emit_lf_account_settings(
 ) -> None:
     gov = (contract.get("governance") or {}).get("lakeFormation") or {}
     admins = gov.get("admins") or []
-    tag_defs = gov.get("tagDefinitions") or {}
 
     if admins:
         # ``aws_lakeformation_data_lake_settings`` is a singleton per
@@ -1619,15 +1624,133 @@ def _emit_lf_account_settings(
             "admins": list(admins),
         }
 
-    for tag_key, tag_values in tag_defs.items():
+    tag_defs = lf_tag_definitions(contract)
+    if tag_defs:
+        resources.setdefault("aws_lakeformation_lf_tag", {}).update(tag_defs)
+
+
+def _lf_tag_name(cid: str, key: Any) -> str:
+    """The ``aws_lakeformation_lf_tag`` resource name of the contract's tag ``key``."""
+    return safe_ident(f"{cid}_lf_tag_{key}")
+
+
+def _lf_tag_definitions(contract: Mapping[str, Any]) -> Mapping[Any, Any]:
+    """The contract's ``governance.lakeFormation.tagDefinitions`` map, as written."""
+    gov = (contract.get("governance") or {}).get("lakeFormation") or {}
+    tag_defs = gov.get("tagDefinitions") if isinstance(gov, Mapping) else None
+    return tag_defs if isinstance(tag_defs, Mapping) else {}
+
+
+def lf_tag_definitions(contract: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """``{resource name: aws_lakeformation_lf_tag body}``: the tags this module creates.
+
+    One per key of the contract's ``governance.lakeFormation.tagDefinitions``, named
+    with the stem :meth:`AwsIacPlugin.emit` uses. Refused where the module could not
+    create the tag as declared: a key with no values (Lake Formation needs at least
+    one; the key used to be skipped, and an association to it then named a resource
+    the module did not declare), and two keys that are one resource name (``a-b`` and
+    ``a_b``; the later used to replace the earlier). Run here, where ``fluid validate``
+    and the emitter both read the definitions, so stage 2 refuses them too.
+    """
+    cid = aws_storage.contract_ident(contract)
+    out: Dict[str, Dict[str, Any]] = {}
+    for tag_key, tag_values in _lf_tag_definitions(contract).items():
         if not tag_values:
+            raise UnsupportedBindingError(
+                "lakeformation-tag-definition",
+                f"governance.lakeFormation.tagDefinitions.{tag_key} lists no values, and a "
+                "Lake Formation tag needs at least one, so the module cannot create it.",
+                (
+                    "List the values the tag allows.",
+                    "Remove the key if the tag is created outside this contract; "
+                    "associating it then needs no definition here.",
+                ),
+            )
+        name = _lf_tag_name(cid, tag_key)
+        if name in out:
+            raise UnsupportedBindingError(
+                "lakeformation-tag-definition",
+                f"governance.lakeFormation.tagDefinitions keys {out[name]['key']!r} and "
+                f"{str(tag_key)!r} are both the resource aws_lakeformation_lf_tag.{name}, "
+                "so one definition would replace the other.",
+                ("Rename one of the keys so that the two differ in a letter or a digit.",),
+            )
+        out[name] = {"key": str(tag_key), "values": list(tag_values)}
+    return out
+
+
+def lf_tag_associations(
+    contract: Mapping[str, Any],
+    exposure: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    index: int = 0,
+) -> List[Dict[str, str]]:
+    """The ``lf_tag`` blocks of the binding's ``governance.lakeFormation.tags``.
+
+    One per key that carries a value. A key the contract's ``tagDefinitions`` declare
+    is a tag this module creates, and the value must be one of its values, compared
+    case-folded since Lake Formation stores keys and values lower-cased. A key it does
+    not declare is a tag owned outside the contract (a platform's central LF-tag
+    ontology): it is associated as written, checked only by Lake Formation at apply,
+    and :func:`_emit_lf_tag_association` orders nothing on it. Tags on a Glue-catalog
+    binding that names no Glue table are refused, as they would be dropped. Run here,
+    where ``fluid validate`` and the emitter both derive the associations, so stage 2
+    refuses them too.
+    """
+    gov = (binding.get("governance") or {}).get("lakeFormation") or {}
+    tags = gov.get("tags") if isinstance(gov, Mapping) else None
+    if not isinstance(tags, Mapping):
+        return []
+    lf_tags = [{"key": str(k), "value": str(v)} for k, v in tags.items() if v]
+    fmt = str(binding.get("format") or "parquet")
+    if not lf_tags or fmt.lower() not in _GLUE_CATALOG_FORMATS:
+        # Not a Glue-catalog format: _emit_lakeformation ignores the whole
+        # governance.lakeFormation block of such a binding, by design.
+        return []
+    where = f"exposes[{exposure.get('exposeId') or index}] governance.lakeFormation.tags"
+    loc = binding.get("location") or {}
+    if not loc.get("database") or not loc.get("table"):
+        raise UnsupportedBindingError(
+            "lakeformation-tag-association",
+            f"{where} associates {', '.join(t['key'] for t in lf_tags)}, but the binding "
+            "names no Glue table (location.database and location.table), so the tags "
+            "would be dropped.",
+            (
+                "Set location.database and location.table to the tags' Glue table.",
+                "Remove governance.lakeFormation.tags.",
+            ),
+        )
+    _refuse_a_value_the_tag_does_not_have(contract, lf_tags, where)
+    return lf_tags
+
+
+def _refuse_a_value_the_tag_does_not_have(
+    contract: Mapping[str, Any], lf_tags: Sequence[Mapping[str, str]], where: str
+) -> None:
+    """Refuse an association whose value the contract's definition of its tag lacks.
+
+    Only a key the contract defines is checked, case-folded, as Lake Formation stores
+    keys and values lower-cased; a tag owned outside the contract is Lake Formation's
+    to check, at apply.
+    """
+    defined = {str(k): v for k, v in _lf_tag_definitions(contract).items() if v}
+    for tag in lf_tags:
+        values = defined.get(tag["key"])
+        if values is None:
             continue
-        resources.setdefault("aws_lakeformation_lf_tag", {})[
-            safe_ident(f"{cid}_lf_tag_{tag_key}")
-        ] = {
-            "key": str(tag_key),
-            "values": list(tag_values),
-        }
+        if tag["value"].casefold() not in {str(v).casefold() for v in values}:
+            raise UnsupportedBindingError(
+                "lakeformation-tag-value",
+                f"{where}.{tag['key']} is {tag['value']!r}, but "
+                f"governance.lakeFormation.tagDefinitions.{tag['key']} allows only "
+                f"{[str(v) for v in values]}, and Lake Formation refuses to associate a "
+                "value the tag does not have.",
+                (
+                    "Associate one of the values the tag allows.",
+                    f"Add {tag['value']!r} to governance.lakeFormation.tagDefinitions."
+                    f"{tag['key']}.",
+                ),
+            )
 
 
 def _lf_location(loc: Mapping[str, Any], placement: _Placement) -> Tuple[Optional[str], str]:
@@ -2345,9 +2468,14 @@ def _emit_lakeformation(
     exclusions: Optional[Mapping[int, Tuple[str, ...]]] = None,
     row_filters: Optional[Mapping[int, RowFilter]] = None,
     masked_views: Sequence["_LfMaskedView"] = (),
+    lf_tags: Sequence[Mapping[str, str]] = (),
 ) -> None:
     """Emit per-exposure LF resources. No-op when the binding has no
     ``governance.lakeFormation`` block.
+
+    ``lf_tags`` is :func:`lf_tag_associations`: the table's one
+    ``aws_lakeformation_resource_lf_tags``, ordered after the tags this module
+    creates and on nothing for a tag owned outside the contract.
 
     ``row_filters`` is :func:`lf_row_filters`: a grant that carries one reads through a
     data cells filter (the filter's predicate, and the grant's excluded columns as its
@@ -2494,30 +2622,10 @@ def _emit_lakeformation(
     #     another AWS account) is emitted once per bucket, over every exposure
     #     on it, by :meth:`AwsIacPlugin.emit`. See :func:`_lf_bucket_policies`.
 
-    # 3. LF-tag associations on the table (LF-TBAC).
-    tag_assoc = gov.get("tags") or {}
-    if tag_assoc and table_key:
-        lf_tags = [{"key": str(k), "value": str(v)} for k, v in tag_assoc.items() if v]
-        if lf_tags:
-            assoc_key = safe_ident(f"{cid}_lf_tags_{table}")
-            resources.setdefault("aws_lakeformation_resource_lf_tags", {})[assoc_key] = {
-                "table": [
-                    {
-                        "database_name": tofu_ref(
-                            f"aws_glue_catalog_table.{table_key}.database_name"
-                        ),
-                        "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
-                    }
-                ],
-                "lf_tag": lf_tags,
-                # The tag KEYS must exist before this association can be
-                # applied. The matching ``aws_lakeformation_lf_tag``
-                # resources come from the contract-level
-                # ``governance.lakeFormation.tagDefinitions`` block.
-                "depends_on": [
-                    f"aws_lakeformation_lf_tag.{safe_ident(f'{cid}_lf_tag_{k}')}" for k in tag_assoc
-                ],
-            }
+    # 3. LF-tag associations on the table (LF-TBAC): the keys that carry a value,
+    #    from :func:`lf_tag_associations`.
+    if lf_tags and table_key:
+        _emit_lf_tag_association(resources, cid, table, table_key, lf_tags)
 
     # 4. Row-level (and optional column-level) filter.
     row_filter = gov.get("rowFilter")
@@ -2565,6 +2673,46 @@ def _lf_filter_table_data(
         "row_filter": [{"filter_expression": row_expr}],
         **col_block,
     }
+
+
+def _emit_lf_tag_association(
+    resources: Dict[str, Any],
+    cid: str,
+    table: str,
+    table_key: str,
+    lf_tags: Sequence[Mapping[str, str]],
+) -> None:
+    """The table's ``aws_lakeformation_resource_lf_tags``: :func:`lf_tag_associations`.
+
+    A tag must exist before it is associated. The association waits only for the
+    tags this module creates: the ``aws_lakeformation_lf_tag`` of the contract's
+    ``tagDefinitions``, which :func:`_emit_lf_account_settings` wrote before any
+    exposure, and only when that resource is this key's (one resource name can
+    stand for ``a-b`` and ``a_b``). A key the contract does not define is a tag
+    owned outside the contract, already in the account: an edge to it would name a
+    resource the module does not declare, and ``tofu validate`` refuses the whole
+    module. The key stays a plain string, which the renderer escapes.
+    """
+    assoc: Dict[str, Any] = {
+        "table": [
+            {
+                "database_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.database_name"),
+                "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
+            }
+        ],
+        "lf_tag": [dict(t) for t in lf_tags],
+    }
+    owned = resources.get("aws_lakeformation_lf_tag") or {}
+    depends_on: List[str] = []
+    for tag in lf_tags:
+        name = _lf_tag_name(cid, tag["key"])
+        if (owned.get(name) or {}).get("key") == tag["key"]:
+            depends_on.append(f"aws_lakeformation_lf_tag.{name}")
+    if depends_on:
+        assoc["depends_on"] = depends_on
+    resources.setdefault("aws_lakeformation_resource_lf_tags", {})[
+        safe_ident(f"{cid}_lf_tags_{table}")
+    ] = assoc
 
 
 def _emit_lf_filtered_grant(

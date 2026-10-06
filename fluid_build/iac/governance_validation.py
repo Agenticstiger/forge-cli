@@ -16,11 +16,15 @@
 
 ``fluid generate iac``, ``fluid plan`` and ``fluid apply`` refuse a principal that
 is unmapped or a placeholder, a column restriction nothing on the binding enforces,
-a Cloud KMS key on AWS or an AWS key on GCP, and retention or encryption on a GCP
-target that is not a BigQuery table. This runs the SAME derivations
+a Cloud KMS key on AWS or an AWS key on GCP, retention or encryption on a GCP
+target that is not a BigQuery table, and a Lake Formation tag the module cannot
+create or associate as declared (a definition with no values, two definitions that
+are one resource, a value the contract's definition of the tag does not allow, tags
+on a binding with no Glue table). This runs the SAME derivations
 (``iac/providers/gcp_governance.py``, ``iac/column_access.py``,
-``iac/principals.py``) so ``fluid validate`` reports each refusal at stage 2, with
-the same message, instead of at apply. The same shape as ``validate_gcp_binding``.
+``iac/principals.py``, the AWS emitter's ``lf_*`` functions) so ``fluid validate``
+reports each refusal at stage 2, with the same message, instead of at apply. The
+same shape as ``validate_gcp_binding``.
 """
 
 from __future__ import annotations
@@ -45,6 +49,22 @@ def _lf_grants(binding: Mapping[str, Any]) -> List[Any]:
     return list(grants) if isinstance(grants, list) else []
 
 
+def _lf_tag_definition_errors(contract: Mapping[str, Any]) -> List[str]:
+    """The refusal of the contract's LF-tag definitions, which the AWS emitter creates
+    once for the whole contract; none for a contract with no expose bound to AWS."""
+    from .providers.aws import lf_tag_definitions
+
+    for exposure in contract.get("exposes") or []:
+        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
+        if isinstance(binding, Mapping) and is_cloud(binding, "aws"):
+            try:
+                lf_tag_definitions(contract)
+            except UnsupportedBindingError as exc:
+                return [_message(exc)]
+            break
+    return []
+
+
 def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
     """``(errors, warnings)`` for the contract's cloud bindings.
 
@@ -64,6 +84,7 @@ def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
         _gov.refuse_mixed_dataset_encryption(contract)
     except UnsupportedBindingError as exc:
         errors.append(_message(exc))
+    errors.extend(_lf_tag_definition_errors(contract))
     for index, exposure in enumerate(contract.get("exposes") or []):
         if not isinstance(exposure, Mapping):
             continue
@@ -73,9 +94,10 @@ def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
         try:
             principal_map(binding)
             if is_cloud(binding, "aws"):
-                from .providers.aws import lf_column_exclusions
+                from .providers.aws import lf_column_exclusions, lf_tag_associations
 
                 lf_column_exclusions(exposure, binding, index)
+                lf_tag_associations(contract, exposure, binding, index)
                 if not _lf_grants(binding):
                     unenforced.append(str(exposure.get("exposeId") or index))
                 continue
