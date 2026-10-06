@@ -382,11 +382,26 @@ data-loss gate counts, but only in a plan that already replaces the table.
 * `tofu plan` with terraform-provider-aws 6.67 against the live state of the lab's
   eleven AWS products planned no change for any of them, with only the provider pin
   moved from `~> 5.0`.
+* **The replace and the rollback, measured on BigQuery**, 6 October 2026, on a
+  temporary DAY-partitioned table with a row access policy and a policy-tagged column,
+  driven through forge-cli's own planner action and `fluid rollback` code:
+  * the pre-replace `CREATE SNAPSHOT TABLE … CLONE` copied both row access policies and
+    the policy tag to the snapshot (not the partition expiration, as BigQuery
+    documents);
+  * the replace's `WRITE_TRUNCATE_DATA` query job, and the rollback's restore from the
+    snapshot, each kept the row access policy, the policy tag, the partitioning and
+    the partition expiration; afterwards a reader with only the filtered policy saw 2
+    of 3 rows and was refused the tagged column;
+  * the query job maps the SELECT's columns by name, not by position, and a missing
+    NULLABLE column lands as NULL;
+  * an identity without full row access or Fine-Grained Reader is refused both the
+    replace job and the restore (403): it fails closed and changes nothing;
+  * the control, the old `CREATE OR REPLACE TABLE … AS SELECT` on an unpartitioned
+    copy, dropped the row access policy and the policy tag, and every row and the
+    tagged column became readable. On a partitioned table BigQuery refuses it outright
+    ("Cannot replace a table with a different partitioning spec").
 * **Not proven yet**: an apply of the masking, row filter and label resources exactly
-  as forge-cli emits them, on either cloud. Nor, on real BigQuery, that a
-  `WRITE_TRUNCATE_DATA` *query* job (the rollback's and the planner's replace) keeps
-  the policy tags and row access policies as the measured load job does, how it maps
-  the SELECT's columns, or what a table snapshot keeps of its table's governance.
+  as forge-cli emits them, on either cloud.
 * **Not proven**: the Lake Formation half against a real account as 0.17.0 derives it
   from `columnRestrictions`. The grant shape it emits (excluded columns beside
   `wildcard`) was applied and enforced on a real account from 0.16.6, written by hand
