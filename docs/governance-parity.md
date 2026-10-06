@@ -20,7 +20,7 @@ contract needs `fluidVersion: "0.7.6"` to validate with them.
 | **Row filters**: `exposes[].policy.authz.rowFilters[] {principal, where, name?}` | A Lake Formation data cells filter per filter (`aws_lakeformation_data_cells_filter`, `row_filter.filter_expression` the predicate, `column_wildcard.excluded_column_names` the principal's excluded columns), and the principal's `SELECT` granted on the filter instead of the table. | A row access policy per filter (`google_bigquery_row_access_policy`, `filter_predicate` the predicate, `grantees` every identity of the principal, whatever it holds: a writer reads rows too), and one more, `fluid_all_rows` (`TRUE`), for every other principal the expose grants anything to, never for a filtered one, since BigQuery shows a principal no policy names no row at all and the union of those that do. | AWS: the column check reads a grant made on a data cells filter, so a filtered principal's excluded columns are still checked. Not checked yet: the filter expression on AWS, and the row access policies on GCP. |
 | **Governance labels**: `labels`, `exposes[].labels`, `dataClassification`, `sovereignty {jurisdiction, regulatoryFramework, dataResidency}` | The same keys as AWS tags on the bucket and the key, and as parameters on the Glue table. | GCP labels on the dataset, the table and the key: the contract's and the expose's labels, and `fluid_classification`, `fluid_jurisdiction`, `fluid_regulation` (the frameworks joined), `fluid_residency`. | Not checked yet. |
 | **Access grants**: `accessPolicy.grants[]` | Not emitted: on AWS, access is the binding's `governance.lakeFormation.grants`. `fluid validate` warns only for an aws binding with no Lake Formation grants, where the contract's access intent is unenforced. | One non-authoritative `google_bigquery_dataset_iam_member` per role and member (and `google_storage_bucket_iam_member` for GCS), with the logical principal mapped to its GCP identity. | Not checked yet on either cloud. |
-| **Lake Formation tags** (AWS only): `binding.governance.lakeFormation.tags`, and `governance.lakeFormation.tagDefinitions` for the tags the contract creates | One `aws_lakeformation_lf_tag` per defined key, and one `aws_lakeformation_resource_lf_tags` per table with the binding's tags. The association waits for the tags the contract defines (`depends_on`), and a value must be one of its tag's values. A key the contract does not define is a tag the platform owns: associated as written, with no `depends_on` (see "Lake Formation tags the platform owns" below). | Not applicable: these are AWS binding fields. | Not checked yet. |
+| **Lake Formation tags** (AWS only): `binding.governance.lakeFormation.tags`, and `governance.lakeFormation.tagDefinitions` for the tags the contract creates | One `aws_lakeformation_lf_tag` per defined key, and one `aws_lakeformation_resource_lf_tags` per table with the binding's tags. The association names each tag the contract defines by reference (`key = aws_lakeformation_lf_tag.<name>.key`, the provider's documented pattern), so it waits for the tag with no `depends_on`, and a value must be one of its tag's values. A key the contract does not define is a tag the platform owns: associated by its literal key, with no reference (see "Lake Formation tags the platform owns" below). | Not applicable: these are AWS binding fields. | Not checked yet. |
 
 A policy that a binding cannot apply is refused at `fluid validate`, `fluid plan` and
 `fluid apply`, never dropped: retention, a key or a column restriction on a GCP
@@ -288,13 +288,15 @@ creates the tag keys and their values, and each domain is given `ASSOCIATE` on t
 to tag its own tables. A contract follows either model, per key:
 
 * A key in `governance.lakeFormation.tagDefinitions` is a tag the contract creates.
-  The apply creates it, the association waits for it, and the association's value
-  must be one of its values (compared case-insensitively, as Lake Formation stores
+  The apply creates it, and the association names it by reference
+  (`key = aws_lakeformation_lf_tag.<name>.key`), so OpenTofu creates the tag first and
+  removes the association first on destroy. The association's value must be one of
+  its values (compared case-insensitively, as Lake Formation stores
   keys and values lower-cased). Do not also create that key anywhere else in the
   account.
 * A key in a binding's `governance.lakeFormation.tags` that the contract does not
-  define is a tag the platform owns. It is associated as written, with no
-  `depends_on` and no warning. It must already exist in the account, and the identity
+  define is a tag the platform owns. It is associated by its literal key, with no
+  reference and no warning, and a destroy leaves the tag in place. It must already exist in the account, and the identity
   running `fluid apply` needs `ASSOCIATE` on it. terraform-provider-aws has no data
   source for an LF-tag, so nothing checks the key or the value before apply: Lake
   Formation does, at apply.
@@ -341,6 +343,15 @@ to tag its own tables. A contract follows either model, per key:
 * `tofu validate` accepts a Lake Formation tag association on a tag the platform owns,
   alone and beside a tag the contract defines (`tests/iac/test_iac_lakeformation_tags.py`).
   Before, it failed with "Reference to undeclared resource".
+* A real `tofu apply` and `tofu plan` against moto
+  (`tests/iac/test_iac_lakeformation_tags_moto.py`): an association applied as 0.19.0
+  emitted it, with literal keys and `depends_on`, plans no change once it names its
+  tags by reference; a tag the platform created beforehand is associated beside one
+  the contract creates, reads back from Lake Formation and survives the destroy; and a
+  platform-owned key that does not exist fails the apply with
+  `EntityNotFoundException`. moto checks that an associated key exists, not that its
+  value is one of the tag's values, so a wrong value on a platform-owned tag is not
+  proven to fail.
 * **Measured against real Google Cloud**, 4 October 2026, on 0.18.0. In a demo lab, two
   lineage chains of eleven products were applied with `fluid apply --env gcp` from
   generated Jenkins pipelines, as a deploy service account reached by Workload Identity

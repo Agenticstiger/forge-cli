@@ -21,6 +21,9 @@ is owned by a platform bootstrap, the account-wide ontology) used to get a
 ``depends_on`` on an ``aws_lakeformation_lf_tag`` the module never declares, so
 ``tofu validate`` failed ``Reference to undeclared resource``. Such a key is now a
 platform-owned tag: associated as written, with no edge, no warning and no refusal.
+A key the contract defines names its tag by reference,
+``key = aws_lakeformation_lf_tag.<name>.key``, the provider's documented pattern, and
+the association carries no ``depends_on``.
 
 What the module cannot create or associate as declared is refused, at emit and by
 ``fluid validate`` with the same message: a value the contract's definition of the
@@ -29,13 +32,15 @@ resource name, and tags on a binding that names no Glue table. The schemas say s
 in every version that carries the fields.
 
 The tests marked ``tofu`` need ``tofu`` on PATH and the provider from the registry
-(no AWS credentials), like ``test_iac_aws_validate.py``; they skip without it.
+(no AWS credentials), like ``test_iac_aws_validate.py``; they skip without it. The
+apply and plan against moto are in ``test_iac_lakeformation_tags_moto.py``.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping
 
@@ -51,6 +56,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.provider, pytest.mark.aws]
 
 CID = "gold_sales_orders"
 ASSOC = f"{CID}_lf_tags_orders"
+TAG_REF = re.compile(r"^\$\{(aws_lakeformation_lf_tag\.[A-Za-z0-9_]+)\.key\}$")
 SCHEMAS = Path(fluid_build.__file__).resolve().parent / "schemas"
 
 
@@ -98,11 +104,26 @@ def _depends_on(document: Mapping[str, Any]) -> Iterator[tuple]:
                 yield f"{rtype}.{name}", dep
 
 
+def _tag_references(document: Mapping[str, Any]) -> Iterator[tuple]:
+    """Each association ``lf_tag`` key that is a reference: ``(owner, tag address)``."""
+    bodies = (document.get("resource") or {}).get("aws_lakeformation_resource_lf_tags") or {}
+    for name, body in bodies.items():
+        for tag in body.get("lf_tag") or []:
+            match = TAG_REF.match(tag["key"])
+            if match:
+                yield f"aws_lakeformation_resource_lf_tags.{name}", match.group(1)
+
+
 def _dangling(contract: Mapping[str, Any]) -> List[str]:
+    """Every ``depends_on`` and every tag-key reference that names no declared resource."""
     document = json.loads(build_module(AwsIacPlugin(), contract))
     declared = _declared(document)
     return [
         f"{owner} depends_on {dep}" for owner, dep in _depends_on(document) if dep not in declared
+    ] + [
+        f"{owner} references {ref}"
+        for owner, ref in _tag_references(document)
+        if ref not in declared
     ]
 
 
@@ -150,7 +171,7 @@ def test_a_platform_owned_tag_validates_with_no_error_and_no_warning():
     assert validate_governance(_contract({"classification": "confidential"})) == ([], [])
 
 
-def test_only_the_keys_this_module_defines_become_dependencies():
+def test_only_the_keys_this_module_defines_are_references():
     """One key defined by the contract, one owned by the platform."""
     contract = _contract(
         {"classification": "confidential", "domain": "sales"},
@@ -158,9 +179,34 @@ def test_only_the_keys_this_module_defines_become_dependencies():
     )
     assert _dangling(contract) == []
     assoc = _association(contract)
-    assert {t["key"] for t in assoc["lf_tag"]} == {"classification", "domain"}
-    # The defined key is still ordered before the association, and only it.
-    assert assoc["depends_on"] == [f"aws_lakeformation_lf_tag.{CID}_lf_tag_domain"]
+    # The defined key names its tag, so the association waits for it; the
+    # platform's key is the literal the contract wrote.
+    assert assoc["lf_tag"] == [
+        {"key": "classification", "value": "confidential"},
+        {"key": f"${{aws_lakeformation_lf_tag.{CID}_lf_tag_domain.key}}", "value": "sales"},
+    ]
+    assert "depends_on" not in assoc
+
+
+@pytest.mark.parametrize(
+    "tags, definitions",
+    [
+        ({"classification": "pii_low"}, {"classification": ["pii_low"]}),
+        ({"classification": "confidential", "domain": "sales"}, {"domain": ["sales"]}),
+        ({"classification": "confidential"}, None),
+        ({"a-b": "x"}, {"a_b": ["y"]}),
+    ],
+    ids=["defined", "mixed", "platform-owned", "resource-name-collision"],
+)
+def test_an_association_never_carries_depends_on(tags, definitions):
+    """OpenTofu prefers a reference to ``depends_on``; the ordering comes from ``key``."""
+    document = json.loads(build_module(AwsIacPlugin(), _contract(tags, definitions)))
+    assert list(_depends_on(document)) == []
+    defined = set(definitions or {})
+    referenced = {ref for _, ref in _tag_references(document)}
+    assert referenced == {
+        f"aws_lakeformation_lf_tag.{CID}_lf_tag_{key}" for key in defined if key in tags
+    }
 
 
 def test_a_defined_tag_still_precedes_its_association_control():
@@ -169,8 +215,13 @@ def test_a_defined_tag_still_precedes_its_association_control():
     assert _dangling(contract) == []
 
 
-def test_a_contract_that_defines_its_tags_emits_what_it_did():
-    """The association body of a contract that defines every key, as main emitted it."""
+def test_a_contract_that_defines_its_tags_names_each_tag_by_reference():
+    """The association body of a contract that defines every key.
+
+    ``main`` (63f3b40) emitted the literal keys and ``depends_on`` on both tags. The
+    references evaluate to the same keys, so an association deployed from that module
+    plans no change (``test_iac_lakeformation_tags_moto.py`` applies one and plans this).
+    """
     contract = _contract(
         {"classification": "pii_low", "domain": "sales"},
         {"classification": ["public", "pii_low", "pii_high"], "domain": ["sales", "marketing"]},
@@ -186,13 +237,12 @@ def test_a_contract_that_defines_its_tags_emits_what_it_did():
     }
     assert resources["aws_lakeformation_resource_lf_tags"] == {
         ASSOC: {
-            "depends_on": [
-                f"aws_lakeformation_lf_tag.{CID}_lf_tag_classification",
-                f"aws_lakeformation_lf_tag.{CID}_lf_tag_domain",
-            ],
             "lf_tag": [
-                {"key": "classification", "value": "pii_low"},
-                {"key": "domain", "value": "sales"},
+                {
+                    "key": f"${{aws_lakeformation_lf_tag.{CID}_lf_tag_classification.key}}",
+                    "value": "pii_low",
+                },
+                {"key": f"${{aws_lakeformation_lf_tag.{CID}_lf_tag_domain.key}}", "value": "sales"},
             ],
             "table": [
                 {
@@ -204,15 +254,17 @@ def test_a_contract_that_defines_its_tags_emits_what_it_did():
     }
 
 
-def test_a_key_with_an_empty_value_adds_no_edge():
-    """The edges come from the associations that carry a value, not from every key."""
+def test_a_key_with_an_empty_value_adds_no_reference():
+    """The references come from the associations that carry a value, not from every key."""
     contract = _contract(
         {"classification": "", "domain": "sales"},
         {"classification": ["public"], "domain": ["sales"]},
     )
     assoc = _association(contract)
-    assert assoc["lf_tag"] == [{"key": "domain", "value": "sales"}]
-    assert assoc["depends_on"] == [f"aws_lakeformation_lf_tag.{CID}_lf_tag_domain"]
+    assert assoc["lf_tag"] == [
+        {"key": f"${{aws_lakeformation_lf_tag.{CID}_lf_tag_domain.key}}", "value": "sales"}
+    ]
+    assert "depends_on" not in assoc
 
 
 def test_a_key_that_shares_a_defined_tags_resource_name_is_not_ordered_on_it():
@@ -253,7 +305,8 @@ def test_a_value_the_definition_does_not_allow_is_refused():
 def test_a_value_is_compared_case_folded(value):
     """Lake Formation stores keys and values lower-cased."""
     contract = _contract({"classification": value}, {"classification": ["Public", "internal"]})
-    assert _association(contract)["lf_tag"] == [{"key": "classification", "value": value}]
+    key = f"${{aws_lakeformation_lf_tag.{CID}_lf_tag_classification.key}}"
+    assert _association(contract)["lf_tag"] == [{"key": key, "value": value}]
     assert validate_governance(contract) == ([], [])
 
 

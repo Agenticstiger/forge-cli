@@ -25,8 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `fluid apply` failed with "Reference to undeclared resource". Such a key is now a
   tag the platform owns: associated as written, with no `depends_on`, no warning and no
   refusal. It must already exist in the account, and the identity running `fluid apply`
-  needs `ASSOCIATE` on it. The association still waits for the tags the contract
-  defines, and a contract that defines every tag it associates emits the same module.
+  needs `ASSOCIATE` on it. A key the contract defines is named by reference,
+  `key = aws_lakeformation_lf_tag.<name>.key`, the provider's documented pattern,
+  instead of a `depends_on` edge, so the association still waits for the tag. The
+  reference evaluates to the same key, so an association applied from 0.19.0 plans no
+  change (applied and planned against moto).
   Refused at `fluid validate` and at emit, where each used to fail at apply or be
   dropped: a value the contract's definition of the tag does not allow, compared
   case-insensitively (`lakeformation-tag-value`); a definition with no values, or two

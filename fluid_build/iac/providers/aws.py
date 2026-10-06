@@ -392,7 +392,7 @@ class AwsIacPlugin:
         # Account-level Lake Formation settings: admins + LF-tag
         # definitions. Emitted once per contract, before per-exposure
         # resources, so a resource_lf_tags association can tell the tags
-        # this module creates (and waits for) from those it does not.
+        # this module creates (and references) from those it does not.
         _emit_lf_account_settings(resources, contract, cid, base_tags)
 
         for index, exposure in enumerate(contract.get("exposes") or []):
@@ -1530,7 +1530,7 @@ def _wire_aws_deps(resources: Dict[str, Any], cid: str) -> None:
 #     ``admins`` → ``aws_lakeformation_data_lake_settings``,
 #     ``tagDefinitions`` → one ``aws_lakeformation_lf_tag`` per key.
 #     Must run before per-resource ``resource_lf_tags`` associations, which
-#     wait for the tags it wrote (see :func:`lf_tag_definitions`).
+#     reference the tags it wrote (see :func:`lf_tag_definitions`).
 #
 #   * ``_emit_lakeformation`` — fires per AWS exposure. Honours
 #     ``binding.governance.lakeFormation``:
@@ -2474,8 +2474,8 @@ def _emit_lakeformation(
     ``governance.lakeFormation`` block.
 
     ``lf_tags`` is :func:`lf_tag_associations`: the table's one
-    ``aws_lakeformation_resource_lf_tags``, ordered after the tags this module
-    creates and on nothing for a tag owned outside the contract.
+    ``aws_lakeformation_resource_lf_tags``, naming a tag this module creates by
+    reference to its key and a tag owned outside the contract by its literal key.
 
     ``row_filters`` is :func:`lf_row_filters`: a grant that carries one reads through a
     data cells filter (the filter's predicate, and the grant's excluded columns as its
@@ -2684,15 +2684,28 @@ def _emit_lf_tag_association(
 ) -> None:
     """The table's ``aws_lakeformation_resource_lf_tags``: :func:`lf_tag_associations`.
 
-    A tag must exist before it is associated. The association waits only for the
-    tags this module creates: the ``aws_lakeformation_lf_tag`` of the contract's
-    ``tagDefinitions``, which :func:`_emit_lf_account_settings` wrote before any
-    exposure, and only when that resource is this key's (one resource name can
-    stand for ``a-b`` and ``a_b``). A key the contract does not define is a tag
-    owned outside the contract, already in the account: an edge to it would name a
-    resource the module does not declare, and ``tofu validate`` refuses the whole
-    module. The key stays a plain string, which the renderer escapes.
+    A tag must exist before it is associated. A key this module creates names its
+    tag by reference, ``key = aws_lakeformation_lf_tag.<name>.key``, as the provider's
+    own example does, so OpenTofu orders the association after the tag from the
+    expression (OpenTofu recommends a reference over ``depends_on``). That is the
+    ``aws_lakeformation_lf_tag`` of the contract's ``tagDefinitions``, which
+    :func:`_emit_lf_account_settings` wrote before any exposure, and only when that
+    resource's key is this key (one resource name can stand for ``a-b`` and
+    ``a_b``). The reference evaluates to the same string, so a deployed association
+    plans no change. A key the contract does not define is a tag owned outside the
+    contract, already in the account: a reference to it would name a resource the
+    module does not declare, and ``tofu validate`` refuses the whole module. It stays
+    a plain string, which the renderer escapes.
     """
+    owned = resources.get("aws_lakeformation_lf_tag") or {}
+    lf_tag: List[Dict[str, Any]] = []
+    for tag in lf_tags:
+        name = _lf_tag_name(cid, tag["key"])
+        if (owned.get(name) or {}).get("key") == tag["key"]:
+            # ``name`` is ``safe_ident`` output, so the expression is emitter text.
+            lf_tag.append({**tag, "key": tofu_ref(f"aws_lakeformation_lf_tag.{name}.key")})
+        else:
+            lf_tag.append(dict(tag))
     assoc: Dict[str, Any] = {
         "table": [
             {
@@ -2700,16 +2713,8 @@ def _emit_lf_tag_association(
                 "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
             }
         ],
-        "lf_tag": [dict(t) for t in lf_tags],
+        "lf_tag": lf_tag,
     }
-    owned = resources.get("aws_lakeformation_lf_tag") or {}
-    depends_on: List[str] = []
-    for tag in lf_tags:
-        name = _lf_tag_name(cid, tag["key"])
-        if (owned.get(name) or {}).get("key") == tag["key"]:
-            depends_on.append(f"aws_lakeformation_lf_tag.{name}")
-    if depends_on:
-        assoc["depends_on"] = depends_on
     resources.setdefault("aws_lakeformation_resource_lf_tags", {})[
         safe_ident(f"{cid}_lf_tags_{table}")
     ] = assoc
