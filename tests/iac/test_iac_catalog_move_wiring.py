@@ -220,3 +220,13 @@ def test_nothing_to_release_reaches_plan(monkeypatch, tmp_path, contract, state,
 
     assert "plan" in tofu.calls
     assert "iceberg_catalog_move_probe_skipped" not in caplog.text
+
+
+def test_the_blocked_event_links_to_the_guard_section():
+    """The CLI prints the docs link the catalog maps the event to; unmapped, it
+    fell back to the generic troubleshooting page, which never mentions it."""
+    from fluid_build._error_catalog import docs_url_for, suggestions_for
+
+    url = docs_url_for("iceberg_catalog_move_blocked")
+    assert url is not None and url.endswith("cli/apply.html#iceberg-catalog-move-guard")
+    assert any("tofu state rm" in s for s in suggestions_for("iceberg_catalog_move_blocked"))

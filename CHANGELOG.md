@@ -16,11 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `iceberg_catalog_move_blocked` and prints the `tofu state rm` commands that release
   them, instead of planning to destroy them: destroying a Glue database deletes every
   table in it. The resources stay in AWS; run the commands, then apply again.
-- The same guard covers Snowflake. An Iceberg expose on `platform: snowflake` whose
-  catalog is external (`lakekeeper`, `rest`, `iceberg_rest`, `polaris`, `unity`, `nessie`
-  or `bigquery`) got a Snowflake EXTERNAL VOLUME from earlier releases and no longer
-  does; `fluid apply` stops with `iceberg_catalog_move_blocked` and the `tofu state rm`
-  command for the volume instead of planning to drop it.
+- The same guard covers Snowflake. An Iceberg expose on `platform: snowflake` with
+  `catalog: lakekeeper`, `bigquery`, the `iceberg-rest` spelling, `hive`, `jdbc`,
+  `hadoop` or `dynamodb` got a Snowflake EXTERNAL VOLUME from 0.19.0 and earlier and no
+  longer does (`rest`, `iceberg_rest`, `polaris`, `unity`, `nessie` and `glue` never
+  had one). `fluid apply` stops with `iceberg_catalog_move_blocked` and the `tofu state
+  rm` command for the volume instead of planning to drop it.
 - A GCP Iceberg expose that a streaming sink writes to must now name its catalog in
   `binding.location.catalog`. Without one, the sink wrote through a REST catalog while
   dbt-bigquery and the GCP IaC created a BigLake table, so one table lived in two
