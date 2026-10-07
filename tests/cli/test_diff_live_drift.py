@@ -753,6 +753,35 @@ def test_glue_access_denied_is_not_read_as_absent(workspace, built_providers, gl
     assert "AccessDeniedException" in expose["detail"]
 
 
+@pytest.mark.parametrize(
+    ("catalog", "kind"),
+    [("lakekeeper", "lakekeeper"), ("iceberg_rest", "rest"), ("nessie", "nessie")],
+)
+def test_an_iceberg_table_in_another_catalog_is_not_read_from_glue(
+    workspace, built_providers, monkeypatch, catalog, kind
+):
+    """Apply creates no Glue table for it, so a Glue table of that name would be
+    somebody else's: neither "absent" nor a comparison with it is true. Runs
+    everywhere, because no AWS call may be made."""
+    from fluid_build.providers import aws_validation
+
+    def _no_aws(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("the Glue inspector reached AWS for a non-Glue Iceberg table")
+
+    monkeypatch.setattr(aws_validation, "AWSValidationProvider", _no_aws)
+    binding = json.loads(json.dumps(AWS_BINDING))
+    binding["format"] = "iceberg"
+    binding["location"]["catalog"] = catalog
+    contract = _write_contract(workspace, _contract(binding))
+
+    rc, event = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    (expose,) = _report(workspace / "diff.json")["live"]["exposes"]
+    assert (rc, event) == (0, None)
+    assert expose["status"] == "not_checked"
+    assert expose["detail"] == f"table lives in Iceberg catalog {kind}; Glue is not inspected"
+
+
 def test_aws_overlay_plans_in_the_binding_region_and_reaches_the_comparison(
     workspace, glue, monkeypatch
 ):

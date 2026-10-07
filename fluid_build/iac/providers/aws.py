@@ -20,6 +20,11 @@ Kinesis data streams, and Redshift Serverless namespaces + workgroups + a
 ``CREATE EXTERNAL SCHEMA`` bridge so Redshift queries the same Glue catalog
 via Spectrum. A pure function of the contract; no credentials, no network.
 
+An Iceberg expose whose ``location.catalog`` names another catalog
+(Lakekeeper, a REST catalog, Polaris, Nessie...) gets its S3 bucket but no Glue
+database or table: the table lives in that catalog, which the streaming sink and
+dbt write to as well (see :func:`_glue_cataloged`).
+
 **Packaging modes (RFC-packaging-modes.md file 3).** ``resolve_packaging``
 decides per container kind whether this contract owns the container:
 
@@ -53,6 +58,14 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
+from ...providers._iceberg_catalog import (
+    FAMILY_UNKNOWN,
+    binding_catalog_kind,
+    catalog_kind_info,
+    is_glue_cataloged,
+    is_iceberg_format,
+    known_catalog_kinds,
+)
 from ...providers._sql_safety import quote_string_literal, validate_ident
 from ...providers.aws.util import warehouse as _warehouse
 from .. import column_access
@@ -402,6 +415,11 @@ class AwsIacPlugin:
             loc = binding.get("location") or {}
             fmt = binding.get("format") or "parquet"
             schema = (exposure.get("contract") or {}).get("schema") or []
+            # Lake Formation on an Iceberg table another catalog owns is
+            # refused before any of it is derived: every LF resource names the
+            # Glue table, and there is none (see :func:`_glue_cataloged`).
+            refuse_lake_formation_on_external_catalog(exposure, binding, index)
+            refuse_unknown_iceberg_catalog(exposure, binding, index)
             # The contract's column restrictions, as each Lake Formation grant's
             # excluded columns (``iac/column_access.py``), its row filters, each on
             # the read grant of its principal, and the protected views its masked
@@ -424,6 +442,7 @@ class AwsIacPlugin:
                 schema,
                 cid,
                 tags,
+                binding=binding,
                 contract=contract,
                 placement=placement,
                 labels=gov_labels,
@@ -574,11 +593,13 @@ class AwsIacPlugin:
                 seen.add(address)
                 blocks.append(ImportBlock(to=address, id=resource_id))
 
-        # Resolve catalog_id once — only when needed (Glue catalog refs).
+        # Resolve catalog_id once — only when needed (Glue catalog refs). The
+        # raw format here, not the emit's parquet default: unchanged from before
+        # the catalog half of the gate was added.
         contract_needs_catalog_id = any(
             is_cloud(b.get("binding") or {}, "aws")
             and ((b.get("binding") or {}).get("location") or {}).get("database")
-            and str(((b.get("binding") or {}).get("format")) or "").lower() in _GLUE_CATALOG_FORMATS
+            and _glue_cataloged(b.get("binding") or {}, (b.get("binding") or {}).get("format"))
             for b in contract.get("exposes") or []
         )
         catalog_id = _resolve_catalog_id() if contract_needs_catalog_id else ""
@@ -597,8 +618,10 @@ class AwsIacPlugin:
             namespace = loc.get("namespace") or loc.get("workgroup")
 
             # Glue catalog resources — only file/lakehouse formats use
-            # the Glue catalog (mirrors ``_emit_glue``'s gate).
-            if database and catalog_id and str(fmt or "").lower() in _GLUE_CATALOG_FORMATS:
+            # the Glue catalog (mirrors ``_emit_glue``'s gate). An Iceberg
+            # table in another catalog is not imported: a Glue table of its
+            # name would be adopted into state as if the contract owned it.
+            if database and catalog_id and _glue_cataloged(binding, fmt):
                 db_key = safe_ident(f"{cid}_{database}")
                 if not placement.database_referenced:
                     # provider id: ``{catalog_id}:{name}``
@@ -734,6 +757,92 @@ _GLUE_CATALOG_FORMATS: frozenset = frozenset(
     {"iceberg", "parquet", "csv", "json", "avro", "orc", "delta"}
 )
 
+
+def _glue_cataloged(binding: Mapping[str, Any], fmt: Any) -> bool:
+    """THE gate of every resource that is, or names, the binding's Glue table.
+
+    Two halves. ``fmt`` (as the caller resolved it) must be a format Glue
+    catalogs (:data:`_GLUE_CATALOG_FORMATS`), and an Iceberg table must also
+    live in the Glue catalog (``_iceberg_catalog.is_glue_cataloged``: no
+    ``location.catalog`` on AWS means Glue). A ``catalog: lakekeeper`` (REST,
+    Polaris, Unity, Nessie...) table lives in THAT catalog: the sink streams to
+    it over REST and dbt writes it there, while this emitter used to create a
+    second, metadata-less Glue table of the same name beside it.
+
+    Every gate reads this one predicate: the Glue database and table
+    (:func:`_emit_glue`), their imports (:meth:`AwsIacPlugin.discover_imports`),
+    the Lake Formation grants, tags and filters (:func:`_emit_lakeformation`),
+    the LF bucket policy, the column checks and ``fluid diff``'s Glue
+    inspector. A Lake Formation resource that passes a gate the Glue table did
+    not references an undeclared ``aws_glue_catalog_table`` and ``tofu
+    validate`` fails. The S3 bucket is not gated: a REST catalog's storage
+    profile still needs it.
+    """
+    return str(fmt or "").lower() in _GLUE_CATALOG_FORMATS and is_glue_cataloged(binding)
+
+
+def refuse_lake_formation_on_external_catalog(
+    exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int = 0
+) -> None:
+    """Refuse ``governance.lakeFormation`` on an Iceberg table another catalog owns.
+
+    Lake Formation governs tables of the Glue Data Catalog. Every per-expose LF
+    resource names the Glue table (grants, LF-tags, data-cells filters) and
+    :func:`_glue_cataloged` emits none for a Lakekeeper or other REST-catalog
+    table, so the block would be dropped without a word: the grants a reviewer
+    read in the contract would control nothing. Called by
+    :meth:`AwsIacPlugin.emit` and by ``governance_validation.validate_governance``,
+    so it is refused at ``fluid validate`` with the message ``fluid apply`` gives.
+    """
+    governance = binding.get("governance")
+    if not isinstance(governance, Mapping) or not governance.get("lakeFormation"):
+        return
+    if is_glue_cataloged(binding):
+        return
+    kind = binding_catalog_kind(binding)
+    raise UnsupportedBindingError(
+        "lake-formation-needs-glue-catalog",
+        f"exposes[{_expose_id(exposure) or index}] declares governance.lakeFormation, but "
+        f"its Iceberg table lives in the {kind!r} catalog (location.catalog), not in AWS "
+        "Glue. Lake Formation governs only Glue Data Catalog tables, so its grants, LF-tags "
+        "and filters would have no table to name and would not be applied.",
+        (
+            f"Govern access in the {kind} catalog itself and remove governance.lakeFormation "
+            "from this binding.",
+            "Remove location.catalog (or set it to 'glue') to keep the table in the Glue "
+            "catalog under Lake Formation.",
+        ),
+    )
+
+
+def refuse_unknown_iceberg_catalog(
+    exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int = 0
+) -> None:
+    """Refuse an Iceberg ``location.catalog`` value no row of the table knows.
+
+    ``fluid validate`` already reports it, but ``fluid apply`` does not run
+    that gate, and on AWS the answer decides whether a Glue table exists: a
+    typo (``catalog: glu``) would otherwise apply with no Glue table and no
+    word. Fail closed with the accepted spellings instead.
+    """
+    if not is_iceberg_format(binding.get("format")):
+        return
+    loc = binding.get("location")
+    raw = loc.get("catalog") if isinstance(loc, Mapping) else None
+    if not raw or catalog_kind_info(raw).family != FAMILY_UNKNOWN:
+        return
+    raise UnsupportedBindingError(
+        "unknown-iceberg-catalog",
+        f"exposes[{_expose_id(exposure) or index}] names Iceberg catalog {raw!r} "
+        "(location.catalog), which FLUID does not know, so it cannot tell whether the "
+        "table belongs in AWS Glue.",
+        (
+            "Use one of: " + ", ".join(known_catalog_kinds()) + ".",
+            "Remove location.catalog to keep the table in the Glue catalog.",
+        ),
+    )
+
+
 #: Hive storage classes per file format, for query engines (Athena, Spark)
 #: that read a Glue table through them. Iceberg is read through its metadata,
 #: not these, and is deliberately absent.
@@ -792,6 +901,7 @@ def _emit_glue(
     cid: str,
     tags: Dict[str, str],
     *,
+    binding: Mapping[str, Any],
     contract: Optional[Mapping[str, Any]] = None,
     placement: _Placement = _LEGACY_PLACEMENT,
     labels: Optional[Mapping[str, str]] = None,
@@ -801,8 +911,9 @@ def _emit_glue(
         return
     # Only file/lakehouse formats use the Glue catalog as their
     # storage-and-schema registry. Redshift-flavoured bindings (whose
-    # ``database`` is internal to the workgroup) skip this emit.
-    if str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS:
+    # ``database`` is internal to the workgroup) skip this emit, and so does
+    # an Iceberg table another catalog owns (see :func:`_glue_cataloged`).
+    if not _glue_cataloged(binding, fmt):
         return
     db_name = safe_ident(f"{cid}_{database}")
     if not placement.database_referenced:
@@ -1554,10 +1665,12 @@ def _wire_aws_deps(resources: Dict[str, Any], cid: str) -> None:
 #     none for a tag owned outside the contract (its resource is not here).
 #   - Empty governance blocks emit nothing — every existing contract
 #     stays at zero LF surface area.
-#   - LF is Glue-catalog-backed, so the per-exposure emit only fires for
-#     formats in ``_GLUE_CATALOG_FORMATS``. Redshift / Kinesis / Lambda
-#     bindings ignore any governance.lakeFormation block by design (LF
-#     doesn't manage those resources).
+#   - LF is Glue-catalog-backed, so the per-exposure emit only fires where
+#     ``_glue_cataloged`` does. Redshift / Kinesis / Lambda bindings ignore
+#     any governance.lakeFormation block by design (LF doesn't manage those
+#     resources); an Iceberg table in another catalog has its block REFUSED
+#     (``refuse_lake_formation_on_external_catalog``), because there the
+#     author asked LF to govern a table that only looks like one it could.
 
 
 def _contract_uses_lakeformation(contract: Mapping[str, Any]) -> bool:
@@ -1701,9 +1814,11 @@ def lf_tag_associations(
         return []
     lf_tags = [{"key": str(k), "value": str(v)} for k, v in tags.items() if v]
     fmt = str(binding.get("format") or "parquet")
-    if not lf_tags or fmt.lower() not in _GLUE_CATALOG_FORMATS:
-        # Not a Glue-catalog format: _emit_lakeformation ignores the whole
-        # governance.lakeFormation block of such a binding, by design.
+    if not lf_tags or not _glue_cataloged(binding, fmt):
+        # Not a Glue-catalog table: _emit_lakeformation ignores the whole
+        # governance.lakeFormation block of such a binding, by design (an Iceberg
+        # table in another catalog is refused before this, by
+        # :func:`refuse_lake_formation_on_external_catalog`).
         return []
     where = f"exposes[{exposure.get('exposeId') or index}] governance.lakeFormation.tags"
     loc = binding.get("location") or {}
@@ -1931,14 +2046,14 @@ def _lf_bucket_policy(
     * ``all-grantees``: a statement for every ``arn:`` grantee — the emit
       before this field existed, byte for byte.
 
-    ``None`` when there is no ``governance.lakeFormation`` block, the format is
-    not Glue-catalog-backed, no database or bucket is bound, no grant names an
-    ``arn:`` principal, or the mode is ``none``.
+    ``None`` when there is no ``governance.lakeFormation`` block, the table is
+    not in the Glue catalog (:func:`_glue_cataloged`), no database or bucket is
+    bound, no grant names an ``arn:`` principal, or the mode is ``none``.
     """
     gov = (binding.get("governance") or {}).get("lakeFormation") or {}
     if not gov:
         return None
-    if str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS or not loc.get("database"):
+    if not _glue_cataloged(binding, fmt) or not loc.get("database"):
         return None
     mode = _lf_bucket_policy_mode(gov)
     principals = _lf_bucket_principals(gov)
@@ -2189,12 +2304,31 @@ def lf_column_exclusions(
     The exclusions reach a grant only as ``table_with_columns`` on a Glue-catalog
     table, so a restriction on another format, or on a binding that names no
     database and table, would be dropped by :func:`_emit_lakeformation`.
+
+    An Iceberg table in another catalog (Lakekeeper, REST...) is refused first,
+    by name: ``column_access`` would otherwise tell the author to add Lake
+    Formation grants, which :func:`refuse_lake_formation_on_external_catalog`
+    then refuses.
     """
+    if column_access.restrictions_for(exposure, index) and not is_glue_cataloged(binding):
+        kind = binding_catalog_kind(binding)
+        raise UnsupportedBindingError(
+            "column-restriction-unenforceable",
+            f"exposes[{exposure.get('exposeId') or index}] restricts columns, but its Iceberg "
+            f"table lives in the {kind!r} catalog (location.catalog), not in AWS Glue; the AWS "
+            "emitter enforces column restrictions only through Lake Formation grants on a "
+            "Glue-catalog table, so nothing would enforce them.",
+            (
+                f"Enforce the restriction in the {kind} catalog's own access control.",
+                "Remove location.catalog (or set it to 'glue') to keep the table in the Glue "
+                "catalog, where Lake Formation grants carry the restriction.",
+            ),
+        )
     exclusions = column_access.lf_exclusions(exposure, binding, index)
     loc = binding.get("location") or {}
     fmt = str(binding.get("format") or "parquet")
     if exclusions is not None and (
-        fmt.lower() not in _GLUE_CATALOG_FORMATS or not loc.get("database") or not loc.get("table")
+        not _glue_cataloged(binding, fmt) or not loc.get("database") or not loc.get("table")
     ):
         raise UnsupportedBindingError(
             "column-restriction-unenforceable",
@@ -2225,9 +2359,26 @@ def lf_row_filters(
     if not filters:
         return {}
     where = f"exposes[{exposure.get('exposeId') or index}].policy.authz.rowFilters"
+    if not is_glue_cataloged(binding):
+        # Refused by name, as column restrictions are: the generic message below
+        # would send the author to Lake Formation grants, which
+        # :func:`refuse_lake_formation_on_external_catalog` then refuses.
+        kind = binding_catalog_kind(binding)
+        raise UnsupportedBindingError(
+            "row-filter-unenforceable",
+            f"{where} filters rows, but its Iceberg table lives in the {kind!r} catalog "
+            "(location.catalog), not in AWS Glue; the AWS emitter enforces row filters only "
+            "as Lake Formation data cells filters on a Glue-catalog table, so nothing would "
+            "enforce it.",
+            (
+                f"Enforce the filter in the {kind} catalog's own access control.",
+                "Remove location.catalog (or set it to 'glue') to keep the table in the Glue "
+                "catalog, where a data cells filter carries the row filter.",
+            ),
+        )
     loc = binding.get("location") or {}
     fmt = str(binding.get("format") or "parquet")
-    if fmt.lower() not in _GLUE_CATALOG_FORMATS or not loc.get("database") or not loc.get("table"):
+    if not _glue_cataloged(binding, fmt) or not loc.get("database") or not loc.get("table"):
         formats = sorted(_GLUE_CATALOG_FORMATS)
         raise UnsupportedBindingError(
             "row-filter-unenforceable",
@@ -2527,8 +2678,10 @@ def _emit_lakeformation(
         return
     # LF only meaningfully manages access to Glue-catalog-backed formats
     # (file formats on S3). Redshift/Kinesis bindings have their own
-    # access-control models and are skipped here.
-    if str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS:
+    # access-control models and are skipped here. An Iceberg table in another
+    # catalog never reaches this: ``emit`` refuses its LF block first
+    # (:func:`refuse_lake_formation_on_external_catalog`).
+    if not _glue_cataloged(binding, fmt):
         return
 
     database = loc.get("database")
@@ -2888,7 +3041,7 @@ def _check_lf_grant_columns(
     (:func:`lf_column_exclusions`): what the emitter writes, so what is checked.
     """
     gov = (binding.get("governance") or {}).get("lakeFormation") or {}
-    if not gov or str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS:
+    if not gov or not _glue_cataloged(binding, fmt):
         return
     if not loc.get("database") or not loc.get("table"):
         return

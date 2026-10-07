@@ -522,7 +522,14 @@ def _execute_debezium_server(
             find_iceberg_expose_binding,
             resolve_iceberg_catalog,
         )
+        from ..kafka_connect.iceberg_sink_validation import iceberg_sink_preflight
         from .iceberg_sink import emit_debezium_iceberg_sink_config
+
+        # Fail closed BEFORE application.properties is written: the same
+        # checks `fluid validate` runs, so a sink it rejects never boots.
+        preflight_error = iceberg_sink_preflight(ctx.contract, ctx.build_id, log=LOG)
+        if preflight_error:
+            return _failed(ctx, started_at, t_start, preflight_error)
 
         binding = find_iceberg_expose_binding(ctx.contract)
         if binding is not None:

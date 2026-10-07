@@ -58,7 +58,9 @@ def compile_policy(contract: dict) -> Tuple[List[Dict[str, Any]], List[str]]:
     Reads binding.platform from the contract schema to determine the
     provider and generate appropriate bindings.  The provider and project
     are embedded in the output so downstream tools (policy-apply) don't
-    need separate flags.
+    need separate flags. An Iceberg expose is granted where its catalog
+    lives: Glue grants only for a Glue-cataloged table (see
+    :func:`_compile_catalog_managed_iceberg` for every other catalog).
 
     Returns:
         (bindings, warnings) where bindings is a list of IAM binding dicts
@@ -87,6 +89,10 @@ def compile_policy(contract: dict) -> Tuple[List[Dict[str, Any]], List[str]]:
 
             if platform == "gcp" or fmt in ("bigquery_table", "gcs_parquet_files", "gcs_file"):
                 _compile_gcp_bindings(bindings, fmt, loc, principal, permissions)
+            elif not _glue_cataloged(binding):
+                _compile_catalog_managed_iceberg(
+                    bindings, warnings, exp, binding, principal, permissions
+                )
             elif platform == "aws" or fmt in ("s3_file", "iceberg", "parquet"):
                 _compile_aws_bindings(bindings, fmt, loc, principal, permissions)
             elif platform == "snowflake" or fmt == "snowflake_table":
@@ -142,8 +148,80 @@ def _compile_gcp_bindings(bindings, fmt, loc, principal, permissions):
             )
 
 
-def _compile_aws_bindings(bindings, fmt, loc, principal, permissions):
-    """Generate AWS IAM policy statements."""
+def _glue_cataloged(binding) -> bool:
+    """Is this expose's table registered in AWS Glue?
+
+    True for every non-Iceberg format and for an Iceberg table whose catalog
+    is Glue (named, or the AWS default). The format check used to be enough
+    on its own: every ``iceberg`` expose was routed to the AWS compiler, so a
+    Lakekeeper table, a Snowflake-managed table and a ``platform: local``
+    table each got a ``glue.table`` grant on a Glue table that does not
+    exist. Reads the classification every emitter shares, imported lazily so
+    this module stays cheap to import.
+    """
+    from ..providers._iceberg_catalog import is_glue_cataloged
+
+    if not isinstance(binding.get("location") or {}, dict):
+        return True  # malformed: keep the historic routing, schema reports it
+    return is_glue_cataloged(binding)
+
+
+def _compile_catalog_managed_iceberg(bindings, warnings, exp, binding, principal, permissions):
+    """Compile an Iceberg expose whose catalog is not AWS Glue.
+
+    The catalog owns the table, so the table-level grant belongs to the
+    catalog's own access control (Snowflake RBAC for a Snowflake-managed
+    table; Lakekeeper / Polaris / Unity authorization for a REST catalog).
+    Snowflake RBAC is compiled here. A grant this compiler cannot express is
+    reported as a warning, the same channel as an unsupported platform, never
+    dropped: a contract that reads as "principal X may read this table" must
+    not compile to silence.
+
+    On AWS the bucket the binding names is still the table's storage, so its
+    S3 statement is emitted; the Glue statement is not.
+    """
+    from ..iac.provider_match import canonical_cloud
+    from ..providers._iceberg_catalog import (
+        FAMILY_SNOWFLAKE_MANAGED,
+        binding_catalog_kind,
+        catalog_kind_info,
+    )
+
+    kind = binding_catalog_kind(binding)
+    fmt = binding.get("format", "")
+    loc = binding.get("location") or {}
+    cloud = canonical_cloud(binding.get("platform"))
+    snowflake_managed = catalog_kind_info(kind).family == FAMILY_SNOWFLAKE_MANAGED
+
+    if snowflake_managed or cloud == "snowflake":
+        _compile_snowflake_bindings(bindings, fmt, loc, principal, permissions)
+    elif cloud == "aws":
+        _compile_aws_bindings(bindings, fmt, loc, principal, permissions, glue=False)
+
+    if snowflake_managed:
+        return
+    expose_id = exp.get("exposeId") or exp.get("id") or "?"
+    perms = list(permissions)
+    if cloud == "snowflake":
+        warnings.append(
+            f"Iceberg expose '{expose_id}' is cataloged in '{kind}': the Snowflake grant "
+            f"compiled for {principal} covers Snowflake readers only. Enforce {perms} for "
+            f"every other engine in the '{kind}' catalog's own access control."
+        )
+    else:
+        warnings.append(
+            f"Iceberg expose '{expose_id}' is cataloged in '{kind}', not AWS Glue, so no "
+            f"table grant was compiled for {principal} {perms}. Enforce it in the "
+            f"'{kind}' catalog's own access control."
+        )
+
+
+def _compile_aws_bindings(bindings, fmt, loc, principal, permissions, *, glue=True):
+    """Generate AWS IAM policy statements.
+
+    ``glue=False`` emits only the S3 statement, for an Iceberg table whose
+    catalog is not Glue (:func:`_compile_catalog_managed_iceberg`).
+    """
     bucket = loc.get("bucket")
     if bucket:
         perm_key = (
@@ -166,7 +244,7 @@ def _compile_aws_bindings(bindings, fmt, loc, principal, permissions):
     # Glue/Athena bindings
     database = loc.get("database") or loc.get("dataset")
     table = loc.get("table")
-    if database:
+    if glue and database:
         perm_key = (
             "manage"
             if any(p in permissions for p in ("write", "insert", "update", "delete"))

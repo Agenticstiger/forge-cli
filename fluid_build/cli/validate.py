@@ -736,8 +736,15 @@ def _run_contract_rules(
         # --- Iceberg streaming-sink checks (RFC-streaming-extension §6.8) --
         # Catch the connector's silent-fail-at-first-record traps at validate
         # time: a sink with no Iceberg expose, the v1-deferred upsert mode,
-        # dynamic routing without a route field, an incomplete REST catalog, or
-        # an operator warehouse override that diverges from the binding.
+        # dynamic routing without a route field, a catalog kind the shared
+        # table does not know or whose required location keys are missing, a
+        # sink.catalog that disagrees with the expose, or an operator override
+        # that moves the warehouse or sets both catalog selectors.
+        #
+        # This gate and the two below fail CLOSED: a crash inside one is an
+        # error, not a --verbose-only note. It used to be the latter, so a
+        # validator that raised on some contract shape passed that contract
+        # as valid with the gate silently switched off.
         try:
             from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
                 validate_iceberg_sink,
@@ -749,9 +756,12 @@ def _run_contract_rules(
                 validation_result.is_valid = False
             for msg in ice_warnings:
                 validation_result.add_warning(msg)
-        except Exception as exc:  # pragma: no cover — defensive
-            if args.verbose:
-                info(logger, f"Iceberg sink check skipped: {exc}")
+        except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+            validation_result.add_error(
+                f"Iceberg sink check could not run ({type(exc).__name__}: {exc}); "
+                "the contract was NOT checked for streaming-sink defects"
+            )
+            validation_result.is_valid = False
 
         # --- Confluent Tableflow binding checks (RFC-streaming-extension §15) --
         # A confluent-bound Iceberg expose carries hard Tableflow inputs
@@ -767,9 +777,12 @@ def _run_contract_rules(
                 validation_result.is_valid = False
             for msg in cf_warnings:
                 validation_result.add_warning(msg)
-        except Exception as exc:  # pragma: no cover — defensive
-            if args.verbose:
-                info(logger, f"Confluent binding check skipped: {exc}")
+        except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+            validation_result.add_error(
+                f"Confluent binding check could not run ({type(exc).__name__}: {exc}); "
+                "the contract was NOT checked for Tableflow binding defects"
+            )
+            validation_result.is_valid = False
 
         # --- Iceberg prerequisite checks (anti-no-op gate) ------------------
         # The Snowflake and GCP IaC emitters are emit-when-derivable: an
@@ -786,9 +799,12 @@ def _run_contract_rules(
                 validation_result.is_valid = False
             for msg in ice_warnings:
                 validation_result.add_warning(msg)
-        except Exception as exc:  # pragma: no cover (defensive)
-            if args.verbose:
-                info(logger, f"Iceberg binding check skipped: {exc}")
+        except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+            validation_result.add_error(
+                f"Iceberg binding check could not run ({type(exc).__name__}: {exc}); "
+                "the contract was NOT checked for Iceberg prerequisite defects"
+            )
+            validation_result.is_valid = False
 
         # --- GCP binding checks (anti-no-op gate) ---------------------------
         # The GCP IaC emitter resolves each expose to a BigQuery / GCS /

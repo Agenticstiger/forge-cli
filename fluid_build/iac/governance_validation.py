@@ -21,7 +21,8 @@ key on AWS or an AWS key on GCP, retention or encryption on a GCP target that is
 a BigQuery table, and a Lake Formation tag the module cannot create or associate as
 declared (a definition with no values, two definitions that are one resource, a
 value the contract's definition of the tag does not allow, tags on a binding with no
-Glue table); ``fluid plan`` does not run the emitter. This runs the SAME derivations
+Glue table), and Lake Formation on an Iceberg table that lives in a catalog other
+than Glue; ``fluid plan`` does not run the emitter. This runs the SAME derivations
 (``iac/providers/gcp_governance.py``, ``lf_governance`` and ``lf_tag_associations``
 in ``iac/providers/aws.py``, ``iac/column_access.py``, ``iac/principals.py``) so
 ``fluid validate`` reports each refusal at stage 2, with the same message, instead of
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 from typing import Any, List, Mapping, Tuple
 
+from ..providers._iceberg_catalog import binding_catalog_kind, is_glue_cataloged
 from .access import normalize_access_grants
 from .base import UnsupportedBindingError
 from .principals import gcp_grants, principal_map
@@ -69,17 +71,25 @@ def _lf_tag_definition_errors(contract: Mapping[str, Any]) -> List[str]:
 def _aws_refusal(
     contract: Mapping[str, Any], exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int
 ) -> str:
-    """What the AWS emitter refuses this expose with, or ``""``: ``lf_governance``,
-    then ``lf_tag_associations``, in the emitter's order.
+    """What the AWS emitter refuses this expose with, or ``""``: Lake Formation on
+    a table outside Glue, ``lf_governance``, then ``lf_tag_associations``, in the
+    emitter's order.
 
     A name the masked view's SQL cannot quote raises a plain ``ValueError``
     (``validate_ident``), on which the emitter stops too. It is reported here as the
     expose's error: escaping, it would end :func:`validate_governance`, and
     ``fluid validate`` would report no governance finding at all.
     """
-    from .providers.aws import lf_governance, lf_tag_associations
+    from .providers.aws import (
+        lf_governance,
+        lf_tag_associations,
+        refuse_lake_formation_on_external_catalog,
+    )
 
     try:
+        # Lake Formation on an Iceberg table another catalog owns would
+        # otherwise be dropped at apply: refused first, as the emitter does.
+        refuse_lake_formation_on_external_catalog(exposure, binding, index)
         lf_governance(exposure, binding, index)
         lf_tag_associations(contract, exposure, binding, index)
     except UnsupportedBindingError as exc:
@@ -104,6 +114,9 @@ def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
     warnings: List[str] = []
     grants = normalize_access_grants(contract)
     unenforced: List[str] = []
+    # AWS Iceberg tables in another catalog: Lake Formation cannot reach them,
+    # so the remedy the warning below gives would itself be refused.
+    elsewhere: List[str] = []
     try:
         _gov.refuse_mixed_dataset_encryption(contract)
     except UnsupportedBindingError as exc:
@@ -122,7 +135,11 @@ def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
                 if refusal:
                     errors.append(refusal)
                 elif not _lf_grants(binding):
-                    unenforced.append(str(exposure.get("exposeId") or index))
+                    expose_id = str(exposure.get("exposeId") or index)
+                    if is_glue_cataloged(binding):
+                        unenforced.append(expose_id)
+                    else:
+                        elsewhere.append(f"{expose_id} ({binding_catalog_kind(binding)})")
                 continue
             if not _gov.gcp_owned(binding):
                 continue
@@ -147,6 +164,13 @@ def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
             "the AWS emitter does not write accessPolicy, and these bindings declare no "
             "governance.lakeFormation.grants, the AWS form of who may read the table. Add "
             "them to the aws overlay's binding (column restrictions then narrow them)."
+        )
+    if grants and elsewhere:
+        warnings.append(
+            f"accessPolicy.grants are not enforced on aws binding(s) {', '.join(elsewhere)}: "
+            "their Iceberg tables live in a catalog other than Glue, and the AWS emitter "
+            "writes access only as Lake Formation grants on a Glue table. Grant access in "
+            "that catalog."
         )
     return errors, warnings
 

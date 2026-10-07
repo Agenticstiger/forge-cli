@@ -138,6 +138,37 @@ python scripts/cleanup_bigquery_test_artifacts.py
 python scripts/cleanup_aws_test_artifacts.py
 ```
 
+## Heavy emulated lane: Lakekeeper + Kafka Connect
+
+`integration-emulated-heavy.yml::lakekeeper-integration` runs `tests/integration/test_lakekeeper_kafka_connect_live.py` against a throwaway Docker stack: Postgres and Lakekeeper (an Iceberg REST catalog), Silo (S3 + STS), a single-node KRaft Kafka, and `cp-kafka-connect` with the Apache Iceberg sink 1.9.2. Every image is pinned by digest and the job holds no secrets.
+
+Each sink config is derived only through forge's own code (`find_iceberg_expose_binding` → `resolve_iceberg_catalog` → `emit_iceberg_sink_config`), then handed to the real worker:
+
+- A `location.catalog: lakekeeper` expose streams records into Lakekeeper. The config carries `type=rest`, the warehouse by name, and no FileIO or storage keys, because Lakekeeper vends STS credentials. The sink creates the namespace and the table, and the test waits until the current snapshot holds every record.
+- A sink carrying both `iceberg.catalog.type` and `iceberg.catalog.catalog-impl` fails at task start with `Cannot create catalog iceberg, both type and catalog-impl are set`, in the task status trace and in the worker log. Every Glue sink failed this way until the deriver emitted one key or the other.
+- forge's derived Glue config (`catalog-impl` only) starts on the same worker. It writes nothing, so no AWS account is involved.
+
+The lane runs nightly, on `workflow_dispatch`, and on a PR carrying the `ci:integration-emulated` label. `scripts/ci/assert_lane_coverage.py` fails the job if the tests skipped.
+
+To run it locally you need Docker with about 2 GB of memory to spare. Once the images are pulled, a run takes about three minutes, most of it the worker's first commit:
+
+```bash
+pip install -e ".[dev]"
+
+FLUID_TEST_LAKEKEEPER=1 \
+FLUID_LK_PLUGIN_CACHE=~/.cache/fluid/iceberg-kafka-connect \
+  pytest -v -m emulated_heavy tests/integration/test_lakekeeper_kafka_connect_live.py
+```
+
+| Variable | Effect |
+|---|---|
+| `FLUID_TEST_LAKEKEEPER=1` | Opts in. Without it, or without a reachable Docker daemon, the module skips. |
+| `FLUID_LK_PLUGIN_CACHE` | Host directory for the unzipped sink plugin (about 165 MB), reused across runs. Unset, a compose volume holds it and teardown deletes it, so every run downloads it again. |
+| `FLUID_LK_PROJECT` | Compose project name. Defaults to `fluid-lk-<random>`. |
+| `FLUID_LK_LOG_DIR` | Where to write the compose logs when a test fails. They are printed either way. |
+
+The stack publishes only Lakekeeper and Connect, on free loopback ports, and the test runs `docker compose down -v --remove-orphans` when it finishes, pass or fail.
+
 ## How CI enforces the safety properties
 
 The `.github/workflows/actionlint.yml` workflow runs on every push and PR (no secrets needed). It fails CI if:

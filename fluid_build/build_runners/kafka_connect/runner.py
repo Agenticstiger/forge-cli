@@ -345,6 +345,14 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     sink_config = kc_props.get("sink_connector_config")
     iceberg_enabled = kc_props.get("iceberg_sink_enabled", sink_config is None)
     if iceberg_enabled and str(ctx.sink.format or "").lower() == "iceberg":
+        # Fail closed BEFORE any Connect REST call: the same checks `fluid
+        # validate` runs, so a sink it rejects (a Lakekeeper binding with no
+        # uri, both catalog selectors set) never reaches the cluster.
+        from .iceberg_sink_validation import iceberg_sink_preflight
+
+        preflight_error = iceberg_sink_preflight(ctx.contract, ctx.build_id, log=LOG)
+        if preflight_error:
+            return _failed(ctx, started_at, t_start, preflight_error)
         binding = _find_iceberg_expose_binding(ctx.contract)
         if binding is not None:
             from ...providers._iceberg_catalog import resolve_iceberg_catalog

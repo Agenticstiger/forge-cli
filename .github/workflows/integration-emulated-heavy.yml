@@ -6,6 +6,9 @@
 #     pubsub, via tests/iac/_gcp_emulator/docker-compose.yml. Keyless.
 #   • AWS — LocalStack (S3 + Glue). Needs LOCALSTACK_AUTH_TOKEN; Glue is a
 #     LocalStack Pro feature (Ultimate tier and above).
+#   • Lakekeeper + Kafka Connect — forge-derived Iceberg sink configs on a
+#     real worker against a real Lakekeeper REST catalog. Keyless, in its
+#     own job (`lakekeeper-integration`).
 #
 # WHY THIS LANE RUNS NIGHTLY, NOT ON A LABEL AND NOT PER MERGE
 # ------------------------------------------------------------
@@ -310,3 +313,130 @@ jobs:
         if: always()
         run: |
           datahub docker nuke --keep-data 2>&1 | tail -5 || true
+
+  # ────────────────────────────────────────────────────────────────────
+  # Lakekeeper + Kafka Connect lane — forge's derived Iceberg sink
+  # configs on a real worker.
+  #
+  # What tests/integration/test_lakekeeper_kafka_connect_live.py proves:
+  #   - a `location.catalog: lakekeeper` expose, derived through forge's
+  #     real code, streams records into a real Lakekeeper REST catalog,
+  #     which vends STS credentials for Silo (S3 + STS);
+  #   - the same worker refuses a sink carrying both
+  #     `iceberg.catalog.type` and `iceberg.catalog.catalog-impl`, the
+  #     startup crash every Glue sink hit before the deriver emitted
+  #     impl XOR type;
+  #   - forge's derived Glue config gets past that refusal.
+  #
+  # Keyless: the stack is self-contained (Postgres, Lakekeeper, Silo,
+  # KRaft Kafka, cp-kafka-connect, every image pinned by digest), so
+  # there is no `environment:` and no deployment record. It still gates
+  # on the same label as its siblings so un-vouched PR code gets no
+  # runner.
+  #
+  # The test downloads the Apache Iceberg sink ZIP itself and verifies
+  # its sha1. The unzipped plugin is cached here by version + sha1; if
+  # the test's pin moves and this key does not, the stale cache is
+  # simply re-downloaded over (its .sha1 marker no longer matches).
+  lakekeeper-integration:
+    name: Lakekeeper + Kafka Connect integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'ci:integration-emulated')
+    permissions:
+      contents: read
+    env:
+      ICEBERG_SINK_VERSION: "1.9.2"
+      # The ZIP's published sha1, not a credential.
+      ICEBERG_SINK_SHA1: 52dab2ff2b9659008deec803d1c1e92813c5ffa7  # pragma: allowlist secret
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # The test imports only forge's pure derivation modules and drives the
+      # stack through `docker compose` and urllib: the base install plus the
+      # pytest plugin pyproject.toml configures is all it needs.
+      - name: Install fluid-build
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . "pytest>=7.4" "pytest-timeout>=2.3"
+
+      - name: Restore the Iceberg sink plugin
+        id: plugin-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/iceberg-kafka-connect
+          key: iceberg-kafka-connect-${{ env.ICEBERG_SINK_VERSION }}-${{ env.ICEBERG_SINK_SHA1 }}
+
+      - name: Run the Lakekeeper + Kafka Connect live tests
+        timeout-minutes: 35
+        env:
+          FLUID_TEST_LAKEKEEPER: "1"
+          FLUID_LK_PLUGIN_CACHE: ${{ runner.temp }}/iceberg-kafka-connect
+          # A fixed project name so the steps below can collect logs from, and
+          # tear down, a stack the test could not clean up (a timeout kill).
+          FLUID_LK_PROJECT: fluid-lk-ci
+          FLUID_LK_LOG_DIR: ${{ runner.temp }}/lakekeeper-logs
+        run: |
+          python -m pytest -v -m emulated_heavy \
+            tests/integration/test_lakekeeper_kafka_connect_live.py \
+            --junitxml=lakekeeper.xml
+
+      # pytest exits 0 on an all-skipped run. This does not.
+      - name: Assert the lane actually exercised Lakekeeper
+        if: always()
+        run: |
+          python scripts/ci/assert_lane_coverage.py lakekeeper.xml \
+            --require "Lakekeeper + Kafka Connect=tests/integration/test_lakekeeper_kafka_connect_live.py"
+
+      # Saved whether or not the tests passed: the download does not depend on
+      # them. Only a verified install is saved; the test's one-shot writes the
+      # .sha1 marker last, after `sha1sum -c` passed.
+      - name: Check the plugin cache is complete
+        id: plugin-ready
+        if: always() && steps.plugin-cache.outputs.cache-hit != 'true'
+        env:
+          CACHE_DIR: ${{ runner.temp }}/iceberg-kafka-connect
+        run: |
+          if [ "$(cat "$CACHE_DIR/.sha1" 2>/dev/null)" = "$ICEBERG_SINK_SHA1" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save the Iceberg sink plugin
+        if: always() && steps.plugin-ready.outputs.ready == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ runner.temp }}/iceberg-kafka-connect
+          key: ${{ steps.plugin-cache.outputs.cache-primary-key }}
+
+      # The test writes compose logs to FLUID_LK_LOG_DIR when it fails; this
+      # catches the case it could not, a run killed before its teardown.
+      - name: Collect logs from a stack left behind
+        if: failure()
+        env:
+          LOG_DIR: ${{ runner.temp }}/lakekeeper-logs
+        run: |
+          mkdir -p "$LOG_DIR"
+          docker compose -p fluid-lk-ci logs --no-color --tail=500 \
+            > "$LOG_DIR/fluid-lk-ci-left-behind.log" 2>&1 || true
+
+      - name: Upload JUnit + compose logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: lakekeeper-integration-logs
+          path: |
+            lakekeeper.xml
+            ${{ runner.temp }}/lakekeeper-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Tear down a stack left behind
+        if: always()
+        run: docker compose -p fluid-lk-ci down -v --remove-orphans || true

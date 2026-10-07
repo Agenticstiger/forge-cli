@@ -108,8 +108,10 @@ def test_deriver_core_keys_and_class():
     assert "io.tabular" not in cfg["connector.class"]
     assert cfg["iceberg.tables"] == "sales.orders"
     assert cfg["topics"] == "orders"
-    assert cfg["iceberg.catalog.type"] == "glue"
+    # catalog-impl XOR type: Iceberg's CatalogUtil refuses a config carrying
+    # both, so a Glue sink that sent both never started.
     assert cfg["iceberg.catalog.catalog-impl"] == "org.apache.iceberg.aws.glue.GlueCatalog"
+    assert "iceberg.catalog.type" not in cfg
     assert cfg["iceberg.catalog.warehouse"] == "s3://lake/sales/orders/"
     assert cfg["iceberg.catalog.io-impl"] == "org.apache.iceberg.aws.s3.S3FileIO"
     assert cfg["iceberg.catalog.client.region"] == "us-east-1"
@@ -280,3 +282,126 @@ def test_runner_default_off_when_handwritten_sink(kafka_connect_mock, tmp_path):
     cfg = kafka_connect_mock.connectors["snk"]["config"]
     assert cfg["connector.class"] == "io.confluent.connect.s3.S3SinkConnector"
     assert "iceberg.tables" not in cfg
+
+
+# ── runner preflight: fail closed BEFORE any Connect REST call ──────────────
+#
+# The runner runs the same checks as `fluid validate` right before deriving,
+# so a sink the validator rejects never reaches the cluster: before this a
+# Lakekeeper binding with no uri was POSTed as a connector that failed at its
+# first record, and a Glue sink with an overridden `type` never started.
+
+_LAKEKEEPER_NO_URI = {
+    "platform": "local",
+    "format": "iceberg",
+    "location": {
+        "database": "sales",
+        "table": "orders",
+        "catalog": "lakekeeper",
+        "warehouse": "analytics",
+    },
+}
+
+
+def _run(contract, tmp_path):
+    from fluid_build.build_runners._acquisition_common import build_acquisition_run_context
+    from fluid_build.build_runners.kafka_connect.runner import KafkaConnectRunner
+
+    ctx = build_acquisition_run_context(contract["builds"][0], contract, tmp_path)
+    return KafkaConnectRunner().run(ctx)
+
+
+@pytest.mark.parametrize(
+    "mutate, expected",
+    [
+        (
+            lambda c: c["exposes"][0].__setitem__("binding", _LAKEKEEPER_NO_URI),
+            "lakekeeper catalog requires binding.location.uri",
+        ),
+        (
+            lambda c: c["builds"][0]["properties"]["kafka-connect"].__setitem__(
+                "iceberg_catalog_overrides", {"iceberg.catalog.type": "rest"}
+            ),
+            "would carry both iceberg.catalog.type",
+        ),
+        (
+            lambda c: c["builds"][0]["properties"]["sink"].__setitem__("catalog", "lakekeeper"),
+            "disagrees with the expose's catalog 'glue'",
+        ),
+        (lambda c: c.__setitem__("exposes", []), "has no expose with binding.format=iceberg"),
+    ],
+    ids=["missing-uri", "type-and-impl", "sink-vs-expose", "no-expose"],
+)
+def test_runner_preflight_fails_before_any_rest_call(
+    kafka_connect_mock, tmp_path, mutate, expected
+):
+    from fluid_build.api.runner import RunState
+    from fluid_build.build_runners.kafka_connect.runner import execute_kafka_connect_build
+
+    contract = _iceberg_contract()
+    mutate(contract)
+
+    result = _run(contract, tmp_path)
+    assert result.state == RunState.FAILED
+    assert expected in (result.error or ""), result.error
+    assert "iceberg sink preflight failed" in result.error
+    # Nothing reached the cluster: not the sink, and not the SOURCE connector
+    # either (it would stream into a topic no sink drains).
+    assert kafka_connect_mock.calls == []
+    assert kafka_connect_mock.connectors == {}
+
+    assert execute_kafka_connect_build(contract["builds"][0], contract, tmp_path) == 1
+    assert kafka_connect_mock.calls == []
+
+
+def test_runner_preflight_warning_logs_and_still_deploys(kafka_connect_mock, tmp_path, caplog):
+    from fluid_build.build_runners.kafka_connect.runner import execute_kafka_connect_build
+
+    contract = _iceberg_contract()
+    contract["exposes"][0]["binding"] = {
+        **_LAKEKEEPER_NO_URI,
+        "location": {
+            **_LAKEKEEPER_NO_URI["location"],
+            "catalog": "nessie",
+            "uri": "http://nessie:19120/api/v2",
+            "warehouse": "s3://lake/warehouse",
+        },
+    }
+    with caplog.at_level("WARNING", logger="fluid.acquire.kafka_connect"):
+        rc = execute_kafka_connect_build(contract["builds"][0], contract, tmp_path)
+    assert rc == 0
+    assert any("iceberg-nessie" in r.getMessage() for r in caplog.records)
+    cfg = kafka_connect_mock.connectors["src-sink"]["config"]
+    assert cfg["iceberg.catalog.type"] == "nessie"
+    assert "iceberg.catalog.catalog-impl" not in cfg
+    assert cfg["iceberg.catalog.uri"] == "http://nessie:19120/api/v2"
+
+
+def test_complete_lakekeeper_streams_over_rest(kafka_connect_mock, tmp_path):
+    from fluid_build.build_runners.kafka_connect.runner import execute_kafka_connect_build
+
+    contract = _iceberg_contract()
+    contract["exposes"][0]["binding"] = {
+        **_LAKEKEEPER_NO_URI,
+        "location": {**_LAKEKEEPER_NO_URI["location"], "uri": "http://lakekeeper:8181/catalog"},
+    }
+    assert execute_kafka_connect_build(contract["builds"][0], contract, tmp_path) == 0
+    cfg = kafka_connect_mock.connectors["src-sink"]["config"]
+    assert cfg["iceberg.catalog.type"] == "rest"
+    assert cfg["iceberg.catalog.uri"] == "http://lakekeeper:8181/catalog"
+    # A warehouse NAME: the catalog vends FileIO, so none is forced.
+    assert "iceberg.catalog.io-impl" not in cfg
+
+
+def test_runner_handwritten_sink_skips_the_preflight(kafka_connect_mock, tmp_path):
+    from fluid_build.build_runners.kafka_connect.runner import execute_kafka_connect_build
+
+    # Derivation is OFF for a hand-written sink, so nothing is derived from the
+    # binding and the run stays byte-for-byte what it was (validate still flags it).
+    contract = _iceberg_contract(sink_connector_config={"connector.class": "x.Y", "topics": "t"})
+    contract["exposes"][0]["binding"] = _LAKEKEEPER_NO_URI
+    assert execute_kafka_connect_build(contract["builds"][0], contract, tmp_path) == 0
+    assert kafka_connect_mock.connectors["snk"]["config"] == {
+        "connector.class": "x.Y",
+        "topics": "t",
+    }

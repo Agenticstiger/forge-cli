@@ -947,6 +947,8 @@ class ContractValidator:
             location = binding.get("location", {})
             props = location.get("properties", {})
             self._validate_bigquery_resource(expose, path, props)
+        elif self.provider_name == "aws" and self._iceberg_outside_glue(expose, path):
+            return
         elif self.provider_name in ("snowflake", "aws", "local"):
             self._validate_generic_resource(expose, path)
         else:
@@ -1082,6 +1084,32 @@ class ContractValidator:
                 suggestion="Check provider credentials and network connectivity",
                 documentation_url="https://agenticstiger.github.io/forge_docs/advanced/production-troubleshooting.html",
             )
+
+    def _iceberg_outside_glue(self, expose: Dict[str, Any], path: str) -> bool:
+        """Report an Iceberg table cataloged outside Glue as not checked.
+
+        The AWS provider reads AWS Glue, and a Lakekeeper/REST/Polaris table is
+        not there: ``fluid apply`` creates no Glue table for it. Looking it up
+        anyway would fail every such contract with "does not exist in AWS Glue
+        catalog". Say what was not checked, and why, instead.
+        """
+        from fluid_build.providers._iceberg_catalog import (
+            binding_catalog_kind,
+            is_glue_cataloged,
+        )
+
+        binding = expose.get("binding")
+        if not isinstance(binding, dict) or is_glue_cataloged(binding):
+            return False
+        self.report.add_issue(
+            "info",
+            "binding",
+            f"Table not checked: it lives in Iceberg catalog "
+            f"'{binding_catalog_kind(binding)}', not AWS Glue, and the AWS "
+            "validation provider reads Glue",
+            path,
+        )
+        return True
 
     def _validate_generic_resource(self, expose: Dict[str, Any], path: str) -> None:
         """Validate a resource using the active validation provider (Snowflake, AWS, local)."""

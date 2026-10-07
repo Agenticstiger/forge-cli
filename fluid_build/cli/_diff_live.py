@@ -755,14 +755,29 @@ def _inspect_glue(
     base: ExposeLiveResult,
     contract: Mapping[str, Any],
 ) -> ExposeLiveResult:
-    from fluid_build.iac.providers.aws import _GLUE_CATALOG_FORMATS
+    from fluid_build.iac.providers.aws import _glue_cataloged
+    from fluid_build.providers._iceberg_catalog import (
+        binding_catalog_kind,
+        is_glue_cataloged,
+    )
 
     loc = binding.get("location") or {}
     database, table = loc.get("database"), loc.get("table")
     # Same default as ``AwsIacPlugin.emit``: a binding with no format is
     # provisioned as parquet.
     fmt = str(binding.get("format") or "parquet").lower()
-    if not (database and table) or fmt not in _GLUE_CATALOG_FORMATS:
+    if not is_glue_cataloged(binding):
+        # An Iceberg table in Lakekeeper (or another REST / Nessie catalog):
+        # apply creates no Glue table for it, and a Glue table of the same name
+        # would be someone else's, so neither "absent" nor a comparison with it
+        # would be true. No AWS call.
+        base.status = NOT_CHECKED
+        base.detail = (
+            f"table lives in Iceberg catalog {binding_catalog_kind(binding)}; "
+            "Glue is not inspected"
+        )
+        return base
+    if not (database and table) or not _glue_cataloged(binding, fmt):
         # Apply creates a Glue table only for a file/lakehouse format with a
         # database and a table; anything else is a bare bucket prefix.
         base.status = NOT_CHECKED

@@ -216,12 +216,21 @@ re-key is tested for zero key-loss — §10).
 
 | Key | Value |
 |---|---|
-| `iceberg.catalog.type` | `glue` |
+| `iceberg.catalog.type` | ~~`glue`~~ **not emitted** (correction below) |
 | `iceberg.catalog.catalog-impl` | `org.apache.iceberg.aws.glue.GlueCatalog` |
 | `iceberg.catalog.io-impl` | `org.apache.iceberg.aws.s3.S3FileIO` |
 | `iceberg.catalog.warehouse` | the **exact** `s3://{bucket}/{path}` `get_iceberg_warehouse` builds for the static table |
 | `iceberg.catalog.client.region` | from `binding.location.region` |
 | credentials | **none emitted** — DefaultCredentialsProvider chain (env / instance-profile / IRSA) |
+
+> **CORRECTION (2026-10-01).** This table listed both `iceberg.catalog.type`
+> and `iceberg.catalog.catalog-impl`, while §6.8 #1 says to reject a config with
+> both. §6.8 is right: Iceberg's `CatalogUtil` refuses a catalog that sets
+> `type` and `catalog-impl` together. The deriver emits **`catalog-impl` XOR
+> `type`**: Glue (and DynamoDB, which has no `type`) get `catalog-impl` only,
+> and every other kind gets `type` only. Both come from the catalog-kind table
+> in `providers/_iceberg_catalog.py` (`catalog_kind_info`), which dbt, the IaC
+> emitters and the policy compiler read too.
 
 REST (`type=rest`, warehouse = catalog **name**, requires `s3.*` creds via
 `secret_ref`) and GCP (`GCSFileIO`) are **tagged-union variants deferred to
@@ -329,6 +338,18 @@ seam (`cli/plan.py`, after action-type parse, before `plan.json` serialization):
      streaming-only fallback — exactly where we'd assumed "auto-create handles
      it." Validator adds: streaming-only + auto-create ⇒ require a
      namespace-ensure action.
+     **CORRECTION (2026-10-01) to the correction above.** The observation is
+     kept as the record of what the spike saw, but its cause was the runtime,
+     not the design: the spike ran the Tabular `io.tabular` **0.6.19** runtime
+     (§14), not the Apache sink v1 ships against. The Apache sink creates the
+     namespace, and each of its parents, when it auto-creates a table, since
+     Iceberg **1.6.0** (apache/iceberg#10186:
+     `IcebergWriterFactory.createNamespaceIfNotExist`, called from
+     `autoCreateTable`; absent in 1.5.2). So **no ensure-namespace step is
+     needed** and the validator requirement above is **withdrawn**. One residue:
+     the sink ignores a `ForbiddenException` from `createNamespace`, so a
+     catalog principal without create-namespace rights still needs the
+     namespace created for it, or the table create fails.
    - **Operator override present:** when a hand-written
      `iceberg.catalog.warehouse` is set, **defer to the operator (warn, not
      fail)** — preserves operator-wins.
@@ -521,6 +542,13 @@ by diffing the 0.6.19 README against the 1.11.0 docs — so the observed run
 validates the entire key surface; only those two constants differ and both are
 independently doc-confirmed for 1.11.0.
 
+**Version caveat, corrected (2026-10-01):** an identical key surface did not
+mean identical behaviour. 0.6.19 predates the namespace auto-create the Apache
+sink gained in Iceberg 1.6.0, which is why correction A below was observed (see
+§6.8 #6). And 0.6.19 is no longer the only published runtime: the Apache
+Software Foundation now publishes the Apache sink on Confluent Hub
+(`iceberg/iceberg-kafka-connect`, version 1.9.2).
+
 **Result: PASS.** 15 rows physically committed to `default.events`; schema
 auto-inferred (`amount:double, name:string, id:long, region:string`); 2 snapshots;
 connector + task `RUNNING`. The exact config that worked is the same shape the
@@ -532,7 +560,7 @@ converters).
 
 | # | Observed | RFC correction |
 |---|---|---|
-| A | `auto-create-enabled=true` created the table but failed with `NoSuchNamespaceException: Namespace default does not exist` until the namespace was created explicitly. | The **auto-create fallback is incomplete** — forge must ensure the **namespace/database** exists even build-only. Folded into §6.8 #6. |
+| A | `auto-create-enabled=true` created the table but failed with `NoSuchNamespaceException: Namespace default does not exist` until the namespace was created explicitly. | The **auto-create fallback is incomplete** — forge must ensure the **namespace/database** exists even build-only. Folded into §6.8 #6. **Withdrawn 2026-10-01:** a 0.6.19 behaviour; the Apache sink creates the namespace and its parents on auto-create since Iceberg 1.6.0 (§6.8 #6). |
 | B | `connector.state=RUNNING` while `tasks[0].state=FAILED` with a full trace. | The runner **must inspect task state + trace**, not just connector state. Confirmed §11 (now marked spike-observed). |
 | C | Schemaless JSON required `value.converter=JsonConverter` + `schemas.enable=false`; a task restart re-delivered records (duplicates) with no EOS. | The deriver must **co-emit converters** (§6.2, was implicit) and EOS config is **necessary not optional** (§11). |
 
@@ -630,6 +658,11 @@ reference plugin). "Engine" becomes a binding concern:
   Kafka-Connect spike found (§14 A: auto-create makes the table, not the
   namespace) — a satisfying cross-topology consistency: **the writer owns the
   table, forge owns the namespace.**
+  **CORRECTION (2026-10-01):** the Tableflow conclusion stands on its own
+  evidence (the IAM policy has no `glue:CreateDatabase`), but the parallel does
+  not: §14 A was a 0.6.19 runtime behaviour, and the Apache sink creates the
+  namespace itself since Iceberg 1.6.0 (§6.8 #6). The split is
+  Tableflow-specific, not cross-topology.
 - **(b) Managed-class feasibility — ANSWERED: NO.** Confluent Cloud has **no
   fully-managed Iceberg sink connector**; the OSS `org.apache.iceberg.connect`
   class runs only via "Bring Your Own Connector" (custom upload). The managed
@@ -666,7 +699,7 @@ sweep (mirrors the existing `FLUID_IAC_LIVE_{AWS,GCP,SNOWFLAKE}` gates).
 | Key | Role | forge derivation |
 |---|---|---|
 | `connector.class` | sink class | constant `org.apache.iceberg.connect.IcebergSinkConnector` |
-| `iceberg.catalog.type` / `catalog-impl` | catalog kind | from `binding.platform` |
+| `iceberg.catalog.type` / `catalog-impl` | catalog kind | from the catalog kind (`location.catalog`, else the `binding.platform` default); `catalog-impl` XOR `type` (corrected 2026-10-01, §6.3) |
 | `iceberg.catalog.warehouse` | warehouse root | `get_iceberg_warehouse()` (shared with static path) |
 | `iceberg.catalog.io-impl` | FileIO | per-platform (`S3FileIO` for AWS) |
 | `iceberg.catalog.client.region` | region | `binding.location.region` |
@@ -676,9 +709,9 @@ sweep (mirrors the existing `FLUID_IAC_LIVE_{AWS,GCP,SNOWFLAKE}` gates).
 | `iceberg.tables.default-partition-by` | partitioning | `icebergConfig.partitionSpec` |
 | `iceberg.control.topic` | EOS control | `_iceberg-control-{product_id}` (spike-validated custom topic) |
 | `iceberg.coordinator.transactional.prefix` | EOS | `iceberg-coord-{product_id}` |
-| `iceberg.tables.auto-create-enabled` | build-only fallback | `true` for streaming-only — **but namespace must pre-exist** (§14 A) |
+| `iceberg.tables.auto-create-enabled` | build-only fallback | `true` for streaming-only; ~~**but namespace must pre-exist** (§14 A)~~ the sink creates the namespace and its parents too, since Iceberg 1.6.0 (corrected 2026-10-01, §6.8 #6) |
 | `key.converter` / `value.converter` | record decode | `JsonConverter` + `schemas.enable=false` (schemaless JSON; §14 C) |
-| (catalog namespace) | table parent | **forge must `ensure-namespace`** — auto-create does NOT (§14 A) |
+| (catalog namespace) | table parent | ~~**forge must `ensure-namespace`** — auto-create does NOT (§14 A)~~ created by the sink on auto-create since Iceberg 1.6.0 (apache/iceberg#10186); no forge step (corrected 2026-10-01, §6.8 #6) |
 
 ## Appendix B — verification log
 

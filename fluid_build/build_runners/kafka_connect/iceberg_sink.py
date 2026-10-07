@@ -96,9 +96,13 @@ def emit_iceberg_sink_config(
     }
 
     # ── catalog block (prefix-passthrough: derive a few, forward the rest) ──
-    cfg["iceberg.catalog.type"] = resolved.catalog_type
+    # catalog-impl XOR type, as the Debezium twin does: Iceberg's
+    # CatalogUtil.loadCatalog throws "both type and catalog-impl are set"
+    # when it gets both, so a Glue sink emitted with both never started.
     if resolved.catalog_impl:
         cfg["iceberg.catalog.catalog-impl"] = resolved.catalog_impl
+    else:
+        cfg["iceberg.catalog.type"] = resolved.catalog_type
     if resolved.warehouse:
         cfg["iceberg.catalog.warehouse"] = resolved.warehouse
     if resolved.io_impl:

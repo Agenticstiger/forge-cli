@@ -237,6 +237,46 @@ def test_validator_warns_on_missing_glue_database():
     assert any("Glue database" in w for w in warnings)
 
 
+# ── catalog kind: Tableflow publishes to Glue, and only Glue ────────────────
+
+
+@pytest.mark.parametrize("catalog", ["lakekeeper", "polaris", "unity", "rest", "horizon"])
+def test_validator_rejects_a_non_glue_catalog(catalog):
+    """A non-Glue ``catalog`` used to be ignored, so ``catalog: lakekeeper``
+    published the table to Glue: a catalog the contract never named."""
+    errors, warnings = validate_confluent_binding(_contract(_loc(catalog=catalog)))
+    assert len(errors) == 1
+    assert f"binding.location.catalog is '{catalog}'" in errors[0]
+    assert "publishes only to AWS Glue" in errors[0]
+    # The Glue-database warning would only restate the error.
+    assert not any("Glue database" in w for w in warnings)
+
+
+@pytest.mark.parametrize("catalog", ["lakekeeper", "polaris", "Unity"])
+def test_emitter_skips_the_catalog_integration_the_validator_refuses(catalog):
+    """Emit-when-derivable pairing: the Glue integration is the one resource a
+    non-Glue contract must not get; storage and the topic still derive."""
+    res = _emit(_contract(_loc(catalog=catalog)))
+    assert "confluent_catalog_integration" not in res
+    assert set(res) == {"confluent_provider_integration", "confluent_tableflow_topic"}
+
+
+@pytest.mark.parametrize("catalog", ["glue", "GLUE", None])
+def test_glue_or_absent_catalog_is_unchanged(catalog):
+    loc = _loc() if catalog is None else _loc(catalog=catalog)
+    assert validate_confluent_binding(_contract(loc)) == ([], [])
+    res = _emit(_contract(loc))
+    glue = next(iter(res["confluent_catalog_integration"].values()))["aws_glue"]
+    assert glue["custom_database"] == "analytics"
+
+
+def test_absent_catalog_module_is_byte_identical_to_explicit_glue():
+    plugin = get_iac_plugin("confluent")
+    assert build_module(plugin, _contract()) == build_module(
+        plugin, _contract(_loc(catalog="glue"))
+    )
+
+
 # ── schema: 0.7.5 accepts the confluent platform + location keys ────────────
 
 

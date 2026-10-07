@@ -183,6 +183,22 @@ class TestGlueCatalogIntegration:
         )
         assert "snowflake_external_volume" not in res
 
+    def test_glue_spelling_folds_onto_the_glue_row(self):
+        res = _sf().emit(
+            _contract(
+                [
+                    _iceberg_exposure(
+                        catalog="GLUE",
+                        account="123456789012",
+                        iam_role_arn="arn:aws:iam::123456789012:role/r",
+                        warehouse="s3://lake/p/",
+                    )
+                ]
+            )
+        )
+        assert "snowflake_catalog_integration_aws_glue" in res
+        assert "snowflake_external_volume" not in res
+
     def test_missing_role_or_account_emits_nothing(self):
         for location in (
             {"catalog": "glue", "account": "123456789012"},
@@ -228,14 +244,24 @@ class TestVolumeConflicts:
         res = _sf().emit(_contract([exposure]))
         assert "snowflake_external_volume" not in res
 
-    def test_unlisted_catalog_value_is_managed_to_both_emitters(self):
-        """Predicate alignment: `catalog: snowflake` is not in the shared
-        external set, so dbt emits built_in AND the IaC emits the volume.
-        Before the fix the IaC skipped on any truthy catalog value."""
+    @pytest.mark.parametrize(
+        "catalog",
+        [
+            # The kind table's alias for snowflake-managed.
+            "snowflake",
+            # A value the table does not know: both emitters keep the
+            # built_in fallback, and ``fluid validate`` refuses the value.
+            "horizon",
+        ],
+    )
+    def test_managed_catalog_values_are_managed_to_both_emitters(self, catalog):
+        """Predicate alignment: dbt emits built_in AND the IaC emits the
+        volume dbt references. Before the first fix the IaC skipped on any
+        truthy catalog value, so dbt referenced a volume nobody created."""
         from fluid_build.engines.dbt.catalogs_yml import generate_catalogs_yml
 
         loc = dict(
-            catalog="snowflake",
+            catalog=catalog,
             warehouse="s3://lake/p/",
             iam_role_arn="arn:aws:iam::123456789012:role/r",
         )
@@ -249,6 +275,30 @@ class TestVolumeConflicts:
         volume = next(iter(res["snowflake_external_volume"].values()))
         assert volume["name"] in content
 
+    def test_lakekeeper_is_external_to_both_emitters(self):
+        """The bug the kind table exists for. ``catalog: lakekeeper`` fell
+        outside the hand-kept external set, so the IaC built an EXTERNAL
+        VOLUME and dbt wrote a Snowflake-managed table into it, while the
+        streaming sink wrote the same table to Lakekeeper over REST."""
+        from fluid_build.engines.dbt.catalogs_yml import generate_catalogs_yml
+
+        contract = _contract(
+            [
+                _iceberg_exposure(
+                    catalog="lakekeeper",
+                    warehouse="s3://lake/p/",
+                    iam_role_arn="arn:aws:iam::123456789012:role/r",
+                )
+            ]
+        )
+        res = _sf().emit(contract)
+        assert "snowflake_external_volume" not in res
+
+        build = {"engine": "dbt", "execution": {"runtime": {"platform": "snowflake"}}}
+        content = generate_catalogs_yml(contract, build)
+        assert "catalog_type: iceberg_rest" in content
+        assert "external_volume" not in content
+
 
 class TestScopeBoundaries:
     def test_non_iceberg_exposes_emit_no_prereqs(self):
@@ -260,12 +310,59 @@ class TestScopeBoundaries:
         assert "snowflake_external_volume" not in res
         assert "snowflake_catalog_integration_aws_glue" not in res
 
-    @pytest.mark.parametrize("catalog", ["rest", "polaris", "unity", "nessie"])
+    @pytest.mark.parametrize(
+        "catalog",
+        [
+            "rest",
+            "polaris",
+            "unity",
+            "nessie",
+            "lakekeeper",
+            "bigquery",
+            "iceberg_rest",
+            "ICEBERG-REST",
+        ],
+    )
     def test_secret_bearing_catalogs_are_a_documented_follow_up(self, catalog):
         """Their integrations authenticate with OAuth secrets or bearer
-        tokens, and the emitted .tf.json is credential-free by invariant."""
-        res = _sf().emit(_contract([_iceberg_exposure(catalog=catalog)]))
+        tokens, and the emitted .tf.json is credential-free by invariant.
+
+        Storage that would satisfy the managed path is present on purpose:
+        a kind misclassified as Snowflake-managed would get a volume here,
+        which is how ``lakekeeper`` used to fail."""
+        res = _sf().emit(
+            _contract(
+                [
+                    _iceberg_exposure(
+                        catalog=catalog,
+                        warehouse="s3://lake/p/",
+                        iam_role_arn="arn:aws:iam::123456789012:role/r",
+                    )
+                ]
+            )
+        )
         assert "snowflake_catalog_integration_iceberg_rest" not in res
+        assert "snowflake_external_volume" not in res
+        assert "snowflake_catalog_integration_aws_glue" not in res
+
+    @pytest.mark.parametrize("catalog", ["hive", "jdbc", "hadoop", "dynamodb"])
+    def test_catalogs_snowflake_cannot_integrate_emit_nothing(self, catalog):
+        """No Snowflake CATALOG_SOURCE exists for these. They used to fall
+        through to the managed path and get a volume no table could use;
+        ``fluid validate`` now refuses them instead."""
+        res = _sf().emit(
+            _contract(
+                [
+                    _iceberg_exposure(
+                        catalog=catalog,
+                        warehouse="s3://lake/p/",
+                        iam_role_arn="arn:aws:iam::123456789012:role/r",
+                    )
+                ]
+            )
+        )
+        assert "snowflake_external_volume" not in res
+        assert "snowflake_catalog_integration_aws_glue" not in res
 
     def test_emitted_module_stays_credential_free(self):
         import json

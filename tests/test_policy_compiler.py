@@ -14,6 +14,8 @@
 
 """Tests for fluid_build/policy/compiler.py — access-policy → IAM bindings."""
 
+import pytest
+
 from fluid_build.policy.compiler import (
     SAFE_BQ_PERMS,
     SAFE_S3_PERMS,
@@ -178,6 +180,93 @@ class TestCompilePolicy:
         assert any("No IAM bindings" in w for w in warnings)
 
 
+class TestIcebergCatalogRouting:
+    """An Iceberg expose is granted where its catalog lives.
+
+    Every ``iceberg`` expose used to route to the AWS compiler on any
+    platform, so a Lakekeeper table, a Snowflake-managed table and a
+    ``platform: local`` table each got a ``glue.table`` grant on a Glue table
+    that does not exist (and ``policy-apply`` took ``provider: aws`` from it).
+    """
+
+    _LOC = {"bucket": "bkt", "database": "mydb", "table": "tbl", "region": "eu-west-1"}
+
+    @staticmethod
+    def _types(bindings):
+        return sorted(b["resource_type"] for b in bindings)
+
+    @staticmethod
+    def _catalog_warnings(warnings):
+        return [w for w in warnings if "cataloged in" in w]
+
+    @pytest.mark.parametrize("catalog", [None, "glue", "GLUE"])
+    def test_glue_catalog_keeps_s3_and_glue_grants(self, catalog):
+        loc = dict(self._LOC, **({"catalog": catalog} if catalog else {}))
+        bindings, warnings = compile_policy(_contract("aws", "iceberg", loc))
+        assert self._types(bindings) == ["glue.table", "s3.bucket"]
+        assert self._catalog_warnings(warnings) == []
+
+    @pytest.mark.parametrize("catalog", ["lakekeeper", "Lakekeeper", "iceberg_rest", "polaris"])
+    def test_rest_catalog_on_aws_gets_no_glue_grant(self, catalog):
+        loc = dict(self._LOC, catalog=catalog)
+        bindings, warnings = compile_policy(_contract("aws", "iceberg", loc))
+        # The bucket is still the table's storage; the Glue table does not exist.
+        assert self._types(bindings) == ["s3.bucket"]
+        (warning,) = self._catalog_warnings(warnings)
+        assert "user@example.com" in warning and "['read']" in warning
+        assert "not AWS Glue" in warning
+
+    def test_rest_catalog_warning_names_the_canonical_kind(self):
+        loc = dict(self._LOC, catalog="LakeKeeper")
+        _, warnings = compile_policy(_contract("aws", "iceberg", loc))
+        assert "'lakekeeper'" in self._catalog_warnings(warnings)[0]
+
+    def test_rest_catalog_without_bucket_compiles_nothing_and_says_so(self):
+        loc = {"database": "mydb", "table": "tbl", "catalog": "lakekeeper"}
+        bindings, warnings = compile_policy(_contract("aws", "iceberg", loc))
+        assert bindings == []
+        assert len(self._catalog_warnings(warnings)) == 1
+        assert any("No IAM bindings" in w for w in warnings)
+
+    def test_snowflake_managed_iceberg_gets_snowflake_rbac(self):
+        loc = {"database": "DB", "schema": "SCH", "table": "T"}
+        bindings, warnings = compile_policy(_contract("snowflake", "iceberg", loc))
+        assert self._types(bindings) == ["snowflake.table"]
+        assert bindings[0]["grants"] == SAFE_SNOWFLAKE_PERMS["readData"]
+        # Snowflake IS the catalog: its grant is the whole enforcement.
+        assert self._catalog_warnings(warnings) == []
+
+    def test_external_catalog_on_snowflake_warns_grant_covers_snowflake_only(self):
+        loc = {"database": "DB", "schema": "SCH", "table": "T", "catalog": "lakekeeper"}
+        bindings, warnings = compile_policy(_contract("snowflake", "iceberg", loc))
+        assert self._types(bindings) == ["snowflake.table"]
+        (warning,) = self._catalog_warnings(warnings)
+        assert "Snowflake readers only" in warning
+
+    @pytest.mark.parametrize("platform", ["local", "azure"])
+    def test_non_aws_platform_gets_no_aws_grant(self, platform):
+        bindings, warnings = compile_policy(_contract(platform, "iceberg", dict(self._LOC)))
+        assert [b for b in bindings if b["provider"] == "aws"] == []
+        assert len(self._catalog_warnings(warnings)) == 1
+
+    def test_one_warning_per_grant_and_expose(self):
+        grants = [
+            {"principal": "a@b.com", "permissions": ["read"]},
+            {"principal": "c@d.com", "permissions": ["write"]},
+        ]
+        loc = dict(self._LOC, catalog="lakekeeper")
+        _, warnings = compile_policy(_contract("aws", "iceberg", loc, grants=grants))
+        catalog_warnings = self._catalog_warnings(warnings)
+        assert len(catalog_warnings) == 2
+        assert "a@b.com" in catalog_warnings[0] and "c@d.com" in catalog_warnings[1]
+
+    def test_non_iceberg_format_ignores_the_catalog_key(self):
+        loc = dict(self._LOC, catalog="lakekeeper")
+        bindings, warnings = compile_policy(_contract("aws", "parquet", loc))
+        assert self._types(bindings) == ["glue.table", "s3.bucket"]
+        assert self._catalog_warnings(warnings) == []
+
+
 class TestGcpBindingsInternal:
     def test_bigquery_no_dataset(self):
         bindings = []
@@ -203,6 +292,12 @@ class TestAwsBindingsInternal:
         glue = [b for b in bindings if b["resource_type"] == "glue.table"]
         assert len(glue) == 1
         assert glue[0]["database"] == "myds"
+
+    def test_glue_false_emits_only_the_s3_statement(self):
+        bindings = []
+        loc = {"bucket": "bkt", "database": "db", "table": "t"}
+        _compile_aws_bindings(bindings, "iceberg", loc, "user@a.com", ["read"], glue=False)
+        assert [b["resource_type"] for b in bindings] == ["s3.bucket"]
 
 
 class TestSnowflakeBindingsInternal:

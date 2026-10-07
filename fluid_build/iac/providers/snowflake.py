@@ -48,8 +48,10 @@ import yaml
 
 from ...observability.secret_redactor import collect_secret_values, redact_secret_text
 from ...providers._iceberg_catalog import (
-    EXTERNAL_ICEBERG_CATALOGS,
+    FAMILY_GLUE,
     STORAGE_PROVIDERS,
+    binding_catalog_kind,
+    catalog_kind_info,
     iceberg_external_volume_is_override,
     iceberg_external_volume_name,
 )
@@ -737,24 +739,36 @@ def _emit_iceberg_prereqs(
     Emit-when-derivable, matching this module's pure-emitter shape (no
     logging, no I/O):
 
-    - Snowflake-managed catalog (no external ``location.catalog``): a
-      ``snowflake_external_volume``. Needs a ``location.warehouse`` with an
-      ``s3://`` or ``gs://`` scheme (or a ``bucket``, treated as S3); S3 also
-      needs ``location.iam_role_arn``. ``allow_writes`` is pinned ``"true"``,
-      which the provider requires for Iceberg tables using Snowflake as the
-      catalog.
-    - ``location.catalog: glue``: a ``snowflake_catalog_integration_aws_glue``.
-      Needs ``location.iam_role_arn`` (the role Snowflake assumes) and
-      ``location.account`` (the AWS account id).
-    - Other external catalogs (rest / polaris / unity): nothing yet. Their
-      integrations authenticate with OAuth client secrets or bearer tokens,
-      and this emitter's ``.tf.json`` is credential-free by invariant, so
-      wiring them needs a variables design first. Documented follow-up.
+    The branch is the ``snowflake_catalog_type`` column of the shared kind
+    table (:func:`fluid_build.providers._iceberg_catalog.catalog_kind_info`),
+    the same column dbt's ``catalogs.yml`` writes as ``catalog_type``, so the
+    two sides partition every spelling identically:
 
-    The external-vs-managed split uses the SAME
-    ``EXTERNAL_ICEBERG_CATALOGS`` set as the dbt emitter, so an unlisted
-    catalog value (``snowflake``, say) is Snowflake-managed to both sides
-    rather than dbt referencing a volume this side never creates.
+    - ``glue``: a ``snowflake_catalog_integration_aws_glue``. Needs
+      ``location.iam_role_arn`` (the role Snowflake assumes) and
+      ``location.account`` (the AWS account id).
+    - ``iceberg_rest`` (rest / iceberg_rest / lakekeeper / polaris / unity /
+      nessie / bigquery): nothing yet. Their integrations authenticate with
+      OAuth client secrets or bearer tokens, and this emitter's ``.tf.json``
+      is credential-free by invariant, so wiring them needs a variables
+      design first. Documented follow-up; ``fluid validate`` warns.
+    - ``None`` (hive / jdbc / hadoop / dynamodb): nothing, ever. Snowflake
+      has no catalog integration for them, and ``fluid validate`` refuses
+      the contract.
+    - ``built_in`` (no ``location.catalog``, ``snowflake``, or a value the
+      table does not know): a ``snowflake_external_volume``. Needs a
+      ``location.warehouse`` with an ``s3://`` or ``gs://`` scheme (or a
+      ``bucket``, treated as S3); S3 also needs ``location.iam_role_arn``.
+      ``allow_writes`` is pinned ``"true"``, which the provider requires for
+      Iceberg tables using Snowflake as the catalog. An unknown value lands
+      here because dbt's fallback for it is ``built_in`` too, so dbt never
+      references a volume this side does not create; ``fluid validate``
+      refuses the value itself.
+
+    This used to lower the raw string and test it against a hand-kept set,
+    which missed ``lakekeeper``: a Lakekeeper table got an EXTERNAL VOLUME
+    and a Snowflake-managed dbt table while its streaming sink wrote to
+    Lakekeeper over REST.
 
     An explicit ``binding.icebergConfig.properties.external_volume`` means
     "I already have a volume": dbt references it and NO resource is emitted
@@ -769,9 +783,9 @@ def _emit_iceberg_prereqs(
     if str(fmt or "").lower() not in _ICEBERG_FORMATS:
         return
 
-    catalog = str(loc.get("catalog") or "").lower()
+    kind = catalog_kind_info(binding_catalog_kind(binding))
 
-    if catalog == "glue":
+    if kind.family == FAMILY_GLUE:
         role_arn = loc.get("iam_role_arn")
         account = loc.get("account")
         if not (role_arn and account):
@@ -789,8 +803,9 @@ def _emit_iceberg_prereqs(
         )
         return
 
-    if catalog in EXTERNAL_ICEBERG_CATALOGS:
-        # rest / polaris / unity / nessie: secret-bearing auth, see docstring.
+    if kind.snowflake_catalog_type != "built_in":
+        # ``iceberg_rest``: secret-bearing auth, see docstring. ``None``:
+        # Snowflake cannot integrate the catalog at all.
         return
 
     if iceberg_external_volume_is_override(binding):
@@ -798,7 +813,7 @@ def _emit_iceberg_prereqs(
         return
 
     # Snowflake-managed (Horizon) catalog: the EXTERNAL VOLUME path. An
-    # unlisted ``catalog`` value lands here too, mirroring the dbt emitter's
+    # unknown ``catalog`` value lands here too, mirroring the dbt emitter's
     # built_in fallback.
     warehouse = str(loc.get("warehouse") or "")
     base_url = ""

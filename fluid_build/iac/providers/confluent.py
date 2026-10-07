@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
+from ...providers._iceberg_catalog import binding_catalog_kind, canonical_catalog_kind
 from ...providers.aws.util.warehouse import normalize_location
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
@@ -68,6 +69,28 @@ def _topic_name(loc: Mapping[str, Any], exposure: Mapping[str, Any]) -> str:
     """The Kafka topic the Tableflow output is named for (the ``display_name``
     and the basis of the OpenTofu resource name): topic > table > exposeId."""
     return loc.get("topic") or loc.get("table") or exposure.get("exposeId") or "topic"
+
+
+def _non_glue_catalog(binding: Mapping[str, Any]) -> str:
+    """The canonical kind of an explicit, non-Glue ``location.catalog``, else ``""``.
+
+    FLUID's Tableflow emitter publishes only to AWS Glue (the
+    ``aws_glue`` block of ``confluent_catalog_integration``). Tableflow's
+    Snowflake Open Catalog (Polaris) and Unity Catalog integrations
+    authenticate with a client secret this credential-free module cannot
+    carry, and Tableflow has no integration for Lakekeeper or a generic
+    Iceberg REST catalog. A non-Glue ``catalog`` used to be ignored, so
+    ``catalog: lakekeeper`` published the table to Glue: a second, metadata-
+    less claim on the name, in a catalog the contract never named. The
+    emitter and ``validate_confluent_binding`` both read this, so the gate
+    refuses exactly what the emitter declines to publish. An absent
+    ``catalog`` is Glue here, as it always was.
+    """
+    loc = binding.get("location") or {}
+    if not canonical_catalog_kind(loc.get("catalog")):
+        return ""
+    kind = binding_catalog_kind(binding)
+    return "" if kind == "glue" else kind
 
 
 def _resource_name(cid: str, loc: Mapping[str, Any], exposure: Mapping[str, Any]) -> str:
@@ -136,6 +159,8 @@ def _emit_tableflow(
     Skips silently when a hard input is absent — ``validate_confluent_binding``
     surfaces a clean error at validate time, and plan-binding guarantees a
     validated contract by apply, so this only guards a partial/unvalidated dict.
+    A non-Glue ``location.catalog`` skips just the catalog integration, on the
+    same :func:`_non_glue_catalog` condition the validator refuses.
     """
     environment_id = loc.get("environment_id")
     cluster_id = loc.get("kafka_cluster_id")
@@ -173,7 +198,10 @@ def _emit_tableflow(
     }
 
     # 3. Catalog integration — publishes the Iceberg table to AWS Glue. The Glue
-    #    database must pre-exist (Tableflow does not create it).
+    #    database must pre-exist (Tableflow does not create it). Never for a
+    #    contract that names another catalog: see _non_glue_catalog.
+    if _non_glue_catalog(exposure.get("binding") or {}):
+        return
     glue: Dict[str, Any] = {"provider_integration_id": pi_ref}
     if database:
         glue["custom_database"] = database
@@ -215,7 +243,18 @@ def validate_confluent_binding(contract: Mapping[str, Any]) -> Tuple[List[str], 
         ):
             if not loc.get(key):
                 errors.append(f"expose '{eid}': platform=confluent requires {label}")
-        if not loc.get("database"):
+        foreign = _non_glue_catalog(binding)
+        if foreign:
+            errors.append(
+                f"expose '{eid}': binding.location.catalog is '{loc.get('catalog')}' "
+                f"({foreign}), but FLUID's Tableflow emitter publishes only to AWS "
+                "Glue. Tableflow's Polaris (Snowflake Open Catalog) and Unity Catalog "
+                "integrations authenticate with a client secret the credential-free "
+                "module cannot carry, and Tableflow has no integration for Lakekeeper "
+                "or a generic Iceberg REST catalog. Set catalog: glue or omit it."
+            )
+        # The Glue-database warning would only restate the error above.
+        elif not loc.get("database"):
             warnings.append(
                 f"expose '{eid}': no binding.location.database — the AWS Glue database must "
                 f"pre-exist and be named as custom_database so Tableflow publishes there"
