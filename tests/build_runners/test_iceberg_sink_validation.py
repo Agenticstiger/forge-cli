@@ -19,6 +19,9 @@ from __future__ import annotations
 import pytest
 
 from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
+    PUBLISHED_KAFKA_CONNECT_SINK_VERSION,
+    executing_build,
+    iceberg_sink_plan,
     iceberg_sink_preflight,
     validate_iceberg_sink,
 )
@@ -588,3 +591,173 @@ def test_preflight_matches_the_run_context_id_of_an_id_less_build():
     # build_acquisition_run_context ids it "unknown"; the message keeps "?".
     msg = iceberg_sink_preflight(contract, "unknown")
     assert msg is not None and "build '?'" in msg
+
+
+# ── ONE gate: the plan validate, the preflight and both runners read ─────────
+
+
+def test_executing_build_selects_by_the_run_context_id():
+    contract = _sink_contract(_GLUE_AWS)
+    first = contract["builds"][0]
+    second = {**first, "id": "second"}
+    contract["builds"].append(second)
+    assert executing_build(contract, "ingest") is first
+    assert executing_build(contract, "second") is second
+    assert executing_build(contract, "absent") is None
+    del first["id"]
+    assert executing_build(contract, "unknown") is first  # run-context spelling
+    first["id"] = None
+    assert executing_build(contract, None) is first
+
+
+@pytest.mark.parametrize(
+    "kc, derives",
+    [
+        ({}, True),
+        ({"sink_connector_config": {"topics": "t"}}, False),
+        ({"sink_connector_config": {"topics": "t"}, "iceberg_sink_enabled": True}, True),
+        ({"iceberg_sink_enabled": False}, False),
+    ],
+)
+def test_kafka_connect_plan_covers_derived_and_handwritten_sinks(kc, derives):
+    build = _sink_contract(_GLUE_AWS, kc=kc)["builds"][0]
+    plan = iceberg_sink_plan(build)
+    assert plan is not None and plan.derives is derives
+
+
+def test_non_iceberg_kafka_connect_build_has_no_plan():
+    build = _sink_contract(_GLUE_AWS, sink={"format": "parquet"})["builds"][0]
+    assert iceberg_sink_plan(build) is None
+
+
+@pytest.mark.parametrize(
+    "dbz, derives",
+    [
+        (_embedded(), True),
+        (_embedded({"config": {"catalog.name": "x"}}), False),
+        ({"deployment": {"mode": "bring-your-own"}}, None),
+        (_embedded({"type": "s3"}), None),
+    ],
+    ids=["derived", "handwritten", "source-only", "non-iceberg-server-sink"],
+)
+def test_debezium_plan_covers_derived_and_handwritten_sinks(dbz, derives):
+    build = _sink_contract(_GLUE_AWS, engine="debezium", debezium=dbz)["builds"][0]
+    plan = iceberg_sink_plan(build)
+    assert (None if plan is None else plan.derives) is derives
+
+
+@pytest.mark.parametrize("kc", [{}, {"sink_connector_config": {"topics": "t"}}])
+def test_preflight_refuses_a_handwritten_sink_validate_refuses(kc):
+    contract = _sink_contract(_BROKEN, kc=kc)
+    assert _errs(contract)
+    msg = iceberg_sink_preflight(contract, "ingest")
+    assert msg is not None and "lakekeeper catalog requires binding.location.uri" in msg
+
+
+# ── GCP: an unnamed catalog is read two ways ────────────────────────────────
+
+_GCP_REST_LOC = {"uri": "https://rest.example/catalog", "warehouse": "gs://acme-lake/wh"}
+
+
+@pytest.mark.parametrize("engine", ["kafka-connect", "debezium"])
+def test_gcp_expose_with_no_catalog_errors_naming_both_readings(engine):
+    contract = _sink_contract(
+        _loc_binding(platform="gcp", **_GCP_REST_LOC),
+        engine=engine,
+        debezium=_embedded() if engine == "debezium" else None,
+    )
+    hit = [e for e in _errs(contract) if "sets no binding.location.catalog" in e]
+    assert len(hit) == 1, _errs(contract)
+    msg = hit[0]
+    assert "a REST catalog (the 'gcp' platform default)" in msg
+    assert "dbt-bigquery and the GCP IaC" in msg and "BigLake metastore table" in msg
+    assert "Set binding.location.catalog: bigquery" in msg and "lakekeeper" in msg
+
+
+def test_gcp_rest_sink_catalog_does_not_name_the_expose_catalog():
+    # dbt-bigquery and the IaC never read sink.catalog, so it cannot settle it.
+    contract = _sink_contract(
+        _loc_binding(platform="gcp", **_GCP_REST_LOC), sink={"catalog": "rest"}
+    )
+    hit = [e for e in _errs(contract) if "sets no binding.location.catalog" in e]
+    assert len(hit) == 1 and "a REST catalog (sink.catalog 'rest')" in hit[0]
+
+
+def test_gcp_sink_catalog_bigquery_agrees_with_biglake_and_warns_the_runtime():
+    # sink.catalog bigquery reaches BigLake, and so do dbt-bigquery and the GCP
+    # IaC for an absent location.catalog: one catalog, so no split and no
+    # "disagrees with 'rest'" error (dbt and the IaC never read 'rest' here).
+    # The published sink still cannot load type=bigquery, which is a warning.
+    contract = _sink_contract(
+        _loc_binding(platform="gcp", warehouse="gs://acme/wh"), sink={"catalog": "bigquery"}
+    )
+    errors, warnings = validate_iceberg_sink(contract)
+    assert errors == []
+    assert any("iceberg.catalog.type=bigquery" in w for w in warnings), warnings
+
+
+def test_gcp_handwritten_rest_sink_is_a_split_named_after_the_handwritten_config():
+    contract = _sink_contract(
+        _loc_binding(platform="gcp", **_GCP_REST_LOC),
+        kc={"sink_connector_config": {"iceberg.catalog.type": "rest"}},
+    )
+    hit = [e for e in _errs(contract) if "sets no binding.location.catalog" in e]
+    assert len(hit) == 1 and "a REST catalog (the hand-written sink config)" in hit[0], hit
+
+
+def test_gcp_handwritten_bigquery_sink_is_not_a_split():
+    contract = _sink_contract(
+        _loc_binding(platform="gcp", warehouse="gs://acme/wh"),
+        kc={"sink_connector_config": {"iceberg.catalog.type": "bigquery"}},
+    )
+    assert not any("sets no binding.location.catalog" in e for e in _errs(contract))
+
+
+def test_bigquery_warning_follows_the_type_that_reaches_the_worker():
+    # A hand-written config that sets type=rest over a bigquery expose sends
+    # REST to the worker, so the "cannot load bigquery" warning would be false.
+    contract = _sink_contract(
+        _loc_binding("bigquery", platform="gcp", warehouse="gs://acme/wh"),
+        kc={"sink_connector_config": {"iceberg.catalog.type": "rest"}},
+    )
+    _, warnings = validate_iceberg_sink(contract)
+    assert not any("iceberg.catalog.type=bigquery" in w for w in warnings), warnings
+
+
+@pytest.mark.parametrize(
+    "catalog, location",
+    [
+        ("bigquery", {"warehouse": "gs://acme/wh"}),
+        ("rest", _GCP_REST_LOC),
+        ("lakekeeper", COMPLETE),
+    ],
+)
+def test_gcp_expose_naming_its_catalog_is_not_refused(catalog, location):
+    errs = _errs(_sink_contract(_loc_binding(catalog, platform="gcp", **location)))
+    assert errs == []
+
+
+def test_unnamed_catalog_off_gcp_is_not_refused():
+    assert _errs(_sink_contract(_loc_binding(**COMPLETE))) == []
+
+
+# ── bigquery: the published Kafka Connect sink predates the type ────────────
+
+
+def test_bigquery_on_kafka_connect_warns_about_the_published_sink():
+    contract = _sink_contract(_loc_binding("bigquery", platform="gcp", warehouse="gs://acme/wh"))
+    errors, warnings = validate_iceberg_sink(contract)
+    assert errors == []
+    hit = [w for w in warnings if "iceberg.catalog.type=bigquery" in w]
+    assert len(hit) == 1
+    assert PUBLISHED_KAFKA_CONNECT_SINK_VERSION in hit[0] and "1.10" in hit[0]
+    assert "Confluent Hub" in hit[0]
+
+
+def test_bigquery_on_debezium_server_has_no_kafka_connect_warning():
+    contract = _sink_contract(
+        _loc_binding("bigquery", platform="gcp", warehouse="gs://acme/wh"),
+        engine="debezium",
+        debezium=_embedded(),
+    )
+    assert not any("iceberg.catalog.type=bigquery" in w for w in _warns(contract))

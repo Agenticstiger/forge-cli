@@ -800,6 +800,10 @@ def refuse_lake_formation_on_external_catalog(
     if is_glue_cataloged(binding):
         return
     kind = binding_catalog_kind(binding)
+    if catalog_kind_info(kind).family == FAMILY_UNKNOWN:
+        # A typo is not a catalog: refuse_unknown_iceberg_catalog names it,
+        # and "govern access in the <typo> catalog" would send the author astray.
+        return
     raise UnsupportedBindingError(
         "lake-formation-needs-glue-catalog",
         f"exposes[{_expose_id(exposure) or index}] declares governance.lakeFormation, but "

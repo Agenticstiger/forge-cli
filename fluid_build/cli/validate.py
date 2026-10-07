@@ -380,37 +380,50 @@ def run(args, logger: logging.Logger) -> int:
         duration = time.time() - start_time
         log_operation_failure(logger, "validate_contract", error=e.event, duration=duration)
 
+        # ``console_error`` wraps its text in ``[red]...[/red]`` markup, so every
+        # value echoed into it is escaped first: a path or message holding a
+        # lowercase ``[word]`` would otherwise lose it (see ``_cprint_literal``).
+        from rich.markup import escape
+
         # Handle specific CLI errors with user-friendly messages
         if e.event == "version_below_minimum":
             if not args.quiet:
                 console_error(
-                    f"Contract version {e.context.get('version')} does not meet minimum requirement {e.context.get('constraint')}"
+                    escape(
+                        f"Contract version {e.context.get('version')} does not meet minimum requirement {e.context.get('constraint')}"
+                    )
                 )
         elif e.event == "version_above_maximum":
             if not args.quiet:
                 console_error(
-                    f"Contract version {e.context.get('version')} exceeds maximum allowed {e.context.get('constraint')}"
+                    escape(
+                        f"Contract version {e.context.get('version')} exceeds maximum allowed {e.context.get('constraint')}"
+                    )
                 )
         elif e.event == "contract_file_not_found":
             if not args.quiet:
-                console_error(f"Contract file not found: {e.context.get('path')}")
+                console_error(escape(f"Contract file not found: {e.context.get('path')}"))
         elif e.event == "contract_version_unsupported":
             if not args.quiet:
                 console_error(
-                    e.context.get(
-                        "message",
-                        f"Unsupported contract version: {e.context.get('version')}",
+                    escape(
+                        str(
+                            e.context.get(
+                                "message",
+                                f"Unsupported contract version: {e.context.get('version')}",
+                            )
+                        )
                     )
                 )
         elif e.event == "contract_required":
             if not args.quiet:
-                console_error(f"{e.context.get('message', 'Contract file is required')}")
+                console_error(escape(f"{e.context.get('message', 'Contract file is required')}"))
         else:
             if not args.quiet:
-                console_error(f"Validation error: {e.event}")
+                console_error(escape(f"Validation error: {e.event}"))
                 if e.context:
                     for key, value in e.context.items():
-                        cprint(f"   {key}: {value}")
+                        _cprint_literal(f"   {key}: {value}")
 
         # Stable slug + catalog-driven guidance (Error-UX card). ``e`` is
         # auto-enriched at construction, so catalogued events (contract_*,
@@ -419,9 +432,9 @@ def run(args, logger: logging.Logger) -> int:
         if not args.quiet:
             slug = getattr(e, "error_slug", None)
             if slug:
-                cprint(f"   [{slug}]")
+                _cprint_literal(f"   [{slug}]")
             for suggestion in getattr(e, "suggestions", None) or []:
-                cprint(f"   💡 {suggestion}")
+                _cprint_literal(f"   💡 {suggestion}")
             docs_url = getattr(e, "docs_url", None)
             if docs_url:
                 # soft_wrap: a docs link is a URL, and Rich word-wraps at the terminal
@@ -1168,6 +1181,22 @@ def _cprint_json(payload: str) -> None:
     cprint(payload, soft_wrap=True, markup=False, highlight=False)
 
 
+def _cprint_literal(line: str) -> None:
+    """Print a line that carries a validation message, with its ``[...]`` intact.
+
+    ``cprint`` parses Rich markup, and Rich reads ``[orders]`` in
+    ``exposes[orders] declares ...`` as a style tag and drops it, so the CLI
+    named no expose at all (``exposes declares ...``) while ``--format json``
+    named the right one. Any lowercase ``[word]`` goes the same way: a bundle
+    issue's ``[error]`` severity, an extra in ``pip install 'pkg[gcp]'``.
+    Messages are data, not markup, so ``markup=False``, as in
+    :func:`_cprint_json`. The redaction pass in ``cprint`` still runs.
+    ``soft_wrap`` leaves wrapping to the terminal, so Rich never breaks a line
+    inside an identifier or a copy-pasteable command.
+    """
+    cprint(line, markup=False, soft_wrap=True)
+
+
 def _output_json_results(result: ValidationResult, args) -> int:
     """Output results in JSON format."""
     import json
@@ -1199,9 +1228,9 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
             cprint("==================")
         for i, error in enumerate(result.errors, 1):
             if args.quiet:
-                cprint(f"ERROR: {error}")
+                _cprint_literal(f"ERROR: {error}")
             else:
-                cprint(f"{i:2}. {error}")
+                _cprint_literal(f"{i:2}. {error}")
 
         if not args.quiet:
             cprint()
@@ -1211,7 +1240,7 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
         cprint("Validation Warnings:")
         cprint("====================")
         for i, warning in enumerate(result.warnings, 1):
-            cprint(f"{i:2}. {warning}")
+            _cprint_literal(f"{i:2}. {warning}")
         cprint()
 
     # Verbose information
@@ -1360,10 +1389,10 @@ def _try_workspace_validate(
             else:
                 cprint(f"  ❌ {product.name:<20} {len(result.errors)} error(s)")
                 for err in result.errors[:3]:
-                    cprint(f"     {err}")
+                    _cprint_literal(f"     {err}")
                 failed += 1
         except Exception as exc:  # noqa: BLE001
-            cprint(f"  ❌ {product.name:<20} load error: {exc}")
+            _cprint_literal(f"  ❌ {product.name:<20} load error: {exc}")
             failed += 1
 
     cprint("")
@@ -1450,7 +1479,7 @@ def _run_bundle_validation(
                     if issue.column is not None:
                         loc += f":C{issue.column}"
                     loc += ")"
-                cprint(
+                _cprint_literal(
                     f"   [{issue.severity}] {issue.validator}: {issue.file}{loc}: {issue.message}"
                 )
 

@@ -215,9 +215,10 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
         contract, str(workdir), env, args, logger, plugin=plugin, actions=actions
     )
 
-    # Pre-plan Iceberg catalog-move guard: Glue resources an older forge-cli
-    # created for an Iceberg table that lives in Lakekeeper / a REST catalog
-    # would otherwise be planned for DESTROY (iac/catalog_moves.py).
+    # Pre-plan Iceberg catalog-move guard: what an older forge-cli created for
+    # an Iceberg table that lives in Lakekeeper / a REST catalog (Glue resources
+    # on AWS, an EXTERNAL VOLUME on Snowflake) would otherwise be planned for
+    # DESTROY (iac/catalog_moves.py).
     _guard_catalog_moves(plugin, contract, provider, str(workdir), env, logger, actions=actions)
 
     _adopt_existing(plugin, contract, actions, str(workdir), env, logger)
@@ -903,33 +904,67 @@ def _guard_catalog_moves(
     *,
     actions: Any = (),
 ) -> None:
-    """Fail closed when the plan would destroy Glue resources of an Iceberg table
-    that now lives in another catalog.
+    """Fail closed when the plan would destroy what an older forge-cli created for
+    an Iceberg table that now lives in another catalog (Glue resources on AWS, an
+    EXTERNAL VOLUME on Snowflake).
 
     Thin CLI adapter over ``iac.catalog_moves.guard_catalog_moves``, the shape
     of :func:`_guard_packaging_transitions`: detection and remediation text live
     in ``iac/``, and this side owns the ``CLIError`` and the audit event.
 
-    A no-op off AWS, for every contract without an AWS Iceberg expose in a
-    non-Glue catalog (checked before the state is even listed), and for a
-    fresh workdir. A probe that fails is logged and skipped rather than failing
-    the apply: the data-loss gate still stands behind it.
+    A no-op for a provider whose emitter moved nothing
+    (``catalog_moves.catalog_move_spec``), for every contract without a moved
+    expose (checked before the state is even listed), and for a fresh workdir.
+    A probe that cannot run is skipped rather than failing the apply, since
+    the data-loss gate still stands behind it, but never silently: that gate's
+    remedy is ``--allow-data-loss``, the one thing an operator must not reach
+    for here, so the skip is a WARNING that says so.
     """
-    if provider != "aws":
-        return
     from fluid_build.iac.catalog_moves import (
         CatalogMoveError,
+        catalog_move_spec,
         guard_catalog_moves,
         moved_iceberg_exposes,
     )
 
-    if not moved_iceberg_exposes(contract):
+    spec = catalog_move_spec(plugin, provider)
+    if spec is None:
         return
+    moved = moved_iceberg_exposes(contract, spec=spec)
+    if not moved:
+        return
+
+    def _skipped(reason: str) -> None:
+        warn(
+            logger,
+            "iceberg_catalog_move_probe_skipped",
+            provider=provider,
+            reason=reason,
+            exposes=[{"expose": e, "catalog": k} for e, k in moved],
+            remedy=(
+                "if the plan below destroys resources an older forge-cli created for these "
+                "exposes, do NOT pass --allow-data-loss: release them with `tofu state rm` "
+                "and re-run apply"
+            ),
+        )
+
     state = runner.tofu_state_list(workdir, env=env)
     if not state:
+        # ``tofu state list`` answers [] for a fresh workdir and for a failed
+        # listing alike; ``state pull`` tells the two apart.
+        try:
+            doc = read_state(Path(workdir), env)
+        except Exception as exc:  # StateMigrationError, or no ``tofu`` at all
+            _skipped(f"the state could not be read: {exc}")
+            return
+        if doc.resources:
+            _skipped(
+                f"`tofu state list` listed nothing, but the state holds "
+                f"{len(doc.resources)} resource(s)"
+            )
         return
     try:
-        guard_catalog_moves(plugin, contract, state, workdir=workdir, actions=actions)
+        guard_catalog_moves(plugin, contract, state, workdir=workdir, actions=actions, spec=spec)
     except CatalogMoveError as exc:
         # Structured audit event BEFORE the raise, as for a packaging transition.
         info(logger, "iceberg_catalog_move_blocked", **exc.event_fields())
@@ -939,7 +974,7 @@ def _guard_catalog_moves(
             {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
         )
     except Exception as exc:  # defensive: a failed probe must not fail the apply
-        logger.debug("opentofu: catalog-move probe failed: %s", exc)
+        _skipped(f"the probe failed: {type(exc).__name__}: {exc}")
 
 
 def _report_suppressed_drift(

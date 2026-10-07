@@ -398,14 +398,96 @@ def test_embedded_complete_lakekeeper_derives_rest(tmp_path: Path):
     assert "debezium.sink.iceberg.catalog-impl=" not in text
 
 
-def test_embedded_handwritten_config_skips_the_preflight(tmp_path: Path):
-    # Derivation is OFF for a hand-written config, so nothing is derived from
-    # the binding and the file stays what the operator wrote.
+@pytest.mark.parametrize(
+    "sink, binding, expected",
+    [
+        (
+            {"type": "iceberg", "config": {"catalog.name": "rest"}},
+            _LAKEKEEPER_NO_URI,
+            "lakekeeper catalog requires binding.location.uri",
+        ),
+        (
+            {"type": "iceberg", "config": {"type": "rest", "catalog-impl": "x.Y"}},
+            None,
+            "would carry both type",
+        ),
+    ],
+    ids=["missing-uri", "both-selectors"],
+)
+def test_embedded_handwritten_config_is_preflighted(tmp_path: Path, sink, binding, expected):
+    # Derivation is OFF for a hand-written config, but the server still writes
+    # an Iceberg sink, so the run refuses what `fluid validate` refuses. It
+    # used to write the file and boot a server that never started.
+    from fluid_build.api.runner import RunState
+
+    contract = _contract(sink=sink, binding=binding)
+    result = _run_embedded(contract, tmp_path)
+    assert result.state == RunState.FAILED
+    assert expected in (result.error or ""), result.error
+    assert "iceberg sink preflight failed" in result.error
+    assert not _props_path(contract, tmp_path).exists()
+
+
+def test_embedded_handwritten_config_validate_accepts_is_written_verbatim(tmp_path: Path):
+    # Preflighted, but nothing is derived: the file stays what the operator wrote.
+    complete = {
+        **_LAKEKEEPER_NO_URI,
+        "location": {**_LAKEKEEPER_NO_URI["location"], "uri": "http://lakekeeper:8181/catalog"},
+    }
     contract = _contract(
-        sink={"type": "iceberg", "config": {"catalog.name": "rest"}}, binding=_LAKEKEEPER_NO_URI
+        sink={"type": "iceberg", "config": {"catalog.name": "rest"}}, binding=complete
     )
     text = _props_text(contract, tmp_path)
     assert "debezium.sink.iceberg.catalog.name=rest" in text
+    assert "debezium.sink.iceberg.uri=" not in text
+
+
+def test_multi_build_embedded_runner_uses_the_executing_builds_properties(tmp_path: Path):
+    # The runner used to read builds[0]'s Debezium settings for every build:
+    # here that is a hand-written config, so ingest derived nothing and wrote
+    # landing's catalog name under landing's server name.
+    import copy
+
+    from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
+        iceberg_sink_preflight,
+        validate_iceberg_sink,
+    )
+
+    contract = _contract(sink={"type": "iceberg"})
+    ingest = contract["builds"][0]
+    landing = copy.deepcopy(ingest)
+    landing["id"] = "landing"
+    landing["outputs"] = []
+    landing["properties"]["sink"] = {"format": "parquet"}
+    landing["properties"]["debezium"]["server_name"] = "landing_srv"
+    landing["properties"]["debezium"]["server"]["sink"] = {
+        "type": "iceberg",
+        "config": {"catalog.name": "landing"},
+    }
+    contract["builds"] = [landing, ingest]
+    assert validate_iceberg_sink(contract) == ([], [])
+    assert iceberg_sink_preflight(contract, "ingest") is None
+
+    execute_debezium_build(ingest, contract, tmp_path, dry_run=False)
+    text = _props_path(contract, tmp_path).read_text()
+    assert "debezium.sink.iceberg.table-namespace=bronze" in text
+    assert "debezium.sink.iceberg.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog" in text
+    assert "landing" not in text
+
+
+def test_embedded_runner_refuses_a_build_the_contract_does_not_declare(tmp_path: Path):
+    import copy
+
+    from fluid_build.api.runner import RunState
+    from fluid_build.build_runners._acquisition_common import build_acquisition_run_context
+    from fluid_build.build_runners.debezium.runner import DebeziumRunner
+
+    contract = _contract(sink={"type": "iceberg"})
+    ghost = copy.deepcopy(contract["builds"][0])
+    ghost["id"] = "ghost"
+    result = DebeziumRunner().run(build_acquisition_run_context(ghost, contract, tmp_path))
+    assert result.state == RunState.FAILED
+    assert "build 'ghost' is not in the contract's builds" in result.error
 
 
 def test_bring_your_own_mode_is_not_preflighted(kafka_connect_mock, tmp_path: Path):

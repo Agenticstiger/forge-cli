@@ -68,7 +68,19 @@ def _base_contract(
             {
                 "exposeId": "data",
                 "kind": "table",
-                "binding": {"platform": "local", "format": "iceberg"},
+                # A complete REST binding: the embedded runner preflights a
+                # hand-written Iceberg sink too, and `fluid validate` refuses a
+                # REST catalog with no uri or warehouse.
+                "binding": {
+                    "platform": "local",
+                    "format": "iceberg",
+                    "location": {
+                        "database": "bronze",
+                        "table": "orders",
+                        "uri": "http://rest:8181/catalog",
+                        "warehouse": "analytics",
+                    },
+                },
                 "contract": {"schema": [], "schemaPolicy": "discover_and_freeze"},
             }
         ],

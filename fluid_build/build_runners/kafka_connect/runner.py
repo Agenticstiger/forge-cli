@@ -246,7 +246,22 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
 
     started_at, t_start = begin_acquisition_run(ctx, runner)
 
-    props = ctx.contract.get("builds", [{}])[0].get("properties", {})
+    from .iceberg_sink_validation import executing_build, iceberg_sink_plan
+
+    # The build this run executes, the SAME one the Iceberg preflight checks.
+    # Reading ``builds[0]`` here ran a later build with the first build's
+    # connector settings while the preflight vetted the later build's.
+    build = executing_build(ctx.contract, ctx.build_id)
+    if build is None:
+        return _failed(
+            ctx,
+            started_at,
+            t_start,
+            f"kafka-connect: the run context's build {ctx.build_id!r} is not in the "
+            "contract's builds, so its properties cannot be read; run a build the "
+            "contract declares",
+        )
+    props = build.get("properties") or {}
     kc_props = props.get("kafka-connect", {}) or {}
     deployment = kc_props.get("deployment", {}) or {}
     server_url = deployment.get("server_url")
@@ -337,22 +352,24 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
 
     # Optional sink-side connector (companion). When the build targets an
     # Iceberg sink, derive the iceberg.catalog.*/iceberg.tables.* config instead
-    # of forcing the operator to hand-author it (RFC §6.2). Gated:
+    # of forcing the operator to hand-author it (RFC §6.2). Gated by
+    # ``iceberg_sink_plan``, the one gate `fluid validate` reads too:
     # ``iceberg_sink_enabled`` defaults OFF when a hand-written
-    # ``sink_connector_config`` is already present, so existing contracts are
-    # byte-for-byte unaffected; when both are set the merge lets operator keys
-    # win (derived first).
+    # ``sink_connector_config`` is already present, so nothing is derived for
+    # it; when both are set the merge lets operator keys win (derived first).
     sink_config = kc_props.get("sink_connector_config")
-    iceberg_enabled = kc_props.get("iceberg_sink_enabled", sink_config is None)
-    if iceberg_enabled and str(ctx.sink.format or "").lower() == "iceberg":
-        # Fail closed BEFORE any Connect REST call: the same checks `fluid
-        # validate` runs, so a sink it rejects (a Lakekeeper binding with no
-        # uri, both catalog selectors set) never reaches the cluster.
+    sink_plan = iceberg_sink_plan(build)
+    if sink_plan is not None:
+        # Fail closed BEFORE any Connect REST call, for a derived AND a
+        # hand-written Iceberg sink: the same checks `fluid validate` runs, so
+        # a sink it rejects (a Lakekeeper binding with no uri, both catalog
+        # selectors set) never reaches the cluster.
         from .iceberg_sink_validation import iceberg_sink_preflight
 
         preflight_error = iceberg_sink_preflight(ctx.contract, ctx.build_id, log=LOG)
         if preflight_error:
             return _failed(ctx, started_at, t_start, preflight_error)
+    if sink_plan is not None and sink_plan.derives:
         binding = _find_iceberg_expose_binding(ctx.contract)
         if binding is not None:
             from ...providers._iceberg_catalog import resolve_iceberg_catalog

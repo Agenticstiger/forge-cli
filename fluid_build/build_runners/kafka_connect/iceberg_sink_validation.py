@@ -20,10 +20,13 @@ the v1-deferred upsert mode, dynamic routing without a route field, and the
 catalog traps below. It is a pure function returning (errors, warnings) — the
 validate stage routes errors to its collector and surfaces warnings, mirroring
 product_types.py. The Kafka-Connect and Debezium-Server runners run the SAME
-checks through :func:`iceberg_sink_preflight` right before they derive a sink,
-so a contract ``fluid validate`` rejects fails its run before any Connect REST
-call or ``application.properties`` write, rather than only when someone
-remembered to validate first.
+checks through :func:`iceberg_sink_preflight` for every build that has a plan
+(one that declares ``sink.format: iceberg``, or an embedded Debezium build that
+derives its sink), derived or hand-written, so such a contract ``fluid validate``
+rejects fails its run before any Connect REST call or ``application.properties``
+write. Which builds those are is ONE answer, :func:`iceberg_sink_plan`, read off the build the runner
+executes (:func:`executing_build`): the validator, the preflight and both
+runners consume it, so none of them re-implements another's gate.
 
 The catalog checks are TABLE-DRIVEN: each one reads the kind's row from
 ``providers/_iceberg_catalog.py`` (the classification the sink deriver, dbt
@@ -34,18 +37,22 @@ Snowflake-managed table for the same expose. Per sink build:
 
 * the kind must be in the table: an unknown value gets each emitter's historic
   fallback, and those fallbacks disagree with one another;
+* on GCP the catalog must be named: absent, the sink writes a REST catalog
+  while dbt-bigquery and the GCP IaC create a BigLake table;
 * ``sink.catalog`` must agree with the expose's catalog, because dbt and the
   IaC read only the expose;
 * every ``binding.location`` key in the row's ``sink_requires`` must be set
   (Glue keeps its advisory region warning: the warehouse falls back);
 * the runtime must ship the catalog's client (the stock Apache Iceberg Kafka
-  Connect runtime has no Nessie client);
+  Connect runtime has no Nessie client, and the published sink predates the
+  ``bigquery`` catalog type);
 * an operator override must not move the warehouse away from the binding, nor
   leave the connector carrying both ``type`` and ``catalog-impl``.
 
 Debezium builds in ``bring-your-own`` / ``managed`` mode create only the SOURCE
 connector (no sink is derived), so none of this applies to them; an embedded
-Debezium Server build is checked whenever it would derive an Iceberg sink.
+Debezium Server build is checked whenever it writes an Iceberg sink, derived
+or from its hand-written ``server.sink.config``.
 
 Why imperative Python and not JSON-Schema if/then: these are CROSS-OBJECT checks
 (a build's sink ↔ a different expose's binding; a computed warehouse vs an
@@ -63,7 +70,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import AbstractSet, Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import AbstractSet, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ...providers._iceberg_catalog import (
     FAMILY_GLUE,
@@ -83,14 +90,30 @@ LOG = logging.getLogger("fluid.acquire.iceberg_sink")
 
 _Issues = Tuple[List[str], List[str]]
 
-#: ``only_build`` default: check every build. A sentinel, not ``None``, because
-#: a build with an explicit ``id: null`` runs with ``ctx.build_id is None``.
-_ALL_BUILDS: Any = object()
+#: The published Apache Iceberg Kafka Connect sink (Confluent Hub). Its
+#: ``CatalogUtil`` knows no ``bigquery`` type; Iceberg 1.10 adds it.
+PUBLISHED_KAFKA_CONNECT_SINK_VERSION = "1.9.2"
+
+
+def executing_build(contract: Mapping[str, Any], build_id: Any) -> Optional[Mapping[str, Any]]:
+    """The build a runner whose run context carries ``build_id`` executes.
+
+    ``build_acquisition_run_context`` ids a build ``build.get("id", "unknown")``
+    (an explicit ``id: null`` runs as ``None``), so the same spelling selects it
+    here. Both streaming runners read their properties from this build and the
+    preflight checks this build, so the two can never look at different ones;
+    they used to read ``builds[0]`` while the preflight checked ``build_id``.
+    ``None`` when no build carries the id.
+    """
+    for build in contract.get("builds") or []:
+        if isinstance(build, Mapping) and build.get("id", "unknown") == build_id:
+            return build
+    return None
 
 
 @dataclass(frozen=True)
-class _SinkRuntime:
-    """How one build's runner assembles its Iceberg sink config.
+class IcebergSinkPlan:
+    """How one build's runner assembles the Iceberg sink config it pushes.
 
     The two runtimes spell the catalog selector differently (Kafka Connect
     prefixes ``iceberg.catalog.``; Debezium Server takes bare keys) and merge
@@ -100,6 +123,7 @@ class _SinkRuntime:
 
     engine: str
     #: Does the runner derive a catalog block from the expose for this build?
+    #: ``False`` means it pushes only the hand-written config, if there is one.
     derives: bool
     type_key: str
     impl_key: str
@@ -109,10 +133,14 @@ class _SinkRuntime:
     warehouse_override: Tuple[str, Any]
 
 
-def _sink_runtime(build: Mapping[str, Any]) -> Optional[_SinkRuntime]:
-    """The runtime that writes an Iceberg sink for ``build``, or ``None``.
+def iceberg_sink_plan(build: Mapping[str, Any]) -> Optional[IcebergSinkPlan]:
+    """How ``build``'s runner writes its Iceberg sink, or ``None`` if it has none.
 
-    Mirrors each runner's own gate. The Debezium runner derives from
+    A plan exists for every build that declares an Iceberg sink or derives
+    one, whether the config is derived or hand-written. It is the ONE gate:
+    ``fluid validate`` checks a build exactly when this returns a plan, both
+    runners run :func:`iceberg_sink_preflight` exactly then, and they derive
+    exactly when ``plan.derives``. The Debezium runner derives from
     ``server.sink.type`` (default ``iceberg``) in embedded mode and never reads
     ``sink.format``, so selecting its builds by ``sink.format`` alone would let
     a deriving build skip every check while one that never derives (a
@@ -136,7 +164,7 @@ def _sink_runtime(build: Mapping[str, Any]) -> Optional[_SinkRuntime]:
             return None
         config = server_sink.get("config") or {}
         label = "debezium.server.sink.config"
-        return _SinkRuntime(
+        return IcebergSinkPlan(
             engine=engine,
             derives=derives,
             type_key="type",
@@ -159,7 +187,7 @@ def _sink_runtime(build: Mapping[str, Any]) -> Optional[_SinkRuntime]:
         overrides += (("iceberg_catalog_overrides", catalog_overrides),)
     if isinstance(handwritten, Mapping):
         overrides += (("sink_connector_config", handwritten),)
-    return _SinkRuntime(
+    return IcebergSinkPlan(
         engine=engine,
         derives=derives,
         type_key="iceberg.catalog.type",
@@ -185,15 +213,19 @@ def iceberg_sink_preflight(
 ) -> Optional[str]:
     """Run-time twin of ``fluid validate``: ONE build's sink errors, or ``None``.
 
-    A runner calls this right before it derives a sink, so a contract the
-    validator rejects fails the run before any Connect REST call or file write
-    instead of shipping a connector that never starts (both selector keys) or
-    writes into a different catalog than dbt reads. ``build_id`` is the run
-    context's id (``build.get("id", "unknown")``); the build is selected by it,
-    not by matching message text. Warnings are logged and never fatal, the same
-    split as ``fluid validate`` without ``--strict``.
+    A runner calls this whenever :func:`iceberg_sink_plan` says it will push an
+    Iceberg sink config, derived or hand-written, so a contract the validator
+    rejects fails the run before any Connect REST call or file write instead of
+    shipping a connector that never starts (both selector keys) or writes into
+    a different catalog than dbt reads. ``build_id`` is the run context's id;
+    the build is :func:`executing_build`, the one the runner reads its
+    properties from, not one matched by message text. Warnings are logged and
+    never fatal, the same split as ``fluid validate`` without ``--strict``.
     """
-    errors, warnings = _validate(contract, only_build=build_id)
+    build = executing_build(contract, build_id)
+    if build is None:
+        return None
+    errors, warnings = _validate(contract, builds=(build,))
     for msg in warnings:
         (log or LOG).warning("iceberg_sink.preflight.warning build=%s %s", build_id, msg)
     if not errors:
@@ -201,20 +233,18 @@ def iceberg_sink_preflight(
     return "iceberg sink preflight failed (see `fluid validate`): " + "; ".join(errors)
 
 
-def _validate(contract: Mapping[str, Any], *, only_build: Any = _ALL_BUILDS) -> _Issues:
+def _validate(contract: Mapping[str, Any], *, builds: Optional[Iterable[Any]] = None) -> _Issues:
     errors: List[str] = []
     warnings: List[str] = []
 
     iceberg_exposes = iceberg_sink_exposes(contract)
     expose_ids = {e.get("exposeId") or e.get("id") for e in iceberg_exposes}
 
-    for build in contract.get("builds") or []:
+    candidates = (contract.get("builds") or []) if builds is None else builds
+    for build in candidates:
         if not isinstance(build, Mapping):
             continue
-        # ``build_acquisition_run_context`` ids a build ``build.get("id", "unknown")``.
-        if only_build is not _ALL_BUILDS and build.get("id", "unknown") != only_build:
-            continue
-        runtime = _sink_runtime(build)
+        runtime = iceberg_sink_plan(build)
         if runtime is None:
             continue  # not a build that writes an Iceberg sink
         _check_build(build, runtime, iceberg_exposes, expose_ids, errors, warnings)
@@ -224,7 +254,7 @@ def _validate(contract: Mapping[str, Any], *, only_build: Any = _ALL_BUILDS) -> 
 
 def _check_build(
     build: Mapping[str, Any],
-    runtime: _SinkRuntime,
+    runtime: IcebergSinkPlan,
     iceberg_exposes: Sequence[Mapping[str, Any]],
     expose_ids: AbstractSet[Any],
     errors: List[str],
@@ -275,7 +305,7 @@ def _check_catalog(
     bid: Any,
     binding: Mapping[str, Any],
     sink: Mapping[str, Any],
-    runtime: _SinkRuntime,
+    runtime: IcebergSinkPlan,
     errors: List[str],
     warnings: List[str],
 ) -> None:
@@ -303,7 +333,10 @@ def _check_catalog(
     # catalog while the static table and the models live in another. Compared
     # canonically: ``iceberg-rest`` and ``rest`` are the same catalog. HARD.
     expose_kind = binding_catalog_kind(binding)
-    if sink_kind and sink_kind != expose_kind:
+    reaching = _reaching_catalog_type(info, runtime)
+    if _gcp_catalog_unnamed(binding) and reaching not in (None, "bigquery"):
+        _gcp_split(bid, sink, sink_kind, reaching, runtime, errors)
+    elif sink_kind and sink_kind != expose_kind and not _gcp_catalog_unnamed(binding):
         expose_source = (
             "binding.location.catalog"
             if canonical_catalog_kind(loc.get("catalog"))
@@ -338,16 +371,91 @@ def _check_catalog(
     # Azure modules (Hive only in its -hive- distribution) but no iceberg-nessie
     # (apache/iceberg kafka-connect/build.gradle), so ``type=nessie`` fails to
     # load NessieCatalog on a stock worker. Advisory: a custom image may add it.
-    if info.name == "nessie" and runtime.engine == "kafka-connect":
+    if reaching == "nessie" and runtime.engine == "kafka-connect":
         warnings.append(
             f"iceberg sink (build {bid!r}): the stock Apache Iceberg Kafka Connect runtime "
             "does not bundle iceberg-nessie (apache/iceberg kafka-connect/build.gradle); "
             "add the iceberg-nessie jar to the worker's connector plugin directory, or "
             "the sink cannot load NessieCatalog"
         )
+    # ``type=bigquery`` (BigQueryMetastoreCatalog) is in Iceberg's CatalogUtil
+    # only from 1.10; the sink published on Confluent Hub is older, so a stock
+    # worker fails to load the catalog at connector start. Advisory: a runtime
+    # built from Iceberg >= 1.10 has it.
+    if reaching == "bigquery" and runtime.engine == "kafka-connect":
+        warnings.append(
+            f"iceberg sink (build {bid!r}): the sink config sets "
+            "iceberg.catalog.type=bigquery, which the published Apache Iceberg Kafka Connect "
+            f"sink ({PUBLISHED_KAFKA_CONNECT_SINK_VERSION} on Confluent Hub) cannot load: "
+            "Iceberg's CatalogUtil gains the bigquery type in 1.10. Run a sink built from "
+            "Iceberg >= 1.10, or the connector fails at start"
+        )
 
     _check_warehouse_override(bid, binding, sink, kind, info, runtime, warnings)
     _check_selector_overrides(bid, kind, info, runtime, errors)
+
+
+def _reaching_catalog_type(info: Any, runtime: IcebergSinkPlan) -> Optional[str]:
+    """The catalog ``type`` the worker actually receives, or ``None``.
+
+    The derived value when the runner derives (``None`` for a catalog reached by
+    ``catalog-impl``), then every override map in merge order, the last one
+    winning, as the runner merges them. A hand-written config therefore decides
+    for itself: its ``type`` is what reaches the worker, not the expose's kind.
+    """
+    reaching: Optional[str] = None
+    if runtime.derives and not info.catalog_impl:
+        reaching = info.runtime_type
+    for _label, mapping in runtime.overrides:
+        if runtime.impl_key in mapping:
+            reaching = None
+        if runtime.type_key in mapping:
+            reaching = str(mapping[runtime.type_key] or "").strip().lower() or None
+    return reaching
+
+
+def _gcp_split(
+    bid: Any,
+    sink: Mapping[str, Any],
+    sink_kind: str,
+    reaching: str,
+    runtime: IcebergSinkPlan,
+    errors: List[str],
+) -> None:
+    """GCP is the one platform where an absent catalog means two things.
+
+    dbt-bigquery and the GCP IaC read only an EXPLICIT ``location.catalog`` and
+    create a BigLake metastore table, while the sink writes through whatever
+    catalog type reaches the worker (the ``rest`` platform default, a
+    ``sink.catalog``, or a hand-written config). Unless that is BigLake too,
+    one table is written to two catalogs. Naming the expose's catalog is the only
+    way they agree. HARD.
+    """
+    if not runtime.derives:
+        source = "the hand-written sink config"
+    elif sink_kind:
+        source = f"sink.catalog {sink.get('catalog')!r}"
+    else:
+        source = "the 'gcp' platform default"
+    errors.append(
+        f"iceberg sink (build {bid!r}): the GCP Iceberg expose sets no "
+        "binding.location.catalog, so it is read two ways: the sink would write through a "
+        f"{'REST' if reaching == 'rest' else reaching} catalog ({source}) while dbt-bigquery and "
+        "the GCP IaC, which read only "
+        "binding.location.catalog, create a BigLake metastore table. Set "
+        "binding.location.catalog: bigquery, or the REST kind your catalog is "
+        "(e.g. rest, lakekeeper)"
+    )
+
+
+def _gcp_catalog_unnamed(binding: Mapping[str, Any]) -> bool:
+    """Is ``binding`` a GCP Iceberg expose with no ``location.catalog``?"""
+    from ...iac.provider_match import canonical_cloud
+
+    loc = binding.get("location") or {}
+    return canonical_cloud(binding.get("platform")) == "gcp" and not canonical_catalog_kind(
+        loc.get("catalog")
+    )
 
 
 def _check_warehouse_override(
@@ -356,7 +464,7 @@ def _check_warehouse_override(
     sink: Mapping[str, Any],
     kind: str,
     info: CatalogKind,
-    runtime: _SinkRuntime,
+    runtime: IcebergSinkPlan,
     warnings: List[str],
 ) -> None:
     """5. zero-drift cross-check (consumes PR1's same_warehouse).
@@ -398,7 +506,7 @@ def _check_selector_overrides(
     bid: Any,
     kind: str,
     info: CatalogKind,
-    runtime: _SinkRuntime,
+    runtime: IcebergSinkPlan,
     errors: List[str],
 ) -> None:
     """6. the merged config must carry ``type`` XOR ``catalog-impl``.

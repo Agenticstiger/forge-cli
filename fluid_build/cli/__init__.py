@@ -446,16 +446,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "exit_code": e.exit_code,
                 },
             )
-            tag = f"  [dim]\\[{slug}][/dim]" if slug else ""
-            context.console.print(f"[red]❌ {e.message}[/red]{tag}")
+            # The message, context values and suggestions are data, not markup:
+            # Rich reads a lowercase ``[word]`` as a style tag and drops it, so
+            # ``exposes[orders] names Iceberg catalog ...`` printed as ``exposes
+            # names ...`` and ``pip install 'pkg[gcp]'`` lost its extra. A ``Text``
+            # styles the label and keeps the value literal; ``rich.markup.escape``
+            # would not do, as it doubles a trailing backslash (``C:\work\``).
+            # soft_wrap on a context value: a remediation is a command, and Rich's
+            # word-wrap puts a real newline inside it, so pasting a printed
+            # ``tofu state rm <address>`` line runs it without its address.
+            from rich.text import Text
+
+            message = Text(f"❌ {e.message}", style="red")
+            if slug:
+                message.append(f"  [{slug}]", style="dim")
+            context.console.print(message)
             if e.context:
                 for key, value in e.context.items():
-                    context.console.print(f"  [dim]{key}:[/dim] {value}")
+                    context.console.print(
+                        Text.assemble("  ", (f"{key}:", "dim"), f" {value}"), soft_wrap=True
+                    )
             suggestions = getattr(e, "suggestions", None) or []
             if suggestions:
                 context.console.print("\n[yellow]💡 Suggestions:[/yellow]")
                 for suggestion in suggestions:
-                    context.console.print(f"  • {suggestion}")
+                    context.console.print(Text(f"  • {suggestion}"))
             docs_url = getattr(e, "docs_url", None)
             if docs_url:
                 # soft_wrap: a docs link is a URL, and Rich word-wraps at the terminal

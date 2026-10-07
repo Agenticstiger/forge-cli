@@ -34,7 +34,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Dict, FrozenSet, List, Optional
+from typing import Any, ClassVar, Dict, FrozenSet, List, Mapping, Optional
 
 from fluid_build.api.runner import (
     RunContext,
@@ -300,7 +300,22 @@ def _execute(ctx: RunContext, runner: DebeziumRunner) -> RunResult:
 
     started_at, t_start = begin_acquisition_run(ctx, runner)
 
-    props = ctx.contract.get("builds", [{}])[0].get("properties", {})
+    from ..kafka_connect.iceberg_sink_validation import executing_build
+
+    # The build this run executes, the SAME one the Iceberg preflight checks.
+    # Reading ``builds[0]`` here ran a later build with the first build's
+    # Debezium settings while the preflight vetted the later build's.
+    build = executing_build(ctx.contract, ctx.build_id)
+    if build is None:
+        return _failed(
+            ctx,
+            started_at,
+            t_start,
+            f"debezium: the run context's build {ctx.build_id!r} is not in the "
+            "contract's builds, so its properties cannot be read; run a build the "
+            "contract declares",
+        )
+    props = build.get("properties") or {}
     dbz_props = props.get("debezium", {}) or {}
     deployment = dbz_props.get("deployment", {}) or {}
     mode = deployment.get("mode", "bring-your-own")
@@ -316,7 +331,7 @@ def _execute(ctx: RunContext, runner: DebeziumRunner) -> RunResult:
         )
     if mode == "embedded":
         return _execute_debezium_server(
-            ctx, deployment, dbz_props, snapshot_mode, started_at, t_start
+            ctx, build, deployment, dbz_props, snapshot_mode, started_at, t_start
         )
     return _failed(ctx, started_at, t_start, f"debezium: unknown deployment.mode '{mode}'")
 
@@ -477,6 +492,7 @@ def _escape_properties_value(value: str) -> str:
 
 def _execute_debezium_server(
     ctx: RunContext,
+    build: Mapping[str, Any],
     deployment: Dict[str, Any],
     dbz_props: Dict[str, Any],
     snapshot_mode: str,
@@ -509,27 +525,33 @@ def _execute_debezium_server(
 
     # Iceberg sink: derive the bare-key config from the contract's iceberg expose
     # binding so the embedded server lands in the SAME table the static Glue
-    # table / KC sink resolve to (RFC zero-drift spine). Mirrors the KC gate:
-    # derivation is OFF whenever a hand-written ``config`` block is present, so
-    # those contracts stay byte-for-byte identical (an explicit empty ``config:
-    # {}`` counts as present, matching the KC ``sink_connector_config`` default);
+    # table / KC sink resolve to (RFC zero-drift spine). Gated by
+    # ``iceberg_sink_plan``, the one gate `fluid validate` and the KC runner
+    # read too: derivation is OFF whenever a hand-written ``config`` block is
+    # present, so nothing is derived for it (an explicit empty ``config: {}``
+    # counts as present, matching the KC ``sink_connector_config`` default);
     # opt back in with ``server.sink.iceberg_sink_enabled: true``. Derived keys
     # go UNDER the hand-written ones, so an operator key always wins.
+    from ..kafka_connect.iceberg_sink_validation import (
+        iceberg_sink_plan,
+        iceberg_sink_preflight,
+    )
+
     sink_config = handwritten
-    iceberg_on = sink_block.get("iceberg_sink_enabled", "config" not in sink_block)
-    if sink_type == "iceberg" and iceberg_on:
+    sink_plan = iceberg_sink_plan(build)
+    if sink_plan is not None:
+        # Fail closed BEFORE application.properties is written, for a derived
+        # AND a hand-written Iceberg sink: the same checks `fluid validate`
+        # runs, so a sink it rejects never boots.
+        preflight_error = iceberg_sink_preflight(ctx.contract, ctx.build_id, log=LOG)
+        if preflight_error:
+            return _failed(ctx, started_at, t_start, preflight_error)
+    if sink_plan is not None and sink_plan.derives:
         from ...providers._iceberg_catalog import (
             find_iceberg_expose_binding,
             resolve_iceberg_catalog,
         )
-        from ..kafka_connect.iceberg_sink_validation import iceberg_sink_preflight
         from .iceberg_sink import emit_debezium_iceberg_sink_config
-
-        # Fail closed BEFORE application.properties is written: the same
-        # checks `fluid validate` runs, so a sink it rejects never boots.
-        preflight_error = iceberg_sink_preflight(ctx.contract, ctx.build_id, log=LOG)
-        if preflight_error:
-            return _failed(ctx, started_at, t_start, preflight_error)
 
         binding = find_iceberg_expose_binding(ctx.contract)
         if binding is not None:

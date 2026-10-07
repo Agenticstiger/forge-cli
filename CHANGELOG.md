@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `iceberg_catalog_move_blocked` and prints the `tofu state rm` commands that release
   them, instead of planning to destroy them: destroying a Glue database deletes every
   table in it. The resources stay in AWS; run the commands, then apply again.
+- The same guard covers Snowflake. An Iceberg expose on `platform: snowflake` whose
+  catalog is external (`lakekeeper`, `rest`, `iceberg_rest`, `polaris`, `unity`, `nessie`
+  or `bigquery`) got a Snowflake EXTERNAL VOLUME from earlier releases and no longer
+  does; `fluid apply` stops with `iceberg_catalog_move_blocked` and the `tofu state rm`
+  command for the volume instead of planning to drop it.
+- A GCP Iceberg expose that a streaming sink writes to must now name its catalog in
+  `binding.location.catalog`. Without one, the sink wrote through a REST catalog while
+  dbt-bigquery and the GCP IaC created a BigLake table, so one table lived in two
+  catalogs; `fluid validate` and the runners now refuse it. Set `catalog: bigquery`, or
+  the REST kind your catalog is.
 
 ### Changed
 
@@ -46,6 +56,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moved the GHCR `latest` tag. The release takes the quality gate's validated tag name.
 
 ### Fixed
+
+- **Command output keeps its square brackets.** Rich read text in brackets as console
+  markup and dropped it, so `fluid validate` printed `exposes declares
+  governance.lakeFormation` instead of `exposes[orders] declares ...`, bundle findings
+  lost their `[error]`/`[warning]` severity, and a suggestion such as `pip install
+  'data-product-forge[gcp]'` lost its extra. Validation messages, error context and
+  suggestions now print literally, and a printed `tofu state rm <address>` command stays
+  on one line, so a copied line runs with its address.
+- **The streaming runners check the sink they push.** The Kafka Connect and embedded
+  Debezium Server runners ran the Iceberg sink checks only for a config they derived; a
+  hand-written `sink_connector_config` or `server.sink.config` that `fluid validate`
+  refuses was still deployed. A hand-written config in a build that declares
+  `sink.format: iceberg` is now checked the same way, before anything is created. In a
+  contract with several builds, each runner also reads the build it is running instead
+  of the first one, which the checks already did.
+- **`catalog: bigquery` on a Kafka Connect sink warns.** It sets
+  `iceberg.catalog.type=bigquery`, which the published Apache Iceberg sink (1.9.2) cannot
+  load; Iceberg adds the type in 1.10. The Nessie and BigQuery runtime warnings follow the
+  catalog type that actually reaches the worker, so a hand-written config that sets
+  `type: rest` no longer draws them.
+- **A typo in `location.catalog` is reported once, as a typo.** The native AWS planner now
+  refuses an unknown catalog value as the IaC does (it used to plan the S3 buckets and no
+  Glue table), without first logging it as a `plan_failed` JSON line, and a typo no longer
+  also draws a Lake Formation refusal advising to "govern access in the <typo> catalog".
+- **The Iceberg catalog-move guard no longer blocks a legitimate apply.** It flagged a
+  Glue database that a since-removed parquet expose had created as a catalog move, and
+  nothing could get past it. A database is now flagged only when the moved expose's own
+  Glue table is in state. When the guard cannot read state or its probe fails, it says so
+  at WARNING level instead of DEBUG.
 
 - **A Kafka Connect Iceberg sink on AWS Glue starts.** The derived connector config set
   both `iceberg.catalog.type` and `iceberg.catalog.catalog-impl`, and Apache Iceberg's
