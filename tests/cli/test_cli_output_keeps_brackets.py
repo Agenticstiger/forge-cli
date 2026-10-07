@@ -275,7 +275,7 @@ def _raise_from_command(monkeypatch, err: Exception) -> None:
 
 def _catalog_move_error(monkeypatch, workdir: str) -> CLIError:
     """The CLIError ``fluid apply`` raises, built by the real guard and adapter."""
-    from fluid_build.cli import _apply_opentofu_engine as engine
+    import fluid_build.cli._apply_opentofu_engine as engine
     from fluid_build.iac.providers.aws import AwsIacPlugin
 
     contract = {
