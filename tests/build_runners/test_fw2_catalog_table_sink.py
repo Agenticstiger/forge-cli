@@ -193,7 +193,6 @@ def test_bigquery_with_no_derivable_warehouse_warns(engine):
     assert errors == []
     hit = _warehouse_warnings(contract)
     assert len(hit) == 1
-    assert "default storage location URI" in hit[0]
     assert ("debezium.sink.iceberg.warehouse" in hit[0]) == (engine == "debezium")
 
 
