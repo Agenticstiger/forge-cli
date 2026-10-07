@@ -81,6 +81,8 @@ _DOC_ROUTES = {
     "dlq": "advanced/typed-cli-errors.html#pipeline-operations",
     "replay": "advanced/typed-cli-errors.html#pipeline-operations",
     "infra#drift": "advanced/typed-cli-errors.html#governance",
+    # the safety gate's own section, which shows its message and remediation
+    "iceberg-catalog-move": "cli/apply.html#iceberg-catalog-move-guard",
 }
 _DOC_FALLBACK = "advanced/production-troubleshooting.html"
 

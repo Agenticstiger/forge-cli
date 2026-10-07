@@ -222,6 +222,15 @@ class AwsProvider(BaseProvider):
             # Re-raise ProviderError as-is
             raise
         except Exception as e:
+            # Imported here: _iceberg_catalog imports this package's util, so a
+            # module-level import would be circular.
+            from fluid_build.providers._iceberg_catalog import UnknownIcebergCatalogError
+
+            if isinstance(e, UnknownIcebergCatalogError):
+                # The contract's input was refused, and the message carries the
+                # remedy: not a planner failure. Logging it as ``plan_failed``
+                # too printed it twice, once as a raw JSON line before the error.
+                raise ProviderError(str(e)) from e
             self.err_kv(event="plan_failed", contract_id=contract.get("id"), error=str(e))
             # Wrap all other exceptions in ProviderError
             raise ProviderError(f"Failed to plan AWS deployment: {e}") from e

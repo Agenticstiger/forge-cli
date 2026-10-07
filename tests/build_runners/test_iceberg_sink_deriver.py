@@ -303,11 +303,11 @@ _LAKEKEEPER_NO_URI = {
 }
 
 
-def _run(contract, tmp_path):
+def _run(contract, tmp_path, build=None):
     from fluid_build.build_runners._acquisition_common import build_acquisition_run_context
     from fluid_build.build_runners.kafka_connect.runner import KafkaConnectRunner
 
-    ctx = build_acquisition_run_context(contract["builds"][0], contract, tmp_path)
+    ctx = build_acquisition_run_context(build or contract["builds"][0], contract, tmp_path)
     return KafkaConnectRunner().run(ctx)
 
 
@@ -393,15 +393,156 @@ def test_complete_lakekeeper_streams_over_rest(kafka_connect_mock, tmp_path):
     assert "iceberg.catalog.io-impl" not in cfg
 
 
-def test_runner_handwritten_sink_skips_the_preflight(kafka_connect_mock, tmp_path):
+# ── a hand-written Iceberg sink is preflighted too ──────────────────────────
+#
+# Derivation is OFF for a hand-written sink_connector_config, but the runner
+# still PUSHES an Iceberg sink, so it runs the same checks `fluid validate`
+# does. The gate used to be the derive flag: validate refused these contracts
+# and the run POSTed them anyway, a connector that never started.
+
+_BOTH_SELECTORS = {
+    "connector.class": "org.apache.iceberg.connect.IcebergSinkConnector",
+    "topics": "public.orders",
+    "iceberg.catalog.type": "rest",
+    "iceberg.catalog.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
+}
+
+
+@pytest.mark.parametrize(
+    "handwritten, mutate, expected",
+    [
+        (
+            {"connector.class": "x.Y", "topics": "t"},
+            lambda c: c["exposes"][0].__setitem__("binding", _LAKEKEEPER_NO_URI),
+            "lakekeeper catalog requires binding.location.uri",
+        ),
+        (_BOTH_SELECTORS, lambda c: None, "would carry both iceberg.catalog.type"),
+        (
+            {"connector.class": "x.Y", "topics": "t"},
+            lambda c: c["builds"][0]["properties"]["kafka-connect"].__setitem__(
+                "streamingSink", {"upsertMode": True}
+            ),
+            "upsertMode is not supported in v1",
+        ),
+    ],
+    ids=["missing-uri", "both-selectors", "upsert"],
+)
+def test_runner_preflights_a_handwritten_iceberg_sink(
+    kafka_connect_mock, tmp_path, handwritten, mutate, expected
+):
+    from fluid_build.api.runner import RunState
+    from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
+        validate_iceberg_sink,
+    )
     from fluid_build.build_runners.kafka_connect.runner import execute_kafka_connect_build
 
-    # Derivation is OFF for a hand-written sink, so nothing is derived from the
-    # binding and the run stays byte-for-byte what it was (validate still flags it).
-    contract = _iceberg_contract(sink_connector_config={"connector.class": "x.Y", "topics": "t"})
-    contract["exposes"][0]["binding"] = _LAKEKEEPER_NO_URI
-    assert execute_kafka_connect_build(contract["builds"][0], contract, tmp_path) == 0
-    assert kafka_connect_mock.connectors["snk"]["config"] == {
-        "connector.class": "x.Y",
-        "topics": "t",
+    contract = _iceberg_contract(sink_connector_config=handwritten)
+    mutate(contract)
+    # `fluid validate` refuses it ...
+    assert any(expected in e for e in validate_iceberg_sink(contract)[0])
+    # ... and so does the run, before any Connect REST call.
+    result = _run(contract, tmp_path)
+    assert result.state == RunState.FAILED
+    assert expected in (result.error or ""), result.error
+    assert "iceberg sink preflight failed" in result.error
+    assert kafka_connect_mock.calls == []
+    assert kafka_connect_mock.connectors == {}
+
+    assert execute_kafka_connect_build(contract["builds"][0], contract, tmp_path) == 1
+    assert kafka_connect_mock.calls == []
+
+
+def test_runner_handwritten_iceberg_sink_validate_accepts_is_pushed_verbatim(
+    kafka_connect_mock, tmp_path
+):
+    from fluid_build.build_runners.kafka_connect.runner import execute_kafka_connect_build
+
+    # Preflighted, but derivation stays OFF: nothing is merged in.
+    handwritten = {
+        "connector.class": "org.apache.iceberg.connect.IcebergSinkConnector",
+        "topics": "public.orders",
+        "iceberg.catalog.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
     }
+    contract = _iceberg_contract(sink_connector_config=handwritten)
+    assert execute_kafka_connect_build(contract["builds"][0], contract, tmp_path) == 0
+    assert kafka_connect_mock.connectors["snk"]["config"] == handwritten
+
+
+# ── multi-build: the runner reads the build it executes ─────────────────────
+#
+# Both runners used to read their properties from builds[0] while the
+# preflight checked the build being run, so a later build ran with the first
+# build's connector settings, overrides included, unchecked.
+
+
+def _landing_then_ingest():
+    """builds[0] lands Parquet with its own Connect settings; builds[1] streams
+    into the Iceberg expose."""
+    import copy
+
+    contract = _iceberg_contract()
+    ingest = contract["builds"][0]
+    landing = copy.deepcopy(ingest)
+    landing["id"] = "landing"
+    landing["outputs"] = []
+    landing["properties"]["sink"] = {"format": "parquet"}
+    landing["properties"]["kafka-connect"].update(
+        connector_name="landing",
+        # Over the Glue expose this re-creates the both-selectors crash, if it
+        # ever reached ingest's derived config.
+        iceberg_catalog_overrides={"iceberg.catalog.type": "rest"},
+    )
+    contract["builds"] = [landing, ingest]
+    return contract
+
+
+def test_multi_build_runner_uses_the_executing_builds_properties(kafka_connect_mock, tmp_path):
+    from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
+        iceberg_sink_preflight,
+        validate_iceberg_sink,
+    )
+    from fluid_build.build_runners.kafka_connect.runner import execute_kafka_connect_build
+
+    contract = _landing_then_ingest()
+    assert validate_iceberg_sink(contract) == ([], [])
+    assert iceberg_sink_preflight(contract, "ingest") is None
+
+    assert execute_kafka_connect_build(contract["builds"][1], contract, tmp_path) == 0
+    # ingest's own connector name, and ingest's own (absent) overrides.
+    assert set(kafka_connect_mock.connectors) == {"src", "src-sink"}
+    cfg = kafka_connect_mock.connectors["src-sink"]["config"]
+    assert cfg["iceberg.catalog.catalog-impl"] == "org.apache.iceberg.aws.glue.GlueCatalog"
+    assert "iceberg.catalog.type" not in cfg
+
+    # And landing runs with ITS settings: a source connector, no sink.
+    assert execute_kafka_connect_build(contract["builds"][0], contract, tmp_path) == 0
+    assert set(kafka_connect_mock.connectors) == {"src", "src-sink", "landing"}
+
+
+def test_multi_build_preflight_checks_the_build_the_runner_executes(kafka_connect_mock, tmp_path):
+    from fluid_build.api.runner import RunState
+
+    # The reverse: ingest's OWN override is the bad one. builds[0] is clean.
+    contract = _landing_then_ingest()
+    contract["builds"][0]["properties"]["kafka-connect"].pop("iceberg_catalog_overrides")
+    contract["builds"][1]["properties"]["kafka-connect"]["iceberg_catalog_overrides"] = {
+        "iceberg.catalog.type": "rest"
+    }
+    result = _run(contract, tmp_path, build=contract["builds"][1])
+    assert result.state == RunState.FAILED
+    assert "build 'ingest'" in result.error and "would carry both" in result.error
+    assert kafka_connect_mock.calls == []
+
+
+def test_runner_refuses_a_build_the_contract_does_not_declare(kafka_connect_mock, tmp_path):
+    import copy
+
+    from fluid_build.api.runner import RunState
+
+    contract = _iceberg_contract()
+    ghost = copy.deepcopy(contract["builds"][0])
+    ghost["id"] = "ghost"
+    result = _run(contract, tmp_path, build=ghost)
+    assert result.state == RunState.FAILED
+    assert "build 'ghost' is not in the contract's builds" in result.error
+    assert kafka_connect_mock.calls == []

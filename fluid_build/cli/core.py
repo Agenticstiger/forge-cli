@@ -157,15 +157,32 @@ class FluidCLIError(_BaseCLIError):
         (rustc/terraform-style) so operators and log scrapers see one routable
         code on every failure.
         """
+        # The message, context and suggestions are data, not markup: Rich read
+        # ``exposes[orders]`` as a style tag and dropped it, and ``pip install
+        # 'pkg[gcp]'`` lost its extra. ``Text`` keeps them literal (``escape``
+        # would double a trailing backslash, as in a Windows path).
         slug = getattr(self, "error_slug", None)
-        tag = f"  [dim]\\[{slug}][/dim]" if slug else ""
-        console.print(f"[red]❌ {self.message}[/red]{tag}")
+        if not RICH_AVAILABLE:  # the fallback Console has no markup to escape
+            console.print(f"❌ {self.message}" + (f"  [{slug}]" if slug else ""))
+            if self.context:
+                console.print(f"Details: {self.context}")
+            for suggestion in self.suggestions or ():
+                console.print(f"  • {suggestion}")
+            if self.docs_url:
+                console.print(f"Documentation: {self.docs_url}")
+            return
+        from rich.text import Text
+
+        line = Text.assemble(("❌ " + str(self.message), "red"))
+        if slug:
+            line.append(f"  [{slug}]", style="dim")
+        console.print(line, soft_wrap=True)
         if self.context:
-            console.print(f"[dim]Details: {self.context}[/dim]")
+            console.print(Text(f"Details: {self.context}", style="dim"), soft_wrap=True)
         if self.suggestions:
             console.print("\n[yellow]💡 Suggestions:[/yellow]")
             for suggestion in self.suggestions:
-                console.print(f"  • {suggestion}")
+                console.print(Text(f"  • {suggestion}"), soft_wrap=True)
         if self.docs_url:
             # soft_wrap: a docs link is a URL, and Rich word-wraps at the terminal
             # width, which puts a real newline INSIDE it. `_console.cprint_json` already

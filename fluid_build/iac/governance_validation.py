@@ -80,12 +80,21 @@ def _aws_refusal(
     expose's error: escaping, it would end :func:`validate_governance`, and
     ``fluid validate`` would report no governance finding at all.
     """
+    from ..providers._iceberg_catalog import FAMILY_UNKNOWN, catalog_kind_info, is_iceberg_format
     from .providers.aws import (
         lf_governance,
         lf_tag_associations,
         refuse_lake_formation_on_external_catalog,
     )
 
+    if (
+        is_iceberg_format(binding.get("format"))
+        and catalog_kind_info(binding_catalog_kind(binding)).family == FAMILY_UNKNOWN
+    ):
+        # The unknown catalog value is the error (iceberg_validation reports
+        # it, and apply refuses it before any governance): a Lake Formation,
+        # column or row refusal naming the typo as a catalog is noise.
+        return ""
     try:
         # Lake Formation on an Iceberg table another catalog owns would
         # otherwise be dropped at apply: refused first, as the emitter does.

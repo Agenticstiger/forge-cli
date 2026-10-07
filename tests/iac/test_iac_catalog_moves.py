@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The pre-plan guard for Glue resources of an Iceberg table that moved catalogs.
+"""The pre-plan guard for resources of an Iceberg table that moved catalogs.
 
 A contract the previous release applied with ``catalog: lakekeeper`` (or rest,
-polaris, nessie...) has a Glue database and table in its OpenTofu state, because
-that release created them whatever the catalog said. The emitter no longer
-does, so the next plan would DESTROY them, and destroying a Glue database
-deletes every table in it. ``fluid apply`` fails closed before ``tofu plan``
-with the ``tofu state rm`` commands instead (``iac/catalog_moves.py``).
+polaris, nessie...) on AWS has a Glue database and table in its OpenTofu state,
+because that release created them whatever the catalog said; on Snowflake,
+``lakekeeper`` / ``bigquery`` got an EXTERNAL VOLUME. The emitters no longer
+create them, so the next plan would DESTROY them, and destroying a Glue
+database deletes every table in it. ``fluid apply`` fails closed before
+``tofu plan`` with the ``tofu state rm`` commands instead
+(``iac/catalog_moves.py``). That the apply engine runs the guard is pinned
+through ``apply_via_opentofu`` in ``test_iac_catalog_move_wiring.py``.
 """
 
 from __future__ import annotations
@@ -30,13 +33,18 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+from fluid_build.iac import runner
 from fluid_build.iac.catalog_moves import (
+    AWS_GLUE_MOVES,
+    SNOWFLAKE_VOLUME_MOVES,
     CatalogMoveError,
+    catalog_move_spec,
     detect_catalog_moves,
     guard_catalog_moves,
     moved_iceberg_exposes,
 )
 from fluid_build.iac.providers.aws import AwsIacPlugin
+from fluid_build.iac.providers.snowflake import SnowflakeIacPlugin
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider]
 
@@ -132,6 +140,73 @@ class TestDetect:
 
         assert detect_catalog_moves(AwsIacPlugin(), contract, state) == (ORDERS,)
 
+    def test_a_database_a_removed_parquet_expose_created_is_not_a_move(self):
+        """SEC-707-4: this release applied a Lakekeeper table and a parquet table
+        on one Glue database, then the parquet expose was removed. The database
+        is no longer declared, but the old release never created it for the
+        Iceberg expose (its Glue table is not in state), so destroying it is a
+        plain removal for the data-loss gate, not a catalog move."""
+        contract = _contract(_expose("iceberg", "lakekeeper"))
+        state = [BUCKET, DB, FACTS]
+
+        assert detect_catalog_moves(AwsIacPlugin(), contract, state) == ()
+        guard_catalog_moves(AwsIacPlugin(), contract, state)
+
+    def test_a_database_is_flagged_for_the_expose_whose_table_is_in_state(self):
+        """Two moved exposes on one database, only one applied by the old
+        release: the database and that table are flagged, and the message names
+        only that expose."""
+        contract = _contract(
+            _expose("iceberg", "lakekeeper"),
+            _expose("iceberg", "rest", expose_id="facts", table="facts"),
+        )
+        state = [BUCKET, DB, ORDERS]
+
+        with pytest.raises(CatalogMoveError) as excinfo:
+            guard_catalog_moves(AwsIacPlugin(), contract, state)
+
+        assert excinfo.value.addresses == (DB, ORDERS)
+        assert excinfo.value.exposes == (("orders", "lakekeeper"),)
+
+    @pytest.mark.parametrize("catalog", ["lakekeeper", "rest", "polaris", "nessie", "bigquery"])
+    def test_a_table_less_expose_s_database_is_flagged(self, catalog):
+        """RT-707-1: a namespace-level Iceberg expose names a database and no
+        table (a dynamic-routing sink's). The old release created the Glue
+        database for it and nothing else, so no Glue table can be in state to
+        prove it, and destroying the database is Glue ``DeleteDatabase``."""
+        expose = _expose("iceberg", catalog)
+        del expose["binding"]["location"]["table"]
+        contract = _contract(expose)
+        state = [BUCKET, DB]
+
+        assert detect_catalog_moves(AwsIacPlugin(), contract, state) == (DB,)
+        with pytest.raises(CatalogMoveError) as excinfo:
+            guard_catalog_moves(AwsIacPlugin(), contract, state)
+        assert excinfo.value.exposes == (("orders", catalog),)
+
+    def test_a_table_less_expose_s_database_a_parquet_expose_uses_is_not_flagged(self):
+        """The database stays declared, so the plan does not destroy it."""
+        expose = _expose("iceberg", "lakekeeper")
+        del expose["binding"]["location"]["table"]
+        contract = _contract(_expose("parquet", expose_id="facts", table="facts"), expose)
+
+        assert detect_catalog_moves(AwsIacPlugin(), contract, [BUCKET, DB, FACTS]) == ()
+
+    def test_a_table_less_expose_does_not_vouch_for_another_s_database(self):
+        """The evidence rule still holds for an expose that declares a table:
+        a table-less sibling on another database flags only its own."""
+        table_less = _expose("iceberg", "rest", expose_id="raw", table="raw")
+        table_less["binding"]["location"].update(database="raw")
+        del table_less["binding"]["location"]["table"]
+        contract = _contract(_expose("iceberg", "lakekeeper"), table_less)
+        raw_db = "aws_glue_catalog_database.analytics_lake_raw"
+
+        with pytest.raises(CatalogMoveError) as excinfo:
+            guard_catalog_moves(AwsIacPlugin(), contract, [BUCKET, DB, FACTS, raw_db])
+
+        assert excinfo.value.addresses == (raw_db,)
+        assert excinfo.value.exposes == (("raw", "rest"),)
+
     def test_a_module_prefixed_address_is_not_this_module_s(self):
         """``fluid`` writes a root module: a child module's resource is not one
         this emit change removes, so it is matched exactly, never by name."""
@@ -151,6 +226,151 @@ class TestDetect:
         before = copy.deepcopy(contract)
         detect_catalog_moves(AwsIacPlugin(), contract, [DB, ORDERS])
         assert contract == before
+
+
+# ---------------------------------------------------------------------------
+# Snowflake: the EXTERNAL VOLUME an old release created
+# ---------------------------------------------------------------------------
+
+VOLUME = "snowflake_external_volume.analytics_lake_vol_FLUID_ANALYTICS_LAKE_VOL"
+SF_TABLE = "snowflake_table.analytics_lake_ANALYTICS_SALES_ORDERS"
+
+
+def _sf_expose(
+    catalog: Optional[str] = None,
+    *,
+    expose_id: str = "orders",
+    table: str = "ORDERS",
+    fmt: str = "iceberg",
+) -> Dict[str, Any]:
+    location: Dict[str, Any] = {
+        "database": "ANALYTICS",
+        "schema": "SALES",
+        "table": table,
+        "warehouse": "s3://lake/warehouse",
+        "iam_role_arn": "arn:aws:iam::123456789012:role/snowflake-lake",
+    }
+    if catalog is not None:
+        location.update(catalog=catalog, uri="http://lakekeeper:8181/catalog")
+    return {
+        "exposeId": expose_id,
+        "binding": {"platform": "snowflake", "format": fmt, "location": location},
+        "contract": {"schema": copy.deepcopy(SCHEMA)},
+    }
+
+
+class TestSnowflakeVolume:
+    """ARCH-1: 0.19.0 tested the raw catalog against a list that missed
+    ``lakekeeper``, ``bigquery`` and the ``iceberg-rest`` spelling, so those
+    exposes got an EXTERNAL VOLUME. The emitter now gives them none."""
+
+    @pytest.mark.parametrize(
+        "catalog, kind",
+        [
+            ("lakekeeper", "lakekeeper"),
+            ("Lakekeeper", "lakekeeper"),
+            ("bigquery", "bigquery"),
+            ("iceberg-rest", "rest"),
+        ],
+    )
+    def test_a_volume_the_old_release_created_is_flagged(self, catalog, kind):
+        contract = _contract(_sf_expose(catalog))
+
+        assert moved_iceberg_exposes(contract, spec=SNOWFLAKE_VOLUME_MOVES) == (("orders", kind),)
+        assert detect_catalog_moves(SnowflakeIacPlugin(), contract, [SF_TABLE, VOLUME]) == (VOLUME,)
+
+    @pytest.mark.parametrize(
+        "catalog", [None, "snowflake", "rest", "iceberg_rest", "polaris", "unity", "nessie", "glue"]
+    )
+    def test_a_catalog_whose_volume_did_not_change_is_not_a_move(self, catalog):
+        """No volume before and none now (rest, polaris...), or one both times
+        (Snowflake-managed): the old list and the kind table agree."""
+        contract = _contract(_sf_expose(catalog))
+        assert moved_iceberg_exposes(contract, spec=SNOWFLAKE_VOLUME_MOVES) == ()
+        assert detect_catalog_moves(SnowflakeIacPlugin(), contract, [SF_TABLE, VOLUME]) == ()
+
+    def test_an_operator_named_volume_never_moves(self):
+        expose = _sf_expose("lakekeeper")
+        expose["binding"]["icebergConfig"] = {"properties": {"external_volume": "OPS_VOL"}}
+        assert moved_iceberg_exposes(_contract(expose), spec=SNOWFLAKE_VOLUME_MOVES) == ()
+
+    def test_a_volume_a_managed_expose_still_uses_is_not_flagged(self):
+        """The volume is named per contract, so a Snowflake-managed expose
+        alongside keeps it declared."""
+        contract = _contract(
+            _sf_expose("lakekeeper"), _sf_expose(None, expose_id="facts", table="FACTS")
+        )
+        assert detect_catalog_moves(SnowflakeIacPlugin(), contract, [SF_TABLE, VOLUME]) == ()
+
+    @pytest.mark.parametrize(
+        "changes",
+        [{"warehouse": "analytics"}, {"iam_role_arn": None}],
+        ids=["warehouse-now-a-catalog-name", "no-iam-role-arn"],
+    )
+    def test_a_volume_is_flagged_after_an_upgrade_that_changed_the_location(self, changes):
+        """JRN-707-1: the before image re-runs today's emitter over today's
+        location, which derives no volume once the warehouse is a Lakekeeper
+        warehouse NAME or the role is gone. The volume the old release created
+        is keyed from the contract id alone, so it is still found."""
+        expose = _sf_expose("lakekeeper")
+        location = expose["binding"]["location"]
+        for key, value in changes.items():
+            if value is None:
+                del location[key]
+            else:
+                location[key] = value
+        contract = _contract(expose)
+
+        assert detect_catalog_moves(SnowflakeIacPlugin(), contract, [SF_TABLE, VOLUME]) == (VOLUME,)
+        assert detect_catalog_moves(SnowflakeIacPlugin(), contract, [SF_TABLE]) == ()
+
+    @pytest.mark.parametrize(
+        "contract_id", ["analytics.lake", "gold.hr.employee_360_v1", "9-lives"]
+    )
+    def test_the_derived_volume_address_is_the_one_the_emitter_writes(self, contract_id):
+        """The one address this module derives instead of emitting: pinned to
+        the Snowflake emitter's own key, so the two cannot drift apart."""
+        contract = {**_contract(_sf_expose(None)), "id": contract_id}
+        binding = contract["exposes"][0]["binding"]
+        emitted = SnowflakeIacPlugin().emit(contract)["snowflake_external_volume"]
+
+        assert set(SNOWFLAKE_VOLUME_MOVES.addresses_before(contract, binding)) == {
+            f"snowflake_external_volume.{key}" for key in emitted
+        }
+
+    def test_raises_with_the_snowflake_remedy(self):
+        with pytest.raises(CatalogMoveError) as excinfo:
+            guard_catalog_moves(
+                SnowflakeIacPlugin(),
+                _contract(_sf_expose("lakekeeper")),
+                [SF_TABLE, VOLUME],
+                workdir="/w/snowflake/analytics.lake",
+            )
+
+        exc = excinfo.value
+        assert exc.kind == "iceberg-catalog-move"
+        assert exc.remediation == (f"tofu -chdir=/w/snowflake/analytics.lake state rm {VOLUME}",)
+        message = str(exc)
+        assert "1 Snowflake EXTERNAL VOLUME(s)" in message
+        assert "exposes[orders]: location.catalog lakekeeper" in message
+        assert "the resources stay in Snowflake" in message
+        assert "DROP EXTERNAL VOLUME" in message
+
+
+class TestSpecLookup:
+    def test_the_in_tree_clouds(self):
+        assert catalog_move_spec(AwsIacPlugin()) is AWS_GLUE_MOVES
+        assert catalog_move_spec(SnowflakeIacPlugin()) is SNOWFLAKE_VOLUME_MOVES
+        assert catalog_move_spec(object(), "gcp") is None
+
+    def test_a_plugin_s_own_hook_wins(self):
+        class _OutOfTree:
+            name = "aws"
+
+            def catalog_move_spec(self):
+                return SNOWFLAKE_VOLUME_MOVES
+
+        assert catalog_move_spec(_OutOfTree(), "aws") is SNOWFLAKE_VOLUME_MOVES
 
 
 # ---------------------------------------------------------------------------
@@ -267,38 +487,110 @@ class TestEngineAdapter:
         )
         assert calls == []
 
-    def test_an_empty_state_passes(self, monkeypatch, engine):
-        self._listing(monkeypatch, engine, [])
-        engine._guard_catalog_moves(
-            _SpyPlugin(),
-            _contract(_expose("iceberg", "lakekeeper")),
-            "aws",
-            "/w",
-            {},
-            logging.getLogger("t"),
-        )
+    def _pull(self, monkeypatch, engine, result) -> None:
+        monkeypatch.setattr(engine.runner, "tofu_state_pull", lambda *_a, **_k: result)
 
-    def test_a_failed_probe_does_not_fail_the_apply(self, monkeypatch, engine):
+    def test_an_empty_state_passes_quietly(self, monkeypatch, engine, caplog):
+        """A fresh workdir: ``state pull`` prints nothing, so there is nothing
+        to release and nothing to warn about."""
+        self._listing(monkeypatch, engine, [])
+        self._pull(monkeypatch, engine, runner.TofuResult("state-pull", 0, "", ""))
+        plugin = _SpyPlugin()
+
+        with caplog.at_level(logging.WARNING, logger="t"):
+            engine._guard_catalog_moves(
+                plugin,
+                _contract(_expose("iceberg", "lakekeeper")),
+                "aws",
+                "/w",
+                {},
+                logging.getLogger("t"),
+            )
+
+        assert plugin.emits == 0
+        assert caplog.records == []
+
+    @pytest.mark.parametrize(
+        "pulled, reason",
+        [
+            (
+                runner.TofuResult("state-pull", 1, "", "Error acquiring the state lock"),
+                "the state could not be read: `tofu state pull` failed: Error acquiring",
+            ),
+            (
+                runner.TofuResult(
+                    "state-pull",
+                    0,
+                    '{"lineage": "l", "serial": 3, "resources": [{"type": "aws_s3_bucket"}]}',
+                    "",
+                ),
+                "listed nothing, but the state holds 1 resource(s)",
+            ),
+        ],
+        ids=["unreadable", "listing-lost"],
+    )
+    def test_a_failed_state_listing_is_a_warning(self, monkeypatch, engine, caplog, pulled, reason):
+        """SEC-707-6: ``tofu state list`` answers [] when it fails, which used
+        to skip the guard as if the workdir were fresh."""
+        self._listing(monkeypatch, engine, [])
+        self._pull(monkeypatch, engine, pulled)
+
+        with caplog.at_level(logging.WARNING, logger="t"):
+            engine._guard_catalog_moves(
+                _SpyPlugin(),
+                _contract(_expose("iceberg", "lakekeeper")),
+                "aws",
+                "/w",
+                {},
+                logging.getLogger("t"),
+            )
+
+        (record,) = caplog.records
+        assert record.levelno == logging.WARNING
+        assert "iceberg_catalog_move_probe_skipped" in record.getMessage()
+        assert reason in record.getMessage()
+        assert "do NOT pass --allow-data-loss" in record.getMessage()
+
+    def test_a_failed_probe_is_a_warning_not_a_failure(self, monkeypatch, engine, caplog):
+        """T4 / ARCH-6: the probe stays fail-open (the data-loss gate stands
+        behind it), but the operator is told, at WARNING, why it did not run."""
+
         class _Broken(AwsIacPlugin):
             def emit(self, contract, actions=()):
                 raise RuntimeError("probe exploded")
 
         self._listing(monkeypatch, engine, [DB, ORDERS])
-        engine._guard_catalog_moves(
-            _Broken(),
-            _contract(_expose("iceberg", "lakekeeper")),
-            "aws",
-            "/w",
-            {},
-            logging.getLogger("t"),
-        )
+        with caplog.at_level(logging.WARNING, logger="t"):
+            engine._guard_catalog_moves(
+                _Broken(),
+                _contract(_expose("iceberg", "lakekeeper")),
+                "aws",
+                "/w",
+                {},
+                logging.getLogger("t"),
+            )
 
-    def test_the_engine_runs_it_after_the_packaging_guard_and_before_plan(self, engine):
-        import inspect
+        (record,) = caplog.records
+        assert record.levelno == logging.WARNING
+        message = record.getMessage()
+        assert "iceberg_catalog_move_probe_skipped" in message
+        assert "the probe failed: RuntimeError: probe exploded" in message
+        assert '"expose": "orders"' in message and '"catalog": "lakekeeper"' in message
+        assert "do NOT pass --allow-data-loss" in message
 
-        source = inspect.getsource(engine.apply_via_opentofu)
-        packaging_at = source.index("_guard_packaging_transitions(")
-        moves_at = source.index("_guard_catalog_moves(")
-        adopt_at = source.index("_adopt_existing(")
-        plan_at = source.index("runner.tofu_plan(")
-        assert packaging_at < moves_at < adopt_at < plan_at
+    def test_snowflake_translates_to_the_same_cli_error(self, monkeypatch, engine):
+        from fluid_build.cli._common import CLIError
+
+        self._listing(monkeypatch, engine, [SF_TABLE, VOLUME])
+        with pytest.raises(CLIError) as excinfo:
+            engine._guard_catalog_moves(
+                SnowflakeIacPlugin(),
+                _contract(_sf_expose("lakekeeper")),
+                "snowflake",
+                "/w",
+                {},
+                logging.getLogger("t"),
+            )
+
+        assert excinfo.value.event == "iceberg_catalog_move_blocked"
+        assert excinfo.value.context["remediation"] == [f"tofu -chdir=/w state rm {VOLUME}"]

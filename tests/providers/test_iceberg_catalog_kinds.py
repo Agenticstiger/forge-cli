@@ -17,9 +17,21 @@
 ``catalog: lakekeeper`` used to stream over REST while dbt's ``catalogs.yml``
 wrote a Snowflake-managed table and the AWS IaC created a Glue table for the
 same name: four emitters each classified the free-string ``catalog`` by hand.
-The unit tests pin the table; the agreement matrix runs EVERY emitter over
-every kind and checks each answer against the kind's row, so a fifth
-hand-rolled classification fails here rather than in a user's lake.
+The unit tests pin the table; the agreement matrix runs these emitters over
+every kind, an absent catalog and an unknown value, and checks each answer
+against the kind's row:
+
+- dbt ``catalogs.yml`` on Snowflake and on BigQuery
+- the Snowflake IaC, the AWS IaC and the Confluent (Tableflow) IaC
+- the native AWS planner (``plan_actions``)
+- ``fluid policy compile`` (``compile_policy``)
+- the Kafka Connect sink validator and both sink derivers (Kafka Connect,
+  Debezium Server)
+- ``fluid diff``'s Glue inspector
+
+A new hand-rolled classification in one of them fails here rather than in a
+user's lake. ``fluid test``'s Glue check (``ContractValidator._iceberg_outside_glue``)
+also reads the table and is not in the matrix.
 """
 
 from __future__ import annotations
@@ -378,3 +390,102 @@ def test_sink_validator_demands_exactly_what_the_row_requires(kind):
     for key in ("uri", "warehouse"):
         demanded = any(f"binding.location.{key}" in e for e in errors)
         assert demanded == (key in row.sink_requires), (key, errors)
+
+
+@pytest.mark.parametrize("kind", MATRIX)
+def test_aws_planner_plans_a_glue_table_only_for_glue(kind):
+    from fluid_build.providers.aws.plan.planner import plan_actions
+
+    contract = _contract(_binding(kind, platform="aws", bucket="lake", region="us-east-1"))
+    if _row(kind, "aws").family == FAMILY_UNKNOWN:
+        # The planner's answer decides whether a Glue table exists, as the
+        # IaC's does: refused, never planned as "not Glue".
+        with pytest.raises(ValueError, match="does not know"):
+            plan_actions(contract, "123456789012", "us-east-1")
+        return
+    ops = [a["op"] for a in plan_actions(contract, "123456789012", "us-east-1")]
+    in_glue = _row(kind, "aws").family == FAMILY_GLUE
+    assert ("glue.ensure_iceberg_table" in ops) == in_glue
+    assert ("glue.ensure_database" in ops) == in_glue
+    # The bucket is the catalog's storage either way.
+    assert "s3.ensure_bucket" in ops
+
+
+@pytest.mark.parametrize("kind", MATRIX)
+def test_policy_compiler_grants_on_glue_only_for_glue(kind):
+    from fluid_build.policy.compiler import compile_policy
+
+    contract = _contract(_binding(kind, platform="aws", bucket="lake", region="us-east-1"))
+    principal = "arn:aws:iam::123456789012:role/reader"
+    contract["accessPolicy"] = {"grants": [{"principal": principal, "permissions": ["read"]}]}
+    bindings, warnings = compile_policy(contract)
+    types = [b["resource_type"] for b in bindings]
+    row = _row(kind, "aws")
+    assert ("glue.table" in types) == (row.family == FAMILY_GLUE)
+    if row.family not in (FAMILY_GLUE, ic.FAMILY_SNOWFLAKE_MANAGED):
+        # A grant on a table outside Glue is reported, never compiled to
+        # silence; the unknown value is named so the reader can see it.
+        assert any(canonical_catalog_kind(kind) in w for w in warnings), warnings
+
+
+@pytest.mark.parametrize("kind", MATRIX)
+def test_confluent_iac_publishes_to_glue_only_for_glue(kind):
+    from fluid_build.iac.providers.confluent import ConfluentIacPlugin, validate_confluent_binding
+
+    binding = _binding(
+        kind,
+        platform="confluent",
+        bucket="lake",
+        environment_id="env-1",
+        kafka_cluster_id="lkc-1",
+        confluent_role_arn="arn:aws:iam::123456789012:role/tableflow",
+        topic="orders",
+    )
+    contract = _contract(binding)
+    res = ConfluentIacPlugin().emit(contract)
+    errors, _ = validate_confluent_binding(contract)
+    # Tableflow publishes to AWS Glue, so an absent catalog is Glue here, as
+    # on AWS: the AWS row is the one to read.
+    in_glue = _row(kind, "aws").family == FAMILY_GLUE
+    assert bool(res.get("confluent_catalog_integration")) == in_glue
+    # The validator refuses exactly what the emitter declines to publish.
+    assert any("binding.location.catalog" in e for e in errors) == (not in_glue), errors
+    assert res.get("confluent_tableflow_topic")
+
+
+@pytest.mark.parametrize("kind", MATRIX)
+def test_dbt_bigquery_writes_biglake_only_for_biglake(kind):
+    from fluid_build.engines.dbt.catalogs_yml import generate_catalogs_yml
+
+    build = {"engine": "dbt", "execution": {"runtime": {"platform": "gcp"}}}
+    content = generate_catalogs_yml(_contract(_binding(kind, platform="gcp", bucket="lake")), build)
+    # ``biglake_metastore`` is dbt-bigquery's only catalog type, and an absent
+    # catalog has always meant BigLake there (the GCP row's REST default is
+    # the streaming sink's, not dbt's: see ``default_catalog_kind``).
+    biglake = kind is None or catalog_kind_info(kind).name == "bigquery"
+    if not biglake:
+        assert content is None
+        return
+    assert content is not None
+    integration = yaml.safe_load(content)["catalogs"][0]["write_integrations"][0]
+    assert integration["catalog_type"] == "biglake_metastore"
+
+
+@pytest.mark.parametrize("kind", MATRIX)
+def test_diff_inspects_glue_only_for_glue(kind, monkeypatch, tmp_path):
+    from fluid_build.cli import _diff_live
+    from fluid_build.providers import aws_validation
+
+    # Stop at the first AWS call: what is asserted is whether Glue would be
+    # read at all, never a live answer.
+    monkeypatch.setattr(aws_validation, "BOTO3_AVAILABLE", False)
+    contract = _contract(_binding(kind, platform="aws", bucket="lake", region="us-east-1"))
+    (result,) = _diff_live.compare_live(contract, tmp_path).exposes
+    if _row(kind, "aws").family == FAMILY_GLUE:
+        assert result.target.startswith("glue:sales.orders"), result
+        assert result.status == _diff_live.ERROR and "boto3" in (result.detail or "")
+    else:
+        # A Glue table of that name would be someone else's: neither "absent"
+        # nor a comparison with it would be true.
+        assert result.status == _diff_live.NOT_CHECKED
+        assert f"Iceberg catalog {canonical_catalog_kind(kind)}" in (result.detail or "")

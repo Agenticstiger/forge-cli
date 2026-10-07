@@ -168,6 +168,16 @@ _CATALOG_ALIASES: Mapping[str, str] = MappingProxyType(
 _UNKNOWN_KIND = CatalogKind("", FAMILY_UNKNOWN, "rest", None, "built_in")
 
 
+class UnknownIcebergCatalogError(ValueError):
+    """An Iceberg ``location.catalog`` value no row of the table knows.
+
+    Typed so a caller can tell the contract's refusal (the remedy is in the
+    message) from a planner that failed to run: the AWS provider used to log it
+    as ``plan_failed`` and then re-raise it, so the user read it twice, once as
+    a raw JSON log line.
+    """
+
+
 def _fold(value: Any) -> str:
     return str(value or "").strip().lower().replace("_", "-")
 
