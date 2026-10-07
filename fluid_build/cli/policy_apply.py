@@ -89,8 +89,8 @@ def run(args, logger: logging.Logger) -> int:
 
         # The compiler's warnings, echoed here too: a grant that compiled to
         # no binding (see ``fluid policy compile``) is not enforced by this
-        # step either, and the run that applies is often not the one that
-        # compiled. A contract with no grants leaves nothing unenforced.
+        # step either, and apply can run in a different job from compile. A
+        # contract with no grants leaves nothing unenforced.
         from fluid_build.policy.compiler import NO_GRANTS
 
         stored = data.get("warnings") if isinstance(data, dict) else None

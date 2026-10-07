@@ -50,7 +50,7 @@ def register(subparsers: argparse._SubParsersAction):
 
 
 #: The values ``compile_policy`` reads as a mapping or a list. A wrong type at
-#: one of these paths is a value the compiler cannot read. Any other schema
+#: one of these paths is one the compiler can fail on. Any other schema
 #: error (an extra key on a grant, a wrong type under ``metadata``) is not
 #: named: it did not make the compiler fail.
 _COMPILER_READ_PATHS = re.compile(
@@ -105,8 +105,8 @@ def run(args, logger: logging.Logger) -> int:
 
             bindings, warnings = compile_policy(c)
         except Exception as e:
-            # Fail closed. This used to write ``{"bindings": []}`` and exit 0,
-            # so a crash read as "no grants to enforce" to the next stage.
+            # Fail closed. This used to write an empty bindings list and exit
+            # 0, so a crash read as "no grants to enforce" to the next stage.
             # Nothing is written: a bindings file from an earlier run stays as
             # it was, and the non-zero exit stops the pipeline before apply.
             logger.debug(traceback.format_exc())
