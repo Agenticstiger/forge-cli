@@ -441,11 +441,15 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     # ── apply safety gates ─────────────────────────────────────────────────
     "iceberg_catalog_move_blocked": (
         [
-            "Run the printed `tofu state rm` commands: they release the resources from "
-            "this contract's OpenTofu state and touch nothing in the cloud",
+            (
+                "Run the printed `tofu state rm` commands: they release the resources from "
+                + "this contract's OpenTofu state and touch nothing in the cloud"
+            ),
             "Then re-run fluid apply",
-            "The released Glue database/table or Snowflake EXTERNAL VOLUME stays in place; "
-            "delete it by hand only if nothing else uses it",
+            (
+                "The released Glue database/table or Snowflake EXTERNAL VOLUME stays in place; "
+                + "delete it by hand only if nothing else uses it"
+            ),
         ],
         "iceberg-catalog-move",
     ),

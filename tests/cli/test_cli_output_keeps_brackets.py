@@ -36,9 +36,8 @@ import pytest
 import yaml
 
 import fluid_build.cli as cli_mod
-from fluid_build.cli import main
+import fluid_build.cli.validate as validate_mod
 from fluid_build.cli._common import CLIError
-from fluid_build.cli.validate import _output_text_results
 
 pytestmark = pytest.mark.unit
 
@@ -123,7 +122,7 @@ def _unwrapped(text: str) -> str:
 def test_validate_names_the_expose_in_its_error(tmp_path, capsys):
     path = _write(tmp_path, _contract("lakekeeper", lake_formation=True))
 
-    rc = main(["validate", path])
+    rc = cli_mod.main(["validate", path])
 
     out = capsys.readouterr().out
     assert rc == 1
@@ -133,7 +132,7 @@ def test_validate_names_the_expose_in_its_error(tmp_path, capsys):
 def test_validate_quiet_names_the_expose_in_its_error(tmp_path, capsys):
     path = _write(tmp_path, _contract("lakekeeper", lake_formation=True))
 
-    rc = main(["validate", "--quiet", path])
+    rc = cli_mod.main(["validate", "--quiet", path])
 
     out = capsys.readouterr().out
     assert rc == 1
@@ -144,7 +143,7 @@ def test_validate_json_is_unchanged(tmp_path, capsys):
     """The JSON path already printed literally; it must still parse and name the id."""
     path = _write(tmp_path, _contract("lakekeeper", lake_formation=True))
 
-    rc = main(["validate", "--format", "json", path])
+    rc = cli_mod.main(["validate", "--format", "json", path])
 
     doc = json.loads(capsys.readouterr().out)
     assert rc == 1
@@ -167,7 +166,7 @@ def _result(errors, warnings) -> SimpleNamespace:
 def test_validate_prints_markup_like_messages_verbatim(capsys, quiet):
     args = SimpleNamespace(quiet=quiet, verbose=False, strict=False)
 
-    _output_text_results(
+    validate_mod._output_text_results(
         _result([f"error: {MARKUP_LIKE}"], [f"warning: {MARKUP_LIKE}"]),
         args,
         logging.getLogger("test"),
@@ -181,7 +180,6 @@ def test_validate_prints_markup_like_messages_verbatim(capsys, quiet):
 
 def test_validate_bundle_issue_keeps_its_severity(monkeypatch, tmp_path, capsys):
     """A bundle finding prints as ``[error] <validator>: ...``; Rich used to eat ``[error]``."""
-    import fluid_build.cli.validate as validate_mod
     import fluid_build.forge.core.validators as validators
 
     issue = SimpleNamespace(
@@ -214,7 +212,6 @@ def test_validate_bundle_issue_keeps_its_severity(monkeypatch, tmp_path, capsys)
 def test_validate_cli_error_context_and_suggestions_print_verbatim(monkeypatch, tmp_path, capsys):
     """``fluid validate``'s own CLIError render: a context value and the suggestions."""
     import fluid_build._error_catalog as catalog
-    import fluid_build.cli.validate as validate_mod
 
     def _load(*_a, **_k):
         raise ValueError(MARKUP_LIKE)
@@ -227,7 +224,7 @@ def test_validate_cli_error_context_and_suggestions_print_verbatim(monkeypatch, 
     )
     path = _write(tmp_path, _contract("lakekeeper", lake_formation=True))
 
-    rc = main(["validate", path])
+    rc = cli_mod.main(["validate", path])
 
     out = _unwrapped(capsys.readouterr().out)
     assert rc == 1
@@ -245,7 +242,7 @@ def test_validate_missing_file_names_the_whole_path(monkeypatch, capsys):
 
     monkeypatch.setattr(security, "validate_cli_path", _missing)
 
-    rc = main(["validate", "orders[draft]\\"])
+    rc = cli_mod.main(["validate", "orders[draft]\\"])
 
     err = _unwrapped(capsys.readouterr().err)
     assert rc == 1
@@ -261,7 +258,7 @@ def test_generate_iac_unsupported_binding_names_the_expose(tmp_path, capsys):
     """A real UnsupportedBindingError, raised by the AWS emitter, rendered by main()."""
     path = _write(tmp_path, _contract("lakekeper", lake_formation=False))
 
-    rc = main(["generate", "iac", path])
+    rc = cli_mod.main(["generate", "iac", path])
 
     out = capsys.readouterr().out
     assert rc != 0
@@ -325,7 +322,7 @@ def test_catalog_move_remediation_names_the_expose_and_keeps_commands_whole(
     assert commands and all(len(c) > 80 for c in commands)
     _raise_from_command(monkeypatch, err)
 
-    rc = main(["validate", "unused.fluid.yaml"])
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
 
     out = capsys.readouterr().out
     assert rc == 1
@@ -345,7 +342,7 @@ def test_cli_error_message_context_and_suggestions_print_verbatim(monkeypatch, c
     err.suggestions = [f"pip install 'data-product-forge[gcp]' ({MARKUP_LIKE})"]
     _raise_from_command(monkeypatch, err)
 
-    rc = main(["validate", "unused.fluid.yaml"])
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
 
     out = capsys.readouterr().out
     assert rc == 1
