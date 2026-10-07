@@ -43,8 +43,10 @@ Snowflake-managed table for the same expose. Per sink build:
 * ``sink.catalog`` must agree with the expose's catalog, because dbt and the
   IaC read only the expose, and so must the catalog an override or a
   hand-written config selects (its ``type`` or ``catalog-impl``);
-* every ``binding.location`` key in the row's ``sink_requires`` must be set
-  (Glue keeps its advisory region warning: the warehouse falls back);
+* every ``binding.location`` key in the row's ``sink_requires`` must be set,
+  a warehouse counting when the deriver resolves one (DynamoDB and JDBC derive
+  it from an explicit bucket); Glue keeps its advisory region warning: the
+  warehouse falls back;
 * the runtime must ship the catalog's client (the stock Apache Iceberg Kafka
   Connect runtime has no Nessie client, and the published sink predates the
   ``bigquery`` catalog type);
@@ -75,6 +77,8 @@ from dataclasses import dataclass
 from typing import AbstractSet, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ...providers._iceberg_catalog import (
+    BIGQUERY_PROJECT_ID,
+    BUCKET_WAREHOUSE_KINDS,
     DYNAMODB_CATALOG_IMPL,
     FAMILY_GLUE,
     FAMILY_REST,
@@ -382,16 +386,17 @@ def _check_catalog(
         )
 
     # 4. catalog tagged-union completeness, from the row's ``sink_requires``.
-    #    HARD: forge can't derive a REST uri or a catalog name. Glue requires
-    #    nothing (the warehouse falls back), so its region stays advisory.
+    #    HARD: forge can't derive a REST uri or a catalog name. A warehouse is
+    #    present when the deriver resolves one (DynamoDB and JDBC derive it
+    #    from an explicit bucket). Glue requires nothing (the warehouse falls
+    #    back), so its region stays advisory.
+    derived_warehouse = resolve_iceberg_catalog(binding, sink=sink, account_ref="").warehouse
     for key in info.sink_requires:
-        if not loc.get(key):
-            suffix = (
-                " (the catalog name)" if key == "warehouse" and info.family == FAMILY_REST else ""
-            )
+        present = derived_warehouse if key == "warehouse" else loc.get(key)
+        if not present:
             errors.append(
                 f"iceberg sink (build {bid!r}): {kind} catalog requires "
-                f"binding.location.{key}{suffix}"
+                f"binding.location.{key}{_requires_hint(key, kind, info)}"
             )
     if info.family == FAMILY_GLUE and not loc.get("region"):
         warnings.append(
@@ -411,20 +416,71 @@ def _check_catalog(
             "the sink cannot load NessieCatalog"
         )
     # ``type=bigquery`` (BigQueryMetastoreCatalog) is in Iceberg's CatalogUtil
-    # only from 1.10; the sink published on Confluent Hub is older, so a stock
-    # worker fails to load the catalog at connector start. Advisory: a runtime
-    # built from Iceberg >= 1.10 has it.
+    # only from 1.10 (apache-iceberg-1.10.0 CatalogUtil.java:78, :321-322; absent
+    # at apache-iceberg-1.9.2); the sink published on Confluent Hub is older,
+    # so a stock worker fails to load the catalog at connector start.
+    # Advisory: a runtime built from Iceberg >= 1.10 has it.
     if reaching == "bigquery" and runtime.engine == "kafka-connect":
         warnings.append(
             f"iceberg sink (build {bid!r}): the sink config sets "
             "iceberg.catalog.type=bigquery, which the published Apache Iceberg Kafka Connect "
             f"sink ({PUBLISHED_KAFKA_CONNECT_SINK_VERSION} on Confluent Hub) cannot load: "
-            "Iceberg's CatalogUtil gains the bigquery type in 1.10. Run a sink built from "
-            "Iceberg >= 1.10, or the connector fails at start"
+            "Iceberg's CatalogUtil gains the bigquery type in 1.10, so on that sink the "
+            "connector fails at start. Run a sink built from Iceberg >= 1.10"
+        )
+    # BigQueryMetastoreCatalog reads the warehouse only to place a dataset it
+    # creates, or a table in a dataset with no default storage location URI
+    # (apache-iceberg-1.10.0 BigQueryMetastoreCatalog.java:147-160, :197-205,
+    # :298-303); an auto-creating sink creates both (IcebergWriterFactory.java
+    # :89, :122-131). Advisory: a dataset with a storage URI needs none.
+    if (
+        reaching == "bigquery"
+        and kind == "bigquery"
+        and runtime.derives
+        and not derived_warehouse
+        and not _overrides_warehouse(runtime)
+    ):
+        warnings.append(
+            f"iceberg sink (build {bid!r}): no gs:// warehouse can be derived from "
+            "binding.location (a gs:// warehouse, or a bucket), so the derived bigquery "
+            "catalog config sets none. BigQueryMetastoreCatalog needs one to create a "
+            "dataset, or a table in a dataset with no default storage location URI"
+            + (
+                "; the Debezium Server Iceberg sink also declares "
+                "debezium.sink.iceberg.warehouse with no default"
+                if runtime.engine == "debezium"
+                else ""
+            )
         )
 
     _check_warehouse_override(bid, binding, sink, kind, info, runtime, warnings)
     _check_selector_overrides(bid, kind, info, runtime, errors)
+
+
+def _requires_hint(key: str, kind: str, info: CatalogKind) -> str:
+    """What a missing ``sink_requires`` key is to the sink, for check 4's error."""
+    if key == "warehouse" and info.family == FAMILY_REST:
+        return " (the catalog name)"
+    if key == "warehouse" and kind in BUCKET_WAREHOUSE_KINDS:
+        return (
+            " (an object-store location), or a binding.location.bucket on platform aws or "
+            f"gcp to derive it from; the {kind} catalog refuses to start without a warehouse"
+        )
+    if key == "project" and kind == "bigquery":
+        return (
+            f" (the sink's {BIGQUERY_PROJECT_ID}); the bigquery catalog refuses to start "
+            "without it"
+        )
+    return ""
+
+
+def _overrides_warehouse(runtime: IcebergSinkPlan) -> bool:
+    """Does an override map merged over the derived config set the warehouse?"""
+    # The warehouse key carries the same runtime prefix as the type key:
+    # ``iceberg.catalog.warehouse`` on Kafka Connect, bare ``warehouse`` on
+    # Debezium Server.
+    key = runtime.type_key[: -len("type")] + "warehouse"
+    return any(mapping.get(key) for _label, mapping in runtime.overrides)
 
 
 def _reaching_catalog_type(info: Any, runtime: IcebergSinkPlan) -> Optional[str]:

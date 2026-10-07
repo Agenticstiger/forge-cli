@@ -32,7 +32,7 @@ from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ._sql_safety import validate_ident
-from .aws.util.warehouse import get_iceberg_warehouse
+from .aws.util.warehouse import bucket_uses_fallback, get_iceberg_warehouse, normalize_location
 
 # Apache Iceberg runtime class names (pinned to the connector surface validated
 # in the OSS spike — RFC §14). Bumping the Iceberg runtime may change these.
@@ -138,12 +138,23 @@ _CATALOG_KINDS: Mapping[str, CatalogKind] = MappingProxyType(
             # Connect runtime does not bundle iceberg-nessie.
             CatalogKind("nessie", FAMILY_NATIVE, "nessie", None, "iceberg_rest", _REST_REQUIRES),
             # BigLake metastore. ``type=bigquery`` exists in Iceberg >= 1.10.
-            CatalogKind("bigquery", FAMILY_NATIVE, "bigquery", None, "iceberg_rest"),
+            # BigQueryMetastoreCatalog.initialize refuses to start without
+            # ``gcp.bigquery.project-id``, which the resolver maps from
+            # ``location.project`` (apache-iceberg-1.10.0
+            # BigQueryMetastoreCatalog.java:84-87).
+            CatalogKind("bigquery", FAMILY_NATIVE, "bigquery", None, "iceberg_rest", ("project",)),
             CatalogKind("hive", FAMILY_NATIVE, "hive", None, None),
-            CatalogKind("jdbc", FAMILY_NATIVE, "jdbc", None, None, ("uri",)),
+            # JdbcCatalog.initialize refuses a missing uri and an empty warehouse
+            # (apache-iceberg-1.10.0 JdbcCatalog.java:114-119). The warehouse
+            # may be derived: see :data:`BUCKET_WAREHOUSE_KINDS`.
+            CatalogKind("jdbc", FAMILY_NATIVE, "jdbc", None, None, ("uri", "warehouse")),
             CatalogKind("hadoop", FAMILY_NATIVE, "hadoop", None, None, ("warehouse",)),
             # CatalogUtil has no ``dynamodb`` type: it is reached by impl only.
-            CatalogKind("dynamodb", FAMILY_NATIVE, None, DYNAMODB_CATALOG_IMPL, None),
+            # DynamoDbCatalog.initialize refuses an empty warehouse
+            # (apache-iceberg-1.10.0 DynamoDbCatalog.java:132-134).
+            CatalogKind(
+                "dynamodb", FAMILY_NATIVE, None, DYNAMODB_CATALOG_IMPL, None, ("warehouse",)
+            ),
             # Horizon over an EXTERNAL VOLUME; a streaming writer reaches it
             # through Snowflake's Iceberg REST endpoint.
             CatalogKind(
@@ -157,6 +168,22 @@ _CATALOG_KINDS: Mapping[str, CatalogKind] = MappingProxyType(
         )
     }
 )
+
+#: Kinds whose ``warehouse`` is an object-store location the resolver may
+#: derive from an explicit ``location.bucket`` (and ``path``) when
+#: ``location.warehouse`` is absent. Never from the account-derived fallback
+#: bucket the Glue row uses: no IaC creates that bucket for a non-Glue table.
+BUCKET_WAREHOUSE_KINDS = frozenset({"dynamodb", "jdbc"})
+
+#: The object-store scheme a derived warehouse gets, by canonical platform.
+_BUCKET_WAREHOUSE_SCHEMES: Mapping[str, str] = MappingProxyType({"aws": "s3", "gcp": "gs"})
+
+#: BigQueryMetastoreCatalog's own property names (apache-iceberg-1.10.0
+#: bigquery/src/main/java/org/apache/iceberg/gcp/bigquery/
+#: BigQueryMetastoreCatalog.java:62-63). Without a location the catalog uses
+#: ``us`` (:68, :90).
+BIGQUERY_PROJECT_ID = "gcp.bigquery.project-id"
+BIGQUERY_LOCATION = "gcp.bigquery.location"
 
 #: Accepted spellings for a canonical kind (after case and ``-``/``_`` folding).
 _CATALOG_ALIASES: Mapping[str, str] = MappingProxyType(
@@ -200,8 +227,12 @@ def known_catalog_kinds() -> Tuple[str, ...]:
 
 
 def default_catalog_kind(binding: Mapping[str, Any]) -> str:
-    """The kind an Iceberg binding gets when it names none: Glue on AWS,
-    Snowflake-managed on Snowflake, a REST catalog anywhere else.
+    """The kind an Iceberg binding gets when it names none: Glue on AWS and on
+    Confluent, Snowflake-managed on Snowflake, a REST catalog anywhere else.
+
+    Confluent is Glue because the Tableflow IaC publishes a table with no
+    ``catalog`` to AWS Glue (``iac/providers/confluent.py``), so the policy
+    compiler and dbt read the catalog the table is actually in.
 
     GCP is the one platform where an absent catalog means two things: the
     streaming sink has always written a REST catalog there, while dbt-bigquery
@@ -213,7 +244,7 @@ def default_catalog_kind(binding: Mapping[str, Any]) -> str:
     from ..iac.provider_match import canonical_cloud
 
     cloud = canonical_cloud(binding.get("platform"))
-    if cloud == "aws":
+    if cloud in ("aws", "confluent"):
         return "glue"
     if cloud == "snowflake":
         return "snowflake-managed"
@@ -380,7 +411,11 @@ def resolve_iceberg_catalog(
 
     ``account_ref`` feeds the warehouse bucket fallback on the Glue path (a
     concrete account id at connector-config time). REST catalogs take an explicit
-    ``uri`` + ``warehouse`` (catalog name) and don't use it.
+    ``uri`` + ``warehouse`` (catalog name) and don't use it. DynamoDB and JDBC
+    take ``location.warehouse``, else derive one from an explicit
+    ``location.bucket`` (:data:`BUCKET_WAREHOUSE_KINDS`); BigQuery takes the
+    ``gs://`` URI :func:`iceberg_storage_uri` gives, plus ``location.project``
+    and ``location.region`` as its own catalog properties.
     """
     loc = binding.get("location") or {}
     database = loc.get("database") or binding.get("database")
@@ -411,6 +446,20 @@ def resolve_iceberg_catalog(
     # refuses it). The FileIO follows the WAREHOUSE scheme so GCS (gs://) and
     # ADLS (abfss://) work, not just S3 (RFC §6.3 — PR7's REST + GCP profiles).
     warehouse = loc.get("warehouse") or ""
+    region = loc.get("region")
+    extra: Dict[str, str] = {}
+    if kind == "bigquery":
+        # The gs:// storage dbt-bigquery's ``external_volume`` and the GCP IaC
+        # use, or none. ``client.region`` is an AWS client property, so the
+        # region goes to the catalog's own location key instead.
+        warehouse = iceberg_storage_uri(binding, scheme="gs")
+        if loc.get("project"):
+            extra[BIGQUERY_PROJECT_ID] = str(loc["project"])
+        if region:
+            extra[BIGQUERY_LOCATION] = str(region)
+        region = None
+    elif not warehouse and kind in BUCKET_WAREHOUSE_KINDS:
+        warehouse = _bucket_warehouse(binding)
     return ResolvedIcebergCatalog(
         catalog_type=info.runtime_type or kind,
         warehouse=warehouse,
@@ -418,11 +467,32 @@ def resolve_iceberg_catalog(
         catalog_impl=info.catalog_impl,
         uri=loc.get("uri"),
         io_impl=_io_impl_for_warehouse(warehouse),
-        region=loc.get("region"),
+        region=region,
         id_columns=id_columns,
         partition_by=partition_by,
+        extra_catalog_props=extra,
         kind=kind,
     )
+
+
+def _bucket_warehouse(binding: Mapping[str, Any]) -> str:
+    """The object-store warehouse an explicit ``location.bucket`` names, or ``""``.
+
+    ``<scheme>://<bucket>/<path>``, with the bucket and path normalised the way
+    the Glue row's :func:`get_iceberg_warehouse` normalises them (``path``
+    defaults to ``<database>/<table>/``). The scheme follows the platform:
+    ``s3`` on AWS, ``gs`` on GCP; any other platform derives nothing. A
+    missing or unresolved bucket derives nothing either, rather than the
+    Glue row's account-derived fallback bucket.
+    """
+    from ..iac.provider_match import canonical_cloud
+
+    loc = binding.get("location") or {}
+    scheme = _BUCKET_WAREHOUSE_SCHEMES.get(canonical_cloud(binding.get("platform")))
+    if not scheme or bucket_uses_fallback(loc):
+        return ""
+    bucket, path = normalize_location(loc, account_ref="")
+    return f"{scheme}://{bucket}/{path}"
 
 
 # ---------------------------------------------------------------------------

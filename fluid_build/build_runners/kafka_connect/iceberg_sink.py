@@ -111,6 +111,12 @@ def emit_iceberg_sink_config(
         cfg["iceberg.catalog.client.region"] = resolved.region
     if resolved.uri:
         cfg["iceberg.catalog.uri"] = resolved.uri
+    # Catalog-specific properties (``gcp.bigquery.project-id``...). The sink
+    # hands every ``iceberg.catalog.``-prefixed key to the catalog with the
+    # prefix stripped (apache-iceberg-1.10.0 kafka-connect/kafka-connect/src/
+    # main/java/org/apache/iceberg/connect/IcebergSinkConfig.java:60, :254).
+    for k, v in (resolved.extra_catalog_props or {}).items():
+        cfg[f"iceberg.catalog.{k}"] = str(v)
 
     # ── routing / write semantics ──
     if resolved.id_columns:
