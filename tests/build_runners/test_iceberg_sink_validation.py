@@ -26,7 +26,9 @@ from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
     validate_iceberg_sink,
 )
 from fluid_build.providers._iceberg_catalog import (
+    DYNAMODB_CATALOG_IMPL,
     FAMILY_REST,
+    GLUE_CATALOG_IMPL,
     canonical_catalog_kind,
     catalog_kind_info,
     known_catalog_kinds,
@@ -447,7 +449,11 @@ _REST = _loc_binding("rest", uri="http://iceberg:8181", warehouse="s3://b/w")
         # presence is what CatalogUtil checks: an empty value still trips it
         (_GLUE_AWS, {"iceberg_catalog_overrides": {"iceberg.catalog.type": ""}}, True),
         # overriding the SAME key the deriver emits is fine
-        (_GLUE_AWS, {"iceberg_catalog_overrides": {"iceberg.catalog.catalog-impl": "x.Y"}}, False),
+        (
+            _GLUE_AWS,
+            {"iceberg_catalog_overrides": {"iceberg.catalog.catalog-impl": GLUE_CATALOG_IMPL}},
+            False,
+        ),
         (_REST, {"iceberg_catalog_overrides": {"iceberg.catalog.type": "rest"}}, False),
         # a hand-written sink config merged over a derived one (opt-in)
         (
@@ -720,8 +726,10 @@ def test_bigquery_warning_follows_the_type_that_reaches_the_worker():
         _loc_binding("bigquery", platform="gcp", warehouse="gs://acme/wh"),
         kc={"sink_connector_config": {"iceberg.catalog.type": "rest"}},
     )
-    _, warnings = validate_iceberg_sink(contract)
+    errors, warnings = validate_iceberg_sink(contract)
     assert not any("iceberg.catalog.type=bigquery" in w for w in warnings), warnings
+    # ... and REST is not the bigquery catalog dbt and the IaC read (JRN-707-2).
+    assert any("Declare the catalog the sink writes to" in e for e in errors), errors
 
 
 @pytest.mark.parametrize(
@@ -735,6 +743,211 @@ def test_bigquery_warning_follows_the_type_that_reaches_the_worker():
 def test_gcp_expose_naming_its_catalog_is_not_refused(catalog, location):
     errs = _errs(_sink_contract(_loc_binding(catalog, platform="gcp", **location)))
     assert errs == []
+
+
+@pytest.mark.parametrize(
+    "sink, kc, reaching, source",
+    [
+        # glue is in the acquisitionSink.catalog schema enum, reached by catalog-impl
+        ({"catalog": "glue"}, None, "a glue", "sink.catalog 'glue'"),
+        (
+            None,
+            {"sink_connector_config": {"iceberg.catalog.catalog-impl": GLUE_CATALOG_IMPL}},
+            "a glue",
+            "the hand-written sink config",
+        ),
+        (
+            None,
+            {"sink_connector_config": {"iceberg.catalog.catalog-impl": DYNAMODB_CATALOG_IMPL}},
+            "a dynamodb",
+            "the hand-written sink config",
+        ),
+        (
+            None,
+            {"sink_connector_config": {"iceberg.catalog.catalog-impl": "com.acme.LakeCatalog"}},
+            "a com.acme.LakeCatalog",
+            "the hand-written sink config",
+        ),
+        (
+            {"catalog": "bigquery"},
+            {"iceberg_catalog_overrides": {"iceberg.catalog.type": "rest"}},
+            "a REST",
+            "iceberg_catalog_overrides",
+        ),
+    ],
+    ids=[
+        "sink-catalog-glue",
+        "handwritten-glue-impl",
+        "handwritten-dynamodb-impl",
+        "handwritten-custom-impl",
+        "override-type-over-sink-catalog",
+    ],
+)
+def test_gcp_split_covers_a_catalog_reached_by_catalog_impl(sink, kc, reaching, source):
+    """CON-2 / LOGIC-2: the gate used to key on the wire ``type``, which is
+    absent for a catalog reached by ``catalog-impl``, so the sink committed to
+    Glue (or DynamoDB, or a custom class) while dbt-bigquery and the GCP IaC
+    created a BigLake table. Every catalog but BigLake is refused."""
+    contract = _sink_contract(
+        _loc_binding(platform="gcp", warehouse="gs://acme/wh"), sink=sink, kc=kc
+    )
+    errs = _errs(contract)
+    hit = [e for e in errs if "sets no binding.location.catalog" in e]
+    assert len(hit) == 1, errs
+    assert f"{reaching} catalog ({source})" in hit[0]
+    assert not any("disagrees" in e or "Declare the catalog" in e for e in errs), errs
+    assert iceberg_sink_preflight(contract, "ingest") is not None
+
+
+@pytest.mark.parametrize(
+    "kc",
+    [
+        {"sink_connector_config": {"iceberg.catalog.type": "bigquery"}},
+        {
+            "sink_connector_config": {
+                "iceberg.catalog.catalog-impl": (
+                    "org.apache.iceberg.gcp.bigquery.BigQueryMetastoreCatalog"
+                )
+            }
+        },
+    ],
+    ids=["type", "catalog-impl"],
+)
+def test_gcp_handwritten_biglake_is_not_a_split_by_type_or_impl(kc):
+    contract = _sink_contract(_loc_binding(platform="gcp", warehouse="gs://acme/wh"), kc=kc)
+    assert not any("sets no binding.location.catalog" in e for e in _errs(contract))
+
+
+# ── a hand-written selector must agree with a NAMED expose catalog ───────────
+
+
+def _disagreements(contract):
+    return [e for e in _errs(contract) if "Declare the catalog the sink writes to" in e]
+
+
+@pytest.mark.parametrize(
+    "binding, kc, engine, label, setting, expose",
+    [
+        # following the GCP split error's remedy, while the config still writes REST
+        (
+            _loc_binding("bigquery", platform="gcp", warehouse="gs://acme/wh"),
+            {"sink_connector_config": {"iceberg.catalog.type": "rest"}},
+            "kafka-connect",
+            "sink_connector_config",
+            "iceberg.catalog.type='rest'",
+            "'bigquery' (binding.location.catalog)",
+        ),
+        # the AWS Glue default, written over REST (a REST endpoint fronting Glue)
+        (
+            _GLUE_AWS,
+            {"sink_connector_config": {"iceberg.catalog.type": "rest"}},
+            "kafka-connect",
+            "sink_connector_config",
+            "iceberg.catalog.type='rest'",
+            "'glue' (the 'aws' platform default)",
+        ),
+        # an override over a derived REST config
+        (
+            _loc_binding("lakekeeper", **COMPLETE),
+            {"iceberg_catalog_overrides": {"iceberg.catalog.type": "nessie"}},
+            "kafka-connect",
+            "iceberg_catalog_overrides",
+            "iceberg.catalog.type='nessie'",
+            "'lakekeeper' (binding.location.catalog)",
+        ),
+        # the Snowflake-managed default, written through Glue
+        (
+            _loc_binding(platform="snowflake", **COMPLETE),
+            {"sink_connector_config": {"iceberg.catalog.catalog-impl": GLUE_CATALOG_IMPL}},
+            "kafka-connect",
+            "sink_connector_config",
+            f"iceberg.catalog.catalog-impl='{GLUE_CATALOG_IMPL}'",
+            "'snowflake-managed' (the 'snowflake' platform default)",
+        ),
+        (
+            _loc_binding("bigquery", platform="gcp", warehouse="gs://acme/wh"),
+            None,
+            "debezium",
+            "debezium.server.sink.config",
+            "type='rest'",
+            "'bigquery' (binding.location.catalog)",
+        ),
+    ],
+    ids=["gcp-remedy-followed", "aws-glue-default", "override", "snowflake-default", "debezium"],
+)
+def test_a_handwritten_catalog_that_differs_from_the_named_one_is_refused(
+    binding, kc, engine, label, setting, expose
+):
+    """JRN-707-2: the sink would write one catalog while dbt and the IaC read
+    another, and validate and the preflight both passed."""
+    debezium = _embedded({"config": {"type": "rest", "uri": "http://lk:8181/catalog"}})
+    contract = _sink_contract(
+        binding, kc=kc, engine=engine, debezium=debezium if engine == "debezium" else None
+    )
+    hit = _disagreements(contract)
+    assert len(hit) == 1, _errs(contract)
+    assert hit[0].startswith(f"iceberg sink (build 'ingest'): {label} sets {setting}")
+    assert f"the expose's catalog {expose}" in hit[0]
+    assert "is catalog: rest" in hit[0]
+    msg = iceberg_sink_preflight(contract, "ingest")
+    assert msg is not None and "Declare the catalog the sink writes to" in msg
+
+
+@pytest.mark.parametrize(
+    "binding, kc",
+    [
+        # every REST-family kind is type=rest on the wire
+        (
+            _loc_binding("lakekeeper", **COMPLETE),
+            {"sink_connector_config": {"iceberg.catalog.type": "rest"}},
+        ),
+        (
+            _loc_binding("rest", **COMPLETE),
+            {"sink_connector_config": {"iceberg.catalog.type": "REST"}},
+        ),
+        (
+            _loc_binding(platform="snowflake", **COMPLETE),
+            {"sink_connector_config": {"iceberg.catalog.type": "rest"}},
+        ),
+        # Glue by type or by its class
+        (_GLUE_AWS, {"sink_connector_config": {"iceberg.catalog.type": "glue"}}),
+        (_GLUE_AWS, {"sink_connector_config": {"iceberg.catalog.catalog-impl": GLUE_CATALOG_IMPL}}),
+        # a REST endpoint that fronts Glue, declared as what the sink writes to
+        (
+            _loc_binding("rest", platform="aws", **COMPLETE),
+            {"sink_connector_config": {"iceberg.catalog.type": "rest"}},
+        ),
+        # a hand-written config that selects no catalog cannot disagree
+        (_GLUE_AWS, {"sink_connector_config": {"topics": "t"}}),
+    ],
+)
+def test_a_handwritten_catalog_that_matches_the_named_one_passes(binding, kc):
+    assert _disagreements(_sink_contract(binding, kc=kc)) == []
+
+
+def test_sink_catalog_disagreement_is_reported_once():
+    # sink.catalog and the hand-written type both disagree: one cause, one error
+    contract = _sink_contract(
+        _loc_binding("bigquery", platform="gcp", warehouse="gs://acme/wh"),
+        sink={"catalog": "rest"},
+        kc={
+            "iceberg_sink_enabled": True,
+            "sink_connector_config": {"iceberg.catalog.type": "rest"},
+        },
+    )
+    errs = _errs(contract)
+    assert len([e for e in errs if "disagrees" in e]) == 1, errs
+    assert _disagreements(contract) == [], errs
+
+
+def test_both_selectors_draw_only_the_selector_error():
+    # The sink never starts, so no catalog reaches it to disagree with.
+    contract = _sink_contract(
+        _GLUE_AWS, kc={"iceberg_catalog_overrides": {"iceberg.catalog.type": "rest"}}
+    )
+    errs = _errs(contract)
+    assert any("would carry both" in e for e in errs), errs
+    assert _disagreements(contract) == [], errs
 
 
 def test_unnamed_catalog_off_gcp_is_not_refused():

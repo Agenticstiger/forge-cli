@@ -47,8 +47,16 @@ declared, so it is not flagged), intersected with the state. Where a cloud has
 a per-expose resource (the AWS Glue table), the expose's candidates count only
 when that resource is in state too, which proves the old release created them
 for THIS expose: a Glue database that a since-removed parquet expose created
-is a plain removal, left to the data-loss gate. The candidate list is the
-plugin's own emit, so no address derivation is duplicated here.
+is a plain removal, left to the data-loss gate. An expose whose old emit has
+no per-expose resource (an Iceberg expose that names a database and no table)
+cannot leave that proof, and the database was the only thing the old release
+created for it, so its database counts on its own. The candidate list is the
+plugin's own emit, so no address derivation is duplicated here, with one
+exception: the Snowflake volume is keyed from the contract id alone, so its
+address is derived from the id too (:func:`_snowflake_volume_before`). The
+before image re-runs today's emitter over today's location, and an upgrade
+that also changed that location (a warehouse that is now a catalog NAME, no
+``iam_role_arn``) can no longer derive the volume the old release created.
 
 What changed is a fact about a previous release, not about the plugin as it is
 now, so the in-tree clouds' :class:`CatalogMoveSpec` live in this module
@@ -84,9 +92,11 @@ from ..providers._iceberg_catalog import (
     binding_catalog_kind,
     catalog_kind_info,
     iceberg_external_volume_is_override,
+    iceberg_external_volume_name,
     is_glue_cataloged,
     is_iceberg_format,
 )
+from .naming import safe_ident
 from .provider_match import is_cloud
 
 __all__ = [
@@ -111,9 +121,14 @@ class CatalogMoveSpec:
     current emitter classifies it the old way. ``resource_types`` are the
     only resources the move removes from the configuration.
     ``evidence_types`` are the per-expose ones among them: when non-empty, an
-    expose's candidates are flagged only if one of these is in state too.
-    ``()`` means the cloud has no per-expose resource, so every candidate in
-    state counts. The prose fields fill the error message.
+    expose's candidates are flagged only if one of these is in state too, or
+    if the expose's old emit has none of them at all (nothing could prove it
+    then, and the rest was created for it alone). ``()`` means the cloud has
+    no per-expose resource, so every candidate in state counts.
+    ``addresses_before`` returns addresses the old release created for a moved
+    binding that do not depend on its location, for a resource the before
+    emit cannot re-derive once the location changed too; the default is none.
+    The prose fields fill the error message.
     """
 
     cloud: str
@@ -129,6 +144,10 @@ class CatalogMoveSpec:
     stays_in: str
     #: What the operator does by hand afterwards, or instead.
     afterwards: str
+    #: ``(contract, binding) -> addresses``; see the class docstring.
+    addresses_before: Callable[[Mapping[str, Any], Mapping[str, Any]], Iterable[str]] = (
+        lambda contract, binding: ()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +248,24 @@ def _back_into_snowflake(binding: MutableMapping[str, Any]) -> None:
     binding["location"]["catalog"] = "snowflake"
 
 
+def _snowflake_volume_before(
+    contract: Mapping[str, Any], binding: Mapping[str, Any]
+) -> Tuple[str, ...]:
+    """The EXTERNAL VOLUME address the old release created for ``contract``.
+
+    The old emitter keyed it ``<contract id>_vol_<volume name>``, and the name
+    derives from the contract id too (``iac/providers/snowflake.py``
+    ``_emit_iceberg_prereqs``; 0.19.0 used the same key), so the address
+    survives an upgrade that also changed the location: a ``warehouse`` that
+    is now a Lakekeeper warehouse NAME rather than an ``s3://`` URL, or no
+    ``iam_role_arn``. Re-running today's emitter derives no volume from that
+    location, yet the volume the old one created is still in state.
+    """
+    cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+    volume = iceberg_external_volume_name(contract, binding)
+    return (f"snowflake_external_volume.{safe_ident(f'{cid}_vol_{volume}')}",)
+
+
 SNOWFLAKE_VOLUME_MOVES = CatalogMoveSpec(
     cloud="snowflake",
     resource_types=("snowflake_external_volume",),
@@ -251,6 +288,7 @@ SNOWFLAKE_VOLUME_MOVES = CatalogMoveSpec(
         "If the table belongs in Snowflake's own catalog, remove location.catalog (or set "
         "it to 'snowflake') instead."
     ),
+    addresses_before=_snowflake_volume_before,
 )
 
 
@@ -375,13 +413,21 @@ def _detect(
     flagged: Set[str] = set()
     owners: List[Tuple[str, str]] = []
     for index in indexes:
-        before = plugin.emit(_as_before(contract, index, spec), actions)
-        released = (_addresses(before, spec.resource_types) - now) & in_state
-        if spec.evidence_types and not any(
-            address.split(".", 1)[0] in spec.evidence_types for address in released
-        ):
-            # None of this expose's own resources is in state, so the previous
-            # release did not create the rest for it either.
+        before = _addresses(
+            plugin.emit(_as_before(contract, index, spec), actions), spec.resource_types
+        )
+        before |= {
+            address
+            for address in spec.addresses_before(contract, exposes[index]["binding"])
+            if address.split(".", 1)[0] in spec.resource_types
+        }
+        released = (before - now) & in_state
+        own = {a for a in before - now if a.split(".", 1)[0] in spec.evidence_types}
+        if own and not own & released:
+            # The expose has resources of its own and none of them is in
+            # state, so the previous release did not create the rest for it
+            # either. An expose with none (a database and no table) proves
+            # nothing either way: what it releases was created for it.
             continue
         if released:
             flagged |= released

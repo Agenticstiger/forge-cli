@@ -161,6 +161,17 @@ def _apply(monkeypatch, tmp_path: Path, contract: Dict[str, Any], *, dry_run: bo
     return engine.apply_via_opentofu(args, _LOG)
 
 
+def _relocated(contract: Dict[str, Any], **changes: Any) -> Dict[str, Any]:
+    """``contract`` with its one expose's location changed (``None`` drops a key)."""
+    location = contract["exposes"][0]["binding"]["location"]
+    for key, value in changes.items():
+        if value is None:
+            location.pop(key, None)
+        else:
+            location[key] = value
+    return contract
+
+
 _BLOCKED = [
     pytest.param(
         _aws_contract("lakekeeper"),
@@ -168,11 +179,33 @@ _BLOCKED = [
         [_AWS_OLD_STATE[0], _AWS_OLD_STATE[1]],
         id="aws-glue-database-and-table",
     ),
+    # RT-707-1: a namespace-level expose (a database, no table); 0.19.0 created
+    # only the Glue database for it, so no Glue table can prove it.
+    pytest.param(
+        _relocated(_aws_contract("lakekeeper"), table=None),
+        [_AWS_OLD_STATE[0], _AWS_OLD_STATE[2]],
+        [_AWS_OLD_STATE[0]],
+        id="aws-table-less-glue-database",
+    ),
     pytest.param(
         _snowflake_contract("lakekeeper"),
         _SNOWFLAKE_OLD_STATE,
         [_SNOWFLAKE_OLD_STATE[1]],
         id="snowflake-external-volume",
+    ),
+    # JRN-707-1: the same upgrade also changed the location, so today's
+    # emitter can no longer derive the volume the old release created.
+    pytest.param(
+        _relocated(_snowflake_contract("lakekeeper"), warehouse="analytics"),
+        _SNOWFLAKE_OLD_STATE,
+        [_SNOWFLAKE_OLD_STATE[1]],
+        id="snowflake-volume-warehouse-now-a-name",
+    ),
+    pytest.param(
+        _relocated(_snowflake_contract("lakekeeper"), iam_role_arn=None),
+        _SNOWFLAKE_OLD_STATE,
+        [_SNOWFLAKE_OLD_STATE[1]],
+        id="snowflake-volume-without-iam-role",
     ),
 ]
 

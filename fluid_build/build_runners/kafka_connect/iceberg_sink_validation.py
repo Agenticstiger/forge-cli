@@ -37,10 +37,12 @@ Snowflake-managed table for the same expose. Per sink build:
 
 * the kind must be in the table: an unknown value gets each emitter's historic
   fallback, and those fallbacks disagree with one another;
-* on GCP the catalog must be named: absent, the sink writes a REST catalog
-  while dbt-bigquery and the GCP IaC create a BigLake table;
+* on GCP the catalog must be named: absent, the sink writes whatever catalog
+  reaches the worker (REST by default, Glue by ``catalog-impl``...) while
+  dbt-bigquery and the GCP IaC create a BigLake table;
 * ``sink.catalog`` must agree with the expose's catalog, because dbt and the
-  IaC read only the expose;
+  IaC read only the expose, and so must the catalog an override or a
+  hand-written config selects (its ``type`` or ``catalog-impl``);
 * every ``binding.location`` key in the row's ``sink_requires`` must be set
   (Glue keeps its advisory region warning: the warehouse falls back);
 * the runtime must ship the catalog's client (the stock Apache Iceberg Kafka
@@ -73,9 +75,11 @@ from dataclasses import dataclass
 from typing import AbstractSet, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ...providers._iceberg_catalog import (
+    DYNAMODB_CATALOG_IMPL,
     FAMILY_GLUE,
     FAMILY_REST,
     FAMILY_UNKNOWN,
+    GLUE_CATALOG_IMPL,
     CatalogKind,
     binding_catalog_kind,
     canonical_catalog_kind,
@@ -93,6 +97,22 @@ _Issues = Tuple[List[str], List[str]]
 #: The published Apache Iceberg Kafka Connect sink (Confluent Hub). Its
 #: ``CatalogUtil`` knows no ``bigquery`` type; Iceberg 1.10 adds it.
 PUBLISHED_KAFKA_CONNECT_SINK_VERSION = "1.9.2"
+
+#: The catalog each ``catalog-impl`` class is: Apache Iceberg's
+#: ``CatalogUtil.ICEBERG_CATALOG_*`` classes (what each ``type`` loads) plus the
+#: impl-only DynamoDB catalog. A ``catalog-impl`` that reaches the worker is
+#: therefore compared as the catalog it is, not skipped as "no type". A class
+#: not listed is a custom catalog: it matches no kind, BigLake included.
+_IMPL_CATALOGS: Mapping[str, str] = {
+    GLUE_CATALOG_IMPL: "glue",
+    DYNAMODB_CATALOG_IMPL: "dynamodb",
+    "org.apache.iceberg.rest.RESTCatalog": "rest",
+    "org.apache.iceberg.nessie.NessieCatalog": "nessie",
+    "org.apache.iceberg.hive.HiveCatalog": "hive",
+    "org.apache.iceberg.jdbc.JdbcCatalog": "jdbc",
+    "org.apache.iceberg.hadoop.HadoopCatalog": "hadoop",
+    "org.apache.iceberg.gcp.bigquery.BigQueryMetastoreCatalog": "bigquery",
+}
 
 
 def executing_build(contract: Mapping[str, Any], build_id: Any) -> Optional[Mapping[str, Any]]:
@@ -329,24 +349,36 @@ def _check_catalog(
         return
 
     # The sink must write through the catalog dbt and the IaC read. Both read
-    # only the expose, so a ``sink.catalog`` that differs streams into one
-    # catalog while the static table and the models live in another. Compared
-    # canonically: ``iceberg-rest`` and ``rest`` are the same catalog. HARD.
+    # only the expose, so a ``sink.catalog``, an override or a hand-written
+    # config that writes another catalog streams into one catalog while the
+    # static table and the models live in another. Compared as the catalog the
+    # worker builds: ``iceberg-rest``, ``lakekeeper`` and ``type=rest`` are all
+    # the REST catalog. ONE error per cause, the most specific first. HARD.
     expose_kind = binding_catalog_kind(binding)
-    reaching = _reaching_catalog_type(info, runtime)
-    if _gcp_catalog_unnamed(binding) and reaching not in (None, "bigquery"):
-        _gcp_split(bid, sink, sink_kind, reaching, runtime, errors)
-    elif sink_kind and sink_kind != expose_kind and not _gcp_catalog_unnamed(binding):
-        expose_source = (
-            "binding.location.catalog"
-            if canonical_catalog_kind(loc.get("catalog"))
-            else f"the {binding.get('platform')!r} platform default"
-        )
+    reaching, origin = _reaching_catalog(info, runtime)
+    if _gcp_catalog_unnamed(binding):
+        if reaching is not None and reaching != "bigquery":
+            _gcp_split(bid, sink, sink_kind, reaching, origin, runtime, errors)
+    elif sink_kind and sink_kind != expose_kind:
         errors.append(
             f"iceberg sink (build {bid!r}): sink.catalog {sink.get('catalog')!r} disagrees "
-            f"with the expose's catalog {expose_kind!r} ({expose_source}); the sink would "
-            f"write through {sink_kind} while dbt and the IaC read {expose_kind}. Set "
+            f"with the expose's catalog {expose_kind!r} ({_expose_source(binding)}); the sink "
+            f"would write through {sink_kind} while dbt and the IaC read {expose_kind}. Set "
             f"binding.location.catalog: {sink_kind} and drop sink.catalog"
+        )
+    elif (
+        origin is not None
+        and reaching is not None
+        and reaching != _wire_catalog(catalog_kind_info(expose_kind))
+        and not _carries_both_selectors(kind, info, runtime)
+    ):
+        label, key, value = origin
+        errors.append(
+            f"iceberg sink (build {bid!r}): {label} sets {key}={value!r}, so the sink would "
+            f"write through {_catalog_noun(reaching)} catalog while dbt and the IaC read the "
+            f"expose's catalog {expose_kind!r} ({_expose_source(binding)}). Declare the "
+            "catalog the sink writes to in binding.location.catalog; a REST endpoint that "
+            "fronts Glue (Glue's Iceberg REST endpoint) is catalog: rest"
         )
 
     # 4. catalog tagged-union completeness, from the row's ``sink_requires``.
@@ -414,11 +446,65 @@ def _reaching_catalog_type(info: Any, runtime: IcebergSinkPlan) -> Optional[str]
     return reaching
 
 
+def _wire_catalog(info: CatalogKind) -> str:
+    """The catalog the worker builds from ``info``'s derived selector.
+
+    ``rest`` for every REST-family kind (lakekeeper, polaris, unity,
+    snowflake-managed), the kind itself for a native ``type``, and the kind a
+    ``catalog-impl`` class is (glue, dynamodb).
+    """
+    if info.catalog_impl:
+        return _IMPL_CATALOGS.get(info.catalog_impl, info.catalog_impl)
+    return info.runtime_type or ""
+
+
+def _reaching_catalog(
+    info: CatalogKind, runtime: IcebergSinkPlan
+) -> Tuple[Optional[str], Optional[Tuple[str, str, str]]]:
+    """The catalog the worker builds, and the override that chose it.
+
+    Starts from the derived kind (``info`` is :func:`iceberg_catalog_kind`'s
+    row, so ``sink.catalog`` counts) when the runner derives, then reads every
+    override map in merge order, the last one winning: a ``type`` names its
+    catalog, and a ``catalog-impl`` is the catalog its class is (a class
+    :data:`_IMPL_CATALOGS` does not know stays its own name, which matches no
+    kind). ``origin`` is ``(map label, key, value)`` of the override that
+    decided, ``None`` when the derived config did; the catalog is ``None``
+    when nothing selects one.
+    """
+    reaching: Optional[str] = _wire_catalog(info) if runtime.derives else None
+    origin: Optional[Tuple[str, str, str]] = None
+    for label, mapping in runtime.overrides:
+        if runtime.impl_key in mapping:
+            impl = str(mapping[runtime.impl_key] or "").strip()
+            reaching = _IMPL_CATALOGS.get(impl, impl) or None
+            origin = (label, runtime.impl_key, impl)
+        if runtime.type_key in mapping:
+            wire = str(mapping[runtime.type_key] or "").strip().lower()
+            reaching = wire or None
+            origin = (label, runtime.type_key, wire)
+    return reaching, origin
+
+
+def _catalog_noun(catalog: str) -> str:
+    """``a REST`` / ``a glue`` / ``a com.acme.Custom``, for the messages."""
+    return f"a {'REST' if catalog == 'rest' else catalog}"
+
+
+def _expose_source(binding: Mapping[str, Any]) -> str:
+    """Where the expose's catalog comes from, for the disagreement messages."""
+    loc = binding.get("location") or {}
+    if canonical_catalog_kind(loc.get("catalog")):
+        return "binding.location.catalog"
+    return f"the {binding.get('platform')!r} platform default"
+
+
 def _gcp_split(
     bid: Any,
     sink: Mapping[str, Any],
     sink_kind: str,
     reaching: str,
+    origin: Optional[Tuple[str, str, str]],
     runtime: IcebergSinkPlan,
     errors: List[str],
 ) -> None:
@@ -429,10 +515,13 @@ def _gcp_split(
     catalog type reaches the worker (the ``rest`` platform default, a
     ``sink.catalog``, or a hand-written config). Unless that is BigLake too,
     one table is written to two catalogs. Naming the expose's catalog is the only
-    way they agree. HARD.
+    way they agree. A catalog reached by ``catalog-impl`` (``sink.catalog:
+    glue``, a hand-written ``GlueCatalog``) counts like any other. HARD.
     """
     if not runtime.derives:
         source = "the hand-written sink config"
+    elif origin is not None:
+        source = origin[0]
     elif sink_kind:
         source = f"sink.catalog {sink.get('catalog')!r}"
     else:
@@ -518,14 +607,7 @@ def _check_selector_overrides(
     override maps are merged last. Presence is what counts: CatalogUtil checks
     the key for null, so even an empty value trips it. HARD.
     """
-    setters: Dict[str, str] = {}
-    if runtime.derives:
-        derived = runtime.impl_key if info.catalog_impl else runtime.type_key
-        setters[derived] = f"the derived {kind} catalog config"
-    for label, mapping in runtime.overrides:
-        for key in (runtime.type_key, runtime.impl_key):
-            if key in mapping:
-                setters[key] = label
+    setters = _selector_setters(kind, info, runtime)
     if runtime.type_key in setters and runtime.impl_key in setters:
         errors.append(
             f"iceberg sink (build {bid!r}): the sink config would carry both "
@@ -534,3 +616,22 @@ def _check_selector_overrides(
             "with both type and catalog-impl set, so the sink never starts. Keep one, and "
             "change catalogs with binding.location.catalog rather than an override"
         )
+
+
+def _carries_both_selectors(kind: str, info: CatalogKind, runtime: IcebergSinkPlan) -> bool:
+    """Check 6's condition: the sink never starts, so no catalog reaches it."""
+    setters = _selector_setters(kind, info, runtime)
+    return runtime.type_key in setters and runtime.impl_key in setters
+
+
+def _selector_setters(kind: str, info: CatalogKind, runtime: IcebergSinkPlan) -> Dict[str, str]:
+    """``{selector key: who set it}`` in the merged config, the last setter winning."""
+    setters: Dict[str, str] = {}
+    if runtime.derives:
+        derived = runtime.impl_key if info.catalog_impl else runtime.type_key
+        setters[derived] = f"the derived {kind} catalog config"
+    for label, mapping in runtime.overrides:
+        for key in (runtime.type_key, runtime.impl_key):
+            if key in mapping:
+                setters[key] = label
+    return setters

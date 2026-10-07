@@ -23,10 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   had one). `fluid apply` stops with `iceberg_catalog_move_blocked` and the `tofu state
   rm` command for the volume instead of planning to drop it.
 - A GCP Iceberg expose that a streaming sink writes to must now name its catalog in
-  `binding.location.catalog`. Without one, the sink wrote through a REST catalog while
-  dbt-bigquery and the GCP IaC created a BigLake table, so one table lived in two
-  catalogs; `fluid validate` and the runners now refuse it. Set `catalog: bigquery`, or
-  the REST kind your catalog is.
+  `binding.location.catalog`. Without one, the sink wrote through whatever catalog
+  reached the worker (REST by default, Glue for `sink.catalog: glue` or a hand-written
+  `catalog-impl`) while dbt-bigquery and the GCP IaC created a BigLake table, so one
+  table lived in two catalogs; `fluid validate` and the runners now refuse it unless the
+  sink writes BigLake. Set `catalog: bigquery`, or the REST kind your catalog is. A
+  hand-written sink config must then select that same catalog.
 
 ### Changed
 
@@ -71,7 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses was still deployed. A hand-written config in a build that declares
   `sink.format: iceberg` is now checked the same way, before anything is created. In a
   contract with several builds, each runner also reads the build it is running instead
-  of the first one, which the checks already did.
+  of the first one, which the checks already did. A `sink_connector_config`,
+  `server.sink.config` or `iceberg_catalog_overrides` whose `type` or `catalog-impl`
+  selects a different catalog than the expose's is now an error on every platform: the
+  sink would write one catalog while dbt and the IaC read another. Declare the catalog
+  the sink writes to in `binding.location.catalog`; a REST endpoint that fronts Glue
+  (Glue's Iceberg REST endpoint) is `catalog: rest`.
 - **`catalog: bigquery` on a Kafka Connect sink warns.** It sets
   `iceberg.catalog.type=bigquery`, which the published Apache Iceberg sink (1.9.2) cannot
   load; Iceberg adds the type in 1.10. The Nessie and BigQuery runtime warnings follow the
@@ -84,8 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The Iceberg catalog-move guard no longer blocks a legitimate apply.** It flagged a
   Glue database that a since-removed parquet expose had created as a catalog move, and
   nothing could get past it. A database is now flagged only when the moved expose's own
-  Glue table is in state. When the guard cannot read state or its probe fails, it says so
-  at WARNING level instead of DEBUG.
+  Glue table is in state, or when the expose names no table: its database is then all
+  an earlier release created for it, and the guard used to let its destroy through. On
+  Snowflake the guard finds the EXTERNAL VOLUME by its contract-derived name, so it also
+  stops an upgrade that changed `location.warehouse` to a catalog name or dropped
+  `iam_role_arn` in the same edit. When the guard cannot read state or its probe fails,
+  it says so at WARNING level instead of DEBUG.
 
 - **A Kafka Connect Iceberg sink on AWS Glue starts.** The derived connector config set
   both `iceberg.catalog.type` and `iceberg.catalog.catalog-impl`, and Apache Iceberg's

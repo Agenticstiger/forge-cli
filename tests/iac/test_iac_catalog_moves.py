@@ -168,6 +168,45 @@ class TestDetect:
         assert excinfo.value.addresses == (DB, ORDERS)
         assert excinfo.value.exposes == (("orders", "lakekeeper"),)
 
+    @pytest.mark.parametrize("catalog", ["lakekeeper", "rest", "polaris", "nessie", "bigquery"])
+    def test_a_table_less_expose_s_database_is_flagged(self, catalog):
+        """RT-707-1: a namespace-level Iceberg expose names a database and no
+        table (a dynamic-routing sink's). The old release created the Glue
+        database for it and nothing else, so no Glue table can be in state to
+        prove it, and destroying the database is Glue ``DeleteDatabase``."""
+        expose = _expose("iceberg", catalog)
+        del expose["binding"]["location"]["table"]
+        contract = _contract(expose)
+        state = [BUCKET, DB]
+
+        assert detect_catalog_moves(AwsIacPlugin(), contract, state) == (DB,)
+        with pytest.raises(CatalogMoveError) as excinfo:
+            guard_catalog_moves(AwsIacPlugin(), contract, state)
+        assert excinfo.value.exposes == (("orders", catalog),)
+
+    def test_a_table_less_expose_s_database_a_parquet_expose_uses_is_not_flagged(self):
+        """The database stays declared, so the plan does not destroy it."""
+        expose = _expose("iceberg", "lakekeeper")
+        del expose["binding"]["location"]["table"]
+        contract = _contract(_expose("parquet", expose_id="facts", table="facts"), expose)
+
+        assert detect_catalog_moves(AwsIacPlugin(), contract, [BUCKET, DB, FACTS]) == ()
+
+    def test_a_table_less_expose_does_not_vouch_for_another_s_database(self):
+        """The evidence rule still holds for an expose that declares a table:
+        a table-less sibling on another database flags only its own."""
+        table_less = _expose("iceberg", "rest", expose_id="raw", table="raw")
+        table_less["binding"]["location"].update(database="raw")
+        del table_less["binding"]["location"]["table"]
+        contract = _contract(_expose("iceberg", "lakekeeper"), table_less)
+        raw_db = "aws_glue_catalog_database.analytics_lake_raw"
+
+        with pytest.raises(CatalogMoveError) as excinfo:
+            guard_catalog_moves(AwsIacPlugin(), contract, [BUCKET, DB, FACTS, raw_db])
+
+        assert excinfo.value.addresses == (raw_db,)
+        assert excinfo.value.exposes == (("raw", "rest"),)
+
     def test_a_module_prefixed_address_is_not_this_module_s(self):
         """``fluid`` writes a root module: a child module's resource is not one
         this emit change removes, so it is matched exactly, never by name."""
@@ -262,6 +301,42 @@ class TestSnowflakeVolume:
             _sf_expose("lakekeeper"), _sf_expose(None, expose_id="facts", table="FACTS")
         )
         assert detect_catalog_moves(SnowflakeIacPlugin(), contract, [SF_TABLE, VOLUME]) == ()
+
+    @pytest.mark.parametrize(
+        "changes",
+        [{"warehouse": "analytics"}, {"iam_role_arn": None}],
+        ids=["warehouse-now-a-catalog-name", "no-iam-role-arn"],
+    )
+    def test_a_volume_is_flagged_after_an_upgrade_that_changed_the_location(self, changes):
+        """JRN-707-1: the before image re-runs today's emitter over today's
+        location, which derives no volume once the warehouse is a Lakekeeper
+        warehouse NAME or the role is gone. The volume the old release created
+        is keyed from the contract id alone, so it is still found."""
+        expose = _sf_expose("lakekeeper")
+        location = expose["binding"]["location"]
+        for key, value in changes.items():
+            if value is None:
+                del location[key]
+            else:
+                location[key] = value
+        contract = _contract(expose)
+
+        assert detect_catalog_moves(SnowflakeIacPlugin(), contract, [SF_TABLE, VOLUME]) == (VOLUME,)
+        assert detect_catalog_moves(SnowflakeIacPlugin(), contract, [SF_TABLE]) == ()
+
+    @pytest.mark.parametrize(
+        "contract_id", ["analytics.lake", "gold.hr.employee_360_v1", "9-lives"]
+    )
+    def test_the_derived_volume_address_is_the_one_the_emitter_writes(self, contract_id):
+        """The one address this module derives instead of emitting: pinned to
+        the Snowflake emitter's own key, so the two cannot drift apart."""
+        contract = {**_contract(_sf_expose(None)), "id": contract_id}
+        binding = contract["exposes"][0]["binding"]
+        emitted = SnowflakeIacPlugin().emit(contract)["snowflake_external_volume"]
+
+        assert set(SNOWFLAKE_VOLUME_MOVES.addresses_before(contract, binding)) == {
+            f"snowflake_external_volume.{key}" for key in emitted
+        }
 
     def test_raises_with_the_snowflake_remedy(self):
         with pytest.raises(CatalogMoveError) as excinfo:
