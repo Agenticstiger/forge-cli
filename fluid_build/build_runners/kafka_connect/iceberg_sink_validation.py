@@ -88,6 +88,7 @@ from ...providers._iceberg_catalog import (
     iceberg_sink_exposes,
     known_catalog_kinds,
     resolve_iceberg_catalog,
+    resolve_iceberg_sink_exposes,
 )
 
 LOG = logging.getLogger("fluid.acquire.iceberg_sink")
@@ -151,6 +152,10 @@ class IcebergSinkPlan:
     overrides: Tuple[Tuple[str, Mapping[str, Any]], ...]
     #: ``(label, value)`` of the warehouse override the zero-drift check reads.
     warehouse_override: Tuple[str, Any]
+    #: The key that names the tables the sink writes (``iceberg.tables`` for
+    #: Kafka Connect, ``table-namespace`` for Debezium Server). An override map
+    #: that sets it names the tables itself instead of the derived config.
+    table_key: str = ""
 
 
 def iceberg_sink_plan(build: Mapping[str, Any]) -> Optional[IcebergSinkPlan]:
@@ -191,6 +196,7 @@ def iceberg_sink_plan(build: Mapping[str, Any]) -> Optional[IcebergSinkPlan]:
             impl_key="catalog-impl",
             overrides=((label, config),),
             warehouse_override=(label, config.get("warehouse")),
+            table_key="table-namespace",
         )
 
     if not declares_iceberg:
@@ -217,7 +223,41 @@ def iceberg_sink_plan(build: Mapping[str, Any]) -> Optional[IcebergSinkPlan]:
             "iceberg_catalog_overrides",
             catalog_overrides.get("iceberg.catalog.warehouse"),
         ),
+        table_key="iceberg.tables",
     )
+
+
+def derives_table_identity(plan: IcebergSinkPlan) -> bool:
+    """Does forge-cli derive the tables ``plan``'s sink config writes?
+
+    ``True`` when the runner derives the config and no override map sets
+    :attr:`IcebergSinkPlan.table_key`. Such a config writes the exposes the
+    build's outputs pick (:func:`iceberg_sink_target`).
+    """
+    return plan.derives and not any(plan.table_key in m for _label, m in plan.overrides)
+
+
+def iceberg_sink_target(
+    contract: Mapping[str, Any],
+    build: Mapping[str, Any],
+    plan: Optional[IcebergSinkPlan] = None,
+) -> Tuple[Tuple[Mapping[str, Any], ...], Optional[str]]:
+    """The Iceberg sink exposes ``build``'s sink writes, or why there are none.
+
+    THE build->expose join: ``fluid validate``, the runner preflight, both
+    streaming runners and the Kafka-Connect late-arrival target read it, so
+    they name the same tables. A config forge-cli derives
+    (:func:`derives_table_identity`) writes the exposes
+    :func:`resolve_iceberg_sink_exposes` joins from the build's outputs, by
+    the runtime's rule (one table for Kafka Connect, one namespace for
+    Debezium Server). Any other config names its own tables and is checked
+    against the first Iceberg sink expose. ``plan`` defaults to
+    :func:`iceberg_sink_plan` of ``build``.
+    """
+    plan = plan if plan is not None else iceberg_sink_plan(build)
+    if plan is not None and derives_table_identity(plan):
+        return resolve_iceberg_sink_exposes(contract, build, namespace=plan.engine == "debezium")
+    return iceberg_sink_exposes(contract)[:1], None
 
 
 def validate_iceberg_sink(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
@@ -267,12 +307,13 @@ def _validate(contract: Mapping[str, Any], *, builds: Optional[Iterable[Any]] = 
         runtime = iceberg_sink_plan(build)
         if runtime is None:
             continue  # not a build that writes an Iceberg sink
-        _check_build(build, runtime, iceberg_exposes, expose_ids, errors, warnings)
+        _check_build(contract, build, runtime, iceberg_exposes, expose_ids, errors, warnings)
 
     return errors, warnings
 
 
 def _check_build(
+    contract: Mapping[str, Any],
     build: Mapping[str, Any],
     runtime: IcebergSinkPlan,
     iceberg_exposes: Sequence[Mapping[str, Any]],
@@ -294,13 +335,19 @@ def _check_build(
             "the connector has no table identity to write to"
         )
         return
+    # The exposes the runner writes, by the resolver the runners call. A
+    # derived config writes the exposes the build's outputs pick, and outputs
+    # that pick none it can write are an error; a config that names its own
+    # tables is checked against the first Iceberg expose. HARD.
+    targets, join_error = iceberg_sink_target(contract, build, runtime)
+    if join_error:
+        errors.append(join_error)
     outputs = build.get("outputs") or []
-    if outputs and not (set(outputs) & expose_ids):
+    if not derives_table_identity(runtime) and outputs and not (set(outputs) & expose_ids):
         warnings.append(
             f"iceberg sink (build {bid!r}) outputs {list(outputs)} don't reference the "
             f"Iceberg expose(s) {sorted(x for x in expose_ids if x)}; the join is implicit"
         )
-    binding = iceberg_exposes[0].get("binding") or {}
 
     # 2. upsert is deferred to v2 (locked v1 decision) — gate, don't silently
     #    append-only. HARD.
@@ -318,7 +365,19 @@ def _check_build(
             "streamingSink.routeField"
         )
 
-    _check_catalog(bid, binding, sink, runtime, errors, warnings)
+    # The catalog checks read each expose the sink writes. A Debezium Server
+    # sink writes several only when they resolve to one catalog, so a message
+    # an earlier expose produced is not repeated.
+    for index, target in enumerate(targets):
+        binding = target.get("binding") or {}
+        if index == 0:
+            _check_catalog(bid, binding, sink, runtime, errors, warnings)
+            continue
+        more_errors: List[str] = []
+        more_warnings: List[str] = []
+        _check_catalog(bid, binding, sink, runtime, more_errors, more_warnings)
+        errors.extend(m for m in more_errors if m not in errors)
+        warnings.extend(m for m in more_warnings if m not in warnings)
 
 
 def _check_catalog(
