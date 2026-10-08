@@ -45,8 +45,9 @@ Snowflake-managed table for the same expose. Per sink build:
   hand-written config selects (its ``type`` or ``catalog-impl``);
 * every ``binding.location`` key in the row's ``sink_requires`` must be set,
   a warehouse counting when the deriver resolves one (DynamoDB and JDBC derive
-  it from an explicit bucket); Glue keeps its advisory region warning: the
-  warehouse falls back;
+  it from an explicit bucket; a bucket ``{{ env.* }}`` template that does not
+  resolve is a warning here and an error in the runner's preflight); Glue
+  keeps its advisory region warning: the warehouse falls back;
 * the runtime must ship the catalog's client (the stock Apache Iceberg Kafka
   Connect runtime has no Nessie client, and the published sink predates the
   ``bigquery`` catalog type);
@@ -72,6 +73,7 @@ messages) rather than splitting the same-object ones into the schema.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 from dataclasses import dataclass
 from typing import AbstractSet, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -244,12 +246,19 @@ def iceberg_sink_preflight(
     a different catalog than dbt reads. ``build_id`` is the run context's id;
     the build is :func:`executing_build`, the one the runner reads its
     properties from, not one matched by message text. Warnings are logged and
-    never fatal, the same split as ``fluid validate`` without ``--strict``.
+    never fatal, the same split as ``fluid validate`` without ``--strict``, with
+    one difference: a ``location.bucket`` template that ``fluid validate``
+    only warns about (it may resolve where the sink runs) is an error here,
+    because the runner derives the sink config in this process next.
     """
     build = executing_build(contract, build_id)
     if build is None:
         return None
-    errors, warnings = _validate(contract, builds=(build,))
+    token = _AT_RUN.set(True)
+    try:
+        errors, warnings = _validate(contract, builds=(build,))
+    finally:
+        _AT_RUN.reset(token)
     for msg in warnings:
         (log or LOG).warning("iceberg_sink.preflight.warning build=%s %s", build_id, msg)
     if not errors:
@@ -391,15 +400,24 @@ def _check_catalog(
     #    from an explicit bucket). A key the catalog needs only to start (the
     #    DynamoDB / JDBC warehouse, the BigQuery project) is also present when
     #    an override map sets its catalog property: the runner merges that map
-    #    into the config it pushes. Glue requires nothing (the warehouse falls
+    #    into the config it pushes. A bucket whose ``{{ env.* }}`` template
+    #    does not resolve here is explicit, so ``fluid validate`` only warns:
+    #    the runner's preflight, in the environment the sink config is
+    #    derived in, refuses it. Glue requires nothing (the warehouse falls
     #    back), so its region stays advisory.
+    from ...providers._iceberg_catalog import unset_bucket_env_vars
+
     derived_warehouse = resolve_iceberg_catalog(binding, sink=sink, account_ref="").warehouse
     for key in info.sink_requires:
         present = derived_warehouse if key == "warehouse" else loc.get(key)
         start_prop = _start_only_property(key, kind)
         if not present and start_prop is not None:
             present = _overrides_catalog_property(runtime, start_prop)
-        if not present:
+        unset = unset_bucket_env_vars(binding) if key == "warehouse" else ()
+        if not present and unset and kind in BUCKET_WAREHOUSE_KINDS:
+            issue = _unresolved_bucket_issue(bid, kind, binding, unset)
+            (errors if _AT_RUN.get() else warnings).append(issue)
+        elif not present:
             errors.append(
                 f"iceberg sink (build {bid!r}): {kind} catalog requires "
                 f"binding.location.{key}{_requires_hint(key, kind, info)}"
@@ -472,6 +490,38 @@ def _check_catalog(
 
     _check_warehouse_override(bid, binding, sink, kind, info, runtime, warnings)
     _check_selector_overrides(bid, kind, info, runtime, errors)
+
+
+#: True while :func:`iceberg_sink_preflight` runs. The runner derives the sink
+#: config in the same process right after it, so a ``location.bucket``
+#: template this environment cannot resolve leaves the sink with no warehouse.
+_AT_RUN: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "iceberg_sink_preflight", default=False
+)
+
+
+def _unresolved_bucket_issue(
+    bid: Any, kind: str, binding: Mapping[str, Any], names: Tuple[str, ...]
+) -> str:
+    """Check 4's message for a warehouse that waits on unset bucket variables."""
+    raw = (binding.get("location") or {}).get("bucket")
+    one = len(names) == 1
+    unset = f"{', '.join(names)} {'is' if one else 'are'} not set"
+    if _AT_RUN.get():
+        return (
+            f"iceberg sink (build {bid!r}): the {kind} catalog's warehouse derives from "
+            f"binding.location.bucket {raw!r}, and {unset} in the runner's environment, so "
+            f"the sink would get no warehouse and the {kind} catalog refuses to start "
+            f"without one. Set {'it' if one else 'them'} here, or set "
+            "binding.location.warehouse"
+        )
+    return (
+        f"iceberg sink (build {bid!r}): the {kind} catalog's warehouse derives from "
+        f"binding.location.bucket {raw!r}, and {unset} here, so it cannot be derived at "
+        f"validate time. Set {'it' if one else 'them'} where the sink runs: the runner "
+        "refuses the build when the bucket does not resolve there, because the "
+        f"{kind} catalog refuses to start without a warehouse"
+    )
 
 
 def _requires_hint(key: str, kind: str, info: CatalogKind) -> str:

@@ -32,7 +32,13 @@ from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ._sql_safety import validate_ident
-from .aws.util.warehouse import bucket_uses_fallback, get_iceberg_warehouse, normalize_location
+from .aws.util.warehouse import (
+    _ENV_TEMPLATE_RE,
+    bucket_uses_fallback,
+    get_iceberg_warehouse,
+    normalize_location,
+    resolve_env_templates,
+)
 
 # Apache Iceberg runtime class names (pinned to the connector surface validated
 # in the OSS spike — RFC §14). Bumping the Iceberg runtime may change these.
@@ -493,6 +499,29 @@ def _bucket_warehouse(binding: Mapping[str, Any]) -> str:
         return ""
     bucket, path = normalize_location(loc, account_ref="")
     return f"{scheme}://{bucket}/{path}"
+
+
+def unset_bucket_env_vars(binding: Mapping[str, Any]) -> Tuple[str, ...]:
+    """The unset variables an explicit bucket's derived warehouse waits on, or ``()``.
+
+    Non-empty when ``location.bucket`` is set on a platform
+    :func:`_bucket_warehouse` derives on (aws, gcp) but its ``{{ env.* }}``
+    templates do not resolve in this process's environment: the bucket is
+    explicit, so the warehouse derives wherever those variables are set, but
+    not here. ``()`` for a resolved or absent bucket, another platform, or a
+    template that is not ``{{ env.* }}`` (nothing resolves that one).
+    """
+    from ..iac.provider_match import canonical_cloud
+
+    loc = binding.get("location") or {}
+    raw = loc.get("bucket")
+    if not raw or canonical_cloud(binding.get("platform")) not in _BUCKET_WAREHOUSE_SCHEMES:
+        return ()
+    resolved = str(resolve_env_templates(raw))
+    names = tuple(dict.fromkeys(_ENV_TEMPLATE_RE.findall(resolved)))
+    if not names or "{{" in _ENV_TEMPLATE_RE.sub("", resolved):
+        return ()
+    return names
 
 
 # ---------------------------------------------------------------------------
