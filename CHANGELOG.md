@@ -45,9 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `location.warehouse` as written; a warehouse with another scheme, or none and no bucket,
   gives none, and `fluid validate` warns.
 - A `platform: confluent` Iceberg expose with no `location.catalog` now reads as Glue, the
-  catalog Tableflow publishes it to. `fluid policy compile` now emits its S3 bucket and
-  Glue table grants, and dbt-snowflake `catalogs.yml` writes
-  `catalog_linked_database_type: glue` for it.
+  catalog Tableflow publishes it to, and dbt-snowflake `catalogs.yml` writes
+  `catalog_linked_database_type: glue` for it. `fluid policy compile` grants a Confluent
+  Tableflow expose its S3 bucket and the Glue table Tableflow publishes: the topic's table
+  (`topic`, else `location.table`, else the expose id, as the Tableflow IaC names it) in
+  `location.database`, or, with none, in the Kafka cluster id database Tableflow defaults
+  to. With neither database nor `kafka_cluster_id` it warns and grants no Glue table.
 - A Kafka Connect build whose Iceberg sink config forge-cli derives now writes exactly one
   Iceberg expose, picked by its `outputs`. `fluid validate` and the run preflight refuse it
   when the outputs name no Iceberg sink expose or name two or more, and when it declares
@@ -94,9 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preflight, both runners and the Kafka Connect late-arrival target read. The Debezium
   Server sink writes every captured table under one `table-namespace` through one catalog,
   so the exposes must share one `binding.location.database` and one catalog. A Glue
-  warehouse, and a DynamoDB or JDBC warehouse derived from `location.bucket`, is a
-  per-table prefix: Glue's is not compared, the derived one only by its bucket, and the
-  sink takes the first expose's. A hand-written config, and an override that sets
+  warehouse is a per-table prefix: it is not compared, and the sink takes the first
+  expose's. A DynamoDB or JDBC catalog creates every missing table under the one warehouse
+  the sink is given, so warehouses derived from `location.bucket` that differ (each is that
+  expose's own table prefix) are refused; set one `location.warehouse` on those exposes, or
+  split the build. A hand-written config, and an override that sets
   `iceberg.tables` (Kafka Connect) or `table-namespace` (Debezium Server), is still checked
   against the first Iceberg sink expose.
 - The Kafka Connect deriver now forwards the catalog's own properties (for BigQuery,
