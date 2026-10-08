@@ -335,15 +335,154 @@ def iceberg_sink_exposes(contract: Mapping[str, Any]) -> Tuple[Mapping[str, Any]
 
 
 def find_iceberg_expose_binding(contract: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """The expose ``binding`` carrying the Iceberg-table identity for a sink.
+    """The binding of the first of :func:`iceberg_sink_exposes`, or ``None``.
 
-    Shared by the Kafka-Connect and Debezium-Server runners so both resolve the
-    SAME table identity (the RFC zero-drift spine): the first of
-    :func:`iceberg_sink_exposes`. The validated build->expose join
-    (build.outputs / exposeId) lands with the plan-time validator (RFC §6.8 #5).
+    A sink config that names its own tables (hand-written, or an override that
+    sets ``iceberg.tables`` / ``table-namespace``) is checked against this
+    expose's catalog. A sink config forge-cli derives reads the exposes
+    :func:`resolve_iceberg_sink_exposes` joins from the build's outputs; the
+    streaming runners select between the two through
+    ``iceberg_sink_validation.iceberg_sink_target``.
     """
     exposes = iceberg_sink_exposes(contract)
     return dict(exposes[0].get("binding") or {}) if exposes else None
+
+
+def _expose_id(expose: Mapping[str, Any]) -> Any:
+    return expose.get("exposeId") or expose.get("id")
+
+
+def _expose_database(expose: Mapping[str, Any]) -> Any:
+    """The database leg of an expose's table, read as :func:`resolve_iceberg_catalog` reads it."""
+    binding = expose.get("binding") or {}
+    return (binding.get("location") or {}).get("database") or binding.get("database")
+
+
+def _described(exposes: Tuple[Mapping[str, Any], ...]) -> list[str]:
+    """``["orders (sales.orders)", ...]``: each expose's id and table, for the messages."""
+    return [
+        f"{_expose_id(e)} ({resolve_iceberg_catalog(e.get('binding') or {}).fq_table})"
+        for e in exposes
+    ]
+
+
+def resolve_iceberg_sink_exposes(
+    contract: Mapping[str, Any],
+    build: Mapping[str, Any],
+    *,
+    namespace: bool = False,
+) -> Tuple[Tuple[Mapping[str, Any], ...], Optional[str]]:
+    """The exposes a sink config forge-cli DERIVES for ``build`` writes, or why it cannot.
+
+    The candidates are :func:`iceberg_sink_exposes`; the build's ``outputs``
+    pick among them, and with no outputs the candidates are the contract's.
+
+    * ``namespace=False`` (Kafka Connect): the derived config carries one
+      ``iceberg.tables`` entry, and the Apache Iceberg sink writes each record
+      to every table that lists (``SinkWriter.routeRecordStatically``), so it
+      writes one expose. Exactly one candidate in outputs, or no outputs and
+      exactly one in the contract; anything else is an error.
+    * ``namespace=True`` (embedded Debezium Server): the derived config carries
+      one ``table-namespace`` and one catalog, and the server writes each
+      captured table under that namespace (``DefaultIcebergTableMapper``).
+      The candidates selected must share one database and resolve to one
+      catalog; outputs that name none of them are an error.
+
+    Returns ``(exposes, None)`` with at least one expose, ``((), error)``, or
+    ``((), None)`` when the contract has no Iceberg sink expose at all (the
+    validator reports that).
+    """
+    candidates = iceberg_sink_exposes(contract)
+    if not candidates:
+        return (), None
+    head = f"iceberg sink (build {build.get('id', '?')!r})"
+    raw_outputs = build.get("outputs") or []
+    outputs = [raw_outputs] if isinstance(raw_outputs, str) else list(raw_outputs)
+    selected = tuple(e for e in candidates if _expose_id(e) in outputs) if outputs else candidates
+    if outputs:
+        picked = f"its outputs {outputs} name {len(selected) or 'none'} of the"
+    else:
+        picked = f"it declares no outputs, and the contract has {len(candidates)}"
+    picked += f" Iceberg sink exposes {_described(candidates)}"
+    if outputs:
+        writes = f"the exposes its outputs {outputs} name, {_described(selected)},"
+    else:
+        writes = f"the contract's Iceberg sink exposes, {_described(selected)},"
+
+    if not namespace:
+        if len(selected) == 1:
+            return selected, None
+        return (), (
+            f"{head}: {picked}; a derived Kafka Connect sink writes one expose (one "
+            "iceberg.tables entry). List exactly one of them in the build's outputs, split "
+            "the build into one build per expose, or hand-write the sink config "
+            "(properties.kafka-connect.sink_connector_config)"
+        )
+
+    remedy = "hand-write the sink config (properties.debezium.server.sink.config)"
+    if not selected:
+        return (), (
+            f"{head}: {picked}; a derived Debezium Server sink writes the exposes the "
+            f"build's outputs name. List them in the build's outputs, or {remedy}"
+        )
+    databases = sorted({str(_expose_database(e)) for e in selected})
+    if len(databases) > 1:
+        return (), (
+            f"{head}: a derived Debezium Server sink writes every captured table under one "
+            f"table-namespace, but {writes} sit in the databases {databases}. Give them one "
+            f"binding.location.database, split the build into one build per database, or {remedy}"
+        )
+    differs = _catalog_differences(selected)
+    if differs:
+        return (), (
+            f"{head}: a derived Debezium Server sink writes through one catalog, but {writes} "
+            f"resolve to different catalogs (their {', '.join(differs)} differ). Give them one "
+            f"catalog, split the build into one build per catalog, or {remedy}"
+        )
+    return selected, None
+
+
+#: The binding setting each :class:`ResolvedIcebergCatalog` catalog field is
+#: resolved from, for the messages.
+_CATALOG_FIELD_SOURCES: Mapping[str, str] = MappingProxyType(
+    {
+        "kind": "catalog",
+        "catalog_type": "catalog",
+        "catalog_impl": "catalog",
+        "uri": "uri",
+        "warehouse": "warehouse",
+        "io_impl": "warehouse",
+        "region": "region",
+        "extra_catalog_props": "catalog properties",
+    }
+)
+
+
+def _catalog_differences(exposes: Tuple[Mapping[str, Any], ...]) -> list[str]:
+    """The catalog settings on which ``exposes`` resolve differently, or ``[]``.
+
+    Compares every :class:`ResolvedIcebergCatalog` field except the table
+    identity and the per-table write defaults. A Glue warehouse is per table
+    too (``get_iceberg_warehouse`` derives ``s3://{bucket}/{database}/{table}/``),
+    while a REST catalog's warehouse is the catalog's name.
+    """
+    from dataclasses import fields as dataclass_fields
+
+    resolved = [resolve_iceberg_catalog(e.get("binding") or {}) for e in exposes]
+    if len(resolved) < 2:
+        return []
+    per_table = {"fq_table", "id_columns", "partition_by"}
+    if all(r.catalog_impl == GLUE_CATALOG_IMPL for r in resolved):
+        per_table.add("warehouse")
+    differs: list[str] = []
+    for f in dataclass_fields(ResolvedIcebergCatalog):
+        if f.name in per_table:
+            continue
+        if any(getattr(r, f.name) != getattr(resolved[0], f.name) for r in resolved[1:]):
+            source = _CATALOG_FIELD_SOURCES.get(f.name, f.name)
+            if source not in differs:
+                differs.append(source)
+    return differs
 
 
 #: Object-store URI schemes, and the Iceberg ``FileIO`` each one needs. THE one
