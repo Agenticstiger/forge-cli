@@ -695,7 +695,8 @@ def test_gcp_sink_catalog_bigquery_agrees_with_biglake_and_warns_the_runtime():
     # "disagrees with 'rest'" error (dbt and the IaC never read 'rest' here).
     # The published sink still cannot load type=bigquery, which is a warning.
     contract = _sink_contract(
-        _loc_binding(platform="gcp", warehouse="gs://acme/wh"), sink={"catalog": "bigquery"}
+        _loc_binding(platform="gcp", warehouse="gs://acme/wh", project="acme-proj"),
+        sink={"catalog": "bigquery"},
     )
     errors, warnings = validate_iceberg_sink(contract)
     assert errors == []
@@ -735,7 +736,7 @@ def test_bigquery_warning_follows_the_type_that_reaches_the_worker():
 @pytest.mark.parametrize(
     "catalog, location",
     [
-        ("bigquery", {"warehouse": "gs://acme/wh"}),
+        ("bigquery", {"warehouse": "gs://acme/wh", "project": "acme-proj"}),
         ("rest", _GCP_REST_LOC),
         ("lakekeeper", COMPLETE),
     ],
@@ -958,7 +959,9 @@ def test_unnamed_catalog_off_gcp_is_not_refused():
 
 
 def test_bigquery_on_kafka_connect_warns_about_the_published_sink():
-    contract = _sink_contract(_loc_binding("bigquery", platform="gcp", warehouse="gs://acme/wh"))
+    contract = _sink_contract(
+        _loc_binding("bigquery", platform="gcp", warehouse="gs://acme/wh", project="acme-proj")
+    )
     errors, warnings = validate_iceberg_sink(contract)
     assert errors == []
     hit = [w for w in warnings if "iceberg.catalog.type=bigquery" in w]

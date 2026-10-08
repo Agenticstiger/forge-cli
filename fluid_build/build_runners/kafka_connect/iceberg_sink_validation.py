@@ -43,8 +43,13 @@ Snowflake-managed table for the same expose. Per sink build:
 * ``sink.catalog`` must agree with the expose's catalog, because dbt and the
   IaC read only the expose, and so must the catalog an override or a
   hand-written config selects (its ``type`` or ``catalog-impl``);
-* every ``binding.location`` key in the row's ``sink_requires`` must be set
-  (Glue keeps its advisory region warning: the warehouse falls back);
+* every ``binding.location`` key in the row's ``sink_requires`` must be set,
+  a warehouse counting when the deriver resolves one (DynamoDB and JDBC derive
+  it from an explicit bucket); Glue keeps its advisory region warning: the
+  warehouse falls back;
+* a bucket ``{{ env.* }}`` template the DynamoDB, JDBC or BigQuery warehouse
+  derives from, naming a variable that is unset or empty, is a warning here
+  and an error in the runner's preflight;
 * the runtime must ship the catalog's client (the stock Apache Iceberg Kafka
   Connect runtime has no Nessie client, and the published sink predates the
   ``bigquery`` catalog type);
@@ -70,11 +75,26 @@ messages) rather than splitting the same-object ones into the schema.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 from dataclasses import dataclass
-from typing import AbstractSet, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    AbstractSet,
+    Any,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from ...providers._iceberg_catalog import (
+    BIGQUERY_PROJECT_ID,
+    BUCKET_WAREHOUSE_KINDS,
     DYNAMODB_CATALOG_IMPL,
     FAMILY_GLUE,
     FAMILY_REST,
@@ -240,17 +260,29 @@ def iceberg_sink_preflight(
     a different catalog than dbt reads. ``build_id`` is the run context's id;
     the build is :func:`executing_build`, the one the runner reads its
     properties from, not one matched by message text. Warnings are logged and
-    never fatal, the same split as ``fluid validate`` without ``--strict``.
+    never fatal, the same split as ``fluid validate`` without ``--strict``, with
+    one difference: a ``location.bucket`` template that ``fluid validate``
+    only warns about (it may resolve where the sink runs) is an error here,
+    because the runner derives the sink config in this process next. The
+    template is read from the contract as written when the runner runs inside
+    :func:`contract_as_written`, as the acquisition dispatcher runs it.
     """
     build = executing_build(contract, build_id)
     if build is None:
         return None
-    errors, warnings = _validate(contract, builds=(build,))
+    run_only: List[str] = []
+    token = _AT_RUN.set(run_only)
+    try:
+        errors, warnings = _validate(contract, builds=(build,))
+    finally:
+        _AT_RUN.reset(token)
     for msg in warnings:
         (log or LOG).warning("iceberg_sink.preflight.warning build=%s %s", build_id, msg)
     if not errors:
         return None
-    return "iceberg sink preflight failed (see `fluid validate`): " + "; ".join(errors)
+    # ``fluid validate`` reports every error but the run-only ones.
+    see = " (see `fluid validate`)" if any(e not in run_only for e in errors) else ""
+    return f"iceberg sink preflight failed{see}: " + "; ".join(errors)
 
 
 def _validate(contract: Mapping[str, Any], *, builds: Optional[Iterable[Any]] = None) -> _Issues:
@@ -318,7 +350,15 @@ def _check_build(
             "streamingSink.routeField"
         )
 
-    _check_catalog(bid, binding, sink, runtime, errors, warnings)
+    _check_catalog(
+        bid,
+        binding,
+        sink,
+        runtime,
+        errors,
+        warnings,
+        auto_creates=_auto_creates(streaming, runtime),
+    )
 
 
 def _check_catalog(
@@ -328,6 +368,8 @@ def _check_catalog(
     runtime: IcebergSinkPlan,
     errors: List[str],
     warnings: List[str],
+    *,
+    auto_creates: bool = False,
 ) -> None:
     """The catalog checks (4-6), every one read off the kind's table row."""
     loc = binding.get("location") or {}
@@ -382,16 +424,52 @@ def _check_catalog(
         )
 
     # 4. catalog tagged-union completeness, from the row's ``sink_requires``.
-    #    HARD: forge can't derive a REST uri or a catalog name. Glue requires
-    #    nothing (the warehouse falls back), so its region stays advisory.
+    #    HARD: forge can't derive a REST uri or a catalog name. A warehouse is
+    #    present when the deriver resolves one (DynamoDB and JDBC derive it
+    #    from an explicit bucket). A key the catalog needs only to start (the
+    #    DynamoDB / JDBC warehouse, the BigQuery project) is also present when
+    #    an override map sets its catalog property: the runner merges that map
+    #    into the config it pushes. A bucket whose ``{{ env.* }}`` template
+    #    does not resolve here is explicit, so ``fluid validate`` only warns:
+    #    the runner's preflight, in the environment the sink config is
+    #    derived in, refuses it when the sink would use that warehouse: a
+    #    DynamoDB / JDBC catalog needs one to start, Debezium Server needs one
+    #    to boot, and a Kafka Connect BigQuery sink reads it only to
+    #    auto-create tables (see the BigQuery warning below). Otherwise the run
+    #    warns too. Glue requires nothing (the warehouse falls back), so its
+    #    region stays advisory.
+    from ...providers._iceberg_catalog import unset_bucket_env_vars
+
+    derived_warehouse = resolve_iceberg_catalog(binding, sink=sink, account_ref="").warehouse
+    # Only a deriving build reads the bucket; one that does not pushes the
+    # operator's map as written.
+    as_written = _binding_as_written(binding)
+    waits_on: Tuple[str, ...] = ()
+    if runtime.derives and not _overrides_warehouse(runtime):
+        waits_on = unset_bucket_env_vars(as_written, kind)
+    if waits_on:
+        required = "warehouse" in info.sink_requires
+        refused = required or runtime.engine == "debezium" or auto_creates
+        issue = _unresolved_bucket_issue(
+            bid, kind, as_written, waits_on, required=required, refused=refused
+        )
+        run_only = _AT_RUN.get()
+        if run_only is None or not refused:
+            warnings.append(issue)
+        else:
+            errors.append(issue)
+            run_only.append(issue)
     for key in info.sink_requires:
-        if not loc.get(key):
-            suffix = (
-                " (the catalog name)" if key == "warehouse" and info.family == FAMILY_REST else ""
-            )
+        if key == "warehouse" and waits_on:
+            continue  # reported above, naming the variables
+        present = derived_warehouse if key == "warehouse" else str(loc.get(key) or "").strip()
+        start_prop = _start_only_property(key, kind)
+        if not present and start_prop is not None:
+            present = _overrides_catalog_property(runtime, start_prop)
+        if not present:
             errors.append(
                 f"iceberg sink (build {bid!r}): {kind} catalog requires "
-                f"binding.location.{key}{suffix}"
+                f"binding.location.{key}{_requires_hint(key, kind, info)}"
             )
     if info.family == FAMILY_GLUE and not loc.get("region"):
         warnings.append(
@@ -411,20 +489,247 @@ def _check_catalog(
             "the sink cannot load NessieCatalog"
         )
     # ``type=bigquery`` (BigQueryMetastoreCatalog) is in Iceberg's CatalogUtil
-    # only from 1.10; the sink published on Confluent Hub is older, so a stock
-    # worker fails to load the catalog at connector start. Advisory: a runtime
-    # built from Iceberg >= 1.10 has it.
+    # only from 1.10 (apache-iceberg-1.10.0 CatalogUtil.java:78, :321-322; absent
+    # at apache-iceberg-1.9.2); the sink published on Confluent Hub is older,
+    # so a stock worker fails to load the catalog at connector start.
+    # Advisory: a runtime built from Iceberg >= 1.10 has it.
     if reaching == "bigquery" and runtime.engine == "kafka-connect":
         warnings.append(
             f"iceberg sink (build {bid!r}): the sink config sets "
             "iceberg.catalog.type=bigquery, which the published Apache Iceberg Kafka Connect "
             f"sink ({PUBLISHED_KAFKA_CONNECT_SINK_VERSION} on Confluent Hub) cannot load: "
-            "Iceberg's CatalogUtil gains the bigquery type in 1.10. Run a sink built from "
-            "Iceberg >= 1.10, or the connector fails at start"
+            "Iceberg's CatalogUtil gains the bigquery type in 1.10, so on that sink the "
+            "connector fails at start. Run a sink built from Iceberg >= 1.10"
+        )
+    # BigQueryMetastoreCatalog reads the warehouse to place a dataset it
+    # creates, and a table it creates in a dataset with no default storage
+    # location URI; without one, both throw IllegalArgumentException
+    # (apache-iceberg-1.10.0 BigQueryMetastoreCatalog.java:146-161, :197-208,
+    # :298-303). The Kafka Connect sink's auto-create calls createNamespace
+    # before every createTable and catches only AlreadyExists / Forbidden
+    # (IcebergWriterFactory.java:89, :122-137), so every table auto-create
+    # throws, even in a dataset that exists. Debezium Server needs one to boot:
+    # IcebergConfig declares ``debezium.sink.iceberg.warehouse`` as a String
+    # with no default (memiiso/debezium-server-iceberg 1.2.0.Final
+    # IcebergConfig.java:44-45), in the config mapping GlobalConfig nests
+    # (GlobalConfig.java:14-15) and IcebergChangeConsumer injects
+    # (IcebergChangeConsumer.java:79), and SmallRye Config refuses to start
+    # with a required mapping property missing. Advisory; a bucket that waits
+    # on a variable is reported above.
+    if (
+        reaching == "bigquery"
+        and kind == "bigquery"
+        and runtime.derives
+        and not derived_warehouse
+        and not waits_on
+        and not _overrides_warehouse(runtime)
+    ):
+        warnings.append(
+            f"iceberg sink (build {bid!r}): no gs:// warehouse can be derived from "
+            "binding.location (a gs:// warehouse, or a bucket), so the derived bigquery "
+            "catalog config sets none. "
+            + (
+                "Debezium Server declares debezium.sink.iceberg.warehouse with no default "
+                "(debezium-server-iceberg 1.2.0.Final IcebergConfig), so the server refuses "
+                "to boot without it, whether or not the tables exist. Set "
+                "binding.location.warehouse or binding.location.bucket, or warehouse in "
+                "debezium.server.sink.config"
+                if runtime.engine == "debezium"
+                else "With iceberg.tables.auto-create-enabled the sink calls createNamespace "
+                "for every table it creates, and BigQueryMetastoreCatalog.createNamespace "
+                "refuses without a warehouse, so table auto-creation fails even in a dataset "
+                "that exists; without auto-create, tables that exist need none"
+            )
         )
 
     _check_warehouse_override(bid, binding, sink, kind, info, runtime, warnings)
     _check_selector_overrides(bid, kind, info, runtime, errors)
+
+
+#: The run-only errors of the :func:`iceberg_sink_preflight` that is running,
+#: ``None`` under ``fluid validate``. The runner derives the sink config in
+#: the same process right after the preflight, so a ``location.bucket``
+#: template this environment cannot resolve leaves the sink with no
+#: warehouse, or one in a bucket the contract does not name.
+_AT_RUN: contextvars.ContextVar[Optional[List[str]]] = contextvars.ContextVar(
+    "iceberg_sink_preflight", default=None
+)
+
+#: The contract as written, before the acquisition dispatcher resolved its
+#: ``{{ env.* }}`` templates (see :func:`contract_as_written`).
+_AS_WRITTEN: contextvars.ContextVar[Optional[Mapping[str, Any]]] = contextvars.ContextVar(
+    "iceberg_sink_contract_as_written", default=None
+)
+
+
+@contextlib.contextmanager
+def contract_as_written(contract: Mapping[str, Any]) -> Iterator[None]:
+    """Let :func:`iceberg_sink_preflight` read ``contract`` as written.
+
+    ``base._execute_acquisition_build`` resolves every ``{{ env.X }}`` before
+    the runner sees the contract, and a missing or empty ``X`` becomes ``""``:
+    ``acme-{{ env.LAKE_ENV }}-lake`` reaches the runner as ``acme--lake``.
+    Inside this block the preflight reads the bucket template from
+    ``contract``, so it names the variable and refuses the build instead of
+    passing a warehouse in a bucket the contract does not name.
+    """
+    token = _AS_WRITTEN.set(contract)
+    try:
+        yield
+    finally:
+        _AS_WRITTEN.reset(token)
+
+
+def _binding_as_written(binding: Mapping[str, Any]) -> Mapping[str, Any]:
+    """``binding`` as the contract wrote it, while a runner runs; else ``binding``.
+
+    The expose binding in the contract :func:`contract_as_written` holds whose
+    resolution by the dispatcher's own resolver is ``binding``. Compared with
+    strings stripped: a plan-embedded contract is first resolved by
+    ``_contract_loader.resolve_contract_env_templates``, which strips every
+    string it renders.
+    """
+    contract = _AS_WRITTEN.get()
+    if contract is None or _AT_RUN.get() is None:
+        return binding
+    return _match_as_written(contract, binding)
+
+
+def unresolved_bucket_vars_at_run(
+    binding: Mapping[str, Any], kind: str, runtime: IcebergSinkPlan
+) -> Tuple[str, ...]:
+    """The unset or empty variables the derived warehouse waits on, as check 4 reads them.
+
+    For a runner deriving inside :func:`contract_as_written`, where ``binding``
+    is already resolved: the variables in its bucket as the contract wrote it.
+    ``()`` outside that scope, for a build that does not derive, and when an
+    override map sets the warehouse (the override is what reaches the sink).
+    """
+    contract = _AS_WRITTEN.get()
+    if contract is None or not runtime.derives or _overrides_warehouse(runtime):
+        return ()
+    from ...providers._iceberg_catalog import unset_bucket_env_vars
+
+    return unset_bucket_env_vars(_match_as_written(contract, binding), kind)
+
+
+def _match_as_written(contract: Mapping[str, Any], binding: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The expose binding in ``contract`` that resolves to ``binding``, else ``binding``."""
+    from ..base import _resolve_env_placeholders
+
+    target = _stripped(binding)
+    for expose in contract.get("exposes") or []:
+        raw = expose.get("binding") if isinstance(expose, Mapping) else None
+        if isinstance(raw, Mapping) and _stripped(_resolve_env_placeholders(dict(raw))) == target:
+            return raw
+    return binding
+
+
+def _stripped(node: Any) -> Any:
+    """``node`` with every string leaf stripped of surrounding whitespace."""
+    if isinstance(node, str):
+        return node.strip()
+    if isinstance(node, Mapping):
+        return {k: _stripped(v) for k, v in node.items()}
+    if isinstance(node, (list, tuple)):
+        return [_stripped(v) for v in node]
+    return node
+
+
+def _unresolved_bucket_issue(
+    bid: Any,
+    kind: str,
+    binding: Mapping[str, Any],
+    names: Tuple[str, ...],
+    *,
+    required: bool,
+    refused: bool,
+) -> str:
+    """Check 4's message for a warehouse that waits on unset or empty bucket variables."""
+    raw = (binding.get("location") or {}).get("bucket")
+    one = len(names) == 1
+    unset = f"{', '.join(names)} {'is' if one else 'are'} unset or empty"
+    refuses = f"the {kind} catalog refuses to start without a warehouse"
+    if _AT_RUN.get() is not None:
+        return (
+            f"iceberg sink (build {bid!r}): the {kind} catalog's warehouse derives from "
+            f"binding.location.bucket {raw!r}, and {unset} in the runner's environment, so "
+            "the bucket does not resolve: the sink would get a warehouse in a bucket the "
+            f"contract does not name, or none{f', and {refuses}' if required else ''}. "
+            f"Set {'it' if one else 'them'} here, or set binding.location.warehouse"
+        )
+    return (
+        f"iceberg sink (build {bid!r}): the {kind} catalog's warehouse derives from "
+        f"binding.location.bucket {raw!r}, and {unset} here, so it cannot be derived at "
+        f"validate time. Set {'it' if one else 'them'} where the sink runs"
+        + (
+            ": the runner refuses the build when the bucket does not resolve there"
+            + (f", because {refuses}" if required else "")
+            if refused
+            else ""
+        )
+    )
+
+
+def _auto_creates(streaming: Mapping[str, Any], runtime: IcebergSinkPlan) -> bool:
+    """Does this Kafka Connect sink auto-create tables? Its default is off.
+
+    ``streamingSink.autoCreate`` sets ``iceberg.tables.auto-create-enabled``,
+    and an override map merged after it wins (apache-iceberg-1.10.0
+    IcebergSinkConfig.java:154-159 defaults the key to false).
+    """
+    value: Any = streaming.get("autoCreate")
+    for _label, cfg in runtime.overrides:
+        if "iceberg.tables.auto-create-enabled" in cfg:
+            value = cfg["iceberg.tables.auto-create-enabled"]
+    return str(value).strip().lower() == "true"
+
+
+def _requires_hint(key: str, kind: str, info: CatalogKind) -> str:
+    """What a missing ``sink_requires`` key is to the sink, for check 4's error."""
+    if key == "warehouse" and info.family == FAMILY_REST:
+        return " (the catalog name)"
+    if key == "warehouse" and kind in BUCKET_WAREHOUSE_KINDS:
+        return (
+            " (an object-store location), or a binding.location.bucket on platform aws or "
+            "gcp to derive it from, or the sink's warehouse property in an override; the "
+            f"{kind} catalog refuses to start without a warehouse"
+        )
+    if key == "project" and kind == "bigquery":
+        return (
+            f" (the sink's {BIGQUERY_PROJECT_ID}), or that property in an override; the "
+            "bigquery catalog refuses to start without it"
+        )
+    return ""
+
+
+def _start_only_property(key: str, kind: str) -> Optional[str]:
+    """The catalog property behind a ``sink_requires`` key only the sink needs.
+
+    DynamoDbCatalog and JdbcCatalog refuse to start without ``warehouse``, and
+    BigQueryMetastoreCatalog without ``gcp.bigquery.project-id`` (the rows in
+    ``_iceberg_catalog`` cite the upstream lines), so an override map that sets
+    the property supplies what the sink needs. ``None`` for any other key.
+    """
+    if key == "warehouse" and kind in BUCKET_WAREHOUSE_KINDS:
+        return "warehouse"
+    if key == "project" and kind == "bigquery":
+        return BIGQUERY_PROJECT_ID
+    return None
+
+
+def _overrides_catalog_property(runtime: IcebergSinkPlan, prop: str) -> bool:
+    """Does an override map merged over the derived config set catalog property ``prop``?"""
+    # A catalog property carries the same runtime prefix as the type key:
+    # ``iceberg.catalog.warehouse`` on Kafka Connect, bare ``warehouse`` on
+    # Debezium Server.
+    key = runtime.type_key[: -len("type")] + prop
+    return any(mapping.get(key) for _label, mapping in runtime.overrides)
+
+
+def _overrides_warehouse(runtime: IcebergSinkPlan) -> bool:
+    """Does an override map merged over the derived config set the warehouse?"""
+    return _overrides_catalog_property(runtime, "warehouse")
 
 
 def _reaching_catalog_type(info: Any, runtime: IcebergSinkPlan) -> Optional[str]:
@@ -573,7 +878,9 @@ def _check_warehouse_override(
 
     derived_wh = resolve_iceberg_catalog(binding, sink=sink, account_ref="").warehouse
     if not derived_wh and "warehouse" in info.sink_requires:
-        return  # check 4 already refused the missing warehouse
+        # The binding has no warehouse to diverge from: check 4 refused it, or
+        # (DynamoDB / JDBC) accepted the override as the sink's warehouse.
+        return
     if same_warehouse(override_wh, derived_wh):
         return
     if info.family == FAMILY_GLUE:
