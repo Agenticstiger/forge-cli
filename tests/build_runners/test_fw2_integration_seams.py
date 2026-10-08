@@ -245,19 +245,36 @@ def _props_path(contract: Dict[str, Any], tmp_path: Path) -> Path:
     return tmp_path / ".fluid" / "debezium" / contract["id"] / "ingest" / "application.properties"
 
 
+_DERIVED = "derive different warehouses from binding.location.bucket and path"
+
+
 @pytest.mark.parametrize("kind", ["jdbc", "dynamodb"])
 @pytest.mark.parametrize("outputs", [["orders", "refunds"], None], ids=["both", "no-outputs"])
-def test_debezium_writes_two_bucket_derived_exposes_of_one_database(tmp_path: Path, kind, outputs):
-    # Each expose derives ``s3://lake/sales/<table>/``: a per-table prefix of
-    # one bucket, as Glue's is, not two catalogs.
+def test_debezium_refuses_two_bucket_derived_exposes_of_one_database(tmp_path: Path, kind, outputs):
+    # Each expose derives ``s3://lake/sales/<table>/``, its own table prefix.
+    # The catalog creates every missing table under the one warehouse the
+    # sink is given, so writing both through either prefix is refused.
     contract = _contract(_two_tables(kind), [_dbz_build(outputs)])
+    errors, _ = validate_iceberg_sink(contract)
+    assert any(_DERIVED in e for e in errors), errors
+    assert _DERIVED in (iceberg_sink_preflight(contract, "ingest") or "")
+    result = DebeziumRunner().run(
+        build_acquisition_run_context(contract["builds"][0], contract, tmp_path)
+    )
+    assert result.state == RunState.FAILED
+    assert not _props_path(contract, tmp_path).exists()
+
+
+@pytest.mark.parametrize("kind", ["jdbc", "dynamodb"])
+def test_debezium_writes_two_exposes_of_one_database_under_one_warehouse(tmp_path: Path, kind):
+    contract = _contract(_two_tables(kind, warehouse="s3://lake/sales/"), [_dbz_build(None)])
     assert validate_iceberg_sink(contract) == ([], [])
     assert iceberg_sink_preflight(contract, "ingest") is None
     ctx = build_acquisition_run_context(contract["builds"][0], contract, tmp_path)
     DebeziumRunner().run(ctx)  # no server binary: fails after writing the config
     text = _props_path(contract, tmp_path).read_text()
     assert "debezium.sink.iceberg.table-namespace=sales" in text
-    assert "debezium.sink.iceberg.warehouse=s3://lake/sales/orders/" in text
+    assert "debezium.sink.iceberg.warehouse=s3://lake/sales/" in text
 
 
 @pytest.mark.parametrize("kind", ["jdbc", "dynamodb"])
@@ -265,14 +282,13 @@ def test_debezium_refuses_bucket_derived_exposes_in_two_buckets(tmp_path: Path, 
     exposes = _two_tables(kind)
     exposes[1]["binding"]["location"]["bucket"] = "other-lake"
     contract = _contract(exposes, [_dbz_build(None)])
-    message = "resolve to different catalogs (their warehouse differ)"
     errors, _ = validate_iceberg_sink(contract)
-    assert any(message in e for e in errors), errors
+    assert any(_DERIVED in e for e in errors), errors
     result = DebeziumRunner().run(
         build_acquisition_run_context(contract["builds"][0], contract, tmp_path)
     )
     assert result.state == RunState.FAILED
-    assert message in (result.error or "")
+    assert _DERIVED in (result.error or "")
     assert not _props_path(contract, tmp_path).exists()
 
 
@@ -348,7 +364,7 @@ def test_policy_compile_grants_both_glue_tables_and_prints_no_warning(tmp_path: 
     assert warnings == []
     assert [(b["provider"], b["resource_type"], b["resource_id"]) for b in bindings] == [
         ("aws", "s3.bucket", "acme-tableflow"),
-        ("aws", "glue.table", "sales_glue"),
+        ("aws", "glue.table", "sales_glue.orders"),
         ("aws", "s3.bucket", "lake"),
         ("aws", "glue.table", "sales.orders"),
     ]

@@ -433,6 +433,18 @@ def resolve_iceberg_sink_exposes(
             f"binding.location.database, split the build into one build per database, or {remedy}"
         )
     differs = _catalog_differences(selected)
+    derived = _derived_warehouses(selected) if differs == ["warehouse"] else {}
+    if derived:
+        kind = resolve_iceberg_catalog(selected[0].get("binding") or {}).kind
+        return (), (
+            f"{head}: a derived Debezium Server sink writes every table through one {kind} "
+            f"catalog warehouse, and the catalog creates a missing table under that "
+            f"warehouse ({_BUCKET_WAREHOUSE_LAYOUT[kind]}). But {writes} derive different "
+            f"warehouses from binding.location.bucket and path ({derived}): each is that "
+            f"expose's own table prefix, so one expose's tables would be created inside "
+            f"another expose's prefix. Set one binding.location.warehouse on them, split the "
+            f"build into one build per expose, or {remedy}"
+        )
     if differs:
         return (), (
             f"{head}: a derived Debezium Server sink writes through one catalog, but {writes} "
@@ -471,11 +483,12 @@ def _catalog_differences(exposes: Tuple[Mapping[str, Any], ...]) -> list[str]:
     too (``get_iceberg_warehouse`` derives ``s3://{bucket}/{database}/{table}/``),
     while a REST catalog's warehouse is the catalog's name. A DynamoDB or JDBC
     warehouse derived from ``location.bucket`` (:func:`_bucket_warehouse`) is
-    a per-table prefix the same way, so only its bucket is compared.
+    compared whole: the catalog creates every missing table under the one
+    warehouse the sink is given, so it is not a per-table prefix.
     """
     from dataclasses import fields as dataclass_fields
 
-    resolved = [_bucket_rooted(e.get("binding") or {}) for e in exposes]
+    resolved = [resolve_iceberg_catalog(e.get("binding") or {}) for e in exposes]
     if len(resolved) < 2:
         return []
     per_table = {"fq_table", "id_columns", "partition_by"}
@@ -504,21 +517,34 @@ def _catalog_differences(exposes: Tuple[Mapping[str, Any], ...]) -> list[str]:
     return differs
 
 
-def _bucket_rooted(binding: Mapping[str, Any]) -> ResolvedIcebergCatalog:
-    """:func:`resolve_iceberg_catalog` of ``binding``, a bucket-derived warehouse cut to its bucket.
+#: Where a catalog that is given a warehouse creates a table it does not have
+#: (apache-iceberg-1.10.0: aws/.../dynamodb/DynamoDbCatalog.java:163-186, for
+#: a namespace with no ``location`` property; core/.../jdbc/JdbcCatalog.java:
+#: 282-284 and 521-526). Both strip the warehouse's trailing slash.
+_BUCKET_WAREHOUSE_LAYOUT: Mapping[str, str] = MappingProxyType(
+    {
+        "dynamodb": "<warehouse>/<namespace>.db/<table>",
+        "jdbc": "<warehouse>/<namespace>/<table>",
+    }
+)
 
-    ``s3://lake/sales/orders/`` becomes ``s3://lake``: the path
-    :func:`_bucket_warehouse` appends defaults to the table's own prefix. A
-    ``location.warehouse`` the binding sets is kept whole.
-    """
-    from dataclasses import replace
 
-    resolved = resolve_iceberg_catalog(binding)
-    explicit = str((binding.get("location") or {}).get("warehouse") or "").strip()
-    if resolved.kind not in BUCKET_WAREHOUSE_KINDS or explicit or "://" not in resolved.warehouse:
-        return resolved
-    scheme, rest = resolved.warehouse.split("://", 1)
-    return replace(resolved, warehouse=f"{scheme}://{rest.split('/', 1)[0]}")
+def _derived_warehouses(exposes: Tuple[Mapping[str, Any], ...]) -> Dict[str, str]:
+    """``{exposeId: warehouse}`` when ``exposes`` are one DynamoDB or JDBC kind
+    whose warehouses :func:`_bucket_warehouse` derives (no
+    ``location.warehouse``) and differ, else ``{}``."""
+    resolved = [resolve_iceberg_catalog(e.get("binding") or {}) for e in exposes]
+    kinds = {r.kind for r in resolved}
+    if len(kinds) != 1 or not kinds <= BUCKET_WAREHOUSE_KINDS:
+        return {}
+    if any(
+        str(((e.get("binding") or {}).get("location") or {}).get("warehouse") or "").strip()
+        for e in exposes
+    ):
+        return {}
+    if len({r.warehouse for r in resolved}) < 2:
+        return {}
+    return {str(_expose_id(e)): r.warehouse for e, r in zip(exposes, resolved, strict=True)}
 
 
 #: Object-store URI schemes, and the Iceberg ``FileIO`` each one needs. THE one

@@ -73,7 +73,7 @@ def test_policy_compile_grants_the_glue_table_when_catalog_is_absent():
     assert not any("cataloged in" in w for w in warnings), warnings
     assert [(b["provider"], b["resource_type"], b["resource_id"]) for b in bindings] == [
         ("aws", "s3.bucket", "acme-tableflow"),
-        ("aws", "glue.table", "sales_glue"),
+        ("aws", "glue.table", "sales_glue.orders"),
     ]
 
 
