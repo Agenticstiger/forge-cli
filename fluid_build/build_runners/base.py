@@ -252,21 +252,32 @@ def _execute_acquisition_build(
     # everything (including secret-shaped vars). Catalog-export paths use
     # ``cli/_common.py::resolve_contract_env_templates`` instead, which
     # leaves sensitive placeholders literal.
+    unresolved_contract = contract
     build = _resolve_env_placeholders(build)
     contract = _resolve_env_placeholders(contract)
 
     module_path, function_name = entry
+    import contextlib
     import importlib
 
     module = importlib.import_module(module_path, package="fluid_build.build_runners")
     runner_fn = getattr(module, function_name)
-    return runner_fn(
-        build,
-        contract,
-        contract_dir,
-        dry_run=dry_run,
-        sample_rows=sample_rows,
-    )
+    # The Iceberg sink preflight reads a bucket's ``{{ env.X }}`` template as
+    # written: the resolution above turned an unset ``X`` into "", which would
+    # point the sink at a bucket the contract does not name.
+    scope: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
+    if engine in ("kafka-connect", "debezium"):
+        from .kafka_connect.iceberg_sink_validation import contract_as_written
+
+        scope = contract_as_written(unresolved_contract)
+    with scope:
+        return runner_fn(
+            build,
+            contract,
+            contract_dir,
+            dry_run=dry_run,
+            sample_rows=sample_rows,
+        )
 
 
 def _execute_embedded_sql_build_snowflake(

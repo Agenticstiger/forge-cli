@@ -223,11 +223,13 @@ def test_kafka_connect_warning_says_auto_create_fails_even_in_an_existing_datase
     assert "default storage location URI" not in warning
 
 
-def test_debezium_warning_keeps_the_dataset_storage_uri_exception():
-    # memiiso/debezium-server-iceberg 1.2.0.Final creates a namespace only when
-    # it is missing, so an existing dataset's storage URI places a new table.
+def test_debezium_warning_says_the_server_refuses_to_boot():
+    # memiiso/debezium-server-iceberg 1.2.0.Final IcebergConfig.java:44-45
+    # declares debezium.sink.iceberg.warehouse as a String with no default, so
+    # the server does not start without one, whether or not the tables exist.
     binding = _binding("bigquery", "gcp", project="acme-proj")
     warning = _warehouse_warning(_dbz_contract(binding, {}))
-    assert "default storage location URI" in warning
+    assert "refuses to boot" in warning
     assert "debezium.sink.iceberg.warehouse" in warning
+    assert "default storage location URI" not in warning
     assert "createNamespace" not in warning

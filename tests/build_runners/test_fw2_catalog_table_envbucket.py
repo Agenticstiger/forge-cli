@@ -148,7 +148,7 @@ def test_several_unset_variables_are_all_named(monkeypatch):
     monkeypatch.delenv("FW2_A", raising=False)
     monkeypatch.delenv("FW2_B", raising=False)
     binding = _binding("dynamodb", bucket="{{ env.FW2_A }}-{{ env.FW2_B }}", region="eu-west-1")
-    assert unset_bucket_env_vars(binding) == ("FW2_A", "FW2_B")
+    assert unset_bucket_env_vars(binding, "dynamodb") == ("FW2_A", "FW2_B")
     warnings = validate_iceberg_sink(_contract(binding))[1]
     assert any("FW2_A, FW2_B are unset or empty here" in w and "Set them" in w for w in warnings)
 
@@ -157,9 +157,9 @@ def test_only_the_variables_without_a_value_are_named(monkeypatch):
     monkeypatch.setenv("FW2_A", "acme")
     monkeypatch.delenv("FW2_B", raising=False)
     binding = _binding("dynamodb", bucket="{{ env.FW2_B }}", region="eu-west-1")
-    assert unset_bucket_env_vars(binding) == ("FW2_B",)
+    assert unset_bucket_env_vars(binding, "dynamodb") == ("FW2_B",)
     binding = _binding("dynamodb", bucket="{{ env.FW2_A }}", region="eu-west-1")
-    assert unset_bucket_env_vars(binding) == ()
+    assert unset_bucket_env_vars(binding, "dynamodb") == ()
 
 
 @pytest.mark.parametrize("binding", _TEMPLATED, ids=_IDS)
@@ -189,7 +189,7 @@ def test_an_empty_variable_is_treated_like_an_unset_one(monkeypatch, binding):
     ids=["non-env-template", "mixed-template", "local-platform"],
 )
 def test_a_bucket_that_cannot_derive_anywhere_stays_a_hard_error(unset, binding):
-    assert unset_bucket_env_vars(binding) == ()
+    assert unset_bucket_env_vars(binding, "dynamodb") == ()
     errors = validate_iceberg_sink(_contract(binding))[0]
     assert any("dynamodb catalog requires binding.location.warehouse" in e for e in errors)
 

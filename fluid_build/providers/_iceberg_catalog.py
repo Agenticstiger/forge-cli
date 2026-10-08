@@ -35,9 +35,9 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from ._sql_safety import validate_ident
 from .aws.util.warehouse import (
     _ENV_TEMPLATE_RE,
-    bucket_uses_fallback,
     get_iceberg_warehouse,
     normalize_location,
+    resolve_env_templates,
 )
 
 # Apache Iceberg runtime class names (pinned to the connector surface validated
@@ -420,7 +420,8 @@ def resolve_iceberg_catalog(
     ``uri`` + ``warehouse`` (catalog name) and don't use it. DynamoDB and JDBC
     take ``location.warehouse``, else derive one from an explicit
     ``location.bucket`` (:data:`BUCKET_WAREHOUSE_KINDS`); BigQuery takes the
-    ``gs://`` URI :func:`iceberg_storage_uri` gives, plus ``location.project``
+    ``gs://`` URI :func:`iceberg_storage_uri` gives for the bucket with its
+    ``{{ env.* }}`` templates rendered, plus ``location.project``
     and ``location.region`` as its own catalog properties.
     """
     loc = binding.get("location") or {}
@@ -456,9 +457,12 @@ def resolve_iceberg_catalog(
     extra: Dict[str, str] = {}
     if kind == "bigquery":
         # The gs:// storage dbt-bigquery's ``external_volume`` and the GCP IaC
-        # use, or none. ``client.region`` is an AWS client property, so the
-        # region goes to the catalog's own location key instead.
-        warehouse = iceberg_storage_uri(binding, scheme="gs")
+        # use, or none, with the bucket's ``{{ env.* }}`` templates rendered:
+        # a bucket that does not resolve here derives none. ``client.region``
+        # is an AWS client property, so the region goes to the catalog's own
+        # location key instead.
+        rendered = {**loc, "bucket": _rendered_bucket(loc)}
+        warehouse = iceberg_storage_uri({"location": rendered}, scheme="gs")
         if loc.get("project"):
             extra[BIGQUERY_PROJECT_ID] = str(loc["project"])
         if region:
@@ -488,41 +492,70 @@ def _bucket_warehouse(binding: Mapping[str, Any]) -> str:
     the Glue row's :func:`get_iceberg_warehouse` normalises them (``path``
     defaults to ``<database>/<table>/``). The scheme follows the platform:
     ``s3`` on AWS, ``gs`` on GCP; any other platform derives nothing. A
-    missing or unresolved bucket derives nothing either, rather than the
-    Glue row's account-derived fallback bucket.
+    missing bucket, or one :func:`_rendered_bucket` cannot render, derives
+    nothing either, rather than the Glue row's account-derived fallback bucket.
     """
     from ..iac.provider_match import canonical_cloud
 
     loc = binding.get("location") or {}
     scheme = _BUCKET_WAREHOUSE_SCHEMES.get(canonical_cloud(binding.get("platform")))
-    if not scheme or bucket_uses_fallback(loc):
+    bucket = _rendered_bucket(loc)
+    if not scheme or not bucket:
         return ""
-    bucket, path = normalize_location(loc, account_ref="")
+    _bucket, path = normalize_location(loc, account_ref="")
     return f"{scheme}://{bucket}/{path}"
 
 
-def unset_bucket_env_vars(binding: Mapping[str, Any]) -> Tuple[str, ...]:
-    """The unset or empty variables in an explicit bucket's ``{{ env.* }}`` templates.
+def _rendered_bucket(loc: Mapping[str, Any]) -> str:
+    """``location.bucket`` with its ``{{ env.* }}`` templates rendered, or ``""``.
 
-    Non-empty when ``location.bucket`` is set on a platform
-    :func:`_bucket_warehouse` derives on (aws, gcp) and names ``{{ env.* }}``
-    variables that are unset or empty in this process's environment: the
-    bucket is explicit, so the warehouse derives wherever those variables are
-    set, but not here. ``()`` when every variable the bucket names has a
-    value, for an absent bucket, another platform, or a bucket holding a
-    template that is not ``{{ env.* }}`` (nothing resolves that one).
+    ``""`` when the bucket is absent, names a variable that is unset or empty
+    in this process's environment, or holds a template that is not
+    ``{{ env.* }}``. An empty variable counts as unset: rendering it would
+    turn ``acme-{{ env.LAKE_ENV }}-lake`` into ``acme--lake``, a bucket the
+    contract does not name.
+    """
+    raw = str(loc.get("bucket") or "").strip()
+    if not raw or _unset_env_vars(raw) or "{{" in _ENV_TEMPLATE_RE.sub("", raw):
+        return ""
+    return str(resolve_env_templates(raw)).strip()
+
+
+def _unset_env_vars(raw: str) -> Tuple[str, ...]:
+    """The ``{{ env.* }}`` variables ``raw`` names that are unset or empty here."""
+    found = (name.strip() for name in _ENV_TEMPLATE_RE.findall(raw))
+    return tuple(dict.fromkeys(name for name in found if not os.environ.get(name)))
+
+
+def unset_bucket_env_vars(binding: Mapping[str, Any], kind: str) -> Tuple[str, ...]:
+    """The unset or empty variables the ``kind`` sink's warehouse waits on.
+
+    Non-empty when the sink resolver derives ``kind``'s warehouse from
+    ``location.bucket`` and that bucket names ``{{ env.* }}`` variables that
+    are unset or empty in this process's environment: DynamoDB and JDBC on
+    aws or gcp with no ``location.warehouse``, and BigQuery with no
+    scheme-qualified ``location.warehouse``. The bucket is explicit, so the
+    warehouse derives wherever those variables are set, but not here. ``()``
+    when every variable the bucket names has a value, for an absent bucket,
+    another kind or platform, a warehouse the binding sets, or a bucket
+    holding a template that is not ``{{ env.* }}`` (nothing resolves that one).
     """
     from ..iac.provider_match import canonical_cloud
 
     loc = binding.get("location") or {}
-    raw = loc.get("bucket")
-    if not raw or canonical_cloud(binding.get("platform")) not in _BUCKET_WAREHOUSE_SCHEMES:
+    raw = str(loc.get("bucket") or "")
+    warehouse = str(loc.get("warehouse") or "").strip()
+    if kind in BUCKET_WAREHOUSE_KINDS:
+        reads_bucket = not warehouse and (
+            canonical_cloud(binding.get("platform")) in _BUCKET_WAREHOUSE_SCHEMES
+        )
+    else:
+        # :func:`iceberg_storage_uri` reads the bucket unless the warehouse
+        # carries a scheme.
+        reads_bucket = kind == "bigquery" and not warehouse.startswith(_WAREHOUSE_SCHEMES)
+    if not raw or not reads_bucket or "{{" in _ENV_TEMPLATE_RE.sub("", raw):
         return ()
-    raw = str(raw)
-    if "{{" in _ENV_TEMPLATE_RE.sub("", raw):
-        return ()
-    found = (name.strip() for name in _ENV_TEMPLATE_RE.findall(raw))
-    return tuple(dict.fromkeys(name for name in found if not os.environ.get(name)))
+    return _unset_env_vars(raw)
 
 
 # ---------------------------------------------------------------------------
