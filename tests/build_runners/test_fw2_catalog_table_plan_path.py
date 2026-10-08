@@ -48,7 +48,9 @@ _PARTIAL = "acme-{{ env.%s }}-lake" % _VAR
 _FULL = "{{ env.%s }}" % _VAR
 
 
-def _contract(engine: str, catalog: str, bucket: str) -> Dict[str, Any]:
+def _contract(
+    engine: str, catalog: str, bucket: str, *, auto_create: bool = False
+) -> Dict[str, Any]:
     platform = "gcp" if catalog == "bigquery" else "aws"
     loc: Dict[str, Any] = {
         "database": "streaming",
@@ -70,6 +72,8 @@ def _contract(engine: str, catalog: str, bucket: str) -> Dict[str, Any]:
         props["kafka-connect"] = {
             "deployment": {"mode": "bring-your-own", "server_url": "http://c:8083"}
         }
+        if auto_create:
+            props["kafka-connect"]["streamingSink"] = {"autoCreate": True}
     return {
         "fluidVersion": "0.7.6",
         "kind": "DataProduct",
@@ -171,7 +175,8 @@ def test_kc_plan_path_refuses_a_bucket_that_does_not_resolve(
     fake_connect, tmp_path, monkeypatch, caplog, catalog, bucket, value
 ):
     _set(monkeypatch, value)
-    contract = _contract("kafka-connect", catalog, bucket)
+    # A Kafka Connect BigQuery sink is refused only with auto-create on.
+    contract = _contract("kafka-connect", catalog, bucket, auto_create=catalog == "bigquery")
     if catalog == "jdbc":
         contract["exposes"][0]["binding"]["location"]["uri"] = "jdbc:postgresql://pg/ice"
     with caplog.at_level(logging.INFO):

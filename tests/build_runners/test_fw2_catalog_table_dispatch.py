@@ -59,7 +59,7 @@ def _binding(catalog: str, bucket: str, **location: Any) -> Dict[str, Any]:
     return {"platform": platform, "format": "iceberg", "location": loc}
 
 
-def _contract(binding: Dict[str, Any], engine: str) -> Dict[str, Any]:
+def _contract(binding: Dict[str, Any], engine: str, *, auto_create: bool = False) -> Dict[str, Any]:
     props: Dict[str, Any] = {
         "source": {"kind": "postgres", "mode": "incremental_append", "streams": ["public.o"]},
         "sink": {"format": "iceberg"},
@@ -70,6 +70,8 @@ def _contract(binding: Dict[str, Any], engine: str) -> Dict[str, Any]:
         props["kafka-connect"] = {
             "deployment": {"mode": "bring-your-own", "server_url": "http://c:8083"}
         }
+        if auto_create:
+            props["kafka-connect"]["streamingSink"] = {"autoCreate": True}
     return {
         "fluidVersion": "0.7.6",
         "kind": "DataProduct",
@@ -167,7 +169,10 @@ def test_kc_dispatch_refuses_a_bucket_that_does_not_resolve(
 ):
     _set(monkeypatch, value)
     extra = {"uri": "jdbc:postgresql://pg:5432/iceberg"} if catalog == "jdbc" else {}
-    contract = _contract(_binding(catalog, bucket, **extra), "kafka-connect")
+    # A Kafka Connect BigQuery sink reads the warehouse only to auto-create
+    # tables, so it is refused only with auto-create on.
+    binding = _binding(catalog, bucket, **extra)
+    contract = _contract(binding, "kafka-connect", auto_create=catalog == "bigquery")
     with caplog.at_level(logging.INFO):
         rc = _dispatch(contract, tmp_path, monkeypatch)
     assert rc == 1
@@ -258,7 +263,8 @@ def test_debezium_dispatch_derives_from_the_resolved_bucket(tmp_path, monkeypatc
     [("mylake", "gs://mylake"), ("", ""), (None, "")],
     ids=["set", "empty", "unset"],
 )
-def test_bigquery_env_bucket_derive_and_validate(monkeypatch, value, warehouse):
+@pytest.mark.parametrize("auto_create", [False, True], ids=["no-autocreate", "autocreate"])
+def test_bigquery_env_bucket_derive_and_validate(monkeypatch, value, warehouse, auto_create):
     _set(monkeypatch, value)
     binding = _binding("bigquery", _FULL)
     resolved = resolve_iceberg_catalog(binding)
@@ -266,7 +272,7 @@ def test_bigquery_env_bucket_derive_and_validate(monkeypatch, value, warehouse):
     assert "{{" not in resolved.warehouse
     assert resolved.extra_catalog_props["gcp.bigquery.project-id"] == "acme-proj"
 
-    contract = _contract(binding, "kafka-connect")
+    contract = _contract(binding, "kafka-connect", auto_create=auto_create)
     errors, warnings = validate_iceberg_sink(contract)
     assert errors == []
     named = [w for w in warnings if _VAR in w]
@@ -279,8 +285,30 @@ def test_bigquery_env_bucket_derive_and_validate(monkeypatch, value, warehouse):
         assert len(named) == 1, warnings
         assert f"{_VAR} is unset or empty here" in named[0]
         assert not [w for w in warnings if "no gs:// warehouse" in w], warnings
-        assert refusal is not None
-        assert f"{_VAR} is unset or empty in the runner's environment" in refusal
+        # The run refuses only when the sink would read the warehouse.
+        assert ("the runner refuses the build" in named[0]) is auto_create
+        if auto_create:
+            assert refusal is not None
+            assert f"{_VAR} is unset or empty in the runner's environment" in refusal
+        else:
+            assert refusal is None
+
+
+@pytest.mark.parametrize("bucket", [_FULL, _PARTIAL], ids=["full", "partial"])
+@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
+def test_kc_bigquery_without_autocreate_runs_and_names_no_other_bucket(
+    fake_connect, tmp_path, monkeypatch, caplog, bucket, value
+):
+    _set(monkeypatch, value)
+    contract = _contract(_binding("bigquery", bucket), "kafka-connect")
+    with caplog.at_level(logging.INFO):
+        rc = _dispatch(contract, tmp_path, monkeypatch)
+    assert rc == 0, caplog.text
+    sinks = [cfg for _name, cfg in fake_connect if cfg.get("iceberg.catalog.type") == "bigquery"]
+    assert len(sinks) == 1, fake_connect
+    # No warehouse in a bucket the contract does not name (acme--lake, gs://).
+    pushed = sinks[0].get("iceberg.catalog.warehouse", "")
+    assert pushed in ("",), sinks[0]
 
 
 def test_bigquery_partial_bucket_with_an_empty_variable_derives_none(monkeypatch):

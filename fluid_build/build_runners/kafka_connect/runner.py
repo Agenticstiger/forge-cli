@@ -392,6 +392,13 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
                 schema_registry_url=sr_url,
                 delivery_guarantee=(props.get("delivery") or {}).get("guarantee"),
             )
+            # A bucket whose variable is unset or empty here resolved to one the
+            # contract does not name. The preflight lets that through only for a
+            # sink that never reads the warehouse (BigQuery without auto-create).
+            from .iceberg_sink_validation import unresolved_bucket_vars_at_run
+
+            if unresolved_bucket_vars_at_run(binding, resolved.kind):
+                derived.pop("iceberg.catalog.warehouse", None)
             sink_config = {**derived, **(sink_config or {})}
 
     connector_name = kc_props.get("connector_name") or f"forge-{ctx.product_id.replace('.', '-')}"

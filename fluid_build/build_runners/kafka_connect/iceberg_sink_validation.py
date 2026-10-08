@@ -350,7 +350,15 @@ def _check_build(
             "streamingSink.routeField"
         )
 
-    _check_catalog(bid, binding, sink, runtime, errors, warnings)
+    _check_catalog(
+        bid,
+        binding,
+        sink,
+        runtime,
+        errors,
+        warnings,
+        auto_creates=_auto_creates(streaming, runtime),
+    )
 
 
 def _check_catalog(
@@ -360,6 +368,8 @@ def _check_catalog(
     runtime: IcebergSinkPlan,
     errors: List[str],
     warnings: List[str],
+    *,
+    auto_creates: bool = False,
 ) -> None:
     """The catalog checks (4-6), every one read off the kind's table row."""
     loc = binding.get("location") or {}
@@ -422,9 +432,11 @@ def _check_catalog(
     #    into the config it pushes. A bucket whose ``{{ env.* }}`` template
     #    does not resolve here is explicit, so ``fluid validate`` only warns:
     #    the runner's preflight, in the environment the sink config is
-    #    derived in, refuses it (BigQuery's too, which needs no warehouse to
-    #    start: the alternative is a warehouse in a bucket the contract does
-    #    not name). Glue requires nothing (the warehouse falls back), so its
+    #    derived in, refuses it when the sink would use that warehouse: a
+    #    DynamoDB / JDBC catalog needs one to start, Debezium Server needs one
+    #    to boot, and a Kafka Connect BigQuery sink reads it only to
+    #    auto-create tables (see the BigQuery warning below). Otherwise the run
+    #    warns too. Glue requires nothing (the warehouse falls back), so its
     #    region stays advisory.
     from ...providers._iceberg_catalog import unset_bucket_env_vars
 
@@ -437,9 +449,12 @@ def _check_catalog(
         waits_on = unset_bucket_env_vars(as_written, kind)
     if waits_on:
         required = "warehouse" in info.sink_requires
-        issue = _unresolved_bucket_issue(bid, kind, as_written, waits_on, required=required)
+        refused = required or runtime.engine == "debezium" or auto_creates
+        issue = _unresolved_bucket_issue(
+            bid, kind, as_written, waits_on, required=required, refused=refused
+        )
         run_only = _AT_RUN.get()
-        if run_only is None:
+        if run_only is None or not refused:
             warnings.append(issue)
         else:
             errors.append(issue)
@@ -577,6 +592,25 @@ def _binding_as_written(binding: Mapping[str, Any]) -> Mapping[str, Any]:
     contract = _AS_WRITTEN.get()
     if contract is None or _AT_RUN.get() is None:
         return binding
+    return _match_as_written(contract, binding)
+
+
+def unresolved_bucket_vars_at_run(binding: Mapping[str, Any], kind: str) -> Tuple[str, ...]:
+    """The unset or empty variables in ``binding``'s bucket as the contract wrote it.
+
+    For a runner deriving inside :func:`contract_as_written`, where ``binding``
+    is already resolved; ``()`` outside that scope.
+    """
+    contract = _AS_WRITTEN.get()
+    if contract is None:
+        return ()
+    from ...providers._iceberg_catalog import unset_bucket_env_vars
+
+    return unset_bucket_env_vars(_match_as_written(contract, binding), kind)
+
+
+def _match_as_written(contract: Mapping[str, Any], binding: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The expose binding in ``contract`` that resolves to ``binding``, else ``binding``."""
     from ..base import _resolve_env_placeholders
 
     target = _stripped(binding)
@@ -605,6 +639,7 @@ def _unresolved_bucket_issue(
     names: Tuple[str, ...],
     *,
     required: bool,
+    refused: bool,
 ) -> str:
     """Check 4's message for a warehouse that waits on unset or empty bucket variables."""
     raw = (binding.get("location") or {}).get("bucket")
@@ -622,10 +657,28 @@ def _unresolved_bucket_issue(
     return (
         f"iceberg sink (build {bid!r}): the {kind} catalog's warehouse derives from "
         f"binding.location.bucket {raw!r}, and {unset} here, so it cannot be derived at "
-        f"validate time. Set {'it' if one else 'them'} where the sink runs: the runner "
-        "refuses the build when the bucket does not resolve there"
-        + (f", because {refuses}" if required else "")
+        f"validate time. Set {'it' if one else 'them'} where the sink runs"
+        + (
+            ": the runner refuses the build when the bucket does not resolve there"
+            + (f", because {refuses}" if required else "")
+            if refused
+            else ""
+        )
     )
+
+
+def _auto_creates(streaming: Mapping[str, Any], runtime: IcebergSinkPlan) -> bool:
+    """Does this Kafka Connect sink auto-create tables? Its default is off.
+
+    ``streamingSink.autoCreate`` sets ``iceberg.tables.auto-create-enabled``,
+    and an override map merged after it wins (apache-iceberg-1.10.0
+    IcebergSinkConfig.java:154-159 defaults the key to false).
+    """
+    value: Any = streaming.get("autoCreate")
+    for _label, cfg in runtime.overrides:
+        if "iceberg.tables.auto-create-enabled" in cfg:
+            value = cfg["iceberg.tables.auto-create-enabled"]
+    return str(value).strip().lower() == "true"
 
 
 def _requires_hint(key: str, kind: str, info: CatalogKind) -> str:

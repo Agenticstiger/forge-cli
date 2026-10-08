@@ -452,7 +452,7 @@ def resolve_iceberg_catalog(
     # unknown kind keeps the historic REST fallback, and ``fluid validate``
     # refuses it). The FileIO follows the WAREHOUSE scheme so GCS (gs://) and
     # ADLS (abfss://) work, not just S3 (RFC §6.3 — PR7's REST + GCP profiles).
-    warehouse = loc.get("warehouse") or ""
+    warehouse = str(loc.get("warehouse") or "").strip()
     region = loc.get("region")
     extra: Dict[str, str] = {}
     if kind == "bigquery":
