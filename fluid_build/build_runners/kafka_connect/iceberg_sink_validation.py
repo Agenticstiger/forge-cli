@@ -429,8 +429,12 @@ def _check_catalog(
     from ...providers._iceberg_catalog import unset_bucket_env_vars
 
     derived_warehouse = resolve_iceberg_catalog(binding, sink=sink, account_ref="").warehouse
+    # Only a deriving build reads the bucket; one that does not pushes the
+    # operator's map as written.
     as_written = _binding_as_written(binding)
-    waits_on = () if _overrides_warehouse(runtime) else unset_bucket_env_vars(as_written, kind)
+    waits_on: Tuple[str, ...] = ()
+    if runtime.derives and not _overrides_warehouse(runtime):
+        waits_on = unset_bucket_env_vars(as_written, kind)
     if waits_on:
         required = "warehouse" in info.sink_requires
         issue = _unresolved_bucket_issue(bid, kind, as_written, waits_on, required=required)
@@ -565,18 +569,33 @@ def _binding_as_written(binding: Mapping[str, Any]) -> Mapping[str, Any]:
     """``binding`` as the contract wrote it, while a runner runs; else ``binding``.
 
     The expose binding in the contract :func:`contract_as_written` holds whose
-    resolution by the dispatcher's own resolver is ``binding``.
+    resolution by the dispatcher's own resolver is ``binding``. Compared with
+    strings stripped: a plan-embedded contract is first resolved by
+    ``_contract_loader.resolve_contract_env_templates``, which strips every
+    string it renders.
     """
     contract = _AS_WRITTEN.get()
     if contract is None or _AT_RUN.get() is None:
         return binding
     from ..base import _resolve_env_placeholders
 
+    target = _stripped(binding)
     for expose in contract.get("exposes") or []:
         raw = expose.get("binding") if isinstance(expose, Mapping) else None
-        if isinstance(raw, Mapping) and _resolve_env_placeholders(dict(raw)) == binding:
+        if isinstance(raw, Mapping) and _stripped(_resolve_env_placeholders(dict(raw))) == target:
             return raw
     return binding
+
+
+def _stripped(node: Any) -> Any:
+    """``node`` with every string leaf stripped of surrounding whitespace."""
+    if isinstance(node, str):
+        return node.strip()
+    if isinstance(node, Mapping):
+        return {k: _stripped(v) for k, v in node.items()}
+    if isinstance(node, (list, tuple)):
+        return [_stripped(v) for v in node]
+    return node
 
 
 def _unresolved_bucket_issue(

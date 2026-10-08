@@ -203,6 +203,7 @@ def _execute_acquisition_build(
     *,
     dry_run: bool,
     sample_rows: Any = None,
+    as_written: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Dispatch an acquisition build to its runner.
 
@@ -210,6 +211,10 @@ def _execute_acquisition_build(
     the registered callable. Capability negotiation runs first so a
     contract asking for an unsupported capability fails with the rich
     ``CapabilityMismatchError`` instead of running the wrong shape.
+
+    ``as_written`` is ``contract`` before any ``{{ env.* }}`` resolution, when
+    the caller resolved some already (a plan-embedded contract); ``None``
+    means ``contract`` is as written.
     """
     engine = (build.get("engine") or "").strip().lower()
 
@@ -252,7 +257,7 @@ def _execute_acquisition_build(
     # everything (including secret-shaped vars). Catalog-export paths use
     # ``cli/_common.py::resolve_contract_env_templates`` instead, which
     # leaves sensitive placeholders literal.
-    unresolved_contract = contract
+    unresolved_contract = contract if as_written is None else as_written
     build = _resolve_env_placeholders(build)
     contract = _resolve_env_placeholders(contract)
 
@@ -1000,6 +1005,7 @@ def run_builds_from_args(
                     1, "contract_load_failed", {"path": str(contract_path), "error": str(exc)}
                 )
         contract = plan_data.get("contract") or {}
+        contract_as_written = contract
         if not contract:
             raise CLIError(
                 1,
@@ -1072,6 +1078,7 @@ def run_builds_from_args(
             raise
         except Exception as e:
             raise CLIError(1, "contract_load_failed", {"path": str(contract_path), "error": str(e)})
+        contract_as_written = contract
         if str(contract_path).lower().endswith((".tgz", ".tar.gz")):
             # A bundle's own directory is not where its contract lives:
             # anchor at the source contract its MANIFEST records.
@@ -1162,12 +1169,16 @@ def run_builds_from_args(
 
         if is_acquisition_build(build):
             sample_rows = getattr(args, "sample_rows", None)
+            # A plan's contract had its ``{{ env.* }}`` templates resolved
+            # above, with an empty variable rendered to "": the Iceberg sink
+            # preflight reads the bucket template from the plan as written.
             result = _execute_acquisition_build(
                 build,
                 contract,
                 contract_path.parent,
                 dry_run=args.dry_run,
                 sample_rows=sample_rows,
+                as_written=contract_as_written,
             )
             _report_build(report, contract_path.parent, product_id, build_id, result, runs_before)
             if result == 0:
