@@ -26,6 +26,7 @@ never disagree (RFC §6.1 / §7).
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -37,7 +38,6 @@ from .aws.util.warehouse import (
     bucket_uses_fallback,
     get_iceberg_warehouse,
     normalize_location,
-    resolve_env_templates,
 )
 
 # Apache Iceberg runtime class names (pinned to the connector surface validated
@@ -502,13 +502,14 @@ def _bucket_warehouse(binding: Mapping[str, Any]) -> str:
 
 
 def unset_bucket_env_vars(binding: Mapping[str, Any]) -> Tuple[str, ...]:
-    """The unset variables an explicit bucket's derived warehouse waits on, or ``()``.
+    """The unset or empty variables in an explicit bucket's ``{{ env.* }}`` templates.
 
     Non-empty when ``location.bucket`` is set on a platform
-    :func:`_bucket_warehouse` derives on (aws, gcp) but its ``{{ env.* }}``
-    templates do not resolve in this process's environment: the bucket is
-    explicit, so the warehouse derives wherever those variables are set, but
-    not here. ``()`` for a resolved or absent bucket, another platform, or a
+    :func:`_bucket_warehouse` derives on (aws, gcp) and names ``{{ env.* }}``
+    variables that are unset or empty in this process's environment: the
+    bucket is explicit, so the warehouse derives wherever those variables are
+    set, but not here. ``()`` when every variable the bucket names has a
+    value, for an absent bucket, another platform, or a bucket holding a
     template that is not ``{{ env.* }}`` (nothing resolves that one).
     """
     from ..iac.provider_match import canonical_cloud
@@ -517,11 +518,11 @@ def unset_bucket_env_vars(binding: Mapping[str, Any]) -> Tuple[str, ...]:
     raw = loc.get("bucket")
     if not raw or canonical_cloud(binding.get("platform")) not in _BUCKET_WAREHOUSE_SCHEMES:
         return ()
-    resolved = str(resolve_env_templates(raw))
-    names = tuple(dict.fromkeys(_ENV_TEMPLATE_RE.findall(resolved)))
-    if not names or "{{" in _ENV_TEMPLATE_RE.sub("", resolved):
+    raw = str(raw)
+    if "{{" in _ENV_TEMPLATE_RE.sub("", raw):
         return ()
-    return names
+    found = (name.strip() for name in _ENV_TEMPLATE_RE.findall(raw))
+    return tuple(dict.fromkeys(name for name in found if not os.environ.get(name)))
 
 
 # ---------------------------------------------------------------------------

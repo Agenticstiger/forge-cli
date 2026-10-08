@@ -503,10 +503,10 @@ _AT_RUN: contextvars.ContextVar[bool] = contextvars.ContextVar(
 def _unresolved_bucket_issue(
     bid: Any, kind: str, binding: Mapping[str, Any], names: Tuple[str, ...]
 ) -> str:
-    """Check 4's message for a warehouse that waits on unset bucket variables."""
+    """Check 4's message for a warehouse that waits on unset or empty bucket variables."""
     raw = (binding.get("location") or {}).get("bucket")
     one = len(names) == 1
-    unset = f"{', '.join(names)} {'is' if one else 'are'} not set"
+    unset = f"{', '.join(names)} {'is' if one else 'are'} unset or empty"
     if _AT_RUN.get():
         return (
             f"iceberg sink (build {bid!r}): the {kind} catalog's warehouse derives from "

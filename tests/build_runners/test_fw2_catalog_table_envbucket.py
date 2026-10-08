@@ -99,7 +99,7 @@ def test_unresolved_bucket_template_warns_at_validate(unset, binding, engine):
     assert len(hit) == 1, warnings
     assert f"the {kind} catalog's warehouse derives from binding.location.bucket" in hit[0]
     assert repr(_TEMPLATE) in hit[0]
-    assert f"{_VAR} is not set here" in hit[0]
+    assert f"{_VAR} is unset or empty here" in hit[0]
     # It does not ask for the bucket the contract already sets.
     assert "requires binding.location.warehouse" not in hit[0]
 
@@ -109,7 +109,7 @@ def test_unresolved_bucket_template_warns_at_validate(unset, binding, engine):
 def test_unresolved_bucket_template_is_refused_by_the_preflight(unset, binding, engine):
     refusal = iceberg_sink_preflight(_contract(binding, engine=engine), "ingest")
     assert refusal is not None
-    assert f"{_VAR} is not set in the runner's environment" in refusal
+    assert f"{_VAR} is unset or empty in the runner's environment" in refusal
     assert "binding.location.warehouse" in refusal
 
 
@@ -150,7 +150,31 @@ def test_several_unset_variables_are_all_named(monkeypatch):
     binding = _binding("dynamodb", bucket="{{ env.FW2_A }}-{{ env.FW2_B }}", region="eu-west-1")
     assert unset_bucket_env_vars(binding) == ("FW2_A", "FW2_B")
     warnings = validate_iceberg_sink(_contract(binding))[1]
-    assert any("FW2_A, FW2_B are not set here" in w and "Set them" in w for w in warnings)
+    assert any("FW2_A, FW2_B are unset or empty here" in w and "Set them" in w for w in warnings)
+
+
+def test_only_the_variables_without_a_value_are_named(monkeypatch):
+    monkeypatch.setenv("FW2_A", "acme")
+    monkeypatch.delenv("FW2_B", raising=False)
+    binding = _binding("dynamodb", bucket="{{ env.FW2_B }}", region="eu-west-1")
+    assert unset_bucket_env_vars(binding) == ("FW2_B",)
+    binding = _binding("dynamodb", bucket="{{ env.FW2_A }}", region="eu-west-1")
+    assert unset_bucket_env_vars(binding) == ()
+
+
+@pytest.mark.parametrize("binding", _TEMPLATED, ids=_IDS)
+def test_an_empty_variable_is_treated_like_an_unset_one(monkeypatch, binding):
+    # An empty value resolves the bucket to "", which derives no warehouse; the
+    # message still names the variable instead of asking for a bucket.
+    monkeypatch.setenv(_VAR, "")
+    contract = _contract(binding)
+    errors, warnings = validate_iceberg_sink(contract)
+    assert errors == []
+    assert any(f"{_VAR} is unset or empty here" in w for w in warnings), warnings
+    refusal = iceberg_sink_preflight(contract, "ingest")
+    assert refusal is not None
+    assert f"{_VAR} is unset or empty in the runner's environment" in refusal
+    assert "requires binding.location.warehouse" not in refusal
 
 
 @pytest.mark.parametrize(
@@ -237,7 +261,7 @@ builds:
 )
 
 
-@pytest.mark.parametrize("value", [None, "acme-lake"], ids=["unset", "set"])
+@pytest.mark.parametrize("value", [None, "", "acme-lake"], ids=["unset", "empty", "set"])
 def test_cli_validate_accepts_the_contract_with_or_without_the_variable(tmp_path, value):
     path = tmp_path / "kc_ddb_envbucket.fluid.yaml"
     path.write_text(textwrap.dedent(_CONTRACT_YAML), encoding="utf-8")
@@ -258,4 +282,4 @@ def test_cli_validate_accepts_the_contract_with_or_without_the_variable(tmp_path
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out
     assert "requires binding.location.warehouse" not in out
-    assert (_VAR in out) is (value is None), out
+    assert (_VAR in out) is (not value), out
