@@ -51,6 +51,12 @@ SAFE_SNOWFLAKE_PERMS = {
     "manage": ["INSERT", "UPDATE", "DELETE", "SELECT"],
 }
 
+#: The message for a contract with no grants. It stays in ``warnings`` (and
+#: so in ``bindings.json``), but it reports a legitimate no-op, not a grant
+#: left unenforced, so ``fluid policy compile`` / ``apply`` do not show it as
+#: a WARNING.
+NO_GRANTS = "No grants found in accessPolicy"
+
 
 def compile_policy(contract: dict) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Compile accessPolicy from contract into provider IAM bindings.
@@ -70,7 +76,7 @@ def compile_policy(contract: dict) -> Tuple[List[Dict[str, Any]], List[str]]:
     grants = (contract.get("accessPolicy") or {}).get("grants", [])
 
     if not grants:
-        warnings.append("No grants found in accessPolicy")
+        warnings.append(NO_GRANTS)
         return bindings, warnings
 
     for g in grants:
