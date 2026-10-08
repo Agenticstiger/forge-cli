@@ -463,10 +463,12 @@ def resolve_iceberg_catalog(
         # location key instead.
         rendered = {**loc, "bucket": _rendered_bucket(loc)}
         warehouse = iceberg_storage_uri({"location": rendered}, scheme="gs")
-        if loc.get("project"):
-            extra[BIGQUERY_PROJECT_ID] = str(loc["project"])
-        if region:
-            extra[BIGQUERY_LOCATION] = str(region)
+        project = str(loc.get("project") or "").strip()
+        if project:
+            extra[BIGQUERY_PROJECT_ID] = project
+        location = str(region or "").strip()
+        if location:
+            extra[BIGQUERY_LOCATION] = location
         region = None
     elif not warehouse and kind in BUCKET_WAREHOUSE_KINDS:
         warehouse = _bucket_warehouse(binding)

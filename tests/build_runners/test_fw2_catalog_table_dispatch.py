@@ -59,7 +59,13 @@ def _binding(catalog: str, bucket: str, **location: Any) -> Dict[str, Any]:
     return {"platform": platform, "format": "iceberg", "location": loc}
 
 
-def _contract(binding: Dict[str, Any], engine: str, *, auto_create: bool = False) -> Dict[str, Any]:
+def _contract(
+    binding: Dict[str, Any],
+    engine: str,
+    *,
+    auto_create: bool = False,
+    overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     props: Dict[str, Any] = {
         "source": {"kind": "postgres", "mode": "incremental_append", "streams": ["public.o"]},
         "sink": {"format": "iceberg"},
@@ -72,6 +78,8 @@ def _contract(binding: Dict[str, Any], engine: str, *, auto_create: bool = False
         }
         if auto_create:
             props["kafka-connect"]["streamingSink"] = {"autoCreate": True}
+        if overrides:
+            props["kafka-connect"]["iceberg_catalog_overrides"] = dict(overrides)
     return {
         "fluidVersion": "0.7.6",
         "kind": "DataProduct",
@@ -358,3 +366,30 @@ def test_kafka_connect_bigquery_no_warehouse_warning_is_unchanged():
     warnings = validate_iceberg_sink(_contract(binding, "kafka-connect"))[1]
     hit = [w for w in warnings if "no gs:// warehouse" in w]
     assert len(hit) == 1 and "without auto-create, tables that exist need none" in hit[0]
+
+
+@pytest.mark.parametrize(
+    "catalog, warehouse",
+    [
+        ("dynamodb", "s3://ops-lake/wh"),
+        ("jdbc", "s3://ops-lake/wh"),
+        ("bigquery", "gs://ops-lake/wh"),
+    ],
+)
+@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
+def test_kc_dispatch_keeps_an_override_warehouse(
+    fake_connect, tmp_path, monkeypatch, caplog, catalog, warehouse, value
+):
+    _set(monkeypatch, value)
+    extra = {"uri": "jdbc:postgresql://pg:5432/iceberg"} if catalog == "jdbc" else {}
+    contract = _contract(
+        _binding(catalog, _FULL, **extra),
+        "kafka-connect",
+        overrides={"iceberg.catalog.warehouse": warehouse},
+    )
+    with caplog.at_level(logging.INFO):
+        rc = _dispatch(contract, tmp_path, monkeypatch)
+    assert rc == 0, caplog.text
+    sinks = [cfg for _name, cfg in fake_connect if "iceberg.tables" in cfg]
+    assert len(sinks) == 1, fake_connect
+    assert sinks[0].get("iceberg.catalog.warehouse") == warehouse, sinks[0]

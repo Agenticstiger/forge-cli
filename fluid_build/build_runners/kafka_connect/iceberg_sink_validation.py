@@ -462,7 +462,7 @@ def _check_catalog(
     for key in info.sink_requires:
         if key == "warehouse" and waits_on:
             continue  # reported above, naming the variables
-        present = derived_warehouse if key == "warehouse" else loc.get(key)
+        present = derived_warehouse if key == "warehouse" else str(loc.get(key) or "").strip()
         start_prop = _start_only_property(key, kind)
         if not present and start_prop is not None:
             present = _overrides_catalog_property(runtime, start_prop)
@@ -595,14 +595,18 @@ def _binding_as_written(binding: Mapping[str, Any]) -> Mapping[str, Any]:
     return _match_as_written(contract, binding)
 
 
-def unresolved_bucket_vars_at_run(binding: Mapping[str, Any], kind: str) -> Tuple[str, ...]:
-    """The unset or empty variables in ``binding``'s bucket as the contract wrote it.
+def unresolved_bucket_vars_at_run(
+    binding: Mapping[str, Any], kind: str, runtime: IcebergSinkPlan
+) -> Tuple[str, ...]:
+    """The unset or empty variables the derived warehouse waits on, as check 4 reads them.
 
     For a runner deriving inside :func:`contract_as_written`, where ``binding``
-    is already resolved; ``()`` outside that scope.
+    is already resolved: the variables in its bucket as the contract wrote it.
+    ``()`` outside that scope, for a build that does not derive, and when an
+    override map sets the warehouse (the override is what reaches the sink).
     """
     contract = _AS_WRITTEN.get()
-    if contract is None:
+    if contract is None or not runtime.derives or _overrides_warehouse(runtime):
         return ()
     from ...providers._iceberg_catalog import unset_bucket_env_vars
 

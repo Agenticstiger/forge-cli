@@ -96,3 +96,41 @@ def test_a_blank_warehouse_and_no_bucket_is_refused(catalog, engine):
     errors, _warnings = validate_iceberg_sink(contract)
     assert any(f"{catalog} catalog requires binding.location.warehouse" in e for e in errors)
     assert iceberg_sink_preflight(contract, "b1") is not None
+
+
+@pytest.mark.parametrize("engine", ["kafka-connect", "debezium"])
+def test_a_blank_bigquery_project_is_refused(engine):
+    binding = {
+        "platform": "gcp",
+        "format": "iceberg",
+        "location": {
+            "database": "streaming",
+            "table": "orders",
+            "catalog": "bigquery",
+            "bucket": "lake",
+            "project": "   ",
+        },
+    }
+    assert "gcp.bigquery.project-id" not in resolve_iceberg_catalog(binding).extra_catalog_props
+    contract = _contract(binding, engine)
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any("bigquery catalog requires binding.location.project" in e for e in errors), errors
+    assert iceberg_sink_preflight(contract, "b1") is not None
+
+
+def test_a_padded_bigquery_project_and_region_are_stripped():
+    binding = {
+        "platform": "gcp",
+        "format": "iceberg",
+        "location": {
+            "database": "streaming",
+            "table": "orders",
+            "catalog": "bigquery",
+            "bucket": "lake",
+            "project": " acme-proj ",
+            "region": " EU ",
+        },
+    }
+    props = resolve_iceberg_catalog(binding).extra_catalog_props
+    assert props["gcp.bigquery.project-id"] == "acme-proj"
+    assert props["gcp.bigquery.location"] == "EU"
