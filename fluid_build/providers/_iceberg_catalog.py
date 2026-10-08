@@ -457,6 +457,11 @@ _CATALOG_FIELD_SOURCES: Mapping[str, str] = MappingProxyType(
     }
 )
 
+#: The binding setting each catalog-specific property is resolved from.
+_CATALOG_PROP_SOURCES: Mapping[str, str] = MappingProxyType(
+    {BIGQUERY_PROJECT_ID: "project", BIGQUERY_LOCATION: "region"}
+)
+
 
 def _catalog_differences(exposes: Tuple[Mapping[str, Any], ...]) -> list[str]:
     """The catalog settings on which ``exposes`` resolve differently, or ``[]``.
@@ -464,11 +469,13 @@ def _catalog_differences(exposes: Tuple[Mapping[str, Any], ...]) -> list[str]:
     Compares every :class:`ResolvedIcebergCatalog` field except the table
     identity and the per-table write defaults. A Glue warehouse is per table
     too (``get_iceberg_warehouse`` derives ``s3://{bucket}/{database}/{table}/``),
-    while a REST catalog's warehouse is the catalog's name.
+    while a REST catalog's warehouse is the catalog's name. A DynamoDB or JDBC
+    warehouse derived from ``location.bucket`` (:func:`_bucket_warehouse`) is
+    a per-table prefix the same way, so only its bucket is compared.
     """
     from dataclasses import fields as dataclass_fields
 
-    resolved = [resolve_iceberg_catalog(e.get("binding") or {}) for e in exposes]
+    resolved = [_bucket_rooted(e.get("binding") or {}) for e in exposes]
     if len(resolved) < 2:
         return []
     per_table = {"fq_table", "id_columns", "partition_by"}
@@ -478,11 +485,40 @@ def _catalog_differences(exposes: Tuple[Mapping[str, Any], ...]) -> list[str]:
     for f in dataclass_fields(ResolvedIcebergCatalog):
         if f.name in per_table:
             continue
-        if any(getattr(r, f.name) != getattr(resolved[0], f.name) for r in resolved[1:]):
-            source = _CATALOG_FIELD_SOURCES.get(f.name, f.name)
-            if source not in differs:
-                differs.append(source)
+        if f.name == "extra_catalog_props":
+            # Named by the binding setting each property comes from.
+            props = sorted({k for r in resolved for k in r.extra_catalog_props})
+            sources = [
+                _CATALOG_PROP_SOURCES.get(k, "catalog properties")
+                for k in props
+                if any(
+                    r.extra_catalog_props.get(k) != resolved[0].extra_catalog_props.get(k)
+                    for r in resolved[1:]
+                )
+            ]
+        elif any(getattr(r, f.name) != getattr(resolved[0], f.name) for r in resolved[1:]):
+            sources = [_CATALOG_FIELD_SOURCES.get(f.name, f.name)]
+        else:
+            sources = []
+        differs.extend(s for s in dict.fromkeys(sources) if s not in differs)
     return differs
+
+
+def _bucket_rooted(binding: Mapping[str, Any]) -> ResolvedIcebergCatalog:
+    """:func:`resolve_iceberg_catalog` of ``binding``, a bucket-derived warehouse cut to its bucket.
+
+    ``s3://lake/sales/orders/`` becomes ``s3://lake``: the path
+    :func:`_bucket_warehouse` appends defaults to the table's own prefix. A
+    ``location.warehouse`` the binding sets is kept whole.
+    """
+    from dataclasses import replace
+
+    resolved = resolve_iceberg_catalog(binding)
+    explicit = str((binding.get("location") or {}).get("warehouse") or "").strip()
+    if resolved.kind not in BUCKET_WAREHOUSE_KINDS or explicit or "://" not in resolved.warehouse:
+        return resolved
+    scheme, rest = resolved.warehouse.split("://", 1)
+    return replace(resolved, warehouse=f"{scheme}://{rest.split('/', 1)[0]}")
 
 
 #: Object-store URI schemes, and the Iceberg ``FileIO`` each one needs. THE one

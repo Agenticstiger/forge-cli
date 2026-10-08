@@ -553,8 +553,9 @@ def _execute_debezium_server(
 
         # The exposes the build's outputs name, as `fluid validate` resolves
         # them. They share one database and one catalog, so the first one's
-        # binding gives the namespace and the catalog block (for Glue, whose
-        # warehouse is a per-table prefix, the first one's prefix).
+        # binding gives the namespace and the catalog block (for Glue, and for
+        # a DynamoDB / JDBC warehouse derived from the bucket, whose warehouse
+        # is a per-table prefix, the first one's prefix).
         targets, _error = iceberg_sink_target(ctx.contract, build, sink_plan)
         if targets:
             resolved = resolve_iceberg_catalog(
