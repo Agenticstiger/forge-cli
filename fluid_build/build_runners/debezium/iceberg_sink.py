@@ -92,8 +92,11 @@ def emit_debezium_iceberg_sink_config(
         # GLOBAL (applies to all derived tables), not a per-table default.
         cfg["partition-by"] = ",".join(resolved.partition_by)
 
-    # Native Iceberg props (s3.* / gcs.* / adls.* / jdbc.* ...) pass straight
-    # through with the same prefix the runner adds.
+    # Native Iceberg props (s3.* / gcs.* / adls.* / jdbc.* / gcp.bigquery.* ...)
+    # pass straight through with the same prefix the runner adds: the server
+    # maps every ``debezium.sink.iceberg.*`` key into the catalog properties
+    # (memiiso/debezium-server-iceberg 1.2.0.Final IcebergConfig.java:18-21,
+    # IcebergChangeConsumer.java:100-102).
     for k, v in (resolved.extra_catalog_props or {}).items():
         cfg[str(k)] = str(v)
 

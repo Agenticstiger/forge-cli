@@ -547,16 +547,19 @@ def _execute_debezium_server(
         if preflight_error:
             return _failed(ctx, started_at, t_start, preflight_error)
     if sink_plan is not None and sink_plan.derives:
-        from ...providers._iceberg_catalog import (
-            find_iceberg_expose_binding,
-            resolve_iceberg_catalog,
-        )
+        from ...providers._iceberg_catalog import resolve_iceberg_catalog
+        from ..kafka_connect.iceberg_sink_validation import iceberg_sink_target
         from .iceberg_sink import emit_debezium_iceberg_sink_config
 
-        binding = find_iceberg_expose_binding(ctx.contract)
-        if binding is not None:
+        # The exposes the build's outputs name, as `fluid validate` resolves
+        # them. They share one database and one catalog, so the first one's
+        # binding gives the namespace and the catalog block (for Glue, whose
+        # warehouse is a per-table prefix, the first one's prefix; a DynamoDB /
+        # JDBC warehouse is one value for all of them, or the resolver refuses).
+        targets, _error = iceberg_sink_target(ctx.contract, build, sink_plan)
+        if targets:
             resolved = resolve_iceberg_catalog(
-                binding,
+                targets[0].get("binding") or {},
                 contract=ctx.contract,
                 sink=ctx.sink,
                 account_ref=ctx.env.get("AWS_ACCOUNT_ID", ""),

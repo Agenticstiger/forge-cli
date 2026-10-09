@@ -128,7 +128,9 @@ class CatalogMoveSpec:
     ``addresses_before`` returns addresses the old release created for a moved
     binding that do not depend on its location, for a resource the before
     emit cannot re-derive once the location changed too; the default is none.
-    The prose fields fill the error message.
+    The prose fields fill the error message. With no ``evidence_types``, the
+    message does not attribute the resources to the moved exposes:
+    ``consequence`` says why they may be in state, and the exposes follow it.
     """
 
     cloud: str
@@ -138,7 +140,8 @@ class CatalogMoveSpec:
     as_before: Callable[[MutableMapping[str, Any]], None]
     #: Counted noun for the resources, e.g. "Glue catalog resource(s)".
     noun: str
-    #: Why the plan would destroy them, and what that destroy does.
+    #: Why the plan would destroy them, and what that destroy does. With no
+    #: ``evidence_types`` it also introduces the expose list printed after it.
     consequence: str
     #: Where ``state rm`` leaves them, e.g. "AWS".
     stays_in: str
@@ -276,17 +279,20 @@ SNOWFLAKE_VOLUME_MOVES = CatalogMoveSpec(
     as_before=_back_into_snowflake,
     noun="Snowflake EXTERNAL VOLUME(s)",
     consequence=(
-        "forge-cli no longer creates an EXTERNAL VOLUME for an Iceberg table in a catalog "
-        "Snowflake does not manage (dbt now writes it as an externally cataloged table, "
-        "not a Snowflake-managed one on a volume), so applying now would plan to DROP "
-        "these volumes, and any Snowflake-managed Iceberg table an earlier dbt run wrote "
-        "onto one still uses it."
+        "The volume is named for the contract, not for an expose, so the state does not "
+        "say which expose it was created for. Possible causes: this contract was applied "
+        "by a forge-cli release that gave an Iceberg table in a catalog Snowflake does not "
+        "manage an EXTERNAL VOLUME (this release gives it none, and dbt writes it as an "
+        "externally cataloged table); or this change removed a Snowflake-managed Iceberg "
+        "expose, or moved one to another catalog. Applying now would plan to DROP the "
+        "volume, and any Snowflake-managed Iceberg table written onto it still uses it.\n\n"
+        "Iceberg exposes whose catalog earlier releases gave an EXTERNAL VOLUME:"
     ),
     stays_in="Snowflake",
     afterwards=(
         "Drop a volume by hand (DROP EXTERNAL VOLUME) only once no Iceberg table uses it. "
-        "If the table belongs in Snowflake's own catalog, remove location.catalog (or set "
-        "it to 'snowflake') instead."
+        "If an Iceberg table belongs in Snowflake's own catalog, remove its "
+        "location.catalog (or set it to 'snowflake') instead."
     ),
     addresses_before=_snowflake_volume_before,
 )
@@ -485,15 +491,24 @@ def guard_catalog_moves(
     if not addresses:
         return
     commands = _state_rm_commands(addresses, workdir=workdir)
+    expose_lines = "\n".join(f"  exposes[{e}]: location.catalog {k}" for e, k in exposes)
+    address_lines = "\n".join(f"  {a}" for a in addresses)
+    if spec.evidence_types:
+        found = (
+            f"{len(addresses)} {spec.noun} for Iceberg table(s) that now live in another "
+            f"catalog:\n\n{expose_lines}\n\n{address_lines}\n\n{spec.consequence}"
+        )
+    else:
+        # No resource in state ties these to an expose, so the moved exposes
+        # are one possible cause, listed after the prose that says so.
+        found = (
+            f"{len(addresses)} {spec.noun} that this contract's configuration no longer "
+            f"declares:\n\n{address_lines}\n\n{spec.consequence}\n\n{expose_lines}"
+        )
     raise CatalogMoveError(
         "iceberg catalog move blocked — this contract's OpenTofu state holds "
-        f"{len(addresses)} {spec.noun} for Iceberg table(s) that now live in another "
-        "catalog:\n\n"
-        + "\n".join(f"  exposes[{e}]: location.catalog {k}" for e, k in exposes)
-        + "\n\n"
-        + "\n".join(f"  {a}" for a in addresses)
-        + f"\n\n{spec.consequence}\n\n"
-        "Drop each from this contract's state, then re-run apply:\n\n"
+        + found
+        + "\n\nDrop each from this contract's state, then re-run apply:\n\n"
         + "\n".join(f"  {command}" for command in commands)
         + "\n\n`tofu state rm` touches ZERO bytes of infrastructure: the resources stay in "
         f"{spec.stays_in}, and only this contract's claim on them is released. " + spec.afterwards,

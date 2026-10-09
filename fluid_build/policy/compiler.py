@@ -51,6 +51,12 @@ SAFE_SNOWFLAKE_PERMS = {
     "manage": ["INSERT", "UPDATE", "DELETE", "SELECT"],
 }
 
+#: The message for a contract with no grants. It stays in ``warnings`` (and
+#: so in ``bindings.json``), but it reports a legitimate no-op, not a grant
+#: left unenforced, so ``fluid policy compile`` / ``apply`` do not show it as
+#: a WARNING.
+NO_GRANTS = "No grants found in accessPolicy"
+
 
 def compile_policy(contract: dict) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Compile accessPolicy from contract into provider IAM bindings.
@@ -70,7 +76,7 @@ def compile_policy(contract: dict) -> Tuple[List[Dict[str, Any]], List[str]]:
     grants = (contract.get("accessPolicy") or {}).get("grants", [])
 
     if not grants:
-        warnings.append("No grants found in accessPolicy")
+        warnings.append(NO_GRANTS)
         return bindings, warnings
 
     for g in grants:
@@ -92,6 +98,10 @@ def compile_policy(contract: dict) -> Tuple[List[Dict[str, Any]], List[str]]:
             elif not _glue_cataloged(binding):
                 _compile_catalog_managed_iceberg(
                     bindings, warnings, exp, binding, principal, permissions
+                )
+            elif _is_tableflow(binding):
+                _compile_tableflow_bindings(
+                    bindings, warnings, exp, fmt, loc, principal, permissions
                 )
             elif platform == "aws" or fmt in ("s3_file", "iceberg", "parquet"):
                 _compile_aws_bindings(bindings, fmt, loc, principal, permissions)
@@ -214,6 +224,49 @@ def _compile_catalog_managed_iceberg(bindings, warnings, exp, binding, principal
             f"table grant was compiled for {principal} {perms}. Enforce it in the "
             f"'{kind}' catalog's own access control."
         )
+
+
+def _is_tableflow(binding) -> bool:
+    """Is this a Glue-cataloged Iceberg expose the Confluent Tableflow IaC publishes?
+
+    Matched the way that emitter matches its exposes (``is_cloud``), so a
+    platform alias it publishes is compiled here too.
+    """
+    from ..iac.provider_match import is_cloud
+    from ..providers._iceberg_catalog import is_iceberg_format
+
+    return is_cloud(binding, "confluent") and is_iceberg_format(binding.get("format"))
+
+
+def _compile_tableflow_bindings(bindings, warnings, exp, fmt, loc, principal, permissions):
+    """Compile a Confluent Tableflow expose: its bucket and the Glue table it publishes.
+
+    Tableflow publishes the table for the Kafka topic, not ``location.table``:
+    the Tableflow IaC names it with ``_topic_name`` (topic > table > exposeId)
+    and publishes it into ``location.database`` (``custom_database``). With no
+    database, Tableflow's Glue database is the Kafka cluster id ("By default,
+    the Glue database name is the cluster ID, and each topic becomes a table
+    under it": docs.confluent.io/cloud/current/topics/tableflow/how-to-guides/
+    catalog-integration/integrate-with-aws-glue-catalog). When neither names
+    the database, the Glue grant is reported as a warning, not widened to a
+    database.
+    """
+    from ..iac.providers.confluent import _topic_name
+
+    topic = _topic_name(loc, exp)
+    database = loc.get("database") or loc.get("kafka_cluster_id")
+    if database:
+        published = {**loc, "database": database, "dataset": None, "table": topic}
+        _compile_aws_bindings(bindings, fmt, published, principal, permissions)
+        return
+    _compile_aws_bindings(bindings, fmt, loc, principal, permissions, glue=False)
+    expose_id = exp.get("exposeId") or exp.get("id") or "?"
+    warnings.append(
+        f"Iceberg expose '{expose_id}' (platform confluent) names neither "
+        f"binding.location.database nor kafka_cluster_id, so the Glue database Tableflow "
+        f"publishes topic '{topic}' into is unknown and no Glue table grant was compiled "
+        f"for {principal} {list(permissions)}."
+    )
 
 
 def _compile_aws_bindings(bindings, fmt, loc, principal, permissions, *, glue=True):
