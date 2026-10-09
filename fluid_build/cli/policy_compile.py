@@ -60,7 +60,7 @@ _COMPILER_READ_PATHS = re.compile(
 
 
 def _compiler_schema_errors(contract: Any) -> List[str]:
-    """The schema type errors ``fluid validate`` reports where the compiler reads.
+    """The schema type errors where the compiler reads, as ``<path> is not of type <type>``.
 
     ``policy compile`` does not schema-validate, so a grant or binding of the
     wrong type reaches the compiler and fails there as a Python error that
@@ -79,7 +79,10 @@ def _compiler_schema_errors(contract: Any) -> List[str]:
     for error in result.errors:
         path, _, message = error.partition(": ")
         if _COMPILER_READ_PATHS.fullmatch(path) and " is not of type " in message:
-            found.append(error)
+            # The path and the expected type, never the value: a value of the
+            # wrong type can be a connection URL with a password in it.
+            expected = message.rsplit(" is not of type ", 1)[1]
+            found.append(f"{path} is not of type {expected}")
     return found
 
 

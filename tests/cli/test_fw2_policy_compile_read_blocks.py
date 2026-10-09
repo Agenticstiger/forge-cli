@@ -65,7 +65,7 @@ _CONTRACT: Dict[str, Any] = {
     ],
 }
 
-_BINDING_ERROR = "exposes[0].binding: 'nope' is not of type 'object'"
+_BINDING_ERROR = "exposes[0].binding is not of type 'object'"
 
 
 def _write(tmp_path: Path, doc: Dict[str, Any]) -> Path:
@@ -122,19 +122,19 @@ def test_an_unrelated_grant_error_is_not_named(tmp_path):
     [
         (
             lambda d: d.update(accessPolicy=["x"]),
-            "accessPolicy: ['x'] is not of type 'object'",
+            "accessPolicy is not of type 'object'",
         ),
         (
             lambda d: d["accessPolicy"].update(grants="g"),
-            "accessPolicy.grants: 'g' is not of type 'array'",
+            "accessPolicy.grants is not of type 'array'",
         ),
         (
             lambda d: d["accessPolicy"]["grants"][0].update(permissions=None),
-            "accessPolicy.grants[0].permissions: None is not of type 'array'",
+            "accessPolicy.grants[0].permissions is not of type 'array'",
         ),
         (
             lambda d: d["exposes"][0]["binding"].update(location=None),
-            "exposes[0].binding.location: None is not of type 'object'",
+            "exposes[0].binding.location is not of type 'object'",
         ),
     ],
     ids=["accessPolicy", "grants", "permissions", "location"],
@@ -212,3 +212,16 @@ def test_grants_that_compile_to_nothing_still_warn(tmp_path, caplog):
 
     shown = [e.get("warning") for e in _warning_events(caplog)]
     assert "No IAM bindings generated from contract" in shown
+
+
+def test_the_crash_error_names_the_path_and_never_the_value(tmp_path):
+    """A wrong-typed value can be a connection URL with a password in it."""
+    secret = "Sup3rS3cretPw"
+    doc = copy.deepcopy(_CONTRACT)
+    doc["exposes"][0]["binding"]["location"] = f"snowflake://svc_user:{secret}@xy12345/DB/S/T"
+
+    error = _compile_error(tmp_path, doc)
+
+    assert "exposes[0].binding.location is not of type 'object'" in error
+    assert secret not in error
+    assert "snowflake://" not in error

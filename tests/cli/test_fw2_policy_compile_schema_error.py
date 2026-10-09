@@ -81,7 +81,7 @@ def test_a_malformed_grant_is_reported_as_the_schema_error(tmp_path):
     assert err.event == "policy_compiler_crashed"
     assert err.context["error"] == (
         "policy compile failed on contract values of the wrong type: "
-        "accessPolicy.grants[0]: 'group:analysts@example.com' is not of type 'object'"
+        "accessPolicy.grants[0] is not of type 'object'"
     )
     assert "AttributeError" not in err.context["error"]
     assert not (tmp_path / "o" / "b.json").exists()

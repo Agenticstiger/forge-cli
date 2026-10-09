@@ -294,7 +294,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of `fluid generate artifacts` now fail with exit 1 and `policy_compiler_crashed` (see
   Upgrade notes). The error names the schema type errors at the values the compiler reads
   (`accessPolicy`, its grants, each grant's permissions, each expose's binding and
-  location), or the compiler's own exception when the schema finds none there.
+  location) by path and expected type, never by value (a value of the wrong type can be a
+  connection URL with a password in it), or the compiler's own exception when the schema
+  finds none there.
 - **The Snowflake EXTERNAL VOLUME catalog-move guard names both causes.** It blocks the
   same applies, but its message no longer claims forge-cli stopped
   creating the volume or that the moved exposes held it. It names both possible causes (an
