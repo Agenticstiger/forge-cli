@@ -59,6 +59,7 @@ import os
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from unittest import mock
 
 import pytest
 
@@ -763,11 +764,11 @@ def tofu_project(
 #     (default ``http://localhost:4566``);
 #   * the explicit opt-in flag ``FLUID_IAC_LIVE_LOCALSTACK=1`` is set.
 #
-# Tests apply the plugin's credential-free ``main.tf.json`` with a sidecar
-# ``provider.tf.json`` that aims the AWS provider at LocalStack — the same
-# pattern the existing moto e2e uses, but against the heavier emulator that
-# faithfully covers Athena query execution, Glue ETL jobs, and many Pro-only
-# services.
+# Tests compile the plugin's module for an emulator (``AWS_ENDPOINT_URL``
+# names LocalStack) and apply it with a sidecar ``provider_override.tf.json``
+# that aims each AWS service at LocalStack — the same pattern the moto e2e
+# uses, but against the heavier emulator that faithfully covers Athena query
+# execution, Glue ETL jobs, and many Pro-only services.
 #
 # Known LocalStack gaps (verified on the live container):
 #   * ``redshift-serverless`` returns 501 InternalFailure → Redshift
@@ -830,10 +831,10 @@ _LOCALSTACK_SERVICES: Tuple[str, ...] = (
 def aws_provider_override(endpoint: str, *, region: str = "us-east-1") -> Dict[str, Any]:
     """A sidecar ``provider`` block aiming the AWS provider at LocalStack.
 
-    ``tofu`` merges every ``*.tf.json`` in the workdir, so this overlays
-    endpoint + dummy-credential config onto the plugin's credential-free
-    ``main.tf.json`` — emitter output stays portable and secret-free, only
-    the test rig knows about the emulator.
+    Written as an override file, ``tofu`` merges it into the provider block
+    the plugin emits for an emulator, overlaying each service's endpoint and
+    dummy credentials onto the credential-free ``main.tf.json`` — emitter
+    output stays portable and secret-free.
     """
     return {
         "provider": {
@@ -902,11 +903,24 @@ class LocalStackProject:
         actions: Sequence[Mapping[str, Any]] = (),
     ) -> str:
         """Compile a contract through the AWS plugin + drop the LocalStack
-        provider override sidecar."""
+        provider override sidecar.
+
+        The module is compiled with ``AWS_ENDPOINT_URL`` naming LocalStack, as
+        an emulator user sets it, so the plugin emits it for an emulator. The
+        sidecar skips requesting the account id, and without one
+        ``hashicorp/aws`` 6 gives a Glue database the id ``:<name>``, then
+        refuses to read it back ("unexpected format for ID (:mesh_silver),
+        expected catalog-id:database-name"). The emulator module names each
+        Glue resource's catalog (``aws._emulator_catalog_id``). It also emits
+        a ``provider "aws"`` block, so the sidecar is an override file, which
+        merges into that block, where a second plain block would be a
+        duplicate provider configuration.
+        """
         plugin = get_iac_plugin("aws")
-        text = build_module(plugin, contract, actions=actions)
+        with mock.patch.dict(os.environ, {"AWS_ENDPOINT_URL": self.endpoint}):
+            text = build_module(plugin, contract, actions=actions)
         (self.workdir / "main.tf.json").write_text(text, encoding="utf-8")
-        (self.workdir / "provider.tf.json").write_text(
+        (self.workdir / "provider_override.tf.json").write_text(
             json.dumps(aws_provider_override(self.endpoint, region=self.region)),
             encoding="utf-8",
         )
