@@ -426,6 +426,27 @@ def _check_catalog(
     auto_creates: bool = False,
 ) -> None:
     """The catalog checks (4-6), every one read off the kind's table row."""
+    # The table the derived config names: ``<namespace>.<table>`` for Kafka
+    # Connect's iceberg.tables, the namespace alone for Debezium Server's
+    # table-namespace. Without one the derived config named the table
+    # ``None.<table>`` (or Debezium Server's default namespace). HARD.
+    if derives_table_identity(runtime):
+        from ...providers._iceberg_catalog import iceberg_namespace
+
+        location = binding.get("location") or {}
+        if not iceberg_namespace(binding):
+            errors.append(
+                f"iceberg sink (build {bid!r}): the expose's binding names no table namespace, "
+                "so the derived sink config has no namespace to write under. Set "
+                "binding.location.database (on GCP, binding.location.dataset)"
+            )
+        elif runtime.engine == "kafka-connect" and not (
+            location.get("table") or binding.get("table")
+        ):
+            errors.append(
+                f"iceberg sink (build {bid!r}): the expose's binding names no table, so the "
+                "derived iceberg.tables has none. Set binding.location.table"
+            )
     loc = binding.get("location") or {}
     kind = iceberg_catalog_kind(binding, sink)
     info = catalog_kind_info(kind)

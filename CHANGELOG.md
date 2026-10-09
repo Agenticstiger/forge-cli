@@ -64,6 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fluid policy compile` now exits 1 with `policy_compiler_crashed` and writes no bindings
   file when the policy compiler crashes. It used to write an empty bindings list and exit
   0, so the next stage read the crash as "no grants to enforce".
+- A Kafka Connect or embedded Debezium build whose sink config forge-cli derives is now
+  refused when its expose names no table namespace (`location.database`, or on GCP
+  `location.dataset`), and a Kafka Connect one when its expose names no `location.table`.
+  The derived config used to name the table `None.<table>`, or leave Debezium Server on its
+  default namespace. An override that sets `iceberg.tables` or `table-namespace` itself is
+  not affected.
 
 ### Changed
 
@@ -261,6 +267,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Iceberg expose, so a build for `refunds` pushed `iceberg.tables=sales.orders` while
   `fluid validate`, the preflight and the run all passed. It now writes the expose its
   `outputs` name (see Upgrade notes).
+- **A GCP streaming sink writes into the expose's BigQuery dataset.** The sink named the
+  table's namespace from `location.database` only, but a GCP binding names its dataset in
+  `location.dataset`, so a BigQuery or other GCP Iceberg sink pushed
+  `iceberg.tables=None.<table>` and `fluid validate` passed. The namespace is now
+  `location.database`, else `location.dataset` (the BigQuery metastore catalog maps a
+  namespace to a dataset), and a sink with neither is refused (see Upgrade notes). The
+  Kafka Connect late-events table and the Debezium shared-database check read it the
+  same way.
 - **DynamoDB, JDBC and BigQuery sink configs carry what the catalog needs to start.**
   `DynamoDbCatalog` and `JdbcCatalog` refuse to initialise without a warehouse, and
   `BigQueryMetastoreCatalog` without `gcp.bigquery.project-id`; forge-cli derived neither

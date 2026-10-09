@@ -344,9 +344,12 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     late_arrival_target = connector_name_for_topic
     if str(ctx.sink.format or "").lower() == "iceberg":
         _ib = _find_iceberg_expose_binding(ctx.contract, build) or {}
+        from ...providers._iceberg_catalog import iceberg_namespace
+
         _loc = _ib.get("location") or {}
-        if _loc.get("database") and _loc.get("table"):
-            late_arrival_target = f"{_loc['database']}.{_loc['table']}"
+        _namespace = iceberg_namespace(_ib)
+        if _namespace and _loc.get("table"):
+            late_arrival_target = f"{_namespace}.{_loc['table']}"
 
     late_arrival_policy = extract_late_arrival_policy(
         contract_or_source=ctx.source,

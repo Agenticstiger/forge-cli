@@ -352,10 +352,22 @@ def _expose_id(expose: Mapping[str, Any]) -> Any:
     return expose.get("exposeId") or expose.get("id")
 
 
+def iceberg_namespace(binding: Mapping[str, Any]) -> str:
+    """The Iceberg namespace a sink writes ``binding``'s table under, or ``""``.
+
+    ``location.database``, else a top-level ``database``, else
+    ``location.dataset``: a GCP binding names its BigQuery dataset there, and
+    the BigQuery metastore catalog maps a namespace to a dataset
+    (apache-iceberg-1.10.0 BigQueryMetastoreCatalog.java:149, :200, :307).
+    """
+    loc = binding.get("location") or {}
+    value = loc.get("database") or binding.get("database") or loc.get("dataset")
+    return str(value or "").strip()
+
+
 def _expose_database(expose: Mapping[str, Any]) -> Any:
     """The database leg of an expose's table, read as :func:`resolve_iceberg_catalog` reads it."""
-    binding = expose.get("binding") or {}
-    return (binding.get("location") or {}).get("database") or binding.get("database")
+    return iceberg_namespace(expose.get("binding") or {}) or None
 
 
 def _described(exposes: Tuple[Mapping[str, Any], ...]) -> list[str]:
@@ -430,7 +442,8 @@ def resolve_iceberg_sink_exposes(
         return (), (
             f"{head}: a derived Debezium Server sink writes every captured table under one "
             f"table-namespace, but {writes} sit in the databases {databases}. Give them one "
-            f"binding.location.database, split the build into one build per database, or {remedy}"
+            f"binding.location.database (location.dataset on GCP), split the build into one "
+            f"build per database, or {remedy}"
         )
     differs = _catalog_differences(selected)
     derived = _derived_warehouses(selected) if differs == ["warehouse"] else {}
@@ -626,7 +639,7 @@ def resolve_iceberg_catalog(
     and ``location.region`` as its own catalog properties.
     """
     loc = binding.get("location") or {}
-    database = loc.get("database") or binding.get("database")
+    database = iceberg_namespace(binding) or None
     table = loc.get("table") or binding.get("table")
     fq_table = f"{database}.{table}"
     kind = iceberg_catalog_kind(binding, sink)
