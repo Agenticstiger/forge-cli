@@ -23,8 +23,9 @@ resources — with no AWS account and no credentials.
 patches the in-process Python ``botocore``); it needs a real HTTP
 endpoint. moto's ``ThreadedMotoServer`` provides exactly that — an
 in-process AWS API on a real ``localhost`` port, with no Docker, no
-auth token, and no credentials. The emitted ``.tf.json`` is aimed at it
-with a sidecar ``provider`` override.
+auth token, and no credentials. ``AWS_ENDPOINT_URL`` names it, so the
+plugin emits its ``.tf.json`` for an emulator, and a sidecar
+``provider_override.tf.json`` aims each service at it.
 
 Skipped unless ``tofu`` is on PATH AND moto's server extra is installed
 (``pip install 'moto[glue,server]'`` — the ``server`` extra pulls in
@@ -33,6 +34,7 @@ Flask). The integration CI lane installs both.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from typing import Any, Dict, Iterator
 
@@ -113,15 +115,34 @@ def tofu_env(_tofu_plugin_cache: str) -> Dict[str, str]:
 
 
 @pytest.fixture
-def moto_endpoint() -> Iterator[str]:
-    """Start an in-process moto AWS server; yield its ``http://`` endpoint."""
+def moto_endpoint(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """Start an in-process moto AWS server; yield its ``http://`` endpoint.
+
+    ``AWS_ENDPOINT_URL`` names it, as an emulator user sets it, so the plugin
+    compiles the module for an emulator. The sidecar skips requesting the
+    account id, and without one ``hashicorp/aws`` 6 gives a Glue database the
+    id ``:<name>``, then refuses to read it back ("unexpected format for ID
+    (:analytics), expected catalog-id:database-name"). The emulator module
+    names each Glue resource's catalog (``aws._emulator_catalog_id``).
+
+    moto's backends are process-wide: stopping a server and starting a new
+    one does NOT clear them, so a database one test leaves behind makes the
+    next test's ``CreateDatabase`` fail with ``AlreadyExistsException``. The
+    ``/moto-api/reset`` admin endpoint clears them, giving each test the clean
+    account it expects.
+    """
+    import requests
     from moto.server import ThreadedMotoServer
 
     server = ThreadedMotoServer(port=0, verbose=False)
     server.start()
     try:
         _, port = server.get_host_and_port()
-        yield f"http://127.0.0.1:{port}"
+        endpoint = f"http://127.0.0.1:{port}"
+        monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)
+        with contextlib.suppress(Exception):
+            requests.post(f"{endpoint}/moto-api/reset", timeout=5)
+        yield endpoint
     finally:
         server.stop()
 
@@ -129,10 +150,12 @@ def moto_endpoint() -> Iterator[str]:
 def _provider_override(endpoint: str) -> Dict[str, Any]:
     """A sidecar ``provider`` block aiming the AWS provider at moto.
 
-    ``tofu`` merges every ``*.tf.json`` in the directory, so this
-    overlays endpoint + dummy-credential config onto the plugin's
-    credential-free ``main.tf.json`` — the plugin output stays portable
-    and secret-free; only the test rig knows about the emulator.
+    Written as ``provider_override.tf.json``, an override file: ``tofu``
+    merges it into the provider block the plugin emits for an emulator
+    (a second plain ``provider "aws"`` block would be a duplicate
+    configuration), overlaying each service's endpoint and dummy
+    credentials onto the credential-free ``main.tf.json`` — the plugin
+    output stays portable and secret-free.
     """
     # Every AWS service the plugin or its test paths touch must point at
     # moto — adding a service later is a one-line addition to this tuple.
@@ -184,7 +207,9 @@ def test_apply_destroy_cycle_against_moto(
     """contract -> .tf.json -> tofu init/plan/apply -> real resources -> destroy."""
     # 1. Compile the contract through the AWS plugin into .tf.json.
     (tmp_path / "main.tf.json").write_text(build_module(get_iac_plugin("aws"), _CONTRACT))
-    (tmp_path / "provider.tf.json").write_text(json.dumps(_provider_override(moto_endpoint)))
+    (tmp_path / "provider_override.tf.json").write_text(
+        json.dumps(_provider_override(moto_endpoint))
+    )
     workdir = str(tmp_path)
     env = tofu_env  # Session-shared provider cache via ``TF_PLUGIN_CACHE_DIR``.
 
@@ -254,7 +279,7 @@ def _apply_module(
     (workdir / "main.tf.json").write_text(
         build_module(plugin, contract, actions=actions), encoding="utf-8"
     )
-    (workdir / "provider.tf.json").write_text(
+    (workdir / "provider_override.tf.json").write_text(
         json.dumps(_provider_override(moto_endpoint)), encoding="utf-8"
     )
     init = runner.tofu_init(str(workdir), env=env)
