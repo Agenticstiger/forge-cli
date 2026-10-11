@@ -216,7 +216,7 @@ def test_grants_that_compile_to_nothing_still_warn(tmp_path, caplog):
 
 def test_the_crash_error_names_the_path_and_never_the_value(tmp_path):
     """A wrong-typed value can be a connection URL with a password in it."""
-    secret = "Sup3rS3cretPw"
+    secret = "Sup3rS3cretPw"  # pragma: allowlist secret
     doc = copy.deepcopy(_CONTRACT)
     doc["exposes"][0]["binding"]["location"] = f"snowflake://svc_user:{secret}@xy12345/DB/S/T"
 
