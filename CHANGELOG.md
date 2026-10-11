@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- The minimum `mcp` is now 1.22 (was 1.20). mcp 1.20 and 1.21 import
+  `eval_type_backport` from pydantic's private `_typing_extra` module, which pydantic 2.14
+  removed, so `mcp.server.fastmcp`, and every forge-cli MCP surface with it, failed to
+  import on a fresh install that resolved those releases with current pydantic. 1.22 is
+  the first 1.x that imports with pydantic 2.14. The CI drift leg that pins the floor moves
+  from 1.20 to 1.22.
 - An AWS contract that declared `location.catalog` other than `glue` (for example
   `rest`, `iceberg_rest`, `polaris`, `unity`, `nessie` or `lakekeeper`) on an Iceberg
   expose holds a Glue database and table in its OpenTofu state that earlier releases

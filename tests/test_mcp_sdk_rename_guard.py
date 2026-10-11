@@ -26,7 +26,7 @@ as empty; a wrongly-shaped dump goes out on the wire and the far side simply
 does not find the fields. Neither raises, so neither shows up as a test
 failure elsewhere. That is what this file is for.
 
-The audit behind the ``mcp>=1.20,<3.0`` ceiling found zero of either. These
+The audit behind the ``<3.0`` ceiling of ``mcp>=1.22,<3.0`` found zero of either. These
 tests pin that result so it cannot drift back unnoticed, in the same spirit
 as ``tests/perf/test_startup_budget.py``, which guards the cold-path import
 budget an ordinary test cannot express.

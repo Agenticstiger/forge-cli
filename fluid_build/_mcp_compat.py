@@ -35,9 +35,9 @@ the migration guide, which oversells several removals:
   ``open_inmemory_session``).
 
 This module is the ONLY place allowed to branch on the SDK generation.
-Runtime code keeps the ``mcp>=1.20,<2.0`` install pin (pyproject.toml)
-until the 2.x drift leg has a green track record — the dual support here
-is what turns that leg green in the first place.
+The install pin (pyproject.toml) is ``mcp>=1.22,<3.0``, so both
+generations install — the dual support here is what keeps both drift legs
+green.
 
 Tier-0 leaf rules: no module-scope ``mcp`` import (the startup budget in
 ``tests/perf/test_startup_budget.py`` forbids ``mcp`` on ``fluid --help``);
