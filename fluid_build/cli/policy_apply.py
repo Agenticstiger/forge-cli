@@ -22,7 +22,7 @@ import traceback
 
 from ..observability.tracing import traced_stage as _traced_stage
 from ._common import CLIError, build_provider
-from ._logging import info
+from ._logging import info, warn
 from .console import cprint
 
 COMMAND = "policy-apply"
@@ -86,6 +86,17 @@ def run(args, logger: logging.Logger) -> int:
 
         with open(bindings_path, encoding="utf-8") as f:
             data = json.load(f)
+
+        # The compiler's warnings, echoed here too: a grant that compiled to
+        # no binding (see ``fluid policy compile``) is not enforced by this
+        # step either, and apply can run in a different job from compile. A
+        # contract with no grants leaves nothing unenforced.
+        from fluid_build.policy.compiler import NO_GRANTS
+
+        stored = data.get("warnings") if isinstance(data, dict) else None
+        for warning in stored if isinstance(stored, list) else ():
+            if warning != NO_GRANTS:
+                warn(logger, "policy_bindings_warning", warning=warning, bindings=args.bindings)
 
         # An empty bindings file is a legitimate no-op, not an error: a
         # contract with no ``accessPolicy`` grants — every raw bronze / SDP

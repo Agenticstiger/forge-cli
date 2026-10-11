@@ -108,7 +108,11 @@ dependencies = [
   #     the sampling capability via that kwarg so the floor must include it.
   #   - The gateway depends on the lifespan API + ``mcp.shared.memory``
   #     test fixtures introduced in 1.20.
-  #   1.20+ has all of the above. Pinned by the mcp-sdk-drift CI job.
+  #   - 1.20 and 1.21 import ``eval_type_backport`` from
+  #     ``pydantic._internal._typing_extra``, which pydantic 2.14 removed,
+  #     so ``mcp.server.fastmcp`` fails to import with current pydantic.
+  #     1.22 is the first 1.x that imports with pydantic 2.14.
+  #   1.22+ has all of the above. Pinned by the mcp-sdk-drift CI job.
   # Ceiling ``<3.0`` since Phase 2 (2026-09-14). The codebase is
   # DUAL-SUPPORT (1.x and 2.x) via the fluid_build/_mcp_compat.py seam, and
   # widening the ceiling is what makes 2.x BLOCKING: the drift job's
@@ -142,7 +146,7 @@ dependencies = [
   # AGENT_IDE.md "Related work" section + the gateway commit msg):
   #   docs:  https://modelcontextprotocol.github.io/python-sdk/
   #   repo:  https://github.com/modelcontextprotocol/python-sdk
-  "mcp>=1.20,<3.0",
+  "mcp>=1.22,<3.0",
   # (The MCP output-port rate limiter is an in-process monotonic-clock
   # deque sliding window in SessionState.check_rate_limit — no dependency.
   # PyrateLimiter was dropped: its Limiter spins a background "leaker"

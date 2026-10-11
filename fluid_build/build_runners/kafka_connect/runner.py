@@ -95,15 +95,20 @@ def resolve_sink_connector(format_or_platform: str, override: Optional[str] = No
     return SINK_CONNECTOR_CLASS["s3"]  # safe default
 
 
-def _find_iceberg_expose_binding(contract: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """The expose ``binding`` carrying the Iceberg-table identity for a sink.
+def _find_iceberg_expose_binding(
+    contract: Mapping[str, Any], build: Mapping[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """The expose ``binding`` carrying the Iceberg-table identity for ``build``'s sink.
 
-    Delegates to the shared resolver helper so the Kafka-Connect and
-    Debezium-Server runners pick the SAME table (RFC zero-drift spine).
+    Delegates to the shared resolver so the Kafka-Connect and Debezium-Server
+    runners pick the SAME table (RFC zero-drift spine): the expose
+    ``iceberg_sink_target`` resolves, the one ``fluid validate`` checks.
+    ``None`` when it resolves none (the preflight refuses that build first).
     """
-    from ...providers._iceberg_catalog import find_iceberg_expose_binding
+    from .iceberg_sink_validation import iceberg_sink_target
 
-    return find_iceberg_expose_binding(contract)
+    exposes, _error = iceberg_sink_target(contract, build)
+    return dict(exposes[0].get("binding") or {}) if exposes else None
 
 
 # ── REST client ────────────────────────────────────────────────────────
@@ -338,10 +343,13 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     # only; nothing provisions the side table yet (RFC §6.7 / spike §14).
     late_arrival_target = connector_name_for_topic
     if str(ctx.sink.format or "").lower() == "iceberg":
-        _ib = _find_iceberg_expose_binding(ctx.contract) or {}
+        _ib = _find_iceberg_expose_binding(ctx.contract, build) or {}
+        from ...providers._iceberg_catalog import iceberg_namespace
+
         _loc = _ib.get("location") or {}
-        if _loc.get("database") and _loc.get("table"):
-            late_arrival_target = f"{_loc['database']}.{_loc['table']}"
+        _namespace = iceberg_namespace(_ib)
+        if _namespace and _loc.get("table"):
+            late_arrival_target = f"{_namespace}.{_loc['table']}"
 
     late_arrival_policy = extract_late_arrival_policy(
         contract_or_source=ctx.source,
@@ -370,7 +378,7 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
         if preflight_error:
             return _failed(ctx, started_at, t_start, preflight_error)
     if sink_plan is not None and sink_plan.derives:
-        binding = _find_iceberg_expose_binding(ctx.contract)
+        binding = _find_iceberg_expose_binding(ctx.contract, build)
         if binding is not None:
             from ...providers._iceberg_catalog import resolve_iceberg_catalog
             from .iceberg_sink import emit_iceberg_sink_config
@@ -392,6 +400,14 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
                 schema_registry_url=sr_url,
                 delivery_guarantee=(props.get("delivery") or {}).get("guarantee"),
             )
+            # A bucket whose variable is unset or empty here resolved to one the
+            # contract does not name. The preflight lets that through only for a
+            # sink that never reads the warehouse (BigQuery without auto-create);
+            # an override warehouse is the operator's and stays.
+            from .iceberg_sink_validation import unresolved_bucket_vars_at_run
+
+            if unresolved_bucket_vars_at_run(binding, resolved.kind, sink_plan):
+                derived.pop("iceberg.catalog.warehouse", None)
             sink_config = {**derived, **(sink_config or {})}
 
     connector_name = kc_props.get("connector_name") or f"forge-{ctx.product_id.replace('.', '-')}"

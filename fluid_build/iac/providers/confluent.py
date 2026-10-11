@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
-from ...providers._iceberg_catalog import binding_catalog_kind, canonical_catalog_kind
+from ...providers._iceberg_catalog import binding_catalog_kind
 from ...providers.aws.util.warehouse import normalize_location
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
@@ -84,11 +84,10 @@ def _non_glue_catalog(binding: Mapping[str, Any]) -> str:
     less claim on the name, in a catalog the contract never named. The
     emitter and ``validate_confluent_binding`` both read this, so the gate
     refuses exactly what the emitter declines to publish. An absent
-    ``catalog`` is Glue here, as it always was.
+    ``catalog`` is Glue: ``_iceberg_catalog.default_catalog_kind`` gives Glue for
+    ``platform: confluent``, so the policy compiler and dbt read the same
+    catalog this emitter publishes to.
     """
-    loc = binding.get("location") or {}
-    if not canonical_catalog_kind(loc.get("catalog")):
-        return ""
     kind = binding_catalog_kind(binding)
     return "" if kind == "glue" else kind
 

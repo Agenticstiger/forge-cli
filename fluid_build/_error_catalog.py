@@ -341,6 +341,19 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Check the agent-policy block in the contract; run 'fluid policy check <contract>'"],
         "sovereignty",
     ),
+    "policy_compiler_crashed": (
+        [
+            (
+                "Run 'fluid validate <contract>': policy compile reads accessPolicy and "
+                + "exposes without validating them against the contract schema"
+            ),
+            (
+                "If the contract validates, re-run with 'fluid --log-level DEBUG policy compile "
+                + "<contract>' to see the compiler's traceback"
+            ),
+        ],
+        "policy-compile#errors",
+    ),
     "policy_apply_failed": (
         ["Run 'fluid policy check <contract>' to surface the offending rule before apply"],
         "sovereignty",

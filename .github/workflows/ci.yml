@@ -408,12 +408,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # "1.20"      = lower-bound pin from pyproject.toml `mcp>=1.20`
+        # "1.22"      = lower-bound pin from pyproject.toml `mcp>=1.22`
         #               (see comment there for the FastMCP API features we
         #               need: deferred-annotation handling, ClientSession
         #               ``sampling_capabilities`` kwarg, etc.)
         # "range-max" = newest release inside the pyproject constraint
-        #               (`mcp>=1.20,<3.0`) — what a fresh
+        #               (`mcp>=1.22,<3.0`) — what a fresh
         #               `pip install data-product-forge` resolves today.
         #               Since Phase 2 widened the ceiling this resolves to
         #               2.x, and this leg is NOT warn-wrapped, so 2.x is
@@ -425,7 +425,7 @@ jobs:
         #               warn-only, for the same reason it was warn-only
         #               for 2.x: an upstream release must not be able to
         #               paint every open PR red.
-        mcp-version: ["1.20", "range-max", "latest"]
+        mcp-version: ["1.22", "range-max", "latest"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -451,7 +451,7 @@ jobs:
           done
           case "${{ matrix.mcp-version }}" in
             # Keep the range-max constraint in sync with pyproject.toml.
-            range-max) pip install --upgrade "mcp>=1.20,<3.0" ;;
+            range-max) pip install --upgrade "mcp>=1.22,<3.0" ;;
             latest)    pip install --upgrade mcp ;;
             *)         pip install --force-reinstall "mcp==${{ matrix.mcp-version }}" ;;
           esac
@@ -470,7 +470,7 @@ jobs:
           version = md.version("mcp")
           major = int(version.split(".")[0])
           print(f"leg={leg} resolved mcp=={version} (major {major})")
-          expected = {"1.20": 1, "range-max": 2, "latest": 2}[leg]
+          expected = {"1.22": 1, "range-max": 2, "latest": 2}[leg]
           if major != expected:
               sys.exit(
                   f"::error::leg '{leg}' resolved mcp {version}, expected major {expected}. "

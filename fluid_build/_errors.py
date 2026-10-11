@@ -83,6 +83,8 @@ _DOC_ROUTES = {
     "infra#drift": "advanced/typed-cli-errors.html#governance",
     # the safety gate's own section, which shows its message and remediation
     "iceberg-catalog-move": "cli/apply.html#iceberg-catalog-move-guard",
+    # the command's own Errors section
+    "policy-compile#errors": "cli/policy-compile.html#errors",
 }
 _DOC_FALLBACK = "advanced/production-troubleshooting.html"
 

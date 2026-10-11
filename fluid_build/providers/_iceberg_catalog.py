@@ -26,13 +26,19 @@ never disagree (RFC §6.1 / §7).
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ._sql_safety import validate_ident
-from .aws.util.warehouse import get_iceberg_warehouse
+from .aws.util.warehouse import (
+    _ENV_TEMPLATE_RE,
+    get_iceberg_warehouse,
+    normalize_location,
+    resolve_env_templates,
+)
 
 # Apache Iceberg runtime class names (pinned to the connector surface validated
 # in the OSS spike — RFC §14). Bumping the Iceberg runtime may change these.
@@ -138,12 +144,23 @@ _CATALOG_KINDS: Mapping[str, CatalogKind] = MappingProxyType(
             # Connect runtime does not bundle iceberg-nessie.
             CatalogKind("nessie", FAMILY_NATIVE, "nessie", None, "iceberg_rest", _REST_REQUIRES),
             # BigLake metastore. ``type=bigquery`` exists in Iceberg >= 1.10.
-            CatalogKind("bigquery", FAMILY_NATIVE, "bigquery", None, "iceberg_rest"),
+            # BigQueryMetastoreCatalog.initialize refuses to start without
+            # ``gcp.bigquery.project-id``, which the resolver maps from
+            # ``location.project`` (apache-iceberg-1.10.0
+            # BigQueryMetastoreCatalog.java:84-87).
+            CatalogKind("bigquery", FAMILY_NATIVE, "bigquery", None, "iceberg_rest", ("project",)),
             CatalogKind("hive", FAMILY_NATIVE, "hive", None, None),
-            CatalogKind("jdbc", FAMILY_NATIVE, "jdbc", None, None, ("uri",)),
+            # JdbcCatalog.initialize refuses a missing uri and an empty warehouse
+            # (apache-iceberg-1.10.0 JdbcCatalog.java:114-119). The warehouse
+            # may be derived: see :data:`BUCKET_WAREHOUSE_KINDS`.
+            CatalogKind("jdbc", FAMILY_NATIVE, "jdbc", None, None, ("uri", "warehouse")),
             CatalogKind("hadoop", FAMILY_NATIVE, "hadoop", None, None, ("warehouse",)),
             # CatalogUtil has no ``dynamodb`` type: it is reached by impl only.
-            CatalogKind("dynamodb", FAMILY_NATIVE, None, DYNAMODB_CATALOG_IMPL, None),
+            # DynamoDbCatalog.initialize refuses an empty warehouse
+            # (apache-iceberg-1.10.0 DynamoDbCatalog.java:132-134).
+            CatalogKind(
+                "dynamodb", FAMILY_NATIVE, None, DYNAMODB_CATALOG_IMPL, None, ("warehouse",)
+            ),
             # Horizon over an EXTERNAL VOLUME; a streaming writer reaches it
             # through Snowflake's Iceberg REST endpoint.
             CatalogKind(
@@ -157,6 +174,22 @@ _CATALOG_KINDS: Mapping[str, CatalogKind] = MappingProxyType(
         )
     }
 )
+
+#: Kinds whose ``warehouse`` is an object-store location the resolver may
+#: derive from an explicit ``location.bucket`` (and ``path``) when
+#: ``location.warehouse`` is absent. Never from the account-derived fallback
+#: bucket the Glue row uses: no IaC creates that bucket for a non-Glue table.
+BUCKET_WAREHOUSE_KINDS = frozenset({"dynamodb", "jdbc"})
+
+#: The object-store scheme a derived warehouse gets, by canonical platform.
+_BUCKET_WAREHOUSE_SCHEMES: Mapping[str, str] = MappingProxyType({"aws": "s3", "gcp": "gs"})
+
+#: BigQueryMetastoreCatalog's own property names (apache-iceberg-1.10.0
+#: bigquery/src/main/java/org/apache/iceberg/gcp/bigquery/
+#: BigQueryMetastoreCatalog.java:62-63). Without a location the catalog uses
+#: ``us`` (:68, :90).
+BIGQUERY_PROJECT_ID = "gcp.bigquery.project-id"
+BIGQUERY_LOCATION = "gcp.bigquery.location"
 
 #: Accepted spellings for a canonical kind (after case and ``-``/``_`` folding).
 _CATALOG_ALIASES: Mapping[str, str] = MappingProxyType(
@@ -200,8 +233,12 @@ def known_catalog_kinds() -> Tuple[str, ...]:
 
 
 def default_catalog_kind(binding: Mapping[str, Any]) -> str:
-    """The kind an Iceberg binding gets when it names none: Glue on AWS,
-    Snowflake-managed on Snowflake, a REST catalog anywhere else.
+    """The kind an Iceberg binding gets when it names none: Glue on AWS and on
+    Confluent, Snowflake-managed on Snowflake, a REST catalog anywhere else.
+
+    Confluent is Glue because the Tableflow IaC publishes a table with no
+    ``catalog`` to AWS Glue (``iac/providers/confluent.py``), so the policy
+    compiler and dbt read the catalog the table is actually in.
 
     GCP is the one platform where an absent catalog means two things: the
     streaming sink has always written a REST catalog there, while dbt-bigquery
@@ -213,7 +250,7 @@ def default_catalog_kind(binding: Mapping[str, Any]) -> str:
     from ..iac.provider_match import canonical_cloud
 
     cloud = canonical_cloud(binding.get("platform"))
-    if cloud == "aws":
+    if cloud in ("aws", "confluent"):
         return "glue"
     if cloud == "snowflake":
         return "snowflake-managed"
@@ -298,15 +335,229 @@ def iceberg_sink_exposes(contract: Mapping[str, Any]) -> Tuple[Mapping[str, Any]
 
 
 def find_iceberg_expose_binding(contract: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """The expose ``binding`` carrying the Iceberg-table identity for a sink.
+    """The binding of the first of :func:`iceberg_sink_exposes`, or ``None``.
 
-    Shared by the Kafka-Connect and Debezium-Server runners so both resolve the
-    SAME table identity (the RFC zero-drift spine): the first of
-    :func:`iceberg_sink_exposes`. The validated build->expose join
-    (build.outputs / exposeId) lands with the plan-time validator (RFC §6.8 #5).
+    A sink config that names its own tables (hand-written, or an override that
+    sets ``iceberg.tables`` / ``table-namespace``) is checked against this
+    expose's catalog. A sink config forge-cli derives reads the exposes
+    :func:`resolve_iceberg_sink_exposes` joins from the build's outputs; the
+    streaming runners select between the two through
+    ``iceberg_sink_validation.iceberg_sink_target``.
     """
     exposes = iceberg_sink_exposes(contract)
     return dict(exposes[0].get("binding") or {}) if exposes else None
+
+
+def _expose_id(expose: Mapping[str, Any]) -> Any:
+    return expose.get("exposeId") or expose.get("id")
+
+
+def iceberg_namespace(binding: Mapping[str, Any]) -> str:
+    """The Iceberg namespace a sink writes ``binding``'s table under, or ``""``.
+
+    ``location.database``, else a top-level ``database``, else
+    ``location.dataset``: a GCP binding names its BigQuery dataset there, and
+    the BigQuery metastore catalog maps a namespace to a dataset
+    (apache-iceberg-1.10.0 BigQueryMetastoreCatalog.java:149, :200, :307).
+    """
+    loc = binding.get("location") or {}
+    value = loc.get("database") or binding.get("database") or loc.get("dataset")
+    return str(value or "").strip()
+
+
+def _expose_database(expose: Mapping[str, Any]) -> Any:
+    """The database leg of an expose's table, read as :func:`resolve_iceberg_catalog` reads it."""
+    return iceberg_namespace(expose.get("binding") or {}) or None
+
+
+def _described(exposes: Tuple[Mapping[str, Any], ...]) -> list[str]:
+    """``["orders (sales.orders)", ...]``: each expose's id and table, for the messages."""
+    return [
+        f"{_expose_id(e)} ({resolve_iceberg_catalog(e.get('binding') or {}).fq_table})"
+        for e in exposes
+    ]
+
+
+def resolve_iceberg_sink_exposes(
+    contract: Mapping[str, Any],
+    build: Mapping[str, Any],
+    *,
+    namespace: bool = False,
+) -> Tuple[Tuple[Mapping[str, Any], ...], Optional[str]]:
+    """The exposes a sink config forge-cli DERIVES for ``build`` writes, or why it cannot.
+
+    The candidates are :func:`iceberg_sink_exposes`; the build's ``outputs``
+    pick among them, and with no outputs the candidates are the contract's.
+
+    * ``namespace=False`` (Kafka Connect): the derived config carries one
+      ``iceberg.tables`` entry, and the Apache Iceberg sink writes each record
+      to every table that lists (``SinkWriter.routeRecordStatically``), so it
+      writes one expose. Exactly one candidate in outputs, or no outputs and
+      exactly one in the contract; anything else is an error.
+    * ``namespace=True`` (embedded Debezium Server): the derived config carries
+      one ``table-namespace`` and one catalog, and the server writes each
+      captured table under that namespace (``DefaultIcebergTableMapper``).
+      The candidates selected must share one database and resolve to one
+      catalog; outputs that name none of them are an error.
+
+    Returns ``(exposes, None)`` with at least one expose, ``((), error)``, or
+    ``((), None)`` when the contract has no Iceberg sink expose at all (the
+    validator reports that).
+    """
+    candidates = iceberg_sink_exposes(contract)
+    if not candidates:
+        return (), None
+    head = f"iceberg sink (build {build.get('id', '?')!r})"
+    raw_outputs = build.get("outputs") or []
+    outputs = [raw_outputs] if isinstance(raw_outputs, str) else list(raw_outputs)
+    selected = tuple(e for e in candidates if _expose_id(e) in outputs) if outputs else candidates
+    if outputs:
+        picked = f"its outputs {outputs} name {len(selected) or 'none'} of the"
+    else:
+        picked = f"it declares no outputs, and the contract has {len(candidates)}"
+    picked += f" Iceberg sink exposes {_described(candidates)}"
+    if outputs:
+        writes = f"the exposes its outputs {outputs} name, {_described(selected)},"
+    else:
+        writes = f"the contract's Iceberg sink exposes, {_described(selected)},"
+
+    if not namespace:
+        if len(selected) == 1:
+            return selected, None
+        return (), (
+            f"{head}: {picked}; a derived Kafka Connect sink writes one expose (one "
+            "iceberg.tables entry). List exactly one of them in the build's outputs, split "
+            "the build into one build per expose, or hand-write the sink config "
+            "(properties.kafka-connect.sink_connector_config)"
+        )
+
+    remedy = "hand-write the sink config (properties.debezium.server.sink.config)"
+    if not selected:
+        return (), (
+            f"{head}: {picked}; a derived Debezium Server sink writes the exposes the "
+            f"build's outputs name. List them in the build's outputs, or {remedy}"
+        )
+    databases = sorted({str(_expose_database(e)) for e in selected})
+    if len(databases) > 1:
+        return (), (
+            f"{head}: a derived Debezium Server sink writes every captured table under one "
+            f"table-namespace, but {writes} sit in the databases {databases}. Give them one "
+            f"binding.location.database (location.dataset on GCP), split the build into one "
+            f"build per database, or {remedy}"
+        )
+    differs = _catalog_differences(selected)
+    derived = _derived_warehouses(selected) if differs == ["warehouse"] else {}
+    if derived:
+        kind = resolve_iceberg_catalog(selected[0].get("binding") or {}).kind
+        return (), (
+            f"{head}: a derived Debezium Server sink writes every table through one {kind} "
+            f"catalog warehouse, and the catalog creates a missing table under that "
+            f"warehouse ({_BUCKET_WAREHOUSE_LAYOUT[kind]}). But {writes} derive different "
+            f"warehouses from binding.location.bucket and path ({derived}): each is that "
+            f"expose's own table prefix, so one expose's tables would be created inside "
+            f"another expose's prefix. Set one binding.location.warehouse on them, split the "
+            f"build into one build per expose, or {remedy}"
+        )
+    if differs:
+        return (), (
+            f"{head}: a derived Debezium Server sink writes through one catalog, but {writes} "
+            f"resolve to different catalogs (their {', '.join(differs)} differ). Give them one "
+            f"catalog, split the build into one build per catalog, or {remedy}"
+        )
+    return selected, None
+
+
+#: The binding setting each :class:`ResolvedIcebergCatalog` catalog field is
+#: resolved from, for the messages.
+_CATALOG_FIELD_SOURCES: Mapping[str, str] = MappingProxyType(
+    {
+        "kind": "catalog",
+        "catalog_type": "catalog",
+        "catalog_impl": "catalog",
+        "uri": "uri",
+        "warehouse": "warehouse",
+        "io_impl": "warehouse",
+        "region": "region",
+        "extra_catalog_props": "catalog properties",
+    }
+)
+
+#: The binding setting each catalog-specific property is resolved from.
+_CATALOG_PROP_SOURCES: Mapping[str, str] = MappingProxyType(
+    {BIGQUERY_PROJECT_ID: "project", BIGQUERY_LOCATION: "region"}
+)
+
+
+def _catalog_differences(exposes: Tuple[Mapping[str, Any], ...]) -> list[str]:
+    """The catalog settings on which ``exposes`` resolve differently, or ``[]``.
+
+    Compares every :class:`ResolvedIcebergCatalog` field except the table
+    identity and the per-table write defaults. A Glue warehouse is per table
+    too (``get_iceberg_warehouse`` derives ``s3://{bucket}/{database}/{table}/``),
+    while a REST catalog's warehouse is the catalog's name. A DynamoDB or JDBC
+    warehouse derived from ``location.bucket`` (:func:`_bucket_warehouse`) is
+    compared whole: the catalog creates every missing table under the one
+    warehouse the sink is given, so it is not a per-table prefix.
+    """
+    from dataclasses import fields as dataclass_fields
+
+    resolved = [resolve_iceberg_catalog(e.get("binding") or {}) for e in exposes]
+    if len(resolved) < 2:
+        return []
+    per_table = {"fq_table", "id_columns", "partition_by"}
+    if all(r.catalog_impl == GLUE_CATALOG_IMPL for r in resolved):
+        per_table.add("warehouse")
+    differs: list[str] = []
+    for f in dataclass_fields(ResolvedIcebergCatalog):
+        if f.name in per_table:
+            continue
+        if f.name == "extra_catalog_props":
+            # Named by the binding setting each property comes from.
+            props = sorted({k for r in resolved for k in r.extra_catalog_props})
+            sources = [
+                _CATALOG_PROP_SOURCES.get(k, "catalog properties")
+                for k in props
+                if any(
+                    r.extra_catalog_props.get(k) != resolved[0].extra_catalog_props.get(k)
+                    for r in resolved[1:]
+                )
+            ]
+        elif any(getattr(r, f.name) != getattr(resolved[0], f.name) for r in resolved[1:]):
+            sources = [_CATALOG_FIELD_SOURCES.get(f.name, f.name)]
+        else:
+            sources = []
+        differs.extend(s for s in dict.fromkeys(sources) if s not in differs)
+    return differs
+
+
+#: Where a catalog that is given a warehouse creates a table it does not have
+#: (apache-iceberg-1.10.0: aws/.../dynamodb/DynamoDbCatalog.java:163-186, for
+#: a namespace with no ``location`` property; core/.../jdbc/JdbcCatalog.java:
+#: 282-284 and 521-526). Both strip the warehouse's trailing slash.
+_BUCKET_WAREHOUSE_LAYOUT: Mapping[str, str] = MappingProxyType(
+    {
+        "dynamodb": "<warehouse>/<namespace>.db/<table>",
+        "jdbc": "<warehouse>/<namespace>/<table>",
+    }
+)
+
+
+def _derived_warehouses(exposes: Tuple[Mapping[str, Any], ...]) -> Dict[str, str]:
+    """``{exposeId: warehouse}`` when ``exposes`` are one DynamoDB or JDBC kind
+    whose warehouses :func:`_bucket_warehouse` derives (no
+    ``location.warehouse``) and differ, else ``{}``."""
+    resolved = [resolve_iceberg_catalog(e.get("binding") or {}) for e in exposes]
+    kinds = {r.kind for r in resolved}
+    if len(kinds) != 1 or not kinds <= BUCKET_WAREHOUSE_KINDS:
+        return {}
+    if any(
+        str(((e.get("binding") or {}).get("location") or {}).get("warehouse") or "").strip()
+        for e in exposes
+    ):
+        return {}
+    if len({r.warehouse for r in resolved}) < 2:
+        return {}
+    return {str(_expose_id(e)): r.warehouse for e, r in zip(exposes, resolved, strict=True)}
 
 
 #: Object-store URI schemes, and the Iceberg ``FileIO`` each one needs. THE one
@@ -380,10 +631,15 @@ def resolve_iceberg_catalog(
 
     ``account_ref`` feeds the warehouse bucket fallback on the Glue path (a
     concrete account id at connector-config time). REST catalogs take an explicit
-    ``uri`` + ``warehouse`` (catalog name) and don't use it.
+    ``uri`` + ``warehouse`` (catalog name) and don't use it. DynamoDB and JDBC
+    take ``location.warehouse``, else derive one from an explicit
+    ``location.bucket`` (:data:`BUCKET_WAREHOUSE_KINDS`); BigQuery takes the
+    ``gs://`` URI :func:`iceberg_storage_uri` gives for the bucket with its
+    ``{{ env.* }}`` templates rendered, plus ``location.project``
+    and ``location.region`` as its own catalog properties.
     """
     loc = binding.get("location") or {}
-    database = loc.get("database") or binding.get("database")
+    database = iceberg_namespace(binding) or None
     table = loc.get("table") or binding.get("table")
     fq_table = f"{database}.{table}"
     kind = iceberg_catalog_kind(binding, sink)
@@ -410,7 +666,26 @@ def resolve_iceberg_catalog(
     # unknown kind keeps the historic REST fallback, and ``fluid validate``
     # refuses it). The FileIO follows the WAREHOUSE scheme so GCS (gs://) and
     # ADLS (abfss://) work, not just S3 (RFC §6.3 — PR7's REST + GCP profiles).
-    warehouse = loc.get("warehouse") or ""
+    warehouse = str(loc.get("warehouse") or "").strip()
+    region = loc.get("region")
+    extra: Dict[str, str] = {}
+    if kind == "bigquery":
+        # The gs:// storage dbt-bigquery's ``external_volume`` and the GCP IaC
+        # use, or none, with the bucket's ``{{ env.* }}`` templates rendered:
+        # a bucket that does not resolve here derives none. ``client.region``
+        # is an AWS client property, so the region goes to the catalog's own
+        # location key instead.
+        rendered = {**loc, "bucket": _rendered_bucket(loc)}
+        warehouse = iceberg_storage_uri({"location": rendered}, scheme="gs")
+        project = str(loc.get("project") or "").strip()
+        if project:
+            extra[BIGQUERY_PROJECT_ID] = project
+        location = str(region or "").strip()
+        if location:
+            extra[BIGQUERY_LOCATION] = location
+        region = None
+    elif not warehouse and kind in BUCKET_WAREHOUSE_KINDS:
+        warehouse = _bucket_warehouse(binding)
     return ResolvedIcebergCatalog(
         catalog_type=info.runtime_type or kind,
         warehouse=warehouse,
@@ -418,11 +693,85 @@ def resolve_iceberg_catalog(
         catalog_impl=info.catalog_impl,
         uri=loc.get("uri"),
         io_impl=_io_impl_for_warehouse(warehouse),
-        region=loc.get("region"),
+        region=region,
         id_columns=id_columns,
         partition_by=partition_by,
+        extra_catalog_props=extra,
         kind=kind,
     )
+
+
+def _bucket_warehouse(binding: Mapping[str, Any]) -> str:
+    """The object-store warehouse an explicit ``location.bucket`` names, or ``""``.
+
+    ``<scheme>://<bucket>/<path>``, with the bucket and path normalised the way
+    the Glue row's :func:`get_iceberg_warehouse` normalises them (``path``
+    defaults to ``<database>/<table>/``). The scheme follows the platform:
+    ``s3`` on AWS, ``gs`` on GCP; any other platform derives nothing. A
+    missing bucket, or one :func:`_rendered_bucket` cannot render, derives
+    nothing either, rather than the Glue row's account-derived fallback bucket.
+    """
+    from ..iac.provider_match import canonical_cloud
+
+    loc = binding.get("location") or {}
+    scheme = _BUCKET_WAREHOUSE_SCHEMES.get(canonical_cloud(binding.get("platform")))
+    bucket = _rendered_bucket(loc)
+    if not scheme or not bucket:
+        return ""
+    _bucket, path = normalize_location(loc, account_ref="")
+    return f"{scheme}://{bucket}/{path}"
+
+
+def _rendered_bucket(loc: Mapping[str, Any]) -> str:
+    """``location.bucket`` with its ``{{ env.* }}`` templates rendered, or ``""``.
+
+    ``""`` when the bucket is absent, names a variable that is unset or empty
+    in this process's environment, or holds a template that is not
+    ``{{ env.* }}``. An empty variable counts as unset: rendering it would
+    turn ``acme-{{ env.LAKE_ENV }}-lake`` into ``acme--lake``, a bucket the
+    contract does not name.
+    """
+    raw = str(loc.get("bucket") or "").strip()
+    if not raw or _unset_env_vars(raw) or "{{" in _ENV_TEMPLATE_RE.sub("", raw):
+        return ""
+    return str(resolve_env_templates(raw)).strip()
+
+
+def _unset_env_vars(raw: str) -> Tuple[str, ...]:
+    """The ``{{ env.* }}`` variables ``raw`` names that are unset or empty here."""
+    found = (name.strip() for name in _ENV_TEMPLATE_RE.findall(raw))
+    return tuple(dict.fromkeys(name for name in found if not os.environ.get(name)))
+
+
+def unset_bucket_env_vars(binding: Mapping[str, Any], kind: str) -> Tuple[str, ...]:
+    """The unset or empty variables the ``kind`` sink's warehouse waits on.
+
+    Non-empty when the sink resolver derives ``kind``'s warehouse from
+    ``location.bucket`` and that bucket names ``{{ env.* }}`` variables that
+    are unset or empty in this process's environment: DynamoDB and JDBC on
+    aws or gcp with no ``location.warehouse``, and BigQuery with no
+    scheme-qualified ``location.warehouse``. The bucket is explicit, so the
+    warehouse derives wherever those variables are set, but not here. ``()``
+    when every variable the bucket names has a value, for an absent bucket,
+    another kind or platform, a warehouse the binding sets, or a bucket
+    holding a template that is not ``{{ env.* }}`` (nothing resolves that one).
+    """
+    from ..iac.provider_match import canonical_cloud
+
+    loc = binding.get("location") or {}
+    raw = str(loc.get("bucket") or "")
+    warehouse = str(loc.get("warehouse") or "").strip()
+    if kind in BUCKET_WAREHOUSE_KINDS:
+        reads_bucket = not warehouse and (
+            canonical_cloud(binding.get("platform")) in _BUCKET_WAREHOUSE_SCHEMES
+        )
+    else:
+        # :func:`iceberg_storage_uri` reads the bucket unless the warehouse
+        # carries a scheme.
+        reads_bucket = kind == "bigquery" and not warehouse.startswith(_WAREHOUSE_SCHEMES)
+    if not raw or not reads_bucket or "{{" in _ENV_TEMPLATE_RE.sub("", raw):
+        return ()
+    return _unset_env_vars(raw)
 
 
 # ---------------------------------------------------------------------------
