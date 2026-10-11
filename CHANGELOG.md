@@ -83,8 +83,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalog addresses its warehouse by NAME (`analytics`, or `<project-id>/<name>` on
   Lakekeeper), so `fluid validate` refuses an object-store URI there, and warns when a
   Lakekeeper `uri` does not end in `/catalog`, where Lakekeeper serves its Iceberg REST
-  API. Schema 0.7.6 (preview) accepts `lakekeeper` and `polaris` in `sink.catalog`;
-  0.7.5 is unchanged.
+  API. The refusal reads the warehouse that reaches the sink: `location.warehouse`, or
+  the warehouse an override or a hand-written sink config sets. For `platform: gcp`, the
+  GCP Iceberg check no longer suggests a `gs://` location for these catalogs. Schema
+  0.7.6 (preview) accepts `lakekeeper` and `polaris` in `sink.catalog`; 0.7.5 is
+  unchanged.
 
 ### Changed
 

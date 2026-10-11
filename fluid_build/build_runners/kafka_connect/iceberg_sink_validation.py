@@ -558,14 +558,23 @@ def _check_catalog(
 
     # A name-addressed catalog owns the storage location: handed an s3:// URI
     # as ``warehouse`` it looks up a warehouse literally called that and the
-    # REST client's /v1/config fails before the first commit. HARD.
-    warehouse = loc.get("warehouse")
-    if info.warehouse_is_name and is_object_store_uri(warehouse):
-        errors.append(
-            f"iceberg sink (build {bid!r}): {kind} addresses a warehouse by NAME "
-            '(e.g. "analytics" or "<project-id>/<name>"), not an object-store URI; '
-            f"binding.location.warehouse is {warehouse!r}"
-        )
+    # REST client's /v1/config fails before the first commit. HARD. Read off
+    # the warehouse that reaches the sink: the binding's, else the last
+    # override map that sets one (the runner merges them in that order).
+    if info.warehouse_is_name:
+        key = runtime.type_key[: -len("type")] + "warehouse"
+        source, warehouse = "binding.location.warehouse", loc.get("warehouse")
+        for label, mapping in runtime.overrides:
+            if mapping.get(key):
+                source, warehouse = f"{label} {key}", mapping.get(key)
+        if is_object_store_uri(warehouse):
+            example = (
+                '"analytics" or "<project-id>/<name>"' if kind == "lakekeeper" else '"analytics"'
+            )
+            errors.append(
+                f"iceberg sink (build {bid!r}): {kind} addresses a warehouse by NAME "
+                f"(e.g. {example}), not an object-store URI; {source} is {warehouse!r}"
+            )
 
     # Lakekeeper mounts the Iceberg REST API under ``/catalog``; a bare host
     # sends the client's GET /v1/config to a path that does not serve it.

@@ -348,12 +348,19 @@ def _check_gcp(contract: Mapping[str, Any], errors: List[str], warnings: List[st
             if is_object_store_uri(warehouse) and not warehouse.lower().startswith(
                 ("gs://", "gcs://")
             ):
+                # A catalog that addresses its warehouse by name takes only the
+                # name: the streaming sink check refuses a gs:// URI there too.
+                alternative = (
+                    ""
+                    if catalog_kind_info(kind).warehouse_is_name
+                    else " or a gs://<bucket>/<optional-path> location FLUID creates the "
+                    "bucket for"
+                )
                 errors.append(
                     f"expose '{eid}': binding.location.warehouse is '{warehouse}', "
                     "which is not Google Cloud Storage. A platform: gcp Iceberg table "
                     f"in a {kind} catalog takes the catalog's warehouse name (the "
-                    "catalog owns the storage) or a gs://<bucket>/<optional-path> "
-                    "location FLUID creates the bucket for."
+                    f"catalog owns the storage){alternative}."
                 )
         elif warehouse:
             errors.append(

@@ -581,7 +581,7 @@ _OBJECT_STORE_FILE_IO = (
 
 def is_object_store_uri(value: Any) -> bool:
     """Does ``value`` carry an object-store scheme (s3://, gs://, abfss://...)?"""
-    return _io_impl_for_warehouse(str(value or "")) is not None
+    return _io_impl_for_warehouse(str(value or "").strip()) is not None
 
 
 def _io_impl_for_warehouse(warehouse: str) -> Optional[str]:
