@@ -314,9 +314,11 @@ class TestAwsPlannedActions:
             [
                 {"op": "lambda.ensure_function", "function_name": "f", "code": {}},
                 {"op": "eventbridge.ensure_schedule", "schedule_name": "s"},
-                {"op": "mwaa.ensure_environment", "environment_name": "e"},
+                {"op": "lambda.add_permission", "function_name": "f"},
             ],
         )
+        # mwaa.ensure_environment used to be skipped here too; it is now
+        # refused (tests/iac/test_iac_aws_unemitted_ops.py).
         assert res == {}
 
     def test_no_actions_emits_no_planned_resources(self):

@@ -49,10 +49,11 @@ def _aws_contract():
 
 
 # Native plan that fully matches the AWS contract above.
+# The AWS planner's own op names: the emitter refuses an op it does not know.
 _AWS_NATIVE_MATCH = [
     {"op": "glue.ensure_database", "database": "sales"},
-    {"op": "glue.create_table", "table": "orders"},
-    {"op": "s3.create_bucket", "bucket": "lake"},
+    {"op": "glue.ensure_table", "table": "orders"},
+    {"op": "s3.ensure_bucket", "bucket": "lake"},
 ]
 
 

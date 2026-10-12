@@ -246,7 +246,12 @@ self-skipping when `tofu` or the gcloud emulator is absent.
   What is *not* mapped is genuinely imperative — an R8 boundary, not an emitter
   gap:
   - **AWS MWAA** (`aws_mwaa_environment`) — needs VPC `network_configuration`
-    (subnets, security groups) the contract does not carry.
+    (subnets, security groups) the contract does not carry. A planned
+    `mwaa.ensure_environment` is refused (`unsupported_binding`, kind
+    `mwaa-environment-not-emitted`) rather than skipped, and so is a contract
+    that asks for one when no AWS planner produced the op (the planner failed,
+    or another cloud's planner ran under `--provider aws`); an op the emitter
+    does not translate is named in a warning.
   - **Non-SQL Snowflake procedures / UDFs** (Python / Java / Scala) — need
     runtime / handler / package config the contract does not carry.
   - **`composer.trigger_dag`**, **Athena query execution**, **Redshift table

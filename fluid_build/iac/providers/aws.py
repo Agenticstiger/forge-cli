@@ -54,7 +54,18 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import yaml
 
@@ -480,7 +491,7 @@ class AwsIacPlugin:
             _emit_lf_bucket_policy(resources, bucket_policy)
         # Glue ETL jobs / Step Functions / the Lambda schedule path —
         # the planner's build & orchestration ops.
-        _emit_from_actions(resources, actions, cid)
+        _emit_from_actions(resources, actions, cid, contract)
         # Second pass — wire ordering edges that the literal-string fields
         # on Redshift external schemas / planned-action resources don't
         # carry by value. See :func:`_wire_aws_deps`.
@@ -1100,36 +1111,239 @@ def _emit_kinesis(
     )
 
 
+#: Planned ops ``_emit_from_actions`` leaves alone because something else owns
+#: them: the data plane :meth:`AwsIacPlugin.emit` derives from ``exposes[]``
+#: (see :class:`~fluid_build.iac.base.IacProviderPlugin`), the build steps the
+#: build runners execute rather than provision, and the pre-replace backup copy
+#: (``aws.s3.copy_prefix``, planned only for a destructive apply mode) whose
+#: ``rollback_snapshot`` marker the apply's rollback writer records.
+_OPS_OWNED_ELSEWHERE = frozenset(
+    {
+        "s3.ensure_bucket",
+        "glue.ensure_database",
+        "glue.ensure_table",
+        "glue.ensure_iceberg_table",
+        "dbt.prepare_profile",
+        "athena.execute_query",
+        "aws.s3.copy_prefix",
+    }
+)
+
+#: Ops the AWS planner emits that nothing in the OpenTofu engine provisions
+#: yet. Each is named in a warning on every emit rather than refused: refusing
+#: them would fail contracts the MWAA fix is not about, and dropping them
+#: without a word is the defect this list exists to end.
+#:
+#: Every op the AWS planner can produce is in :data:`_ACTION_EMITTERS`, in
+#: :data:`_OPS_OWNED_ELSEWHERE`, here, or is ``mwaa.ensure_environment``;
+#: ``tests/iac/test_iac_aws_unemitted_ops.py`` fails when one is not.
+_OPS_NOT_YET_EMITTED = frozenset(
+    {
+        "iam.bind_glue_database",
+        "iam.bind_s3_bucket",
+        "athena.create_view",
+        "redshift.ensure_schema",
+        "redshift.ensure_table",
+        "events.ensure_schedule",
+    }
+)
+
+#: The op the AWS schedule planner (``providers/aws/plan/schedule.py``) plans
+#: for ``orchestration.engine`` airflow or mwaa with an ``orchestration.schedule``.
+_MWAA_OP = "mwaa.ensure_environment"
+
+
+# The directory-name rule ``fluid schedule-sync`` applies to product scopes
+# (cli/schedule_sync.py ``_SCOPE_NAME_RE``).
+_PRODUCT_DIR_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}")
+
+
+class _MwaaRequest(NamedTuple):
+    """What a contract that asks for MWAA says about the environment."""
+
+    #: ``orchestration.mwaa.environmentName``, else ``mwaa-<contract id>``.
+    name: str
+    #: True when the contract names it: the user most likely runs it already.
+    named: bool
+    #: ``orchestration.mwaa.dagS3Path``: where the environment reads DAGs.
+    dags: Optional[str]
+    #: The contract id when it is a valid ``schedule-sync`` product directory
+    #: name, else ``None``. ``schedule-sync`` (product delete scope, its
+    #: default) refuses DAGs that are not inside a ``<product-id>/`` directory.
+    product: Optional[str] = None
+
+
+def _mwaa_requested(contract: Mapping[str, Any]) -> Optional[_MwaaRequest]:
+    """The MWAA environment the contract asks for, or ``None``.
+
+    The same test the AWS schedule planner applies before it plans
+    :data:`_MWAA_OP` (``_plan_scheduled_execution``: a schedule, and the
+    engine lower-cased, unstripped, is ``airflow`` or ``mwaa``), and the same
+    name it gives the environment.
+    """
+    orchestration = contract.get("orchestration")
+    if not isinstance(orchestration, Mapping) or not orchestration.get("schedule"):
+        return None
+    engine = orchestration.get("engine", "")
+    if not isinstance(engine, str) or engine.lower() not in ("airflow", "mwaa"):
+        return None
+    mwaa = orchestration.get("mwaa")
+    mwaa = mwaa if isinstance(mwaa, Mapping) else {}
+    named = mwaa.get("environmentName")
+    dags = mwaa.get("dagS3Path")
+    contract_id = str(contract.get("id") or "")
+    return _MwaaRequest(
+        name=str(named) if named else f"mwaa-{contract.get('id', 'unknown')}",
+        named=bool(named),
+        dags=str(dags) if dags else None,
+        product=contract_id if _PRODUCT_DIR_RE.fullmatch(contract_id) else None,
+    )
+
+
+def _refuse_mwaa_environment(name: Any, request: Optional[_MwaaRequest]) -> UnsupportedBindingError:
+    """The contract asks for an MWAA environment, and OpenTofu cannot create it.
+
+    ``aws_mwaa_environment`` requires ``network_configuration`` (two private
+    ``subnet_ids`` and ``security_group_ids``), and the contract carries no
+    network. Skipping the op let ``fluid apply`` report success with no
+    Airflow environment, so it is refused instead.
+
+    The way to keep Airflow is the Path-A push: ``fluid schedule-sync
+    --scheduler mwaa`` copies the DAGs to the S3 folder the environment reads
+    (``--destination``; its MWAA dispatch reads no ``--environment-name``),
+    filled in from ``orchestration.mwaa.dagS3Path`` when the contract gives it.
+    """
+    shown = name if name else "?"
+    named = bool(request and request.named and request.name == name)
+    dags = request.dags if request else None
+    # Printed as-is in a command line, so a control character in the
+    # contract's path falls back to the placeholder rather than reach the terminal.
+    dest = dags if dags and dags.isprintable() else "s3://<the environment's DAG bucket>/dags/"
+    # schedule-sync mirrors each top-level directory of --dags-dir into the
+    # same-named folder of the destination, and refuses loose files, so the DAG
+    # is generated into dags/<product-id>/ for the pair to run as printed.
+    product = request.product if request and request.product else "<product-id>"
+    push = (
+        f"`fluid generate schedule --scheduler airflow --output dags/{product}` and "
+        f"`fluid schedule-sync --scheduler mwaa --dags-dir dags --destination {dest}`"
+    )
+    without = (
+        "fluid apply still plans the environment while the contract has "
+        "orchestration.schedule, so apply a copy of the contract without it."
+    )
+    if named:
+        keep_airflow = (
+            f"Your contract names the existing MWAA environment {shown!r}: push this "
+            f"contract's DAG to it with {push}. {without}"
+        )
+    else:
+        keep_airflow = (
+            f"To keep Airflow, create the MWAA environment {shown!r} yourself (it needs your "
+            f"VPC), then push this contract's DAG to it with {push}. {without}"
+        )
+    return UnsupportedBindingError(
+        "mwaa-environment-not-emitted",
+        f"The contract asks for the MWAA environment {shown!r} (orchestration.engine airflow "
+        "or mwaa with orchestration.schedule), but the OpenTofu engine cannot create an "
+        "aws_mwaa_environment: it needs a VPC network_configuration (subnets and security "
+        "groups) that the contract does not carry. Applying would report success with no "
+        "Airflow environment, so nothing was applied.",
+        (
+            "To schedule without Airflow, set orchestration.engine to 'none' and keep "
+            "orchestration.schedule: fluid apply then creates an EventBridge Scheduler "
+            "schedule.",
+            keep_airflow,
+        ),
+    )
+
+
 def _emit_from_actions(
-    resources: Dict[str, Any], actions: Iterable[Mapping[str, Any]], cid: str
+    resources: Dict[str, Any],
+    actions: Iterable[Mapping[str, Any]],
+    cid: str,
+    contract: Mapping[str, Any],
 ) -> None:
     """Translate the planner's build / orchestration ops into ``hashicorp/aws`` resources.
 
     Covers Glue ETL jobs, Step Functions, and the Lambda schedule / event
-    path — inline Lambda source is zipped by ``data.archive_file`` (see
-    :meth:`AwsIacPlugin.emit_data`). MWAA is still skipped: ``aws_mwaa_environment``
-    needs VPC ``network_configuration`` the contract does not carry.
+    path (:data:`_ACTION_EMITTERS`) — inline Lambda source is zipped by
+    ``data.archive_file`` (see :meth:`AwsIacPlugin.emit_data`). An op with no
+    emitter goes to :func:`_account_for_unemitted_op`, so no planned op is
+    dropped without a word.
+
+    A contract that asks for MWAA is refused whatever ``actions`` holds, so
+    the refusal follows the contract, not the planner that happened to run.
+    ``actions`` may lack the environment op because no AWS planner produced
+    it: ``native_actions`` in ``cli/generate_iac.py`` passes ``[]`` when the
+    planner could not run or failed on an unrelated field (it logs that at
+    DEBUG), and passes another cloud's ops when a multi-cloud contract's first
+    expose is not on AWS and the user chose ``--provider aws`` (or
+    ``FLUID_PROVIDER`` names another planner). Either way the module would
+    lack the environment as silently as before. When the op is present, its
+    ``environment_name`` is the one the refusal names.
     """
-    for action in actions or []:
-        if not isinstance(action, Mapping):
-            continue
+    planned = [action for action in actions or [] if isinstance(action, Mapping)]
+    requested = _mwaa_requested(contract)
+    if requested is not None and not any(action.get("op") == _MWAA_OP for action in planned):
+        raise _refuse_mwaa_environment(requested.name, requested)
+    for action in planned:
         op = action.get("op")
-        if op == "glue.ensure_job":
-            _emit_glue_job(resources, action, cid)
-        elif op == "stepfunctions.ensure_state_machine":
-            _emit_state_machine(resources, action, cid)
-        elif op == "lambda.ensure_function":
-            _emit_lambda_function(resources, action, cid)
-        elif op == "lambda.add_permission":
-            _emit_lambda_permission(resources, action, cid)
-        elif op == "lambda.create_event_source_mapping":
-            _emit_event_source_mapping(resources, action, cid)
-        elif op == "eventbridge.ensure_schedule":
-            _emit_scheduler_schedule(resources, action, cid)
-        elif op == "eventbridge.ensure_rule":
-            _emit_event_rule(resources, action, cid)
-        elif op == "s3.ensure_notification":
-            _emit_s3_notification(resources, action, cid)
+        emitter = _ACTION_EMITTERS.get(op) if isinstance(op, str) else None
+        if emitter is not None:
+            emitter(resources, action, cid)
+        else:
+            _account_for_unemitted_op(action, requested)
+
+
+def _account_for_unemitted_op(action: Mapping[str, Any], requested: Optional[_MwaaRequest]) -> None:
+    """Pass, refuse, or name in a warning a planned op the emitter has no translation for.
+
+    A data-plane or build op owned elsewhere (``_OPS_OWNED_ELSEWHERE``) passes.
+    :data:`_MWAA_OP` is refused (:func:`_refuse_mwaa_environment`; a contract
+    that asks for it is refused before the loop, in :func:`_emit_from_actions`,
+    so this guards an op handed in without that request). Anything
+    else is named in a warning: a known op nothing provisions yet, an
+    orchestration task, and an op this module does not know. The last is not
+    refused: an AWS planner op cannot reach it unclassified (the planner-
+    vocabulary test sees to that), so what does is another cloud's op, which
+    ``native_actions`` passes when a multi-cloud contract's first expose is not
+    on AWS and the user chose ``--provider aws``, as the ambiguous-provider
+    error tells them to. Refusing it failed the AWS half of every such contract.
+    """
+    op = action.get("op")
+    known = op if isinstance(op, str) else ""
+    # An orchestration.tasks[] step (providers/aws/plan/orchestration.py) is a
+    # task the scheduler runs, in whatever vocabulary the contract wrote: its
+    # ``s3.ensure_bucket`` is not the bucket exposes[] declares.
+    task = isinstance(action.get("orchestration"), Mapping)
+    if known in _OPS_OWNED_ELSEWHERE and not task:
+        return
+    if known == _MWAA_OP:
+        raise _refuse_mwaa_environment(action.get("environment_name"), requested)
+    # Op and id are %r: a task's op and every id come from the contract, and
+    # repr keeps a control character in either out of the terminal.
+    if known in _OPS_NOT_YET_EMITTED:
+        LOG.warning(
+            "aws_planned_op_not_emitted op=%r id=%r: the plan lists it, but the OpenTofu "
+            "engine provisions nothing for it, so fluid apply will not create it",
+            known,
+            action.get("id"),
+        )
+        return
+    if task:
+        LOG.warning(
+            "aws_orchestration_task_not_emitted op=%r id=%r: orchestration tasks run in "
+            "the scheduler, and fluid apply provisions nothing for them",
+            op,
+            action.get("id"),
+        )
+        return
+    LOG.warning(
+        "planned_op_not_emitted op=%r id=%r: the plan lists it, and the AWS OpenTofu "
+        "module has no translation for it, so fluid apply on AWS will not create it",
+        op,
+        action.get("id"),
+    )
 
 
 def _emit_glue_job(resources: Dict[str, Any], action: Mapping[str, Any], cid: str) -> None:
@@ -1392,6 +1606,19 @@ def _emit_s3_notification(resources: Dict[str, Any], action: Mapping[str, Any], 
         safe_ident(f"{cid}_{bucket}_notification"),
         {"bucket": bucket, "lambda_function": [lambda_block]},
     )
+
+
+#: The planned ops this module translates, op -> emitter.
+_ACTION_EMITTERS: Mapping[str, Callable[[Dict[str, Any], Mapping[str, Any], str], None]] = {
+    "glue.ensure_job": _emit_glue_job,
+    "stepfunctions.ensure_state_machine": _emit_state_machine,
+    "lambda.ensure_function": _emit_lambda_function,
+    "lambda.add_permission": _emit_lambda_permission,
+    "lambda.create_event_source_mapping": _emit_event_source_mapping,
+    "eventbridge.ensure_schedule": _emit_scheduler_schedule,
+    "eventbridge.ensure_rule": _emit_event_rule,
+    "s3.ensure_notification": _emit_s3_notification,
+}
 
 
 # ---------------------------------------------------------------------------
