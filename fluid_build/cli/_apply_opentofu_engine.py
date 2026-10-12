@@ -61,8 +61,17 @@ from ._logging import info, warn
 from .generate_iac import _resolve_provider, native_actions
 
 
-def apply_via_opentofu(args, logger: logging.Logger) -> int:
-    """Run ``fluid apply`` through the OpenTofu engine. Returns an exit code."""
+def apply_via_opentofu(
+    args, logger: logging.Logger, contract: Optional[Mapping[str, Any]] = None
+) -> int:
+    """Run ``fluid apply`` through the OpenTofu engine. Returns an exit code.
+
+    ``contract`` is the copy ``fluid apply`` already loaded and schema-gated.
+    When given it is what ``tofu`` applies (its ``{{ env.* }}`` placeholders
+    resolved here) and the file is not re-read, so a source changed after
+    the gate cannot reach ``tofu`` unvalidated. Without it the contract is
+    loaded from ``args.contract``.
+    """
     # Plan-binding verification — must run BEFORE any tofu apply so a
     # tampered plan.json is rejected before infra changes. The native
     # apply path (cli/apply.py::_verify_plan_digests) had this gate; the
@@ -72,7 +81,7 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     # OpenTofu path matches the native path's stage-7 guarantee.
     _verify_plan_binding_for_opentofu(args, logger)
 
-    contract = _load_contract(args, logger)
+    contract = _load_contract(args, logger, contract)
     provider = _resolve_provider(contract, getattr(args, "provider", None) or "auto")
     report = current_report()
     if report is not None:
@@ -640,7 +649,9 @@ def _apply_lineage(contract: Mapping[str, Any], *, provider: str, planned: Mappi
     )
 
 
-def resolve_apply_engine(args, logger: logging.Logger) -> str:
+def resolve_apply_engine(
+    args, logger: logging.Logger, contract: Optional[Mapping[str, Any]] = None
+) -> str:
     """Resolve the apply engine for ``fluid apply`` — automatic, per-provider.
 
     There is no user-facing engine switch: the cloud providers (all cut
@@ -648,11 +659,14 @@ def resolve_apply_engine(args, logger: logging.Logger) -> str:
     keeps its native apply. The per-provider mapping lives in
     ``iac.cutover``. Any failure to classify the contract falls back to
     ``native`` — the safe default.
+
+    ``contract``, when given, is the copy ``fluid apply`` loaded: the engine
+    is chosen from it rather than from a second read of ``args.contract``.
     """
     from fluid_build.iac.cutover import resolve_engine
 
     try:
-        contract = _load_contract(args, logger)
+        contract = _load_contract(args, logger, contract)
         provider = _resolve_provider(contract, getattr(args, "provider", None) or "auto")
     except CLIError as exc:
         # A `--provider` that contradicts the contract's binding is an
@@ -727,14 +741,22 @@ def _verify_plan_binding_for_opentofu(args, logger: logging.Logger) -> None:
         )
 
 
-def _load_contract(args, logger: logging.Logger) -> Dict[str, Any]:
+def _load_contract(
+    args, logger: logging.Logger, loaded: Optional[Mapping[str, Any]] = None
+) -> Dict[str, Any]:
     """Load the contract dict from a ``.fluid.yaml`` file or a ``.json`` plan.
+
+    ``loaded`` is a contract the caller already holds; it is used instead of
+    reading ``args.contract`` (templates are still resolved, on a copy).
 
     ``{{ env.* }}`` placeholders are resolved before the contract reaches the
     emitter — the OpenTofu data-plane is emitted straight from the contract's
     ``exposes[]``, so an unresolved template would otherwise land verbatim in
     the ``.tf.json``.
     """
+    if loaded is not None:
+        resolved: Dict[str, Any] = resolve_env_templates_in_contract(dict(loaded))
+        return resolved
     src = str(args.contract)
     if src.endswith(".json"):
         with open(src, encoding="utf-8") as handle:

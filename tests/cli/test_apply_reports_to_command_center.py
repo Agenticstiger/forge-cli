@@ -175,6 +175,11 @@ def product(tmp_path: Path, monkeypatch) -> Path:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.chdir(tmp_path)
+    # ``fluid apply`` schema-validates on the OpenTofu engine too, and the
+    # fixture's top-level ``version`` (what the run report reads as the
+    # contract version) is not a schema key. These tests cover the report,
+    # not validation, so the pre-apply gate is stood down here.
+    monkeypatch.setattr("fluid_build.cli.apply._gate_contract_for_apply", lambda *a, **k: None)
     (tmp_path / "overlays").mkdir()
     (tmp_path / "overlays" / "gcp.yaml").write_text(yaml.safe_dump(_GCP_OVERLAY), encoding="utf-8")
     contract = tmp_path / "contract.fluid.yaml"

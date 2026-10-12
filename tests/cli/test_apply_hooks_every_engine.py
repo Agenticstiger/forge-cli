@@ -35,13 +35,33 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from fluid_build.cli import apply as apply_cli
 
 logger = logging.getLogger("test_apply_hooks_every_engine")
 
-_CONTRACT = {"id": "silver.community.smoke_v1", "name": "Smoke"}
+# Schema-valid: ``fluid apply`` validates the contract on every engine before
+# any hook or ``tofu`` runs, so an invalid fixture would never reach a hook.
+_CONTRACT = {
+    "fluidVersion": "0.7.5",
+    "kind": "DataProduct",
+    "id": "silver.community.smoke_v1",
+    "name": "Smoke",
+    "metadata": {"owner": {"team": "community"}},
+    "exposes": [
+        {
+            "exposeId": "rows",
+            "kind": "table",
+            "binding": {
+                "platform": "local",
+                "format": "parquet",
+                "location": {"path": "./out/rows.parquet"},
+            },
+            "contract": {"schema": [{"name": "id", "type": "INTEGER"}]},
+        }
+    ],
+}
 
 
 def _args(contract: str, **overrides) -> argparse.Namespace:
@@ -186,47 +206,43 @@ class TestApplyHooksOnOpenTofuEngine:
 
 
 class TestRunApplyHooksForSource:
-    """``_run_apply_hooks_for_source`` loads both documented apply inputs."""
+    """``_run_apply_hooks_for_source`` runs the hooks on the contract it is
+    given (the copy ``run()`` loaded and gated), anchored at the source's
+    directory, for both documented apply inputs."""
 
-    def test_loads_a_yaml_contract(self, tmp_path):
+    def test_yaml_source(self, tmp_path):
         contract_file = _write_yaml(tmp_path)
         with (
             patch(
                 "fluid_build.cli.apply.load_contract_with_overlay",
-                return_value=dict(_CONTRACT),
+                side_effect=AssertionError("re-read"),
             ),
             patch("fluid_build.cli.apply._run_apply_hooks", return_value=0) as hooks,
         ):
-            rc = apply_cli._run_apply_hooks_for_source(_args(str(contract_file)), logger)
+            rc = apply_cli._run_apply_hooks_for_source(
+                _args(str(contract_file)), dict(_CONTRACT), logger
+            )
 
         assert rc == 0
         assert hooks.call_args.args[0] == _CONTRACT
         assert hooks.call_args.args[1] == contract_file.resolve().parent
 
-    def test_loads_the_contract_embedded_in_a_plan_json(self, tmp_path):
+    def test_plan_json_source(self, tmp_path):
         plan_file = tmp_path / "plan.json"
-        plan_file.write_text(json.dumps({"contract": _CONTRACT}), encoding="utf-8")
+        plan_file.write_text(json.dumps({"contract": {"id": "on-disk"}}), encoding="utf-8")
         with patch("fluid_build.cli.apply._run_apply_hooks", return_value=0) as hooks:
-            rc = apply_cli._run_apply_hooks_for_source(_args(str(plan_file)), logger)
+            rc = apply_cli._run_apply_hooks_for_source(
+                _args(str(plan_file)), dict(_CONTRACT), logger
+            )
 
         assert rc == 0
         assert hooks.call_args.args[0] == _CONTRACT
+        assert hooks.call_args.args[1] == tmp_path.resolve()
 
-    def test_unloadable_source_defers_to_the_engine(self, tmp_path):
-        """A source the loader rejects is the engine's error to report — the
-        hook adapter must not mask it with its own non-zero exit."""
-        missing = tmp_path / "nope.fluid.yaml"
-        with patch(
-            "fluid_build.cli.apply.load_contract_with_overlay",
-            side_effect=OSError("boom"),
-        ):
-            rc = apply_cli._run_apply_hooks_for_source(_args(str(missing)), logger)
-        assert rc == 0
-
-    def test_plan_json_without_an_embedded_contract_is_skipped(self, tmp_path):
-        plan_file = tmp_path / "plan.json"
-        plan_file.write_text(json.dumps({"actions": []}), encoding="utf-8")
-        with patch("fluid_build.cli.apply._run_apply_hooks", new=Mock()) as hooks:
-            rc = apply_cli._run_apply_hooks_for_source(_args(str(plan_file)), logger)
-        assert rc == 0
-        hooks.assert_not_called()
+    def test_a_reporting_hook_is_returned(self, tmp_path):
+        contract_file = _write_yaml(tmp_path)
+        with patch("fluid_build.cli.apply._run_apply_hooks", return_value=1):
+            rc = apply_cli._run_apply_hooks_for_source(
+                _args(str(contract_file)), dict(_CONTRACT), logger
+            )
+        assert rc == 1
