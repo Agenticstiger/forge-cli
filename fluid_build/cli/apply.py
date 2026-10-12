@@ -324,6 +324,49 @@ def _gate_contract_for_apply(contract: Dict[str, Any], logger: logging.Logger) -
     _gate_contract_for_plan_or_apply(contract, logger, command="apply")
 
 
+def _gate_apply_source(
+    args, verified_plan_data: Optional[Dict[str, Any]], logger: logging.Logger
+) -> Dict[str, Any]:
+    """Load the contract ``fluid apply`` was given and run the pre-apply gate.
+
+    Runs once per apply, above the engine dispatch, so the OpenTofu engine
+    and the build-augmented modes (whose early returns sit above the native
+    provider path) validate exactly what the native path does.
+
+    For a ``plan.json`` the contract is the digest-attested copy embedded in
+    ``verified_plan_data`` (never a re-read of the file). A plan with no
+    embedded contract returns ``{}`` unvalidated: the engine that needs one
+    owns that error (``opentofu_engine_no_contract``). Otherwise the contract
+    is loaded with its ``--env`` overlay, as the native path always did.
+
+    Returns the gated contract, so the native path applies what was validated.
+
+    Raises:
+        CLIError: ``contract_version_unsupported``, ``apply_contract_invalid``,
+            or ``apply_execution_failed`` when the source cannot be loaded.
+    """
+    if verified_plan_data is not None:
+        embedded = verified_plan_data.get("contract")
+        if not isinstance(embedded, dict) or not embedded:
+            return {}
+        contract: Dict[str, Any] = embedded
+    else:
+        logger.info(f"Loading FLUID contract: {args.contract}")
+        try:
+            contract = load_contract_with_overlay(args.contract, args.env, logger)
+        except CLIError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — mapped as the native path always did
+            from fluid_build.cli._errors import FluidUserError
+
+            if isinstance(exc, FluidUserError):
+                raise
+            logger.error(f"💥 Unexpected error during execution: {exc}")
+            raise CLIError(1, "apply_execution_failed", {"error": str(exc)}) from exc
+    _gate_contract_for_apply(contract, logger)
+    return contract
+
+
 # ==========================================
 # CLI Command Registration & Execution
 # ==========================================
@@ -1729,6 +1772,27 @@ def run(args, logger: logging.Logger) -> int:
             {"mode": resolved_mode.value, "env": args.env, "reason": gate.reason},
         )
 
+    # --- Pre-apply contract gate (11-stage pipeline stage 7) ---
+    # Pre-0.7 rejection + JSON-schema validation, the gate ``fluid plan`` and
+    # ``fluid validate`` run. Like the data-loss gate it sits above EVERY
+    # early return: the OpenTofu branch (aws / gcp / snowflake / confluent /
+    # IaC plugin clouds) and both engines' ``needs_build`` returns used to
+    # skip it, so a schema-invalid contract reached ``tofu`` or the build
+    # runner and could exit 0. One call per run; the native path below
+    # applies the contract it returns. Failures are logged and exit as they
+    # did when the gate lived inside the native ``try`` block below.
+    try:
+        gated_contract = _gate_apply_source(args, verified_plan_data, logger)
+    except CLIError:
+        duration = time.time() - start_time
+        log_operation_failure(logger, "apply_contract", error="CLI error", duration=duration)
+        raise
+    except KeyboardInterrupt:
+        duration = time.time() - start_time
+        log_operation_failure(logger, "apply_contract", error="User interrupted", duration=duration)
+        logger.warning("⚠️ Execution interrupted by user")
+        return 130
+
     if apply_engine == "opentofu":
         # Apply-time plugin hooks run on EVERY engine. They used to be
         # invoked only from the native path's YAML branch, several hundred
@@ -1793,16 +1857,9 @@ def run(args, logger: logging.Logger) -> int:
             plan_data = verified_plan_data
 
             contract = plan_data.get("contract", {})
-
-            # --- Pre-apply contract gate (embedded-contract path) ---------
-            # A pre-built plan.json embeds the full contract. The plan-binding
-            # digest gate above proves the plan wasn't tampered with, but a
-            # plan minted from a pre-0.7 / schema-invalid contract by an
-            # older fluid (before the plan-time gate existed) could still
-            # reach apply. Re-run the same gates on the embedded contract so
-            # apply never executes DDL for an unsupported / broken contract.
-            if isinstance(contract, dict) and contract:
-                _gate_contract_for_apply(contract, logger)
+            # The embedded contract was schema-gated by ``_gate_apply_source``
+            # above the engine dispatch (a plan minted by an older fluid,
+            # before the plan-time gate existed, is still refused there).
 
             # --- Plan-format detection ---
             # Two plan.json shapes exist today:
@@ -1834,17 +1891,9 @@ def run(args, logger: logging.Logger) -> int:
                 plan = None
                 use_simple_mode = True
         else:
-            # Load contract
-            logger.info(f"Loading FLUID contract: {args.contract}")
-            contract = load_contract_with_overlay(args.contract, args.env, logger)
-
-            # --- Pre-apply contract gate ----------------------------------
-            # ``fluid apply`` used to apply ANY contract — including a
-            # pre-0.7 end-of-life contract or a structurally-broken one —
-            # with exit 0. Run the same gates ``fluid validate`` runs
-            # (pre-0.7 rejection + JSON-schema validation) BEFORE any DDL.
-            # A failure raises ``CLIError`` → non-zero exit, no apply.
-            _gate_contract_for_apply(contract, logger)
+            # Loaded and schema-gated by ``_gate_apply_source`` above the
+            # engine dispatch; apply exactly that contract, never a re-read.
+            contract = gated_contract
 
             # Run plugin-registered apply-time hooks (entry-point group
             # ``fluid_build.apply_hooks``). Plugins can use these to verify

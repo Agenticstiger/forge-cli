@@ -41,7 +41,27 @@ from fluid_build.cli import apply as apply_cli
 
 logger = logging.getLogger("test_apply_hooks_every_engine")
 
-_CONTRACT = {"id": "silver.community.smoke_v1", "name": "Smoke"}
+# Schema-valid: ``fluid apply`` validates the contract on every engine before
+# any hook or ``tofu`` runs, so an invalid fixture would never reach a hook.
+_CONTRACT = {
+    "fluidVersion": "0.7.5",
+    "kind": "DataProduct",
+    "id": "silver.community.smoke_v1",
+    "name": "Smoke",
+    "metadata": {"owner": {"team": "community"}},
+    "exposes": [
+        {
+            "exposeId": "rows",
+            "kind": "table",
+            "binding": {
+                "platform": "local",
+                "format": "parquet",
+                "location": {"path": "./out/rows.parquet"},
+            },
+            "contract": {"schema": [{"name": "id", "type": "INTEGER"}]},
+        }
+    ],
+}
 
 
 def _args(contract: str, **overrides) -> argparse.Namespace:

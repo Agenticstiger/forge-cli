@@ -30,6 +30,30 @@ from unittest.mock import patch
 
 from fluid_build.cli import apply as apply_module
 
+# ``fluid apply`` schema-validates the contract before any build runs, so the
+# fixture must be a valid contract for the run to reach the build runner.
+_CONTRACT_YAML = """\
+fluidVersion: '0.7.2'
+kind: DataProduct
+id: demo.env_hydration
+name: Env Hydration
+metadata:
+  owner:
+    team: dp
+exposes:
+  - exposeId: rows
+    kind: table
+    binding:
+      platform: local
+      format: parquet
+      location:
+        path: ./out/rows.parquet
+    contract:
+      schema:
+        - name: id
+          type: INTEGER
+"""
+
 
 def test_apply_run_hydrates_dotenv_before_branch_dispatch(tmp_path: Path) -> None:
     # Build a minimal argparse.Namespace that apply.run will short-circuit on.
@@ -42,7 +66,7 @@ def test_apply_run_hydrates_dotenv_before_branch_dispatch(tmp_path: Path) -> Non
         mode="amend-and-build",
         build_id="some_build",
     )
-    (tmp_path / "contract.fluid.yaml").write_text("fluidVersion: '0.7.2'\nkind: DataProduct\n")
+    (tmp_path / "contract.fluid.yaml").write_text(_CONTRACT_YAML)
 
     call_order: list[str] = []
 
@@ -75,7 +99,7 @@ def test_apply_run_passes_env_overlay_to_hydrate(tmp_path: Path) -> None:
         mode="amend-and-build",
         build_id="some_build",
     )
-    (tmp_path / "contract.fluid.yaml").write_text("fluidVersion: '0.7.2'\nkind: DataProduct\n")
+    (tmp_path / "contract.fluid.yaml").write_text(_CONTRACT_YAML)
 
     captured: dict = {}
 
