@@ -382,6 +382,45 @@ class TestAMultiCloudContract:
         (record,) = [r for r in caplog.records if "bq.ensure_dataset" in r.getMessage()]
         assert record.levelno == logging.WARNING
 
+    @pytest.mark.parametrize("other", ["gcp", "snowflake"])
+    def test_airflow_is_refused_though_another_cloud_planned(
+        self, other, no_aws, monkeypatch, tmp_path
+    ):
+        # The first expose's planner runs and returns its own ops, so the AWS
+        # planner that plans the environment never does: the refusal must
+        # follow the contract's request, not the ops that came back.
+        monkeypatch.setenv("AWS_ACCOUNT_ID", ACCOUNT)
+        contract = _two_clouds(other)
+        contract["orchestration"] = dict(_AIRFLOW)
+        out = tmp_path / "out"
+        args = _args(_write(tmp_path, contract), out)
+        args.provider = "aws"
+        with pytest.raises(CLIError) as excinfo:
+            generate_iac.run(args, logging.getLogger("t"))
+        assert (excinfo.value.event, excinfo.value.context["kind"]) == (
+            "unsupported_binding",
+            "mwaa-environment-not-emitted",
+        )
+        assert not out.exists()
+
+    @pytest.mark.parametrize(
+        "foreign",
+        [
+            [{"op": "bq.ensure_dataset", "id": "dataset_ds"}],
+            [{"op": "sf.table.ensure", "id": "t"}],
+            # FLUID_PROVIDER=local plans with LocalProvider.
+            [{"op": "materialize", "id": "m"}],
+        ],
+        ids=["gcp", "snowflake", "local"],
+    )
+    def test_another_clouds_ops_do_not_stand_in_for_the_environment(self, foreign):
+        contract = _two_clouds("gcp")
+        contract["orchestration"] = dict(_AIRFLOW)
+        with pytest.raises(UnsupportedBindingError) as excinfo:
+            _aws().emit(contract, foreign)
+        assert excinfo.value.kind == "mwaa-environment-not-emitted"
+        assert "mwaa-offline_orders" in str(excinfo.value)
+
 
 _AWS_PLANNER = Path(generate_iac.__file__).resolve().parents[1] / "providers" / "aws"
 _OP_LITERAL = re.compile(r"""["']op["']\s*:\s*["']([A-Za-z0-9_.]+)["']""")

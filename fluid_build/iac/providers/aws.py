@@ -1256,17 +1256,20 @@ def _emit_from_actions(
     emitter goes to :func:`_account_for_unemitted_op`, so no planned op is
     dropped without a word.
 
-    A contract that asks for MWAA is refused even when ``actions`` is empty:
-    ``fluid apply`` and ``fluid generate iac`` pass ``[]`` when the native
-    planner could not run or failed on an unrelated field (``native_actions``
-    in ``cli/generate_iac.py`` logs that at DEBUG), and the module would then
-    lack the environment as silently as before. A non-empty ``actions`` came
-    from a planner that ran; that the AWS one plans the environment it is
-    asked for is :func:`_account_for_unemitted_op`'s to refuse.
+    A contract that asks for MWAA is refused whatever ``actions`` holds, so
+    the refusal follows the contract, not the planner that happened to run.
+    ``actions`` may lack the environment op because no AWS planner produced
+    it: ``native_actions`` in ``cli/generate_iac.py`` passes ``[]`` when the
+    planner could not run or failed on an unrelated field (it logs that at
+    DEBUG), and passes another cloud's ops when a multi-cloud contract's first
+    expose is not on AWS and the user chose ``--provider aws`` (or
+    ``FLUID_PROVIDER`` names another planner). Either way the module would
+    lack the environment as silently as before. When the op is present, its
+    ``environment_name`` is the one the refusal names.
     """
     planned = [action for action in actions or [] if isinstance(action, Mapping)]
     requested = _mwaa_requested(contract)
-    if not planned and requested is not None:
+    if requested is not None and not any(action.get("op") == _MWAA_OP for action in planned):
         raise _refuse_mwaa_environment(requested.name, requested)
     for action in planned:
         op = action.get("op")
@@ -1281,7 +1284,9 @@ def _account_for_unemitted_op(action: Mapping[str, Any], requested: Optional[_Mw
     """Pass, refuse, or name in a warning a planned op the emitter has no translation for.
 
     A data-plane or build op owned elsewhere (``_OPS_OWNED_ELSEWHERE``) passes.
-    :data:`_MWAA_OP` is refused (:func:`_refuse_mwaa_environment`). Anything
+    :data:`_MWAA_OP` is refused (:func:`_refuse_mwaa_environment`; a contract
+    that asks for it is refused before the loop, in :func:`_emit_from_actions`,
+    so this guards an op handed in without that request). Anything
     else is named in a warning: a known op nothing provisions yet, an
     orchestration task, and an op this module does not know. The last is not
     refused: an AWS planner op cannot reach it unclassified (the planner-

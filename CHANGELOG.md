@@ -38,8 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MWAA environment yourself (or name your existing one in
   `orchestration.mwaa.environmentName`), push the DAG with `fluid generate schedule` and
   `fluid schedule-sync --scheduler mwaa --destination s3://<dag-bucket>/dags/`, and apply a
-  copy of the contract without `orchestration.schedule`. The refusal holds when the AWS
-  planner fails on another field and apply falls back to the data plane. A planned op the
+  copy of the contract without `orchestration.schedule`. The refusal follows the contract,
+  so it holds when the AWS planner fails on another field and when a multi-cloud contract
+  whose first expose is on another cloud is applied with `--provider aws`. A planned op the
   engine does not provision (IAM bindings from `metadata.policies`, Athena views, Redshift
   schemas and tables, `execution.trigger` schedules, `orchestration.tasks`, another
   cloud's op under `--provider aws`) is named in a warning.
