@@ -34,12 +34,14 @@ from __future__ import annotations
 from typing import Dict, Mapping, Optional
 
 from ...providers._iceberg_catalog import ResolvedIcebergCatalog
+from ...providers._iceberg_catalog_auth import CatalogAuth
 
 
 def emit_debezium_iceberg_sink_config(
     resolved: ResolvedIcebergCatalog,
     *,
     overrides: Optional[Mapping[str, str]] = None,
+    catalog_auth: Optional[CatalogAuth] = None,
 ) -> Dict[str, str]:
     """Build the flat BARE-key Debezium-Server Iceberg sink config.
 
@@ -48,6 +50,12 @@ def emit_debezium_iceberg_sink_config(
     once. Pure: same input -> identical output (the plan-binding guarantee).
     ``overrides`` (a hand-written ``server.sink.config``) is forwarded LAST so
     an operator key always wins.
+
+    ``catalog_auth`` (``sink.catalogAuth``) adds the REST catalog's auth
+    properties as bare keys, the secret as an ``env:<NAME>`` reference that
+    Iceberg resolves from the server's environment. The runner starts the
+    server with its own environment, so its preflight refuses a run where the
+    variable is unset or empty.
     """
     cfg: Dict[str, str] = {}
 
@@ -99,6 +107,15 @@ def emit_debezium_iceberg_sink_config(
     # IcebergChangeConsumer.java:100-102).
     for k, v in (resolved.extra_catalog_props or {}).items():
         cfg[str(k)] = str(v)
+
+    # REST catalog auth from ``sink.catalogAuth``, through the same map:
+    # ``credential=env:<NAME>`` reaches RESTSessionCatalog.initialize, which
+    # resolves it from the process environment (apache-iceberg-1.10.0
+    # RESTSessionCatalog.java:195). Not a Quarkus ``${NAME}`` expression: that
+    # would be expanded into the config SmallRye holds, and the server copies
+    # this map into its Hadoop Configuration too (IcebergChangeConsumer.java:97-98).
+    if catalog_auth is not None:
+        cfg.update(catalog_auth.catalog_properties())
 
     # Operator escape hatch — forwarded LAST so a hand-written key always wins.
     for k, v in (overrides or {}).items():

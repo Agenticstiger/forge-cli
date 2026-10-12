@@ -548,6 +548,7 @@ def _execute_debezium_server(
             return _failed(ctx, started_at, t_start, preflight_error)
     if sink_plan is not None and sink_plan.derives:
         from ...providers._iceberg_catalog import resolve_iceberg_catalog
+        from ...providers._iceberg_catalog_auth import catalog_auth_of
         from ..kafka_connect.iceberg_sink_validation import iceberg_sink_target
         from .iceberg_sink import emit_debezium_iceberg_sink_config
 
@@ -564,7 +565,11 @@ def _execute_debezium_server(
                 sink=ctx.sink,
                 account_ref=ctx.env.get("AWS_ACCOUNT_ID", ""),
             )
-            sink_config = {**emit_debezium_iceberg_sink_config(resolved), **handwritten}
+            derived = emit_debezium_iceberg_sink_config(
+                resolved,
+                catalog_auth=catalog_auth_of((build.get("properties") or {}).get("sink")),
+            )
+            sink_config = {**derived, **handwritten}
 
     # Render the line-based .properties file. Every contract-derived key/value
     # routes through _properties_line, which fail-closes on control characters so
@@ -602,6 +607,10 @@ def _execute_debezium_server(
             "(bare name on PATH, or an absolute path to an executable file)",
         )
 
+    # No ``env=``: the server inherits this process's environment, which is
+    # where Iceberg resolves the ``env:<NAME>`` catalog properties
+    # ``sink.catalogAuth`` emits, and where the preflight checked the variable
+    # is set. The secret is never written to application.properties.
     try:
         proc = subprocess.run(
             [binary, "--config", str(config_path)],

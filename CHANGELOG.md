@@ -76,6 +76,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The derived config used to name the table `None.<table>`, or leave Debezium Server on its
   default namespace. An override that sets `iceberg.tables` or `table-namespace` itself is
   not affected.
+- `fluid validate` and the streaming runners now warn when an Iceberg sink override
+  (`iceberg_catalog_overrides`, `sink_connector_config`, `debezium.server.sink.config`) sets
+  the catalog's `credential` or `token` to a literal value, which forge-cli then pushes to
+  the Kafka Connect REST API or writes to `application.properties`. A value that starts
+  with `env:` or carries a `${...}` expression does not warn. Under `fluid validate
+  --strict` the warning fails validation; use `sink.catalogAuth`, or an `env:<VARIABLE>`
+  value.
+
+### Added
+
+- **`sink.catalogAuth` (schema 0.7.6 preview).** A Kafka Connect (`sink.format: iceberg`) or
+  embedded Debezium build whose Iceberg sink config forge-cli derives can authenticate to a
+  REST catalog (`rest`, `lakekeeper`, `polaris`, `unity`, `snowflake-managed`) by naming an
+  environment variable: `type: oauth2` with `credentialEnv` (a variable holding
+  `client_id:client_secret`), `oauth2ServerUri` and `scope` (all required, plus optional
+  `audience` and `resource`), or `type: bearer` with `tokenEnv`. The derived config carries
+  `rest.auth.type=oauth2` and `credential=env:<NAME>` or `token=env:<NAME>`, under
+  `iceberg.catalog.` for Kafka Connect and `debezium.sink.iceberg.` for Debezium Server;
+  Iceberg's REST client resolves `env:` from the environment of the process that runs the
+  sink, so no secret value appears in a config forge-cli writes or pushes. A variable name
+  that is not exactly `[A-Za-z_][A-Za-z0-9_]*` (a trailing newline included) fails the
+  schema, and so does one shaped like a personal access token (a run of 20 or more letters
+  and digits, with a digit, between underscores, such as `dapi` + 32 hex); neither error
+  quotes the value. The token-shape rule is a heuristic: a short or digit-free token still
+  reads as a name. `oauth2ServerUri` must start with a lowercase `http://` or `https://`
+  (Iceberg treats any other spelling as a path on the catalog host) and may not carry a
+  `user:password@` part. `oauth2ServerUri`, `scope`, `audience` and `resource` may not
+  hold a `${...}` expression, which Debezium Server would expand and Kafka Connect would
+  pass on as text, a control character, or a value starting with `env:`, which Iceberg
+  would resolve from the environment. `fluid validate` refuses `catalogAuth` on a build
+  with no derived Iceberg sink; it and the run preflight refuse it on a catalog not
+  reached over REST, on a sink config forge-cli does not derive, and next to an override
+  that sets `rest.auth.type`, `credential`, `token`, `oauth2-server-uri`, `scope`,
+  `audience`, `resource`, `rest.sigv4-enabled` or a `header.Authorization`. Schema errors
+  under `catalogAuth` do not quote the value, on a contract and on a bundle. The embedded
+  Debezium run refuses to start when the
+  variable is unset or empty, because Iceberg drops a property whose variable is unset;
+  the Kafka Connect variable lives on the Connect worker, which forge-cli cannot check.
+
+- **`catalog: lakekeeper` is checked as Lakekeeper.** A Lakekeeper, Polaris or Unity
+  catalog addresses its warehouse by NAME (`analytics`, or `<project-id>/<name>` on
+  Lakekeeper), so `fluid validate` refuses an object-store URI there, and warns when a
+  Lakekeeper `uri` does not end in `/catalog`, where Lakekeeper serves its Iceberg REST
+  API. The refusal reads the warehouse that reaches the sink: `location.warehouse`, or
+  the warehouse an override or a hand-written sink config sets. For `platform: gcp`, the
+  GCP Iceberg check no longer suggests a `gs://` location for these catalogs. Schema
+  0.7.6 (preview) accepts `lakekeeper` and `polaris` in `sink.catalog`; 0.7.5 is
+  unchanged.
 
 ### Added
 

@@ -381,6 +381,7 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
         binding = _find_iceberg_expose_binding(ctx.contract, build)
         if binding is not None:
             from ...providers._iceberg_catalog import resolve_iceberg_catalog
+            from ...providers._iceberg_catalog_auth import catalog_auth_of
             from .iceberg_sink import emit_iceberg_sink_config
 
             resolved = resolve_iceberg_catalog(
@@ -399,6 +400,10 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
                 kc_props=kc_props,
                 schema_registry_url=sr_url,
                 delivery_guarantee=(props.get("delivery") or {}).get("guarantee"),
+                # ``env:<NAME>`` references only; the variable lives on the
+                # Connect worker, out of this process's sight, so there is no
+                # run check for it here (the embedded Debezium runner has one).
+                catalog_auth=catalog_auth_of(props.get("sink")),
             )
             # A bucket whose variable is unset or empty here resolved to one the
             # contract does not name. The preflight lets that through only for a
