@@ -342,7 +342,8 @@ def iceberg_sink_preflight(
     if not errors:
         return None
     # ``fluid validate`` reports every error but the run-only ones.
-    see = " (see `fluid validate`)" if any(e not in run_only for e in errors) else ""
+    run_only_seen = {_redacted(e) for e in run_only}
+    see = " (see `fluid validate`)" if any(e not in run_only_seen for e in errors) else ""
     return f"iceberg sink preflight failed{see}: " + "; ".join(errors)
 
 
@@ -364,7 +365,22 @@ def _validate(contract: Mapping[str, Any], *, builds: Optional[Iterable[Any]] = 
             continue
         _check_build(contract, build, runtime, iceberg_exposes, expose_ids, errors, warnings)
 
-    return errors, warnings
+    return [_redacted(e) for e in errors], [_redacted(w) for w in warnings]
+
+
+def _redacted(message: str) -> str:
+    """``message`` through the shared secret redactor, the one funnel every check uses.
+
+    The checks quote contract values (a catalog ``uri``, an override's
+    warehouse), and those reach ``fluid validate``'s output, the run
+    preflight's log and the run error. A ``user:password@`` URL, a
+    ``key=value`` secret or a value registered with
+    :func:`~fluid_build.observability.secret_redactor.register_secret` is
+    masked here whichever check wrote the message.
+    """
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
+    return redact_secret_text(message)
 
 
 def _check_build(
@@ -1142,9 +1158,11 @@ def _check_catalog_auth(
     # pushed as written, so catalogAuth would silently not apply.
     if not runtime.derives:
         example = (
-            ", ".join(f"{prefix}{k}={v}" for k, v in auth.example_properties().items())
+            # "<key> to <value>", not "<key>=<value>": the shared redactor masks
+            # a value after a credential-shaped key, and these are not secrets.
+            ", ".join(f"{prefix}{k} to {v}" for k, v in auth.example_properties().items())
             if auth is not None
-            else f"{prefix}rest.auth.type=oauth2 and {prefix}credential=env:<VARIABLE>"
+            else f"{prefix}rest.auth.type to oauth2 and {prefix}credential to env:<VARIABLE>"
         )
         handwritten = any(
             m for label, m in runtime.overrides if label != "iceberg_catalog_overrides"
@@ -1157,7 +1175,7 @@ def _check_catalog_auth(
         errors.append(
             f"{head}: sink.{CATALOG_AUTH_FIELD} applies to a sink config forge-cli derives, "
             f"and {why}, so nothing reads it. Set the catalog's auth properties in the sink "
-            f"config yourself ({example}), or remove sink.{CATALOG_AUTH_FIELD}"
+            f"config yourself (set {example}), or remove sink.{CATALOG_AUTH_FIELD}"
         )
         return
 
@@ -1215,7 +1233,13 @@ def _check_catalog_auth_env_at_run(
     run_only = _AT_RUN.get()
     if auth is None or run_only is None or runtime.engine != "debezium":
         return
-    if os.environ.get(auth.env_var):
+    value = os.environ.get(auth.env_var)
+    if value:
+        # The secret the embedded server will read: register it so the shared
+        # redactor masks it in any message or log line from this process.
+        from fluid_build.observability.secret_redactor import register_secret
+
+        register_secret(value)
         return
     issue = (
         f"{head}: sink.{CATALOG_AUTH_FIELD}.{auth.env_field} names {auth.env_var}, which is "

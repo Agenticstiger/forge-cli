@@ -60,7 +60,8 @@ def sanitize_topic_segment(value: str, *, max_len: int = 200) -> str:
     slug = _KAFKA_SAFE.sub("-", value).strip("-._") or "x"
     if slug == value and len(slug) <= max_len:
         return slug
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    # A collision-avoiding name suffix, not a security digest.
+    digest = hashlib.sha256(value.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
     return f"{slug[:max_len]}-{digest}"
 
 

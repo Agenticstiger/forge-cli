@@ -190,10 +190,10 @@ def test_a_handwritten_sink_config_is_refused(contract, where):
     assert where in hit[0]
     # It tells the user which keys to set in their own config.
     prefix = "iceberg.catalog." if "kafka-connect" in where else ""
-    assert f"{prefix}credential=env:LAKEKEEPER_CREDENTIAL" in hit[0]
-    assert f"{prefix}rest.auth.type=oauth2" in hit[0]
+    assert f"{prefix}credential to env:LAKEKEEPER_CREDENTIAL" in hit[0]
+    assert f"{prefix}rest.auth.type to oauth2" in hit[0]
     # A contract value is named by its field, not echoed (it could hold a secret).
-    assert f"{prefix}oauth2-server-uri=<oauth2ServerUri>" in hit[0]
+    assert f"{prefix}oauth2-server-uri to <oauth2ServerUri>" in hit[0]
     assert "keycloak:8080" not in hit[0]
 
 
