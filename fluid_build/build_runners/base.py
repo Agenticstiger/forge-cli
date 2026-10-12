@@ -944,6 +944,7 @@ def run_builds_from_args(
     *,
     force_run: bool = False,
     plan_data: Optional[Dict[str, Any]] = None,
+    contract: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Execute builds from a FLUID contract.
 
@@ -959,6 +960,11 @@ def run_builds_from_args(
     mode-checked when ``args.contract`` is a ``plan.json``. When given it is
     used as-is and the file is NOT re-read, so the builds that run are the
     ones the plan-binding gate attested.
+
+    ``contract`` is the contract ``fluid apply`` already loaded (with its
+    ``--env`` overlay) and schema-gated when ``args.contract`` is a contract
+    or a bundle. When given it is used as-is and the file is NOT re-read, so
+    the builds that run are the ones the gate validated.
 
     Every input shape anchors at the SOURCE contract's directory (relative
     ``binding.location.path``, dbt ``repository``, the ``.fluid`` state
@@ -1069,15 +1075,18 @@ def run_builds_from_args(
             LOG.debug("env template resolution failed (non-fatal): %s", exc)
     else:
         # Standard YAML contract path (or a bundle).
-        LOG.info(f"Loading contract: {contract_path}")
-        try:
-            contract = load_contract_with_overlay(
-                str(contract_path), getattr(args, "env", None), logger
-            )
-        except CLIError:
-            raise
-        except Exception as e:
-            raise CLIError(1, "contract_load_failed", {"path": str(contract_path), "error": str(e)})
+        if contract is None:
+            LOG.info(f"Loading contract: {contract_path}")
+            try:
+                contract = load_contract_with_overlay(
+                    str(contract_path), getattr(args, "env", None), logger
+                )
+            except CLIError:
+                raise
+            except Exception as e:
+                raise CLIError(
+                    1, "contract_load_failed", {"path": str(contract_path), "error": str(e)}
+                )
         contract_as_written = contract
         if str(contract_path).lower().endswith((".tgz", ".tar.gz")):
             # A bundle's own directory is not where its contract lives:

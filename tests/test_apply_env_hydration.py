@@ -73,7 +73,7 @@ def test_apply_run_hydrates_dotenv_before_branch_dispatch(tmp_path: Path) -> Non
     def _fake_hydrate(project_root: Path, environment=None) -> None:
         call_order.append("hydrate")
 
-    def _fake_run_builds(args, logger, *, force_run=False) -> int:
+    def _fake_run_builds(args, logger, *, force_run=False, **_kwargs) -> int:
         call_order.append("run_builds")
         return 0
 

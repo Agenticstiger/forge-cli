@@ -210,6 +210,22 @@ class TestRunSimpleMode:
         with patch("fluid_build.cli.apply._gate_contract_for_apply", new=Mock()):
             yield
 
+    @pytest.fixture(autouse=True)
+    def _pin_native_engine(self):
+        """Pin the native engine: these tests exercise its provider detection.
+
+        ``fluid apply`` chooses the engine from the contract it loaded, so an
+        aws / gcp / snowflake fixture would now route to the OpenTofu engine,
+        as it does in production. These tests used to reach the native path
+        only because the engine was chosen from a second read of the real
+        local contract file while the native path applied the mocked one.
+        """
+        with patch(
+            "fluid_build.cli._apply_opentofu_engine.resolve_apply_engine",
+            return_value="native",
+        ):
+            yield
+
     def _minimal_contract(self):
         return {"id": "test-product", "name": "Test Product"}
 

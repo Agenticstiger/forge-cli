@@ -261,36 +261,20 @@ def _run_apply_hooks(
     return 1
 
 
-def _run_apply_hooks_for_source(args, logger: logging.Logger) -> int:
-    """Run apply-time hooks for whatever ``args.contract`` points at.
+def _run_apply_hooks_for_source(
+    args: argparse.Namespace, contract: Dict[str, Any], logger: logging.Logger
+) -> int:
+    """Run apply-time hooks on the OpenTofu path, on the loaded contract.
 
-    The native path already holds a loaded contract when it reaches its
-    hook call site; the OpenTofu path does not — it hands ``args`` straight
-    to :func:`apply_via_opentofu`. This adapter loads the contract for both
-    documented apply inputs (a ``.fluid.yaml`` path and a pre-generated
-    ``plan.json``, which embeds the contract under ``contract``) so the hook
-    surface is identical on both engines.
-
-    A contract that cannot be loaded is NOT a reason to skip the guards
-    silently — but it is also not this function's error to report: the
-    engine loads the same source moments later and raises the proper
-    ``CLIError``. So we log at debug and return 0, letting the engine own
-    the failure message.
+    The native path calls :func:`_run_apply_hooks` at its own call site; the
+    OpenTofu path hands ``args`` straight to :func:`apply_via_opentofu`, so
+    this adapter mirrors that call, anchored at the source's directory, to
+    keep the hook surface identical on both engines. ``contract`` is the copy
+    ``run()`` loaded and gated (a ``plan.json``'s embedded contract, or the
+    ``.fluid.yaml`` with its ``--env`` overlay): the hooks see what ``tofu``
+    applies, never a re-read of the file.
     """
     src = str(getattr(args, "contract", "") or "")
-    try:
-        if src.endswith(".json"):
-            plan_data = read_json(src)
-            contract = plan_data.get("contract") if isinstance(plan_data, dict) else None
-            if not isinstance(contract, dict) or not contract:
-                logger.debug("apply hooks skipped: %s has no embedded contract", src)
-                return 0
-        else:
-            contract = load_contract_with_overlay(src, getattr(args, "env", None), logger)
-    except Exception as exc:  # noqa: BLE001 — the engine re-loads and reports
-        logger.debug("apply hooks skipped: %s could not be loaded (%s)", src, type(exc).__name__)
-        return 0
-
     rc = _run_apply_hooks(
         contract,
         Path(src).resolve().parent,
@@ -324,47 +308,65 @@ def _gate_contract_for_apply(contract: Dict[str, Any], logger: logging.Logger) -
     _gate_contract_for_plan_or_apply(contract, logger, command="apply")
 
 
-def _gate_apply_source(
-    args, verified_plan_data: Optional[Dict[str, Any]], logger: logging.Logger
+def _log_apply_failure(logger: logging.Logger, start_time: float, error: Exception) -> None:
+    """Record a pre-dispatch ``apply_contract`` failure for the structured log."""
+    log_operation_failure(logger, "apply_contract", error=error, duration=time.time() - start_time)
+
+
+def _load_apply_source(
+    args: argparse.Namespace, verified_plan_data: Optional[Dict[str, Any]], logger: logging.Logger
 ) -> Dict[str, Any]:
-    """Load the contract ``fluid apply`` was given and run the pre-apply gate.
+    """Load, once, the contract ``fluid apply`` was given.
 
-    Runs once per apply, above the engine dispatch, so the OpenTofu engine
-    and the build-augmented modes (whose early returns sit above the native
-    provider path) validate exactly what the native path does.
+    Every consumer takes this one copy: the engine choice
+    (``resolve_apply_engine``), the pre-apply gate, the OpenTofu engine, the
+    build runner and the native provider. None of them re-reads the file, so
+    the contract that is applied is the contract that was validated, even if
+    the file changes after the gate returns (TOCTOU).
 
-    For a ``plan.json`` the contract is the digest-attested copy embedded in
-    ``verified_plan_data`` (never a re-read of the file). A plan with no
-    embedded contract returns ``{}`` unvalidated: the engine that needs one
-    owns that error (``opentofu_engine_no_contract``). Otherwise the contract
-    is loaded with its ``--env`` overlay, as the native path always did.
-
-    Returns the gated contract, so the native path applies what was validated.
+    For a ``plan.json`` it is the digest-attested copy embedded in
+    ``verified_plan_data``. A plan with no embedded contract, or an empty or
+    non-mapping one, is refused with ``apply_plan_missing_contract``: there is
+    nothing to validate, and such a plan used to fall back to the native
+    engine and run its actions unchecked. Otherwise the contract is loaded
+    with its ``--env`` overlay, as the native path always did.
 
     Raises:
-        CLIError: ``contract_version_unsupported``, ``apply_contract_invalid``,
-            or ``apply_execution_failed`` when the source cannot be loaded.
+        CLIError: ``apply_plan_missing_contract``, or ``apply_execution_failed``
+            when the contract cannot be loaded.
     """
     if verified_plan_data is not None:
         embedded = verified_plan_data.get("contract")
         if not isinstance(embedded, dict) or not embedded:
-            return {}
-        contract: Dict[str, Any] = embedded
-    else:
-        logger.info(f"Loading FLUID contract: {args.contract}")
-        try:
-            contract = load_contract_with_overlay(args.contract, args.env, logger)
-        except CLIError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — mapped as the native path always did
-            from fluid_build.cli._errors import FluidUserError
+            raise CLIError(
+                1,
+                "apply_plan_missing_contract",
+                {
+                    "path": str(args.contract),
+                    "hint": (
+                        "plan.json embeds no contract, so there is nothing to "
+                        "validate before applying it. Re-run ``fluid plan "
+                        "<contract> --out <plan>.json`` with a current forge-cli."
+                    ),
+                },
+            )
+        return embedded
+    logger.info(f"Loading FLUID contract: {args.contract}")
+    try:
+        return load_contract_with_overlay(args.contract, args.env, logger)
+    except CLIError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — mapped as the native path always did
+        from fluid_build.cli._errors import FluidUserError
 
-            if isinstance(exc, FluidUserError):
-                raise
-            logger.error(f"💥 Unexpected error during execution: {exc}")
-            raise CLIError(1, "apply_execution_failed", {"error": str(exc)}) from exc
-    _gate_contract_for_apply(contract, logger)
-    return contract
+        if isinstance(exc, FluidUserError):
+            raise
+        logger.error(f"💥 Unexpected error during execution: {exc}")
+        if getattr(args, "debug", False):
+            import traceback
+
+            logger.error(traceback.format_exc())
+        raise CLIError(1, "apply_execution_failed", {"error": str(exc)}) from exc
 
 
 # ==========================================
@@ -1756,7 +1758,19 @@ def run(args, logger: logging.Logger) -> int:
         resolve_apply_engine,
     )
 
-    apply_engine = resolve_apply_engine(args, logger)
+    # The contract is loaded ONCE, here, and that copy drives everything
+    # below: the engine choice, the schema gate, ``tofu``, the build runner
+    # and the native provider (see ``_load_apply_source``).
+    try:
+        source_contract = _load_apply_source(args, verified_plan_data, logger)
+    except CLIError as exc:
+        _log_apply_failure(logger, start_time, exc)
+        raise
+    except KeyboardInterrupt:
+        _log_apply_failure(logger, start_time, Exception("User interrupted"))
+        logger.warning("⚠️ Execution interrupted by user")
+        return 130
+    apply_engine = resolve_apply_engine(args, logger, contract=source_contract)
 
     gate = check_data_loss_gate(
         resolved_mode,
@@ -1778,20 +1792,15 @@ def run(args, logger: logging.Logger) -> int:
     # early return: the OpenTofu branch (aws / gcp / snowflake / confluent /
     # IaC plugin clouds) and both engines' ``needs_build`` returns used to
     # skip it, so a schema-invalid contract reached ``tofu`` or the build
-    # runner and could exit 0. One call per run; the native path below
-    # applies the contract it returns. Failures are logged and exit as they
-    # did when the gate lived inside the native ``try`` block below.
+    # runner and could exit 0. One call per run, on the one loaded copy.
     try:
-        gated_contract = _gate_apply_source(args, verified_plan_data, logger)
-    except CLIError:
-        duration = time.time() - start_time
-        log_operation_failure(logger, "apply_contract", error="CLI error", duration=duration)
+        _gate_contract_for_apply(source_contract, logger)
+    except CLIError as exc:
+        _log_apply_failure(logger, start_time, exc)
         raise
-    except KeyboardInterrupt:
-        duration = time.time() - start_time
-        log_operation_failure(logger, "apply_contract", error="User interrupted", duration=duration)
-        logger.warning("⚠️ Execution interrupted by user")
-        return 130
+    # A YAML source hands the build runner the gated contract; a plan.json
+    # keeps handing it the attested plan (``plan_kwargs``), which embeds it.
+    build_kwargs: Dict[str, Any] = plan_kwargs or {"contract": source_contract}
 
     if apply_engine == "opentofu":
         # Apply-time plugin hooks run on EVERY engine. They used to be
@@ -1803,10 +1812,10 @@ def run(args, logger: logging.Logger) -> int:
         # override. A guard that fires on the toy local target and no-ops
         # against production clouds is a fail-open control, so the dispatch
         # is mirrored here, ahead of ``tofu init/plan/apply``.
-        _hook_rc = _run_apply_hooks_for_source(args, logger)
+        _hook_rc = _run_apply_hooks_for_source(args, source_contract, logger)
         if _hook_rc != 0:
             return _hook_rc
-        rc = apply_via_opentofu(args, logger)
+        rc = apply_via_opentofu(args, logger, contract=source_contract)
         # The OpenTofu engine provisions infrastructure only. Build-augmented
         # modes (amend-and-build / replace-and-build) still need their build
         # phase to run — mirror the native dispatch below so ``--build`` is
@@ -1815,7 +1824,7 @@ def run(args, logger: logging.Logger) -> int:
             args.build_id = resolved_build_id
             from fluid_build.build_runners import run_builds_from_args
 
-            return run_builds_from_args(args, logger, force_run=True, **plan_kwargs)
+            return run_builds_from_args(args, logger, force_run=True, **build_kwargs)
         return rc
 
     try:
@@ -1838,7 +1847,7 @@ def run(args, logger: logging.Logger) -> int:
             args.build_id = resolved_build_id
             from fluid_build.build_runners import run_builds_from_args
 
-            return run_builds_from_args(args, logger, force_run=True, **plan_kwargs)
+            return run_builds_from_args(args, logger, force_run=True, **build_kwargs)
 
         # Load contract or execution plan
         if verified_plan_data is not None:
@@ -1857,9 +1866,9 @@ def run(args, logger: logging.Logger) -> int:
             plan_data = verified_plan_data
 
             contract = plan_data.get("contract", {})
-            # The embedded contract was schema-gated by ``_gate_apply_source``
-            # above the engine dispatch (a plan minted by an older fluid,
-            # before the plan-time gate existed, is still refused there).
+            # The embedded contract was schema-gated above the engine
+            # dispatch (a plan minted by an older fluid, before the plan-time
+            # gate existed, is still refused there).
 
             # --- Plan-format detection ---
             # Two plan.json shapes exist today:
@@ -1891,9 +1900,9 @@ def run(args, logger: logging.Logger) -> int:
                 plan = None
                 use_simple_mode = True
         else:
-            # Loaded and schema-gated by ``_gate_apply_source`` above the
-            # engine dispatch; apply exactly that contract, never a re-read.
-            contract = gated_contract
+            # Loaded and schema-gated above the engine dispatch; apply exactly
+            # that contract, never a re-read.
+            contract = source_contract
 
             # Run plugin-registered apply-time hooks (entry-point group
             # ``fluid_build.apply_hooks``). Plugins can use these to verify
