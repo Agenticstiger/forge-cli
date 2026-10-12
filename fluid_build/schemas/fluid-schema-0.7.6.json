@@ -3601,6 +3601,158 @@
           "items": {
             "type": "string"
           }
+        },
+        "catalogAuth": {
+          "type": "object",
+          "description": "NEW in v0.7.6: How the Iceberg sink config forge-cli DERIVES (kafka-connect with sink.format iceberg, embedded debezium) authenticates to an Iceberg REST catalog (rest, lakekeeper, polaris, unity, snowflake-managed). Names an environment variable, never a secret: forge-cli emits the secret as the catalog property value env:<NAME>, which Apache Iceberg's REST client resolves from the environment of the process that runs the sink (the Kafka Connect worker, or the Debezium Server forge-cli launches). Iceberg drops a property whose variable is unset, so the embedded Debezium run refuses to start without it; forge-cli cannot see a Connect worker's environment. type oauth2 (client credentials): credentialEnv names a variable holding client_id:client_secret, oauth2ServerUri is the identity provider's token endpoint, scope is required (lakekeeper on a Keycloak-fronted Lakekeeper; PRINCIPAL_ROLE:ALL on Polaris with internal auth, whose oauth2ServerUri is <polaris>/api/catalog/v1/oauth/tokens). type bearer: tokenEnv names a variable holding a bearer token (Unity Catalog OSS). oauth2ServerUri, scope, audience and resource are written as they are and may not hold a ${...} expression or start with env: (Debezium Server would expand it, Kafka Connect would not). fluid validate refuses it on a hand-written sink config, on a catalog not reached over REST, and next to an override that sets rest.auth.type, credential, token, oauth2-server-uri, scope, audience, resource, rest.sigv4-enabled or a header.Authorization.",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "oauth2",
+                "bearer"
+              ],
+              "description": "oauth2: OAuth2 client credentials against oauth2ServerUri. bearer: a static bearer token."
+            },
+            "credentialEnv": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?![\\s\\S])",
+              "not": {
+                "pattern": "(?:^|_)(?=[A-Za-z]*[0-9])[A-Za-z0-9]{20,}(?:_|$)"
+              },
+              "description": "type oauth2: the NAME of the environment variable holding client_id:client_secret (Iceberg splits it on the first ':'). Emitted as credential=env:<NAME>. A value shaped like a token (a run of 20 or more letters and digits, with a digit, between underscores) is refused."
+            },
+            "oauth2ServerUri": {
+              "type": "string",
+              "pattern": "^https?://[^\\s/?#@]+(?:[/?#]\\S*)?$",
+              "not": {
+                "pattern": "\\$\\{|[\\x00-\\x1f\\x7f]|^\\s*env:"
+              },
+              "description": "type oauth2: absolute URL starting with a lowercase http:// or https:// of the identity provider's token endpoint, with no user:password@ part (the client id and secret go in credentialEnv's variable), e.g. a Keycloak realm's <keycloak>/realms/<realm>/protocol/openid-connect/token. Emitted as oauth2-server-uri; without it Iceberg would send the credential to the catalog's own v1/oauth/tokens."
+            },
+            "scope": {
+              "type": "string",
+              "minLength": 1,
+              "not": {
+                "pattern": "\\$\\{|[\\x00-\\x1f\\x7f]|^\\s*env:"
+              },
+              "description": "type oauth2: the OAuth2 scope to request (Iceberg's default, catalog, is not one most identity providers know). Emitted as scope."
+            },
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "not": {
+                "pattern": "\\$\\{|[\\x00-\\x1f\\x7f]|^\\s*env:"
+              },
+              "description": "type oauth2, optional: sent as the audience parameter on the token request."
+            },
+            "resource": {
+              "type": "string",
+              "minLength": 1,
+              "not": {
+                "pattern": "\\$\\{|[\\x00-\\x1f\\x7f]|^\\s*env:"
+              },
+              "description": "type oauth2, optional: sent as the resource parameter on the token request."
+            },
+            "tokenEnv": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?![\\s\\S])",
+              "not": {
+                "pattern": "(?:^|_)(?=[A-Za-z]*[0-9])[A-Za-z0-9]{20,}(?:_|$)"
+              },
+              "description": "type bearer: the NAME of the environment variable holding the bearer token. Emitted as token=env:<NAME>. A value shaped like a token (a run of 20 or more letters and digits, with a digit, between underscores, such as a dapi... personal access token) is refused."
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "oauth2"
+                  }
+                },
+                "type": "object"
+              },
+              "then": {
+                "required": [
+                  "credentialEnv",
+                  "oauth2ServerUri",
+                  "scope"
+                ],
+                "allOf": [
+                  {
+                    "not": {
+                      "required": [
+                        "tokenEnv"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "if": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "bearer"
+                  }
+                },
+                "type": "object"
+              },
+              "then": {
+                "required": [
+                  "tokenEnv"
+                ],
+                "allOf": [
+                  {
+                    "not": {
+                      "required": [
+                        "credentialEnv"
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "required": [
+                        "oauth2ServerUri"
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "required": [
+                        "scope"
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "required": [
+                        "audience"
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "required": [
+                        "resource"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ]
         }
       }
     },

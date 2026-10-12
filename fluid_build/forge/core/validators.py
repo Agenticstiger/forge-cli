@@ -405,6 +405,8 @@ def validate_json_schema(
 
         # Honour the schema's declared $schema; Draft 7 silently ignores
         # newer keywords, which drops the constraints they express.
+        from fluid_build.schema_manager import format_schema_error
+
         validator = jsonschema.validators.validator_for(schema)(schema)
         errors = sorted(validator.iter_errors(doc), key=lambda e: list(e.absolute_path))
         for err in errors:
@@ -414,7 +416,7 @@ def validate_json_schema(
                     file=path,
                     validator="json-schema",
                     severity="error",
-                    message=f"at {loc}: {err.message}",
+                    message=f"at {loc}: {format_schema_error(err)}",
                     code="SCHEMA001",
                 )
             )

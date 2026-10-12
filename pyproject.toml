@@ -694,6 +694,9 @@ module = [
     # The agentPolicy gate: it decides whether an agent may read production
     # data, so a silent Any is a silent allow.
     "fluid_build.policy.decision",
+    # sink.catalogAuth: decides what a streaming sink's catalog credential
+    # becomes in the config forge-cli pushes, so a silent Any is a silent leak.
+    "fluid_build.providers._iceberg_catalog_auth",
     "fluid_build.secrets",
 ]
 strict = true

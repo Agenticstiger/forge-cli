@@ -57,7 +57,13 @@ Snowflake-managed table for the same expose. Per sink build:
   Connect runtime has no Nessie client, and the published sink predates the
   ``bigquery`` catalog type);
 * an operator override must not move the warehouse away from the binding, nor
-  leave the connector carrying both ``type`` and ``catalog-impl``.
+  leave the connector carrying both ``type`` and ``catalog-impl``;
+* ``sink.catalogAuth`` must be well formed, on a catalog reached over REST, in
+  a sink config forge-cli derives, with no override map setting the auth
+  properties it emits; an embedded Debezium run also needs its variable set
+  (the Kafka Connect variable lives on the worker, which forge-cli cannot
+  see); and an override map that inlines a ``credential`` or ``token`` value
+  is a warning.
 
 Debezium builds in ``bring-your-own`` / ``managed`` mode create only the SOURCE
 connector (no sink is derived), so none of this applies to them; an embedded
@@ -81,6 +87,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     AbstractSet,
@@ -113,6 +120,16 @@ from ...providers._iceberg_catalog import (
     known_catalog_kinds,
     resolve_iceberg_catalog,
     resolve_iceberg_sink_exposes,
+)
+from ...providers._iceberg_catalog_auth import (
+    AUTH_OWNED_PROPERTIES,
+    AUTHORIZATION_HEADER_PROPERTY,
+    CATALOG_AUTH_FIELD,
+    INLINE_CHECKED_KEYS,
+    CatalogAuth,
+    is_literal_secret,
+    parse_catalog_auth,
+    raw_catalog_auth,
 )
 
 LOG = logging.getLogger("fluid.acquire.iceberg_sink")
@@ -325,7 +342,8 @@ def iceberg_sink_preflight(
     if not errors:
         return None
     # ``fluid validate`` reports every error but the run-only ones.
-    see = " (see `fluid validate`)" if any(e not in run_only for e in errors) else ""
+    run_only_seen = {_redacted(e) for e in run_only}
+    see = " (see `fluid validate`)" if any(e not in run_only_seen for e in errors) else ""
     return f"iceberg sink preflight failed{see}: " + "; ".join(errors)
 
 
@@ -342,10 +360,27 @@ def _validate(contract: Mapping[str, Any], *, builds: Optional[Iterable[Any]] = 
             continue
         runtime = iceberg_sink_plan(build)
         if runtime is None:
-            continue  # not a build that writes an Iceberg sink
+            # Not a build that writes an Iceberg sink, so nothing reads it.
+            _check_unread_catalog_auth(build, errors)
+            continue
         _check_build(contract, build, runtime, iceberg_exposes, expose_ids, errors, warnings)
 
-    return errors, warnings
+    return [_redacted(e) for e in errors], [_redacted(w) for w in warnings]
+
+
+def _redacted(message: str) -> str:
+    """``message`` through the shared secret redactor, the one funnel every check uses.
+
+    The checks quote contract values (a catalog ``uri``, an override's
+    warehouse), and those reach ``fluid validate``'s output, the run
+    preflight's log and the run error. A ``user:password@`` URL, a
+    ``key=value`` secret or a value registered with
+    :func:`~fluid_build.observability.secret_redactor.register_secret` is
+    masked here whichever check wrote the message.
+    """
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
+    return redact_secret_text(message)
 
 
 def _check_build(
@@ -400,6 +435,9 @@ def _check_build(
             f"iceberg sink (build {bid!r}): streamingSink.dynamicEnabled requires "
             "streamingSink.routeField"
         )
+
+    _check_catalog_auth(bid, sink, runtime, targets, errors)
+    _check_inlined_secrets(bid, sink, runtime, warnings)
 
     # The catalog checks read each expose the sink writes. A Debezium Server
     # sink writes several only when they resolve to one catalog, so a message
@@ -1052,3 +1090,199 @@ def _selector_setters(kind: str, info: CatalogKind, runtime: IcebergSinkPlan) ->
             if key in mapping:
                 setters[key] = label
     return setters
+
+
+# ---------------------------------------------------------------------------
+# sink.catalogAuth
+# ---------------------------------------------------------------------------
+
+#: The engines whose runner derives an Iceberg sink config and reads
+#: ``sink.catalogAuth`` into it.
+_CATALOG_AUTH_ENGINES = ("kafka-connect", "debezium")
+
+
+def _property_prefix(runtime: IcebergSinkPlan) -> str:
+    """``iceberg.catalog.`` on Kafka Connect, ``""`` on Debezium Server."""
+    return runtime.type_key[: -len("type")]
+
+
+def _handwritten_label(engine: str) -> str:
+    if engine == "debezium":
+        return "properties.debezium.server.sink.config"
+    return "properties.kafka-connect.sink_connector_config"
+
+
+def _check_unread_catalog_auth(build: Mapping[str, Any], errors: List[str]) -> None:
+    """A ``sink.catalogAuth`` on a build that writes no Iceberg sink. HARD.
+
+    Nothing reads it there (a Kafka Connect build with another ``sink.format``,
+    a Debezium build in bring-your-own or managed mode), so the auth the author
+    declared would silently not apply.
+    """
+    sink = (build.get("properties") or {}).get("sink") or {}
+    if raw_catalog_auth(sink) is None:
+        return
+    errors.append(
+        f"build {build.get('id', '?')!r}: sink.{CATALOG_AUTH_FIELD} has no effect: it "
+        "configures the Iceberg sink config forge-cli derives for a kafka-connect build "
+        "with sink.format: iceberg or an embedded debezium build, and this build writes "
+        "no such sink. Remove it"
+    )
+
+
+def _check_catalog_auth(
+    bid: Any,
+    sink: Mapping[str, Any],
+    runtime: IcebergSinkPlan,
+    targets: Sequence[Mapping[str, Any]],
+    errors: List[str],
+) -> None:
+    """``sink.catalogAuth``: shape, catalog, derivation, overrides, and the
+    embedded Debezium variable at run time. HARD."""
+    raw = raw_catalog_auth(sink)
+    if raw is None:
+        return
+    head = f"iceberg sink (build {bid!r})"
+    if runtime.engine not in _CATALOG_AUTH_ENGINES:
+        errors.append(
+            f"{head}: sink.{CATALOG_AUTH_FIELD} has no effect on engine {runtime.engine!r}: "
+            f"only the {' and '.join(_CATALOG_AUTH_ENGINES)} runners derive an Iceberg sink "
+            "config. Remove it"
+        )
+        return
+    auth, problems = parse_catalog_auth(raw)
+    errors.extend(f"{head}: {p}" for p in problems)
+    prefix = _property_prefix(runtime)
+
+    # The auth goes into the config forge-cli derives; a hand-written config is
+    # pushed as written, so catalogAuth would silently not apply.
+    if not runtime.derives:
+        example = (
+            # "<key> to <value>", not "<key>=<value>": the shared redactor masks
+            # a value after a credential-shaped key, and these are not secrets.
+            ", ".join(f"{prefix}{k} to {v}" for k, v in auth.example_properties().items())
+            if auth is not None
+            else f"{prefix}rest.auth.type to oauth2 and {prefix}credential to env:<VARIABLE>"
+        )
+        handwritten = any(
+            m for label, m in runtime.overrides if label != "iceberg_catalog_overrides"
+        )
+        why = (
+            f"this build's sink config is hand-written ({_handwritten_label(runtime.engine)})"
+            if handwritten
+            else "this build does not derive its sink config (derivation is turned off)"
+        )
+        errors.append(
+            f"{head}: sink.{CATALOG_AUTH_FIELD} applies to a sink config forge-cli derives, "
+            f"and {why}, so nothing reads it. Set the catalog's auth properties in the sink "
+            f"config yourself (set {example}), or remove sink.{CATALOG_AUTH_FIELD}"
+        )
+        return
+
+    # Only an Iceberg RESTCatalog reads these properties: the table's rows
+    # whose runtime type is ``rest``. An unknown kind is refused by check 4.
+    refused: List[str] = []
+    for target in targets:
+        kind = iceberg_catalog_kind(target.get("binding") or {}, sink)
+        info = catalog_kind_info(kind)
+        if info.family == FAMILY_UNKNOWN or info.speaks_rest or kind in refused:
+            continue
+        refused.append(kind)
+        errors.append(
+            f"{head}: sink.{CATALOG_AUTH_FIELD} configures an Iceberg REST catalog's auth, "
+            f"and the {kind} catalog is not reached over REST (the sink builds Iceberg's "
+            f"{_wire_catalog(info)} catalog), so nothing would read it. Remove "
+            f"sink.{CATALOG_AUTH_FIELD}, or use a REST catalog kind"
+        )
+
+    # An override map merged over the derived config that also sets an auth
+    # property makes the result depend on merge order, and Iceberg uses a
+    # ``token`` over a ``credential`` when it gets both
+    # (apache-iceberg-1.10.0 OAuth2Manager.java:118-119).
+    for label, mapping in runtime.overrides:
+        clashing = [f"{prefix}{k}" for k in AUTH_OWNED_PROPERTIES if f"{prefix}{k}" in mapping]
+        clashing += [
+            key
+            for key in mapping
+            if str(key).lower() == f"{prefix}{AUTHORIZATION_HEADER_PROPERTY}".lower()
+        ]
+        if clashing:
+            errors.append(
+                f"{head}: sink.{CATALOG_AUTH_FIELD} and {label} both set the catalog's auth "
+                f"({', '.join(clashing)}), so which one reaches the catalog is ambiguous "
+                "(Iceberg uses a token over a credential when it gets both). Remove those "
+                f"keys from {label}, or remove sink.{CATALOG_AUTH_FIELD}"
+            )
+
+    _check_catalog_auth_env_at_run(head, auth, runtime, errors)
+
+
+def _check_catalog_auth_env_at_run(
+    head: str, auth: Optional[CatalogAuth], runtime: IcebergSinkPlan, errors: List[str]
+) -> None:
+    """The embedded Debezium preflight: the named variable must be set. HARD, run only.
+
+    The runner starts Debezium Server with this process's environment, and
+    Iceberg drops a catalog property whose ``env:`` variable is unset
+    (apache-iceberg-1.10.0 EnvironmentUtil.java:39-43), so the sink would reach
+    the catalog without credentials. Only presence is tested; the value is
+    never logged or returned. A Kafka Connect sink resolves the variable on the
+    Connect worker, whose environment forge-cli cannot see, so it gets no such
+    check.
+    """
+    run_only = _AT_RUN.get()
+    if auth is None or run_only is None or runtime.engine != "debezium":
+        return
+    value = os.environ.get(auth.env_var)
+    if value:
+        # The secret the embedded server will read: register it so the shared
+        # redactor masks it in any message or log line from this process.
+        from fluid_build.observability.secret_redactor import register_secret
+
+        register_secret(value)
+        return
+    issue = (
+        f"{head}: sink.{CATALOG_AUTH_FIELD}.{auth.env_field} names {auth.env_var}, which is "
+        "unset or empty in the runner's environment. The embedded Debezium Server inherits "
+        "that environment, and Iceberg drops a catalog property whose env: variable is "
+        f"unset, so the sink would reach the catalog without credentials. Set {auth.env_var} "
+        "before the run"
+    )
+    errors.append(issue)
+    run_only.append(issue)
+
+
+def _check_inlined_secrets(
+    bid: Any,
+    sink: Mapping[str, Any],
+    runtime: IcebergSinkPlan,
+    warnings: List[str],
+) -> None:
+    """An override map that writes a literal ``credential`` / ``token``. WARNING.
+
+    The value is inlined into the config forge-cli pushes to the Connect REST
+    API or writes to ``application.properties``. Never quotes the value. A key
+    the catalogAuth conflict check already refuses is not repeated here.
+    """
+    prefix = _property_prefix(runtime)
+    has_auth = (
+        raw_catalog_auth(sink) is not None
+        and runtime.derives
+        and runtime.engine in _CATALOG_AUTH_ENGINES
+    )
+    where = (
+        "writes to application.properties"
+        if runtime.engine == "debezium"
+        else "pushes to the Kafka Connect REST API"
+    )
+    for label, mapping in runtime.overrides:
+        for prop in INLINE_CHECKED_KEYS:
+            key = f"{prefix}{prop}"
+            if key not in mapping or has_auth or not is_literal_secret(mapping[key]):
+                continue
+            warnings.append(
+                f"iceberg sink (build {bid!r}): {label} sets {key} to a literal value (not "
+                f"shown), so the secret is inlined into the sink config forge-cli {where}. "
+                f"Use sink.{CATALOG_AUTH_FIELD}, or set {key} to env:<VARIABLE>, which Iceberg "
+                "resolves from the environment of the process that runs the sink"
+            )

@@ -34,6 +34,7 @@ import re
 from typing import Any, Dict, List, Mapping, Optional
 
 from ...providers._iceberg_catalog import ResolvedIcebergCatalog
+from ...providers._iceberg_catalog_auth import CatalogAuth
 
 # org.apache.iceberg.connect.* is the CURRENT Apache class (1.x); io.tabular.* is
 # the retired pre-donation namespace (RFC §15.1) — never emit the legacy one.
@@ -59,7 +60,8 @@ def sanitize_topic_segment(value: str, *, max_len: int = 200) -> str:
     slug = _KAFKA_SAFE.sub("-", value).strip("-._") or "x"
     if slug == value and len(slug) <= max_len:
         return slug
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    # A collision-avoiding name suffix, not a security digest.
+    digest = hashlib.sha256(value.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
     return f"{slug[:max_len]}-{digest}"
 
 
@@ -77,6 +79,7 @@ def emit_iceberg_sink_config(
     kc_props: Optional[Mapping[str, Any]] = None,
     schema_registry_url: Optional[str] = None,
     delivery_guarantee: Optional[str] = None,
+    catalog_auth: Optional[CatalogAuth] = None,
 ) -> Dict[str, str]:
     """Build the flat Iceberg sink connector config for ``topics``.
 
@@ -84,6 +87,14 @@ def emit_iceberg_sink_config(
     contract-derived config riding plan-binding later). ``kc_props`` may carry an
     ``iceberg_catalog_overrides`` map and a ``streamingSink`` tuning block; both
     are forwarded last so an operator can always override a derived key.
+
+    ``catalog_auth`` (``sink.catalogAuth``) adds the REST catalog's auth
+    properties under ``iceberg.catalog.``, the secret as an ``env:<NAME>``
+    reference that Iceberg resolves on the Connect WORKER, from the worker's
+    environment. forge-cli cannot see that environment, so nothing here or in
+    the runner checks that the variable is set: if it is not, Iceberg drops the
+    property (EnvironmentUtil.java:39-43) and the sink sends its catalog
+    requests without credentials.
     """
     kc_props = kc_props or {}
     streaming = kc_props.get("streamingSink") or kc_props.get("streaming_sink") or {}
@@ -117,6 +128,15 @@ def emit_iceberg_sink_config(
     # main/java/org/apache/iceberg/connect/IcebergSinkConfig.java:60, :254).
     for k, v in (resolved.extra_catalog_props or {}).items():
         cfg[f"iceberg.catalog.{k}"] = str(v)
+    # REST catalog auth from ``sink.catalogAuth``: the same prefix-passthrough,
+    # so Iceberg's RESTSessionCatalog receives ``credential=env:<NAME>`` and
+    # resolves it from the worker's environment (apache-iceberg-1.9.2
+    # RESTSessionCatalog.java:195). Not a KIP-887 ``${env:...}`` reference: that
+    # needs the worker's EnvVarConfigProvider, and an unresolved one reaches
+    # the catalog as the literal text.
+    if catalog_auth is not None:
+        for k, v in catalog_auth.catalog_properties().items():
+            cfg[f"iceberg.catalog.{k}"] = v
 
     # ── routing / write semantics ──
     if resolved.id_columns:

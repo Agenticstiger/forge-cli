@@ -56,6 +56,38 @@ SCHEMA_FILE_PATTERN = re.compile(r"^fluid-schema-(\d+\.\d+(?:\.\d+)?)\.json$")
 SCHEMA_REPO_BASE = "https://raw.githubusercontent.com/open-data-protocol/fluid/main/schema"
 LOG = logging.getLogger(__name__)
 
+#: Contract objects whose field values a schema error must not quote. A
+#: ``sink.catalogAuth`` field names an environment variable, and a value that
+#: fails the name pattern may be a secret pasted in its place; jsonschema's
+#: messages quote the failing instance (``'<value>' does not match ...``).
+_UNQUOTED_VALUE_PATHS = frozenset({"catalogAuth"})
+
+#: Validators whose jsonschema message names only keys, never a value.
+_KEY_ONLY_VALIDATORS = frozenset({"required", "additionalProperties"})
+
+
+def format_schema_error(error: Any) -> str:
+    """``error.message``, without the failing value under :data:`_UNQUOTED_VALUE_PATHS`.
+
+    Every path that reports a FLUID-contract schema error formats it here
+    (``fluid validate`` on a contract and on a bundle), so a secret pasted in
+    place of a ``sink.catalogAuth`` variable name is not printed or saved.
+    """
+    if not any(part in _UNQUOTED_VALUE_PATHS for part in error.absolute_path):
+        return str(error.message)
+    if error.validator in _KEY_ONLY_VALIDATORS:
+        return str(error.message)
+    if error.validator == "pattern":
+        return f"does not match {error.validator_value!r} (value not shown)"
+    value = error.validator_value
+    if error.validator == "not" and isinstance(value, dict) and list(value) == ["required"]:
+        # ``not: {required: [field]}``: a field the object's ``type`` does not take.
+        return f"{', '.join(map(str, value['required']))} is not allowed here"
+    if error.validator == "not" and isinstance(value, dict) and list(value) == ["pattern"]:
+        # ``not: {pattern: ...}``: a token-shaped variable name, or a ``${``.
+        return f"must not match {value['pattern']!r} (value not shown)"
+    return f"fails {error.validator}: {error.validator_value!r} (value not shown)"
+
 
 def _schema_version_sort_key(version: str) -> tuple[int, int, int]:
     match = VERSION_PATTERN.match(version)
@@ -665,7 +697,7 @@ class FluidSchemaManager:
                             path_parts.append(str(part))
 
                 path_str = "".join(path_parts) if path_parts else "root"
-                error_msg = f"{path_str}: {error.message}"
+                error_msg = f"{path_str}: {format_schema_error(error)}"
                 result.add_error(error_msg)
 
             return len(errors) == 0
