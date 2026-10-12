@@ -112,8 +112,9 @@ AUTH_OWNED_PROPERTIES: Tuple[str, ...] = (
 #: the auth session's headers with putIfAbsent, so a configured one would win.
 AUTHORIZATION_HEADER_PROPERTY = "header.authorization"
 
-#: The catalog properties that carry a secret.
-SECRET_PROPERTIES: Tuple[str, ...] = ("credential", "token")
+#: The NAMES of the catalog properties whose value is a secret (checked for
+#: an inlined literal; the names themselves are not secret).
+INLINE_CHECKED_KEYS: Tuple[str, ...] = ("credential", "token")
 
 #: Per ``type``: the variable field, the other required fields, the optional ones.
 _SHAPES: Mapping[str, Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = {

@@ -125,7 +125,7 @@ from ...providers._iceberg_catalog_auth import (
     AUTH_OWNED_PROPERTIES,
     AUTHORIZATION_HEADER_PROPERTY,
     CATALOG_AUTH_FIELD,
-    SECRET_PROPERTIES,
+    INLINE_CHECKED_KEYS,
     CatalogAuth,
     is_literal_secret,
     parse_catalog_auth,
@@ -1252,7 +1252,7 @@ def _check_inlined_secrets(
         else "pushes to the Kafka Connect REST API"
     )
     for label, mapping in runtime.overrides:
-        for prop in SECRET_PROPERTIES:
+        for prop in INLINE_CHECKED_KEYS:
             key = f"{prefix}{prop}"
             if key not in mapping or has_auth or not is_literal_secret(mapping[key]):
                 continue

@@ -160,9 +160,9 @@ _TOKEN_LIFESPAN_S = 3600
 
 #: The worker's environment variable holding ``<client_id>:<client_secret>``,
 #: the shape Iceberg's ``credential`` takes (OAuth2Util.java parseCredential).
-_CREDENTIAL_ENV = "LK_CREDENTIAL"
+_LK_VAR_NAME = "LK_CREDENTIAL"
 #: A variable the worker does not have.
-_MISSING_ENV = "LK_MISSING"
+_UNSET_VAR_NAME = "LK_MISSING"
 
 #: Worker-side (compose network) addresses. Lakekeeper validates a token's
 #: ``iss`` against the discovery document it fetches from here; a token the
@@ -585,7 +585,7 @@ def _wait_failed(stack: _AuthStack, name: str, *, deadline_s: float = 180) -> Di
         if _failed_task(status) is not None:
             return status
         time.sleep(2)
-    pytest.fail(f"no task of {name} FAILED within {deadline_s:.0f}s: {status}")
+    raise AssertionError(f"no task of {name} FAILED within {deadline_s:.0f}s: {status}")
 
 
 # ---------------------------------------------------------------------------
@@ -604,12 +604,12 @@ def test_catalog_auth_oauth2_streams_into_an_auth_required_lakekeeper(
     topic = f"orders-auth-{suffix}"
     connector = f"fluid-lk-oauth-{suffix}"
     config = _derive(
-        _oauth2_contract(f"live.lakekeeper.oauth_{suffix}", table, _CREDENTIAL_ENV), topic
+        _oauth2_contract(f"live.lakekeeper.oauth_{suffix}", table, _LK_VAR_NAME), topic
     )
 
     # Checked before any container starts: a deriver regression fails here in
     # well under a second.
-    _assert_auth_properties(config, _CREDENTIAL_ENV)
+    _assert_auth_properties(config, _LK_VAR_NAME)
     assert config["iceberg.catalog.warehouse"] == _WAREHOUSE
     assert config["iceberg.tables"] == f"{_NAMESPACE}.{table}"
 
@@ -659,7 +659,7 @@ def test_stored_connector_config_holds_the_reference_not_the_secret(
     topic = f"orders-stored-{suffix}"
     connector = f"fluid-lk-stored-{suffix}"
     config = _derive(
-        _oauth2_contract(f"live.lakekeeper.stored_{suffix}", f"orders_{suffix}", _CREDENTIAL_ENV),
+        _oauth2_contract(f"live.lakekeeper.stored_{suffix}", f"orders_{suffix}", _LK_VAR_NAME),
         topic,
     )
     with stack.logs_on_failure(request.node.name):
@@ -671,7 +671,7 @@ def test_stored_connector_config_holds_the_reference_not_the_secret(
             status_code, body = _http("GET", f"{stack.connect_url}/connectors/{connector}/config")
             assert status_code == 200, f"GET /connectors/{connector}/config -> {status_code}"
             stored = _parse(body)
-            assert stored["iceberg.catalog.credential"] == f"env:{_CREDENTIAL_ENV}"
+            assert stored["iceberg.catalog.credential"] == f"env:{_LK_VAR_NAME}"
             assert stored["iceberg.catalog.rest.auth.type"] == "oauth2"
             assert stored["iceberg.catalog.oauth2-server-uri"] == _TOKEN_ENDPOINT
             assert stored["iceberg.catalog.scope"] == _SCOPE
@@ -688,7 +688,7 @@ def test_stored_connector_config_holds_the_reference_not_the_secret(
                 "--timeout-ms",
                 "10000",
             )
-            assert f"env:{_CREDENTIAL_ENV}" in persisted, "the sink's config is not in the topic"
+            assert f"env:{_LK_VAR_NAME}" in persisted, "the sink's config is not in the topic"
             assert stack.client_secret not in persisted
 
             # Nor did the worker log the resolved value.
@@ -713,17 +713,19 @@ def test_unset_credential_variable_fails_the_task_and_writes_nothing(
     topic = f"orders-missing-{suffix}"
     connector = f"fluid-lk-missing-{suffix}"
     config = _derive(
-        _oauth2_contract(f"live.lakekeeper.missing_{suffix}", table, _MISSING_ENV), topic
+        _oauth2_contract(f"live.lakekeeper.missing_{suffix}", table, _UNSET_VAR_NAME), topic
     )
-    _assert_auth_properties(config, _MISSING_ENV)
+    _assert_auth_properties(config, _UNSET_VAR_NAME)
 
     with stack.logs_on_failure(request.node.name):
         # The premise: the worker has LK_CREDENTIAL and not LK_MISSING. Only
         # presence is tested; the value is never printed.
-        has = stack.compose("exec", "-T", "connect", "sh", "-c", f'test -n "${_CREDENTIAL_ENV}"')
+        has = stack.compose("exec", "-T", "connect", "sh", "-c", f'test -n "${_LK_VAR_NAME}"')
         assert has.returncode == 0, "the worker has no LK_CREDENTIAL"
-        missing = stack.compose("exec", "-T", "connect", "sh", "-c", f'test -z "${_MISSING_ENV}"')
-        assert missing.returncode == 0, f"the worker unexpectedly has {_MISSING_ENV}"
+        missing = stack.compose(
+            "exec", "-T", "connect", "sh", "-c", f'test -z "${_UNSET_VAR_NAME}"'
+        )
+        assert missing.returncode == 0, f"the worker unexpectedly has {_UNSET_VAR_NAME}"
 
         try:
             _create_topic(stack, topic)

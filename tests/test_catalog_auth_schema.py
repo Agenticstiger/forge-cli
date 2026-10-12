@@ -32,7 +32,6 @@ import pytest
 import fluid_build
 from fluid_build.providers._iceberg_catalog_auth import (
     ENV_NAME_RE,
-    EXPRESSION_RE,
     FORBIDDEN_TEXT_PATTERN,
     SECRET_SHAPED_NAME_RE,
     parse_catalog_auth,
