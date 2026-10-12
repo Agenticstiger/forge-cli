@@ -1943,7 +1943,7 @@
         },
         "catalog": {
           "type": "string",
-          "description": "NEW in v0.7.5: The Iceberg catalog that owns this table: glue, rest, lakekeeper, polaris, unity, nessie, bigquery, hive, jdbc, hadoop, dynamodb or snowflake-managed. Spellings fold case and '-'/'_', so iceberg_rest == rest and snowflake == snowflake-managed; fluid validate refuses any other value on an Iceberg expose. When absent: glue on platform aws, snowflake-managed on snowflake, rest elsewhere. The REST catalogs (rest, lakekeeper, polaris, unity) need location.uri and location.warehouse. On platform aws, a kind other than glue gets no Glue table and no Glue grant: that catalog creates and governs the table. Every emitter (streaming sinks, dbt catalogs.yml, the IaC, policy compile) reads one table, providers/_iceberg_catalog.py."
+          "description": "NEW in v0.7.5: The Iceberg catalog that owns this table: glue, rest, lakekeeper, polaris, unity, nessie, bigquery, hive, jdbc, hadoop, dynamodb or snowflake-managed. Spellings fold case and '-'/'_', so iceberg_rest == rest and snowflake == snowflake-managed; fluid validate refuses any other value on an Iceberg expose. When absent: glue on platform aws, snowflake-managed on snowflake, rest elsewhere. The REST catalogs (rest, lakekeeper, polaris, unity) need location.uri plus location.warehouse as the catalog's warehouse NAME, not an object-store URI; Lakekeeper serves its Iceberg REST API under <host>/catalog (uri: http://lakekeeper:8181/catalog). On platform aws, a kind other than glue gets no Glue table and no Glue grant: that catalog creates and governs the table. Every emitter (streaming sinks, dbt catalogs.yml, the IaC, policy compile) reads one table, providers/_iceberg_catalog.py."
         },
         "warehouse": {
           "type": "string",
@@ -3591,7 +3591,9 @@
             "nessie",
             "unity",
             "snowflake-managed",
-            "hive"
+            "hive",
+            "lakekeeper",
+            "polaris"
           ]
         },
         "partitionBy": {

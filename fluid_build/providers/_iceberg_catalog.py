@@ -99,6 +99,11 @@ class CatalogKind:
     snowflake_catalog_type: Optional[str]
     #: ``binding.location`` keys a streaming sink needs for this catalog.
     sink_requires: Tuple[str, ...] = ()
+    #: The warehouse is a warehouse/catalog NAME, never an object-store URI.
+    warehouse_is_name: bool = False
+    #: Path the catalog serves its REST API under (Lakekeeper mounts
+    #: ``/catalog``), or ``None`` when the catalog prescribes none.
+    uri_suffix: Optional[str] = None
 
     @property
     def speaks_rest(self) -> bool:
@@ -121,6 +126,8 @@ _CATALOG_KINDS: Mapping[str, CatalogKind] = MappingProxyType(
                 None,
                 "iceberg_rest",
                 _REST_REQUIRES,
+                warehouse_is_name=True,
+                uri_suffix="/catalog",
             ),
             CatalogKind(
                 "polaris",
@@ -129,6 +136,7 @@ _CATALOG_KINDS: Mapping[str, CatalogKind] = MappingProxyType(
                 None,
                 "iceberg_rest",
                 _REST_REQUIRES,
+                warehouse_is_name=True,
             ),
             CatalogKind(
                 "unity",
@@ -137,6 +145,7 @@ _CATALOG_KINDS: Mapping[str, CatalogKind] = MappingProxyType(
                 None,
                 "iceberg_rest",
                 _REST_REQUIRES,
+                warehouse_is_name=True,
             ),
             # Native NessieCatalog for the sinks (uri ends /api/v1|v2, the
             # warehouse is an object-store location), while Snowflake reaches
@@ -572,7 +581,7 @@ _OBJECT_STORE_FILE_IO = (
 
 def is_object_store_uri(value: Any) -> bool:
     """Does ``value`` carry an object-store scheme (s3://, gs://, abfss://...)?"""
-    return _io_impl_for_warehouse(str(value or "")) is not None
+    return _io_impl_for_warehouse(str(value or "").strip()) is not None
 
 
 def _io_impl_for_warehouse(warehouse: str) -> Optional[str]:
