@@ -315,6 +315,35 @@ exits 0.
 
 ---
 
+## Contract validation
+
+`fluid apply` validates the contract before anything else touches it, on
+every engine and in every mode: the same pre-0.7 rejection and JSON-schema
+check `fluid validate` and `fluid plan` run. It runs after the plan-binding
+and data-loss gates and before `tofu`, the native provider or any build.
+
+```text
+$ fluid apply contract.fluid.yaml --yes        # an aws contract: OpenTofu engine
+❌ apply_contract_invalid  [ERR_APPLY_CONTRACT_INVALID]
+  command: apply
+  error_count: 1
+  errors: ["orchestration.engine: 'not-a-real-engine' is not one of ['airflow', 'dagster', 'prefect', 'kubeflow', 'custom', 'none']"]
+  message: Contract validation failed with 1 error(s); ``fluid apply`` will not proceed on a schema-invalid contract. Run ``fluid validate`` for the full report.
+```
+
+| Contract | Event | Exit |
+|---|---|---|
+| `fluidVersion` below 0.7 | `contract_version_unsupported` | 1 |
+| not schema-valid | `apply_contract_invalid` | 1 |
+
+For a `plan.json` the contract checked is the one embedded in the plan, the
+copy the `planDigest` covers. A plan with no embedded contract is not
+checked here; the OpenTofu engine refuses it (`opentofu_engine_no_contract`).
+There is no flag to skip the check. Run `fluid validate <contract> --env <env>`
+to see every error.
+
+---
+
 ## Plan binding
 
 `fluid apply plan.json` re-verifies the plan's `planDigest` (and

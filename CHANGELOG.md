@@ -70,6 +70,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fluid policy compile` now exits 1 with `policy_compiler_crashed` and writes no bindings
   file when the policy compiler crashes. It used to write an empty bindings list and exit
   0, so the next stage read the crash as "no grants to enforce".
+- `fluid apply` now validates the contract on every engine and in every mode. On the
+  OpenTofu engine (aws, gcp, snowflake, confluent and IaC plugin clouds), and with
+  `--mode amend-and-build` or `replace-and-build` on any provider, a contract that is not
+  schema-valid, or is older than 0.7, reached `tofu` or the build runner without being
+  checked and could apply with exit 0. It now stops before planning with
+  `apply_contract_invalid` (or `contract_version_unsupported`), exit 1, as a native
+  `fluid apply --mode amend` always did. A cloud or build apply that succeeded on a
+  contract that was never valid now fails: run `fluid validate <contract> --env <env>`,
+  fix what it reports, and apply again. A `plan.json` is checked on the contract it
+  embeds. There is no flag to skip the check.
 - A Kafka Connect or embedded Debezium build whose sink config forge-cli derives is now
   refused when its expose names no table namespace (`location.database`, or on GCP
   `location.dataset`), and a Kafka Connect one when its expose names no `location.table`.
