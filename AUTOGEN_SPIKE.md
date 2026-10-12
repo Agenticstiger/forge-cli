@@ -248,8 +248,9 @@ self-skipping when `tofu` or the gcloud emulator is absent.
   - **AWS MWAA** (`aws_mwaa_environment`) — needs VPC `network_configuration`
     (subnets, security groups) the contract does not carry. A planned
     `mwaa.ensure_environment` is refused (`unsupported_binding`, kind
-    `mwaa-environment-not-emitted`) rather than skipped, as is any AWS op the
-    emitter does not know (`planned-op-not-emitted`).
+    `mwaa-environment-not-emitted`) rather than skipped, and so is a contract
+    that asks for one when the planner produced no plan; an op the emitter
+    does not translate is named in a warning.
   - **Non-SQL Snowflake procedures / UDFs** (Python / Java / Scala) — need
     runtime / handler / package config the contract does not carry.
   - **`composer.trigger_dag`**, **Athena query execution**, **Redshift table

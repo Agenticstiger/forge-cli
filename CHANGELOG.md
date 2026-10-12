@@ -35,12 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   VPC network the contract does not carry; apply reported success and no environment
   existed. To schedule without Airflow, set `orchestration.engine: none` and keep the
   schedule (an EventBridge Scheduler schedule is created). To keep Airflow, create the
-  MWAA environment yourself, push the DAG with `fluid generate schedule` and
-  `fluid schedule-sync --scheduler mwaa`, and apply a copy of the contract without
-  `orchestration.schedule`. Any other planned AWS op the engine does not know now fails
-  the same way (kind `planned-op-not-emitted`), and the known ops it does not provision
-  yet (IAM bindings from `metadata.policies`, Athena views, Redshift schemas and tables,
-  `execution.trigger` schedules, `orchestration.tasks`) are named in a warning.
+  MWAA environment yourself (or name your existing one in
+  `orchestration.mwaa.environmentName`), push the DAG with `fluid generate schedule` and
+  `fluid schedule-sync --scheduler mwaa --destination s3://<dag-bucket>/dags/`, and apply a
+  copy of the contract without `orchestration.schedule`. The refusal holds when the AWS
+  planner fails on another field and apply falls back to the data plane. A planned op the
+  engine does not provision (IAM bindings from `metadata.policies`, Athena views, Redshift
+  schemas and tables, `execution.trigger` schedules, `orchestration.tasks`, another
+  cloud's op under `--provider aws`) is named in a warning.
 - A GCP Iceberg expose that a streaming sink writes to must now name its catalog in
   `binding.location.catalog`. Without one, the sink wrote through whatever catalog
   reached the worker (REST by default, Glue for `sink.catalog: glue` or a hand-written
