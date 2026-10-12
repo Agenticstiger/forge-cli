@@ -1153,6 +1153,11 @@ _OPS_NOT_YET_EMITTED = frozenset(
 _MWAA_OP = "mwaa.ensure_environment"
 
 
+# The directory-name rule ``fluid schedule-sync`` applies to product scopes
+# (cli/schedule_sync.py ``_SCOPE_NAME_RE``).
+_PRODUCT_DIR_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}")
+
+
 class _MwaaRequest(NamedTuple):
     """What a contract that asks for MWAA says about the environment."""
 
@@ -1162,6 +1167,10 @@ class _MwaaRequest(NamedTuple):
     named: bool
     #: ``orchestration.mwaa.dagS3Path``: where the environment reads DAGs.
     dags: Optional[str]
+    #: The contract id when it is a valid ``schedule-sync`` product directory
+    #: name, else ``None``. ``schedule-sync`` (product delete scope, its
+    #: default) refuses DAGs that are not inside a ``<product-id>/`` directory.
+    product: Optional[str] = None
 
 
 def _mwaa_requested(contract: Mapping[str, Any]) -> Optional[_MwaaRequest]:
@@ -1182,10 +1191,12 @@ def _mwaa_requested(contract: Mapping[str, Any]) -> Optional[_MwaaRequest]:
     mwaa = mwaa if isinstance(mwaa, Mapping) else {}
     named = mwaa.get("environmentName")
     dags = mwaa.get("dagS3Path")
+    contract_id = str(contract.get("id") or "")
     return _MwaaRequest(
         name=str(named) if named else f"mwaa-{contract.get('id', 'unknown')}",
         named=bool(named),
         dags=str(dags) if dags else None,
+        product=contract_id if _PRODUCT_DIR_RE.fullmatch(contract_id) else None,
     )
 
 
@@ -1208,8 +1219,12 @@ def _refuse_mwaa_environment(name: Any, request: Optional[_MwaaRequest]) -> Unsu
     # Printed as-is in a command line, so a control character in the
     # contract's path falls back to the placeholder rather than reach the terminal.
     dest = dags if dags and dags.isprintable() else "s3://<the environment's DAG bucket>/dags/"
+    # schedule-sync mirrors each top-level directory of --dags-dir into the
+    # same-named folder of the destination, and refuses loose files, so the DAG
+    # is generated into dags/<product-id>/ for the pair to run as printed.
+    product = request.product if request and request.product else "<product-id>"
     push = (
-        "`fluid generate schedule --scheduler airflow --output dags` and "
+        f"`fluid generate schedule --scheduler airflow --output dags/{product}` and "
         f"`fluid schedule-sync --scheduler mwaa --dags-dir dags --destination {dest}`"
     )
     without = (

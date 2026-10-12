@@ -82,6 +82,27 @@ class TestMwaaEnvironmentIsRefused:
         assert "--scheduler mwaa --dags-dir dags --destination s3://" in keep_airflow
         assert "--environment-name" not in keep_airflow
 
+    def test_the_printed_keep_airflow_commands_run_as_printed(self, tmp_path):
+        """The DAG goes into dags/<contract id>/: schedule-sync's default
+        (product delete scope) refuses a loose file at the top of --dags-dir."""
+        from fluid_build.cli.schedule_sync import _product_scopes
+
+        with pytest.raises(UnsupportedBindingError) as excinfo:
+            _aws().emit(_contract(orchestration=_AIRFLOW), [])
+        (keep_airflow,) = [step for step in excinfo.value.remediation if "schedule-sync" in step]
+        output = re.search(r"--output (\S+?)`", keep_airflow).group(1)
+        assert output == "dags/offline_orders"
+        dag = tmp_path / output / "offline_orders_dag.py"
+        dag.parent.mkdir(parents=True)
+        dag.write_text("# generated\n")
+        assert _product_scopes(tmp_path / "dags") == ["offline_orders"]
+
+    def test_an_id_schedule_sync_cannot_use_as_a_directory_prints_a_placeholder(self):
+        with pytest.raises(UnsupportedBindingError) as excinfo:
+            _aws().emit(_contract(id="sales orders/v1", orchestration=_AIRFLOW), [])
+        (keep_airflow,) = [step for step in excinfo.value.remediation if "schedule-sync" in step]
+        assert "--output dags/<product-id>`" in keep_airflow
+
     @pytest.mark.parametrize("engine", ["airflow", "mwaa"])
     def test_the_planned_path_fails_before_a_module_is_built(self, engine):
         contract = _contract(orchestration={"engine": engine, "schedule": "0 * * * *"})
