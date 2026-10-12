@@ -1,0 +1,11 @@
+# CodeQL configuration for the advanced setup in .github/workflows/codeql.yml.
+#
+# tests/ is excluded from analysis. Test contracts deliberately carry
+# credential-shaped field names and fake secrets (to prove they are refused
+# and never quoted), and CodeQL's sensitive-data heuristics treat them as
+# taint sources for alerts in production code (PR #712: alerts 308 and 310
+# were dismissed as false positives for exactly this). Production code is
+# still analysed in full, and is the only place a real secret can enter.
+name: forge-cli CodeQL
+paths-ignore:
+  - tests/**
