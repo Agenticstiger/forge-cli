@@ -1,7 +1,8 @@
-# CodeQL advanced setup. It replaces GitHub's default setup (same languages,
-# same default query suite) so .github/codeql/codeql-config.yml can keep the
-# test suite out of the analysis. The default setup must be switched off in
-# the repository's code-security settings, or GitHub refuses this workflow's
+# CodeQL advanced setup. It replaces GitHub's default setup (same languages)
+# so .github/codeql/codeql-config.yml can keep the test suite out of the
+# analysis, and it runs the security-extended suite: the default suite plus
+# lower-precision security queries. The default setup must stay off in the
+# repository's code-security settings, or GitHub refuses this workflow's
 # uploads.
 name: CodeQL
 
@@ -41,6 +42,7 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: none
+          queries: security-extended
           config-file: ./.github/codeql/codeql-config.yml
       - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d  # v4.38.3
         with:
