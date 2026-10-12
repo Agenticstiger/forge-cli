@@ -28,6 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer does (`rest`, `iceberg_rest`, `polaris`, `unity`, `nessie` and `glue` never
   had one). `fluid apply` stops with `iceberg_catalog_move_blocked` and the `tofu state
   rm` command for the volume instead of planning to drop it.
+- An AWS contract with `orchestration.engine: airflow` or `mwaa` and an
+  `orchestration.schedule` now fails `fluid apply` and `fluid generate iac` with
+  `unsupported_binding` (kind `mwaa-environment-not-emitted`). Its plan promised an MWAA
+  environment that the OpenTofu engine never created, since `aws_mwaa_environment` needs a
+  VPC network the contract does not carry; apply reported success and no environment
+  existed. To schedule without Airflow, set `orchestration.engine: none` and keep the
+  schedule (an EventBridge Scheduler schedule is created). To keep Airflow, create the
+  MWAA environment yourself, push the DAG with `fluid generate schedule` and
+  `fluid schedule-sync --scheduler mwaa`, and apply a copy of the contract without
+  `orchestration.schedule`. Any other planned AWS op the engine does not know now fails
+  the same way (kind `planned-op-not-emitted`), and the known ops it does not provision
+  yet (IAM bindings from `metadata.policies`, Athena views, Redshift schemas and tables,
+  `execution.trigger` schedules, `orchestration.tasks`) are named in a warning.
 - A GCP Iceberg expose that a streaming sink writes to must now name its catalog in
   `binding.location.catalog`. Without one, the sink wrote through whatever catalog
   reached the worker (REST by default, Glue for `sink.catalog: glue` or a hand-written

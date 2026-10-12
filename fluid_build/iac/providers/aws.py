@@ -1100,6 +1100,65 @@ def _emit_kinesis(
     )
 
 
+#: Planned ops ``_emit_from_actions`` leaves alone because something else owns
+#: them: the data plane :meth:`AwsIacPlugin.emit` derives from ``exposes[]``
+#: (see :class:`~fluid_build.iac.base.IacProviderPlugin`), and the build steps
+#: the build runners execute rather than provision.
+_OPS_OWNED_ELSEWHERE = frozenset(
+    {
+        "s3.ensure_bucket",
+        "glue.ensure_database",
+        "glue.ensure_table",
+        "glue.ensure_iceberg_table",
+        "dbt.prepare_profile",
+        "athena.execute_query",
+    }
+)
+
+#: Ops the AWS planner emits that nothing in the OpenTofu engine provisions
+#: yet. Each is named in a warning on every emit rather than refused: refusing
+#: them would fail contracts the MWAA fix is not about, and dropping them
+#: without a word is the defect this list exists to end.
+_OPS_NOT_YET_EMITTED = frozenset(
+    {
+        "iam.bind_glue_database",
+        "iam.bind_s3_bucket",
+        "athena.create_view",
+        "redshift.ensure_schema",
+        "redshift.ensure_table",
+        "events.ensure_schedule",
+    }
+)
+
+
+def _refuse_mwaa_environment(action: Mapping[str, Any]) -> UnsupportedBindingError:
+    """``mwaa.ensure_environment`` — planned, but OpenTofu cannot create it.
+
+    ``aws_mwaa_environment`` requires ``network_configuration`` (two private
+    ``subnet_ids`` and ``security_group_ids``), and the contract carries no
+    network. Skipping the op let ``fluid apply`` report success with no
+    Airflow environment, so it is refused instead.
+    """
+    name = action.get("environment_name") or "?"
+    return UnsupportedBindingError(
+        "mwaa-environment-not-emitted",
+        f"The plan asks for the MWAA environment {name!r} (orchestration.engine airflow or "
+        "mwaa with orchestration.schedule), but the OpenTofu engine cannot create an "
+        "aws_mwaa_environment: it needs a VPC network_configuration (subnets and security "
+        "groups) that the contract does not carry. Applying would report success with no "
+        "Airflow environment, so nothing was applied.",
+        (
+            "To schedule without Airflow, set orchestration.engine to 'none' and keep "
+            "orchestration.schedule: fluid apply then creates an EventBridge Scheduler "
+            "schedule.",
+            "To keep Airflow, create the MWAA environment yourself (it needs your VPC), push "
+            "this contract's DAG to it with `fluid generate schedule` and `fluid schedule-sync "
+            "--scheduler mwaa --environment-name <env>`, and run fluid apply on a copy of the "
+            "contract without orchestration.schedule.",
+        ),
+    )
+
+
 def _emit_from_actions(
     resources: Dict[str, Any], actions: Iterable[Mapping[str, Any]], cid: str
 ) -> None:
@@ -1107,8 +1166,8 @@ def _emit_from_actions(
 
     Covers Glue ETL jobs, Step Functions, and the Lambda schedule / event
     path — inline Lambda source is zipped by ``data.archive_file`` (see
-    :meth:`AwsIacPlugin.emit_data`). MWAA is still skipped: ``aws_mwaa_environment``
-    needs VPC ``network_configuration`` the contract does not carry.
+    :meth:`AwsIacPlugin.emit_data`). An op with no emitter goes to
+    :func:`_account_for_unemitted_op`, so no planned op is dropped without a word.
     """
     for action in actions or []:
         if not isinstance(action, Mapping):
@@ -1130,6 +1189,58 @@ def _emit_from_actions(
             _emit_event_rule(resources, action, cid)
         elif op == "s3.ensure_notification":
             _emit_s3_notification(resources, action, cid)
+        else:
+            _account_for_unemitted_op(action)
+
+
+def _account_for_unemitted_op(action: Mapping[str, Any]) -> None:
+    """Pass, refuse, or name in a warning a planned op the emitter has no translation for.
+
+    A data-plane or build op owned elsewhere (``_OPS_OWNED_ELSEWHERE``) passes.
+    ``mwaa.ensure_environment`` is refused (:func:`_refuse_mwaa_environment`);
+    an op no list here knows is refused by name, the way dbt fails with
+    ``MissingMaterializationError`` ("No materialization ... was found for
+    adapter", dbt-adapters ``exceptions/compilation.py``) rather than skipping
+    the model; a known op nothing provisions yet, and an orchestration task,
+    is named in a warning.
+    """
+    op = action.get("op")
+    known = op if isinstance(op, str) else ""
+    # An orchestration.tasks[] step (providers/aws/plan/orchestration.py) is a
+    # task the scheduler runs, in whatever vocabulary the contract wrote: its
+    # ``s3.ensure_bucket`` is not the bucket exposes[] declares.
+    task = isinstance(action.get("orchestration"), Mapping)
+    if known in _OPS_OWNED_ELSEWHERE and not task:
+        return
+    if known == "mwaa.ensure_environment":
+        raise _refuse_mwaa_environment(action)
+    if known in _OPS_NOT_YET_EMITTED:
+        LOG.warning(
+            "aws_planned_op_not_emitted op=%s id=%s: the plan lists it, but the OpenTofu "
+            "engine provisions nothing for it, so fluid apply will not create it",
+            known,
+            action.get("id"),
+        )
+        return
+    if task:
+        LOG.warning(
+            "aws_orchestration_task_not_emitted op=%s id=%s: orchestration tasks run in "
+            "the scheduler, and fluid apply provisions nothing for them",
+            op,
+            action.get("id"),
+        )
+        return
+    where = f" (action {action['id']!r})" if action.get("id") else ""
+    raise UnsupportedBindingError(
+        "planned-op-not-emitted",
+        f"The plan contains the AWS op {op!r}{where}, and the OpenTofu engine "
+        "has no translation for it. Applying would skip it and report success, so nothing "
+        "was applied.",
+        (
+            "Remove the contract field that plans this op, or report it as a fluid "
+            "bug if the planner produced it from a valid contract.",
+        ),
+    )
 
 
 def _emit_glue_job(resources: Dict[str, Any], action: Mapping[str, Any], cid: str) -> None:

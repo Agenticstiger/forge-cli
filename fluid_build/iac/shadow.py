@@ -51,6 +51,7 @@ _TF_TYPE_TO_KIND = {
     "aws_glue_catalog_table": "table",
     "aws_s3_bucket": "bucket",
     "aws_kinesis_stream": "stream",
+    "aws_mwaa_environment": "environment",
     "google_bigquery_dataset": "dataset",
     "google_bigquery_table": "table",
     "google_storage_bucket": "bucket",
@@ -73,6 +74,9 @@ _OP_KEYWORDS: Tuple[Tuple[str, str], ...] = (
     ("bucket", "bucket"),
     ("topic", "topic"),
     ("stream", "stream"),
+    # `mwaa.ensure_environment`: without it the op resolved to no kind, so an
+    # environment the emitter dropped never showed up as a native-only gap.
+    ("environment", "environment"),
 )
 
 _TF_NAME_FIELDS = ("name", "bucket", "table_id", "dataset_id", "topic", "stream")
@@ -85,6 +89,7 @@ _NATIVE_NAME_FIELDS = (
     "database",
     "topic",
     "stream",
+    "environment_name",
     "name",
 )
 
