@@ -35,10 +35,11 @@ import copy
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Optional
 from unittest import mock
 
 import pytest
+import yaml
 
 from fluid_build.cli import build_parser
 from fluid_build.cli._common import CLIError
@@ -99,25 +100,22 @@ def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-def _yaml(contract: Dict[str, Any]) -> str:
-    Path("contract.fluid.yaml").write_text(json.dumps(contract), encoding="utf-8")
-    return "contract.fluid.yaml"
+def _source(form: str, contract: Optional[Dict[str, Any]], *, mode: str = "amend") -> str:
+    """Write ``contract`` in one of the two forms ``fluid apply`` takes: the
+    YAML file an operator hands it, or a digest-bound ``plan.json`` that
+    embeds it (``contract=None``: a plan with no embedded contract)."""
+    if form == "yaml":
+        path, text = Path("contract.fluid.yaml"), yaml.safe_dump(contract, sort_keys=False)
+    else:
+        plan: Dict[str, Any] = {"format_version": "0.7.5", "mode": mode, "actions": []}
+        if contract is not None:
+            plan["contract"] = copy.deepcopy(contract)
+        path, text = Path("runtime/plan.json"), json.dumps(inject_digests(plan, bundle_path=None))
+    path.write_text(text, encoding="utf-8")
+    return str(path)
 
 
-def _plan(contract: Dict[str, Any], *, mode: str = "amend") -> str:
-    plan = {
-        "format_version": "0.7.5",
-        "generated_at": 1700000000,
-        "mode": mode,
-        "contract": copy.deepcopy(contract),
-        "contract_metadata": {"id": contract["id"]},
-        "actions": [],
-        "total_actions": 0,
-    }
-    Path("runtime/plan.json").write_text(
-        json.dumps(inject_digests(plan, bundle_path=None)), encoding="utf-8"
-    )
-    return "runtime/plan.json"
+_FORMS = ["yaml", "plan"]
 
 
 def _apply(src: str, *flags: str) -> int:
@@ -125,9 +123,12 @@ def _apply(src: str, *flags: str) -> int:
     return apply_run(build_parser().parse_args(["apply", src, *flags, "--yes"]), LOG)
 
 
-def _refused(src: str, *flags: str) -> CLIError:
+def _refused(src: str, *flags: str, before: mock.Mock) -> CLIError:
+    """Assert the apply is refused with a ``CLIError`` and ``before`` (the
+    engine or build runner the gate guards) never ran; return the error."""
     with pytest.raises(CLIError) as exc:
         _apply(src, *flags)
+    before.assert_not_called()
     return exc.value
 
 
@@ -181,78 +182,61 @@ _REFUSALS = [
 
 @pytest.mark.usefixtures("workspace")
 class TestOpenTofuEngineIsGated:
+    @pytest.mark.parametrize("form", _FORMS)
     @pytest.mark.parametrize("contract,event", _REFUSALS)
     @pytest.mark.parametrize("mode", ["amend", "dry-run", "amend-and-build"])
-    def test_yaml_is_refused_before_tofu(
-        self, tofu: mock.Mock, builds: mock.Mock, contract: Dict[str, Any], event: str, mode: str
+    def test_refused_before_tofu(
+        self, tofu: mock.Mock, builds: mock.Mock, form: str, contract: Any, event: str, mode: str
     ) -> None:
-        err = _refused(_yaml(contract), "--mode", mode)
-        assert err.event == event
-        tofu.assert_not_called()
+        src = _source(form, contract, mode=mode)
+        assert _refused(src, "--mode", mode, before=tofu).event == event
         builds.assert_not_called()
 
     def test_schema_errors_are_named(self, tofu: mock.Mock) -> None:
-        err = _refused(_yaml(_INVALID))
+        err = _refused(_source("yaml", _INVALID), before=tofu)
         assert any("orchestration" in str(e) for e in err.context["errors"])
 
     def test_hooks_do_not_run_for_a_refused_contract(self, tofu: mock.Mock) -> None:
         with mock.patch("fluid_build.cli.apply._run_apply_hooks", return_value=0) as hooks:
-            _refused(_yaml(_INVALID))
-        hooks.assert_not_called()
+            _refused(_source("yaml", _INVALID), before=hooks)
 
-    def test_contract_embedded_in_a_plan_is_refused_before_tofu(self, tofu: mock.Mock) -> None:
-        assert _refused(_plan(_INVALID), "--mode", "amend").event == "apply_contract_invalid"
-        tofu.assert_not_called()
-
-    @pytest.mark.parametrize("source", [_yaml, _plan], ids=["yaml", "plan"])
+    @pytest.mark.parametrize("form", _FORMS)
     def test_valid_contract_reaches_tofu_after_one_gate(
-        self, tofu: mock.Mock, gate: mock.Mock, source: Any
+        self, tofu: mock.Mock, gate: mock.Mock, form: str
     ) -> None:
-        assert _apply(source(_VALID), "--mode", "amend") == 0
+        assert _apply(_source(form, _VALID), "--mode", "amend") == 0
         tofu.assert_called_once()
         assert gate.call_count == 1
 
     def test_unparseable_yaml_is_a_typed_error_before_tofu(self, tofu: mock.Mock) -> None:
         Path("broken.fluid.yaml").write_text("id: [unclosed\n", encoding="utf-8")
-        assert _refused("broken.fluid.yaml").event == "apply_execution_failed"
-        tofu.assert_not_called()
+        assert _refused("broken.fluid.yaml", before=tofu).event == "apply_execution_failed"
 
     def test_plan_without_an_embedded_contract_defers_to_the_engine(self, tofu: mock.Mock) -> None:
         """No contract to validate: the engine keeps owning that error
         (``opentofu_engine_no_contract``), so the gate must not invent one."""
-        plan = {"format_version": "0.7.5", "mode": "amend", "actions": [], "total_actions": 0}
-        Path("runtime/plan.json").write_text(
-            json.dumps(inject_digests(plan, bundle_path=None)), encoding="utf-8"
-        )
-        _apply("runtime/plan.json", "--mode", "amend")
+        _apply(_source("plan", None), "--mode", "amend")
         tofu.assert_called_once()
 
 
 @pytest.mark.usefixtures("workspace", "native")
 class TestNativeBuildModesAreGated:
+    @pytest.mark.parametrize("form", _FORMS)
     @pytest.mark.parametrize("contract,event", _REFUSALS)
     @pytest.mark.parametrize(
-        "flags",
-        [("--mode", "amend-and-build"), ("--mode", "replace-and-build", "--allow-data-loss")],
-        ids=["amend-and-build", "replace-and-build"],
+        "mode,extra",
+        [("amend-and-build", ()), ("replace-and-build", ("--allow-data-loss",))],
     )
-    def test_yaml_is_refused_before_the_build_runner(
-        self, builds: mock.Mock, contract: Dict[str, Any], event: str, flags: Any
+    def test_refused_before_the_build_runner(
+        self, builds: mock.Mock, form: str, contract: Any, event: str, mode: str, extra: Any
     ) -> None:
-        assert _refused(_yaml(contract), *flags).event == event
-        builds.assert_not_called()
-
-    def test_contract_embedded_in_a_plan_is_refused_before_the_build_runner(
-        self, builds: mock.Mock
-    ) -> None:
-        plan = _plan(_INVALID, mode="amend-and-build")
-        assert _refused(plan, "--mode", "amend-and-build").event == "apply_contract_invalid"
-        builds.assert_not_called()
+        src = _source(form, contract, mode=mode)
+        assert _refused(src, "--mode", mode, *extra, before=builds).event == event
 
     def test_valid_contract_reaches_the_build_runner_after_one_gate(
         self, builds: mock.Mock, gate: mock.Mock
     ) -> None:
-        assert _apply(_yaml(_VALID), "--mode", "amend-and-build") == 0
+        assert _apply(_source("yaml", _VALID), "--mode", "amend-and-build") == 0
         builds.assert_called_once()
         assert gate.call_count == 1
 
@@ -262,8 +246,8 @@ class TestNativeProviderPathAppliesWhatWasGated:
     """The native path applies the very contract the gate validated: one
     load, one gate, no re-read between them."""
 
-    @pytest.mark.parametrize("source", [_yaml, _plan], ids=["yaml", "plan"])
-    def test_one_load_one_gate(self, gate: mock.Mock, source: Any) -> None:
+    @pytest.mark.parametrize("form,loads", [("yaml", 1), ("plan", 0)])
+    def test_one_load_one_gate(self, gate: mock.Mock, form: str, loads: int) -> None:
         from fluid_build.cli import apply as apply_cli
 
         with (
@@ -273,7 +257,7 @@ class TestNativeProviderPathAppliesWhatWasGated:
             ) as load,
             mock.patch("fluid_build.cli.apply._run_simple_apply", return_value=0) as simple,
         ):
-            assert _apply(source(_VALID), "--mode", "amend") == 0
+            assert _apply(_source(form, _VALID), "--mode", "amend") == 0
         assert gate.call_count == 1
-        assert load.call_count == (1 if source is _yaml else 0)
+        assert load.call_count == loads
         assert simple.call_args.kwargs["contract"]["id"] == _VALID["id"]
