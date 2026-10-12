@@ -3677,7 +3677,8 @@
                   "type": {
                     "const": "oauth2"
                   }
-                }
+                },
+                "type": "object"
               },
               "then": {
                 "required": [
@@ -3705,7 +3706,8 @@
                   "type": {
                     "const": "bearer"
                   }
-                }
+                },
+                "type": "object"
               },
               "then": {
                 "required": [

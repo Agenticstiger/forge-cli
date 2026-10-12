@@ -301,3 +301,12 @@ def test_a_bundle_validation_does_not_quote_a_pasted_secret():
     messages = [i.message for i in issues]
     assert any("credentialEnv" in m for m in messages), messages
     assert not any("2OR3eRvYfSZ" in m for m in messages), messages
+
+
+@pytest.mark.parametrize("catalog_auth", ["LK_CREDENTIAL", ["oauth2"], 3])
+def test_a_non_mapping_catalog_auth_draws_one_error(catalog_auth):
+    # Both per-type `if` blocks were vacuously true for a non-object, so their
+    # `then` branches added six false "is not allowed here" errors.
+    errors = [e for e in _errors("0.7.6", catalog_auth) if "catalogAuth" in e]
+    assert len(errors) == 1, errors
+    assert "fails type: 'object'" in errors[0]
