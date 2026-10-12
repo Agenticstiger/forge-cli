@@ -79,7 +79,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fluid apply --mode amend` always did. A cloud or build apply that succeeded on a
   contract that was never valid now fails: run `fluid validate <contract> --env <env>`,
   fix what it reports, and apply again. A `plan.json` is checked on the contract it
-  embeds. There is no flag to skip the check.
+  embeds, and one that embeds none is now refused with `apply_plan_missing_contract`
+  (exit 1) on every engine; it used to fall back to the native engine and run its
+  actions unchecked. Re-run `fluid plan` to get a plan that embeds its contract. The
+  contract is read once, and the engine, hooks, `tofu` and build runner all take that
+  checked copy. There is no flag to skip the check.
 - A Kafka Connect or embedded Debezium build whose sink config forge-cli derives is now
   refused when its expose names no table namespace (`location.database`, or on GCP
   `location.dataset`), and a Kafka Connect one when its expose names no `location.table`.

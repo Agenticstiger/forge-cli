@@ -335,10 +335,20 @@ $ fluid apply contract.fluid.yaml --yes        # an aws contract: OpenTofu engin
 |---|---|---|
 | `fluidVersion` below 0.7 | `contract_version_unsupported` | 1 |
 | not schema-valid | `apply_contract_invalid` | 1 |
+| a `plan.json` that embeds no contract | `apply_plan_missing_contract` | 1 |
 
 For a `plan.json` the contract checked is the one embedded in the plan, the
-copy the `planDigest` covers. A plan with no embedded contract is not
-checked here; the OpenTofu engine refuses it (`opentofu_engine_no_contract`).
+copy the `planDigest` covers. A plan whose `contract` is missing, empty or not
+an object is refused on every engine, with or without
+`--no-verify-plan-binding`: there is nothing to check, and the `planDigest`
+proves only that the file is unchanged, not who wrote it. Re-run `fluid plan`
+with a current forge-cli to get a plan that embeds its contract.
+
+The contract checked is the contract applied. `fluid apply` reads its input
+once; the engine choice, the apply-time hooks, `tofu`, the build runner and
+the native provider all take that copy, so a file changed after the check
+does not reach any of them.
+
 There is no flag to skip the check. Run `fluid validate <contract> --env <env>`
 to see every error.
 
