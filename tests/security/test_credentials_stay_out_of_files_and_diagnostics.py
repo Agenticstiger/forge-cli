@@ -67,8 +67,9 @@ def test_old_name_still_imports_for_library_callers():
 def test_no_module_calls_the_old_name():
     """CodeQL treats a call to a function named like ``*secret*`` as a source
     of secrets. A call to ``mask_known_secrets`` made the redactor's OUTPUT a
-    "secret", and 14 alerts followed it into log lines and files that only
-    ever held redacted text. Call ``redact_known_values``."""
+    "secret", so each log line or file that carried redacted text was reported
+    as a clear-text leak (14 alerts on main had that source). Call
+    ``redact_known_values``."""
     root = Path(sr.__file__).resolve().parents[1]
     callers = []
     for path in root.rglob("*.py"):
@@ -259,6 +260,12 @@ def _diagnostic(path: str, leaf, op="eq", value="x") -> str:
         "a.apiKey",
         "a.clientSecret",
         "a.sessionToken",
+        "a.connection_url",
+        "a.credentials.url",
+        "a.accountKey",
+        "a.sharedAccessKey",
+        "a.signingKey",
+        "a.sas",
     ],
 )
 def test_a_credential_key_is_masked(path):
@@ -286,6 +293,20 @@ def test_a_key_that_refers_to_or_only_mentions_a_credential_is_shown(path, leaf,
     ``catalogAuth`` that names one), a token budget and ``authz``/``author`` are
     not credentials: the diagnostic keeps the value the planner needs."""
     assert shown in _diagnostic(path, leaf, op, value)
+
+
+@pytest.mark.parametrize(
+    "op, value", [("lt", "aaa"), ("lte", "aaa"), ("gt", "zzz"), ("gte", "zzz"), ("contains", "x")]
+)
+def test_every_comparison_masks_a_credential_leaf(op, value):
+    assert _SECRET not in _diagnostic("a.password", _SECRET, op, value)
+
+
+@pytest.mark.parametrize("nested", ["pwd", "dsn", "connectionString", "accountKey", "auth"])
+def test_a_credential_key_inside_a_mapping_leaf_is_masked(nested):
+    diagnostic = _diagnostic("a.settings", {"host": "h", nested: _SECRET}, "eq", {"host": "x"})
+    assert _SECRET not in diagnostic
+    assert "'host': 'h'" in diagnostic
 
 
 def test_a_self_referential_leaf_does_not_flip_the_predicate(tmp_path):
@@ -361,6 +382,16 @@ class _FailingConnection:
 
     def sql(self, _sql):
         raise RuntimeError(self.message)
+
+
+def test_no_local_provider_log_call_carries_a_raw_exception_text():
+    """Every ``"error": str(e)`` the local provider logs goes through the shared
+    redactor (``local.py`` logs a plan, load, SQL, create-table and copy error)."""
+    import fluid_build.providers.local.local as local_module
+
+    source = Path(local_module.__file__).read_text(encoding="utf-8")
+    assert '"error": str(e)' not in source
+    assert source.count("redact_secret_text(str(e))") >= 6
 
 
 def test_local_redact_sql_masks_a_postgres_url_password():
@@ -697,6 +728,21 @@ def test_invoke_target_config_is_private_and_removed(tmp_path):
     assert seen["mode"] == 0o600 and seen["parent"] == 0o700
     assert not Path(seen["path"]).exists()
     assert not stale.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes and a script tap")
+def test_invoke_tap_removes_the_config_after_a_timeout(tmp_path):
+    from fluid_build.build_runners.meltano.runner import invoke_tap
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        invoke_tap(
+            str(_fake_tap(tmp_path, 0, sleep=120)),
+            config=_tap_config(),
+            workdir=tmp_path / "w",
+            timeout_seconds=8,
+        )
+    seen = json.loads((tmp_path / "tap-saw.json").read_text())
+    assert not Path(seen["path"]).exists()
 
 
 # ── fluid init: generated connector config is git-ignored ────────────────

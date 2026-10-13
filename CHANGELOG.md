@@ -124,7 +124,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `env:<VARIABLE>` value is still written as it is. A hand-written sink key outside that
   list is written as before, in a file that is now created at mode 0600.
 - A Meltano / Singer tap and target now read their `--config` file from a private
-  temporary directory that is removed when the tap or target exits, instead of
+  temporary directory that is removed when the tap or target exits (a `fluid` process
+  killed by a signal can leave it there), instead of
   `.fluid/meltano/<product>/<build>/tap_config.json` and `target_config.json`. A copy an
   earlier release left there is deleted on the next run. A tap that writes a refreshed
   token back to its config file loses that write; the next run resolves the credential

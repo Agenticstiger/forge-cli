@@ -342,17 +342,22 @@ def _is_number(value: Any) -> bool:
 
 #: A key whose last word makes it a REFERENCE to a credential, not one:
 #: ``secretRef``, ``tokenEnv``, ``credentialEnv``, ``catalogAuth.type``,
-#: ``oauth2ServerUri``, ``passwordFile``.
+#: ``passwordFile``. ``url``/``uri`` are not here: a ``connection_url`` can
+#: carry ``Pwd=`` in a form no text rule recognises.
 _REFERENCE_WORDS = frozenset(
-    {"ref", "env", "type", "kind", "mode", "provider", "uri", "url", "endpoint"}
-    | {"scope", "audience", "resource", "name", "file", "path", "enabled"}
+    {"ref", "env", "type", "kind", "mode", "provider", "scope", "audience", "resource"}
+    | {"name", "file", "path", "enabled"}
 )
 #: Words that only contain a sensitive part (``auth``): ``authz``, ``author``.
 _NOT_CREDENTIAL_WORDS = frozenset({"authz", "authn", "author", "authors", "authority"})
 #: A token budget, not a token: ``maxTokensPerDay``, ``tokensPerMinute``.
 _TOKEN_BUDGET_RE = re.compile(r"(?:^|_)(?:max|min)_tokens(?:_|$)|(?:^|_)tokens_per(?:_|$)")
-#: Spellings the shared key rule does not know: ``MYSQL_PWD``, ``passwd``, ``dsn``.
-_MORE_CREDENTIAL_NAMES_RE = re.compile(r"(?:passwd|pwd|dsn|connectionstring)$")
+#: Spellings the shared key rule does not know: ``MYSQL_PWD``, ``passwd``,
+#: ``dsn``, ``accountKey``, ``sharedAccessKey``, ``signingKey``, ``sas``.
+_MORE_CREDENTIAL_NAMES_RE = re.compile(
+    r"(?:passwd|pwd|passcode|dsn|connectionstring|sas|sastoken"
+    r"|(?:access|account|sharedaccess|signing|encryption|master|storage|ssh|subscription)key)$"
+)
 _KEY_WORD_BREAK_RE = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
 
 
@@ -406,9 +411,29 @@ def _display_leaf(concrete: str, leaf: Any) -> Any:
     if not leaf_is_a_reference and any(_key_hides_its_value(key) for key in keys):
         return _REDACTED
     try:
-        return redact_value(leaf)
+        return redact_value(_mask_credential_keys(leaf))
     except RecursionError:
         return _REDACTED
+
+
+def _mask_credential_keys(value: Any) -> Any:
+    """``value`` with every mapping entry under a key that holds a credential
+    replaced, by the same rule as a path key (``redact_value``'s own key rule
+    lacks ``pwd``, ``dsn``, ``accountKey`` and the rest)."""
+    from fluid_build.observability.secret_redactor import _REDACTED
+
+    if isinstance(value, dict):
+        return {
+            key: (
+                _REDACTED
+                if isinstance(key, str) and _key_hides_its_value(key)
+                else _mask_credential_keys(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_credential_keys(item) for item in value]
+    return value
 
 
 def _compare(op: str, leaf: Any, expected: Any, *, shown: Any) -> Tuple[bool, str]:
