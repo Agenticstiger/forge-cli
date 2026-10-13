@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- ODCS and ODPS files are now read with the YAML caps FLUID contracts already had. `fluid
+  odps import`, `fluid odcs validate`/`import`, `fluid odps-bitol validate`, the
+  `contractId` resolver and `fluid forge --seed-from` refuse a YAML file over 5 MiB, with
+  more than 50 aliases, or whose aliases add more than 100,000 nodes; write the repeated
+  blocks out instead of reusing them through anchors. A bundle directory without a
+  readable ODPS doc that holds such a file fails instead of importing as ODCS-only.
+- A file the resolver probes for a port's `contractId` must now declare that `contractId`
+  as its `id`. A bundle that relied on a file named after the port but declaring another
+  id fails a strict import, or skips the port under `--lenient`; make the port's
+  `contractId` and the ODCS `id` agree.
+
+### Fixed
+
+- **`fluid forge --seed-from` catches a dropped expose.** When the model left out an
+  expose the seed declares, the ground-truth guard raised `IndexError`, logged
+  `structural_seed_guard_failed` and kept the generated contract, so the expose was lost
+  without an error. A missing expose is now a seed mismatch, which the repair loop feeds
+  back to the model on its next attempt.
+- **A malformed or mismatched `contractId` no longer breaks an ODPS import.** A
+  `contractId` with a NUL byte, a value that is not a string, or an unparsable URL such as
+  `http://[::1` made `fluid odps import` fail with `ValueError` or `TypeError`, even with
+  `--lenient` and on input ports, which always import leniently. It is now an unresolved
+  contract: `--lenient` and input ports skip it with a warning, and a strict import stops
+  with an unresolved-contract error (`not a valid contractId` for a NUL byte, a
+  non-string or an empty value). A file the resolver probes for a `contractId`, such as
+  `orders.odcs.yaml` for `commerce.orders`, is now used only when it declares that `id`;
+  a file that declares another contract is skipped with a warning naming both ids instead
+  of being linked to the port.
+
+### Security
+
+- **The YAML guard caps what aliases expand to, not only how many there are.** It
+  allowed 50 aliases, which is not a bound: 22 levels of `[*a, *a]` are 44 aliases that
+  expand to 25,165,822 nodes, and a 685-byte contract shaped like that held `fluid
+  validate` for more than 90 seconds. A document is now also refused when its aliases add
+  more than 100,000 nodes, or grow it more than 100-fold once it is past 1,000 nodes, and
+  the error names both sizes; a stream is read only up to the 5 MiB cap. The ODCS and ODPS
+  readers had no cap at all: `fluid odps import`, the `contractId` resolver (fetched
+  contracts included), `fluid forge --seed-from`, `fluid odps-bitol validate` and `fluid
+  odcs validate`/`import` read YAML with a plain `yaml.safe_load`. They now use the same
+  guard and report a refused file as a failed validation or import, and the OpenAPI
+  validator, the artifact fan-out and the federation manifest reader report it as the
+  unreadable file it is instead of failing with `UnsafeYamlError`.
+
 ## [0.20.0] — 2026-10-15
 
 ### Security advisories
@@ -784,29 +830,6 @@ This release fixes six security advisories. Each entry below has its own upgrade
 
 ### Fixed
 
-- **`fluid forge --seed-from` catches a dropped expose.** When the model left out an
-  expose the seed declares, the ground-truth guard raised `IndexError`, logged
-  `structural_seed_guard_failed` and kept the generated contract, so the expose was lost
-  without an error. A missing expose is now a seed mismatch, and the repair loop asks the
-  model to restore it.
-- **A malformed or mismatched `contractId` no longer breaks an ODPS import.** A
-  `contractId` with a NUL byte, a value that is not a string, or an unparsable URL such as
-  `http://[::1` made `fluid opds import` fail with `ValueError` or `TypeError`, even with
-  `--lenient` and on input ports, which always import leniently. It is now an unresolved
-  contract: `--lenient` and input ports skip it with a warning, and a strict import stops
-  with `not a valid contractId`. A file the resolver probes for a `contractId`, such as
-  `orders.odcs.yaml` for `commerce.orders`, is now used only when it declares that `id`;
-  a file that declares another contract is skipped with a warning instead of being linked
-  to the port.
-- **YAML aliases can no longer blow a small file up into millions of nodes.** The
-  billion-laughs guard capped how many aliases a document uses (50) but not what they
-  expand to: 22 levels of `[*a, *a]` are 44 aliases and 2^22 nodes, and that 685-byte
-  contract held `fluid validate` for more than 90 seconds. A document is now also refused
-  when its aliases add more than 100,000 nodes, or grow it more than 100-fold once it is
-  past 1,000 nodes, and the error names both sizes. The ODCS and ODPS readers behind
-  `fluid opds import`, the `contractId` resolver (fetched contracts included), `fluid forge
-  --seed-from` and `fluid odps-bitol validate` read YAML with a plain `yaml.safe_load` and
-  had no cap at all; they now use the same guard.
 - **Command output keeps its square brackets.** Rich read text in brackets as console
   markup and dropped it, so `fluid validate` printed `exposes declares
   governance.lakeFormation` instead of `exposes[orders] declares ...`, bundle findings
