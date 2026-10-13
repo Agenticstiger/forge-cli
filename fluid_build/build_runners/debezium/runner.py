@@ -491,15 +491,31 @@ def _escape_properties_value(value: str) -> str:
     return escaped
 
 
+def _write_private_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path``, readable by this user only (0o600)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fh.fileno(), 0o600)
+        fh.write(text)
+
+
 #: A property whose VALUE is a credential: Debezium's PASSWORD-typed fields
 #: (``database.password``, ``*.ssl.*.password``), the Iceberg / S3 / JDBC /
 #: GCS / ADLS secrets (``credential``, ``token``, ``s3.secret-access-key``,
-#: ``s3.session-token``, ``jdbc.password``, ``adls.sas-token.*``), a Kafka JAAS
-#: blob, and a Mongo connection string (it may carry userinfo). Narrower than
+#: ``s3.session-token``, ``jdbc.password``, ``adls.sas-token.*``,
+#: ``adls.auth.shared-key.account.key``, ``s3.sse.key``), an HTTP
+#: ``header.Authorization``, a Kafka JAAS blob or PEM ``ssl.keystore.key``, a
+#: Pulsar ``authParams``, and a Mongo or Event Hubs connection string (it may
+#: carry userinfo or a shared access key). Narrower than
 #: ``is_sensitive_key_name`` on purpose: ``rest.auth.type`` and
-#: ``oauth2-server-uri`` are not secrets, and stay readable in the file.
+#: ``oauth2-server-uri`` are not secrets, and stay readable in the file. A
+#: false positive only moves a value to the environment.
 _CREDENTIAL_PROPERTY_RE = re.compile(
-    r"(?i)password|secret|token|credential|jaas\.config|connection\.string"
+    r"(?i)password|secret|token|credential|authorization|auth[._-]?params|jaas\.config"
+    r"|connection[._-]?string|api[._-]?key|private[._-]?key|account[._-]?key"
+    r"|keystore\.key|sse\.key"
 )
 
 
@@ -520,8 +536,10 @@ def render_application_properties(
     (DBZ-2886). So no credential is written to disk: the file sits under the
     contract directory, where ``git add -A`` would stage it.
 
-    An ``env:<NAME>`` value is written as it is: it is Iceberg's own reference
-    to an environment variable (``sink.catalogAuth``), not a secret.
+    A sink ``env:<NAME>`` value is written as it is: it is Iceberg's own
+    reference to an environment variable (``sink.catalogAuth``), not a secret.
+    A source property gets no such reading, so a source password that starts
+    with ``env:`` still goes to the environment.
 
     Raises ``ValueError`` for a control character in a key or value
     (:func:`_properties_line`), or for two properties whose names map to the
@@ -529,11 +547,21 @@ def render_application_properties(
     """
     env: Dict[str, str] = {}
 
-    def line(key: str, value: object) -> str:
-        rendered = _properties_line(key, value)
+    def line(key: str, value: object, *, env_refs: bool = False) -> str:
         text = str(value)
-        if not text or text.startswith("env:") or not _CREDENTIAL_PROPERTY_RE.search(key):
-            return rendered
+        if (
+            not text
+            or (env_refs and text.startswith("env:"))
+            or not _CREDENTIAL_PROPERTY_RE.search(key)
+        ):
+            return _properties_line(key, value)
+        # The value never reaches the file, so only a control character in
+        # the KEY could inject a line; the value is still refused (no
+        # credential has one, a trailing newline from a secret file is a
+        # mistake), but the error names the key, never the value.
+        _properties_line(key, "")
+        if any(ch in text for ch in "\r\n\f\x00"):
+            raise ValueError(f"debezium config entry {key} has a control character in its value")
         name = "FLUID_DBZ_" + re.sub(r"[^A-Za-z0-9]", "_", key.removeprefix("debezium.")).upper()
         if env.get(name, text) != text:
             raise ValueError(f"two debezium properties map to the environment variable {name}")
@@ -543,7 +571,9 @@ def render_application_properties(
     lines = [line(f"debezium.source.{k}", v) for k, v in source_config.items()]
     lines.append("quarkus.log.console.json=false")
     lines.append(_properties_line("debezium.sink.type", sink_type))
-    lines += [line(f"debezium.sink.{sink_type}.{k}", v) for k, v in sink_config.items()]
+    lines += [
+        line(f"debezium.sink.{sink_type}.{k}", v, env_refs=True) for k, v in sink_config.items()
+    ]
     return "\n".join(lines), env
 
 
@@ -638,14 +668,13 @@ def _execute_debezium_server(
         )
     except ValueError as exc:
         return _failed(ctx, started_at, t_start, str(exc))
-    from ...credentials.encrypted_store import _atomic_write_bytes
-
-    # Created at 0o600 (O_EXCL, then an atomic rename): never briefly
-    # world-readable, and no chmod whose failure could be ignored. A
-    # hand-written sink key the credential rule does not name still lands
-    # in this file.
+    # Created 0o600 and tightened to 0o600 when it already exists (a copy an
+    # earlier release wrote at 0o644 with the password in it is truncated
+    # first): never world-readable, and no chmod whose failure is ignored. A
+    # symlink in its place is refused rather than followed. A hand-written
+    # sink key the credential rule does not name still lands in this file.
     try:
-        _atomic_write_bytes(config_path, properties.encode("utf-8"), mode=0o600)
+        _write_private_text(config_path, properties)
     except OSError as exc:
         return _failed(ctx, started_at, t_start, f"could not write {config_path}: {exc}")
 

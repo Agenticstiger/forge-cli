@@ -181,24 +181,27 @@ def _resolve_tap_binary(tap_name: str, *, project_dir: Optional[Path] = None) ->
 
 
 @contextmanager
-def _private_tap_config(config: Dict[str, Any], workdir: Path) -> Iterator[Path]:
-    """Yield the path of a tap's ``--config`` file that only this user can read.
+def _private_singer_config(config: Dict[str, Any], workdir: Path, name: str) -> Iterator[Path]:
+    """Yield the path of a Singer tap's or target's ``--config`` file that only
+    this user can read.
 
     Singer's ``--config`` contract puts the resolved credential in a file: it
-    is how a tap reads its password. The file is created 0o600 inside a
-    0o700 ``TemporaryDirectory`` (the pattern ``dbt/profiles.py`` uses for a
-    generated ``profiles.yml``), and removed when the tap exits, however it
-    exits. It used to be ``<workdir>/tap_config.json``: under the contract
-    directory, 0o644, never deleted, and not in the ``.gitignore`` that
-    ``fluid init`` writes, so ``git add -A`` staged the password. A copy an
-    earlier release left there is deleted.
+    is how a tap or target reads its password. The file is created 0o600
+    inside a 0o700 ``TemporaryDirectory`` (the pattern ``dbt/profiles.py``
+    uses for a generated ``profiles.yml``) and removed when the ``with``
+    block exits: after the subprocess returns, fails or times out. A fluid
+    process killed by a signal can leave it in that private directory. It
+    used to be ``<workdir>/<name>``: under the contract directory, 0o644,
+    never deleted, and not in the ``.gitignore`` that ``fluid init`` writes,
+    so ``git add -A`` staged the password. A copy an earlier release left
+    there is deleted.
 
     A tap that writes a refreshed OAuth token back to its config file loses
     that write; the next run resolves the credential from ``secretRef`` again.
     """
-    (workdir / "tap_config.json").unlink(missing_ok=True)
+    (workdir / name).unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="fluid-singer-") as tmp:
-        path = Path(tmp) / "tap_config.json"
+        path = Path(tmp) / name
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(config, fh)
@@ -227,7 +230,7 @@ def invoke_tap(
     # regardless of its cwd. Using relative paths here would have the
     # tap look for ``<cwd>/<workdir>/tap_state.json`` after subprocess
     # cd's into ``workdir`` — that's a double-prefix bug we hit.
-    with _private_tap_config(config, workdir) as config_path:
+    with _private_singer_config(config, workdir, "tap_config.json") as config_path:
         cmd = [binary, "--config", str(config_path)]
         if state is not None:
             state_path = (workdir / "tap_state.json").resolve()
@@ -271,7 +274,7 @@ def discover_tap_catalog(
     """
     workdir.mkdir(parents=True, exist_ok=True)
     LOG.info("singer.discover binary=%s", binary)
-    with _private_tap_config(config, workdir) as config_path:
+    with _private_singer_config(config, workdir, "tap_config.json") as config_path:
         cmd = [binary, "--config", str(config_path), "--discover"]
         try:
             proc = subprocess.run(
@@ -447,9 +450,6 @@ def invoke_target(
     code and surfaces stderr to the operator.
     """
     workdir.mkdir(parents=True, exist_ok=True)
-    config_path = (workdir / "target_config.json").resolve()
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-    cmd = [binary, "--config", str(config_path)]
 
     LOG.info("singer.target.invoke binary=%s cwd=%s", binary, workdir)
     # Pre-render the Singer message stream once; Popen.communicate(input=...)
@@ -465,20 +465,21 @@ def invoke_target(
         lines.append(json.dumps({"type": "STATE", "value": state}))
     singer_input = "\n".join(lines) + ("\n" if lines else "")
 
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(workdir.resolve()),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        _stdout, stderr = proc.communicate(input=singer_input, timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        _stdout, stderr = proc.communicate()
-        return {"exit_code": -1, "stderr": f"target timeout after {timeout_seconds}s\n{stderr}"}
+    with _private_singer_config(config, workdir, "target_config.json") as config_path:
+        proc = subprocess.Popen(
+            [binary, "--config", str(config_path)],
+            cwd=str(workdir.resolve()),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _stdout, stderr = proc.communicate(input=singer_input, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _stdout, stderr = proc.communicate()
+            return {"exit_code": -1, "stderr": f"target timeout after {timeout_seconds}s\n{stderr}"}
 
     # Persist stderr to disk so an operator can re-read after the run
     # without re-piping. Mirrors the tap-side ``tap_discover_stderr.log``

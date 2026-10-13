@@ -50,6 +50,15 @@ import traceback
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+# The key names whose ``key=value`` / ``key: value`` VALUE is a credential: one
+# vocabulary for the assignment rule below, the placeholder rule, and
+# :func:`names_a_credential`.
+_CREDENTIAL_KEY_WORDS = (
+    r"api[_-]?key|authorization|aws_secret_access_key|secret[_.-]access[_.-]key|secret[_.-]key|"
+    r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
+    r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token"
+)
+
 _REDACTED = "***REDACTED***"
 # Substring-match list: a mapping/env key is sensitive when any entry is
 # a substring of the lower-cased key name. Keep alphabetically sorted.
@@ -194,11 +203,7 @@ _PEM_PRIVATE_KEY_RE = re.compile(
 # Pinned by ``tests/security/test_security_regressions_round3.py``.
 _ASSIGNMENT_RE = re.compile(
     r"(?ix)"
-    r"(?P<key>\b(?:[A-Za-z0-9_]{,128}_)?(?:"
-    r"api[_-]?key|authorization|aws_secret_access_key|secret[_.-]access[_.-]key|secret[_.-]key|"
-    r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
-    r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token"
-    r")\b)"
+    r"(?P<key>\b(?:[A-Za-z0-9_]{,128}_)?(?:" + _CREDENTIAL_KEY_WORDS + r")\b)"
     r"(?P<sep>['\"]?\s{,8}[:=]\s{,8})"
     r"(?P<quote>['\"]?)"
     r"(?P<value>.{,256}?)(?P=quote)"
@@ -228,11 +233,7 @@ _PLACEHOLDER_RE = re.compile(
 # inspect the last ~64 characters before each placeholder so the regex stays
 # linear in the message length.
 _PRECEDING_SENSITIVE_KEY_RE = re.compile(
-    r"(?ix)\b(?:[A-Za-z0-9_]*_)?(?:"
-    r"api[_-]?key|authorization|aws_secret_access_key|secret[_.-]access[_.-]key|secret[_.-]key|"
-    r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
-    r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token"
-    r")\b\s*[:=]\s*$"
+    r"(?ix)\b(?:[A-Za-z0-9_]*_)?(?:" + _CREDENTIAL_KEY_WORDS + r")\b\s*[:=]\s*$"
 )
 
 
@@ -631,6 +632,26 @@ def is_sensitive_key_name(name: str) -> bool:
     counts as sensitive.
     """
     return _is_sensitive_key(name)
+
+
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_NAMES_A_CREDENTIAL_RE = re.compile(r"(?i)(?:^|_)(?:" + _CREDENTIAL_KEY_WORDS + r")$")
+
+
+def names_a_credential(name: str) -> bool:
+    """True when the key ``name`` itself names a credential, as the text
+    layer's ``key=value`` rule reads one: ``db_password``, ``apiKey``,
+    ``private-key`` and ``clientSecret`` do; ``maxTokensPerDay``,
+    ``secretRef``, ``tokenEnv``, ``authz`` and ``author`` do not.
+
+    camelCase, ``-`` and ``.`` read as ``_``, and the name must END with a
+    credential word. Narrower than :func:`is_sensitive_key_name`, which
+    matches a sensitive word anywhere in a key: right for masking a logging
+    payload, too broad where hiding a value costs the reader, such as a
+    diagnostic that says what a field holds.
+    """
+    snake = _CAMEL_BOUNDARY_RE.sub("_", name).replace("-", "_").replace(".", "_")
+    return bool(_NAMES_A_CREDENTIAL_RE.search(snake))
 
 
 def redact_value(value: Any) -> Any:

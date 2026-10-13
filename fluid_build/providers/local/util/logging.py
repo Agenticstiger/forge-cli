@@ -23,7 +23,11 @@ consistent event formatting. Adapted from GCP provider.
 import re
 from typing import Any, Dict, List
 
-from fluid_build.observability.secret_redactor import is_sensitive_key_name, redact_secret_text
+from fluid_build.observability.secret_redactor import (
+    _URL_USERINFO_RE,
+    is_sensitive_key_name,
+    redact_known_values,
+)
 
 # Patterns for sensitive data that should be redacted
 SENSITIVE_PATTERNS = [
@@ -85,16 +89,18 @@ def redact_string(text: str) -> str:
     if not isinstance(text, str):
         return text
 
-    redacted = text
+    # The two layers the Snowflake twin runs first: the credentials this
+    # process holds, masked whole (before a pattern below can cut one short),
+    # then any ``scheme://user:password@`` userinfo. ``_log_error`` passes a  # pragma: allowlist secret
+    # raw ``str(e)`` through here into the record's ``ctx``, which a JSON log
+    # formatter renders, and the patterns below knew only ``postgresql://``.
+    redacted = redact_known_values(text, placeholder="[REDACTED]")
+    redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]\2", redacted)
 
     for pattern in SENSITIVE_PATTERNS:
         redacted = pattern.sub("[REDACTED]", redacted)
 
-    # Then the shared redactor: the patterns above are a provider-local
-    # subset (no ``postgres://`` userinfo, no ``token=``, no credential this
-    # process registered), and ``_log_error`` passes a raw ``str(e)`` through
-    # here into the record's ``ctx``, which a JSON log formatter renders.
-    return redact_secret_text(redacted)
+    return redacted
 
 
 def redact_dict(data: Dict[str, Any], max_depth: int = 10) -> Dict[str, Any]:

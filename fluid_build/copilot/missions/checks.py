@@ -347,20 +347,24 @@ def _display_leaf(concrete: str, leaf: Any) -> Any:
     reads ``password: expected == …, got 'x'`` as a ``password`` assignment
     whose value is the word ``expected``, so ``'x'`` reached the terminal,
     ``--json``, the scorecard file and the planner's LLM prompt. Mask it here
-    instead, by the path's key names, with the semantics ``redact_value``
-    gives a mapping key: a leaf at or under a credential-named key is never
-    shown, and any other leaf goes through ``redact_value``.
+    instead, by the path's key names: a leaf at or under a key that names a
+    credential (:func:`names_a_credential`) is never shown, and any other leaf
+    goes through ``redact_value``. A value that cannot be redacted (a YAML
+    alias that refers to itself) is not shown either.
     """
     from fluid_build.observability.secret_redactor import (
         _REDACTED,
-        is_sensitive_key_name,
+        names_a_credential,
         redact_value,
     )
 
     keys = [s for s in re.split(r"[.\[\]]", concrete) if s and s != "*" and not s.isdigit()]
-    if any(is_sensitive_key_name(key) for key in keys):
+    if any(names_a_credential(key) for key in keys):
         return _REDACTED
-    return redact_value(leaf)
+    try:
+        return redact_value(leaf)
+    except RecursionError:
+        return _REDACTED
 
 
 def _compare(op: str, leaf: Any, expected: Any, *, shown: Any) -> Tuple[bool, str]:

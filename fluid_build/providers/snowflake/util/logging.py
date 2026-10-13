@@ -100,7 +100,7 @@ SENSITIVE_PATTERNS = [
         #     Including it HERE would run before the PEM-block pattern and
         #     corrupt a ``private_key=<multiline PEM>`` header, leaking the body.
         r"(?i)\b(?P<key>(?:[A-Za-z0-9_]{,128}_)?(?:"
-        r"api[_-]?key|authorization|secret[_-]access[_-]key|client_secret|"
+        r"api[_-]?key|authorization|secret[_.-]access[_.-]key|secret[_.-]key|client_secret|"
         r"oauth[_-]?token|password|session[_-]token|secret|token|passphrase"
         r"))"
         r"(?P<sep>\s{,8}[:=]\s{,8})"

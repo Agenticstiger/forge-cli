@@ -1261,7 +1261,8 @@ def _check_inlined_secrets(
     """An override map that writes a literal ``credential`` / ``token``. WARNING.
 
     The value is inlined into the config forge-cli pushes to the Connect REST
-    API or writes to ``application.properties``. Never quotes the value. A key
+    API or passes to Debezium Server (in its environment, not in
+    ``application.properties``). Never quotes the value. A key
     the catalogAuth conflict check already refuses is not repeated here.
     """
     prefix = _property_prefix(runtime)
@@ -1271,7 +1272,7 @@ def _check_inlined_secrets(
         and runtime.engine in _CATALOG_AUTH_ENGINES
     )
     where = (
-        "writes to application.properties"
+        "passes to Debezium Server"
         if runtime.engine == "debezium"
         else "pushes to the Kafka Connect REST API"
     )
