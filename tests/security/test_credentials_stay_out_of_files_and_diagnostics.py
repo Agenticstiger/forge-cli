@@ -387,9 +387,11 @@ class _FailingConnection:
 def test_no_local_provider_log_call_carries_a_raw_exception_text():
     """Every ``"error": str(e)`` the local provider logs goes through the shared
     redactor (``local.py`` logs a plan, load, SQL, create-table and copy error)."""
-    import fluid_build.providers.local.local as local_module
+    import inspect
 
-    source = Path(local_module.__file__).read_text(encoding="utf-8")
+    from fluid_build.providers.local.local import LocalProvider
+
+    source = Path(inspect.getsourcefile(LocalProvider) or "").read_text(encoding="utf-8")
     assert '"error": str(e)' not in source
     assert source.count("redact_secret_text(str(e))") >= 6
 
