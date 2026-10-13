@@ -180,16 +180,10 @@ class ContractResolver:
     def resolve(
         self, contract_id: str, *, hint: Optional[Union[str, Path]] = None
     ) -> ResolvedContract:
-        # contractId is document text. A value that is not a non-empty string
-        # without NUL bytes names no file and no URL; report it as not found so
-        # lenient imports skip the port. It used to raise ValueError/TypeError
-        # from the path probes, which aborted the whole import.
-        if not isinstance(contract_id, str) or not contract_id or "\x00" in contract_id:
-            raise ContractNotFound(
-                contract_id,
-                [],
-                reason="not a valid contractId (expected a non-empty string with no NUL bytes)",
-            )
+        # Report an id that names no file and no URL as not found, so lenient
+        # imports skip the port; the path probes used to raise on it instead.
+        if not _is_valid_contract_id(contract_id):
+            raise ContractNotFound(contract_id, [], reason=_INVALID_CONTRACT_ID)
         if contract_id in self._cache:
             return self._cache[contract_id]
 
@@ -407,6 +401,18 @@ class ContractResolver:
     def _cache_and_return(self, contract_id: str, resolved: ResolvedContract) -> ResolvedContract:
         self._cache[contract_id] = resolved
         return resolved
+
+
+_INVALID_CONTRACT_ID = "not a valid contractId (expected a non-empty string with no NUL bytes)"
+
+
+def _is_valid_contract_id(value: object) -> bool:
+    """True for a contractId the probes can use: a non-empty string without NUL.
+
+    contractId is document text, so anything else (a number, a list, a NUL
+    byte that ``Path.resolve`` rejects) names no file and no URL.
+    """
+    return isinstance(value, str) and bool(value) and "\x00" not in value
 
 
 def _looks_like_url(value: str) -> bool:

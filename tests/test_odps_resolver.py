@@ -116,19 +116,24 @@ class TestErrors:
         with pytest.raises(RemoteFetchDisabled):
             resolver.resolve("anything", hint="https://example.com/c.yaml")
 
-    @pytest.mark.parametrize("contract_id", ["orders\x00x", 123, ["orders"], "", "http://[::1"])
-    def test_malformed_contract_id_is_not_found(self, tmp_path: Path, contract_id: object) -> None:
+    @pytest.mark.parametrize(
+        "contract_id, reason",
+        [
+            ("orders\x00x", "not a valid contractId"),
+            (123, "not a valid contractId"),
+            (["orders"], "not a valid contractId"),
+            ("", "not a valid contractId"),
+            ("http://[::1", "Tried"),  # not a URL urlparse accepts: probed as a plain id
+        ],
+    )
+    def test_malformed_contract_id_is_not_found(
+        self, tmp_path: Path, contract_id: object, reason: str
+    ) -> None:
         # contractId is document text. A value the resolver cannot look up is
         # a contract it did not find, which lenient imports skip; it used to
         # raise ValueError/TypeError and abort the whole import.
-        resolver = ContractResolver(base_path=tmp_path, allow_remote=False)
-        with pytest.raises(ContractNotFound):
-            resolver.resolve(contract_id)  # type: ignore[arg-type]
-
-    def test_malformed_contract_id_message_says_why(self, tmp_path: Path) -> None:
-        resolver = ContractResolver(base_path=tmp_path, allow_remote=False)
-        with pytest.raises(ContractNotFound, match="not a valid contractId"):
-            resolver.resolve("orders\x00x")
+        with pytest.raises(ContractNotFound, match=reason):
+            ContractResolver(base_path=tmp_path).resolve(contract_id)  # type: ignore[arg-type]
 
 
 def _odcs_yaml(contract_id: str) -> str:
@@ -194,26 +199,21 @@ class TestLooksLikeUrl:
 # ---------------------------------------------------------------------------
 
 
-class TestRemoteResolution:
-    def test_alias_bomb_body_is_not_found(self, tmp_path: Path) -> None:
-        # A fetched body is parsed with the same anchor-expansion caps as any
-        # other untrusted YAML, not a plain yaml.safe_load.
-        lines = ["apiVersion: v3.1.0", "kind: DataContract", "l0: &l0 [lol]"]
-        lines += [f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]" for i in range(1, 19)]
-        resolver = ContractResolver(base_path=tmp_path, allow_remote=True)
-        with (
-            patch(
-                "fluid_build.providers.odps_standard.resolver._fetch_bytes",
-                return_value=(200, {"content-type": "application/yaml"}, "\n".join(lines).encode()),
-            ),
-            patch(
-                "fluid_build.providers.odps_standard.resolver._assert_safe_url",
-                return_value=None,
-            ),
-        ):
-            with pytest.raises(ContractNotFound):
-                resolver.resolve("https://example.com/c.odcs.yaml")
+def test_fetched_alias_bomb_is_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fetched body is parsed with the anchor-expansion caps any untrusted
+    YAML gets, not a plain yaml.safe_load."""
+    from fluid_build.providers.odps_standard import resolver as resolver_mod
 
+    lines = ["apiVersion: v3.1.0", "kind: DataContract", "l0: &l0 [lol]"]
+    lines += [f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]" for i in range(1, 19)]
+    body = "\n".join(lines).encode()
+    monkeypatch.setattr(resolver_mod, "_assert_safe_url", lambda url: None)
+    monkeypatch.setattr(resolver_mod, "_fetch_bytes", lambda *a, **k: (200, {}, body))
+    with pytest.raises(ContractNotFound):
+        ContractResolver(allow_remote=True).resolve("https://example.com/c.odcs.yaml")
+
+
+class TestRemoteResolution:
     def test_html_with_200_is_refused(self, tmp_path: Path) -> None:
         resolver = ContractResolver(base_path=tmp_path, allow_remote=True)
         with (

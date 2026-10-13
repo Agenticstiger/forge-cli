@@ -167,20 +167,16 @@ class TestNegative:
         # The expose stub still gets created — just without a contract body
         assert len(fluid["exposes"]) == 1
 
-    def test_malformed_contract_id_lenient_warns(self, provider: BitolOdpsProvider) -> None:
+    @pytest.mark.parametrize("ports, lenient", [("outputPorts", True), ("inputPorts", False)])
+    def test_malformed_contract_id_skips_the_port(
+        self, provider: BitolOdpsProvider, ports: str, lenient: bool
+    ) -> None:
         # A NUL byte in a contractId made the resolver raise ValueError, which
-        # aborted the import even with lenient=True.
+        # aborted the import even with lenient=True, and even on input ports,
+        # which always resolve leniently.
         doc = yaml.safe_load(_bundle_product_path().read_text(encoding="utf-8"))
-        doc["outputPorts"][0]["contractId"] = "orders\x00x"
-        fluid = provider.import_contract(doc, base_path=BUNDLE_DIR, lenient=True)
-        assert len(fluid["exposes"]) == 2
-
-    def test_malformed_input_port_contract_id_is_skipped(self, provider: BitolOdpsProvider) -> None:
-        # Input ports are always resolved leniently; a malformed id must not
-        # abort an otherwise strict import.
-        doc = yaml.safe_load(_bundle_product_path().read_text(encoding="utf-8"))
-        doc["inputPorts"] = [{"name": "upstream", "version": "1.0.0", "contractId": "up\x00"}]
-        fluid = provider.import_contract(doc, base_path=BUNDLE_DIR)
+        doc.setdefault(ports, [{"name": "upstream", "version": "1.0.0"}])[0]["contractId"] = "x\x00"
+        fluid = provider.import_contract(doc, base_path=BUNDLE_DIR, lenient=lenient)
         assert len(fluid["exposes"]) == 2
 
     def test_two_odps_docs_in_directory_raises(self, provider: BitolOdpsProvider) -> None:
