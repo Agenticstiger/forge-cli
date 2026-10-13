@@ -475,21 +475,6 @@ class TestRunOdpsValidate(unittest.TestCase):
             result = _run_odps_validate(args)
         assert result == 0
 
-    def test_validate_rejects_an_alias_bomb(self):
-        from fluid_build.cli.odps_standard import _run_odps_validate
-        from fluid_build.util.safe_yaml import UnsafeYamlError
-
-        lines = ["apiVersion: v1.0.0", "kind: DataProduct", "id: dp-001", "name: P"]
-        lines += ["status: active", "l0: &l0 [lol]"]
-        lines += [f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]" for i in range(1, 19)]
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            f.write("\n".join(lines))
-        args = argparse.Namespace(odps_file=f.name)
-
-        with patch("fluid_build.cli.odps_standard.cprint"):
-            with self.assertRaises(UnsafeYamlError):
-                _run_odps_validate(args)
-
     def test_validate_missing_fields_returns_1(self):
         from fluid_build.cli.odps_standard import _run_odps_validate
 
@@ -704,6 +689,21 @@ class TestOdpsBitolCli(unittest.TestCase):
         result = runner.invoke(odps_bitol_cli, ["--help"])
         assert result.exit_code == 0
         assert "ODPS-Bitol" in result.output or "odps-bitol" in result.output.lower()
+
+
+def test_odps_validate_reports_an_alias_bomb_as_a_failure(tmp_path: Path) -> None:
+    """The file is read with the anchor-expansion caps; one over them fails the
+    validation with the reason instead of ending as an unhandled exception."""
+    from fluid_build.cli.odps_standard import _run_odps_validate
+
+    lines = ["apiVersion: v1.0.0", "kind: DataProduct", "id: dp-001", "name: P", "status: x"]
+    lines += ["l0: &l0 [lol]"] + [f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]" for i in range(1, 19)]
+    product = tmp_path / "product.odps.yaml"
+    product.write_text("\n".join(lines), encoding="utf-8")
+
+    with patch("fluid_build.cli.odps_standard.cprint") as printed:
+        assert _run_odps_validate(argparse.Namespace(odps_file=str(product))) == 1
+    assert "aliases expand" in printed.call_args.args[0]
 
 
 if __name__ == "__main__":
