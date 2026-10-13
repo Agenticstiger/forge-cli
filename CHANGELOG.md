@@ -784,6 +784,11 @@ This release fixes six security advisories. Each entry below has its own upgrade
 
 ### Fixed
 
+- **`fluid forge --seed-from` catches a dropped expose.** When the model left out an
+  expose the seed declares, the ground-truth guard raised `IndexError`, logged
+  `structural_seed_guard_failed` and kept the generated contract, so the expose was lost
+  without an error. A missing expose is now a seed mismatch, and the repair loop asks the
+  model to restore it.
 - **Command output keeps its square brackets.** Rich read text in brackets as console
   markup and dropped it, so `fluid validate` printed `exposes declares
   governance.lakeFormation` instead of `exposes[orders] declares ...`, bundle findings
