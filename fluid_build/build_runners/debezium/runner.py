@@ -644,7 +644,10 @@ def _execute_debezium_server(
     # world-readable, and no chmod whose failure could be ignored. A
     # hand-written sink key the credential rule does not name still lands
     # in this file.
-    _atomic_write_bytes(config_path, properties.encode("utf-8"), mode=0o600)
+    try:
+        _atomic_write_bytes(config_path, properties.encode("utf-8"), mode=0o600)
+    except OSError as exc:
+        return _failed(ctx, started_at, t_start, f"could not write {config_path}: {exc}")
 
     # Validate any contract-supplied ``server_binary`` before it becomes
     # ``argv[0]`` (arbitrary-binary-execution guard). A value with a path

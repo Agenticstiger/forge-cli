@@ -325,6 +325,39 @@ def test_embedded_server_file_holds_no_password_and_server_gets_it(tmp_path, mon
     assert captured.read_text() == _SECRET
 
 
+def test_an_unwritable_config_is_a_failed_run_not_a_crash(tmp_path, monkeypatch):
+    from fluid_build.build_runners.debezium import runner as dbz
+    from fluid_build.credentials import encrypted_store
+
+    def refuse(*_a, **_k):
+        raise FileExistsError(17, "File exists")
+
+    monkeypatch.setattr(encrypted_store, "_atomic_write_bytes", refuse)
+    ctx = SimpleNamespace(
+        workdir=str(tmp_path),
+        product_id="p",
+        build_id="b",
+        run_id="r",
+        source=SimpleNamespace(
+            kind="postgres", connection=SimpleNamespace(raw={"host": "db"}), streams=[]
+        ),
+        contract={},
+        sink=None,
+        env={},
+    )
+    result = dbz._execute_debezium_server(
+        ctx,
+        {"engine": "debezium", "properties": {}},
+        {"mode": "embedded"},
+        {"server": {"sink": {"type": "kafka"}}},
+        "initial",
+        "2026-10-13T00:00:00Z",
+        0.0,
+    )
+    assert result.state.value == "failed"
+    assert "could not write" in (result.error or "")
+
+
 # ── #53 / #54: the Singer tap config is private and short-lived ──────────
 
 

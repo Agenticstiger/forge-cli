@@ -297,7 +297,8 @@ def test_debezium_server_iceberg_lands_rows(tmp_path: Path):
                 "python:3.11-slim",
                 "sh",
                 "-c",
-                "pip -q install 'pyiceberg[s3fs]==0.8.1' pyarrow >/dev/null 2>&1 "
+                # 0.11.1 parses format-version 3 metadata, which the server writes
+                "pip -q install 'pyiceberg[s3fs]==0.11.1' pyarrow >/dev/null 2>&1 "
                 "&& python /read_back.py",
             ],
             capture_output=True,
