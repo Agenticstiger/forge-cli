@@ -433,9 +433,17 @@ def _run_odcs_import(args):
     import json
     from pathlib import Path
 
+    import yaml
+
+    from fluid_build.util.safe_yaml import UnsafeYamlError
+
     # Import ODCS
     provider = OdcsProvider()
-    fluid_contract = provider.import_contract(args.odcs_file)
+    try:
+        fluid_contract = provider.import_contract(args.odcs_file)
+    except (UnsafeYamlError, yaml.YAMLError) as exc:
+        console_error(f"Error importing: {exc}")
+        return 1
 
     # Generate output path if not specified
     if not args.output:
@@ -516,9 +524,14 @@ def _run_odcs_validate(args):
         roundtrip_check,
         validate_via_vowl,
     )
+    from fluid_build.util.safe_yaml import UnsafeYamlError
 
     file_path = Path(args.odcs_file)
-    odcs_data = load_yaml_json(file_path)
+    try:
+        odcs_data = load_yaml_json(file_path)
+    except UnsafeYamlError as exc:
+        cprint(f"✗ Validation failed: {exc}")
+        return 1
 
     report: dict = {
         "file": str(file_path),

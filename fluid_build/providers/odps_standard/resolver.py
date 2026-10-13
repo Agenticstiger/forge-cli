@@ -17,7 +17,8 @@
 Resolution order (per the Phase 3 plan):
 
   1. **local file** — probe candidate filenames in ``base_path`` and a few
-     conventional subdirs.
+     conventional subdirs. A probed file is used only when it declares the
+     ``contractId`` as its ``id``; one that declares another is skipped.
   2. **http(s) URL** — only when the ``contractId`` is itself a URL (or a
      ``hint`` URL is given) and ``allow_remote=True``.
 
@@ -318,8 +319,8 @@ class ContractResolver:
         # contract only if it declares that id, as ODPS ports reference ODCS ids.
         if require_id and data.get("id") != contract_id:
             LOG.warning(
-                "Skipping %s: it declares id %r, not contractId %r",
-                path,
+                "Skipping %r: it declares id %r, not contractId %r",
+                str(path),  # %r: the bundle names its files, control characters included
                 data.get("id"),
                 contract_id,
             )
@@ -364,7 +365,10 @@ class ContractResolver:
                 data = json.loads(text)
             except json.JSONDecodeError:
                 data = load_yaml_safe(text)
-        except (UnicodeDecodeError, yaml.YAMLError, UnsafeYamlError):
+        except UnsafeYamlError as exc:
+            # Its message carries only sizes and counts, never body text.
+            raise ContractNotFound(contract_id, [url], reason=str(exc)) from None
+        except (UnicodeDecodeError, yaml.YAMLError):
             # Don't propagate parser exception text — it can include body fragments
             raise ContractNotFound(contract_id, [url]) from None
         if not isinstance(data, Mapping):

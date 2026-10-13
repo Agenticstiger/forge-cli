@@ -572,3 +572,37 @@ class TestRunOdcsInfo:
             code = _run_odcs_info(args)
 
         assert code == 0
+
+
+# ---------------------------------------------------------------------------
+# A file over the YAML caps fails cleanly (it was read with a plain safe_load)
+# ---------------------------------------------------------------------------
+
+# 13 levels of [*a, *a]: 26 aliases that grow a 30-node file to 49,150 nodes.
+_ALIAS_BOMB = "\n".join(
+    ["l0: &l0 [lol]"] + [f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]" for i in range(1, 14)]
+)
+
+
+def test_odcs_validate_reports_an_alias_bomb_as_a_failure(tmp_path: Path) -> None:
+    import argparse
+
+    contract = tmp_path / "c.yaml"
+    contract.write_text(_ALIAS_BOMB, encoding="utf-8")
+    args = argparse.Namespace(odcs_file=str(contract), report=None, roundtrip=False, vowl=False)
+    with patch("fluid_build.cli.odcs.cprint") as printed:
+        assert _run_odcs_validate(args) == 1
+    assert "aliases expand" in printed.call_args.args[0]
+
+
+def test_odcs_import_reports_an_alias_bomb_as_a_failed_import(tmp_path: Path) -> None:
+    import argparse
+
+    contract = tmp_path / "c.yaml"
+    contract.write_text(_ALIAS_BOMB, encoding="utf-8")
+    out = tmp_path / "out.yaml"
+    args = argparse.Namespace(odcs_file=str(contract), output=str(out), format="yaml")
+    with patch("fluid_build.cli.odcs.console_error") as reported:
+        assert _run_odcs_import(args) == 1
+    assert "aliases expand" in reported.call_args.args[0]
+    assert not out.exists()

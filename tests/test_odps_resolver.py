@@ -209,7 +209,7 @@ def test_fetched_alias_bomb_is_not_found(monkeypatch: pytest.MonkeyPatch) -> Non
     body = "\n".join(lines).encode()
     monkeypatch.setattr(resolver_mod, "_assert_safe_url", lambda url: None)
     monkeypatch.setattr(resolver_mod, "_fetch_bytes", lambda *a, **k: (200, {}, body))
-    with pytest.raises(ContractNotFound):
+    with pytest.raises(ContractNotFound, match="aliases expand"):
         ContractResolver(allow_remote=True).resolve("https://example.com/c.odcs.yaml")
 
 
