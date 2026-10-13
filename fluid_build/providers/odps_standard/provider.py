@@ -421,7 +421,8 @@ class BitolOdpsProvider(BaseProvider):
             return resolver.resolve(contract_id)
         except ContractNotFound as exc:
             if lenient:
-                self.logger.warning("Skipping unresolved contract %s: %s", contract_id, exc)
+                # %r: contractId is document text and can carry a NUL byte.
+                self.logger.warning("Skipping unresolved contract %r: %s", contract_id, exc)
                 return None
             raise
 
