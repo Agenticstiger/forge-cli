@@ -187,8 +187,8 @@ def _private_singer_config(config: Dict[str, Any], workdir: Path, name: str) -> 
 
     Singer's ``--config`` contract puts the resolved credential in a file: it
     is how a tap or target reads its password. The file is created 0o600
-    inside a 0o700 ``TemporaryDirectory`` (the pattern ``dbt/profiles.py``
-    uses for a generated ``profiles.yml``) and removed when the ``with``
+    inside a 0o700 ``TemporaryDirectory`` (as ``dbt/profiles.py`` keeps a
+    generated ``profiles.yml``) and removed when the ``with``
     block exits: after the subprocess returns, fails or times out. A fluid
     process killed by a signal can leave it in that private directory. It
     used to be ``<workdir>/<name>``: under the contract directory, 0o644,

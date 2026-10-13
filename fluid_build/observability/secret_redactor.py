@@ -51,8 +51,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 # The key names whose ``key=value`` / ``key: value`` VALUE is a credential: one
-# vocabulary for the assignment rule below, the placeholder rule, and
-# :func:`names_a_credential`.
+# vocabulary for the assignment rule and the placeholder rule below.
 _CREDENTIAL_KEY_WORDS = (
     r"api[_-]?key|authorization|aws_secret_access_key|secret[_.-]access[_.-]key|secret[_.-]key|"
     r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
@@ -632,26 +631,6 @@ def is_sensitive_key_name(name: str) -> bool:
     counts as sensitive.
     """
     return _is_sensitive_key(name)
-
-
-_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-_NAMES_A_CREDENTIAL_RE = re.compile(r"(?i)(?:^|_)(?:" + _CREDENTIAL_KEY_WORDS + r")$")
-
-
-def names_a_credential(name: str) -> bool:
-    """True when the key ``name`` itself names a credential, as the text
-    layer's ``key=value`` rule reads one: ``db_password``, ``apiKey``,
-    ``private-key`` and ``clientSecret`` do; ``maxTokensPerDay``,
-    ``secretRef``, ``tokenEnv``, ``authz`` and ``author`` do not.
-
-    camelCase, ``-`` and ``.`` read as ``_``, and the name must END with a
-    credential word. Narrower than :func:`is_sensitive_key_name`, which
-    matches a sensitive word anywhere in a key: right for masking a logging
-    payload, too broad where hiding a value costs the reader, such as a
-    diagnostic that says what a field holds.
-    """
-    snake = _CAMEL_BOUNDARY_RE.sub("_", name).replace("-", "_").replace(".", "_")
-    return bool(_NAMES_A_CREDENTIAL_RE.search(snake))
 
 
 def redact_value(value: Any) -> Any:

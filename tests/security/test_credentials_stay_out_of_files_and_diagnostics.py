@@ -155,7 +155,7 @@ def _mission(tmp_path, criteria):
         "        database: sales\n"
         f"        password: '{_SECRET}'\n"
         f"        api_token: '{_SECRET}'\n"
-        f"        settings: {{user: app, password: '{_SECRET}'}}\n",
+        f"        settings: {{user: app, auth: '{_SECRET}'}}\n",
         encoding="utf-8",
     )
     spec = MissionSpec(
@@ -228,9 +228,43 @@ def _diagnostic(path: str, leaf, op="eq", value="x") -> str:
 
 
 @pytest.mark.parametrize(
-    "path", ["a.privateKey", "a.private-key", "a.apiKey", "a.clientSecret", "a.sessionToken"]
+    "path",
+    [
+        "a.password",
+        "a.passwords",
+        "a.secrets",
+        "a.secrets.db",
+        "a.tokens",
+        "a.auth",
+        "a.auth.basic",
+        "a.bearer",
+        "a.jwt",
+        "a.secretValue",
+        "a.private_key_pem",
+        "a.credentials_json",
+        "a.credentials.user",
+        "a.connection_string",
+        "a.connectionString",
+        "a.conn_str",
+        "a.dsn",
+        "a.PGPASSWORD",
+        "a.DBPassword",
+        "a.AWSSecretAccessKey",
+        "a.MYSQL_PWD",
+        "a.passwd",
+        "a.password1",
+        "a.DB Password",
+        "a.privateKey",
+        "a.private-key",
+        "a.apiKey",
+        "a.clientSecret",
+        "a.sessionToken",
+    ],
 )
-def test_a_camel_or_kebab_case_credential_key_is_masked(path):
+def test_a_credential_key_is_masked(path):
+    """The key rule fails closed: anything the shared ``is_sensitive_key_name``
+    calls a credential (plurals, containers, ``*Value``, no separator) hides
+    the value, and so does a key under it."""
     assert _SECRET not in _diagnostic(path, _SECRET)
 
 
@@ -241,12 +275,16 @@ def test_a_camel_or_kebab_case_credential_key_is_masked(path):
         ("policy.authz.readers", ["group:everyone"], "contains", "group:x", "'group:everyone'"),
         ("binding.secretRef.provider", "vault", "eq", "env", "got 'vault'"),
         ("sink.catalogAuth.tokenEnv", "UC_TOKEN", "eq", "X", "got 'UC_TOKEN'"),
+        ("sink.catalogAuth.type", "oauth2", "eq", "bearer", "got 'oauth2'"),
+        ("sink.catalogAuth.scope", "lakekeeper", "eq", "x", "got 'lakekeeper'"),
+        ("binding.passwordFile", "/run/pw", "eq", "x", "got '/run/pw'"),
         ("metadata.author", "alice", "eq", "bob", "got 'alice'"),
     ],
 )
-def test_a_key_that_only_mentions_a_credential_word_is_shown(path, leaf, op, value, shown):
-    """``auth``/``token``/``secret`` inside a longer key name is not a credential:
-    the diagnostic must keep the value the planner needs to repair it."""
+def test_a_key_that_refers_to_or_only_mentions_a_credential_is_shown(path, leaf, op, value, shown):
+    """A reference to a credential (``secretRef``, ``tokenEnv``, anything under
+    ``catalogAuth`` that names one), a token budget and ``authz``/``author`` are
+    not credentials: the diagnostic keeps the value the planner needs."""
     assert shown in _diagnostic(path, leaf, op, value)
 
 
@@ -287,6 +325,42 @@ def test_local_sql_error_context_masks_a_postgres_url_password(tmp_path):
     assert records, "nothing was logged"
     assert _SECRET not in repr(records[-1].__dict__)
     assert "nohost/x.csv" in repr(records[-1].__dict__)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "HTTP 401 https://api/x?token={s}&api_key={s}",
+        "auth failed: client_secret={s}",
+        "Authorization: Bearer {s}",
+        "aws_secret_access_key={s}",
+    ],
+)
+def test_a_failed_sql_action_logs_its_error_redacted(tmp_path, error):
+    """``_run_sql_on`` logs ``local_sql_error`` with the exception's text; that
+    text gets the full shared redactor, not only the provider's patterns."""
+    from unittest import mock
+
+    from fluid_build.providers.local.local import LocalProvider
+
+    provider = LocalProvider(
+        logger=logging.getLogger("test.local.sqlerr"), anchor_dir=str(tmp_path)
+    )
+    with mock.patch.object(provider, "_log_error") as log_error, pytest.raises(RuntimeError):
+        provider._run_sql_on(
+            _FailingConnection(error.format(s=_SECRET)), 0, {}, "SELECT 1", [], [], 0.0
+        )
+    assert log_error.call_args_list, "nothing was logged"
+    logged = repr([c.args for c in log_error.call_args_list])
+    assert _SECRET not in logged
+
+
+class _FailingConnection:
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    def sql(self, _sql):
+        raise RuntimeError(self.message)
 
 
 def test_local_redact_sql_masks_a_postgres_url_password():
@@ -378,6 +452,13 @@ def test_env_prefix_is_iceberg_syntax_for_the_sink_only():
 @pytest.mark.parametrize(
     "key",
     [
+        "database.password",
+        "mongodb.password",
+        "mongodb.connection.string",
+        "client.secret",
+        "s3.session-token",
+        "oauth2.credential",
+        "sasl.jaas.config",
         "connectionstring",
         "header.Authorization",
         "client.authParams",
@@ -394,6 +475,19 @@ def test_more_credential_property_names_go_to_the_environment(key):
     assert list(env.values()) == [_SECRET]
 
 
+def test_every_catalog_auth_secret_name_is_a_credential_property():
+    """The renderer's rule and catalogAuth's own list of secret-valued
+    properties cannot drift apart."""
+    from fluid_build.build_runners.debezium.runner import _CREDENTIAL_PROPERTY_RE
+    from fluid_build.providers._iceberg_catalog_auth import (
+        AUTHORIZATION_HEADER_PROPERTY,
+        INLINE_CHECKED_KEYS,
+    )
+
+    for key in (*INLINE_CHECKED_KEYS, AUTHORIZATION_HEADER_PROPERTY):
+        assert _CREDENTIAL_PROPERTY_RE.search(key), key
+
+
 def test_two_properties_on_one_env_name_fail_closed():
     from fluid_build.build_runners.debezium.runner import render_application_properties
 
@@ -406,10 +500,13 @@ def test_embedded_server_file_holds_no_password_and_server_gets_it(tmp_path, mon
     from fluid_build.build_runners.debezium import runner as dbz
 
     monkeypatch.setenv("PG_PASSWORD_T211", _SECRET)
+    monkeypatch.setenv("LAKEKEEPER_CREDENTIAL_T211", "inherited")
     captured = tmp_path / "server-env.txt"
     server = tmp_path / "debezium-server"
     server.write_text(
-        f"#!/bin/sh\nprintf '%s' \"$FLUID_DBZ_SOURCE_DATABASE_PASSWORD\" > '{captured}'\nexit 3\n"
+        "#!/bin/sh\n"
+        'printf \'%s|%s\' "$FLUID_DBZ_SOURCE_DATABASE_PASSWORD" "$LAKEKEEPER_CREDENTIAL_T211"'
+        f" > '{captured}'\nexit 3\n"
     )
     server.chmod(0o700)
     ctx = SimpleNamespace(
@@ -438,7 +535,8 @@ def test_embedded_server_file_holds_no_password_and_server_gets_it(tmp_path, mon
     config = tmp_path / ".fluid/debezium/sales.orders/b1/application.properties"
     assert _SECRET not in config.read_text()
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
-    assert captured.read_text() == _SECRET
+    # the credential is added to the inherited environment, not instead of it
+    assert captured.read_text() == f"{_SECRET}|inherited"
 
 
 def _embedded_ctx(tmp_path):

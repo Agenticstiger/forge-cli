@@ -91,9 +91,10 @@ def redact_string(text: str) -> str:
 
     # The two layers the Snowflake twin runs first: the credentials this
     # process holds, masked whole (before a pattern below can cut one short),
-    # then any ``scheme://user:password@`` userinfo. ``_log_error`` passes a  # pragma: allowlist secret
-    # raw ``str(e)`` through here into the record's ``ctx``, which a JSON log
-    # formatter renders, and the patterns below knew only ``postgresql://``.
+    # then any ``scheme://user:password@`` userinfo, which the patterns below  # pragma: allowlist secret
+    # knew only for ``postgresql://``. The record's ``ctx`` goes out through
+    # here, and a JSON log formatter renders it. An exception's text gets the
+    # full shared redactor where the provider logs it (``local.py``).
     redacted = redact_known_values(text, placeholder="[REDACTED]")
     redacted = _URL_USERINFO_RE.sub(r"\1[REDACTED]\2", redacted)
 

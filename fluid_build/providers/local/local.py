@@ -416,7 +416,7 @@ class LocalProvider(BaseProvider):
             return actions
 
         except Exception as e:
-            self._log_error("local_plan_error", {"error": str(e)})
+            self._log_error("local_plan_error", {"error": redact_secret_text(str(e))})
             raise
 
     def apply(
@@ -811,7 +811,12 @@ class LocalProvider(BaseProvider):
         except Exception as e:
             self._log_error(
                 "local_load_data_error",
-                {"i": idx, "error": str(e), "path": str(path), "table": table_name},
+                {
+                    "i": idx,
+                    "error": redact_secret_text(str(e)),
+                    "path": str(path),
+                    "table": table_name,
+                },
             )
             raise
         finally:
@@ -880,7 +885,7 @@ class LocalProvider(BaseProvider):
                 "local_sql_error",
                 {
                     "i": idx,
-                    "error": str(e),
+                    "error": redact_secret_text(str(e)),
                     "sql_preview": redacted_sql[:500],
                     "duration_ms": duration_ms(start_time),
                 },
@@ -903,7 +908,8 @@ class LocalProvider(BaseProvider):
                 )
             except Exception as e:
                 self._log_warn(
-                    "local_sql_create_table_warn", {"table": output_table, "error": str(e)}
+                    "local_sql_create_table_warn",
+                    {"table": output_table, "error": redact_secret_text(str(e))},
                 )
 
         written: List[str] = []
@@ -1115,7 +1121,7 @@ class LocalProvider(BaseProvider):
             except Exception as e:
                 self._log_warn(
                     "local_materialize_fallback",
-                    {"i": idx, "source_table": source_table, "error": str(e)},
+                    {"i": idx, "source_table": source_table, "error": redact_secret_text(str(e))},
                 )
 
         if src and not source_table:

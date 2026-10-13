@@ -109,7 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fluid validate` and the streaming runners now warn when an Iceberg sink override
   (`iceberg_catalog_overrides`, `sink_connector_config`, `debezium.server.sink.config`) sets
   the catalog's `credential` or `token` to a literal value, which forge-cli then pushes to
-  the Kafka Connect REST API or writes to `application.properties`. A value that starts
+  the Kafka Connect REST API or passes to Debezium Server. A value that starts
   with `env:` or carries a `${...}` expression does not warn. Under `fluid validate
   --strict` the warning fails validation; use `sink.catalogAuth`, or an `env:<VARIABLE>`
   value.
@@ -449,19 +449,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   predicate on a path such as `exposes[*].binding.location.password` printed
   `got '<value>'` to the terminal, `--json`, the stored scorecard and the planner's LLM
   prompt, because the redactor read `password: expected == …` as the assignment. A leaf at
-  or under a key that names a credential (`password`, `apiKey`, `privateKey`,
-  `clientSecret`, `sessionToken`, …) now shows as `***REDACTED***`; a key that only <!-- pragma: allowlist secret -->
-  contains such a word (`maxTokensPerDay`, `secretRef`, `tokenEnv`) still shows its value.
-  (CodeQL alert 241.)
-- **The shared redactor masks `aws.secret.access.key=`, `secret.access.key=` and
-  `fs.s3a.secret.key=`.** It knew only the `_` and `-` spellings, so a Kafka Connect task
-  trace stored in a run record kept an S3 secret key. The Snowflake provider's redactor
-  masks the same spellings. (CodeQL alert 231.)
-- **The local provider's log context masks the credentials forge-cli holds and URL
-  userinfo.** A failed SQL action put the raw error into the log record's context, which a
-  JSON log formatter renders, and the provider's own patterns knew only `postgresql://`.
-  It now runs the same two layers first that the Snowflake provider does: each registered
-  credential masked whole, then any `scheme://user:password@`. (CodeQL alert 292.) <!-- pragma: allowlist secret -->
+  or under a key the redactor treats as a credential (`password`, `secrets`, `auth`,
+  `connection_string`, `apiKey`, `PGPASSWORD`, …) now shows as `***REDACTED***`. A key that <!-- pragma: allowlist secret -->
+  refers to a credential (`secretRef`, `tokenEnv`, `catalogAuth.type`) or only contains such
+  a word (`maxTokensPerDay`, `authz`, `author`) still shows its value. (CodeQL alert 241.)
+- **The shared redactor masks `aws.secret.access.key=`, `secret.access.key=`,
+  `fs.s3a.secret.key=` and `secret_key=`.** It knew `secret_access_key` with `_` or `-`, and
+  no `secret.key` form at all, so a Kafka Connect task trace stored in a run record kept an
+  S3 secret key. The Snowflake provider's redactor masks the same spellings. (CodeQL alert
+  231.)
+- **The local provider's log context no longer carries a raw error.** A failed plan, load,
+  SQL or copy action put the exception's text into the log record's context, which a JSON
+  log formatter renders. That text now goes through the shared redactor, and every context
+  value first gets the two layers the Snowflake provider runs: each credential forge-cli
+  holds masked whole, then any `scheme://user:password@` userinfo. (CodeQL alert 292.) <!-- pragma: allowlist secret -->
 - `mask_known_secrets` is now `redact_known_values`; the old name stays as an alias. CodeQL
   treats a call to a function named like `*secret*` as a source of secrets, so every caller
   of the redactor was reported as logging or storing a credential it had already masked.
