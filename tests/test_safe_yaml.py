@@ -21,6 +21,7 @@ import io
 from pathlib import Path
 
 import pytest
+import yaml
 
 from fluid_build.util.safe_yaml import MAX_YAML_ALIASES, UnsafeYamlError, load_yaml_safe
 
@@ -103,10 +104,58 @@ def test_recursive_alias_does_not_hide_an_expansion() -> None:
         load_yaml_safe(doc)
 
 
-def test_large_alias_free_document_is_allowed() -> None:
-    """The expansion budget counts what aliases add, not document size."""
-    doc = "\n".join(f"k{i}: [a, b, {{c: d}}]" for i in range(5_000))
-    assert len(load_yaml_safe(doc)) == 5_000
+def test_budget_counts_what_aliases_add_not_document_size() -> None:
+    """One alias sends this 800-node document through the expansion walk; it
+    adds one node, so it loads under a budget of 50."""
+    doc = "anchor: &a x\nref: *a\n" + "\n".join(f"k{i}: [a, b]" for i in range(200))
+    assert load_yaml_safe(doc, max_alias_expansion=50)["ref"] == "x"
+
+
+def test_ratio_cap_refuses_a_chain_under_the_node_budget() -> None:
+    """13 levels add 49,120 nodes, inside the 100,000 default, but grow a 30-node
+    document more than 1,600-fold, so the ratio rule refuses it on its own."""
+    with pytest.raises(UnsafeYamlError, match="expand"):
+        load_yaml_safe(_doubling_chain(13))
+
+
+@pytest.mark.parametrize("refs, refused", [(39, False), (45, True)])
+def test_default_expansion_cap(refs: int, refused: bool) -> None:
+    """A 2,501-node block aliased 39 times adds 97,539 nodes; 45 times adds
+    112,545, over the 100,000 default. Neither trips the ratio rule."""
+    block = "{" + ", ".join(f"f{i}: v" for i in range(1250)) + "}"
+    doc = f"base: &b {block}\n" + "\n".join(f"r{i}: *b" for i in range(refs))
+    if refused:
+        with pytest.raises(UnsafeYamlError, match="expand"):
+            load_yaml_safe(doc)
+    else:
+        assert len(load_yaml_safe(doc)) == refs + 1
+
+
+@pytest.mark.parametrize(
+    "tag", ["!!python/object/apply:os.getcwd []", "!!python/name:os.getcwd ''"]
+)
+def test_alias_path_constructs_safe_tags_only(tag: str) -> None:
+    """With an alias the document is composed and constructed by hand; that
+    path must refuse Python object tags exactly as ``yaml.safe_load`` does."""
+    with pytest.raises(yaml.YAMLError):
+        load_yaml_safe(f"a: &x 1\nb: *x\nc: {tag}")
+
+
+def test_stream_is_read_only_up_to_the_cap() -> None:
+    """A stream is refused after one unit past the cap, not read whole."""
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.sizes: list = []
+
+        def read(self, size: int = -1) -> str:
+            self.sizes.append(size)
+            return "x" * (size if size > 0 else 10_000_000)
+
+    stream = _Stream()
+    with pytest.raises(UnsafeYamlError, match="safety cap"):
+        load_yaml_safe(stream, max_bytes=1_000)
+    assert stream.sizes == [1_001]
 
 
 def test_reusing_a_block_is_allowed() -> None:
@@ -137,3 +186,34 @@ def test_odcs_reader_applies_the_caps(tmp_path: Path) -> None:
     )
     with pytest.raises(UnsafeYamlError):
         read_input(path)
+
+
+def test_callers_report_a_refused_file_as_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Callers that caught ``yaml.YAMLError`` alone crashed with
+    ``UnsafeYamlError``; the expansion budget refuses more inputs than the
+    alias count did, so each must report the file as it reports bad YAML."""
+    import logging
+    import sys
+    import types
+
+    from fluid_build.forge.core import artifact_fanout, validators
+    from fluid_build.forge.federation import load_federation_manifest
+
+    bomb = _doubling_chain(13)
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_text(bomb, encoding="utf-8")
+    assert artifact_fanout._contract_is_reference_only(contract) is False
+    assert artifact_fanout._load_schedule_contract(contract, None, logging.getLogger()) is None
+
+    manifest = tmp_path / "federation" / "upstreams.yaml"
+    manifest.parent.mkdir()
+    manifest.write_text(bomb, encoding="utf-8")
+    assert load_federation_manifest(tmp_path).workspaces == []
+
+    # The parse runs before the validator library is used.
+    monkeypatch.setitem(sys.modules, "openapi_spec_validator", types.ModuleType("stub"))
+    monkeypatch.setattr(validators, "_openapi_validator_available", lambda: True)
+    issues = validators.validate_openapi("api.yaml", bomb.encode(), strict=True)
+    assert [issue.code for issue in issues] == ["OAS-PARSE"]

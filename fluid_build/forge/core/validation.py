@@ -442,8 +442,8 @@ class ProjectValidator:
             # validator before the cap ever ran. Stat FIRST and reject
             # oversized files as a validation issue — mirrors the
             # stat-before-read in ``forge/federation.py`` and reuses the same
-            # :data:`MAX_YAML_BYTES` ceiling. ``load_yaml_safe`` (50-alias +
-            # 5 MiB caps) remains the parse path (defence in depth). Falls
+            # :data:`MAX_YAML_BYTES` ceiling. ``load_yaml_safe`` (size, alias
+            # and alias-expansion caps) remains the parse path (defence in depth). Falls
             # back to the bare loader only when PyYAML itself is unavailable.
             try:
                 from fluid_build.util.safe_yaml import MAX_YAML_BYTES, load_yaml_safe

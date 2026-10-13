@@ -15,22 +15,23 @@
 """Bounded YAML loading for untrusted input.
 
 ``yaml.safe_load`` blocks arbitrary-object construction but does NOT cap
-anchor/alias expansion: a small document with nested YAML aliases can
-balloon to gigabytes when composed (the "billion laughs" denial-of-service).
+anchor/alias expansion: a small document with nested YAML aliases loads as
+a few shared objects, then balloons to gigabytes in whatever walks it next,
+validation, error messages, ``json.dumps`` (the "billion laughs"
+denial-of-service).
 
 There is no drop-in OSS parser that fixes this without dropping anchor
 support entirely (StrictYAML) — see PyYAML issue #235. So we pre-scan the
 cheap event stream: ``yaml.parse`` tokenises the document WITHOUT resolving
 aliases, so it stays linear-time even for a malicious payload. We count
-``AliasEvent``s and reject over-budget input before the expensive
-``safe_load`` compose/construct step ever runs.
+``AliasEvent``s and reject over-budget input before anything is composed.
 
-The count alone does not bound expansion: 24 levels of
-``l<n>: &l<n> [*l<n-1>, *l<n-1>]`` are 48 aliases and 2**25 nodes. So a
-document that has aliases is composed (composition keeps an alias as a
-second reference to its anchor's node, so the graph stays as small as the
-text) and walked once, charging every alias the size of the node it
-repeats, before anything is constructed. The budget follows OmegaConf 2.4's
+The count alone does not bound expansion: 22 levels of
+``l<n>: &l<n> [*l<n-1>, *l<n-1>]`` are 44 aliases that expand to 25,165,822
+nodes. So a document that has aliases is then composed (composition keeps
+an alias as a second reference to its anchor's node, so the graph stays as
+small as the text) and walked once, charging every alias the size of the
+node it repeats, before anything is constructed. The budget follows OmegaConf 2.4's
 YAML alias limits (``omegaconf/_yaml.py``, BSD-3-Clause) with two
 differences. It caps the nodes aliases ADD, not the document's total, so a
 large contract without aliases loads. And a recursive alias is not refused
@@ -84,15 +85,15 @@ def load_yaml_safe(
     if source is None:
         return None
     if hasattr(source, "read"):
-        source = source.read()
+        # One unit past the cap is enough to refuse a stream; reading a huge
+        # file whole just to measure it is the exhaustion the cap prevents.
+        source = source.read(max_bytes + 1)
+    if isinstance(source, (bytes, str)) and len(source) > max_bytes:
+        raise UnsafeYamlError(f"YAML input is over the {max_bytes}-byte safety cap")
     if isinstance(source, bytes):
         source = source.decode("utf-8")
     if not isinstance(source, str):
         raise UnsafeYamlError(f"load_yaml_safe expects text, got {type(source).__name__}")
-    if len(source) > max_bytes:
-        raise UnsafeYamlError(
-            f"YAML input is {len(source)} bytes, over the {max_bytes}-byte safety cap"
-        )
     aliases = 0
     for event in yaml.parse(source, Loader=yaml.SafeLoader):
         if isinstance(event, yaml.AliasEvent):

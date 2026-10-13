@@ -86,7 +86,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import yaml
 
 from fluid_build.forge.core.bundle import _slug, build_manifest, validate_manifest
-from fluid_build.util.safe_yaml import load_yaml_safe
+from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
 
 LOG = logging.getLogger("fluid.forge.core.artifact_fanout")
 
@@ -258,7 +258,7 @@ def _contract_is_reference_only(contract_path: Path) -> bool:
     try:
         with open(contract_path, "r", encoding="utf-8") as fh:
             contract = load_yaml_safe(fh) or {}
-    except (OSError, yaml.YAMLError):
+    except (OSError, yaml.YAMLError, UnsafeYamlError):
         return False
     builds = contract.get("builds")
     if not isinstance(builds, list):
@@ -288,7 +288,7 @@ def _load_schedule_contract(
     try:
         with open(contract_path, "r", encoding="utf-8") as fh:
             load_yaml_safe(fh)
-    except (OSError, yaml.YAMLError):
+    except (OSError, yaml.YAMLError, UnsafeYamlError):
         return None
     try:
         contract = load_contract_with_overlay(str(contract_path), overlay_env, logger)
