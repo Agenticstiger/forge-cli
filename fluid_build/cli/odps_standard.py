@@ -138,9 +138,9 @@ def validate_command(odps_file: str):
         file_path = Path(odps_file)
         with open(file_path, encoding="utf-8") as f:
             if file_path.suffix in (".yaml", ".yml"):
-                import yaml
+                from fluid_build.util.safe_yaml import load_yaml_safe
 
-                odps_data = yaml.safe_load(f)
+                odps_data = load_yaml_safe(f)
             else:
                 odps_data = json.load(f)
 
@@ -322,9 +322,9 @@ def _run_odps_validate(args):
     file_path = Path(args.odps_file)
     with open(file_path, encoding="utf-8") as f:
         if file_path.suffix in (".yaml", ".yml"):
-            import yaml
+            from fluid_build.util.safe_yaml import load_yaml_safe
 
-            odps_data = yaml.safe_load(f)
+            odps_data = load_yaml_safe(f)
         else:
             odps_data = json.load(f)
 

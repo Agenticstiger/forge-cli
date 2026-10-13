@@ -195,6 +195,25 @@ class TestLooksLikeUrl:
 
 
 class TestRemoteResolution:
+    def test_alias_bomb_body_is_not_found(self, tmp_path: Path) -> None:
+        # A fetched body is parsed with the same anchor-expansion caps as any
+        # other untrusted YAML, not a plain yaml.safe_load.
+        lines = ["apiVersion: v3.1.0", "kind: DataContract", "l0: &l0 [lol]"]
+        lines += [f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]" for i in range(1, 19)]
+        resolver = ContractResolver(base_path=tmp_path, allow_remote=True)
+        with (
+            patch(
+                "fluid_build.providers.odps_standard.resolver._fetch_bytes",
+                return_value=(200, {"content-type": "application/yaml"}, "\n".join(lines).encode()),
+            ),
+            patch(
+                "fluid_build.providers.odps_standard.resolver._assert_safe_url",
+                return_value=None,
+            ),
+        ):
+            with pytest.raises(ContractNotFound):
+                resolver.resolve("https://example.com/c.odcs.yaml")
+
     def test_html_with_200_is_refused(self, tmp_path: Path) -> None:
         resolver = ContractResolver(base_path=tmp_path, allow_remote=True)
         with (

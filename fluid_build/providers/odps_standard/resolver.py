@@ -56,6 +56,7 @@ from fluid_build.util.safe_http import (
 from fluid_build.util.safe_http import (
     fetch_bytes as _fetch_bytes,
 )
+from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
 
 LOG = logging.getLogger(__name__)
 # Probing matrix sized for the common case (Bitol fragments layout: ODPS doc
@@ -368,8 +369,8 @@ class ContractResolver:
             try:
                 data = json.loads(text)
             except json.JSONDecodeError:
-                data = yaml.safe_load(text)
-        except (UnicodeDecodeError, yaml.YAMLError):
+                data = load_yaml_safe(text)
+        except (UnicodeDecodeError, yaml.YAMLError, UnsafeYamlError):
             # Don't propagate parser exception text — it can include body fragments
             raise ContractNotFound(contract_id, [url]) from None
         if not isinstance(data, Mapping):

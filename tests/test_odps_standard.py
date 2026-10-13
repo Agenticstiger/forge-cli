@@ -475,6 +475,21 @@ class TestRunOdpsValidate(unittest.TestCase):
             result = _run_odps_validate(args)
         assert result == 0
 
+    def test_validate_rejects_an_alias_bomb(self):
+        from fluid_build.cli.odps_standard import _run_odps_validate
+        from fluid_build.util.safe_yaml import UnsafeYamlError
+
+        lines = ["apiVersion: v1.0.0", "kind: DataProduct", "id: dp-001", "name: P"]
+        lines += ["status: active", "l0: &l0 [lol]"]
+        lines += [f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]" for i in range(1, 19)]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("\n".join(lines))
+        args = argparse.Namespace(odps_file=f.name)
+
+        with patch("fluid_build.cli.odps_standard.cprint"):
+            with self.assertRaises(UnsafeYamlError):
+                _run_odps_validate(args)
+
     def test_validate_missing_fields_returns_1(self):
         from fluid_build.cli.odps_standard import _run_odps_validate
 

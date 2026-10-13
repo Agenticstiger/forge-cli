@@ -18,6 +18,7 @@ denial-of-service defense for untrusted YAML (G1)."""
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 import pytest
 
@@ -68,3 +69,71 @@ def test_alias_cap_boundary() -> None:
     refs = "\n".join(f"r{i}: *a" for i in range(MAX_YAML_ALIASES + 1))
     with pytest.raises(UnsafeYamlError):
         load_yaml_safe("a: &a 1\n" + refs)
+
+
+def _doubling_chain(levels: int) -> str:
+    """Each level is a list of two aliases to the level below: 2 aliases per
+    level, 2**levels leaves. 24 levels stay under the 50-alias cap."""
+    lines = ["l0: &l0 [lol]"]
+    for i in range(1, levels + 1):
+        lines.append(f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]")
+    return "\n".join(lines)
+
+
+def test_rejects_doubling_chain_under_the_alias_cap() -> None:
+    """48 aliases pass a count cap of 50 yet expand to 2**24 nodes; a 45-alias
+    chain like this one held `fluid validate` for over 90 seconds."""
+    doc = _doubling_chain(24)
+    assert doc.count("*") <= MAX_YAML_ALIASES
+    with pytest.raises(UnsafeYamlError, match="expand"):
+        load_yaml_safe(doc)
+
+
+def test_recursive_alias_is_left_to_its_consumers() -> None:
+    """The expansion walk counts an alias inside its own anchor once and ends.
+    The document still loads as the cycle it is: the contract API refuses it
+    with its documented ``contract_load_failed``."""
+    data = load_yaml_safe("a: &a [x, *a]")
+    assert data["a"][1] is data["a"]
+
+
+def test_recursive_alias_does_not_hide_an_expansion() -> None:
+    doc = _doubling_chain(24) + "\nloop: &loop [*l24, *loop]"
+    with pytest.raises(UnsafeYamlError, match="expand"):
+        load_yaml_safe(doc)
+
+
+def test_large_alias_free_document_is_allowed() -> None:
+    """The expansion budget counts what aliases add, not document size."""
+    doc = "\n".join(f"k{i}: [a, b, {{c: d}}]" for i in range(5_000))
+    assert len(load_yaml_safe(doc)) == 5_000
+
+
+def test_reusing_a_block_is_allowed() -> None:
+    """Ordinary DRY reuse of one anchored block stays well inside the budget."""
+    block = "{" + ", ".join(f"f{i}: v{i}" for i in range(100)) + "}"
+    refs = "\n".join(f"r{i}: *b" for i in range(40))
+    data = load_yaml_safe(f"base: &b {block}\n{refs}")
+    assert data["r39"] == data["base"]
+
+
+def test_expansion_budget_boundary() -> None:
+    """Five aliases to a ten-item list add 55 nodes: allowed at 55, not at 54."""
+    doc = "base: &b [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n" + "\n".join(f"r{i}: *b" for i in range(5))
+    assert load_yaml_safe(doc, max_alias_expansion=55)["r4"] == list(range(1, 11))
+    with pytest.raises(UnsafeYamlError):
+        load_yaml_safe(doc, max_alias_expansion=54)
+
+
+def test_odcs_reader_applies_the_caps(tmp_path: Path) -> None:
+    """ODCS/ODPS files come from other teams and catalogs; the reader the
+    Bitol import, the contractId resolver and ``--seed-from`` share used a
+    plain ``yaml.safe_load``."""
+    from fluid_build.providers.odcs.io import read_input
+
+    path = tmp_path / "bomb.odcs.yaml"
+    path.write_text(
+        "apiVersion: v3.1.0\nkind: DataContract\n" + _doubling_chain(18), encoding="utf-8"
+    )
+    with pytest.raises(UnsafeYamlError):
+        read_input(path)

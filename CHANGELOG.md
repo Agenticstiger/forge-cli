@@ -798,6 +798,15 @@ This release fixes six security advisories. Each entry below has its own upgrade
   `orders.odcs.yaml` for `commerce.orders`, is now used only when it declares that `id`;
   a file that declares another contract is skipped with a warning instead of being linked
   to the port.
+- **YAML aliases can no longer blow a small file up into millions of nodes.** The
+  billion-laughs guard capped how many aliases a document uses (50) but not what they
+  expand to: 22 levels of `[*a, *a]` are 44 aliases and 2^22 nodes, and that 685-byte
+  contract held `fluid validate` for more than 90 seconds. A document is now also refused
+  when its aliases add more than 100,000 nodes, or grow it more than 100-fold once it is
+  past 1,000 nodes, and the error names both sizes. The ODCS and ODPS readers behind
+  `fluid opds import`, the `contractId` resolver (fetched contracts included), `fluid forge
+  --seed-from` and `fluid odps-bitol validate` read YAML with a plain `yaml.safe_load` and
+  had no cap at all; they now use the same guard.
 - **Command output keeps its square brackets.** Rich read text in brackets as console
   markup and dropped it, so `fluid validate` printed `exposes declares
   governance.lakeFormation` instead of `exposes[orders] declares ...`, bundle findings
