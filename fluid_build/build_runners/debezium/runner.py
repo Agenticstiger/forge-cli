@@ -29,12 +29,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Dict, FrozenSet, List, Mapping, Optional
+from typing import Any, ClassVar, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 from fluid_build.api.runner import (
     RunContext,
@@ -490,6 +491,62 @@ def _escape_properties_value(value: str) -> str:
     return escaped
 
 
+#: A property whose VALUE is a credential: Debezium's PASSWORD-typed fields
+#: (``database.password``, ``*.ssl.*.password``), the Iceberg / S3 / JDBC /
+#: GCS / ADLS secrets (``credential``, ``token``, ``s3.secret-access-key``,
+#: ``s3.session-token``, ``jdbc.password``, ``adls.sas-token.*``), a Kafka JAAS
+#: blob, and a Mongo connection string (it may carry userinfo). Narrower than
+#: ``is_sensitive_key_name`` on purpose: ``rest.auth.type`` and
+#: ``oauth2-server-uri`` are not secrets, and stay readable in the file.
+_CREDENTIAL_PROPERTY_RE = re.compile(
+    r"(?i)password|secret|token|credential|jaas\.config|connection\.string"
+)
+
+
+def render_application_properties(
+    source_config: Mapping[str, Any],
+    sink_type: str,
+    sink_config: Mapping[str, Any],
+) -> Tuple[str, Dict[str, str]]:
+    """Render Debezium Server's ``application.properties``, and the environment
+    that carries its credentials.
+
+    A credential-valued property is written as a ``${FLUID_DBZ_<PROPERTY>}``
+    expression, and its value goes into the returned environment, which the
+    caller passes to the server. Quarkus resolves the expression from the
+    environment (SmallRye Config: environment variables, ordinal 300, are a
+    config source like the file). The line stays in the file because Debezium
+    Server only collects the ``debezium.source.*`` properties it finds there
+    (DBZ-2886). So no credential is written to disk: the file sits under the
+    contract directory, where ``git add -A`` would stage it.
+
+    An ``env:<NAME>`` value is written as it is: it is Iceberg's own reference
+    to an environment variable (``sink.catalogAuth``), not a secret.
+
+    Raises ``ValueError`` for a control character in a key or value
+    (:func:`_properties_line`), or for two properties whose names map to the
+    same environment variable.
+    """
+    env: Dict[str, str] = {}
+
+    def line(key: str, value: object) -> str:
+        rendered = _properties_line(key, value)
+        text = str(value)
+        if not text or text.startswith("env:") or not _CREDENTIAL_PROPERTY_RE.search(key):
+            return rendered
+        name = "FLUID_DBZ_" + re.sub(r"[^A-Za-z0-9]", "_", key.removeprefix("debezium.")).upper()
+        if env.get(name, text) != text:
+            raise ValueError(f"two debezium properties map to the environment variable {name}")
+        env[name] = text
+        return f"{_escape_properties_key(key)}=${{{name}}}"
+
+    lines = [line(f"debezium.source.{k}", v) for k, v in source_config.items()]
+    lines.append("quarkus.log.console.json=false")
+    lines.append(_properties_line("debezium.sink.type", sink_type))
+    lines += [line(f"debezium.sink.{sink_type}.{k}", v) for k, v in sink_config.items()]
+    return "\n".join(lines), env
+
+
 def _execute_debezium_server(
     ctx: RunContext,
     build: Mapping[str, Any],
@@ -574,22 +631,20 @@ def _execute_debezium_server(
     # Render the line-based .properties file. Every contract-derived key/value
     # routes through _properties_line, which fail-closes on control characters so
     # a newline in a binding value cannot inject extra Debezium directives.
+    # Credentials go to the server's environment, not the file.
     try:
-        lines = [_properties_line(f"debezium.source.{k}", v) for k, v in source_config.items()]
-        lines.append("quarkus.log.console.json=false")
-        lines.append(_properties_line("debezium.sink.type", sink_type))
-        for k, v in sink_config.items():
-            lines.append(_properties_line(f"debezium.sink.{sink_type}.{k}", v))
+        properties, secret_env = render_application_properties(
+            source_config, sink_type, sink_config
+        )
     except ValueError as exc:
         return _failed(ctx, started_at, t_start, str(exc))
-    config_path.write_text("\n".join(lines), encoding="utf-8")
-    # The file holds the source DB password and any operator-forwarded sink
-    # credentials (s3.secret-access-key / jdbc.password); it inherits the umask
-    # (0o644) otherwise. Force 0o600, mirroring dbt/profiles.py.
-    try:
-        os.chmod(config_path, 0o600)
-    except OSError:
-        pass
+    from ...credentials.encrypted_store import _atomic_write_bytes
+
+    # Created at 0o600 (O_EXCL, then an atomic rename): never briefly
+    # world-readable, and no chmod whose failure could be ignored. A
+    # hand-written sink key the credential rule does not name still lands
+    # in this file.
+    _atomic_write_bytes(config_path, properties.encode("utf-8"), mode=0o600)
 
     # Validate any contract-supplied ``server_binary`` before it becomes
     # ``argv[0]`` (arbitrary-binary-execution guard). A value with a path
@@ -607,13 +662,15 @@ def _execute_debezium_server(
             "(bare name on PATH, or an absolute path to an executable file)",
         )
 
-    # No ``env=``: the server inherits this process's environment, which is
-    # where Iceberg resolves the ``env:<NAME>`` catalog properties
-    # ``sink.catalogAuth`` emits, and where the preflight checked the variable
-    # is set. The secret is never written to application.properties.
+    # The server inherits this process's environment, which is where Iceberg
+    # resolves the ``env:<NAME>`` catalog properties ``sink.catalogAuth``
+    # emits, and where the preflight checked the variable is set. The
+    # ``FLUID_DBZ_*`` credentials the file refers to are added to it. No
+    # secret is written to application.properties.
     try:
         proc = subprocess.run(
             [binary, "--config", str(config_path)],
+            env={**os.environ, **secret_env} if secret_env else None,
             capture_output=True,
             text=True,
             timeout=int(dbz_props.get("timeout_seconds", 60)),

@@ -808,6 +808,10 @@ FLUID_GITIGNORE_BLOCK = """\
 .fluid/copilot-memory.json
 .fluid/logs/
 
+# Generated per-run connector config (never commit; regenerated each run)
+.fluid/debezium/
+.fluid/meltano/
+
 # Build outputs (never commit)
 runtime/
 

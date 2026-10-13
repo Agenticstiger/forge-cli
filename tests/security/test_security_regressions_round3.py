@@ -329,7 +329,7 @@ class TestBuildDriverForwardsReadablePaths:
 # ``jdbc:snowflake://h/?password="p@ss"&user=x`` from fully masked into
 # emitting the password verbatim. Net: strictly worse.
 #
-# The fix is the exact-value layer (``mask_known_secrets``, borrowed from
+# The fix is the exact-value layer (``redact_known_values``, borrowed from
 # ``misprint``): at redaction time the credential's literal value is already
 # held, so it is matched literally — delimiter-agnostic, cannot truncate. The
 # pattern layer is left EXACTLY as shipped and is only the net for values we

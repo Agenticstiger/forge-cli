@@ -113,6 +113,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `env:` or carries a `${...}` expression does not warn. Under `fluid validate
   --strict` the warning fails validation; use `sink.catalogAuth`, or an `env:<VARIABLE>`
   value.
+- The embedded Debezium Server's `application.properties` no longer holds credentials. A
+  property whose name carries `password`, `secret`, `token`, `credential`, `jaas.config`
+  or `connection.string` is written as `${FLUID_DBZ_<PROPERTY>}` (for example
+  `debezium.source.database.password=${FLUID_DBZ_SOURCE_DATABASE_PASSWORD}`), and forge-cli
+  passes the value to the server in that environment variable. A `server_binary` wrapper
+  that replaces the environment must pass the `FLUID_DBZ_*` variables through. An
+  `env:<VARIABLE>` value is still written as it is.
+- A Meltano / Singer tap now reads its `--config` file from a private temporary
+  directory that is removed when the tap exits, instead of
+  `.fluid/meltano/<product>/<build>/tap_config.json`. A copy an earlier release left there
+  is deleted on the next run. A tap that writes a refreshed token back to its config file
+  loses that write; the next run resolves the credential again.
+- `fluid init` now git-ignores `.fluid/debezium/` and `.fluid/meltano/`. A project whose
+  `.gitignore` already has the fluid-cli block does not get the new lines; add them
+  yourself, and check that no `application.properties` or `tap_config.json` under those
+  directories was committed with a credential in it.
 
 ### Added
 
@@ -413,6 +429,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upgrade from a release that gave a non-Snowflake-managed catalog a volume, or a
   Snowflake-managed expose removed or re-cataloged in this change) and keeps the `tofu
   state rm` remediation.
+
+### Security
+- **Credentials no longer reach disk in generated connector config.** The embedded Debezium
+  Server's `application.properties` held the source database password that a `secretRef`
+  resolved, under the contract directory, briefly at mode 0644 and kept after the run; the
+  Singer `tap_config.json` held it at 0644, was never deleted, and neither file was
+  git-ignored, so `git add -A` staged the password. The Debezium credential now goes to the
+  server's environment and the file is created at 0600; the tap config lives 0600 in a
+  private temporary directory for the life of the tap. (CodeQL alerts 211, 53, 54.)
+- **`fluid mission` no longer quotes a contract's inline credential.** A failing predicate on
+  a path such as `exposes[*].binding.location.password` printed `got '<value>'` to the
+  terminal, `--json`, the stored scorecard and the planner's LLM prompt, because the
+  redactor read `password: expected == …` as the assignment. A leaf at or under a
+  credential-named key now shows as `***REDACTED***`. (CodeQL alert 241.)
+- **The shared redactor masks `aws.secret.access.key=`, `secret.access.key=` and
+  `fs.s3a.secret.key=`.** It knew only the `_` and `-` spellings, so a Kafka Connect task
+  trace stored in a run record kept an S3 secret key. (CodeQL alert 231.)
+- **The local provider's log context is redacted by the shared redactor.** Its own
+  patterns missed `postgres://user:password@` URLs and `token=`, and a failed SQL action
+  put the raw error into the log record's context, which a JSON log formatter renders.
+  (CodeQL alert 292.)
+- `mask_known_secrets` is now `redact_known_values`; the old name stays as an alias. CodeQL
+  treats a call to a function named like `*secret*` as a source of secrets, so every caller
+  of the redactor was reported as logging or storing a credential it had already masked.
 
 ### Documentation
 

@@ -23,7 +23,7 @@ consistent event formatting. Adapted from GCP provider.
 import re
 from typing import Any, Dict, List
 
-from fluid_build.observability.secret_redactor import is_sensitive_key_name
+from fluid_build.observability.secret_redactor import is_sensitive_key_name, redact_secret_text
 
 # Patterns for sensitive data that should be redacted
 SENSITIVE_PATTERNS = [
@@ -90,7 +90,11 @@ def redact_string(text: str) -> str:
     for pattern in SENSITIVE_PATTERNS:
         redacted = pattern.sub("[REDACTED]", redacted)
 
-    return redacted
+    # Then the shared redactor: the patterns above are a provider-local
+    # subset (no ``postgres://`` userinfo, no ``token=``, no credential this
+    # process registered), and ``_log_error`` passes a raw ``str(e)`` through
+    # here into the record's ``ctx``, which a JSON log formatter renders.
+    return redact_secret_text(redacted)
 
 
 def redact_dict(data: Dict[str, Any], max_depth: int = 10) -> Dict[str, Any]:

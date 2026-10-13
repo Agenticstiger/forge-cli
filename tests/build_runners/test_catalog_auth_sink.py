@@ -278,10 +278,11 @@ def test_embedded_writes_env_references_and_the_server_inherits_the_environment(
     assert "debezium.sink.iceberg.scope=lakekeeper" in text
     assert _SECRET_VALUE not in text
     assert _SECRET_VALUE not in caplog.text
-    # No ``env=``: the server process inherits this one's environment, where
-    # Iceberg resolves env:LAKEKEEPER_CREDENTIAL.
+    # ``env=None``: the server process inherits this one's environment, where
+    # Iceberg resolves env:LAKEKEEPER_CREDENTIAL (the source has no password
+    # to add to it).
     assert len(fake_server.calls) == 1
-    assert "env" not in fake_server.calls[0]
+    assert fake_server.calls[0].get("env") is None
 
 
 @pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])

@@ -39,6 +39,7 @@ import pytest
 from fluid_build.build_runners.debezium.iceberg_sink import (
     emit_debezium_iceberg_sink_config,
 )
+from fluid_build.build_runners.debezium.runner import render_application_properties
 from fluid_build.providers._iceberg_catalog import resolve_iceberg_catalog
 from tests._infrastructure.testcontainers_fixtures import _docker_available
 
@@ -67,14 +68,16 @@ services:
       interval: 3s
       timeout: 3s
       retries: 30
+  # Silo: the S3-compatible MinIO fork the Lakekeeper lane uses (minio/minio
+  # and minio/mc left Docker Hub on 2026-09-11). It ships ``mc`` too.
   minio:
-    image: minio/minio:latest
+    image: pgsty/silo:RELEASE.2026-09-03T13-18-01Z@sha256:b616a0cf8cb281e7e6bb3c9b1fb53875b4016a2878223925541c18f82d6c5ca3
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
+    command: ["server", "/data"]
   mc:
-    image: minio/mc:latest
+    image: pgsty/silo:RELEASE.2026-09-03T13-18-01Z@sha256:b616a0cf8cb281e7e6bb3c9b1fb53875b4016a2878223925541c18f82d6c5ca3
     depends_on: [minio]
     entrypoint: >
       /bin/sh -c "
@@ -106,6 +109,7 @@ services:
         condition: service_healthy
       iceberg-rest:
         condition: service_started
+    env_file: [./debezium.env]
     volumes:
       - ./application.properties:/debezium/config/application.properties:ro
 """
@@ -150,10 +154,12 @@ sys.exit(0 if n >= 5 else 3)
 """
 
 
-def _build_application_properties() -> str:
+def _build_application_properties() -> tuple[str, dict[str, str]]:
     """The Iceberg sink block comes from forge's REAL deriver — the unit under
-    test — assembled with a standard Postgres source / JSON-format / file-offset
-    Debezium Server config."""
+    test — and the file from the runner's REAL renderer, with a standard
+    Postgres source / JSON-format / file-offset Debezium Server config. The
+    renderer moves the credentials to the returned environment, which the
+    container gets through ``env_file``: the server must resolve them."""
     binding = {
         "platform": "local",
         "format": "iceberg",
@@ -175,33 +181,47 @@ def _build_application_properties() -> str:
             "s3.secret-access-key": "minioadmin",
         },
     )
-    # the runner's prefix loop (runner.py:468-469), applied verbatim
-    lines = ["quarkus.log.console.json=false", "debezium.sink.type=iceberg"]
-    lines += [f"debezium.sink.iceberg.{k}={v}" for k, v in derived.items()]
-    lines += [
+    source = {
+        "offset.storage": "org.apache.kafka.connect.storage.FileOffsetBackingStore",
+        "offset.storage.file.filename": "/debezium/data/offsets.dat",
+        "offset.flush.interval.ms": "0",
+        "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+        "database.hostname": "postgres",
+        "database.port": "5432",
+        "database.user": "postgres",
+        "database.password": "postgres",  # pragma: allowlist secret
+        "database.dbname": "appdb",
+        "database.server.id": "1234",
+        "topic.prefix": "cdcsrv",
+        "plugin.name": "pgoutput",
+        "slot.name": "dbz_slot",
+        "publication.name": "dbz_pub",
+        "publication.autocreate.mode": "filtered",
+        "snapshot.mode": "initial",
+        "table.include.list": "public.orders",
+    }
+    props, env = render_application_properties(source, "iceberg", derived)
+    lines = [
+        props,
         "debezium.format.value=json",
         "debezium.format.value.schemas.enable=true",
         "debezium.format.key=json",
         "debezium.format.key.schemas.enable=true",
-        "debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore",
-        "debezium.source.offset.storage.file.filename=/debezium/data/offsets.dat",
-        "debezium.source.offset.flush.interval.ms=0",
-        "debezium.source.connector.class=io.debezium.connector.postgresql.PostgresConnector",
-        "debezium.source.database.hostname=postgres",
-        "debezium.source.database.port=5432",
-        "debezium.source.database.user=postgres",
-        "debezium.source.database.password=postgres",
-        "debezium.source.database.dbname=appdb",
-        "debezium.source.database.server.id=1234",
-        "debezium.source.topic.prefix=cdcsrv",
-        "debezium.source.plugin.name=pgoutput",
-        "debezium.source.slot.name=dbz_slot",
-        "debezium.source.publication.name=dbz_pub",
-        "debezium.source.publication.autocreate.mode=filtered",
-        "debezium.source.snapshot.mode=initial",
-        "debezium.source.table.include.list=public.orders",
     ]
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", env
+
+
+def _assert_credentials_only_in_env(props: str, env: dict[str, str]) -> None:
+    """No credential in the file: the server resolves each from its environment."""
+    assert "debezium.source.database.password=${FLUID_DBZ_SOURCE_DATABASE_PASSWORD}" in props
+    assert (
+        "debezium.sink.iceberg.s3.secret-access-key="
+        "${FLUID_DBZ_SINK_ICEBERG_S3_SECRET_ACCESS_KEY}" in props
+    )
+    assert env == {
+        "FLUID_DBZ_SOURCE_DATABASE_PASSWORD": "postgres",  # pragma: allowlist secret
+        "FLUID_DBZ_SINK_ICEBERG_S3_SECRET_ACCESS_KEY": "minioadmin",  # pragma: allowlist secret
+    }
 
 
 def _compose(args, cwd, project):
@@ -219,11 +239,13 @@ def test_debezium_server_iceberg_lands_rows(tmp_path: Path):
     (tmp_path / "docker-compose.yml").write_text(_COMPOSE)
     (tmp_path / "seed.sql").write_text(_SEED)
     (tmp_path / "read_back.py").write_text(_READ_BACK)
-    props = _build_application_properties()
+    props, env = _build_application_properties()
     (tmp_path / "application.properties").write_text(props)
+    (tmp_path / "debezium.env").write_text("".join(f"{k}={v}\n" for k, v in env.items()))
 
     # the deriver's output is asserted directly (cheap, runs even on slow CI)
     assert "debezium.sink.iceberg.type=rest" in props
+    _assert_credentials_only_in_env(props, env)
     assert "debezium.sink.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO" in props
     assert "debezium.sink.iceberg.table-namespace=cdc" in props
     assert "iceberg.control.topic" not in props  # KC-only key must not leak

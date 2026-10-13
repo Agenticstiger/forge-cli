@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -339,13 +340,38 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _compare(op: str, leaf: Any, expected: Any) -> Tuple[bool, str]:
+def _display_leaf(concrete: str, leaf: Any) -> Any:
+    """The leaf as a diagnostic may quote it (``got <leaf>``).
+
+    ``_redact_result`` cannot mask a quoted leaf afterwards: its pattern layer
+    reads ``password: expected == …, got 'x'`` as a ``password`` assignment
+    whose value is the word ``expected``, so ``'x'`` reached the terminal,
+    ``--json``, the scorecard file and the planner's LLM prompt. Mask it here
+    instead, by the path's key names, with the semantics ``redact_value``
+    gives a mapping key: a leaf at or under a credential-named key is never
+    shown, and any other leaf goes through ``redact_value``.
+    """
+    from fluid_build.observability.secret_redactor import (
+        _REDACTED,
+        is_sensitive_key_name,
+        redact_value,
+    )
+
+    keys = [s for s in re.split(r"[.\[\]]", concrete) if s and s != "*" and not s.isdigit()]
+    if any(is_sensitive_key_name(key) for key in keys):
+        return _REDACTED
+    return redact_value(leaf)
+
+
+def _compare(op: str, leaf: Any, expected: Any, *, shown: Any) -> Tuple[bool, str]:
     """Evaluate one leaf. Returns ``(ok, reason_if_not)``. Type mismatches
-    fail with a reason rather than raising — fail closed, never crash."""
+    fail with a reason rather than raising — fail closed, never crash.
+    ``shown`` is what the reason quotes in place of the leaf
+    (:func:`_display_leaf`)."""
     if op == "eq":
-        return (leaf == expected, f"expected == {expected!r}, got {leaf!r}")
+        return (leaf == expected, f"expected == {expected!r}, got {shown!r}")
     if op == "ne":
-        return (leaf != expected, f"expected != {expected!r}, got {leaf!r}")
+        return (leaf != expected, f"expected != {expected!r}, got {shown!r}")
     if op == "contains":
         if isinstance(leaf, str):
             ok = isinstance(expected, str) and expected in leaf
@@ -353,7 +379,7 @@ def _compare(op: str, leaf: Any, expected: Any) -> Tuple[bool, str]:
             ok = expected in leaf
         else:
             return (False, f"contains needs a string or array, got {type(leaf).__name__}")
-        return (ok, f"expected to contain {expected!r}, got {leaf!r}")
+        return (ok, f"expected to contain {expected!r}, got {shown!r}")
 
     # Ordered comparisons: both numeric, or both strings — never mixed.
     if _is_number(leaf) and _is_number(expected):
@@ -371,7 +397,7 @@ def _compare(op: str, leaf: Any, expected: Any) -> Tuple[bool, str]:
         "gt": leaf > expected,
         "gte": leaf >= expected,
     }[op]
-    return (ok, f"expected {op} {expected!r}, got {leaf!r}")
+    return (ok, f"expected {op} {expected!r}, got {shown!r}")
 
 
 def _check_predicate(
@@ -414,7 +440,9 @@ def _check_predicate(
     diagnostics.extend(f"{p}: path not found" for p in missing)
     failing = 0
     for concrete, leaf in leaves:
-        ok, reason = _compare(criterion.op, leaf, criterion.value)
+        ok, reason = _compare(
+            criterion.op, leaf, criterion.value, shown=_display_leaf(concrete, leaf)
+        )
         if not ok:
             failing += 1
             diagnostics.append(f"{concrete}: {reason}")
