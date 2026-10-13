@@ -75,10 +75,12 @@ class ContractNotFound(ProviderError):
 
     _MAX_TRIED_DISPLAYED = 5
 
-    def __init__(self, contract_id: str, tried: List[str]):
+    def __init__(self, contract_id: str, tried: List[str], *, reason: Optional[str] = None):
         self.contract_id = contract_id
         self.tried = list(tried)
-        if tried:
+        if reason:
+            msg = f"Could not resolve contractId {contract_id!r}: {reason}"
+        elif tried:
             head = tried[: self._MAX_TRIED_DISPLAYED]
             tail = (
                 f"\n  …and {len(tried) - self._MAX_TRIED_DISPLAYED} more"
@@ -177,6 +179,16 @@ class ContractResolver:
     def resolve(
         self, contract_id: str, *, hint: Optional[Union[str, Path]] = None
     ) -> ResolvedContract:
+        # contractId is document text. A value that is not a non-empty string
+        # without NUL bytes names no file and no URL; report it as not found so
+        # lenient imports skip the port. It used to raise ValueError/TypeError
+        # from the path probes, which aborted the whole import.
+        if not isinstance(contract_id, str) or not contract_id or "\x00" in contract_id:
+            raise ContractNotFound(
+                contract_id,
+                [],
+                reason="not a valid contractId (expected a non-empty string with no NUL bytes)",
+            )
         if contract_id in self._cache:
             return self._cache[contract_id]
 
@@ -201,7 +213,7 @@ class ContractResolver:
             for candidate in self._local_candidates(contract_id):
                 tried.append(str(candidate))
                 if candidate.exists():
-                    resolved = self._load_local(contract_id, candidate)
+                    resolved = self._load_local(contract_id, candidate, require_id=True)
                     if resolved is not None:
                         return self._cache_and_return(contract_id, resolved)
 
@@ -247,7 +259,7 @@ class ContractResolver:
                     candidate = sub_dir / f"{stem}{ext}"
                     try:
                         resolved = candidate.resolve()
-                    except (OSError, RuntimeError):
+                    except (OSError, ValueError, RuntimeError):  # NUL byte, symlink loop
                         continue
                     if not _is_within(resolved, base_resolved):
                         continue
@@ -296,13 +308,26 @@ class ContractResolver:
             return
         self._index.setdefault(odcs_id, path)
 
-    def _load_local(self, contract_id: str, path: Path) -> Optional[ResolvedContract]:
+    def _load_local(
+        self, contract_id: str, path: Path, *, require_id: bool = False
+    ) -> Optional[ResolvedContract]:
         try:
             data = read_input(path)
         except Exception as exc:
             LOG.warning("Failed to read %s: %s", path, exc)
             return None
         if not isinstance(data, Mapping):
+            return None
+        # A probe only guesses the file from the contractId: the last-segment
+        # probe tries orders.odcs.yaml for "commerce.orders". The file is that
+        # contract only if it declares that id, as ODPS ports reference ODCS ids.
+        if require_id and data.get("id") != contract_id:
+            LOG.warning(
+                "Skipping %s: it declares id %r, not contractId %r",
+                path,
+                data.get("id"),
+                contract_id,
+            )
             return None
         self._validate(contract_id, data, origin=str(path))
         return ResolvedContract(
@@ -384,7 +409,10 @@ class ContractResolver:
 
 
 def _looks_like_url(value: str) -> bool:
-    parsed = urlparse(value)
+    try:
+        parsed = urlparse(value)
+    except ValueError:  # e.g. "http://[::1": urlparse rejects the unclosed IPv6 bracket
+        return False
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 

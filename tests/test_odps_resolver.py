@@ -116,6 +116,55 @@ class TestErrors:
         with pytest.raises(RemoteFetchDisabled):
             resolver.resolve("anything", hint="https://example.com/c.yaml")
 
+    @pytest.mark.parametrize("contract_id", ["orders\x00x", 123, ["orders"], "", "http://[::1"])
+    def test_malformed_contract_id_is_not_found(self, tmp_path: Path, contract_id: object) -> None:
+        # contractId is document text. A value the resolver cannot look up is
+        # a contract it did not find, which lenient imports skip; it used to
+        # raise ValueError/TypeError and abort the whole import.
+        resolver = ContractResolver(base_path=tmp_path, allow_remote=False)
+        with pytest.raises(ContractNotFound):
+            resolver.resolve(contract_id)  # type: ignore[arg-type]
+
+    def test_malformed_contract_id_message_says_why(self, tmp_path: Path) -> None:
+        resolver = ContractResolver(base_path=tmp_path, allow_remote=False)
+        with pytest.raises(ContractNotFound, match="not a valid contractId"):
+            resolver.resolve("orders\x00x")
+
+
+def _odcs_yaml(contract_id: str) -> str:
+    return (
+        "apiVersion: v3.1.0\nkind: DataContract\n"
+        f"id: {contract_id}\nversion: 1.0.0\nstatus: active\n"
+    )
+
+
+class TestProbedIdMustMatch:
+    def test_probed_file_declaring_another_id_is_skipped(self, tmp_path: Path) -> None:
+        # The last-segment probe tries orders.odcs.yaml for "commerce.orders".
+        # A file there that declares a different contract must not be linked.
+        (tmp_path / "orders.odcs.yaml").write_text(_odcs_yaml("billing.orders"), encoding="utf-8")
+        resolver = ContractResolver(base_path=tmp_path, allow_remote=False)
+        with patch("fluid_build.providers.odps_standard.resolver.LOG") as log:
+            with pytest.raises(ContractNotFound):
+                resolver.resolve("commerce.orders")
+        warned = " ".join(str(a) for c in log.warning.call_args_list for a in c.args)
+        assert "billing.orders" in warned and "commerce.orders" in warned
+
+    def test_probed_file_declaring_the_same_id_resolves(self, tmp_path: Path) -> None:
+        (tmp_path / "orders.odcs.yaml").write_text(_odcs_yaml("commerce.orders"), encoding="utf-8")
+        resolver = ContractResolver(base_path=tmp_path, allow_remote=False)
+        assert resolver.resolve("commerce.orders").odcs["id"] == "commerce.orders"
+
+    def test_skipped_mismatch_does_not_hide_a_later_match(self, tmp_path: Path) -> None:
+        (tmp_path / "orders.odcs.yaml").write_text(_odcs_yaml("billing.orders"), encoding="utf-8")
+        (tmp_path / "contracts").mkdir()
+        (tmp_path / "contracts" / "orders.odcs.yaml").write_text(
+            _odcs_yaml("commerce.orders"), encoding="utf-8"
+        )
+        resolver = ContractResolver(base_path=tmp_path, allow_remote=False)
+        result = resolver.resolve("commerce.orders")
+        assert Path(result.origin).parent.name == "contracts"
+
 
 # ---------------------------------------------------------------------------
 # URL detection
@@ -133,6 +182,7 @@ class TestLooksLikeUrl:
             ("just-an-id", False),
             ("product.something", False),
             ("https://", False),  # no netloc
+            ("http://[::1", False),  # urlparse raises on the unclosed IPv6 bracket
         ],
     )
     def test_detection(self, value: str, expected: bool) -> None:

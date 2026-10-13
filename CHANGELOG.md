@@ -789,6 +789,15 @@ This release fixes six security advisories. Each entry below has its own upgrade
   `structural_seed_guard_failed` and kept the generated contract, so the expose was lost
   without an error. A missing expose is now a seed mismatch, and the repair loop asks the
   model to restore it.
+- **A malformed or mismatched `contractId` no longer breaks an ODPS import.** A
+  `contractId` with a NUL byte, a value that is not a string, or an unparsable URL such as
+  `http://[::1` made `fluid opds import` fail with `ValueError` or `TypeError`, even with
+  `--lenient` and on input ports, which always import leniently. It is now an unresolved
+  contract: `--lenient` and input ports skip it with a warning, and a strict import stops
+  with `not a valid contractId`. A file the resolver probes for a `contractId`, such as
+  `orders.odcs.yaml` for `commerce.orders`, is now used only when it declares that `id`;
+  a file that declares another contract is skipped with a warning instead of being linked
+  to the port.
 - **Command output keeps its square brackets.** Rich read text in brackets as console
   markup and dropped it, so `fluid validate` printed `exposes declares
   governance.lakeFormation` instead of `exposes[orders] declares ...`, bundle findings

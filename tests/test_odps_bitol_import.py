@@ -28,6 +28,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from fluid_build.providers.base import ProviderError
 from fluid_build.providers.odcs import OdcsProvider
@@ -165,6 +166,22 @@ class TestNegative:
         fluid = provider.import_contract(BROKEN / "dangling-port.odps.yaml", lenient=True)
         # The expose stub still gets created — just without a contract body
         assert len(fluid["exposes"]) == 1
+
+    def test_malformed_contract_id_lenient_warns(self, provider: BitolOdpsProvider) -> None:
+        # A NUL byte in a contractId made the resolver raise ValueError, which
+        # aborted the import even with lenient=True.
+        doc = yaml.safe_load(_bundle_product_path().read_text(encoding="utf-8"))
+        doc["outputPorts"][0]["contractId"] = "orders\x00x"
+        fluid = provider.import_contract(doc, base_path=BUNDLE_DIR, lenient=True)
+        assert len(fluid["exposes"]) == 2
+
+    def test_malformed_input_port_contract_id_is_skipped(self, provider: BitolOdpsProvider) -> None:
+        # Input ports are always resolved leniently; a malformed id must not
+        # abort an otherwise strict import.
+        doc = yaml.safe_load(_bundle_product_path().read_text(encoding="utf-8"))
+        doc["inputPorts"] = [{"name": "upstream", "version": "1.0.0", "contractId": "up\x00"}]
+        fluid = provider.import_contract(doc, base_path=BUNDLE_DIR)
+        assert len(fluid["exposes"]) == 2
 
     def test_two_odps_docs_in_directory_raises(self, provider: BitolOdpsProvider) -> None:
         with pytest.raises(ProviderError, match="found 2 ODPS docs"):
