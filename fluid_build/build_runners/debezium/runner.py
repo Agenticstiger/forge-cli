@@ -29,12 +29,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Dict, FrozenSet, List, Mapping, Optional
+from typing import Any, ClassVar, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 from fluid_build.api.runner import (
     RunContext,
@@ -490,6 +491,92 @@ def _escape_properties_value(value: str) -> str:
     return escaped
 
 
+def _write_private_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path``, readable by this user only (0o600)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fh.fileno(), 0o600)
+        fh.write(text)
+
+
+#: A property whose VALUE is a credential: Debezium's PASSWORD-typed fields
+#: (``database.password``, ``*.ssl.*.password``), the Iceberg / S3 / JDBC /
+#: GCS / ADLS secrets (``credential``, ``token``, ``s3.secret-access-key``,
+#: ``s3.session-token``, ``jdbc.password``, ``adls.sas-token.*``,
+#: ``adls.auth.shared-key.account.key``, ``s3.sse.key``), an HTTP
+#: ``header.Authorization``, a Kafka JAAS blob or PEM ``ssl.keystore.key``, a
+#: Pulsar ``authParams``, and a Mongo or Event Hubs connection string (it may
+#: carry userinfo or a shared access key). Narrower than
+#: ``is_sensitive_key_name`` on purpose: ``rest.auth.type`` and
+#: ``oauth2-server-uri`` are not secrets, and stay readable in the file. A
+#: false positive only moves a value to the environment.
+_CREDENTIAL_PROPERTY_RE = re.compile(
+    r"(?i)password|secret|token|credential|authorization|auth[._-]?params|jaas\.config"
+    r"|connection[._-]?string|api[._-]?key|private[._-]?key|account[._-]?key"
+    r"|keystore\.key|sse\.key"
+)
+
+
+def render_application_properties(
+    source_config: Mapping[str, Any],
+    sink_type: str,
+    sink_config: Mapping[str, Any],
+) -> Tuple[str, Dict[str, str]]:
+    """Render Debezium Server's ``application.properties``, and the environment
+    that carries its credentials.
+
+    A credential-valued property is written as a ``${FLUID_DBZ_<PROPERTY>}``
+    expression, and its value goes into the returned environment, which the
+    caller passes to the server. Quarkus resolves the expression from the
+    environment (SmallRye Config: environment variables, ordinal 300, are a
+    config source like the file). The line stays in the file because Debezium
+    Server only collects the ``debezium.source.*`` properties it finds there
+    (DBZ-2886). So no credential is written to disk: the file sits under the
+    contract directory, where ``git add -A`` would stage it.
+
+    A sink ``env:<NAME>`` value is written as it is: it is Iceberg's own
+    reference to an environment variable (``sink.catalogAuth``), not a secret.
+    A source property gets no such reading, so a source password that starts
+    with ``env:`` still goes to the environment.
+
+    Raises ``ValueError`` for a control character in a key or value
+    (:func:`_properties_line`), or for two properties whose names map to the
+    same environment variable.
+    """
+    env: Dict[str, str] = {}
+
+    def line(key: str, value: object, *, env_refs: bool = False) -> str:
+        text = str(value)
+        if (
+            not text
+            or (env_refs and text.startswith("env:"))
+            or not _CREDENTIAL_PROPERTY_RE.search(key)
+        ):
+            return _properties_line(key, value)
+        # The value never reaches the file, so only a control character in
+        # the KEY could inject a line; the value is still refused (no
+        # credential has one, a trailing newline from a secret file is a
+        # mistake), but the error names the key, never the value.
+        _properties_line(key, "")
+        if any(ch in text for ch in "\r\n\f\x00"):
+            raise ValueError(f"debezium config entry {key} has a control character in its value")
+        name = "FLUID_DBZ_" + re.sub(r"[^A-Za-z0-9]", "_", key.removeprefix("debezium.")).upper()
+        if env.get(name, text) != text:
+            raise ValueError(f"two debezium properties map to the environment variable {name}")
+        env[name] = text
+        return f"{_escape_properties_key(key)}=${{{name}}}"
+
+    lines = [line(f"debezium.source.{k}", v) for k, v in source_config.items()]
+    lines.append("quarkus.log.console.json=false")
+    lines.append(_properties_line("debezium.sink.type", sink_type))
+    lines += [
+        line(f"debezium.sink.{sink_type}.{k}", v, env_refs=True) for k, v in sink_config.items()
+    ]
+    return "\n".join(lines), env
+
+
 def _execute_debezium_server(
     ctx: RunContext,
     build: Mapping[str, Any],
@@ -574,22 +661,22 @@ def _execute_debezium_server(
     # Render the line-based .properties file. Every contract-derived key/value
     # routes through _properties_line, which fail-closes on control characters so
     # a newline in a binding value cannot inject extra Debezium directives.
+    # Credentials go to the server's environment, not the file.
     try:
-        lines = [_properties_line(f"debezium.source.{k}", v) for k, v in source_config.items()]
-        lines.append("quarkus.log.console.json=false")
-        lines.append(_properties_line("debezium.sink.type", sink_type))
-        for k, v in sink_config.items():
-            lines.append(_properties_line(f"debezium.sink.{sink_type}.{k}", v))
+        properties, secret_env = render_application_properties(
+            source_config, sink_type, sink_config
+        )
     except ValueError as exc:
         return _failed(ctx, started_at, t_start, str(exc))
-    config_path.write_text("\n".join(lines), encoding="utf-8")
-    # The file holds the source DB password and any operator-forwarded sink
-    # credentials (s3.secret-access-key / jdbc.password); it inherits the umask
-    # (0o644) otherwise. Force 0o600, mirroring dbt/profiles.py.
+    # Created 0o600 and tightened to 0o600 when it already exists (a copy an
+    # earlier release wrote at 0o644 with the password in it is truncated
+    # first): never world-readable, and no chmod whose failure is ignored. A
+    # symlink in its place is refused rather than followed. A hand-written
+    # sink key the credential rule does not name still lands in this file.
     try:
-        os.chmod(config_path, 0o600)
-    except OSError:
-        pass
+        _write_private_text(config_path, properties)
+    except OSError as exc:
+        return _failed(ctx, started_at, t_start, f"could not write {config_path}: {exc}")
 
     # Validate any contract-supplied ``server_binary`` before it becomes
     # ``argv[0]`` (arbitrary-binary-execution guard). A value with a path
@@ -607,13 +694,15 @@ def _execute_debezium_server(
             "(bare name on PATH, or an absolute path to an executable file)",
         )
 
-    # No ``env=``: the server inherits this process's environment, which is
-    # where Iceberg resolves the ``env:<NAME>`` catalog properties
-    # ``sink.catalogAuth`` emits, and where the preflight checked the variable
-    # is set. The secret is never written to application.properties.
+    # The server inherits this process's environment, which is where Iceberg
+    # resolves the ``env:<NAME>`` catalog properties ``sink.catalogAuth``
+    # emits, and where the preflight checked the variable is set. The
+    # ``FLUID_DBZ_*`` credentials the file refers to are added to it. No
+    # secret is written to application.properties.
     try:
         proc = subprocess.run(
             [binary, "--config", str(config_path)],
+            env={**os.environ, **secret_env} if secret_env else None,
             capture_output=True,
             text=True,
             timeout=int(dbz_props.get("timeout_seconds", 60)),

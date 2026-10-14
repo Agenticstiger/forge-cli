@@ -298,7 +298,7 @@ def test_a_literal_secret_in_a_handwritten_config_warns():
     warnings = validate_iceberg_sink(contract)[1]
     assert any(
         "debezium.server.sink.config sets credential to a literal value" in w
-        and "writes to application.properties" in w
+        and "passes to Debezium Server" in w
         and "id:sec" not in w
         for w in warnings
     ), warnings

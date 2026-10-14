@@ -109,10 +109,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fluid validate` and the streaming runners now warn when an Iceberg sink override
   (`iceberg_catalog_overrides`, `sink_connector_config`, `debezium.server.sink.config`) sets
   the catalog's `credential` or `token` to a literal value, which forge-cli then pushes to
-  the Kafka Connect REST API or writes to `application.properties`. A value that starts
+  the Kafka Connect REST API or passes to Debezium Server. A value that starts
   with `env:` or carries a `${...}` expression does not warn. Under `fluid validate
   --strict` the warning fails validation; use `sink.catalogAuth`, or an `env:<VARIABLE>`
   value.
+- The embedded Debezium Server's `application.properties` no longer holds the credentials
+  forge-cli resolves or derives. A property whose name carries `password`, `secret`,
+  `token`, `credential`, `authorization`, `authParams`, `jaas.config`, a connection
+  string, or an API, private, account, keystore or SSE key is written as
+  `${FLUID_DBZ_<PROPERTY>}` (for example
+  `debezium.source.database.password=${FLUID_DBZ_SOURCE_DATABASE_PASSWORD}`), and forge-cli
+  passes the value to the server in that environment variable. A `server_binary` wrapper
+  that replaces the environment must pass the `FLUID_DBZ_*` variables through. A sink
+  `env:<VARIABLE>` value is still written as it is. A hand-written sink key outside that
+  list is written as before, in a file that is now created at mode 0600.
+- A Meltano / Singer tap and target now read their `--config` file from a private
+  temporary directory that is removed when the tap or target exits (a `fluid` process
+  killed by a signal can leave it there), instead of
+  `.fluid/meltano/<product>/<build>/tap_config.json` and `target_config.json`. A copy an
+  earlier release left there is deleted on the next run. A tap that writes a refreshed
+  token back to its config file loses that write; the next run resolves the credential
+  again.
+- `fluid init` now git-ignores `**/.fluid/debezium/` and `**/.fluid/meltano/`, in every
+  product directory of the workspace. A project whose `.gitignore` already has the
+  fluid-cli block does not get the new lines; add them yourself, and check that no
+  `application.properties`, `tap_config.json` or `target_config.json` under those
+  directories was committed with a credential in it. Rotate any you find.
 
 ### Added
 
@@ -413,6 +435,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upgrade from a release that gave a non-Snowflake-managed catalog a volume, or a
   Snowflake-managed expose removed or re-cataloged in this change) and keeps the `tofu
   state rm` remediation.
+
+### Security
+- **The Debezium and Singer config files forge-cli generates no longer keep the source or
+  destination password on disk.** The embedded Debezium Server's `application.properties`
+  held the source database password a `secretRef` resolved, under the contract directory,
+  briefly at mode 0644 and kept after the run. The Singer `tap_config.json` and
+  `target_config.json` held the source and warehouse passwords at 0644 and were never
+  deleted. None of them was git-ignored, so `git add -A` staged the password. The Debezium
+  credentials now go to the server's environment and the file is created at 0600; the
+  Singer configs live 0600 in a private temporary directory for the life of the tap or
+  target. (CodeQL alerts 211, 53, 54.)
+- **A failing `fluid mission` predicate no longer quotes a contract's inline credential.** A
+  predicate on a path such as `exposes[*].binding.location.password` printed
+  `got '<value>'` to the terminal, `--json`, the stored scorecard and the planner's LLM
+  prompt, because the redactor read `password: expected == …` as the assignment. A leaf at
+  or under a key the redactor treats as a credential (`password`, `secrets`, `auth`,
+  `connection_string`, `apiKey`, `PGPASSWORD`, …) now shows as `***REDACTED***`. A key that <!-- pragma: allowlist secret -->
+  refers to a credential (`secretRef`, `tokenEnv`, `catalogAuth.type`) or only contains such
+  a word (`maxTokensPerDay`, `authz`, `author`) still shows its value. (CodeQL alert 241.)
+- **The shared redactor masks `aws.secret.access.key=`, `secret.access.key=`,
+  `fs.s3a.secret.key=` and `secret_key=`.** It knew `secret_access_key` with `_` or `-`, and
+  no `secret.key` form at all, so a Kafka Connect task trace stored in a run record kept an
+  S3 secret key. The Snowflake provider's redactor masks the same spellings. (CodeQL alert
+  231.)
+- **The local provider's log context no longer carries a raw error.** A failed plan, load,
+  SQL or copy action put the exception's text into the log record's context, which a JSON
+  log formatter renders. That text now goes through the shared redactor, and every context
+  value first gets the two layers the Snowflake provider runs: each credential forge-cli
+  holds masked whole, then any `scheme://user:password@` userinfo. (CodeQL alert 292.) <!-- pragma: allowlist secret -->
+- `mask_known_secrets` is now `redact_known_values`; the old name stays as an alias. CodeQL
+  treats a call to a function named like `*secret*` as a source of secrets, so every caller
+  of the redactor was reported as logging or storing a credential it had already masked.
 
 ### Documentation
 

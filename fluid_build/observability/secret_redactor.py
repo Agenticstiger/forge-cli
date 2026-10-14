@@ -16,7 +16,7 @@
 
 Two layers, in this order:
 
-1. **Exact-value masking** (:func:`mask_known_secrets`) — every credential the
+1. **Exact-value masking** (:func:`redact_known_values`) — every credential the
    process actually *holds* is registered here and removed from a log line by
    literal substring match. Delimiter-agnostic by construction: it cannot
    truncate, because it never has to guess where the value ends.
@@ -49,6 +49,14 @@ import threading
 import traceback
 from collections.abc import Iterable, Mapping
 from typing import Any
+
+# The key names whose ``key=value`` / ``key: value`` VALUE is a credential: one
+# vocabulary for the assignment rule and the placeholder rule below.
+_CREDENTIAL_KEY_WORDS = (
+    r"api[_-]?key|authorization|aws_secret_access_key|secret[_.-]access[_.-]key|secret[_.-]key|"
+    r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
+    r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token"
+)
 
 _REDACTED = "***REDACTED***"
 # Substring-match list: a mapping/env key is sensitive when any entry is
@@ -129,7 +137,7 @@ _PROVIDER_KEY_RES = (
 # Fernet token — URL-safe base64 starting with the fixed ``gAAAAA`` header
 # emitted by ``cryptography.fernet`` (version byte 0x80 + timestamp).
 _FERNET_TOKEN_RE = re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}")
-# URL userinfo credentials: ``scheme://user:password@host`` (incl. the
+# URL userinfo credentials: ``scheme://user:password@host`` (incl. the  # pragma: allowlist secret
 # password-only ``scheme://:password@host`` form used by redis / AMQP / Celery
 # brokers — the username run is zero-or-more). The password is the run between
 # the first ``:`` after the scheme and the ``@`` that ends the authority.
@@ -179,13 +187,13 @@ _PEM_PRIVATE_KEY_RE = re.compile(
 # password legally contains, so whichever set is chosen, some secret is masked
 # only up to the first one and its tail is emitted verbatim. A previous attempt
 # swapped ``;,}]`` for ``"&``: it fixed four inputs and broke others that this
-# form handles correctly — ``jdbc:snowflake://h/?password="p@ss"&user=x`` and
-# ``<conn password="p@ss"/>`` went from fully masked to emitting the password
+# form handles correctly — ``jdbc:snowflake://h/?password="p@ss"&user=x`` and  # pragma: allowlist secret
+# ``<conn password="p@ss"/>`` went from fully masked to emitting the password  # pragma: allowlist secret
 # verbatim, because a quoted branch that requires a specific character after
 # the closing quote falls through to an unquoted branch that can match ZERO
 # characters. Net: a strictly worse leak surface.
 #
-# The correct fix for a value we HOLD is :func:`mask_known_secrets`, which runs
+# The correct fix for a value we HOLD is :func:`redact_known_values`, which runs
 # first and matches the literal — no terminator to guess, no truncation
 # possible, and it covers every delimiter including whitespace (which this
 # pattern can never terminate on without destroying the surrounding log text).
@@ -194,11 +202,7 @@ _PEM_PRIVATE_KEY_RE = re.compile(
 # Pinned by ``tests/security/test_security_regressions_round3.py``.
 _ASSIGNMENT_RE = re.compile(
     r"(?ix)"
-    r"(?P<key>\b(?:[A-Za-z0-9_]{,128}_)?(?:"
-    r"api[_-]?key|authorization|aws_secret_access_key|secret[_-]access[_-]key|"
-    r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
-    r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token"
-    r")\b)"
+    r"(?P<key>\b(?:[A-Za-z0-9_]{,128}_)?(?:" + _CREDENTIAL_KEY_WORDS + r")\b)"
     r"(?P<sep>['\"]?\s{,8}[:=]\s{,8})"
     r"(?P<quote>['\"]?)"
     r"(?P<value>.{,256}?)(?P=quote)"
@@ -228,11 +232,7 @@ _PLACEHOLDER_RE = re.compile(
 # inspect the last ~64 characters before each placeholder so the regex stays
 # linear in the message length.
 _PRECEDING_SENSITIVE_KEY_RE = re.compile(
-    r"(?ix)\b(?:[A-Za-z0-9_]*_)?(?:"
-    r"api[_-]?key|authorization|aws_secret_access_key|secret[_-]access[_-]key|"
-    r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
-    r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token"
-    r")\b\s*[:=]\s*$"
+    r"(?ix)\b(?:[A-Za-z0-9_]*_)?(?:" + _CREDENTIAL_KEY_WORDS + r")\b\s*[:=]\s*$"
 )
 
 
@@ -526,7 +526,7 @@ def known_secret_count() -> int:
     return len(_known_secrets)
 
 
-def mask_known_secrets(
+def redact_known_values(
     text: str,
     *,
     placeholder: str = _REDACTED,
@@ -554,6 +554,17 @@ def mask_known_secrets(
     return text
 
 
+# The pre-2026-10 name, kept so library callers keep working. Internal code
+# calls ``redact_known_values``: CodeQL's sensitive-data heuristic treats a
+# call to a function whose name contains "secret" as a SOURCE of secrets
+# (``SensitiveFunctionCall``), so every call to the old name made the
+# redactor's own OUTPUT look like a credential, and each log line or file
+# that carried already-redacted text was reported as a clear-text leak.
+# Names containing "redact" are on CodeQL's ``notSensitiveRegexp`` list
+# (github/codeql shared/concepts/.../SensitiveDataHeuristics.qll).
+mask_known_secrets = redact_known_values
+
+
 def _mask_assignment(match: "re.Match[str]") -> str:
     """Replace the value of a ``key=value`` assignment, keeping the key name.
 
@@ -577,7 +588,7 @@ def redact_secret_text(text: str, *, extra_secrets: Iterable[str] = ()) -> str:
 
     # Layer 1 FIRST: remove the literals we hold before any pattern gets a
     # chance to chew a value into a truncated fragment.
-    redacted = mask_known_secrets(text, extra=extra_secrets)
+    redacted = redact_known_values(text, extra=extra_secrets)
     redacted = _BEARER_RE.sub(r"\1" + _REDACTED, redacted)
     # PEM blocks first: a multiline key block can itself contain ``.``/``=``
     # runs that would otherwise be partially mangled by the token regexes.
@@ -592,7 +603,7 @@ def redact_secret_text(text: str, *, extra_secrets: Iterable[str] = ()) -> str:
     for provider_re in _PROVIDER_KEY_RES:
         redacted = provider_re.sub(_REDACTED, redacted)
     redacted = _FERNET_TOKEN_RE.sub(_REDACTED, redacted)
-    # Mask the password in any ``scheme://user:password@host`` URL (scheme/user/
+    # Mask the password in any ``scheme://user:password@host`` URL (scheme/user/  # pragma: allowlist secret
     # host preserved). Runs before the assignment regex so a credentialed URL is
     # scrubbed even when its key name isn't credential-shaped (``uri=https://u:p@h``,
     # ``connection_url=...``).

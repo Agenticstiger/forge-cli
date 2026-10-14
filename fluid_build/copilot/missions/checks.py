@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -339,13 +340,111 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _compare(op: str, leaf: Any, expected: Any) -> Tuple[bool, str]:
+#: A key whose last word makes it a REFERENCE to a credential, not one:
+#: ``secretRef``, ``tokenEnv``, ``credentialEnv``, ``catalogAuth.type``,
+#: ``passwordFile``. ``url``/``uri`` are not here: a ``connection_url`` can
+#: carry ``Pwd=`` in a form no text rule recognises.
+_REFERENCE_WORDS = frozenset(
+    {"ref", "env", "type", "kind", "mode", "provider", "scope", "audience", "resource"}
+    | {"name", "file", "path", "enabled"}
+)
+#: Words that only contain a sensitive part (``auth``): ``authz``, ``author``.
+_NOT_CREDENTIAL_WORDS = frozenset({"authz", "authn", "author", "authors", "authority"})
+#: A token budget, not a token: ``maxTokensPerDay``, ``tokensPerMinute``.
+_TOKEN_BUDGET_RE = re.compile(r"(?:^|_)(?:max|min)_tokens(?:_|$)|(?:^|_)tokens_per(?:_|$)")
+#: Spellings the shared key rule does not know: ``MYSQL_PWD``, ``passwd``,
+#: ``dsn``, ``accountKey``, ``sharedAccessKey``, ``signingKey``, ``sas``.
+_MORE_CREDENTIAL_NAMES_RE = re.compile(
+    r"(?:passwd|pwd|passcode|dsn|connectionstring|sas|sastoken"
+    r"|(?:access|account|sharedaccess|signing|encryption|master|storage|ssh|subscription)key)$"
+)
+_KEY_WORD_BREAK_RE = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _key_words(key: str) -> List[str]:
+    return [word.lower() for word in _KEY_WORD_BREAK_RE.split(key) if word]
+
+
+def _key_hides_its_value(key: str) -> bool:
+    """Whether a contract key holds a credential, so a diagnostic must not
+    quote what is at or under it.
+
+    The shared rule (``is_sensitive_key_name``, which masks a mapping key in
+    every logging payload) decides, so ``passwords``, ``auth``,
+    ``connection_string``, ``secretValue`` and ``PGPASSWORD`` hide their value.
+    Three kinds of key are read as what they are instead: one that refers to
+    a credential (its last word is in ``_REFERENCE_WORDS``), a word that only
+    contains ``auth`` (``authz``, ``author``), and a token budget
+    (``maxTokensPerDay``). A planner repairing those needs the value.
+    """
+    from fluid_build.observability.secret_redactor import is_sensitive_key_name
+
+    words = _key_words(key)
+    if not words or words[-1] in _REFERENCE_WORDS:
+        return False
+    name = "_".join(word for word in words if word not in _NOT_CREDENTIAL_WORDS)
+    if not name or _TOKEN_BUDGET_RE.search(name):
+        return False
+    return is_sensitive_key_name(name) or bool(
+        _MORE_CREDENTIAL_NAMES_RE.search(name.replace("_", ""))
+    )
+
+
+def _display_leaf(concrete: str, leaf: Any) -> Any:
+    """The leaf as a diagnostic may quote it (``got <leaf>``).
+
+    ``_redact_result`` cannot mask a quoted leaf afterwards: its pattern layer
+    reads ``password: expected == …, got 'x'`` as a ``password`` assignment
+    whose value is the word ``expected``, so ``'x'`` reached the terminal,
+    ``--json``, the scorecard file and the planner's LLM prompt. Mask it here
+    instead, by the path's key names: a leaf at or under a key that holds a
+    credential (:func:`_key_hides_its_value`) is never shown, unless the leaf's
+    own key refers to one (``catalogAuth.tokenEnv``), and any other leaf goes
+    through ``redact_value``. A value that cannot be redacted (a YAML alias
+    that refers to itself) is not shown either.
+    """
+    from fluid_build.observability.secret_redactor import _REDACTED, redact_value
+
+    keys = [s for s in re.split(r"[.\[\]]", concrete) if s and s != "*" and not s.isdigit()]
+    leaf_words = _key_words(keys[-1]) if keys else []
+    leaf_is_a_reference = bool(leaf_words) and leaf_words[-1] in _REFERENCE_WORDS
+    if not leaf_is_a_reference and any(_key_hides_its_value(key) for key in keys):
+        return _REDACTED
+    try:
+        return redact_value(_mask_credential_keys(leaf))
+    except RecursionError:
+        return _REDACTED
+
+
+def _mask_credential_keys(value: Any) -> Any:
+    """``value`` with every mapping entry under a key that holds a credential
+    replaced, by the same rule as a path key (``redact_value``'s own key rule
+    lacks ``pwd``, ``dsn``, ``accountKey`` and the rest)."""
+    from fluid_build.observability.secret_redactor import _REDACTED
+
+    if isinstance(value, dict):
+        return {
+            key: (
+                _REDACTED
+                if isinstance(key, str) and _key_hides_its_value(key)
+                else _mask_credential_keys(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_credential_keys(item) for item in value]
+    return value
+
+
+def _compare(op: str, leaf: Any, expected: Any, *, shown: Any) -> Tuple[bool, str]:
     """Evaluate one leaf. Returns ``(ok, reason_if_not)``. Type mismatches
-    fail with a reason rather than raising — fail closed, never crash."""
+    fail with a reason rather than raising — fail closed, never crash.
+    ``shown`` is what the reason quotes in place of the leaf
+    (:func:`_display_leaf`)."""
     if op == "eq":
-        return (leaf == expected, f"expected == {expected!r}, got {leaf!r}")
+        return (leaf == expected, f"expected == {expected!r}, got {shown!r}")
     if op == "ne":
-        return (leaf != expected, f"expected != {expected!r}, got {leaf!r}")
+        return (leaf != expected, f"expected != {expected!r}, got {shown!r}")
     if op == "contains":
         if isinstance(leaf, str):
             ok = isinstance(expected, str) and expected in leaf
@@ -353,7 +452,7 @@ def _compare(op: str, leaf: Any, expected: Any) -> Tuple[bool, str]:
             ok = expected in leaf
         else:
             return (False, f"contains needs a string or array, got {type(leaf).__name__}")
-        return (ok, f"expected to contain {expected!r}, got {leaf!r}")
+        return (ok, f"expected to contain {expected!r}, got {shown!r}")
 
     # Ordered comparisons: both numeric, or both strings — never mixed.
     if _is_number(leaf) and _is_number(expected):
@@ -371,7 +470,7 @@ def _compare(op: str, leaf: Any, expected: Any) -> Tuple[bool, str]:
         "gt": leaf > expected,
         "gte": leaf >= expected,
     }[op]
-    return (ok, f"expected {op} {expected!r}, got {leaf!r}")
+    return (ok, f"expected {op} {expected!r}, got {shown!r}")
 
 
 def _check_predicate(
@@ -414,7 +513,9 @@ def _check_predicate(
     diagnostics.extend(f"{p}: path not found" for p in missing)
     failing = 0
     for concrete, leaf in leaves:
-        ok, reason = _compare(criterion.op, leaf, criterion.value)
+        ok, reason = _compare(
+            criterion.op, leaf, criterion.value, shown=_display_leaf(concrete, leaf)
+        )
         if not ok:
             failing += 1
             diagnostics.append(f"{concrete}: {reason}")
