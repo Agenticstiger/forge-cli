@@ -21,7 +21,7 @@ actually works against an actual repository, and whether the digest it
 computes survives a peer reformatting the same contract.
 
 So the git tests here build a genuine repo on disk and drive real git
-through it. Only ``_build_auth_url`` is patched -- to point at the local
+through it. Only ``_git_remote_url`` is patched -- to point at the local
 fixture instead of a network remote -- because the endpoint allow-list
 deliberately refuses ``file://`` (an SSRF/local-file-read guard), and
 weakening it for a test would be testing a configuration the product
@@ -143,7 +143,7 @@ class TestAgainstARealGitRepo:
         real here. A mocked test cannot tell you that argv is well-formed.
         """
         with patch(
-            "fluid_build.forge.federation._build_auth_url",
+            "fluid_build.forge.federation._git_remote_url",
             return_value=str(upstream_repo),
         ):
             digest = _fetch_digest_via_git(self._ws(), "telco.orders", "1")
@@ -165,7 +165,7 @@ class TestAgainstARealGitRepo:
         """
         ws = self._ws()
         with patch(
-            "fluid_build.forge.federation._build_auth_url",
+            "fluid_build.forge.federation._git_remote_url",
             return_value=str(upstream_repo),
         ):
             first = _fetch_digest_via_git(ws, "telco.orders", "1")
@@ -187,7 +187,7 @@ class TestAgainstARealGitRepo:
         """The converse: a real schema change MUST change the digest."""
         ws = self._ws()
         with patch(
-            "fluid_build.forge.federation._build_auth_url",
+            "fluid_build.forge.federation._git_remote_url",
             return_value=str(upstream_repo),
         ):
             before = _fetch_digest_via_git(ws, "telco.orders", "1")

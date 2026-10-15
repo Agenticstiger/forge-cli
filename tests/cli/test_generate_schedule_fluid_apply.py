@@ -419,6 +419,10 @@ def _literal_connection(contract: str = DEMO_CONTRACT) -> str:
 #: Variables the ``fluid apply`` code path reads that a scheduled run does not
 #: need, so the worker environment does not pass them.
 NOT_PASSED = {
+    "GIT_CONFIG_PARAMETERS": (
+        "federation reads it only to append its own git config entries after any the "
+        "caller already set; with none set its entries are the whole value"
+    ),
     "JENKINS_URL": (
         "only tags a Command Center run report as a Jenkins run; a scheduled run is not one"
     ),

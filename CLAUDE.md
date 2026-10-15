@@ -221,7 +221,26 @@ streaming runners. Headline items:
     `<product_id>/contract.fluid.yaml`, recomputes via
     `compute_contract_digest`. Falls back to shell-out git when
     gitpython missing. Auth via env-var `secret_ref` (e.g.
-    `GITHUB_TOKEN`) injected into HTTPS clone URL.
+    `GITHUB_TOKEN`), handed to git only through the process
+    environment: entries appended to `GIT_CONFIG_PARAMETERS` setting
+    `http.<endpoint>.extraHeader` (and
+    `http.<endpoint>.followRedirects=false`), git >= 2.31, keyed to the
+    endpoint URL and read after any inherited `GIT_CONFIG_COUNT` pairs and
+    `GIT_CONFIG_PARAMETERS` entries; an empty `extraHeader` first clears
+    the configured list and the operator's non-Authorization headers for the
+    endpoint are handed back after it, so one Authorization header goes out
+    and a gateway's header still does. A `url.<base>.insteadOf` rewrite of
+    the endpoint to another scheme, host, port or path means no token; one
+    that only adds userinfo keeps it, with the settings also keyed to that
+    `user@` URL. Never in the clone URL, argv or the cache's `.git/config`.
+  - Credential policy, checked before anything is sent: `GITHUB_TOKEN`
+    / `GH_TOKEN` go only to GitHub hosts by default; any other variable
+    needs an operator-set `FLUID_FEDERATION_SECRET_REF_ALLOWLIST` entry
+    (recommended `NAME@host`); https only. User docs:
+    `docs/FEDERATION.md`. Pin files:
+    `tests/forge/test_federation_credentials.py`,
+    `tests/forge/test_federation_operator_policy.py`,
+    `tests/forge/test_federation_git_redirects.py`.
   - Pin file: `tests/forge/test_federation_backends.py`.
   - Manifest schema: `federation/upstreams.yaml` with workspaces
     `[{id, kind: git_registry|catalog|http_registry, endpoint,

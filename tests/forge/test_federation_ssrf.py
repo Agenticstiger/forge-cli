@@ -251,7 +251,7 @@ class TestGitTokenLeak:
         with patch("subprocess.run", side_effect=leaky):
             with caplog.at_level("WARNING"):
                 ok = _fed._git_clone_or_pull_via_shellout(
-                    auth_url=auth_url,
+                    remote_url=auth_url,
                     cache_dir=tmp_path / "clone",
                     workspace_id="ext",
                 )

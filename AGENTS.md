@@ -554,8 +554,27 @@ workspaces:
     endpoint: https://github.com/acme/telco-billing-mesh
     auth:
       mode: github_token         # | basic | oidc | bearer | none
-      secret_ref: GITHUB_TOKEN   # env var name; resolved at fetch time
+      secret_ref: GITHUB_TOKEN   # env var name; by default sent only to GitHub hosts, over https
 ```
+
+`secret_ref` names a variable; where its value may be sent is set by the
+operator, not by the committed manifest. Every check runs before anything is
+sent, and a refusal is reported as an `unreachable` finding:
+
+* `GITHUB_TOKEN` / `GH_TOKEN` go to `github.com`, `api.github.com` and
+  `raw.githubusercontent.com` only, unless the operator lists them for
+  another host (GitHub Enterprise: `GITHUB_TOKEN@github.acme.internal`).
+* Any other variable needs an entry in
+  `FLUID_FEDERATION_SECRET_REF_ALLOWLIST`, set by the operator (shell, CI,
+  or a `FLUID_SECRETS_FILE` outside the project): `NAME@host`, host without
+  a port. A bare `NAME` allows any host. A value set in a project `.env` /
+  `.env.*` file is ignored.
+* https only: an `http://` or `git://` endpoint whose auth would attach the
+  credential is refused; `ssh://` git endpoints are never sent it. git gets
+  the token as `http.<endpoint>.extraHeader` appended to
+  `GIT_CONFIG_PARAMETERS` in its environment, never in the clone URL.
+
+Full policy, redirect handling and upgrade notes: `docs/FEDERATION.md`.
 
 `validate_federated_consumes` is wired into `cli/apply.py` as a
 stage-7 gate. It **warns; it does not abort**. Unlike plan-binding —

@@ -87,6 +87,10 @@ class TestHttpBackend:
     def test_bearer_auth_header_built_from_secret_ref(self, monkeypatch):
         ws = self._ws(auth_mode="bearer", auth_secret_ref="REGISTRY_TOKEN")
         monkeypatch.setenv("REGISTRY_TOKEN", "tok-9876")
+        # Only GITHUB_TOKEN / GH_TOKEN (toward GitHub) are allowed by default.
+        monkeypatch.setenv(
+            "FLUID_FEDERATION_SECRET_REF_ALLOWLIST", "REGISTRY_TOKEN@registry.example"
+        )
 
         route = respx.get("https://registry.example/api/p/1/digest").mock(
             return_value=httpx.Response(200, text="sha256:def\n")

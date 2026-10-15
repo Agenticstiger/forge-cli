@@ -376,7 +376,7 @@ WARNING.
 | `--allow-skipped-builds` | exit 0 even when every build was skipped |
 | `--force-pattern-drift` | override apply-time plugin hooks that report drift |
 | `--no-verify-plan-binding` | skip plan/bundle digest verification |
-| `--no-verify-federation` | skip the federated-consumes upstream-digest gate |
+| `--no-verify-federation` | skip the federated-consumes upstream-digest gate (credentials for a private upstream: [federation](FEDERATION.md)) |
 | `--ensure-opentofu` | provision a pinned, SHA-256-verified `tofu` if missing |
 
 `fluid apply` sets `allow_abbrev=False`: flags are matched exactly, never by
