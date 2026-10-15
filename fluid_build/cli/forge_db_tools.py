@@ -259,8 +259,10 @@ def _fetch_sample_rows(arguments: Dict[str, Any], env: Mapping[str, str]) -> Dic
         _attach_string_mysql,
         _attach_string_postgres,
         _attach_string_sqlite,
+        _error_text,
         _normalize_kind,
         _parse_uri,
+        _uri_scheme,
         _validate_alias,
     )
     from fluid_build.providers._sql_safety import validate_ident
@@ -309,14 +311,18 @@ def _fetch_sample_rows(arguments: Dict[str, Any], env: Mapping[str, str]) -> Dic
     # Resolve the source kind + parse the URI (credentials included) via the
     # shared JDBC helpers.
     try:
-        kind = _normalize_kind(uri.split("://", 1)[0])
+        kind = _normalize_kind(_uri_scheme(uri))
         conn_args = _parse_uri(uri, kind)
     except ValueError as exc:
-        return {"error": "InvalidConnectionUri", "message": str(exc)}
+        # This message goes to the model, with the URI's password masked.
+        return {"error": "InvalidConnectionUri", "message": _error_text(exc, uri)}
 
     alias = _validate_alias("source_db")
     if kind == "postgres":
-        attach = _attach_string_postgres(conn_args, alias)
+        # The URI is the operator's own configuration, read from this process's
+        # environment; the model only picks an alias. So it authenticates as the
+        # operator set it up, client certificate included.
+        attach = _attach_string_postgres(conn_args, alias, operator_supplied=True)
     elif kind == "mysql":
         attach = _attach_string_mysql(conn_args, alias)
     else:  # sqlite

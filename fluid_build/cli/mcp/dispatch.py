@@ -24,8 +24,12 @@ from __future__ import annotations
 import argparse as _argparse
 import json
 import logging
+import os
+import re
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 import yaml
 
@@ -63,7 +67,12 @@ def _pkg():
     return _mcp_pkg
 
 
-def _build_source_adapter(arguments, *, allow_inline_credentials: bool = False):
+def _build_source_adapter(
+    arguments,
+    *,
+    allow_inline_credentials: bool = False,
+    allow_metadata_service: bool = False,
+):
     """Package-level indirection wrapper for the real adapter builder.
 
     Delegates to :func:`_build_source_adapter_impl`, but resolves it through
@@ -76,9 +85,15 @@ def _build_source_adapter(arguments, *, allow_inline_credentials: bool = False):
     # to the real implementation to avoid infinite recursion.
     if builder is None or builder is _build_source_adapter:
         return _build_source_adapter_impl(
-            arguments, allow_inline_credentials=allow_inline_credentials
+            arguments,
+            allow_inline_credentials=allow_inline_credentials,
+            allow_metadata_service=allow_metadata_service,
         )
-    return builder(arguments, allow_inline_credentials=allow_inline_credentials)
+    return builder(
+        arguments,
+        allow_inline_credentials=allow_inline_credentials,
+        allow_metadata_service=allow_metadata_service,
+    )
 
 
 def _write_audit_event(*args, **kwargs):
@@ -148,6 +163,7 @@ def _call_tool(
     *,
     read_only: bool,
     allow_inline_credentials: bool = False,
+    allow_metadata_service: bool = False,
 ) -> Dict[str, Any]:
     """Dispatch a named tool to its implementation (sync, runs in worker thread).
 
@@ -157,6 +173,14 @@ def _call_tool(
     """
     from fluid_build.cli.forge_data_model import diff_logical_models
     from fluid_build.copilot.schemas.stage_outputs import ConceptualRelationship
+
+    # Every source-catalog tool builds its adapter under the operator's two
+    # credential gates (``--allow-inline-credentials``, ``--allow-metadata-service``).
+    build_adapter = partial(
+        _build_source_adapter,
+        allow_inline_credentials=allow_inline_credentials,
+        allow_metadata_service=allow_metadata_service,
+    )
 
     if name == "read_logical_model":
         path = Path(arguments["path"])
@@ -246,9 +270,7 @@ def _call_tool(
         }
 
     if name == "list_source_tables":
-        adapter = _build_source_adapter(
-            arguments, allow_inline_credentials=allow_inline_credentials
-        )
+        adapter = build_adapter(arguments)
         scope = _scope_from_args(arguments)
         tables = adapter.list_tables(scope)
         _write_audit_event(
@@ -262,9 +284,7 @@ def _call_tool(
         return {"tables": [t.model_dump(mode="json", by_alias=True) for t in tables]}
 
     if name == "inspect_source_table":
-        adapter = _build_source_adapter(
-            arguments, allow_inline_credentials=allow_inline_credentials
-        )
+        adapter = build_adapter(arguments)
         fqn = str(arguments.get("fqn") or "")
         if not fqn:
             raise RuntimeError("inspect_source_table requires 'fqn'")
@@ -276,9 +296,7 @@ def _call_tool(
         return table.model_dump(mode="json", by_alias=True)
 
     if name == "list_source_lineage":
-        adapter = _build_source_adapter(
-            arguments, allow_inline_credentials=allow_inline_credentials
-        )
+        adapter = build_adapter(arguments)
         fqn = str(arguments.get("fqn") or "")
         if not fqn:
             raise RuntimeError("list_source_lineage requires 'fqn'")
@@ -290,9 +308,7 @@ def _call_tool(
         return lineage.model_dump(mode="json", by_alias=True)
 
     if name == "list_source_glossary":
-        adapter = _build_source_adapter(
-            arguments, allow_inline_credentials=allow_inline_credentials
-        )
+        adapter = build_adapter(arguments)
         scope = _scope_from_args(arguments)
         terms = adapter.list_glossary_terms(scope)
         _write_audit_event(
@@ -313,6 +329,16 @@ def _call_tool(
         jdbc_kinds = {"postgres", "postgresql", "mysql", "sqlite"}
         source_value = str(arguments.get("source") or "").lower().strip()
         if source_value in jdbc_kinds:
+            # A JDBC source reaches a database — and this host's credentials,
+            # files and identity — just as a catalog credential block does, so
+            # it is classified under the same operator gates before any
+            # connection is attempted.
+            _gate_jdbc_source(
+                source_value,
+                arguments.get("uri"),
+                allow_inline_credentials=allow_inline_credentials,
+                allow_metadata_service=allow_metadata_service,
+            )
             return _dispatch_forge_from_jdbc_source(arguments)
 
         # ``resolve_store`` is imported at module level — do NOT
@@ -323,9 +349,7 @@ def _call_tool(
         from fluid_build.copilot.agents.base import StageSession
         from fluid_build.copilot.agents.logical_agent import LogicalAgent
 
-        adapter = _build_source_adapter(
-            arguments, allow_inline_credentials=allow_inline_credentials
-        )
+        adapter = build_adapter(arguments)
         scope = _scope_from_args(arguments)
         technique = str(arguments.get("technique") or "data_vault_2")
         engine = str(arguments.get("engine") or "dbt")
@@ -548,7 +572,7 @@ def _dispatch_forge_from_jdbc_source(arguments: Dict[str, Any]) -> Dict[str, Any
     if not uri:
         raise RuntimeError(
             f"forge_from_source --source {source!r} requires 'uri'. "
-            "Example: postgresql://user:pass@host:5432/db"
+            "Example: postgresql://user:pass@host:5432/db"  # pragma: allowlist secret
         )
     if not output_path:
         raise RuntimeError("forge_from_source requires 'output_path'")
@@ -569,6 +593,9 @@ def _dispatch_forge_from_jdbc_source(arguments: Dict[str, Any]) -> Dict[str, Any
         tables=scope.get("tables") or None,
     )
     jdbc_logger = logging.getLogger("fluid.mcp.forge_from_jdbc_source")
+    # No operator_supplied here, ever: the URI is the client's, so a password
+    # connection stays pinned to its own material and never presents this
+    # host's client certificate or libpq settings.
     rc = _run_from_jdbc_source(namespace, jdbc_logger)
     if rc != 0:
         raise RuntimeError(
@@ -612,10 +639,430 @@ def _import_adapter_class(dotted_path: str) -> Any:
     return getattr(module, class_name)
 
 
+class McpToolRefusal(RuntimeError):
+    """An anticipated refusal whose message must reach the MCP client intact.
+
+    The server layer re-raises it as the SDK's ``ToolError`` (see
+    :func:`fluid_build._mcp_compat.get_tool_error`); on SDK 2.x a bare
+    ``RuntimeError`` reaches the client only as "Error executing tool <name>",
+    which would hide which server flag the operator needs.
+    """
+
+
+def _metadata_service_opt_in(arguments: Dict[str, Any], *, allow_metadata_service: bool) -> bool:
+    """Return whether this call may use the metadata-service credential fallback.
+
+    The client's ``allow_metadata_service`` argument can only *request* the
+    fallback. Granting it is the operator's call, made at server start with
+    ``fluid mcp serve --allow-metadata-service`` or with
+    ``FLUID_ALLOW_METADATA_SERVICE=1`` in the server's own environment (the
+    same switch :class:`CredentialResolver` honours). A request without that
+    opt-in is refused, never silently ignored, so the caller learns why.
+
+    Same shape as the inline-credentials gate below, and as the operator-wins
+    precedence of github-mcp-server's ``--read-only`` / ``GITHUB_READ_ONLY``
+    (docs/server-configuration.md): a per-request value never relaxes a
+    server-side setting.
+    """
+    if not arguments.get("allow_metadata_service"):
+        return False
+    if _operator_allows_metadata_service(allow_metadata_service):
+        return True
+    raise McpToolRefusal(
+        "Source-catalog tools refused allow_metadata_service over MCP: the "
+        "cloud metadata-service credential fallback (instance role, workload "
+        "identity, gcloud ADC) uses this host's ambient cloud identity and "
+        "must be enabled by the operator. Retry without allow_metadata_service "
+        "and pass credentials.credential_id, or restart the server with "
+        "--allow-metadata-service (or FLUID_ALLOW_METADATA_SERVICE=1 in the "
+        "server's environment)."
+    )
+
+
+def _operator_allows_metadata_service(allow_metadata_service: bool) -> bool:
+    """The operator's opt-in: ``--allow-metadata-service`` or the env var."""
+    return allow_metadata_service or os.environ.get("FLUID_ALLOW_METADATA_SERVICE") == "1"
+
+
+_JDBC_URI_SCHEMES = {
+    "postgres": ("postgres", "postgresql"),
+    "mysql": ("mysql",),
+    "sqlite": ("sqlite",),
+}
+
+# An absolute path on Windows, which libpq also reads as a socket directory.
+_WINDOWS_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
+
+
+def _scan_to(text: str, pos: int, stops: str) -> int:
+    """The index of the first character at or after ``pos`` that is in ``stops``."""
+    while pos < len(text) and text[pos] not in stops:
+        pos += 1
+    return pos
+
+
+def _libpq_uri_parts(uri: str) -> Tuple[str, str, List[str]]:
+    """``(user, password, hosts)`` of a postgres URI, read the way libpq reads it.
+
+    Adapted from ``conninfo_uri_parse_options`` in PostgreSQL's
+    ``src/interfaces/libpq/fe-connect.c`` (PostgreSQL License): the
+    ``user:password`` part ends at the first ``@`` before any ``/``, and is
+    percent-decoded. ``hosts`` is :func:`_libpq_hosts` of the rest.
+    """
+    rest = uri.partition("://")[2]
+    user = password = ""
+    if "@" in rest[: _scan_to(rest, 0, "/")]:
+        userinfo, _, rest = rest.partition("@")
+        user, _, password = userinfo.partition(":")
+    return unquote(user), unquote(password), _libpq_hosts(rest)
+
+
+def _libpq_hosts(rest: str) -> List[str]:
+    """Every host libpq would take from ``rest``, the part of a URI after its user information.
+
+    Adapted from ``conninfo_uri_parse_options`` / ``conninfo_uri_parse_params``
+    in PostgreSQL's ``src/interfaces/libpq/fe-connect.c`` (PostgreSQL License):
+    the host list is a run of comma-separated ``host[:port]`` items that ends at
+    ``/`` or ``?``, where an item that opens with ``[`` is an IPv6 address up to
+    ``]``; query parameters are ``key=value`` pairs split on ``&``; and every
+    part is percent-decoded (``+`` is not a space). libpq decodes the host part
+    as one string and only then splits it on ``,``, so an encoded comma
+    (``%2C``) separates hosts like a bare one: ``db%2C`` is ``db`` and then the
+    default socket. The result is every item of the decoded host list plus every
+    comma-separated item of a ``host=`` or ``hostaddr=`` parameter. A spelling
+    libpq would refuse is read leniently: this only classifies, it never
+    connects.
+    """
+    hosts: List[str] = []
+    pos = 0
+    while True:
+        if rest.startswith("[", pos):
+            end = _scan_to(rest, pos, "]")
+            host = rest[pos + 1 : end]
+            pos = end + 1
+        else:
+            end = _scan_to(rest, pos, ":/?,")
+            host = rest[pos:end]
+            pos = end
+        if rest.startswith(":", pos):
+            pos = _scan_to(rest, pos + 1, "/?,")
+        hosts.extend(unquote(host).split(","))
+        if not rest.startswith(",", pos):
+            break
+        pos += 1
+    for pair in rest[pos:].partition("?")[2].split("&"):
+        key, _, value = pair.partition("=")
+        if unquote(key) in ("host", "hostaddr"):
+            hosts.extend(unquote(value).split(","))
+    return hosts
+
+
+# Removed from a URL before it is split (CPython's
+# ``urllib.parse._UNSAFE_URL_BYTES_TO_REMOVE``, bpo-43882).
+_URLLIB_REMOVES = str.maketrans("", "", "\t\r\n")
+
+
+def _urllib_host_part(uri: str) -> str:
+    """``uri`` from its host part on, where urllib, and so the attach, finds it.
+
+    Mirrors ``urllib.parse.urlsplit`` and ``_NetlocResultMixinStr._hostinfo``
+    (CPython ``Lib/urllib/parse.py``): the netloc runs from ``//`` to the first
+    ``/``, ``?`` or ``#``, and the user information inside it to its *last*
+    ``@``. libpq ends the user information at the first ``@`` instead, so an
+    ``@`` typed in a password moves libpq's host but not urllib's.
+    """
+    rest = uri.translate(_URLLIB_REMOVES).partition("://")[2]
+    return rest[rest.rfind("@", 0, _scan_to(rest, 0, "/?#")) + 1 :]
+
+
+def _more_than_one_at_before_the_host(uri: str) -> bool:
+    """Whether readers can disagree on where ``uri``'s password ends."""
+    rest = uri.partition("://")[2]
+    return rest.count("@", 0, _scan_to(rest, 0, "/")) > 1
+
+
+def _libpq_local_socket(host: str) -> bool:
+    """Whether libpq reaches ``host`` through one of this host's unix sockets.
+
+    libpq's ``host`` rules: an empty host is the default socket directory, a
+    host that looks like an absolute path is a socket directory (on Windows a
+    drive-letter path too), and one that starts with ``@`` is an
+    abstract-namespace socket. A blank host counts as empty here, which is
+    stricter than libpq (it looks ``" "`` up as a host name).
+    """
+    host = host.strip()
+    return not host or host.startswith(("/", "\\", "@")) or bool(_WINDOWS_DRIVE_PATH.match(host))
+
+
+def _gate_jdbc_source(
+    source: str,
+    uri: Optional[str],
+    *,
+    allow_inline_credentials: bool,
+    allow_metadata_service: bool,
+) -> None:
+    """Classify a ``forge_from_source`` JDBC request like a catalog credential block.
+
+    A JDBC URI (``postgres`` / ``postgresql`` / ``mysql`` / ``sqlite``) reaches
+    a database over the LLM-facing wire, so it is gated exactly as an inline
+    catalog credential is:
+
+    * a **password in the URI** is the caller's own inline material — it needs
+      ``--allow-inline-credentials`` (the same gate inline blocks need), and the
+      connection is then pinned to that password (``_jdbc_introspect``);
+    * **no password** means the connection would fall back to THIS host's own
+      database credentials (``PGPASSWORD`` / ``~/.pgpass`` / a libpq service /
+      ``MYSQL_PWD``) and send them to the host the client chose — the
+      host-identity case, so it needs ``--allow-metadata-service``;
+    * a **sqlite** URI names a file on THIS host's disk, which an MCP client
+      must not be able to choose, so it needs ``--allow-metadata-service`` too;
+    * a URI with **no user name** authenticates as this host's login name
+      (``PGUSER`` / the OS user), a mysql URI naming **localhost** goes
+      through this host's unix socket, where socket authentication identifies
+      the server's OS user, and so does a **postgres host that is empty, blank
+      or a socket path** — an empty URI host, an empty element of a host list
+      (``db,`` / ``,db``, also with the comma percent-encoded: ``db%2C``), a
+      percent-encoded path (``%2Fvar%2Frun%2Fpostgresql``),
+      an ``@`` abstract socket, or such a value in a ``host=`` / ``hostaddr=``
+      query parameter: all are this host's identity, so they need
+      ``--allow-metadata-service`` as well as the inline opt-in for a password.
+
+    A postgres host is the one the attach connects to. The attach reads the URI
+    with urllib, whose user information runs to the last ``@`` before the
+    host, and builds key=value pairs from its fields, so the raw URI never
+    reaches libpq: ``user:Summer2024@@db`` connects over TCP to ``db``. The host
+    list urllib gives it is checked, and so is that same host part with its
+    query, read with libpq's stricter rules (percent-decoding, ``host=``; see
+    :func:`_libpq_hosts`). A URI urllib cannot read never connects; it is
+    classified on libpq's own reading of the whole URI
+    (:func:`_libpq_uri_parts`), and a refusal there says so when more than one
+    ``@`` makes the end of the password ambiguous. A mysql URI urllib cannot
+    give a host and port has no such second reading; it is refused whatever
+    the flags, since none would make it connect.
+
+    The URI must be a string whose scheme matches the source
+    (``postgres://`` / ``postgresql://``, ``mysql://``, ``sqlite://``).
+
+    Refused otherwise with a typed :class:`McpToolRefusal` naming the exact
+    flag, so the refusal reaches the client intact. ``allow_metadata_service``
+    here is the operator's opt-in; the client's argument of that name is not
+    read on the JDBC path. Nor is ``credentials.credential_id``, a catalog-source
+    field: the JDBC path connects with ``uri`` alone, so no refusal here offers
+    a saved source. The operator's own CLI (``fluid forge data-model
+    from-source`` / ``fluid init --discover``) never passes through this gate.
+    """
+    from fluid_build.cli.discover._jdbc_introspect import (
+        _MISSING_HOSTNAME,
+        _normalize_kind,
+        _parse_uri,
+        _uri_problem,
+    )
+
+    if not uri:
+        # The dispatcher raises its own actionable "requires 'uri'" error.
+        return
+    if not isinstance(uri, str):
+        raise McpToolRefusal("forge_from_source refused a JDBC source: 'uri' must be a string.")
+    kind = _normalize_kind(source)  # raises ValueError on an unsupported kind
+    schemes = _JDBC_URI_SCHEMES[kind]
+    scheme, sep, _rest = uri.partition("://")
+    if not sep or scheme.lower() not in schemes:
+        raise McpToolRefusal(
+            f"forge_from_source refused a {source} source: the URI scheme must be "
+            f"{' or '.join(s + '://' for s in schemes)}."
+        )
+
+    if kind == "sqlite":
+        if not _operator_allows_metadata_service(allow_metadata_service):
+            raise McpToolRefusal(
+                "forge_from_source refused a sqlite source over MCP: the URI names a "
+                "file on this server's disk, and an MCP client must not choose a "
+                "server-side path. Run it from the CLI (`fluid forge data-model "
+                "from-source`), or restart the server with --allow-metadata-service (or "
+                "FLUID_ALLOW_METADATA_SERVICE=1 in the server's environment) to allow a "
+                "client-named server path."
+            )
+        return
+
+    local_socket = False
+    ambiguous_at = False
+    if kind == "postgres":
+        parsed: Optional[Dict[str, Any]]
+        try:
+            parsed = _parse_uri(uri, kind)
+        except ValueError:
+            parsed = None
+        if parsed is None:
+            # The attach reads the URI with this same parser, so it would stop
+            # before connecting. The client still learns which flag libpq's
+            # own reading of the URI needs, instead of an unclassified error.
+            libpq_user, libpq_password, hosts = _libpq_uri_parts(uri)
+            parsed = {"user": libpq_user, "password": libpq_password}
+            ambiguous_at = _more_than_one_at_before_the_host(uri)
+        else:
+            # The attach never hands the URI to libpq: it builds key=value
+            # pairs from urllib's fields. So the hosts are the list it connects
+            # to, plus that same host part (and its query) read with libpq's
+            # rules, which is stricter: it percent-decodes and reads host=.
+            hosts = str(parsed.get("host") or "").split(",")
+            hosts += _libpq_hosts(_urllib_host_part(uri))
+        local_socket = any(_libpq_local_socket(host) for host in hosts)
+    else:
+        problem = _uri_problem(uri)
+        if problem is not None:
+            # No second reading would name a host here, and the attach would
+            # refuse the URI before connecting, so no flag can make it usable,
+            # and the refusal does not ask for one. _uri_problem never quotes the
+            # URI, and returns rather than raises, so this refusal carries
+            # neither the password nor urllib's error.
+            hint = ""
+            if problem == _MISSING_HOSTNAME:
+                # A mysql client reads an empty host as localhost: the same
+                # host-identity class as a URI naming it.
+                hint = (
+                    " A mysql client reads an empty host as localhost, this server's "
+                    "unix socket, which needs --allow-metadata-service; name the "
+                    "database server's host (127.0.0.1 for TCP on this machine)."
+                )
+            raise McpToolRefusal(
+                f"forge_from_source refused a mysql source over MCP: the URI has no "
+                f"usable host and port: {problem}. No flag would make it connect, and "
+                f"nothing was contacted.{hint}"
+            )
+        parsed = _parse_uri(uri, kind)
+    has_password = bool(parsed.get("password"))
+    host_identity = None
+    if not parsed.get("user"):
+        host_identity = (
+            "the URI has no user name, so the connection would log in as this host's "
+            "own login name (PGUSER or the OS user)"
+        )
+    elif kind == "mysql" and str(parsed.get("host") or "").rstrip(".").lower() == "localhost":
+        host_identity = (
+            "a mysql 'localhost' is reached through this host's unix socket, where "
+            "socket authentication identifies the server's OS user (use 127.0.0.1 "
+            "for TCP)"
+        )
+    elif local_socket and ambiguous_at:
+        host_identity = (
+            "the URI has more than one '@' before its host, so where the password ends "
+            "is ambiguous. libpq ends it at the first '@' and then reads a host that is "
+            "empty, blank or a socket path: this host's unix socket, where peer or trust "
+            "authentication identifies the server's OS user. urllib, which this server's "
+            "attach uses, cannot read the URI, so the attach would refuse it before "
+            "connecting"
+        )
+    elif local_socket:
+        host_identity = (
+            "a postgres host that is empty, blank or a socket path (in the host list, "
+            "or in a host or hostaddr parameter) is this host's unix socket, where peer "
+            "or trust authentication identifies the server's OS user whatever password "
+            "the URI carries"
+        )
+    if host_identity is not None:
+        if not _operator_allows_metadata_service(allow_metadata_service):
+            raise McpToolRefusal(
+                f"forge_from_source refused a JDBC source over MCP: {host_identity}. "
+                "Run it from the CLI (`fluid forge data-model from-source`), or restart "
+                "the server with --allow-metadata-service (or "
+                "FLUID_ALLOW_METADATA_SERVICE=1 in the server's environment)."
+            )
+        if not has_password:
+            return
+    if has_password:
+        if not allow_inline_credentials:
+            raise McpToolRefusal(
+                "forge_from_source refused an inline JDBC credential over MCP: the URI "
+                "carries a password, a secret that would travel over the LLM-facing "
+                "wire. Run it from the CLI (`fluid forge data-model from-source`), or "
+                "restart the server with --allow-inline-credentials if the caller is a "
+                "trusted in-process CLI harness."
+            )
+        return
+
+    # No password: the connection would authenticate with this host's own
+    # credential material and reach the host the client named.
+    if not _operator_allows_metadata_service(allow_metadata_service):
+        raise McpToolRefusal(
+            "forge_from_source refused a JDBC source with no password over MCP: with no "
+            "password in the URI, the connection falls back to this host's own database "
+            "credentials (PGPASSWORD, ~/.pgpass, a libpq service or MYSQL_PWD) and would "
+            "send them to the host the client named. Put the caller's own password in "
+            "the URI (with --allow-inline-credentials), run it from the CLI (`fluid "
+            "forge data-model from-source`), or restart the server with "
+            "--allow-metadata-service (or FLUID_ALLOW_METADATA_SERVICE=1 in the server's "
+            "environment)."
+        )
+
+
+def _gate_inline_host_identity(resolver: Any) -> None:
+    """Refuse inline credentials that authenticate as this host, on ``resolver``.
+
+    ``--allow-inline-credentials`` lets a caller send a credential block, but a
+    block can reach what this host holds as surely as ``allow_metadata_service``
+    does: through its ``auth_method`` (or its default: Glue ``iam_role``,
+    BigQuery / Dataplex ``adc``), through blank keys (an SDK reads an empty key
+    as "none supplied" and falls back to its default chain), through a path
+    (the SDK reads that file, gcloud ADC or a mounted key, from this host's
+    disk), or through this host's configuration (a netrc login for the endpoint
+    it names, DataHub settings). That stays the operator's decision, so the
+    check runs on the typed credential the resolver produced, where the model's
+    defaults have been applied and blank values read as absent, before any
+    adapter or SDK sees it. The classification is
+    :func:`~fluid_build.copilot.catalog.credentials.host_identity_reason`,
+    which fails closed: only a block whose own material is a value its SDK uses
+    as given passes. The client's own ``allow_metadata_service`` argument never
+    stands in for the operator, and a saved source (``credential_id``) is the
+    operator's configuration, so it is not checked.
+
+    A block that passes is handed to the adapter pinned to its own material
+    (:func:`~fluid_build.copilot.catalog.credentials.pin_to_own_material`): an
+    SDK that would let this host's environment or config files choose the
+    credential (``DATABRICKS_AUTH_TYPE`` over a Unity token) or probe this
+    host's cloud identity (the Snowflake login's AWS STS call) is told not to.
+
+    Wraps the instance's ``resolve`` rather than subclassing, so the adapter's
+    ``from_resolver`` contract is unchanged and this module still imports the
+    catalog package lazily.
+    """
+    from fluid_build.copilot.catalog.credentials import (
+        host_identity_reason,
+        inline_credential_forms,
+        pin_to_own_material,
+    )
+
+    resolve = resolver.resolve
+
+    def _resolve(**kwargs: Any) -> Any:
+        credentials = resolve(**kwargs)
+        if not kwargs.get("inline_credentials"):
+            return credentials
+        reason = host_identity_reason(credentials)
+        if reason is not None:
+            catalog = kwargs.get("catalog_name") or "catalog"
+            instead = inline_credential_forms(credentials)
+            raise McpToolRefusal(
+                f"Source-catalog tools refused inline {catalog} credentials: the block "
+                f"{reason}, so it would authenticate as this host rather than as the "
+                "caller. With --allow-inline-credentials alone, a block must carry the "
+                "caller's own credential as values, never a path to a file on this "
+                "server, and nothing this host holds may stand in for it."
+                + (f" {instead}" if instead else "")
+                + " Otherwise pass credentials.credential_id (a source the operator "
+                "saved with fluid ai setup), or restart the server with "
+                "--allow-metadata-service (or FLUID_ALLOW_METADATA_SERVICE=1 in the "
+                "server's environment)."
+            )
+        return pin_to_own_material(credentials)
+
+    resolver.resolve = _resolve
+
+
 def _build_source_adapter_impl(
     arguments: Dict[str, Any],
     *,
     allow_inline_credentials: bool = False,
+    allow_metadata_service: bool = False,
 ) -> Any:
     """Resolve the right adapter from MCP tool arguments.
 
@@ -634,6 +1081,13 @@ def _build_source_adapter_impl(
     ``fluid mcp serve --allow-inline-credentials``. The default
     rejects ``inline`` so a malicious LLM client cannot push raw
     secrets through the tool surface.
+
+    Likewise ``allow_metadata_service: true`` (the cloud metadata-service
+    / ADC fallback) is refused unless the server was started with
+    ``--allow-metadata-service`` or ``FLUID_ALLOW_METADATA_SERVICE=1`` —
+    see :func:`_metadata_service_opt_in`. The same opt-in governs inline
+    credentials whose ``auth_method`` selects the host's identity — see
+    :func:`_gate_inline_host_identity`.
 
     The resolver merges keyring + ``~/.fluid/sources.yaml`` into a
     typed Credentials object the adapter consumes. Each adapter's
@@ -661,6 +1115,9 @@ def _build_source_adapter_impl(
             "server with --allow-inline-credentials if the caller is "
             "a trusted in-process CLI harness."
         )
+    use_metadata_service = _metadata_service_opt_in(
+        arguments, allow_metadata_service=allow_metadata_service
+    )
     if not credential_id and not inline:
         raise RuntimeError(
             "Source-catalog tools require credentials.credential_id "
@@ -670,9 +1127,9 @@ def _build_source_adapter_impl(
     if source not in _SOURCE_ADAPTERS:
         supported = ", ".join(sorted(_SOURCE_ADAPTERS))
         raise RuntimeError(f"Unknown source-catalog adapter: {source!r}. Supported: {supported}.")
-    resolver = CredentialResolver(
-        allow_metadata_service=bool(arguments.get("allow_metadata_service", False))
-    )
+    resolver = CredentialResolver(allow_metadata_service=use_metadata_service)
+    if inline and not _operator_allows_metadata_service(allow_metadata_service):
+        _gate_inline_host_identity(resolver)
     adapter_cls = _import_adapter_class(_SOURCE_ADAPTERS[source])
     return adapter_cls.from_resolver(
         resolver, credential_id=credential_id, inline_credentials=inline

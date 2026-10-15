@@ -32,11 +32,15 @@ escaping, and ``DiscoveredStream`` building happens here in one place.
 
 from __future__ import annotations
 
+import contextlib
+import inspect
+import threading
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from fluid_build.providers._sql_safety import build_libpq_dsn, quote_ansi_string_literal
+from fluid_build.providers._sql_safety import quote_ansi_string_literal
 
 from .registry import DiscoveredColumn, DiscoveredStream, Discoverer
 
@@ -70,6 +74,99 @@ def _mysql_table_filter(conn: dict, quote: Callable[[str], str]) -> str:
     return f"table_schema = {quote(db)}"
 
 
+# Whether the URI being discovered is one the operator typed on the command
+# line. It travels out of band, not as an argument, so a JdbcDiscoverer subclass
+# written against main's one-argument discover(uri) / _introspect(conn) keeps
+# working under ``fluid init --discover``. Only discover_operator_uri and an
+# explicit ``discover(..., operator_supplied=True)`` set it, for the length of
+# that call; the default is the pin. The value lives in the calling thread's
+# (or asyncio task's) context (PEP 567) and is reset when the call returns, so
+# no other command sees it, and the MCP server, which calls neither, cannot
+# set it.
+_OPERATOR_SUPPLIED_URI: ContextVar[bool] = ContextVar(
+    "fluid_jdbc_operator_supplied_uri", default=False
+)
+
+# A thread the discoverer starts does not run in that context: a
+# ThreadPoolExecutor worker or a threading.Thread starts from an empty one
+# (PEP 567; contextvars docs). So discover_operator_uri also counts the
+# discoverer instance it runs as the operator's for the length of the call,
+# keyed by id() (the call holds a reference, so the id cannot be reused while
+# it is counted), and _introspect honours either. Only discover_operator_uri
+# changes the count, and only ``fluid init --discover`` calls it: the MCP server
+# never runs that command, so no MCP route can set it. The count belongs to
+# the instance, not to a thread: while the operator's command runs, any thread
+# that calls that same instance is unpinned. The command runs nothing else, but
+# a program that embeds discoverers must not call discover_operator_uri on an
+# instance that another thread is using for a URI the operator did not supply.
+_OPERATOR_INSTANCES: Dict[int, int] = {}
+_OPERATOR_INSTANCES_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _operator_supplied_uri() -> Iterator[None]:
+    token = _OPERATOR_SUPPLIED_URI.set(True)
+    try:
+        yield
+    finally:
+        _OPERATOR_SUPPLIED_URI.reset(token)
+
+
+@contextlib.contextmanager
+def _operator_instance(discoverer: object) -> Iterator[None]:
+    """Count ``discoverer`` as running the operator's URI until the block ends.
+
+    A count, so a nested or overlapping operator call on the same instance
+    does not end the outer one's.
+    """
+    key = id(discoverer)
+    with _OPERATOR_INSTANCES_LOCK:
+        _OPERATOR_INSTANCES[key] = _OPERATOR_INSTANCES.get(key, 0) + 1
+    try:
+        yield
+    finally:
+        with _OPERATOR_INSTANCES_LOCK:
+            remaining = _OPERATOR_INSTANCES.pop(key) - 1
+            if remaining:
+                _OPERATOR_INSTANCES[key] = remaining
+
+
+def _runs_operator_uri(discoverer: object) -> bool:
+    """Whether ``discoverer`` is running a URI the operator typed, in any thread."""
+    return _OPERATOR_SUPPLIED_URI.get() or id(discoverer) in _OPERATOR_INSTANCES
+
+
+def _takes_operator_supplied(method: Any) -> bool:
+    """Whether ``method`` declares an ``operator_supplied`` keyword."""
+    try:
+        param = inspect.signature(method).parameters.get("operator_supplied")
+    except (TypeError, ValueError):  # a builtin or C callable without a signature
+        return False
+    return param is not None and param.kind in (
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+
+
+def discover_operator_uri(discoverer: Discoverer, uri: str) -> List[DiscoveredStream]:
+    """``discoverer.discover(uri)`` for a URI the operator typed on the command line.
+
+    For ``fluid init --discover`` only: inside it a JdbcDiscoverer may use this
+    host's client certificate and libpq settings, as the operator's own
+    connection always has, also in a thread it starts to call its own
+    ``_introspect``. Every discoverer is still called as ``discover(uri)``, the
+    interface the registry documents; a JdbcDiscoverer whose ``discover``
+    declares the ``operator_supplied`` keyword is passed it as well. A
+    discoverer that hands the URI to a different discoverer instance in a
+    thread it starts should make that call with
+    ``contextvars.copy_context().run``; otherwise that thread is pinned.
+    """
+    with _operator_supplied_uri(), _operator_instance(discoverer):
+        if isinstance(discoverer, JdbcDiscoverer) and _takes_operator_supplied(discoverer.discover):
+            return discoverer.discover(uri, operator_supplied=True)
+        return discoverer.discover(uri)
+
+
 @dataclass
 class JdbcDiscoverer(Discoverer):
     """Generic JDBC-style discoverer.
@@ -98,10 +195,22 @@ class JdbcDiscoverer(Discoverer):
         # (e.g. the registry's __init__ shape) get a stable value.
         return self.config.schemes[0]
 
-    def discover(self, uri: str) -> List[DiscoveredStream]:
+    def discover(self, uri: str, *, operator_supplied: bool = False) -> List[DiscoveredStream]:
+        """Introspect ``uri``.
+
+        ``operator_supplied=True`` only for a URI the operator typed on the
+        command line; see :func:`~._jdbc_introspect.build_attach_dsn` for what
+        the default pins. ``fluid init --discover`` says so through
+        :func:`discover_operator_uri` instead, so a subclass that overrides
+        ``discover(uri)`` or ``_introspect(conn)`` with main's one-argument
+        signatures keeps working and still runs as the operator there.
+        """
         if self.config is None:
             raise RuntimeError(f"{type(self).__name__} requires a JdbcSourceConfig")
         conn = self._parse_uri(uri)
+        if operator_supplied:
+            with _operator_supplied_uri():
+                return self._introspect(conn)
         return self._introspect(conn)
 
     def _parse_uri(self, uri: str) -> dict:
@@ -121,11 +230,35 @@ class JdbcDiscoverer(Discoverer):
     def _introspect(self, conn: dict) -> List[DiscoveredStream]:
         from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 
-        dsn = build_libpq_dsn(conn, database_key=self.config.database_dsn_key)
+        from ._jdbc_introspect import _host_credential_env_suppressed, build_attach_dsn
+
+        operator_supplied = _runs_operator_uri(self)
+        dsn = build_attach_dsn(
+            conn,
+            database_key=self.config.database_dsn_key,
+            postgres=self.config.attach_type == "postgres",
+            operator_supplied=operator_supplied,
+        )
         alias = self.config.attach_alias
         attach_sql = (
             f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE {self.config.attach_type})"
         )
+        # The whole pin, as introspect_jdbc applies it: a password the caller
+        # supplied is its own material, so this host's ambient DB credential
+        # environment is hidden while the scanner connects. For mysql that
+        # window is the whole pin; the DSN carries the libpq half.
+        pinned = (
+            self.config.attach_type in ("postgres", "mysql")
+            and bool(conn.get("password"))
+            and not operator_supplied
+        )
+
+        def _attach(c: Any) -> None:
+            if pinned:
+                with _host_credential_env_suppressed():
+                    c.execute(attach_sql)
+            else:
+                c.execute(attach_sql)
 
         # The source is attached before the sandbox locks; the catalog queries
         # after it reach that database and no file or URL.
@@ -133,7 +266,7 @@ class JdbcDiscoverer(Discoverer):
             ":memory:",
             allow=DuckDBAllowlist.none(),
             extensions=[self.config.extension],
-            before_lock=lambda c: c.execute(attach_sql),
+            before_lock=_attach,
         )
         streams: List[DiscoveredStream] = []
         try:

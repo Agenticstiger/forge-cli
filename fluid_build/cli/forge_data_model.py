@@ -636,7 +636,9 @@ def run_from_source_command(args: Any, logger: logging.Logger) -> int:
     from fluid_build.copilot.catalog.source_registry import is_jdbc_source
 
     if is_jdbc_source(args.source):
-        return _run_from_jdbc_source(args, logger)
+        # The operator typed --uri on the command line, so the connection may
+        # use this host's client certificate and libpq settings.
+        return _run_from_jdbc_source(args, logger, operator_supplied=True)
 
     # Lazy imports keep ``fluid forge --help`` cold-start fast: the
     # catalog SDKs only load when this command actually runs.

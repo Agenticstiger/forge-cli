@@ -74,10 +74,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-from pathlib import Path
-from typing import Any, Dict, Literal, Mapping, Optional, Type, TypeVar
+from pathlib import Path, PurePath
+from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Type, TypeVar, get_args
 
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, BeforeValidator, ConfigDict, PrivateAttr, SecretStr
 
 from fluid_build.copilot.catalog.base import (
     CatalogConfigError,
@@ -121,6 +121,58 @@ class CredentialNotFoundError(CatalogConfigError):
 
 
 # ---------------------------------------------------------------------
+# Blank credential values.
+# ---------------------------------------------------------------------
+
+
+def _blank_is_absent(value: Any) -> Any:
+    """Read a blank or whitespace-only credential value as not supplied.
+
+    SDKs read an empty key as "no key" and fall back to their default
+    credential chain: boto3 ends at the container or instance role,
+    google-auth at gcloud ADC or the metadata server, the Databricks SDK at
+    this host's own configuration. So a blank value is absence, and the model
+    records it as ``None``. A value the auth method needs is then refused by
+    the auth method's own check in ``to_connection_kwargs`` (Data Mesh
+    Manager's ``api_key``, a required field, fails validation instead),
+    so the SDK never quietly substitutes the host's identity for it. An
+    optional value is just left out of the SDK's arguments: a blank Glue
+    ``session_token`` means no session token, a blank Snowflake
+    ``private_key_passphrase`` no passphrase. A non-blank value is kept
+    verbatim.
+    """
+    if isinstance(value, SecretStr):
+        return value if value.get_secret_value().strip() else None
+    if isinstance(value, (str, PurePath)) and not str(value).strip():
+        return None
+    return value
+
+
+_Material = Annotated[Optional[str], BeforeValidator(_blank_is_absent)]
+"""A credential field that is material, or names where it lives (a profile)."""
+
+_SecretMaterial = Annotated[Optional[SecretStr], BeforeValidator(_blank_is_absent)]
+"""A secret credential field; blank reads as not supplied."""
+
+_PathMaterial = Annotated[Optional[Path], BeforeValidator(_blank_is_absent)]
+"""A path to a credential file; blank reads as not supplied (not as ``.``)."""
+
+
+def _has_material(value: Any) -> bool:
+    """Whether ``value`` is credential material: present and not blank.
+
+    Checks the value itself rather than trusting the validators above, so a
+    model built with ``model_construct`` is judged the same way.
+    """
+    if value is None:
+        return False
+    text = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
+    if isinstance(value, PurePath) and text == ".":
+        return False  # ``Path("")`` reads back as ``.``
+    return bool(text.strip())
+
+
+# ---------------------------------------------------------------------
 # Per-source typed credential models.
 #
 # Sprint A ships Snowflake + Unity. Sprint B adds BigQuery / Dataplex /
@@ -129,7 +181,61 @@ class CredentialNotFoundError(CatalogConfigError):
 # ---------------------------------------------------------------------
 
 
-class SnowflakeCredentials(BaseModel):
+class SourceCredentials(BaseModel):
+    """Base of the per-source credential models.
+
+    Carries one setting that is not a field: whether the block may use only its
+    own material (see :func:`pin_to_own_material`). Not being a field, no key in
+    a credential block, inline or saved, can set or clear it.
+    """
+
+    _own_material_only: bool = PrivateAttr(default=False)
+
+
+SourceCredentialsT = TypeVar("SourceCredentialsT", bound=SourceCredentials)
+
+
+def pin_to_own_material(credentials: SourceCredentialsT) -> SourceCredentialsT:
+    """A copy of ``credentials`` whose SDK authenticates with the block's material alone.
+
+    For a block an MCP caller sent inline, which :func:`host_identity_reason`
+    has passed as the caller's own. Some catalog SDKs read settings from this
+    host's environment and config files that choose or add a credential, so a
+    block of the caller's own can still end up authenticating as this host.
+    The copy's ``to_connection_kwargs`` adds the SDK arguments that keep those
+    settings out:
+
+    * Unity ``pat``: ``auth_type="pat"``. The Databricks SDK fills every
+      setting the constructor leaves unset from this host's ``DATABRICKS_*``
+      environment and from the ``~/.databrickscfg`` profile
+      ``DATABRICKS_CONFIG_PROFILE`` names (``DATABRICKS_CONFIG_FILE`` moves the
+      file), and an ``auth_type`` found there beats the token: ``oauth-m2m``
+      posts this host's client secret to the token endpoint of the workspace
+      the block names, ``basic`` sends this host's password to it. An explicit
+      ``auth_type`` is never overwritten, and with it the SDK uses the token
+      only. (Unity ``oauth_m2m`` already names its ``auth_type``.)
+    * Snowflake: ``platform_detection_timeout_seconds=0.0``. Building its login
+      request the connector probes this host's cloud identity (an STS
+      ``GetCallerIdentity`` signed with this host's AWS credentials, the Azure
+      managed-identity and GCP metadata endpoints) and reports what it found
+      to the account the block names. A timeout of 0 turns the probes off.
+
+    The other SDKs need nothing: boto3 takes explicit keys as the whole
+    credential (no env, profile, container or instance lookup); the DataHub SDK
+    sends an explicit token as given (its ``DATAHUB_*`` logins apply only to a
+    block with no token or a ``__from_env__`` server, both refused); the Data
+    Mesh Manager adapter's ``httpx`` client sends the header it is given. The
+    channels these SDKs leave open (netrc, a DataHub client certificate) cannot
+    be switched off through their APIs, so :func:`host_identity_reason` refuses
+    the block instead. Nothing here changes a saved source or a block the
+    operator allowed with ``--allow-metadata-service``.
+    """
+    pinned = credentials.model_copy()
+    pinned._own_material_only = True
+    return pinned
+
+
+class SnowflakeCredentials(SourceCredentials):
     """Snowflake Horizon source credentials.
 
     The recommended ``auth_method`` is ``private_key`` (rotation-
@@ -144,10 +250,10 @@ class SnowflakeCredentials(BaseModel):
     account: str
     user: str
     auth_method: Literal["password", "private_key", "oauth", "sso"] = "private_key"
-    password: Optional[SecretStr] = None
-    private_key_path: Optional[Path] = None
-    private_key_passphrase: Optional[SecretStr] = None
-    oauth_token: Optional[SecretStr] = None
+    password: _SecretMaterial = None
+    private_key_path: _PathMaterial = None
+    private_key_passphrase: _SecretMaterial = None
+    oauth_token: _SecretMaterial = None
     role: Optional[str] = None
     warehouse: Optional[str] = None
 
@@ -163,6 +269,9 @@ class SnowflakeCredentials(BaseModel):
             kw["role"] = self.role
         if self.warehouse:
             kw["warehouse"] = self.warehouse
+        if self._own_material_only:
+            # No probe of this host's cloud identity (see pin_to_own_material).
+            kw["platform_detection_timeout_seconds"] = 0.0
         if self.auth_method == "password":
             if self.password is None:
                 raise CredentialNotFoundError(
@@ -200,7 +309,7 @@ class SnowflakeCredentials(BaseModel):
         return kw
 
 
-class BigQueryCredentials(BaseModel):
+class BigQueryCredentials(SourceCredentials):
     """Google BigQuery source credentials.
 
     Recommended ``auth_method`` is ``adc`` (Application Default
@@ -219,7 +328,7 @@ class BigQueryCredentials(BaseModel):
 
     project: str
     auth_method: Literal["adc", "service_account_json", "oidc"] = "adc"
-    service_account_path: Optional[Path] = None
+    service_account_path: _PathMaterial = None
     location: Optional[str] = None  # e.g., "EU", "US", "us-central1"
     quota_project: Optional[str] = None  # billing-project override
 
@@ -255,7 +364,7 @@ class BigQueryCredentials(BaseModel):
         return kw
 
 
-class DataplexCredentials(BaseModel):
+class DataplexCredentials(SourceCredentials):
     """Google Cloud Dataplex source credentials.
 
     Dataplex shares Google's auth chain with BigQuery — same
@@ -270,7 +379,7 @@ class DataplexCredentials(BaseModel):
     project: str
     location: str  # required for Dataplex; "global" is the cross-region option
     auth_method: Literal["adc", "service_account_json", "oidc"] = "adc"
-    service_account_path: Optional[Path] = None
+    service_account_path: _PathMaterial = None
 
     def to_connection_kwargs(self) -> Dict[str, Any]:
         kw: Dict[str, Any] = {"project": self.project, "location": self.location}
@@ -287,7 +396,7 @@ class DataplexCredentials(BaseModel):
         return kw
 
 
-class GlueCredentials(BaseModel):
+class GlueCredentials(SourceCredentials):
     """AWS Glue Data Catalog source credentials.
 
     Recommended ``auth_method`` is ``iam_role`` (assume-role via STS,
@@ -304,11 +413,11 @@ class GlueCredentials(BaseModel):
 
     region: str
     auth_method: Literal["iam_role", "iam_key", "instance_profile", "sso"] = "iam_role"
-    profile_name: Optional[str] = None
+    profile_name: _Material = None
     role_arn: Optional[str] = None
-    access_key_id: Optional[str] = None
-    secret_access_key: Optional[SecretStr] = None
-    session_token: Optional[SecretStr] = None  # for STS-issued temp creds
+    access_key_id: _Material = None
+    secret_access_key: _SecretMaterial = None
+    session_token: _SecretMaterial = None  # for STS-issued temp creds
 
     def to_connection_kwargs(self) -> Dict[str, Any]:
         """Translate to ``boto3.session.Session(**)`` kwargs.
@@ -346,7 +455,7 @@ class GlueCredentials(BaseModel):
         return kw
 
 
-class DataHubCredentials(BaseModel):
+class DataHubCredentials(SourceCredentials):
     """DataHub source credentials.
 
     Recommended ``auth_method`` is ``oauth`` (rotation-friendly).
@@ -362,9 +471,9 @@ class DataHubCredentials(BaseModel):
 
     server: str
     auth_method: Literal["pat", "oauth", "none"] = "pat"
-    token: Optional[SecretStr] = None
-    oauth_client_id: Optional[str] = None
-    oauth_client_secret: Optional[SecretStr] = None
+    token: _SecretMaterial = None
+    oauth_client_id: _Material = None
+    oauth_client_secret: _SecretMaterial = None
 
     def to_connection_kwargs(self) -> Dict[str, Any]:
         kw: Dict[str, Any] = {"server": self.server}
@@ -392,7 +501,7 @@ class DataHubCredentials(BaseModel):
         return kw
 
 
-class DataMeshManagerCredentials(BaseModel):
+class DataMeshManagerCredentials(SourceCredentials):
     """Data Mesh Manager source credentials.
 
     DMM uses a single API token (Bearer). The ``server`` field is
@@ -411,7 +520,8 @@ class DataMeshManagerCredentials(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     server: str
-    api_key: SecretStr
+    # Required, so a blank key fails validation rather than reading as absent.
+    api_key: Annotated[SecretStr, BeforeValidator(_blank_is_absent)]
 
     def to_connection_kwargs(self) -> Dict[str, Any]:
         return {
@@ -420,7 +530,7 @@ class DataMeshManagerCredentials(BaseModel):
         }
 
 
-class UnityCredentials(BaseModel):
+class UnityCredentials(SourceCredentials):
     """Databricks Unity Catalog source credentials.
 
     Recommended ``auth_method`` is ``oauth_m2m`` (service principal,
@@ -433,11 +543,11 @@ class UnityCredentials(BaseModel):
 
     host: str
     auth_method: Literal["pat", "oauth_m2m", "azure_ad", "google_id"] = "oauth_m2m"
-    token: Optional[SecretStr] = None
-    oauth_client_id: Optional[str] = None
-    oauth_client_secret: Optional[SecretStr] = None
-    azure_tenant_id: Optional[str] = None
-    google_service_account_path: Optional[Path] = None
+    token: _SecretMaterial = None
+    oauth_client_id: _Material = None
+    oauth_client_secret: _SecretMaterial = None
+    azure_tenant_id: _Material = None
+    google_service_account_path: _PathMaterial = None
 
     def to_connection_kwargs(self) -> Dict[str, Any]:
         """Translate to the dict the ``WorkspaceClient(**)`` constructor
@@ -453,6 +563,10 @@ class UnityCredentials(BaseModel):
                     ],
                 )
             kw["token"] = self.token.get_secret_value()
+            if self._own_material_only:
+                # The token is the only credential: this host's DATABRICKS_AUTH_TYPE
+                # or profile ``auth_type`` cannot replace it (see pin_to_own_material).
+                kw["auth_type"] = "pat"
         elif self.auth_method == "oauth_m2m":
             if self.oauth_client_id is None or self.oauth_client_secret is None:
                 raise CredentialNotFoundError(
@@ -483,6 +597,281 @@ class UnityCredentials(BaseModel):
                 )
             kw["google_service_account"] = str(self.google_service_account_path.expanduser())
         return kw
+
+
+# ---------------------------------------------------------------------
+# Whose identity an inline credential block authenticates as.
+# ---------------------------------------------------------------------
+
+_NO_OWN_MATERIAL = (
+    "carries no credential material of its own (a blank or whitespace-only key, "
+    "secret, token or path is not material)"
+)
+_UNCLASSIFIED_AUTH_METHOD = "uses an auth_method this server does not classify"
+
+# The DataHub SDK reads this from the server's environment when it builds a
+# session, whatever endpoint the block names.
+_DATAHUB_HOST_CLIENT_CERT_ENV = "DATAHUB_CLIENT_CERT_PATH"
+
+# Credential types whose endpoint the block names and whose SDK reaches it with
+# ``requests``: DataHub (acryl-datahub) and Unity (databricks-sdk). Data Mesh
+# Manager's adapter uses ``httpx``, which applies netrc only through an explicit
+# ``httpx.NetRCAuth``; boto3, google-auth and the Snowflake connector reach
+# their vendor's endpoints, not one the block names.
+_NAMED_HTTP_ENDPOINT = (DataHubCredentials, UnityCredentials)
+
+# What a caller can send inline that is its own credential, per type.
+_INLINE_FORMS: Dict[Type[BaseModel], str] = {
+    GlueCredentials: (
+        "auth_method 'iam_key' with access_key_id and secret_access_key, and no profile_name"
+    ),
+    UnityCredentials: (
+        "auth_method 'pat' with token, or 'oauth_m2m' with oauth_client_id and "
+        "oauth_client_secret"
+    ),
+    SnowflakeCredentials: "auth_method 'password' with password, or 'oauth' with oauth_token",
+    DataHubCredentials: "auth_method 'pat' with token, and an http(s) server URL",
+    DataMeshManagerCredentials: "api_key",
+}
+
+
+def _is_path_type(annotation: Any) -> bool:
+    if isinstance(annotation, type) and issubclass(annotation, PurePath):
+        return True
+    return any(_is_path_type(arg) for arg in get_args(annotation))
+
+
+def _host_file_field(credentials: BaseModel) -> Optional[str]:
+    """The first field of ``credentials`` that names a file, if any does.
+
+    Decided by the field's type, or by a path value, so a field added later
+    and a model built with ``model_construct`` are judged the same way.
+    """
+    for name, field in type(credentials).model_fields.items():
+        value = getattr(credentials, name, None)
+        names_a_file = isinstance(value, PurePath) or _is_path_type(field.annotation)
+        if names_a_file and _has_material(value):
+            return name
+    return None
+
+
+def _host_netrc_files() -> List[Path]:
+    """The netrc files ``requests`` may read on this host.
+
+    ``requests.utils.get_netrc_auth`` reads ``$NETRC`` when it is set and
+    otherwise ``~/.netrc`` or ``~/_netrc``. Every candidate counts here, set or
+    not, so a change in that precedence cannot slip one past this check.
+    """
+    candidates = [os.environ.get("NETRC"), "~/.netrc", "~/_netrc"]
+    return [
+        Path(os.path.expanduser(candidate))
+        for candidate in candidates
+        if candidate and os.path.exists(os.path.expanduser(candidate))
+    ]
+
+
+def _is_http_url(value: str) -> bool:
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(value.strip())
+    return parts.scheme.lower() in {"http", "https"} and bool(parts.hostname)
+
+
+def host_identity_reason(credentials: BaseModel) -> Optional[str]:
+    """Why an inline ``credentials`` block would authenticate as this host, or ``None``.
+
+    ``None`` only when the block carries non-blank credential material of its
+    own, as a value its SDK uses as given, and nothing this host holds takes
+    its place. Otherwise the reason completes the sentence "the block ...".
+    The MCP server refuses such a block unless the operator allows the
+    metadata service. Meant for blocks a caller sent: a saved source is the
+    operator's own configuration and is not classified.
+
+    What makes a block the host's:
+
+    * A path, in any field and spelled any way (absolute, relative, ``~``,
+      ``$VAR``, a symlink). The SDK reads the file from this host's disk, so
+      the identity in it (gcloud ADC, a mounted service-account key, a
+      Snowflake private key) is the host's.
+    * An ``auth_method`` that takes the SDK's default chain or a login on this
+      host: Glue ``iam_role``, ``instance_profile``, ``sso`` or a named
+      ``profile_name`` (read from ``~/.aws``, and a profile wins over keys;
+      ``role_arn`` is no material, the adapter never assumes it);
+      BigQuery / Dataplex ``adc`` and ``oidc``; Unity ``azure_ad`` (this host's
+      ``az login``) and ``google_id`` (this host's Google ADC); Snowflake
+      ``sso`` (this host's browser session); DataHub ``none``, and ``oauth``,
+      whose client credentials the adapter does not send, so the SDK uses
+      this host's ``DATAHUB_SYSTEM_CLIENT_ID`` / ``_SECRET``.
+    * Missing or blank material for the auth method.
+    * This host's configuration standing in for the block: a DataHub
+      ``server`` that is not an http(s) URL (``__from_env__`` makes the SDK
+      read this host's ``DATAHUB_GMS_*`` settings), a DataHub client
+      certificate in ``DATAHUB_CLIENT_CERT_PATH``, or a netrc file.
+      ``requests`` attaches a netrc login to the DataHub endpoint the block
+      names and to any host that endpoint redirects to. A Unity request gets
+      one when it has no auth of its own (requests ``Session.prepare_request``
+      reads netrc only then) and on every redirect, for the host it is
+      redirected to (``Session.rebuild_auth``). The Databricks SDK sets
+      ``session.auth`` on its API client (``ApiClient`` / ``_BaseClient``) and
+      sends an ``oauth_m2m`` token request with ``HTTPBasicAuth``, but an
+      ``oauth_m2m`` endpoint lookup goes out with no auth of its own, so with
+      the named host's login, in databricks-sdk 0.20 to 0.35 for a workspace
+      host (a plain ``requests.get`` in ``Config.oidc_endpoints``) and in 0.36 to
+      0.86 on a host the SDK treats as Azure while it has an Azure client id
+      (``ARM_CLIENT_ID``, or a ``~/.databrickscfg`` profile's
+      ``azure_client_id``: ``get_azure_entra_id_workspace_endpoints``). From
+      0.87 (checked through 0.153) that lookup goes through ``_BaseClient``
+      too. The ``databricks`` extra accepts ``databricks-sdk>=0.20``.
+
+    So BigQuery and Dataplex, whose models take a key only as a file path,
+    have no inline form of their own. Fails closed: a credential type or
+    ``auth_method`` not handled here is the host's until it is classified.
+
+    A setting an SDK reads from this host to choose the credential, where the
+    SDK lets a constructor argument override it, is not a reason here: the MCP
+    gate hands a passed block on through :func:`pin_to_own_material`, which
+    passes that argument (a Unity token's ``auth_type``).
+    """
+    field = _host_file_field(credentials)
+    if field is not None:
+        return (
+            f"names a file on this host ({field}), which the SDK would read from "
+            "this host's disk"
+        )
+    reason = _auth_method_reason(credentials)
+    if reason is not None:
+        return reason
+    if (
+        isinstance(credentials, DataHubCredentials)
+        and os.environ.get(_DATAHUB_HOST_CLIENT_CERT_ENV, "").strip()
+    ):
+        return (
+            "would be sent with this host's DataHub client certificate "
+            f"({_DATAHUB_HOST_CLIENT_CERT_ENV})"
+        )
+    if isinstance(credentials, _NAMED_HTTP_ENDPOINT) and _host_netrc_files():
+        return (
+            "names an endpoint that the SDK's HTTP client would send this host's "
+            "netrc logins to (~/.netrc, ~/_netrc or $NETRC), along with any host "
+            "that endpoint redirects to"
+        )
+    return None
+
+
+def _auth_method_reason(credentials: BaseModel) -> Optional[str]:
+    """The part of :func:`host_identity_reason` that reads the block alone."""
+    if isinstance(credentials, GlueCredentials):
+        if credentials.profile_name is not None:
+            return (
+                "names an AWS profile (profile_name), which boto3 reads from this "
+                "host's ~/.aws files"
+            )
+        if credentials.auth_method in ("iam_role", "instance_profile", "sso"):
+            return (
+                f"uses auth_method {credentials.auth_method!r}, which takes boto3's "
+                "default chain (this host's instance or container role)"
+            )
+        if credentials.auth_method != "iam_key":
+            return _UNCLASSIFIED_AUTH_METHOD
+        if _has_material(credentials.access_key_id) and _has_material(
+            credentials.secret_access_key
+        ):
+            return None
+        return _NO_OWN_MATERIAL
+    if isinstance(credentials, (BigQueryCredentials, DataplexCredentials)):
+        if credentials.auth_method == "service_account_json":
+            # Its only material is a path, which names a file on this host.
+            return _NO_OWN_MATERIAL
+        if credentials.auth_method in ("adc", "oidc"):
+            return (
+                f"uses auth_method {credentials.auth_method!r}, which takes "
+                "google-auth's default chain (gcloud ADC, workload identity, the "
+                "metadata server)"
+            )
+        return _UNCLASSIFIED_AUTH_METHOD
+    if isinstance(credentials, UnityCredentials):
+        if credentials.auth_method == "pat":
+            return None if _has_material(credentials.token) else _NO_OWN_MATERIAL
+        if credentials.auth_method == "oauth_m2m":
+            if _has_material(credentials.oauth_client_id) and _has_material(
+                credentials.oauth_client_secret
+            ):
+                return None
+            return _NO_OWN_MATERIAL
+        if credentials.auth_method == "azure_ad":
+            return "uses auth_method 'azure_ad', which signs in with this host's az login"
+        if credentials.auth_method == "google_id":
+            return "uses auth_method 'google_id', which impersonates through this host's ADC"
+        return _UNCLASSIFIED_AUTH_METHOD
+    if isinstance(credentials, SnowflakeCredentials):
+        material = {"password": credentials.password, "oauth": credentials.oauth_token}
+        if credentials.auth_method in material:
+            own = _has_material(material[credentials.auth_method])
+            return None if own else _NO_OWN_MATERIAL
+        if credentials.auth_method == "private_key":
+            # Its only material is a path, which names a file on this host.
+            return _NO_OWN_MATERIAL
+        if credentials.auth_method == "sso":
+            return (
+                "uses auth_method 'sso', the External Browser flow, which signs in "
+                "with this host's browser session"
+            )
+        return _UNCLASSIFIED_AUTH_METHOD
+    if isinstance(credentials, DataHubCredentials):
+        if not _is_http_url(credentials.server):
+            return (
+                "names a server that is not an http(s) URL; the DataHub SDK reads "
+                "'__from_env__' from this host's DATAHUB_GMS_* settings"
+            )
+        if credentials.auth_method == "pat":
+            return None if _has_material(credentials.token) else _NO_OWN_MATERIAL
+        if credentials.auth_method == "oauth":
+            if not (
+                _has_material(credentials.oauth_client_id)
+                and _has_material(credentials.oauth_client_secret)
+            ):
+                return _NO_OWN_MATERIAL
+            return (
+                "uses auth_method 'oauth', whose client id and secret this adapter "
+                "does not send; the DataHub SDK falls back to this host's "
+                "DATAHUB_SYSTEM_CLIENT_ID / DATAHUB_SYSTEM_CLIENT_SECRET"
+            )
+        if credentials.auth_method == "none":
+            return (
+                "uses auth_method 'none', which sends no credential of its own; the "
+                "DataHub SDK falls back to this host's system client credentials"
+            )
+        return _UNCLASSIFIED_AUTH_METHOD
+    if isinstance(credentials, DataMeshManagerCredentials):
+        return None if _has_material(credentials.api_key) else _NO_OWN_MATERIAL
+    return "is a credential type this server does not classify"
+
+
+def selects_host_identity(credentials: BaseModel) -> bool:
+    """Whether an inline ``credentials`` block would authenticate as this host.
+
+    See :func:`host_identity_reason`, which also says why.
+    """
+    return host_identity_reason(credentials) is not None
+
+
+def inline_credential_forms(credentials: BaseModel) -> Optional[str]:
+    """A sentence saying what inline block the caller could send instead.
+
+    ``None`` when the block is already a form of the caller's own and only this
+    host's configuration (a netrc file, a DataHub setting) stands in for it, so
+    no other block would do. BigQuery and Dataplex have no such form: their
+    models take a key only as a file path, which names a file on the server.
+    """
+    if _host_file_field(credentials) is None and _auth_method_reason(credentials) is None:
+        return None
+    for credential_type, forms in _INLINE_FORMS.items():
+        if isinstance(credentials, credential_type):
+            return f"Send {forms}."
+    return (
+        "This catalog has no such form: its credential model takes a key only as a "
+        "file path on the server."
+    )
 
 
 def _plaintext_source_secrets_allowed() -> bool:
@@ -905,7 +1294,10 @@ class CredentialResolver:
         """Construct credentials from catalog-specific env vars.
 
         Returns ``None`` when the minimum-required env vars for the
-        catalog aren't set. Each catalog has its own minimum set
+        catalog aren't set. A project or region alone is not a
+        credential: the ambient-identity modes it would select (Glue
+        ``instance_profile``, BigQuery / Dataplex ``adc``) are returned
+        only when ``allow_metadata_service`` is on. Each catalog has its own minimum set
         defined inline below. We deliberately don't return a
         partially-populated object — fail-fast on missing inputs is
         the world-class contract.
@@ -980,14 +1372,14 @@ class CredentialResolver:
             if sa_path:
                 fields["auth_method"] = "service_account_json"
                 fields["service_account_path"] = Path(sa_path)
-            else:
-                # ADC path — only valid when ``allow_metadata_service``
-                # is set. ``_from_env`` doesn't have access to that
-                # gate; we still construct the credential here, and
-                # the adapter's ``_client`` step is what triggers the
-                # ADC pickup. The gate guards the metadata-service
-                # PATH, not the ADC mode declaration.
+            elif self.allow_metadata_service:
+                # ADC carries no credential of its own: google-auth's
+                # default chain fills it in from the host (gcloud ADC
+                # file, GCE / GKE metadata server). That is the
+                # metadata-service fallback, so it needs the opt-in.
                 fields["auth_method"] = "adc"
+            else:
+                return None
             location = os.environ.get("GOOGLE_CLOUD_LOCATION")
             if location:
                 fields["location"] = location
@@ -1005,8 +1397,11 @@ class CredentialResolver:
             if sa_path:
                 fields["auth_method"] = "service_account_json"
                 fields["service_account_path"] = Path(sa_path)
-            else:
+            elif self.allow_metadata_service:
+                # Same host-identity fallback as BigQuery above.
                 fields["auth_method"] = "adc"
+            else:
+                return None
             return credential_type.model_validate(fields)
 
         if catalog_name == "glue":
@@ -1027,12 +1422,14 @@ class CredentialResolver:
             elif profile:
                 fields["auth_method"] = "iam_role"
                 fields["profile_name"] = profile
-            else:
-                # Bare region with no credentials — fall through to
-                # instance-profile / metadata-service. The adapter
-                # picks that up automatically via boto3's default
-                # chain when ``allow_metadata_service`` is on.
+            elif self.allow_metadata_service:
+                # Bare region with no credentials: boto3's default chain
+                # supplies the host's identity (instance / container role,
+                # default profile). That is the metadata-service fallback,
+                # so it needs the opt-in.
                 fields["auth_method"] = "instance_profile"
+            else:
+                return None
             return credential_type.model_validate(fields)
 
         if catalog_name == "datahub":
@@ -1134,4 +1531,12 @@ __all__ = [
     "GlueCredentials",
     "DataHubCredentials",
     "DataMeshManagerCredentials",
+    "SourceCredentials",
+    # Whether an inline credential block authenticates as this host (the MCP
+    # inline gate), why, and what the caller can send instead; and the copy of
+    # a passed block that keeps this host's SDK settings out of it.
+    "host_identity_reason",
+    "inline_credential_forms",
+    "pin_to_own_material",
+    "selects_host_identity",
 ]

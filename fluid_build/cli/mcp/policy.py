@@ -127,6 +127,14 @@ class McpPolicy:
     # because the inline shape lets a peer push raw secrets through
     # the otherwise-secret-free MCP wire.
     allow_inline_credentials: bool = False
+    # Default OFF — the cloud metadata-service / ADC credential fallback
+    # (instance role, workload identity, gcloud ADC) uses this host's
+    # ambient cloud identity, which usually carries broad scopes.  That
+    # is an operator decision: a client's ``allow_metadata_service``
+    # argument is honoured only when this is on (``--allow-metadata-service``)
+    # or ``FLUID_ALLOW_METADATA_SERVICE=1`` is set in the server's own
+    # environment.  Otherwise the request is refused, like inline creds.
+    allow_metadata_service: bool = False
 
     def is_tool_allowed(self, tool: str) -> bool:
         if tool in self.denied_tools:
@@ -266,6 +274,7 @@ def _build_policy_from_args(args) -> McpPolicy:
         writable_paths=writable_paths,
         writable_namespaces=writable_namespaces,
         allow_inline_credentials=bool(getattr(args, "allow_inline_credentials", False)),
+        allow_metadata_service=bool(getattr(args, "allow_metadata_service", False)),
     )
 
 

@@ -64,6 +64,8 @@ from fluid_build.providers._duckdb_sandbox import (
 )
 from fluid_build.providers._sql_safety import (
     build_libpq_dsn,
+    build_mysql_dsn,
+    mask_dsn_password,
     quote_ansi_string_literal,
     validate_ident,
 )
@@ -751,14 +753,31 @@ class DuckdbRunner:
         """
         kind = ctx.source.kind
         if kind in ("mysql", "mariadb"):
-            # Resolve secretRef → password before build_libpq_dsn reads
+            # Resolve secretRef → password before build_mysql_dsn reads
             # connection.get("password"). Inline literal values still win.
             conn = resolve_connection_secrets(dict(ctx.source.connection.raw))
-            dsn = build_libpq_dsn(conn, database_key="database")
+            # mysql_scanner's own DSN syntax, not libpq's: libpq quoting let a
+            # value with a space add socket= or ssl_key=, and a '?' turn the
+            # rest into URI options. build_mysql_dsn double-quotes each value
+            # and refuses a '?', a '/' in the host and a control character.
+            dsn = build_mysql_dsn(conn, database_key="database")
             alias = _mysql_alias_for_build(ctx.build_id)
-            # mysql extension supports both mysql:// and mariadb:// upstreams;
-            # the duckdb extension type literal is always ``mysql``.
-            con.execute(f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE mysql)")
+            password = conn.get("password")
+            masked: Optional[str] = None
+            try:
+                # mysql extension supports both mysql:// and mariadb:// upstreams;
+                # the duckdb extension type literal is always ``mysql``.
+                con.execute(f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE mysql)")
+            except Exception as exc:
+                if not password:
+                    raise
+                # mysql_scanner quotes the whole DSN in a connect error, and
+                # ``fluid apply`` prints the error: keep it, without the password.
+                masked = mask_dsn_password(str(exc), str(password))
+            if masked is not None:
+                # Raised after the handler has ended, so the unmasked error is
+                # neither the cause nor the context of this one (PEP 415).
+                raise RuntimeError(masked)
         elif kind == "sqlite":
             conn = dict(ctx.source.connection.raw)
             # SQLite uses a path, not a libpq-style DSN. The path comes

@@ -351,8 +351,13 @@ _SEMANTIC_MODE_DESCRIPTION = "Retrieval mode. 'hybrid' is best when the VectorBa
 _SEMANTIC_LIMIT_DESCRIPTION = "Maximum number of records to return."
 _ADAPTER_DISPATCH_DESCRIPTION = "Catalog adapter to dispatch against."
 _ALLOW_METADATA_SERVICE_DESCRIPTION = (
-    "Allow the credential resolver to fall back to cloud-metadata-service "
-    "auth (instance profile, workload identity). Off by default."
+    "Catalog sources only. Request the credential resolver's fallback to "
+    "cloud-metadata-service auth (instance profile, workload identity, gcloud "
+    "ADC). Off by default. Refused with an error unless the server was started "
+    "with --allow-metadata-service (or FLUID_ALLOW_METADATA_SERVICE=1). A JDBC "
+    "source (postgres/postgresql/mysql/sqlite) ignores it: there only the "
+    "server's own opt-in lets a URI use this host's database credentials, files "
+    "or identity."
 )
 _TECHNIQUE_DESCRIPTION = "Modeling technique: Data Vault 2.0 or Dimensional (Kimball)."
 _NAME_DESCRIPTION = "Logical-model name. Defaults to the schema name."
@@ -367,7 +372,7 @@ _LOGICAL_PATH_OUT_DESCRIPTION = (
 _FORGE_FROM_SOURCE_URI_DESCRIPTION = (
     "JDBC URI for postgres/postgresql/mysql/sqlite sources. "
     "Carries credentials inline (no credential_id needed). "
-    "Example: postgresql://user:pass@host:5432/db. "
+    "Example: postgresql://user:pass@host:5432/db. "  # pragma: allowlist secret
     "Ignored for catalog sources (snowflake/unity/bigquery/dataplex/glue/datahub/datamesh_manager)."
 )
 _FORGE_RUN_MODE_DESCRIPTION = "Forge run mode (see tool description)."
@@ -596,11 +601,7 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
                 "allow_metadata_service": {
                     "type": "boolean",
                     "default": False,
-                    "description": (
-                        "Allow the credential resolver to fall back to "
-                        "cloud-metadata-service auth (instance profile, "
-                        "workload identity). Off by default."
-                    ),
+                    "description": _ALLOW_METADATA_SERVICE_DESCRIPTION,
                 },
             },
             "required": ["source", "credentials"],
@@ -621,7 +622,11 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
                 "source": {"type": "string", "enum": _SOURCE_ENUM},
                 "credentials": _CREDENTIALS_PROP,
                 "fqn": _FQN_REQ,
-                "allow_metadata_service": {"type": "boolean", "default": False},
+                "allow_metadata_service": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": _ALLOW_METADATA_SERVICE_DESCRIPTION,
+                },
             },
             "required": ["source", "credentials", "fqn"],
             "additionalProperties": False,
@@ -641,7 +646,11 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
                 "source": {"type": "string", "enum": _SOURCE_ENUM},
                 "credentials": _CREDENTIALS_PROP,
                 "fqn": _FQN_REQ,
-                "allow_metadata_service": {"type": "boolean", "default": False},
+                "allow_metadata_service": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": _ALLOW_METADATA_SERVICE_DESCRIPTION,
+                },
             },
             "required": ["source", "credentials", "fqn"],
             "additionalProperties": False,
@@ -660,7 +669,11 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
                 "source": {"type": "string", "enum": _SOURCE_ENUM},
                 "credentials": _CREDENTIALS_PROP,
                 "scope": _SCOPE_PROP,
-                "allow_metadata_service": {"type": "boolean", "default": False},
+                "allow_metadata_service": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": _ALLOW_METADATA_SERVICE_DESCRIPTION,
+                },
             },
             "required": ["source", "credentials"],
             "additionalProperties": False,

@@ -39,7 +39,9 @@ from fluid_build.util.contract import slugify_identifier
 _FLUID_ID_RE = re.compile(r"^[a-z0-9_][a-z0-9_.-]*[a-z0-9_]$|^[a-z0-9_]$")
 
 
-def _run_from_jdbc_source(args: Any, logger: logging.Logger) -> int:
+def _run_from_jdbc_source(
+    args: Any, logger: logging.Logger, *, operator_supplied: bool = False
+) -> int:
     """Forge a logical model from a JDBC database via duckdb extensions.
 
     Branch entered from ``run_from_source_command`` when
@@ -49,12 +51,18 @@ def _run_from_jdbc_source(args: Any, logger: logging.Logger) -> int:
     a contract under ``args.output`` using the same ``--name`` and
     sidecar logic as the catalog path.
 
+    ``operator_supplied`` is passed by the command-line branch only: the
+    operator typed ``--uri``, so it may use this host's client certificate and
+    libpq settings. It is never read from ``args``, so the MCP
+    ``forge_from_source`` shim, which builds ``args`` from a client's request,
+    keeps the default pin (see ``introspect_jdbc``).
+
     Implementation note: we don't reuse the catalog adapter
     abstraction here because there's no credential resolver — the URI
     carries everything. A thin synthesise-then-write pass is enough
     to plug the JDBC source into the world-class plan v1.5.
     """
-    from fluid_build.cli.discover._jdbc_introspect import introspect_jdbc
+    from fluid_build.cli.discover._jdbc_introspect import _error_text, introspect_jdbc
 
     if not getattr(args, "uri", None):
         cprint(
@@ -70,18 +78,20 @@ def _run_from_jdbc_source(args: Any, logger: logging.Logger) -> int:
             uri=args.uri,
             schema_filter=getattr(args, "schema_name", None),
             table_filter=getattr(args, "tables", None),
+            operator_supplied=operator_supplied,
         )
     except (ImportError, ValueError) as exc:
-        cprint(f"[red]JDBC introspection failed:[/red] {exc}")
+        # Over MCP this console is the server's, and its log: whatever the
+        # message quotes, the URI's password is masked.
+        cprint(f"[red]JDBC introspection failed:[/red] {_error_text(exc, args.uri)}")
         return 2
     except Exception as exc:  # noqa: BLE001 — surface clean
         # Connect / SQL errors carry detail the operator needs to see
         # verbatim ("could not connect to server", "FATAL: password
-        # authentication failed", etc.). Console output is OK for the
-        # interactive run; structured logs (which may flow to log
-        # aggregators) get only the exception class — JDBC error
-        # messages can echo the JDBC URL including embedded password.
-        cprint(f"[red]JDBC introspection failed:[/red] {exc}")
+        # authentication failed", etc.), with the URI's password masked.
+        # Structured logs (which may flow to log aggregators) get only the
+        # exception class.
+        cprint(f"[red]JDBC introspection failed:[/red] {_error_text(exc, args.uri)}")
         logger.debug("jdbc_introspect_failed: %s", type(exc).__name__)
         return 1
 

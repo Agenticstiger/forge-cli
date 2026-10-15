@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 _SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Identifier-quote characters for every supported dialect belong in the
@@ -192,8 +192,28 @@ def validate_sql_type_param_payload(payload: str) -> str:
     return payload
 
 
+# Control characters have no place in a connection value. That is every
+# character of Unicode category Cc: C0, DEL and C1 (U+0080..U+009F, whose
+# U+0085 NEXT LINE is a line break to str.splitlines()). libpq's conninfo
+# parser ends an unquoted value at any C isspace() character (PostgreSQL
+# src/interfaces/libpq/fe-connect.c, conninfo_parse) and libpq_escape quotes
+# only a value with a space or a quote, so a tab or a newline would start a
+# second keyword; and a scanner's connect error quotes the DSN, so an ESC or a
+# newline would reach a terminal or split a log line.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_DSN_FIELDS = ("host", "user", "password", "database")
+
+
+def reject_control_chars(value: Any, field_name: str) -> None:
+    """Raise ``ValueError`` if ``value`` carries a control character (Unicode Cc)."""
+    if value is not None and _CONTROL_CHARS.search(str(value)):
+        raise ValueError(
+            f"Invalid {field_name} in database connection: control characters are not permitted."
+        )
+
+
 def libpq_escape(value: Any) -> str:
-    """Escape one libpq-style DSN value (postgres + mysql + sqlite extension).
+    """Escape one libpq DSN value (postgres; mysql uses :func:`mysql_dsn_value`).
 
     Strings with whitespace or single quotes are wrapped in single
     quotes with internal quotes / backslashes doubled (libpq syntax).
@@ -206,9 +226,9 @@ def libpq_escape(value: Any) -> str:
     Used by:
 
     * The duckdb acquisition runner when building ``postgres_scan(...)``
-      DSNs and ``ATTACH '<dsn>' ... TYPE mysql`` strings.
-    * The discoverer modules (``cli/discover/postgres.py``,
-      ``cli/discover/mysql.py``).
+      DSNs.
+    * The JDBC attach builder (``cli/discover/_jdbc_introspect.py``) for
+      postgres.
     """
     s = str(value).replace("\\", "\\\\").replace("'", "\\'")
     return f"'{s}'" if (" " in s or "'" in s) else s
@@ -221,23 +241,28 @@ def build_libpq_dsn(
 ) -> str:
     """Construct a libpq-style DSN ``key=value`` whitespace-separated string.
 
-    The postgres path uses ``database_key="dbname"`` (libpq convention);
-    the mysql path uses ``database_key="database"`` (duckdb mysql
-    extension expects this key). Both engines share the same escape +
-    field-emission logic; only the database key name differs.
+    The postgres path uses ``database_key="dbname"`` (libpq convention).
+    The mysql path (``database_key="database"``) must not use this
+    function: DuckDB's mysql extension does not read libpq syntax, so
+    :func:`build_mysql_dsn` builds that DSN.
 
     Empty / missing fields are omitted (no ``user=`` for an empty
     user). The returned DSN is SQL-literal-safe once the caller wraps
-    it with :func:`quote_string_literal`. ``port`` is validated as
-    numeric and raises ``ValueError`` at build time when non-digit;
-    other values route through :func:`libpq_escape`.
+    it with :func:`quote_string_literal`. ``port`` must be ASCII digits
+    and a value with a control character is refused, both with
+    ``ValueError`` at build time; other values route through
+    :func:`libpq_escape`.
     """
+    for key in _DSN_FIELDS:
+        reject_control_chars(connection.get(key), key)
     parts = []
     if connection.get("host"):
         parts.append(f"host={libpq_escape(connection['host'])}")
     if connection.get("port") not in (None, ""):
         port_str = str(connection["port"])
-        if not port_str.isdigit():
+        # str.isdigit() alone also accepts fullwidth, Arabic-Indic, superscript
+        # and other Unicode digits; a port is ASCII 0-9 only.
+        if not (port_str.isascii() and port_str.isdigit()):
             raise ValueError(f"connection.port must be numeric, got {port_str!r}")
         parts.append(f"port={port_str}")
     if connection.get("user"):
@@ -247,6 +272,82 @@ def build_libpq_dsn(
     if connection.get("database"):
         parts.append(f"{database_key}={libpq_escape(connection['database'])}")
     return " ".join(parts)
+
+
+def mysql_dsn_value(value: Any) -> str:
+    """Quote one value for DuckDB's mysql_scanner DSN.
+
+    That DSN is not libpq syntax: an unquoted value is taken literally up to
+    the next space, single quotes mean nothing, and inside double quotes only
+    ``\\\\`` and ``\\"`` are escapes. Every value is therefore double-quoted
+    with backslash escaped first, then the double quote, so it reaches the
+    server exactly and cannot add a second keyword (``socket=``, ``ssl_key=``).
+    A ``?`` cannot be carried at all: :func:`build_mysql_dsn` refuses it.
+    """
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def build_mysql_dsn(connection: Mapping[str, Any], *, database_key: str = "database") -> str:
+    """The mysql counterpart of :func:`build_libpq_dsn`, in mysql_scanner syntax.
+
+    Every value goes through :func:`mysql_dsn_value`. mysql_scanner first
+    runs every attach string through a URI parser that splits on ``?``
+    whatever the quoting and reads what follows as URI options (``socket``,
+    ``ssl-key``, ...), so a value carrying ``?`` is refused. So is a host
+    with a ``/``: ``name://...`` makes MariaDB Connector/C load a client
+    plugin of that name, and the scanner reads a path as a host name, not a
+    socket. ``port`` must be ASCII digits, and a value with a control
+    character is refused. Callers MUST still wrap the full DSN with
+    :func:`quote_string_literal` at the SQL boundary.
+    """
+    for key in _DSN_FIELDS:
+        reject_control_chars(connection.get(key), key)
+    for key in _DSN_FIELDS:
+        if "?" in str(connection.get(key) or ""):
+            raise ValueError(
+                f"Invalid {key} in mysql source: '?' cannot be passed through "
+                "DuckDB's mysql extension."
+            )
+    host = connection.get("host")
+    if host and "/" in str(host):
+        raise ValueError("Invalid host in mysql source: '/' is not permitted in a mysql host.")
+    parts = []
+    if host:
+        parts.append(f"host={mysql_dsn_value(host)}")
+    if connection.get("port") not in (None, ""):
+        port = str(connection["port"])
+        # str.isdigit() alone also accepts fullwidth, Arabic-Indic, superscript
+        # and other Unicode digits; a port is ASCII 0-9 only.
+        if not (port.isascii() and port.isdigit()):
+            raise ValueError(f"connection.port must be numeric, got {port!r}")
+        parts.append(f"port={port}")
+    for key, name in (("user", "user"), ("password", "password"), ("database", database_key)):
+        if connection.get(key):
+            parts.append(f"{name}={mysql_dsn_value(connection[key])}")
+    return " ".join(parts)
+
+
+def mask_dsn_password(text: str, password: Optional[str]) -> str:
+    """Replace every quoted form of ``password`` in a driver message with ``***``.
+
+    The postgres and mysql scanners quote the DSN they were given in a connect
+    error, so the raw value, its libpq and mysql DSN forms and their SQL-literal
+    forms are all masked. The JDBC introspection and the duckdb build runner's
+    mysql ``ATTACH`` share it.
+    """
+    if not password:
+        return text
+    forms = {
+        password,
+        libpq_escape(password),
+        mysql_dsn_value(password),
+        mysql_dsn_value(password)[1:-1],
+    }
+    forms |= {form.replace("'", "''") for form in forms}
+    for form in sorted(forms, key=len, reverse=True):
+        text = text.replace(form, "***")
+    return text
 
 
 def validate_sql_expression_allowlist(expr: str) -> str:

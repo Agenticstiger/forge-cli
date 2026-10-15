@@ -176,18 +176,26 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
     keeps its own explicit ``asyncio.to_thread`` because it MUST run
     off the loop.
     """
-    from fluid_build.cli.mcp.dispatch import _call_tool
+    from fluid_build.cli.mcp.dispatch import McpToolRefusal, _call_tool
 
     check_tool_permission = __import__(
         "fluid_build.cli.mcp.policy", fromlist=["check_tool_permission"]
     ).check_tool_permission
     check_tool_permission(name, arguments, policy=_policy())
-    return _call_tool(
-        name,
-        arguments,
-        read_only=_policy().read_only,
-        allow_inline_credentials=_policy().allow_inline_credentials,
-    )
+    try:
+        return _call_tool(
+            name,
+            arguments,
+            read_only=_policy().read_only,
+            allow_inline_credentials=_policy().allow_inline_credentials,
+            allow_metadata_service=_policy().allow_metadata_service,
+        )
+    except McpToolRefusal as exc:
+        # Surface the refusal (which names the server flag to set) as the
+        # SDK's ToolError; SDK 2.x would mask a bare RuntimeError.
+        from fluid_build._mcp_compat import get_tool_error
+
+        raise get_tool_error()(str(exc)) from exc
 
 
 # ----------------------------------------------------------------------

@@ -69,13 +69,307 @@ not a regression.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import re
+import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
+from fluid_build.providers._sql_safety import (
+    build_libpq_dsn,
+    build_mysql_dsn,
+    libpq_escape,
+    mask_dsn_password,
+    mysql_dsn_value,
+    quote_ansi_string_literal,
+    reject_control_chars,
+)
+
 LOG = logging.getLogger("fluid.cli.discover.jdbc")
+
+# This host's ambient database credentials. They are suppressed for the
+# duration of a *pinned* ATTACH (a connection that carries its own password),
+# so neither libpq nor the duckdb mysql client can fall back to a password in
+# this host's environment, and libpq cannot fall back to a credential file, a
+# service definition or a token that belongs to this host rather than to the
+# caller.
+#
+# The libpq names are those of libpq's documented environment variables
+# (PostgreSQL 18 docs, "libpq: Environment Variables"; DuckDB 1.5.6's
+# postgres_scanner binary carries libpq 18's names, PGOAUTHDEBUG among them)
+# that carry a credential, a file or service
+# definition holding one, or a switch that sends one: PGSYSCONFDIR locates the
+# system-wide pg_service.conf, and PGGSSDELEGATION=1 forwards this host's
+# Kerberos credentials to the server. PGOAUTHTOKEN is not libpq's own: the
+# postgres_scanner's OAuth hook sends it as an OAUTHBEARER token. PGUSER is
+# left alone on purpose: a login name is used only when the URI names no user,
+# which the MCP gate already refuses without --allow-metadata-service, and
+# hiding it would only swap one host login name (PGUSER) for another (the OS
+# user). The rest (host, port, TLS and session settings) carry no credential.
+#
+# The mysql names: MYSQL_PWD is a password the duckdb mysql client sends when
+# the DSN carries none. MYSQL_HOST, MYSQL_TCP_PORT and MYSQL_UNIX_PORT are the
+# MySQL client's connection defaults (MySQL 8.4 Reference Manual, "Environment
+# Variables"), cleared so none of them stands in for a part the DSN leaves out.
+# MYSQL_GROUP_SUFFIX only names extra option-file groups. DuckDB 1.5.6's
+# mysql_scanner was seen to send no password from an option file (~/.my.cnf,
+# ~/.mylogin.cnf, ~/my.cnf, /etc/my.cnf, /etc/mysql/my.cnf, $MYSQL_HOME/my.cnf),
+# with or without that suffix, so clearing it is a precaution: there is no
+# option-file fallback for it to close.
+_HOST_CREDENTIAL_ENV = (
+    "PGPASSWORD",
+    "PGPASSFILE",
+    "PGSERVICE",
+    "PGSERVICEFILE",
+    "PGSYSCONFDIR",
+    "PGSSLCERT",
+    "PGSSLKEY",
+    "PGOAUTHTOKEN",
+    "PGGSSDELEGATION",
+    "MYSQL_PWD",
+    "MYSQL_HOST",
+    "MYSQL_TCP_PORT",
+    "MYSQL_UNIX_PORT",
+    "MYSQL_GROUP_SUFFIX",
+)
+
+# libpq skips a client certificate whose file does not exist (ENOENT or
+# ENOTDIR). Pointing a pinned connection's certificate and key below os.devnull
+# means it never presents this host's ~/.postgresql/postgresql.crt to a server
+# that asks for one.
+_NO_CLIENT_CERT = os.path.join(os.devnull, "fluid-no-client-certificate")
+
+# The suppression below mutates the process environment. forge_run's in-process
+# worker thread can run alongside forge_from_source, so windows are serialised
+# (and re-entrant within one thread) rather than interleaved: two overlapping
+# windows could otherwise restore the host credentials while the second attach
+# is still inside its own.
+_HOST_CREDENTIAL_ENV_LOCK = threading.RLock()
+
+
+# The mysql_scanner quoting lives beside the libpq one in _sql_safety, which
+# the duckdb runner's own mysql ATTACH shares. _mysql_dsn_value is an alias of
+# it under this module's private naming; this module itself quotes through
+# build_mysql_dsn.
+_mysql_dsn_value = mysql_dsn_value
+
+
+def build_attach_dsn(
+    connection: Dict[str, Any],
+    *,
+    database_key: str,
+    postgres: bool,
+    operator_supplied: bool = False,
+) -> str:
+    """Build the DSN for a DuckDB ``ATTACH`` of a JDBC source.
+
+    Postgres values are quoted per libpq rules via :func:`build_libpq_dsn` /
+    :func:`libpq_escape`, and mysql values per mysql_scanner rules via
+    :func:`build_mysql_dsn`, so a value carrying a space, a quote, or an ``=``
+    is taken as one field and cannot inject a second keyword (``host=`` /
+    ``passfile=`` / ``sslcert=`` / ``socket=`` …). The whole DSN is still
+    wrapped by the caller with :func:`quote_ansi_string_literal` at the SQL
+    boundary, so it cannot break out of the ATTACH string literal either.
+
+    When a postgres connection carries its own ``password`` it is pinned to
+    that material: ``passfile`` is redirected to :data:`os.devnull` so a host
+    ``~/.pgpass`` is never consulted as a fallback, and ``sslcert`` / ``sslkey``
+    name a path that cannot exist, so this host's default client certificate
+    is never presented. That keeps an MCP client from borrowing this host's
+    TLS identity for a server the client chose. ``operator_supplied=True``
+    turns the pin off for a URI the operator typed on the command line, which
+    then authenticates as it always did, with this host's client certificate
+    when the server asks for one. The default is the pin, so a caller that
+    does not say where the URI came from gets it. A connection with no
+    password emits no ``password=`` field and is left to the host's ambient
+    credential sources on purpose — the operator CLI relies on that, and over
+    MCP the ``--allow-metadata-service`` gate is what authorises it.
+
+    Control characters in any value are rejected by the shared builders, which
+    the duckdb build runner's own DSNs go through as well.
+    """
+    if not postgres:
+        return build_mysql_dsn(connection, database_key=database_key)
+    dsn = build_libpq_dsn(connection, database_key=database_key)
+    if connection.get("password") and not operator_supplied:
+        dsn = (
+            f"{dsn} passfile={libpq_escape(os.devnull)}"
+            f" sslcert={libpq_escape(_NO_CLIENT_CERT + '.crt')}"
+            f" sslkey={libpq_escape(_NO_CLIENT_CERT + '.key')}"
+        )
+    return dsn
+
+
+# The masker for a driver message that quotes a DSN lives beside the DSN
+# builders, so the duckdb build runner's mysql ATTACH masks its connect error
+# with the same one; _mask_password is the name this module calls it by.
+_mask_password = mask_dsn_password
+
+# A URI scheme as RFC 3986 section 3.1 spells it. Only when the text before the
+# first '://' is one does the authority start after that '://'.
+_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*")
+
+# The libpq connection parameters that carry a secret, which a postgres URI may
+# also give in its query string (PostgreSQL docs, libpq "Connection URIs" and
+# "Parameter Key Words"). The attach never reads the query, but an error that
+# quotes the URI does.
+_QUERY_SECRET = re.compile(
+    r"[?&](?:password|sslpassword|oauth_client_secret)=([^&#]*)", re.IGNORECASE
+)
+
+
+class _UnusableUriError(ValueError):
+    """A JDBC URI that cannot be used, quoted with its password already masked.
+
+    Raised by :func:`_parse_uri` and :func:`_uri_scheme` only. The message
+    shows the URI with the password masked where it sits (:func:`_masked_uri`),
+    so a caller prints it as it is: masking it again by substring would also
+    hide every other place the password's text appears, the source kind in
+    "Invalid postgres URI" among them when the password is ``postgres``.
+    """
+
+
+def _authority_starts(uri: str) -> List[int]:
+    """Where a reader of ``uri`` may take its authority to start.
+
+    After ``://`` when what comes before it is a scheme. Otherwise there is no
+    authority a parser agrees on (a missing slash, or a ``://`` that only
+    appears later, in the query or in the password itself), and it may start
+    after the first ``:`` or at the very beginning.
+    """
+    scheme, sep, _tail = uri.partition("://")
+    if sep and _SCHEME.fullmatch(scheme):
+        return [len(scheme) + len(sep)]
+    colon = uri.find(":")
+    return [colon + 1, 0] if colon >= 0 else [0]
+
+
+def _password_spans(uri: str) -> List[Tuple[int, int]]:
+    """The ``(start, end)`` offsets of every string a reader of ``uri`` could take as its password.
+
+    The password is what follows the first ``:`` of the user information,
+    which runs from the start of the authority to an ``@``. Readers disagree
+    on which ``@``: libpq stops at the first one, urllib at the last one
+    before the first ``/``, ``?`` or ``#``, and a password typed with one of
+    those characters unencoded runs on to the last ``@`` of all. Every reading
+    from one start shares its first character, so the longest covers every
+    ``@`` in between: only these three are read, which keeps a URI of many
+    ``@`` linear to mask. A secret given as a query parameter is one more.
+    Never raises, so even a URI that no parser can read is masked.
+    """
+    spans: Set[Tuple[int, int]] = set()
+    for start in _authority_starts(uri):
+        rest = uri[start:]
+        authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
+        for at in (rest.find("@"), authority.rfind("@"), rest.rfind("@")):
+            colon = rest.find(":", 0, max(at, 0))
+            if 0 <= colon < at - 1:
+                spans.add((start + colon + 1, start + at))
+    for match in _QUERY_SECRET.finditer(uri):
+        if match.group(1):
+            spans.add(match.span(1))
+    return sorted(spans)
+
+
+def _uri_password_readings(uri: str) -> List[str]:
+    """Every string a reader of ``uri`` could take as its password, longest first."""
+    readings = {uri[start:end] for start, end in _password_spans(uri)}
+    return sorted(readings, key=len, reverse=True)
+
+
+def _masked_uri(uri: str) -> str:
+    """``uri`` with every span a reader could take as its password replaced by ``***``.
+
+    Masked where it sits, as SQLAlchemy's ``URL.render_as_string(hide_password=True)``
+    renders a URL, rather than wherever its text occurs, so a user name, a
+    database or a scheme that happens to equal the password stays readable.
+    Overlapping spans are masked as one.
+    """
+    merged: List[List[int]] = []
+    for start, end in _password_spans(uri):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    pieces: List[str] = []
+    done = 0
+    for start, end in merged:
+        pieces += [uri[done:start], "***"]
+        done = end
+    return "".join(pieces) + uri[done:]
+
+
+def _mask_uri_password(text: str, uri: str) -> str:
+    """``text`` with every reading of ``uri``'s password masked by :func:`_mask_password`.
+
+    For a message that quotes ``uri``, or text derived from it, when the
+    password cannot be taken from a successful parse. The longest reading is
+    masked first, so a shorter one cannot leave the rest of a longer one behind.
+    """
+    for password in _uri_password_readings(uri):
+        text = _mask_password(text, password)
+    return text
+
+
+def _error_text(exc: BaseException, uri: str) -> str:
+    """What may be shown of ``exc``, an error raised while using ``uri``.
+
+    A refusal of the URI itself is already masked where the password sits; any
+    other message has every reading of the password masked wherever it occurs.
+    """
+    if isinstance(exc, _UnusableUriError):
+        return str(exc)
+    return _mask_uri_password(str(exc), uri)
+
+
+def _uri_scheme(uri: str) -> str:
+    """The scheme before ``uri``'s ``://``; :class:`_UnusableUriError` when it has none.
+
+    For a caller that takes the source kind from the URI itself. Without this
+    the text before the first ``://`` would be quoted as the kind, and for a
+    URI with a missing slash that text holds the password.
+    """
+    scheme, sep, _tail = uri.partition("://")
+    if sep and _SCHEME.fullmatch(scheme):
+        return scheme
+    raise _UnusableUriError(
+        "Unsupported JDBC source: the URI does not start with postgres://, postgresql://, "
+        f"mysql:// or sqlite://. Got: {_masked_uri(uri)!r}"
+    )
+
+
+@contextlib.contextmanager
+def _host_credential_env_suppressed() -> Iterator[None]:
+    """Hide this host's ambient DB credential env vars for a pinned ATTACH.
+
+    The saved values are put back when the window closes, also when the attach
+    raises. Windows opened through this function in different threads are
+    serialised by :data:`_HOST_CREDENTIAL_ENV_LOCK`, so they never interleave
+    their save and restore; within one thread a nested window is safe when it
+    closes before the window around it.
+
+    That is all the lock covers. Code that does not go through this function
+    is not serialised with it, so there is no guarantee against:
+
+    * another thread reading these variables, which sees them unset while a
+      window is open;
+    * ``os.environ.copy()`` in another thread, which can race the pop and the
+      restore (and raise ``KeyError``);
+    * an ``engine._run_sync_stage(env_snapshot=True)`` whose snapshot and
+      restore overlap a window, which can delete the variables for good or
+      bring them back inside the window;
+    * same-thread windows that do not close in LIFO order, where the first to
+      close restores the variables inside the other.
+    """
+    with _HOST_CREDENTIAL_ENV_LOCK:
+        saved = {k: os.environ.pop(k) for k in _HOST_CREDENTIAL_ENV if k in os.environ}
+        try:
+            yield
+        finally:
+            os.environ.update(saved)
 
 
 @dataclass
@@ -183,12 +477,47 @@ def _normalize_kind(source: str) -> str:
     return s if s != "postgresql" else "postgres"
 
 
+# What a reserved character in the user information does. Deliberately no
+# advice to percent-encode it: the attach does not decode the user name or the
+# password, so an encoded password would reach the server still encoded.
+_RESERVED_IN_USERINFO = (
+    "a '/', '?', '#', '@', '[' or ']' in the user name or password, or a ':' in "
+    "the user name, changes where the host is read"
+)
+# What :func:`_uri_problem` returns for a URI with no host at all.
+_MISSING_HOSTNAME = "missing hostname"
+
+
+def _uri_problem(uri: str) -> Optional[str]:
+    """Why urllib cannot give :func:`_parse_uri` a host and port for ``uri``, or ``None``.
+
+    urllib's own error is not passed on: it can quote the netloc, or a piece
+    of it (a bracketed host, the port), and with a reserved character typed
+    in the password that piece is the password. The reason is
+    returned, not raised, so the caller's error is raised after this handler
+    has ended and urllib's is neither its cause nor its context.
+    """
+    try:
+        parsed = urlparse(uri)
+    except ValueError:
+        return f"it is not a well-formed URI ({_RESERVED_IN_USERINFO})"
+    if not parsed.hostname:
+        return _MISSING_HOSTNAME
+    try:
+        _ = parsed.port
+    except ValueError:
+        return f"the port is not a number from 0 to 65535 ({_RESERVED_IN_USERINFO})"
+    return None
+
+
 def _parse_uri(uri: str, kind: str) -> Dict[str, str]:
     """Normalise a JDBC URI into a duckdb ATTACH-string map.
 
     Returns the kwargs duckdb's postgres / mysql ATTACH expects. For
     SQLite, returns ``{"path": "/abs/path"}`` since SQLite ATTACH is
-    just a file path.
+    just a file path. A postgres / mysql URI with no host or a bad port, or
+    one urllib cannot read, raises ``ValueError`` naming the problem and
+    quoting the URI with its password masked.
     """
     if kind == "sqlite":
         # SQLAlchemy / standard SQLite URI forms:
@@ -198,7 +527,7 @@ def _parse_uri(uri: str, kind: str) -> Dict[str, str]:
         # scheme separator), then the optional third slash that
         # SQLAlchemy uses to mark an empty host. The remaining path
         # is what duckdb's ATTACH wants.
-        body = uri.split("sqlite://", 1)[-1]
+        body = uri[len("sqlite://") :] if uri.lower().startswith("sqlite://") else uri
         if body.startswith("/"):
             # ``sqlite:///path`` → strip exactly one slash
             #                      (host = "", path = "/path" → "path")
@@ -207,9 +536,13 @@ def _parse_uri(uri: str, kind: str) -> Dict[str, str]:
             body = body[1:]
         return {"path": body}
 
+    problem = _uri_problem(uri)
+    if problem is not None:
+        # The URI is quoted so the caller can see what is wrong, and this text
+        # reaches consoles and logs (the MCP server's among them) and the
+        # model, through fetch_sample_rows: its password is masked.
+        raise _UnusableUriError(f"Invalid {kind} URI: {problem}. Got: {_masked_uri(uri)!r}")
     parsed = urlparse(uri)
-    if not parsed.hostname:
-        raise ValueError(f"Invalid {kind} URI: missing hostname. Got: {uri!r}")
     out = {
         "host": parsed.hostname,
         "port": str(parsed.port or (5432 if kind == "postgres" else 3306)),
@@ -220,34 +553,38 @@ def _parse_uri(uri: str, kind: str) -> Dict[str, str]:
     return out
 
 
-def _attach_string_postgres(args: Dict[str, str], alias: str) -> str:
-    parts = [f"dbname={args['dbname']}"]
-    if args.get("host"):
-        parts.append(f"host={args['host']}")
-    if args.get("port"):
-        parts.append(f"port={args['port']}")
-    if args.get("user"):
-        parts.append(f"user={args['user']}")
-    if args.get("password"):
-        parts.append(f"password={args['password']}")
-    return f"ATTACH '{' '.join(parts)}' AS {alias} (TYPE postgres)"
+def _pg_mysql_connection(args: Dict[str, str]) -> Dict[str, Any]:
+    """Map the parsed-URI dict onto :func:`build_libpq_dsn`'s connection shape."""
+    return {
+        "host": args.get("host"),
+        "port": args.get("port"),
+        "user": args.get("user"),
+        "password": args.get("password"),
+        "database": args.get("dbname"),
+    }
+
+
+def _attach_string_postgres(
+    args: Dict[str, str], alias: str, *, operator_supplied: bool = False
+) -> str:
+    dsn = build_attach_dsn(
+        _pg_mysql_connection(args),
+        database_key="dbname",  # pragma: allowlist secret (the libpq keyword name)
+        postgres=True,
+        operator_supplied=operator_supplied,
+    )
+    return f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE postgres)"
 
 
 def _attach_string_mysql(args: Dict[str, str], alias: str) -> str:
-    parts = [f"database={args['dbname']}"]
-    if args.get("host"):
-        parts.append(f"host={args['host']}")
-    if args.get("port"):
-        parts.append(f"port={args['port']}")
-    if args.get("user"):
-        parts.append(f"user={args['user']}")
-    if args.get("password"):
-        parts.append(f"password={args['password']}")
-    return f"ATTACH '{' '.join(parts)}' AS {alias} (TYPE mysql)"
+    dsn = build_attach_dsn(_pg_mysql_connection(args), database_key="database", postgres=False)
+    return f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE mysql)"
 
 
 def _attach_string_sqlite(args: Dict[str, str], alias: str) -> str:
-    return f"ATTACH '{args['path']}' AS {alias} (TYPE sqlite)"
+    path = args["path"]
+    reject_control_chars(path, "sqlite path")
+    return f"ATTACH {quote_ansi_string_literal(path)} AS {alias} (TYPE sqlite)"
 
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -577,6 +914,7 @@ def introspect_jdbc(
     uri: str,
     schema_filter: Optional[str] = None,
     table_filter: Optional[List[str]] = None,
+    operator_supplied: bool = False,
 ) -> IntrospectedDatabase:
     """Connect to the JDBC database via duckdb extensions and enumerate
     its tables, columns, PKs, FKs, and CHECK constraints.
@@ -588,6 +926,11 @@ def introspect_jdbc(
             user-accessible schema is enumerated.
         table_filter: Optional list of table names to enumerate. When
             None, every table is returned.
+        operator_supplied: True only when the operator typed ``uri`` on the
+            command line. Otherwise a URI that carries a password is pinned
+            to its own material (see :func:`build_attach_dsn`) and this
+            host's database credential environment is hidden while it
+            connects.
 
     Returns:
         :class:`IntrospectedDatabase` with the full table/column tree
@@ -625,6 +968,44 @@ def introspect_jdbc(
         "mysql": _attach_string_mysql,
         "sqlite": _attach_string_sqlite,
     }.get(kind)
+    # A password in a URI the operator did not type is the caller's own
+    # material: pin the connection to it and keep this host's ambient DB
+    # credentials, client certificate and service definitions out of the
+    # handshake, so an MCP client cannot borrow this host's identity. A URI the
+    # operator typed on the command line authenticates as it always did. A URI
+    # with no password is left to the host sources on purpose (the operator CLI
+    # relies on it; over MCP the --allow-metadata-service gate is what
+    # authorises it).
+    pin_own_material = (
+        kind in ("postgres", "mysql") and bool(args.get("password")) and not operator_supplied
+    )
+
+    def _before_lock(c: Any) -> None:
+        if kind == "postgres":
+            attach_sql = _attach_string_postgres(args, alias, operator_supplied=operator_supplied)
+        else:
+            attach_sql = attach(args, alias)  # type: ignore[misc]
+        password = args.get("password")
+        masked: Optional[str] = None
+        try:
+            if pin_own_material:
+                with _host_credential_env_suppressed():
+                    c.execute(attach_sql)
+            else:
+                c.execute(attach_sql)
+        except Exception as exc:
+            if not password:
+                raise
+            # The scanners quote the DSN in a connect error; keep the message,
+            # without the password.
+            masked = _mask_password(str(exc), password)
+        if masked is not None:
+            # Raised after the handler has ended, so the unmasked driver error is
+            # neither the cause nor the context of this one. Inside the handler,
+            # ``raise ... from None`` would only set __suppress_context__ (PEP 415)
+            # and leave the original, password and all, on __context__.
+            raise RuntimeError(masked)
+
     # Install + load the extension (duckdb caches the binary, so this is fast
     # on a second run) and ATTACH the source before the sandbox locks; the
     # introspection queries after it reach that database and no file or URL.
@@ -632,7 +1013,7 @@ def introspect_jdbc(
         ":memory:",
         allow=DuckDBAllowlist.none(),
         extensions=[kind] if attach is not None else [],
-        before_lock=(lambda c: c.execute(attach(args, alias))) if attach is not None else None,
+        before_lock=_before_lock if attach is not None else None,
     )
     try:
 

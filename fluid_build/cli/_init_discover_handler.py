@@ -71,7 +71,13 @@ def run_discover(args, logger: logging.Logger, *, uri: str) -> int:
 
     cprint(f"🔍 Discovering streams at {uri}…")
     try:
-        streams = discoverer.discover(uri)
+        # The operator typed this URI on the command line, so a JDBC
+        # discoverer may use this host's client certificate and libpq
+        # settings. Every discoverer, a registered JDBC subclass written
+        # against main's interface included, is still called as discover(uri).
+        from fluid_build.cli.discover._jdbc_base import discover_operator_uri
+
+        streams = discover_operator_uri(discoverer, uri)
     except Exception as exc:  # noqa: BLE001
         raise ConnectivityProbeError.for_target(
             target=uri,
