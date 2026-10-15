@@ -33,8 +33,9 @@ import edge (no cycle).
 from __future__ import annotations
 
 import asyncio
+import logging
 import signal
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Set, Tuple
 
 from mcp.server.stdio import stdio_server
 
@@ -81,7 +82,7 @@ async def run_http_async(
     from starlette.responses import JSONResponse, Response
     from starlette.routing import Mount, Route
 
-    from .auth import AuthValidator, extract_mtls_identity
+    from .auth import AuthValidator
 
     # Resolve the auth strategy from FLUID_MCP_AUTH_MODE
     # (shared-token / jwt / none). When the validator
@@ -97,11 +98,14 @@ async def run_http_async(
             "untrusted network."
         )
 
+    forwarded_certs = _ForwardedCertIdentity(auth_validator, srv.state.logger)
+
     class _AuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
             if not auth_validator.is_enabled():
                 return await call_next(request)
-            decision = auth_validator.validate(dict(request.headers))
+            headers = dict(request.headers)
+            decision = auth_validator.validate(headers)
             if not decision.allowed:
                 return JSONResponse(
                     {
@@ -118,10 +122,7 @@ async def run_http_async(
             # self-attestation for downstream rowFilter resolution).
             request.scope["fluid_auth_attrs"] = dict(decision.caller_attributes)
             request.scope["fluid_auth_kind"] = decision.identity_kind
-            # Also pull mTLS metadata forwarded by the proxy so
-            # the audit trail records BOTH the JWT identity AND
-            # the cert that carried it.
-            request.scope["fluid_auth_attrs"].update(extract_mtls_identity(dict(request.headers)))
+            forwarded_certs.bind(request, headers)
             return await call_next(request)
 
     sse_path = "/sse"
@@ -156,7 +157,12 @@ async def run_http_async(
         ],
         middleware=[Middleware(_AuthMiddleware)],
     )
-    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    # proxy_headers=False: uvicorn otherwise rewrites ``request.client``
+    # from X-Forwarded-For whenever the peer is in FORWARDED_ALLOW_IPS
+    # (default 127.0.0.1,::1), so the trusted-proxy check above would read a
+    # header value instead of the TCP peer. The gateway's peer is the TCP
+    # peer; uvicorn's access log therefore shows the proxy's address.
+    config = uvicorn.Config(app, host=host, port=port, log_level="info", proxy_headers=False)
     server = uvicorn.Server(config)
     # Stash the uvicorn Server so stop_http() (or a test harness,
     # or a future SIGTERM handler for the HTTP path) can flip
@@ -173,12 +179,100 @@ async def run_http_async(
             "sse_path": sse_path,
             "auth_mode": auth_validator.mode,
             "auth_enabled": auth_validator.is_enabled(),
+            "trusted_proxies": [str(n) for n in auth_validator.trusted_proxies],
         },
     )
     try:
         await server.serve()
     finally:
         srv._uvicorn_server = None
+
+
+class _ForwardedCertIdentity:
+    """Binds the client certificate an mTLS-terminating proxy forwarded
+    (``X-Client-CN`` / ``X-Client-Fingerprint``) onto an authenticated
+    request — only when the TCP peer is listed in
+    ``FLUID_MCP_TRUSTED_PROXIES``; anyone else could have set the headers
+    itself.
+
+    When honoured the values bind ``${caller.client_cn}`` /
+    ``${caller.client_fingerprint}`` (via ``fluid_auth_attrs``) and are kept
+    apart under ``fluid_mtls_identity`` so the data_access audit record can
+    name the certificate next to ``authKind`` without mistaking a token claim
+    for it.
+
+    Ignored headers are logged at WARNING with the real reason and the peer
+    address, once per (reason, peer). An operator who has not yet listed
+    their proxy sees which address to add instead of a bare row-filter
+    denial. The set of logged pairs is bounded so a client cycling source
+    addresses cannot turn the log into a flood: after
+    ``MAX_LOGGED_PEERS`` pairs one final line says further ones are
+    suppressed. Header values are never written to the log.
+    """
+
+    #: Distinct (reason, peer) pairs logged before the rest are suppressed.
+    MAX_LOGGED_PEERS = 32
+
+    def __init__(self, validator: Any, logger: logging.Logger) -> None:
+        self._trusted = validator.trusted_proxies
+        self._logger = logger
+        self._logged: Set[Tuple[str, str]] = set()
+        self._suppressed = False
+
+    def bind(self, request: Any, headers: Mapping[str, str]) -> None:
+        from .auth import extract_mtls_identity, has_mtls_identity_headers
+
+        peer_host = request.client.host if request.client else None
+        identity = extract_mtls_identity(
+            headers, peer_host=peer_host, trusted_proxies=self._trusted
+        )
+        if identity:
+            request.scope["fluid_auth_attrs"].update(identity)
+            request.scope["fluid_mtls_identity"] = identity
+            return
+        if self._suppressed or not has_mtls_identity_headers(headers):
+            return
+        self._log_ignored(peer_host, headers)
+
+    def _log_ignored(self, peer_host: Optional[str], headers: Mapping[str, str]) -> None:
+        from .auth import ignored_mtls_headers_reason
+
+        reason = ignored_mtls_headers_reason(
+            headers, peer_host=peer_host, trusted_proxies=self._trusted
+        )
+        peer = peer_host or "unknown"
+        key = (reason, peer)
+        if key in self._logged:
+            return
+        if len(self._logged) >= self.MAX_LOGGED_PEERS:
+            self._suppressed = True
+            self._logger.warning(
+                "output_port_mtls_headers_ignored: further ignored X-Client-CN / "
+                "X-Client-Fingerprint warnings are suppressed after %d distinct peers.",
+                self.MAX_LOGGED_PEERS,
+            )
+            return
+        self._logged.add(key)
+        if reason == "unknown_peer":
+            why = "the TCP peer address is unknown, so it cannot be a trusted proxy"
+        elif reason == "untrusted_peer":
+            why = (
+                f"the peer {peer} is not in FLUID_MCP_TRUSTED_PROXIES. If {peer} is "
+                f"your mTLS-terminating proxy, set FLUID_MCP_TRUSTED_PROXIES={peer}; "
+                "otherwise the client set these headers itself"
+            )
+        elif reason == "empty":
+            why = f"the trusted proxy {peer} sent them with empty values"
+        else:
+            why = f"the values the trusted proxy {peer} sent contain control characters"
+        self._logger.warning(
+            "output_port_mtls_headers_ignored: X-Client-CN / X-Client-Fingerprint "
+            "ignored because %s. Any row filter on ${caller.client_cn} or "
+            "${caller.client_fingerprint} denies this request (logged once per "
+            "reason and peer).",
+            why,
+            extra={"peer": peer, "reason": reason},
+        )
 
 
 def stop_http(srv: "OutputPortMcpServer", *, force: bool = False) -> None:

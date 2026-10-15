@@ -277,6 +277,75 @@ on top of the CLI flags. CLI overrides take precedence so an
 operator can temporarily widen or narrow the surface for incident
 response without editing the contract.
 
+## HTTP transport authentication
+
+`--transport http` reads its auth settings from the environment when it
+starts:
+
+| Variable | Values | Default |
+|---|---|---|
+| `FLUID_MCP_AUTH_MODE` | `shared-token`, `jwt`, `none` | `shared-token` |
+| `FLUID_MCP_AUTH_TOKEN` | the bearer secret for `shared-token` | unset (auth off, with a warning) |
+| `FLUID_MCP_JWT_ISSUER` / `_AUDIENCE` / `_JWKS_URL` | the IdP settings for `jwt` | unset (auth off, with a warning) |
+| `FLUID_MCP_TRUSTED_PROXIES` | comma-separated IPs / CIDRs of your mTLS proxies, e.g. `127.0.0.1` or `10.0.4.17/32` | empty: no proxy is trusted |
+
+Any other `FLUID_MCP_AUTH_MODE` value, or a `FLUID_MCP_TRUSTED_PROXIES`
+entry that is not an IP or CIDR, stops `serve` with exit code 2
+(`invalid_auth_mode` / `invalid_trusted_proxies`) and names the values it
+accepts. So does a host address with a prefix, such as `10.0.4.17/8`:
+write `10.0.4.17` for that one proxy, or `10.0.0.0/8` if you mean the whole
+range. stdio does not read these variables.
+
+**mTLS terminates at a reverse proxy.** There is no `mtls` mode: put an
+mTLS-terminating proxy in front of the gateway (templates in
+[`examples/mcp-output-port-docker/proxy/`](../examples/mcp-output-port-docker/proxy/)),
+which forwards the verified certificate as `X-Client-CN` and
+`X-Client-Fingerprint`. The gateway reads those two headers only on a
+request authenticated with `shared-token` or `jwt` **and** whose TCP peer
+is listed in `FLUID_MCP_TRUSTED_PROXIES`, the same allow-list idea as
+uvicorn's `--forwarded-allow-ips`. From any other peer they are ignored.
+When honoured they bind `${caller.client_cn}` and
+`${caller.client_fingerprint}` in `policy.rowFilters`. Nothing else binds
+them: a client that names its own certificate in `clientInfo` or in its
+`fluid` capability block is ignored, in every auth mode. If a filter keys on
+them and they were not honoured, the call fails closed.
+
+`serve` refuses to start, with exit code 2, when a certificate could never
+be honoured:
+
+- `--transport http` with auth not actually enabled (`FLUID_MCP_AUTH_MODE=none`,
+  `shared-token` without `FLUID_MCP_AUTH_TOKEN`, or `jwt` missing the
+  issuer, audience or JWKS URL) while `FLUID_MCP_TRUSTED_PROXIES` is set or
+  a rowFilter reads `${caller.client_cn}` / `${caller.client_fingerprint}`.
+  The message names the variable that keeps auth off.
+- `--transport stdio` when a rowFilter reads either attribute, since a pipe
+  carries no headers.
+
+```bash
+FLUID_MCP_AUTH_MODE=shared-token FLUID_MCP_AUTH_TOKEN=... \
+FLUID_MCP_TRUSTED_PROXIES=127.0.0.1 \
+  fluid mcp output-port serve ./contract.fluid.yaml --transport http --host 127.0.0.1
+```
+
+The peer is the TCP peer: the gateway does not take it from
+`X-Forwarded-For`, so uvicorn's access log shows the proxy's address.
+
+List only the proxy's own address, or the narrowest CIDR that covers your
+proxy replicas. Any peer inside a listed range can assert any client
+certificate, so a wide range such as a whole pod or VPC network lets every
+host on it choose its own `${caller.client_cn}`.
+
+When the gateway ignores the two headers it logs
+`output_port_mtls_headers_ignored` at WARNING with the reason and the peer
+address, once per reason and peer. If the peer is your proxy, the line tells
+you the value to set:
+
+```text
+output_port_mtls_headers_ignored: X-Client-CN / X-Client-Fingerprint ignored because the peer 10.0.4.17 is not in FLUID_MCP_TRUSTED_PROXIES. If 10.0.4.17 is your mTLS-terminating proxy, set FLUID_MCP_TRUSTED_PROXIES=10.0.4.17; ...
+```
+
+The denied call's audit record carries the same hint in `annotatedMessage`.
+
 ## Audit trail
 
 Every `tools/call` writes a JSON document to
@@ -284,8 +353,11 @@ Every `tools/call` writes a JSON document to
 `fluid_build.copilot.store.audit_trail.write_audit_event`. The
 document records the tool name, expose id, contract path,
 `elapsedMs`, and a sanitised argument summary (long SQL bodies are
-truncated to 256 characters). Forensic operators consume the
-trail with the existing `AuditReportGenerator`.
+truncated to 256 characters). Each `data_access` record also carries
+`authKind` — the layer that authenticated the call (`shared-token`,
+`jwt`, or `none`) — and, when a trusted proxy forwarded a client
+certificate, `clientCertCn` and `clientCertFingerprint`. Forensic
+operators consume the trail with the existing `AuditReportGenerator`.
 
 ## Client certification
 

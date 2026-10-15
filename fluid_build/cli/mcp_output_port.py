@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     # (which only run under ``fluid mcp output-port <cmd>``). Annotation-only
     # here keeps ``OutputPortPolicy`` resolvable for type-checkers.
     from fluid_build.output_ports.mcp import OutputPortPolicy
+    from fluid_build.output_ports.mcp.auth import AuthValidator
 
 
 def attach_to_mcp_subparsers(sp: argparse._SubParsersAction) -> None:
@@ -177,17 +178,18 @@ def attach_to_mcp_subparsers(sp: argparse._SubParsersAction) -> None:
     # Transport selection. ``stdio`` is the default — what Claude
     # Desktop / Cursor / MCP Inspector use over a child-process
     # pipe. ``http`` switches to MCP-SSE on the chosen host:port for
-    # network-served deployments. The gateway has no built-in HTTP
-    # auth today; pair with a reverse proxy that enforces mTLS or
-    # OAuth until the auth phase ships.
+    # network-served deployments, authenticated per FLUID_MCP_AUTH_MODE;
+    # mTLS terminates at a reverse proxy the gateway trusts via
+    # FLUID_MCP_TRUSTED_PROXIES.
     serve.add_argument(
         "--transport",
         choices=("stdio", "http"),
         default="stdio",
         help=(
             "MCP transport. `stdio` (default) for desktop tool "
-            "integrations; `http` for MCP-SSE on `--host:--port` "
-            "(no built-in auth — front with mTLS/OAuth proxy)."
+            "integrations; `http` for MCP-SSE on `--host:--port`, "
+            "authenticated per FLUID_MCP_AUTH_MODE (shared-token | jwt | none). "
+            "For mTLS, front it with a proxy listed in FLUID_MCP_TRUSTED_PROXIES."
         ),
     )
     serve.add_argument(
@@ -351,6 +353,12 @@ def _run_serve(args, logger: logging.Logger) -> int:
     from fluid_build.output_ports.mcp import find_expose, run_stdio
 
     contract_path = _resolve_contract_path(args)
+    transport = getattr(args, "transport", "stdio")
+    # HTTP reads FLUID_MCP_AUTH_* / FLUID_MCP_TRUSTED_PROXIES; a bad value
+    # must stop here as a typed error, before any side effect, rather than
+    # surface later as a traceback from inside the transport. stdio never
+    # consults them, so it is not checked.
+    http_auth = _http_auth_validator() if transport == "http" else None
     contract = load_contract_with_overlay(str(contract_path), args.env, logger)
     expose = find_expose(contract, getattr(args, "expose_id", None) or None)
     expose_id = str(expose.get("exposeId"))
@@ -446,6 +454,20 @@ def _run_serve(args, logger: logging.Logger) -> int:
             f"contract={contract_path.name} — ready for MCP client on stdio.\n"
         )
         sys.stderr.flush()
+    host = getattr(args, "host", "127.0.0.1")
+    port = int(getattr(args, "port", 8765) or 8765)
+    unsatisfiable = _jurisdiction_gate_unsatisfiable(policy, transport=transport)
+    if unsatisfiable is not None:
+        sys.stderr.write(unsatisfiable)
+        sys.stderr.flush()
+        return 2
+    cert_unsatisfiable = _cert_identity_gate_unsatisfiable(
+        expose, transport=transport, http_auth=http_auth
+    )
+    if cert_unsatisfiable is not None:
+        sys.stderr.write(cert_unsatisfiable)
+        sys.stderr.flush()
+        return 2
     logger.info(
         "output_port_serve_start",
         extra={
@@ -457,15 +479,7 @@ def _run_serve(args, logger: logging.Logger) -> int:
             "auditRequired": audit_required,
         },
     )
-    transport = getattr(args, "transport", "stdio")
-    host = getattr(args, "host", "127.0.0.1")
-    port = int(getattr(args, "port", 8765) or 8765)
-    unsatisfiable = _jurisdiction_gate_unsatisfiable(policy, transport=transport)
-    if unsatisfiable is not None:
-        sys.stderr.write(unsatisfiable)
-        sys.stderr.flush()
-        return 2
-    if transport == "http":
+    if http_auth is not None and not http_auth.is_enabled():
         sys.stderr.write(
             f"⚠️  fluid mcp output-port: HTTP transport binds {host}:{port} with "
             "NO built-in auth. Front with a reverse proxy that enforces "
@@ -638,6 +652,42 @@ def _print_doctor_report(report, *, expose_id: str) -> None:
         sys.stdout.write("\n")
 
 
+def _http_auth_validator() -> AuthValidator:
+    """Build the HTTP transport's auth validator from the environment, or
+    raise a typed :class:`CLIError` naming the bad variable and the values
+    it accepts."""
+    from fluid_build.output_ports.mcp.auth import AuthConfigError, AuthValidator
+
+    try:
+        return AuthValidator.from_env()
+    except AuthConfigError as exc:
+        if exc.env_var == "FLUID_MCP_AUTH_MODE":
+            raise CLIError(
+                2,
+                "invalid_auth_mode",
+                {
+                    "FLUID_MCP_AUTH_MODE": exc.value,
+                    "expected": exc.expected,
+                    "hint": (
+                        "mTLS is not a gateway mode: terminate it at a reverse proxy "
+                        "(examples/mcp-output-port-docker/proxy/), run the gateway with "
+                        "shared-token or jwt, and list the proxy's address in "
+                        "FLUID_MCP_TRUSTED_PROXIES so its X-Client-CN header is honoured."
+                    ),
+                },
+            ) from None
+        raise CLIError(
+            2,
+            "invalid_trusted_proxies",
+            {
+                exc.env_var: exc.value,
+                "expected": exc.expected,
+                "detail": str(exc),
+                "example": "FLUID_MCP_TRUSTED_PROXIES=127.0.0.1",
+            },
+        ) from None
+
+
 def _auth_mode_configured() -> bool:
     """Whether the HTTP transport will actually run its auth middleware."""
     mode = (os.environ.get("FLUID_MCP_AUTH_MODE") or "").strip().lower()
@@ -694,6 +744,87 @@ def _jurisdiction_gate_unsatisfiable(policy, *, transport: str) -> Optional[str]
             "called 'jurisdiction'.\n"
         )
     return None
+
+
+def _auth_off_reason(http_auth: AuthValidator) -> str:
+    """Why ``http_auth.is_enabled()`` is False, naming the variables to set.
+    Never includes a configured value."""
+    if http_auth.mode == "none":
+        return "FLUID_MCP_AUTH_MODE=none"
+    if http_auth.mode == "jwt":
+        missing = [
+            name
+            for name, value in (
+                ("FLUID_MCP_JWT_ISSUER", http_auth.jwt_issuer),
+                ("FLUID_MCP_JWT_AUDIENCE", http_auth.jwt_audience),
+                ("FLUID_MCP_JWT_JWKS_URL", http_auth.jwt_jwks_url),
+            )
+            if not value
+        ]
+        return f"FLUID_MCP_AUTH_MODE=jwt but {', '.join(missing)} is unset"
+    return f"FLUID_MCP_AUTH_MODE={http_auth.mode} but FLUID_MCP_AUTH_TOKEN is unset"
+
+
+def _cert_identity_gate_unsatisfiable(
+    expose, *, transport: str, http_auth: Optional[AuthValidator]
+) -> Optional[str]:
+    """Refuse at startup when client-certificate identity could never bind.
+
+    ``${caller.client_cn}`` / ``${caller.client_fingerprint}`` bind only from
+    the ``X-Client-CN`` / ``X-Client-Fingerprint`` headers of a trusted proxy,
+    and the gateway reads those only on a request its auth middleware has
+    authenticated (``shared-token`` with a token, or ``jwt`` with issuer,
+    audience and JWKS URL). A client's own claim to a certificate never binds
+    them. So two setups can never honour a certificate:
+
+    * stdio, which carries no headers, when a rowFilter keys on one;
+    * HTTP with auth not actually enabled, when a rowFilter keys on one or
+      ``FLUID_MCP_TRUSTED_PROXIES`` is set — the operator is relying on the
+      proxy, and the gateway would ignore it.
+
+    Like ``_jurisdiction_gate_unsatisfiable`` this turns a stream of per-call
+    denials, or a deployment that looks protected and is not, into one
+    message at startup. Returns the message, or ``None`` when serving is fine.
+    """
+    from fluid_build.output_ports.mcp.auth import MTLS_IDENTITY_ATTRS
+    from fluid_build.output_ports.mcp.query_compiler import row_filter_caller_attributes
+
+    needed = sorted(MTLS_IDENTITY_ATTRS.intersection(row_filter_caller_attributes(expose)))
+    named = ", ".join(f"${{caller.{attr}}}" for attr in needed)
+    if transport != "http" or http_auth is None:
+        if not needed:
+            return None
+        return (
+            f"fluid mcp output-port: refusing to serve over {transport!r}.\n"
+            f"  A rowFilter on this expose reads {named}, which binds only from a "
+            "client certificate forwarded by a trusted mTLS proxy. "
+            f"{transport!r} carries no headers, so every call would be denied.\n"
+            "  Serve it over HTTP with auth, behind the proxy:\n"
+            "    FLUID_MCP_AUTH_MODE=shared-token FLUID_MCP_AUTH_TOKEN=... \\\n"
+            "    FLUID_MCP_TRUSTED_PROXIES=127.0.0.1 \\\n"
+            "      fluid mcp output-port serve <contract> --transport http\n"
+        )
+    if http_auth.is_enabled():
+        return None
+    if needed:
+        relied_on = f"A rowFilter on this expose reads {named}"
+        tail = ""
+    elif http_auth.trusted_proxies:
+        relied_on = "FLUID_MCP_TRUSTED_PROXIES is set"
+        tail = "  If no proxy forwards client certificates, unset FLUID_MCP_TRUSTED_PROXIES.\n"
+    else:
+        return None
+    return (
+        "fluid mcp output-port: refusing to serve unauthenticated.\n"
+        f"  {relied_on}, but HTTP auth is off ({_auth_off_reason(http_auth)}). "
+        "The gateway reads a trusted proxy's X-Client-CN / X-Client-Fingerprint "
+        "headers only on an authenticated request, so no client certificate would "
+        "ever be honoured, and anyone who can reach the gateway could call it.\n"
+        "  Enable auth: FLUID_MCP_AUTH_MODE=shared-token with FLUID_MCP_AUTH_TOKEN "
+        "(the token the proxy sends), or FLUID_MCP_AUTH_MODE=jwt with "
+        "FLUID_MCP_JWT_ISSUER, FLUID_MCP_JWT_AUDIENCE and FLUID_MCP_JWT_JWKS_URL.\n"
+        f"{tail}"
+    )
 
 
 def _build_policy(args, *, contract_path: Path, expose, contract=None) -> OutputPortPolicy:

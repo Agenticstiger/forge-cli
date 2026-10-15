@@ -37,7 +37,9 @@ proxy in front of the gateway — see
 exposes :func:`extract_mtls_identity` to read the proxy-forwarded
 ``X-Client-CN`` / ``X-Client-Fingerprint`` headers so the gateway
 can stamp the client cert into the audit event for cryptographic
-attribution alongside JWT claims.
+attribution alongside JWT claims. Those headers are honoured only when
+the TCP peer is a proxy listed in ``FLUID_MCP_TRUSTED_PROXIES``
+(:func:`parse_trusted_proxies`); from anyone else they are ignored.
 
 Borrowed-not-built per /borrow-before-build:
 
@@ -50,12 +52,13 @@ Borrowed-not-built per /borrow-before-build:
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import os
 import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, Mapping, Optional, Sequence, Tuple, Union
 
 #: Claim -> caller-attribute mappings applied when an operator configures none.
 #:
@@ -81,6 +84,41 @@ DEFAULT_JWT_CLAIM_MAPPINGS: Mapping[str, str] = MappingProxyType(
         "jurisdiction": "jurisdiction",
     }
 )
+
+#: Every value ``FLUID_MCP_AUTH_MODE`` accepts. mTLS is not a mode: it
+#: terminates at the reverse proxy, which forwards the verified certificate
+#: to a gateway that trusts that proxy via ``FLUID_MCP_TRUSTED_PROXIES``.
+VALID_AUTH_MODES: Tuple[str, ...] = ("shared-token", "jwt", "none")
+
+#: Proxy-forwarded client-certificate headers -> caller attribute names.
+MTLS_IDENTITY_HEADERS: Tuple[Tuple[str, str], ...] = (
+    ("x-client-cn", "client_cn"),
+    ("x-client-fingerprint", "client_fingerprint"),
+)
+
+#: Caller attributes that name a client certificate. Like ``jurisdiction``
+#: they bind from the verified channel only, never from what a client says
+#: about itself: the one party able to vouch for a certificate is the trusted
+#: proxy that terminated it. See ``OutputPortMcpServer._resolve_request_identity``.
+MTLS_IDENTITY_ATTRS: FrozenSet[str] = frozenset(name for _, name in MTLS_IDENTITY_HEADERS)
+
+TrustedNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+
+
+class AuthConfigError(ValueError):
+    """The gateway's auth environment is invalid, so it must not start.
+
+    A ``ValueError`` subclass so callers that already catch ``ValueError``
+    keep working. ``env_var`` / ``value`` / ``expected`` let the CLI render
+    a typed error instead of a traceback.
+    """
+
+    def __init__(self, message: str, *, env_var: str, value: str, expected: str) -> None:
+        super().__init__(message)
+        self.env_var = env_var
+        self.value = value
+        self.expected = expected
+
 
 #: The caller attribute a verified jurisdiction claim lands in. Read from the
 #: cryptographically-verified channel ONLY — see
@@ -130,13 +168,20 @@ class AuthValidator:
         jwt_algorithms: Sequence[str] = ("RS256", "ES256", "EdDSA"),
         jwt_claim_mappings: Optional[Mapping[str, str]] = None,
         jwks_cache_ttl_seconds: float = 600.0,
+        trusted_proxies: Sequence[TrustedNetwork] = (),
     ) -> None:
-        if mode not in {"shared-token", "jwt", "none"}:
-            raise ValueError(
+        if mode not in VALID_AUTH_MODES:
+            raise AuthConfigError(
                 f"unknown FLUID_MCP_AUTH_MODE={mode!r}; expected one of "
-                "shared-token / jwt / none"
+                f"{' / '.join(VALID_AUTH_MODES)}",
+                env_var="FLUID_MCP_AUTH_MODE",
+                value=mode,
+                expected=", ".join(VALID_AUTH_MODES),
             )
         self.mode = mode
+        # Networks whose X-Client-CN / X-Client-Fingerprint headers are
+        # believed. Empty (the default) means no peer is trusted.
+        self.trusted_proxies: Tuple[TrustedNetwork, ...] = tuple(trusted_proxies)
         self.shared_token = shared_token
         self.jwt_issuer = jwt_issuer
         self.jwt_audience = jwt_audience
@@ -163,7 +208,10 @@ class AuthValidator:
         env vars.
         """
         mode = os.environ.get("FLUID_MCP_AUTH_MODE", "shared-token")
-        kwargs: Dict[str, Any] = {"mode": mode}
+        kwargs: Dict[str, Any] = {
+            "mode": mode,
+            "trusted_proxies": parse_trusted_proxies(os.environ.get("FLUID_MCP_TRUSTED_PROXIES")),
+        }
         if mode == "shared-token":
             kwargs["shared_token"] = os.environ.get("FLUID_MCP_AUTH_TOKEN")
         elif mode == "jwt":
@@ -340,7 +388,78 @@ def _bearer_token(headers: Mapping[str, str]) -> Optional[str]:
     return None
 
 
-def extract_mtls_identity(headers: Mapping[str, str]) -> Dict[str, str]:
+def parse_trusted_proxies(value: Optional[str]) -> Tuple[TrustedNetwork, ...]:
+    """Parse ``FLUID_MCP_TRUSTED_PROXIES``: comma-separated IPs / CIDRs.
+
+    Same shape as uvicorn's ``--forwarded-allow-ips`` (``_TrustedHosts`` in
+    ``uvicorn/middleware/proxy_headers.py``), with three deliberate
+    differences. uvicorn keeps an unparseable entry as a literal string,
+    which its own source notes makes a typo impossible to notice; here a
+    malformed entry stops the gateway with :class:`AuthConfigError`.
+    ``*`` is refused: trusting every peer is exactly the posture this
+    setting exists to prevent, so an operator who means it must write
+    ``0.0.0.0/0,::/0``. And a host address with a prefix
+    (``10.0.4.17/8``) is refused rather than silently widened to its
+    network (``10.0.0.0/8``): it is almost always a typo for ``/32``, and
+    the widened reading trusts every peer in that range.
+
+    Unset or blank returns ``()`` — no peer is trusted.
+    """
+    if value is None or not value.strip():
+        return ()
+    networks = []
+    for raw in value.split(","):
+        entry = raw.strip()
+        try:
+            if not entry or entry == "*":
+                raise ValueError(entry)
+            network = ipaddress.ip_network(entry, strict=False)
+        except ValueError:
+            raise AuthConfigError(
+                f"FLUID_MCP_TRUSTED_PROXIES entry {entry!r} is not an IP address or "
+                "CIDR network; expected a comma-separated list of your proxies' "
+                "own addresses, such as '127.0.0.1' or '127.0.0.1,10.0.4.17/32'",
+                env_var="FLUID_MCP_TRUSTED_PROXIES",
+                value=value,
+                expected="comma-separated IP addresses or CIDR networks",
+            ) from None
+        if "/" in entry and network.network_address != ipaddress.ip_interface(entry).ip:
+            host = entry.split("/", 1)[0]
+            raise AuthConfigError(
+                f"FLUID_MCP_TRUSTED_PROXIES entry {entry!r} is a host address with a "
+                f"prefix, which would trust every peer in {str(network)!r}. Write "
+                f"{host!r} to trust only that proxy, or {str(network)!r} if you mean "
+                "the whole range",
+                env_var="FLUID_MCP_TRUSTED_PROXIES",
+                value=value,
+                expected="comma-separated IP addresses or CIDR networks",
+            )
+        networks.append(network)
+    return tuple(networks)
+
+
+def is_trusted_proxy(peer_host: Optional[str], trusted_proxies: Sequence[TrustedNetwork]) -> bool:
+    """True when ``peer_host`` (the TCP peer address) is inside a trusted
+    network. An unknown or non-IP peer is never trusted."""
+    if not peer_host or not trusted_proxies:
+        return False
+    try:
+        address = ipaddress.ip_address(peer_host)
+    except ValueError:
+        return False
+    return any(address in network for network in trusted_proxies)
+
+
+def _is_header_safe(value: str) -> bool:
+    return not any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
+def extract_mtls_identity(
+    headers: Mapping[str, str],
+    *,
+    peer_host: Optional[str] = None,
+    trusted_proxies: Sequence[TrustedNetwork] = (),
+) -> Dict[str, str]:
     """Read mTLS-from-proxy metadata (CN + fingerprint) into the
     caller_attributes shape so the gateway can stamp the client
     certificate identity onto the audit event alongside JWT claims.
@@ -348,17 +467,47 @@ def extract_mtls_identity(headers: Mapping[str, str]) -> Dict[str, str]:
     Both Caddy and nginx forward the verified client cert as
     ``X-Client-CN`` and ``X-Client-Fingerprint`` headers (see the
     proxy templates in ``examples/mcp-output-port-docker/proxy/``).
-    Missing headers return an empty dict — operators NOT running
-    behind an mTLS-terminating proxy don't see these fields, which
-    is correct.
+
+    The headers are believed ONLY when ``peer_host`` — the TCP peer, never
+    an ``X-Forwarded-For`` value — falls inside ``trusted_proxies``. Any
+    other caller could have written them itself, so for anyone else this
+    returns ``{}``; the defaults trust nobody. Values carrying control
+    characters are dropped too. Missing headers return ``{}``.
     """
+    if not is_trusted_proxy(peer_host, trusted_proxies):
+        return {}
     out: Dict[str, str] = {}
-    for header_name, attr_name in [
-        ("x-client-cn", "client_cn"),
-        ("x-client-fingerprint", "client_fingerprint"),
-    ]:
+    for header_name, attr_name in MTLS_IDENTITY_HEADERS:
         for key, value in headers.items():
-            if key.lower() == header_name and value:
+            if key.lower() == header_name and value and _is_header_safe(value):
                 out[attr_name] = value
                 break
     return out
+
+
+def has_mtls_identity_headers(headers: Mapping[str, str]) -> bool:
+    """True when any proxy-forwarded certificate header is present."""
+    names = {name for name, _ in MTLS_IDENTITY_HEADERS}
+    return any(key.lower() in names for key in headers)
+
+
+def ignored_mtls_headers_reason(
+    headers: Mapping[str, str],
+    *,
+    peer_host: Optional[str],
+    trusted_proxies: Sequence[TrustedNetwork],
+) -> str:
+    """Why :func:`extract_mtls_identity` returned nothing for headers that
+    :func:`has_mtls_identity_headers` saw: ``"unknown_peer"``,
+    ``"untrusted_peer"``, ``"empty"`` (a trusted proxy sent blank values) or
+    ``"control_characters"``. Mirrors the checks in
+    :func:`extract_mtls_identity` so the operator log names the real cause."""
+    if not peer_host:
+        return "unknown_peer"
+    if not is_trusted_proxy(peer_host, trusted_proxies):
+        return "untrusted_peer"
+    names = {name for name, _ in MTLS_IDENTITY_HEADERS}
+    values = [value for key, value in headers.items() if key.lower() in names]
+    if any(value and not _is_header_safe(value) for value in values):
+        return "control_characters"
+    return "empty"

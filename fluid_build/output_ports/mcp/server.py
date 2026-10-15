@@ -89,7 +89,7 @@ from ._expose_utils import (
     _jsonable,
     _summarise_arguments,
 )
-from .auth import JURISDICTION_ATTR
+from .auth import JURISDICTION_ATTR, MTLS_IDENTITY_ATTRS
 from .drivers import EngineDriver, build_driver
 from .policy import OutputPortPolicy
 from .query_compiler import QueryValidationError
@@ -487,6 +487,10 @@ class OutputPortMcpServer:
             # has already received this client's clientInfo + auth attrs
             # by the time we get here.
             model_id, use_case, caller_attributes = self._resolve_request_identity(request_context)
+            # Which layer authenticated this call (and, when a trusted proxy
+            # forwarded one, which client certificate) — stamped on every
+            # data_access record this call writes.
+            audit_identity = _audit_identity(request_context)
 
             # Open an OTel span around the full tool-call path so
             # operators can correlate gateway traffic with the rest
@@ -527,7 +531,7 @@ class OutputPortMcpServer:
                         "argumentSummary": _summarise_arguments(arguments),
                         "runId": self.state.run_id,
                     }
-                    self._write_audit(decision_payload)
+                    self._write_audit(decision_payload, identity=audit_identity)
                     _set_span_attrs(span, {"fluid.decision": "deny", "fluid.reason": rl_reason})
                     return _error_result(
                         {
@@ -549,7 +553,7 @@ class OutputPortMcpServer:
                     use_case=use_case,
                     caller_jurisdiction=self._resolve_verified_jurisdiction(request_context),
                 )
-                self._write_audit(decision_payload)
+                self._write_audit(decision_payload, identity=audit_identity)
                 _set_span_attrs(
                     span,
                     {
@@ -585,7 +589,8 @@ class OutputPortMcpServer:
                             "policySource": "circuit-breaker",
                             "argumentSummary": _summarise_arguments(arguments),
                             "runId": self.state.run_id,
-                        }
+                        },
+                        identity=audit_identity,
                     )
                     _set_span_attrs(
                         span, {"fluid.decision": "deny", "fluid.reason": "circuit-open"}
@@ -618,7 +623,8 @@ class OutputPortMcpServer:
                             "policySource": "token-budget",
                             "argumentSummary": _summarise_arguments(arguments),
                             "runId": self.state.run_id,
-                        }
+                        },
+                        identity=audit_identity,
                     )
                     _set_span_attrs(
                         span, {"fluid.decision": "deny", "fluid.reason": tok_reason or ""}
@@ -649,7 +655,10 @@ class OutputPortMcpServer:
                             self.state._actively_dispatching += 1
                             try:
                                 response = await self._dispatch_allowed_tool(
-                                    name, arguments, caller_attributes=caller_attributes
+                                    name,
+                                    arguments,
+                                    caller_attributes=caller_attributes,
+                                    audit_identity=audit_identity,
                                 )
                             finally:
                                 self.state._actively_dispatching = max(
@@ -659,7 +668,10 @@ class OutputPortMcpServer:
                         self.state._actively_dispatching += 1
                         try:
                             response = await self._dispatch_allowed_tool(
-                                name, arguments, caller_attributes=caller_attributes
+                                name,
+                                arguments,
+                                caller_attributes=caller_attributes,
+                                audit_identity=audit_identity,
                             )
                         finally:
                             self.state._actively_dispatching = max(
@@ -697,7 +709,8 @@ class OutputPortMcpServer:
                                 "policySource": "token-budget",
                                 "argumentSummary": _summarise_arguments(arguments),
                                 "runId": self.state.run_id,
-                            }
+                            },
+                            identity=audit_identity,
                         )
                         return _error_result(
                             {
@@ -771,7 +784,15 @@ class OutputPortMcpServer:
         So: when the transport stamps ``fluid_auth_kind`` (JWT / mTLS
         actually enforced), ONLY verified attributes bind. Self-attestation
         stays authoritative solely when no auth is configured — the
-        pre-existing no-auth behaviour, unchanged.
+        pre-existing no-auth behaviour — with one exception below.
+
+        **Certificate attributes are verified-only in every mode.**
+        ``client_cn`` / ``client_fingerprint`` name a client certificate, and
+        only the trusted mTLS proxy can vouch for one. They are dropped from
+        the self-attested tier whatever the auth mode, so with auth off a
+        ``${caller.client_cn}`` rowFilter fails closed instead of selecting
+        the rows of whichever CN the client typed. ``jurisdiction`` has the
+        same rule for its gate (:meth:`_resolve_verified_jurisdiction`).
         """
         model_id: Optional[str] = None
         use_case: Optional[str] = None
@@ -840,6 +861,15 @@ class OutputPortMcpServer:
                     attrs[key] = value
         except Exception as exc:  # noqa: BLE001
             self.state.logger.debug("output_port_identity_capability_failed: %s", exc)
+        self_attested_certs = sorted(MTLS_IDENTITY_ATTRS.intersection(attrs))
+        for name in self_attested_certs:
+            del attrs[name]
+        if self_attested_certs:
+            self.state.logger.debug(
+                "output_port_identity_self_attested_certificate_ignored: dropped=%s "
+                "(certificate attributes bind only from a trusted proxy)",
+                self_attested_certs,
+            )
         try:
             request = getattr(ctx, "request", None)
             scope = getattr(request, "scope", None) or {}
@@ -990,7 +1020,11 @@ class OutputPortMcpServer:
         }
         return payload, allowed, reason
 
-    def _write_audit(self, payload: Mapping[str, Any]) -> None:
+    def _write_audit(
+        self, payload: Mapping[str, Any], *, identity: Optional[Mapping[str, Any]] = None
+    ) -> None:
+        if identity:
+            payload = {**payload, **identity}
         try:
             # Honour FLUID_AUDIT_ROOT so operators can redirect to a
             # SIEM-forwarded path; the writer falls back to
@@ -1007,7 +1041,12 @@ class OutputPortMcpServer:
     # ------------------------------------------------------------------
 
     async def _dispatch_allowed_tool(
-        self, name: str, arguments: Dict[str, Any], *, caller_attributes: Dict[str, Any]
+        self,
+        name: str,
+        arguments: Dict[str, Any],
+        *,
+        caller_attributes: Dict[str, Any],
+        audit_identity: Optional[Mapping[str, Any]] = None,
     ) -> List[TextContent] | CallToolResult:
         """Dispatch a tool that has cleared the policy gate.
 
@@ -1114,7 +1153,8 @@ class OutputPortMcpServer:
                         "policySource": self.state.policy.policy_source,
                         "annotatedMessage": full_message,
                         "argumentSummary": _summarise_arguments(arguments),
-                    }
+                    },
+                    identity=audit_identity,
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -1234,6 +1274,30 @@ def run_stdio(
 # ---------------------------------------------------------------------
 # Tool/resource rendering helpers (sync, no SDK state)
 # ---------------------------------------------------------------------
+
+
+def _audit_identity(request_context: Any) -> Dict[str, Any]:
+    """The authentication facts a ``data_access`` record carries.
+
+    ``authKind`` is the layer the transport middleware verified
+    (``shared-token`` / ``jwt``), or ``none`` when no auth ran (stdio, or
+    HTTP without auth configured). ``clientCertCn`` /
+    ``clientCertFingerprint`` appear only when a proxy listed in
+    ``FLUID_MCP_TRUSTED_PROXIES`` forwarded them — read from
+    ``fluid_mtls_identity``, which the middleware writes for exactly that
+    case, never from the self-attested tier or a token claim.
+    """
+    request = getattr(request_context, "request", None)
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, Mapping):
+        return {"authKind": "none"}
+    identity: Dict[str, Any] = {"authKind": str(scope.get("fluid_auth_kind") or "none")}
+    mtls = scope.get("fluid_mtls_identity") or {}
+    if mtls.get("client_cn"):
+        identity["clientCertCn"] = str(mtls["client_cn"])
+    if mtls.get("client_fingerprint"):
+        identity["clientCertFingerprint"] = str(mtls["client_fingerprint"])
+    return identity
 
 
 def _render_tools(expose: Mapping[str, Any], policy: OutputPortPolicy) -> List[Tool]:

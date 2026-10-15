@@ -65,8 +65,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 
+from fluid_build.output_ports.mcp.auth import MTLS_IDENTITY_ATTRS
 from fluid_build.providers._sql_safety import (
     validate_ident,
     validate_sql_expression_allowlist,
@@ -268,6 +269,20 @@ _VALUE_REVEALING_AGGS = frozenset({"min", "max", "median", "percentile"})
 _PARAM_PLACEHOLDER_RE = re.compile(r":p_(\d+)\b")
 
 
+def _missing_attr_hint(attr: str) -> str:
+    """Operator hint for a missing certificate attribute. ``client_cn`` /
+    ``client_fingerprint`` come only from a proxy listed in
+    ``FLUID_MCP_TRUSTED_PROXIES``; without that hint an operator who has not
+    yet listed their proxy sees a bare denial."""
+    if attr not in MTLS_IDENTITY_ATTRS:
+        return ""
+    return (
+        f". caller.{attr} is set only from the X-Client-CN / X-Client-Fingerprint "
+        "headers of a request whose TCP peer is listed in FLUID_MCP_TRUSTED_PROXIES; "
+        "the gateway log names the peer when it ignores them"
+    )
+
+
 def _resolve_caller_placeholder(value: Any, caller_attributes: Mapping[str, Any]) -> Any:
     """Replace ``${caller.<attr>}`` tokens in ``value`` with values from
     ``caller_attributes``. Lists / tuples recurse; non-string scalars pass
@@ -281,12 +296,36 @@ def _resolve_caller_placeholder(value: Any, caller_attributes: Mapping[str, Any]
         if attr not in caller_attributes:
             raise RowFilterIdentityMissing(
                 f"rowFilter references caller.{attr} but caller_attributes "
-                f"only carry: {sorted(caller_attributes)}"
+                f"only carry: {sorted(caller_attributes)}{_missing_attr_hint(attr)}"
             )
         return caller_attributes[attr]
     if isinstance(value, (list, tuple)):
         return [_resolve_caller_placeholder(v, caller_attributes) for v in value]
     return value
+
+
+def row_filter_caller_attributes(expose: Mapping[str, Any]) -> FrozenSet[str]:
+    """The ``${caller.<attr>}`` names ``expose.policy.rowFilters[]`` reads,
+    walking ``equals`` and ``in`` values the same way
+    :func:`compile_row_filter_clauses` resolves them. Lets the CLI refuse at
+    startup a configuration in which a required attribute can never bind."""
+    found: Set[str] = set()
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, str):
+            match = _CALLER_PLACEHOLDER.fullmatch(value)
+            if match is not None:
+                found.add(match.group(1))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                _walk(item)
+
+    for entry in (expose.get("policy") or {}).get("rowFilters") or []:
+        if isinstance(entry, Mapping):
+            for operator in ("equals", "in"):
+                if operator in entry:
+                    _walk(entry[operator])
+    return frozenset(found)
 
 
 def _quote_filter_identifier(column: str, dialect: Optional[str]) -> str:

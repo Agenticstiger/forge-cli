@@ -9,7 +9,9 @@
 #      the forge-docs repo for cmds).
 #   3. Drop the CA pem at /etc/ssl/forge-mcp/clients-ca.pem.
 #   4. Set FLUID_MCP_AUTH_TOKEN in the gateway environment to a
-#      shared secret you also configure on the trusted clients.
+#      shared secret you also configure on the trusted clients, and
+#      FLUID_MCP_TRUSTED_PROXIES=127.0.0.1 so the gateway honours the
+#      X-Client-CN / X-Client-Fingerprint headers this proxy sets.
 #   5. caddy run --config Caddyfile (binds :443).
 #
 # Why mTLS + bearer-token + agentPolicy: every layer protects against
@@ -63,7 +65,8 @@ mcp.your-domain.example {
         # Forward the client cert subject to the gateway as a header
         # so the gateway can stamp it onto the audit event for
         # cryptographic identity attribution beyond what the bearer
-        # token alone gives.
+        # token alone gives. The gateway believes these only from a peer
+        # in FLUID_MCP_TRUSTED_PROXIES (here 127.0.0.1).
         header_up X-Client-CN {tls_client_subject}
         header_up X-Client-Fingerprint {tls_client_fingerprint}
     }

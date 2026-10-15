@@ -36,6 +36,7 @@ from fluid_build.output_ports.mcp.auth import (
     AuthDecision,
     AuthValidator,
     extract_mtls_identity,
+    parse_trusted_proxies,
 )
 
 # ---------------------------------------------------------------------
@@ -283,12 +284,21 @@ def test_extract_mtls_identity_reads_proxy_forwarded_headers():
         "X-Client-Fingerprint": "deadbeefcafe1234",
         "Authorization": "Bearer xyz",
     }
-    attrs = extract_mtls_identity(headers)
+    # Read only from a trusted proxy peer — see test_mcp_trusted_proxies.py.
+    attrs = extract_mtls_identity(
+        headers, peer_host="127.0.0.1", trusted_proxies=parse_trusted_proxies("127.0.0.1")
+    )
     assert attrs == {"client_cn": "CN=alice,O=acme", "client_fingerprint": "deadbeefcafe1234"}
 
 
 def test_extract_mtls_identity_empty_when_proxy_didnt_forward():
-    assert extract_mtls_identity({"Authorization": "Bearer xyz"}) == {}
+    trusted = parse_trusted_proxies("127.0.0.1")
+    assert (
+        extract_mtls_identity(
+            {"Authorization": "Bearer xyz"}, peer_host="127.0.0.1", trusted_proxies=trusted
+        )
+        == {}
+    )
 
 
 # ---------------------------------------------------------------------
