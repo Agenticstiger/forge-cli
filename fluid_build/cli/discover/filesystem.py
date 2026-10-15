@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import List
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from .registry import DiscoveredColumn, DiscoveredStream, Discoverer
 
@@ -43,7 +43,7 @@ class FilesystemDiscoverer(Discoverer):
             cols = _columns_for(f, fmt)
             streams.append(
                 DiscoveredStream(
-                    name=Path(f).stem,
+                    name=_stream_name(f),
                     columns=cols,
                     metadata={"path": f, "format": fmt},
                 )
@@ -76,8 +76,29 @@ def _expand_glob(uri: str) -> List[str]:
     raise FileNotFoundError(uri)
 
 
+def _file_path(location: str) -> PurePosixPath:
+    """The file part of ``location``: for a URL, its path alone.
+
+    A URL's query string and fragment are not part of the file's name. Read as a
+    plain path they would be (``orders.csv?sig=...`` has the stem ``orders`` and
+    the suffix ``.csv?sig=...``, and a "/" inside the query starts a new segment),
+    and the stream name becomes the contract's name and file name.
+    """
+    if "://" in location:
+        return PurePosixPath(urlsplit(location).path)
+    return PurePosixPath(Path(location).as_posix())
+
+
+def _stream_name(location: str) -> str:
+    """The file's stem; for a URL with no file in its path, the host."""
+    stem = _file_path(location).stem
+    if stem or "://" not in location:
+        return stem
+    return urlsplit(location).hostname or "stream"
+
+
 def _format_for(path: str) -> str:
-    suffix = Path(path).suffix.lower().lstrip(".")
+    suffix = _file_path(path).suffix.lower().lstrip(".")
     if suffix in ("csv",):
         return "csv"
     if suffix in ("parquet", "pq"):
