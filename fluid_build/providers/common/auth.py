@@ -15,10 +15,33 @@
 """Authentication utilities for API access"""
 
 import os
-from typing import Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 
-def get_auth_headers(endpoint: str, auth_config: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def _credential(value: Any) -> Optional[str]:
+    """``value`` when it is a non-empty string; anything else is no credential.
+
+    ``false``, ``0``, ``[]`` or ``!!binary ""`` from a YAML config carry no
+    credential, and neither does a number or a list: a header value is a
+    string, and every falsy one used to read as "missing" and be refilled
+    from the environment.
+    """
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _env_credential(env_var: str, env_fallback: bool) -> Optional[str]:
+    """``env_var``'s value when the caller may fall back to the environment and it is set."""
+    return (os.getenv(env_var) or None) if env_fallback else None
+
+
+def get_auth_headers(
+    endpoint: str,
+    auth_config: Optional[Mapping[str, Any]] = None,
+    *,
+    env_fallback: bool = True,
+) -> Dict[str, str]:
     """Generate authentication headers for API requests
 
     Supports multiple auth methods:
@@ -34,19 +57,24 @@ def get_auth_headers(endpoint: str, auth_config: Optional[Dict[str, str]] = None
             - token: Bearer token value
             - username: Basic auth username
             - password: Basic auth password
+        env_fallback: Whether a credential the block does not carry (anything
+            but a non-empty string) is read from FLUID_API_KEY /
+            FLUID_BEARER_TOKEN. ``False`` for an endpoint a config file in the
+            checkout named (``CatalogConfig.project_endpoint_file``): the
+            runner's credential never goes there, whatever the block holds.
 
     Returns:
         Dictionary of HTTP headers
     """
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
-    if not auth_config:
+    if not isinstance(auth_config, Mapping) or not auth_config:
         # Try environment variables as fallback
-        api_key = os.getenv("FLUID_API_KEY")
+        api_key = _env_credential("FLUID_API_KEY", env_fallback)
         if api_key:
             headers["X-API-Key"] = api_key
 
-        bearer_token = os.getenv("FLUID_BEARER_TOKEN")
+        bearer_token = _env_credential("FLUID_BEARER_TOKEN", env_fallback)
         if bearer_token:
             headers["Authorization"] = f"Bearer {bearer_token}"
 
@@ -55,12 +83,16 @@ def get_auth_headers(endpoint: str, auth_config: Optional[Dict[str, str]] = None
     auth_type = auth_config.get("type", "api_key")
 
     if auth_type == "api_key":
-        api_key = auth_config.get("api_key") or os.getenv("FLUID_API_KEY")
+        api_key = _credential(auth_config.get("api_key")) or _env_credential(
+            "FLUID_API_KEY", env_fallback
+        )
         if api_key:
             headers["X-API-Key"] = api_key
 
     elif auth_type == "bearer":
-        token = auth_config.get("token") or os.getenv("FLUID_BEARER_TOKEN")
+        token = _credential(auth_config.get("token")) or _env_credential(
+            "FLUID_BEARER_TOKEN", env_fallback
+        )
         if token:
             headers["Authorization"] = f"Bearer {token}"
 

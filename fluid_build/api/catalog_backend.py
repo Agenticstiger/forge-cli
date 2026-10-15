@@ -197,8 +197,11 @@ def all_catalog_backend_specs() -> List[CatalogBackendSpec]:
     return out
 
 
-def apply_env_overrides(name: str, catalog_config: Dict[str, Any]) -> None:
+def apply_env_overrides(name: str, catalog_config: Dict[str, Any]) -> List[str]:
     """Apply the env-var → config-key mapping from the spec in place.
+
+    Returns the config keys it wrote, so that ``config_manager`` can tell
+    which values in the block are the environment's.
 
     No-op when *name* isn't registered (preserves the surrounding
     legacy native-provider env-var blocks in ``config_manager`` that
@@ -206,13 +209,16 @@ def apply_env_overrides(name: str, catalog_config: Dict[str, Any]) -> None:
     """
     spec = _BACKENDS.get(name)
     if spec is None:
-        return
+        return []
+    written: List[str] = []
     for config_key, env_names in spec.env_vars.items():
         for env in env_names:
             value = os.environ.get(env)
             if value:
                 catalog_config[config_key] = value
+                written.append(config_key)
                 break
+    return written
 
 
 __all__ = [

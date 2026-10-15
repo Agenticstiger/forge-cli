@@ -340,9 +340,17 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
         # product's stored ``contract_hash`` says the contract has not changed.
         self.force_contract_sync = bool(config.get("force_contract_sync", False))
 
+    def _auth_headers(self) -> Dict[str, str]:
+        """The credential headers: from the auth block, and from FLUID_API_KEY /
+        FLUID_BEARER_TOKEN only for the operator's own endpoint, never for one
+        the checkout's project config named."""
+        return get_auth_headers(
+            self.endpoint, self.auth, env_fallback=self.project_endpoint_file is None
+        )
+
     def _headers(self) -> Dict[str, str]:
         """Auth headers plus ``X-Organization-Id`` once the organization is known."""
-        headers = get_auth_headers(self.endpoint, self.auth)
+        headers = self._auth_headers()
         org_id = self._organization_id
         if org_id is None and self._configured_org_id and _is_valid_org_id(self._configured_org_id):
             org_id = self._configured_org_id
@@ -476,7 +484,7 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
         server listed in all, so the caller can tell a dropped entry from a
         missing one.
         """
-        headers = get_auth_headers(self.endpoint, self.auth)
+        headers = self._auth_headers()
         if not (headers.get("X-API-Key") or headers.get("Authorization")):
             raise CommandCenterCredentialMissingError(
                 "No Command Center credential is configured, so its organizations cannot "

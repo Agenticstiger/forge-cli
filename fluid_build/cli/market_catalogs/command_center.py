@@ -68,10 +68,15 @@ class CommandCenterConnector(BaseCatalogConnector):
             self.base_url = cc.get_catalog_url()
             self.cc_client = cc
 
-            # Initialize aiohttp session
+            # Initialize aiohttp session. Every request on it follows a
+            # redirect only within the Command Center's origin: the client's
+            # probes passed the host gate for that origin, not for wherever
+            # the Command Center redirects (the reporter's redirect rule).
             import aiohttp
 
-            self.session = aiohttp.ClientSession()
+            from fluid_build.observability.reporter import foreign_redirect_trace_config
+
+            self.session = aiohttp.ClientSession(trace_configs=[foreign_redirect_trace_config()])
 
             self.logger.info(f"Connected to Command Center catalog: {self.base_url}")
             return True

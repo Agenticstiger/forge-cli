@@ -31,7 +31,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # NOTE: ``requests`` (~107 modules incl urllib3/certifi/charset_normalizer) is
 # resolved lazily — at import time it would land on the cold ``fluid --help``
@@ -125,8 +125,99 @@ def _is_requests_exception(exc: BaseException, name: str) -> bool:
     return bool(exc_type and isinstance(exc, exc_type))
 
 
-def _marketplace_request(request_func, url: str, logger: logging.Logger, **kwargs):
-    """Run a marketplace HTTP request with bounded timeout and one transient retry."""
+class NamedRegistryURL(str):
+    """A marketplace URL the operator named as a blueprint registry.
+
+    ``FLUID_API_URL``, or ``FLUID_PUBLIC_REGISTRY`` with
+    ``FLUID_MARKETPLACE_FALLBACK=public`` (:func:`get_api_url`): a registry,
+    not the Command Center, so a request to it that carries nothing (a search,
+    a blueprint lookup) may follow a redirect to another origin, as a registry
+    that moved host needs. A plain ``str``, such as the Command Center's
+    marketplace URL, gets no such leeway.
+    """
+
+    __slots__ = ()
+
+
+# The headers ``requests`` sends on every request of its own accord
+# (``requests.utils.default_headers``,
+# https://github.com/psf/requests/blob/main/src/requests/utils.py). Any other
+# header may carry a credential, and on a hop to another host ``requests``
+# re-derives only ``Authorization`` (``Session.rebuild_auth``) and ``Cookie``
+# (``Session.resolve_redirects``): an ``X-API-Key`` would go on with it. So a
+# request with any other header counts as carrying one.
+_DEFAULT_REQUEST_HEADERS = frozenset({"user-agent", "accept-encoding", "accept", "connection"})
+
+
+def _carries_anything(request: Any) -> bool:
+    """Whether a prepared request has a body or a header beyond requests' defaults."""
+    return request.body is not None or any(
+        name.lower() not in _DEFAULT_REQUEST_HEADERS for name in request.headers
+    )
+
+
+def _named_registry_redirect_hook() -> Callable[..., Any]:
+    """A response hook for one call to a named registry: ``refuse_foreign_redirect``
+    if the call's first request carries a body or a header of its own.
+
+    A call whose first request has neither (only ``requests``' default
+    headers) is followed wherever it goes, as main did: nothing in it is the
+    operator's. One with a body (the instantiate POST, the operator's
+    parameters) or any other header (Authorization from ``auth`` or
+    ``~/.netrc``, X-API-Key, a cookie the caller passes) still stops at the
+    origin.
+
+    Judged once, on the first request: ``requests`` runs a call's response
+    hooks on every hop, the first response's first. A later hop's prepared
+    request may carry headers ``requests`` adds of its own accord, none of
+    them the operator's for the next origin, and each recomputed for each
+    next URL: the ``Cookie`` it builds from the call's own jar, which holds
+    the cookies this redirect chain set (``Session.resolve_redirects``;
+    ``requests.get`` uses a fresh session); for an http:// URL, the
+    ``Proxy-Authorization`` of the operator's proxy
+    (``Session.rebuild_proxies``), which goes to the proxy, not the origin;
+    and an ``Authorization`` that ``~/.netrc`` binds to the hop's own host
+    (``Session.rebuild_auth``, which drops it when the host changes).
+    Judging every hop afresh read the first two as the operator's and
+    stopped a registry that set a cookie, or was reached through an
+    authenticated proxy, before it moved host. One hook per call: the
+    verdict belongs to that call's redirect chain.
+    """
+    from fluid_build.observability.reporter import refuse_foreign_redirect
+
+    verdict: List[bool] = []
+
+    def hook(response: Any, *args: Any, **kwargs: Any) -> Any:
+        if not verdict:
+            verdict.append(_carries_anything(response.request))
+        if response.is_redirect and verdict[0]:
+            return refuse_foreign_redirect(response, *args, **kwargs)
+        return response
+
+    return hook
+
+
+def _marketplace_request(
+    request_func, url: str, logger: logging.Logger, *, named_registry: bool = False, **kwargs
+):
+    """Run a marketplace HTTP request with bounded timeout and one transient retry.
+
+    A redirect is followed only within the marketplace's origin (the
+    reporter's redirect rule, ``refuse_foreign_redirect``, as for the Command
+    Center client's probes): neither a search nor the instantiate POST, which
+    carries the operator's parameters, goes on to another origin. The refusal
+    is raised as a ``RequestException``, which every caller reports.
+
+    ``named_registry`` says ``url`` is in a registry the operator named
+    (:class:`NamedRegistryURL`), not the Command Center: there a request with
+    no body and no header of its own follows a redirect to another origin, as
+    on main (:func:`_named_registry_redirect_hook`).
+    """
+    from fluid_build.observability.reporter import (
+        CredentialRedirectRefused,
+        refuse_foreign_redirect,
+    )
+
     timeout = kwargs.pop("timeout", MARKETPLACE_HTTP_TIMEOUT_SECONDS)
     request_error = _requests_exception_type("RequestException") or Exception
     transient_errors = tuple(
@@ -139,8 +230,12 @@ def _marketplace_request(request_func, url: str, logger: logging.Logger, **kwarg
     )
 
     for attempt in range(MARKETPLACE_HTTP_RETRIES + 1):
+        # A retry is a new redirect chain, judged afresh.
+        hook = _named_registry_redirect_hook() if named_registry else refuse_foreign_redirect
         try:
-            return request_func(url, timeout=timeout, **kwargs)
+            return request_func(url, timeout=timeout, hooks={"response": hook}, **kwargs)
+        except CredentialRedirectRefused as exc:
+            raise request_error(f"not following the redirect: {exc}") from exc
         except request_error as exc:
             is_transient = bool(transient_errors and isinstance(exc, transient_errors))
             if not is_transient or attempt >= MARKETPLACE_HTTP_RETRIES:
@@ -347,7 +442,7 @@ def get_api_url(logger: Optional[logging.Logger] = None, *, required: bool = Tru
     env_url = os.getenv("FLUID_API_URL")
     if env_url:
         logger.debug(f"Using explicit API URL from environment: {env_url}")
-        return env_url
+        return NamedRegistryURL(env_url)
 
     # Priority 2: Command Center (auto-detected)
     import fluid_build.cli.marketplace as _self
@@ -385,7 +480,7 @@ def get_api_url(logger: Optional[logging.Logger] = None, *, required: bool = Tru
                     logger.debug(f"Local cache not found: {fallback_url}")
             else:
                 console.print(f"[yellow]⚠️  Using fallback registry: {fallback_url}[/yellow]")
-                return fallback_url
+                return NamedRegistryURL(fallback_url)
 
     # No sources available. When the caller can fall back to bundled
     # blueprints, stay quiet and let it decide what to show.
@@ -477,7 +572,12 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
     registry_total = 0
     if api_url:
         try:
-            response = _marketplace_get(api_url, logger, params=params)
+            response = _marketplace_get(
+                api_url,
+                logger,
+                named_registry=isinstance(api_url, NamedRegistryURL),
+                params=params,
+            )
             response.raise_for_status()
             data = response.json()
             registry = data.get("items", [])
@@ -582,7 +682,12 @@ def show_blueprint_info(args, logger: logging.Logger, api_url: str) -> int:
         if getattr(args, "version", None):
             params["version"] = args.version
         try:
-            response = _marketplace_get(f"{api_url}/{args.blueprint_id}", logger, params=params)
+            response = _marketplace_get(
+                f"{api_url}/{args.blueprint_id}",
+                logger,
+                named_registry=isinstance(api_url, NamedRegistryURL),
+                params=params,
+            )
             response.raise_for_status()
             bp = response.json()
         except requests.exceptions.RequestException as e:
@@ -693,7 +798,11 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
         bp = bundled_bp
     else:
         try:
-            response = _marketplace_get(f"{api_url}/{args.blueprint_id}", logger)
+            response = _marketplace_get(
+                f"{api_url}/{args.blueprint_id}",
+                logger,
+                named_registry=isinstance(api_url, NamedRegistryURL),
+            )
             response.raise_for_status()
             bp = response.json()
         except requests.exceptions.RequestException as e:

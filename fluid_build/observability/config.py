@@ -24,15 +24,19 @@ from typing import Dict, Optional
 import yaml
 
 
-def _safe_home_dir() -> Path:
-    """Resolve a usable home directory even in restricted environments."""
+def _safe_home_dir() -> Optional[Path]:
+    """The home directory, or ``None`` when there is none.
+
+    Never the working directory: that is the checkout being built, and its
+    ``.fluid/config.yaml`` is a project config, not the operator's. Without a
+    home there is no operator config file; the environment still configures
+    the Command Center.
+    """
     try:
         return Path.home()
     except Exception:
         env_home = os.getenv("HOME") or os.getenv("USERPROFILE")
-        if env_home:
-            return Path(env_home)
-        return Path.cwd()
+        return Path(env_home) if env_home else None
 
 
 @dataclass
@@ -86,8 +90,9 @@ class CommandCenterConfig:
         config = cls()
 
         # Load from config file
-        config_file = _safe_home_dir() / ".fluid" / "config.yaml"
-        if config_file.exists():
+        home = _safe_home_dir()
+        config_file = home / ".fluid" / "config.yaml" if home is not None else None
+        if config_file is not None and config_file.exists():
             try:
                 with open(config_file, encoding="utf-8") as f:
                     yaml_config = yaml.safe_load(f) or {}

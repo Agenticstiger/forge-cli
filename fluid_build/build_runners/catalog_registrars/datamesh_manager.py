@@ -73,11 +73,19 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
     auto_approve_access: bool = False
 
     def __post_init__(self) -> None:
-        # Late env-var fallback so env state at register-time wins.
-        self.api_url = (
-            self.api_url or os.environ.get("DMM_API_URL") or "https://api.datamesh-manager.com"
-        )
-        self.api_token = self.api_token or os.environ.get("DMM_API_KEY")
+        # A blank token is no token: it must not read as "set" to the checks
+        # below, nor go out as an empty ``Authorization`` header.
+        if self.api_token is not None and not str(self.api_token).strip():
+            self.api_token = None
+        # Late env-var fallback so env state at register-time wins, for the
+        # endpoint and its key together: DMM_API_KEY goes only to the endpoint
+        # from DMM_API_URL (or the default). An endpoint handed in may be one a
+        # project config in the checkout named (``config_manager`` resolves
+        # it, and gives it only a key that same file carries), so it is never
+        # paired with the runner's key here.
+        if not self.api_url:
+            self.api_url = os.environ.get("DMM_API_URL") or "https://api.datamesh-manager.com"
+            self.api_token = self.api_token or os.environ.get("DMM_API_KEY")
         # Env-var fallback for auto-approve. Explicit constructor value wins;
         # the env var only fires when not set (i.e. default False).
         if not self.auto_approve_access:

@@ -21,11 +21,23 @@ accepted config shapes" logic per backend.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+#: Where :func:`pick_token` looks for the token, in order. ``config_manager``
+#: reads it too, to tell whether a block carries a credential of its own.
+TOKEN_SLOTS: Tuple[Tuple[str, ...], ...] = (
+    ("api_token",),
+    ("token",),
+    ("auth", "api_token"),
+    ("auth", "token"),
+    ("auth", "api_key"),
+    ("auth", "bearer_token"),
+)
 
 
 def pick_token(config: Dict[str, Any]) -> Optional[str]:
-    """Pull an API token out of *config* in any of the accepted shapes:
+    """Pull an API token out of *config* in any of the accepted shapes
+    (:data:`TOKEN_SLOTS`, first match wins):
 
     - top-level ``api_token`` / ``token``
     - nested ``auth.api_token`` / ``auth.token`` / ``auth.api_key`` /
@@ -33,18 +45,20 @@ def pick_token(config: Dict[str, Any]) -> Optional[str]:
 
     Returns ``None`` when nothing is set so the registrar omits the
     ``Authorization`` header (matches the registrar's own behaviour for
-    unauthenticated targets in tests).
+    unauthenticated targets in tests). A value that is only whitespace is
+    not set either: it would go out as an empty bearer token. Nor is a
+    boolean (YAML's ``true`` / ``yes`` / ``on``): it is no credential, as
+    for the Command Center (``providers.common.auth``), so a later slot,
+    such as the ``auth.api_key`` that DMM_API_KEY fills, applies instead of
+    ``Bearer True``.
     """
-    for key in ("api_token", "token"):
-        v = config.get(key)
-        if v:
+    for slot in TOKEN_SLOTS:
+        holder: Any = config
+        for key in slot[:-1]:
+            holder = holder.get(key) if isinstance(holder, dict) else None
+        v = holder.get(slot[-1]) if isinstance(holder, dict) else None
+        if v and not isinstance(v, bool) and str(v).strip():
             return str(v)
-    auth = config.get("auth") or {}
-    if isinstance(auth, dict):
-        for key in ("api_token", "token", "api_key", "bearer_token"):
-            v = auth.get(key)
-            if v:
-                return str(v)
     return None
 
 

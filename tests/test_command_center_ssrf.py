@@ -41,7 +41,7 @@ from fluid_build.observability.reporter import (
     _command_center_host_allowed as _cc_reporter_gate,
 )
 
-_CLIENT_PRIV = "fluid_build.cli._command_center._hostname_is_private"
+_CLIENT_PRIV = "fluid_build.observability.reporter._hostname_is_private"  # one gate
 # reporter.py imports ``_hostname_is_private`` at top level from
 # the tier-0 ``fluid_build._net`` leaf (PR #139 fixed the structural
 # observability ↔ build_runners cycle, so the previous lazy import

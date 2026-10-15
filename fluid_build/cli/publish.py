@@ -401,40 +401,27 @@ async def publish_contract(
             error=f"Failed to load contract: {e}",
         )
 
+    catalog_config, config_error = _publish_catalog_config(
+        config, catalog_name, endpoint_override, verbose
+    )
+    if config_error:
+        return PublishResult(
+            success=False,
+            catalog_id=catalog_name,
+            asset_id=contract.get("id", str(contract_path)),
+            error=config_error,
+        )
+
     # Resolve {{ env.VAR }} templates across the whole contract before the
     # catalog adapter forwards it downstream. Without this, raw placeholders
     # land in the DMM server block (plan/apply resolve them per-string at the
-    # Snowflake boundary — publish has no such boundary).
-    contract = resolve_contract_env_templates(contract)
-
-    # Get catalog config
-    catalog_config = config.get_catalog_config(catalog_name)
-    if not catalog_config and not endpoint_override:
-        return PublishResult(
-            success=False,
-            catalog_id=catalog_name,
-            asset_id=contract.get("id", str(contract_path)),
-            error=f"Catalog '{catalog_name}' not configured",
-        )
-
-    # Apply per-invocation endpoint override (from ``--target name:endpoint``).
-    # Shallow-copy so we don't mutate the shared config dict across targets.
-    # The override is intentionally allowed to seed an otherwise-empty
-    # config so ``--target datahub:https://datahub.company.com`` works
-    # without a prior YAML / env-var setup.
-    if endpoint_override:
-        catalog_config = dict(catalog_config) if catalog_config else {}
-        catalog_config["endpoint"] = endpoint_override
-        if verbose:
-            logger.info(f"🔧 {catalog_name}: endpoint overridden to {endpoint_override}")
-
-    if not catalog_config.get("enabled", True):
-        return PublishResult(
-            success=False,
-            catalog_id=catalog_name,
-            asset_id=contract.get("id", str(contract_path)),
-            error=f"Catalog '{catalog_name}' is disabled in configuration",
-        )
+    # Snowflake boundary — publish has no such boundary). Not for an endpoint
+    # the checkout named: the runner's environment is not the checkout's to send.
+    project_file = getattr(catalog_config, "project_endpoint_file", None)
+    if project_file:
+        _warn_env_templates_kept(catalog_name, project_file, contract)
+    else:
+        contract = resolve_contract_env_templates(contract)
 
     # Create provider instance
     try:
@@ -528,6 +515,95 @@ async def publish_contract(
     return result
 
 
+def _publish_catalog_config(
+    config: FluidConfig, catalog_name: str, endpoint_override: Optional[str], verbose: bool
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """The catalog configuration to publish with, or why there is none.
+
+    An endpoint named by the project config (a file in the checkout) gets only
+    the credentials that file carries itself: refuse, saying what to do, rather
+    than publish without the credential the operator expects. Such an endpoint
+    must also pass the host gate ``fluid apply`` applies before its Command
+    Center report. A ``--target name:endpoint`` override, the environment and
+    the user config are the operator's own and trusted as they are.
+    """
+    from fluid_build.config_manager import UntrustedCatalogEndpoint
+
+    try:
+        catalog_config = config.get_catalog_config(catalog_name, endpoint=endpoint_override)
+    except UntrustedCatalogEndpoint as exc:
+        return {}, f"Catalog '{catalog_name}': {exc}"
+    if not catalog_config and not endpoint_override:
+        return {}, f"Catalog '{catalog_name}' not configured"
+
+    # Apply per-invocation endpoint override (from ``--target name:endpoint``).
+    # Copy so we don't mutate the shared config dict across targets. The
+    # override is intentionally allowed to seed an otherwise-empty config so
+    # ``--target datahub:https://datahub.company.com`` works without a prior
+    # YAML / env-var setup.
+    if endpoint_override:
+        catalog_config = dict(catalog_config) if catalog_config else {}
+        catalog_config["endpoint"] = endpoint_override
+        if verbose:
+            from fluid_build.observability.reporter import endpoint_origin
+
+            logger.info(
+                f"🔧 {catalog_name}: endpoint overridden to {endpoint_origin(endpoint_override)}"
+            )
+
+    if not catalog_config.get("enabled", True):
+        return catalog_config, f"Catalog '{catalog_name}' is disabled in configuration"
+    if getattr(catalog_config, "project_endpoint_file", None):
+        from fluid_build.observability.reporter import project_endpoint_refusal
+
+        return catalog_config, project_endpoint_refusal(catalog_name, catalog_config)
+    return catalog_config, None
+
+
+def _warn_env_templates_kept(catalog_name: str, project_file: str, contract: Any) -> None:
+    """Say that ``{{ env.* }}`` stays literal for an endpoint the checkout named."""
+    from fluid_build.providers.snowflake.util.config import ENV_TEMPLATE_RE
+
+    names: List[str] = []
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                _walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+        elif isinstance(value, str):
+            names.extend(m.strip() for m in ENV_TEMPLATE_RE.findall(value))
+
+    _walk(contract)
+    if names:
+        logger.warning(
+            "Catalog %s: the endpoint comes from the project config %s, so %s in the "
+            "contract are sent as written, not filled from the environment. To fill "
+            "them, set the endpoint through its environment variable or in "
+            "~/.fluid/config.yaml.",
+            catalog_name,
+            project_file,
+            ", ".join("{{ env.%s }}" % n for n in dict.fromkeys(names)),
+        )
+
+
+def _display_url(url: Optional[str]) -> Optional[str]:
+    """``url`` without userinfo, query or fragment, where a credential can ride."""
+    if not url:
+        return url
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.hostname:
+        return url
+    return urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))
+
+
 def format_results(
     results: List[PublishResult], format: str = "text", console: Optional[Console] = None
 ) -> str:
@@ -588,7 +664,11 @@ def format_results(
 
             for r in results:
                 status = "✅ Success" if r.success else "❌ Failed"
-                details = (r.catalog_url or r.details.get("summary")) if r.success else r.error
+                details = (
+                    (_display_url(r.catalog_url) or r.details.get("summary"))
+                    if r.success
+                    else r.error
+                )
                 table.add_row(r.asset_id, status, r.catalog_id, details or "")
 
             console.print(table)
@@ -604,7 +684,7 @@ def format_results(
                 output.append(f"  Status: {'✅ Success' if r.success else '❌ Failed'}")
                 output.append(f"  Catalog: {r.catalog_id}")
                 if r.success and r.catalog_url:
-                    output.append(f"  URL: {r.catalog_url}")
+                    output.append(f"  URL: {_display_url(r.catalog_url)}")
                 elif r.success and r.details.get("summary"):
                     output.append(f"  {r.details['summary']}")
                 if r.error:

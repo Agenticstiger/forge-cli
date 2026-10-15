@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from fluid_build.cli._market_checkout import CheckoutMarketBlock
 from fluid_build.cli.market import (
     BaseCatalogConnector,
     CatalogType,
@@ -49,8 +50,15 @@ class ApacheAtlasConnector(BaseCatalogConnector):
         """Connect to Apache Atlas"""
         try:
             base_url = self.config.get("base_url", "http://localhost:21000")
-            username = self.config.get("username", os.environ.get("ATLAS_USERNAME", ""))
-            password = self.config.get("password", os.environ.get("ATLAS_PASSWORD", ""))
+            # A block from the checkout's market.yaml chose base_url: it gets
+            # only the credentials it carries, never the runner's.
+            from_env = not isinstance(self.config, CheckoutMarketBlock)
+            username = self.config.get(
+                "username", os.environ.get("ATLAS_USERNAME", "") if from_env else ""
+            )
+            password = self.config.get(
+                "password", os.environ.get("ATLAS_PASSWORD", "") if from_env else ""
+            )
 
             if not username or not password:
                 self.logger.error(

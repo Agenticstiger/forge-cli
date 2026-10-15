@@ -131,6 +131,81 @@ DMM_API_KEY=${{ secrets.DMM_API_KEY }} \
 No interactive prompts. The API key is read from the environment variable
 `DMM_API_KEY`. The `--overlay` path is parameterised by the deploy stage.
 
+#### Where `fluid publish --target dmm` takes its endpoint from
+
+`fluid publish` reads catalog settings from, in rising priority: `/etc/fluid/config.yaml`,
+your user config (`~/.fluid/config.yaml`), a project config in the working directory
+(`fluid.config.yaml`, `.fluidrc.yaml`, `.fluidrc` or `.fluid/config.yaml`), the environment,
+and `--target dmm:<endpoint>`. A YAML anchor, alias or merge key in any of these files
+shares a value, never a setting: writing under one name never changes another, so a project
+config cannot reach one of your catalog blocks through an alias you use for it. A file whose
+aliases or merge keys (`<<:`) nest so deep that they would expand far past what is written
+in it (the limit is go-yaml's "excessive aliasing" rule, which also counts each key a merge
+key copies) is refused with a parse error that names the file, rather than expanded;
+`fluid market` skips such a `market.yaml`, in `~/.fluid` or the working directory, with a
+warning that names it.
+
+A project config is part of the checkout, so the CLI does not trust it like your own config:
+
+- `${VAR}` placeholders in it are kept as written, not filled from the environment.
+- An endpoint it sets is only sent a key that the same file carries. It is never sent
+  `DMM_API_KEY` or a key from `~/.fluid/config.yaml`. When the file carries its own key
+  where the catalog reads one (`api_token`, `token`, `auth.api_token`, `auth.token`,
+  `auth.api_key` or `auth.bearer_token`), that key is sent and `DMM_API_KEY` is left out.
+  When it carries none, `fluid publish --target dmm` stops and says so, and a contract that
+  lists the catalog under `properties.catalog.register` reports that target as not
+  registered. Set the endpoint with `DMM_API_URL`, in `~/.fluid/config.yaml`, or with
+  `--target dmm:<endpoint>` instead.
+- A key the file sets to anything but a non-empty string (`""`, `null`, spaces, `false`,
+  `0`, `no`, `[]`, `{}`) is no key: such an endpoint is treated exactly as if the file left
+  the key out. Quote a key that looks like a number or a date. (In your own config files an
+  unquoted number or date is still sent as your key, as YAML reads it, so `1.50` goes out
+  as `1.5`, with a warning that names the setting and says to quote it; an unquoted `true`,
+  `yes` or `on` there is no key, and `DMM_API_KEY`, if set, is sent instead.) A Command Center
+  `auth.api_key` or `auth.token` that the file sets to a number is no key even when the
+  endpoint is yours (`FLUID_CC_ENDPOINT`): the log names the setting and says to quote it,
+  and `FLUID_API_KEY` or `FLUID_BEARER_TOKEN`, if set, is sent in its place.
+- Nothing else from your environment or your own config files reaches such an endpoint,
+  whatever its name and however deep in a list or map it sits, except these settings:
+  the organization (`organization_id`, `organization`, `FLUID_CC_ORG_ID`),
+  `DMM_PROVIDER_HINT`, `DMM_DATA_PRODUCT_SPECIFICATION`, `odps_lineage_mode` (a string),
+  `auto_approve_access` (`true` or `false`), `auth.type`, `enabled`,
+  `force_contract_sync`, `timeout`, `max_retries`, `retry_delay` and the circuit-breaker
+  settings. Any other value, an empty map or list included, is named in the refusal. So
+  the provider README's block in `~/.fluid/config.yaml` does not stop a checkout whose
+  own config carries its own endpoint and key, whether `DMM_API_KEY` is exported, empty
+  or unset (its `${DMM_API_KEY}`, then empty or left as written, is no key): that
+  endpoint gets the checkout's key, never `DMM_API_KEY`, and the README's settings. A
+  key your config file sets there itself is still never sent, and still named.
+- `{{ env.NAME }}` placeholders in the contract are sent as written to such an endpoint,
+  not filled from the environment; `fluid publish --target dmm` logs a warning naming
+  them. Registration under `properties.catalog.register` never fills them, whatever the
+  endpoint.
+- Such an endpoint must be `https://`, unless it is loopback (`localhost`, `127.0.0.1`,
+  `::1`) or its host is on `FLUID_COMMAND_CENTER_HOST_ALLOWLIST` (comma-separated host
+  suffixes). A host that resolves to a private or cloud-metadata address also needs that
+  allow-list. This holds even when the project config carries its own key, for
+  `--target dmm` and for `properties.catalog.register` alike; a refused target is
+  reported as not published.
+
+An endpoint from `DMM_API_URL`, `~/.fluid/config.yaml` or `--target dmm:<endpoint>` is
+yours: it gets your key, and the host check above does not apply to it. Run from your home
+directory, `~/.fluid/config.yaml` (or `~/.fluidrc.yaml`) is still your user config, not a
+project config.
+
+The same rule covers `fluid market`: with no `~/.fluid/market.yaml`, it reads `market.yaml`
+from the working directory, and an `mcp` block from that file may not name `token_env`,
+`env_from`, a `command` or the `stdio` transport, and its `url` must pass the host check
+above. A `token` the file carries itself is sent. The Command Center that `fluid market`
+and `fluid market --blueprints` use comes only from `FLUID_COMMAND_CENTER_URL` or
+`~/.fluid/config.yaml`, never from a `fluid.yaml` in the working directory, and no request
+to it (the blueprint search, `--blueprint-id`, `--instantiate`, the catalog connector)
+follows a redirect to another origin. A blueprint registry you name yourself, with
+`FLUID_API_URL` or with `FLUID_PUBLIC_REGISTRY` and `FLUID_MARKETPLACE_FALLBACK=public`, is
+not the Command Center: a search or a `--blueprint-id` lookup there sends no credential and
+no parameters, so it follows a registry that moved to another host. `--instantiate`, which
+sends your parameters, still does not follow a redirect off the registry's origin.
+
 ---
 
 ### 6. Other useful commands

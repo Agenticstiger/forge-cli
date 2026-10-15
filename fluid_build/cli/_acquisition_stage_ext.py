@@ -42,7 +42,7 @@ import logging
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # The identifier grammar + validator are hoisted into the neutral
 # ``build_runners._ids`` leaf so the runtime chokepoint
@@ -317,7 +317,7 @@ def publish_acquisition(contract: Dict[str, Any], workdir: Path) -> List[Publish
     from fluid_build.api.catalog_publication import CatalogPublicationPayload
     from fluid_build.build_runners import _catalog as catalog_orchestrator
 
-    target_configs = _collect_target_configs(contract)
+    target_configs, refused = _collect_target_configs(contract)
 
     results: List[PublishResult] = []
     product_id = contract.get("id", "")
@@ -328,6 +328,22 @@ def publish_acquisition(contract: Dict[str, Any], workdir: Path) -> List[Publish
         plan = catalog_orchestrator.CatalogPlan.from_dict(
             build.get("properties", {}).get("catalog", {})
         )
+        # A refused target gets no registrar at all: one built from defaults
+        # would fill the credential from the environment for another endpoint.
+        for target in [t for t in plan.targets if t in refused]:
+            for expose_id in list(build.get("outputs") or []) or [
+                a.asset_id for a in payload.assets
+            ]:
+                results.append(
+                    PublishResult(
+                        product_id=product_id,
+                        expose_id=expose_id,
+                        target=target,
+                        succeeded=False,
+                        error=refused[target],
+                    )
+                )
+        plan.targets = [t for t in plan.targets if t not in refused]
         if not plan.targets:
             continue
         _ensure_builtin_registrars(plan.targets)
@@ -359,14 +375,20 @@ def publish_acquisition(contract: Dict[str, Any], workdir: Path) -> List[Publish
     return results
 
 
-def _collect_target_configs(contract: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def _collect_target_configs(
+    contract: Dict[str, Any],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
     """Resolve per-target catalog configs for every target named in any
     acquisition build's ``properties.catalog.register``.
 
     Reading via ``FluidConfig`` picks up both the YAML config blocks
     and the env-var overrides applied in ``get_catalog_config``. Best-
     effort: a failed lookup degrades to an empty dict so the registrar
-    factory falls back to its defaults.
+    factory falls back to its defaults. The exception is a target whose
+    endpoint the project config names while its credential would come from
+    the environment or the user config, or whose project endpoint fails the
+    https / private-address host gate: it is returned in the second dict,
+    with the reason, and must not be registered at all.
     """
     targets: List[str] = []
     for build in acquisition_builds(contract):
@@ -374,21 +396,38 @@ def _collect_target_configs(contract: Dict[str, Any]) -> Dict[str, Dict[str, Any
             if t not in targets:
                 targets.append(t)
     if not targets:
-        return {}
+        return {}, {}
     try:
-        from fluid_build.config_manager import FluidConfig
+        from fluid_build.config_manager import FluidConfig, UntrustedCatalogEndpoint
+        from fluid_build.observability.reporter import project_endpoint_refusal
 
         cfg = FluidConfig()
     except Exception:  # noqa: BLE001
-        return {}
+        return {}, {}
     out: Dict[str, Dict[str, Any]] = {}
+    refused: Dict[str, str] = {}
     for t in targets:
         try:
             resolved = cfg.get_catalog_config(t) or {}
+        except UntrustedCatalogEndpoint as exc:
+            LOG.warning("Catalog %s: %s.", t, exc)
+            refused[t] = str(exc)
+            continue
         except Exception:  # noqa: BLE001
             resolved = {}
+        # The same host gate ``fluid publish --target`` applies to an endpoint
+        # the checkout named, even when that file carries its own key.
+        refusal = (
+            project_endpoint_refusal(t, resolved)
+            if getattr(resolved, "project_endpoint_file", None)
+            else None
+        )
+        if refusal:
+            LOG.warning("%s.", refusal)
+            refused[t] = refusal
+            continue
         out[t] = resolved
-    return out
+    return out, refused
 
 
 def _classifications_from_run_records(

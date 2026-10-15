@@ -22,8 +22,8 @@ import queue
 import threading
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+from urllib.parse import urljoin, urlparse, urlsplit
 
 try:
     import requests
@@ -51,27 +51,202 @@ _CC_HOST_ALLOWLIST_ENV = "FLUID_COMMAND_CENTER_HOST_ALLOWLIST"
 _CC_ALWAYS_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
-def _command_center_host_allowed(url: Optional[str]) -> bool:
-    """Return True when ``url``'s host is safe for the reporter to POST to.
+def endpoint_origin(url: Optional[str]) -> str:
+    """``scheme://host[:port]`` of ``url``: what a log line may say about it.
 
+    The path and query can carry a secret (a token segment, a placeholder that
+    was expanded) and userinfo is a credential, so neither is ever logged; the
+    origin alone tells the operator where a request went. The port appears
+    only when the URL names one.
+    """
+    parts = urlsplit(url or "")
+    host = parts.hostname
+    if not host:
+        return "<endpoint with no host>"
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    origin = f"{parts.scheme or '?'}://{host}"
+    return f"{origin}:{port}" if port else origin
+
+
+def _command_center_host_refusal(url: Optional[str]) -> Optional[str]:
+    """Why the reporter (or a catalog publish) may not send a credential to ``url``.
+
+    The one Command Center host gate: the Command Center client's detection
+    probes (``cli/_command_center.py``) use it too. ``None`` when it may.
     Loopback and any host on ``FLUID_COMMAND_CENTER_HOST_ALLOWLIST`` are
-    permitted; any other host resolving to a private/link-local/
-    loopback/cloud-metadata address is refused via
-    :func:`_hostname_is_private`. A URL with no host is refused.
+    permitted over http or https.
+    Any other host needs https (the credential travels as a header) and must
+    not resolve to a private/link-local/loopback/cloud-metadata address
+    (:func:`_hostname_is_private`, which fails closed on DNS errors).
     """
     if not url:
-        return False
-    host = urlparse(url).hostname
+        return "no endpoint is configured"
+    parts = urlparse(url)
+    host = parts.hostname
     if not host:
-        return False
+        return "the endpoint has no host"
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return f"the endpoint scheme is {scheme or 'missing'}; use an https:// endpoint"
     if host in _CC_ALWAYS_ALLOWED_HOSTS:
-        return True
+        return None
     suffixes = [
         s.strip() for s in os.environ.get(_CC_HOST_ALLOWLIST_ENV, "").split(",") if s.strip()
     ]
     if any(host == s or host.endswith("." + s) for s in suffixes):
-        return True
-    return not _hostname_is_private(host)
+        return None
+    if _hostname_is_private(host):
+        return (
+            "its host resolves to a private or metadata address; allow it with "
+            f"{_CC_HOST_ALLOWLIST_ENV}"
+        )
+    if scheme != "https":
+        return (
+            "it is plain http, which would send the credential in clear text; use an "
+            f"https:// endpoint, or allow-list the host with {_CC_HOST_ALLOWLIST_ENV}"
+        )
+    return None
+
+
+def _command_center_host_allowed(url: Optional[str]) -> bool:
+    """Return True when the reporter may send its credential to ``url``.
+
+    See :func:`_command_center_host_refusal` for the rule and the reasons.
+    """
+    return _command_center_host_refusal(url) is None
+
+
+def project_endpoint_refusal(catalog_name: str, catalog_config: Mapping[str, Any]) -> Optional[str]:
+    """Why a catalog endpoint named by the project config may not be published to.
+
+    ``None`` when it may. Every ``fluid publish`` path (``--target`` and a
+    contract's ``properties.catalog.register``) applies this to an endpoint
+    from a config file in the checkout: the same host gate the Command Center
+    report uses (:func:`_command_center_host_refusal`). The message names only
+    the origin, never the path, query or userinfo.
+    """
+    endpoint = catalog_config.get("endpoint") or catalog_config.get("url")
+    if not endpoint:
+        return None
+    refusal = _command_center_host_refusal(str(endpoint))
+    if refusal is None:
+        return None
+    return (
+        f"Not publishing to catalog '{catalog_name}' at {endpoint_origin(str(endpoint))}, "
+        f"an endpoint from the project config: {refusal}"
+    )
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+class CredentialRedirectRefused(Exception):
+    """A credential-bearing request was redirected where its credential may not go.
+
+    ``str()`` names origins only (:func:`endpoint_origin`), never a path or query.
+    """
+
+
+def _origin_of(url: str) -> Optional[Tuple[str, str, int]]:
+    """``(scheme, host, port)`` of an http(s) URL, the port filled in; else ``None``."""
+    parts = urlsplit(url)
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if scheme not in _DEFAULT_PORTS or not host:
+        return None
+    return scheme, host, _DEFAULT_PORTS[scheme] if port is None else port
+
+
+def credential_redirect_refusal(source: str, target: str) -> Optional[str]:
+    """Why a request carrying a credential to ``source`` may not follow a redirect to ``target``.
+
+    ``None`` when it may: ``target`` (absolute) is on the same origin (scheme,
+    host and port), or is the same host moved from http to https on the
+    default ports, the one cross-origin hop for which ``requests`` keeps
+    ``Authorization`` (``should_strip_auth``). Every other hop is refused
+    rather than followed with the credential stripped: the request body is the
+    run's report, which is not for another origin either. An https request is
+    never followed down to http.
+    """
+    old, new = _origin_of(source), _origin_of(target)
+    if old is None or new is None:
+        return f"it redirects to {endpoint_origin(target)}, which is not an http(s) origin"
+    if old == new:
+        return None
+    if old[0] == "https" and new[0] != "https":
+        return f"it redirects from https down to {endpoint_origin(target)}"
+    if old == ("http", new[1], 80) and new == ("https", old[1], 443):
+        return None
+    return (
+        f"it redirects from {endpoint_origin(source)} to another origin, "
+        f"{endpoint_origin(target)}"
+    )
+
+
+def refuse_foreign_redirect(response: Any, *_args: Any, **_kwargs: Any) -> Any:
+    """A ``requests`` response hook: raise :class:`CredentialRedirectRefused` for
+    a redirect :func:`credential_redirect_refusal` refuses, before it is followed.
+
+    ``requests`` runs a request's response hooks on every hop, so passing
+    ``hooks={"response": refuse_foreign_redirect}`` to one call guards that
+    call; :func:`guard_credential_redirects` installs it on a whole session.
+    """
+    if not response.is_redirect:
+        return response
+    target = urljoin(response.url, response.headers.get("location", ""))
+    refusal = credential_redirect_refusal(response.url, target)
+    if refusal is None:
+        return response
+    response.close()
+    raise CredentialRedirectRefused(refusal)
+
+
+def guard_credential_redirects(session: Any) -> Any:
+    """Make ``session`` (a ``requests.Session``) refuse a redirect its credentials may not follow.
+
+    ``requests`` follows redirects by default and, when the host changes, drops
+    only ``Authorization``: a credential in any other header (``X-API-Key``)
+    went on to wherever the endpoint redirected. A response hook
+    (:func:`refuse_foreign_redirect`) sees every hop before ``requests``
+    follows it, and raises :class:`CredentialRedirectRefused` for one
+    :func:`credential_redirect_refusal` refuses. Returns ``session``.
+    """
+    session.hooks["response"].append(refuse_foreign_redirect)
+    return session
+
+
+def foreign_redirect_trace_config() -> Any:
+    """An ``aiohttp.TraceConfig`` that refuses what :func:`refuse_foreign_redirect` refuses.
+
+    The same rule for an ``aiohttp.ClientSession``, which follows redirects by
+    default: built with ``trace_configs=[foreign_redirect_trace_config()]``, a
+    session raises :class:`CredentialRedirectRefused` for every hop
+    :func:`credential_redirect_refusal` refuses, on every request it makes,
+    before ``aiohttp`` follows it.
+    """
+    import aiohttp
+
+    async def _on_redirect(_session: Any, _context: Any, params: Any) -> None:
+        response = params.response
+        source = str(response.url)
+        location = response.headers.get("Location") or response.headers.get("URI") or ""
+        refusal = credential_redirect_refusal(source, urljoin(source, location))
+        if refusal is not None:
+            response.close()
+            raise CredentialRedirectRefused(refusal)
+
+    trace = aiohttp.TraceConfig()
+    trace.on_request_redirect.append(_on_redirect)
+    return trace
 
 
 class CircuitState(Enum):
@@ -164,8 +339,10 @@ class CircuitBreaker:
             self.last_failure_time = time.time()
 
             if self.state == CircuitState.HALF_OPEN:
+                # The type only: a requests exception's text repeats the URL.
                 logger.warning(
-                    f"Circuit breaker transitioning HALF_OPEN → OPEN (recovery failed: {error})"
+                    "Circuit breaker transitioning HALF_OPEN → OPEN (recovery failed: %s)",
+                    type(error).__name__,
                 )
                 self.state = CircuitState.OPEN
                 self.failure_count = 0
@@ -229,10 +406,11 @@ class CommandCenterReporter:
         #: whether the run reached the Command Center (the queue is async).
         self.stats: Dict[str, int] = {"sent": 0, "failed": 0}
 
-        # Session for connection pooling
+        # Session for connection pooling. Every request carries the credential,
+        # so a redirect is followed only within the endpoint's own origin.
         self.session: Optional[Any] = None
         if self.enabled and requests:
-            self.session = requests.Session()
+            self.session = guard_credential_redirects(requests.Session())
             headers = {"Content-Type": "application/json"}
             if config.api_key:
                 headers["X-API-Key"] = config.api_key
@@ -258,11 +436,9 @@ class CommandCenterReporter:
         # exfil the API key to e.g. http://169.254.169.254/.
         if not _command_center_host_allowed(self.config.url):
             logger.warning(
-                "Command Center URL host resolves to a private/loopback/"
-                "link-local/cloud-metadata address; reporter disabled to "
-                "prevent SSRF (API-key exfil). Set %s=<host-suffix> to allow "
-                "a genuinely internal Command Center endpoint.",
-                _CC_HOST_ALLOWLIST_ENV,
+                "Command Center reporter disabled for %s: %s.",
+                endpoint_origin(self.config.url),
+                _command_center_host_refusal(self.config.url),
             )
             self.enabled = False
             return
@@ -273,7 +449,9 @@ class CommandCenterReporter:
         self.running = True
         self.worker_thread = threading.Thread(target=self._worker, daemon=True, name="CC-Reporter")
         self.worker_thread.start()
-        logger.info(f"Command Center reporter started (url={self.config.url})")
+        logger.info(
+            "Command Center reporter started (destination=%s)", endpoint_origin(self.config.url)
+        )
 
     def stop(self, timeout: float = 5.0):
         """
@@ -487,13 +665,18 @@ class CommandCenterReporter:
 
         except Exception as e:
             self.stats["failed"] += 1
-            # The type and the status only: a requests exception's text
-            # repeats the URL, and nothing here needs the response body.
-            status = getattr(getattr(e, "response", None), "status_code", None)
+            if isinstance(e, CredentialRedirectRefused):
+                # Its text names the origins only.
+                outcome = f"not followed, {e}"
+            else:
+                # The type and the status only: a requests exception's text
+                # repeats the URL, and nothing here needs the response body.
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                outcome = str(status or type(e).__name__)
             logger.warning(
                 "Failed to send event to Command Center: %s %s -> %s",
                 method,
                 endpoint,
-                status or type(e).__name__,
+                outcome,
             )
             raise

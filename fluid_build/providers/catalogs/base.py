@@ -155,6 +155,11 @@ class BaseCatalogProvider(ABC):
         self.config = config
         self.endpoint = config.get("endpoint", config.get("url", ""))
         self.auth = config.get("auth", {})
+        #: The project config file that named the endpoint, when a config file
+        #: in the checkout did (``config_manager.CatalogConfig``); ``None`` for
+        #: the operator's own endpoint. No credential for such an endpoint is
+        #: ever read from the environment, whatever the auth block holds.
+        self.project_endpoint_file: Optional[str] = getattr(config, "project_endpoint_file", None)
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
 
         # Resilience settings

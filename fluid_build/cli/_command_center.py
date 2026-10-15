@@ -24,14 +24,29 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
 
 import yaml
 
-# Reuse the canonical SSRF post-DNS-resolution gate (RFC1918,
-# link-local 169.254.0.0/16 — AWS/GCP metadata — loopback, reserved;
-# fails closed on DNS errors) rather than re-deriving a range list.
-from fluid_build._net import _hostname_is_private
+# The Command Center host gate is the reporter's: one policy for every request
+# to a Command Center, whether or not it carries the credential yet (this
+# client's probes do not; the URL it detects is where the credential goes
+# next). Loopback (the ``http://localhost:8000`` default) and hosts on
+# ``FLUID_COMMAND_CENTER_HOST_ALLOWLIST`` pass over http or https; any other
+# host needs https and must not resolve to a private or cloud-metadata address.
+from fluid_build.observability.reporter import (
+    _command_center_host_allowed as _command_center_host_allowed,
+)
+from fluid_build.observability.reporter import (
+    _command_center_host_refusal,
+    endpoint_origin,
+    refuse_foreign_redirect,
+)
+
+# Every probe follows a redirect only within the origin the gate passed (or
+# the same host moved up to https): the reporter's redirect rule. A Command
+# Center that answers with a redirect to another origin, a private or a cloud
+# metadata address included, is not followed there.
+_PROBE_HOOKS = {"response": refuse_foreign_redirect}
 
 try:
     import requests
@@ -39,42 +54,6 @@ try:
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
-
-# Opt-in allow-list for operators whose Command Center genuinely lives
-# on an internal/private address (the default ``http://localhost:8000``
-# is itself a loopback host, so localhost is permitted unconditionally
-# — see :func:`_command_center_host_allowed`). Comma-separated host
-# suffixes; matched exactly or as a dotted suffix.
-_CC_HOST_ALLOWLIST_ENV = "FLUID_COMMAND_CENTER_HOST_ALLOWLIST"
-# Loopback hosts always permitted: the documented default Command
-# Center URL is ``http://localhost:8000`` (a local dev server). The
-# SSRF concern is a *user/config-supplied* URL bouncing the X-API-Key
-# to a cloud-metadata endpoint — not the operator's own localhost.
-_CC_ALWAYS_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-
-
-def _command_center_host_allowed(url: Optional[str]) -> bool:
-    """Return True when ``url``'s host is safe to probe.
-
-    Loopback (the documented localhost default) and any host on the
-    ``FLUID_COMMAND_CENTER_HOST_ALLOWLIST`` allow-list are permitted;
-    every other host that resolves to a private/link-local/loopback/
-    cloud-metadata address is refused via :func:`_hostname_is_private`.
-    A URL with no host is refused.
-    """
-    if not url:
-        return False
-    host = urlparse(url).hostname
-    if not host:
-        return False
-    if host in _CC_ALWAYS_ALLOWED_HOSTS:
-        return True
-    suffixes = [
-        s.strip() for s in os.environ.get(_CC_HOST_ALLOWLIST_ENV, "").split(",") if s.strip()
-    ]
-    if any(host == s or host.endswith("." + s) for s in suffixes):
-        return True
-    return not _hostname_is_private(host)
 
 
 @dataclass
@@ -118,8 +97,11 @@ class CommandCenterClient:
 
         Priority order:
         1. Environment variable: FLUID_COMMAND_CENTER_URL
-        2. Config file: ~/.fluid/config.yaml
+        2. Config file: ~/.fluid/config.yaml (or .yml), the operator's own
         3. Default: http://localhost:8000
+
+        Never a file in the working directory: that is the checkout, and the
+        URL found here is where the Command Center credential goes next.
 
         Returns:
             Command Center URL or None if detection disabled
@@ -148,22 +130,25 @@ class CommandCenterClient:
 
     def _load_from_config(self) -> Optional[str]:
         """
-        Load Command Center URL from config file.
+        Load Command Center URL from the operator's config file.
 
         Checks:
         - ~/.fluid/config.yaml
         - ~/.fluid/config.yml
-        - ./fluid.yaml
-        - ./fluid.yml
+
+        ``./fluid.yaml`` in the working directory is not read: a checkout must
+        not choose the Command Center this client probes and hands on.
 
         Returns:
             URL from config or None
         """
+        try:
+            home = Path.home()
+        except RuntimeError:  # no home directory: there is no operator config
+            return None
         config_paths = [
-            Path.home() / ".fluid" / "config.yaml",
-            Path.home() / ".fluid" / "config.yml",
-            Path("fluid.yaml"),
-            Path("fluid.yml"),
+            home / ".fluid" / "config.yaml",
+            home / ".fluid" / "config.yml",
         ]
 
         for config_path in config_paths:
@@ -201,18 +186,15 @@ class CommandCenterClient:
             self.logger.warning("requests library not available, skipping Command Center detection")
             return
 
-        # SSRF gate: the URL is user/config-supplied and we POST an
-        # X-API-Key against it elsewhere. Refuse to probe a host that
-        # resolves to a private/link-local/cloud-metadata address
-        # unless it is loopback (the localhost default) or explicitly
-        # allow-listed. Bail before any request leaves the process.
-        if not _command_center_host_allowed(self.url):
+        # The reporter's host gate, before any request leaves the process:
+        # the URL is user/config-supplied, and the credential goes to it
+        # elsewhere. The warning names the origin only.
+        refusal = _command_center_host_refusal(self.url)
+        if refusal:
             self.logger.warning(
-                "Command Center URL host resolves to a private/loopback/"
-                "link-local/cloud-metadata address; skipping detection to "
-                "prevent SSRF. Set %s=<host-suffix> to allow a genuinely "
-                "internal Command Center endpoint.",
-                _CC_HOST_ALLOWLIST_ENV,
+                "Command Center detection skipped for %s: %s.",
+                endpoint_origin(self.url),
+                refusal,
             )
             self.available = False
             return
@@ -220,7 +202,7 @@ class CommandCenterClient:
         try:
             # Quick health check with timeout
             health_url = f"{self.url}/health"
-            response = requests.get(health_url, timeout=2)
+            response = requests.get(health_url, timeout=2, hooks=_PROBE_HOOKS)
 
             if response.status_code == 200:
                 self.available = True
@@ -282,7 +264,7 @@ class CommandCenterClient:
             url = f"{self.url}{endpoint}"
 
             # Try HEAD request first (faster)
-            response = requests.head(url, timeout=1)
+            response = requests.head(url, timeout=1, hooks=_PROBE_HOOKS)
 
             # 200 OK or 405 Method Not Allowed (HEAD not supported but endpoint exists)
             if response.status_code in (200, 405):
@@ -293,7 +275,7 @@ class CommandCenterClient:
                 return False
 
             # For other status codes, try GET with limit
-            response = requests.get(url, params={"limit": 1}, timeout=1)
+            response = requests.get(url, params={"limit": 1}, timeout=1, hooks=_PROBE_HOOKS)
             return response.status_code in (200, 401, 403)  # Exists (may need auth)
 
         except Exception as e:
@@ -308,7 +290,7 @@ class CommandCenterClient:
             Version string or "unknown"
         """
         try:
-            response = requests.get(f"{self.url}/api/v1/version", timeout=1)
+            response = requests.get(f"{self.url}/api/v1/version", timeout=1, hooks=_PROBE_HOOKS)
             if response.status_code == 200:
                 data = response.json()
                 return data.get("version", "unknown")

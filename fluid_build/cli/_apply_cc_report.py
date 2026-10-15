@@ -308,14 +308,18 @@ class ApplyRunReport:
         return reporter
 
     def _say_outcome(self, reporter: Any) -> None:
+        from fluid_build.observability.reporter import endpoint_origin
+
         sent, failed = reporter.stats.get("sent", 0), reporter.stats.get("failed", 0)
+        # The origin only: the endpoint's path may carry a secret.
+        where = endpoint_origin(reporter.config.url)
         if failed or sent < 2:
             self._say(
-                f"  command center: run {self.execution_id} not fully reported "
+                f"  command center: run {self.execution_id} not fully reported to {where} "
                 f"({sent} of 2 requests accepted); the apply's result is unaffected"
             )
         else:
-            self._say(f"  command center: run {self.execution_id} reported")
+            self._say(f"  command center: run {self.execution_id} reported to {where}")
 
     @staticmethod
     def _say(line: str) -> None:
@@ -419,11 +423,25 @@ def _command_center_config(logger: logging.Logger):
         return published
     env_config = CommandCenterConfig.from_environment()
     if env_config.is_configured():
+        refused = _host_refused(env_config.url)
+        if refused:
+            return None, refused
         org = (os.environ.get("FLUID_CC_ORG_ID") or "").strip()
         if org and _header_safe(org):
             env_config.headers = {**env_config.headers, "X-Organization-Id": org}
         return env_config, None
     return None, _NOT_CONFIGURED
+
+
+def _host_refused(endpoint: Optional[str]) -> Optional[str]:
+    """Why the credential may not go to ``endpoint``, naming only its origin."""
+    from fluid_build.observability.reporter import (
+        _command_center_host_refusal,
+        endpoint_origin,
+    )
+
+    refusal = _command_center_host_refusal(endpoint)
+    return f"{endpoint_origin(endpoint)}: {refusal}" if refusal else None
 
 
 def _publish_path_config(logger: logging.Logger):
@@ -432,11 +450,19 @@ def _publish_path_config(logger: logging.Logger):
     ``None`` when the catalog configuration names no Command Center at all;
     ``(None, reason)`` when it names one this run cannot report to.
     """
-    from fluid_build.config_manager import COMMAND_CENTER_CANONICAL_NAME, FluidConfig
+    from fluid_build.config_manager import (
+        COMMAND_CENTER_CANONICAL_NAME,
+        FluidConfig,
+        UntrustedCatalogEndpoint,
+    )
     from fluid_build.observability.config import CommandCenterConfig
 
     try:
         catalog = FluidConfig().get_catalog_config(COMMAND_CENTER_CANONICAL_NAME) or {}
+    except UntrustedCatalogEndpoint as exc:
+        # An endpoint from the project config never gets the runner's
+        # credential; say so rather than going quiet as if nothing were configured.
+        return None, str(exc)
     except Exception:  # noqa: BLE001 - an unreadable config is "not configured"
         return None
     endpoint = str(catalog.get("endpoint") or "").strip()
@@ -446,19 +472,19 @@ def _publish_path_config(logger: logging.Logger):
     # endpoint alone is not a configured Command Center: a credential is.
     from fluid_build.providers.common import get_auth_headers
 
-    probe = get_auth_headers(endpoint, catalog.get("auth"))
+    probe = get_auth_headers(
+        endpoint,
+        catalog.get("auth"),
+        env_fallback=getattr(catalog, "project_endpoint_file", None) is None,
+    )
     if not (probe.get("X-API-Key") or probe.get("Authorization")):
         return None
-    # The reporter's SSRF gate, before the organization lookup below sends the
-    # credential anywhere: loopback or an allow-listed host, never a private
-    # or cloud-metadata address (observability/reporter.py).
-    from fluid_build.observability.reporter import _command_center_host_allowed
-
-    if not _command_center_host_allowed(endpoint):
-        return None, (
-            "its host resolves to a private or metadata address; allow it with "
-            "FLUID_COMMAND_CENTER_HOST_ALLOWLIST"
-        )
+    # The reporter's host gate, before the organization lookup below sends the
+    # credential anywhere: https (or loopback / an allow-listed host), never a
+    # private or cloud-metadata address (observability/reporter.py).
+    refused = _host_refused(endpoint)
+    if refused:
+        return None, refused
     try:
         from fluid_build.providers.catalogs.fluid_cc import FluidCommandCenterProvider
 

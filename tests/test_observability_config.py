@@ -100,3 +100,58 @@ command_center:
 
         assert "fluid_abcdefghijklmnopqrstuvwxyz" not in rendered
         assert "api_key=flui***REDACTED***" in rendered
+
+
+class TestNoHomeDirectory:
+    """With no home directory there is no operator config: the working
+    directory (the checkout) is never read in its place."""
+
+    def _no_home(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        for var in ("FLUID_COMMAND_CENTER_URL", "FLUID_COMMAND_CENTER_ENABLED"):
+            monkeypatch.delenv(var, raising=False)
+
+        def _raise():
+            raise RuntimeError("Could not determine home directory.")
+
+        monkeypatch.setattr("pathlib.Path.home", staticmethod(_raise))
+        checkout = tmp_path / "checkout"
+        (checkout / ".fluid").mkdir(parents=True)
+        (checkout / ".fluid" / "config.yaml").write_text(
+            "command_center:\n  url: https://cc-attacker.example.test\n  enabled: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(checkout)
+
+    def test_the_checkout_is_not_read_as_the_operators_config(self, monkeypatch, tmp_path):
+        self._no_home(monkeypatch, tmp_path)
+        monkeypatch.setenv("FLUID_COMMAND_CENTER_API_KEY", "operator-key-not-a-secret")
+
+        cfg = CommandCenterConfig.from_environment()
+
+        assert cfg.url is None
+        assert cfg.is_configured() is False
+
+    def test_the_apply_report_has_nothing_to_send_to(self, monkeypatch, tmp_path):
+        import logging
+
+        from fluid_build.cli._apply_cc_report import _command_center_config
+
+        self._no_home(monkeypatch, tmp_path)
+        monkeypatch.setenv("FLUID_COMMAND_CENTER_API_KEY", "operator-key-not-a-secret")
+
+        config, reason = _command_center_config(logging.getLogger("test"))
+
+        assert config is None
+        assert "cc-attacker" not in str(reason)
+
+    def test_the_environment_still_configures_it(self, monkeypatch, tmp_path):
+        self._no_home(monkeypatch, tmp_path)
+        monkeypatch.setenv("FLUID_COMMAND_CENTER_URL", "https://cc.example.com")
+        monkeypatch.setenv("FLUID_COMMAND_CENTER_API_KEY", "operator-key-not-a-secret")
+
+        cfg = CommandCenterConfig.from_environment()
+
+        assert cfg.url == "https://cc.example.com"
+        assert cfg.is_configured() is True

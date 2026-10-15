@@ -77,6 +77,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from fluid_build._mcp_compat import attr as _mcp_attr
+from fluid_build.cli._market_checkout import CheckoutMarketBlock
 from fluid_build.cli.market import (
     BaseCatalogConnector,
     DataProductLayer,
@@ -84,6 +85,13 @@ from fluid_build.cli.market import (
     DataProductStatus,
     SearchFilters,
 )
+from fluid_build.observability.reporter import _command_center_host_refusal, endpoint_origin
+
+# Keys of an ``mcp`` block that reach into the runner rather than carry their
+# own material: an env var whose value is sent (``token_env``), env vars copied
+# into a server (``env_from``), and a command to start (a stdio server inherits
+# the whole environment). A block from the checkout's market.yaml may not use them.
+_RUNNER_KEYS: Tuple[str, ...] = ("token_env", "env_from", "command")
 
 # Tool-name fragments that, absent an explicit profile match, mark a tool as
 # search-capable. Ordered by preference.
@@ -411,6 +419,49 @@ class McpCatalogConnector(BaseCatalogConnector):
         """
         return self._open_real_session()
 
+    def _checkout_file(self) -> Optional[str]:
+        """The checkout's market.yaml this block came from, or ``None`` for the operator's."""
+        if isinstance(self.config, CheckoutMarketBlock):
+            return self.config.checkout_file or "market.yaml"
+        return None
+
+    def _transport(self) -> str:
+        return str(
+            self.config.get("transport")
+            or ("stdio" if self.config.get("command") else "streamable_http")
+        )
+
+    def _checkout_refusal(self) -> Optional[str]:
+        """Why a block from the checkout's market.yaml may not be used as written.
+
+        The project-config trust rule: it may send a token it carries itself,
+        but not name the runner's environment (``token_env``, ``env_from``) or
+        start a command, and its endpoint must pass the Command Center host
+        gate (https unless loopback or allow-listed; never a private or
+        metadata address). ``None`` for the operator's own block.
+        """
+        source = self._checkout_file()
+        if source is None:
+            return None
+        named = [key for key in _RUNNER_KEYS if self.config.get(key)]
+        if self._transport() == "stdio" and "command" not in named:
+            named.append("transport: stdio")
+        if named:
+            return (
+                f"not using the mcp block in {source}: that file is in the working "
+                f"directory (the checkout), and it names {', '.join(named)}. A market "
+                "config in the checkout cannot read the runner's environment or start "
+                "a command. Put the block in ~/.fluid/market.yaml to use it"
+            )
+        url = self.config.get("url")
+        refusal = _command_center_host_refusal(str(url)) if url else None
+        if refusal:
+            return (
+                f"not connecting to {endpoint_origin(str(url))}, an MCP endpoint from "
+                f"{source} in the checkout: {refusal}"
+            )
+        return None
+
     def _headers(self) -> Dict[str, str]:
         """Build request headers for a *remote* MCP endpoint.
 
@@ -419,9 +470,10 @@ class McpCatalogConnector(BaseCatalogConnector):
         literal ``token`` is accepted for convenience but discouraged. Defaults
         to an ``Authorization: Bearer`` scheme; ``auth_header`` / ``auth_scheme``
         override it for catalogs that use a different shape (e.g. ``x-api-key``).
+        A block from the checkout's market.yaml never reads ``token_env``.
         """
         headers = {str(k): str(v) for k, v in (self.config.get("headers") or {}).items()}
-        token_env = self.config.get("token_env")
+        token_env = None if self._checkout_file() else self.config.get("token_env")
         token = self.config.get("token") or (os.environ.get(token_env) if token_env else None)
         if token:
             header_name = self.config.get("auth_header", "Authorization")
@@ -468,9 +520,10 @@ class McpCatalogConnector(BaseCatalogConnector):
         from mcp import StdioServerParameters
         from mcp.client.session_group import SseServerParameters, StreamableHttpParameters
 
-        transport = self.config.get("transport") or (
-            "stdio" if self.config.get("command") else "streamable_http"
-        )
+        refusal = self._checkout_refusal()
+        if refusal:
+            raise ValueError(refusal)
+        transport = self._transport()
         if transport == "stdio":
             command = self.config.get("command")
             if not command:
@@ -510,7 +563,8 @@ class McpCatalogConnector(BaseCatalogConnector):
         env: Dict[str, str] = {k: str(v) for k, v in os.environ.items()}
         for k, v in (self.config.get("env") or {}).items():
             env[str(k)] = str(v)
-        for server_var, source_var in (self.config.get("env_from") or {}).items():
+        env_from = {} if self._checkout_file() else (self.config.get("env_from") or {})
+        for server_var, source_var in env_from.items():
             value = os.environ.get(str(source_var))
             if value is not None:
                 env[str(server_var)] = value

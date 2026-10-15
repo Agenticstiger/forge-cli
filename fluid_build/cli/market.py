@@ -46,8 +46,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import yaml
-
 from fluid_build.cli.console import cprint, cprint_json, hint, success
 
 # Rich imports for enhanced output
@@ -649,21 +647,24 @@ def load_market_config(args, logger: logging.Logger) -> Dict[str, Any]:
     }
     config.update(default_config)
 
-    # 2. Load from configuration file (lowest precedence)
-    config_paths = [
-        Path.home() / ".fluid" / "market.yaml",
-        Path.home() / ".fluid" / "market.yml",
-        Path("market.yaml"),
-        Path("market.yml"),
-    ]
+    # 2. Load from configuration file (lowest precedence): ~/.fluid/market.yaml, else
+    # ./market.yaml in the working directory, which is the checkout's: each catalog
+    # block from it comes back as a CheckoutMarketBlock (cli/_market_checkout.py).
+    # Each path gets its own copy of an aliased value: the env merge below must
+    # not write into a checkout block through an alias of the one it fills.
+    from fluid_build.config_manager import load_config_file
 
-    for config_path in config_paths:
+    from ._market_checkout import checkout_blocks, mark_checkout_blocks, market_config_files
+
+    marked: Dict[str, str] = {}
+    for config_path, from_checkout in market_config_files():
         if config_path.exists():
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    file_config = yaml.safe_load(f) or {}
+                    file_config = load_config_file(f, str(config_path))
                     _merge_config(config, file_config)
                     logger.debug(f"Loaded configuration from {config_path}")
+                    marked = checkout_blocks(file_config, config_path, from_checkout)
                     break
             except Exception as e:
                 logger.warning(f"Failed to load config from {config_path}: {e}")
@@ -673,6 +674,7 @@ def load_market_config(args, logger: logging.Logger) -> Dict[str, Any]:
     if env_config:
         _merge_config(config, env_config)
         logger.debug("Loaded configuration from environment variables")
+    mark_checkout_blocks(config, marked, env_config)
 
     # 4. Command line arguments override everything (highest precedence)
     if hasattr(args, "catalogs") and args.catalogs:
@@ -1387,3 +1389,5 @@ from fluid_build.cli.market_catalogs.google_data_catalog import (
     GoogleCloudDataCatalogConnector,  # noqa: E402,F401
 )
 from fluid_build.cli.market_catalogs.rest_api import CustomRestApiConnector  # noqa: E402,F401
+
+from ._market_checkout import CheckoutMarketBlock  # noqa: E402,F401
