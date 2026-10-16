@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 This release fixes six security advisories. Each entry below has its own upgrade notes; read them before upgrading.
 
-#### A — project configuration trust (fix/sec-project-config-trust)
+#### A — project configuration trust (fix/sec-project-config-trust) — [GHSA-vw85-xrwh-3p3x](https://github.com/Agenticstiger/forge-cli/security/advisories/GHSA-vw85-xrwh-3p3x)
 
 **Security**
 - **A config file in the working directory is no longer trusted like your own config**.
@@ -117,7 +117,7 @@ This release fixes six security advisories. Each entry below has its own upgrade
   `DataMeshManagerRegistrar(api_url=...)` no longer fills its token from `DMM_API_KEY`
   when it is given an endpoint.
 
-#### B — untrusted-checkout files: workspace roots and project `.env` (fix/sec-workspace-root-ceiling, fix/sec-dotenv-protected-vars)
+#### B — untrusted-checkout files: workspace roots and project `.env` (fix/sec-workspace-root-ceiling, fix/sec-dotenv-protected-vars) — [GHSA-58px-v64p-6ppm](https://github.com/Agenticstiger/forge-cli/security/advisories/GHSA-58px-v64p-6ppm)
 
 **Security**
 - **A `fluid.workspace.yaml` above the project (for example one `fluid init`
@@ -232,7 +232,7 @@ This release fixes six security advisories. Each entry below has its own upgrade
   `PYTHON_DOTENV_DISABLED` once it reads a project file, and `hydrate_dotenv`
   exports a `FLUID_SECRETS_FILE` itself rather than through `load_dotenv`.
 
-#### C — MCP host identity gate (fix/sec-mcp-metadata-service-gate)
+#### C — MCP host identity gate (fix/sec-mcp-metadata-service-gate) — [GHSA-m7j5-jcrq-cmxm](https://github.com/Agenticstiger/forge-cli/security/advisories/GHSA-m7j5-jcrq-cmxm)
 
 **Security**
 - **Using this host's cloud metadata-service or ADC identity is the operator's decision in
@@ -317,7 +317,7 @@ This release fixes six security advisories. Each entry below has its own upgrade
   carries a password; pass `operator_supplied=True` for a URI your operator supplied, as
   `introspect_jdbc` also accepts.
 
-#### D — federation credentials (fix/sec-federation-credentials)
+#### D — federation credentials (fix/sec-federation-credentials) — [GHSA-m288-j7hc-rhrj](https://github.com/Agenticstiger/forge-cli/security/advisories/GHSA-m288-j7hc-rhrj)
 
 **Security**
 - **A federation manifest no longer decides where a credential goes.**
@@ -396,7 +396,7 @@ This release fixes six security advisories. Each entry below has its own upgrade
 - Refusals are reported as `unreachable` findings; as in 0.19.0, the federation
   gate warns and does not stop `fluid apply`.
 
-#### E — MCP output-port trusted proxies (fix/sec-mcp-trusted-proxies)
+#### E — MCP output-port trusted proxies (fix/sec-mcp-trusted-proxies) — [GHSA-x4fj-f8p7-p9f3](https://github.com/Agenticstiger/forge-cli/security/advisories/GHSA-x4fj-f8p7-p9f3)
 **Security**
 - `fluid mcp output-port serve --transport http` reads the `X-Client-CN` / `X-Client-Fingerprint` headers only under two conditions: the request passed `shared-token` or `jwt` auth, and its TCP peer is listed in the new `FLUID_MCP_TRUSTED_PROXIES`. That variable takes comma-separated IPs or CIDRs and is empty by default, so no peer is trusted. Before, any client that held the token or a valid JWT and could reach the gateway without going through the proxy could name any certificate and pass a `${caller.client_cn}` / `${caller.client_fingerprint}` row filter. Headers from any other peer are ignored, and so are empty values and values with control characters. A filter that needs them then fails closed. The check uses the TCP peer, never `X-Forwarded-For`: uvicorn's proxy-header rewriting is off for the gateway.
 - `${caller.client_cn}` and `${caller.client_fingerprint}` no longer bind from a value the client supplies about itself (`clientInfo` extras or its `fluid` capability block). This holds in every auth mode.
@@ -416,7 +416,7 @@ This release fixes six security advisories. Each entry below has its own upgrade
 - **stdio no longer serves an expose whose row filter reads `${caller.client_cn}` or `${caller.client_fingerprint}`.** `serve` exits 2. Before, the client's own claim bound the filter. Serve it over HTTP behind the proxy instead.
 - uvicorn's access log for the gateway now shows the TCP peer (the proxy) instead of an `X-Forwarded-For` address, and `FORWARDED_ALLOW_IPS` no longer affects the gateway. The "NO built-in auth" warning now prints only when HTTP auth is actually off.
 
-#### F — init --discover credential redaction (fix/sec-discover-uri-redaction)
+#### F — init --discover credential redaction (fix/sec-discover-uri-redaction) — [GHSA-25mh-f2f4-9vxp](https://github.com/Agenticstiger/forge-cli/security/advisories/GHSA-25mh-f2f4-9vxp)
 
 **Security**
 - **`fluid init --discover <uri>` no longer prints the credentials in its URI, or writes
