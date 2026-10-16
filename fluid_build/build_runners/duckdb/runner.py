@@ -37,6 +37,7 @@ when it detects an acquisition build with ``engine: duckdb``.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import os
 import re
@@ -60,7 +61,9 @@ from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
     confine_declared,
     copy_tmp_path,
+    refuse_broad_root,
     secure_duckdb_connect,
+    workspace_grant,
 )
 from fluid_build.providers._sql_safety import (
     build_libpq_dsn,
@@ -574,11 +577,30 @@ def _declared_roots(ctx: RunContext) -> List[Any]:
     """Where a declared source or landing may be: the contract's directory and workspace.
 
     ``DuckDBAllowlist.with_declared`` adds the operator's
-    ``FLUID_DUCKDB_ALLOWED_DIRS``; the contract itself cannot add a root.
+    ``FLUID_DUCKDB_ALLOWED_DIRS``; the contract itself cannot add a root. A
+    workspace at ``$HOME``, above it, at a temp root or at ``/``, or above the
+    contract's repository, is not one (``workspace_grant``).
     """
-    from fluid_build.util.workspace_root import find_workspace_root
+    grant = workspace_grant(_contract_dir(ctx))
+    if grant.refused:
+        _warn_workspace_not_granted(grant.not_granted_message())
+    return [ctx.workdir, grant.granted]
 
-    return [ctx.workdir, find_workspace_root(Path(ctx.workdir))]
+
+def _contract_dir(ctx: RunContext) -> Any:
+    """``ctx.workdir``, which every connection is granted whole: not ``$HOME``, ``/tmp`` or ``/``.
+
+    Raises ``DuckDBSandboxError`` (``refuse_broad_root``) for a contract saved
+    straight into such a directory, unless the operator allows it.
+    """
+    refuse_broad_root(ctx.workdir)
+    return ctx.workdir
+
+
+@functools.lru_cache(maxsize=64)
+def _warn_workspace_not_granted(message: str) -> None:
+    """Once per workspace per process: a run asks for its roots several times."""
+    LOG.warning(message)
 
 
 def _grant_source(allow: DuckDBAllowlist, ctx: RunContext, streams: List[str]) -> DuckDBAllowlist:
@@ -631,7 +653,7 @@ def _run_allowlist(
     ctx: RunContext, streams: List[str], sink_format: Optional[str] = None
 ) -> DuckDBAllowlist:
     """The contract's directory, the declared source, and the declared landing."""
-    allow = _grant_source(DuckDBAllowlist.none().with_dirs(ctx.workdir), ctx, streams)
+    allow = _grant_source(DuckDBAllowlist.none().with_dirs(_contract_dir(ctx)), ctx, streams)
     if sink_format is None:
         return allow
     return _grant_destination(allow, ctx, streams, sink_format)
@@ -1820,7 +1842,7 @@ def _connect_for_destination(ctx: RunContext) -> Any:
     # and nothing else: the source is not granted here.
     sink_format = (ctx.sink.format or "parquet").lower()
     allow = _grant_destination(
-        DuckDBAllowlist.none().with_dirs(ctx.workdir), ctx, _run_streams(ctx), sink_format
+        DuckDBAllowlist.none().with_dirs(_contract_dir(ctx)), ctx, _run_streams(ctx), sink_format
     )
     return secure_duckdb_connect(":memory:", allow=allow, before_lock=_prepare)
 

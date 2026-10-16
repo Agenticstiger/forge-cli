@@ -83,6 +83,19 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
   contract's repository may supply, so it may be a symlink to ``$HOME``.
   :func:`unaliased_dir` grants it only where its name says it is, or inside
   the call site's roots.
+* The contract's own directory is granted whole, and a contract can be saved
+  anywhere: :func:`refuse_broad_root` refuses to open a connection for one
+  that is ``$HOME``, a home directory, a system temp directory or ``/``
+  (:func:`broad_root_reason`), unless the operator lists it in
+  ``FLUID_DUCKDB_ALLOWED_DIRS``.
+* The FLUID workspace a contract sits in (the nearest ancestor holding
+  ``fluid.workspace.yaml``) is granted so that products can read their
+  siblings' files, but that file can sit anywhere above the contract.
+  :func:`workspace_grant` does not grant a workspace root that is one of those
+  broad directories, nor one above the version-control repository the
+  contract is in (``~/src`` holding several clones): the call site then runs
+  without it. A workspace with no repository between it and the contract is
+  one trust domain: every directory in it may read every other.
 * Autoloading is off, so a function from an extension the call site did not
   load (``sqlite_scan``, ``read_xlsx``, ``ST_Read``, ``delta_scan``,
   ``iceberg_scan``) is not in the catalog. :func:`is_sandbox_refusal` treats
@@ -114,9 +127,21 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 from fluid_build._errors import FluidUserError, doc_url
 
@@ -477,6 +502,214 @@ def unaliased_dir(path: PathLike, *, within: Iterable[Optional[PathLike]] = ()) 
     return None
 
 
+#: The default file systems on macOS (APFS, HFS+) and Windows (NTFS) ignore
+#: case, so ``/Users/Me`` names ``/users/me`` there; elsewhere it does not.
+_CASE_INSENSITIVE_FS = sys.platform == "darwin" or sys.platform.startswith("win")
+
+#: Where every user's scratch files live. ``/private/...`` is what macOS
+#: resolves ``/tmp`` and ``/var`` to; ``/private/var/folders`` holds each
+#: user's ``$TMPDIR``. :func:`tempfile.gettempdir` adds this process's own.
+#: These paths are only compared against, to refuse granting them; nothing is
+#: ever created or written under them, so bandit's B108 does not apply.
+_SYSTEM_TEMP_DIRS = (
+    "/tmp",  # nosec B108
+    "/var/tmp",  # nosec B108
+    "/private/tmp",
+    "/private/var/tmp",
+    "/private/var/folders",
+    # Linux shared memory: world-writable, like /tmp.
+    "/dev/shm",  # nosec B108
+    "/run/shm",
+)
+
+#: Where accounts' home directories live (Linux, macOS, Fedora Atomic). One of
+#: them, or the directory itself, holds other users' files, whoever runs fluid
+#: (``root`` has ``HOME=/root``, so ``/home/alice`` is not "your" home).
+_HOMES_PARENTS = ("/home", "/Users", "/var/home")
+
+#: The system temp directories that issue each user a nested ``$TMPDIR``
+#: (macOS: ``/private/var/folders/<a>/<b>/T``). A directory between one of
+#: these and :func:`tempfile.gettempdir` is that user's scratch space too.
+_PER_USER_TEMP_PARENTS = ("/private/var/folders",)
+
+#: :func:`broad_root_reason` codes, as a reader would say them.
+BROAD_ROOT_REASONS = {
+    "filesystem_root": "the filesystem root",
+    "home": "your home directory",
+    "home_ancestor": "a directory that holds your home directory",
+    "temp_root": "a system temp directory, or a directory that holds one",
+    "user_home": "an account's home directory, or the directory that holds them",
+    # A workspace_grant code, not a broad_root_reason one.
+    "outside_repository": "above the version-control repository the contract is in",
+}
+
+#: What marks a directory as the root of a version-control checkout. ``.git``
+#: is a file in a worktree or a submodule, so either kind counts.
+_VCS_MARKERS = (".git", ".hg")
+
+
+def _fold(real: str) -> str:
+    return real.casefold() if _CASE_INSENSITIVE_FS else real
+
+
+def _home_dirs() -> Tuple[str, ...]:
+    """``$HOME`` (as DuckDB's ``~`` reads it) and the account's own home, ``realpath``-ed."""
+    homes = [os.path.expanduser("~")]
+    try:
+        import pwd
+
+        homes.append(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):  # Windows, or a uid with no entry
+        pass
+    return tuple({os.path.realpath(h) for h in homes if h and os.path.isabs(h)})
+
+
+def broad_root_reason(path: PathLike) -> Optional[str]:
+    """Why granting the directory ``path`` whole would grant the host, else ``None``.
+
+    ``"filesystem_root"``; ``"home"`` for ``$HOME`` and ``"home_ancestor"``
+    for a directory that holds it (``/Users``, ``/home``); ``"temp_root"``
+    for a system temp directory (``/tmp``, ``/var/tmp``, ``$TMPDIR``, macOS's
+    ``/private/var/folders``, ``/dev/shm``) or a directory that holds one;
+    ``"user_home"`` for another account's home (``/home/alice`` when root
+    runs fluid) or the directory that holds them (``_HOMES_PARENTS``). Every other
+    directory, a project below ``$HOME`` or ``/tmp`` included, is ``None``.
+    ``$TMPDIR`` counts as held only when the system issued it (below
+    ``_PER_USER_TEMP_PARENTS``): one pointed into a project
+    (``TMPDIR=~/src/lab/.tmp``) is refused itself, but leaves its project a
+    project. Compared after ``realpath`` (DuckDB resolves symlinks in its
+    allowlist the same way), and without case where the file system ignores it.
+    """
+    real = os.path.realpath(os.path.expanduser(os.fspath(path)))
+    if os.path.dirname(real) == real:  # '/', or a Windows drive or share root
+        return "filesystem_root"
+    folded = _fold(real)
+    own_temp = _fold(os.path.realpath(tempfile.gettempdir()))
+    system_temps = [_fold(os.path.realpath(t)) for t in _SYSTEM_TEMP_DIRS]
+    if folded == own_temp or folded in system_temps:  # even when $HOME is below it
+        return "temp_root"
+    for home in _home_dirs():
+        if _is_within(_fold(home), folded):
+            return "home" if _fold(home) == folded else "home_ancestor"
+    for parent in _HOMES_PARENTS:
+        homes = _fold(os.path.realpath(parent))
+        if folded == homes or os.path.dirname(folded) == homes:
+            return "user_home"
+    held = list(system_temps)
+    per_user = (_fold(os.path.realpath(p)) for p in _PER_USER_TEMP_PARENTS)
+    if any(_is_within(own_temp, parent) for parent in per_user):
+        held.append(own_temp)
+    if any(_is_within(temp, folded) for temp in held):
+        return "temp_root"
+    return None
+
+
+def refuse_broad_root(path: PathLike) -> None:
+    """Raise :class:`DuckDBSandboxError` when the contract directory ``path`` is the host.
+
+    A call site grants the contract's own directory whole, and a contract can
+    be saved anywhere: one saved straight into ``$HOME`` or ``/tmp`` would have
+    its SQL read every file there (``~/.aws/credentials``, another user's
+    scratch files). Refused rather than narrowed, because nothing tells the
+    contract's own data apart from the rest of that directory. A directory the
+    operator lists in ``FLUID_DUCKDB_ALLOWED_DIRS`` (or one below such an
+    entry) is the operator's decision, and passes.
+    """
+    reason = broad_root_reason(path)
+    if reason is None:
+        return
+    real = os.path.realpath(os.path.expanduser(os.fspath(path)))
+    if any(_is_within(_fold(real), _fold(d)) for d in operator_allowed_dirs()):
+        return
+    raise _sandbox_error(
+        what=(
+            f"The contract's directory {real} is {BROAD_ROOT_REASONS.get(reason, reason)}, "
+            "so its SQL is not run there. Move the contract into a directory of its own; "
+            f"the operator can allow this one with {OPERATOR_DIRS_ENV}."
+        ),
+        why=(
+            "The contract's directory is opened whole to its SQL. Here that would be every "
+            "file below it: credentials, other projects, other users' files."
+        ),
+        fix=(
+            "Move the contract into a directory of its own (for example "
+            "~/my-product/contract.fluid.yaml) and run it from there, or, as the operator, "
+            f"list this directory in {OPERATOR_DIRS_ENV} to allow it anyway."
+        ),
+    )
+
+
+class WorkspaceGrant(NamedTuple):
+    """The FLUID workspace above a contract, and whether its sandbox may have it."""
+
+    #: The directory holding the nearest ``fluid.workspace.yaml``, or ``None``.
+    found: Optional[Path]
+    #: Why ``found`` is not granted, or ``None``: a :func:`broad_root_reason`
+    #: code, or ``"outside_repository"``.
+    refused: Optional[str]
+
+    @property
+    def granted(self) -> Optional[Path]:
+        """The workspace root to grant the contract's SQL, or ``None``."""
+        return None if self.refused else self.found
+
+    def not_granted_message(self) -> str:
+        """The ``local_workspace_not_granted`` warning: what was dropped, why, and the fix."""
+        why = BROAD_ROOT_REASONS.get(self.refused or "", self.refused)
+        return (
+            f"local_workspace_not_granted: {self.found} holds fluid.workspace.yaml, but it is "
+            f"{why}, so its files are not opened to contract SQL; the build runs with the "
+            "contract's own directory. Move fluid.workspace.yaml into the directory that holds "
+            "your data products, or list the directories contracts may declare files in with "
+            f"{OPERATOR_DIRS_ENV} in the shell that runs fluid."
+        )
+
+
+def workspace_grant(start: Optional[PathLike]) -> WorkspaceGrant:
+    """The FLUID workspace above ``start`` (a contract's directory), vetted for the sandbox.
+
+    A workspace root is granted to contract SQL so a product can read its
+    siblings' files, and ``fluid.workspace.yaml`` may sit at any ancestor
+    (``fluid init`` writes it where it runs). One at ``$HOME``, above it, at a
+    system temp directory or at ``/`` would open that whole tree, so it is
+    found but not granted (:attr:`WorkspaceGrant.refused`): the call site runs
+    without it and logs :meth:`WorkspaceGrant.not_granted_message`. So is one
+    above the version-control repository the contract is in
+    (``"outside_repository"``): a ``fluid.workspace.yaml`` in ``~/src`` would
+    otherwise let a repository cloned there read every other clone, so the
+    walk stops at the contract's own checkout. Rather than
+    fail the build: the contract's own directory is still granted, so a
+    single-product build is unaffected. The same posture as git's answer to
+    CVE-2022-24765, which stops repository discovery from trusting a ``.git``
+    in a shared ancestor directory. Workspace defaults (``find_workspace_root``
+    for the loader and the CLI) are unchanged; only file access is narrowed.
+    """
+    if start is None:
+        return WorkspaceGrant(None, None)
+    # Through the module, so a test can stand in for the search.
+    from fluid_build.util import workspace_root
+
+    found = workspace_root.find_workspace_root(Path(start))
+    if found is None:
+        return WorkspaceGrant(None, None)
+    reason = broad_root_reason(found)
+    if reason is None and _repository_below(found, Path(start)) is not None:
+        reason = "outside_repository"
+    return WorkspaceGrant(found, reason)
+
+
+def _repository_below(found: Path, start: Path) -> Optional[Path]:
+    """The nearest checkout root from ``start`` up to, not including, ``found``."""
+    current = start.resolve()
+    stop = found.resolve()
+    for directory in [current, *current.parents]:
+        if directory == stop:
+            return None
+        if any(os.path.lexists(directory / marker) for marker in _VCS_MARKERS):
+            return directory
+    return None
+
+
 def _new(
     existing: Tuple[str, ...],
     candidates: Iterable[Any],
@@ -736,10 +969,13 @@ def sandbox_refusal_hint(allow: DuckDBAllowlist, refusal: Optional[BaseException
 
 
 __all__ = [
+    "BROAD_ROOT_REASONS",
     "MIN_DUCKDB_VERSION",
     "OPERATOR_DIRS_ENV",
     "DuckDBAllowlist",
     "DuckDBSandboxError",
+    "WorkspaceGrant",
+    "broad_root_reason",
     "confine_declared",
     "copy_tmp_path",
     "duckdb_version",
@@ -747,7 +983,9 @@ __all__ = [
     "is_sandbox_refusal",
     "is_unloaded_function",
     "operator_allowed_dirs",
+    "refuse_broad_root",
     "sandbox_refusal_hint",
     "secure_duckdb_connect",
     "unaliased_dir",
+    "workspace_grant",
 ]

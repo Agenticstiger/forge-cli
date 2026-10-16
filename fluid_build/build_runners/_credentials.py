@@ -53,7 +53,7 @@ The forge-cli-owned surface is small and stable:
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Type
+from typing import Any, Callable, Dict, FrozenSet, Optional, Tuple, Type
 
 try:
     from pydantic import AliasChoices, Field
@@ -306,6 +306,32 @@ def get_credentials_for(platform: str, binding: Optional[Dict[str, Any]] = None)
         if v is not None and v != "":
             fields[k] = v
     return fields
+
+
+def env_names_for(platform: str, field: str) -> Tuple[str, ...]:
+    """The environment variables ``get_credentials_for(platform)`` reads
+    ``field`` from, upper-cased (the classes compare names in any case): the
+    field's validation aliases, else the class's ``env_prefix`` plus the field
+    name. Empty for a platform or field no class declares."""
+    cls = _CREDENTIAL_CLASSES.get(platform.lower())
+    info = cls.model_fields.get(field) if cls is not None else None
+    if cls is None or info is None:
+        return ()
+    choices = getattr(info.validation_alias, "choices", None)
+    if choices:
+        return tuple(str(choice).upper() for choice in choices)
+    prefix = str(cls.model_config.get("env_prefix") or "")
+    return ((prefix + field).upper(),)
+
+
+def env_names_read_for(platform: str) -> FrozenSet[str]:
+    """Every environment variable ``get_credentials_for(platform)`` reads,
+    upper-cased: :func:`env_names_for` of each field of the platform's class.
+    Empty for a platform no class declares."""
+    cls = _CREDENTIAL_CLASSES.get(platform.lower())
+    if cls is None:
+        return frozenset()
+    return frozenset(name for field in cls.model_fields for name in env_names_for(platform, field))
 
 
 # ── Per-engine introspector registry ──────────────────────────────────

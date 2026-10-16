@@ -133,6 +133,12 @@ class AgentSpec:
     cost_field: Optional[str]  # top-level JSON cost field, e.g. "total_cost_usd"
     auth_markers: Tuple[str, ...]  # stderr substrings -> not_authenticated
     login_hint: str  # actionable suggestion for missing-key / not-authenticated
+    # Endpoint variables the agent reads, and the key variables it sends there
+    # instead of its own stored login. A project dotenv file's endpoint reaches
+    # the agent only next to one of those keys from the project files too; see
+    # ``_agent_environment``.
+    endpoint_env: Tuple[str, ...] = ()
+    endpoint_key_env: Tuple[str, ...] = ()
 
 
 _AGENT_SPECS: Dict[str, AgentSpec] = {
@@ -161,12 +167,14 @@ _AGENT_SPECS: Dict[str, AgentSpec] = {
             "authentication",
         ),
         login_hint="Run `claude` once and sign in (subscription), or set ANTHROPIC_API_KEY.",
+        endpoint_env=("ANTHROPIC_BASE_URL",),
+        endpoint_key_env=("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"),
     ),
     "codex": AgentSpec(
         name="codex",
         binary="codex",
         keyless=False,
-        api_key_env="CODEX_API_KEY",
+        api_key_env="CODEX_API_KEY",  # pragma: allowlist secret (a variable name)
         prompt_transport="argv",
         system_prompt_mode="prepend",
         system_prompt_flag="",
@@ -185,12 +193,16 @@ _AGENT_SPECS: Dict[str, AgentSpec] = {
             "403",
         ),
         login_hint="Set CODEX_API_KEY — `codex exec` uses API-key auth in headless mode.",
+        # codex sends its stored login (ChatGPT or API key) to OPENAI_BASE_URL
+        # unless CODEX_API_KEY is set; OPENAI_API_KEY does not replace it.
+        endpoint_env=("OPENAI_BASE_URL",),
+        endpoint_key_env=("CODEX_API_KEY",),
     ),
     "cursor": AgentSpec(
         name="cursor",
         binary="cursor-agent",
         keyless=False,
-        api_key_env="CURSOR_API_KEY",
+        api_key_env="CURSOR_API_KEY",  # pragma: allowlist secret (a variable name)
         prompt_transport="argv",
         system_prompt_mode="prepend",
         system_prompt_flag="",
@@ -216,7 +228,7 @@ _AGENT_SPECS: Dict[str, AgentSpec] = {
         # ``kiro-cli chat --no-interactive "<prompt>"`` (kiro.dev/docs/cli/headless).
         binary="kiro-cli",
         keyless=False,
-        api_key_env="KIRO_API_KEY",
+        api_key_env="KIRO_API_KEY",  # pragma: allowlist secret (a variable name)
         prompt_transport="argv",
         system_prompt_mode="prepend",
         system_prompt_flag="",
@@ -336,6 +348,40 @@ def _scratch_cwd() -> str:
     with ``FLUID_FORGE_AGENT_CWD`` when you *want* the agent to see the repo.
     """
     return os.environ.get("FLUID_FORGE_AGENT_CWD") or tempfile.gettempdir()
+
+
+def _agent_environment(spec: AgentSpec) -> Dict[str, str]:
+    """The environment the agent CLI runs with.
+
+    ``os.environ``, minus an endpoint (``spec.endpoint_env``) that a project
+    dotenv file supplied while none of the agent's key variables came from the
+    project files (a blank one counts as none; ``project_supplied``): the
+    agent would send its own stored login there. The
+    project files may pair OPENAI_BASE_URL with OPENAI_API_KEY for FLUID's own
+    OpenAI calls (``credentials.protected_env``), but codex reads only
+    CODEX_API_KEY in place of its login.
+    """
+    env = dict(os.environ)
+    if not spec.endpoint_env:
+        return env
+    from fluid_build.credentials.dotenv_store import project_supplied
+
+    if any(project_supplied(key) for key in spec.endpoint_key_env):
+        return env
+    dropped = [key for key in spec.endpoint_env if project_supplied(key)]
+    for key in dropped:
+        del env[key]
+    if dropped:
+        LOG.warning(
+            "Not passing %s from the project's dotenv files to %s: it would send your "
+            "%s login there. Set %s in the same project files, or export the endpoint "
+            "in your shell.",
+            ", ".join(dropped),
+            spec.binary,
+            spec.name,
+            " or ".join(spec.endpoint_key_env),
+        )
+    return env
 
 
 def _redact(text: str) -> str:
@@ -485,7 +531,7 @@ class CodingAgentProvider(LlmProvider):
         # CI/headless-machine fallback. With no auth at all the CLI's own error
         # surfaces below (kiro additionally opens a browser for first-time auth,
         # bounded by the per-call timeout).
-        env = dict(os.environ)
+        env = _agent_environment(spec)
 
         argv: List[str] = [binary, *spec.base_args]
         # Model passthrough only when the user set an explicit, non-placeholder

@@ -288,19 +288,57 @@ def hydrate_dotenv(project_root: Path, environment: Optional[str] = None) -> Non
         3. ``{project_root}/.env.local``
         4. ``$FLUID_SECRETS_FILE`` (if set and the path is a file)
 
+    Files 1-3 may not set the ``credentials.protected_env`` names (skipped with
+    one warning), nor a third-party endpoint such as ``OPENAI_BASE_URL`` or
+    ``PGHOST`` unless they also supply its credential and the operator has not
+    set one in the shell or in the secrets file. ``FLUID_SECRETS_FILE`` counts
+    only when exported before this call, so the file it names is the
+    operator's and every key in it loads. Once a project file is read,
+    ``PYTHON_DOTENV_DISABLED`` is set (unless the operator set it), so dbt and
+    litellm do not load the project's ``.env`` again on their own.
+
     Best-effort: missing ``python-dotenv``, missing files, and read errors are
     DEBUG-logged and skipped — this is convenience hydration, not a gate.
     """
     env_logger = logging.getLogger("fluid.cli.env")
 
     try:
-        from fluid_build.credentials.dotenv_store import DotEnvCredentialStore, load_dotenv
+        from fluid_build.credentials.dotenv_store import (
+            DOTENV_SWITCH,
+            DotEnvCredentialStore,
+            operator_set_dotenv_switch,
+        )
     except ImportError:
         env_logger.debug("python-dotenv not installed; skipping env hydration")
         return
 
+    # Resolved before the project files load: only an operator-exported path
+    # counts, and ``~`` in it is the operator's home, not one a project
+    # file supplied after the fact.
+    secrets_file = os.environ.get("FLUID_SECRETS_FILE")
+    secrets_path: Optional[Path] = None
+    if secrets_file:
+        try:
+            secrets_path = Path(secrets_file).expanduser()
+        except RuntimeError as exc:  # no home directory to expand ``~`` against
+            env_logger.debug("Cannot resolve FLUID_SECRETS_FILE=%s: %s", secrets_file, exc)
+
+    # The secrets file loads last and wins, so its credentials are the
+    # operator's even before they reach os.environ: a project endpoint must
+    # not be paired with them (``protected_env.unpaired_endpoints``).
+    operator_values: Dict[str, Optional[str]] = {}
+    if secrets_path is not None and secrets_path.is_file():
+        try:
+            from dotenv import dotenv_values
+
+            operator_values = dict(dotenv_values(secrets_path))
+        except (ImportError, OSError, ValueError) as exc:
+            env_logger.debug("Cannot pre-read FLUID_SECRETS_FILE %s: %s", secrets_path, exc)
+
     try:
-        DotEnvCredentialStore(project_root=project_root, environment=environment).load()
+        DotEnvCredentialStore(
+            project_root=project_root, environment=environment, operator_env=operator_values
+        ).load()
     except ImportError:
         env_logger.debug("python-dotenv not available; skipping project dotenv hydration")
     except (OSError, ValueError) as exc:
@@ -308,19 +346,21 @@ def hydrate_dotenv(project_root: Path, environment: Optional[str] = None) -> Non
     except Exception as exc:  # pragma: no cover - defensive
         env_logger.warning("Unexpected error hydrating project dotenv: %s", exc)
 
-    secrets_file = os.environ.get("FLUID_SECRETS_FILE")
-    if not secrets_file:
+    if secrets_path is None:
         return
 
-    secrets_path = Path(secrets_file).expanduser()
     if not secrets_path.is_file():
         env_logger.debug("FLUID_SECRETS_FILE=%s does not point at a file; skipping", secrets_path)
         return
 
-    try:
-        load_dotenv(secrets_path, override=True)
-        env_logger.debug("Hydrated os.environ from FLUID_SECRETS_FILE=%s", secrets_path)
-    except (OSError, ValueError) as exc:
-        env_logger.debug("Failed to load FLUID_SECRETS_FILE %s: %s", secrets_path, exc)
-    except Exception as exc:  # pragma: no cover - defensive
-        env_logger.warning("Unexpected error loading FLUID_SECRETS_FILE %s: %s", secrets_path, exc)
+    # Exported from the values read above rather than with ``load_dotenv``:
+    # the project files switched python-dotenv's loader off
+    # (PYTHON_DOTENV_DISABLED, so dbt and litellm cannot re-read them), and
+    # values read before the project files loaded expand ``${VAR}`` against
+    # the operator's environment only.
+    for key, value in operator_values.items():
+        if value is not None:
+            os.environ[key] = value
+            if key.strip().upper() == DOTENV_SWITCH:
+                operator_set_dotenv_switch()
+    env_logger.debug("Hydrated os.environ from FLUID_SECRETS_FILE=%s", secrets_path)

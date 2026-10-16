@@ -261,6 +261,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Must run before ANY output: the banner below is Unicode-heavy and would
     # crash on a cp1252 console otherwise (xsdOYJ6E).
     _force_utf8_streams()
+    # Project dotenv files reach this process only through
+    # credentials.dotenv_store, which drops the names a project file may not
+    # set. dbt (which loads the nearest .env when it starts) and litellm
+    # (which loads one when it is imported, found from its install directory,
+    # so a virtualenv inside the project finds the project's) would read them
+    # again without that filter. An operator who exported the switch keeps it;
+    # the project's own code (a python build step) does not get FLUID's.
+    from fluid_build.credentials.dotenv_store import switch_off_dotenv_loading
+
+    switch_off_dotenv_loading()
     cli = ProductionCLI()
 
     try:

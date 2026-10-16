@@ -41,7 +41,19 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Dict, FrozenSet, List, Optional
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
+from urllib.parse import urlsplit
 
 from fluid_build.api.runner import (
     RunContext,
@@ -292,6 +304,7 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
 
     from .._acquisition_common import begin_acquisition_run, resolve_connection_secrets
     from .._credentials import make_destination
+    from .destinations import undo_bridge_writes
 
     started_at, t_start = begin_acquisition_run(ctx, runner)
 
@@ -304,6 +317,15 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
     expose = (ctx.contract.get("exposes") or [{}])[0]
     binding = expose.get("binding") or {}
     dest_platform = binding.get("platform")
+    # The environment before the bridge copies anything into dlt's names: a
+    # dlt variable set there is the operator's or the project's, never the
+    # bridge's copy of a FLUID one (_project_endpoints_for_destination). An
+    # earlier build in this process (fluid apply runs its builds in a loop and
+    # goes on after a failed one) left its copies in place, for dlt to read
+    # until that build was done; they go back first, so every build starts
+    # from the environment as the operator left it.
+    undo_bridge_writes()
+    environ_before_bridge = dict(os.environ)
     if dest_platform:
         make_destination(
             "dlt",
@@ -449,8 +471,20 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
             out_dir.mkdir(parents=True, exist_ok=True)
             destination = fs_dest(bucket_url=str(out_dir))
     else:
-        # Generic — let dlt pick up from env
-        destination = dest_name
+        endpoints = _project_endpoints_for_destination(
+            dest_name, pipeline_name, binding, environ_before_bridge
+        )
+        if endpoints:
+            try:
+                destination = _destination_with_project_credentials(
+                    dest_name, binding, pipeline_name, endpoints
+                )
+            except Exception as exc:  # noqa: BLE001 — any failure here must stop the run
+                LOG.error("dlt.destination.pinned.failed err=%s", exc)
+                return _failed_result(ctx, started_at, str(exc), t_start)
+        else:
+            # Generic — let dlt pick up from env
+            destination = dest_name
 
     write_disposition = _map_mode_to_write_disposition(ctx.source.mode.value)
 
@@ -520,6 +554,565 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
             "pipeline_name": pipeline_name,
         },
     )
+
+
+# The FLUID services whose endpoint variables the dlt bridge (destinations.py,
+# through _credentials.py) copies into a destination's credentials:
+# SNOWFLAKE_ACCOUNT, POSTGRES_HOST / PG_HOST, REDSHIFT_HOST.
+_BRIDGED_SERVICES = {
+    "snowflake": "Snowflake",
+    "postgres": "PostgreSQL",
+    "redshift": "Amazon Redshift",
+}
+
+# The dlt destination types that connect through libpq (psycopg2), and the
+# connection parameters of the connection string dlt hands it: its credentials
+# require a host, a user name, a password and a database, and have a port and a
+# connect timeout by default (destinations/impl/postgres/sql_client.py,
+# ``Psycopg2SqlClient.open_connection``, which the redshift client inherits;
+# dlt 1.31.0, checked against dlt and psycopg2 in
+# tests/test_dotenv_dlt_destination.py).
+_LIBPQ_DESTINATIONS = frozenset({"postgres", "redshift"})
+_DLT_LIBPQ_PARAMETERS = frozenset({"host", "port", "user", "password", "dbname", "connect_timeout"})
+
+# libpq's variables that choose where it connects, with the parameter each
+# gives. libpq takes a parameter from its variable only where the connection
+# string leaves it out
+# (https://www.postgresql.org/docs/current/libpq-envars.html), and given
+# ``hostaddr`` it connects to that address whatever ``host`` says
+# (https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-HOSTADDR).
+# So on dlt's connection a project's PGHOST and PGPORT change nothing and a
+# project's PGHOSTADDR would move the connection, the operator's password with
+# it. No project file can set PGHOSTADDR (protected_env.PROTECTED_ENV_KEYS);
+# should one ever load, the runner still pins the destination to the project's
+# values. libpq's other variables that could change where the password goes or
+# what is sent are set by dlt's connection string (PGUSER, PGPASSWORD,
+# PGDATABASE), read only without a password in it (PGPASSFILE), or refused in a
+# project file outright (PGSERVICE, PGSERVICEFILE, PGSYSCONFDIR, PGSSLMODE,
+# PGSSLROOTCERT ...).
+_LIBPQ_ENDPOINTS = {"PGHOST": "host", "PGHOSTADDR": "hostaddr", "PGPORT": "port"}
+
+# Default-deny for a dlt destination's own credentials. dlt layers every field
+# of a destination's credentials it finds in the environment on top of the
+# operator's (dlt/common/configuration/resolve.py: the environment provider
+# comes first, and each field resolves on its own), so a project that set one
+# could move or reshape the operator's connection with the operator's password
+# still on it: the postgres / redshift ``query`` map gives libpq ``hostaddr``
+# (https://www.postgresql.org/docs/current/libpq-connect.html), the ducklake
+# ``catalog`` connection is a libpq URL of its own, an ``endpoint_url`` takes
+# the operator's object-store keys elsewhere, a ``password`` or ``username``
+# chooses the credential. Enumerating the fields that can do that missed nested
+# configurations (round 16), so every name dlt reads under a destination's
+# credentials — every field, at any depth, and every lookup spelling of it
+# (:func:`_dlt_credentials_names`) — is an endpoint: a project dotenv file
+# that sets one pins the destination to the project's own credentials, or the
+# run fails closed. When dlt's spec cannot be introspected the destination's
+# credentials sections pin whole.
+#
+# The exceptions: the fields below, per dlt credentials class (an exact class,
+# a subclass inherits nothing), each a top-level field holding one value. They
+# select inside the operator's own account or tune its session, and cannot move
+# the connection or choose a credential; each was checked against dlt 1.31.0
+# (tests/test_dotenv_dlt_default_deny.py):
+#   PostgreSQL, Redshift  database, connect_timeout, client_encoding,
+#                         session_timezone. dlt hands libpq a URL
+#                         (``to_native_representation``) plus ``options``;
+#                         libpq's own parser (psycopg2 ``parse_dsn``) shows a
+#                         value in one of them either stays in its own
+#                         parameter or makes libpq refuse the string, never
+#                         sets the host, address, port, user, password, TLS
+#                         files or service.
+#   Snowflake             database, warehouse, role. dlt passes each to the
+#                         connector as its own keyword argument
+#                         (``SnowflakeCredentials.to_connector_params``), never
+#                         into the account or host the connector derives its
+#                         address from.
+# Every other field of every destination pins, ``database`` included wherever
+# it was not checked or is not plain data: Fabric joins it into its ODBC
+# connection string unescaped (MSSQL / Synapse escape it), DuckDB reads it as a
+# file path, MotherDuck as an ``md:`` URL, SQLAlchemy as its dialect does.
+_DLT_IN_ACCOUNT_FIELDS: Dict[str, FrozenSet[str]] = {
+    "dlt.destinations.impl.postgres.configuration.PostgresCredentials": frozenset(
+        {"database", "connect_timeout", "client_encoding", "session_timezone"}
+    ),
+    "dlt.destinations.impl.redshift.configuration.RedshiftCredentials": frozenset(
+        {"database", "connect_timeout", "client_encoding", "session_timezone"}
+    ),
+    "dlt.destinations.impl.snowflake.configuration.SnowflakeCredentials": frozenset(
+        {"database", "warehouse", "role"}
+    ),
+}
+
+# How deep the spec walk follows configurations nested in the credentials; a
+# deeper one pins whole (dlt 1.31 nests at most three: ducklake's storage
+# credentials).
+_DLT_MAX_NESTING = 6
+
+# The sections dlt's environment provider reads a destination's credentials
+# under, most specific first, each tried first behind the pipeline name
+# (dlt/common/configuration/resolve.py, _build_section_lookup_paths and
+# _resolve_single_value; providers/environ.py joins the pipeline name, the
+# sections and the field with ``__`` and upper-cases the result).
+_DLT_CREDENTIAL_SECTIONS = (
+    "DESTINATION__{name}__CREDENTIALS",
+    "DESTINATION__CREDENTIALS",
+    "CREDENTIALS",
+)
+
+
+def _dlt_destination(destination: str) -> Tuple[str, str]:
+    """The section dlt reads the contract's destination ``destination``'s
+    configuration under, and the short name of its type, as ``dlt.pipeline``
+    resolves it (``Destination.from_reference``): ``snowflake`` and
+    ``dlt.destinations.snowflake`` are both ``("snowflake", "snowflake")``, and
+    a named destination ``my_wh`` whose ``DESTINATION__MY_WH__DESTINATION_TYPE``
+    is ``snowflake`` is ``("my_wh", "snowflake")``
+    (https://dlthub.com/docs/general-usage/destination#configure-multiple-destinations-of-the-same-type).
+    A reference dlt cannot resolve is returned as it is: ``dlt.pipeline`` then
+    fails on it before it reads any credentials."""
+    try:
+        from dlt.common.destination import Destination
+
+        reference = Destination.from_reference(destination)
+    except Exception:  # noqa: BLE001 — dlt missing, or a reference it cannot resolve
+        return destination, destination
+    return reference.destination_name, reference.destination_type.rsplit(".", 1)[-1]
+
+
+def _dlt_names(destination: str, pipeline_name: str, field: Optional[str]) -> List[str]:
+    """The variables dlt reads ``field`` of ``destination``'s credentials from,
+    in its order; with ``field`` None, the whole credentials (a connection
+    string)."""
+    sections = [section.format(name=destination.upper()) for section in _DLT_CREDENTIAL_SECTIONS]
+    prefixes = [f"{pipeline_name.upper()}__", ""] if pipeline_name else [""]
+    suffix = f"__{field.upper()}" if field else ""
+    return [prefix + section + suffix for prefix in prefixes for section in sections]
+
+
+def _dlt_config_classes(hint: Any) -> List[Any]:
+    """The dlt configuration classes ``hint`` names: itself, or each member of
+    a union (``Optional``, ``Final`` and ``Annotated`` unwrapped), as
+    ``typing.get_args`` gives them."""
+    import typing
+
+    from dlt.common.configuration.specs.base_configuration import BaseConfiguration
+
+    found: List[Any] = []
+    pending = [hint]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, type) and issubclass(current, BaseConfiguration):
+            if current not in found:
+                found.append(current)
+        else:
+            pending.extend(typing.get_args(current))
+    return found
+
+
+def _dlt_credentials_spec(
+    kind: str,
+) -> Tuple[List[Tuple[Tuple[str, ...], bool]], List[Tuple[str, ...]], List[Tuple[str, ...]]]:
+    """dlt's credentials of the destination type ``kind``, walked:
+    ``(fields, configurations, opaque)``.
+
+    ``fields`` are the resolvable fields at any depth, each as its path from
+    the credentials and whether :data:`_DLT_IN_ACCOUNT_FIELDS` allows it;
+    ``configurations`` the nested configurations' paths; ``opaque`` those
+    (``()`` for the credentials themselves) whose fields cannot be listed in
+    advance: dlt picks the class at run time (a hint resolver, such as lance's
+    and the filesystem's credentials), or it has none of its own. Every class
+    the credentials can be (``credentials_type()`` and each member of a union
+    hint) is walked. Raises when dlt cannot introspect ``kind``.
+    """
+    import dlt
+
+    from .destinations import _credentials_class
+
+    root = _credentials_class(kind)
+    if root is None:
+        raise LookupError(f"dlt has no credentials class for destination type {kind!r}")
+    spec = getattr(dlt.destinations, kind.lower())().spec()
+    classes = _dlt_config_classes(spec.get_resolvable_fields().get("credentials"))
+    fields: List[Tuple[Tuple[str, ...], bool]] = []
+    configurations: List[Tuple[str, ...]] = []
+    opaque: List[Tuple[str, ...]] = []
+    if "credentials" in (getattr(type(spec), "__hint_resolvers__", None) or {}):
+        opaque.append(())
+
+    def walk(cls: Any, path: Tuple[str, ...], seen: Tuple[Any, ...]) -> None:
+        allowed = _DLT_IN_ACCOUNT_FIELDS.get(f"{cls.__module__}.{cls.__qualname__}", frozenset())
+        resolvers = getattr(cls, "__hint_resolvers__", None) or {}
+        hints = cls.get_resolvable_fields()
+        if not hints and path:
+            opaque.append(path)
+        for field, hint in hints.items():
+            here = (*path, field)
+            nested = _dlt_config_classes(hint)
+            if not nested:
+                fields.append((here, not path and field in allowed and field not in resolvers))
+                continue
+            configurations.append(here)
+            if field in resolvers or field.startswith("_") or len(here) >= _DLT_MAX_NESTING:
+                opaque.append(here)
+            for member in nested:
+                if member in seen:
+                    opaque.append(here)
+                else:
+                    walk(member, here, (*seen, member))
+
+    for cls in dict.fromkeys([root, *classes]):
+        walk(cls, (), (cls,))
+    return fields, configurations, opaque
+
+
+def _dlt_credentials_names(
+    section: str, pipeline_name: str, kind: str
+) -> Tuple[FrozenSet[str], Tuple[str, ...]]:
+    """The names dlt reads the credentials of the destination under
+    ``section`` (type ``kind``) from in the pipeline ``pipeline_name``, every
+    field at any depth in every spelling, upper-cased, but those of
+    :data:`_DLT_IN_ACCOUNT_FIELDS`: ``(names, prefixes)``; a name under one of
+    ``prefixes`` is one of them too.
+
+    dlt looks a field of a configuration up under that configuration's
+    section path, then under each shorter path made by dropping sections
+    before the configuration's own name, each also behind the pipeline name:
+    the credentials' ``host`` under ``DESTINATION__<NAME>__CREDENTIALS``,
+    ``DESTINATION__CREDENTIALS`` and ``CREDENTIALS``; ducklake's
+    ``credentials.catalog.host`` under
+    ``DESTINATION__DUCKLAKE__CREDENTIALS__CATALOG``,
+    ``DESTINATION__DUCKLAKE__CATALOG``, ``DESTINATION__CATALOG`` and
+    ``CATALOG`` (dlt/common/configuration/resolve.py,
+    ``_build_section_lookup_paths``, and ``_resolve_config_field`` for a
+    nested configuration, dlt 1.31.0). A configuration's whole value (a
+    connection string) is read under its own section path the same way. The
+    names below a field (a single key of a ``query`` map) count with it, and
+    every name below an opaque configuration (:func:`_dlt_credentials_spec`).
+    When dlt cannot introspect ``kind`` the credentials are opaque, and every
+    name under ``DESTINATION__<NAME>__`` counts too: fail closed.
+    """
+    heads = (f"{pipeline_name.upper()}__", "") if pipeline_name else ("",)
+
+    def spellings(path: Sequence[str], tail: Sequence[str] = ()) -> List[str]:
+        full = ["DESTINATION", section.upper(), "CREDENTIALS", *(part.upper() for part in path)]
+        sections, own = full[:-1], full[-1]
+        return [
+            head + "__".join((*sections[:kept], own, *tail))
+            for head in heads
+            for kept in range(len(sections), -1, -1)
+        ]
+
+    names: Set[str] = set()
+    prefixes: Set[str] = set()
+    try:
+        fields, configurations, opaque = _dlt_credentials_spec(kind)
+    except Exception as exc:  # noqa: BLE001 — dlt missing, or a spec it cannot build: pin
+        LOG.debug("dlt.destination.spec.unknown kind=%s err=%s", kind, exc)
+        fields, configurations, opaque = [], [], [()]
+        prefixes.update(f"{head}DESTINATION__{section.upper()}__" for head in heads)
+    for path, allowed in fields:
+        if not allowed:
+            read = spellings(path[:-1], (path[-1].upper(),))
+            names.update(read)
+            prefixes.update(f"{name}__" for name in read)
+    for path in [(), *configurations]:
+        names.update(spellings(path))
+    for path in opaque:
+        prefixes.update(f"{name}__" for name in spellings(path))
+    return frozenset(names), tuple(sorted(prefixes))
+
+
+def _dlt_endpoint_fields(kind: str) -> FrozenSet[str]:
+    """The top-level fields of ``kind``'s dlt credentials that pin it: all of
+    them (nested configurations included) but :data:`_DLT_IN_ACCOUNT_FIELDS`.
+    The empty set when dlt cannot introspect ``kind``; the names under its
+    credentials sections then pin whole (:func:`_dlt_credentials_names`)."""
+    try:
+        fields, configurations, _ = _dlt_credentials_spec(kind)
+    except Exception:  # noqa: BLE001 — dlt missing, or a spec it cannot build
+        return frozenset()
+    return frozenset(
+        {path[0] for path, allowed in fields if not allowed} | {path[0] for path in configurations}
+    )
+
+
+def _project_endpoint_field_names(
+    section: str, pipeline_name: str, kind: str, names: Sequence[str]
+) -> List[str]:
+    """The variables in ``names`` dlt reads a field of the credentials of the
+    destination under ``section`` (type ``kind``) from in the pipeline
+    ``pipeline_name``, at any depth and in any spelling it looks up, other than
+    the in-account fields (:func:`_dlt_credentials_names`). Compared
+    upper-cased and stripped, as everywhere here; never parsed. Over-matching
+    only pins more, never less.
+    """
+    read, below = _dlt_credentials_names(section, pipeline_name, kind)
+    return [
+        name
+        for name in names
+        if name.strip().upper() in read or name.strip().upper().startswith(below)
+    ]
+
+
+def _reaches_destination(name: str, destination: str, pipeline_name: str) -> bool:
+    """Whether dlt reads the variable ``name`` for ``destination``'s credentials
+    in the pipeline ``pipeline_name``: one of the names :func:`_dlt_names`
+    gives for the whole credentials (a connection string), or one of them
+    followed by a field (``__HOST``, ``___SNOWFLAKE_HOST``).
+
+    Matched against those exact names, never parsed: the pipeline name is the
+    contract's and is the first section dlt tries, so one that looks like a
+    section (``sources``, ``a__destination__postgres``) is read as the
+    destination's credentials all the same. A name behind another pipeline's
+    name is one dlt never reads in this run.
+    """
+    upper = name.strip().upper()
+    for credentials in _dlt_names(destination, pipeline_name, None):
+        if upper == credentials:
+            return True
+        field = upper[len(credentials) + 2 :]
+        if upper.startswith(credentials + "__") and field and "__" not in field:
+            return True
+    return False
+
+
+def _operator_destination_endpoint(
+    section: str, pipeline_name: str, environ: Mapping[str, str]
+) -> Optional[str]:
+    """The operator's variable in ``environ`` that gives dlt the host of the
+    destination under ``section`` ahead of the bridge's copy, or ``None``.
+
+    The bridge writes ``DESTINATION__<SECTION>__CREDENTIALS__HOST`` only where
+    that is unset. dlt takes a field from the first of :func:`_dlt_names` that
+    is set, so a host the operator exported under that name or one dlt reads
+    before it is the one dlt uses. A connection string comes before every field
+    variable: dlt parses it first and keeps what it gives as explicit values
+    that no provider overrides, filling in only what it leaves out
+    (dlt/common/configuration/resolve.py, ``_maybe_parse_native_value`` and
+    ``_resolve_config_field``, the same from dlt 0.5.4 to 1.31.0). One the
+    operator exported that names a host wins the same way. A value is the
+    operator's when it is not blank, no project dotenv file supplied it and
+    the bridge did not write it (``destinations.bridge_writes``: a copy it has
+    not put back yet is the bridge's, whatever it copied).
+    """
+    from fluid_build.credentials.dotenv_store import project_value_in_effect
+
+    from .destinations import bridge_writes
+
+    copies = bridge_writes()
+
+    def operators(name: str) -> str:
+        value = environ.get(name) or ""
+        if not value.strip() or project_value_in_effect(name, environ):
+            return ""
+        if copies.get(name) == value:
+            return ""
+        return value
+
+    hosts = _dlt_names(section, pipeline_name, "host")
+    copied = f"DESTINATION__{section.upper()}__CREDENTIALS__HOST"
+    for name in hosts[: hosts.index(copied) + 1]:
+        if operators(name):
+            return name
+    for name in _dlt_names(section, pipeline_name, None):
+        value = operators(name)
+        try:
+            host = urlsplit(value.strip()).hostname if value else None
+        except ValueError:
+            host = None
+        if host:
+            return name
+    return None
+
+
+def _project_endpoints_for_destination(
+    destination: str,
+    pipeline_name: str,
+    binding: Optional[Mapping[str, Any]] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> List[str]:
+    """The project's endpoint variables in effect that reach the contract's
+    destination ``destination``'s credentials in the pipeline
+    ``pipeline_name``: dlt's own, and those of the FLUID service the bridge
+    copies into them. Names compare in any case (``dotenv_store``).
+
+    The bridge (``destinations.py``) runs only for ``binding.platform``, writes
+    under that platform's section, reads only the variables of its credential
+    class (``_credentials.env_names_read_for``) and keeps a dlt variable that
+    is already set. So a FLUID endpoint reaches the destination only when
+    ``binding.platform`` is the section dlt reads it under, only under a name
+    the bridge reads (not libpq's ``PGHOST`` or the Snowflake resolver's
+    ``SF_ACCOUNT``), and only while ``environ`` (the environment before the
+    bridge ran in this build; default ``os.environ``) holds no host of the
+    operator's that dlt uses ahead of the bridge's copy
+    (:func:`_operator_destination_endpoint`): the destination is then the
+    operator's. ``binding`` None means not known, and counts as if the bridge
+    reached the destination: that pins more, never less.
+
+    Every field of the destination's own dlt credentials a project sets, at
+    any depth and in any spelling dlt looks it up under, is an endpoint too,
+    for every destination type, bridged or not (default-deny): dlt layers it
+    on top of the operator's credentials, so the connector would read the
+    project's address, options or credential from it while dlt still sends
+    the operator's password. The exceptions are the in-account fields of
+    :data:`_DLT_IN_ACCOUNT_FIELDS` (:func:`_project_endpoint_field_names`).
+
+    libpq's ``PGHOSTADDR`` would reach every destination dlt connects to
+    through libpq, whatever the binding or the operator exported: libpq
+    connects to that address with the password dlt passes
+    (:data:`_LIBPQ_ENDPOINTS`). No project file can set it; one that loaded
+    all the same is found here by its name, not through ``protected_env``'s
+    endpoint groups, which leave a protected name out.
+    """
+    from fluid_build.credentials.dotenv_store import (
+        project_endpoints_in_effect,
+        project_values_in_effect,
+    )
+
+    from .._credentials import env_names_read_for
+
+    section, kind = _dlt_destination(destination)
+    found = [
+        name
+        for name in project_endpoints_in_effect("dlt")
+        if _reaches_destination(name, section, pipeline_name)
+    ]
+    if kind.lower() in _LIBPQ_DESTINATIONS:
+        for name in project_values_in_effect():
+            parameter = _LIBPQ_ENDPOINTS.get(name.strip().upper())
+            if parameter is not None and parameter not in _DLT_LIBPQ_PARAMETERS:
+                found.append(name)
+    # Every field of the destination's own dlt credentials a project sets is
+    # an endpoint too, but the in-account ones (default-deny,
+    # :data:`_DLT_IN_ACCOUNT_FIELDS`): dlt layers it on top of the operator's
+    # credentials, so libpq / the connector reads the project's ``hostaddr``,
+    # catalog host or password from it while dlt still sends the operator's.
+    # This holds for every destination, bridged or not, so it comes before the
+    # FLUID-service branch below. A name already found is listed once.
+    found += [
+        name
+        for name in _project_endpoint_field_names(
+            section, pipeline_name, kind, list(project_values_in_effect())
+        )
+        if name not in found
+    ]
+    service = _BRIDGED_SERVICES.get(section.lower())
+    if not service:
+        return found
+    if binding is not None and str(binding.get("platform") or "").lower() != section.lower():
+        return found
+    operator = _operator_destination_endpoint(
+        section, pipeline_name, os.environ if environ is None else environ
+    )
+    if operator:
+        LOG.debug("dlt.destination.operator section=%s name=%s", section, operator)
+        return found
+    read = env_names_read_for(section)
+    return found + [
+        name for name in project_endpoints_in_effect(service) if name.strip().upper() in read
+    ]
+
+
+def _destination_with_project_credentials(
+    destination: str,
+    binding: Dict[str, Any],
+    pipeline_name: str,
+    endpoints: Optional[Sequence[str]] = None,
+) -> Any:
+    """dlt's ``destination`` with credentials from the project's own values only.
+
+    dlt resolves each credential field on its own, from the environment and
+    then from its ``secrets.toml`` and ``config.toml`` (the operator's global
+    ``~/.dlt`` ones included) and its other config providers, so a host the
+    project chose would be completed with the operator's key, authenticator,
+    user, database, TLS client key or password. The bridge also copies the
+    operator's FLUID variables (``SNOWFLAKE_PRIVATE_KEY_PATH`` ...) into the
+    environment dlt reads. So the credentials are built here from the
+    project's values in effect (``dotenv_store.project_values_in_effect``):
+    first the variables dlt reads, in its order, the connection string before
+    the fields, then FLUID's variables the bridge reads for the field, and the
+    contract's ``binding.location``. They are handed to the destination
+    factory resolved, which dlt then uses as they are
+    (https://dlthub.com/docs/general-usage/destination, passing credentials
+    to a destination factory).
+
+    ``endpoints`` are the project's endpoints that pinned the destination,
+    named in an error (by default :func:`_project_endpoints_for_destination`).
+    Raises ``ValueError`` for a destination FLUID cannot build credentials
+    for, and when the project's values leave out a field dlt requires.
+    """
+    import dlt
+    from dlt.common.configuration.specs.base_configuration import extract_inner_hint
+    from dlt.common.configuration.utils import deserialize_value
+
+    from fluid_build.credentials.dotenv_store import project_values_in_effect
+
+    from .._credentials import env_names_for, get_credentials_for
+    from .destinations import _credentials_class, _value_for_dlt_field
+
+    if endpoints is None:
+        endpoints = _project_endpoints_for_destination(destination, pipeline_name, binding)
+    named = ", ".join(endpoints)
+    section, kind = _dlt_destination(destination)
+    factory = getattr(dlt.destinations, kind.lower(), None)
+    credentials_class = _credentials_class(kind) if factory is not None else None
+    if credentials_class is None:
+        raise ValueError(
+            f"dlt destination {destination!r}: the project's dotenv files set its endpoint "
+            f"({named}), and FLUID cannot build its credentials from the project's "
+            "values alone. Export the endpoint in your shell or CI environment to use it."
+        )
+    project = project_values_in_effect()
+    by_name: Dict[str, List[str]] = {}
+    for name, value in project.items():
+        by_name.setdefault(name.upper(), []).append(value)
+    location = binding.get("location") or {}
+    bridged: Dict[str, Any] = {}
+    for field, value in get_credentials_for(section, binding=binding).items():
+        names = env_names_for(section, field)
+        if location.get(field) == value or any(str(value) in by_name.get(n, ()) for n in names):
+            bridged[field] = value
+        elif not str(value).strip():
+            # behind the operator's blank variable the project's value is the
+            # one in effect, as the credential resolver reads it
+            # (dotenv_store.project_value_in_effect)
+            theirs = next((by_name[n][0] for n in names if by_name.get(n)), None)
+            if theirs is not None:
+                bridged[field] = theirs
+
+    def first(names: List[str]) -> Optional[str]:
+        return next((project[name] for name in names if project.get(name)), None)
+
+    credentials = credentials_class()
+    native = first(_dlt_names(section, pipeline_name, None))
+    if native:
+        credentials.parse_native_representation(native)
+    hints = credentials.get_resolvable_fields()
+    for field, hint in hints.items():
+        if field == "drivername":
+            continue
+        value: Any = first(_dlt_names(section, pipeline_name, field))
+        if value is None:
+            value = _value_for_dlt_field(section, field, bridged)
+        if value is None or value == "":
+            continue
+        if isinstance(value, str):
+            value = deserialize_value(field, value, extract_inner_hint(hint))
+        setattr(credentials, field, value)
+    missing = [
+        field
+        for field, hint in hints.items()
+        if not credentials.is_field_resolved(getattr(credentials, field, None), hint)
+    ]
+    if missing:
+        raise ValueError(
+            f"dlt destination {destination!r}: the project's dotenv files set its endpoint "
+            f"({named}), so its credentials come only from those files and the "
+            f"contract, which leave out {', '.join(missing)}. Add them there, or export "
+            "the endpoint in your shell or CI environment to use your own dlt credentials."
+        )
+    credentials.resolve()
+    return factory(credentials=credentials, destination_name=section)
 
 
 def _failed_result(ctx: RunContext, started_at: str, err: str, t_start: float) -> RunResult:

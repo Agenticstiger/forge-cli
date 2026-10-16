@@ -132,9 +132,15 @@ class BaseCredentialResolver(ABC):
         Raises:
             CredentialError: If required credential not found
         """
+        # A provider's endpoint chosen by the project's dotenv files gets only
+        # the project's credentials: the CLI argument, the environment and
+        # those files. Nothing from the operator's stores below, and nothing
+        # cached, which may have come from them.
+        pinned = self._project_endpoint_in_effect()
+
         # Check cache first — honor the configured TTL.
         cache_key = f"{self.provider}.{key}"
-        cached = self._cache.get(cache_key)
+        cached = None if pinned else self._cache.get(cache_key)
         if cached is not None:
             cached_value, expires_at = cached
             if time.monotonic() < expires_at:
@@ -168,44 +174,49 @@ class BaseCredentialResolver(ABC):
             if value:
                 logger.debug("Credential resolved from: .env file")
 
+        # Reading the project's files may have just loaded its endpoint.
+        pinned = pinned or self._project_endpoint_in_effect()
+        if value is None and pinned:
+            logger.debug("Credential sources outside the environment skipped (project endpoint)")
+
         # 4. OS Keyring
-        if value is None:
+        if value is None and not pinned:
             value = self._get_from_keyring(key)
             if value:
                 logger.debug("Credential resolved from: OS keyring")
 
         # 5. Encrypted file
-        if value is None:
+        if value is None and not pinned:
             value = self._get_from_encrypted_file(key)
             if value:
                 logger.debug("Credential resolved from: encrypted file")
 
         # 6. Config file
-        if value is None:
+        if value is None and not pinned:
             value = self._get_from_config(key)
             if value:
                 logger.debug("Credential resolved from: config file")
 
         # 7. Vault
-        if value is None:
+        if value is None and not pinned:
             value = self._get_from_vault(key)
             if value:
                 logger.debug("Credential resolved from: Vault")
 
         # 8. Secret Manager
-        if value is None:
+        if value is None and not pinned:
             value = self._get_from_secret_manager(key)
             if value:
                 logger.debug("Credential resolved from: secret manager")
 
         # 9. Provider-specific default
-        if value is None:
+        if value is None and not pinned:
             value = self._get_provider_default(key, **kwargs)
             if value:
                 logger.debug("Credential resolved from: provider default")
 
         # 10. Interactive prompt (lowest priority)
-        if value is None and self.config.allow_prompt and required:
+        if value is None and self.config.allow_prompt and required and not pinned:
             value = self._get_from_prompt(key)
             if value:
                 logger.debug("Credential resolved from: interactive prompt")
@@ -218,7 +229,7 @@ class BaseCredentialResolver(ABC):
             )
 
         # Cache the result with a monotonic expiry stamp.
-        if value is not None:
+        if value is not None and not pinned:
             self._cache[cache_key] = (
                 value,
                 time.monotonic() + self.config.cache_duration_seconds,
@@ -226,15 +237,33 @@ class BaseCredentialResolver(ABC):
 
         return value
 
-    def _get_from_env(self, key: str) -> Optional[str]:
-        """Get credential from environment variable."""
-        env_keys = [
+    def _project_endpoint_in_effect(self) -> bool:
+        """Whether this provider's endpoint in effect came from project dotenv files.
+
+        Then ``get_credential`` reads only the CLI argument, the environment
+        and the project's files: the project files paired that endpoint with
+        a credential of their own (``credentials.protected_env``), and the
+        operator's keyring, encrypted file, config file or secret manager
+        must not supply one for a host the project chose. Providers whose
+        endpoints are listed there override this.
+        """
+        return False
+
+    def _env_names(self, key: str) -> List[str]:
+        """The environment variables ``key`` is read from, in order."""
+        return [
             f"{self.provider.upper()}_{key.upper()}",
             f"{self.provider.upper()}__{key.upper()}",
             key.upper(),
         ]
 
-        for env_key in env_keys:
+    def _dotenv_names(self, key: str) -> List[str]:
+        """The names ``key`` is read under from the project's .env files, in order."""
+        return [f"{self.provider.upper()}_{key.upper()}", key.upper()]
+
+    def _get_from_env(self, key: str) -> Optional[str]:
+        """Get credential from environment variable."""
+        for env_key in self._env_names(key):
             value = os.environ.get(env_key)
             if value:
                 return value
@@ -263,9 +292,7 @@ class BaseCredentialResolver(ABC):
             )
 
             # Try provider-prefixed key first, then fallback to plain key
-            env_keys = [f"{self.provider.upper()}_{key.upper()}", key.upper()]
-
-            for env_key in env_keys:
+            for env_key in self._dotenv_names(key):
                 value = store.get_credential(env_key)
                 if value:
                     return value

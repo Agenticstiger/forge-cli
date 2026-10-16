@@ -68,9 +68,16 @@ dependencies = [
   # a core dependency, so this broke installs, not just CI. Cap 3.10 below
   # the regression and leave 3.11+ on current litellm; drop the second line
   # once upstream guards that import with typing_extensions.
-  "litellm>=1.83.7,<2; python_version >= '3.11'",
-  "litellm>=1.83.7,<1.98; python_version < '3.11'",
-  "python-dotenv>=1.0",  # .env file credential loading in fluid_build.credentials.dotenv_store
+  #
+  # >=1.83.14 for the python-dotenv floor below: 1.83.7 to 1.83.13 pin
+  # python-dotenv==1.0.1, which ignores PYTHON_DOTENV_DISABLED.
+  "litellm>=1.83.14,<2; python_version >= '3.11'",
+  "litellm>=1.83.14,<1.98; python_version < '3.11'",
+  # .env file credential loading in fluid_build.credentials.dotenv_store.
+  # 1.2.0 is the first release that honours PYTHON_DOTENV_DISABLED, which
+  # stops dbt and litellm re-reading the project's .env around the
+  # protected_env filter; 1.0.x and 1.1.x load regardless.
+  "python-dotenv>=1.2.0",
   "cryptography>=46.0.7",  # Fernet-encrypted credential store; security: >=46.0.7 closes CVE-2026-26007/39892/34073
   # OS keyring is now a hard dependency (Issue 5).  Catalog source
   # secrets default to the OS keyring (encrypted-at-rest); the

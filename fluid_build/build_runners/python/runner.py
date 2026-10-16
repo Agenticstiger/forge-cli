@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional
 
 from fluid_build._console import cprint, success
 from fluid_build._console import error as console_error
+from fluid_build.credentials.dotenv_store import environment_for_project_code
 
 from .._path_safety import confine_to_workspace, resolve_workspace_root
 
@@ -133,11 +134,15 @@ def execute_build(
                     python_executable = str(venv_python)
 
             try:
+                # The checkout's own code: without the python-dotenv switch
+                # FLUID set for dbt and litellm, so a step that loads its own
+                # dotenv file still can.
                 result = subprocess.run(
                     [python_executable, str(script_path)],
                     cwd=contract_dir,
                     capture_output=no_output,
                     text=True,
+                    env=environment_for_project_code(),
                 )
 
                 duration = time.time() - start_time

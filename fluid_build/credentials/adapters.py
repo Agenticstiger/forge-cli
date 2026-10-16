@@ -20,7 +20,7 @@ credential resolution logic while maintaining backward compatibility.
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .resolver import BaseCredentialResolver, CredentialConfig
 
@@ -37,6 +37,29 @@ class SnowflakeCredentialAdapter(BaseCredentialResolver):
 
     def __init__(self, config: Optional[CredentialConfig] = None):
         super().__init__(provider="snowflake", config=config)
+
+    # The keys resolve_snowflake_settings (providers/snowflake/util/config.py)
+    # also reads as SF_<KEY> and the pairing rule (protected_env, the
+    # Snowflake group) accepts so spelled: the password. Read it here too,
+    # after the SNOWFLAKE_ spellings and before the bare one.
+    _SF_SPELLED_KEYS = frozenset({"password"})
+
+    def _project_endpoint_in_effect(self) -> bool:
+        """A Snowflake account or host from the project's dotenv files is in effect."""
+        from .dotenv_store import project_endpoint_in_effect
+
+        return project_endpoint_in_effect("Snowflake")
+
+    def _with_sf_spelling(self, key: str, names: List[str]) -> List[str]:
+        if key.lower() not in self._SF_SPELLED_KEYS:
+            return names
+        return names[:-1] + [f"SF_{key.upper()}"] + names[-1:]
+
+    def _env_names(self, key: str) -> List[str]:
+        return self._with_sf_spelling(key, super()._env_names(key))
+
+    def _dotenv_names(self, key: str) -> List[str]:
+        return self._with_sf_spelling(key, super()._dotenv_names(key))
 
     def _get_provider_default(self, key: str, **kwargs) -> Optional[str]:
         """
@@ -78,6 +101,13 @@ class SnowflakeCredentialAdapter(BaseCredentialResolver):
                 oauth_token = self.get_credential("oauth_token", required=False, **kwargs)
                 if oauth_token:
                     params["oauth_token"] = oauth_token
+                elif self._project_endpoint_in_effect():
+                    # An account the project's files chose goes only with the
+                    # project's own credential (protected_env): never sign in
+                    # to it with the operator's browser session.
+                    authenticator = self.get_credential("authenticator", required=False, **kwargs)
+                    if authenticator:
+                        params["authenticator"] = authenticator
                 else:
                     # Fallback to external browser (SSO)
                     params["authenticator"] = self.get_credential(

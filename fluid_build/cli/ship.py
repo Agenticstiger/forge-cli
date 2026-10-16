@@ -211,8 +211,13 @@ def _run_stage(fluid_bin: List[str], stage: str, argv: List[str], logger: loggin
     # flags (``--*-secret`` / ``--*-token``) the operator passed through.
     logger.info("[ship %s] $ fluid %s %s", stage, stage, " ".join(_sanitize_argv(argv)))
     logger.info("─" * 70)
+    from fluid_build.credentials.dotenv_store import environment_for_project_code
+
     try:
-        result = subprocess.run(cmd, check=False)
+        # Without the python-dotenv switch this process set: the stage's own
+        # main() sets it again, and so knows a python build step may load
+        # its own dotenv file.
+        result = subprocess.run(cmd, check=False, env=environment_for_project_code())
     except FileNotFoundError as exc:
         logger.error("ship_subprocess_failed: %s", exc)
         return 127

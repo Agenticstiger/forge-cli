@@ -92,6 +92,9 @@ DBT_ENV_EXACT_KEYS = frozenset(
         "PGSSLCERT",
         "PGSSLKEY",
         "PGSSLROOTCERT",
+        # dbt in the container would otherwise load the mounted project's
+        # .env, which the CLI read through credentials.protected_env
+        "PYTHON_DOTENV_DISABLED",
     }
 )
 
@@ -478,6 +481,17 @@ def _env_is_user_forwarded(key: str, patterns: List[str]) -> bool:
 
 
 def _collect_dbt_container_env() -> Dict[str, str]:
+    """The variables the dbt container inherits (``docker run -e NAME``).
+
+    The adapter prefixes and exact names above, ``FLUID_DBT_FORWARD_ENV``,
+    and what the project's dotenv files set. dbt in the container used to
+    read the mounted project's ``.env`` itself (``env_var('TARGET_SCHEMA')``);
+    ``PYTHON_DOTENV_DISABLED`` stops that, so the CLI passes on the values its
+    own filtered read exported instead (``dotenv_store.project_exports``),
+    never a name ``credentials.protected_env`` refused.
+    """
+    from fluid_build.credentials.dotenv_store import project_exports
+
     env_vars: Dict[str, str] = {}
     extra_patterns = _user_configured_forward_env()
     for key, value in os.environ.items():
@@ -489,6 +503,8 @@ def _collect_dbt_container_env() -> Dict[str, str]:
             or _env_is_user_forwarded(key, extra_patterns)
         ):
             env_vars[key] = value
+    for key, value in project_exports().items():
+        env_vars.setdefault(key, value)
     return env_vars
 
 

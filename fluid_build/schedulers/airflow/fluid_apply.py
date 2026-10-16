@@ -162,6 +162,10 @@ PASSTHROUGH_NAMES = (
     "S3_DATA_DIR",
     "GOOG_SERVICE_ACCOUNT_NAME",
     "TESTCONTAINERS_HOST_OVERRIDE",
+    # python-dotenv's off switch: fluid turns it on itself (so dbt and
+    # litellm never re-read the project's .env); a value the worker's
+    # operator set is theirs to keep
+    "PYTHON_DOTENV_DISABLED",
 )
 
 # Airflow's dag_id grammar is ``^[\w.-]+$`` with a 250 character cap.

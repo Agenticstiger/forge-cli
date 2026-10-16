@@ -65,9 +65,12 @@ native tool always wins.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import shlex
+import shutil
+import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
@@ -226,6 +229,42 @@ def _operation_timeout_seconds() -> Optional[float]:
 # ---------------------------------------------------------------------------
 # Client (generalises DbtMcpClient; one session per operation)
 # ---------------------------------------------------------------------------
+def _pin_snowflake_connections(env: Dict[str, str]) -> None:
+    """Keep the operator's saved Snowflake connections from a project's account.
+
+    The connector fills a named connection from ``connections.toml`` /
+    ``config.toml`` under ``SNOWFLAKE_HOME`` (``~/.snowflake``) or from
+    ``SNOWFLAKE_CONNECTIONS``, under the arguments it is given. While the
+    account or host in effect came from the project's dotenv files (which
+    then supplied the credential that pairs it, ``credentials.protected_env``),
+    the server gets an empty ``SNOWFLAKE_HOME`` and none of those variables,
+    so a password or key saved there never goes to the project's host.
+    """
+    from fluid_build.credentials.dotenv_store import project_endpoint_in_effect
+
+    if not project_endpoint_in_effect("Snowflake", env):
+        return
+    for name in list(env):
+        if name.upper().startswith("SNOWFLAKE_CONNECTIONS") or name.upper() in (
+            "SNOWFLAKE_DEFAULT_CONNECTION_NAME",
+            "SNOWFLAKE_CONNECTION_NAME",
+        ):
+            del env[name]
+    env["SNOWFLAKE_HOME"] = _empty_snowflake_home()
+
+
+_EMPTY_SNOWFLAKE_HOME: List[str] = []
+
+
+def _empty_snowflake_home() -> str:
+    """An empty, owner-only directory for this process; removed at exit."""
+    if not _EMPTY_SNOWFLAKE_HOME:
+        directory = tempfile.mkdtemp(prefix="fluid-snowflake-home-")
+        atexit.register(shutil.rmtree, directory, True)
+        _EMPTY_SNOWFLAKE_HOME.append(directory)
+    return _EMPTY_SNOWFLAKE_HOME[0]
+
+
 class HostedMcpClient:
     """Thin stdio client that lists/calls tools on a hosted MCP server.
 
@@ -274,6 +313,8 @@ class HostedMcpClient:
         """
         env: Dict[str, str] = {k: str(v) for k, v in os.environ.items()}
         env.update(self._extra_env)
+        if self.spec.name == "snowflake":
+            _pin_snowflake_connections(env)
         return env
 
     # -- session seam (overridden in tests with an in-memory server) ---------

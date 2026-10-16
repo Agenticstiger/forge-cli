@@ -38,8 +38,12 @@ merely writes into a platform-owned pool:
 
 from __future__ import annotations
 
+import atexit
 import logging
+import os
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -63,6 +67,24 @@ from ..provider_match import is_cloud
 from ..versions import required_providers
 
 _logger = logging.getLogger(__name__)
+
+_EMPTY_PROVIDER_CONFIG: List[str] = []
+
+
+def _empty_provider_config() -> str:
+    """An empty, owner-only Snowflake provider config file for this process.
+
+    Owner-only, as the provider expects of its config file; empty, so no
+    profile of the operator's reaches the run. Removed at exit.
+    """
+    if not _EMPTY_PROVIDER_CONFIG:
+        directory = tempfile.mkdtemp(prefix="fluid-snowflake-")
+        atexit.register(shutil.rmtree, directory, True)
+        path = os.path.join(directory, "config")
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        _EMPTY_PROVIDER_CONFIG.append(path)
+    return _EMPTY_PROVIDER_CONFIG[0]
+
 
 # Keys a binding location may carry an explicit view body under. The
 # ``bindingLocation`` schema has ``additionalProperties: false`` and declares
@@ -322,6 +344,16 @@ class SnowflakeIacPlugin:
         )
         if account and org_resolved and account_resolved:
             overlay["SNOWFLAKE_ACCOUNT"] = ""
+        # The provider merges its TOML config (~/.snowflake/config, or
+        # SNOWFLAKE_CONFIG_PATH) under the environment field by field, so an
+        # account the project's dotenv files chose would get the password,
+        # key or authenticator of the operator's profile. Such an account
+        # pairs only with a credential the project files supply
+        # (credentials.protected_env); give the provider an empty config.
+        from ...credentials.dotenv_store import project_endpoint_in_effect
+
+        if project_endpoint_in_effect("Snowflake", env):
+            overlay["SNOWFLAKE_CONFIG_PATH"] = _empty_provider_config()
         return overlay
 
     def discover_imports(

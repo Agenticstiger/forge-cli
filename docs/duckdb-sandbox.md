@@ -36,7 +36,7 @@ The same SQL reading the contract's own data builds as before:
 
 | Where the SQL runs | It can read and write |
 |---|---|
-| Embedded-SQL build on the local DuckDB engine (`builds[].properties.sql`) | the contract's directory, the FLUID workspace it sits in (`fluid.workspace.yaml`), `./runtime`, the run's scratch directory, each declared `parameters.inputs[].path`, each resolved `consumes[]` upstream, the expose's landing path, and the `s3://` prefixes those name. A declared local path counts only [inside the allowed directories](#declared-locations-stay-inside-the-allowed-directories) |
+| Embedded-SQL build on the local DuckDB engine (`builds[].properties.sql`) | the contract's directory, the FLUID workspace it sits in (`fluid.workspace.yaml`; [not at `$HOME`, `/tmp` or `/`, nor above the contract's repository](#a-workspace-is-granted-only-when-it-is-a-project-tree)), `./runtime`, the run's scratch directory, each declared `parameters.inputs[].path`, each resolved `consumes[]` upstream, the expose's landing path, and the `s3://` prefixes those name. A declared local path counts only [inside the allowed directories](#declared-locations-stay-inside-the-allowed-directories) |
 | DuckDB acquisition build (`pattern: acquisition`, `engine: duckdb`) | the contract's directory, the declared `source.connection.uri` (or stream paths), and each stream's landing file, each inside the allowed directories. A `mysql` source is attached before the sandbox closes; so is a `sqlite` source, and its file must also be inside the allowed directories |
 | `fluid validate` quality rules, `fluid verify`, `fluid diff` | the one file being checked |
 | `fluid contract-tests` local actions | each declared input file and each output file |
@@ -65,7 +65,8 @@ Each declared input and output is granted to the build's SQL, and whoever
 writes the contract writes the declarations. So a declaration grants a local
 path only inside these directories:
 
-- the contract's directory and the FLUID workspace it sits in;
+- the contract's directory and the FLUID workspace it sits in (a workspace
+  [only when it is a project tree](#a-workspace-is-granted-only-when-it-is-a-project-tree));
 - `./runtime` and the run's scratch directory (`./runtime` only when it is a
   real directory, or a symlink into the contract's directory or workspace; see
   below);
@@ -162,6 +163,96 @@ field can set it. A relative entry, or `/`, is refused.
 
 A product inside a FLUID workspace can also read its sibling products' files by
 path, and a `consumes[]` entry resolves to the upstream's landed file.
+
+### A workspace is granted only when it is a project tree
+
+The workspace is the nearest directory above the contract that holds
+`fluid.workspace.yaml`, and `fluid init` writes that file wherever it runs. A
+workspace file in one of these directories would open everything below it to
+contract SQL, so its directory is not granted:
+
+- `$HOME`, or a directory that holds it (`/home`, `/Users`);
+- another account's home directory (`/home/alice` when you run fluid as
+  `root`), or the directory that holds them;
+- a system temp directory (`/tmp`, `/var/tmp`, `$TMPDIR`, macOS's
+  `/private/var/folders`, `/dev/shm`), or a directory that holds one;
+- the filesystem root `/`;
+- a directory above the version-control repository the contract is in. With
+  `~/src/fluid.workspace.yaml` and each repository cloned below it, a contract
+  in `~/src/one` does not get `~/src`, so it cannot read `~/src/two`. A
+  repository root is a directory holding `.git` (a directory, or the file a
+  worktree or submodule has) or `.hg`. A workspace file at the repository
+  root, beside `.git`, is granted as before.
+
+Paths are compared after resolving symlinks, and without case on macOS and
+Windows. A project anywhere below those directories, `~/src/lab` or
+`/tmp/ci-1234/lab`, is a workspace like any other. So is a project you point
+`$TMPDIR` into: with `TMPDIR=~/src/lab/.tmp`, only `.tmp` is refused.
+
+A workspace is one trust domain: when no repository root sits between the
+workspace file and a contract, every directory below the workspace file can
+read every other. Put only directories you trust below a workspace file that
+is not itself in a repository.
+
+The run continues with the contract's own directory, and logs a warning that
+names the directory and the fix. A build that reads only its own directory
+still succeeds. A build that reads a sibling product's file by path, or a
+`consumes[]` upstream outside its own directory, fails with the sandbox's
+refusal (which lists the directories it may use) until you move the workspace
+file:
+
+```console
+$ cd ~/proj && fluid apply contract.fluid.yaml --mode amend-and-build --yes
+local_workspace_not_granted: /home/me holds fluid.workspace.yaml, but it is your
+home directory, so its files are not opened to contract SQL; the build runs with
+the contract's own directory. Move fluid.workspace.yaml into the directory that
+holds your data products, or list the directories contracts may declare files in
+with FLUID_DUCKDB_ALLOWED_DIRS in the shell that runs fluid.
+```
+
+To share files between products, move `fluid.workspace.yaml` into the directory
+that holds them (`~/src/lab/fluid.workspace.yaml`). To let contracts read a
+directory outside any project, the operator lists it in
+`FLUID_DUCKDB_ALLOWED_DIRS` and the contract declares the file
+([above](#reading-a-file-outside-the-contracts-directory)). The workspace file
+still supplies its defaults to the CLI; only file access is narrowed.
+
+### A contract saved directly in `$HOME` or `/tmp` is refused
+
+The contract's own directory is opened whole to its SQL. A contract saved
+straight into one of the directories above (`~/contract.fluid.yaml`,
+`/tmp/contract.fluid.yaml`) would have its SQL read everything there, so its
+build is refused before any SQL runs, even SQL that reads only its own data:
+
+```console
+$ cd ~ && fluid apply contract.fluid.yaml --mode amend-and-build --yes
+   ❌ Failed: 1 action(s) failed
+      The contract's directory /home/me is your home directory, so its SQL is
+not run there. Move the contract into a directory of its own; the operator can
+allow this one with FLUID_DUCKDB_ALLOWED_DIRS.
+```
+
+Move the contract into a directory of its own (`~/my-product/`). To run it
+where it is anyway, the operator lists that directory in
+`FLUID_DUCKDB_ALLOWED_DIRS`. The DuckDB acquisition runner refuses such a
+contract directory with the same `DuckDBSandboxError`. Without a contract
+directory (a bare `apply` of actions), the working directory is not granted
+whole, and in one of those directories it is not a root for declared
+locations either.
+
+### Seeing the directories a run may use
+
+Each local run also logs the directories its SQL may use as the DEBUG line
+`local_sandbox_roots`. It is not printed by default; `FLUID_LOG_LEVEL=DEBUG`,
+`fluid --log-level DEBUG apply ...` or `fluid apply ... --debug` prints it, and
+adding `--log-file run.log` to `--log-level DEBUG` writes it to that file:
+
+```console
+$ FLUID_LOG_LEVEL=DEBUG fluid apply contract.fluid.yaml --mode amend-and-build --yes
+...
+local_sandbox_roots: anchor=/home/me/src/lab/report, workspace=/home/me/src/lab,
+runtime=/home/me/src/lab/report/runtime, scratch=/tmp/fluid_1a2b3c4d
+```
 
 ## How it works
 

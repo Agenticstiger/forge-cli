@@ -417,7 +417,7 @@ def _count(path: Path) -> int:
 
 @pytest.mark.parametrize("root", ["operator", "workspace"])
 def test_a_landing_outside_the_contract_directory_is_replaced_on_every_run(
-    root, layout, monkeypatch
+    root, layout, monkeypatch, tmp_path_factory
 ):
     """Outside the contract's directory a landing is granted as its file, and a
     ``COPY ... TO`` over an existing file writes DuckDB's ``tmp_`` sibling first
@@ -430,6 +430,9 @@ def test_a_landing_outside_the_contract_directory_is_replaced_on_every_run(
         monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(shared))
     else:
         monkeypatch.delenv("FLUID_DUCKDB_ALLOWED_DIRS", raising=False)
+        # The layout's $HOME is inside the workspace, which would make it a
+        # workspace that is not granted (``workspace_grant``): $HOME elsewhere.
+        monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
         (layout["tmp"] / "fluid.workspace.yaml").write_text(
             "workspace: {name: lab}\n", encoding="utf-8"
         )

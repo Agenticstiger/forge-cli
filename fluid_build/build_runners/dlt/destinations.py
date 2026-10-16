@@ -42,11 +42,40 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 from .._credentials import register_engine_introspector
 
 LOG = logging.getLogger("fluid.acquire.dlt.destinations")
+
+# What the bridge wrote into ``os.environ``: name -> (the value before, the
+# value written). The dlt runner puts it back before the next build takes its
+# snapshot of the environment (:func:`undo_bridge_writes`), and never counts a
+# variable still holding the bridge's value as one the operator exported
+# (:func:`bridge_writes`): a later build in the same process (``fluid apply``
+# runs its builds in a loop) would otherwise take the bridge's copy of a
+# project's host for the operator's own and let dlt complete it with the
+# operator's password.
+_BRIDGE_WRITES: Dict[str, Tuple[Optional[str], str]] = {}
+
+
+def bridge_writes() -> Dict[str, str]:
+    """The variables the bridge set and has not put back, with the value it wrote."""
+    return {name: written for name, (_, written) in _BRIDGE_WRITES.items()}
+
+
+def undo_bridge_writes() -> None:
+    """Put back what the bridge set in ``os.environ``: a variable that still
+    holds the bridge's value gets its value from before (unset, or blank); one
+    set to something else since keeps it."""
+    for name, (before, written) in list(_BRIDGE_WRITES.items()):
+        if os.environ.get(name) != written:
+            continue
+        if before is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = before
+    _BRIDGE_WRITES.clear()
 
 
 # FLUID-canonical → dlt-SDK-canonical field-name aliases. Only listed when
@@ -119,6 +148,35 @@ def _expand_bigquery_service_account(fluid_credentials: Dict[str, Any]) -> None:
         fluid_credentials["project_id"] = sa.get("project_id")
 
 
+def _credentials_class(platform: str) -> Any:
+    """dlt's credentials class for the destination ``platform``, or ``None``.
+
+    ``destination.spec()`` returns a ``DestinationClientConfiguration``;
+    ``.credentials_type()`` is a CLASSMETHOD (not an attribute) that returns
+    the credentials class — confirmed via dlt source. Older API used a
+    ``credentials_class`` attribute; we try both.
+    """
+    import dlt
+
+    dest_factory = getattr(dlt.destinations, platform.lower(), None)
+    if dest_factory is None:
+        return None
+    spec = dest_factory().spec()
+    cred_class = None
+    # Newer dlt (1.x): spec.credentials_type() is a classmethod.
+    ct = getattr(spec, "credentials_type", None)
+    if callable(ct):
+        try:
+            cred_class = ct()
+        except TypeError:
+            # Some dlt versions need it called on the class
+            cred_class = ct
+    # Older dlt: spec.credentials_class attribute.
+    if cred_class is None or not isinstance(cred_class, type):
+        cred_class = getattr(spec, "credentials_class", None)
+    return cred_class
+
+
 @register_engine_introspector("dlt")
 def _dlt_introspect(
     *,
@@ -136,7 +194,8 @@ def _dlt_introspect(
 
     Returns ``None``; dlt reads the env vars itself when ``pipeline.run``
     constructs the destination client. dlt picks the auth flow (password,
-    keypair, OAuth) based on which fields end up populated.
+    keypair, OAuth) based on which fields end up populated. What it sets is
+    recorded for :func:`undo_bridge_writes`.
     """
     try:
         import dlt
@@ -149,31 +208,14 @@ def _dlt_introspect(
         _expand_bigquery_service_account(credentials)
 
     # Discover the destination's required fields via dlt's own spec.
-    # ``destination.spec()`` returns a ``DestinationClientConfiguration``;
-    # ``.credentials_type()`` is a CLASSMETHOD (not an attribute) that
-    # returns the credentials class — confirmed via dlt source. Older API
-    # used ``credentials_class`` attribute; we try both.
     try:
-        dest_factory = getattr(dlt.destinations, platform.lower(), None)
-        if dest_factory is None:
+        if getattr(dlt.destinations, platform.lower(), None) is None:
             LOG.warning(
                 "dlt has no destination named %r; skipping credential bridge",
                 platform,
             )
             return
-        spec = dest_factory().spec()
-        cred_class = None
-        # Newer dlt (1.x): spec.credentials_type() is a classmethod.
-        ct = getattr(spec, "credentials_type", None)
-        if callable(ct):
-            try:
-                cred_class = ct()
-            except TypeError:
-                # Some dlt versions need it called on the class
-                cred_class = ct
-        # Older dlt: spec.credentials_class attribute.
-        if cred_class is None or not isinstance(cred_class, type):
-            cred_class = getattr(spec, "credentials_class", None)
+        cred_class = _credentials_class(platform)
         if cred_class is None:
             LOG.debug("dlt destination %r has no credentials class; skipping", platform)
             return
@@ -201,4 +243,7 @@ def _dlt_introspect(
             continue
         env_var = f"DESTINATION__{platform_upper}__CREDENTIALS__{sdk_field.upper()}"
         if not os.environ.get(env_var):
+            # what is there now, unset or blank: an earlier copy of the
+            # bridge's is gone, or it would be set
+            _BRIDGE_WRITES[env_var] = (os.environ.get(env_var), str(value))
             os.environ[env_var] = str(value)

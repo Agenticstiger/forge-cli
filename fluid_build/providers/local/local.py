@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import sys
@@ -41,10 +42,14 @@ from fluid_build.observability.secret_redactor import redact_secret_text, redact
 from fluid_build.providers._duckdb_read import build_register_view_sql
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
+    WorkspaceGrant,
+    broad_root_reason,
     is_sandbox_refusal,
+    refuse_broad_root,
     sandbox_refusal_hint,
     secure_duckdb_connect,
     unaliased_dir,
+    workspace_grant,
 )
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderMetadata
@@ -60,6 +65,12 @@ from .util.retry import with_retry
 
 JSONLike = Dict[str, Any]
 PathLike = Union[str, Path]
+
+#: ``local_sandbox_roots`` goes here, not to the provider's own logger: that
+#: one is pinned at INFO (``providers/base.py``), which drops a DEBUG line
+#: before ``--debug`` or a ``--log-file`` sink can see it. This logger follows
+#: the level the CLI sets.
+_SANDBOX_LOG = logging.getLogger("fluid_build.providers.local.sandbox")
 
 # ------------------------------ Utilities ------------------------------ #
 
@@ -87,6 +98,40 @@ RESERVED_LOG_KEYS = {
     "thread",
     "threadName",
 }
+
+
+def _log_sandbox_roots(
+    provider: Any,
+    grant: WorkspaceGrant,
+    anchor: Optional[Path],
+    runtime: Optional[str],
+    scratch: Optional[Path],
+) -> None:
+    """Say which directories contract SQL may use, once per run, not per connection.
+
+    ``local_sandbox_roots`` at DEBUG on each run (``fluid --debug``,
+    ``FLUID_LOG_LEVEL=DEBUG``, or ``--log-level DEBUG --log-file``), and
+    ``local_workspace_not_granted`` (a warning, shown by default) when the
+    workspace found above the contract is too broad to grant, naming it and
+    the fix.
+    """
+    roots = {
+        "anchor": str(anchor) if anchor else None,
+        "workspace": str(grant.granted) if grant.granted else None,
+        "runtime": runtime,
+        "scratch": str(scratch) if scratch else None,
+    }
+    key = tuple(roots.values())
+    if getattr(provider, "_sandbox_roots_logged", None) == key:
+        return
+    provider._sandbox_roots_logged = key
+    if grant.refused:
+        provider._log_warn(
+            grant.not_granted_message(),
+            {"workspace": str(grant.found), "reason": grant.refused},
+        )
+    shown = ", ".join(f"{name}={value}" for name, value in roots.items() if value)
+    _SANDBOX_LOG.debug(f"local_sandbox_roots: {shown}", extra=_safe_extra(redact_dict(roots)))
 
 
 def _safe_extra(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -263,13 +308,16 @@ class LocalProvider(BaseProvider):
         """What this provider's SQL may touch, and nothing else.
 
         The source contract's directory (``anchor_dir``) and the FLUID
-        workspace it sits in, the run's session scratch directory,
+        workspace it sits in (:func:`workspace_grant`), the run's session scratch directory,
         ``./runtime`` (where previews and default outputs land), and each
         location the actions declare: an input file, an output file, an
         ``s3://`` prefix. A contract's SQL that names any other path,
         ``/etc/passwd`` or ``~/.aws/credentials``, is refused by DuckDB.
         ``./runtime`` is left out when it is a symlink that leads outside the
-        contract's directory and workspace (:func:`unaliased_dir`).
+        contract's directory and workspace (:func:`unaliased_dir`). A contract
+        directory that is ``$HOME``, a home or temp directory or ``/`` is
+        refused (:func:`refuse_broad_root`); without a contract directory, a
+        working directory like that is not a root for declarations.
 
         A declared location is granted only inside those directories (plus
         the upstream roots in ``FLUID_UPSTREAM_CONTRACTS`` and the operator's
@@ -280,16 +328,22 @@ class LocalProvider(BaseProvider):
         all the same.
         """
         from fluid_build.util.upstream_discovery import collect_search_roots
-        from fluid_build.util.workspace_root import find_workspace_root
 
         session = getattr(self, "_session_db", None)
         scratch = Path(session).parent if session else None
-        # Without a contract directory (a bare ``apply`` of actions), the
-        # working directory stands in for it, as it does for relative paths.
-        anchor = self.anchor_dir if self.anchor_dir is not None else Path.cwd()
-        # A contract inside a FLUID workspace (``fluid.workspace.yaml``) may
-        # read its sibling products' files by path, as consumes[] does.
-        workspace = find_workspace_root(self.anchor_dir) if self.anchor_dir is not None else None
+        # The contract's directory is granted whole, so not one at $HOME, /tmp
+        # or /. Without one (a bare ``apply`` of actions), the working directory
+        # stands in for it as a root for declarations, but only a narrow one.
+        anchor: Optional[Path]
+        if self.anchor_dir is not None:
+            refuse_broad_root(self.anchor_dir)
+            anchor = self.anchor_dir
+        else:
+            anchor = None if broad_root_reason(Path.cwd()) else Path.cwd()
+        # A contract inside a FLUID workspace may read its sibling products' files
+        # by path, as consumes[] does; not one at $HOME, /tmp or /, nor one above the
+        # contract's own repository (workspace_grant).
+        workspace = (grant := workspace_grant(self.anchor_dir)).granted
         # ``./runtime`` is in the working directory, usually the contract's
         # own, so the contract's repository can ship it as a symlink
         # (``runtime -> ../../..``). Granted only where its name says it is, or
@@ -302,6 +356,7 @@ class LocalProvider(BaseProvider):
             )
         allow = DuckDBAllowlist.none().with_dirs(self.anchor_dir, workspace, runtime, scratch)
         within = [anchor, runtime, scratch, *collect_search_roots(workspace)]
+        _log_sandbox_roots(self, grant, anchor, runtime, scratch)
         for spec in specs:
             raw = spec.get("path") if isinstance(spec, dict) else spec
             if not raw:
