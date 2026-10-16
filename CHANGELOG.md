@@ -7,6 +7,556 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-10-15
+
+### Security advisories
+
+This release fixes six security advisories. Each entry below has its own upgrade notes; read them before upgrading.
+
+#### A — project configuration trust (fix/sec-project-config-trust)
+
+**Security**
+- **A config file in the working directory is no longer trusted like your own config**.
+  A catalog endpoint set by `.fluidrc.yaml`, `.fluidrc`,
+  `fluid.config.yaml` or `.fluid/config.yaml` in the checkout (Command Center, Data Mesh
+  Manager, DataHub, OpenMetadata or a plug-in catalog) is sent only a key that the same
+  file carries where that catalog reads one. It does not get `FLUID_API_KEY`,
+  `FLUID_BEARER_TOKEN`, `DMM_API_KEY` or any other key from the environment,
+  `/etc/fluid` or `~/.fluid`. When something of yours would have to be withheld from such
+  a block, `fluid publish` fails, `fluid apply` prints `run not reported (...)`, and a
+  `properties.catalog.register` target is reported as not registered; each message names
+  what was withheld, never its value, and how to use the endpoint. Previously the
+  checkout's endpoint was paired with your key.
+- `${VAR}` placeholders in a project config's catalog settings are kept as written; when
+  the variable is set, a warning names the setting and the file. Before, they were filled
+  from the environment, so a committed endpoint could carry any variable to its host. A
+  contract's `{{ env.NAME }}` placeholders are also sent as written to an endpoint from a
+  project config.
+- From your own config files and environment, an endpoint from a project config gets only
+  a fixed list of non-secret settings (`organization_id`, `organization`,
+  `data_product_specification`, `provider_hint`, `odps_lineage_mode`,
+  `auto_approve_access`, `auth.type`, `enabled`, `force_contract_sync`, `timeout`,
+  `max_retries`, `retry_delay` and the circuit-breaker settings). Any other value, at any
+  depth, is withheld, and the call refuses and names it. Where the project file carries
+  its own key, the environment's credential and an operator credential setting that is
+  `null`, blank, or only a `${NAME}` whose variable is unset or empty are left out without
+  a refusal. A key the project file sets to anything but a non-empty string (`""`,
+  `null`, `false`, `0`, `[]`, `{}`, an unquoted number or date) is no key, so it can no
+  longer let the runner's key fill the slot.
+- An endpoint from a project config must be `https://` unless its host is loopback or on
+  `FLUID_COMMAND_CENTER_HOST_ALLOWLIST`, and a host that resolves to a private or
+  cloud-metadata address must be on that list, for `fluid publish --target` and
+  `properties.catalog.register` alike. `fluid publish` had no host check before.
+- The `fluid apply` Command Center report applies the same host check to every endpoint,
+  follows a redirect only within the endpoint's origin (or from http to https on the same
+  host and default ports), and names the destination as `scheme://host[:port]`, including
+  in `run <id> reported to ...`. `X-API-Key` used to follow a redirect to any host.
+- `fluid market`: an `mcp` block in a `market.yaml` read from the working directory (when
+  there is no `~/.fluid/market.yaml`) can no longer use `token_env`, `env_from`, `command`
+  or the `stdio` transport, and its `url` must pass the host check. Such a block could send
+  any environment variable to its own URL or start a program. An Apache Atlas block from
+  that file no longer falls back to `ATLAS_USERNAME` / `ATLAS_PASSWORD`. The Command Center
+  URL for `fluid market` and `--blueprints` comes from `FLUID_COMMAND_CENTER_URL`,
+  `~/.fluid/config.yaml` or the built-in `http://localhost:8000` default, never from
+  `./fluid.yaml`; it passes the host check, and the client's probes, its marketplace
+  requests and the market Command Center catalog connector do not follow a redirect to
+  another origin, other than the same-host upgrade to https.
+- A YAML anchor, alias or merge key in a config file shares a value, not a setting, so a
+  project config cannot write into one of your catalog blocks through an alias. A config
+  file or `market.yaml` whose aliases or merge keys would expand far beyond its size is
+  refused, using go-yaml's "excessive aliasing" limit.
+
+**Upgrade notes**
+- If a committed project config names a catalog endpoint and relies on a key from the
+  environment or `~/.fluid`, set the endpoint yourself instead: `FLUID_CC_ENDPOINT`,
+  `DMM_API_URL`, `DATAHUB_GMS_URL` or `OPENMETADATA_SERVER_URL`, the endpoint in
+  `~/.fluid/config.yaml`, or `fluid publish --target <name>:<endpoint>`. Move `${VAR}`
+  placeholders out of project configs the same way.
+- A project config that carries both its endpoint and its own key now sends that key even
+  when the runner exports one.
+- The `fluid apply` Command Center report and `fluid market`'s Command Center detection now
+  need `https://` for every host that is not loopback or on
+  `FLUID_COMMAND_CENTER_HOST_ALLOWLIST`, your own endpoint included. `fluid publish` to an
+  endpoint you set still has no host check.
+- If `~/.fluid/config.yaml` or `/etc/fluid/config.yaml` sets anything outside the list
+  above in a catalog block whose endpoint comes from a checkout's project config, and the
+  checkout's file does not set that setting itself, that block is refused (`fluid publish`
+  fails, `fluid apply` does not report the run, a `properties.catalog.register` target is
+  not registered) and the message names it. That includes a literal key, even next to a
+  checkout that carries its own. When the checkout's block carries its own key, a
+  credential setting that is `null`, blank, or only a `${NAME}` whose variable is unset or
+  empty does not count, so the Data Mesh Manager provider README's block does not cause a
+  refusal.
+- Quote credentials. In a project config, an unquoted number, date or boolean is no key
+  for an endpoint that file sets; a Command Center `auth.api_key` or `auth.token` written
+  that way is not sent to your own endpoint either, and `FLUID_API_KEY` /
+  `FLUID_BEARER_TOKEN`, if set, is sent instead. A non-zero number, a date or `true` gets a
+  warning to quote it, except in a setting that an exported variable also fills for an
+  endpoint the file sets (for example `FLUID_API_KEY` for the Command Center's
+  `auth.api_key`, `DMM_API_KEY` for the Data Mesh Manager's key, `DATAHUB_GMS_TOKEN` or
+  `OPENMETADATA_JWT_TOKEN` for their `api_token`): that endpoint is refused without the
+  explanation. In your own config files an unquoted number or date is sent as YAML reads
+  it, with a warning to quote it.
+- An unquoted `true`, `yes` or `on` as a Data Mesh Manager, DataHub or OpenMetadata token is
+  no longer sent as `Bearer True`; the next token setting applies, such as the
+  `auth.api_key` that `DMM_API_KEY` fills.
+- `fluid market`: move an `mcp` block that uses `token_env`, `env_from`, `command` or
+  `stdio` from `./market.yaml` to `~/.fluid/market.yaml`. `command_center.url` in
+  `./fluid.yaml` is no longer read; use `FLUID_COMMAND_CENTER_URL` or
+  `~/.fluid/config.yaml`. The `--instantiate` POST, which carries your parameters, to a
+  blueprint registry that moved host now stops at the old origin, so the command fails;
+  searches, `--blueprint-id` lookups and the lookup before that POST in a registry you name
+  with `FLUID_API_URL` (or `FLUID_PUBLIC_REGISTRY` with `FLUID_MARKETPLACE_FALLBACK=public`)
+  still follow it, unless the request carries a credential header or a cookie (for example
+  an `Authorization` header from `~/.netrc`), in which case it stops at the registry's
+  origin like the POST.
+- Library callers: `FluidConfig.get_catalog_config(name)` raises `UntrustedCatalogEndpoint`
+  instead of returning a block it would have to strip, takes a keyword-only `endpoint=`
+  override and returns a `CatalogConfig` (a `dict` with `project_endpoint_file`).
+  `get_auth_headers` takes a keyword-only `env_fallback` (default `True`).
+  `DataMeshManagerRegistrar(api_url=...)` no longer fills its token from `DMM_API_KEY`
+  when it is given an endpoint.
+
+#### B — untrusted-checkout files: workspace roots and project `.env` (fix/sec-workspace-root-ceiling, fix/sec-dotenv-protected-vars)
+
+**Security**
+- **A `fluid.workspace.yaml` above the project (for example one `fluid init`
+  wrote into `~`) no longer widens the DuckDB sandbox when it sits in a broad
+  directory or above the contract's repository**. A
+  workspace file at `$HOME`, above `$HOME`, at another account's home or a
+  home-holding directory (`/home`, `/Users`, `/var/home`), at a system temp
+  directory (`/tmp`, `/var/tmp`, `$TMPDIR`, `/private/var/folders`,
+  `/dev/shm`) or a directory that holds one, or at `/`, is found but not granted to contract SQL, and
+  neither is one above the contract's version-control repository (`.git`,
+  `.hg`), so a repository cloned below a shared workspace file does not inherit
+  it. The build runs with the contract's own directory and logs
+  `local_workspace_not_granted`, naming the directory and the fix. A contract
+  saved directly in one of those broad directories is refused before any SQL
+  runs. Paths are compared after resolving symlinks, and without case on macOS
+  and Windows. Previously a workspace at any of these but `/` opened its whole
+  tree to any contract's embedded SQL (one at `/` failed the build).
+- **A project `.env`, `.env.<environment>` and `.env.local` can no longer set
+  operator-only settings.** These are variables that widen a sandbox or
+  confinement root (`FLUID_DUCKDB_ALLOWED_DIRS`, `FLUID_REF_ROOT`,
+  `FLUID_UPSTREAM_CONTRACTS`, …); move where FLUID reads trusted configuration
+  or writes state (`FLUID_SECRETS_FILE`, `FLUID_STATE_BACKEND`, `HOME`, the XDG
+  and Windows `APPDATA` / `LOCALAPPDATA` / `ProgramData` directories, the
+  temporary directory); change an authentication or trust mode; change where
+  data and credentials are sent (the Command Center, catalog, lineage,
+  telemetry and LLM endpoints, proxies and CA bundles, `PGHOSTADDR`, the libpq
+  service variables, `PGSSLMODE` and the libpq CA lists, the litellm proxy and
+  GitHub Copilot settings); or choose which program runs (`PATH`,
+  `PYTHONPATH`, `LD_*`, `ComSpec`, `SystemRoot`, `windir`, `GIT_SSH_COMMAND`,
+  `GIT_CONFIG_*`, `GIT_DIR`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, …). `FLUID_DBZ_*`
+  is protected as a prefix (the Debezium runner sets those itself).
+  `fluid apply`, `verify` and `publish` skip them with one warning that names
+  them, never their values; credentials in `.env` still load. The list lives in
+  `fluid_build/credentials/protected_env.py`, an unlisted `FLUID_*` whose shape
+  says it is an endpoint, location, allow-list or program is protected anyway,
+  and a test fails on any `FLUID_*` name that appears as a literal in the
+  package and is left unclassified.
+- **A project `.env` can no longer point a credential of yours for a listed
+  service at a host the project chose.** An endpoint such as
+  `OPENAI_BASE_URL`, `PGHOST`, `SNOWFLAKE_ACCOUNT`, `DATABRICKS_HOST` or a dlt
+  destination's host is ignored when a credential of the same service is in
+  your environment, your
+  `FLUID_SECRETS_FILE`, or — for a service that also reads a keyring, a stored
+  CLI login, an SDK config file or cloud default credentials — whenever the
+  project files do not supply the credential every reader sends in its place.
+  Previously the SDK, driver or data loader sent your credential to the host
+  the project chose. A decoy credential of the right service does not pair the
+  endpoint, a project name that differs from yours only in case no longer
+  loads, and while a Snowflake account from the project's files is in effect
+  every Snowflake reader (the resolver, OpenTofu, the hosted MCP server, dlt)
+  takes credentials only from the environment and the project files; a
+  Snowflake authenticator other than `snowflake` the project sets is refused,
+  so it cannot sign in with your browser session or identity provider.
+- **A dlt destination whose credentials a project `.env` touches gets the
+  project's credentials only.** Every field of the destination's dlt
+  `credentials` configuration that the project's files set pins the
+  destination — at any depth, under every name dlt reads it under, the `query`
+  map and its single keys included — for every destination type (default-deny),
+  except the in-account fields `database`, `connect_timeout`, `client_encoding`
+  and `session_timezone` (postgres, redshift) and `database`, `warehouse` and
+  `role` (snowflake). `PGHOSTADDR` is yours alone, which closes every libpq
+  reader at once. A destination you exported (its own dlt host, or a connection
+  string naming a host) stays yours against the project's FLUID endpoint
+  variables (`POSTGRES_HOST`, `SNOWFLAKE_ACCOUNT`, `REDSHIFT_HOST`); a dlt
+  credentials field the project sets still pins it. The FLUID-to-dlt bridge's
+  copies from one build no longer count as yours for the next build in the
+  same `fluid apply`.
+- **dbt and litellm no longer re-read the project `.env` around the filter.**
+  `fluid` sets `PYTHON_DOTENV_DISABLED` at start-up and once it has read a
+  project's files, and forwards it to the dbt container; a scheduled apply
+  keeps a `PYTHON_DOTENV_DISABLED` the Airflow worker's operator set. A python
+  build step is your own code, so it still loads its own dotenv file.
+- Project `.env` values are read literally: `${VAR}` is no longer expanded from
+  your environment.
+
+**Upgrade notes**
+- If your `fluid.workspace.yaml` lives in your home or a temp directory and
+  your products read each other's files by path, move it into the directory
+  that holds the products when they share one repository or sit in no
+  repository. For products cloned side by side, list their common directory
+  in `FLUID_DUCKDB_ALLOWED_DIRS` and declare the file; do the same to let
+  contracts read a directory outside any project. Move a contract saved
+  straight in `$HOME` or `/tmp` into a directory of its own, or allow-list its
+  directory. A `fluid.workspace.yaml` with no version-control
+  root between it and a contract still grants its whole tree, so put only
+  directories you trust below one.
+- If your project `.env` set a protected variable (for example
+  `FLUID_COMMAND_CENTER_URL`, `DMM_API_URL`, `HTTPS_PROXY`,
+  `FLUID_STATE_BACKEND`, `FLUID_DUCKDB_ALLOWED_DIRS`, `PGHOSTADDR` or a git
+  transport variable), `fluid` now prints `Ignored ... from project dotenv
+  files` and runs without it. Export it in your shell or CI job, or in a
+  `FLUID_SECRETS_FILE` you export; a `FLUID_SECRETS_FILE` path set in `.env` is
+  itself ignored.
+- If CI or your shell exports a credential while a committed `.env` names the
+  matching endpoint (`OPENAI_BASE_URL`, `PGHOST`, `SNOWFLAKE_ACCOUNT`, a dlt
+  destination's host, …), that endpoint is now ignored. Set it in the CI
+  environment, the shell or `FLUID_SECRETS_FILE`. A project that brings its own
+  endpoint and its own credential still works when your environment and
+  `FLUID_SECRETS_FILE` hold no credential of that service.
+- A dlt destination whose host, port, query field, password or any other
+  credentials field a committed `.env` sets now uses the project's own
+  credentials or fails, naming what is missing. The in-account fields above are
+  still read. Export the endpoint to use your own dlt configuration.
+- With dbt-core 1.12 or later, dbt no longer finds a `.env` above the
+  contract, and litellm no longer loads one at import. Export the variable (also list its name in
+  `FLUID_DBT_FORWARD_ENV` for the dbt container), keep the `.env` in the
+  directory you run `fluid` from, or set `PYTHON_DOTENV_DISABLED=0` for a
+  trusted checkout. The minimum `python-dotenv` is now 1.2.0 and the minimum
+  `litellm` 1.83.14.
+- Library callers: `DotEnvCredentialStore(...)` takes a keyword-only
+  `operator_env=`, `DotEnvCredentialStore.load()` applies the filter and sets
+  `PYTHON_DOTENV_DISABLED` once it reads a project file, and `hydrate_dotenv`
+  exports a `FLUID_SECRETS_FILE` itself rather than through `load_dotenv`.
+
+#### C — MCP host identity gate (fix/sec-mcp-metadata-service-gate)
+
+**Security**
+- **Using this host's cloud metadata-service or ADC identity is the operator's decision in
+  `fluid mcp serve`.** The source-catalog tools (`list_source_tables`,
+  `inspect_source_table`, `list_source_lineage`, `list_source_glossary`,
+  `forge_from_source`) no longer let an MCP client use the host's cloud metadata-service /
+  ADC identity. For a catalog source, the client's `allow_metadata_service`
+  argument is honoured only when the server runs with the new `--allow-metadata-service`
+  flag or `FLUID_ALLOW_METADATA_SERVICE=1`, and is otherwise refused with a tool error that
+  names the flag; a JDBC `forge_from_source` ignores the argument and is classified by its
+  URI (see below). The credential resolver behind these tools and
+  `fluid forge data-model from-source` also no longer turns a bare region or project
+  variable into the host's instance role, workload identity or gcloud ADC without that
+  opt-in.
+- With `--allow-inline-credentials` alone, an inline catalog block is accepted only when it
+  carries non-blank credential material of its own as values (see docs/MCP.md for the
+  forms per catalog). A path to a file on the server, a named AWS profile, an auth method
+  that uses the host's identity or a login on the host, a DataHub server that is not an
+  http(s) URL, `DATAHUB_CLIENT_CERT_PATH`, or a netrc file on the host (DataHub, Unity) now
+  also needs `--allow-metadata-service`. A blank or whitespace-only key, secret, token or
+  credential-file path is not credential material anywhere: inline blocks, saved sources and
+  the CLI. An accepted Unity `pat` block uses its token even when the server's
+  `DATABRICKS_AUTH_TYPE` or `~/.databrickscfg` profile names another auth type, and an
+  accepted Snowflake block no longer probes the server's cloud identity.
+- `forge_from_source` with a postgres, mysql or sqlite `uri` now needs an operator opt-in:
+  `--allow-inline-credentials` for a password in the URI, and `--allow-metadata-service`
+  for a URI with no password, no user name, a sqlite path, a mysql `localhost` or a postgres
+  host that is this server's unix socket. The scheme must match the source. A postgres
+  connection with a client-supplied password no longer presents the server's default
+  client certificate, and for a postgres or mysql connection with a client-supplied
+  password the server's `PGPASSWORD`, `PGPASSFILE`, `PGSERVICE`, `PGSERVICEFILE`,
+  `PGSYSCONFDIR`, `PGSSLCERT`, `PGSSLKEY`, `PGOAUTHTOKEN`, `PGGSSDELEGATION` and
+  `MYSQL_PWD` / `MYSQL_HOST` / `MYSQL_TCP_PORT` / `MYSQL_UNIX_PORT` /
+  `MYSQL_GROUP_SUFFIX` variables are hidden while it attaches.
+- DuckDB `ATTACH` strings are quoted in each driver's own syntax (libpq for postgres, double
+  quotes for DuckDB's mysql DSN) inside one SQL literal. That covers MCP
+  `forge_from_source`, `fluid init --discover`, `fluid forge data-model from-source`,
+  `fetch_sample_rows`, and the build runner's mysql and mariadb sources. Control characters
+  in a host, user, password or database are refused there and in the build runner's
+  `postgres_scan` connection string.
+- Connect errors from `fluid forge data-model from-source`, `forge_from_source` and the
+  build runner's mysql or mariadb `ATTACH` no longer show the password. Neither does the
+  error for a JDBC URI that cannot be used in `fluid forge data-model from-source`,
+  `forge_from_source` or `fetch_sample_rows`, which now masks the password where it sits in
+  the URI.
+
+**Upgrade notes**
+- MCP clients that send `allow_metadata_service: true` for a catalog source now get an error
+  unless the server runs with `--allow-metadata-service` (or
+  `FLUID_ALLOW_METADATA_SERVICE=1`); a JDBC `forge_from_source` ignores the argument and is
+  classified by its URI. Add the flag to the server's `args` in your MCP client config if
+  you rely on instance-role, workload-identity or ADC auth.
+- A catalog read that relied on `AWS_REGION` / `AWS_DEFAULT_REGION` alone (Glue),
+  `GOOGLE_CLOUD_PROJECT` / `GCLOUD_PROJECT` alone (BigQuery), or a project variable plus
+  `DATAPLEX_LOCATION` / `GOOGLE_CLOUD_LOCATION` with no `GOOGLE_APPLICATION_CREDENTIALS`
+  (Dataplex) now fails with "No credentials resolved" unless you pass
+  `--allow-metadata-service` or set `FLUID_ALLOW_METADATA_SERVICE=1`. This includes
+  `fluid forge data-model from-source`. Over MCP with the flag (not the variable), the call
+  must also send `allow_metadata_service: true`.
+  `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`,
+  `GOOGLE_APPLICATION_CREDENTIALS` and saved `credential_id` sources resolve as before.
+- `fluid mcp serve --allow-inline-credentials`: BigQuery and Dataplex inline blocks, Glue
+  blocks with a `profile_name` or an auth method other than `iam_key`, Snowflake
+  `private_key` and `sso`, Unity `azure_ad` and `google_id`, DataHub `none` and `oauth`, and
+  DataHub or Unity blocks on a host with a netrc file now need `--allow-metadata-service` or
+  a saved `credentials.credential_id`.
+- A saved source or CLI credential with a blank key, secret, token or path that its auth
+  method needs now fails that auth method's check; a Glue key and secret that are both
+  blank no longer let boto3 fall back to the host's identity.
+- MCP `forge_from_source` with a JDBC `uri`: a password in the URI needs
+  `--allow-inline-credentials`; a URI with no password, no user name, a sqlite path, a mysql
+  `localhost` or a postgres socket host needs `--allow-metadata-service` (plus the inline
+  flag when it carries a password). Use `127.0.0.1` for mysql over TCP. `jdbc:`,
+  `mariadb://` and `mysql+pymysql://` URIs are refused. A postgres database that requires a
+  client certificate refuses an MCP connection whose URI carries a password; run
+  `fluid forge data-model from-source` from the CLI instead.
+- A `?` in a mysql host, user, password or database, a `/` in a mysql host, a control
+  character in a host, user, password or database, and a port that is not ASCII digits are
+  now refused before connecting, including in `fluid apply` builds. DuckDB's mysql
+  extension cannot carry a `?`, so a mysql password containing one has to change.
+- Library callers: `JdbcDiscoverer.discover(uri)` called directly now pins a URI that
+  carries a password; pass `operator_supplied=True` for a URI your operator supplied, as
+  `introspect_jdbc` also accepts.
+
+#### D — federation credentials (fix/sec-federation-credentials)
+
+**Security**
+- **A federation manifest no longer decides where a credential goes.**
+  `auth.secret_ref` in `federation/upstreams.yaml` could name any environment
+  variable, and `fluid apply` (including `--dry-run`) sent its value to whatever
+  host the manifest named. By default, `GITHUB_TOKEN` and `GH_TOKEN` now go only
+  to `github.com`, `api.github.com` and `raw.githubusercontent.com`. Any other
+  variable or host must be listed by whoever runs `fluid apply` in the new
+  `FLUID_FEDERATION_SECRET_REF_ALLOWLIST`, as `NAME@host` (recommended) or a bare
+  `NAME` (any host). Outside that policy nothing is sent: the upstream is
+  reported `unreachable` with a reason that names the variable, the host and the
+  entry to add. See docs/FEDERATION.md.
+- **Federation credentials travel only over https.** An `http://` or `git://`
+  endpoint whose auth would attach a credential is refused before anything is
+  sent. Without `auth.secret_ref`, such endpoints still work anonymously.
+- **HTTP and catalog registries no longer pass credentials to another origin
+  on a redirect.** A hop to another origin drops `Authorization`, `Proxy-Authorization` and
+  `Cookie` for the rest of the chain, and a redirect from `https://` to
+  `http://` is refused. Before, every hop received the same headers.
+- **Git registries no longer put the token in the clone URL.** It used to
+  appear in the `git clone` command line and stay in
+  `~/.cache/fluid/federation-git/<workspace-id>/.git/config`. git now gets it
+  only through its process environment, as endpoint-keyed entries appended to
+  `GIT_CONFIG_PARAMETERS`: an empty `extraHeader` that clears git's header list,
+  your own non-`Authorization` extra headers for the endpoint, federation's
+  `Authorization` header, and `followRedirects=false`. The endpoint receives one
+  `Authorization` header, and a redirect is reported `unreachable` instead of
+  being followed with it. Each refresh resets a cached clone's
+  `remote.origin.url` to the endpoint, which removes a token an earlier version
+  stored there.
+- **The federation policy comes only from the operator.**
+  `FLUID_FEDERATION_SECRET_REF_ALLOWLIST` and `FLUID_FEDERATION_HOST_ALLOWLIST`
+  are ignored when a project `.env` / `.env.*` file (or a `FLUID_SECRETS_FILE`
+  while a project file sets `FLUID_SECRETS_FILE`) gives them a value. A refused
+  fetch names the file whose value was ignored, and
+  `federation_policy_env_ignored` is logged when your own value was set too.
+  A committed `.env` could otherwise widen the policy meant to constrain the
+  same checkout.
+- A git refresh runs only on the cache directory itself, never on a repository
+  that encloses it, and a refresh that cannot fetch reports the upstream
+  `unreachable` instead of checking the pin against the old cache.
+- The `federation_secret_ref_allowlist_entry_has_port` warning, for an
+  allow-list entry written with a port (which never matches), suggests
+  `NAME@<host>` with the entry's hostname filled in, and repeats nothing else
+  from the entry, which may have been copied from a URL that holds a password.
+
+**Upgrade notes**
+- A `secret_ref` whose auth mode attaches it now needs an operator-set entry
+  such as `FLUID_FEDERATION_SECRET_REF_ALLOWLIST=CATALOG_TOKEN@catalog.acme.com`,
+  unless it is `GITHUB_TOKEN` or `GH_TOKEN` going to a GitHub host. For GitHub
+  Enterprise Server, list `GITHUB_TOKEN@<your host>`. The check runs even when
+  the variable is unset, so a manifest that names a variable for a host it may
+  not go to reports `unreachable` instead of fetching anonymously.
+- Move an `http://` or `git://` endpoint that carries `auth.secret_ref` to
+  `https://` (`ssh://` for git), or remove the credential.
+- Set `FLUID_FEDERATION_SECRET_REF_ALLOWLIST` and
+  `FLUID_FEDERATION_HOST_ALLOWLIST` in the shell, the CI environment or a
+  `FLUID_SECRETS_FILE` outside the project, unless a project `.env` / `.env.*`
+  file also sets `FLUID_SECRETS_FILE`, which ignores the policy in the secrets
+  file too. While a project `.env` / `.env.*` file sets either one, it is
+  ignored, including your own value. A template line with no value is fine.
+- Write allow-list hosts without a port (`NAME@host` covers every port) and
+  IPv6 hosts without brackets.
+- Authenticated git fetches need git 2.31 or later; with an older git they
+  report `unreachable`.
+- An authenticated git endpoint that redirects, such as a renamed GitHub
+  repository, now reports `unreachable`; point it at the current URL. An HTTP or
+  catalog registry whose redirect chain goes from `https://` to `http://` at any
+  hop now fails; point it at the final `https://` location.
+- A git refresh that cannot fetch now reports `unreachable`.
+- On an authenticated git fetch, an `Authorization` extra header from your git
+  configuration for the endpoint is replaced by federation's; your other extra
+  headers are still sent, unless one contains a line break or a NUL, which makes
+  the fetch anonymous. A `url.<base>.insteadOf` rule that rewrites the endpoint
+  to another scheme, host, port or path also makes it anonymous.
+- Refusals are reported as `unreachable` findings; as in 0.19.0, the federation
+  gate warns and does not stop `fluid apply`.
+
+#### E — MCP output-port trusted proxies (fix/sec-mcp-trusted-proxies)
+**Security**
+- `fluid mcp output-port serve --transport http` reads the `X-Client-CN` / `X-Client-Fingerprint` headers only under two conditions: the request passed `shared-token` or `jwt` auth, and its TCP peer is listed in the new `FLUID_MCP_TRUSTED_PROXIES`. That variable takes comma-separated IPs or CIDRs and is empty by default, so no peer is trusted. Before, any client that held the token or a valid JWT and could reach the gateway without going through the proxy could name any certificate and pass a `${caller.client_cn}` / `${caller.client_fingerprint}` row filter. Headers from any other peer are ignored, and so are empty values and values with control characters. A filter that needs them then fails closed. The check uses the TCP peer, never `X-Forwarded-For`: uvicorn's proxy-header rewriting is off for the gateway.
+- `${caller.client_cn}` and `${caller.client_fingerprint}` no longer bind from a value the client supplies about itself (`clientInfo` extras or its `fluid` capability block). This holds in every auth mode.
+- `serve` refuses to start, with exit 2, in two setups where no forwarded certificate can be read:
+  - `--transport http` with gateway auth not enabled, while `FLUID_MCP_TRUSTED_PROXIES` is set or a row filter reads either attribute;
+  - `--transport stdio` when a row filter reads either attribute.
+- `data_access` audit records carry `authKind` (`shared-token`, `jwt` or `none`). When a trusted proxy forwarded a certificate, they also carry `clientCertCn` and `clientCertFingerprint`.
+- These settings now stop `serve --transport http` with exit 2 (`invalid_auth_mode` / `invalid_trusted_proxies`), and the error names the accepted values:
+  - an unknown `FLUID_MCP_AUTH_MODE` (for example `mtls`), which used to produce a traceback;
+  - a `FLUID_MCP_TRUSTED_PROXIES` entry that is not an IP or CIDR, is `*` or is empty;
+  - a `FLUID_MCP_TRUSTED_PROXIES` host address with a prefix, such as `10.0.4.17/8`, which is refused instead of widened to its network.
+- When the gateway ignores the headers, it logs `output_port_mtls_headers_ignored` at WARNING, once per reason and peer, with the peer address and, for an untrusted peer, the `FLUID_MCP_TRUSTED_PROXIES` value to set.
+
+**Upgrade notes**
+- **Set `FLUID_MCP_TRUSTED_PROXIES` if you run behind an mTLS proxy and rely on the forwarded certificate.** Use the proxy's address: `127.0.0.1` for the shipped nginx and Caddy templates, or the proxy's address when it runs in another container or host. Until you do, calls that a `${caller.client_cn}` / `${caller.client_fingerprint}` filter applies to fail with `RowFilterIdentityMissing`, and the WARNING names the address to add. List only the proxy's own address, or the narrowest CIDR covering your proxy replicas: any peer in a listed range can assert any client certificate. See docs/MCP_OUTPUT_PORT.md.
+- **The certificate headers need gateway auth.** Use `shared-token` with `FLUID_MCP_AUTH_TOKEN`, or `jwt` with `FLUID_MCP_JWT_ISSUER`, `FLUID_MCP_JWT_AUDIENCE` and `FLUID_MCP_JWT_JWKS_URL`. Without auth, `serve --transport http` now exits 2 if `FLUID_MCP_TRUSTED_PROXIES` is set or a row filter reads a certificate attribute. The message names the variable that keeps auth off.
+- **stdio no longer serves an expose whose row filter reads `${caller.client_cn}` or `${caller.client_fingerprint}`.** `serve` exits 2. Before, the client's own claim bound the filter. Serve it over HTTP behind the proxy instead.
+- uvicorn's access log for the gateway now shows the TCP peer (the proxy) instead of an `X-Forwarded-For` address, and `FORWARDED_ALLOW_IPS` no longer affects the gateway. The "NO built-in auth" warning now prints only when HTTP auth is actually off.
+
+#### F — init --discover credential redaction (fix/sec-discover-uri-redaction)
+
+**Security**
+- **`fluid init --discover <uri>` no longer prints the credentials in its URI, or writes
+  them into the contracts, in the cases listed below.** It printed the URI as given,
+  password included, in the progress line and the connectivity and unsupported-scheme
+  errors, both rendered and in the typed error's JSON form. It also logged the URI as
+  given in the `discover.emitted` line (from 0.10.1 the CLI's log filter masks a plain
+  `user:password@` password there, but not a user-name token, and up to 0.17.0 a query
+  signature reached that line unmasked). And it wrote the password into every emitted
+  `contract.*.fluid.yaml`. For a URL source it wrote the whole URL, including its
+  `user:password@` part and its query string (a remote URL's only up to 0.17.0).
+  - For a URI with a `scheme://`, the progress line, the log line and the errors now
+    show the URI masked. The `user:password` part is masked up to the last `@`.
+    Database URIs keep the user name; any other scheme masks it too, because it can be
+    a token. Every query value is masked and its name kept, except that everything after
+    a parameter named like a credential (`password=`, `token=`, `api_key=`) is masked as
+    well. The fragment is left out.
+  - Contracts carry no `user:password@` part, query string or fragment (a URL
+    whose user name holds a raw `/`, `?` or `#` is an exception; see the upgrade notes).
+    A Postgres contract gets `secretRef: env://PGPASSWORD` and a MySQL/MariaDB contract
+    gets `secretRef: env://MYSQL_PWD` when the URI held a password. A URL contract keeps
+    its scheme, host, port and path. For a URL contract, a closing line names the query
+    parameters left out, never their values. It shows masked a name that the display
+    rules mask (for example a piece of a user name or token). After a parameter named
+    like a credential, such as `token=`, it can still name later parameters that the
+    printed URI no longer shows.
+- A discoverer that a plugin registers under a key that is not an RFC 3986 scheme
+  (`my_db`, `jdbc:postgresql`) no longer has the URI's user name or password written to
+  its contracts, except where a URL is used as given (a user name with a raw `/` before
+  its `:`; see the note on a raw `/`, `?` or `#`). The text after the key's `://` is
+  read as it would be after a scheme, and the contract keeps `<key>://host:port/path`. Without a project name, the contract's
+  id and name are built from that path. They were built from a path that held the
+  `user:password` part, and carried the password in lower case.
+- A URI whose `user:password` part a URL parser could read as the host or port is
+  refused before any connection, with the masked URI in the error. That is when the
+  text from `://` to the last `@` holds a `:`, `urlsplit` reads that part differently
+  (the `@` comes after the first `/`, `?` or `#`, or the part holds a tab or a line
+  break), and the text between `://` and that first `/`, `?` or `#` holds a `:` (a port
+  or an IPv6 address included), an `@`, `[` or `]`, or `urlsplit` cannot parse the URI.
+  A database URI of that shape is refused whatever its host. A discoverer registered
+  under a key that is not an RFC 3986 scheme gets the same refusal for the text after
+  its `://`: by the database rules when it is built on the JDBC base, by the URL rules
+  otherwise. A URL that is not a database URI, and whose text between `://` and the
+  first `/`, `?` or `#` is a host name alone, is used as given when a `:` and an `@`
+  come after that host (`s3://bucket/2024-01-01T10:00:00/user@example.com/x.csv`).
+- A failed discovery's reason is masked before it is shown, in three ways:
+  - Copies of the URI that the driver quotes, whole or cut short, are masked. That holds
+    whether the copy is as given or re-escaped as a SQL literal, a libpq DSN value,
+    `repr()`, JSON or percent-encoding.
+  - The password is masked where it follows a password key: `password=`, `PGPASSWORD=`,
+    `MYSQL_PWD=`, or any key ending in `password`, `passwd` or `pwd`. So a password the
+    URI also spells as its user or database name (`postgres:postgres@.../postgres`) is
+    hidden there, while the user and database names stay readable.
+  - Hidden values are registered with the process-wide redaction registry, so later
+    output in the same process masks them too. A value is not registered if it is
+    shorter than 6 characters, is a fragment of a redaction key name, or is also spelled
+    by the shown URI.
+- The `ConnectivityProbeError` that `--discover` raises no longer carries the driver's own
+  error as its `__cause__` or `__context__`. That error can quote the URI or the DSN
+  unmasked, and any formatted traceback printed it: a crash reporter, `logger.exception`,
+  or a program that embeds the CLI.
+  - Its cause is now a stand-in that names the driver's exception type, with the masked
+    text and no traceback.
+  - The masked reason keeps, one line each, the errors a plugin chains with
+    `raise ... from` and an exception group's sub-errors.
+  - A driver error whose `str()` fails no longer escapes with the URI attached. It reads
+    `<exception str() failed>`.
+- A credential URI typed without its `//` is now masked like a URI. Examples are
+  `postgres:alice:PW@host/db` and `https:/host/f.csv?sig=...`. This applies when the
+  text before the location's first `:` is postgres, postgresql, mysql, mariadb, sqlite,
+  file, http, https, s3, gs, gcs, az, azure, abfs or abfss, or a scheme a registered
+  discoverer reads.
+  Text before the first `://` counts as a scheme only where RFC 3986 allows one, so a
+  `://` later in the query or fragment no longer leaves the credential in clear. Any
+  other location with no `://` is still read as a local path and shown as given
+  (`ftp:alice:PW@host`, `user:PW@host/db`). `fluid init --help` says so.
+- The filesystem discoverer names a remote stream, and reads its format, from the URL's
+  path, never from its query string or fragment. Up to 0.17.0 a query string or fragment
+  could reach a stream name, the contract's name and its file name, and up to 0.19.0 so
+  could the `user:password@` part of a URL whose path is `/`. A URL whose path is empty
+  or `/` is named after its host.
+
+**Upgrade notes**
+- **Database contracts.** Contracts from `fluid init --discover` with a Postgres or
+  MySQL/MariaDB URI that holds a password no longer contain `password:`. They reference
+  `secretRef: env://PGPASSWORD` or `secretRef: env://MYSQL_PWD` instead. Export that
+  variable before `fluid apply`. To keep the password off the command line as well,
+  export it before `--discover` and leave it out of the URI. Those contracts get no
+  `secretRef`, and the database client reads the variable itself.
+- **URL contracts.** A URL contract keeps no query string at all, including harmless
+  parameters such as `versionId=7` or `format=csv`. It also keeps no fragment and no
+  `user:password@` part. The closing line lists the dropped parameter names. Add back by
+  hand any parameter the source needs that is not a credential.
+- **Remote stream names.** A remote stream is named, and its format read, from the URL's
+  path, never from its query string or fragment. A URL whose path is empty or `/` is
+  named after its host. That is a new contract name and file name when the host holds a
+  `.`, or the URL has a port or a `user:password@` part: `https://files.example.test/`
+  was `files.example` and is now `files.example.test`; `http://localhost:9000/` was
+  `localhost:9000` and is now `localhost`.
+- **Masked user names.** The display of a URI that is not a database URI masks the user
+  name along with the password: `https://***REDACTED***@host/...`. If the text before <!-- pragma: allowlist secret -->
+  `://` is not an RFC 3986 scheme, the display masks from the first `:` to the last `@`.
+  For example, `jdbc:postgresql://alice:...@host/shop` is shown as `jdbc:***REDACTED***@host/shop`.
+  A URL with an `@` in its path is masked from `://` to that `@`:
+  `s3://bucket/2024-01-01T10:00:00/user@example.com/x.csv` is shown as
+  `s3://***REDACTED***@example.com/x.csv`. Its contract keeps the path as given.
+- **New refusal.** `--discover` now refuses, with "cannot tell the password from the
+  host", the URIs described above. They include URIs with no password that earlier
+  releases accepted: a URL with a port or an IPv6 host and an `@` later in its path,
+  query or fragment (`http://localhost:9000/bucket/a@b.csv`), and a database URI with a
+  `:` before an `@` that follows its first `/`, `?` or `#`
+  (`postgres://db:5432/shop?application_name=ops@laptop`). For an `http://` or
+  `https://` URL, percent-encode that `@` as `%40`. For a password that holds a raw `/`,
+  `?` or `#`, take the password out of the URI (`PGPASSWORD`, `MYSQL_PWD`), or, for
+  other URLs, percent-encode `/`, `?`, `#` and `@` in the `user:password` part.
+- **Locations typed without `//`.** Type the `//` after the scheme. A location with no
+  `://` is masked only when the text before its first `:` is one of the schemes listed
+  above.
+- **A raw `/`, `?` or `#` in a URL's user name.** A URL whose user name holds one of
+  these characters, before its `:` or as a token with no password, is used as given:
+  the text before that character is contacted as the host and written to the contracts.
+  After a `/`, the contract also keeps the rest, password or token included, in its
+  connection `uri` (for a database URI given such a token, in its database name). After
+  a `?` or `#`, the rest is read as the query string or fragment, which is not written.
+  A database URI whose user name holds such a character before its `:` is refused. The
+  output still masks the user name and password. Leave such credentials out of the URI
+  and let the storage client's own credential chain supply them.
+- **Plugin discoverers.** A discoverer registered under a key that is not an RFC 3986
+  scheme (`my_db`, `jdbc:postgresql`) now gets the refusal above. Its contracts get a
+  connection `uri` of `<key>://host:port/path`, with no user name or password and no
+  `secretRef`, except where a URL is used as given (a user name with a raw `/` before
+  its `:`; see the note on a raw `/`, `?` or `#`). Without a project name, their id
+  and name are built from that path instead of from one that held the `user:password`
+  part.
+- **Library callers.** The `ConnectivityProbeError` that `run_discover` raises now has a
+  `RuntimeError` stand-in as `__cause__`, whose message starts with the driver's exception
+  type name. Its `__context__` is `None`. Code that inspected the driver's exception on
+  the chain must read the type name from that message instead.
+
+
 ### Upgrade notes
 
 - The minimum `mcp` is now 1.22 (was 1.20). mcp 1.20 and 1.21 import
