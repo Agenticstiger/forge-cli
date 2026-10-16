@@ -517,7 +517,7 @@ This release fixes six security advisories. Each entry below has its own upgrade
   was `files.example` and is now `files.example.test`; `http://localhost:9000/` was
   `localhost:9000` and is now `localhost`.
 - **Masked user names.** The display of a URI that is not a database URI masks the user
-  name along with the password: `https://***REDACTED***@host/...`. If the text before
+  name along with the password: `https://***REDACTED***@host/...`. If the text before <!-- pragma: allowlist secret -->
   `://` is not an RFC 3986 scheme, the display masks from the first `:` to the last `@`.
   For example, `jdbc:postgresql://alice:...@host/shop` is shown as `jdbc:***REDACTED***@host/shop`.
   A URL with an `@` in its path is masked from `://` to that `@`:
