@@ -612,9 +612,6 @@ def _run_odcs_validate(args):
 
 def _write_validate_report(args, report: dict) -> None:
     """Write the optional structured report (CI gate) for ``--report``."""
-    import json
-    from pathlib import Path
-
     if getattr(args, "report", None):
         report_path = Path(args.report)
         report_path.parent.mkdir(parents=True, exist_ok=True)

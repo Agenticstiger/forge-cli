@@ -593,7 +593,6 @@ def test_odcs_validate_reports_an_unreadable_file_as_a_failure(
     tmp_path: Path, text: str, reason: str
 ) -> None:
     import argparse
-    import json
 
     contract = tmp_path / "c.yaml"
     contract.write_text(text, encoding="utf-8")
