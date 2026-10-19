@@ -162,6 +162,71 @@ def test_stream_is_read_only_up_to_the_cap() -> None:
     assert stream.sizes == [1_001]
 
 
+def test_short_reads_are_read_to_the_end() -> None:
+    """A raw stream may return fewer units than asked before its end; the
+    bounded read keeps reading instead of parsing the first chunk."""
+
+    class _Trickle(io.RawIOBase):
+        def __init__(self, data: bytes) -> None:
+            self.data = data
+
+        def readable(self) -> bool:
+            return True
+
+        def read(self, size: int = -1) -> bytes:
+            chunk, self.data = self.data[:7], self.data[7:]
+            return chunk
+
+    assert load_yaml_safe(_Trickle(b"name: a-long-enough-value\nid: x\n")) == {
+        "name": "a-long-enough-value",
+        "id": "x",
+    }
+    with pytest.raises(UnsafeYamlError, match="safety cap"):
+        load_yaml_safe(_Trickle(b"k: " + b"v" * 100), max_bytes=50)
+
+
+@pytest.mark.parametrize("as_bytes", [False, True], ids=["str", "bytes"])
+def test_size_cap_counts_utf8_bytes(as_bytes: bool) -> None:
+    """400 three-byte characters are 1,203 bytes: over a 1,000-byte cap
+    whether they arrive as text or as bytes."""
+    doc = "k: " + "\u20ac" * 400
+    with pytest.raises(UnsafeYamlError, match="1000-byte"):
+        load_yaml_safe(doc.encode("utf-8") if as_bytes else doc, max_bytes=1_000)
+    assert load_yaml_safe("k: " + "\u20ac" * 300, max_bytes=1_000) == {"k": "\u20ac" * 300}
+
+
+def test_depth_cap_boundary() -> None:
+    """A document nested to the cap loads; one level more is refused, not
+    left to PyYAML's ``RecursionError``, and so is one 20,000 levels deep,
+    which PyYAML's scanner took tens of seconds to read to the end.
+    ``a: [[1]]`` is three levels."""
+    assert load_yaml_safe("[" * 128 + "]" * 128) is not None
+    for depth in (129, 20_000):
+        with pytest.raises(UnsafeYamlError, match="more than 128 levels"):
+            load_yaml_safe("[" * depth + "]" * depth)
+    assert load_yaml_safe("a: [[1]]", max_depth=3) == {"a": [[1]]}
+    with pytest.raises(UnsafeYamlError, match="more than 2 levels"):
+        load_yaml_safe("a: [[1]]", max_depth=2)
+
+
+def test_aliases_repeating_a_long_string_are_refused() -> None:
+    """Twenty aliases add few nodes but repeat a 1,000,000-character string
+    twenty times; the node budget alone let it through."""
+    big = "x" * 1_000_000
+    doc = f"s: &s {big}\nl1: &l1 [*s, *s, *s, *s]\nl2: &l2 [*l1, *l1, *l1, *l1]\n"
+    with pytest.raises(UnsafeYamlError, match="repeat 20000000 characters"):
+        load_yaml_safe(doc)
+
+
+def test_character_budget_boundary() -> None:
+    """Two aliases to a ten-character string add 20 characters: allowed at
+    20, not at 19."""
+    doc = "a: &a abcdefghij\nb: *a\nc: *a\n"
+    assert load_yaml_safe(doc, max_alias_expansion_chars=20)["c"] == "abcdefghij"
+    with pytest.raises(UnsafeYamlError, match="repeat 20 characters"):
+        load_yaml_safe(doc, max_alias_expansion_chars=19)
+
+
 def test_reusing_a_block_is_allowed() -> None:
     """Ordinary DRY reuse of one anchored block stays well inside the budget."""
     block = "{" + ", ".join(f"f{i}: v{i}" for i in range(100)) + "}"
