@@ -9,18 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
-- The YAML guard has a new cap: every file it reads, FLUID contracts included, is refused
-  when its aliases add more than 100,000 nodes or grow it more than 100-fold past 1,000
-  nodes. ODCS and ODPS files now go through the guard at all, so `fluid odps
-  import`/`validate`, `fluid odcs validate`/`import`, `fluid odps-bitol validate`, the
-  `contractId` resolver and `fluid forge --seed-from` also refuse a YAML file over 5 MiB or
-  with more than 50 aliases, the caps FLUID contracts already had. Write the repeated
-  blocks out instead of reusing them through anchors. A bundle directory without a
-  readable ODPS doc that holds such a file fails instead of importing as ODCS-only.
+- The YAML guard has new caps for every file it reads, FLUID contracts included: a file
+  is refused when it nests more than 128 levels deep, or when its aliases add more than
+  100,000 nodes or 5 MiB of text, or grow it more than 100-fold past 1,000 nodes. The
+  5 MiB size cap now counts UTF-8 bytes for text as well as for bytes. ODCS and ODPS files
+  now go through the guard at all, so `fluid odps import`/`validate`, `fluid odcs
+  validate`/`import`, `fluid odps-bitol validate`, the `contractId` resolver and `fluid
+  forge --seed-from` also refuse a YAML file over 5 MiB or with more than 50 aliases, the
+  caps FLUID contracts already had. Write the repeated blocks out instead of reusing them
+  through anchors. A bundle directory without a readable ODPS doc that holds a file the
+  guard refuses, or one that does not parse, fails instead of importing as ODCS-only.
 - A file the resolver probes for a port's `contractId` must now declare that `contractId`
-  as its `id`. A bundle that relied on a file named after the port but declaring another
-  id fails a strict import, or skips the port under `--lenient`; make the port's
-  `contractId` and the ODCS `id` agree.
+  as its `id`. A bundle that relied on a file named after the port's `contractId` but
+  declaring another id fails a strict import, or skips the port under `--lenient` (an
+  input port is always skipped); make the port's `contractId` and the ODCS `id` agree.
 
 ### Fixed
 
@@ -30,24 +32,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without an error. A missing expose is now a seed mismatch, which the repair loop feeds
   back to the model on its next attempt.
 - **A malformed or mismatched `contractId` no longer breaks an ODPS import.** A
-  `contractId` with a NUL byte, a value that is not a string, or an unparsable URL such as
-  `http://[::1` made `fluid odps import` fail with `ValueError` or `TypeError`, even with
-  `--lenient` and on input ports, which always import leniently. It is now an unresolved
-  contract: `--lenient` and input ports skip it with a warning, and a strict import stops
-  with an unresolved-contract error (`not a valid contractId` for a NUL byte or a value
-  that is not a string; an empty one is ignored, as before). A file the resolver probes
+  `contractId` with a NUL byte, a value that is not a string, a segment longer than a file
+  name may be, or an unparsable URL such as `http://[::1` made `fluid odps import` fail
+  with `ValueError`, `TypeError` or `OSError`, even with `--lenient` and on input ports,
+  which always import leniently. It is now an unresolved contract: `--lenient` and input
+  ports skip it with a warning, and a strict import stops with an unresolved-contract
+  error (`not a valid contractId` for a NUL byte or a value that is not a string, `false`
+  and `0` included, which a strict import used to skip; an empty or missing one is
+  ignored, as before). A file the resolver probes
   for a `contractId`, such as `orders.odcs.yaml` for `commerce.orders`, is now used only
   when it declares that `id`; a file that declares another contract is skipped with a
   warning naming both ids instead of being linked to the port.
+- **`fluid odps import <dir>` no longer drops a product doc it cannot read.** A product
+  file with a YAML syntax error, or with an upper-case suffix such as `PRODUCT.ODPS.YAML`
+  (which the ODCS reader parsed as JSON), was skipped without a word, and the directory
+  imported as ODCS-only. Every ODCS/ODPS reader now reads an upper-case `.YAML`/`.YML`
+  suffix as YAML, and a directory file that does not parse is skipped with a warning
+  naming it; a directory left without a readable ODPS doc fails.
+- **`fluid generate artifacts` reports a contract it cannot read.** With `--emit
+  schedule` alone, a contract that did not parse skipped the only emitter and exited 0
+  with no files; a contract that was not UTF-8 or not a mapping ended in "Unexpected
+  error". Each is now a `generate_artifacts_failed` error naming the file.
+- **`fluid odcs validate --report` writes the report when the file does not parse.** The
+  command printed the failure and exited 1 without the report, so a CI gate reading it
+  found no file; the report now records a failed `parse` pass.
 
 ### Security
 
-- **The YAML guard caps what aliases expand to, not only how many there are.** It
-  allowed 50 aliases, which is not a bound: 22 levels of `[*a, *a]` are 44 aliases that
-  expand to 25,165,822 nodes, and a 685-byte contract shaped like that held `fluid
-  validate` for more than 90 seconds. A document is now also refused when its aliases add
-  more than 100,000 nodes, or grow it more than 100-fold once it is past 1,000 nodes, and
-  the error names both sizes; a stream is read only up to the 5 MiB cap. The ODCS and ODPS
+- **The YAML guard caps what aliases expand to, in nodes and in text, and how deep a file
+  nests.** It allowed 50 aliases, which is not a bound: 22 levels of `[*a, *a]` are 44
+  aliases that expand to 25,165,822 nodes, and a 685-byte contract shaped like that held
+  `fluid validate` for more than 90 seconds. A document is now also refused when its
+  aliases add more than 100,000 nodes or 5 MiB of text (a 1 MB string repeated through
+  two nested lists of four aliases adds 20 MB), or grow it more than 100-fold once it is
+  past 1,000 nodes, and the error names the sizes. A file nested more than 128 levels deep
+  is refused before PyYAML scans it to the end (a 64 KB file nested 32,000 deep took over
+  40 seconds) or fails with `RecursionError`, and a stream is read only up to the 5 MiB
+  cap. The ODCS and ODPS
   readers had no cap at all: `fluid odps import`, the `contractId` resolver (fetched
   contracts included), `fluid forge --seed-from`, `fluid odps-bitol validate` and `fluid
   odcs validate`/`import` read YAML with a plain `yaml.safe_load`. They now use the same
