@@ -37,6 +37,7 @@ from fluid_build.forge.core.artifact_fanout import (
     _contract_is_reference_only,
     _emit_policies,
     _expose_level_policies,
+    _load_contract,
     _schedule_skip_reason,
     parse_emit_set,
     run_fanout,
@@ -207,6 +208,20 @@ class TestContractInspectionHelpers:
         c.write_text("not: valid: yaml: [\n")
         assert _contract_is_reference_only(c) is False
 
+    @pytest.mark.parametrize(
+        "content",
+        [b"not: valid: yaml: [\n", b"builds: \xff\xfe\n", b"- builds\n- reference\n"],
+        ids=["malformed", "latin-1", "list"],
+    )
+    def test_unreadable_contract(self, tmp_path, content):
+        # Not reference-only, and a FanoutError (what `fluid generate artifacts`
+        # reports) from the loader every emitter uses, not an unhandled exception.
+        c = tmp_path / "c.yaml"
+        c.write_bytes(content)
+        assert _contract_is_reference_only(c) is False
+        with pytest.raises(FanoutError, match="did not parse"):
+            _load_contract(c)
+
     def test_orchestration_engine_detected(self):
         assert _schedule_skip_reason({"orchestration": {"engine": "airflow"}}) is None
 
@@ -305,6 +320,16 @@ class TestRunFanout:
                 emit_raw="bogus",
                 manifest_path=None,
                 logger=logger,
+            )
+
+    def test_schedule_alone_reports_a_contract_that_does_not_parse(self, tmp_path, logger):
+        # Schedule skipped an unreadable contract for the other emitters to
+        # report; with `--emit schedule` alone, stage 3 exited 0 on nothing.
+        contract = tmp_path / "contract.fluid.yaml"
+        contract.write_text("not: valid: yaml: [\n", encoding="utf-8")
+        with pytest.raises(FanoutError, match="did not parse"):
+            run_fanout(
+                contract, tmp_path / "art", emit_raw="schedule", manifest_path=None, logger=logger
             )
 
     def test_missing_bundle_errors(self, tmp_path, logger):
