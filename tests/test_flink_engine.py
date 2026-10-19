@@ -51,7 +51,9 @@ FLINK_SQL = (
 )
 
 
-def _flink_build(platform: str = "kubernetes", *, engine: str = "flink") -> Dict[str, Any]:
+def _flink_build(
+    platform: str = "kubernetes", *, engine: str = "flink"
+) -> Dict[str, Any]:
     build: Dict[str, Any] = {
         "id": "reconcile",
         "engine": engine,
@@ -112,7 +114,9 @@ def _contract(fluid_version: str = "0.7.6", engine: str = "flink") -> Dict[str, 
 
 
 def _errors(version: str, contract: Dict[str, Any]) -> list:
-    schema = json.loads((SCHEMAS / f"fluid-schema-{version}.json").read_text(encoding="utf-8"))
+    schema = json.loads(
+        (SCHEMAS / f"fluid-schema-{version}.json").read_text(encoding="utf-8")
+    )
     validator = jsonschema.validators.validator_for(schema)(schema)
     return [e.message for e in validator.iter_errors(contract)]
 
@@ -141,11 +145,17 @@ class TestSchema:
     [
         pytest.param(_flink_build(), True, id="engine-flink"),
         pytest.param({"engine": " FLINK "}, True, id="engine-case-and-space"),
-        pytest.param({"engine": "sql", "properties": {"language": "Flink_SQL"}}, True, id="lang"),
-        pytest.param({"engine": "sql", "properties": {"sql": "SELECT 1"}}, False, id="sql"),
+        pytest.param(
+            {"engine": "sql", "properties": {"language": "Flink_SQL"}}, True, id="lang"
+        ),
+        pytest.param(
+            {"engine": "sql", "properties": {"sql": "SELECT 1"}}, False, id="sql"
+        ),
         pytest.param({"properties": {"language": "sql"}}, False, id="language-sql"),
         # Out of scope here: other languages keep the behaviour they had.
-        pytest.param({"properties": {"language": "python", "sql": "--"}}, False, id="python"),
+        pytest.param(
+            {"properties": {"language": "python", "sql": "--"}}, False, id="python"
+        ),
         pytest.param({"engine": 7, "properties": ["flink_sql"]}, False, id="malformed"),
     ],
 )
@@ -160,7 +170,10 @@ def test_a_flink_build_is_not_inline_sql(engine: str) -> None:
     assert is_embedded_sql_build(_flink_build(engine=engine)) is False
     plain = {"pattern": "embedded-logic", "properties": {"sql": "SELECT 1"}}
     assert is_embedded_sql_build(plain) is True
-    python = {"pattern": "embedded-logic", "properties": {"sql": "--", "language": "python"}}
+    python = {
+        "pattern": "embedded-logic",
+        "properties": {"sql": "--", "language": "python"},
+    }
     assert is_embedded_sql_build(python) is True  # unchanged
 
 
@@ -181,7 +194,9 @@ def _args(contract_path: Path, *, dry_run: bool) -> argparse.Namespace:
 class TestBuildRunner:
     @pytest.mark.parametrize("shape", SHAPES)
     @pytest.mark.parametrize("dry_run", [True, False], ids=["dry-run", "run"])
-    @pytest.mark.parametrize("platform", ["kubernetes", ""], ids=["kubernetes", "no-platform"])
+    @pytest.mark.parametrize(
+        "platform", ["kubernetes", ""], ids=["kubernetes", "no-platform"]
+    )
     def test_a_flink_build_is_reported_not_run(
         self,
         tmp_path: Path,
@@ -191,12 +206,12 @@ class TestBuildRunner:
         platform: str,
         shape: tuple,
     ) -> None:
-        import fluid_build.build_runners.base as base
-
         def _must_not_run(*_a: Any, **_k: Any) -> int:
             raise AssertionError("a flink build reached the inline-SQL executor")
 
-        monkeypatch.setattr(base, "_execute_embedded_sql_build", _must_not_run)
+        monkeypatch.setattr(
+            "fluid_build.build_runners.base._execute_embedded_sql_build", _must_not_run
+        )
         version, engine = shape
         contract = _contract(version, engine)
         contract["builds"] = [_flink_build(platform, engine=engine)]
@@ -206,7 +221,10 @@ class TestBuildRunner:
         # A contract whose only build runs elsewhere is not "every build was
         # skipped": nothing is missing, so the apply succeeds without
         # --allow-skipped-builds.
-        assert run_builds_from_args(_args(path, dry_run=dry_run), logging.getLogger("t")) == 0
+        assert (
+            run_builds_from_args(_args(path, dry_run=dry_run), logging.getLogger("t"))
+            == 0
+        )
         out = capsys.readouterr().out
         said = "engine 'flink'" if engine == "flink" else "language 'flink_sql'"
         assert f"{said} runs on" in out and "outside forge-cli" in out
@@ -231,9 +249,15 @@ class TestBuildRunner:
         monkeypatch.setattr(apply_run, "current_apply_run", lambda: _Report())
         path = tmp_path / "contract.fluid.yaml"
         path.write_text(yaml.safe_dump(_contract()), encoding="utf-8")
-        assert run_builds_from_args(_args(path, dry_run=True), logging.getLogger("t")) == 0
+        assert (
+            run_builds_from_args(_args(path, dry_run=True), logging.getLogger("t")) == 0
+        )
         assert recorded == [
-            {"build_id": "reconcile", "status": "skipped", "reason": "runs_outside_forge"}
+            {
+                "build_id": "reconcile",
+                "status": "skipped",
+                "reason": "runs_outside_forge",
+            }
         ]
 
 
@@ -244,11 +268,15 @@ class TestPlanners:
     def test_local_planner(self, shape: tuple) -> None:
         from fluid_build.providers.local.planner import plan_actions
 
-        actions = plan_actions(copy.deepcopy(_contract(*shape)), logger=logging.getLogger("t"))
+        actions = plan_actions(
+            copy.deepcopy(_contract(*shape)), logger=logging.getLogger("t")
+        )
         assert not [a for a in actions if a.get("op") == "execute_sql"]
         assert "INSERT INTO service_instances_full" not in json.dumps(actions)
 
-    def test_local_planner_lands_the_sql_build_before_a_flink_build(self, shape: tuple) -> None:
+    def test_local_planner_lands_the_sql_build_before_a_flink_build(
+        self, shape: tuple
+    ) -> None:
         # With the Flink build last, the expose took the first loaded input,
         # raw, because the last build had produced no table. The SQL build
         # names the expose; the Flink build names none.
@@ -262,7 +290,9 @@ class TestPlanners:
             "outputs": ["service_instances_full"],
             "properties": {
                 "sql": "SELECT id FROM customers",
-                "parameters": {"inputs": [{"name": "customers", "path": "data/customers.csv"}]},
+                "parameters": {
+                    "inputs": [{"name": "customers", "path": "data/customers.csv"}]
+                },
             },
         }
         contract["builds"].insert(0, clean)
@@ -275,7 +305,9 @@ class TestPlanners:
         (materialize,) = [a for a in actions if a.get("op") == "materialize"]
         assert materialize["payload"]["source_table"] == "result_clean"
 
-    def test_local_planner_lands_nothing_for_an_expose_flink_writes(self, shape: tuple) -> None:
+    def test_local_planner_lands_nothing_for_an_expose_flink_writes(
+        self, shape: tuple
+    ) -> None:
         # With every build running elsewhere, the expose took the first loaded
         # input and landed it raw under the expose's name.
         from fluid_build.providers.local.planner import plan_actions
@@ -292,7 +324,9 @@ class TestPlanners:
         actions = plan_actions(contract, logger=logging.getLogger("t"))
         assert not [a for a in actions if a.get("op") == "materialize"]
 
-    @pytest.mark.parametrize("sql_outputs", [None, ["customers_full"]], ids=["none", "declared"])
+    @pytest.mark.parametrize(
+        "sql_outputs", [None, ["customers_full"]], ids=["none", "declared"]
+    )
     def test_an_expose_flink_may_write_never_lands_another_builds_rows(
         self, shape: tuple, sql_outputs, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -349,13 +383,19 @@ class TestPlanners:
         from fluid_build.providers.local.local import LocalProvider
 
         provider = LocalProvider(project=str(tmp_path))
-        actions = provider._derive_actions_from_contract(copy.deepcopy(_contract(*shape)))
-        assert actions == [{"op": "noop", "skipped": True, "reason": "build_runs_outside_forge"}]
+        actions = provider._derive_actions_from_contract(
+            copy.deepcopy(_contract(*shape))
+        )
+        assert actions == [
+            {"op": "noop", "skipped": True, "reason": "build_runs_outside_forge"}
+        ]
 
     def test_aws_planner(self, shape: tuple) -> None:
         from fluid_build.providers.aws.plan.planner import plan_actions
 
-        actions = plan_actions(copy.deepcopy(_contract(*shape)), "123456789012", "eu-west-1")
+        actions = plan_actions(
+            copy.deepcopy(_contract(*shape)), "123456789012", "eu-west-1"
+        )
         assert not [a for a in actions if a.get("op") == "athena.execute_query"]
 
     def test_gcp_planner(self, shape: tuple) -> None:
@@ -378,7 +418,9 @@ class TestPlanners:
         )
         assert not [a for a in actions if a.get("op") == "sf.sql.execute"]
 
-    def test_snowflake_replace_still_ensures_the_flink_target(self, shape: tuple) -> None:
+    def test_snowflake_replace_still_ensures_the_flink_target(
+        self, shape: tuple
+    ) -> None:
         # Replace mode skips ensure_table for an expose a SQL build recreates;
         # a Flink build does not recreate it, so its table is still ensured.
         from fluid_build.providers.snowflake.plan.planner import plan_actions
@@ -397,7 +439,12 @@ class TestPlanners:
             }
         ]
         actions = plan_actions(
-            contract, account="acme", warehouse="WH", database="DB", schema="PUBLIC", mode="replace"
+            contract,
+            account="acme",
+            warehouse="WH",
+            database="DB",
+            schema="PUBLIC",
+            mode="replace",
         )
         assert [a for a in actions if a.get("op") == "sf.table.ensure"]
 
@@ -408,8 +455,12 @@ def test_a_scheduler_gets_no_task_for_a_flink_build(shape: tuple) -> None:
     from fluid_build.schedulers.synthesis import synthesize_orchestration_from_builds
 
     contract = _contract(*shape)
-    assert synthesize_orchestration_from_builds(copy.deepcopy(contract), "airflow") == {}
-    contract["builds"].append({"id": "daily", "engine": "sql", "properties": {"sql": "SELECT 1"}})
+    assert (
+        synthesize_orchestration_from_builds(copy.deepcopy(contract), "airflow") == {}
+    )
+    contract["builds"].append(
+        {"id": "daily", "engine": "sql", "properties": {"sql": "SELECT 1"}}
+    )
     tasks = synthesize_orchestration_from_builds(contract, "airflow")["tasks"]
     assert [t["taskId"] for t in tasks] == ["daily"]
 
@@ -434,14 +485,24 @@ class TestGenerators:
             yaml.safe_dump(_contract(*shape)), encoding="utf-8"
         )
         result = _run_cli(
-            "generate", "transformation", "contract.fluid.yaml", "-o", "out", "-q", cwd=tmp_path
+            "generate",
+            "transformation",
+            "contract.fluid.yaml",
+            "-o",
+            "out",
+            "-q",
+            cwd=tmp_path,
         )
         assert result.returncode == 0, result.stdout + result.stderr
-        assert "there is no transformation code to generate" in " ".join(result.stdout.split())
+        assert "there is no transformation code to generate" in " ".join(
+            result.stdout.split()
+        )
         assert not (tmp_path / "out").exists()
 
     @pytest.mark.parametrize("shape", SHAPES)
-    def test_generate_schedule_has_nothing_to_schedule(self, tmp_path: Path, shape: tuple) -> None:
+    def test_generate_schedule_has_nothing_to_schedule(
+        self, tmp_path: Path, shape: tuple
+    ) -> None:
         # It wrote a nightly DAG whose task only logged the Flink SQL.
         (tmp_path / "contract.fluid.yaml").write_text(
             yaml.safe_dump(_contract(*shape)), encoding="utf-8"
@@ -480,18 +541,33 @@ class TestGenerators:
             }
         else:
             contract["orchestration"] = {"engine": "airflow"}
-        (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(contract), encoding="utf-8")
+        (tmp_path / "contract.fluid.yaml").write_text(
+            yaml.safe_dump(contract), encoding="utf-8"
+        )
         result = _run_cli(
-            "generate", "schedule", "contract.fluid.yaml", "-o", "sched", *extra_args, cwd=tmp_path
+            "generate",
+            "schedule",
+            "contract.fluid.yaml",
+            "-o",
+            "sched",
+            *extra_args,
+            cwd=tmp_path,
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert "nothing to schedule" in " ".join(result.stdout.split())
         assert not (tmp_path / "sched").exists()
 
     def test_an_unknown_scheduler_is_still_an_error(self, tmp_path: Path) -> None:
-        (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(_contract()), encoding="utf-8")
+        (tmp_path / "contract.fluid.yaml").write_text(
+            yaml.safe_dump(_contract()), encoding="utf-8"
+        )
         result = _run_cli(
-            "generate", "schedule", "contract.fluid.yaml", "--scheduler", "bogus", cwd=tmp_path
+            "generate",
+            "schedule",
+            "contract.fluid.yaml",
+            "--scheduler",
+            "bogus",
+            cwd=tmp_path,
         )
         assert result.returncode == 1
         assert "No scheduler available for 'bogus'" in result.stdout
@@ -505,7 +581,10 @@ class TestGenerators:
         )
 
         contract = _contract()
-        contract["builds"][0]["execution"]["trigger"] = {"type": "schedule", "schedule": "@daily"}
+        contract["builds"][0]["execution"]["trigger"] = {
+            "type": "schedule",
+            "schedule": "@daily",
+        }
         assert has_scheduled_builds(contract) is False
         assert scheduled_builds(contract) == []
 
