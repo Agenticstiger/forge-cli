@@ -42,6 +42,7 @@ from fluid_build.providers._sql_safety import (
     validate_ident,
     validate_sql_expression_allowlist,
 )
+from fluid_build.util.contract import is_externally_run_build
 
 from ..util.config import resolve_env_templates as _resolve_env_templates
 from ..util.metadata import extract_snowflake_tags
@@ -792,7 +793,8 @@ def _plan_build(
 
     # Modern builds[] support for native SQL happy-path contracts.
     for index, build_entry in enumerate(contract.get("builds", []) or []):
-        if not isinstance(build_entry, Mapping):
+        # Flink SQL is not Snowflake SQL: that job runs outside forge-cli.
+        if not isinstance(build_entry, Mapping) or is_externally_run_build(build_entry):
             continue
 
         properties = build_entry.get("properties", {})
@@ -969,8 +971,10 @@ def _plan_expose(
             if not isinstance(build_entry, Mapping):
                 continue
             outputs = build_entry.get("outputs") or []
-            if outputs and (
-                build_entry.get("sql") or (build_entry.get("properties") or {}).get("sql")
+            if (
+                outputs
+                and not is_externally_run_build(build_entry)
+                and (build_entry.get("sql") or (build_entry.get("properties") or {}).get("sql"))
             ):
                 sql_build_targets.update(outputs)
 

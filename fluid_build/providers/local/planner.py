@@ -50,6 +50,7 @@ from fluid_build.util.contract import (
     get_expose_location,
     get_exposes,
     get_primary_build,
+    is_externally_run_build,
 )
 
 
@@ -217,6 +218,12 @@ def plan_actions(
             )
             continue
 
+        if is_externally_run_build(build):  # Flink SQL runs outside forge-cli
+            log.debug(
+                "local planner: build '%s' (engine=%s) runs outside forge-cli", build_id, engine
+            )
+            continue
+
         # Extract SQL from various formats
         sql_text = _extract_sql(build, contract, log)
 
@@ -341,6 +348,8 @@ def plan_actions(
     for _ei in _expose_iter:
         expose_id = _ei["_id"]
         out_path = _ei["_path"]
+        if _produced_outside_forge(expose_id, builds, log):
+            continue
 
         if not out_path:
             # Generate default path
@@ -503,6 +512,42 @@ def _extract_input_tables(
     return inputs
 
 
+def _produced_outside_forge(expose_id: Any, builds: List[Dict[str, Any]], log: Any) -> bool:
+    """True when forge-cli must not land ``expose_id``: a job that runs outside
+    forge-cli (a Flink job) writes it, or may.
+
+    The builds that write it are the ones whose ``outputs`` name it; when none
+    does, the ones that declare no ``outputs`` (a build that declares them has
+    said what it writes). When all of those run outside forge-cli, the expose is
+    theirs. When only some do, which build writes it is ambiguous, and landing
+    a local table under its name could publish another build's rows, so it is
+    not landed and the warning asks for ``outputs``.
+    """
+    dict_builds = [b for b in builds if isinstance(b, dict)]
+    producers = [
+        b for b in dict_builds if isinstance(b.get("outputs"), list) and expose_id in b["outputs"]
+    ] or [b for b in dict_builds if not isinstance(b.get("outputs"), list)]
+    outside = [b for b in producers if is_externally_run_build(b)]
+    if not outside:
+        return False
+    if len(outside) == len(producers):
+        log.info(
+            "local planner: expose '%s' is written by a job that runs outside forge-cli; "
+            "nothing to land",
+            expose_id,
+        )
+    else:
+        log.warning(
+            "local planner: expose '%s' is not landed: build(s) %s run outside forge-cli "
+            "and may write it, as may %s. Declare builds[].outputs to say which build "
+            "writes which expose.",
+            expose_id,
+            ", ".join(repr(b.get("id")) for b in outside),
+            ", ".join(repr(b.get("id")) for b in producers if b not in outside),
+        )
+    return True
+
+
 def _determine_source_table(
     expose: Dict[str, Any], builds: List[Dict[str, Any]], loaded_tables: Set[str], logger
 ) -> Optional[str]:
@@ -524,6 +569,8 @@ def _determine_source_table(
     # job, a dbt model) produced none, and taking its absence for "no build
     # output" landed the first loaded input, raw, in the expose.
     for build in reversed(builds):
+        if not isinstance(build, dict):
+            continue
         output_table = build.get("output_table") or f"result_{build.get('id', '0')}"
         if output_table in loaded_tables:
             return output_table
