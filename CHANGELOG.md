@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
-- ODCS and ODPS files are now read with the YAML caps FLUID contracts already had. `fluid
-  odps import`, `fluid odcs validate`/`import`, `fluid odps-bitol validate`, the
-  `contractId` resolver and `fluid forge --seed-from` refuse a YAML file over 5 MiB, with
-  more than 50 aliases, or whose aliases add more than 100,000 nodes; write the repeated
+- The YAML guard has a new cap: every file it reads, FLUID contracts included, is refused
+  when its aliases add more than 100,000 nodes or grow it more than 100-fold past 1,000
+  nodes. ODCS and ODPS files now go through the guard at all, so `fluid odps
+  import`/`validate`, `fluid odcs validate`/`import`, `fluid odps-bitol validate`, the
+  `contractId` resolver and `fluid forge --seed-from` also refuse a YAML file over 5 MiB or
+  with more than 50 aliases, the caps FLUID contracts already had. Write the repeated
   blocks out instead of reusing them through anchors. A bundle directory without a
   readable ODPS doc that holds such a file fails instead of importing as ODCS-only.
 - A file the resolver probes for a port's `contractId` must now declare that `contractId`
@@ -32,11 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `http://[::1` made `fluid odps import` fail with `ValueError` or `TypeError`, even with
   `--lenient` and on input ports, which always import leniently. It is now an unresolved
   contract: `--lenient` and input ports skip it with a warning, and a strict import stops
-  with an unresolved-contract error (`not a valid contractId` for a NUL byte, a
-  non-string or an empty value). A file the resolver probes for a `contractId`, such as
-  `orders.odcs.yaml` for `commerce.orders`, is now used only when it declares that `id`;
-  a file that declares another contract is skipped with a warning naming both ids instead
-  of being linked to the port.
+  with an unresolved-contract error (`not a valid contractId` for a NUL byte or a value
+  that is not a string; an empty one is ignored, as before). A file the resolver probes
+  for a `contractId`, such as `orders.odcs.yaml` for `commerce.orders`, is now used only
+  when it declares that `id`; a file that declares another contract is skipped with a
+  warning naming both ids instead of being linked to the port.
 
 ### Security
 
