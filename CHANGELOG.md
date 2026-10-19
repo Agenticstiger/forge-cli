@@ -24,6 +24,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as its `id`. A bundle that relied on a file named after the port's `contractId` but
   declaring another id fails a strict import, or skips the port under `--lenient` (an
   input port is always skipped); make the port's `contractId` and the ODCS `id` agree.
+- In a contract whose `fluidVersion` is 0.7.6 (the schema 0.7.6 preview) or later, an
+  overlay patches `builds`, `exposes` and `consumes` by identity, not by position. An
+  overlay that names each entry's id merges as before when it lists them in the base's
+  order; one that names an id at another position now patches the entry with that id, and
+  an entry whose id the base lacks is appended and logged as `overlay_entry_added`. When
+  the base's entries carry unique ids, an overlay entry with no id, or two naming the same
+  id, now fails the load (`contract_load_failed`): give each the id of the entry it
+  patches. Id-less patches still apply to a base with at most one entry, as long as no
+  overlay entry for it names an id. A 0.7.5 or older contract still merges by position.
+
+### Added
+
+- **Overlays merge `builds`, `exposes` and `consumes` by identity (schema 0.7.6 preview).**
+  Lists of maps merged by position, so inserting or reordering a build in the base silently
+  retargeted every overlay: with `builds: [ingest, transform]` and `overlays/prod.yaml`
+  raising `builds[1]`, adding a `backfill` build first made prod patch `ingest`, copying
+  `id: transform` onto it, and `fluid plan --env prod` failed with `planner_failed:
+  'schedule_transform'`. From `fluidVersion` 0.7.6, `builds[].id`, `exposes[].exposeId`
+  and `consumes[]`'s `productId` + `exposeId` match an overlay entry to its base entry, as
+  Kubernetes server-side apply matches list entries by their list-map keys. An entry that
+  matches nothing is appended and logged as `overlay_entry_added`, which names the base's
+  ids, so a typo shows. An overlay entry the merge cannot match (no id, or an id named
+  twice) fails the load with the index, where falling back to position would retarget it;
+  a base whose own ids are missing or repeated keeps the positional merge and logs
+  `overlay_merged_by_position`. Lists inside an entry, such as an expose's schema, still
+  merge by position. Every command that applies an overlay, and the contract API, merges
+  this way.
+- **Older contracts warn when a positional patch lands on another entry.** Before 0.7.6,
+  an overlay entry that names an id (or part of a `consumes` key) other than the base
+  entry at its position logs `overlay_patch_retargeted`, naming both, and the merge is
+  unchanged. Each merge warning names its contract and is logged once per process, so a
+  command that loads the contract twice says it once.
 
 ### Fixed
 
