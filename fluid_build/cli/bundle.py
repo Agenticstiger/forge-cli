@@ -220,12 +220,20 @@ def materialize_contract(
     compiled = compile_contract(contract_path, logger=compile_logger or logger)
     overlay_path: Optional[Path] = None
     if env:
-        from ..loader import _deep_merge, load_overlay_document, note_missing_overlay
+        from ..loader import (
+            OverlayMergeError,
+            _deep_merge,
+            load_overlay_document,
+            note_missing_overlay,
+        )
 
         found = load_overlay_document(contract_path, env)
         if found is not None:
             overlay_path, overlay = found
-            compiled = _deep_merge(dict(compiled), overlay)
+            try:
+                compiled = _deep_merge(dict(compiled), overlay)
+            except OverlayMergeError as exc:
+                raise OverlayMergeError(f"{overlay_path}: {exc}") from exc
             logger.info("overlay_applied", extra={"overlay": str(overlay_path)})
         else:
             note_missing_overlay(contract_path, env, logger, contract=compiled)

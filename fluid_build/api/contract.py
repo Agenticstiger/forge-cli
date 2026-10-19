@@ -327,8 +327,10 @@ def load_contract_from_dict(
       Not given: nothing is read from disk, and every ``$ref`` stays in
       place, listed in ``unresolved_refs``.
     * ``overlay`` given: deep-merged over the base after ``$ref`` resolution,
-      with the engine's merge (dicts key by key, lists of objects by
-      position, anything else replaced), as an overlay file is. Exactly as
+      with the engine's merge (dicts key by key; lists of objects by
+      position, or ``builds``/``exposes``/``consumes`` by identity from
+      fluidVersion 0.7.6; anything else replaced), as an overlay file is.
+      Exactly as
       in the engine, the overlay is **not** applied when it holds a ``$ref``
       or when the merged contract still holds one (a same-document ``#/...``
       pointer): ``fluid plan --env`` plans the base in that shape, so this
@@ -377,9 +379,14 @@ def load_contract_from_dict(
         # reach every alias of the node they change.
         contract = _unshare(contract)
     if overlay is not None:
-        contract = _replay_overlay(
-            contract, copy.deepcopy(dict(overlay)), composed=base_dir is not None, log=log
-        )
+        try:
+            contract = _replay_overlay(
+                contract, copy.deepcopy(dict(overlay)), composed=base_dir is not None, log=log
+            )
+        except loader.OverlayMergeError as exc:
+            # An overlay entry the merge cannot match: the same failure
+            # ``load_contract(path, env=...)`` reports.
+            raise ContractLoadError("contract_load_failed", f"overlay: {exc}") from exc
     # ``_contract_loader.load_contract_with_overlay``'s rewrites, in its order.
     for rewrite in _ENGINE_REWRITES:
         contract = getattr(_contract_loader, rewrite)(contract)
