@@ -11,14 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The YAML guard has new caps for every file it reads, FLUID contracts included: a file
   is refused when it nests more than 128 levels deep, or when its aliases add more than
-  100,000 nodes or 5 MiB of text, or grow it more than 100-fold past 1,000 nodes. The
-  5 MiB size cap now counts UTF-8 bytes for text as well as for bytes. ODCS and ODPS files
-  now go through the guard at all, so `fluid odps import`/`validate`, `fluid odcs
-  validate`/`import`, `fluid odps-bitol validate`, the `contractId` resolver and `fluid
-  forge --seed-from` also refuse a YAML file over 5 MiB or with more than 50 aliases, the
-  caps FLUID contracts already had. Write the repeated blocks out instead of reusing them
-  through anchors. A bundle directory without a readable ODPS doc that holds a file the
-  guard refuses, or one that does not parse, fails instead of importing as ODCS-only.
+  100,000 nodes or 5,242,880 characters of text, or grow it more than 100-fold past 1,000
+  nodes. The 5 MiB size cap now counts UTF-8 bytes for text as well as for bytes. ODCS and
+  ODPS files now go through the guard at all, so `fluid odps import`/`validate`, `fluid
+  odcs validate`/`import`, `fluid odps-bitol validate`, the `contractId` resolver and
+  `fluid forge --seed-from` also refuse a YAML file over 5 MiB or with more than 50
+  aliases, the caps FLUID contracts already had. Write the repeated blocks out instead of
+  reusing them through anchors. A bundle directory without a readable ODPS doc that holds
+  a file the guard refuses, or one that does not parse, fails instead of importing as
+  ODCS-only.
 - A file the resolver probes for a port's `contractId` must now declare that `contractId`
   as its `id`. A bundle that relied on a file named after the port's `contractId` but
   declaring another id fails a strict import, or skips the port under `--lenient` (an
@@ -53,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schedule` alone, a contract that did not parse skipped the only emitter and exited 0
   with no files; a contract that was not UTF-8 or not a mapping ended in "Unexpected
   error". Each is now a `generate_artifacts_failed` error naming the file.
-- **`fluid odcs validate --report` writes the report when the file does not parse.** The
+- **`fluid odcs validate --report` writes the report when the YAML does not parse.** The
   command printed the failure and exited 1 without the report, so a CI gate reading it
   found no file; the report now records a failed `parse` pass.
 
@@ -63,12 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nests.** It allowed 50 aliases, which is not a bound: 22 levels of `[*a, *a]` are 44
   aliases that expand to 25,165,822 nodes, and a 685-byte contract shaped like that held
   `fluid validate` for more than 90 seconds. A document is now also refused when its
-  aliases add more than 100,000 nodes or 5 MiB of text (a 1 MB string repeated through
-  two nested lists of four aliases adds 20 MB), or grow it more than 100-fold once it is
-  past 1,000 nodes, and the error names the sizes. A file nested more than 128 levels deep
-  is refused before PyYAML scans it to the end (a 64 KB file nested 32,000 deep took over
-  40 seconds) or fails with `RecursionError`, and a stream is read only up to the 5 MiB
-  cap. The ODCS and ODPS
+  aliases add more than 100,000 nodes or 5,242,880 characters of text (a
+  1,000,000-character string repeated through two nested lists of four aliases adds
+  20,000,000), or grow it more than 100-fold once it is past 1,000 nodes, and the error
+  names the sizes. A file nested more than 128 levels deep is refused before PyYAML scans
+  it to the end (a 64 KB file nested 32,000 deep took over 40 seconds) or fails with
+  `RecursionError`, and a stream is read only up to the 5 MiB cap. The ODCS and ODPS
   readers had no cap at all: `fluid odps import`, the `contractId` resolver (fetched
   contracts included), `fluid forge --seed-from`, `fluid odps-bitol validate` and `fluid
   odcs validate`/`import` read YAML with a plain `yaml.safe_load`. They now use the same
