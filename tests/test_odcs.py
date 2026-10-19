@@ -584,15 +584,22 @@ _ALIAS_BOMB = "\n".join(
 )
 
 
-def test_odcs_validate_reports_an_alias_bomb_as_a_failure(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "text, reason",
+    [(_ALIAS_BOMB, "aliases expand"), ("id: [unclosed\n", "Validation failed")],
+    ids=["alias-bomb", "malformed"],
+)
+def test_odcs_validate_reports_an_unreadable_file_as_a_failure(
+    tmp_path: Path, text: str, reason: str
+) -> None:
     import argparse
 
     contract = tmp_path / "c.yaml"
-    contract.write_text(_ALIAS_BOMB, encoding="utf-8")
+    contract.write_text(text, encoding="utf-8")
     args = argparse.Namespace(odcs_file=str(contract), report=None, roundtrip=False, vowl=False)
     with patch("fluid_build.cli.odcs.cprint") as printed:
         assert _run_odcs_validate(args) == 1
-    assert "aliases expand" in printed.call_args.args[0]
+    assert reason in printed.call_args.args[0]
 
 
 def test_odcs_import_reports_an_alias_bomb_as_a_failed_import(tmp_path: Path) -> None:

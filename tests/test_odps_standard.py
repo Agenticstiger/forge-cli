@@ -691,19 +691,31 @@ class TestOdpsBitolCli(unittest.TestCase):
         assert "ODPS-Bitol" in result.output or "odps-bitol" in result.output.lower()
 
 
-def test_odps_validate_reports_an_alias_bomb_as_a_failure(tmp_path: Path) -> None:
-    """The file is read with the anchor-expansion caps; one over them fails the
-    validation with the reason instead of ending as an unhandled exception."""
+_BOMB_PRODUCT = "\n".join(
+    ["apiVersion: v1.0.0", "kind: DataProduct", "id: dp-001", "name: P", "status: x"]
+    + ["l0: &l0 [lol]"]
+    + [f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]" for i in range(1, 19)]
+)
+
+
+@pytest.mark.parametrize(
+    "text, reason",
+    [(_BOMB_PRODUCT, "aliases expand"), ("id: [unclosed\n", "Validation failed")],
+    ids=["alias-bomb", "malformed"],
+)
+def test_odps_validate_reports_an_unreadable_file_as_a_failure(
+    tmp_path: Path, text: str, reason: str
+) -> None:
+    """The file is read with the anchor-expansion caps; one over them, or one
+    that is not YAML, fails the validation instead of an unhandled exception."""
     from fluid_build.cli.odps_standard import _run_odps_validate
 
-    lines = ["apiVersion: v1.0.0", "kind: DataProduct", "id: dp-001", "name: P", "status: x"]
-    lines += ["l0: &l0 [lol]"] + [f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]" for i in range(1, 19)]
     product = tmp_path / "product.odps.yaml"
-    product.write_text("\n".join(lines), encoding="utf-8")
+    product.write_text(text, encoding="utf-8")
 
     with patch("fluid_build.cli.odps_standard.cprint") as printed:
         assert _run_odps_validate(argparse.Namespace(odps_file=str(product))) == 1
-    assert "aliases expand" in printed.call_args.args[0]
+    assert reason in printed.call_args.args[0]
 
 
 if __name__ == "__main__":

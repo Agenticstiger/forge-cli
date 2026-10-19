@@ -319,6 +319,8 @@ def _run_odps_validate(args):
     import json
     from pathlib import Path
 
+    import yaml
+
     from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
 
     file_path = Path(args.odps_file)
@@ -326,7 +328,7 @@ def _run_odps_validate(args):
         if file_path.suffix in (".yaml", ".yml"):
             try:
                 odps_data = load_yaml_safe(f)
-            except UnsafeYamlError as exc:
+            except (UnsafeYamlError, yaml.YAMLError) as exc:
                 cprint(f"✗ Validation failed: {exc}")
                 return 1
         else:

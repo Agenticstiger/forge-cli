@@ -82,8 +82,8 @@ def _doubling_chain(levels: int) -> str:
 
 
 def test_rejects_doubling_chain_under_the_alias_cap() -> None:
-    """48 aliases pass a count cap of 50 yet expand to 2**24 nodes; a 45-alias
-    chain like this one held `fluid validate` for over 90 seconds."""
+    """48 aliases pass a count cap of 50 yet expand to 2**24 leaves (100,663,294
+    nodes); a 44-alias chain like this one held `fluid validate` for over 90 s."""
     doc = _doubling_chain(24)
     assert doc.count("*") <= MAX_YAML_ALIASES
     with pytest.raises(UnsafeYamlError, match="expand"):
@@ -114,8 +114,12 @@ def test_budget_counts_what_aliases_add_not_document_size() -> None:
 def test_ratio_cap_refuses_a_chain_under_the_node_budget() -> None:
     """13 levels add 49,120 nodes, inside the 100,000 default, but grow a 30-node
     document more than 1,600-fold, so the ratio rule refuses it on its own."""
-    with pytest.raises(UnsafeYamlError, match="expand"):
+    try:
         load_yaml_safe(_doubling_chain(13))
+    except UnsafeYamlError as refused:
+        assert "from 30 to 49150 nodes" in str(refused)
+    else:
+        pytest.fail("a 1,638-fold expansion loaded")
 
 
 @pytest.mark.parametrize("refs, refused", [(39, False), (45, True)])
@@ -206,6 +210,10 @@ def test_callers_report_a_refused_file_as_unreadable(
     contract.write_text(bomb, encoding="utf-8")
     assert artifact_fanout._contract_is_reference_only(contract) is False
     assert artifact_fanout._load_schedule_contract(contract, None, logging.getLogger()) is None
+    # Every emitter loads through _load_contract; `fluid generate artifacts`
+    # reports a FanoutError and nothing else.
+    with pytest.raises(artifact_fanout.FanoutError, match="did not parse"):
+        artifact_fanout._load_contract(contract)
 
     manifest = tmp_path / "federation" / "upstreams.yaml"
     manifest.parent.mkdir()

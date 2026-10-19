@@ -459,8 +459,13 @@ def _slug_from_contract(contract: Dict[str, Any]) -> str:
 
 
 def _load_contract(contract_path: Path) -> Dict[str, Any]:
-    with open(contract_path, "r", encoding="utf-8") as fh:
-        doc = load_yaml_safe(fh)
+    try:
+        with open(contract_path, "r", encoding="utf-8") as fh:
+            doc = load_yaml_safe(fh)
+    except (yaml.YAMLError, UnsafeYamlError) as exc:
+        # FanoutError is what `fluid generate artifacts` reports; anything else
+        # ends as an unhandled exception.
+        raise FanoutError(f"contract at {contract_path} did not parse: {exc}", key=None) from exc
     if not isinstance(doc, dict):
         raise FanoutError(
             f"contract at {contract_path} did not parse as a mapping",

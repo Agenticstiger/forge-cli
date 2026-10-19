@@ -517,6 +517,8 @@ def _run_odcs_validate(args):
     import json
     from pathlib import Path
 
+    import yaml
+
     from fluid_build.cli._common import load_yaml_json
     from fluid_build.providers.odcs.validation import (
         collect_errors,
@@ -529,7 +531,7 @@ def _run_odcs_validate(args):
     file_path = Path(args.odcs_file)
     try:
         odcs_data = load_yaml_json(file_path)
-    except UnsafeYamlError as exc:
+    except (UnsafeYamlError, yaml.YAMLError) as exc:
         cprint(f"✗ Validation failed: {exc}")
         return 1
 
