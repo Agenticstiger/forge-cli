@@ -511,7 +511,7 @@ def _determine_source_table(
 
     Priority:
     1. expose.source_table (explicit)
-    2. Last build's output table
+    2. The output table of the last build that produced one
     3. Table matching expose ID
     4. None (will fail at apply time)
     """
@@ -520,10 +520,11 @@ def _determine_source_table(
     if source:
         return source
 
-    # Use last build's output
-    if builds:
-        last_build = builds[-1]
-        output_table = last_build.get("output_table") or f"result_{last_build.get('id', '0')}"
+    # The last build that produced a table: one this planner skipped (a Flink
+    # job, a dbt model) produced none, and taking its absence for "no build
+    # output" landed the first loaded input, raw, in the expose.
+    for build in reversed(builds):
+        output_table = build.get("output_table") or f"result_{build.get('id', '0')}"
         if output_table in loaded_tables:
             return output_table
 
