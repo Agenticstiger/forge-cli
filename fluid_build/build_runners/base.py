@@ -38,6 +38,7 @@ from fluid_build._console import cprint, success
 from fluid_build._console import error as console_error
 from fluid_build._contract_loader import CLIError, load_contract_with_overlay
 from fluid_build.util.binding_paths import ENV_PLACEHOLDER_RE
+from fluid_build.util.contract import describe_externally_run_build, is_externally_run_build
 
 LOG = logging.getLogger("fluid.build_runners")
 
@@ -87,6 +88,24 @@ def is_dbt_build(build: Dict[str, Any]) -> bool:
     return engine == "dbt" or engine.startswith("dbt-")
 
 
+def _report_externally_run_build(build: Dict[str, Any], build_id: str, report: Any) -> None:
+    """Say that a build runs on its own platform; it is not run here.
+
+    A Flink job runs on the Flink Kubernetes Operator or AWS Managed Service
+    for Apache Flink. forge-cli has no runner for it, and its SQL is not
+    DuckDB's or a warehouse's. The summary counts it on its own line, apart
+    from skips; the run report, whose statuses are succeeded, failed and
+    skipped, records it as skipped with ``reason: runs_outside_forge``.
+    """
+    platform = embedded_sql_platform(build) or "its own platform"
+    cprint(
+        f"\n⏭️  Build '{build_id}' - {describe_externally_run_build(build)} runs on "
+        f"{platform}, outside forge-cli; there is nothing for forge-cli to run."
+    )
+    if report is not None:
+        report.record_build(build_id=build_id, status="skipped", reason="runs_outside_forge")
+
+
 def is_embedded_sql_build(build: Dict[str, Any]) -> bool:
     """Return True for builds with inline SQL (``engine: sql`` or
     ``pattern: embedded-logic`` + inline ``properties.sql``).
@@ -95,14 +114,19 @@ def is_embedded_sql_build(build: Dict[str, Any]) -> bool:
     by the runtime platform the build declares — the local provider's
     DuckDB engine for ``platform: local`` (or an unset platform), the
     warehouse itself for a declared warehouse (see
-    :data:`_EMBEDDED_SQL_EXECUTORS`).  They do NOT require an external
+    :func:`_execute_embedded_sql_build`).  They do NOT require an external
     Python script, so the python-runner's ``resolve_script_path`` lookup
     is the wrong dispatch — it always returns ``None`` and emits the
     confusing "Script not found: ingest.py" warning.
 
     Bug A4-A: ``--mode amend-and-build`` delegated to ``run_builds_from_args``
     which fell through to the Python-runner branch for embedded-SQL builds.
+
+    A Flink build (``engine: flink``, or ``properties.language: flink_sql``)
+    is not one: its SQL is Flink's dialect, and the job runs outside forge-cli.
     """
+    if is_externally_run_build(build):
+        return False
     engine = (build.get("engine") or "").strip().lower()
     pattern = (build.get("pattern") or "").strip().lower()
     if engine == "sql":
@@ -1171,10 +1195,18 @@ def run_builds_from_args(
     total_executed = 0
     total_failed = 0
     total_skipped = 0
+    # Builds whose engine runs on another platform: not run here, and not a
+    # skip either, which means a missing artifact (see the guard below).
+    total_external = 0
 
     for build in builds:
         build_id = build.get("id", "unknown")
         runs_before = _run_ids(contract_path.parent, product_id, build_id) if report else None
+
+        if is_externally_run_build(build):
+            _report_externally_run_build(build, build_id, report)
+            total_external += 1
+            continue
 
         if is_acquisition_build(build):
             sample_rows = getattr(args, "sample_rows", None)
@@ -1297,6 +1329,8 @@ def run_builds_from_args(
     success(f"Executed: {total_executed}")
     console_error(f"Failed: {total_failed}")
     cprint(f"⏭️  Skipped: {total_skipped}")
+    if total_external:
+        cprint(f"🛰️  Run outside forge-cli: {total_external}")
     cprint(f"{'=' * 80}\n")
 
     if total_failed:
@@ -1319,12 +1353,14 @@ def run_builds_from_args(
         if report is not None:
             report.build_failed("builds_all_skipped")
         console_error(
-            f"Every build was skipped ({total_skipped}/{len(builds)}) — nothing "
+            f"Every build was skipped ({total_skipped}/{len(builds) - total_external}) — nothing "
             "was transformed and no rows were produced. Fix the missing build "
             "artifact(s) reported above, or pass --allow-skipped-builds if the "
             "skip is expected."
         )
-        LOG.error("build.all_skipped skipped=%d total=%d", total_skipped, len(builds))
+        LOG.error(
+            "build.all_skipped skipped=%d total=%d", total_skipped, len(builds) - total_external
+        )
         return 1
 
     return 0

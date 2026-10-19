@@ -190,14 +190,19 @@ class ApplyRunReport:
         build_id: str,
         status: str,
         run: Optional[Mapping[str, Any]] = None,
+        reason: Optional[str] = None,
     ) -> None:
         """One build of a build-augmented apply: ``succeeded``, ``failed`` or ``skipped``.
 
         ``run`` is the run record the build wrote, if it wrote one; only its
         id, the table it loaded, where it landed and the rows are kept.
+        ``reason`` says why a build was not run, such as ``runs_outside_forge``
+        for a job that runs on its own platform.
         """
         try:
             entry: Dict[str, Any] = {"build_id": str(build_id), "status": str(status)}
+            if reason:
+                entry["reason"] = str(reason)
             entry.update(_build_facts(run))
             self.result.setdefault("builds", []).append(entry)
             if status == "failed":

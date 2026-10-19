@@ -127,6 +127,37 @@ def get_build_engine(build: Mapping[str, Any]) -> Optional[str]:
     return build.get("engine")
 
 
+#: Engines and code languages whose jobs run on a platform outside forge-cli,
+#: such as the Flink Kubernetes Operator or AWS Managed Service for Apache
+#: Flink. forge-cli validates and plans such a build but ships no runner for
+#: it, and never runs its ``properties.sql`` as its own SQL. ``engine: flink``
+#: is new in schema 0.7.6; ``properties.language: flink_sql`` is how 0.7.5 and
+#: older contracts declare the same job.
+EXTERNALLY_RUN_ENGINES = frozenset({"flink"})
+EXTERNALLY_RUN_LANGUAGES = frozenset({"flink_sql"})
+
+
+def is_externally_run_build(build: Mapping[str, Any]) -> bool:
+    """True when the build's job runs on a platform forge-cli does not drive:
+    its engine is ``flink``, or its ``properties.language`` is ``flink_sql``."""
+    engine = get_build_engine(build)
+    if isinstance(engine, str) and engine.strip().lower() in EXTERNALLY_RUN_ENGINES:
+        return True
+    props = build.get("properties")
+    language = props.get("language") if isinstance(props, Mapping) else None
+    return isinstance(language, str) and language.strip().lower() in EXTERNALLY_RUN_LANGUAGES
+
+
+def describe_externally_run_build(build: Mapping[str, Any]) -> str:
+    """What makes the build run elsewhere, for messages: ``engine 'flink'`` or
+    ``language 'flink_sql'``."""
+    engine = get_build_engine(build)
+    if isinstance(engine, str) and engine.strip().lower() in EXTERNALLY_RUN_ENGINES:
+        return f"engine '{engine}'"
+    props = build.get("properties")
+    return f"language '{props.get('language') if isinstance(props, Mapping) else None}'"
+
+
 def get_contract_version(contract: Mapping[str, Any]) -> Optional[str]:
     """
     Get the FLUID schema version from a contract.

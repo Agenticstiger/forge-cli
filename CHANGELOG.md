@@ -33,9 +33,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id, now fails the load (`contract_load_failed`): give each the id of the entry it
   patches. Id-less patches still apply to a base with at most one entry, as long as no
   overlay entry for it names an id. A 0.7.5 or older contract still merges by position.
+- A build with `properties.language: flink_sql` is no longer run as SQL of forge-cli's own.
+  `fluid apply --mode amend-and-build` ran its Flink SQL on DuckDB, or refused an unknown
+  embedded-SQL platform, and the local, AWS, GCP and Snowflake planners planned it as a
+  DuckDB, Athena, BigQuery or Snowflake statement. It is now treated like `engine: flink`
+  (below): reported as run outside forge-cli, planned without SQL, and left out of
+  generated schedules. Declare `engine: flink` with `fluidVersion: "0.7.6"` to name the
+  engine too.
 
 ### Added
 
+- **`engine: flink` (0.7.6 preview).** A build can declare Apache Flink as its engine,
+  usually a long-running Flink SQL job with `properties.language: flink_sql`; the contract
+  must say `fluidVersion: "0.7.6"`. forge-cli validates and plans it but ships no runner:
+  the job runs on the Flink Kubernetes Operator, AWS Managed Service for Apache Flink, or
+  whatever platform runs it. `fluid apply --mode amend-and-build` reports such a build as
+  run outside forge-cli and counts it on its own summary line, so a contract whose only
+  builds run elsewhere is not "every build was skipped"; the run report records it as
+  `skipped` with `reason: runs_outside_forge`. No provider planner turns its SQL into a
+  DuckDB, Athena, BigQuery or Snowflake action, and the local planner does not land an
+  expose it writes; when a contract mixes such a build with a local one and does not say
+  through `builds[].outputs` which writes which expose, the local planner lands neither
+  candidate and warns rather than guess. `fluid generate schedule` gives it no task or DAG
+  (a contract with no other build, and no hand-declared orchestration tasks, has nothing
+  to schedule and exits 0), and `fluid generate transformation` says there is no code to
+  generate for it. Deployment settings (parallelism, upgrade mode, Flink configuration) go
+  under `properties.parameters`. 0.7.5 is unchanged.
 - **Overlays merge `builds`, `exposes` and `consumes` by identity (schema 0.7.6 preview).**
   Lists of maps merged by position, so inserting or reordering a build in the base silently
   retargeted every overlay: with `builds: [ingest, transform]` and `overlays/prod.yaml`
@@ -59,6 +82,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A local expose lands the last build that produced a table.** The local planner took
+  the output of the contract's last build, and when that build produced none here (a dbt
+  model, a Flink job) it fell back to the first input it had loaded and landed it raw in
+  the expose, columns the expose does not declare included. It now takes the last build
+  whose output it has.
 - **`fluid forge --seed-from` catches a dropped expose.** When the model left out an
   expose the seed declares, the ground-truth guard raised `IndexError`, logged
   `structural_seed_guard_failed` and kept the generated contract, so the expose was lost

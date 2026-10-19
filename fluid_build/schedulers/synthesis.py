@@ -25,6 +25,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
+from fluid_build.util.contract import is_externally_run_build
+
 # Provider + engine → scheduler action mapping.
 # Keys are (provider, engine) tuples; values are the action string used
 # by the scheduler generators to pick the right operator.
@@ -112,7 +114,13 @@ def synthesize_orchestration_from_builds(
     The returned dict is suitable for injection into the contract before
     calling a scheduler's ``validate()`` and ``generate()`` methods.
     """
-    builds: List[Dict[str, Any]] = contract.get("builds", [])
+    # A Flink job runs continuously on its own platform: there is nothing to
+    # schedule for it, and a nightly task that "runs" it would only log its SQL.
+    builds: List[Dict[str, Any]] = [
+        b
+        for b in contract.get("builds", []) or []
+        if not (isinstance(b, dict) and is_externally_run_build(b))
+    ]
     if not builds:
         return {}
 

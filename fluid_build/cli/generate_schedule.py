@@ -50,6 +50,14 @@ from ._logging import error, info
 SUBCOMMAND = "schedule"
 
 
+def _only_externally_run_builds(contract: Dict[str, Any]) -> bool:
+    """True when the contract has builds and every one runs outside forge-cli."""
+    from fluid_build.util.contract import is_externally_run_build
+
+    builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
+    return bool(builds) and all(is_externally_run_build(b) for b in builds)
+
+
 def register_subcommand(subparsers: argparse._SubParsersAction):
     """Register the schedule subcommand under ``fluid generate``."""
     p = subparsers.add_parser(
@@ -156,6 +164,19 @@ def run(args: Any, logger: logging.Logger) -> int:
             # artifact is inert until schedule-sync pushes it to a scheduler
             # the operator names, so defaulting WHO renders it commits nothing.
             scheduler_name = fluid_apply.DEFAULT_ENGINE
+
+        # A contract whose every build runs on its own platform (a Flink job)
+        # has nothing to schedule, which is not an error: unless it hand-declares
+        # orchestration tasks, or names a scheduler that does not exist.
+        if _only_externally_run_builds(contract) and not fluid_apply.has_explicit_tasks(contract):
+            from fluid_build.schedulers import has_scheduler
+
+            if not scheduler_name or has_scheduler(scheduler_name):
+                cprint(
+                    "Every build runs outside forge-cli (a Flink job, for example), so "
+                    "there is nothing to schedule. No files written."
+                )
+                return 0
 
         if not scheduler_name:
             cprint(

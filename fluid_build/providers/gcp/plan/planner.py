@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from fluid_build.providers._planner_base import BasePlanner
 from fluid_build.providers._sql_safety import validate_ident
+from fluid_build.util.contract import is_externally_run_build
 
 from ..util.logging import format_event
 from ..util.names import normalize_bucket_name, normalize_dataset_name
@@ -429,7 +430,8 @@ def _plan_build_transformations(
     # the table's rows (destructive). Multi-output builds emit one action
     # per output.
     for build_idx, build_entry in enumerate(contract.get("builds", []) or []):
-        if not isinstance(build_entry, Mapping):
+        # Flink SQL is not BigQuery SQL: that job runs outside forge-cli.
+        if not isinstance(build_entry, Mapping) or is_externally_run_build(build_entry):
             continue
         props = build_entry.get("properties", {})
         if not isinstance(props, Mapping):
