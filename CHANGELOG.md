@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-10-19
+
 ### Upgrade notes
 
 - The YAML guard has new caps for every file it reads, FLUID contracts included: a file
@@ -5120,7 +5122,9 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.20.0...v0.21.0
+[0.20.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.18.2...v0.19.0
 [0.18.2]: https://github.com/Agenticstiger/forge-cli/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/Agenticstiger/forge-cli/compare/v0.18.0...v0.18.1
