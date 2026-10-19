@@ -33,16 +33,19 @@ from typing import Any, Dict
 import pytest
 import yaml
 
-import fluid_build.loader as loader
-from fluid_build.loader import OverlayMergeError, _deep_merge
+from fluid_build.loader import (
+    _NOTED_OVERLAY_MERGE_WARNINGS,
+    OverlayMergeError,
+    _deep_merge,
+)
 
 
 @pytest.fixture(autouse=True)
 def _fresh_warnings():
     # Each merge warning is logged once per process; every test starts afresh.
-    loader._NOTED_OVERLAY_MERGE_WARNINGS.clear()
+    _NOTED_OVERLAY_MERGE_WARNINGS.clear()
     yield
-    loader._NOTED_OVERLAY_MERGE_WARNINGS.clear()
+    _NOTED_OVERLAY_MERGE_WARNINGS.clear()
 
 
 #: The base contract's builds, with ``backfill`` inserted before the two the
@@ -66,7 +69,9 @@ def _merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _events(caplog: pytest.LogCaptureFixture) -> list:
-    return [getattr(r, "event", None) for r in caplog.records if r.name == "fluid.loader"]
+    return [
+        getattr(r, "event", None) for r in caplog.records if r.name == "fluid.loader"
+    ]
 
 
 class TestKeyedMerge:
@@ -86,9 +91,16 @@ class TestKeyedMerge:
     ) -> None:
         # A new entry, or a patch whose id has a typo: either way, say so.
         caplog.set_level(logging.WARNING, logger="fluid.loader")
-        overlay = {"builds": [{"id": "transfrom", "engine": "spark"}, PROD["builds"][0]]}
+        overlay = {
+            "builds": [{"id": "transfrom", "engine": "spark"}, PROD["builds"][0]]
+        }
         builds = _merge(_base("0.7.6"), overlay)["builds"]
-        assert [b["id"] for b in builds] == ["backfill", "ingest", "transform", "transfrom"]
+        assert [b["id"] for b in builds] == [
+            "backfill",
+            "ingest",
+            "transform",
+            "transfrom",
+        ]
         assert builds[2]["properties"] == {"executors": 8}
         assert _events(caplog) == ["overlay_entry_added"]
         assert "adds builds id transfrom" in caplog.records[0].getMessage()
@@ -96,10 +108,14 @@ class TestKeyedMerge:
 
     @pytest.mark.parametrize("version", ["0.7.10", "0.8", "1.0"])
     def test_later_versions_merge_by_identity(self, version: str) -> None:
-        assert _merge(_base(version), PROD)["builds"][2]["properties"] == {"executors": 8}
+        assert _merge(_base(version), PROD)["builds"][2]["properties"] == {
+            "executors": 8
+        }
 
     @pytest.mark.parametrize("version", ["0.7.6-rc1", "0.7.\u00b2", None])
-    def test_a_version_that_is_not_plain_numbers_merges_by_position(self, version) -> None:
+    def test_a_version_that_is_not_plain_numbers_merges_by_position(
+        self, version
+    ) -> None:
         base = _base("0.7.6")
         base["fluidVersion"] = version
         assert _merge(base, PROD)["builds"][0]["properties"] == {"executors": 8}
@@ -112,7 +128,9 @@ class TestKeyedMerge:
                 {"exposeId": "b", "binding": {"location": {"topic": "b.dev"}}},
             ],
         }
-        overlay = {"exposes": [{"exposeId": "b", "binding": {"location": {"topic": "b.prod"}}}]}
+        overlay = {
+            "exposes": [{"exposeId": "b", "binding": {"location": {"topic": "b.prod"}}}]
+        }
         exposes = _merge(base, overlay)["exposes"]
         assert exposes[0]["binding"]["location"]["topic"] == "a.dev"
         assert exposes[1]["binding"]["location"]["topic"] == "b.prod"
@@ -125,23 +143,34 @@ class TestKeyedMerge:
                 {"productId": "p", "exposeId": "y", "versionConstraint": "^1.0"},
             ],
         }
-        overlay = {"consumes": [{"productId": "p", "exposeId": "y", "versionConstraint": "^2.0"}]}
+        overlay = {
+            "consumes": [
+                {"productId": "p", "exposeId": "y", "versionConstraint": "^2.0"}
+            ]
+        }
         consumes = _merge(base, overlay)["consumes"]
         assert [c["versionConstraint"] for c in consumes] == ["^1.0", "^2.0"]
 
     def test_an_overlay_can_opt_in_by_raising_the_version(self) -> None:
         overlay = {"fluidVersion": "0.7.6", **PROD}
-        assert _merge(_base("0.7.5"), overlay)["builds"][2]["properties"] == {"executors": 8}
+        assert _merge(_base("0.7.5"), overlay)["builds"][2]["properties"] == {
+            "executors": 8
+        }
 
     def test_lists_inside_a_matched_entry_still_merge_by_position(self) -> None:
         base = {
             "fluidVersion": "0.7.6",
             "exposes": [
-                {"exposeId": "a", "contract": {"schema": [{"name": "id"}, {"name": "v"}]}},
+                {
+                    "exposeId": "a",
+                    "contract": {"schema": [{"name": "id"}, {"name": "v"}]},
+                },
                 {"exposeId": "b"},
             ],
         }
-        overlay = {"exposes": [{"exposeId": "a", "contract": {"schema": [{"type": "string"}]}}]}
+        overlay = {
+            "exposes": [{"exposeId": "a", "contract": {"schema": [{"type": "string"}]}}]
+        }
         schema = _merge(base, overlay)["exposes"][0]["contract"]["schema"]
         assert schema == [{"name": "id", "type": "string"}, {"name": "v"}]
 
@@ -158,15 +187,18 @@ class TestPositionalMerge:
         # ...and now says so.
         assert _events(caplog) == ["overlay_patch_retargeted"]
         message = caplog.records[0].getMessage()
-        assert "builds[0] names id transform but patches the base's builds[0], id backfill" in (
-            message
+        assert (
+            "builds[0] names id transform but patches the base's builds[0], id backfill"
+            in (message)
         )
 
     def test_a_patch_in_the_base_order_does_not_warn(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         caplog.set_level(logging.WARNING, logger="fluid.loader")
-        overlay = {"builds": [{"id": "backfill"}, {"id": "ingest", "engine": "debezium"}]}
+        overlay = {
+            "builds": [{"id": "backfill"}, {"id": "ingest", "engine": "debezium"}]
+        }
         builds = _merge(_base("0.7.5"), overlay)["builds"]
         assert builds[1]["engine"] == "debezium"
         assert _events(caplog) == []
@@ -175,7 +207,9 @@ class TestPositionalMerge:
         "overlay, problem",
         [
             pytest.param(
-                {"builds": [{"properties": {"executors": 8}}]}, "builds[0] names no id", id="no-id"
+                {"builds": [{"properties": {"executors": 8}}]},
+                "builds[0] names no id",
+                id="no-id",
             ),
             pytest.param(
                 {"builds": [{"id": "transform"}, {"id": "transform"}]},
@@ -195,13 +229,21 @@ class TestPositionalMerge:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         caplog.set_level(logging.WARNING, logger="fluid.loader")
-        base = {"fluidVersion": "0.7.6", "builds": [{"engine": "sql"}, {"engine": "dbt"}]}
+        base = {
+            "fluidVersion": "0.7.6",
+            "builds": [{"engine": "sql"}, {"engine": "dbt"}],
+        }
         merged = _merge(base, {"builds": [{"engine": "spark"}]})
         assert [b["engine"] for b in merged["builds"]] == ["spark", "dbt"]
         assert _events(caplog) == ["overlay_merged_by_position"]
-        assert "give every base entry of builds a unique id" in caplog.records[0].getMessage()
+        assert (
+            "give every base entry of builds a unique id"
+            in caplog.records[0].getMessage()
+        )
 
-    def test_a_single_entry_is_not_ambiguous(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_a_single_entry_is_not_ambiguous(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         caplog.set_level(logging.WARNING, logger="fluid.loader")
         base = {"fluidVersion": "0.7.6", "builds": [{"id": "only", "engine": "sql"}]}
         merged = _merge(base, {"builds": [{"engine": "dbt"}]})
@@ -227,13 +269,18 @@ class TestPositionalMerge:
         caplog.set_level(logging.WARNING, logger="fluid.loader")
         base = {
             "fluidVersion": "0.7.5",
-            "consumes": [{"productId": "a", "exposeId": "e"}, {"productId": "b", "exposeId": "e"}],
+            "consumes": [
+                {"productId": "a", "exposeId": "e"},
+                {"productId": "b", "exposeId": "e"},
+            ],
         }
         _merge(base, {"consumes": [{"productId": "b", "purpose": "x"}]})
         assert _events(caplog) == ["overlay_patch_retargeted"]
         assert "names productId b but patches" in caplog.records[0].getMessage()
 
-    def test_each_warning_is_logged_once(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_each_warning_is_logged_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         # `fluid apply` loads the contract twice.
         caplog.set_level(logging.WARNING, logger="fluid.loader")
         _merge(_base("0.7.5"), PROD)
@@ -241,7 +288,9 @@ class TestPositionalMerge:
         assert _events(caplog) == ["overlay_patch_retargeted"]
 
 
-@pytest.mark.parametrize("version, executors", [("0.7.6", [2, None, 8]), ("0.7.5", [8, None, 2])])
+@pytest.mark.parametrize(
+    "version, executors", [("0.7.6", [2, None, 8]), ("0.7.5", [8, None, 2])]
+)
 def test_load_contract_with_overlay_applies_the_rule(
     tmp_path: Path, version: str, executors: list
 ) -> None:
@@ -249,22 +298,32 @@ def test_load_contract_with_overlay_applies_the_rule(
 
     base = _base(version)
     base["builds"][0]["properties"] = {"executors": 2}
-    (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(base), encoding="utf-8")
+    (tmp_path / "contract.fluid.yaml").write_text(
+        yaml.safe_dump(base), encoding="utf-8"
+    )
     (tmp_path / "overlays").mkdir()
-    (tmp_path / "overlays" / "prod.yaml").write_text(yaml.safe_dump(PROD), encoding="utf-8")
+    (tmp_path / "overlays" / "prod.yaml").write_text(
+        yaml.safe_dump(PROD), encoding="utf-8"
+    )
     contract = load_with_overlay(tmp_path / "contract.fluid.yaml", env="prod")
-    assert [(b.get("properties") or {}).get("executors") for b in contract["builds"]] == (executors)
+    assert [
+        (b.get("properties") or {}).get("executors") for b in contract["builds"]
+    ] == (executors)
 
 
 def test_load_with_overlay_reports_an_entry_it_cannot_match(tmp_path: Path) -> None:
     from fluid_build.loader import load_with_overlay
 
-    (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(_base("0.7.6")), encoding="utf-8")
+    (tmp_path / "contract.fluid.yaml").write_text(
+        yaml.safe_dump(_base("0.7.6")), encoding="utf-8"
+    )
     (tmp_path / "overlays").mkdir()
     (tmp_path / "overlays" / "prod.yaml").write_text(
         yaml.safe_dump({"builds": [{"properties": {"executors": 8}}]}), encoding="utf-8"
     )
-    with pytest.raises(RuntimeError, match=r"prod\.yaml: the overlay's builds\[0\] names no id"):
+    with pytest.raises(
+        RuntimeError, match=r"prod\.yaml: the overlay's builds\[0\] names no id"
+    ):
         load_with_overlay(tmp_path / "contract.fluid.yaml", env="prod")
 
 
@@ -280,13 +339,19 @@ def test_the_contract_api_reports_an_unmatched_entry_as_a_load_error() -> None:
 def test_bundle_names_the_overlay_it_cannot_apply(tmp_path: Path) -> None:
     from fluid_build.cli.bundle import materialize_contract
 
-    (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(_base("0.7.6")), encoding="utf-8")
+    (tmp_path / "contract.fluid.yaml").write_text(
+        yaml.safe_dump(_base("0.7.6")), encoding="utf-8"
+    )
     (tmp_path / "overlays").mkdir()
     (tmp_path / "overlays" / "prod.yaml").write_text(
         yaml.safe_dump({"builds": [{"engine": "dbt"}]}), encoding="utf-8"
     )
-    with pytest.raises(OverlayMergeError, match=r"overlays/prod\.yaml: the overlay's builds\[0\]"):
-        materialize_contract(tmp_path / "contract.fluid.yaml", "prod", logging.getLogger("t"))
+    with pytest.raises(
+        OverlayMergeError, match=r"overlays/prod\.yaml: the overlay's builds\[0\]"
+    ):
+        materialize_contract(
+            tmp_path / "contract.fluid.yaml", "prod", logging.getLogger("t")
+        )
 
 
 def test_a_warning_names_its_contract_and_each_contract_gets_its_own(
@@ -303,7 +368,9 @@ def test_a_warning_names_its_contract_and_each_contract_gets_its_own(
     assert "in p2, the overlay's builds[0]" in messages[1]
 
 
-def test_an_added_entry_names_its_contract_too(caplog: pytest.LogCaptureFixture) -> None:
+def test_an_added_entry_names_its_contract_too(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     caplog.set_level(logging.WARNING, logger="fluid.loader")
     for product in ("p1", "p2"):
         base = _base("0.7.6")
