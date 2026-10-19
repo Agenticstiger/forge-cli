@@ -116,6 +116,62 @@ class TestErrors:
         with pytest.raises(RemoteFetchDisabled):
             resolver.resolve("anything", hint="https://example.com/c.yaml")
 
+    @pytest.mark.parametrize(
+        "contract_id, reason",
+        [
+            ("orders\x00x", "not a valid contractId"),
+            (123, "not a valid contractId"),
+            (["orders"], "not a valid contractId"),
+            ("", "not a valid contractId"),
+            ("http://[::1", "Tried"),  # not a URL urlparse accepts: probed as a plain id
+            # A file name past the OS limit: exists() raised OSError.
+            pytest.param("a" * 300, "Tried", id="name-too-long"),
+        ],
+    )
+    def test_malformed_contract_id_is_not_found(
+        self, tmp_path: Path, contract_id: object, reason: str
+    ) -> None:
+        # contractId is document text. A value the resolver cannot look up is
+        # a contract it did not find, which lenient imports skip; it used to
+        # raise ValueError/TypeError and abort the whole import.
+        with pytest.raises(ContractNotFound, match=reason):
+            ContractResolver(base_path=tmp_path).resolve(contract_id)  # type: ignore[arg-type]
+
+
+def _odcs_yaml(contract_id: str) -> str:
+    return (
+        "apiVersion: v3.1.0\nkind: DataContract\n"
+        f"id: {contract_id}\nversion: 1.0.0\nstatus: active\n"
+    )
+
+
+class TestProbedIdMustMatch:
+    def test_probed_file_declaring_another_id_is_skipped(self, tmp_path: Path) -> None:
+        # The last-segment probe tries orders.odcs.yaml for "commerce.orders".
+        # A file there that declares a different contract must not be linked.
+        (tmp_path / "orders.odcs.yaml").write_text(_odcs_yaml("billing.orders"), encoding="utf-8")
+        resolver = ContractResolver(base_path=tmp_path, allow_remote=False)
+        with patch("fluid_build.providers.odps_standard.resolver.LOG") as log:
+            with pytest.raises(ContractNotFound):
+                resolver.resolve("commerce.orders")
+        warned = " ".join(str(a) for c in log.warning.call_args_list for a in c.args)
+        assert "billing.orders" in warned and "commerce.orders" in warned
+
+    def test_probed_file_declaring_the_same_id_resolves(self, tmp_path: Path) -> None:
+        (tmp_path / "orders.odcs.yaml").write_text(_odcs_yaml("commerce.orders"), encoding="utf-8")
+        resolver = ContractResolver(base_path=tmp_path, allow_remote=False)
+        assert resolver.resolve("commerce.orders").odcs["id"] == "commerce.orders"
+
+    def test_skipped_mismatch_does_not_hide_a_later_match(self, tmp_path: Path) -> None:
+        (tmp_path / "orders.odcs.yaml").write_text(_odcs_yaml("billing.orders"), encoding="utf-8")
+        (tmp_path / "contracts").mkdir()
+        (tmp_path / "contracts" / "orders.odcs.yaml").write_text(
+            _odcs_yaml("commerce.orders"), encoding="utf-8"
+        )
+        resolver = ContractResolver(base_path=tmp_path, allow_remote=False)
+        result = resolver.resolve("commerce.orders")
+        assert Path(result.origin).parent.name == "contracts"
+
 
 # ---------------------------------------------------------------------------
 # URL detection
@@ -133,6 +189,7 @@ class TestLooksLikeUrl:
             ("just-an-id", False),
             ("product.something", False),
             ("https://", False),  # no netloc
+            ("http://[::1", False),  # urlparse raises on the unclosed IPv6 bracket
         ],
     )
     def test_detection(self, value: str, expected: bool) -> None:
@@ -142,6 +199,20 @@ class TestLooksLikeUrl:
 # ---------------------------------------------------------------------------
 # Remote fetch — mocked _fetch_bytes (the httpx-based safe helper)
 # ---------------------------------------------------------------------------
+
+
+def test_fetched_alias_bomb_is_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fetched body is parsed with the anchor-expansion caps any untrusted
+    YAML gets, not a plain yaml.safe_load."""
+    from fluid_build.providers.odps_standard import resolver as resolver_mod
+
+    lines = ["apiVersion: v3.1.0", "kind: DataContract", "l0: &l0 [lol]"]
+    lines += [f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}]" for i in range(1, 19)]
+    body = "\n".join(lines).encode()
+    monkeypatch.setattr(resolver_mod, "_assert_safe_url", lambda url: None)
+    monkeypatch.setattr(resolver_mod, "_fetch_bytes", lambda *a, **k: (200, {}, body))
+    with pytest.raises(ContractNotFound, match="aliases expand"):
+        ContractResolver(allow_remote=True).resolve("https://example.com/c.odcs.yaml")
 
 
 class TestRemoteResolution:

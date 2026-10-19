@@ -17,7 +17,8 @@
 Resolution order (per the Phase 3 plan):
 
   1. **local file** — probe candidate filenames in ``base_path`` and a few
-     conventional subdirs.
+     conventional subdirs. A probed file is used only when it declares the
+     ``contractId`` as its ``id``; one that declares another is skipped.
   2. **http(s) URL** — only when the ``contractId`` is itself a URL (or a
      ``hint`` URL is given) and ``allow_remote=True``.
 
@@ -56,6 +57,7 @@ from fluid_build.util.safe_http import (
 from fluid_build.util.safe_http import (
     fetch_bytes as _fetch_bytes,
 )
+from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
 
 LOG = logging.getLogger(__name__)
 # Probing matrix sized for the common case (Bitol fragments layout: ODPS doc
@@ -75,10 +77,12 @@ class ContractNotFound(ProviderError):
 
     _MAX_TRIED_DISPLAYED = 5
 
-    def __init__(self, contract_id: str, tried: List[str]):
+    def __init__(self, contract_id: str, tried: List[str], *, reason: Optional[str] = None):
         self.contract_id = contract_id
         self.tried = list(tried)
-        if tried:
+        if reason:
+            msg = f"Could not resolve contractId {contract_id!r}: {reason}"
+        elif tried:
             head = tried[: self._MAX_TRIED_DISPLAYED]
             tail = (
                 f"\n  …and {len(tried) - self._MAX_TRIED_DISPLAYED} more"
@@ -177,6 +181,10 @@ class ContractResolver:
     def resolve(
         self, contract_id: str, *, hint: Optional[Union[str, Path]] = None
     ) -> ResolvedContract:
+        # Report an id that names no file and no URL as not found, so lenient
+        # imports skip the port; the path probes used to raise on it instead.
+        if not _is_valid_contract_id(contract_id):
+            raise ContractNotFound(contract_id, [], reason=_INVALID_CONTRACT_ID)
         if contract_id in self._cache:
             return self._cache[contract_id]
 
@@ -197,13 +205,9 @@ class ContractResolver:
                 return self._cache_and_return(contract_id, resolved)
 
         # 2. Local file probes
-        if self.base_path is not None:
-            for candidate in self._local_candidates(contract_id):
-                tried.append(str(candidate))
-                if candidate.exists():
-                    resolved = self._load_local(contract_id, candidate)
-                    if resolved is not None:
-                        return self._cache_and_return(contract_id, resolved)
+        resolved = self._probe_local(contract_id, tried)
+        if resolved is not None:
+            return self._cache_and_return(contract_id, resolved)
 
         # 3. http(s) if the contractId itself is a URL
         if _looks_like_url(contract_id):
@@ -227,6 +231,20 @@ class ContractResolver:
 
     # ---- internals ------------------------------------------------------
 
+    def _probe_local(self, contract_id: str, tried: List[str]) -> Optional[ResolvedContract]:
+        """The first probed file under ``base_path`` that declares ``contract_id``."""
+        for candidate in self._local_candidates(contract_id):
+            tried.append(str(candidate))
+            try:
+                present = candidate.exists()
+            except OSError:  # ENAMETOOLONG: a path segment past the OS limit
+                continue
+            if present:
+                resolved = self._load_local(contract_id, candidate, require_id=True)
+                if resolved is not None:
+                    return resolved
+        return None
+
     def _local_candidates(self, contract_id: str) -> List[Path]:
         if self.base_path is None:
             return []
@@ -247,7 +265,7 @@ class ContractResolver:
                     candidate = sub_dir / f"{stem}{ext}"
                     try:
                         resolved = candidate.resolve()
-                    except (OSError, RuntimeError):
+                    except (OSError, ValueError, RuntimeError):  # NUL byte, symlink loop
                         continue
                     if not _is_within(resolved, base_resolved):
                         continue
@@ -296,13 +314,26 @@ class ContractResolver:
             return
         self._index.setdefault(odcs_id, path)
 
-    def _load_local(self, contract_id: str, path: Path) -> Optional[ResolvedContract]:
+    def _load_local(
+        self, contract_id: str, path: Path, *, require_id: bool = False
+    ) -> Optional[ResolvedContract]:
         try:
             data = read_input(path)
         except Exception as exc:
             LOG.warning("Failed to read %s: %s", path, exc)
             return None
         if not isinstance(data, Mapping):
+            return None
+        # A probe only guesses the file from the contractId: the last-segment
+        # probe tries orders.odcs.yaml for "commerce.orders". The file is that
+        # contract only if it declares that id, as ODPS ports reference ODCS ids.
+        if require_id and data.get("id") != contract_id:
+            LOG.warning(
+                "Skipping %r: it declares id %r, not contractId %r",
+                str(path),  # %r: the bundle names its files, control characters included
+                data.get("id"),
+                contract_id,
+            )
             return None
         self._validate(contract_id, data, origin=str(path))
         return ResolvedContract(
@@ -343,7 +374,10 @@ class ContractResolver:
             try:
                 data = json.loads(text)
             except json.JSONDecodeError:
-                data = yaml.safe_load(text)
+                data = load_yaml_safe(text)
+        except UnsafeYamlError as exc:
+            # Its message carries only sizes and counts, never body text.
+            raise ContractNotFound(contract_id, [url], reason=str(exc)) from None
         except (UnicodeDecodeError, yaml.YAMLError):
             # Don't propagate parser exception text — it can include body fragments
             raise ContractNotFound(contract_id, [url]) from None
@@ -383,8 +417,23 @@ class ContractResolver:
         return resolved
 
 
+_INVALID_CONTRACT_ID = "not a valid contractId (expected a non-empty string with no NUL bytes)"
+
+
+def _is_valid_contract_id(value: object) -> bool:
+    """True for a contractId the probes can use: a non-empty string without NUL.
+
+    contractId is document text, so anything else (a number, a list, a NUL
+    byte that ``Path.resolve`` rejects) names no file and no URL.
+    """
+    return isinstance(value, str) and bool(value) and "\x00" not in value
+
+
 def _looks_like_url(value: str) -> bool:
-    parsed = urlparse(value)
+    try:
+        parsed = urlparse(value)
+    except ValueError:  # e.g. "http://[::1": urlparse rejects the unclosed IPv6 bracket
+        return False
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 

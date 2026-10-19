@@ -204,13 +204,22 @@ def _ground_truth_paths_for(fluid: Mapping[str, Any]) -> List[str]:
 
 
 def resolve_at_path(fluid: Mapping[str, Any], path: str) -> Any:
-    """Look up the value at a dotted/indexed path like ``exposes[0].contract.schema``."""
+    """Look up the value at a dotted/indexed path like ``exposes[0].contract.schema``.
+
+    Returns ``None`` for anything missing, including an index past the end of
+    a list or into a non-list. The candidate is LLM output of any shape, and a
+    lookup that raised made :func:`diff_against_seed` raise, which the runtime
+    logs as ``structural_seed_guard_failed`` and then keeps the contract.
+    """
     import re
 
     cursor: Any = fluid
     for token in re.findall(r"[^.\[\]]+|\[\d+\]", path):
         if token.startswith("[") and token.endswith("]"):
-            cursor = cursor[int(token[1:-1])]
+            index = int(token[1:-1])
+            if not isinstance(cursor, (list, tuple)) or index >= len(cursor):
+                return None
+            cursor = cursor[index]
         else:
             if isinstance(cursor, Mapping):
                 cursor = cursor.get(token)

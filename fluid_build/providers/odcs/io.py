@@ -44,10 +44,12 @@ LOG = logging.getLogger(__name__)
 def read_input(path: Union[str, Path]) -> Dict[str, Any]:
     """Load an ODCS YAML/JSON file.
 
-    Routes ODCS-shaped files through ``OpenDataContractStandard.from_file()``
-    so Pydantic catches structural issues at the boundary. Falls back to
-    plain ``yaml.safe_load`` / ``json.load`` when the file doesn't have
-    the ``apiVersion`` + ``kind`` markers (e.g. partial fixtures).
+    YAML is read with :func:`fluid_build.util.safe_yaml.load_yaml_safe`, so a
+    file over its size, alias-count or alias-expansion caps raises
+    ``UnsafeYamlError`` (a ``ValueError``). ODCS-shaped files are then routed
+    through ``OpenDataContractStandard.from_file()`` so Pydantic catches
+    structural issues at the boundary; the raw load is returned when the file
+    doesn't have the ``apiVersion`` + ``kind`` markers (e.g. partial fixtures).
     """
     input_path = Path(path)
     raw = _raw_load(input_path)
@@ -114,10 +116,12 @@ def write_output(data: Dict[str, Any], path: Union[Path, str], fmt: str) -> None
 
 def _raw_load(path: Path) -> Any:
     with open(path, encoding="utf-8") as f:
-        if path.suffix in (".yaml", ".yml"):
-            import yaml
+        if path.suffix.lower() in (".yaml", ".yml"):
+            # ODCS / ODPS files come from other teams and catalogs, so they
+            # get the anchor-expansion caps any untrusted YAML gets.
+            from fluid_build.util.safe_yaml import load_yaml_safe
 
-            return yaml.safe_load(f)
+            return load_yaml_safe(f)
         return json.load(f)
 
 

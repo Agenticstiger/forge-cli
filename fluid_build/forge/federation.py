@@ -634,7 +634,7 @@ def load_federation_manifest(workspace_root: Path) -> FederationManifest:
     try:
         with path.open(encoding="utf-8") as f:
             doc = load_yaml_safe(f) or {}
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, yaml.YAMLError, UnsafeYamlError) as exc:
         LOG.warning("federation_manifest_unreadable: path=%s error=%s", path, exc)
         return FederationManifest()
     rows = doc.get("workspaces", [])

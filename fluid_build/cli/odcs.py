@@ -433,9 +433,17 @@ def _run_odcs_import(args):
     import json
     from pathlib import Path
 
+    import yaml
+
+    from fluid_build.util.safe_yaml import UnsafeYamlError
+
     # Import ODCS
     provider = OdcsProvider()
-    fluid_contract = provider.import_contract(args.odcs_file)
+    try:
+        fluid_contract = provider.import_contract(args.odcs_file)
+    except (UnsafeYamlError, yaml.YAMLError) as exc:
+        console_error(f"Error importing: {exc}")
+        return 1
 
     # Generate output path if not specified
     if not args.output:
@@ -506,8 +514,9 @@ def _run_odcs_validate(args):
     Exit code is 1 iff any pass surfaces a violation. With ``--report PATH``
     every result is also serialised to a JSON file for CI gates.
     """
-    import json
     from pathlib import Path
+
+    import yaml
 
     from fluid_build.cli._common import load_yaml_json
     from fluid_build.providers.odcs.validation import (
@@ -516,15 +525,22 @@ def _run_odcs_validate(args):
         roundtrip_check,
         validate_via_vowl,
     )
+    from fluid_build.util.safe_yaml import UnsafeYamlError
 
     file_path = Path(args.odcs_file)
-    odcs_data = load_yaml_json(file_path)
-
     report: dict = {
         "file": str(file_path),
         "passes": {},
         "ok": True,
     }
+    try:
+        odcs_data = load_yaml_json(file_path)
+    except (UnsafeYamlError, yaml.YAMLError) as exc:
+        cprint(f"✗ Validation failed: {exc}")
+        report["passes"]["parse"] = {"ok": False, "error": str(exc)[:300]}
+        report["ok"] = False
+        _write_validate_report(args, report)
+        return 1
 
     # Pass 1 — jsonschema (multi-error)
     schema = load_schema()
@@ -590,14 +606,17 @@ def _run_odcs_validate(args):
                     f"extra={len(rt['extra'])} changed={len(rt['changed'])}"
                 )
 
-    # Optional structured report (CI gate)
+    _write_validate_report(args, report)
+    return 0 if report["ok"] else 1
+
+
+def _write_validate_report(args, report: dict) -> None:
+    """Write the optional structured report (CI gate) for ``--report``."""
     if getattr(args, "report", None):
         report_path = Path(args.report)
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         cprint(f"📄 Report: {report_path}")
-
-    return 0 if report["ok"] else 1
 
 
 def _run_odcs_info(args):

@@ -151,6 +151,72 @@ class TestGroundTruthGuard:
         mismatches = diff_against_seed(seed, mutated)
         assert mismatches == []
 
+    def test_dropped_expose_is_a_mismatch_not_a_crash(self) -> None:
+        # A candidate that drops a seeded expose must trip the guard. The
+        # lookup used to raise IndexError here; the runtime caught it as
+        # ``structural_seed_guard_failed`` and kept the mutated contract.
+        seed = load_seed(BUNDLE_DIR)
+        assert len(seed.fluid["exposes"]) >= 2
+        mutated = copy.deepcopy(seed.fluid)
+        mutated["exposes"].pop()
+        last = len(mutated["exposes"])
+        mismatches = diff_against_seed(seed, mutated)
+        dropped = [m for m in mismatches if m["path"].startswith(f"exposes[{last}].")]
+        assert dropped
+        assert all(m["candidate"] is None for m in dropped)
+
+
+class TestRuntimeGuard:
+    def test_runtime_sends_a_dropped_expose_back_to_the_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # End to end through generate_copilot_artifacts with a scripted model:
+        # attempt 1 drops a seeded expose, attempt 2 returns the seed. Schema
+        # validation is stubbed (a seed is a skeleton the model completes) so
+        # the guard is what decides attempt 1. Streaming and the judge pass
+        # bypass call_llm and reach the network, so both are off.
+        monkeypatch.setenv("FLUID_LLM_STREAMING", "0")
+        monkeypatch.setenv("FLUID_COPILOT_JUDGE", "0")
+        import json
+        import logging
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from fluid_build.cli import forge_copilot_runtime as rt
+
+        seed = load_seed(BUNDLE_DIR)
+        dropped = copy.deepcopy(seed.fluid)
+        dropped["exposes"].pop()
+        reply = {"recommended_template": "starter", "recommended_provider": "local"}
+        replies = [
+            json.dumps({**reply, "readme_markdown": "# p\n", "contract": contract})
+            for contract in [dropped] + [seed.fluid] * 4
+        ]
+        valid = SimpleNamespace(is_valid=True, errors=[], warnings=[])
+        with (
+            patch.object(rt, "call_llm", side_effect=replies),
+            patch.object(rt, "validate_generated_result", return_value=([], [])),
+            patch(
+                "fluid_build.schema_manager.FluidSchemaManager.validate_contract",
+                return_value=valid,
+            ),
+        ):
+            result = rt.generate_copilot_artifacts(
+                {"project_goal": "orders", "structural_seed": seed},
+                llm_config=rt.LlmConfig(
+                    provider="openai",
+                    model="m",
+                    endpoint="https://api.openai.com/v1/chat/completions",
+                    api_key="k",
+                ),
+                discovery_report=rt.DiscoveryReport(workspace_roots=[str(BUNDLE_DIR)]),
+                capability_matrix={"providers": ["local"], "templates": {"starter": {}}},
+                logger=logging.getLogger(__name__),
+            )
+        first = result.attempt_reports[0].validation_errors
+        assert any(e.startswith("Seed ground-truth violation at exposes[1].") for e in first)
+        assert len(result.contract["exposes"]) == len(seed.fluid["exposes"])
+
 
 # ---------------------------------------------------------------------------
 # Path resolver helper
@@ -164,3 +230,12 @@ class TestResolveAtPath:
 
     def test_returns_none_for_missing_path(self) -> None:
         assert resolve_at_path({}, "exposes[0].id") is None
+
+    def test_returns_none_for_index_past_the_end(self) -> None:
+        assert resolve_at_path({"exposes": [{"id": "a"}]}, "exposes[1].id") is None
+
+    @pytest.mark.parametrize("container", [{"0": {"id": "a"}}, {0: {"id": "a"}}, "ab", 7])
+    def test_returns_none_for_index_into_a_non_list(self, container: object) -> None:
+        # An LLM can return any shape; indexing a dict, string or number is a
+        # missing value, not a lookup to attempt.
+        assert resolve_at_path({"exposes": container}, "exposes[0]") is None

@@ -86,7 +86,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import yaml
 
 from fluid_build.forge.core.bundle import _slug, build_manifest, validate_manifest
-from fluid_build.util.safe_yaml import load_yaml_safe
+from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
 
 LOG = logging.getLogger("fluid.forge.core.artifact_fanout")
 
@@ -258,7 +258,9 @@ def _contract_is_reference_only(contract_path: Path) -> bool:
     try:
         with open(contract_path, "r", encoding="utf-8") as fh:
             contract = load_yaml_safe(fh) or {}
-    except (OSError, yaml.YAMLError):
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, UnsafeYamlError):
+        return False
+    if not isinstance(contract, dict):
         return False
     builds = contract.get("builds")
     if not isinstance(builds, list):
@@ -277,8 +279,8 @@ def _load_schedule_contract(
     Loaded through the same loader (overlay, ``$ref`` resolution and alias
     normalisation included) so the gate below and the renderer agree on
     which builds carry a trigger. ``None`` only when the contract file itself
-    cannot be read, which skips ``schedule`` exactly as it always has (the
-    other emitters then report the unreadable file). A contract that reads
+    cannot be read; ``run_fanout`` then reports the unreadable file, as every
+    other emitter does. A contract that reads
     but will not load, a malformed overlay above all, raises: skipping would
     drop the schedule while stage 3 reported success, and ``fluid apply
     --env`` fails on the same overlay.
@@ -288,7 +290,7 @@ def _load_schedule_contract(
     try:
         with open(contract_path, "r", encoding="utf-8") as fh:
             load_yaml_safe(fh)
-    except (OSError, yaml.YAMLError):
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, UnsafeYamlError):
         return None
     try:
         contract = load_contract_with_overlay(str(contract_path), overlay_env, logger)
@@ -459,8 +461,17 @@ def _slug_from_contract(contract: Dict[str, Any]) -> str:
 
 
 def _load_contract(contract_path: Path) -> Dict[str, Any]:
-    with open(contract_path, "r", encoding="utf-8") as fh:
-        doc = load_yaml_safe(fh)
+    try:
+        with open(contract_path, "r", encoding="utf-8") as fh:
+            doc = load_yaml_safe(fh)
+    except OSError as exc:
+        # FanoutError is what `fluid generate artifacts` reports; anything else
+        # ends as an unhandled exception.
+        raise FanoutError(
+            f"contract at {contract_path} could not be read: {exc}", key=None
+        ) from exc
+    except (UnicodeDecodeError, yaml.YAMLError, UnsafeYamlError) as exc:
+        raise FanoutError(f"contract at {contract_path} did not parse: {exc}", key=None) from exc
     if not isinstance(doc, dict):
         raise FanoutError(
             f"contract at {contract_path} did not parse as a mapping",
@@ -888,6 +899,10 @@ def run_fanout(
         if "schedule" in emits:
             schedule_contract = _load_schedule_contract(resolved_contract, overlay_env, logger)
             schedule_skip = _schedule_skip_reason(schedule_contract)
+            if schedule_skip == "generate_artifacts_skip_schedule_unreadable":
+                # Raises the FanoutError every other emitter would; with
+                # `--emit schedule` alone, skipping would report success.
+                _load_contract(resolved_contract)
         if "schedule" in emits and schedule_skip is not None:
             logger.info(schedule_skip, extra={"hint": _SCHEDULE_SKIP_HINTS[schedule_skip]})
             emits = [k for k in emits if k != "schedule"]

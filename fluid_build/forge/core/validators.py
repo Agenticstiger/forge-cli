@@ -51,7 +51,7 @@ from fluid_build.util.ref_confinement import (
     confine_ref,
     iter_external_refs,
 )
-from fluid_build.util.safe_yaml import load_yaml_safe
+from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
 
 LOG = logging.getLogger("fluid.forge.core.validators")
 
@@ -307,7 +307,7 @@ def validate_openapi(
             spec = json.loads(content.decode("utf-8"))
         else:
             spec = load_yaml_safe(content)
-    except (yaml.YAMLError, json.JSONDecodeError) as exc:
+    except (yaml.YAMLError, UnsafeYamlError, json.JSONDecodeError) as exc:
         return [
             ValidationIssue(
                 file=path,

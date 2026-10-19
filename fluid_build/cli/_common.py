@@ -97,14 +97,18 @@ def load_yaml_json(path: Path) -> Any:
     ``if .yaml then yaml.safe_load else json.load`` pattern that was
     previously duplicated across ``cli/opds.py``, ``cli/odcs.py``, and
     ``forge/core/artifact_fanout.py``.
+
+    YAML goes through :func:`fluid_build.util.safe_yaml.load_yaml_safe`: the
+    files it reads (ODCS contracts for ``fluid odcs``) come from other teams,
+    so one over its caps raises ``UnsafeYamlError``.
     """
     import json as _json
 
-    with open(path, encoding="utf-8") as f:
-        if path.suffix in (".yaml", ".yml"):
-            import yaml as _yaml
+    from fluid_build.util.safe_yaml import load_yaml_safe
 
-            return _yaml.safe_load(f)
+    with open(path, encoding="utf-8") as f:
+        if path.suffix.lower() in (".yaml", ".yml"):
+            return load_yaml_safe(f)
         return _json.load(f)
 
 
