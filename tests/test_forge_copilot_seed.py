@@ -167,11 +167,16 @@ class TestGroundTruthGuard:
 
 
 class TestRuntimeGuard:
-    def test_runtime_sends_a_dropped_expose_back_to_the_model(self) -> None:
+    def test_runtime_sends_a_dropped_expose_back_to_the_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # End to end through generate_copilot_artifacts with a scripted model:
         # attempt 1 drops a seeded expose, attempt 2 returns the seed. Schema
         # validation is stubbed (a seed is a skeleton the model completes) so
-        # the guard is what decides attempt 1.
+        # the guard is what decides attempt 1. Streaming and the judge pass
+        # bypass call_llm and reach the network, so both are off.
+        monkeypatch.setenv("FLUID_LLM_STREAMING", "0")
+        monkeypatch.setenv("FLUID_COPILOT_JUDGE", "0")
         import json
         import logging
         from types import SimpleNamespace
