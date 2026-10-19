@@ -76,6 +76,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard and report a refused file as a failed validation or import, and the OpenAPI
   validator, the artifact fan-out and the federation manifest reader report it as the
   unreadable file it is instead of failing with `UnsafeYamlError`.
+- **A committed `.env` can no longer point `REKA_API_BASE` at the FLUID LLM key.**
+  litellm 1.106.0 added Reka to its registry of OpenAI-compatible providers, read
+  from `REKA_API_BASE`, and the vendored list of litellm endpoints did not have it.
+  With `FLUID_LLM_API_KEY` (or the keyring key) in use, a project's `REKA_API_BASE`
+  is now ignored, as every other litellm provider endpoint is.
 
 ## [0.20.0] — 2026-10-15
 

@@ -24,9 +24,9 @@ Copilot ones) is protected outright. Any other ``<NAME>_API_BASE`` is the
 project's own setting and follows the name-shape rule.
 
 Vendored because importing litellm takes seconds and dotenv hydration runs on
-every command. Generated from the litellm 1.83.14, 1.97.0 and 1.105.0 wheels
-(FLUID's floor, the last release Python 3.10 can import, and the newest), as
-the union of:
+every command. Generated from the litellm 1.83.14, 1.97.0, 1.105.0 and
+1.106.0 wheels (FLUID's floor, the last release Python 3.10 can import, and the
+two newest), as the union of:
 
 * ``<PROVIDER>_API_BASE`` for every ``litellm.provider_list`` entry (``-``
   read as ``_``);
@@ -218,6 +218,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "RAGFLOW_API_BASE",
         "RECRAFT_API_BASE",
         "REDUCTO_API_BASE",
+        "REKA_API_BASE",
         "REPLICATE_API_BASE",
         "RUNWAYML_API_BASE",
         "S3_VECTORS_API_BASE",
