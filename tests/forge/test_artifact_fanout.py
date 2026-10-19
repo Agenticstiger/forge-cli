@@ -222,6 +222,10 @@ class TestContractInspectionHelpers:
         with pytest.raises(FanoutError, match="did not parse"):
             _load_contract(c)
 
+    def test_load_contract_reports_a_path_it_cannot_open(self, tmp_path):
+        with pytest.raises(FanoutError, match="could not be read"):
+            _load_contract(tmp_path)
+
     def test_orchestration_engine_detected(self):
         assert _schedule_skip_reason({"orchestration": {"engine": "airflow"}}) is None
 
@@ -322,15 +326,19 @@ class TestRunFanout:
                 logger=logger,
             )
 
-    def test_schedule_alone_reports_a_contract_that_does_not_parse(self, tmp_path, logger):
+    @pytest.mark.parametrize(
+        "content", [b"not: valid: yaml: [\n", b"id: \xff\xfe\n"], ids=["malformed", "latin-1"]
+    )
+    @pytest.mark.parametrize("emit", ["schedule", None], ids=["schedule-alone", "default"])
+    def test_run_fanout_reports_a_contract_that_does_not_parse(
+        self, tmp_path, logger, content, emit
+    ):
         # Schedule skipped an unreadable contract for the other emitters to
         # report; with `--emit schedule` alone, stage 3 exited 0 on nothing.
         contract = tmp_path / "contract.fluid.yaml"
-        contract.write_text("not: valid: yaml: [\n", encoding="utf-8")
+        contract.write_bytes(content)
         with pytest.raises(FanoutError, match="did not parse"):
-            run_fanout(
-                contract, tmp_path / "art", emit_raw="schedule", manifest_path=None, logger=logger
-            )
+            run_fanout(contract, tmp_path / "art", emit_raw=emit, manifest_path=None, logger=logger)
 
     def test_missing_bundle_errors(self, tmp_path, logger):
         with pytest.raises(FanoutError, match="input not found"):
