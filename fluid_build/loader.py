@@ -164,19 +164,46 @@ def parse_contract_text(text: str, *, suffix: str = ".yaml") -> Dict[str, Any]:
         raise RuntimeError(f"Failed to parse contract text: {e}") from e
 
 
-def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+#: Top-level contract lists whose items an overlay patches by identity rather
+#: than by position, from fluidVersion 0.7.6 on. Kubernetes server-side apply
+#: merges a list the same way (``x-kubernetes-list-map-keys``, compound keys
+#: such as ``containerPort`` + ``protocol``), as does jsonmerge's
+#: ``arrayMergeById``: an entry matches on every key field, and an overlay entry
+#: that matches none is appended.
+_OVERLAY_IDENTITY_KEYS: Dict[str, Tuple[str, ...]] = {
+    "builds": ("id",),
+    "exposes": ("exposeId",),
+    "consumes": ("productId", "exposeId"),
+}
+_KEYED_OVERLAY_MERGE_SINCE = (0, 7, 6)
+
+
+class OverlayMergeError(ValueError):
+    """An overlay entry cannot be matched to the base entry it patches."""
+
+
+def _deep_merge(
+    base: Dict[str, Any], overlay: Dict[str, Any], *, _root: bool = True
+) -> Dict[str, Any]:
     """
     Recursively merge overlay into base.
 
     - Dicts (both sides): merged key-by-key recursively.
-    - List of dicts (both sides): merged positionally so overlay entries act as
-      partial patches — each overlay item is deep-merged into the corresponding
-      base item by index.  Extra overlay items beyond the base length are appended.
+    - List of dicts (both sides): each overlay entry is a partial patch,
+      deep-merged into a base entry. ``builds``, ``exposes`` and ``consumes``
+      at the top of a contract whose fluidVersion is 0.7.6 or later are matched
+      by identity (``builds[].id``, ``exposes[].exposeId``, ``consumes[]`` by
+      ``productId`` + ``exposeId``) when the base entries carry unique ones; an
+      overlay entry that matches nothing is appended. Any other list of dicts
+      is merged by position, and extra overlay entries are appended. See
+      :func:`_merge_dict_list`.
     - Scalar lists / mismatched types: overlay value replaces base value entirely.
     """
+    keyed = _root and _keyed_overlay_merge(base, overlay)
+    contract_id = str(base.get("id") or "the contract") if _root else ""
     for k, v in overlay.items():
         if k in base and isinstance(base[k], dict) and isinstance(v, dict):
-            base[k] = _deep_merge(base[k], v)
+            base[k] = _deep_merge(base[k], v, _root=False)
         elif (
             k in base
             and isinstance(base[k], list)
@@ -184,20 +211,209 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
             and v
             and all(isinstance(item, dict) for item in v)
         ):
-            # Positional merge for list-of-dicts: patch each overlay entry into
-            # the corresponding base entry, preserving unmentioned fields.
-            merged: List[Any] = list(base[k])
-            for i, overlay_item in enumerate(v):
-                if i < len(merged) and isinstance(merged[i], dict):
-                    merged[i] = _deep_merge(dict(merged[i]), overlay_item)
-                elif i < len(merged):
-                    merged[i] = overlay_item
-                else:
-                    merged.append(overlay_item)
-            base[k] = merged
+            identity = _OVERLAY_IDENTITY_KEYS.get(k) if _root else None
+            base[k] = _merge_dict_list(
+                k, base[k], v, identity, keyed=keyed, contract_id=contract_id
+            )
         else:
             base[k] = v
     return base
+
+
+def _keyed_overlay_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> bool:
+    """True when the merged contract's fluidVersion is 0.7.6 or later."""
+    version = overlay.get("fluidVersion", base.get("fluidVersion"))
+    parts = str(version or "").strip().split(".")
+    if not all(part.isascii() and part.isdigit() and len(part) < 10 for part in parts):
+        return False
+    return tuple(int(part) for part in parts) >= _KEYED_OVERLAY_MERGE_SINCE
+
+
+def _merge_dict_list(
+    name: str,
+    base_items: List[Any],
+    overlay_items: List[Dict[str, Any]],
+    identity: Optional[Tuple[str, ...]],
+    *,
+    keyed: bool,
+    contract_id: str = "",
+) -> List[Any]:
+    """Patch ``overlay_items`` into ``base_items``, by identity or by position.
+
+    Merging by position retargets an overlay as soon as the base gains,
+    loses or reorders an entry, without any error. From 0.7.6 a list with an
+    identity key merges by it when the base's entries carry unique ones, and
+    an overlay entry that names none, or names one twice, is refused: falling
+    back to position would retarget it. Before 0.7.6, or when the base's ids
+    are missing or repeated, the merge is by position and warns when a patch
+    lands on an entry that names another id.
+    """
+    base_ids = [_item_identity(item, identity) for item in base_items] if identity else []
+    overlay_ids = [_item_identity(item, identity) for item in overlay_items] if identity else []
+    if identity and keyed and _unique_ids(base_ids):
+        if len(base_items) > 1 or any(overlay_ids):
+            return _merge_by_identity(
+                name, identity, base_items, overlay_items, base_ids, overlay_ids, contract_id
+            )
+        # At most one base entry and id-less patches: nothing else they could mean.
+
+    if identity and len(base_items) > 1:
+        _warn_positional_overlay(
+            name, identity, base_items, overlay_items, keyed=keyed, contract_id=contract_id
+        )
+    merged = list(base_items)
+    for i, overlay_item in enumerate(overlay_items):
+        if i < len(merged) and isinstance(merged[i], dict):
+            merged[i] = _deep_merge(dict(merged[i]), overlay_item, _root=False)
+        elif i < len(merged):
+            merged[i] = overlay_item
+        else:
+            merged.append(overlay_item)
+    return merged
+
+
+def _merge_by_identity(
+    name: str,
+    keys: Tuple[str, ...],
+    base_items: List[Any],
+    overlay_items: List[Dict[str, Any]],
+    base_ids: List[Optional[Tuple[str, ...]]],
+    overlay_ids: List[Optional[Tuple[str, ...]]],
+    contract_id: str = "",
+) -> List[Any]:
+    key_label = " + ".join(keys)
+    seen: Dict[Tuple[str, ...], int] = {}
+    for i, ident in enumerate(overlay_ids):
+        if ident is None:
+            raise OverlayMergeError(
+                f"the overlay's {name}[{i}] names no {key_label}. In a contract whose "
+                f"fluidVersion is 0.7.6 or later, every overlay entry of {name} names the "
+                f"{key_label} of the entry it patches, or of a new entry to add."
+            )
+        if ident in seen:
+            raise OverlayMergeError(
+                f"the overlay's {name}[{seen[ident]}] and {name}[{i}] both name "
+                f"{key_label} {'/'.join(ident)}; patch each entry once."
+            )
+        seen[ident] = i
+    merged: List[Any] = list(base_items)
+    position = {ident: i for i, ident in enumerate(base_ids)}
+    for ident, overlay_item in zip(overlay_ids, overlay_items, strict=True):
+        i = position.get(ident)
+        if i is None:
+            # A new entry, or a patch whose id has a typo: say which.
+            _warn_once(
+                "overlay_entry_added",
+                name,
+                None,
+                "overlay_entry_added: the overlay for %s adds %s %s %s, which the base does "
+                "not have (the base has %s). If it was meant to patch one of those, fix its %s.",
+                contract_id,
+                name,
+                key_label,
+                "/".join(ident),
+                ", ".join("/".join(b) for b in base_ids if b) or "none",
+                key_label,
+            )
+            merged.append(overlay_item)
+        else:
+            merged[i] = _deep_merge(dict(merged[i]), overlay_item, _root=False)
+    return merged
+
+
+def _item_identity(item: Any, keys: Tuple[str, ...]) -> Optional[Tuple[str, ...]]:
+    if not isinstance(item, Mapping):
+        return None
+    values = tuple(item.get(key) for key in keys)
+    if all(isinstance(value, str) and value for value in values):
+        return values
+    return None
+
+
+def _unique_ids(ids: List[Optional[Tuple[str, ...]]]) -> bool:
+    return all(ids) and len(set(ids)) == len(ids)
+
+
+def _warn_positional_overlay(
+    name: str,
+    keys: Tuple[str, ...],
+    base_items: List[Any],
+    overlay_items: List[Dict[str, Any]],
+    *,
+    keyed: bool,
+    contract_id: str = "",
+) -> None:
+    key_label = " + ".join(keys)
+    remedy = (
+        f"give every base entry of {name} a unique {key_label}"
+        if keyed
+        else f"set fluidVersion 0.7.6 or later to merge {name} by {key_label}"
+    )
+    # Only the positions both lists have: an overlay entry past the base's end is appended.
+    for i, (overlay_item, base_item) in enumerate(zip(overlay_items, base_items, strict=False)):
+        overlay_id = _key_fields(overlay_item, keys)
+        base_id = _key_fields(base_item, keys)
+        # A key field both entries name, with different values: the patch is
+        # for another entry, even when the overlay names only part of the key.
+        if any(k in overlay_id and k in base_id and overlay_id[k] != base_id[k] for k in keys):
+            _warn_once(
+                "overlay_patch_retargeted",
+                name,
+                i,
+                "overlay_patch_retargeted: in %s, the overlay's %s[%d] names %s %s but "
+                "patches the base's %s[%d], %s %s, because lists merge by position. Put "
+                "the overlay's entries in the base's order, or %s.",
+                contract_id,
+                name,
+                i,
+                " + ".join(overlay_id),
+                "/".join(overlay_id.values()),
+                name,
+                i,
+                " + ".join(base_id),
+                "/".join(base_id.values()),
+                remedy,
+            )
+    if keyed:
+        _warn_once(
+            "overlay_merged_by_position",
+            name,
+            None,
+            "overlay_merged_by_position: in %s, %s is merged by position, not by %s, "
+            "because not every base entry carries a unique %s; %s.",
+            contract_id,
+            name,
+            key_label,
+            key_label,
+            remedy,
+        )
+
+
+def _key_fields(item: Any, keys: Tuple[str, ...]) -> Dict[str, str]:
+    """The identity fields ``item`` names, of the ones in ``keys``."""
+    if not isinstance(item, Mapping):
+        return {}
+    return {k: item[k] for k in keys if isinstance(item.get(k), str) and item[k]}
+
+
+#: Overlay merge warnings already logged by this process, each naming its
+#: contract: a command that loads its contract twice (``fluid apply`` does)
+#: says each once, as :func:`note_missing_overlay` does for a missing overlay.
+#: Tests reset it with ``_NOTED_OVERLAY_MERGE_WARNINGS.clear()``.
+_NOTED_OVERLAY_MERGE_WARNINGS: Set[str] = set()
+_NOTED_OVERLAY_MERGE_WARNINGS_LOCK = threading.Lock()
+
+
+def _warn_once(event: str, name: str, index: Optional[int], message: str, *args: Any) -> None:
+    text = message % args
+    with _NOTED_OVERLAY_MERGE_WARNINGS_LOCK:
+        if text in _NOTED_OVERLAY_MERGE_WARNINGS:
+            return
+        _NOTED_OVERLAY_MERGE_WARNINGS.add(text)
+    extra: Dict[str, Any] = {"event": event, "list": name}
+    if index is not None:
+        extra["index"] = index
+    LOG.warning("%s", text, extra=extra)
 
 
 # ---------------------------------------------------------------------------
