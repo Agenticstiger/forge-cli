@@ -27,6 +27,7 @@ from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from fluid_build.providers._planner_base import BasePlanner
+from fluid_build.util.contract import is_externally_run_build
 
 from ..util import warehouse as _warehouse
 from ..util.logging import format_event
@@ -560,11 +561,12 @@ def _plan_build_transformations(
             )
 
     elif pattern == "embedded-logic":
-        # Inline SQL execution via Athena
+        # Inline SQL execution via Athena. Flink SQL is not Athena SQL: that
+        # job runs outside forge-cli.
         props = build_config.get("properties", {})
         sql = props.get("sql")
 
-        if sql:
+        if sql and not is_externally_run_build(build_config):
             actions.append(
                 {
                     "op": "athena.execute_query",

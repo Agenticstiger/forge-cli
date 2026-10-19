@@ -2878,7 +2878,8 @@
                 "meltano",
                 "dlt",
                 "kafka-connect",
-                "debezium"
+                "debezium",
+                "flink"
               ]
             },
             {
@@ -2886,7 +2887,7 @@
             }
           ],
           "default": "dbt",
-          "description": "Build/ingestion engine. Transformation engines: dbt, sql, python, spark, glue, custom. Adapter-qualified dbt engines (dbt-<adapter>, e.g. dbt-glue, dbt-snowflake, dbt-bigquery) are accepted too and route through the dbt build runner, which derives the adapter from the suffix. Ingestion engines (acquisition pattern only): duckdb (zero-infra files/JDBC), airbyte (350+ SaaS), meltano (Singer 600+ taps), dlt (Python-native), kafka-connect (streaming), debezium (CDC). AWS Glue: glue (Spark ETL jobs managed by Glue)."
+          "description": "Build/ingestion engine. Transformation engines: dbt, sql, python, spark, glue, custom. Adapter-qualified dbt engines (dbt-<adapter>, e.g. dbt-glue, dbt-snowflake, dbt-bigquery) are accepted too and route through the dbt build runner, which derives the adapter from the suffix. Ingestion engines (acquisition pattern only): duckdb (zero-infra files/JDBC), airbyte (350+ SaaS), meltano (Singer 600+ taps), dlt (Python-native), kafka-connect (streaming), debezium (CDC). AWS Glue: glue (Spark ETL jobs managed by Glue). NEW in v0.7.6: flink (Apache Flink jobs, usually long-running streaming SQL with properties.language: flink_sql). forge-cli validates and plans a flink build but ships no runner for it: the platform that runs the job, such as the Flink Kubernetes Operator or AWS Managed Service for Apache Flink, executes it. Put deployment settings under properties.parameters, for example parallelism and upgradeMode, as the Flink Kubernetes Operator's job spec names them, and flinkConfiguration."
         },
         "capabilities": {
           "type": "array",

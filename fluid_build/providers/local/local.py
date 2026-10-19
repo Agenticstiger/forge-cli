@@ -620,10 +620,15 @@ class LocalProvider(BaseProvider):
           - Write to exposes[0] path if provided, else default under runtime/out/.
         """
         # Import contract utilities for version-agnostic access
-        from fluid_build.util.contract import get_primary_build
+        from fluid_build.util.contract import get_primary_build, is_externally_run_build
 
         contract = self._anchored(contract)
         build = get_primary_build(contract)
+        if build and is_externally_run_build(build):
+            # Flink SQL is not DuckDB's to run, and the demo fallback below
+            # must not stand in for the job.
+            self._log_info("local_build_runs_outside_forge", {"engine": build.get("engine")})
+            return [{"op": "noop", "skipped": True, "reason": "build_runs_outside_forge"}]
         sql_text: Optional[str] = None
         inputs_spec: List[Any] = []
 

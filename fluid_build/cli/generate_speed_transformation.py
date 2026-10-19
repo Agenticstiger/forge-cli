@@ -221,6 +221,9 @@ def run(args: Any, logger: logging.Logger) -> int:
             if getattr(args, "all_builds", False)
             else [(build_index, builds[build_index])]
         )
+        selected_builds = _drop_externally_run_builds(selected_builds)
+        if not selected_builds:
+            return 0
         if getattr(args, "all_builds", False):
             results = _generate_all_builds(
                 args,
@@ -519,6 +522,29 @@ def _topological_build_waves(
         waves.append(wave)
         resolved.update(ready_ids)
     return waves
+
+
+def _drop_externally_run_builds(
+    selected: List[Tuple[int, Dict[str, Any]]],
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """Leave out builds whose job runs outside forge-cli, saying so for each.
+
+    A Flink job's SQL is inline and runs on Flink: there is no transformation
+    code for forge-cli to generate.
+    """
+    from fluid_build.util.contract import describe_externally_run_build, is_externally_run_build
+
+    kept = []
+    for index, build in selected:
+        if is_externally_run_build(build):
+            cprint(
+                f"Build '{build.get('id', index)}' runs outside forge-cli "
+                f"({describe_externally_run_build(build)}); there is no transformation "
+                "code to generate for it."
+            )
+        else:
+            kept.append((index, build))
+    return kept
 
 
 def _generate_single_build(
