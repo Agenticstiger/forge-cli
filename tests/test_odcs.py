@@ -593,23 +593,45 @@ def test_odcs_validate_reports_an_unreadable_file_as_a_failure(
     tmp_path: Path, text: str, reason: str
 ) -> None:
     import argparse
+    import json
 
     contract = tmp_path / "c.yaml"
     contract.write_text(text, encoding="utf-8")
-    args = argparse.Namespace(odcs_file=str(contract), report=None, roundtrip=False, vowl=False)
+    report = tmp_path / "report.json"
+    args = argparse.Namespace(
+        odcs_file=str(contract), report=str(report), roundtrip=False, vowl=False
+    )
     with patch("fluid_build.cli.odcs.cprint") as printed:
         assert _run_odcs_validate(args) == 1
-    assert reason in printed.call_args.args[0]
+    assert any(reason in c.args[0] for c in printed.call_args_list)
+    # A CI gate reading --report gets the failure too, not a missing file.
+    written = json.loads(report.read_text(encoding="utf-8"))
+    assert written["ok"] is False and written["passes"]["parse"]["ok"] is False
 
 
-def test_odcs_import_reports_an_alias_bomb_as_a_failed_import(tmp_path: Path) -> None:
+def test_load_yaml_json_reads_an_uppercase_suffix_as_yaml(tmp_path: Path) -> None:
+    from fluid_build.cli._common import load_yaml_json
+
+    contract = tmp_path / "C.YML"
+    contract.write_text("kind: DataContract\n", encoding="utf-8")
+    assert load_yaml_json(contract) == {"kind": "DataContract"}
+
+
+@pytest.mark.parametrize(
+    "text, reason",
+    [(_ALIAS_BOMB, "aliases expand"), ("id: [unclosed\n", "Error importing")],
+    ids=["alias-bomb", "malformed"],
+)
+def test_odcs_import_reports_an_unreadable_file_as_a_failed_import(
+    tmp_path: Path, text: str, reason: str
+) -> None:
     import argparse
 
     contract = tmp_path / "c.yaml"
-    contract.write_text(_ALIAS_BOMB, encoding="utf-8")
+    contract.write_text(text, encoding="utf-8")
     out = tmp_path / "out.yaml"
     args = argparse.Namespace(odcs_file=str(contract), output=str(out), format="yaml")
     with patch("fluid_build.cli.odcs.console_error") as reported:
         assert _run_odcs_import(args) == 1
-    assert "aliases expand" in reported.call_args.args[0]
+    assert reason in reported.call_args.args[0]
     assert not out.exists()

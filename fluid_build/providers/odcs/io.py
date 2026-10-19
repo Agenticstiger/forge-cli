@@ -116,7 +116,7 @@ def write_output(data: Dict[str, Any], path: Union[Path, str], fmt: str) -> None
 
 def _raw_load(path: Path) -> Any:
     with open(path, encoding="utf-8") as f:
-        if path.suffix in (".yaml", ".yml"):
+        if path.suffix.lower() in (".yaml", ".yml"):
             # ODCS / ODPS files come from other teams and catalogs, so they
             # get the anchor-expansion caps any untrusted YAML gets.
             from fluid_build.util.safe_yaml import load_yaml_safe

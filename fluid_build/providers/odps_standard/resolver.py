@@ -205,13 +205,9 @@ class ContractResolver:
                 return self._cache_and_return(contract_id, resolved)
 
         # 2. Local file probes
-        if self.base_path is not None:
-            for candidate in self._local_candidates(contract_id):
-                tried.append(str(candidate))
-                if candidate.exists():
-                    resolved = self._load_local(contract_id, candidate, require_id=True)
-                    if resolved is not None:
-                        return self._cache_and_return(contract_id, resolved)
+        resolved = self._probe_local(contract_id, tried)
+        if resolved is not None:
+            return self._cache_and_return(contract_id, resolved)
 
         # 3. http(s) if the contractId itself is a URL
         if _looks_like_url(contract_id):
@@ -234,6 +230,20 @@ class ContractResolver:
         raise ContractNotFound(contract_id, tried)
 
     # ---- internals ------------------------------------------------------
+
+    def _probe_local(self, contract_id: str, tried: List[str]) -> Optional[ResolvedContract]:
+        """The first probed file under ``base_path`` that declares ``contract_id``."""
+        for candidate in self._local_candidates(contract_id):
+            tried.append(str(candidate))
+            try:
+                present = candidate.exists()
+            except OSError:  # ENAMETOOLONG: a path segment past the OS limit
+                continue
+            if present:
+                resolved = self._load_local(contract_id, candidate, require_id=True)
+                if resolved is not None:
+                    return resolved
+        return None
 
     def _local_candidates(self, contract_id: str) -> List[Path]:
         if self.base_path is None:

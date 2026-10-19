@@ -718,5 +718,16 @@ def test_odps_validate_reports_an_unreadable_file_as_a_failure(
     assert reason in printed.call_args.args[0]
 
 
+def test_odps_validate_reads_an_uppercase_suffix_as_yaml(tmp_path: Path) -> None:
+    """PRODUCT.ODPS.YAML was parsed as JSON, so the caps never ran on it."""
+    from fluid_build.cli.odps_standard import _run_odps_validate
+
+    product = tmp_path / "PRODUCT.ODPS.YAML"
+    product.write_text(_BOMB_PRODUCT, encoding="utf-8")
+    with patch("fluid_build.cli.odps_standard.cprint") as printed:
+        assert _run_odps_validate(argparse.Namespace(odps_file=str(product))) == 1
+    assert "aliases expand" in printed.call_args.args[0]
+
+
 if __name__ == "__main__":
     unittest.main()

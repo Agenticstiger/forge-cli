@@ -30,10 +30,11 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import yaml
+
 from fluid_build.providers._path_safety import contained_path, safe_filename_stem
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderError
 from fluid_build.providers.odcs.provider import OdcsProvider
-from fluid_build.util.safe_yaml import UnsafeYamlError
 
 from .io import read_input, write_output
 from .mappers import EXPORT_PIPELINE, IMPORT_PIPELINE
@@ -296,20 +297,21 @@ class BitolOdpsProvider(BaseProvider):
           product wrapper.
 
         Raises if the directory contains more than one ODPS doc, or none
-        while the YAML caps refused a file that may be it. A refused file
-        next to a readable ODPS doc is skipped with a warning.
+        while a file that may be it could not be read (it did not parse, or
+        the YAML caps refused it). Such a file next to a readable ODPS doc
+        is skipped with a warning.
         """
         root = Path(dir_path)
         if not root.is_dir():
             raise ProviderError(f"import_directory: {root} is not a directory")
 
-        odps_files, odcs_files, refused = _classify_bundle_files(root, self.logger)
-        if refused and not odps_files:
-            # A refused file may be the product: importing the rest as an
+        odps_files, odcs_files, unreadable = _classify_bundle_files(root, self.logger)
+        if unreadable and not odps_files:
+            # An unreadable file may be the product: importing the rest as an
             # ODCS-only directory would drop it without an error.
             raise ProviderError(
-                f"import_directory: found no readable ODPS doc in {root}, and the YAML "
-                f"caps refused {len(refused)} file(s) that may be it: {refused}"
+                f"import_directory: found no readable ODPS doc in {root}, and could not "
+                f"read {len(unreadable)} file(s) that may be it: {unreadable}"
             )
 
         if len(odps_files) > 1:
@@ -387,7 +389,7 @@ class BitolOdpsProvider(BaseProvider):
             if stub is None:
                 continue
             cid = port.get("contractId")
-            if not cid:
+            if cid is None or cid == "":
                 continue
             resolved = self._safe_resolve(resolver, cid, lenient=lenient)
             if resolved is None:
@@ -404,7 +406,7 @@ class BitolOdpsProvider(BaseProvider):
             if stub is None:
                 continue
             cid = port.get("contractId")
-            if not cid:
+            if cid is None or cid == "":
                 continue
             # Always lenient for input ports — upstream contracts may live elsewhere
             resolved = self._safe_resolve(resolver, cid, lenient=True)
@@ -513,39 +515,25 @@ def _classify_bundle_files(
     root: Path, logger: logging.Logger
 ) -> Tuple[List[Path], List[Path], List[str]]:
     """Sort a directory's YAML/JSON files into ODPS docs, ODCS contracts and
-    files the YAML caps refused, which are skipped with a warning."""
+    files that could not be read, which are skipped with a warning."""
     odps_files: List[Path] = []
     odcs_files: List[Path] = []
-    refused: List[str] = []
+    unreadable: List[str] = []
     for child in sorted(root.rglob("*")):
         if not child.is_file() or child.suffix.lower() not in (".yaml", ".yml", ".json"):
             continue
+        # A file that does not parse, or that the YAML caps refuse, may be the
+        # product doc, so it is reported, not mistaken for an unrelated file.
         try:
-            kind = _sniff_kind(child)
-        except UnsafeYamlError as exc:
+            data = read_input(child)
+        # ValueError: UnsafeYamlError, UnicodeDecodeError, JSONDecodeError.
+        except (OSError, ValueError, RecursionError, yaml.YAMLError) as exc:
             logger.warning("Skipping %r: %s", str(child), exc)
-            refused.append(str(child))
+            unreadable.append(str(child))
             continue
+        kind = data.get("kind") if isinstance(data, Mapping) else None
         if kind == "DataProduct":
             odps_files.append(child)
         elif kind == "DataContract":
             odcs_files.append(child)
-    return odps_files, odcs_files, refused
-
-
-def _sniff_kind(path: Path) -> Optional[str]:
-    """Return ``kind`` from a YAML/JSON file; ``None`` for one that does not parse.
-
-    ``UnsafeYamlError`` propagates: a file the YAML caps refuse may be the
-    product doc, which :meth:`BitolOdpsProvider.import_directory` must not
-    mistake for an unrelated file.
-    """
-    try:
-        data = read_input(path)
-    except UnsafeYamlError:
-        raise
-    except Exception:
-        return None
-    if not isinstance(data, Mapping):
-        return None
-    return data.get("kind")
+    return odps_files, odcs_files, unreadable

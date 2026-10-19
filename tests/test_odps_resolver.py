@@ -124,6 +124,8 @@ class TestErrors:
             (["orders"], "not a valid contractId"),
             ("", "not a valid contractId"),
             ("http://[::1", "Tried"),  # not a URL urlparse accepts: probed as a plain id
+            # A file name past the OS limit: exists() raised OSError.
+            pytest.param("a" * 300, "Tried", id="name-too-long"),
         ],
     )
     def test_malformed_contract_id_is_not_found(

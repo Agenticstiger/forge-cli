@@ -107,7 +107,7 @@ def load_yaml_json(path: Path) -> Any:
     from fluid_build.util.safe_yaml import load_yaml_safe
 
     with open(path, encoding="utf-8") as f:
-        if path.suffix in (".yaml", ".yml"):
+        if path.suffix.lower() in (".yaml", ".yml"):
             return load_yaml_safe(f)
         return _json.load(f)
 
