@@ -165,6 +165,8 @@ class TestGroundTruthGuard:
         assert dropped
         assert all(m["candidate"] is None for m in dropped)
 
+
+class TestRuntimeGuard:
     def test_runtime_sends_a_dropped_expose_back_to_the_model(self) -> None:
         # End to end through generate_copilot_artifacts with a scripted model:
         # attempt 1 drops a seeded expose, attempt 2 returns the seed. Schema

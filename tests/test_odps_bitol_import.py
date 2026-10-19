@@ -197,6 +197,18 @@ class TestNegative:
         fmt, contract_id, exc = log.warning.call_args.args
         assert (fmt % (contract_id, exc)).startswith("Skipping unresolved contract 'x\\x00'")
 
+    def test_two_odps_docs_in_directory_raises(self, provider: BitolOdpsProvider) -> None:
+        with pytest.raises(ProviderError, match="found 2 ODPS docs"):
+            provider.import_directory(BROKEN / "two-odps-docs")
+
+    def test_nonexistent_directory_raises(self, provider: BitolOdpsProvider) -> None:
+        with pytest.raises(ProviderError, match="is not a directory"):
+            provider.import_directory(FIXTURES / "does-not-exist")
+
+
+class TestRefusedYaml:
+    """A directory file over the YAML caps is skipped, never silently reclassified."""
+
     def test_refused_file_without_a_readable_product_fails_the_directory(
         self, provider: BitolOdpsProvider, tmp_path: Path
     ) -> None:
@@ -215,11 +227,3 @@ class TestNegative:
             (tmp_path / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
         (tmp_path / "docker-compose.yaml").write_text(_ALIAS_BOMB, encoding="utf-8")
         assert len(provider.import_directory(tmp_path)["exposes"]) == 2
-
-    def test_two_odps_docs_in_directory_raises(self, provider: BitolOdpsProvider) -> None:
-        with pytest.raises(ProviderError, match="found 2 ODPS docs"):
-            provider.import_directory(BROKEN / "two-odps-docs")
-
-    def test_nonexistent_directory_raises(self, provider: BitolOdpsProvider) -> None:
-        with pytest.raises(ProviderError, match="is not a directory"):
-            provider.import_directory(FIXTURES / "does-not-exist")

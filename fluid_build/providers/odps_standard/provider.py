@@ -28,7 +28,7 @@ import logging
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fluid_build.providers._path_safety import contained_path, safe_filename_stem
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderError
@@ -303,26 +303,7 @@ class BitolOdpsProvider(BaseProvider):
         if not root.is_dir():
             raise ProviderError(f"import_directory: {root} is not a directory")
 
-        odps_files: List[Path] = []
-        odcs_files: List[Path] = []
-        refused: List[str] = []
-        for child in sorted(root.rglob("*")):
-            if not child.is_file():
-                continue
-            suf = child.suffix.lower()
-            if suf not in (".yaml", ".yml", ".json"):
-                continue
-            try:
-                kind = _sniff_kind(child)
-            except UnsafeYamlError as exc:
-                self.logger.warning("Skipping %r: %s", str(child), exc)
-                refused.append(str(child))
-                continue
-            if kind == "DataProduct":
-                odps_files.append(child)
-            elif kind == "DataContract":
-                odcs_files.append(child)
-
+        odps_files, odcs_files, refused = _classify_bundle_files(root, self.logger)
         if refused and not odps_files:
             # A refused file may be the product: importing the rest as an
             # ODCS-only directory would drop it without an error.
@@ -526,6 +507,30 @@ class BitolOdpsProvider(BaseProvider):
             self.logger.warning("ODPS schema not available, skipping validation")
             return
         validate(odps, schema)
+
+
+def _classify_bundle_files(
+    root: Path, logger: logging.Logger
+) -> Tuple[List[Path], List[Path], List[str]]:
+    """Sort a directory's YAML/JSON files into ODPS docs, ODCS contracts and
+    files the YAML caps refused, which are skipped with a warning."""
+    odps_files: List[Path] = []
+    odcs_files: List[Path] = []
+    refused: List[str] = []
+    for child in sorted(root.rglob("*")):
+        if not child.is_file() or child.suffix.lower() not in (".yaml", ".yml", ".json"):
+            continue
+        try:
+            kind = _sniff_kind(child)
+        except UnsafeYamlError as exc:
+            logger.warning("Skipping %r: %s", str(child), exc)
+            refused.append(str(child))
+            continue
+        if kind == "DataProduct":
+            odps_files.append(child)
+        elif kind == "DataContract":
+            odcs_files.append(child)
+    return odps_files, odcs_files, refused
 
 
 def _sniff_kind(path: Path) -> Optional[str]:
