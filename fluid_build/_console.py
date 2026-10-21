@@ -196,9 +196,11 @@ def cprint_literal(text: Any, **kwargs: Any) -> None:
 
     The ``str`` counterpart of :func:`literal_text`, for a line a renderer quotes back
     (a check name, a tool's stderr). It stays a ``str`` so :func:`cprint` still redacts
-    it; the raw text is redacted first, as in :func:`error`.
+    it; the raw text is redacted first, as in :func:`error`. ``markup`` and ``emoji``
+    are always off, whatever ``kwargs`` says.
     """
-    cprint(_show_controls(_redact_str(str(text))), markup=False, emoji=False, **kwargs)
+    kwargs.update(markup=False, emoji=False)
+    cprint(_show_controls(_redact_str(str(text))), **kwargs)
 
 
 def info(msg: str) -> None:

@@ -475,6 +475,17 @@ def test_provider_error_prints_its_message_verbatim(monkeypatch, capsys):
     assert f"❌ Provider error: {MESSAGE}" in _unwrapped(capsys.readouterr().out)
 
 
+def test_provider_error_is_redacted(monkeypatch, capsys):
+    _raise_from_command(monkeypatch, cli_mod.ProviderError("[/] auth failed token=abc123"))
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "abc123" not in out
+    assert "❌ Provider error: [/] auth failed token=<redacted>" in _unwrapped(out)
+
+
 def test_last_resort_handler_prints_its_message_verbatim(monkeypatch, capsys):
     """The outer fallback reports through ``console_error``, which wrapped it in ``[red]``."""
 
@@ -658,6 +669,25 @@ def test_plain_reports_keep_brackets_when_rich_is_absent(monkeypatch, capsys):
     output_plain_report(report)
 
     assert capsys.readouterr().out.count(MESSAGE) == 2 * len(ROW_CATEGORIES)
+
+
+def test_plain_reports_spell_out_control_characters(monkeypatch, capsys):
+    from datetime import datetime
+
+    from fluid_build.cli.contract_validation import ValidationReport, output_plain_report
+    from fluid_build.cli.test import _output_plain
+
+    monkeypatch.setattr("fluid_build._console.console", None)
+    report = ValidationReport("c.yaml", f"orders{ESCAPES}", "1", datetime(2026, 1, 1), 0.0)
+    report.add_issue("error", "schema", f"bad {ESCAPES}", "exposes[0]")
+
+    _output_plain(report)
+    output_plain_report(report)
+
+    out = capsys.readouterr().out
+    assert not _reaches_the_terminal(out)
+    assert "fluid test  |  FAIL  |  orders\\x1b[2J" in out
+    assert "INVALID: orders\\x1b[2J\\x1b]8;;http://evil.example/" in out
 
 
 def test_soda_text_prints_check_names_and_stderr_verbatim(capsys):

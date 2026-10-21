@@ -686,7 +686,7 @@ class TestOutputFunctionsExt(unittest.TestCase):
         from fluid_build.cli.contract_validation import output_plain_report
 
         report = self._make_full_report(valid=True)
-        with patch("fluid_build.cli.contract_validation.cprint"):
+        with patch("fluid_build.cli.contract_validation.cprint_literal"):
             try:
                 output_plain_report(report, None)
             except Exception as e:

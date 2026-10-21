@@ -100,6 +100,13 @@ class TestHelpers:
         # A CRLF still breaks the line; a lone CR, which would print over it, is spelled.
         assert "\r" not in err and "next\\x0dover" in err
 
+    def test_error_keeps_a_crlf_line_break(self, capsys):
+        error("Validation failed\r\nsee line 2")
+        assert capsys.readouterr().err == "❌ Validation failed\nsee line 2\n"
+        with patch("fluid_build._console.RICH_AVAILABLE", False):
+            error("Validation failed\r\nsee line 2")
+        assert capsys.readouterr().err == "❌ Validation failed\nsee line 2\n"
+
     def test_error_without_rich_spells_out_control_characters(self, capsys):
         with patch("fluid_build._console.RICH_AVAILABLE", False):
             error("deploy failed\r✅ all checks passed \x1b[2J")

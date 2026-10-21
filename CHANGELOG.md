@@ -60,8 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both commands an id holding `[/]` crashed the command with a `MarkupError` traceback.
   The soda engine's check names and stderr, the `❌` lines printed by the CLI's shared
   error helper, and the `Unexpected error:` line print as written too, so an exception
-  that quotes `[/]` no longer ends in a second traceback (that line and its `--debug`
-  traceback are now redacted like the rest). In all of these a `:name:` code stays text
+  that quotes `[/]` no longer ends in a second traceback. That line, the `Provider
+  error:` line and the `--debug` traceback are now redacted, as the `❌` lines already
+  were. In all of these a `:name:` code stays text
   (`fe80::a:b:c` showed an emoji) and a control character prints as `\x1b` and the like,
   so an escape sequence in a contract or an error message can no longer clear the
   terminal or plant a link. JSON and JUnit output are unchanged.
