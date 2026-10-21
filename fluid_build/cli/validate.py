@@ -899,6 +899,24 @@ def _run_contract_rules(
             if args.verbose:
                 info(logger, f"Vector binding check skipped: {exc}")
 
+        # --- A continuous trigger on a batch build (WARNING) ---------------
+        # trigger.type continuous (0.7.6) says the job's platform keeps it
+        # running, so no scheduler starts the build. forge-cli runs dbt,
+        # python, inline-SQL and batch-acquisition builds to completion: the
+        # dbt and python runners refuse the trigger, and the others run once
+        # per fluid apply. A warning, not an error: plain validate passes and
+        # --strict fails. A crash in the check is reported, never swallowed.
+        try:
+            from fluid_build.build_runners.base import continuous_trigger_warnings
+
+            for msg in continuous_trigger_warnings(contract):
+                validation_result.add_warning(msg)
+        except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+            validation_result.add_warning(
+                f"Continuous-trigger check could not run ({type(exc).__name__}: {exc}); "
+                "the contract was NOT checked for a continuous trigger on a batch build"
+            )
+
         # --- Packaging checks (RFC-packaging-modes.md file 9) ---------------
         # ``fluid validate`` had NO packaging awareness: a `shared` block with
         # no `pool` validated clean and then failed at `fluid plan` with an

@@ -236,3 +236,176 @@ class TestCli:
         assert result.returncode == 0, result.stdout + result.stderr
         assert "continuously (trigger.type: continuous)" in " ".join(result.stdout.split())
         assert not (tmp_path / "sched").exists()
+
+
+# ── a continuous trigger on a build forge-cli runs as a batch run ──────────
+
+_SQL = {"sql": "SELECT 1"}
+_REMEDY = "Use trigger.type schedule, or run the job on a platform that keeps it running."
+
+
+def _build(engine: Any = None, trigger: str = "continuous", **extra: Any) -> Dict[str, Any]:
+    build: Dict[str, Any] = {"id": "b", "execution": {"trigger": {"type": trigger}}, **extra}
+    if engine is not None:
+        build["engine"] = engine
+    return build
+
+
+def _warnings(contract: Dict[str, Any]) -> list:
+    from fluid_build.build_runners.base import continuous_trigger_warnings
+
+    return continuous_trigger_warnings(contract)
+
+
+class TestBatchBuildWarning:
+    """A continuous trigger says the job's platform keeps it running, and no
+    scheduler starts the build; forge-cli runs dbt, python, inline-SQL and batch
+    acquisition builds to completion, so ``fluid validate`` warns."""
+
+    def test_a_dbt_build_is_never_run(self) -> None:
+        assert _warnings({"builds": [_build("dbt")]}) == [
+            "builds[0] (id 'b'): trigger.type continuous on engine 'dbt': forge-cli runs dbt "
+            "builds as batch runs, which end, and its dbt runner refuses a continuous trigger: "
+            f"forge-cli never runs this build. {_REMEDY}"
+        ]
+
+    def test_a_duckdb_acquisition_runs_once_per_apply(self) -> None:
+        assert _warnings({"builds": [_build("duckdb", pattern="acquisition")]}) == [
+            "builds[0] (id 'b'): trigger.type continuous on engine 'duckdb': forge-cli runs "
+            "duckdb builds as batch runs, which end: this build runs once per fluid apply, and "
+            f"no scheduler starts it. {_REMEDY}"
+        ]
+
+    @pytest.mark.parametrize(
+        "build, says",
+        [
+            pytest.param(_build("dbt-snowflake"), "its dbt runner refuses", id="dbt-adapter"),
+            pytest.param(_build(" Python "), "its python runner refuses", id="python"),
+            pytest.param(_build("sql", properties=_SQL), "inline-SQL builds", id="sql"),
+            pytest.param(
+                _build(pattern="embedded-logic", properties=_SQL),
+                "on a build with no engine: forge-cli runs inline-SQL builds",
+                id="inline-sql-no-engine",
+            ),
+            # The runner takes inline SQL ahead of dbt, so the build runs on DuckDB.
+            pytest.param(
+                _build("dbt", pattern="embedded-logic", properties=_SQL),
+                "on engine 'dbt': forge-cli runs inline-SQL builds",
+                id="dbt-with-inline-sql",
+            ),
+            *[
+                pytest.param(_build(e, pattern="acquisition"), f"runs {e} builds", id=e)
+                for e in ("airbyte", "meltano", "dlt")
+            ],
+        ],
+    )
+    def test_every_batch_runner_is_warned(self, build: Dict[str, Any], says: str) -> None:
+        (warning,) = _warnings({"builds": [build]})
+        assert says in warning
+        assert warning.endswith(_REMEDY)
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(_build("kafka-connect", pattern="acquisition"), id="kafka-connect"),
+            pytest.param(_build("debezium", pattern="acquisition"), id="debezium"),
+            pytest.param(_build("flink", properties=_SQL), id="flink"),
+            pytest.param(
+                _build("sql", properties={"language": "flink_sql", **_SQL}), id="flink-sql"
+            ),
+            # No runner of its own: a Spark or Glue streaming job can run on
+            # its own platform.
+            pytest.param(_build("spark"), id="spark"),
+            pytest.param(_build("glue"), id="glue"),
+            pytest.param(_build("custom"), id="custom"),
+            pytest.param(_build(), id="no-engine-no-sql"),
+            pytest.param(_build("dbt", trigger="schedule"), id="schedule"),
+            pytest.param({"id": "b", "engine": "dbt"}, id="no-trigger"),
+        ],
+    )
+    def test_no_warning(self, build: Dict[str, Any]) -> None:
+        assert _warnings({"builds": [build]}) == []
+
+    @pytest.mark.parametrize(
+        "contract",
+        [
+            pytest.param({"builds": "dbt"}, id="builds-str"),
+            pytest.param({"builds": None}, id="builds-null"),
+            pytest.param({"builds": ["dbt", None, 3]}, id="build-not-object"),
+            pytest.param({"builds": [_build(5)]}, id="engine-int"),
+            pytest.param({"builds": [_build("sql", pattern=["x"])]}, id="pattern-list"),
+            pytest.param(
+                {"builds": [_build(pattern="embedded-logic", properties=["SELECT 1"])]},
+                id="properties-list",
+            ),
+            pytest.param({"builds": [{"id": "b", "engine": "dbt", "execution": "x"}]}, id="exec"),
+        ],
+    )
+    def test_any_shape_is_read_without_raising(self, contract: Dict[str, Any]) -> None:
+        # fluid validate runs its contract rules on a contract the schema refused too.
+        assert _warnings(contract) == []
+
+    def test_a_build_without_an_id_is_named_by_index(self) -> None:
+        build = _build("python")
+        del build["id"]
+        (warning,) = _warnings({"builds": [_build("spark"), build]})
+        assert warning.startswith("builds[1]: trigger.type continuous on engine 'python':")
+
+
+def test_streaming_engines_are_the_runners_that_declare_streaming() -> None:
+    # The kafka-connect and debezium runners leave a connector running; every
+    # other acquisition runner runs to completion. Read from the runners, so a
+    # new streaming runner cannot be warned about by mistake.
+    from fluid_build.api.runner import RunnerCapability
+    from fluid_build.build_runners.base import (
+        ACQUISITION_ENGINES,
+        STREAMING_ACQUISITION_ENGINES,
+        _declared_capabilities_for_engine,
+    )
+
+    declared = {engine: _declared_capabilities_for_engine(engine) for engine in ACQUISITION_ENGINES}
+    assert all(caps is not None for caps in declared.values()), declared
+    assert STREAMING_ACQUISITION_ENGINES == {
+        engine
+        for engine, caps in declared.items()
+        if caps is not None and RunnerCapability.STREAMING.value in caps
+    }
+
+
+class TestValidateCli:
+    @staticmethod
+    def _write(tmp_path: Path) -> None:
+        contract = _contract()
+        contract["builds"] = [
+            {
+                "id": "transform",
+                "engine": "dbt",
+                "pattern": "hybrid-reference",
+                "repository": "./dbt",
+                "execution": {"trigger": {"type": "continuous"}},
+            }
+        ]
+        (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(contract), "utf-8")
+
+    def test_plain_validate_warns_and_passes(self, tmp_path: Path) -> None:
+        self._write(tmp_path)
+        result = _run_cli("validate", "contract.fluid.yaml", "--offline", cwd=tmp_path)
+        assert result.returncode == 0, result.stdout + result.stderr
+        out = " ".join(result.stdout.split())
+        assert "builds[0] (id 'transform'): trigger.type continuous on engine 'dbt'" in out
+
+    def test_strict_fails(self, tmp_path: Path) -> None:
+        self._write(tmp_path)
+        result = _run_cli("validate", "contract.fluid.yaml", "--offline", "--strict", cwd=tmp_path)
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "warnings treated as errors (--strict)" in result.stdout
+
+    def test_json_lists_the_warning(self, tmp_path: Path) -> None:
+        self._write(tmp_path)
+        result = _run_cli(
+            "validate", "contract.fluid.yaml", "--offline", "--format", "json", cwd=tmp_path
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        report = json.loads(result.stdout)
+        assert report["valid"] is True
+        assert [w for w in report["warnings"] if "trigger.type continuous" in w]

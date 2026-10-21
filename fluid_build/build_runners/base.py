@@ -38,7 +38,11 @@ from fluid_build._console import cprint, success
 from fluid_build._console import error as console_error
 from fluid_build._contract_loader import CLIError, load_contract_with_overlay
 from fluid_build.util.binding_paths import ENV_PLACEHOLDER_RE
-from fluid_build.util.contract import describe_externally_run_build, is_externally_run_build
+from fluid_build.util.contract import (
+    describe_externally_run_build,
+    is_continuous_build,
+    is_externally_run_build,
+)
 
 LOG = logging.getLogger("fluid.build_runners")
 
@@ -203,6 +207,96 @@ def is_acquisition_build(build: Dict[str, Any]) -> bool:
         return False
     engine = (build.get("engine") or "").strip().lower()
     return engine in ACQUISITION_ENGINES
+
+
+#: Acquisition engines whose runner leaves a job running after ``fluid apply``
+#: ends: the Kafka Connect or Debezium connector it deploys keeps streaming.
+#: They are the runners that declare ``RunnerCapability.STREAMING``; every
+#: other runner here runs a build to completion, a batch run.
+STREAMING_ACQUISITION_ENGINES = frozenset({"kafka-connect", "debezium"})
+
+
+def _batch_runner_for(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
+    """``(builds, refusing_runner)`` when :func:`run_builds_from_args` runs the
+    build to completion, else None.
+
+    ``builds`` names the builds that runner takes, for messages. The dbt and
+    python runners refuse a continuous trigger, and ``refusing_runner`` names
+    them; inline SQL and the duckdb, airbyte, meltano and dlt runners run the
+    build once, with ``refusing_runner`` None. The checks follow the
+    dispatcher's order, so they name the runner that gets the build. A build
+    forge-cli has no runner of its own for (spark, glue, custom, or no engine)
+    is None: it can be a streaming job its own platform keeps running.
+    """
+    engine, pattern, props = build.get("engine"), build.get("pattern"), build.get("properties")
+    # The dispatch predicates read these shapes, and fluid validate also reads
+    # a contract the schema refused.
+    if not (
+        isinstance(engine, (str, type(None)))
+        and isinstance(pattern, (str, type(None)))
+        and isinstance(props, (dict, type(None)))
+    ):
+        return None
+    name = (engine or "").strip().lower()
+    if is_externally_run_build(build):
+        return None
+    if is_acquisition_build(build):
+        return None if name in STREAMING_ACQUISITION_ENGINES else (f"{name} builds", None)
+    if is_embedded_sql_build(build):
+        return "inline-SQL builds", None
+    if is_dbt_build(build):
+        return "dbt builds", "dbt"
+    if name == "python":
+        return "python builds", "python"
+    return None
+
+
+def continuous_trigger_warnings(contract: Dict[str, Any]) -> List[str]:
+    """``fluid validate``'s warnings for continuous builds forge-cli runs as batch runs.
+
+    ``trigger.type: continuous`` (schema 0.7.6) says the job's platform keeps
+    it running, so no scheduler starts the build
+    (:func:`~fluid_build.util.contract.is_unscheduled_build`). A batch run
+    ends: the dbt and python runners refuse the trigger, so forge-cli never
+    runs such a build, and an inline-SQL build or a duckdb, airbyte, meltano or
+    dlt acquisition runs once per ``fluid apply``. A warning, not an error:
+    plain ``fluid validate`` passes, and ``--strict`` fails.
+
+    Borrowed: Spark checks a continuous trigger against what the query can run
+    before it starts (``UnsupportedOperationChecker.checkForContinuous``), and
+    Databricks refuses ``Trigger.Continuous`` where it cannot keep a job
+    running (``INFINITE_STREAMING_TRIGGER_NOT_SUPPORTED``), naming the trigger.
+    """
+    builds = contract.get("builds")
+    if not isinstance(builds, list):
+        return []
+    warnings: List[str] = []
+    for index, build in enumerate(builds):
+        if not isinstance(build, dict) or not is_continuous_build(build):
+            continue
+        runner = _batch_runner_for(build)
+        if runner is None:
+            continue
+        runs, refuser = runner
+        bid = build.get("id")
+        where = (
+            f"builds[{index}] (id {bid!r})" if isinstance(bid, str) and bid else f"builds[{index}]"
+        )
+        engine = build.get("engine")
+        on = f"engine {engine!r}" if engine else "a build with no engine"
+        if refuser:
+            outcome = (
+                f", and its {refuser} runner refuses a continuous trigger: forge-cli never "
+                "runs this build"
+            )
+        else:
+            outcome = ": this build runs once per fluid apply, and no scheduler starts it"
+        warnings.append(
+            f"{where}: trigger.type continuous on {on}: forge-cli runs {runs} as batch runs, "
+            f"which end{outcome}. Use trigger.type schedule, or run the job on a platform that "
+            "keeps it running."
+        )
+    return warnings
 
 
 # Acquisition-engine registry: ``engine name → (module path, callable name)``.
