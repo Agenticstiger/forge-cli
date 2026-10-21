@@ -430,3 +430,30 @@ def test_a_task_named_like_another_tasks_result_keeps_its_own_edge():
     source = generate_airflow_dag_taskflow(contract, "123456789012", "eu-west-1")
     assert "    chk_result_2 = chk()" in source
     assert "    chk_result >> after_result" in source
+
+
+@pytest.mark.parametrize("task_id", ["task", "dag", "AthenaOperator", "S3CreateBucketOperator"])
+def test_a_task_named_like_an_imported_name_does_not_shadow_it(task_id: str):
+    """``taskId: task`` emitted ``def task():`` inside the DAG function, shadowing the
+    ``@task`` decorator (UnboundLocalError when Airflow parsed it)."""
+    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag_taskflow
+
+    contract = _contract()
+    contract["orchestration"]["tasks"] = [
+        {
+            "taskId": task_id,
+            "type": "provider_action",
+            "action": "aws.glue.ensure_database",
+            "params": {"database": "d"},
+        }
+    ]
+    tree = ast.parse(generate_airflow_dag_taskflow(contract, "123456789012", "eu-west-1"))
+    bound = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    bound |= {
+        t.id
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    }
+    assert task_id not in bound, f"{task_id!r} rebinds an imported name"

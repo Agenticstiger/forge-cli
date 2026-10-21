@@ -43,11 +43,20 @@ from fluid_build.providers.common.codegen_utils import (
 logger = logging.getLogger(__name__)
 
 
-# Module-level names the generated DAG binds itself. A task variable must not
-# collide with any of them.
+# Module-level names the generated DAG binds itself, including every name its
+# imports bind (the TaskFlow ``dag`` / ``task`` decorators and the operator
+# classes). A task variable must not collide with any of them: ``taskId: task``
+# emitted ``def task():`` inside the DAG function, which shadows the decorator.
 _EMITTED_MODULE_NAMES = frozenset(
     {
         "dag",
+        "task",
+        "PythonOperator",
+        "S3CreateBucketOperator",
+        "GlueJobOperator",
+        "AthenaOperator",
+        "RedshiftDataOperator",
+        "LambdaInvokeFunctionOperator",
         "default_args",
         "logger",
         "json",

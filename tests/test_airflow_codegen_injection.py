@@ -1037,3 +1037,18 @@ def test_init_basic_dag_retries_are_numbers_not_code(tmp_path):
     assert_inert(code)
     assert "'retries': 3," in code and "timedelta(minutes=5)" in code
     assert "PWNED" not in code
+
+
+def test_init_basic_dag_infinite_retries_fall_back(tmp_path):
+    """``int(float('inf'))`` raises OverflowError, which skipped the DAG instead."""
+    import logging
+
+    from fluid_build.cli.init import create_basic_dag
+
+    create_basic_dag(
+        tmp_path,
+        {"name": "p", "orchestration": {"retries": float("inf")}},
+        logging.getLogger(__name__),
+    )
+    (dag,) = (tmp_path / "dags").glob("*.py")
+    assert "'retries': 3," in dag.read_text()

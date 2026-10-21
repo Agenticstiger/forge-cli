@@ -75,7 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database), and `BigQueryCreateTableOperator` renders `table_resource` (the schema). A
   literal `{{`, `{%` or `{#` in a warehouse or database name, or in a schema field such
   as a description, is now rendered as Jinja when the task runs, and fails it. Escape it
-  as `{{ '{{' }}`.
+  as `{{ '{{' }}`, `{{ '{%' }}` or `{{ '{#' }}`, or wrap the value in `{% raw %}` ...
+  `{% endraw %}`.
 
 ### Added
 

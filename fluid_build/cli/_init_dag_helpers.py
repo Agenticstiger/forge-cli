@@ -169,7 +169,7 @@ def create_basic_dag(project_dir: Path, contract: dict, logger):
     # contract value such as `3, __import__('os').system('...')` would run at parse time.
     try:
         retries = max(0, min(int(orchestration.get("retries", 3)), 100))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: `retries: .inf`
         retries = 3
     delay = _re.fullmatch(r"\s*(\d{1,4})\s*m?\s*", str(orchestration.get("retry_delay", "5m")))
     retry_minutes = int(delay.group(1)) if delay else 5
