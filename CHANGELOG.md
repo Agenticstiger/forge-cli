@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `timetable` next to it, as Databricks Jobs refuses a continuous trigger next to any
   other, and the error names the field and the trigger type that takes it. It is not
   Airflow's `@continuous`, which starts batch runs back to back. 0.7.5 is unchanged.
+  Declare it on a build that runs outside forge-cli or on a connector: the dbt and python
+  runners refuse it ("Unknown trigger type"), as they refuse `event` and `dataset`, and
+  `fluid scaffold-composer` still writes its nightly DAG for any contract.
 
 ### Changed
 
