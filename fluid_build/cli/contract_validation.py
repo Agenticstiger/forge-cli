@@ -292,11 +292,16 @@ class ContractValidator:
         """Execute comprehensive contract validation."""
         start_time = time.time()
 
-        # Load contract
+        # Load contract. A positional overlay patch that lands on another
+        # entry is only logged by the loader; collect it, so it is reported
+        # as a warning below and ``--strict`` fails on it.
+        from fluid_build.loader import collect_overlay_warnings
+
         try:
-            self.contract = load_contract_with_overlay(
-                str(self.contract_path), self.env, self.logger
-            )
+            with collect_overlay_warnings() as overlay_warnings:
+                self.contract = load_contract_with_overlay(
+                    str(self.contract_path), self.env, self.logger
+                )
         except FileNotFoundError:
             from .core import ContractNotFoundError
 
@@ -330,6 +335,9 @@ class ContractValidator:
             duration=0.0,
             data_checks_performed=self.check_data,
         )
+        # The message already names the fix.
+        for warning in overlay_warnings:
+            self.report.add_issue("warning", "overlay", warning.message)
 
         # Step 1: Validate contract syntax against schema
         self._validate_contract_schema()

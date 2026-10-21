@@ -25,8 +25,12 @@ that names another id.
 from __future__ import annotations
 
 import copy
+import json
 import logging
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
@@ -335,3 +339,148 @@ def test_an_added_entry_names_its_contract_too(
         "overlay_entry_added: the overlay for p1",
         "overlay_entry_added: the overlay for p2",
     ]
+
+
+# --strict: ``fluid validate`` and ``fluid contract-validation`` take a
+# retargeted patch from the loader and report it as their own warning, so
+# ``--strict`` fails on it. The loader used to log it, which --strict never read.
+
+
+class TestCollectOverlayWarnings:
+    def test_the_block_takes_a_retargeted_patch_instead_of_logging_it(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from fluid_build.loader import OverlayWarning, collect_overlay_warnings
+
+        caplog.set_level(logging.DEBUG, logger="fluid.loader")
+        with collect_overlay_warnings() as taken:
+            _merge(_base("0.7.5"), PROD)
+        assert [w.event for w in taken] == ["overlay_patch_retargeted"]
+        assert isinstance(taken[0], OverlayWarning)
+        assert "names id transform but patches the base's builds[0], id backfill" in (
+            taken[0].message
+        )
+        # Said once, by the command: the log keeps it at DEBUG.
+        levels = [r.levelno for r in caplog.records if r.name == "fluid.loader"]
+        assert levels == [logging.DEBUG]
+
+    def test_an_added_entry_stays_a_log_line(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Adding a build only prod runs is often intended, and --strict could
+        # not be silenced on it.
+        from fluid_build.loader import collect_overlay_warnings
+
+        caplog.set_level(logging.WARNING, logger="fluid.loader")
+        with collect_overlay_warnings() as taken:
+            _merge(_base("0.7.6"), {"builds": [{"id": "reindex", "engine": "spark"}]})
+        assert taken == []
+        assert _events(caplog) == ["overlay_entry_added"]
+
+    def test_a_warning_the_block_took_is_still_logged_by_a_later_load(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from fluid_build.loader import collect_overlay_warnings
+
+        caplog.set_level(logging.WARNING, logger="fluid.loader")
+        with collect_overlay_warnings() as taken:
+            _merge(_base("0.7.5"), PROD)
+            _merge(_base("0.7.5"), PROD)
+        assert len(taken) == 1
+        assert _events(caplog) == []
+        _merge(_base("0.7.5"), PROD)
+        assert _events(caplog) == ["overlay_patch_retargeted"]
+
+    def test_outside_a_block_nothing_is_collected(self) -> None:
+        from fluid_build.loader import _OVERLAY_WARNING_SINK, collect_overlay_warnings
+
+        with collect_overlay_warnings():
+            pass
+        assert _OVERLAY_WARNING_SINK.get() is None
+
+
+def _write_product(tmp_path: Path, version: str, overlay: Dict[str, Any]) -> None:
+    contract = {
+        "fluidVersion": version,
+        "kind": "DataProduct",
+        "id": "network.service-instances",
+        "name": "Service instances",
+        "metadata": {"owner": {"team": "data-engineering"}},
+        "builds": [{"id": b["id"], "engine": "custom", "description": b["id"]} for b in BUILDS],
+        "exposes": [
+            {
+                "exposeId": "service_instances",
+                "kind": "topic",
+                "binding": {
+                    "platform": "kafka",
+                    "format": "kafka_topic",
+                    "location": {"topic": "network.service-instances"},
+                },
+                "contract": {"schema": [{"name": "id", "type": "string"}]},
+            }
+        ],
+    }
+    (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(contract), encoding="utf-8")
+    (tmp_path / "overlays").mkdir()
+    (tmp_path / "overlays" / "prod.yaml").write_text(yaml.safe_dump(overlay), encoding="utf-8")
+
+
+#: Written against ``[ingest, transform]``: its second entry patches transform.
+PROD_BY_POSITION = {"builds": [{}, {"id": "transform", "description": "8 executors"}]}
+
+
+def _validate(tmp_path: Path, *argv: str) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(
+        [sys.executable, "-m", "fluid_build.cli", "validate", "contract.fluid.yaml"]
+        + ["--env", "prod", "--offline", *argv],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        env={k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")},
+    )
+
+
+class TestValidateStrict:
+    def test_the_retargeted_patch_is_a_warning(self, tmp_path: Path) -> None:
+        _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+        result = _validate(tmp_path)
+        assert result.returncode == 0, result.stdout + result.stderr
+        out = result.stdout + result.stderr
+        assert "Validation Warnings:" in result.stdout
+        # Reported by validate, not also logged by the loader.
+        assert out.count("overlay_patch_retargeted") == 1
+        assert "the overlay's builds[1] names id transform but patches the base's builds[1], " in (
+            " ".join(result.stdout.split())
+        )
+
+    def test_strict_fails_on_it(self, tmp_path: Path) -> None:
+        _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+        assert _validate(tmp_path, "--strict").returncode == 1
+
+    def test_strict_json_lists_it(self, tmp_path: Path) -> None:
+        _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+        result = _validate(tmp_path, "--strict", "--format", "json")
+        assert result.returncode == 1
+        warnings = json.loads(result.stdout)["warnings"]
+        assert [w.split(":")[0] for w in warnings] == ["overlay_patch_retargeted"]
+
+    def test_keyed_merge_has_nothing_to_warn_about(self, tmp_path: Path) -> None:
+        overlay = {"builds": [{"id": "transform", "description": "8 executors"}]}
+        _write_product(tmp_path, "0.7.6", overlay)
+        result = _validate(tmp_path, "--strict")
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_an_added_build_does_not_fail_strict(self, tmp_path: Path) -> None:
+        overlay = {"builds": [{"id": "reindex", "engine": "custom", "description": "reindex"}]}
+        _write_product(tmp_path, "0.7.6", overlay)
+        result = _validate(tmp_path, "--strict")
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_contract_validation_reports_it_as_a_warning(tmp_path: Path) -> None:
+    from fluid_build.cli.contract_validation import ContractValidator
+
+    _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+    report = ContractValidator(
+        tmp_path / "contract.fluid.yaml", env="prod", check_data=False, track_history=False
+    ).validate()
+    overlay = [w for w in report.get_warnings() if w.category == "overlay"]
+    assert [w.message.split(":")[0] for w in overlay] == ["overlay_patch_retargeted"]

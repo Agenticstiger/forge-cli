@@ -106,6 +106,9 @@ Examples:
 
   # Strict validation (warnings as errors)
   fluid validate contract.fluid.yaml --strict
+
+  # Strict, and fail when an overlay patch lands on another build, expose or consume
+  fluid validate contract.fluid.yaml --env prod --strict
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -301,10 +304,7 @@ def run(args, logger: logging.Logger) -> int:
             return _run_bundle_validation(contract_path, args, schema_manager, logger, start_time)
 
         # Load contract with overlay
-        try:
-            contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
-        except Exception as e:
-            raise CLIError(1, "contract_load_failed", {"error": str(e)})
+        contract, overlay_warnings = _load_contract_and_overlay_warnings(args, logger)
 
         # 0.7-only gate: pre-0.7 schemas (0.4.x / 0.5.x / 0.6.x) are no
         # longer supported anywhere in the pipeline. Reject them with an
@@ -330,6 +330,9 @@ def run(args, logger: logging.Logger) -> int:
             schema_manager=schema_manager,
             logger=logger,
         )
+
+        for warning in overlay_warnings:
+            validation_result.add_warning(warning)
 
         # Show schema if requested
         if args.show_schema:
@@ -450,6 +453,24 @@ def run(args, logger: logging.Logger) -> int:
         return e.exit_code
     except Exception as e:
         raise CLIError(1, "cli_unhandled_exception", {"error": str(e)})
+
+
+def _load_contract_and_overlay_warnings(args, logger: logging.Logger) -> tuple[dict, list[str]]:
+    """Load ``args.contract`` with its ``--env`` overlay, and the overlay warnings to report.
+
+    A positional overlay patch that lands on another entry is only logged by
+    the loader, and ``--strict`` reads the validation result, never the log.
+    :func:`fluid_build.loader.collect_overlay_warnings` hands it to validate
+    instead, so it is reported as a warning and ``--strict`` fails on it.
+    """
+    from fluid_build.loader import collect_overlay_warnings
+
+    try:
+        with collect_overlay_warnings() as overlay_warnings:
+            contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
+    except Exception as e:
+        raise CLIError(1, "contract_load_failed", {"error": str(e)})
+    return contract, [warning.message for warning in overlay_warnings]
 
 
 def _handle_list_versions(schema_manager: FluidSchemaManager, args, logger: logging.Logger) -> int:
