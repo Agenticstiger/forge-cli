@@ -1284,7 +1284,8 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
     treat_warnings_as_errors = args.strict and has_warnings
 
     if has_errors or treat_warnings_as_errors:
-        if not has_errors:
+        # Under --quiet the warnings were not listed, errors or not.
+        if treat_warnings_as_errors and (args.quiet or not has_errors):
             _explain_strict_failure(result, args)
         return 1
     else:
@@ -1292,7 +1293,7 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
 
 
 def _explain_strict_failure(result: ValidationResult, args: Any) -> None:
-    """Say why ``--strict`` exits 1 after a summary that reads valid.
+    """Say why ``--strict`` exits 1: after a summary that reads valid, or under ``--quiet``.
 
     ``--quiet`` prints errors only, so there each warning is printed as the
     error ``--strict`` made it: a count alone does not say what to fix.

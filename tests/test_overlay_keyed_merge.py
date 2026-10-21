@@ -474,6 +474,17 @@ class TestValidateStrict:
         assert result.stdout.startswith("ERROR (--strict): overlay_patch_retargeted: in ")
         assert (result.stdout + result.stderr).count("overlay_patch_retargeted") == 1
 
+    def test_quiet_strict_names_it_beside_other_errors(self, tmp_path: Path) -> None:
+        # --strict must not show less than --quiet alone.
+        _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+        contract = yaml.safe_load((tmp_path / "contract.fluid.yaml").read_text("utf-8"))
+        contract["bogusTopLevel"] = 1
+        (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(contract), "utf-8")
+        result = _validate(tmp_path, "--quiet", "--strict")
+        assert result.returncode == 1
+        assert "ERROR: root: Additional properties" in result.stdout
+        assert "ERROR (--strict): overlay_patch_retargeted: in " in result.stdout
+
     def test_strict_json_lists_it(self, tmp_path: Path) -> None:
         _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
         result = _validate(tmp_path, "--strict", "--format", "json")
