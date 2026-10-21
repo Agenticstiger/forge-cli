@@ -106,6 +106,9 @@ Examples:
 
   # Strict validation (warnings as errors)
   fluid validate contract.fluid.yaml --strict
+
+  # Strict: also fail when an overlay patch lands on another entry
+  fluid validate contract.fluid.yaml --env prod --strict
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -302,7 +305,9 @@ def run(args, logger: logging.Logger) -> int:
 
         # Load contract with overlay
         try:
-            contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
+            contract, overlay_warnings = _load_with_overlay_warnings(
+                args.contract, getattr(args, "env", None), logger
+            )
         except Exception as e:
             raise CLIError(1, "contract_load_failed", {"error": str(e)})
 
@@ -331,6 +336,9 @@ def run(args, logger: logging.Logger) -> int:
             logger=logger,
         )
 
+        for warning in overlay_warnings:
+            validation_result.add_warning(warning)
+
         # Show schema if requested
         if args.show_schema:
             _show_schema_info(target_version, schema_manager, args, logger)
@@ -355,6 +363,7 @@ def run(args, logger: logging.Logger) -> int:
         log_metric(logger, "validation_warnings", len(validation_result.warnings), unit="count")
 
         # Output results
+        _print_quiet_overlay_warnings(args, overlay_warnings)
         exit_code = _output_results(validation_result, args, logger)
 
         # Log operation result
@@ -450,6 +459,23 @@ def run(args, logger: logging.Logger) -> int:
         return e.exit_code
     except Exception as e:
         raise CLIError(1, "cli_unhandled_exception", {"error": str(e)})
+
+
+def _load_with_overlay_warnings(
+    contract_path: str, env: Optional[str], logger: logging.Logger
+) -> tuple[dict, list[str]]:
+    """Load a contract with its ``--env`` overlay, and the overlay warnings to report.
+
+    A positional overlay patch that lands on another entry is only logged by
+    the loader, and ``--strict`` reads the validation result, never the log.
+    :func:`fluid_build.loader.collect_overlay_warnings` hands it to validate
+    instead, so it is reported as a warning and ``--strict`` fails on it.
+    """
+    from fluid_build.loader import collect_overlay_warnings
+
+    with collect_overlay_warnings() as overlay_warnings:
+        contract = load_contract_with_overlay(contract_path, env, logger)
+    return contract, [warning.message for warning in overlay_warnings]
 
 
 def _handle_list_versions(schema_manager: FluidSchemaManager, args, logger: logging.Logger) -> int:
@@ -1258,9 +1284,37 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
     treat_warnings_as_errors = args.strict and has_warnings
 
     if has_errors or treat_warnings_as_errors:
+        # Under --quiet the warnings were not listed, errors or not.
+        if treat_warnings_as_errors and (args.quiet or not has_errors):
+            _explain_strict_failure(result, args)
         return 1
     else:
         return 0
+
+
+def _explain_strict_failure(result: ValidationResult, args: Any) -> None:
+    """Say why ``--strict`` exits 1: after a summary that reads valid, or under ``--quiet``.
+
+    ``--quiet`` prints errors only, so there each warning is printed as the
+    error ``--strict`` made it: a count alone does not say what to fix.
+    """
+    if args.quiet:
+        for warning in result.warnings:
+            _cprint_literal(f"ERROR (--strict): {warning}")
+    else:
+        cprint("❌ Validation failed: warnings treated as errors (--strict)")
+
+
+def _print_quiet_overlay_warnings(args: Any, overlay_warnings: list[str]) -> None:
+    """Under ``--quiet``, still show an overlay patch that landed on another entry.
+
+    ``--quiet`` prints errors only, but the loader always printed this warning,
+    whatever the flags. Under ``--strict`` it is printed as an error instead
+    (:func:`_explain_strict_failure`).
+    """
+    if args.quiet and not args.strict and args.format == "text":
+        for warning in overlay_warnings:
+            _cprint_literal(f"WARNING: {warning}")
 
 
 # ---------------------------------------------------------------------------
@@ -1377,19 +1431,17 @@ def _try_workspace_validate(
     failed = 0
     for product in products:
         try:
-            contract = _load_contract_for_workspace(product.contract_path, args, logger)
+            contract, overlay_warnings = _load_with_overlay_warnings(
+                str(product.contract_path), getattr(args, "env", None), logger
+            )
             result = schema_manager.validate_contract(
                 contract,
                 strict=args.strict,
                 offline_only=getattr(args, "offline", False),
             )
-            if result.is_valid:
-                cprint(f"  ✅ {product.name:<20} valid ({product.fluid_version or '?'})")
+            if _report_workspace_product(product, result, overlay_warnings, args.strict):
                 passed += 1
             else:
-                cprint(f"  ❌ {product.name:<20} {len(result.errors)} error(s)")
-                for err in result.errors[:3]:
-                    _cprint_literal(f"     {err}")
                 failed += 1
         except Exception as exc:  # noqa: BLE001
             _cprint_literal(f"  ❌ {product.name:<20} load error: {exc}")
@@ -1401,6 +1453,30 @@ def _try_workspace_validate(
         return 1
     cprint(f"All {passed} product{'s' if passed != 1 else ''} valid.")
     return 0
+
+
+def _report_workspace_product(
+    product: Any, result: ValidationResult, overlay_warnings: list[str], strict: bool
+) -> bool:
+    """Print one workspace product's line, and whether it passed.
+
+    ``--strict`` fails a product on an overlay patch that lands on another
+    entry; its other warnings are not reported here.
+    """
+    if not result.is_valid:
+        cprint(f"  ❌ {product.name:<20} {len(result.errors)} error(s)")
+        for err in result.errors[:3]:
+            _cprint_literal(f"     {err}")
+    elif overlay_warnings and strict:
+        cprint(
+            f"  ❌ {product.name:<20} {len(overlay_warnings)} overlay warning(s), "
+            "treated as errors (--strict)"
+        )
+    else:
+        cprint(f"  ✅ {product.name:<20} valid ({product.fluid_version or '?'})")
+    for warning in overlay_warnings:
+        _cprint_literal(f"     ⚠️  {warning}")
+    return result.is_valid and not (overlay_warnings and strict)
 
 
 # ---------------------------------------------------------------------------
@@ -1603,13 +1679,3 @@ def _bundle_contract_rule_issues(
         for msg in result.warnings
     )
     return issues
-
-
-def _load_contract_for_workspace(
-    contract_path: Path,
-    args: Any,
-    logger: logging.Logger,
-) -> dict:
-    """Load a contract, applying environment overlay if requested."""
-    env = getattr(args, "env", None)
-    return load_contract_with_overlay(str(contract_path), env, logger)

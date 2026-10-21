@@ -439,6 +439,12 @@ def _build_check_rows(report) -> List[tuple]:
     else:
         rows.append((_PASS, "Schema syntax", "Valid"))
 
+    # Environment overlay (only rendered when the --env overlay patched an
+    # entry it does not name): --strict fails on it, so it must show.
+    overlay_issues = [i for i in issues if i.category == "overlay"]
+    if overlay_issues:
+        rows.append((_WARN, "Environment overlay", _detail(e.message for e in overlay_issues)))
+
     # Provider connectivity
     # The connection probe runs in provider detection, so it happens
     # under --no-data too.

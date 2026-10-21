@@ -292,11 +292,16 @@ class ContractValidator:
         """Execute comprehensive contract validation."""
         start_time = time.time()
 
-        # Load contract
+        # Load contract. A positional overlay patch that lands on another
+        # entry is only logged by the loader; collect it, so it is reported
+        # as a warning below and ``--strict`` fails on it.
+        from fluid_build.loader import collect_overlay_warnings
+
         try:
-            self.contract = load_contract_with_overlay(
-                str(self.contract_path), self.env, self.logger
-            )
+            with collect_overlay_warnings() as overlay_warnings:
+                self.contract = load_contract_with_overlay(
+                    str(self.contract_path), self.env, self.logger
+                )
         except FileNotFoundError:
             from .core import ContractNotFoundError
 
@@ -330,6 +335,9 @@ class ContractValidator:
             duration=0.0,
             data_checks_performed=self.check_data,
         )
+        # The message already names the fix.
+        for warning in overlay_warnings:
+            self.report.add_issue("warning", "overlay", warning.message)
 
         # Step 1: Validate contract syntax against schema
         self._validate_contract_schema()
@@ -1625,6 +1633,8 @@ Duration: {report.duration:.2f}s"""
 
     # Issues table
     if report.issues:
+        from rich.markup import escape
+
         table = Table(title="Validation Issues", show_header=True)
         table.add_column("Severity", style="bold")
         table.add_column("Category")
@@ -1638,7 +1648,11 @@ Duration: {report.duration:.2f}s"""
                 "info": "[blue]INFO[/blue]",
             }.get(issue.severity, issue.severity.upper())
 
-            table.add_row(severity_style, issue.category, issue.message, issue.path)
+            # Messages quote contract text (an overlay warning names the
+            # contract's ids), which Rich would parse as markup.
+            table.add_row(
+                severity_style, issue.category, escape(issue.message), escape(issue.path or "")
+            )
 
         console.print(table)
     else:

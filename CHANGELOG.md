@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- `fluid validate --env <env> --strict` (on one contract or a whole workspace), `fluid
+  contract-validation --env <env> --strict` and `fluid test --env <env> --strict` (the
+  native engine; `--engine soda` does not read `--strict`) now fail when an overlay patch
+  lands on an entry that names another id (`overlay_patch_retargeted`), which an overlay
+  merged by position can do: a 0.7.5 or older contract, or a 0.7.6 base whose entries lack
+  unique ids. Without `--strict` these commands list it among their warnings (`fluid test`
+  as an "Environment overlay" row, `fluid validate --quiet` as a `WARNING:` line), and the
+  loader no longer also logs it there. Put the overlay's entries in the base's order, or
+  set `fluidVersion: "0.7.6"` with a unique id on every base entry, so overlays patch by
+  id. `overlay_entry_added` stays a log line and does not fail `--strict`. `fluid validate
+  <bundle>.tgz` does not see the warning: `fluid bundle --env` merged the overlay before,
+  so validate the contract file with `--env`.
+- `fluid validate --strict` now says `Validation failed: warnings treated as errors
+  (--strict)` when warnings alone fail it, after a summary that reads valid; with
+  `--quiet` it prints each such warning as `ERROR (--strict): <warning>`.
+- A product whose every build becomes `continuous` (or runs outside forge-cli) gets no
+  `schedule/` artifacts, so pipeline stage 11 skips `fluid schedule-sync`, and a DAG
+  deployed for it earlier stays in the scheduler: remove that DAG by hand.
+- An environment overlay cannot turn a scheduled build continuous: overlays cannot
+  delete the base's `cron` or `schedule`, which a continuous trigger refuses. Declare the
+  trigger in each environment's overlay instead of in the base.
+
+### Added
+
+- **`trigger.type: continuous` (0.7.6 preview).** A build whose job its platform keeps
+  running, such as an `engine: flink` job or a `kafka-connect` or `debezium` connector,
+  can say so: `execution.trigger: {type: continuous}`. No scheduler starts it: `fluid
+  generate schedule`, `fluid schedule-sync` and the `fluid apply` DAGs leave the build out,
+  where a connector used to get a nightly `0 2 * * *` task. A contract with no other build
+  has nothing to schedule. The schema refuses `cron`, `schedule`, `datasets`, `event` and
+  `timetable` next to it, as Databricks Jobs refuses a continuous trigger next to any
+  other, and the error names the field and the trigger type that takes it. It is not
+  Airflow's `@continuous`, which starts batch runs back to back. 0.7.5 is unchanged.
+  Declare it on a build that runs outside forge-cli or on a connector: the dbt and python
+  runners refuse it ("Unknown trigger type"), as they refuse `event` and `dataset`, and
+  `fluid scaffold-composer` still writes its nightly DAG for any contract.
+
+### Changed
+
+- A schema error from a `not: {required: [...]}` rule now reads `<field> is not allowed
+  here`, or the rule's own `description`, instead of quoting the whole object and the
+  subschema it must not match.
+
 ## [0.21.0] — 2026-10-19
 
 ### Upgrade notes

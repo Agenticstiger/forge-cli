@@ -72,17 +72,24 @@ def format_schema_error(error: Any) -> str:
     Every path that reports a FLUID-contract schema error formats it here
     (``fluid validate`` on a contract and on a bundle), so a secret pasted in
     place of a ``sink.catalogAuth`` variable name is not printed or saved.
+
+    A ``not: {required: [field]}`` rule, a field the object's ``type`` does not
+    take, reads as ``<field> is not allowed here``, or as the rule's own
+    ``description`` when it carries one: jsonschema's message would quote the
+    whole object and the subschema it must not match.
     """
+    value = error.validator_value
+    if error.validator == "not" and isinstance(value, dict) and list(value) == ["required"]:
+        why = error.schema.get("description") if isinstance(error.schema, dict) else None
+        if isinstance(why, str) and why:
+            return why
+        return f"{', '.join(map(str, value['required']))} is not allowed here"
     if not any(part in _UNQUOTED_VALUE_PATHS for part in error.absolute_path):
         return str(error.message)
     if error.validator in _KEY_ONLY_VALIDATORS:
         return str(error.message)
     if error.validator == "pattern":
         return f"does not match {error.validator_value!r} (value not shown)"
-    value = error.validator_value
-    if error.validator == "not" and isinstance(value, dict) and list(value) == ["required"]:
-        # ``not: {required: [field]}``: a field the object's ``type`` does not take.
-        return f"{', '.join(map(str, value['required']))} is not allowed here"
     if error.validator == "not" and isinstance(value, dict) and list(value) == ["pattern"]:
         # ``not: {pattern: ...}``: a token-shaped variable name, or a ``${``.
         return f"must not match {value['pattern']!r} (value not shown)"

@@ -38,6 +38,9 @@ hand-declares `orchestration.tasks` (those keep their declared operators). A
 build is left out when its own `execution.orchestration.engine` is `none` or
 not Airflow, or when its trigger is `event`, `dataset`,
 `schedule_and_dataset` or `timetable`, which a plain cron DAG cannot express.
+A build whose trigger is `continuous` (schema 0.7.6), or that runs outside
+forge-cli (`engine: flink`, `properties.language: flink_sql`), gets no DAG and no task
+at all: its platform keeps the job running.
 
 Layout, one directory per product:
 

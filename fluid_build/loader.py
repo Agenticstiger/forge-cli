@@ -15,12 +15,26 @@
 # fluid_build/loader.py
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Set, Tuple, Union
+from typing import (
+    AbstractSet,
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from fluid_build.util.ref_confinement import (
     REF_ROOT_ENV,
@@ -404,15 +418,66 @@ _NOTED_OVERLAY_MERGE_WARNINGS: Set[str] = set()
 _NOTED_OVERLAY_MERGE_WARNINGS_LOCK = threading.Lock()
 
 
+class OverlayWarning(NamedTuple):
+    """An overlay merge warning: its event name and its message."""
+
+    event: str
+    message: str
+
+
+#: Overlay warnings ``fluid validate`` and ``fluid contract-validation`` report
+#: as their own warnings, so that ``--strict`` fails on them: a positional patch
+#: that landed on another entry. ``overlay_entry_added`` is often intended (a
+#: build only prod runs) and ``--strict`` could not be silenced on it, so it
+#: stays a log line.
+STRICT_OVERLAY_WARNINGS = frozenset({"overlay_patch_retargeted"})
+
+#: The events and the list of the :func:`collect_overlay_warnings` block that
+#: is running, ``None`` outside one. A context variable, as
+#: ``warnings.catch_warnings`` is under Python 3.14's ``context_aware_warnings``,
+#: so a load in another thread or task does not add to this block's list.
+_OVERLAY_WARNING_SINK: contextvars.ContextVar[
+    Optional[Tuple[AbstractSet[str], List[OverlayWarning]]]
+] = contextvars.ContextVar("overlay_warning_sink", default=None)
+
+
+@contextlib.contextmanager
+def collect_overlay_warnings(
+    events: AbstractSet[str] = STRICT_OVERLAY_WARNINGS,
+) -> Iterator[List[OverlayWarning]]:
+    """Hand the overlay merge warnings named in ``events`` to the caller.
+
+    The loader logs its warnings, and a command's ``--strict`` reads its own
+    findings, never the log. Inside this block a warning named in ``events`` is
+    appended to the yielded list instead, once, and logged at DEBUG only: the
+    caller reports it, so the terminal does not show it twice. A warning the
+    block takes is not marked as said, so a later load outside a block still
+    logs it.
+    """
+    sink: List[OverlayWarning] = []
+    token = _OVERLAY_WARNING_SINK.set((events, sink))
+    try:
+        yield sink
+    finally:
+        _OVERLAY_WARNING_SINK.reset(token)
+
+
 def _warn_once(event: str, name: str, index: Optional[int], message: str, *args: Any) -> None:
     text = message % args
+    extra: Dict[str, Any] = {"event": event, "list": name}
+    if index is not None:
+        extra["index"] = index
+    collecting = _OVERLAY_WARNING_SINK.get()
+    if collecting is not None and event in collecting[0]:
+        warning = OverlayWarning(event, text)
+        if warning not in collecting[1]:
+            collecting[1].append(warning)
+        LOG.debug("%s", text, extra=extra)
+        return
     with _NOTED_OVERLAY_MERGE_WARNINGS_LOCK:
         if text in _NOTED_OVERLAY_MERGE_WARNINGS:
             return
         _NOTED_OVERLAY_MERGE_WARNINGS.add(text)
-    extra: Dict[str, Any] = {"event": event, "list": name}
-    if index is not None:
-        extra["index"] = index
     LOG.warning("%s", text, extra=extra)
 
 
