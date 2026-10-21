@@ -472,12 +472,20 @@ def bundle_overlay_warnings(source: Optional[Mapping[str, Any]]) -> List[str]:
     ``[]`` when it records none: a bundle built without ``--env``, one whose
     overlay merged cleanly, and one built before the record existed. Like the
     rest of the block it is outside the merkle root, a hint rather than bundle
-    content, so only the entries that are non-empty strings are read.
+    content: editing it keeps the digest. So only the entries that are
+    non-empty strings are read, and in each a character that is not printable
+    is escaped as ``repr`` writes it (``\\x1b``, ``\\n``, ``\\ud800``), as the
+    block's other values are quoted with ``!r``: printed, an edited entry
+    cannot move the terminal's cursor, forge a line or fail to encode.
     """
     recorded = source.get("overlayWarnings") if source else None
     if not isinstance(recorded, list):
         return []
-    return [warning for warning in recorded if isinstance(warning, str) and warning]
+    return [
+        "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in warning)
+        for warning in recorded
+        if isinstance(warning, str) and warning
+    ]
 
 
 #: An environment name as a MANIFEST may record it: a plain name, never a

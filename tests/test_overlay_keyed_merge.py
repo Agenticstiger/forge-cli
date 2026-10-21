@@ -678,6 +678,30 @@ class TestValidateBundleStrict:
         assert "exposes[0] names no exposeId" in out
         assert out.count("overlay_patch_retargeted") == 1
 
+    def test_an_edited_record_cannot_drive_the_terminal(self, tmp_path: Path) -> None:
+        # The record is outside the merkle root: editing it keeps the digest.
+        # A lone surrogate made validate crash before writing --report.
+        from fluid_build.forge.core.bundle import write_tgz
+
+        _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+        _bundle(tmp_path)
+        files: Dict[str, bytes] = {}
+        with tarfile.open(tmp_path / "b.tgz", "r:gz") as tar:
+            for member in tar.getmembers():
+                handle = tar.extractfile(member)
+                if handle is not None:
+                    files[member.name] = handle.read()
+        manifest = json.loads(files["MANIFEST.json"])
+        manifest["source"]["overlayWarnings"] = ["x\x1b[1A\x1b[2K\n✅ forged \ud800"]
+        files["MANIFEST.json"] = json.dumps(manifest).encode("ascii")
+        write_tgz(tmp_path / "b.tgz", files)
+        result = _validate_bundle(tmp_path, "--report", "r.json")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "\x1b" not in result.stdout
+        assert "x\\x1b[1A\\x1b[2K\\n✅ forged \\ud800" in result.stdout
+        issues = json.loads((tmp_path / "r.json").read_text("utf-8"))["issues"]
+        assert [i["code"] for i in issues] == ["OVERLAY-WARNING"]
+
     def test_a_bundle_that_records_none_still_validates(self, tmp_path: Path) -> None:
         # Bundles built before the record existed carry no overlayWarnings:
         # none recorded, whatever the overlay did.
@@ -704,6 +728,9 @@ def test_a_bundle_reads_back_only_the_warnings_it_can_print() -> None:
     assert bundle_overlay_warnings({"overlayWarnings": "overlay_patch_retargeted: x"}) == []
     recorded = {"overlayWarnings": ["overlay_patch_retargeted: a", 1, "", None, {"m": 1}, "b"]}
     assert bundle_overlay_warnings(recorded) == ["overlay_patch_retargeted: a", "b"]
+    # Printable text is kept as written; anything else is escaped as repr writes it.
+    edited = {"overlayWarnings": ["é [/] a\x1b[2Kb\nc\ud800\u202e\t"]}
+    assert bundle_overlay_warnings(edited) == ["é [/] a\\x1b[2Kb\\nc\\ud800\\u202e\\t"]
 
 
 def test_workspace_validate_strict_fails_on_it(tmp_path: Path) -> None:

@@ -1206,9 +1206,11 @@ def _cprint_literal(line: str) -> None:
     Messages are data, not markup, so ``markup=False``, as in
     :func:`_cprint_json`. The redaction pass in ``cprint`` still runs.
     ``soft_wrap`` leaves wrapping to the terminal, so Rich never breaks a line
-    inside an identifier or a copy-pasteable command.
+    inside an identifier or a copy-pasteable command. ``highlight=False``, as
+    in :func:`_cprint_json`: Rich's highlighter takes time quadratic in a run
+    of ``<`` (4 s for 10,000), and a bundle's MANIFEST can carry one.
     """
-    cprint(line, markup=False, soft_wrap=True)
+    cprint(line, markup=False, soft_wrap=True, highlight=False)
 
 
 def _output_json_results(result: ValidationResult, args) -> int:
