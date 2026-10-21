@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A product whose every build becomes `continuous` (or runs outside forge-cli) gets no
   `schedule/` artifacts, so pipeline stage 11 skips `fluid schedule-sync`, and a DAG
   deployed for it earlier stays in the scheduler: remove that DAG by hand.
+- `fluid scaffold-composer` writes no DAG for a contract whose every build runs outside
+  forge-cli (`engine: flink`, `properties.language: flink_sql`) or continuously, where it
+  used to write one. A DAG it wrote for such a contract before stays in `--out-dir`, which
+  the command names, and in Cloud Composer if you deployed it: delete both.
 - An environment overlay cannot turn a scheduled build continuous: overlays cannot
   delete the base's `cron` or `schedule`, which a continuous trigger refuses. Declare the
   trigger in each environment's overlay instead of in the base.
@@ -61,15 +65,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `timetable` next to it, as Databricks Jobs refuses a continuous trigger next to any
   other, and the error names the field and the trigger type that takes it. It is not
   Airflow's `@continuous`, which starts batch runs back to back. 0.7.5 is unchanged.
-  Declare it on a build that runs outside forge-cli or on a connector: the dbt and python
-  runners refuse it ("Unknown trigger type"), as they refuse `event` and `dataset`, and
-  `fluid scaffold-composer` still writes its nightly DAG for any contract.
+  Declare it on a build that runs outside forge-cli or on a connector: on a build forge-cli
+  runs as a batch run, `fluid validate` warns and `--strict` fails. The dbt and python
+  runners refuse the trigger and say why, and an inline-SQL build or a `duckdb`, `airbyte`,
+  `meltano` or `dlt` acquisition runs once per `fluid apply`. A `spark`, `glue` or `custom`
+  build gets no warning: forge-cli has no runner of its own for it, and its platform may
+  keep it running.
 
 ### Changed
 
 - A schema error from a `not: {required: [...]}` rule now reads `<field> is not allowed
   here`, or the rule's own `description`, instead of quoting the whole object and the
   subschema it must not match.
+- `fluid scaffold-composer` takes the DAG's cron from the first build a scheduler starts,
+  so a Flink job's own cron no longer schedules it, and writes no DAG for a contract whose
+  every build runs outside forge-cli or continuously, as `fluid generate schedule` writes
+  no files for one.
 
 ### Fixed
 
