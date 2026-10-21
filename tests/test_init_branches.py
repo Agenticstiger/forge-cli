@@ -312,36 +312,75 @@ class TestRunFunction:
 
 
 class TestGenerateDagForProject:
-    @patch("subprocess.run")
-    def test_dag_generation_success(self, mock_run, tmp_path):
+    # ``orchestration.tasks`` makes the contract one that schedules something.
+    CONTRACT = {"name": "test-product", "orchestration": {"tasks": [{"taskId": "t"}]}}
+    RUN = "fluid_build.cli._init_dag_helpers._run_generate_schedule"
+
+    @staticmethod
+    def _project(tmp_path, contract):
+        """A project holding *contract* (JSON is YAML), as the helper reads it from disk."""
+        import json
+
+        (tmp_path / "contract.fluid.yaml").write_text(json.dumps(contract))
+        return tmp_path
+
+    def test_dag_generation_success(self, tmp_path):
         from fluid_build.cli.init import generate_dag_for_project
 
-        mock_run.return_value = MagicMock(returncode=0)
-        contract = {"name": "test-product", "orchestration": {"schedule": "@daily"}}
-        mock_console = MagicMock()
-        result = generate_dag_for_project(
-            tmp_path, contract, logging.getLogger("test"), mock_console
-        )
-        assert result is True
+        def write_dag(project_dir, dag_dir, logger):  # what ``fluid generate schedule`` writes
+            dag_dir.mkdir()
+            (dag_dir / "p_dag.py").write_text("DAG(dag_id='p', schedule='@daily')\n")
+            return 0
 
-    @patch("subprocess.run")
-    def test_dag_generation_fallback(self, mock_run, tmp_path):
+        with patch(self.RUN, side_effect=write_dag):
+            result = generate_dag_for_project(
+                self._project(tmp_path, self.CONTRACT),
+                self.CONTRACT,
+                logging.getLogger("test"),
+                MagicMock(),
+            )
+        assert result is True
+        assert "`p_dag.py`" in (tmp_path / "dags" / "README.md").read_text()
+
+    def test_dag_generation_writes_nothing_when_nothing_is_scheduled(self, tmp_path):
         from fluid_build.cli.init import generate_dag_for_project
 
-        mock_run.return_value = MagicMock(returncode=1)
-        contract = {"name": "test-product"}
-        mock_console = MagicMock()
-        result = generate_dag_for_project(
-            tmp_path, contract, logging.getLogger("test"), mock_console
-        )
-        assert result is True
+        with patch(self.RUN) as run:
+            result = generate_dag_for_project(
+                self._project(tmp_path, {"name": "test-product"}),
+                {"name": "test-product"},
+                logging.getLogger("test"),
+                MagicMock(),
+            )
+        assert result is False
+        run.assert_not_called()
+        assert not (tmp_path / "dags").exists()
+
+    def test_dag_generation_refused_writes_no_dag(self, tmp_path):
+        from fluid_build.cli.init import generate_dag_for_project
+
+        with (
+            patch(self.RUN, return_value=1),
+            patch("fluid_build.cli.init.create_basic_dag") as basic,
+        ):
+            result = generate_dag_for_project(
+                self._project(tmp_path, self.CONTRACT),
+                self.CONTRACT,
+                logging.getLogger("test"),
+                MagicMock(),
+            )
+        assert result is False
+        basic.assert_not_called()
+        assert not (tmp_path / "dags").exists()
 
     def test_dag_generation_exception(self, tmp_path):
         from fluid_build.cli.init import generate_dag_for_project
 
-        contract = {"name": "test-product"}
-        with patch("subprocess.run", side_effect=FileNotFoundError("no fluid")):
+        with patch(self.RUN, side_effect=OSError("disk full")):
             result = generate_dag_for_project(
-                tmp_path, contract, logging.getLogger("test"), MagicMock()
+                self._project(tmp_path, self.CONTRACT),
+                self.CONTRACT,
+                logging.getLogger("test"),
+                MagicMock(),
             )
             assert result is False

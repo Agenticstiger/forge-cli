@@ -192,6 +192,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retries a stub cannot pass, until the function is written. A callable whose name the DAG
   already uses (`dag`, an operator class, an earlier task) or a `__dunder__` name is refused
   with a `ValueError` when the DAG is generated.
+- **The `fluid init` DAG helper writes what `fluid generate schedule` writes, or nothing.**
+  `generate_dag_for_project` ran `fluid generate-airflow --output-dir`, a flag that command
+  does not have, so it always wrote a basic validate/plan/apply DAG, or no DAG when `fluid`
+  was not on PATH. It now runs `fluid generate schedule --scheduler airflow --overwrite`
+  in-process through the CLI's own parser, and its `dags/README.md` names the DAGs that run
+  wrote and says to edit the contract, not the DAG. It writes no DAG, and says why, when the
+  contract schedules nothing (no build with a cron trigger and no `orchestration.tasks`, as
+  with customer-360's `manual` build) or when the command refuses the contract, an invalid
+  cron for instance, instead of a basic DAG on a schedule the contract never declared.
+  `create_basic_dag`, no longer a fallback, passes `fluid apply --yes` instead of the
+  rejected `--auto-approve` and quotes the project path. No CLI command reaches the helper
+  with DAGs enabled today: `fluid demo` turns them off.
 
 ## [0.21.0] — 2026-10-19
 

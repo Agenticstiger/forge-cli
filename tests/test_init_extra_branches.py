@@ -498,36 +498,56 @@ class TestRun:
 
 
 class TestGenerateDagForProject:
+    # A build with a cron trigger makes the contract one that schedules something.
+    CONTRACT = {
+        "name": "ok-dag",
+        "builds": [{"id": "b", "execution": {"trigger": {"type": "schedule", "cron": "@hourly"}}}],
+    }
+    RUN = "fluid_build.cli._init_dag_helpers._run_generate_schedule"
+
+    @staticmethod
+    def _project(tmp_path, contract):
+        """A project holding *contract* (JSON is YAML), as the helper reads it from disk."""
+        import json
+
+        (tmp_path / "contract.fluid.yaml").write_text(json.dumps(contract))
+        return tmp_path
+
     @patch("fluid_build.cli.init.RICH_AVAILABLE", False)
-    @patch("fluid_build.cli.init.create_dags_readme")
     @patch("fluid_build.cli.init.create_basic_dag")
-    def test_subprocess_failure_creates_basic(self, mock_basic, _mock_readme, tmp_path, logger):
+    def test_refused_contract_writes_no_basic_dag(self, mock_basic, tmp_path, logger):
         from fluid_build.cli.init import generate_dag_for_project
 
-        contract = {"name": "test-dag"}
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1)
-            result = generate_dag_for_project(tmp_path, contract, logger, None)
-        assert result is True
-        mock_basic.assert_called_once()
+        with patch(self.RUN, return_value=2):
+            result = generate_dag_for_project(
+                self._project(tmp_path, self.CONTRACT), self.CONTRACT, logger, None
+            )
+        assert result is False
+        mock_basic.assert_not_called()
 
     @patch("fluid_build.cli.init.RICH_AVAILABLE", False)
-    @patch("fluid_build.cli.init.create_dags_readme")
-    def test_subprocess_success(self, _mock_readme, tmp_path, logger):
+    def test_success(self, tmp_path, logger):
         from fluid_build.cli.init import generate_dag_for_project
 
-        contract = {"name": "ok-dag", "orchestration": {"schedule": "@hourly"}}
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            result = generate_dag_for_project(tmp_path, contract, logger, None)
+        def write_dag(project_dir, dag_dir, logger):  # what ``fluid generate schedule`` writes
+            dag_dir.mkdir()
+            (dag_dir / "ok_dag_dag.py").write_text("DAG(dag_id='ok_dag')\n")
+            return 0
+
+        with patch(self.RUN, side_effect=write_dag):
+            result = generate_dag_for_project(
+                self._project(tmp_path, self.CONTRACT), self.CONTRACT, logger, None
+            )
         assert result is True
 
     @patch("fluid_build.cli.init.RICH_AVAILABLE", False)
     def test_exception_returns_false(self, tmp_path, logger):
         from fluid_build.cli.init import generate_dag_for_project
 
-        with patch("subprocess.run", side_effect=OSError("no subprocess")):
-            result = generate_dag_for_project(tmp_path, {}, logger, None)
+        with patch(self.RUN, side_effect=OSError("disk full")):
+            result = generate_dag_for_project(
+                self._project(tmp_path, self.CONTRACT), self.CONTRACT, logger, None
+            )
         assert result is False
 
 
