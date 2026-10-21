@@ -356,7 +356,7 @@ class TestLocalProviderOutputFormat:
         assert Path(out_path).exists(), "parquet file must exist after apply"
         # Confirm it's readable parquet
         con = duckdb.connect(":memory:")
-        rows = con.sql(f"SELECT COUNT(*) FROM read_parquet({out_path!r})").fetchone()[0]
+        rows = con.sql(f"SELECT COUNT(*) FROM read_parquet({out_path!r})").fetchall()[0][0]
         assert rows >= 1
 
 

@@ -1154,11 +1154,10 @@ def _with_extension(name: str) -> Any:
         ) from exc
 
 
-def test_a_loaded_sqlite_scanner_is_not_bounded_by_the_allowlist(tmp_path):
-    """Pins a documented limit: once ``sqlite`` is loaded, any SQLite file the
-    process can read is reachable, whatever the allowlist says. A call site that
-    loads it must keep contract SQL off the connection."""
-    db = tmp_path / "elsewhere.sqlite"
+_DUCKDB_2 = sandbox.duckdb_version(duckdb) >= (2, 0, 0)
+
+
+def _seed_sqlite(db: Path) -> None:
     seed = duckdb.connect()
     try:
         seed.execute("INSTALL sqlite; LOAD sqlite")
@@ -1168,8 +1167,50 @@ def test_a_loaded_sqlite_scanner_is_not_bounded_by_the_allowlist(tmp_path):
     seed.execute(f"CREATE TABLE s.t AS SELECT '{SECRET}' AS v")
     seed.close()
 
+
+@pytest.mark.skipif(_DUCKDB_2, reason="DuckDB 2.0 bounds the sqlite scanner (next test)")
+def test_a_loaded_sqlite_scanner_is_not_bounded_by_the_allowlist(tmp_path):
+    """Pins a documented limit through DuckDB 1.5: once ``sqlite`` is loaded,
+    any SQLite file the process can read is reachable, whatever the allowlist
+    says. A call site that loads it must keep contract SQL off the connection."""
+    db = tmp_path / "elsewhere.sqlite"
+    _seed_sqlite(db)
+
     con = _with_extension("sqlite")
     assert con.execute(f"SELECT v FROM sqlite_scan('{db}', 't')").fetchall() == [(SECRET,)]
+
+
+@pytest.mark.skipif(not _DUCKDB_2, reason="through DuckDB 1.5 the scanner is unbounded")
+def test_from_duckdb_2_a_loaded_sqlite_scanner_is_bounded_by_the_allowlist(tmp_path):
+    """DuckDB 2.0's sqlite scanner opens files through DuckDB's file system, so
+    the allowlist bounds it as it bounds ``read_csv``: a file outside, ``./..``
+    out of an allowed directory and a symlink out of one are each refused,
+    while a file inside is read. The engine still keeps contract SQL off a
+    connection that loads a scanner (``postgres`` stays unbounded)."""
+    inside, outside = tmp_path / "allowed", tmp_path / "outside"
+    inside.mkdir()
+    outside.mkdir()
+    _seed_sqlite(outside / "x.sqlite")
+    _seed_sqlite(inside / "x.sqlite")
+    (inside / "link.sqlite").symlink_to(outside / "x.sqlite")
+
+    try:
+        con = secure_duckdb_connect(
+            allow=DuckDBAllowlist.none().with_dirs(inside), extensions=["sqlite"]
+        )
+    except duckdb.Error as exc:
+        raise pytest.skip.Exception("the sqlite extension is not installable here") from exc
+    assert con.execute(f"SELECT v FROM sqlite_scan('{inside}/x.sqlite', 't')").fetchall() == [
+        (SECRET,)
+    ]
+    for refused in (
+        f"SELECT v FROM sqlite_scan('{outside}/x.sqlite', 't')",
+        f"SELECT v FROM sqlite_scan('{inside}/./../outside/x.sqlite', 't')",
+        f"SELECT v FROM sqlite_scan('{inside}/link.sqlite', 't')",
+        f"ATTACH '{outside}/x.sqlite' AS o (TYPE sqlite)",
+    ):
+        with pytest.raises(duckdb.PermissionException):
+            con.execute(refused).fetchall()
 
 
 def test_a_loaded_postgres_scanner_is_not_bounded_by_the_allowlist():

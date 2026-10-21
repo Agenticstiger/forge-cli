@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- forge-cli runs on DuckDB 2.x as well as 1.5.x (`duckdb>=1.5.0`, no ceiling; DuckDB 2.0
+  needs Python 3.11, so a Python 3.10 install stays on 1.5.x). On 2.x, a DuckDB database
+  file forge-cli creates (`fluid init`'s `.fluid/db.duckdb`, the local provider's
+  session and `persist` databases, an acquisition's DuckDB destination) is written in
+  DuckDB 1.5's storage format, so a 1.5 install can still open it; a file that already
+  exists keeps its format. DuckDB 2.x's own default format cannot be read by 1.5: a file
+  another 2.x tool created needs every process that opens it on 2.x, or an `EXPORT
+  DATABASE` on 2.x and an `IMPORT DATABASE` on 1.5.
 - `fluid validate --env <env> --strict` (on one contract or a whole workspace), `fluid
   contract-validation --env <env> --strict` and `fluid test --env <env> --strict` (the
   native engine; `--engine soda` does not read `--strict`) now fail when an overlay patch
@@ -51,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A schema error from a `not: {required: [...]}` rule now reads `<field> is not allowed
   here`, or the rule's own `description`, instead of quoting the whole object and the
   subschema it must not match.
+
+### Fixed
+
+- **DuckDB 2.0.** `fluid verify` reported every local file as `error` ("Relations no
+  longer have fetchone()"); `fluid apply`'s local SQL and materialize steps and
+  `contract_tests` actions lost their row counts (a materialize step logged
+  `local_materialize_fallback`, a `contract_tests` action reported `-1` rows). DuckDB 2.0
+  relations have no `fetchone()`, and a query result keeps its connection busy until it
+  is read to the end, which fails the next step on that connection. Every DuckDB result
+  is now read to the end, the same way on 1.5.x and 2.x.
 
 ## [0.21.0] — 2026-10-19
 

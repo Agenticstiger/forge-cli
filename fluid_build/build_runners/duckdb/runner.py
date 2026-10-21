@@ -57,6 +57,7 @@ from fluid_build.api.runner import (
 )
 from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.source import AcquisitionMode
+from fluid_build.providers._duckdb_compat import first_row
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
     confine_declared,
@@ -1253,9 +1254,9 @@ def _persist_cursor_after_run(
     quoted_path = quote_ansi_string_literal(out_path)
     con = _connect_for_destination(ctx)
     try:
-        row = con.execute(
-            f"SELECT MAX({cursor_field_safe}) FROM {reader}({quoted_path})"
-        ).fetchone()
+        row = first_row(
+            con.execute(f"SELECT MAX({cursor_field_safe}) FROM {reader}({quoted_path})")
+        )
     finally:
         con.close()
     new_value = row[0] if row is not None else None
@@ -1409,14 +1410,14 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 # select re-reads the source, which a live database may have
                 # changed since, and a table holding exactly what the COPY
                 # wrote then failed verify against the larger number.
-                written = con.execute(copy_sql).fetchone()
+                written = first_row(con.execute(copy_sql))
                 if written is not None and isinstance(written[0], int):
                     n = written[0]
                 else:
                     counted_at_write = False
                     # Best-effort via COUNT on the same select.
                     try:
-                        row = con.execute(f"SELECT COUNT(*) FROM ({landed_sel})").fetchone()
+                        row = first_row(con.execute(f"SELECT COUNT(*) FROM ({landed_sel})"))
                         n = row[0] if row is not None else 0
                     except Exception:
                         n = 0
@@ -1857,7 +1858,7 @@ def _artifact_exists(con: Any, path: str, reader: str) -> bool:
     if not _is_remote_uri(path):
         return Path(path).exists()
     try:
-        con.execute(f"SELECT 1 FROM {reader}({quote_ansi_string_literal(path)}) LIMIT 1").fetchone()
+        first_row(con.execute(f"SELECT 1 FROM {reader}({quote_ansi_string_literal(path)}) LIMIT 1"))
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -1944,9 +1945,9 @@ def _count_file_rows(path: str, sink_format: str) -> int:
     ]
     con = secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none().with_paths(path))
     try:
-        row = con.execute(
-            f"SELECT COUNT(*) FROM {reader}({quote_ansi_string_literal(path)})"
-        ).fetchone()
+        row = first_row(
+            con.execute(f"SELECT COUNT(*) FROM {reader}({quote_ansi_string_literal(path)})")
+        )
     finally:
         con.close()
     return int(row[0]) if row else 0

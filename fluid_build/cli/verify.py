@@ -960,6 +960,7 @@ def _verify_local_file(
 
     # Introspect with DuckDB.
     try:
+        from fluid_build.providers._duckdb_compat import first_row
         from fluid_build.providers._duckdb_sandbox import (
             DuckDBAllowlist,
             secure_duckdb_connect,
@@ -979,7 +980,7 @@ def _verify_local_file(
             relation_sql = f"SELECT * FROM read_csv_auto({literal})"
         rel = con.sql(relation_sql)
 
-        row_count = rel.aggregate("count(*)").fetchone()[0]
+        row_count = first_row(rel.aggregate("count(*)"))[0]
         actual_columns = [col for col in rel.columns]
         # Did the columns policy.privacy.masking names land treated? Counts only:
         # a value that fails the check is cleartext and stays out of the report.

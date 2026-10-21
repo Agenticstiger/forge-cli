@@ -26,6 +26,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from fluid_build.providers._duckdb_compat import first_row
 from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.providers.quality_engine import (
@@ -175,7 +176,7 @@ class LocalValidationProvider(ValidationProvider):
                     fields: List[FieldSchema] = []
                     for row in rows:
                         fields.append(FieldSchema(name=row[0], type=row[1], mode="NULLABLE"))
-                    count_row = conn.execute(f"SELECT COUNT(*) FROM {table_ref}").fetchone()
+                    count_row = first_row(conn.execute(f"SELECT COUNT(*) FROM {table_ref}"))
                     row_count = count_row[0] if count_row else None
                     size_bytes = path.stat().st_size
                     conn.close()
@@ -219,7 +220,7 @@ class LocalValidationProvider(ValidationProvider):
                 count_sql = "SELECT COUNT(*) FROM {fn}({p})".format(
                     fn=read_fn, p=quote_ansi_string_literal(abs_path)
                 )
-                count_row = conn.execute(count_sql).fetchone()
+                count_row = first_row(conn.execute(count_sql))
                 row_count = count_row[0] if count_row else None
 
                 # File size

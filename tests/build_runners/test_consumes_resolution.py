@@ -1131,7 +1131,7 @@ def test_the_high_value_churn_example_builds_as_it_did_before_consumes_resolved(
     )
     assert run_builds_from_args(args, logging.getLogger("t")) == 0, printed
     out = copy / "output" / "high_value_churn.parquet"
-    assert duckdb.sql(f"SELECT COUNT(*) FROM '{out}'").fetchone()[0] > 0
+    assert duckdb.sql(f"SELECT COUNT(*) FROM '{out}'").fetchall()[0][0] > 0
     assert any(
         "consumes bronze.local.high_value_customers_v1/hv_customers" in line
         and "lineage only" in line
