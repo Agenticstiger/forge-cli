@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- `fluid validate --env <env> --strict` and `fluid contract-validation --env <env>
+  --strict` now fail when an overlay patch lands on an entry that names another id
+  (`overlay_patch_retargeted`), which a 0.7.5 or older contract, merged by position, can
+  do. Without `--strict` both commands list it under their warnings, and the loader no
+  longer also logs it there. Put the overlay's entries in the base's order, or set
+  `fluidVersion: "0.7.6"` so overlays patch by id. `overlay_entry_added` stays a log line
+  and does not fail `--strict`. `fluid validate <bundle>.tgz` does not see the warning:
+  `fluid bundle --env` merged the overlay before, so validate the contract file with
+  `--env`.
+
+### Added
+
+- **`trigger.type: continuous` (0.7.6 preview).** A build whose job its platform keeps
+  running, such as an `engine: flink` job or a `kafka-connect` or `debezium` connector,
+  can say so: `execution.trigger: {type: continuous}`. No scheduler starts it: `fluid
+  generate schedule`, `fluid schedule-sync` and the `fluid apply` DAGs leave the build out,
+  where a connector used to get a nightly `0 2 * * *` task. A contract with no other build
+  has nothing to schedule. The schema refuses `cron`, `schedule`, `datasets`, `event` and
+  `timetable` next to it, as Databricks Jobs refuses a continuous trigger next to any
+  other, and the error names the field and the trigger type that takes it. It is not
+  Airflow's `@continuous`, which starts batch runs back to back. 0.7.5 is unchanged.
+
+### Changed
+
+- A schema error from a `not: {required: [...]}` rule now reads `<field> is not allowed
+  here`, or the rule's own `description`, instead of quoting the whole object and the
+  subschema it must not match.
+
 ## [0.21.0] — 2026-10-19
 
 ### Upgrade notes
