@@ -77,6 +77,28 @@ class TestHelpers:
         captured = capsys.readouterr()
         assert "something broke" in captured.err
 
+    def test_error_prints_markup_shaped_text_literally(self, capsys):
+        # The ``[red]`` wrapper made a ``[/]`` raise MarkupError and ate ``[orders]``.
+        message = "[/] exposes[orders] ^[a-z0-9]+$ [bold]x[/bold] C:\\work\\"
+        error(message)
+        assert f"❌ {message}\n" in capsys.readouterr().err
+
+    def test_error_still_redacts_secrets(self, capsys):
+        error("connect failed [/] password=hunter2")
+        err = capsys.readouterr().err
+        assert "password=<redacted>" in err
+        assert "hunter2" not in err
+
+    def test_error_spells_out_terminal_control_characters(self, capsys, monkeypatch):
+        # A terminal: Rich writes its own colour codes, but none from the message.
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        error("A\x1b[2J\x1b]8;;http://evil.example/\x1b\\B \x9b31m\r\nnext line")
+        err = capsys.readouterr().err
+        assert "\x1b[2J" not in err and "\x1b]8;;" not in err and "\x9b" not in err
+        assert "A\\x1b[2J\\x1b]8;;http://evil.example/\\x1b\\B \\x9b31m" in err
+        # A CRLF line break still breaks the line; Rich drops the CR.
+        assert "\r" not in err and "next line" in err
+
     def test_heading(self, capsys):
         heading("My Section")
         captured = capsys.readouterr()

@@ -44,6 +44,7 @@ from fluid_build._console import (
     heading,
     hint,
     info,
+    literal_text,
     success,
     warning,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "heading",
     "hint",
     "info",
+    "literal_text",
     "success",
     "warning",
 ]

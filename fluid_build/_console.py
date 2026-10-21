@@ -39,6 +39,7 @@ from typing import Any
 
 try:
     from rich.console import Console as RichConsole
+    from rich.text import Text as RichText
 
     RICH_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -58,6 +59,28 @@ _RICH_TAG_PATTERN = re.compile(r"\[/?[a-z_ ]+\]")
 _SECRET_OUTPUT_PATTERN = re.compile(
     r"(?i)\b(password|passphrase|token|secret|api[_ -]?key)\b(\s*[:=]\s*)([^\s,;]+)"
 )
+# The control characters (Unicode Cc) a terminal acts on: ESC opens an escape
+# sequence, and the C1 range holds the one-byte CSI and OSC. Printed raw, a contract
+# value or an exception message could clear the screen, retitle the window or show a
+# link that opens another URL. Tab and line feed stay. Carriage return is left to
+# Rich, which drops it, so CRLF text reads normally.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _show_controls(text: str) -> str:
+    """``text`` with each control character spelled ``\\xNN`` instead of sent to the terminal."""
+    return _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
+def literal_text(text: Any, style: str = "") -> RichText:
+    """``text`` as a Rich ``Text``: printed as written, control characters spelled out.
+
+    For data a renderer quotes back, such as a contract value or an exception message.
+    Rich parses a ``str`` as markup, so a lowercase ``[word]`` vanishes and ``[/]``
+    raises ``MarkupError``. ``rich.markup.escape`` is no substitute: it doubles a
+    trailing backslash when no tag follows it. Rich must be installed.
+    """
+    return RichText(_show_controls(str(text)), style=style)
 
 
 def _redact_str(value: str) -> str:
@@ -178,13 +201,21 @@ def warning(msg: str) -> None:
 
 
 def error(msg: str) -> None:
-    """Error message (red ❌) – written to *stderr*."""
+    """Error message (red ❌) – written to *stderr*.
+
+    ``msg`` is printed literally, never parsed as Rich markup. An error
+    quotes data: a contract id, a schema ``pattern``, an exception message.
+    Wrapped in ``[red]...[/red]``, a lowercase ``[word]`` in it vanished and
+    a ``[/]`` raised ``MarkupError``, which escaped the CLI's last-resort
+    handler as a traceback because that handler reports through this
+    function. Control characters are spelled out (see :func:`literal_text`).
+    """
     # Funnel through the typed ``_redact_str`` sanitiser so CodeQL
     # recognises the sink path is sanitised on every branch.
-    safe_msg = _redact_str(str(msg))
+    safe_msg = _redact_str(_show_controls(str(msg)))
     if RICH_AVAILABLE:
         _err_console = RichConsole(stderr=True)
-        _err_console.print(f"[red]❌ {safe_msg}[/red]")
+        _err_console.print(RichText(f"❌ {safe_msg}", style="red"))
     else:
         print(f"❌ {safe_msg}", file=sys.stderr)
 

@@ -379,3 +379,76 @@ def test_fluid_cli_error_format_for_user_prints_brackets_literally():
     assert "exposes[orders] names [bold]nothing[/bold]" in out
     assert "data-product-forge[gcp]" in out
     assert "C:\\\\work\\\\'" in out or "C:\\work\\" in out
+
+
+# ---------------------------------------------------------------------------
+# main(): the generic handlers, which report an exception's own text
+# ---------------------------------------------------------------------------
+
+# ``[/]`` closes whatever tag is open, so inside a ``[red]...[/red]`` wrapper (or
+# a report's own ``[bold]`` header) it left the real closing tag unmatched, and
+# Rich raised MarkupError. A JSON Schema pattern lost its character classes.
+MESSAGE = f"[/] {MARKUP_LIKE} ^[a-z0-9]+$"
+# Escape sequences a terminal acts on: clear the screen, a link that opens another
+# URL, and the one-byte CSI. Rich never writes any of them for its own styles.
+ESCAPES = "\x1b[2J\x1b]8;;http://evil.example/\x1b\\click\x1b]8;;\x1b\\ \x9b31m"
+
+
+def _reaches_the_terminal(stream: str) -> bool:
+    return any(seq in stream for seq in ("\x1b[2J", "\x1b]8;;", "\x9b"))
+
+
+def test_unexpected_error_prints_its_message_verbatim(monkeypatch, capsys):
+    """``[red]{e}[/red]`` raised MarkupError on ``[/]``; the fallback then died on it too."""
+    _raise_from_command(monkeypatch, ValueError(MESSAGE))
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    assert rc == 2
+    assert f"❌ Unexpected error: {MESSAGE}" in _unwrapped(capsys.readouterr().out)
+
+
+def test_debug_traceback_prints_the_message_verbatim(monkeypatch, capsys):
+    _raise_from_command(monkeypatch, ValueError(MESSAGE))
+
+    rc = cli_mod.main(["--debug", "validate", "unused.fluid.yaml"])
+
+    assert rc == 2
+    assert f"ValueError: {MESSAGE}" in _unwrapped(capsys.readouterr().out)
+
+
+def test_provider_error_prints_its_message_verbatim(monkeypatch, capsys):
+    _raise_from_command(monkeypatch, cli_mod.ProviderError(MESSAGE))
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    assert rc == 1
+    assert f"❌ Provider error: {MESSAGE}" in _unwrapped(capsys.readouterr().out)
+
+
+def test_last_resort_handler_prints_its_message_verbatim(monkeypatch, capsys):
+    """The outer fallback reports through ``console_error``, which wrapped it in ``[red]``."""
+
+    def _fail(self):
+        raise RuntimeError(MESSAGE)
+
+    monkeypatch.setattr(cli_mod.ProductionCLI, "setup_production_environment", _fail)
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    assert rc == 2
+    assert f"❌ CLI initialization failed: {MESSAGE}" in _unwrapped(capsys.readouterr().err)
+
+
+def test_unexpected_error_spells_out_control_characters(monkeypatch, capsys):
+    """A highlighted ``str`` broke these sequences up by accident; a ``Text`` is not highlighted."""
+    monkeypatch.setenv("FORCE_COLOR", "1")  # a terminal
+    monkeypatch.setenv("COLUMNS", "400")
+    _raise_from_command(monkeypatch, ValueError(ESCAPES))
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert not _reaches_the_terminal(out)
+    assert "Unexpected error: \\x1b[2J\\x1b]8;;http://evil.example/" in out

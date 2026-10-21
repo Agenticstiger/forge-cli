@@ -389,47 +389,35 @@ def run(args, logger: logging.Logger) -> int:
         duration = time.time() - start_time
         log_operation_failure(logger, "validate_contract", error=e.event, duration=duration)
 
-        # ``console_error`` wraps its text in ``[red]...[/red]`` markup, so every
-        # value echoed into it is escaped first: a path or message holding a
-        # lowercase ``[word]`` would otherwise lose it (see ``_cprint_literal``).
-        from rich.markup import escape
-
-        # Handle specific CLI errors with user-friendly messages
+        # Handle specific CLI errors with user-friendly messages. ``console_error``
+        # prints its text literally, so no value needs escaping first.
         if e.event == "version_below_minimum":
             if not args.quiet:
                 console_error(
-                    escape(
-                        f"Contract version {e.context.get('version')} does not meet minimum requirement {e.context.get('constraint')}"
-                    )
+                    f"Contract version {e.context.get('version')} does not meet minimum requirement {e.context.get('constraint')}"
                 )
         elif e.event == "version_above_maximum":
             if not args.quiet:
                 console_error(
-                    escape(
-                        f"Contract version {e.context.get('version')} exceeds maximum allowed {e.context.get('constraint')}"
-                    )
+                    f"Contract version {e.context.get('version')} exceeds maximum allowed {e.context.get('constraint')}"
                 )
         elif e.event == "contract_file_not_found":
             if not args.quiet:
-                console_error(escape(f"Contract file not found: {e.context.get('path')}"))
+                console_error(f"Contract file not found: {e.context.get('path')}")
         elif e.event == "contract_version_unsupported":
             if not args.quiet:
                 console_error(
-                    escape(
-                        str(
-                            e.context.get(
-                                "message",
-                                f"Unsupported contract version: {e.context.get('version')}",
-                            )
-                        )
+                    e.context.get(
+                        "message",
+                        f"Unsupported contract version: {e.context.get('version')}",
                     )
                 )
         elif e.event == "contract_required":
             if not args.quiet:
-                console_error(escape(f"{e.context.get('message', 'Contract file is required')}"))
+                console_error(f"{e.context.get('message', 'Contract file is required')}")
         else:
             if not args.quiet:
-                console_error(escape(f"Validation error: {e.event}"))
+                console_error(f"Validation error: {e.event}")
                 if e.context:
                     for key, value in e.context.items():
                         _cprint_literal(f"   {key}: {value}")
