@@ -225,6 +225,12 @@ CONTINUOUS_REMEDY = (
 #: other runner here runs a build to completion, a batch run.
 STREAMING_ACQUISITION_ENGINES = frozenset({"kafka-connect", "debezium"})
 
+#: Engines whose job can run on a platform the build names in
+#: ``execution.runtime.platform``, such as a Spark or Glue streaming job on
+#: Databricks or AWS Glue. Without such a platform the python runner runs the
+#: build's script locally, as for any engine without a runner of its own.
+PLATFORM_RUN_ENGINES = frozenset({"spark", "glue", "custom"})
+
 
 def _batch_runner_for(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
     """``(builds, refusing_runner)`` when :func:`run_builds_from_args` runs the
@@ -235,11 +241,15 @@ def _batch_runner_for(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str
     them; inline SQL and the duckdb, airbyte, meltano and dlt runners run the
     build each time ``fluid apply`` runs it, with ``refusing_runner`` None.
     The checks follow the dispatcher's order, so they name the runner that gets
-    the build; a build with no engine goes to the python runner. None for a
-    connector, which stays running, and for a build no forge-cli runner takes:
-    a spark, glue or custom engine, an ingestion engine without ``pattern:
-    acquisition``, or inline SQL on a platform with no embedded-SQL executor.
-    The dispatcher leaves a continuous one of those to its platform
+    the build. The python runner takes every build the others do not: python,
+    no engine, spark, glue, custom, and an ingestion engine declared without
+    ``pattern: acquisition``; it runs the build's script locally.
+
+    None for a connector, which stays running, and for a build forge-cli does
+    not run: inline SQL on a platform with no embedded-SQL executor, and a
+    spark, glue or custom build that declares a ``runtime.platform`` other
+    than the local one, where that platform runs the job. The dispatcher
+    leaves a continuous one of those to its platform
     (:func:`_runs_outside_forge_continuously`).
     """
     engine, pattern, props = build.get("engine"), build.get("pattern"), build.get("properties")
@@ -262,9 +272,13 @@ def _batch_runner_for(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str
         return "inline-SQL builds", None
     if is_dbt_build(build):
         return "dbt builds", "dbt"
-    if name in ("python", ""):
-        return ("python builds" if name else "builds with no engine"), "python"
-    return None
+    if name in PLATFORM_RUN_ENGINES and embedded_sql_platform(build) not in LOCAL_SQL_PLATFORMS:
+        return None
+    if not name:
+        return "builds with no engine", "python"
+    if name in ACQUISITION_ENGINES:
+        return f"{name} builds without pattern: acquisition", "python"
+    return f"{name} builds", "python"
 
 
 def continuous_trigger_warnings(contract: Dict[str, Any]) -> List[str]:
@@ -274,12 +288,13 @@ def continuous_trigger_warnings(contract: Dict[str, Any]) -> List[str]:
     it running, so no scheduler starts the build
     (:func:`~fluid_build.util.contract.is_unscheduled_build`). A batch run
     ends: the dbt and python runners refuse the trigger, so forge-cli never
-    runs such a build (or one with no engine, which the python runner takes),
-    and an inline-SQL build or a duckdb, airbyte, meltano or dlt acquisition
-    runs only when ``fluid apply`` runs builds. A warning, not an error: plain
-    ``fluid validate`` passes, and ``--strict`` fails. A continuous build that
-    no forge-cli runner takes gets none: its platform keeps it running, and
-    ``fluid apply`` leaves it there (:func:`_runs_outside_forge_continuously`).
+    runs such a build (the python runner takes every build no other runner
+    does), and an inline-SQL build or a duckdb, airbyte, meltano or dlt
+    acquisition runs only when ``fluid apply`` runs builds. A warning, not an
+    error: plain ``fluid validate`` passes, and ``--strict`` fails. A
+    continuous build that forge-cli does not run gets none: its platform keeps
+    it running, and ``fluid apply`` leaves it there
+    (:func:`_runs_outside_forge_continuously`).
 
     Borrowed: Spark checks a continuous trigger against what the query can run
     before it starts (``UnsupportedOperationChecker.checkForContinuous``), and
@@ -336,11 +351,11 @@ def refuse_continuous_trigger(runs: str) -> int:
 
 
 def _runs_outside_forge_continuously(build: Dict[str, Any]) -> bool:
-    """True for a continuous build that no forge-cli runner takes.
+    """True for a continuous build that forge-cli does not run.
 
-    That is a spark, glue or custom engine, an ingestion engine declared
-    without ``pattern: acquisition``, or inline SQL on a platform with no
-    embedded-SQL executor (:func:`_batch_runner_for` is None for each). Its
+    That is inline SQL on a platform with no embedded-SQL executor, or a
+    spark, glue or custom build that declares a ``runtime.platform`` other
+    than the local one (:func:`_batch_runner_for` is None for each). That
     platform keeps the job running, so :func:`run_builds_from_args` leaves it
     there as it does a Flink job, and ``fluid validate`` gives no warning. A
     Kafka Connect or Debezium connector is not one: its runner deploys it.
@@ -355,7 +370,7 @@ def _runs_outside_forge_continuously(build: Dict[str, Any]) -> bool:
 
 
 def _report_continuous_outside_forge(build: Dict[str, Any], build_id: str, report: Any) -> None:
-    """Say that a continuous build no forge-cli runner takes is not run here.
+    """Say that a continuous build forge-cli does not run is not run here.
 
     Counted and recorded as :func:`_report_externally_run_build` counts and
     records a Flink job: on its own summary line, and as skipped with

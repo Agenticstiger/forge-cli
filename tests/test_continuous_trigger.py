@@ -313,6 +313,29 @@ class TestBatchBuildWarning:
                 pytest.param(_build(e, pattern="acquisition"), f"runs {e} builds", id=e)
                 for e in ("airbyte", "meltano", "dlt")
             ],
+            # The python runner runs the script of any build no other runner
+            # takes, locally, unless a spark, glue or custom build names a
+            # platform of its own.
+            *[
+                pytest.param(_build(e), f"runs {e} builds as batch runs", id=e)
+                for e in ("spark", "glue", "custom")
+            ],
+            pytest.param(
+                _build("spark", execution=_runtime("local")),
+                "runs spark builds as batch runs",
+                id="spark-on-local",
+            ),
+            pytest.param(
+                _build("dlt", pattern="hybrid-reference"),
+                "forge-cli runs dlt builds without pattern: acquisition as batch runs, which "
+                "end, and its python runner refuses",
+                id="dlt-without-acquisition",
+            ),
+            pytest.param(
+                _build("kafka-connect"),
+                "runs kafka-connect builds without pattern: acquisition",
+                id="connector-without-acquisition",
+            ),
         ],
     )
     def test_every_batch_runner_is_warned(self, build: Dict[str, Any], says: str) -> None:
@@ -329,12 +352,12 @@ class TestBatchBuildWarning:
             pytest.param(
                 _build("sql", properties={"language": "flink_sql", **_SQL}), id="flink-sql"
             ),
-            # No forge-cli runner takes these: fluid apply leaves them to their
-            # platform, as it does a Flink job.
-            pytest.param(_build("spark"), id="spark"),
-            pytest.param(_build("glue"), id="glue"),
-            pytest.param(_build("custom"), id="custom"),
-            pytest.param(_build("kafka-connect"), id="connector-without-acquisition"),
+            # forge-cli does not run these: fluid apply leaves them to the
+            # platform they name, as it does a Flink job.
+            *[
+                pytest.param(_build(e, execution=_runtime(p)), id=f"{e}-on-{p}")
+                for e, p in (("spark", "databricks"), ("glue", "aws"), ("custom", "kubernetes"))
+            ],
             pytest.param(
                 _build("spark", pattern="embedded-logic", properties=_SQL, execution=_runtime()),
                 id="inline-sql-on-databricks",
@@ -368,7 +391,7 @@ class TestBatchBuildWarning:
     def test_a_build_without_an_id_is_named_by_index(self) -> None:
         build = _build("python")
         del build["id"]
-        (warning,) = _warnings({"builds": [_build("spark"), build]})
+        (warning,) = _warnings({"builds": [_build("flink"), build]})
         assert warning.startswith("builds[1]: trigger.type continuous on engine 'python':")
 
 
@@ -413,21 +436,17 @@ _DISPATCHED = [
     pytest.param(_build("spark", pattern="hybrid-reference"), id="spark"),
     pytest.param(_build("glue"), id="glue"),
     pytest.param(_build("custom"), id="custom"),
+    pytest.param(_build("spark", execution=_runtime()), id="spark-on-databricks"),
+    pytest.param(_build("glue", execution=_runtime("aws")), id="glue-on-aws"),
+    pytest.param(_build("dlt", pattern="hybrid-reference"), id="dlt-not-acquisition"),
     pytest.param(_build("flink", properties=_SQL), id="flink"),
     pytest.param(_build("sql", properties={"language": "flink_sql", **_SQL}), id="flink-sql"),
 ]
 
 
-@pytest.mark.parametrize("build", _DISPATCHED)
-def test_validate_warns_exactly_when_apply_runs_the_build_as_a_batch_run(
-    build: Dict[str, Any],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture,
-) -> None:
-    # One predicate behind both: a warned build reaches a batch runner under
-    # fluid apply --mode amend-and-build, and any other reaches a connector's
-    # runner or none, as a Flink job does.
+def _dispatch(build: Dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list:
+    """The runners ``fluid apply --mode amend-and-build`` hands *build* to,
+    recorded instead of run."""
     import argparse
     import logging
 
@@ -467,10 +486,44 @@ def test_validate_warns_exactly_when_apply_runs_the_build_as_a_batch_run(
         args, logging.getLogger("test"), force_run=True, contract={"id": "p", "builds": [build]}
     )
     assert rc == 0
-    connector = called == ["acquisition"] and build["engine"] in base.STREAMING_ACQUISITION_ENGINES
+    return called
+
+
+@pytest.mark.parametrize("build", _DISPATCHED)
+def test_validate_warns_exactly_when_apply_runs_the_build_as_a_batch_run(
+    build: Dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    # One predicate behind both: a warned build reaches a batch runner under
+    # fluid apply --mode amend-and-build, and any other reaches a connector's
+    # runner or none, as a Flink job does.
+    from fluid_build.build_runners.base import STREAMING_ACQUISITION_ENGINES
+
+    called = _dispatch(build, tmp_path, monkeypatch)
+    connector = called == ["acquisition"] and build["engine"] in STREAMING_ACQUISITION_ENGINES
     assert bool(_warnings({"builds": [build]})) is (bool(called) and not connector), called
     if not called:
         assert "there is nothing for forge-cli to run" in " ".join(capsys.readouterr().out.split())
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(_build("spark", pattern="hybrid-reference"), id="spark"),
+        pytest.param(_build("custom", execution=_runtime("local")), id="custom-on-local"),
+        pytest.param(_build("dlt", pattern="hybrid-reference"), id="dlt-not-acquisition"),
+        pytest.param(_build("kafka-connect"), id="kafka-connect-no-pattern"),
+    ],
+)
+def test_apply_hands_a_local_script_to_the_python_runner(
+    build: Dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The python runner runs these builds' scripts when the trigger is
+    # manual, so a continuous one is refused there, not passed off as a job
+    # some platform keeps running.
+    assert _dispatch(build, tmp_path, monkeypatch) == ["python"]
 
 
 class TestValidateCli:
