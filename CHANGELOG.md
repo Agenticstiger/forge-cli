@@ -9,15 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
-- `fluid validate --env <env> --strict` and `fluid contract-validation --env <env>
-  --strict` now fail when an overlay patch lands on an entry that names another id
-  (`overlay_patch_retargeted`), which a 0.7.5 or older contract, merged by position, can
-  do. Without `--strict` both commands list it under their warnings, and the loader no
-  longer also logs it there. Put the overlay's entries in the base's order, or set
-  `fluidVersion: "0.7.6"` so overlays patch by id. `overlay_entry_added` stays a log line
-  and does not fail `--strict`. `fluid validate <bundle>.tgz` does not see the warning:
-  `fluid bundle --env` merged the overlay before, so validate the contract file with
-  `--env`.
+- `fluid validate --env <env> --strict` (on one contract or a whole workspace), `fluid
+  contract-validation --env <env> --strict` and `fluid test --env <env> --strict` now fail
+  when an overlay patch lands on an entry that names another id
+  (`overlay_patch_retargeted`), which an overlay merged by position can do: a 0.7.5 or
+  older contract, or a 0.7.6 base whose entries lack unique ids. Without `--strict` these
+  commands list it among their warnings (`fluid test` as an "Environment overlay" row),
+  and the loader no longer also logs it there. Put the overlay's entries in the base's
+  order, or set `fluidVersion: "0.7.6"` so overlays patch by id. `overlay_entry_added`
+  stays a log line and does not fail `--strict`. `fluid validate <bundle>.tgz` does not
+  see the warning: `fluid bundle --env` merged the overlay before, so validate the
+  contract file with `--env`.
+- `fluid validate --strict` now says `Validation failed: warnings treated as errors
+  (--strict)` when warnings alone fail it, after a summary that reads valid.
 
 ### Added
 
