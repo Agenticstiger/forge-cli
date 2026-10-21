@@ -233,7 +233,7 @@ def test_validate_cli_error_context_and_suggestions_print_verbatim(monkeypatch, 
 
 
 def test_validate_missing_file_names_the_whole_path(monkeypatch, capsys):
-    """The ``console_error`` lines wrap their text in ``[red]`` markup; the value is escaped."""
+    """``console_error`` prints its text as written, the trailing backslash included."""
     import fluid_build.cli.security as security
     from fluid_build.cli.core import FluidCLIError
 
@@ -247,6 +247,42 @@ def test_validate_missing_file_names_the_whole_path(monkeypatch, capsys):
     err = _unwrapped(capsys.readouterr().err)
     assert rc == 1
     assert "Contract file not found: orders[draft]\\ " in err + " "
+
+
+@pytest.mark.parametrize(
+    "event, context, expected",
+    [
+        (
+            "version_below_minimum",
+            {"version": "0.7[/]", "constraint": ">=1.0[gcp]"},
+            "Contract version 0.7[/] does not meet minimum requirement >=1.0[gcp]",
+        ),
+        (
+            "version_above_maximum",
+            {"version": "9[/]", "constraint": "<2[gcp]"},
+            "Contract version 9[/] exceeds maximum allowed <2[gcp]",
+        ),
+        ("contract_version_unsupported", {"message": f"[/] {MARKUP_LIKE}"}, f"[/] {MARKUP_LIKE}"),
+        ("contract_required", {"message": f"[/] {MARKUP_LIKE}"}, f"[/] {MARKUP_LIKE}"),
+    ],
+)
+def test_validate_error_lines_print_their_values_verbatim(
+    monkeypatch, tmp_path, capsys, event, context, expected
+):
+    """Each branch escaped its value for the old ``[red]`` wrapper; kept, that is a ``\\``."""
+
+    def _raise(_contract):
+        raise CLIError(1, event, context)
+
+    monkeypatch.setattr(validate_mod, "_reject_pre_07_contract", _raise)
+    path = _write(tmp_path, _contract("lakekeeper", lake_formation=True))
+
+    rc = cli_mod.main(["validate", path])
+
+    err = _unwrapped(capsys.readouterr().err)
+    assert rc == 1
+    assert f"❌ {expected}" in err
+    assert "\\[" not in err
 
 
 # ---------------------------------------------------------------------------
@@ -409,12 +445,25 @@ def test_unexpected_error_prints_its_message_verbatim(monkeypatch, capsys):
 
 
 def test_debug_traceback_prints_the_message_verbatim(monkeypatch, capsys):
-    _raise_from_command(monkeypatch, ValueError(MESSAGE))
+    # ``fe80::a:b:c`` holds the ``:b:`` emoji code, which a ``str`` print swapped in.
+    _raise_from_command(monkeypatch, ValueError(f"{MESSAGE} fe80::a:b:c \x1b[2J"))
 
     rc = cli_mod.main(["--debug", "validate", "unused.fluid.yaml"])
 
     assert rc == 2
-    assert f"ValueError: {MESSAGE}" in _unwrapped(capsys.readouterr().out)
+    assert f"ValueError: {MESSAGE} fe80::a:b:c \\x1b[2J" in _unwrapped(capsys.readouterr().out)
+
+
+def test_unexpected_error_and_its_traceback_are_redacted(monkeypatch, capsys):
+    """The MarkupError used to keep this off the screen; printed now, it must be redacted."""
+    _raise_from_command(monkeypatch, ValueError("[/] connect failed password=hunter2"))
+
+    rc = cli_mod.main(["--debug", "validate", "unused.fluid.yaml"])
+
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "hunter2" not in out
+    assert "❌ Unexpected error: [/] connect failed password=<redacted>" in _unwrapped(out)
 
 
 def test_provider_error_prints_its_message_verbatim(monkeypatch, capsys):
@@ -557,6 +606,7 @@ def test_contract_validation_table_prints_messages_and_paths_verbatim(monkeypatc
     report = _report_quoting_markup()
     # A rule's severity comes from the contract; one outside the styled set prints as given.
     report.add_issue("[/]fatal", "quality", "rule failed", "exposes[orders].dq")
+    report.add_issue("error", "schema", "location.path: C:\\work\\", "C:\\work\\")
 
     output_rich_report(report)
 
@@ -567,6 +617,9 @@ def test_contract_validation_table_prints_messages_and_paths_verbatim(monkeypatc
         assert f"{category}: {MESSAGE}" in out
         assert f"exposes[{category}]" in out
     assert "[/]FATAL" in out
+    # rich.markup.escape would have doubled both trailing backslashes.
+    assert "location.path: C:\\work\\ " in out
+    assert "│ C:\\work\\ " in out
 
 
 def test_reports_spell_out_control_characters(monkeypatch, capsys):
@@ -612,11 +665,12 @@ def test_soda_text_prints_check_names_and_stderr_verbatim(capsys):
     from fluid_build.build_runners.soda.runner import SodaResult
     from fluid_build.cli.test import _emit_soda_text
 
-    name = "invalid_count(code) = 0 [/] ^[a-z]+$"
+    # ``:x:`` and the ``:b:`` in ``fe80::a:b:c`` are emoji codes to a ``str`` print.
+    name = "invalid_count(code) = 0 [/] ^[a-z]+$ :x:"
     result = SodaResult(
         return_code=1,
         raw_stdout="",
-        raw_stderr=f"check failed: {name}",
+        raw_stderr=f"check failed: {name} on fe80::a:b:c\x1b[2J",
         checks_failed=1,
         failed_check_names=[name],
     )
@@ -625,4 +679,4 @@ def test_soda_text_prints_check_names_and_stderr_verbatim(capsys):
 
     out = _unwrapped(capsys.readouterr().out)
     assert f"- {name}" in out
-    assert f"soda stderr: check failed: {name}" in out
+    assert f"soda stderr: check failed: {name} on fe80::a:b:c\\x1b[2J" in out

@@ -62,14 +62,18 @@ _SECRET_OUTPUT_PATTERN = re.compile(
 # The control characters (Unicode Cc) a terminal acts on: ESC opens an escape
 # sequence, and the C1 range holds the one-byte CSI and OSC. Printed raw, a contract
 # value or an exception message could clear the screen, retitle the window or show a
-# link that opens another URL. Tab and line feed stay. Carriage return is left to
-# Rich, which drops it, so CRLF text reads normally.
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+# link that opens another URL, and a carriage return lets the rest of a line print
+# over its start. Tab and line feed stay; a CRLF line break reads as a line feed.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 def _show_controls(text: str) -> str:
-    """``text`` with each control character spelled ``\\xNN`` instead of sent to the terminal."""
-    return _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+    """``text`` with each control character spelled ``\\xNN`` instead of sent to the terminal.
+
+    Redact before calling this, not after: a spelled control ends in a hex digit, a
+    word character, so ``\\x00PASSWORD=`` no longer matches the redaction pattern.
+    """
+    return _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", text.replace("\r\n", "\n"))
 
 
 def literal_text(text: Any, style: str = "") -> RichText:
@@ -77,8 +81,10 @@ def literal_text(text: Any, style: str = "") -> RichText:
 
     For data a renderer quotes back, such as a contract value or an exception message.
     Rich parses a ``str`` as markup, so a lowercase ``[word]`` vanishes and ``[/]``
-    raises ``MarkupError``. ``rich.markup.escape`` is no substitute: it doubles a
-    trailing backslash when no tag follows it. Rich must be installed.
+    raises ``MarkupError``, and it swaps a ``:name:`` code for its emoji
+    (``fe80::a:b:c`` gained a 🅱). A ``Text`` gets neither. ``rich.markup.escape`` is
+    no substitute: it doubles a trailing backslash when no tag follows it. Rich must
+    be installed.
     """
     return RichText(_show_controls(str(text)), style=style)
 
@@ -185,6 +191,16 @@ def cprint_json(document: str, **kwargs: Any) -> None:
         stream.flush()
 
 
+def cprint_literal(text: Any, **kwargs: Any) -> None:
+    """:func:`cprint` for data: no markup, no ``:emoji:`` codes, control characters spelled.
+
+    The ``str`` counterpart of :func:`literal_text`, for a line a renderer quotes back
+    (a check name, a tool's stderr). It stays a ``str`` so :func:`cprint` still redacts
+    it; the raw text is redacted first, as in :func:`error`.
+    """
+    cprint(_show_controls(_redact_str(str(text))), markup=False, emoji=False, **kwargs)
+
+
 def info(msg: str) -> None:
     """Informational message (cyan prefix)."""
     cprint(f"[cyan]ℹ[/cyan]  {msg}")
@@ -210,9 +226,10 @@ def error(msg: str) -> None:
     handler as a traceback because that handler reports through this
     function. Control characters are spelled out (see :func:`literal_text`).
     """
-    # Funnel through the typed ``_redact_str`` sanitiser so CodeQL
-    # recognises the sink path is sanitised on every branch.
-    safe_msg = _redact_str(_show_controls(str(msg)))
+    # Redact the raw text first (see ``_show_controls``), and funnel through the
+    # typed ``_redact_str`` sanitiser last so CodeQL recognises the sink path is
+    # sanitised on every branch.
+    safe_msg = _redact_str(_show_controls(_redact_str(str(msg))))
     if RICH_AVAILABLE:
         _err_console = RichConsole(stderr=True)
         _err_console.print(RichText(f"❌ {safe_msg}", style="red"))

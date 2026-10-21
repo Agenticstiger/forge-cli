@@ -55,14 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`fluid test` and `fluid contract-validation` print the contract's text as written.**
-  Both read their report as Rich markup, so a JSON Schema pattern such as
-  `^[a-z0-9][a-z0-9-]*[a-z0-9]$` printed as `^*$`, `exposes[orders]` lost its id, and an
-  id or expose id holding `[/]` crashed the command with a `MarkupError` traceback. The
-  `❌` error lines every command prints, and the handler for an unexpected error, show
-  their text as written too, so an exception that quotes `[/]` no longer ends in a second
-  traceback. In that text, and in both reports, a control character prints as `\x1b`
-  and the like, so an escape sequence in a contract or an error message can no longer
-  clear the terminal or plant a link. JSON and JUnit output are unchanged.
+  `fluid test` read its report as Rich markup, so a JSON Schema pattern such as
+  `^[a-z0-9][a-z0-9-]*[a-z0-9]$` printed as `^*$` and `exposes[orders]` lost its id; in
+  both commands an id holding `[/]` crashed the command with a `MarkupError` traceback.
+  The soda engine's check names and stderr, the `❌` lines printed by the CLI's shared
+  error helper, and the `Unexpected error:` line print as written too, so an exception
+  that quotes `[/]` no longer ends in a second traceback (that line and its `--debug`
+  traceback are now redacted like the rest). In all of these a `:name:` code stays text
+  (`fe80::a:b:c` showed an emoji) and a control character prints as `\x1b` and the like,
+  so an escape sequence in a contract or an error message can no longer clear the
+  terminal or plant a link. JSON and JUnit output are unchanged.
 
 ## [0.21.0] — 2026-10-19
 

@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from fluid_build.cli.console import cprint, cprint_json, literal_text, success
+from fluid_build.cli.console import cprint, cprint_json, cprint_literal, literal_text, success
 from fluid_build.cli.console import error as console_error
 
 # Rich imports for enhanced output
@@ -1700,10 +1700,9 @@ def output_plain_report(report: ValidationReport, output_file: Optional[str] = N
             f.write(report_text)
         success(f"Report saved to: {output_file}")
     else:
-        # The report quotes contract text; without ``markup=False`` the
-        # console's Rich-less fallback strips an ``exposes[orders]``-style
-        # ``[word]`` as if it were a style tag.
-        cprint(report_text, markup=False)
+        # The report quotes contract text; as markup, the console's Rich-less
+        # fallback strips an ``exposes[orders]``-style ``[word]`` as a style tag.
+        cprint_literal(report_text)
 
 
 def output_json_report(report: ValidationReport, output_file: Optional[str] = None) -> None:

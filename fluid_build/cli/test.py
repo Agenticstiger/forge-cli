@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from fluid_build.cli.console import cprint, literal_text, success, warning
+from fluid_build.cli.console import cprint, cprint_literal, literal_text, success, warning
 from fluid_build.cli.console import error as console_error
 
 from ._common import CLIError
@@ -605,10 +605,9 @@ def _output_plain(report, output_file: Optional[str] = None) -> None:
             f.write(text)
         cprint(f"Report saved to: {output_file}")
     else:
-        # The report quotes contract text; without ``markup=False`` the
-        # console's Rich-less fallback strips an ``exposes[orders]``-style
-        # ``[word]`` as if it were a style tag.
-        cprint(text, markup=False)
+        # The report quotes contract text; as markup, the console's Rich-less
+        # fallback strips an ``exposes[orders]``-style ``[word]`` as a style tag.
+        cprint_literal(text)
 
 
 # ======================================================================
@@ -975,10 +974,7 @@ def _run_soda_engine(
         if result.raw_stderr:
             from fluid_build.observability.secret_redactor import redact_secret_text
 
-            cprint(
-                f"   soda stderr: {redact_secret_text(result.raw_stderr.strip()[:500])}",
-                markup=False,
-            )
+            cprint_literal(f"   soda stderr: {redact_secret_text(result.raw_stderr.strip()[:500])}")
 
     # Render in the requested format (re-use the existing --output flag).
     output_format = getattr(args, "output", "text")
@@ -1142,9 +1138,10 @@ def _emit_soda_text(result, datasource: str, rendering=None) -> None:
     if result.failed_check_names:
         cprint("   failed checks:")
         # A check name quotes the contract's rule (a ``valid regex`` reads
-        # ``[a-z]``), and Soda's stderr quotes the SodaCL. Both are data.
+        # ``[a-z]``), and Soda's stderr quotes the SodaCL and the hosts it reached
+        # (``fe80::a:b:c`` holds the ``:b:`` emoji code). Both are data.
         for name in result.failed_check_names:
-            cprint(f"     - {name}", markup=False)
+            cprint_literal(f"     - {name}")
     if not result.ok and result.raw_stderr:
         # Soda's stderr can include credential-bearing connection
         # strings (DSNs with embedded passwords, BigQuery service-
@@ -1153,4 +1150,4 @@ def _emit_soda_text(result, datasource: str, rendering=None) -> None:
         from fluid_build.observability.secret_redactor import redact_secret_text
 
         redacted = redact_secret_text(result.raw_stderr.strip()[:500])
-        cprint(f"   soda stderr: {redacted}", markup=False)
+        cprint_literal(f"   soda stderr: {redacted}")

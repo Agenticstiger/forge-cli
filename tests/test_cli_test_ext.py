@@ -527,7 +527,7 @@ class TestOutputRich:
 class TestOutputPlain:
     def test_plain_output_to_stdout(self, capsys):
         report = _make_report(is_valid=True)
-        with patch("fluid_build.cli.test.cprint") as mock_cprint:
+        with patch("fluid_build.cli.test.cprint_literal") as mock_cprint:
             _output_plain(report)
         mock_cprint.assert_called()
 
@@ -545,7 +545,9 @@ class TestOutputPlain:
         issue = _make_issue(severity="error", category="schema", message="bad")
         report = _make_report(is_valid=False, issues=[issue])
         lines_seen = []
-        with patch("fluid_build.cli.test.cprint", side_effect=lambda t, **_: lines_seen.append(t)):
+        with patch(
+            "fluid_build.cli.test.cprint_literal", side_effect=lambda t: lines_seen.append(t)
+        ):
             _output_plain(report)
         joined = "\n".join(str(l) for l in lines_seen)
         assert "FAIL" in joined
@@ -553,7 +555,9 @@ class TestOutputPlain:
     def test_plain_shows_pass_label(self):
         report = _make_report(is_valid=True)
         lines_seen = []
-        with patch("fluid_build.cli.test.cprint", side_effect=lambda t, **_: lines_seen.append(t)):
+        with patch(
+            "fluid_build.cli.test.cprint_literal", side_effect=lambda t: lines_seen.append(t)
+        ):
             _output_plain(report)
         joined = "\n".join(str(l) for l in lines_seen)
         assert "PASS" in joined
@@ -562,7 +566,9 @@ class TestOutputPlain:
         issue = _make_issue(severity="error", category="schema", message="bad", suggestion="fix it")
         report = _make_report(is_valid=False, issues=[issue])
         lines_seen = []
-        with patch("fluid_build.cli.test.cprint", side_effect=lambda t, **_: lines_seen.append(t)):
+        with patch(
+            "fluid_build.cli.test.cprint_literal", side_effect=lambda t: lines_seen.append(t)
+        ):
             _output_plain(report)
         joined = "\n".join(str(l) for l in lines_seen)
         assert "fix it" in joined

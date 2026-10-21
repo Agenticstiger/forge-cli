@@ -189,6 +189,18 @@ def test_scan_that_accounts_for_nothing_is_not_reported_as_a_pass(tmp_path, fake
     assert _run_soda_engine(_args(path), path, LOGGER) == 1
 
 
+def test_unaccounted_scan_prints_soda_stderr_as_written(tmp_path, fake_soda, capsys):
+    """Soda's stderr quotes the SodaCL and the hosts it reached; it is data, not markup."""
+    stderr = "parse error near [/] ^[a-z]+$ on fe80::a:b:c \x1b[2J"
+    fake_soda.return_value = _scan(checks_passed=0, raw_stderr=stderr)
+    path = _write(tmp_path, [_MAPPABLE])
+
+    assert _run_soda_engine(_args(path), path, LOGGER) == 1
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert "soda stderr: parse error near [/] ^[a-z]+$ on fe80::a:b:c \\x1b[2J" in out
+
+
 def test_checks_soda_parsed_but_never_evaluated_are_not_a_pass(tmp_path, fake_soda):
     """``N checks not evaluated`` still exits soda 0 — it must not exit us 0."""
     fake_soda.return_value = _scan(checks_passed=0, checks_not_evaluated=1)
