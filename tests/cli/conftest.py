@@ -152,17 +152,24 @@ def plan_file(temp_dir):
 
 # Environment configuration for tests
 @pytest.fixture(autouse=True)
-def test_environment():
-    """Set up test environment variables"""
+def test_environment(monkeypatch):
+    """Set up test environment variables.
+
+    Both go through ``monkeypatch``. Autouse fixtures in the root conftest and in
+    this one create ``monkeypatch`` before this fixture, so its undo runs after the
+    restore below. Set straight into ``os.environ``, these values were what a test's
+    own ``monkeypatch.delenv`` or ``setenv`` recorded as the original, and its undo put
+    them back for the rest of the session (see ``test_conftest_env_isolation.py``).
+    """
     original_env = os.environ.copy()
 
     # Set test environment variables
-    os.environ["FLUID_ENV"] = "test"
-    os.environ["FLUID_LOG_LEVEL"] = "DEBUG"
+    monkeypatch.setenv("FLUID_ENV", "test")
+    monkeypatch.setenv("FLUID_LOG_LEVEL", "DEBUG")
 
     yield
 
-    # Restore original environment
+    # Restore anything a test changed in os.environ directly
     os.environ.clear()
     os.environ.update(original_env)
 

@@ -428,9 +428,11 @@ def _write_product(tmp_path: Path, version: str, overlay: Dict[str, Any]) -> Non
 PROD_BY_POSITION = {"builds": [{}, {"id": "transform", "description": "8 executors"}]}
 
 #: Environment variables a CLI subprocess here must not inherit: API keys, and
-#: the debug level ``tests/cli/conftest.py`` sets, which some xdist workers keep.
-#: At DEBUG the loader also logs a warning the command reports, and the tests
-#: below count that the terminal shows it once.
+#: debug switches, such as one a developer exported. (``tests/cli/conftest.py``
+#: used to leak its ``FLUID_LOG_LEVEL=DEBUG`` into later tests; see
+#: ``tests/cli/test_conftest_env_isolation.py``.) At DEBUG the loader also logs a
+#: warning the command reports, and the tests below count that the terminal shows
+#: it once.
 _NOT_INHERITED = ("FLUID_LOG_LEVEL", "FLUID_DEBUG", "FLUID_SHOW_REGISTRATION")
 
 
