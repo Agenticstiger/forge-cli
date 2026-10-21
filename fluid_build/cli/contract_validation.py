@@ -1633,6 +1633,8 @@ Duration: {report.duration:.2f}s"""
 
     # Issues table
     if report.issues:
+        from rich.markup import escape
+
         table = Table(title="Validation Issues", show_header=True)
         table.add_column("Severity", style="bold")
         table.add_column("Category")
@@ -1646,7 +1648,11 @@ Duration: {report.duration:.2f}s"""
                 "info": "[blue]INFO[/blue]",
             }.get(issue.severity, issue.severity.upper())
 
-            table.add_row(severity_style, issue.category, issue.message, issue.path)
+            # Messages quote contract text (an overlay warning names the
+            # contract's ids), which Rich would parse as markup.
+            table.add_row(
+                severity_style, issue.category, escape(issue.message), escape(issue.path or "")
+            )
 
         console.print(table)
     else:

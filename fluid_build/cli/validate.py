@@ -363,6 +363,7 @@ def run(args, logger: logging.Logger) -> int:
         log_metric(logger, "validation_warnings", len(validation_result.warnings), unit="count")
 
         # Output results
+        _print_quiet_overlay_warnings(args, overlay_warnings)
         exit_code = _output_results(validation_result, args, logger)
 
         # Log operation result
@@ -1291,11 +1292,28 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
 
 
 def _explain_strict_failure(result: ValidationResult, args: Any) -> None:
-    """Say why ``--strict`` exits 1 after a summary that reads valid."""
+    """Say why ``--strict`` exits 1 after a summary that reads valid.
+
+    ``--quiet`` prints errors only, so there each warning is printed as the
+    error ``--strict`` made it: a count alone does not say what to fix.
+    """
     if args.quiet:
-        _cprint_literal(f"ERROR: {len(result.warnings)} warning(s) treated as errors (--strict)")
+        for warning in result.warnings:
+            _cprint_literal(f"ERROR (--strict): {warning}")
     else:
         cprint("❌ Validation failed: warnings treated as errors (--strict)")
+
+
+def _print_quiet_overlay_warnings(args: Any, overlay_warnings: list[str]) -> None:
+    """Under ``--quiet``, still show an overlay patch that landed on another entry.
+
+    ``--quiet`` prints errors only, but the loader always printed this warning,
+    whatever the flags. Under ``--strict`` it is printed as an error instead
+    (:func:`_explain_strict_failure`).
+    """
+    if args.quiet and not args.strict and args.format == "text":
+        for warning in overlay_warnings:
+            _cprint_literal(f"WARNING: {warning}")
 
 
 # ---------------------------------------------------------------------------

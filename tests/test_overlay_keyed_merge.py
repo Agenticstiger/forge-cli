@@ -459,6 +459,21 @@ class TestValidateStrict:
         assert result.returncode == 1
         assert "Validation failed: warnings treated as errors (--strict)" in result.stdout
 
+    def test_quiet_still_shows_it(self, tmp_path: Path) -> None:
+        # --quiet prints errors only, but the loader always printed this one.
+        _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+        result = _validate(tmp_path, "--quiet")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.startswith("WARNING: overlay_patch_retargeted: in ")
+        assert (result.stdout + result.stderr).count("overlay_patch_retargeted") == 1
+
+    def test_quiet_strict_names_it_as_the_error(self, tmp_path: Path) -> None:
+        _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+        result = _validate(tmp_path, "--quiet", "--strict")
+        assert result.returncode == 1
+        assert result.stdout.startswith("ERROR (--strict): overlay_patch_retargeted: in ")
+        assert (result.stdout + result.stderr).count("overlay_patch_retargeted") == 1
+
     def test_strict_json_lists_it(self, tmp_path: Path) -> None:
         _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
         result = _validate(tmp_path, "--strict", "--format", "json")
@@ -513,6 +528,20 @@ def test_fluid_test_shows_it_as_a_row() -> None:
     assert detail.startswith("overlay_patch_retargeted: in p")
     report.issues.clear()
     assert "Environment overlay" not in [name for _, name, _ in _build_check_rows(report)]
+
+
+def test_an_id_that_reads_as_markup_does_not_break_either_table(capsys) -> None:
+    # The message quotes the contract's ids; "[/]" made Rich raise MarkupError.
+    from fluid_build.cli.contract_validation import ValidationReport, output_rich_report
+    from fluid_build.cli.test import _output_rich
+
+    message = "overlay_patch_retargeted: in p, the overlay's builds[1] names id [/] but ..."
+    report = ValidationReport("c.yaml", "p", "1", datetime.now(), 0.0)
+    report.add_issue("warning", "overlay", message)
+    output_rich_report(report)
+    _output_rich(report)
+    # Each table shows the id as written (the tables wrap the rest of the line).
+    assert capsys.readouterr().out.count("[/]") == 2
 
 
 def test_contract_validation_reports_it_as_a_warning(tmp_path: Path) -> None:
