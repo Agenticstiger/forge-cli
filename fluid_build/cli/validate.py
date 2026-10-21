@@ -1274,20 +1274,20 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
     if has_errors or treat_warnings_as_errors:
         # Under --quiet the warnings were not listed, errors or not.
         if treat_warnings_as_errors and (args.quiet or not has_errors):
-            _explain_strict_failure(result, args)
+            _explain_strict_failure(result.warnings, args.quiet)
         return 1
     else:
         return 0
 
 
-def _explain_strict_failure(result: ValidationResult, args: Any) -> None:
+def _explain_strict_failure(warnings: List[str], quiet: bool) -> None:
     """Say why ``--strict`` exits 1: after a summary that reads valid, or under ``--quiet``.
 
     ``--quiet`` prints errors only, so there each warning is printed as the
     error ``--strict`` made it: a count alone does not say what to fix.
     """
-    if args.quiet:
-        for warning in result.warnings:
+    if quiet:
+        for warning in warnings:
             _cprint_literal(f"ERROR (--strict): {warning}")
     else:
         cprint("❌ Validation failed: warnings treated as errors (--strict)")
@@ -1506,13 +1506,15 @@ def _run_bundle_validation(
         report.issues.insert(0, env_issue)
         report.status = "fail"
 
-    # Contract-level rules (sovereignty, agent policy, binding prerequisites,
+    # The overlay warnings ``fluid bundle --env`` recorded, then the
+    # contract-level rules (sovereignty, agent policy, binding prerequisites,
     # packaging, semantics, composition, plugin validators) on the resolved
-    # contract the bundle carries — the same rules the contract path runs.
+    # contract the bundle carries — what the contract path reports.
     # Skipped when the MANIFEST gate already failed: there is no trustworthy
     # contract to run them on, and the tamper finding is the answer.
     manifest_ok = not any(i.code == "MANIFEST-TAMPER" for i in report.issues)
     if manifest_ok and not (fail_fast and report.status == "fail"):
+        report.issues.extend(_bundle_overlay_issues(tgz_path))
         report.issues.extend(_bundle_contract_rule_issues(tgz_path, args, schema_manager, logger))
         has_error = any(i.severity == "error" for i in report.issues)
         has_warning = any(i.severity == "warning" for i in report.issues)
@@ -1525,7 +1527,9 @@ def _run_bundle_validation(
 
     if out_format == "json":
         _cprint_json(json.dumps(report.to_dict(), indent=2))
-    elif not quiet:
+    elif quiet:
+        _print_quiet_bundle_issues(report.issues, strict)
+    else:
         status_icon = "✅" if report.status == "pass" else "❌"
         cprint(f"{status_icon} Bundle {report.status}: {tgz_path}")
         cprint(f"   digest: {report.bundle_digest}")
@@ -1535,17 +1539,14 @@ def _run_bundle_validation(
             f"({s.get('error', 0)} error, {s.get('warning', 0)} warning, "
             f"{s.get('info', 0)} info)"
         )
-        if verbose or report.status == "fail":
-            for issue in report.issues:
-                loc = ""
-                if issue.line is not None:
-                    loc = f" (L{issue.line}"
-                    if issue.column is not None:
-                        loc += f":C{issue.column}"
-                    loc += ")"
-                _cprint_literal(
-                    f"   [{issue.severity}] {issue.validator}: {issue.file}{loc}: {issue.message}"
-                )
+        # A bundle that passes still lists its warnings, as a contract file does.
+        for issue in report.issues:
+            if verbose or report.status == "fail" or issue.severity == "warning":
+                _cprint_literal(f"   [{issue.severity}] {_bundle_issue_text(issue)}")
+        if strict and not any(issue.severity == "error" for issue in report.issues):
+            warnings = [_bundle_issue_text(i) for i in report.issues if i.severity == "warning"]
+            if warnings:
+                _explain_strict_failure(warnings, quiet=False)
 
     # Structured report file — atomic write.
     if report_path:
@@ -1562,6 +1563,73 @@ def _run_bundle_validation(
         cprint(f"   validation completed in {elapsed:.2f}s")
 
     return 0 if report.status == "pass" else 1
+
+
+#: The report code of an overlay warning ``fluid bundle --env`` recorded.
+_OVERLAY_WARNING_CODE = "OVERLAY-WARNING"
+
+
+def _bundle_issue_text(issue: Any) -> str:
+    """One bundle finding as the report lists it: ``validator: file (Lline:Ccol): message``."""
+    loc = ""
+    if issue.line is not None:
+        loc = f" (L{issue.line}"
+        if issue.column is not None:
+            loc += f":C{issue.column}"
+        loc += ")"
+    return f"{issue.validator}: {issue.file}{loc}: {issue.message}"
+
+
+def _print_quiet_bundle_issues(issues: List[Any], strict: bool) -> None:
+    """``--quiet`` on a bundle: what it prints for a contract file.
+
+    Each error; under ``--strict`` each warning, as the error it made
+    (:func:`_explain_strict_failure`); without it, the overlay warnings
+    ``fluid bundle --env`` recorded, which ``fluid validate <contract> --env
+    --quiet`` shows too (:func:`_print_quiet_overlay_warnings`).
+    """
+    for issue in issues:
+        if issue.severity == "error":
+            _cprint_literal(f"ERROR: {_bundle_issue_text(issue)}")
+    warnings = [issue for issue in issues if issue.severity == "warning"]
+    if strict:
+        _explain_strict_failure([_bundle_issue_text(issue) for issue in warnings], quiet=True)
+        return
+    for issue in warnings:
+        if issue.code == _OVERLAY_WARNING_CODE:
+            _cprint_literal(f"WARNING: {_bundle_issue_text(issue)}")
+
+
+def _bundle_overlay_issues(tgz_path: Path) -> list:
+    """The overlay warnings ``fluid bundle --env`` recorded, as report findings.
+
+    A bundle is never re-overlaid, so validating it cannot see a positional
+    overlay patch the merge landed on another entry: ``fluid bundle`` records
+    the warning in the MANIFEST ``source`` block, and it is reported here as a
+    warning, as ``fluid validate <contract> --env`` reports it, so
+    ``--strict`` (pipeline stage 2) fails on it. A bundle that records none,
+    one built before the record existed included, has none to report.
+    """
+    import tarfile
+
+    from fluid_build.forge.core.bundle import bundle_overlay_warnings, read_bundle_source
+    from fluid_build.forge.core.validators import ValidationIssue
+
+    try:
+        source = read_bundle_source(tgz_path)
+    except (tarfile.TarError, OSError, ValueError):
+        # Unreadable: the MANIFEST gate before this reports that bundle.
+        return []
+    return [
+        ValidationIssue(
+            file="MANIFEST.json",
+            validator="overlay",
+            severity="warning",
+            message=warning,
+            code=_OVERLAY_WARNING_CODE,
+        )
+        for warning in bundle_overlay_warnings(source)
+    ]
 
 
 def _bundle_env_issue(tgz_path: Path, env: Optional[str], logger: logging.Logger):

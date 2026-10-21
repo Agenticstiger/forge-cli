@@ -54,7 +54,7 @@ import tarfile
 import unicodedata
 from importlib import import_module
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
@@ -184,11 +184,12 @@ def build_manifest(
     reproduce with shell tools (``sha256sum | sort | sha256sum``).
 
     ``source`` (optional) is the provenance block :func:`make_bundle_source`
-    builds: where the source contract lives relative to the bundle, and which
-    environment overlay was applied. It is metadata about the bundle, not
-    bundle content, so it is deliberately OUTSIDE the merkle root — the
-    digest still identifies the resolved contract alone, and two bundles of
-    the same contract written to different directories keep one digest.
+    builds: where the source contract lives relative to the bundle, which
+    environment overlay was applied, and the overlay warnings its merge raised.
+    It is metadata about the bundle, not bundle content, so it is deliberately
+    OUTSIDE the merkle root — the digest still identifies the resolved contract
+    alone, and two bundles of the same contract written to different
+    directories keep one digest.
     """
     per_file: Dict[str, str] = {}
     for path in sorted(files.keys()):
@@ -406,6 +407,7 @@ def make_bundle_source(
     *,
     env: Optional[str] = None,
     overlay_path: Optional[Path] = None,
+    overlay_warnings: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """Build the MANIFEST ``source`` block for a bundle written to ``out_path``.
 
@@ -415,11 +417,15 @@ def make_bundle_source(
     an absolute path would differ per CI agent. ``env`` is the ``--env`` the
     bundle was built with (``None`` when none was given) and ``overlay`` the
     overlay file actually merged, relative to the contract's directory
-    (``None`` when no overlay was applied).
+    (``None`` when no overlay was applied). ``overlayWarnings``, present only
+    when there are any, lists the overlay merge warnings ``fluid validate
+    --strict`` fails on (:func:`fluid_build.loader.collect_overlay_warnings`):
+    a bundle is never re-overlaid, so validating it cannot see them otherwise.
 
     Downstream stages use it to anchor relative ``binding.location.path``
-    values at the source contract's directory and to refuse an ``--env`` that
-    disagrees with the environment the bundle was built for.
+    values at the source contract's directory, to refuse an ``--env`` that
+    disagrees with the environment the bundle was built for, and to report
+    the overlay warnings (:func:`bundle_overlay_warnings`).
     """
     contract_abs = Path(contract_path).resolve()
     out_dir = Path(out_path).resolve().parent
@@ -438,7 +444,10 @@ def make_bundle_source(
             ).as_posix()
         except ValueError:
             overlay_rel = Path(overlay_path).name
-    return {"contract": contract_rel, "env": env or None, "overlay": overlay_rel}
+    source: Dict[str, Any] = {"contract": contract_rel, "env": env or None, "overlay": overlay_rel}
+    if overlay_warnings:
+        source["overlayWarnings"] = list(overlay_warnings)
+    return source
 
 
 def read_bundle_source(tgz_path: Path) -> Optional[Dict[str, Any]]:
@@ -455,6 +464,20 @@ def read_bundle_source(tgz_path: Path) -> Optional[Dict[str, Any]]:
         manifest = json.loads(read_tar_member_bounded(tar, "MANIFEST.json").decode("utf-8"))
     source = manifest.get("source") if isinstance(manifest, dict) else None
     return dict(source) if isinstance(source, dict) else None
+
+
+def bundle_overlay_warnings(source: Optional[Mapping[str, Any]]) -> List[str]:
+    """The overlay merge warnings a MANIFEST ``source`` block records.
+
+    ``[]`` when it records none: a bundle built without ``--env``, one whose
+    overlay merged cleanly, and one built before the record existed. Like the
+    rest of the block it is outside the merkle root, a hint rather than bundle
+    content, so only the entries that are non-empty strings are read.
+    """
+    recorded = source.get("overlayWarnings") if source else None
+    if not isinstance(recorded, list):
+        return []
+    return [warning for warning in recorded if isinstance(warning, str) and warning]
 
 
 #: An environment name as a MANIFEST may record it: a plain name, never a
@@ -672,6 +695,7 @@ __all__ = [
     "MANIFEST_VERSION",
     "build_bundle_tgz",
     "build_manifest",
+    "bundle_overlay_warnings",
     "bundle_source_contract",
     "extract_fragments",
     "make_bundle_source",
