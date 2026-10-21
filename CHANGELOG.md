@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relations have no `fetchone()`, and a query result keeps its connection busy until it
   is read to the end, which fails the next step on that connection. Every DuckDB result
   is now read to the end, the same way on 1.5.x and 2.x.
+- A local SQL action or `contract_tests` action whose SQL ends in a statement that
+  returns no rows (`CREATE TABLE ... AS`, an `INSERT` without `RETURNING`) now fails with
+  a message saying to end the SQL with a `SELECT` of the result. DuckDB 1.5 failed there
+  on `'NoneType' object has no attribute 'write_csv'`, and DuckDB 2.0 wrote a one-row
+  `Count` file as the action's output and reported success.
 
 ## [0.21.0] — 2026-10-19
 

@@ -233,7 +233,7 @@ class TestWriteOutput:
     def test_csv_dry_run(self):
         rel = MagicMock()
         count_rel = MagicMock()
-        count_rel.fetchone.return_value = (42,)
+        count_rel.fetchall.return_value = [(42,)]
         rel.count.return_value = count_rel
         cnt, path = _write_output(rel, {"path": "/tmp/out.csv", "format": "csv"}, dry_run=True)
         assert cnt == 42

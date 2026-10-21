@@ -454,9 +454,9 @@ def confine_declared(
     """The ``realpath`` of a declared local ``location``, refused outside ``within``.
 
     For a location the engine opens itself rather than grants to the SQL, such
-    as a SQLite source it ``ATTACH``es before the lock: the sqlite scanner opens
-    files through its own client library, so ``allowed_directories`` never
-    bounds it, and this check is the only one. Confined as
+    as a SQLite source it ``ATTACH``es before the lock: nothing bounds that open
+    (and through DuckDB 1.5 the sqlite scanner's own client library is never
+    bounded), so this check is the only one. Confined as
     :meth:`DuckDBAllowlist.with_declared` confines (``within`` plus
     ``FLUID_DUCKDB_ALLOWED_DIRS``); a relative ``location`` is resolved against
     ``base``, else the working directory. Open the returned path, the one that

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 import pytest
 
@@ -33,6 +33,7 @@ duckdb = pytest.importorskip("duckdb")
 from fluid_build.providers._duckdb_compat import (  # noqa: E402
     STORAGE_COMPATIBILITY_VERSION,
     first_row,
+    query_relation,
     storage_compat_config,
 )
 from fluid_build.providers._duckdb_sandbox import (  # noqa: E402
@@ -95,6 +96,156 @@ def test_on_duckdb_2_a_partial_read_keeps_the_connection_busy():
     assert con.execute("SELECT count(*) FROM t").fetchone() == (5,)
     with pytest.raises(duckdb.Error, match="(?i)resource in use|busy|open result"):
         con.sql("SELECT 1").fetchall()
+
+
+# ── query_relation ───────────────────────────────────────────────────────
+
+
+def _table_t() -> Any:
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t AS SELECT range AS a FROM range(3)")
+    return con
+
+
+@pytest.mark.parametrize(
+    "sql, columns",
+    [
+        ("SELECT 1 AS a", ["a"]),
+        ("WITH x AS (SELECT 1 AS a) SELECT * FROM x", ["a"]),
+        ("FROM t", ["a"]),
+        ("CREATE TABLE made AS SELECT 1 AS q; SELECT * FROM made", ["q"]),
+        ("INSERT INTO t VALUES (7) RETURNING a", ["a"]),
+        ("UPDATE t SET a = a RETURNING a", ["a"]),
+        ('SELECT count(*) AS "Count" FROM t', ["Count"]),
+        ("PIVOT t ON a USING count(*)", ["0", "1", "2"]),
+        ("DESCRIBE t", None),
+        ("CALL pragma_version()", None),
+        ("EXPLAIN SELECT 1", None),
+    ],
+)
+def test_query_relation_keeps_a_query(sql, columns):
+    rel = query_relation(_table_t(), sql)
+    assert rel is not None
+    if columns is not None:
+        assert rel.columns == columns
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE TABLE made AS SELECT 1 AS q",
+        "CREATE OR REPLACE VIEW v AS SELECT 1 AS q",
+        "INSERT INTO t VALUES (7)",
+        "UPDATE t SET a = a",
+        "DELETE FROM t WHERE a = 100",
+        "MERGE INTO t USING (SELECT 1 AS a) s ON t.a = s.a "
+        "WHEN NOT MATCHED THEN INSERT VALUES (s.a)",
+        "DROP TABLE t",
+        "SET threads = 2",
+        "SELECT 1 AS x; CREATE TABLE made AS SELECT 1 AS q",
+    ],
+)
+def test_query_relation_is_none_for_a_statement_that_returns_no_rows(sql):
+    """DuckDB 1.5 returned None here; 2.0 returns a relation over a row count,
+    which an engine writing "the result" would write as a one-row Count file."""
+    assert query_relation(_table_t(), sql) is None
+
+
+def test_query_relation_of_a_copy_is_none(tmp_path):
+    con = _table_t()
+    assert query_relation(con, f"COPY t TO '{tmp_path / 'x.csv'}'") is None
+    assert (tmp_path / "x.csv").read_text(encoding="utf-8").splitlines() == ["a", "0", "1", "2"]
+
+
+def test_query_relation_runs_each_statement_once():
+    con = _table_t()
+    assert query_relation(con, "INSERT INTO t VALUES (7)") is None
+    assert first_row(con.execute("SELECT count(*) FROM t WHERE a = 7")) == (1,)
+    assert query_relation(con, "CREATE TABLE made AS SELECT 1 AS q") is None
+    assert con.execute("SELECT q FROM made").fetchall() == [(1,)]
+
+
+# ── the engine, end to end ───────────────────────────────────────────────
+
+
+@pytest.fixture
+def product(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    contract_dir = tmp_path / "product"
+    (contract_dir / "data").mkdir(parents=True)
+    (contract_dir / "data" / "orders.csv").write_text("id,amount\n1,10\n2,20\n", encoding="utf-8")
+    (tmp_path / "home").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(contract_dir)
+    monkeypatch.delenv("FLUID_UPSTREAM_CONTRACTS", raising=False)
+    return contract_dir
+
+
+def _local_apply(product: Path, *actions: Dict[str, Any]) -> List[Dict[str, Any]]:
+    from fluid_build.providers.local.local import LocalProvider
+
+    provider = LocalProvider(project="local", region="local", anchor_dir=product)
+    load = {"op": "load_data", "path": str(product / "data" / "orders.csv"), "table_name": "orders"}
+    return provider.apply(actions=[load, *actions])["results"]
+
+
+def test_local_apply_counts_rows_and_materializes(product):
+    """On DuckDB 2.0 the SQL action's row count was lost (``rows: None``) and a
+    materialize step fell back to a skipped ``noop`` after writing its file."""
+    out = product / "out"
+    results = _local_apply(
+        product,
+        {
+            "op": "sql",
+            "sql": "SELECT * FROM orders",
+            "output_table": "t1",
+            "outputs": [str(out / "t1.parquet")],
+        },
+        {"op": "materialize", "source_table": "t1", "dst": str(out / "copy.csv")},
+    )
+    assert [r["status"] for r in results] == ["ok", "ok", "ok"], results
+    assert results[0]["rows"] == 2
+    assert results[1]["rows"] == 2
+    assert results[2]["op"] == "materialize"
+    assert (out / "copy.csv").read_text(encoding="utf-8").splitlines() == [
+        "id,amount",
+        "1,10",
+        "2,20",
+    ]
+
+
+def test_local_sql_that_returns_no_rows_fails_the_same_on_both_versions(product):
+    """1.5 failed on ``None.write_csv``; 2.0 wrote a one-row ``Count`` file and
+    reported ok. Both now refuse it and say what to write instead."""
+    out = product / "out" / "made.csv"
+    results = _local_apply(
+        product,
+        {"op": "sql", "sql": "CREATE TABLE made AS SELECT * FROM orders", "outputs": [str(out)]},
+    )
+    assert results[1]["status"] == "error"
+    assert "returns no rows" in results[1]["error"]
+    assert "End the SQL with a SELECT" in results[1]["error"]
+    assert not out.exists()
+
+
+def test_contract_tests_sql_that_returns_no_rows_fails_clearly():
+    from fluid_build.contract_tests import LocalProviderError, _execute_sql
+
+    with pytest.raises(LocalProviderError, match="returns no rows"):
+        _execute_sql(duckdb.connect(), "CREATE TABLE made AS SELECT 1 AS q")
+    assert _execute_sql(duckdb.connect(), "SELECT 1 AS q").fetchall() == [(1,)]
+
+
+def test_the_snowflake_mock_connects(tmp_path):
+    """DuckDB 2.0 refuses ``CREATE SCHEMA information_schema`` (a system catalog)."""
+    from fluid_build.providers.local.mocks import SnowflakeDuckDBMock
+
+    mock = SnowflakeDuckDBMock(db_path=str(tmp_path / "sf.duckdb"))
+    con = mock.connect()
+    assert con.execute("SELECT count(*) FROM information_schema.schemata").fetchall()[0][0] > 0
+    assert con.execute(
+        "SELECT count(*) FROM information_schema.schemata WHERE schema_name = 'PUBLIC'"
+    ).fetchall() == [(1,)]
+    con.close()
 
 
 # ── storage format ───────────────────────────────────────────────────────

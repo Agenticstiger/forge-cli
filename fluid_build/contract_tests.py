@@ -53,7 +53,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fluid_build.providers._duckdb_compat import first_row
+from fluid_build.providers._duckdb_compat import first_row, query_relation
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
     DuckDBSandboxError,
@@ -209,10 +209,9 @@ def _execute_sql(con, sql: str):
     if not sql_stripped:
         raise LocalProviderError("No SQL provided for action")
     try:
-        # DuckDB returns a Relation for SELECT; for CREATE TABLE AS, we can
-        # run an additional SELECT if needed. We assume a SELECT for portability.
-        rel = con.sql(sql_stripped)
-        return rel
+        # A relation for a query; None when the last statement returns no rows
+        # (CREATE TABLE AS, INSERT), on DuckDB 1.5 and 2.x alike.
+        rel = query_relation(con, sql_stripped)
     except Exception as e:
         # Try to be helpful if the error hints at missing tables
         msg = str(e)
@@ -222,6 +221,12 @@ def _execute_sql(con, sql: str):
                 "the SQL references the correct table/view names. Error: " + msg
             ) from e
         raise LocalProviderError("SQL execution failed: " + msg) from e
+    if rel is None:
+        raise LocalProviderError(
+            "The action's SQL ends in a statement that returns no rows (CREATE, INSERT, "
+            "UPDATE, ...), so it has no result to write. End it with a SELECT of the result."
+        )
+    return rel
 
 
 def _write_output(rel, outputs: Dict[str, Any], dry_run: bool) -> Tuple[int, Optional[str]]:
