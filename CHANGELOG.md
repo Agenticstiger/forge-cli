@@ -47,9 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `schedule/` artifacts, so pipeline stage 11 skips `fluid schedule-sync`, and a DAG
   deployed for it earlier stays in the scheduler: remove that DAG by hand.
 - `fluid scaffold-composer` writes no DAG for a contract whose every build runs outside
-  forge-cli (`engine: flink`, `properties.language: flink_sql`) or continuously, where it
-  used to write one. A DAG it wrote for such a contract before stays in `--out-dir`, which
-  the command names, and in Cloud Composer if you deployed it: delete both.
+  forge-cli (`engine: flink`, `properties.language: flink_sql`) or continuously and that
+  declares no `orchestration.tasks`, where it used to write one. A DAG it wrote for such a
+  contract before stays in `--out-dir`, which the command names, and in Cloud Composer if
+  you deployed it: delete both.
 - An environment overlay cannot turn a scheduled build continuous: overlays cannot
   delete the base's `cron` or `schedule`, which a continuous trigger refuses. Declare the
   trigger in each environment's overlay instead of in the base.
@@ -67,10 +68,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Airflow's `@continuous`, which starts batch runs back to back. 0.7.5 is unchanged.
   Declare it on a build that runs outside forge-cli or on a connector: on a build forge-cli
   runs as a batch run, `fluid validate` warns and `--strict` fails. The dbt and python
-  runners refuse the trigger and say why, and an inline-SQL build or a `duckdb`, `airbyte`,
-  `meltano` or `dlt` acquisition runs once per `fluid apply`. A `spark`, `glue` or `custom`
-  build gets no warning: forge-cli has no runner of its own for it, and its platform may
-  keep it running.
+  runners refuse the trigger and say why (the python runner also takes a build with no
+  engine), and an inline-SQL build or a `duckdb`, `airbyte`, `meltano` or `dlt`
+  acquisition runs only when `fluid apply` runs builds. A continuous build that no
+  forge-cli runner takes, such as a `spark`, `glue` or `custom` one, or inline SQL on a
+  platform with no embedded-SQL executor, gets no warning: `fluid apply --mode
+  amend-and-build` leaves it to its platform, as it does a Flink job.
 
 ### Changed
 
@@ -79,8 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subschema it must not match.
 - `fluid scaffold-composer` takes the DAG's cron from the first build a scheduler starts,
   so a Flink job's own cron no longer schedules it, and writes no DAG for a contract whose
-  every build runs outside forge-cli or continuously, as `fluid generate schedule` writes
-  no files for one.
+  every build runs outside forge-cli or continuously, unless it declares
+  `orchestration.tasks`: the test `fluid generate schedule` applies before it writes no
+  files.
 
 ### Fixed
 
