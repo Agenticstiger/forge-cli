@@ -398,6 +398,18 @@ class TestCollectOverlayWarnings:
             pass
         assert _OVERLAY_WARNING_SINK.get() is None
 
+    def test_a_block_that_raises_logs_what_it_took(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Its caller reports the warnings only when the block completes: a
+        # patch retargeted before another entry failed the merge was lost.
+        from fluid_build.loader import collect_overlay_warnings
+
+        caplog.set_level(logging.WARNING, logger="fluid.loader")
+        with pytest.raises(OverlayMergeError):
+            with collect_overlay_warnings():
+                _merge(_base("0.7.5"), PROD)
+                raise OverlayMergeError("the next list failed")
+        assert _events(caplog) == ["overlay_patch_retargeted"]
+
 
 def _write_product(tmp_path: Path, version: str, overlay: Dict[str, Any]) -> None:
     contract = {
@@ -646,6 +658,25 @@ class TestValidateBundleStrict:
         assert "overlayWarnings" not in _manifest_source(tmp_path / "b.tgz")
         result = _validate_bundle(tmp_path, "--strict")
         assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_a_merge_that_then_fails_still_names_the_retargeted_patch(self, tmp_path: Path) -> None:
+        # Two defects in one overlay: a patch retargeted in builds (whose ids
+        # repeat, so they merge by position), then an exposes entry with no id.
+        _write_product(tmp_path, "0.7.6", {})
+        contract = yaml.safe_load((tmp_path / "contract.fluid.yaml").read_text("utf-8"))
+        contract["builds"][0]["id"] = "ingest"
+        second = copy.deepcopy(contract["exposes"][0])
+        second["exposeId"] = "service_instances_v2"
+        contract["exposes"].append(second)
+        (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(contract), "utf-8")
+        overlay = dict(PROD_BY_POSITION, exposes=[{"description": "no exposeId"}])
+        (tmp_path / "overlays" / "prod.yaml").write_text(yaml.safe_dump(overlay), "utf-8")
+        argv = ["contract.fluid.yaml", "--env", "prod", "--format", "tgz", "--out", "b.tgz"]
+        built = _fluid(tmp_path, "bundle", *argv)
+        out = built.stdout + built.stderr
+        assert built.returncode == 1, out
+        assert "exposes[0] names no exposeId" in out
+        assert out.count("overlay_patch_retargeted") == 1
 
     def test_a_bundle_that_records_none_still_validates(self, tmp_path: Path) -> None:
         # Bundles built before the record existed carry no overlayWarnings:

@@ -452,12 +452,18 @@ def collect_overlay_warnings(
     appended to the yielded list instead, once, and logged at DEBUG only: the
     caller reports it, so the terminal does not show it twice. A warning the
     block takes is not marked as said, so a later load outside a block still
-    logs it.
+    logs it. A block that raises cannot report what it took, such as a patch
+    retargeted before another overlay entry failed the merge, so those
+    warnings are logged here before the error propagates.
     """
     sink: List[OverlayWarning] = []
     token = _OVERLAY_WARNING_SINK.set((events, sink))
     try:
         yield sink
+    except Exception:
+        for warning in sink:
+            _log_warning_once(warning.message, {"event": warning.event})
+        raise
     finally:
         _OVERLAY_WARNING_SINK.reset(token)
 
@@ -474,6 +480,10 @@ def _warn_once(event: str, name: str, index: Optional[int], message: str, *args:
             collecting[1].append(warning)
         LOG.debug("%s", text, extra=extra)
         return
+    _log_warning_once(text, extra)
+
+
+def _log_warning_once(text: str, extra: Dict[str, Any]) -> None:
     with _NOTED_OVERLAY_MERGE_WARNINGS_LOCK:
         if text in _NOTED_OVERLAY_MERGE_WARNINGS:
             return
