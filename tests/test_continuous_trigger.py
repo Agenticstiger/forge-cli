@@ -123,6 +123,15 @@ class TestSchema:
             f"time, so its trigger takes no other trigger. Remove {field}, or {remedy}."
         ]
 
+    @pytest.mark.parametrize("trigger", [None, "@daily", ["0 2 * * *"]])
+    def test_a_trigger_that_is_not_an_object_gets_one_error(self, trigger: Any) -> None:
+        # A blank `trigger:` in YAML is null; it used to draw five refusals
+        # of a continuous trigger nobody declared.
+        contract = _contract()
+        contract["builds"][0]["execution"]["trigger"] = trigger
+        assert [m for m in _errors("0.7.6", contract) if "continuous" in m] == []
+        assert len(_errors("0.7.6", contract)) == 1
+
     @pytest.mark.parametrize(
         "trigger",
         [

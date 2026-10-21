@@ -4388,6 +4388,7 @@
       "allOf": [
         {
           "if": {
+            "type": "object",
             "required": [
               "type"
             ],
