@@ -427,6 +427,20 @@ def _write_product(tmp_path: Path, version: str, overlay: Dict[str, Any]) -> Non
 #: Written against ``[ingest, transform]``: its second entry patches transform.
 PROD_BY_POSITION = {"builds": [{}, {"id": "transform", "description": "8 executors"}]}
 
+#: Environment variables a CLI subprocess here must not inherit: API keys, and
+#: the debug level ``tests/cli/conftest.py`` sets, which some xdist workers keep.
+#: At DEBUG the loader also logs a warning the command reports, and the tests
+#: below count that the terminal shows it once.
+_NOT_INHERITED = ("FLUID_LOG_LEVEL", "FLUID_DEBUG", "FLUID_SHOW_REGISTRATION")
+
+
+def _cli_env() -> Dict[str, str]:
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if not k.endswith("_API_KEY") and k not in _NOT_INHERITED
+    }
+
 
 def _validate(tmp_path: Path, *argv: str) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(
@@ -435,7 +449,7 @@ def _validate(tmp_path: Path, *argv: str) -> "subprocess.CompletedProcess[str]":
         cwd=str(tmp_path),
         capture_output=True,
         text=True,
-        env={k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")},
+        env=_cli_env(),
     )
 
 
@@ -515,7 +529,7 @@ def test_workspace_validate_strict_fails_on_it(tmp_path: Path) -> None:
     product.mkdir(parents=True)
     _write_product(product, "0.7.5", PROD_BY_POSITION)
     run = [sys.executable, "-m", "fluid_build.cli", "validate", "--env", "prod", "--offline"]
-    env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
+    env = _cli_env()
     lenient = subprocess.run(run, cwd=tmp_path, capture_output=True, text=True, env=env)
     strict = subprocess.run(
         run + ["--strict"], cwd=tmp_path, capture_output=True, text=True, env=env
