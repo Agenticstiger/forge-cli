@@ -403,11 +403,14 @@ class TestCollectOverlayWarnings:
         # patch retargeted before another entry failed the merge was lost.
         from fluid_build.loader import collect_overlay_warnings
 
-        caplog.set_level(logging.WARNING, logger="fluid.loader")
-        with pytest.raises(OverlayMergeError):
+        def merge_then_fail() -> None:
             with collect_overlay_warnings():
                 _merge(_base("0.7.5"), PROD)
                 raise OverlayMergeError("the next list failed")
+
+        caplog.set_level(logging.WARNING, logger="fluid.loader")
+        with pytest.raises(OverlayMergeError, match="the next list failed"):
+            merge_then_fail()
         assert _events(caplog) == ["overlay_patch_retargeted"]
 
 
