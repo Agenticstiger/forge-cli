@@ -42,12 +42,7 @@ try:
 except Exception:  # pragma: no cover
     yaml = None
 
-from ..loader import (
-    RefResolutionError,
-    collect_overlay_warnings,
-    compile_contract,
-    load_with_overlay,
-)
+from ..loader import RefResolutionError, collect_overlay_warnings, compile_contract
 from ..observability.tracing import traced_stage
 
 COMMAND = "bundle"
