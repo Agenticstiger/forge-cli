@@ -10,18 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Upgrade notes
 
 - `fluid validate --env <env> --strict` (on one contract or a whole workspace), `fluid
-  contract-validation --env <env> --strict` and `fluid test --env <env> --strict` now fail
-  when an overlay patch lands on an entry that names another id
-  (`overlay_patch_retargeted`), which an overlay merged by position can do: a 0.7.5 or
-  older contract, or a 0.7.6 base whose entries lack unique ids. Without `--strict` these
-  commands list it among their warnings (`fluid test` as an "Environment overlay" row),
-  and the loader no longer also logs it there. Put the overlay's entries in the base's
-  order, or set `fluidVersion: "0.7.6"` so overlays patch by id. `overlay_entry_added`
-  stays a log line and does not fail `--strict`. `fluid validate <bundle>.tgz` does not
-  see the warning: `fluid bundle --env` merged the overlay before, so validate the
-  contract file with `--env`.
+  contract-validation --env <env> --strict` and `fluid test --env <env> --strict` (the
+  native engine; `--engine soda` does not read `--strict`) now fail when an overlay patch
+  lands on an entry that names another id (`overlay_patch_retargeted`), which an overlay
+  merged by position can do: a 0.7.5 or older contract, or a 0.7.6 base whose entries lack
+  unique ids. Without `--strict` these commands list it among their warnings (`fluid test`
+  as an "Environment overlay" row, `fluid validate --quiet` as a `WARNING:` line), and the
+  loader no longer also logs it there. Put the overlay's entries in the base's order, or
+  set `fluidVersion: "0.7.6"` with a unique id on every base entry, so overlays patch by
+  id. `overlay_entry_added` stays a log line and does not fail `--strict`. `fluid validate
+  <bundle>.tgz` does not see the warning: `fluid bundle --env` merged the overlay before,
+  so validate the contract file with `--env`.
 - `fluid validate --strict` now says `Validation failed: warnings treated as errors
-  (--strict)` when warnings alone fail it, after a summary that reads valid.
+  (--strict)` when warnings alone fail it, after a summary that reads valid; with
+  `--quiet` it prints each such warning as `ERROR (--strict): <warning>`.
+- A product whose every build becomes `continuous` (or runs outside forge-cli) gets no
+  `schedule/` artifacts, so pipeline stage 11 skips `fluid schedule-sync`, and a DAG
+  deployed for it earlier stays in the scheduler: remove that DAG by hand.
+- An environment overlay cannot turn a scheduled build continuous: overlays cannot
+  delete the base's `cron` or `schedule`, which a continuous trigger refuses. Declare the
+  trigger in each environment's overlay instead of in the base.
 
 ### Added
 
