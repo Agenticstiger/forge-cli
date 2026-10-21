@@ -164,10 +164,13 @@ def test_a_scheduler_gets_no_task_for_a_continuous_connector() -> None:
     assert [t["taskId"] for t in tasks] == ["daily"]
 
 
-def test_a_continuous_build_gets_no_fluid_apply_dag() -> None:
+@pytest.mark.parametrize("kind, scheduled", [("continuous", False), ("schedule", True)])
+def test_a_continuous_build_gets_no_fluid_apply_dag(kind: str, scheduled: bool) -> None:
+    # With a cron beside it, as a contract that skipped validation can have.
     from fluid_build.schedulers.airflow.fluid_apply import has_scheduled_builds
 
-    assert has_scheduled_builds({"builds": [_connector({"type": "continuous"})]}) is False
+    contract = {"builds": [_connector({"type": kind, "cron": "0 2 * * *"})]}
+    assert has_scheduled_builds(contract) is scheduled
 
 
 def test_schedule_sync_writes_nothing_for_a_continuous_connector(tmp_path: Path) -> None:
