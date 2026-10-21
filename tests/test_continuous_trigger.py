@@ -242,6 +242,8 @@ class TestCli:
 
 _SQL = {"sql": "SELECT 1"}
 _REMEDY = "Use trigger.type schedule or manual, or run the job on a platform that keeps it running."
+# A spark, glue or custom build is left to the platform it names.
+_PLATFORM_REMEDY = _REMEDY[:-1] + ", named in execution.runtime.platform."
 
 
 def _build(engine: Any = None, trigger: str = "continuous", **extra: Any) -> Dict[str, Any]:
@@ -341,7 +343,8 @@ class TestBatchBuildWarning:
     def test_every_batch_runner_is_warned(self, build: Dict[str, Any], says: str) -> None:
         (warning,) = _warnings({"builds": [build]})
         assert says in warning
-        assert warning.endswith(_REMEDY)
+        platform_run = build.get("engine") in ("spark", "glue", "custom")
+        assert warning.endswith(_PLATFORM_REMEDY if platform_run else _REMEDY)
 
     @pytest.mark.parametrize(
         "build",
@@ -387,6 +390,11 @@ class TestBatchBuildWarning:
     def test_any_shape_is_read_without_raising(self, contract: Dict[str, Any]) -> None:
         # fluid validate runs its contract rules on a contract the schema refused too.
         assert _warnings(contract) == []
+
+    def test_a_spark_build_is_told_where_to_name_its_platform(self) -> None:
+        (warning,) = _warnings({"builds": [_build("spark")]})
+        assert warning.endswith(_PLATFORM_REMEDY)
+        assert _warnings({"builds": [_build("spark", execution=_runtime())]}) == []
 
     def test_a_build_without_an_id_is_named_by_index(self) -> None:
         build = _build("python")

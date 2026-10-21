@@ -327,9 +327,13 @@ def continuous_trigger_warnings(contract: Dict[str, Any]) -> List[str]:
             outcome = (
                 ": this build runs only when fluid apply runs builds, and no scheduler starts it"
             )
+        remedy = CONTINUOUS_REMEDY
+        if refuser == "python" and str(engine or "").strip().lower() in PLATFORM_RUN_ENGINES:
+            # Naming that platform is what leaves the job to it.
+            remedy = remedy[:-1] + ", named in execution.runtime.platform."
         warnings.append(
             f"{where}: trigger.type continuous on {on}: forge-cli runs {runs} as batch runs, "
-            f"which end{outcome}. {CONTINUOUS_REMEDY}"
+            f"which end{outcome}. {remedy}"
         )
     return warnings
 

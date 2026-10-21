@@ -71,10 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runners refuse the trigger and say why (the python runner takes every build no other
   runner does, such as one with no engine or a local `spark` script), and an inline-SQL
   build or a `duckdb`, `airbyte`, `meltano` or `dlt` acquisition runs only when `fluid
-  apply` runs builds. A continuous `spark`, `glue` or `custom` build that names a
-  `runtime.platform` other than `local`, or inline SQL on a platform with no embedded-SQL
-  executor, gets no warning: `fluid apply --mode amend-and-build` leaves it to that
-  platform, as it does a Flink job.
+  apply` runs builds. A continuous `spark`, `glue` or `custom` build without inline SQL
+  that names a `runtime.platform` other than `local`, or inline SQL on a platform with no
+  embedded-SQL executor, gets no warning: `fluid apply --mode amend-and-build` leaves it
+  to that platform, as it does a Flink job.
 
 ### Changed
 
