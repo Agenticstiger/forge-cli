@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
@@ -451,9 +452,12 @@ class TestValidateStrict:
             " ".join(result.stdout.split())
         )
 
-    def test_strict_fails_on_it(self, tmp_path: Path) -> None:
+    def test_strict_fails_on_it_and_says_why(self, tmp_path: Path) -> None:
+        # The summary above reads "Valid FLUID contract".
         _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
-        assert _validate(tmp_path, "--strict").returncode == 1
+        result = _validate(tmp_path, "--strict")
+        assert result.returncode == 1
+        assert "Validation failed: warnings treated as errors (--strict)" in result.stdout
 
     def test_strict_json_lists_it(self, tmp_path: Path) -> None:
         _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
@@ -473,6 +477,42 @@ class TestValidateStrict:
         _write_product(tmp_path, "0.7.6", overlay)
         result = _validate(tmp_path, "--strict")
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_workspace_validate_strict_fails_on_it(tmp_path: Path) -> None:
+    # `fluid validate --env prod --strict` with no contract validates every
+    # product in the workspace.
+    (tmp_path / "fluid.workspace.yaml").write_text(
+        yaml.safe_dump({"products_dir": "products"}), encoding="utf-8"
+    )
+    product = tmp_path / "products" / "svc"
+    product.mkdir(parents=True)
+    _write_product(product, "0.7.5", PROD_BY_POSITION)
+    run = [sys.executable, "-m", "fluid_build.cli", "validate", "--env", "prod", "--offline"]
+    env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
+    lenient = subprocess.run(run, cwd=tmp_path, capture_output=True, text=True, env=env)
+    strict = subprocess.run(
+        run + ["--strict"], cwd=tmp_path, capture_output=True, text=True, env=env
+    )
+    assert lenient.returncode == 0, lenient.stdout + lenient.stderr
+    assert "overlay_patch_retargeted" in lenient.stdout
+    assert strict.returncode == 1
+    assert "1 overlay warning(s), treated as errors (--strict)" in strict.stdout
+
+
+def test_fluid_test_shows_it_as_a_row() -> None:
+    # `fluid test --strict` failed on it without printing it.
+    from fluid_build.cli.contract_validation import ValidationReport
+    from fluid_build.cli.test import _build_check_rows
+
+    report = ValidationReport("c.yaml", "p", "1", datetime.now(), 0.0)
+    report.add_issue("warning", "overlay", "overlay_patch_retargeted: in p, the overlay's ...")
+    rows = {name: (status, detail) for status, name, detail in _build_check_rows(report)}
+    status, detail = rows["Environment overlay"]
+    assert status != rows["Schema syntax"][0]
+    assert detail.startswith("overlay_patch_retargeted: in p")
+    report.issues.clear()
+    assert "Environment overlay" not in [name for _, name, _ in _build_check_rows(report)]
 
 
 def test_contract_validation_reports_it_as_a_warning(tmp_path: Path) -> None:
