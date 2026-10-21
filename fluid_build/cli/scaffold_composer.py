@@ -188,21 +188,40 @@ def _extract_cron(c: dict) -> object:
     return "0 2 * * *"
 
 
-def _report_nothing_to_schedule(dag_path: str) -> None:
+def _wrote_dag(dag_path: str, dag_id: str) -> bool:
+    """True when ``dag_path`` is a DAG this command wrote for ``dag_id``: it
+    carries the template's ``tags=["FLUID"]`` and its ``dag_id``, quoted as
+    ``py_str_literal`` writes it or as the template did before it."""
+    if not os.path.isfile(dag_path):
+        return False
+    try:
+        with open(dag_path, encoding="utf-8", errors="replace") as f:
+            head = f.read(65536)
+    except OSError:
+        return False
+    return 'tags=["FLUID"]' in head and (
+        f"dag_id={py_str_literal(dag_id)}," in head or f'dag_id="{dag_id}",' in head
+    )
+
+
+def _report_nothing_to_schedule(dag_path: str, dag_id: str) -> None:
     """Say why no DAG is written, as ``fluid generate schedule`` does, and name
-    a DAG written for the product before: left in place, it keeps scheduling
-    the product wherever it was deployed."""
+    a DAG this command wrote for the product before: left in place, it keeps
+    scheduling the product wherever it was deployed. A file of the same name
+    that it did not write is someone else's, and is not mentioned."""
     cprint(
         "Every build runs outside forge-cli (a Flink job, for example) or continuously "
         "(trigger.type: continuous), so there is nothing to schedule. No DAG written."
     )
-    if os.path.exists(dag_path):
-        # soft_wrap: the terminal wraps the line, so the path is never broken
-        # by an inserted newline and copies whole.
+    if _wrote_dag(dag_path, dag_id):
+        # Printed as written: soft_wrap leaves wrapping to the terminal, so the
+        # path is never broken by an inserted newline and copies whole, and no
+        # [markup] or :emoji: code in it is rendered.
         cprint(
-            f"A DAG written for this product before is still at {dag_path}: delete it, and "
-            "remove it from Cloud Composer if you deployed it there.",
+            f"A DAG this command wrote for the product before is still at {dag_path}: delete "
+            "it, and remove it from Cloud Composer if you deployed it there.",
             markup=False,
+            emoji=False,
             soft_wrap=True,
         )
 
@@ -220,10 +239,14 @@ def run(args, logger: logging.Logger) -> int:
         # component that doubles as a valid Python ``dag_id``.
         dag_id = sanitize_identifier(c.get("id") or c.get("name") or "fluid_product")
         # No scheduler starts a Flink job or a continuous build, so a contract
-        # with no other build has nothing to schedule, as `fluid generate
-        # schedule` says, and gets no DAG.
-        if has_only_unscheduled_builds(c):
-            _report_nothing_to_schedule(os.path.join(os.path.abspath(args.out_dir), f"{dag_id}.py"))
+        # with no other build has nothing to schedule and gets no DAG. The
+        # test is `fluid generate schedule`'s, hand-declared orchestration
+        # tasks included, so the two commands agree on such a contract.
+        from fluid_build.schedulers.airflow.fluid_apply import has_explicit_tasks
+
+        if has_only_unscheduled_builds(c) and not has_explicit_tasks(c):
+            dag_path = os.path.join(os.path.abspath(args.out_dir), f"{dag_id}.py")
+            _report_nothing_to_schedule(dag_path, dag_id)
             return 0
         cron = _validate_cron(_extract_cron(c))
         # SECURITY (shell + Python-literal injection): the contract path is

@@ -559,17 +559,18 @@ class TestRunnerRefusal:
 
 class TestScaffoldComposer:
     @staticmethod
-    def _run(tmp_path: Path, *builds: Dict[str, Any]) -> "tuple[int, Path]":
+    def _run(
+        tmp_path: Path, *builds: Dict[str, Any], out: str = "dags", **top: Any
+    ) -> "tuple[int, Path]":
         import logging
         from types import SimpleNamespace
 
         from fluid_build.cli.scaffold_composer import run
 
         contract = tmp_path / "contract.fluid.yaml"
-        contract.write_text(
-            yaml.safe_dump({"id": "net.instances", "builds": list(builds)}), "utf-8"
-        )
-        out_dir = tmp_path / "dags"
+        doc = {"id": "net.instances", "builds": list(builds), **top}
+        contract.write_text(yaml.safe_dump(doc), "utf-8")
+        out_dir = tmp_path / out
         args = SimpleNamespace(contract=str(contract), env=None, out_dir=str(out_dir))
         return run(args, logging.getLogger("test.scaffold_composer")), out_dir
 
@@ -584,17 +585,40 @@ class TestScaffoldComposer:
         assert "continuously (trigger.type: continuous), so there is nothing to schedule." in out
         assert "No DAG written." in out
 
-    def test_a_dag_written_before_is_named_and_kept(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    @pytest.mark.parametrize("out", ["dags", "dags [/]:id:"])
+    def test_a_dag_it_wrote_before_is_named_and_kept(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture, out: str
     ) -> None:
-        stale = tmp_path / "dags" / "net_instances.py"
-        stale.parent.mkdir()
-        stale.write_text("# nightly\n", "utf-8")
+        scheduled = {"id": "t", "engine": "dbt", "execution": {"trigger": {"cron": "0 3 * * *"}}}
+        self._run(tmp_path, scheduled, out=out)
+        (dag,) = (tmp_path / out).glob("*.py")
+        written = dag.read_text("utf-8")
+        capsys.readouterr()
+        rc, _ = self._run(tmp_path, _connector({"type": "continuous"}), out=out)
+        assert rc == 0
+        assert dag.read_text("utf-8") == written
+        # As written and whole: no markup or emoji rendered, no fold to break a copy.
+        assert f"is still at {dag}: delete it" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "content, named",
+        [
+            # The template before #215 quoted the dag_id with double quotes.
+            ('    dag_id="net_instances",\n    tags=["FLUID"]\n', True),
+            ("# hand-written by another team\n", False),
+            ('    dag_id="other_product",\n    tags=["FLUID"]\n', False),
+        ],
+    )
+    def test_only_a_file_it_wrote_is_named(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture, content: str, named: bool
+    ) -> None:
+        existing = tmp_path / "dags" / "net_instances.py"
+        existing.parent.mkdir()
+        existing.write_text(content, "utf-8")
         rc, _ = self._run(tmp_path, _connector({"type": "continuous"}))
         assert rc == 0
-        assert stale.read_text("utf-8") == "# nightly\n"
-        # Whole, as printed: a path folded across lines does not copy.
-        assert f"is still at {stale}: delete it" in capsys.readouterr().out
+        assert existing.read_text("utf-8") == content
+        assert ("is still at" in capsys.readouterr().out) is named
 
     def test_the_cron_comes_from_a_build_a_scheduler_starts(self, tmp_path: Path) -> None:
         # The Flink job's cron is its platform's business, not this DAG's.
@@ -607,6 +631,14 @@ class TestScaffoldComposer:
         assert rc == 0
         (dag,) = out_dir.glob("*.py")
         assert "schedule='0 3 * * *'" in dag.read_text("utf-8")
+
+    def test_hand_declared_tasks_keep_the_dag(self, tmp_path: Path) -> None:
+        # As fluid generate schedule does: the contract declares what to run.
+        tasks = {"tasks": [{"taskId": "refresh", "action": "dbt_run"}]}
+        rc, out_dir = self._run(tmp_path, _connector({"type": "continuous"}), orchestration=tasks)
+        assert rc == 0
+        (dag,) = out_dir.glob("*.py")
+        assert "schedule='0 2 * * *'" in dag.read_text("utf-8")
 
     def test_a_contract_with_no_builds_keeps_its_nightly_dag(self, tmp_path: Path) -> None:
         rc, out_dir = self._run(tmp_path)
