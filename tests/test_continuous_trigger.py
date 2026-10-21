@@ -451,3 +451,64 @@ class TestRunnerRefusal:
         script.write_text("print('ran')\n", "utf-8")
         assert runner.execute_build(_build("python", trigger="event"), script, tmp_path) == 1
         assert "Unknown trigger type: event" in capsys.readouterr().out
+
+
+# ── scaffold-composer: a DAG only for builds a scheduler starts ──────────────
+
+
+class TestScaffoldComposer:
+    @staticmethod
+    def _run(tmp_path: Path, *builds: Dict[str, Any]) -> "tuple[int, Path]":
+        import logging
+        from types import SimpleNamespace
+
+        from fluid_build.cli.scaffold_composer import run
+
+        contract = tmp_path / "contract.fluid.yaml"
+        contract.write_text(
+            yaml.safe_dump({"id": "net.instances", "builds": list(builds)}), "utf-8"
+        )
+        out_dir = tmp_path / "dags"
+        args = SimpleNamespace(contract=str(contract), env=None, out_dir=str(out_dir))
+        return run(args, logging.getLogger("test.scaffold_composer")), out_dir
+
+    def test_nothing_to_schedule_writes_no_dag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        flink = {"id": "j", "engine": "flink", "execution": {"trigger": {"cron": "0 5 * * *"}}}
+        rc, out_dir = self._run(tmp_path, _connector({"type": "continuous"}), flink)
+        assert rc == 0
+        assert not out_dir.exists()
+        out = " ".join(capsys.readouterr().out.split())
+        assert "continuously (trigger.type: continuous), so there is nothing to schedule." in out
+        assert "No DAG written." in out
+
+    def test_a_dag_written_before_is_named_and_kept(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        stale = tmp_path / "dags" / "net_instances.py"
+        stale.parent.mkdir()
+        stale.write_text("# nightly\n", "utf-8")
+        rc, _ = self._run(tmp_path, _connector({"type": "continuous"}))
+        assert rc == 0
+        assert stale.read_text("utf-8") == "# nightly\n"
+        out = " ".join(capsys.readouterr().out.split())
+        assert "net_instances.py" in out and "delete it" in out
+
+    def test_the_cron_comes_from_a_build_a_scheduler_starts(self, tmp_path: Path) -> None:
+        # The Flink job's cron is its platform's business, not this DAG's.
+        rc, out_dir = self._run(
+            tmp_path,
+            {"id": "j", "engine": "flink", "execution": {"trigger": {"cron": "0 5 * * *"}}},
+            _connector({"type": "continuous"}),
+            {"id": "t", "engine": "dbt", "execution": {"trigger": {"cron": "0 3 * * *"}}},
+        )
+        assert rc == 0
+        (dag,) = out_dir.glob("*.py")
+        assert "schedule='0 3 * * *'" in dag.read_text("utf-8")
+
+    def test_a_contract_with_no_builds_keeps_its_nightly_dag(self, tmp_path: Path) -> None:
+        rc, out_dir = self._run(tmp_path)
+        assert rc == 0
+        (dag,) = out_dir.glob("*.py")
+        assert "schedule='0 2 * * *'" in dag.read_text("utf-8")

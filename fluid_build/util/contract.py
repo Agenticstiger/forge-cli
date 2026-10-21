@@ -176,6 +176,14 @@ def is_unscheduled_build(build: Mapping[str, Any]) -> bool:
     return is_externally_run_build(build) or is_continuous_build(build)
 
 
+def has_only_unscheduled_builds(contract: Mapping[str, Any]) -> bool:
+    """True when the contract has builds and no scheduler starts any of them:
+    each runs outside forge-cli, or continuously (:func:`is_unscheduled_build`).
+    A contract with no builds is False: no build of it was left out."""
+    builds = [b for b in get_builds(contract) if isinstance(b, Mapping)]
+    return bool(builds) and all(is_unscheduled_build(b) for b in builds)
+
+
 def get_contract_version(contract: Mapping[str, Any]) -> Optional[str]:
     """
     Get the FLUID schema version from a contract.

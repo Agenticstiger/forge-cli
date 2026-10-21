@@ -19,8 +19,11 @@ import logging
 import os
 import re
 import shlex
+from typing import Any, Dict, List
 
+from .._console import cprint
 from ..providers.common.codegen_utils import py_str_literal, sanitize_identifier
+from ..util.contract import has_only_unscheduled_builds, is_unscheduled_build
 from ._acquisition_stage_ext import _validate_cron as _validate_cron_grammar
 from ._common import CLIError, load_contract_with_overlay
 from ._logging import info
@@ -157,30 +160,53 @@ def _build_pipeline_bash_commands(contract_path: str, provider: str) -> tuple[st
     return validate_cmd, plan_cmd, apply_cmd
 
 
-def _extract_cron(c: dict) -> object:
-    """Pull the trigger cron from a contract, tolerating both the
-    normalized ``builds: [...]`` list shape (what
-    ``load_contract_with_overlay`` emits) and the legacy singular
-    ``build: {...}`` mapping. Returns the default daily cron when absent."""
+def _builds(c: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The contract's builds: the normalized ``builds: [...]`` list (what
+    ``load_contract_with_overlay`` emits), then the legacy singular
+    ``build: {...}`` mapping."""
     builds = c.get("builds")
-    if isinstance(builds, list):
-        for b in builds:
-            if isinstance(b, dict):
-                cron = ((b.get("execution") or {}).get("trigger") or {}).get("cron")
-                if cron is not None:
-                    return cron
+    found = [b for b in builds if isinstance(b, dict)] if isinstance(builds, list) else []
     legacy = c.get("build")
     if isinstance(legacy, dict):
-        cron = ((legacy.get("execution") or {}).get("trigger") or {}).get("cron")
+        found.append(legacy)
+    return found
+
+
+def _extract_cron(c: dict) -> object:
+    """Pull the trigger cron of the first build a scheduler starts, from the
+    normalized ``builds: [...]`` list or the legacy singular ``build: {...}``
+    mapping. A build no scheduler starts (a Flink job, or a continuous trigger:
+    :func:`~fluid_build.util.contract.is_unscheduled_build`) is skipped, so a
+    cron it carries for its own platform does not schedule this DAG. Returns
+    the default daily cron when absent."""
+    for b in _builds(c):
+        if is_unscheduled_build(b):
+            continue
+        cron = ((b.get("execution") or {}).get("trigger") or {}).get("cron")
         if cron is not None:
             return cron
     return "0 2 * * *"
 
 
+def _report_nothing_to_schedule(dag_path: str) -> None:
+    """Say why no DAG is written, as ``fluid generate schedule`` does, and name
+    a DAG written for the product before: left in place, it keeps scheduling
+    the product wherever it was deployed."""
+    cprint(
+        "Every build runs outside forge-cli (a Flink job, for example) or continuously "
+        "(trigger.type: continuous), so there is nothing to schedule. No DAG written."
+    )
+    if os.path.exists(dag_path):
+        cprint(
+            f"A DAG written for this product before is still at {dag_path}: delete it, and "
+            "remove it from Cloud Composer if you deployed it there.",
+            markup=False,
+        )
+
+
 def run(args, logger: logging.Logger) -> int:
     try:
         c = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
-        cron = _validate_cron(_extract_cron(c))
         # SECURITY (path traversal + filename injection): the contract's
         # id/name is attacker-influenced and was previously only ``.``->``_``
         # cleaned, which leaves ``/`` (path traversal) and an absolute name
@@ -190,6 +216,13 @@ def run(args, logger: logging.Logger) -> int:
         # to ``_`` and strips leading digits, yielding a single safe path
         # component that doubles as a valid Python ``dag_id``.
         dag_id = sanitize_identifier(c.get("id") or c.get("name") or "fluid_product")
+        # No scheduler starts a Flink job or a continuous build, so a contract
+        # with no other build has nothing to schedule, as `fluid generate
+        # schedule` says, and gets no DAG.
+        if has_only_unscheduled_builds(c):
+            _report_nothing_to_schedule(os.path.join(os.path.abspath(args.out_dir), f"{dag_id}.py"))
+            return 0
+        cron = _validate_cron(_extract_cron(c))
         # SECURITY (shell + Python-literal injection): the contract path is
         # interpolated into a generated ``bash_command`` that a shell runs at
         # task time AND into Python source Airflow imports at DAG-parse time.
