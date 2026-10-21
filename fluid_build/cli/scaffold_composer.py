@@ -197,10 +197,13 @@ def _report_nothing_to_schedule(dag_path: str) -> None:
         "(trigger.type: continuous), so there is nothing to schedule. No DAG written."
     )
     if os.path.exists(dag_path):
+        # soft_wrap: the terminal wraps the line, so the path is never broken
+        # by an inserted newline and copies whole.
         cprint(
             f"A DAG written for this product before is still at {dag_path}: delete it, and "
             "remove it from Cloud Composer if you deployed it there.",
             markup=False,
+            soft_wrap=True,
         )
 
 

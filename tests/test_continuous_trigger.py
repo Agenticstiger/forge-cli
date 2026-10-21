@@ -492,8 +492,8 @@ class TestScaffoldComposer:
         rc, _ = self._run(tmp_path, _connector({"type": "continuous"}))
         assert rc == 0
         assert stale.read_text("utf-8") == "# nightly\n"
-        out = " ".join(capsys.readouterr().out.split())
-        assert "net_instances.py" in out and "delete it" in out
+        # Whole, as printed: a path folded across lines does not copy.
+        assert f"is still at {stale}: delete it" in capsys.readouterr().out
 
     def test_the_cron_comes_from_a_build_a_scheduler_starts(self, tmp_path: Path) -> None:
         # The Flink job's cron is its platform's business, not this DAG's.
