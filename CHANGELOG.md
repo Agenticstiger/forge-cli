@@ -52,6 +52,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   here`, or the rule's own `description`, instead of quoting the whole object and the
   subschema it must not match.
 
+### Fixed
+
+- **`fluid test` and `fluid contract-validation` print the contract's text as written.**
+  Both read their report as Rich markup, so a JSON Schema pattern such as
+  `^[a-z0-9][a-z0-9-]*[a-z0-9]$` printed as `^*$`, `exposes[orders]` lost its id, and an
+  id or expose id holding `[/]` crashed the command with a `MarkupError` traceback. The
+  `❌` error lines every command prints, and the handler for an unexpected error, show
+  their text as written too, so an exception that quotes `[/]` no longer ends in a second
+  traceback. In that text, and in both reports, a control character prints as `\x1b`
+  and the like, so an escape sequence in a contract or an error message can no longer
+  clear the terminal or plant a link. JSON and JUnit output are unchanged.
+
 ## [0.21.0] — 2026-10-19
 
 ### Upgrade notes

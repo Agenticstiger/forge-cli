@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from fluid_build.cli.console import cprint, cprint_json, success
+from fluid_build.cli.console import cprint, cprint_json, literal_text, success
 from fluid_build.cli.console import error as console_error
 
 # Rich imports for enhanced output
@@ -1616,25 +1616,31 @@ def output_text_report(report: ValidationReport, output_file: Optional[str] = No
 
 
 def output_rich_report(report: ValidationReport, output_file: Optional[str] = None) -> None:
-    """Output validation report using Rich formatting."""
+    """Output validation report using Rich formatting.
+
+    The contract's own values (its id and version, every issue message and
+    path, a rule's severity) go in through ``literal_text``, never as markup:
+    an id holding ``[/]`` raised ``MarkupError``, and a JSON Schema
+    ``pattern`` lost its ``[a-z0-9]`` classes.
+    """
     console = Console()
 
     # Summary panel
     status_color = "green" if report.is_valid() else "red"
     status_icon = "✅" if report.is_valid() else "❌"
 
-    summary_text = f"""[bold]{status_icon} Contract Validation: {report.contract_id}[/bold]
-Version: {report.contract_version}
-Validated: {report.exposes_validated} exposed, {report.consumes_validated} consumed
-Results: {report.checks_passed} passed, {report.checks_failed} failed
-Duration: {report.duration:.2f}s"""
+    summary_text = Text.assemble(
+        literal_text(f"{status_icon} Contract Validation: {report.contract_id}", "bold"),
+        literal_text(f"\nVersion: {report.contract_version}"),
+        f"\nValidated: {report.exposes_validated} exposed, {report.consumes_validated} consumed",
+        f"\nResults: {report.checks_passed} passed, {report.checks_failed} failed",
+        f"\nDuration: {report.duration:.2f}s",
+    )
 
     console.print(Panel(summary_text, title="Validation Summary", border_style=status_color))
 
     # Issues table
     if report.issues:
-        from rich.markup import escape
-
         table = Table(title="Validation Issues", show_header=True)
         table.add_column("Severity", style="bold")
         table.add_column("Category")
@@ -1646,12 +1652,13 @@ Duration: {report.duration:.2f}s"""
                 "error": "[red]ERROR[/red]",
                 "warning": "[yellow]WARNING[/yellow]",
                 "info": "[blue]INFO[/blue]",
-            }.get(issue.severity, issue.severity.upper())
+            }.get(issue.severity) or literal_text(issue.severity.upper())
 
-            # Messages quote contract text (an overlay warning names the
-            # contract's ids), which Rich would parse as markup.
             table.add_row(
-                severity_style, issue.category, escape(issue.message), escape(issue.path or "")
+                severity_style,
+                issue.category,
+                literal_text(issue.message),
+                literal_text(issue.path or ""),
             )
 
         console.print(table)
@@ -1693,7 +1700,10 @@ def output_plain_report(report: ValidationReport, output_file: Optional[str] = N
             f.write(report_text)
         success(f"Report saved to: {output_file}")
     else:
-        cprint(report_text)
+        # The report quotes contract text; without ``markup=False`` the
+        # console's Rich-less fallback strips an ``exposes[orders]``-style
+        # ``[word]`` as if it were a style tag.
+        cprint(report_text, markup=False)
 
 
 def output_json_report(report: ValidationReport, output_file: Optional[str] = None) -> None:

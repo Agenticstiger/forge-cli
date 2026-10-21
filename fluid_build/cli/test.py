@@ -44,9 +44,9 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, List, Optional
 
-from fluid_build.cli.console import cprint, success, warning
+from fluid_build.cli.console import cprint, literal_text, success, warning
 from fluid_build.cli.console import error as console_error
 
 from ._common import CLIError
@@ -55,7 +55,6 @@ from .core import FluidCLIError
 # Rich imports (optional)
 try:
     from rich.console import Console
-    from rich.markup import escape
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
@@ -63,11 +62,6 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
-
-    def escape(text: str) -> str:  # type: ignore[misc]
-        """No-op stand-in when rich is absent — nothing parses markup then."""
-        return text
-
 
 from fluid_build.severity import is_error as _is_error_severity
 from fluid_build.severity import is_warning as _is_warning_severity
@@ -327,21 +321,16 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 # ======================================================================
 
 
-def _detail(messages: Iterable[str]) -> str:
-    """Join issue messages into a Rich table cell, escaped as literal text.
-
-    Validator messages quote the contract schema verbatim, so they routinely
-    carry ``[...]`` runs — a JSON Schema ``pattern`` (``[a-z0-9]``), a contract
-    path (``exposes[0]``), an enum list. Rich parses those as style markup and
-    swallows them, so ``^[a-z0-9][a-z0-9-]*[a-z0-9]$`` reached the operator as
-    the unactionable ``^*$``. ``escape`` keeps the cell showing exactly what
-    the validator said.
-    """
-    return escape("; ".join(messages))
-
-
 def _output_rich(report, output_file: Optional[str] = None) -> None:
-    """Render a Data-Contract-CLI-style test results table."""
+    """Render a Data-Contract-CLI-style test results table.
+
+    Everything the contract supplies (its id, version and provider, every
+    issue message) goes in through ``literal_text``, never as markup.
+    Messages quote the contract verbatim: a JSON Schema ``pattern``
+    (``^[a-z0-9][a-z0-9-]*[a-z0-9]$`` reached the operator as ``^*$``), an
+    ``exposes[orders]`` path, an id. An id holding ``[/]`` raised
+    ``MarkupError`` and the command died with a traceback.
+    """
     if not RICH_AVAILABLE:
         _output_plain(report, output_file)
         return
@@ -353,15 +342,17 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
     icon = "\u2705" if passed else "\u274c"
     border = "green" if passed else "red"
 
-    header_lines = [
-        f"[bold]{icon} Data Contract Test: {report.contract_id}[/bold]",
-        f"Version {report.contract_version}  |  Provider: {_detect_provider_label(report)}",
-        "Duration: {dur:.2f}s  |  {dt}".format(
+    header = Text.assemble(
+        literal_text(f"{icon} Data Contract Test: {report.contract_id}", "bold"),
+        literal_text(
+            f"\nVersion {report.contract_version}  |  Provider: {_detect_provider_label(report)}"
+        ),
+        "\nDuration: {dur:.2f}s  |  {dt}".format(
             dur=report.duration,
             dt=report.validation_time.strftime("%Y-%m-%d %H:%M:%S"),
         ),
-    ]
-    console.print(Panel("\n".join(header_lines), border_style=border, title="fluid test"))
+    )
+    console.print(Panel(header, border_style=border, title="fluid test"))
 
     # ── check-by-check table ──
     rows = _build_check_rows(report)
@@ -373,7 +364,7 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
     table.add_column("Details", overflow="fold")
 
     for idx, (status, name, detail) in enumerate(rows, 1):
-        table.add_row(str(idx), _ROW_ICON[status], name, detail)
+        table.add_row(str(idx), _ROW_ICON[status], name, literal_text(detail))
 
     console.print(table)
 
@@ -420,7 +411,8 @@ def _build_check_rows(report) -> List[tuple]:
 
     Split out of the renderer so each row's outcome is a value that can
     be counted (and unit-tested) rather than a decision made inline
-    while printing.
+    while printing. ``details`` is plain text, not markup; the renderer
+    keeps it literal.
     """
     issues = report.issues
     data_checked = getattr(report, "data_checks_performed", True)
@@ -443,7 +435,7 @@ def _build_check_rows(report) -> List[tuple]:
     # entry it does not name): --strict fails on it, so it must show.
     overlay_issues = [i for i in issues if i.category == "overlay"]
     if overlay_issues:
-        rows.append((_WARN, "Environment overlay", _detail(e.message for e in overlay_issues)))
+        rows.append((_WARN, "Environment overlay", "; ".join(e.message for e in overlay_issues)))
 
     # Provider connectivity
     # The connection probe runs in provider detection, so it happens
@@ -613,7 +605,10 @@ def _output_plain(report, output_file: Optional[str] = None) -> None:
             f.write(text)
         cprint(f"Report saved to: {output_file}")
     else:
-        cprint(text)
+        # The report quotes contract text; without ``markup=False`` the
+        # console's Rich-less fallback strips an ``exposes[orders]``-style
+        # ``[word]`` as if it were a style tag.
+        cprint(text, markup=False)
 
 
 # ======================================================================
@@ -980,7 +975,10 @@ def _run_soda_engine(
         if result.raw_stderr:
             from fluid_build.observability.secret_redactor import redact_secret_text
 
-            cprint(f"   soda stderr: {redact_secret_text(result.raw_stderr.strip()[:500])}")
+            cprint(
+                f"   soda stderr: {redact_secret_text(result.raw_stderr.strip()[:500])}",
+                markup=False,
+            )
 
     # Render in the requested format (re-use the existing --output flag).
     output_format = getattr(args, "output", "text")
@@ -1143,8 +1141,10 @@ def _emit_soda_text(result, datasource: str, rendering=None) -> None:
     cprint(counts)
     if result.failed_check_names:
         cprint("   failed checks:")
+        # A check name quotes the contract's rule (a ``valid regex`` reads
+        # ``[a-z]``), and Soda's stderr quotes the SodaCL. Both are data.
         for name in result.failed_check_names:
-            cprint(f"     - {name}")
+            cprint(f"     - {name}", markup=False)
     if not result.ok and result.raw_stderr:
         # Soda's stderr can include credential-bearing connection
         # strings (DSNs with embedded passwords, BigQuery service-
@@ -1153,4 +1153,4 @@ def _emit_soda_text(result, datasource: str, rendering=None) -> None:
         from fluid_build.observability.secret_redactor import redact_secret_text
 
         redacted = redact_secret_text(result.raw_stderr.strip()[:500])
-        cprint(f"   soda stderr: {redacted}")
+        cprint(f"   soda stderr: {redacted}", markup=False)

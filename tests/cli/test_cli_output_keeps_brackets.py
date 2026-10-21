@@ -452,3 +452,177 @@ def test_unexpected_error_spells_out_control_characters(monkeypatch, capsys):
     assert rc == 2
     assert not _reaches_the_terminal(out)
     assert "Unexpected error: \\x1b[2J\\x1b]8;;http://evil.example/" in out
+
+
+# ---------------------------------------------------------------------------
+# fluid test / fluid contract-validation: the report quotes the contract back
+# ---------------------------------------------------------------------------
+
+MARKUP_ID = "orders.[/]v1"
+# Every issue category a ``fluid test`` table row lists the messages of.
+ROW_CATEGORIES = (
+    "schema",
+    "overlay",
+    "connection",
+    "binding",
+    "missing_resource",
+    "missing_field",
+    "empty_table",
+    "quality",
+    "metadata",
+    "drift",
+)
+
+
+def _contract_quoting_markup() -> Dict[str, Any]:
+    """A local product the schema rejects; each error quotes the value back."""
+    return {
+        "fluidVersion": "0.7.5",
+        "kind": "DataProduct",
+        "id": MARKUP_ID,
+        "name": "Orders",
+        "domain": "sales",
+        "tags": ["Not A Tag"],
+        "metadata": {"owner": {"team": "data-platform"}},
+        "exposes": [
+            {
+                "exposeId": "orders[/]daily",
+                "kind": "table",
+                "binding": {
+                    "platform": "local",
+                    "format": "parquet",
+                    "location": {"path": "out/orders.parquet"},
+                },
+                "contract": {"schema": [{"name": "order_id", "type": "integer"}]},
+            }
+        ],
+    }
+
+
+def _report_quoting_markup():
+    from datetime import datetime
+
+    from fluid_build.cli.contract_validation import ValidationReport
+
+    report = ValidationReport(
+        "c.yaml", MARKUP_ID, "1.0.[/]", datetime(2026, 1, 1), 0.0, provider_name="lake[/]house"
+    )
+    for category in ROW_CATEGORIES:
+        report.add_issue("error", category, f"{category}: {MESSAGE}", f"exposes[{category}]")
+    return report
+
+
+@pytest.mark.parametrize(
+    "command, title",
+    [("test", "Data Contract Test"), ("contract-validation", "Contract Validation")],
+)
+def test_report_prints_a_markup_shaped_contract_verbatim(
+    tmp_path, monkeypatch, capsys, command, title
+):
+    """End to end: the id's ``[/]`` crashed both commands with a MarkupError traceback."""
+    monkeypatch.setenv("COLUMNS", "400")  # one table line per message
+    path = _write(tmp_path, _contract_quoting_markup())
+
+    rc = cli_mod.main([command, path, "--no-data", "--no-cache"])
+
+    out = capsys.readouterr().out
+    assert rc == 1  # the schema errors
+    assert f"{title}: {MARKUP_ID}" in out
+    assert "'orders[/]daily' does not match" in out
+    assert "'Not A Tag' does not match '^[a-z0-9]" in out
+
+
+def test_fluid_test_table_prints_every_row_and_the_header_verbatim(monkeypatch, capsys):
+    from fluid_build.cli.test import _output_rich
+
+    monkeypatch.setenv("COLUMNS", "400")
+    report = _report_quoting_markup()
+    report.add_issue("error", "schema", "location.path: C:\\work\\")
+
+    _output_rich(report)
+
+    out = capsys.readouterr().out
+    assert f"Data Contract Test: {MARKUP_ID}" in out
+    assert "Version 1.0.[/]  |  Provider: lake[/]house" in out
+    for category in ROW_CATEGORIES:
+        assert f"{category}: {MESSAGE}" in out
+    # rich.markup.escape would have doubled the trailing backslash.
+    assert "location.path: C:\\work\\ " in out
+
+
+def test_contract_validation_table_prints_messages_and_paths_verbatim(monkeypatch, capsys):
+    from fluid_build.cli.contract_validation import output_rich_report
+
+    monkeypatch.setenv("COLUMNS", "400")
+    report = _report_quoting_markup()
+    # A rule's severity comes from the contract; one outside the styled set prints as given.
+    report.add_issue("[/]fatal", "quality", "rule failed", "exposes[orders].dq")
+
+    output_rich_report(report)
+
+    out = capsys.readouterr().out
+    assert f"Contract Validation: {MARKUP_ID}" in out
+    assert "Version: 1.0.[/]" in out
+    for category in ROW_CATEGORIES:
+        assert f"{category}: {MESSAGE}" in out
+        assert f"exposes[{category}]" in out
+    assert "[/]FATAL" in out
+
+
+def test_reports_spell_out_control_characters(monkeypatch, capsys):
+    """On a terminal, a contract value must not clear it or plant a link."""
+    from datetime import datetime
+
+    from fluid_build.cli.contract_validation import ValidationReport, output_rich_report
+    from fluid_build.cli.test import _output_rich
+
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("COLUMNS", "400")
+    report = ValidationReport(
+        "c.yaml", f"orders{ESCAPES}", f"1{ESCAPES}", datetime(2026, 1, 1), 0.0
+    )
+    report.add_issue("error", "schema", f"bad {ESCAPES}", f"exposes[{ESCAPES}]")
+
+    _output_rich(report)
+    output_rich_report(report)
+
+    out = capsys.readouterr().out
+    assert not _reaches_the_terminal(out)
+    assert "Data Contract Test: orders\\x1b[2J" in out
+    assert "Contract Validation: orders\\x1b[2J" in out
+    assert "bad \\x1b[2J\\x1b]8;;http://evil.example/" in out
+
+
+def test_plain_reports_keep_brackets_when_rich_is_absent(monkeypatch, capsys):
+    """Without Rich, ``cprint`` strips every ``[word]`` unless told the text is not markup."""
+    from fluid_build.cli.contract_validation import output_plain_report
+    from fluid_build.cli.test import _output_plain
+
+    monkeypatch.setattr("fluid_build._console.console", None)
+    report = _report_quoting_markup()
+
+    _output_plain(report)
+    output_plain_report(report)
+
+    assert capsys.readouterr().out.count(MESSAGE) == 2 * len(ROW_CATEGORIES)
+
+
+def test_soda_text_prints_check_names_and_stderr_verbatim(capsys):
+    """A check name quotes the contract's rule; Soda's stderr quotes the SodaCL."""
+    from fluid_build.build_runners.soda.runner import SodaResult
+    from fluid_build.cli.test import _emit_soda_text
+
+    name = "invalid_count(code) = 0 [/] ^[a-z]+$"
+    result = SodaResult(
+        return_code=1,
+        raw_stdout="",
+        raw_stderr=f"check failed: {name}",
+        checks_failed=1,
+        failed_check_names=[name],
+    )
+
+    _emit_soda_text(result, "warehouse")
+
+    out = _unwrapped(capsys.readouterr().out)
+    assert f"- {name}" in out
+    assert f"soda stderr: check failed: {name}" in out
