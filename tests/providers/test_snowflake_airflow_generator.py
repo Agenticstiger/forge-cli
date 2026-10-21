@@ -28,6 +28,10 @@ escape is applied and the SQL round-trips unchanged.
 from __future__ import annotations
 
 import ast
+import re
+import sys
+import types
+from typing import Any, Dict
 
 import pytest
 
@@ -509,3 +513,253 @@ class TestAirflowGeneratorCodeInjection:
             ]
         }
         _assert_no_injection(airflow_generator.generate_airflow_dag(contract, orchestration))
+
+    def test_python_callable_injection_is_inert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        payload = "x'); " + _PWN + " #" + _NL + _PWN
+        code = _python_dag({"name": "py", "type": "python", "callable": payload})
+        _assert_no_injection(code)
+        dag = _load_with_stub_airflow(code, monkeypatch)
+        with pytest.raises(_AirflowFailException) as error:
+            dag["py"].kwargs["python_callable"]()
+        assert _PWN in str(error.value)  # the contract's text survives only as data
+
+
+class _AirflowFailException(Exception):
+    """Stands in for Airflow's exception that fails a task without retrying it."""
+
+
+def _load_with_stub_airflow(source: str, monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
+    """Run a generated DAG module against stub Airflow 3 modules; return its namespace.
+
+    Adapted from ``tests/cli/_schedule_dag_fixtures.load_dag``: Airflow is not a
+    test dependency, so each operator the generator imports is a class that keeps
+    its kwargs. Running the module body is what Airflow's DagBag does when it
+    parses the file, so a name the DAG uses but never defines raises ``NameError``
+    here as it would there. Like Airflow, an operator refuses a ``dag=`` that is
+    not the DAG and ``>>`` refuses anything but a task, so a name the module
+    rebinds fails here too.
+    """
+
+    class _DAG:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    class _Task:
+        def __init__(self, **kwargs: Any) -> None:
+            assert isinstance(kwargs.get("dag"), _DAG), f"dag={kwargs.get('dag')!r}"
+            assert callable(kwargs.get("python_callable", len)), kwargs
+            self.kwargs = kwargs
+
+        def __rshift__(self, other: "_Task") -> "_Task":
+            assert isinstance(other, _Task), f"{self!r} >> {other!r}"
+            return other
+
+    def module(name: str, **attrs: Any) -> types.ModuleType:
+        mod = types.ModuleType(name)
+        mod.__dict__.update(attrs)
+        return mod
+
+    def operator(name: str) -> type:
+        return type(name, (_Task,), {})
+
+    stubs = {
+        name: module(name)
+        for name in (
+            "airflow",
+            "airflow.providers",
+            "airflow.providers.common",
+            "airflow.providers.common.sql",
+            "airflow.providers.common.sql.operators",
+            "airflow.providers.standard",
+            "airflow.providers.standard.operators",
+            "airflow.providers.standard.sensors",
+        )
+    }
+    for name, attrs in {
+        "airflow.sdk": {"DAG": _DAG},
+        # A stub imports it when it runs, not when the DAG is parsed.
+        "airflow.sdk.exceptions": {"AirflowFailException": _AirflowFailException},
+        "airflow.providers.common.sql.operators.sql": {
+            "SQLExecuteQueryOperator": operator("SQLExecuteQueryOperator")
+        },
+        "airflow.providers.standard.operators.python": {
+            "PythonOperator": operator("PythonOperator")
+        },
+        "airflow.providers.standard.operators.bash": {"BashOperator": operator("BashOperator")},
+        "airflow.providers.standard.sensors.external_task": {
+            "ExternalTaskSensor": operator("ExternalTaskSensor")
+        },
+    }.items():
+        stubs[name] = module(name, **attrs)
+    for name, mod in stubs.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    namespace: Dict[str, Any] = {"__name__": "generated_dag"}
+    exec(compile(source, "generated_dag.py", "exec"), namespace)  # noqa: S102 - test harness
+    return namespace
+
+
+def _python_dag(*tasks: Dict[str, Any]) -> str:
+    """A DAG whose first task, ``load``, runs SQL, followed by *tasks*."""
+    load = {
+        "name": "load",
+        "type": "provider_action",
+        "action": "sf.sql.execute",
+        "parameters": {"sql": "SELECT 1"},
+    }
+    return airflow_generator.generate_airflow_dag({"id": "sales.orders"}, {"tasks": [load, *tasks]})
+
+
+class TestPythonTaskStub:
+    """A python task's callable is defined in the DAG it is generated into.
+
+    It used to be emitted as ``python_callable=<name>`` with no ``def``, so
+    parsing the file raised ``NameError`` and Airflow lost the whole DAG.
+    """
+
+    def test_the_dag_loads_and_the_stub_fails_its_task_by_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        dag = _load_with_stub_airflow(
+            _python_dag(
+                {
+                    "name": "score",
+                    "type": "python",
+                    "callable": "score_customers",
+                    "depends_on": ["load"],
+                },
+                {"name": "notify", "type": "bash", "command": "echo done", "depends_on": ["score"]},
+            ),
+            monkeypatch,
+        )
+        stub = dag["score"].kwargs["python_callable"]
+        assert stub is dag["score_customers"]
+        with pytest.raises(
+            _AirflowFailException, match=r"Task 'score' calls score_customers\(\)"
+        ) as error:
+            stub(ds="2026-01-01")  # Airflow passes the context as keywords
+        assert "names the callable 'score_customers' but ships no code" in str(error.value)
+
+    def test_a_task_without_a_callable_gets_a_default_stub(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        dag = _load_with_stub_airflow(_python_dag({"name": "audit", "type": "python"}), monkeypatch)
+        assert dag["audit"].kwargs["python_callable"] is dag["audit_func"]
+        with pytest.raises(_AirflowFailException, match="names no callable"):
+            dag["audit_func"]()
+
+    def test_a_stub_may_share_its_own_tasks_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        dag = _load_with_stub_airflow(
+            _python_dag({"name": "transform", "type": "python", "callable": "transform"}),
+            monkeypatch,
+        )
+        assert type(dag["transform"]).__name__ == "PythonOperator"
+        with pytest.raises(_AirflowFailException, match="Task 'transform'"):
+            dag["transform"].kwargs["python_callable"]()
+
+    def test_tasks_sharing_a_callable_each_name_their_own_task(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        dag = _load_with_stub_airflow(
+            _python_dag(
+                {"name": "a", "type": "python", "callable": "shared"},
+                {"name": "b", "type": "python", "callable": "shared"},
+            ),
+            monkeypatch,
+        )
+        for task in ("a", "b"):
+            with pytest.raises(_AirflowFailException, match=f"Task '{task}'"):
+                dag[task].kwargs["python_callable"]()
+
+    def test_a_later_task_may_take_the_callables_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The operator holds the stub before the later task rebinds the name."""
+        dag = _load_with_stub_airflow(
+            _python_dag(
+                {"name": "py", "type": "python", "callable": "notify"},
+                {"name": "notify", "type": "bash", "command": "echo hi", "depends_on": ["py"]},
+            ),
+            monkeypatch,
+        )
+        assert type(dag["notify"]).__name__ == "BashOperator"
+        with pytest.raises(_AirflowFailException, match="Task 'py'"):
+            dag["py"].kwargs["python_callable"]()
+
+    @pytest.mark.parametrize(
+        "callable_name",
+        # ``load`` is the task variable defined above the python task.
+        [
+            "dag",
+            "DAG",
+            "PythonOperator",
+            "default_args",
+            "ExternalTaskSensor",
+            "ImportError",
+            "__builtins__",
+            "load",
+        ],
+    )
+    def test_a_callable_that_would_rebind_a_name_the_dag_uses_is_refused(
+        self, callable_name: str
+    ) -> None:
+        with pytest.raises(
+            ValueError, match=re.escape(f"python task 'py': cannot stub callable '{callable_name}'")
+        ):
+            _python_dag({"name": "py", "type": "python", "callable": callable_name})
+
+    def test_a_default_callable_clash_names_the_default(self) -> None:
+        # ``audit``'s default callable is ``audit_func``, already a task above it here.
+        with pytest.raises(
+            ValueError, match="cannot stub its default callable 'audit_func': an earlier task's"
+        ):
+            _python_dag(
+                {"name": "audit_func", "type": "bash", "command": "echo"},
+                {"name": "audit", "type": "python"},
+            )
+
+    def test_a_task_that_binds_nothing_reserves_no_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unsupported task type becomes a TODO comment, so its name stays free."""
+        dag = _load_with_stub_airflow(
+            _python_dag(
+                {"name": "notify", "type": "email"},
+                {"name": "py", "type": "python", "callable": "notify"},
+            ),
+            monkeypatch,
+        )
+        with pytest.raises(_AirflowFailException, match="Task 'py'"):
+            dag["notify"]()
+
+    def test_the_harness_catches_a_rebound_dag(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        source = _python_dag(
+            {"name": "py", "type": "python", "callable": "f"},
+            {"name": "later", "type": "bash", "command": "echo"},
+        )
+        rebound = source.replace("def f(", "def dag(").replace(
+            "python_callable=f,", "python_callable=dag,"
+        )
+        assert rebound != source
+        with pytest.raises(AssertionError, match="dag=<function dag"):
+            _load_with_stub_airflow(rebound, monkeypatch)
+
+    def test_the_reserved_names_cover_every_name_the_header_binds(self) -> None:
+        from fluid_build.providers.snowflake.orchestration.common import (
+            OrchestrationConfig,
+            OrchestrationEngine,
+        )
+
+        header = airflow_generator._generate_dag_header(
+            OrchestrationConfig(engine=OrchestrationEngine.AIRFLOW, dag_id="d")
+        )
+        bound = set()
+        for node in ast.walk(ast.parse(header)):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                bound.update((alias.asname or alias.name).split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.Assign):
+                bound.update(target.id for target in node.targets if isinstance(target, ast.Name))
+        assert bound, "parsed nothing"
+        assert bound <= airflow_generator._DAG_MODULE_NAMES, (
+            bound - airflow_generator._DAG_MODULE_NAMES
+        )

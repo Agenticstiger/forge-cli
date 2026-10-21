@@ -183,6 +183,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source as text, so a contract value ran as Python when Airflow parsed the DAG. Both are
   now read as numbers (retries 0 to 100, the delay in whole minutes), falling back to 3
   and 5.
+- **A python task no longer loses the Snowflake orchestration DAG.** `generate_airflow_dag`
+  in `providers/snowflake/orchestration`, a library function no `fluid` command calls
+  (`fluid export` uses `providers/snowflake/codegen`), emitted `python_callable=<callable>`
+  for a function it never defined, so Airflow raised `NameError` parsing the file and
+  dropped the whole DAG. It now defines a stub of that callable above the task: the DAG
+  loads, and the task fails with `AirflowFailException`, naming itself and skipping the
+  retries a stub cannot pass, until the function is written. A callable whose name the DAG
+  already uses (`dag`, an operator class, an earlier task) or a `__dunder__` name is refused
+  with a `ValueError` when the DAG is generated.
 
 ## [0.21.0] — 2026-10-19
 
