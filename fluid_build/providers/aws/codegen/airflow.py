@@ -748,6 +748,17 @@ def _generate_taskflow_dag(
     # What a dependency edge connects: the operator itself, or a @task's call result
     # (``<var>_result``). A @task function is not a task: ``fn >> fn`` raises TypeError.
     nodes: Dict[str, str] = {}
+    # A @task's result gets a name of its own, allocated against every task variable and
+    # every other result: a task named ``chk_result`` and ``chk``'s result must not share one.
+    taken = set(task_vars.values()) | set(_EMITTED_MODULE_NAMES)
+
+    def _result_name(var: str) -> str:
+        candidate, suffix = f"{var}_result", 2
+        while candidate in taken:
+            candidate = f"{var}_result_{suffix}"
+            suffix += 1
+        taken.add(candidate)
+        return candidate
 
     for t in tasks:
         tid = t.get("taskId", "")
@@ -806,8 +817,9 @@ def _generate_taskflow_dag(
                     f"json.loads({json_literal(params)}), {py_str_literal(account_id)}, "
                     f"{py_str_literal(region)})"
                 )
-            lines.append(f"    {var}_result = {var}()")
-            nodes[tid] = f"{var}_result"
+            result = _result_name(var)
+            lines.append(f"    {result} = {var}()")
+            nodes[tid] = result
         else:
             # Generic @task fallback
             lines.append("")
@@ -818,8 +830,9 @@ def _generate_taskflow_dag(
                 f"json.loads({json_literal(params)}), {py_str_literal(account_id)}, "
                 f"{py_str_literal(region)})"
             )
-            lines.append(f"    {var}_result = {var}()")
-            nodes[tid] = f"{var}_result"
+            result = _result_name(var)
+            lines.append(f"    {result} = {var}()")
+            nodes[tid] = result
 
     # Dependencies
     for t in tasks:

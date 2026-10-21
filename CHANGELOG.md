@@ -68,8 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (apache-airflow-providers-common-sql, which the snowflake provider installs) with
   `conn_id`, because apache-airflow-providers-snowflake 6.0 removed `SnowflakeOperator`;
   a DAG generated before needs regenerating to load. A GCP `create_table` task uses
-  `BigQueryCreateTableOperator` where the google provider has it (14+), and the old
-  `BigQueryCreateEmptyTableOperator` before that.
+  `BigQueryCreateTableOperator` where the google provider has it (13+; 17.0 removed the
+  old one), and `BigQueryCreateEmptyTableOperator` before that.
+- Both new operators template more of their arguments than the ones they replace:
+  `SQLExecuteQueryOperator` renders `conn_id` and `hook_params` (the warehouse and
+  database), and `BigQueryCreateTableOperator` renders `table_resource` (the schema). A
+  literal `{{`, `{%` or `{#` in a warehouse or database name, or in a schema field such
+  as a description, is now rendered as Jinja when the task runs, and fails it. Escape it
+  as `{{ '{{' }}`.
 
 ### Added
 
@@ -158,19 +164,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Generated Airflow DAGs load on Airflow 3.** `fluid export --engine airflow`, `fluid
-  generate schedule`, `fluid init`, `fluid scaffold-composer`, `fluid schedule-sync` and
-  the AWS, GCP and Snowflake code generators emitted `DAG(schedule_interval=...)` and
-  `start_date=days_ago(1)`, which Airflow 3 removed, so their DAGs failed to import. They
-  now pass `schedule=` with a fixed `start_date` and `catchup=False`, and import `DAG`,
-  `dag`/`task` and the core operators and sensors from their Airflow 3 homes
-  (`airflow.sdk`, apache-airflow-providers-standard), falling back to the Airflow 2 paths,
-  so the same DAG loads on Airflow 2.7+ and 3.x.
+  generate schedule`, `fluid init` and the AWS, GCP and Snowflake code generators emitted
+  `DAG(schedule_interval=...)` and `start_date=days_ago(1)`, which Airflow 3 removed, so
+  their DAGs failed to import. They now pass `schedule=` with a fixed `start_date` and
+  `catchup=False`. Every generator, `fluid scaffold-composer` and `fluid schedule-sync`
+  included, imports `DAG`, `dag`/`task` and the core operators and sensors from their
+  Airflow 3 homes (`airflow.sdk`, apache-airflow-providers-standard), falling back to the
+  Airflow 2 paths, so the same DAG loads on Airflow 2.7+ and 3.x without the deprecation
+  warnings Airflow 3 gives the old import paths.
 - The AWS TaskFlow DAG wired its `@task` functions (`load >> publish`), which raised
   `TypeError` when Airflow parsed it; it now wires each task's result, and an operator
   task as itself.
 - The GCP DAG imports the Dataflow operator only when a task uses it: its module needs
   apache-airflow-providers-apache-beam, and the unused import stopped every GCP DAG from
   loading where that provider was absent.
+- `fluid init`'s basic DAG spliced `orchestration.retries` and `retry_delay` into the DAG
+  source as text, so a contract value ran as Python when Airflow parsed the DAG. Both are
+  now read as numbers (retries 0 to 100, the delay in whole minutes), falling back to 3
+  and 5.
 
 ## [0.21.0] — 2026-10-19
 

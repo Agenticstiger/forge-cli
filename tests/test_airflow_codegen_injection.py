@@ -984,3 +984,56 @@ def test_aws_task_id_cannot_rebind_emitted_module_names():
     m = _unique_task_identifiers([{"taskId": "dag"}, {"taskId": "_execute_provider_action"}])
     assert m["dag"] != "dag"
     assert m["_execute_provider_action"] != "_execute_provider_action"
+
+
+# ---------------------------------------------------------------------------
+# GCP create_table schema, and `fluid init`'s basic DAG
+# ---------------------------------------------------------------------------
+
+
+def test_gcp_create_table_schema_is_injection_safe():
+    """The schema reaches both create-table operators as a literal: as ``schema_fields``
+    and inside ``table_resource``."""
+    from fluid_build.providers.gcp.codegen.airflow import generate_airflow_dag
+
+    hostile = [{"name": POC_SQL, "type": POC_SQUOTE, "description": POC_IDENT, POC_SQL: 1}]
+    contract = {
+        "id": "p",
+        "name": "p",
+        "orchestration": {
+            "tasks": [
+                {
+                    "taskId": POC_IDENT,
+                    "type": "provider_action",
+                    "action": "gcp.bigquery.create_table",
+                    "params": {"dataset_id": POC_SQL, "table_id": POC_SQUOTE, "schema": hostile},
+                }
+            ]
+        },
+    }
+    code = generate_airflow_dag(contract, "my-project", "us-central1")
+    assert_inert(code)
+    assert "BigQueryCreateTableOperator(" in code and "BigQueryCreateEmptyTableOperator(" in code
+
+
+def test_init_basic_dag_retries_are_numbers_not_code(tmp_path):
+    """``orchestration.retries`` and ``retry_delay`` used to be spliced into the DAG source
+    as text, so a contract value ran at DAG-parse time."""
+    import logging
+
+    from fluid_build.cli.init import create_basic_dag
+
+    contract = {
+        "name": "p",
+        "orchestration": {
+            "schedule": "@daily",
+            "retries": "3, __import__('os').system('touch /tmp/PWNED4')",
+            "retry_delay": "5) or __import__('os').system('touch /tmp/PWNED5') or (5",
+        },
+    }
+    create_basic_dag(tmp_path, contract, logging.getLogger(__name__))
+    (dag,) = (tmp_path / "dags").glob("*.py")
+    code = dag.read_text()
+    assert_inert(code)
+    assert "'retries': 3," in code and "timedelta(minutes=5)" in code
+    assert "PWNED" not in code

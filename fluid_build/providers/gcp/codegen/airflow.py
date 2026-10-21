@@ -103,25 +103,29 @@ Generated: {datetime.now(dt_timezone.utc).replace(tzinfo=None).isoformat()}Z
 """'''
 
 
+def _is_dataflow_template(task: Dict[str, Any]) -> bool:
+    """The test ``_generate_single_task`` dispatches on: ``<any>.dataflow.run_template``."""
+    parts = str(task.get("action", "")).split(".")
+    return len(parts) >= 3 and parts[1] == "dataflow" and parts[2] == "run_template"
+
+
 def _generate_dag_imports(tasks: Optional[List[Dict[str, Any]]] = None) -> str:
     """Generate import statements.
 
     The Dataflow operator is imported only when a task uses it: its module needs
     apache-airflow-providers-apache-beam, and an unused import that fails stops the
     whole DAG from loading."""
-    dataflow = any(str(t.get("action", "")).startswith("gcp.dataflow.") for t in tasks or [])
+    dataflow = any(_is_dataflow_template(t) for t in tasks or [])
     return (
-        (
-            "from datetime import datetime, timedelta\n"
-            "from zoneinfo import ZoneInfo\n"
-            + airflow_dag_import()
-            + airflow_standard_import("PythonOperator")
-        )
+        "from datetime import datetime, timedelta\n"
+        "from zoneinfo import ZoneInfo\n"
+        + airflow_dag_import()
+        + airflow_standard_import("PythonOperator")
         + """from airflow.providers.google.cloud.operators.bigquery import (
     BigQueryCreateEmptyDatasetOperator,
     BigQueryInsertJobOperator,
 )
-try:  # apache-airflow-providers-google 14+, which removed BigQueryCreateEmptyTableOperator
+try:  # apache-airflow-providers-google 13+ (17.0 removed BigQueryCreateEmptyTableOperator)
     from airflow.providers.google.cloud.operators.bigquery import BigQueryCreateTableOperator
 except ImportError:  # older google providers (Airflow 2)
     BigQueryCreateTableOperator = None
@@ -134,17 +138,18 @@ from airflow.providers.google.cloud.operators.pubsub import (
     PubSubCreateTopicOperator,
     PubSubCreateSubscriptionOperator,
 )
-import json
-import logging
-
-logger = logging.getLogger(__name__)"""
+"""
         + (
-            "\nfrom airflow.providers.google.cloud.operators.dataflow import (\n"
+            "from airflow.providers.google.cloud.operators.dataflow import (\n"
             "    DataflowTemplatedJobStartOperator,\n"
-            ")"
+            ")\n"
             if dataflow
             else ""
         )
+        + """import json
+import logging
+
+logger = logging.getLogger(__name__)"""
     )
 
 
@@ -252,8 +257,8 @@ def _generate_bigquery_task(
         dataset_lit = py_str_literal(params.get("dataset_id", "unknown_dataset"))
         table_lit = py_str_literal(params.get("table_id", "unknown_table"))
         schema_fields = params.get("schema", [])
-        # BigQueryCreateTableOperator where the google provider has it (14+), the
-        # removed BigQueryCreateEmptyTableOperator before that: see the imports.
+        # BigQueryCreateTableOperator where the google provider has it (13+), the
+        # BigQueryCreateEmptyTableOperator it replaced (removed in 17.0) before that.
         return f"""if BigQueryCreateTableOperator is not None:
     {var} = BigQueryCreateTableOperator(
         task_id={task_id_lit},

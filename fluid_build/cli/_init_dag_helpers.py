@@ -165,6 +165,14 @@ def create_basic_dag(project_dir: Path, contract: dict, logger):
     dag_id = _re.sub(r"[^a-zA-Z0-9_]", "_", contract_name)[:128]
     schedule = _re.sub(r"[^a-zA-Z0-9@*/, _-]", "", orchestration.get("schedule", "@daily"))[:64]
     contract_name = _re.sub(r"[^a-zA-Z0-9 _.-]", "_", contract_name)[:128]
+    # Numbers, never text: both are interpolated into the DAG's Python source, so a
+    # contract value such as `3, __import__('os').system('...')` would run at parse time.
+    try:
+        retries = max(0, min(int(orchestration.get("retries", 3)), 100))
+    except (TypeError, ValueError):
+        retries = 3
+    delay = _re.fullmatch(r"\s*(\d{1,4})\s*m?\s*", str(orchestration.get("retry_delay", "5m")))
+    retry_minutes = int(delay.group(1)) if delay else 5
 
     dag_content = f'''"""
 Airflow DAG for FLUID contract: {contract_name}
@@ -180,8 +188,8 @@ default_args = {{
     'start_date': datetime(2024, 1, 1),
     'email_on_failure': False,
     'email_on_retry': False,
-    'retries': {orchestration.get("retries", 3)},
-    'retry_delay': timedelta(minutes={orchestration.get("retry_delay", "5m").replace("m", "")}),
+    'retries': {retries},
+    'retry_delay': timedelta(minutes={retry_minutes}),
 }}
 
 with DAG(

@@ -1,14 +1,15 @@
 """Every Airflow DAG forge-cli generates parses on Airflow 2.7+ and on Airflow 3.
 
-Airflow 3 removed ``DAG(schedule_interval=...)`` and ``airflow.utils.dates.days_ago``,
-moved the core operators and sensors to apache-airflow-providers-standard, and
-exports ``DAG``, ``dag`` and ``task`` from ``airflow.sdk``. A DAG that uses the
-removed names fails to import on Airflow 3 (``TypeError`` / ``ImportError``), so
-``fluid export --engine airflow``, ``fluid generate schedule``, ``fluid init``,
-``fluid scaffold-composer`` and ``fluid schedule-sync`` all have to emit the
-shape both versions accept: ``schedule=``, a fixed ``start_date``, and each
-moved name imported from its Airflow 3 home with an ``except ImportError``
-fallback to the Airflow 2 path (``providers/common/codegen_utils.py``).
+Airflow 3 removed ``DAG(schedule_interval=...)`` (``TypeError``) and
+``airflow.utils.dates.days_ago`` (``ImportError``), so a DAG that uses either fails to
+import. It also moved the core operators and sensors to apache-airflow-providers-standard
+and exports ``DAG``, ``dag`` and ``task`` from ``airflow.sdk``; the old paths still
+resolve on 3.2 with a deprecation warning. Every generator (``fluid export --engine
+airflow``, ``fluid generate schedule``, ``fluid init``, ``fluid scaffold-composer``,
+``fluid schedule-sync``, the AWS, GCP and Snowflake code generators) emits the shape
+both versions accept without either: ``schedule=``, a fixed ``start_date``, and each
+moved name imported from its Airflow 3 home with an ``except ImportError`` fallback to
+the Airflow 2 path (``providers/common/codegen_utils.py``).
 
 This renders every generator and checks the source, so it needs no Airflow
 install. The author also loaded each rendered DAG into a real Airflow 3.2.2 and
@@ -26,12 +27,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # Imported only in an ``except ImportError`` fallback, behind its Airflow 3 path.
-AIRFLOW2_ONLY = {
-    "airflow.operators.bash",
-    "airflow.operators.python",
-    "airflow.sensors.external_task",
-    "airflow.decorators",
-}
+AIRFLOW2_ONLY = ("airflow.operators", "airflow.sensors", "airflow.decorators")
+AIRFLOW2_DAG_MODULES = {"airflow", "airflow.models", "airflow.models.dag"}
 AIRFLOW3_HOMES = ("airflow.sdk", "airflow.providers.standard.")
 
 _TASKS = [
@@ -150,9 +147,27 @@ def _gcp(dataflow: bool = False) -> str:
 
 
 def _snowflake() -> str:
+    """The SQL tasks (``sf.query.*``, ``sf.table.*``): ``sf.snowflake.*`` falls back to a
+    PythonOperator and never reaches SQLExecuteQueryOperator."""
     from fluid_build.providers.snowflake.codegen.airflow import generate_airflow_dag
 
-    return generate_airflow_dag(_contract("sf.snowflake"), account="acct", database="DB")
+    contract = _contract("sf.snowflake")
+    contract["orchestration"]["tasks"] = [
+        {
+            "taskId": "load",
+            "type": "provider_action",
+            "action": "sf.query.run_query",
+            "params": {"sql": "SELECT 1"},
+        },
+        {
+            "taskId": "publish",
+            "type": "provider_action",
+            "action": "sf.table.create_table",
+            "params": {"table": "ORDERS", "columns": [{"name": "ID", "type": "INTEGER"}]},
+            "dependsOn": ["load"],
+        },
+    ]
+    return generate_airflow_dag(contract, account="acct", database="DB")
 
 
 def _snowflake_orchestration() -> str:
@@ -227,33 +242,64 @@ RENDERS = {
 }
 
 
+def _under(module: str, prefixes) -> bool:
+    return any(module == p or module.startswith(p + ".") for p in prefixes)
+
+
+def _imported_names(node: ast.AST) -> set[str]:
+    return (
+        {a.asname or a.name for a in node.names}
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        else set()
+    )
+
+
+def _airflow2_only(node: ast.AST) -> bool:
+    if isinstance(node, ast.Import):
+        return any(_under(a.name, AIRFLOW2_ONLY) for a in node.names)
+    if isinstance(node, ast.ImportFrom):
+        module = node.module or ""
+        names = {a.name for a in node.names}
+        return _under(module, AIRFLOW2_ONLY) or (
+            module in AIRFLOW2_DAG_MODULES
+            and bool(names & {"DAG", "dag", "task", "operators", "sensors"})
+        )
+    return False
+
+
+def _catches_import_error(handler: ast.ExceptHandler) -> bool:
+    kinds = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return any(
+        isinstance(k, ast.Name) and k.id in ("ImportError", "ModuleNotFoundError") for k in kinds
+    )
+
+
 def _airflow2_only_imports_outside_a_fallback(tree: ast.AST) -> list[str]:
-    """Each Airflow-2-only import, unless it sits in an ``except ImportError:`` whose
-    ``try`` imports the Airflow 3 home first."""
+    """Each Airflow-2-only import (``from x import y`` or ``import x``), unless it sits in an
+    ``except ImportError`` whose ``try`` imports the same names from their Airflow 3 home."""
     fallbacks: set[int] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Try):
             continue
-        tries_airflow3 = any(
-            isinstance(n, ast.ImportFrom) and (n.module or "").startswith(AIRFLOW3_HOMES)
+        airflow3 = [
+            n
             for stmt in node.body
             for n in ast.walk(stmt)
-        )
+            if isinstance(n, ast.ImportFrom) and (n.module or "").startswith(AIRFLOW3_HOMES)
+        ]
+        provided = set().union(*(_imported_names(n) for n in airflow3)) if airflow3 else set()
         for handler in node.handlers:
-            catches_import_error = (
-                isinstance(handler.type, ast.Name) and handler.type.id == "ImportError"
-            )
-            if tries_airflow3 and catches_import_error:
-                fallbacks.update(id(n) for stmt in handler.body for n in ast.walk(stmt))
-    found = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ImportFrom) or id(node) in fallbacks:
-            continue
-        module = node.module or ""
-        names = {a.name for a in node.names}
-        if module in AIRFLOW2_ONLY or (module == "airflow" and names & {"DAG", "dag", "task"}):
-            found.append(f"line {node.lineno}: from {module} import {', '.join(sorted(names))}")
-    return found
+            if not (airflow3 and _catches_import_error(handler)):
+                continue
+            for stmt in handler.body:
+                for n in ast.walk(stmt):
+                    if _imported_names(n) and _imported_names(n) <= provided:
+                        fallbacks.add(id(n))
+    return [
+        f"line {node.lineno}: {ast.unparse(node)}"
+        for node in ast.walk(tree)
+        if _airflow2_only(node) and id(node) not in fallbacks
+    ]
 
 
 @pytest.mark.parametrize("name", sorted(RENDERS))
@@ -272,12 +318,32 @@ def test_the_generated_dag_parses_on_airflow_2_and_3(name: str, tmp_path: Path):
     ), "no schedule="
 
 
-def test_the_import_check_can_fail():
-    bare = "from airflow import DAG\nfrom airflow.operators.bash import BashOperator\n"
-    assert len(_airflow2_only_imports_outside_a_fallback(ast.parse(bare))) == 2
-    # A fallback with no Airflow 3 import in its ``try`` is no fallback.
-    hollow = "try:\n    import json\nexcept ImportError:\n    from airflow.operators.bash import BashOperator\n"
-    assert len(_airflow2_only_imports_outside_a_fallback(ast.parse(hollow))) == 1
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from airflow import DAG\n",
+        "from airflow.operators.bash import BashOperator\n",
+        "import airflow.operators.bash\n",
+        "from airflow.operators import bash\n",
+        "from airflow.models import DAG\n",
+        "from airflow.decorators import dag, task\n",
+        # A fallback with no Airflow 3 import in its ``try`` is no fallback ...
+        "try:\n    import json\nexcept ImportError:\n    from airflow.operators.bash import BashOperator\n",
+        # ... nor one that imports a different name than its ``try``.
+        "try:\n    from airflow.providers.standard.operators.bash import BashOperator\n"
+        "except ImportError:\n    from airflow.operators.python import PythonOperator\n",
+    ],
+)
+def test_the_import_check_can_fail(source: str):
+    assert len(_airflow2_only_imports_outside_a_fallback(ast.parse(source))) == 1
+
+
+def test_the_import_check_accepts_the_fallbacks_generators_emit():
+    tuple_handler = (
+        "try:\n    from airflow.sdk import DAG\n"
+        "except (ImportError, ModuleNotFoundError):\n    from airflow import DAG\n"
+    )
+    assert _airflow2_only_imports_outside_a_fallback(ast.parse(tuple_handler)) == []
     from fluid_build.providers.common.codegen_utils import (
         airflow_dag_import,
         airflow_standard_import,
@@ -294,7 +360,7 @@ def test_the_dataflow_import_comes_only_with_a_dataflow_task(tmp_path: Path):
 
 
 def test_no_generator_emits_an_operator_its_provider_removed(tmp_path: Path):
-    """snowflake provider 6.0 removed SnowflakeOperator; google provider 14 removed
+    """snowflake provider 6.0 removed SnowflakeOperator; google provider 17.0 removed
     BigQueryCreateEmptyTableOperator, which survives only behind the newer operator."""
     for name, render in RENDERS.items():
         workdir = tmp_path / name.replace(" ", "_")
@@ -313,3 +379,54 @@ def test_taskflow_wires_task_results_not_task_functions(tmp_path: Path):
     assert "    load >> publish_result" in RENDERS["aws codegen taskflow with an operator"](
         tmp_path
     )
+
+
+def test_snowflake_sql_runs_through_sql_execute_query_with_its_hook_params(tmp_path: Path):
+    source = RENDERS["snowflake codegen"](tmp_path)
+    assert source.count("SQLExecuteQueryOperator(") == 2
+    assert "conn_id=SNOWFLAKE_CONN_ID" in source and "hook_params={" in source
+
+
+def test_a_dataflow_import_follows_the_dispatch_not_the_prefix():
+    from fluid_build.providers.gcp.codegen.airflow import _generate_dag_imports
+
+    def imports(action: str) -> str:
+        return _generate_dag_imports([{"action": action}])
+
+    assert "DataflowTemplatedJobStartOperator" in imports("dataflow.dataflow.run_template")
+    assert "DataflowTemplatedJobStartOperator" not in imports("gcp.dataflow.launch_flex")
+    # Before the standard library imports, not after `logger = ...` (E402 in the DAG).
+    flow = imports("gcp.dataflow.run_template")
+    assert flow.index("DataflowTemplatedJobStartOperator") < flow.index("import json")
+
+
+def test_a_task_named_like_another_tasks_result_keeps_its_own_edge():
+    """``chk_result`` (an operator) and ``chk`` (a @task) must not share a variable, or the
+    edge from ``chk_result`` silently starts at ``chk``'s result instead."""
+    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag_taskflow
+
+    contract = _contract()
+    contract["orchestration"]["tasks"] = [
+        {
+            "taskId": "chk_result",
+            "type": "provider_action",
+            "action": "aws.s3.ensure_bucket",
+            "params": {"bucket": "b"},
+        },
+        {
+            "taskId": "chk",
+            "type": "provider_action",
+            "action": "aws.glue.ensure_database",
+            "params": {"database": "d"},
+        },
+        {
+            "taskId": "after",
+            "type": "provider_action",
+            "action": "aws.glue.ensure_database",
+            "params": {"database": "e"},
+            "dependsOn": ["chk_result"],
+        },
+    ]
+    source = generate_airflow_dag_taskflow(contract, "123456789012", "eu-west-1")
+    assert "    chk_result_2 = chk()" in source
+    assert "    chk_result >> after_result" in source
