@@ -59,6 +59,7 @@ from fluid_build.build_runners._ids import (
 from fluid_build.build_runners._ids import (
     validate_identifier as _validate_identifier,
 )
+from fluid_build.util.contract import is_continuous_build
 
 LOG = logging.getLogger("fluid.acquire.stage_ext")
 
@@ -481,6 +482,10 @@ def schedule_sync_acquisition(
     out: List[ScheduleArtifact] = []
     for build in acquisition_builds(contract):
         bid = _validate_identifier(build.get("id", ""), kind="build.id")
+        # A continuous connector keeps running on its own: a schedule beside it
+        # is refused by schema 0.7.6, and must not start a second copy here.
+        if is_continuous_build(build):
+            continue
         execution = build.get("execution", {}) or {}
         trigger = execution.get("trigger", {}) or {}
         schedule = trigger.get("schedule")

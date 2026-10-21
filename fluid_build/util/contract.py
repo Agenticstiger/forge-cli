@@ -158,6 +158,24 @@ def describe_externally_run_build(build: Mapping[str, Any]) -> str:
     return f"language '{props.get('language') if isinstance(props, Mapping) else None}'"
 
 
+def is_continuous_build(build: Mapping[str, Any]) -> bool:
+    """True when the build's ``execution.trigger.type`` is ``continuous`` (new in
+    schema 0.7.6): its platform keeps the job running, so no scheduler starts
+    its runs. Named after Databricks Jobs' continuous trigger, not Airflow's
+    ``@continuous``, which starts batch runs back to back."""
+    execution = build.get("execution")
+    trigger = execution.get("trigger") if isinstance(execution, Mapping) else None
+    kind = trigger.get("type") if isinstance(trigger, Mapping) else None
+    return isinstance(kind, str) and kind.strip().lower() == "continuous"
+
+
+def is_unscheduled_build(build: Mapping[str, Any]) -> bool:
+    """True when no scheduler starts the build's runs: its job runs outside
+    forge-cli (:func:`is_externally_run_build`), or continuously
+    (:func:`is_continuous_build`)."""
+    return is_externally_run_build(build) or is_continuous_build(build)
+
+
 def get_contract_version(contract: Mapping[str, Any]) -> Optional[str]:
     """
     Get the FLUID schema version from a contract.

@@ -4316,8 +4316,10 @@
             "dependency",
             "dataset",
             "schedule_and_dataset",
-            "timetable"
-          ]
+            "timetable",
+            "continuous"
+          ],
+          "description": "NEW in v0.7.6: continuous, for a build that runs as a long-lived job on its own platform, such as an engine: flink job on the Flink Kubernetes Operator or AWS Managed Service for Apache Flink, or a kafka-connect or debezium connector. The platform keeps the job running, so no scheduler starts runs: fluid generate schedule, fluid schedule-sync and the fluid apply DAGs leave the build out. A continuous trigger takes no other trigger, so cron, schedule, datasets, event and timetable are refused next to it, as Databricks Jobs refuses a continuous trigger next to any other."
         },
         "schedule": {
           "type": "string"
@@ -4382,7 +4384,65 @@
           "type": "object",
           "description": "Custom timetable configuration"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "const": "continuous"
+              }
+            }
+          },
+          "then": {
+            "allOf": [
+              {
+                "description": "cron is not allowed with type continuous: a continuous job runs all the time, so its trigger takes no other trigger. Remove cron, or set type: schedule.",
+                "not": {
+                  "required": [
+                    "cron"
+                  ]
+                }
+              },
+              {
+                "description": "schedule is not allowed with type continuous: a continuous job runs all the time, so its trigger takes no other trigger. Remove schedule, or set type: schedule.",
+                "not": {
+                  "required": [
+                    "schedule"
+                  ]
+                }
+              },
+              {
+                "description": "datasets is not allowed with type continuous: a continuous job runs all the time, so its trigger takes no other trigger. Remove datasets, or set type: dataset.",
+                "not": {
+                  "required": [
+                    "datasets"
+                  ]
+                }
+              },
+              {
+                "description": "event is not allowed with type continuous: a continuous job runs all the time, so its trigger takes no other trigger. Remove event, or set type: event.",
+                "not": {
+                  "required": [
+                    "event"
+                  ]
+                }
+              },
+              {
+                "description": "timetable is not allowed with type continuous: a continuous job runs all the time, so its trigger takes no other trigger. Remove timetable, or set type: timetable.",
+                "not": {
+                  "required": [
+                    "timetable"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
     },
     "runtime": {
       "type": "object",
