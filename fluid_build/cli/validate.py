@@ -903,8 +903,8 @@ def _run_contract_rules(
         # trigger.type continuous (0.7.6) says the job's platform keeps it
         # running, so no scheduler starts the build. forge-cli runs dbt,
         # python, inline-SQL and batch-acquisition builds to completion: the
-        # dbt and python runners refuse the trigger, and the others run once
-        # per fluid apply. A warning, not an error: plain validate passes and
+        # dbt and python runners refuse the trigger, and only fluid apply runs
+        # the others. A warning, not an error: plain validate passes and
         # --strict fails. A crash in the check is reported, never swallowed.
         try:
             from fluid_build.build_runners.base import continuous_trigger_warnings

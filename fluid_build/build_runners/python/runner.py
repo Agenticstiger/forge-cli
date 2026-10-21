@@ -37,6 +37,7 @@ from fluid_build.credentials.dotenv_store import environment_for_project_code
 from fluid_build.util.contract import is_continuous_build
 
 from .._path_safety import confine_to_workspace, resolve_workspace_root
+from ..base import refuse_continuous_trigger
 
 LOG = logging.getLogger("fluid.build_runners.python")
 
@@ -101,19 +102,9 @@ def execute_build(
     cprint(f"   Trigger: {trigger_label}")
 
     # trigger.type continuous (schema 0.7.6) says the job's platform keeps it
-    # running, and the script's run ends. ``fluid validate`` warns about it
-    # (base.continuous_trigger_warnings).
+    # running, and the script's run ends.
     if is_continuous_build(build):
-        cprint(
-            "   ❌ trigger.type continuous: forge-cli runs a build's Python script as a batch "
-            "run, which ends, and a continuous trigger says the job's platform keeps it running."
-        )
-        cprint(
-            "   Use trigger.type manual or schedule, or run the job on a platform that keeps "
-            "it running."
-        )
-        cprint(f"{'=' * 80}")
-        return 1
+        return refuse_continuous_trigger("a build's Python script as a batch run, which ends")
 
     if trigger_type == "manual" or (trigger_type == "schedule" and force_run):
         iterations = 1 if trigger_type == "schedule" and force_run else trigger.get("iterations", 1)

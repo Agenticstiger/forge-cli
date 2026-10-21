@@ -241,7 +241,7 @@ class TestCli:
 # ── a continuous trigger on a build forge-cli runs as a batch run ──────────
 
 _SQL = {"sql": "SELECT 1"}
-_REMEDY = "Use trigger.type schedule, or run the job on a platform that keeps it running."
+_REMEDY = "Use trigger.type schedule or manual, or run the job on a platform that keeps it running."
 
 
 def _build(engine: Any = None, trigger: str = "continuous", **extra: Any) -> Dict[str, Any]:
@@ -249,6 +249,10 @@ def _build(engine: Any = None, trigger: str = "continuous", **extra: Any) -> Dic
     if engine is not None:
         build["engine"] = engine
     return build
+
+
+def _runtime(platform: str = "databricks") -> Dict[str, Any]:
+    return {"trigger": {"type": "continuous"}, "runtime": {"platform": platform}}
 
 
 def _warnings(contract: Dict[str, Any]) -> list:
@@ -269,11 +273,11 @@ class TestBatchBuildWarning:
             f"forge-cli never runs this build. {_REMEDY}"
         ]
 
-    def test_a_duckdb_acquisition_runs_once_per_apply(self) -> None:
+    def test_only_fluid_apply_runs_a_duckdb_acquisition(self) -> None:
         assert _warnings({"builds": [_build("duckdb", pattern="acquisition")]}) == [
             "builds[0] (id 'b'): trigger.type continuous on engine 'duckdb': forge-cli runs "
-            "duckdb builds as batch runs, which end: this build runs once per fluid apply, and "
-            f"no scheduler starts it. {_REMEDY}"
+            "duckdb builds as batch runs, which end: this build runs only when fluid apply runs "
+            f"builds, and no scheduler starts it. {_REMEDY}"
         ]
 
     @pytest.mark.parametrize(
@@ -281,7 +285,19 @@ class TestBatchBuildWarning:
         [
             pytest.param(_build("dbt-snowflake"), "its dbt runner refuses", id="dbt-adapter"),
             pytest.param(_build(" Python "), "its python runner refuses", id="python"),
+            # The dispatcher hands a build with no engine to the python runner.
+            pytest.param(
+                _build(),
+                "on a build with no engine: forge-cli runs builds with no engine as batch runs, "
+                "which end, and its python runner refuses",
+                id="no-engine",
+            ),
             pytest.param(_build("sql", properties=_SQL), "inline-SQL builds", id="sql"),
+            pytest.param(
+                _build("sql", properties=_SQL, execution=_runtime("snowflake")),
+                "inline-SQL builds",
+                id="sql-on-snowflake",
+            ),
             pytest.param(
                 _build(pattern="embedded-logic", properties=_SQL),
                 "on a build with no engine: forge-cli runs inline-SQL builds",
@@ -313,12 +329,16 @@ class TestBatchBuildWarning:
             pytest.param(
                 _build("sql", properties={"language": "flink_sql", **_SQL}), id="flink-sql"
             ),
-            # No runner of its own: a Spark or Glue streaming job can run on
-            # its own platform.
+            # No forge-cli runner takes these: fluid apply leaves them to their
+            # platform, as it does a Flink job.
             pytest.param(_build("spark"), id="spark"),
             pytest.param(_build("glue"), id="glue"),
             pytest.param(_build("custom"), id="custom"),
-            pytest.param(_build(), id="no-engine-no-sql"),
+            pytest.param(_build("kafka-connect"), id="connector-without-acquisition"),
+            pytest.param(
+                _build("spark", pattern="embedded-logic", properties=_SQL, execution=_runtime()),
+                id="inline-sql-on-databricks",
+            ),
             pytest.param(_build("dbt", trigger="schedule"), id="schedule"),
             pytest.param({"id": "b", "engine": "dbt"}, id="no-trigger"),
         ],
@@ -372,6 +392,87 @@ def test_streaming_engines_are_the_runners_that_declare_streaming() -> None:
     }
 
 
+_DISPATCHED = [
+    pytest.param(_build("dbt"), id="dbt"),
+    pytest.param(_build("dbt-snowflake"), id="dbt-adapter"),
+    pytest.param(_build("python"), id="python"),
+    pytest.param(_build(), id="no-engine"),
+    pytest.param(_build("sql", properties=_SQL), id="sql"),
+    pytest.param(_build("sql", properties=_SQL, execution=_runtime("snowflake")), id="snowflake"),
+    pytest.param(_build("spark", pattern="embedded-logic", properties=_SQL), id="spark-sql-local"),
+    pytest.param(
+        _build("spark", pattern="embedded-logic", properties=_SQL, execution=_runtime()),
+        id="spark-sql-databricks",
+    ),
+    *[
+        pytest.param(_build(engine, pattern="acquisition"), id=f"{engine}-acquisition")
+        for engine in ("duckdb", "airbyte", "meltano", "dlt", "kafka-connect", "debezium")
+    ],
+    pytest.param(_build("duckdb", pattern="hybrid-reference"), id="duckdb-not-acquisition"),
+    pytest.param(_build("kafka-connect"), id="kafka-connect-no-pattern"),
+    pytest.param(_build("spark", pattern="hybrid-reference"), id="spark"),
+    pytest.param(_build("glue"), id="glue"),
+    pytest.param(_build("custom"), id="custom"),
+    pytest.param(_build("flink", properties=_SQL), id="flink"),
+    pytest.param(_build("sql", properties={"language": "flink_sql", **_SQL}), id="flink-sql"),
+]
+
+
+@pytest.mark.parametrize("build", _DISPATCHED)
+def test_validate_warns_exactly_when_apply_runs_the_build_as_a_batch_run(
+    build: Dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    # One predicate behind both: a warned build reaches a batch runner under
+    # fluid apply --mode amend-and-build, and any other reaches a connector's
+    # runner or none, as a Flink job does.
+    import argparse
+    import logging
+
+    from fluid_build.build_runners import base
+    from fluid_build.build_runners.dbt import runner as dbt_runner
+    from fluid_build.build_runners.python import runner as python_runner
+
+    called: list = []
+
+    def _record(name: str) -> Any:
+        def _run(*_args: Any, **_kwargs: Any) -> int:
+            called.append(name)
+            return 0
+
+        return _run
+
+    monkeypatch.setattr(base, "_execute_acquisition_build", _record("acquisition"))
+    monkeypatch.setattr(base, "_execute_embedded_sql_build", _record("inline-sql"))
+    monkeypatch.setattr(dbt_runner, "execute_dbt_build", _record("dbt"))
+    monkeypatch.setattr(python_runner, "execute_build", _record("python"))
+    (tmp_path / "contract.fluid.yaml").write_text("id: p\n", "utf-8")
+    (tmp_path / "ingest.py").write_text("print('ran')\n", "utf-8")
+    (tmp_path / "dbt_project.yml").write_text("name: p\nprofile: p\n", "utf-8")
+    args = argparse.Namespace(
+        contract=str(tmp_path / "contract.fluid.yaml"),
+        build_id=None,
+        dry_run=False,
+        fail_fast=False,
+        delay=0,
+        no_output=True,
+        sample_rows=None,
+        env=None,
+        mode="amend-and-build",
+        allow_skipped_builds=False,
+    )
+    rc = base.run_builds_from_args(
+        args, logging.getLogger("test"), force_run=True, contract={"id": "p", "builds": [build]}
+    )
+    assert rc == 0
+    connector = called == ["acquisition"] and build["engine"] in base.STREAMING_ACQUISITION_ENGINES
+    assert bool(_warnings({"builds": [build]})) is (bool(called) and not connector), called
+    if not called:
+        assert "there is nothing for forge-cli to run" in " ".join(capsys.readouterr().out.split())
+
+
 class TestValidateCli:
     @staticmethod
     def _write(tmp_path: Path) -> None:
@@ -398,7 +499,7 @@ class TestValidateCli:
         self._write(tmp_path)
         result = _run_cli("validate", "contract.fluid.yaml", "--offline", "--strict", cwd=tmp_path)
         assert result.returncode == 1, result.stdout + result.stderr
-        assert "warnings treated as errors (--strict)" in result.stdout
+        assert "warnings treated as errors (--strict)" in " ".join(result.stdout.split())
 
     def test_json_lists_the_warning(self, tmp_path: Path) -> None:
         self._write(tmp_path)
