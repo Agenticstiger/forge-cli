@@ -45,6 +45,7 @@ import yaml
 
 from fluid_build._console import cprint, success
 from fluid_build._console import error as console_error
+from fluid_build.util.contract import is_continuous_build
 
 from .._path_safety import confine_to_workspace
 from ..base import SENSITIVE_ENV_KEY_RE, _resolve_env_placeholders
@@ -938,6 +939,21 @@ def execute_dbt_build(
     if trigger_type == "schedule" and force_run:
         trigger_label = "schedule (manual apply override)"
     cprint(f"   Trigger: {trigger_label}")
+
+    # trigger.type continuous (schema 0.7.6) says the job's platform keeps it
+    # running, and a dbt run ends. Refused before a profile is prepared;
+    # ``fluid validate`` warns about it (base.continuous_trigger_warnings).
+    if is_continuous_build(build):
+        cprint(
+            "   ❌ trigger.type continuous: forge-cli runs dbt builds as batch runs, which "
+            "end, and a continuous trigger says the job's platform keeps it running."
+        )
+        cprint(
+            "   Use trigger.type manual or schedule, or run the job on a platform that keeps "
+            "it running."
+        )
+        cprint(f"{'=' * 80}")
+        return 1
 
     project_config = _load_dbt_project_config(project_dir)
     profiles_dir, temp_profiles_dir = resolve_dbt_profiles_dir(build, project_dir, project_config)

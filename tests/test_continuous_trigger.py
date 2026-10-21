@@ -409,3 +409,45 @@ class TestValidateCli:
         report = json.loads(result.stdout)
         assert report["valid"] is True
         assert [w for w in report["warnings"] if "trigger.type continuous" in w]
+
+
+class TestRunnerRefusal:
+    def test_the_dbt_runner_names_the_trigger(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from fluid_build.build_runners.dbt import runner
+
+        def _not_reached(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("a refused build must not prepare a dbt profile")
+
+        monkeypatch.setattr(runner, "resolve_dbt_profiles_dir", _not_reached)
+        assert runner.execute_dbt_build(_build("dbt"), tmp_path, tmp_path) == 1
+        out = " ".join(capsys.readouterr().out.split())
+        assert "trigger.type continuous: forge-cli runs dbt builds as batch runs" in out
+        assert "Unknown trigger type" not in out
+
+    def test_the_python_runner_names_the_trigger(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from fluid_build.build_runners.python import runner
+
+        def _not_run(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("a refused build must not run its script")
+
+        script = tmp_path / "ingest.py"
+        script.write_text("print('ran')\n", "utf-8")
+        monkeypatch.setattr(runner.subprocess, "run", _not_run)
+        assert runner.execute_build(_build("python"), script, tmp_path) == 1
+        out = " ".join(capsys.readouterr().out.split())
+        assert "trigger.type continuous: forge-cli runs a build's Python script" in out
+        assert "Unknown trigger type" not in out
+
+    def test_another_unknown_trigger_keeps_its_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        from fluid_build.build_runners.python import runner
+
+        script = tmp_path / "ingest.py"
+        script.write_text("print('ran')\n", "utf-8")
+        assert runner.execute_build(_build("python", trigger="event"), script, tmp_path) == 1
+        assert "Unknown trigger type: event" in capsys.readouterr().out
