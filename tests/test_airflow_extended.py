@@ -191,7 +191,9 @@ class TestGenerateAirflowDagTaskflow:
             ]
         )
         result = generate_airflow_dag_taskflow(contract, "123", "us-east-1")
-        assert "a >> b" in result
+        # The S3 operator to the Glue @task's result: the @task function itself is not
+        # a task, and `a >> b` raised TypeError when Airflow parsed the DAG.
+        assert "    a >> b_result" in result
 
     def test_athena_uses_classic_operator(self):
         contract = _make_contract(

@@ -286,7 +286,9 @@ def test_benign_contract_still_produces_expected_operators():
     }
     (code,) = AirflowScheduler().generate(contract, provider="snowflake").values()
     assert_inert(code)
-    assert "load = SnowflakeOperator(" in code
+    assert (
+        "load = SQLExecuteQueryOperator(" in code
+    )  # snowflake provider 6.0 removed SnowflakeOperator
     assert "sql='SELECT 1'" in code
     assert "task_id='load'" in code
 

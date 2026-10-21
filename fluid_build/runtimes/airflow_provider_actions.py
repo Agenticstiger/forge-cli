@@ -26,6 +26,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from ..providers.common.codegen_utils import (
+    airflow_dag_import,
+    airflow_standard_import,
     escape_for_docstring,
     py_str_literal,
     sanitize_identifier,
@@ -279,11 +281,7 @@ Generated at: {datetime.now().isoformat()}
 Domain: {d_domain}
 Description: {d_description}
 """
-from airflow import DAG
-from airflow.operators.bash import BashOperator
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
-from datetime import datetime, timedelta
+{airflow_dag_import()}{airflow_standard_import("BashOperator")}{airflow_standard_import("PythonOperator")}from datetime import datetime, timedelta, timezone
 
 # DAG configuration
 default_args = {{
@@ -299,8 +297,8 @@ default_args = {{
 dag = DAG(
     dag_id={py_str_literal(dag_id)},
     description={py_str_literal(description)},
-    schedule_interval={py_str_literal(schedule)},
-    start_date=days_ago(1),
+    schedule={py_str_literal(schedule)},
+    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     catchup=False,
     tags=["fluid", "data-product", {py_str_literal(kind)}, {py_str_literal(domain)}],
     default_args=default_args
@@ -454,14 +452,13 @@ dag = DAG(
         return f'''"""
 Empty Airflow DAG - No provider actions found
 """
-from airflow import DAG
-from airflow.operators.bash import BashOperator
-from airflow.utils.dates import days_ago
+from datetime import datetime, timezone
 
+{airflow_dag_import()}{airflow_standard_import("BashOperator")}
 dag = DAG(
     dag_id={py_str_literal(dag_id)},
-    schedule_interval={py_str_literal(schedule)},
-    start_date=days_ago(1),
+    schedule={py_str_literal(schedule)},
+    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     catchup=False,
     tags=["fluid", "placeholder"]
 )

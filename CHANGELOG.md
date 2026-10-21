@@ -64,6 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An environment overlay cannot turn a scheduled build continuous: overlays cannot
   delete the base's `cron` or `schedule`, which a continuous trigger refuses. Declare the
   trigger in each environment's overlay instead of in the base.
+- Generated Airflow DAGs run Snowflake SQL through `SQLExecuteQueryOperator`
+  (apache-airflow-providers-common-sql, which the snowflake provider installs) with
+  `conn_id`, because apache-airflow-providers-snowflake 6.0 removed `SnowflakeOperator`;
+  a DAG generated before needs regenerating to load. A GCP `create_table` task uses
+  `BigQueryCreateTableOperator` where the google provider has it (14+), and the old
+  `BigQueryCreateEmptyTableOperator` before that.
 
 ### Added
 
@@ -148,6 +154,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`fe80::a:b:c` showed an emoji) and a control character prints as `\x1b` and the like,
   so an escape sequence in a contract or an error message can no longer clear the
   terminal or plant a link. JSON and JUnit output are unchanged.
+
+### Fixed
+
+- **Generated Airflow DAGs load on Airflow 3.** `fluid export --engine airflow`, `fluid
+  generate schedule`, `fluid init`, `fluid scaffold-composer`, `fluid schedule-sync` and
+  the AWS, GCP and Snowflake code generators emitted `DAG(schedule_interval=...)` and
+  `start_date=days_ago(1)`, which Airflow 3 removed, so their DAGs failed to import. They
+  now pass `schedule=` with a fixed `start_date` and `catchup=False`, and import `DAG`,
+  `dag`/`task` and the core operators and sensors from their Airflow 3 homes
+  (`airflow.sdk`, apache-airflow-providers-standard), falling back to the Airflow 2 paths,
+  so the same DAG loads on Airflow 2.7+ and 3.x.
+- The AWS TaskFlow DAG wired its `@task` functions (`load >> publish`), which raised
+  `TypeError` when Airflow parsed it; it now wires each task's result, and an operator
+  task as itself.
+- The GCP DAG imports the Dataflow operator only when a task uses it: its module needs
+  apache-airflow-providers-apache-beam, and the unused import stopped every GCP DAG from
+  loading where that provider was absent.
 
 ## [0.21.0] — 2026-10-19
 

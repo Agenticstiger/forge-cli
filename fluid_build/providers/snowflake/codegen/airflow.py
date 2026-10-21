@@ -30,6 +30,8 @@ from typing import Any, Dict, List
 
 from fluid_build.providers._sql_safety import validate_ident, validate_sql_type_name
 from fluid_build.providers.common.codegen_utils import (
+    airflow_dag_import,
+    airflow_standard_import,
     escape_for_docstring,
     py_str_literal,
     sanitize_identifier,
@@ -125,16 +127,20 @@ Generated: {datetime.now(dt_timezone.utc).replace(tzinfo=None).isoformat()}Z
 
 def _generate_dag_imports() -> str:
     """Generate import statements."""
-    return """from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
+    return (
+        (
+            "from datetime import datetime, timedelta\n"
+            "from zoneinfo import ZoneInfo\n"
+            + airflow_dag_import()
+            + airflow_standard_import("PythonOperator")
+        )
+        + """from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 import json
 import logging
 
 logger = logging.getLogger(__name__)"""
+    )
 
 
 def _generate_dag_definition(
@@ -169,7 +175,7 @@ dag = DAG(
     dag_id={dag_id_lit},
     default_args=default_args,
     description={description_lit},
-    schedule_interval={schedule_lit},
+    schedule={schedule_lit},
     start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo({timezone_lit})),
     catchup=False,
     tags={tags!r},
@@ -218,7 +224,7 @@ def _generate_snowflake_sql_task(
     """Generate Snowflake SQL task code.
 
     SQL-injection safety: ``create_database`` / ``create_schema`` /
-    ``create_table`` build DDL that the generated ``SnowflakeOperator`` runs at
+    ``create_table`` build DDL that the generated ``SQLExecuteQueryOperator`` runs at
     DAG *runtime*, so ``py_str_literal`` (which only neutralises the Python
     layer) is not enough on its own. Every IDENTIFIER (database / schema /
     table / column name) is routed through ``validate_ident`` and every column
@@ -268,12 +274,13 @@ def _generate_snowflake_sql_task(
     warehouse_lit = py_str_literal(warehouse)
     database_lit = py_str_literal(database)
 
-    return f"""{var} = SnowflakeOperator(
+    # SQLExecuteQueryOperator (apache-airflow-providers-common-sql), not SnowflakeOperator,
+    # which apache-airflow-providers-snowflake 6.0 removed.
+    return f"""{var} = SQLExecuteQueryOperator(
     task_id={task_id_lit},
-    snowflake_conn_id=SNOWFLAKE_CONN_ID,
+    conn_id=SNOWFLAKE_CONN_ID,
     sql={sql_lit},
-    warehouse={warehouse_lit},
-    database={database_lit},
+    hook_params={{"warehouse": {warehouse_lit}, "database": {database_lit}}},
     dag=dag,
 )"""
 
@@ -345,7 +352,7 @@ def _generate_task_dependencies(tasks: List[Dict[str, Any]]) -> str:
 
 
 def _convert_schedule(schedule: str) -> str:
-    """Convert FLUID schedule to Airflow schedule_interval."""
+    """Convert FLUID schedule to an Airflow ``schedule`` value."""
     schedule_lower = schedule.lower()
     if schedule_lower in ("@hourly", "@daily", "@weekly", "@monthly"):
         return schedule_lower
