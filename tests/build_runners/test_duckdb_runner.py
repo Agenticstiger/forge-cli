@@ -212,7 +212,10 @@ class TestDuckdbFilesystemFailures:
 # ── postgres, no server ───────────────────────────────────────────────────
 
 
-def test_an_unreachable_postgres_source_fails_the_build_not_the_process(tmp_path, caplog):
+@pytest.mark.parametrize("with_password", [True, False], ids=["password", "no-password"])
+def test_an_unreachable_postgres_source_fails_the_build_not_the_process(
+    tmp_path, caplog, with_password
+):
     """The source is attached as the run's connection opens (DuckDB 2.0 has no
     ``postgres_scan``), so its connect error is reported as the build's failure,
     with the password masked, as a failing stream was before."""
@@ -240,7 +243,7 @@ def test_an_unreachable_postgres_source_fails_the_build_not_the_process(tmp_path
                             "host": "127.0.0.1",
                             "port": 9,  # discard: nothing listens
                             "user": "fluid",
-                            "password": password,
+                            **({"password": password} if with_password else {}),
                             "database": "app",
                         },
                         "mode": "full_refresh",

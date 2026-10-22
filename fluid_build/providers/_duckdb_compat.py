@@ -78,16 +78,12 @@ def one_row(result: Any) -> Tuple[Any, ...]:
     return row
 
 
-#: Statement types whose result is a query result (rows), whatever they hold.
-#: Not ``MULTI``, 2.0's type for a ``PIVOT`` with columns it must look up first:
-#: a bare ``PIVOT`` returns rows, a ``CREATE TABLE ... AS PIVOT`` does not, so
-#: that one is judged by the result's shape.
+#: Statement types whose result is a query result, whatever it holds: DuckDB 1.5
+#: returns a relation for these even when it is a ``Success`` flag
+#: (``CHECKPOINT`` is a ``CALL``). Not ``MULTI``, 2.0's type for a ``PIVOT``
+#: with columns it must look up first: a bare ``PIVOT`` returns rows, a
+#: ``CREATE TABLE ... AS PIVOT`` does not, so its shape decides.
 _QUERY_STATEMENTS = frozenset({"SELECT", "EXPLAIN", "CALL", "PRAGMA"})
-#: Statement types that never return rows.
-_NO_ROWS_STATEMENTS = frozenset(
-    {"CREATE", "DROP", "ALTER", "SET", "VARIABLE_SET", "ATTACH", "DETACH", "TRANSACTION"}
-    | {"LOAD", "VACUUM", "ANALYZE", "EXPORT", "COPY_DATABASE", "PREPARE"}
-)
 #: What 2.0 holds for a statement with no query result: the changed-row count
 #: (``INSERT``, ``UPDATE``, ``DELETE``, ``MERGE``, ``COPY``), or a success flag.
 _NO_RESULT_SHAPES = frozenset({(("Count",), ("BIGINT",)), (("Success",), ("BOOLEAN",))})
@@ -111,10 +107,13 @@ def query_relation(con: Any, sql: str) -> Any:
     2.0 returns a relation for both, and for SQL of several statements the
     relation of the last one that returned rows, which need not be the last
     statement. On 2.x every statement but the last therefore runs first, and
-    the last one alone decides: by its type, then by the shape 2.0 gives a
-    statement without a query result. Each statement runs once. One case stays
-    apart: a ``RETURNING`` clause whose only column is a ``BIGINT`` named
-    ``Count`` reads as no rows on 2.x.
+    the last one alone decides: a query type keeps its relation, and any other
+    statement is judged by the shape 2.0 gives one without a query result (a
+    ``Count`` of changed rows, or a ``Success`` flag; every DDL, ``SET``,
+    ``ATTACH``, ``LOAD`` and transaction statement returns one of the two).
+    Each statement runs once. One case stays apart: a ``RETURNING`` clause
+    whose only column is a ``BIGINT`` named ``Count``, or a ``BOOLEAN`` named
+    ``Success``, reads as no rows on 2.x.
     """
     import duckdb
 
@@ -134,8 +133,6 @@ def query_relation(con: Any, sql: str) -> Any:
     rel = con.sql(last.query)
     if last.type.name in _QUERY_STATEMENTS:
         return rel
-    if last.type.name in _NO_ROWS_STATEMENTS:
-        return None
     shape = (tuple(rel.columns), tuple(str(t) for t in rel.types))
     return None if shape in _NO_RESULT_SHAPES else rel
 

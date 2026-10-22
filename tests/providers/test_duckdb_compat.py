@@ -141,6 +141,8 @@ def _table_t() -> Any:
         ("DESCRIBE t", None),
         ("CALL pragma_version()", None),
         ("EXPLAIN SELECT 1", None),
+        # A CALL whose result is a Success flag: 1.5 returns it as a relation.
+        ("CHECKPOINT", ["Success"]),
     ],
 )
 def test_query_relation_keeps_a_query(sql, columns):
