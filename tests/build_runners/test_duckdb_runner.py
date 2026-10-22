@@ -218,16 +218,7 @@ _CONNECT_FAILED = {
 }
 
 
-@pytest.mark.parametrize("with_password", [True, False], ids=["password", "no-password"])
-@pytest.mark.parametrize("kind", ["postgres", "mysql"])
-def test_an_unreachable_database_source_fails_the_build_not_the_process(
-    tmp_path, caplog, kind, with_password
-):
-    """The source is attached as the run's connection opens (DuckDB 2.0 has no
-    ``postgres_scan``), so its connect error is reported as the build's failure,
-    with the password masked. The error is a connection failure: not a function
-    DuckDB 2.0 lacks, nor the "Unknown secret storage found: 'local_file'" that
-    an ATTACH without a named secret hits under the sandbox."""
+def _require_extension(kind: str) -> None:
     duckdb = pytest.importorskip("duckdb")
     try:
         probe = duckdb.connect()
@@ -235,9 +226,11 @@ def test_an_unreachable_database_source_fails_the_build_not_the_process(
         probe.close()
     except duckdb.Error:
         pytest.skip(f"the {kind} extension is not installable here (offline)")
-    password = "runner-unreachable-db-pw-6T"  # pragma: allowlist secret
-    out_path = tmp_path / "orders.parquet"
-    contract = {
+
+
+def _database_source_contract(kind: str, connection: Dict[str, Any], out_path: Path) -> dict:
+    """One acquisition build reading ``app.orders`` from a ``kind`` database."""
+    return {
         "fluidVersion": "0.7.3",
         "id": "bronze.db_orders",
         "builds": [
@@ -248,13 +241,7 @@ def test_an_unreachable_database_source_fails_the_build_not_the_process(
                 "properties": {
                     "source": {
                         "kind": kind,
-                        "connection": {
-                            "host": "127.0.0.1",
-                            "port": 9,  # discard: nothing listens
-                            "user": "fluid",
-                            **({"password": password} if with_password else {}),
-                            "database": "app",
-                        },
+                        "connection": connection,
                         "mode": "full_refresh",
                         "streams": ["app.orders"],
                     },
@@ -276,6 +263,29 @@ def test_an_unreachable_database_source_fails_the_build_not_the_process(
             }
         ],
     }
+
+
+@pytest.mark.parametrize("with_password", [True, False], ids=["password", "no-password"])
+@pytest.mark.parametrize("kind", ["postgres", "mysql"])
+def test_an_unreachable_database_source_fails_the_build_not_the_process(
+    tmp_path, caplog, kind, with_password
+):
+    """The source is attached as the run's connection opens (DuckDB 2.0 has no
+    ``postgres_scan``), so its connect error is reported as the build's failure,
+    with the password masked. The error is a connection failure: not a function
+    DuckDB 2.0 lacks, nor the "Unknown secret storage found: 'local_file'" that
+    an ATTACH without a named secret hits under the sandbox."""
+    _require_extension(kind)
+    password = "runner-unreachable-db-pw-6T"  # pragma: allowlist secret
+    out_path = tmp_path / "orders.parquet"
+    connection = {
+        "host": "127.0.0.1",
+        "port": 9,  # discard: nothing listens
+        "user": "fluid",
+        **({"password": password} if with_password else {}),
+        "database": "app",
+    }
+    contract = _database_source_contract(kind, connection, out_path)
     caplog.set_level("DEBUG")
     rc = execute_duckdb_build(contract["builds"][0], contract, tmp_path, dry_run=False)
     assert rc == 1
@@ -285,6 +295,45 @@ def test_an_unreachable_database_source_fails_the_build_not_the_process(
     for written in tmp_path.rglob("*"):
         if written.is_file():
             assert password not in written.read_text(encoding="utf-8", errors="replace"), written
+
+
+@pytest.mark.parametrize(
+    "refused, reason",
+    [
+        ({"port": "abc"}, "connection.port must be numeric"),
+        # The run record's redactor reads "<NAME>_SECRET: environment" as an
+        # assignment and masks its value, so the record says "variable not set".
+        ({"secretRef": "env://FLUID_TEST_UNSET_SOURCE_SECRET"}, "variable not set"),
+        # The file backend refuses a name with a separator: a ConfigurationError,
+        # as every secret backend but env:// raises, not a ValueError.
+        ({"secretRef": "file://a/b"}, "Invalid secret name"),
+    ],
+    ids=["port", "unset-secret-ref", "secret-backend-error"],
+)
+@pytest.mark.parametrize("kind", ["postgres", "mysql"])
+def test_a_source_the_runner_cannot_set_up_fails_the_build_with_a_run_record(
+    tmp_path, monkeypatch, kind, refused, reason
+):
+    """A connection block refused before any attach (a port that is not a
+    number, a secretRef that does not resolve) fails the build as a connect
+    error does: exit 1 and a failed run record, not an exception out of the
+    runner that ends `fluid apply` before its other builds run."""
+    import json
+
+    _require_extension(kind)
+    monkeypatch.delenv("FLUID_TEST_UNSET_SOURCE_SECRET", raising=False)
+    out_path = tmp_path / "orders.parquet"
+    connection = {"host": "127.0.0.1", "port": 9, "user": "fluid", "database": "app", **refused}
+    contract = _database_source_contract(kind, connection, out_path)
+    rc = execute_duckdb_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+    assert rc == 1
+    assert not out_path.exists()
+    runs = tmp_path / ".fluid" / "runs" / "bronze.db_orders" / "ingest_db" / "runs"
+    (record,) = [json.loads(p.read_text(encoding="utf-8")) for p in runs.glob("*.json")]
+    assert record["state"] == "failed"
+    (stream,) = record["streams"]
+    assert stream["state"] == "failed"
+    assert stream["error"].startswith("source: ") and reason in stream["error"], stream
 
 
 # ── postgres (docker-required) ────────────────────────────────────────────

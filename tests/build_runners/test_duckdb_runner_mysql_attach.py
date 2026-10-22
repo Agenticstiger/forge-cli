@@ -218,8 +218,8 @@ class TestPostgresAttachDsnRefusesControlCharacters:
 
 class TestPostgresAttach:
     """DuckDB 2.0's postgres extension has no ``postgres_scan``, so the runner
-    attaches a postgres source before the sandbox's lock, read-only, as it
-    attaches mysql and sqlite."""
+    attaches a postgres source before the sandbox's lock, as it attaches mysql
+    and sqlite sources, and attaches it read-only."""
 
     def test_the_source_is_attached_read_only_under_a_per_build_alias(self):
         secret, sql = _executed(dict(_BASE, port="5432"), kind="postgres")
@@ -260,6 +260,17 @@ class TestPostgresAttach:
             _executed(raw, kind=kind)
         # Still a ValueError for callers that catch the builder's refusal.
         assert isinstance(caught.value, ValueError)
+
+    @pytest.mark.parametrize("kind", ["postgres", "mysql"])
+    def test_a_secret_backend_error_fails_the_source_setup(self, kind):
+        """Every backend but env:// raises ConfigurationError, not ValueError;
+        the file backend refuses a name with a separator before reading."""
+        from fluid_build.build_runners.duckdb.runner import _SourceSetupError
+
+        raw = {k: v for k, v in _BASE.items() if k != "password"}
+        raw["secretRef"] = "file://a/b"  # pragma: allowlist secret
+        with pytest.raises(_SourceSetupError, match="Invalid secret name"):
+            _executed(raw, kind=kind)
 
     def test_a_connect_error_has_the_password_masked(self):
         class _Con:

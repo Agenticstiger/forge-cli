@@ -630,13 +630,16 @@ jobs:
   # This installs exactly the floor the sandbox enforces (MIN_DUCKDB_VERSION,
   # read from the code, so the two cannot drift) on a supported Python and
   # runs what differs between DuckDB versions: the compat seam
-  # (providers/_duckdb_compat.py), the sandbox, the MCP DuckDB driver and the
-  # local end-to-end suite.
+  # (providers/_duckdb_compat.py), the sandbox, the MCP DuckDB driver, the
+  # DuckDB acquisition runner (its database-source attaches) and every suite
+  # the DuckDB end-to-end job runs. tests/test_ci_duckdb_floor.py fails when a
+  # file the end-to-end job runs, or a test that branches on the DuckDB
+  # version, is missing here.
   # ──────────────────────────────────────────────────────────────
   duckdb-floor:
     name: DuckDB floor (Python 3.12)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -644,17 +647,51 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install with local extras, then the DuckDB floor
+        env:
+          # Same pip timeout and retried install as the test matrix (see the
+          # comments there).
+          PIP_TIMEOUT: "30"
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,local]"
+          for attempt in 1 2 3; do
+            python -m pip install -e ".[dev,local]" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::pip install -e .[dev,local] failed 3 times; this is an install failure, not a test failure."
+              exit 1
+            fi
+            echo "::warning::pip install -e .[dev,local] failed (attempt ${attempt}/3); retrying in 30s."
+            sleep 30
+          done
           floor=$(python -c "from fluid_build.providers._duckdb_sandbox import MIN_DUCKDB_VERSION as v; print('.'.join(map(str, v)))")
-          python -m pip install "duckdb==${floor}"
+          for attempt in 1 2 3; do
+            python -m pip install "duckdb==${floor}" && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::pip install duckdb==${floor} failed 3 times; this is an install failure, not a test failure."
+              exit 1
+            fi
+            echo "::warning::pip install duckdb==${floor} failed (attempt ${attempt}/3); retrying in 30s."
+            sleep 30
+          done
           python -c "import duckdb, sys; print('duckdb', duckdb.__version__); sys.exit(duckdb.__version__ != '${floor}')"
       - name: Run the DuckDB-version-sensitive tests on the floor
         env:
+          # The quickstart and example suites fail, rather than skip, without
+          # duckdb (as in the DuckDB end-to-end job).
           FLUID_REQUIRE_DUCKDB: "1"
         run: |
-          python -m pytest -q tests/providers/test_duckdb_compat.py tests/providers/test_duckdb_sandbox.py tests/providers/test_duckdb_sandbox_workspace_root.py tests/output_ports/test_drivers_duckdb.py tests/test_e2e_local.py tests/test_e2e_local_apply.py tests/test_e2e_local_negative.py
+          python -m pytest -q \
+            tests/providers/test_duckdb_compat.py \
+            tests/providers/test_duckdb_sandbox.py \
+            tests/providers/test_duckdb_sandbox_workspace_root.py \
+            tests/output_ports/test_drivers_duckdb.py \
+            tests/build_runners/test_duckdb_runner.py \
+            tests/build_runners/test_duckdb_runner_mysql_attach.py \
+            tests/test_e2e_local.py \
+            tests/test_e2e_local_apply.py \
+            tests/test_e2e_local_negative.py \
+            tests/providers/test_local_live_happy_path.py \
+            tests/test_quickstart_templates_execute.py \
+            tests/test_examples_execute.py
       - name: Cleanup local artifacts (defensive)
         if: always()
         run: python scripts/cleanup_local_test_artifacts.py

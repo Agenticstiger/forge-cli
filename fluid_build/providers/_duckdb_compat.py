@@ -49,8 +49,8 @@ from typing import Any, Dict, Optional, Tuple
 #: The storage format DuckDB 1.5 writes by default (storage version 64, which
 #: DuckDB 1.0 and later open). Database files forge-cli creates on DuckDB 2.x
 #: are written in it, so a 1.5 install (Python 3.10, or a tool pinned below 2)
-#: opens them, and a 2.x connection accepts the same SQL on them as 1.5 does
-#: (no 2.0-only types such as VARIANT).
+#: opens them, and a 2.x connection accepts the same SQL on them as 1.5 does (a
+#: VARIANT column, which needs storage v1.5.0, is refused on both).
 STORAGE_COMPATIBILITY_VERSION = "v1.0.0"
 
 

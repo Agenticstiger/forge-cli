@@ -401,9 +401,12 @@ def _postgres_attach_sql(connection: Dict[str, Any], *, alias: str) -> str:
     """``ATTACH '<libpq dsn>' AS <alias> (TYPE postgres, SECRET <alias>, READ_ONLY)``.
 
     DuckDB 1.5's ``postgres_scan(dsn, schema, table)`` is gone from DuckDB 2.0's
-    postgres extension; ``ATTACH`` works on both, and attached ``READ_ONLY`` the
-    source cannot be written through it (``postgres_execute`` and ``INSERT`` are
-    refused). The DSN is the shared :func:`build_libpq_dsn` one (control
+    postgres extension; ``ATTACH`` works on both. ``READ_ONLY`` refuses a write
+    through the attached catalog (``INSERT``, ``CREATE``) and runs the
+    connection in a read-only transaction, but it is no write barrier:
+    ``postgres_execute`` sends its SQL to the server, which can end that
+    transaction (a ``COMMIT``) and then write. Only the engine's own SQL runs on
+    this connection. The DSN is the shared :func:`build_libpq_dsn` one (control
     characters and a non-numeric port refused), one SQL literal at the boundary.
     ``SECRET <alias>`` names the empty secret :func:`_empty_secret_sql` makes.
     """
@@ -834,6 +837,13 @@ class DuckdbRunner:
                 # Resolve secretRef → password before the DSN is built; an
                 # inline literal still wins.
                 conn = resolve_connection_secrets(dict(ctx.source.connection.raw))
+            except Exception as exc:
+                # An unset variable or an unknown scheme (ValueError), or the
+                # secret backend's own error (ConfigurationError from vault,
+                # aws, gcp, azure or file): each names the reference, never
+                # the secret.
+                raise _SourceSetupError(str(exc)) from exc
+            try:
                 if postgres:
                     alias = _postgres_alias_for_build(ctx.build_id)
                     attach_sql = _postgres_attach_sql(conn, alias=alias)  # validates first
@@ -842,9 +852,8 @@ class DuckdbRunner:
                     attach_sql = _mysql_attach_sql(conn, alias=alias)  # validates first
                 con.execute(_empty_secret_sql("postgres" if postgres else "mysql", alias=alias))
             except ValueError as exc:
-                # A DSN value the builder refuses, or a secretRef that does not
-                # resolve: the message names the field or the reference, never
-                # a value of the connection's.
+                # A DSN value the builder refuses: the message names the field
+                # (and quotes a refused port), never a credential.
                 raise _SourceSetupError(str(exc)) from exc
             except duckdb.Error as exc:  # the extension did not load
                 raise _SourceAttachError(str(exc)) from exc

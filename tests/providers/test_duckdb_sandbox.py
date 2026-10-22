@@ -522,9 +522,10 @@ def test_the_copy_sibling_is_one_more_file_confined_like_the_landing(layout, mon
 
 
 def test_a_sqlite_source_outside_the_allowed_directories_is_refused(layout, monkeypatch):
-    """The sqlite scanner opens files through its own library, which DuckDB's
-    allowlist never bounds, so the declared source path was attached wherever
-    it pointed: any SQLite file on the host could be landed."""
+    """The engine attaches a SQLite source before the sandbox's lock, when no
+    allowlist applies yet (and through DuckDB 1.5 the sqlite scanner did not
+    honour one), so the declared source path was attached wherever it pointed:
+    any SQLite file on the host could be landed."""
     import sqlite3
 
     from fluid_build.build_runners.duckdb.runner import execute_duckdb_build
@@ -1186,7 +1187,8 @@ def test_from_duckdb_2_a_loaded_sqlite_scanner_is_bounded_by_the_allowlist(tmp_p
     the allowlist bounds it as it bounds ``read_csv``: a file outside, ``./..``
     out of an allowed directory and a symlink out of one are each refused,
     while a file inside is read. The engine still keeps contract SQL off a
-    connection that loads a scanner (``postgres`` stays unbounded)."""
+    connection that loads a scanner (``postgres_query`` reaches what the engine
+    attached before the lock)."""
     inside, outside = tmp_path / "allowed", tmp_path / "outside"
     inside.mkdir()
     outside.mkdir()

@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   needs Python 3.11, so a Python 3.10 install stays on 1.5.x). On 2.x, a DuckDB database
   file forge-cli creates (`fluid demo`'s `.fluid/db.duckdb`, the local provider's session
   and `persist` databases, a Meltano acquisition's DuckDB destination) is written in the
-  format DuckDB 1.5 writes, which DuckDB 1.0 and later open, so a 2.0-only type such as
-  `VARIANT` is refused in it as on 1.5; a file that already exists keeps its format.
+  format DuckDB 1.5 writes, which DuckDB 1.0 and later open, so a type that needs a newer
+  format, such as a `VARIANT` column, is refused in it on 2.x as it is on 1.5; a file
+  that already exists keeps its format.
   DuckDB 2.x's own default format cannot be read by 1.5: a file another 2.x tool created
   (dbt-duckdb and dlt included), or forge-cli 0.21.0 or older on DuckDB 2.0, opens only
   on 2.x. To convert one, run on 2.x: `ATTACH 'old.duckdb' AS src (READ_ONLY); ATTACH
@@ -86,8 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read as `<alias>.<schema>.<table>` on 1.5.x and 2.x; a Postgres source's
   `connection.secretRef` is resolved into the password, as a MySQL source's already was.
   A source the runner cannot attach (unreachable, refused, a `secretRef` that does not
-  resolve) now fails the build with the reason, its password masked, and writes a run
-  record; it used to end `fluid apply` with `Unexpected error during execution`.
+  resolve) fails the build with the reason, its password masked, and writes a run
+  record; a MySQL or MariaDB source used to end `fluid apply` with `Unexpected error
+  during execution` instead.
 - A local SQL action, or a legacy `fluid_build.contract_tests` action, whose SQL ends in
   a statement that returns no rows (`CREATE TABLE ... AS`, an `INSERT` without
   `RETURNING`) now fails with a message saying to write just the `SELECT`. DuckDB 1.5
