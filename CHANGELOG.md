@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-10-22
+
 ### Upgrade notes
 
 - forge-cli runs on DuckDB 2.x as well as 1.5.x (`duckdb>=1.5.0`, no ceiling; DuckDB 2.0
@@ -161,8 +163,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`fe80::a:b:c` showed an emoji) and a control character prints as `\x1b` and the like,
   so an escape sequence in a contract or an error message can no longer clear the
   terminal or plant a link. JSON and JUnit output are unchanged.
-
-### Fixed
 
 - **Generated Airflow DAGs load on Airflow 3.** `fluid export --engine airflow`, `fluid
   generate schedule`, `fluid init` and the AWS, GCP and Snowflake code generators emitted
@@ -5320,7 +5320,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.18.2...v0.19.0
