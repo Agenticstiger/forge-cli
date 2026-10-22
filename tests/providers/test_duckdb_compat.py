@@ -162,7 +162,7 @@ def test_query_relation_keeps_a_query(sql, columns):
         "UPDATE t SET a = a",
         "DELETE FROM t WHERE a = 100",
         "MERGE INTO t USING (SELECT 1 AS a) s ON t.a = s.a "
-        "WHEN NOT MATCHED THEN INSERT VALUES (s.a)",
+        + "WHEN NOT MATCHED THEN INSERT VALUES (s.a)",
         "DROP TABLE t",
         "SET threads = 2",
         "SELECT 1 AS x; CREATE TABLE made AS SELECT 1 AS q",
@@ -323,7 +323,7 @@ def test_local_apply_counts_rows_and_materializes(product):
         "CREATE TABLE made AS SELECT * FROM orders",
         "CREATE TABLE made AS PIVOT orders ON id USING sum(amount)",
         "CREATE TABLE made AS SELECT * FROM orders; SELECT * FROM made; "
-        "INSERT INTO made VALUES (3, 30)",
+        + "INSERT INTO made VALUES (3, 30)",
     ],
     ids=["ctas", "pivot-ctas", "dml-after-a-query"],
 )
