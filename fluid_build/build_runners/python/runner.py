@@ -34,8 +34,10 @@ from typing import Any, Dict, Optional
 from fluid_build._console import cprint, success
 from fluid_build._console import error as console_error
 from fluid_build.credentials.dotenv_store import environment_for_project_code
+from fluid_build.util.contract import is_continuous_build
 
 from .._path_safety import confine_to_workspace, resolve_workspace_root
+from ..base import refuse_continuous_trigger
 
 LOG = logging.getLogger("fluid.build_runners.python")
 
@@ -98,6 +100,11 @@ def execute_build(
     if trigger_type == "schedule" and force_run:
         trigger_label = "schedule (manual apply override)"
     cprint(f"   Trigger: {trigger_label}")
+
+    # trigger.type continuous (schema 0.7.6) says the job's platform keeps it
+    # running, and the script's run ends.
+    if is_continuous_build(build):
+        return refuse_continuous_trigger("a build's Python script as a batch run, which ends")
 
     if trigger_type == "manual" or (trigger_type == "schedule" and force_run):
         iterations = 1 if trigger_type == "schedule" and force_run else trigger.get("iterations", 1)

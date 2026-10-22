@@ -236,3 +236,473 @@ class TestCli:
         assert result.returncode == 0, result.stdout + result.stderr
         assert "continuously (trigger.type: continuous)" in " ".join(result.stdout.split())
         assert not (tmp_path / "sched").exists()
+
+
+# ── a continuous trigger on a build forge-cli runs as a batch run ──────────
+
+_SQL = {"sql": "SELECT 1"}
+_REMEDY = "Use trigger.type schedule or manual, or run the job on a platform that keeps it running."
+# A spark, glue or custom build is left to the platform it names.
+_PLATFORM_REMEDY = _REMEDY[:-1] + ", named in execution.runtime.platform."
+
+
+def _build(engine: Any = None, trigger: str = "continuous", **extra: Any) -> Dict[str, Any]:
+    build: Dict[str, Any] = {"id": "b", "execution": {"trigger": {"type": trigger}}, **extra}
+    if engine is not None:
+        build["engine"] = engine
+    return build
+
+
+def _runtime(platform: str = "databricks") -> Dict[str, Any]:
+    return {"trigger": {"type": "continuous"}, "runtime": {"platform": platform}}
+
+
+def _warnings(contract: Dict[str, Any]) -> list:
+    from fluid_build.build_runners.base import continuous_trigger_warnings
+
+    return continuous_trigger_warnings(contract)
+
+
+class TestBatchBuildWarning:
+    """A continuous trigger says the job's platform keeps it running, and no
+    scheduler starts the build; forge-cli runs dbt, python, inline-SQL and batch
+    acquisition builds to completion, so ``fluid validate`` warns."""
+
+    def test_a_dbt_build_is_never_run(self) -> None:
+        assert _warnings({"builds": [_build("dbt")]}) == [
+            "builds[0] (id 'b'): trigger.type continuous on engine 'dbt': forge-cli runs dbt "
+            "builds as batch runs, which end, and its dbt runner refuses a continuous trigger: "
+            f"forge-cli never runs this build. {_REMEDY}"
+        ]
+
+    def test_only_fluid_apply_runs_a_duckdb_acquisition(self) -> None:
+        assert _warnings({"builds": [_build("duckdb", pattern="acquisition")]}) == [
+            "builds[0] (id 'b'): trigger.type continuous on engine 'duckdb': forge-cli runs "
+            "duckdb builds as batch runs, which end: this build runs only when fluid apply runs "
+            f"builds, and no scheduler starts it. {_REMEDY}"
+        ]
+
+    @pytest.mark.parametrize(
+        "build, says",
+        [
+            pytest.param(_build("dbt-snowflake"), "its dbt runner refuses", id="dbt-adapter"),
+            pytest.param(_build(" Python "), "its python runner refuses", id="python"),
+            # The dispatcher hands a build with no engine to the python runner.
+            pytest.param(
+                _build(),
+                "on a build with no engine: forge-cli runs builds with no engine as batch runs, "
+                "which end, and its python runner refuses",
+                id="no-engine",
+            ),
+            pytest.param(_build("sql", properties=_SQL), "inline-SQL builds", id="sql"),
+            pytest.param(
+                _build("sql", properties=_SQL, execution=_runtime("snowflake")),
+                "inline-SQL builds",
+                id="sql-on-snowflake",
+            ),
+            pytest.param(
+                _build(pattern="embedded-logic", properties=_SQL),
+                "on a build with no engine: forge-cli runs inline-SQL builds",
+                id="inline-sql-no-engine",
+            ),
+            # The runner takes inline SQL ahead of dbt, so the build runs on DuckDB.
+            pytest.param(
+                _build("dbt", pattern="embedded-logic", properties=_SQL),
+                "on engine 'dbt': forge-cli runs inline-SQL builds",
+                id="dbt-with-inline-sql",
+            ),
+            *[
+                pytest.param(_build(e, pattern="acquisition"), f"runs {e} builds", id=e)
+                for e in ("airbyte", "meltano", "dlt")
+            ],
+            # The python runner runs the script of any build no other runner
+            # takes, locally, unless a spark, glue or custom build names a
+            # platform of its own.
+            *[
+                pytest.param(_build(e), f"runs {e} builds as batch runs", id=e)
+                for e in ("spark", "glue", "custom")
+            ],
+            pytest.param(
+                _build("spark", execution=_runtime("local")),
+                "runs spark builds as batch runs",
+                id="spark-on-local",
+            ),
+            pytest.param(
+                _build("dlt", pattern="hybrid-reference"),
+                "forge-cli runs dlt builds without pattern: acquisition as batch runs, which "
+                "end, and its python runner refuses",
+                id="dlt-without-acquisition",
+            ),
+            pytest.param(
+                _build("kafka-connect"),
+                "runs kafka-connect builds without pattern: acquisition",
+                id="connector-without-acquisition",
+            ),
+        ],
+    )
+    def test_every_batch_runner_is_warned(self, build: Dict[str, Any], says: str) -> None:
+        (warning,) = _warnings({"builds": [build]})
+        assert says in warning
+        platform_run = build.get("engine") in ("spark", "glue", "custom")
+        assert warning.endswith(_PLATFORM_REMEDY if platform_run else _REMEDY)
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(_build("kafka-connect", pattern="acquisition"), id="kafka-connect"),
+            pytest.param(_build("debezium", pattern="acquisition"), id="debezium"),
+            pytest.param(_build("flink", properties=_SQL), id="flink"),
+            pytest.param(
+                _build("sql", properties={"language": "flink_sql", **_SQL}), id="flink-sql"
+            ),
+            # forge-cli does not run these: fluid apply leaves them to the
+            # platform they name, as it does a Flink job.
+            *[
+                pytest.param(_build(e, execution=_runtime(p)), id=f"{e}-on-{p}")
+                for e, p in (("spark", "databricks"), ("glue", "aws"), ("custom", "kubernetes"))
+            ],
+            pytest.param(
+                _build("spark", pattern="embedded-logic", properties=_SQL, execution=_runtime()),
+                id="inline-sql-on-databricks",
+            ),
+            pytest.param(_build("dbt", trigger="schedule"), id="schedule"),
+            pytest.param({"id": "b", "engine": "dbt"}, id="no-trigger"),
+        ],
+    )
+    def test_no_warning(self, build: Dict[str, Any]) -> None:
+        assert _warnings({"builds": [build]}) == []
+
+    @pytest.mark.parametrize(
+        "contract",
+        [
+            pytest.param({"builds": "dbt"}, id="builds-str"),
+            pytest.param({"builds": None}, id="builds-null"),
+            pytest.param({"builds": ["dbt", None, 3]}, id="build-not-object"),
+            pytest.param({"builds": [_build(5)]}, id="engine-int"),
+            pytest.param({"builds": [_build("sql", pattern=["x"])]}, id="pattern-list"),
+            pytest.param(
+                {"builds": [_build(pattern="embedded-logic", properties=["SELECT 1"])]},
+                id="properties-list",
+            ),
+            pytest.param({"builds": [{"id": "b", "engine": "dbt", "execution": "x"}]}, id="exec"),
+        ],
+    )
+    def test_any_shape_is_read_without_raising(self, contract: Dict[str, Any]) -> None:
+        # fluid validate runs its contract rules on a contract the schema refused too.
+        assert _warnings(contract) == []
+
+    def test_a_spark_build_is_told_where_to_name_its_platform(self) -> None:
+        (warning,) = _warnings({"builds": [_build("spark")]})
+        assert warning.endswith(_PLATFORM_REMEDY)
+        assert _warnings({"builds": [_build("spark", execution=_runtime())]}) == []
+
+    def test_a_build_without_an_id_is_named_by_index(self) -> None:
+        build = _build("python")
+        del build["id"]
+        (warning,) = _warnings({"builds": [_build("flink"), build]})
+        assert warning.startswith("builds[1]: trigger.type continuous on engine 'python':")
+
+
+def test_streaming_engines_are_the_runners_that_declare_streaming() -> None:
+    # The kafka-connect and debezium runners leave a connector running; every
+    # other acquisition runner runs to completion. Read from the runners, so a
+    # new streaming runner cannot be warned about by mistake.
+    from fluid_build.api.runner import RunnerCapability
+    from fluid_build.build_runners.base import (
+        ACQUISITION_ENGINES,
+        STREAMING_ACQUISITION_ENGINES,
+        _declared_capabilities_for_engine,
+    )
+
+    declared = {engine: _declared_capabilities_for_engine(engine) for engine in ACQUISITION_ENGINES}
+    assert all(caps is not None for caps in declared.values()), declared
+    assert STREAMING_ACQUISITION_ENGINES == {
+        engine
+        for engine, caps in declared.items()
+        if caps is not None and RunnerCapability.STREAMING.value in caps
+    }
+
+
+_DISPATCHED = [
+    pytest.param(_build("dbt"), id="dbt"),
+    pytest.param(_build("dbt-snowflake"), id="dbt-adapter"),
+    pytest.param(_build("python"), id="python"),
+    pytest.param(_build(), id="no-engine"),
+    pytest.param(_build("sql", properties=_SQL), id="sql"),
+    pytest.param(_build("sql", properties=_SQL, execution=_runtime("snowflake")), id="snowflake"),
+    pytest.param(_build("spark", pattern="embedded-logic", properties=_SQL), id="spark-sql-local"),
+    pytest.param(
+        _build("spark", pattern="embedded-logic", properties=_SQL, execution=_runtime()),
+        id="spark-sql-databricks",
+    ),
+    *[
+        pytest.param(_build(engine, pattern="acquisition"), id=f"{engine}-acquisition")
+        for engine in ("duckdb", "airbyte", "meltano", "dlt", "kafka-connect", "debezium")
+    ],
+    pytest.param(_build("duckdb", pattern="hybrid-reference"), id="duckdb-not-acquisition"),
+    pytest.param(_build("kafka-connect"), id="kafka-connect-no-pattern"),
+    pytest.param(_build("spark", pattern="hybrid-reference"), id="spark"),
+    pytest.param(_build("glue"), id="glue"),
+    pytest.param(_build("custom"), id="custom"),
+    pytest.param(_build("spark", execution=_runtime()), id="spark-on-databricks"),
+    pytest.param(_build("glue", execution=_runtime("aws")), id="glue-on-aws"),
+    pytest.param(_build("dlt", pattern="hybrid-reference"), id="dlt-not-acquisition"),
+    pytest.param(_build("flink", properties=_SQL), id="flink"),
+    pytest.param(_build("sql", properties={"language": "flink_sql", **_SQL}), id="flink-sql"),
+]
+
+
+def _dispatch(build: Dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list:
+    """The runners ``fluid apply --mode amend-and-build`` hands *build* to,
+    recorded instead of run."""
+    import argparse
+    import logging
+
+    from fluid_build.build_runners import base
+    from fluid_build.build_runners.dbt import runner as dbt_runner
+    from fluid_build.build_runners.python import runner as python_runner
+
+    called: list = []
+
+    def _record(name: str) -> Any:
+        def _run(*_args: Any, **_kwargs: Any) -> int:
+            called.append(name)
+            return 0
+
+        return _run
+
+    monkeypatch.setattr(base, "_execute_acquisition_build", _record("acquisition"))
+    monkeypatch.setattr(base, "_execute_embedded_sql_build", _record("inline-sql"))
+    monkeypatch.setattr(dbt_runner, "execute_dbt_build", _record("dbt"))
+    monkeypatch.setattr(python_runner, "execute_build", _record("python"))
+    (tmp_path / "contract.fluid.yaml").write_text("id: p\n", "utf-8")
+    (tmp_path / "ingest.py").write_text("print('ran')\n", "utf-8")
+    (tmp_path / "dbt_project.yml").write_text("name: p\nprofile: p\n", "utf-8")
+    args = argparse.Namespace(
+        contract=str(tmp_path / "contract.fluid.yaml"),
+        build_id=None,
+        dry_run=False,
+        fail_fast=False,
+        delay=0,
+        no_output=True,
+        sample_rows=None,
+        env=None,
+        mode="amend-and-build",
+        allow_skipped_builds=False,
+    )
+    rc = base.run_builds_from_args(
+        args, logging.getLogger("test"), force_run=True, contract={"id": "p", "builds": [build]}
+    )
+    assert rc == 0
+    return called
+
+
+@pytest.mark.parametrize("build", _DISPATCHED)
+def test_validate_warns_exactly_when_apply_runs_the_build_as_a_batch_run(
+    build: Dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    # One predicate behind both: a warned build reaches a batch runner under
+    # fluid apply --mode amend-and-build, and any other reaches a connector's
+    # runner or none, as a Flink job does.
+    from fluid_build.build_runners.base import STREAMING_ACQUISITION_ENGINES
+
+    called = _dispatch(build, tmp_path, monkeypatch)
+    connector = called == ["acquisition"] and build["engine"] in STREAMING_ACQUISITION_ENGINES
+    assert bool(_warnings({"builds": [build]})) is (bool(called) and not connector), called
+    if not called:
+        assert "there is nothing for forge-cli to run" in " ".join(capsys.readouterr().out.split())
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(_build("spark", pattern="hybrid-reference"), id="spark"),
+        pytest.param(_build("custom", execution=_runtime("local")), id="custom-on-local"),
+        pytest.param(_build("dlt", pattern="hybrid-reference"), id="dlt-not-acquisition"),
+        pytest.param(_build("kafka-connect"), id="kafka-connect-no-pattern"),
+    ],
+)
+def test_apply_hands_a_local_script_to_the_python_runner(
+    build: Dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The python runner runs these builds' scripts when the trigger is
+    # manual, so a continuous one is refused there, not passed off as a job
+    # some platform keeps running.
+    assert _dispatch(build, tmp_path, monkeypatch) == ["python"]
+
+
+class TestValidateCli:
+    @staticmethod
+    def _write(tmp_path: Path) -> None:
+        contract = _contract()
+        contract["builds"] = [
+            {
+                "id": "transform",
+                "engine": "dbt",
+                "pattern": "hybrid-reference",
+                "repository": "./dbt",
+                "execution": {"trigger": {"type": "continuous"}},
+            }
+        ]
+        (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(contract), "utf-8")
+
+    def test_plain_validate_warns_and_passes(self, tmp_path: Path) -> None:
+        self._write(tmp_path)
+        result = _run_cli("validate", "contract.fluid.yaml", "--offline", cwd=tmp_path)
+        assert result.returncode == 0, result.stdout + result.stderr
+        out = " ".join(result.stdout.split())
+        assert "builds[0] (id 'transform'): trigger.type continuous on engine 'dbt'" in out
+
+    def test_strict_fails(self, tmp_path: Path) -> None:
+        self._write(tmp_path)
+        result = _run_cli("validate", "contract.fluid.yaml", "--offline", "--strict", cwd=tmp_path)
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "warnings treated as errors (--strict)" in " ".join(result.stdout.split())
+
+    def test_json_lists_the_warning(self, tmp_path: Path) -> None:
+        self._write(tmp_path)
+        result = _run_cli(
+            "validate", "contract.fluid.yaml", "--offline", "--format", "json", cwd=tmp_path
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        report = json.loads(result.stdout)
+        assert report["valid"] is True
+        assert [w for w in report["warnings"] if "trigger.type continuous" in w]
+
+
+class TestRunnerRefusal:
+    def test_the_dbt_runner_names_the_trigger(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from fluid_build.build_runners.dbt import runner
+
+        def _not_reached(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("a refused build must not prepare a dbt profile")
+
+        monkeypatch.setattr(runner, "resolve_dbt_profiles_dir", _not_reached)
+        assert runner.execute_dbt_build(_build("dbt"), tmp_path, tmp_path) == 1
+        out = " ".join(capsys.readouterr().out.split())
+        assert "trigger.type continuous: forge-cli runs dbt builds as batch runs" in out
+        assert "Unknown trigger type" not in out
+
+    def test_the_python_runner_names_the_trigger(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from fluid_build.build_runners.python import runner
+
+        def _not_run(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("a refused build must not run its script")
+
+        script = tmp_path / "ingest.py"
+        script.write_text("print('ran')\n", "utf-8")
+        monkeypatch.setattr(runner.subprocess, "run", _not_run)
+        assert runner.execute_build(_build("python"), script, tmp_path) == 1
+        out = " ".join(capsys.readouterr().out.split())
+        assert "trigger.type continuous: forge-cli runs a build's Python script" in out
+        assert "Unknown trigger type" not in out
+
+    def test_another_unknown_trigger_keeps_its_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        from fluid_build.build_runners.python import runner
+
+        script = tmp_path / "ingest.py"
+        script.write_text("print('ran')\n", "utf-8")
+        assert runner.execute_build(_build("python", trigger="event"), script, tmp_path) == 1
+        assert "Unknown trigger type: event" in capsys.readouterr().out
+
+
+# ── scaffold-composer: a DAG only for builds a scheduler starts ──────────────
+
+
+class TestScaffoldComposer:
+    @staticmethod
+    def _run(
+        tmp_path: Path, *builds: Dict[str, Any], out: str = "dags", **top: Any
+    ) -> "tuple[int, Path]":
+        import logging
+        from types import SimpleNamespace
+
+        from fluid_build.cli.scaffold_composer import run
+
+        contract = tmp_path / "contract.fluid.yaml"
+        doc = {"id": "net.instances", "builds": list(builds), **top}
+        contract.write_text(yaml.safe_dump(doc), "utf-8")
+        out_dir = tmp_path / out
+        args = SimpleNamespace(contract=str(contract), env=None, out_dir=str(out_dir))
+        return run(args, logging.getLogger("test.scaffold_composer")), out_dir
+
+    def test_nothing_to_schedule_writes_no_dag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        flink = {"id": "j", "engine": "flink", "execution": {"trigger": {"cron": "0 5 * * *"}}}
+        rc, out_dir = self._run(tmp_path, _connector({"type": "continuous"}), flink)
+        assert rc == 0
+        assert not out_dir.exists()
+        out = " ".join(capsys.readouterr().out.split())
+        assert "continuously (trigger.type: continuous), so there is nothing to schedule." in out
+        assert "No DAG written." in out
+
+    @pytest.mark.parametrize("out", ["dags", "dags [/]:id:"])
+    def test_a_dag_it_wrote_before_is_named_and_kept(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture, out: str
+    ) -> None:
+        scheduled = {"id": "t", "engine": "dbt", "execution": {"trigger": {"cron": "0 3 * * *"}}}
+        self._run(tmp_path, scheduled, out=out)
+        (dag,) = (tmp_path / out).glob("*.py")
+        written = dag.read_text("utf-8")
+        capsys.readouterr()
+        rc, _ = self._run(tmp_path, _connector({"type": "continuous"}), out=out)
+        assert rc == 0
+        assert dag.read_text("utf-8") == written
+        # As written and whole: no markup or emoji rendered, no fold to break a copy.
+        assert f"is still at {dag}: delete it" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "content, named",
+        [
+            # The template before #215 quoted the dag_id with double quotes.
+            ('    dag_id="net_instances",\n    tags=["FLUID"]\n', True),
+            ("# hand-written by another team\n", False),
+            ('    dag_id="other_product",\n    tags=["FLUID"]\n', False),
+        ],
+    )
+    def test_only_a_file_it_wrote_is_named(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture, content: str, named: bool
+    ) -> None:
+        existing = tmp_path / "dags" / "net_instances.py"
+        existing.parent.mkdir()
+        existing.write_text(content, "utf-8")
+        rc, _ = self._run(tmp_path, _connector({"type": "continuous"}))
+        assert rc == 0
+        assert existing.read_text("utf-8") == content
+        assert ("is still at" in capsys.readouterr().out) is named
+
+    def test_the_cron_comes_from_a_build_a_scheduler_starts(self, tmp_path: Path) -> None:
+        # The Flink job's cron is its platform's business, not this DAG's.
+        rc, out_dir = self._run(
+            tmp_path,
+            {"id": "j", "engine": "flink", "execution": {"trigger": {"cron": "0 5 * * *"}}},
+            _connector({"type": "continuous"}),
+            {"id": "t", "engine": "dbt", "execution": {"trigger": {"cron": "0 3 * * *"}}},
+        )
+        assert rc == 0
+        (dag,) = out_dir.glob("*.py")
+        assert "schedule='0 3 * * *'" in dag.read_text("utf-8")
+
+    def test_hand_declared_tasks_keep_the_dag(self, tmp_path: Path) -> None:
+        # As fluid generate schedule does: the contract declares what to run.
+        tasks = {"tasks": [{"taskId": "refresh", "action": "dbt_run"}]}
+        rc, out_dir = self._run(tmp_path, _connector({"type": "continuous"}), orchestration=tasks)
+        assert rc == 0
+        (dag,) = out_dir.glob("*.py")
+        assert "schedule='0 2 * * *'" in dag.read_text("utf-8")
+
+    def test_a_contract_with_no_builds_keeps_its_nightly_dag(self, tmp_path: Path) -> None:
+        rc, out_dir = self._run(tmp_path)
+        assert rc == 0
+        (dag,) = out_dir.glob("*.py")
+        assert "schedule='0 2 * * *'" in dag.read_text("utf-8")

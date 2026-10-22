@@ -50,15 +50,6 @@ from ._logging import error, info
 SUBCOMMAND = "schedule"
 
 
-def _only_unscheduled_builds(contract: Dict[str, Any]) -> bool:
-    """True when the contract has builds and no scheduler starts any of them:
-    each runs outside forge-cli, or continuously."""
-    from fluid_build.util.contract import is_unscheduled_build
-
-    builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
-    return bool(builds) and all(is_unscheduled_build(b) for b in builds)
-
-
 def register_subcommand(subparsers: argparse._SubParsersAction):
     """Register the schedule subcommand under ``fluid generate``."""
     p = subparsers.add_parser(
@@ -155,6 +146,7 @@ def run(args: Any, logger: logging.Logger) -> int:
 
         # --- Resolve scheduler ---
         from fluid_build.schedulers.airflow import fluid_apply
+        from fluid_build.util.contract import has_only_unscheduled_builds
 
         scheduler_name = getattr(args, "scheduler", None)
         if not scheduler_name:
@@ -170,7 +162,7 @@ def run(args: Any, logger: logging.Logger) -> int:
         # a build whose trigger is continuous) has nothing to schedule, which is
         # not an error: unless it hand-declares orchestration tasks, or names a
         # scheduler that does not exist.
-        if _only_unscheduled_builds(contract) and not fluid_apply.has_explicit_tasks(contract):
+        if has_only_unscheduled_builds(contract) and not fluid_apply.has_explicit_tasks(contract):
             from fluid_build.schedulers import has_scheduler
 
             if not scheduler_name or has_scheduler(scheduler_name):
