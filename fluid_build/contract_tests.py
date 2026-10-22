@@ -27,7 +27,8 @@ Action schema (expected keys used here):
                - The key is an alias; referenced as table/view name in SQL.
                - `path` can be a string (supports globs) or list of strings.
                - If `name` is set, it overrides the alias for the table/view name.
-- sql:         the SQL string to execute (must be a SELECT or CREATE TABLE AS ... style)
+- sql:         the SQL string to execute; it must end in a SELECT of the result
+               (for CREATE TABLE t AS SELECT ..., write just the SELECT ...)
 - outputs:     dict with one or more outputs. Supported:
                {
                  "path": "runtime/out/high_value_churn_risk.csv",
@@ -53,7 +54,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fluid_build.providers._duckdb_compat import NO_ROWS_TO_WRITE, first_row, query_relation
+from fluid_build.providers._duckdb_compat import NO_ROWS_TO_WRITE, one_row, query_relation
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
     DuckDBSandboxError,
@@ -246,7 +247,7 @@ def _write_output(rel, outputs: Dict[str, Any], dry_run: bool) -> Tuple[int, Opt
     if dry_run:
         # Estimate count without writing
         try:
-            cnt = first_row(rel.count("*"))[0]
+            cnt = one_row(rel.count("*"))[0]
         except Exception as e:
             LOGGER.warning(f"Failed to count rows in dry run: {e}")
             cnt = -1
@@ -312,7 +313,7 @@ def _write_output(rel, outputs: Dict[str, Any], dry_run: bool) -> Tuple[int, Opt
 
         # Count rows
         try:
-            cnt = first_row(rel.count("*"))[0]
+            cnt = one_row(rel.count("*"))[0]
         except Exception as e:
             LOGGER.warning(f"Failed to count output rows: {e}")
             cnt = -1

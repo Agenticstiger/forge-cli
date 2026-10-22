@@ -23,6 +23,7 @@ docstring; the cases here are the ones that broke forge-cli's own code.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -33,6 +34,7 @@ duckdb = pytest.importorskip("duckdb")
 from fluid_build.providers._duckdb_compat import (  # noqa: E402
     STORAGE_COMPATIBILITY_VERSION,
     first_row,
+    one_row,
     query_relation,
     storage_compat_config,
 )
@@ -72,6 +74,18 @@ def test_first_row_of_no_rows_is_none():
     con = duckdb.connect()
     assert first_row(con.execute("SELECT 1 WHERE false")) is None
     assert first_row(con.sql("SELECT 1 WHERE false")) is None
+
+
+def test_one_row_is_the_row_of_an_aggregate():
+    con = duckdb.connect()
+    assert one_row(con.execute("SELECT count(*) FROM range(0)")) == (0,)
+    assert one_row(con.sql("SELECT max(range) FROM range(4)")) == (3,)
+
+
+def test_one_row_refuses_an_empty_result():
+    """An aggregate cannot return no row; a caller indexing [0] must not get None."""
+    with pytest.raises(ValueError, match="no row"):
+        one_row(duckdb.connect().execute("SELECT 1 WHERE false"))
 
 
 def test_the_connection_is_free_after_first_row():
@@ -149,6 +163,17 @@ def test_query_relation_keeps_a_query(sql, columns):
         "DROP TABLE t",
         "SET threads = 2",
         "SELECT 1 AS x; CREATE TABLE made AS SELECT 1 AS q",
+        # DuckDB 2.0 types a PIVOT whose columns it looks up as MULTI, a query
+        # or not: as DDL it returns a Success flag.
+        "CREATE TABLE p AS PIVOT t ON a USING count(*)",
+        # SQL ending in DML after a query: 2.0's con.sql() returns the query's rows.
+        "CREATE TABLE o2 AS SELECT 1 AS id; SELECT * FROM o2; INSERT INTO o2 VALUES (3)",
+        "SELECT a FROM t; DELETE FROM t WHERE a = 1",
+        "SELECT a FROM t; UPDATE t SET a = a",
+        "SELECT a FROM t; ALTER TABLE t ADD COLUMN b INTEGER",
+        "SELECT 1 AS x; SET threads = 2",
+        "SELECT 1 AS x; DROP TABLE t",
+        "BEGIN; SELECT * FROM t; COMMIT",
     ],
 )
 def test_query_relation_is_none_for_a_statement_that_returns_no_rows(sql):
@@ -169,6 +194,10 @@ def test_query_relation_runs_each_statement_once():
     assert first_row(con.execute("SELECT count(*) FROM t WHERE a = 7")) == (1,)
     assert query_relation(con, "CREATE TABLE made AS SELECT 1 AS q") is None
     assert con.execute("SELECT q FROM made").fetchall() == [(1,)]
+    rel = query_relation(con, "INSERT INTO t VALUES (8); SELECT count(*) AS n FROM t WHERE a = 8")
+    assert rel.fetchall() == [(1,)]
+    assert query_relation(con, "SELECT a FROM t; DELETE FROM t WHERE a = 8") is None
+    assert first_row(con.execute("SELECT count(*) FROM t WHERE a = 8")) == (0,)
 
 
 # ── the engine, end to end ───────────────────────────────────────────────
@@ -219,33 +248,26 @@ def test_local_apply_counts_rows_and_materializes(product):
     ]
 
 
-def test_local_sql_that_returns_no_rows_fails_the_same_on_both_versions(product):
-    """1.5 failed on ``None.write_csv``; 2.0 wrote a one-row ``Count`` file and
-    reported ok. Both now refuse it and say what to write instead."""
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE TABLE made AS SELECT * FROM orders",
+        "CREATE TABLE made AS PIVOT orders ON id USING sum(amount)",
+        "CREATE TABLE made AS SELECT * FROM orders; SELECT * FROM made; "
+        "INSERT INTO made VALUES (3, 30)",
+    ],
+    ids=["ctas", "pivot-ctas", "dml-after-a-query"],
+)
+def test_local_sql_that_returns_no_rows_fails_the_same_on_both_versions(product, sql):
+    """1.5 failed on ``None.write_csv``; 2.0 wrote a one-row ``Count`` file (or
+    a ``Success`` header, or the rows before the INSERT) and reported ok. Both
+    now refuse it and say what to write instead."""
     out = product / "out" / "made.csv"
-    results = _local_apply(
-        product,
-        {"op": "sql", "sql": "CREATE TABLE made AS SELECT * FROM orders", "outputs": [str(out)]},
-    )
-    assert results[1]["status"] == "error"
+    results = _local_apply(product, {"op": "sql", "sql": sql, "outputs": [str(out)]})
+    assert results[1]["status"] == "error", results
     assert "returns no rows" in results[1]["error"]
-    assert "End it with a SELECT of the result" in results[1]["error"]
+    assert "write just the SELECT" in results[1]["error"]
     assert not out.exists()
-
-
-def test_the_fix_the_no_rows_error_suggests_works(product):
-    """The error's own example (CREATE, then SELECT what it made) lands the rows."""
-    out = product / "out" / "made.csv"
-    results = _local_apply(
-        product,
-        {
-            "op": "sql",
-            "sql": "CREATE TABLE made AS SELECT * FROM orders; SELECT * FROM made",
-            "outputs": [str(out)],
-        },
-    )
-    assert results[1]["status"] == "ok", results
-    assert out.read_text(encoding="utf-8").splitlines() == ["id,amount", "1,10", "2,20"]
 
 
 def test_contract_tests_sql_that_returns_no_rows_fails_clearly():
@@ -267,8 +289,8 @@ def test_contract_tests_dry_run_counts_a_real_relation(tmp_path):
 
 def test_a_remote_landing_is_probed_without_keeping_the_connection_busy(tmp_path, monkeypatch):
     """``_artifact_exists`` probes a remote landing with ``SELECT 1 ... LIMIT 1``
-    on the run's own connection; read partway on DuckDB 2.0, that kept the
-    connection busy for the late-arrival split that reads the landing next."""
+    on the run's own connection; on DuckDB 2.0 a result read only partway keeps
+    the connection busy for the next relation read on it."""
     from fluid_build.build_runners.duckdb import runner
 
     landed = tmp_path / "landed.parquet"
@@ -280,13 +302,8 @@ def test_a_remote_landing_is_probed_without_keeping_the_connection_busy(tmp_path
     assert runner._artifact_exists(con, str(tmp_path / "missing.parquet"), "read_parquet") is False
 
 
-@pytest.mark.parametrize(
-    "function", ["postgres_scan", "postgres_query", "mysql_scan", "sqlite_scan", "read_xlsx"]
-)
-def test_a_scanner_the_sandbox_did_not_load_reads_as_a_refusal(function):
-    """DuckDB 2.0 stopped naming ``postgres_scan``'s extension in its error
-    ("does not exist!"), and no version names ``mysql_scan``'s; contract SQL
-    calling one still gets the sandbox's hint instead of a bare catalog error."""
+@pytest.mark.parametrize("function", ["postgres_query", "mysql_query", "sqlite_scan", "read_xlsx"])
+def test_a_function_of_an_extension_the_sandbox_did_not_load_reads_as_a_refusal(function):
     from fluid_build.providers._duckdb_sandbox import is_sandbox_refusal, is_unloaded_function
 
     con = secure_duckdb_connect(allow=DuckDBAllowlist.none())
@@ -294,6 +311,23 @@ def test_a_scanner_the_sandbox_did_not_load_reads_as_a_refusal(function):
         con.execute(f"SELECT * FROM {function}('x', 'y')")
     assert is_unloaded_function(refused.value), refused.value
     assert is_sandbox_refusal(refused.value)
+
+
+@pytest.mark.skipif(not DUCKDB_2, reason="postgres_scan exists through DuckDB 1.5")
+def test_duckdb_2_has_no_postgres_scan_even_with_the_extension_loaded():
+    """Why the duckdb runner reads a Postgres source through ATTACH: DuckDB 2.0's
+    postgres extension dropped ``postgres_scan``. Not a sandbox refusal either:
+    loading the extension would not bring it back."""
+    from fluid_build.providers._duckdb_sandbox import is_sandbox_refusal
+
+    try:
+        con = secure_duckdb_connect(allow=DuckDBAllowlist.none(), extensions=["postgres"])
+    except duckdb.Error as exc:
+        raise pytest.skip.Exception("the postgres extension is not installable here") from exc
+    with pytest.raises(duckdb.CatalogException) as missing:
+        con.execute("SELECT * FROM postgres_scan('host=127.0.0.1 port=9', 'public', 't')")
+    assert "does not exist" in str(missing.value)
+    assert not is_sandbox_refusal(missing.value)
 
 
 def test_an_unknown_function_is_not_a_sandbox_refusal():
@@ -335,7 +369,8 @@ def test_storage_compat_config_pins_only_from_duckdb_2():
         assert storage_compat_config(version) == {
             "storage_compatibility_version": STORAGE_COMPATIBILITY_VERSION
         }
-    assert STORAGE_COMPATIBILITY_VERSION == "v1.5.0"
+    # What DuckDB 1.5 writes by default: storage version 64, "v1.0.0+".
+    assert STORAGE_COMPATIBILITY_VERSION == "v1.0.0"
 
 
 def test_a_database_file_the_engine_creates_is_readable_by_duckdb_1_5(tmp_path):
@@ -344,13 +379,23 @@ def test_a_database_file_the_engine_creates_is_readable_by_duckdb_1_5(tmp_path):
     db = tmp_path / "new.duckdb"
     con = secure_duckdb_connect(db, allow=DuckDBAllowlist.none())
     con.execute("CREATE TABLE t AS SELECT 1 AS a")
-    if DUCKDB_2:
-        assert _storage(con, "new") == "v1.5.0+"
-    else:  # 1.5's own default, left alone
-        assert _storage(con, "new") == "v1.0.0+"
+    # The same format on both: 1.5's own default, which 2.x is pinned to.
+    assert _storage(con, "new") == "v1.0.0+"
     assert con.execute("SELECT current_setting('storage_compatibility_version')").fetchall() == [
         (STORAGE_COMPATIBILITY_VERSION if DUCKDB_2 else "v0.10.2",)
     ]
+
+
+def test_a_new_database_file_has_the_header_duckdb_1_5_writes(tmp_path):
+    """Byte-level: storage version 64 in the main header, which DuckDB 1.0 and
+    later read; 2.0's own default writes 999 there, which no 1.5 opens."""
+    db = tmp_path / "header.duckdb"
+    con = secure_duckdb_connect(db, allow=DuckDBAllowlist.none())
+    con.execute("CREATE TABLE t AS SELECT 1 AS a")
+    con.close()
+    header = db.read_bytes()[:20]
+    assert header[8:12] == b"DUCK"
+    assert int.from_bytes(header[12:20], "little") == 64
 
 
 def test_an_attached_new_database_follows_the_same_format(tmp_path):
@@ -359,7 +404,7 @@ def test_an_attached_new_database_follows_the_same_format(tmp_path):
         before_lock=lambda c: c.execute(f"ATTACH '{tmp_path / 'att.duckdb'}' AS att"),
     )
     con.execute("CREATE TABLE att.t AS SELECT 1 AS a")
-    assert _storage(con, "att") == ("v1.5.0+" if DUCKDB_2 else "v1.0.0+")
+    assert _storage(con, "att") == "v1.0.0+"
 
 
 def test_a_database_file_that_exists_keeps_its_format(tmp_path):
@@ -385,7 +430,7 @@ def test_a_callers_own_storage_setting_wins(tmp_path):
         db, allow=DuckDBAllowlist.none(), config={"storage_compatibility_version": "latest"}
     )
     con.execute("CREATE TABLE t AS SELECT 1 AS a")
-    assert _storage(con, "latest") != "v1.5.0+"
+    assert _storage(con, "latest").startswith("v2.")
 
 
 def test_the_storage_setting_is_locked_with_the_rest(tmp_path):
@@ -399,15 +444,17 @@ def test_the_storage_setting_is_locked_with_the_rest(tmp_path):
 #: Reads that DuckDB 2.0 removed from relations or ``con.execute()`` results, or
 #: that leave a result open (the connection stays busy until it is drained):
 #: ``fetchone``/``fetchmany`` (``first_row`` replaces them), the Arrow batch
-#: readers, ``rel.arrow()``. A relation's argument-less ``execute()``, also gone,
-#: is caught separately.
+#: readers, ``rel.arrow()``. Caught separately: a relation's argument-less
+#: ``execute()`` (gone), and an ``execute()`` of a query whose result is thrown
+#: away unread (open until the next ``execute()``). ``rel.pl()`` is not listed:
+#: relations keep it in 2.0.
 _PARTIAL_OR_GONE = frozenset(
     {"fetchone", "fetchmany", "fetch_df_chunk", "fetch_arrow_table", "fetch_record_batch"}
     | {"fetch_arrow_reader", "record_batch", "arrow"}
 )
 
-#: Modules whose ``fetchone`` (or argument-less ``execute``) belongs to another
-#: client, never DuckDB's.
+#: Modules whose ``fetchone`` (or ``execute``) belongs to another client, never
+#: DuckDB's; each must keep importing no DuckDB.
 _OTHER_CLIENTS = {
     "fluid_build/cli/doctor.py": "sqlite3 / Snowflake connector cursors",
     "fluid_build/cli/workspace.py": "sqlite3 workspace registry",
@@ -417,13 +464,46 @@ _OTHER_CLIENTS = {
     "fluid_build/copilot/store/backends/vector.py": "sqlite3 + sqlite-vec probe",
     "fluid_build/forge_datamodel/from_ddl/snowflake_dumper.py": "Snowflake connector cursor",
     "fluid_build/providers/gcp/util/auth.py": "googleapiclient request .execute()",
+    "fluid_build/output_ports/mcp/drivers/postgres.py": "psycopg cursor health probe",
+    "fluid_build/output_ports/mcp/drivers/snowflake.py": "Snowflake cursor health probe",
 }
+
+#: The start of a statement that returns rows, for an ``execute()`` whose result
+#: is thrown away.
+_QUERY_START = re.compile(
+    r"\s*(SELECT|WITH|FROM|TABLE|VALUES|DESCRIBE|SHOW|SUMMARIZE|PRAGMA|CALL|EXPLAIN|PIVOT)\b",
+    re.IGNORECASE,
+)
+
+
+def _literal_start(node: ast.expr) -> str:
+    """The leading literal text of a ``str`` or f-string argument, else ``""``."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr) and node.values:
+        first = node.values[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return first.value
+    return ""
+
+
+def _unread_query(node: ast.AST) -> bool:
+    """``<x>.execute("SELECT ...")`` as a statement of its own: its rows are never read."""
+    if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
+        return False
+    call = node.value
+    return (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "execute"
+        and bool(call.args)
+        and bool(_QUERY_START.match(_literal_start(call.args[0])))
+    )
 
 
 def _partial_reads(path: Path) -> List[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     where = path.relative_to(REPO_ROOT).as_posix() if REPO_ROOT in path.parents else path.name
-    return [
+    found = [
         f"{where}:{node.lineno} .{node.func.attr}()"
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
@@ -433,6 +513,10 @@ def _partial_reads(path: Path) -> List[str]:
             or (node.func.attr == "execute" and not node.args and not node.keywords)
         )
     ]
+    found += [
+        f"{where}:{node.lineno} unread .execute()" for node in ast.walk(tree) if _unread_query(node)
+    ]
+    return found
 
 
 @pytest.mark.parametrize(
@@ -448,12 +532,31 @@ def _partial_reads(path: Path) -> List[str]:
         "rel.record_batch()\n",
         "rel.arrow()\n",
         "rel.execute()\n",
+        "con.execute('SELECT 1')\n",
+        "con.execute(f'select count(*) FROM {table}')\n",
+        "con.execute('DESCRIBE t')\n",
     ],
 )
 def test_the_partial_read_detector_catches_each_shape(shape, tmp_path):
     sample = tmp_path / "probe.py"
     sample.write_text(shape, encoding="utf-8")
     assert _partial_reads(sample), shape
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "con.execute('SELECT 1').fetchall()\n",
+        "rows = con.execute('SELECT 1')\n",
+        "con.execute('CREATE TABLE t AS SELECT 1')\n",
+        "con.execute(f'COPY ({select}) TO {path}')\n",
+        "con.execute(sql)\n",
+    ],
+)
+def test_the_partial_read_detector_leaves_a_read_or_a_write_alone(shape, tmp_path):
+    sample = tmp_path / "probe.py"
+    sample.write_text(shape, encoding="utf-8")
+    assert not _partial_reads(sample), shape
 
 
 def test_no_partial_reads_in_duckdb_code():
@@ -481,3 +584,8 @@ def test_every_other_client_module_still_needs_its_exemption():
         path = REPO_ROOT / module
         assert path.is_file(), module
         assert _partial_reads(path), f"{module} no longer needs its exemption; drop it"
+        # The exemption is for another client's calls: DuckDB code there would
+        # go unchecked.
+        assert not re.search(
+            r"import duckdb|from duckdb|secure_duckdb_connect", path.read_text(encoding="utf-8")
+        ), f"{module} now uses DuckDB; it cannot stay exempt"

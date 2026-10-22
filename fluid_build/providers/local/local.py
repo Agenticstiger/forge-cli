@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fluid_build.observability.secret_redactor import redact_secret_text, redact_value
-from fluid_build.providers._duckdb_compat import NO_ROWS_TO_WRITE, first_row, query_relation
+from fluid_build.providers._duckdb_compat import NO_ROWS_TO_WRITE, one_row, query_relation
 from fluid_build.providers._duckdb_read import build_register_view_sql
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
@@ -846,9 +846,7 @@ class LocalProvider(BaseProvider):
             with_retry(_register_with_retry, logger=self.logger, max_attempts=3)
 
             # Get row count for reporting
-            rowcount = first_row(con.execute(f"SELECT COUNT(*) FROM {validate_ident(table_name)}"))[
-                0
-            ]
+            rowcount = one_row(con.execute(f"SELECT COUNT(*) FROM {validate_ident(table_name)}"))[0]
 
             self._log_info(
                 "local_load_data_complete",
@@ -992,7 +990,7 @@ class LocalProvider(BaseProvider):
 
         rowcount = None
         try:
-            rowcount = first_row(rel.aggregate("count(*)"))[0]
+            rowcount = one_row(rel.aggregate("count(*)"))[0]
         except Exception:
             pass
 
@@ -1168,7 +1166,7 @@ class LocalProvider(BaseProvider):
                 try:
                     rel = con.sql(f"SELECT * FROM {validate_ident(source_table)}")
                     self._write_relation(rel, dst, fmt)
-                    rowcount = first_row(rel.count("*"))[0] if hasattr(rel, "count") else -1
+                    rowcount = one_row(rel.count("*"))[0] if hasattr(rel, "count") else -1
                     del rel
                 finally:
                     # Closed on every path (see _run_load_data_action).

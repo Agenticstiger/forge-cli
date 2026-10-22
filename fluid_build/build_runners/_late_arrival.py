@@ -370,7 +370,7 @@ def split_late_events_in_duckdb(
     can call this too.
     """
     # ── input validation ────────────────────────────────────────────
-    from fluid_build.providers._duckdb_compat import first_row
+    from fluid_build.providers._duckdb_compat import first_row, one_row
     from fluid_build.providers._sql_safety import validate_ident
 
     validate_ident(source_relation)
@@ -402,7 +402,7 @@ def split_late_events_in_duckdb(
     )
 
     # ── append late rows to side-output ──────────────────────────────
-    late_count = first_row(
+    late_count = one_row(
         con.execute(f"SELECT count(*) FROM {source_relation} WHERE {threshold_expr}")
     )[0]
     if late_count > 0:
@@ -412,7 +412,7 @@ def split_late_events_in_duckdb(
         )
         con.execute(f"DELETE FROM {source_relation} WHERE {threshold_expr}")
 
-    on_time_count = first_row(con.execute(f"SELECT count(*) FROM {source_relation}"))[0]
+    on_time_count = one_row(con.execute(f"SELECT count(*) FROM {source_relation}"))[0]
 
     return {"on_time": int(on_time_count), "late": int(late_count)}
 

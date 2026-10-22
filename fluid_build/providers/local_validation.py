@@ -133,7 +133,7 @@ class LocalValidationProvider(ValidationProvider):
         """Local provider is always reachable."""
         try:
             conn = self._connect(allow=DuckDBAllowlist.none())
-            conn.execute("SELECT 1")
+            conn.execute("SELECT 1").fetchall()
             conn.close()
             return True
         except Exception:

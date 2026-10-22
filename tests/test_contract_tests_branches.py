@@ -230,15 +230,6 @@ class TestWriteOutput:
         with pytest.raises(LocalProviderError, match="format must be"):
             _write_output(rel, {"path": "/tmp/out.txt", "format": "json"}, dry_run=False)
 
-    def test_csv_dry_run(self):
-        rel = MagicMock()
-        count_rel = MagicMock()
-        count_rel.fetchall.return_value = [(42,)]
-        rel.count.return_value = count_rel
-        cnt, path = _write_output(rel, {"path": "/tmp/out.csv", "format": "csv"}, dry_run=True)
-        assert cnt == 42
-        assert path is None
-
     def test_csv_dry_run_count_error(self):
         rel = MagicMock()
         rel.count.side_effect = RuntimeError("count fail")

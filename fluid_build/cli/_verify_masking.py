@@ -215,9 +215,9 @@ def local_dimension(
     )
     values: List[int] = []
     if selects:
-        from fluid_build.providers._duckdb_compat import first_row
+        from fluid_build.providers._duckdb_compat import one_row
 
-        row = first_row(con.execute(f"SELECT {', '.join(selects)} FROM ({relation_sql})"))
+        row = one_row(con.execute(f"SELECT {', '.join(selects)} FROM ({relation_sql})"))
         values = [int(v or 0) for v in row]
     return finish(values)
 

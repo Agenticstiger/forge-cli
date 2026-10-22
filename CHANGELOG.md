@@ -12,11 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - forge-cli runs on DuckDB 2.x as well as 1.5.x (`duckdb>=1.5.0`, no ceiling; DuckDB 2.0
   needs Python 3.11, so a Python 3.10 install stays on 1.5.x). On 2.x, a DuckDB database
   file forge-cli creates (`fluid demo`'s `.fluid/db.duckdb`, the local provider's session
-  and `persist` databases, a Meltano acquisition's DuckDB destination) is written in
-  DuckDB 1.5's storage format, which DuckDB 1.5.0 and later open; a file that already
-  exists keeps its format. DuckDB 2.x's own default format cannot be read by 1.5: a file
-  another 2.x tool created (dbt-duckdb and dlt included) needs every process that opens
-  it on 2.x, or an `EXPORT DATABASE` on 2.x and an `IMPORT DATABASE` on 1.5.
+  and `persist` databases, a Meltano acquisition's DuckDB destination) is written in the
+  format DuckDB 1.5 writes, which DuckDB 1.0 and later open, so a 2.0-only type such as
+  `VARIANT` is refused in it as on 1.5; a file that already exists keeps its format.
+  DuckDB 2.x's own default format cannot be read by 1.5: a file another 2.x tool created
+  (dbt-duckdb and dlt included), or forge-cli 0.21.0 or older on DuckDB 2.0, opens only
+  on 2.x. To convert one, run on 2.x: `ATTACH 'old.duckdb' AS src (READ_ONLY); ATTACH
+  'new.duckdb' AS dst (STORAGE_VERSION 'v1.0.0'); COPY FROM DATABASE src TO dst;`.
 - Contract SQL runs on the DuckDB that is installed, and DuckDB 2.0 changed some SQL: the
   `x -> x + 1` lambda is an error (write `lambda x: x + 1`), and integer `//` and `%` by
   zero raise an error instead of returning NULL (wrap them in `TRY(...)`). See
@@ -67,17 +69,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **DuckDB 2.0.** `fluid verify` reported every local file as `error` ("Relations no
-  longer have fetchone()"); `fluid apply`'s local SQL and materialize steps and
-  `contract_tests` actions lost their row counts (a materialize step logged
-  `local_materialize_fallback`, a `contract_tests` action reported `-1` rows). DuckDB 2.0
-  relations have no `fetchone()`, and a query result keeps its connection busy until it
-  is read to the end, which fails the next step on that connection. Every DuckDB result
-  is now read to the end, the same way on 1.5.x and 2.x.
-- A local SQL action or `contract_tests` action whose SQL ends in a statement that
-  returns no rows (`CREATE TABLE ... AS`, an `INSERT` without `RETURNING`) now fails with
-  a message saying to end the SQL with a `SELECT` of the result. DuckDB 1.5 failed there
-  on `'NoneType' object has no attribute 'write_csv'`, and DuckDB 2.0 wrote a one-row
-  `Count` file as the action's output and reported success.
+  longer have fetchone()"); `fluid apply`'s local SQL and materialize steps, and the
+  actions of the legacy `fluid_build.contract_tests` module, lost their row counts (a
+  materialize step logged `local_materialize_fallback`, a `contract_tests` action
+  reported `-1` rows). DuckDB 2.0 relations have no `fetchone()`, and a query result
+  keeps its connection busy until it is read to the end, which fails the next step on
+  that connection. Every DuckDB result is now read to the end, the same way on 1.5.x and
+  2.x.
+- **DuckDB 2.0: a Postgres source.** A DuckDB acquisition build reading Postgres failed
+  on DuckDB 2.0 (`Table Function with name postgres_scan does not exist!`): the postgres
+  extension dropped `postgres_scan`. The source is now attached read-only before the
+  sandbox locks, as MySQL and SQLite sources are, and read as `<alias>.<schema>.<table>`
+  on 1.5.x and 2.x; its `connection.secretRef` is resolved into the password, as a MySQL
+  source's already was. A Postgres or MySQL source the runner cannot connect to now fails
+  the build with the connect error, its password masked, and writes a run record; it
+  used to end `fluid apply` with `Unexpected error during execution`.
+- A local SQL action, or a legacy `fluid_build.contract_tests` action, whose SQL ends in
+  a statement that returns no rows (`CREATE TABLE ... AS`, an `INSERT` without
+  `RETURNING`) now fails with a message saying to write just the `SELECT`. DuckDB 1.5
+  failed there on `'NoneType' object has no attribute 'write_csv'`, and DuckDB 2.0
+  reported success with a one-row `Count` file, an empty `Success` file (a `CREATE TABLE
+  ... AS PIVOT`) or the rows of an earlier `SELECT` in the same SQL as the output.
 
 ## [0.21.0] — 2026-10-19
 

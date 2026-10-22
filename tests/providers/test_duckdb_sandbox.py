@@ -1133,8 +1133,8 @@ def test_a_function_from_an_unloaded_extension_reads_as_a_sandbox_refusal(layout
 
 
 def test_contract_sql_runs_on_a_connection_with_no_database_scanner(layout, printed):
-    """sqlite/postgres/mysql scanners are not bounded by the allowlist (next
-    test), so the connection contract SQL runs on must never have one loaded."""
+    """A loaded database scanner widens what SQL on the connection reaches (the
+    tests below), so the connection contract SQL runs on must never have one."""
     rc = _build(
         "SELECT count(*) AS n FROM duckdb_functions() WHERE function_name IN "
         "('sqlite_scan', 'sqlite_attach', 'postgres_scan', 'postgres_query', 'mysql_query')",
@@ -1213,9 +1213,11 @@ def test_from_duckdb_2_a_loaded_sqlite_scanner_is_bounded_by_the_allowlist(tmp_p
             con.execute(refused).fetchall()
 
 
+@pytest.mark.skipif(_DUCKDB_2, reason="DuckDB 2.0's postgres extension has no postgres_scan")
 def test_a_loaded_postgres_scanner_is_not_bounded_by_the_allowlist():
-    """Pins a documented limit: ``postgres_scan`` opens its own socket, so the
-    failure is the server's (nothing listens), not the sandbox's refusal."""
+    """Pins a documented limit through DuckDB 1.5: ``postgres_scan`` opens its
+    own socket, so the failure is the server's (nothing listens), not the
+    sandbox's refusal."""
     con = _with_extension("postgres")
     with pytest.raises(duckdb.Error) as failed:
         con.execute(
@@ -1223,6 +1225,16 @@ def test_a_loaded_postgres_scanner_is_not_bounded_by_the_allowlist():
         )
     assert not isinstance(failed.value, duckdb.PermissionException), failed.value
     assert "Permission Error" not in str(failed.value)
+
+
+@pytest.mark.parametrize("extension", ["postgres", "mysql"])
+def test_after_the_lock_no_database_can_be_attached_through_a_loaded_scanner(extension):
+    """On every version: ``postgres_query`` / ``mysql_query`` reach only the
+    databases the engine attached before the lock, which is how the duckdb
+    runner reads a postgres or mysql source."""
+    con = _with_extension(extension)
+    with pytest.raises(duckdb.PermissionException, match="disabled through configuration"):
+        con.execute(f"ATTACH 'host=127.0.0.1 port=9 connect_timeout=1' AS x (TYPE {extension})")
 
 
 # ── the helper's own guarantees ──────────────────────────────────────────

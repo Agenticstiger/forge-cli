@@ -100,15 +100,17 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
   load (``sqlite_scan``, ``read_xlsx``, ``ST_Read``, ``delta_scan``,
   ``iceberg_scan``) is not in the catalog. :func:`is_sandbox_refusal` treats
   that error as a refusal.
-* The ``postgres`` and ``mysql`` scanners open sockets through their own
-  client libraries, not through DuckDB's file system, so neither
-  ``allowed_directories`` nor ``enable_external_access`` bounds them: once
-  ``postgres`` is loaded, ``postgres_scan`` reaches any host the process can.
-  Through DuckDB 1.5 the ``sqlite`` scanner opens files that way too, so
-  ``sqlite_scan`` / ``ATTACH ... (TYPE sqlite)`` open any SQLite file the
-  process can read; from 2.0 it goes through DuckDB's file system and the
-  allowlist bounds it. Only the engine's own SQL runs on a connection that
-  loads a scanner; contract SQL never does.
+* A database scanner the call site loads widens what SQL on that connection
+  reaches, and how far depends on the DuckDB version (each case replayed on
+  1.5.0, 1.5.6 and 2.0.0). Through 1.5, once ``postgres`` is loaded,
+  ``postgres_scan(dsn, ...)`` connects to any host the process can reach, and
+  once ``sqlite`` is loaded, ``sqlite_scan`` / ``ATTACH ... (TYPE sqlite)`` open
+  any SQLite file it can read, whatever the allowlist says. DuckDB 2.0 has no
+  ``postgres_scan``, and refuses a SQLite file outside the allowlist as it
+  refuses any other read. On both, an ``ATTACH`` of a postgres or mysql
+  database after the lock is refused, so ``postgres_query`` / ``mysql_query``
+  reach only what the engine attached before it. Only the engine's own SQL runs
+  on a connection that loads a scanner; contract SQL never does.
 * DuckDB shares one database instance per file per process, and the lock is
   instance-wide: a second connection to a file database that is already open
   cannot be sandboxed, and is refused with :class:`DuckDBSandboxError`. Each
@@ -849,7 +851,7 @@ def secure_duckdb_connect(
     declared source database or creating an object-store secret. ``config``
     takes scalar start-up options (``threads``, ``TimeZone``), which cannot be
     changed once the configuration is locked. On DuckDB 2.x a database file the
-    connection creates is written in DuckDB 1.5's storage format
+    connection creates is written in the storage format DuckDB 1.5 writes
     (:func:`~fluid_build.providers._duckdb_compat.storage_compat_config`), unless
     ``config`` names ``storage_compatibility_version`` itself.
 
@@ -924,26 +926,14 @@ def _already_open(target: str) -> DuckDBSandboxError:
     )
 
 
-#: Scanner functions DuckDB does not name with their extension when it is not
-#: loaded: ``mysql_scan`` on every version, ``postgres_scan`` from 2.0.
-_UNADVERTISED_EXTENSION_FUNCTIONS = ("postgres_scan", "mysql_scan")
-
-
 def is_unloaded_function(exc: BaseException) -> bool:
     """Whether ``exc`` is a function whose extension autoloading would have loaded.
 
     DuckDB's catalog error: ``Table Function with name "sqlite_scan" is not in
-    the catalog, but it exists in the sqlite_scanner extension``, or, for a
-    scanner it does not advertise, ``Table Function with name postgres_scan
-    does not exist!``.
+    the catalog, but it exists in the sqlite_scanner extension``.
     """
     text = str(exc)
-    if "but it exists in the" in text and "extension" in text:
-        return True
-    return any(
-        f"Table Function with name {name} does not exist" in text
-        for name in _UNADVERTISED_EXTENSION_FUNCTIONS
-    )
+    return "but it exists in the" in text and "extension" in text
 
 
 def is_sandbox_refusal(exc: BaseException) -> bool:
