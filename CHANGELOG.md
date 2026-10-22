@@ -164,8 +164,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so an escape sequence in a contract or an error message can no longer clear the
   terminal or plant a link. JSON and JUnit output are unchanged.
 
-### Fixed
-
 - **Generated Airflow DAGs load on Airflow 3.** `fluid export --engine airflow`, `fluid
   generate schedule`, `fluid init` and the AWS, GCP and Snowflake code generators emitted
   `DAG(schedule_interval=...)` and `start_date=days_ago(1)`, which Airflow 3 removed, so
