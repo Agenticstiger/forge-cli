@@ -209,6 +209,73 @@ class TestDuckdbFilesystemFailures:
         assert rc != 0
 
 
+# ── postgres, no server ───────────────────────────────────────────────────
+
+
+def test_an_unreachable_postgres_source_fails_the_build_not_the_process(tmp_path, caplog):
+    """The source is attached as the run's connection opens (DuckDB 2.0 has no
+    ``postgres_scan``), so its connect error is reported as the build's failure,
+    with the password masked, as a failing stream was before."""
+    duckdb = pytest.importorskip("duckdb")
+    try:
+        probe = duckdb.connect()
+        probe.execute("INSTALL postgres; LOAD postgres")
+        probe.close()
+    except duckdb.Error:
+        pytest.skip("the postgres extension is not installable here (offline)")
+    password = "runner-unreachable-pg-pw-6T"  # pragma: allowlist secret
+    out_path = tmp_path / "orders.parquet"
+    contract = {
+        "fluidVersion": "0.7.3",
+        "id": "bronze.pg_orders",
+        "builds": [
+            {
+                "id": "ingest_pg",
+                "pattern": "acquisition",
+                "engine": "duckdb",
+                "properties": {
+                    "source": {
+                        "kind": "postgres",
+                        "connection": {
+                            "host": "127.0.0.1",
+                            "port": 9,  # discard: nothing listens
+                            "user": "fluid",
+                            "password": password,
+                            "database": "app",
+                        },
+                        "mode": "full_refresh",
+                        "streams": ["public.orders"],
+                    },
+                    "sink": {"format": "parquet"},
+                },
+                "outputs": ["orders"],
+            }
+        ],
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "table",
+                "binding": {
+                    "platform": "local",
+                    "format": "parquet",
+                    "location": {"path": str(out_path)},
+                },
+                "contract": {"schema": []},
+            }
+        ],
+    }
+    caplog.set_level("DEBUG")
+    rc = execute_duckdb_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+    assert rc == 1
+    assert not out_path.exists()
+    # A connection failure, the source reached: not a function DuckDB 2.0 lacks.
+    assert "Unable to connect to Postgres" in caplog.text
+    assert password not in caplog.text
+    for written in tmp_path.rglob("*"):
+        if written.is_file():
+            assert password not in written.read_text(encoding="utf-8", errors="replace"), written
+
+
 # ── postgres (docker-required) ────────────────────────────────────────────
 
 
@@ -218,7 +285,7 @@ class TestDuckdbFilesystemFailures:
     reason="Set FLUID_TEST_POSTGRES_HOST/PORT/USER/PASSWORD/DB to run; CI uses docker-compose.",
 )
 class TestDuckdbPostgresLive:
-    def test_postgres_scan_round_trip(self, tmp_path):
+    def test_postgres_round_trip(self, tmp_path):
         host = os.environ["FLUID_TEST_POSTGRES_HOST"]
         port = int(os.environ.get("FLUID_TEST_POSTGRES_PORT", "5432"))
         user = os.environ.get("FLUID_TEST_POSTGRES_USER", "postgres")

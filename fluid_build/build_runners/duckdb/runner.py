@@ -21,9 +21,9 @@ Builds a DuckDB SQL string of the form:
 Reader dispatch by ``source.kind``:
 
   - ``filesystem``  -> ``read_csv`` / ``read_parquet`` / ``read_json``
-  - ``postgres``    -> ``postgres_scan(...)``
-  - ``mysql``       -> ``mysql_scan(...)``
-  - ``sqlite``      -> ``sqlite_scan(...)``
+  - ``postgres``    -> ``ATTACH ... (TYPE postgres, READ_ONLY)``, then ``<alias>.<schema>.<table>``
+  - ``mysql``       -> ``ATTACH ... (TYPE mysql)``, then ``<alias>.<database>.<table>``
+  - ``sqlite``      -> ``ATTACH ... (TYPE sqlite)``, then ``<alias>.<table>``
   - ``http``        -> ``read_csv_auto('https://...')``
 
 Loads required extensions on demand (``httpfs``, ``postgres``, ``mysql``,
@@ -397,29 +397,51 @@ def _build_select_for_filesystem(uri: str, fmt: str, opts: Dict[str, Any]) -> st
     raise ValueError(f"unsupported reader.format for filesystem: {fmt}")
 
 
-def _build_select_for_postgres(connection: Dict[str, Any], stream: str) -> str:
-    """``postgres_scan('host=… port=… dbname=… user=… password=…', schema, table)``.
+def _postgres_attach_sql(connection: Dict[str, Any], *, alias: str) -> str:
+    """``ATTACH '<libpq dsn>' AS <alias> (TYPE postgres, SECRET <alias>, READ_ONLY)``.
 
-    Schema/table are validated as identifiers (so ``stream='x; DROP TABLE y'``
-    is rejected at build time, not executed). DSN values are passed through
-    ``quote_ansi_string_literal`` so embedded single quotes can't escape the
-    outer SQL string. The DSN itself uses libpq's ``key=value`` whitespace
-    format; the entire DSN is a single SQL literal at the boundary.
+    DuckDB 1.5's ``postgres_scan(dsn, schema, table)`` is gone from DuckDB 2.0's
+    postgres extension; ``ATTACH`` works on both, and attached ``READ_ONLY`` the
+    source cannot be written through it (``postgres_execute`` and ``INSERT`` are
+    refused). The DSN is the shared :func:`build_libpq_dsn` one (control
+    characters and a non-numeric port refused), one SQL literal at the boundary.
+    ``SECRET <alias>`` names the empty secret :func:`_postgres_secret_sql` makes.
+    """
+    alias = validate_ident(alias)
+    dsn = build_libpq_dsn(connection, database_key="dbname")
+    return (
+        f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} "
+        f"(TYPE postgres, SECRET {alias}, READ_ONLY)"
+    )
 
-    Delegates DSN construction to the shared :func:`build_libpq_dsn` so
-    postgres and mysql don't drift over time.
+
+def _postgres_secret_sql(*, alias: str) -> str:
+    """``CREATE TEMPORARY SECRET <alias> (TYPE postgres)``: empty, the DSN carries the credentials.
+
+    Without a secret named in the ``ATTACH`` the postgres extension looks for a
+    default one in every secret storage, and the persistent storage the sandbox
+    turns off answers ``Unknown secret storage found: 'local_file'`` (DuckDB 1.5
+    and 2.0 alike). A temporary secret lives in memory, on this connection only.
+    """
+    return f"CREATE TEMPORARY SECRET {validate_ident(alias)} (TYPE postgres)"
+
+
+def _build_select_for_postgres(stream: str, *, alias: str) -> str:
+    """``SELECT * FROM <alias>.<schema>.<table>`` over the ``ATTACH``-ed postgres source.
+
+    ``DuckdbRunner._attach_external_databases`` attaches it first
+    (:func:`_postgres_attach_sql`). Schema and table are validated as
+    identifiers, so ``stream='x; DROP TABLE y'`` is rejected at build time; a
+    bare ``"table"`` is read from ``public``.
     """
     if "." in stream:
         schema, table = stream.split(".", 1)
     else:
         schema, table = "public", stream
+    alias = validate_ident(alias)
     schema = validate_ident(schema)
     table = validate_ident(table)
-    dsn = build_libpq_dsn(connection, database_key="dbname")
-    return (
-        f"SELECT * FROM postgres_scan({quote_ansi_string_literal(dsn)}, "
-        f"{quote_ansi_string_literal(schema)}, {quote_ansi_string_literal(table)})"
-    )
+    return f"SELECT * FROM {alias}.{schema}.{table}"
 
 
 def _build_select_for_mysql(connection: Dict[str, Any], stream: str, *, alias: str) -> str:
@@ -484,6 +506,13 @@ def _mysql_alias_for_build(build_id: str) -> str:
     """
     safe = re.sub(r"[^A-Za-z0-9_]", "_", build_id) or "default"
     candidate = f"mysql_{safe}"
+    return validate_ident(candidate)
+
+
+def _postgres_alias_for_build(build_id: str) -> str:
+    """Per-build ATTACH alias for postgres — same pattern as mysql."""
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", build_id) or "default"
+    candidate = f"postgres_{safe}"
     return validate_ident(candidate)
 
 
@@ -607,9 +636,9 @@ def _warn_workspace_not_granted(message: str) -> None:
 def _grant_source(allow: DuckDBAllowlist, ctx: RunContext, streams: List[str]) -> DuckDBAllowlist:
     """``allow`` plus where a filesystem / http source reads from.
 
-    A database source needs no grant: postgres is scanned through its DSN, and
-    mysql / sqlite are attached before the lock (``_attach_external_databases``),
-    a sqlite file only inside :func:`_declared_roots` (``confine_declared``).
+    A database source needs no grant: postgres / mysql / sqlite are attached
+    before the lock (``_attach_external_databases``), a sqlite file only inside
+    :func:`_declared_roots` (``confine_declared``).
     A local source is granted only inside :func:`_declared_roots` (a glob as
     the directory above its first wildcard): the contract names it, so naming
     ``~/.ssh/*`` must not make it readable.
@@ -751,31 +780,38 @@ class DuckdbRunner:
         self._attach_external_databases(con, ctx)
 
     def _attach_external_databases(self, con: Any, ctx: RunContext) -> None:
-        """ATTACH any source kind that requires a named database alias.
+        """ATTACH the source database a postgres / mysql / sqlite build reads.
 
-        Postgres uses ``postgres_scan(dsn, schema, table)`` directly with
-        the DSN inline, so no ATTACH is needed. The mysql / mariadb /
-        sqlite extensions only expose ATTACH-then-reference semantics —
-        there's no ``mysql_scan(dsn, …)`` function — so we ATTACH here
-        at extension-load time and ``_build_select_for_<kind>`` helpers
-        reference ``<alias>.<schema>.<table>`` (or ``<alias>.<table>``
-        for sqlite).
+        These extensions read through ATTACH-then-reference: the attach runs
+        here, at extension-load time (before the sandbox's lock, after which an
+        ATTACH is refused), and ``_build_select_for_<kind>`` references
+        ``<alias>.<schema>.<table>`` (or ``<alias>.<table>`` for sqlite).
+        Postgres used ``postgres_scan(dsn, schema, table)`` until DuckDB 2.0
+        dropped it; it is attached ``READ_ONLY``.
 
-        The alias is per-build (``mysql_<build_id>`` / ``sqlite_<build_id>``)
-        so two sources in the same contract / interpreter don't collide
-        on a hardcoded name.
+        The alias is per-build (``postgres_<build_id>`` / ``mysql_<build_id>``
+        / ``sqlite_<build_id>``) so two sources in the same contract /
+        interpreter don't collide on a hardcoded name.
 
         Best-effort: if the connection DSN is malformed or the upstream
         is unreachable, the ATTACH raises and the runner surfaces the
-        error in the per-stream try/except.
+        error in the per-stream try/except, with the password masked.
 
         A sqlite file is confined to :func:`_declared_roots` plus the
         operator's ``FLUID_DUCKDB_ALLOWED_DIRS`` first, and refused with
-        ``DuckDBSandboxError`` outside them: the sqlite scanner is not bounded
-        by the sandbox's allowlist, so nothing else would stop it.
+        ``DuckDBSandboxError`` outside them: nothing else bounds an ATTACH
+        made before the lock.
         """
         kind = ctx.source.kind
-        if kind in ("mysql", "mariadb"):
+        if kind == "postgres":
+            # Resolve secretRef → password, as the mysql branch does; an inline
+            # literal still wins.
+            conn = resolve_connection_secrets(dict(ctx.source.connection.raw))
+            alias = _postgres_alias_for_build(ctx.build_id)
+            attach_sql = _postgres_attach_sql(conn, alias=alias)  # validates first
+            con.execute(_postgres_secret_sql(alias=alias))
+            _attach_with_password_masked(con, attach_sql, conn.get("password"))
+        elif kind in ("mysql", "mariadb"):
             # Resolve secretRef → password before build_mysql_dsn reads
             # connection.get("password"). Inline literal values still win.
             conn = resolve_connection_secrets(dict(ctx.source.connection.raw))
@@ -785,22 +821,13 @@ class DuckdbRunner:
             # and refuses a '?', a '/' in the host and a control character.
             dsn = build_mysql_dsn(conn, database_key="database")
             alias = _mysql_alias_for_build(ctx.build_id)
-            password = conn.get("password")
-            masked: Optional[str] = None
-            try:
-                # mysql extension supports both mysql:// and mariadb:// upstreams;
-                # the duckdb extension type literal is always ``mysql``.
-                con.execute(f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE mysql)")
-            except Exception as exc:
-                if not password:
-                    raise
-                # mysql_scanner quotes the whole DSN in a connect error, and
-                # ``fluid apply`` prints the error: keep it, without the password.
-                masked = mask_dsn_password(str(exc), str(password))
-            if masked is not None:
-                # Raised after the handler has ended, so the unmasked error is
-                # neither the cause nor the context of this one (PEP 415).
-                raise RuntimeError(masked)
+            # mysql extension supports both mysql:// and mariadb:// upstreams;
+            # the duckdb extension type literal is always ``mysql``.
+            _attach_with_password_masked(
+                con,
+                f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE mysql)",
+                conn.get("password"),
+            )
         elif kind == "sqlite":
             conn = dict(ctx.source.connection.raw)
             # SQLite uses a path, not a libpq-style DSN. The path comes
@@ -809,14 +836,40 @@ class DuckdbRunner:
             path = conn.get("uri") or conn.get("path") or conn.get("database") or ""
             if not path:
                 raise ValueError("sqlite source requires connection.uri, .path, or .database")
-            # The sqlite scanner opens the file through its own client library,
-            # which allowed_directories never bounds: this confinement is the
-            # only check on it. Without it a contract could land any SQLite
-            # file on the host (a browser's cookie store, another app's data).
-            # The checked realpath is what is attached.
+            # The attach runs before the sandbox's lock, when nothing bounds the
+            # open (and through DuckDB 1.5 the sqlite scanner's own client
+            # library is never bounded): this confinement is the only check on
+            # it. Without it a contract could land any SQLite file on the host
+            # (a browser's cookie store, another app's data). The checked
+            # realpath is what is attached.
             real = confine_declared(str(path), within=_declared_roots(ctx))
             alias = _sqlite_alias_for_build(ctx.build_id)
             con.execute(f"ATTACH {quote_ansi_string_literal(real)} AS {alias} (TYPE sqlite)")
+
+
+class _SourceAttachError(RuntimeError):
+    """The source database could not be attached; the message holds no password."""
+
+
+def _attach_with_password_masked(con: Any, statement: str, password: Any) -> None:
+    """Run an ``ATTACH`` that carries a DSN; its connect error loses the password.
+
+    The postgres and mysql scanners quote the whole DSN they were given in a
+    connect error, and ``fluid apply`` prints the error: keep it, without the
+    password (:func:`mask_dsn_password`), as a :class:`_SourceAttachError` the
+    run reports as the build's failure.
+    """
+    masked: Optional[str] = None
+    try:
+        con.execute(statement)
+    except Exception as exc:
+        if not password:
+            raise _SourceAttachError(str(exc)) from exc
+        masked = mask_dsn_password(str(exc), str(password))
+    if masked is not None:
+        # Raised after the handler has ended, so the unmasked error is
+        # neither the cause nor the context of this one (PEP 415).
+        raise _SourceAttachError(masked)
 
 
 def _select_for_first_stream(ctx: RunContext) -> str:
@@ -837,7 +890,7 @@ def _select_for_stream(ctx: RunContext, stream: str) -> str:
         opts = dict(ctx.source.reader.options) if ctx.source.reader else {}
         return _build_select_for_http(uri, fmt or "csv", opts)
     if kind == "postgres":
-        return _build_select_for_postgres(conn, stream)
+        return _build_select_for_postgres(stream, alias=_postgres_alias_for_build(ctx.build_id))
     if kind in ("mysql", "mariadb"):
         # MariaDB uses the same duckdb mysql extension; the discoverer
         # already accepts both schemes (cli/discover/mysql.py), keep
@@ -1360,11 +1413,17 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     dlq_writer: Optional[DLQWriter] = None
     dlq_total_records = 0
 
-    con = secure_duckdb_connect(
-        ":memory:",
-        allow=_run_allowlist(ctx, streams_to_run, sink_format),
-        before_lock=lambda c: runner._load_extensions(c, ctx),
-    )
+    try:
+        con = secure_duckdb_connect(
+            ":memory:",
+            allow=_run_allowlist(ctx, streams_to_run, sink_format),
+            before_lock=lambda c: runner._load_extensions(c, ctx),
+        )
+    except _SourceAttachError as exc:
+        # The source database is attached as the connection opens. Its connect
+        # error fails the run as a stream's error does, so the run record and
+        # the build's summary carry it (without the password).
+        return _refused_run(ctx, streams_to_run, started_at, t_start, f"source: {exc}")
     try:
         if masker is not None:
             masker.install(con)
@@ -1490,8 +1549,8 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                         on_error,
                     )
             except Exception as exc:  # noqa: BLE001
-                # The COPY SQL embeds DSN strings (postgres_scan dsn=…),
-                # which DuckDB echoes in its error messages. Don't pass
+                # DuckDB echoes the statement, and a source database's own
+                # error, in its error messages. Don't pass
                 # `exc` directly and don't dump the full traceback via
                 # exc_info — both can carry password/key data.
                 LOG.error(

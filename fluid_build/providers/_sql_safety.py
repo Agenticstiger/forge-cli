@@ -225,8 +225,8 @@ def libpq_escape(value: Any) -> str:
 
     Used by:
 
-    * The duckdb acquisition runner when building ``postgres_scan(...)``
-      DSNs.
+    * The duckdb acquisition runner when building its postgres ``ATTACH``
+      DSN.
     * The JDBC attach builder (``cli/discover/_jdbc_introspect.py``) for
       postgres.
     """

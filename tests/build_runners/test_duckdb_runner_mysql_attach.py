@@ -187,22 +187,69 @@ class TestControlCharactersRefusedBeforeTheAttach:
         assert dict(_parse_mysql_dsn(_dsn_of(sql)))["password"] == value
 
 
-class TestPostgresScanDsnRefusesControlCharacters:
-    """The runner's postgres source is read through ``postgres_scan(dsn, ...)``,
-    whose DSN the same shared builder makes. libpq ends a bare value at any C
-    ``isspace()`` character, and libpq_escape quotes only a value with a space
-    or a quote, so a tab or newline there started a second keyword."""
+class TestPostgresAttachDsnRefusesControlCharacters:
+    """The runner's postgres source is attached with ``ATTACH '<dsn>' ... (TYPE
+    postgres)``, whose DSN the same shared builder makes. libpq ends a bare
+    value at any C ``isspace()`` character, and libpq_escape quotes only a value
+    with a space or a quote, so a tab or newline there started a second keyword."""
 
     @pytest.mark.parametrize("field", ["host", "user", "password", "database"])
     @pytest.mark.parametrize("ch", _CONTROLS, ids=lambda c: f"U+{ord(c):04X}")
     def test_refused(self, field, ch):
-        from fluid_build.build_runners.duckdb.runner import _build_select_for_postgres
-
         conn = {"host": "db.test", "port": "5432", "user": "u", "password": FAKE_PW}
         conn["database"] = "app"
         conn[field] = f"ab{ch}sslmode=disable"
         with pytest.raises(ValueError, match=f"{field}.*control characters"):
-            _build_select_for_postgres(conn, "public.orders")
+            _attach(conn, kind="postgres")
+
+
+class TestPostgresAttach:
+    """DuckDB 2.0's postgres extension has no ``postgres_scan``, so the runner
+    attaches a postgres source before the sandbox's lock, read-only, as it
+    attaches mysql and sqlite."""
+
+    def test_the_source_is_attached_read_only_under_a_per_build_alias(self):
+        secret, sql = _attach(dict(_BASE, port="5432"), kind="postgres")
+        # An empty temporary secret: the sandbox's disabled persistent storage
+        # otherwise fails the ATTACH's default-secret lookup.
+        assert secret == "CREATE TEMPORARY SECRET postgres_b1 (TYPE postgres)"
+        assert sql.startswith("ATTACH '")
+        assert sql.endswith(" AS postgres_b1 (TYPE postgres, SECRET postgres_b1, READ_ONLY)")
+        assert "dbname=app" in _dsn_of(sql)
+
+    def test_the_select_reads_the_attached_alias(self):
+        from fluid_build.build_runners.duckdb.runner import _build_select_for_postgres
+
+        assert (
+            _build_select_for_postgres("sales.orders", alias="postgres_b1")
+            == "SELECT * FROM postgres_b1.sales.orders"
+        )
+        assert (
+            _build_select_for_postgres("orders", alias="postgres_b1")
+            == "SELECT * FROM postgres_b1.public.orders"
+        )
+
+    def test_a_secret_ref_password_is_resolved(self, monkeypatch):
+        monkeypatch.setenv("RUNNER_FAKE_PG_SECRET", "runner-pg-ref-pw-3J")
+        raw = {k: v for k, v in _BASE.items() if k != "password"}
+        raw["secretRef"] = "env://RUNNER_FAKE_PG_SECRET"  # pragma: allowlist secret
+        _secret, sql = _attach(raw, kind="postgres")
+        assert "password=runner-pg-ref-pw-3J" in _dsn_of(sql)
+
+    def test_a_connect_error_has_the_password_masked(self):
+        class _Con:
+            def execute(self, sql: str, *_a: Any, **_k: Any) -> None:
+                if sql.startswith("ATTACH"):
+                    # What postgres_scanner says: it quotes the DSN it was given.
+                    raise RuntimeError(
+                        f'IO Error: Unable to connect to Postgres at "{_dsn_of(sql)}"'
+                    )
+
+        with pytest.raises(RuntimeError) as caught:
+            _attach_on(_Con(), dict(_BASE, port="5432"), kind="postgres")
+        assert FAKE_PW not in str(caught.value)
+        assert "password=***" in str(caught.value)
+        assert caught.value.__context__ is None and caught.value.__cause__ is None
 
 
 class TestConnectErrorHasThePasswordMasked:

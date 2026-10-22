@@ -4,7 +4,7 @@ id: bronze.crm_orders
 name: CRM Orders Bronze
 description: |
   Source-aligned Bronze data product. Acquires raw orders from a Postgres
-  source via DuckDB's postgres_scan and lands them as Parquet for downstream
+  source through DuckDB's postgres extension and lands them as Parquet for downstream
   Silver/Gold consumption.
 domain: sales
 
