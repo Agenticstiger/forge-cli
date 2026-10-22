@@ -644,6 +644,7 @@ def _duckdb_table_exists(path: Path, schema_name: str, table: str) -> bool:
     checked by the provider's own allowlist first and are bound as
     parameters, never spliced into the SQL.
     """
+    from fluid_build.providers._duckdb_compat import first_row
     from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
     from fluid_build.providers.local_validation import _build_duckdb_table_ref
 
@@ -652,11 +653,13 @@ def _duckdb_table_exists(path: Path, schema_name: str, table: str) -> bool:
     # access beyond the database file itself.
     con = secure_duckdb_connect(path, allow=DuckDBAllowlist.none(), read_only=True)
     try:
-        row = con.execute(
-            "SELECT count(*) FROM information_schema.tables "
-            "WHERE lower(table_schema) = lower(?) AND lower(table_name) = lower(?)",
-            [schema_name, table],
-        ).fetchone()
+        row = first_row(
+            con.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE lower(table_schema) = lower(?) AND lower(table_name) = lower(?)",
+                [schema_name, table],
+            )
+        )
     finally:
         con.close()
     return bool(row and row[0])

@@ -100,13 +100,17 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
   load (``sqlite_scan``, ``read_xlsx``, ``ST_Read``, ``delta_scan``,
   ``iceberg_scan``) is not in the catalog. :func:`is_sandbox_refusal` treats
   that error as a refusal.
-* The ``sqlite``, ``postgres`` and ``mysql`` scanners open files and sockets
-  through their own client libraries, not through DuckDB's file system, so
-  neither ``allowed_directories`` nor ``enable_external_access`` bounds them:
-  once ``sqlite`` is loaded, ``sqlite_scan`` / ``ATTACH ... (TYPE sqlite)``
-  open any SQLite file the process can read, and once ``postgres`` is loaded,
-  ``postgres_scan`` reaches any host the process can. Only the engine's own
-  SQL runs on a connection that loads them; contract SQL never does.
+* A database scanner the call site loads widens what SQL on that connection
+  reaches, and how far depends on the DuckDB version (each case replayed on
+  1.5.0, 1.5.6 and 2.0.0). Through 1.5, once ``postgres`` is loaded,
+  ``postgres_scan(dsn, ...)`` connects to any host the process can reach, and
+  once ``sqlite`` is loaded, ``sqlite_scan`` / ``ATTACH ... (TYPE sqlite)`` open
+  any SQLite file it can read, whatever the allowlist says. DuckDB 2.0 has no
+  ``postgres_scan``, and refuses a SQLite file outside the allowlist as it
+  refuses any other read. On both, an ``ATTACH`` of a postgres or mysql
+  database after the lock is refused, so ``postgres_query`` / ``mysql_query``
+  reach only what the engine attached before it. Only the engine's own SQL runs
+  on a connection that loads a scanner; contract SQL never does.
 * DuckDB shares one database instance per file per process, and the lock is
   instance-wide: a second connection to a file database that is already open
   cannot be sandboxed, and is refused with :class:`DuckDBSandboxError`. Each
@@ -145,6 +149,7 @@ from typing import (
 
 from fluid_build._errors import FluidUserError, doc_url
 
+from ._duckdb_compat import storage_compat_config
 from ._sql_safety import quote_ansi_string_literal, validate_ident
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -451,9 +456,9 @@ def confine_declared(
     """The ``realpath`` of a declared local ``location``, refused outside ``within``.
 
     For a location the engine opens itself rather than grants to the SQL, such
-    as a SQLite source it ``ATTACH``es before the lock: the sqlite scanner opens
-    files through its own client library, so ``allowed_directories`` never
-    bounds it, and this check is the only one. Confined as
+    as a SQLite source it ``ATTACH``es before the lock: nothing bounds that open
+    (and through DuckDB 1.5 the sqlite scanner's own client library is never
+    bounded), so this check is the only one. Confined as
     :meth:`DuckDBAllowlist.with_declared` confines (``within`` plus
     ``FLUID_DUCKDB_ALLOWED_DIRS``); a relative ``location`` is resolved against
     ``base``, else the working directory. Open the returned path, the one that
@@ -796,7 +801,8 @@ def duckdb_version(module: Any) -> Tuple[int, int, int]:
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
-def _require_supported(module: Any) -> None:
+def _require_supported(module: Any) -> Tuple[int, int, int]:
+    """``module``'s version, once it is one the sandbox can confine."""
     version = duckdb_version(module)
     if version < MIN_DUCKDB_VERSION:
         want = ".".join(str(n) for n in MIN_DUCKDB_VERSION)
@@ -810,6 +816,7 @@ def _require_supported(module: Any) -> None:
             ),
             fix=f"pip install 'duckdb>={want}'",
         )
+    return version
 
 
 def _sql_list(values: Iterable[str]) -> str:
@@ -843,7 +850,10 @@ def secure_duckdb_connect(
     in, for set-up that needs access the SQL must not have, such as attaching a
     declared source database or creating an object-store secret. ``config``
     takes scalar start-up options (``threads``, ``TimeZone``), which cannot be
-    changed once the configuration is locked.
+    changed once the configuration is locked. On DuckDB 2.x a database file the
+    connection creates is written in the storage format DuckDB 1.5 writes
+    (:func:`~fluid_build.providers._duckdb_compat.storage_compat_config`), unless
+    ``config`` names ``storage_compatibility_version`` itself.
 
     Raises :class:`DuckDBSandboxError` for an older DuckDB, a bad allowlist
     entry, or a file ``database`` this process already has open (its one
@@ -853,10 +863,13 @@ def secure_duckdb_connect(
     """
     import duckdb
 
-    _require_supported(duckdb)
+    version = _require_supported(duckdb)
     target = os.fspath(database)
+    # A database file this creates stays readable by the oldest supported
+    # DuckDB (see _duckdb_compat); a caller's own setting wins.
+    options = {**storage_compat_config(version), **dict(config or {})}
     try:
-        con = duckdb.connect(target, read_only=read_only, config=dict(config or {}))
+        con = duckdb.connect(target, read_only=read_only, config=options)
     except duckdb.Error as exc:
         if "same database file with a different configuration" in str(exc):
             raise _already_open(target) from exc

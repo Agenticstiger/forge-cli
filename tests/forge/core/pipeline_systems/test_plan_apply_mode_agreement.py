@@ -228,7 +228,7 @@ def test_generated_plan_and_apply_agree_on_the_mode(
     assert _flag(apply_argv, "--mode") == apply_mode
     landed = ws / "contracts" / "p" / "out" / "rows.parquet"
     if apply_mode in _BUILD_MODES:
-        assert duckdb.sql(f"SELECT count(*) FROM '{landed}'").fetchone() == (1,)
+        assert duckdb.sql(f"SELECT count(*) FROM '{landed}'").fetchall() == [(1,)]
     # A build id reaches ``fluid apply`` only with a build mode.
     expected_build_id = build_id if (build_id and apply_mode in _BUILD_MODES) else None
     assert _flag(apply_argv, "--build-id") == expected_build_id
@@ -257,7 +257,7 @@ def test_a_parameterless_run_uses_the_declared_defaults(
     assert _flag(apply_argv, "--build-id") == expected_build_id
     landed = ws / "contracts" / "p" / "out" / "rows.parquet"
     if expected_mode in _BUILD_MODES:
-        assert duckdb.sql(f"SELECT count(*) FROM '{landed}'").fetchone() == (1,)
+        assert duckdb.sql(f"SELECT count(*) FROM '{landed}'").fetchall() == [(1,)]
     if expected_mode == "dry-run":
         assert not landed.exists()  # a dry run writes nothing
 
@@ -301,7 +301,7 @@ def test_a_run_on_defaults_applies_the_fluid_env_default(
     apply_argv = _run_chain(ws, stages, exported, default_env="staging")
     assert _flag(apply_argv, "--env") == "staging"
     out = ws / "contracts" / "p" / "out"
-    assert duckdb.sql(f"SELECT count(*) FROM '{out / 'staging' / 'rows.parquet'}'").fetchone() == (
-        1,
-    )
+    assert duckdb.sql(f"SELECT count(*) FROM '{out / 'staging' / 'rows.parquet'}'").fetchall() == [
+        (1,)
+    ]
     assert not (out / "rows.parquet").exists()  # the base binding was not applied

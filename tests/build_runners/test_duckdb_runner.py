@@ -14,8 +14,9 @@
 
 """DuckDB acquisition runner — unit + integration tests.
 
-Filesystem-based tests run unconditionally; postgres tests require a live
-Postgres (docker-compose / Testcontainers) and are gated by an env var.
+Filesystem-based tests run unconditionally; the live postgres and mysql round
+trips need a server and run only when their FLUID_TEST_* variables are set (no
+CI job sets them).
 """
 
 from __future__ import annotations
@@ -209,16 +210,249 @@ class TestDuckdbFilesystemFailures:
         assert rc != 0
 
 
+# ── postgres, no server ───────────────────────────────────────────────────
+
+
+_UNSET_SECRET_REF = "env://FLUID_TEST_UNSET_SOURCE_SECRET"  # pragma: allowlist secret
+_REFUSED_SECRET_REF = "file://a/b"  # pragma: allowlist secret
+
+_CONNECT_FAILED = {
+    "postgres": "Unable to connect to Postgres",
+    "mysql": "Failed to connect to MySQL",
+}
+
+
+def _require_extension(kind: str) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    try:
+        probe = duckdb.connect()
+        probe.execute(f"INSTALL {kind}; LOAD {kind}")
+        probe.close()
+    except duckdb.Error:
+        pytest.skip(f"the {kind} extension is not installable here (offline)")
+
+
+def _database_source_contract(kind: str, connection: Dict[str, Any], out_path: Path) -> dict:
+    """One acquisition build reading ``app.orders`` from a ``kind`` database."""
+    return {
+        "fluidVersion": "0.7.3",
+        "id": "bronze.db_orders",
+        "builds": [
+            {
+                "id": "ingest_db",
+                "pattern": "acquisition",
+                "engine": "duckdb",
+                "properties": {
+                    "source": {
+                        "kind": kind,
+                        "connection": connection,
+                        "mode": "full_refresh",
+                        "streams": ["app.orders"],
+                    },
+                    "sink": {"format": "parquet"},
+                },
+                "outputs": ["orders"],
+            }
+        ],
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "table",
+                "binding": {
+                    "platform": "local",
+                    "format": "parquet",
+                    "location": {"path": str(out_path)},
+                },
+                "contract": {"schema": []},
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize("with_password", [True, False], ids=["password", "no-password"])
+@pytest.mark.parametrize("kind", ["postgres", "mysql"])
+def test_an_unreachable_database_source_fails_the_build_not_the_process(
+    tmp_path, caplog, kind, with_password
+):
+    """The source is attached as the run's connection opens (DuckDB 2.0 has no
+    ``postgres_scan``), so its connect error is reported as the build's failure,
+    with the password masked. The error is a connection failure: not a function
+    DuckDB 2.0 lacks, nor the "Unknown secret storage found: 'local_file'" that
+    an ATTACH without a named secret hits under the sandbox."""
+    _require_extension(kind)
+    password = "runner-unreachable-db-pw-6T"  # pragma: allowlist secret
+    out_path = tmp_path / "orders.parquet"
+    connection = {
+        "host": "127.0.0.1",
+        "port": 9,  # discard: nothing listens
+        "user": "fluid",
+        **({"password": password} if with_password else {}),
+        "database": "app",
+    }
+    contract = _database_source_contract(kind, connection, out_path)
+    caplog.set_level("DEBUG")
+    rc = execute_duckdb_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+    assert rc == 1
+    assert not out_path.exists()
+    assert _CONNECT_FAILED[kind] in caplog.text, caplog.text[-2000:]
+    assert password not in caplog.text
+    for written in tmp_path.rglob("*"):
+        if written.is_file():
+            assert password not in written.read_text(encoding="utf-8", errors="replace"), written
+
+
+@pytest.mark.parametrize(
+    "refused, reason",
+    [
+        ({"port": "abc"}, "connection.port must be numeric"),
+        # The run record's redactor reads "<NAME>_SECRET: environment" as an
+        # assignment and masks its value, so the record says "variable not set".
+        ({"secretRef": _UNSET_SECRET_REF}, "variable not set"),
+        # The file backend refuses a name with a separator: a ConfigurationError,
+        # as every secret backend but env:// raises, not a ValueError.
+        ({"secretRef": _REFUSED_SECRET_REF}, "Invalid secret name"),
+    ],
+    ids=["port", "unset-secret-ref", "secret-backend-error"],
+)
+@pytest.mark.parametrize("kind", ["postgres", "mysql"])
+def test_a_source_the_runner_cannot_set_up_fails_the_build_with_a_run_record(
+    tmp_path, monkeypatch, kind, refused, reason
+):
+    """A connection block refused before any attach (a port that is not a
+    number, a secretRef that does not resolve) fails the build as a connect
+    error does: exit 1 and a failed run record, not an exception out of the
+    runner that ends `fluid apply` before its other builds run."""
+    import json
+
+    _require_extension(kind)
+    monkeypatch.delenv("FLUID_TEST_UNSET_SOURCE_SECRET", raising=False)
+    out_path = tmp_path / "orders.parquet"
+    connection = {"host": "127.0.0.1", "port": 9, "user": "fluid", "database": "app", **refused}
+    contract = _database_source_contract(kind, connection, out_path)
+    rc = execute_duckdb_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+    assert rc == 1
+    assert not out_path.exists()
+    runs = tmp_path / ".fluid" / "runs" / "bronze.db_orders" / "ingest_db" / "runs"
+    (record,) = [json.loads(p.read_text(encoding="utf-8")) for p in runs.glob("*.json")]
+    assert record["state"] == "failed"
+    (stream,) = record["streams"]
+    assert stream["state"] == "failed"
+    assert stream["error"].startswith("source: ") and reason in stream["error"], stream
+
+
+def test_a_postgres_enum_column_reads_as_text_as_postgres_scan_read_it():
+    """``postgres_scan`` typed a Postgres enum ``VARCHAR``; the ``ATTACH``-ed
+    catalog types it ``ENUM(...)``, which the schema gate took for a type
+    change against a declared ``VARCHAR``. DuckDB's own enum stands in here
+    for the attached one: both describe as ``ENUM('a', 'b')``."""
+    import types
+
+    duckdb = pytest.importorskip("duckdb")
+    from fluid_build.build_runners.duckdb.runner import (
+        _postgres_alias_for_build,
+        _postgres_enums_as_varchar,
+        _select_for_stream,
+    )
+
+    con = duckdb.connect()
+    # Under the alias the runner attaches the source as.
+    alias = _postgres_alias_for_build("b1")
+    con.execute(f"ATTACH ':memory:' AS {alias}")
+    con.execute(f"CREATE SCHEMA {alias}.app")
+    con.execute(
+        f"CREATE TABLE {alias}.app.src (id INTEGER, mood ENUM('sad', 'ok', 'happy'), "
+        "moods ENUM('sad', 'ok', 'happy')[], \"Odd \"\"Name\" ENUM('a)b', 'c'))"
+    )
+    con.execute(f"INSERT INTO {alias}.app.src VALUES (1, 'ok', ['sad', 'happy'], 'a)b')")
+    ctx = types.SimpleNamespace(
+        build_id="b1",
+        source=types.SimpleNamespace(kind="postgres", connection=types.SimpleNamespace(raw={})),
+    )
+    select_sql = _select_for_stream(con, ctx, "app.src")
+    assert [(row[0], row[1]) for row in con.execute(f"DESCRIBE {select_sql}").fetchall()] == [
+        ("id", "INTEGER"),
+        ("mood", "VARCHAR"),
+        ("moods", "VARCHAR[]"),
+        ('Odd "Name', "VARCHAR"),
+    ]
+    assert con.execute(select_sql).fetchall() == [(1, "ok", ["sad", "happy"], "a)b")]
+    # Text order, not declaration order: 'ok' < 'sad' as text, not as this enum.
+    assert con.execute(f"SELECT mood < 'sad' FROM ({select_sql})").fetchall() == [(True,)]
+    no_enum = f"SELECT id FROM {alias}.app.src"
+    assert _postgres_enums_as_varchar(con, no_enum) == no_enum
+
+
+def test_a_database_source_that_drifts_from_its_declared_schema_is_refused(tmp_path):
+    """The schema gate fingerprints the source on a connection of its own,
+    which must attach the source as the run's does: a database source exists
+    only through that ``ATTACH``. The gate swallows a fingerprint that fails,
+    so a fingerprint that cannot see the source would land drifted data."""
+    import sqlite3
+
+    from fluid_build._errors import SchemaDriftError
+
+    _require_extension("sqlite")
+    db = tmp_path / "src.sqlite"
+    source = sqlite3.connect(db)
+    source.execute("CREATE TABLE orders (id INTEGER, name TEXT)")
+    source.execute("INSERT INTO orders VALUES (1, 'a'), (2, 'b')")
+    source.commit()
+    source.close()
+    out = tmp_path / "orders.parquet"
+    contract = {
+        "fluidVersion": "0.7.3",
+        "id": "bronze.sqlite_orders",
+        "builds": [
+            {
+                "id": "ingest_sqlite",
+                "pattern": "acquisition",
+                "engine": "duckdb",
+                "properties": {
+                    "source": {
+                        "kind": "sqlite",
+                        "connection": {"path": str(db)},
+                        "mode": "full_refresh",
+                        "streams": ["orders"],
+                    },
+                    "sink": {"format": "parquet"},
+                },
+                "outputs": ["orders"],
+            }
+        ],
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "table",
+                "binding": {
+                    "platform": "local",
+                    "format": "parquet",
+                    "location": {"path": str(out)},
+                },
+                "contract": {
+                    "schemaPolicy": "strict",
+                    "schema": [
+                        {"name": "id", "type": "integer"},
+                        {"name": "not_in_the_source", "type": "string"},
+                    ],
+                },
+            }
+        ],
+    }
+    with pytest.raises(SchemaDriftError):
+        execute_duckdb_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+    assert not out.exists()
+
+
 # ── postgres (docker-required) ────────────────────────────────────────────
 
 
 @pytest.mark.integration
 @pytest.mark.skipif(
     os.environ.get("FLUID_TEST_POSTGRES_HOST") is None,
-    reason="Set FLUID_TEST_POSTGRES_HOST/PORT/USER/PASSWORD/DB to run; CI uses docker-compose.",
+    reason="Set FLUID_TEST_POSTGRES_HOST/PORT/USER/PASSWORD/DB to run (no CI job sets them).",
 )
 class TestDuckdbPostgresLive:
-    def test_postgres_scan_round_trip(self, tmp_path):
+    def test_postgres_round_trip(self, tmp_path):
         host = os.environ["FLUID_TEST_POSTGRES_HOST"]
         port = int(os.environ.get("FLUID_TEST_POSTGRES_PORT", "5432"))
         user = os.environ.get("FLUID_TEST_POSTGRES_USER", "postgres")
@@ -309,7 +543,7 @@ class TestDuckdbPostgresLive:
 @pytest.mark.integration
 @pytest.mark.skipif(
     os.environ.get("FLUID_TEST_MYSQL_HOST") is None,
-    reason="Set FLUID_TEST_MYSQL_HOST/PORT/USER/PASSWORD/DB to run; CI uses docker-compose.",
+    reason="Set FLUID_TEST_MYSQL_HOST/PORT/USER/PASSWORD/DB to run (no CI job sets them).",
 )
 class TestDuckdbMysqlLive:
     def test_mysql_scan_round_trip(self, tmp_path):

@@ -27,7 +27,8 @@ Action schema (expected keys used here):
                - The key is an alias; referenced as table/view name in SQL.
                - `path` can be a string (supports globs) or list of strings.
                - If `name` is set, it overrides the alias for the table/view name.
-- sql:         the SQL string to execute (must be a SELECT or CREATE TABLE AS ... style)
+- sql:         the SQL string to execute; it must end in a SELECT of the result
+               (for CREATE TABLE t AS SELECT ..., write just the SELECT ...)
 - outputs:     dict with one or more outputs. Supported:
                {
                  "path": "runtime/out/high_value_churn_risk.csv",
@@ -53,6 +54,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from fluid_build.providers._duckdb_compat import NO_ROWS_TO_WRITE, one_row, query_relation
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
     DuckDBSandboxError,
@@ -208,10 +210,9 @@ def _execute_sql(con, sql: str):
     if not sql_stripped:
         raise LocalProviderError("No SQL provided for action")
     try:
-        # DuckDB returns a Relation for SELECT; for CREATE TABLE AS, we can
-        # run an additional SELECT if needed. We assume a SELECT for portability.
-        rel = con.sql(sql_stripped)
-        return rel
+        # A relation for a query; None when the last statement returns no rows
+        # (CREATE TABLE AS, INSERT), on DuckDB 1.5 and 2.x alike.
+        rel = query_relation(con, sql_stripped)
     except Exception as e:
         # Try to be helpful if the error hints at missing tables
         msg = str(e)
@@ -221,6 +222,9 @@ def _execute_sql(con, sql: str):
                 "the SQL references the correct table/view names. Error: " + msg
             ) from e
         raise LocalProviderError("SQL execution failed: " + msg) from e
+    if rel is None:
+        raise LocalProviderError(NO_ROWS_TO_WRITE)
+    return rel
 
 
 def _write_output(rel, outputs: Dict[str, Any], dry_run: bool) -> Tuple[int, Optional[str]]:
@@ -243,7 +247,7 @@ def _write_output(rel, outputs: Dict[str, Any], dry_run: bool) -> Tuple[int, Opt
     if dry_run:
         # Estimate count without writing
         try:
-            cnt = rel.count("*").fetchone()[0]
+            cnt = one_row(rel.count("*"))[0]
         except Exception as e:
             LOGGER.warning(f"Failed to count rows in dry run: {e}")
             cnt = -1
@@ -266,7 +270,13 @@ def _write_output(rel, outputs: Dict[str, Any], dry_run: bool) -> Tuple[int, Opt
 
             # Create a temp view and then COPY from it.
             tmp_view = "__fluid_tmp_out"
-            rel.create_view(tmp_view, replace=True)
+            try:
+                rel.create_view(tmp_view, replace=True)
+            except Exception as e:
+                # DuckDB 2.0 refuses a view over rows it already holds (a PIVOT,
+                # nextval(), RETURNING); the COPY below then fails too, and its
+                # pandas fallback writes the file.
+                LOGGER.debug(f"Failed to create temp view {tmp_view}: {e}")
             if mode == "append":
                 # Append parquet: create if not exists then append is not trivial.
                 # DuckDB supports COPY with APPEND (v0.10+). Try; else fallback.
@@ -309,7 +319,7 @@ def _write_output(rel, outputs: Dict[str, Any], dry_run: bool) -> Tuple[int, Opt
 
         # Count rows
         try:
-            cnt = rel.count("*").fetchone()[0]
+            cnt = one_row(rel.count("*"))[0]
         except Exception as e:
             LOGGER.warning(f"Failed to count output rows: {e}")
             cnt = -1

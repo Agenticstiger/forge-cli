@@ -65,7 +65,7 @@ YAML
 ( cd "$WORK/duckdb" && python -m fluid_build.cli apply --build ingest contract.fluid.yaml >/repo/.verify-logs/duckdb.out 2>&1 )
 state=$(run_state "$WORK/duckdb")
 [ -f "$WORK/duckdb/out/orders.parquet" ] \
-  && rows=$(python -c "import duckdb;print(duckdb.sql(\"select count(*) from '$WORK/duckdb/out/orders.parquet'\").fetchone()[0])" 2>/dev/null) \
+  && rows=$(python -c "import duckdb;print(duckdb.sql(\"select count(*) from '$WORK/duckdb/out/orders.parquet'\").fetchall()[0][0])" 2>/dev/null) \
   && [ "$rows" = "5" ] \
   && ok "5 rows landed in parquet (state=$state)" duckdb \
   || miss "duckdb state=$state rows=${rows:-?} err=$(run_error "$WORK/duckdb")" duckdb

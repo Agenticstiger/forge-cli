@@ -212,8 +212,8 @@ class SnowflakeDuckDBMock:
                 self.db_path, allow=DuckDBAllowlist.none(), config={"TimeZone": "UTC"}
             )
 
-            # Create standard Snowflake schemas if they don't exist
-            self._con.execute("CREATE SCHEMA IF NOT EXISTS INFORMATION_SCHEMA")
+            # Snowflake's PUBLIC schema. DuckDB has its own information_schema,
+            # and DuckDB 2.0 refuses to create one ("system catalog").
             self._con.execute("CREATE SCHEMA IF NOT EXISTS PUBLIC")
 
             self.logger.info(f"Connected to Snowflake mock at {self.db_path}")

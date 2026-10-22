@@ -39,6 +39,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fluid_build.observability.secret_redactor import redact_secret_text, redact_value
+from fluid_build.providers._duckdb_compat import (
+    NO_ROWS_TO_WRITE,
+    one_row,
+    query_relation,
+    relation_view,
+)
 from fluid_build.providers._duckdb_read import build_register_view_sql
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
@@ -845,9 +851,7 @@ class LocalProvider(BaseProvider):
             with_retry(_register_with_retry, logger=self.logger, max_attempts=3)
 
             # Get row count for reporting
-            rowcount = con.execute(f"SELECT COUNT(*) FROM {validate_ident(table_name)}").fetchone()[
-                0
-            ]
+            rowcount = one_row(con.execute(f"SELECT COUNT(*) FROM {validate_ident(table_name)}"))[0]
 
             self._log_info(
                 "local_load_data_complete",
@@ -936,7 +940,7 @@ class LocalProvider(BaseProvider):
         try:
             # Execute SQL with retry logic (handles transient DuckDB errors)
             def _execute_sql():
-                return con.sql(sql)
+                return query_relation(con, sql)
 
             rel = with_retry(_execute_sql, logger=self.logger, max_attempts=3)
 
@@ -957,6 +961,10 @@ class LocalProvider(BaseProvider):
             # error (an error -> traceback -> frame -> error cycle would keep
             # the connection alive until the cyclic GC runs).
             raise self._sandbox_refusal(e) from e
+        if rel is None:
+            # The same on DuckDB 1.5 and 2.x (see query_relation); 1.5 used to
+            # fail below on ``None.write_csv``.
+            raise ValueError(NO_ROWS_TO_WRITE)
 
         # If an output_table is specified, persist the result as a DuckDB table
         # so downstream materialize/copy steps can reference it.
@@ -987,7 +995,7 @@ class LocalProvider(BaseProvider):
 
         rowcount = None
         try:
-            rowcount = rel.aggregate("count(*)").fetchone()[0]
+            rowcount = one_row(rel.aggregate("count(*)"))[0]
         except Exception:
             pass
 
@@ -1136,12 +1144,11 @@ class LocalProvider(BaseProvider):
         """
         from fluid_build.build_runners.duckdb.runner import _build_copy_destination
 
-        view = "__fluid_embedded_result"
-        rel.create_view(view, replace=True)
         # ``replace`` on the first ``{select}``, not ``str.format``: the quoted
         # URI follows it in the template and may itself hold braces.
         template = _build_copy_destination(uri, fmt)
-        con.execute(template.replace("{select}", f"SELECT * FROM {view}", 1))
+        with relation_view(con, rel, "__fluid_embedded_result") as view:
+            con.execute(template.replace("{select}", f"SELECT * FROM {view}", 1))
 
     # ------------------ COPY / materialize (helper) --------------------- #
 
@@ -1163,7 +1170,7 @@ class LocalProvider(BaseProvider):
                 try:
                     rel = con.sql(f"SELECT * FROM {validate_ident(source_table)}")
                     self._write_relation(rel, dst, fmt)
-                    rowcount = rel.count("*").fetchone()[0] if hasattr(rel, "count") else -1
+                    rowcount = one_row(rel.count("*"))[0] if hasattr(rel, "count") else -1
                     del rel
                 finally:
                     # Closed on every path (see _run_load_data_action).

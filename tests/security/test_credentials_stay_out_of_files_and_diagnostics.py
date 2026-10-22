@@ -383,6 +383,10 @@ class _FailingConnection:
     def sql(self, _sql):
         raise RuntimeError(self.message)
 
+    def extract_statements(self, _sql):
+        # On DuckDB 2.x query_relation parses the SQL first (_duckdb_compat).
+        raise RuntimeError(self.message)
+
 
 def test_no_local_provider_log_call_carries_a_raw_exception_text():
     """Every ``"error": str(e)`` the local provider logs goes through the shared

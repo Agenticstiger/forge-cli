@@ -17,9 +17,9 @@
 Introspects a live source and emits a deterministic Bronze contract for every
 discoverable stream. Supported source kinds:
 
-  - ``postgres://...``   — full schema/table introspection via DuckDB postgres_scan
-  - ``mysql://...``      — same via mysql_scan
-  - ``sqlite:///...``    — via sqlite_scan
+  - ``postgres://...``   — full schema/table introspection via DuckDB's postgres extension (ATTACH)
+  - ``mysql://...``      — same via the mysql extension
+  - ``sqlite:///...``    — via the sqlite extension
   - ``s3://`` / ``file://`` / ``https://`` — filesystem (CSV / Parquet / JSONL)
 
 The output is a list of ``contract.<id>.fluid.yaml`` files plus an optional

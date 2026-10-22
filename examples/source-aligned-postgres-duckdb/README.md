@@ -1,8 +1,8 @@
 # Source-aligned Postgres → DuckDB → Parquet
 
 A minimal source-aligned data product (`Bronze` / `SDP`) that acquires
-`public.orders` from a Postgres source via DuckDB's `postgres_scan` and
-lands it as Parquet.
+`public.orders` from a Postgres source through DuckDB's postgres extension
+(the source is attached read-only) and lands it as Parquet.
 
 **Vocabulary note.** v0.7.3 carries two interchangeable classifications:
 the medallion `metadata.layer` (`Bronze`/`Silver`/`Gold`) and the Data
@@ -34,7 +34,7 @@ The pipeline:
 
 ```
 fluid validate contract.fluid.yaml
-fluid apply --build ingest_orders contract.fluid.yaml
+fluid apply contract.fluid.yaml --mode amend-and-build --build-id ingest_orders
 ```
 
 `apply` detects `pattern: acquisition` + `engine: duckdb`, dispatches to
@@ -45,7 +45,10 @@ table to `out/orders.parquet`, and persists a run record under
 ## What this exercises
 
 - v0.7.3 `acquisition` build pattern + `duckdb` engine
-- Postgres source via `postgres_scan` (no Airbyte server needed)
+- Postgres source attached by DuckDB's postgres extension (no Airbyte server needed).
+  The attach is `READ_ONLY`, which refuses writes through DuckDB's catalog but
+  is no write barrier on the server; outside this demo, connect as a role that
+  can only read (for example one granted `pg_read_all_data`)
 - Parquet sink via `COPY (...) TO ... (FORMAT 'parquet')`
 - Run-record persistence + lock acquisition
 - Pre-land hook chain (`dlp_scan`, `quality_gate`) — non-blocking on this

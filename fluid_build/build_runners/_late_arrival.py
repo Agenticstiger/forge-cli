@@ -370,6 +370,7 @@ def split_late_events_in_duckdb(
     can call this too.
     """
     # ── input validation ────────────────────────────────────────────
+    from fluid_build.providers._duckdb_compat import first_row, one_row
     from fluid_build.providers._sql_safety import validate_ident
 
     validate_ident(source_relation)
@@ -380,9 +381,9 @@ def split_late_events_in_duckdb(
         return {"on_time": 0, "late": 0}
 
     # ── compute watermark ────────────────────────────────────────────
-    watermark_row = con.execute(
-        f"SELECT max({event_time_column}) FROM {source_relation}"
-    ).fetchone()
+    watermark_row = first_row(
+        con.execute(f"SELECT max({event_time_column}) FROM {source_relation}")
+    )
     watermark = watermark_row[0] if watermark_row else None
     if watermark is None:
         # Empty source — no enforcement possible.
@@ -401,9 +402,9 @@ def split_late_events_in_duckdb(
     )
 
     # ── append late rows to side-output ──────────────────────────────
-    late_count = con.execute(
-        f"SELECT count(*) FROM {source_relation} WHERE {threshold_expr}"
-    ).fetchone()[0]
+    late_count = one_row(
+        con.execute(f"SELECT count(*) FROM {source_relation} WHERE {threshold_expr}")
+    )[0]
     if late_count > 0:
         con.execute(
             f"INSERT INTO {side_output_relation} "
@@ -411,7 +412,7 @@ def split_late_events_in_duckdb(
         )
         con.execute(f"DELETE FROM {source_relation} WHERE {threshold_expr}")
 
-    on_time_count = con.execute(f"SELECT count(*) FROM {source_relation}").fetchone()[0]
+    on_time_count = one_row(con.execute(f"SELECT count(*) FROM {source_relation}"))[0]
 
     return {"on_time": int(on_time_count), "late": int(late_count)}
 

@@ -82,6 +82,34 @@ def test_health_check_succeeds(tmp_path):
     assert "latency_ms" in health
 
 
+def test_concurrent_calls_on_one_driver_all_succeed(tmp_path):
+    """DuckDB 2.0 refuses a second thread on one connection where 1.5 waited.
+    health_check and execute each take a cursor of their own, so concurrent
+    calls on one driver succeed on both versions."""
+    import threading
+
+    driver, _ = _build_duckdb_driver(tmp_path)
+    assert driver.health_check()["status"] == "ok"  # the connection now exists
+    errors = []
+
+    def work():
+        try:
+            for _ in range(20):
+                health = driver.health_check()
+                if health["status"] != "ok":
+                    errors.append(health["detail"])
+                driver.sample(limit=1)
+        except Exception as exc:  # noqa: BLE001 - collected for the assert
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=work) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+
+
 def test_sample_returns_three_rows(tmp_path):
     driver, _ = _build_duckdb_driver(tmp_path)
     result = driver.sample(limit=10)
