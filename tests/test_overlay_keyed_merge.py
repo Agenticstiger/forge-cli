@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
@@ -397,6 +398,21 @@ class TestCollectOverlayWarnings:
             pass
         assert _OVERLAY_WARNING_SINK.get() is None
 
+    def test_a_block_that_raises_logs_what_it_took(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Its caller reports the warnings only when the block completes: a
+        # patch retargeted before another entry failed the merge was lost.
+        from fluid_build.loader import collect_overlay_warnings
+
+        def merge_then_fail() -> None:
+            with collect_overlay_warnings():
+                _merge(_base("0.7.5"), PROD)
+                raise OverlayMergeError("the next list failed")
+
+        caplog.set_level(logging.WARNING, logger="fluid.loader")
+        with pytest.raises(OverlayMergeError, match="the next list failed"):
+            merge_then_fail()
+        assert _events(caplog) == ["overlay_patch_retargeted"]
+
 
 def _write_product(tmp_path: Path, version: str, overlay: Dict[str, Any]) -> None:
     contract = {
@@ -517,6 +533,207 @@ class TestValidateStrict:
         _write_product(tmp_path, "0.7.6", overlay)
         result = _validate(tmp_path, "--strict")
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+# A bundle is frozen: `fluid validate <bundle>.tgz` never merges the overlay
+# again, so it cannot see a patch the merge retargeted. `fluid bundle --env`
+# records the warning in the bundle's MANIFEST and validate reads it from
+# there. Pipeline stage 2 runs exactly `fluid validate <bundle> --env <env>
+# --strict`.
+
+
+def _fluid(cwd: Path, *argv: str) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(
+        [sys.executable, "-m", "fluid_build.cli", *argv],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        env=_cli_env(),
+    )
+
+
+def _bundle(tmp_path: Path) -> "subprocess.CompletedProcess[str]":
+    argv = ["contract.fluid.yaml", "--env", "prod", "--format", "tgz", "--out", "b.tgz"]
+    built = _fluid(tmp_path, "bundle", *argv)
+    assert built.returncode == 0, built.stdout + built.stderr
+    return built
+
+
+def _validate_bundle(tmp_path: Path, *argv: str) -> "subprocess.CompletedProcess[str]":
+    return _fluid(tmp_path, "validate", "b.tgz", "--env", "prod", "--offline", *argv)
+
+
+def _manifest_source(tgz: Path) -> Dict[str, Any]:
+    with tarfile.open(tgz, "r:gz") as tar:
+        member = tar.extractfile("MANIFEST.json")
+        assert member is not None
+        return json.loads(member.read().decode("utf-8"))["source"]
+
+
+@pytest.fixture(scope="module")
+def retargeted_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A bundle ``fluid bundle --env prod`` built from a positional 0.7.5 overlay."""
+    path = tmp_path_factory.mktemp("retargeted")
+    _write_product(path, "0.7.5", PROD_BY_POSITION)
+    _bundle(path)
+    return path
+
+
+class TestValidateBundleStrict:
+    def test_the_bundle_records_it_and_says_it_once(self, tmp_path: Path) -> None:
+        _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+        built = _bundle(tmp_path)
+        out = built.stdout + built.stderr
+        # Said by the bundle command, not also logged by the loader.
+        assert out.count("overlay_patch_retargeted") == 1
+        assert "overlay warnings: 1 recorded in the bundle" in out
+        recorded = _manifest_source(tmp_path / "b.tgz")["overlayWarnings"]
+        assert [w.split(":")[0] for w in recorded] == ["overlay_patch_retargeted"]
+        assert "the overlay's builds[1] names id transform but patches the base's builds[1], " in (
+            recorded[0]
+        )
+
+    def test_the_retargeted_patch_is_a_warning(self, retargeted_bundle: Path) -> None:
+        result = _validate_bundle(retargeted_bundle)
+        assert result.returncode == 0, result.stdout + result.stderr
+        # Listed although the bundle passes, as a contract file lists it.
+        assert (
+            "[warning] overlay: MANIFEST.json: overlay_patch_retargeted: in "
+            "network.service-instances, the overlay's builds[1] names id transform"
+        ) in " ".join(result.stdout.split())
+
+    def test_strict_fails_on_it_and_says_why(self, retargeted_bundle: Path) -> None:
+        result = _validate_bundle(retargeted_bundle, "--strict")
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "overlay_patch_retargeted: in network.service-instances" in result.stdout
+        assert "Validation failed: warnings treated as errors (--strict)" in result.stdout
+
+    def test_quiet_still_shows_it(self, retargeted_bundle: Path) -> None:
+        result = _validate_bundle(retargeted_bundle, "--quiet")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.startswith(
+            "WARNING: overlay: MANIFEST.json: overlay_patch_retargeted: in "
+        )
+        assert (result.stdout + result.stderr).count("overlay_patch_retargeted") == 1
+
+    def test_quiet_strict_names_it_as_the_error(self, retargeted_bundle: Path) -> None:
+        result = _validate_bundle(retargeted_bundle, "--quiet", "--strict")
+        assert result.returncode == 1
+        assert result.stdout.startswith(
+            "ERROR (--strict): overlay: MANIFEST.json: overlay_patch_retargeted: in "
+        )
+        assert (result.stdout + result.stderr).count("overlay_patch_retargeted") == 1
+
+    def test_strict_json_lists_it(self, retargeted_bundle: Path) -> None:
+        result = _validate_bundle(retargeted_bundle, "--strict", "--format", "json")
+        assert result.returncode == 1
+        report = json.loads(result.stdout)
+        assert report["status"] == "fail"
+        assert [
+            (i["severity"], i["file"], i["code"], i["message"].split(":")[0])
+            for i in report["issues"]
+        ] == [("warning", "MANIFEST.json", "OVERLAY-WARNING", "overlay_patch_retargeted")]
+
+    def test_quiet_strict_names_it_beside_other_errors(self, tmp_path: Path) -> None:
+        # --quiet printed nothing for a bundle, so --strict named the warning
+        # as the error and hid the real one.
+        _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+        contract = yaml.safe_load((tmp_path / "contract.fluid.yaml").read_text("utf-8"))
+        contract["bogusTopLevel"] = 1
+        (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(contract), "utf-8")
+        _bundle(tmp_path)
+        result = _validate_bundle(tmp_path, "--quiet", "--strict")
+        assert result.returncode == 1
+        lines = result.stdout.splitlines()
+        assert any(
+            line.startswith("ERROR: json-schema: contract.resolved.yaml: ")
+            and "bogusTopLevel" in line
+            for line in lines
+        ), result.stdout
+        assert any(
+            line.startswith("ERROR (--strict): overlay: MANIFEST.json: overlay_patch_retargeted")
+            for line in lines
+        ), result.stdout
+
+    def test_a_keyed_merge_records_nothing(self, tmp_path: Path) -> None:
+        _write_product(tmp_path, "0.7.6", {"builds": [{"id": "transform", "description": "8"}]})
+        _bundle(tmp_path)
+        assert "overlayWarnings" not in _manifest_source(tmp_path / "b.tgz")
+        result = _validate_bundle(tmp_path, "--strict")
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_a_merge_that_then_fails_still_names_the_retargeted_patch(self, tmp_path: Path) -> None:
+        # Two defects in one overlay: a patch retargeted in builds (whose ids
+        # repeat, so they merge by position), then an exposes entry with no id.
+        _write_product(tmp_path, "0.7.6", {})
+        contract = yaml.safe_load((tmp_path / "contract.fluid.yaml").read_text("utf-8"))
+        contract["builds"][0]["id"] = "ingest"
+        second = copy.deepcopy(contract["exposes"][0])
+        second["exposeId"] = "service_instances_v2"
+        contract["exposes"].append(second)
+        (tmp_path / "contract.fluid.yaml").write_text(yaml.safe_dump(contract), "utf-8")
+        overlay = dict(PROD_BY_POSITION, exposes=[{"description": "no exposeId"}])
+        (tmp_path / "overlays" / "prod.yaml").write_text(yaml.safe_dump(overlay), "utf-8")
+        argv = ["contract.fluid.yaml", "--env", "prod", "--format", "tgz", "--out", "b.tgz"]
+        built = _fluid(tmp_path, "bundle", *argv)
+        out = built.stdout + built.stderr
+        assert built.returncode == 1, out
+        assert "exposes[0] names no exposeId" in out
+        assert out.count("overlay_patch_retargeted") == 1
+
+    def test_an_edited_record_cannot_drive_the_terminal(self, tmp_path: Path) -> None:
+        # The record is outside the merkle root: editing it keeps the digest.
+        # A lone surrogate made validate crash before writing --report.
+        from fluid_build.forge.core.bundle import write_tgz
+
+        _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+        _bundle(tmp_path)
+        files: Dict[str, bytes] = {}
+        with tarfile.open(tmp_path / "b.tgz", "r:gz") as tar:
+            for member in tar.getmembers():
+                handle = tar.extractfile(member)
+                if handle is not None:
+                    files[member.name] = handle.read()
+        manifest = json.loads(files["MANIFEST.json"])
+        manifest["source"]["overlayWarnings"] = ["x\x1b[1A\x1b[2K\n✅ forged \ud800"]
+        files["MANIFEST.json"] = json.dumps(manifest).encode("ascii")
+        write_tgz(tmp_path / "b.tgz", files)
+        result = _validate_bundle(tmp_path, "--report", "r.json")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "\x1b" not in result.stdout
+        assert "x\\x1b[1A\\x1b[2K\\n✅ forged \\ud800" in result.stdout
+        issues = json.loads((tmp_path / "r.json").read_text("utf-8"))["issues"]
+        assert [i["code"] for i in issues] == ["OVERLAY-WARNING"]
+
+    def test_a_bundle_that_records_none_still_validates(self, tmp_path: Path) -> None:
+        # Bundles built before the record existed carry no overlayWarnings:
+        # none recorded, whatever the overlay did.
+        from fluid_build.cli.bundle import bundle_contract_id, materialize_contract
+        from fluid_build.forge.core.bundle import build_bundle_tgz, make_bundle_source
+
+        _write_product(tmp_path, "0.7.5", PROD_BY_POSITION)
+        contract = tmp_path / "contract.fluid.yaml"
+        compiled, overlay_path = materialize_contract(contract, "prod", logging.getLogger("t"))
+        out = tmp_path / "b.tgz"
+        source = make_bundle_source(contract, out, env="prod", overlay_path=overlay_path)
+        build_bundle_tgz(compiled, out, contract_id=bundle_contract_id(compiled), source=source)
+        assert "overlayWarnings" not in _manifest_source(out)
+        result = _validate_bundle(tmp_path, "--strict")
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_a_bundle_reads_back_only_the_warnings_it_can_print() -> None:
+    # The source block is outside the merkle root: a hint, read defensively.
+    from fluid_build.forge.core.bundle import bundle_overlay_warnings
+
+    assert bundle_overlay_warnings(None) == []
+    assert bundle_overlay_warnings({"env": "prod"}) == []
+    assert bundle_overlay_warnings({"overlayWarnings": "overlay_patch_retargeted: x"}) == []
+    recorded = {"overlayWarnings": ["overlay_patch_retargeted: a", 1, "", None, {"m": 1}, "b"]}
+    assert bundle_overlay_warnings(recorded) == ["overlay_patch_retargeted: a", "b"]
+    # Printable text is kept as written; anything else is escaped as repr writes it.
+    edited = {"overlayWarnings": ["é [/] a\x1b[2Kb\nc\ud800\u202e\t"]}
+    assert bundle_overlay_warnings(edited) == ["é [/] a\\x1b[2Kb\\nc\\ud800\\u202e\\t"]
 
 
 def test_workspace_validate_strict_fails_on_it(tmp_path: Path) -> None:

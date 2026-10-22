@@ -37,12 +37,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as an "Environment overlay" row, `fluid validate --quiet` as a `WARNING:` line), and the
   loader no longer also logs it there. Put the overlay's entries in the base's order, or
   set `fluidVersion: "0.7.6"` with a unique id on every base entry, so overlays patch by
-  id. `overlay_entry_added` stays a log line and does not fail `--strict`. `fluid validate
-  <bundle>.tgz` does not see the warning: `fluid bundle --env` merged the overlay before,
-  so validate the contract file with `--env`.
+  id. `overlay_entry_added` stays a log line and does not fail `--strict`. A bundle is
+  never re-overlaid, so `fluid bundle --env --format tgz` records the warning in the
+  bundle's MANIFEST (`source.overlayWarnings`) and says how many it recorded; `fluid
+  validate <bundle>.tgz` lists it, and under `--strict`, which stage 2 of the generated
+  pipelines runs, fails on it. A bundle built before this change records none and passes
+  as before: rebuild it to have it checked. `fluid contract-validation` and `fluid test`
+  do not read the record, so on a bundle they miss the warning: run them on the contract
+  file with `--env`.
 - `fluid validate --strict` now says `Validation failed: warnings treated as errors
   (--strict)` when warnings alone fail it, after a summary that reads valid; with
   `--quiet` it prints each such warning as `ERROR (--strict): <warning>`.
+- `fluid validate <bundle>.tgz` now prints what it prints for a contract file: a bundle
+  that passes lists its warnings, not only their count; `--quiet`, which printed nothing,
+  prints each error as `ERROR: <finding>`, a recorded overlay warning as `WARNING:
+  <finding>`, and under `--strict` each warning as `ERROR (--strict): <finding>`; and
+  `--strict` failing on warnings alone says so, as above.
 - A product whose every build becomes `continuous` (or runs outside forge-cli) gets no
   `schedule/` artifacts, so pipeline stage 11 skips `fluid schedule-sync`, and a DAG
   deployed for it earlier stays in the scheduler: remove that DAG by hand.

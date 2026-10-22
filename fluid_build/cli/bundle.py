@@ -42,7 +42,7 @@ try:
 except Exception:  # pragma: no cover
     yaml = None
 
-from ..loader import RefResolutionError, compile_contract, load_with_overlay
+from ..loader import RefResolutionError, collect_overlay_warnings, compile_contract
 from ..observability.tracing import traced_stage
 
 COMMAND = "bundle"
@@ -386,10 +386,14 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # overlay on top when requested, with the same loud notice as every
         # other stage when ``--env`` names an overlay that does not exist: a
         # bundle is the root of trust for stages 2-9, so a silently
-        # un-overlaid bundle poisons every one of them.
-        compiled, overlay_path = materialize_contract(
-            contract_path, env, logger, compile_logger=_compile_logger
-        )
+        # un-overlaid bundle poisons every one of them. A positional overlay
+        # patch that lands on another entry is collected, not only logged: a
+        # bundle is never re-overlaid, so the tgz MANIFEST records it for
+        # ``fluid validate <bundle> --strict`` (pipeline stage 2) to fail on.
+        with collect_overlay_warnings() as overlay_warnings:
+            compiled, overlay_path = materialize_contract(
+                contract_path, env, logger, compile_logger=_compile_logger
+            )
 
     except FileNotFoundError as e:
         sys.stderr.write(f"❌ File not found: {e}\n")
@@ -400,6 +404,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     except Exception as e:
         sys.stderr.write(f"❌ Compilation failed: {e}\n")
         return 1
+
+    # The loader logs a warning the block took at DEBUG only: say it here, once.
+    for warning in overlay_warnings:
+        logger.warning("%s", warning.message, extra={"event": warning.event})
 
     # Feedback: tell the user if the contract had nothing to bundle
     # (suppressed for --format tgz — the tgz has fragments regardless of refs)
@@ -436,10 +444,16 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # anchored at the contract's directory, as it is when the contract
         # itself is the input) and which environment was applied (so
         # ``plan`` / ``apply`` / ``verify --env X`` can refuse a bundle built
-        # for a different one). Recorded in MANIFEST.json, outside the
-        # merkle root: the digest still names the contract alone.
+        # for a different one), with the overlay warnings the merge raised (so
+        # ``fluid validate <bundle> --strict`` fails on them). Recorded in
+        # MANIFEST.json, outside the merkle root: the digest still names the
+        # contract alone.
         source = make_bundle_source(
-            Path(contract_path), Path(out), env=env, overlay_path=overlay_path
+            Path(contract_path),
+            Path(out),
+            env=env,
+            overlay_path=overlay_path,
+            overlay_warnings=[warning.message for warning in overlay_warnings],
         )
         try:
             digest = build_bundle_tgz(
@@ -457,6 +471,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         if env:
             applied = source.get("overlay") or "none (base contract)"
             sys.stderr.write(f"   env: {env} (overlay: {applied})\n")
+        if overlay_warnings:
+            sys.stderr.write(
+                f"   overlay warnings: {len(overlay_warnings)} recorded in the bundle; "
+                "`fluid validate --strict` fails on it\n"
+            )
 
         # ── Optional: Sigstore cosign keyless signing ─────────────────
         # Runs after tgz emission so the digest is already stable. A
