@@ -405,7 +405,7 @@ def _postgres_attach_sql(connection: Dict[str, Any], *, alias: str) -> str:
     source cannot be written through it (``postgres_execute`` and ``INSERT`` are
     refused). The DSN is the shared :func:`build_libpq_dsn` one (control
     characters and a non-numeric port refused), one SQL literal at the boundary.
-    ``SECRET <alias>`` names the empty secret :func:`_postgres_secret_sql` makes.
+    ``SECRET <alias>`` names the empty secret :func:`_empty_secret_sql` makes.
     """
     alias = validate_ident(alias)
     dsn = build_libpq_dsn(connection, database_key="dbname")
@@ -415,15 +415,37 @@ def _postgres_attach_sql(connection: Dict[str, Any], *, alias: str) -> str:
     )
 
 
-def _postgres_secret_sql(*, alias: str) -> str:
-    """``CREATE TEMPORARY SECRET <alias> (TYPE postgres)``: empty, the DSN carries the credentials.
+def _empty_secret_sql(secret_type: str, *, alias: str) -> str:
+    """``CREATE TEMPORARY SECRET <alias> (TYPE postgres|mysql)``: empty, the DSN carries the credentials.
 
-    Without a secret named in the ``ATTACH`` the postgres extension looks for a
-    default one in every secret storage, and the persistent storage the sandbox
-    turns off answers ``Unknown secret storage found: 'local_file'`` (DuckDB 1.5
-    and 2.0 alike). A temporary secret lives in memory, on this connection only.
+    Without a secret named in the ``ATTACH``, the postgres and mysql extensions
+    look for a default one in every secret storage, and the persistent storage
+    the sandbox turns off answers ``Unknown secret storage found: 'local_file'``
+    (DuckDB 1.5 and 2.0 alike), so no postgres or mysql source could attach. A
+    temporary secret lives in memory, on this connection only.
     """
-    return f"CREATE TEMPORARY SECRET {validate_ident(alias)} (TYPE postgres)"
+    if secret_type not in ("postgres", "mysql"):
+        raise ValueError(f"no attach secret for a {secret_type!r} source")
+    return f"CREATE TEMPORARY SECRET {validate_ident(alias)} (TYPE {secret_type})"
+
+
+def _mysql_attach_sql(connection: Dict[str, Any], *, alias: str) -> str:
+    """``ATTACH '<mysql dsn>' AS <alias> (TYPE mysql, SECRET <alias>, READ_ONLY)``.
+
+    mysql_scanner's own DSN syntax, not libpq's: libpq quoting let a value with
+    a space add ``socket=`` or ``ssl_key=``, and a ``?`` turn the rest into URI
+    options. :func:`build_mysql_dsn` double-quotes each value and refuses a
+    ``?``, a ``/`` in the host and a control character. The extension type is
+    ``mysql`` for a MariaDB upstream too. ``SECRET <alias>`` names the empty
+    secret :func:`_empty_secret_sql` makes; ``READ_ONLY``, as a postgres source
+    is attached, since acquisition only reads.
+    """
+    alias = validate_ident(alias)
+    dsn = build_mysql_dsn(connection, database_key="database")
+    return (
+        f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} "
+        f"(TYPE mysql, SECRET {alias}, READ_ONLY)"
+    )
 
 
 def _build_select_for_postgres(stream: str, *, alias: str) -> str:
@@ -793,9 +815,10 @@ class DuckdbRunner:
         / ``sqlite_<build_id>``) so two sources in the same contract /
         interpreter don't collide on a hardcoded name.
 
-        Best-effort: if the connection DSN is malformed or the upstream
-        is unreachable, the ATTACH raises and the runner surfaces the
-        error in the per-stream try/except, with the password masked.
+        A connection block the DSN builder refuses, a ``secretRef`` that does
+        not resolve, or an upstream that cannot be reached raises a
+        :class:`_SourceAttachError` (the password masked), which fails the run
+        with that reason and a run record (``_execute``).
 
         A sqlite file is confined to :func:`_declared_roots` plus the
         operator's ``FLUID_DUCKDB_ALLOWED_DIRS`` first, and refused with
@@ -803,31 +826,29 @@ class DuckdbRunner:
         made before the lock.
         """
         kind = ctx.source.kind
-        if kind == "postgres":
-            # Resolve secretRef → password, as the mysql branch does; an inline
-            # literal still wins.
-            conn = resolve_connection_secrets(dict(ctx.source.connection.raw))
-            alias = _postgres_alias_for_build(ctx.build_id)
-            attach_sql = _postgres_attach_sql(conn, alias=alias)  # validates first
-            con.execute(_postgres_secret_sql(alias=alias))
+        if kind in ("postgres", "mysql", "mariadb"):
+            import duckdb
+
+            postgres = kind == "postgres"
+            try:
+                # Resolve secretRef → password before the DSN is built; an
+                # inline literal still wins.
+                conn = resolve_connection_secrets(dict(ctx.source.connection.raw))
+                if postgres:
+                    alias = _postgres_alias_for_build(ctx.build_id)
+                    attach_sql = _postgres_attach_sql(conn, alias=alias)  # validates first
+                else:
+                    alias = _mysql_alias_for_build(ctx.build_id)
+                    attach_sql = _mysql_attach_sql(conn, alias=alias)  # validates first
+                con.execute(_empty_secret_sql("postgres" if postgres else "mysql", alias=alias))
+            except ValueError as exc:
+                # A DSN value the builder refuses, or a secretRef that does not
+                # resolve: the message names the field or the reference, never
+                # a value of the connection's.
+                raise _SourceSetupError(str(exc)) from exc
+            except duckdb.Error as exc:  # the extension did not load
+                raise _SourceAttachError(str(exc)) from exc
             _attach_with_password_masked(con, attach_sql, conn.get("password"))
-        elif kind in ("mysql", "mariadb"):
-            # Resolve secretRef → password before build_mysql_dsn reads
-            # connection.get("password"). Inline literal values still win.
-            conn = resolve_connection_secrets(dict(ctx.source.connection.raw))
-            # mysql_scanner's own DSN syntax, not libpq's: libpq quoting let a
-            # value with a space add socket= or ssl_key=, and a '?' turn the
-            # rest into URI options. build_mysql_dsn double-quotes each value
-            # and refuses a '?', a '/' in the host and a control character.
-            dsn = build_mysql_dsn(conn, database_key="database")
-            alias = _mysql_alias_for_build(ctx.build_id)
-            # mysql extension supports both mysql:// and mariadb:// upstreams;
-            # the duckdb extension type literal is always ``mysql``.
-            _attach_with_password_masked(
-                con,
-                f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE mysql)",
-                conn.get("password"),
-            )
         elif kind == "sqlite":
             conn = dict(ctx.source.connection.raw)
             # SQLite uses a path, not a libpq-style DSN. The path comes
@@ -849,6 +870,10 @@ class DuckdbRunner:
 
 class _SourceAttachError(RuntimeError):
     """The source database could not be attached; the message holds no password."""
+
+
+class _SourceSetupError(_SourceAttachError, ValueError):
+    """The source's connection block was refused before any attach was tried."""
 
 
 def _attach_with_password_masked(con: Any, statement: str, password: Any) -> None:

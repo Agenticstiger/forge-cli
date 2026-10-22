@@ -50,8 +50,8 @@ def _attach_on(con: Any, raw: Dict[str, Any], kind: str = "mysql") -> None:
     runner._attach_external_databases(con, ctx)  # type: ignore[arg-type]
 
 
-def _attach(raw: Dict[str, Any], kind: str = "mysql") -> List[str]:
-    """Run the runner's mysql attach on a recording connection; return the SQL run."""
+def _executed(raw: Dict[str, Any], kind: str = "mysql") -> List[str]:
+    """Run the runner's attach on a recording connection; return every statement run."""
     seen: List[str] = []
 
     class _Con:
@@ -60,6 +60,11 @@ def _attach(raw: Dict[str, Any], kind: str = "mysql") -> List[str]:
 
     _attach_on(_Con(), raw, kind)
     return seen
+
+
+def _attach(raw: Dict[str, Any], kind: str = "mysql") -> List[str]:
+    """The ``ATTACH`` statements :func:`_executed` saw (the empty secret left out)."""
+    return [sql for sql in _executed(raw, kind) if not sql.startswith("CREATE TEMPORARY SECRET")]
 
 
 def _dsn_of(attach_sql: str) -> str:
@@ -124,7 +129,15 @@ class TestEveryValueReachesTheServerExactly:
     def test_a_plain_connection(self):
         (sql,) = _attach(_BASE)
         assert dict(_parse_mysql_dsn(_dsn_of(sql))) == _BASE
-        assert sql.endswith(" AS mysql_b1 (TYPE mysql)")
+        assert sql.endswith(" AS mysql_b1 (TYPE mysql, SECRET mysql_b1, READ_ONLY)")
+
+    def test_an_empty_temporary_secret_is_named_in_the_attach(self):
+        """Without it the extension looks for a default secret in the persistent
+        storage the sandbox turned off: ``Unknown secret storage found:
+        'local_file'``, and no mysql source attached at all."""
+        secret, sql = _executed(_BASE)
+        assert secret == "CREATE TEMPORARY SECRET mysql_b1 (TYPE mysql)"
+        assert sql.startswith("ATTACH '")
 
 
 class TestRefusedBeforeTheAttach:
@@ -209,7 +222,7 @@ class TestPostgresAttach:
     attaches mysql and sqlite."""
 
     def test_the_source_is_attached_read_only_under_a_per_build_alias(self):
-        secret, sql = _attach(dict(_BASE, port="5432"), kind="postgres")
+        secret, sql = _executed(dict(_BASE, port="5432"), kind="postgres")
         # An empty temporary secret: the sandbox's disabled persistent storage
         # otherwise fails the ATTACH's default-secret lookup.
         assert secret == "CREATE TEMPORARY SECRET postgres_b1 (TYPE postgres)"
@@ -233,8 +246,20 @@ class TestPostgresAttach:
         monkeypatch.setenv("RUNNER_FAKE_PG_SECRET", "runner-pg-ref-pw-3J")
         raw = {k: v for k, v in _BASE.items() if k != "password"}
         raw["secretRef"] = "env://RUNNER_FAKE_PG_SECRET"  # pragma: allowlist secret
-        _secret, sql = _attach(raw, kind="postgres")
+        (sql,) = _attach(raw, kind="postgres")
         assert "password=runner-pg-ref-pw-3J" in _dsn_of(sql)
+
+    @pytest.mark.parametrize("kind", ["postgres", "mysql"])
+    def test_a_secret_ref_that_does_not_resolve_fails_the_source_setup(self, kind, monkeypatch):
+        from fluid_build.build_runners.duckdb.runner import _SourceAttachError
+
+        monkeypatch.delenv("RUNNER_FAKE_UNSET_SECRET", raising=False)
+        raw = {k: v for k, v in _BASE.items() if k != "password"}
+        raw["secretRef"] = "env://RUNNER_FAKE_UNSET_SECRET"  # pragma: allowlist secret
+        with pytest.raises(_SourceAttachError, match="RUNNER_FAKE_UNSET_SECRET") as caught:
+            _executed(raw, kind=kind)
+        # Still a ValueError for callers that catch the builder's refusal.
+        assert isinstance(caught.value, ValueError)
 
     def test_a_connect_error_has_the_password_masked(self):
         class _Con:
@@ -262,6 +287,8 @@ class TestConnectErrorHasThePasswordMasked:
     def _failing_con() -> Any:
         class _Con:
             def execute(self, sql: str, *_a: Any, **_k: Any) -> None:
+                if not sql.startswith("ATTACH"):
+                    return
                 # What mysql_scanner 1.5.6 says, quoting the DSN and the SQL.
                 raise RuntimeError(
                     "IO Error: Failed to connect to MySQL database with parameters "

@@ -76,14 +76,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps its connection busy until it is read to the end, which fails the next step on
   that connection. Every DuckDB result is now read to the end, the same way on 1.5.x and
   2.x.
-- **DuckDB 2.0: a Postgres source.** A DuckDB acquisition build reading Postgres failed
-  on DuckDB 2.0 (`Table Function with name postgres_scan does not exist!`): the postgres
-  extension dropped `postgres_scan`. The source is now attached read-only before the
-  sandbox locks, as MySQL and SQLite sources are, and read as `<alias>.<schema>.<table>`
-  on 1.5.x and 2.x; its `connection.secretRef` is resolved into the password, as a MySQL
-  source's already was. A Postgres or MySQL source the runner cannot connect to now fails
-  the build with the connect error, its password masked, and writes a run record; it
-  used to end `fluid apply` with `Unexpected error during execution`.
+- **DuckDB 2.0: Postgres and MySQL sources.** A DuckDB acquisition build reading
+  Postgres failed on DuckDB 2.0 (`Table Function with name postgres_scan does not
+  exist!`): the postgres extension dropped `postgres_scan`. A MySQL or MariaDB source
+  failed on every DuckDB version, before connecting (`Unknown secret storage found:
+  'local_file'`): its `ATTACH` looked for a default secret in the persistent storage the
+  sandbox turns off. Both are now attached read-only before the sandbox locks, each with
+  an empty temporary secret named in the `ATTACH` (the DSN carries the credentials), and
+  read as `<alias>.<schema>.<table>` on 1.5.x and 2.x; a Postgres source's
+  `connection.secretRef` is resolved into the password, as a MySQL source's already was.
+  A source the runner cannot attach (unreachable, refused, a `secretRef` that does not
+  resolve) now fails the build with the reason, its password masked, and writes a run
+  record; it used to end `fluid apply` with `Unexpected error during execution`.
 - A local SQL action, or a legacy `fluid_build.contract_tests` action, whose SQL ends in
   a statement that returns no rows (`CREATE TABLE ... AS`, an `INSERT` without
   `RETURNING`) now fails with a message saying to write just the `SELECT`. DuckDB 1.5

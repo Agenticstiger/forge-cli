@@ -212,33 +212,42 @@ class TestDuckdbFilesystemFailures:
 # ── postgres, no server ───────────────────────────────────────────────────
 
 
+_CONNECT_FAILED = {
+    "postgres": "Unable to connect to Postgres",
+    "mysql": "Failed to connect to MySQL",
+}
+
+
 @pytest.mark.parametrize("with_password", [True, False], ids=["password", "no-password"])
-def test_an_unreachable_postgres_source_fails_the_build_not_the_process(
-    tmp_path, caplog, with_password
+@pytest.mark.parametrize("kind", ["postgres", "mysql"])
+def test_an_unreachable_database_source_fails_the_build_not_the_process(
+    tmp_path, caplog, kind, with_password
 ):
     """The source is attached as the run's connection opens (DuckDB 2.0 has no
     ``postgres_scan``), so its connect error is reported as the build's failure,
-    with the password masked, as a failing stream was before."""
+    with the password masked. The error is a connection failure: not a function
+    DuckDB 2.0 lacks, nor the "Unknown secret storage found: 'local_file'" that
+    an ATTACH without a named secret hits under the sandbox."""
     duckdb = pytest.importorskip("duckdb")
     try:
         probe = duckdb.connect()
-        probe.execute("INSTALL postgres; LOAD postgres")
+        probe.execute(f"INSTALL {kind}; LOAD {kind}")
         probe.close()
     except duckdb.Error:
-        pytest.skip("the postgres extension is not installable here (offline)")
-    password = "runner-unreachable-pg-pw-6T"  # pragma: allowlist secret
+        pytest.skip(f"the {kind} extension is not installable here (offline)")
+    password = "runner-unreachable-db-pw-6T"  # pragma: allowlist secret
     out_path = tmp_path / "orders.parquet"
     contract = {
         "fluidVersion": "0.7.3",
-        "id": "bronze.pg_orders",
+        "id": "bronze.db_orders",
         "builds": [
             {
-                "id": "ingest_pg",
+                "id": "ingest_db",
                 "pattern": "acquisition",
                 "engine": "duckdb",
                 "properties": {
                     "source": {
-                        "kind": "postgres",
+                        "kind": kind,
                         "connection": {
                             "host": "127.0.0.1",
                             "port": 9,  # discard: nothing listens
@@ -247,7 +256,7 @@ def test_an_unreachable_postgres_source_fails_the_build_not_the_process(
                             "database": "app",
                         },
                         "mode": "full_refresh",
-                        "streams": ["public.orders"],
+                        "streams": ["app.orders"],
                     },
                     "sink": {"format": "parquet"},
                 },
@@ -271,8 +280,7 @@ def test_an_unreachable_postgres_source_fails_the_build_not_the_process(
     rc = execute_duckdb_build(contract["builds"][0], contract, tmp_path, dry_run=False)
     assert rc == 1
     assert not out_path.exists()
-    # A connection failure, the source reached: not a function DuckDB 2.0 lacks.
-    assert "Unable to connect to Postgres" in caplog.text
+    assert _CONNECT_FAILED[kind] in caplog.text, caplog.text[-2000:]
     assert password not in caplog.text
     for written in tmp_path.rglob("*"):
         if written.is_file():
