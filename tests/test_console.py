@@ -19,6 +19,7 @@ from unittest.mock import patch
 from fluid_build.cli.console import (
     _redact_str,
     cprint,
+    cprint_literal,
     detail,
     error,
     heading,
@@ -77,6 +78,47 @@ class TestHelpers:
         captured = capsys.readouterr()
         assert "something broke" in captured.err
 
+    def test_error_prints_markup_shaped_text_literally(self, capsys):
+        # The ``[red]`` wrapper made a ``[/]`` raise MarkupError and ate ``[orders]``.
+        message = "[/] exposes[orders] ^[a-z0-9]+$ [bold]x[/bold] C:\\work\\"
+        error(message)
+        assert f"❌ {message}\n" in capsys.readouterr().err
+
+    def test_error_still_redacts_secrets(self, capsys):
+        error("connect failed [/] password=hunter2")
+        err = capsys.readouterr().err
+        assert "password=<redacted>" in err
+        assert "hunter2" not in err
+
+    def test_error_spells_out_terminal_control_characters(self, capsys, monkeypatch):
+        # A terminal: Rich writes its own colour codes, but none from the message.
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        error("A\x1b[2J\x1b]8;;http://evil.example/\x1b\\B \x9b31m\r\nnext\rover")
+        err = capsys.readouterr().err
+        assert "\x1b[2J" not in err and "\x1b]8;;" not in err and "\x9b" not in err
+        assert "A\\x1b[2J\\x1b]8;;http://evil.example/\\x1b\\B \\x9b31m" in err
+        # A CRLF still breaks the line; a lone CR, which would print over it, is spelled.
+        assert "\r" not in err and "next\\x0dover" in err
+
+    def test_error_keeps_a_crlf_line_break(self, capsys):
+        error("Validation failed\r\nsee line 2")
+        assert capsys.readouterr().err == "❌ Validation failed\nsee line 2\n"
+        with patch("fluid_build._console.RICH_AVAILABLE", False):
+            error("Validation failed\r\nsee line 2")
+        assert capsys.readouterr().err == "❌ Validation failed\nsee line 2\n"
+
+    def test_error_without_rich_spells_out_control_characters(self, capsys):
+        with patch("fluid_build._console.RICH_AVAILABLE", False):
+            error("deploy failed\r✅ all checks passed \x1b[2J")
+        assert capsys.readouterr().err == "❌ deploy failed\\x0d✅ all checks passed \\x1b[2J\n"
+
+    def test_error_redacts_a_secret_beside_a_control_character(self, capsys):
+        # A spelled control ends in a hex digit, which hid the key from the pattern.
+        error("PATH=/usr/bin\x00PASSWORD=hunter2\x00HOME=/root; token\x1f=abc123")
+        err = capsys.readouterr().err
+        assert "hunter2" not in err and "abc123" not in err
+        assert "\\x00PASSWORD=<redacted>" in err
+
     def test_heading(self, capsys):
         heading("My Section")
         captured = capsys.readouterr()
@@ -92,3 +134,20 @@ class TestHelpers:
         hint("try this")
         captured = capsys.readouterr()
         assert "try this" in captured.out
+
+
+class TestCprintLiteral:
+    def test_prints_data_as_written(self, capsys):
+        # Markup, emoji codes (``:x:``, the ``:b:`` in ``fe80::a:b:c``) and controls.
+        cprint_literal("exposes[orders] [/] :x: fe80::a:b:c C:\\work\\ \x1b[2J")
+        out = capsys.readouterr().out
+        assert "exposes[orders] [/] :x: fe80::a:b:c C:\\work\\ \\x1b[2J\n" in out
+
+    def test_still_redacts(self, capsys):
+        cprint_literal("dsn failed: user=bob\x00password=hunter2")
+        assert "hunter2" not in capsys.readouterr().out
+
+    def test_keeps_brackets_without_rich(self, capsys):
+        with patch("fluid_build._console.console", None):
+            cprint_literal("exposes[orders] [bold]x[/bold]")
+        assert capsys.readouterr().out == "exposes[orders] [bold]x[/bold]\n"

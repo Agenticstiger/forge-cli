@@ -511,9 +511,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise
 
         except Exception as e:  # noqa: BLE001
+            # The exception text is data, not markup, as in the CLIError branch
+            # above. Parsed as markup, an error quoting ``[/]`` raised
+            # ``MarkupError`` from this handler, and the outer fallback then
+            # died on the same text with a traceback. It is redacted too: that
+            # crash used to keep a secret beside a ``[/]`` off the screen.
+            from fluid_build._console import _redact_str, literal_text
+
             # Structured catch for provider errors (before generic Exception)
             if ProviderError is not None and isinstance(e, ProviderError):
-                context.console.print(f"[red]❌ Provider error: {e}[/red]")
+                context.console.print(literal_text(_redact_str(f"❌ Provider error: {e}"), "red"))
                 cli.logger.log_safe(
                     "error",
                     "Provider error",
@@ -532,7 +539,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 1
 
             # Handle unexpected errors with enhanced context
-            context.console.print(f"[red]❌ Unexpected error: {e}[/red]")
+            context.console.print(literal_text(_redact_str(f"❌ Unexpected error: {e}"), "red"))
             cli.logger.log_safe(
                 "error",
                 "CLI unhandled exception",
@@ -548,7 +555,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 import traceback
 
                 context.console.print("\n[red]Debug traceback:[/red]")
-                context.console.print(traceback.format_exc())
+                context.console.print(literal_text(_redact_str(traceback.format_exc())))
 
             # Provide helpful guidance
             context.console.print("\n[yellow]💡 This appears to be an unexpected error.[/yellow]")

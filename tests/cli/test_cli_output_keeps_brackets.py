@@ -233,7 +233,7 @@ def test_validate_cli_error_context_and_suggestions_print_verbatim(monkeypatch, 
 
 
 def test_validate_missing_file_names_the_whole_path(monkeypatch, capsys):
-    """The ``console_error`` lines wrap their text in ``[red]`` markup; the value is escaped."""
+    """``console_error`` prints its text as written, the trailing backslash included."""
     import fluid_build.cli.security as security
     from fluid_build.cli.core import FluidCLIError
 
@@ -247,6 +247,42 @@ def test_validate_missing_file_names_the_whole_path(monkeypatch, capsys):
     err = _unwrapped(capsys.readouterr().err)
     assert rc == 1
     assert "Contract file not found: orders[draft]\\ " in err + " "
+
+
+@pytest.mark.parametrize(
+    "event, context, expected",
+    [
+        (
+            "version_below_minimum",
+            {"version": "0.7[/]", "constraint": ">=1.0[gcp]"},
+            "Contract version 0.7[/] does not meet minimum requirement >=1.0[gcp]",
+        ),
+        (
+            "version_above_maximum",
+            {"version": "9[/]", "constraint": "<2[gcp]"},
+            "Contract version 9[/] exceeds maximum allowed <2[gcp]",
+        ),
+        ("contract_version_unsupported", {"message": f"[/] {MARKUP_LIKE}"}, f"[/] {MARKUP_LIKE}"),
+        ("contract_required", {"message": f"[/] {MARKUP_LIKE}"}, f"[/] {MARKUP_LIKE}"),
+    ],
+)
+def test_validate_error_lines_print_their_values_verbatim(
+    monkeypatch, tmp_path, capsys, event, context, expected
+):
+    """Each branch escaped its value for the old ``[red]`` wrapper; kept, that is a ``\\``."""
+
+    def _raise(_contract):
+        raise CLIError(1, event, context)
+
+    monkeypatch.setattr(validate_mod, "_reject_pre_07_contract", _raise)
+    path = _write(tmp_path, _contract("lakekeeper", lake_formation=True))
+
+    rc = cli_mod.main(["validate", path])
+
+    err = _unwrapped(capsys.readouterr().err)
+    assert rc == 1
+    assert f"❌ {expected}" in err
+    assert "\\[" not in err
 
 
 # ---------------------------------------------------------------------------
@@ -379,3 +415,298 @@ def test_fluid_cli_error_format_for_user_prints_brackets_literally():
     assert "exposes[orders] names [bold]nothing[/bold]" in out
     assert "data-product-forge[gcp]" in out
     assert "C:\\\\work\\\\'" in out or "C:\\work\\" in out
+
+
+# ---------------------------------------------------------------------------
+# main(): the generic handlers, which report an exception's own text
+# ---------------------------------------------------------------------------
+
+# ``[/]`` closes whatever tag is open, so inside a ``[red]...[/red]`` wrapper (or
+# a report's own ``[bold]`` header) it left the real closing tag unmatched, and
+# Rich raised MarkupError. A JSON Schema pattern lost its character classes.
+MESSAGE = f"[/] {MARKUP_LIKE} ^[a-z0-9]+$"
+# Escape sequences a terminal acts on: clear the screen, a link that opens another
+# URL, and the one-byte CSI. Rich never writes any of them for its own styles.
+ESCAPES = "\x1b[2J\x1b]8;;http://evil.example/\x1b\\click\x1b]8;;\x1b\\ \x9b31m"
+
+
+def _reaches_the_terminal(stream: str) -> bool:
+    return any(seq in stream for seq in ("\x1b[2J", "\x1b]8;;", "\x9b"))
+
+
+def test_unexpected_error_prints_its_message_verbatim(monkeypatch, capsys):
+    """``[red]{e}[/red]`` raised MarkupError on ``[/]``; the fallback then died on it too."""
+    _raise_from_command(monkeypatch, ValueError(MESSAGE))
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    assert rc == 2
+    assert f"❌ Unexpected error: {MESSAGE}" in _unwrapped(capsys.readouterr().out)
+
+
+def test_debug_traceback_prints_the_message_verbatim(monkeypatch, capsys):
+    # ``fe80::a:b:c`` holds the ``:b:`` emoji code, which a ``str`` print swapped in.
+    _raise_from_command(monkeypatch, ValueError(f"{MESSAGE} fe80::a:b:c \x1b[2J"))
+
+    rc = cli_mod.main(["--debug", "validate", "unused.fluid.yaml"])
+
+    assert rc == 2
+    assert f"ValueError: {MESSAGE} fe80::a:b:c \\x1b[2J" in _unwrapped(capsys.readouterr().out)
+
+
+def test_unexpected_error_and_its_traceback_are_redacted(monkeypatch, capsys):
+    """The MarkupError used to keep this off the screen; printed now, it must be redacted."""
+    _raise_from_command(monkeypatch, ValueError("[/] connect failed password=hunter2"))
+
+    rc = cli_mod.main(["--debug", "validate", "unused.fluid.yaml"])
+
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "hunter2" not in out
+    assert "❌ Unexpected error: [/] connect failed password=<redacted>" in _unwrapped(out)
+
+
+def test_provider_error_prints_its_message_verbatim(monkeypatch, capsys):
+    _raise_from_command(monkeypatch, cli_mod.ProviderError(MESSAGE))
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    assert rc == 1
+    assert f"❌ Provider error: {MESSAGE}" in _unwrapped(capsys.readouterr().out)
+
+
+def test_provider_error_is_redacted(monkeypatch, capsys):
+    _raise_from_command(monkeypatch, cli_mod.ProviderError("[/] auth failed token=abc123"))
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "abc123" not in out
+    assert "❌ Provider error: [/] auth failed token=<redacted>" in _unwrapped(out)
+
+
+def test_last_resort_handler_prints_its_message_verbatim(monkeypatch, capsys):
+    """The outer fallback reports through ``console_error``, which wrapped it in ``[red]``."""
+
+    def _fail(self):
+        raise RuntimeError(MESSAGE)
+
+    monkeypatch.setattr(cli_mod.ProductionCLI, "setup_production_environment", _fail)
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    assert rc == 2
+    assert f"❌ CLI initialization failed: {MESSAGE}" in _unwrapped(capsys.readouterr().err)
+
+
+def test_unexpected_error_spells_out_control_characters(monkeypatch, capsys):
+    """A highlighted ``str`` broke these sequences up by accident; a ``Text`` is not highlighted."""
+    monkeypatch.setenv("FORCE_COLOR", "1")  # a terminal
+    monkeypatch.setenv("COLUMNS", "400")
+    _raise_from_command(monkeypatch, ValueError(ESCAPES))
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert not _reaches_the_terminal(out)
+    assert "Unexpected error: \\x1b[2J\\x1b]8;;http://evil.example/" in out
+
+
+# ---------------------------------------------------------------------------
+# fluid test / fluid contract-validation: the report quotes the contract back
+# ---------------------------------------------------------------------------
+
+MARKUP_ID = "orders.[/]v1"
+# Every issue category a ``fluid test`` table row lists the messages of.
+ROW_CATEGORIES = (
+    "schema",
+    "overlay",
+    "connection",
+    "binding",
+    "missing_resource",
+    "missing_field",
+    "empty_table",
+    "quality",
+    "metadata",
+    "drift",
+)
+
+
+def _contract_quoting_markup() -> Dict[str, Any]:
+    """A local product the schema rejects; each error quotes the value back."""
+    return {
+        "fluidVersion": "0.7.5",
+        "kind": "DataProduct",
+        "id": MARKUP_ID,
+        "name": "Orders",
+        "domain": "sales",
+        "tags": ["Not A Tag"],
+        "metadata": {"owner": {"team": "data-platform"}},
+        "exposes": [
+            {
+                "exposeId": "orders[/]daily",
+                "kind": "table",
+                "binding": {
+                    "platform": "local",
+                    "format": "parquet",
+                    "location": {"path": "out/orders.parquet"},
+                },
+                "contract": {"schema": [{"name": "order_id", "type": "integer"}]},
+            }
+        ],
+    }
+
+
+def _report_quoting_markup():
+    from datetime import datetime
+
+    from fluid_build.cli.contract_validation import ValidationReport
+
+    report = ValidationReport(
+        "c.yaml", MARKUP_ID, "1.0.[/]", datetime(2026, 1, 1), 0.0, provider_name="lake[/]house"
+    )
+    for category in ROW_CATEGORIES:
+        report.add_issue("error", category, f"{category}: {MESSAGE}", f"exposes[{category}]")
+    return report
+
+
+@pytest.mark.parametrize(
+    "command, title",
+    [("test", "Data Contract Test"), ("contract-validation", "Contract Validation")],
+)
+def test_report_prints_a_markup_shaped_contract_verbatim(
+    tmp_path, monkeypatch, capsys, command, title
+):
+    """End to end: the id's ``[/]`` crashed both commands with a MarkupError traceback."""
+    monkeypatch.setenv("COLUMNS", "400")  # one table line per message
+    path = _write(tmp_path, _contract_quoting_markup())
+
+    rc = cli_mod.main([command, path, "--no-data", "--no-cache"])
+
+    out = capsys.readouterr().out
+    assert rc == 1  # the schema errors
+    assert f"{title}: {MARKUP_ID}" in out
+    assert "'orders[/]daily' does not match" in out
+    assert "'Not A Tag' does not match '^[a-z0-9]" in out
+
+
+def test_fluid_test_table_prints_every_row_and_the_header_verbatim(monkeypatch, capsys):
+    from fluid_build.cli.test import _output_rich
+
+    monkeypatch.setenv("COLUMNS", "400")
+    report = _report_quoting_markup()
+    report.add_issue("error", "schema", "location.path: C:\\work\\")
+
+    _output_rich(report)
+
+    out = capsys.readouterr().out
+    assert f"Data Contract Test: {MARKUP_ID}" in out
+    assert "Version 1.0.[/]  |  Provider: lake[/]house" in out
+    for category in ROW_CATEGORIES:
+        assert f"{category}: {MESSAGE}" in out
+    # rich.markup.escape would have doubled the trailing backslash.
+    assert "location.path: C:\\work\\ " in out
+
+
+def test_contract_validation_table_prints_messages_and_paths_verbatim(monkeypatch, capsys):
+    from fluid_build.cli.contract_validation import output_rich_report
+
+    monkeypatch.setenv("COLUMNS", "400")
+    report = _report_quoting_markup()
+    # A rule's severity comes from the contract; one outside the styled set prints as given.
+    report.add_issue("[/]fatal", "quality", "rule failed", "exposes[orders].dq")
+    report.add_issue("error", "schema", "location.path: C:\\work\\", "C:\\work\\")
+
+    output_rich_report(report)
+
+    out = capsys.readouterr().out
+    assert f"Contract Validation: {MARKUP_ID}" in out
+    assert "Version: 1.0.[/]" in out
+    for category in ROW_CATEGORIES:
+        assert f"{category}: {MESSAGE}" in out
+        assert f"exposes[{category}]" in out
+    assert "[/]FATAL" in out
+    # rich.markup.escape would have doubled both trailing backslashes.
+    assert "location.path: C:\\work\\ " in out
+    assert "│ C:\\work\\ " in out
+
+
+def test_reports_spell_out_control_characters(monkeypatch, capsys):
+    """On a terminal, a contract value must not clear it or plant a link."""
+    from datetime import datetime
+
+    from fluid_build.cli.contract_validation import ValidationReport, output_rich_report
+    from fluid_build.cli.test import _output_rich
+
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("COLUMNS", "400")
+    report = ValidationReport(
+        "c.yaml", f"orders{ESCAPES}", f"1{ESCAPES}", datetime(2026, 1, 1), 0.0
+    )
+    report.add_issue("error", "schema", f"bad {ESCAPES}", f"exposes[{ESCAPES}]")
+
+    _output_rich(report)
+    output_rich_report(report)
+
+    out = capsys.readouterr().out
+    assert not _reaches_the_terminal(out)
+    assert "Data Contract Test: orders\\x1b[2J" in out
+    assert "Contract Validation: orders\\x1b[2J" in out
+    assert "bad \\x1b[2J\\x1b]8;;http://evil.example/" in out
+
+
+def test_plain_reports_keep_brackets_when_rich_is_absent(monkeypatch, capsys):
+    """Without Rich, ``cprint`` strips every ``[word]`` unless told the text is not markup."""
+    from fluid_build.cli.contract_validation import output_plain_report
+    from fluid_build.cli.test import _output_plain
+
+    monkeypatch.setattr("fluid_build._console.console", None)
+    report = _report_quoting_markup()
+
+    _output_plain(report)
+    output_plain_report(report)
+
+    assert capsys.readouterr().out.count(MESSAGE) == 2 * len(ROW_CATEGORIES)
+
+
+def test_plain_reports_spell_out_control_characters(monkeypatch, capsys):
+    from datetime import datetime
+
+    from fluid_build.cli.contract_validation import ValidationReport, output_plain_report
+    from fluid_build.cli.test import _output_plain
+
+    monkeypatch.setattr("fluid_build._console.console", None)
+    report = ValidationReport("c.yaml", f"orders{ESCAPES}", "1", datetime(2026, 1, 1), 0.0)
+    report.add_issue("error", "schema", f"bad {ESCAPES}", "exposes[0]")
+
+    _output_plain(report)
+    output_plain_report(report)
+
+    out = capsys.readouterr().out
+    assert not _reaches_the_terminal(out)
+    assert "fluid test  |  FAIL  |  orders\\x1b[2J" in out
+    assert "INVALID: orders\\x1b[2J\\x1b]8;;http://evil.example/" in out
+
+
+def test_soda_text_prints_check_names_and_stderr_verbatim(capsys):
+    """A check name quotes the contract's rule; Soda's stderr quotes the SodaCL."""
+    from fluid_build.build_runners.soda.runner import SodaResult
+    from fluid_build.cli.test import _emit_soda_text
+
+    # ``:x:`` and the ``:b:`` in ``fe80::a:b:c`` are emoji codes to a ``str`` print.
+    name = "invalid_count(code) = 0 [/] ^[a-z]+$ :x:"
+    result = SodaResult(
+        return_code=1,
+        raw_stdout="",
+        raw_stderr=f"check failed: {name} on fe80::a:b:c\x1b[2J",
+        checks_failed=1,
+        failed_check_names=[name],
+    )
+
+    _emit_soda_text(result, "warehouse")
+
+    out = _unwrapped(capsys.readouterr().out)
+    assert f"- {name}" in out
+    assert f"soda stderr: check failed: {name} on fe80::a:b:c\\x1b[2J" in out

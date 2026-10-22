@@ -162,14 +162,14 @@ class TestOutputJson:
 
 
 class TestOutputPlain:
-    @patch("fluid_build.cli.test.cprint")
+    @patch("fluid_build.cli.test.cprint_literal")
     def test_stdout_pass(self, mock_cprint):
         report = _make_report(valid=True, issues=[])
         _output_plain(report)
         call_text = mock_cprint.call_args[0][0]
         assert "PASS" in call_text
 
-    @patch("fluid_build.cli.test.cprint")
+    @patch("fluid_build.cli.test.cprint_literal")
     def test_stdout_fail(self, mock_cprint):
         report = _make_report(valid=False, issues=[_make_issue()])
         _output_plain(report)
@@ -183,7 +183,7 @@ class TestOutputPlain:
         content = Path(out_file).read_text()
         assert "PASS" in content
 
-    @patch("fluid_build.cli.test.cprint")
+    @patch("fluid_build.cli.test.cprint_literal")
     def test_with_suggestion(self, mock_cprint):
         issue = _make_issue(suggestion="fix it")
         report = _make_report(valid=False, issues=[issue])
