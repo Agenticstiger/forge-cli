@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- forge-cli runs on DuckDB 2.x as well as 1.5.x (`duckdb>=1.5.0`, no ceiling; DuckDB 2.0
+  needs Python 3.11, so a Python 3.10 install stays on 1.5.x). On 2.x, a DuckDB database
+  file forge-cli creates (`fluid demo`'s `.fluid/db.duckdb`, the local provider's session
+  and `persist` databases, a Meltano acquisition's DuckDB destination) is written in the
+  format DuckDB 1.5 writes, which DuckDB 1.0 and later open, so a type that needs a newer
+  format, such as a `VARIANT` column, is refused in it on 2.x as it is on 1.5; a file
+  that already exists keeps its format.
+  DuckDB 2.x's own default format cannot be read by 1.5: a file another 2.x tool created
+  (dbt-duckdb and dlt included), or forge-cli 0.21.0 or older on DuckDB 2.0, opens only
+  on 2.x. To convert one, run on 2.x: `ATTACH 'old.duckdb' AS src (READ_ONLY); ATTACH
+  'new.duckdb' AS dst (STORAGE_VERSION 'v1.0.0'); COPY FROM DATABASE src TO dst;`.
+- Contract SQL runs on the DuckDB that is installed, and DuckDB 2.0 changed some SQL: the
+  `x -> x + 1` lambda is an error (write `lambda x: x + 1`), and integer `//` and `%` by
+  zero raise an error instead of returning NULL (wrap them in `TRY(...)`). See
+  https://duckdb.org/docs/2.0/operations_manual/migration.html.
+- A DuckDB acquisition build now resolves a Postgres source's `connection.secretRef`. It
+  ignored it, and libpq's `PGPASSWORD` or `~/.pgpass` supplied the password, so a
+  `secretRef` that does not resolve where `fluid apply` runs now fails the build. To keep
+  using `PGPASSWORD`, remove the `secretRef`; an inline `password` still wins over it.
 - `fluid validate --env <env> --strict` (on one contract or a whole workspace), `fluid
   contract-validation --env <env> --strict` and `fluid test --env <env> --strict` (the
   native engine; `--engine soda` does not read `--strict`) now fail when an overlay patch
@@ -54,6 +73,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **DuckDB 2.0.** `fluid verify` reported every local file as `error` ("Relations no
+  longer have fetchone()"); `fluid apply`'s local SQL and materialize steps, and the
+  actions of the legacy `fluid_build.contract_tests` module, lost their row counts (a
+  materialize step logged `local_materialize_fallback`, a `contract_tests` action
+  reported `-1` rows). DuckDB 2.0 relations have no `fetchone()`, and a query result
+  keeps its connection busy until it is read to the end, which fails the next step on
+  that connection. Every DuckDB result is now read to the end, the same way on 1.5.x and
+  2.x.
+- **DuckDB 2.0: Postgres and MySQL sources.** A DuckDB acquisition build reading
+  Postgres failed on DuckDB 2.0 (`Table Function with name postgres_scan does not
+  exist!`): the postgres extension dropped `postgres_scan`. A MySQL or MariaDB source
+  failed on every DuckDB version, before connecting (`Unknown secret storage found:
+  'local_file'`): its `ATTACH` looked for a default secret in the persistent storage the
+  sandbox turns off. Both are now attached read-only before the sandbox locks, each with
+  an empty temporary secret named in the `ATTACH` (the DSN carries the credentials), and
+  read as `<alias>.<schema>.<table>` on 1.5.x and 2.x; a Postgres source's
+  `connection.secretRef` is resolved into the password, as a MySQL source's already was.
+  A Postgres enum column still reads, and lands, as text. A stream name is looked up as
+  DuckDB looks up names, ignoring case: where two tables' names differ only in case, the
+  build can read the other one.
+  A source the runner cannot attach (unreachable, refused, a `secretRef` that does not
+  resolve) fails the build with the reason, its password masked, and writes a run
+  record; a MySQL or MariaDB source used to end `fluid apply` with `Unexpected error
+  during execution` instead.
+- A local SQL action, or a legacy `fluid_build.contract_tests` action, whose SQL ends in
+  a statement that returns no rows (`CREATE TABLE ... AS`, an `INSERT` without
+  `RETURNING`) now fails with a message saying to write just the `SELECT`. DuckDB 1.5
+  failed there on `'NoneType' object has no attribute 'write_csv'`, and DuckDB 2.0
+  reported success with a one-row `Count` file, an empty `Success` file (a `CREATE TABLE
+  ... AS PIVOT`) or the rows of an earlier `SELECT` in the same SQL as the output.
+- **DuckDB 2.0: contract SQL.** A local SQL action whose SQL ends in a comment after its
+  last `;` failed to write its output (`syntax error at or near ";"`); SQL with a
+  statement that does not parse ran the statements ahead of it before failing, where
+  DuckDB 1.5 runs none; and the result of a `PIVOT` without an `IN` list, or of a query
+  calling `nextval()`, could not be written to an `s3://` output or, in
+  `fluid_build.contract_tests`, to Parquet (`Cannot create the view ...: it reads rows
+  held in this process`). Each now behaves as on 1.5.
 - **`fluid test` and `fluid contract-validation` print the contract's text as written.**
   `fluid test` read its report as Rich markup, so a JSON Schema pattern such as
   `^[a-z0-9][a-z0-9-]*[a-z0-9]$` printed as `^*$` and `exposes[orders]` lost its id; in

@@ -209,7 +209,7 @@ class TestFluidApplyIdempotency:
         output_csv = hello_world_workspace / "runtime" / "out" / "hello-world-v1.csv"
         # ``all_varchar=True`` for the same reason as the schema test —
         # avoids materialising TIMESTAMPTZ which needs pytz at runtime.
-        row_count = duckdb.read_csv(str(output_csv), all_varchar=True).count("*").fetchone()[0]
+        row_count = duckdb.read_csv(str(output_csv), all_varchar=True).count("*").fetchall()[0][0]
         assert row_count == 1, f"expected 1 row after two applies; got {row_count}"
 
 

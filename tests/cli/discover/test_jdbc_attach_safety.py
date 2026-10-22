@@ -137,7 +137,7 @@ class TestControlCharsRejected:
 
 class TestSharedBuildersRejectControlChars:
     """The check lives in the shared DSN builders, so every caller gets it: the
-    JDBC attach, and the duckdb build runner's mysql ATTACH and postgres_scan DSN,
+    JDBC attach, and the duckdb build runner's mysql and postgres ATTACH DSNs,
     which call the builders directly."""
 
     @pytest.mark.parametrize("ch", ["\x00", "\t", "\n", "\x1b", "\x7f", "\x85"], ids=repr)
@@ -182,7 +182,7 @@ class TestPostgresPortIsAsciiDigits:
 
     @pytest.mark.parametrize("name", sorted(_PORTS))
     def test_build_libpq_dsn_refuses_a_non_ascii_digit_port(self, name):
-        # The shared builder: the duckdb runner's postgres_scan DSN uses it too.
+        # The shared builder: the duckdb runner's postgres ATTACH DSN uses it too.
         from fluid_build.providers._sql_safety import build_libpq_dsn
 
         with pytest.raises(ValueError, match="port"):

@@ -522,9 +522,10 @@ def test_the_copy_sibling_is_one_more_file_confined_like_the_landing(layout, mon
 
 
 def test_a_sqlite_source_outside_the_allowed_directories_is_refused(layout, monkeypatch):
-    """The sqlite scanner opens files through its own library, which DuckDB's
-    allowlist never bounds, so the declared source path was attached wherever
-    it pointed: any SQLite file on the host could be landed."""
+    """The engine attaches a SQLite source before the sandbox's lock, when no
+    allowlist applies yet (and through DuckDB 1.5 the sqlite scanner did not
+    honour one), so the declared source path was attached wherever it pointed:
+    any SQLite file on the host could be landed."""
     import sqlite3
 
     from fluid_build.build_runners.duckdb.runner import execute_duckdb_build
@@ -1133,8 +1134,8 @@ def test_a_function_from_an_unloaded_extension_reads_as_a_sandbox_refusal(layout
 
 
 def test_contract_sql_runs_on_a_connection_with_no_database_scanner(layout, printed):
-    """sqlite/postgres/mysql scanners are not bounded by the allowlist (next
-    test), so the connection contract SQL runs on must never have one loaded."""
+    """A loaded database scanner widens what SQL on the connection reaches (the
+    tests below), so the connection contract SQL runs on must never have one."""
     rc = _build(
         "SELECT count(*) AS n FROM duckdb_functions() WHERE function_name IN "
         "('sqlite_scan', 'sqlite_attach', 'postgres_scan', 'postgres_query', 'mysql_query')",
@@ -1154,11 +1155,10 @@ def _with_extension(name: str) -> Any:
         ) from exc
 
 
-def test_a_loaded_sqlite_scanner_is_not_bounded_by_the_allowlist(tmp_path):
-    """Pins a documented limit: once ``sqlite`` is loaded, any SQLite file the
-    process can read is reachable, whatever the allowlist says. A call site that
-    loads it must keep contract SQL off the connection."""
-    db = tmp_path / "elsewhere.sqlite"
+_DUCKDB_2 = sandbox.duckdb_version(duckdb) >= (2, 0, 0)
+
+
+def _seed_sqlite(db: Path) -> None:
     seed = duckdb.connect()
     try:
         seed.execute("INSTALL sqlite; LOAD sqlite")
@@ -1168,13 +1168,58 @@ def test_a_loaded_sqlite_scanner_is_not_bounded_by_the_allowlist(tmp_path):
     seed.execute(f"CREATE TABLE s.t AS SELECT '{SECRET}' AS v")
     seed.close()
 
+
+@pytest.mark.skipif(_DUCKDB_2, reason="DuckDB 2.0 bounds the sqlite scanner (next test)")
+def test_a_loaded_sqlite_scanner_is_not_bounded_by_the_allowlist(tmp_path):
+    """Pins a documented limit through DuckDB 1.5: once ``sqlite`` is loaded,
+    any SQLite file the process can read is reachable, whatever the allowlist
+    says. A call site that loads it must keep contract SQL off the connection."""
+    db = tmp_path / "elsewhere.sqlite"
+    _seed_sqlite(db)
+
     con = _with_extension("sqlite")
     assert con.execute(f"SELECT v FROM sqlite_scan('{db}', 't')").fetchall() == [(SECRET,)]
 
 
+@pytest.mark.skipif(not _DUCKDB_2, reason="through DuckDB 1.5 the scanner is unbounded")
+def test_from_duckdb_2_a_loaded_sqlite_scanner_is_bounded_by_the_allowlist(tmp_path):
+    """DuckDB 2.0's sqlite scanner opens files through DuckDB's file system, so
+    the allowlist bounds it as it bounds ``read_csv``: a file outside, ``./..``
+    out of an allowed directory and a symlink out of one are each refused,
+    while a file inside is read. The engine still keeps contract SQL off a
+    connection that loads a scanner (``postgres_query`` reaches what the engine
+    attached before the lock)."""
+    inside, outside = tmp_path / "allowed", tmp_path / "outside"
+    inside.mkdir()
+    outside.mkdir()
+    _seed_sqlite(outside / "x.sqlite")
+    _seed_sqlite(inside / "x.sqlite")
+    (inside / "link.sqlite").symlink_to(outside / "x.sqlite")
+
+    try:
+        con = secure_duckdb_connect(
+            allow=DuckDBAllowlist.none().with_dirs(inside), extensions=["sqlite"]
+        )
+    except duckdb.Error as exc:
+        raise pytest.skip.Exception("the sqlite extension is not installable here") from exc
+    assert con.execute(f"SELECT v FROM sqlite_scan('{inside}/x.sqlite', 't')").fetchall() == [
+        (SECRET,)
+    ]
+    for refused in (
+        f"SELECT v FROM sqlite_scan('{outside}/x.sqlite', 't')",
+        f"SELECT v FROM sqlite_scan('{inside}/./../outside/x.sqlite', 't')",
+        f"SELECT v FROM sqlite_scan('{inside}/link.sqlite', 't')",
+        f"ATTACH '{outside}/x.sqlite' AS o (TYPE sqlite)",
+    ):
+        with pytest.raises(duckdb.PermissionException):
+            con.execute(refused).fetchall()
+
+
+@pytest.mark.skipif(_DUCKDB_2, reason="DuckDB 2.0's postgres extension has no postgres_scan")
 def test_a_loaded_postgres_scanner_is_not_bounded_by_the_allowlist():
-    """Pins a documented limit: ``postgres_scan`` opens its own socket, so the
-    failure is the server's (nothing listens), not the sandbox's refusal."""
+    """Pins a documented limit through DuckDB 1.5: ``postgres_scan`` opens its
+    own socket, so the failure is the server's (nothing listens), not the
+    sandbox's refusal."""
     con = _with_extension("postgres")
     with pytest.raises(duckdb.Error) as failed:
         con.execute(
@@ -1182,6 +1227,16 @@ def test_a_loaded_postgres_scanner_is_not_bounded_by_the_allowlist():
         )
     assert not isinstance(failed.value, duckdb.PermissionException), failed.value
     assert "Permission Error" not in str(failed.value)
+
+
+@pytest.mark.parametrize("extension", ["postgres", "mysql"])
+def test_after_the_lock_no_database_can_be_attached_through_a_loaded_scanner(extension):
+    """On every version: ``postgres_query`` / ``mysql_query`` reach only the
+    databases the engine attached before the lock, which is how the duckdb
+    runner reads a postgres or mysql source."""
+    con = _with_extension(extension)
+    with pytest.raises(duckdb.PermissionException, match="disabled through configuration"):
+        con.execute(f"ATTACH 'host=127.0.0.1 port=9 connect_timeout=1' AS x (TYPE {extension})")
 
 
 # ── the helper's own guarantees ──────────────────────────────────────────
@@ -1402,11 +1457,20 @@ def _duckdb_aliases(tree: ast.AST) -> tuple:
     return modules, members
 
 
+#: Functions of the duckdb module that take no connection and read nothing but
+#: their argument. ``tokenize`` splits a SQL string into token offsets and
+#: types (``_duckdb_compat`` finds a statement's trailing comments with it);
+#: unlike ``duckdb.sql`` and the other module-level functions, it has no
+#: ``connection`` parameter and runs no SQL.
+_CONNECTIONLESS = frozenset({"tokenize"})
+
+
 def _bypasses(path: Path) -> List[str]:
     """Each place ``path`` opens or queries DuckDB without the helper.
 
     * any call on the duckdb module (``duckdb.connect``, ``duckdb.sql`` and the
-      other module-level functions run on an unsandboxed default connection);
+      other module-level functions run on an unsandboxed default connection),
+      except the :data:`_CONNECTIONLESS` ones;
     * a function imported from duckdb (``from duckdb import connect``);
     * ``<anything named like duck>.connect(...)``, which catches the module
       held in a variable (``self._duckdb.connect``, ``_Duck.get().connect``).
@@ -1425,12 +1489,26 @@ def _bypasses(path: Path) -> List[str]:
         if isinstance(func, ast.Attribute):
             receiver = func.value
             if isinstance(receiver, ast.Name) and receiver.id in modules:
-                found.append(f"{where} duckdb.{func.attr}(...)")
+                if func.attr not in _CONNECTIONLESS:
+                    found.append(f"{where} duckdb.{func.attr}(...)")
             elif func.attr == "connect" and "duck" in ast.unparse(receiver).lower():
                 found.append(f"{where} {ast.unparse(func)}(...)")
         elif isinstance(func, ast.Name) and func.id in members:
             found.append(f"{where} {func.id}(...) imported from duckdb")
     return found
+
+
+def test_a_connectionless_duckdb_function_is_not_a_bypass(tmp_path):
+    """``duckdb.tokenize`` runs no SQL; the exemption is that name alone."""
+    # A default-connection function documents its ``connection`` parameter;
+    # tokenize has none, on 1.5 and 2.x.
+    assert "connection" in (duckdb.execute.__doc__ or "")
+    assert "connection" not in (duckdb.tokenize.__doc__ or "")
+    sample = tmp_path / "probe.py"
+    sample.write_text("import duckdb\nduckdb.tokenize('SELECT 1 -- c')\n", encoding="utf-8")
+    assert _bypasses(sample) == []
+    sample.write_text("import duckdb\nduckdb.tokenizer('SELECT 1')\n", encoding="utf-8")
+    assert _bypasses(sample)
 
 
 def test_the_bypass_detector_sees_the_helpers_own_connect():

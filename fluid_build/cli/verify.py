@@ -960,6 +960,7 @@ def _verify_local_file(
 
     # Introspect with DuckDB.
     try:
+        from fluid_build.providers._duckdb_compat import one_row
         from fluid_build.providers._duckdb_sandbox import (
             DuckDBAllowlist,
             secure_duckdb_connect,
@@ -968,25 +969,28 @@ def _verify_local_file(
         # The masking check below runs SQL built from the contract: it reads
         # the one file being verified and nothing else.
         con = secure_duckdb_connect(allow=DuckDBAllowlist.none().with_paths(file_path))
-        # A SQL string literal, not Python ``repr``: the path now carries the
-        # contract's directory, and ``repr`` switches to double quotes (a
-        # DuckDB identifier) or backslash escapes (literal in DuckDB) the
-        # moment a directory name holds a quote.
-        literal = quote_ansi_string_literal(file_path.as_posix())
-        if actual_fmt == "parquet":
-            relation_sql = f"SELECT * FROM read_parquet({literal})"
-        else:
-            relation_sql = f"SELECT * FROM read_csv_auto({literal})"
-        rel = con.sql(relation_sql)
+        try:
+            # A SQL string literal, not Python ``repr``: the path now carries the
+            # contract's directory, and ``repr`` switches to double quotes (a
+            # DuckDB identifier) or backslash escapes (literal in DuckDB) the
+            # moment a directory name holds a quote.
+            literal = quote_ansi_string_literal(file_path.as_posix())
+            if actual_fmt == "parquet":
+                relation_sql = f"SELECT * FROM read_parquet({literal})"
+            else:
+                relation_sql = f"SELECT * FROM read_csv_auto({literal})"
+            rel = con.sql(relation_sql)
 
-        row_count = rel.aggregate("count(*)").fetchone()[0]
-        actual_columns = [col for col in rel.columns]
-        # Did the columns policy.privacy.masking names land treated? Counts only:
-        # a value that fails the check is cleartext and stays out of the report.
-        from fluid_build.cli._verify_masking import local_dimension
+            row_count = one_row(rel.aggregate("count(*)"))[0]
+            actual_columns = [col for col in rel.columns]
+            # Did the columns policy.privacy.masking names land treated? Counts
+            # only: a value that fails the check is cleartext and stays out of
+            # the report.
+            from fluid_build.cli._verify_masking import local_dimension
 
-        masking = local_dimension(con, relation_sql, actual_columns, expose_config)
-        con.close()
+            masking = local_dimension(con, relation_sql, actual_columns, expose_config)
+        finally:
+            con.close()
     except Exception as exc:
         return {
             "status": "error",

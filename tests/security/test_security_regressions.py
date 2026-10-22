@@ -39,6 +39,7 @@ from fluid_build.build_runners.duckdb.runner import (
     _build_select_for_filesystem,
     _build_select_for_postgres,
     _csv_options_clause,
+    _postgres_attach_sql,
 )
 from fluid_build.build_runners.hooks.tokenize_pii import (
     _TOKEN_HEX_LEN,
@@ -78,15 +79,18 @@ class TestDuckdbSqlInjection:
 
     def test_postgres_stream_must_be_identifier(self):
         with pytest.raises(ValueError):
-            _build_select_for_postgres(
-                {"host": "h", "port": 5432, "user": "u", "password": "p", "database": "d"},
-                "public.orders; DROP TABLE secrets; --",
-            )
+            _build_select_for_postgres("public.orders; DROP TABLE secrets; --", alias="pg")
+
+    def test_postgres_alias_must_be_identifier(self):
+        with pytest.raises(ValueError):
+            _build_select_for_postgres("orders", alias="pg; DROP TABLE secrets")
+        with pytest.raises(ValueError):
+            _postgres_attach_sql({"host": "h"}, alias="pg; DROP TABLE secrets")
 
     def test_postgres_password_with_quote_neutralized(self):
         # Password contains a single quote; the runner must escape it twice
-        # (libpq + SQL boundary) so the resulting SQL is still well-formed.
-        sql = _build_select_for_postgres(
+        # (libpq + SQL boundary) so the ATTACH is still one well-formed statement.
+        sql = _postgres_attach_sql(
             {
                 "host": "h",
                 "port": 5432,
@@ -94,18 +98,18 @@ class TestDuckdbSqlInjection:
                 "password": "p'; DROP TABLE secrets; --",
                 "database": "d",
             },
-            "orders",
+            alias="pg",
         )
         # Single quote was doubled at the SQL boundary.
         assert "''" in sql
-        # Exactly one postgres_scan call is emitted.
-        assert sql.count("postgres_scan(") == 1
+        assert sql.count("ATTACH ") == 1
+        assert sql.endswith(" AS pg (TYPE postgres, SECRET pg, READ_ONLY)")
 
     def test_postgres_port_must_be_numeric(self):
         with pytest.raises(ValueError):
-            _build_select_for_postgres(
+            _postgres_attach_sql(
                 {"host": "h", "port": "5432; DROP", "user": "u", "password": "p", "database": "d"},
-                "orders",
+                alias="pg",
             )
 
     def test_copy_destination_path_with_quote_is_quoted(self):
