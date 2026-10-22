@@ -193,8 +193,13 @@ class DuckDBDriver(EngineDriver):
     def health_check(self) -> Dict[str, Any]:
         started = time.monotonic()
         try:
-            connection = self._get_connection()
-            connection.execute("SELECT 1").fetchall()
+            # A cursor of its own, as execute() uses: on DuckDB 2.0 a call on
+            # the shared connection refuses while another thread is on it.
+            cursor = self._get_connection().cursor()
+            try:
+                cursor.execute("SELECT 1").fetchall()
+            finally:
+                cursor.close()
         except Exception as exc:  # noqa: BLE001
             return {
                 "status": "unavailable",

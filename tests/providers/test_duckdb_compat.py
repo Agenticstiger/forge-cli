@@ -62,6 +62,12 @@ def test_first_row_of_a_relation():
     assert first_row(rel.count("*")) == (3,)
 
 
+def test_first_row_is_the_first_of_several_rows():
+    con = duckdb.connect()
+    assert first_row(con.execute("SELECT range FROM range(3) ORDER BY 1")) == (0,)
+    assert first_row(con.sql("SELECT range FROM range(3) ORDER BY 1")) == (0,)
+
+
 def test_first_row_of_no_rows_is_none():
     con = duckdb.connect()
     assert first_row(con.execute("SELECT 1 WHERE false")) is None
@@ -235,6 +241,55 @@ def test_contract_tests_sql_that_returns_no_rows_fails_clearly():
     assert _execute_sql(duckdb.connect(), "SELECT 1 AS q").fetchall() == [(1,)]
 
 
+def test_contract_tests_dry_run_counts_a_real_relation(tmp_path):
+    from fluid_build.contract_tests import _write_output
+
+    rel = duckdb.connect().sql("SELECT range AS a FROM range(42)")
+    out = tmp_path / "out.csv"
+    assert _write_output(rel, {"path": str(out), "format": "csv"}, dry_run=True) == (42, None)
+    assert not out.exists()
+
+
+def test_a_remote_landing_is_probed_without_keeping_the_connection_busy(tmp_path, monkeypatch):
+    """``_artifact_exists`` probes a remote landing with ``SELECT 1 ... LIMIT 1``
+    on the run's own connection; read partway on DuckDB 2.0, that kept the
+    connection busy for the late-arrival split that reads the landing next."""
+    from fluid_build.build_runners.duckdb import runner
+
+    landed = tmp_path / "landed.parquet"
+    duckdb.connect().execute(f"COPY (SELECT 1 AS a) TO '{landed}' (FORMAT parquet)")
+    monkeypatch.setattr(runner, "_is_remote_uri", lambda _path: True)
+    con = duckdb.connect()
+    assert runner._artifact_exists(con, str(landed), "read_parquet") is True
+    assert con.sql(f"SELECT a FROM read_parquet('{landed}')").fetchall() == [(1,)]
+    assert runner._artifact_exists(con, str(tmp_path / "missing.parquet"), "read_parquet") is False
+
+
+@pytest.mark.parametrize(
+    "function", ["postgres_scan", "postgres_query", "mysql_scan", "sqlite_scan", "read_xlsx"]
+)
+def test_a_scanner_the_sandbox_did_not_load_reads_as_a_refusal(function):
+    """DuckDB 2.0 stopped naming ``postgres_scan``'s extension in its error
+    ("does not exist!"), and no version names ``mysql_scan``'s; contract SQL
+    calling one still gets the sandbox's hint instead of a bare catalog error."""
+    from fluid_build.providers._duckdb_sandbox import is_sandbox_refusal, is_unloaded_function
+
+    con = secure_duckdb_connect(allow=DuckDBAllowlist.none())
+    with pytest.raises(duckdb.Error) as refused:
+        con.execute(f"SELECT * FROM {function}('x', 'y')")
+    assert is_unloaded_function(refused.value), refused.value
+    assert is_sandbox_refusal(refused.value)
+
+
+def test_an_unknown_function_is_not_a_sandbox_refusal():
+    from fluid_build.providers._duckdb_sandbox import is_sandbox_refusal
+
+    con = secure_duckdb_connect(allow=DuckDBAllowlist.none())
+    with pytest.raises(duckdb.Error) as missing:
+        con.execute("SELECT * FROM no_such_function_anywhere()")
+    assert not is_sandbox_refusal(missing.value)
+
+
 def test_the_snowflake_mock_connects(tmp_path):
     """DuckDB 2.0 refuses ``CREATE SCHEMA information_schema`` (a system catalog)."""
     from fluid_build.providers.local.mocks import SnowflakeDuckDBMock
@@ -326,13 +381,18 @@ def test_the_storage_setting_is_locked_with_the_rest(tmp_path):
 
 # ── no partial reads in DuckDB code ──────────────────────────────────────
 
-#: Calls DuckDB 2.0 removed from relations or from ``con.execute()`` results, or
-#: that leave a result open. ``first_row`` replaces the first two.
+#: Reads that DuckDB 2.0 removed from relations or ``con.execute()`` results, or
+#: that leave a result open (the connection stays busy until it is drained):
+#: ``fetchone``/``fetchmany`` (``first_row`` replaces them), the Arrow batch
+#: readers, ``rel.arrow()``. A relation's argument-less ``execute()``, also gone,
+#: is caught separately.
 _PARTIAL_OR_GONE = frozenset(
     {"fetchone", "fetchmany", "fetch_df_chunk", "fetch_arrow_table", "fetch_record_batch"}
+    | {"fetch_arrow_reader", "record_batch", "arrow"}
 )
 
-#: Modules whose ``fetchone`` belongs to another database's client, never DuckDB's.
+#: Modules whose ``fetchone`` (or argument-less ``execute``) belongs to another
+#: client, never DuckDB's.
 _OTHER_CLIENTS = {
     "fluid_build/cli/doctor.py": "sqlite3 / Snowflake connector cursors",
     "fluid_build/cli/workspace.py": "sqlite3 workspace registry",
@@ -341,6 +401,7 @@ _OTHER_CLIENTS = {
     "fluid_build/copilot/store/backends/sqlite.py": "sqlite3 connection",
     "fluid_build/copilot/store/backends/vector.py": "sqlite3 + sqlite-vec probe",
     "fluid_build/forge_datamodel/from_ddl/snowflake_dumper.py": "Snowflake connector cursor",
+    "fluid_build/providers/gcp/util/auth.py": "googleapiclient request .execute()",
 }
 
 
@@ -352,7 +413,10 @@ def _partial_reads(path: Path) -> List[str]:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _PARTIAL_OR_GONE
+        and (
+            node.func.attr in _PARTIAL_OR_GONE
+            or (node.func.attr == "execute" and not node.args and not node.keywords)
+        )
     ]
 
 
@@ -365,6 +429,10 @@ def _partial_reads(path: Path) -> List[str]:
         "con.execute('select 1').fetch_arrow_table()\n",
         "rel.fetch_df_chunk()\n",
         "con.execute('select 1').fetch_record_batch(10)\n",
+        "rel.fetch_arrow_reader(1000)\n",
+        "rel.record_batch()\n",
+        "rel.arrow()\n",
+        "rel.execute()\n",
     ],
 )
 def test_the_partial_read_detector_catches_each_shape(shape, tmp_path):
@@ -374,11 +442,14 @@ def test_the_partial_read_detector_catches_each_shape(shape, tmp_path):
 
 
 def test_no_partial_reads_in_duckdb_code():
-    offenders = []
+    offenders, scanned = [], 0
     for path in sorted(PACKAGE.rglob("*.py")):
         if path.relative_to(REPO_ROOT).as_posix() in _OTHER_CLIENTS:
             continue
+        scanned += 1
         offenders.extend(_partial_reads(path))
+    # A fence that scans nothing passes; it must see the DuckDB modules.
+    assert scanned > 500, scanned
     assert not offenders, (
         "On DuckDB 2.0 a relation has no fetchone/fetchmany, and a con.execute() "
         "result read partway keeps its connection busy (the next relation read, "
@@ -394,4 +465,4 @@ def test_every_other_client_module_still_needs_its_exemption():
     for module in _OTHER_CLIENTS:
         path = REPO_ROOT / module
         assert path.is_file(), module
-        assert _partial_reads(path), f"{module} no longer calls fetchone; drop its exemption"
+        assert _partial_reads(path), f"{module} no longer needs its exemption; drop it"

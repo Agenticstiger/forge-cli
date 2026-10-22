@@ -11,12 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - forge-cli runs on DuckDB 2.x as well as 1.5.x (`duckdb>=1.5.0`, no ceiling; DuckDB 2.0
   needs Python 3.11, so a Python 3.10 install stays on 1.5.x). On 2.x, a DuckDB database
-  file forge-cli creates (`fluid init`'s `.fluid/db.duckdb`, the local provider's
-  session and `persist` databases, an acquisition's DuckDB destination) is written in
-  DuckDB 1.5's storage format, so a 1.5 install can still open it; a file that already
+  file forge-cli creates (`fluid demo`'s `.fluid/db.duckdb`, the local provider's session
+  and `persist` databases, a Meltano acquisition's DuckDB destination) is written in
+  DuckDB 1.5's storage format, which DuckDB 1.5.0 and later open; a file that already
   exists keeps its format. DuckDB 2.x's own default format cannot be read by 1.5: a file
-  another 2.x tool created needs every process that opens it on 2.x, or an `EXPORT
-  DATABASE` on 2.x and an `IMPORT DATABASE` on 1.5.
+  another 2.x tool created (dbt-duckdb and dlt included) needs every process that opens
+  it on 2.x, or an `EXPORT DATABASE` on 2.x and an `IMPORT DATABASE` on 1.5.
+- Contract SQL runs on the DuckDB that is installed, and DuckDB 2.0 changed some SQL: the
+  `x -> x + 1` lambda is an error (write `lambda x: x + 1`), and integer `//` and `%` by
+  zero raise an error instead of returning NULL (wrap them in `TRY(...)`). See
+  https://duckdb.org/docs/2.0/operations_manual/migration.html.
 - `fluid validate --env <env> --strict` (on one contract or a whole workspace), `fluid
   contract-validation --env <env> --strict` and `fluid test --env <env> --strict` (the
   native engine; `--engine soda` does not read `--strict`) now fail when an overlay patch

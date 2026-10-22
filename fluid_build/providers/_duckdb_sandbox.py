@@ -924,14 +924,26 @@ def _already_open(target: str) -> DuckDBSandboxError:
     )
 
 
+#: Scanner functions DuckDB does not name with their extension when it is not
+#: loaded: ``mysql_scan`` on every version, ``postgres_scan`` from 2.0.
+_UNADVERTISED_EXTENSION_FUNCTIONS = ("postgres_scan", "mysql_scan")
+
+
 def is_unloaded_function(exc: BaseException) -> bool:
     """Whether ``exc`` is a function whose extension autoloading would have loaded.
 
     DuckDB's catalog error: ``Table Function with name "sqlite_scan" is not in
-    the catalog, but it exists in the sqlite_scanner extension``.
+    the catalog, but it exists in the sqlite_scanner extension``, or, for a
+    scanner it does not advertise, ``Table Function with name postgres_scan
+    does not exist!``.
     """
     text = str(exc)
-    return "but it exists in the" in text and "extension" in text
+    if "but it exists in the" in text and "extension" in text:
+        return True
+    return any(
+        f"Table Function with name {name} does not exist" in text
+        for name in _UNADVERTISED_EXTENSION_FUNCTIONS
+    )
 
 
 def is_sandbox_refusal(exc: BaseException) -> bool:
