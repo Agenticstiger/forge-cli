@@ -22,7 +22,12 @@ import shlex
 from typing import Any, Dict, List
 
 from .._console import cprint
-from ..providers.common.codegen_utils import py_str_literal, sanitize_identifier
+from ..providers.common.codegen_utils import (
+    airflow_dag_import,
+    airflow_standard_import,
+    py_str_literal,
+    sanitize_identifier,
+)
 from ..util.contract import has_only_unscheduled_builds, is_unscheduled_build
 from ._acquisition_stage_ext import _validate_cron as _validate_cron_grammar
 from ._common import CLIError, load_contract_with_overlay
@@ -39,10 +44,13 @@ def register(subparsers: argparse._SubParsersAction):
     p.set_defaults(cmd=COMMAND, func=run)
 
 
-DAG_TMPL = """from __future__ import annotations
-from airflow import DAG
-from airflow.operators.bash import BashOperator
-from datetime import datetime
+# Airflow 2.7+ and 3.x: see codegen_utils.airflow_dag_import. The import blocks hold
+# no braces, so the template stays safe for str.format.
+DAG_TMPL = (
+    "from __future__ import annotations\n"
+    + airflow_dag_import()
+    + airflow_standard_import("BashOperator")
+    + """from datetime import datetime
 with DAG(
     dag_id={dag_id},
     start_date=datetime(2024,1,1),
@@ -65,6 +73,7 @@ with DAG(
     )
     validate >> plan >> apply
 """
+)
 
 
 def _validate_cron(raw: object) -> str:

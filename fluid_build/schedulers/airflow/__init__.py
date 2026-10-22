@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional
 
 from fluid_build.engines.base import Severity, ValidationIssue
 from fluid_build.providers.common.codegen_utils import (
+    airflow_dag_import,
+    airflow_standard_import,
     convert_schedule_to_airflow,
     generate_file_header,
     generate_task_dependencies_code,
@@ -148,11 +150,13 @@ class AirflowScheduler(ScheduleEngine):
 
 def _generate_imports(provider: Optional[str]) -> str:
     """Generate import statements based on provider."""
-    base = """from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-import json
+    base = (
+        "from datetime import datetime, timedelta\n"
+        "from zoneinfo import ZoneInfo\n"
+        + airflow_dag_import()
+        + airflow_standard_import("PythonOperator")
+    )
+    base += """import json
 import logging
 
 logger = logging.getLogger(__name__)"""
@@ -162,7 +166,6 @@ logger = logging.getLogger(__name__)"""
         base += """
 from airflow.providers.google.cloud.operators.bigquery import (
     BigQueryCreateEmptyDatasetOperator,
-    BigQueryCreateEmptyTableOperator,
     BigQueryInsertJobOperator,
 )
 from airflow.providers.google.cloud.operators.gcs import (
@@ -176,7 +179,7 @@ from airflow.providers.amazon.aws.operators.athena import AthenaOperator
 from airflow.providers.amazon.aws.operators.step_function import StepFunctionStartExecutionOperator"""
     elif provider_lower == "snowflake":
         base += """
-from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator"""
+from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator"""
 
     return base
 
@@ -214,7 +217,7 @@ dag = DAG(
     dag_id={py_str_literal(sanitize_identifier(contract_id))},
     default_args=default_args,
     description={py_str_literal(contract_name)},
-    schedule_interval={py_str_literal(airflow_schedule)},
+    schedule={py_str_literal(airflow_schedule)},
     start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo({py_str_literal(timezone)})),
     catchup=False,
     tags={tags!r},
@@ -371,19 +374,20 @@ def _generate_snowflake_task(task: Dict[str, Any], config: Dict[str, Any]) -> st
             # repr() escapes embedded quotes / triple-quotes / newlines, so SQL
             # cannot terminate the literal and inject a top-level statement.
             sql_lit = py_str_literal(params.get("sql", params.get("query", "SELECT 1")))
-            return f"""{var} = SnowflakeOperator(
+            return f"""{var} = SQLExecuteQueryOperator(
     task_id={task_id_lit},
     sql={sql_lit},
-    snowflake_conn_id={conn_lit},
+    conn_id={conn_lit},
     dag=dag,
 )"""
 
-    # Fallback: wrap action in SnowflakeOperator SQL call
+    # Fallback: wrap action in a SQLExecuteQueryOperator SQL call (snowflake provider 6.0
+    # removed SnowflakeOperator)
     sql_lit = py_str_literal(params.get("sql", f"-- TODO: implement {action}"))
-    return f"""{var} = SnowflakeOperator(
+    return f"""{var} = SQLExecuteQueryOperator(
     task_id={task_id_lit},
     sql={sql_lit},
-    snowflake_conn_id={conn_lit},
+    conn_id={conn_lit},
     dag=dag,
 )"""
 

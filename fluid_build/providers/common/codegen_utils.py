@@ -166,7 +166,7 @@ def convert_schedule_to_cron(schedule: str) -> str:
 
 def convert_schedule_to_airflow(schedule: str) -> str:
     """
-    Convert FLUID schedule to Airflow schedule_interval format.
+    Convert FLUID schedule to an Airflow ``schedule`` value.
 
     Airflow accepts both cron and special keywords like @daily.
 
@@ -174,7 +174,7 @@ def convert_schedule_to_airflow(schedule: str) -> str:
         schedule: FLUID schedule string
 
     Returns:
-        Airflow schedule_interval value
+        Airflow ``schedule`` value (``DAG(schedule=...)``)
     """
     schedule_lower = schedule.lower().strip()
 
@@ -188,6 +188,45 @@ def convert_schedule_to_airflow(schedule: str) -> str:
 
     # Default to daily
     return "@daily"
+
+
+# ── Generated DAGs run on Airflow 2.7+ and 3.x ─────────────────────────────
+#
+# Airflow 3 removed ``DAG(schedule_interval=...)`` and ``airflow.utils.dates.days_ago``,
+# moved the core operators and sensors to apache-airflow-providers-standard, and
+# exports ``DAG`` from ``airflow.sdk``. A generated DAG therefore passes
+# ``schedule=`` (Airflow 2.4+), a fixed timezone-aware ``start_date`` with
+# ``catchup=False``, and imports each name from its Airflow 3 home first, falling
+# back to the Airflow 2 core path: the same shape schedulers/airflow/fluid_apply.py
+# already emits. The import paths are Airflow's own deprecation map
+# (airflow-core/src/airflow/operators/__init__.py and sensors/__init__.py at 3.2.2).
+_AIRFLOW_STANDARD_MODULES = {
+    "BashOperator": "operators.bash",
+    "PythonOperator": "operators.python",
+    "ExternalTaskSensor": "sensors.external_task",
+}
+
+
+def airflow_dag_import(indent: str = "") -> str:
+    """``DAG`` from ``airflow.sdk`` on Airflow 3, from ``airflow`` on Airflow 2."""
+    return (
+        f"{indent}try:  # Airflow 3\n"
+        f"{indent}    from airflow.sdk import DAG\n"
+        f"{indent}except ImportError:  # Airflow 2.x\n"
+        f"{indent}    from airflow import DAG\n"
+    )
+
+
+def airflow_standard_import(name: str, indent: str = "") -> str:
+    """``name`` from apache-airflow-providers-standard (Airflow 3, or Airflow 2 with the
+    provider installed), else from Airflow 2's core module."""
+    module = _AIRFLOW_STANDARD_MODULES[name]
+    return (
+        f"{indent}try:  # Airflow 3, or Airflow 2 with apache-airflow-providers-standard\n"
+        f"{indent}    from airflow.providers.standard.{module} import {name}\n"
+        f"{indent}except ImportError:  # Airflow 2.x core\n"
+        f"{indent}    from airflow.{module} import {name}\n"
+    )
 
 
 def json_literal(value: Any) -> str:

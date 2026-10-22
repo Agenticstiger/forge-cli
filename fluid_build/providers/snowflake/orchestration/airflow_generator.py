@@ -17,8 +17,8 @@
 Airflow DAG generation from FLUID 0.7.1 orchestration specifications.
 
 Converts FLUID provider action tasks into Airflow operators:
-- sf.table.ensure → SnowflakeOperator
-- sf.sql.execute → SnowflakeOperator
+- sf.table.ensure → SQLExecuteQueryOperator
+- sf.sql.execute → SQLExecuteQueryOperator
 - python → PythonOperator
 - bash → BashOperator
 """
@@ -26,7 +26,12 @@ Converts FLUID provider action tasks into Airflow operators:
 from typing import Any, Dict, List, Optional
 
 from ..._sql_safety import quote_string_literal, validate_ident, validate_sql_type_name
-from ...common.codegen_utils import py_str_literal, sanitize_identifier
+from ...common.codegen_utils import (
+    airflow_dag_import,
+    airflow_standard_import,
+    py_str_literal,
+    sanitize_identifier,
+)
 from ..registry import SnowflakeActionRegistry
 from .common import OrchestrationConfig, OrchestrationEngine, extract_dependencies, sanitize_task_id
 
@@ -128,12 +133,8 @@ def _generate_dag_header(config: OrchestrationConfig) -> str:
     return f"""{docstring_lit}
 
 from datetime import datetime, timedelta
-from airflow import DAG
-from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
-from airflow.operators.python import PythonOperator
-from airflow.operators.bash import BashOperator
-from airflow.sensors.external_task import ExternalTaskSensor
-
+{airflow_dag_import()}from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
+{airflow_standard_import("PythonOperator")}{airflow_standard_import("BashOperator")}{airflow_standard_import("ExternalTaskSensor")}
 # DAG default arguments
 default_args = {{
     'owner': {owner_lit},
@@ -150,7 +151,7 @@ dag = DAG(
     dag_id={dag_id_lit},
     default_args=default_args,
     description={description_lit},
-    schedule_interval={schedule_lit},
+    schedule={schedule_lit},
     start_date=datetime(2025, 1, 1),
     catchup=False,
     tags={config.tags!r},
@@ -190,7 +191,7 @@ def _generate_task_definitions(tasks: List[Dict[str, Any]], config: Orchestratio
 def _generate_provider_action_task(
     task: Dict[str, Any], task_id: str, config: OrchestrationConfig
 ) -> str:
-    """Generate SnowflakeOperator for provider action."""
+    """Generate a SQLExecuteQueryOperator for a provider action."""
     action = task.get("action", "")
     params = task.get("parameters", {})
     task.get("description", "")
@@ -230,9 +231,11 @@ def _generate_provider_action_task(
     conn_lit = py_str_literal(config.snowflake_conn_id)
     sql_lit = py_str_literal(sql)
 
-    return f"""{var} = SnowflakeOperator(
+    # SQLExecuteQueryOperator (common-sql), not SnowflakeOperator: snowflake provider 6.0
+    # removed it.
+    return f"""{var} = SQLExecuteQueryOperator(
     task_id={task_id_lit},
-    snowflake_conn_id={conn_lit},
+    conn_id={conn_lit},
     sql={sql_lit},
     dag=dag,
 )
@@ -339,7 +342,7 @@ def _generate_create_table_sql(params: Dict[str, Any]) -> str:
     """Generate CREATE TABLE SQL.
 
     SQL-injection safety: this SQL is executed by the generated
-    ``SnowflakeOperator`` at DAG *runtime*, so every IDENTIFIER (database /
+    ``SQLExecuteQueryOperator`` at DAG *runtime*, so every IDENTIFIER (database /
     schema / table / column / cluster-by column) is routed through
     ``validate_ident`` before the existing double-quote wrapping, and every
     column TYPE through ``validate_sql_type_name``. A contract-supplied value

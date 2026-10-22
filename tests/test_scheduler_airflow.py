@@ -191,7 +191,9 @@ class TestAirflowSchedulerGeneration:
         content = list(files.values())[0]
 
         assert "from airflow import DAG" in content
-        assert "SnowflakeOperator" in content
+        assert (
+            "SQLExecuteQueryOperator" in content
+        )  # snowflake provider 6.0 removed SnowflakeOperator
         assert "load_customers" in content
         assert "sf_conn" in content
 

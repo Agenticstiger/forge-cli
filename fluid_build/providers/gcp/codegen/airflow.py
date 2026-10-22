@@ -21,9 +21,11 @@ or self-hosted Airflow on GCP.
 
 from datetime import datetime
 from datetime import timezone as dt_timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fluid_build.providers.common.codegen_utils import (
+    airflow_dag_import,
+    airflow_standard_import,
     convert_schedule_to_airflow,
     generate_file_header,
     generate_task_dependencies_code,
@@ -72,7 +74,7 @@ def generate_airflow_dag(contract: Dict[str, Any], project: str, region: str) ->
         gcp_region=region,
     )
     dag_code += "\n\n"
-    dag_code += _generate_dag_imports()
+    dag_code += _generate_dag_imports(provider_tasks)
     dag_code += "\n\n"
     dag_code += _generate_dag_definition(contract_id, contract_name, schedule, timezone)
     dag_code += "\n\n"
@@ -101,17 +103,33 @@ Generated: {datetime.now(dt_timezone.utc).replace(tzinfo=None).isoformat()}Z
 """'''
 
 
-def _generate_dag_imports() -> str:
-    """Generate import statements."""
-    return """from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.providers.google.cloud.operators.bigquery import (
+def _is_dataflow_template(task: Dict[str, Any]) -> bool:
+    """The test ``_generate_single_task`` dispatches on: ``<any>.dataflow.run_template``."""
+    parts = str(task.get("action", "")).split(".")
+    return len(parts) >= 3 and parts[1] == "dataflow" and parts[2] == "run_template"
+
+
+def _generate_dag_imports(tasks: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Generate import statements.
+
+    The Dataflow operator is imported only when a task uses it: its module needs
+    apache-airflow-providers-apache-beam, and an unused import that fails stops the
+    whole DAG from loading."""
+    dataflow = any(_is_dataflow_template(t) for t in tasks or [])
+    return (
+        "from datetime import datetime, timedelta\n"
+        "from zoneinfo import ZoneInfo\n"
+        + airflow_dag_import()
+        + airflow_standard_import("PythonOperator")
+        + """from airflow.providers.google.cloud.operators.bigquery import (
     BigQueryCreateEmptyDatasetOperator,
-    BigQueryCreateEmptyTableOperator,
     BigQueryInsertJobOperator,
 )
+try:  # apache-airflow-providers-google 13+ (17.0 removed BigQueryCreateEmptyTableOperator)
+    from airflow.providers.google.cloud.operators.bigquery import BigQueryCreateTableOperator
+except ImportError:  # older google providers (Airflow 2)
+    BigQueryCreateTableOperator = None
+    from airflow.providers.google.cloud.operators.bigquery import BigQueryCreateEmptyTableOperator
 from airflow.providers.google.cloud.operators.gcs import (
     GCSCreateBucketOperator,
     GCSDeleteBucketOperator,
@@ -120,13 +138,19 @@ from airflow.providers.google.cloud.operators.pubsub import (
     PubSubCreateTopicOperator,
     PubSubCreateSubscriptionOperator,
 )
-from airflow.providers.google.cloud.operators.dataflow import (
-    DataflowTemplatedJobStartOperator,
-)
-import json
+"""
+        + (
+            "from airflow.providers.google.cloud.operators.dataflow import (\n"
+            "    DataflowTemplatedJobStartOperator,\n"
+            ")\n"
+            if dataflow
+            else ""
+        )
+        + """import json
 import logging
 
 logger = logging.getLogger(__name__)"""
+    )
 
 
 def _generate_dag_definition(
@@ -161,7 +185,7 @@ dag = DAG(
     dag_id={dag_id_lit},
     default_args=default_args,
     description={contract_name_lit},
-    schedule_interval={airflow_schedule_lit},
+    schedule={airflow_schedule_lit},
     start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo({timezone_lit})),
     catchup=False,
     tags={tags!r},
@@ -233,14 +257,26 @@ def _generate_bigquery_task(
         dataset_lit = py_str_literal(params.get("dataset_id", "unknown_dataset"))
         table_lit = py_str_literal(params.get("table_id", "unknown_table"))
         schema_fields = params.get("schema", [])
-        return f"""{var} = BigQueryCreateEmptyTableOperator(
-    task_id={task_id_lit},
-    dataset_id={dataset_lit},
-    table_id={table_lit},
-    project_id={project_lit},
-    schema_fields={schema_fields!r},
-    dag=dag,
-)"""
+        # BigQueryCreateTableOperator where the google provider has it (13+), the
+        # BigQueryCreateEmptyTableOperator it replaced (removed in 17.0) before that.
+        return f"""if BigQueryCreateTableOperator is not None:
+    {var} = BigQueryCreateTableOperator(
+        task_id={task_id_lit},
+        dataset_id={dataset_lit},
+        table_id={table_lit},
+        project_id={project_lit},
+        table_resource={{"schema": {{"fields": {schema_fields!r}}}}},
+        dag=dag,
+    )
+else:
+    {var} = BigQueryCreateEmptyTableOperator(
+        task_id={task_id_lit},
+        dataset_id={dataset_lit},
+        table_id={table_lit},
+        project_id={project_lit},
+        schema_fields={schema_fields!r},
+        dag=dag,
+    )"""
 
     elif operation == "query" or operation == "run_query":
         query_sql = params.get("query", "SELECT 1")

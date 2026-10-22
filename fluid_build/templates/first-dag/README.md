@@ -74,9 +74,16 @@ outputs:
 ```python
 # dags/sales_analytics_pipeline_dag.py (auto-generated!)
 
-from airflow import DAG
-from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
+
+try:  # Airflow 3
+    from airflow.sdk import DAG
+except ImportError:  # Airflow 2.x
+    from airflow import DAG
+try:  # Airflow 3, or Airflow 2 with apache-airflow-providers-standard
+    from airflow.providers.standard.operators.python import PythonOperator
+except ImportError:  # Airflow 2.x core
+    from airflow.operators.python import PythonOperator
 
 default_args = {
     'owner': 'analytics-team',
@@ -89,7 +96,7 @@ default_args = {
 with DAG(
     'sales_analytics_pipeline',
     default_args=default_args,
-    schedule_interval='0 2 * * *',
+    schedule='0 2 * * *',
     catchup=False,
     tags=['sales', 'analytics', 'auto-generated'],
 ) as dag:

@@ -32,6 +32,8 @@ from datetime import timezone as dt_timezone
 from typing import Any, Dict, List, Optional
 
 from fluid_build.providers.common.codegen_utils import (
+    airflow_dag_import,
+    airflow_standard_import,
     escape_for_docstring,
     json_literal,
     py_str_literal,
@@ -41,11 +43,20 @@ from fluid_build.providers.common.codegen_utils import (
 logger = logging.getLogger(__name__)
 
 
-# Module-level names the generated DAG binds itself. A task variable must not
-# collide with any of them.
+# Module-level names the generated DAG binds itself, including every name its
+# imports bind (the TaskFlow ``dag`` / ``task`` decorators and the operator
+# classes). A task variable must not collide with any of them: ``taskId: task``
+# emitted ``def task():`` inside the DAG function, which shadows the decorator.
 _EMITTED_MODULE_NAMES = frozenset(
     {
         "dag",
+        "task",
+        "PythonOperator",
+        "S3CreateBucketOperator",
+        "GlueJobOperator",
+        "AthenaOperator",
+        "RedshiftDataOperator",
+        "LambdaInvokeFunctionOperator",
         "default_args",
         "logger",
         "json",
@@ -187,11 +198,14 @@ Generated: {datetime.now(dt_timezone.utc).replace(tzinfo=None).isoformat()}
 
 def _generate_dag_imports() -> str:
     """Generate import statements."""
-    return """from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.providers.amazon.aws.operators.s3 import S3CreateBucketOperator
+    return (
+        (
+            "from datetime import datetime, timedelta\n"
+            "from zoneinfo import ZoneInfo\n"
+            + airflow_dag_import()
+            + airflow_standard_import("PythonOperator")
+        )
+        + """from airflow.providers.amazon.aws.operators.s3 import S3CreateBucketOperator
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 from airflow.providers.amazon.aws.operators.athena import AthenaOperator
 from airflow.providers.amazon.aws.operators.redshift_data import RedshiftDataOperator
@@ -200,6 +214,7 @@ import json
 import logging
 
 logger = logging.getLogger(__name__)"""
+    )
 
 
 def _generate_dag_definition(
@@ -227,7 +242,7 @@ dag = DAG(
     dag_id={py_str_literal(_sanitize_dag_id(contract_id))},
     default_args=default_args,
     description={py_str_literal(contract_name)},
-    schedule_interval={py_str_literal(airflow_schedule)},
+    schedule={py_str_literal(airflow_schedule)},
     start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo({py_str_literal(timezone)})),
     catchup=False,
     tags={tags!r},
@@ -686,7 +701,10 @@ def _generate_taskflow_imports() -> str:
     """Generate import statements for TaskFlow API."""
     return """from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from airflow.decorators import dag, task
+try:  # Airflow 3
+    from airflow.sdk import dag, task
+except ImportError:  # Airflow 2.x
+    from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.operators.s3 import S3CreateBucketOperator
 from airflow.providers.amazon.aws.operators.athena import AthenaOperator
 from airflow.providers.amazon.aws.operators.redshift_data import RedshiftDataOperator
@@ -736,6 +754,20 @@ def _generate_taskflow_dag(
 
     # Build per-task variable names for dependency wiring
     task_vars: Dict[str, str] = _unique_task_identifiers(tasks)
+    # What a dependency edge connects: the operator itself, or a @task's call result
+    # (``<var>_result``). A @task function is not a task: ``fn >> fn`` raises TypeError.
+    nodes: Dict[str, str] = {}
+    # A @task's result gets a name of its own, allocated against every task variable and
+    # every other result: a task named ``chk_result`` and ``chk``'s result must not share one.
+    taken = set(task_vars.values()) | set(_EMITTED_MODULE_NAMES)
+
+    def _result_name(var: str) -> str:
+        candidate, suffix = f"{var}_result", 2
+        while candidate in taken:
+            candidate = f"{var}_result_{suffix}"
+            suffix += 1
+        taken.add(candidate)
+        return candidate
 
     for t in tasks:
         tid = t.get("taskId", "")
@@ -755,6 +787,7 @@ def _generate_taskflow_dag(
             lines.append(f"        region_name={py_str_literal(params.get('region', region))},")
             lines.append("        aws_conn_id='aws_default',")
             lines.append("    )")
+            nodes[tid] = var
         elif service == "athena" and operation == "execute_query":
             query = params.get("query", "")
             db = params.get("database", "default")
@@ -769,6 +802,7 @@ def _generate_taskflow_dag(
             lines.append(f"        output_location={py_str_literal(out)},")
             lines.append("        aws_conn_id='aws_default',")
             lines.append("    )")
+            nodes[tid] = var
         elif service == "glue":
             # Glue operations use @task decorators
             lines.append("")
@@ -792,7 +826,9 @@ def _generate_taskflow_dag(
                     f"json.loads({json_literal(params)}), {py_str_literal(account_id)}, "
                     f"{py_str_literal(region)})"
                 )
-            lines.append(f"    {var}_result = {var}()")
+            result = _result_name(var)
+            lines.append(f"    {result} = {var}()")
+            nodes[tid] = result
         else:
             # Generic @task fallback
             lines.append("")
@@ -803,17 +839,19 @@ def _generate_taskflow_dag(
                 f"json.loads({json_literal(params)}), {py_str_literal(account_id)}, "
                 f"{py_str_literal(region)})"
             )
-            lines.append(f"    {var}_result = {var}()")
+            result = _result_name(var)
+            lines.append(f"    {result} = {var}()")
+            nodes[tid] = result
 
     # Dependencies
     for t in tasks:
         tid = t.get("taskId", "")
         depends_on = t.get("dependsOn", [])
         if depends_on:
-            var = task_vars[tid]
+            node = nodes[tid]
             for dep in depends_on:
-                dep_var = task_vars.get(dep)
-                if dep_var is None:
+                dep_node = nodes.get(dep)
+                if dep_node is None:
                     logger.warning(
                         "aws airflow: task %r dependsOn %r, which is not a "
                         "provider_action task in this DAG — edge skipped",
@@ -822,7 +860,7 @@ def _generate_taskflow_dag(
                     )
                     lines.append(f"    # dependency on non-DAG task {dep!r} skipped")
                     continue
-                lines.append(f"    {dep_var} >> {var}")
+                lines.append(f"    {dep_node} >> {node}")
 
     lines.append("")
     lines.append("")
