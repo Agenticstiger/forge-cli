@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fluid_build.observability.secret_redactor import redact_secret_text, redact_value
-from fluid_build.providers._duckdb_compat import first_row, query_relation
+from fluid_build.providers._duckdb_compat import NO_ROWS_TO_WRITE, first_row, query_relation
 from fluid_build.providers._duckdb_read import build_register_view_sql
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
@@ -961,12 +961,7 @@ class LocalProvider(BaseProvider):
         if rel is None:
             # The same on DuckDB 1.5 and 2.x (see query_relation); 1.5 used to
             # fail below on ``None.write_csv``.
-            raise ValueError(
-                f"SQL action {idx} ends in a statement that returns no rows (CREATE, "
-                "INSERT, UPDATE, ...), so it has no result to write. End the SQL with a "
-                "SELECT of the result; to keep it as a table for later actions, also set "
-                "output_table."
-            )
+            raise ValueError(NO_ROWS_TO_WRITE)
 
         # If an output_table is specified, persist the result as a DuckDB table
         # so downstream materialize/copy steps can reference it.

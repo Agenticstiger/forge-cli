@@ -53,7 +53,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fluid_build.providers._duckdb_compat import first_row, query_relation
+from fluid_build.providers._duckdb_compat import NO_ROWS_TO_WRITE, first_row, query_relation
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
     DuckDBSandboxError,
@@ -222,10 +222,7 @@ def _execute_sql(con, sql: str):
             ) from e
         raise LocalProviderError("SQL execution failed: " + msg) from e
     if rel is None:
-        raise LocalProviderError(
-            "The action's SQL ends in a statement that returns no rows (CREATE, INSERT, "
-            "UPDATE, ...), so it has no result to write. End it with a SELECT of the result."
-        )
+        raise LocalProviderError(NO_ROWS_TO_WRITE)
     return rel
 
 

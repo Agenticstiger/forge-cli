@@ -229,8 +229,23 @@ def test_local_sql_that_returns_no_rows_fails_the_same_on_both_versions(product)
     )
     assert results[1]["status"] == "error"
     assert "returns no rows" in results[1]["error"]
-    assert "End the SQL with a SELECT" in results[1]["error"]
+    assert "End it with a SELECT of the result" in results[1]["error"]
     assert not out.exists()
+
+
+def test_the_fix_the_no_rows_error_suggests_works(product):
+    """The error's own example (CREATE, then SELECT what it made) lands the rows."""
+    out = product / "out" / "made.csv"
+    results = _local_apply(
+        product,
+        {
+            "op": "sql",
+            "sql": "CREATE TABLE made AS SELECT * FROM orders; SELECT * FROM made",
+            "outputs": [str(out)],
+        },
+    )
+    assert results[1]["status"] == "ok", results
+    assert out.read_text(encoding="utf-8").splitlines() == ["id,amount", "1,10", "2,20"]
 
 
 def test_contract_tests_sql_that_returns_no_rows_fails_clearly():

@@ -74,6 +74,15 @@ _NO_ROWS_STATEMENTS = frozenset(
 _NO_RESULT_SHAPES = frozenset({(("Count",), ("BIGINT",)), (("Success",), ("BOOLEAN",))})
 
 
+#: What the engine says when SQL meant to produce a result ends in a statement
+#: that returns no rows (``query_relation`` answered ``None``).
+NO_ROWS_TO_WRITE = (
+    "The SQL ends in a statement that returns no rows (CREATE, INSERT, UPDATE, ...), so "
+    "there is no result to write. End it with a SELECT of the result, for example: "
+    "CREATE TABLE t AS SELECT ...; SELECT * FROM t"
+)
+
+
 def query_relation(con: Any, sql: str) -> Any:
     """``con.sql(sql)``, or ``None`` when the SQL's last statement returns no rows.
 
@@ -115,6 +124,7 @@ def storage_compat_config(version: Tuple[int, int, int]) -> Dict[str, str]:
 
 
 __all__ = [
+    "NO_ROWS_TO_WRITE",
     "STORAGE_COMPATIBILITY_VERSION",
     "first_row",
     "query_relation",
