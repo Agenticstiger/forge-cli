@@ -624,6 +624,42 @@ jobs:
         run: python scripts/cleanup_local_test_artifacts.py
 
   # ──────────────────────────────────────────────────────────────
+  # DuckDB floor. pyproject.toml takes duckdb>=1.5.0 with no ceiling, and
+  # DuckDB 2.0 needs Python 3.11, so the only other job on 1.5.x is the
+  # Python 3.10 test leg, which gets the newest 1.5 patch, never the floor.
+  # This installs exactly the floor the sandbox enforces (MIN_DUCKDB_VERSION,
+  # read from the code, so the two cannot drift) on a supported Python and
+  # runs what differs between DuckDB versions: the compat seam
+  # (providers/_duckdb_compat.py), the sandbox, the MCP DuckDB driver and the
+  # local end-to-end suite.
+  # ──────────────────────────────────────────────────────────────
+  duckdb-floor:
+    name: DuckDB floor (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with local extras, then the DuckDB floor
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,local]"
+          floor=$(python -c "from fluid_build.providers._duckdb_sandbox import MIN_DUCKDB_VERSION as v; print('.'.join(map(str, v)))")
+          python -m pip install "duckdb==${floor}"
+          python -c "import duckdb, sys; print('duckdb', duckdb.__version__); sys.exit(duckdb.__version__ != '${floor}')"
+      - name: Run the DuckDB-version-sensitive tests on the floor
+        env:
+          FLUID_REQUIRE_DUCKDB: "1"
+        run: |
+          python -m pytest -q tests/providers/test_duckdb_compat.py tests/providers/test_duckdb_sandbox.py tests/providers/test_duckdb_sandbox_workspace_root.py tests/output_ports/test_drivers_duckdb.py tests/test_e2e_local.py tests/test_e2e_local_apply.py tests/test_e2e_local_negative.py
+      - name: Cleanup local artifacts (defensive)
+        if: always()
+        run: python scripts/cleanup_local_test_artifacts.py
+
+  # ──────────────────────────────────────────────────────────────
   # dbt v2 canary. The `test` and `coverage-and-audit` jobs install
   # `dbt-core<2` + dbt-duckdb, so they exercise the 1.x line only. Every
   # claim this repo makes about dbt v2 / Fusion was otherwise asserted
