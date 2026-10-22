@@ -1457,11 +1457,20 @@ def _duckdb_aliases(tree: ast.AST) -> tuple:
     return modules, members
 
 
+#: Functions of the duckdb module that take no connection and read nothing but
+#: their argument. ``tokenize`` splits a SQL string into token offsets and
+#: types (``_duckdb_compat`` finds a statement's trailing comments with it);
+#: unlike ``duckdb.sql`` and the other module-level functions, it has no
+#: ``connection`` parameter and runs no SQL.
+_CONNECTIONLESS = frozenset({"tokenize"})
+
+
 def _bypasses(path: Path) -> List[str]:
     """Each place ``path`` opens or queries DuckDB without the helper.
 
     * any call on the duckdb module (``duckdb.connect``, ``duckdb.sql`` and the
-      other module-level functions run on an unsandboxed default connection);
+      other module-level functions run on an unsandboxed default connection),
+      except the :data:`_CONNECTIONLESS` ones;
     * a function imported from duckdb (``from duckdb import connect``);
     * ``<anything named like duck>.connect(...)``, which catches the module
       held in a variable (``self._duckdb.connect``, ``_Duck.get().connect``).
@@ -1480,12 +1489,26 @@ def _bypasses(path: Path) -> List[str]:
         if isinstance(func, ast.Attribute):
             receiver = func.value
             if isinstance(receiver, ast.Name) and receiver.id in modules:
-                found.append(f"{where} duckdb.{func.attr}(...)")
+                if func.attr not in _CONNECTIONLESS:
+                    found.append(f"{where} duckdb.{func.attr}(...)")
             elif func.attr == "connect" and "duck" in ast.unparse(receiver).lower():
                 found.append(f"{where} {ast.unparse(func)}(...)")
         elif isinstance(func, ast.Name) and func.id in members:
             found.append(f"{where} {func.id}(...) imported from duckdb")
     return found
+
+
+def test_a_connectionless_duckdb_function_is_not_a_bypass(tmp_path):
+    """``duckdb.tokenize`` runs no SQL; the exemption is that name alone."""
+    # A default-connection function documents its ``connection`` parameter;
+    # tokenize has none, on 1.5 and 2.x.
+    assert "connection" in (duckdb.execute.__doc__ or "")
+    assert "connection" not in (duckdb.tokenize.__doc__ or "")
+    sample = tmp_path / "probe.py"
+    sample.write_text("import duckdb\nduckdb.tokenize('SELECT 1 -- c')\n", encoding="utf-8")
+    assert _bypasses(sample) == []
+    sample.write_text("import duckdb\nduckdb.tokenizer('SELECT 1')\n", encoding="utf-8")
+    assert _bypasses(sample)
 
 
 def test_the_bypass_detector_sees_the_helpers_own_connect():
