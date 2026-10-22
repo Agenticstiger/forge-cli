@@ -19,7 +19,7 @@ Airflow DAG generation from FLUID 0.7.1 orchestration specifications.
 Converts FLUID provider action tasks into Airflow operators:
 - sf.table.ensure → SQLExecuteQueryOperator
 - sf.sql.execute → SQLExecuteQueryOperator
-- python → PythonOperator
+- python → PythonOperator, calling a stub of the callable it names
 - bash → BashOperator
 """
 
@@ -51,6 +51,10 @@ def generate_airflow_dag(
 
     Returns:
         Python code for Airflow DAG
+
+    Raises:
+        ValueError: a SQL identifier or type is unsafe, or a python task's callable
+            name would rebind a name the generated DAG uses.
     """
     if config is None:
         config = _build_config_from_contract(contract, orchestration)
@@ -98,6 +102,25 @@ def _build_config_from_contract(
         database=location.get("database"),
         schema=location.get("schema"),
     )
+
+
+#: Every name ``_generate_dag_header`` binds, plus ``ImportError``, which each stub's
+#: ``except`` names. A python task's stub ``def`` under one of these would rebind it for
+#: every task below.
+_DAG_MODULE_NAMES = frozenset(
+    {
+        "datetime",
+        "timedelta",
+        "DAG",
+        "SQLExecuteQueryOperator",
+        "PythonOperator",
+        "BashOperator",
+        "ExternalTaskSensor",
+        "default_args",
+        "dag",
+        "ImportError",
+    }
+)
 
 
 def _generate_dag_header(config: OrchestrationConfig) -> str:
@@ -163,16 +186,19 @@ dag = DAG(
 def _generate_task_definitions(tasks: List[Dict[str, Any]], config: OrchestrationConfig) -> str:
     """Generate Airflow task definitions."""
     code = "# Task definitions\n\n"
+    # The variables the tasks above bound: a python task's stub ``def`` must not rebind one.
+    task_vars: set = set()
 
     for task in tasks:
         task_type = task.get("type", "provider_action")
         task_name = task.get("name", "unknown")
         task_id = sanitize_task_id(task_name)
+        start = len(code)
 
         if task_type == "provider_action":
             code += _generate_provider_action_task(task, task_id, config)
         elif task_type == "python":
-            code += _generate_python_task(task, task_id)
+            code += _generate_python_task(task, task_id, task_vars)
         elif task_type == "bash":
             code += _generate_bash_task(task, task_id)
         elif task_type == "sensor":
@@ -184,6 +210,9 @@ def _generate_task_definitions(tasks: List[Dict[str, Any]], config: Orchestratio
                 f"# TODO: Unsupported task type {py_str_literal(task_type)} "
                 f"for task {py_str_literal(task_name)}\n\n"
             )
+        var = sanitize_identifier(task_id)
+        if f"\n{var} = " in "\n" + code[start:]:  # an ERROR or TODO comment binds nothing
+            task_vars.add(var)
 
     return code
 
@@ -243,29 +272,85 @@ def _generate_provider_action_task(
 """
 
 
-def _generate_python_task(task: Dict[str, Any], task_id: str) -> str:
-    """Generate PythonOperator.
+def _generate_python_task(task: Dict[str, Any], task_id: str, task_vars: set) -> str:
+    """Generate a PythonOperator, preceded by a stub of the callable it names.
 
-    ``python_callable`` is emitted as a *bare* Python name (a reference to a
-    callable), so the contract-supplied ``callable`` is routed through
-    ``sanitize_identifier`` -- otherwise a value like ``os.system(...) or x``
-    would be interpolated as a top-level expression and executed at parse
-    time. The LHS variable name uses the same helper so it matches the
-    dependency wiring; ``task_id`` is emitted as a ``repr()``-escaped literal.
+    The contract ships no code for the callable, and ``python_callable=`` naming
+    an undefined function is a ``NameError`` when Airflow parses the file, which
+    loses the whole DAG. The stub raises ``AirflowFailException`` naming the task:
+    the DAG loads, and this task fails, without the retries a stub cannot pass,
+    until someone writes the function. It never goes green having done nothing.
+    It imports the exception when it runs, from Airflow 3's ``airflow.sdk``
+    first, so nothing is imported at parse time.
+
+    The stub's name is the contract's ``callable`` routed through
+    ``sanitize_identifier`` (otherwise ``os.system(...) or x`` would be
+    interpolated as code and run at parse time), and its message is one
+    ``repr()``-escaped literal via ``py_str_literal``. The LHS variable name
+    uses the same helper so it matches the dependency wiring.
     """
-    callable_name = task.get("callable", task_id + "_func")
+    named = task.get("callable")
+    callable_name = named or f"{task_id}_func"
 
     var = sanitize_identifier(task_id)
     task_id_lit = py_str_literal(task_id)
     callable_ident = sanitize_identifier(callable_name)
 
-    return f"""{var} = PythonOperator(
+    clash = _stub_clash(callable_ident, task_vars)
+    if clash:
+        what = f"callable {str(named)!r}" if named else f"its default callable {callable_ident!r}"
+        raise ValueError(
+            f"python task {task_id!r}: cannot stub {what}: {clash}. "
+            "Set the task's callable to another name."
+        )
+
+    source = (
+        f"the contract names the callable {str(named)!r} but ships no code for it"
+        if named
+        else "the contract's python task names no callable"
+    )
+    message_lit = py_str_literal(
+        f"Task {task_id!r} calls {callable_ident}(), which this generated DAG only stubs: "
+        f"{source}. Implement {callable_ident}() in this file, or make the task a bash "
+        "task that runs your code."
+    )
+
+    return f"""# Stub: the contract does not ship this callable's code.
+def {callable_ident}(*args, **kwargs):
+    try:  # Airflow 3
+        from airflow.sdk.exceptions import AirflowFailException
+    except ImportError:  # Airflow 2.x
+        from airflow.exceptions import AirflowFailException
+    raise AirflowFailException({message_lit})
+
+
+{var} = PythonOperator(
     task_id={task_id_lit},
     python_callable={callable_ident},
     dag=dag,
 )
 
 """
+
+
+def _stub_clash(ident: str, task_vars: set) -> str:
+    """Why a stub ``def`` named *ident* is refused, or ``""`` when it is not.
+
+    It would rebind a name the module defines above it. For the ``dag``, an
+    operator class or an earlier task's variable the DAG would then fail to load
+    or wire the wrong object; the header's other names are refused too, so no stub
+    shadows them. A ``__dunder__`` name is Python's. Sharing its own task's name is
+    fine: the stub sits right above the operator, and
+    ``x = PythonOperator(python_callable=x)`` reads the function before the
+    assignment rebinds ``x``.
+    """
+    if ident.startswith("__") and ident.endswith("__"):
+        return "names of the form __name__ are Python's"
+    if ident in task_vars:
+        return f"an earlier task's variable is already named {ident!r}"
+    if ident in _DAG_MODULE_NAMES:
+        return f"the generated DAG already uses the name {ident!r}"
+    return ""
 
 
 def _generate_bash_task(task: Dict[str, Any], task_id: str) -> str:
