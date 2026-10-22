@@ -39,7 +39,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fluid_build.observability.secret_redactor import redact_secret_text, redact_value
-from fluid_build.providers._duckdb_compat import NO_ROWS_TO_WRITE, one_row, query_relation
+from fluid_build.providers._duckdb_compat import (
+    NO_ROWS_TO_WRITE,
+    one_row,
+    query_relation,
+    relation_view,
+)
 from fluid_build.providers._duckdb_read import build_register_view_sql
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
@@ -1139,12 +1144,11 @@ class LocalProvider(BaseProvider):
         """
         from fluid_build.build_runners.duckdb.runner import _build_copy_destination
 
-        view = "__fluid_embedded_result"
-        rel.create_view(view, replace=True)
         # ``replace`` on the first ``{select}``, not ``str.format``: the quoted
         # URI follows it in the template and may itself hold braces.
         template = _build_copy_destination(uri, fmt)
-        con.execute(template.replace("{select}", f"SELECT * FROM {view}", 1))
+        with relation_view(con, rel, "__fluid_embedded_result") as view:
+            con.execute(template.replace("{select}", f"SELECT * FROM {view}", 1))
 
     # ------------------ COPY / materialize (helper) --------------------- #
 

@@ -19,7 +19,7 @@ forge-cli takes ``duckdb>=1.5.0`` with no ceiling (the floor is the sandbox's,
 needs Python 3.11, so a Python 3.10 install stays on 1.5.x while a newer one
 gets 2.x: the engine runs on both, and what differs lives here.
 
-Three 2.0 changes reach the engine (duckdb-python v2.0.0 release notes,
+These 2.0 changes reach the engine (duckdb-python v2.0.0 release notes,
 "Upgrading from 1.x"; https://duckdb.org/docs/2.0/clients/python/migration.html):
 
 * A ``con.execute()`` result streams, and owns its connection until it is read
@@ -31,8 +31,15 @@ Three 2.0 changes reach the engine (duckdb-python v2.0.0 release notes,
   ... AS``, an ``INSERT`` without ``RETURNING``) returns a relation where 1.5
   returned ``None``: over the statement's row count, or, after an earlier
   query in the same SQL, over that query's rows. Written out as a contract's
-  result, that is a one-row ``Count`` file or stale rows. :func:`query_relation`
-  answers ``None`` for it on both.
+  result, that is a one-row ``Count`` file or stale rows. It also runs the
+  statements ahead of one that does not parse, where 1.5 runs none, and a
+  relation of SQL that ends in a comment after its ``;`` fails to aggregate,
+  limit or write ("syntax error at or near ';'"). :func:`query_relation`
+  answers as 1.5 does on both.
+* A relation whose rows 2.0 already holds (its SQL ran when the relation was
+  made: a ``PIVOT`` without an ``IN`` list, a ``SELECT`` calling
+  ``nextval()``, ``... RETURNING``) cannot back a view ("it reads rows held in
+  this process"). :func:`relation_view` puts those rows in a table instead.
 * A database file 2.0 creates uses storage version 2.0, which no 1.5 process can
   open ("can only read versions between 64 and 68"). :func:`storage_compat_config`
   has 2.x write the format 1.5 itself writes, so a file forge-cli creates is the
@@ -44,13 +51,15 @@ Nothing here imports duckdb at module level: callers pass what they hold, and
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, Optional, Tuple
 
-#: The storage format DuckDB 1.5 writes by default (storage version 64, which
-#: DuckDB 1.0 and later open). Database files forge-cli creates on DuckDB 2.x
-#: are written in it, so a 1.5 install (Python 3.10, or a tool pinned below 2)
-#: opens them, and a 2.x connection accepts the same SQL on them as 1.5 does (a
-#: VARIANT column, which needs storage v1.5.0, is refused on both).
+#: Storage version 64, the one DuckDB 1.5 writes by default (its own setting
+#: reads ``v0.10.2``, which writes the same version), and which DuckDB 1.0 and
+#: later open. Database files forge-cli creates on DuckDB 2.x are written in
+#: it, so a 1.5 install (Python 3.10, or a tool pinned below 2) opens them, and
+#: a 2.x connection accepts the same SQL on them as 1.5 does (a VARIANT column,
+#: which needs storage v1.5.0, is refused on both).
 STORAGE_COMPATIBILITY_VERSION = "v1.0.0"
 
 
@@ -111,9 +120,10 @@ def query_relation(con: Any, sql: str) -> Any:
     statement is judged by the shape 2.0 gives one without a query result (a
     ``Count`` of changed rows, or a ``Success`` flag; every DDL, ``SET``,
     ``ATTACH``, ``LOAD`` and transaction statement returns one of the two).
-    Each statement runs once. One case stays apart: a ``RETURNING`` clause
-    whose only column is a ``BIGINT`` named ``Count``, or a ``BOOLEAN`` named
-    ``Success``, reads as no rows on 2.x.
+    Each statement runs once, and SQL that does not parse raises before any of
+    it runs, as on 1.5. One case stays apart: a ``RETURNING`` clause whose only
+    column is a ``BIGINT`` named ``Count``, or a ``BOOLEAN`` named ``Success``,
+    reads as no rows on 2.x.
     """
     import duckdb
 
@@ -121,20 +131,67 @@ def query_relation(con: Any, sql: str) -> Any:
 
     if duckdb_version(duckdb) < (2, 0, 0):
         return con.sql(sql)
-    try:
-        statements = con.extract_statements(sql)
-    except Exception:  # noqa: BLE001 - DuckDB raises its own error from con.sql
-        statements = []
-    if not statements:
+    # Parses the whole SQL first: a statement that does not parse raises here,
+    # before any runs (2.0's con.sql() would run the statements ahead of it).
+    statements = con.extract_statements(sql)
+    if not statements:  # empty, or only comments
         return con.sql(sql)
     for statement in statements[:-1]:
-        con.execute(statement.query).fetchall()
+        con.execute(statement.query)
+        # To its end without reading its rows into Python (2.0's complete()):
+        # a SELECT ahead of the last statement is run for its effects only.
+        con.complete()
     last = statements[-1]
-    rel = con.sql(last.query)
+    rel = con.sql(_without_trailing_comments(last.query))
     if last.type.name in _QUERY_STATEMENTS:
         return rel
     shape = (tuple(rel.columns), tuple(str(t) for t in rel.types))
     return None if shape in _NO_RESULT_SHAPES else rel
+
+
+def _without_trailing_comments(statement: str) -> str:
+    """``statement`` without the comments that end it.
+
+    DuckDB 2.0 keeps a statement's text with the relation ``con.sql()`` makes
+    and reads it again inside the SQL of ``aggregate``, ``limit`` or
+    ``write_csv``, where a comment after the closing ``;`` no longer parses.
+    ``duckdb.tokenize`` tells a comment from a ``--`` inside a string, and
+    gives each token's offset in bytes.
+    """
+    import duckdb
+
+    cut = None
+    for offset, kind in reversed(duckdb.tokenize(statement)):
+        if kind != duckdb.token_type.comment:
+            break
+        cut = offset
+    if cut is None:
+        return statement
+    return statement.encode("utf-8")[:cut].decode("utf-8").rstrip()
+
+
+@contextmanager
+def relation_view(con: Any, rel: Any, name: str) -> Iterator[str]:
+    """``name`` reads ``rel`` while the block runs (a view), for SQL such as ``COPY``.
+
+    DuckDB 2.0 refuses a view over a relation whose rows it already holds (see
+    the module docstring); those rows go to a table of that name instead. The
+    view or table is dropped when the block ends. ``name`` is an identifier the
+    caller owns.
+    """
+    import duckdb
+
+    try:
+        rel.create_view(name, replace=True)
+        kind = "VIEW"
+    except duckdb.InvalidInputException:
+        con.execute(f"DROP TABLE IF EXISTS {name}")
+        rel.to_table(name)
+        kind = "TABLE"
+    try:
+        yield name
+    finally:
+        con.execute(f"DROP {kind} IF EXISTS {name}")
 
 
 def storage_compat_config(version: Tuple[int, int, int]) -> Dict[str, str]:
@@ -157,5 +214,6 @@ __all__ = [
     "first_row",
     "one_row",
     "query_relation",
+    "relation_view",
     "storage_compat_config",
 ]

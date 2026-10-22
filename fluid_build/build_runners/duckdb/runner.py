@@ -22,7 +22,7 @@ Reader dispatch by ``source.kind``:
 
   - ``filesystem``  -> ``read_csv`` / ``read_parquet`` / ``read_json``
   - ``postgres``    -> ``ATTACH ... (TYPE postgres, READ_ONLY)``, then ``<alias>.<schema>.<table>``
-  - ``mysql``       -> ``ATTACH ... (TYPE mysql)``, then ``<alias>.<database>.<table>``
+  - ``mysql``       -> ``ATTACH ... (TYPE mysql, READ_ONLY)``, then ``<alias>.<database>.<table>``
   - ``sqlite``      -> ``ATTACH ... (TYPE sqlite)``, then ``<alias>.<table>``
   - ``http``        -> ``read_csv_auto('https://...')``
 
@@ -469,12 +469,37 @@ def _build_select_for_postgres(stream: str, *, alias: str) -> str:
     return f"SELECT * FROM {alias}.{schema}.{table}"
 
 
+#: How an ``ATTACH``-ed Postgres catalog types an enum column, ``ENUM('a', 'b')``,
+#: or an array of one, ``ENUM('a', 'b')[]``. Group 1 is the array suffix.
+_ENUM_TYPE = re.compile(r"ENUM\(.*\)((?:\[\])*)", re.DOTALL)
+
+
+def _postgres_enums_as_varchar(con: Any, select_sql: str) -> str:
+    """``select_sql`` with each enum column read as ``VARCHAR`` (an enum array as ``VARCHAR[]``).
+
+    ``postgres_scan``, which read a Postgres source until DuckDB 2.0 dropped
+    it, typed an enum column ``VARCHAR``; the ``ATTACH``-ed catalog types it
+    ``ENUM(...)``. Read as before, an enum column is no type change to the
+    declared schema the gate compares, a ``range`` gate compares it as text
+    rather than in declaration order, and it lands as the text it always did.
+    The same ``SELECT * REPLACE`` the masking projection uses.
+    """
+    replaced = []
+    for row in con.execute(f"DESCRIBE {select_sql}").fetchall():
+        match = _ENUM_TYPE.fullmatch(str(row[1]))
+        if match:
+            ident = '"' + str(row[0]).replace('"', '""') + '"'
+            replaced.append(f"CAST({ident} AS VARCHAR{match.group(1)}) AS {ident}")
+    if not replaced:
+        return select_sql
+    return f"SELECT * REPLACE ({', '.join(replaced)}) FROM ({select_sql})"
+
+
 def _build_select_for_mysql(connection: Dict[str, Any], stream: str, *, alias: str) -> str:
     """Read from MySQL via the duckdb ``mysql`` extension.
 
-    Requires that ``ATTACH '<dsn>' AS <alias> (TYPE mysql)`` has already
-    been issued in the same connection (handled by
-    ``DuckdbRunner._attach_external_databases``).
+    Requires the ``ATTACH`` of :func:`_mysql_attach_sql` on the same
+    connection (``DuckdbRunner._attach_external_databases`` makes it).
 
     The ``alias`` is per-build (derived from the build_id) so a contract
     with two mysql sources doesn't collide on a hardcoded ``mysql_db``
@@ -762,7 +787,7 @@ class DuckdbRunner:
             before_lock=lambda c: self._load_extensions(c, ctx),
         )
         try:
-            select_sql = _select_for_first_stream(ctx)
+            select_sql = _select_for_first_stream(con, ctx)
             con.execute(f"CREATE TEMP VIEW _fp AS {select_sql}")
             rows = con.execute("DESCRIBE _fp").fetchall()
             # What lands, not what the source holds: a masked column lands as
@@ -906,11 +931,12 @@ def _attach_with_password_masked(con: Any, statement: str, password: Any) -> Non
         raise _SourceAttachError(masked)
 
 
-def _select_for_first_stream(ctx: RunContext) -> str:
-    return _select_for_stream(ctx, ctx.source.streams[0] if ctx.source.streams else "data")
+def _select_for_first_stream(con: Any, ctx: RunContext) -> str:
+    return _select_for_stream(con, ctx, ctx.source.streams[0] if ctx.source.streams else "data")
 
 
-def _select_for_stream(ctx: RunContext, stream: str) -> str:
+def _select_for_stream(con: Any, ctx: RunContext, stream: str) -> str:
+    """The ``SELECT`` of ``stream`` on ``con``, the run's connection with the source attached."""
     kind = ctx.source.kind
     conn = dict(ctx.source.connection.raw)
     if kind == "filesystem":
@@ -924,7 +950,10 @@ def _select_for_stream(ctx: RunContext, stream: str) -> str:
         opts = dict(ctx.source.reader.options) if ctx.source.reader else {}
         return _build_select_for_http(uri, fmt or "csv", opts)
     if kind == "postgres":
-        return _build_select_for_postgres(stream, alias=_postgres_alias_for_build(ctx.build_id))
+        select_sql = _build_select_for_postgres(
+            stream, alias=_postgres_alias_for_build(ctx.build_id)
+        )
+        return _postgres_enums_as_varchar(con, select_sql)
     if kind in ("mysql", "mariadb"):
         # MariaDB uses the same duckdb mysql extension; the discoverer
         # already accepts both schemes (cli/discover/mysql.py), keep
@@ -1464,7 +1493,7 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
         for stream in streams_to_run:
             t_stream = time.time()
             try:
-                base_sel = _select_for_stream(ctx, stream)
+                base_sel = _select_for_stream(con, ctx, stream)
                 # Apply incremental cursor filter if the contract asked for it.
                 # ``last_cursor_value`` is the value we filtered on (None for
                 # full refresh OR first incremental run); kept for the

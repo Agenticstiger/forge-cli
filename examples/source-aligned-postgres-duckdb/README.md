@@ -45,7 +45,10 @@ table to `out/orders.parquet`, and persists a run record under
 ## What this exercises
 
 - v0.7.3 `acquisition` build pattern + `duckdb` engine
-- Postgres source attached by DuckDB's postgres extension (no Airbyte server needed)
+- Postgres source attached by DuckDB's postgres extension (no Airbyte server needed).
+  The attach is `READ_ONLY`, which refuses writes through DuckDB's catalog but
+  is no write barrier on the server; outside this demo, connect as a role that
+  can only read (for example one granted `pg_read_all_data`)
 - Parquet sink via `COPY (...) TO ... (FORMAT 'parquet')`
 - Run-record persistence + lock acquisition
 - Pre-land hook chain (`dlp_scan`, `quality_gate`) — non-blocking on this

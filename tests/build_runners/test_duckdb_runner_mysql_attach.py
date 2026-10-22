@@ -135,8 +135,8 @@ class TestEveryValueReachesTheServerExactly:
         """Without it the extension looks for a default secret in the persistent
         storage the sandbox turned off: ``Unknown secret storage found:
         'local_file'``, and no mysql source attached at all."""
-        secret, sql = _executed(_BASE)
-        assert secret == "CREATE TEMPORARY SECRET mysql_b1 (TYPE mysql)"
+        store_sql, sql = _executed(_BASE)
+        assert store_sql == "CREATE TEMPORARY SECRET mysql_b1 (TYPE mysql)"
         assert sql.startswith("ATTACH '")
 
 
@@ -222,10 +222,10 @@ class TestPostgresAttach:
     and sqlite sources, and attaches it read-only."""
 
     def test_the_source_is_attached_read_only_under_a_per_build_alias(self):
-        secret, sql = _executed(dict(_BASE, port="5432"), kind="postgres")
+        store_sql, sql = _executed(dict(_BASE, port="5432"), kind="postgres")
         # An empty temporary secret: the sandbox's disabled persistent storage
         # otherwise fails the ATTACH's default-secret lookup.
-        assert secret == "CREATE TEMPORARY SECRET postgres_b1 (TYPE postgres)"
+        assert store_sql == "CREATE TEMPORARY SECRET postgres_b1 (TYPE postgres)"
         assert sql.startswith("ATTACH '")
         assert sql.endswith(" AS postgres_b1 (TYPE postgres, SECRET postgres_b1, READ_ONLY)")
         assert "dbname=app" in _dsn_of(sql)

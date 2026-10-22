@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `x -> x + 1` lambda is an error (write `lambda x: x + 1`), and integer `//` and `%` by
   zero raise an error instead of returning NULL (wrap them in `TRY(...)`). See
   https://duckdb.org/docs/2.0/operations_manual/migration.html.
+- A DuckDB acquisition build now resolves a Postgres source's `connection.secretRef`. It
+  ignored it, and libpq's `PGPASSWORD` or `~/.pgpass` supplied the password, so a
+  `secretRef` that does not resolve where `fluid apply` runs now fails the build. To keep
+  using `PGPASSWORD`, remove the `secretRef`; an inline `password` still wins over it.
 - `fluid validate --env <env> --strict` (on one contract or a whole workspace), `fluid
   contract-validation --env <env> --strict` and `fluid test --env <env> --strict` (the
   native engine; `--engine soda` does not read `--strict`) now fail when an overlay patch
@@ -86,6 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an empty temporary secret named in the `ATTACH` (the DSN carries the credentials), and
   read as `<alias>.<schema>.<table>` on 1.5.x and 2.x; a Postgres source's
   `connection.secretRef` is resolved into the password, as a MySQL source's already was.
+  A Postgres enum column still reads, and lands, as text. A stream name is looked up as
+  DuckDB looks up names, ignoring case: where two tables' names differ only in case, the
+  build can read the other one.
   A source the runner cannot attach (unreachable, refused, a `secretRef` that does not
   resolve) fails the build with the reason, its password masked, and writes a run
   record; a MySQL or MariaDB source used to end `fluid apply` with `Unexpected error
@@ -96,6 +103,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed there on `'NoneType' object has no attribute 'write_csv'`, and DuckDB 2.0
   reported success with a one-row `Count` file, an empty `Success` file (a `CREATE TABLE
   ... AS PIVOT`) or the rows of an earlier `SELECT` in the same SQL as the output.
+- **DuckDB 2.0: contract SQL.** A local SQL action whose SQL ends in a comment after its
+  last `;` failed to write its output (`syntax error at or near ";"`); SQL with a
+  statement that does not parse ran the statements ahead of it before failing, where
+  DuckDB 1.5 runs none; and the result of a `PIVOT` without an `IN` list, or of a query
+  calling `nextval()`, could not be written to an `s3://` output or, in
+  `fluid_build.contract_tests`, to Parquet (`Cannot create the view ...: it reads rows
+  held in this process`). Each now behaves as on 1.5.
 
 ## [0.21.0] — 2026-10-19
 

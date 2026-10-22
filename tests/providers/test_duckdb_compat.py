@@ -36,6 +36,7 @@ from fluid_build.providers._duckdb_compat import (  # noqa: E402
     first_row,
     one_row,
     query_relation,
+    relation_view,
     storage_compat_config,
 )
 from fluid_build.providers._duckdb_sandbox import (  # noqa: E402
@@ -202,6 +203,72 @@ def test_query_relation_runs_each_statement_once():
     assert first_row(con.execute("SELECT count(*) FROM t WHERE a = 8")) == (0,)
 
 
+def test_query_relation_of_sql_that_does_not_parse_runs_none_of_it():
+    """DuckDB 2.0's con.sql() runs the statements ahead of one that does not
+    parse before it raises; 1.5 parses the whole SQL first and runs none."""
+    con = _table_t()
+    with pytest.raises(duckdb.ParserException):
+        query_relation(con, "INSERT INTO t VALUES (7); SELEC 1")
+    assert first_row(con.execute("SELECT count(*) FROM t WHERE a = 7")) == (0,)
+
+
+@pytest.mark.parametrize("sql", ["", "-- nothing", "/* nothing */"])
+def test_query_relation_of_no_statement_is_none(sql):
+    assert query_relation(_table_t(), sql) is None
+
+
+@pytest.mark.parametrize(
+    "sql, value",
+    [
+        ("SELECT 'x' AS v FROM t; -- the result", "x"),
+        ("SELECT 'x' AS v FROM t; /* the result */", "x"),
+        ("SELECT 'x' AS v FROM t -- the result", "x"),
+        ("SELECT 'x' AS v FROM t;\n-- one\n-- two\n", "x"),
+        # A ';' or '--' inside a string is not the end, and the offsets
+        # DuckDB's tokenizer gives are bytes, which these characters are not.
+        ("SELECT '; --é€' AS v FROM t; -- ü", "; --é€"),
+    ],
+)
+def test_a_comment_after_the_last_statement_leaves_the_relation_usable(sql, value, tmp_path):
+    """DuckDB 2.0 reads the statement's text again inside the SQL of a
+    relation's aggregate, limit or write, where a comment after the closing
+    ';' fails to parse; 1.5 reads it fine."""
+    rel = query_relation(_table_t(), sql)
+    assert one_row(rel.aggregate("count(*)")) == (3,)
+    assert rel.limit(1).fetchall() == [(value,)]
+    out = tmp_path / "out.csv"
+    rel.write_csv(str(out))
+    assert out.read_text(encoding="utf-8").splitlines()[1] == value
+
+
+@pytest.mark.parametrize(
+    "sql, rows",
+    [
+        # DuckDB 2.0 runs these as the relation is made and holds their rows.
+        ("PIVOT t ON a USING count(*)", [(1, 1, 1)]),
+        ("SELECT nextval('s') AS n FROM t ORDER BY n", [(1,), (2,), (3,)]),
+        ("SELECT a FROM t ORDER BY a", [(0,), (1,), (2,)]),
+    ],
+    ids=["pivot", "nextval", "lazy"],
+)
+def test_relation_view_reads_rows_duckdb_already_holds(sql, rows, tmp_path):
+    """DuckDB 2.0 refuses a view over such a relation ("it reads rows held in
+    this process"); relation_view keeps the COPY the engine runs from it."""
+    con = _table_t()
+    con.execute("CREATE SEQUENCE s")
+    rel = con.sql(sql)
+    out = tmp_path / "out.parquet"
+    with relation_view(con, rel, "__fluid_test_result") as name:
+        con.execute(f"COPY (SELECT * FROM {name}) TO '{out}' (FORMAT parquet)")
+    assert duckdb.connect().execute(f"SELECT * FROM '{out}'").fetchall() == rows
+    # The query ran once (the sequence moved by three, not six) and nothing is left.
+    if "nextval" in sql:
+        assert con.execute("SELECT currval('s')").fetchall() == [(3,)]
+    left = "SELECT count(*) FROM duckdb_{0}s() WHERE {0}_name = '__fluid_test_result'"
+    assert con.execute(left.format("view")).fetchall() == [(0,)]
+    assert con.execute(left.format("table")).fetchall() == [(0,)]
+
+
 # ── the engine, end to end ───────────────────────────────────────────────
 
 
@@ -270,6 +337,71 @@ def test_local_sql_that_returns_no_rows_fails_the_same_on_both_versions(product,
     assert "returns no rows" in results[1]["error"]
     assert "write just the SELECT" in results[1]["error"]
     assert not out.exists()
+
+
+def test_local_sql_ending_in_a_comment_writes_its_result(product):
+    out = product / "out" / "orders.csv"
+    sql = "SELECT * FROM orders ORDER BY id; -- every order"
+    results = _local_apply(product, {"op": "sql", "sql": sql, "outputs": [str(out)]})
+    assert results[1]["status"] == "ok", results
+    assert out.read_text(encoding="utf-8").splitlines() == ["id,amount", "1,10", "2,20"]
+
+
+def test_local_sql_with_a_statement_that_does_not_parse_runs_none_of_it(product):
+    """On DuckDB 2.0 the statement ahead of the bad one ran, and the next
+    action in the same apply saw the table it made."""
+    out = product / "out"
+    results = _local_apply(
+        product,
+        {
+            "op": "sql",
+            "sql": "CREATE TABLE made AS SELECT * FROM orders; SELEC 1",
+            "outputs": [str(out / "bad.csv")],
+        },
+        {
+            "op": "sql",
+            "sql": "SELECT count(*) AS n FROM duckdb_tables() WHERE table_name = 'made'",
+            "outputs": [str(out / "made.csv")],
+        },
+    )
+    assert [r["status"] for r in results] == ["ok", "error", "ok"], results
+    assert (out / "made.csv").read_text(encoding="utf-8").splitlines() == ["n", "0"]
+
+
+def _sales(con: Any) -> Any:
+    con.execute(
+        "CREATE TABLE sales AS SELECT * FROM (VALUES ('jan', 1), ('feb', 2), ('jan', 3)) "
+        "s(month, amount)"
+    )
+    return con
+
+
+def test_a_local_result_duckdb_already_holds_is_copied_to_a_remote_output(tmp_path):
+    """``_copy_relation_to_uri`` (an ``s3://`` output) made a view of the
+    result, which DuckDB 2.0 refuses for a PIVOT without an IN list. A local
+    path stands in for the bucket: the COPY is the same statement."""
+    from fluid_build.providers.local.local import LocalProvider
+
+    con = _sales(duckdb.connect())
+    rel = con.sql("PIVOT sales ON month USING sum(amount)")
+    out = tmp_path / "pivot.parquet"
+    provider = LocalProvider(project="local", region="local", anchor_dir=tmp_path)
+    provider._copy_relation_to_uri(con, rel, str(out), "parquet")
+    assert duckdb.connect().execute(f"SELECT feb, jan FROM '{out}'").fetchall() == [(2, 4)]
+
+
+def test_contract_tests_writes_a_result_duckdb_already_holds_to_parquet(tmp_path):
+    pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+    from fluid_build.contract_tests import _execute_sql, _write_output
+
+    rel = _execute_sql(_sales(duckdb.connect()), "PIVOT sales ON month USING sum(amount)")
+    out = tmp_path / "pivot.parquet"
+    assert _write_output(rel, {"path": str(out), "format": "parquet"}, dry_run=False) == (
+        1,
+        str(out.resolve()),
+    )
+    assert duckdb.connect().execute(f"SELECT feb, jan FROM '{out}'").fetchall() == [(2, 4)]
 
 
 def test_contract_tests_sql_that_returns_no_rows_fails_clearly():

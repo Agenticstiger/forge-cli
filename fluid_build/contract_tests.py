@@ -270,7 +270,13 @@ def _write_output(rel, outputs: Dict[str, Any], dry_run: bool) -> Tuple[int, Opt
 
             # Create a temp view and then COPY from it.
             tmp_view = "__fluid_tmp_out"
-            rel.create_view(tmp_view, replace=True)
+            try:
+                rel.create_view(tmp_view, replace=True)
+            except Exception as e:
+                # DuckDB 2.0 refuses a view over rows it already holds (a PIVOT,
+                # nextval(), RETURNING); the COPY below then fails too, and its
+                # pandas fallback writes the file.
+                LOGGER.debug(f"Failed to create temp view {tmp_view}: {e}")
             if mode == "append":
                 # Append parquet: create if not exists then append is not trivial.
                 # DuckDB supports COPY with APPEND (v0.10+). Try; else fallback.
