@@ -262,10 +262,11 @@ def register(subparsers) -> None:
         choices=["v1.0.0", "v1.1.0"],
         default=None,
         help=(
-            "ODPS apiVersion to emit. Default v1.0.0 (the released standard). "
-            "v1.1.0 adds the RFC 0029 top-level `type` (sourceAligned / aggregate / "
-            "consumerAligned, mapped from metadata.productType) but is pre-release "
-            "until Bitol cuts it, so it stays opt-in."
+            "ODPS apiVersion to emit. Both are released: v1.0.0 (default) and "
+            "v1.1.0, which adds the RFC 0029 top-level `type` (sourceAligned / "
+            "aggregate / consumerAligned, mapped from metadata.productType). "
+            "v1.1.0 stays opt-in so existing consumers keep reading the "
+            "apiVersion they already parse."
         ),
     )
     export.set_defaults(func=lambda args, logger=None: _run_odps_export(args))

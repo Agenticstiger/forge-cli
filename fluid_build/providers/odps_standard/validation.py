@@ -33,9 +33,10 @@ LOG = logging.getLogger(__name__)
 _SCHEMA_DIR = Path(__file__).parent / "schemas"
 _SCHEMA_PATH = _SCHEMA_DIR / "odps-product-v1.0.0.json"
 
-#: apiVersion values with a vendored schema. v1.1.0 is sourced from the dev
-#: branch (approved RFCs staged for release, top-level ``type`` from RFC 0029)
-#: and stays opt-in as an emit target until Bitol cuts it on main.
+#: apiVersion values with a vendored schema. Both are released standards:
+#: v1.0.0 (2025-09-24) and v1.1.0 (2026-09-08, top-level ``type`` from
+#: RFC 0029). v1.1.0 stays opt-in as an emit target so contracts pinned to a
+#: 0.7.5 schema keep emitting the apiVersion their consumers already read.
 SUPPORTED_API_VERSIONS = ("v1.0.0", "v1.1.0")
 DEFAULT_API_VERSION = "v1.0.0"
 

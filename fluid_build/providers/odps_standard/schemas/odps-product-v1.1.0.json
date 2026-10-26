@@ -3,30 +3,20 @@
   "title": "Open Data Product Standard (ODPS)",
   "description": "An open data product standard descriptor to enable defining data products.",
   "type": "object",
-  "required": [
-    "apiVersion",
-    "kind",
-    "id"
-  ],
+  "required": ["apiVersion", "kind", "id"],
   "additionalProperties": false,
   "properties": {
     "apiVersion": {
       "type": "string",
       "default": "v1.1.0",
       "description": "Version of the standard used to build data product. Default value is v1.1.0.",
-      "enum": [
-        "v1.1.0",
-        "v1.0.0",
-        "v0.9.0"
-      ]
+      "enum": ["v1.1.0", "v1.0.0", "v0.9.0"]
     },
     "kind": {
       "type": "string",
       "default": "DataProduct",
       "description": "The kind of file this is. Valid value is `DataProduct`.",
-      "enum": [
-        "DataProduct"
-      ]
+      "enum": ["DataProduct"]
     },
     "id": {
       "type": "string",
@@ -51,13 +41,7 @@
     "status": {
       "type": "string",
       "description": "Current status of the data product.",
-      "examples": [
-        "proposed",
-        "draft",
-        "active",
-        "deprecated",
-        "retired"
-      ]
+      "examples": ["proposed", "draft", "active", "deprecated", "retired"]
     },
     "domain": {
       "type": "string",
@@ -135,11 +119,7 @@
     "Tags": {
       "type": "array",
       "description": "A list of tags that may be assigned to the elements (object or property); the tags keyword may appear at any level. Tags may be used to better categorize an element. For example, `finance`, `sensitive`, `employee_record`.",
-      "examples": [
-        "finance",
-        "sensitive",
-        "employee_record"
-      ],
+      "examples": ["finance", "sensitive", "employee_record"],
       "items": {
         "type": "string"
       }
@@ -200,18 +180,10 @@
         "vendor": {
           "type": "string",
           "description": "Identifies the vendor, provider, or external system associated with this custom property. SHOULD be a stable, lowercase identifier matching ^[a-z0-9][a-z0-9-]*$ (e.g. confluent, zeenea, atlan, soda). Tools MUST preserve unknown vendor values.",
-          "examples": [
-            "confluent",
-            "zeenea",
-            "atlan",
-            "soda"
-          ]
+          "examples": ["confluent", "zeenea", "atlan", "soda"]
         }
       },
-      "required": [
-        "property",
-        "value"
-      ]
+      "required": ["property", "value"]
     },
     "Synonyms": {
       "type": "array",
@@ -257,9 +229,7 @@
           }
         }
       },
-      "required": [
-        "synonym"
-      ]
+      "required": ["synonym"]
     },
     "AuthoritativeDefinition": {
       "type": "object",
@@ -273,17 +243,7 @@
         "type": {
           "type": "string",
           "description": "Type of definition for authority.",
-          "examples": [
-            "businessDefinition",
-            "canonicalUrl",
-            "glossary",
-            "implementation",
-            "ontology",
-            "taxonomy",
-            "transformationImplementation",
-            "tutorial",
-            "videoTutorial"
-          ]
+          "examples": ["businessDefinition", "canonicalUrl", "glossary", "implementation", "ontology", "taxonomy", "transformationImplementation", "tutorial", "videoTutorial"]
         },
         "url": {
           "type": "string",
@@ -295,10 +255,7 @@
           "description": "Optional description."
         }
       },
-      "required": [
-        "type",
-        "url"
-      ]
+      "required": ["type", "url"]
     },
     "InputPort": {
       "type": "object",
@@ -344,9 +301,7 @@
           }
         }
       },
-      "required": [
-        "name"
-      ]
+      "required": ["name"]
     },
     "OutputPort": {
       "type": "object",
@@ -420,9 +375,7 @@
           "$ref": "#/$defs/Context"
         }
       },
-      "required": [
-        "name"
-      ]
+      "required": ["name"]
     },
     "SBOM": {
       "type": "object",
@@ -442,6 +395,17 @@
           "type": "string",
           "format": "uri",
           "description": "URL to the SBOM."
+        },
+        "tags": { "$ref": "#/$defs/Tags" },
+        "customProperties": {
+          "type": "array",
+          "description": "Custom properties block.",
+          "items": { "$ref": "#/$defs/CustomProperty" }
+        },
+        "authoritativeDefinitions": {
+          "type": "array",
+          "description": "Authoritative definitions block.",
+          "items": { "$ref": "#/$defs/AuthoritativeDefinition" }
         }
       }
     },
@@ -459,10 +423,7 @@
           "description": "Version of the input contract."
         }
       },
-      "required": [
-        "id",
-        "version"
-      ]
+      "required": ["id", "version"]
     },
     "ManagementPort": {
       "type": "object",
@@ -485,21 +446,13 @@
         "content": {
           "type": "string",
           "description": "Content type.",
-          "examples": [
-            "discoverability",
-            "observability",
-            "control",
-            "dictionary"
-          ]
+          "examples": ["discoverability", "observability", "control", "dictionary"]
         },
         "type": {
           "type": "string",
           "default": "rest",
           "description": "Type: can be `rest` or `topic`. Default is `rest`.",
-          "examples": [
-            "rest",
-            "topic"
-          ]
+          "examples": ["rest", "topic"]
         },
         "url": {
           "type": "string",
@@ -532,10 +485,7 @@
           }
         }
       },
-      "required": [
-        "name",
-        "content"
-      ]
+      "required": ["name", "content"]
     },
     "Support": {
       "type": "object",
@@ -562,23 +512,12 @@
         "tool": {
           "type": "string",
           "description": "Name of the tool.",
-          "examples": [
-            "email",
-            "slack",
-            "teams",
-            "discord",
-            "ticket",
-            "other"
-          ]
+          "examples": ["email", "slack", "teams", "discord", "ticket", "other"]
         },
         "scope": {
           "type": "string",
           "description": "Scope can be: `interactive`, `announcements`, `issues`.",
-          "examples": [
-            "interactive",
-            "announcements",
-            "issues"
-          ]
+          "examples": ["interactive", "announcements", "issues"]
         },
         "invitationUrl": {
           "type": "string",
@@ -603,10 +542,7 @@
           }
         }
       },
-      "required": [
-        "channel",
-        "url"
-      ]
+      "required": ["channel", "url"]
     },
     "TeamMember": {
       "type": "object",
@@ -665,9 +601,7 @@
           }
         }
       },
-      "required": [
-        "username"
-      ]
+      "required": ["username"]
     },
     "Context": {
       "type": "object",
@@ -695,27 +629,19 @@
               },
               "answer": {
                 "type": "string",
-                "description": "The expected response or result description. Optional \u2014 omit to signal an unanswered sample question."
+                "description": "The expected response or result description. Optional — omit to signal an unanswered sample question."
               },
               "authoritativeDefinitions": {
                 "type": "array",
-                "items": {
-                  "$ref": "#/$defs/AuthoritativeDefinition"
-                }
+                "items": { "$ref": "#/$defs/AuthoritativeDefinition" }
               },
-              "tags": {
-                "$ref": "#/$defs/Tags"
-              },
+              "tags": { "$ref": "#/$defs/Tags" },
               "customProperties": {
                 "type": "array",
-                "items": {
-                  "$ref": "#/$defs/CustomProperty"
-                }
+                "items": { "$ref": "#/$defs/CustomProperty" }
               }
             },
-            "required": [
-              "question"
-            ]
+            "required": ["question"]
           }
         },
         "constraints": {
@@ -735,23 +661,15 @@
               },
               "authoritativeDefinitions": {
                 "type": "array",
-                "items": {
-                  "$ref": "#/$defs/AuthoritativeDefinition"
-                }
+                "items": { "$ref": "#/$defs/AuthoritativeDefinition" }
               },
-              "tags": {
-                "$ref": "#/$defs/Tags"
-              },
+              "tags": { "$ref": "#/$defs/Tags" },
               "customProperties": {
                 "type": "array",
-                "items": {
-                  "$ref": "#/$defs/CustomProperty"
-                }
+                "items": { "$ref": "#/$defs/CustomProperty" }
               }
             },
-            "required": [
-              "constraint"
-            ]
+            "required": ["constraint"]
           }
         }
       }
@@ -796,5 +714,5 @@
       }
     }
   },
-  "$comment": "Vendored from bitol-io/open-data-product-standard branch dev (pre-release v1.1.0, fetched 2026-07-26). The dev branch is the approved-RFC staging ground; replace with the main-branch copy when v1.1.0 is released."
+  "$comment": "Vendored verbatim from bitol-io/open-data-product-standard tag v1.1.0 (released 2026-09-08), schema/odps-json-schema-v1.1.0.json. Only this $comment is added. Refresh from the tag, never from a branch."
 }

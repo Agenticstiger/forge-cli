@@ -67,9 +67,10 @@ class BitolOdpsProvider(BaseProvider):
     def __init__(self) -> None:
         super().__init__()
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        # Emit target. v1.0.0 stays the default until Bitol releases v1.1.0
-        # on main: emitting an unreleased apiVersion by default would produce
-        # documents that fail validation against the published schema.
+        # Emit target. Bitol released v1.1.0 on 2026-09-08, so both supported
+        # apiVersions are published standards. v1.0.0 stays the default because
+        # changing the emitted apiVersion changes what every existing consumer
+        # parses; the default moves with a FLUID schema bump, not silently.
         # Opt in per process via ODPS_API_VERSION=v1.1.0 (or set api_version
         # on the instance) to emit the RFC 0029 top-level ``type``.
         self.api_version = os.getenv("ODPS_API_VERSION", DEFAULT_API_VERSION)
