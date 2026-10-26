@@ -362,7 +362,8 @@ def _export_odps_bitol(contract_path: str, env, out: str, logger: logging.Logger
                 "x-fluidId": c.get("id"),
             },
         }
-        os.makedirs(os.path.dirname(out), exist_ok=True)
+        # Same empty-dirname guard as the try branch.
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:
             _yaml.safe_dump(odps_bitol, f, default_flow_style=False)
         info(logger, "generate_standard_odps_bitol_ok", out=out, mode="fallback-skeleton")
