@@ -150,10 +150,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Upgrade notes
 
 - **A contract using `env://` against a remote host now fails until the operator allows it.** Each
-  one is restored with a single operator-environment variable, for example
-  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST="PG_PASSWORD@db.example.com"` (that host only) or
-  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST="PG_PASSWORD"` (any host). Set it in the shell, in CI, or
-  in a `FLUID_SECRETS_FILE` outside the project — **not** in a project `.env`, where it is ignored.
+  one is restored by setting a single operator-environment variable,
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, to the variable's own name — for example
+  `PG_PASSWORD@db.example.com` for that host only, or `PG_PASSWORD` for any host. Set it in the
+  shell, in CI, or in a `FLUID_SECRETS_FILE` outside the project — **not** in a project `.env`,
+  where it is ignored.
   A host written with a port never matches, so leave the port off. Local development against
   `localhost`, `127.0.0.0/8` or `::1` needs no configuration. The better long-term answer for a
   production credential is a secret store: `vault://`, `aws://`, `gcp://`, `azure://` or `file://`.

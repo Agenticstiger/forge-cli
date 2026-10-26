@@ -179,8 +179,8 @@ def test_a_malformed_entry_grants_nothing(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_an_inline_password_is_untouched() -> None:
     """No secretRef, no policy: the contract carried its own credential."""
-    out = _resolve({"host": "db.example.com", "password": "inline"})
-    assert out["password"] == "inline"
+    out = _resolve({"host": "db.example.com", "password": "inline"})  # pragma: allowlist secret
+    assert out["password"] == "inline"  # pragma: allowlist secret
 
 
 def test_a_store_backed_scheme_is_not_policed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -248,7 +248,11 @@ def test_the_allowlist_itself_is_operator_only() -> None:
     [
         ({"host": "db.example.com"}, "db.example.com"),
         ({"host": "db.example.com", "uri": "postgresql://ignored/"}, "db.example.com"),
-        ({"uri": "postgresql://alice:pw@db.example.com:5432/sales"}, "db.example.com"),
+        # a userinfo-bearing URI is the shape under test
+        (
+            {"uri": "postgresql://alice:pw@db.example.com:5432/sales"},  # pragma: allowlist secret
+            "db.example.com",
+        ),
         ({"uri": "db.example.com:5432"}, "db.example.com"),
         ({"uri": "postgresql://alice@[2001:db8::1]:5432/s"}, "2001:db8::1"),
         ({"instance_url": "https://corp.example.com/api"}, "corp.example.com"),
@@ -318,9 +322,13 @@ def test_a_trailing_at_grants_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_an_inline_credential_is_not_policed() -> None:
     """The upgrade note promises this: the reference is never read, so nothing is sent."""
     out = _resolve(
-        {"host": "db.example.com", "password": "inline", "secretRef": f"env://{VARIABLE}"}
+        {
+            "host": "db.example.com",
+            "password": "inline",  # pragma: allowlist secret
+            "secretRef": f"env://{VARIABLE}",
+        }
     )
-    assert out["password"] == "inline"
+    assert out["password"] == "inline"  # pragma: allowlist secret
     assert "secretRef" not in out
 
 
