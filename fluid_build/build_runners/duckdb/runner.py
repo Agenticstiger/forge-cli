@@ -43,6 +43,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
@@ -1323,14 +1324,131 @@ def _apply_incremental_filter(
         # runs will use the cursor that's persisted at end-of-run.
         return base_sel, None
     last_value = last_cursor.value
-    # The cursor value is treated as a SQL literal regardless of the
-    # column type: duckdb will coerce ``'2026-05-01T00:00:00'`` against
-    # a TIMESTAMP column and ``'42'`` against an INT. ``quote_ansi_string_literal``
-    # neutralises any embedded quote / control char from a tampered
-    # state file.
-    quoted_value = quote_ansi_string_literal(str(last_value))
-    filtered = f"SELECT * FROM ({base_sel}) WHERE {cursor_field_safe} > {quoted_value}"
+    # ``_cursor_comparison`` builds the predicate: an instant comparison for a
+    # timestamp cursor, which no session time zone can shift, and a plain
+    # literal for a scalar one. It quotes through ``quote_ansi_string_literal``,
+    # so a tampered state file cannot inject SQL into the WHERE clause.
+    predicate = _cursor_comparison(cursor_field_safe, last_value)
+    filtered = f"SELECT * FROM ({base_sel}) WHERE {predicate}"
     return filtered, last_value
+
+
+#: A trailing UTC offset on a timestamp DuckDB rendered as text: ``Z``, or a
+#: sign and 2-4 digits with an optional colon (``+00``, ``-0400``, ``-04:00``).
+#: Matched explicitly rather than left to :meth:`datetime.fromisoformat`, whose
+#: tolerance for ``Z`` and a two-digit offset depends on the Python version and
+#: this package supports 3.10 upward.
+_CURSOR_OFFSET_RE = re.compile(r"(?P<head>.*?)(?P<off>Z|[+-]\d{2}:?(?:\d{2})?)$")
+
+
+def _canonical_cursor_text(value: Any) -> str:
+    """``value`` as cursor text whose meaning does not depend on DuckDB's version.
+
+    A cursor is stored as text and pasted into ``WHERE <field> > '<text>'`` as
+    an UNTYPED literal, so that text has to denote one instant whatever the
+    column resolved to. DuckDB 1.5 reads a JSON timestamp carrying ``Z`` as a
+    naive TIMESTAMP and 2.0 reads it as TIMESTAMP WITH TIME ZONE, so the two
+    disagree about what an offset-bearing literal means.
+
+    An offset-bearing timestamp is therefore converted to UTC and rendered
+    WITHOUT an offset. Naive-UTC text denotes the same instant against a naive
+    TIMESTAMP column and, under the pinned UTC session
+    (:data:`~fluid_build.providers._duckdb_compat.SESSION_TIME_ZONE`), against a
+    TIMESTAMPTZ one.
+
+    This is also what repairs state already on disk, so no cursor file has to be
+    rewritten. A shipped DuckDB 2.0 install on a host with a non-zero offset
+    persisted cursors like ``2026-05-01 10:00:00-04:00``; DuckDB 1.5 drops that
+    offset when it coerces to a naive TIMESTAMP, which moves the ``>`` boundary
+    and re-emits rows (measured: a row duplicated even with the time zone
+    pinned). Normalising on read closes that.
+
+    Anything that is not an offset-bearing timestamp is returned as its own
+    text, unchanged: an integer cursor, an opaque string, an already-naive
+    timestamp. A value that looks like it carries an offset but does not parse
+    is also returned unchanged -- a cursor whose text we do not understand is
+    left exactly as the previous release compared it.
+    """
+    text = str(value)
+    match = _CURSOR_OFFSET_RE.match(text)
+    if match is None:
+        return text
+    head, off = match.group("head"), match.group("off")
+    if off == "Z":
+        normalised = head + "+00:00"
+    else:
+        digits = off.replace(":", "")
+        if len(digits) == 3:  # '+04' -> '+04:00'
+            normalised = head + digits + ":00"
+        elif len(digits) == 5:
+            normalised = head + digits[:3] + ":" + digits[3:]
+        else:
+            return text
+    try:
+        parsed = datetime.fromisoformat(normalised)
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        return text
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
+
+
+def _cursor_is_timestamp(text: str) -> bool:
+    """Whether canonical cursor text denotes a date or timestamp rather than a scalar.
+
+    Decided from the VALUE, not by probing the column: the cursor is the stored
+    ``MAX()`` of that column, so its text already tells us which comparison is
+    right, and a probe would cost a query per run. An integer cursor
+    (``'42'``), an opaque key (``'order-000123'``) and anything else that is not
+    an ISO date or timestamp answer ``False`` and keep the plain comparison.
+    """
+    # Require the separators. Python 3.11+ parses BASIC ISO too, so a bare
+    # ``20260501`` -- a perfectly ordinary date-as-integer cursor -- would
+    # otherwise take the instant path and ``epoch_us`` would fail on its
+    # INTEGER column.
+    if "-" not in text[:11]:
+        return False
+    try:
+        datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _cursor_comparison(field_sql: str, value: Any) -> str:
+    """The incremental ``>`` predicate for one cursor, free of the session time zone.
+
+    A plain ``<field> > '<text>'`` is not safe for a timestamp. The literal is
+    untyped, so DuckDB coerces it to the column's type, and on DuckDB 2.0 a JSON
+    timestamp column resolves to TIMESTAMP WITH TIME ZONE, where a naive literal
+    is read in the session time zone -- the host's, unless something pins it.
+    The boundary then moves by the host's UTC offset and rows are silently
+    skipped or re-emitted.
+
+    Comparing INSTANTS removes the ambiguity: ``epoch_us`` of a TIMESTAMP WITH
+    TIME ZONE is its instant, and of a naive TIMESTAMP is that time read as UTC,
+    which is exactly what :func:`_canonical_cursor_text` renders. The same
+    predicate is therefore correct on 1.5 and 2.0 and under any host zone
+    (measured: the plain literal returns 1 row where 2 are due, on 2.0 at
+    UTC-4; this returns 2 on both versions under both zones).
+
+    Pinning the session zone to UTC would also have worked and is NOT used:
+    ``TimeZone`` is an ICU-backed setting, the sandbox forbids autoloading
+    extensions, and where ICU is absent DuckDB does not even recognise the
+    option -- so a pin would fail the connection in exactly the hardened
+    environments the sandbox exists for. ``epoch_us`` needs no extension
+    (verified with autoload disabled and an empty extension directory).
+
+    The cost, accepted deliberately: wrapping the column in a function can stop
+    the predicate being pushed into the Parquet or JSON reader, so a large
+    source scans more than it would have. Correct rows beat a faster wrong
+    answer, and only a timestamp cursor takes this path.
+    """
+    text = _canonical_cursor_text(value)
+    literal = quote_ansi_string_literal(text)
+    if _cursor_is_timestamp(text):
+        return f"epoch_us({field_sql}) > epoch_us(TIMESTAMP {literal})"
+    return f"{field_sql} > {literal}"
 
 
 def _persist_cursor_after_run(
@@ -1383,7 +1501,7 @@ def _persist_cursor_after_run(
         ctx.build_id,
         Cursor(
             stream=stream,
-            value=str(new_value),
+            value=_canonical_cursor_text(new_value),
             updated_at=utc_now_iso(),
         ),
     )

@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An incremental cursor written on DuckDB 1.5 and read on 2.0 silently dropped or
+  duplicated rows.** The cursor is stored as text and compared as an untyped SQL literal,
+  and the two versions disagree about the column type it is coerced against:
+  `read_json_auto` over a timestamp carrying `Z` gives TIMESTAMP on 1.5 and TIMESTAMP WITH
+  TIME ZONE on 2.0, where a naive literal is read in the session time zone -- the host's.
+  On a host with a non-zero UTC offset the `>` boundary therefore moved: an end-to-end run
+  that wrote its cursor on 1.5 and continued on 2.0 landed 5 of 6 rows and advanced the
+  cursor past the row it skipped, at exit code 0 with the stream recorded `succeeded`.
+  Both DuckDB versions resolve to `duckdb>=1.5.0`, so one install can write state another
+  reads.
+  A timestamp cursor now compares INSTANTS (`epoch_us`), which no session time zone can
+  shift, and the stored text is normalised to a naive UTC instant. **No state file needs
+  rewriting**: a cursor a shipped 2.0 install already wrote carries an explicit offset and
+  is normalised when read. Integer, date-as-integer and opaque string cursors keep the
+  plain comparison. CSV sources were never affected -- `read_csv_auto` already sniffed
+  TIMESTAMPTZ on 1.5.
+  Pinning the session zone to UTC would also have worked and is deliberately not used:
+  `TimeZone` is ICU-backed, the sandbox forbids autoloading extensions, and without ICU
+  DuckDB does not recognise the option at all, so a pin would fail the connection in
+  exactly the hardened environments the sandbox exists for. The accepted cost of the
+  instant comparison is that wrapping the column in a function can stop the predicate
+  being pushed into the Parquet or JSON reader.
+- **A pipeline discovered on DuckDB 1.5 failed `SchemaDriftError` on 2.0.** The drift gate
+  compared type *names*, and 2.0 infers HUGEINT where 1.5 infers DOUBLE for the same
+  integer literal, and TIMESTAMP WITH TIME ZONE where 1.5 infers TIMESTAMP. Upgrading
+  DuckDB — no contract edit, no new data — broke a working pipeline on a false positive.
+  Those pairs are now treated as one physical type under two names. The widening/narrowing
+  classification is unchanged: the family check runs after it, so `type_widened` and
+  `type_narrowed` still fire for every ordered numeric pair. Note DOUBLE and HUGEINT are
+  not value-identical — 1.5 landed a lossy 17-significant-digit float where 2.0 lands the
+  exact 128-bit integer — so the non-failing path says the physical type moved rather than
+  passing silently.
+- **`fluid init --discover` emitted contracts its own `fluid validate` rejected.** The
+  emitter wrote the source's type name straight through, so a discover on DuckDB 2.0
+  produced `type: hugeint` and `type: '"null"'` and `fluid validate` then exited 1 on the
+  file the tool had just written. Validating every name in DuckDB's own `duckdb_types()`
+  against the bundled schema showed **35 rejected names**, not the two reported: `uinteger`
+  and `integer[]` were rejected on 1.5 as well, so this was never only a 2.0 problem.
+  Discovered types are now canonicalised at the emitter, mapping each rejected name to the
+  nearest one the schema accepts and leaving every already-valid name untouched. An
+  unsigned or 128-bit type maps to a width that holds its range (`uinteger` → `bigint`,
+  `hugeint` → `numeric`) rather than to the similar-sounding name. Contracts already emitted
+  with an invalid type stay invalid — the fix is emit-time — but those already failed
+  validation, so nothing working changes.
+
 ### Security
 
 - A contract repository could hand the whole host to its own SQL through DuckDB's spill
