@@ -834,6 +834,9 @@ jobs:
         # the fixed version makes the install unsatisfiable. virtualenv is not a
         # blocker -- its latest allows filelock<5.
         #
+        # Upstream tracker: BerriAI/litellm#48394 (asks litellm to lift the
+        # cap; virtualenv already moved to filelock<5).
+        #
         # REMOVE all three as soon as litellm lifts the cap and
         # `filelock>=4.2.1` resolves. Re-check with:
         #   curl -s https://pypi.org/pypi/litellm/json \
