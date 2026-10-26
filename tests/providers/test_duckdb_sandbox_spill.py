@@ -40,6 +40,7 @@ from __future__ import annotations
 import gc
 import os
 import stat
+import sys
 from pathlib import Path
 from typing import Any, List
 
@@ -56,6 +57,16 @@ from fluid_build.providers._duckdb_sandbox import (  # noqa: E402
 
 #: A file every host has, that no test here ever grants.
 UNGRANTED_HOST_FILE = "/etc/passwd"
+
+#: The module object, for monkeypatching its private helpers. A test that
+#: replaces ``_own_spill_dir`` or ``_refuse_ungranted_dirs`` has to set the
+#: attribute ON THE MODULE, because that is what the production code looks up
+#: when it calls them -- rebinding a name imported into this file would patch
+#: nothing. Read out of ``sys.modules`` (the ``from`` import above has already
+#: put it there) rather than with a second ``import ... as``, so this file
+#: keeps a single import style for it: CodeQL flags a module imported with both
+#: ``import`` and ``import from``.
+sandbox = sys.modules[DuckDBAllowlist.__module__]
 
 
 def _setting(con: Any, name: str) -> Any:
@@ -228,8 +239,6 @@ def test_a_failed_open_leaves_no_spill_directory(monkeypatch: pytest.MonkeyPatch
     count of them would fail for reasons that have nothing to do with the
     call under test.
     """
-    import fluid_build.providers._duckdb_sandbox as sandbox
-
     made: List[str] = []
     real = sandbox._own_spill_dir
     monkeypatch.setattr(
@@ -262,8 +271,6 @@ def test_a_failure_after_the_spill_directory_exists_still_removes_it(
     real caller both produce -- the ``weakref.finalize`` has not fired, so
     without the explicit cleanup the directory is observably left behind.
     """
-    import fluid_build.providers._duckdb_sandbox as sandbox
-
     made: List[str] = []
     real = sandbox._own_spill_dir
 
@@ -312,8 +319,6 @@ def test_the_read_back_refuses_a_remote_prefix_the_call_site_did_not_grant() -> 
     ``allow.remote_prefixes`` -- including a prefix reported in some other
     string form, which falls through to the same refusal.
     """
-    import fluid_build.providers._duckdb_sandbox as sandbox
-
     allow = DuckDBAllowlist.none().with_remote("s3://bucket/landing/")
     con = secure_duckdb_connect(":memory:", allow=allow)
     try:
@@ -353,8 +358,6 @@ def test_an_unasked_for_grant_fails_the_connection_closed(
     granted.mkdir()
     allow = DuckDBAllowlist.none().with_dirs(granted, extra)
     narrowed = DuckDBAllowlist(dirs=(str(granted),))
-
-    import fluid_build.providers._duckdb_sandbox as sandbox
 
     real = sandbox._refuse_ungranted_dirs
     monkeypatch.setattr(
