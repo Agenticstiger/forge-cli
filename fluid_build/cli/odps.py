@@ -46,11 +46,13 @@ import argparse
 import json
 import logging
 import sys
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from fluid_build.cli.console import cprint, cprint_json
 from fluid_build.cli.console import error as console_error
+from fluid_build.cli.console import warning as console_warning
 
 # Logger name intentionally preserved as ``"fluid.cli.opds"`` even though
 # the canonical module path is now ``fluid_build.cli.odps`` (renamed
@@ -318,6 +320,11 @@ def cmd_opds_import(args: argparse.Namespace, logger: logging.Logger) -> int:
         :meth:`BitolOdpsProvider.import_contract` with resolver.
       - Path is a directory → :meth:`BitolOdpsProvider.import_directory`.
 
+    Whatever the input shape, the resulting contract is validated against the
+    FLUID schema before anything is written: an import that cannot produce a
+    valid contract names the first problem and writes nothing, unless
+    ``--lenient`` says to write it anyway.
+
     ``--spec odps-4.1`` is reserved for the LF/ODPI provider, which is
     export-only and rejects import with a clear error.
     """
@@ -354,6 +361,29 @@ def cmd_opds_import(args: argparse.Namespace, logger: logging.Logger) -> int:
         console_error(f"Error importing: {e}")
         return 1
 
+    # Validate before writing. This command claimed to "always emit one
+    # validated FLUID contract" while never running the validator, so an
+    # import of its own export printed the success tick and wrote a file
+    # ``fluid validate`` then rejected with ten errors.
+    valid, problem = _validate_imported(fluid)
+    if not valid:
+        if not lenient:
+            logger.error(
+                "opds_import_invalid_contract",
+                extra={"error": problem, "path": str(in_path)},
+            )
+            console_error(
+                f"Imported {in_path}, but the FLUID contract it produces is not valid: "
+                f"{problem}. Nothing was written. Fix the source document, or pass "
+                "--lenient to write the contract anyway and repair it by hand."
+            )
+            return 1
+        logger.warning(
+            "opds_import_invalid_contract_written",
+            extra={"error": problem, "path": str(in_path)},
+        )
+        console_warning(f"--lenient: writing a FLUID contract that does not validate: {problem}")
+
     if out and out != "-":
         out_path = Path(out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -374,6 +404,26 @@ def cmd_opds_import(args: argparse.Namespace, logger: logging.Logger) -> int:
 
             cprint(yaml.dump(fluid, default_flow_style=False, sort_keys=False))
     return 0
+
+
+def _validate_imported(fluid: Mapping[str, Any]) -> Tuple[bool, str]:
+    """Run the validator the ``fluid validate --offline`` path runs.
+
+    Same call as :func:`fluid_build.cli.validate.run_on_contract_dict` makes —
+    the schema version comes from the contract's own ``fluidVersion`` — but
+    without that function's error printing, because this command reports the
+    first problem in one line of its own. Returns ``(is_valid, problem)``.
+
+    Function-local import: ``schema_manager`` pulls in ``jsonschema``, which
+    ``tests/perf/test_startup_budget.py`` forbids on the ``fluid --help`` path.
+    """
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    result = FluidSchemaManager().validate_contract(fluid, offline_only=True)
+    if result.is_valid:
+        return True, ""
+    first = result.errors[0] if result.errors else "no error reported"
+    return False, f"{first} ({len(result.errors)} error(s), schema v{result.schema_version})"
 
 
 def _dispatch_import(path: Path, *, allow_remote: bool, lenient: bool) -> Dict[str, Any]:
@@ -461,11 +511,40 @@ def cmd_opds_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
         console_error("ODPS v4.1 validator not available")
         return 1
 
+    # Every way opening or parsing the file can fail is a statement about the
+    # file, and this command's contract is exit 1 for "invalid or unreadable".
+    # Only ``OSError`` and ``JSONDecodeError`` were caught, so a non-UTF-8 file
+    # (``UnicodeDecodeError``) or a document nested past the recursion limit
+    # (``RecursionError``) escaped, and the CLI exited 2 with "CLI unhandled
+    # exception". The messages are the ones ``fluid odps-bitol validate`` settled
+    # on in ``cli/odps_standard.py::_run_odps_validate``, so the two commands
+    # diagnose the same file the same way; each names the file because the json
+    # module's own text does not.
     try:
         with open(path, encoding="utf-8") as f:
             opds_data = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        console_error(f"Error loading ODPS v4.1 file: {e}")
+    except OSError as e:
+        console_error(
+            f"✗ Validation failed: cannot read {path}: {e.strerror or e}. "
+            "Check that the path exists, is a file, and is readable."
+        )
+        return 1
+    except UnicodeDecodeError as e:
+        console_error(
+            f"✗ Validation failed: {path} is not valid UTF-8 text: {e}. "
+            "Re-save the file as UTF-8."
+        )
+        return 1
+    except json.JSONDecodeError as e:
+        console_error(f"✗ Validation failed: {path}: {e}")
+        return 1
+    except RecursionError:
+        # ``json.load`` has no depth cap of its own; a document nested past the
+        # interpreter's recursion limit is unparseable, not a crash of this tool.
+        console_error(
+            f"✗ Validation failed: {path} is nested too deeply to parse. "
+            "Flatten the document and run the command again."
+        )
         return 1
     if not isinstance(opds_data, dict):
         console_error(f"Error: {path} did not parse as a mapping")
@@ -673,7 +752,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         description=(
             "Import a Bitol ODPS product file, a directory containing the ODPS doc + "
             "sibling ODCS files (or just ODCS files), or a single ODCS contract file. "
-            "Always emits one validated FLUID contract."
+            "Emits one FLUID contract, validated against the FLUID schema before it "
+            "is written: an import that cannot produce a valid contract fails and "
+            "writes nothing unless --lenient is passed."
         ),
     )
     importp.add_argument(
@@ -713,7 +794,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     importp.add_argument(
         "--lenient",
         action="store_true",
-        help="Downgrade output-port resolution failures to warnings (input ports are always lenient).",
+        help=(
+            "Downgrade output-port resolution failures to warnings (input ports are "
+            "always lenient), and write the FLUID contract even when it does not "
+            "validate against the FLUID schema."
+        ),
     )
     importp.set_defaults(func=cmd_opds_import)
 

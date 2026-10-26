@@ -166,8 +166,14 @@ class TestImportAndRoundTrip:
         verbatim without inventing a Data Mesh classification."""
         fluid = _provider().import_contract(self._v11_doc("referenceData"))
         assert "productType" not in fluid["metadata"]
-        passthrough = fluid["metadata"]["odps_passthrough"]
+        # The pass-through moved out of `metadata.odps_passthrough`, which
+        # additionalProperties:false rejected, into root `extensions.odps` —
+        # the one object the FLUID schema declares open.
+        passthrough = fluid["extensions"]["odps"]["metadata"]
         assert passthrough["odps_type"] == "referenceData"
+        # "verbatim" in the docstring means the whole document, not just the
+        # type field the custom classification rides on.
+        assert passthrough["source"] == self._v11_doc("referenceData")
 
     def test_custom_type_round_trips_verbatim(self):
         provider = _provider("v1.1.0")

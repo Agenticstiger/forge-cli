@@ -66,6 +66,13 @@ EXTENSION_NAMESPACE = "odcs"
 
 # FLUID ``metadata`` is a closed object; only these keys may appear there.
 # Anything else the ODCS side wants to carry goes to the pass-through.
+#
+# ``team`` is in here but is NOT accepted by every bundled schema: the roster
+# arrived in FLUID 0.7.6, and before it the import had to bucket the Bitol team
+# it read, which is why an ODPS export of an ODCS-imported contract emitted only
+# the owner-derived member. Ask :func:`metadata_keys_for` rather than this set
+# directly, so a document declaring an older version still gets the roster
+# bucketed instead of written into a ``metadata`` that rejects it.
 _FLUID_METADATA_KEYS = frozenset(
     {
         "businessContext",
@@ -77,8 +84,14 @@ _FLUID_METADATA_KEYS = frozenset(
         "productType",
         "provenance",
         "tags",
+        "team",
     }
 )
+
+# The ``metadata`` keys above that only some bundled schema versions declare.
+# Every other key has been there since the oldest version we bundle, so there is
+# nothing to ask the schema about.
+_VERSIONED_METADATA_KEYS = frozenset({"team"})
 
 # FLUID ``metadata.owner`` is closed too.
 _FLUID_OWNER_KEYS = frozenset({"team", "email", "slack", "oncall"})
@@ -100,17 +113,99 @@ _LOCATION_KEYS = (
 
 
 # --------------------------------------------------------------------------
+# which schema version an imported document may declare
+# --------------------------------------------------------------------------
+
+
+def resolve_declared_version(recorded: Any) -> str:
+    """The FLUID schema version an imported contract may declare.
+
+    ``recorded`` is whatever the source document said its FLUID version was: an
+    ODCS ``customProperties`` entry written by an earlier export, or an upstream
+    import's own root field. ``None`` means the document recorded nothing, which
+    is the normal case for a genuinely foreign document; it gets the latest
+    stable version, as before.
+
+    A recorded value is **foreign text that selects a JSON Schema**, so it is
+    honoured only when it names a version this build actually bundles. An
+    unknown string, a path, a number, an empty string, a version newer than
+    anything shipped: each falls back to the stable default and logs the value
+    it rejected. Without that check a document could make forge declare a
+    version forge does not ship, and every later ``fluid validate`` of the
+    imported contract would either fall through to a schema nobody chose or go
+    looking for one over the network.
+
+    A preview version (``PREVIEW_VERSIONS``) is bundled and fully validatable,
+    so it is honoured — but only for a document that already recorded it, and
+    the INFO line says so, because the alternative is a user wondering why an
+    import declares a preview schema. Preview never becomes the default: the
+    fallback is :meth:`FluidSchemaManager.latest_bundled_version`, which
+    excludes it.
+    """
+    # Function-local: schema_manager pulls in jsonschema, and the CLI's startup
+    # budget (tests/perf/test_startup_budget.py) forbids that on ``--help``.
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    default = FluidSchemaManager.latest_bundled_version()
+    if recorded is None:
+        return default
+    if isinstance(recorded, str) and recorded in FluidSchemaManager.BUNDLED_VERSIONS:
+        if recorded in FluidSchemaManager.PREVIEW_VERSIONS:
+            LOG.info(
+                "Import: honouring the source document's recorded fluidVersion %s, a "
+                "PREVIEW schema version. The imported contract declares it because the "
+                "document did; it is not the default for a document that records none.",
+                recorded,
+            )
+        return recorded
+    # %r: the value is document text and may be a non-string or carry control
+    # characters.
+    LOG.warning(
+        "Import: ignoring the recorded fluidVersion %r — this build bundles only %s. "
+        "The imported contract declares %s instead. A document cannot select a schema "
+        "version forge does not ship.",
+        recorded,
+        ", ".join(FluidSchemaManager.BUNDLED_VERSIONS),
+        default,
+    )
+    return default
+
+
+def metadata_keys_for(version: str) -> frozenset:
+    """``_FLUID_METADATA_KEYS`` minus the keys this schema version has no slot for.
+
+    ``metadata`` is closed in every bundled version, so a key the declared
+    version does not declare has to be bucketed rather than written — writing it
+    is what makes the import emit a contract its own validator rejects.
+    """
+    return _FLUID_METADATA_KEYS - {
+        key for key in _VERSIONED_METADATA_KEYS if not _metadata_declares(version, key)
+    }
+
+
+@lru_cache(maxsize=None)
+def _metadata_declares(version: str, key: str) -> bool:
+    """Does this bundled FLUID schema declare ``metadata.<key>``?"""
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    schema = FluidSchemaManager().get_schema(version, offline_only=True)
+    if not isinstance(schema, Mapping):
+        # A version we cannot read: assume the narrower answer. Bucketing a key
+        # the schema would have accepted is lossless (it exports verbatim from
+        # the bucket); writing one it rejects fails the whole contract.
+        return False
+    metadata = (schema.get("properties") or {}).get("metadata")
+    properties = metadata.get("properties") if isinstance(metadata, Mapping) else None
+    return isinstance(properties, Mapping) and key in properties
+
+
+# --------------------------------------------------------------------------
 # import side: intermediate shape → valid FLUID document
 # --------------------------------------------------------------------------
 
 
 def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, Any]:
     """Restructure the import pipeline's output into a valid FLUID contract."""
-    # Function-local: schema_manager pulls in jsonschema, and the CLI's
-    # startup budget (tests/perf/test_startup_budget.py) forbids that on the
-    # ``--help`` path.
-    from fluid_build.schema_manager import FluidSchemaManager
-
     work = copy.deepcopy(dict(fluid))
     bucket: Dict[str, Any] = {}
 
@@ -118,11 +213,12 @@ def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, 
     metadata_pt = dict(metadata.pop(PASSTHROUGH_KEY, {}) or {})
 
     doc: Dict[str, Any] = {
-        # ODCS carries no FLUID schema version. Keep the one the extras mapper
-        # restored so an imported contract stays pinned to the version it was
-        # authored against; only a genuinely foreign document gets the default.
-        "fluidVersion": work.pop("fluidVersion", None)
-        or FluidSchemaManager.latest_bundled_version(),
+        # ODCS carries no FLUID schema version of its own. Keep the one the
+        # extras mapper restored so an imported contract stays pinned to the
+        # version it was authored against; only a genuinely foreign document
+        # gets the default. The restored value came out of a document that may
+        # be foreign or hostile, so it goes through the allowlist.
+        "fluidVersion": resolve_declared_version(work.pop("fluidVersion", None)),
         "kind": work.pop("kind", None) or "DataProduct",
     }
 
@@ -172,7 +268,11 @@ def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, 
         bucket["version"] = version
 
     # Remaining non-FLUID metadata keys (tenant, dataProduct, ...) → bucket.
-    stray = {k: v for k, v in metadata.items() if k not in _FLUID_METADATA_KEYS}
+    # Asked per declared version, because ``team`` has a home only from 0.7.6:
+    # on an older document the roster the team mapper just wrote is bucketed,
+    # and ``rehydrate`` puts it back for the export.
+    accepted_metadata = metadata_keys_for(str(doc["fluidVersion"]))
+    stray = {k: v for k, v in metadata.items() if k not in accepted_metadata}
     for key in stray:
         metadata.pop(key)
     if stray:
