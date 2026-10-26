@@ -58,6 +58,7 @@ from fluid_build.api.runner import (
 )
 from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.source import AcquisitionMode
+from fluid_build.credentials.host_db_env import host_credential_env_suppressed
 from fluid_build.providers._duckdb_compat import first_row
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
@@ -883,7 +884,12 @@ class DuckdbRunner:
                 raise _SourceSetupError(str(exc)) from exc
             except duckdb.Error as exc:  # the extension did not load
                 raise _SourceAttachError(str(exc)) from exc
-            _attach_with_password_masked(con, attach_sql, conn.get("password"))
+            # The contract chose this host, and libpq / mysql_scanner would
+            # read this machine's credentials for it (see host_db_env). The
+            # declared DSN still carries its own, so a real source is
+            # unaffected.
+            with host_credential_env_suppressed():
+                _attach_with_password_masked(con, attach_sql, conn.get("password"))
         elif kind == "sqlite":
             conn = dict(ctx.source.connection.raw)
             # SQLite uses a path, not a libpq-style DSN. The path comes

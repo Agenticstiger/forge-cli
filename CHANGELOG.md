@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **An acquisition source no longer receives this host's ambient database credentials.** A contract
+  names the host its postgres or mysql source lives on, and libpq and mysql_scanner read
+  credentials from the process environment for whatever host they are handed — so a contract naming
+  a host of its own choosing could be authenticated with this machine's `PGPASSWORD`, `PGPASSFILE`,
+  `PGSERVICE` or `MYSQL_PWD`: a credential the contract was never given, belonging to a different
+  server. `fluid init --discover` has suppressed these since its JDBC introspection landed; the
+  acquisition runners had not, so the same contract fields reached the same client libraries with
+  the environment intact.
+  The duckdb runner's `ATTACH` now runs inside the same suppression window, which is shared from
+  `credentials/host_db_env.py` rather than copied (`build_runners` may not import `cli`). 14
+  variables are covered, and `cli/discover/_jdbc_introspect` keeps its original private names as
+  aliases, so nothing that referenced them changes.
+  **This route is independent of a contract's own `connection.secretRef`** and no allowlist over
+  `secretRef` would close it, because the credential never passes through `secretRef` at all. The
+  declared DSN still carries its own credentials, so a legitimate source is unaffected and no
+  contract change is needed.
+
+
 ### Fixed
 
 - **An incremental cursor written on DuckDB 1.5 and read on 2.0 silently dropped or
