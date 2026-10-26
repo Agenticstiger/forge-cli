@@ -14,7 +14,8 @@
 
 """Team object — Bitol ODPS schema is byte-identical to Bitol ODCS Team
 (minus the optional ``id`` StableId). We delegate to the ODCS team mapper
-to avoid duplicating the FLUID owner ↔ team object translation.
+to avoid duplicating the FLUID ``metadata.team`` / ``metadata.owner`` ↔ team
+object translation, including which of the two wins when a contract sets both.
 """
 
 from __future__ import annotations
@@ -33,11 +34,9 @@ from .base import (
 
 
 def to_odps(ctx: ExportCtx) -> None:
-    pt_team = get_metadata_passthrough(ctx.fluid).get("team")
-    if isinstance(pt_team, Mapping) and pt_team:
-        ctx.odps["team"] = dict(pt_team)
-        return
-    team = _odcs_team._owner_to_team(ctx.fluid)
+    team = _odcs_team.fluid_team_to_bitol(
+        ctx.fluid, get_metadata_passthrough(ctx.fluid).get("team")
+    )
     if team:
         ctx.odps["team"] = team
 
@@ -49,5 +48,6 @@ def to_fluid(ctx: ImportCtx) -> None:
     owner = _odcs_team._team_to_owner(team)
     if owner:
         ctx.fluid["owner"] = owner
+    _odcs_team.write_roster(ctx.fluid, team)
     if isinstance(team, Mapping):
         metadata_passthrough(ctx.fluid)["team"] = dict(team)
