@@ -22,8 +22,17 @@ SQL, with an EMPTY allowlist, on every version the engine supports (reproduced
 on duckdb 1.5.1, 1.5.6 and 2.0.0; the MCP output port's ``query_sql`` runs on
 the same helper).
 
-Every test here fails without :func:`_own_spill_dir`: ``allowed_directories``
-comes back as ``['/']`` and ``read_text('/etc/passwd')`` returns a row.
+11 of the 14 tests here fail when the production fix is reverted to the previous
+code. The 3 that do not are the deliberately non-discriminating guards --
+spilling is still enabled, a failed open leaks nothing, and the read-back
+accepts every grant shape a real call site uses -- which exist to catch a
+future regression rather than to witness this one. Two guards are additionally
+mutation-checked, because an assertion about a directory that something else
+also removes is worthless: deleting the explicit spill cleanup fails
+``test_a_failure_after_the_spill_directory_exists_still_removes_it``, and
+disabling :func:`_open_lock` fails
+``test_concurrent_opens_of_one_file_database_never_cross_configure`` in 6 runs
+out of 6.
 """
 
 from __future__ import annotations
@@ -239,6 +248,94 @@ def test_a_failed_open_leaves_no_spill_directory(monkeypatch: pytest.MonkeyPatch
 
 
 # ── the read-back refuses a grant the call site did not ask for ──────────
+
+
+def test_a_failure_after_the_spill_directory_exists_still_removes_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The except branch, exercised where there IS a directory to clean up.
+
+    ``before_lock`` raises BEFORE the spill directory is created, so the
+    failed-open test above cannot reach this: it passes with the cleanup
+    deleted. The read-back is the one failure that happens after, and with a
+    live traceback holding the frame -- which is what ``pytest.raises`` and a
+    real caller both produce -- the ``weakref.finalize`` has not fired, so
+    without the explicit cleanup the directory is observably left behind.
+    """
+    import fluid_build.providers._duckdb_sandbox as sandbox
+
+    made: List[str] = []
+    real = sandbox._own_spill_dir
+
+    def record() -> str:
+        made.append(real())
+        return made[-1]
+
+    monkeypatch.setattr(sandbox, "_own_spill_dir", record)
+    # Make the post-lock read-back refuse, so the failure lands after the
+    # directory exists.
+    monkeypatch.setattr(
+        sandbox,
+        "_refuse_ungranted_dirs",
+        lambda con, allow, spill: (_ for _ in ()).throw(
+            sandbox._sandbox_error(what="forced", why="forced", fix="forced")
+        ),
+    )
+    with pytest.raises(DuckDBSandboxError) as caught:
+        secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none())
+    # Holding ``caught`` keeps the traceback, and so the frame holding the
+    # connection, alive: the weakref.finalize therefore has NOT fired, and what
+    # is asserted below is the explicit cleanup rather than garbage collection.
+    # Without this the test passes with that cleanup deleted.
+    assert caught.tb is not None
+    assert made, "the spill directory was never created, so this proves nothing"
+    assert not Path(made[0]).exists(), "a failed open left its spill directory behind"
+
+
+def test_a_caller_cannot_choose_the_spill_directory() -> None:
+    """``config={'temp_directory': ...}`` is refused rather than silently overridden.
+
+    DuckDB folds its temp directory into ``allowed_directories``, so honouring
+    a caller's value would widen what contract SQL reads; ignoring it would
+    leave the caller believing its own directory was in use.
+    """
+    with pytest.raises(DuckDBSandboxError, match="temp_directory"):
+        secure_duckdb_connect(
+            ":memory:", allow=DuckDBAllowlist.none(), config={"temp_directory": "/tmp"}
+        )
+
+
+def test_the_read_back_refuses_a_remote_prefix_the_call_site_did_not_grant() -> None:
+    """The remote branch of the read-back, which the accept-path tests never reach.
+
+    A reported entry that is a URL is refused unless it is literally one of
+    ``allow.remote_prefixes`` -- including a prefix reported in some other
+    string form, which falls through to the same refusal.
+    """
+    import fluid_build.providers._duckdb_sandbox as sandbox
+
+    allow = DuckDBAllowlist.none().with_remote("s3://bucket/landing/")
+    con = secure_duckdb_connect(":memory:", allow=allow)
+    try:
+        spill = _setting(con, "temp_directory")
+        # _Reporting stands in for DuckDB reporting a prefix nothing granted.
+        with pytest.raises(DuckDBSandboxError, match="other-bucket"):
+            sandbox._refuse_ungranted_dirs(_Reporting(("s3://other-bucket/",)), allow, spill)
+    finally:
+        con.close()
+
+
+class _Reporting:
+    """A stand-in connection whose ``allowed_directories`` is whatever we say."""
+
+    def __init__(self, entries: Any) -> None:
+        self._entries = list(entries)
+
+    def execute(self, _sql: str) -> "_Reporting":
+        return self
+
+    def fetchall(self) -> List[Any]:
+        return [(self._entries,)]
 
 
 def test_an_unasked_for_grant_fails_the_connection_closed(

@@ -168,6 +168,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    List,
     Mapping,
     NamedTuple,
     Optional,
@@ -896,6 +897,24 @@ def _open_lock(target: str) -> Any:
 SPILL_DIR_PREFIX = "fluid-duckdb-spill-"
 
 
+def _refuse_caller_spill_dir(config: Optional[Mapping[str, Any]]) -> None:
+    """Refuse a ``config`` that names ``temp_directory``: the sandbox owns it.
+
+    Silently overriding it would be worse than refusing, because the caller
+    would go on believing its own directory was in use.
+    """
+    if any(str(key).lower() == "temp_directory" for key in (config or {})):
+        raise _sandbox_error(
+            what="DuckDB config names 'temp_directory'",
+            why=(
+                "The sandbox owns the spill directory. DuckDB folds its temp directory "
+                "into allowed_directories, so a value chosen anywhere else widens what "
+                "contract SQL may read."
+            ),
+            fix="Drop 'temp_directory' from config; the connection sets its own.",
+        )
+
+
 def _own_spill_dir() -> str:
     """A private directory for one connection's spill files, created mode 0700.
 
@@ -1016,6 +1035,7 @@ def secure_duckdb_connect(
     import duckdb
 
     version = _require_supported(duckdb)
+    _refuse_caller_spill_dir(config)
     target = os.fspath(database)
     # A database file this creates stays readable by the oldest supported
     # DuckDB (see _duckdb_compat); a caller's own setting wins.
@@ -1030,6 +1050,9 @@ def secure_duckdb_connect(
             if "same database file with a different configuration" in str(exc):
                 raise _already_open(target) from exc
             raise
+        # Appended with the spill directory's remover as soon as there is one,
+        # so a failure can run it AFTER the connection is closed.
+        spill_cleanup: List["weakref.finalize"] = []
         try:
             _confine_connection(
                 con,
@@ -1038,9 +1061,14 @@ def secure_duckdb_connect(
                 allow=allow,
                 extensions=extensions,
                 before_lock=before_lock,
+                spill_cleanup=spill_cleanup,
             )
         except BaseException:
             con.close()
+            # Only now that DuckDB has let go: it may still hold open spill
+            # files, and a removal underneath it would fail on Windows.
+            for drop in spill_cleanup:
+                drop()
             raise
     return con
 
@@ -1053,58 +1081,52 @@ def _confine_connection(
     allow: DuckDBAllowlist,
     extensions: Iterable[str],
     before_lock: Optional[Callable[[Any], None]],
+    spill_cleanup: List["weakref.finalize"],
 ) -> None:
     """Apply the sandbox to an open connection, in the order the module docstring gives.
 
     Called with that database file's :func:`_open_lock` held, so no other
-    thread is configuring this instance while these settings land. Raises with
-    the spill directory already removed; the caller closes the connection.
+    thread is configuring this instance while these settings land.
+    ``spill_cleanup`` is appended with the spill directory's remover once it
+    exists, so the caller runs it after closing the connection.
     """
-    drop_spill: Optional["weakref.finalize"] = None
     try:
-        try:
-            con.execute("SET allow_persistent_secrets = false")
-        except duckdb.Error as exc:
-            # The first statement on a fresh connection: locked already means
-            # this joined another connection's locked instance of the file.
-            if "configuration has been locked" in str(exc):
-                raise _already_open(target) from exc
-            raise
-        con.execute("SET allow_community_extensions = false")
-        for ext in extensions:
-            name = validate_ident(str(ext))
-            try:
-                con.execute(f"LOAD {name}")
-            except duckdb.Error:
-                con.execute(f"INSTALL {name}")
-                con.execute(f"LOAD {name}")
-        if before_lock is not None:
-            before_lock(con)
-        con.execute("SET autoinstall_known_extensions = false")
-        con.execute("SET autoload_known_extensions = false")
-        # Before the allowlist, because DuckDB folds its temp directory into
-        # allowed_directories: left at its relative default, that is a
-        # directory the contract's repository owns (see _own_spill_dir).
-        spill = _own_spill_dir()
-        drop_spill = weakref.finalize(con, shutil.rmtree, spill, ignore_errors=True)
-        con.execute(f"SET temp_directory = {quote_ansi_string_literal(spill)}")
-        home = os.environ.get("HOME")
-        if home:
-            # duckdb/duckdb#26064: the allowlist check expands '~' with $HOME and
-            # the open with this setting. Equal and locked, they cannot disagree.
-            con.execute(f"SET home_directory = {quote_ansi_string_literal(home)}")
-        directories = [_with_sep(d) for d in allow.dirs] + list(allow.remote_prefixes)
-        con.execute(f"SET allowed_directories = {_sql_list(directories)}")
-        con.execute(f"SET allowed_paths = {_sql_list(allow.paths)}")
-        con.execute("SET enable_external_access = false")
-        con.execute("SET lock_configuration = true")
-        _refuse_ungranted_dirs(con, allow, spill)
-    except BaseException:
-        # The connection is closing, so nothing will spill here: take the
-        # directory with it rather than leaving it for $TMPDIR's reaper.
-        if drop_spill is not None:
-            drop_spill()
+        con.execute("SET allow_persistent_secrets = false")
+    except duckdb.Error as exc:
+        # The first statement on a fresh connection: locked already means
+        # this joined another connection's locked instance of the file.
+        if "configuration has been locked" in str(exc):
+            raise _already_open(target) from exc
         raise
+    con.execute("SET allow_community_extensions = false")
+    for ext in extensions:
+        name = validate_ident(str(ext))
+        try:
+            con.execute(f"LOAD {name}")
+        except duckdb.Error:
+            con.execute(f"INSTALL {name}")
+            con.execute(f"LOAD {name}")
+    if before_lock is not None:
+        before_lock(con)
+    con.execute("SET autoinstall_known_extensions = false")
+    con.execute("SET autoload_known_extensions = false")
+    # Before the allowlist, because DuckDB folds its temp directory into
+    # allowed_directories: left at its relative default, that is a
+    # directory the contract's repository owns (see _own_spill_dir).
+    spill = _own_spill_dir()
+    spill_cleanup.append(weakref.finalize(con, shutil.rmtree, spill, ignore_errors=True))
+    con.execute(f"SET temp_directory = {quote_ansi_string_literal(spill)}")
+    home = os.environ.get("HOME")
+    if home:
+        # duckdb/duckdb#26064: the allowlist check expands '~' with $HOME and
+        # the open with this setting. Equal and locked, they cannot disagree.
+        con.execute(f"SET home_directory = {quote_ansi_string_literal(home)}")
+    directories = [_with_sep(d) for d in allow.dirs] + list(allow.remote_prefixes)
+    con.execute(f"SET allowed_directories = {_sql_list(directories)}")
+    con.execute(f"SET allowed_paths = {_sql_list(allow.paths)}")
+    con.execute("SET enable_external_access = false")
+    con.execute("SET lock_configuration = true")
+    _refuse_ungranted_dirs(con, allow, spill)
 
 
 def _already_open(target: str) -> DuckDBSandboxError:
@@ -1181,6 +1203,7 @@ __all__ = [
     "BROAD_ROOT_REASONS",
     "MIN_DUCKDB_VERSION",
     "OPERATOR_DIRS_ENV",
+    "SPILL_DIR_PREFIX",
     "DuckDBAllowlist",
     "DuckDBSandboxError",
     "WorkspaceGrant",
