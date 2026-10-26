@@ -121,7 +121,12 @@ class OdcsProvider(_OdcsProviderImpl):
             options={"include_quality_checks": True},
         )
         _quality_mapper.to_odcs(ctx)
-        return ctx.odcs.get("quality")
+        # The contract-level block no longer sits at the ODCS root: that root is
+        # ``additionalProperties: false`` and has no ``quality``, so writing it
+        # there made every such export an invalid document. It now rides in a
+        # namespaced custom property, and this shim's contract — "the
+        # contract-level quality block" — is unchanged, so read it from there.
+        return _quality_mapper._contract_quality_from_custom_properties(ctx.odcs)
 
     # --- schema (import) -----------------------------------------------
     def _odcs_schema_to_expose(self, odcs: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
