@@ -32,11 +32,13 @@ DuckDB docs give ("Securing DuckDB", introduced in 1.2):
    database, an object-store secret);
 3. ``autoinstall_known_extensions = false`` / ``autoload_known_extensions =
    false``, so a query cannot pull an extension in afterwards;
-4. ``home_directory`` (pinned to ``$HOME``, see below), then
+4. ``temp_directory`` (a directory this helper creates and owns, see below),
+   ``home_directory`` (pinned to ``$HOME``, see below), then
    ``allowed_directories`` and ``allowed_paths``: only what the call site
    declares it reads or writes;
 5. ``enable_external_access = false``;
-6. ``lock_configuration = true``, so the SQL cannot ``SET`` any of it back.
+6. ``lock_configuration = true``, so the SQL cannot ``SET`` any of it back,
+   then a read-back that the grants are the ones the call site asked for.
 
 Each setting is a ``SET`` statement on the connection, not the ``config=`` dict:
 the dict does not take the list-valued ``allowed_directories``.
@@ -51,6 +53,12 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
   refused on 1.5.0; see ``tests/providers/test_duckdb_sandbox.py``).
   :data:`MIN_DUCKDB_VERSION` is therefore 1.5.0, and a connection refuses to
   open on anything older.
+* DuckDB folds its ``temp_directory`` into ``allowed_directories``, and its
+  default is relative: ``.tmp`` in the working directory, or ``<db>.tmp``
+  beside a file database. Both sit where the contract's repository can place a
+  symlink, so the engine creates and owns the spill directory instead
+  (:func:`_own_spill_dir`), and :func:`_refuse_ungranted_dirs` reads the
+  grants back under the lock to check that is all DuckDB took.
 * duckdb/duckdb#26064 (open): ``~`` is expanded with ``$HOME`` by the check and
   with the ``home_directory`` setting by the open, so once the two differ they
   name different files and the check passes for one while the other is read.
@@ -131,8 +139,10 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
 import tempfile
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -829,6 +839,94 @@ def _with_sep(directory: str) -> str:
     return directory if directory.endswith(("/", os.sep)) else directory + os.sep
 
 
+#: Prefix of the spill directory each connection owns (:func:`_own_spill_dir`).
+#: Named so an operator who finds one left behind knows what wrote it.
+SPILL_DIR_PREFIX = "fluid-duckdb-spill-"
+
+
+def _own_spill_dir() -> str:
+    """A private directory for one connection's spill files, created mode 0700.
+
+    DuckDB's default ``temp_directory`` is RELATIVE: ``.tmp`` in the working
+    directory, or ``<db>.tmp`` beside a file database. Either sits in a
+    directory a contract's repository supplies, and DuckDB resolves its temp
+    directory into ``allowed_directories`` like any other entry, so a
+    repository that ships ``.tmp -> /`` grants the whole host to its own SQL
+    (reproduced with an empty allowlist on 1.5.1, 1.5.6 and 2.0.0, both
+    variants: ``tests/providers/test_duckdb_sandbox_spill.py``). Pointing
+    ``temp_directory`` at a directory the engine creates takes that grant away
+    from the contract: :func:`tempfile.mkdtemp` creates it 0700 under
+    ``$TMPDIR``, outside the contract's tree, under a name no contract can
+    predict or pre-place a symlink at.
+
+    Spilling stays on. ``temp_directory = ''`` leaves ``allowed_directories``
+    empty, which is tighter still, but a query that outgrows ``memory_limit``
+    then fails where it used to finish, and the configuration is locked, so no
+    call site could turn spilling back on. The directory this grants instead is
+    one empty directory the engine made: contract SQL can read
+    ``current_setting('temp_directory')`` and write scratch files there, which
+    reaches nothing it did not already have.
+
+    An owned per-connection spill directory, set before the configuration is
+    locked and removed on teardown, is the pattern paulosuzart/duckbox (#80),
+    nightswatchhq/nuthatch (#1182) and monarch-initiative/monarch-app (#1422)
+    each arrived at independently; DuckDB's own "Securing DuckDB" page does not
+    mention ``temp_directory`` at all. Those projects' own follow-ups name what
+    this does NOT do: no ``max_temp_directory_size`` cap (DuckDB's default is
+    90% of the free space on the volume), and a hard kill leaves the directory
+    behind for ``$TMPDIR``'s own reaper to collect.
+    """
+    return tempfile.mkdtemp(prefix=SPILL_DIR_PREFIX)
+
+
+def _refuse_ungranted_dirs(con: Any, allow: DuckDBAllowlist, spill: str) -> None:
+    """Refuse the connection if DuckDB granted a directory ``allow`` does not name.
+
+    Read back under the lock, so it reports what the SQL actually runs with
+    rather than what was sent. The sandbox is only as good as DuckDB's own
+    bookkeeping, and that bookkeeping has surprised us twice: a relative
+    ``temp_directory`` is folded in (the defect above), and ``allowed_paths``
+    and ``allowed_directories`` are separate lists that resolve differently.
+    A grant that appears from somewhere other than ``allow`` fails the
+    connection closed rather than running contract SQL with it.
+
+    Both sides are compared after ``realpath`` and, where the file system
+    ignores case, after casefolding, because that is how DuckDB stores them:
+    two entries that resolve to one directory are reported once (a grant of
+    both ``link`` and its target ``real`` reports only ``real/``). A remote
+    prefix is reported as it was given on 2.0, but DuckDB 1.5 resolves it as a
+    relative local path (``s3://bucket/landing/`` comes back as
+    ``<cwd>/s3:/bucket/landing/``, which :func:`os.path.realpath` reproduces),
+    so both forms count as granted.
+    """
+    reported = tuple(con.execute("SELECT current_setting('allowed_directories')").fetchall()[0][0])
+    granted = {_fold(os.path.realpath(d)) for d in (*allow.dirs, spill)}
+    granted |= {_fold(os.path.realpath(p)) for p in allow.remote_prefixes}
+    extra = [
+        entry
+        for entry in reported
+        if (entry not in allow.remote_prefixes)
+        if (is_remote_location(entry) or _fold(os.path.realpath(entry)) not in granted)
+    ]
+    if extra:
+        raise _sandbox_error(
+            what=(
+                "DuckDB granted directories this connection did not ask for: "
+                + ", ".join(repr(e) for e in extra)
+            ),
+            why=(
+                "Under the lock, contract SQL reads everything in "
+                "allowed_directories. DuckDB reported a directory that is not in this "
+                "call site's allowlist, so what the SQL can read is not what was granted."
+            ),
+            fix=(
+                "This is a bug in the sandbox or a change in DuckDB, not something a "
+                "contract can cause. Report it with the DuckDB version "
+                "(SELECT version()) and the directories listed above."
+            ),
+        )
+
+
 def secure_duckdb_connect(
     database: PathLike = ":memory:",
     *,
@@ -850,7 +948,9 @@ def secure_duckdb_connect(
     in, for set-up that needs access the SQL must not have, such as attaching a
     declared source database or creating an object-store secret. ``config``
     takes scalar start-up options (``threads``, ``TimeZone``), which cannot be
-    changed once the configuration is locked. On DuckDB 2.x a database file the
+    changed once the configuration is locked. Spill files go to a 0700 directory
+    this creates under ``$TMPDIR`` and removes once the connection is gone, not
+    to DuckDB's relative default (:func:`_own_spill_dir`). On DuckDB 2.x a database file the
     connection creates is written in the storage format DuckDB 1.5 writes
     (:func:`~fluid_build.providers._duckdb_compat.storage_compat_config`), unless
     ``config`` names ``storage_compatibility_version`` itself.
@@ -874,6 +974,7 @@ def secure_duckdb_connect(
         if "same database file with a different configuration" in str(exc):
             raise _already_open(target) from exc
         raise
+    drop_spill: Optional["weakref.finalize"] = None
     try:
         try:
             con.execute("SET allow_persistent_secrets = false")
@@ -895,6 +996,12 @@ def secure_duckdb_connect(
             before_lock(con)
         con.execute("SET autoinstall_known_extensions = false")
         con.execute("SET autoload_known_extensions = false")
+        # Before the allowlist, because DuckDB folds its temp directory into
+        # allowed_directories: left at its relative default, that is a
+        # directory the contract's repository owns (see _own_spill_dir).
+        spill = _own_spill_dir()
+        drop_spill = weakref.finalize(con, shutil.rmtree, spill, ignore_errors=True)
+        con.execute(f"SET temp_directory = {quote_ansi_string_literal(spill)}")
         home = os.environ.get("HOME")
         if home:
             # duckdb/duckdb#26064: the allowlist check expands '~' with $HOME and
@@ -905,7 +1012,12 @@ def secure_duckdb_connect(
         con.execute(f"SET allowed_paths = {_sql_list(allow.paths)}")
         con.execute("SET enable_external_access = false")
         con.execute("SET lock_configuration = true")
+        _refuse_ungranted_dirs(con, allow, spill)
     except BaseException:
+        # The connection is closing, so nothing will spill here: take the
+        # directory with it rather than leaving it for $TMPDIR's reaper.
+        if drop_spill is not None:
+            drop_spill()
         con.close()
         raise
     return con
