@@ -210,23 +210,32 @@ def test_the_spill_directory_goes_away_with_the_connection() -> None:
     assert not spill.exists(), "the engine's spill directory outlived its connection"
 
 
-def test_a_failed_open_leaves_no_spill_directory(tmp_path: Path) -> None:
-    """The ``before_lock`` path raises after the directory would have been made."""
-    before = _spill_dirs()
-    with pytest.raises(RuntimeError, match="no"):
+def test_a_failed_open_leaves_no_spill_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``before_lock`` that raises must not leak the directory it had made.
 
-        def boom(_con: Any) -> None:
-            raise RuntimeError("nope")
+    Watches the one directory THIS call creates rather than globbing ``$TMPDIR``
+    for the prefix: the suite runs under pytest-xdist, so another worker's
+    connection can hold a spill directory of its own for the whole test, and a
+    count of them would fail for reasons that have nothing to do with the
+    call under test.
+    """
+    import fluid_build.providers._duckdb_sandbox as sandbox
 
+    made: List[str] = []
+    real = sandbox._own_spill_dir
+    monkeypatch.setattr(
+        sandbox, "_own_spill_dir", lambda: made.append(real()) or made[-1]  # type: ignore[func-returns-value]
+    )
+
+    def boom(_con: Any) -> None:
+        raise RuntimeError("nope")
+
+    with pytest.raises(RuntimeError, match="nope"):
         secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none(), before_lock=boom)
-    assert _spill_dirs() == before
-
-
-def _spill_dirs() -> List[str]:
-    import tempfile
-
-    root = Path(tempfile.gettempdir())
-    return sorted(p.name for p in root.glob(SPILL_DIR_PREFIX + "*"))
+    # before_lock runs BEFORE the spill directory is created, so the expected
+    # outcome is that none was made at all; if that order ever changes, the
+    # one that was made must still be gone.
+    assert [d for d in made if Path(d).exists()] == []
 
 
 # ── the read-back refuses a grant the call site did not ask for ──────────
@@ -290,3 +299,62 @@ def test_the_read_back_accepts_every_shape_a_call_site_grants(tmp_path: Path) ->
         ]
     finally:
         con.close()
+
+
+# ── one instance per file means one configurer at a time ─────────────────
+
+
+def test_concurrent_opens_of_one_file_database_never_cross_configure(tmp_path: Path) -> None:
+    """Two threads opening one file DB: each connection gets its own allowlist, or a refusal.
+
+    DuckDB shares one instance per file per process and the sandbox's settings
+    live on the instance, so without ``_open_lock`` the two opens interleave:
+    one connection runs under the other's allowlist, and the post-lock
+    read-back inspects a list the other thread is still writing, which
+    segfaults DuckDB 1.5.x in ``AllowedDirectoriesSetting::GetSetting``. What
+    must never happen is a RETURNED connection that can read a directory it
+    did not grant.
+    """
+    import threading
+
+    granted = tmp_path / "granted"
+    granted.mkdir()
+    (granted / "secret.csv").write_text("a\n1\n", encoding="utf-8")
+    db = tmp_path / "shared.duckdb"
+
+    results: List[Any] = []
+    lock = threading.Lock()
+
+    def open_with(allow: DuckDBAllowlist, wide: bool) -> None:
+        try:
+            con = secure_duckdb_connect(db, allow=allow)
+        except DuckDBSandboxError:
+            with lock:
+                results.append(("refused", None, wide))
+            return
+        try:
+            reads = _reads(con, str(granted / "secret.csv"))
+            with lock:
+                results.append(("open", reads, wide))
+        finally:
+            con.close()
+
+    for _ in range(12):
+        results.clear()
+        wide = DuckDBAllowlist.none().with_dirs(granted)
+        narrow = DuckDBAllowlist.none()
+        threads = [
+            threading.Thread(target=open_with, args=(wide, True)),
+            threading.Thread(target=open_with, args=(narrow, False)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(results) == 2, f"a thread neither opened nor was refused: {results}"
+        # The invariant is not "one at a time" -- serialising the opens makes
+        # both succeed in turn, which is correct. It is that a connection
+        # which granted NOTHING can never read the other's directory.
+        assert ("open", True) not in [
+            (kind, leaked) for kind, leaked, wide in results if not wide
+        ], f"a connection read a directory it did not grant: {results}"

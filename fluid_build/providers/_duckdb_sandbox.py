@@ -122,7 +122,22 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
 * DuckDB shares one database instance per file per process, and the lock is
   instance-wide: a second connection to a file database that is already open
   cannot be sandboxed, and is refused with :class:`DuckDBSandboxError`. Each
-  call site closes its connection before the next opens the same file.
+  call site closes its connection before the next opens the same file, and
+  :func:`_open_lock` serialises the open so that refusal is deterministic
+  rather than the outcome of a race.
+* ``lock_configuration`` does not hold on DuckDB 1.5.x for the logging
+  settings reached as a TABLE FUNCTION. ``SET enable_logging = true`` is
+  refused as it should be, but ``SELECT * FROM enable_logging(...)`` is
+  accepted, and the sandbox's own path refusal is then thrown from DuckDB's
+  logger write path as an uncaught C++ exception that aborts the process
+  (SIGABRT; reproduced on 1.5.1 and 1.5.6, refused cleanly on 2.0.0). So on
+  1.5.x one statement can end the process rather than raise something
+  :func:`is_sandbox_refusal` can classify. It widens no grant -- the failure is
+  availability, not confidentiality -- and the engine's own SQL never spells
+  it; the exposure is a free-form SQL surface, such as the MCP output port's
+  ``query_sql`` under ``policy.allow_free_form_sql``, whose SELECT-only gate a
+  table function passes. Denying those functions belongs in that gate, not
+  here: no connection setting can take back what the lock does not hold.
 * The DuckDB docs call these settings defense-in-depth, "not a substitute for
   proper sandboxing": a multi-tenant host still runs each contract in its own
   container.
@@ -137,11 +152,13 @@ References:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
 import sys
 import tempfile
+import threading
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,6 +166,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     Iterable,
     Mapping,
     NamedTuple,
@@ -839,6 +857,40 @@ def _with_sep(directory: str) -> str:
     return directory if directory.endswith(("/", os.sep)) else directory + os.sep
 
 
+#: One lock per database FILE, so two threads never configure one DuckDB
+#: instance at once (:func:`_open_lock`). The dict is guarded because the
+#: read-modify-write that adds a missing key is not atomic.
+_OPEN_LOCKS: Dict[str, "threading.Lock"] = {}
+_OPEN_LOCKS_GUARD = threading.Lock()
+
+
+def _open_lock(target: str) -> Any:
+    """The lock that serialises opening ``target``, or a no-op for in-memory.
+
+    DuckDB shares one instance per database file per process, and the sandbox's
+    settings live on that instance, not on the connection. Two threads opening
+    one file therefore race: each ``SET`` lands on the instance the other is
+    also configuring, so one connection can end up running under the other's
+    allowlist, and :func:`_refuse_ungranted_dirs` reads a list the other thread
+    is still writing -- which segfaults DuckDB inside
+    ``AllowedDirectoriesSetting::GetSetting`` on 1.5.1 and 1.5.6 (not on
+    2.0.0). Serialising the open closes all of it: the second thread finds a
+    locked instance and gets the :func:`_already_open` refusal it was always
+    meant to get, instead of winning a race. No ``before_lock`` callback opens
+    a database through this helper, so holding the lock across one cannot
+    deadlock.
+
+    A private in-memory database (``:memory:``, ``""``) is its own instance per
+    connection and needs no lock. A NAMED one (``:memory:shared``) is shared
+    within the process as a file is, and is keyed by its literal name.
+    """
+    if target in (":memory:", ""):
+        return contextlib.nullcontext()
+    key = target if target.startswith(":") else _fold(os.path.realpath(target))
+    with _OPEN_LOCKS_GUARD:
+        return _OPEN_LOCKS.setdefault(key, threading.Lock())
+
+
 #: Prefix of the spill directory each connection owns (:func:`_own_spill_dir`).
 #: Named so an operator who finds one left behind knows what wrote it.
 SPILL_DIR_PREFIX = "fluid-duckdb-spill-"
@@ -968,12 +1020,46 @@ def secure_duckdb_connect(
     # A database file this creates stays readable by the oldest supported
     # DuckDB (see _duckdb_compat); a caller's own setting wins.
     options = {**storage_compat_config(version), **dict(config or {})}
-    try:
-        con = duckdb.connect(target, read_only=read_only, config=options)
-    except duckdb.Error as exc:
-        if "same database file with a different configuration" in str(exc):
-            raise _already_open(target) from exc
-        raise
+    # One instance per file per process, and the sandbox's settings live on the
+    # instance: without this, two threads opening one file configure each
+    # other's connection (see _open_lock).
+    with _open_lock(target):
+        try:
+            con = duckdb.connect(target, read_only=read_only, config=options)
+        except duckdb.Error as exc:
+            if "same database file with a different configuration" in str(exc):
+                raise _already_open(target) from exc
+            raise
+        try:
+            _confine_connection(
+                con,
+                duckdb,
+                target=target,
+                allow=allow,
+                extensions=extensions,
+                before_lock=before_lock,
+            )
+        except BaseException:
+            con.close()
+            raise
+    return con
+
+
+def _confine_connection(
+    con: Any,
+    duckdb: Any,
+    *,
+    target: str,
+    allow: DuckDBAllowlist,
+    extensions: Iterable[str],
+    before_lock: Optional[Callable[[Any], None]],
+) -> None:
+    """Apply the sandbox to an open connection, in the order the module docstring gives.
+
+    Called with that database file's :func:`_open_lock` held, so no other
+    thread is configuring this instance while these settings land. Raises with
+    the spill directory already removed; the caller closes the connection.
+    """
     drop_spill: Optional["weakref.finalize"] = None
     try:
         try:
@@ -1018,9 +1104,7 @@ def secure_duckdb_connect(
         # directory with it rather than leaving it for $TMPDIR's reaper.
         if drop_spill is not None:
             drop_spill()
-        con.close()
         raise
-    return con
 
 
 def _already_open(target: str) -> DuckDBSandboxError:
