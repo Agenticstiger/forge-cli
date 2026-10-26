@@ -51,6 +51,7 @@ could grant itself the allowlist meant to constrain it.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -59,12 +60,20 @@ from fluid_build._errors import FluidUserError, doc_url
 #: Operator-only. Comma-separated ``NAME`` or ``NAME@host`` entries.
 ALLOWLIST_ENV = "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST"
 
-#: Connection fields that can carry the destination, in the order the schema's
-#: ``acquisitionSource.connection`` lists them as alternatives. ``host`` is the
-#: plain field; ``uri`` and ``instance_url`` carry it inside a URL.
-_HOST_FIELDS = ("host", "uri", "instance_url")
+#: Every field that can carry a destination. ALL of them are checked, not just
+#: the first that parses: a contract that set ``host: localhost`` as a decoy
+#: beside a remote ``connection_string`` would otherwise be exempted on the
+#: strength of the decoy. ``connection_string`` is debezium's mongodb shape;
+#: ``extra_config`` can carry ``database.hostname`` and friends.
+_HOST_FIELDS = ("host", "uri", "instance_url", "connection_string", "server", "endpoint")
+
+#: URI schemes that name an object store rather than a database server. Their
+#: authority is a BUCKET, not a host, so reporting it as a destination both
+#: refuses working contracts and suggests an allowlist entry that is nonsense.
+_OBJECT_STORE_SCHEMES = frozenset({"s3", "s3a", "s3n", "gs", "gcs", "az", "azure", "abfss", "file"})
 
 
+@dataclass
 class AcquisitionSecretPolicyError(FluidUserError):
     """A ``secretRef`` would be sent somewhere the operator has not allowed.
 
@@ -75,29 +84,52 @@ class AcquisitionSecretPolicyError(FluidUserError):
     code: str = "AcquisitionSecretPolicyError"
 
 
-def connection_host(connection: Mapping[str, Any]) -> Optional[str]:
-    """The hostname a connection block would send credentials to, or ``None``.
+def connection_hosts(connection: Mapping[str, Any]) -> List[Optional[str]]:
+    """Every destination this connection block could send a credential to.
 
-    ``None`` means "no host could be determined", which is treated as remote by
-    :func:`refuse_unless_allowed`: a destination we cannot read is not one we
-    can clear. A bare ``host`` wins over a URL, and a URL's host is taken with
-    :func:`urllib.parse.urlsplit` rather than a regex so userinfo, ports,
-    bracketed IPv6 and an empty authority behave as the stdlib decides.
+    A list, because the policy has to clear ALL of them: trusting the first
+    field that happened to parse let a contract put ``host: localhost`` beside
+    a remote ``connection_string`` and be exempted on the decoy.
+
+    An entry is ``None`` when a present field names something we cannot read as
+    a host, which :func:`refuse_unless_allowed` treats as remote -- a
+    destination we cannot read is not one we can clear. An object-store URI
+    (``s3://bucket/...``) is skipped entirely rather than reported as a host:
+    its authority is a bucket, so refusing on it would break working contracts
+    and suggest a meaningless allowlist entry.
     """
+    out: List[Optional[str]] = []
     for field in _HOST_FIELDS:
         raw = connection.get(field)
-        if raw is None or str(raw).strip() == "":
+        if raw is None or not isinstance(raw, (str, bytes)) or str(raw).strip() == "":
             continue
         text = str(raw).strip()
         if field == "host":
-            return text
+            out.append(text)
+            continue
+        scheme = text.partition("://")[0].strip().lower() if "://" in text else ""
+        if scheme in _OBJECT_STORE_SCHEMES:
+            continue
         try:
             parsed = urlsplit(text if "//" in text else f"//{text}")
         except ValueError:
-            return None
-        if parsed.hostname:
-            return parsed.hostname
-    return None
+            out.append(None)
+            continue
+        out.append(parsed.hostname or None)
+    return out
+
+
+def connection_host(connection: Mapping[str, Any]) -> Optional[str]:
+    """The first destination :func:`connection_hosts` found, for diagnostics.
+
+    The POLICY uses ``connection_hosts`` and clears every entry; this is the
+    one a message names, and the first remote one is the informative choice.
+    """
+    hosts = connection_hosts(connection)
+    for host in hosts:
+        if not is_loopback(host):
+            return host
+    return hosts[0] if hosts else None
 
 
 def is_loopback(host: Optional[str]) -> bool:
@@ -122,7 +154,11 @@ def is_loopback(host: Optional[str]) -> bool:
     """
     from fluid_build.build_runners._acquisition_common import _is_loopback_host
 
-    return _is_loopback_host(host)
+    if host is None:
+        return False
+    # A trailing dot is the fully-qualified spelling of the same name, and the
+    # shared helper does not strip it.
+    return _is_loopback_host(host.strip().rstrip(".") or host)
 
 
 def _entries(raw: str) -> List[Tuple[str, Optional[str]]]:
@@ -136,7 +172,13 @@ def _entries(raw: str) -> List[Tuple[str, Optional[str]]]:
         name = name.strip()
         if not name:
             continue
-        out.append((name, host.strip().lower() or None if sep else None))
+        if sep:
+            target = host.strip().lower().rstrip(".")
+            if not target:
+                continue  # `NAME@` is malformed: it grants nothing, not everything
+            out.append((name, target))
+        else:
+            out.append((name, None))
     return out
 
 
@@ -165,11 +207,12 @@ def _allows(variable: str, host: Optional[str], entries: List[Tuple[str, Optiona
 def refuse_unless_allowed(
     variable: str,
     *,
-    host: Optional[str],
+    connection: Optional[Mapping[str, Any]] = None,
+    host: Optional[str] = None,
     scheme: str = "env",
     environ: Optional[Mapping[str, str]] = None,
 ) -> None:
-    """Raise unless ``variable`` may be sent to ``host``.
+    """Raise unless ``variable`` may be sent to every destination in ``connection``.
 
     Called before the reference is resolved, so a refusal never reads the
     secret. Only ``env://`` is policed: the other schemes name a secret in a
@@ -177,34 +220,58 @@ def refuse_unless_allowed(
     already a decision the operator made, whereas ``env://`` turns whatever
     happens to be in the environment into a credential for a host the contract
     picked.
+
+    ``connection`` is the preferred argument: EVERY destination it carries has
+    to clear, so a decoy loopback field cannot mask a remote sibling. ``host``
+    is for the call sites that know their one destination directly (an
+    orchestrator URL), and is checked on its own.
     """
     if scheme != "env":
         return
-    if is_loopback(host):
-        return
-    if _allows(variable, host, allowlist(environ)):
-        return
-    where = f"host {host!r}" if host else "a host that could not be determined"
-    raise AcquisitionSecretPolicyError(
-        what=(
-            f"the contract would send environment variable {variable!r} to {where} "
-            "as a credential"
-        ),
-        why=(
-            "A contract names both the variable to read and the host it is sent to, so "
-            "without an operator allowlist any variable in this environment could be "
-            "sent to a host the contract chose. A loopback host needs no entry; every "
-            "destination that leaves this machine does."
-        ),
-        fix=(
-            f"If this is intended, add it to {ALLOWLIST_ENV} in the OPERATOR environment "
-            f"(a shell or CI variable, not a project .env, which is ignored for this "
-            f'setting): {ALLOWLIST_ENV}="{variable}@{host}" for that host only, or '
-            f'"{variable}" for any host. Otherwise put the credential in a secret store '
-            "and reference it with vault://, aws://, gcp://, azure:// or file://."
-        ),
-        doc=doc_url(),
-    )
+    targets: List[Optional[str]] = []
+    if connection is not None:
+        targets.extend(connection_hosts(connection))
+        if not targets and any(field in connection for field in _HOST_FIELDS):
+            # Every destination field present named an object store, whose
+            # authority is a bucket rather than a host. This host-based policy
+            # has nothing to decide on, and refusing would break a working
+            # contract while suggesting a meaningless allowlist entry. A
+            # KNOWN GAP, recorded in the module docstring: an object-store
+            # credential is not covered here.
+            return
+    if host is not None or not targets:
+        targets.append(host)
+    entries = allowlist(environ)
+    for target in targets:
+        if is_loopback(target):
+            continue
+        if _allows(variable, target, entries):
+            continue
+        where = f"host {target!r}" if target else "a host that could not be determined"
+        suggestion = (
+            f'{ALLOWLIST_ENV}="{variable}@{target}"' if target else f'{ALLOWLIST_ENV}="{variable}"'
+        )
+        raise AcquisitionSecretPolicyError(
+            what=(
+                f"the contract would send environment variable {variable!r} to {where} "
+                "as a credential"
+            ),
+            why=(
+                "A contract names both the variable to read and the host it is sent to, so "
+                "without an operator allowlist any variable in this environment could be "
+                "sent to a host the contract chose. A loopback host needs no entry; every "
+                "destination that leaves this machine does."
+            ),
+            fix=(
+                f"If this is intended, set it in the OPERATOR environment (a shell or CI "
+                f"variable, not a project .env, which is ignored for this setting): "
+                f'{suggestion} for that host only, or {ALLOWLIST_ENV}="{variable}" for any '
+                "host. A host written with a port never matches, so leave the port off. "
+                "Otherwise put the credential in a secret store and reference it with "
+                "vault://, aws://, gcp://, azure:// or file://."
+            ),
+            doc=doc_url(),
+        )
 
 
 def register_resolved(value: Any) -> None:
@@ -222,9 +289,3 @@ def register_resolved(value: Any) -> None:
         register_secret(value)
     except Exception:  # pragma: no cover - redaction is best-effort
         return
-
-
-def describe(connection: Mapping[str, Any]) -> Dict[str, Any]:
-    """What the policy sees for ``connection``: for diagnostics and tests."""
-    host = connection_host(connection)
-    return {"host": host, "loopback": is_loopback(host), "allowlist": allowlist()}

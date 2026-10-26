@@ -41,7 +41,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from fluid_build.build_runners._secret_policy import (
-    connection_host,
     refuse_unless_allowed,
     register_resolved,
 )
@@ -535,10 +534,18 @@ def resolve_connection_secrets(
     # reads the secret. This is the one place that sees both halves the contract
     # chose -- the variable and the destination -- which is why the check lives
     # here and all six acquisition runners inherit it.
+    if out.get(target_field):
+        # An inline literal already wins (below), so the reference is never
+        # read and nothing is sent anywhere: there is nothing to police. The
+        # upgrade note promises exactly this, and checking here would refuse a
+        # contract that has a working credential and a stale secretRef beside
+        # it.
+        return out
     scheme = str(secret_ref).partition("://")[0].strip().lower()
     if scheme == "env":
         variable = str(secret_ref).partition("://")[2].strip()
-        refuse_unless_allowed(variable, host=connection_host(out), scheme="env")
+        # The whole connection, so EVERY destination it carries has to clear.
+        refuse_unless_allowed(variable, connection=out, scheme="env")
     value = resolve_secret_ref(secret_ref)
     # #884: the literal can be echoed by a client library's own error, which the
     # runners print. Registering it means the redactor masks it by value rather

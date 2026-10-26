@@ -52,6 +52,12 @@ from .._acquisition_common import (
     utc_now_iso,
     write_run_record_and_finalize,
 )
+from .._secret_policy import (
+    AcquisitionSecretPolicyError,
+    connection_host,
+    refuse_unless_allowed,
+    register_resolved,
+)
 
 LOG = logging.getLogger("fluid.acquire.airbyte")
 
@@ -306,7 +312,20 @@ def _execute_rest_mode(
     api_token = auth.get("token")
     if not api_token and auth.get("secretRef"):
         try:
+            # The contract names deployment.server_url, so this reference takes
+            # the same policy as a source connection's -- the destination here
+            # is that URL's host, not a connection block's.
+            _ref = str(auth["secretRef"])
+            if _ref.partition("://")[0].strip().lower() == "env":
+                refuse_unless_allowed(
+                    _ref.partition("://")[2].strip(),
+                    host=connection_host({"uri": server_url}),
+                    scheme="env",
+                )
             api_token = resolve_secret_ref(auth["secretRef"])
+            register_resolved(api_token)
+        except AcquisitionSecretPolicyError:
+            raise
         except (ValueError, NotImplementedError) as exc:
             return _failed(
                 ctx,

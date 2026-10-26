@@ -29,6 +29,7 @@ the secret.
 from __future__ import annotations
 
 import os
+import pathlib
 from typing import Any, Dict
 
 import pytest
@@ -275,3 +276,99 @@ def test_a_resolved_secret_is_registered_with_the_redactor(
     monkeypatch.setenv(ALLOWLIST_ENV, VARIABLE)
     _resolve({"host": "db.example.com", "secretRef": f"env://{VARIABLE}"})
     assert SECRET in seen, "the resolved value was not registered for redaction"
+
+
+# ── what the adversarial review of this policy found ────────────────────
+
+
+def test_a_decoy_loopback_field_cannot_mask_a_remote_sibling() -> None:
+    """The HIGH finding: trusting the first field that parses was a bypass.
+
+    A contract set ``host: localhost`` beside a remote ``connection_string``
+    (debezium's mongodb shape) and was exempted on the decoy, while the
+    credential went to the remote one. EVERY destination has to clear.
+    """
+    with pytest.raises(AcquisitionSecretPolicyError) as caught:
+        _resolve(
+            {
+                "host": "localhost",
+                "connection_string": "mongodb://evil.example.com/db",
+                "secretRef": f"env://{VARIABLE}",
+            }
+        )
+    assert "evil.example.com" in caught.value.what, caught.value.what
+
+
+@pytest.mark.parametrize(
+    "field", ["connection_string", "server", "endpoint", "uri", "instance_url"]
+)
+def test_every_destination_bearing_field_is_read(field: str) -> None:
+    """A field the policy does not read is a field a contract can hide behind."""
+    with pytest.raises(AcquisitionSecretPolicyError):
+        _resolve({field: "remote.example.com", "secretRef": f"env://{VARIABLE}"})
+
+
+def test_a_trailing_at_grants_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``NAME@`` parsed fail-OPEN to any host, which is the opposite of intended."""
+    monkeypatch.setenv(ALLOWLIST_ENV, f"{VARIABLE}@")
+    with pytest.raises(AcquisitionSecretPolicyError):
+        _resolve({"host": "evil.example.com", "secretRef": f"env://{VARIABLE}"})
+
+
+def test_an_inline_credential_is_not_policed() -> None:
+    """The upgrade note promises this: the reference is never read, so nothing is sent."""
+    out = _resolve(
+        {"host": "db.example.com", "password": "inline", "secretRef": f"env://{VARIABLE}"}
+    )
+    assert out["password"] == "inline"
+    assert "secretRef" not in out
+
+
+def test_an_object_store_uri_is_not_treated_as_a_host() -> None:
+    """Its authority is a bucket, so a host policy has nothing to decide.
+
+    Refusing it broke working contracts AND suggested an allowlist entry naming
+    a bucket, which is meaningless. Recorded as a known limitation rather than
+    silently cleared.
+    """
+    for uri in ("s3://bucket/prefix", "gs://bucket/p", "az://c/p", "file:///tmp/x"):
+        out = _resolve({"uri": uri, "secretRef": f"env://{VARIABLE}"})
+        assert out["password"] == SECRET, uri
+
+
+def test_the_fqdn_form_of_localhost_is_loopback() -> None:
+    assert is_loopback("localhost.")
+    assert _resolve({"host": "localhost.", "secretRef": f"env://{VARIABLE}"})["password"] == SECRET
+
+
+def test_the_refusal_carries_its_own_error_code() -> None:
+    """Without @dataclass the inherited `code` read "FluidUserError"."""
+    with pytest.raises(AcquisitionSecretPolicyError) as caught:
+        _resolve({"host": "db.example.com", "secretRef": f"env://{VARIABLE}"})
+    assert caught.value.code == "AcquisitionSecretPolicyError"
+
+
+def test_the_fix_warns_that_a_port_never_matches() -> None:
+    """federation already warns about this; the message should pre-empt it."""
+    with pytest.raises(AcquisitionSecretPolicyError) as caught:
+        _resolve({"host": "db.example.com", "secretRef": f"env://{VARIABLE}"})
+    assert "port" in caught.value.fix
+
+
+def test_a_host_written_with_a_port_does_not_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fails closed, as federation does, rather than appearing to work."""
+    monkeypatch.setenv(ALLOWLIST_ENV, f"{VARIABLE}@db.example.com:5432")
+    with pytest.raises(AcquisitionSecretPolicyError):
+        _resolve({"host": "db.example.com", "secretRef": f"env://{VARIABLE}"})
+
+
+def test_the_airbyte_deployment_token_path_is_policed() -> None:
+    """It was claimed as policed in an earlier commit message and was not.
+
+    The edit had failed on a bad anchor and the omission went unnoticed, so this
+    pins the call site rather than the claim.
+    """
+    from fluid_build.build_runners.airbyte import runner as airbyte_runner
+
+    source = pathlib.Path(airbyte_runner.__file__).read_text(encoding="utf-8")
+    assert "refuse_unless_allowed(" in source, "the deployment.auth.secretRef path is unpoliced"

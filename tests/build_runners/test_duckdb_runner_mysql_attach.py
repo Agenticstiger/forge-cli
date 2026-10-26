@@ -51,7 +51,7 @@ def _allow_the_fixture_host(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv(
         "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST",
-        "RUNNER_FAKE_PG_SECRET,RUNNER_FAKE_MYSQL_SECRET",
+        "RUNNER_FAKE_PG_SECRET,RUNNER_FAKE_MYSQL_SECRET,RUNNER_FAKE_UNSET_SECRET",
     )
 
 

@@ -53,39 +53,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resolved `secretRef` values are registered with the exact-value redactor (#884), so a literal a
   client library echoes in its own error is masked by value rather than by pattern.
 
-### Known limitations
 
-- **The loopback exemption covers only the engines where this process makes the connection** —
-  dlt, duckdb, meltano, and the `embedded` modes of debezium and airbyte. For kafka_connect and
-  the `bring-your-own` / `managed` modes of debezium and airbyte, forge-cli does not connect to
-  the database at all: it hands the whole connector config, resolved credential included, to the
-  orchestrator named by `properties.<engine>.deployment.server_url`. That URL is contract-chosen
-  and **this policy does not check it**, so a loopback `connection.host` still clears a send whose
-  credential then leaves the machine in an HTTP body. The behaviour is unchanged from before this
-  release — nothing regressed — but it is NOT closed, and `deployment.server_url` has no host
-  allowlist of the kind `FLUID_COMMAND_CENTER_HOST_ALLOWLIST`, `FLUID_FEDERATION_HOST_ALLOWLIST`
-  and `FLUID_WEBHOOK_HOST_ALLOWLIST` already provide elsewhere. Treat an `env://` secretRef on
-  those three paths as unprotected whatever the declared host.
-- A connection whose only destination field is an object-store URI (`s3://`, `gs://`, `az://`,
-  `file://`) is not policed: the authority there is a bucket, not a host, so a host-based policy
-  has nothing to decide.
-- `{{ env.NAME }}` interpolation in a connection field reads the environment without going through
-  `secretRef` at all, so it is not covered by this policy.
-
-### Upgrade notes
-
-- **A contract using `env://` against a remote host now fails until the operator allows it.** Each
-  one is restored with a single operator-environment variable, for example
-  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST="PG_PASSWORD@db.example.com"` (that host only) or
-  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST="PG_PASSWORD"` (any host). Set it in the shell, in CI, or
-  in a `FLUID_SECRETS_FILE` outside the project — **not** in a project `.env`, where it is ignored.
-  A host written with a port never matches, so leave the port off. Local development against
-  `localhost`, `127.0.0.0/8` or `::1` needs no configuration. The better long-term answer for a
-  production credential is a secret store: `vault://`, `aws://`, `gcp://`, `azure://` or `file://`.
-- `fluid init --discover` against a remote host emits a contract carrying `env://`, which `fluid
-  apply` will now refuse until that variable is allowlisted. The discover hint does not yet print
-  the allowlist line; the refusal from `apply` does.
-
+- A contract repository could hand the whole host to its own SQL through DuckDB's spill
+  directory. `secure_duckdb_connect` never set `temp_directory`, and DuckDB resolves its
+  temp directory into `allowed_directories` like any other grant; the default is relative
+  (`.tmp` in the working directory, or `<db>.tmp` beside a file database), so a repository
+  shipping `.tmp -> /` got `allowed_directories = ['/']` on a connection that granted
+  nothing, and contract SQL could read any file the process could. Reproduced on duckdb
+  1.5.1, 1.5.6 and 2.0.0, for an in-memory and a file database, through the same helper the
+  MCP output port's `query_sql` runs on. The engine now creates and owns that directory
+  (mode 0700, under `$TMPDIR`, removed with the connection), reads the grants back under
+  the lock and refuses the connection if DuckDB took a directory the call site did not
+  name, and refuses a caller-supplied `temp_directory` rather than silently overriding it.
+  Spilling is unaffected. No contract, flag or configuration change is needed.
+- Opening one DuckDB database file from two threads at once is now serialised. DuckDB
+  shares one instance per file per process and the sandbox's settings live on the instance,
+  so the two opens could cross-configure: a connection could be returned running under the
+  other thread's allowlist. The second opener now reliably gets the existing
+  "already open in this process" refusal.
 
 ### Fixed
 
@@ -134,27 +119,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with an invalid type stay invalid — the fix is emit-time — but those already failed
   validation, so nothing working changes.
 
-### Security
-
-- A contract repository could hand the whole host to its own SQL through DuckDB's spill
-  directory. `secure_duckdb_connect` never set `temp_directory`, and DuckDB resolves its
-  temp directory into `allowed_directories` like any other grant; the default is relative
-  (`.tmp` in the working directory, or `<db>.tmp` beside a file database), so a repository
-  shipping `.tmp -> /` got `allowed_directories = ['/']` on a connection that granted
-  nothing, and contract SQL could read any file the process could. Reproduced on duckdb
-  1.5.1, 1.5.6 and 2.0.0, for an in-memory and a file database, through the same helper the
-  MCP output port's `query_sql` runs on. The engine now creates and owns that directory
-  (mode 0700, under `$TMPDIR`, removed with the connection), reads the grants back under
-  the lock and refuses the connection if DuckDB took a directory the call site did not
-  name, and refuses a caller-supplied `temp_directory` rather than silently overriding it.
-  Spilling is unaffected. No contract, flag or configuration change is needed.
-- Opening one DuckDB database file from two threads at once is now serialised. DuckDB
-  shares one instance per file per process and the sandbox's settings live on the instance,
-  so the two opens could cross-configure: a connection could be returned running under the
-  other thread's allowlist. The second opener now reliably gets the existing
-  "already open in this process" refusal.
-
 ### Known limitations
+
+- **The loopback exemption covers only the engines where this process makes the connection** —
+  dlt, duckdb, meltano, and the `embedded` modes of debezium and airbyte. For kafka_connect and
+  the `bring-your-own` / `managed` modes of debezium and airbyte, forge-cli does not connect to
+  the database at all: it hands the whole connector config, resolved credential included, to the
+  orchestrator named by `properties.<engine>.deployment.server_url`. That URL is contract-chosen
+  and **this policy does not check it**, so a loopback `connection.host` still clears a send whose
+  credential then leaves the machine in an HTTP body. The behaviour is unchanged from before this
+  release — nothing regressed — but it is NOT closed, and `deployment.server_url` has no host
+  allowlist of the kind `FLUID_COMMAND_CENTER_HOST_ALLOWLIST`, `FLUID_FEDERATION_HOST_ALLOWLIST`
+  and `FLUID_WEBHOOK_HOST_ALLOWLIST` already provide elsewhere. Treat an `env://` secretRef on
+  those three paths as unprotected whatever the declared host.
+- A connection whose only destination field is an object-store URI (`s3://`, `gs://`, `az://`,
+  `file://`) is not policed: the authority there is a bucket, not a host, so a host-based policy
+  has nothing to decide.
+- `{{ env.NAME }}` interpolation in a connection field reads the environment without going through
+  `secretRef` at all, so it is not covered by this policy.
+
 
 - On DuckDB 1.5.x, `lock_configuration` does not hold for logging reached as a table
   function: `SET enable_logging = true` is refused, but `SELECT * FROM enable_logging(...)`
@@ -163,6 +146,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine's own SQL never spells it; the exposure is a free-form SQL surface such as the MCP
   output port's `query_sql` under `policy.allow_free_form_sql`. DuckDB 2.0 refuses it
   cleanly.
+
+### Upgrade notes
+
+- **A contract using `env://` against a remote host now fails until the operator allows it.** Each
+  one is restored with a single operator-environment variable, for example
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST="PG_PASSWORD@db.example.com"` (that host only) or
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST="PG_PASSWORD"` (any host). Set it in the shell, in CI, or
+  in a `FLUID_SECRETS_FILE` outside the project — **not** in a project `.env`, where it is ignored.
+  A host written with a port never matches, so leave the port off. Local development against
+  `localhost`, `127.0.0.0/8` or `::1` needs no configuration. The better long-term answer for a
+  production credential is a secret store: `vault://`, `aws://`, `gcp://`, `azure://` or `file://`.
+- `fluid init --discover` against a remote host emits a contract carrying `env://`, which `fluid
+  apply` will now refuse until that variable is allowlisted. The discover hint does not yet print
+  the allowlist line; the refusal from `apply` does.
 
 ## [0.22.0] — 2026-10-22
 
