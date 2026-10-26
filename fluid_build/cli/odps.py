@@ -414,16 +414,25 @@ def _validate_imported(fluid: Mapping[str, Any]) -> Tuple[bool, str]:
     without that function's error printing, because this command reports the
     first problem in one line of its own. Returns ``(is_valid, problem)``.
 
-    Function-local import: ``schema_manager`` pulls in ``jsonschema``, which
+    A jsonschema error quotes the value that failed, and the value comes from a
+    document this command was handed — so a poisoned contract could print its
+    own credential to stderr. The message therefore goes through
+    ``redact_secret_text``, the repo's own redactor, rather than the console's
+    weaker ``key=value`` sanitiser: a `snowflake://user:password@host` DSN in a
+    rejected field is masked here, not advertised.
+
+    Function-local imports: ``schema_manager`` pulls in ``jsonschema``, which
     ``tests/perf/test_startup_budget.py`` forbids on the ``fluid --help`` path.
     """
+    from fluid_build.observability.secret_redactor import redact_secret_text
     from fluid_build.schema_manager import FluidSchemaManager
 
     result = FluidSchemaManager().validate_contract(fluid, offline_only=True)
     if result.is_valid:
         return True, ""
     first = result.errors[0] if result.errors else "no error reported"
-    return False, f"{first} ({len(result.errors)} error(s), schema v{result.schema_version})"
+    problem = f"{first} ({len(result.errors)} error(s), schema v{result.schema_version})"
+    return False, redact_secret_text(problem)
 
 
 def _dispatch_import(path: Path, *, allow_remote: bool, lenient: bool) -> Dict[str, Any]:
