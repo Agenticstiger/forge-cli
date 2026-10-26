@@ -207,3 +207,64 @@ def test_the_rename_reaches_the_operator_through_the_real_gate(
     assert "acquisition_schema_family_rename" in [
         r.message for r in caplog.records
     ], "the gate allowed the family rename without telling anyone"
+
+
+# ── the family table and the discover emitter must not drift apart ───────
+
+
+def test_every_discover_alias_is_same_family_as_its_target() -> None:
+    """Otherwise fixing one bug causes another, which is what happened.
+
+    `fluid init --discover` writes the CANONICAL name into the contract while
+    DuckDB keeps inferring the SOURCE name, so unless the two are one family the
+    drift gate fails at apply exactly what the emitter stopped failing at
+    validate -- the failure moves rather than going away.
+    """
+    from fluid_build.build_runners._schema_evolution import _same_type_family
+    from fluid_build.cli.discover.emitter import _SCHEMA_TYPE_ALIASES
+
+    missing = [
+        (source, target)
+        for source, target in _SCHEMA_TYPE_ALIASES.items()
+        if not _same_type_family(source, target)
+    ]
+    assert missing == [], f"add these to _TYPE_FAMILIES: {missing}"
+
+
+def test_no_duckdb_type_name_trips_the_gate_after_discover() -> None:
+    """The round trip over the INSTALLED DuckDB's whole type list.
+
+    Catches a future DuckDB type name here rather than in a user's failed apply.
+    """
+    duckdb = pytest.importorskip("duckdb")
+    from fluid_build.cli.discover.emitter import canonical_column_type
+
+    con = duckdb.connect(":memory:")
+    try:
+        names = [
+            row[0]
+            for row in con.execute(
+                "SELECT DISTINCT lower(type_name) FROM duckdb_types()"
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+    tripped = [
+        (name, canonical_column_type(name))
+        for name in names
+        if _event(canonical_column_type(name), name) != "none"
+    ]
+    assert tripped == [], (
+        f"duckdb {duckdb.__version__}: discover would write these and the drift "
+        f"gate would then fail them at apply: {tripped}"
+    )
+
+
+def test_an_all_null_column_round_trips() -> None:
+    """``typeof(NULL)`` is the quoted string ``"NULL"``, which must still match."""
+    from fluid_build.cli.discover.emitter import canonical_column_type
+
+    assert canonical_column_type('"NULL"') == "string"
+    assert _event("string", '"NULL"') == "none"
+    # ... but a column that gains a real type is still drift.
+    assert _event("string", "integer") == "type_changed"

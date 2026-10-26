@@ -1353,9 +1353,8 @@ def _canonical_cursor_text(value: Any) -> str:
 
     An offset-bearing timestamp is therefore converted to UTC and rendered
     WITHOUT an offset. Naive-UTC text denotes the same instant against a naive
-    TIMESTAMP column and, under the pinned UTC session
-    (:data:`~fluid_build.providers._duckdb_compat.SESSION_TIME_ZONE`), against a
-    TIMESTAMPTZ one.
+    TIMESTAMP column, and it is the text the instant comparison in
+    :func:`_cursor_comparison` reads as UTC against a TIMESTAMPTZ one.
 
     This is also what repairs state already on disk, so no cursor file has to be
     rewritten. A shipped DuckDB 2.0 install on a host with a non-zero offset
@@ -1391,7 +1390,15 @@ def _canonical_cursor_text(value: Any) -> str:
         return text
     if parsed.tzinfo is None:
         return text
-    return parsed.astimezone(timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
+    try:
+        shifted = parsed.astimezone(timezone.utc)
+    except (OverflowError, OSError):
+        # Converting year 1 or year 9999 across a non-zero offset leaves
+        # datetime's range. Such a cursor is not a real high-water mark, and
+        # returning it unchanged keeps the previous release's behaviour rather
+        # than failing the run on it.
+        return text
+    return shifted.replace(tzinfo=None).isoformat(sep=" ")
 
 
 #: The column types ``epoch_us`` accepts. Measured on duckdb 1.5.6 and 2.0.0,

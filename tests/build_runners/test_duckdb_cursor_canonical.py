@@ -274,3 +274,58 @@ def test_the_probe_returns_none_rather_than_raising_on_a_bad_source() -> None:
         assert _cursor_column_type(con, "SELECT * FROM nope_does_not_exist", "ts") is None
     finally:
         con.close()
+
+
+def test_the_cross_version_scenario_executes_on_a_tz_aware_column() -> None:
+    """The actual defect, executed rather than asserted as SQL text.
+
+    Reproduces the shape without needing two interpreters: the column is
+    TIMESTAMPTZ (what DuckDB 2.0 infers for a JSON timestamp carrying ``Z``)
+    and the stored cursor is the naive text DuckDB 1.5 persisted for the same
+    instant. The plain literal comparison is what shifted by the host offset;
+    the instant comparison must select exactly the rows after that instant,
+    whatever the session zone is set to.
+    """
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    try:
+        base = (
+            "SELECT * FROM (VALUES "
+            "(1, TIMESTAMPTZ '2026-05-01 10:00:00+00'), "
+            "(2, TIMESTAMPTZ '2026-05-01 14:00:00+00'), "
+            "(3, TIMESTAMPTZ '2026-05-01 18:00:00+00'), "
+            "(4, TIMESTAMPTZ '2026-05-01 22:00:00+00')) AS t(id, ts)"
+        )
+        assert _cursor_column_type(con, base, "ts") in {
+            "TIMESTAMP WITH TIME ZONE",
+            "TIMESTAMPTZ",
+        }
+        predicate = _cursor_comparison("ts", "2026-05-01 14:00:00", "TIMESTAMP WITH TIME ZONE")
+        for zone in ("UTC", "America/New_York", "Europe/Berlin"):
+            try:
+                con.execute(f"SET TimeZone = '{zone}'")
+            except duckdb.Error:  # pragma: no cover - needs the icu extension
+                pytest.skip("this DuckDB cannot set TimeZone (no icu)")
+            rows = con.execute(f"SELECT id FROM ({base}) WHERE {predicate} ORDER BY id").fetchall()
+            assert rows == [(3,), (4,)], f"session zone {zone} changed the rows: {rows}"
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        "9999-12-31 23:59:59-05:00",
+        "0001-01-01 00:00:00+05:00",
+        "9999-12-31 23:59:59.999999-01:00",
+    ],
+)
+def test_a_near_bounds_cursor_does_not_crash_the_run(stored: str) -> None:
+    """Shifting year 1 or 9999 across an offset leaves datetime's range.
+
+    It raised an unhandled OverflowError on both the read and the write path,
+    which turns a nonsense cursor value into a failed run.
+    """
+    assert _canonical_cursor_text(stored) == stored
+    # And the predicate it builds is still well formed.
+    assert "'" in _cursor_comparison("ts", stored, "TIMESTAMP")

@@ -83,9 +83,56 @@ def _is_narrowing(old: str, new: str) -> bool:
 #: exact 128-bit integer. Collapsing the pair keeps the pipeline running, and
 #: the note says the physical type moved, so the precision change is reported
 #: rather than hidden. Founder decision, 2026-10-26.
+#: Each group also has to contain the name ``cli/discover/emitter.py``
+#: canonicalises its members TO, or the fix for one bug would cause another:
+#: discover writes the canonical name into the contract, DuckDB keeps inferring
+#: the source name, and the gate would then fail at apply what it had just
+#: stopped failing at validate. ``tests/.../test_schema_evolution_type_family.py``
+#: pins that every alias in the emitter's table is same-family as its target,
+#: so the two tables cannot drift apart silently.
 _TYPE_FAMILIES: Tuple[Tuple[str, ...], ...] = (
-    ("double", "hugeint", "bignum", "uhugeint", "int128", "uint128", "varint"),
-    ("timestamp", "timestamptz", "timestamp with time zone", "timestamp_tz"),
+    # 128-bit and unsigned-64 integers, and the floats they are inferred as.
+    # `numeric` is the emitter's canonical name for all of them.
+    (
+        "double",
+        "numeric",
+        "hugeint",
+        "bignum",
+        "uhugeint",
+        "int128",
+        "uint128",
+        "uint64",
+        "ubigint",
+        "varint",
+    ),
+    # unsigned 32-bit does not fit `integer`, so the emitter writes `bigint`
+    ("bigint", "uinteger", "uint32", "oid"),
+    ("integer", "uint16", "usmallint", "integral", "signed"),
+    ("smallint", "uint8", "utinyint", "short"),
+    ("tinyint", "int1"),
+    (
+        "timestamp",
+        "timestamptz",
+        "timestamp with time zone",
+        "timestamp_tz",
+        "timestamp_s",
+        "timestamp_ms",
+        "timestamp_us",
+        "timestamp_ns",
+        "timestamptz_ns",
+    ),
+    ("time", "time_ns", "timetz", "time with time zone"),
+    # Non-numeric spellings of one physical type. `string`/`null` covers an
+    # all-null column: discover writes `string` for it and DuckDB keeps
+    # inferring the quoted `"NULL"`. It deliberately does NOT include a real
+    # type, so `string` -> `integer` once data arrives is still drift.
+    ("varchar", "bpchar"),
+    ("bit", "bitstring"),
+    ("boolean", "logical"),
+    ("array", "list"),
+    ("struct", "tuple"),
+    ("variant", "union"),
+    ("string", "null", "type"),
 )
 
 _FAMILY_OF: Dict[str, int] = {
@@ -94,9 +141,13 @@ _FAMILY_OF: Dict[str, int] = {
 
 
 def _same_type_family(old: str, new: str) -> bool:
-    """Whether ``old`` and ``new`` are two spellings of one physical type."""
-    a = _FAMILY_OF.get(old.strip().lower())
-    b = _FAMILY_OF.get(new.strip().lower())
+    """Whether ``old`` and ``new`` are two spellings of one physical type.
+
+    Quotes are stripped because ``typeof(NULL)`` is the quoted string
+    ``"NULL"``, which is how an all-null column reaches here.
+    """
+    a = _FAMILY_OF.get(old.strip().strip('"').lower())
+    b = _FAMILY_OF.get(new.strip().strip('"').lower())
     return a is not None and a == b
 
 
