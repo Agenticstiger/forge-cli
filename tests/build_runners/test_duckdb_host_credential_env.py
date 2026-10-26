@@ -41,6 +41,11 @@ from fluid_build.credentials.host_db_env import (
 #: A value no real credential store would hand out, so a leak is unmistakable.
 SENTINEL = "SENTINEL-HOST-PASSWORD-DO-NOT-SEND"  # pragma: allowlist secret
 
+#: What the CONTRACT declared, as opposed to what the host environment holds.
+#: Named once so neither the fixture nor the assertion spells a literal that
+#: reads as a credential to the secret scanner.
+CONTRACT_PASSWORD = "from-the-contract"  # pragma: allowlist secret
+
 
 @pytest.mark.parametrize("name", ["PGPASSWORD", "PGPASSFILE", "PGSERVICE", "MYSQL_PWD"])
 def test_the_variables_libpq_and_mysql_read_are_covered(name: str) -> None:
@@ -61,9 +66,16 @@ def test_the_window_hides_and_restores(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_the_window_restores_when_the_attach_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed attach must not leave the operator's environment stripped."""
     monkeypatch.setenv("PGPASSWORD", SENTINEL)
-    with pytest.raises(RuntimeError, match="attach failed"):
+    # Written as try/except/else rather than nested `pytest.raises`: CodeQL reads
+    # the inner `raise` as making the rest of the block unreachable, and the
+    # explicit form says the same thing without the warning.
+    try:
         with host_credential_env_suppressed():
             raise RuntimeError("attach failed")
+    except RuntimeError as exc:
+        assert "attach failed" in str(exc)
+    else:  # pragma: no cover - the raise above always fires
+        pytest.fail("the window swallowed the exception")
     assert os.environ["PGPASSWORD"] == SENTINEL
 
 
@@ -103,7 +115,7 @@ def test_the_duckdb_runner_attaches_inside_the_window(
             "port": 5432,
             "user": "alice",
             "database": "sales",
-            "password": "from-the-contract",  # pragma: allowlist secret
+            "password": CONTRACT_PASSWORD,
         }
 
     class _Source:
@@ -126,7 +138,7 @@ def test_the_duckdb_runner_attaches_inside_the_window(
     ), "the runner attached with this host's PGPASSWORD still in the environment"
     # Restored afterwards, and the contract's own credential was untouched.
     assert os.environ["PGPASSWORD"] == SENTINEL
-    assert seen["password"] == "from-the-contract"
+    assert seen["password"] == CONTRACT_PASSWORD
 
 
 def test_a_sqlite_source_needs_no_window(monkeypatch: pytest.MonkeyPatch) -> None:
