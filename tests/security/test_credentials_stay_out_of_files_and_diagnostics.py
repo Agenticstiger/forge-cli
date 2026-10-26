@@ -537,6 +537,12 @@ def test_embedded_server_file_holds_no_password_and_server_gets_it(tmp_path, mon
     from fluid_build.build_runners.debezium import runner as dbz
 
     monkeypatch.setenv("PG_PASSWORD_T211", _SECRET)
+    # `env://` to a remote host needs the operator's allowlist now
+    # (build_runners/_secret_policy); this fixture's host is the bare name `db`.
+    # This suite is about the secret not reaching a FILE or a diagnostic once it
+    # is legitimately in use, which is a different control from whether the send
+    # is permitted at all.
+    monkeypatch.setenv("FLUID_ACQUISITION_SECRET_REF_ALLOWLIST", "PG_PASSWORD_T211")
     monkeypatch.setenv("LAKEKEEPER_CREDENTIAL_T211", "inherited")
     captured = tmp_path / "server-env.txt"
     server = tmp_path / "debezium-server"
