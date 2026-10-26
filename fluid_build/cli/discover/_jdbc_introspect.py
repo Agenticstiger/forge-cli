@@ -80,7 +80,6 @@ from urllib.parse import urlparse
 
 from fluid_build.credentials.host_db_env import (
     HOST_CREDENTIAL_ENV,
-    HOST_CREDENTIAL_ENV_LOCK,
     NO_CLIENT_CERT,
     host_credential_env_suppressed,
 )
@@ -125,9 +124,12 @@ LOG = logging.getLogger("fluid.cli.discover.jdbc")
 # acquisition runners can use it too -- ``build_runners`` may not import
 # ``cli``. These aliases keep this module's original private names, which its
 # own tests and the patch points around them refer to.
+# Only the names something actually refers to: _HOST_CREDENTIAL_ENV from this
+# module's own tests, _NO_CLIENT_CERT from build_attach_dsn below. The lock
+# needs no alias -- nothing outside host_db_env touches it, and it is reachable
+# there as HOST_CREDENTIAL_ENV_LOCK if that ever changes.
 _HOST_CREDENTIAL_ENV = HOST_CREDENTIAL_ENV
 _NO_CLIENT_CERT = NO_CLIENT_CERT
-_HOST_CREDENTIAL_ENV_LOCK = HOST_CREDENTIAL_ENV_LOCK
 
 
 # The mysql_scanner quoting lives beside the libpq one in _sql_safety, which
