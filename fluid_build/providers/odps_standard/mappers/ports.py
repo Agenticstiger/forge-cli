@@ -21,7 +21,10 @@ recorded), and otherwise follows the convention ``{productId}.{portName}``
 (matches :mod:`fluid_build.providers.datamesh_manager.datamesh_manager`).
 Either way it equals the ``id`` of the per-port ODCS contract the provider
 emits as a sibling file — both sides resolve it through
-:func:`fluid_build.util.contract.explicit_expose_contract_id`.
+:func:`fluid_build.util.contract.expose_contract_id`, and
+:meth:`BitolOdpsProvider.render` refuses an export in which two ports would
+resolve to one id. The equality is held by that refusal, not by the two call
+sites happening to agree.
 
 Per-port pass-throughs flow through ``expose.odps_passthrough.*`` /
 ``expect.odps_passthrough.*`` for round-trip:

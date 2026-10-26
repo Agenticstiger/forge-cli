@@ -1011,41 +1011,81 @@ def _run_contract_rules(
 
 
 def _duplicate_contract_id_errors(contract: Mapping[str, Any]) -> List[str]:
-    """Refuse two exposes that claim the same ``exposes[].contract.id``.
+    """Refuse two exposes whose output ports would be published under one
+    contract id.
 
-    That id (0.7.6, optional) is used verbatim as the ODCS ``id`` and as the
-    ODPS output port ``contractId`` instead of the ``<product id>.<exposeId>``
-    the exporters derive. Derived ids are unique by construction; explicit
-    ones are not, and two exposes sharing one publish two different contracts
-    under a single identity — whichever a consumer resolves last wins and the
-    other output port is unreachable. ``uniqueItems`` compares whole array
-    items, so JSON Schema cannot express uniqueness across a nested key; the
-    rule has to live in code. Shapes the schema would have rejected (a
-    non-string id, a non-object expose) are skipped rather than reported
-    twice.
+    An expose's contract id (``exposes[].contract.id``, 0.7.6, optional) is
+    used verbatim as the ODCS ``id`` and as the ODPS output port
+    ``contractId``; an expose that pins none gets the
+    ``<product id>.<exposeId>`` the exporters derive. Two ports sharing one id
+    publish two different contracts under a single identity, and the ODPS
+    exporter keys its per-port contracts by that id, so one of the two schemas
+    is simply absent from the bundle — a consumer resolving the losing port
+    silently gets the other port's schema.
+
+    Comparing pinned ids against each other is only half the check: a pin can
+    equally collide with the id a *sibling* derives, which is the worse case
+    because the sibling carries no ``contract.id`` to point the author at.
+    Every un-pinned expose is therefore seeded with its derived id first, via
+    :func:`~fluid_build.util.contract.expose_contract_id` so the string is the
+    one the exporters will actually mint rather than a second copy of the
+    convention. A *pinned* expose contributes only its pin: its derived id is
+    never published, so a sibling pinning to that derived string collides with
+    nothing and must not be rejected.
+
+    ``uniqueItems`` compares whole array items, so JSON Schema cannot express
+    uniqueness across a nested key; the rule has to live in code. Shapes the
+    schema would have rejected (a non-string id, a non-object expose) are
+    skipped rather than reported twice.
     """
-    claimed_by: Dict[str, str] = {}
-    errors: List[str] = []
+    from fluid_build.util.contract import explicit_expose_contract_id, expose_contract_id
+
     exposes = contract.get("exposes")
     if not isinstance(exposes, list):
-        return errors
+        return []
+
+    def _label(index: int, expose: Mapping[str, Any]) -> str:
+        expose_id = expose.get("exposeId")
+        return expose_id if isinstance(expose_id, str) and expose_id else f"exposes[{index}]"
+
+    # (label, pinned id or None) in document order, so the errors come out in a
+    # stable order whatever the dict iteration does.
+    resolved: List[Tuple[str, Optional[str]]] = []
+    derived_by: Dict[str, str] = {}
     for index, expose in enumerate(exposes):
         if not isinstance(expose, Mapping):
             continue
-        expose_contract = expose.get("contract")
-        if not isinstance(expose_contract, Mapping):
+        label = _label(index, expose)
+        pinned = explicit_expose_contract_id(expose, contract)
+        resolved.append((label, pinned))
+        if pinned is None:
+            derived = expose_contract_id(contract, expose)
+            if derived is not None:
+                derived_by.setdefault(derived, label)
+
+    errors: List[str] = []
+    claimed_by: Dict[str, str] = {}
+    for label, pinned in resolved:
+        if pinned is None:
             continue
-        contract_id = expose_contract.get("id")
-        if not isinstance(contract_id, str) or not contract_id:
+        sibling = derived_by.get(pinned)
+        if sibling is not None:
+            # "Give each expose its own contract.id" is wrong advice here: the
+            # sibling has no contract.id to change, so name the two moves that
+            # do resolve it.
+            errors.append(
+                f"contract id {pinned!r} is used by exposes {sibling!r} and {label!r}"
+                f" — {sibling!r} pins no contract.id, so the exporters derive this"
+                f" id for it; change the contract.id on {label!r}, or rename the"
+                f" expose {sibling!r}"
+            )
             continue
-        expose_id = expose.get("exposeId")
-        label = expose_id if isinstance(expose_id, str) and expose_id else f"exposes[{index}]"
-        first = claimed_by.get(contract_id)
+        first = claimed_by.get(pinned)
         if first is None:
-            claimed_by[contract_id] = label
+            claimed_by[pinned] = label
             continue
         errors.append(
-            f"contract id {contract_id!r} is used by exposes {first!r} and {label!r}"
+            f"contract id {pinned!r} is used by exposes {first!r} and {label!r}"
             " — give each expose its own contract.id"
         )
     return errors

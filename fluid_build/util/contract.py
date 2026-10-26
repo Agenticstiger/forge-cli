@@ -214,22 +214,92 @@ def get_expose_contract(expose: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 # The per-expose pass-through bucket the Bitol ODPS importer records an
-# imported output port's own ``contractId`` in. Spelled here rather than
-# imported from that provider because the two exporters below have to read the
-# same key, and the ODCS one has no business importing the ODPS one.
+# imported output port's own ``contractId`` in, and the root extension object
+# the same importer parks that bucket in on its way out of the import. Spelled
+# here rather than imported from that provider because every caller below has
+# to read the same keys, and the ODCS exporter has no business importing the
+# ODPS one.
 _ODPS_PASSTHROUGH_KEY = "odps_passthrough"
+_EXTENSIONS_KEY = "extensions"
+_ODPS_EXTENSION_NAMESPACE = "odps"
 
 
-def explicit_expose_contract_id(expose: Mapping[str, Any]) -> Optional[str]:
+def _expose_key(expose: Mapping[str, Any]) -> Optional[str]:
+    """The name an expose answers to, in the order every exporter accepts it.
+
+    ``exposeId`` is canonical; ``id`` is the 0.7.1 legacy spelling and ``name``
+    is what the forge AI templates emit. The ODPS output-port mapper accepts
+    all three for the port name, so the derived contract id and the ODPS
+    round-trip bucket have to key off the same lookup or they would disagree
+    about which expose a bucket entry belongs to.
+    """
+    for key in ("exposeId", "id", "name"):
+        value = expose.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _imported_contract_id(contract: Mapping[str, Any], expose_key: Optional[str]) -> Optional[str]:
+    """The ``contractId`` an ODPS import recorded for ``expose_key``, in the
+    root extension object, or ``None``.
+
+    An ODPS import parks its per-expose round-trip state in root
+    ``extensions.odps.exposes.<exposeId>.expose`` — the one object the FLUID
+    schema declares open, and therefore the only legal home for it.
+    ``BitolOdpsProvider.render`` pushes that state back down into the inline
+    per-expose bucket before it maps anything, but four other entry points
+    render a per-expose ODCS straight from the contract and never do, so
+    reading only the inline bucket made an imported id resolve for the ODPS
+    exporter and silently re-derive for everybody else. Reading the extension
+    here is what makes the resolution a property of the contract rather than of
+    whoever happened to rehydrate it first.
+    """
+    if not expose_key:
+        return None
+    extensions = contract.get(_EXTENSIONS_KEY)
+    if not isinstance(extensions, Mapping):
+        return None
+    bucket = extensions.get(_ODPS_EXTENSION_NAMESPACE)
+    if not isinstance(bucket, Mapping):
+        return None
+    exposes = bucket.get("exposes")
+    if not isinstance(exposes, Mapping):
+        return None
+    entry = exposes.get(expose_key)
+    if not isinstance(entry, Mapping):
+        return None
+    inner = entry.get("expose")
+    if not isinstance(inner, Mapping):
+        return None
+    return _as_contract_id(inner.get("contract_id"))
+
+
+def _as_contract_id(value: Any) -> Optional[str]:
+    """``value`` when it is a usable contract id, else ``None``.
+
+    A contract id is a non-empty string: it becomes the ODCS document's ``id``
+    and a URL path segment in every catalog that stores it. ``str(value)``
+    would coerce a YAML number or a mapping into something that looks like an
+    id and is not — the shapes ``exposeContract.id`` already rejects — so a
+    non-string is refused here too and the port keeps its derived id.
+    """
+    return value if isinstance(value, str) and value else None
+
+
+def explicit_expose_contract_id(
+    expose: Mapping[str, Any],
+    contract: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
     """Return the contract id an expose names for itself, or ``None``.
 
     Two exporters mint a per-port contract id — the ODCS document's ``id`` and
     the ODPS output port's ``contractId``, which Bitol fragments mode requires
     to be the same string — and both derive ``<product id>.<exposeId>`` when
-    the contract names none. They resolve the named one here so the two cannot
-    disagree about what the port's contract is called.
+    the contract names none. Every caller resolves the named one here, so no
+    two of them can disagree about what a port's contract is called.
 
-    Two places hold one, in priority order:
+    Three places hold one, in priority order:
 
     1. ``contract.id`` (fluid-schema 0.7.6). What an author pins when the
        derived id is not the one consumers or a catalog know the port by —
@@ -238,17 +308,104 @@ def explicit_expose_contract_id(expose: Mapping[str, Any]) -> Optional[str]:
        imported port's own ``contractId`` here too, whenever the version the
        source document recorded declares the field.
     2. The ODPS importer's per-expose pass-through record of the ``contractId``
-       the imported port already answered to. Still the only home for it when
-       the import declares an older version: ``exposeContract`` is closed
-       before 0.7.6, so writing the field there would make the whole imported
-       contract fail ``fluid validate``.
+       the imported port already answered to, inline on the expose. Still the
+       only home for it when the import declares an older version:
+       ``exposeContract`` is closed before 0.7.6, so writing the field there
+       would make the whole imported contract fail ``fluid validate``.
+    3. The same record where an import actually leaves it on disk — root
+       ``extensions.odps`` — which is why ``contract`` is worth passing. Only
+       ``BitolOdpsProvider.render`` rehydrates (2) from it, so a caller that
+       omits ``contract`` gets the imported id from an ODPS export and the
+       derived one from every other entry point. Pass the contract.
     """
-    contract = expose.get("contract")
-    if isinstance(contract, Mapping) and contract.get("id"):
-        return str(contract["id"])
+    expose_contract = expose.get("contract")
+    if isinstance(expose_contract, Mapping):
+        pinned = _as_contract_id(expose_contract.get("id"))
+        if pinned:
+            return pinned
     passthrough = expose.get(_ODPS_PASSTHROUGH_KEY)
-    if isinstance(passthrough, Mapping) and passthrough.get("contract_id"):
-        return str(passthrough["contract_id"])
+    if isinstance(passthrough, Mapping):
+        inline = _as_contract_id(passthrough.get("contract_id"))
+        if inline:
+            return inline
+    if contract is not None:
+        return _imported_contract_id(contract, _expose_key(expose))
+    return None
+
+
+def derived_contract_id(product_id: Any, port_name: str) -> str:
+    """``<product id>.<port name>`` — the contract id an exporter mints for a
+    port that names none.
+
+    The one place this convention is spelled. ``fluid validate`` has to derive
+    exactly the string the exporters will, or its collision check compares a
+    pinned id against an id nothing ever publishes; a second copy of the
+    f-string is how the two drift apart.
+    """
+    return f"{product_id}.{port_name}"
+
+
+def expose_contract_id(
+    contract: Mapping[str, Any],
+    expose: Mapping[str, Any],
+    *,
+    expose_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+) -> Optional[str]:
+    """The contract id one output port will be published under: the id the
+    expose names for itself, else the derived ``<product id>.<exposeId>``.
+
+    The fallback-included form of :func:`explicit_expose_contract_id`, and the
+    one every id-minting caller should use — the per-port ODCS ``id``, the ODPS
+    output port's ``contractId``, the Data Mesh Manager publish url, and
+    ``fluid validate``'s collision check, which can only compare a pinned id
+    against a derived one if it derives them by the same rule. ``None`` only
+    when the port names no id and the contract has no id to derive from, which
+    is what leaves a per-port ODCS without a scoped ``id`` today.
+
+    ``product_id`` overrides the half of the derived id that comes from the
+    contract. Data Mesh Manager publishes under the id of the product it is
+    writing (``dp["id"]``, which a caller may have set), not necessarily the
+    contract's own, and its derived ids have to keep matching the url its
+    companion ODCS contracts are PUT to.
+    """
+    from fluid_build.providers._mapper_common import fluid_id
+
+    explicit = explicit_expose_contract_id(expose, contract)
+    if explicit:
+        return explicit
+    port_name = expose_id or _expose_key(expose)
+    product_id = product_id or fluid_id(contract)
+    if not port_name or not product_id:
+        return None
+    return derived_contract_id(product_id, port_name)
+
+
+def expose_contract_id_for_ref(
+    contract: Mapping[str, Any],
+    expose_ref: str,
+    *,
+    product_id: Optional[str] = None,
+) -> Optional[str]:
+    """:func:`expose_contract_id` for a caller that holds the port's name
+    rather than the expose object.
+
+    The Data Mesh Manager publish flow walks the ODPS payload's output ports
+    and the contract's exposes in separate loops, so each site had only the
+    name — and each derived ``{product_id}.{name}`` for itself, which
+    overwrote a pinned contractId on the wire and PUT the companion ODCS body
+    under an id its own output port did not reference. Resolving by name here
+    lets those sites share the one resolution without reaching into an ODPS
+    mapper for it. ``None`` when no expose answers to ``expose_ref``, which
+    leaves the caller's own ``contractId`` untouched.
+    """
+    if not expose_ref:
+        return None
+    for expose in get_exposes(contract):
+        if not isinstance(expose, Mapping):
+            continue
+        if expose_ref in (expose.get("exposeId"), expose.get("id"), expose.get("name")):
+            return expose_contract_id(contract, expose, expose_id=expose_ref, product_id=product_id)
     return None
 
 

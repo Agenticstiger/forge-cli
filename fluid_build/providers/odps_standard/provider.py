@@ -86,11 +86,18 @@ class BitolOdpsProvider(BaseProvider):
 
     Per-port ODCS rendering is delegated to :class:`OdcsProvider` (calling
     ``render(fluid, expose_id=...)``); the per-expose id it produces equals the
-    ODPS port's ``contractId`` by construction, because both sides resolve it
-    through :func:`fluid_build.util.contract.explicit_expose_contract_id`. The
-    derived ``{product_id}.{expose_id}`` is only what that lookup falls back to:
-    an id the expose pins (``contract.id``) or one an import recorded is used
-    verbatim, by both sides alike.
+    ODPS port's ``contractId`` because both sides resolve it through
+    :func:`fluid_build.util.contract.expose_contract_id`, reading the same
+    contract. The derived ``{product_id}.{expose_id}`` is only what that lookup
+    falls back to: an id the expose pins (``contract.id``) or one an import
+    recorded is used verbatim, by both sides alike.
+
+    Agreeing on the lookup is not on its own enough to make the two ids the
+    same string, and this class does not rely on it being: two exposes can
+    resolve to one id, and then one per-port contract overwrites the other. The
+    ``contractId``-collision refusal and the ``odcs.id != port.contractId``
+    check in :meth:`render` are what actually hold the invariant, and they hold
+    it by refusing an export that would not satisfy it.
     """
 
     def __init__(self) -> None:
@@ -203,6 +210,17 @@ class BitolOdpsProvider(BaseProvider):
         # Emit per-port ODCS contracts, keyed by contractId.
         contracts: Dict[str, Dict[str, Any]] = {}
         seen_port_names: set[str] = set()
+        # Which port claimed each contract id. ``contracts`` is keyed by that
+        # id, so a second port resolving to one already taken used to overwrite
+        # the first entry: the bundle came out with N output ports and fewer
+        # than N ODCS contracts, the losing port's schema absent altogether,
+        # and a consumer resolving it got the surviving port's schema instead.
+        # ``fluid validate`` now refuses the contract that causes it, but
+        # neither ``fluid odps export`` nor ``fluid generate artifacts`` runs
+        # validate, so the exporter has to refuse it too — and refuse rather
+        # than warn: a sealed bundle that is silently missing a schema is worse
+        # than an export that did not happen.
+        claimed_by: Dict[str, Any] = {}
         for port in product.get("outputPorts") or []:
             port_name = port.get("name")
             contract_id = port.get("contractId")
@@ -212,6 +230,17 @@ class BitolOdpsProvider(BaseProvider):
                     "must have a unique exposeId/id."
                 )
             seen_port_names.add(port_name)
+            first_port = claimed_by.get(contract_id)
+            if first_port is not None:
+                raise ProviderError(
+                    f"Output ports '{first_port}' and '{port_name}' both resolve to "
+                    f"contract id '{contract_id}' — one per-port ODCS contract would "
+                    f"overwrite the other and '{first_port}' would have no schema in "
+                    "the exported bundle. Give each expose a distinct "
+                    "exposes[].contract.id, or drop the pin so the id is derived "
+                    "from the exposeId."
+                )
+            claimed_by[contract_id] = port_name
             odcs = self._odcs.render(src, expose_id=port_name)
             if odcs.get("id") != contract_id:
                 # Defensive — these should be equal by construction

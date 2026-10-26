@@ -24,11 +24,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderError
-from fluid_build.util.contract import explicit_expose_contract_id
+from fluid_build.util.contract import expose_contract_id
 
 from .io import read_input, write_output
 from .mappers import EXPORT_PIPELINE, IMPORT_PIPELINE, normalize
-from .mappers.base import ExportCtx, ImportCtx, fluid_id
+from .mappers.base import ExportCtx, ImportCtx
 from .validation import load_schema, roundtrip_check, validate, validate_via_vowl
 
 
@@ -104,10 +104,13 @@ class OdcsProvider(BaseProvider):
         """Render a FLUID contract to ODCS v3.1.0.
 
         When ``expose_id`` is provided the rendered ODCS takes its ``id`` from
-        that expose's own ``contract.id`` when it declares one and scopes it to
-        ``{product_id}.{expose_id}`` otherwise, and reads ``status`` from that
-        expose's lifecycle — exactly what the Bitol ODPS provider needs when
-        emitting per-port contracts.
+        :func:`fluid_build.util.contract.expose_contract_id` — the id that
+        expose pins (``contract.id``), the one an ODPS import recorded for it,
+        else the derived ``{product_id}.{expose_id}`` — and reads ``status``
+        from that expose's lifecycle. That is exactly what the Bitol ODPS
+        provider needs when emitting per-port contracts, and because the
+        resolution reads the whole contract rather than the expose alone, this
+        method answers the same id however it was reached.
         """
         if isinstance(src, list):
             raise ProviderError(
@@ -279,13 +282,17 @@ class OdcsProvider(BaseProvider):
         # and a catalog whose ids are its own (a UUID, say) could not be served
         # at all. The ODPS output port's ``contractId`` resolves through the
         # same helper, so the two stay the one string Bitol fragments mode
-        # requires them to be.
-        explicit_id = explicit_expose_contract_id(exposes[0])
-        product_id = fluid_id(fluid)
-        if explicit_id:
-            scoped["_scoped_id"] = explicit_id
-        elif product_id:
-            scoped["_scoped_id"] = f"{product_id}.{expose_id}"
+        # requires them to be. The *whole* contract goes in, not just the
+        # expose: an ODPS import leaves the imported id in root
+        # ``extensions.odps`` and only ``BitolOdpsProvider.render`` pushes it
+        # down onto the expose first, so resolving from the expose alone made
+        # every other entry point that renders a per-expose ODCS directly
+        # (``render_all_ports``, the two Data Mesh Manager publish flows, the
+        # copilot round-trip check, the catalog payload builder) re-derive an
+        # id the source document had already named.
+        scoped_id = expose_contract_id(fluid, exposes[0], expose_id=expose_id)
+        if scoped_id:
+            scoped["_scoped_id"] = scoped_id
         # Only stamp a scoped status when the port actually declares one —
         # defaulting to "active" here used to mask the contract-root
         # ``lifecycle.state``, so every per-port export claimed "active".
