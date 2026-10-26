@@ -66,6 +66,109 @@ def _is_narrowing(old: str, new: str) -> bool:
         return False
 
 
+#: Type names that are two spellings of one physical type, so a change between
+#: them is a RENAME rather than drift. Each entry was measured on duckdb 1.5.6
+#: and 2.0.0 over the same input bytes; nothing is here on the strength of the
+#: name alone.
+#:
+#: DuckDB 2.0 infers HUGEINT where 1.5 infers DOUBLE for the same integer
+#: literal, and TIMESTAMP WITH TIME ZONE where 1.5 infers TIMESTAMP for the same
+#: JSON timestamp. Without this, upgrading DuckDB -- no contract edit, no new
+#: data -- raises SchemaDriftError on a pipeline that was working, which is a
+#: false positive: the inferrer drifted, the data did not.
+#:
+#: HONEST CAVEAT, and the reason :func:`family_rename_note` exists: DOUBLE and
+#: HUGEINT are not value-identical. For the same CSV literal 1.5 landed
+#: 1.7014118346046924e+35 (17 significant digits, lossy) where 2.0 lands the
+#: exact 128-bit integer. Collapsing the pair keeps the pipeline running, and
+#: the note says the physical type moved, so the precision change is reported
+#: rather than hidden. Founder decision, 2026-10-26.
+#: Each group also has to contain the name ``cli/discover/emitter.py``
+#: canonicalises its members TO, or the fix for one bug would cause another:
+#: discover writes the canonical name into the contract, DuckDB keeps inferring
+#: the source name, and the gate would then fail at apply what it had just
+#: stopped failing at validate. ``tests/.../test_schema_evolution_type_family.py``
+#: pins that every alias in the emitter's table is same-family as its target,
+#: so the two tables cannot drift apart silently.
+_TYPE_FAMILIES: Tuple[Tuple[str, ...], ...] = (
+    # 128-bit and unsigned-64 integers, and the floats they are inferred as.
+    # `numeric` is the emitter's canonical name for all of them.
+    (
+        "double",
+        "numeric",
+        "hugeint",
+        "bignum",
+        "uhugeint",
+        "int128",
+        "uint128",
+        "uint64",
+        "ubigint",
+        "varint",
+    ),
+    # unsigned 32-bit does not fit `integer`, so the emitter writes `bigint`
+    ("bigint", "uinteger", "uint32", "oid"),
+    ("integer", "uint16", "usmallint", "integral", "signed"),
+    ("smallint", "uint8", "utinyint", "short"),
+    ("tinyint", "int1"),
+    (
+        "timestamp",
+        "timestamptz",
+        "timestamp with time zone",
+        "timestamp_tz",
+        "timestamp_s",
+        "timestamp_ms",
+        "timestamp_us",
+        "timestamp_ns",
+        "timestamptz_ns",
+    ),
+    ("time", "time_ns", "timetz", "time with time zone"),
+    # Non-numeric spellings of one physical type. `string`/`null` covers an
+    # all-null column: discover writes `string` for it and DuckDB keeps
+    # inferring the quoted `"NULL"`. It deliberately does NOT include a real
+    # type, so `string` -> `integer` once data arrives is still drift.
+    ("varchar", "bpchar"),
+    ("bit", "bitstring"),
+    ("boolean", "logical"),
+    ("array", "list"),
+    ("struct", "tuple"),
+    ("variant", "union"),
+    ("string", "null", "type"),
+)
+
+_FAMILY_OF: Dict[str, int] = {
+    name: index for index, names in enumerate(_TYPE_FAMILIES) for name in names
+}
+
+
+def _same_type_family(old: str, new: str) -> bool:
+    """Whether ``old`` and ``new`` are two spellings of one physical type.
+
+    Quotes are stripped because ``typeof(NULL)`` is the quoted string
+    ``"NULL"``, which is how an all-null column reaches here.
+    """
+    a = _FAMILY_OF.get(old.strip().strip('"').lower())
+    b = _FAMILY_OF.get(new.strip().strip('"').lower())
+    return a is not None and a == b
+
+
+def family_rename_note(old: str, new: str) -> Optional[str]:
+    """A line for the operator when a type change was only a spelling change.
+
+    Returned so the caller can SAY the physical type moved while not failing on
+    it. ``None`` when the two are not one family.
+    """
+    if old.strip().lower() == new.strip().lower():
+        return None  # nothing changed: a rename note for X -> X is noise
+    if not _same_type_family(old, new):
+        return None
+    return (
+        f"column type {old!r} -> {new!r}: the same physical type under two names "
+        "(DuckDB 1.5 and 2.0 infer these differently for identical input), so "
+        "this is not schema drift. The stored width does change, so a value's "
+        "precision may differ between the two."
+    )
+
+
 @dataclass
 class EvolutionPlan:
     decisions: List[SchemaEvolutionDecision]
@@ -96,6 +199,12 @@ def diff_columns(
             events.append(("type_widened", name, base, cur))
         elif _is_narrowing(base.type, cur.type):
             events.append(("type_narrowed", name, base, cur))
+        elif _same_type_family(base.type, cur.type):
+            # Last, never before the ladder above: every ordered pair in
+            # _NUMERIC_ORDER is also same-family, so testing this first
+            # collapses all 56 of them and type_widened / type_narrowed
+            # would never fire again.
+            continue
         else:
             events.append(("type_changed", name, base, cur))
     for name, base in by_baseline.items():

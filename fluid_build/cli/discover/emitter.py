@@ -95,7 +95,7 @@ def emit_contract(
                     "schema": [
                         {
                             "name": c.name,
-                            "type": (c.type or "string").lower(),
+                            "type": canonical_column_type(c.type),
                             "required": not c.nullable,
                         }
                         for c in s.columns
@@ -106,6 +106,106 @@ def emit_contract(
             for s in streams
         ],
     }
+
+
+#: Source type names the bundled contract schema does not accept, mapped to the
+#: nearest name it does. Built by validating every name in DuckDB's own
+#: ``duckdb_types()`` against ``$defs.column.properties.type`` on duckdb 1.5.6
+#: and 2.0.0: 35 of them are rejected, not the two the bug report named.
+#:
+#: Without this the emitter wrote DuckDB's spelling straight through, so a
+#: discover on DuckDB 2.0 produced ``type: hugeint`` and ``type: '"null"'`` and
+#: the tool's own ``fluid validate`` then rejected the contract it had just
+#: written. Two of these (``uinteger``, ``integer[]``) were rejected on 1.5 too,
+#: so this is not only a 2.0 problem.
+#:
+#: An unsigned or 128-bit type maps to a name WIDE ENOUGH to hold its range
+#: rather than to the same-sounding one: ``uinteger`` (0..2^32-1) does not fit
+#: ``integer``, and ``hugeint`` does not fit ``bigint``, so they become
+#: ``bigint`` and ``numeric``. The schema's own enum keeps ``bigint`` and
+#: ``integer`` distinct, so the choice is visible in the emitted contract.
+#:
+#: Parameterised and spaced forms are deliberately absent: the schema's pattern
+#: branch already accepts ``decimal(18,2)``, ``varchar(255)``, ``struct(...)``,
+#: ``map(...)`` and ``timestamp with time zone``. Only ``<type>[]`` and the
+#: quoted ``"NULL"`` need shape handling, below.
+_SCHEMA_TYPE_ALIASES = {
+    # integers: width that holds the range, not the similar-sounding name
+    "int1": "tinyint",
+    "uint8": "smallint",
+    "utinyint": "smallint",
+    "short": "smallint",
+    "uint16": "integer",
+    "usmallint": "integer",
+    "integral": "integer",
+    "signed": "integer",
+    "uint32": "bigint",
+    "uinteger": "bigint",
+    "oid": "bigint",
+    # 128-bit and unsigned 64-bit exceed bigint
+    "hugeint": "numeric",
+    "int128": "numeric",
+    "uhugeint": "numeric",
+    "uint128": "numeric",
+    "uint64": "numeric",
+    "ubigint": "numeric",
+    "varint": "numeric",
+    "bignum": "numeric",
+    # text, binary, boolean
+    "bpchar": "varchar",
+    "bitstring": "bit",
+    "logical": "boolean",
+    # date and time: the precision suffix is not a different type
+    "timestamp_s": "timestamp",
+    "timestamp_ms": "timestamp",
+    "timestamp_us": "timestamp",
+    "timestamp_ns": "timestamp",
+    "timestamptz_ns": "timestamptz",
+    "time_ns": "time",
+    "timetz": "time",
+    "time with time zone": "time",
+    # composites
+    "list": "array",
+    "tuple": "struct",
+    "union": "variant",
+    # a column of only NULLs, and DuckDB's own meta type
+    "null": "string",
+    "type": "string",
+}
+
+
+def canonical_column_type(raw: Optional[str]) -> str:
+    """A source column type the bundled contract schema accepts.
+
+    The one place a discovered type becomes a contract field type, so every
+    discover backend inherits it.
+
+    A name the table does not list passes through lower-cased, exactly as
+    before. That is deliberate rather than a gap: the schema accepts a
+    cross-dialect superset through its pattern branch, so the JDBC backends'
+    own dialect names (and ``decimal(18,2)``, ``varchar(255)``,
+    ``struct(...)``) are already valid and must not be squashed. The table
+    therefore carries only names measured to be REJECTED. A source type that is
+    neither valid nor listed still reaches the contract unchanged and still
+    fails ``fluid validate`` -- the same as today, and not something this
+    change claims to fix.
+    """
+    text = (raw or "string").strip()
+    if not text:
+        return "string"
+    lowered = text.lower()
+    # ``INTEGER[]``, ``VARCHAR[][]`` -- a list of anything is an array.
+    if lowered.endswith("[]"):
+        return "array"
+    # ``typeof(NULL)`` is the quoted string ``"NULL"``.
+    if lowered.strip('"') == "null":
+        return "string"
+    if lowered in _SCHEMA_TYPE_ALIASES:
+        return _SCHEMA_TYPE_ALIASES[lowered]
+    base = lowered.split("(", 1)[0].strip()
+    if base in _SCHEMA_TYPE_ALIASES:
+        return _SCHEMA_TYPE_ALIASES[base]
+    return lowered
 
 
 def _safe_id(name: str) -> str:

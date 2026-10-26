@@ -38,7 +38,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 LOG = logging.getLogger("fluid.build_runners.acquisition")
 
@@ -717,6 +717,7 @@ def enforce_schema_policy_or_raise(ctx: Any, runner: Any) -> None:
         overrides=contract_block.get("evolutionOverrides") or {},
         is_first_run=False,
     )
+    _log_family_renames(baseline, current)
     if not plan.has_failure:
         return
 
@@ -734,6 +735,39 @@ def enforce_schema_policy_or_raise(ctx: Any, runner: Any) -> None:
         baseline_digest=baseline_digest,
         current_digest=current_digest,
     )
+
+
+def _log_family_renames(
+    baseline: Sequence[Any],
+    current: Sequence[Any],
+) -> None:
+    """Tell the operator about a type change the drift gate deliberately allowed.
+
+    ``diff_columns`` emits no event when a column's type changed only between
+    two spellings of one physical type (DuckDB 1.5's DOUBLE vs 2.0's HUGEINT,
+    TIMESTAMP vs TIMESTAMP WITH TIME ZONE), so that upgrading DuckDB does not
+    raise a false ``SchemaDriftError``. Suppressing the FAILURE is the intent;
+    suppressing the NOTICE as well is not, because the two types are not always
+    value-identical -- 1.5 landed a lossy 17-significant-digit float where 2.0
+    lands the exact 128-bit integer.
+
+    Logged whatever the policy decides, and before the gate's early return, so
+    a contract that declared ``schemaPolicy: strict`` still hears that the
+    physical type moved even though the run is allowed to continue.
+    """
+    from fluid_build.build_runners._schema_evolution import family_rename_note
+
+    by_name = {getattr(c, "name", None): c for c in baseline}
+    for col in current:
+        was = by_name.get(getattr(col, "name", None))
+        if was is None:
+            continue
+        note = family_rename_note(getattr(was, "type", "") or "", getattr(col, "type", "") or "")
+        if note:
+            LOG.warning(
+                "acquisition_schema_family_rename",
+                extra={"column": getattr(col, "name", None), "detail": note},
+            )
 
 
 def write_run_record(

@@ -43,6 +43,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
@@ -1291,7 +1292,7 @@ def _build_quality_predicates(
 
 
 def _apply_incremental_filter(
-    ctx: RunContext, stream: str, base_sel: str
+    ctx: RunContext, stream: str, base_sel: str, con: Any = None
 ) -> Tuple[str, Optional[Any]]:
     """Wrap a base SELECT with an incremental cursor filter.
 
@@ -1323,14 +1324,170 @@ def _apply_incremental_filter(
         # runs will use the cursor that's persisted at end-of-run.
         return base_sel, None
     last_value = last_cursor.value
-    # The cursor value is treated as a SQL literal regardless of the
-    # column type: duckdb will coerce ``'2026-05-01T00:00:00'`` against
-    # a TIMESTAMP column and ``'42'`` against an INT. ``quote_ansi_string_literal``
-    # neutralises any embedded quote / control char from a tampered
-    # state file.
-    quoted_value = quote_ansi_string_literal(str(last_value))
-    filtered = f"SELECT * FROM ({base_sel}) WHERE {cursor_field_safe} > {quoted_value}"
+    # ``_cursor_comparison`` builds the predicate: an instant comparison for a
+    # timestamp cursor, which no session time zone can shift, and a plain
+    # literal for a scalar one. It quotes through ``quote_ansi_string_literal``,
+    # so a tampered state file cannot inject SQL into the WHERE clause.
+    column_type = _cursor_column_type(con, base_sel, cursor_field_safe) if con is not None else None
+    predicate = _cursor_comparison(cursor_field_safe, last_value, column_type)
+    filtered = f"SELECT * FROM ({base_sel}) WHERE {predicate}"
     return filtered, last_value
+
+
+#: A trailing UTC offset on a timestamp DuckDB rendered as text: ``Z``, or a
+#: sign and 2-4 digits with an optional colon (``+00``, ``-0400``, ``-04:00``).
+#: Matched explicitly rather than left to :meth:`datetime.fromisoformat`, whose
+#: tolerance for ``Z`` and a two-digit offset depends on the Python version and
+#: this package supports 3.10 upward.
+_CURSOR_OFFSET_RE = re.compile(r"(?P<head>.*?)(?P<off>Z|[+-]\d{2}:?(?:\d{2})?)$")
+
+
+def _canonical_cursor_text(value: Any) -> str:
+    """``value`` as cursor text whose meaning does not depend on DuckDB's version.
+
+    A cursor is stored as text and pasted into ``WHERE <field> > '<text>'`` as
+    an UNTYPED literal, so that text has to denote one instant whatever the
+    column resolved to. DuckDB 1.5 reads a JSON timestamp carrying ``Z`` as a
+    naive TIMESTAMP and 2.0 reads it as TIMESTAMP WITH TIME ZONE, so the two
+    disagree about what an offset-bearing literal means.
+
+    An offset-bearing timestamp is therefore converted to UTC and rendered
+    WITHOUT an offset. Naive-UTC text denotes the same instant against a naive
+    TIMESTAMP column, and it is the text the instant comparison in
+    :func:`_cursor_comparison` reads as UTC against a TIMESTAMPTZ one.
+
+    This is also what repairs state already on disk, so no cursor file has to be
+    rewritten. A shipped DuckDB 2.0 install on a host with a non-zero offset
+    persisted cursors like ``2026-05-01 10:00:00-04:00``; DuckDB 1.5 drops that
+    offset when it coerces to a naive TIMESTAMP, which moves the ``>`` boundary
+    and re-emits rows (measured: a row duplicated even with the time zone
+    pinned). Normalising on read closes that.
+
+    Anything that is not an offset-bearing timestamp is returned as its own
+    text, unchanged: an integer cursor, an opaque string, an already-naive
+    timestamp. A value that looks like it carries an offset but does not parse
+    is also returned unchanged -- a cursor whose text we do not understand is
+    left exactly as the previous release compared it.
+    """
+    text = str(value)
+    match = _CURSOR_OFFSET_RE.match(text)
+    if match is None:
+        return text
+    head, off = match.group("head"), match.group("off")
+    if off == "Z":
+        normalised = head + "+00:00"
+    else:
+        digits = off.replace(":", "")
+        if len(digits) == 3:  # '+04' -> '+04:00'
+            normalised = head + digits + ":00"
+        elif len(digits) == 5:
+            normalised = head + digits[:3] + ":" + digits[3:]
+        else:
+            return text
+    try:
+        parsed = datetime.fromisoformat(normalised)
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        return text
+    try:
+        shifted = parsed.astimezone(timezone.utc)
+    except (OverflowError, OSError):
+        # Converting year 1 or year 9999 across a non-zero offset leaves
+        # datetime's range. Such a cursor is not a real high-water mark, and
+        # returning it unchanged keeps the previous release's behaviour rather
+        # than failing the run on it.
+        return text
+    return shifted.replace(tzinfo=None).isoformat(sep=" ")
+
+
+#: The column types ``epoch_us`` accepts. Measured on duckdb 1.5.6 and 2.0.0,
+#: identically: every other type -- VARCHAR, INTEGER, DECIMAL, the ``"NULL"``
+#: of an all-null column -- raises BinderException, so the instant comparison
+#: must never be emitted for one.
+_EPOCH_US_TYPES = frozenset(
+    {
+        "TIMESTAMP",
+        "TIMESTAMP WITH TIME ZONE",
+        "TIMESTAMPTZ",
+        "TIMESTAMP_S",
+        "TIMESTAMP_MS",
+        "TIMESTAMP_NS",
+        "TIMESTAMPTZ_NS",
+        "DATE",
+        "TIME",
+    }
+)
+
+
+def _cursor_column_type(con: Any, base_sel: str, field_sql: str) -> Optional[str]:
+    """The declared type of the cursor column in ``base_sel``, or ``None``.
+
+    Asked of the source, not guessed from the cursor's text. The value's shape
+    is not enough: a VARCHAR column holding ``'2026-05-01 10:00:00'`` yields a
+    cursor that looks exactly like a timestamp, and ``epoch_us`` on VARCHAR is a
+    BinderException that would fail every incremental run on such a column.
+
+    ``LIMIT 0``, so this costs a bind and no scan. ``None`` when the probe
+    cannot answer -- a source that will not bind here fails informatively on the
+    real query a moment later, so this never raises on its own.
+    """
+    try:
+        rows = con.execute(f"SELECT typeof({field_sql}) FROM ({base_sel}) LIMIT 1").fetchall()
+    except Exception:
+        return None
+    if rows and rows[0] and rows[0][0]:
+        return str(rows[0][0]).strip().upper()
+    # An empty source binds but returns no row: ask DuckDB for the column's
+    # type from the relation's own schema instead.
+    try:
+        described = con.execute(f"DESCRIBE SELECT {field_sql} FROM ({base_sel})").fetchall()
+    except Exception:
+        return None
+    return str(described[0][1]).strip().upper() if described and len(described[0]) > 1 else None
+
+
+def _cursor_comparison(field_sql: str, value: Any, column_type: Optional[str]) -> str:
+    """The incremental ``>`` predicate for one cursor, free of the session time zone.
+
+    A plain ``<field> > '<text>'`` is not safe for a timestamp. The literal is
+    untyped, so DuckDB coerces it to the column's type, and on DuckDB 2.0 a JSON
+    timestamp column resolves to TIMESTAMP WITH TIME ZONE, where a naive literal
+    is read in the session time zone -- the host's, unless something pins it.
+    The boundary then moves by the host's UTC offset and rows are silently
+    skipped or re-emitted.
+
+    Comparing INSTANTS removes the ambiguity: ``epoch_us`` of a TIMESTAMP WITH
+    TIME ZONE is its instant, and of a naive TIMESTAMP is that time read as UTC,
+    which is exactly what :func:`_canonical_cursor_text` renders. The same
+    predicate is therefore correct on 1.5 and 2.0 and under any host zone
+    (measured: the plain literal returns 1 row where 2 are due, on 2.0 at
+    UTC-4; this returns 2 on both versions under both zones).
+
+    Only for a column type ``epoch_us`` accepts (:data:`_EPOCH_US_TYPES`).
+    Every other type -- VARCHAR, INTEGER, DECIMAL -- keeps the plain
+    comparison, because ``epoch_us`` raises BinderException on it. The decision
+    is the COLUMN's type, never the cursor text's shape: a VARCHAR column of
+    timestamp-looking strings produces a cursor indistinguishable from a real
+    timestamp's.
+
+    Pinning the session zone to UTC would also have worked and is NOT used:
+    ``TimeZone`` is an ICU-backed setting, the sandbox forbids autoloading
+    extensions, and where ICU is absent DuckDB does not even recognise the
+    option -- so a pin would fail the connection in exactly the hardened
+    environments the sandbox exists for. ``epoch_us`` needs no extension
+    (verified with autoload disabled and an empty extension directory).
+
+    The cost, accepted deliberately: wrapping the column in a function can stop
+    the predicate being pushed into the Parquet or JSON reader, so a large
+    source scans more than it would have. Correct rows beat a faster wrong
+    answer, and only a temporal column takes this path.
+    """
+    text = _canonical_cursor_text(value)
+    literal = quote_ansi_string_literal(text)
+    if column_type and column_type.split("(", 1)[0].strip() in _EPOCH_US_TYPES:
+        return f"epoch_us({field_sql}) > epoch_us(TIMESTAMP {literal})"
+    return f"{field_sql} > {literal}"
 
 
 def _persist_cursor_after_run(
@@ -1383,7 +1540,7 @@ def _persist_cursor_after_run(
         ctx.build_id,
         Cursor(
             stream=stream,
-            value=str(new_value),
+            value=_canonical_cursor_text(new_value),
             updated_at=utc_now_iso(),
         ),
     )
@@ -1498,7 +1655,7 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 # ``last_cursor_value`` is the value we filtered on (None for
                 # full refresh OR first incremental run); kept for the
                 # ``cursor_advanced`` flag emitted on the StreamResult.
-                sel, last_cursor_value = _apply_incremental_filter(ctx, stream, base_sel)
+                sel, last_cursor_value = _apply_incremental_filter(ctx, stream, base_sel, con)
                 # Build quality-gate predicates. When gates are declared,
                 # we partition the SELECT into a GOOD set (lands in the
                 # destination) and a BAD set (routed to DLQ). ``good_where``
