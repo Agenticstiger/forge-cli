@@ -28,7 +28,6 @@ the secret.
 
 from __future__ import annotations
 
-import os
 import pathlib
 from typing import Any, Dict
 

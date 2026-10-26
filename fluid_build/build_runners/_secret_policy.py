@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
 from fluid_build._errors import FluidUserError, doc_url
