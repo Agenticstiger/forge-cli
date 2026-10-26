@@ -30,10 +30,11 @@ the contract has to satisfy the schema, not this test's idea of it.
 
 from __future__ import annotations
 
+import copy
 import logging
 from argparse import Namespace
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import pytest
 import yaml
@@ -41,6 +42,7 @@ import yaml
 from fluid_build.cli.odps import SPEC_BITOL_1_0_0, cmd_opds_import
 from fluid_build.cli.validate import run_on_contract_dict
 from fluid_build.providers.odps_standard import BitolOdpsProvider
+from fluid_build.providers.odps_standard.provider import _PORT_TYPE_TO_PLATFORM
 from fluid_build.schema_manager import SchemaManager
 
 LOG = logging.getLogger(__name__)
@@ -215,6 +217,178 @@ class TestMinimalDocument:
         _write(tmp_path / "acme.sales.orders.odcs.yaml", _MINIMAL_ODCS)
         fluid = provider.import_contract(_write(tmp_path / "p.odps.yaml", _MINIMAL_ODPS))
         assert fluid["lifecycle"] == {"state": "preview"}
+
+
+# ---------------------------------------------------------------------------
+# The status the export publishes is the contract's, not the import's receipt.
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleStateRoundTrip:
+    """``lifecycle.state`` is what the contract claims; the bucket only replays.
+
+    The Bitol vocabulary is wider than the ``lifecycle.state`` enum —
+    ``draft`` and ``proposed`` both have to land on ``preview`` — so the import
+    keeps the source document's verbatim spelling in ``extensions.odps.status``
+    and the export replays it, which is the only way the round trip stays
+    exact. The hazard that creates: the verbatim value is a receipt for what
+    the document said at import time, and the moment someone edits
+    ``lifecycle.state`` the receipt is stale. Replaying it then publishes a
+    status the contract no longer claims — a product retired in the contract
+    would be exported as a draft.
+    """
+
+    def _imported(self, provider: BitolOdpsProvider, tmp_path: Path, status: str) -> Dict[str, Any]:
+        _write(tmp_path / "acme.sales.orders.odcs.yaml", _MINIMAL_ODCS)
+        doc = copy.deepcopy(_MINIMAL_ODPS)
+        doc["status"] = status
+        return provider.import_contract(_write(tmp_path / "p.odps.yaml", doc))
+
+    @pytest.mark.parametrize("status", ["draft", "proposed"])
+    def test_the_premise_a_verbatim_status_is_there_to_go_stale(
+        self, provider: BitolOdpsProvider, tmp_path: Path, status: str
+    ) -> None:
+        # Without this the cases below could pass on a contract that had no
+        # verbatim status to go stale in the first place. ``proposed`` is the
+        # spelling that proves the replay is doing real work: it imports as
+        # ``preview`` like ``draft`` does, so nothing can derive it back.
+        imported = self._imported(provider, tmp_path, status)
+
+        assert imported["lifecycle"] == {"state": "preview"}
+        assert imported["extensions"]["odps"]["status"] == status
+        assert provider.render(copy.deepcopy(imported))["product"]["status"] == status
+
+    @pytest.mark.parametrize("status", ["draft", "proposed"])
+    @pytest.mark.parametrize("state", ["retired", "deprecated", "active"])
+    def test_an_edited_state_wins_over_the_imported_status(
+        self, provider: BitolOdpsProvider, tmp_path: Path, status: str, state: str
+    ) -> None:
+        edited = self._imported(provider, tmp_path, status)
+        edited["lifecycle"]["state"] = state
+
+        exported = provider.render(edited)["product"]
+        assert exported["status"] == state
+        assert exported["status"] != status
+
+    @pytest.mark.parametrize("status", ["draft", "proposed"])
+    def test_a_state_the_verbatim_status_still_agrees_with_replays_verbatim(
+        self, provider: BitolOdpsProvider, tmp_path: Path, status: str
+    ) -> None:
+        # The other half: ``preview`` is what both spellings imported as, so
+        # the contract has not been edited and the exact Bitol word is what
+        # keeps the round trip lossless. Setting the state to the value the
+        # import derived must not coarsen ``proposed`` into ``draft``.
+        edited = self._imported(provider, tmp_path, status)
+        edited["lifecycle"]["state"] = "preview"
+        assert provider.render(edited)["product"]["status"] == status
+
+
+# ---------------------------------------------------------------------------
+# What an output port's kind and platform are derived from.
+# ---------------------------------------------------------------------------
+
+
+def _odps_with_port(**port: Any) -> Dict[str, Any]:
+    """The minimal product doc with one output port described by ``port``."""
+    doc = copy.deepcopy(_MINIMAL_ODPS)
+    doc["outputPorts"] = [{"name": "orders", "contractId": "acme.sales.orders", **port}]
+    return doc
+
+
+class TestKindComesFromTheResolvedContract:
+    """A typeless port's ``kind`` is the resolved contract's ``physicalType``.
+
+    A Bitol ``OutputPort.type`` names a platform (``snowflake``, ``s3``), never
+    the kind of object the port serves, and the field is optional. FLUID
+    requires ``kind`` on every expose, so with nothing but the port to go on
+    the importer has to synthesize the ``other`` placeholder. The resolved ODCS
+    contract knows better: its ``physicalType`` says what the object actually
+    is, and it is merged in ahead of the guess.
+    """
+
+    def test_a_typeless_port_whose_contract_is_a_view_imports_as_a_view(
+        self, provider: BitolOdpsProvider, tmp_path: Path
+    ) -> None:
+        odcs = copy.deepcopy(_MINIMAL_ODCS)
+        odcs["schema"][0]["physicalType"] = "view"
+        _write(tmp_path / "acme.sales.orders.odcs.yaml", odcs)
+
+        fluid = provider.import_contract(_write(tmp_path / "p.odps.yaml", _odps_with_port()))
+
+        _assert_valid(fluid)
+        assert fluid["exposes"][0]["kind"] == "view"
+
+    def test_the_premise_the_port_alone_only_yields_the_placeholder(
+        self, provider: BitolOdpsProvider, tmp_path: Path
+    ) -> None:
+        # The same typeless port with no contract to resolve. This is what the
+        # test above would assert if the merge stopped carrying ``kind`` over,
+        # so it is the measure of what that merge is worth.
+        src = _write(tmp_path / "p.odps.yaml", _odps_with_port())
+        fluid = provider.import_contract(src, lenient=True)
+
+        _assert_valid(fluid)
+        assert fluid["exposes"][0]["kind"] == "other"
+
+
+class TestPortTypeToPlatform:
+    """Every entry of ``_PORT_TYPE_TO_PLATFORM``, by construction.
+
+    Parametrising over the real table rather than a copy of it means a port
+    type added to the mapping is covered the day it is added, and a mapping
+    quietly changed under an existing entry fails here.
+
+    The route is an **unresolved** port: a resolved ODCS contract's
+    ``servers[]`` is the authoritative platform signal and its binding is
+    merged in ahead of this derivation, so the table is only ever consulted for
+    a port whose contract could not be read — which is exactly the
+    ``--lenient`` bundle a third party hands over.
+    """
+
+    def _imported(
+        self, provider: BitolOdpsProvider, tmp_path: Path, port_type: Optional[str]
+    ) -> Dict[str, Any]:
+        port = {} if port_type is None else {"type": port_type}
+        doc = _odps_with_port(contractId="no.such.contract", **port)
+        return provider.import_contract(_write(tmp_path / "p.odps.yaml", doc), lenient=True)
+
+    @pytest.mark.parametrize(
+        ("port_type", "platform"), sorted(_PORT_TYPE_TO_PLATFORM.items()), ids=repr
+    )
+    def test_each_port_type_derives_its_platform(
+        self, provider: BitolOdpsProvider, tmp_path: Path, port_type: str, platform: str
+    ) -> None:
+        fluid = self._imported(provider, tmp_path, port_type)
+
+        _assert_valid(fluid)
+        assert fluid["exposes"][0]["binding"]["platform"] == platform
+
+    @pytest.mark.parametrize(
+        "port_type",
+        [
+            pytest.param("mysql", id="a-platform-fluid-has-no-enum-value-for"),
+            pytest.param("custom", id="the-bitol-escape-hatch"),
+            pytest.param("", id="an-empty-string"),
+            pytest.param(None, id="no-type-at-all"),
+        ],
+    )
+    def test_an_unknown_port_type_derives_other(
+        self, provider: BitolOdpsProvider, tmp_path: Path, port_type: Optional[str]
+    ) -> None:
+        # ``other`` is the enum's honest escape hatch. Guessing a platform the
+        # document never named would send the apply path at the wrong cloud.
+        fluid = self._imported(provider, tmp_path, port_type)
+
+        _assert_valid(fluid)
+        assert fluid["exposes"][0]["binding"]["platform"] == "other"
+
+    def test_the_lookup_is_case_insensitive(
+        self, provider: BitolOdpsProvider, tmp_path: Path
+    ) -> None:
+        # The table is lower-case and a port type is free document text, so an
+        # upper-case spelling must not fall through to ``other``.
+        fluid = self._imported(provider, tmp_path, "BigQuery")
+        assert fluid["exposes"][0]["binding"]["platform"] == "gcp"
 
 
 # ---------------------------------------------------------------------------

@@ -52,6 +52,7 @@ from fluid_build.cli.validate import run_on_contract_dict
 from fluid_build.providers.odcs.mappers.extras import FLUID_EXTRAS_PROPERTY
 from fluid_build.providers.odcs.provider import OdcsProvider
 from fluid_build.providers.odps_standard import BitolOdpsProvider
+from fluid_build.providers.odps_standard.provider import _supports_expose_contract_id
 from fluid_build.schema_manager import SchemaManager
 
 PREVIEW = "0.7.6"
@@ -209,6 +210,79 @@ def _foreign_bundle(root: Path, recorded: Any = ..., *, record: bool = True) -> 
     return root
 
 
+# A second port, so a bundle can hold two siblings that disagree about the
+# version. Its contract id is as unguessable as the first: a derived
+# ``{product}.{expose}`` would not survive the re-export assertions below.
+SECOND_PORT_CONTRACT_ID = "9c1a7e55-2b60-4f0e-8d33-1a7b4c5e6d71"
+
+
+def _sibling(contract_id: str, object_name: str, recorded: Any) -> Dict[str, Any]:
+    """One ODCS sibling, recording ``recorded`` as its source's fluidVersion."""
+    odcs = copy.deepcopy(_FOREIGN_ODCS)
+    odcs["id"] = contract_id
+    odcs["schema"][0]["name"] = object_name
+    odcs["customProperties"] = [
+        {"property": FLUID_EXTRAS_PROPERTY, "value": {"root": {"fluidVersion": recorded}}}
+    ]
+    return odcs
+
+
+def _two_sibling_bundle(root: Path, orders: Any, returns: Any) -> Path:
+    """A two-port bundle whose siblings record ``orders`` and ``returns``.
+
+    Both the directory walk (``sorted(rglob)``) and the version collection
+    (``outputPorts`` order) read ``orders`` first, so swapping the two
+    arguments swaps the read order as well as the values — which is what makes
+    the pair of parametrised cases a test of the rule rather than of whichever
+    file happened to be read first.
+    """
+    _write(root / "a-orders.odcs.yaml", _sibling(PORT_CONTRACT_ID, "orders", orders))
+    _write(root / "b-returns.odcs.yaml", _sibling(SECOND_PORT_CONTRACT_ID, "returns", returns))
+    product = copy.deepcopy(_FOREIGN_ODPS)
+    product["outputPorts"] = [
+        {"name": "orders", "contractId": PORT_CONTRACT_ID, "type": "snowflake"},
+        {"name": "returns", "contractId": SECOND_PORT_CONTRACT_ID, "type": "snowflake"},
+    ]
+    _write(root / "acme.sales.odps.yaml", product)
+    return root
+
+
+def _odcs_only_dir(root: Path, first: Any, second: Any) -> Path:
+    """The same disagreement with no ODPS product doc at all.
+
+    ``_import_odcs_only`` collects the recorded versions from its own
+    sub-imports rather than from resolved ports, so it is a second, independent
+    site for the same rule and needs its own coverage.
+    """
+    _write(root / "a-orders.odcs.yaml", _sibling(PORT_CONTRACT_ID, "orders", first))
+    _write(root / "b-returns.odcs.yaml", _sibling(SECOND_PORT_CONTRACT_ID, "returns", second))
+    return root
+
+
+def _bundle_with_a_restored_id(root: Path, recorded: Any) -> Path:
+    """A bundle whose sibling records ``recorded`` *and* pins the expose's id.
+
+    ``extensions.exposes.<id>.contract.id`` is how the ODCS extras blob carries
+    a pinned ``exposeContract.id`` that ODCS itself has no field for, so an
+    expose arrives at the normaliser already holding one. When the recorded
+    version predates the field (0.7.6 added it) that inline id would fail the
+    closed ``exposeContract`` and take the whole import down with it.
+    """
+    odcs = copy.deepcopy(_FOREIGN_ODCS)
+    odcs["customProperties"] = [
+        {
+            "property": FLUID_EXTRAS_PROPERTY,
+            "value": {
+                "root": {"fluidVersion": recorded},
+                "exposes": {"orders": {"contract": {"id": PORT_CONTRACT_ID}}},
+            },
+        }
+    ]
+    _write(root / "orders.odcs.yaml", odcs)
+    _write(root / "acme.sales.odps.yaml", copy.deepcopy(_FOREIGN_ODPS))
+    return root
+
+
 def _expose(fluid: Dict[str, Any]) -> Dict[str, Any]:
     return fluid["exposes"][0]
 
@@ -346,6 +420,80 @@ class TestWhatIsHonoured:
         assert PREVIEW in SchemaManager.PREVIEW_VERSIONS
 
 
+class TestSiblingsThatDisagree:
+    """Several siblings recording different versions: the highest accepted wins.
+
+    The siblings of one bundle came from one FLUID contract and normally agree.
+    When they do not — a directory hand-edited one file at a time, or two
+    exports dropped into one folder — the merged document can carry a field only
+    the newer schema declares, and declaring the lower version would reject it.
+    Taking the first version read, or the last, would make the imported
+    contract's schema depend on the order of a directory walk.
+    """
+
+    @pytest.mark.parametrize(
+        ("orders", "returns"),
+        [
+            pytest.param(STABLE, PREVIEW, id="newer-sibling-second"),
+            pytest.param(PREVIEW, STABLE, id="newer-sibling-first"),
+        ],
+    )
+    def test_the_highest_version_wins_whichever_sibling_records_it(
+        self, provider: BitolOdpsProvider, tmp_path: Path, orders: str, returns: str
+    ) -> None:
+        imported = provider.import_directory(_two_sibling_bundle(tmp_path, orders, returns))
+
+        _assert_valid(imported)
+        assert imported["fluidVersion"] == PREVIEW
+        # Both ports really resolved, so the two versions really were in
+        # disagreement — a bundle where the second sibling went unread would
+        # pass the assertion above for the wrong reason.
+        assert [e["exposeId"] for e in imported["exposes"]] == ["orders", "returns"]
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            pytest.param(STABLE, PREVIEW, id="newer-sibling-second"),
+            pytest.param(PREVIEW, STABLE, id="newer-sibling-first"),
+        ],
+    )
+    def test_an_odcs_only_directory_applies_the_same_rule(
+        self, provider: BitolOdpsProvider, tmp_path: Path, first: str, second: str
+    ) -> None:
+        # No ODPS product doc, so the versions come from the sub-imports' own
+        # root ``fluidVersion`` rather than from resolved ports. Same rule,
+        # different collection site.
+        imported = provider.import_directory(_odcs_only_dir(tmp_path / "acme-sales", first, second))
+
+        _assert_valid(imported)
+        assert imported["fluidVersion"] == PREVIEW
+        assert [e["exposeId"] for e in imported["exposes"]] == ["orders", "returns"]
+
+    @pytest.mark.parametrize(
+        ("orders", "returns"),
+        [
+            pytest.param(PREVIEW, "9.9.9", id="refused-sibling-second"),
+            pytest.param("9.9.9", PREVIEW, id="refused-sibling-first"),
+        ],
+    )
+    def test_highest_means_highest_accepted_not_highest_recorded(
+        self,
+        provider: BitolOdpsProvider,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        orders: Any,
+        returns: Any,
+    ) -> None:
+        # A version this build does not bundle is replaced by the stable
+        # default before the comparison, so a sibling recording nonsense can
+        # neither select a schema nor hold the others back.
+        imported = provider.import_directory(_two_sibling_bundle(tmp_path, orders, returns))
+
+        _assert_valid(imported)
+        assert imported["fluidVersion"] == PREVIEW
+        assert "ignoring the recorded fluidVersion '9.9.9'" in caplog.text
+
+
 class TestWhatIsRefused:
     @pytest.mark.parametrize(
         "recorded",
@@ -446,6 +594,65 @@ class TestExposeContractId:
 
         rendered = OdcsProvider().render(imported, expose_id="orders")
         assert rendered["id"] == PORT_CONTRACT_ID
+
+
+class TestARestoredIdAtAVersionWithoutTheField:
+    """The mirror case: the extras blob restores an id the schema cannot hold.
+
+    ``_normalize_imported_expose`` writes the port's contract id inline only
+    when the declared schema has ``exposeContract.id``. The branch that matters
+    here is the other one: the expose arrives *already* carrying an inline id,
+    because the sibling's ``fluidExtras`` pinned one, while the version that
+    sibling recorded predates the field. Leaving it inline fails the closed
+    ``exposeContract`` and takes the whole import with it; dropping it loses the
+    id the catalog knows the port by. It moves to the per-expose pass-through
+    instead, which is where the exporter looks as its fallback.
+
+    This is the version-conditional branch, so the premise is asserted rather
+    than assumed: the day 0.7.4 or 0.7.5 grows an ``exposeContract.id`` these
+    cases stop exercising the branch, and the premise is what says so.
+    """
+
+    @pytest.mark.parametrize("recorded", [STABLE, "0.7.4"], ids=["stable", "older-than-stable"])
+    def test_the_premise_that_version_has_no_expose_contract_id(self, recorded: str) -> None:
+        assert not _supports_expose_contract_id(recorded)
+        assert _supports_expose_contract_id(PREVIEW)
+
+    @pytest.mark.parametrize("recorded", [STABLE, "0.7.4"], ids=["stable", "older-than-stable"])
+    def test_a_restored_id_moves_to_the_passthrough(
+        self, provider: BitolOdpsProvider, tmp_path: Path, recorded: str
+    ) -> None:
+        imported = provider.import_directory(_bundle_with_a_restored_id(tmp_path, recorded))
+
+        # The recorded version is honoured, which is precisely why the id
+        # cannot stay where the extras blob put it.
+        assert imported["fluidVersion"] == recorded
+        _assert_valid(imported)
+        assert "id" not in _expose(imported)["contract"]
+        assert _passthrough_contract_id(imported) == PORT_CONTRACT_ID
+
+    @pytest.mark.parametrize("recorded", [STABLE, "0.7.4"], ids=["stable", "older-than-stable"])
+    def test_a_restored_id_still_re_exports_verbatim(
+        self, provider: BitolOdpsProvider, tmp_path: Path, recorded: str
+    ) -> None:
+        # Moved, not lost: the port keeps answering to the id the bundle gave
+        # it rather than to a derived ``{product}.{expose}``.
+        bundle = _bundle_with_a_restored_id(tmp_path, recorded)
+        rendered = provider.render(provider.import_directory(bundle))
+
+        assert rendered["product"]["outputPorts"][0]["contractId"] == PORT_CONTRACT_ID
+        assert list(rendered["contracts"]) == [PORT_CONTRACT_ID]
+
+    def test_at_a_version_with_the_field_the_restored_id_stays_inline(
+        self, provider: BitolOdpsProvider, tmp_path: Path
+    ) -> None:
+        # The other half of the conditional, from the same fixture: nothing is
+        # moved out of a schema that declares the field.
+        imported = provider.import_directory(_bundle_with_a_restored_id(tmp_path, PREVIEW))
+
+        _assert_valid(imported)
+        assert imported["fluidVersion"] == PREVIEW
+        assert _expose(imported)["contract"]["id"] == PORT_CONTRACT_ID
 
 
 # ---------------------------------------------------------------------------
