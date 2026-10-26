@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A poisoned ODPS document could print its own credential to stderr.** `fluid odps import`'s new
+  validate-before-write gate reports the first schema error, and a jsonschema error quotes the value
+  that failed — a value that comes from the document the command was handed. Importing a bundle
+  whose root `id` was `snowflake://svc_etl:<password>@host/?token=<token>` printed the password in
+  full while masking the token in the same string: the repo's redactor knows that shape and simply
+  was not on this path, which went through the console's weaker `key=value` sanitiser. The gate's
+  message now goes through `observability/secret_redactor.py::redact_secret_text`. A value with
+  nothing credential-shaped in it is still quoted, so the diagnosis is not swallowed.
+  The underlying weakness is older than this release — `fluid validate` prints the same bytes — and
+  that path is deliberately left for its own change; this fixes the surface that was added here.
 - **An acquisition source no longer receives this host's ambient database credentials.** A contract
   names the host its postgres or mysql source lives on, and libpq and mysql_scanner read
   credentials from the process environment for whatever host they are handed — so a contract naming
@@ -151,9 +161,15 @@ into consumers.
 - **A pinned or imported contract id was re-derived on export.** An ODPS import kept an output
   port's own `contractId` in a pass-through bucket, but the export derived the id again, so a port
   imported with a UUID re-exported as `<productId>.<exposeId>` — and so did its ODCS. An explicit
-  `exposes[].contract.id` is now used verbatim as both, resolved through one helper so the
-  fragments-mode invariant that the two are the same string holds by construction rather than by two
-  call sites agreeing.
+  `exposes[].contract.id` is now used verbatim as both. Every site that mints a per-port contract id
+  resolves it through `util/contract.py::expose_contract_id`, and that resolution reads the whole
+  contract — including the root `extensions.odps` an import leaves the id in — so the five entry
+  points that render a per-expose ODCS all answer the same string, not only the one that happens to
+  rehydrate the bucket first. The fragments-mode invariant that the ODPS `contractId` and the ODCS
+  `id` are the same string is then held by the export refusing a contract that would break it, not
+  by agreement between call sites: two exposes resolving to one id are rejected by `fluid validate`
+  and by `BitolOdpsProvider.render`, which would otherwise have written one per-port ODCS for two
+  output ports and left the losing port with no schema in the bundle at all.
 - **Several contracts from one product shared a name.** A per-port export named every ODCS after the
   product, so tools that key files or registry subjects on the contract name collided. ODCS puts
   identity on `id`, which was already per-expose, so this was invisible to id-keyed consumers and
