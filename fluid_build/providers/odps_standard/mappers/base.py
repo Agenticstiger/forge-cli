@@ -36,6 +36,7 @@ from fluid_build.providers._mapper_common import (
     make_passthrough_helpers,
     resolve_status,
 )
+from fluid_build.util.contract import explicit_expose_contract_id
 
 PASSTHROUGH_KEY = "odps_passthrough"
 
@@ -79,6 +80,19 @@ def contract_id_for_port(product_id: str, port_name: str) -> str:
     return f"{product_id}.{port_name}"
 
 
+def contract_id_for_expose(expose: Mapping[str, Any], product_id: str, port_name: str) -> str:
+    """The contract id for one output port: the one the expose names, else derived.
+
+    Deriving it unconditionally meant an id could not be pinned and an
+    imported one did not survive: a port imported with a catalog's own
+    contractId re-exported as ``{productId}.{portName}``, and renaming either
+    half renamed the contract. :func:`explicit_expose_contract_id` is the same
+    lookup the ODCS per-port render does, which is what keeps the two ids equal
+    and the fragments-mode linking invariant intact.
+    """
+    return explicit_expose_contract_id(expose) or contract_id_for_port(product_id, port_name)
+
+
 __all__ = [
     "PASSTHROUGH_KEY",
     "metadata_passthrough",
@@ -92,4 +106,6 @@ __all__ = [
     "fluid_id",
     "resolve_status",
     "contract_id_for_port",
+    "contract_id_for_expose",
+    "explicit_expose_contract_id",
 ]

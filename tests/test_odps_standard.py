@@ -112,8 +112,11 @@ def test_provider_render_maps_consumes_to_input_ports():
     only ``name, version, contractId, tags, customProperties,
     authoritativeDefinitions``. The provider strips FLUID-specific extras
     (``id``, ``description``, ``reference``, ``required``, ``sourceSystemId``)
-    and synthesizes ``contractId`` from ``reference`` when the FLUID consume
-    didn't declare one explicitly."""
+    and, when the FLUID consume names no ``contractId`` of its own, defaults it
+    to the expose-scoped ``{productId}.{exposeId}`` — the id forge itself gives
+    that upstream port's ODCS contract. The bare ``productId`` this used to
+    emit named a contract that exists nowhere, so a lineage edge between two
+    FLUID products resolved in no catalog that follows the reference."""
     provider = OdpsStandardProvider()
 
     result = provider.render(_sample_fluid_contract_with_consumes_and_expose_id())
@@ -122,14 +125,20 @@ def test_provider_render_maps_consumes_to_input_ports():
         {
             "name": "subscriber_usage_daily",
             "version": "1.0.0",
-            # contractId synthesized from reference (consume had no explicit
-            # contractId; reference is the upstream source's canonical name).
-            "contractId": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
+            # Expose-scoped: the upstream productId plus the exposeId this
+            # consume names. That is the same string the upstream product's own
+            # per-port ODCS render emits as its ``id``, which is what makes the
+            # lineage edge resolvable.
+            "contractId": (
+                "bizlab.teleforge.subscriber_usage_daily_lineage_local.subscriber_usage_daily"
+            ),
         },
         {
             "name": "billing_health_daily",
             "version": "1.0.0",
-            "contractId": "bizlab.teleforge.billing_health_daily_lineage_local",
+            "contractId": (
+                "bizlab.teleforge.billing_health_daily_lineage_local.billing_health_daily"
+            ),
         },
     ]
 
@@ -174,16 +183,18 @@ def test_provider_render_emits_input_port_contract_id_when_explicit():
 
     # Explicit contractId preserved verbatim.
     assert result["inputPorts"][0]["contractId"] == "test.upstream.a.contract.v1"
-    # Second port: no explicit contractId → synthesis fallback chain kicks
-    # in (reference → name). Must be set (v1.0.0 schema requires it) and
-    # stable — the exact value depends on what reference the canonical
-    # helper produces from productId+exposeId, which we treat as an impl
-    # detail. Pin that contractId is non-empty and matches a known source.
+    # Second port: no explicit contractId, so the id is synthesized, and the
+    # v1.0.0 schema requires one. The synthesized value is the linking
+    # convention, not an implementation detail: it is the expose-scoped
+    # ``{productId}.{exposeId}`` that the upstream product's own per-port ODCS
+    # contract carries, which is what lets a catalog resolve the edge. The bare
+    # productId names a contract that exists nowhere. Pin the exact string; a
+    # substring check passed for both forms and left the convention unpinned.
     cid_1 = result["inputPorts"][1]["contractId"]
-    assert cid_1, "contractId must be synthesized when FLUID consume omits it"
-    assert (
-        "test.upstream.b" in cid_1 or "upstream_b" in cid_1
-    ), f"synthesized contractId should reflect the upstream source; got {cid_1!r}"
+    assert cid_1 == "test.upstream.b.upstream_b", (
+        "a consume without a contractId must link to the upstream's "
+        f"expose-scoped contract id; got {cid_1!r}"
+    )
     # ``required`` is NOT permitted on v1.0.0 InputPort — stripped.
     assert "required" not in result["inputPorts"][0]
     assert "required" not in result["inputPorts"][1]

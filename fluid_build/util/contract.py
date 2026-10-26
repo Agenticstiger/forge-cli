@@ -213,6 +213,45 @@ def get_expose_contract(expose: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     return expose.get("contract")
 
 
+# The per-expose pass-through bucket the Bitol ODPS importer records an
+# imported output port's own ``contractId`` in. Spelled here rather than
+# imported from that provider because the two exporters below have to read the
+# same key, and the ODCS one has no business importing the ODPS one.
+_ODPS_PASSTHROUGH_KEY = "odps_passthrough"
+
+
+def explicit_expose_contract_id(expose: Mapping[str, Any]) -> Optional[str]:
+    """Return the contract id an expose names for itself, or ``None``.
+
+    Two exporters mint a per-port contract id — the ODCS document's ``id`` and
+    the ODPS output port's ``contractId``, which Bitol fragments mode requires
+    to be the same string — and both derive ``<product id>.<exposeId>`` when
+    the contract names none. They resolve the named one here so the two cannot
+    disagree about what the port's contract is called.
+
+    Two places hold one, in priority order:
+
+    1. ``contract.id`` (fluid-schema 0.7.6). What an author pins when the
+       derived id is not the one consumers or a catalog know the port by —
+       without it, renaming the product or the expose silently renames the
+       contract and breaks every reference to it. An ODPS import writes the
+       imported port's own ``contractId`` here too, whenever the version the
+       source document recorded declares the field.
+    2. The ODPS importer's per-expose pass-through record of the ``contractId``
+       the imported port already answered to. Still the only home for it when
+       the import declares an older version: ``exposeContract`` is closed
+       before 0.7.6, so writing the field there would make the whole imported
+       contract fail ``fluid validate``.
+    """
+    contract = expose.get("contract")
+    if isinstance(contract, Mapping) and contract.get("id"):
+        return str(contract["id"])
+    passthrough = expose.get(_ODPS_PASSTHROUGH_KEY)
+    if isinstance(passthrough, Mapping) and passthrough.get("contract_id"):
+        return str(passthrough["contract_id"])
+    return None
+
+
 def get_consumes(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """Return ``contract.consumes`` as a list of upstream-reference
     dicts. Empty list when the contract declares none or carries a

@@ -597,9 +597,16 @@ class TestInputPortDuplicateExposeIdHandling:
             f"expected 2 inputPorts (both consumes preserved) — got {len(ports)}: "
             f"{[p.get('name') for p in ports]}"
         )
+        # Each contractId is expose-scoped (``{productId}.{exposeId}``) — the id
+        # forge gives that upstream port's own ODCS contract. So the shared
+        # ``shared_port`` exposeId still yields two distinct, resolvable
+        # upstream addresses, not two bare productIds pointing at contracts
+        # that exist nowhere.
         contract_ids = {p.get("contractId") for p in ports}
-        assert "silver.synthetic.upstream_a" in contract_ids
-        assert "silver.synthetic.upstream_b" in contract_ids
+        assert contract_ids == {
+            "silver.synthetic.upstream_a.shared_port",
+            "silver.synthetic.upstream_b.shared_port",
+        }
         # Names must be unique within the product.
         names = [p.get("name") for p in ports]
         assert len(set(names)) == 2, f"inputPort names not unique: {names}"

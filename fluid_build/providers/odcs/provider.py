@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderError
+from fluid_build.util.contract import explicit_expose_contract_id
 
 from .io import read_input, write_output
 from .mappers import EXPORT_PIPELINE, IMPORT_PIPELINE, normalize
@@ -102,10 +103,11 @@ class OdcsProvider(BaseProvider):
     ) -> Dict[str, Any]:
         """Render a FLUID contract to ODCS v3.1.0.
 
-        When ``expose_id`` is provided the rendered ODCS scopes its ``id`` to
-        ``{product_id}.{expose_id}`` and reads ``status`` from that expose's
-        lifecycle — exactly what the Bitol ODPS provider needs when emitting
-        per-port contracts.
+        When ``expose_id`` is provided the rendered ODCS takes its ``id`` from
+        that expose's own ``contract.id`` when it declares one and scopes it to
+        ``{product_id}.{expose_id}`` otherwise, and reads ``status`` from that
+        expose's lifecycle — exactly what the Bitol ODPS provider needs when
+        emitting per-port contracts.
         """
         if isinstance(src, list):
             raise ProviderError(
@@ -271,8 +273,18 @@ class OdcsProvider(BaseProvider):
                 f"Expose '{expose_id}' not found in contract. " f"Available exposeIds: {available}"
             )
         scoped["exposes"] = exposes
+        # The id a port names for itself wins over the derived one, verbatim: a
+        # derived id changes the moment the product or the expose is renamed,
+        # which renames the contract under every consumer that references it,
+        # and a catalog whose ids are its own (a UUID, say) could not be served
+        # at all. The ODPS output port's ``contractId`` resolves through the
+        # same helper, so the two stay the one string Bitol fragments mode
+        # requires them to be.
+        explicit_id = explicit_expose_contract_id(exposes[0])
         product_id = fluid_id(fluid)
-        if product_id:
+        if explicit_id:
+            scoped["_scoped_id"] = explicit_id
+        elif product_id:
             scoped["_scoped_id"] = f"{product_id}.{expose_id}"
         # Only stamp a scoped status when the port actually declares one —
         # defaulting to "active" here used to mask the contract-root
