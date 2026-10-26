@@ -280,11 +280,12 @@ def fluid_type_from_odcs(
     return fluid_base
 
 
-# Provider physical-type tables. Both are exhaustive against the FLUID column
-# -type enum (the same single source of truth the logicalType map above tracks)
-# — see the drift guard in tests/providers/test_odcs_type_mapping.py. A missing
-# entry used to emit *no* ``physicalType`` at all, which reads as "FLUID has no
-# opinion" when in fact the contract stated one.
+# Provider physical-type tables. All three are exhaustive against the FLUID
+# column-type enum (the same single source of truth the logicalType map above
+# tracks) — see the drift guards in tests/providers/test_odcs_type_mapping.py
+# and tests/providers/test_odcs_kafka_physical_types.py. A missing entry used
+# to emit *no* ``physicalType`` at all, which reads as "FLUID has no opinion"
+# when in fact the contract stated one.
 _PHYSICAL_BY_PROVIDER: Dict[Tuple[str, ...], Dict[str, str]] = {
     ("gcp", "bigquery"): {
         # string family
@@ -464,7 +465,170 @@ _PHYSICAL_BY_PROVIDER: Dict[Tuple[str, ...], Dict[str, str]] = {
         "geom": "GEOMETRY",
         "point": "GEOGRAPHY",
     },
+    # Kafka / Confluent: the physical type IS the Avro type name.
+    #
+    # Without this table Kafka fell through to the ``fluid_to_physical``
+    # default, which answers with the *logicalType* — and ODCS has nine of
+    # those. A FLUID ``bigint`` column therefore exported as
+    # ``physicalType: integer``, and every tool that derives an Avro schema
+    # from an ODCS contract reads ``integer`` as Avro ``int``, which is 32-bit
+    # (ODCS v3.1.0 even defaults the integer logicalType's ``format`` option to
+    # ``i32``). A producer such as Flink BIGINT writes a 64-bit long, so the
+    # registered subject and the bytes on the topic disagree and consumers
+    # silently truncate. That is why this table exists.
+    #
+    # Names are the Avro primitive and complex type names from the Avro 1.12
+    # specification (null/boolean/int/long/float/double/bytes/string, plus
+    # record/enum/array/map/fixed). Where Avro offers no single right answer
+    # the choice follows what the consumer ecosystem actually reads: the
+    # concrete reference is datacontract-cli's ODCS→Avro exporter
+    # (datacontract/export/avro_exporter.py::to_avro_type), which special-cases
+    # exactly these physicalType spellings — ``long``/``bigint`` → Avro long,
+    # ``float``/``double`` → themselves, ``decimal`` → bytes carrying the
+    # ``decimal`` logical type, ``map`` → an Avro map, ``timestamp_ntz`` →
+    # long + ``local-timestamp-millis`` — and otherwise falls back to the ODCS
+    # logicalType. Every entry below is chosen so that fallback also lands on
+    # the right Avro type, never on a narrower one.
+    ("kafka", "confluent"): {
+        # string family — Avro ``string`` is the only text primitive; it has no
+        # length, so varchar(255) loses nothing that Avro could have carried.
+        # ``uuid`` and ``enum`` have Avro annotations (a ``uuid`` logical type
+        # on string, and the ``enum`` complex type), but both need data FLUID's
+        # column type does not carry — an enum needs its ``symbols`` list, and
+        # an Avro enum without symbols is invalid — so they stay ``string``.
+        "string": "string",
+        "text": "string",
+        "varchar": "string",
+        "varchar2": "string",
+        "nvarchar": "string",
+        "char": "string",
+        "nchar": "string",
+        "character": "string",
+        "clob": "string",
+        "uuid": "string",
+        "uniqueidentifier": "string",
+        "guid": "string",
+        "enum": "string",
+        # binary family — Avro's ``bytes``. Note the ODCS logicalType for these
+        # is ``string`` (ODCS has no binary logicalType), so a consumer that
+        # ignores physicalType still gets ``string``; this is the one family
+        # where the physicalType is the *only* place the truth is written.
+        "binary": "bytes",
+        "varbinary": "bytes",
+        "bytes": "bytes",
+        "blob": "bytes",
+        "bytea": "bytes",
+        "raw": "bytes",
+        "hll": "bytes",
+        # interval — Avro's ``duration`` is a fixed(12) of three little-endian
+        # uint32s that almost nothing in the Kafka ecosystem reads or writes.
+        # An ISO-8601 interval string is what actually ships on topics.
+        "interval": "string",
+        # geospatial family — Avro has no geo type; these serialize as WKT or
+        # GeoJSON text, matching the ``string`` logicalType above.
+        "geography": "string",
+        "geometry": "string",
+        "geom": "string",
+        "point": "string",
+        # integer family, split by width — this split is the whole point of the
+        # table. Avro has no 8- or 16-bit integer, so the narrow types widen to
+        # ``int``; anything 64-bit must say ``long`` or the data is truncated.
+        # ``int2``/``int4``/``int8`` are Postgres spellings, where the number
+        # is bytes, not bits: int8 is bigint.
+        "int": "int",
+        "integer": "int",
+        "int2": "int",
+        "int4": "int",
+        "int16": "int",
+        "int32": "int",
+        "tinyint": "int",
+        "smallint": "int",
+        "mediumint": "int",
+        "serial": "int",
+        "year": "int",
+        "int8": "long",
+        "int64": "long",
+        "bigint": "long",
+        "long": "long",
+        "longint": "long",
+        "bigserial": "long",
+        # number family — ``float`` is Avro's 32-bit float and ``double`` its
+        # 64-bit one, so the same width discipline as the integers applies.
+        "float": "float",
+        "float4": "float",
+        "float32": "float",
+        "real": "float",
+        "double": "double",
+        "float8": "double",
+        "float64": "double",
+        # fixed-point — Avro models a decimal as ``bytes`` annotated with the
+        # ``decimal`` logical type plus ``precision`` and ``scale``. The
+        # annotation cannot live in a physicalType string, so the spelling here
+        # is the bare word ``decimal``, which is the token datacontract-cli
+        # matches to emit {"type": "bytes", "logicalType": "decimal"}; the
+        # precision and scale ride in ``customProperties``, where that exporter
+        # reads them — see :func:`physical_type_custom_properties`.
+        "decimal": "decimal",
+        "dec": "decimal",
+        "numeric": "decimal",
+        "number": "decimal",
+        "bignumeric": "decimal",
+        "money": "decimal",
+        # boolean family
+        "bool": "boolean",
+        "boolean": "boolean",
+        "bit": "boolean",
+        # temporal family — every Avro timestamp is a ``long`` under a logical
+        # type, and ``date`` is an ``int`` under one. Naming the Avro primitive
+        # here would throw the logical type away (physicalType ``long`` reads
+        # as a plain count of milliseconds with no timestamp-ness), so these
+        # keep the self-describing SQL word, which both leaves the ODCS
+        # logicalType in charge — date → int+date, timestamp → long+
+        # timestamp-millis — and tells a human which one it is.
+        "date": "date",
+        "time": "time",
+        "timestamp": "timestamp",
+        "timestamptz": "timestamp",
+        "timestamp_tz": "timestamp",
+        "timestamp_ltz": "timestamp",
+        # zone-less wall-clock types. ``timestamp_ntz`` is the one spelling
+        # datacontract-cli maps to Avro ``local-timestamp-millis``, which is
+        # exactly what a timestamp without a zone means; the plain
+        # ``timestamp`` above would claim a UTC instant instead.
+        "datetime": "timestamp_ntz",
+        "datetime2": "timestamp_ntz",
+        "smalldatetime": "timestamp_ntz",
+        "timestamp_ntz": "timestamp_ntz",
+        "timestampntz": "timestamp_ntz",
+        # structured / semi-structured. A JSON-ish column arrives on a topic as
+        # JSON text, so ``string`` is the honest wire shape. (Its ODCS
+        # logicalType is ``object``, and a consumer keying off that will build
+        # an Avro record instead — FLUID's column type carries no sub-fields to
+        # put in one, which is a known limitation of a flat column list, not
+        # something a different physicalType could fix.)
+        "json": "string",
+        "jsonb": "string",
+        "variant": "string",
+        "super": "string",
+        "object": "record",
+        "struct": "record",
+        "record": "record",
+        "row": "record",
+        "map": "map",
+        "array": "array",
+    },
 }
+
+
+# Avro type names are not parameterized: there is no ``long(18)`` and no
+# ``string(255)``. For these providers the parameter suffix is dropped from the
+# physical name rather than re-attached; a decimal's precision and scale are
+# carried by :func:`physical_type_custom_properties` instead, so nothing is
+# lost.
+_UNPARAMETERIZED_PHYSICAL_PROVIDERS: frozenset = frozenset({("kafka", "confluent")})
+
+# The physical-type spelling that means "Avro decimal" in the table above.
+_AVRO_DECIMAL = "decimal"
 
 
 def fluid_to_physical(fluid_type: str, provider: Optional[str]) -> Optional[str]:
@@ -472,8 +636,10 @@ def fluid_to_physical(fluid_type: str, provider: Optional[str]) -> Optional[str]
 
     Any parameter suffix the FLUID type carries is re-attached to the physical
     name, so ``decimal(18,4)`` on Snowflake renders ``DECIMAL(18,4)`` — the
-    same thing the IaC compiler puts in the CREATE TABLE. Falls back to the
-    logicalType when the provider is unknown.
+    same thing the IaC compiler puts in the CREATE TABLE. Providers whose
+    physical names are Avro type names take no parameters at all
+    (``_UNPARAMETERIZED_PHYSICAL_PROVIDERS``). Falls back to the logicalType
+    when the provider is unknown.
     """
     base, params = split_parameterized(fluid_type)
     if not provider:
@@ -484,8 +650,55 @@ def fluid_to_physical(fluid_type: str, provider: Optional[str]) -> Optional[str]
             physical = table.get(base)
             if physical is None:
                 return None
-            return f"{physical}({','.join(params)})" if params else physical
+            if not params or keys in _UNPARAMETERIZED_PHYSICAL_PROVIDERS:
+                return physical
+            return f"{physical}({','.join(params)})"
     return fluid_to_logical(fluid_type)
+
+
+def physical_type_custom_properties(
+    fluid_type: str, provider: Optional[str]
+) -> List[Dict[str, Any]]:
+    """ODCS ``customProperties`` a physical type needs to stay lossless.
+
+    Only the Avro-named providers (Kafka / Confluent) need this today, and only
+    for a decimal. Avro models a decimal as ``bytes`` annotated with the
+    ``decimal`` logical type plus ``precision`` and ``scale``, and ODCS has
+    nowhere else to put those two numbers: the ``number`` branch of
+    ``logicalTypeOptions`` is ``additionalProperties: false`` with no
+    precision/scale slot, and a parameterized ``decimal(18,4)`` physicalType
+    stops being the token an Avro-deriving consumer recognises. So they go in
+    ``customProperties``, which is exactly where datacontract-cli's Avro
+    exporter looks for them (``_get_config_value`` over ``customProperties``,
+    matching ``property`` against ``precision``/``scale``).
+
+    Returns ``[]`` whenever there is nothing to add, so callers can emit the
+    key only when it has content.
+    """
+    if not provider:
+        return []
+    base, params = split_parameterized(fluid_type)
+    prov = provider.lower()
+    for keys, table in _PHYSICAL_BY_PROVIDER.items():
+        if prov not in keys or keys not in _UNPARAMETERIZED_PHYSICAL_PROVIDERS:
+            continue
+        if table.get(base) != _AVRO_DECIMAL:
+            return []
+        # Avro requires ``precision`` and treats ``scale`` as optional
+        # (defaulting to 0), so a bare ``decimal(18)`` emits precision alone.
+        # ``strict=False`` is the point: the two tuples are deliberately
+        # different lengths. A third parameter would not be a decimal, so bail
+        # rather than invent a meaning for it.
+        names = ("precision", "scale")
+        if len(params) > len(names):
+            return []
+        out: List[Dict[str, Any]] = []
+        for name, value in zip(names, params, strict=False):
+            if not value.isdigit():
+                return []
+            out.append({"property": name, "value": int(value)})
+        return out
+    return []
 
 
 # ODCS server.type ↔ FLUID provider

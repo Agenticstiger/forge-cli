@@ -29,7 +29,9 @@ Field-level extras (``physicalType``, ``physicalName``, ``businessName``,
 ``examples``, ``encryptedName``, ``criticalDataElement``, ``authoritativeDefinitions``,
 ``customProperties``) flow through ``field.odcs_passthrough.*``.
 
-Per-property ``quality[]`` is delegated to :mod:`.quality`.
+Per-property ``quality[]`` is delegated to :mod:`.quality`, and is suppressed
+along with every other quality surface when the provider's
+``include_quality_checks`` is off.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ from .types import (
     fluid_to_physical,
     fluid_type_from_odcs,
     logical_type_options,
+    physical_type_custom_properties,
     physical_type_to_platform,
 )
 
@@ -209,10 +212,12 @@ def to_odcs(ctx: ExportCtx) -> None:
 
     Always emits an array — required by the ODCS v3.1.0 schema.
     """
-    ctx.odcs["schema"] = list(_extract_schema(ctx.fluid))
+    ctx.odcs["schema"] = list(
+        _extract_schema(ctx.fluid, include_quality=ctx.options.get("include_quality_checks", True))
+    )
 
 
-def _extract_schema(fluid: Mapping[str, Any]) -> List[Dict[str, Any]]:
+def _extract_schema(fluid: Mapping[str, Any], include_quality: bool = True) -> List[Dict[str, Any]]:
     odcs_schema: List[Dict[str, Any]] = []
     for expose in fluid.get("exposes") or []:
         if not isinstance(expose, Mapping):
@@ -236,7 +241,7 @@ def _extract_schema(fluid: Mapping[str, Any]) -> List[Dict[str, Any]]:
         for fld in contract_schema:
             if not isinstance(fld, Mapping):
                 continue
-            properties.append(_field_to_property(fld, provider))
+            properties.append(_field_to_property(fld, provider, include_quality))
         if not properties:
             continue
 
@@ -310,7 +315,9 @@ def _binding_object_name(expose: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-def _field_to_property(fld: Mapping[str, Any], provider: Optional[str]) -> Dict[str, Any]:
+def _field_to_property(
+    fld: Mapping[str, Any], provider: Optional[str], include_quality: bool = True
+) -> Dict[str, Any]:
     prop: Dict[str, Any] = {
         "name": fld.get("name", "unknown"),
         "logicalType": fluid_to_logical(fld.get("type", "string")),
@@ -329,6 +336,16 @@ def _field_to_property(fld: Mapping[str, Any], provider: Optional[str]) -> Dict[
         phys = fluid_to_physical(fld.get("type", "string"), provider)
         if phys:
             prop["physicalType"] = phys
+        # A physical type whose name cannot carry its own parameters needs them
+        # somewhere: an Avro decimal is ``bytes`` + logicalType ``decimal`` +
+        # precision + scale, and physicalType is a bare string. Only written on
+        # a fresh export — an imported field reproduces the source document's
+        # own ``customProperties`` verbatim through the pass-through loop below,
+        # which must stay the round-trip fixed point.
+        if "custom_properties" not in pt:
+            custom = physical_type_custom_properties(fld.get("type", "string"), provider)
+            if custom:
+                prop["customProperties"] = custom
 
     # logicalTypeOptions: ODCS keeps the type *parameters* here because
     # logicalType is a nine-value enum with nowhere to put precision/scale/
@@ -367,11 +384,20 @@ def _field_to_property(fld: Mapping[str, Any], provider: Optional[str]) -> Dict[
 
     # Property-level quality: delegated to mappers.quality.to_odcs_property
     # which reads field.quality and synthesises auto-checks when needed.
-    from . import quality as quality_mapper  # local import to avoid cycle
+    #
+    # ``include_quality`` is the provider's ``include_quality_checks``
+    # (ODCS_INCLUDE_QUALITY / ``fluid generate standard --no-quality``), threaded
+    # down from ``to_odcs`` the same way ``provider`` is. The call used to be
+    # unconditional, so the switch suppressed only the contract-level block and
+    # the declared-quality pass in the quality mapper: a user who turned quality
+    # off still got a derived not-null rule on every required column and a
+    # uniqueness rule on every primary key. Off now means off everywhere.
+    if include_quality:
+        from . import quality as quality_mapper  # local import to avoid cycle
 
-    qchecks = quality_mapper.to_odcs_property(fld)
-    if qchecks:
-        prop["quality"] = qchecks
+        qchecks = quality_mapper.to_odcs_property(fld)
+        if qchecks:
+            prop["quality"] = qchecks
 
     # Pass-through extras (excluding physical_type which was applied above)
     for src, dst in (
