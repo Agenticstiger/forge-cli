@@ -262,10 +262,12 @@ def _export_odcs(contract_path: str, env, out: str, logger: logging.Logger) -> i
     """
     import yaml as _yaml
 
-    from fluid_build.loader import load_contract
     from fluid_build.providers.odcs.provider import OdcsProvider
 
-    c = resolve_for_export(load_contract(contract_path))
+    # ``--env`` is accepted by this command, so it has to be applied here too.
+    # Loading without the overlay exported the base contract and said nothing,
+    # so `--env prod` silently produced the dev topic / database.
+    c = resolve_for_export(load_contract_with_overlay(contract_path, env, logger))
     provider = OdcsProvider()
     results = provider.render_all_ports(c)  # [(expose_id, odcs_doc), ...]
 
@@ -326,22 +328,27 @@ def _export_odps_bitol(contract_path: str, env, out: str, logger: logging.Logger
     through ``artifact_fanout._emit_odps_bitol``.
     """
     try:
-        from fluid_build.loader import load_contract
         from fluid_build.providers.odps_standard import BitolOdpsProvider
 
-        c = resolve_for_export(load_contract(contract_path))
+        # Same as ODCS above: ``--env`` has to reach the loader or the overlay
+        # is accepted and ignored.
+        c = resolve_for_export(load_contract_with_overlay(contract_path, env, logger))
         provider = BitolOdpsProvider()
         provider.strict_validation = False  # bare-product flow shouldn't enforce sibling validation
         bundle = provider.render(c)
         product = bundle["product"]
 
-        os.makedirs(os.path.dirname(out), exist_ok=True)
+        # ``os.path.dirname`` is "" for a bare file name like ``-o out.yaml``,
+        # and ``makedirs("")`` raises FileNotFoundError.
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         import yaml as _yaml
 
         with open(out, "w", encoding="utf-8") as f:
             _yaml.safe_dump(product, f, default_flow_style=False)
         info(logger, "generate_standard_odps_bitol_ok", out=out)
-        cprint(f"✓ Wrote 1 Bitol ODPS v1.0.0 doc to {out}")
+        # Print the apiVersion actually written: ODPS_API_VERSION=v1.1.0 emits
+        # a v1.1.0 document, and announcing v1.0.0 for it is simply wrong.
+        cprint(f"✓ Wrote 1 Bitol ODPS {product.get('apiVersion', 'v1.0.0')} doc to {out}")
         return 0
     except ImportError:
         # Fallback
