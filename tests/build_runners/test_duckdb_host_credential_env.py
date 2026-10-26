@@ -66,16 +66,19 @@ def test_the_window_hides_and_restores(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_the_window_restores_when_the_attach_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed attach must not leave the operator's environment stripped."""
     monkeypatch.setenv("PGPASSWORD", SENTINEL)
-    # Written as try/except/else rather than nested `pytest.raises`: CodeQL reads
-    # the inner `raise` as making the rest of the block unreachable, and the
-    # explicit form says the same thing without the warning.
+    # A flag rather than `else:` or a nested `pytest.raises`. Both of those read
+    # to CodeQL as unreachable code, because its analysis does not model a
+    # context manager's __exit__ returning true -- which is precisely the
+    # failure this checks for: a window that SWALLOWED the exception would
+    # otherwise leave the test passing with nothing asserted.
+    propagated = False
     try:
         with host_credential_env_suppressed():
             raise RuntimeError("attach failed")
     except RuntimeError as exc:
+        propagated = True
         assert "attach failed" in str(exc)
-    else:  # pragma: no cover - the raise above always fires
-        pytest.fail("the window swallowed the exception")
+    assert propagated, "the window swallowed the exception instead of re-raising"
     assert os.environ["PGPASSWORD"] == SENTINEL
 
 
