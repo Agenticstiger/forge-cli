@@ -34,7 +34,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-from fluid_build.cli.discover.emitter import canonical_column_type
+from fluid_build.cli.discover.emitter import canonical_column_type, emit_contract
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCHEMAS = REPO_ROOT / "fluid_build" / "schemas"
@@ -56,9 +56,7 @@ def _emitted_version() -> str:
     `fluid validate` reads `fluidVersion` out of the emitted contract, and the
     emitter writes an older one than the newest bundled.
     """
-    import fluid_build.cli.discover.emitter as emitter
-
-    contract = emitter.emit_contract(
+    contract = emit_contract(
         product_id="p",
         name="p",
         domain="d",
@@ -243,7 +241,6 @@ def test_every_bundled_schema_accepts_what_the_emitter_writes() -> None:
 
 def test_the_emitter_actually_applies_the_canonicalisation() -> None:
     """Pins the WIRING. The discover tests pass with the call site reverted."""
-    import fluid_build.cli.discover.emitter as emitter
     from fluid_build.cli.discover.registry import DiscoveredColumn, DiscoveredStream
 
     stream = DiscoveredStream(
@@ -254,7 +251,7 @@ def test_the_emitter_actually_applies_the_canonicalisation() -> None:
             DiscoveredColumn(name="tags", type="INTEGER[]"),
         ],
     )
-    contract = emitter.emit_contract(
+    contract = emit_contract(
         product_id="p",
         name="p",
         domain="d",
