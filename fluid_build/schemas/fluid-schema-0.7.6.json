@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://open-data-protocol.github.io/fluid/schema/fluid-schema-0.7.6.json",
   "title": "FLUID 0.7.6 — Declarative Packaging Modes (preview)",
-  "description": "FLUID contract schema 0.7.6 — the current PREVIEW version, opened when 0.7.5 was promoted to stable.\n\n🔥 NEW in v0.7.6:\n• Declarative packaging modes — a top-level `packaging` block (plus a per-exposure `binding.packaging` override) declares per-container ownership for the IaC emit: `isolated` (this product creates and owns the container) vs `shared` (a pre-existing, platform-owned pool referenced via an OpenTofu data source), with a per-kind `containers` override map for hybrid tiers and a `pool` id for tenancy/cost attribution (RFC-packaging-modes.md).\n• Backward compatible with v0.7.5 — every 0.7.5 contract validates as 0.7.6 unchanged; an ABSENT packaging block keeps the legacy byte-identical emit.",
+  "description": "FLUID contract schema 0.7.6 — the current PREVIEW version, opened when 0.7.5 was promoted to stable.\n\n🔥 NEW in v0.7.6:\n• Declarative packaging modes — a top-level `packaging` block (plus a per-exposure `binding.packaging` override) declares per-container ownership for the IaC emit: `isolated` (this product creates and owns the container) vs `shared` (a pre-existing, platform-owned pool referenced via an OpenTofu data source), with a per-kind `containers` override map for hybrid tiers and a `pool` id for tenancy/cost attribution (RFC-packaging-modes.md).\n• Optional Bitol-shaped fields the exporters already wanted, each one opt-in: `metadata.team` (a roster — name plus members, every member a `$defs.teamMember` whose only required field is `username`), the root `description` as `{purpose, usage, limitations}` as well as a plain string, `consumes[].contractId` (an upstream that has a contract id of its own), `exposes[].contract.id` (used verbatim as the ODCS `id` and the ODPS output port `contractId` instead of the derived `<product id>.<exposeId>`; two exposes may not share one) and `binding.location.host` plus `binding.serialization.{value, key}` for Kafka. A contract that sets none of them validates and exports exactly as it does today.\n• `exposes[].contract.schema[].quality` — column-level data quality rules in ODCS's own shape. The ODCS exporter always replayed this key verbatim and read it back on import, but `$defs.column` is closed and did not define it, so the one way to publish a hand-written column rule was to write a contract `fluid validate` refuses. Optional: a column without it exports exactly as it does today.\n• Backward compatible with v0.7.5 — every 0.7.5 contract validates as 0.7.6 unchanged; an ABSENT packaging block keeps the legacy byte-identical emit.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -128,7 +128,16 @@
       "minLength": 1
     },
     "description": {
-      "type": "string"
+      "description": "NEW in v0.7.6: Either a plain string — unchanged meaning, it becomes `purpose` on export — or the structured object. While this was a string, an export of a valid contract could only ever carry `description.purpose`: `usage` and `limitations` had no home a contract could declare, so every ODCS and ODPS export left them empty.",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Prose description. Exported as `description.purpose`."
+        },
+        {
+          "$ref": "#/$defs/descriptionObject"
+        }
+      ]
     },
     "domain": {
       "type": "string",
@@ -231,6 +240,24 @@
             "oncall": {
               "type": "string",
               "description": "Oncall rotation or contact for operational issues."
+            }
+          }
+        },
+        "team": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "NEW in v0.7.6: The team behind this product, as a roster rather than a single contact. `metadata.owner` holds one team name and one mailbox and carries no role, so a product with a data owner, a steward and two engineers had nowhere to say so and the exported ODCS/ODPS team block came out empty. The field names are Bitol's, so an imported team round-trips without a translation. Optional: a contract without it exports exactly as it does today.",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Team name, e.g. 'Sales Analytics'."
+            },
+            "members": {
+              "type": "array",
+              "description": "The people on the team, each with the role they hold on this product.",
+              "items": {
+                "$ref": "#/$defs/teamMember"
+              }
             }
           }
         },
@@ -349,6 +376,51 @@
     }
   },
   "$defs": {
+    "descriptionObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.6: The structured form of the root `description`. The three field names are Bitol's — ODPS v1.1.0 `$defs.Description` and the ODCS v3.1.0 root `description` both use exactly purpose/usage/limitations — so import and export are a pass-through rather than a translation.",
+      "properties": {
+        "purpose": {
+          "type": "string",
+          "description": "What this data product is for."
+        },
+        "usage": {
+          "type": "string",
+          "description": "How a consumer is expected to use it."
+        },
+        "limitations": {
+          "type": "string",
+          "description": "What it must not be used for, and what it does not cover."
+        }
+      }
+    },
+    "teamMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.6: One member of `metadata.team.members`. The field names and the username-only required list are Bitol's ODCS v3.1.0 / ODPS v1.1.0 `$defs.TeamMember`, copied verbatim so an imported team exports back unchanged.",
+      "required": [
+        "username"
+      ],
+      "properties": {
+        "username": {
+          "type": "string",
+          "description": "The member's identifier in the organisation's directory — the one field Bitol requires."
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name."
+        },
+        "role": {
+          "type": "string",
+          "description": "The role this member holds on this product, e.g. 'owner', 'steward', 'data engineer'. Free-form: Bitol does not constrain it."
+        },
+        "email": {
+          "type": "string",
+          "format": "email"
+        }
+      }
+    },
     "packaging": {
       "type": "object",
       "additionalProperties": false,
@@ -729,6 +801,11 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "id": {
+          "type": "string",
+          "description": "NEW in v0.7.6: An explicit, stable contract id, used verbatim as the ODCS `id` and as the ODPS output port `contractId`. Without it the id is derived as `<product id>.<exposeId>`, so renaming the product or the expose silently changes the contract id and breaks every consumer reference to it, and a catalog that requires an id format of its own (a UUID, say) cannot be served at all. Each expose needs its own: two exposes sharing one id is refused by `fluid validate`.",
+          "minLength": 1
+        },
         "schemaSignature": {
           "type": "string",
           "pattern": "^sha256:[0-9a-fA-F]{64}$",
@@ -994,6 +1071,81 @@
               },
               "message": {
                 "type": "string"
+              }
+            }
+          }
+        },
+        "quality": {
+          "type": "array",
+          "description": "NEW in v0.7.6: Column-level data quality rules, in ODCS's own shape — the array that is written straight into `schema[].properties[].quality[]` of the exported ODCS v3.1.0 contract, and the array an imported ODCS column's rules are read back into. The ODCS exporter has always replayed this key verbatim and always read it back on import, but `$defs.column` is `additionalProperties: false` and did not define it, so a column written the way the exporter supports was REFUSED by `fluid validate`: the only way to get a hand-written quality rule into a published contract was to write an invalid contract. Optional and additive — a column without it exports exactly as it does today, with the rules forge derives from `required`, the primary-key tag and `validationRules`. Setting it REPLACES those derived rules for that column rather than adding to them, which is what makes an imported ODCS column round-trip byte-for-byte. The authority for an item's contents is ODCS v3.1.0 `$defs.DataQuality`, deliberately not re-declared here (a copy would drift from the vendored schema, and `fluid generate odcs --validate` already checks the emitted document against it); the keys below are the common ones. Every rule should carry an `id`: it is optional in ODCS, but a DQ engine that labels its results by rule id rejects a contract whose rules have none.",
+          "items": {
+            "type": "object",
+            "minProperties": 1,
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "description": "Stable rule identifier, unique within this column's rules. The pattern is ODCS `$defs.StableId`. Rules forge derives itself are named `<column>-<metric>`."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text",
+                  "library",
+                  "sql",
+                  "custom"
+                ],
+                "description": "ODCS quality check type. text = prose; library = one of ODCS's predefined metrics; sql = a query whose result is compared; custom = a named engine's own check."
+              },
+              "metric": {
+                "type": "string",
+                "enum": [
+                  "nullValues",
+                  "missingValues",
+                  "invalidValues",
+                  "duplicateValues",
+                  "rowCount"
+                ],
+                "description": "type: library only. The five predefined metrics ODCS v3.1.0 defines; a name outside this list is not a library rule."
+              },
+              "arguments": {
+                "type": "object",
+                "description": "type: library only. Extra arguments for the metric — `pattern` (a regex) or `validValues` (a list) for invalidValues, as DataHub's ODCS ingestion source reads them."
+              },
+              "query": {
+                "type": "string",
+                "description": "type: sql only. The query whose result the comparison operator is applied to."
+              },
+              "engine": {
+                "type": "string",
+                "description": "type: custom only. The engine that runs the check, e.g. soda, great-expectations, dbt."
+              },
+              "implementation": {
+                "description": "type: custom only. The check as that engine expresses it."
+              },
+              "dimension": {
+                "type": "string",
+                "enum": [
+                  "accuracy",
+                  "completeness",
+                  "conformity",
+                  "consistency",
+                  "coverage",
+                  "timeliness",
+                  "uniqueness"
+                ],
+                "description": "The data quality dimension the rule measures."
+              },
+              "description": {
+                "type": "string"
+              },
+              "severity": {
+                "type": "string",
+                "description": "Severity of a failure. ODCS types this as a free string and documents info / warning / error by example."
+              },
+              "unit": {
+                "type": "string",
+                "description": "Unit the comparison is in, usually rows (the default) or percent."
               }
             }
           }
@@ -1754,6 +1906,37 @@
               }
             ]
           }
+        },
+        "serialization": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "NEW in v0.7.6: How message VALUES (and keys) are serialized on the wire. A Kafka binding today declares only `format: kafka_topic`, which tells a consumer nothing about whether the values are Avro or JSON — the one thing it has to know to read the topic at all. The first four values are the message formats ODCS v3.1.0 documents for its own Kafka server `format` field; the two `-confluent` values name those same wire formats carried through a Confluent schema registry, spelled as Apache Flink spells them.",
+          "properties": {
+            "value": {
+              "type": "string",
+              "enum": [
+                "json",
+                "avro",
+                "protobuf",
+                "xml",
+                "avro-confluent",
+                "json-confluent"
+              ],
+              "description": "How message values are serialized."
+            },
+            "key": {
+              "type": "string",
+              "enum": [
+                "json",
+                "avro",
+                "protobuf",
+                "xml",
+                "avro-confluent",
+                "json-confluent"
+              ],
+              "description": "How message keys are serialized, for a topic whose keys are not opaque bytes."
+            }
+          }
         }
       },
       "allOf": [
@@ -1883,6 +2066,10 @@
         "gateway": {
           "type": "string",
           "description": "API gateway endpoint"
+        },
+        "host": {
+          "type": "string",
+          "description": "NEW in v0.7.6: Host or endpoint; for a Kafka binding, the bootstrap servers. The ODCS server mapper already reads `host` and falls back to `account`, so until now the only valid way to set the bootstrap servers was a field named for something else — and with neither set, the exported ODCS server is the placeholder `${KAFKA_BOOTSTRAP_SERVERS}`. Usually set per environment in an overlay rather than in the base contract."
         },
         "baseUrl": {
           "type": "string",
@@ -2772,6 +2959,10 @@
         "exposeId": {
           "$ref": "#/$defs/identifier",
           "description": "The upstream exposeId being consumed."
+        },
+        "contractId": {
+          "type": "string",
+          "description": "NEW in v0.7.6: The upstream contract's OWN id, for an upstream that has one of its own — a product not built with FLUID, registered in a catalog under an id FLUID did not derive. The canonical-port builder already prefers an explicit contractId over the derived `<productId>.<exposeId>`; until now `consumes[]` was closed, so there was no way to supply it and the derived id was exported as if the upstream answered to it."
         },
         "versionConstraint": {
           "$ref": "#/$defs/semverRange"

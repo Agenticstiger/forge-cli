@@ -760,6 +760,17 @@ def _run_contract_rules(
             if args.verbose:
                 info(logger, f"Metadata consistency check skipped: {exc}")
 
+        # --- One contract id per expose (0.7.6) --------------------------
+        # ``exposes[].contract.id`` is exported verbatim as the ODCS ``id``
+        # and the ODPS output port ``contractId``, so two exposes claiming
+        # one id publish two different contracts under a single identity.
+        # JSON Schema cannot express uniqueness across a nested key, which
+        # is why this is a code check. Resolved through module-self so the
+        # test seam on the helper keeps working.
+        for msg in _self._duplicate_contract_id_errors(contract):
+            validation_result.add_error(msg)
+            validation_result.is_valid = False
+
         # --- Iceberg streaming-sink checks (RFC-streaming-extension §6.8) --
         # Catch the connector's silent-fail-at-first-record traps at validate
         # time: a sink with no Iceberg expose, the v1-deferred upsert mode,
@@ -997,6 +1008,47 @@ def _run_contract_rules(
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Composition rule check skipped: {exc}")
+
+
+def _duplicate_contract_id_errors(contract: Mapping[str, Any]) -> List[str]:
+    """Refuse two exposes that claim the same ``exposes[].contract.id``.
+
+    That id (0.7.6, optional) is used verbatim as the ODCS ``id`` and as the
+    ODPS output port ``contractId`` instead of the ``<product id>.<exposeId>``
+    the exporters derive. Derived ids are unique by construction; explicit
+    ones are not, and two exposes sharing one publish two different contracts
+    under a single identity — whichever a consumer resolves last wins and the
+    other output port is unreachable. ``uniqueItems`` compares whole array
+    items, so JSON Schema cannot express uniqueness across a nested key; the
+    rule has to live in code. Shapes the schema would have rejected (a
+    non-string id, a non-object expose) are skipped rather than reported
+    twice.
+    """
+    claimed_by: Dict[str, str] = {}
+    errors: List[str] = []
+    exposes = contract.get("exposes")
+    if not isinstance(exposes, list):
+        return errors
+    for index, expose in enumerate(exposes):
+        if not isinstance(expose, Mapping):
+            continue
+        expose_contract = expose.get("contract")
+        if not isinstance(expose_contract, Mapping):
+            continue
+        contract_id = expose_contract.get("id")
+        if not isinstance(contract_id, str) or not contract_id:
+            continue
+        expose_id = expose.get("exposeId")
+        label = expose_id if isinstance(expose_id, str) and expose_id else f"exposes[{index}]"
+        first = claimed_by.get(contract_id)
+        if first is None:
+            claimed_by[contract_id] = label
+            continue
+        errors.append(
+            f"contract id {contract_id!r} is used by exposes {first!r} and {label!r}"
+            " — give each expose its own contract.id"
+        )
+    return errors
 
 
 def _validate_with_version_fallback(
