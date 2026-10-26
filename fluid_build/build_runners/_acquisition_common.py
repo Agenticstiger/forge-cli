@@ -40,6 +40,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from fluid_build.build_runners._secret_policy import (
+    connection_host,
+    refuse_unless_allowed,
+    register_resolved,
+)
+
 LOG = logging.getLogger("fluid.build_runners.acquisition")
 
 # Strips ANSI CSI sequences and ASCII control chars from error strings
@@ -525,7 +531,19 @@ def resolve_connection_secrets(
     secret_ref = out.pop("secretRef", None)
     if not secret_ref:
         return out
+    # The policy runs BEFORE the reference is resolved, so a refused send never
+    # reads the secret. This is the one place that sees both halves the contract
+    # chose -- the variable and the destination -- which is why the check lives
+    # here and all six acquisition runners inherit it.
+    scheme = str(secret_ref).partition("://")[0].strip().lower()
+    if scheme == "env":
+        variable = str(secret_ref).partition("://")[2].strip()
+        refuse_unless_allowed(variable, host=connection_host(out), scheme="env")
     value = resolve_secret_ref(secret_ref)
+    # #884: the literal can be echoed by a client library's own error, which the
+    # runners print. Registering it means the redactor masks it by value rather
+    # than hoping a pattern recognises its shape.
+    register_resolved(value)
     if not out.get(target_field):
         out[target_field] = value
     return out

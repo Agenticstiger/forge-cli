@@ -26,6 +26,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared DSN still carries its own credentials, so a legitimate source is unaffected and no
   contract change is needed.
 
+- **A contract could send any environment variable to a host of its own choosing.**
+  `connection.secretRef: env://NAME` let the contract name both halves — the variable to read and
+  the host the resolved value is sent to as a password — and nothing checked either. A run whose
+  environment holds secrets (CI, an operator's shell) could therefore have any variable
+  exfiltrated. All six acquisition runners (airbyte, debezium, dlt, duckdb, kafka_connect,
+  meltano) go through one helper, so all six were affected.
+  `env://` now resolves only when **every** destination the connection block carries is loopback,
+  or when the operator has listed the variable in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` as
+  `NAME` (any host) or `NAME@host`. Every destination is checked, not just the first field that
+  parses, so a decoy `host: localhost` beside a remote `connection_string` does not clear the
+  send. The check runs **before** the reference is resolved, so a refused send never reads the
+  secret, and the refusal names the variable and host but never the value. `vault://`, `aws://`,
+  `gcp://`, `azure://` and `file://` are not policed: those name a secret the operator provisioned
+  and granted this process access to, which is already an operator decision. A `secretRef` whose
+  target field already holds an inline credential is not policed either — the reference is never
+  read and nothing is sent.
+  The allowlist is an **operator** setting: a value set by one of the project's own dotenv files is
+  ignored, because `fluid apply` hydrates the environment from `.env`, `.env.<env>` and
+  `FLUID_SECRETS_FILE`, and those files are committed beside the contract.
+- **`TESTCONTAINERS_HOST_OVERRIDE` is now an operator-only setting**, as
+  `FLUID_RUNNER_HOST_OVERRIDE` already was. Both rewrite a contract-declared loopback host to a
+  reachable one *after* the policy above has cleared the send as local-only, so a project dotenv
+  file able to set either could have redirected a credential allowed only because it was staying
+  on this machine.
+- Resolved `secretRef` values are registered with the exact-value redactor (#884), so a literal a
+  client library echoes in its own error is masked by value rather than by pattern.
+
+### Known limitations
+
+- **The loopback exemption covers only the engines where this process makes the connection** —
+  dlt, duckdb, meltano, and the `embedded` modes of debezium and airbyte. For kafka_connect and
+  the `bring-your-own` / `managed` modes of debezium and airbyte, forge-cli does not connect to
+  the database at all: it hands the whole connector config, resolved credential included, to the
+  orchestrator named by `properties.<engine>.deployment.server_url`. That URL is contract-chosen
+  and **this policy does not check it**, so a loopback `connection.host` still clears a send whose
+  credential then leaves the machine in an HTTP body. The behaviour is unchanged from before this
+  release — nothing regressed — but it is NOT closed, and `deployment.server_url` has no host
+  allowlist of the kind `FLUID_COMMAND_CENTER_HOST_ALLOWLIST`, `FLUID_FEDERATION_HOST_ALLOWLIST`
+  and `FLUID_WEBHOOK_HOST_ALLOWLIST` already provide elsewhere. Treat an `env://` secretRef on
+  those three paths as unprotected whatever the declared host.
+- A connection whose only destination field is an object-store URI (`s3://`, `gs://`, `az://`,
+  `file://`) is not policed: the authority there is a bucket, not a host, so a host-based policy
+  has nothing to decide.
+- `{{ env.NAME }}` interpolation in a connection field reads the environment without going through
+  `secretRef` at all, so it is not covered by this policy.
+
+### Upgrade notes
+
+- **A contract using `env://` against a remote host now fails until the operator allows it.** Each
+  one is restored with a single operator-environment variable, for example
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST="PG_PASSWORD@db.example.com"` (that host only) or
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST="PG_PASSWORD"` (any host). Set it in the shell, in CI, or
+  in a `FLUID_SECRETS_FILE` outside the project — **not** in a project `.env`, where it is ignored.
+  A host written with a port never matches, so leave the port off. Local development against
+  `localhost`, `127.0.0.0/8` or `::1` needs no configuration. The better long-term answer for a
+  production credential is a secret store: `vault://`, `aws://`, `gcp://`, `azure://` or `file://`.
+- `fluid init --discover` against a remote host emits a contract carrying `env://`, which `fluid
+  apply` will now refuse until that variable is allowlisted. The discover hint does not yet print
+  the allowlist line; the refusal from `apply` does.
+
 
 ### Fixed
 
