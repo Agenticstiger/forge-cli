@@ -268,6 +268,14 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "FLUID_COMMAND_CENTER_HOST_ALLOWLIST",
         "FLUID_FEDERATION_HOST_ALLOWLIST",
         "FLUID_FEDERATION_SECRET_REF_ALLOWLIST",
+        "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST",
+        # Both rewrite a contract-declared loopback host to a reachable one,
+        # AFTER the secretRef policy has cleared the send as local-only
+        # (build_runners/_secret_policy). A project file that could set either
+        # would redirect a credential the policy allowed only because it was
+        # staying on this machine. FLUID_RUNNER_HOST_OVERRIDE was already
+        # listed; the testcontainers name it also honours was not.
+        "TESTCONTAINERS_HOST_OVERRIDE",
         "FLUID_WEBHOOK_HOST_ALLOWLIST",
         "DMM_ALLOW_INSECURE_HTTP",
         "DMM_AUTO_APPROVE_ACCESS",

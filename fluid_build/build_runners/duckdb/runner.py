@@ -58,6 +58,7 @@ from fluid_build.api.runner import (
 )
 from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.source import AcquisitionMode
+from fluid_build.build_runners._secret_policy import AcquisitionSecretPolicyError
 from fluid_build.credentials.host_db_env import host_credential_env_suppressed
 from fluid_build.providers._duckdb_compat import first_row
 from fluid_build.providers._duckdb_sandbox import (
@@ -864,6 +865,11 @@ class DuckdbRunner:
                 # Resolve secretRef → password before the DSN is built; an
                 # inline literal still wins.
                 conn = resolve_connection_secrets(dict(ctx.source.connection.raw))
+            except AcquisitionSecretPolicyError:
+                # A typed user error: let the CLI render its what/why/fix panel
+                # rather than flattening it to a one-line _SourceSetupError,
+                # which drops the allowlist line the operator needs.
+                raise
             except Exception as exc:
                 # An unset variable or an unknown scheme (ValueError), or the
                 # secret backend's own error (ConfigurationError from vault,
