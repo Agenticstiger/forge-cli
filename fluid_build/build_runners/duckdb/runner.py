@@ -1292,7 +1292,7 @@ def _build_quality_predicates(
 
 
 def _apply_incremental_filter(
-    ctx: RunContext, stream: str, base_sel: str
+    ctx: RunContext, stream: str, base_sel: str, con: Any = None
 ) -> Tuple[str, Optional[Any]]:
     """Wrap a base SELECT with an incremental cursor filter.
 
@@ -1328,7 +1328,8 @@ def _apply_incremental_filter(
     # timestamp cursor, which no session time zone can shift, and a plain
     # literal for a scalar one. It quotes through ``quote_ansi_string_literal``,
     # so a tampered state file cannot inject SQL into the WHERE clause.
-    predicate = _cursor_comparison(cursor_field_safe, last_value)
+    column_type = _cursor_column_type(con, base_sel, cursor_field_safe) if con is not None else None
+    predicate = _cursor_comparison(cursor_field_safe, last_value, column_type)
     filtered = f"SELECT * FROM ({base_sel}) WHERE {predicate}"
     return filtered, last_value
 
@@ -1393,29 +1394,53 @@ def _canonical_cursor_text(value: Any) -> str:
     return parsed.astimezone(timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
 
 
-def _cursor_is_timestamp(text: str) -> bool:
-    """Whether canonical cursor text denotes a date or timestamp rather than a scalar.
+#: The column types ``epoch_us`` accepts. Measured on duckdb 1.5.6 and 2.0.0,
+#: identically: every other type -- VARCHAR, INTEGER, DECIMAL, the ``"NULL"``
+#: of an all-null column -- raises BinderException, so the instant comparison
+#: must never be emitted for one.
+_EPOCH_US_TYPES = frozenset(
+    {
+        "TIMESTAMP",
+        "TIMESTAMP WITH TIME ZONE",
+        "TIMESTAMPTZ",
+        "TIMESTAMP_S",
+        "TIMESTAMP_MS",
+        "TIMESTAMP_NS",
+        "TIMESTAMPTZ_NS",
+        "DATE",
+        "TIME",
+    }
+)
 
-    Decided from the VALUE, not by probing the column: the cursor is the stored
-    ``MAX()`` of that column, so its text already tells us which comparison is
-    right, and a probe would cost a query per run. An integer cursor
-    (``'42'``), an opaque key (``'order-000123'``) and anything else that is not
-    an ISO date or timestamp answer ``False`` and keep the plain comparison.
+
+def _cursor_column_type(con: Any, base_sel: str, field_sql: str) -> Optional[str]:
+    """The declared type of the cursor column in ``base_sel``, or ``None``.
+
+    Asked of the source, not guessed from the cursor's text. The value's shape
+    is not enough: a VARCHAR column holding ``'2026-05-01 10:00:00'`` yields a
+    cursor that looks exactly like a timestamp, and ``epoch_us`` on VARCHAR is a
+    BinderException that would fail every incremental run on such a column.
+
+    ``LIMIT 0``, so this costs a bind and no scan. ``None`` when the probe
+    cannot answer -- a source that will not bind here fails informatively on the
+    real query a moment later, so this never raises on its own.
     """
-    # Require the separators. Python 3.11+ parses BASIC ISO too, so a bare
-    # ``20260501`` -- a perfectly ordinary date-as-integer cursor -- would
-    # otherwise take the instant path and ``epoch_us`` would fail on its
-    # INTEGER column.
-    if "-" not in text[:11]:
-        return False
     try:
-        datetime.fromisoformat(text)
-    except ValueError:
-        return False
-    return True
+        rows = con.execute(f"SELECT typeof({field_sql}) FROM ({base_sel}) LIMIT 1").fetchall()
+    except Exception:
+        return None
+    if rows and rows[0] and rows[0][0]:
+        return str(rows[0][0]).strip().upper()
+    # An empty source binds but returns no row: ask DuckDB for the column's
+    # type from the relation's own schema instead.
+    try:
+        described = con.execute(f"DESCRIBE SELECT {field_sql} FROM ({base_sel})").fetchall()
+    except Exception:
+        return None
+    return str(described[0][1]).strip().upper() if described and len(described[0]) > 1 else None
 
 
-def _cursor_comparison(field_sql: str, value: Any) -> str:
+def _cursor_comparison(field_sql: str, value: Any, column_type: Optional[str]) -> str:
     """The incremental ``>`` predicate for one cursor, free of the session time zone.
 
     A plain ``<field> > '<text>'`` is not safe for a timestamp. The literal is
@@ -1432,6 +1457,13 @@ def _cursor_comparison(field_sql: str, value: Any) -> str:
     (measured: the plain literal returns 1 row where 2 are due, on 2.0 at
     UTC-4; this returns 2 on both versions under both zones).
 
+    Only for a column type ``epoch_us`` accepts (:data:`_EPOCH_US_TYPES`).
+    Every other type -- VARCHAR, INTEGER, DECIMAL -- keeps the plain
+    comparison, because ``epoch_us`` raises BinderException on it. The decision
+    is the COLUMN's type, never the cursor text's shape: a VARCHAR column of
+    timestamp-looking strings produces a cursor indistinguishable from a real
+    timestamp's.
+
     Pinning the session zone to UTC would also have worked and is NOT used:
     ``TimeZone`` is an ICU-backed setting, the sandbox forbids autoloading
     extensions, and where ICU is absent DuckDB does not even recognise the
@@ -1442,11 +1474,11 @@ def _cursor_comparison(field_sql: str, value: Any) -> str:
     The cost, accepted deliberately: wrapping the column in a function can stop
     the predicate being pushed into the Parquet or JSON reader, so a large
     source scans more than it would have. Correct rows beat a faster wrong
-    answer, and only a timestamp cursor takes this path.
+    answer, and only a temporal column takes this path.
     """
     text = _canonical_cursor_text(value)
     literal = quote_ansi_string_literal(text)
-    if _cursor_is_timestamp(text):
+    if column_type and column_type.split("(", 1)[0].strip() in _EPOCH_US_TYPES:
         return f"epoch_us({field_sql}) > epoch_us(TIMESTAMP {literal})"
     return f"{field_sql} > {literal}"
 
@@ -1616,7 +1648,7 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 # ``last_cursor_value`` is the value we filtered on (None for
                 # full refresh OR first incremental run); kept for the
                 # ``cursor_advanced`` flag emitted on the StreamResult.
-                sel, last_cursor_value = _apply_incremental_filter(ctx, stream, base_sel)
+                sel, last_cursor_value = _apply_incremental_filter(ctx, stream, base_sel, con)
                 # Build quality-gate predicates. When gates are declared,
                 # we partition the SELECT into a GOOD set (lands in the
                 # destination) and a BAD set (routed to DLQ). ``good_where``

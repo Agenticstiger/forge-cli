@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import itertools
 
+import pytest
+
 from fluid_build.api.schema import SchemaColumn
 from fluid_build.build_runners._schema_evolution import (
     _NUMERIC_ORDER,
@@ -117,3 +119,91 @@ def test_the_rename_is_reported_rather_than_hidden() -> None:
 def test_the_family_check_is_case_and_space_insensitive() -> None:
     assert _event("DOUBLE", "HugeInt") == "none"
     assert _event("timestamp", "  TIMESTAMPTZ  ") == "none"
+
+
+# ── the collapse is allowed, but it is not silent ────────────────────────
+
+
+def test_the_acquisition_gate_logs_a_family_rename(caplog: pytest.LogCaptureFixture) -> None:
+    """Suppressing the FAILURE is intended; suppressing the NOTICE is not.
+
+    ``diff_columns`` emits no event for a family rename, so the drift gate
+    returns early and a contract that declared ``schemaPolicy: strict`` would
+    otherwise hear nothing at all — even though DOUBLE and HUGEINT are not
+    value-identical. Without this wiring ``family_rename_note`` had no
+    production caller, which made the module comment's claim that the change is
+    "reported rather than hidden" untrue.
+    """
+    import logging
+
+    from fluid_build.build_runners._acquisition_common import _log_family_renames
+
+    with caplog.at_level(logging.WARNING):
+        _log_family_renames(
+            [SchemaColumn(name="big", type="double"), SchemaColumn(name="other", type="varchar")],
+            [SchemaColumn(name="big", type="hugeint"), SchemaColumn(name="other", type="varchar")],
+        )
+    messages = [r.message for r in caplog.records]
+    assert "acquisition_schema_family_rename" in messages, messages
+    assert (
+        len([m for m in messages if m == "acquisition_schema_family_rename"]) == 1
+    ), "only the renamed column should be reported, not the unchanged one"
+
+
+def test_the_gate_logs_nothing_when_no_type_changed(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    from fluid_build.build_runners._acquisition_common import _log_family_renames
+
+    with caplog.at_level(logging.WARNING):
+        _log_family_renames(
+            [SchemaColumn(name="a", type="double")],
+            [SchemaColumn(name="a", type="double")],
+        )
+    assert [r.message for r in caplog.records] == []
+
+
+def test_the_rename_reaches_the_operator_through_the_real_gate(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Through ``enforce_schema_policy_or_raise``, not the helper directly.
+
+    This is the test that fails if the call is ever removed from the gate: a
+    direct call to ``_log_family_renames`` passes either way. ``schemaPolicy:
+    strict`` is used deliberately -- that is the contract that would otherwise
+    hear nothing, since the family collapse means the gate returns before it
+    raises.
+    """
+    import logging
+
+    from fluid_build.api.schema import SchemaColumn, SchemaFingerprint
+    from fluid_build.build_runners._acquisition_common import (
+        enforce_schema_policy_or_raise,
+    )
+
+    contract = {
+        "exposes": [
+            {
+                "contract": {
+                    "schema": [{"name": "big", "type": "double"}],
+                    "schemaPolicy": "strict",
+                }
+            }
+        ]
+    }
+
+    class _Ctx:
+        def __init__(self) -> None:
+            self.contract = contract
+
+    class _Runner:
+        def fingerprint(self, _ctx: object) -> SchemaFingerprint:
+            # What a DuckDB 2.0 install now infers for the same source bytes.
+            return SchemaFingerprint.of([SchemaColumn(name="big", type="hugeint")])
+
+    with caplog.at_level(logging.WARNING):
+        enforce_schema_policy_or_raise(_Ctx(), _Runner())
+
+    assert "acquisition_schema_family_rename" in [
+        r.message for r in caplog.records
+    ], "the gate allowed the family rename without telling anyone"

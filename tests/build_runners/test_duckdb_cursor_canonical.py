@@ -52,8 +52,8 @@ import pytest
 from fluid_build.build_runners.duckdb.runner import (
     _apply_incremental_filter,
     _canonical_cursor_text,
+    _cursor_column_type,
     _cursor_comparison,
-    _cursor_is_timestamp,
 )
 
 
@@ -145,44 +145,132 @@ class _Ctx:
 def test_the_emitted_where_clause_compares_instants() -> None:
     """Exercises the wiring, which a direct call to the helpers does not.
 
-    Without this, removing either helper from ``_apply_incremental_filter``
-    leaves every other test in this file passing.
+    Given a real connection, so the column probe answers: without this,
+    removing either helper from ``_apply_incremental_filter`` leaves every
+    other test in this file passing.
     """
-    sql, last = _apply_incremental_filter(
-        _Ctx("2026-05-01 10:00:00-04:00"), "evt", "SELECT * FROM src"
-    )
-    assert "epoch_us(" in sql, f"a timestamp cursor must compare instants: {sql}"
-    assert "'2026-05-01 14:00:00'" in sql, sql
-    assert "-04:00" not in sql, f"the raw offset-bearing cursor reached the SQL: {sql}"
-    # The returned value stays the value that was stored, so a caller that
-    # records it sees what it persisted.
-    assert last == "2026-05-01 10:00:00-04:00"
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    try:
+        base = "SELECT * FROM (VALUES (TIMESTAMP '2026-05-01 20:00:00')) AS t(event_time)"
+        sql, last = _apply_incremental_filter(_Ctx("2026-05-01 10:00:00-04:00"), "evt", base, con)
+        assert "epoch_us(" in sql, f"a timestamp cursor must compare instants: {sql}"
+        assert "'2026-05-01 14:00:00'" in sql, sql
+        assert "-04:00" not in sql, f"the raw offset-bearing cursor reached the SQL: {sql}"
+        # The predicate has to execute, not merely read correctly.
+        assert con.execute(f"SELECT count(*) FROM ({sql})").fetchall() == [(1,)]
+        # The returned value stays the value that was stored, so a caller that
+        # records it sees what it persisted.
+        assert last == "2026-05-01 10:00:00-04:00"
+    finally:
+        con.close()
 
 
 def test_an_integer_cursor_keeps_the_plain_comparison() -> None:
     """``epoch_us`` of an integer column would fail, so a scalar must not take it."""
-    sql, last = _apply_incremental_filter(_Ctx("42"), "evt", "SELECT * FROM src")
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    try:
+        base = "SELECT * FROM (VALUES (41), (43)) AS t(event_time)"
+        sql, last = _apply_incremental_filter(_Ctx("42"), "evt", base, con)
+        assert "epoch_us(" not in sql, sql
+        assert "'42'" in sql, sql
+        assert con.execute(f"SELECT count(*) FROM ({sql})").fetchall() == [(1,)]
+        assert last == "42"
+    finally:
+        con.close()
+
+
+def test_without_a_connection_the_predicate_stays_as_it_was() -> None:
+    """No probe, no instant path: the pre-change comparison, never a broken one."""
+    sql, _ = _apply_incremental_filter(_Ctx("2026-05-01 14:00:00"), "evt", "SELECT * FROM src")
     assert "epoch_us(" not in sql, sql
-    assert "'42'" in sql, sql
-    assert last == "42"
+    assert "'2026-05-01 14:00:00'" in sql, sql
 
 
 @pytest.mark.parametrize(
-    "text, is_ts",
+    "column_type, instant",
     [
-        ("2026-05-01 14:00:00", True),
-        ("2026-05-01T14:00:00", True),
-        ("2026-05-01", True),
-        ("42", False),
-        # Python 3.11+ parses basic ISO, so this must be excluded explicitly:
-        # a date-as-integer cursor lives in an INTEGER column.
-        ("20260501", False),
-        ("20260501T140000", False),
-        ("order-000123", False),
-        ("", False),
+        # epoch_us accepts exactly these, measured identically on 1.5.6 and 2.0.0.
+        ("TIMESTAMP", True),
+        ("TIMESTAMP WITH TIME ZONE", True),
+        ("TIMESTAMPTZ", True),
+        ("TIMESTAMP_MS", True),
+        ("TIMESTAMP_NS", True),
+        ("DATE", True),
+        ("TIME", True),
+        # Everything else raises BinderException under epoch_us, so it must not
+        # be emitted. VARCHAR is the one that matters: a VARCHAR column of
+        # timestamp-looking strings yields a cursor indistinguishable from a
+        # real timestamp's, so deciding from the VALUE would break every
+        # incremental run on such a column.
+        ("VARCHAR", False),
+        ("INTEGER", False),
+        ("BIGINT", False),
+        ("DECIMAL(18,2)", False),
+        ('"NULL"', False),
+        (None, False),
     ],
 )
-def test_only_a_timestamp_cursor_takes_the_instant_path(text: str, is_ts: bool) -> None:
-    assert _cursor_is_timestamp(text) is is_ts
-    predicate = _cursor_comparison("ts", text)
-    assert ("epoch_us(" in predicate) is is_ts, predicate
+def test_only_an_epoch_capable_column_takes_the_instant_path(
+    column_type: object, instant: bool
+) -> None:
+    predicate = _cursor_comparison("ts", "2026-05-01 10:00:00", column_type)
+    assert ("epoch_us(" in predicate) is instant, predicate
+
+
+def test_a_varchar_cursor_column_still_runs_on_real_duckdb() -> None:
+    """The regression the column probe exists for.
+
+    ``epoch_us(VARCHAR)`` is a BinderException on 1.5.6 and 2.0.0, so emitting
+    the instant comparison for a VARCHAR cursor column would fail every
+    incremental run on it. The probe has to report VARCHAR and the predicate
+    has to stay a plain comparison that actually executes.
+    """
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    try:
+        base = "SELECT * FROM (VALUES ('2026-05-01 10:00:00'), ('2026-05-01 20:00:00')) AS t(ts)"
+        assert _cursor_column_type(con, base, "ts") == "VARCHAR"
+        predicate = _cursor_comparison("ts", "2026-05-01 14:00:00", "VARCHAR")
+        assert "epoch_us(" not in predicate, predicate
+        rows = con.execute(f"SELECT count(*) FROM ({base}) WHERE {predicate}").fetchall()
+        assert rows == [(1,)], rows
+    finally:
+        con.close()
+
+
+def test_the_probe_reads_a_real_timestamp_column_and_the_predicate_executes() -> None:
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    try:
+        base = (
+            "SELECT * FROM (VALUES (TIMESTAMP '2026-05-01 10:00:00'), "
+            "(TIMESTAMP '2026-05-01 20:00:00')) AS t(ts)"
+        )
+        assert _cursor_column_type(con, base, "ts") == "TIMESTAMP"
+        predicate = _cursor_comparison("ts", "2026-05-01 14:00:00", "TIMESTAMP")
+        assert "epoch_us(" in predicate, predicate
+        assert con.execute(f"SELECT count(*) FROM ({base}) WHERE {predicate}").fetchall() == [(1,)]
+    finally:
+        con.close()
+
+
+def test_the_probe_answers_for_an_empty_source() -> None:
+    """A first incremental run over a source with no rows must still bind."""
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    try:
+        base = "SELECT CAST(NULL AS TIMESTAMP) AS ts WHERE false"
+        assert _cursor_column_type(con, base, "ts") == "TIMESTAMP"
+    finally:
+        con.close()
+
+
+def test_the_probe_returns_none_rather_than_raising_on_a_bad_source() -> None:
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    try:
+        assert _cursor_column_type(con, "SELECT * FROM nope_does_not_exist", "ts") is None
+    finally:
+        con.close()

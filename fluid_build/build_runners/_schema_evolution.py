@@ -106,6 +106,8 @@ def family_rename_note(old: str, new: str) -> Optional[str]:
     Returned so the caller can SAY the physical type moved while not failing on
     it. ``None`` when the two are not one family.
     """
+    if old.strip().lower() == new.strip().lower():
+        return None  # nothing changed: a rename note for X -> X is noise
     if not _same_type_family(old, new):
         return None
     return (
