@@ -32,6 +32,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Mapping
 
+# Shared with the ODCS mapper pipeline so both spell the product-name
+# ``customProperties`` key identically; see the stamp at the end of
+# ``_build_data_contract_odcs``.
+from fluid_build.providers.odcs.mappers.metadata import FLUID_PRODUCT_NAME_PROPERTY
+
 _STATUS_MAP: Dict[str, str] = {
     "draft": "draft",
     "development": "draft",
@@ -86,15 +91,15 @@ def _build_data_contract_odcs(
     """
     meta = fluid.get("metadata", {})
     contract_id = f"{product_id}-contract"
+    product_name = meta.get("name") or fluid.get("name") or product_id
 
     dc: Dict[str, Any] = {
         "apiVersion": "v3.1.0",
         "kind": "DataContract",
         "id": contract_id,
-        "name": meta.get("name") or fluid.get("name") or product_id,
+        "name": product_name,
         "version": meta.get("version", "1.0.0"),
         "status": _STATUS_MAP.get(str(meta.get("status", "active")).lower(), "active"),
-        "dataProduct": product_id,
         "team": {
             "name": derive_team_id_fn(fluid),
         },
@@ -214,8 +219,35 @@ def _build_data_contract_odcs(
     builds = fluid.get("builds", {})
     if isinstance(builds, (dict, list)) and builds:
         custom_props.append({"property": "builds", "value": builds})
-    if custom_props:
-        dc["customProperties"] = custom_props
+
+    # Name the owning product without ODCS ``dataProduct``, which this builder
+    # used to fill with the product id. Bitol deprecated that field in v3.1.0
+    # (the official 3.2.0 schema reads "DEPRECATED since v3.1.0") to keep
+    # products in ODPS and contracts in ODCS, so it is a field removal waiting
+    # for ODCS 4.0. ``customProperties`` is the spec's escape hatch and carries
+    # the same ``fluidProductName`` entry the ODCS mapper writes on its per-port
+    # contracts. (The mapper's *whole-contract* export leaves it out, because
+    # ``name`` already says it; this builder emits a whole-product contract, so
+    # here the entry repeats ``name``.)
+    #
+    # Note the value is the product's *name*, as in the mapper, not the id the
+    # old ``dataProduct`` held: this contract's ``id`` is still
+    # ``<product id>-contract``, which is where the id remains recoverable. A
+    # label the author named ``fluidProductName`` wins, as a pass-through entry
+    # does in the mapper, so the key never appears twice.
+    if not any(p["property"] == FLUID_PRODUCT_NAME_PROPERTY for p in custom_props):
+        custom_props.append(
+            {
+                "property": FLUID_PRODUCT_NAME_PROPERTY,
+                "value": product_name,
+                "description": (
+                    "Name of the FLUID data product this contract describes. "
+                    "Written here because ODCS 'dataProduct' is deprecated since "
+                    "v3.1.0; the product itself is published as ODPS."
+                ),
+            }
+        )
+    dc["customProperties"] = custom_props
 
     return dc
 
