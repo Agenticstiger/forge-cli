@@ -816,7 +816,37 @@ jobs:
         # permanently red. The project alone resolves pyjwt>=2.13.0, so
         # auditing first keeps the gate honest. Do NOT fold the scanner
         # install back into the step above.
-        run: pip-audit --desc
+        #
+        # filelock CVE-2026-112940 / -112913 / -112907 (ignored 2026-10-26,
+        # founder-approved). All three are in filelock's SQLite-backed
+        # ReadWriteLock / AsyncReadWriteLock, and that API is UNREACHABLE in
+        # our closure. Verified, not assumed: no package in a resolved
+        # `.[dev,local]` env references ReadWriteLock outside filelock itself;
+        # fluid_build never imports filelock; and the six packages that do
+        # (cachecontrol, huggingface_hub, litellm, mypy, mypyc, pip) all use
+        # the plain FileLock. All three are also AV:L/PR:L -- they need a
+        # second local user able to create or rename entries in the lock
+        # database's own directory.
+        #
+        # The fix is filelock 4.2.1, which CANNOT be resolved here: litellm is
+        # a BASE dependency (not an extra) and its latest release 1.106.4 still
+        # declares filelock<4.0 (checked against the PyPI JSON API), so pinning
+        # the fixed version makes the install unsatisfiable. virtualenv is not a
+        # blocker -- its latest allows filelock<5.
+        #
+        # Upstream tracker: BerriAI/litellm#48394 (asks litellm to lift the
+        # cap; virtualenv already moved to filelock<5).
+        #
+        # REMOVE all three as soon as litellm lifts the cap and
+        # `filelock>=4.2.1` resolves. Re-check with:
+        #   curl -s https://pypi.org/pypi/litellm/json \
+        #     | python -c "import json,sys;print([r for r in json.load(sys.stdin)['info']['requires_dist'] if 'filelock' in r])"
+        # Scoped by ID deliberately: any OTHER filelock CVE still fails the gate.
+        run: |
+          pip-audit --desc \
+            --ignore-vuln CVE-2026-112940 \
+            --ignore-vuln CVE-2026-112913 \
+            --ignore-vuln CVE-2026-112907
       - name: Install SAST scanners
         run: pip install bandit "semgrep==1.163.0"
       - name: Bandit security scan

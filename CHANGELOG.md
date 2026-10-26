@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- A contract repository could hand the whole host to its own SQL through DuckDB's spill
+  directory. `secure_duckdb_connect` never set `temp_directory`, and DuckDB resolves its
+  temp directory into `allowed_directories` like any other grant; the default is relative
+  (`.tmp` in the working directory, or `<db>.tmp` beside a file database), so a repository
+  shipping `.tmp -> /` got `allowed_directories = ['/']` on a connection that granted
+  nothing, and contract SQL could read any file the process could. Reproduced on duckdb
+  1.5.1, 1.5.6 and 2.0.0, for an in-memory and a file database, through the same helper the
+  MCP output port's `query_sql` runs on. The engine now creates and owns that directory
+  (mode 0700, under `$TMPDIR`, removed with the connection), reads the grants back under
+  the lock and refuses the connection if DuckDB took a directory the call site did not
+  name, and refuses a caller-supplied `temp_directory` rather than silently overriding it.
+  Spilling is unaffected. No contract, flag or configuration change is needed.
+- Opening one DuckDB database file from two threads at once is now serialised. DuckDB
+  shares one instance per file per process and the sandbox's settings live on the instance,
+  so the two opens could cross-configure: a connection could be returned running under the
+  other thread's allowlist. The second opener now reliably gets the existing
+  "already open in this process" refusal.
+
+### Known limitations
+
+- On DuckDB 1.5.x, `lock_configuration` does not hold for logging reached as a table
+  function: `SET enable_logging = true` is refused, but `SELECT * FROM enable_logging(...)`
+  is accepted and the sandbox's own path refusal is then thrown from DuckDB's logger write
+  path as an uncaught C++ exception that aborts the process. It widens no grant, and the
+  engine's own SQL never spells it; the exposure is a free-form SQL surface such as the MCP
+  output port's `query_sql` under `policy.allow_free_form_sql`. DuckDB 2.0 refuses it
+  cleanly.
+
 ## [0.22.0] — 2026-10-22
 
 ### Upgrade notes
