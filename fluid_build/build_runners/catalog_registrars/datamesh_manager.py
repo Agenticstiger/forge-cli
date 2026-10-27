@@ -421,10 +421,12 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                         parsed, payload
                     )
                     if "inputPorts" in parsed and isinstance(parsed["inputPorts"], list):
-                        # Deferred: this module is imported for its
-                        # ``register_catalog_backend`` side effect, so it stays
-                        # off the light CLI's cold path (tests/perf).
+                        # Deferred: this module is imported purely for its
+                        # ``register_catalog_backend`` side effect, so building
+                        # the backend registry does not pull the ODPS provider
+                        # in with it.
                         from fluid_build.providers.odps_standard.mappers.ports import (
+                            consume_input_port_contract_ids,
                             remove_output_port_input_contracts,
                         )
 
@@ -442,7 +444,21 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                         # output port's lineage unless it goes with it — which
                         # would put back the unresolvable SourceSystem
                         # reference this strip exists to remove.
-                        remove_output_port_input_contracts(parsed, removed)
+                        #
+                        # Only the consume-derived ones, though. The rule above
+                        # also drops an ``expects[]`` port, whose expose replays
+                        # the upstream document's OWN ``inputContracts``; that
+                        # is the only record of the dependency, since Access
+                        # agreements are built from ``consumes[]``.
+                        consume_ids = consume_input_port_contract_ids(payload.contract or {})
+                        remove_output_port_input_contracts(
+                            parsed,
+                            [
+                                ip
+                                for ip in removed
+                                if isinstance(ip, dict) and str(ip.get("contractId")) in consume_ids
+                            ],
+                        )
                     return parsed
             except Exception:  # noqa: BLE001 — fall through to native
                 LOG.debug(

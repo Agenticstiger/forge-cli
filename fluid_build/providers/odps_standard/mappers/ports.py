@@ -37,7 +37,7 @@ Per-port pass-throughs flow through ``expose.odps_passthrough.*`` /
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, MutableMapping
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fluid_build.util.contract import (
     builds_to_canonical_input_ports,
@@ -223,6 +223,29 @@ def _consume_to_input_port(
             }
         ]
     return port
+
+
+def consume_input_port_contract_ids(fluid: Mapping[str, Any]) -> Set[str]:
+    """The ``contractId``s an export's input ports carry for ``consumes[]``.
+
+    A publish target that strips input ports by a cruder rule than "is this a
+    product consume" needs this to tell which of the ports it dropped had
+    lineage *derived* from ``consumes[]`` — the only lineage
+    :func:`remove_output_port_input_contracts` may remove.
+
+    An ``expects[]`` port is the case that makes the distinction matter. It is
+    dropped by a "no ``sourceSystemId``" rule just like a product consume, but
+    its expose replays the upstream document's own ``inputContracts`` verbatim
+    through the ODPS pass-through, and nothing else in the payload records that
+    dependency — Access agreements are built from ``consumes[]``. Removing it
+    would lose the upstream, not deduplicate it.
+    """
+    ids: Set[str] = set()
+    for canonical in consumes_to_canonical_ports(fluid):
+        contract_id = _input_port_contract_id(canonical)
+        if contract_id:
+            ids.add(str(contract_id))
+    return ids
 
 
 def remove_output_port_input_contracts(

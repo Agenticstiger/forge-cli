@@ -154,6 +154,40 @@ class TestProductConsumeLineageIsNotPublishedTwice:
         for port in body.get("outputPorts") or []:
             assert "inputContracts" not in port, port["inputContracts"]
 
+    @respx.mock
+    def test_an_imported_documents_own_lineage_is_not_stripped_with_it(self):
+        """The registrar drops an input port that carries no ``sourceSystemId``,
+        which catches an ``expects[]`` port as well as a product consume. Only
+        the consume-derived lineage may go with it: an ``expects[]`` port's
+        expose replays the upstream document's OWN ``inputContracts``, and
+        nothing else in the payload records that dependency, because Access
+        agreements are built from ``consumes[]``.
+        """
+        from fluid_build.api.catalog_publication import CatalogPublicationPayload
+
+        respx.route(method="PUT").mock(return_value=httpx.Response(200, json={"ok": True}))
+
+        contract = _consuming_contract()
+        contract.pop("consumes")
+        contract["expects"] = [
+            {"id": "customers_raw", "version": "1", "contractId": "vendor.customers_raw"}
+        ]
+        contract["exposes"][0]["odps_passthrough"] = {
+            "input_contracts": [{"id": "vendor.customers_raw", "version": "1"}]
+        }
+
+        payload = CatalogPublicationPayload.from_contract(contract, {})
+        assert DataMeshManagerRegistrar(api_token="t").register_payload(payload).succeeded is True
+
+        bodies = [
+            json.loads(call.request.content)
+            for call in respx.calls
+            if "/api/dataproducts/" in str(call.request.url)
+        ]
+        assert bodies, "no dataproduct PUT fired"
+        lineage = [port.get("inputContracts") for port in bodies[0].get("outputPorts") or []]
+        assert lineage == [[{"id": "vendor.customers_raw", "version": "1"}]], lineage
+
 
 # ── Registrar unit ───────────────────────────────────────────────────────
 
