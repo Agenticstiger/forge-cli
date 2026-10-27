@@ -228,11 +228,17 @@ def test_dq_threshold_and_operator_become_the_matching_odcs_operator() -> None:
 
 
 def test_quality_expression_lands_on_the_object_as_a_sql_rule() -> None:
+    """ODCS defines ``sql`` as a query returning a comparable value, so a FLUID
+    row predicate becomes one. It used to be emitted verbatim, which handed a DQ
+    engine a fragment it could not execute."""
     rules = {r["id"]: r for r in _object_quality(_render(_RICH))}
     assert "amount_positive" in rules, f"expression not exported: {sorted(rules)}"
     assert rules["amount_positive"]["type"] == "sql"
-    assert rules["amount_positive"]["query"] == "amount > 0"
-    assert rules["amount_positive"]["mustBe"] is True
+    assert (
+        rules["amount_positive"]["query"]
+        == "SELECT COUNT(*) FROM ${table} WHERE (amount > 0) IS NOT TRUE"
+    )
+    assert rules["amount_positive"]["mustBe"] == 0
 
 
 def test_freshness_rule_exports_as_an_odcs_custom_rule() -> None:

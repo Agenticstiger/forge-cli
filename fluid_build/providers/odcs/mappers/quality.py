@@ -449,17 +449,45 @@ def _dq_severity(check: Dict[str, Any], rule: Mapping[str, Any]) -> None:
 def _expression_to_quality(expr: Mapping[str, Any]) -> Dict[str, Any]:
     """One ``exposes[].contract.quality`` entry as an ODCS ``sql`` rule.
 
-    The FLUID field is "SQL or boolean expression that must evaluate to true",
-    which is exactly ODCS ``$defs.DataQualitySql`` (``query`` plus one operator)
-    with ``mustBe: true``. ``mustBe`` is untyped in the spec, so a boolean is
-    as valid there as a row count.
+    The FLUID field is "SQL or boolean expression that must evaluate to true" —
+    a ROW PREDICATE, such as ``preferred_customer_flag IN ('Y', 'N')``. ODCS is
+    specific about what ``sql`` means: ``$defs.DataQuality.type`` says "'sql' is
+    an individual SQL query that returns a value that can be compared", and
+    ``$defs.DataQualitySql.query`` carries the example ``SELECT COUNT(*) FROM
+    ${table} WHERE ${column} IS NOT NULL``. Emitting the bare predicate as
+    ``query`` therefore handed an engine something it cannot execute: it was a
+    fragment, not a statement, and the ``mustBe: true`` beside it compared
+    against a value no query produced.
+
+    A predicate is now exported as the count of rows that fail it, compared to
+    zero — the shape ODCS's own example takes, and the one OpenMetadata
+    documents for ``sql`` rules (exactly one comparison against a whole number).
+    ``${table}`` is the placeholder from that example.
+
+    ``IS NOT TRUE`` rather than ``NOT (...)`` on purpose. Under SQL's
+    three-valued logic ``NOT (flag IN ('Y','N'))`` is NULL when ``flag`` is
+    NULL, so a naive negation counts no failure for the row — yet a row whose
+    predicate did not evaluate to TRUE has not satisfied "must evaluate to
+    true". ``IS NOT TRUE`` catches NULL and FALSE alike, and is supported by
+    DuckDB, PostgreSQL, MySQL, Snowflake and BigQuery.
+
+    An expression that is already a query (it starts with ``SELECT`` or
+    ``WITH``) is passed through as written with the previous comparison: the
+    author wrote a statement and chose what it returns.
     """
-    check: Dict[str, Any] = {
-        "type": "sql",
-        "query": expr["expression"],
-        "mustBe": True,
-        "description": f"Expression must hold for every row: {expr['expression']}",
-    }
+    expression = str(expr["expression"]).strip()
+    is_query = expression.upper().startswith(("SELECT", "WITH"))
+
+    check: Dict[str, Any] = {"type": "sql"}
+    if is_query:
+        check["query"] = expression
+        check["mustBe"] = True
+        check["description"] = f"Expression must hold for every row: {expression}"
+    else:
+        check["query"] = f"SELECT COUNT(*) FROM ${{table}} WHERE ({expression}) IS NOT TRUE"
+        check["mustBe"] = 0
+        check["description"] = f"Rows failing the expression must be 0: {expression}"
+
     severity = expr.get("severity")
     if severity:
         check["severity"] = _DQ_SEVERITY.get(severity, severity)
