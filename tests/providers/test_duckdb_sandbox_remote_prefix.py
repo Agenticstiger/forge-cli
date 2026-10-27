@@ -29,10 +29,14 @@ so the escape's own resolution entered the granted set and excused the grant.
 The prefix is now joined to the resolved cwd lexically, so the honest form still
 matches and an escaping one no longer does.
 
-6 of the 8 tests here fail when the production change is reverted, on duckdb
-1.5.6 and 2.0.0 alike. The 2 that do not are deliberate: the legitimate-prefix
-guard has to pass before and after, and the defect witness passes on pre-fix
-code by construction.
+Reverting the production change -- its two call sites and the read-back's
+accommodation, with the new helpers left defined so the tests that patch them
+still import -- fails 6 of the 8 tests this file had at that measurement, on
+duckdb 1.5.6 and 2.0.0 alike. The 2 that survive are deliberate: the
+legitimate-prefix guard has to pass before and after, and the defect witness
+passes on pre-fix code by construction. A LITERAL revert deletes
+``_refuse_escaping_remote_prefixes`` as well, so the tests that patch it error
+instead of failing -- still red, by a different route.
 
 There are two barriers, and the tests pin each one alone: the grant is refused
 before it is set, and the read-back under the lock refuses it again if that
@@ -64,6 +68,7 @@ from fluid_build.providers._duckdb_sandbox import (  # noqa: E402
 from tests.providers.test_duckdb_sandbox_spill import (  # noqa: E402
     UNGRANTED_HOST_FILE,
     _reads,
+    _Reporting,
     _setting,
 )
 
@@ -211,6 +216,31 @@ def test_with_both_barriers_bypassed_the_grant_is_real(
         assert _reads(con, UNGRANTED_HOST_FILE)
     finally:
         con.close()
+
+
+@posix_symlink
+def test_the_read_back_defers_to_the_escape_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deferral needs the read-back driven directly to be exercised at all.
+
+    In ``test_the_read_back_still_refuses_when_the_pre_set_check_is_bypassed``
+    the patched no-op is the SAME function the read-back defers to, so that test
+    witnesses the generic "did not ask for" message, not this one. Here the real
+    check runs inside the read-back, against a stand-in connection reporting the
+    grant DuckDB would have made.
+    """
+    monkeypatch.chdir(_repo_with_scheme_link(tmp_path, "/"))
+    allow = DuckDBAllowlist.none().with_remote("s3://etc/")
+
+    with pytest.raises(DuckDBSandboxError) as excinfo:
+        sandbox._refuse_ungranted_dirs(
+            _Reporting((os.path.realpath("/etc") + os.sep,)), allow, str(tmp_path)
+        )
+
+    rendered = _rendered(excinfo.value)
+    assert "s3://etc/" in rendered, rendered
+    assert "did not ask for" not in rendered, rendered
 
 
 # ── what must keep working ───────────────────────────────────────────────

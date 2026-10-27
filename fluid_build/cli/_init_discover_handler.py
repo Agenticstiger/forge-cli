@@ -249,8 +249,9 @@ def _probe_error(exc: Exception, uri: str, safe_uri: str, view: _UriView) -> Flu
     VPN / network policy / credentials" -- advice that sends the reader to their
     network for something in their working directory. Its fields are kept and
     masked instead, since the refusal names the location it refused and that
-    can carry userinfo (``https://user:pw@host/``), which is what the masking
-    here is for.
+    can carry a password in its userinfo, which is what the masking here is
+    for. (Spelling that URL shape out here trips the secret scanner, so it is
+    described rather than written.)
     """
 
     def mask(text: str) -> str:
@@ -267,11 +268,23 @@ def _kept_or_reframed(
 ) -> FluidUserError:
     """``exc`` with its own fields masked when it is already a typed error.
 
+    EVERY field :meth:`FluidUserError.as_json` emits is masked, ``extras`` and
+    ``doc`` included. Leaving ``extras`` alone would have been the one way a
+    value this handler masks everywhere else reached ``--json`` output: an
+    out-of-tree discoverer that put the location as given under a key of its
+    own (``dsn``, say) would have had it serialised verbatim, since ``"uri"``
+    is overwritten here but no other key was touched. No error in the tree
+    carries extras through this path, so the gap was latent -- but ``as_json``
+    is precisely what the sibling tests assert a credential never reaches.
+
     ``replace`` needs the concrete class to be constructible from its fields,
     which every typed error in the tree is. A discoverer from outside the tree
     could raise a ``FluidUserError`` subclass that is not, and this code runs
     while an error is already being handled -- the last place to raise a second
-    one -- so an awkward subclass falls back to the connectivity framing.
+    one -- so anything awkward falls back to the connectivity framing. The
+    ``except`` is broad for that reason: a subclass can refuse to rebuild in
+    more ways than ``TypeError``, and none of them is worth losing the original
+    failure over.
     """
     if isinstance(exc, FluidUserError):
         try:
@@ -280,12 +293,28 @@ def _kept_or_reframed(
                 what=mask(exc.what),
                 why=mask(exc.why),
                 fix=mask(exc.fix),
+                doc=mask(exc.doc) if exc.doc else exc.doc,
                 where=mask(exc.where) if exc.where else exc.where,
-                extras={**exc.extras, "uri": safe_uri},
+                extras={**_masked_extras(exc.extras, mask), "uri": safe_uri},
             )
-        except (TypeError, ValueError):
+        except Exception:  # noqa: BLE001 - never raise while an error is live
             pass
     return ConnectivityProbeError.for_target(target=safe_uri, reason=reason)
+
+
+def _masked_extras(extras: Any, mask: Callable[[str], str]) -> Dict[str, Any]:
+    """``extras`` with every string masked, at any depth ``as_json`` would dump."""
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, str):
+            return mask(value)
+        if isinstance(value, dict):
+            return {key: walk(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [walk(item) for item in value]
+        return value
+
+    return {key: walk(value) for key, value in dict(extras or {}).items()}
 
 
 def _type_name(exc: BaseException) -> str:
