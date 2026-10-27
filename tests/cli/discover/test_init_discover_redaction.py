@@ -43,6 +43,7 @@ import fluid_build.cli._init_discover_handler as handler
 from fluid_build.cli._errors import ConnectivityProbeError, SchemaValidationError
 from fluid_build.cli.discover.registry import DiscoveredColumn, DiscoveredStream
 from fluid_build.observability.secret_redactor import forget_known_secrets, redact_secret_text
+from fluid_build.providers._duckdb_sandbox import DuckDBSandboxError
 from fluid_build.providers._sql_safety import libpq_escape, quote_ansi_string_literal
 from fluid_build.schema_manager import FluidSchemaManager
 
@@ -255,6 +256,40 @@ class TestDiscoverErrorsKeepPasswordOut:
             _run(monkeypatch, tmp_path, uri, stub)
         assert "ab@cd" not in info.value.as_json()
         assert "cd@127.0.0.1" not in info.value.as_json()
+
+
+class TestTypedErrorsKeepTheirOwnAdvice:
+    """An error that already says what to do is not reframed as a connectivity failure."""
+
+    def test_a_typed_error_keeps_its_own_advice_and_is_still_masked(self, monkeypatch, tmp_path):
+        """A sandbox refusal reaches the same ``except Exception`` as a driver error.
+
+        Reframing it as a connectivity failure replaced its ``fix`` with "Check
+        VPN / network policy / credentials", which sends the reader to their
+        network for something in their working directory. Its own fields are
+        kept -- and still masked, because the refusal names the location it
+        refused and that location can carry userinfo.
+        """
+        uri = f"https://alice:{SENTINEL}@example.com/data.csv"
+        stub = _StubDiscoverer(
+            error=DuckDBSandboxError(
+                what="a declared remote prefix would grant a local directory to the SQL",
+                why=f"Refused here: {uri} resolves to /somewhere",
+                fix="Remove the link in the working directory.",
+                doc="https://example.invalid/doc",
+            )
+        )
+        with pytest.raises(DuckDBSandboxError) as info:
+            _run(monkeypatch, tmp_path, uri, stub)
+        exc = info.value
+        assert exc.code == "DuckDBSandboxError"
+        assert "working directory" in exc.fix
+        assert "VPN" not in exc.fix
+        assert SENTINEL not in exc.what
+        assert SENTINEL not in (exc.why or "")
+        assert SENTINEL not in exc.render(color=False)
+        assert SENTINEL not in exc.as_json()
+        assert _contracts(tmp_path) == []
 
 
 class TestPasswordWithUnencodedDelimiter:
@@ -1052,12 +1087,14 @@ class TestDriverErrorQuotingAReQuotedCopy:
         # Holding both quote characters, repr() escapes the single one.
         uri = "https://alice:pa'ss\"WORDTAIL@h.invalid/../a.csv"  # pragma: allowlist secret
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
-        with pytest.raises(ConnectivityProbeError) as info:
+        # A sandbox refusal keeps its own type and advice rather than being
+        # reframed as a connectivity failure, and is masked either way.
+        with pytest.raises(DuckDBSandboxError) as info:
             handler.run_discover(_args(tmp_path), logging.getLogger("t"), uri=uri)
         exc = info.value
-        why = exc.why or ""
-        assert "WORDTAIL" not in exc.render(color=False) + exc.as_json(), why
-        assert "remote prefix 'https://***REDACTED***@h.invalid/../' contains '..'" in why
+        rendered = exc.render(color=False) + exc.as_json()
+        assert "WORDTAIL" not in rendered, exc.why
+        assert "remote prefix 'https://***REDACTED***@h.invalid/../' contains '..'" in rendered
 
     @pytest.mark.parametrize("odd", ["\udc80", "\ud800"])
     def test_a_value_that_is_not_utf8_is_still_masked(self, odd):
@@ -1177,7 +1214,7 @@ class TestDriverErrorChainKeepsPasswordOut:
         # The sandbox refuses this before any network access, quoting the URL.
         uri = "https://alice:pa'ss\"WORDTAIL@h.invalid/../a.csv"  # pragma: allowlist secret
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
-        with pytest.raises(ConnectivityProbeError) as info:
+        with pytest.raises(DuckDBSandboxError) as info:
             handler.run_discover(_args(tmp_path), logging.getLogger("t"), uri=uri)
         text = _chain_text(info.value)
         assert "WORDTAIL" not in text, text
