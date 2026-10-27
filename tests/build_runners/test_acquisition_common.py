@@ -111,6 +111,21 @@ class TestResolveSecretRef:
 class TestResolveConnectionSecrets:
     """Convenience wrapper that places the resolved secret into a target field."""
 
+    @pytest.fixture(autouse=True)
+    def _allow_the_remote_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """These cases exercise RESOLUTION, not the send policy.
+
+        ``env://`` to a remote host now needs the operator's allowlist
+        (``build_runners/_secret_policy``), and ``db.example`` is remote. Listing
+        the variables keeps these tests about what they were about, and is the
+        same one-line change an operator makes on upgrade. The policy itself is
+        covered in ``test_acquisition_secret_policy.py``.
+        """
+        monkeypatch.setenv(
+            "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST",
+            "PG_PASSWORD,API_TOKEN,TOKEN,SECRET,MY_SECRET,GH_TOKEN",
+        )
+
     def test_no_secret_ref_returns_shallow_copy_unchanged(self):
         original = {"host": "db.example", "port": 5432, "user": "alice"}
         out = resolve_connection_secrets(original)

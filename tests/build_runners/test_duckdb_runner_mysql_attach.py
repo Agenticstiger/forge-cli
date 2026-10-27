@@ -40,6 +40,21 @@ _BASE = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _allow_the_fixture_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``env://`` to a remote host needs the operator's allowlist now.
+
+    These suites exercise the ATTACH and its error handling, not the secretRef
+    send policy, and the fixture host (``db.test``) is remote. Listing the two
+    variables they use keeps them about what they were about; the policy itself
+    is covered in ``test_acquisition_secret_policy.py``.
+    """
+    monkeypatch.setenv(
+        "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST",
+        "RUNNER_FAKE_PG_SECRET,RUNNER_FAKE_MYSQL_SECRET,RUNNER_FAKE_UNSET_SECRET",
+    )
+
+
 def _attach_on(con: Any, raw: Dict[str, Any], kind: str = "mysql") -> None:
     """Run the runner's attach of a ``kind`` source with ``raw`` on ``con``."""
     ctx = types.SimpleNamespace(
