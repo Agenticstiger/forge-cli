@@ -148,6 +148,7 @@ class _FakeRestClient:
     """
 
     last_url: Optional[str] = None
+    last_operator_supplied: Optional[bool] = None
 
     def __init__(
         self,
@@ -155,8 +156,10 @@ class _FakeRestClient:
         *,
         api_token: Optional[str] = None,
         timeout_seconds: int = 30,
+        operator_supplied: bool = False,
     ) -> None:
         type(self).last_url = server_url
+        type(self).last_operator_supplied = operator_supplied
         self.closed = False
 
     def list_sources(self, workspace_id: str) -> List[Dict[str, Any]]:
@@ -298,6 +301,12 @@ class TestEndpointPrecedence:
             source=WORKSPACE,
         )
         assert fake_client.last_url == FLAG_URL
+        # The URL is the OPERATOR's, typed on the command line, so the
+        # deployment-host policy must not second-guess it: without this flag,
+        # `--server-url https://airbyte.example.com` was refused and the
+        # operator was told to set an allowlist variable to permit what they
+        # had just asked for.
+        assert fake_client.last_operator_supplied is True
 
     def test_env_var_reaches_the_real_client(
         self, fake_client: type, monkeypatch: pytest.MonkeyPatch

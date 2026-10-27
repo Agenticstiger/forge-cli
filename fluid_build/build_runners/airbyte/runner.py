@@ -42,6 +42,9 @@ from fluid_build.api.runner import (
 )
 from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.security import ImageSignatureVerifier
+from fluid_build.build_runners._deployment_host_policy import (
+    refuse_unless_host_allowed,
+)
 
 from .._acquisition_common import (
     adapt_source_config,
@@ -85,6 +88,7 @@ class AirbyteRestClient:
         *,
         api_token: Optional[str] = None,
         timeout_seconds: int = 30,
+        operator_supplied: bool = False,
     ):
         # SSRF guard — Airbyte server_url comes from contract.fluid.yaml
         # and carries a Bearer token in headers. allow_private=True for
@@ -92,8 +96,22 @@ class AirbyteRestClient:
         # DNS-pins. follow_redirects=False (httpx already strips
         # Authorization cross-host, but a same-host redirect to an
         # alternate path would still receive the token).
+        #
+        # Where the config may go — see _deployment_host_policy. Airbyte's
+        # source config carries the resolved source password and this client
+        # carries the operator's Airbyte token, so a public host has to be one
+        # the operator named. The runner checks this where it reads server_url,
+        # before the config (and so the secretRef) is resolved; this is the
+        # chokepoint for any other caller.
+        # Not the module-level ``refuse_unless_allowed`` from _secret_policy:
+        # that polices which VARIABLE may be read for a given host, this one
+        # which HOST may receive the result.
+        from fluid_build.build_runners._deployment_host_policy import request_guard
         from fluid_build.util.safe_http import safe_httpx_client
 
+        server_url = refuse_unless_host_allowed(
+            server_url, engine="airbyte", operator_supplied=operator_supplied
+        )
         headers: Dict[str, str] = {}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
@@ -102,6 +120,11 @@ class AirbyteRestClient:
             headers=headers,
             timeout=float(timeout_seconds),
             allow_private=True,
+            event_hooks={
+                "request": [
+                    request_guard(server_url, engine="airbyte", operator_supplied=operator_supplied)
+                ]
+            },
         )
 
     def close(self) -> None:
@@ -306,6 +329,13 @@ def _execute_rest_mode(
     server_url = deployment.get("server_url")
     if not server_url:
         return _failed(ctx, started_at, t_start, "airbyte REST mode requires deployment.server_url")
+
+    # Before the config is built, because building it resolves the contract's
+    # secretRef: the client constructor is the chokepoint, but it runs AFTER
+    # that, so a refused deployment would otherwise still have fetched the
+    # password from Vault/KMS -- audit entries, API calls, plaintext in memory.
+    # The constructor keeps its own check as the backstop for any other caller.
+    refuse_unless_host_allowed(server_url, engine="airbyte")
     auth = deployment.get("auth", {}) or {}
     # auth.token wins; if absent, resolve auth.secretRef via the central
     # secret backends (env://, vault://, aws://, gcp://, azure://, file://).
