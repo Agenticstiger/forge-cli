@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-10-27
+
+### Fixed
+
+- **Exported lineage claimed a version the contract never pinned.** An ODPS `inputPorts[].version`
+  came from the consume's own `version` or the provider's `1.0.0` default, and a consume that states
+  a range (`versionConstraint: ^2.1`) has neither — so every such export asserted `version: 1.0.0`,
+  a pin the contract did not make and, for a product whose 1.x line is retired, a version that no
+  longer exists. The lowest version the range accepts is now resolved (`^2.1` → `2.1.0`,
+  `~1.4` → `1.4.0`, `>=3.0.0` → `3.0.0`). A range the resolver cannot read falls back to the old
+  constant rather than guessing: ODPS v1.0.0 has `version` in `InputPort`'s `required`, so the field
+  cannot simply be omitted, and a wrong exact version reads as a fact somebody established. The
+  refusals include a compound range, a wildcard, `>1.0.0` (whose true lower bound semver gives no
+  way to name), and anything whose components are not plain ASCII digits without a leading zero —
+  `^01.2` is a schema-valid constraint, but `01.2.0` matches neither `$defs.semver` nor any
+  resolver. `versionConstraint` still rides along in `customProperties`, so the range this product
+  accepts is not lost.
+
+- **An exported output port named none of its upstreams.** `outputPorts[].inputContracts` was
+  populated only from an imported ODPS document's pass-through, so a contract written in FLUID
+  exported output ports with no lineage at all and a catalog reading dependencies there saw a
+  product with none. The entries are now derived from the document's own resolved input ports — one
+  per `consumes[]`, carrying exactly the `id` and `version` Bitol's `$defs.InputContract` allows,
+  read from those ports rather than recomputed so the two halves of one document cannot disagree. An
+  imported document's own `inputContracts` still win, and `expects[]` — the carrier an imported
+  document's input ports arrive on — is excluded, so import → export stays a fixed point and never
+  adds a dependency the author did not write. A `builds[].properties.source` stream is excluded too:
+  its `<kind>://<database>/<stream>` id is synthesized to populate the *required* input-port field
+  for a source that has no contract at all, and `inputContracts` is optional, so naming an id no
+  catalog can resolve is worse than naming nothing. Both Data Mesh Manager publish paths — the
+  registrar behind `fluid publish --target datamesh-manager` and `catalog.register`, and
+  `fluid datamesh-manager publish` — strip the derived lineage alongside the input ports it mirrors,
+  for the reason those were already stripped: Entropy draws product-to-product lineage from Access
+  resources, so naming the upstream twice would require mirroring it as a SourceSystem and render
+  duplicate graph nodes. They strip by different rules, so each passes the ports it dropped to one
+  shared helper.
+
+- **A quality expression exported as SQL no DQ engine could execute.** ODCS defines the `sql` rule's
+  `query` as an individual query returning a value that can be compared, and FLUID's
+  `exposes[].contract.quality[].expression` is a row predicate — it was emitted verbatim, so an
+  engine was handed `preferred_customer_flag IN ('Y', 'N')` with `mustBe: true` and nothing to
+  execute. A predicate now becomes a counting query compared to zero, against the `${table}`
+  placeholder from ODCS's own example. The negation is `(…) IS NOT TRUE`, not `NOT (…)`: under
+  three-valued logic a NULL row makes the naive form NULL and counts no failure, although that row's
+  predicate did not hold. An expression whose *first token* is `SELECT` or `WITH` passes through
+  unchanged; the token boundary matters, because matching a bare prefix left every predicate on a
+  column named `selected_at` or `with_tax` in the broken state this fixes. The predicate is wrapped
+  on its own line and a trailing `;` is dropped, so neither a line comment nor a stray semicolon can
+  swallow the closing paren.
+
+- **A renamed input port leaked a product consume into the Data Mesh Manager payload.** Found while
+  covering the lineage strip above. When two `consumes[]` share an `exposeId` the exporter renames
+  the second, and `fluid datamesh-manager publish` matched the renamed port by name — which misses
+  two of the three rename shapes: a `productId` tail containing `__` of its own
+  (`silver.crm__core` → `crm__core__customers`, split at the wrong `__`), and the numeric-suffix
+  fallback (`customers_2`, with no `__` to match on). Both published a port Entropy cannot resolve
+  without mirroring the upstream product as a SourceSystem. The match now also tests the contract id
+  the exporter actually stamps on the port, read from the exporter's own helper so the convention has
+  one definition; a source-system consume keeps its port, as before. This leak predates the release —
+  but deriving `outputPorts[].inputContracts` would have doubled it, so it is fixed here rather than
+  carried.
+
+### Added
+
+- `consumes[].contractVersion` (0.7.6 preview) — the exact upstream version this product was built
+  and tested against, within `versionConstraint`. It wins over the resolved lower bound as the
+  version an exported input port, and its matching `inputContracts` entry, claims.
+
+### Changed
+
+**Exported artifacts change shape in this release.** If you have tooling that reads forge's ODCS or
+ODPS output, read this before upgrading. Each change is a fix for output that was wrong and is
+described in full under *Fixed*; the summary is here because the old values may be baked into
+consumers.
+
+- An ODPS export of a contract with `consumes[]` now carries `outputPorts[].inputContracts`, where
+  before it carried none, and an input port's `version` may differ from `1.0.0` where the contract
+  states a range. A consumer that compares exported documents byte-for-byte will see both.
+- An ODCS `sql` quality rule derived from `exposes[].contract.quality[].expression` now carries a
+  counting query (`SELECT COUNT(*) FROM ${table} WHERE (<expression>) IS NOT TRUE`, the predicate on
+  its own line) with `mustBe: 0`, where it previously carried the bare expression with
+  `mustBe: true`; its `description` changes with it. A DQ configuration or test that pins the old
+  `query` string or the boolean `mustBe` must be updated — ours was. An expression already written
+  as a `SELECT` or `WITH` query is unchanged.
+
 ## [0.23.0] — 2026-10-27
 
 ### Security

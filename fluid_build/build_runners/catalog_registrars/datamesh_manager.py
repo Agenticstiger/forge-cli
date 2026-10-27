@@ -421,15 +421,44 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                         parsed, payload
                     )
                     if "inputPorts" in parsed and isinstance(parsed["inputPorts"], list):
-                        parsed["inputPorts"] = [
-                            ip
-                            for ip in parsed["inputPorts"]
-                            if isinstance(ip, dict)
-                            and "sourceSystemId" in ip
-                            and ip["sourceSystemId"]
-                        ]
-                        if not parsed["inputPorts"]:
+                        # Deferred: this module is imported purely for its
+                        # ``register_catalog_backend`` side effect, so building
+                        # the backend registry does not pull the ODPS provider
+                        # in with it.
+                        from fluid_build.providers.odps_standard.mappers.ports import (
+                            consume_input_port_contract_ids,
+                            remove_output_port_input_contracts,
+                        )
+
+                        kept: List[Any] = []
+                        removed: List[Any] = []
+                        for ip in parsed["inputPorts"]:
+                            keep = isinstance(ip, dict) and ip.get("sourceSystemId")
+                            (kept if keep else removed).append(ip)
+                        parsed["inputPorts"] = kept
+                        if not kept:
                             parsed.pop("inputPorts", None)
+                        # The ODPS render derives
+                        # ``outputPorts[].inputContracts`` from the same
+                        # ``consumes[]``, so a stripped port stays named in the
+                        # output port's lineage unless it goes with it — which
+                        # would put back the unresolvable SourceSystem
+                        # reference this strip exists to remove.
+                        #
+                        # Only the consume-derived ones, though. The rule above
+                        # also drops an ``expects[]`` port, whose expose replays
+                        # the upstream document's OWN ``inputContracts``; that
+                        # is the only record of the dependency, since Access
+                        # agreements are built from ``consumes[]``.
+                        consume_ids = consume_input_port_contract_ids(payload.contract or {})
+                        remove_output_port_input_contracts(
+                            parsed,
+                            [
+                                ip
+                                for ip in removed
+                                if isinstance(ip, dict) and str(ip.get("contractId")) in consume_ids
+                            ],
+                        )
                     return parsed
             except Exception:  # noqa: BLE001 — fall through to native
                 LOG.debug(

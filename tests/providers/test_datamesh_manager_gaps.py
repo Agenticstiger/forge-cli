@@ -713,6 +713,186 @@ class TestRemoveOdpsProductConsumeInputPorts:
             {"name": "crm_source", "contractId": "bronze.telco.party_v1"}
         ]
 
+    @pytest.mark.parametrize(
+        ("label", "consumes"),
+        [
+            (
+                "productId tail contains __",
+                [
+                    {"productId": "silver.crm.core", "exposeId": "customers"},
+                    {"productId": "silver.crm__core", "exposeId": "customers"},
+                ],
+            ),
+            (
+                # Three consumes sharing an exposeId AND a productId tail: the
+                # first keeps ``customers``, the second takes
+                # ``core__customers``, and the third falls back to
+                # ``customers_2`` — the shape with no ``__`` to match on.
+                "numeric-suffix rename fallback",
+                [
+                    {"productId": "silver.a.core", "exposeId": "customers"},
+                    {"productId": "silver.b.core", "exposeId": "customers"},
+                    {"productId": "silver.c.core", "exposeId": "customers"},
+                ],
+            ),
+            (
+                "exposeId itself contains __",
+                [
+                    {"productId": "silver.crm.core", "exposeId": "cust__omers"},
+                    {"productId": "silver.party", "exposeId": "cust__omers"},
+                ],
+            ),
+        ],
+    )
+    def test_a_renamed_port_is_matched_whatever_shape_the_rename_took(self, label, consumes):
+        """Two consumes sharing an ``exposeId`` make the exporter rename the
+        second, and the rename has three shapes. Matching the name by splitting
+        at the FIRST ``__`` read ``silver.crm__core`` as the boundary and let
+        that port through; the numeric-suffix fallback carries no ``__`` at all.
+        A leaked port is an unresolvable SourceSystem reference, and since the
+        lineage key mirrors the ports, it leaked twice.
+        """
+        from fluid_build.providers.datamesh_manager.datamesh_manager import (
+            DataMeshManagerProvider,
+        )
+
+        contract = {
+            "fluidVersion": "0.7.3",
+            "kind": "DataProduct",
+            "id": "gold.sales.orders",
+            "name": "Orders",
+            "metadata": {"layer": "Gold", "owner": {"team": "dp", "email": "dp@co.example"}},
+            "consumes": consumes,
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "kind": "table",
+                    "binding": {
+                        "platform": "snowflake",
+                        "format": "snowflake_table",
+                        "location": {"database": "G", "schema": "S", "table": "O"},
+                    },
+                    "contract": {"schema": [{"name": "id", "type": "string"}]},
+                }
+            ],
+        }
+        payload = DataMeshManagerProvider(api_key="t").apply(contract, dry_run=True)["payload"]
+        assert not payload.get("inputPorts"), (label, payload.get("inputPorts"))
+        lineage = [port.get("inputContracts") for port in payload.get("outputPorts") or []]
+        assert not any(lineage), (label, lineage)
+
+    def test_a_source_system_consume_keeps_its_port_and_its_lineage(self):
+        """The over-match guard. Entropy resolves a source-system port, so it
+        survives — and its lineage entry must survive with it."""
+        from fluid_build.providers.datamesh_manager.datamesh_manager import (
+            DataMeshManagerProvider,
+        )
+
+        contract = {
+            "fluidVersion": "0.7.3",
+            "kind": "DataProduct",
+            "id": "gold.sales.orders",
+            "name": "Orders",
+            "metadata": {"layer": "Gold", "owner": {"team": "dp", "email": "dp@co.example"}},
+            "consumes": [
+                {"productId": "bronze.telco.party", "exposeId": "account_source"},
+                {
+                    "productId": "bronze.telco.party",
+                    "exposeId": "crm_source",
+                    "sourceSystem": "bss-crm",
+                },
+            ],
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "kind": "table",
+                    "binding": {
+                        "platform": "snowflake",
+                        "format": "snowflake_table",
+                        "location": {"database": "G", "schema": "S", "table": "O"},
+                    },
+                    "contract": {"schema": [{"name": "id", "type": "string"}]},
+                }
+            ],
+        }
+        payload = DataMeshManagerProvider(api_key="t").apply(contract, dry_run=True)["payload"]
+        assert [ip["name"] for ip in payload["inputPorts"]] == ["crm_source"]
+        assert payload["outputPorts"][0]["inputContracts"] == [
+            {"id": "bronze.telco.party.crm_source", "version": "1.0.0"}
+        ]
+
+    def test_a_removed_ports_derived_lineage_goes_with_it(self):
+        """Since 0.24.0 the ODPS exporter derives ``outputPorts[].inputContracts``
+        from ``consumes[]``, so one product-to-product edge is stated twice in a
+        document. Leaving the lineage behind puts back the duplicate graph nodes
+        this strip exists to prevent."""
+        fluid = {
+            "consumes": [
+                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
+                {
+                    "productId": "bronze.telco.party_v1",
+                    "exposeId": "crm_source",
+                    "sourceSystem": "bss-crm",
+                },
+            ],
+        }
+        odps_payload = {
+            "inputPorts": [
+                {
+                    "name": "account_source",
+                    "contractId": "bronze.telco.party_v1.account_source",
+                },
+                {"name": "crm_source", "contractId": "bronze.telco.party_v1.crm_source"},
+            ],
+            "outputPorts": [
+                {
+                    "name": "accounts",
+                    "inputContracts": [
+                        {"id": "bronze.telco.party_v1.account_source", "version": "1.0.0"},
+                        {"id": "bronze.telco.party_v1.crm_source", "version": "1.0.0"},
+                    ],
+                }
+            ],
+        }
+
+        DataMeshManagerProvider._remove_odps_product_consume_input_ports(odps_payload, fluid)
+
+        assert odps_payload["inputPorts"] == [
+            {"name": "crm_source", "contractId": "bronze.telco.party_v1.crm_source"}
+        ]
+        # The source-system consume keeps its lineage, because its port is kept.
+        assert odps_payload["outputPorts"][0]["inputContracts"] == [
+            {"id": "bronze.telco.party_v1.crm_source", "version": "1.0.0"}
+        ]
+
+    def test_the_lineage_key_goes_away_when_every_entry_was_a_product_consume(self):
+        fluid = {
+            "consumes": [
+                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
+            ],
+        }
+        odps_payload = {
+            "inputPorts": [
+                {
+                    "name": "account_source",
+                    "contractId": "bronze.telco.party_v1.account_source",
+                }
+            ],
+            "outputPorts": [
+                {
+                    "name": "accounts",
+                    "inputContracts": [
+                        {"id": "bronze.telco.party_v1.account_source", "version": "1.0.0"}
+                    ],
+                }
+            ],
+        }
+
+        DataMeshManagerProvider._remove_odps_product_consume_input_ports(odps_payload, fluid)
+
+        assert "inputPorts" not in odps_payload
+        assert "inputContracts" not in odps_payload["outputPorts"][0]
+
     def test_removes_input_ports_key_when_only_product_consumes_exist(self):
         fluid = {
             "consumes": [

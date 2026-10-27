@@ -446,20 +446,65 @@ def _dq_severity(check: Dict[str, Any], rule: Mapping[str, Any]) -> None:
         check["severity"] = _DQ_SEVERITY.get(severity, severity)
 
 
+# ``\b`` so only a whole first token counts: a column named ``selected_at`` or
+# ``with_tax`` begins with these letters and is a predicate, not a query.
+_QUERY_FIRST_TOKEN_RE = re.compile(r"\s*(?:select|with)\b", re.IGNORECASE)
+
+
 def _expression_to_quality(expr: Mapping[str, Any]) -> Dict[str, Any]:
     """One ``exposes[].contract.quality`` entry as an ODCS ``sql`` rule.
 
-    The FLUID field is "SQL or boolean expression that must evaluate to true",
-    which is exactly ODCS ``$defs.DataQualitySql`` (``query`` plus one operator)
-    with ``mustBe: true``. ``mustBe`` is untyped in the spec, so a boolean is
-    as valid there as a row count.
+    The FLUID field is "SQL or boolean expression that must evaluate to true" —
+    a ROW PREDICATE, such as ``preferred_customer_flag IN ('Y', 'N')``. ODCS is
+    specific about what ``sql`` means: ``$defs.DataQuality.type`` says "'sql' is
+    an individual SQL query that returns a value that can be compared", and
+    ``$defs.DataQualitySql.query`` carries the example ``SELECT COUNT(*) FROM
+    ${table} WHERE ${column} IS NOT NULL``. Emitting the bare predicate as
+    ``query`` therefore handed an engine something it cannot execute: it was a
+    fragment, not a statement, and the ``mustBe: true`` beside it compared
+    against a value no query produced.
+
+    A predicate is now exported as the count of rows that fail it, compared to
+    zero — the shape ODCS's own example takes, and one its
+    ``$defs.DataQualityOperators`` ``oneOf`` accepts. ``${table}`` is the
+    placeholder from that example.
+
+    ``IS NOT TRUE`` rather than ``NOT (...)`` on purpose. Under SQL's
+    three-valued logic ``NOT (flag IN ('Y','N'))`` is NULL when ``flag`` is
+    NULL, so a naive negation counts no failure for the row — yet a row whose
+    predicate did not evaluate to TRUE has not satisfied "must evaluate to
+    true". ``IS NOT TRUE`` catches NULL and FALSE alike, and is supported by
+    DuckDB, PostgreSQL, MySQL, Snowflake and BigQuery.
+
+    An expression that is already a query (its first token is ``SELECT`` or
+    ``WITH``) is passed through as written with the previous comparison: the
+    author wrote a statement and chose what it returns. The boundary matters —
+    ``startswith`` alone sent ``selected_at IS NOT NULL`` and ``with_tax > 0``
+    down that branch and exported them unchanged, reinstating the very fragment
+    this is here to remove.
+
+    A predicate still containing a ``;`` of its own is left as the author wrote
+    it: the field is specified as one predicate, and a second statement in it is
+    not something to guess at.
     """
-    check: Dict[str, Any] = {
-        "type": "sql",
-        "query": expr["expression"],
-        "mustBe": True,
-        "description": f"Expression must hold for every row: {expr['expression']}",
-    }
+    expression = str(expr["expression"]).strip()
+    # A trailing ``;`` would end up inside the wrapper's parentheses below.
+    expression = expression.rstrip(";").rstrip()
+    is_query = bool(_QUERY_FIRST_TOKEN_RE.match(expression))
+
+    check: Dict[str, Any] = {"type": "sql"}
+    if is_query:
+        check["query"] = expression
+        check["mustBe"] = True
+        check["description"] = f"Expression must hold for every row: {expression}"
+    else:
+        # The predicate gets its own line: a trailing ``-- comment`` on one line
+        # with the wrapper swallowed ``) IS NOT TRUE`` and left a statement the
+        # engine could not parse.
+        check["query"] = f"SELECT COUNT(*) FROM ${{table}} WHERE (\n{expression}\n) IS NOT TRUE"
+        check["mustBe"] = 0
+        check["description"] = f"Rows failing the expression must be 0: {expression}"
+
     severity = expr.get("severity")
     if severity:
         check["severity"] = _DQ_SEVERITY.get(severity, severity)

@@ -36,8 +36,8 @@ Per-port pass-throughs flow through ``expose.odps_passthrough.*`` /
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, Dict, List, Optional
+from collections.abc import Iterable, Mapping, MutableMapping
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fluid_build.util.contract import (
     builds_to_canonical_input_ports,
@@ -62,6 +62,56 @@ from .types import provider_to_port_type
 # open slot the closed object leaves, under a name that says whose it is.
 VERSION_CONSTRAINT_PROPERTY = "fluidVersionConstraint"
 
+
+def _range_lower_bound(constraint: Any) -> Optional[str]:
+    """The lowest version a semver range accepts, as an exact semver string.
+
+    Only the forms ``$defs.semverRange`` documents: ``^1.2``, ``~1.4``,
+    ``>=1.0.0`` and an exact version. Anything else returns ``None`` so the
+    caller falls back rather than guesses — a wrong exact version in exported
+    lineage is worse than the constant it replaces, because it reads as a fact
+    somebody established. ``>1.0.0`` is among the refusals on purpose: it does
+    not accept 1.0.0, and its true lower bound is the next version, which semver
+    gives no way to name.
+
+    Deliberately not a semver library: none of ``semver``,
+    ``semantic_version`` or ``packaging`` is a declared dependency of this
+    project, and the CLI's core is kept lean on purpose. ``schema_manager.VersionConstraint`` is also not reused: it rejects
+    the caret outright ("Invalid FLUID version format"), does not normalise to
+    three components, and is the FLUID *schema* version type — pointing it at an
+    upstream data product's version would overload it and put ``--min-version``
+    at risk for no gain.
+    """
+    if not isinstance(constraint, str):
+        return None
+    text = constraint.strip()
+    if not text or "," in text or "||" in text or " " in text:
+        return None
+    for prefix in ("^", "~", ">=", "="):
+        if text.startswith(prefix):
+            text = text[len(prefix) :].strip()
+            break
+    if not text or any(c in text for c in "<>=*xX^~"):
+        return None
+    parts = text.split(".")
+    # ``isascii()`` as well as ``isdigit()``: the latter is true for Arabic-Indic
+    # digits and superscripts, so ``^١.٢`` would otherwise be read as a range and
+    # its "lower bound" emitted verbatim into a version field. A leading zero is
+    # refused for the same reason — ``^01.2`` is a schema-valid constraint
+    # (``semverRange`` carries no pattern) but ``01.2.0`` matches neither
+    # ``$defs.semver`` nor any resolver, so it is worse than the fallback.
+    if not 1 <= len(parts) <= 3 or not all(
+        p.isascii() and p.isdigit() and (p == "0" or not p.startswith("0")) for p in parts
+    ):
+        return None
+    # ``^2.1`` and ``~1.4`` accept 2.1.0 and 1.4.0 as their lowest member; an
+    # omitted component is zero, which is how npm's range grammar — the one
+    # ``$defs.semverRange``'s examples come from — reads a partial version.
+    while len(parts) < 3:
+        parts.append("0")
+    return ".".join(parts)
+
+
 # ----- FLUID → ODPS --------------------------------------------------------
 
 
@@ -69,24 +119,186 @@ def to_odps(ctx: ExportCtx) -> None:
     fluid = ctx.fluid
     product_id = fluid_id(fluid) or "product"
 
+    # Input ports are resolved first because an output port's ``inputContracts``
+    # names them: deriving that list from the already-resolved
+    # ``(contractId, version)`` pairs is what keeps the two halves of one
+    # document agreeing, instead of two sites each deciding a version. Only the
+    # authored subset feeds the derivation — see ``_build_input_ports``. The
+    # ``ctx.odps`` keys are still assigned outputPorts-first below, so the
+    # emitted key order is unchanged.
+    input_ports, authored_ports = _build_input_ports(fluid, ctx, product_id)
+    derived_input_contracts = _input_contracts_from_ports(authored_ports)
+
     output_ports = []
     for expose in fluid.get("exposes") or []:
         if not isinstance(expose, Mapping):
             continue
-        port = _expose_to_output_port(expose, product_id)
+        port = _expose_to_output_port(expose, product_id, derived_input_contracts)
         if port:
             output_ports.append(port)
     if output_ports:
         ctx.odps["outputPorts"] = output_ports
 
-    input_ports = _build_input_ports(fluid, ctx, product_id)
     if input_ports:
         ctx.odps["inputPorts"] = input_ports
 
 
+def _input_contracts_from_ports(
+    input_ports: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """The ``outputPorts[].inputContracts`` a product's own consumes imply.
+
+    Takes the *authored* input ports only (``_build_input_ports``' second
+    return value), never the full list.
+
+    Every output port receives the same entries. ODPS models the key per port,
+    but FLUID's ``consumes[]`` is product-level — ``$defs.consumeRef`` has no
+    expose selector — so there is no per-expose upstream mapping to narrow it
+    with, and claiming one would be invention.
+
+    Bitol ``$defs.InputContract`` is ``additionalProperties: false`` with
+    ``required: [id, version]`` and no other properties, so an entry is exactly
+    the input port's resolved ``contractId`` and ``version`` — read from the
+    ports rather than recomputed, so the lineage cannot name a contract or a
+    version the document's own input ports do not.
+
+    Until this existed, ``inputContracts`` came only from an imported ODPS
+    document's pass-through, so a contract written in FLUID exported output
+    ports that named none of their upstreams and a catalog reading lineage
+    there saw a product with no dependencies at all.
+    """
+    contracts: List[Dict[str, Any]] = []
+    seen: set = set()
+    for port in input_ports:
+        contract_id = port.get("contractId")
+        version = port.get("version")
+        if not contract_id or not version:
+            continue
+        key = (str(contract_id), str(version))
+        if key in seen:
+            continue
+        seen.add(key)
+        contracts.append({"id": str(contract_id), "version": str(version)})
+    return contracts
+
+
+def _consume_to_input_port(
+    canonical: Mapping[str, Any], name: str, contract_id: Optional[str]
+) -> Dict[str, Any]:
+    """One Bitol ODPS ``InputPort`` from one normalized ``consumes[]`` entry.
+
+    The version is resolved in a chain: the exact version the author states
+    (``contractVersion``) wins; failing that, the lowest version the declared
+    range accepts; failing that, the consume's own ``version`` or the provider
+    default. The chain ENDS at that constant rather than omitting the field,
+    because ODPS v1.0.0 — the default emit target — has ``version`` in
+    ``InputPort``'s ``required``, so an omission would make every such export
+    invalid. Before the middle step existed, a consume stating only a range had
+    neither of the other two and every such export claimed ``version: 1.0.0`` —
+    a pin the contract never made.
+
+    ``versionConstraint`` itself has no field in that closed object, so it rides
+    along as a ``customProperties`` entry. Dropping it left an export claiming
+    the upstream is pinned to exactly one version when the contract said
+    "any 1.x".
+    """
+    constraint = canonical.get("version_constraint")
+    resolved_version = (
+        canonical.get("contract_version") or _range_lower_bound(constraint) or canonical["version"]
+    )
+    port: Dict[str, Any] = {
+        "name": name,
+        "version": str(resolved_version),
+        "contractId": contract_id or name,
+    }
+    if constraint:
+        port["customProperties"] = [
+            {
+                "property": VERSION_CONSTRAINT_PROPERTY,
+                "value": str(constraint),
+                "description": (
+                    "FLUID consumes[].versionConstraint — the semver range "
+                    "this product accepts from the upstream contract."
+                ),
+            }
+        ]
+    return port
+
+
+def consume_input_port_contract_ids(fluid: Mapping[str, Any]) -> Set[str]:
+    """The ``contractId``s an export's input ports carry for ``consumes[]``.
+
+    A publish target that strips input ports by a cruder rule than "is this a
+    product consume" needs this to tell which of the ports it dropped had
+    lineage *derived* from ``consumes[]`` — the only lineage
+    :func:`remove_output_port_input_contracts` may remove.
+
+    An ``expects[]`` port is the case that makes the distinction matter. It is
+    dropped by a "no ``sourceSystemId``" rule just like a product consume, but
+    its expose replays the upstream document's own ``inputContracts`` verbatim
+    through the ODPS pass-through, and nothing else in the payload records that
+    dependency — Access agreements are built from ``consumes[]``. Removing it
+    would lose the upstream, not deduplicate it.
+    """
+    ids: Set[str] = set()
+    for canonical in consumes_to_canonical_ports(fluid):
+        contract_id = input_port_contract_id(canonical)
+        if contract_id:
+            ids.add(str(contract_id))
+    return ids
+
+
+def remove_output_port_input_contracts(
+    odps_payload: MutableMapping[str, Any], removed_ports: Iterable[Any]
+) -> None:
+    """Drop ``outputPorts[].inputContracts`` entries for removed input ports.
+
+    The inverse of :func:`_input_contracts_from_ports`, and it lives beside it
+    so the two cannot drift. A publish target that removes an input port has to
+    remove the lineage entry that mirrors it: forge derives that key from the
+    product's own ``consumes[]``, so one dependency is stated twice in a
+    document, and removing only the port leaves the upstream still named.
+
+    Both Data Mesh Manager publish paths need this — the
+    :class:`DataMeshManagerRegistrar` that backs ``fluid publish --target
+    datamesh-manager`` and ``catalog.register``, and the
+    ``DataMeshManagerProvider`` behind ``fluid datamesh-manager publish``. They
+    strip by different rules (a missing ``sourceSystemId`` vs. a canonical
+    product-consume match), so each passes the ports it dropped and this reads
+    the ``contractId``s off them. Entropy would otherwise have to mirror each
+    upstream product as a SourceSystem to resolve the reference, and render the
+    duplicate graph nodes the strip exists to prevent.
+
+    A dropped port with no ``contractId`` needs no action: it never produced a
+    lineage entry, because :func:`_input_contracts_from_ports` skips it.
+    """
+    contract_ids = {
+        str(port["contractId"])
+        for port in removed_ports
+        if isinstance(port, Mapping) and port.get("contractId")
+    }
+    if not contract_ids:
+        return
+    for port in odps_payload.get("outputPorts") or []:
+        if not isinstance(port, MutableMapping):
+            continue
+        entries = port.get("inputContracts")
+        if not isinstance(entries, list):
+            continue
+        kept = [
+            entry
+            for entry in entries
+            if not (isinstance(entry, Mapping) and str(entry.get("id")) in contract_ids)
+        ]
+        if kept:
+            port["inputContracts"] = kept
+        else:
+            port.pop("inputContracts", None)
+
+
 def _build_input_ports(
     fluid: Mapping[str, Any], ctx: ExportCtx, product_id: str
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Assemble Bitol ODPS v1.0.0 ``InputPort`` list from any FLUID lineage.
 
     Three lineage sources are handled, in priority order:
@@ -97,7 +309,7 @@ def _build_input_ports(
        since v1.0.0 ``InputPort`` is ``additionalProperties: false``, and
        carries ``versionConstraint`` — which that closed object has no field
        for — as a ``customProperties`` entry. ``contractId`` comes from
-       :func:`_input_port_contract_id`.
+       :func:`input_port_contract_id`.
     2. ``builds[].properties.source`` (SDP convention) — normalized via
        :func:`builds_to_canonical_input_ports`. Emits per-source-stream
        ports with synthetic ``contractId`` and ``customProperties`` for
@@ -113,8 +325,28 @@ def _build_input_ports(
     disambiguating name (``b1__data_analytics_platform`` / ``b2__…``). Before
     this dedup keyed by name alone, the second consume was silently dropped
     and downstream catalogs lost half the lineage.
+
+    Returns ``(input_ports, authored_ports)``. ``authored_ports`` is the path-1
+    subset — the upstream *contracts* this contract names, and the only lineage
+    ``outputPorts[].inputContracts`` may be derived from.
+
+    Path 2 is excluded because its ``contractId`` is synthesized as
+    ``<kind>://<database>/<stream>`` for a source that has no contract at all
+    (see :func:`builds_to_canonical_input_ports`). That synthesis exists to
+    populate ``inputPorts[].contractId``, which ODPS v1.0.0 requires;
+    ``inputContracts`` is optional, so naming an id no catalog can resolve is
+    worse than naming nothing — the failure
+    :func:`input_port_contract_id` describes: an id that resolves in no
+    catalog following the reference.
+
+    Path 3 is excluded because ``expects[]`` is also the carrier an imported
+    ODPS document's input ports arrive on, and an imported document's
+    output-port lineage is whatever that document said — including nothing.
+    Deriving it there made import → export add a dependency the author never
+    wrote, which the round-trip tests caught.
     """
     input_ports: List[Dict[str, Any]] = []
+    authored_ports: List[Dict[str, Any]] = []
     seen: set = set()  # ``(name, contract_id)`` tuples — true dedup key.
     seen_names: set = set()  # ``name`` only — drives the collision-rename path.
     logger = getattr(ctx, "logger", None)
@@ -143,35 +375,16 @@ def _build_input_ports(
     for canonical in consumes_to_canonical_ports(
         fluid, default_version=default_version, logger=logger
     ):
-        contract_id = _input_port_contract_id(canonical)
+        contract_id = input_port_contract_id(canonical)
         dedup_key = (canonical["name"], contract_id)
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
         name = _unique_name(canonical["name"], canonical.get("reference"))
         seen_names.add(name)
-        consume_port: Dict[str, Any] = {
-            "name": name,
-            "version": canonical["version"],
-            "contractId": contract_id or name,
-        }
-        constraint = canonical.get("version_constraint")
-        if constraint:
-            # ``version`` here is the consume's own ``version`` or the
-            # provider's default — never the range. Dropping the range left an
-            # export claiming the upstream is pinned to exactly that version
-            # when the contract said "any 1.x".
-            consume_port["customProperties"] = [
-                {
-                    "property": VERSION_CONSTRAINT_PROPERTY,
-                    "value": str(constraint),
-                    "description": (
-                        "FLUID consumes[].versionConstraint — the semver range "
-                        "this product accepts from the upstream contract."
-                    ),
-                }
-            ]
+        consume_port = _consume_to_input_port(canonical, name, contract_id)
         input_ports.append(consume_port)
+        authored_ports.append(consume_port)
 
     # Path 2 — builds[].properties.source (SDP source streams)
     for canonical in builds_to_canonical_input_ports(
@@ -206,10 +419,10 @@ def _build_input_ports(
             seen_names.add(port_obj["name"])
             input_ports.append(port_obj)
 
-    return input_ports
+    return input_ports, authored_ports
 
 
-def _input_port_contract_id(canonical: Mapping[str, Any]) -> Optional[str]:
+def input_port_contract_id(canonical: Mapping[str, Any]) -> Optional[str]:
     """The contract an upstream consume points at.
 
     An explicit ``consumes[].contractId`` wins: that is an upstream which has
@@ -233,7 +446,11 @@ def _input_port_contract_id(canonical: Mapping[str, Any]) -> Optional[str]:
     return str(name) if name else None
 
 
-def _expose_to_output_port(expose: Mapping[str, Any], product_id: str) -> Optional[Dict[str, Any]]:
+def _expose_to_output_port(
+    expose: Mapping[str, Any],
+    product_id: str,
+    derived_input_contracts: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
     from fluid_build.providers.base import ProviderError
 
     # Bitol ODPS v1.0.0 OutputPort requires ``name``. Accept any of
@@ -264,7 +481,15 @@ def _expose_to_output_port(expose: Mapping[str, Any], product_id: str) -> Option
     if "sbom" in pt:
         port["sbom"] = list(pt["sbom"])
     if "input_contracts" in pt:
+        # An imported ODPS document's own lineage wins, so import → export stays
+        # a fixed point: the upstream stated these, and re-deriving them from our
+        # consumes could name different contracts.
         port["inputContracts"] = list(pt["input_contracts"])
+    elif derived_input_contracts:
+        # Otherwise the product's own consumes ARE its lineage. A
+        # FLUID-authored contract used to export output ports naming no
+        # upstreams at all.
+        port["inputContracts"] = [dict(entry) for entry in derived_input_contracts]
 
     if expose.get("tags"):
         port["tags"] = list(expose["tags"])
