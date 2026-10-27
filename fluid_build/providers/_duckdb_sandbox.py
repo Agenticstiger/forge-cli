@@ -34,8 +34,9 @@ DuckDB docs give ("Securing DuckDB", introduced in 1.2):
    false``, so a query cannot pull an extension in afterwards;
 4. ``temp_directory`` (a directory this helper creates and owns, see below),
    ``home_directory`` (pinned to ``$HOME``, see below), then
-   ``allowed_directories`` and ``allowed_paths``: only what the call site
-   declares it reads or writes;
+   ``allowed_directories`` and ``allowed_paths``: what the call site declares
+   it reads or writes, plus -- only when it declared a remote prefix -- the one
+   host CA bundle file DuckDB's TLS needs (:func:`_ca_bundle_for_remote`);
 5. ``enable_external_access = false``;
 6. ``lock_configuration = true``, so the SQL cannot ``SET`` any of it back,
    then a read-back that the grants are the ones the call site asked for.
@@ -53,6 +54,25 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
   refused on 1.5.0; see ``tests/providers/test_duckdb_sandbox.py``).
   :data:`MIN_DUCKDB_VERSION` is therefore 1.5.0, and a connection refuses to
   open on anything older.
+* A remote read needs the host's CA bundle, and from DuckDB 2.0 that read goes
+  through the sandbox. duckdb/duckdb-httpfs#474 moved it inside DuckDB's file
+  system (``CURLOPT_CAINFO_BLOB``, an in-memory store for httplib) where curl
+  and OpenSSL used to open it themselves, bypassing ``allowed_paths``
+  entirely. So on 1.5.x a remote read works with no CA grant, and on 2.0.0 the
+  same read fails before a byte moves with ``Cannot read a CA certificate
+  bundle``. :func:`_ca_bundle_for_remote` grants it: one file, only when the
+  allowlist carries a remote prefix. Measured, not assumed:
+  ``fluid init --discover s3://noaa-ghcn-pds/...`` emitted 8 columns on 1.5.6
+  and exited 1 on 2.0.0, measured at ``5f2ec50b`` (and on clean ``7cf5471a``
+  when the card was filed); the grant makes 2.0.0 emit the same 8.
+  Two things this does NOT do, because neither is needed: it does not set
+  ``ca_cert_file`` (the probe mirrors DuckDB's own order, so DuckDB opens the
+  file that was granted), and it touches no verification setting -- an expired
+  and a self-signed certificate are already refused on both engines, with and
+  without ``enable_server_cert_verification``, which is the httplib flag while
+  s3 and https go through curl (duckdb/duckdb-httpfs#378 unified the two).
+  Plain ``http://`` never needed the grant: duckdb/duckdb-httpfs#499 made a
+  failed bundle load non-fatal there, and 2.0.0 carries it.
 * DuckDB folds its ``temp_directory`` into ``allowed_directories``, and its
   default is relative: ``.tmp`` in the working directory, or ``<db>.tmp``
   beside a file database. Both sit where the contract's repository can place a
@@ -1008,6 +1028,47 @@ def _refuse_escaping_remote_prefixes(allow: DuckDBAllowlist) -> None:
         )
 
 
+#: The CA bundles DuckDB's httpfs probes, in the order its own refusal names
+#: them ("Add one of ... to allowed_paths"). Mirrored from DuckDB rather than
+#: borrowed from ``ssl.get_default_verify_paths()`` or ``certifi``, the way
+#: sethmlarson/truststore picks a trust store for OpenSSL: the grant has to
+#: name the file DuckDB will open, and DuckDB probes these five itself,
+#: consulting neither OpenSSL's defaults nor ``SSL_CERT_FILE``. Granting
+#: certifi's bundle would also add a dependency the base install does not ship.
+#: ``tests/providers/test_duckdb_sandbox_ca_bundle.py`` parses the list back out
+#: of DuckDB's refusal and fails if upstream's order or contents drift.
+_CA_BUNDLE_CANDIDATES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+)
+
+
+def _ca_bundle_for_remote(allow: DuckDBAllowlist) -> Optional[str]:
+    """The one CA bundle to grant for ``allow``'s remote prefixes, if any.
+
+    ``None`` when the call site declared no remote prefix -- a purely local
+    read must not gain a grant it has no use for -- and ``None`` when the host
+    has none of DuckDB's candidates, which is a minimal container or Windows.
+    Granting nothing there is what this already did: DuckDB then raises its own
+    refusal naming the paths it looked for, which is more accurate than
+    anything this could say.
+
+    A directory is never returned. ``allowed_paths`` grants one file, so this
+    cannot widen what :func:`_refuse_ungranted_dirs` reads back from
+    ``allowed_directories`` -- including the remote prefixes that are
+    load-bearing on 1.5.x (see :func:`_escaping_remote_prefix`).
+    """
+    if not allow.remote_prefixes:
+        return None
+    for candidate in _CA_BUNDLE_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def _refuse_ungranted_dirs(con: Any, allow: DuckDBAllowlist, spill: str) -> None:
     """Refuse the connection if DuckDB granted a directory ``allow`` does not name.
 
@@ -1191,7 +1252,12 @@ def _confine_connection(
     _refuse_escaping_remote_prefixes(allow)
     directories = [_with_sep(d) for d in allow.dirs] + list(allow.remote_prefixes)
     con.execute(f"SET allowed_directories = {_sql_list(directories)}")
-    con.execute(f"SET allowed_paths = {_sql_list(allow.paths)}")
+    # The CA bundle is appended here and NOT folded into ``allow``: the
+    # allowlist stays what the call site declared, so a refusal hint and the
+    # read-back below speak only of the caller's own grants.
+    bundle = _ca_bundle_for_remote(allow)
+    paths = list(allow.paths) + ([bundle] if bundle is not None else [])
+    con.execute(f"SET allowed_paths = {_sql_list(paths)}")
     con.execute("SET enable_external_access = false")
     con.execute("SET lock_configuration = true")
     _refuse_ungranted_dirs(con, allow, spill)

@@ -683,6 +683,7 @@ jobs:
             tests/providers/test_duckdb_compat.py \
             tests/providers/test_duckdb_sandbox.py \
             tests/providers/test_duckdb_sandbox_workspace_root.py \
+            tests/providers/test_duckdb_sandbox_ca_bundle.py \
             tests/build_runners/test_duckdb_cursor_canonical.py \
             tests/build_runners/test_schema_evolution_type_family.py \
             tests/cli/discover/test_discover_type_canonicalization.py \

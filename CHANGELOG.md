@@ -53,6 +53,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Command Center gate still lets a credential reach any public `https` endpoint unlisted.
   Mirroring them would have reproduced the hole.
 
+### Fixed
+
+- **`fluid init --discover` against a remote URL failed on DuckDB 2.0.0**, before a byte was read:
+  `PermissionException: Cannot read a CA certificate bundle: file system access is restricted by
+  configuration`. TLS needs the host's trust store, the sandbox granted no path to it, and nothing
+  granted one when a remote prefix was declared — so the whole remote-discovery surface was broken
+  on the engine the project resolves to by default, while the same call worked on 1.5.x. The cause
+  is upstream and deliberate: duckdb/duckdb-httpfs#474 moved the bundle read inside DuckDB's own
+  file system, where curl and OpenSSL used to open it themselves and bypassed `allowed_paths`
+  entirely.
+
+  The sandbox now grants the first CA bundle that exists out of the five DuckDB probes, as **one
+  file** in `allowed_paths`, and only when the allowlist carries a remote prefix. A local read
+  gains nothing, `allowed_directories` is untouched — so what a remote prefix grants locally is
+  unchanged — and the grant is not folded into the allowlist, so refusal messages still name only
+  what the contract declared. On a host with none of the five (a minimal container, Windows)
+  nothing is granted and DuckDB's own refusal, which names the paths it looked for, is left to
+  speak.
+
+  Certificate verification is untouched and stays on: an expired and a self-signed certificate are
+  refused on 1.5.6 and 2.0.0 alike, with and without `enable_server_cert_verification` — that
+  setting governs the httplib client, while `s3://` and `https://` go through curl, whose own flag
+  defaults to on (duckdb/duckdb-httpfs#378 unified the two). Nothing here disables verification or
+  pins `ca_cert_file`.
+
+  Verified by running the CLI: `fluid init --discover s3://noaa-ghcn-pds/csv/by_year/2024.csv`
+  emits 8 columns and `--discover https://…/customer.csv` emits 18, on 1.5.1, 1.5.6 and 2.0.0,
+  and `fluid validate` accepts the result.
+
 ### Upgrade notes
 
 - **A contract whose orchestrator is on a public host now fails until the operator allows it.**
