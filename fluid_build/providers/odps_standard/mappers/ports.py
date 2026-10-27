@@ -242,7 +242,7 @@ def consume_input_port_contract_ids(fluid: Mapping[str, Any]) -> Set[str]:
     """
     ids: Set[str] = set()
     for canonical in consumes_to_canonical_ports(fluid):
-        contract_id = _input_port_contract_id(canonical)
+        contract_id = input_port_contract_id(canonical)
         if contract_id:
             ids.add(str(contract_id))
     return ids
@@ -309,7 +309,7 @@ def _build_input_ports(
        since v1.0.0 ``InputPort`` is ``additionalProperties: false``, and
        carries ``versionConstraint`` — which that closed object has no field
        for — as a ``customProperties`` entry. ``contractId`` comes from
-       :func:`_input_port_contract_id`.
+       :func:`input_port_contract_id`.
     2. ``builds[].properties.source`` (SDP convention) — normalized via
        :func:`builds_to_canonical_input_ports`. Emits per-source-stream
        ports with synthetic ``contractId`` and ``customProperties`` for
@@ -336,7 +336,7 @@ def _build_input_ports(
     populate ``inputPorts[].contractId``, which ODPS v1.0.0 requires;
     ``inputContracts`` is optional, so naming an id no catalog can resolve is
     worse than naming nothing — the failure
-    :func:`_input_port_contract_id` describes: an id that resolves in no
+    :func:`input_port_contract_id` describes: an id that resolves in no
     catalog following the reference.
 
     Path 3 is excluded because ``expects[]`` is also the carrier an imported
@@ -375,7 +375,7 @@ def _build_input_ports(
     for canonical in consumes_to_canonical_ports(
         fluid, default_version=default_version, logger=logger
     ):
-        contract_id = _input_port_contract_id(canonical)
+        contract_id = input_port_contract_id(canonical)
         dedup_key = (canonical["name"], contract_id)
         if dedup_key in seen:
             continue
@@ -422,7 +422,7 @@ def _build_input_ports(
     return input_ports, authored_ports
 
 
-def _input_port_contract_id(canonical: Mapping[str, Any]) -> Optional[str]:
+def input_port_contract_id(canonical: Mapping[str, Any]) -> Optional[str]:
     """The contract an upstream consume points at.
 
     An explicit ``consumes[].contractId`` wins: that is an upstream which has

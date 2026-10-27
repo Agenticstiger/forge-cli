@@ -57,6 +57,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on its own line and a trailing `;` is dropped, so neither a line comment nor a stray semicolon can
   swallow the closing paren.
 
+- **A renamed input port leaked a product consume into the Data Mesh Manager payload.** Found while
+  covering the lineage strip above. When two `consumes[]` share an `exposeId` the exporter renames
+  the second, and `fluid datamesh-manager publish` matched the renamed port by name — which misses
+  two of the three rename shapes: a `productId` tail containing `__` of its own
+  (`silver.crm__core` → `crm__core__customers`, split at the wrong `__`), and the numeric-suffix
+  fallback (`customers_2`, with no `__` to match on). Both published a port Entropy cannot resolve
+  without mirroring the upstream product as a SourceSystem. The match now also tests the contract id
+  the exporter actually stamps on the port, read from the exporter's own helper so the convention has
+  one definition; a source-system consume keeps its port, as before. This leak predates the release —
+  but deriving `outputPorts[].inputContracts` would have doubled it, so it is fixed here rather than
+  carried.
+
 ### Added
 
 - `consumes[].contractVersion` (0.7.6 preview) — the exact upstream version this product was built

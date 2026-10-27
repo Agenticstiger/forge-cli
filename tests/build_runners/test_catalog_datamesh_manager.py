@@ -155,6 +155,60 @@ class TestProductConsumeLineageIsNotPublishedTwice:
             assert "inputContracts" not in port, port["inputContracts"]
 
     @respx.mock
+    def test_a_stated_lineage_survives_even_when_the_product_also_consumes(self):
+        """The cell that distinguishes "pass-through wins" from
+        "consume-derived": with both present the mapper emits the stated
+        entries, so there is no derived entry to strip and the stated one must
+        not be taken for it."""
+        from fluid_build.api.catalog_publication import CatalogPublicationPayload
+
+        respx.route(method="PUT").mock(return_value=httpx.Response(200, json={"ok": True}))
+
+        contract = _consuming_contract()
+        contract["expects"] = [
+            {"id": "customers_raw", "version": "1", "contractId": "vendor.customers_raw"}
+        ]
+        contract["exposes"][0]["odps_passthrough"] = {
+            "input_contracts": [{"id": "vendor.customers_raw", "version": "1"}]
+        }
+
+        payload = CatalogPublicationPayload.from_contract(contract, {})
+        assert DataMeshManagerRegistrar(api_token="t").register_payload(payload).succeeded is True
+
+        bodies = [
+            json.loads(call.request.content)
+            for call in respx.calls
+            if "/api/dataproducts/" in str(call.request.url)
+        ]
+        lineage = [port.get("inputContracts") for port in bodies[0].get("outputPorts") or []]
+        assert lineage == [[{"id": "vendor.customers_raw", "version": "1"}]], lineage
+
+    @respx.mock
+    def test_a_stated_entry_naming_the_consumed_contract_is_still_removed(self):
+        """When the stated id IS the one the consume derives, the consume wins.
+        Keeping it would name an upstream product with no input port to resolve
+        it — the duplicate-graph-node leak this strip exists to prevent."""
+        from fluid_build.api.catalog_publication import CatalogPublicationPayload
+
+        respx.route(method="PUT").mock(return_value=httpx.Response(200, json={"ok": True}))
+
+        contract = _consuming_contract()
+        contract["exposes"][0]["odps_passthrough"] = {
+            "input_contracts": [{"id": "silver.crm.core.customers", "version": "1.0.0"}]
+        }
+
+        payload = CatalogPublicationPayload.from_contract(contract, {})
+        assert DataMeshManagerRegistrar(api_token="t").register_payload(payload).succeeded is True
+
+        bodies = [
+            json.loads(call.request.content)
+            for call in respx.calls
+            if "/api/dataproducts/" in str(call.request.url)
+        ]
+        for port in bodies[0].get("outputPorts") or []:
+            assert "inputContracts" not in port, port["inputContracts"]
+
+    @respx.mock
     def test_an_imported_documents_own_lineage_is_not_stripped_with_it(self):
         """The registrar drops an input port that carries no ``sourceSystemId``,
         which catches an ``expects[]`` port as well as a product consume. Only

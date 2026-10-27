@@ -45,6 +45,7 @@ import logging
 from typing import Any, Dict, List, Mapping, Optional
 
 from fluid_build.providers.odps_standard.mappers.ports import (
+    input_port_contract_id,
     remove_output_port_input_contracts,
 )
 from fluid_build.util.contract import consumes_to_canonical_ports, kind_to_dmm_type
@@ -203,6 +204,12 @@ def remove_odps_product_consume_input_ports(
 
     product_port_names: set[str] = set()
     product_contract_ids: set[str] = set()
+    # The id the exporter actually stamps on a product-consume's input port,
+    # read from the same helper the exporter uses so the convention has one
+    # definition. Matching on it catches a renamed port whatever shape the
+    # rename took, including the numeric-suffix fallback that carries no
+    # ``__`` for the name checks below to find.
+    product_derived_contract_ids: set[str] = set()
     for canonical in consumes_to_canonical_ports(fluid, logger=LOG):
         reference = canonical.get("reference")
         if not reference or canonical.get("source_system_id"):
@@ -212,6 +219,9 @@ def remove_odps_product_consume_input_ports(
             if value:
                 product_port_names.add(str(value))
         product_contract_ids.add(str(reference))
+        derived = input_port_contract_id(canonical)
+        if derived:
+            product_derived_contract_ids.add(str(derived))
 
     if not product_port_names and not product_contract_ids:
         return
@@ -220,6 +230,19 @@ def remove_odps_product_consume_input_ports(
         if not isinstance(port, Mapping):
             return False
         name = str(port.get("name", ""))
+        # An exact match on the derived contract id is the most specific
+        # signal there is: it is ``{productId}.{exposeId}`` or an id the
+        # author pinned, not the bare productId the checks below fall back
+        # to, so it cannot catch a source-system port that merely shares an
+        # upstream. Being independent of the NAME is what matters — the name
+        # checks below miss two of the three rename shapes, a productId tail
+        # containing ``__`` of its own (``silver.crm__core`` →
+        # ``crm__core__customers``, split at the wrong ``__``) and the
+        # numeric-suffix fallback (``customers_2``, no ``__`` to find at
+        # all). Both leaked a port Entropy cannot resolve, and since the
+        # lineage key mirrors the ports, they leaked twice.
+        if str(port.get("contractId", "")) in product_derived_contract_ids:
+            return True
         # Fast path — original (pre-Gap-3) behavior. A port whose name is
         # exactly a canonical product-consume exposeId is a product-consume
         # regardless of contractId. This is the legacy path that
