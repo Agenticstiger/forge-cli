@@ -95,7 +95,10 @@ def _range_lower_bound(constraint: Any) -> Optional[str]:
     if not text or any(c in text for c in "<>=*xX^~"):
         return None
     parts = text.split(".")
-    if not 1 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+    # ``isascii()`` as well as ``isdigit()``: the latter is true for Arabic-Indic
+    # digits and superscripts, so ``^١.٢`` would otherwise be read as a range and
+    # its "lower bound" emitted verbatim into a version field.
+    if not 1 <= len(parts) <= 3 or not all(p.isascii() and p.isdigit() for p in parts):
         return None
     # ``^2.1`` and ``~1.4`` accept 2.1.0 and 1.4.0 as their lowest member; an
     # omitted component is zero, which is also what semver.org says a range's

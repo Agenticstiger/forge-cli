@@ -146,6 +146,8 @@ class TestTheLowerBoundHelper:
             "<2.0.0",
             "<=2.0.0",
             "latest",
+            "^١.٢",  # Arabic-Indic digits: str.isdigit() is true for these
+            "^2.²",  # superscript two likewise
             "",
             "   ",
             None,
