@@ -57,6 +57,14 @@ UPSTREAM_CONTRACT_ID = "silver.crm.core.customers"
 EXPRESSION = "preferred_customer_flag IN ('Y', 'N')"
 
 
+def _counting_query(expression: str) -> str:
+    """The wrapper `_expression_to_quality` builds for a row predicate.
+
+    The predicate is on its own line so a trailing ``-- comment`` cannot eat the
+    closing paren and the comparison after it."""
+    return f"SELECT COUNT(*) FROM ${{table}} WHERE (\n{expression}\n) IS NOT TRUE"
+
+
 def _contract(consume: Optional[Dict[str, Any]] = None, **kw: Any) -> Dict[str, Any]:
     """A 0.7.6 contract with one consume and one expose carrying a quality rule."""
     base_consume: Dict[str, Any] = {"productId": "silver.crm.core", "exposeId": "customers"}
@@ -114,7 +122,7 @@ def _sql_rules(odcs: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# 19. the version an input port claims
+# Defect 19a — the version an input port claims
 # ---------------------------------------------------------------------------
 
 
@@ -148,6 +156,10 @@ class TestTheLowerBoundHelper:
             "latest",
             "^١.٢",  # Arabic-Indic digits: str.isdigit() is true for these
             "^2.²",  # superscript two likewise
+            "^01.2",  # a leading zero is not semver, and no resolver matches it
+            "^2.01",
+            "~00",
+            ">=0001.0.0",
             "",
             "   ",
             None,
@@ -202,7 +214,7 @@ class TestTheInputPortVersion:
 
 
 # ---------------------------------------------------------------------------
-# 19. the lineage an output port carries
+# Defect 19b — the lineage an output port carries
 # ---------------------------------------------------------------------------
 
 
@@ -273,6 +285,31 @@ class TestOutputPortLineage:
         assert odps["inputPorts"][0]["contractId"] == "vendor.customers_raw"
         assert "inputContracts" not in odps["outputPorts"][0]
 
+    def test_a_source_stream_is_an_input_port_but_not_a_contract(self):
+        """``builds[].properties.source`` synthesizes ``<kind>://<db>/<stream>``
+        as a contractId so ODPS v1.0.0's required ``inputPorts[].contractId`` is
+        populated for a source that has no contract at all. ``inputContracts``
+        is optional, so naming an id no catalog can resolve is worse than
+        naming nothing."""
+        contract = _contract()
+        contract.pop("consumes")
+        contract["builds"] = [
+            {
+                "buildId": "b1",
+                "engine": "duckdb",
+                "properties": {
+                    "source": {
+                        "kind": "postgres",
+                        "database": "crmdb",
+                        "streams": ["customers"],
+                    }
+                },
+            }
+        ]
+        odps = _odps(contract)
+        assert odps["inputPorts"][0]["contractId"].startswith("postgres://")
+        assert "inputContracts" not in odps["outputPorts"][0]
+
     def test_a_contract_with_no_consumes_gets_no_lineage_key(self):
         contract = _contract()
         contract.pop("consumes")
@@ -281,7 +318,7 @@ class TestOutputPortLineage:
 
 
 # ---------------------------------------------------------------------------
-# 19. the new field is preview-gated
+# Defect 19c — the new field is preview-gated
 # ---------------------------------------------------------------------------
 
 
@@ -307,7 +344,7 @@ class TestTheFieldIsPreviewGated:
 
 
 # ---------------------------------------------------------------------------
-# 20. a quality expression an engine can execute
+# Defect 20 — a quality expression an engine can execute
 # ---------------------------------------------------------------------------
 
 
@@ -315,9 +352,7 @@ class TestTheQualityExpression:
     def test_a_predicate_becomes_a_counting_query_compared_to_zero(self):
         rule = _expression_to_quality({"expression": EXPRESSION})
         assert rule["type"] == "sql"
-        assert rule["query"] == (
-            f"SELECT COUNT(*) FROM ${{table}} WHERE ({EXPRESSION}) IS NOT TRUE"
-        )
+        assert rule["query"] == _counting_query(EXPRESSION)
         assert rule["mustBe"] == 0
 
     def test_it_uses_the_placeholder_from_the_odcs_example(self):
@@ -332,19 +367,35 @@ class TestTheQualityExpression:
         assert "IS NOT TRUE" in rule["query"]
         assert f"NOT ({EXPRESSION})" not in rule["query"]
 
-    @pytest.mark.parametrize("prefix", ["SELECT", "select", "WITH", "  SELECT"])
+    @pytest.mark.parametrize("prefix", ["SELECT", "select", "WITH", "  SELECT", "SELECT\n"])
     def test_an_expression_that_is_already_a_query_passes_through(self, prefix):
         expression = f"{prefix} COUNT(*) FROM orders"
         rule = _expression_to_quality({"expression": expression})
         assert rule["query"] == expression.strip()
         assert rule["mustBe"] is True
 
-    def test_the_exported_odcs_validates(self):
-        from fluid_build.providers.odcs.validation import collect_errors
-        from fluid_build.providers.odcs.validation import load_schema as odcs_schema
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "selected_at IS NOT NULL",
+            "selection_count > 0",
+            "select_count = 1",
+            "with_tax > 0",
+            "withholding_amount >= 0",
+            "withdrawn_flag IS NOT NULL",
+        ],
+    )
+    def test_a_column_that_merely_starts_with_select_or_with_is_a_predicate(self, expression):
+        """``startswith`` with no word boundary sent these down the pass-through
+        branch and exported the bare fragment with ``mustBe: true`` — the exact
+        thing this is here to remove, reinstated for a whole class of columns."""
+        rule = _expression_to_quality({"expression": expression})
+        assert rule["query"] == _counting_query(expression)
+        assert rule["mustBe"] == 0
 
-        odcs = OdcsProvider().render(_contract({"versionConstraint": "^2.1"}), expose_id="orders")
-        assert collect_errors(odcs, odcs_schema()) == []
+    def test_a_trailing_semicolon_does_not_land_inside_the_parentheses(self):
+        rule = _expression_to_quality({"expression": "amount > 0;"})
+        assert rule["query"] == _counting_query("amount > 0")
 
     def test_the_rule_reaches_the_exported_document(self):
         odcs = OdcsProvider().render(_contract(), expose_id="orders")

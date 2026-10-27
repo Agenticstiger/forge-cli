@@ -74,10 +74,9 @@ def _range_lower_bound(constraint: Any) -> Optional[str]:
     not accept 1.0.0, and its true lower bound is the next version, which semver
     gives no way to name.
 
-    Deliberately not a semver library. ``semver``, ``semantic_version`` and
-    ``packaging`` are all present in the resolved environment but none is a
-    declared dependency of this project, and the CLI's core is kept lean on
-    purpose. ``schema_manager.VersionConstraint`` is also not reused: it rejects
+    Deliberately not a semver library: none of ``semver``,
+    ``semantic_version`` or ``packaging`` is a declared dependency of this
+    project, and the CLI's core is kept lean on purpose. ``schema_manager.VersionConstraint`` is also not reused: it rejects
     the caret outright ("Invalid FLUID version format"), does not normalise to
     three components, and is the FLUID *schema* version type — pointing it at an
     upstream data product's version would overload it and put ``--min-version``
@@ -97,12 +96,17 @@ def _range_lower_bound(constraint: Any) -> Optional[str]:
     parts = text.split(".")
     # ``isascii()`` as well as ``isdigit()``: the latter is true for Arabic-Indic
     # digits and superscripts, so ``^١.٢`` would otherwise be read as a range and
-    # its "lower bound" emitted verbatim into a version field.
-    if not 1 <= len(parts) <= 3 or not all(p.isascii() and p.isdigit() for p in parts):
+    # its "lower bound" emitted verbatim into a version field. A leading zero is
+    # refused for the same reason — ``^01.2`` is a schema-valid constraint
+    # (``semverRange`` carries no pattern) but ``01.2.0`` matches neither
+    # ``$defs.semver`` nor any resolver, so it is worse than the fallback.
+    if not 1 <= len(parts) <= 3 or not all(
+        p.isascii() and p.isdigit() and (p == "0" or not p.startswith("0")) for p in parts
+    ):
         return None
     # ``^2.1`` and ``~1.4`` accept 2.1.0 and 1.4.0 as their lowest member; an
-    # omitted component is zero, which is also what semver.org says a range's
-    # lower bound is.
+    # omitted component is zero, which is how npm's range grammar — the one
+    # ``$defs.semverRange``'s examples come from — reads a partial version.
     while len(parts) < 3:
         parts.append("0")
     return ".".join(parts)
@@ -147,6 +151,11 @@ def _input_contracts_from_ports(
     Takes the *authored* input ports only (``_build_input_ports``' second
     return value), never the full list.
 
+    Every output port receives the same entries. ODPS models the key per port,
+    but FLUID's ``consumes[]`` is product-level — ``$defs.consumeRef`` has no
+    expose selector — so there is no per-expose upstream mapping to narrow it
+    with, and claiming one would be invention.
+
     Bitol ``$defs.InputContract`` is ``additionalProperties: false`` with
     ``required: [id, version]`` and no other properties, so an entry is exactly
     the input port's resolved ``contractId`` and ``version`` — read from the
@@ -173,7 +182,7 @@ def _input_contracts_from_ports(
     return contracts
 
 
-def _consume_input_port(
+def _consume_to_input_port(
     canonical: Mapping[str, Any], name: str, contract_id: Optional[str]
 ) -> Dict[str, Any]:
     """One Bitol ODPS ``InputPort`` from one normalized ``consumes[]`` entry.
@@ -246,14 +255,23 @@ def _build_input_ports(
     this dedup keyed by name alone, the second consume was silently dropped
     and downstream catalogs lost half the lineage.
 
-    Returns ``(input_ports, authored_ports)``. ``authored_ports`` is the subset
-    from paths 1 and 2 — the lineage this contract states itself, and the only
-    lineage ``outputPorts[].inputContracts`` may be derived from. Path 3 is
-    excluded because ``expects[]`` is also the carrier an imported ODPS
-    document's input ports arrive on, and an imported document's output-port
-    lineage is whatever that document said — including nothing. Deriving it
-    there made import → export add a dependency the author never wrote, which
-    the round-trip tests caught.
+    Returns ``(input_ports, authored_ports)``. ``authored_ports`` is the path-1
+    subset — the upstream *contracts* this contract names, and the only lineage
+    ``outputPorts[].inputContracts`` may be derived from.
+
+    Path 2 is excluded because its ``contractId`` is synthesized as
+    ``<kind>://<database>/<stream>`` for a source that has no contract at all
+    (see :func:`builds_to_canonical_input_ports`). That synthesis exists to
+    populate ``inputPorts[].contractId``, which ODPS v1.0.0 requires;
+    ``inputContracts`` is optional, so naming an id no catalog can resolve is
+    worse than naming nothing — the failure
+    :func:`_input_port_contract_id` already warns about.
+
+    Path 3 is excluded because ``expects[]`` is also the carrier an imported
+    ODPS document's input ports arrive on, and an imported document's
+    output-port lineage is whatever that document said — including nothing.
+    Deriving it there made import → export add a dependency the author never
+    wrote, which the round-trip tests caught.
     """
     input_ports: List[Dict[str, Any]] = []
     authored_ports: List[Dict[str, Any]] = []
@@ -292,7 +310,7 @@ def _build_input_ports(
         seen.add(dedup_key)
         name = _unique_name(canonical["name"], canonical.get("reference"))
         seen_names.add(name)
-        consume_port = _consume_input_port(canonical, name, contract_id)
+        consume_port = _consume_to_input_port(canonical, name, contract_id)
         input_ports.append(consume_port)
         authored_ports.append(consume_port)
 
@@ -319,7 +337,6 @@ def _build_input_ports(
         if custom_props:
             port["customProperties"] = custom_props
         input_ports.append(port)
-        authored_ports.append(port)
 
     # Path 3 — expects[] (FLUID 0.7.1 legacy)
     for expect in fluid.get("expects") or []:

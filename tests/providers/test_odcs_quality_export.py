@@ -236,7 +236,7 @@ def test_quality_expression_lands_on_the_object_as_a_sql_rule() -> None:
     assert rules["amount_positive"]["type"] == "sql"
     assert (
         rules["amount_positive"]["query"]
-        == "SELECT COUNT(*) FROM ${table} WHERE (amount > 0) IS NOT TRUE"
+        == "SELECT COUNT(*) FROM ${table} WHERE (\namount > 0\n) IS NOT TRUE"
     )
     assert rules["amount_positive"]["mustBe"] == 0
 

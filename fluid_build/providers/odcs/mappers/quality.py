@@ -446,6 +446,11 @@ def _dq_severity(check: Dict[str, Any], rule: Mapping[str, Any]) -> None:
         check["severity"] = _DQ_SEVERITY.get(severity, severity)
 
 
+# ``\b`` so only a whole first token counts: a column named ``selected_at`` or
+# ``with_tax`` begins with these letters and is a predicate, not a query.
+_QUERY_FIRST_TOKEN_RE = re.compile(r"\s*(?:select|with)\b", re.IGNORECASE)
+
+
 def _expression_to_quality(expr: Mapping[str, Any]) -> Dict[str, Any]:
     """One ``exposes[].contract.quality`` entry as an ODCS ``sql`` rule.
 
@@ -460,9 +465,9 @@ def _expression_to_quality(expr: Mapping[str, Any]) -> Dict[str, Any]:
     against a value no query produced.
 
     A predicate is now exported as the count of rows that fail it, compared to
-    zero — the shape ODCS's own example takes, and the one OpenMetadata
-    documents for ``sql`` rules (exactly one comparison against a whole number).
-    ``${table}`` is the placeholder from that example.
+    zero — the shape ODCS's own example takes, and one its
+    ``$defs.DataQualityOperators`` ``oneOf`` accepts. ``${table}`` is the
+    placeholder from that example.
 
     ``IS NOT TRUE`` rather than ``NOT (...)`` on purpose. Under SQL's
     three-valued logic ``NOT (flag IN ('Y','N'))`` is NULL when ``flag`` is
@@ -471,12 +476,21 @@ def _expression_to_quality(expr: Mapping[str, Any]) -> Dict[str, Any]:
     true". ``IS NOT TRUE`` catches NULL and FALSE alike, and is supported by
     DuckDB, PostgreSQL, MySQL, Snowflake and BigQuery.
 
-    An expression that is already a query (it starts with ``SELECT`` or
+    An expression that is already a query (its first token is ``SELECT`` or
     ``WITH``) is passed through as written with the previous comparison: the
-    author wrote a statement and chose what it returns.
+    author wrote a statement and chose what it returns. The boundary matters —
+    ``startswith`` alone sent ``selected_at IS NOT NULL`` and ``with_tax > 0``
+    down that branch and exported them unchanged, reinstating the very fragment
+    this is here to remove.
+
+    A predicate still containing a ``;`` of its own is left as the author wrote
+    it: the field is specified as one predicate, and a second statement in it is
+    not something to guess at.
     """
     expression = str(expr["expression"]).strip()
-    is_query = expression.upper().startswith(("SELECT", "WITH"))
+    # A trailing ``;`` would end up inside the wrapper's parentheses below.
+    expression = expression.rstrip(";").rstrip()
+    is_query = bool(_QUERY_FIRST_TOKEN_RE.match(expression))
 
     check: Dict[str, Any] = {"type": "sql"}
     if is_query:
@@ -484,7 +498,10 @@ def _expression_to_quality(expr: Mapping[str, Any]) -> Dict[str, Any]:
         check["mustBe"] = True
         check["description"] = f"Expression must hold for every row: {expression}"
     else:
-        check["query"] = f"SELECT COUNT(*) FROM ${{table}} WHERE ({expression}) IS NOT TRUE"
+        # The predicate gets its own line: a trailing ``-- comment`` on one line
+        # with the wrapper swallowed ``) IS NOT TRUE`` and left a statement the
+        # engine could not parse.
+        check["query"] = f"SELECT COUNT(*) FROM ${{table}} WHERE (\n{expression}\n) IS NOT TRUE"
         check["mustBe"] = 0
         check["description"] = f"Rows failing the expression must be 0: {expression}"
 
