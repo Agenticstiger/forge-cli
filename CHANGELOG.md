@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-10-27
+
 ### Security
 
 - **A poisoned ODPS document could print its own credential to stderr.** `fluid odps import`'s new
@@ -5678,7 +5680,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.19.0...v0.20.0
