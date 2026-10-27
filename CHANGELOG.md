@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-10-27
+
+### Fixed
+
+- **Exported lineage claimed a version the contract never pinned.** An ODPS `inputPorts[].version`
+  came from the consume's own `version` or the provider's `1.0.0` default, and a consume that states
+  a range (`versionConstraint: ^2.1`) has neither — so every such export asserted `version: 1.0.0`,
+  a pin the contract did not make and, for a product whose 1.x line is retired, a version that no
+  longer exists. The lowest version the range accepts is now resolved (`^2.1` → `2.1.0`,
+  `~1.4` → `1.4.0`, `>=3.0.0` → `3.0.0`). A range the resolver cannot read falls back to the old
+  constant rather than guessing: ODPS v1.0.0 has `version` in `InputPort`'s `required`, so the field
+  cannot simply be omitted, and a wrong exact version reads as a fact somebody established.
+  `versionConstraint` still rides along in `customProperties`, so the range this product accepts is
+  not lost.
+
+- **An exported output port named none of its upstreams.** `outputPorts[].inputContracts` was
+  populated only from an imported ODPS document's pass-through, so a contract written in FLUID
+  exported output ports with no lineage at all and a catalog reading dependencies there saw a
+  product with none. The entries are now derived from the document's own resolved input ports — one
+  per `consumes[]`, carrying exactly the `id` and `version` Bitol's `$defs.InputContract` allows,
+  read from those ports rather than recomputed so the two halves of one document cannot disagree. An
+  imported document's own `inputContracts` still win, and `expects[]` — the carrier an imported
+  document's input ports arrive on — is excluded, so import → export stays a fixed point and never
+  adds a dependency the author did not write.
+
+- **A quality expression exported as SQL no DQ engine could execute.** ODCS defines the `sql` rule's
+  `query` as an individual query returning a value that can be compared, and FLUID's
+  `exposes[].contract.quality[].expression` is a row predicate — it was emitted verbatim, so an
+  engine was handed `preferred_customer_flag IN ('Y', 'N')` with `mustBe: true` and nothing to
+  execute. A predicate now becomes a counting query compared to zero, against the `${table}`
+  placeholder from ODCS's own example. The negation is `(…) IS NOT TRUE`, not `NOT (…)`: under
+  three-valued logic a NULL row makes the naive form NULL and counts no failure, although that row's
+  predicate did not hold. An expression already written as a `SELECT` or `WITH` query passes through
+  unchanged.
+
+### Added
+
+- `consumes[].contractVersion` (0.7.6 preview) — the exact upstream version this product was built
+  and tested against, within `versionConstraint`. It wins over the resolved lower bound as the
+  version an exported input port, and its matching `inputContracts` entry, claims.
+
+### Changed
+
+- An ODPS export of a contract with `consumes[]` now carries `outputPorts[].inputContracts`, where
+  before it carried none, and an input port's `version` may differ from `1.0.0` where the contract
+  states a range. A consumer that compares exported documents byte-for-byte will see both.
+
 ## [0.23.0] — 2026-10-27
 
 ### Security
