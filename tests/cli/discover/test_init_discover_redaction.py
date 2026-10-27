@@ -40,9 +40,14 @@ from hypothesis import assume, example, given, settings
 from hypothesis import strategies as st
 
 import fluid_build.cli._init_discover_handler as handler
-from fluid_build.cli._errors import ConnectivityProbeError, SchemaValidationError
+from fluid_build.cli._errors import (
+    ConnectivityProbeError,
+    FluidUserError,
+    SchemaValidationError,
+)
 from fluid_build.cli.discover.registry import DiscoveredColumn, DiscoveredStream
 from fluid_build.observability.secret_redactor import forget_known_secrets, redact_secret_text
+from fluid_build.providers._duckdb_sandbox import DuckDBSandboxError
 from fluid_build.providers._sql_safety import libpq_escape, quote_ansi_string_literal
 from fluid_build.schema_manager import FluidSchemaManager
 
@@ -255,6 +260,80 @@ class TestDiscoverErrorsKeepPasswordOut:
             _run(monkeypatch, tmp_path, uri, stub)
         assert "ab@cd" not in info.value.as_json()
         assert "cd@127.0.0.1" not in info.value.as_json()
+
+
+class TestTypedErrorsKeepTheirOwnAdvice:
+    """An error that already says what to do is not reframed as a connectivity failure."""
+
+    def test_a_typed_error_keeps_its_own_advice_and_every_field_is_masked(
+        self, monkeypatch, tmp_path
+    ):
+        """A sandbox refusal reaches the same ``except Exception`` as a driver error.
+
+        Reframing it as a connectivity failure replaced its ``fix`` with "Check
+        VPN / network policy / credentials", which sends the reader to their
+        network for something in their working directory. Its own fields are
+        kept -- and the credential is put in EVERY field here, because the
+        refusal names the location it refused and that can carry userinfo.
+        ``extras`` and ``doc`` matter as much as the rest: ``as_json`` emits
+        them, and ``extras`` was the one field the keep-and-mask path first
+        copied through verbatim.
+        """
+        uri = f"https://alice:{SENTINEL}@example.com/data.csv"
+        stub = _StubDiscoverer(
+            error=DuckDBSandboxError(
+                what=f"a declared remote prefix would grant a local directory: {uri}",
+                why=f"Refused here: {uri} resolves to /somewhere",
+                fix=f"Remove the link in the working directory, or drop {uri}.",
+                doc=f"https://example.invalid/doc?ctx={SENTINEL}",
+                where=f"contract.fluid.yaml -> {uri}",
+                extras={"dsn": uri, "nested": {"copy": [uri]}},
+            )
+        )
+        with pytest.raises(DuckDBSandboxError) as info:
+            _run(monkeypatch, tmp_path, uri, stub)
+        exc = info.value
+
+        # Its own advice survived, rather than the connectivity template's.
+        assert exc.code == "DuckDBSandboxError"
+        assert "working directory" in exc.fix
+        assert "VPN" not in exc.fix
+        # Every field a reader or a machine can see is masked.
+        for field in (exc.what, exc.why or "", exc.fix, exc.doc or "", exc.where or ""):
+            assert SENTINEL not in field, field
+        assert SENTINEL not in json.dumps(exc.extras, default=str)
+        assert SENTINEL not in exc.render(color=False)
+        assert SENTINEL not in exc.as_json()
+        # Masked, not merely dropped: the location is still named.
+        assert "example.com" in exc.why
+        assert _contracts(tmp_path) == []
+
+    def test_a_subclass_that_cannot_be_rebuilt_falls_back_without_leaking(
+        self, monkeypatch, tmp_path
+    ):
+        """``replace`` cannot rebuild every subclass, and this runs mid-failure.
+
+        A second exception raised here would carry the driver's error, URI and
+        password as its context. The connectivity framing is the fallback, and
+        the credential must be absent from it too.
+        """
+
+        class _Awkward(DuckDBSandboxError):
+            def __init__(self, token: str) -> None:  # not constructible from fields
+                super().__init__(
+                    what=f"refused {token}",
+                    why=f"because of {token}",
+                    fix="do something",
+                    doc="https://example.invalid/d",
+                )
+
+        uri = f"https://alice:{SENTINEL}@example.com/data.csv"
+        with pytest.raises(FluidUserError) as info:
+            _run(monkeypatch, tmp_path, uri, _StubDiscoverer(error=_Awkward(uri)))
+        exc = info.value
+        assert SENTINEL not in exc.render(color=False)
+        assert SENTINEL not in exc.as_json()
+        assert SENTINEL not in _chain_text(exc)
 
 
 class TestPasswordWithUnencodedDelimiter:
@@ -1052,12 +1131,14 @@ class TestDriverErrorQuotingAReQuotedCopy:
         # Holding both quote characters, repr() escapes the single one.
         uri = "https://alice:pa'ss\"WORDTAIL@h.invalid/../a.csv"  # pragma: allowlist secret
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
-        with pytest.raises(ConnectivityProbeError) as info:
+        # A sandbox refusal keeps its own type and advice rather than being
+        # reframed as a connectivity failure, and is masked either way.
+        with pytest.raises(DuckDBSandboxError) as info:
             handler.run_discover(_args(tmp_path), logging.getLogger("t"), uri=uri)
         exc = info.value
-        why = exc.why or ""
-        assert "WORDTAIL" not in exc.render(color=False) + exc.as_json(), why
-        assert "remote prefix 'https://***REDACTED***@h.invalid/../' contains '..'" in why
+        rendered = exc.render(color=False) + exc.as_json()
+        assert "WORDTAIL" not in rendered, exc.why
+        assert "remote prefix 'https://***REDACTED***@h.invalid/../' contains '..'" in rendered
 
     @pytest.mark.parametrize("odd", ["\udc80", "\ud800"])
     def test_a_value_that_is_not_utf8_is_still_masked(self, odd):
@@ -1177,7 +1258,7 @@ class TestDriverErrorChainKeepsPasswordOut:
         # The sandbox refuses this before any network access, quoting the URL.
         uri = "https://alice:pa'ss\"WORDTAIL@h.invalid/../a.csv"  # pragma: allowlist secret
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
-        with pytest.raises(ConnectivityProbeError) as info:
+        with pytest.raises(DuckDBSandboxError) as info:
             handler.run_discover(_args(tmp_path), logging.getLogger("t"), uri=uri)
         text = _chain_text(info.value)
         assert "WORDTAIL" not in text, text

@@ -43,6 +43,7 @@ import yaml
 
 from fluid_build.cli._errors import (
     ConnectivityProbeError,
+    FluidUserError,
     SchemaValidationError,
 )
 from fluid_build.cli.console import cprint
@@ -164,7 +165,7 @@ def run_discover(args, logger: logging.Logger, *, uri: str) -> int:
         )
 
     cprint(f"🔍 Discovering streams at {safe_uri}…")
-    failure: Optional[ConnectivityProbeError] = None
+    failure: Optional[FluidUserError] = None
     try:
         # The operator typed this URI on the command line, so a JDBC
         # discoverer may use this host's client certificate and libpq
@@ -232,20 +233,88 @@ def run_discover(args, logger: logging.Logger, *, uri: str) -> int:
     return 0
 
 
-def _probe_error(exc: Exception, uri: str, safe_uri: str, view: _UriView) -> ConnectivityProbeError:
+def _probe_error(exc: Exception, uri: str, safe_uri: str, view: _UriView) -> FluidUserError:
     """The typed error for a discovery that failed with ``exc``, masked throughout.
 
-    ``exc`` is the driver's own error, which quotes the URI or the DSN as given,
-    in its message, its arguments, its notes or the errors chained to it. Only
-    text is kept, masked as the display masks ``uri``: its message and those of
-    the errors that explain it (:func:`_reason`). The cause is a stand-in naming
-    the driver's exception type with that masked text, and carries no
-    traceback, notes or chain of its own.
+    ``exc`` is usually the driver's own error, which quotes the URI or the DSN
+    as given, in its message, its arguments, its notes or the errors chained to
+    it. Only text is kept, masked as the display masks ``uri``: its message and
+    those of the errors that explain it (:func:`_reason`). The cause is a
+    stand-in naming the driver's exception type with that masked text, and
+    carries no traceback, notes or chain of its own.
+
+    An error that already says what to do keeps saying it. A refusal from the
+    DuckDB sandbox reaches here through the same ``except Exception``, and
+    reframing it as a connectivity failure replaced its own ``fix`` with "Check
+    VPN / network policy / credentials" -- advice that sends the reader to their
+    network for something in their working directory. Its fields are kept and
+    masked instead, since the refusal names the location it refused and that
+    can carry a password in its userinfo, which is what the masking here is
+    for. (Spelling that URL shape out here trips the secret scanner, so it is
+    described rather than written.)
     """
-    reason = _reason(exc, lambda text: _masked(text, uri, view))
-    error = ConnectivityProbeError.for_target(target=safe_uri, reason=reason)
+
+    def mask(text: str) -> str:
+        return _masked(text, uri, view)
+
+    reason = _reason(exc, mask)
+    error = _kept_or_reframed(exc, mask, safe_uri, reason)
     error.__cause__ = RuntimeError(f"{_type_name(exc)}: {reason}")
     return error
+
+
+def _kept_or_reframed(
+    exc: Exception, mask: Callable[[str], str], safe_uri: str, reason: str
+) -> FluidUserError:
+    """``exc`` with its own fields masked when it is already a typed error.
+
+    EVERY field :meth:`FluidUserError.as_json` emits is masked, ``extras`` and
+    ``doc`` included. Leaving ``extras`` alone would have been the one way a
+    value this handler masks everywhere else reached ``--json`` output: an
+    out-of-tree discoverer that put the location as given under a key of its
+    own (``dsn``, say) would have had it serialised verbatim, since ``"uri"``
+    is overwritten here but no other key was touched. No error in the tree
+    carries extras through this path, so the gap was latent -- but ``as_json``
+    is precisely what the sibling tests assert a credential never reaches.
+
+    ``replace`` needs the concrete class to be constructible from its fields,
+    which every typed error in the tree is. A discoverer from outside the tree
+    could raise a ``FluidUserError`` subclass that is not, and this code runs
+    while an error is already being handled -- the last place to raise a second
+    one -- so anything awkward falls back to the connectivity framing. The
+    ``except`` is broad for that reason: a subclass can refuse to rebuild in
+    more ways than ``TypeError``, and none of them is worth losing the original
+    failure over.
+    """
+    if isinstance(exc, FluidUserError):
+        try:
+            return replace(
+                exc,
+                what=mask(exc.what),
+                why=mask(exc.why),
+                fix=mask(exc.fix),
+                doc=mask(exc.doc) if exc.doc else exc.doc,
+                where=mask(exc.where) if exc.where else exc.where,
+                extras={**_masked_extras(exc.extras, mask), "uri": safe_uri},
+            )
+        except Exception:  # noqa: BLE001 - never raise while an error is live
+            pass
+    return ConnectivityProbeError.for_target(target=safe_uri, reason=reason)
+
+
+def _masked_extras(extras: Any, mask: Callable[[str], str]) -> Dict[str, Any]:
+    """``extras`` with every string masked, at any depth ``as_json`` would dump."""
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, str):
+            return mask(value)
+        if isinstance(value, dict):
+            return {key: walk(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [walk(item) for item in value]
+        return value
+
+    return {key: walk(value) for key, value in dict(extras or {}).items()}
 
 
 def _type_name(exc: BaseException) -> str:

@@ -950,6 +950,64 @@ def _own_spill_dir() -> str:
     return tempfile.mkdtemp(prefix=SPILL_DIR_PREFIX)
 
 
+def _escaping_remote_prefix(prefix: str, cwd: str) -> Optional[str]:
+    """The local directory ``prefix`` would grant, or ``None`` when it grants none.
+
+    DuckDB resolves every ``allowed_directories`` entry against the file system.
+    A remote prefix has no business naming a local path, but its text can: with
+    ``s3: -> /`` in the working directory, ``s3://etc/`` resolves to ``/etc``.
+
+    The honest form is the lexical one -- DuckDB 1.5 reports
+    ``s3://bucket/landing/`` as ``<cwd>/s3:/bucket/landing/``, which is what
+    joining and normalising gives. Resolving symlinks is what differs, so a
+    prefix whose resolution leaves that form is one whose components follow a
+    link, and the directory it lands on is what DuckDB will grant. Existence is
+    deliberately not the test: DuckDB grants a resolved path that is not there
+    yet, and contract SQL can write into it.
+    """
+    joined = os.path.join(cwd, prefix)
+    lexical = _fold(os.path.normpath(joined))
+    resolved = os.path.realpath(joined)
+    return resolved if _fold(resolved) != lexical else None
+
+
+def _refuse_escaping_remote_prefixes(allow: DuckDBAllowlist) -> None:
+    """Raise before the grant is set, rather than reporting it afterwards.
+
+    :func:`_refuse_ungranted_dirs` would catch this too, and keeps doing so as
+    the backstop. Refusing here means the connection never holds the grant at
+    all, so the barrier does not rest on a single read-back.
+    """
+    cwd = os.path.realpath(os.getcwd())
+    escaped = [
+        (prefix, landed)
+        for prefix in allow.remote_prefixes
+        if (landed := _escaping_remote_prefix(prefix, cwd)) is not None
+    ]
+    if escaped:
+        # ``what`` is the panel's TITLE, which the renderer truncates to one line,
+        # so the prefixes go in ``why``: naming them is the whole point of the
+        # message and a cut-off title would hide it.
+        raise _sandbox_error(
+            what="a declared remote prefix would grant a local directory to the SQL",
+            why=(
+                "DuckDB resolves every allowed_directories entry against the file "
+                "system, so a prefix whose text also names a local path becomes a local "
+                "grant, and a link in the working directory is enough. Refused here: "
+                + "; ".join(f"{p} resolves to {landed}" for p, landed in escaped)
+                + ". A remote prefix must bound remote reads and grant no local "
+                "directory."
+            ),
+            fix=(
+                "Remove the link (or the directory) in the working directory whose name "
+                "matches the prefix's scheme, or declare the location by a prefix whose "
+                "text does not resolve locally. If the local directory is genuinely "
+                "needed, declare it as a directory so it is granted deliberately rather "
+                "than as a side effect of a URL."
+            ),
+        )
+
+
 def _refuse_ungranted_dirs(con: Any, allow: DuckDBAllowlist, spill: str) -> None:
     """Refuse the connection if DuckDB granted a directory ``allow`` does not name.
 
@@ -964,15 +1022,19 @@ def _refuse_ungranted_dirs(con: Any, allow: DuckDBAllowlist, spill: str) -> None
     Both sides are compared after ``realpath`` and, where the file system
     ignores case, after casefolding, because that is how DuckDB stores them:
     two entries that resolve to one directory are reported once (a grant of
-    both ``link`` and its target ``real`` reports only ``real/``). A remote
-    prefix is reported as it was given on 2.0, but DuckDB 1.5 resolves it as a
-    relative local path (``s3://bucket/landing/`` comes back as
-    ``<cwd>/s3:/bucket/landing/``, which :func:`os.path.realpath` reproduces),
-    so both forms count as granted.
+    both ``link`` and its target ``real`` reports only ``real/``).
+
+    A remote prefix is accommodated by its LEXICAL form, which is what DuckDB
+    1.5 reports (``s3://bucket/landing/`` comes back as
+    ``<cwd>/s3:/bucket/landing/``; 2.0 reports the URL itself). Writing it as
+    ``realpath(prefix)`` followed symlinks inside the prefix and so excused the
+    escape :func:`_escaping_remote_prefix` refuses. The cwd itself is resolved,
+    since DuckDB reports the resolved form.
     """
     reported = tuple(con.execute("SELECT current_setting('allowed_directories')").fetchall()[0][0])
+    here = os.path.realpath(os.getcwd())
     granted = {_fold(os.path.realpath(d)) for d in (*allow.dirs, spill)}
-    granted |= {_fold(os.path.realpath(p)) for p in allow.remote_prefixes}
+    granted |= {_fold(os.path.normpath(os.path.join(here, p))) for p in allow.remote_prefixes}
     extra = [
         entry
         for entry in reported
@@ -980,6 +1042,11 @@ def _refuse_ungranted_dirs(con: Any, allow: DuckDBAllowlist, spill: str) -> None
         if (is_remote_location(entry) or _fold(os.path.realpath(entry)) not in granted)
     ]
     if extra:
+        # An escaping prefix is refused before the SET, so reaching it here means
+        # that check was bypassed. Defer to its message: this grant IS something
+        # a contract can cause, and the advice below would send the reader off to
+        # report a sandbox bug they caused themselves.
+        _refuse_escaping_remote_prefixes(allow)
         raise _sandbox_error(
             what=(
                 "DuckDB granted directories this connection did not ask for: "
@@ -1121,6 +1188,7 @@ def _confine_connection(
         # duckdb/duckdb#26064: the allowlist check expands '~' with $HOME and
         # the open with this setting. Equal and locked, they cannot disagree.
         con.execute(f"SET home_directory = {quote_ansi_string_literal(home)}")
+    _refuse_escaping_remote_prefixes(allow)
     directories = [_with_sep(d) for d in allow.dirs] + list(allow.remote_prefixes)
     con.execute(f"SET allowed_directories = {_sql_list(directories)}")
     con.execute(f"SET allowed_paths = {_sql_list(allow.paths)}")
