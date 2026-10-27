@@ -2967,6 +2967,13 @@
         "versionConstraint": {
           "$ref": "#/$defs/semverRange"
         },
+        "contractVersion": {
+          "$ref": "#/$defs/semver",
+          "description": "NEW in v0.7.6: The exact upstream contract version this product was built and tested against, within `versionConstraint`. Exported as the ODPS `inputPorts[].version`, and as the version of the matching `outputPorts[].inputContracts[]` entry. Without it the export derives the range's lower bound; for a range it cannot read it falls back to 1.0.0, because ODPS v1.0.0 requires a version on every input port and the field cannot simply be omitted. `versionConstraint` stays the range this product accepts; this is the single version its exported lineage claims.",
+          "examples": [
+            "2.1.0"
+          ]
+        },
         "qosExpectations": {
           "type": "object",
           "additionalProperties": false,

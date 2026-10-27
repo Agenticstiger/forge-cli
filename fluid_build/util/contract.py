@@ -683,6 +683,13 @@ def consumes_to_canonical_ports(
             "reference": get_consume_ref(consume),
             # 0.7.2 canonical fields
             "version_constraint": version_constraint if version_constraint else None,
+            # 0.7.6: the exact upstream version this product was built against,
+            # which is what an exported input port and its matching
+            # ``inputContracts`` entry should claim. ``version`` above is the
+            # consume's own ``version`` or the provider default, and a consume
+            # that states only a range has neither — that is how an export came
+            # to say ``version: 1.0.0`` for ``versionConstraint: ^2.1``.
+            "contract_version": consume.get("contractVersion") or consume.get("contract_version"),
             "qos_expectations": qos if isinstance(qos, Mapping) and qos else None,
             "required_policies": (
                 list(required_policies)
