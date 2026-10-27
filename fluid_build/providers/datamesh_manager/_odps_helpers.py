@@ -42,7 +42,7 @@ What's here:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Set
 
 from fluid_build.util.contract import consumes_to_canonical_ports, kind_to_dmm_type
 
@@ -180,6 +180,9 @@ def remove_odps_product_consume_input_ports(
     duplicate graph nodes. Explicit source-system consumes remain as input
     ports.
 
+    A removed port's ``outputPorts[].inputContracts`` entry goes with it — see
+    :func:`_remove_output_port_input_contracts`.
+
     Matching strategy: we identify product-consume ports by **both**
     ``(id, name)`` (the canonical exposeId — matches the inputPort before
     the dedup-rename in :func:`fluid_build.providers.odps_standard.mappers
@@ -243,11 +246,53 @@ def remove_odps_product_consume_input_ports(
                     return True
         return False
 
-    retained = [port for port in input_ports if not _is_product_consume(port)]
+    retained: List[Any] = []
+    removed: List[Any] = []
+    for port in input_ports:
+        (removed if _is_product_consume(port) else retained).append(port)
     if retained:
         odps_payload["inputPorts"] = retained
     else:
         odps_payload.pop("inputPorts", None)
+    _remove_output_port_input_contracts(odps_payload, removed)
+
+
+def _remove_output_port_input_contracts(
+    odps_payload: Dict[str, Any], removed_ports: List[Any]
+) -> None:
+    """Drop ``outputPorts[].inputContracts`` entries for a removed input port.
+
+    Since 0.24.0 the ODPS exporter derives that key from a product's own
+    ``consumes[]``, so one product-to-product dependency is stated twice in a
+    document. Removing only the input port left the same upstream named in the
+    output port's lineage, which puts back exactly the duplicate graph nodes
+    :func:`remove_odps_product_consume_input_ports` exists to prevent — the
+    product would have to be mirrored as a SourceSystem to resolve the
+    reference. Explicit source-system consumes keep their lineage, because
+    their input ports are kept too.
+    """
+    contract_ids: Set[str] = {
+        str(port["contractId"])
+        for port in removed_ports
+        if isinstance(port, Mapping) and port.get("contractId")
+    }
+    if not contract_ids:
+        return
+    for port in odps_payload.get("outputPorts") or []:
+        if not isinstance(port, MutableMapping):
+            continue
+        entries = port.get("inputContracts")
+        if not isinstance(entries, list):
+            continue
+        kept = [
+            entry
+            for entry in entries
+            if not (isinstance(entry, Mapping) and str(entry.get("id")) in contract_ids)
+        ]
+        if kept:
+            port["inputContracts"] = kept
+        else:
+            port.pop("inputContracts", None)
 
 
 def ensure_odps_input_port_contract_ids(

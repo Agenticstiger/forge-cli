@@ -713,6 +713,78 @@ class TestRemoveOdpsProductConsumeInputPorts:
             {"name": "crm_source", "contractId": "bronze.telco.party_v1"}
         ]
 
+    def test_a_removed_ports_derived_lineage_goes_with_it(self):
+        """Since 0.24.0 the ODPS exporter derives ``outputPorts[].inputContracts``
+        from ``consumes[]``, so one product-to-product edge is stated twice in a
+        document. Leaving the lineage behind puts back the duplicate graph nodes
+        this strip exists to prevent."""
+        fluid = {
+            "consumes": [
+                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
+                {
+                    "productId": "bronze.telco.party_v1",
+                    "exposeId": "crm_source",
+                    "sourceSystem": "bss-crm",
+                },
+            ],
+        }
+        odps_payload = {
+            "inputPorts": [
+                {
+                    "name": "account_source",
+                    "contractId": "bronze.telco.party_v1.account_source",
+                },
+                {"name": "crm_source", "contractId": "bronze.telco.party_v1.crm_source"},
+            ],
+            "outputPorts": [
+                {
+                    "name": "accounts",
+                    "inputContracts": [
+                        {"id": "bronze.telco.party_v1.account_source", "version": "1.0.0"},
+                        {"id": "bronze.telco.party_v1.crm_source", "version": "1.0.0"},
+                    ],
+                }
+            ],
+        }
+
+        DataMeshManagerProvider._remove_odps_product_consume_input_ports(odps_payload, fluid)
+
+        assert odps_payload["inputPorts"] == [
+            {"name": "crm_source", "contractId": "bronze.telco.party_v1.crm_source"}
+        ]
+        # The source-system consume keeps its lineage, because its port is kept.
+        assert odps_payload["outputPorts"][0]["inputContracts"] == [
+            {"id": "bronze.telco.party_v1.crm_source", "version": "1.0.0"}
+        ]
+
+    def test_the_lineage_key_goes_away_when_every_entry_was_a_product_consume(self):
+        fluid = {
+            "consumes": [
+                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
+            ],
+        }
+        odps_payload = {
+            "inputPorts": [
+                {
+                    "name": "account_source",
+                    "contractId": "bronze.telco.party_v1.account_source",
+                }
+            ],
+            "outputPorts": [
+                {
+                    "name": "accounts",
+                    "inputContracts": [
+                        {"id": "bronze.telco.party_v1.account_source", "version": "1.0.0"}
+                    ],
+                }
+            ],
+        }
+
+        DataMeshManagerProvider._remove_odps_product_consume_input_ports(odps_payload, fluid)
+
+        assert "inputPorts" not in odps_payload
+        assert "inputContracts" not in odps_payload["outputPorts"][0]
+
     def test_removes_input_ports_key_when_only_product_consumes_exist(self):
         fluid = {
             "consumes": [
