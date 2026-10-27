@@ -184,12 +184,23 @@ def test_bitol_validate_names_the_file_it_could_not_parse(tmp_path: Path, case: 
 
 
 def test_bitol_validate_names_the_json_parse_error(tmp_path: Path) -> None:
+    """Exit 1 with the parser's own diagnosis, not exit 2 with a traceback.
+
+    CPython's wording for this document is deliberately NOT asserted: 3.13
+    replaced "Expecting property name enclosed in double quotes" with "Illegal
+    trailing comma before end of object", so pinning the text passed on 3.10
+    through 3.12 and failed the suite on 3.13 and 3.14. What the guard is for
+    is relaying the parser's position instead of crashing, so that is what
+    this asserts.
+    """
     path = tmp_path / "bad.json"
     path.write_text('{"apiVersion": "v1.0.0",}\n', encoding="utf-8")
     code, message = _validate_message(path)
     assert code == 1
-    assert "Expecting property name enclosed in double quotes" in message
+    assert str(path) in message
     assert "line 1 column" in message
+    assert "Unexpected error" not in message
+    assert "unhandled exception" not in message
 
 
 def test_bitol_validate_names_the_yaml_parse_error(tmp_path: Path) -> None:

@@ -73,14 +73,23 @@ def test_v41_validate_exits_0_on_a_document_the_exporter_emitted(tmp_path: Path)
 
 
 def test_v41_validate_names_the_json_parse_error(tmp_path: Path) -> None:
+    """Exit 1 with the parser's own diagnosis, not exit 2 with a traceback.
+
+    CPython's wording is deliberately NOT asserted: 3.13 replaced "Expecting
+    property name enclosed in double quotes" with "Illegal trailing comma
+    before end of object", so pinning the text passed on 3.10 through 3.12 and
+    failed the suite on 3.13 and 3.14. The guard exists to relay the parser's
+    position rather than crash, so that is what this asserts.
+    """
     path = tmp_path / "bad.json"
     path.write_text('{"dataProductId": "x",}\n', encoding="utf-8")
     code, message = _validate(path)
     assert code == 1
     assert message.startswith("✗ Validation failed: ")
     assert str(path) in message
-    assert "Expecting property name enclosed in double quotes" in message
     assert "line 1 column" in message
+    assert "Unexpected error" not in message
+    assert "unhandled exception" not in message
 
 
 def test_v41_validate_reports_an_empty_file(tmp_path: Path) -> None:
