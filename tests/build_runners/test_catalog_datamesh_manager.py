@@ -87,6 +87,74 @@ def _acquisition_contract() -> Dict[str, Any]:
     }
 
 
+def _consuming_contract() -> Dict[str, Any]:
+    """A Gold product whose only upstream is another FLUID product."""
+    return {
+        "fluidVersion": "0.7.3",
+        "kind": "DataProduct",
+        "id": "gold.sales.orders",
+        "name": "Orders (Gold)",
+        "description": "Consumer-aligned orders built from the CRM core product",
+        "metadata": {
+            "layer": "Gold",
+            "owner": {"team": "data-platform", "email": "dp@co.example"},
+        },
+        "consumes": [{"productId": "silver.crm.core", "exposeId": "customers"}],
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "table",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_table",
+                    "location": {
+                        "database": "GOLD",
+                        "schema": "SALES",
+                        "table": "ORDERS",
+                    },
+                },
+                "contract": {"schema": [{"name": "id", "type": "string"}]},
+            }
+        ],
+    }
+
+
+class TestProductConsumeLineageIsNotPublishedTwice:
+    """Entropy draws product-to-product lineage from Access agreements, so the
+    registrar strips product-consume ``inputPorts`` — an upstream product would
+    otherwise have to be mirrored as a SourceSystem for the reference to
+    resolve, and the graph would render duplicate nodes.
+
+    Since 0.24.0 the ODPS render also derives ``outputPorts[].inputContracts``
+    from the same ``consumes[]``, so the dependency is stated twice in one
+    document. Stripping only the input port left the upstream named anyway, on
+    the canonical publish path.
+    """
+
+    @respx.mock
+    def test_the_dataproduct_put_names_no_upstream_product(self):
+        from fluid_build.api.catalog_publication import CatalogPublicationPayload
+
+        respx.route(method="PUT").mock(return_value=httpx.Response(200, json={"ok": True}))
+
+        payload = CatalogPublicationPayload.from_contract(_consuming_contract(), {})
+        result = DataMeshManagerRegistrar(api_token="t").register_payload(payload)
+        assert result.succeeded is True
+
+        bodies = [
+            json.loads(call.request.content)
+            for call in respx.calls
+            if "/api/dataproducts/" in str(call.request.url)
+        ]
+        assert (
+            bodies
+        ), f"no dataproduct PUT fired; urls were {[str(c.request.url) for c in respx.calls]}"
+        body = bodies[0]
+        assert "inputPorts" not in body, body.get("inputPorts")
+        for port in body.get("outputPorts") or []:
+            assert "inputContracts" not in port, port["inputContracts"]
+
+
 # ── Registrar unit ───────────────────────────────────────────────────────
 
 

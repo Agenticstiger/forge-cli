@@ -36,7 +36,7 @@ Per-port pass-throughs flow through ``expose.odps_passthrough.*`` /
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build.util.contract import (
@@ -225,6 +225,54 @@ def _consume_to_input_port(
     return port
 
 
+def remove_output_port_input_contracts(
+    odps_payload: MutableMapping[str, Any], removed_ports: Iterable[Any]
+) -> None:
+    """Drop ``outputPorts[].inputContracts`` entries for removed input ports.
+
+    The inverse of :func:`_input_contracts_from_ports`, and it lives beside it
+    so the two cannot drift. A publish target that removes an input port has to
+    remove the lineage entry that mirrors it: forge derives that key from the
+    product's own ``consumes[]``, so one dependency is stated twice in a
+    document, and removing only the port leaves the upstream still named.
+
+    Both Data Mesh Manager publish paths need this — the
+    :class:`DataMeshManagerRegistrar` that backs ``fluid publish --target
+    datamesh-manager`` and ``catalog.register``, and the
+    ``DataMeshManagerProvider`` behind ``fluid datamesh-manager publish``. They
+    strip by different rules (a missing ``sourceSystemId`` vs. a canonical
+    product-consume match), so each passes the ports it dropped and this reads
+    the ``contractId``s off them. Entropy would otherwise have to mirror each
+    upstream product as a SourceSystem to resolve the reference, and render the
+    duplicate graph nodes the strip exists to prevent.
+
+    A dropped port with no ``contractId`` needs no action: it never produced a
+    lineage entry, because :func:`_input_contracts_from_ports` skips it.
+    """
+    contract_ids = {
+        str(port["contractId"])
+        for port in removed_ports
+        if isinstance(port, Mapping) and port.get("contractId")
+    }
+    if not contract_ids:
+        return
+    for port in odps_payload.get("outputPorts") or []:
+        if not isinstance(port, MutableMapping):
+            continue
+        entries = port.get("inputContracts")
+        if not isinstance(entries, list):
+            continue
+        kept = [
+            entry
+            for entry in entries
+            if not (isinstance(entry, Mapping) and str(entry.get("id")) in contract_ids)
+        ]
+        if kept:
+            port["inputContracts"] = kept
+        else:
+            port.pop("inputContracts", None)
+
+
 def _build_input_ports(
     fluid: Mapping[str, Any], ctx: ExportCtx, product_id: str
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -265,7 +313,8 @@ def _build_input_ports(
     populate ``inputPorts[].contractId``, which ODPS v1.0.0 requires;
     ``inputContracts`` is optional, so naming an id no catalog can resolve is
     worse than naming nothing — the failure
-    :func:`_input_port_contract_id` already warns about.
+    :func:`_input_port_contract_id` describes: an id that resolves in no
+    catalog following the reference.
 
     Path 3 is excluded because ``expects[]`` is also the carrier an imported
     ODPS document's input ports arrive on, and an imported document's

@@ -36,10 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adds a dependency the author did not write. A `builds[].properties.source` stream is excluded too:
   its `<kind>://<database>/<stream>` id is synthesized to populate the *required* input-port field
   for a source that has no contract at all, and `inputContracts` is optional, so naming an id no
-  catalog can resolve is worse than naming nothing. A `fluid publish --target datamesh-manager`
-  payload has the derived lineage stripped alongside the input ports it mirrors, for the reason
-  those were already stripped — Entropy draws product-to-product lineage from Access resources, and
-  naming the upstream twice would render duplicate graph nodes.
+  catalog can resolve is worse than naming nothing. Both Data Mesh Manager publish paths — the
+  registrar behind `fluid publish --target datamesh-manager` and `catalog.register`, and
+  `fluid datamesh-manager publish` — strip the derived lineage alongside the input ports it mirrors,
+  for the reason those were already stripped: Entropy draws product-to-product lineage from Access
+  resources, so naming the upstream twice would require mirroring it as a SourceSystem and render
+  duplicate graph nodes. They strip by different rules, so each passes the ports it dropped to one
+  shared helper.
 
 - **A quality expression exported as SQL no DQ engine could execute.** ODCS defines the `sql` rule's
   `query` as an individual query returning a value that can be compared, and FLUID's

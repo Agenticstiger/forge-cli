@@ -608,8 +608,8 @@ def consumes_to_canonical_ports(
             # --- 0.7.x consumeRef canonical fields ---
             "reference": Optional[str],            # productId
             "description": str,                    # purpose
-            "version_constraint": Optional[str],
-            "contract_version": Optional[str],  # upstream contract version, explicit only   # semverRange
+            "version_constraint": Optional[str],  # semverRange
+            "contract_version": Optional[str],     # semver, explicit only
             "qos_expectations": Optional[Mapping], # freshnessMax / maxStaleness / ...
             "required_policies": Optional[list],
             "tags": Optional[list],

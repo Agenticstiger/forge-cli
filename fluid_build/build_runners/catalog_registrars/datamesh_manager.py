@@ -421,15 +421,28 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                         parsed, payload
                     )
                     if "inputPorts" in parsed and isinstance(parsed["inputPorts"], list):
-                        parsed["inputPorts"] = [
-                            ip
-                            for ip in parsed["inputPorts"]
-                            if isinstance(ip, dict)
-                            and "sourceSystemId" in ip
-                            and ip["sourceSystemId"]
-                        ]
-                        if not parsed["inputPorts"]:
+                        # Deferred: this module is imported for its
+                        # ``register_catalog_backend`` side effect, so it stays
+                        # off the light CLI's cold path (tests/perf).
+                        from fluid_build.providers.odps_standard.mappers.ports import (
+                            remove_output_port_input_contracts,
+                        )
+
+                        kept: List[Any] = []
+                        removed: List[Any] = []
+                        for ip in parsed["inputPorts"]:
+                            keep = isinstance(ip, dict) and ip.get("sourceSystemId")
+                            (kept if keep else removed).append(ip)
+                        parsed["inputPorts"] = kept
+                        if not kept:
                             parsed.pop("inputPorts", None)
+                        # The ODPS render derives
+                        # ``outputPorts[].inputContracts`` from the same
+                        # ``consumes[]``, so a stripped port stays named in the
+                        # output port's lineage unless it goes with it — which
+                        # would put back the unresolvable SourceSystem
+                        # reference this strip exists to remove.
+                        remove_output_port_input_contracts(parsed, removed)
                     return parsed
             except Exception:  # noqa: BLE001 — fall through to native
                 LOG.debug(
