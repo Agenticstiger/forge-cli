@@ -124,12 +124,21 @@ into consumers.
   case, and a whole-contract export is untouched.
 - ODPS `inputPorts[].contractId` is now `<productId>.<exposeId>` rather than the bare upstream
   product id, and `versionConstraint` is carried in a custom property instead of being dropped.
-- A Kafka server's ODCS `format` is now the format of the messages, as ODCS defines it, rather than
-  the FLUID binding format `kafka_topic`.
+- A Kafka server's ODCS `format` is now the format of the messages, as ODCS defines it, taken from
+  the `binding.serialization.value` this release adds — `avro`, `json`, `protobuf` or `xml`, with
+  the two `-confluent` spellings collapsing onto the wire format they carry. A contract that has
+  not adopted that field still exports the FLUID binding format `kafka_topic`, exactly as before:
+  the exporter will not guess a wire format from a contract that never stated one, and ODCS's own
+  `json` default would be wrong for every Avro topic. So this changes a Kafka export only once the
+  contract says what its messages are.
 - A Kafka column's `physicalType` is now an Avro type name. Notably `bigint` exports as `long`
   where it previously exported as `integer`.
-- Derived quality rules now carry an `id`, and rules declared on a contract now appear in the
-  exported ODCS rather than only in the `fluidExtras` custom property.
+- Derived quality rules now carry an `id`, and rules declared on a contract are exported as ODCS
+  quality instead of riding only in the `fluidExtras` custom property — for the four `dq.rules`
+  types ODCS can express: `completeness`, `uniqueness`, `valid_values` and `freshness`. The other
+  four (`accuracy`, `schema`, `anomaly_detection`, `drift_detection`) have no executable ODCS form,
+  so each is logged by name with the reason and still carried in `fluidExtras`, as the *Fixed*
+  entry says.
 - `fluid odps import` now refuses to write an invalid contract instead of reporting success; pass
   `--lenient` for the old behaviour. The pass-through bucket it writes moved from
   `metadata.odps_passthrough` to the root `extensions.odps`, because `metadata` is
@@ -194,6 +203,17 @@ into consumers.
   `owner.contacts[]`, but the schema rejected those keys, so a valid contract never reached that
   code. With `metadata.team.members` set, both exporters now emit every member and role; without
   it, the owner-derived path is unchanged.
+- **A team member's `email` was advertised by the schema and dropped by both exporters.** The
+  0.7.6 `teamMember` declares it, so an author could fill it in and `fluid validate` accepted the
+  contract, but it reached neither the ODPS product nor the ODCS team block — in ODPS it reached
+  nothing at all, and in ODCS it survived only inside the `fluidExtras` round-trip blob, which
+  `ODCS_FLUID_EXTRAS=false` switches off. It cannot be a member field: Bitol's `TeamMember` has no
+  `email` property and is closed in all three vendored schemas (ODCS v3.1.0, ODPS v1.0.0 and
+  v1.1.0), so emitting one fails strict Bitol validation. All three do accept a member
+  `customProperties` list, so the address is now published there as `fluidEmail`, the same escape
+  hatch and the same `fluid`-prefixed naming as `fluidProductName` and `fluidExtras`. Both
+  importers read it back into the roster, so the field round-trips, and the exported documents
+  still validate against both vendored schemas.
 - **The ODPS exporter dropped a structured description entirely.** Given the object the ODCS
   exporter has accepted since #585, it wrote no `description` at all, because it only knew how to
   wrap a string. It now passes the object through.

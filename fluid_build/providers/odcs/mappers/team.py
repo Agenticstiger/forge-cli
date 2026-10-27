@@ -29,6 +29,11 @@ roster: ``{name, members[{username, name, role, email}]}``, with Bitol's own
 field names. Import fills both; export prefers the roster, and falls back to
 the owner-derived single member when a contract has none.
 
+``email`` is the one roster field Bitol has no property for — ``TeamMember`` is
+closed in all three vendored schemas — so it is published as the member's
+``fluidEmail`` custom property rather than dropped; see
+:data:`FLUID_MEMBER_EMAIL_PROPERTY`.
+
 The roster has a home only from 0.7.6, and ``metadata`` is closed in every
 version, so :func:`write_roster` putting it there is not the last word:
 ``normalize.to_document`` keeps it only when the version the source document
@@ -175,18 +180,110 @@ def _owner_to_team(fluid: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 # Member fields besides ``username`` that FLUID's ``teamMember`` and Bitol's
-# ``TeamMember`` both define. ``email`` is FLUID-only, see :func:`write_roster`.
+# ``TeamMember`` both define as plain properties. ``email`` is not one of them;
+# it travels as a custom property, see :data:`FLUID_MEMBER_EMAIL_PROPERTY`.
 _ROSTER_FIELDS = ("name", "role")
+
+# The ``customProperties`` key a member's FLUID ``email`` travels in.
+#
+# Bitol's ``TeamMember`` has no ``email`` property and is closed
+# (``additionalProperties: false`` in ODCS v3.1.0 and in ODPS v1.0.0 and v1.1.0
+# alike), so a member field named ``email`` fails all three vendored schemas —
+# which is why this mapper used to drop the field and say nothing, leaving an
+# author who filled it in with no output and no diagnostic. Every one of those
+# three definitions does accept ``customProperties``, the spec's own escape
+# hatch, so that is where it goes, under the same ``fluid``-prefixed camelCase
+# name this provider already uses for ``fluidProductName`` (:mod:`.metadata`),
+# ``fluidExtras`` (:mod:`.extras`) and ``fluidContractQuality``
+# (:mod:`.quality`).
+#
+# Only ``{property, value, description}`` is written: ODPS v1.1.0's
+# ``CustomProperty`` also has a ``vendor`` field but ODCS v3.1.0's does not, and
+# both exporters publish this one shape.
+FLUID_MEMBER_EMAIL_PROPERTY = "fluidEmail"
+
+# Short on purpose: this rides on every member that declares an email, so a
+# paragraph here would be the bulk of a large team's exported block.
+_MEMBER_EMAIL_DESCRIPTION = (
+    "FLUID metadata.team.members[].email. Bitol's TeamMember has no email "
+    "field; safe for other consumers to ignore."
+)
+
+
+def _email_property_index(member: Mapping[str, Any]) -> Optional[int]:
+    """Where :data:`FLUID_MEMBER_EMAIL_PROPERTY` sits in a member's custom properties."""
+    properties = member.get("customProperties")
+    if not isinstance(properties, list):
+        return None
+    for index, prop in enumerate(properties):
+        if isinstance(prop, Mapping) and prop.get("property") == FLUID_MEMBER_EMAIL_PROPERTY:
+            return index
+    return None
+
+
+def _read_member_email(member: Mapping[str, Any]) -> Optional[str]:
+    """The ``email`` a Bitol member carries, or None when it carries none."""
+    index = _email_property_index(member)
+    if index is None:
+        return None
+    value = member["customProperties"][index].get("value")
+    return value if isinstance(value, str) and value else None
+
+
+def _write_member_email(member: Dict[str, Any], email: Optional[str]) -> None:
+    """Carry the roster's ``email`` in the member's ``fluidEmail`` custom property.
+
+    The roster owns the address, so it beats the stale copy an import parked in
+    the pass-through, exactly as ``name`` and ``role`` do. An entry already
+    there keeps its position and its ``description`` and only its ``value``
+    changes, which is what keeps ``import -> export`` an exact fixed point.
+
+    The address is written even when it equals ``username``. Skipping the
+    duplicate would be tidier output, but a round-trip could then not tell a
+    member who declared no ``email`` from one whose ``email`` happened to match
+    their username, and would drop the field for the second.
+
+    A ``fluidEmail`` entry whose value is not a string was not written here —
+    :func:`_read_member_email` does not import one either — so it is left where
+    it is, like every other custom property this mapper does not own.
+    """
+    index = _email_property_index(member)
+    if email is None:
+        if index is not None and isinstance(member["customProperties"][index].get("value"), str):
+            del member["customProperties"][index]
+            if not member["customProperties"]:
+                member.pop("customProperties", None)
+        return
+    if index is not None:
+        member["customProperties"][index]["value"] = email
+        return
+    properties = member.get("customProperties")
+    if properties is None:
+        member["customProperties"] = properties = []
+    elif not isinstance(properties, list):
+        # Not a Bitol custom-property list at all. Replacing it to make room for
+        # the email would destroy whatever the document put there, so the email
+        # stays in ``metadata.team`` only.
+        return
+    properties.append(
+        {
+            "property": FLUID_MEMBER_EMAIL_PROPERTY,
+            "value": email,
+            "description": _MEMBER_EMAIL_DESCRIPTION,
+        }
+    )
 
 
 def write_roster(fluid: MutableMapping[str, Any], team: Any) -> None:
     """Put a Bitol ``team``'s roster on ``fluid`` as ``metadata.team``.
 
-    The roster is ``{name, members[{username, name, role}]}``: the fields both
-    Bitol's ``TeamMember`` and FLUID's ``teamMember`` define. ``email`` is left
-    unset on purpose. Bitol's ``username`` already is "the username or email",
-    and copying it into ``email`` would make a hand-written roster that never
-    set one compare unequal to its own round-trip.
+    The roster is ``{name, members[{username, name, role, email}]}``: the three
+    fields both Bitol's ``TeamMember`` and FLUID's ``teamMember`` define as
+    properties, plus the ``email`` :func:`_read_member_email` recovers from the
+    member's ``fluidEmail`` custom property. ``email`` is never filled in from
+    ``username``: Bitol's ``username`` already is "the username or email", and
+    copying it across would make a hand-written roster that never set one
+    compare unequal to its own round-trip.
 
     A roster is promoted whole or not at all. A member without a ``username``
     (both Bitol and FLUID's ``teamMember`` require one) or with a ``name`` or
@@ -219,6 +316,9 @@ def write_roster(fluid: MutableMapping[str, Any], team: Any) -> None:
             if not isinstance(value, str):
                 return
             entry[key] = value
+        email = _read_member_email(member)
+        if email is not None:
+            entry["email"] = email
         roster.append(entry)
     if not roster:
         return
@@ -306,8 +406,11 @@ def _team_from_roster(
     Members are matched by ``username``, first-come first-served, because one
     person can hold two roles as two entries with the same username.
 
-    FLUID's ``email`` has no Bitol field and ``TeamMember`` is closed, so it is
-    not exported; a Bitol ``username`` can already be an email.
+    FLUID's ``email`` is the one roster field Bitol has no property for, so it
+    is published as the ``fluidEmail`` custom property instead — see
+    :func:`_write_member_email`. The pass-through's ``customProperties`` are
+    carried like any other Bitol-only key, and that one entry is reconciled
+    against the roster on top of them.
     """
     passthrough = passthrough_team if isinstance(passthrough_team, Mapping) else {}
 
@@ -328,6 +431,8 @@ def _team_from_roster(
                 member[key] = entry[key]
             else:
                 member.pop(key, None)
+        email = entry.get("email")
+        _write_member_email(member, email if isinstance(email, str) and email else None)
         members.append(member)
 
     team = copy.deepcopy(dict(passthrough))

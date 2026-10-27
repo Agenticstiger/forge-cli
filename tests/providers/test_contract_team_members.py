@@ -220,21 +220,163 @@ class TestThreeMembersWithRoles:
         bundle = BitolOdpsProvider().render(_contract(members=THREE_MEMBERS))
         _assert_valid_bitol(bundle["product"], bundle["contracts"])
 
-    def test_email_has_no_bitol_field_and_is_not_exported(self) -> None:
-        # Bitol's TeamMember is closed and its ``username`` already is "the
-        # username or email". Exporting ``email`` would fail the Bitol schema.
-        members = [{**ADA, "email": "ada@corp.example.com"}, GRACE]
-        bundle = BitolOdpsProvider().render(_contract(members=members))
-        assert bundle["product"]["team"]["members"] == [ADA, GRACE]
+
+# ---------------------------------------------------------------------------
+# A member's email reaches both exports as the fluidEmail custom property
+# ---------------------------------------------------------------------------
+
+
+ADA_WITH_EMAIL = {**ADA, "email": "ada@corp.example.com"}
+
+# What the mapper publishes for that member. ``description`` is asserted
+# verbatim rather than ignored: it is the only thing telling a consumer who
+# meets ``fluidEmail`` what it is, and a test that skipped it would let the
+# sentence rot.
+ADA_EMAIL_PROPERTY = {
+    "property": "fluidEmail",
+    "value": "ada@corp.example.com",
+    "description": (
+        "FLUID metadata.team.members[].email. Bitol's TeamMember has no email "
+        "field; safe for other consumers to ignore."
+    ),
+}
+ADA_EXPORTED = {**ADA, "customProperties": [ADA_EMAIL_PROPERTY]}
+
+
+class TestMemberEmailTravelsAsACustomProperty:
+    """``metadata.team.members[].email`` is published, not dropped.
+
+    The 0.7.6 ``teamMember`` declares ``email``, so ``fluid validate`` accepts
+    a contract that fills it in — and both exporters used to drop it on the
+    floor. It cannot be a member *field*: Bitol's ``TeamMember`` has no
+    ``email`` property and is closed in all three vendored schemas, so a member
+    carrying one fails strict Bitol validation. All three do accept a member
+    ``customProperties`` list, which is where it goes.
+    """
+
+    def test_the_odps_export_publishes_it_on_the_member(self) -> None:
+        bundle = BitolOdpsProvider().render(_contract(members=[ADA_WITH_EMAIL, GRACE]))
+        assert bundle["product"]["team"]["members"] == [ADA_EXPORTED, GRACE]
+
+    def test_every_odcs_contract_in_the_odps_bundle_publishes_it(self) -> None:
+        bundle = BitolOdpsProvider().render(_contract(members=[ADA_WITH_EMAIL, GRACE]))
+        assert len(bundle["contracts"]) == 2
+        for contract in bundle["contracts"].values():
+            assert contract["team"]["members"] == [ADA_EXPORTED, GRACE]
+
+    def test_each_standalone_odcs_export_publishes_it(self) -> None:
+        contract = _contract(members=[ADA_WITH_EMAIL, GRACE])
+        for expose_id in ("orders", "customers"):
+            odcs = OdcsProvider().render(contract, expose_id=expose_id)
+            assert odcs["team"]["members"] == [ADA_EXPORTED, GRACE]
+
+    def test_both_exported_documents_still_satisfy_the_vendored_bitol_schemas(self) -> None:
+        # The whole reason ``email`` is not a member field: this is what an
+        # ``email`` key on a closed ``TeamMember`` would fail.
+        bundle = BitolOdpsProvider().render(_contract(members=[ADA_WITH_EMAIL, GRACE, LINUS]))
         _assert_valid_bitol(bundle["product"], bundle["contracts"])
 
-    def test_the_odcs_export_still_carries_the_email_for_a_fluid_reimport(self) -> None:
-        # FLUID -> ODCS -> FLUID must stay lossless: what the team block cannot
-        # carry rides in the ``fluidExtras`` blob, derived by diffing a re-import.
-        members = [{**ADA, "email": "ada@corp.example.com"}, GRACE]
-        odcs = OdcsProvider().render(_contract(members=members), expose_id="orders")
+    def test_no_member_carries_a_bare_email_key(self) -> None:
+        bundle = BitolOdpsProvider().render(_contract(members=[ADA_WITH_EMAIL, GRACE]))
+        for member in bundle["product"]["team"]["members"]:
+            assert "email" not in member
+
+    def test_a_member_that_declares_no_email_gets_no_custom_properties(self) -> None:
+        # No noise on the members that did not ask for it.
+        assert _export_odcs(_contract(members=THREE_MEMBERS))["members"] == THREE_MEMBERS
+
+    def test_an_email_equal_to_the_username_is_still_published(self) -> None:
+        # Skipping the duplicate would be tidier, but then a round-trip could
+        # not tell a member who declared no email from one whose email happens
+        # to match their username, and would drop the field for the second.
+        member = {"username": "ada@example.com", "email": "ada@example.com"}
+        exported = _export_odcs(_contract(members=[member]))["members"][0]
+        assert [p["property"] for p in exported["customProperties"]] == ["fluidEmail"]
+        assert exported["customProperties"][0]["value"] == "ada@example.com"
+
+    @pytest.mark.parametrize("importer", [_import_odcs, _import_odps], ids=["odcs", "odps"])
+    def test_both_importers_read_it_back_into_the_roster(self, importer) -> None:
+        team = {"name": "Sales Analytics", "members": [copy.deepcopy(ADA_EXPORTED), GRACE]}
+        assert importer(team)["metadata"]["team"]["members"] == [ADA_WITH_EMAIL, GRACE]
+
+    def test_the_email_survives_with_the_fluid_extras_blob_switched_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Its previous only carrier was that blob, which this flag removes, so
+        # ``ODCS_FLUID_EXTRAS=false`` used to publish the email nowhere at all.
+        monkeypatch.setenv("ODCS_FLUID_EXTRAS", "false")
+        odcs = OdcsProvider().render(_contract(members=[ADA_WITH_EMAIL]), expose_id="orders")
+        assert odcs["team"]["members"] == [ADA_EXPORTED]
+        assert not [p for p in odcs.get("customProperties") or [] if p["property"] == "fluidExtras"]
+
+    def test_the_blob_no_longer_needs_to_carry_the_roster_at_all(self) -> None:
+        # ``fluidExtras`` is a *derived* delta — whatever the round-trip
+        # reproduces is omitted. Now that the team block carries the email,
+        # ``metadata.team`` drops out of it, which is the mechanism's own
+        # statement that nothing about the roster is lost any more.
+        odcs = OdcsProvider().render(_contract(members=[ADA_WITH_EMAIL]), expose_id="orders")
         extras = next(p for p in odcs["customProperties"] if p["property"] == "fluidExtras")
-        assert extras["value"]["metadata"]["team"]["members"][0]["email"] == "ada@corp.example.com"
+        assert "team" not in extras["value"]["metadata"]
+
+
+class TestMemberEmailAgainstTheBitolOnlyMemberKeys:
+    """The ``fluidEmail`` entry is reconciled *on top of* the pass-through.
+
+    A member can hold Bitol keys FLUID has no home for, custom properties of
+    its own among them. Those come back from the pass-through bucket on export,
+    and the one entry this mapper owns has to be edited into that list rather
+    than replacing it.
+    """
+
+    SLACK = {"property": "slack", "value": "@ada"}
+    TEAM = {
+        "name": "Sales Analytics",
+        "members": [
+            {
+                **ADA,
+                "dateIn": "2024-01-01",
+                "customProperties": [SLACK, copy.deepcopy(ADA_EMAIL_PROPERTY)],
+            }
+        ],
+    }
+
+    def test_import_then_export_reproduces_the_document(self) -> None:
+        assert _export_odcs(_import_odcs(copy.deepcopy(self.TEAM))) == self.TEAM
+
+    def test_an_edited_email_wins_over_the_stale_pass_through_copy(self) -> None:
+        fluid = _import_odcs(copy.deepcopy(self.TEAM))
+        fluid["metadata"]["team"]["members"][0]["email"] = "ada@newdomain.example.com"
+        member = _export_odcs(fluid)["members"][0]
+        assert member["customProperties"] == [
+            self.SLACK,
+            {**ADA_EMAIL_PROPERTY, "value": "ada@newdomain.example.com"},
+        ]
+
+    def test_removing_the_email_removes_only_that_entry(self) -> None:
+        fluid = _import_odcs(copy.deepcopy(self.TEAM))
+        del fluid["metadata"]["team"]["members"][0]["email"]
+        member = _export_odcs(fluid)["members"][0]
+        assert member["customProperties"] == [self.SLACK]
+        assert member["dateIn"] == "2024-01-01"
+
+    def test_removing_the_only_email_drops_the_empty_list_rather_than_leaving_it(self) -> None:
+        team = {"name": "T", "members": [copy.deepcopy(ADA_EXPORTED)]}
+        fluid = _import_odcs(team)
+        del fluid["metadata"]["team"]["members"][0]["email"]
+        assert _export_odcs(fluid)["members"] == [ADA]
+
+    @pytest.mark.parametrize("value", [None, 7, ["a@b.example"], {}], ids=str)
+    def test_an_entry_this_mapper_did_not_write_is_left_verbatim(self, value: Any) -> None:
+        # A ``fluidEmail`` whose value is not a string is not an address this
+        # mapper would have imported, so it is carried like any other foreign
+        # custom property instead of being rewritten or deleted.
+        team = {
+            "name": "T",
+            "members": [{**ADA, "customProperties": [{"property": "fluidEmail", "value": value}]}],
+        }
+        fluid = _import_odcs(copy.deepcopy(team))
+        assert "email" not in fluid["metadata"]["team"]["members"][0]
+        assert _export_odcs(fluid) == team
 
 
 # ---------------------------------------------------------------------------
