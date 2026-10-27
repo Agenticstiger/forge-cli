@@ -84,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Six optional fields in the 0.7.6 preview schema, for things a contract could not previously
+- **Seven optional fields in the 0.7.6 preview schema, for things a contract could not previously
   say.** Each is optional and additive, so a contract that sets none of them validates and exports
   byte for byte as before. The names are taken from Bitol ODCS v3.1.0 and the released ODPS v1.1.0
   rather than invented, so import and export are a pass-through instead of a translation.
@@ -128,9 +128,10 @@ into consumers.
   the `binding.serialization.value` this release adds — `avro`, `json`, `protobuf` or `xml`, with
   the two `-confluent` spellings collapsing onto the wire format they carry. A contract that has
   not adopted that field still exports the FLUID binding format `kafka_topic`, exactly as before:
-  the exporter will not guess a wire format from a contract that never stated one, and ODCS's own
-  `json` default would be wrong for every Avro topic. So this changes a Kafka export only once the
-  contract says what its messages are.
+  the exporter will not guess a wire format from a contract that never stated one, and guessing
+  `json` would be wrong for every Avro topic. So this changes a Kafka export only once the contract
+  says what its messages are. (A Kafka binding that declares no `format` at all has defaulted to
+  `json` since before this release — that is unchanged, and not what the new field replaces.)
 - A Kafka column's `physicalType` is now an Avro type name. Notably `bigint` exports as `long`
   where it previously exported as `integer`.
 - Derived quality rules now carry an `id`, and rules declared on a contract are exported as ODCS
@@ -139,8 +140,10 @@ into consumers.
   four (`accuracy`, `schema`, `anomaly_detection`, `drift_detection`) have no executable ODCS form,
   so each is logged by name with the reason and still carried in `fluidExtras`, as the *Fixed*
   entry says.
-- `fluid odps import` now refuses to write an invalid contract instead of reporting success; pass
-  `--lenient` for the old behaviour. The pass-through bucket it writes moved from
+- `fluid odps import` now refuses to write an invalid contract instead of reporting success. The
+  existing `--lenient` flag, which downgraded output-port resolution failures to warnings, is
+  widened to mean "write it anyway" and so restores the old behaviour. The pass-through bucket it
+  writes moved from
   `metadata.odps_passthrough` to the root `extensions.odps`, because `metadata` is
   `additionalProperties: false` and the old address could never validate.
 
