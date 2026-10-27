@@ -204,13 +204,21 @@ def test_bitol_validate_names_the_json_parse_error(tmp_path: Path) -> None:
 
 
 def test_bitol_validate_names_the_yaml_parse_error(tmp_path: Path) -> None:
-    """Pins the YAML branch the JSON branch was missing: it still exits 1 with the parser's text."""
+    """Pins the YAML branch the JSON branch was missing: exit 1 with the parser's text.
+
+    PyYAML's exact phrasing is not asserted, for the reason the two JSON tests
+    above carry: a library's message is not this code's contract, and pinning
+    one cost two CI rounds on 3.13 and 3.14. The position and the file are the
+    parts the guard is responsible for relaying.
+    """
     path = tmp_path / "bad.odps.yaml"
     path.write_text("apiVersion: [unclosed\n", encoding="utf-8")
     code, message = _validate_message(path)
     assert code == 1
-    assert "while parsing a flow sequence" in message
+    assert str(path) in message
     assert "line 1" in message
+    assert "Unexpected error" not in message
+    assert "unhandled exception" not in message
 
 
 @pytest.mark.parametrize("name", ["list.json", "list.odps.yaml"])
@@ -267,13 +275,25 @@ def test_bitol_validate_reports_bytes_that_are_not_utf8(tmp_path: Path, name: st
     assert str(path) in message
 
 
-def test_bitol_validate_reports_json_nested_past_the_recursion_limit(tmp_path: Path) -> None:
+def test_bitol_validate_survives_a_pathologically_deep_json_document(tmp_path: Path) -> None:
+    """A document designed to blow the parser must exit 1, not crash the CLI.
+
+    Which parser error arrives is interpreter-specific, so it is not asserted.
+    Up to 3.13 the decoder recurses and 100,000 opening brackets raise
+    ``RecursionError`` ("nested too deeply"). CPython 3.14's decoder is not
+    recursive, so the same document parses all 100,000 brackets and then runs
+    out of input, giving ``JSONDecodeError: Expecting value: line 1 column
+    100001``. Both are handled; pinning either message made the suite pass on
+    3.10 through 3.13 and fail on 3.14. The ``RecursionError`` arm is still
+    needed for the interpreters that take it.
+    """
     path = tmp_path / "deep.json"
     path.write_text("[" * 100_000, encoding="utf-8")
     code, message = _validate_message(path)
     assert code == 1
-    assert "nested too deeply" in message
     assert str(path) in message
+    assert "Unexpected error" not in message
+    assert "unhandled exception" not in message
 
 
 @pytest.mark.parametrize("case", ["malformed-json", "malformed-yaml", "missing", "directory"])

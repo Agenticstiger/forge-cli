@@ -16,8 +16,9 @@
 
 The v4.1 branch of ``cmd_opds_validate`` caught only ``OSError`` and
 ``json.JSONDecodeError`` around ``json.load``. A file that is not UTF-8
-(``UnicodeDecodeError``) and a document nested past the recursion limit
-(``RecursionError``) escaped, and the CLI exited 2 with "CLI unhandled
+(``UnicodeDecodeError``) and a pathologically deep document (``RecursionError``
+up to 3.13; a plain ``JSONDecodeError`` on 3.14, whose decoder does not
+recurse) escaped, and the CLI exited 2 with "CLI unhandled
 exception" where the contract is exit 0 for valid and exit 1 for invalid or
 unreadable. ``fluid odps-bitol validate`` was fixed for the same cases first
 (``tests/cli/test_odps_bitol_validate_and_env.py``); these tests pin that the
@@ -113,14 +114,24 @@ def test_v41_validate_reports_bytes_that_are_not_utf8(tmp_path: Path) -> None:
     assert "Re-save the file as UTF-8." in message
 
 
-def test_v41_validate_reports_json_nested_past_the_recursion_limit(tmp_path: Path) -> None:
+def test_v41_validate_survives_a_pathologically_deep_json_document(tmp_path: Path) -> None:
+    """A document designed to blow the parser must exit 1, not crash the CLI.
+
+    Which parser error arrives is interpreter-specific, so it is not asserted.
+    Up to 3.13 the decoder recurses and 100,000 opening brackets raise
+    ``RecursionError``; CPython 3.14's decoder is not recursive, so the same
+    document parses them all and then runs out of input, giving a
+    ``JSONDecodeError``. Both are handled, and pinning either message failed
+    the suite on 3.14.
+    """
     path = tmp_path / "deep.json"
     path.write_text("[" * 100_000, encoding="utf-8")
     code, message = _validate(path)
     assert code == 1
     assert message.startswith("✗ Validation failed: ")
-    assert "nested too deeply" in message
     assert str(path) in message
+    assert "Unexpected error" not in message
+    assert "unhandled exception" not in message
 
 
 def test_v41_validate_reports_a_missing_path(tmp_path: Path) -> None:

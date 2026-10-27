@@ -250,9 +250,11 @@ into consumers.
   `apiVersion`.
 - **Three validate commands crashed instead of diagnosing a malformed file.** On the
   `odps-bitol` and `--spec odps-4.1` paths only some parse failures were caught, so a malformed
-  `.json`, non-UTF-8 bytes, or a document nested past the recursion limit escaped as an unhandled
-  exception and exited 2. Each now exits 1 naming the file and the problem, as does a missing path, a
-  directory and a document that parses to something other than a mapping.
+  `.json`, non-UTF-8 bytes, or a pathologically deep document escaped as an unhandled exception and
+  exited 2. Each now exits 1 naming the file and the problem, as does a missing path, a directory
+  and a document that parses to something other than a mapping. (Which error a deep document raises
+  is interpreter-specific: a `RecursionError` up to 3.13, and a plain parse error on 3.14, whose
+  json decoder no longer recurses. Both are handled.)
 - **`fluid generate standard --env` was accepted and ignored for `odcs`, `odps` and
   `odps-bitol`.** Those paths loaded the base contract with no warning, so an overlay that changes a
   Kafka topic or a Glue database produced the base value under a `--env prod` flag, while `fluid odps
