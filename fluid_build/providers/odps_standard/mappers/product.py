@@ -96,15 +96,24 @@ def to_odps(ctx: ExportCtx) -> None:
 
     # Description: ODPS uses {purpose, limitations, usage}. Accept the
     # description from any of three FLUID locations — explicit
-    # odps_passthrough bucket (wins for round-trip fidelity), top-level
-    # ``description`` string, or ``metadata.description``.
+    # odps_passthrough bucket (wins for round-trip fidelity), the top-level
+    # ``description``, or ``metadata.description``.
+    #
+    # A 0.7.6 root ``description`` is either a string or that same structured
+    # object, whose three field names are Bitol's own. Only the string case was
+    # handled, and an object matched no branch, so it exported as NO
+    # description at all — ``usage`` and ``limitations`` silently dropped, and
+    # ``purpose`` with them. An ODCS import keeps the original object in its
+    # pass-through bucket, so the ODCS exporter (PR #585) restored all three
+    # while an ODPS export of the very same contract kept at most purpose.
     pt = get_metadata_passthrough(fluid)
+    description = fluid.get("description") or metadata.get("description")
     if "description" in pt:
         odps["description"] = dict(pt["description"])
-    elif isinstance(fluid.get("description"), str) and fluid["description"]:
-        odps["description"] = {"purpose": fluid["description"]}
-    elif metadata.get("description"):
-        odps["description"] = {"purpose": metadata["description"]}
+    elif isinstance(description, Mapping) and description:
+        odps["description"] = dict(description)
+    elif isinstance(description, str) and description:
+        odps["description"] = {"purpose": description}
 
     # ``domain`` is a root FLUID field and a root Bitol ODPS field, but only
     # ``metadata.domain`` was read — a key an ODCS import writes and a

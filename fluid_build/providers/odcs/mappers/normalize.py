@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
@@ -66,6 +67,13 @@ EXTENSION_NAMESPACE = "odcs"
 
 # FLUID ``metadata`` is a closed object; only these keys may appear there.
 # Anything else the ODCS side wants to carry goes to the pass-through.
+#
+# ``team`` is in here but is NOT accepted by every bundled schema: the roster
+# arrived in FLUID 0.7.6, and before it the import had to bucket the Bitol team
+# it read, which is why an ODPS export of an ODCS-imported contract emitted only
+# the owner-derived member. Ask :func:`metadata_keys_for` rather than this set
+# directly, so a document declaring an older version still gets the roster
+# bucketed instead of written into a ``metadata`` that rejects it.
 _FLUID_METADATA_KEYS = frozenset(
     {
         "businessContext",
@@ -77,8 +85,14 @@ _FLUID_METADATA_KEYS = frozenset(
         "productType",
         "provenance",
         "tags",
+        "team",
     }
 )
+
+# The ``metadata`` keys above that only some bundled schema versions declare.
+# Every other key has been there since the oldest version we bundle, so there is
+# nothing to ask the schema about.
+_VERSIONED_METADATA_KEYS = frozenset({"team"})
 
 # FLUID ``metadata.owner`` is closed too.
 _FLUID_OWNER_KEYS = frozenset({"team", "email", "slack", "oncall"})
@@ -100,17 +114,147 @@ _LOCATION_KEYS = (
 
 
 # --------------------------------------------------------------------------
+# which schema version an imported document may declare
+# --------------------------------------------------------------------------
+
+
+def resolve_declared_version(recorded: Any) -> str:
+    """The FLUID schema version an imported contract may declare.
+
+    ``recorded`` is whatever the source document said its FLUID version was: an
+    ODCS ``customProperties`` entry written by an earlier export, or an upstream
+    import's own root field. ``None`` means the document recorded nothing, which
+    is the normal case for a genuinely foreign document; it gets the latest
+    stable version, as before.
+
+    A recorded value is **foreign text that selects a JSON Schema**, so it is
+    honoured only when it names a version this build actually bundles. An
+    unknown string, a path, a number, an empty string, a version newer than
+    anything shipped: each falls back to the stable default and logs the value
+    it rejected. Without that check a document could make forge declare a
+    version forge does not ship, and every later ``fluid validate`` of the
+    imported contract would either fall through to a schema nobody chose or go
+    looking for one over the network.
+
+    A preview version (``PREVIEW_VERSIONS``) is bundled and fully validatable,
+    so it is honoured — but only for a document that already recorded it, and
+    the INFO line says so, because the alternative is a user wondering why an
+    import declares a preview schema. Preview never becomes the default: the
+    fallback is :meth:`FluidSchemaManager.latest_bundled_version`, which
+    excludes it.
+    """
+    # Function-local: schema_manager pulls in jsonschema, and the CLI's startup
+    # budget (tests/perf/test_startup_budget.py) forbids that on ``--help``.
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    default = FluidSchemaManager.latest_bundled_version()
+    if recorded is None:
+        return default
+    if isinstance(recorded, str) and recorded in FluidSchemaManager.BUNDLED_VERSIONS:
+        if recorded in FluidSchemaManager.PREVIEW_VERSIONS:
+            LOG.info(
+                "Import: honouring the source document's recorded fluidVersion %s, a "
+                "PREVIEW schema version. The imported contract declares it because the "
+                "document did; it is not the default for a document that records none.",
+                recorded,
+            )
+        return recorded
+    # %r: the value is document text and may be a non-string or carry control
+    # characters.
+    LOG.warning(
+        "Import: ignoring the recorded fluidVersion %r — this build bundles only %s. "
+        "The imported contract declares %s instead. A document cannot select a schema "
+        "version forge does not ship.",
+        recorded,
+        ", ".join(FluidSchemaManager.BUNDLED_VERSIONS),
+        default,
+    )
+    return default
+
+
+def metadata_keys_for(version: str) -> frozenset:
+    """``_FLUID_METADATA_KEYS`` minus the keys this schema version has no slot for.
+
+    ``metadata`` is closed in every bundled version, so a key the declared
+    version does not declare has to be bucketed rather than written — writing it
+    is what makes the import emit a contract its own validator rejects.
+    """
+    return _FLUID_METADATA_KEYS - {
+        key for key in _VERSIONED_METADATA_KEYS if not _metadata_declares(version, key)
+    }
+
+
+@lru_cache(maxsize=None)
+def _metadata_declares(version: str, key: str) -> bool:
+    """Does this bundled FLUID schema declare ``metadata.<key>``?"""
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    schema = FluidSchemaManager().get_schema(version, offline_only=True)
+    if not isinstance(schema, Mapping):
+        # A version we cannot read: assume the narrower answer. Bucketing a key
+        # the schema would have accepted is lossless (it exports verbatim from
+        # the bucket); writing one it rejects fails the whole contract.
+        return False
+    metadata = (schema.get("properties") or {}).get("metadata")
+    properties = metadata.get("properties") if isinstance(metadata, Mapping) else None
+    return isinstance(properties, Mapping) and key in properties
+
+
+@lru_cache(maxsize=None)
+def _def_declares(version: str, definition: str, key: str) -> bool:
+    """Does this bundled FLUID schema declare ``$defs.<definition>.<key>``?
+
+    Asked of the schema rather than compared against the version string that
+    introduced a field, so promoting a preview version to stable, or adding a
+    later one that keeps the field, needs no edit here. Same narrow-answer
+    fallback as :func:`_metadata_declares`: ``$defs.column`` and
+    ``$defs.exposeContract`` are both ``additionalProperties: false``, so
+    guessing "declared" on a schema we cannot read would make the import emit a
+    contract its own validator rejects, while guessing "not declared" only
+    routes the value to the pass-through the export already reads back.
+    """
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    schema = FluidSchemaManager().get_schema(version, offline_only=True)
+    if not isinstance(schema, Mapping):
+        return False
+    block = (schema.get("$defs") or {}).get(definition)
+    properties = block.get("properties") if isinstance(block, Mapping) else None
+    return isinstance(properties, Mapping) and key in properties
+
+
+@lru_cache(maxsize=None)
+def _identifier_pattern(version: str) -> Optional[re.Pattern]:
+    """The regex this bundled FLUID schema's ``$defs.identifier`` declares.
+
+    Read from the schema rather than copied into a constant because the pattern
+    is not the same in every bundled version: 0.7.1 and 0.7.2 accept lowercase
+    only, 0.7.3 widened it to both casings. ``None`` when the schema cannot be
+    read or declares no pattern, which the caller treats as "cannot say", so an
+    id is left exactly as the document stated it.
+    """
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    schema = FluidSchemaManager().get_schema(version, offline_only=True)
+    if not isinstance(schema, Mapping):
+        return None
+    identifier = (schema.get("$defs") or {}).get("identifier")
+    pattern = identifier.get("pattern") if isinstance(identifier, Mapping) else None
+    if not isinstance(pattern, str) or not pattern:
+        return None
+    try:
+        return re.compile(pattern)
+    except re.error:  # pragma: no cover - a bundled schema we ship is valid
+        return None
+
+
+# --------------------------------------------------------------------------
 # import side: intermediate shape → valid FLUID document
 # --------------------------------------------------------------------------
 
 
 def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, Any]:
     """Restructure the import pipeline's output into a valid FLUID contract."""
-    # Function-local: schema_manager pulls in jsonschema, and the CLI's
-    # startup budget (tests/perf/test_startup_budget.py) forbids that on the
-    # ``--help`` path.
-    from fluid_build.schema_manager import FluidSchemaManager
-
     work = copy.deepcopy(dict(fluid))
     bucket: Dict[str, Any] = {}
 
@@ -118,11 +262,12 @@ def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, 
     metadata_pt = dict(metadata.pop(PASSTHROUGH_KEY, {}) or {})
 
     doc: Dict[str, Any] = {
-        # ODCS carries no FLUID schema version. Keep the one the extras mapper
-        # restored so an imported contract stays pinned to the version it was
-        # authored against; only a genuinely foreign document gets the default.
-        "fluidVersion": work.pop("fluidVersion", None)
-        or FluidSchemaManager.latest_bundled_version(),
+        # ODCS carries no FLUID schema version of its own. Keep the one the
+        # extras mapper restored so an imported contract stays pinned to the
+        # version it was authored against; only a genuinely foreign document
+        # gets the default. The restored value came out of a document that may
+        # be foreign or hostile, so it goes through the allowlist.
+        "fluidVersion": resolve_declared_version(work.pop("fluidVersion", None)),
         "kind": work.pop("kind", None) or "DataProduct",
     }
 
@@ -130,7 +275,16 @@ def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, 
     contract_id = None
     if isinstance(contract_block, Mapping):
         contract_id = contract_block.get("id")
-    doc["id"] = work.get("id") or contract_id or odcs.get("id") or "imported.odcs.contract"
+    doc["id"], verbatim_id = _root_identifier(
+        work.get("id") or contract_id or odcs.get("id"), str(doc["fluidVersion"])
+    )
+    if verbatim_id is not None:
+        # The ODCS ``id`` the root could not carry. ``rehydrate`` replays it so
+        # a whole-contract re-export still publishes the id the source document
+        # named, and :func:`_pin_contract_id` keeps the per-port export on it
+        # too. Without one of those two the import would answer an export with
+        # a different contract id than the one every consumer references.
+        bucket["contract_id"] = verbatim_id
 
     # ``name`` is required by FLUID and optional in ODCS. Fall back to the id
     # rather than inventing a title, and remember that we did so, so re-export
@@ -172,7 +326,11 @@ def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, 
         bucket["version"] = version
 
     # Remaining non-FLUID metadata keys (tenant, dataProduct, ...) → bucket.
-    stray = {k: v for k, v in metadata.items() if k not in _FLUID_METADATA_KEYS}
+    # Asked per declared version, because ``team`` has a home only from 0.7.6:
+    # on an older document the roster the team mapper just wrote is bucketed,
+    # and ``rehydrate`` puts it back for the export.
+    accepted_metadata = metadata_keys_for(str(doc["fluidVersion"]))
+    stray = {k: v for k, v in metadata.items() if k not in accepted_metadata}
     for key in stray:
         metadata.pop(key)
     if stray:
@@ -190,10 +348,12 @@ def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, 
 
     servers = metadata_pt.get("servers") if isinstance(metadata_pt, Mapping) else None
     doc["exposes"] = [
-        _normalize_expose(expose, servers, bucket)
+        _normalize_expose(expose, servers, bucket, str(doc["fluidVersion"]))
         for expose in (work.get("exposes") or [])
         if isinstance(expose, Mapping)
     ]
+    if verbatim_id is not None:
+        _pin_contract_id(doc["exposes"], verbatim_id, str(doc["fluidVersion"]))
 
     # ``expects`` is not a FLUID root key (the modern spelling is ``consumes``,
     # which requires a productId/exposeId pair ODCS servers cannot supply). The
@@ -255,6 +415,86 @@ def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, 
     return doc
 
 
+# Root ``id`` for a document that names no contract id at all.
+_IMPORTED_ID_FALLBACK = "imported.odcs.contract"
+
+
+def _slugged_root_id(raw: Any) -> str:
+    """``raw`` reduced to something ``$defs.identifier`` accepts in every version.
+
+    :func:`fluid_build.util.contract.slugify_identifier` lowercases, collapses
+    every run of other characters to a single dash and guards a leading digit,
+    so its result satisfies the lowercase-only 0.7.1/0.7.2 pattern as well as
+    the wider one from 0.7.3 on.
+    """
+    from fluid_build.util.contract import slugify_identifier
+
+    return slugify_identifier(str(raw), fallback=_IMPORTED_ID_FALLBACK)
+
+
+def _root_identifier(raw: Any, version: str) -> tuple[str, Optional[str]]:
+    """The FLUID root ``id`` for an imported document, plus the id it could not use.
+
+    ODCS puts no format on its ``id`` — a catalog's own URN or UUID is exactly
+    what ``exposes[].contract.id`` exists to pin, and a pinned id is published
+    as the ODCS ``id`` verbatim. FLUID's root ``id`` is narrower: it has to
+    match ``$defs.identifier``. The importer reconstructed the root id straight
+    from the ODCS ``id``, so a contract pinned to ``urn:acme:contract:…``
+    exported fine and then came back as a contract ``fluid validate`` refuses —
+    ``fluid odcs import`` exited 1 on a document forge itself had written, and
+    the only way out was to un-pin the id the catalog requires.
+
+    The ODCS id is still used verbatim whenever it is a legal FLUID identifier,
+    which is every derived ``<productId>.<exposeId>`` and most hand-written
+    ones, so nothing changes for them. Only an id FLUID cannot spell is
+    replaced, by a slug of itself rather than by the ODCS ``name`` or the schema
+    object's: those are the *port's* name, not the product's, so two products
+    with a port called ``orders`` would import under one id, and a name is prose
+    that may carry no identifier characters at all. The slug is derived from the
+    id, so it is deterministic and traceable back to it, and the second return
+    value carries the original for the round-trip to replay.
+    """
+    if raw is None or raw == "":
+        return _IMPORTED_ID_FALLBACK, None
+    text = str(raw)
+    pattern = _identifier_pattern(version)
+    if pattern is None or pattern.match(text):
+        return text, None
+    slug = _slugged_root_id(text)
+    # %r: the id is document text and may carry control characters.
+    LOG.warning(
+        "ODCS import: the contract id %r is not a FLUID identifier (%s), so the "
+        "imported contract's root `id` is %s instead. The id itself is kept as the "
+        "output port's `exposes[].contract.id` where the schema version declares "
+        "that field, and in `extensions.odcs.contract_id`, so re-exporting this "
+        "contract publishes it verbatim.",
+        text,
+        pattern.pattern,
+        slug,
+    )
+    return slug, text
+
+
+def _pin_contract_id(exposes: List[Dict[str, Any]], contract_id: str, version: str) -> None:
+    """Pin an un-FLUID-able ODCS ``id`` as the single output port's contract id.
+
+    An ODCS document is one contract, so a document with exactly one expose has
+    exactly one port that the id belongs to and pinning it is unambiguous.
+    Several exposes (a foreign document with several schema objects) is the case
+    where the id names the document rather than any one port, so none is pinned
+    and the ``extensions.odcs.contract_id`` replay is what carries it.
+
+    Only written when the declared schema declares ``exposeContract.id`` (0.7.6
+    added it) and only for an id the root could not keep, so an import that
+    already round-tripped its id through the root is untouched.
+    """
+    if len(exposes) != 1 or not _def_declares(version, "exposeContract", "id"):
+        return
+    contract = exposes[0].get("contract")
+    if isinstance(contract, dict) and not contract.get("id"):
+        contract["id"] = contract_id
+
+
 # Lowest FLUID schema version with a root ``extensions`` object — the promotion
 # target, chosen as the *lowest* that works so the document stays as close to
 # the author's declared version as the content allows. Asserted against the
@@ -299,6 +539,7 @@ def _normalize_expose(
     expose: Mapping[str, Any],
     servers: Optional[Any],
     bucket: Dict[str, Any],
+    declared_version: str,
 ) -> Dict[str, Any]:
     work = dict(expose)
     expose_pt = dict(work.pop(PASSTHROUGH_KEY, {}) or {})
@@ -327,7 +568,7 @@ def _normalize_expose(
     for fld in contract.get("schema") or []:
         if not isinstance(fld, Mapping):
             continue
-        clean, fld_pt = _normalize_field(fld)
+        clean, fld_pt = _normalize_field(fld, declared_version)
         fields.append(clean)
         if fld_pt:
             field_buckets[clean["name"]] = fld_pt
@@ -426,12 +667,31 @@ def _match_server(servers: Optional[Any], expose_id: str) -> Optional[Mapping[st
 _FIELD_ONLY_IN_PASSTHROUGH = ("quality", "classification")
 
 
-def _normalize_field(fld: Mapping[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+def _normalize_field(
+    fld: Mapping[str, Any], declared_version: str
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
     work = dict(fld)
     field_pt = dict(work.pop(PASSTHROUGH_KEY, {}) or {})
     for key in _FIELD_ONLY_IN_PASSTHROUGH:
         if key in work:
             field_pt[key] = work.pop(key)
+    # ``column.quality`` arrived in FLUID 0.7.6, so from that version on the
+    # rules have a home on the column itself and do not need the pass-through.
+    # Keeping them in it was a silent loss one leg further out: the ODPS
+    # importer merges a resolved port's ``expose.contract`` into its port stub
+    # and discards the sub-import's root ``extensions``, so every column-level
+    # ODCS quality rule vanished on a FLUID → ODPS → FLUID cycle — not even
+    # into the ODPS bucket. Inline, the rules travel inside the block the merge
+    # already carries.
+    #
+    # An EMPTY list stays in the pass-through. It is bookkeeping, not author
+    # content: ``quality.to_odcs_property`` reads any list as "replay verbatim,
+    # synthesise nothing", so the empty list is what records that an imported
+    # column had no rules, and writing ``quality: []`` onto every column of
+    # every imported contract would be noise an author has to read past.
+    quality = field_pt.get("quality")
+    if quality and _def_declares(declared_version, "column", "quality"):
+        work["quality"] = field_pt.pop("quality")
     return work, field_pt
 
 
@@ -458,6 +718,17 @@ def rehydrate(fluid: Mapping[str, Any]) -> Mapping[str, Any]:
     authored = bucket.get("authored_version")
     if authored and work.get("fluidVersion") == _MIN_EXTENSIONS_VERSION:
         work["fluidVersion"] = authored
+
+    # Replay the source document's own contract id when the FLUID root could not
+    # spell it (a catalog URN, say — see :func:`_root_identifier`). The
+    # whole-contract export reads the root ``id``, so without this the published
+    # ODCS would answer to the slug the import had to invent and no consumer
+    # reference to the real id would resolve. Guarded like ``authored_version``:
+    # only while the root still carries that slug, so the moment someone edits
+    # ``id`` themselves their edit wins.
+    verbatim_id = bucket.get("contract_id")
+    if verbatim_id and work.get("id") == _slugged_root_id(verbatim_id):
+        work["id"] = verbatim_id
 
     if isinstance(bucket.get("metadata"), Mapping):
         metadata[PASSTHROUGH_KEY] = dict(bucket["metadata"])

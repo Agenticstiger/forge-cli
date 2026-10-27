@@ -16,9 +16,10 @@
 
 The field carries the architectural classification (sourceAligned /
 aggregate / consumerAligned), which maps 1:1 onto FLUID's SDP / ADP / CDP.
-v1.1.0 is approved but unreleased, so the emit target stays v1.0.0 by
-default and v1.1.0 is opt-in; a v1.0.0 document must never carry ``type``
-because that schema is ``additionalProperties: false``.
+Bitol released v1.1.0 on 2026-09-08; the emit target still stays v1.0.0 by
+default (changing it changes what every existing consumer parses) and
+v1.1.0 is opt-in. A v1.0.0 document must never carry ``type`` because that
+schema is ``additionalProperties: false``.
 """
 
 from __future__ import annotations
@@ -165,8 +166,14 @@ class TestImportAndRoundTrip:
         verbatim without inventing a Data Mesh classification."""
         fluid = _provider().import_contract(self._v11_doc("referenceData"))
         assert "productType" not in fluid["metadata"]
-        passthrough = fluid["metadata"]["odps_passthrough"]
+        # The pass-through moved out of `metadata.odps_passthrough`, which
+        # additionalProperties:false rejected, into root `extensions.odps` —
+        # the one object the FLUID schema declares open.
+        passthrough = fluid["extensions"]["odps"]["metadata"]
         assert passthrough["odps_type"] == "referenceData"
+        # "verbatim" in the docstring means the whole document, not just the
+        # type field the custom classification rides on.
+        assert passthrough["source"] == self._v11_doc("referenceData")
 
     def test_custom_type_round_trips_verbatim(self):
         provider = _provider("v1.1.0")
@@ -205,3 +212,53 @@ class TestImportAndRoundTrip:
         """A v1.1.0 document is valid even when the provider's emit target
         is v1.0.0: validation keys on the document's declared apiVersion."""
         _provider("v1.0.0").validate_product(self._v11_doc())
+
+
+class TestVendoredSchemaIsTheReleasedOne:
+    """The v1.1.0 schema shipped here was a dev-branch snapshot taken
+    2026-07-26, before Bitol released v1.1.0 on 2026-09-08. The released
+    schema opened ``SBOM`` for ``authoritativeDefinitions``,
+    ``customProperties`` and ``tags``; against the snapshot, a document that
+    is valid per the published standard was rejected."""
+
+    def _schema(self) -> Dict[str, Any]:
+        schema = load_schema("v1.1.0")
+        assert schema is not None
+        return schema
+
+    def test_comment_names_the_release_tag_not_a_branch(self):
+        comment = self._schema()["$comment"]
+        assert "tag v1.1.0" in comment
+        assert "branch dev" not in comment
+        assert "pre-release" not in comment
+
+    def test_sbom_carries_the_three_fields_the_release_added(self):
+        sbom = self._schema()["$defs"]["SBOM"]
+        assert sbom["additionalProperties"] is False
+        for field in ("authoritativeDefinitions", "customProperties", "tags"):
+            assert field in sbom["properties"], field
+
+    def test_a_published_document_with_sbom_tags_is_accepted(self):
+        """The exact rejection the snapshot produced: "Additional properties
+        are not allowed ('tags' was unexpected)"."""
+        doc = {
+            "apiVersion": "v1.1.0",
+            "kind": "DataProduct",
+            "id": "silver.orders",
+            "name": "orders",
+            "status": "active",
+            "outputPorts": [
+                {
+                    "name": "orders",
+                    "version": "1.0.0",
+                    "sbom": [
+                        {
+                            "type": "dbt",
+                            "url": "https://example.invalid/manifest.json",
+                            "tags": ["generated"],
+                        }
+                    ],
+                }
+            ],
+        }
+        validate(doc, self._schema())

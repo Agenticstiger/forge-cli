@@ -262,12 +262,14 @@ def register(subparsers) -> None:
         choices=["v1.0.0", "v1.1.0"],
         default=None,
         help=(
-            "ODPS apiVersion to emit. Default v1.0.0 (the released standard). "
-            "v1.1.0 adds the RFC 0029 top-level `type` (sourceAligned / aggregate / "
-            "consumerAligned, mapped from metadata.productType) but is pre-release "
-            "until Bitol cuts it, so it stays opt-in."
+            "ODPS apiVersion to emit. Both are released: v1.0.0 (default) and "
+            "v1.1.0, which adds the RFC 0029 top-level `type` (sourceAligned / "
+            "aggregate / consumerAligned, mapped from metadata.productType). "
+            "v1.1.0 stays opt-in so existing consumers keep reading the "
+            "apiVersion they already parse."
         ),
     )
+    export.add_argument("--env", help="Environment name for overlay application")
     export.set_defaults(func=lambda args, logger=None: _run_odps_export(args))
 
     # odps-bitol validate
@@ -289,7 +291,7 @@ def _run_odps_export(args):
     logger = logging.getLogger(__name__)
 
     # Load contract
-    fluid_contract = load_contract_with_overlay(args.contract, None, logger)
+    fluid_contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
 
     # Configure provider
     provider = OdpsStandardProvider()
@@ -321,32 +323,65 @@ def _run_odps_validate(args):
 
     import yaml
 
+    from fluid_build.providers.base import ProviderError
+    from fluid_build.providers.odps_standard import BitolOdpsProvider
     from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
 
     file_path = Path(args.odps_file)
-    with open(file_path, encoding="utf-8") as f:
-        if file_path.suffix.lower() in (".yaml", ".yml"):
-            try:
+    # Opening and parsing share one guard because every way either step fails is a
+    # statement about the file, and this command's contract is exit 1 for "invalid or
+    # unreadable". Only the YAML parse used to be guarded, so a malformed ``.json``, a
+    # missing path, a directory, an unreadable file or non-UTF-8 bytes escaped as an
+    # uncaught exception and the CLI exited 2 with "CLI unhandled exception". Each
+    # message names the file because the parsers' own text does not: PyYAML quotes
+    # ``<unicode string>`` and the json module quotes nothing.
+    try:
+        with open(file_path, encoding="utf-8") as f:
+            if file_path.suffix.lower() in (".yaml", ".yml"):
                 odps_data = load_yaml_safe(f)
-            except (UnsafeYamlError, yaml.YAMLError) as exc:
-                cprint(f"✗ Validation failed: {exc}")
-                return 1
-        else:
-            odps_data = json.load(f)
-
-    # Validate required fields
-    required_fields = ["apiVersion", "kind", "id", "name", "status"]
-    missing = [f for f in required_fields if f not in odps_data]
-
-    if missing:
-        cprint(f"✗ Validation failed: Missing fields: {', '.join(missing)}")
+            else:
+                odps_data = json.load(f)
+    except OSError as exc:
+        cprint(
+            f"✗ Validation failed: cannot read {file_path}: {exc.strerror or exc}. "
+            "Check that the path exists, is a file, and is readable."
+        )
+        return 1
+    except UnicodeDecodeError as exc:
+        cprint(
+            f"✗ Validation failed: {file_path} is not valid UTF-8 text: {exc}. "
+            "Re-save the file as UTF-8."
+        )
+        return 1
+    except (UnsafeYamlError, yaml.YAMLError, json.JSONDecodeError) as exc:
+        cprint(f"✗ Validation failed: {file_path}: {exc}")
+        return 1
+    except RecursionError:
+        # ``json.load`` has no depth cap of its own; a document nested past the
+        # interpreter's recursion limit is unparseable, not a crash of this tool.
+        cprint(
+            f"✗ Validation failed: {file_path} is nested too deeply to parse. "
+            "Flatten the document and run the command again."
+        )
         return 1
 
-    if odps_data.get("kind") != "DataProduct":
-        cprint("✗ Validation failed: kind must be 'DataProduct'")
+    if not isinstance(odps_data, dict):
+        cprint(f"✗ Validation failed: {file_path} did not parse as a mapping")
         return 1
 
-    cprint("✓ Validation passed")
+    # This used to assert five keys and print "Validation passed", so a document
+    # with ``status: 123`` or an unknown top-level key passed here while
+    # ``fluid odps validate`` rejected the same file. It now takes the path
+    # ``fluid odps validate`` takes, which picks the JSON Schema from the
+    # document's own declared apiVersion, so the two commands cannot disagree.
+    try:
+        BitolOdpsProvider().validate_product(odps_data)
+    except ProviderError as exc:
+        cprint(f"✗ {exc}")
+        return 1
+
+    declared_version = str(odps_data.get("apiVersion") or "v1.0.0")
+    cprint(f"✓ Validation passed: Bitol ODPS {declared_version} file is valid: {file_path}")
     return 0
 
 

@@ -40,7 +40,11 @@ from fluid_build.providers.datamesh_manager._contract_builders import (
     _PROVIDER_TYPE_MAP,
     _STATUS_MAP,
 )
-from fluid_build.util.contract import consumes_to_canonical_ports
+from fluid_build.util.contract import (
+    consumes_to_canonical_ports,
+    contract_id_collision,
+    expose_contract_id_for_ref,
+)
 
 LOG = logging.getLogger("fluid.providers.datamesh_manager.publish")
 
@@ -266,6 +270,17 @@ class _PublishFlowMixin:
             self._log.warning("OdcsProvider not available — cannot preview ODCS contracts: %s", exc)
             return []
 
+        # The render below is wrapped in ``except Exception`` so one
+        # unexportable port does not lose the whole preview, which also means
+        # the per-port render's own collision refusal would come out as a
+        # warning and a silently shorter preview. Refuse here instead, through
+        # the same contract-level check every exporter calls: two ports PUT to
+        # one ``/api/datacontracts/<id>`` url means the second body overwrites
+        # the first and one port's schema is simply not in the catalog.
+        collision = contract_id_collision(fluid, product_id=product_id)
+        if collision:
+            raise ProviderError(collision)
+
         odcs_prov = OdcsProvider()
         previews: List[Dict[str, Any]] = []
         for expose in fluid.get("exposes", []):
@@ -274,7 +289,13 @@ class _PublishFlowMixin:
             expose_id = expose.get("exposeId") or expose.get("id")
             if not expose_id:
                 continue
-            contract_id = f"{product_id}.{expose_id}"
+            # Same resolution as the output port's ``contractId`` and as the
+            # ODCS body's own ``id``: the url has to be the id the contract
+            # declares, or the product references a contract nobody published.
+            contract_id = (
+                expose_contract_id_for_ref(fluid, expose_id, product_id=product_id)
+                or f"{product_id}.{expose_id}"
+            )
             try:
                 odcs_body = odcs_prov.render(fluid, expose_id=expose_id)
             except Exception as exc:
@@ -299,9 +320,13 @@ class _PublishFlowMixin:
     ) -> List[Dict[str, Any]]:
         """Publish one ODCS data contract for every expose port.
 
-        Each contract is PUT to ``/api/datacontracts/{product_id}.{exposeId}``
-        in ODCS v3.1.0 JSON format.  The contract id matches the ``dataContractId``
-        already written into the output port by ``_map_output_ports``.
+        Each contract is PUT to ``/api/datacontracts/<contract id>`` in ODCS
+        v3.1.0 JSON format, where the contract id is what
+        :func:`~fluid_build.util.contract.expose_contract_id_for_ref` resolves
+        for the port — the id the expose pins or an ODPS import recorded, else
+        the derived ``{product_id}.{exposeId}``. That is the same resolution
+        the output port's ``contractId`` goes through, which is what keeps the
+        reference and the published contract the same string.
 
         Returns a list of per-expose result dicts.
         """
@@ -312,6 +337,12 @@ class _PublishFlowMixin:
                 "OdcsProvider is required to publish ODCS contracts.\n"
                 "Ensure fluid_build.providers.odcs is installed."
             ) from exc
+
+        # See the preview above: a failed render is recorded per port and the
+        # loop carries on, so the collision has to be refused before it.
+        collision = contract_id_collision(fluid, product_id=product_id)
+        if collision:
+            raise ProviderError(collision)
 
         odcs_prov = OdcsProvider()
         results: List[Dict[str, Any]] = []
@@ -324,7 +355,13 @@ class _PublishFlowMixin:
                 self._log.warning("Expose missing exposeId/id — skipping ODCS contract publish")
                 continue
 
-            contract_id = f"{product_id}.{expose_id}"
+            # See the preview above: the url is the resolved id, not the
+            # derived one, so the published output port's ``contractId``
+            # resolves to something that exists.
+            contract_id = (
+                expose_contract_id_for_ref(fluid, expose_id, product_id=product_id)
+                or f"{product_id}.{expose_id}"
+            )
 
             try:
                 odcs_body = odcs_prov.render(fluid, expose_id=expose_id)

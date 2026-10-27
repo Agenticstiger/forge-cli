@@ -760,6 +760,17 @@ def _run_contract_rules(
             if args.verbose:
                 info(logger, f"Metadata consistency check skipped: {exc}")
 
+        # --- One contract id per expose (0.7.6) --------------------------
+        # ``exposes[].contract.id`` is exported verbatim as the ODCS ``id``
+        # and the ODPS output port ``contractId``, so two exposes claiming
+        # one id publish two different contracts under a single identity.
+        # JSON Schema cannot express uniqueness across a nested key, which
+        # is why this is a code check. Resolved through module-self so the
+        # test seam on the helper keeps working.
+        for msg in _self._duplicate_contract_id_errors(contract):
+            validation_result.add_error(msg)
+            validation_result.is_valid = False
+
         # --- Iceberg streaming-sink checks (RFC-streaming-extension §6.8) --
         # Catch the connector's silent-fail-at-first-record traps at validate
         # time: a sink with no Iceberg expose, the v1-deferred upsert mode,
@@ -997,6 +1008,45 @@ def _run_contract_rules(
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Composition rule check skipped: {exc}")
+
+
+def _duplicate_contract_id_errors(contract: Mapping[str, Any]) -> List[str]:
+    """Refuse two exposes whose output ports would be published under one
+    contract id.
+
+    An expose's contract id (``exposes[].contract.id``, 0.7.6, optional) is
+    used verbatim as the ODCS ``id`` and as the ODPS output port
+    ``contractId``; an expose that pins none gets the
+    ``<product id>.<exposeId>`` the exporters derive. Two ports sharing one id
+    publish two different contracts under a single identity, and the ODPS
+    exporter keys its per-port contracts by that id, so one of the two schemas
+    is simply absent from the bundle — a consumer resolving the losing port
+    silently gets the other port's schema.
+
+    Comparing pinned ids against each other is only half the check: a pin can
+    equally collide with the id a *sibling* derives, which is the worse case
+    because the sibling carries no ``contract.id`` to point the author at.
+    Every un-pinned expose is therefore seeded with its derived id first, via
+    :func:`~fluid_build.util.contract.expose_contract_id` so the string is the
+    one the exporters will actually mint rather than a second copy of the
+    convention. A *pinned* expose contributes only its pin: its derived id is
+    never published, so a sibling pinning to that derived string collides with
+    nothing and must not be rejected.
+
+    ``uniqueItems`` compares whole array items, so JSON Schema cannot express
+    uniqueness across a nested key; the rule has to live in code. Shapes the
+    schema would have rejected (a non-string id, a non-object expose) are
+    skipped rather than reported twice.
+
+    The rule itself lives in :func:`~fluid_build.util.contract.contract_id_collisions`,
+    beside the single id resolution point, because every export door enforces
+    the same rule and a second copy here would be free to drift from the one the
+    exporters apply. This function stays as the name ``_run_contract_rules``
+    calls, so the validate surface is unchanged.
+    """
+    from fluid_build.util.contract import contract_id_collisions
+
+    return contract_id_collisions(contract)
 
 
 def _validate_with_version_fallback(

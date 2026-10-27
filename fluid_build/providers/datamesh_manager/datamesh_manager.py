@@ -47,6 +47,9 @@ from fluid_build.providers.base import BaseProvider, ProviderError
 from fluid_build.util.contract import (
     builds_to_canonical_input_ports,
     consumes_to_canonical_ports,
+    contract_id_collision,
+    expose_contract_id,
+    expose_contract_id_for_ref,
     kind_to_dmm_type,
 )
 
@@ -500,6 +503,21 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             data_product_specification=data_product_specification,
         )
         product_id = dp.get("id") or self._extract_id(fluid)
+
+        # Refuse a contract-id collision before anything is sent or previewed.
+        # The same contract-level check the exporters call, by the same helper
+        # — not the per-expose ODCS render's own, because
+        # :meth:`_preview_odcs_per_expose` and
+        # :meth:`_publish_odcs_per_expose` catch whatever that render raises
+        # and carry on, so a collision would come out as a skipped contract
+        # and a published product referencing a contract id nothing was PUT
+        # under. The derived half of the id is scoped to the product this
+        # publish is writing, which is the id its companion ODCS contracts are
+        # PUT under and need not be the contract's own.
+        collision = contract_id_collision(fluid, product_id=product_id)
+        if collision:
+            raise ProviderError(collision)
+
         is_odps_payload = self._is_odps_payload(dp)
         lineage_mode = self._normalize_odps_lineage_mode(
             odps_lineage_mode or self.odps_lineage_mode
@@ -547,17 +565,36 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         else:
             dp["teamId"] = tid
 
-        # Wire contract references on output ports when publishing companion contracts.
-        # IDs must match per-expose publish ids: ``{product_id}.{expose_id}``.
+        # Wire contract references on output ports when publishing companion
+        # contracts. The id must match the one the companion ODCS contract is
+        # PUT under, which is whatever
+        # :func:`~fluid_build.util.contract.expose_contract_id_for_ref`
+        # resolves — the id the expose pins or an import recorded, else the
+        # derived ``{product_id}.{expose_id}``. Deriving it here unconditionally
+        # overwrote a pinned contractId on the wire, so the published product
+        # referenced a contract id that nothing was published under.
         if publish_contract:
             for port in dp.get("outputPorts", []):
                 if is_odps_payload:
                     expose_ref = port.get("name") or port.get("id")
-                    if expose_ref:
-                        port["contractId"] = f"{product_id}.{expose_ref}"
+                    resolved_id = (
+                        expose_contract_id_for_ref(fluid, expose_ref, product_id=product_id)
+                        if expose_ref
+                        else None
+                    )
+                    if resolved_id:
+                        port["contractId"] = resolved_id
                 else:
+                    # The legacy DPS 0.0.1 payload spells the same reference
+                    # ``dataContractId``, and it points at the same companion
+                    # ODCS contract, published under the same resolved id — so
+                    # it resolves the same way or the DPS payload references a
+                    # contract id nothing was published under.
                     if not port.get("dataContractId") and port.get("id"):
-                        port["dataContractId"] = f"{product_id}.{port['id']}"
+                        port["dataContractId"] = (
+                            expose_contract_id_for_ref(fluid, port["id"], product_id=product_id)
+                            or f"{product_id}.{port['id']}"
+                        )
 
         if dry_run:
             result: Dict[str, Any] = {
@@ -807,9 +844,15 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 str(lifecycle.get("state", "active")).lower(), "active"
             )
 
-            # Link output port to its per-expose ODCS data contract
+            # Link output port to its per-expose ODCS data contract. Through
+            # the one resolution, so the reference is the id that contract is
+            # actually published under — the one the expose pins or an ODPS
+            # import recorded, else the derived ``{product_id}.{expose_id}``.
             if product_id:
-                port["dataContractId"] = f"{product_id}.{expose_id}"
+                port["dataContractId"] = (
+                    expose_contract_id(fluid, expose, expose_id=expose_id, product_id=product_id)
+                    or f"{product_id}.{expose_id}"
+                )
 
             provider = self._extract_provider(expose)
             if provider:

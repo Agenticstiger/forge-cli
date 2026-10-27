@@ -147,7 +147,16 @@ def _load_directory(path: Path, *, allow_remote: bool) -> SeedResult:
     provider = BitolOdpsProvider()
     provider.strict_validation = False
     fluid = provider.import_directory(path, allow_remote=allow_remote, lenient=True)
-    pt = (fluid.get("metadata") or {}).get("odps_passthrough") or {}
+    # The ODCS-only marker is read from ``extensions.odps.metadata``, not from
+    # ``metadata.odps_passthrough``. The importer's mappers do write the bucket
+    # inline under ``metadata`` while they build their intermediate shape, but
+    # ``_to_fluid_document`` hoists it into root ``extensions.odps`` before
+    # returning, because ``metadata`` is ``additionalProperties: false`` in the
+    # FLUID schema and a bucket left there could never validate. Reading the
+    # pre-hoist address yielded ``{}`` for every directory, so every ODCS-only
+    # directory was silently reported as a plain bundle and the LLM was never
+    # told its seed had no product wrapper.
+    pt = ((fluid.get("extensions") or {}).get("odps") or {}).get("metadata") or {}
     shape = SHAPE_ODCS_ONLY_DIRECTORY if pt.get("odcs_only_directory") else SHAPE_DIRECTORY
     provenance: List[Dict[str, Any]] = [
         {"shape": shape, "source": "local", "origin": str(path)},

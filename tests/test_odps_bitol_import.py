@@ -75,24 +75,40 @@ class TestImportContract:
         fluid = provider.import_contract(_bundle_product_path())
         for expose in fluid["exposes"]:
             schema = expose.get("contract", {}).get("schema", [])
-            assert schema, f"expose {expose['id']} has no schema"
+            assert schema, f"expose {expose['exposeId']} has no schema"
             assert all("name" in field for field in schema)
 
     def test_qos_carries_back_from_slaProperties(self, provider: BitolOdpsProvider) -> None:
         fluid = provider.import_contract(_bundle_product_path())
         # daily_orders had qos.availability + freshnessSLO; sla preservation
-        # round-trips into the first expose's qos block.
-        daily = next(e for e in fluid["exposes"] if e["id"] == "daily_orders")
-        assert "qos" in daily
+        # round-trips into the first expose's qos block. An expose names itself
+        # `exposeId`, never `id`: the FLUID schema sets additionalProperties:false
+        # on every expose, so the `id` spelling was one of the ten errors a
+        # freshly imported contract used to fail its own validator with.
+        daily = next(e for e in fluid["exposes"] if e["exposeId"] == "daily_orders")
+        # 0.999 availability + a PT1H interval, carried back whole.
+        assert daily["qos"] == {"availability": "99.9%", "freshnessSLO": "PT1H"}
 
     def test_metadata_owner_team_present(self, provider: BitolOdpsProvider) -> None:
         fluid = provider.import_contract(_bundle_product_path())
-        assert fluid.get("owner", {}).get("team") == "commerce-team"
+        # The owner lives under `metadata`, not at the root, which rejects it.
+        # Assert the whole object: the relocation had to take the email with
+        # the team, and naming only the team would not have caught losing it.
+        assert fluid["metadata"]["owner"] == {"team": "commerce-team", "email": "alice@acme.com"}
 
     def test_passthrough_source_captured(self, provider: BitolOdpsProvider) -> None:
         fluid = provider.import_contract(_bundle_product_path())
-        pt = (fluid.get("metadata") or {}).get("odps_passthrough") or {}
-        assert "source" in pt, "import must preserve the original ODPS doc"
+        # Everything with no schema home moved out of `metadata.odps_passthrough`
+        # — an address additionalProperties:false rejected — into root
+        # `extensions.odps`, the one object the FLUID schema declares open.
+        pt = ((fluid.get("extensions") or {}).get("odps") or {}).get("metadata") or {}
+        original = yaml.safe_load(_bundle_product_path().read_text(encoding="utf-8"))
+        assert pt["source"] == original, "import must preserve the original ODPS doc"
+        # The whole bucket, not just the key this test is named for. `team` is
+        # bucketed only while the declared version has no `metadata.team`; when
+        # 0.7.6 becomes the stable default the roster lands there and this set
+        # loses it.
+        assert sorted(pt) == ["description", "source", "team"]
 
 
 # ---------------------------------------------------------------------------
@@ -115,9 +131,13 @@ class TestImportOdcsOnlyDirectory:
 
     def test_warning_recorded_in_passthrough(self, provider: BitolOdpsProvider) -> None:
         fluid = provider.import_directory(CONTRACTS_ONLY)
-        pt = (fluid.get("metadata") or {}).get("odps_passthrough") or {}
+        # Same relocation as the source bucket above: root `extensions.odps`.
+        pt = ((fluid.get("extensions") or {}).get("odps") or {}).get("metadata") or {}
         assert pt.get("odcs_only_directory") is True
-        assert "odcs_only_warning" in pt
+        # The warning has to name the directory it is about — a bare key says
+        # nothing to whoever reads the imported contract later.
+        assert str(CONTRACTS_ONLY) in pt["odcs_only_warning"]
+        assert sorted(pt) == ["odcs_only_directory", "odcs_only_warning"]
 
 
 # ---------------------------------------------------------------------------
@@ -260,4 +280,10 @@ class TestUnreadableBundleFile:
         for path in BUNDLE_DIR.iterdir():
             name = path.name.upper() if path.name.endswith(".odps.yaml") else path.name
             (tmp_path / name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-        assert "owner" in provider.import_directory(tmp_path)
+        imported = provider.import_directory(tmp_path)
+        # The owner is the product doc's own, at its post-relocation address
+        # under `metadata`. Asserting the value, not the key: the ODCS-only
+        # fallback this test guards against also produces a `metadata.owner`,
+        # a synthesized `{"team": "unknown"}`, so a membership check would
+        # have passed on exactly the misclassification it is here to catch.
+        assert imported["metadata"]["owner"] == {"team": "commerce-team", "email": "alice@acme.com"}

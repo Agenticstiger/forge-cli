@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A poisoned ODPS document could print its own credential to stderr.** `fluid odps import`'s new
+  validate-before-write gate reports the first schema error, and a jsonschema error quotes the value
+  that failed — a value that comes from the document the command was handed. Importing a bundle
+  whose root `id` was `snowflake://svc_etl:<password>@host/?token=<token>` printed the password in
+  full while masking the token in the same string: the repo's redactor knows that shape and simply
+  was not on this path, which went through the console's weaker `key=value` sanitiser. The gate's
+  message now goes through `observability/secret_redactor.py::redact_secret_text`. A value with
+  nothing credential-shaped in it is still quoted, so the diagnosis is not swallowed.
+  The underlying weakness is older than this release — `fluid validate` prints the same bytes — and
+  that path is deliberately left for its own change; this fixes the surface that was added here.
 - **An acquisition source no longer receives this host's ambient database credentials.** A contract
   names the host its postgres or mysql source lives on, and libpq and mysql_scanner read
   credentials from the process environment for whatever host they are handed — so a contract naming
@@ -72,8 +82,201 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other thread's allowlist. The second opener now reliably gets the existing
   "already open in this process" refusal.
 
+### Added
+
+- **Seven optional fields in the 0.7.6 preview schema, for things a contract could not previously
+  say.** Each is optional and additive, so a contract that sets none of them validates and exports
+  byte for byte as before. The names are taken from Bitol ODCS v3.1.0 and the released ODPS v1.1.0
+  rather than invented, so import and export are a pass-through instead of a translation.
+  `metadata.team` `{name, members[]}` with `members[].{username, name, role, email}` —
+  `metadata.owner` could express at most one person and carried no role, so a catalog that requires
+  named roles (product owner, steward, custodian) skipped the product. The root `description` now
+  accepts either a string, unchanged, which becomes `purpose`, or `{purpose, usage, limitations}`,
+  the shape both Bitol standards define. `consumes[].contractId` lets an author name the contract id
+  of an upstream that was not built with FLUID; the exporter already preferred an explicit one, but
+  the closed schema rejected the key. `exposes[].contract.id` pins a contract id so it survives
+  renaming the product or the expose, and serves catalogs that require their own id format.
+  `binding.location.host` carries Kafka bootstrap servers — the ODCS exporter already read `host`
+  while the schema accepted only `account`, so the only valid way to set them was a field named for
+  something else. `binding.serialization` `{value, key}` says how messages are serialized. A column
+  may now carry `quality`, which the exporter already replayed although the closed column definition
+  rejected it. All of these require `fluidVersion: "0.7.6"`, which is still a preview; see #752 for
+  the promotion criteria.
+- **`fluid validate` refuses two exposes that pin the same contract id.** JSON Schema cannot express
+  uniqueness across a nested key, so this is a code check at the one chokepoint `fluid validate
+  --offline` reaches: `contract id 'x' is used by exposes 'a' and 'b' — give each expose its own
+  contract.id`.
+- **`--env` on `fluid odps-bitol export` and `fluid odcs export`.** Neither accepted one, while
+  `fluid odps export` had always honoured it.
+
+### Changed
+
+**Exported artifacts change shape in this release.** If you have tooling that reads forge's ODCS or
+ODPS output, read this section before upgrading. Each change is a fix for output that was wrong, and
+each is described in full under *Fixed*; the summary is here because the old values may be baked
+into consumers.
+
+- A per-port ODCS contract is now named after its **port** — the expose title, falling back to its
+  `exposeId` — and the product name moves to a `fluidProductName` custom property. Previously every
+  contract a product exported carried the product's name, so a product with several exposes emitted
+  several contracts sharing one name. This changes the exported `name` for a single-expose product
+  too, whenever the port's title differs from the product name. The ODCS `id` is unchanged in every
+  case, and a whole-contract export is untouched.
+- ODPS `inputPorts[].contractId` is now `<productId>.<exposeId>` rather than the bare upstream
+  product id, and `versionConstraint` is carried in a custom property instead of being dropped.
+- A Kafka server's ODCS `format` is now the format of the messages, as ODCS defines it, taken from
+  the `binding.serialization.value` this release adds — `avro`, `json`, `protobuf` or `xml`, with
+  the two `-confluent` spellings collapsing onto the wire format they carry. A contract that has
+  not adopted that field still exports the FLUID binding format `kafka_topic`, exactly as before:
+  the exporter will not guess a wire format from a contract that never stated one, and guessing
+  `json` would be wrong for every Avro topic. So this changes a Kafka export only once the contract
+  says what its messages are. (A Kafka binding that declares no `format` at all has defaulted to
+  `json` since before this release — that is unchanged, and not what the new field replaces.)
+- A Kafka column's `physicalType` is now an Avro type name. Notably `bigint` exports as `long`
+  where it previously exported as `integer`.
+- Derived quality rules now carry an `id`, and rules declared on a contract are exported as ODCS
+  quality instead of riding only in the `fluidExtras` custom property — for the four `dq.rules`
+  types ODCS can express: `completeness`, `uniqueness`, `valid_values` and `freshness`. The other
+  four (`accuracy`, `schema`, `anomaly_detection`, `drift_detection`) have no executable ODCS form,
+  so each is logged by name with the reason and still carried in `fluidExtras`, as the *Fixed*
+  entry says.
+- `fluid odps import` now refuses to write an invalid contract instead of reporting success. The
+  existing `--lenient` flag, which downgraded output-port resolution failures to warnings, is
+  widened to mean "write it anyway" and so restores the old behaviour. The pass-through bucket it
+  writes moved from
+  `metadata.odps_passthrough` to the root `extensions.odps`, because `metadata` is
+  `additionalProperties: false` and the old address could never validate.
+
+
 ### Fixed
 
+- **A Kafka contract exported a 64-bit column as a 32-bit one, so the registered schema and the
+  data disagreed.** `fluid_to_physical` falls back to the ODCS *logicalType* when a binding's
+  provider has no physical-type table, and Kafka had none. FLUID `bigint` maps to the logicalType
+  `integer`, and ODCS's own schema defaults an unqualified `integer` to `i32` — so the exported
+  column said 32 bits. A tool deriving an Avro schema from that contract reads Avro `int` while a
+  producer such as Flink `BIGINT` writes a 64-bit `long`: the two disagree silently, which is a
+  data-corruption class of defect rather than a cosmetic one. `bigint` and `long` now export as
+  `long`, `int` stays `int`, and a `decimal` carries its precision and scale in `customProperties`
+  the way an ODCS-to-Avro consumer reads them. The table covers every FLUID type rather than the
+  handful that surfaced the bug, and it is derived from the Avro 1.12 specification and from
+  datacontract-cli's own `avro_exporter.py`. Providers that already had a table are unchanged.
+- **A DQ engine refused forge's contracts outright, because derived quality rules had no id.** The
+  exporter synthesises not-null rules from `required` and uniqueness rules from primary-key tags.
+  ODCS quality rules carry an `id`, and an engine that labels results by rule id rejected the whole
+  contract — so a single derived rule made the export unusable there. Derived rules now carry a
+  deterministic `<column>-<metric>` id, sanitised to the charset ODCS's `StableId` declares and
+  unique within its schema object. Two renders of the same contract produce the same ids, so an
+  export is not a spurious diff. Rules forge did not write are still replayed verbatim, ids and all.
+- **Quality rules an author wrote were never exported.** `exposes[].contract.dq.rules` and
+  `exposes[].contract.quality` were not mapped to ODCS quality at all; the extras pass parked them
+  in the `fluidExtras` custom property, so a consumer running ODCS quality rules saw only the rules
+  synthesised from `required` and primary keys and none of the author's own. They now map onto the
+  property or object their selector names, using ODCS's own metric and operator names —
+  completeness to `nullValues`, uniqueness to `duplicateValues`, valid-values to `invalidValues`,
+  thresholds to the matching operator, freshness and expressions to `custom` and `sql`. A rule type
+  with no executable ODCS form is now **logged by name with the reason** and still carried in
+  `fluidExtras`; silence was the previous behaviour and the actual bug.
+- **The exporter supported a column field the schema rejected, and read one the schema does not
+  define.** A column's `quality` list was replayed verbatim on export, but the 0.7.6 column
+  definition is `additionalProperties: false` and had no `quality`, so `fluid validate` rejected a
+  column written the way the exporter supported. The field is now declared. Separately the exporter
+  read `validations` while the schema defines `validationRules`, so rules written as documented were
+  never exported; it now reads `validationRules`, and keeps `validations` as a tolerated alias
+  because the exporter is also handed dicts that never passed through the validator.
+- **`fluid odps import` reported success and wrote a contract its own validator rejects.** Export
+  then import produced a document that `fluid validate --offline` failed with ten errors, while the
+  command printed a success tick and its help claimed it "Always emits one validated FLUID
+  contract". The importer now normalises, reusing the ODCS leg's helpers rather than restating them,
+  and validates before writing: it names the first problem, writes nothing and exits 1, while
+  `--lenient` writes anyway behind a warning. Nothing is dropped — anything with no schema home
+  rides in the pass-through bucket and is replayed verbatim on export, so the product document still
+  round-trips byte for byte.
+- **A contract using the new 0.7.6 fields could be exported but never imported back.** The importer
+  pinned every result to the latest bundled *stable* schema, which rejects the preview fields, and
+  the new validate-before-write gate then correctly refused it. An import now declares the
+  `fluidVersion` the source document recorded, falling back to stable when it records none. That
+  value selects a JSON Schema and comes from a document that may be foreign, so it is honoured only
+  when it is a string in the bundled set; anything else falls back to stable and logs a warning
+  naming the rejected value, and a preview version is never the fallback. Only the sibling ODCS
+  records the version, so a bundle import can honour it and a bare product import cannot.
+- **A team's members and their roles survived an ODCS export and were flattened by an ODPS one.**
+  Both exporters derived `team` from `metadata.owner`, which yields at most one member — username
+  set to the owner's email, no name, no role. The mapper already read `owner.name`, `owner.role` and
+  `owner.contacts[]`, but the schema rejected those keys, so a valid contract never reached that
+  code. With `metadata.team.members` set, both exporters now emit every member and role; without
+  it, the owner-derived path is unchanged.
+- **A team member's `email` was advertised by the schema and dropped by both exporters.** The
+  0.7.6 `teamMember` declares it, so an author could fill it in and `fluid validate` accepted the
+  contract, but it reached neither the ODPS product nor the ODCS team block — in ODPS it reached
+  nothing at all, and in ODCS it survived only inside the `fluidExtras` round-trip blob, which
+  `ODCS_FLUID_EXTRAS=false` switches off. It cannot be a member field: Bitol's `TeamMember` has no
+  `email` property and is closed in all three vendored schemas (ODCS v3.1.0, ODPS v1.0.0 and
+  v1.1.0), so emitting one fails strict Bitol validation. All three do accept a member
+  `customProperties` list, so the address is now published there as `fluidEmail`, the same escape
+  hatch and the same `fluid`-prefixed naming as `fluidProductName` and `fluidExtras`. Both
+  importers read it back into the roster, so the field round-trips, and the exported documents
+  still validate against both vendored schemas.
+- **The ODPS exporter dropped a structured description entirely.** Given the object the ODCS
+  exporter has accepted since #585, it wrote no `description` at all, because it only knew how to
+  wrap a string. It now passes the object through.
+- **Lineage between two FLUID products did not resolve.** `consumes[]` became ODPS `inputPorts[]`
+  with `contractId` set to the upstream *product* id — but forge names that upstream port's own ODCS
+  `<productId>.<exposeId>`, so the edge pointed at a contract no catalog has. It now defaults to the
+  id forge itself mints, while an explicit `consumes[].contractId` still wins. `versionConstraint`
+  was read and then discarded; it now rides in a custom property, since Bitol's `InputPort` has no
+  such field.
+- **A pinned or imported contract id was re-derived on export.** An ODPS import kept an output
+  port's own `contractId` in a pass-through bucket, but the export derived the id again, so a port
+  imported with a UUID re-exported as `<productId>.<exposeId>` — and so did its ODCS. An explicit
+  `exposes[].contract.id` is now used verbatim as both. Every site that mints a per-port contract id
+  resolves it through `util/contract.py::expose_contract_id`, and that resolution reads the whole
+  contract — including the root `extensions.odps` an import leaves the id in — so the five entry
+  points that render a per-expose ODCS all answer the same string, not only the one that happens to
+  rehydrate the bucket first. The fragments-mode invariant that the ODPS `contractId` and the ODCS
+  `id` are the same string is then held by the export refusing a contract that would break it, not
+  by agreement between call sites: two exposes resolving to one id are rejected by `fluid validate`
+  and by `BitolOdpsProvider.render`, which would otherwise have written one per-port ODCS for two
+  output ports and left the losing port with no schema in the bundle at all.
+- **Several contracts from one product shared a name.** A per-port export named every ODCS after the
+  product, so tools that key files or registry subjects on the contract name collided. ODCS puts
+  identity on `id`, which was already per-expose, so this was invisible to id-keyed consumers and
+  silent for everyone else.
+- **`fluid odps-bitol validate` checked five keys and never ran the schema.** It asserted that
+  `apiVersion`, `kind`, `id`, `name` and `status` were present and that `kind` was `DataProduct`,
+  then printed a pass. A document with `status: 123` and an unknown top-level key exited 0 while
+  `fluid odps validate` rejected the same file and exited 1 — two commands, one standard, opposite
+  answers. It now calls the same code path, which selects the schema from the document's own
+  `apiVersion`.
+- **Three validate commands crashed instead of diagnosing a malformed file.** On the
+  `odps-bitol` and `--spec odps-4.1` paths only some parse failures were caught, so a malformed
+  `.json`, non-UTF-8 bytes, or a pathologically deep document escaped as an unhandled exception and
+  exited 2. Each now exits 1 naming the file and the problem, as does a missing path, a directory
+  and a document that parses to something other than a mapping. (Which error a deep document raises
+  is interpreter-specific: a `RecursionError` up to 3.13, and a plain parse error on 3.14, whose
+  json decoder no longer recurses. Both are handled.)
+- **`fluid generate standard --env` was accepted and ignored for `odcs`, `odps` and
+  `odps-bitol`.** Those paths loaded the base contract with no warning, so an overlay that changes a
+  Kafka topic or a Glue database produced the base value under a `--env prod` flag, while `fluid odps
+  export --env` and `fluid generate artifacts --env` had always applied it.
+- **`fluid generate standard -o out.yaml` failed on a bare file name**, with
+  `[Errno 2] No such file or directory: ''`, because `os.path.dirname` of a bare name is empty and
+  `os.makedirs("")` raises. Two of the four sites that derive a directory this way were guarded; all
+  four now are, and a test parses the module and fails if a fifth unguarded site is ever added.
+- **The vendored ODPS v1.1.0 schema was a dev-branch snapshot, so valid documents were rejected.**
+  Bitol released v1.1.0 on 2026-09-08; the file here was fetched from the dev branch on 2026-07-26,
+  before the release opened `$defs.SBOM` for `authoritativeDefinitions`, `customProperties` and
+  `tags`. Because `SBOM` is `additionalProperties: false`, `fluid odps validate` rejected a document
+  valid against the published standard with "Additional properties are not allowed ('tags' was
+  unexpected)". The file is now vendored verbatim from the v1.1.0 tag. Forge's own exports were never
+  affected, since forge writes no SBOM; the gap showed when validating another tool's document.
+  `v1.0.0` stays the default emit target, now as a stated compatibility decision rather than a wait
+  for the release: changing the emitted `apiVersion` changes what every existing consumer parses.
+- **`fluid forge` seed loading misread an ODCS-only directory as a plain directory.** The ODPS
+  importer's pass-through bucket moved to the root `extensions.odps`, and the seed loader still read
+  the old `metadata.odps_passthrough` address, so the lookup always yielded nothing and every
+  ODCS-only directory was classified as an ordinary one. A test now pins the marker's address at the
+  writer, so the next relocation fails at the source.
 - **An incremental cursor written on DuckDB 1.5 and read on 2.0 silently dropped or
   duplicated rows.** The cursor is stored as text and compared as an untyped SQL literal,
   and the two versions disagree about the column type it is coerced against:

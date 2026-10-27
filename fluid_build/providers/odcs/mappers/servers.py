@@ -23,6 +23,7 @@ re-attach to exposes if desired.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +34,8 @@ from .base import (
     metadata_passthrough,
 )
 from .types import provider_to_server_type, server_type_to_provider
+
+LOG = logging.getLogger(__name__)
 
 # ----- ODCS → FLUID --------------------------------------------------------
 
@@ -161,7 +164,10 @@ def _merge_binding_into_location(
     # Fields that ODCS expects on the server record but FLUID puts at
     # the binding sibling level (e.g. binding.format alongside
     # binding.location). Extend as new server types surface them.
-    _BINDING_LIFTED = ("format", "delimiter", "endpointUrl")
+    # ``serialization`` is not copied onto the server as-is: the Kafka branch
+    # of :func:`_server_details_from_location` reads it to decide the ODCS
+    # message ``format``, and no other server type looks at it.
+    _BINDING_LIFTED = ("format", "delimiter", "endpointUrl", "serialization")
     merged: Dict[str, Any] = dict(location)
     for key in _BINDING_LIFTED:
         if key not in merged and key in binding:
@@ -250,12 +256,31 @@ def _server_details_from_location(location: Mapping[str, Any], provider: str) ->
         # ODCS S3Server requires {location}.
         details.setdefault("location", "${S3_LOCATION}")
     elif p == "kafka":
+        # ``host`` is the declared home of the bootstrap servers since 0.7.6.
+        # ``account`` stays as a fallback because until then the schema
+        # rejected ``host`` and accepted ``account``, so a Kafka contract that
+        # named its brokers at all named them there; dropping the fallback
+        # would turn each of those exports back into the placeholder below.
         host = location.get("host") or location.get("account")
         if host:
             details["host"] = host
-        if "format" in location:
+        message_format = _kafka_message_format(location.get("serialization"))
+        if message_format:
+            details["format"] = message_format
+        elif "format" in location:
+            # No declared message format, so keep what this mapper has always
+            # written for it: ``binding.format`` (the storage kind, usually
+            # the legacy token ``kafka_topic``) rather than guessing. Falling
+            # back to ODCS's own ``json`` default would swap a meaningless
+            # token for a confident claim that is wrong for every Avro topic,
+            # and would change the export of every contract that has not
+            # adopted ``binding.serialization``. The token goes away when the
+            # contract says what its messages are.
             details["format"] = location["format"]
-        # ODCS KafkaServer requires {host, format}.
+        # ODCS KafkaServer requires {host}; ``format`` is optional and
+        # defaults to json. Neither fallback is a claim about the topic: the
+        # placeholder is substituted at deploy time like the other server
+        # types', and an absent host is the documented, tested behaviour.
         details.setdefault("host", "${KAFKA_BOOTSTRAP_SERVERS}")
         details.setdefault("format", "json")
     elif p in ("postgres", "postgresql"):
@@ -344,6 +369,54 @@ def _server_details_from_location(location: Mapping[str, Any], provider: str) ->
             if key in custom_keys:
                 details[key] = value
     return details
+
+
+# FLUID ``binding.serialization.value`` -> the ODCS v3.1.0 Kafka server
+# ``format`` ("The format of the messages", documented as json, avro,
+# protobuf or xml). The two ``-confluent`` values are those same wire formats
+# carried through a Confluent schema registry, which is what the ODCS field
+# means by the format of the messages, so they collapse onto the plain name.
+# Whether a registry is involved is not lost: ``binding.serialization`` rides
+# along verbatim in the ``fluidExtras`` custom property (extras.py) unless
+# ``ODCS_FLUID_EXTRAS=false`` opts out of that blob, and ODCS has no server
+# field for it that this mapper could fill honestly.
+_KAFKA_MESSAGE_FORMAT = {
+    "json": "json",
+    "avro": "avro",
+    "protobuf": "protobuf",
+    "xml": "xml",
+    "avro-confluent": "avro",
+    "json-confluent": "json",
+}
+
+
+def _kafka_message_format(serialization: Any) -> Optional[str]:
+    """ODCS Kafka server ``format`` for a binding's ``serialization``, or None.
+
+    Only ``serialization.value`` describes the messages. ``serialization.key``
+    is deliberately not exported: ODCS's Kafka server has one ``format`` field
+    and it means the message value, so putting the key's format there would
+    make the field say something else.
+
+    None means "the contract did not say", and the caller keeps its previous
+    behaviour. A value outside the schema's enum is treated the same way, with
+    a warning, because the exporter does not run ``fluid validate`` first and
+    must not crash on, or repeat, a format ODCS does not document.
+    """
+    if not isinstance(serialization, Mapping):
+        return None
+    value = serialization.get("value")
+    if value is None:
+        return None
+    message_format = _KAFKA_MESSAGE_FORMAT.get(value) if isinstance(value, str) else None
+    if message_format is None:
+        LOG.warning(
+            "binding.serialization.value %r has no ODCS Kafka message format; the server "
+            "format is left as it would be without serialization. Use one of: %s.",
+            value,
+            ", ".join(_KAFKA_MESSAGE_FORMAT),
+        )
+    return message_format
 
 
 def _build_s3_uri(bucket: Optional[str], path: Optional[str]) -> Optional[str]:

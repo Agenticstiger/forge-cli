@@ -15,10 +15,16 @@
 """Input / output port mapping.
 
 Each FLUID expose becomes one ``outputPorts[]`` entry; each FLUID expect
-becomes one ``inputPorts[]`` entry. ``contractId`` follows the convention
-``{productId}.{portName}`` (matches :mod:`fluid_build.providers.datamesh_manager.datamesh_manager`)
-and equals the ``id`` of the per-port ODCS contract the provider emits as a
-sibling file.
+becomes one ``inputPorts[]`` entry. ``contractId`` is the one the expose names
+for itself when it names one (``contract.id``, or the id an ODPS import
+recorded), and otherwise follows the convention ``{productId}.{portName}``
+(matches :mod:`fluid_build.providers.datamesh_manager.datamesh_manager`).
+Either way it equals the ``id`` of the per-port ODCS contract the provider
+emits as a sibling file — both sides resolve it through
+:func:`fluid_build.util.contract.expose_contract_id`, and
+:meth:`BitolOdpsProvider.render` refuses an export in which two ports would
+resolve to one id. The equality is held by that refusal, not by the two call
+sites happening to agree.
 
 Per-port pass-throughs flow through ``expose.odps_passthrough.*`` /
 ``expect.odps_passthrough.*`` for round-trip:
@@ -41,6 +47,7 @@ from fluid_build.util.contract import (
 from .base import (
     ExportCtx,
     ImportCtx,
+    contract_id_for_expose,
     contract_id_for_port,
     expect_passthrough,
     expose_passthrough,
@@ -49,6 +56,11 @@ from .base import (
     get_expose_passthrough,
 )
 from .types import provider_to_port_type
+
+# Bitol ``InputPort`` has no field for a version range — ``version`` names one
+# exact version — so the FLUID consume's ``versionConstraint`` rides in the one
+# open slot the closed object leaves, under a name that says whose it is.
+VERSION_CONSTRAINT_PROPERTY = "fluidVersionConstraint"
 
 # ----- FLUID → ODPS --------------------------------------------------------
 
@@ -82,9 +94,10 @@ def _build_input_ports(
     1. ``consumes[]`` (FLUID 0.7.2+ canonical lineage) — normalized via
        :func:`consumes_to_canonical_ports`. Strips FLUID-specific fields
        (``id``, ``description``, ``reference``, ``required``, ``sourceSystemId``)
-       since v1.0.0 ``InputPort`` is ``additionalProperties: false``.
-       Synthesizes ``contractId`` in priority order: explicit ``contract_id``
-       → ``reference`` → ``name``.
+       since v1.0.0 ``InputPort`` is ``additionalProperties: false``, and
+       carries ``versionConstraint`` — which that closed object has no field
+       for — as a ``customProperties`` entry. ``contractId`` comes from
+       :func:`_input_port_contract_id`.
     2. ``builds[].properties.source`` (SDP convention) — normalized via
        :func:`builds_to_canonical_input_ports`. Emits per-source-stream
        ports with synthetic ``contractId`` and ``customProperties`` for
@@ -130,22 +143,35 @@ def _build_input_ports(
     for canonical in consumes_to_canonical_ports(
         fluid, default_version=default_version, logger=logger
     ):
-        contract_id = (
-            canonical.get("contract_id") or canonical.get("reference") or canonical.get("name")
-        )
-        dedup_key = (canonical["name"], str(contract_id) if contract_id else None)
+        contract_id = _input_port_contract_id(canonical)
+        dedup_key = (canonical["name"], contract_id)
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
         name = _unique_name(canonical["name"], canonical.get("reference"))
         seen_names.add(name)
-        input_ports.append(
-            {
-                "name": name,
-                "version": canonical["version"],
-                "contractId": str(contract_id) if contract_id else name,
-            }
-        )
+        consume_port: Dict[str, Any] = {
+            "name": name,
+            "version": canonical["version"],
+            "contractId": contract_id or name,
+        }
+        constraint = canonical.get("version_constraint")
+        if constraint:
+            # ``version`` here is the consume's own ``version`` or the
+            # provider's default — never the range. Dropping the range left an
+            # export claiming the upstream is pinned to exactly that version
+            # when the contract said "any 1.x".
+            consume_port["customProperties"] = [
+                {
+                    "property": VERSION_CONSTRAINT_PROPERTY,
+                    "value": str(constraint),
+                    "description": (
+                        "FLUID consumes[].versionConstraint — the semver range "
+                        "this product accepts from the upstream contract."
+                    ),
+                }
+            ]
+        input_ports.append(consume_port)
 
     # Path 2 — builds[].properties.source (SDP source streams)
     for canonical in builds_to_canonical_input_ports(
@@ -183,6 +209,30 @@ def _build_input_ports(
     return input_ports
 
 
+def _input_port_contract_id(canonical: Mapping[str, Any]) -> Optional[str]:
+    """The contract an upstream consume points at.
+
+    An explicit ``consumes[].contractId`` wins: that is an upstream which has
+    an id of its own — a product not built with FLUID, registered under
+    something FLUID did not derive. Otherwise the id is the one forge itself
+    gives that upstream port's ODCS contract, ``<productId>.<exposeId>``.
+    Exporting the bare ``productId`` named a contract that exists nowhere, so
+    lineage between two FLUID products resolved in no catalog that follows the
+    reference.
+    """
+    explicit = canonical.get("contract_id")
+    if explicit:
+        return str(explicit)
+    reference = canonical.get("reference")
+    upstream_port = canonical.get("id")
+    if reference and upstream_port:
+        return contract_id_for_port(str(reference), str(upstream_port))
+    if reference:
+        return str(reference)
+    name = canonical.get("name")
+    return str(name) if name else None
+
+
 def _expose_to_output_port(expose: Mapping[str, Any], product_id: str) -> Optional[Dict[str, Any]]:
     from fluid_build.providers.base import ProviderError
 
@@ -201,7 +251,7 @@ def _expose_to_output_port(expose: Mapping[str, Any], product_id: str) -> Option
     port: Dict[str, Any] = {
         "name": name,
         "version": str(expose.get("version", 1)),
-        "contractId": contract_id_for_port(product_id, name),
+        "contractId": contract_id_for_expose(expose, product_id, name),
     }
     if expose.get("description"):
         port["description"] = expose["description"]

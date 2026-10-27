@@ -121,7 +121,9 @@ def export_command(
         # ── Per-port mode ────────────────────────────────────────────────────
         if per_port:
             out_dir = Path(output).parent if output else Path(".")
-            out_dir.mkdir(parents=True, exist_ok=True)
+            # Not created up front: ``write_output`` makes the parent as it
+            # writes, so a refused export (a contract-id collision, say) leaves
+            # no empty directory behind — matching ``fluid odps export``.
             results = provider.render_all_ports(fluid_contract, out_dir=out_dir, fmt=format)
             if not results:
                 click.echo("WARNING: No exposes found in contract — nothing exported.", err=True)
@@ -349,6 +351,7 @@ def register(subparsers) -> None:
     )
     export.add_argument("--no-quality", action="store_true", help="Exclude quality checks")
     export.add_argument("--no-sla", action="store_true", help="Exclude SLA properties")
+    export.add_argument("--env", help="Environment name for overlay application")
     export.set_defaults(func=lambda args, logger=None: _run_odcs_export(args))
 
     # odcs import
@@ -406,7 +409,9 @@ def _run_odcs_export(args):
     logger = logging.getLogger(__name__)
 
     # Load contract
-    fluid_contract = resolve_for_export(load_contract_with_overlay(args.contract, None, logger))
+    fluid_contract = resolve_for_export(
+        load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
+    )
 
     # Configure provider
     provider = OdcsProvider()

@@ -22,7 +22,7 @@ supported.
 
 import logging
 import re
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
 def get_expose_id(expose: Mapping[str, Any]) -> Optional[str]:
@@ -211,6 +211,328 @@ def get_expose_contract(expose: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         The contract section object or None
     """
     return expose.get("contract")
+
+
+# The per-expose pass-through bucket the Bitol ODPS importer records an
+# imported output port's own ``contractId`` in, and the root extension object
+# the same importer parks that bucket in on its way out of the import. Spelled
+# here rather than imported from that provider because every caller below has
+# to read the same keys, and the ODCS exporter has no business importing the
+# ODPS one.
+_ODPS_PASSTHROUGH_KEY = "odps_passthrough"
+_EXTENSIONS_KEY = "extensions"
+_ODPS_EXTENSION_NAMESPACE = "odps"
+
+
+def _expose_key(expose: Mapping[str, Any]) -> Optional[str]:
+    """The name an expose answers to, in the order every exporter accepts it.
+
+    ``exposeId`` is canonical; ``id`` is the 0.7.1 legacy spelling and ``name``
+    is what the forge AI templates emit. The ODPS output-port mapper accepts
+    all three for the port name, so the derived contract id and the ODPS
+    round-trip bucket have to key off the same lookup or they would disagree
+    about which expose a bucket entry belongs to.
+    """
+    for key in ("exposeId", "id", "name"):
+        value = expose.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _imported_contract_id(contract: Mapping[str, Any], expose_key: Optional[str]) -> Optional[str]:
+    """The ``contractId`` an ODPS import recorded for ``expose_key``, in the
+    root extension object, or ``None``.
+
+    An ODPS import parks its per-expose round-trip state in root
+    ``extensions.odps.exposes.<exposeId>.expose`` — the one object the FLUID
+    schema declares open, and therefore the only legal home for it.
+    ``BitolOdpsProvider.render`` pushes that state back down into the inline
+    per-expose bucket before it maps anything, but four other entry points
+    render a per-expose ODCS straight from the contract and never do, so
+    reading only the inline bucket made an imported id resolve for the ODPS
+    exporter and silently re-derive for everybody else. Reading the extension
+    here is what makes the resolution a property of the contract rather than of
+    whoever happened to rehydrate it first.
+    """
+    if not expose_key:
+        return None
+    extensions = contract.get(_EXTENSIONS_KEY)
+    if not isinstance(extensions, Mapping):
+        return None
+    bucket = extensions.get(_ODPS_EXTENSION_NAMESPACE)
+    if not isinstance(bucket, Mapping):
+        return None
+    exposes = bucket.get("exposes")
+    if not isinstance(exposes, Mapping):
+        return None
+    entry = exposes.get(expose_key)
+    if not isinstance(entry, Mapping):
+        return None
+    inner = entry.get("expose")
+    if not isinstance(inner, Mapping):
+        return None
+    return _as_contract_id(inner.get("contract_id"))
+
+
+def _as_contract_id(value: Any) -> Optional[str]:
+    """``value`` when it is a usable contract id, else ``None``.
+
+    A contract id is a non-empty string: it becomes the ODCS document's ``id``
+    and a URL path segment in every catalog that stores it. ``str(value)``
+    would coerce a YAML number or a mapping into something that looks like an
+    id and is not — the shapes ``exposeContract.id`` already rejects — so a
+    non-string is refused here too and the port keeps its derived id.
+    """
+    return value if isinstance(value, str) and value else None
+
+
+def explicit_expose_contract_id(
+    expose: Mapping[str, Any],
+    contract: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Return the contract id an expose names for itself, or ``None``.
+
+    Two exporters mint a per-port contract id — the ODCS document's ``id`` and
+    the ODPS output port's ``contractId``, which Bitol fragments mode requires
+    to be the same string — and both derive ``<product id>.<exposeId>`` when
+    the contract names none. Every caller resolves the named one here, so no
+    two of them can disagree about what a port's contract is called.
+
+    Three places hold one, in priority order:
+
+    1. ``contract.id`` (fluid-schema 0.7.6). What an author pins when the
+       derived id is not the one consumers or a catalog know the port by —
+       without it, renaming the product or the expose silently renames the
+       contract and breaks every reference to it. An ODPS import writes the
+       imported port's own ``contractId`` here too, whenever the version the
+       source document recorded declares the field.
+    2. The ODPS importer's per-expose pass-through record of the ``contractId``
+       the imported port already answered to, inline on the expose. Still the
+       only home for it when the import declares an older version:
+       ``exposeContract`` is closed before 0.7.6, so writing the field there
+       would make the whole imported contract fail ``fluid validate``.
+    3. The same record where an import actually leaves it on disk — root
+       ``extensions.odps`` — which is why ``contract`` is worth passing. Only
+       ``BitolOdpsProvider.render`` rehydrates (2) from it, so a caller that
+       omits ``contract`` gets the imported id from an ODPS export and the
+       derived one from every other entry point. Pass the contract.
+    """
+    expose_contract = expose.get("contract")
+    if isinstance(expose_contract, Mapping):
+        pinned = _as_contract_id(expose_contract.get("id"))
+        if pinned:
+            return pinned
+    passthrough = expose.get(_ODPS_PASSTHROUGH_KEY)
+    if isinstance(passthrough, Mapping):
+        inline = _as_contract_id(passthrough.get("contract_id"))
+        if inline:
+            return inline
+    if contract is not None:
+        return _imported_contract_id(contract, _expose_key(expose))
+    return None
+
+
+def derived_contract_id(product_id: Any, port_name: str) -> str:
+    """``<product id>.<port name>`` — the contract id an exporter mints for a
+    port that names none.
+
+    The one place this convention is spelled. ``fluid validate`` has to derive
+    exactly the string the exporters will, or its collision check compares a
+    pinned id against an id nothing ever publishes; a second copy of the
+    f-string is how the two drift apart.
+    """
+    return f"{product_id}.{port_name}"
+
+
+def expose_contract_id(
+    contract: Mapping[str, Any],
+    expose: Mapping[str, Any],
+    *,
+    expose_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+) -> Optional[str]:
+    """The contract id one output port will be published under: the id the
+    expose names for itself, else the derived ``<product id>.<exposeId>``.
+
+    The fallback-included form of :func:`explicit_expose_contract_id`, and the
+    one every id-minting caller should use — the per-port ODCS ``id``, the ODPS
+    output port's ``contractId``, the Data Mesh Manager publish url, and
+    ``fluid validate``'s collision check, which can only compare a pinned id
+    against a derived one if it derives them by the same rule. ``None`` only
+    when the port names no id and the contract has no id to derive from, which
+    is what leaves a per-port ODCS without a scoped ``id`` today.
+
+    ``product_id`` overrides the half of the derived id that comes from the
+    contract. Data Mesh Manager publishes under the id of the product it is
+    writing (``dp["id"]``, which a caller may have set), not necessarily the
+    contract's own, and its derived ids have to keep matching the url its
+    companion ODCS contracts are PUT to.
+    """
+    from fluid_build.providers._mapper_common import fluid_id
+
+    explicit = explicit_expose_contract_id(expose, contract)
+    if explicit:
+        return explicit
+    port_name = expose_id or _expose_key(expose)
+    product_id = product_id or fluid_id(contract)
+    if not port_name or not product_id:
+        return None
+    return derived_contract_id(product_id, port_name)
+
+
+def expose_contract_id_for_ref(
+    contract: Mapping[str, Any],
+    expose_ref: str,
+    *,
+    product_id: Optional[str] = None,
+) -> Optional[str]:
+    """:func:`expose_contract_id` for a caller that holds the port's name
+    rather than the expose object.
+
+    The Data Mesh Manager publish flow walks the ODPS payload's output ports
+    and the contract's exposes in separate loops, so each site had only the
+    name — and each derived ``{product_id}.{name}`` for itself, which
+    overwrote a pinned contractId on the wire and PUT the companion ODCS body
+    under an id its own output port did not reference. Resolving by name here
+    lets those sites share the one resolution without reaching into an ODPS
+    mapper for it. ``None`` when no expose answers to ``expose_ref``, which
+    leaves the caller's own ``contractId`` untouched.
+    """
+    if not expose_ref:
+        return None
+    for expose in get_exposes(contract):
+        if not isinstance(expose, Mapping):
+            continue
+        if expose_ref in (expose.get("exposeId"), expose.get("id"), expose.get("name")):
+            return expose_contract_id(contract, expose, expose_id=expose_ref, product_id=product_id)
+    return None
+
+
+def _collision_label(index: int, expose: Mapping[str, Any]) -> str:
+    """How one expose is named in a collision message.
+
+    The same lookup the exporters use for the output port's name, so the two
+    labels in the message are the strings the author will find in the
+    document. A port that names itself nothing at all is pointed at by its
+    array position, because there is nothing else to call it.
+    """
+    return _expose_key(expose) or f"exposes[{index}]"
+
+
+def _collision_message(
+    contract_id: str,
+    first: Tuple[str, bool],
+    second: Tuple[str, bool],
+) -> str:
+    """One collision, phrased so the two moves that resolve it both fit.
+
+    ``first``/``second`` are ``(label, pinned)`` in document order. Which
+    advice is right depends on whether either side pins the id: an un-pinned
+    expose has no ``contract.id`` to change, so "give each expose its own
+    contract.id" would send the author to a field that is not in the document
+    — the move for that side is to rename the expose, since the id is derived
+    from its name.
+    """
+    first_label, first_pinned = first
+    second_label, second_pinned = second
+    shared = (
+        f"contract id {contract_id!r} is used by exposes {first_label!r} and"
+        f" {second_label!r} — two output ports under one contract id publish two"
+        " different schemas under a single identity, so a consumer resolving it"
+        " gets one of the two arbitrarily and the other port's schema is lost"
+    )
+    if first_pinned and second_pinned:
+        return f"{shared}; give each expose its own contract.id"
+    if first_pinned != second_pinned:
+        pinned_label = first_label if first_pinned else second_label
+        derived_label = second_label if first_pinned else first_label
+        return (
+            f"{shared}. {derived_label!r} pins no contract.id, so the exporters"
+            f" derive this id for it; change the contract.id on {pinned_label!r},"
+            f" or rename the expose {derived_label!r}"
+        )
+    # Defensive. Two un-pinned exposes derive one id only when they answer to
+    # one name, and a same-named pair is skipped by the caller as the
+    # duplicate-port-name error it is — a more specific message than this one.
+    # Kept so a change to the derivation cannot make this function hand back
+    # advice that names the wrong side.
+    return f"{shared}; rename one of the two exposes so their derived ids differ"
+
+
+def contract_id_collisions(
+    contract: Mapping[str, Any],
+    *,
+    product_id: Optional[str] = None,
+) -> List[str]:
+    """Every pair of output ports this contract would publish under one
+    contract id, as ready-to-raise messages in document order.
+
+    The collision is a property of the contract, not of one exporter, which is
+    why it is resolved here next to :func:`expose_contract_id` rather than in
+    whichever exporter happened to find it first. It used to live inside
+    ``BitolOdpsProvider.render`` alone, so the ODPS doors refused a colliding
+    contract while ``fluid generate standard --format odcs``, ``fluid generate
+    artifacts --emit odcs`` and the Data Mesh Manager publish accepted it and
+    emitted two ODCS documents carrying one ``id`` — the same defect the
+    refusal exists to prevent, since one of the two schemas is what a consumer
+    resolving that id gets, and in the file-per-id layout one simply overwrites
+    the other. Every door calls this; a fourth exporter added later looks for
+    it where the id itself is minted.
+
+    The published id of a port is exactly what :func:`expose_contract_id`
+    answers for it, so collisions are duplicates of that — which is what keeps
+    the false-positive case accepted: a pin equal to a *pinned* sibling's
+    derived string collides with nothing, because that sibling is published
+    under its pin and its derived string is an id no contract answers to.
+
+    ``product_id`` is passed through to :func:`expose_contract_id` for the
+    Data Mesh Manager, which derives its ids from the id of the product it is
+    writing rather than the contract's own.
+    """
+    claimed: Dict[str, Tuple[str, bool]] = {}
+    errors: List[str] = []
+    for index, expose in enumerate(get_exposes(contract)):
+        if not isinstance(expose, Mapping):
+            continue
+        resolved = expose_contract_id(contract, expose, product_id=product_id)
+        if resolved is None:
+            # No pin and nothing to derive from. Such a port reaches a
+            # per-port ODCS without a scoped id at all, which is a different
+            # gap; it cannot collide with anything here.
+            continue
+        entry = (
+            _collision_label(index, expose),
+            explicit_expose_contract_id(expose, contract) is not None,
+        )
+        first = claimed.get(resolved)
+        if first is None:
+            claimed[resolved] = entry
+            continue
+        if first[0] == entry[0]:
+            # Not two ports sharing an id — one name used twice, which every
+            # exporter reports in its own, more specific words ("Duplicate
+            # output port name"). Reporting it as a contract-id collision here
+            # took that message away and told the author to rename an expose
+            # without saying that the two are already the same name.
+            continue
+        errors.append(_collision_message(resolved, first, entry))
+    return errors
+
+
+def contract_id_collision(
+    contract: Mapping[str, Any],
+    *,
+    product_id: Optional[str] = None,
+) -> Optional[str]:
+    """The first message :func:`contract_id_collisions` returns, or ``None``.
+
+    For the exporters and the publish flow, which refuse the whole contract on
+    the first collision rather than reporting all of them: the export is not
+    going to happen either way, and the author fixes one pin at a time.
+    """
+    collisions = contract_id_collisions(contract, product_id=product_id)
+    return collisions[0] if collisions else None
 
 
 def get_consumes(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:

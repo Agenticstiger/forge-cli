@@ -26,9 +26,11 @@ Covers:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1348,14 +1350,121 @@ class TestBuildDataContractODCS:
 
     def test_odcs_custom_properties(self):
         dc = self._make_provider()._build_data_contract_odcs(RICH_CONTRACT, "bronze.bss.accounts")
-        assert "customProperties" in dc
-        prop_names = [p["property"] for p in dc["customProperties"]]
-        assert "layer" in prop_names
-        assert "domain" in prop_names
+        # Labels first, then ``builds``, then the product-name entry the builder
+        # adds in place of the deprecated ``dataProduct``.
+        assert [p["property"] for p in dc["customProperties"]] == [
+            "layer",
+            "domain",
+            "builds",
+            "fluidProductName",
+        ]
 
-    def test_odcs_data_product_link(self):
+    # -- the product name: customProperties, not deprecated ``dataProduct`` --
+
+    @staticmethod
+    def _product_name_entries(dc):
+        return [p for p in dc["customProperties"] if p["property"] == "fluidProductName"]
+
+    def test_odcs_does_not_write_the_deprecated_data_product_field(self):
+        """Bitol deprecated ODCS ``dataProduct`` in v3.1.0 (the 3.2.0 schema reads
+        "DEPRECATED since v3.1.0") to keep products in ODPS and contracts in ODCS."""
         dc = self._make_provider()._build_data_contract_odcs(RICH_CONTRACT, "bronze.bss.accounts")
-        assert dc["dataProduct"] == "bronze.bss.accounts"
+        assert "dataProduct" not in dc
+
+    def test_odcs_product_name_is_a_custom_property(self):
+        dc = self._make_provider()._build_data_contract_odcs(RICH_CONTRACT, "bronze.bss.accounts")
+        (entry,) = self._product_name_entries(dc)
+        # The product's *name*, not the id the old ``dataProduct`` held, so it
+        # must differ from the product id for this fixture to prove anything.
+        assert entry["value"] == "BSS Customer Accounts"
+        assert entry["value"] != "bronze.bss.accounts"
+        assert dc["name"] == entry["value"]
+
+    def test_odcs_product_name_entry_has_the_mapper_entry_shape(self):
+        """Same property and entry shape the ODCS mapper writes
+        (``mappers/metadata.py::_stamp_product_name``): property, value, description."""
+        from fluid_build.providers.odcs.mappers.metadata import FLUID_PRODUCT_NAME_PROPERTY
+
+        assert FLUID_PRODUCT_NAME_PROPERTY == "fluidProductName"
+        dc = self._make_provider()._build_data_contract_odcs(RICH_CONTRACT, "bronze.bss.accounts")
+        (entry,) = self._product_name_entries(dc)
+        assert set(entry) == {"property", "value", "description"}
+        assert entry["description"].strip()
+
+    def test_odcs_product_name_falls_back_to_the_product_id_like_name_does(self):
+        contract = {"id": "legacy.product", "owner": {"team": "analytics"}, "exposes": []}
+        dc = self._make_provider()._build_data_contract_odcs(contract, "legacy.product")
+        assert dc["name"] == "legacy.product"
+        (entry,) = self._product_name_entries(dc)
+        assert entry["value"] == "legacy.product"
+
+    def test_odcs_author_label_named_like_the_entry_is_not_duplicated(self):
+        contract = copy.deepcopy(RICH_CONTRACT)
+        contract["labels"] = {"fluidProductName": "Author Chosen"}
+        dc = self._make_provider()._build_data_contract_odcs(contract, "bronze.bss.accounts")
+        assert self._product_name_entries(dc) == [
+            {"property": "fluidProductName", "value": "Author Chosen"}
+        ]
+
+    # -- schema validity (vendored ODCS v3.1.0, via the repo's own helper) --
+
+    @staticmethod
+    def _schema_errors(dc):
+        pytest.importorskip(
+            "jsonschema", reason="collect_errors() is a silent no-op without jsonschema"
+        )
+        from fluid_build.providers.odcs import validation
+
+        schema = validation.load_schema()
+        assert schema is not None, "vendored ODCS v3.1.0 schema failed to load"
+        return validation.collect_errors(dc, schema)
+
+    def test_odcs_contract_validates_against_the_vendored_schema(self):
+        """Everything this builder emits validates, apart from the ``servers`` and
+        SLO blocks (next tests). Built from RICH_CONTRACT minus its binding and
+        ``sla``, so the envelope, team, schema, tags and the new
+        ``customProperties`` entry are all under the real schema."""
+        contract = copy.deepcopy(RICH_CONTRACT)
+        contract.pop("sla")
+        for expose in contract["exposes"]:
+            expose.pop("binding")
+        dc = self._make_provider()._build_data_contract_odcs(contract, "bronze.bss.accounts")
+        assert "servers" not in dc
+        assert "serviceLevelObjectives" not in dc
+        assert self._schema_errors(dc) == []
+
+    def test_odcs_known_schema_errors_are_only_the_preexisting_servers_and_slo_ones(self):
+        """Two defects that predate the ``dataProduct`` change and are NOT fixed by
+        it: a server carries no ``server`` id and leaks the location's ``table``,
+        and ``serviceLevelObjectives`` is not an ODCS v3.1.0 field (it is
+        ``slaProperties``). Pinned exactly so this change provably adds none and
+        removes none; the builder's replacement through ``OdcsProvider`` retires
+        both."""
+        dc = self._make_provider()._build_data_contract_odcs(RICH_CONTRACT, "bronze.bss.accounts")
+        # (path, validator, the field the message names): the first quoted token
+        # of a jsonschema message, which keeps this independent of its wording.
+        found = sorted(
+            (e["path"], e["validator"], re.search(r"'([^']+)'", e["message"]).group(1))
+            for e in self._schema_errors(dc)
+        )
+        assert found == [
+            ("", "additionalProperties", "serviceLevelObjectives"),
+            ("", "unevaluatedProperties", "serviceLevelObjectives"),
+            ("servers.0", "required", "server"),
+            ("servers.0", "unevaluatedProperties", "table"),
+        ]
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "pre-existing: servers[] lacks the required 'server' id and carries the "
+            "location's 'table'; serviceLevelObjectives is not a v3.1.0 field. "
+            "Strict, so fixing the builder forces this marker (and the pin above) out."
+        ),
+    )
+    def test_odcs_rich_contract_validates_against_the_vendored_schema(self):
+        dc = self._make_provider()._build_data_contract_odcs(RICH_CONTRACT, "bronze.bss.accounts")
+        assert self._schema_errors(dc) == []
 
     def test_odcs_sla(self):
         dc = self._make_provider()._build_data_contract_odcs(RICH_CONTRACT, "bronze.bss.accounts")
@@ -1397,6 +1506,70 @@ class TestBuildDataContractODCS:
 
         dc = self._make_provider()._build_data_contract_odcs(contract, "legacy.product")
         assert dc["schema"][0]["physicalType"] == "view"
+
+
+# ---------------------------------------------------------------------------
+# 12b. The publish flow does not use the hand-rolled builder above
+# ---------------------------------------------------------------------------
+
+
+class TestPublishFlowRoutesThroughOdcsProvider:
+    """``_build_data_contract_odcs`` duplicates the ODCS mapper pipeline and lags
+    it, so the per-expose publish flow must keep going through
+    ``OdcsProvider.render`` — that is the only reason published contracts get the
+    mapper's fixes (per-port ``name``, ``fluidProductName``) without the builder
+    being touched. If this fails, a published contract has silently moved onto
+    the builder."""
+
+    PRODUCT_ID = "bronze.bss.accounts"
+
+    @pytest.fixture()
+    def spied(self):
+        """A provider whose builder explodes if called, and the ``expose_id`` of every
+        real ``OdcsProvider.render`` call."""
+        from fluid_build.providers.odcs import OdcsProvider
+
+        real_render = OdcsProvider.render
+        render_calls = []
+
+        def spy(self, fluid, *args, **kwargs):
+            render_calls.append(kwargs.get("expose_id"))
+            return real_render(self, fluid, *args, **kwargs)
+
+        provider = DataMeshManagerProvider(api_key="fake", api_url="https://test.com")
+        with (
+            patch.object(OdcsProvider, "render", spy),
+            patch.object(
+                provider,
+                "_build_data_contract_odcs",
+                side_effect=AssertionError("the publish flow must not use the builder"),
+            ),
+        ):
+            yield provider, render_calls, real_render(
+                OdcsProvider(), RICH_CONTRACT, expose_id="customer_accounts"
+            )
+
+    def test_publish_puts_the_providers_render_not_the_builders(self, spied):
+        provider, render_calls, expected_body = spied
+        with patch.object(provider, "_request", return_value=MagicMock(status_code=200)) as req:
+            results = provider._publish_odcs_per_expose(RICH_CONTRACT, self.PRODUCT_ID)
+
+        assert render_calls == ["customer_accounts"]
+        assert [r["success"] for r in results] == [True]
+        assert req.call_args.args == (
+            "PUT",
+            "/api/datacontracts/bronze.bss.accounts.customer_accounts",
+        )
+        body = req.call_args.kwargs["json_body"]
+        assert body == expected_body
+        assert "dataProduct" not in body
+
+    def test_dry_run_preview_is_the_providers_render_not_the_builders(self, spied):
+        provider, render_calls, expected_body = spied
+        (preview,) = provider._preview_odcs_per_expose(RICH_CONTRACT, self.PRODUCT_ID)
+
+        assert render_calls == ["customer_accounts"]
+        assert preview["payload"] == expected_body
 
 
 # ---------------------------------------------------------------------------

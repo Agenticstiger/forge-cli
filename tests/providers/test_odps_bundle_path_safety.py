@@ -161,7 +161,13 @@ class TestRoundTripStillWorks:
         assert (out_dir / "silver.orders.odps.yaml").exists()
 
         imported = provider.import_directory(out_dir)
-        assert imported["contract"]["id"] == "silver.orders"
+        # The product id is the root `id`. It used to arrive under `contract.id`,
+        # an address the FLUID schema rejects on the root, so the imported
+        # contract failed its own validator.
+        assert imported["id"] == "silver.orders"
+        # The sibling ODCS file was found and merged back as the one expose it
+        # was written for — that is the convention this test is guarding.
+        assert [e["exposeId"] for e in imported["exposes"]] == ["orders"]
 
 
 class TestOtherEmittersAreGated:

@@ -24,10 +24,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderError
+from fluid_build.util.contract import contract_id_collision, expose_contract_id
 
 from .io import read_input, write_output
 from .mappers import EXPORT_PIPELINE, IMPORT_PIPELINE, normalize
-from .mappers.base import ExportCtx, ImportCtx, fluid_id
+from .mappers.base import ExportCtx, ImportCtx
 from .validation import load_schema, roundtrip_check, validate, validate_via_vowl
 
 
@@ -102,10 +103,14 @@ class OdcsProvider(BaseProvider):
     ) -> Dict[str, Any]:
         """Render a FLUID contract to ODCS v3.1.0.
 
-        When ``expose_id`` is provided the rendered ODCS scopes its ``id`` to
-        ``{product_id}.{expose_id}`` and reads ``status`` from that expose's
-        lifecycle — exactly what the Bitol ODPS provider needs when emitting
-        per-port contracts.
+        When ``expose_id`` is provided the rendered ODCS takes its ``id`` from
+        :func:`fluid_build.util.contract.expose_contract_id` — the id that
+        expose pins (``contract.id``), the one an ODPS import recorded for it,
+        else the derived ``{product_id}.{expose_id}`` — and reads ``status``
+        from that expose's lifecycle. That is exactly what the Bitol ODPS
+        provider needs when emitting per-port contracts, and because the
+        resolution reads the whole contract rather than the expose alone, this
+        method answers the same id however it was reached.
         """
         if isinstance(src, list):
             raise ProviderError(
@@ -116,6 +121,22 @@ class OdcsProvider(BaseProvider):
         # Push any ``extensions.odcs`` round-trip state back into the inline
         # buckets the mappers read. No-op for hand-written FLUID contracts.
         src = normalize.rehydrate(src)
+        if expose_id:
+            # Every per-expose ODCS in the tree is rendered here — this method
+            # and ``render_all_ports``, which loops over it — so this is the
+            # one place a contract-id collision has to be refused for all of
+            # them. It was refused in ``BitolOdpsProvider.render`` only, and
+            # the ODCS doors (``fluid generate standard --format odcs``,
+            # ``fluid generate artifacts --emit odcs``) happily wrote two
+            # documents carrying one ``id``: whichever of the two a consumer
+            # resolves is arbitrary, and in the one-file-per-id layout the
+            # second overwrites the first. Refusing rather than warning,
+            # because serving one of two schemas under an id is worse than an
+            # export that did not happen. The check runs before the scope, so
+            # it sees the sibling the id collides with.
+            collision = contract_id_collision(src)
+            if collision:
+                raise ProviderError(collision)
         fluid = self._scope_to_expose(src, expose_id) if expose_id else src
         odcs: Dict[str, Any] = {}
         ctx = ExportCtx(
@@ -271,9 +292,23 @@ class OdcsProvider(BaseProvider):
                 f"Expose '{expose_id}' not found in contract. " f"Available exposeIds: {available}"
             )
         scoped["exposes"] = exposes
-        product_id = fluid_id(fluid)
-        if product_id:
-            scoped["_scoped_id"] = f"{product_id}.{expose_id}"
+        # The id a port names for itself wins over the derived one, verbatim: a
+        # derived id changes the moment the product or the expose is renamed,
+        # which renames the contract under every consumer that references it,
+        # and a catalog whose ids are its own (a UUID, say) could not be served
+        # at all. The ODPS output port's ``contractId`` resolves through the
+        # same helper, so the two stay the one string Bitol fragments mode
+        # requires them to be. The *whole* contract goes in, not just the
+        # expose: an ODPS import leaves the imported id in root
+        # ``extensions.odps`` and only ``BitolOdpsProvider.render`` pushes it
+        # down onto the expose first, so resolving from the expose alone made
+        # every other entry point that renders a per-expose ODCS directly
+        # (``render_all_ports``, the two Data Mesh Manager publish flows, the
+        # copilot round-trip check, the catalog payload builder) re-derive an
+        # id the source document had already named.
+        scoped_id = expose_contract_id(fluid, exposes[0], expose_id=expose_id)
+        if scoped_id:
+            scoped["_scoped_id"] = scoped_id
         # Only stamp a scoped status when the port actually declares one —
         # defaulting to "active" here used to mask the contract-root
         # ``lifecycle.state``, so every per-port export claimed "active".

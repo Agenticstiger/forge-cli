@@ -306,6 +306,24 @@ def _render_odps_yaml(contract: Mapping[str, Any]) -> Optional[str]:
 def _render_odcs_yaml(contract: Mapping[str, Any], expose_id: str) -> Optional[str]:
     if not expose_id:
         return None
+
+    # Two exposes resolving to one contract id would publish two different
+    # schemas under a single identity. The provider refuses such an export, and
+    # the broad ``except`` below would turn that refusal into an ordinary
+    # "continuing without it" warning — indistinguishable from a mapper hiccup.
+    # Checked here so the reason is named, and at ERROR because a catalog that
+    # publishes this product will carry no ODCS for ANY of its ports.
+    #
+    # Deliberately not raised: this layer must never raise on bad input (see
+    # ``_build_asset``), so a caller that needs the export to fail should run
+    # ``fluid validate``, which rejects the same contract with the same message.
+    from fluid_build.util.contract import contract_id_collision
+
+    collision = contract_id_collision(contract)
+    if collision:
+        LOG.error("Refusing to render ODCS for expose %s: %s", expose_id, collision)
+        return None
+
     try:
         import yaml as _yaml
 

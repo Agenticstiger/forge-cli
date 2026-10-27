@@ -84,12 +84,19 @@ def _expected_input_refs(contract: dict) -> list[str]:
     ]
 
 
-def _expected_dmm_input_contract_ids(contract: dict) -> list[str]:
-    """DMM's ODPS overlay promotes ``consumes: {productId, exposeId}`` references
-    to the expose-level ``{productId}.{exposeId}`` published address. See
+def _expected_input_contract_ids(contract: dict) -> list[str]:
+    """The ``inputPorts[].contractId`` an ODPS export is expected to carry: the
+    consume's own ``contractId`` when it declares one, otherwise the
+    expose-level ``{productId}.{exposeId}`` published address a
+    ``consumes: {productId, exposeId}`` reference promotes to.
+
+    DMM's ODPS overlay was first to do this — see
     ``DataMeshManagerProvider._ensure_odps_input_port_contract_ids`` for the
-    promotion rule; other ODPS emitters (OdpsStandardProvider, official
-    OPDS) keep the bare product-level reference.
+    promotion rule — and ``OdpsStandardProvider`` now defaults to the same
+    address, because the bare product-level reference it emitted before named a
+    contract that exists nowhere. The legacy official-OPDS emitter still keeps
+    the bare reference in its own ``reference`` field (see
+    :func:`_expected_input_refs`).
     """
     refs: list[str] = []
     for consume in contract.get("consumes", []):
@@ -200,6 +207,7 @@ def test_lineage_fixtures_preserve_input_ports_across_odps_exports(
     contract = _load_contract(fixture_name)
     expected_ids = _expected_input_ids(contract)
     expected_refs = _expected_input_refs(contract)
+    expected_contract_ids = _expected_input_contract_ids(contract)
     odps_standard = OdpsStandardProvider().render(contract)
     dmm_result = DataMeshManagerProvider(
         api_key="dummy", api_url="https://api.entropy-data.com"
@@ -209,11 +217,14 @@ def test_lineage_fixtures_preserve_input_ports_across_odps_exports(
 
     # ODPS-Bitol v1.0.0 InputPort forbids ``id`` and ``reference``; the
     # identifier travels via ``name`` and the reference is folded into
-    # ``contractId`` (synthesized when no explicit contractId is provided).
-    # The raw OdpsStandardProvider uses the bare product reference as the
-    # synthetic contractId — no DMM-specific promotion applied.
+    # ``contractId`` (defaulted when no explicit contractId is provided).
+    # The OdpsStandardProvider addresses the upstream at the expose level,
+    # ``{productId}.{exposeId}`` — the same id the upstream product's own
+    # per-port ODCS render carries, so the edge resolves. ``expected_refs``
+    # stays product-level for the two assertions further down, which read
+    # surfaces that name the product rather than one of its ports.
     assert [port["name"] for port in odps_standard["inputPorts"]] == expected_ids
-    assert [port["contractId"] for port in odps_standard["inputPorts"]] == expected_refs
+    assert [port["contractId"] for port in odps_standard["inputPorts"]] == expected_contract_ids
     # DMM removes product-to-product consumes from the ODPS inputPorts and
     # publishes them as first-class Entropy Access agreements instead. This
     # avoids mirroring upstream products as SourceSystems in the DMM graph.
