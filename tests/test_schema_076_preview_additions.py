@@ -31,13 +31,17 @@ own exporters already read:
   mapper already reads ``host``, and a Kafka binding declaring only
   ``format: kafka_topic`` tells a consumer nothing about whether the values
   are Avro or JSON.
+* ``exposes[].contract.schema[].quality`` — the ODCS exporter has always
+  replayed a column's quality array verbatim and the importer has always read
+  it back, but ``$defs.column`` is closed and did not declare it, so a column
+  written the way the exporter supports was refused by ``fluid validate``.
 
 The field names are Bitol's (ODCS v3.1.0 / ODPS v1.1.0) so import and export
 are a pass-through rather than a translation.
 
-All five are optional and 0.7.6 is preview-gated: a contract that sets none
-of them validates exactly as it does today, and a 0.7.5 contract cannot
-reach them at all.
+All of them are optional and 0.7.6 is preview-gated: a contract that sets
+none of them validates exactly as it does today, and a 0.7.5 contract
+cannot reach them at all.
 """
 
 from __future__ import annotations
@@ -333,7 +337,9 @@ class TestRejectedShapes:
 
 _DUPLICATE_MESSAGE = (
     "contract id 'urn:acme:contract:orders:1' is used by exposes 'orders' and 'orders_api'"
-    " — give each expose its own contract.id"
+    " — two output ports under one contract id publish two different schemas under a single"
+    " identity, so a consumer resolving it gets one of the two arbitrarily and the other port's"
+    " schema is lost; give each expose its own contract.id"
 )
 
 
@@ -394,3 +400,94 @@ class TestDuplicateContractId:
 
         assert rc == 1
         assert _DUPLICATE_MESSAGE in captured.out + captured.err
+
+
+# ---------------------------------------------------------------------------
+# ``column.quality`` — the sixth field
+# ---------------------------------------------------------------------------
+
+
+_ODCS_RULE = {
+    "id": "ID-nullValues",
+    "type": "library",
+    "metric": "nullValues",
+    "mustBe": 0,
+    "dimension": "completeness",
+    "severity": "error",
+}
+
+
+def _with_column_quality(rule: Dict[str, Any]) -> Dict[str, Any]:
+    contract = _base_contract()
+    contract["exposes"][0]["contract"]["schema"][0]["quality"] = [copy.deepcopy(rule)]
+    return contract
+
+
+class TestColumnQuality:
+    def test_a_rule_in_odcs_shape_validates(self, manager):
+        _assert_valid(manager, _with_column_quality(_ODCS_RULE))
+
+    def test_a_bare_text_rule_validates(self, manager):
+        # ODCS ``$defs.DataQuality`` requires nothing but a non-empty object,
+        # and the FLUID copy deliberately re-declares no required key.
+        _assert_valid(manager, _with_column_quality({"type": "text", "description": "Hourly."}))
+
+    def test_rejected_on_075(self, manager):
+        contract = _with_column_quality(_ODCS_RULE)
+        contract["fluidVersion"] = "0.7.5"
+        result = _assert_invalid(manager, contract, version="0.7.5")
+        assert any("quality" in m for m in _messages(result)), _messages(result)
+
+    def test_an_empty_rule_object_is_rejected(self, manager):
+        # ``minProperties: 1``: a rule that says nothing is not a rule, and a
+        # DQ engine handed one has no check to run.
+        _assert_invalid(manager, _with_column_quality({}))
+
+    def test_a_metric_outside_the_odcs_five_is_rejected(self, manager):
+        result = _assert_invalid(
+            manager, _with_column_quality({"type": "library", "metric": "freshness"})
+        )
+        assert any("nullValues" in m for m in _messages(result)), _messages(result)
+
+    def test_a_rule_id_outside_the_stable_id_pattern_is_rejected(self, manager):
+        # ODCS ``$defs.StableId``. An id with a dot or a space is what a DQ
+        # engine keys its results on, so it has to be the spelling ODCS allows.
+        _assert_invalid(manager, _with_column_quality({**_ODCS_RULE, "id": "ID.nullValues"}))
+
+
+# ---------------------------------------------------------------------------
+# ``exposes[].contract.id`` is deliberately unconstrained
+# ---------------------------------------------------------------------------
+
+
+class TestContractIdShape:
+    """Why the importer has to tolerate an id FLUID's root cannot spell.
+
+    The alternative to teaching the ODCS importer about such an id was to
+    constrain this field with the root's own ``$defs.identifier`` pattern, which
+    would have made ``fluid validate`` reject exactly the ids the field exists
+    to carry — the catalog-supplied URN or UUID that cannot be derived as
+    ``<product id>.<exposeId>``. These pin that choice: the field takes any
+    non-empty string, and the round-trip is the ODCS importer's problem (see
+    tests/providers/test_pinned_id_portability.py).
+    """
+
+    def test_a_catalog_urn_validates(self, manager):
+        contract = _base_contract()
+        contract["exposes"][0]["contract"]["id"] = "urn:acme:contract:orders:v1"
+        _assert_valid(manager, contract)
+
+    def test_the_field_declares_no_pattern(self, manager):
+        field = manager.get_schema("0.7.6", offline_only=True)["$defs"]["exposeContract"][
+            "properties"
+        ]["id"]
+        assert "pattern" not in field
+        assert field["minLength"] == 1
+
+    def test_an_empty_contract_id_is_rejected(self, manager):
+        # ``minLength: 1``: an empty string would publish a contract with no
+        # id at all while reading as a pin, which the derived-id fallback
+        # would then not supply.
+        contract = _base_contract()
+        contract["exposes"][0]["contract"]["id"] = ""
+        _assert_invalid(manager, contract)

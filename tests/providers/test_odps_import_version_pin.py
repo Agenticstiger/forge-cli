@@ -330,16 +330,13 @@ class TestTheHeadlineCase:
         assert _expose(imported)["contract"]["id"] == PORT_CONTRACT_ID
         assert _expose(imported)["binding"]["location"]["host"] == ("acme.snowflakecomputing.com")
 
-        # The other two arrive somewhere else, for reasons that are not the
-        # version pin and are pinned here so they stay visible rather than
-        # looking like this change forgot them.
-        #
-        # The structured root description is flattened: the ODPS product mapper
-        # writes its ``purpose`` to ``metadata.description`` and parks the whole
-        # object in the pass-through, so the root comes back a string. Lossless
-        # — the re-export reproduces all three parts — but the imported contract
-        # no longer declares the structured form it could now hold.
-        assert imported["description"] == source["description"]["purpose"]
+        # The structured root description survives whole. The ODPS product
+        # mapper still hands over ``purpose`` alone and parks the object in the
+        # pass-through — it has no declared version to consult — and
+        # ``_to_fluid_document`` promotes it back to the root because the
+        # version recorded here accepts an object. The parked copy stays, which
+        # is what keeps the ODPS leg an exact fixed point.
+        assert imported["description"] == source["description"]
         assert imported["extensions"]["odps"]["metadata"]["description"] == source["description"]
 
         # ``consumers`` does not survive an ODPS round trip at all. It is
