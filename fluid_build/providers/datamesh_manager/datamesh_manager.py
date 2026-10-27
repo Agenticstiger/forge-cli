@@ -47,6 +47,7 @@ from fluid_build.providers.base import BaseProvider, ProviderError
 from fluid_build.util.contract import (
     builds_to_canonical_input_ports,
     consumes_to_canonical_ports,
+    contract_id_collision,
     expose_contract_id,
     expose_contract_id_for_ref,
     kind_to_dmm_type,
@@ -502,6 +503,21 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             data_product_specification=data_product_specification,
         )
         product_id = dp.get("id") or self._extract_id(fluid)
+
+        # Refuse a contract-id collision before anything is sent or previewed.
+        # The same contract-level check the exporters call, by the same helper
+        # — not the per-expose ODCS render's own, because
+        # :meth:`_preview_odcs_per_expose` and
+        # :meth:`_publish_odcs_per_expose` catch whatever that render raises
+        # and carry on, so a collision would come out as a skipped contract
+        # and a published product referencing a contract id nothing was PUT
+        # under. The derived half of the id is scoped to the product this
+        # publish is writing, which is the id its companion ODCS contracts are
+        # PUT under and need not be the contract's own.
+        collision = contract_id_collision(fluid, product_id=product_id)
+        if collision:
+            raise ProviderError(collision)
+
         is_odps_payload = self._is_odps_payload(dp)
         lineage_mode = self._normalize_odps_lineage_mode(
             odps_lineage_mode or self.odps_lineage_mode

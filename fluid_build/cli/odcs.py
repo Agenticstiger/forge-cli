@@ -121,7 +121,9 @@ def export_command(
         # ── Per-port mode ────────────────────────────────────────────────────
         if per_port:
             out_dir = Path(output).parent if output else Path(".")
-            out_dir.mkdir(parents=True, exist_ok=True)
+            # Not created up front: ``write_output`` makes the parent as it
+            # writes, so a refused export (a contract-id collision, say) leaves
+            # no empty directory behind — matching ``fluid odps export``.
             results = provider.render_all_ports(fluid_contract, out_dir=out_dir, fmt=format)
             if not results:
                 click.echo("WARNING: No exposes found in contract — nothing exported.", err=True)

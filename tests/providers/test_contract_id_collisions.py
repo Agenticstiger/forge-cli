@@ -259,7 +259,9 @@ class TestValidateRejectsPinnedAgainstDerived:
 
         assert _rule_errors(contract) == [
             "contract id 'urn:acme:contract:catalog:1' is used by exposes 'items' and 'prices'"
-            " — give each expose its own contract.id"
+            " — two output ports under one contract id publish two different schemas under a"
+            " single identity, so a consumer resolving it gets one of the two arbitrarily and"
+            " the other port's schema is lost; give each expose its own contract.id"
         ]
 
     def test_distinct_pins_and_no_pins_at_all_are_accepted(self):
@@ -474,3 +476,127 @@ class TestDataMeshManagerMatchesTheOdpsFile:
         }
         assert "/api/datacontracts/urn:acme:contract:items:1" in put_paths
         assert f"/api/datacontracts/{PRODUCT_ID}.prices" in put_paths
+
+
+# ---------------------------------------------------------------------------
+# Finding 5 — the check is the contract's, not one exporter's
+# ---------------------------------------------------------------------------
+
+
+class TestTheSharedCollisionCheck:
+    """``util.contract.contract_id_collisions`` is the one implementation.
+
+    It lived inside ``BitolOdpsProvider.render``, so only the ODPS doors
+    refused a colliding contract. ``fluid generate standard --format odcs``,
+    ``fluid generate artifacts --emit odcs`` and the Data Mesh Manager publish
+    each wrote two ODCS documents carrying one ``id`` instead.
+    ``tests/cli/test_collision_guard_every_door.py`` pins the doors; this pins
+    what they all call.
+    """
+
+    def test_a_pin_colliding_with_an_unpinned_siblings_derived_id(self):
+        from fluid_build.util.contract import contract_id_collisions
+
+        (message,) = contract_id_collisions(_pinned_to_a_siblings_derived_id())
+        assert f"{PRODUCT_ID}.items" in message
+        assert "'items'" in message
+        assert "'prices'" in message
+        # The sibling has no contract.id to change, so the message names the
+        # two moves that exist rather than the one that does not.
+        assert "change the contract.id on 'prices'" in message
+        assert "rename the expose 'items'" in message
+        assert "give each expose its own contract.id" not in message
+
+    def test_two_pinned_exposes_sharing_an_id(self):
+        from fluid_build.util.contract import contract_id_collisions
+
+        contract = _two_port_contract()
+        contract["exposes"][0]["contract"]["id"] = "urn:acme:contract:catalog:1"
+        contract["exposes"][1]["contract"]["id"] = "urn:acme:contract:catalog:1"
+        (message,) = contract_id_collisions(contract)
+        assert "'urn:acme:contract:catalog:1'" in message
+        assert "give each expose its own contract.id" in message
+
+    def test_a_pin_matching_a_PINNED_siblings_derived_id_is_accepted(self):
+        """The false positive, at the helper. ``items`` is published under its
+        urn, so ``shop.catalog.items`` is an id no contract answers to."""
+        from fluid_build.util.contract import contract_id_collisions
+
+        contract = _two_port_contract()
+        contract["exposes"][0]["contract"]["id"] = "urn:acme:contract:items:1"
+        contract["exposes"][1]["contract"]["id"] = f"{PRODUCT_ID}.items"
+        assert contract_id_collisions(contract) == []
+
+    def test_distinct_pins_and_no_pins_at_all_are_accepted(self):
+        from fluid_build.util.contract import contract_id_collisions
+
+        contract = _two_port_contract()
+        assert contract_id_collisions(contract) == []
+        contract["exposes"][0]["contract"]["id"] = "urn:acme:contract:items:1"
+        contract["exposes"][1]["contract"]["id"] = "urn:acme:contract:prices:1"
+        assert contract_id_collisions(contract) == []
+
+    def test_an_imported_id_is_resolved_the_same_way_as_a_pin(self, imported_with_uuid_contract_id):
+        """An import leaves the id in root ``extensions.odps``, and the check
+        has to read it from there or it compares against an id nothing
+        publishes."""
+        from fluid_build.util.contract import contract_id_collisions
+
+        contract = copy.deepcopy(imported_with_uuid_contract_id)
+        assert contract_id_collisions(contract) == []
+        contract["exposes"].append(_expose("extra", "EXTRA", "EXTRA_NAME"))
+        contract["exposes"][-1]["contract"]["id"] = UUID_CONTRACT_ID
+        (message,) = contract_id_collisions(contract)
+        assert UUID_CONTRACT_ID in message
+        assert "'items'" in message
+        assert "'extra'" in message
+
+    def test_product_id_scopes_the_derived_half(self):
+        """Data Mesh Manager derives from the id of the product it is writing,
+        so the check has to derive from the same one or it misses the
+        collision its own urls would have."""
+        from fluid_build.util.contract import contract_id_collisions
+
+        contract = _two_port_contract()
+        contract["exposes"][1]["contract"]["id"] = "other.product.items"
+        assert contract_id_collisions(contract) == []
+        (message,) = contract_id_collisions(contract, product_id="other.product")
+        assert "'other.product.items'" in message
+
+    def test_only_the_colliding_pair_is_reported(self):
+        from fluid_build.util.contract import contract_id_collisions
+
+        contract = _two_port_contract()
+        contract["exposes"].append(_expose("stock", "STOCK", "ON_HAND"))
+        contract["exposes"][2]["contract"]["id"] = f"{PRODUCT_ID}.items"
+        (message,) = contract_id_collisions(contract)
+        assert "'prices'" not in message
+
+    def test_the_single_collision_form_returns_the_first_or_none(self):
+        from fluid_build.util.contract import contract_id_collision, contract_id_collisions
+
+        collider = _pinned_to_a_siblings_derived_id()
+        assert contract_id_collision(collider) == contract_id_collisions(collider)[0]
+        assert contract_id_collision(_two_port_contract()) is None
+
+    @pytest.mark.parametrize("exposes", [None, "not-a-list", [], ["not-a-mapping"]])
+    def test_shapes_the_schema_would_have_rejected_are_skipped(self, exposes):
+        """The check runs on exporter paths that never gated on ``fluid
+        validate``, so a malformed document must not raise out of it."""
+        from fluid_build.util.contract import contract_id_collisions
+
+        contract = _two_port_contract()
+        contract["exposes"] = exposes
+        assert contract_id_collisions(contract) == []
+
+    def test_one_name_used_twice_is_left_to_the_duplicate_name_guard(self, exporter):
+        """Two exposes answering to one name derive one id, and reporting that
+        as a contract-id collision cost the author the message that actually
+        describes it."""
+        from fluid_build.util.contract import contract_id_collisions
+
+        contract = _two_port_contract()
+        contract["exposes"][1]["exposeId"] = "items"
+        assert contract_id_collisions(contract) == []
+        with pytest.raises(ProviderError, match="Duplicate output port name"):
+            exporter.render(contract)

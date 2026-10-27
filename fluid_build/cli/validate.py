@@ -1037,58 +1037,16 @@ def _duplicate_contract_id_errors(contract: Mapping[str, Any]) -> List[str]:
     uniqueness across a nested key; the rule has to live in code. Shapes the
     schema would have rejected (a non-string id, a non-object expose) are
     skipped rather than reported twice.
+
+    The rule itself lives in :func:`~fluid_build.util.contract.contract_id_collisions`,
+    beside the single id resolution point, because every export door enforces
+    the same rule and a second copy here would be free to drift from the one the
+    exporters apply. This function stays as the name ``_run_contract_rules``
+    calls, so the validate surface is unchanged.
     """
-    from fluid_build.util.contract import explicit_expose_contract_id, expose_contract_id
+    from fluid_build.util.contract import contract_id_collisions
 
-    exposes = contract.get("exposes")
-    if not isinstance(exposes, list):
-        return []
-
-    def _label(index: int, expose: Mapping[str, Any]) -> str:
-        expose_id = expose.get("exposeId")
-        return expose_id if isinstance(expose_id, str) and expose_id else f"exposes[{index}]"
-
-    # (label, pinned id or None) in document order, so the errors come out in a
-    # stable order whatever the dict iteration does.
-    resolved: List[Tuple[str, Optional[str]]] = []
-    derived_by: Dict[str, str] = {}
-    for index, expose in enumerate(exposes):
-        if not isinstance(expose, Mapping):
-            continue
-        label = _label(index, expose)
-        pinned = explicit_expose_contract_id(expose, contract)
-        resolved.append((label, pinned))
-        if pinned is None:
-            derived = expose_contract_id(contract, expose)
-            if derived is not None:
-                derived_by.setdefault(derived, label)
-
-    errors: List[str] = []
-    claimed_by: Dict[str, str] = {}
-    for label, pinned in resolved:
-        if pinned is None:
-            continue
-        sibling = derived_by.get(pinned)
-        if sibling is not None:
-            # "Give each expose its own contract.id" is wrong advice here: the
-            # sibling has no contract.id to change, so name the two moves that
-            # do resolve it.
-            errors.append(
-                f"contract id {pinned!r} is used by exposes {sibling!r} and {label!r}"
-                f" — {sibling!r} pins no contract.id, so the exporters derive this"
-                f" id for it; change the contract.id on {label!r}, or rename the"
-                f" expose {sibling!r}"
-            )
-            continue
-        first = claimed_by.get(pinned)
-        if first is None:
-            claimed_by[pinned] = label
-            continue
-        errors.append(
-            f"contract id {pinned!r} is used by exposes {first!r} and {label!r}"
-            " — give each expose its own contract.id"
-        )
-    return errors
+    return contract_id_collisions(contract)
 
 
 def _validate_with_version_fallback(

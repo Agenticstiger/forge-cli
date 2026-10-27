@@ -61,10 +61,11 @@ from fluid_build.providers.odcs.mappers.types import (
     physical_type_to_expose_kind,
 )
 from fluid_build.providers.odcs.provider import OdcsProvider
+from fluid_build.util.contract import contract_id_collision
 
 from .io import read_input, write_output
 from .mappers import EXPORT_PIPELINE, IMPORT_PIPELINE
-from .mappers.base import PASSTHROUGH_KEY, ExportCtx, ImportCtx
+from .mappers.base import PASSTHROUGH_KEY, ExportCtx, ImportCtx, fluid_id
 from .resolver import ContractNotFound, ContractResolver, ResolvedContract
 from .validation import (
     DEFAULT_API_VERSION,
@@ -94,10 +95,11 @@ class BitolOdpsProvider(BaseProvider):
 
     Agreeing on the lookup is not on its own enough to make the two ids the
     same string, and this class does not rely on it being: two exposes can
-    resolve to one id, and then one per-port contract overwrites the other. The
-    ``contractId``-collision refusal and the ``odcs.id != port.contractId``
-    check in :meth:`render` are what actually hold the invariant, and they hold
-    it by refusing an export that would not satisfy it.
+    resolve to one id, and then one per-port contract overwrites the other.
+    :meth:`render` refuses such a contract up front, through the shared
+    :func:`~fluid_build.util.contract.contract_id_collision` every other door
+    calls, and the ``odcs.id != port.contractId`` check holds the rest of the
+    invariant — both by refusing an export that would not satisfy it.
     """
 
     def __init__(self) -> None:
@@ -188,6 +190,19 @@ class BitolOdpsProvider(BaseProvider):
         # goes through untouched.
         src = _rehydrate_document(src)
 
+        # Refuse a contract-id collision before a single mapper runs, so a
+        # refused export writes nothing and leaves nothing behind. Detection
+        # is :func:`~fluid_build.util.contract.contract_id_collision`, the one
+        # the ODCS per-port render and the Data Mesh Manager publish call too:
+        # the collision is a property of the contract, and while it was
+        # detected here instead, every door that did not come through this
+        # exporter accepted it. ``product_id`` is the id the output-port mapper
+        # derives with, fallback included, so the ids compared are the ones
+        # that would reach the bundle.
+        collision = contract_id_collision(src, product_id=fluid_id(src) or "product")
+        if collision:
+            raise ProviderError(collision)
+
         product: Dict[str, Any] = {}
         ctx = ExportCtx(
             fluid=src,
@@ -207,20 +222,15 @@ class BitolOdpsProvider(BaseProvider):
         # effect for the same render call.
         self._odcs._vowl_validate_on_export = self.strict_validation
 
-        # Emit per-port ODCS contracts, keyed by contractId.
+        # Emit per-port ODCS contracts, keyed by contractId. Two ports
+        # resolving to one id used to overwrite each other right here: the
+        # bundle came out with N output ports and fewer than N ODCS contracts,
+        # the losing port's schema absent altogether, and a consumer resolving
+        # it got the surviving port's schema instead. The refusal above is what
+        # prevents that now, so this loop only has to keep the port *names*
+        # apart — they become ``outputPorts`` entries and filenames.
         contracts: Dict[str, Dict[str, Any]] = {}
         seen_port_names: set[str] = set()
-        # Which port claimed each contract id. ``contracts`` is keyed by that
-        # id, so a second port resolving to one already taken used to overwrite
-        # the first entry: the bundle came out with N output ports and fewer
-        # than N ODCS contracts, the losing port's schema absent altogether,
-        # and a consumer resolving it got the surviving port's schema instead.
-        # ``fluid validate`` now refuses the contract that causes it, but
-        # neither ``fluid odps export`` nor ``fluid generate artifacts`` runs
-        # validate, so the exporter has to refuse it too — and refuse rather
-        # than warn: a sealed bundle that is silently missing a schema is worse
-        # than an export that did not happen.
-        claimed_by: Dict[str, Any] = {}
         for port in product.get("outputPorts") or []:
             port_name = port.get("name")
             contract_id = port.get("contractId")
@@ -230,17 +240,6 @@ class BitolOdpsProvider(BaseProvider):
                     "must have a unique exposeId/id."
                 )
             seen_port_names.add(port_name)
-            first_port = claimed_by.get(contract_id)
-            if first_port is not None:
-                raise ProviderError(
-                    f"Output ports '{first_port}' and '{port_name}' both resolve to "
-                    f"contract id '{contract_id}' — one per-port ODCS contract would "
-                    f"overwrite the other and '{first_port}' would have no schema in "
-                    "the exported bundle. Give each expose a distinct "
-                    "exposes[].contract.id, or drop the pin so the id is derived "
-                    "from the exposeId."
-                )
-            claimed_by[contract_id] = port_name
             odcs = self._odcs.render(src, expose_id=port_name)
             if odcs.get("id") != contract_id:
                 # Defensive — these should be equal by construction
@@ -761,8 +760,25 @@ def _to_fluid_document(
     metadata_name = metadata.pop("name", None)
     doc["name"] = odps.get("name") or metadata_name or doc["id"]
 
+    # ``product.py::to_fluid`` hands over the ``purpose`` STRING and parks the
+    # whole ``{purpose, usage, limitations}`` object in the pass-through, because
+    # the root ``description`` is ``type: string`` in every bundled version
+    # before 0.7.6 and that mapper has no declared version to consult. So the
+    # object was preserved but never reached an export again: a re-export
+    # carried only ``purpose``, which is the very gap the object form was added
+    # to close. This is the one place that knows ``declared_version``, so the
+    # structured form is promoted back here when the schema accepts it. The
+    # pass-through copy stays — it is what keeps the ODPS leg an exact fixed
+    # point.
     description = metadata.pop("description", None)
-    if description:
+    parked_description = metadata_pt.get("description")
+    if (
+        isinstance(parked_description, Mapping)
+        and parked_description
+        and _root_description_accepts_an_object(declared_version)
+    ):
+        doc["description"] = dict(parked_description)
+    elif description:
         doc["description"] = description
 
     domain = metadata.pop("domain", None)
@@ -1064,6 +1080,38 @@ def _supports_expose_contract_id(version: str) -> bool:
     contract = defs.get("exposeContract")
     properties = contract.get("properties") if isinstance(contract, Mapping) else None
     return isinstance(properties, Mapping) and "id" in properties
+
+
+@lru_cache(maxsize=None)
+def _root_description_accepts_an_object(version: str) -> bool:
+    """Does this bundled FLUID schema let the root ``description`` be an object?
+
+    Asked of the schema for the same reason
+    :func:`_supports_expose_contract_id` asks it, rather than comparing against
+    the version that introduced the object form (0.7.6): promoting that version
+    to stable, or adding a later one, then needs no edit here.
+    """
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    schema = FluidSchemaManager().get_schema(version, offline_only=True)
+    if not isinstance(schema, Mapping):
+        return False
+    properties = schema.get("properties")
+    description = properties.get("description") if isinstance(properties, Mapping) else None
+    if not isinstance(description, Mapping):
+        return False
+    if description.get("type") == "object":
+        return True
+    branches = description.get("oneOf") or description.get("anyOf") or []
+    for branch in branches:
+        if not isinstance(branch, Mapping):
+            continue
+        if branch.get("type") == "object":
+            return True
+        ref = branch.get("$ref")
+        if isinstance(ref, str) and ref.rsplit("/", 1)[-1] == "descriptionObject":
+            return True
+    return False
 
 
 @lru_cache(maxsize=None)

@@ -42,6 +42,7 @@ from fluid_build.providers.datamesh_manager._contract_builders import (
 )
 from fluid_build.util.contract import (
     consumes_to_canonical_ports,
+    contract_id_collision,
     expose_contract_id_for_ref,
 )
 
@@ -269,6 +270,17 @@ class _PublishFlowMixin:
             self._log.warning("OdcsProvider not available — cannot preview ODCS contracts: %s", exc)
             return []
 
+        # The render below is wrapped in ``except Exception`` so one
+        # unexportable port does not lose the whole preview, which also means
+        # the per-port render's own collision refusal would come out as a
+        # warning and a silently shorter preview. Refuse here instead, through
+        # the same contract-level check every exporter calls: two ports PUT to
+        # one ``/api/datacontracts/<id>`` url means the second body overwrites
+        # the first and one port's schema is simply not in the catalog.
+        collision = contract_id_collision(fluid, product_id=product_id)
+        if collision:
+            raise ProviderError(collision)
+
         odcs_prov = OdcsProvider()
         previews: List[Dict[str, Any]] = []
         for expose in fluid.get("exposes", []):
@@ -325,6 +337,12 @@ class _PublishFlowMixin:
                 "OdcsProvider is required to publish ODCS contracts.\n"
                 "Ensure fluid_build.providers.odcs is installed."
             ) from exc
+
+        # See the preview above: a failed render is recorded per port and the
+        # loop carries on, so the collision has to be refused before it.
+        collision = contract_id_collision(fluid, product_id=product_id)
+        if collision:
+            raise ProviderError(collision)
 
         odcs_prov = OdcsProvider()
         results: List[Dict[str, Any]] = []

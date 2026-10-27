@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderError
-from fluid_build.util.contract import expose_contract_id
+from fluid_build.util.contract import contract_id_collision, expose_contract_id
 
 from .io import read_input, write_output
 from .mappers import EXPORT_PIPELINE, IMPORT_PIPELINE, normalize
@@ -121,6 +121,22 @@ class OdcsProvider(BaseProvider):
         # Push any ``extensions.odcs`` round-trip state back into the inline
         # buckets the mappers read. No-op for hand-written FLUID contracts.
         src = normalize.rehydrate(src)
+        if expose_id:
+            # Every per-expose ODCS in the tree is rendered here — this method
+            # and ``render_all_ports``, which loops over it — so this is the
+            # one place a contract-id collision has to be refused for all of
+            # them. It was refused in ``BitolOdpsProvider.render`` only, and
+            # the ODCS doors (``fluid generate standard --format odcs``,
+            # ``fluid generate artifacts --emit odcs``) happily wrote two
+            # documents carrying one ``id``: whichever of the two a consumer
+            # resolves is arbitrary, and in the one-file-per-id layout the
+            # second overwrites the first. Refusing rather than warning,
+            # because serving one of two schemas under an id is worse than an
+            # export that did not happen. The check runs before the scope, so
+            # it sees the sibling the id collides with.
+            collision = contract_id_collision(src)
+            if collision:
+                raise ProviderError(collision)
         fluid = self._scope_to_expose(src, expose_id) if expose_id else src
         odcs: Dict[str, Any] = {}
         ctx = ExportCtx(

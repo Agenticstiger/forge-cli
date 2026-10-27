@@ -514,8 +514,14 @@ def _emit_odps_bitol(contract_path: Path, out_dir: Path, logger: logging.Logger)
     from fluid_build.providers.odps_standard import BitolOdpsProvider
 
     contract = _load_contract(contract_path)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
+    # No ``mkdir`` here: the provider's own bundle writer creates ``out_dir``
+    # when it has something to write into it. Creating it first left an empty
+    # ``<out>/odps-bitol/`` behind whenever the render refused — a
+    # contract-id collision, say — while ``fluid odps export --out-dir``
+    # leaves nothing at all, and the two should agree on what a refused export
+    # looks like on disk. Cleaning up afterwards would have to tell an empty
+    # directory we made from one the caller already had.
     provider = BitolOdpsProvider()
     bundle = provider.render(contract, out_dir=out_dir, fmt="yaml")
 
@@ -544,7 +550,9 @@ def _emit_odcs(contract_path: Path, out_dir: Path, logger: logging.Logger) -> Li
     from fluid_build.providers.odcs.odcs import OdcsProvider
 
     contract = _load_contract(contract_path)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # No ``mkdir`` here either, for the reason given in ``_emit_odps_bitol``:
+    # the per-port writer creates the directory as it writes the first file,
+    # so a refused render leaves nothing behind.
     # Same shared-helper derivation as the writer, so a sanitised exposeId
     # still yields the real path rather than a phantom one the manifest
     # would later fail to hash.

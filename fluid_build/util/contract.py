@@ -22,7 +22,7 @@ supported.
 
 import logging
 import re
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
 def get_expose_id(expose: Mapping[str, Any]) -> Optional[str]:
@@ -407,6 +407,132 @@ def expose_contract_id_for_ref(
         if expose_ref in (expose.get("exposeId"), expose.get("id"), expose.get("name")):
             return expose_contract_id(contract, expose, expose_id=expose_ref, product_id=product_id)
     return None
+
+
+def _collision_label(index: int, expose: Mapping[str, Any]) -> str:
+    """How one expose is named in a collision message.
+
+    The same lookup the exporters use for the output port's name, so the two
+    labels in the message are the strings the author will find in the
+    document. A port that names itself nothing at all is pointed at by its
+    array position, because there is nothing else to call it.
+    """
+    return _expose_key(expose) or f"exposes[{index}]"
+
+
+def _collision_message(
+    contract_id: str,
+    first: Tuple[str, bool],
+    second: Tuple[str, bool],
+) -> str:
+    """One collision, phrased so the two moves that resolve it both fit.
+
+    ``first``/``second`` are ``(label, pinned)`` in document order. Which
+    advice is right depends on whether either side pins the id: an un-pinned
+    expose has no ``contract.id`` to change, so "give each expose its own
+    contract.id" would send the author to a field that is not in the document
+    — the move for that side is to rename the expose, since the id is derived
+    from its name.
+    """
+    first_label, first_pinned = first
+    second_label, second_pinned = second
+    shared = (
+        f"contract id {contract_id!r} is used by exposes {first_label!r} and"
+        f" {second_label!r} — two output ports under one contract id publish two"
+        " different schemas under a single identity, so a consumer resolving it"
+        " gets one of the two arbitrarily and the other port's schema is lost"
+    )
+    if first_pinned and second_pinned:
+        return f"{shared}; give each expose its own contract.id"
+    if first_pinned != second_pinned:
+        pinned_label = first_label if first_pinned else second_label
+        derived_label = second_label if first_pinned else first_label
+        return (
+            f"{shared}. {derived_label!r} pins no contract.id, so the exporters"
+            f" derive this id for it; change the contract.id on {pinned_label!r},"
+            f" or rename the expose {derived_label!r}"
+        )
+    # Defensive. Two un-pinned exposes derive one id only when they answer to
+    # one name, and a same-named pair is skipped by the caller as the
+    # duplicate-port-name error it is — a more specific message than this one.
+    # Kept so a change to the derivation cannot make this function hand back
+    # advice that names the wrong side.
+    return f"{shared}; rename one of the two exposes so their derived ids differ"
+
+
+def contract_id_collisions(
+    contract: Mapping[str, Any],
+    *,
+    product_id: Optional[str] = None,
+) -> List[str]:
+    """Every pair of output ports this contract would publish under one
+    contract id, as ready-to-raise messages in document order.
+
+    The collision is a property of the contract, not of one exporter, which is
+    why it is resolved here next to :func:`expose_contract_id` rather than in
+    whichever exporter happened to find it first. It used to live inside
+    ``BitolOdpsProvider.render`` alone, so the ODPS doors refused a colliding
+    contract while ``fluid generate standard --format odcs``, ``fluid generate
+    artifacts --emit odcs`` and the Data Mesh Manager publish accepted it and
+    emitted two ODCS documents carrying one ``id`` — the same defect the
+    refusal exists to prevent, since one of the two schemas is what a consumer
+    resolving that id gets, and in the file-per-id layout one simply overwrites
+    the other. Every door calls this; a fourth exporter added later looks for
+    it where the id itself is minted.
+
+    The published id of a port is exactly what :func:`expose_contract_id`
+    answers for it, so collisions are duplicates of that — which is what keeps
+    the false-positive case accepted: a pin equal to a *pinned* sibling's
+    derived string collides with nothing, because that sibling is published
+    under its pin and its derived string is an id no contract answers to.
+
+    ``product_id`` is passed through to :func:`expose_contract_id` for the
+    Data Mesh Manager, which derives its ids from the id of the product it is
+    writing rather than the contract's own.
+    """
+    claimed: Dict[str, Tuple[str, bool]] = {}
+    errors: List[str] = []
+    for index, expose in enumerate(get_exposes(contract)):
+        if not isinstance(expose, Mapping):
+            continue
+        resolved = expose_contract_id(contract, expose, product_id=product_id)
+        if resolved is None:
+            # No pin and nothing to derive from. Such a port reaches a
+            # per-port ODCS without a scoped id at all, which is a different
+            # gap; it cannot collide with anything here.
+            continue
+        entry = (
+            _collision_label(index, expose),
+            explicit_expose_contract_id(expose, contract) is not None,
+        )
+        first = claimed.get(resolved)
+        if first is None:
+            claimed[resolved] = entry
+            continue
+        if first[0] == entry[0]:
+            # Not two ports sharing an id — one name used twice, which every
+            # exporter reports in its own, more specific words ("Duplicate
+            # output port name"). Reporting it as a contract-id collision here
+            # took that message away and told the author to rename an expose
+            # without saying that the two are already the same name.
+            continue
+        errors.append(_collision_message(resolved, first, entry))
+    return errors
+
+
+def contract_id_collision(
+    contract: Mapping[str, Any],
+    *,
+    product_id: Optional[str] = None,
+) -> Optional[str]:
+    """The first message :func:`contract_id_collisions` returns, or ``None``.
+
+    For the exporters and the publish flow, which refuse the whole contract on
+    the first collision rather than reporting all of them: the export is not
+    going to happen either way, and the author fixes one pin at a time.
+    """
+    collisions = contract_id_collisions(contract, product_id=product_id)
+    return collisions[0] if collisions else None
 
 
 def get_consumes(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
