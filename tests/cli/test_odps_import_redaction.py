@@ -17,9 +17,13 @@
 The gate reports the first schema error, and a jsonschema error quotes the
 value that failed. That value comes from a document the command was handed, so
 a poisoned contract could print its own credential to stderr. The message goes
-through ``redact_secret_text``; before it did, a `snowflake://user:password@host`
-DSN in a rejected field was printed in full while a GitHub token in the same
-string was masked — the redactor knew the shape and simply was not on this path.
+through ``redact_secret_text``; before it did, a DSN of the shape
+``snowflake://user:<secret>@host`` in a rejected field was printed in full while
+a GitHub token in the same string was masked — the redactor knew that shape and
+simply was not on this path.
+
+The fixtures below are synthetic and carry ``pragma: allowlist secret`` so the
+repo's secret scanner reads them as the test data they are.
 """
 
 from __future__ import annotations
@@ -32,8 +36,8 @@ from fluid_build.cli.odps import _validate_imported
 
 pytestmark = pytest.mark.unit
 
-_PASSWORD = "S3cr3t-Pa55w0rd"
-_DSN = f"snowflake://svc_etl:{_PASSWORD}@acme-prod.snowflakecomputing.com/db"
+_PASSWORD = "S3cr3t-Pa55w0rd"  # pragma: allowlist secret
+_DSN = f"snowflake://svc_etl:{_PASSWORD}@acme-prod.snowflakecomputing.com/db"  # pragma: allowlist secret
 
 
 def _contract(**overrides: Any) -> Dict[str, Any]:
@@ -93,10 +97,10 @@ class TestTheCredentialIsNotPrinted:
     @pytest.mark.parametrize(
         "secret",
         [
-            "postgres://admin:hunter2@db.internal:5432/warehouse",
-            "mysql://root:tr0ub4dor@10.0.0.4/orders",
-            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "AKIAIOSFODNN7EXAMPLE",
+            "postgres://admin:hunter2@db.internal:5432/warehouse",  # pragma: allowlist secret
+            "mysql://root:tr0ub4dor@10.0.0.4/orders",  # pragma: allowlist secret
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",  # pragma: allowlist secret
+            "AKIAIOSFODNN7EXAMPLE",  # pragma: allowlist secret
         ],
     )
     def test_other_credential_shapes_are_masked_too(self, secret):

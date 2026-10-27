@@ -418,8 +418,9 @@ def _validate_imported(fluid: Mapping[str, Any]) -> Tuple[bool, str]:
     document this command was handed — so a poisoned contract could print its
     own credential to stderr. The message therefore goes through
     ``redact_secret_text``, the repo's own redactor, rather than the console's
-    weaker ``key=value`` sanitiser: a `snowflake://user:password@host` DSN in a
-    rejected field is masked here, not advertised.
+    weaker ``key=value`` sanitiser: a DSN of the shape
+    ``snowflake://user:<secret>@host`` in a rejected field is masked here, not
+    advertised.
 
     Function-local imports: ``schema_manager`` pulls in ``jsonschema``, which
     ``tests/perf/test_startup_budget.py`` forbids on the ``fluid --help`` path.
