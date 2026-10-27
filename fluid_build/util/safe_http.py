@@ -60,6 +60,8 @@ import socket
 from typing import Any, Optional, Tuple
 from urllib.parse import urlparse
 
+from fluid_build import _net
+
 LOG = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 30.0  # seconds
@@ -70,60 +72,14 @@ class UnsafeURLError(ValueError):
     """Raised when a URL targets a non-public address or non-http(s) scheme."""
 
 
-# CIDR ranges that ``ipaddress.is_private`` does NOT flag but which are
-# nonetheless non-routable / not safe to fetch from. Borrowed from
-# requests-hardened (Saleor, BSD-3).
-EXTRA_BLOCKED_NETWORKS = tuple(
-    ipaddress.ip_network(cidr)
-    for cidr in (
-        "100.64.0.0/10",  # RFC 6598 — Carrier-Grade NAT
-        "192.0.0.0/24",  # RFC 6890 — IETF Protocol Assignments (CPython #113171 gap)
-        "192.0.2.0/24",  # RFC 5737 — TEST-NET-1
-        "192.88.99.0/24",  # RFC 7526 — 6to4 relay anycast (deprecated)
-        "198.18.0.0/15",  # RFC 2544 — benchmarking
-        "198.51.100.0/24",  # RFC 5737 — TEST-NET-2
-        "203.0.113.0/24",  # RFC 5737 — TEST-NET-3
-        "240.0.0.0/4",  # RFC 1112 — class E reserved
-        "2001:20::/28",  # RFC 7343 — ORCHIDv2
-        "2002::/16",  # RFC 3056 — 6to4
-        "5f00::/16",  # RFC 9602 — IPv6 Segment Routing
-        "64:ff9b::/96",  # RFC 6052 — Well-Known NAT64
-        "64:ff9b:1::/48",  # RFC 8215 — Local-Use NAT64
-    )
-)
-
-
-def is_public_address(addr: str) -> bool:
-    """True iff ``addr`` is a routable public IP (v4 or v6).
-
-    Handles three traps ``ipaddress`` alone does not:
-      * IPv4-mapped IPv6 (``::ffff:a.b.c.d``) — on Python <3.12 the
-        v6 form does NOT recurse ``is_private``/``is_loopback`` into
-        the embedded v4 (gh-87105 / bpo-44904 fixed only in 3.12).
-      * Zone-id-bearing v6 (``fe80::1%eth0``) — strip the scope.
-      * Extended CIDR deny-list (:data:`EXTRA_BLOCKED_NETWORKS`).
-    """
-    if "%" in addr:
-        addr = addr.split("%", 1)[0]
-    try:
-        ip = ipaddress.ip_address(addr)
-    except ValueError:
-        return False
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    if (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    ):
-        return False
-    for network in EXTRA_BLOCKED_NETWORKS:
-        if ip.version == network.version and ip in network:
-            return False
-    return True
+# The address predicate and the extended deny-list now live in the tier-0 leaf
+# ``fluid_build._net``, beside the broad SSRF gate that consults the same list.
+# They were defined in both places and disagreed: ``_net._hostname_is_private``
+# judged on bare ``ipaddress`` flags, so a CGNAT address was "public" there and
+# non-public here. Re-exported under the original names because both are part
+# of this module's documented surface and ``__all__``.
+EXTRA_BLOCKED_NETWORKS = _net.EXTRA_BLOCKED_NETWORKS
+is_public_address = _net.is_public_address
 
 
 def resolve_and_validate(hostname: str, *, allow_private: bool = False) -> str:

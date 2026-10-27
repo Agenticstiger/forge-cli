@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **A contract could have a product's database credential delivered to any host it named.** On the
+  `kafka-connect` path, and on the **default** `bring-your-own` / `managed` modes of `debezium` and
+  `airbyte`, forge-cli never connects to the source database: it resolves the contract's
+  `connection.secretRef`, puts the plaintext into the connector config (`database.password`,
+  `connection.password`) and POSTs the whole config to
+  `properties.<engine>.deployment.server_url` — a URL the **contract** chooses. Nothing constrained
+  that host, so the credential could be sent anywhere, needing no allowlist entry and no operator
+  mistake; a loopback `connection.host` even made the build look local. A **public** orchestrator
+  host must now be named in `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`.
+
+  Loopback and private hosts need no entry: an orchestrator on the cluster network is the ordinary
+  deployment, a credential that stays inside the organisation is not the leak this closes, and
+  refusing it would have broken every working install on upgrade. A Tailscale or other CGNAT
+  address (`100.64.0.0/10`) counts as private, which it did not at first — the extended
+  non-routable-range list the tree already had was consulted by `util/safe_http` but not by the
+  classifier this policy uses, so such an orchestrator was called public and refused with the wrong
+  reason. Both now read one list, in the tier-0 `_net` leaf.
+
+  Link-local and unspecified addresses are refused outright, allowlist or not, because that is where
+  cloud instance metadata lives. A host that resolves to **both** public and non-public addresses is
+  treated as public: one private record beside a public one is how an unnamed host is made to look
+  internal, and the connection is pinned to the public address regardless.
+
+  The gate runs where each runner reads `deployment.server_url`, which is **before** the connector
+  config is built — and building it is what resolves the `secretRef` — so a refused deployment never
+  fetches the password from its secret store. The REST client constructors keep the same check as
+  the chokepoint for any other caller, and it is re-applied per request, so a host that did not
+  resolve at construction is judged for real once it does.
+
+  A URL the **operator** supplied — `fluid import airbyte --server-url`, or
+  `FLUID_IMPORT_AIRBYTE_URL` — is not second-guessed, since the policy exists because a *contract*
+  can choose where a credential goes. The scheme and metadata-address rules still apply there.
+
+  The variable is operator-only (`credentials/protected_env.py`): `fluid apply` hydrates the
+  environment from `.env`, `.env.<env>` and `FLUID_SECRETS_FILE`, which are committed beside the
+  contract, so without that a contract repository could grant itself the allowlist meant to
+  constrain it.
+
+  Deliberately **not** modelled on `FLUID_WEBHOOK_HOST_ALLOWLIST`,
+  `FLUID_FEDERATION_HOST_ALLOWLIST` or `FLUID_COMMAND_CENTER_HOST_ALLOWLIST` despite the matching
+  name. Those are SSRF allowlists: unset, they *permit* any public host and refuse private ones, and
+  the Command Center gate still lets a credential reach any public `https` endpoint unlisted.
+  Mirroring them would have reproduced the hole.
+
+### Upgrade notes
+
+- **A contract whose orchestrator is on a public host now fails until the operator allows it.**
+  Set `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST` in the shell, in CI, or in a
+  `FLUID_SECRETS_FILE` outside the project — **not** in a project `.env`, where it is ignored — to
+  the host or its parent domain (`connect.example.com`, or `example.com` to cover subdomains). A
+  host written with a port never matches, so leave the port off. Deployments on `localhost`,
+  `127.0.0.0/8`, `::1` or a private network need no configuration, which is the common case.
+
+### Known limitations
+
+- Two credential paths this policy does not reach, both pre-existing. An object-store URI can carry
+  its own credentials in the URI itself, which is not a `secretRef` and so is not policed; and
+  `{{ env.NAME }}` interpolation inside a contract bypasses `secretRef` entirely. Neither is changed
+  by this release.
+
 ## [0.24.0] — 2026-10-27
 
 ### Fixed

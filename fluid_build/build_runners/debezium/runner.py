@@ -46,6 +46,9 @@ from fluid_build.api.runner import (
     StreamResult,
 )
 from fluid_build.api.schema import SchemaFingerprint
+from fluid_build.build_runners._deployment_host_policy import (
+    refuse_unless_host_allowed,
+)
 
 from .._acquisition_common import (
     extract_source_schemas,
@@ -353,6 +356,13 @@ def _execute_kafka_connect(
             t_start,
             "debezium kafka-connect mode requires deployment.server_url",
         )
+
+    # Before the config is built, because building it resolves the contract's
+    # secretRef: the client constructor is the chokepoint, but it runs AFTER
+    # that, so a refused deployment would otherwise still have fetched the
+    # password from Vault/KMS -- audit entries, API calls, plaintext in memory.
+    # The constructor keeps its own check as the backstop for any other caller.
+    refuse_unless_host_allowed(server_url, engine="debezium")
     try:
         connector_class = resolve_debezium_class(
             ctx.source.kind, override=dbz_props.get("connector_class")
@@ -387,7 +397,7 @@ def _execute_kafka_connect(
     )
     if late_arrival_policy.get("enabled"):
         config.update(late_arrival_policy["connector_config"])
-    client = KafkaConnectRestClient(server_url)
+    client = KafkaConnectRestClient(server_url, engine="debezium")
     try:
         existing = client.get_connector(connector_name)
         if existing is None:

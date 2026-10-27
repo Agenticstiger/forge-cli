@@ -92,7 +92,17 @@ class AirbyteImporter(Importer):
         from fluid_build.build_runners.airbyte.runner import AirbyteRestClient
 
         token = opts.get("api_token", self.api_token)
-        client = AirbyteRestClient(url, api_token=token, timeout_seconds=self.timeout_seconds)
+        # The operator chose this URL (``--server-url`` or
+        # FLUID_IMPORT_AIRBYTE_URL), not a contract, so the
+        # deployment-host policy does not second-guess it. Reading an
+        # Airbyte workspace the operator named is the point of the
+        # command; the scheme and metadata-address rules still apply.
+        client = AirbyteRestClient(
+            url,
+            api_token=token,
+            timeout_seconds=self.timeout_seconds,
+            operator_supplied=True,
+        )
         report = ImportReport()
         try:
             sources = client.list_sources(workspace_id=source)

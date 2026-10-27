@@ -42,6 +42,10 @@ from fluid_build.api.runner import (
     StreamResult,
 )
 from fluid_build.api.schema import SchemaFingerprint
+from fluid_build.build_runners._deployment_host_policy import (
+    DeploymentHostError,
+    refuse_unless_host_allowed,
+)
 
 from .._acquisition_common import (
     extract_source_schemas,
@@ -117,19 +121,40 @@ def _find_iceberg_expose_binding(
 class KafkaConnectRestClient:
     """Minimal REST client for the Kafka Connect API."""
 
-    def __init__(self, base_url: str, *, timeout_seconds: int = 30):
-        # SSRF guard — Kafka Connect ``server_url`` comes from
-        # contract.fluid.yaml, which may be operator-supplied. Route
-        # through safe_httpx_client so a poisoned URL pointing at IMDS
-        # / RFC1918 cannot exfil connector configs (which carry DB
-        # creds). allow_private=True because Kafka Connect endpoints
-        # commonly live on private cluster networks.
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout_seconds: int = 30,
+        engine: str = "kafka-connect",
+        operator_supplied: bool = False,
+    ):
+        # Where the config may go. The connector config POSTed through this
+        # client carries the resolved source password, and ``server_url`` is
+        # named by contract.fluid.yaml, so a public host has to be one the
+        # OPERATOR named. Checked here, at construction, because that is before
+        # the runner resolves the secretRef: a refused deployment never reads
+        # the credential. ``allow_private=True`` below is what left this open —
+        # it is the right setting for a cluster-internal orchestrator and no
+        # constraint at all on a public one.
+        #
+        # ``engine`` only names the caller in the message; debezium builds this
+        # same client for its kafka-connect mode.
+        from fluid_build.build_runners._deployment_host_policy import request_guard
         from fluid_build.util.safe_http import safe_httpx_client
 
+        base_url = refuse_unless_host_allowed(
+            base_url, engine=engine, operator_supplied=operator_supplied
+        )
         self._client = safe_httpx_client(
             base_url=base_url,
             timeout=float(timeout_seconds),
             allow_private=True,
+            event_hooks={
+                "request": [
+                    request_guard(base_url, engine=engine, operator_supplied=operator_supplied)
+                ]
+            },
         )
 
     def close(self) -> None:
@@ -240,6 +265,11 @@ def _poll_connector_health(
             if state in ("RUNNING", "FAILED", "PAUSED"):
                 ok = state == "RUNNING" and not any(t.get("state") == "FAILED" for t in tasks)
                 return state, ok, traces
+        except DeploymentHostError:
+            # Not transient, and not something polling can resolve: the guard
+            # refused the host this client dials. Retrying to the deadline
+            # would swallow it and report UNKNOWN instead.
+            raise
         except Exception as exc:  # noqa: BLE001 — eventual consistency
             LOG.debug("kafka_connect.status_poll.transient name=%s err=%s", name, exc)
         time.sleep(interval)
@@ -272,6 +302,13 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     server_url = deployment.get("server_url")
     if not server_url:
         return _failed(ctx, started_at, t_start, "kafka-connect requires deployment.server_url")
+
+    # Before the config is built, because building it resolves the contract's
+    # secretRef: the client constructor is the chokepoint, but it runs AFTER
+    # that, so a refused deployment would otherwise still have fetched the
+    # password from Vault/KMS -- audit entries, API calls, plaintext in memory.
+    # The constructor keeps its own check as the backstop for any other caller.
+    refuse_unless_host_allowed(server_url, engine="kafka-connect")
 
     try:
         connector_class = resolve_source_connector(
@@ -487,6 +524,11 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
                 "late_arrival_side_output_table": late_arrival_policy.get("side_output_table"),
             },
         )
+    except DeploymentHostError:
+        # Let the typed refusal out whole: _failed(str(exc)) keeps only `what`
+        # and drops the `why` and the `fix` naming the allowlist variable,
+        # which is the whole value of the message.
+        raise
     except Exception as exc:  # noqa: BLE001
         LOG.error("kafka_connect.failed err=%s", exc, exc_info=True)
         return _failed(ctx, started_at, t_start, str(exc))
