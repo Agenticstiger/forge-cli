@@ -450,7 +450,7 @@ def test_a_refused_deployment_never_resolves_the_secret(
     while the runner binds that name in its own module namespace, so the patch
     could never have been reached.
     """
-    import fluid_build.build_runners.kafka_connect.runner as kc
+    from fluid_build.build_runners.kafka_connect import runner as kc
     from tests.build_runners.test_kafka_connect_full_matrix import _base_contract
 
     def _never(*_a: Any, **_k: Any) -> Any:
