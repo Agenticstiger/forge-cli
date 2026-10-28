@@ -81,8 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unprivileged `fluid` cannot write it, but `fluid generate ci` emits a `python:3.12-slim` job that
   runs as root, and a contract built there could have installed its own CA into that container's
   trust store. Granting a copy removes the reach, which is the part that mattered: the host store is
-  not in `allowed_paths` at all, so nothing outside this process's own temporary directory can be
-  written. It does **not** make the copy itself immutable — the mode is a speed bump. `COPY TO` with
+  not in `allowed_paths` at all, so the CA grant writes nothing outside this process's own temporary
+  directory (the connection still reaches whatever the contract declared — that is the allowlist's
+  job, unchanged here). It does **not** make the copy itself immutable — the mode is a speed bump. `COPY TO` with
   its default options writes a temporary file and renames it over the target, so 0400 stops nothing
   once the containing directory is writable by the SQL, and root ignores the mode regardless. The
   grant is therefore dropped outright when the copy would land inside a granted directory (`$TMPDIR`

@@ -1476,7 +1476,7 @@ def sandbox_refusal_hint(allow: DuckDBAllowlist, refusal: Optional[BaseException
     # dropped when the pin cannot land or the copy would be exposed -- which is
     # the safe direction for a sentence about what SQL may read.
     also = (
-        ", and a private read-only copy of the host's TLS trust store, which a remote " "read needs"
+        ", and a private copy of the host's TLS trust store, which a remote read needs"
         if _ca_bundle_for_remote(allow)
         else ""
     )
