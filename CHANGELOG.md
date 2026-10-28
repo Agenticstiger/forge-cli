@@ -7,6 +7,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-10-28
+
+### Added
+
+- **A `$ref` can name a SQL, Markdown or other text file, and becomes its text.**
+  `properties: {sql: {$ref: ./sql/transform.sql}}` and `usage: {$ref: ./docs/usage.md}` now compose.
+  A target ending in `.sql`, `.md`, `.markdown`, `.txt`, `.py`, `.scala` or `.r` (any case) is read
+  as UTF-8 text, never parsed: its BOM is dropped, CRLF line ends become LF, and it may be at most
+  5 MiB. A JSON pointer into a text file is refused. `fluid bundle` inlines the text, so a bundle
+  stays one self-contained document, and `--format tgz` hashes the file like any other fragment.
+  Before, such a ref failed with "YAML root must be an object/dict", or with a raw PyYAML error for
+  SQL holding `: `.
+
+- **A fragment may be any JSON or YAML value**, not only an object, so a port's quality rules can
+  live in a file that is the list itself: `quality: {$ref: ./fragments/quality.yaml}`. The root
+  contract and an overlay must still be objects. A file with no known suffix keeps the old rule
+  (JSON of any shape, otherwise a YAML object), so a dotfile such as `.env` never composes as a
+  string.
+
+- **Keys beside a `$ref` are merged over what it names**, as an RFC 7386 JSON Merge Patch on a copy
+  of the target (the extended `$ref` of json-schema-ref-parser): objects merge, lists and scalars
+  replace, `null` removes a key. `{$ref: ../../shared/columns.yaml#/order_id, description: Order
+  key}` reuses a shared column with one field changed. A target that is not an object cannot take
+  keys beside its `$ref`, and the error says so. Refs inside the keys resolve relative to the file
+  that holds them, and are confined like any other.
+
+- **Same-document pointers resolve.** `{$ref: "#/builds/0/properties/parameters/shared"}` names a
+  place in the **composed** contract (every fragment read and the environment's overlay merged),
+  whichever file the pointer is written in. So splitting a contract never changes what a pointer
+  names, and an overlay that changes a shared value reaches every pointer to it. RFC 6901 escapes
+  (`~0`, `~1`) decode, a pointer may go through other refs, and keys beside a pointer merge like
+  keys beside a file ref. `#foo` is not a JSON pointer and is refused; a pointer that reaches
+  itself is a cycle. A pointer that would be **merged into an object already at its place** (as a
+  key beside a file `$ref` whose target holds an object there, or as an overlay value over a base
+  object) is refused, naming the file and the place: it resolves after every merge, so its keys
+  and the object's would be mixed. Write the keys there, or name a file (`./x.yaml#/a`), which is
+  read before the merge.
+
+- **`fluid split --parts`** chooses what moves to files of its own: `sovereignty`,
+  `accessPolicy`, `builds`, `exposes` (the default, as before), `sql` (a build's `properties.sql` to
+  `sql/<build id>.sql`, or `.py` / `.scala` / `.r` by its language), `quality` and `schema` (an
+  expose's lists), `extensions` or `extensions.<name>`, and `description` (the texts to
+  `docs/<part>.md`). A part inside another is referenced from the file it ends up in.
+
+- **`ref_root` in `fluid.workspace.yaml`** widens the `$ref` root for every product under it, so
+  fragments the products share (a team, glossary terms) no longer need `FLUID_REF_ROOT` in CI, in
+  the editor and in every tool on the library:
+
+  ```yaml
+  # fluid.workspace.yaml
+  ref_root: .        # refRoot and workspace: {ref_root} are read too
+  ```
+
+  The file is found by walking up from the contract, and is read only for a contract that names
+  another file. A project file may not widen confinement past its own tree, the reason a project
+  `.env` cannot set `FLUID_REF_ROOT`, so the root is used only when it is a relative directory at
+  or below the workspace file's own, contains the contract, and passes the vetting the DuckDB
+  sandbox gives a workspace: not `/`, a home or a temp root, and not above the repository the
+  contract is in. Anything else is ignored with a WARNING, and the contract keeps its own
+  directory. Precedence: `ref_root=` > `FLUID_REF_ROOT` > the workspace > the contract's
+  directory. `FLUID_IGNORE_WORKSPACE_REF_ROOT=1` turns the setting off, and a project `.env` cannot
+  set it.
+
+- **An authoring schema editors can check fragments with.**
+  `fluid_build/schemas/fluid-authoring-schema-0.7.6.json` is the 0.7.6 schema with `{$ref: ...}`,
+  keys beside it included, accepted at every value position, wrapped the way the OpenAPI 3.1
+  meta-schema admits a Reference Object. A value that is not a `$ref` gets exactly the canonical
+  checks and messages. It is generated from the canonical schema
+  (`python -m fluid_build.schema_authoring`), and a test fails when it drifts. Its name stays out
+  of the `fluid-schema-*.json` glob that version discovery reads. The canonical schemas are
+  unchanged: every command validates the composed contract against them.
+
+- **`fluid validate --fragment KIND FILE`** checks one fragment against the schema definition it
+  stands for: `expose`, `build`, `column`, `sovereignty` or any other `$defs` name, or `quality` /
+  `schema` for an expose's lists. The version comes from `--schema-version` or from the nearest
+  `contract.fluid.yaml` above the fragment, and the errors read as the whole contract's do.
+
+- **Validation errors name the file and line they were written in:**
+  `fragments/exposes/orders.yaml:14 (exposes[0].contract.schema[1].type): 42 is not valid ...`
+  instead of a path into a document nobody wrote. A value set by an overlay names the overlay. An
+  unexpected key names the key; a missing one names the object's definition, not an overlay or
+  keys beside a `$ref` that only merged other keys into it. Errors in the root contract read as
+  before. The library answers the same question with `LoadedContract.origin_of(path)`.
+
+### Changed
+
+- **One composition for every command and the library.** `fluid validate`, `plan`, `apply`,
+  `bundle`, `generate` (`artifacts`, `standard`, `ci`, `airflow`), `docs`, the library's
+  `load_contract` and the MCP `validate_contract` and `score_contract_quality` tools now read the
+  same document: the contract's fragments, then the overlay with its own refs resolved relative to
+  the overlay file, then same-document pointers. **No `$ref` survives** anywhere, open objects
+  such as `parameters`, `labels` and `extensions` included: a ref that cannot be resolved fails the
+  command and names the file and the place it was written at. The silent fallback that re-read the
+  base contract when a `$ref` was left over is gone, and with it the dropped overlay.
+
+- **`fluid split` keeps every comment of a YAML root.** The root is spliced instead of re-dumped:
+  every byte outside a moved part is kept, and each part takes its own text, comments and block
+  scalars to its fragment. A part that is already a `$ref` is left alone, so a second run changes
+  nothing; a file that exists is never written over (two parts bound for one file name get `-2`,
+  `-3`); a JSON root stays JSON; a CRLF root keeps its line ends. Before it ends, split composes the
+  result and compares it with the original, and takes back every file it wrote if they differ; a
+  contract that does not compose here (a ref that needs `FLUID_REF_ROOT`, unset) is not split at
+  all, dry run included. A root with YAML aliases is split as data, as before, and the command says
+  its comments were not kept.
+
+- **Library API 1.2.** `LoadedContract.origin_of(path)`; `load_contract_from_text` and
+  `load_contract_from_dict` take `overlay_dir=` for the refs inside an overlay given as data;
+  `LoadedContract.overlay` and `.files` come from the composition, the overlay's fragments
+  included; `unresolved_refs` is empty for every file load, and the `contract_overlay_not_applied`
+  warning is no longer emitted, because an overlay is never dropped.
+
 ### Security
 
 - **A contract could have a product's database credential delivered to any host it named.** On the
@@ -52,6 +163,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name. Those are SSRF allowlists: unset, they *permit* any public host and refuse private ones, and
   the Command Center gate still lets a credential reach any public `https` endpoint unlisted.
   Mirroring them would have reproduced the hole.
+
+- **An overlay was read from anywhere a symlink pointed, and `--env` could name any file.** A
+  `$ref` was confined to the ref root, but the overlay file itself was not: an `overlays/` directory
+  or an `overlays/prod.yaml` linking outside the contract's tree was read and merged, so
+  `fluid bundle --env prod` printed whatever YAML the link named; and `fluid validate`, `plan` and
+  `bundle` took `--env ../../x` or `--env /abs/x` as a path, reading and merging the file it named
+  (the library already refused it). An overlay must now be a regular file inside the ref root
+  after symlinks are resolved, and `--env` a single path component, in every command; a FIFO or a
+  device in an overlay's place no longer blocks the command.
+
+- **Every file a composition reads is read with a bound.** The root contract, overlays and every
+  fragment were read whole before the 5 MiB cap applied, so a sparse file cost twice its size in
+  memory. They are now read only as regular files, never past the cap. Each target file is parsed
+  once per composition, and one composition resolves at most 10,000 refs and nests no deeper than
+  the bundle writer can write, so a small contract can no longer cost unbounded parsing (a
+  doubling chain of refs took about 70 s before the expansion cap refused it).
+
+- **A `$ref` could hang a command, or read what no contract should.** A ref to a FIFO or a device
+  (`/dev/zero`) blocked forever; a target must now be a regular file, refused before it is opened.
+  With the root widened to `/`, a ref could read `/proc/self/environ`, whose reported size of 0
+  passed every size check; `/proc`, `/sys` and `/dev` are now refused whatever the root. A
+  fragment that contains itself through a YAML alias overflowed the stack, and refs that double
+  the contract at every step (the billion laughs of `$ref`) had no bound; both are refused now,
+  the second by a cap on the composed size (1,000,000 values, 50 MiB of text) that counts every
+  copy an alias makes.
 
 ### Fixed
 
@@ -103,7 +239,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emits 8 columns and `--discover https://…/customer.csv` emits 18, on 1.5.1, 1.5.6 and 2.0.0,
   and `fluid validate` accepts the result.
 
+- **An overlay was dropped, or half applied, when a `$ref` was involved.** An overlay was merged
+  with its own refs unresolved, and the two loaders then disagreed. With the prod binding in a
+  fragment, `fluid validate --env prod` logged `overlay_applied` and passed while the library, and
+  every plugin on it, re-read the base contract and exported the **dev** topic for prod with
+  exit 0; `fluid bundle --env prod` wrote the dev topic plus a literal `$ref`. A `$ref` left
+  anywhere in the base (a same-file pointer, or one with keys beside it) dropped every overlay on
+  the library path, so a plugin could combine two different documents in one run. An overlay's
+  refs now resolve relative to the overlay file, inside the same root, and nothing falls back to
+  the base.
+
+- **A `$ref` with keys beside it, or a same-file `#/` pointer, stayed in the contract as a literal
+  key.** Its target was never read, `fluid validate` passed when the ref sat in an open object such
+  as `parameters`, and the literal `$ref` reached the runtime config a plugin rendered. A shared
+  column reused with another description failed with "'name' is a required property", which did
+  not say the reference had been ignored.
+
+- **A fragment whose root is a list could not be referenced** ("YAML root must be an
+  object/dict"), while the same list as `.json` loaded.
+
+- **`fluid docs` ignored fragments and the 0.7.x shapes.** A contract written by `fluid split`
+  listed its port as `expose-0`; every 0.7.x port showed "No schema columns defined.", because
+  columns were read from `exposes[].schema`; and a description object (`{purpose, usage}`) aborted
+  the whole run with "'dict' object has no attribute 'replace'" after truncating the page to 0
+  bytes. Contracts are now loaded composed; ports are named by `exposeId`; columns come from
+  `contract.schema` (a legacy top-level `schema` still reads); Nullable follows `required` and PII
+  follows `sensitivity`; a description object renders its purpose, usage and limitations. A
+  contract that fails to load gets an index row naming the error, and the rest of the catalog is
+  written. Two contracts with one id get a page each instead of one overwriting the other.
+  `index.json` keeps its keys and value types.
+
+- **A split contract got different artifacts from the same contract written flat.** `fluid
+  generate artifacts` without `--env` read the raw root, so a split contract failed with "FLUID
+  expose has no usable name" or exported a literal `$ref`, and `generate ci` judged
+  reference-only builds and engines from the raw root too. A split contract now gets
+  byte-identical artifacts to the flat one, with or without `--env`; a contract with no `$ref` is
+  read exactly as before.
+
+- **`fluid split` could lose data and break the contract it split.** It wrote YAML into a `.json`
+  root, overwrote one fragment with another when two ids made the same file name, and on a second
+  run wrapped its own `$ref`s into new fragments until the contract no longer loaded. It also
+  dropped every comment of the root. See **Changed** for what it does now.
+
+- **Two readers in validate and apply still read the root as written.** The composition rule
+  (an ADP or CDP may not consume what its type forbids) read each upstream's `productType` from its
+  raw root, so an upstream whose metadata lives in a fragment passed unchecked; and apply's ADP
+  auto-replay found downstream products from their raw `consumes[]`, so one whose consumes live in
+  a fragment got no replay marker when its upstream rewound. Both now read composed contracts,
+  skipping one that does not compose.
+
+- **The bundle's YAML turned a next-line character into a space.** Text holding U+0085 was kept
+  exactly by the loader and the JSON bundle, but `fluid bundle` and the tgz's
+  `contract.resolved.yaml` wrote it bare, and YAML readers fold that into a space, so
+  `fluid plan bundle.tgz` planned different SQL than `fluid plan contract`. Such a string is now
+  written escaped.
+
+- **Naming the line of n errors in one mapping took n² time**, for every contract: 40,000
+  invalid values took 38 s. A mapping's keys are now indexed once per report.
+
+- **A workspace `ref_root` the file system could not stat crashed the load** with a bare
+  `OSError`, and an unreadable `fluid.workspace.yaml` was ignored without a word. Both are now
+  ignored with a warning, and the escape error says the workspace root was ignored and why.
+
+- **The MCP `validate_contract` tool read a contract raw.** A fragment-first contract reached it
+  with `{$ref: ...}` where its builds and exposes are, so it reported errors `fluid validate` does
+  not, and an empty file validated nothing. The `contract_path` form of `validate_contract`,
+  `score_contract_quality` and `enrich_contract_suggestions` now composes the contract like every
+  command, fragments confined to the contract's directory unless widened.
+
 ### Upgrade notes
+
+- **A `$ref` that 0.24.0 left in the contract now composes or fails.** A `$ref` with keys beside
+  it, a same-file `#/` pointer, or a ref inside an overlay used to stay a literal key (and, on the
+  library path, drop the overlay). It now resolves, and one that cannot be resolved fails every
+  command, naming the file and the place. A contract that embeds a document carrying its own
+  `$ref` keys (a JSON Schema or OpenAPI fragment inside `parameters` or an extension) now fails,
+  because every `$ref` key is read as a contract reference; keep such a payload as a string.
+
+- **Contracts that use the new forms need 0.25.0.** Text refs, list-root fragments, keys beside a
+  `$ref`, pointers, refs inside overlays and a workspace `ref_root` fail on 0.24.0, or load
+  differently there (a `$ref` with keys beside it inside `parameters` passed 0.24.0 as a literal
+  key). Pin `data-product-forge>=0.25.0` wherever such contracts are validated or planned. The
+  default `fluid split` output stays readable by 0.24.0: verified on every shipped example.
+
+- **Overlays are held to the ref root, and `--env` names an environment.** An `overlays/` directory
+  or overlay file that links outside the contract's tree is refused; widen the root
+  (`ref_root` in `fluid.workspace.yaml`, or `FLUID_REF_ROOT`) to share one. `--env ../x` or
+  `--env /abs/x` is refused by every command.
+
+- **`fluid split` writes a different root than 0.24.0 did**: it keeps the root's text and comments
+  instead of re-dumping it; the fragments are the same.
 
 - **A contract whose orchestrator is on a public host now fails until the operator allows it.**
   Set `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST` in the shell, in CI, or in a
@@ -113,6 +338,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `127.0.0.0/8`, `::1` or a private network need no configuration, which is the common case.
 
 ### Known limitations
+
+- **`fluid contract digest` and the federation `upstreamDigest` still hash the root file as
+  written**, so an edit inside a fragment does not change them; `LoadedContract.digest` covers
+  the composed contract. Changing it changes existing pins, so it waits for a decision.
+- **Some read-only views still read the root file as written** and so do not see what fragments
+  hold: `fluid status`, `fluid stats`, the forge welcome scan, `viz-graph`'s workspace view, the
+  workspace product listing, the copilot's contract tools and `forge --refine`.
+- **`fluid split` does not rebase a relative `$ref` inside a part it moves**; it refuses such a
+  split, changing nothing, instead of writing a fragment whose ref no longer resolves.
+- **Left as they were:** `file.yaml#key` without the leading `/` is accepted, as 0.24.0 accepted
+  it; two `$ref` keys in one mapping keep the last, as YAML does; a file with a text-like suffix
+  not in the list above (`.hql`, `.ddl`, `.j2`) is read as YAML or JSON, not as text.
 
 - Two credential paths this policy does not reach, both pre-existing. An object-store URI can carry
   its own credentials in the URI itself, which is not a `secretRef` and so is not policed; and
