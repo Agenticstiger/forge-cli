@@ -35,8 +35,10 @@ DuckDB docs give ("Securing DuckDB", introduced in 1.2):
 4. ``temp_directory`` (a directory this helper creates and owns, see below),
    ``home_directory`` (pinned to ``$HOME``, see below), then
    ``allowed_directories`` and ``allowed_paths``: what the call site declares
-   it reads or writes, plus -- only when it declared a remote prefix -- the one
-   host CA bundle file DuckDB's TLS needs (:func:`_ca_bundle_for_remote`);
+   it reads or writes, plus -- only when it declared a remote prefix, and only
+   when the pin below lands -- a private copy of the host CA bundle DuckDB's TLS
+   needs (:func:`_private_ca_bundle`), with ``ca_cert_file`` pinned to that copy
+   (``SET GLOBAL``, so a ``con.cursor()`` inherits it);
 5. ``enable_external_access = false``;
 6. ``lock_configuration = true``, so the SQL cannot ``SET`` any of it back,
    then a read-back that the grants are the ones the call site asked for.
@@ -70,6 +72,14 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
   ``ca_cert_file`` pinned to it so DuckDB opens that copy and not its own probe
   result. Granting the store itself was the first version of this and it let
   contract SQL replace the host trust store wherever the process can write it.
+  The copy's mode is a speed bump, not the barrier: measured, ``COPY TO`` with
+  its default options writes a temporary file and renames it over the target, so
+  0400 stops nothing once the containing DIRECTORY is writable by the SQL --
+  which is why the grant is dropped outright when the copy would land inside a
+  granted directory (``$TMPDIR`` pointed into the workspace, an ordinary CI or
+  direnv setup). The barrier that holds is that the host store is never granted;
+  the worst an attacker-chosen copy buys is the trust anchors of one connection
+  whose remote locations the contract named anyway.
   No verification setting is touched: an expired and a self-signed certificate
   are refused on 1.5.6 and 2.0.0 alike, with and without
   ``enable_server_cert_verification``, which governs the httplib client while
@@ -182,6 +192,7 @@ References:
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import shutil
@@ -209,6 +220,8 @@ from fluid_build._errors import FluidUserError, doc_url
 
 from ._duckdb_compat import storage_compat_config
 from ._sql_safety import quote_ansi_string_literal, validate_ident
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import duckdb
@@ -1104,22 +1117,60 @@ def _private_ca_bundle(bundle: str) -> str:
     fix, which granted the store itself.
 
     So the store is never granted. The connection reads a copy that belongs to
-    it: 0400 so an unprivileged write is refused by the OS as well as by the
-    allowlist, under :func:`tempfile.mkdtemp`'s 0700 directory outside the
-    contract's tree, removed when the connection is gone. Root can still
-    overwrite the copy, and that is the whole point of the copy -- the damage
-    stops at one connection's own TLS trust, whose remote locations the contract
-    chose anyway, and no state outside the process is touched.
+    it, under :func:`tempfile.mkdtemp`'s 0700 directory, removed when the
+    connection object is finalised.
+
+    What the 0400 is worth, stated exactly: it refuses an unprivileged write
+    through a plain open, and nothing more. The allowlist does NOT refuse a
+    write to this path -- it is in ``allowed_paths``, which is the premise of
+    this whole function -- and measured, ``COPY TO`` with its default options
+    writes a temporary file and renames it over the target, so the mode is
+    bypassed as soon as the containing directory is writable by the SQL. The
+    caller therefore drops the grant entirely when the directory would sit
+    inside a granted one (:func:`_ca_dir_within_a_grant`), and root bypasses the
+    mode in any case.
+
+    The guarantee that does hold is the one that matters: the host store is not
+    in ``allowed_paths``, so nothing outside this process's own temporary
+    directory can be reached. An attacker who does replace the copy chooses the
+    trust anchors of one connection, over remote locations the contract named
+    anyway, and the file is gone when that connection is.
 
     The cost is one ~330 KB file copy per connection that declared a remote
     prefix, which is why :func:`_ca_bundle_for_remote` returns ``None`` for
     every other connection.
     """
     directory = tempfile.mkdtemp(prefix=CA_DIR_PREFIX)
-    copy = os.path.join(directory, "ca-bundle.pem")
-    shutil.copyfile(bundle, copy)
-    os.chmod(copy, 0o400)
+    try:
+        copy = os.path.join(directory, "ca-bundle.pem")
+        shutil.copyfile(bundle, copy)
+        os.chmod(copy, 0o400)
+    except BaseException:
+        # The caller registers the remover only once this returns, so a failure
+        # here -- ENOSPC, an I/O error, or the candidate disappearing between
+        # the isfile probe and the copy -- would leak the directory for good.
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
     return copy
+
+
+def _ca_dir_within_a_grant(directory: str, allow: DuckDBAllowlist) -> Optional[str]:
+    """The granted directory ``directory`` sits inside, or ``None``.
+
+    ``tempfile.mkdtemp`` honours ``$TMPDIR``, and a workspace-local ``$TMPDIR``
+    is an ordinary CI, direnv or Nix arrangement. Where it points inside a
+    directory this connection grants, the copy is writable by the SQL whatever
+    its mode: measured, ``COPY TO`` with default options renamed a new file over
+    the 0400 copy on 1.5.6 and 2.0.0, turning 333 KB of trust anchors into 14
+    bytes. Granting a trust store the SQL can replace is worse than granting
+    none, so the caller grants none.
+    """
+    real = _fold(os.path.realpath(directory))
+    for granted in allow.dirs:
+        root = _fold(os.path.realpath(granted))
+        if _is_within(real, root):
+            return root
+    return None
 
 
 def _refuse_ungranted_dirs(con: Any, allow: DuckDBAllowlist, spill: str) -> None:
@@ -1314,16 +1365,38 @@ def _confine_connection(
     host_bundle = _ca_bundle_for_remote(allow)
     if host_bundle is not None:
         private = _private_ca_bundle(host_bundle)
-        spill_cleanup.append(
-            weakref.finalize(con, shutil.rmtree, os.path.dirname(private), ignore_errors=True)
-        )
-        paths.append(private)
-        try:
-            con.execute(f"SET ca_cert_file = {quote_ansi_string_literal(private)}")
-        except duckdb.Error:
-            # httpfs is not loaded on this connection, so the setting does not
-            # exist and no TLS will happen either. Nothing to point at.
-            pass
+        directory = os.path.dirname(private)
+        exposed = _ca_dir_within_a_grant(directory, allow)
+        if exposed is not None:
+            # Writable by the SQL whatever the mode, so worse than no grant.
+            shutil.rmtree(directory, ignore_errors=True)
+            _log.warning(
+                "duckdb_ca_bundle_grant_skipped: the temporary directory would sit inside "
+                "the granted directory %s, where contract SQL could replace the trust "
+                "store this connection reads. A remote read may fail on DuckDB 2.0 with "
+                "'Cannot read a CA certificate bundle'; point TMPDIR outside the granted "
+                "tree to restore it.",
+                exposed,
+            )
+        else:
+            try:
+                # GLOBAL, not the session default: ca_cert_file is a LOCAL-scope
+                # setting, so a session-scoped pin leaves con.cursor() with ''
+                # and its remote reads failing on 2.0.0 (measured). The lock
+                # still refuses a change afterwards, GLOBAL or not.
+                con.execute(f"SET GLOBAL ca_cert_file = {quote_ansi_string_literal(private)}")
+            except duckdb.Error:
+                # httpfs is not loaded, so the setting is not in the catalog and
+                # DuckDB will never open this copy. Granting it would leave a
+                # writable file in allowed_paths for a benefit that cannot
+                # exist -- the azure extension takes exactly this path, and its
+                # own TLS does not read the bundle from here.
+                shutil.rmtree(directory, ignore_errors=True)
+            else:
+                spill_cleanup.append(
+                    weakref.finalize(con, shutil.rmtree, directory, ignore_errors=True)
+                )
+                paths.append(private)
     con.execute(f"SET allowed_paths = {_sql_list(paths)}")
     con.execute("SET enable_external_access = false")
     con.execute("SET lock_configuration = true")
@@ -1399,7 +1472,9 @@ def sandbox_refusal_hint(allow: DuckDBAllowlist, refusal: Optional[BaseException
     # Named without its path: what SQL can read is the private copy
     # :func:`_private_ca_bundle` made for this connection, not the host store
     # this returns, and printing the store would point the reader at a file the
-    # SQL was in fact refused.
+    # SQL was in fact refused. It can overstate by one line -- the grant is
+    # dropped when the pin cannot land or the copy would be exposed -- which is
+    # the safe direction for a sentence about what SQL may read.
     also = (
         ", and a private read-only copy of the host's TLS trust store, which a remote " "read needs"
         if _ca_bundle_for_remote(allow)

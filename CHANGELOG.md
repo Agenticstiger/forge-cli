@@ -65,9 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entirely.
 
   The sandbox now takes the first CA bundle that exists out of the five DuckDB probes and grants a
-  **private, read-only copy** of it — one file in `allowed_paths`, mode 0400 in a 0700 directory
-  the connection owns, with `ca_cert_file` pinned to it and the copy removed on teardown — and only
-  when the allowlist carries a remote prefix. A local read gains nothing, `allowed_directories` is
+  **private copy** of it — one file in `allowed_paths`, mode 0400 in a 0700 directory the connection
+  owns, with `ca_cert_file` pinned to it (`SET GLOBAL`, so a `con.cursor()` inherits the pin) and
+  the copy removed when the connection object is finalised — and only when the allowlist carries a
+  remote prefix AND that pin lands. A local read gains nothing, `allowed_directories` is
   untouched (so what a remote prefix grants locally is unchanged), and the allowlist object is not
   widened. On a host with none of the five (a minimal container, Windows) nothing is granted and
   DuckDB's own refusal, which names the paths it looked for, is left to speak.
@@ -79,8 +80,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still refused. Only file ownership stood in the way: `/etc/ssl/cert.pem` is root-owned, so an
   unprivileged `fluid` cannot write it, but `fluid generate ci` emits a `python:3.12-slim` job that
   runs as root, and a contract built there could have installed its own CA into that container's
-  trust store. Granting a copy removes the capability: the store is not in `allowed_paths` at all,
-  and the copy's mode refuses an unprivileged write as well.
+  trust store. Granting a copy removes the reach, which is the part that mattered: the host store is
+  not in `allowed_paths` at all, so nothing outside this process's own temporary directory can be
+  written. It does **not** make the copy itself immutable — the mode is a speed bump. `COPY TO` with
+  its default options writes a temporary file and renames it over the target, so 0400 stops nothing
+  once the containing directory is writable by the SQL, and root ignores the mode regardless. The
+  grant is therefore dropped outright when the copy would land inside a granted directory (`$TMPDIR`
+  pointed into the workspace — an ordinary CI, direnv or Nix arrangement), and dropped when the
+  `ca_cert_file` pin cannot land, which is every connection that loaded no httpfs. What an attacker
+  who replaces the copy gets is the trust anchors of one connection, over remote locations the
+  contract named anyway, on a file that is gone when that connection is.
 
   Certificate verification is untouched and stays on: an expired and a self-signed certificate are
   refused on 1.5.6 and 2.0.0 alike, with and without `enable_server_cert_verification` — that

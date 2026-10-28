@@ -46,41 +46,53 @@ reads ``allow`` as the declared-inputs list is unaffected -- while the refusal
 hint does disclose that a copy of the trust store is readable, because telling
 the user otherwise would be false.
 
-Every test here but one is offline, and that one
-(``test_the_candidate_list_matches_the_one_duckdb_names``) needs httpfs, so it
-skips when the extension cannot be installed, as its sibling in
-``test_duckdb_sandbox.py`` does. The real network proof is the CLI run in the PR
-description; what CI can check without a network is the read-back, and on 2.0.0
+Nothing here reads a remote location, but the tests that assert a GRANT do load
+httpfs -- the grant is gated on the ``ca_cert_file`` pin, and that setting lives
+in the extension -- so they go through :func:`_granting_connection`, which skips
+when httpfs cannot be installed, as ``test_duckdb_sandbox.py`` does. On a cold
+machine that is a ~19 MB download, once. The tests that assert NO grant need no
+extension at all. The real network proof is the CLI run in the PR description;
+what CI can check without reading anything remote is the read-back, and on 2.0.0
 the refusal itself, which arrives before any connection is attempted.
 
 Each mechanism was reverted on duckdb 2.0.0 and the failures recorded, not
-predicted:
+predicted. Re-measured against this file's 20 tests whenever a test was added,
+because a table that drifts teaches a maintainer to distrust the count:
 
-===================================  ====================================
-reverted                             tests that fail
-===================================  ====================================
-the probe returns ``None``           8
-the probe returns the directory      9
-the remote-prefix guard is dropped   2 (both local-read tests)
-the copy is replaced by the store    4
-``chmod 0400`` is dropped            2
-the ``ca_cert_file`` pin is dropped  1 -- AND a live ``s3://`` read on
-                                     2.0.0 fails with the original
-                                     ``Cannot read a CA certificate
-                                     bundle``, which is what makes the pin
-                                     load-bearing rather than belt-and-braces
-the cleanup finalize is dropped      1
-===================================  ====================================
+=====================================  ==============
+reverted                               tests that fail
+=====================================  ==============
+the probe returns ``None``             11
+the probe returns the directory        13
+the remote-prefix guard is dropped     1
+the copy is replaced by the store      7
+``chmod 0400`` is dropped              2
+the ``ca_cert_file`` pin is dropped    3
+the pin is session-scoped, not GLOBAL  1
+the exposed-directory check is dropped 1
+the grant is kept when the pin fails   1
+the cleanup finalize is dropped        1
+a failed copy is not cleaned up        1
+=====================================  ==============
 
-Two of those were worth the trouble of checking. Returning the bundle's
-directory did NOT fail ``test_the_grant_is_one_file_and_not_a_directory`` until
-that test was made to check the granted entry itself -- a directory handed to
+Dropping the remote-prefix guard fails only ONE test now, where it used to fail
+two: the grant is gated on the pin as well, so a local connection (which loads
+no httpfs) gets nothing even with the guard gone, and
+``test_a_local_refusal_hint_says_nothing_about_a_trust_store`` is what catches
+it. Two mechanisms covering one mistake is the point; the count moving is not a
+regression.
+
+Three rows were worth the trouble of checking. Returning the bundle's directory
+did NOT fail ``test_the_grant_is_one_file_and_not_a_directory`` until that test
+was made to check the granted entry itself -- a directory handed to
 ``allowed_paths`` never reaches ``allowed_directories``, so reading the latter
-back could not see it. And granting the host store did NOT fail the write test
-until it asserted the store's absence from ``allowed_paths``: the ``COPY`` is
-refused on a developer machine either way, because ``/etc/ssl/cert.pem`` is
-root-owned. In the root container the threat model is about, it would not have
-been refused at all.
+back could not see it. Granting the host store did NOT fail the write test until
+it asserted the store's absence from ``allowed_paths``: the ``COPY`` is refused
+on a developer machine either way, because ``/etc/ssl/cert.pem`` is root-owned,
+and in the root container the threat model is about it would not have been
+refused at all. And the pin being session-scoped instead of GLOBAL fails exactly
+one test, ``test_a_cursor_inherits_the_pin``, which exists because nothing else
+in the file would have noticed.
 """
 
 from __future__ import annotations
@@ -90,6 +102,7 @@ import os
 import posixpath
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, List
 
@@ -134,6 +147,27 @@ def _granted_paths(con: Any) -> List[str]:
     return [sandbox._fold(os.path.realpath(p)) for p in _setting(con, "allowed_paths")]
 
 
+def _granting_connection(allow: DuckDBAllowlist) -> Any:
+    """A sandboxed connection that actually carries the CA grant.
+
+    The grant is gated on the ``ca_cert_file`` pin landing, and that setting
+    only exists once httpfs is loaded -- so a connection without the extension
+    gets no copy at all, deliberately (there is no TLS for it to serve). Every
+    test that asserts a grant therefore loads httpfs, and skips where the
+    extension cannot be installed, as ``test_duckdb_sandbox.py`` does.
+    """
+    try:
+        return secure_duckdb_connect(":memory:", allow=allow, extensions=["httpfs"])
+    except duckdb.Error:
+        pytest.skip("httpfs is not installable here (offline)")
+
+
+def _ca_directories() -> List[str]:
+    """The CA copy directories currently in $TMPDIR."""
+    root = tempfile.gettempdir()
+    return [d for d in os.listdir(root) if d.startswith(sandbox.CA_DIR_PREFIX)]
+
+
 def _host_bundle() -> str:
     """The candidate this host actually has, or skip."""
     for candidate in sandbox._CA_BUNDLE_CANDIDATES:
@@ -154,7 +188,7 @@ def test_a_declared_remote_prefix_grants_one_private_copy_of_the_bundle() -> Non
     """
     bundle = _host_bundle()
 
-    con = secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none().with_locations(REMOTE))
+    con = _granting_connection(DuckDBAllowlist.none().with_locations(REMOTE))
     try:
         granted = _granted_paths(con)
         assert len(granted) == 1, granted
@@ -183,14 +217,7 @@ def test_duckdb_is_pinned_at_the_copy() -> None:
     """
     _host_bundle()
 
-    try:
-        con = secure_duckdb_connect(
-            ":memory:",
-            allow=DuckDBAllowlist.none().with_locations(REMOTE),
-            extensions=["httpfs"],
-        )
-    except duckdb.Error:
-        pytest.skip("httpfs is not installable here (offline)")
+    con = _granting_connection(DuckDBAllowlist.none().with_locations(REMOTE))
     try:
         # Both sides through the same fold: _granted_paths() case-folds the way
         # the sandbox does, and the raw setting does not.
@@ -212,7 +239,7 @@ def test_duckdb_can_read_the_copy_it_was_granted_and_not_the_host_store() -> Non
     """
     bundle = _host_bundle()
 
-    con = secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none().with_locations(REMOTE))
+    con = _granting_connection(DuckDBAllowlist.none().with_locations(REMOTE))
     try:
         copy = _granted_paths(con)[0]
         assert con.execute(f"SELECT count(*) FROM read_text('{copy}')").fetchall()[0][0] == 1
@@ -246,7 +273,7 @@ def test_the_granted_copy_cannot_be_written_and_the_host_store_is_not_granted() 
     with open(bundle, "rb") as host:
         before = host.read()
 
-    con = secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none().with_locations(REMOTE))
+    con = _granting_connection(DuckDBAllowlist.none().with_locations(REMOTE))
     try:
         copy = _granted_paths(con)[0]
         # The barrier that does not depend on who we are. Asserted because the
@@ -279,11 +306,17 @@ def test_the_granted_copy_cannot_be_written_and_the_host_store_is_not_granted() 
 def test_the_copy_is_removed_once_the_connection_is_gone() -> None:
     """One ~330 KB file per remote connection, not a leak in $TMPDIR.
 
-    The same ``weakref.finalize`` teardown the spill directory uses.
+    The same ``weakref.finalize`` teardown the spill directory uses, with the
+    same limits, measured: ``con.close()`` ALONE does not remove it, because the
+    finalizer is keyed on the connection object, so a caller holding a closed
+    connection (a cached handle, or a traceback pinning the frame) keeps the
+    copy until that reference goes. An unclosed connection is cleaned at normal
+    interpreter exit; ``os._exit`` or a kill leaves it for ``$TMPDIR``'s reaper,
+    exactly as the spill directory documents.
     """
     _host_bundle()
 
-    con = secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none().with_locations(REMOTE))
+    con = _granting_connection(DuckDBAllowlist.none().with_locations(REMOTE))
     directory = os.path.dirname(_granted_paths(con)[0])
     assert os.path.isdir(directory)
 
@@ -330,7 +363,7 @@ def test_a_declared_file_and_the_ca_copy_both_reach_allowed_paths(tmp_path: Path
     declared.write_text("a,b\n1,2\n", encoding="utf-8")
     allow = DuckDBAllowlist.none().with_paths(str(declared)).with_remote(REMOTE_PREFIX)
 
-    con = secure_duckdb_connect(":memory:", allow=allow)
+    con = _granting_connection(allow)
     try:
         granted = _granted_paths(con)
         assert len(granted) == 2, granted
@@ -349,7 +382,7 @@ def test_the_grant_is_one_file_and_not_a_directory() -> None:
     _host_bundle()
     allow = DuckDBAllowlist.none().with_locations(REMOTE)
 
-    con = secure_duckdb_connect(":memory:", allow=allow)
+    con = _granting_connection(allow)
     try:
         # Each granted path is a FILE. Asserted on the entry itself and not
         # only on ``allowed_directories``: a directory handed to
@@ -384,7 +417,7 @@ def test_the_allowlist_the_caller_passed_is_not_widened() -> None:
     bundle = _host_bundle()
     allow = DuckDBAllowlist.none().with_locations(REMOTE)
 
-    con = secure_duckdb_connect(":memory:", allow=allow)
+    con = _granting_connection(allow)
     try:
         assert allow.paths == ()
         hint = sandbox_refusal_hint(allow)
@@ -456,6 +489,98 @@ def test_a_candidate_that_is_not_a_file_is_skipped(
 
     allow = DuckDBAllowlist.none().with_locations(REMOTE)
     assert sandbox._ca_bundle_for_remote(allow) == str(real)
+
+
+def test_a_connection_without_httpfs_gets_no_grant_and_leaves_nothing(tmp_path: Path) -> None:
+    """No pin, no grant -- and no copy left on disk either.
+
+    ``ca_cert_file`` is an httpfs setting, so on a connection that did not load
+    the extension the pin cannot land and DuckDB will never open the copy.
+    Granting it anyway would put a writable file in ``allowed_paths`` for a
+    benefit that cannot exist. The azure extension takes exactly this path
+    (``cli/discover/filesystem.py`` loads ``azure``, not ``httpfs``, for an
+    ``azure://`` URL), which is how the review found it.
+    """
+    before = len(_ca_directories())
+
+    con = secure_duckdb_connect(":memory:", allow=DuckDBAllowlist.none().with_locations(REMOTE))
+    try:
+        assert _granted_paths(con) == []
+        assert len(_ca_directories()) == before
+    finally:
+        con.close()
+
+
+def test_a_tmpdir_inside_a_granted_directory_gets_no_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A trust store the SQL could replace is worse than no trust store.
+
+    ``tempfile.mkdtemp`` honours ``$TMPDIR``, and a workspace-local ``$TMPDIR``
+    is an ordinary CI, direnv or Nix arrangement. Measured there: ``COPY TO``
+    with its DEFAULT options writes a temporary file and renames it over the
+    target, so the copy's 0400 stops nothing once its directory is writable by
+    the SQL -- 333 KB of trust anchors became 14 bytes on 1.5.6 and 2.0.0. The
+    grant is dropped instead, loudly, and nothing is left behind.
+    """
+    _host_bundle()
+    granted_dir = tmp_path / "workspace"
+    (granted_dir / ".tmp").mkdir(parents=True)
+    monkeypatch.setenv("TMPDIR", str(granted_dir / ".tmp") + os.sep)
+    monkeypatch.setattr("tempfile.tempdir", None)
+    allow = DuckDBAllowlist.none().with_dirs(str(granted_dir)).with_remote(REMOTE_PREFIX)
+
+    with caplog.at_level("WARNING"):
+        con = secure_duckdb_connect(":memory:", allow=allow, extensions=["httpfs"])
+    try:
+        assert _granted_paths(con) == []
+        assert not list((granted_dir / ".tmp").glob(sandbox.CA_DIR_PREFIX + "*"))
+        assert "duckdb_ca_bundle_grant_skipped" in caplog.text
+    finally:
+        con.close()
+
+
+def test_a_failed_copy_leaves_no_directory_behind(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The remover is registered by the caller, so the copy has to clean up itself.
+
+    ``mkdtemp`` runs first and the ``weakref.finalize`` only once
+    :func:`_private_ca_bundle` has returned, so a failure in between -- ENOSPC,
+    an I/O error, or the candidate disappearing between the ``isfile`` probe and
+    the copy -- used to leak the directory for the lifetime of ``$TMPDIR``.
+    """
+    bundle = _host_bundle()
+    before = len(_ca_directories())
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(sandbox.shutil, "copyfile", _boom)
+
+    with pytest.raises(OSError):
+        sandbox._private_ca_bundle(bundle)
+
+    assert len(_ca_directories()) == before
+
+
+def test_a_cursor_inherits_the_pin(tmp_path: Path) -> None:
+    """``ca_cert_file`` is LOCAL scope, so the pin has to be GLOBAL.
+
+    Measured with a session-scoped ``SET``: ``con.cursor()`` reported
+    ``ca_cert_file = ''`` and its remote read failed on 2.0.0 with the original
+    ``Cannot read a CA certificate bundle`` -- ``allowed_paths`` is GLOBAL so
+    the cursor saw the copy, but nothing pointed DuckDB at it, and the
+    configuration is locked so no caller could set it either.
+    """
+    _host_bundle()
+
+    con = _granting_connection(DuckDBAllowlist.none().with_locations(REMOTE))
+    try:
+        copy = _granted_paths(con)[0]
+        cursor = con.cursor()
+        pinned = sandbox._fold(os.path.realpath(_setting(cursor, "ca_cert_file")))
+        assert pinned == copy
+    finally:
+        con.close()
 
 
 def test_a_host_with_no_candidate_grants_nothing(
