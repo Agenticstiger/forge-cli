@@ -43,6 +43,7 @@ from fluid_build.contract_refs import (
     Origin,
     RefBudget,
     _is_system_path,
+    find_ref_node,
     is_pointer_node,
     is_ref_node,
     parse_ref,
@@ -1617,6 +1618,33 @@ def note_missing_overlay(
             "declared_in_environments_block": in_block,
         },
     )
+
+
+def load_contract_fields(path: Union[str, Path], *fields: str) -> Dict[str, Any]:
+    """The contract at ``path``, composed only when a value the caller reads needs it.
+
+    For a reader that scans many contracts for a few values (the composition
+    rule's product index, apply's replay walk): ``fields`` are dotted paths
+    (``metadata.productType``). The root is parsed, and the contract composed
+    only when one of those values, or an object above it, is a ``$ref``, so a
+    tree of contracts costs what parsing it does. Other parts are left as
+    written. Raises as :func:`load_contract` does.
+    """
+    raw = _parse_file(Path(path))
+    if any(_ref_along(raw, field.split(".")) for field in fields):
+        return load_contract(path)
+    return raw
+
+
+def _ref_along(node: Any, keys: List[str]) -> bool:
+    """True when the value at ``keys`` under ``node``, or an object above it, holds a ``$ref``."""
+    for key in keys:
+        if is_ref_node(node):
+            return True
+        if not isinstance(node, dict):
+            return False
+        node = node.get(key)
+    return find_ref_node(node) is not None
 
 
 def load_contract(

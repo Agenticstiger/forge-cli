@@ -580,10 +580,10 @@ def _index_entry(candidate: Path) -> Optional[Tuple[str, Optional[str]]]:
     code is ``None`` when it names neither a ``productType`` nor a ``layer``
     that maps to one.
     """
-    from fluid_build.loader import load_contract
+    from fluid_build.loader import load_contract_fields
 
     try:
-        data = load_contract(candidate)
+        data = load_contract_fields(candidate, "id", "metadata.productType", "metadata.layer")
         pid = data.get("id")
         if not pid:
             return None

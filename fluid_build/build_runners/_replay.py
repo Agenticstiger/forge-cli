@@ -126,12 +126,12 @@ def find_downstream_products(
     a ref that does not resolve) do NOT abort the walk — broken
     contracts get logged + skipped.
     """
-    from fluid_build.loader import load_contract
+    from fluid_build.loader import load_contract_fields
 
     matches: List[Dict[str, Any]] = []
     for path in sorted(workspace_root.rglob("*.fluid.yaml")):
         try:
-            contract = load_contract(path)
+            contract = load_contract_fields(path, "id", "consumes")
         except Exception as exc:  # noqa: BLE001 - one broken contract must not stop the walk
             LOG.debug("downstream_walk_skip: path=%s error=%s", path, exc)
             continue

@@ -221,13 +221,13 @@ def test_build_index_parses_each_file_once(tmp_path, monkeypatch):
     _write_contract(tmp_path / "sub" / "p2.fluid.yaml", product_id="p2", product_type="ADP")
 
     parsed: list[str] = []
-    real_loader = loader.load_contract
+    real_loader = loader.load_contract_fields
 
-    def _counting_loader(path, **kwargs):
+    def _counting_loader(path, *fields):
         parsed.append(str(path))
-        return real_loader(path, **kwargs)
+        return real_loader(path, *fields)
 
-    monkeypatch.setattr(loader, "load_contract", _counting_loader)
+    monkeypatch.setattr(loader, "load_contract_fields", _counting_loader)
 
     # Overlapping roots: ``tmp_path`` already covers ``tmp_path/sub``.
     index = _build_product_type_index([tmp_path, tmp_path / "sub", tmp_path], None)
@@ -377,13 +377,13 @@ def test_each_fluid_file_parsed_once_for_many_consumes(tmp_path, monkeypatch):
     contract = yaml.safe_load(target.read_text(encoding="utf-8"))
 
     parse_count = {"n": 0}
-    real_loader = loader.load_contract
+    real_loader = loader.load_contract_fields
 
-    def _counting_loader(path, **kwargs):
+    def _counting_loader(path, *fields):
         parse_count["n"] += 1
-        return real_loader(path, **kwargs)
+        return real_loader(path, *fields)
 
-    monkeypatch.setattr(loader, "load_contract", _counting_loader)
+    monkeypatch.setattr(loader, "load_contract_fields", _counting_loader)
     validate_composition_for_contract(contract, workspace_root=tmp_path, contract_path=target)
     # 10 files on disk (9 upstreams + target, target skipped as self) →
     # at most 10 loads total, NOT 10 * 9.
