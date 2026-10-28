@@ -245,7 +245,7 @@ def _call_tool(
         if arguments.get("logical_path"):
             logical = _load_logical_draft(Path(arguments["logical_path"]))
         if arguments.get("contract_path"):
-            contract = yaml.safe_load(Path(arguments["contract_path"]).read_text(encoding="utf-8"))
+            contract = _contract_file(arguments["contract_path"])
         return validator.validate(logical=logical, contract=contract).model_dump(
             mode="json", by_alias=True
         )
@@ -430,6 +430,21 @@ def _call_tool(
     raise RuntimeError(f"Unknown tool {name}")
 
 
+def _contract_file(path_arg: str) -> Dict[str, Any]:
+    """The contract at ``path_arg`` as ``fluid validate`` sees it: composed.
+
+    Read raw, a contract kept in fragments holds ``{$ref: ...}`` where its
+    builds and exposes are. The fragments are confined the way every command
+    confines them (the contract's directory, unless widened).
+    """
+    from fluid_build.loader import load_contract
+
+    loaded = load_contract(Path(path_arg))
+    if not isinstance(loaded, dict):
+        raise RuntimeError(f"Contract at {path_arg!r} did not parse to a dict")
+    return loaded
+
+
 def _resolve_contract_argument(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Accept either ``contract_path`` (filesystem) or ``contract`` (inline dict).
 
@@ -441,11 +456,7 @@ def _resolve_contract_argument(arguments: Dict[str, Any]) -> Dict[str, Any]:
     path_arg = arguments.get("contract_path")
     inline = arguments.get("contract")
     if path_arg:
-        text = Path(path_arg).read_text(encoding="utf-8")
-        loaded = yaml.safe_load(text) or {}
-        if not isinstance(loaded, dict):
-            raise RuntimeError(f"Contract at {path_arg!r} did not parse to a dict")
-        return loaded
+        return _contract_file(path_arg)
     if inline is not None:
         if not isinstance(inline, dict):
             raise RuntimeError("'contract' argument must be a dict")

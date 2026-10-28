@@ -121,6 +121,19 @@ def test_resolve_contract_path_wins_over_inline(tmp_path: Path):
     assert contract["id"] == "from-path"
 
 
+def test_resolve_contract_from_path_composes_its_fragments(tmp_path: Path):
+    """The tools see the contract fluid validate checks, not its {$ref} placeholders."""
+    (tmp_path / "fragments").mkdir()
+    (tmp_path / "fragments" / "builds.yaml").write_text(
+        yaml.safe_dump(SAMPLE_CONTRACT["builds"]), encoding="utf-8"
+    )
+    p = tmp_path / "c.yaml"
+    split = {**SAMPLE_CONTRACT, "builds": {"$ref": "./fragments/builds.yaml"}}
+    p.write_text(yaml.safe_dump(split), encoding="utf-8")
+
+    assert _resolve_contract_argument({"contract_path": str(p)}) == SAMPLE_CONTRACT
+
+
 def test_resolve_contract_requires_one_arg():
     with pytest.raises(RuntimeError, match="contract_path"):
         _resolve_contract_argument({})
