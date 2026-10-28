@@ -31,8 +31,9 @@ The rule, in the order it is applied:
    refused.
 3. The ref is joined to the directory of the file that contains it and
    ``Path.resolve()``-d, which collapses ``..`` AND follows symlinks; the
-   result must satisfy ``is_relative_to(root)`` with ``root`` resolved the
-   same way. A ``../`` climb or a symlink pointing out of the root fails here.
+   result must be inside ``root`` resolved the same way (:func:`is_within`,
+   ``is_relative_to`` as a string comparison). A ``../`` climb or a symlink
+   pointing out of the root fails here.
 4. With no root at all (a fragment that has no directory, e.g. an OpenAPI
    document extracted from a bundle), every external ref is refused: only
    same-document ``#/...`` refs remain.
@@ -58,6 +59,7 @@ Stdlib only, so both ``fluid_build.loader`` and
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterator, Optional, Sequence, Tuple, Union
@@ -68,6 +70,7 @@ __all__ = [
     "RefResolutionError",
     "confine_ref",
     "format_pointer",
+    "is_within",
     "iter_external_refs",
     "ref_location",
 ]
@@ -130,6 +133,20 @@ def ref_location(pointer: str, source: Optional[Path]) -> str:
     """Where a ``$ref`` was written: its JSON pointer, and the file when known."""
     at = f"at JSON pointer '{pointer}'" if pointer else "at the document root"
     return f"{at} in {source}" if source is not None else at
+
+
+def is_within(path: Path, directory: Union[Path, str]) -> bool:
+    """True when ``path`` is ``directory`` or below it; both absolute and resolved.
+
+    ``Path.is_relative_to`` without its cost: it builds every parent of
+    ``path`` to compare, and a composition asks once per ref and per denied
+    directory. Compared as ``os.path.normcase`` strings, as the platform's
+    path flavour compares them (case-insensitively on Windows only).
+    """
+    text = os.path.normcase(os.fspath(path))
+    # Without its trailing separator, so that "/" and "C:\\" are prefixes too.
+    prefix = os.path.normcase(os.fspath(directory)).rstrip("\\/")
+    return text == prefix or text.startswith(prefix + os.sep)
 
 
 def _is_absolute(file_part: str) -> bool:
@@ -207,7 +224,7 @@ def confine_ref(
     except (OSError, ValueError, RuntimeError) as exc:  # NUL byte, symlink loop
         raise _refuse(f"cannot be resolved as a path: {exc}") from exc
 
-    if not target.is_relative_to(resolved_root):
+    if not is_within(target, resolved_root):
         hint = f" {root_hint}" if root_hint else ""
         raise _refuse(
             f"escapes the ref root {resolved_root} (after resolving '..' and "
