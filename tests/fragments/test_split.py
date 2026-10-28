@@ -3279,3 +3279,15 @@ def test_a_bare_cr_file_is_split_as_data(
     assert split(contract, "--parts", "builds") == 0
     assert "bare CR" in capsys.readouterr().err
     assert load_contract(contract) == before
+
+
+def test_a_next_line_break_in_a_yaml_root_is_split_as_data(tmp_path: Path) -> None:
+    """NEL used as a YAML line break: the text splice cannot place it, so the data split
+    runs, and the result composes to the original."""
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_bytes("id: x\u0085builds:\n  - id: t\n    engine: sql\n".encode("utf-8"))
+    from fluid_build.loader import load_contract
+
+    before = load_contract(contract)
+    assert split(contract, "--parts", "builds") == 0
+    assert load_contract(contract) == before

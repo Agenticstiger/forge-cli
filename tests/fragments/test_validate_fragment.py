@@ -818,3 +818,13 @@ def test_a_contract_in_a_home_or_temp_root_is_never_a_fragments_contract(
     monkeypatch.setattr(_duckdb_sandbox, "_home_dirs", lambda: (str(home),))
 
     assert _nearest_contract(fragment) is None
+
+
+def test_a_contract_whose_fluid_version_is_a_ref_gives_no_version(tmp_path: Path) -> None:
+    """The nearest contract keeps fluidVersion in a fragment: no version is read from it
+    (the run then asks for --schema-version), and nothing crashes."""
+    from fluid_build.cli.validate import _contract_version
+
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_text("fluidVersion: {$ref: ./v.yaml}\nid: x\n", encoding="utf-8")
+    assert _contract_version(contract) is None

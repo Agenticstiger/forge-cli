@@ -635,7 +635,8 @@ def _contract_version(contract: Optional[Path]) -> Optional[str]:
         version = _parse_file(contract).get("fluidVersion")
     except Exception:  # noqa: BLE001 - no readable version: the default applies
         return None
-    return str(version) if version else None
+    # A version kept elsewhere (a $ref) is not one this lookup can read.
+    return version if isinstance(version, str) and version else None
 
 
 def _handle_list_versions(schema_manager: FluidSchemaManager, args, logger: logging.Logger) -> int:

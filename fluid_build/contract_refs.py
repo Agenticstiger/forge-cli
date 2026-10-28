@@ -775,6 +775,8 @@ def _file_key(target: Path) -> Any:
         info = os.stat(target)
     except OSError:
         return (os.fspath(target), is_text)
+    if not info.st_ino:  # a file system that reports no inode: the name is all there is
+        return (os.fspath(target), is_text)
     return (info.st_dev, info.st_ino, is_text)
 
 

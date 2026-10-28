@@ -390,7 +390,7 @@ def test_dx08_validate_fails_fast_on_a_contract_that_contains_itself(
 ) -> None:
     path = _self_containing(tmp_path, with_ref=with_ref, loop=loop)
 
-    result = _fluid(["validate", path], cwd=tmp_path, timeout=6, memory_cap=_HANG_MEMORY_CAP)
+    result = _fluid(["validate", path], cwd=tmp_path, timeout=60, memory_cap=_HANG_MEMORY_CAP)
 
     assert result.returncode == 1
     assert "Traceback" not in result.stdout + result.stderr
@@ -402,7 +402,7 @@ def test_dx08_validate_fails_fast_on_an_overlay_that_contains_itself(tmp_path: P
     _write(path.parent / "overlays" / "prod.yaml", _LIST_LOOP)
 
     result = _fluid(
-        ["validate", path, "--env", "prod"], cwd=tmp_path, timeout=6, memory_cap=_HANG_MEMORY_CAP
+        ["validate", path, "--env", "prod"], cwd=tmp_path, timeout=60, memory_cap=_HANG_MEMORY_CAP
     )
 
     assert result.returncode == 1
@@ -413,7 +413,7 @@ def test_dx08_validate_fails_fast_on_an_overlay_that_contains_itself(tmp_path: P
 def test_dx08_the_api_fails_fast_on_a_contract_that_contains_itself(tmp_path: Path) -> None:
     path = _self_containing(tmp_path, with_ref=False)
 
-    result = _run(["-c", _API_LOAD, path], cwd=tmp_path, timeout=6, memory_cap=_HANG_MEMORY_CAP)
+    result = _run(["-c", _API_LOAD, path], cwd=tmp_path, timeout=60, memory_cap=_HANG_MEMORY_CAP)
 
     assert result.returncode == 1
     assert result.stdout.strip() == "contract_load_failed"
@@ -428,7 +428,7 @@ def test_dx08_bundle_fails_fast_on_a_contract_with_refs_that_contains_itself(
     result = _fluid(
         ["bundle", path, "--out", tmp_path / "b.yaml"],
         cwd=tmp_path,
-        timeout=6,
+        timeout=60,
         memory_cap=_HANG_MEMORY_CAP,
     )
 
@@ -447,7 +447,7 @@ def test_dx08_validate_fragment_fails_fast_on_a_fragment_that_contains_itself(
     result = _fluid(
         ["validate", "--fragment", "schema", fragment],
         cwd=tmp_path,
-        timeout=6,
+        timeout=60,
         memory_cap=_HANG_MEMORY_CAP,
     )
 

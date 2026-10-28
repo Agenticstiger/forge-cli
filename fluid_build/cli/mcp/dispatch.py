@@ -478,8 +478,10 @@ def _readable_ref_root(path: Path, readable: Tuple[Path, ...]) -> Optional[Path]
     if _path_is_allowed(Path(root).resolve(), readable):
         return None
     contract = path.resolve()
-    holders = [r.resolve() for r in readable if _path_is_allowed(contract, (r,))]
-    # The deepest readable path holding the contract: the narrowest cap.
+    holders = [r.resolve() for r in readable if r.is_dir() and _path_is_allowed(contract, (r,))]
+    # The deepest readable directory holding the contract: the narrowest cap. A
+    # readable path that names files leaves the contract's own directory, and the
+    # check of every file read after the composition.
     return max(holders, key=lambda r: len(r.parts)) if holders else contract.parent
 
 
