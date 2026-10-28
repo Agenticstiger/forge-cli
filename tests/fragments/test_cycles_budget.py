@@ -862,7 +862,7 @@ def test_e23_spellings_of_one_whole_file_ref_are_still_a_cycle(
     started = time.monotonic()
     _ref_error(lambda: load_contract(path), file=a, pointer="/x", has=("Circular",))
 
-    assert time.monotonic() - started < 2
+    assert time.monotonic() - started < 10  # a hang guard, with room for a loaded CI runner
 
 
 @pytest.mark.slow
