@@ -802,3 +802,190 @@ def test_generate_artifacts_reads_a_split_contract_whole_without_an_env(
     assert main(["generate", "artifacts", str(path), "--out", str(out)]) == 0
     written = "\n".join(p.read_text("utf-8") for p in out.rglob("*") if p.is_file())
     assert "orders.dev.events" in written and "$ref" not in written
+
+
+# ── where a value was written (draft 25) ───────────────────────────────
+
+_EXPOSE_FRAGMENT = """\
+# Expose: orders_events
+
+exposeId: orders_events
+kind: topic
+version: "1.0.0"
+binding:
+  platform: kafka
+  format: kafka_topic
+  location: {topic: orders.dev.events}
+contract:
+  schema:
+    - {name: order_id, type: string, required: true}
+    - name: amount
+      type: 42
+"""
+
+
+def _split_stream(tmp_path: Path) -> Path:
+    contract = yaml.safe_load(_STREAM)
+    contract["exposes"] = [{"$ref": "./fragments/exposes/orders_events.yaml"}]
+    _write(tmp_path / "fragments" / "exposes" / "orders_events.yaml", _EXPOSE_FRAGMENT)
+    return _write(tmp_path / "contract.fluid.yaml", yaml.safe_dump(contract, sort_keys=False))
+
+
+def test_validate_names_the_fragment_and_line_of_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    from fluid_build.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    path = _split_stream(tmp_path)
+
+    assert main(["validate", str(path)]) == 1
+
+    out = capsys.readouterr().out
+    assert (
+        "fragments/exposes/orders_events.yaml:14 (exposes[0].contract.schema[1].type): "
+        "42 is not valid under any of the given schemas"
+    ) in out
+
+
+def test_an_error_in_the_root_contract_keeps_its_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    from fluid_build.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path / "contract.fluid.yaml", _STREAM.replace("kind: topic", "kind: 42", 1))
+
+    assert main(["validate", str(path)]) == 1
+
+    out = capsys.readouterr().out
+    assert "exposes[0].kind: 42 is not one of" in out
+    assert "contract.fluid.yaml:" not in out
+
+
+def test_an_error_the_overlay_brought_in_names_the_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    from fluid_build.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    # Listed in the other order than the base: matched by exposeId.
+    _write(
+        tmp_path / "overlays" / "prod.yaml",
+        "exposes:\n"
+        "  - exposeId: audit_events\n"
+        "    binding: {location: {topic: audit.prod.events}}\n"
+        "  - exposeId: orders_events\n"
+        "    kind: not_a_kind\n",
+    )
+    path = _write(tmp_path / "contract.fluid.yaml", _STREAM)
+
+    assert main(["validate", str(path), "--env", "prod"]) == 1
+
+    out = capsys.readouterr().out
+    assert "overlays/prod.yaml:5 (exposes[0].kind): 'not_a_kind' is not one of" in out
+
+
+def test_origins_follow_siblings_pointers_and_text(tmp_path: Path) -> None:
+    from fluid_build.loader import compose_contract
+
+    _write(tmp_path / "shared.yaml", "name: order_id\ntype: string\ndescription: shared\n")
+    _write(tmp_path / "q.sql", "SELECT 1\n")
+    path = _write(
+        tmp_path / "contract.fluid.yaml",
+        "column:\n"
+        "  $ref: ./shared.yaml\n"
+        "  description: mine\n"
+        "sql: {$ref: ./q.sql}\n"
+        'copy: {$ref: "#/column"}\n',
+    )
+
+    origins = compose_contract(path).origins
+    root, shared, sql = (
+        path.resolve(),
+        (tmp_path / "shared.yaml").resolve(),
+        (tmp_path / "q.sql").resolve(),
+    )
+
+    assert origins.locate(["column", "type"]) == (shared, 2)
+    assert origins.locate(["column", "description"]) == (root, 3)
+    assert origins.locate(["sql"]) == (sql, None)
+    assert origins.locate(["copy", "name"]) == (shared, 1)
+    # The object was written in shared.yaml; the siblings only patched a key.
+    assert origins.locate(["copy"]) == (shared, 1)
+    assert origins.locate(["column"], definition=True) == (shared, 1)
+    assert origins.describe(["column", "type"]) == "shared.yaml:2"
+    assert origins.describe(["column", "description"]) is None
+
+
+def test_the_api_tells_where_a_value_was_written(tmp_path: Path) -> None:
+    from fluid_build.api.contract import load_contract as api_load_contract
+    from fluid_build.api.contract import load_contract_from_dict
+
+    path = _split_stream(tmp_path)
+    fragment = (tmp_path / "fragments" / "exposes" / "orders_events.yaml").resolve()
+
+    loaded = api_load_contract(path)
+
+    assert loaded.origin_of(["exposes", 0, "contract", "schema", 1, "type"]) == (fragment, 14)
+    assert loaded.origin_of(["id"]) == (path.resolve(), 3)
+    assert load_contract_from_dict({"id": "x"}).origin_of(["id"]) is None
+
+
+def test_an_extension_error_names_the_fragment_of_its_block() -> None:
+    from fluid_build.cli.validate import _in_fragment
+
+    def locate(path: Any) -> Any:
+        return "fragments/ext.yaml:3" if list(path) == ["extensions", "acme"] else None
+
+    assert (
+        _in_fragment("extensions.acme: platform: unexpected", locate)
+        == "fragments/ext.yaml:3 (extensions.acme): platform: unexpected"
+    )
+    assert _in_fragment("extensions.other: x", locate) == "extensions.other: x"
+    assert _in_fragment("extensions.acme: x", None) == "extensions.acme: x"
+
+
+def test_a_missing_key_is_named_where_its_object_was_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    from fluid_build.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    path = _split_stream(tmp_path)
+    fragment = tmp_path / "fragments" / "exposes" / "orders_events.yaml"
+    fragment.write_text(
+        _EXPOSE_FRAGMENT.replace("kind: topic\n", "").replace("type: 42", "type: number"), "utf-8"
+    )
+    # The overlay merges a key into the same expose: it did not write the object.
+    _write(
+        tmp_path / "overlays" / "prod.yaml",
+        "exposes:\n  - exposeId: orders_events\n    version: 1.0.1\n",
+    )
+
+    assert main(["validate", str(path), "--env", "prod"]) == 1
+
+    out = capsys.readouterr().out
+    assert (
+        "fragments/exposes/orders_events.yaml:3 (exposes[0]): 'kind' is a required property"
+    ) in out
+
+
+def test_an_unexpected_key_is_named_where_it_was_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    from fluid_build.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    path = _split_stream(tmp_path)
+    fragment = tmp_path / "fragments" / "exposes" / "orders_events.yaml"
+    fragment.write_text(_EXPOSE_FRAGMENT.replace("type: 42", "type: number"), "utf-8")
+    _write(
+        tmp_path / "overlays" / "prod.yaml",
+        "exposes:\n  - exposeId: orders_events\n    binding:\n      bogus: 1\n",
+    )
+
+    assert main(["validate", str(path), "--env", "prod"]) == 1
+
+    out = capsys.readouterr().out
+    assert "overlays/prod.yaml:4 (exposes[0].binding): Additional properties" in out

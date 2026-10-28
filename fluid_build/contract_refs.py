@@ -51,8 +51,22 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 from fluid_build.util.ref_confinement import (
     RefResolutionError,
@@ -65,6 +79,8 @@ __all__ = [
     "MAX_REF_DEPTH",
     "TEXT_REF_SUFFIXES",
     "ComposeTrace",
+    "ContractOrigins",
+    "Origin",
     "RefBudget",
     "find_ref_node",
     "is_ref_node",
@@ -200,10 +216,12 @@ def _kind(value: Any) -> str:
 
 class ComposeTrace:
     """What one composition read: every file, in the order it was first read,
-    and where each same-document pointer was written."""
+    where each same-document pointer was written, and (when ``origins`` is
+    set) which file each part of the result came from."""
 
-    def __init__(self) -> None:
+    def __init__(self, origins: Optional["ContractOrigins"] = None) -> None:
         self.files: List[Path] = []
+        self.origins = origins
         # id(node) -> (node, file, pointer in that file). The node is held so
         # its id cannot be reused by another object while the trace lives.
         self._pointer_sites: Dict[int, Tuple[Any, Optional[Path], Pointer]] = {}
@@ -269,6 +287,7 @@ def resolve_file_refs(
     source: Optional[Path] = None,
     trace: Optional[ComposeTrace] = None,
     budget: Optional[RefBudget] = None,
+    origins: Optional["ContractOrigins"] = None,
 ) -> Any:
     """``obj`` with every ``$ref`` to a file replaced by what it names.
 
@@ -283,7 +302,8 @@ def resolve_file_refs(
     Protections: confinement (URLs, absolute paths and escapes from the root
     are refused before a target is opened), the system-directory deny list
     for callers that widen the root, cycle detection, a nesting depth limit,
-    and the expansion cap (:data:`MAX_REF_EXPANSION_NODES`).
+    and the expansion cap (:data:`MAX_REF_EXPANSION_NODES`). ``origins``
+    (default ``trace.origins``) records where each fragment landed.
     """
     refs = _FileRefs(
         root=base_dir if ref_root is None else ref_root,
@@ -291,8 +311,9 @@ def resolve_file_refs(
         ignored_ref_root_env=ignored_ref_root_env,
         trace=trace,
         budget=budget if budget is not None else RefBudget(),
+        origins=origins if origins is not None else (trace.origins if trace else None),
     )
-    return refs.walk(obj, base_dir, source, (), 0)
+    return refs.walk(obj, base_dir, source, (), (), 0)
 
 
 class _FileRefs:
@@ -306,35 +327,56 @@ class _FileRefs:
         ignored_ref_root_env: Optional[str],
         trace: Optional[ComposeTrace],
         budget: RefBudget,
+        origins: Optional["ContractOrigins"],
     ) -> None:
         self.root = root
         self.root_hint = root_hint
         self.ignored_ref_root_env = ignored_ref_root_env
         self.trace = trace
         self.budget = budget
+        self.origins = origins
         # The refs being expanded, outermost first: a ref met again inside
         # its own target is a cycle, while the same file reached from two
         # branches (a diamond) is not.
         self.ancestry: Set[str] = set()
 
     def walk(
-        self, obj: Any, base_dir: Path, source: Optional[Path], loc: Pointer, depth: int
+        self,
+        obj: Any,
+        base_dir: Path,
+        source: Optional[Path],
+        loc: Pointer,
+        at: Pointer,
+        depth: int,
     ) -> Any:
+        """``obj``, written at ``loc`` in ``source``, placed at ``at`` in the result."""
         if depth > MAX_REF_DEPTH:
             raise RefResolutionError(
                 f"$ref nesting depth exceeded {MAX_REF_DEPTH} — "
                 f"possible circular reference or very deep nesting"
             )
         if is_ref_node(obj):
-            return self.ref(obj, base_dir, source, loc, depth)
+            return self.ref(obj, base_dir, source, loc, at, depth)
         if isinstance(obj, dict):
-            return {k: self.walk(v, base_dir, source, (*loc, k), depth) for k, v in obj.items()}
+            return {
+                k: self.walk(v, base_dir, source, (*loc, k), (*at, k), depth)
+                for k, v in obj.items()
+            }
         if isinstance(obj, list):
-            return [self.walk(v, base_dir, source, (*loc, i), depth) for i, v in enumerate(obj)]
+            return [
+                self.walk(v, base_dir, source, (*loc, i), (*at, i), depth)
+                for i, v in enumerate(obj)
+            ]
         return obj
 
     def ref(
-        self, node: Dict[str, Any], base_dir: Path, source: Optional[Path], loc: Pointer, depth: int
+        self,
+        node: Dict[str, Any],
+        base_dir: Path,
+        source: Optional[Path],
+        loc: Pointer,
+        at: Pointer,
+        depth: int,
     ) -> Any:
         ref = node["$ref"]
         where = ref_location(format_pointer(loc), source)
@@ -346,7 +388,7 @@ class _FileRefs:
         # Siblings live in the file that holds the ref, so their own refs
         # resolve relative to it, whatever the target turns out to be.
         siblings = {
-            key: self.walk(value, base_dir, source, (*loc, key), depth)
+            key: self.walk(value, base_dir, source, (*loc, key), (*at, key), depth)
             for key, value in node.items()
             if key != "$ref"
         }
@@ -369,14 +411,24 @@ class _FileRefs:
         self.ancestry.add(key)
         try:
             value, is_text = _read_target(target, ref, pointer, where)
+            origins = self.origins
             if self.trace is not None:
                 self.trace.add_file(target)
+            if origins is not None:
+                origins.add(at, Origin(target, None if is_text else pointer_tokens(pointer)))
             self.budget.charge(value, ref, where)
             if not is_text:
-                value = self.walk(value, target.parent, target, pointer_tokens(pointer), depth + 1)
+                value = self.walk(
+                    value, target.parent, target, pointer_tokens(pointer), at, depth + 1
+                )
         finally:
             self.ancestry.discard(key)
-        return _apply_siblings(value, siblings, ref, where) if siblings else value
+        if not siblings:
+            return value
+        if origins is not None and source is not None:
+            # The siblings were written beside the ref: they answer first.
+            origins.add(at, Origin(source, loc, patch=True))
+        return _apply_siblings(value, siblings, ref, where)
 
     def locate(
         self, ref: str, file_part: str, base_dir: Path, loc: Pointer, source: Optional[Path]
@@ -604,6 +656,9 @@ class _PointerRefs:
             for key, sub in node.items()
             if key != "$ref"
         }
+        origins = self.trace.origins if self.trace is not None else None
+        if origins is not None:
+            origins.alias(here, target, siblings)
         return _apply_siblings(value, siblings, ref, where) if siblings else value
 
     def lookup(self, target: Pointer, active: Tuple[Pointer, ...], ref: str, where: str) -> Any:
@@ -631,3 +686,166 @@ class _PointerRefs:
         if site is not None:
             return ref_location(format_pointer(site[1]), site[0])
         return f"at JSON pointer '{format_pointer(here)}' of the composed contract"
+
+
+# ── provenance ──────────────────────────────────────────────────────────
+
+
+class Origin(NamedTuple):
+    """Where a part of the composed contract was written."""
+
+    file: Path
+    #: Its pointer inside ``file``; ``None`` for a text file, which is one value.
+    inner: Optional[Pointer]
+    #: First keys under it this origin does not answer for: an overlay's keyed
+    #: lists, whose entries land at other indexes and are recorded on their own.
+    hide: FrozenSet[Any] = frozenset()
+    #: Merged over what was there (siblings, an overlay): it wrote the keys it
+    #: holds, not the object they sit in.
+    patch: bool = False
+
+
+class _Alias(NamedTuple):
+    """A ``#/`` pointer: what sits here is a copy of ``target``, but its siblings."""
+
+    target: Pointer
+    siblings: FrozenSet[Any]
+
+
+class ContractOrigins:
+    """Which file, and which line in it, each part of a composed contract came from.
+
+    Recorded during composition in a table keyed by the path in the composed
+    contract; the contract itself stays plain dicts and lists. Each path holds
+    what was written there, in order: a fragment, the keys written beside its
+    ``$ref``, an overlay, a pointer's copy. :meth:`locate` takes the deepest
+    recorded path above the one asked for, latest writer first, and keeps the
+    first whose file holds the rest of the path: a key a later writer did not
+    set came from an earlier one. Lines are read only when asked for, by
+    composing the file's YAML again.
+    """
+
+    def __init__(self, root: Optional[Path] = None) -> None:
+        #: The root contract file; :meth:`describe` names every other file.
+        self.root = root
+        self._entries: Dict[Pointer, List[Union[Origin, _Alias]]] = {}
+        self._trees: Dict[Path, Any] = {}
+
+    def add(self, at: Sequence[Union[str, int]], origin: Origin) -> None:
+        self._entries.setdefault(tuple(at), []).append(origin)
+
+    def alias(
+        self,
+        at: Sequence[Union[str, int]],
+        target: Sequence[Union[str, int]],
+        siblings: Iterable[Any],
+    ) -> None:
+        self._entries.setdefault(tuple(at), []).append(_Alias(tuple(target), frozenset(siblings)))
+
+    def extend(
+        self, other: "ContractOrigins", move: Callable[[Pointer], Pointer], *, patch: bool = False
+    ) -> None:
+        """Add ``other``'s records, each path moved by ``move``; ``patch`` marks
+        every file record of ``other`` as merged over what was there."""
+        for at, entries in other._entries.items():
+            if patch:
+                entries = [e._replace(patch=True) if isinstance(e, Origin) else e for e in entries]
+            self._entries.setdefault(move(at), []).extend(entries)
+
+    def locate(
+        self, path: Sequence[Union[str, int]], *, definition: bool = False
+    ) -> Optional[Tuple[Path, Optional[int]]]:
+        """``(file, line)`` for the value at ``path`` in the composed contract.
+
+        ``line`` is 1-based, the line of its key (or list item) in ``file``,
+        ``None`` when the file gives none (a text file, JSON YAML cannot read).
+        ``None`` when nothing recorded covers ``path``. With ``definition``,
+        the file that wrote the object at ``path`` is preferred over one that
+        only merged keys into it: the place to add a key that is missing.
+        """
+        key = tuple(path)
+        if definition:
+            return self._locate(key, 0, True) or self._locate(key, 0, False)
+        return self._locate(key, 0, False)
+
+    def describe(
+        self, path: Sequence[Union[str, int]], *, definition: bool = False
+    ) -> Optional[str]:
+        """``fragments/x.yaml:21`` for a value written outside the root contract, else ``None``.
+
+        The file is named relative to the root contract's directory.
+        """
+        found = self.locate(path, definition=definition)
+        if found is None or found[0] == self.root:
+            return None
+        file, line = found
+        shown = str(file)
+        if self.root is not None:
+            try:
+                shown = os.path.relpath(file, self.root.parent)
+            except ValueError:  # another drive, on Windows
+                pass
+        return f"{shown}:{line}" if line else shown
+
+    def _locate(
+        self, path: Pointer, hops: int, definition: bool
+    ) -> Optional[Tuple[Path, Optional[int]]]:
+        if hops > MAX_REF_DEPTH:
+            return None
+        for cut in range(len(path), -1, -1):
+            head, rest = path[:cut], path[cut:]
+            for entry in reversed(self._entries.get(head, ())):
+                if isinstance(entry, _Alias):
+                    if rest and rest[0] in entry.siblings:
+                        continue
+                    return self._locate((*entry.target, *rest), hops + 1, definition)
+                if rest and rest[0] in entry.hide:
+                    continue
+                if entry.patch and (definition or not rest):
+                    # A patch wrote keys; the object itself was written elsewhere.
+                    continue
+                if entry.inner is None:
+                    if not rest:
+                        return entry.file, None
+                    continue
+                found, line = self._line(entry.file, (*entry.inner, *rest))
+                if found:
+                    return entry.file, line
+        return None
+
+    def _line(self, file: Path, inner: Pointer) -> Tuple[bool, Optional[int]]:
+        """Whether ``file`` holds ``inner``, and the 1-based line it is at."""
+        if file not in self._trees:
+            self._trees[file] = _compose_file(file)
+        node = self._trees[file]
+        if node is None:
+            return True, None
+        import yaml
+
+        line = node.start_mark.line + 1
+        for token in inner:
+            if isinstance(node, yaml.MappingNode):
+                for key, value in node.value:
+                    if isinstance(key, yaml.ScalarNode) and key.value == str(token):
+                        line, node = key.start_mark.line + 1, value
+                        break
+                else:
+                    return False, None
+            elif isinstance(node, yaml.SequenceNode):
+                if not str(token).isdigit() or int(token) >= len(node.value):
+                    return False, None
+                node = node.value[int(token)]
+                line = node.start_mark.line + 1
+            else:
+                return False, None
+        return True, line
+
+
+def _compose_file(path: Path) -> Any:
+    """The YAML node tree of ``path`` (marks give lines), or ``None`` when it has none."""
+    from fluid_build.util.safe_yaml import compose_yaml_safe
+
+    try:
+        return compose_yaml_safe(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a line is a courtesy: no tree, no line
+        return None

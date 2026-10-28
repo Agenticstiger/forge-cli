@@ -118,6 +118,27 @@ def load_yaml_safe(
         loader.dispose()
 
 
+def compose_yaml_safe(source: Any) -> Any:
+    """The YAML node graph of ``source`` (its marks give lines), under the caps
+    of :func:`load_yaml_safe`; ``None`` for an empty document.
+
+    Composition keeps an alias as a second reference to its anchor's node, so
+    the graph stays as small as the text; a walk over it must not expand it.
+    """
+    if source is None:
+        return None
+    source = _bounded_text(source, MAX_YAML_BYTES)
+    aliases = _count_aliases(source, MAX_YAML_ALIASES, MAX_YAML_DEPTH)
+    loader = yaml.SafeLoader(source)
+    try:
+        node = loader.get_single_node()
+        if node is not None and aliases:
+            _check_alias_expansion(node, MAX_YAML_ALIAS_EXPANSION, MAX_YAML_ALIAS_EXPANSION_CHARS)
+        return node
+    finally:
+        loader.dispose()
+
+
 def _bounded_text(source: Any, max_bytes: int) -> str:
     """``source`` as text, refused when it is over ``max_bytes`` UTF-8 bytes."""
     if hasattr(source, "read"):

@@ -24,7 +24,8 @@ notice. Anything inside is governed.
 Consumers that need a contract exactly as ``fluid plan`` sees it (a
 control plane comparing a contract to a plan, CI tooling, editors) use
 :func:`load_contract` and its in-memory siblings from ``.contract``
-(added in 1.1; ``overlay_dir=`` on the in-memory forms in 1.2).
+(added in 1.1; ``overlay_dir=`` on the in-memory forms and
+``LoadedContract.origin_of`` in 1.2).
 """
 
 from __future__ import annotations

@@ -20,7 +20,7 @@ import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
@@ -305,7 +305,7 @@ def run(args, logger: logging.Logger) -> int:
 
         # Load contract with overlay
         try:
-            contract, overlay_warnings = _load_with_overlay_warnings(
+            contract, overlay_warnings, locate = _load_with_overlay_warnings(
                 args.contract, getattr(args, "env", None), logger
             )
         except Exception as e:
@@ -334,6 +334,7 @@ def run(args, logger: logging.Logger) -> int:
             args=args,
             schema_manager=schema_manager,
             logger=logger,
+            locate=locate,
         )
 
         for warning in overlay_warnings:
@@ -348,7 +349,7 @@ def run(args, logger: logging.Logger) -> int:
         # sub-key of ``contract.extensions`` and validates its own shape
         # there. Errors get appended to the validation result as if they
         # had been emitted by the core schema validator.
-        _run_extension_validators(contract, validation_result, logger)
+        _run_extension_validators(contract, validation_result, logger, locate=locate)
 
         # Run plugin-supplied contract validators (entry-point group
         # ``fluid_build.validators`` — the fluid_sdk ``Validator`` role). Each
@@ -451,19 +452,23 @@ def run(args, logger: logging.Logger) -> int:
 
 def _load_with_overlay_warnings(
     contract_path: str, env: Optional[str], logger: logging.Logger
-) -> tuple[dict, list[str]]:
-    """Load a contract with its ``--env`` overlay, and the overlay warnings to report.
+) -> tuple[dict, list[str], Optional[Callable[..., Optional[str]]]]:
+    """Load a contract with its ``--env`` overlay, the overlay warnings to report,
+    and where each part of it was written.
 
     A positional overlay patch that lands on another entry is only logged by
     the loader, and ``--strict`` reads the validation result, never the log.
     :func:`fluid_build.loader.collect_overlay_warnings` hands it to validate
     instead, so it is reported as a warning and ``--strict`` fails on it.
+    :func:`fluid_build.loader.collect_origins` hands over the composition's
+    origins, so an error in a fragment or the overlay names that file and line.
     """
-    from fluid_build.loader import collect_overlay_warnings
+    from fluid_build.loader import collect_origins, collect_overlay_warnings
 
-    with collect_overlay_warnings() as overlay_warnings:
+    with collect_overlay_warnings() as overlay_warnings, collect_origins() as origins:
         contract = load_contract_with_overlay(contract_path, env, logger)
-    return contract, [warning.message for warning in overlay_warnings]
+    locate = origins[-1].describe if origins else None
+    return contract, [warning.message for warning in overlay_warnings], locate
 
 
 def _handle_list_versions(schema_manager: FluidSchemaManager, args, logger: logging.Logger) -> int:
@@ -657,9 +662,14 @@ def _validate_contract_for_version(
     args,
     schema_manager: FluidSchemaManager,
     logger: logging.Logger,
+    locate: Optional[Callable[..., Optional[str]]] = None,
 ) -> ValidationResult:
     validation_result = schema_manager.validate_contract(
-        contract, schema_version=target_version, strict=args.strict, offline_only=args.offline
+        contract,
+        schema_version=target_version,
+        strict=args.strict,
+        offline_only=args.offline,
+        locate=locate,
     )
     _run_contract_rules(contract, target_version, validation_result, args, logger)
     return validation_result
@@ -1056,6 +1066,7 @@ def _validate_with_version_fallback(
     args,
     schema_manager: FluidSchemaManager,
     logger: logging.Logger,
+    locate: Optional[Callable[..., Optional[str]]] = None,
 ) -> Tuple[Optional[SchemaVersion], ValidationResult]:
     validation_result = _validate_contract_for_version(
         contract=contract,
@@ -1063,6 +1074,7 @@ def _validate_with_version_fallback(
         args=args,
         schema_manager=schema_manager,
         logger=logger,
+        locate=locate,
     )
 
     if not auto_selected or validation_result.is_valid or not target_version:
@@ -1082,6 +1094,7 @@ def _validate_with_version_fallback(
         args=args,
         schema_manager=schema_manager,
         logger=logger,
+        locate=locate,
     )
     return previous_version, fallback_result
 
@@ -1164,6 +1177,8 @@ def _run_extension_validators(
     contract: Dict[str, Any],
     validation_result: ValidationResult,
     logger: logging.Logger,
+    *,
+    locate: Optional[Callable[..., Optional[str]]] = None,
 ) -> None:
     """Invoke any plugin-registered ``contract.extensions`` validators.
 
@@ -1191,7 +1206,19 @@ def _run_extension_validators(
     from fluid_build.extension_schemas import run_extension_validators
 
     for err in run_extension_validators(contract, logger):
-        validation_result.add_error(err)
+        validation_result.add_error(_in_fragment(err, locate))
+
+
+def _in_fragment(err: str, locate: Optional[Callable[..., Optional[str]]]) -> str:
+    """``extensions.<key>: msg`` as ``<fragment>:<line> (extensions.<key>): msg``
+    when that block was written in a fragment. A validator's own message is
+    plugin text, so only the block it names is located, not the key it means."""
+    head, sep, tail = err.partition(": ")
+    if locate is None or not sep or not head.startswith("extensions."):
+        return err
+    key = head[len("extensions.") :]
+    where = (locate(["extensions", key]) if key else None) or locate(["extensions"])
+    return f"{where} ({head}): {tail}" if where else err
 
 
 def _run_role_validators(
@@ -1489,13 +1516,14 @@ def _try_workspace_validate(
     failed = 0
     for product in products:
         try:
-            contract, overlay_warnings = _load_with_overlay_warnings(
+            contract, overlay_warnings, locate = _load_with_overlay_warnings(
                 str(product.contract_path), getattr(args, "env", None), logger
             )
             result = schema_manager.validate_contract(
                 contract,
                 strict=args.strict,
                 offline_only=getattr(args, "offline", False),
+                locate=locate,
             )
             if _report_workspace_product(product, result, overlay_warnings, args.strict):
                 passed += 1

@@ -39,6 +39,8 @@ from typing import (
 from fluid_build.contract_refs import (
     MAX_REF_DEPTH,
     ComposeTrace,
+    ContractOrigins,
+    Origin,
     RefBudget,
     is_ref_node,
     parse_ref,
@@ -62,9 +64,13 @@ except Exception:  # pragma: no cover
 
 __all__ = [
     "REF_ROOT_ENV",
+    "ComposedContract",
     "RefConfinementError",
     "RefResolutionError",
     "available_overlay_envs",
+    "collect_origins",
+    "compose_contract",
+    "compose_document",
     "load_contract",
     "load_with_overlay",
     "compile_contract",
@@ -728,6 +734,8 @@ class ComposedContract(NamedTuple):
     #: Every file read, first-read order, resolved: the contract, its
     #: fragments, then the overlay and its fragments.
     files: Tuple[Path, ...]
+    #: Which file, and line, each part of ``document`` came from.
+    origins: ContractOrigins
 
 
 def compose_contract(
@@ -774,8 +782,9 @@ def compose_contract(
     # The ref root is widened only for a contract with a ref to another file;
     # an overlay's refs count too.
     root = _effective_ref_root(path, [contract, found[1]] if found else contract, ref_root)
-    trace = ComposeTrace()
+    trace = ComposeTrace(ContractOrigins(source))
     trace.add_file(source)
+    trace.origins.add((), Origin(source, ()))
     try:
         document = _compose(
             contract,
@@ -796,7 +805,11 @@ def compose_contract(
         # with a typo'd or missing overlay silently deployed the BASE
         # contract at the default log level. Say so, once per contract/env.
         note_missing_overlay(path, env, log, contract=document)
-    return ComposedContract(document, overlay_path, tuple(trace.files))
+    composed = ComposedContract(document, overlay_path, tuple(trace.files), trace.origins)
+    sink = _ORIGINS_SINK.get()
+    if sink is not None:
+        sink.append(composed.origins)
+    return composed
 
 
 def compose_document(
@@ -810,7 +823,7 @@ def compose_document(
     file in ``base_dir``: its refs confined to ``base_dir``, the overlay's
     refs resolved against ``overlay_dir`` (default ``base_dir``). Neither
     input is modified; ``files`` lists the fragments read."""
-    trace = ComposeTrace()
+    trace = ComposeTrace(ContractOrigins())
     composed = _compose(
         dict(document),
         base_dir=base_dir,
@@ -821,7 +834,7 @@ def compose_document(
         overlay_dir=overlay_dir if overlay_dir is not None else base_dir,
         overlay_source=None,
     )
-    return ComposedContract(composed, None, tuple(trace.files))
+    return ComposedContract(composed, None, tuple(trace.files), trace.origins)
 
 
 def _compose(
@@ -839,7 +852,12 @@ def _compose(
     same-document pointers of the result: nothing that is a ``$ref`` is left."""
     budget = RefBudget()
 
-    def refs(document: Dict[str, Any], directory: Path, file: Optional[Path]) -> Any:
+    def refs(
+        document: Dict[str, Any],
+        directory: Path,
+        file: Optional[Path],
+        origins: Optional[ContractOrigins],
+    ) -> Any:
         return resolve_file_refs(
             document,
             directory,
@@ -849,9 +867,10 @@ def _compose(
             source=file,
             trace=trace,
             budget=budget,
+            origins=origins,
         )
 
-    composed = refs(contract, base_dir, source)
+    composed = refs(contract, base_dir, source, trace.origins)
     if not isinstance(composed, dict):
         # A root ``$ref`` may name a list or a scalar; a contract is an object.
         raise ValueError(
@@ -862,8 +881,79 @@ def _compose(
         if overlay_source is not None:
             trace.add_file(overlay_source)
         # Resolved first, so a keyed merge sees the ids its fragments name.
-        composed = _deep_merge(composed, refs(overlay, overlay_dir, overlay_source))
+        layer_origins = ContractOrigins()
+        layer = refs(overlay, overlay_dir, overlay_source, layer_origins)
+        lengths = {name: len(composed.get(name) or ()) for name in _OVERLAY_IDENTITY_KEYS}
+        composed = _deep_merge(composed, layer)
+        if trace.origins is not None:
+            _note_overlay_origins(
+                trace.origins, layer, layer_origins, composed, overlay_source, lengths
+            )
     return resolve_pointer_refs(composed, trace=trace, budget=budget)
+
+
+def _note_overlay_origins(
+    origins: ContractOrigins,
+    layer: Dict[str, Any],
+    layer_origins: ContractOrigins,
+    merged: Dict[str, Any],
+    overlay_source: Optional[Path],
+    lengths: Mapping[str, int],
+) -> None:
+    """Record what the overlay wrote, at the paths its entries landed on.
+
+    An entry of a keyed list (``builds``, ``exposes``, ``consumes``) may land at
+    another index than it has in the overlay: matched by id, or appended. The
+    entry with the same id in the merged list is where it landed; an entry that
+    names no id was merged by position. The overlay patches what the base
+    wrote, except an entry it appends, which it wrote whole.
+    """
+    moved: Dict[str, Dict[int, int]] = {}
+    for name, keys in _OVERLAY_IDENTITY_KEYS.items():
+        items, landed = layer.get(name), merged.get(name)
+        if not isinstance(items, list) or not isinstance(landed, list):
+            continue
+        ids = [_item_identity(item, keys) for item in landed]
+        moved[name] = {}
+        for i, item in enumerate(items):
+            ident = _item_identity(item, keys)
+            moved[name][i] = ids.index(ident) if ident is not None and ident in ids else i
+
+    def move(at: Tuple[Union[str, int], ...]) -> Tuple[Union[str, int], ...]:
+        if len(at) > 1 and at[0] in moved and isinstance(at[1], int):
+            return (at[0], moved[at[0]].get(at[1], at[1]), *at[2:])
+        return at
+
+    if overlay_source is not None:
+        origins.add((), Origin(overlay_source, (), hide=frozenset(moved), patch=True))
+        for name, landing in moved.items():
+            for i, j in landing.items():
+                appended = j >= lengths.get(name, 0)
+                origins.add((name, j), Origin(overlay_source, (name, i), patch=not appended))
+    origins.extend(layer_origins, move, patch=True)
+
+
+#: The :class:`ContractOrigins` of each composition inside a
+#: :func:`collect_origins` block, ``None`` outside one.
+_ORIGINS_SINK: contextvars.ContextVar[Optional[List[ContractOrigins]]] = contextvars.ContextVar(
+    "origins_sink", default=None
+)
+
+
+@contextlib.contextmanager
+def collect_origins() -> Iterator[List[ContractOrigins]]:
+    """Hand the caller where each part of the contracts composed in the block came from.
+
+    ``fluid validate`` loads through the CLI loader, which returns the contract
+    alone; inside this block every :func:`compose_contract` call also appends
+    its :class:`ContractOrigins`, so an error can name the fragment it is in.
+    """
+    sink: List[ContractOrigins] = []
+    token = _ORIGINS_SINK.set(sink)
+    try:
+        yield sink
+    finally:
+        _ORIGINS_SINK.reset(token)
 
 
 def _overlay_candidates(contract_path: Path, env: str) -> Tuple[Path, ...]:

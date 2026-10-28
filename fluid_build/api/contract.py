@@ -61,7 +61,7 @@ import ntpath
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Set, Tuple, Union
 
 __all__ = [
     "ContractLoadError",
@@ -161,6 +161,22 @@ class LoadedContract:
     #: in-memory forms without ``base_dir`` leave them, every reference of a
     #: document that names other files.
     unresolved_refs: Tuple[str, ...] = field(default_factory=tuple)
+    #: Where each part of ``contract`` was written (see :meth:`origin_of`).
+    _origins: Any = field(default=None, repr=False, compare=False)
+
+    def origin_of(self, path: Sequence[Union[str, int]]) -> Optional[Tuple[Path, Optional[int]]]:
+        """The file, and the 1-based line in it, the value at ``path`` was written in.
+
+        ``path`` is a path in ``contract``, such as ``["exposes", 0, "binding"]``:
+        a value a ``$ref`` or the overlay brought in names that file, any other
+        the contract file. The line is ``None`` when the file gives none (a
+        text file, JSON). ``None`` when the origin is not known: a bundle (its
+        fragments were inlined when it was built), an in-memory load without
+        ``base_dir``, a path the rewrites moved (a legacy ``build:``).
+        """
+        if self._origins is None:
+            return None
+        return self._origins.locate(path)
 
     @property
     def digest(self) -> str:
@@ -266,6 +282,7 @@ def load_contract(
         overlay=composed.overlay.resolve() if composed.overlay is not None else None,
         files=composed.files,
         unresolved_refs=_ref_values(contract),
+        _origins=composed.origins,
     )
 
 
@@ -352,6 +369,7 @@ def load_contract_from_dict(
         )
 
     files: Tuple[Path, ...] = ()
+    origins = None
     if base_dir is not None:
         base = _resolve_input_path(base_dir, "base_dir")
         layer_dir = _resolve_input_path(overlay_dir, "overlay_dir") if overlay_dir else None
@@ -370,6 +388,7 @@ def load_contract_from_dict(
             raise _as_load_error(exc, base) from exc
         contract = composed.document
         files = composed.files
+        origins = composed.origins
     else:
         contract = _compose_without_files(document, overlay)
     return LoadedContract(
@@ -377,6 +396,7 @@ def load_contract_from_dict(
         origin="memory",
         files=files,
         unresolved_refs=_ref_values(contract),
+        _origins=origins,
     )
 
 
