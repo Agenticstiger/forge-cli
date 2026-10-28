@@ -434,15 +434,30 @@ def _contract_file(path_arg: str) -> Dict[str, Any]:
     """The contract at ``path_arg`` as ``fluid validate`` sees it: composed.
 
     Read raw, a contract kept in fragments holds ``{$ref: ...}`` where its
-    builds and exposes are. The fragments are confined the way every command
-    confines them (the contract's directory, unless widened).
+    builds and exposes are. The composition confines its fragments to the ref
+    root, which a workspace ``ref_root`` or ``FLUID_REF_ROOT`` may widen past
+    the server's ``--readable-paths``; every file it read must also be readable
+    under the active policy, or the tool refuses, as it refuses such a
+    ``contract_path``. Without a policy (no server running) only the ref root
+    applies.
     """
-    from fluid_build.loader import load_contract
+    from fluid_build.cli.mcp.policy import _path_is_allowed
+    from fluid_build.loader import compose_contract
 
-    loaded = load_contract(Path(path_arg))
-    if not isinstance(loaded, dict):
+    composed = compose_contract(Path(path_arg))
+    try:
+        policy = _pkg()._policy()
+    except RuntimeError:  # not served: no policy to hold the reads to
+        policy = None
+    if policy is not None:
+        for file in composed.files:
+            if not _path_is_allowed(Path(file).resolve(), policy.readable_paths):
+                raise PermissionError(
+                    f"contract {path_arg} composes {file}, which is outside --readable-paths"
+                )
+    if not isinstance(composed.document, dict):
         raise RuntimeError(f"Contract at {path_arg!r} did not parse to a dict")
-    return loaded
+    return composed.document
 
 
 def _resolve_contract_argument(arguments: Dict[str, Any]) -> Dict[str, Any]:

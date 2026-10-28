@@ -1879,12 +1879,13 @@ def test_dx05_the_mcp_tool_path_composes_refs_confined_like_the_cli(tmp_path: Pa
     assert SECRET not in str(info.value)
 
 
-def test_dx05_mcp_readable_paths_gate_the_argument_but_not_the_ref_targets(
-    tmp_path: Path,
+def test_dx05_mcp_readable_paths_gate_the_ref_targets_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Characterization (notes): ``--readable-paths`` gates ``contract_path``; the
-    contract's refs are held to the ref root, which a workspace ``refRoot`` can
-    make wider than the readable paths."""
+    """``--readable-paths`` gates ``contract_path`` and every file its composition reads: a
+    workspace ``ref_root`` wider than the readable paths does not let a contract the policy
+    admits compose, and echo, a file the policy does not."""
+    import fluid_build.cli.mcp as mcp_mod
     from fluid_build.cli.mcp import dispatch
     from fluid_build.cli.mcp.policy import McpPolicy, check_tool_permission
 
@@ -1894,11 +1895,13 @@ def test_dx05_mcp_readable_paths_gate_the_argument_but_not_the_ref_targets(
     proj = ws / "proj"
     path = _contract(proj, _with_owner({"$ref": "../secrets/team.yaml"}))
     policy = McpPolicy(readable_paths=(proj.resolve(),))
+    monkeypatch.setattr(mcp_mod, "_policy", lambda: policy)
 
     check_tool_permission("validate_contract", {"contract_path": str(path)}, policy=policy)
     with pytest.raises(PermissionError):
         check_tool_permission("validate_contract", {"contract_path": str(secret)}, policy=policy)
-    assert dispatch._contract_file(str(path))["metadata"]["owner"]["team"] == SECRET
+    with pytest.raises(PermissionError, match="outside --readable-paths"):
+        dispatch._contract_file(str(path))
 
 
 def _tree(root: Path, skip: Path) -> Dict[str, Optional[bytes]]:

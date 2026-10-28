@@ -430,3 +430,30 @@ def test_list_source_adapters_reports_eleven_sources():
     kinds = {entry["name"]: entry["kind"] for entry in adapters}
     assert kinds["postgres"] == "jdbc"
     assert kinds["snowflake"] == "catalog"
+
+
+def test_a_fragment_outside_the_readable_paths_is_refused(tmp_path: Path, monkeypatch):
+    """A workspace ref_root may widen the ref root past --readable-paths: a contract the
+    policy lets the tool read must not compose, and echo, a file the policy does not."""
+    import fluid_build.cli.mcp as mcp_mod
+    from fluid_build.cli.mcp.policy import McpPolicy
+
+    (tmp_path / "secret").mkdir()
+    (tmp_path / "secret" / "s.yaml").write_text("api_key: SECRET-1\n", encoding="utf-8")
+    (tmp_path / "fluid.workspace.yaml").write_text("ref_root: .\n", encoding="utf-8")
+    product = tmp_path / "products" / "a"
+    product.mkdir(parents=True)
+    contract = product / "c.yaml"
+    split = {**SAMPLE_CONTRACT, "description": {"$ref": "../../secret/s.yaml"}}
+    contract.write_text(yaml.safe_dump(split), encoding="utf-8")
+    policy = McpPolicy(readable_paths=(product.resolve(),), writable_paths=(product.resolve(),))
+    monkeypatch.setattr(mcp_mod, "_policy", lambda: policy)
+
+    with pytest.raises(PermissionError, match="outside --readable-paths"):
+        _resolve_contract_argument({"contract_path": str(contract)})
+    # Inside the readable root it composes, as before.
+    wide = McpPolicy(readable_paths=(tmp_path.resolve(),), writable_paths=(tmp_path.resolve(),))
+    monkeypatch.setattr(mcp_mod, "_policy", lambda: wide)
+    assert _resolve_contract_argument({"contract_path": str(contract)})["description"] == {
+        "api_key": "SECRET-1"
+    }
