@@ -757,3 +757,46 @@ def test_k20_a_path_with_dotdot_meets_the_same_gate_as_plain_validate(
     assert "path_traversal_detected" in out_frag + err_frag
     # and with the same spelling absent, the same fragment is fine
     assert _validate(capsys, "--fragment", "expose", fragment)[0] == 0
+
+
+def test_a_symlinked_contract_above_a_fragment_does_not_choose_its_ref_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A planted ``contract.fluid.yaml`` link must not point a fragment's root at a home
+    directory: the link is not taken, so the fragment keeps its own directory's root."""
+    from fluid_build.cli import main
+
+    home = tmp_path / "home"
+    (home / ".docker").mkdir(parents=True)
+    (home / ".profile").write_text("# profile\n", encoding="utf-8")
+    (home / ".docker" / "config.json").write_text('{"auths": {"r": {"auth": "SECRET-1"}}}', "utf-8")
+    repo = tmp_path / "repo"
+    (repo / "fragments" / "exposes").mkdir(parents=True)
+    (repo / "contract.fluid.yaml").symlink_to(home / ".profile")
+    fragment = repo / "fragments" / "exposes" / "orders.yaml"
+    fragment.write_text(
+        "exposeId: {$ref: ../../../home/.docker/config.json}\nkind: table\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(repo)
+
+    code = main(["validate", "--fragment", "expose", "fragments/exposes/orders.yaml"])
+    out = capsys.readouterr()
+
+    assert code == 1
+    assert "SECRET-1" not in out.out + out.err
+    assert "escapes the ref root" in out.out + out.err
+
+
+def test_the_contract_lookup_stops_at_the_fragments_repository(tmp_path: Path) -> None:
+    from fluid_build.cli.validate import _nearest_contract
+
+    (tmp_path / "contract.fluid.yaml").write_text("id: outer\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    fragment = repo / "fragments" / "x.yaml"
+    fragment.parent.mkdir()
+    fragment.write_text("a: 1\n", encoding="utf-8")
+
+    assert _nearest_contract(fragment) is None
+    (repo / "contract.fluid.yaml").write_text("id: inner\n", encoding="utf-8")
+    assert _nearest_contract(fragment) == (repo / "contract.fluid.yaml").resolve()

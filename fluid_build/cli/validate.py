@@ -512,6 +512,7 @@ def _run_fragment_validation(
     """
     import fluid_build.cli.validate as _self
     from fluid_build import contract_refs, loader
+    from fluid_build.util.ref_confinement import RefConfinementError, is_within
 
     kind = args.fragment
     if getattr(args, "env", None):
@@ -548,6 +549,11 @@ def _run_fragment_validation(
             if contract is not None
             else loader._RefRoot(fragment.resolve().parent)
         )
+        if not is_within(fragment.resolve(), root.ref_root):
+            raise RefConfinementError(
+                f"fragment {fragment} is outside the ref root of its contract {contract} "
+                f"({root.ref_root}): a fragment is checked under the root its contract has"
+            )
         document = contract_refs.resolve_file_refs(
             raw,
             fragment.resolve().parent,
@@ -591,13 +597,23 @@ def _run_fragment_validation(
 
 
 def _nearest_contract(fragment: Path) -> Optional[Path]:
-    """The root contract nearest above ``fragment``, the one it most likely belongs to."""
+    """The root contract nearest above ``fragment``, the one it most likely belongs to.
+
+    It chooses the fragment's ref root, so a symlink is never taken for it (the
+    CLI refuses a symlinked contract path for the same reason: a planted link
+    would point the root anywhere), and the walk stops at the fragment's
+    repository or workspace (a directory holding ``.git`` or
+    ``fluid.workspace.yaml``), so an unrelated contract higher up, in a home
+    directory say, cannot widen it.
+    """
     start = fragment.resolve()
     for directory in start.parents:
         for name in _CONTRACT_FILE_NAMES:
             candidate = directory / name
-            if candidate.is_file() and candidate != start:
+            if candidate != start and not candidate.is_symlink() and candidate.is_file():
                 return candidate
+        if (directory / ".git").exists() or (directory / "fluid.workspace.yaml").is_file():
+            return None
     return None
 
 
