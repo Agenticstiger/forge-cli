@@ -36,7 +36,7 @@ from typing import Any, Dict, Iterator, List, Optional
 import pytest
 import yaml
 
-import fluid_build
+from fluid_build import loader
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 SECRET = "SECRET-1"  # pragma: allowlist secret
@@ -82,8 +82,6 @@ exposes:
 @pytest.fixture(autouse=True)
 def _fresh_loader_state() -> Iterator[None]:
     """The loader's warn-once registries empty (the children start fresh anyway)."""
-    from fluid_build import loader
-
     registries = [
         value
         for name, value in vars(loader).items()
@@ -228,7 +226,7 @@ def test_the_subprocess_runs_this_checkout(tmp_path: Path) -> None:
         timeout=60,
     )
     assert Path(probe.stdout.strip()).resolve().is_relative_to(CHECKOUT)
-    assert Path(fluid_build.__file__).resolve().is_relative_to(CHECKOUT)
+    assert Path(loader.__file__).resolve().is_relative_to(CHECKOUT)
 
 
 # ── D-17: devices under FLUID_REF_ROOT=/ are refused, never read ───────

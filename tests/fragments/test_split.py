@@ -43,7 +43,6 @@ from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Seq
 import pytest
 import yaml
 
-import fluid_build
 from fluid_build import loader
 from fluid_build.loader import compose_contract
 
@@ -493,7 +492,7 @@ def split_0_24_0(contract: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, st
 
 
 def test_i01_fluid_build_is_the_checkout_under_test() -> None:
-    assert Path(fluid_build.__file__).resolve().is_relative_to(REPO)
+    assert Path(loader.__file__).resolve().is_relative_to(REPO)
 
 
 def test_i01_default_split_writes_the_0_24_0_paths_and_data(tmp_path: Path) -> None:

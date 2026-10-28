@@ -435,7 +435,7 @@ def test_list_source_adapters_reports_eleven_sources():
 def test_a_fragment_outside_the_readable_paths_is_refused(tmp_path: Path, monkeypatch):
     """A workspace ref_root may widen the ref root past --readable-paths: a contract the
     policy lets the tool read must not compose, and echo, a file the policy does not."""
-    import fluid_build.cli.mcp as mcp_mod
+    from fluid_build.cli import mcp as mcp_mod
     from fluid_build.cli.mcp.policy import McpPolicy
 
     (tmp_path / "secret").mkdir()
@@ -468,7 +468,7 @@ def test_a_ref_outside_the_readable_paths_fails_before_the_file_is_read(
 ):
     """A composition that fails must not quote a file outside --readable-paths either: the
     ref root is capped to the readable path before any fragment is opened."""
-    import fluid_build.cli.mcp as mcp_mod
+    from fluid_build.cli import mcp as mcp_mod
     from fluid_build.cli.mcp.policy import McpPolicy
 
     (tmp_path / "secret").mkdir()

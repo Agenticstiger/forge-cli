@@ -34,7 +34,6 @@ from typing import Any, Dict, Sequence, Tuple
 import pytest
 import yaml
 
-import fluid_build
 from fluid_build import loader
 
 _CHECKOUT = Path(__file__).resolve().parents[2]
@@ -42,7 +41,7 @@ _CHECKOUT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture(scope="module", autouse=True)
 def _the_checkout_under_test_is_the_one_imported() -> None:
-    imported = Path(fluid_build.__file__).resolve()
+    imported = Path(loader.__file__).resolve()
     assert imported.is_relative_to(_CHECKOUT), f"{imported} is not inside {_CHECKOUT}"
 
 

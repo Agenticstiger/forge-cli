@@ -59,7 +59,6 @@ from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Se
 import pytest
 import yaml
 
-import fluid_build
 from fluid_build import loader
 from fluid_build.loader import (
     RefConfinementError,
@@ -83,7 +82,7 @@ SECRET = "SECRET-1"  # pragma: allowlist secret
 @pytest.fixture(scope="session", autouse=True)
 def _the_checkout_under_test_is_the_one_that_runs() -> None:
     """Prove which ``fluid_build`` the in-process tests exercise (subprocesses get PYTHONPATH)."""
-    loaded = Path(fluid_build.__file__).resolve()
+    loaded = Path(loader.__file__).resolve()
     assert loaded.is_relative_to(REPO_ROOT), f"{loaded} is not inside the checkout {REPO_ROOT}"
 
 

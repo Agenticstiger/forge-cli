@@ -60,11 +60,10 @@ from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Set, Tuple
 import pytest
 import yaml
 
-import fluid_build
 from fluid_build import loader
 
 _CHECKOUT = Path(__file__).resolve().parents[2]
-_PACKAGE = Path(fluid_build.__file__).resolve().parent
+_PACKAGE = Path(loader.__file__).resolve().parent
 
 
 @pytest.fixture(scope="module", autouse=True)

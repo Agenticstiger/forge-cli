@@ -43,7 +43,6 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import pytest
 import yaml
 
-import fluid_build
 from fluid_build import contract_refs, loader
 from fluid_build.contract_refs import RefBudget, resolve_file_refs, resolve_pointer_refs
 from fluid_build.loader import RefResolutionError, load_contract, load_with_overlay
@@ -476,7 +475,7 @@ def test_e11_catalog_bomb_of_thirty_levels_is_ended_by_the_depth_limit_in_second
 
 
 def _checkout_root() -> Path:
-    return Path(fluid_build.__file__).resolve().parent.parent
+    return Path(loader.__file__).resolve().parent.parent
 
 
 def _cli_subprocess(args: list, cwd: Path, timeout: float) -> subprocess.CompletedProcess:

@@ -40,7 +40,7 @@ from typing import Any, Dict, List, Optional
 import pytest
 import yaml
 
-import fluid_build
+from fluid_build import loader
 
 _REPO = Path(__file__).resolve().parents[2]
 _EXAMPLES = _REPO / "examples"
@@ -53,7 +53,7 @@ ALL_PARTS = "sovereignty,accessPolicy,builds,exposes,sql,quality,schema,extensio
 @pytest.fixture(scope="module", autouse=True)
 def _the_checkout_under_test_is_the_one_running() -> None:
     """The tests live in a checkout; the code they exercise must be that checkout's."""
-    running = Path(fluid_build.__file__).resolve()
+    running = Path(loader.__file__).resolve()
     assert running.is_relative_to(_REPO), f"{running} is not inside {_REPO}"
 
 
@@ -70,7 +70,6 @@ def _private_schema_cache(tmp_path_factory: pytest.TempPathFactory) -> Any:
 @pytest.fixture(autouse=True)
 def _fresh_loader_state(monkeypatch: pytest.MonkeyPatch) -> Any:
     """The loader's warn-once registries are process-wide; the ref-root variables are ambient."""
-    from fluid_build import loader
 
     def clear() -> None:
         for name in dir(loader):
@@ -1043,7 +1042,7 @@ def _imported_names(node: Any) -> List[str]:
 def test_j14_docs_build_does_not_import_the_loader_at_module_scope() -> None:
     import ast
 
-    source = (Path(fluid_build.__file__).parent / "cli" / "docs_build.py").read_text("utf-8")
+    source = (Path(loader.__file__).parent / "cli" / "docs_build.py").read_text("utf-8")
     heavy = ("fluid_build.loader", "fluid_build.contract_refs", "fluid_build.schema_manager")
     for node in ast.parse(source).body:
         offenders = [

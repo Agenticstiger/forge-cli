@@ -51,7 +51,6 @@ from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Sequence, Tu
 import pytest
 import yaml
 
-import fluid_build
 from fluid_build import loader
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -63,7 +62,7 @@ RELEASE_TAG = "v0.24.0"
 
 @pytest.fixture(scope="session", autouse=True)
 def _the_checkout_under_test_is_the_one_that_runs() -> None:
-    loaded = Path(fluid_build.__file__).resolve()
+    loaded = Path(loader.__file__).resolve()
     assert loaded.is_relative_to(REPO_ROOT), f"{loaded} is not inside the checkout {REPO_ROOT}"
 
 

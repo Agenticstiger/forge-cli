@@ -46,7 +46,6 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import pytest
 import yaml
 
-import fluid_build
 from fluid_build import contract_refs, loader
 from fluid_build.api import ContractLoadError, load_contract_from_dict, load_contract_from_text
 from fluid_build.api import load_contract as api_load_contract
@@ -275,7 +274,7 @@ class _FileSpy:
 
 
 def test_the_checkout_under_test_is_the_one_imported() -> None:
-    assert Path(fluid_build.__file__).resolve().is_relative_to(CHECKOUT)
+    assert Path(loader.__file__).resolve().is_relative_to(CHECKOUT)
 
 
 # ── D-01 .. D-04: escapes are refused, wherever they are written ───────
@@ -1890,7 +1889,7 @@ def test_dx05_mcp_readable_paths_gate_the_ref_targets_too(
     """``--readable-paths`` gates ``contract_path`` and every file its composition reads: a
     workspace ``ref_root`` wider than the readable paths does not let a contract the policy
     admits compose, and echo, a file the policy does not."""
-    import fluid_build.cli.mcp as mcp_mod
+    from fluid_build.cli import mcp as mcp_mod
     from fluid_build.cli.mcp import dispatch
     from fluid_build.cli.mcp.policy import McpPolicy, check_tool_permission
 

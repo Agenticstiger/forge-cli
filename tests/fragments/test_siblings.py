@@ -38,7 +38,6 @@ from typing import Any, Dict, Iterator, List, Tuple
 import pytest
 import yaml
 
-import fluid_build
 from fluid_build import contract_refs, loader
 from fluid_build.contract_refs import resolve_file_refs
 from fluid_build.loader import RefConfinementError, RefResolutionError
@@ -145,7 +144,7 @@ def _spy_on_reads(monkeypatch: pytest.MonkeyPatch) -> List[str]:
 def test_b00_import_origin_is_this_checkout() -> None:
     """The tests run against the checkout they sit in, never a stale installed copy."""
     checkout = Path(__file__).resolve().parents[2]
-    assert Path(fluid_build.__file__).resolve().is_relative_to(checkout)
+    assert Path(loader.__file__).resolve().is_relative_to(checkout)
 
 
 # ── B. siblings and merge patch (RFC 7386) ──────────────────────────────

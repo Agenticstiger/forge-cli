@@ -36,7 +36,6 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import pytest
 import yaml
 
-import fluid_build
 from fluid_build import loader
 from fluid_build.contract_refs import MAX_TEXT_REF_BYTES, ComposeTrace, resolve_file_refs
 from fluid_build.loader import RefResolutionError
@@ -142,7 +141,7 @@ def _bundle(
 def test_n00_import_origin_is_this_checkout() -> None:
     """The tests run against the checkout they sit in, never a stale installed copy."""
     checkout = Path(__file__).resolve().parents[2]
-    assert Path(fluid_build.__file__).resolve().is_relative_to(checkout)
+    assert Path(loader.__file__).resolve().is_relative_to(checkout)
 
 
 # ── N-01 .. N-05: bytes, line endings, empty files, caps, other encodings ──

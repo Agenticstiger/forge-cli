@@ -44,7 +44,6 @@ import jsonschema
 import pytest
 import yaml
 
-import fluid_build
 from fluid_build import schema_authoring
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -68,7 +67,7 @@ _V0_24_0_SHA256 = {
 
 @pytest.fixture(scope="module", autouse=True)
 def _the_checkout_under_test_is_the_one_running() -> None:
-    running = Path(fluid_build.__file__).resolve()
+    running = Path(schema_authoring.__file__).resolve()
     assert running.is_relative_to(_REPO), f"{running} is not inside {_REPO}"
 
 
@@ -866,7 +865,7 @@ def test_k09_the_wheel_and_the_sdist_include_the_file() -> None:
 
     config = tomllib.loads((_REPO / "pyproject.toml").read_text("utf-8"))
     patterns = config["tool"]["setuptools"]["package-data"]["fluid_build"]
-    package = Path(fluid_build.__file__).parent
+    package = Path(schema_authoring.__file__).parent
     shipped = {
         Path(match).as_posix()
         for pattern in patterns

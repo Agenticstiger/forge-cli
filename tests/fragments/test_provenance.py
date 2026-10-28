@@ -53,7 +53,6 @@ from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tup
 
 import pytest
 
-import fluid_build
 from fluid_build import contract_refs, loader
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -156,7 +155,7 @@ def _hermetic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Run in tmp_path, with no ref-root override from the environment, and with
     the loader's warn-once registries empty before and after. The code under test
     must be the checkout this file lives in, not another one on the path."""
-    assert Path(fluid_build.__file__).resolve().is_relative_to(CHECKOUT), fluid_build.__file__
+    assert Path(loader.__file__).resolve().is_relative_to(CHECKOUT), loader.__file__
     monkeypatch.chdir(tmp_path)
     for name in ("FLUID_REF_ROOT", "FLUID_IGNORE_WORKSPACE_REF_ROOT"):
         monkeypatch.delenv(name, raising=False)

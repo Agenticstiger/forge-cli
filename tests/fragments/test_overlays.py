@@ -43,7 +43,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pytest
 import yaml
 
-import fluid_build
 from fluid_build import loader
 from fluid_build.loader import RefConfinementError, RefResolutionError
 
@@ -65,7 +64,7 @@ def _clear_loader_registries() -> None:
 
 @pytest.fixture(scope="module", autouse=True)
 def _the_checkout_under_test_is_the_one_imported() -> None:
-    imported = Path(fluid_build.__file__).resolve()
+    imported = Path(loader.__file__).resolve()
     assert imported.is_relative_to(_CHECKOUT), f"{imported} is not inside {_CHECKOUT}"
 
 

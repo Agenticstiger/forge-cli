@@ -34,10 +34,10 @@ import jsonschema
 import pytest
 import yaml
 
-import fluid_build
+from fluid_build import loader
 
 _REPO = Path(__file__).resolve().parents[2]
-_SCHEMAS = Path(fluid_build.__file__).parent / "schemas"
+_SCHEMAS = Path(loader.__file__).parent / "schemas"
 
 
 # ── fixtures ────────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ _SCHEMAS = Path(fluid_build.__file__).parent / "schemas"
 
 @pytest.fixture(scope="module", autouse=True)
 def _the_checkout_under_test_is_the_one_running() -> None:
-    running = Path(fluid_build.__file__).resolve()
+    running = Path(loader.__file__).resolve()
     assert running.is_relative_to(_REPO), f"{running} is not inside {_REPO}"
 
 
@@ -61,8 +61,6 @@ def _private_schema_cache(tmp_path_factory: pytest.TempPathFactory) -> Any:
 
 @pytest.fixture(autouse=True)
 def _fresh_loader_state(monkeypatch: pytest.MonkeyPatch) -> Any:
-    from fluid_build import loader
-
     def clear() -> None:
         for name in dir(loader):
             if name.startswith("_NOTED_") and isinstance(getattr(loader, name), set):
