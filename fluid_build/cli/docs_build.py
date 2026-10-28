@@ -62,8 +62,9 @@ def run(args, logger: logging.Logger) -> int:
         # per-contract drill-in pages without re-parsing.
         contracts = {p: _load_contract_quiet(p, logger) for p in paths}
         entries = [_summarize_contract(p, c, error) for p, (c, error) in contracts.items()]
-        # Sort by id for deterministic output.
-        entries.sort(key=lambda e: (e.get("id") or "", e.get("path", "")))
+        # Sort by id for deterministic output. An id is whatever the contract
+        # holds, so it is compared as text: a number does not sort against a string.
+        entries.sort(key=lambda e: (str(e.get("id") or ""), str(e.get("path", ""))))
         # Two contracts with one id would write one page; each gets its own.
         slugs = _unique_slugs(entries)
 
@@ -131,32 +132,63 @@ def _resolve_contract_paths(args) -> list[str]:
     return sorted(found)
 
 
+def _plain(value: Any) -> Any:
+    """``value`` as plain JSON data.
+
+    What a contract may hold that JSON has no type for (a YAML date, a set)
+    becomes its text, and a key that is not a string becomes one, so one odd
+    value cannot make the catalog unwritable.
+    """
+    if isinstance(value, Mapping):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _items(value: Any) -> list[Any]:
+    """The entries of a list-valued key; a value that is not a list holds none."""
+    return value if isinstance(value, list) else []
+
+
+def _count(value: Any) -> int:
+    """How many entries a list-valued key holds."""
+    return len(_items(value))
+
+
 def _summarize_contract(path: str, contract: Any, error: Any = None) -> dict[str, Any]:
     """Extract a small set of header fields for the index.
 
     The JSON keeps the contract's own values (``description`` and ``owner``
-    may be objects); the HTML renders them as text.
+    may be objects); the HTML renders them as text. A contract that did not
+    load, or whose values cannot be listed, gets a row with its ``error`` and
+    no ``id``: one bad contract is not the catalog.
     """
     if not isinstance(contract, Mapping):
         return {"path": path, "id": None, "error": error or "not a mapping"}
 
-    metadata = contract.get("metadata") if isinstance(contract.get("metadata"), Mapping) else {}
-    return {
-        "path": path,
-        "slug": _slug_for(contract, path),
-        "id": contract.get("id"),
-        "name": contract.get("name"),
-        "description": contract.get("description"),
-        "fluidVersion": contract.get("fluidVersion"),
-        "kind": contract.get("kind"),
-        "owner": metadata.get("owner"),
-        "domain": contract.get("domain") or metadata.get("domain"),
-        "layer": metadata.get("layer"),
-        "productType": metadata.get("productType"),
-        "tags": contract.get("tags") or metadata.get("tags"),
-        "exposes_count": len(contract.get("exposes") or []),
-        "consumes_count": len(contract.get("consumes") or []),
-    }
+    try:
+        metadata = contract.get("metadata") if isinstance(contract.get("metadata"), Mapping) else {}
+        return {
+            "path": path,
+            "slug": _slug_for(contract, path),
+            "id": _plain(contract.get("id")),
+            "name": _plain(contract.get("name")),
+            "description": _plain(contract.get("description")),
+            "fluidVersion": _plain(contract.get("fluidVersion")),
+            "kind": _plain(contract.get("kind")),
+            "owner": _plain(metadata.get("owner")),
+            "domain": _plain(contract.get("domain") or metadata.get("domain")),
+            "layer": _plain(metadata.get("layer")),
+            "productType": _plain(metadata.get("productType")),
+            "tags": _plain(contract.get("tags") or metadata.get("tags")),
+            "exposes_count": _count(contract.get("exposes")),
+            "consumes_count": _count(contract.get("consumes")),
+        }
+    except Exception as exc:  # noqa: BLE001 - one odd contract, not the catalog
+        return {"path": path, "id": None, "error": f"not listed: {exc}"}
 
 
 def _load_contract_quiet(path: str, logger: logging.Logger) -> tuple[Any, Any]:
@@ -284,7 +316,7 @@ def _render_index_html(entries: list[dict[str, Any]]) -> str:
                 layer,
                 product_type,
                 _description_text(e.get("description")),
-                " ".join(tags) if isinstance(tags, list) else "",
+                " ".join(str(t) for t in tags) if isinstance(tags, list) else "",
                 e.get("path"),
             ]
         ).lower()
@@ -357,14 +389,14 @@ def _render_contract_html(contract: Mapping[str, Any], path: str) -> str:
 
     # --- Exposes (one section per exposed dataset) ---
     expose_sections: list[str] = []
-    for idx, expose in enumerate(contract.get("exposes") or []):
+    for idx, expose in enumerate(_items(contract.get("exposes"))):
         if not isinstance(expose, Mapping):
             continue
         expose_sections.append(_render_expose_html(expose, idx))
     exposes_html = "\n".join(expose_sections) or "<p><em>No exposed datasets.</em></p>"
 
     # --- Consumes ---
-    consumes = contract.get("consumes") or []
+    consumes = _items(contract.get("consumes"))
     consumes_rows = []
     for c in consumes:
         if not isinstance(c, Mapping):

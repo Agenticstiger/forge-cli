@@ -1055,13 +1055,6 @@ _ODD = [
 
 
 @pytest.mark.parametrize("odd", _ODD)
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG DOCS-ABORT: a contract holding a value of an unexpected type (non-string id, "
-    "non-string tags, a YAML date, exposes that is not a list) makes fluid docs fail as a whole "
-    "('docs_failed', naming no contract), against spec 10: one bad contract does not abort the "
-    "catalog",
-)
 def test_j04x_one_contract_with_an_odd_value_does_not_abort_the_catalog(
     tmp_path: Path, odd: Dict[str, Any]
 ) -> None:
@@ -1073,6 +1066,34 @@ def test_j04x_one_contract_with_an_odd_value_does_not_abort_the_catalog(
 
     assert (out / "contract-good-one.html").is_file()
     assert len(_index(out)) == 2
+
+
+def test_j04x_a_contract_with_odd_values_is_listed_with_them_as_text(tmp_path: Path) -> None:
+    _put(tmp_path / "good" / "contract.fluid.yaml", _min_doc("good.one"))
+    _put(
+        tmp_path / "odd" / "contract.fluid.yaml",
+        _min_doc(
+            "odd.one",
+            id=123,
+            tags=[1, datetime.date(2024, 1, 1)],
+            exposes=5,
+            consumes=5,
+            metadata={"owner": {"team": "t", datetime.date(2024, 1, 2): "a date for a key"}},
+        ),
+    )
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    (row,) = [r for r in _index(out) if r["id"] == 123]
+    assert row["tags"] == [1, "2024-01-01"]
+    assert row["exposes_count"] == row["consumes_count"] == 0
+    assert row["owner"] == {"team": "t", "2024-01-02": "a date for a key"}
+    assert "error" not in row
+    page = _page(out, row["slug"])
+    assert "No exposed datasets." in page and "No upstream products." in page
+    index = (out / "index.html").read_text("utf-8")
+    assert '<span class="tag">1</span>' in index and '<span class="tag">2024-01-01</span>' in index
 
 
 # ── J-14 ────────────────────────────────────────────────────────────────
