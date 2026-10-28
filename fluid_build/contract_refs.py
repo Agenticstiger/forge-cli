@@ -148,12 +148,12 @@ MAX_REF_EXPANSION_CHARS = 10 * MAX_TEXT_REF_BYTES
 MAX_REF_RESOLUTIONS = 10_000
 
 #: How deep the composed contract may nest, the root object counted as one
-#: level. Every YAML file is held to ``util.safe_yaml.MAX_YAML_DEPTH`` (128),
-#: but fragments, one inside another, nest deeper than any file, and past
-#: about 330 levels the YAML writer of ``fluid bundle`` exhausts the recursion
-#: limit, so ``validate`` would accept a contract ``bundle`` cannot write. Held
-#: well below that, at compose time, every command reads the same contract.
-MAX_COMPOSED_DEPTH = 200
+#: level, as ``util.safe_yaml.MAX_YAML_DEPTH`` (128) counts a YAML file.
+#: Fragments, one inside another, nest deeper than any file may; held to the
+#: same cap at compose time, every command reads the same contract, and the
+#: bundle of any contract that composes (one YAML file) reads back. (Past about
+#: 330 levels the YAML writer of ``fluid bundle`` would not even write it.)
+MAX_COMPOSED_DEPTH = 128
 
 
 def is_ref_node(obj: Any) -> bool:
@@ -343,6 +343,7 @@ class ComposeTrace:
 
     def __init__(self, origins: Optional["ContractOrigins"] = None) -> None:
         self.files: List[Path] = []
+        self._seen_files: Set[Path] = set()
         self.origins = origins
         # id(node) -> (node, file, pointer in that file). The node is held so
         # its id cannot be reused by another object while the trace lives.
@@ -351,7 +352,8 @@ class ComposeTrace:
         self._replaced: Dict[int, Tuple[Any, str]] = {}
 
     def add_file(self, path: Path) -> None:
-        if path not in self.files:
+        if path not in self._seen_files:  # a set: a list scan per ref was quadratic
+            self._seen_files.add(path)
             self.files.append(path)
 
     def note_pointer(self, node: Any, source: Optional[Path], loc: Pointer) -> None:

@@ -312,10 +312,15 @@ def test_e09_one_fragment_nested_a_hundred_yaml_levels_is_not_ref_depth(
 
 
 def test_e09_yaml_nesting_has_its_own_cap_of_128_levels(tmp_path: Path) -> None:
-    _write(tmp_path / "ok.yaml", _nested_flow(128, "leaf") + "\n")
+    """A file may nest 128 levels; the composed contract too, its root counted, so a
+    fragment of 128 levels under the root (129 composed) is refused by the composed cap."""
+    _write(tmp_path / "ok.yaml", _nested_flow(127, "leaf") + "\n")
+    _write(tmp_path / "deepest.yaml", _nested_flow(128, "leaf") + "\n")
     _write(tmp_path / "over.yaml", _nested_flow(129, "leaf") + "\n")
 
-    assert _depth_of(load_contract(_contract(tmp_path, "r: {$ref: ./ok.yaml}\n"))["r"], "k") == 128
+    assert _depth_of(load_contract(_contract(tmp_path, "r: {$ref: ./ok.yaml}\n"))["r"], "k") == 127
+    path = _contract(tmp_path, "r: {$ref: ./deepest.yaml}\n")
+    _ref_error(lambda: load_contract(path), has=("more than 128 levels deep",))
 
     path = _contract(tmp_path, "r: {$ref: ./over.yaml}\n")
     message = _ref_error(lambda: load_contract(path), file=path, pointer="/r")
@@ -362,8 +367,10 @@ def test_e10_validate_and_bundle_agree_on_a_deep_composed_contract_sg34(
     ``MAX_COMPOSED_DEPTH`` levels, well below the writer's limit: at the cap both commands
     succeed, past it both refuse with a ref error that names the cap, and neither crashes."""
     monkeypatch.chdir(tmp_path)
+    from fluid_build.util.safe_yaml import MAX_YAML_DEPTH, load_yaml_safe
+
     cap = contract_refs.MAX_COMPOSED_DEPTH
-    assert cap == 200
+    assert cap == MAX_YAML_DEPTH  # so a bundle of any contract that composes reads back
 
     at_cap = _deep_product(tmp_path / "at-cap", cap)
     composed = load_contract(at_cap)
@@ -371,7 +378,7 @@ def test_e10_validate_and_bundle_agree_on_a_deep_composed_contract_sg34(
     capsys.readouterr()
     assert _cli("validate", str(at_cap)) == 0
     assert _cli("bundle", str(at_cap), "--out", str(tmp_path / "at-cap.yaml")) == 0
-    written = yaml.safe_load((tmp_path / "at-cap.yaml").read_text(encoding="utf-8"))
+    written = load_yaml_safe((tmp_path / "at-cap.yaml").read_text(encoding="utf-8"))
     assert _depth_of(written["extensions"]["deep"], "k") == cap - 2
 
     # One level past the cap, and the 600 levels (10 fragments of 60) that bundle could not write.
