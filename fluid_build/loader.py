@@ -36,12 +36,19 @@ from typing import (
     Union,
 )
 
+from fluid_build.contract_refs import (
+    MAX_REF_DEPTH,
+    ComposeTrace,
+    is_ref_node,
+    parse_ref,
+    pointer_tokens,
+    resolve_file_refs,
+    resolve_pointer,
+)
 from fluid_build.util.ref_confinement import (
     REF_ROOT_ENV,
     RefConfinementError,
     RefResolutionError,
-    confine_ref,
-    format_pointer,
     iter_external_refs,
 )
 
@@ -495,13 +502,15 @@ def _log_warning_once(text: str, extra: Dict[str, Any]) -> None:
 # $ref resolution — multi-file contract composition
 # ---------------------------------------------------------------------------
 
-_MAX_REF_DEPTH = 20  # safety limit against accidental deep nesting
-
-
-# ``RefResolutionError`` and its confinement subclass live in
-# ``fluid_build.util.ref_confinement`` (stdlib-only, shared with the bundle
-# OpenAPI validator) and are re-exported here, so
-# ``from fluid_build.loader import RefResolutionError`` keeps working.
+# The resolver lives in ``fluid_build.contract_refs``; these names are kept for
+# the callers and tests that import them from here. ``RefResolutionError`` and
+# its confinement subclass live in ``fluid_build.util.ref_confinement``
+# (stdlib-only, shared with the bundle OpenAPI validator) and are re-exported
+# here, so ``from fluid_build.loader import RefResolutionError`` keeps working.
+_MAX_REF_DEPTH = MAX_REF_DEPTH
+_is_ref_node = is_ref_node
+_parse_ref = parse_ref
+_resolve_pointer = resolve_pointer
 
 _REF_ROOT_HINT = (
     f"To compose fragments from a wider tree (e.g. a monorepo's shared/ "
@@ -510,61 +519,9 @@ _REF_ROOT_HINT = (
 )
 
 
-def _is_ref_node(obj: Any) -> bool:
-    """Return True if *obj* is a dict containing a single ``$ref`` key."""
-    return isinstance(obj, dict) and "$ref" in obj and len(obj) == 1
-
-
-def _parse_ref(ref_value: str) -> Tuple[str, Optional[str]]:
-    """Split a $ref value into (file_path, json_pointer | None).
-
-    Examples:
-        "./schemas/user.yaml"          → ("./schemas/user.yaml", None)
-        "./schemas/user.yaml#/User"    → ("./schemas/user.yaml", "/User")
-        "#/definitions/common"         → ("", "/definitions/common")
-    """
-    if "#" in ref_value:
-        file_part, pointer = ref_value.split("#", 1)
-        return file_part, pointer or None
-    return ref_value, None
-
-
-def _resolve_pointer(obj: Any, pointer: str) -> Any:
-    """Resolve a JSON-pointer style path (e.g. ``/builds/0``) into *obj*.
-
-    Only supports ``/key`` and ``/index`` segments — enough for FLUID contracts.
-    """
-    if not pointer or pointer == "/":
-        return obj
-    parts = pointer.strip("/").split("/")
-    current = obj
-    for part in parts:
-        if isinstance(current, dict):
-            if part not in current:
-                raise RefResolutionError(
-                    f"JSON pointer segment '{part}' not found in object "
-                    f"(available keys: {list(current.keys())})"
-                )
-            current = current[part]
-        elif isinstance(current, list):
-            try:
-                current = current[int(part)]
-            except (ValueError, IndexError) as exc:
-                raise RefResolutionError(
-                    f"JSON pointer segment '{part}' is not a valid list index"
-                ) from exc
-        else:
-            raise RefResolutionError(
-                f"Cannot traverse into {type(current).__name__} with pointer segment '{part}'"
-            )
-    return current
-
-
 def _pointer_parts(pointer: Optional[str]) -> Tuple[str, ...]:
     """Segments of a ``#/a/b`` fragment, for error locations."""
-    if not pointer or pointer == "/":
-        return ()
-    return tuple(pointer.strip("/").split("/"))
+    return pointer_tokens(pointer)
 
 
 def _resolve_refs(
@@ -575,180 +532,26 @@ def _resolve_refs(
     root_hint: str = _REF_ROOT_HINT,
     ignored_ref_root_env: Optional[str] = None,
     _source: Optional[Path] = None,
-    _loc: Tuple[Union[str, int], ...] = (),
-    _seen: Optional[Set[str]] = None,
-    _depth: int = 0,
+    _trace: Optional[ComposeTrace] = None,
 ) -> Any:
-    """Recursively resolve ``$ref`` pointers in a parsed contract tree.
+    """Resolve every ``$ref`` to a file in a parsed contract tree.
 
-    Supports:
-      - External file refs:  ``$ref: ./path/to/file.yaml``
-      - File + pointer:      ``$ref: ./file.yaml#/section``
-      - Same-file pointer:   ``$ref: "#/definitions/x"`` (left in place as-is)
-      - Refs inside lists:   ``builds: [{ $ref: ./builds/ingest.yaml }]``
-
-    Protections:
-      - Confinement: every external ref goes through
-        :func:`fluid_build.util.ref_confinement.confine_ref`. The target,
-        after ``..`` and symlinks are resolved, must sit inside ``ref_root``
-        (default: ``base_dir`` of the first call, i.e. the root contract's
-        directory). Nested refs are held to the SAME root, not to the
-        directory of the fragment that contains them. URLs (``file://``
-        included) and absolute paths are refused.
-      - System-directory deny list (``SecurePathValidator``) as a second
-        layer, for callers that widen ``ref_root``.
-      - Circular reference detection (tracks resolved absolute paths)
-      - Depth limit (``_MAX_REF_DEPTH``) to prevent runaway recursion
-      - Clear error messages naming the ref and its JSON pointer.
-        ``root_hint`` ends an escape message; ``ignored_ref_root_env`` is
-        recorded on every :class:`RefConfinementError`. Both come from
-        :func:`_effective_ref_root` and are held for nested refs too.
+    See :func:`fluid_build.contract_refs.resolve_file_refs`: a ref resolves
+    relative to the file that contains it, confined to ``ref_root`` (default
+    ``base_dir``); a text target (``.sql``, ``.md``, ...) is its text; keys
+    beside ``$ref`` are merged over its target (RFC 7386). Same-document
+    ``#/...`` pointers are kept for the pointer pass. ``root_hint`` and
+    ``ignored_ref_root_env`` come from :func:`_effective_ref_root`.
     """
-    if _depth > _MAX_REF_DEPTH:
-        raise RefResolutionError(
-            f"$ref nesting depth exceeded {_MAX_REF_DEPTH} — "
-            f"possible circular reference or very deep nesting"
-        )
-
-    if _seen is None:
-        _seen = set()
-    root = base_dir if ref_root is None else ref_root
-
-    # ── Handle $ref node ──────────────────────────────────────────
-    if _is_ref_node(obj):
-        ref_value = obj["$ref"]
-        if not isinstance(ref_value, str):
-            raise RefResolutionError(f"$ref value must be a string, got {type(ref_value).__name__}")
-
-        file_part, pointer = _parse_ref(ref_value)
-
-        if not file_part:
-            # Same-file pointer refs (#/definitions/x) — return as-is for now;
-            # these would need the root document to resolve, which is a
-            # future enhancement.
-            LOG.debug("skipping_same_file_ref", extra={"ref": ref_value})
-            return obj
-
-        # Confinement: a URL, an absolute path, or a target outside the root
-        # is refused before the target is tested for existence or opened, so
-        # a refused ref cannot probe the host for files either.
-        ref_path = confine_ref(
-            ref_value,
-            file_part,
-            base_dir=base_dir,
-            root=root,
-            pointer=format_pointer(_loc),
-            source=_source,
-            root_hint=root_hint,
-            ignored_ref_root_env=ignored_ref_root_env,
-        )
-
-        # Defense in depth (F3): system directories stay blocked even when a
-        # caller widens ``ref_root``. Route through the platform-aware
-        # ``SecurePathValidator`` so the deny set matches the rest of the
-        # CLI (it knows macOS ``/etc`` is ``/private/etc``). Imported lazily
-        # to keep ``loader.py``'s import graph free of the ``cli`` package.
-        try:
-            from fluid_build.cli.core import FluidCLIError
-            from fluid_build.cli.security import SecurePathValidator, get_security_context
-
-            SecurePathValidator(get_security_context())._validate_path_security(ref_path, "read")
-        except FluidCLIError as exc:
-            raise RefResolutionError(
-                f"$ref resolves to a blocked system path: {ref_value} " f"(resolved to {ref_path})"
-            ) from exc
-        except ImportError:
-            # Defensive fallback — if the cli.security module is somehow
-            # unavailable, keep the legacy prefix block so refs are still
-            # screened rather than silently allowed.
-            _ref_str = str(ref_path)
-            _BLOCKED_PREFIXES = ("/etc/", "/var/", "/usr/", "/proc/", "/sys/", "/dev/")
-            if any(_ref_str.startswith(p) for p in _BLOCKED_PREFIXES):
-                raise RefResolutionError(
-                    f"$ref resolves to a blocked system path: {ref_value} "
-                    f"(resolved to {ref_path})"
-                )
-
-        # Circular detection keyed on absolute path + pointer.
-        # Use stack-based tracking: add before descending, remove after.
-        # This allows "diamond" dependencies (same file from multiple
-        # branches) while still catching true cycles (A → B → A).
-        ref_key = f"{ref_path}#{pointer or ''}"
-        if ref_key in _seen:
-            raise RefResolutionError(f"Circular $ref detected: {ref_key}")
-        _seen.add(ref_key)
-
-        if not ref_path.exists():
-            raise RefResolutionError(f"$ref target not found: {ref_value} (resolved to {ref_path})")
-
-        try:
-            resolved = _parse_file(ref_path)
-        except Exception as e:
-            raise RefResolutionError(f"Failed to parse $ref target '{ref_value}': {e}") from e
-
-        # Apply JSON pointer if present
-        if pointer:
-            try:
-                resolved = _resolve_pointer(resolved, pointer)
-            except RefResolutionError as e:
-                raise RefResolutionError(
-                    f"Failed to resolve pointer '{pointer}' in '{ref_value}': {e}"
-                ) from e
-
-        # Recursively resolve refs in the loaded content — relative to the
-        # fragment's own directory, but confined to the ORIGINAL root.
-        result = _resolve_refs(
-            resolved,
-            ref_path.parent,
-            ref_root=root,
-            root_hint=root_hint,
-            ignored_ref_root_env=ignored_ref_root_env,
-            _source=ref_path,
-            _loc=_pointer_parts(pointer),
-            _seen=_seen,
-            _depth=_depth + 1,
-        )
-
-        # Pop from ancestry stack so sibling branches can ref the same file
-        _seen.discard(ref_key)
-        return result
-
-    # ── Recurse into dicts ────────────────────────────────────────
-    if isinstance(obj, dict):
-        return {
-            k: _resolve_refs(
-                v,
-                base_dir,
-                ref_root=root,
-                root_hint=root_hint,
-                ignored_ref_root_env=ignored_ref_root_env,
-                _source=_source,
-                _loc=(*_loc, k),
-                _seen=_seen,
-                _depth=_depth,
-            )
-            for k, v in obj.items()
-        }
-
-    # ── Recurse into lists ────────────────────────────────────────
-    if isinstance(obj, list):
-        return [
-            _resolve_refs(
-                item,
-                base_dir,
-                ref_root=root,
-                root_hint=root_hint,
-                ignored_ref_root_env=ignored_ref_root_env,
-                _source=_source,
-                _loc=(*_loc, i),
-                _seen=_seen,
-                _depth=_depth,
-            )
-            for i, item in enumerate(obj)
-        ]
-
-    # ── Scalars pass through ──────────────────────────────────────
-    return obj
+    return resolve_file_refs(
+        obj,
+        base_dir,
+        ref_root=ref_root,
+        root_hint=root_hint,
+        ignored_ref_root_env=ignored_ref_root_env,
+        source=_source,
+        trace=_trace,
+    )
 
 
 class _RefRoot(NamedTuple):
@@ -1187,6 +990,7 @@ def load_contract(
     *,
     resolve_refs: bool = True,
     ref_root: Optional[Union[str, Path]] = None,
+    _trace: Optional[ComposeTrace] = None,
 ) -> Dict[str, Any]:
     """
     Load a single FLUID contract file (JSON or YAML).
@@ -1198,7 +1002,7 @@ def load_contract(
     ``$ref`` targets are confined to the contract's directory tree; pass
     ``ref_root`` (or set ``FLUID_REF_ROOT``) to widen it to a directory that
     contains the contract. A ref outside the root raises
-    :class:`RefConfinementError`.
+    :class:`RefConfinementError`. ``_trace`` collects every file read.
     """
     p = Path(path)
     contract = _parse_file(p)
@@ -1212,6 +1016,7 @@ def load_contract(
             root_hint=root.root_hint,
             ignored_ref_root_env=root.ignored_ref_root_env,
             _source=source,
+            _trace=_trace,
         )
     return contract
 

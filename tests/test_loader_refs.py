@@ -79,8 +79,9 @@ class TestIsRefNode:
     def test_valid_ref(self):
         assert _is_ref_node({"$ref": "./file.yaml"}) is True
 
-    def test_ref_with_extra_keys_is_not_ref(self):
-        assert _is_ref_node({"$ref": "./file.yaml", "extra": True}) is False
+    def test_ref_with_sibling_keys_is_a_ref(self):
+        # The siblings are merged over the target (RFC 7386), never ignored.
+        assert _is_ref_node({"$ref": "./file.yaml", "extra": True}) is True
 
     def test_empty_dict(self):
         assert _is_ref_node({}) is False

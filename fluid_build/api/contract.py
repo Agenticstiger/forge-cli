@@ -78,10 +78,6 @@ ContractOrigin = Literal["file", "bundle", "memory"]
 
 PathLike = Union[str, "os.PathLike[str]"]
 
-# Aligned with ``fluid_build.loader._MAX_REF_DEPTH``: the provenance walk
-# never descends further than the resolver it describes.
-_MAX_REF_DEPTH = 20
-
 #: The rewrites ``_contract_loader.load_contract_with_overlay`` applies after
 #: its auto-bundle step, in its order, each ``contract -> contract``. The
 #: in-memory forms replay exactly these, by name; a guard test parses the
@@ -366,11 +362,12 @@ def load_contract_from_dict(
     if base_dir is not None:
         base = _resolve_input_path(base_dir, "base_dir")
         # ``loader.load_contract`` does exactly this after parsing the file.
+        trace = loader.ComposeTrace()
         try:
-            contract = loader._resolve_refs(contract, base)
+            contract = loader._resolve_refs(contract, base, _trace=trace)
         except Exception as exc:  # noqa: BLE001 - mapped to one typed error
             raise _as_load_error(exc, base) from exc
-        files = tuple(_walk_ref_files(document, base))
+        files = tuple(trace.files)
     else:
         # The resolver rebuilds every dict and list it passes through, so in
         # the engine no two places in the base contract share one object
@@ -664,12 +661,6 @@ def _applied_overlay(
     return None
 
 
-def _is_ref_node(node: Any) -> bool:
-    # The resolver's own test (``loader._is_ref_node``), kept local so the
-    # walk below reads as one unit.
-    return isinstance(node, dict) and "$ref" in node and len(node) == 1
-
-
 def _ref_values(node: Any) -> Tuple[str, ...]:
     """Every ``$ref`` value left in ``node``, in document order, deduplicated.
 
@@ -695,50 +686,13 @@ def _ref_values(node: Any) -> Tuple[str, ...]:
 
 
 def _composed_ref_files(contract_path: Path) -> List[Path]:
-    """The ``$ref`` target files composed into the contract at ``contract_path``."""
-    from fluid_build import loader
+    """The ``$ref`` target files composed into the contract at ``contract_path``.
 
-    raw = loader.load_contract(contract_path, resolve_refs=False)
-    return _walk_ref_files(raw, contract_path.parent)
-
-
-def _walk_ref_files(document: Any, base_dir: Path) -> List[Path]:
-    """Files the engine's ``$ref`` resolver reads for ``document``, first-read order.
-
-    Called only after the resolver succeeded on the same document, so every
-    reference here is one it accepted; this walk reports, it never decides.
+    The resolver's own record of what it read, so a text target, a list-rooted
+    fragment and a ref with siblings are listed exactly as they were read.
     """
     from fluid_build import loader
 
-    found: List[Path] = []
-
-    def _walk(node: Any, base: Path, ancestry: Set[str], depth: int) -> None:
-        if depth > _MAX_REF_DEPTH:
-            return
-        if _is_ref_node(node):
-            ref_value = node["$ref"]
-            if not isinstance(ref_value, str):
-                return
-            file_part, pointer = loader._parse_ref(ref_value)
-            if not file_part:
-                return  # same-document pointer: left in place, reads nothing
-            target = (base / file_part).resolve()
-            key = f"{target}#{pointer or ''}"
-            if key in ancestry:
-                return
-            if target not in found:
-                found.append(target)
-            subtree = loader.load_contract(target, resolve_refs=False)
-            if pointer:
-                subtree = loader._resolve_pointer(subtree, pointer)
-            _walk(subtree, target.parent, ancestry | {key}, depth + 1)
-            return
-        if isinstance(node, Mapping):
-            for value in node.values():
-                _walk(value, base, ancestry, depth)
-        elif isinstance(node, list):
-            for item in node:
-                _walk(item, base, ancestry, depth)
-
-    _walk(document, base_dir, set(), 0)
-    return found
+    trace = loader.ComposeTrace()
+    loader.load_contract(contract_path, _trace=trace)
+    return trace.files

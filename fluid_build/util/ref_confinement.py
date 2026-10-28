@@ -18,8 +18,9 @@ A contract is untrusted input: a service runs ``fluid validate`` /
 ``plan`` / ``bundle`` on contracts users upload. Composing a file into the
 contract and then echoing the contract back (``bundle`` prints it, ``validate``
 quotes it in errors) turns an unconfined ``$ref`` into a read of any
-dict-rooted YAML/JSON file on the host. So a ``$ref`` may only name a file
-inside the *ref root*: by default the directory of the root contract file.
+YAML/JSON file on the host, or of any text file a text ``$ref`` names
+(``.sql``, ``.md``, ...). So a ``$ref`` may only name a file inside the *ref
+root*: by default the directory of the root contract file.
 
 The rule, in the order it is applied:
 
@@ -49,7 +50,7 @@ converged on:
 
 Neither is imported: FLUID's resolver composes YAML fragments with a
 JSON-pointer suffix, which neither library's resolver does, so the policy is
-borrowed and the resolver stays ``fluid_build.loader._resolve_refs``.
+borrowed and the resolver stays :mod:`fluid_build.contract_refs`.
 
 Stdlib only, so both ``fluid_build.loader`` and
 ``fluid_build.forge.core.validators`` can import it without new edges.
@@ -68,6 +69,7 @@ __all__ = [
     "confine_ref",
     "format_pointer",
     "iter_external_refs",
+    "ref_location",
 ]
 
 #: Environment variable a CLI caller sets to widen the ref root (e.g. to a
@@ -124,7 +126,8 @@ def format_pointer(parts: Sequence[Union[str, int]]) -> str:
     return "".join("/" + str(p).replace("~", "~0").replace("/", "~1") for p in parts)
 
 
-def _where(pointer: str, source: Optional[Path]) -> str:
+def ref_location(pointer: str, source: Optional[Path]) -> str:
+    """Where a ``$ref`` was written: its JSON pointer, and the file when known."""
     at = f"at JSON pointer '{pointer}'" if pointer else "at the document root"
     return f"{at} in {source}" if source is not None else at
 
@@ -168,7 +171,7 @@ def confine_ref(
         RefConfinementError: the ref is a URL, an absolute path, escapes
             *root* (after symlinks are resolved), or *root* is ``None``.
     """
-    where = _where(pointer, source)
+    where = ref_location(pointer, source)
 
     def _refuse(reason: str) -> RefConfinementError:
         return RefConfinementError(
