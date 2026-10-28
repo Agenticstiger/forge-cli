@@ -322,12 +322,6 @@ def test_h01_workspace_validate_names_each_products_fragments_relative_to_that_p
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG P5-09: finding the line of an error scans a mapping's keys one by one, so n "
-    "invalid values in one mapping cost n squared: 40,000 take 38 s against 0.6 s without it "
-    "(a 5 MiB contract of invalid labels: about an hour), with or without any $ref",
-)
 def test_h01_error_lookup_cost_is_linear_in_the_number_of_errors(tmp_path: Path) -> None:
     """Naming the file and line of each error must not turn validate into a quadratic job:
     a contract is untrusted input, and 0.24.0 reported the same errors in a fraction of a second."""

@@ -1072,6 +1072,9 @@ class ContractOrigins:
         self.root = root
         self._entries: Dict[Pointer, List[Union[Origin, _Alias]]] = {}
         self._trees: Dict[Path, Any] = {}
+        # id(mapping node) -> {key: (line, value)}, built on first use: the trees
+        # keep every node alive, so an id is not reused while this table lives.
+        self._keys: Dict[int, Dict[str, Tuple[int, Any]]] = {}
 
     def add(self, at: Sequence[Union[str, int]], origin: Origin) -> None:
         self._entries.setdefault(tuple(at), []).append(origin)
@@ -1171,11 +1174,28 @@ class ContractOrigins:
             return True, None
         line = node.start_mark.line + 1
         for token in inner:
-            step = _node_child(node, token)
+            step = self._child(node, token)
             if step is None:
                 return False, None
             line, node = step
         return True, line
+
+    def _child(self, node: Any, token: Union[str, int]) -> Optional[Tuple[int, Any]]:
+        """:func:`_node_child`, with a mapping's keys indexed once, so n errors in
+        one mapping cost n lookups, not n scans of it. A key written twice is
+        found where it was written last, the value the loader keeps."""
+        import yaml
+
+        if not isinstance(node, yaml.MappingNode):
+            return _node_child(node, token)
+        keys = self._keys.get(id(node))
+        if keys is None:
+            keys = self._keys[id(node)] = {
+                key.value: (key.start_mark.line + 1, value)
+                for key, value in node.value
+                if isinstance(key, yaml.ScalarNode)
+            }
+        return keys.get(str(token))
 
 
 #: :meth:`ContractOrigins._from_entry`: this record did not write the path.
@@ -1200,10 +1220,15 @@ def _node_child(node: Any, token: Union[str, int]) -> Optional[Tuple[int, Any]]:
 
 
 def _compose_file(path: Path) -> Any:
-    """The YAML node tree of ``path`` (marks give lines), or ``None`` when it has none."""
-    from fluid_build.util.safe_yaml import compose_yaml_safe
+    """The YAML node tree of ``path`` (marks give lines), or ``None`` when it has none.
+
+    Read again after the composition, under the rules every file it reads keeps
+    (:func:`fluid_build.util.safe_yaml.read_bounded_text`): a regular file, so one
+    replaced since by a FIFO cannot block the report, read no further than the cap.
+    """
+    from fluid_build.util.safe_yaml import compose_yaml_safe, read_bounded_text
 
     try:
-        return compose_yaml_safe(path.read_text(encoding="utf-8"))
+        return compose_yaml_safe(read_bounded_text(path))
     except Exception:  # noqa: BLE001 - a line is a courtesy: no tree, no line
         return None
