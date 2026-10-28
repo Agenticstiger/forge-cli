@@ -493,9 +493,7 @@ def test_n13_a_string_sibling_does_not_merge_with_an_int_key_sg03(tmp_path: Path
 # ── N-14 .. N-16: ref values, nesting, look-alike keys ─────────────────
 
 
-@pytest.mark.parametrize(
-    "value", [42, 1.5, True, False, None, ["a"], {"a": 1}, []], ids=lambda v: repr(v)
-)
+@pytest.mark.parametrize("value", [42, 1.5, True, False, None, ["a"], {"a": 1}, []], ids=repr)
 def test_n14_a_ref_value_that_is_not_a_string_is_refused_naming_the_place(
     tmp_path: Path, value: Any
 ) -> None:

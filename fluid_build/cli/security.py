@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import logging
 import os
-import platform
 import re
 import signal
 import stat
@@ -36,7 +35,6 @@ from types import FrameType
 from typing import Any, Optional, Set, Union
 
 from fluid_build._path_policy import FORBIDDEN_PATHS
-from fluid_build._path_policy import build_forbidden_paths as _build_forbidden_paths
 
 from .core import FluidCLIError
 
@@ -219,7 +217,7 @@ class SecurePathValidator:
         # S-002: use ``Path.is_relative_to`` instead of a string prefix
         # match so siblings like ``/etcd/file.yaml`` are not
         # false-positive-denied. The forbidden set is platform-aware
-        # (see _build_forbidden_paths).
+        # (see fluid_build._path_policy.build_forbidden_paths).
         for forbidden in self.security_context.forbidden_paths:
             try:
                 is_blocked = path.is_relative_to(Path(forbidden))

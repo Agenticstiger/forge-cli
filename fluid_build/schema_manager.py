@@ -27,7 +27,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Union
 
 import yaml
 

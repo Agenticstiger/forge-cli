@@ -64,7 +64,6 @@ from __future__ import annotations
 import copy
 import functools
 import json
-import logging
 import os
 from pathlib import Path
 from typing import (
@@ -111,7 +110,6 @@ __all__ = [
     "resolve_pointer_refs",
 ]
 
-LOG = logging.getLogger("fluid.loader")
 
 #: A path inside a document: object keys and list indexes, root first.
 Pointer = Tuple[Union[str, int], ...]

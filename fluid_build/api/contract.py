@@ -412,10 +412,10 @@ def _compose_without_files(
     # sharing). Without that, the overlay merge and the rewrites, which change
     # nodes in place, would reach every alias of the node they change.
     contract = _unshare(copy.deepcopy(dict(document)))
-    names_files = any(loader._parse_ref(ref)[0] for ref in _ref_values(contract))
+    names_files = any(contract_refs.parse_ref(ref)[0] for ref in _ref_values(contract))
     layer = _unshare(copy.deepcopy(dict(overlay))) if overlay is not None else None
     if layer is not None and (
-        names_files or any(loader._parse_ref(ref)[0] for ref in _ref_values(layer))
+        names_files or any(contract_refs.parse_ref(ref)[0] for ref in _ref_values(layer))
     ):
         raise ContractLoadError(
             "contract_overlay_needs_base_dir",

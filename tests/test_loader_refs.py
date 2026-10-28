@@ -41,11 +41,11 @@ from textwrap import dedent
 import pytest
 import yaml
 
+from fluid_build.contract_refs import is_ref_node as _is_ref_node
+from fluid_build.contract_refs import parse_ref as _parse_ref
+from fluid_build.contract_refs import resolve_pointer as _resolve_pointer
 from fluid_build.loader import (
     RefResolutionError,
-    _is_ref_node,
-    _parse_ref,
-    _resolve_pointer,
     _resolve_refs,
     compile_contract,
     load_contract,

@@ -24,10 +24,9 @@ Every other value is written as PyYAML always wrote it.
 from __future__ import annotations
 
 import json
-import logging
 import tarfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import pytest
 import yaml

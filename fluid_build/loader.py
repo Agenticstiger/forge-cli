@@ -69,6 +69,11 @@ except Exception:  # pragma: no cover
 
 
 __all__ = [
+    # Kept for callers of 0.24.0: the resolver names, as the loader offered them.
+    "_MAX_REF_DEPTH",
+    "_is_ref_node",
+    "_parse_ref",
+    "_resolve_pointer",
     "REF_ROOT_ENV",
     "ComposedContract",
     "RefConfinementError",
@@ -648,15 +653,18 @@ def _log_warning_once(text: str, extra: Dict[str, Any]) -> None:
 # $ref resolution — multi-file contract composition
 # ---------------------------------------------------------------------------
 
-# The resolver lives in ``fluid_build.contract_refs``; these names are kept for
-# the callers and tests that import them from here. ``RefResolutionError`` and
-# its confinement subclass live in ``fluid_build.util.ref_confinement``
-# (stdlib-only, shared with the bundle OpenAPI validator) and are re-exported
-# here, so ``from fluid_build.loader import RefResolutionError`` keeps working.
+# The resolver lives in ``fluid_build.contract_refs``; these names stay here for
+# the callers that import them from the loader, as 0.24.0 offered them (pinned
+# by tests/fragments/test_compat_gate.py), and are listed in ``__all__``.
 _MAX_REF_DEPTH = MAX_REF_DEPTH
 _is_ref_node = is_ref_node
 _parse_ref = parse_ref
 _resolve_pointer = resolve_pointer
+
+# ``RefResolutionError`` and its confinement subclass live in
+# ``fluid_build.util.ref_confinement`` (stdlib-only, shared with the bundle
+# OpenAPI validator) and are re-exported here, so
+# ``from fluid_build.loader import RefResolutionError`` keeps working.
 
 _REF_ROOT_HINT = (
     f"To compose fragments from a wider tree (e.g. a monorepo's shared/ "
