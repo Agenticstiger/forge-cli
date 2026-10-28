@@ -2333,9 +2333,8 @@ def test_i32_the_dict_level_splitter_takes_parts_and_keeps_a_part_inside_its_fil
 def test_i33_a_symlinked_fragments_directory_never_leaves_a_fragment_outside_out(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """SG-32 characterisation (finding SP-08). The ref root check refuses the split
-    afterwards, and the files are taken back, but the fragment files were written
-    through the link first and the directories made there stay behind."""
+    """SP-08: a ``fragments/`` directory that links outside is refused before anything is
+    written, there or through it: no file and no directory lands outside."""
     pair = make_pair(tmp_path, SPLIT_ALL_FILES)
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -2344,10 +2343,9 @@ def test_i33_a_symlinked_fragments_directory_never_leaves_a_fragment_outside_out
 
     assert split(pair.split_contract) == 1
 
-    assert "escapes the ref root" in capsys.readouterr().err
+    assert "is a symlink; split writes no file through one" in capsys.readouterr().err
     assert pair.split_contract.read_bytes() == root
-    assert not files_of(outside)  # no fragment survives outside ...
-    assert entries_of(outside) == ["builds/", "exposes/"]  # ... but its directories do
+    assert entries_of(outside) == []
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs symlinks")
@@ -3229,3 +3227,24 @@ def test_the_root_is_never_written_through_a_symlink(
     assert not elsewhere.exists() and not elsewhere.parent.exists()
     assert (out / "contract.fluid.yaml").is_symlink()
     assert sorted(p.name for p in out.iterdir()) == ["contract.fluid.yaml"]
+
+
+def test_no_fragment_is_written_through_a_symlinked_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-08: ``fragments/`` linking outside the output directory is refused before any file
+    or directory is written, there or through it."""
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_text(
+        "id: x\nbuilds:\n  - id: t\n    engine: sql\n    properties: {sql: SELECT 1}\n",
+        encoding="utf-8",
+    )
+    original = contract.read_bytes()
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (tmp_path / "fragments").symlink_to(outside)
+
+    assert split(contract) == 1
+    assert "symlink" in capsys.readouterr().err
+    assert list(outside.iterdir()) == []
+    assert contract.read_bytes() == original

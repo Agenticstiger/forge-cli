@@ -39,11 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names, and an overlay that changes a shared value reaches every pointer to it. RFC 6901 escapes
   (`~0`, `~1`) decode, a pointer may go through other refs, and keys beside a pointer merge like
   keys beside a file ref. `#foo` is not a JSON pointer and is refused; a pointer that reaches
-  itself is a cycle. A pointer that would be **merged into an object already at its place** (as a
-  key beside a file `$ref` whose target holds an object there, or as an overlay value over a base
-  object) is refused, naming the file and the place: it resolves after every merge, so its keys
-  and the object's would be mixed. Write the keys there, or name a file (`./x.yaml#/a`), which is
-  read before the merge.
+  itself is a cycle. A pointer resolves after every merge, so it cannot take part in one: a
+  pointer that would be **merged into an object already at its place** (as a key beside a file
+  `$ref` whose target holds an object there, or as an overlay value over a base object), and an
+  overlay object or list of objects over a **base** pointer, are refused, naming the file and the
+  place. Write those keys out, or name a file (`./x.yaml#/a`), which is read before the merge. A
+  scalar or a list of plain values over a pointer replaces it, as it replaces any value.
 
 - **`fluid split --parts`** chooses what moves to files of its own: `sovereignty`,
   `accessPolicy`, `builds`, `exposes` (the default, as before), `sql` (a build's `properties.sql` to

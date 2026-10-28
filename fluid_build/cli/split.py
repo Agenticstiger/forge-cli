@@ -203,6 +203,17 @@ def _print_dry_run(contract: Dict[str, Any], parts: Sequence[str], taken: Collec
         sys.stderr.write(f"   {target}\n")
 
 
+def _symlink_on_the_way(out_dir: Path, rel_path: str) -> Optional[Path]:
+    """The first directory between ``out_dir`` and ``rel_path`` that is a symlink, if
+    any: a fragment written through it would land outside the output directory."""
+    current = out_dir
+    for part in Path(rel_path).parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            return current
+    return None
+
+
 def _split(
     contract_path: Path,
     contract: Dict[str, Any],
@@ -260,6 +271,10 @@ def _write_checked(
         # open(..., "w") would write through it, a dangling one included, and the
         # undo could only remove the link, leaving the written file where it points.
         return f"{root_out} is a symlink; split writes no file through one"
+    for rel_path in fragments:
+        link = _symlink_on_the_way(out_dir, rel_path)
+        if link is not None:
+            return f"{link} is a symlink; split writes no file through one"
     original_root: Optional[str] = None
     if root_out.exists():
         with open(root_out, encoding="utf-8", newline="") as handle:

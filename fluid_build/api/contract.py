@@ -169,7 +169,7 @@ class LoadedContract:
         ``path`` is a path in ``contract``, such as ``["exposes", 0, "binding"]``:
         a value a ``$ref`` or the overlay brought in names that file, any other
         the contract file. The line is ``None`` when the file gives none (a
-        text file, JSON). ``None`` when the origin is not known: a bundle (its
+        text file, or JSON that YAML cannot read). ``None`` when the origin is not known: a bundle (its
         fragments were inlined when it was built), an in-memory load without
         ``base_dir``, a path the rewrites moved (a legacy ``build:``).
         """
