@@ -35,7 +35,18 @@ from __future__ import annotations
 import copy
 import posixpath
 import re
-from typing import Any, Collection, Dict, Iterable, List, NamedTuple, Optional, Tuple, Union
+from typing import (
+    Any,
+    Collection,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import yaml
 
@@ -152,16 +163,25 @@ def fragment_sites(
     never written twice or over.
     """
     wanted = set(parts)
-    sites: List[FragmentSite] = []
+    sites = [
+        *_section_sites(contract, wanted),
+        *_entry_sites(contract, wanted),
+        *_extension_sites(contract, wanted),
+        *_description_sites(contract, wanted),
+    ]
+    return _unique_targets(sites, taken)
 
-    def add(path: Tuple[Union[str, int], ...], target: str, header: Optional[str], text: bool):
-        sites.append(FragmentSite(path, target, header, text))
 
+def _section_sites(contract: Dict[str, Any], wanted: Collection[str]) -> Iterator[FragmentSite]:
+    """``sovereignty`` and ``accessPolicy``, each to a file of its own."""
     for key, (rel_path, header) in _SCALAR_SECTIONS.items():
         value = contract.get(key)
         if key in wanted and isinstance(value, dict) and value and not _is_ref(value):
-            add((key,), rel_path, header, False)
+            yield FragmentSite((key,), rel_path, header)
 
+
+def _entry_sites(contract: Dict[str, Any], wanted: Collection[str]) -> Iterator[FragmentSite]:
+    """Each build and expose, and the parts inside one, in contract order."""
     for key, (directory, id_field, comment_prefix) in _LIST_SECTIONS.items():
         items = contract.get(key)
         if not isinstance(items, list):
@@ -172,55 +192,65 @@ def fragment_sites(
             item_id = item.get(id_field, "")
             slug = _slugify(item_id) if item_id else f"unnamed-{i}"
             if key in wanted:
-                add(
-                    (key, i),
-                    f"{directory}/{slug}.yaml",
-                    f"{comment_prefix}{item_id or slug}\n",
-                    False,
-                )
-            if key == "builds" and "sql" in wanted:
-                props = item.get("properties")
-                if isinstance(props, dict) and _file_text(props.get("sql")):
-                    suffix = _CODE_SUFFIX.get(str(props.get("language") or "").lower(), "sql")
-                    add((key, i, "properties", "sql"), f"sql/{slug}.{suffix}", None, True)
-            if key == "exposes":
-                body = item.get("contract")
-                for part, folder, label in (
-                    ("quality", "fragments/quality", "Quality rules"),
-                    ("schema", "fragments/schemas", "Columns"),
-                ):
-                    value = body.get(part) if isinstance(body, dict) else None
-                    if part in wanted and isinstance(value, list) and value:
-                        add(
-                            (key, i, "contract", part),
-                            f"{folder}/{slug}.yaml",
-                            f"# {label}: {item_id or slug}\n",
-                            False,
-                        )
+                header = f"{comment_prefix}{item_id or slug}\n"
+                yield FragmentSite((key, i), f"{directory}/{slug}.yaml", header)
+            if key == "builds":
+                yield from _sql_sites(item, i, slug, wanted)
+            elif key == "exposes":
+                yield from _expose_list_sites(item, i, item_id or slug, slug, wanted)
 
+
+def _sql_sites(
+    build: Dict[str, Any], i: int, slug: str, wanted: Collection[str]
+) -> Iterator[FragmentSite]:
+    """A build's ``properties.sql``, to ``sql/<id>`` with its language's suffix."""
+    props = build.get("properties")
+    if "sql" in wanted and isinstance(props, dict) and _file_text(props.get("sql")):
+        suffix = _CODE_SUFFIX.get(str(props.get("language") or "").lower(), "sql")
+        yield FragmentSite(("builds", i, "properties", "sql"), f"sql/{slug}.{suffix}", None, True)
+
+
+def _expose_list_sites(
+    expose: Dict[str, Any], i: int, name: str, slug: str, wanted: Collection[str]
+) -> Iterator[FragmentSite]:
+    """An expose's ``contract.quality`` and ``contract.schema`` lists."""
+    body = expose.get("contract")
+    if not isinstance(body, dict):
+        return
+    for part, folder, label in (
+        ("quality", "fragments/quality", "Quality rules"),
+        ("schema", "fragments/schemas", "Columns"),
+    ):
+        value = body.get(part)
+        if part in wanted and isinstance(value, list) and value:
+            path = ("exposes", i, "contract", part)
+            yield FragmentSite(path, f"{folder}/{slug}.yaml", f"# {label}: {name}\n")
+
+
+def _extension_sites(contract: Dict[str, Any], wanted: Collection[str]) -> Iterator[FragmentSite]:
+    """Each extension block named by ``extensions`` or ``extensions.<name>``."""
     extensions = contract.get("extensions")
-    if isinstance(extensions, dict):
-        for name, value in extensions.items():
-            if not ("extensions" in wanted or f"extensions.{name}" in wanted):
-                continue
-            if isinstance(value, (dict, list)) and value and not _is_ref(value):
-                add(
-                    ("extensions", name),
-                    f"fragments/extensions/{_slugify(name)}.yaml",
-                    f"# Extension: {name}\n",
-                    False,
-                )
+    if not isinstance(extensions, dict):
+        return
+    for name, value in extensions.items():
+        if not ("extensions" in wanted or f"extensions.{name}" in wanted):
+            continue
+        if isinstance(value, (dict, list)) and value and not _is_ref(value):
+            target = f"fragments/extensions/{_slugify(name)}.yaml"
+            yield FragmentSite(("extensions", name), target, f"# Extension: {name}\n")
 
+
+def _description_sites(contract: Dict[str, Any], wanted: Collection[str]) -> Iterator[FragmentSite]:
+    """The description text, or each text of a description object, as Markdown."""
+    if "description" not in wanted:
+        return
     description = contract.get("description")
-    if "description" in wanted:
-        if _file_text(description):
-            add(("description",), "docs/description.md", None, True)
-        elif isinstance(description, dict) and not _is_ref(description):
-            for key in _DESCRIPTION_PARTS:
-                if _file_text(description.get(key)):
-                    add(("description", key), f"docs/{key}.md", None, True)
-
-    return _unique_targets(sites, taken)
+    if _file_text(description):
+        yield FragmentSite(("description",), "docs/description.md", None, True)
+    elif isinstance(description, dict) and not _is_ref(description):
+        for key in _DESCRIPTION_PARTS:
+            if _file_text(description.get(key)):
+                yield FragmentSite(("description", key), f"docs/{key}.md", None, True)
 
 
 def _unique_targets(sites: List[FragmentSite], taken: Collection[str]) -> List[FragmentSite]:
@@ -295,18 +325,6 @@ def _walk(document: Any, path: Iterable[Union[str, int]]) -> Any:
     for part in path:
         document = document[part]
     return document
-
-
-def describe_fragment_layout(
-    contract: Dict[str, Any], parts: Iterable[str] = DEFAULT_PARTS
-) -> List[str]:
-    """Return list of fragment paths that *would* be created.
-
-    Useful for ``--dry-run`` preview and smart-default decisions.
-    """
-    if not isinstance(contract, dict):
-        return []
-    return [site.target for site in fragment_sites(contract, parts)]
 
 
 def is_complex_enough_for_fragments(contract: Dict[str, Any]) -> bool:

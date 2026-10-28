@@ -44,7 +44,6 @@ from fluid_build.contract_refs import (
     RefBudget,
     is_ref_node,
     parse_ref,
-    pointer_tokens,
     resolve_file_refs,
     resolve_pointer,
     resolve_pointer_refs,
@@ -537,11 +536,6 @@ WORKSPACE_REF_ROOT_KEY = "ref_root"
 IGNORE_WORKSPACE_REF_ROOT_ENV = "FLUID_IGNORE_WORKSPACE_REF_ROOT"
 
 
-def _pointer_parts(pointer: Optional[str]) -> Tuple[str, ...]:
-    """Segments of a ``#/a/b`` fragment, for error locations."""
-    return pointer_tokens(pointer)
-
-
 def _resolve_refs(
     obj: Any,
     base_dir: Path,
@@ -777,10 +771,8 @@ _NOTED_WORKSPACE_REF_ROOT_IGNORED: Set[str] = set()
 
 def _note_workspace_ref_root_ignored(source: Path, problem: str) -> None:
     key = str(source)
-    with _NOTED_REF_ROOT_ENV_IGNORED_LOCK:
-        if key in _NOTED_WORKSPACE_REF_ROOT_IGNORED:
-            return
-        _NOTED_WORKSPACE_REF_ROOT_IGNORED.add(key)
+    if not _first_time(_NOTED_WORKSPACE_REF_ROOT_IGNORED, key):
+        return
     LOG.warning(
         "workspace_ref_root_ignored: %s (%s). Contracts under it keep their own directory "
         "as the ref root.",
@@ -800,14 +792,21 @@ _NOTED_REF_ROOT_ENV_IGNORED: Set[str] = set()
 _NOTED_REF_ROOT_ENV_IGNORED_LOCK = threading.Lock()
 
 
+def _first_time(noted: Set[str], key: str) -> bool:
+    """Record ``key`` in a ref-root warn-once registry; ``True`` the first time."""
+    with _NOTED_REF_ROOT_ENV_IGNORED_LOCK:
+        if key in noted:
+            return False
+        noted.add(key)
+        return True
+
+
 def _note_ref_root_env_ignored(contract_dir: Path, value: str, problem: str) -> None:
     """WARN, once per ``FLUID_REF_ROOT`` value per process, that it does not
     apply to this contract and the root it gets without it (``contract_dir``:
     its own directory, or its workspace's ``ref_root``) is used."""
-    with _NOTED_REF_ROOT_ENV_IGNORED_LOCK:
-        if value in _NOTED_REF_ROOT_ENV_IGNORED:
-            return
-        _NOTED_REF_ROOT_ENV_IGNORED.add(value)
+    if not _first_time(_NOTED_REF_ROOT_ENV_IGNORED, value):
+        return
     LOG.warning(
         "ref_root_env_ignored: %s. Ignoring it for this contract: its $refs are "
         "confined to %s, the root it gets without the variable. Logged once "

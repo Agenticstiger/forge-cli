@@ -228,16 +228,11 @@ def iter_external_refs(doc: Any) -> Iterator[Tuple[str, str]]:
     stack: list[Tuple[Tuple[Union[str, int], ...], Any]] = [((), doc)]
     while stack:
         parts, node = stack.pop()
-        if isinstance(node, (dict, list)):
-            if id(node) in seen:
-                continue
-            seen.add(id(node))
-        if isinstance(node, dict):
-            ref = node.get("$ref")
-            if isinstance(ref, str) and not ref.startswith("#"):
-                yield format_pointer(parts), ref
-            for key, value in node.items():
-                stack.append(((*parts, key), value))
-        elif isinstance(node, list):
-            for idx, value in enumerate(node):
-                stack.append(((*parts, idx), value))
+        if not isinstance(node, (dict, list)) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        ref = node.get("$ref") if isinstance(node, dict) else None
+        if isinstance(ref, str) and not ref.startswith("#"):
+            yield format_pointer(parts), ref
+        children = node.items() if isinstance(node, dict) else enumerate(node)
+        stack.extend(((*parts, key), value) for key, value in children)

@@ -107,15 +107,9 @@ def load_yaml_safe(
     source = _bounded_text(source, max_bytes)
     if _count_aliases(source, max_aliases, max_depth) == 0:
         return yaml.safe_load(source)
-    loader = yaml.SafeLoader(source)
-    try:
-        node = loader.get_single_node()
-        if node is None:
-            return None
-        _check_alias_expansion(node, max_alias_expansion, max_alias_expansion_chars)
-        return loader.construct_document(node)
-    finally:
-        loader.dispose()
+    return _checked_document(
+        source, True, max_alias_expansion, max_alias_expansion_chars, construct=True
+    )
 
 
 def compose_yaml_safe(source: Any) -> Any:
@@ -129,12 +123,30 @@ def compose_yaml_safe(source: Any) -> Any:
         return None
     source = _bounded_text(source, MAX_YAML_BYTES)
     aliases = _count_aliases(source, MAX_YAML_ALIASES, MAX_YAML_DEPTH)
+    return _checked_document(
+        source, bool(aliases), MAX_YAML_ALIAS_EXPANSION, MAX_YAML_ALIAS_EXPANSION_CHARS
+    )
+
+
+def _checked_document(
+    source: str,
+    has_aliases: bool,
+    max_alias_expansion: int,
+    max_alias_expansion_chars: int,
+    *,
+    construct: bool = False,
+) -> Any:
+    """The single document in ``source``: its node, or its value when
+    ``construct``; ``None`` when empty. A document with aliases is refused
+    when they expand it past the caps (:func:`_check_alias_expansion`)."""
     loader = yaml.SafeLoader(source)
     try:
         node = loader.get_single_node()
-        if node is not None and aliases:
-            _check_alias_expansion(node, MAX_YAML_ALIAS_EXPANSION, MAX_YAML_ALIAS_EXPANSION_CHARS)
-        return node
+        if node is None:
+            return None
+        if has_aliases:
+            _check_alias_expansion(node, max_alias_expansion, max_alias_expansion_chars)
+        return loader.construct_document(node) if construct else node
     finally:
         loader.dispose()
 

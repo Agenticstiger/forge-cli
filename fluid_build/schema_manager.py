@@ -117,6 +117,21 @@ def _locate_error(error: Any, locate: Callable[..., Optional[str]]) -> Optional[
     return locate(path)
 
 
+def _error_path(error: Any, locate: Optional[Callable[..., Optional[str]]] = None) -> str:
+    """Where an error is: ``exposes[0].contract.schema[1].type`` (``root`` for the
+    document), after the file and line it was written at when ``locate`` knows
+    one: ``fragments/x.yaml:21 (exposes[0]...)``."""
+    path = ""
+    for part in error.path:
+        if isinstance(part, int):
+            path += f"[{part}]"
+        else:
+            path += f".{part}" if path else str(part)
+    path = path or "root"
+    where = _locate_error(error, locate) if locate is not None else None
+    return f"{where} ({path})" if where else path
+
+
 def _schema_version_sort_key(version: str) -> tuple[int, int, int]:
     match = VERSION_PATTERN.match(version)
     if not match:
@@ -723,23 +738,7 @@ class FluidSchemaManager:
             errors = sorted(validator.iter_errors(contract), key=lambda e: e.path)
 
             for error in errors:
-                # Build path string
-                path_parts = []
-                for part in error.path:
-                    if isinstance(part, int):
-                        path_parts.append(f"[{part}]")
-                    else:
-                        if path_parts:
-                            path_parts.append(f".{part}")
-                        else:
-                            path_parts.append(str(part))
-
-                path_str = "".join(path_parts) if path_parts else "root"
-                where = _locate_error(error, locate) if locate is not None else None
-                if where:
-                    path_str = f"{where} ({path_str})"
-                error_msg = f"{path_str}: {format_schema_error(error)}"
-                result.add_error(error_msg)
+                result.add_error(f"{_error_path(error, locate)}: {format_schema_error(error)}")
 
             return len(errors) == 0
 

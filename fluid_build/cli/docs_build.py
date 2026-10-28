@@ -365,27 +365,29 @@ def _columns(expose: Mapping[str, Any]) -> list[Any]:
     return legacy if isinstance(legacy, list) else []
 
 
+def _column_row_html(col: Mapping[str, Any]) -> str:
+    """One column as a table row. Nullable follows ``required`` (0.7.x), else
+    the legacy ``nullable``; PII follows ``sensitivity``, or the legacy ``pii``."""
+    if "required" in col:
+        nullable = "no" if col.get("required") else "yes"
+    else:
+        nullable = "yes" if col.get("nullable", True) is not False else "no"
+    personal = col.get("pii") or col.get("sensitivity") in _PERSONAL_DATA
+    pii_marker = '<span class="pii" aria-label="contains PII">PII</span>' if personal else ""
+    return (
+        "<tr>"
+        f"<td><code>{html.escape(str(col.get('name', '—')))}</code></td>"
+        f"<td>{html.escape(str(col.get('type', '—')))}</td>"
+        f"<td>{nullable}</td>"
+        f"<td>{pii_marker}</td>"
+        f"<td>{html.escape(str(col.get('description') or ''))}</td>"
+        "</tr>"
+    )
+
+
 def _render_expose_html(expose: Mapping[str, Any], idx: int) -> str:
     eid = expose.get("exposeId") or expose.get("id") or expose.get("name") or f"expose-{idx}"
-    schema_rows = []
-    for col in _columns(expose):
-        if not isinstance(col, Mapping):
-            continue
-        if "required" in col:
-            nullable = "no" if col.get("required") else "yes"
-        else:
-            nullable = "yes" if col.get("nullable", True) is not False else "no"
-        personal = col.get("pii") or col.get("sensitivity") in _PERSONAL_DATA
-        pii_marker = '<span class="pii" aria-label="contains PII">PII</span>' if personal else ""
-        schema_rows.append(
-            "<tr>"
-            f"<td><code>{html.escape(str(col.get('name', '—')))}</code></td>"
-            f"<td>{html.escape(str(col.get('type', '—')))}</td>"
-            f"<td>{nullable}</td>"
-            f"<td>{pii_marker}</td>"
-            f"<td>{html.escape(str(col.get('description') or ''))}</td>"
-            "</tr>"
-        )
+    schema_rows = [_column_row_html(col) for col in _columns(expose) if isinstance(col, Mapping)]
     schema_html = "\n      ".join(schema_rows) or (
         '<tr><td colspan="5" class="empty">No schema columns defined.</td></tr>'
     )
