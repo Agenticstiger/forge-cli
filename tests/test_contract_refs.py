@@ -989,3 +989,162 @@ def test_an_unexpected_key_is_named_where_it_was_written(
 
     out = capsys.readouterr().out
     assert "overlays/prod.yaml:4 (exposes[0].binding): Additional properties" in out
+
+
+@pytest.mark.parametrize("env", [None, "prod"])
+def test_generate_artifacts_writes_the_same_files_for_a_split_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env: Any
+) -> None:
+    from fluid_build.cli import main
+
+    outputs = []
+    for layout in ("flat", "split"):
+        root = tmp_path / layout
+        _write(
+            root / "overlays" / "prod.yaml",
+            "exposes:\n  - exposeId: orders_events\n"
+            "    binding: {location: {topic: orders.prod.events}}\n",
+        )
+        contract = yaml.safe_load(_STREAM)
+        if layout == "split":
+            for expose in contract["exposes"]:
+                _write(
+                    root / "fragments" / f"{expose['exposeId']}.yaml",
+                    yaml.safe_dump(expose, sort_keys=False),
+                )
+            contract["exposes"] = [
+                {"$ref": f"./fragments/{e['exposeId']}.yaml"} for e in contract["exposes"]
+            ]
+        path = _write(root / "contract.fluid.yaml", yaml.safe_dump(contract, sort_keys=False))
+        monkeypatch.chdir(root)
+        argv = ["generate", "artifacts", str(path), "--out", str(root / "out")]
+        assert main(argv + (["--env", env] if env else [])) == 0
+        files = sorted(p for p in (root / "out").rglob("*") if p.is_file())
+        outputs.append(
+            {
+                p.relative_to(root / "out").as_posix(): _undated(p.read_text("utf-8"))
+                for p in files
+                if p.name != "MANIFEST.json"
+            }
+        )
+
+    assert outputs[0] == outputs[1]
+
+
+def _undated(text: str) -> str:
+    """ODPS v4.1 stamps today's date; the comparison is about content."""
+    import re
+
+    return re.sub(r'"(created|updated)": "[^"]*"', r'"\1": "-"', text)
+
+
+def test_generate_ci_reads_a_split_contract_whole(tmp_path: Path) -> None:
+    from fluid_build.cli import generate_ci
+
+    contract = yaml.safe_load(_STREAM)
+    contract["builds"] = [{"$ref": "./fragments/b.yaml"}]
+    _write(
+        tmp_path / "fragments" / "b.yaml",
+        "id: ingest\npattern: hybrid-reference\nengine: dbt\n",
+    )
+    path = _write(tmp_path / "contract.fluid.yaml", yaml.safe_dump(contract, sort_keys=False))
+
+    assert generate_ci._contract_is_reference_only(str(path)) is True
+    assert generate_ci._extract_engine_context(str(path))["engine"] == "dbt"
+
+
+# ── what a ref may not read, and how much it may bring ─────────────────
+
+
+def test_a_directory_is_not_a_target(tmp_path: Path) -> None:
+    (tmp_path / "parts").mkdir()
+    path = _contract(tmp_path, {"x": {"$ref": "./parts"}})
+
+    with pytest.raises(RefResolutionError, match="which is not a regular file"):
+        load_contract(path)
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "mkfifo"), reason="no FIFOs here")
+def test_a_fifo_is_refused_before_it_is_read(tmp_path: Path) -> None:
+    import os
+
+    os.mkfifo(tmp_path / "pipe.sql")
+    path = _contract(tmp_path, {"sql": {"$ref": "./pipe.sql"}})
+
+    with pytest.raises(RefResolutionError, match="which is not a regular file"):
+        load_contract(path)
+
+
+@pytest.mark.parametrize("target", ["/proc/self/environ", "/sys/kernel/x", "/dev/zero"])
+def test_kernel_trees_stay_blocked_with_any_root(target: str) -> None:
+    with pytest.raises(RefResolutionError, match="blocked system path"):
+        contract_refs._refuse_system_path(Path(target), target)
+
+
+def test_a_file_without_a_known_suffix_must_still_hold_an_object(tmp_path: Path) -> None:
+    """A dotfile inside the root reads as a YAML string; a ref must not hand it out."""
+    _write(tmp_path / ".env", "API_TOKEN=s3cr3t\n")
+    _write(tmp_path / "schema.avsc", '[{"type": "record", "name": "A"}]')
+    leaky = _contract(tmp_path, {"x": {"$ref": "./.env"}})
+
+    with pytest.raises(RefResolutionError, match="YAML root must be an object/dict"):
+        load_contract(leaky)
+    fine = _contract(tmp_path, {"x": {"$ref": "./schema.avsc"}})
+    assert load_contract(fine)["x"] == [{"type": "record", "name": "A"}]
+
+
+def test_a_fragment_that_contains_itself_is_refused(tmp_path: Path) -> None:
+    _write(tmp_path / "loop.yaml", "a: &a\n  b: *a\n")
+    path = _contract(tmp_path, {"x": {"$ref": "./loop.yaml"}})
+
+    with pytest.raises(ValueError, match="contains itself through a YAML alias"):
+        load_contract(path)
+
+
+def test_the_cap_counts_keys_and_alias_copies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(contract_refs, "MAX_REF_EXPANSION_CHARS", 1_000)
+    _write(tmp_path / "keys.yaml", yaml.safe_dump({"k" * 2_000: 1}))
+    with pytest.raises(RefResolutionError, match="takes what refs bring"):
+        load_contract(_contract(tmp_path, {"x": {"$ref": "./keys.yaml"}}))
+
+    monkeypatch.setattr(contract_refs, "MAX_REF_EXPANSION_NODES", 300)
+    _write(
+        tmp_path / "aliases.yaml",
+        "base: &b [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n"
+        "copies: [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b, *b, *b, *b, *b, *b, *b, *b, *b, *b, *b,"
+        " *b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\n",
+    )
+    with pytest.raises(RefResolutionError, match="takes what refs bring"):
+        load_contract(_contract(tmp_path, {"y": {"$ref": "./aliases.yaml"}}))
+
+
+def test_a_list_index_is_ascii_digits(tmp_path: Path) -> None:
+    _write(tmp_path / "l.yaml", "items: [a, b, c]\n")
+    path = _contract(tmp_path, {"x": {"$ref": "./l.yaml#/items/²"}})
+
+    with pytest.raises(RefResolutionError, match="is not a valid list index"):
+        load_contract(path)
+
+
+def test_the_depth_error_names_the_ref_that_went_too_deep(tmp_path: Path) -> None:
+    for n in range(contract_refs.MAX_REF_DEPTH + 2):
+        _write(tmp_path / f"l{n}.yaml", f"next: {{$ref: ./l{n + 1}.yaml}}\n")
+    _write(tmp_path / f"l{contract_refs.MAX_REF_DEPTH + 2}.yaml", "end: true\n")
+    path = _contract(tmp_path, {"x": {"$ref": "./l0.yaml"}})
+
+    with pytest.raises(RefResolutionError, match="depth exceeded") as info:
+        load_contract(path)
+    assert "at JSON pointer '/next' in" in str(info.value)
+
+
+def test_an_overlay_must_compose_to_an_object(tmp_path: Path) -> None:
+    from fluid_build.loader import load_with_overlay
+
+    _write(tmp_path / "rules.yaml", "- a\n")
+    _write(tmp_path / "overlays" / "prod.yaml", "$ref: ../rules.yaml\n")
+    path = _write(tmp_path / "contract.fluid.yaml", "id: x\n")
+
+    with pytest.raises(ValueError, match="Overlay root must be an object/dict"):
+        load_with_overlay(path, "prod")

@@ -168,7 +168,7 @@ def _pointer_step(current: Any, token: str) -> Any:
             )
         return current[token]
     if isinstance(current, list):
-        if not token.isdigit() or int(token) >= len(current):
+        if not (token.isascii() and token.isdigit()) or int(token) >= len(current):
             raise RefResolutionError(f"JSON pointer segment '{token}' is not a valid list index")
         return current[int(token)]
     raise RefResolutionError(
@@ -262,18 +262,31 @@ class RefBudget:
 
 
 def _size(value: Any) -> Tuple[int, int]:
-    """Values and string characters in ``value``, each shared container counted once."""
+    """Values, and characters of string values and keys, in ``value``.
+
+    A container a YAML alias shares is counted at every place it appears, as
+    the composition copies it there. A container inside itself is not
+    followed again (the walk refuses it).
+    """
     nodes = chars = 0
-    seen: Set[int] = set()
-    stack = [value]
+    on_path: Set[int] = set()
+    stack: List[Tuple[Any, bool]] = [(value, False)]
     while stack:
-        node = stack.pop()
+        node, leaving = stack.pop()
+        if leaving:
+            on_path.discard(id(node))
+            continue
         nodes += 1
         if isinstance(node, str):
             chars += len(node)
-        elif isinstance(node, (dict, list)) and id(node) not in seen:
-            seen.add(id(node))
-            stack.extend(node.values() if isinstance(node, dict) else node)
+        elif isinstance(node, (dict, list)) and id(node) not in on_path:
+            on_path.add(id(node))
+            stack.append((node, True))
+            if isinstance(node, dict):
+                chars += sum(len(k) for k in node if isinstance(k, str))
+                stack.extend((v, False) for v in node.values())
+            else:
+                stack.extend((v, False) for v in node)
     return nodes, chars
 
 
@@ -313,7 +326,17 @@ def resolve_file_refs(
         budget=budget if budget is not None else RefBudget(),
         origins=origins if origins is not None else (trace.origins if trace else None),
     )
-    return refs.walk(obj, base_dir, source, (), (), 0)
+    try:
+        return refs.walk(obj, base_dir, source, (), (), 0)
+    except RecursionError as exc:
+        raise RefResolutionError(_TOO_DEEP) from exc
+
+
+#: Python's own recursion limit, reached by nesting that spans many fragments.
+_TOO_DEEP = (
+    "the contract nests too deep to compose: its fragments, one inside another, "
+    "go past the depth this process can walk"
+)
 
 
 class _FileRefs:
@@ -339,6 +362,9 @@ class _FileRefs:
         # its own target is a cycle, while the same file reached from two
         # branches (a diamond) is not.
         self.ancestry: Set[str] = set()
+        # The containers being walked: one met again inside itself is a YAML
+        # alias that makes the document contain itself.
+        self.on_path: Set[int] = set()
 
     def walk(
         self,
@@ -350,24 +376,29 @@ class _FileRefs:
         depth: int,
     ) -> Any:
         """``obj``, written at ``loc`` in ``source``, placed at ``at`` in the result."""
-        if depth > MAX_REF_DEPTH:
-            raise RefResolutionError(
-                f"$ref nesting depth exceeded {MAX_REF_DEPTH} — "
-                f"possible circular reference or very deep nesting"
-            )
         if is_ref_node(obj):
             return self.ref(obj, base_dir, source, loc, at, depth)
-        if isinstance(obj, dict):
-            return {
-                k: self.walk(v, base_dir, source, (*loc, k), (*at, k), depth)
-                for k, v in obj.items()
-            }
-        if isinstance(obj, list):
+        if not isinstance(obj, (dict, list)):
+            return obj
+        if id(obj) in self.on_path:
+            # Not a ref failure: the document itself cannot be written out.
+            raise ValueError(
+                f"{ref_location(format_pointer(loc), source)}: the document contains itself "
+                f"through a YAML alias, so it cannot be composed"
+            )
+        self.on_path.add(id(obj))
+        try:
+            if isinstance(obj, dict):
+                return {
+                    k: self.walk(v, base_dir, source, (*loc, k), (*at, k), depth)
+                    for k, v in obj.items()
+                }
             return [
                 self.walk(v, base_dir, source, (*loc, i), (*at, i), depth)
                 for i, v in enumerate(obj)
             ]
-        return obj
+        finally:
+            self.on_path.discard(id(obj))
 
     def ref(
         self,
@@ -404,9 +435,23 @@ class _FileRefs:
         key = f"{target}#{pointer or ''}"
         if key in self.ancestry:
             raise RefResolutionError(f"Circular $ref detected: {key} ({where})")
-        if not target.exists():
+        if depth >= MAX_REF_DEPTH:
+            raise RefResolutionError(
+                f"$ref nesting depth exceeded {MAX_REF_DEPTH} — possible circular reference "
+                f"or very deep nesting ('{ref}' {where})"
+            )
+        try:
+            exists, regular = target.exists(), target.is_file()
+        except OSError as exc:
+            raise RefResolutionError(f"$ref '{ref}' {where} cannot be read: {exc}") from exc
+        if not exists:
             raise RefResolutionError(
                 f"$ref target not found: {ref} (resolved to {target}), {where}"
+            )
+        if not regular:
+            # A directory, a FIFO or a device would block or never end.
+            raise RefResolutionError(
+                f"$ref '{ref}' {where} names {target}, which is not a regular file"
             )
         self.ancestry.add(key)
         try:
@@ -448,13 +493,25 @@ class _FileRefs:
         return target
 
 
+#: Kernel trees a ref never reads, whatever the root: their files report a
+#: size of 0 and hold the process's environment, devices and such.
+_KERNEL_TREES = ("/proc", "/sys", "/dev")
+
+
 def _refuse_system_path(target: Path, ref: str) -> None:
     """Keep system directories blocked even when a caller widens the ref root.
 
     Routed through the platform-aware ``SecurePathValidator`` so the deny set
-    matches the rest of the CLI (it knows macOS ``/etc`` is ``/private/etc``).
-    Imported lazily to keep this module's import graph free of ``cli``.
+    matches the rest of the CLI (it knows macOS ``/etc`` is ``/private/etc``),
+    plus the kernel trees (:data:`_KERNEL_TREES`), which that set leaves to the
+    CLI's own path checks. Imported lazily to keep this module's import graph
+    free of ``cli``.
     """
+    text = target.as_posix()
+    if any(text == tree or text.startswith(tree + "/") for tree in _KERNEL_TREES):
+        raise RefResolutionError(
+            f"$ref resolves to a blocked system path: {ref} (resolved to {target})"
+        )
     try:
         from fluid_build.cli.core import FluidCLIError
         from fluid_build.cli.security import SecurePathValidator, get_security_context
@@ -523,11 +580,12 @@ def _read_text(target: Path, ref: str, where: str) -> str:
 
 
 def _parse_target(path: Path) -> Any:
-    """A ref target parsed as JSON or YAML by its suffix. Any root is accepted.
+    """A ref target parsed as JSON or YAML by its suffix.
 
-    The root contract and an overlay must be objects (``loader._parse_file``);
-    a fragment may be any value, so quality rules or columns can live in a
-    file of their own as a list. An empty YAML file is ``{}``, as before.
+    The root contract and an overlay must be objects (``loader._parse_file``).
+    A ``.json``, ``.yaml`` or ``.yml`` fragment may be any value, so quality
+    rules or columns can live in a file of their own as a list; a file with
+    another suffix keeps the old rule. An empty YAML file is ``{}``, as before.
     """
     text = path.read_text(encoding="utf-8")
     suffix = path.suffix.lower()
@@ -538,7 +596,14 @@ def _parse_target(path: Path) -> Any:
     try:
         return json.loads(text)
     except ValueError:
-        return _yaml(text)
+        pass
+    # Any other suffix (``.avsc``, none at all) parses as JSON, or else as a
+    # YAML object, as before: a dotfile or a key file inside the root reads
+    # as a YAML string, and a ref must not hand that out.
+    value = _yaml(text)
+    if not isinstance(value, dict):
+        raise ValueError(f"YAML root must be an object/dict: {path}")
+    return value
 
 
 def _yaml(text: str) -> Any:
@@ -572,7 +637,10 @@ def resolve_pointer_refs(
     if find_ref_node(document) is None:
         return document
     pointers = _PointerRefs(document, trace, budget if budget is not None else RefBudget())
-    resolved = pointers.resolve(document, (), ())
+    try:
+        resolved = pointers.resolve(document, (), ())
+    except RecursionError as exc:
+        raise RefResolutionError(_TOO_DEEP) from exc
     left = find_ref_node(resolved)
     if left is not None:
         raise RefResolutionError(

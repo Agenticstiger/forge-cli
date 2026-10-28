@@ -883,6 +883,11 @@ def _compose(
         # Resolved first, so a keyed merge sees the ids its fragments name.
         layer_origins = ContractOrigins()
         layer = refs(overlay, overlay_dir, overlay_source, layer_origins)
+        if not isinstance(layer, dict):
+            raise ValueError(
+                f"Overlay root must be an object/dict: {overlay_source or overlay_dir} "
+                f"composes to a {type(layer).__name__}"
+            )
         lengths = {name: len(composed.get(name) or ()) for name in _OVERLAY_IDENTITY_KEYS}
         composed = _deep_merge(composed, layer)
         if trace.origins is not None:
