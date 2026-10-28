@@ -472,7 +472,9 @@ def _readable_ref_root(path: Path, readable: Tuple[Path, ...]) -> Optional[Path]
     from fluid_build import loader
     from fluid_build.cli.mcp.policy import _path_is_allowed
 
-    root = loader._effective_ref_root(path, loader._parse_file(path), None).ref_root
+    # The root it would get if it named another file (reads_outside): one that
+    # names none reads nothing past its own directory anyway.
+    root = loader._effective_ref_root(path, {}, None, reads_outside=True).ref_root
     if _path_is_allowed(Path(root).resolve(), readable):
         return None
     contract = path.resolve()
