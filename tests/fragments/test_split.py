@@ -2589,26 +2589,48 @@ def test_i34_a_refused_split_leaves_the_tree_exactly_as_it_was(
     assert digest(tmp_path) == before
 
 
-def test_i03_a_comment_on_the_header_of_a_moved_text_scalar_is_dropped_without_a_word(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("line_end", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_i03_a_comment_on_the_header_of_a_moved_text_scalar_stays_beside_its_ref(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], line_end: str
 ) -> None:
-    """SG-32 characterisation (finding SP-10): ``sql: |  # the main query``. The
-    comment is outside the string's value, inside the span that becomes a ref,
-    and a text file cannot hold it. Nothing says it was left out."""
+    """Finding SP-10: ``sql: |  # the main query``. A text file cannot hold the
+    comment, so it stays on the line of the ref that replaces the scalar."""
     text = (
         "id: x\nbuilds:\n  - id: a\n    engine: sql\n    properties:\n"
-        "      sql: |  # the main query\n        SELECT 1\n"
+        "      sql: |-  # the main query\n        SELECT 1\n"
         "description:\n  purpose: >  # about\n    A folded\n    purpose.\n  usage: u  # kept\n"
-    )
+    ).replace("\n", line_end)
     pair = solo(tmp_path, text)
     capsys.readouterr()
 
     after = split_and_check(pair, "sql,description")
 
-    everything = b"\n".join(after.values()).decode("utf-8")
-    assert "the main query" not in everything and "# about" not in everything
-    assert "# kept" in text_of(after, NAME)  # a comment after a scalar's end is the root's
+    root = text_of(after, NAME)
+    assert f"      sql: {{$ref: ./sql/a.sql}}  # the main query{line_end}" in root
+    assert f"  purpose: {{$ref: ./docs/purpose.md}}  # about{line_end}" in root
+    assert f"  usage: {{$ref: ./docs/usage.md}}  # kept{line_end}" in root
+    assert after["sql/a.sql"] == b"SELECT 1"
+    assert_comments_conserved(text, after)
     assert "were not kept" not in capsys.readouterr().err
+
+
+def test_i03_the_header_comment_of_text_cut_from_a_moved_part_stays_in_its_fragment(
+    tmp_path: Path,
+) -> None:
+    """Finding SP-10: the comment stays in the file that holds the ref: here the
+    build's fragment, where the sql ref is."""
+    text = (
+        "id: x\nbuilds:\n  - id: a\n    engine: sql\n    properties:\n"
+        "      sql: !!str |  # the main query\n        SELECT 1\n      parameters: {a: 1}\n"
+    )
+    pair = solo(tmp_path, text)
+
+    after = split_and_check(pair, "builds,sql")
+
+    fragment = text_of(after, "fragments/builds/a.yaml")
+    assert "  sql: {$ref: ../../sql/a.sql}  # the main query\n" in fragment
+    assert after["sql/a.sql"] == b"SELECT 1\n"
+    assert_comments_conserved(text, after)
 
 
 @pytest.mark.parametrize(
@@ -3183,7 +3205,8 @@ def _render(contract: Dict[str, Any], rng: random.Random) -> str:
 
 
 def _with_comments(text: str, rng: random.Random, trailing: bool) -> str:
-    """Full-line comments at random lines, and trailing ones if ``trailing``.
+    """Full-line comments at random lines, and trailing ones if ``trailing``,
+    a block scalar's header line included.
 
     Lines inside a block scalar are left alone (a ``#`` there is text).
     """
@@ -3209,7 +3232,7 @@ def _with_comments(text: str, rng: random.Random, trailing: bool) -> str:
     for n, line in enumerate(lines):
         if n in full:
             out.append(" " * (len(line) - len(line.lstrip(" "))) + f"# full-{n}")
-        if n in tail and not re.search(r"[|>][-+0-9]*$", line.rstrip()):
+        if n in tail:
             line = f"{line}  # trail-{n}"
         out.append(line)
     return "\n".join(out)

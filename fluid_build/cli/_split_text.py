@@ -19,7 +19,9 @@ every comment outside a moved part, key order, quoting, flow style and blank
 lines. Each moved part takes its own text to its fragment, comments inside
 it included, and a ``$ref`` takes its place. A part inside another (a
 build's SQL) is cut out of its container's text first, so the container's
-fragment holds the ref to it.
+fragment holds the ref to it. The comment on a block scalar's header line
+(``sql: |  # the query``) stays beside the ref that replaces the scalar: a
+text file cannot hold it.
 
 PyYAML's compose marks give each part's span; PyYAML is a base dependency,
 so no round-trip library is needed. A block node's end mark runs past its
@@ -33,6 +35,7 @@ line, as a flow mapping.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
@@ -41,6 +44,10 @@ from fluid_build.cli.forge_contract_fragments import FragmentSite, container_of,
 from fluid_build.util.safe_yaml import compose_yaml_safe
 
 __all__ = ["SpliceRefused", "split_yaml_text"]
+
+#: The comment on a block scalar's header line, the blanks before it included:
+#: a ``#`` that follows a blank, so a ``#`` inside a tag is not one.
+_HEADER_COMMENT = re.compile(r"[ \t]+#.*$")
 
 
 class SpliceRefused(Exception):
@@ -140,7 +147,7 @@ def _span(
     end = _content_end(text, node)
     flow = "{$ref: " + _yaml_string(ref) + "}"
     if is_text or isinstance(node, yaml.ScalarNode) or node.flow_style:
-        return start, end, flow
+        return start, end, flow + _header_comment(text, node)
     end = _with_trailing_comment(text, end)
     if key is not None and node.start_mark.line == key.start_mark.line:
         # A tag or an anchor on the key's line ("key: &a", the mapping below):
@@ -152,6 +159,20 @@ def _span(
         indent = " " * (key.start_mark.column + 2 - node.start_mark.column)
         return start, end, indent + "$ref: " + _yaml_string(ref)
     return start, end, "$ref: " + _yaml_string(ref)
+
+
+def _header_comment(text: str, node: Any) -> str:
+    """The comment on a block scalar's header line, as written; ``""`` for none.
+
+    The ref that replaces the scalar keeps it: a text file cannot hold it.
+    """
+    if not (isinstance(node, yaml.ScalarNode) and node.style in ("|", ">")):
+        return ""
+    start = node.start_mark.index
+    newline = text.find("\n", start)
+    header = text[start : len(text) if newline < 0 else newline].rstrip("\r")
+    found = _HEADER_COMMENT.search(header)
+    return found.group(0) if found else ""
 
 
 def _content_end(text: str, node: Any) -> int:
