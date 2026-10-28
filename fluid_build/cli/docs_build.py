@@ -28,6 +28,10 @@ from ._logging import info
 
 COMMAND = "docs"
 
+#: The file names a product's root contract has. ``--src`` lists these and nothing
+#: else: ``contract.fluid.<env>.yaml`` beside one is its overlay, not a product.
+_CONTRACT_FILE_NAMES = ("contract.fluid.yaml", "contract.fluid.yml", "contract.fluid.json")
+
 
 def register(subparsers: argparse._SubParsersAction):
     p = subparsers.add_parser(
@@ -108,12 +112,16 @@ def _resolve_contract_paths(args) -> list[str]:
     """Resolve the set of contract files to summarize.
 
     ``--files`` wins when present (explicit glob mode); otherwise fall
-    back to the recursive scan under ``--src``.
+    back to the recursive scan under ``--src``, which lists the root contracts
+    (:data:`_CONTRACT_FILE_NAMES`) and not the overlays beside them.
     """
     files_glob = getattr(args, "files", None)
     if files_glob:
         return sorted(glob.glob(files_glob, recursive=True))
-    return sorted(glob.glob(f"{args.src}/**/contract.fluid.*", recursive=True))
+    found: set[str] = set()
+    for name in _CONTRACT_FILE_NAMES:
+        found.update(glob.glob(f"{args.src}/**/{name}", recursive=True))
+    return sorted(found)
 
 
 def _summarize_contract(path: str, contract: Any, error: Any = None) -> dict[str, Any]:

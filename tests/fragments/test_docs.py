@@ -570,6 +570,29 @@ def test_j04_every_page_the_html_index_links_to_exists(tmp_path: Path) -> None:
     assert [link for link in links if not (out / link).is_file()] == []
 
 
+@pytest.mark.parametrize("suffix", [".yaml", ".yml", ".json"])
+def test_f23_docs_src_lists_a_root_contract_of_each_suffix_and_never_its_overlay(
+    tmp_path: Path, suffix: str
+) -> None:
+    """``contract.fluid.<env>.<suffix>`` beside a root contract is an overlay (the loader's
+    candidate ``<stem>.<env>.<suffix>``), whatever its suffix."""
+    src = tmp_path / "src"
+    document = _min_doc(f"suffix.{suffix[1:]}")
+    root = src / "p" / f"contract.fluid{suffix}"
+    root.parent.mkdir(parents=True)
+    root.write_text(
+        json.dumps(document) if suffix == ".json" else yaml.safe_dump(document), encoding="utf-8"
+    )
+    (src / "p" / f"contract.fluid.prod{suffix}").write_text("{}\n", encoding="utf-8")
+    (src / "p" / "overlays").mkdir()
+    (src / "p" / "overlays" / f"test{suffix}").write_text("{}\n", encoding="utf-8")
+    out = tmp_path / "site"
+
+    assert _docs(src, out, src=True) == 0
+
+    assert [Path(r["path"]).name for r in _index(out)] == [f"contract.fluid{suffix}"]
+
+
 # ── J-05 ────────────────────────────────────────────────────────────────
 
 _HOSTILE = {
