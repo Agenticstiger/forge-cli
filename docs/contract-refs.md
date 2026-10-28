@@ -1,11 +1,11 @@
 # Composing a contract from fragments with `$ref`
 
-A contract can pull any part of itself from another file with `$ref`: an
-object, a list or a value from a YAML or JSON file, or the text of a `.sql` or
-`.md` file. Every command (`fluid validate`, `plan`, `apply`, `bundle`,
-`generate`, `docs`) and the contract API resolve every ref before they do
-anything else, through one composition, so the rest of the pipeline sees one
-document.
+A contract can pull any part of itself from another file with `$ref`: a
+value from a YAML or JSON file (an object, a list, a scalar), or the text of a
+`.sql`, `.md`, `.markdown`, `.txt`, `.py`, `.scala` or `.r` file, read as a
+string and never parsed. `fluid validate`, `plan`, `apply`, `bundle` and every
+other command resolve every ref before they do anything else, so the rest of
+the pipeline sees one document.
 
 ```text
 orders/
@@ -38,80 +38,14 @@ fluid bundle   orders/contract.fluid.yaml   # print the single resolved document
 A ref is resolved relative to the file that contains it, so
 `fragments/builds/ingest.yaml` may itself say `$ref: ../policy.yaml`.
 
-Every `$ref` goes through the same three steps:
-
-1. **Read the target.** A JSON or YAML file may hold any value at its root, so
-   quality rules or columns can live in a file of their own as a list. A file
-   ending in `.sql`, `.md`, `.markdown`, `.txt`, `.py`, `.scala` or `.r` is its
-   text, as a string, never parsed (UTF-8, at most 5 MiB):
-
-   ```yaml
-   builds:
-     - id: transform
-       pattern: embedded-logic
-       properties:
-         sql: {$ref: ./sql/transform.sql}
-   description:
-     usage: {$ref: ./docs/usage.md}
-   ```
-
-2. **Apply the pointer.** `file.yaml#/a/b` selects inside the target
-   ([RFC 6901](https://www.rfc-editor.org/rfc/rfc6901), `~1` for `/` and `~0`
-   for `~` in a key). A pointer cannot select inside a text file.
-3. **Merge the siblings.** Keys written beside `$ref` are merged over a copy of
-   the target as a [JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7386):
-   objects merge key by key, a list or a scalar replaces, `null` removes a key.
-   A shared fragment is reused with one field changed:
-
-   ```yaml
-   - $ref: ./shared/columns.yaml#/order_id
-     description: The order this row belongs to
-   ```
-
-   A target that is not an object (a list, a value, a text file) cannot take
-   siblings, and says so.
-
-**Same-document pointers** (`$ref: "#/a/b"`, or `"#"` for the whole document)
-name a place in the composed contract: every fragment in, the `--env` overlay
-merged. That holds in whichever file the pointer is written, so `fluid split`
-never changes what a pointer names; to point inside a fragment file, name the
-file (`./columns.yaml#/order_id`). A pointer that names nothing, or a place
-that contains it, is an error.
-
-**Overlays** compose the same way: a `$ref` in `overlays/prod.yaml` resolves
-relative to the overlay file, under the same ref root, before the overlay is
-merged, so an environment can take a binding or a whole entry from a fragment.
-
-**Nothing is left.** After composition no `$ref` remains, open blocks such as
-`parameters` and `extensions` included. A ref that cannot be resolved fails
-every command, naming the ref, the file it was written in and its JSON pointer.
-Refs may bring at most 1,000,000 values or 50 MiB of text into one contract: a
-target is copied once for every ref that reaches it, so refs that each name the
-one before twice would otherwise double the contract at every step.
-
-### Checking fragments in an editor, and on their own
-
-The canonical schema describes the composed contract, so an editor checking a
-root that holds `{$ref: ...}` against it reports every ref. Point the editor at
-the authoring schema instead, bundled beside the canonical one as
-`fluid_build/schemas/fluid-authoring-schema-0.7.6.json`: the same schema, with
-a `$ref` (siblings included) accepted wherever a value stands, and the
-canonical checks and messages everywhere else. It is generated from the
-canonical schema (`python -m fluid_build.schema_authoring`).
-
-To check one fragment on its own, name what it stands for:
-
-```bash
-fluid validate --fragment expose fragments/exposes/orders.yaml
-fluid validate --fragment quality fragments/quality/orders.yaml
-```
-
-The kind is a `$defs` name of the schema (`expose`, `build`, `column`,
-`sovereignty`, `accessPolicy`, ...) or `quality` / `schema` for an expose's
-lists. The schema version is `--schema-version`, else the `fluidVersion` of
-the nearest `contract.fluid.yaml` above the file. Errors name the file and
-line, as validating the whole contract does; the contract-wide rules
-(sovereignty against regions, overlays) need the whole contract.
+Keys written beside `$ref` are merged over a copy of what it names, as a
+[JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7386): objects merge, a
+list or a scalar replaces, `null` removes a key. A target that is not an
+object takes no keys beside its `$ref`. A same-document ref
+(`$ref: "#/a/b"`) names a place in the composed contract, after the `--env`
+overlay is merged, whichever file it is written in. A `$ref` in an overlay
+resolves relative to the overlay file. No `$ref` is left after composition: one
+that cannot be resolved fails the command and names the file it was written in.
 
 ---
 
@@ -155,35 +89,12 @@ process can read into itself, and `fluid bundle` would print it back.
 
 ## Widening the root (monorepos)
 
-### Once, in the workspace
-
-A workspace that keeps fragments its products share declares the root once,
-in `fluid.workspace.yaml`, as a path relative to that file:
-
-```yaml
-# repo/fluid.workspace.yaml
-name: commerce
-ref_root: .        # refRoot is read too
-```
-
-Every contract under `repo/` may then name `repo/shared/...`, from any working
-directory and with no variable set. The nearest `fluid.workspace.yaml` above a
-contract is the one read, and it is only read for a contract that names
-another file. A workspace file is part of the project, and a project may not
-reach outside its own tree, so the setting is ignored (with a warning, and the
-contract keeps its own directory) when the root it names:
-
-- is outside the workspace file's directory (`..`, an absolute path, `~`);
-- is not a directory, or does not contain the contract;
-- is the filesystem root, a home directory or a temporary directory, or sits
-  above the version-control repository the contract is in (the same vetting
-  the DuckDB sandbox gives a workspace).
-
-An operator running other people's contracts (a service that validates
-uploads) sets `FLUID_IGNORE_WORKSPACE_REF_ROOT=1` to keep every contract to its
-own directory; a project `.env` cannot set it.
-
-### Per process or per call
+A workspace can widen it once for every product under it: `ref_root: .` in
+`fluid.workspace.yaml`, relative to that file. The root must stay inside the
+workspace file's own directory, contain the contract, and not be a home, a
+temporary directory, `/` or above the contract's repository; otherwise the
+setting is ignored with a warning. `FLUID_IGNORE_WORKSPACE_REF_ROOT=1` turns it
+off.
 
 To share fragments between products, set the ref root to a directory that
 contains both the contracts and the shared fragments:
