@@ -56,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`fluid init --discover` against a remote URL failed on DuckDB 2.0.0**, before a byte was read:
-  `PermissionException: Cannot read a CA certificate bundle: file system access is restricted by
+  `Permission Error: Cannot read a CA certificate bundle: file system access is restricted by
   configuration`. TLS needs the host's trust store, the sandbox granted no path to it, and nothing
   granted one when a remote prefix was declared — so the whole remote-discovery surface was broken
   on the engine the project resolves to by default, while the same call worked on 1.5.x. The cause
@@ -108,6 +108,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own credentials in the URI itself, which is not a `secretRef` and so is not policed; and
   `{{ env.NAME }}` interpolation inside a contract bypasses `secretRef` entirely. Neither is changed
   by this release.
+
+- **A CA bundle outside DuckDB's five candidate paths cannot be used.** There is no operator
+  override (no `FLUID_DUCKDB_CA_BUNDLE`, and DuckDB consults neither `SSL_CERT_FILE` nor OpenSSL's
+  defaults — measured), so a host whose trust store lives elsewhere, including one behind a
+  TLS-inspecting proxy whose own CA is installed somewhere else, still gets DuckDB's refusal on a
+  remote read. That is no worse than before this release, where every such read failed on 2.0.0
+  regardless, and the refusal still names the paths it looked for — but it is not closed.
+- **`azure://` / `az://` is not measured.** The fix grants the copy for every declared remote
+  prefix, but the Azure filesystem extension does its own TLS and may not read the bundle through
+  this path. `s3://`, `gs://`, `http://` and `https://` were verified live.
 
 ## [0.24.0] — 2026-10-27
 

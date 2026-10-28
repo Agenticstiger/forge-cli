@@ -14,9 +14,11 @@
 
 """A declared remote prefix grants the one CA bundle its TLS needs, and nothing else.
 
-On DuckDB 2.0.0 every remote read failed before a byte moved::
+On DuckDB 2.0.0 every remote read failed before a byte moved. The message, as
+DuckDB prints it and as the CLI shows it on its ``why`` line -- the exception
+type is ``duckdb.PermissionException``, which is not part of the text::
 
-    PermissionException: Cannot read a CA certificate bundle: file system access
+    Permission Error: Cannot read a CA certificate bundle: file system access
     is restricted by configuration. Add one of /etc/ssl/certs/ca-certificates.crt,
     ... to allowed_paths, point ca_cert_file at an allowed file, or disable
     server certificate verification
@@ -85,6 +87,7 @@ from __future__ import annotations
 
 import gc
 import os
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -115,6 +118,9 @@ REMOTE = "s3://noaa-ghcn-pds/csv/by_year/2024.csv"
 #: before the connection is attempted, which is what makes the drift guard
 #: below work with no network.
 UNREACHABLE = "https://127.0.0.1:1/nothing.csv"
+
+#: The same bucket as a bare prefix, for the allowlist built by hand.
+REMOTE_PREFIX = "s3://noaa-ghcn-pds/csv/by_year/"
 
 
 def _granted_paths(con: Any) -> List[str]:
@@ -307,6 +313,33 @@ def test_a_local_read_grants_no_ca_bundle(tmp_path: Path) -> None:
         con.close()
 
 
+def test_a_declared_file_and_the_ca_copy_both_reach_allowed_paths(tmp_path: Path) -> None:
+    """The shape the changed line assembles: ``allow.paths`` plus the copy.
+
+    Every other test here declares one or the other, so a regression in the
+    concatenation -- dropping the caller's own declared files and granting only
+    the bundle -- would be invisible.
+
+    Membership, not order: DuckDB's read-back order is its own. Measured with
+    three files declared ``zzz, aaa, mmm``, it reported ``mmm, aaa, zzz`` --
+    neither sorted nor as declared -- so an assertion on position would be
+    pinning an implementation detail that happens to hold today.
+    """
+    _host_bundle()
+    declared = tmp_path / "declared.csv"
+    declared.write_text("a,b\n1,2\n", encoding="utf-8")
+    allow = DuckDBAllowlist.none().with_paths(str(declared)).with_remote(REMOTE_PREFIX)
+
+    con = secure_duckdb_connect(":memory:", allow=allow)
+    try:
+        granted = _granted_paths(con)
+        assert len(granted) == 2, granted
+        assert sandbox._fold(os.path.realpath(str(declared))) in granted, granted
+        assert any(sandbox.CA_DIR_PREFIX in entry for entry in granted), granted
+    finally:
+        con.close()
+
+
 def test_the_grant_is_one_file_and_not_a_directory() -> None:
     """``allowed_directories`` is untouched, so #757's prefix grant is unaffected.
 
@@ -445,13 +478,51 @@ def test_a_host_with_no_candidate_grants_nothing(
         con.close()
 
 
-def test_every_candidate_is_an_absolute_file_path() -> None:
-    """A relative entry would be refused by DuckDB and a directory would widen the grant."""
+def test_every_candidate_is_an_absolute_posix_file_path() -> None:
+    """A relative entry would be refused by DuckDB and a directory would widen the grant.
+
+    Judged with ``posixpath``, not ``os.path``: these are POSIX paths, and from
+    Python 3.13 ``ntpath.isabs`` answers False for a path with a single leading
+    slash (it is drive-relative on Windows). Measured: ``ntpath.isabs(
+    '/etc/ssl/cert.pem')`` is True on 3.12 and False on 3.14, so ``os.path``
+    would fail this test for a contributor on Windows under 3.13 or later --
+    about their platform, not about the list.
+
+    The directory check only bites for a candidate that exists; what keeps a
+    non-existent one honest is :func:`_ca_bundle_for_remote`'s own
+    ``os.path.isfile``, pinned by ``test_a_candidate_that_is_not_a_file_is_skipped``.
+    """
     assert sandbox._CA_BUNDLE_CANDIDATES
     for candidate in sandbox._CA_BUNDLE_CANDIDATES:
-        assert os.path.isabs(candidate), candidate
-        assert not candidate.endswith(("/", os.sep)), candidate
+        assert posixpath.isabs(candidate), candidate
+        assert not candidate.endswith("/"), candidate
         assert not os.path.isdir(candidate), candidate
+
+
+#: What :data:`sandbox._CA_BUNDLE_CANDIDATES` must hold, spelled out here so an
+#: edit to it has to be made twice, deliberately.
+EXPECTED_CANDIDATES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+)
+
+
+def test_the_candidate_list_is_pinned_literally() -> None:
+    """The one check on the list that runs on every host and every engine.
+
+    ``test_the_candidate_list_matches_the_one_duckdb_names`` is the authority on
+    what DuckDB actually probes, but it needs 2.0.0 and httpfs, so it skips on
+    the ``duckdb-floor`` lane -- which installs MIN_DUCKDB_VERSION, 1.5.0, the
+    very lane this file was added to. The probe tests skip too where the host
+    has none of the five. Measured on the first version of this file: narrowing
+    the production tuple to one absent path left duckdb 1.5.6 fully green, so
+    total drift in OUR copy of the list was invisible everywhere but one lane.
+    This assertion has no host or engine dependency at all.
+    """
+    assert sandbox._CA_BUNDLE_CANDIDATES == EXPECTED_CANDIDATES
 
 
 def test_the_candidate_list_matches_the_one_duckdb_names(monkeypatch: pytest.MonkeyPatch) -> None:
