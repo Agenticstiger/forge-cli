@@ -25,7 +25,9 @@ off. Precedence: ``ref_root=`` > ``FLUID_REF_ROOT`` > workspace > the
 contract's own directory.
 
 Implemented key spellings: ``ref_root`` and ``refRoot`` (top level, or inside
-a ``workspace:`` mapping); off-switch ``FLUID_IGNORE_WORKSPACE_REF_ROOT``.
+a ``workspace:`` mapping); off-switch ``FLUID_IGNORE_WORKSPACE_REF_ROOT``. A
+value or a file that cannot be used is ignored with a WARNING, and every
+escape error of a contract under it says it was ignored and why.
 
 Every test builds its files under ``tmp_path``. The broad-root cases patch the
 sandbox's ``_home_dirs`` / ``_HOMES_PARENTS`` / ``_SYSTEM_TEMP_DIRS`` /
@@ -423,20 +425,54 @@ def test_l03_a_ref_root_above_the_workspace_is_refused_and_the_default_root_is_k
     assert str(ws.root / "fluid.workspace.yaml") in warning.getMessage()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG L-03: the escape error never says the workspace ref_root was ignored, or why; "
-    "its hint tells the author to declare the ref_root that was just ignored",
-)
 def test_l03_the_escape_error_says_the_ref_root_was_ignored_and_why(tmp_path: Path) -> None:
     ws = make_ws(tmp_path, setting("refRoot", ".."))
 
-    with pytest.raises(RefConfinementError) as err:
+    for _ in range(2):  # the second load logs nothing: its error is all a service's caller sees
+        with pytest.raises(RefConfinementError) as err:
+            load_contract(ws.contract)
+
+        message = str(err.value)
+        assert "ignored" in message.lower(), message
+        assert "outside the workspace directory" in message, message
+        assert str(ws.root / "fluid.workspace.yaml") in message, "it names the file to fix"
+        assert "declare ref_root" not in message, "it asks for the ref_root that was declared"
+
+
+def test_l03_with_the_off_switch_the_hint_does_not_ask_for_a_workspace_ref_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, io_spy: IoSpy
+) -> None:
+    ws = make_ws(tmp_path)
+    monkeypatch.setenv(OFF_SWITCH, "1")
+
+    with pytest.raises(RefConfinementError, match="escapes the ref root") as err:
         load_contract(ws.contract)
 
     message = str(err.value)
-    assert "ignored" in message.lower(), message
+    assert f"{OFF_SWITCH} is set" in message, message
+    assert "declare ref_root" not in message, "the hint asks for the setting that is switched off"
+    assert io_spy.finder_calls == [], "the switch does not even look for the workspace file"
+    assert "fluid.workspace.yaml" not in io_spy.parsed_names()
+
+
+def test_l03_an_ignored_variable_and_an_ignored_workspace_value_are_both_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loader_log: List[logging.LogRecord]
+) -> None:
+    ws = make_ws(tmp_path, setting("refRoot", ".."))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("FLUID_REF_ROOT", str(elsewhere))
+
+    with pytest.raises(RefConfinementError, match="escapes the ref root") as err:
+        load_contract(ws.contract)
+
+    message = str(err.value)
+    assert "FLUID_REF_ROOT is set but was ignored" in message, message
+    assert "The workspace's ref_root was ignored" in message, message
     assert "outside the workspace directory" in message, message
+    assert err.value.ignored_ref_root_env == str(elsewhere)
+    assert Path(err.value.root or "") == ws.product, "neither widened the root"
+    assert len(ignored(loader_log)) == 1 and len(ignored(loader_log, ENV_IGNORED_EVENT)) == 1
 
 
 # ── L-04 ────────────────────────────────────────────────────────────────
@@ -914,19 +950,14 @@ def test_l15_a_contract_that_needs_no_wider_root_still_validates_beside_a_malfor
     assert run_main("validate", ws.contract) == 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG L-15: a workspace file that cannot be parsed (list root, invalid YAML, alias "
-    "bomb, over the size cap) is swallowed with no diagnostic at all, while the escape hint "
-    "tells the author to declare the ref_root they declared",
-)
 @pytest.mark.parametrize("kind", sorted(_MALFORMED_FILES))
 def test_l15_a_malformed_workspace_file_leaves_a_diagnostic(
     tmp_path: Path, loader_log: List[logging.LogRecord], kind: str
 ) -> None:
     ws = make_ws(tmp_path, _MALFORMED_FILES[kind])
+    source = str(ws.root / "fluid.workspace.yaml")
 
-    with pytest.raises(RefConfinementError):
+    with pytest.raises(RefConfinementError) as err:
         load_contract(ws.contract)
 
     mentions = [
@@ -935,6 +966,30 @@ def test_l15_a_malformed_workspace_file_leaves_a_diagnostic(
         if r.levelno >= logging.WARNING and "fluid.workspace.yaml" in r.getMessage()
     ]
     assert mentions, "nothing was logged about the unusable fluid.workspace.yaml"
+    (warning,) = mentions
+    assert warning.event == WS_IGNORED_EVENT  # type: ignore[attr-defined]
+    assert source in warning.getMessage() and "cannot be parsed" in reason(warning)
+    # The escape error says so too: a service's caller never sees the log.
+    assert "The workspace's ref_root was ignored" in str(err.value), str(err.value)
+    assert source in str(err.value) and "cannot be parsed" in str(err.value)
+    assert "declare ref_root" not in str(err.value)
+
+
+def test_l15_a_yaml_syntax_error_is_placed_not_quoted(
+    tmp_path: Path, loader_log: List[logging.LogRecord]
+) -> None:
+    """The parser's message quotes the lines it failed on; the diagnostic names where they are."""
+    ws = make_ws(tmp_path, f"name: commerce\nnote: [{SECRET}, unclosed\nrefRoot: .\n")
+    with pytest.raises(Exception, match=SECRET):  # control: the parser's own message quotes it
+        yaml.safe_load((ws.root / "fluid.workspace.yaml").read_text(encoding="utf-8"))
+
+    with pytest.raises(RefConfinementError) as err:
+        load_contract(ws.contract)
+
+    (warning,) = ignored(loader_log)
+    assert "line " in reason(warning), reason(warning)
+    for text in (warning.getMessage(), str(err.value)):
+        assert SECRET not in text, text
 
 
 @pytest.mark.parametrize(
@@ -1215,20 +1270,10 @@ def _locked(ws: Workspace, shape: str) -> Iterator[None]:
             locked.chmod(0o755)
 
 
+#: Each makes ``Path.is_dir()`` raise up to Python 3.13 (3.14 answers False instead).
 _UNSTATTABLE = ["one-name", "many-segments", "untraversable-directory"]
-#: ``Path.is_dir()`` raises for a name it cannot stat up to Python 3.13; 3.14 answers False.
-_IS_DIR_RAISES = sys.version_info < (3, 14)
-_L21_BUG = (
-    "BUG L-21 (Python 3.10 to 3.13; 3.14's Path.is_dir answers False): a ref_root the file system cannot stat (longer than it allows, or under a "
-    "directory the process may not enter) raises a bare OSError (File name too long / "
-    "Permission denied) out of _workspace_root_or_problem: the Path.is_dir() after resolve() "
-    "is unguarded. A bad value in an unrelated file then fails even a contract whose refs all "
-    "stay in its own directory, and a valid FLUID_REF_ROOT does not rescue it (the workspace "
-    "is read before the variable is looked at)"
-)
 
 
-@pytest.mark.xfail(_IS_DIR_RAISES, strict=True, reason=_L21_BUG)
 @pytest.mark.parametrize("shape", _UNSTATTABLE)
 def test_l21_an_unstattable_ref_root_is_ignored_and_a_local_contract_still_loads(
     tmp_path: Path, loader_log: List[logging.LogRecord], shape: str
@@ -1241,27 +1286,29 @@ def test_l21_an_unstattable_ref_root_is_ignored_and_a_local_contract_still_loads
 
     (warning,) = ignored(loader_log)
     assert warning.getMessage()
+    assert len(reason(warning)) < 1000, "a 5000-character value is shown cut short"
 
 
-@pytest.mark.xfail(_IS_DIR_RAISES, strict=True, reason=_L21_BUG)
 @pytest.mark.parametrize("shape", _UNSTATTABLE)
 def test_l21_an_unstattable_ref_root_gives_the_escape_error_not_an_oserror(
     tmp_path: Path, shape: str
 ) -> None:
     ws = _unstattable_ref_root(tmp_path, shape, "../../shared/team.yaml")
 
-    with _locked(ws, shape), pytest.raises(RefConfinementError, match="escapes the ref root"):
-        load_contract(ws.contract)
+    with _locked(ws, shape):
+        with pytest.raises(RefConfinementError, match="escapes the ref root") as err:
+            load_contract(ws.contract)
+    assert "The workspace's ref_root was ignored" in str(err.value)
 
 
-@pytest.mark.xfail(_IS_DIR_RAISES, strict=True, reason=_L21_BUG)
 def test_l21_a_valid_fluid_ref_root_is_not_undone_by_an_unstattable_workspace_value(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loader_log: List[logging.LogRecord]
 ) -> None:
     ws = _unstattable_ref_root(tmp_path, "one-name", "../../shared/team.yaml")
     monkeypatch.setenv("FLUID_REF_ROOT", str(ws.root))
 
     assert owner_of(ws.contract) == TEAM
+    assert not ignored(loader_log), "a variable that applies leaves the workspace file unread"
 
 
 def test_l21_the_ref_root_argument_never_reads_the_workspace_file(tmp_path: Path) -> None:

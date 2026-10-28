@@ -623,12 +623,11 @@ def _effective_ref_root(
         explicit, origin = str(ref_root), "ref_root"
     else:
         explicit, origin = os.environ.get(REF_ROOT_ENV, "").strip(), REF_ROOT_ENV
-    # The root without the variable: the workspace's, else the contract's own.
-    unset = (_workspace_ref_root(contract_dir) if ref_root is None else None) or _RefRoot(
-        contract_dir
-    )
     if not explicit:
-        return unset
+        if ref_root is not None:
+            return _RefRoot(contract_dir)
+        # The root without the variable: the workspace's, else the contract's own.
+        return _workspace_ref_root(contract_dir).root
     try:
         # A stale value can fail to resolve at all: ``~gone/repo`` for a
         # user that no longer exists, a symlink loop, or a parent the
@@ -660,12 +659,15 @@ def _effective_ref_root(
         problem = f"{origin}={explicit!r} cannot be resolved: {str(exc).rstrip('.')}"
     if origin != REF_ROOT_ENV:
         raise RefResolutionError(problem)
+    # The root without the variable, read only now: a ref_root= or a
+    # FLUID_REF_ROOT that applies leaves the workspace file unread.
+    unset, refused = _workspace_ref_root(contract_dir)
     _note_ref_root_env_ignored(unset.ref_root, explicit, problem)
     return _RefRoot(
         unset.ref_root,
         root_hint=(
             f"{REF_ROOT_ENV} is set but was ignored for this contract: {problem}. "
-            f"To compose fragments from a wider tree, set {REF_ROOT_ENV} to a "
+            f"{refused}To compose fragments from a wider tree, set {REF_ROOT_ENV} to a "
             f"directory that contains the contract or pass ref_root= to the "
             f"loader; see docs/contract-refs.md."
         ),
@@ -673,8 +675,39 @@ def _effective_ref_root(
     )
 
 
-def _workspace_ref_root(contract_dir: Path) -> Optional[_RefRoot]:
-    """The ref root the workspace declares for a contract in ``contract_dir``, if usable.
+#: Ends an escape error while ``FLUID_IGNORE_WORKSPACE_REF_ROOT`` is set: the
+#: default hint would suggest declaring the one setting the operator switched off.
+_WORKSPACE_REF_ROOT_OFF_HINT = (
+    f"{IGNORE_WORKSPACE_REF_ROOT_ENV} is set, so no workspace's ref_root applies in this "
+    f"process. To compose fragments from a wider tree, set {REF_ROOT_ENV} to a directory "
+    f"that contains the contract, or pass ref_root= to the loader; see docs/contract-refs.md."
+)
+
+
+class _WorkspaceRoot(NamedTuple):
+    """What a contract's workspace makes of its ref root (:func:`_workspace_ref_root`)."""
+
+    #: The root, and the hint its escape errors end with, that the contract
+    #: gets with no ``ref_root=`` and no ``FLUID_REF_ROOT``.
+    root: _RefRoot
+    #: Why the workspace's ``ref_root`` was ignored for the contract, a
+    #: sentence its escape errors repeat; ``""`` when it applied or none was set.
+    refused: str = ""
+
+
+class _WorkspaceProblem(NamedTuple):
+    """Why a workspace's ``ref_root`` cannot widen anything."""
+
+    #: What kind of problem: a word, or a ``broad_root_reason`` code.
+    code: str
+    #: The sentence a WARNING and an escape error give: the value, what it
+    #: resolved to, and why that cannot be the root.
+    text: str
+
+
+def _workspace_ref_root(contract_dir: Path) -> _WorkspaceRoot:
+    """The ref root a contract in ``contract_dir`` gets from its workspace: the
+    one the workspace declares, if usable, else the contract's own directory.
 
     ``ref_root`` in the nearest ``fluid.workspace.yaml`` above the contract,
     a path relative to that file. A project file must not reach outside its
@@ -683,70 +716,156 @@ def _workspace_ref_root(contract_dir: Path) -> Optional[_RefRoot]:
     contain the contract, and pass the vetting the DuckDB sandbox gives a
     workspace grant: not the filesystem root, a home or a temp root, and not
     above the repository the contract is in. A workspace file planted higher
-    up therefore widens nothing it does not own. An unusable value is
-    ignored, with a WARNING once per file. ``FLUID_IGNORE_WORKSPACE_REF_ROOT``
-    switches the setting off.
+    up therefore widens nothing it does not own.
+
+    A value that cannot be used, or a file that cannot be parsed, is ignored:
+    the contract keeps its own directory, a WARNING says why
+    (:func:`_note_workspace_ref_root_ignored`), and so does every escape error
+    of the contract (``refused``), which is all a service's caller sees.
+    ``FLUID_IGNORE_WORKSPACE_REF_ROOT`` switches the setting off, and the
+    file is then not read at all.
     """
     if os.environ.get(IGNORE_WORKSPACE_REF_ROOT_ENV, "").strip():
-        return None
+        return _WorkspaceRoot(_RefRoot(contract_dir, root_hint=_WORKSPACE_REF_ROOT_OFF_HINT))
     from .util.workspace_root import WORKSPACE_CONFIG_FILENAME, find_workspace_root
 
+    own = _WorkspaceRoot(_RefRoot(contract_dir))
     try:
         found = find_workspace_root(contract_dir)
-        if found is None:
-            return None
-        workspace = _parse_file(found / WORKSPACE_CONFIG_FILENAME)
-    except Exception:  # noqa: BLE001 - an unreadable workspace declares nothing
-        return None
+    except Exception:  # noqa: BLE001 - a tree that cannot be searched declares nothing
+        return own
+    if found is None:
+        return own
+    source = found / WORKSPACE_CONFIG_FILENAME
+    try:
+        workspace = _parse_file(source)
+        if not isinstance(workspace, dict):
+            raise ValueError(f"its root is a {type(workspace).__name__}, not a mapping")
+    except Exception as exc:  # noqa: BLE001 - a file that cannot be parsed declares nothing
+        why = _why_unparseable(exc, source)
+        problem = _WorkspaceProblem("unparseable", f"{source.name} cannot be parsed ({why})")
+        return _workspace_refused(contract_dir, source, problem)
     block = (
         workspace.get("workspace") if isinstance(workspace.get("workspace"), dict) else workspace
     )
     value = block.get(WORKSPACE_REF_ROOT_KEY, block.get("refRoot"))
     if value is None:
-        return None
-    source = found / WORKSPACE_CONFIG_FILENAME
+        return own
     root = _workspace_root_or_problem(found, value, contract_dir)
-    if isinstance(root, str):
-        _note_workspace_ref_root_ignored(source, root)
-        return None
-    return _RefRoot(
-        root,
-        root_hint=(
-            f"The ref root {root} is the workspace's (ref_root in {source}). To compose "
-            f"from a wider tree, move ref_root up, set {REF_ROOT_ENV}, or pass ref_root= "
-            f"to the loader; see docs/contract-refs.md."
-        ),
+    if isinstance(root, _WorkspaceProblem):
+        return _workspace_refused(contract_dir, source, root)
+    return _WorkspaceRoot(
+        _RefRoot(
+            root,
+            root_hint=(
+                f"The ref root {root} is the workspace's (ref_root in {source}). To compose "
+                f"from a wider tree, move ref_root up, set {REF_ROOT_ENV}, or pass ref_root= "
+                f"to the loader; see docs/contract-refs.md."
+            ),
+        )
     )
 
 
-def _workspace_root_or_problem(found: Path, value: Any, contract_dir: Path) -> Union[Path, str]:
+def _workspace_refused(
+    contract_dir: Path, source: Path, problem: _WorkspaceProblem
+) -> _WorkspaceRoot:
+    """The contract's own directory, for a workspace whose ``ref_root`` was
+    ignored: the WARNING, and the sentence the contract's escape errors carry."""
+    _note_workspace_ref_root_ignored(source, problem)
+    refused = f"The workspace's ref_root was ignored for this contract: {problem.text} ({source}). "
+    return _WorkspaceRoot(
+        _RefRoot(
+            contract_dir,
+            root_hint=(
+                f"{refused}To compose fragments from a wider tree, fix that file, set "
+                f"{REF_ROOT_ENV} to a directory that contains the contract, or pass "
+                f"ref_root= to the loader; see docs/contract-refs.md."
+            ),
+        ),
+        refused,
+    )
+
+
+def _why_unparseable(exc: BaseException, source: Path) -> str:
+    """Why ``source`` could not be parsed, in one line that quotes none of it."""
+    seen = {id(exc)}
+    while exc.__cause__ is not None and id(exc.__cause__) not in seen:
+        exc = exc.__cause__  # the parser's own error, under the loader's wrapping
+        seen.add(id(exc))
+    mark = getattr(exc, "problem_mark", None)
+    if mark is not None:
+        # A YAML syntax error prints the line it is on; name the place instead.
+        what = getattr(exc, "problem", None) or "invalid YAML"
+        return _shown(f"{what} at line {mark.line + 1}, column {mark.column + 1}")
+    if isinstance(exc, OSError) and exc.strerror:
+        return exc.strerror
+    # The file is named beside the reason already, and its directory differs
+    # per upload: neither belongs in the reason.
+    text = str(exc).removesuffix(f": {source}").replace(str(source), source.name)
+    return _shown(text.splitlines()[0] if text.strip() else type(exc).__name__)
+
+
+#: How many characters of a value from a workspace file a message shows. The
+#: file may hold megabytes in its ref_root, and every escape error of a
+#: contract under it repeats why that ref_root was ignored.
+_SHOWN_CHARS = 200
+
+
+def _shown(text: str) -> str:
+    """``text`` for a message, cut after :data:`_SHOWN_CHARS` characters."""
+    if len(text) <= _SHOWN_CHARS:
+        return text
+    return f"{text[:_SHOWN_CHARS]}... ({len(text) - _SHOWN_CHARS:,} more characters)"
+
+
+def _workspace_root_or_problem(
+    found: Path, value: Any, contract_dir: Path
+) -> Union[Path, _WorkspaceProblem]:
     """The directory a workspace ``ref_root`` names, or why it cannot widen anything."""
     from pathlib import PurePosixPath, PureWindowsPath
 
     if not isinstance(value, str) or not value.strip():
-        return f"ref_root must be a directory path relative to the workspace file, got {value!r}"
+        shown = _shown(repr(value))
+        return _WorkspaceProblem(
+            "not_a_path",
+            f"ref_root must be a directory path relative to the workspace file, got {shown}",
+        )
     text = value.strip()
+    shown = _shown(repr(text))
+
+    def problem(code: str, why: str) -> _WorkspaceProblem:
+        return _WorkspaceProblem(code, f"ref_root {shown} {why}")
+
     if (
         text.startswith("~")
         or PurePosixPath(text).is_absolute()
         or PureWindowsPath(text).is_absolute()
         or PureWindowsPath(text).drive
     ):
-        return f"ref_root {text!r} must be a path relative to the workspace file's directory"
+        return problem("not_relative", "must be a path relative to the workspace file's directory")
     try:
         workspace_dir = found.resolve()
         root = (found / text).resolve()
     except (OSError, RuntimeError, ValueError) as exc:
-        return f"ref_root {text!r} cannot be resolved: {exc}"
+        return problem("cannot_resolve", f"cannot be resolved: {_shown(str(exc))}")
+    at = _shown(str(root))
     if not root.is_relative_to(workspace_dir):
-        return (
-            f"ref_root {text!r} resolves to {root}, outside the workspace directory "
-            f"{workspace_dir}; a workspace file may only widen the root within its own tree"
+        return problem(
+            "outside_workspace",
+            f"resolves to {at}, outside the workspace directory {workspace_dir}; a workspace "
+            f"file may only widen the root within its own tree",
         )
-    if not root.is_dir():
-        return f"ref_root {text!r} resolves to {root}, which is not a directory"
+    try:
+        is_dir = root.is_dir()
+    except OSError as exc:
+        # A name too long to look up, or a parent the process may not enter:
+        # Python 3.13 and older raise where 3.14 answers False.
+        why = exc.strerror or _shown(str(exc))
+        return problem("cannot_stat", f"resolves to {at}, which cannot be read: {why}")
+    if not is_dir:
+        return problem("not_a_directory", f"resolves to {at}, which is not a directory")
     if not contract_dir.is_relative_to(root):
-        return f"ref_root {text!r} resolves to {root}, which does not contain the contract"
+        return problem("contract_outside", f"resolves to {at}, which does not contain the contract")
     # The DuckDB sandbox's vetting of a workspace, reused so the two never
     # disagree on what a project directory is. Imported here only: most
     # contracts never get this far.
@@ -754,12 +873,13 @@ def _workspace_root_or_problem(found: Path, value: Any, contract_dir: Path) -> U
 
     reason = broad_root_reason(root)
     if reason is not None:
-        return f"ref_root {text!r} resolves to {root}, which is too broad a root ({reason})"
+        return problem(reason, f"resolves to {at}, which is too broad a root ({reason})")
     repository = _repository_below(root, contract_dir)
     if repository is not None:
-        return (
-            f"ref_root {text!r} resolves to {root}, above the repository the contract is in "
-            f"({repository}); a workspace file there would reach every checkout under it"
+        return problem(
+            "outside_repository",
+            f"resolves to {at}, above the repository the contract is in ({repository}); a "
+            f"workspace file there would reach every checkout under it",
         )
     return root
 
@@ -769,16 +889,16 @@ def _workspace_root_or_problem(found: Path, value: Any, contract_dir: Path) -> U
 _NOTED_WORKSPACE_REF_ROOT_IGNORED: Set[str] = set()
 
 
-def _note_workspace_ref_root_ignored(source: Path, problem: str) -> None:
+def _note_workspace_ref_root_ignored(source: Path, problem: _WorkspaceProblem) -> None:
     key = str(source)
     if not _first_time(_NOTED_WORKSPACE_REF_ROOT_IGNORED, key):
         return
     LOG.warning(
         "workspace_ref_root_ignored: %s (%s). Contracts under it keep their own directory "
         "as the ref root.",
-        problem,
+        problem.text,
         source,
-        extra={"event": "workspace_ref_root_ignored", "workspace": key},
+        extra={"event": "workspace_ref_root_ignored", "workspace": key, "reason": problem.code},
     )
 
 

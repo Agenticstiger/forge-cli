@@ -130,13 +130,16 @@ def test_a_root_a_workspace_file_may_not_declare_is_ignored(
     path = _workspace(tmp_path, setting)
 
     with caplog.at_level(logging.WARNING, logger="fluid.loader"):
-        with pytest.raises(RefConfinementError, match="escapes the ref root"):
+        with pytest.raises(RefConfinementError, match="escapes the ref root") as err:
             load_contract(path)
 
     warned = [
         r.getMessage() for r in caplog.records if "workspace_ref_root_ignored" in r.getMessage()
     ]
     assert len(warned) == 1 and why in warned[0]
+    # The escape error says so too, rather than asking for the ref_root it ignored.
+    assert "The workspace's ref_root was ignored" in str(err.value) and why in str(err.value)
+    assert "declare ref_root" not in str(err.value)
 
 
 def test_a_workspace_above_the_contracts_repository_widens_nothing(tmp_path: Path) -> None:
@@ -214,9 +217,21 @@ def test_a_contract_without_file_refs_never_reads_the_workspace(tmp_path: Path) 
     assert load_contract(path)["metadata"]["owner"] == {"team": "t"}
 
 
-def test_an_unreadable_workspace_file_declares_nothing(tmp_path: Path) -> None:
+def test_an_unreadable_workspace_file_declares_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     path = _workspace(tmp_path)
-    (tmp_path / "ws" / "fluid.workspace.yaml").write_text("- not: a mapping\n", encoding="utf-8")
+    source = tmp_path / "ws" / "fluid.workspace.yaml"
+    source.write_text("- not: a mapping\n", encoding="utf-8")
 
-    with pytest.raises(RefConfinementError, match="escapes the ref root"):
-        load_contract(path)
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        with pytest.raises(RefConfinementError, match="escapes the ref root") as err:
+            load_contract(path)
+
+    # Declares nothing, but says so: in the log, and in the error.
+    (warned,) = [
+        r for r in caplog.records if getattr(r, "event", None) == "workspace_ref_root_ignored"
+    ]
+    assert str(source.resolve()) in warned.getMessage()
+    assert "cannot be parsed" in warned.getMessage()
+    assert "cannot be parsed" in str(err.value)
