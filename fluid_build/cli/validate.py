@@ -536,6 +536,7 @@ def _run_fragment_validation(
     whole contract.
     """
     from fluid_build import contract_refs, loader
+    from fluid_build.errors import FluidError
     from fluid_build.schema_manager import SchemaVersion, ValidationResult
     from fluid_build.util.ref_confinement import RefResolutionError, is_within
 
@@ -547,23 +548,6 @@ def _run_fragment_validation(
             {"error": "--env applies to a whole contract; validate the contract with it"},
         )
     contract = _nearest_contract(fragment)
-    version = (
-        args.schema_version
-        or _contract_version(contract)
-        or (schema_manager.latest_bundled_version())
-    )
-    schema = schema_manager.get_schema(SchemaVersion.parse(version), offline_only=True)
-    if not schema:
-        raise CLIError(1, "schema_not_available", {"version": version})
-    defs = schema.get("$defs") or {}
-    pointer = _FRAGMENT_POINTERS.get(kind) or (f"#/$defs/{kind}" if kind in defs else None)
-    if pointer is None:
-        kinds = ", ".join(sorted([*defs, *_FRAGMENT_POINTERS]))
-        raise CLIError(
-            1,
-            "fragment_kind_unknown",
-            {"error": f"{kind!r} is not a kind of fragment in schema {version}; kinds: {kinds}"},
-        )
 
     origins = loader.ContractOrigins(None)
     origins.add((), loader.Origin(fragment.resolve(), ()))
@@ -602,6 +586,26 @@ def _run_fragment_validation(
             },
         )
 
+    # The fragment is composed before a schema version is asked for: what is wrong with the file
+    # itself (it cannot be read, its refs escape the root) is reported first.
+    version = _fragment_schema_version(args.schema_version, fragment, contract)
+    try:
+        schema_version = SchemaVersion.parse(version)
+    except (ValueError, FluidError) as exc:
+        raise CLIError(1, "invalid_schema_version", {"version": version, "error": str(exc)})
+    schema = schema_manager.get_schema(schema_version, offline_only=True)
+    if not schema:
+        raise CLIError(1, "schema_not_available", {"version": version})
+    defs = schema.get("$defs") or {}
+    pointer = _FRAGMENT_POINTERS.get(kind) or (f"#/$defs/{kind}" if kind in defs else None)
+    if pointer is None:
+        kinds = ", ".join(sorted([*defs, *_FRAGMENT_POINTERS]))
+        raise CLIError(
+            1,
+            "fragment_kind_unknown",
+            {"error": f"{kind!r} is not a kind of fragment in schema {version}; kinds: {kinds}"},
+        )
+
     def locate(path: Sequence[Any], definition: bool = False) -> Optional[str]:
         found = origins.locate(path, definition=definition)
         if found is None:
@@ -613,7 +617,7 @@ def _run_fragment_validation(
         return f"{shown}:{found[1]}" if found[1] else shown
 
     result = ValidationResult(
-        is_valid=True, schema_version=SchemaVersion.parse(version), subject=f"{kind} fragment"
+        is_valid=True, schema_version=schema_version, subject=f"{kind} fragment"
     )
     wrapper = {"$schema": schema.get("$schema"), "$defs": defs, "$ref": pointer}
     if not schema_manager._validate_with_jsonschema(document, wrapper, result, locate):
@@ -651,17 +655,58 @@ def _nearest_contract(fragment: Path) -> Optional[Path]:
 _REPOSITORY_MARKERS = (".git", ".hg", ".svn", "fluid.workspace.yaml")
 
 
-def _contract_version(contract: Optional[Path]) -> Optional[str]:
-    if contract is None:
-        return None
-    from fluid_build.loader import _parse_file
+def _fragment_schema_version(flag: Optional[str], fragment: Path, contract: Optional[Path]) -> str:
+    """The schema version a fragment is checked against.
 
-    try:
-        version = _parse_file(contract).get("fluidVersion")
-    except Exception:  # noqa: BLE001 - no readable version: the default applies
-        return None
-    # A version kept elsewhere (a $ref) is not one this lookup can read.
-    return version if isinstance(version, str) and version else None
+    ``--schema-version``, else the ``fluidVersion`` of the nearest root contract
+    above the fragment. With neither the run asks for ``--schema-version``: a
+    fragment checked against a version nobody named is judged by the wrong
+    schema (a valid 0.7.6 fragment fails on a field 0.7.5 does not have).
+    """
+    if flag:
+        return flag
+    if contract is None:
+        why = f"no contract.fluid.yaml sits above {fragment.name} to read it from"
+    else:
+        try:
+            version = _contract_version(contract)
+        except Exception as exc:  # noqa: BLE001 - said below, with the file it is about
+            problem = " ".join(str(exc).split())
+            why = f"{contract}, the nearest contract above it, cannot be read: {problem}"
+        else:
+            if version:
+                return version
+            why = f"{contract}, the nearest contract above it, declares no fluidVersion"
+    raise CLIError(
+        1,
+        "schema_version_required",
+        {
+            "error": (
+                f"cannot tell which schema version to check the fragment against: {why}. "
+                "Pass --schema-version <version>, for example --schema-version 0.7.6."
+            )
+        },
+    )
+
+
+def _contract_version(contract: Path) -> Optional[str]:
+    """The ``fluidVersion`` a root contract declares, as the loader reads a value.
+
+    Only that value is composed, so a ``$ref`` in it is followed, and a contract
+    that does not compose yet (the fragment under check may be the reason) still
+    gives its version. ``None`` when it declares none.
+    """
+    from fluid_build.loader import compose_document, parse_contract_text
+    from fluid_build.util.safe_yaml import MAX_YAML_BYTES
+
+    with open(contract, "rb") as handle:
+        data = handle.read(MAX_YAML_BYTES + 1)
+    if len(data) > MAX_YAML_BYTES:
+        raise ValueError(f"the file is over the {MAX_YAML_BYTES}-byte cap")
+    document = parse_contract_text(data.decode("utf-8"), suffix=contract.suffix)
+    declared = {"fluidVersion": document.get("fluidVersion")}
+    version = compose_document(declared, contract.resolve().parent).document["fluidVersion"]
+    return str(version) if version else None
 
 
 def _handle_list_versions(schema_manager: FluidSchemaManager, args, logger: logging.Logger) -> int:

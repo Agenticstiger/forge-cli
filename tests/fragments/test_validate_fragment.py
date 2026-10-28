@@ -336,13 +336,6 @@ def test_k13_without_a_root_contract_the_run_never_falls_back_to_an_older_schema
     assert rc in (0, 1)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG K13-NO-ROOT-VERSION: with no root contract above the fragment and no "
-    "--schema-version, validate --fragment guesses the newest STABLE schema (0.7.5) and exits 0 "
-    "instead of asking for --schema-version (spec 9: the version comes from the flag or the "
-    "nearest root contract)",
-)
 def test_k13_without_a_root_contract_the_run_asks_for_a_schema_version(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
@@ -353,12 +346,6 @@ def test_k13_without_a_root_contract_the_run_asks_for_a_schema_version(
 
 
 @pytest.mark.parametrize("root", ["none", "unreadable"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG K13-NO-ROOT-VERSION: with no readable root contract above it and no "
-    "--schema-version, a fragment valid in 0.7.6 is judged by the guessed newest STABLE schema "
-    "(0.7.5) and gets a false error ('id' was unexpected); an unreadable root is not mentioned",
-)
 def test_k13_a_fragment_valid_in_0_7_6_gets_no_false_error_from_a_guessed_older_schema(
     tmp_path: Path, capsys: pytest.CaptureFixture, root: str
 ) -> None:
@@ -407,6 +394,110 @@ def test_k13_the_flag_wins_over_the_root_contract_and_the_nearest_contract_wins_
         "(schema v0.7.5)"
         in _validate(capsys, "--fragment", "expose", fragment, "--schema-version", "0.7.5")[1]
     )
+
+
+def test_k13_a_root_contract_with_no_version_is_named_when_the_run_asks(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    contract, fragment = _project(tmp_path)
+    root = _root_doc()
+    del root["fluidVersion"]
+    _dump(contract, root)
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "schema_version_required" in flat
+    assert f"{contract.resolve()}, the nearest contract above it, declares no fluidVersion" in flat
+    assert "Pass --schema-version" in flat
+
+
+def test_k13_an_unreadable_root_contract_is_named_when_the_run_asks(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    contract, fragment = _project(tmp_path)
+    contract.write_text("fluidVersion: [\n", encoding="utf-8")
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "schema_version_required" in flat
+    assert f"{contract.resolve()}, the nearest contract above it, cannot be read:" in flat
+
+
+def test_k13_a_root_that_does_not_compose_still_gives_its_version(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Only the version is read from the root. A dangling ref elsewhere in it (the fragment
+    under check may be the reason) does not stop the fragment from being checked."""
+    contract, fragment = _project(tmp_path, version="0.7.5")
+    root = _root_doc("0.7.5")
+    root["builds"] = [{"$ref": "./fragments/builds/not-written-yet.yaml"}]
+    _dump(contract, root)
+    assert _validate(capsys, contract)[0] == 1  # the contract itself does not load
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    assert rc == 0, out + err
+    assert "Valid expose fragment (schema v0.7.5)" in out
+
+
+def test_k13_a_version_kept_in_a_fragment_of_the_root_is_followed(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    contract, fragment = _project(tmp_path)
+    root = _root_doc()
+    root["fluidVersion"] = {"$ref": "./version.yaml"}
+    _dump(contract, root)
+    (contract.parent / "version.yaml").write_text("'0.7.5'\n", encoding="utf-8")
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    assert rc == 0, out + err
+    assert "(schema v0.7.5)" in out
+
+
+def test_k13_the_version_of_a_json_root_contract_is_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    fragment = _dump(tmp_path / "p" / "fragments" / "orders.yaml", _expose())
+    (tmp_path / "p" / "contract.fluid.json").write_text(
+        json.dumps(_root_doc("0.7.5")), encoding="utf-8"
+    )
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    assert rc == 0, out + err
+    assert "(schema v0.7.5)" in out
+
+
+def test_k13_a_version_that_is_not_one_is_refused_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    _, fragment = _project(tmp_path)
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment, "--schema-version", "bogus")
+
+    assert rc == 1
+    assert "invalid_schema_version" in out + err and "cli_unhandled_exception" not in out + err
+
+
+def test_k13_a_fragment_that_does_not_load_is_told_so_before_a_version_is_asked_for(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """With no root contract and no ``--schema-version`` the run asks for the version, but
+    first it loads the file: what is wrong with the fragment itself comes first."""
+    escaping = _dump(
+        tmp_path / "loose" / "d" / "cols.yaml", [{"name": "id", "type": {"$ref": "../x.md"}}]
+    )
+    broken = _dump(tmp_path / "loose" / "e" / "orders.yaml", _expose())
+    broken.write_text("exposeId: [\n", encoding="utf-8")
+
+    for fragment, said in ((escaping, "escapes the ref root"), (broken, "contract_load_failed")):
+        rc, out, err = _validate(capsys, "--fragment", "schema", fragment)
+
+        assert rc == 1 and said in " ".join((out + err).split())
+        assert "schema_version_required" not in out + err
 
 
 # ── K-14 ────────────────────────────────────────────────────────────────
