@@ -256,6 +256,10 @@ def _write_checked(
     """
     from fluid_build.loader import compose_contract
 
+    if root_out.is_symlink():
+        # open(..., "w") would write through it, a dangling one included, and the
+        # undo could only remove the link, leaving the written file where it points.
+        return f"{root_out} is a symlink; split writes no file through one"
     original_root: Optional[str] = None
     if root_out.exists():
         with open(root_out, encoding="utf-8", newline="") as handle:

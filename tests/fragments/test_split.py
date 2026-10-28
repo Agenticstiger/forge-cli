@@ -3205,3 +3205,27 @@ def test_i01_a_contract_with_hundreds_of_parts_splits_them_all(tmp_path: Path) -
 
     assert len(new_files(pair, after)) == 5 * n
     assert time.monotonic() - started < 60
+
+
+def test_the_root_is_never_written_through_a_symlink(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--out`` holding a link at the root's name (dangling or not) is refused before any
+    file is written: the undo could remove only the link, not the file it pointed to."""
+    source = tmp_path / "src"
+    source.mkdir()
+    contract = source / "contract.fluid.yaml"
+    contract.write_text(
+        "id: x\nbuilds:\n  - id: t\n    engine: sql\n    properties: {sql: SELECT 1}\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    elsewhere = tmp_path / "elsewhere" / "written.yaml"
+    (out / "contract.fluid.yaml").symlink_to(elsewhere)
+
+    assert split(contract, "--out", out) == 1
+    assert "symlink" in capsys.readouterr().err
+    assert not elsewhere.exists() and not elsewhere.parent.exists()
+    assert (out / "contract.fluid.yaml").is_symlink()
+    assert sorted(p.name for p in out.iterdir()) == ["contract.fluid.yaml"]
