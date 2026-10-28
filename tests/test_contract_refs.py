@@ -453,3 +453,352 @@ def test_compile_contract_matches_load_contract(tmp_path: Path) -> None:
     path = _product(tmp_path, inline=False)
 
     assert compile_contract(path) == load_contract(path)
+
+
+# ── same-document pointers (draft 23) ──────────────────────────────────
+
+
+def _doc(tmp_path: Path, text: str) -> Path:
+    return _write(tmp_path / "contract.fluid.yaml", text)
+
+
+def test_a_pointer_names_a_place_in_the_contract(tmp_path: Path) -> None:
+    path = _doc(
+        tmp_path,
+        "defs: {flink: {parallelism: 2, checkpoints: 60s}}\n"
+        "builds:\n"
+        "  - properties:\n"
+        "      parameters:\n"
+        '        flinkConfiguration: {$ref: "#/defs/flink", parallelism: 8}\n',
+    )
+
+    params = load_contract(path)["builds"][0]["properties"]["parameters"]
+
+    assert params["flinkConfiguration"] == {"parallelism": 8, "checkpoints": "60s"}
+
+
+def test_a_pointer_in_a_fragment_names_the_composed_contract(tmp_path: Path) -> None:
+    """Splitting a contract into files never changes what a pointer names."""
+    _write(tmp_path / "fragments" / "b.yaml", 'conf: {$ref: "#/shared/flink"}\n')
+    split = _doc(tmp_path, "shared: {flink: {p: 2}}\nbuilds: [{$ref: ./fragments/b.yaml}]\n")
+    flat = _write(
+        tmp_path / "flat" / "contract.fluid.yaml",
+        'shared: {flink: {p: 2}}\nbuilds: [{conf: {$ref: "#/shared/flink"}}]\n',
+    )
+
+    assert (
+        load_contract(split)
+        == load_contract(flat)
+        == {
+            "shared": {"flink": {"p": 2}},
+            "builds": [{"conf": {"p": 2}}],
+        }
+    )
+
+
+def test_a_pointer_passes_through_file_refs_and_other_pointers(tmp_path: Path) -> None:
+    _write(tmp_path / "parts.yaml", "a: {b: 1}\n")
+    path = _doc(
+        tmp_path,
+        "parts: {$ref: ./parts.yaml}\n"
+        'alias: {$ref: "#/parts"}\n'
+        'x: {$ref: "#/parts/a/b"}\n'
+        'y: {$ref: "#/alias/a/b"}\n',
+    )
+
+    contract = load_contract(path)
+
+    assert (contract["x"], contract["y"], contract["alias"]) == (1, 1, {"a": {"b": 1}})
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'a: {$ref: "#/b"}\nb: {$ref: "#/a"}\n',
+        'a: {x: {$ref: "#/a"}}\n',
+        'whole: {$ref: "#"}\n',
+    ],
+)
+def test_a_pointer_that_reaches_itself_is_a_cycle(tmp_path: Path, text: str) -> None:
+    with pytest.raises(RefResolutionError, match="Circular"):
+        load_contract(_doc(tmp_path, text))
+
+
+def test_a_pointer_to_nothing_names_the_file_it_was_written_in(tmp_path: Path) -> None:
+    _write(tmp_path / "fragments" / "b.yaml", 'conf: {$ref: "#/shared/flink"}\n')
+    path = _doc(tmp_path, "shared: {}\nbuilds: [{$ref: ./fragments/b.yaml}]\n")
+
+    with pytest.raises(RefResolutionError) as info:
+        load_contract(path)
+
+    message = str(info.value)
+    assert "'/shared/flink' in the composed contract, which is not there" in message
+    assert f"at JSON pointer '/conf' in {(tmp_path / 'fragments' / 'b.yaml').resolve()}" in message
+    assert "name the file ('./part.yaml#/key')" in message
+
+
+def test_a_same_document_ref_must_be_a_json_pointer(tmp_path: Path) -> None:
+    with pytest.raises(RefResolutionError, match="is not a JSON pointer"):
+        load_contract(_doc(tmp_path, 'defs: {}\nx: {$ref: "#defs"}\n'))
+
+
+def test_no_ref_survives_in_open_objects(tmp_path: Path) -> None:
+    _write(tmp_path / "tables" / "input.yaml", "connector: kafka\ntopic: orders\n")
+    path = _doc(
+        tmp_path,
+        "builds:\n"
+        "  - properties:\n"
+        "      parameters:\n"
+        "        input: {$ref: ./tables/input.yaml, scan.startup.mode: earliest}\n"
+        "        shared: {p: 1}\n"
+        '        copy: {$ref: "#/builds/0/properties/parameters/shared"}\n'
+        "extensions: {x: {$ref: ./tables/input.yaml#/topic}}\n",
+    )
+
+    contract = load_contract(path)
+
+    assert contract_refs.find_ref_node(contract) is None
+    assert contract["builds"][0]["properties"]["parameters"]["input"] == {
+        "connector": "kafka",
+        "topic": "orders",
+        "scan.startup.mode": "earliest",
+    }
+    assert contract["extensions"] == {"x": "orders"}
+
+
+def test_pointers_that_double_the_contract_are_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(contract_refs, "MAX_REF_EXPANSION_NODES", 500)
+    lines = ["l0: [1, 2, 3, 4]"]
+    lines += [f'l{n}: [{{$ref: "#/l{n - 1}"}}, {{$ref: "#/l{n - 1}"}}]' for n in range(1, 12)]
+
+    with pytest.raises(RefResolutionError, match="takes what refs bring into the contract past"):
+        load_contract(_doc(tmp_path, "\n".join(lines) + "\n"))
+
+
+def test_a_contract_without_refs_is_returned_as_parsed(tmp_path: Path) -> None:
+    document = {"id": "x", "builds": [{"id": "b", "properties": {"sql": "SELECT 1"}}]}
+
+    assert contract_refs.resolve_pointer_refs(document) is document
+
+
+# ── one composition for every command (draft 22) ────────────────────────
+
+_STREAM = """\
+fluidVersion: "0.7.6"
+kind: DataProduct
+id: commerce.orders_events
+name: Orders Events
+description: Order events published to Kafka.
+domain: commerce
+metadata:
+  layer: Bronze
+  owner: {team: commerce-data, email: commerce@example.com}
+exposes:
+  - exposeId: orders_events
+    kind: topic
+    version: "1.0.0"
+    binding:
+      platform: kafka
+      format: kafka_topic
+      location: {topic: orders.dev.events}
+    contract:
+      schema:
+        - {name: order_id, type: string, required: true}
+  - exposeId: audit_events
+    kind: topic
+    version: "1.0.0"
+    binding:
+      platform: kafka
+      format: kafka_topic
+      location: {topic: audit.dev.events}
+    contract:
+      schema:
+        - {name: event_id, type: string, required: true}
+"""
+
+_PROD_BINDING = "platform: kafka\nformat: kafka_topic\nlocation: {topic: orders.prod.events}\n"
+
+
+def _stream(tmp_path: Path, overlay: str, **fragments: str) -> Path:
+    for name, text in fragments.items():
+        _write(tmp_path / "fragments" / name, text)
+    _write(tmp_path / "overlays" / "prod.yaml", overlay)
+    return _write(tmp_path / "contract.fluid.yaml", _STREAM)
+
+
+def _topics(document: Dict[str, Any]) -> Dict[str, str]:
+    return {e["exposeId"]: e["binding"]["location"]["topic"] for e in document["exposes"]}
+
+
+_OVERLAYS = {
+    # The overlay takes one field from a fragment.
+    "binding": (
+        "exposes:\n  - exposeId: orders_events\n"
+        "    binding: {$ref: ../fragments/prod-binding.yaml}\n",
+        {"prod-binding.yaml": _PROD_BINDING},
+    ),
+    # The overlay takes a whole entry from a fragment: matched by the id the
+    # fragment names, among two exposes (a keyed 0.7.6 merge).
+    "entry": (
+        "exposes:\n  - {$ref: ../fragments/prod-expose.yaml}\n",
+        {
+            "prod-expose.yaml": (
+                "exposeId: orders_events\nbinding: {location: {topic: orders.prod.events}}\n"
+            )
+        },
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_OVERLAYS))
+def test_every_entry_point_applies_an_overlay_composed_from_fragments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    from fluid_build._contract_loader import load_contract_with_overlay
+    from fluid_build.api.contract import load_contract as api_load_contract
+    from fluid_build.cli import main
+    from fluid_build.cli.bundle import materialize_contract
+    from fluid_build.loader import load_with_overlay
+
+    monkeypatch.chdir(tmp_path)
+    overlay, fragments = _OVERLAYS[shape]
+    path = _stream(tmp_path, overlay, **fragments)
+    expected = {"orders_events": "orders.prod.events", "audit_events": "audit.dev.events"}
+    log = __import__("logging").getLogger("test")
+
+    documents = [
+        load_with_overlay(path, "prod"),
+        load_contract_with_overlay(str(path), "prod", log),
+        materialize_contract(path, "prod", log)[0],
+        api_load_contract(path, env="prod").contract,
+    ]
+    for document in documents:
+        assert _topics(document) == expected
+        assert contract_refs.find_ref_node(document) is None
+
+    assert main(["validate", str(path), "--env", "prod", "--strict"]) == 0
+    assert main(["bundle", str(path), "--env", "prod", "--out", str(tmp_path / "b.yaml")]) == 0
+    assert _topics(yaml.safe_load((tmp_path / "b.yaml").read_text("utf-8"))) == expected
+    out = tmp_path / "artifacts"
+    assert main(["generate", "artifacts", str(path), "--env", "prod", "--out", str(out)]) == 0
+    written = "\n".join(p.read_text("utf-8") for p in out.rglob("*") if p.is_file())
+    assert "orders.prod.events" in written and "orders.dev.events" not in written
+    assert "$ref" not in written
+
+
+def test_validate_checks_what_an_overlay_fragment_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The overlay is validated, not dropped: a bad value in its fragment fails."""
+    from fluid_build.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    overlay, fragments = _OVERLAYS["binding"]
+    bad = {"prod-binding.yaml": _PROD_BINDING.replace("kafka_topic", "not_a_format")}
+    path = _stream(tmp_path, overlay, **bad)
+
+    assert main(["validate", str(path), "--env", "prod"]) == 1
+
+
+def test_a_ref_in_the_base_no_longer_drops_the_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.api.contract import load_contract as api_load_contract
+    from fluid_build.loader import load_with_overlay
+
+    _write(tmp_path / "kafka-props.yaml", "acks: '1'\nlinger.ms: '5'\n")
+    _write(
+        tmp_path / "overlays" / "prod.yaml",
+        "exposes:\n  - exposeId: orders_events\n"
+        "    binding: {location: {topic: orders.prod.events}}\n",
+    )
+    path = _write(
+        tmp_path / "contract.fluid.yaml",
+        _STREAM.replace(
+            "      location: {topic: orders.dev.events}\n",
+            "      location: {topic: orders.dev.events}\n"
+            "      properties: {$ref: ./kafka-props.yaml, acks: all}\n",
+            1,
+        ),
+    )
+
+    for document in (load_with_overlay(path, "prod"), api_load_contract(path, env="prod").contract):
+        assert _topics(document)["orders_events"] == "orders.prod.events"
+        assert document["exposes"][0]["binding"]["properties"] == {"acks": "all", "linger.ms": "5"}
+
+
+def test_a_pointer_resolves_after_the_overlay_is_merged(tmp_path: Path) -> None:
+    from fluid_build.loader import load_with_overlay
+
+    _write(tmp_path / "overlays" / "prod.yaml", "shared: {parallelism: 8}\n")
+    path = _doc(tmp_path, 'shared: {parallelism: 2}\nflink: {$ref: "#/shared"}\n')
+
+    assert load_with_overlay(path, None)["flink"] == {"parallelism": 2}
+    assert load_with_overlay(path, "prod")["flink"] == {"parallelism": 8}
+
+
+def test_an_overlay_ref_is_confined_to_the_contracts_root(tmp_path: Path) -> None:
+    from fluid_build.loader import load_with_overlay
+
+    _write(tmp_path / "outside.yaml", "topic: stolen\n")
+    product = tmp_path / "product"
+    _write(product / "overlays" / "prod.yaml", "binding: {$ref: ../../outside.yaml}\n")
+    path = _write(product / "contract.fluid.yaml", "id: x\n")
+
+    with pytest.raises(RefConfinementError, match="escapes the ref root"):
+        load_with_overlay(path, "prod")
+
+
+def test_an_overlay_only_ref_gets_the_widened_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.loader import load_with_overlay
+
+    _write(tmp_path / "shared" / "prod-binding.yaml", "topic: orders.prod.events\n")
+    product = tmp_path / "products" / "orders"
+    _write(
+        product / "overlays" / "prod.yaml", "binding: {$ref: ../../../shared/prod-binding.yaml}\n"
+    )
+    path = _write(product / "contract.fluid.yaml", "id: x\nbinding: {topic: dev}\n")
+    monkeypatch.setenv("FLUID_REF_ROOT", str(tmp_path))
+
+    assert load_with_overlay(path, "prod")["binding"] == {"topic": "orders.prod.events"}
+
+
+def test_a_ref_that_cannot_be_resolved_fails_every_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    from fluid_build.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    path = _stream(
+        tmp_path,
+        "exposes:\n  - exposeId: orders_events\n    binding: {$ref: ../fragments/missing.yaml}\n",
+    )
+
+    assert main(["validate", str(path), "--env", "prod"]) == 1
+    assert main(["bundle", str(path), "--env", "prod", "--out", str(tmp_path / "b.yaml")]) == 2
+    assert main(["plan", str(path), "--env", "prod", "--out", str(tmp_path / "p.json")]) != 0
+    assert not (tmp_path / "b.yaml").exists() and not (tmp_path / "p.json").exists()
+    err = capsys.readouterr()
+    assert "$ref target not found: ../fragments/missing.yaml" in err.out + err.err
+    assert "overlays/prod.yaml" in err.out + err.err
+
+
+def test_generate_artifacts_reads_a_split_contract_whole_without_an_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    contract = yaml.safe_load(_STREAM)
+    _write(tmp_path / "fragments" / "orders.yaml", yaml.safe_dump(contract["exposes"][0]))
+    contract["exposes"][0] = {"$ref": "./fragments/orders.yaml"}
+    path = _write(tmp_path / "contract.fluid.yaml", yaml.safe_dump(contract, sort_keys=False))
+
+    out = tmp_path / "artifacts"
+    assert main(["generate", "artifacts", str(path), "--out", str(out)]) == 0
+    written = "\n".join(p.read_text("utf-8") for p in out.rglob("*") if p.is_file())
+    assert "orders.dev.events" in written and "$ref" not in written

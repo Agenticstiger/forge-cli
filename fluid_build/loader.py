@@ -39,11 +39,13 @@ from typing import (
 from fluid_build.contract_refs import (
     MAX_REF_DEPTH,
     ComposeTrace,
+    RefBudget,
     is_ref_node,
     parse_ref,
     pointer_tokens,
     resolve_file_refs,
     resolve_pointer,
+    resolve_pointer_refs,
 )
 from fluid_build.util.ref_confinement import (
     REF_ROOT_ENV,
@@ -701,8 +703,7 @@ def compile_contract(
             contain the contract. See ``docs/contract-refs.md``.
 
     Returns:
-        Fully resolved contract dict with no remaining ``$ref`` nodes
-        (except same-file pointers, which are preserved).
+        Fully resolved contract dict with no remaining ``$ref`` nodes.
     """
     log = logger or LOG
     p = Path(path).resolve()
@@ -712,17 +713,157 @@ def compile_contract(
         return contract
 
     log.info("compile_start", extra={"path": str(p)})
-    root = _effective_ref_root(p, contract, ref_root)
-    compiled = _resolve_refs(
-        contract,
-        p.parent,
-        ref_root=root.ref_root,
-        root_hint=root.root_hint,
-        ignored_ref_root_env=root.ignored_ref_root_env,
-        _source=p,
-    )
+    compiled = compose_contract(p, ref_root=ref_root, logger=log).document
     log.info("compile_done", extra={"path": str(p)})
     return compiled
+
+
+class ComposedContract(NamedTuple):
+    """A contract composed from its files, as every command reads it."""
+
+    #: The contract: every ``$ref`` resolved, the overlay merged.
+    document: Dict[str, Any]
+    #: The overlay merged in; ``None`` when no env was asked for or none matched.
+    overlay: Optional[Path]
+    #: Every file read, first-read order, resolved: the contract, its
+    #: fragments, then the overlay and its fragments.
+    files: Tuple[Path, ...]
+
+
+def compose_contract(
+    contract_path: str | Path,
+    env: Optional[str] = None,
+    *,
+    ref_root: Optional[Union[str, Path]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> ComposedContract:
+    """The contract at ``contract_path`` as every command reads it for ``env``.
+
+    The one composition behind ``validate``, ``plan``, ``apply``, ``bundle``,
+    ``generate`` and the contract API, so no two of them see different
+    documents:
+
+    1. The contract's file refs resolve (:mod:`fluid_build.contract_refs`).
+    2. The ``env`` overlay (:func:`load_overlay_document`) has its own file
+       refs resolved, relative to the overlay file and confined to the same
+       ref root, so an environment is composed from fragments like the base.
+       Then it is merged (:func:`_deep_merge`), so its ``builds``, ``exposes``
+       and ``consumes`` entries match by the ids their fragments name.
+    3. Same-document pointers resolve against the result.
+
+    The overlay is never dropped: one that cannot be applied is an error. An
+    ``env`` with no overlay gets the base, with the notice of
+    :func:`note_missing_overlay`.
+
+    Raises:
+        RefResolutionError: a ``$ref`` cannot be resolved; the message names
+            it and the file and JSON pointer it was written at.
+        OverlayMergeError: an overlay entry cannot be matched; the message
+            starts with the overlay file.
+        ValueError: the contract or the overlay root is not an object.
+        FileNotFoundError, RuntimeError: the contract cannot be read or parsed.
+    """
+    log = logger or LOG
+    path = Path(contract_path)
+    contract = _parse_file(path)
+    if not isinstance(contract, dict):
+        raise ValueError(f"contract root must be an object/dict: {path}")
+    found = load_overlay_document(path, env)
+    overlay_path = found[0] if found is not None else None
+    source = path.resolve()
+    # The ref root is widened only for a contract with a ref to another file;
+    # an overlay's refs count too.
+    root = _effective_ref_root(path, [contract, found[1]] if found else contract, ref_root)
+    trace = ComposeTrace()
+    trace.add_file(source)
+    try:
+        document = _compose(
+            contract,
+            base_dir=source.parent,
+            source=source,
+            root=root,
+            trace=trace,
+            overlay=found[1] if found else None,
+            overlay_dir=overlay_path.resolve().parent if overlay_path else None,
+            overlay_source=overlay_path.resolve() if overlay_path else None,
+        )
+    except OverlayMergeError as exc:
+        raise OverlayMergeError(f"{overlay_path}: {exc}") from exc
+    if overlay_path is not None:
+        log.info("overlay_applied", extra={"overlay": str(overlay_path)})
+    elif env:
+        # No overlay found. This used to be a DEBUG line, so ``--env prod``
+        # with a typo'd or missing overlay silently deployed the BASE
+        # contract at the default log level. Say so, once per contract/env.
+        note_missing_overlay(path, env, log, contract=document)
+    return ComposedContract(document, overlay_path, tuple(trace.files))
+
+
+def compose_document(
+    document: Mapping[str, Any],
+    base_dir: Path,
+    *,
+    overlay: Optional[Mapping[str, Any]] = None,
+    overlay_dir: Optional[Path] = None,
+) -> ComposedContract:
+    """``document`` composed as :func:`compose_contract` composes a contract
+    file in ``base_dir``: its refs confined to ``base_dir``, the overlay's
+    refs resolved against ``overlay_dir`` (default ``base_dir``). Neither
+    input is modified; ``files`` lists the fragments read."""
+    trace = ComposeTrace()
+    composed = _compose(
+        dict(document),
+        base_dir=base_dir,
+        source=None,
+        root=_RefRoot(base_dir, root_hint=f"Refs may only name files under {base_dir}."),
+        trace=trace,
+        overlay=dict(overlay) if overlay is not None else None,
+        overlay_dir=overlay_dir if overlay_dir is not None else base_dir,
+        overlay_source=None,
+    )
+    return ComposedContract(composed, None, tuple(trace.files))
+
+
+def _compose(
+    contract: Dict[str, Any],
+    *,
+    base_dir: Path,
+    source: Optional[Path],
+    root: _RefRoot,
+    trace: ComposeTrace,
+    overlay: Optional[Dict[str, Any]],
+    overlay_dir: Optional[Path],
+    overlay_source: Optional[Path],
+) -> Dict[str, Any]:
+    """``contract``'s file refs, then the overlay's merged over it, then the
+    same-document pointers of the result: nothing that is a ``$ref`` is left."""
+    budget = RefBudget()
+
+    def refs(document: Dict[str, Any], directory: Path, file: Optional[Path]) -> Any:
+        return resolve_file_refs(
+            document,
+            directory,
+            ref_root=root.ref_root,
+            root_hint=root.root_hint,
+            ignored_ref_root_env=root.ignored_ref_root_env,
+            source=file,
+            trace=trace,
+            budget=budget,
+        )
+
+    composed = refs(contract, base_dir, source)
+    if not isinstance(composed, dict):
+        # A root ``$ref`` may name a list or a scalar; a contract is an object.
+        raise ValueError(
+            f"contract root must be an object/dict: {source or base_dir} composes to a "
+            f"{type(composed).__name__}"
+        )
+    if overlay is not None and overlay_dir is not None:
+        if overlay_source is not None:
+            trace.add_file(overlay_source)
+        # Resolved first, so a keyed merge sees the ids its fragments name.
+        composed = _deep_merge(composed, refs(overlay, overlay_dir, overlay_source))
+    return resolve_pointer_refs(composed, trace=trace, budget=budget)
 
 
 def _overlay_candidates(contract_path: Path, env: str) -> Tuple[Path, ...]:
@@ -990,35 +1131,22 @@ def load_contract(
     *,
     resolve_refs: bool = True,
     ref_root: Optional[Union[str, Path]] = None,
-    _trace: Optional[ComposeTrace] = None,
 ) -> Dict[str, Any]:
     """
     Load a single FLUID contract file (JSON or YAML).
 
-    By default, any ``$ref`` pointers are resolved transparently so callers
-    always receive a fully-expanded document.  Pass ``resolve_refs=False``
-    to load the raw document without expansion.
+    By default, every ``$ref`` is resolved transparently so callers always
+    receive a fully-expanded document (:func:`compose_contract`, no overlay).
+    Pass ``resolve_refs=False`` to load the raw document without expansion.
 
     ``$ref`` targets are confined to the contract's directory tree; pass
     ``ref_root`` (or set ``FLUID_REF_ROOT``) to widen it to a directory that
     contains the contract. A ref outside the root raises
-    :class:`RefConfinementError`. ``_trace`` collects every file read.
+    :class:`RefConfinementError`.
     """
-    p = Path(path)
-    contract = _parse_file(p)
-    if resolve_refs:
-        source = p.resolve()
-        root = _effective_ref_root(p, contract, ref_root)
-        contract = _resolve_refs(
-            contract,
-            source.parent,
-            ref_root=root.ref_root,
-            root_hint=root.root_hint,
-            ignored_ref_root_env=root.ignored_ref_root_env,
-            _source=source,
-            _trace=_trace,
-        )
-    return contract
+    if not resolve_refs:
+        return _parse_file(Path(path))
+    return compose_contract(path, ref_root=ref_root).document
 
 
 def load_overlay_document(
@@ -1059,9 +1187,10 @@ def load_with_overlay(
     """
     Load a contract and, if env is provided, deep-merge a matching overlay.
 
-    ``$ref`` pointers are resolved *before* the overlay is applied so that
-    environment overrides can target any field — including those pulled from
-    external fragments.
+    The document of :func:`compose_contract`: ``$ref`` resolves in the base
+    and in the overlay *before* the merge, so environment overrides can target
+    any field — including those pulled from external fragments — and an
+    overlay can itself be composed from fragments.
 
     Example:
       base: examples/customer360/contract.fluid.yaml
@@ -1069,29 +1198,13 @@ def load_with_overlay(
         examples/customer360/overlays/dev.yaml  (etc...)
     """
     log = logger or logging.getLogger("fluid.loader")
-    base_path = Path(contract_path)
-
-    # Load base (with ref resolution)
-    base = load_contract(base_path, resolve_refs=resolve_refs, ref_root=ref_root)
-
-    # Apply overlay if requested
-    if env:
-        for cand in _overlay_candidates(base_path, env):
-            if cand.exists():
-                try:
-                    overlay = _parse_file(cand)
-                    if not isinstance(overlay, dict):
-                        raise ValueError(f"Overlay root must be an object/dict: {cand}")
-                    merged = _deep_merge(dict(base), overlay)
-                    log.info("overlay_applied", extra={"overlay": str(cand)})
-                    return merged
-                except Exception as e:
-                    raise RuntimeError(f"Failed to apply overlay {cand}: {e}") from e
-        # No overlay found. This used to be a DEBUG line, so ``--env prod``
-        # with a typo'd or missing overlay silently deployed the BASE
-        # contract at the default log level. Say so, once per contract/env.
-        note_missing_overlay(base_path, env, log, contract=base)
-        return base
-
-    # No env → return base as-is
-    return base
+    if not resolve_refs:
+        base = _parse_file(Path(contract_path))
+        found = load_overlay_document(contract_path, env)
+        if found is None:
+            return base
+        return _deep_merge(dict(base), found[1])
+    try:
+        return compose_contract(contract_path, env, ref_root=ref_root, logger=log).document
+    except OverlayMergeError as exc:
+        raise RuntimeError(f"Failed to apply overlay {exc}") from exc

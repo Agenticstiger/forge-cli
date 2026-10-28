@@ -24,7 +24,7 @@ notice. Anything inside is governed.
 Consumers that need a contract exactly as ``fluid plan`` sees it (a
 control plane comparing a contract to a plan, CI tooling, editors) use
 :func:`load_contract` and its in-memory siblings from ``.contract``
-(added in 1.1).
+(added in 1.1; ``overlay_dir=`` on the in-memory forms in 1.2).
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ from .source import (
 )
 from .state import Cursor, RunLock, StateStore, Watermark
 
-__api_version__ = "1.1"
+__api_version__ = "1.2"
 
 __all__ = [
     "__api_version__",

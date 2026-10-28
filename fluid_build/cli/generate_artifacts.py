@@ -133,30 +133,37 @@ def _fanout_input_for_env(
 ) -> Path:
     """The file ``run_fanout`` should read so the artifacts describe ``env``.
 
-    * No ``env``: ``input_path`` unchanged (historical behaviour).
     * A bundle: unchanged, after :func:`check_bundle_env` proves it was built
       for ``env``. The bundle already carries the overlay-applied contract.
-    * A raw contract: the document ``fluid bundle <contract> --env <env>``
-      freezes (:func:`fluid_build.cli.bundle.materialize_contract`, the same
-      code), written as a deterministic bundle under ``tmpdir``. So stage 3
-      on a contract emits the artifacts stage 3 on that bundle would (the
-      policy bindings of a cloud overlay, for one, only exist there).
+    * A raw contract with no ``env`` and no ``$ref``: unchanged (historical
+      behaviour; the file is the contract).
+    * Any other raw contract: the document ``fluid bundle <contract> [--env
+      <env>]`` freezes (:func:`fluid_build.cli.bundle.materialize_contract`,
+      the same code), written as a deterministic bundle under ``tmpdir``. So
+      stage 3 on a contract emits the artifacts stage 3 on that bundle would
+      (the policy bindings of a cloud overlay, for one, only exist there), and
+      a contract split into fragments is read whole, never as its raw root.
     """
-    if not env:
-        return input_path
-    # ``run_fanout`` refuses a bad env before anything is written; the overlay
-    # search below turns ``env`` into a file name, so refuse it first here.
-    from fluid_build.schedulers.airflow import fluid_apply
-
-    try:
-        fluid_apply.validate_env_name(env)
-    except fluid_apply.ScheduleRenderError as exc:
-        raise CLIError(1, "generate_artifacts_failed", {"error": str(exc), "emit_key": "schedule"})
     from fluid_build._contract_loader import _is_bundle_path, check_bundle_env
 
     if _is_bundle_path(str(input_path)):
-        check_bundle_env(str(input_path), env, logger)
+        if env:
+            check_bundle_env(str(input_path), env, logger)
         return input_path
+    if not env and not _holds_refs(input_path):
+        return input_path
+    if env:
+        # ``run_fanout`` refuses a bad env before anything is written; the
+        # overlay search below turns ``env`` into a file name, so refuse it
+        # first here.
+        from fluid_build.schedulers.airflow import fluid_apply
+
+        try:
+            fluid_apply.validate_env_name(env)
+        except fluid_apply.ScheduleRenderError as exc:
+            raise CLIError(
+                1, "generate_artifacts_failed", {"error": str(exc), "emit_key": "schedule"}
+            )
     from fluid_build.cli.bundle import bundle_contract_id, materialize_contract
     from fluid_build.forge.core.bundle import build_bundle_tgz
 
@@ -171,6 +178,17 @@ def _fanout_input_for_env(
     materialised = tmpdir / "contract.bundle.tgz"
     build_bundle_tgz(merged, materialised, contract_id=bundle_contract_id(merged))
     return materialised
+
+
+def _holds_refs(input_path: Path) -> bool:
+    """True when the contract file holds a ``$ref`` (unreadable: left to ``run_fanout``)."""
+    from fluid_build.contract_refs import find_ref_node
+    from fluid_build.loader import _parse_file
+
+    try:
+        return find_ref_node(_parse_file(input_path)) is not None
+    except Exception:  # noqa: BLE001 - run_fanout reports an unreadable contract
+        return False
 
 
 def _run_from_generate(args: argparse.Namespace, logger: logging.Logger) -> int:

@@ -23,15 +23,16 @@ Three entry points, one result type:
 * :func:`load_contract_from_dict` takes an already-parsed document.
 
 The two in-memory forms never touch the filesystem unless ``base_dir`` is
-passed; without it a ``$ref`` is left in place and listed in
-:attr:`LoadedContract.unresolved_refs`, so the caller decides what an
-unresolved reference means.
+passed; without it a document that names other files keeps every ``$ref``
+in place, listed in :attr:`LoadedContract.unresolved_refs`, so the caller
+decides what an unresolved reference means.
 
 What "as plan sees it" covers, in the engine's order:
 
 1. parsing (JSON, or YAML with the billion-laughs guard);
 2. ``$ref`` composition against the contract's directory (``base_dir`` for
-   the in-memory forms);
+   the in-memory forms), the overlay's own refs included, then the
+   same-document ``#/...`` pointers of the result;
 3. the environment overlay (``env`` for a file, ``overlay`` for the
    in-memory forms), deep-merged over the base;
 4. alias values rewritten to their canonical enum value
@@ -39,14 +40,14 @@ What "as plan sees it" covers, in the engine's order:
 5. a legacy singular ``build:`` rewritten to ``builds: [build]``.
 
 This module only composes the engine's functions; it adds no rewrite of its
-own. :func:`load_contract` calls the engine's loader itself, so a new step
-there reaches it with no change here. The in-memory forms have no file to
-hand that loader, so they replay its steps: the auto-bundle decision (which
-drops an overlay when a ``$ref`` survives), then the rewrites named in
-:data:`_ENGINE_REWRITES`. ``tests/api/test_contract_load.py`` pins the file
-form to the ``contract`` of a real ``fluid plan`` run, pins the in-memory
-forms to the file form, and parses the engine loader's source to fail when
-it gains a step the in-memory forms do not replay.
+own. Every form composes with the engine's composition
+(``loader.compose_contract`` for a file, ``loader.compose_document`` for the
+in-memory forms), then replays the rewrites named in
+:data:`_ENGINE_REWRITES`, in the engine loader's order.
+``tests/api/test_contract_load.py`` pins the file form to the ``contract`` of
+a real ``fluid plan`` run, pins the in-memory forms to the file form, and
+parses the engine loader's source to fail when it gains a step this module
+does not replay.
 
 Part of the governed ``fluid_build.api`` surface: SemVer applies through
 ``fluid_build.api.__api_version__``.
@@ -79,8 +80,8 @@ ContractOrigin = Literal["file", "bundle", "memory"]
 PathLike = Union[str, "os.PathLike[str]"]
 
 #: The rewrites ``_contract_loader.load_contract_with_overlay`` applies after
-#: its auto-bundle step, in its order, each ``contract -> contract``. The
-#: in-memory forms replay exactly these, by name; a guard test parses the
+#: it composes the contract, in its order, each ``contract -> contract``.
+#: Every form here replays exactly these, by name; a guard test parses the
 #: engine function and fails when its sequence and this tuple differ.
 _ENGINE_REWRITES: Tuple[str, ...] = (
     "_normalize_contract_aliases",
@@ -146,17 +147,19 @@ class LoadedContract:
     #: The environment requested (``env=`` of :func:`load_contract`).
     env: Optional[str] = None
     #: The overlay file merged into ``contract`` for ``env``; ``None`` when no
-    #: env was requested, none matched, the engine did not apply the one it
-    #: found (logged as ``contract_overlay_not_applied``), or the source is a
-    #: bundle (whose overlay was applied when it was built).
+    #: env was requested, none matched, or the source is a bundle (whose
+    #: overlay was applied when it was built). A matching overlay is always
+    #: applied: one that cannot be is a load error.
     overlay: Optional[Path] = None
     #: Every file composed into ``contract``, in the order the engine reads
-    #: them: the source, then each ``$ref`` target (first occurrence), then
-    #: the overlay. Empty for the in-memory forms without ``base_dir``.
+    #: them: the source, each ``$ref`` target (first occurrence, text files
+    #: included), then the overlay and the targets of its refs. Empty for the
+    #: in-memory forms without ``base_dir``.
     files: Tuple[Path, ...] = field(default_factory=tuple)
-    #: ``$ref`` values left in ``contract``, in document order: same-document
-    #: ``#/...`` pointers (the engine keeps them), and for the in-memory forms
-    #: without ``base_dir`` every reference.
+    #: ``$ref`` values left in ``contract``, in document order. The engine
+    #: leaves none: every ref is resolved or the load fails. Only the
+    #: in-memory forms without ``base_dir`` leave them, every reference of a
+    #: document that names other files.
     unresolved_refs: Tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -221,7 +224,7 @@ def load_contract(
     Raises:
         ContractLoadError: the contract could not be loaded.
     """
-    from fluid_build import _contract_loader
+    from fluid_build import _contract_loader, loader
 
     log = logger or LOG
     resolved = _resolve_input_path(path, "contract path")
@@ -231,18 +234,14 @@ def load_contract(
             f"env {env!r} is not an environment name: {_ENV_RULE}",
             path=resolved,
         )
-    if env is not None and not _contract_loader._is_bundle_path(str(resolved)):
-        _refuse_a_base_root_the_overlay_merge_would_coerce(resolved)
-    try:
-        contract = _contract_loader.load_contract_with_overlay(str(resolved), env, log)
-    except Exception as exc:  # noqa: BLE001 - every failure is mapped to one typed error
-        raise _as_load_error(exc, resolved) from exc
-    if not isinstance(contract, dict):
-        # A JSON file whose root is an array loads without error and then
-        # fails somewhere inside the planner; say so here instead.
-        raise _not_a_mapping(contract, resolved)
 
     if _contract_loader._is_bundle_path(str(resolved)):
+        try:
+            contract = _contract_loader.load_contract_with_overlay(str(resolved), env, log)
+        except Exception as exc:  # noqa: BLE001 - every failure is mapped to one typed error
+            raise _as_load_error(exc, resolved) from exc
+        if not isinstance(contract, dict):
+            raise _not_a_mapping(contract, resolved)
         return LoadedContract(
             contract=contract,
             origin="bundle",
@@ -252,26 +251,20 @@ def load_contract(
             unresolved_refs=_ref_values(contract),
         )
 
-    # Provenance re-reads the files the load just read; a file changed or
-    # removed in between surfaces as the same typed error a load would raise.
+    # The engine loader's composition, then its rewrites in its order: the
+    # document ``fluid plan`` plans, with the files it was composed from.
     try:
-        overlay = _applied_overlay(resolved, env, contract, log)
-        ref_files = _composed_ref_files(resolved)
-    except Exception as exc:  # noqa: BLE001 - mapped to one typed error
+        composed = loader.compose_contract(resolved, env)
+        contract = _replay_engine_rewrites(composed.document)
+    except Exception as exc:  # noqa: BLE001 - every failure is mapped to one typed error
         raise _as_load_error(exc, resolved) from exc
-    files: List[Path] = [resolved]
-    for ref_file in ref_files:
-        if ref_file not in files:
-            files.append(ref_file)
-    if overlay is not None:
-        files.append(overlay)
     return LoadedContract(
         contract=contract,
         origin="file",
         source=resolved,
         env=env,
-        overlay=overlay,
-        files=tuple(files),
+        overlay=composed.overlay.resolve() if composed.overlay is not None else None,
+        files=composed.files,
         unresolved_refs=_ref_values(contract),
     )
 
@@ -282,6 +275,7 @@ def load_contract_from_text(
     suffix: str = ".yaml",
     base_dir: Optional[PathLike] = None,
     overlay: Optional[Mapping[str, Any]] = None,
+    overlay_dir: Optional[PathLike] = None,
     logger: Optional[logging.Logger] = None,
 ) -> LoadedContract:
     """Parse contract ``text`` and load it as :func:`load_contract` would load that file.
@@ -292,8 +286,9 @@ def load_contract_from_text(
 
     Equal to ``load_contract(f).contract`` for a file ``f`` holding ``text``
     when ``base_dir`` is ``f``'s directory and ``overlay`` is the parsed
-    overlay ``load_contract(f, env=...)`` would select. See
-    :func:`load_contract_from_dict` for ``base_dir`` and ``overlay``.
+    overlay ``load_contract(f, env=...)`` would select and ``overlay_dir`` its
+    directory. See :func:`load_contract_from_dict` for ``base_dir``,
+    ``overlay`` and ``overlay_dir``.
 
     Raises:
         ContractLoadError: ``contract_parse_failed``, ``contract_not_a_mapping``,
@@ -306,7 +301,9 @@ def load_contract_from_text(
         document = loader.parse_contract_text(text, suffix=suffix)
     except Exception as exc:  # noqa: BLE001 - mapped to one typed error
         raise _parse_error(exc) from exc
-    return load_contract_from_dict(document, base_dir=base_dir, overlay=overlay, logger=logger)
+    return load_contract_from_dict(
+        document, base_dir=base_dir, overlay=overlay, overlay_dir=overlay_dir, logger=logger
+    )
 
 
 def load_contract_from_dict(
@@ -314,37 +311,34 @@ def load_contract_from_dict(
     *,
     base_dir: Optional[PathLike] = None,
     overlay: Optional[Mapping[str, Any]] = None,
+    overlay_dir: Optional[PathLike] = None,
     logger: Optional[logging.Logger] = None,
 ) -> LoadedContract:
     """Load an already-parsed contract ``document`` as the engine would.
 
     * ``base_dir`` given: each ``$ref`` is resolved against it with the
-      engine's resolver, reading the files it names (listed in ``files``).
-      Not given: nothing is read from disk, and every ``$ref`` stays in
-      place, listed in ``unresolved_refs``.
-    * ``overlay`` given: deep-merged over the base after ``$ref`` resolution,
-      with the engine's merge (dicts key by key; lists of objects by
-      position, or ``builds``/``exposes``/``consumes`` by identity from
-      fluidVersion 0.7.6; anything else replaced), as an overlay file is.
-      Exactly as
-      in the engine, the overlay is **not** applied when it holds a ``$ref``
-      or when the merged contract still holds one (a same-document ``#/...``
-      pointer): ``fluid plan --env`` plans the base in that shape, so this
-      returns the base and logs a ``contract_overlay_not_applied`` WARNING.
-      Without ``base_dir``, a document holding file ``$ref`` values leaves
-      that decision open (it depends on what the fragments hold), so an
-      overlay is then refused with ``contract_overlay_needs_base_dir``.
+      engine's composition, reading the files it names (listed in
+      ``files``), and confined to it. Not given: nothing is read from disk; a
+      document that names other files keeps every ``$ref`` in place, listed
+      in ``unresolved_refs``, and one that names none has its same-document
+      ``#/...`` pointers resolved, as the engine would.
+    * ``overlay`` given: its own ``$ref`` values resolved against
+      ``overlay_dir`` (the directory of the overlay file, default
+      ``base_dir``), then deep-merged over the base with the engine's merge
+      (dicts key by key; lists of objects by position, or
+      ``builds``/``exposes``/``consumes`` by identity from fluidVersion
+      0.7.6; anything else replaced), as an overlay file is. Without
+      ``base_dir``, an overlay for a document that names other files, or one
+      that names files itself, cannot be composed and is refused with
+      ``contract_overlay_needs_base_dir``.
 
     ``document`` and ``overlay`` are never modified.
 
     Raises:
         ContractLoadError: ``contract_not_a_mapping``,
-            ``contract_overlay_needs_base_dir``, or a ``$ref`` failure when
-            ``base_dir`` is given.
+            ``contract_overlay_needs_base_dir``, or a ``$ref`` failure.
     """
-    from fluid_build import _contract_loader, loader
-
-    log = logger or LOG
+    from fluid_build import loader
 
     if not isinstance(document, Mapping):
         raise ContractLoadError(
@@ -357,42 +351,76 @@ def load_contract_from_dict(
             f"an overlay document must be a mapping, got {type(overlay).__name__}",
         )
 
-    contract: Dict[str, Any] = copy.deepcopy(dict(document))
     files: Tuple[Path, ...] = ()
     if base_dir is not None:
         base = _resolve_input_path(base_dir, "base_dir")
-        # ``loader.load_contract`` does exactly this after parsing the file.
-        trace = loader.ComposeTrace()
+        layer_dir = _resolve_input_path(overlay_dir, "overlay_dir") if overlay_dir else None
         try:
-            contract = loader._resolve_refs(contract, base, _trace=trace)
-        except Exception as exc:  # noqa: BLE001 - mapped to one typed error
-            raise _as_load_error(exc, base) from exc
-        files = tuple(trace.files)
-    else:
-        # The resolver rebuilds every dict and list it passes through, so in
-        # the engine no two places in the base contract share one object
-        # (``deepcopy`` keeps YAML alias sharing). Without that, the overlay
-        # merge and the rewrites below, which change nodes in place, would
-        # reach every alias of the node they change.
-        contract = _unshare(contract)
-    if overlay is not None:
-        try:
-            contract = _replay_overlay(
-                contract, copy.deepcopy(dict(overlay)), composed=base_dir is not None, log=log
+            composed = loader.compose_document(
+                copy.deepcopy(dict(document)),
+                base,
+                overlay=copy.deepcopy(dict(overlay)) if overlay is not None else None,
+                overlay_dir=layer_dir,
             )
         except loader.OverlayMergeError as exc:
             # An overlay entry the merge cannot match: the same failure
             # ``load_contract(path, env=...)`` reports.
             raise ContractLoadError("contract_load_failed", f"overlay: {exc}") from exc
-    # ``_contract_loader.load_contract_with_overlay``'s rewrites, in its order.
-    for rewrite in _ENGINE_REWRITES:
-        contract = getattr(_contract_loader, rewrite)(contract)
+        except Exception as exc:  # noqa: BLE001 - mapped to one typed error
+            raise _as_load_error(exc, base) from exc
+        contract = composed.document
+        files = composed.files
+    else:
+        contract = _compose_without_files(document, overlay)
     return LoadedContract(
-        contract=contract,
+        contract=_replay_engine_rewrites(contract),
         origin="memory",
         files=files,
         unresolved_refs=_ref_values(contract),
     )
+
+
+def _compose_without_files(
+    document: Mapping[str, Any], overlay: Optional[Mapping[str, Any]]
+) -> Dict[str, Any]:
+    """``document`` (and ``overlay``) composed with no directory to read files from."""
+    from fluid_build import contract_refs, loader
+
+    # The engine's composition rebuilds every dict and list, so no two places
+    # in the contract share one object (``deepcopy`` keeps YAML alias
+    # sharing). Without that, the overlay merge and the rewrites, which change
+    # nodes in place, would reach every alias of the node they change.
+    contract = _unshare(copy.deepcopy(dict(document)))
+    names_files = any(loader._parse_ref(ref)[0] for ref in _ref_values(contract))
+    layer = _unshare(copy.deepcopy(dict(overlay))) if overlay is not None else None
+    if layer is not None and (
+        names_files or any(loader._parse_ref(ref)[0] for ref in _ref_values(layer))
+    ):
+        raise ContractLoadError(
+            "contract_overlay_needs_base_dir",
+            "the document or the overlay holds file $ref values and no base_dir was given, "
+            "so the overlay cannot be merged over what they name: pass base_dir (the "
+            "contract's directory) to load it as fluid plan does",
+        )
+    if names_files:
+        return contract
+    try:
+        if layer is not None:
+            contract = loader._deep_merge(contract, layer)
+        return contract_refs.resolve_pointer_refs(contract)
+    except loader.OverlayMergeError as exc:
+        raise ContractLoadError("contract_load_failed", f"overlay: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - mapped to one typed error
+        raise _as_load_error(exc, None) from exc
+
+
+def _replay_engine_rewrites(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """``_contract_loader.load_contract_with_overlay``'s rewrites, in its order."""
+    from fluid_build import _contract_loader
+
+    for rewrite in _ENGINE_REWRITES:
+        contract = getattr(_contract_loader, rewrite)(contract)
+    return contract
 
 
 # ── helpers ────────────────────────────────────────────────────────────
@@ -428,29 +456,6 @@ def _not_a_mapping(root: Any, path: Path) -> ContractLoadError:
         f"the contract root must be an object, got {type(root).__name__}",
         path=path,
     )
-
-
-def _refuse_a_base_root_the_overlay_merge_would_coerce(contract_path: Path) -> None:
-    """Raise ``contract_not_a_mapping`` when the base ``load_with_overlay`` merges is
-    not an object.
-
-    The loader checks a YAML root, but not a JSON one (or one a root ``$ref``
-    composes). With an overlay present it merges into ``dict(base)``, which
-    turns a list root into a dict (``[["k", "v"]]``, ``[{"a": 1, "b": 2}]``,
-    ``[]``) or fails with a message that names no root, so the same file
-    would load, or fail with ``contract_load_failed``, only because an
-    overlay exists. Without an env, :func:`load_contract`'s post-load check
-    catches it.
-    """
-    from fluid_build import loader
-
-    try:
-        # The base exactly as ``load_with_overlay`` reads it, ``$ref`` composed.
-        base = loader.load_contract(contract_path)
-    except Exception:  # noqa: BLE001 - the engine's own load raises it, typed there
-        return
-    if not isinstance(base, dict):
-        raise _not_a_mapping(base, contract_path)
 
 
 def _resolve_input_path(value: PathLike, what: str) -> Path:
@@ -502,46 +507,6 @@ def _unshare(node: Any) -> Any:
             else:
                 target.append(child)
     return root
-
-
-def _replay_overlay(
-    contract: Dict[str, Any],
-    overlay: Dict[str, Any],
-    *,
-    composed: bool,
-    log: logging.Logger,
-) -> Dict[str, Any]:
-    """The engine's overlay merge plus its auto-bundle decision, for a parsed overlay.
-
-    ``loader.load_with_overlay`` deep-merges the overlay; then
-    ``_contract_loader._auto_bundle_if_needed`` sees a ``$ref`` left in the
-    merged contract (from the overlay, or a same-document pointer) and
-    reloads the base file, which drops the overlay. ``contract`` is that
-    reloaded base when ``composed`` (its file references were resolved
-    against ``base_dir``), so dropping the overlay means returning it.
-    """
-    from fluid_build import _contract_loader, loader
-
-    if not _contract_loader._has_ref_pointers(overlay):
-        if not composed and any(loader._parse_ref(ref)[0] for ref in _ref_values(contract)):
-            raise ContractLoadError(
-                "contract_overlay_needs_base_dir",
-                "the document holds file $ref values and no base_dir was given, so "
-                "whether the engine applies the overlay cannot be decided: pass "
-                "base_dir (the contract's directory) to load it as fluid plan does",
-            )
-        # ``_deep_merge`` mutates nested dicts of its base: merge into a copy,
-        # so the un-overlaid contract survives if the overlay is dropped.
-        merged = loader._deep_merge(copy.deepcopy(contract), overlay)
-        if not _contract_loader._has_ref_pointers(merged):
-            return merged
-    log.warning(
-        "contract_overlay_not_applied: the overlay was not merged, because the "
-        "overlay or the contract holds a $ref; `fluid plan --env` plans the base "
-        "contract in this shape too",
-        extra={"event": "contract_overlay_not_applied"},
-    )
-    return contract
 
 
 def _cause_chain(exc: BaseException) -> List[BaseException]:
@@ -596,7 +561,7 @@ def _parse_error(exc: BaseException) -> ContractLoadError:
     return ContractLoadError("contract_parse_failed", str(exc))
 
 
-def _as_load_error(exc: BaseException, path: Path) -> ContractLoadError:
+def _as_load_error(exc: BaseException, path: Optional[Path]) -> ContractLoadError:
     """One :class:`ContractLoadError` for whatever the engine's loader raised."""
     from fluid_build import loader
 
@@ -608,57 +573,13 @@ def _as_load_error(exc: BaseException, path: Path) -> ContractLoadError:
         return ContractLoadError(event, str(detail or exc), path=path)
     if isinstance(exc, FileNotFoundError):
         return ContractLoadError("contract_not_found", str(exc), path=path)
-    if isinstance(exc, loader.RefResolutionError):
+    if any(isinstance(e, loader.RefResolutionError) for e in _cause_chain(exc)):
         return ContractLoadError("contract_ref_unresolved", str(exc), path=path)
     if _is_syntax_error(exc):
         return ContractLoadError("contract_parse_failed", str(exc), path=path)
     if _is_root_check(exc):
         return ContractLoadError("contract_not_a_mapping", str(exc), path=path)
     return ContractLoadError("contract_load_failed", str(exc), path=path)
-
-
-def _applied_overlay(
-    contract_path: Path,
-    env: Optional[str],
-    contract: Dict[str, Any],
-    log: logging.Logger,
-) -> Optional[Path]:
-    """The overlay file the engine applied for ``env``, or ``None``.
-
-    The candidate is the file ``load_with_overlay`` selects (same search).
-    It is not always applied: when the overlay or the merged contract holds
-    a ``$ref``, the engine's auto-bundle step reloads the contract from the
-    base file, and the overlay is dropped without a word. Provenance must
-    not claim a file that did not reach ``contract``, so in exactly that
-    shape the result is compared with the base alone, and an equal result
-    reports no overlay (with a WARNING, because ``fluid plan`` is planning
-    the base contract for that env).
-    """
-    from fluid_build import _contract_loader, loader
-
-    found = loader.load_overlay_document(contract_path, env)
-    if found is None:
-        return None
-    overlay_path, overlay_doc = found
-    if not (
-        _contract_loader._has_ref_pointers(overlay_doc)
-        or _contract_loader._has_ref_pointers(contract)
-    ):
-        return overlay_path.resolve()
-    base_only = _contract_loader.load_contract_with_overlay(str(contract_path), None, log)
-    if base_only != contract:
-        return overlay_path.resolve()
-    log.warning(
-        "contract_overlay_not_applied: the engine selected overlay %s for --env %r but "
-        "planned %s without it, because the overlay or the contract holds a $ref; "
-        "`fluid plan --env %s` plans the base contract too",
-        overlay_path,
-        env,
-        contract_path,
-        env,
-        extra={"event": "contract_overlay_not_applied", "env": env},
-    )
-    return None
 
 
 def _ref_values(node: Any) -> Tuple[str, ...]:
@@ -683,16 +604,3 @@ def _ref_values(node: Any) -> Tuple[str, ...]:
         else:
             stack.extend(reversed(n))
     return tuple(out)
-
-
-def _composed_ref_files(contract_path: Path) -> List[Path]:
-    """The ``$ref`` target files composed into the contract at ``contract_path``.
-
-    The resolver's own record of what it read, so a text target, a list-rooted
-    fragment and a ref with siblings are listed exactly as they were read.
-    """
-    from fluid_build import loader
-
-    trace = loader.ComposeTrace()
-    loader.load_contract(contract_path, _trace=trace)
-    return trace.files

@@ -237,15 +237,19 @@ class TestLegitimateRefsStillResolve:
         result = load_contract(tmp_path / "link" / "contract.fluid.yaml")
         assert result["labels"] == {"ok": True}
 
-    def test_same_document_refs_are_left_in_place(self, layout):
+    def test_same_document_refs_resolve_without_confinement(self, layout):
+        """A ``#/`` pointer reads no file, so the ref root never applies to it."""
         _, proj = layout
         contract = _write(
-            proj / "contract.fluid.yaml",
-            {"defs": {"x": 1}, "use": {"$ref": "#/defs/x"}, "whole": {"$ref": "#"}},
+            proj / "contract.fluid.yaml", {"defs": {"x": 1}, "use": {"$ref": "#/defs/x"}}
         )
-        result = load_contract(contract)
-        assert result["use"] == {"$ref": "#/defs/x"}
-        assert result["whole"] == {"$ref": "#"}
+        assert load_contract(contract)["use"] == 1
+
+    def test_the_whole_document_inside_itself_is_a_cycle(self, layout):
+        _, proj = layout
+        contract = _write(proj / "contract.fluid.yaml", {"defs": {}, "whole": {"$ref": "#"}})
+        with pytest.raises(RefResolutionError, match="Circular"):
+            load_contract(contract)
 
 
 # ---------------------------------------------------------------------------

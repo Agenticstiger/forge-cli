@@ -1,8 +1,11 @@
 # Composing a contract from fragments with `$ref`
 
-A contract can pull any object from another YAML or JSON file with `$ref`.
-`fluid validate`, `plan`, `apply` and `bundle` resolve every ref before they
-do anything else, so the rest of the pipeline sees one document.
+A contract can pull any part of itself from another file with `$ref`: an
+object, a list or a value from a YAML or JSON file, or the text of a `.sql` or
+`.md` file. Every command (`fluid validate`, `plan`, `apply`, `bundle`,
+`generate`, `docs`) and the contract API resolve every ref before they do
+anything else, through one composition, so the rest of the pipeline sees one
+document.
 
 ```text
 orders/
@@ -35,8 +38,56 @@ fluid bundle   orders/contract.fluid.yaml   # print the single resolved document
 A ref is resolved relative to the file that contains it, so
 `fragments/builds/ingest.yaml` may itself say `$ref: ../policy.yaml`.
 
-A `$ref` node is an object whose only key is `$ref`. Same-document refs
-(`$ref: "#/definitions/x"`) are left in place as written.
+Every `$ref` goes through the same three steps:
+
+1. **Read the target.** A JSON or YAML file may hold any value at its root, so
+   quality rules or columns can live in a file of their own as a list. A file
+   ending in `.sql`, `.md`, `.markdown`, `.txt`, `.py`, `.scala` or `.r` is its
+   text, as a string, never parsed (UTF-8, at most 5 MiB):
+
+   ```yaml
+   builds:
+     - id: transform
+       pattern: embedded-logic
+       properties:
+         sql: {$ref: ./sql/transform.sql}
+   description:
+     usage: {$ref: ./docs/usage.md}
+   ```
+
+2. **Apply the pointer.** `file.yaml#/a/b` selects inside the target
+   ([RFC 6901](https://www.rfc-editor.org/rfc/rfc6901), `~1` for `/` and `~0`
+   for `~` in a key). A pointer cannot select inside a text file.
+3. **Merge the siblings.** Keys written beside `$ref` are merged over a copy of
+   the target as a [JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7386):
+   objects merge key by key, a list or a scalar replaces, `null` removes a key.
+   A shared fragment is reused with one field changed:
+
+   ```yaml
+   - $ref: ./shared/columns.yaml#/order_id
+     description: The order this row belongs to
+   ```
+
+   A target that is not an object (a list, a value, a text file) cannot take
+   siblings, and says so.
+
+**Same-document pointers** (`$ref: "#/a/b"`, or `"#"` for the whole document)
+name a place in the composed contract: every fragment in, the `--env` overlay
+merged. That holds in whichever file the pointer is written, so `fluid split`
+never changes what a pointer names; to point inside a fragment file, name the
+file (`./columns.yaml#/order_id`). A pointer that names nothing, or a place
+that contains it, is an error.
+
+**Overlays** compose the same way: a `$ref` in `overlays/prod.yaml` resolves
+relative to the overlay file, under the same ref root, before the overlay is
+merged, so an environment can take a binding or a whole entry from a fragment.
+
+**Nothing is left.** After composition no `$ref` remains, open blocks such as
+`parameters` and `extensions` included. A ref that cannot be resolved fails
+every command, naming the ref, the file it was written in and its JSON pointer.
+Refs may bring at most 1,000,000 values or 50 MiB of text into one contract: a
+target is copied once for every ref that reaches it, so refs that each name the
+one before twice would otherwise double the contract at every step.
 
 ---
 

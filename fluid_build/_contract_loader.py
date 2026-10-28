@@ -249,6 +249,8 @@ def load_contract_with_overlay(
         loader = _imp("fluid_build.loader")
     except Exception as e:
         raise CLIError(1, "loader_import_failed", {"error": str(e)})
+    # Every $ref resolved, in the base and in the overlay, before the merge;
+    # one that cannot be resolved is an error, never a fallback to the base.
     if hasattr(loader, "load_with_overlay"):
         contract = loader.load_with_overlay(path, env)
     elif hasattr(loader, "load_contract"):
@@ -256,8 +258,6 @@ def load_contract_with_overlay(
     else:
         raise CLIError(2, "loader_missing_functions", {})
 
-    # Auto-bundle: if the contract contains $ref pointers, silently resolve them
-    contract = _auto_bundle_if_needed(contract, path, logger)
     # Normalize common alias values to their canonical form before any
     # downstream code (validator, planner, runner) reads them. Without
     # this, contracts using human-friendly aliases like ``sink.format=kafka``
@@ -573,55 +573,6 @@ def _normalize_contract_aliases(contract: Dict[str, Any]) -> Dict[str, Any]:
             _rewrite_at_path(sub, rest, mapping)
 
     return contract
-
-
-def _auto_bundle_if_needed(
-    contract: Dict[str, Any], path: str, logger: logging.Logger
-) -> Dict[str, Any]:
-    """Transparently bundle fragment contracts containing $ref pointers.
-
-    Scans the loaded contract for unresolved ``$ref`` strings.  If found,
-    delegates to the bundle/compile module to resolve them.  This makes
-    ``fluid split`` / ``fluid bundle`` invisible in the happy path —
-    ``validate``, ``plan``, and ``apply`` just work with fragments.
-    """
-    if not _has_ref_pointers(contract):
-        return contract
-
-    try:
-        # Resolved dynamically (never a literal ``import``) so the static
-        # import graph carries no ``_contract_loader → fluid_build.loader``
-        # edge — ``loader`` lazily reaches ``cli.security`` for its path gate,
-        # and a static edge here would drag ``build_runners → … → cli`` back
-        # under the import-linter indirect-chain check.
-        loader_mod = _imp("fluid_build.loader")
-        compile_contract = getattr(loader_mod, "compile_contract", None)
-        if compile_contract is None:
-            raise ImportError("fluid_build.loader has no compile_contract")
-
-        logger.debug("auto_bundle: detected $ref pointers, bundling fragments")
-        bundled = compile_contract(path, logger=logger)
-        if bundled and isinstance(bundled, dict):
-            return bundled
-    except ImportError:
-        logger.debug("auto_bundle: compile_contract not available, skipping")
-    except Exception as e:
-        logger.debug("auto_bundle: failed (%s), using raw contract", e)
-
-    return contract
-
-
-def _has_ref_pointers(obj: Any, _depth: int = 0) -> bool:
-    """Recursively check if a contract dict contains ``$ref`` strings."""
-    if _depth > 20:  # aligned with loader._MAX_REF_DEPTH
-        return False
-    if isinstance(obj, dict):
-        if "$ref" in obj:
-            return True
-        return any(_has_ref_pointers(v, _depth + 1) for v in obj.values())
-    if isinstance(obj, list):
-        return any(_has_ref_pointers(item, _depth + 1) for item in obj)
-    return False
 
 
 def resolve_contract_env_templates(value: Any) -> Any:

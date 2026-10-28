@@ -30,8 +30,15 @@ whatever it names:
    key, any other value (a list included) replaces, ``null`` removes the key.
    A target that is not an object cannot take siblings.
 
-File refs resolve relative to the file that holds them, confined to the ref
-root (:func:`fluid_build.util.ref_confinement.confine_ref`).
+File refs resolve first (:func:`resolve_file_refs`), relative to the file that
+holds them and confined to the ref root
+(:func:`fluid_build.util.ref_confinement.confine_ref`). Same-document
+pointers (``#/a/b``) resolve last (:func:`resolve_pointer_refs`), against the
+composed contract: every file in and the environment overlay merged. A
+pointer names a place in the contract, whichever file it is written in, so
+splitting a contract into files never changes what it names; to point inside
+a file, name the file (``./part.yaml#/a``). After both passes no ``$ref`` is
+left: one that cannot be resolved is an error that says where it was written.
 
 Borrowed, not built: the sibling rule is JSON Merge Patch (RFC 7386), the
 rule ``@apidevtools/json-schema-ref-parser`` applies to its "extended
@@ -58,11 +65,14 @@ __all__ = [
     "MAX_REF_DEPTH",
     "TEXT_REF_SUFFIXES",
     "ComposeTrace",
+    "RefBudget",
+    "find_ref_node",
     "is_ref_node",
     "merge_patch",
     "parse_ref",
     "resolve_file_refs",
     "resolve_pointer",
+    "resolve_pointer_refs",
 ]
 
 LOG = logging.getLogger("fluid.loader")
@@ -189,17 +199,31 @@ def _kind(value: Any) -> str:
 
 
 class ComposeTrace:
-    """What one composition read: every file, in the order it was first read."""
+    """What one composition read: every file, in the order it was first read,
+    and where each same-document pointer was written."""
 
     def __init__(self) -> None:
         self.files: List[Path] = []
+        # id(node) -> (node, file, pointer in that file). The node is held so
+        # its id cannot be reused by another object while the trace lives.
+        self._pointer_sites: Dict[int, Tuple[Any, Optional[Path], Pointer]] = {}
 
     def add_file(self, path: Path) -> None:
         if path not in self.files:
             self.files.append(path)
 
+    def note_pointer(self, node: Any, source: Optional[Path], loc: Pointer) -> None:
+        self._pointer_sites[id(node)] = (node, source, loc)
 
-class _Budget:
+    def pointer_site(self, node: Any) -> Optional[Tuple[Optional[Path], Pointer]]:
+        """The file and the pointer inside it where ``node`` was written, if known."""
+        entry = self._pointer_sites.get(id(node))
+        if entry is None or entry[0] is not node:
+            return None
+        return entry[1], entry[2]
+
+
+class RefBudget:
     """What refs have brought into the composed contract so far (:data:`MAX_REF_EXPANSION_NODES`)."""
 
     def __init__(self) -> None:
@@ -244,7 +268,7 @@ def resolve_file_refs(
     ignored_ref_root_env: Optional[str] = None,
     source: Optional[Path] = None,
     trace: Optional[ComposeTrace] = None,
-    budget: Optional[_Budget] = None,
+    budget: Optional[RefBudget] = None,
 ) -> Any:
     """``obj`` with every ``$ref`` to a file replaced by what it names.
 
@@ -266,7 +290,7 @@ def resolve_file_refs(
         root_hint=root_hint,
         ignored_ref_root_env=ignored_ref_root_env,
         trace=trace,
-        budget=budget if budget is not None else _Budget(),
+        budget=budget if budget is not None else RefBudget(),
     )
     return refs.walk(obj, base_dir, source, (), 0)
 
@@ -281,7 +305,7 @@ class _FileRefs:
         root_hint: str,
         ignored_ref_root_env: Optional[str],
         trace: Optional[ComposeTrace],
-        budget: _Budget,
+        budget: RefBudget,
     ) -> None:
         self.root = root
         self.root_hint = root_hint
@@ -329,7 +353,10 @@ class _FileRefs:
         if not file_part:
             # A same-document pointer names a place in the composed contract,
             # which does not exist until every file is in.
-            return {"$ref": ref, **siblings}
+            kept = {"$ref": ref, **siblings}
+            if self.trace is not None:
+                self.trace.note_pointer(kept, source, loc)
+            return kept
 
         target = self.locate(ref, file_part, base_dir, loc, source)
         key = f"{target}#{pointer or ''}"
@@ -467,3 +494,140 @@ def _yaml(text: str) -> Any:
 
     value = load_yaml_safe(text)
     return {} if value is None else value
+
+
+# ── same-document pointers ─────────────────────────────────────────────
+
+
+def resolve_pointer_refs(
+    document: Any,
+    *,
+    trace: Optional[ComposeTrace] = None,
+    budget: Optional[RefBudget] = None,
+) -> Any:
+    """``document`` with every same-document ``$ref`` replaced by what it names.
+
+    ``document`` is the composed contract: its file refs inlined and the
+    environment overlay merged. ``#/a/b`` names that place in it, ``#`` the
+    whole of it. A pointer may pass through another ref, and its siblings
+    are merged over its target as for a file ref. A document without a
+    ``$ref`` is returned as it is.
+
+    Raises:
+        RefResolutionError: a pointer names nothing, is not a JSON pointer,
+            names a place that contains it (a cycle), or a ``$ref`` is left.
+    """
+    if find_ref_node(document) is None:
+        return document
+    pointers = _PointerRefs(document, trace, budget if budget is not None else RefBudget())
+    resolved = pointers.resolve(document, (), ())
+    left = find_ref_node(resolved)
+    if left is not None:
+        raise RefResolutionError(
+            f"a $ref is left at JSON pointer '{format_pointer(left)}' of the composed contract "
+            f"after every ref was resolved"
+        )
+    return resolved
+
+
+def find_ref_node(document: Any) -> Optional[Pointer]:
+    """Where the first mapping with a ``$ref`` key sits in ``document``, in document order.
+
+    Iterative, and each container is visited once, so neither depth nor a
+    YAML alias that makes the document contain itself can stop it short.
+    """
+    seen: Set[int] = set()
+    stack: List[Tuple[Pointer, Any]] = [((), document)]
+    while stack:
+        path, node = stack.pop()
+        if not isinstance(node, (dict, list)) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, dict):
+            if "$ref" in node:
+                return path
+            stack.extend(((*path, k), v) for k, v in reversed(list(node.items())))
+        else:
+            stack.extend(((*path, i), v) for i, v in reversed(list(enumerate(node))))
+    return None
+
+
+class _PointerRefs:
+    """One pass over the composed contract, expanding every ``#/...`` pointer."""
+
+    def __init__(self, document: Any, trace: Optional[ComposeTrace], budget: RefBudget) -> None:
+        self.document = document
+        self.trace = trace
+        self.budget = budget
+
+    def resolve(self, node: Any, here: Pointer, active: Tuple[Pointer, ...]) -> Any:
+        """``node`` (found at ``here``) with its pointers expanded; ``active`` holds the
+        pointers being expanded around it, outermost first."""
+        if is_ref_node(node):
+            return self.expand(node, here, active)
+        if isinstance(node, dict):
+            return {k: self.resolve(v, (*here, k), active) for k, v in node.items()}
+        if isinstance(node, list):
+            return [self.resolve(v, (*here, i), active) for i, v in enumerate(node)]
+        return node
+
+    def expand(self, node: Dict[str, Any], here: Pointer, active: Tuple[Pointer, ...]) -> Any:
+        ref = node["$ref"]
+        where = self.where(node, here)
+        if not isinstance(ref, str):
+            raise RefResolutionError(
+                f"$ref value must be a string, got {type(ref).__name__} ({where})"
+            )
+        file_part, pointer = parse_ref(ref)
+        if file_part:
+            raise RefResolutionError(f"$ref '{ref}' {where} names a file that was not read")
+        if pointer is not None and not pointer.startswith("/"):
+            raise RefResolutionError(
+                f"$ref '{ref}' {where} is not a JSON pointer: a same-document ref is '#' "
+                f"or '#/' followed by the path, such as '#/builds/0/properties'"
+            )
+        target = pointer_tokens(pointer)
+        if target in active:
+            raise RefResolutionError(
+                f"Circular $ref detected: '{ref}' {where} is reached again while it is "
+                f"being resolved"
+            )
+        if len(active) >= MAX_REF_DEPTH:
+            raise RefResolutionError(
+                f"$ref nesting depth exceeded {MAX_REF_DEPTH} — possible circular reference "
+                f"or very deep nesting ('{ref}' {where})"
+            )
+        value = self.lookup(target, (*active, target), ref, where)
+        self.budget.charge(value, ref, where)
+        siblings = {
+            key: self.resolve(sub, (*here, key), active)
+            for key, sub in node.items()
+            if key != "$ref"
+        }
+        return _apply_siblings(value, siblings, ref, where) if siblings else value
+
+    def lookup(self, target: Pointer, active: Tuple[Pointer, ...], ref: str, where: str) -> Any:
+        """The resolved value at ``target`` in the composed contract."""
+        current = self.document
+        walked: Pointer = ()
+        for token in target:
+            if is_ref_node(current):
+                # The pointer passes through another ref: follow it first.
+                current = self.expand(current, walked, active)
+            try:
+                current = _pointer_step(current, str(token))
+            except RefResolutionError as exc:
+                raise RefResolutionError(
+                    f"$ref '{ref}' {where} names '{format_pointer(target)}' in the composed "
+                    f"contract, which is not there: {exc}. A '#/' pointer names a place in the "
+                    f"whole contract, whichever file it is written in; to point inside a file, "
+                    f"name the file ('./part.yaml#/key')."
+                ) from exc
+            walked = (*walked, token)
+        return self.resolve(current, walked, active)
+
+    def where(self, node: Any, here: Pointer) -> str:
+        site = self.trace.pointer_site(node) if self.trace is not None else None
+        if site is not None:
+            return ref_location(format_pointer(site[1]), site[0])
+        return f"at JSON pointer '{format_pointer(here)}' of the composed contract"
