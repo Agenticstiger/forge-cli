@@ -122,74 +122,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **A contract could have a product's database credential delivered to any host it named.** On the
-  `kafka-connect` path, and on the **default** `bring-your-own` / `managed` modes of `debezium` and
-  `airbyte`, forge-cli never connects to the source database: it resolves the contract's
-  `connection.secretRef`, puts the plaintext into the connector config (`database.password`,
-  `connection.password`) and POSTs the whole config to
-  `properties.<engine>.deployment.server_url` — a URL the **contract** chooses. Nothing constrained
-  that host, so the credential could be sent anywhere, needing no allowlist entry and no operator
-  mistake; a loopback `connection.host` even made the build look local. A **public** orchestrator
-  host must now be named in `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`.
-
-  Loopback and private hosts need no entry: an orchestrator on the cluster network is the ordinary
-  deployment, a credential that stays inside the organisation is not the leak this closes, and
-  refusing it would have broken every working install on upgrade. A Tailscale or other CGNAT
-  address (`100.64.0.0/10`) counts as private, which it did not at first — the extended
-  non-routable-range list the tree already had was consulted by `util/safe_http` but not by the
-  classifier this policy uses, so such an orchestrator was called public and refused with the wrong
-  reason. Both now read one list, in the tier-0 `_net` leaf.
-
-  Link-local and unspecified addresses are refused outright, allowlist or not, because that is where
-  cloud instance metadata lives. A host that resolves to **both** public and non-public addresses is
-  treated as public: one private record beside a public one is how an unnamed host is made to look
-  internal, and the connection is pinned to the public address regardless.
-
-  The gate runs where each runner reads `deployment.server_url`, which is **before** the connector
-  config is built — and building it is what resolves the `secretRef` — so a refused deployment never
-  fetches the password from its secret store. The REST client constructors keep the same check as
-  the chokepoint for any other caller, and it is re-applied per request, so a host that did not
-  resolve at construction is judged for real once it does.
-
-  A URL the **operator** supplied — `fluid import airbyte --server-url`, or
-  `FLUID_IMPORT_AIRBYTE_URL` — is not second-guessed, since the policy exists because a *contract*
-  can choose where a credential goes. The scheme and metadata-address rules still apply there.
-
-  The variable is operator-only (`credentials/protected_env.py`): `fluid apply` hydrates the
-  environment from `.env`, `.env.<env>` and `FLUID_SECRETS_FILE`, which are committed beside the
-  contract, so without that a contract repository could grant itself the allowlist meant to
-  constrain it.
-
-  Deliberately **not** modelled on `FLUID_WEBHOOK_HOST_ALLOWLIST`,
-  `FLUID_FEDERATION_HOST_ALLOWLIST` or `FLUID_COMMAND_CENTER_HOST_ALLOWLIST` despite the matching
-  name. Those are SSRF allowlists: unset, they *permit* any public host and refuse private ones, and
-  the Command Center gate still lets a credential reach any public `https` endpoint unlisted.
-  Mirroring them would have reproduced the hole.
-
-- **An overlay was read from anywhere a symlink pointed, and `--env` could name any file.** A
-  `$ref` was confined to the ref root, but the overlay file itself was not: an `overlays/` directory
-  or an `overlays/prod.yaml` linking outside the contract's tree was read and merged, so
-  `fluid bundle --env prod` printed whatever YAML the link named; and `fluid validate`, `plan` and
-  `bundle` took `--env ../../x` or `--env /abs/x` as a path, reading and merging the file it named
-  (the library already refused it). An overlay must now be a regular file inside the ref root
-  after symlinks are resolved, and `--env` a single path component, in every command; a FIFO or a
-  device in an overlay's place no longer blocks the command.
-
-- **Every file a composition reads is read with a bound.** The root contract, overlays and every
-  fragment were read whole before the 5 MiB cap applied, so a sparse file cost twice its size in
-  memory. They are now read only as regular files, never past the cap. Each target file is parsed
-  once per composition, and one composition resolves at most 10,000 refs and nests no deeper than
-  the bundle writer can write, so a small contract can no longer cost unbounded parsing (a
-  doubling chain of refs took about 70 s before the expansion cap refused it).
-
-- **A `$ref` could hang a command, or read what no contract should.** A ref to a FIFO or a device
-  (`/dev/zero`) blocked forever; a target must now be a regular file, refused before it is opened.
-  With the root widened to `/`, a ref could read `/proc/self/environ`, whose reported size of 0
-  passed every size check; `/proc`, `/sys` and `/dev` are now refused whatever the root. A
-  fragment that contains itself through a YAML alias overflowed the stack, and refs that double
-  the contract at every step (the billion laughs of `$ref`) had no bound; both are refused now,
-  the second by a cap on the composed size (1,000,000 values, 50 MiB of text) that counts every
-  copy an alias makes.
+- **A contract could have a product's database credential sent to a host it named.** A public
+  orchestrator host must now be listed in `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST` (see
+  Upgrade notes).
+- **Overlay files are confined like `$ref` targets, and `--env` must name an environment, not a path.**
+- **Every file a contract composition reads is read bounded and only as a regular file**, with caps
+  on the refs one composition resolves and on how deep it nests.
+- **A `$ref` can no longer hang a command or read system directories.**
 
 ### Fixed
 
