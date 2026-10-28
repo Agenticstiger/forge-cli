@@ -1931,3 +1931,46 @@ def test_f35_the_artifacts_equal_those_of_the_bundle_of_the_same_contract(
     )
     for name in names:
         assert (from_contract / name).read_bytes() == (from_bundle / name).read_bytes(), name
+
+
+_POINTER_BASE = """\
+fluidVersion: "0.7.6"
+kind: DataProduct
+id: d.p
+name: P
+extensions:
+  shared:
+    alpha: {exposeId: alpha, kind: table, binding: {platform: local, format: csv, location: {path: a.csv}}}
+    beta: {exposeId: beta, kind: table, binding: {platform: local, format: csv, location: {path: b.csv}}}
+    both: [{$ref: "#/extensions/shared/alpha"}, {$ref: "#/extensions/shared/beta"}]
+"""
+
+
+@pytest.mark.parametrize(
+    "exposes",
+    [
+        '[{$ref: "#/extensions/shared/alpha"}, {$ref: "#/extensions/shared/beta"}]',
+        '{$ref: "#/extensions/shared/both"}',
+    ],
+    ids=["entries-are-pointers", "the-list-is-a-pointer"],
+)
+def test_an_overlay_over_a_base_pointer_is_refused_not_misapplied(
+    tmp_path: Path, exposes: str
+) -> None:
+    """Pointers resolve after the overlay: matched by id it would land by position, and a
+    list over a pointer would drop what it names. Both are refused, naming the place."""
+    from fluid_build.loader import compose_contract
+    from fluid_build.util.ref_confinement import RefResolutionError
+
+    (tmp_path / "contract.fluid.yaml").write_text(
+        _POINTER_BASE + f"exposes: {exposes}\n", encoding="utf-8"
+    )
+    (tmp_path / "overlays").mkdir()
+    (tmp_path / "overlays" / "prod.yaml").write_text(
+        "exposes:\n  - exposeId: beta\n    binding: {location: {path: prod-b.csv}}\n",
+        encoding="utf-8",
+    )
+
+    assert compose_contract(tmp_path / "contract.fluid.yaml").document["exposes"]
+    with pytest.raises(RefResolutionError, match="resolved only after the overlay is merged"):
+        compose_contract(tmp_path / "contract.fluid.yaml", "prod")

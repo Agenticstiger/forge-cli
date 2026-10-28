@@ -272,6 +272,8 @@ def _deep_merge(
     keyed = _root and _keyed_overlay_merge(base, overlay)
     contract_id = str(base.get("id") or "the contract") if _root else ""
     for k, v in overlay.items():
+        if k in base and is_pointer_node(base[k]) and isinstance(v, list):
+            raise _merge_over_pointer(base[k], (*_at, k), "sets a list")
         if k in base and isinstance(base[k], dict) and isinstance(v, dict):
             base[k] = _merge_object(base[k], v, (*_at, k), _trace)
         elif (
@@ -325,6 +327,22 @@ def _pointer_merged(
     return pointer_merge_error(node, written, into)
 
 
+def _merge_over_pointer(pointer: Dict[str, Any], at: _Place, what: str) -> RefResolutionError:
+    """The refusal of an overlay merged over the base's ``#/`` pointer at ``at``.
+
+    The pointer is resolved only after the overlay is merged, so the overlay
+    cannot see what it names: matched by id, it would be matched by position;
+    a list over it would replace what it names whole.
+    """
+    return RefResolutionError(
+        f"the overlay {what} at '{format_pointer(at)}', where the base contract has the "
+        f"'#/' pointer '{pointer.get('$ref')}'; a pointer names a place in the composed "
+        f"contract and is resolved only after the overlay is merged, so the overlay cannot "
+        f"see what it names. Write that part of the base out, or name a file "
+        f"('./part.yaml#/...'), which is read before the merge."
+    )
+
+
 def _keyed_overlay_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> bool:
     """True when the merged contract's fluidVersion is 0.7.6 or later."""
     version = overlay.get("fluidVersion", base.get("fluidVersion"))
@@ -356,6 +374,11 @@ def _merge_dict_list(
     lands on an entry that names another id. ``at`` is where the list sits in
     the contract; ``trace`` is :func:`_deep_merge`'s.
     """
+    if identity and keyed:
+        for i, item in enumerate(base_items):
+            if is_pointer_node(item):
+                by = " + ".join(identity)
+                raise _merge_over_pointer(item, (*at, i), f"patches '{name}' by {by}")
     base_ids = [_item_identity(item, identity) for item in base_items] if identity else []
     overlay_ids = [_item_identity(item, identity) for item in overlay_items] if identity else []
     if identity and keyed and _unique_ids(base_ids):
