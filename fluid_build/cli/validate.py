@@ -1550,13 +1550,19 @@ def _output_json_results(result: ValidationResult, args) -> int:
     """Output results in JSON format."""
     import json
 
-    output = {
-        "valid": result.is_valid,
-        "schema_version": str(result.schema_version) if result.schema_version else None,
-        "errors": result.errors,
-        "warnings": result.warnings,
-        "validation_time": result.validation_time,
-    }
+    output: Dict[str, Any] = {"valid": result.is_valid}
+    fragment = _fragment_kind(args)
+    if fragment is not None:
+        # Which kind of fragment this verdict is about.
+        output["fragment"] = fragment
+    output.update(
+        {
+            "schema_version": str(result.schema_version) if result.schema_version else None,
+            "errors": result.errors,
+            "warnings": result.warnings,
+            "validation_time": result.validation_time,
+        }
+    )
 
     _cprint_json(json.dumps(output, indent=2))
     return 0 if result.is_valid and (not args.strict or not result.warnings) else 1

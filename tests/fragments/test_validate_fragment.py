@@ -823,11 +823,6 @@ def test_k19_the_json_output_has_the_version_and_the_errors(
     assert len(document["errors"]) == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG K19-JSON-FRAGMENT: --format json for --fragment has no 'fragment' field, so a "
-    "consumer cannot tell which kind of fragment the result is about (catalog K-19; not in spec 9)",
-)
 def test_k19_the_json_output_names_the_fragment(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
@@ -837,6 +832,27 @@ def test_k19_the_json_output_names_the_fragment(
 
     document = json.loads(out)
     assert "fragment" in document
+
+
+def test_k19_the_json_output_names_the_kind_whatever_the_verdict(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    contract, fragment = _project(tmp_path)
+    wrong = _dump(tmp_path / "wrong.yaml", [{"rule": "r", "expression": "x", "severity": "loud"}])
+
+    ok = json.loads(_validate(capsys, "--fragment", "expose", fragment, "--format", "json")[1])
+    bad = json.loads(
+        _validate(
+            capsys, "--fragment", "quality", wrong, "--schema-version", "0.7.6", "--format", "json"
+        )[1]
+    )
+
+    assert (ok["valid"], ok["fragment"], ok["schema_version"]) == (True, "expose", "0.7.6")
+    assert (bad["valid"], bad["fragment"], bad["schema_version"]) == (False, "quality", "0.7.6")
+    assert bad["errors"]
+    # A whole contract is not a fragment: its document is the one it always was.
+    whole = json.loads(_validate(capsys, contract, "--format", "json")[1])
+    assert list(whole) == ["valid", "schema_version", "errors", "warnings", "validation_time"]
 
 
 # ── K-20 ────────────────────────────────────────────────────────────────
