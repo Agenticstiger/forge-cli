@@ -131,6 +131,36 @@ process can read into itself, and `fluid bundle` would print it back.
 
 ## Widening the root (monorepos)
 
+### Once, in the workspace
+
+A workspace that keeps fragments its products share declares the root once,
+in `fluid.workspace.yaml`, as a path relative to that file:
+
+```yaml
+# repo/fluid.workspace.yaml
+name: commerce
+ref_root: .        # refRoot is read too
+```
+
+Every contract under `repo/` may then name `repo/shared/...`, from any working
+directory and with no variable set. The nearest `fluid.workspace.yaml` above a
+contract is the one read, and it is only read for a contract that names
+another file. A workspace file is part of the project, and a project may not
+reach outside its own tree, so the setting is ignored (with a warning, and the
+contract keeps its own directory) when the root it names:
+
+- is outside the workspace file's directory (`..`, an absolute path, `~`);
+- is not a directory, or does not contain the contract;
+- is the filesystem root, a home directory or a temporary directory, or sits
+  above the version-control repository the contract is in (the same vetting
+  the DuckDB sandbox gives a workspace).
+
+An operator running other people's contracts (a service that validates
+uploads) sets `FLUID_IGNORE_WORKSPACE_REF_ROOT=1` to keep every contract to its
+own directory; a project `.env` cannot set it.
+
+### Per process or per call
+
 To share fragments between products, set the ref root to a directory that
 contains both the contracts and the shared fragments:
 
@@ -153,7 +183,8 @@ contract = load_contract("repo/products/orders/contract.fluid.yaml", ref_root="r
 ```
 
 `load_contract`, `load_with_overlay` and `compile_contract` all accept
-`ref_root`. The argument wins over `FLUID_REF_ROOT`.
+`ref_root`. The argument wins over `FLUID_REF_ROOT`, which wins over the
+workspace's `ref_root`.
 
 Rules for the wider root:
 

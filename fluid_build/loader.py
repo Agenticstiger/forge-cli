@@ -522,9 +522,19 @@ _resolve_pointer = resolve_pointer
 
 _REF_ROOT_HINT = (
     f"To compose fragments from a wider tree (e.g. a monorepo's shared/ "
-    f"directory), set {REF_ROOT_ENV} to that directory or pass ref_root= to "
-    f"the loader; see docs/contract-refs.md."
+    f"directory), declare ref_root in the workspace's fluid.workspace.yaml, set "
+    f"{REF_ROOT_ENV} to that directory, or pass ref_root= to the loader; see "
+    f"docs/contract-refs.md."
 )
+
+#: The ``fluid.workspace.yaml`` key that widens the ref root of the contracts
+#: under it, relative to the file (``refRoot`` is read too).
+WORKSPACE_REF_ROOT_KEY = "ref_root"
+
+#: Set by an operator to ignore every workspace ``ref_root``: a service that
+#: validates uploaded contracts keeps each to its own directory. A project
+#: ``.env`` cannot set it (``credentials/protected_env.py``).
+IGNORE_WORKSPACE_REF_ROOT_ENV = "FLUID_IGNORE_WORKSPACE_REF_ROOT"
 
 
 def _pointer_parts(pointer: Optional[str]) -> Tuple[str, ...]:
@@ -589,8 +599,15 @@ def _effective_ref_root(
 
     The opt-in is only consulted when the contract has an external ref.
 
-    The two sources fail differently when the root is unusable (cannot be
-    resolved, is not a directory, or does not contain the contract):
+    Without either, the workspace may widen it: ``ref_root`` in the nearest
+    ``fluid.workspace.yaml`` above the contract (:func:`_workspace_ref_root`),
+    held to that file's own directory. That is also the root a contract gets
+    when ``FLUID_REF_ROOT`` is ignored for it: the root it would get with the
+    variable unset.
+
+    The two explicit sources fail differently when the root is unusable
+    (cannot be resolved, is not a directory, or does not contain the
+    contract):
 
     * ``ref_root=`` is a choice the caller made for THIS contract, so it is a
       :class:`RefResolutionError`.
@@ -606,12 +623,18 @@ def _effective_ref_root(
       service it reaches the server log, not the caller.
     """
     contract_dir = contract_path.resolve().parent
+    if next(iter_external_refs(contract), None) is None:
+        return _RefRoot(contract_dir)
     if ref_root is not None:
         explicit, origin = str(ref_root), "ref_root"
     else:
         explicit, origin = os.environ.get(REF_ROOT_ENV, "").strip(), REF_ROOT_ENV
-    if not explicit or next(iter_external_refs(contract), None) is None:
-        return _RefRoot(contract_dir)
+    # The root without the variable: the workspace's, else the contract's own.
+    unset = (_workspace_ref_root(contract_dir) if ref_root is None else None) or _RefRoot(
+        contract_dir
+    )
+    if not explicit:
+        return unset
     try:
         # A stale value can fail to resolve at all: ``~gone/repo`` for a
         # user that no longer exists, a symlink loop, or a parent the
@@ -643,9 +666,9 @@ def _effective_ref_root(
         problem = f"{origin}={explicit!r} cannot be resolved: {str(exc).rstrip('.')}"
     if origin != REF_ROOT_ENV:
         raise RefResolutionError(problem)
-    _note_ref_root_env_ignored(contract_dir, explicit, problem)
+    _note_ref_root_env_ignored(unset.ref_root, explicit, problem)
     return _RefRoot(
-        contract_dir,
+        unset.ref_root,
         root_hint=(
             f"{REF_ROOT_ENV} is set but was ignored for this contract: {problem}. "
             f"To compose fragments from a wider tree, set {REF_ROOT_ENV} to a "
@@ -653,6 +676,117 @@ def _effective_ref_root(
             f"loader; see docs/contract-refs.md."
         ),
         ignored_ref_root_env=explicit,
+    )
+
+
+def _workspace_ref_root(contract_dir: Path) -> Optional[_RefRoot]:
+    """The ref root the workspace declares for a contract in ``contract_dir``, if usable.
+
+    ``ref_root`` in the nearest ``fluid.workspace.yaml`` above the contract,
+    a path relative to that file. A project file must not reach outside its
+    own tree (a project ``.env`` may not set ``FLUID_REF_ROOT`` for that
+    reason), so the root must be a directory at or below the file's own,
+    contain the contract, and pass the vetting the DuckDB sandbox gives a
+    workspace grant: not the filesystem root, a home or a temp root, and not
+    above the repository the contract is in. A workspace file planted higher
+    up therefore widens nothing it does not own. An unusable value is
+    ignored, with a WARNING once per file. ``FLUID_IGNORE_WORKSPACE_REF_ROOT``
+    switches the setting off.
+    """
+    if os.environ.get(IGNORE_WORKSPACE_REF_ROOT_ENV, "").strip():
+        return None
+    from .util.workspace_root import WORKSPACE_CONFIG_FILENAME, find_workspace_root
+
+    try:
+        found = find_workspace_root(contract_dir)
+        if found is None:
+            return None
+        workspace = _parse_file(found / WORKSPACE_CONFIG_FILENAME)
+    except Exception:  # noqa: BLE001 - an unreadable workspace declares nothing
+        return None
+    block = (
+        workspace.get("workspace") if isinstance(workspace.get("workspace"), dict) else workspace
+    )
+    value = block.get(WORKSPACE_REF_ROOT_KEY, block.get("refRoot"))
+    if value is None:
+        return None
+    source = found / WORKSPACE_CONFIG_FILENAME
+    root = _workspace_root_or_problem(found, value, contract_dir)
+    if isinstance(root, str):
+        _note_workspace_ref_root_ignored(source, root)
+        return None
+    return _RefRoot(
+        root,
+        root_hint=(
+            f"The ref root {root} is the workspace's (ref_root in {source}). To compose "
+            f"from a wider tree, move ref_root up, set {REF_ROOT_ENV}, or pass ref_root= "
+            f"to the loader; see docs/contract-refs.md."
+        ),
+    )
+
+
+def _workspace_root_or_problem(found: Path, value: Any, contract_dir: Path) -> Union[Path, str]:
+    """The directory a workspace ``ref_root`` names, or why it cannot widen anything."""
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    if not isinstance(value, str) or not value.strip():
+        return f"ref_root must be a directory path relative to the workspace file, got {value!r}"
+    text = value.strip()
+    if (
+        text.startswith("~")
+        or PurePosixPath(text).is_absolute()
+        or PureWindowsPath(text).is_absolute()
+        or PureWindowsPath(text).drive
+    ):
+        return f"ref_root {text!r} must be a path relative to the workspace file's directory"
+    try:
+        workspace_dir = found.resolve()
+        root = (found / text).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return f"ref_root {text!r} cannot be resolved: {exc}"
+    if not root.is_relative_to(workspace_dir):
+        return (
+            f"ref_root {text!r} resolves to {root}, outside the workspace directory "
+            f"{workspace_dir}; a workspace file may only widen the root within its own tree"
+        )
+    if not root.is_dir():
+        return f"ref_root {text!r} resolves to {root}, which is not a directory"
+    if not contract_dir.is_relative_to(root):
+        return f"ref_root {text!r} resolves to {root}, which does not contain the contract"
+    # The DuckDB sandbox's vetting of a workspace, reused so the two never
+    # disagree on what a project directory is. Imported here only: most
+    # contracts never get this far.
+    from fluid_build.providers._duckdb_sandbox import _repository_below, broad_root_reason
+
+    reason = broad_root_reason(root)
+    if reason is not None:
+        return f"ref_root {text!r} resolves to {root}, which is too broad a root ({reason})"
+    repository = _repository_below(root, contract_dir)
+    if repository is not None:
+        return (
+            f"ref_root {text!r} resolves to {root}, above the repository the contract is in "
+            f"({repository}); a workspace file there would reach every checkout under it"
+        )
+    return root
+
+
+#: Workspace files whose ``ref_root`` was reported as ignored in this process.
+#: Tests reset it with ``.clear()``.
+_NOTED_WORKSPACE_REF_ROOT_IGNORED: Set[str] = set()
+
+
+def _note_workspace_ref_root_ignored(source: Path, problem: str) -> None:
+    key = str(source)
+    with _NOTED_REF_ROOT_ENV_IGNORED_LOCK:
+        if key in _NOTED_WORKSPACE_REF_ROOT_IGNORED:
+            return
+        _NOTED_WORKSPACE_REF_ROOT_IGNORED.add(key)
+    LOG.warning(
+        "workspace_ref_root_ignored: %s (%s). Contracts under it keep their own directory "
+        "as the ref root.",
+        problem,
+        source,
+        extra={"event": "workspace_ref_root_ignored", "workspace": key},
     )
 
 
@@ -668,14 +802,15 @@ _NOTED_REF_ROOT_ENV_IGNORED_LOCK = threading.Lock()
 
 def _note_ref_root_env_ignored(contract_dir: Path, value: str, problem: str) -> None:
     """WARN, once per ``FLUID_REF_ROOT`` value per process, that it does not
-    apply to this contract and the default root is used."""
+    apply to this contract and the root it gets without it (``contract_dir``:
+    its own directory, or its workspace's ``ref_root``) is used."""
     with _NOTED_REF_ROOT_ENV_IGNORED_LOCK:
         if value in _NOTED_REF_ROOT_ENV_IGNORED:
             return
         _NOTED_REF_ROOT_ENV_IGNORED.add(value)
     LOG.warning(
         "ref_root_env_ignored: %s. Ignoring it for this contract: its $refs are "
-        "confined to the contract's own directory %s (the default). Logged once "
+        "confined to %s, the root it gets without the variable. Logged once "
         "per value in this process; a later contract it is ignored for gets no "
         "warning, but its escape errors say the variable was ignored and why.",
         problem,
