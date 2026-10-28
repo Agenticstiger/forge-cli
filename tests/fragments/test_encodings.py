@@ -258,12 +258,15 @@ def test_n04_a_yaml_fragment_is_accepted_at_5_mib_and_refused_one_byte_over(
     assert "./over.yaml" in str(info.value)
 
 
-def test_n04_a_json_fragment_over_5_mib_is_read_whole_sg09(tmp_path: Path) -> None:
-    """SG-09 characterization: JSON has no per-file cap before the parse; only the expansion
-    budget (50 MiB of characters, all refs together) limits it."""
+def test_n04_a_json_fragment_over_5_mib_is_refused_sg09(tmp_path: Path) -> None:
+    """SG-09, decided (D-38): JSON is held to the 5 MiB cap of every file the composition
+    reads, as YAML is, on its size, before it is read (it used to be read whole, and only
+    the expansion budget limited it)."""
     _write(tmp_path / "big.json", json.dumps({"k": "a" * (MIB5 + 1)}))
 
-    assert len(_rfr({"x": {"$ref": "./big.json"}}, tmp_path)["x"]["k"]) == MIB5 + 1
+    with pytest.raises(RefResolutionError, match="over the 5242880-byte safety cap") as info:
+        _rfr({"x": {"$ref": "./big.json"}}, tmp_path)
+    assert "./big.json" in str(info.value)
 
 
 @pytest.mark.parametrize(
@@ -803,16 +806,15 @@ def test_n23_redundant_path_segments_are_collapsed(tmp_path: Path) -> None:
     }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG N23-trailing-slash: Path() drops the trailing slash, so './x.yaml/' names the "
-    "regular file x.yaml instead of failing",
-)
-def test_n23_a_trailing_slash_does_not_name_a_regular_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ref", ["./x.yaml/", "./x.yaml/."])
+def test_n23_a_trailing_slash_does_not_name_a_regular_file(tmp_path: Path, ref: str) -> None:
+    """``Path`` drops the ending, but the file system reads it as 'a directory'."""
     _write(tmp_path / "x.yaml", "k: root/x\n")
 
-    with pytest.raises(RefResolutionError):
-        _rfr({"x": {"$ref": "./x.yaml/"}}, tmp_path)
+    with pytest.raises(RefResolutionError, match="names a directory") as info:
+        _rfr({"x": {"$ref": ref}}, tmp_path)
+
+    assert ref in str(info.value)
 
 
 def test_n24_a_file_name_with_a_hash_cannot_be_named_because_the_ref_splits_at_the_hash_sg02(

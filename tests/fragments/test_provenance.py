@@ -1136,11 +1136,6 @@ def test_h12_every_failure_class_names_the_ref_the_file_and_the_pointer(
     assert "SECRET-1" not in text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG P5-04: the blocked-system-path error names the ref and its target but not the "
-    "file the ref was written in nor its JSON pointer",
-)
 @pytest.mark.parametrize("command", ["LC", "V", "B"])
 @pytest.mark.parametrize("where", ["fragment", "root"])
 def test_h12_deny_list_error_names_the_file_and_the_pointer(
@@ -1219,21 +1214,22 @@ def test_h12_overlay_pointer_merged_into_a_base_object_is_still_refused(
     assert "cli_unhandled_exception" not in text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG P5-06: a '#/' pointer an overlay writes at an object the base also has is merged "
-    "into it, and its error no longer names the overlay file",
-)
 @pytest.mark.parametrize("command", ["LC", "V", "B"])
 def test_h12_overlay_pointer_merged_into_a_base_object_names_the_overlay_file(
     tmp_path: Path, capsys: pytest.CaptureFixture, command: str
 ) -> None:
+    """Decided: a pointer the overlay writes over an object of the base is refused, and
+    the refusal names the overlay file, the pointer's place in it and the remedy."""
     contract = _overlay_product(tmp_path / "p", _MERGED_POINTER)
     extra = ("prod",) if command == "LC" else ("--env", "prod")
 
     text = _fail(command, contract, capsys, tmp_path, *extra)
 
-    assert "overlays/prod.yaml" in _squash(text)
+    flat = _squash(text)
+    assert "overlays/prod.yaml" in flat
+    assert _squash("at JSON pointer '/exposes/0/binding/location'") in flat
+    assert _squash("cannot be merged into an object") in flat
+    assert _squash("name a file ('./part.yaml#/...')") in flat
 
 
 def test_h12_pointer_escapes_slash_and_tilde_in_keys(

@@ -1363,13 +1363,14 @@ def test_l23_without_the_setting_both_products_fail_with_the_escape(
 # ── L-24 ────────────────────────────────────────────────────────────────
 
 
-def test_l24_the_in_memory_forms_are_held_to_base_dir_whatever_the_workspace_says(
+def test_l24_the_in_memory_forms_get_the_root_the_file_form_gets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """SG-22 / SG-33 (characterised): refRoot and ``FLUID_REF_ROOT`` reach only the file form.
-
-    The docs promise that ``load_contract_from_text(text, base_dir=<its dir>)``
-    equals ``load_contract(<that file>)``; with a widened root it does not.
+    """SG-22 / SG-33, decided: ``load_contract_from_text(text, base_dir=<its dir>)`` equals
+    ``load_contract(<that file>)``, as docs/CONTRACT_LOADING_API.md promises, with the
+    root widened too: the workspace's refRoot and ``FLUID_REF_ROOT`` reach the in-memory
+    forms exactly as they reach a contract file in ``base_dir``, and the off-switch
+    turns the workspace's off for both.
     """
     from fluid_build.api.contract import (
         ContractLoadError,
@@ -1380,18 +1381,22 @@ def test_l24_the_in_memory_forms_are_held_to_base_dir_whatever_the_workspace_say
 
     ws = make_ws(tmp_path)
     text = ws.contract.read_text(encoding="utf-8")
-    assert api_load_contract(ws.contract).contract["metadata"]["owner"] == TEAM
+    from_file = api_load_contract(ws.contract).contract
+    assert from_file["metadata"]["owner"] == TEAM
 
+    assert load_contract_from_text(text, base_dir=ws.product).contract == from_file
+    assert load_contract_from_dict(yaml.safe_load(text), base_dir=ws.product).contract == from_file
+
+    # The workspace's refRoot off, FLUID_REF_ROOT on: the same root again.
+    monkeypatch.setenv(OFF_SWITCH, "1")
     with pytest.raises(ContractLoadError) as from_text:
         load_contract_from_text(text, base_dir=ws.product)
+    assert from_text.value.event == "contract_ref_unresolved"
+    assert "escapes the ref root" in str(from_text.value)
     monkeypatch.setenv("FLUID_REF_ROOT", str(ws.root))
-    with pytest.raises(ContractLoadError) as from_dict:
-        load_contract_from_dict(yaml.safe_load(text), base_dir=ws.product)
-
-    for err in (from_text.value, from_dict.value):
-        assert err.event == "contract_ref_unresolved"
-        assert "escapes the ref root" in str(err)
-        assert str(ws.product) in str(err), "the message names the directory the refs are held to"
+    assert load_contract_from_dict(yaml.safe_load(text), base_dir=ws.product).contract == (
+        api_load_contract(ws.contract).contract
+    )
 
 
 # ── L-25 ────────────────────────────────────────────────────────────────

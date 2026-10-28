@@ -1678,13 +1678,14 @@ def test_f30_a_cycle_in_an_overlay_fragment_is_an_error_naming_the_fragment(
 # ── F-31 / F-32 · an overlay in another place, or entirely a ref ───────────
 
 
-def test_f31_an_overlays_directory_that_is_a_symlink_out_of_the_root_is_read_today(
+def test_f31_an_overlays_directory_that_is_a_symlink_out_of_the_root_is_refused(
     tmp_path: Path,
 ) -> None:
-    """SG-15, characterization. ``overlays/`` is a link to a directory outside the
-    contract's tree: the overlay file inside it is read and merged, though its real
-    path is outside the ref root. (Its refs are not: they are confined, relative to
-    the real directory. Reported as a finding.)"""
+    """SG-15, decided. ``overlays/`` is a link to a directory outside the contract's
+    tree: the overlay file inside it is not read, as a ref to it would not be (the ref
+    root holds after symlinks are resolved). It is refused, naming the overlay, on every
+    entry point, so a link planted in an uploaded tree cannot pull a host's
+    ``<env>.yaml`` into a bundle."""
     outside = tmp_path / "shared-overlays"
     _write(
         outside / "prod.yaml",
@@ -1696,18 +1697,27 @@ def test_f31_an_overlays_directory_that_is_a_symlink_out_of_the_root_is_read_tod
         {"contract.fluid.yaml": _dump(_base_doc(exposes=[_topic_expose("orders_events", DEV)]))},
     )
     _symlink(product / "overlays", outside)
-    from fluid_build.api.contract import load_contract
+    from fluid_build.api.contract import ContractLoadError, load_contract
 
-    loaded = load_contract(path, env="prod")
+    with pytest.raises(ContractLoadError) as info:
+        load_contract(path, env="prod")
+    assert info.value.event == "contract_ref_unresolved"
+    for call in (
+        lambda: loader.load_with_overlay(path, "prod"),
+        lambda: loader.compose_contract(path, "prod"),
+        lambda: loader.load_overlay_document(path, "prod"),
+    ):
+        with pytest.raises(RefConfinementError, match="escapes the ref root") as refused:
+            call()
+        assert "overlays/prod.yaml" in str(refused.value)
+        assert "FROM-OUTSIDE" not in str(refused.value)
 
-    assert _topics(loaded.contract) == {"orders_events": "FROM-OUTSIDE"}
-    assert loaded.overlay is not None and loaded.overlay.is_relative_to(outside.resolve())
-    assert not loaded.overlay.is_relative_to(product.resolve())
 
-
-def test_f31_a_ref_inside_a_symlinked_overlay_is_relative_to_the_real_file_and_confined(
+def test_f31_a_symlinked_overlay_is_refused_before_its_refs_are_resolved(
     tmp_path: Path,
 ) -> None:
+    """The overlay's own place is checked before it is read, so its refs (which would
+    resolve relative to the real file, and be confined) are never reached."""
     outside = tmp_path / "shared-overlays"
     _write(
         outside / "prod.yaml",
@@ -1721,17 +1731,14 @@ def test_f31_a_ref_inside_a_symlinked_overlay_is_relative_to_the_real_file_and_c
     )
     _symlink(product / "overlays", outside)
 
-    # ``../fragments/b.yaml`` from the real directory is outside the product's root.
-    with pytest.raises(RefConfinementError, match="escapes the ref root"):
+    with pytest.raises(RefConfinementError, match="escapes the ref root") as info:
         loader.load_with_overlay(path, "prod")
+
+    assert str(info.value).startswith(f"overlay {product.resolve() / 'overlays' / 'prod.yaml'} ")
+    assert "../fragments/b.yaml" not in str(info.value)
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG F-overlay-fifo-hang: an overlay candidate that is a FIFO is opened and read, so "
-    "every command run with --env blocks forever (a FIFO ref target is refused)",
-)
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
 def test_f31_an_overlay_candidate_that_is_not_a_regular_file_is_refused_not_read(
     tmp_path: Path,

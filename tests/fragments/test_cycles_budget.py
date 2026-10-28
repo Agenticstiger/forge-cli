@@ -25,8 +25,9 @@ composition, files and pointers together.
 
 The caps are monkeypatched wherever a test needs one to trip quickly. The wording of the
 depth and CLI errors (E-08, E-26) is pinned by the message tests: here they pin the
-boundary, the exit codes and that the run ends. A scenario that cites an open question
-(SG-34) pins what the code does today.
+boundary, the exit codes and that the run ends. SG-34, once an open question, is decided:
+the composed contract nests at most ``MAX_COMPOSED_DEPTH`` levels deep, and one
+composition resolves at most ``MAX_REF_RESOLUTIONS`` refs, parsing each file once.
 """
 
 from __future__ import annotations
@@ -342,69 +343,65 @@ def test_e10_ten_chained_fragments_of_120_levels_compose_or_fail_cleanly_sg34(
     assert _depth_of(contract["r"], "k") >= 120
 
 
-def test_e10_validate_accepts_a_deep_composed_contract_that_bundle_cannot_write_sg34(
+def _deep_product(product: Path, levels: int) -> Path:
+    """A valid contract whose composed depth is ``levels``: the root, ``extensions`` and
+    ``levels - 2`` objects of ``{k: ...}`` from two chained fragments."""
+    nested = levels - 2
+    _write(product / "f0.yaml", _nested_flow(nested // 2, "{$ref: ./f1.yaml}") + "\n")
+    _write(product / "f1.yaml", _nested_flow(nested - nested // 2, "end") + "\n")
+    return _contract(product, _min_with_extensions({"deep": {"$ref": "./f0.yaml"}}))
+
+
+def test_e10_validate_and_bundle_agree_on_a_deep_composed_contract_sg34(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """SG-34 characterisation. Between what the YAML writer can dump and what composition
-    can walk there is a band of depths. A contract in it composes, ``validate`` accepts it
-    and ``bundle`` dies in PyYAML's recursive representer, reported by the CLI's catch-all
-    ("Unexpected error: maximum recursion depth exceeded", logged as an unhandled
-    exception). The writer's limit is not new: the same depth written inline, with no ref
-    at all, fails the same way. The band depends on the interpreter, so the depth is
-    searched for, and the test skips where there is none."""
+    """SG-34, decided. Fragments one inside another nest deeper than any one file may, and
+    past about 330 levels PyYAML's recursive writer exhausts the recursion limit, so
+    ``validate`` used to accept a contract ``bundle`` died writing ("Unexpected error:
+    maximum recursion depth exceeded"). Composition now holds the composed contract to
+    ``MAX_COMPOSED_DEPTH`` levels, well below the writer's limit: at the cap both commands
+    succeed, past it both refuse with a ref error that names the cap, and neither crashes."""
     monkeypatch.chdir(tmp_path)
-    found: Optional[Dict[str, Any]] = None
-    for levels in (40, 50, 60, 70, 80, 90, 100):
-        product = tmp_path / f"deep{levels}"
-        _chained_deep_fragments(product, files=10, levels=levels)
-        path = _contract(product, _min_with_extensions({"deep": {"$ref": "./f0.yaml"}}))
-        try:
-            load_contract(path)
-        except RefResolutionError:
-            break  # composition itself now refuses: no band left
-        capsys.readouterr()
-        out = product / "bundle.yaml"
-        code = _cli("bundle", str(path), "--out", str(out))
-        seen = capsys.readouterr()
-        if code != 0:
-            found = {
-                "path": path,
-                "out": out,
-                "levels": levels,
-                "text": seen.out + seen.err,
-            }
-            break
-    if found is None:
-        pytest.skip("no depth between what bundle can write and what composition can walk")
+    cap = contract_refs.MAX_COMPOSED_DEPTH
+    assert cap == 200
 
-    assert "maximum recursion depth exceeded" in found["text"]
-    assert not found["out"].exists()
-    assert _cli("validate", str(found["path"])) == 0, "validate accepts what bundle cannot write"
-
-    # The same depth with no ref at all: the limit belongs to the writer, not to composition.
-    inline = yaml.safe_load(_MIN)
-    deep: Any = "end"
-    for _ in range(10 * found["levels"]):
-        deep = {"k": deep}
-    inline["extensions"] = {"deep": deep}
-    try:
-        text = json.dumps(inline)
-    except RecursionError:
-        return  # this interpreter cannot even write the control document
+    at_cap = _deep_product(tmp_path / "at-cap", cap)
+    composed = load_contract(at_cap)
+    assert 2 + _depth_of(composed["extensions"]["deep"], "k") == cap
     capsys.readouterr()
-    inline_path = _write(tmp_path / "inline" / "contract.fluid.json", text)
-    assert _cli("bundle", str(inline_path), "--out", str(tmp_path / "inline" / "b.yaml")) != 0
+    assert _cli("validate", str(at_cap)) == 0
+    assert _cli("bundle", str(at_cap), "--out", str(tmp_path / "at-cap.yaml")) == 0
+    written = yaml.safe_load((tmp_path / "at-cap.yaml").read_text(encoding="utf-8"))
+    assert _depth_of(written["extensions"]["deep"], "k") == cap - 2
+
+    # One level past the cap, and the 600 levels (10 fragments of 60) that bundle could not write.
+    _chained_deep_fragments(tmp_path / "chained", files=10, levels=60)
+    chained = _contract(tmp_path / "chained", _min_with_extensions({"deep": {"$ref": "./f0.yaml"}}))
+    for path in (_deep_product(tmp_path / "over-cap", cap + 1), chained):
+        _ref_error(lambda: load_contract(path), has=(f"more than {cap} levels deep",))
+        capsys.readouterr()
+        assert _cli("validate", str(path)) == 1
+        out = path.parent / "bundle.yaml"
+        assert _cli("bundle", str(path), "--out", str(out)) == 2
+        seen = capsys.readouterr()
+        text = seen.out + seen.err
+        assert _squash(f"more than {cap} levels deep") in _squash(text)
+        assert "maximum recursion depth" not in text and "Unexpected error" not in text
+        assert not out.exists()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG E10-msg: a RecursionError raised while a fragment is parsed (the stack is already "
-        "deep from the walk) is reported as 'Failed to parse $ref target ...: maximum recursion "
-        "depth exceeded', blaming a fragment that is fine, not with the 'nests too deep' message "
-        "built for it"
-    ),
-)
+def test_e10_a_pointer_that_copies_a_deep_value_deeper_is_held_to_the_cap(tmp_path: Path) -> None:
+    """The cap holds what a pointer places too: a copy lands as deep as its pointer."""
+    cap = contract_refs.MAX_COMPOSED_DEPTH
+    _write(tmp_path / "deep.yaml", _nested_flow(100, "end") + "\n")
+    text = "a: {$ref: ./deep.yaml}\n" + "b: " + _nested_flow(cap - 100, '{$ref: "#/a"}') + "\n"
+    path = _contract(tmp_path, text)
+
+    message = _ref_error(lambda: load_contract(path), file=path, has=("'#/a'",))
+
+    assert f"more than {cap} levels deep" in message
+
+
 def test_e10_recursion_while_parsing_a_fragment_is_reported_as_nesting_depth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -505,16 +502,10 @@ def test_e11_control_a_small_file_bomb_composes_through_the_same_subprocess(
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG E11-time: the expansion cap bounds the size of what refs bring in, not the work. "
-        "Every file ref re-reads and re-parses its target (~0.7 ms), so a 19-level doubling "
-        "bomb of 1 KiB fragments (2**19 refs, inside the depth limit) takes ~70 s to be "
-        "refused, not under 5 s"
-    ),
-)
 def test_e11_real_caps_file_bomb_is_refused_in_seconds(tmp_path: Path) -> None:
+    """Each fragment is parsed once per composition, and one composition resolves at most
+    ``MAX_REF_RESOLUTIONS`` refs, so the 2**19 refs of this bomb end at the cap in seconds
+    (they took about 70 s when every ref read and parsed its target again)."""
     _fan_in_bomb(tmp_path, 19, json.dumps("x" * 1024))
     path = _contract(tmp_path, _min_with_extensions({"bomb": {"$ref": "./l19.yaml"}}))
     bound = 12.0
@@ -526,6 +517,39 @@ def test_e11_real_caps_file_bomb_is_refused_in_seconds(tmp_path: Path) -> None:
 
     assert done.returncode == 1
     assert "contract_load_failed" in _squash(done.stdout + done.stderr)
+    assert f"past{contract_refs.MAX_REF_RESOLUTIONS:,}" in _squash(done.stdout + done.stderr)
+
+
+def test_e11_the_bomb_parses_each_fragment_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """However many refs reach a fragment, one composition parses it once."""
+    monkeypatch.setattr(contract_refs, "MAX_REF_EXPANSION_CHARS", 64 * 1024)
+    _fan_in_bomb(tmp_path, 19, json.dumps("x" * 1024))
+    path = _contract(tmp_path, "r: {$ref: ./l19.yaml}\n")
+    parsed: list = []
+    real = contract_refs._parse_target
+    monkeypatch.setattr(contract_refs, "_parse_target", lambda p: parsed.append(p) or real(p))
+
+    _ref_error(lambda: load_contract(path), has=(f"{64 * 1024:,}",))
+
+    assert len(parsed) == len(set(parsed)) == 20  # l19 down to l0, each once
+
+
+@pytest.mark.parametrize(("refs", "ok"), [(10, True), (11, False)])
+def test_e11_the_cap_on_ref_resolutions_counts_file_refs_and_pointers_alike(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refs: int, ok: bool
+) -> None:
+    monkeypatch.setattr(contract_refs, "MAX_REF_RESOLUTIONS", 10)
+    _write(tmp_path / "t.yaml", "k: 1\n")
+    lines = ["extensions:"] + [f"  f{i}: {{$ref: ./t.yaml}}" for i in range(refs - 1)]
+    lines.append('  p: {$ref: "#/extensions/f0"}')
+    path = _contract(tmp_path, "\n".join(lines) + "\n")
+
+    if ok:
+        assert load_contract(path)["extensions"]["p"] == {"k": 1}
+    else:
+        _ref_error(lambda: load_contract(path), file=path, has=("past 10.",))
 
 
 def test_e12_mixed_bomb_is_capped_across_both_passes_with_real_constants(tmp_path: Path) -> None:

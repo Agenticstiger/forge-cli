@@ -1125,12 +1125,6 @@ def test_m16_a_contract_without_refs_reads_and_parses_only_its_own_files_once(
         assert "fluid.workspace.yaml" not in read
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG M-16: compile_contract (fluid bundle) parses the contract twice: it parses it "
-    "for the resolve_refs=False early return, then compose_contract parses it again "
-    "(v0.24.0 parsed it once)",
-)
 def test_m16_compile_contract_parses_a_contract_without_refs_once(
     tmp_path: Path, spies: Spies
 ) -> None:

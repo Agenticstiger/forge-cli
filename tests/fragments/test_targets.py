@@ -544,14 +544,10 @@ def test_a18_a_root_that_is_not_an_object_is_refused_by_every_entry_point(
     assert not (tmp_path / "b.yaml").exists()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG A18-raw-json-root: _parse_file accepts a JSON root that is not an object, so "
-    "resolve_refs=False hands it back (or dies in dict() with no file named)",
-)
 def test_a18_a_raw_load_of_a_json_root_that_is_not_an_object_is_refused(tmp_path: Path) -> None:
-    """The YAML twin of this file raises ``YAML root must be an object/dict`` naming the
-    file on every entry point; the JSON one only does when refs are resolved."""
+    """As its YAML twin does, a JSON root that is not an object is refused naming the
+    file on every entry point, ``resolve_refs=False`` included (it used to be handed
+    back, or to die in ``dict()`` with no file named)."""
     contract = _write(tmp_path / "contract.fluid.json", '[{"$ref": "./x.yaml"}]')
     _write(tmp_path / "overlays" / "prod.yaml", "id: prod\n")
 

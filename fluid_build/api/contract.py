@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import ntpath
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -244,10 +243,12 @@ def load_contract(
 
     log = logger or LOG
     resolved = _resolve_input_path(path, "contract path")
-    if env is not None and not _is_env_component(env):
+    # The loader's own rule, which every command is held to, checked here
+    # before anything is read so the error names the contract path.
+    if env is not None and not loader._is_env_component(env):
         raise ContractLoadError(
             "contract_env_invalid",
-            f"env {env!r} is not an environment name: {_ENV_RULE}",
+            f"env {env!r} is not an environment name: {loader._ENV_RULE}",
             path=resolved,
         )
 
@@ -424,10 +425,13 @@ def _compose_without_files(
         )
     if names_files:
         return contract
+    # The merge and the pointer pass share a trace, as in the engine: a
+    # pointer the overlay puts over a bare pointer is checked once composed.
+    trace = contract_refs.ComposeTrace()
     try:
         if layer is not None:
-            contract = loader._deep_merge(contract, layer)
-        return contract_refs.resolve_pointer_refs(contract)
+            contract = loader._deep_merge(contract, layer, _trace=trace)
+        return contract_refs.resolve_pointer_refs(contract, trace=trace)
     except loader.OverlayMergeError as exc:
         raise ContractLoadError("contract_load_failed", f"overlay: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - mapped to one typed error
@@ -444,30 +448,6 @@ def _replay_engine_rewrites(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ── helpers ────────────────────────────────────────────────────────────
-
-#: :func:`_is_env_component` in words, for ``contract_env_invalid``.
-_ENV_RULE = (
-    "an env names an overlay file next to the contract, so it must be one path "
-    "component: not empty, not '.' or '..', no '/', '\\' or NUL, not drive-qualified ('C:prod')"
-)
-
-
-def _is_env_component(env: Any) -> bool:
-    """True when ``env`` keeps every overlay path the engine builds from it in the
-    contract's directory.
-
-    Only what makes ``env`` a path is refused, so every other name loads as
-    ``fluid plan --env`` loads it (``_staging``, ``prod+eu``, a long name).
-    The rule does not depend on the platform, so one env means the same thing
-    everywhere: both separators are refused, which also refuses every absolute
-    path, and a Windows drive (``C:prod``) is found with ``ntpath`` on every
-    platform, not with ``os.path``, which finds none on POSIX.
-    """
-    if not isinstance(env, str) or env in ("", ".", ".."):
-        return False
-    if "\x00" in env or "/" in env or "\\" in env:
-        return False
-    return not ntpath.splitdrive(env)[0]
 
 
 def _not_a_mapping(root: Any, path: Path) -> ContractLoadError:
@@ -562,6 +542,7 @@ def _is_syntax_error(exc: BaseException) -> bool:
 #: ``$ref`` holding a NUL byte), and are not about the root.
 _ROOT_CHECK_MESSAGES: Tuple[str, ...] = (
     "YAML root must be an object/dict",
+    "JSON root must be an object/dict",
     "Overlay root must be an object/dict",
     "contract root must be an object/dict",
 )

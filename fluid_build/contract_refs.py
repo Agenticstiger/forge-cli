@@ -37,8 +37,20 @@ pointers (``#/a/b``) resolve last (:func:`resolve_pointer_refs`), against the
 composed contract: every file in and the environment overlay merged. A
 pointer names a place in the contract, whichever file it is written in, so
 splitting a contract into files never changes what it names; to point inside
-a file, name the file (``./part.yaml#/a``). After both passes no ``$ref`` is
-left: one that cannot be resolved is an error that says where it was written.
+a file, name the file (``./part.yaml#/a``). So a pointer cannot be merged
+into an object, as a key beside a file ``$ref`` whose target holds an object
+there or as an overlay value over an object of the base: what it names is not
+known at the merge, and is refused (:func:`pointer_merge_error`). Where no
+object stands, it replaces. After both passes no ``$ref`` is left: one that
+cannot be resolved is an error that says where it was written.
+
+The work is bounded as well as the result: every file is a regular file of
+at most 5 MiB, read with that bound
+(:func:`fluid_build.util.safe_yaml.read_bounded_file`) and parsed once per
+composition however many refs name it; one composition resolves at most
+:data:`MAX_REF_RESOLUTIONS` refs, brings in at most
+:data:`MAX_REF_EXPANSION_NODES` values, and nests at most
+:data:`MAX_COMPOSED_DEPTH` levels deep.
 
 Borrowed, not built: the sibling rule is JSON Merge Patch (RFC 7386), the
 rule ``@apidevtools/json-schema-ref-parser`` applies to its "extended
@@ -49,6 +61,7 @@ dependency for it, so the resolver is this module.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -72,20 +85,26 @@ from fluid_build.util.ref_confinement import (
     RefResolutionError,
     confine_ref,
     format_pointer,
+    is_within,
     ref_location,
 )
 
 __all__ = [
+    "MAX_COMPOSED_DEPTH",
     "MAX_REF_DEPTH",
+    "MAX_REF_RESOLUTIONS",
     "TEXT_REF_SUFFIXES",
     "ComposeTrace",
     "ContractOrigins",
     "Origin",
     "RefBudget",
     "find_ref_node",
+    "is_pointer_node",
     "is_ref_node",
     "merge_patch",
     "parse_ref",
+    "pointer_merge_error",
+    "replaces_pointer",
     "resolve_file_refs",
     "resolve_pointer",
     "resolve_pointer_refs",
@@ -108,7 +127,8 @@ MAX_REF_DEPTH = 20
 TEXT_REF_SUFFIXES = frozenset({".sql", ".md", ".markdown", ".txt", ".py", ".scala", ".r"})
 
 #: Largest text file a ``$ref`` reads: the cap ``util.safe_yaml`` puts on a
-#: YAML document.
+#: YAML document, which every other file the composition reads (the root
+#: contract, an overlay, a JSON or YAML fragment) is held to as well.
 MAX_TEXT_REF_BYTES = 5 * 1024 * 1024
 
 #: What refs may bring into one composed contract, counted over every target
@@ -119,10 +139,61 @@ MAX_TEXT_REF_BYTES = 5 * 1024 * 1024
 MAX_REF_EXPANSION_NODES = 1_000_000
 MAX_REF_EXPANSION_CHARS = 10 * MAX_TEXT_REF_BYTES
 
+#: How many refs, file refs and pointers together, one composition may
+#: resolve. The expansion cap bounds what refs bring in, not the work: a ref to
+#: a small fragment costs a confinement check and a copy however little it
+#: brings, so refs that each name the one before twice would make every
+#: command work for minutes before the cap is reached. A contract split into
+#: thousands of fragments stays well under it.
+MAX_REF_RESOLUTIONS = 10_000
+
+#: How deep the composed contract may nest, the root object counted as one
+#: level. Every YAML file is held to ``util.safe_yaml.MAX_YAML_DEPTH`` (128),
+#: but fragments, one inside another, nest deeper than any file, and past
+#: about 330 levels the YAML writer of ``fluid bundle`` exhausts the recursion
+#: limit, so ``validate`` would accept a contract ``bundle`` cannot write. Held
+#: well below that, at compose time, every command reads the same contract.
+MAX_COMPOSED_DEPTH = 200
+
 
 def is_ref_node(obj: Any) -> bool:
     """True if ``obj`` is a mapping with a ``$ref`` key, with or without siblings."""
     return isinstance(obj, dict) and "$ref" in obj
+
+
+def is_pointer_node(obj: Any) -> bool:
+    """True if ``obj`` is a same-document ref (``{"$ref": "#..."}``), with or without siblings."""
+    return is_ref_node(obj) and isinstance(obj["$ref"], str) and obj["$ref"].startswith("#")
+
+
+def pointer_merge_error(node: Dict[str, Any], written: str, into: str) -> RefResolutionError:
+    """The refusal of a ``#/`` pointer that a merge would merge into an object.
+
+    A pointer names a place in the composed contract, which exists only once
+    every file is read and the overlay merged; until then it is a dict, and
+    merging it into an object would put its ``$ref`` beside that object's
+    keys, which would then beat the values it names. ``written`` says where
+    the pointer was written (its file and JSON pointer), ``into`` which object
+    it would be merged into.
+    """
+    return RefResolutionError(
+        f"$ref '{node.get('$ref')}' {written} would be merged into {into}, but a '#/' "
+        f"pointer names a place in the composed contract and is resolved only after every "
+        f"file is read and the overlay merged, so it cannot be merged into an object. Write "
+        f"the keys there instead, or name a file ('./part.yaml#/...'), which is read before "
+        f"the merge."
+    )
+
+
+def replaces_pointer(node: Any, below: Any) -> bool:
+    """True when merging the pointer ``node`` over ``below`` waits for the pointer pass.
+
+    ``below`` is a bare pointer (no siblings): what it names, and so whether
+    ``node`` lands on an object, is known only once the contract is composed.
+    ``node`` replaces it and :meth:`ComposeTrace.note_replaced` keeps it.
+    Any other object is an object now, and ``node`` is refused there.
+    """
+    return is_pointer_node(node) and is_pointer_node(below) and len(below) == 1
 
 
 def parse_ref(ref_value: str) -> Tuple[str, Optional[str]]:
@@ -194,8 +265,22 @@ def merge_patch(target: Any, patch: Any) -> Any:
     return result
 
 
-def _apply_siblings(target: Any, siblings: Dict[str, Any], ref: str, where: str) -> Any:
-    """The siblings of ``$ref`` merged over its resolved ``target``."""
+def _apply_siblings(
+    target: Any,
+    siblings: Dict[str, Any],
+    ref: str,
+    where: str,
+    trace: Optional["ComposeTrace"] = None,
+) -> Any:
+    """The siblings of ``$ref`` merged over its resolved ``target``.
+
+    A merge patch (:func:`merge_patch`) that knows the ``#/`` pointers the
+    siblings hold in the file pass: one over an object of the target is
+    refused (:func:`pointer_merge_error`), one over a bare pointer replaces
+    it and ``trace`` keeps the one it replaced (:func:`replaces_pointer`), and
+    one where the target has no object replaces, as any value does. In the
+    pointer pass the siblings hold no pointer and it is a plain merge patch.
+    """
     if not isinstance(target, dict):
         kind = "text" if isinstance(target, str) else f"a {_kind(target)}"
         raise RefResolutionError(
@@ -203,7 +288,43 @@ def _apply_siblings(target: Any, siblings: Dict[str, Any], ref: str, where: str)
             f"which are merged over its target, but the target is {kind}, not an object. "
             f"Move those keys into the target, or drop them."
         )
-    return merge_patch(target, siblings)
+    return _merge_siblings(target, siblings, ref, where, (), trace)
+
+
+def _merge_siblings(
+    target: Any,
+    patch: Dict[str, Any],
+    ref: str,
+    where: str,
+    path: Pointer,
+    trace: Optional["ComposeTrace"],
+) -> Dict[str, Any]:
+    """:func:`merge_patch` of ``patch`` (at ``path`` below the ``$ref``) over ``target``."""
+    result = dict(target) if isinstance(target, dict) else {}
+    for key, value in patch.items():
+        below = result.get(key)
+        if value is None:
+            result.pop(key, None)
+        elif not isinstance(value, dict):
+            result[key] = value
+        elif not is_pointer_node(value):
+            result[key] = _merge_siblings(below, value, ref, where, (*path, key), trace)
+        elif not isinstance(below, dict):
+            result[key] = value  # no object there: the pointer replaces, as any value does
+        elif replaces_pointer(value, below) and trace is not None:
+            trace.note_replaced(value, below["$ref"])
+            result[key] = value
+        else:
+            site = trace.pointer_site(value) if trace is not None else None
+            written = (
+                ref_location(format_pointer(site[1]), site[0])
+                if site is not None
+                else f"beside $ref '{ref}' {where}"
+            )
+            raise pointer_merge_error(
+                value, written, f"the object that '{ref}' holds at '{format_pointer((*path, key))}'"
+            )
+    return result
 
 
 def _kind(value: Any) -> str:
@@ -216,8 +337,9 @@ def _kind(value: Any) -> str:
 
 class ComposeTrace:
     """What one composition read: every file, in the order it was first read,
-    where each same-document pointer was written, and (when ``origins`` is
-    set) which file each part of the result came from."""
+    where each same-document pointer was written, which pointer a merge put
+    one in place of, and (when ``origins`` is set) which file each part of
+    the result came from."""
 
     def __init__(self, origins: Optional["ContractOrigins"] = None) -> None:
         self.files: List[Path] = []
@@ -225,6 +347,8 @@ class ComposeTrace:
         # id(node) -> (node, file, pointer in that file). The node is held so
         # its id cannot be reused by another object while the trace lives.
         self._pointer_sites: Dict[int, Tuple[Any, Optional[Path], Pointer]] = {}
+        # id(node) -> (node, the $ref of the pointer it replaced).
+        self._replaced: Dict[int, Tuple[Any, str]] = {}
 
     def add_file(self, path: Path) -> None:
         if path not in self.files:
@@ -240,16 +364,50 @@ class ComposeTrace:
             return None
         return entry[1], entry[2]
 
+    def note_replaced(self, node: Any, ref: str) -> None:
+        """The pointer ``node`` was merged over the bare pointer ``ref`` and replaced
+        it: the pointer pass refuses it if ``ref`` names an object (:func:`replaces_pointer`)."""
+        self._replaced[id(node)] = (node, ref)
+
+    def replaced(self, node: Any) -> Optional[str]:
+        """The ``$ref`` of the pointer ``node`` replaced in a merge, if it did."""
+        entry = self._replaced.get(id(node))
+        return entry[1] if entry is not None and entry[0] is node else None
+
 
 class RefBudget:
-    """What refs have brought into the composed contract so far (:data:`MAX_REF_EXPANSION_NODES`)."""
+    """What one composition has spent on refs so far: the values and characters
+    they brought in (:data:`MAX_REF_EXPANSION_NODES`), the refs it resolved
+    (:data:`MAX_REF_RESOLUTIONS`), and the files it parsed, each parsed once."""
 
     def __init__(self) -> None:
         self.nodes = 0
         self.chars = 0
+        self.resolutions = 0
+        #: Each target read so far, by resolved path: its text, or its parsed
+        #: value before any pointer is applied. Every later ref to it gets its
+        #: own copy, charged as if it had been read again.
+        self.targets: Dict[Path, Any] = {}
 
-    def charge(self, value: Any, ref: str, where: str) -> None:
-        nodes, chars = _size(value)
+    def resolve(self, ref: str, where: str) -> None:
+        """Count one more ref resolved, refused past :data:`MAX_REF_RESOLUTIONS`."""
+        self.resolutions += 1
+        if self.resolutions > MAX_REF_RESOLUTIONS:
+            raise RefResolutionError(
+                f"$ref '{ref}' {where} takes the refs this contract resolves past "
+                f"{MAX_REF_RESOLUTIONS:,}. A target is resolved again for every ref that "
+                f"reaches it, so refs that each name the one before twice double the work "
+                f"every step."
+            )
+
+    def charge(self, value: Any, ref: str, where: str, depth: Optional[int] = None) -> None:
+        """Charge ``value``, which a ref brings in, to the expansion cap.
+
+        ``depth``, when given, is how many levels deep the place it lands is;
+        the value is then refused when it would make the composed contract
+        nest more than :data:`MAX_COMPOSED_DEPTH` levels deep.
+        """
+        nodes, chars, levels = _size(value)
         self.nodes += nodes
         self.chars += chars
         if self.nodes > MAX_REF_EXPANSION_NODES or self.chars > MAX_REF_EXPANSION_CHARS:
@@ -259,20 +417,31 @@ class RefBudget:
                 f"characters. A target is copied once for every ref that reaches it, so "
                 f"refs that each name the one before twice double the contract every step."
             )
+        if depth is not None and depth + levels > MAX_COMPOSED_DEPTH:
+            raise RefResolutionError(
+                f"$ref '{ref}' {where} places {levels} levels of nesting {depth} levels deep, "
+                f"so the composed contract would nest more than {MAX_COMPOSED_DEPTH} levels "
+                f"deep, past what every command can write out. {_FLATTEN}"
+            )
 
 
-def _size(value: Any) -> Tuple[int, int]:
-    """Values, and characters of string values and keys, in ``value``.
+#: How to get under :data:`MAX_COMPOSED_DEPTH`.
+_FLATTEN = "Nest it less deeply."
+
+
+def _size(value: Any) -> Tuple[int, int, int]:
+    """Values, characters of string values and keys, and levels of nesting
+    (objects and lists, ``value`` itself counted) in ``value``.
 
     A container a YAML alias shares is counted at every place it appears, as
     the composition copies it there. A container inside itself is not
     followed again (the walk refuses it).
     """
-    nodes = chars = 0
+    nodes = chars = levels = 0
     on_path: Set[int] = set()
-    stack: List[Tuple[Any, bool]] = [(value, False)]
+    stack: List[Tuple[Any, bool, int]] = [(value, False, 1)]
     while stack:
-        node, leaving = stack.pop()
+        node, leaving, level = stack.pop()
         if leaving:
             on_path.discard(id(node))
             continue
@@ -280,14 +449,15 @@ def _size(value: Any) -> Tuple[int, int]:
         if isinstance(node, str):
             chars += len(node)
         elif isinstance(node, (dict, list)) and id(node) not in on_path:
+            levels = max(levels, level)
             on_path.add(id(node))
-            stack.append((node, True))
+            stack.append((node, True, level))
             if isinstance(node, dict):
                 chars += sum(len(k) for k in node if isinstance(k, str))
-                stack.extend((v, False) for v in node.values())
+                stack.extend((v, False, level + 1) for v in node.values())
             else:
-                stack.extend((v, False) for v in node)
-    return nodes, chars
+                stack.extend((v, False, level + 1) for v in node)
+    return nodes, chars, levels
 
 
 def resolve_file_refs(
@@ -314,15 +484,21 @@ def resolve_file_refs(
 
     Protections: confinement (URLs, absolute paths and escapes from the root
     are refused before a target is opened), the system-directory deny list
-    for callers that widen the root, cycle detection, a nesting depth limit,
-    and the expansion cap (:data:`MAX_REF_EXPANSION_NODES`). ``origins``
-    (default ``trace.origins``) records where each fragment landed.
+    for callers that widen the root, cycle detection, a nesting depth limit
+    for refs and one for the result (:data:`MAX_COMPOSED_DEPTH`), the
+    expansion cap (:data:`MAX_REF_EXPANSION_NODES`), the cap on refs
+    resolved (:data:`MAX_REF_RESOLUTIONS`), and a bounded read of a regular
+    file for every target, each parsed once. A ``#/`` pointer beside a
+    ``$ref``, over an object its target holds, is refused
+    (:func:`pointer_merge_error`). ``origins`` (default ``trace.origins``)
+    records where each fragment landed.
     """
     refs = _FileRefs(
         root=base_dir if ref_root is None else ref_root,
         root_hint=root_hint,
         ignored_ref_root_env=ignored_ref_root_env,
-        trace=trace,
+        # Always kept: a refused pointer is named by where it was written.
+        trace=trace if trace is not None else ComposeTrace(),
         budget=budget if budget is not None else RefBudget(),
         origins=origins if origins is not None else (trace.origins if trace else None),
     )
@@ -348,7 +524,7 @@ class _FileRefs:
         root: Path,
         root_hint: str,
         ignored_ref_root_env: Optional[str],
-        trace: Optional[ComposeTrace],
+        trace: ComposeTrace,
         budget: RefBudget,
         origins: Optional["ContractOrigins"],
     ) -> None:
@@ -385,6 +561,13 @@ class _FileRefs:
             raise ValueError(
                 f"{ref_location(format_pointer(loc), source)}: the document contains itself "
                 f"through a YAML alias, so it cannot be composed"
+            )
+        if len(at) >= MAX_COMPOSED_DEPTH:
+            # ``at`` holds the levels above this one: it is level len(at) + 1.
+            raise RefResolutionError(
+                f"the composed contract nests more than {MAX_COMPOSED_DEPTH} levels deep "
+                f"{ref_location(format_pointer(loc), source)}, past what every command can "
+                f"write out. {_FLATTEN}"
             )
         self.on_path.add(id(obj))
         try:
@@ -427,11 +610,11 @@ class _FileRefs:
             # A same-document pointer names a place in the composed contract,
             # which does not exist until every file is in.
             kept = {"$ref": ref, **siblings}
-            if self.trace is not None:
-                self.trace.note_pointer(kept, source, loc)
+            self.trace.note_pointer(kept, source, loc)
             return kept
 
-        target = self.locate(ref, file_part, base_dir, loc, source)
+        self.budget.resolve(ref, where)
+        target = self.locate(ref, file_part, base_dir, loc, source, where)
         key = f"{target}#{pointer or ''}"
         if key in self.ancestry:
             raise RefResolutionError(f"Circular $ref detected: {key} ({where})")
@@ -453,16 +636,26 @@ class _FileRefs:
             raise RefResolutionError(
                 f"$ref '{ref}' {where} names {target}, which is not a regular file"
             )
+        if file_part.endswith(_DIRECTORY_ENDINGS):
+            # ``Path`` drops the ending, which would name the file itself.
+            raise RefResolutionError(
+                f"$ref '{ref}' {where} ends as a directory path does, so it names a "
+                f"directory, not the regular file {target}"
+            )
         self.ancestry.add(key)
         try:
-            value, is_text = _read_target(target, ref, pointer, where)
+            read_before = target in self.budget.targets
+            value, is_text = _read_target(target, ref, pointer, where, self.budget.targets)
             origins = self.origins
-            if self.trace is not None:
-                self.trace.add_file(target)
+            self.trace.add_file(target)
             if origins is not None:
                 origins.add(at, Origin(target, None if is_text else pointer_tokens(pointer)))
             self.budget.charge(value, ref, where)
             if not is_text:
+                if read_before:
+                    # Parsed once, for an earlier ref: this one walks a copy of
+                    # its own, so the walk's alias check sees only this use.
+                    value = copy.deepcopy(value)
                 value = self.walk(
                     value, target.parent, target, pointer_tokens(pointer), at, depth + 1
                 )
@@ -473,10 +666,16 @@ class _FileRefs:
         if origins is not None and source is not None:
             # The siblings were written beside the ref: they answer first.
             origins.add(at, Origin(source, loc, patch=True))
-        return _apply_siblings(value, siblings, ref, where)
+        return _apply_siblings(value, siblings, ref, where, self.trace)
 
     def locate(
-        self, ref: str, file_part: str, base_dir: Path, loc: Pointer, source: Optional[Path]
+        self,
+        ref: str,
+        file_part: str,
+        base_dir: Path,
+        loc: Pointer,
+        source: Optional[Path],
+        where: str,
     ) -> Path:
         """The confined target of a file ref: refused before it is tested or opened."""
         target = confine_ref(
@@ -489,65 +688,80 @@ class _FileRefs:
             root_hint=self.root_hint,
             ignored_ref_root_env=self.ignored_ref_root_env,
         )
-        _refuse_system_path(target, ref)
+        _refuse_system_path(target, ref, where)
         return target
 
+
+#: How a file ref ends when it names a directory (``./x.yaml/``, ``./x.yaml/.``).
+_DIRECTORY_ENDINGS = ("/", "/.") + (("\\", "\\.") if os.name == "nt" else ())
 
 #: Kernel trees a ref never reads, whatever the root: their files report a
 #: size of 0 and hold the process's environment, devices and such.
 _KERNEL_TREES = ("/proc", "/sys", "/dev")
 
 
-def _refuse_system_path(target: Path, ref: str) -> None:
-    """Keep system directories blocked even when a caller widens the ref root.
+def _refuse_system_path(target: Path, ref: str, where: str = "") -> None:
+    """Keep system directories blocked even when a caller widens the ref root
+    (:func:`_is_system_path`). ``where`` says where the ref was written."""
+    if _is_system_path(target):
+        at = f" {where}" if where else ""
+        raise RefResolutionError(
+            f"$ref '{ref}'{at} resolves to a blocked system path: {target}. Refs never read "
+            f"system directories, whatever the ref root."
+        )
 
-    Routed through the platform-aware ``SecurePathValidator`` so the deny set
-    matches the rest of the CLI (it knows macOS ``/etc`` is ``/private/etc``),
-    plus the kernel trees (:data:`_KERNEL_TREES`), which that set leaves to the
-    CLI's own path checks. Imported lazily to keep this module's import graph
-    free of ``cli``.
+
+def _is_system_path(target: Path) -> bool:
+    """True when ``target`` (resolved) is in a system directory no ref reads.
+
+    The deny set is the CLI's own (``cli.security``'s security context), so
+    the two agree (it knows macOS ``/etc`` is ``/private/etc``), plus the
+    kernel trees (:data:`_KERNEL_TREES`), which that set leaves to the CLI's
+    own path checks. Only the set is used: the CLI's other path rules (a cap
+    on the number of path parts, for one) are about paths an operator types,
+    not about system directories, and would refuse a fragment deep inside
+    the root. Imported lazily to keep this module's import graph free of
+    ``cli``.
     """
     text = target.as_posix()
     if any(text == tree or text.startswith(tree + "/") for tree in _KERNEL_TREES):
-        raise RefResolutionError(
-            f"$ref resolves to a blocked system path: {ref} (resolved to {target})"
-        )
+        return True
     try:
-        from fluid_build.cli.core import FluidCLIError
-        from fluid_build.cli.security import SecurePathValidator, get_security_context
-
-        SecurePathValidator(get_security_context())._validate_path_security(target, "read")
-    except FluidCLIError as exc:
-        raise RefResolutionError(
-            f"$ref resolves to a blocked system path: {ref} (resolved to {target})"
-        ) from exc
+        from fluid_build.cli.security import get_security_context
     except ImportError:
         # Defensive fallback: if cli.security is somehow unavailable, keep the
         # legacy prefix block so refs are still screened, not silently allowed.
-        blocked = ("/etc/", "/var/", "/usr/", "/proc/", "/sys/", "/dev/")
-        if str(target).startswith(blocked):
-            raise RefResolutionError(
-                f"$ref resolves to a blocked system path: {ref} (resolved to {target})"
-            )
+        return text.startswith(("/etc/", "/var/", "/usr/", "/proc/", "/sys/", "/dev/"))
+    context = get_security_context()
+    return context.enable_path_validation and any(
+        is_within(target, forbidden) for forbidden in context.forbidden_paths
+    )
 
 
-def _read_target(target: Path, ref: str, pointer: Optional[str], where: str) -> Tuple[Any, bool]:
-    """``(value, is_text)``: what a file ref names, its pointer applied."""
-    if target.suffix.lower() in TEXT_REF_SUFFIXES:
-        if pointer is not None:
-            raise RefResolutionError(
-                f"$ref '{ref}' {where} points into {target.name} with '#{pointer}', but a "
-                f"{target.suffix} file is read as text and a JSON pointer only selects inside "
-                f"a JSON or YAML document. Drop '#{pointer}', or keep the text in a YAML file "
-                f"under a key and point at that key."
-            )
-        return _read_text(target, ref, where), True
-    try:
-        value = _parse_target(target)
-    except Exception as exc:
-        # PyYAML names a string input "<unicode string>"; name the file.
-        problem = str(exc).replace('"<unicode string>"', f'"{target.name}"')
-        raise RefResolutionError(f"Failed to parse $ref target '{ref}' {where}: {problem}") from exc
+def _read_target(
+    target: Path, ref: str, pointer: Optional[str], where: str, read: Dict[Path, Any]
+) -> Tuple[Any, bool]:
+    """``(value, is_text)``: what a file ref names, its pointer applied.
+
+    ``read`` holds every target read so far in this composition: a target is
+    read and parsed once, however many refs name it. The value handed out is
+    the one ``read`` holds (or a part of it), never changed by the walk,
+    which rebuilds what it walks; a ref that is not the first to read a
+    parsed target walks a copy (``_FileRefs.ref``).
+    """
+    is_text = target.suffix.lower() in TEXT_REF_SUFFIXES
+    if is_text and pointer is not None:
+        raise RefResolutionError(
+            f"$ref '{ref}' {where} points into {target.name} with '#{pointer}', but a "
+            f"{target.suffix} file is read as text and a JSON pointer only selects inside "
+            f"a JSON or YAML document. Drop '#{pointer}', or keep the text in a YAML file "
+            f"under a key and point at that key."
+        )
+    if target not in read:
+        read[target] = _read_text(target, ref, where) if is_text else _parse(target, ref, where)
+    value = read[target]
+    if is_text:
+        return value, True
     if pointer:
         try:
             value = resolve_pointer(value, pointer)
@@ -558,14 +772,29 @@ def _read_target(target: Path, ref: str, pointer: Optional[str], where: str) -> 
     return value, False
 
 
+def _parse(target: Path, ref: str, where: str) -> Any:
+    """:func:`_parse_target`, its failure a ref error that names the ref."""
+    try:
+        return _parse_target(target)
+    except RecursionError:
+        # The stack was already deep from the walk: the nesting is at fault,
+        # not the file, which :func:`resolve_file_refs` reports as such.
+        raise
+    except Exception as exc:
+        # PyYAML names a string input "<unicode string>"; name the file.
+        problem = str(exc).replace('"<unicode string>"', f'"{target.name}"')
+        raise RefResolutionError(f"Failed to parse $ref target '{ref}' {where}: {problem}") from exc
+
+
 def _read_text(target: Path, ref: str, where: str) -> str:
     """A text target's content: UTF-8 (a byte-order mark dropped), newlines as ``\\n``."""
+    from fluid_build.util.safe_yaml import read_bounded_file
+
     try:
-        size = target.stat().st_size
-        data = b"" if size > MAX_TEXT_REF_BYTES else target.read_bytes()
+        data = read_bounded_file(target, MAX_TEXT_REF_BYTES)
     except OSError as exc:
         raise RefResolutionError(f"$ref '{ref}' {where} cannot read {target}: {exc}") from exc
-    if size > MAX_TEXT_REF_BYTES or len(data) > MAX_TEXT_REF_BYTES:
+    if data is None:
         raise RefResolutionError(
             f"$ref '{ref}' {where} names a text file over the {MAX_TEXT_REF_BYTES:,}-byte cap: "
             f"{target}"
@@ -586,8 +815,12 @@ def _parse_target(path: Path) -> Any:
     A ``.json``, ``.yaml`` or ``.yml`` fragment may be any value, so quality
     rules or columns can live in a file of their own as a list; a file with
     another suffix keeps the old rule. An empty YAML file is ``{}``, as before.
+    Whatever the suffix, the file is read with the cap of a YAML document
+    (:func:`fluid_build.util.safe_yaml.read_bounded_text`).
     """
-    text = path.read_text(encoding="utf-8")
+    from fluid_build.util.safe_yaml import read_bounded_text
+
+    text = read_bounded_text(path)
     suffix = path.suffix.lower()
     if suffix == ".json":
         return json.loads(text)
@@ -706,6 +939,12 @@ class _PointerRefs:
                 f"$ref '{ref}' {where} is not a JSON pointer: a same-document ref is '#' "
                 f"or '#/' followed by the path, such as '#/builds/0/properties'"
             )
+        replaced = self.trace.replaced(node) if self.trace is not None else None
+        if replaced is not None and self.names_an_object(replaced):
+            # A merge put this pointer over a bare one, which names an object.
+            raise pointer_merge_error(
+                node, where, f"the object that '{replaced}' names at '{format_pointer(here)}'"
+            )
         target = pointer_tokens(pointer)
         if target in active:
             raise RefResolutionError(
@@ -717,8 +956,11 @@ class _PointerRefs:
                 f"$ref nesting depth exceeded {MAX_REF_DEPTH} — possible circular reference "
                 f"or very deep nesting ('{ref}' {where})"
             )
+        self.budget.resolve(ref, where)
         value = self.lookup(target, (*active, target), ref, where)
-        self.budget.charge(value, ref, where)
+        # A copy lands here, ``len(here)`` levels deep: the composed contract
+        # nests as deep as the copy reaches.
+        self.budget.charge(value, ref, where, depth=len(here))
         siblings = {
             key: self.resolve(sub, (*here, key), active)
             for key, sub in node.items()
@@ -754,6 +996,38 @@ class _PointerRefs:
         if site is not None:
             return ref_location(format_pointer(site[1]), site[0])
         return f"at JSON pointer '{format_pointer(here)}' of the composed contract"
+
+    def names_an_object(self, ref: str) -> bool:
+        """Whether the pointer ``ref`` names an object in the composed contract.
+
+        The pointers met on the way are followed, never expanded, so nothing is
+        charged or recorded; a place that is not there, or a chain of pointers
+        that does not end, names no object (expanding them reports it).
+        """
+        tokens = list(pointer_tokens(parse_ref(ref)[1]))
+        node: Any = self.document
+        hops = 0
+        while True:
+            if is_pointer_node(node) and not (tokens and tokens[0] in node):
+                if not tokens and len(node) > 1:
+                    return True  # siblings take an object, or the expansion fails
+                hops += 1
+                if hops > MAX_REF_DEPTH:
+                    return False
+                tokens = [*pointer_tokens(parse_ref(node["$ref"])[1]), *tokens]
+                node = self.document
+                continue
+            if not tokens:
+                return isinstance(node, dict)
+            token = tokens.pop(0)
+            if isinstance(node, dict) and token in node:
+                node = node[token]
+            elif isinstance(node, list) and token.isascii() and token.isdigit():
+                if int(token) >= len(node):
+                    return False
+                node = node[int(token)]
+            else:
+                return False
 
 
 # ── provenance ──────────────────────────────────────────────────────────

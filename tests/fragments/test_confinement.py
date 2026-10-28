@@ -1036,15 +1036,19 @@ _ENV_NAMES = {
 
 @pytest.mark.parametrize("command", ["validate", "plan", "bundle", "generate-artifacts"])
 @pytest.mark.parametrize("kind", list(_ENV_NAMES))
-def test_d24_sg21_an_env_that_is_a_path(
+def test_d24_sg21_an_env_that_is_a_path_is_refused_by_every_command(
     tmp_path: Path,
     cli: Callable[..., Tuple[int, str]],
     monkeypatch: pytest.MonkeyPatch,
     command: str,
     kind: str,
 ) -> None:
-    """SG-21 characterization: ``generate artifacts`` and the API refuse an env that
-    is a path; ``validate``, ``plan`` and ``bundle`` read the file it names."""
+    """SG-21, decided: one rule for ``--env`` everywhere, the API's ``contract_env_invalid``
+    (one path component: not ``.`` or ``..``, no ``/``, ``\\`` or NUL, not
+    drive-qualified), held where the loader looks the overlay up. No command reads the
+    file such an env names. An empty ``--env`` names no file: the commands take it as no
+    env, as before (``generate artifacts`` documents it), while the API refuses ``""``
+    as it always has. ``generate artifacts`` keeps its own stricter name check."""
     evil = _write(tmp_path / "evil.yaml", f"extensions: {{leak: {SECRET}}}\n")
     product = tmp_path / "p"
     path = _contract(product, _min())
@@ -1068,20 +1072,48 @@ def test_d24_sg21_an_env_that_is_a_path(
     else:
         code, out = cli("validate", path, "--env", env)
 
-    read_outside = evil.resolve() in parsed
-    path_like = kind in ("dotdot", "absolute")
-    if command == "generate-artifacts" and kind != "empty":
-        assert code != 0, out
-        assert not read_outside
+    assert evil.resolve() not in parsed, (code, out)
+    assert SECRET not in out
+    if kind == "empty":
+        assert code == 0, out
     else:
-        assert read_outside == path_like, (code, out)
-    if kind in ("dotdot", "absolute"):
-        with pytest.raises(ContractLoadError) as info:
-            api_load_contract(path, env=env)
+        assert code != 0, out
+        if command != "generate-artifacts":
+            assert "is not an environment name" in _flat(out), out
+    with pytest.raises(ContractLoadError) as info:
+        api_load_contract(path, env=env)
+    assert info.value.event == "contract_env_invalid"
+
+
+@pytest.mark.parametrize("env", ["../../evil", "..", ".", "C:prod", "a\\b"])
+def test_d24_sg21_the_loader_refuses_an_env_that_is_a_path_before_reading_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env: str
+) -> None:
+    """The library entry points hold ``env`` to the rule too, with the API's event name;
+    an empty ``env`` is no env, as ``None`` is."""
+    from fluid_build._contract_loader import CLIError
+
+    _write(tmp_path / "evil.yaml", f"extensions: {{leak: {SECRET}}}\n")
+    path = _contract(tmp_path / "p", _min())
+    _write(tmp_path / "p" / "overlays" / "dev.yaml", "extensions: {env: dev}\n")
+    spy = _FileSpy(monkeypatch)
+
+    for call in (
+        lambda: load_with_overlay(path, env),
+        lambda: compose_contract(path, env),
+        lambda: loader.load_overlay_document(path, env),
+        lambda: load_with_overlay(path, env, resolve_refs=False),
+    ):
+        with pytest.raises(CLIError) as info:
+            call()
         assert info.value.event == "contract_env_invalid"
+        assert "is not an environment name" in str(info.value)
+    assert not spy.opened(tmp_path / "evil.yaml")
+    assert loader.load_overlay_document(path, "") is None
+    assert load_with_overlay(path, "") == load_with_overlay(path, None)
 
 
-def test_d24_sg21_bundle_merges_and_prints_the_file_an_env_path_names(
+def test_d24_sg21_bundle_refuses_an_env_path_and_prints_nothing_it_names(
     tmp_path: Path, cli: Callable[..., Tuple[int, str]]
 ) -> None:
     _write(tmp_path / "evil.yaml", f"extensions: {{leak: {SECRET}}}\n")
@@ -1091,8 +1123,10 @@ def test_d24_sg21_bundle_merges_and_prints_the_file_an_env_path_names(
 
     code, out = cli("bundle", path, "--env", "../../evil", "--out", bundle)
 
-    assert code == 0, out
-    assert yaml.safe_load(bundle.read_text(encoding="utf-8"))["extensions"]["leak"] == SECRET
+    assert code != 0, out
+    assert "is not an environment name" in _flat(out)
+    assert SECRET not in out
+    assert not bundle.exists()
 
 
 # ── D-25, D-26: bundles and the in-memory API ───────────────────────────
@@ -1153,25 +1187,30 @@ def test_d25_sg23_a_frozen_ref_in_an_open_object_reaches_plan_json_as_a_literal(
     assert planned["contract"]["extensions"]["acme"] == {"$ref": "./x.yaml"}
 
 
-def test_d26_sg22_an_in_memory_document_is_confined_to_base_dir_whatever_the_env(
+def test_d26_sg22_an_in_memory_document_gets_the_root_a_file_in_base_dir_would_get(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """SG-22, decided: the in-memory forms equal the file form for a contract in
+    ``base_dir`` (docs/CONTRACT_LOADING_API.md), ref root included: confined to
+    ``base_dir`` by default, widened by ``FLUID_REF_ROOT`` exactly as the file is."""
     _secret_yaml(tmp_path / "x.yaml")
     base = tmp_path / "p"
-    base.mkdir()
     doc = _with_owner({"$ref": "../x.yaml"})
+    file_form = _contract(base, doc)
 
-    for env_root in (None, str(tmp_path)):
-        if env_root:
-            # SG-22: today FLUID_REF_ROOT does not widen the in-memory forms.
-            monkeypatch.setenv(REF_ROOT_ENV, env_root)
-        with pytest.raises(ContractLoadError) as info:
-            load_contract_from_dict(doc, base_dir=base)
-        assert info.value.event == "contract_ref_unresolved"
-        assert "escapes the ref root" in str(info.value)
-        assert SECRET not in _chain_text(info.value)
-        with pytest.raises(ContractLoadError, match="escapes the ref root"):
-            load_contract_from_text(_dump(doc), base_dir=base)
+    with pytest.raises(ContractLoadError) as info:
+        load_contract_from_dict(doc, base_dir=base)
+    assert info.value.event == "contract_ref_unresolved"
+    assert "escapes the ref root" in str(info.value)
+    assert SECRET not in _chain_text(info.value)
+    with pytest.raises(ContractLoadError, match="escapes the ref root"):
+        load_contract_from_text(_dump(doc), base_dir=base)
+
+    monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path))
+    expected = api_load_contract(file_form).contract
+    assert expected["metadata"]["owner"]["team"] == SECRET
+    assert load_contract_from_dict(doc, base_dir=base).contract == expected
+    assert load_contract_from_text(_dump(doc), base_dir=base).contract == expected
 
 
 def test_d26_an_overlay_dir_outside_base_dir_does_not_widen_the_overlays_refs(
@@ -1361,33 +1400,35 @@ def test_d33_a_contract_reached_through_a_symlinked_directory_composes(
         assert code == 0, out
 
 
-def test_d34_sg14_a_symlinked_root_contract_takes_a_different_overlay_per_entry_point(
+def test_d34_sg14_a_symlinked_root_contract_takes_the_overlay_beside_its_target(
     tmp_path: Path, cli: Callable[..., Tuple[int, str]]
 ) -> None:
-    """SG-14 characterization: refs (and the default root) are resolved beside the
-    link's target everywhere, but the raw loader finds overlays beside the link
-    while the API finds them beside the target, and the CLI refuses the link."""
+    """SG-14, decided: refs (and the default root) are resolved beside the link's target,
+    and so is the overlay, on every entry point; it may ref the files beside it. The
+    CLI still refuses the link itself."""
     templates = tmp_path / "templates"
     _write(templates / "frag.yaml", "team: TEMPLATE-FRAG\nemail: t@example.com\n")
     _contract(templates, _with_owner({"$ref": "./frag.yaml"}), name="c.yaml")
-    _write(templates / "overlays" / "prod.yaml", "extensions: {marker: TEMPLATE-OVERLAY}\n")
+    _write(templates / "overlays" / "prod.yaml", "extensions: {marker: {$ref: ../frag.yaml}}\n")
     product = tmp_path / "p"
     _write(product / "frag.yaml", "team: LINK-FRAG\nemail: l@example.com\n")
     _write(product / "overlays" / "prod.yaml", "extensions: {marker: LINK-OVERLAY}\n")
     link = product / "contract.fluid.yaml"
     _symlink(link, Path("../templates/c.yaml"))
 
-    raw = load_with_overlay(link, "prod")
-    api = api_load_contract(link, env="prod").contract
+    documents = {
+        "load_with_overlay": load_with_overlay(link, "prod"),
+        "compose_contract": compose_contract(link, "prod").document,
+        "api": api_load_contract(link, env="prod").contract,
+    }
 
-    assert raw["metadata"]["owner"]["team"] == "TEMPLATE-FRAG"
-    assert api["metadata"]["owner"]["team"] == "TEMPLATE-FRAG"
-    assert raw["extensions"]["marker"] == "LINK-OVERLAY"
-    assert api["extensions"]["marker"] == "TEMPLATE-OVERLAY"
-    # The overlay the raw loader takes cannot name a file beside it: its root is the target's.
-    _write(product / "overlays" / "prod.yaml", "extensions: {marker: {$ref: ../frag.yaml}}\n")
-    with pytest.raises(RefConfinementError, match="escapes the ref root"):
-        load_with_overlay(link, "prod")
+    for entry, document in documents.items():
+        assert document["metadata"]["owner"]["team"] == "TEMPLATE-FRAG", entry
+        assert document["extensions"]["marker"]["team"] == "TEMPLATE-FRAG", entry
+    assert compose_contract(link, "prod").overlay == templates.resolve() / "overlays" / "prod.yaml"
+    assert loader.load_overlay_document(link, "prod")[0] == (
+        templates.resolve() / "overlays" / "prod.yaml"
+    )
     code, out = cli("validate", link, "--env", "prod")
     assert code == 1 and "symlink_path_rejected" in out
 
@@ -1468,11 +1509,12 @@ def test_d36_a_text_file_exactly_at_the_cap_is_accepted(tmp_path: Path) -> None:
     assert len(usage) == cap
 
 
-def test_d37_sg09_a_huge_json_fragment_is_read_whole_before_the_cap_refuses_it(
+def test_d37_sg09_a_huge_json_fragment_is_refused_on_its_size_before_it_is_read(
     tmp_path: Path,
 ) -> None:
-    """SG-09 characterization: no per-file cap for JSON; the expansion budget refuses
-    it, after the whole file was read and parsed."""
+    """SG-09, decided: a JSON fragment is held to the 5 MiB cap of every file the
+    composition reads, on its size, before it is read (it used to be read and parsed
+    whole, and only the expansion budget refused it)."""
     size = 60 * MIB
     product = tmp_path / "p"
     _write(product / "big.json", json.dumps("x" * size))
@@ -1483,8 +1525,9 @@ def test_d37_sg09_a_huge_json_fragment_is_read_whole_before_the_cap_refuses_it(
     peak, raised = _peak_while(lambda: load_contract(path))
 
     assert isinstance(raised, RefResolutionError)
-    assert "takes what refs bring into the contract" in str(raised)
-    assert peak >= size
+    assert "over the 5242880-byte safety cap" in str(raised)
+    assert "./big.json" in str(raised)
+    assert peak < MIB
 
 
 def test_d38_a_yaml_fragment_over_the_cap_is_refused_naming_it(tmp_path: Path) -> None:
@@ -1500,31 +1543,35 @@ def test_d38_a_yaml_fragment_over_the_cap_is_refused_naming_it(tmp_path: Path) -
     assert "./big.yaml" in str(info.value)
 
 
-@pytest.mark.parametrize("where", ["fragment", "overlay"])
-def test_d38_sg09_a_sparse_yaml_file_is_read_whole_before_the_cap_refuses_it(
+@pytest.mark.parametrize("where", ["fragment", "overlay", "root", "unknown-suffix"])
+def test_d38_sg09_a_sparse_file_is_refused_on_its_size_before_it_is_read(
     tmp_path: Path, where: str
 ) -> None:
-    """SG-09 characterization (memory): the 5 MiB YAML cap is checked on the text
-    after the whole file is read and decoded, so a sparse file that takes no disk
-    makes every command allocate about twice its size. A ``.md`` file is checked
-    on its size first (D-36)."""
+    """SG-09, decided: every file the composition reads (the root contract, an overlay,
+    a fragment of any suffix) is read with the 5 MiB bound, so a sparse file that takes
+    no disk is refused on its size, as a ``.md`` file is (D-36), instead of being read
+    and decoded whole (about twice its size allocated) before the cap refused it."""
     size = 32 * MIB
     product = tmp_path / "p"
-    if where == "fragment":
-        _sparse(product / "big.yaml", size)
+    if where in ("fragment", "unknown-suffix"):
+        name = "big.yaml" if where == "fragment" else "big.avsc"
+        _sparse(product / name, size)
         doc = _min()
-        doc["extensions"] = {"big": {"$ref": "./big.yaml"}}
+        doc["extensions"] = {"big": {"$ref": f"./{name}"}}
         path = _contract(product, doc)
         call: Callable[[], Any] = lambda: load_contract(path)  # noqa: E731
-    else:
+    elif where == "overlay":
         _sparse(product / "overlays" / "prod.yaml", size)
         path = _contract(product, _min())
         call = lambda: load_with_overlay(path, "prod")  # noqa: E731
+    else:
+        path = _sparse(product / "contract.fluid.json", size)
+        call = lambda: load_contract(path)  # noqa: E731
 
     peak, raised = _peak_while(call)
 
     assert raised is not None and "5242880-byte safety cap" in str(raised)
-    assert peak >= size
+    assert peak < MIB
 
 
 @pytest.mark.parametrize(
@@ -1676,56 +1723,76 @@ def test_d42_a_workspace_ref_root_through_a_symlink_cannot_climb_out_of_its_tree
 
 
 @pytest.mark.parametrize("shape", ["file-symlink", "directory-symlink"])
-def test_dx01_sg15_an_overlay_reached_through_a_symlink_is_read_from_outside_the_root(
-    tmp_path: Path, cli: Callable[..., Tuple[int, str]], shape: str
+def test_dx01_sg15_an_overlay_reached_through_a_symlink_out_of_the_root_is_refused_unread(
+    tmp_path: Path, cli: Callable[..., Tuple[int, str]], monkeypatch: pytest.MonkeyPatch, shape: str
 ) -> None:
-    """SG-15 characterization (finding): refs refuse a symlink out of the root, but
-    the overlay file is opened through one, and ``bundle --env`` prints what it
-    holds. ``overlays/prod.yaml`` may link to any file (``~/.kube/config``): the
-    candidate's own name, not the target's, picks the YAML parser."""
+    """SG-15, decided: an overlay is a file the composition reads, held to the rule of a
+    ref: inside the ref root after symlinks are resolved. ``overlays/prod.yaml`` linked
+    to any file (``~/.kube/config``), or ``overlays/`` linked to another directory, is
+    refused naming the overlay, before it is opened, on every entry point."""
     outside = tmp_path / "outside"
     _write(outside / "kube-config", f"apiVersion: v1\nextensions:\n  token: {SECRET}\n")
     product = tmp_path / "p"
     path = _contract(product, _min())
     if shape == "file-symlink":
         _symlink(product / "overlays" / "prod.yaml", outside / "kube-config")
+        target = outside / "kube-config"
     else:
-        _write(outside / "overlays" / "prod.yaml", f"extensions:\n  token: {SECRET}\n")
+        target = _write(outside / "overlays" / "prod.yaml", f"extensions:\n  token: {SECRET}\n")
         _symlink(product / "overlays", outside / "overlays", is_dir=True)
     bundle = tmp_path / "bundle.yaml"
 
     code, out = cli("bundle", path, "--env", "prod", "--out", bundle)
 
-    assert code == 0, out
-    assert yaml.safe_load(bundle.read_text(encoding="utf-8"))["extensions"]["token"] == SECRET
-    assert load_with_overlay(path, "prod")["extensions"]["token"] == SECRET
+    assert code != 0, out
+    assert "escapes the ref root" in _flat(out) and "prod.yaml" in out
+    assert SECRET not in out
+    assert not bundle.exists()
+    spy = _FileSpy(monkeypatch)
+    for entry in ENTRIES:
+        if entry in ("load_contract", "compile_contract"):
+            continue  # no env: no overlay is looked for
+        _, ref_error = _refusal(entry, path, "prod")
+        assert isinstance(ref_error, RefConfinementError), entry
+        assert "overlays/prod.yaml" in str(ref_error) and SECRET not in str(ref_error), entry
+    assert not spy.opened(target)
 
 
-def test_dx01_sg15_an_overlay_symlink_to_a_device_is_read(tmp_path: Path) -> None:
-    """SG-10/SG-15 characterization: an overlay is not checked to be a regular file
-    (a FIFO hangs every command: ``test_confinement_subprocess.py``)."""
+def test_dx01_an_overlay_symlinked_inside_a_wider_root_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The root the overlay is held to is the contract's ref root: a link to a shared
+    overlay is read when ``FLUID_REF_ROOT`` widens the root to hold it."""
+    shared = _write(tmp_path / "shared" / "prod.yaml", "extensions: {marker: SHARED-PROD}\n")
+    product = tmp_path / "p"
+    path = _contract(product, _min())
+    _symlink(product / "overlays" / "prod.yaml", shared)
+
+    with pytest.raises(RefConfinementError, match="escapes the ref root"):
+        load_with_overlay(path, "prod")
+    monkeypatch.setenv(REF_ROOT_ENV, str(tmp_path))
+
+    assert load_with_overlay(path, "prod")["extensions"] == {"marker": "SHARED-PROD"}
+
+
+def test_dx01_sg10_an_overlay_symlink_to_a_device_is_refused(tmp_path: Path) -> None:
+    """SG-10/SG-15, decided: a link to ``/dev/null`` leads out of the root, and it is no
+    regular file either; it is refused, not composed as an empty overlay."""
     if not Path("/dev/null").exists():
         pytest.skip("no /dev/null")
     product = tmp_path / "p"
     path = _contract(product, _min())
     _symlink(product / "overlays" / "prod.yaml", Path("/dev/null"))
 
-    composed = compose_contract(path, "prod")
+    with pytest.raises(RefConfinementError) as info:
+        compose_contract(path, "prod")
 
-    assert composed.overlay == product / "overlays" / "prod.yaml"
-    assert composed.document == _min()
+    assert "overlays/prod.yaml" in str(info.value)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=RefResolutionError,
-    reason=(
-        "BUG DX-03: an in-root fragment whose resolved path has more than "
-        "cli.security.MAX_PATH_DEPTH (25) parts is refused as 'a blocked system path': "
-        "_refuse_system_path reuses the CLI path validator, depth cap included"
-    ),
-)
 def test_dx03_a_deep_fragment_inside_the_root_composes(tmp_path: Path) -> None:
+    """The CLI's cap on the parts of a path an operator types is not a system-path rule:
+    the ref deny list uses only the CLI's set of system directories."""
     from fluid_build.cli.security import MAX_PATH_DEPTH
 
     product = tmp_path / "p"
@@ -1757,12 +1824,13 @@ def test_dx03_a_fragment_at_the_depth_cap_composes(tmp_path: Path) -> None:
     assert load_contract(path)["metadata"]["owner"]["team"] == "deep"
 
 
-def test_dx04_every_ref_to_one_file_reads_and_parses_it_again_uncharged(
+def test_dx04_a_file_named_by_many_refs_is_parsed_once_and_each_copy_is_charged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Characterization (finding): a target is read and parsed once per ref that
-    names it, and what the parse costs (comments, whitespace) is not charged to
-    the expansion cap, which counts only the values brought in (spec 7)."""
+    """DX-04, decided: one composition reads and parses a target once, however many refs
+    name it, so what the parse costs (comments, whitespace) is paid once; every ref
+    still gets its own copy, charged to the expansion cap (spec 7), and the refs
+    themselves are held to ``MAX_REF_RESOLUTIONS``."""
     product = tmp_path / "p"
     padding = "# " + "p" * 98 + "\n"
     padded = _write(product / "padded.yaml", padding * 500 + TEAM)
@@ -1770,7 +1838,7 @@ def test_dx04_every_ref_to_one_file_reads_and_parses_it_again_uncharged(
     doc = _min()
     doc["extensions"] = {"copies": [{"$ref": "./padded.yaml"} for _ in range(copies)]}
     path = _contract(product, doc)
-    # Room for what the refs bring in, a fraction of what they make the loader parse.
+    # Room for what the refs bring in, a fraction of what they would make the loader parse.
     read_total = padded.stat().st_size * copies
     monkeypatch.setattr(contract_refs, "MAX_REF_EXPANSION_CHARS", read_total // 100)
 
@@ -1785,8 +1853,14 @@ def test_dx04_every_ref_to_one_file_reads_and_parses_it_again_uncharged(
 
     composed = load_contract(path)
 
-    assert len(composed["extensions"]["copies"]) == copies
-    assert parsed == [padded.resolve()] * copies
+    copied = composed["extensions"]["copies"]
+    assert copied == [yaml.safe_load(TEAM)] * copies
+    assert len({id(c) for c in copied}) == copies, "each ref has a copy of its own"
+    assert parsed == [padded.resolve()]
+    # Each copy is still charged: one more ref than the cap leaves room for is refused.
+    monkeypatch.setattr(contract_refs, "MAX_REF_EXPANSION_NODES", 3 * copies - 1)
+    with pytest.raises(RefResolutionError, match="takes what refs bring into the contract"):
+        load_contract(path)
 
 
 def test_dx05_the_mcp_tool_path_composes_refs_confined_like_the_cli(tmp_path: Path) -> None:

@@ -325,22 +325,27 @@ def test_d23_a_workspace_file_that_is_a_fifo_is_not_waited_on(tmp_path: Path) ->
 
 @pytest.mark.slow
 @pytest.mark.parametrize("command", ["validate", "bundle"])
-def test_dx02_sg10_an_overlay_that_is_a_fifo_hangs_the_command(
+def test_dx02_sg10_an_overlay_that_is_a_fifo_is_refused_without_a_hang(
     tmp_path: Path, command: str
 ) -> None:
-    """SG-10 characterization (finding): a ``$ref`` target must be a regular file,
-    but the overlay candidate is only checked to exist and is then read, so a
-    FIFO at ``overlays/<env>.yaml`` blocks ``--env <env>`` forever (a link to
-    ``/dev/zero`` would read without end)."""
+    """SG-10, decided: an overlay is held to the rule of a ``$ref`` target, a regular
+    file, checked before it is read and again on the file opened without blocking.
+    A FIFO at ``overlays/<env>.yaml`` used to block ``--env <env>`` forever; it is
+    refused, naming the overlay."""
     product = tmp_path / "p"
     path = _contract(product, yaml.safe_load(MIN_TEXT))
     _mkfifo(product / "overlays" / "prod.yaml")
+    out = tmp_path / "bundle.yaml"
     args: List[Any] = [command, path, "--env", "prod"]
     if command == "bundle":
-        args += ["--out", tmp_path / "bundle.yaml"]
+        args += ["--out", out]
 
-    with pytest.raises(subprocess.TimeoutExpired):
-        _fluid(args, cwd=tmp_path, timeout=6)
+    result = _fluid(args, cwd=tmp_path, timeout=20)
+
+    output = _flat(result.stdout + result.stderr)
+    assert result.returncode == 1, output
+    assert "not a regular file" in output and "overlays/prod.yaml" in output
+    assert not out.exists()
 
 
 # ── DX-08: a contract that contains itself (YAML alias) ─────────────────

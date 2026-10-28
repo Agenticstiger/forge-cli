@@ -618,7 +618,9 @@ def test_c22_pointer_bomb_in_one_file_is_refused_by_the_cap_in_seconds(tmp_path:
     elapsed = time.monotonic() - started
 
     assert "'/extensions/p" in message, "the location of the pointer that crossed the cap"
-    assert f"{contract_refs.MAX_REF_EXPANSION_NODES:,}" in message
+    # Each pointer resolves its target again, so the work doubles with every level: the
+    # cap on ref resolutions ends it before what it brings in reaches the expansion cap.
+    assert f"{contract_refs.MAX_REF_RESOLUTIONS:,}" in message
     assert elapsed < 5, f"the cap took {elapsed:.1f}s to refuse a pointer bomb"
 
 
@@ -881,13 +883,29 @@ def test_b14_pointer_sibling_written_in_a_fragment_also_sees_the_env(tmp_path: P
     assert load_with_overlay(path, None)["build"]["parallelism"] == 2
 
 
-# ── B-14, C-20: a pointer is a copy of its place, wherever it is merged ──
+# ── B-14, C-20: a pointer is never merged into an object ─────────────────
 #
-# A pointer sits in the document until the last pass, but it must behave as the value
-# it names. The twin of every case below writes that value in place instead, and the
-# docs say what happens to it: objects merge key by key, a scalar replaces, null removes.
+# A pointer sits in the document until the last pass, so what it names is not known when
+# siblings or an overlay are merged. Merged into an object as data, its ``$ref`` would sit
+# beside that object's keys, which would then beat the values it names. So it is refused
+# there (decided: as a key beside a file ref whose target holds an object at that key, or
+# as an overlay value over an object of the base), naming the file that wrote it, its
+# place and the remedy: write the keys there, or name a file, which is read before the
+# merge. Where no object stands (no key, a scalar, a list) it replaces, as any value does.
+# Over a bare pointer it replaces too, unless that pointer names an object.
 
 _B14_TARGET = "engine: flink\nparallelism: {min: 1, max: 4, extra: 9}\n"
+
+
+def _refused_pointer_merge(
+    call: Callable[[], Any], *, ref: str, file: Path, pointer: str, into: str
+) -> str:
+    """The refusal of a pointer merged into an object: who wrote it, where, and the remedy."""
+    message = _ref_error(call, ref=ref, file=file, pointer=pointer)
+    assert into in message
+    assert "cannot be merged into an object" in message
+    assert "Write the keys there instead, or name a file ('./part.yaml#/...')" in message
+    return message
 
 
 def test_b14_control_object_and_file_ref_siblings_merge_over_an_object_key(tmp_path: Path) -> None:
@@ -904,63 +922,115 @@ def test_b14_control_object_and_file_ref_siblings_merge_over_an_object_key(tmp_p
     assert scalar["build"]["parallelism"] == 7
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG B14-hybrid: a pointer used as a sibling is merged into an object-valued key of "
-        "the file-ref target as a literal {$ref} object, so the target's own keys end up "
-        "beside the pointer and beat the values it names (the sibling is silently ignored)"
-    ),
-)
-def test_b14_pointer_sibling_over_an_object_key_merges_like_its_inline_twin(
-    tmp_path: Path,
-) -> None:
+def test_b14_a_pointer_sibling_over_an_object_key_is_refused(tmp_path: Path) -> None:
+    """B14-hybrid (decided): the target holds an object at the key, so it is refused, not
+    merged in as data (which silently kept the target's min and max)."""
     _write(tmp_path / "t.yaml", _B14_TARGET)
-    contract = _lc(
+    path = _contract(
         tmp_path,
         "defaults: {p: {min: 2, max: 8}}\n"
         'build: {$ref: ./t.yaml, parallelism: {$ref: "#/defaults/p"}}\n',
     )
 
-    assert contract["build"]["parallelism"] == {"min": 2, "max": 8, "extra": 9}
+    _refused_pointer_merge(
+        lambda: load_contract(path),
+        ref="#/defaults/p",
+        file=path,
+        pointer="/build/parallelism",
+        into="the object that './t.yaml' holds at '/parallelism'",
+    )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG B14-hybrid: a pointer sibling over a pointer held by the target replaces it "
-        "instead of merging over it, so the target's other keys are lost"
-    ),
-)
-def test_b14_pointer_sibling_over_a_pointer_in_the_target_merges_like_its_inline_twin(
+def test_b14_a_pointer_sibling_over_an_object_deeper_in_the_target_is_refused(
     tmp_path: Path,
 ) -> None:
+    """A pointer inside a sibling object is refused where it meets the target's object."""
+    _write(tmp_path / "t.yaml", "parallelism: {inner: {a: 1}, keep: 2}\n")
+    path = _contract(
+        tmp_path,
+        "defaults: {p: {b: 2}}\n"
+        'build: {$ref: ./t.yaml, parallelism: {inner: {$ref: "#/defaults/p"}}}\n',
+    )
+
+    _refused_pointer_merge(
+        lambda: load_contract(path),
+        ref="#/defaults/p",
+        file=path,
+        pointer="/build/parallelism/inner",
+        into="the object that './t.yaml' holds at '/parallelism/inner'",
+    )
+
+
+def test_b14_a_pointer_sibling_over_a_pointer_to_an_object_is_refused(tmp_path: Path) -> None:
+    """B14-hybrid (decided): the target's pointer names an object, so the sibling would be
+    merged into it; the pass that knows what it names refuses it."""
     _write(tmp_path / "t.yaml", 'parallelism: {$ref: "#/defaults/a"}\n')
-    contract = _lc(
+    path = _contract(
         tmp_path,
         "defaults: {a: {x: 1, y: 2}, b: {y: 20}}\n"
         'build: {$ref: ./t.yaml, parallelism: {$ref: "#/defaults/b"}}\n',
     )
 
-    assert contract["build"]["parallelism"] == {"x": 1, "y": 20}
+    _refused_pointer_merge(
+        lambda: load_contract(path),
+        ref="#/defaults/b",
+        file=path,
+        pointer="/build/parallelism",
+        into="the object that '#/defaults/a' names at '/build/parallelism'",
+    )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG B14-scalar: a pointer sibling that names a scalar, over an object-valued key of "
-        "the target, is refused with 'has sibling keys (...) but the target is a int', listing "
-        "the target's own keys as the siblings; the inline twin (parallelism: 7) composes"
-    ),
-)
-def test_b14_pointer_sibling_naming_a_scalar_replaces_an_object_key(tmp_path: Path) -> None:
-    _write(tmp_path / "t.yaml", _B14_TARGET)
+def test_b14_a_pointer_sibling_over_a_pointer_to_a_scalar_replaces_it(tmp_path: Path) -> None:
+    _write(tmp_path / "t.yaml", 'engine: flink\nparallelism: {$ref: "#/defaults/a"}\n')
     contract = _lc(
+        tmp_path,
+        "defaults: {a: 4, b: {y: 20}}\n"
+        'build: {$ref: ./t.yaml, parallelism: {$ref: "#/defaults/b"}}\n',
+    )
+
+    assert contract["build"] == {"engine": "flink", "parallelism": {"y": 20}}
+
+
+def test_b14_a_pointer_sibling_naming_a_scalar_over_an_object_key_is_refused(
+    tmp_path: Path,
+) -> None:
+    """B14-scalar (decided): the place holds an object, so the pointer is refused whatever
+    it names, and the error is about the pointer, not about the target's own keys."""
+    _write(tmp_path / "t.yaml", _B14_TARGET)
+    path = _contract(
         tmp_path,
         'defaults: {p: 7}\nbuild: {$ref: ./t.yaml, parallelism: {$ref: "#/defaults/p"}}\n',
     )
 
-    assert contract["build"]["parallelism"] == 7
+    message = _refused_pointer_merge(
+        lambda: load_contract(path),
+        ref="#/defaults/p",
+        file=path,
+        pointer="/build/parallelism",
+        into="the object that './t.yaml' holds at '/parallelism'",
+    )
+    assert "has sibling keys" not in message
+
+
+def test_b14_a_pointer_sibling_where_the_target_has_no_object_replaces(tmp_path: Path) -> None:
+    """No key, a scalar or a list at the place: the pointer replaces, as any value does."""
+    _write(tmp_path / "t.yaml", "engine: flink\nparallelism: 1\nhosts: [a, b]\n")
+    contract = _lc(
+        tmp_path,
+        "defaults: {p: {min: 2}, l: [c]}\n"
+        "build:\n"
+        "  $ref: ./t.yaml\n"
+        '  parallelism: {$ref: "#/defaults/p"}\n'
+        '  hosts: {$ref: "#/defaults/l"}\n'
+        '  extra: {$ref: "#/defaults/p"}\n',
+    )
+
+    assert contract["build"] == {
+        "engine": "flink",
+        "parallelism": {"min": 2},
+        "hosts": ["c"],
+        "extra": {"min": 2},
+    }
 
 
 def _overlay_binding(tmp_path: Path, location: Dict[str, Any]) -> Dict[str, Any]:
@@ -980,17 +1050,76 @@ def test_c20_control_overlay_object_overrides_the_base_binding_location(tmp_path
     }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG C20-hybrid: an overlay value that is a pointer, over an object the base has, is "
-        "merged in as a literal {$ref} object, so the base's keys end up beside the pointer "
-        "and beat the values it names: the overlay silently fails to override them"
-    ),
-)
-def test_c20_overlay_pointer_over_a_base_object_key_merges_like_its_inline_twin(
+def test_c20_an_overlay_pointer_over_a_base_object_is_refused_naming_the_overlay(
     tmp_path: Path,
 ) -> None:
-    location = _overlay_binding(tmp_path, {"$ref": "#/extensions/prodLocation"})
+    """C20-hybrid (decided): merged in as data, the pointer silently kept the base's path;
+    it is refused instead, naming the overlay, the place and the remedy."""
+    with pytest.raises(RefResolutionError) as info:
+        _overlay_binding(tmp_path, {"$ref": "#/extensions/prodLocation"})
+    message = str(info.value)
 
-    assert location == {"path": "runtime/out/prod.csv"}
+    assert "'#/extensions/prodLocation'" in message
+    assert f"in {(tmp_path / 'overlays' / 'prod.yaml').resolve()}" in message
+    assert "at JSON pointer '/exposes/0/binding/location'" in message
+    assert "the object the base contract has at '/exposes/0/binding/location'" in message
+    assert "name a file ('./part.yaml#/...')" in message
+
+
+def test_c20_an_overlay_pointer_where_the_base_has_no_object_replaces(tmp_path: Path) -> None:
+    """Over a scalar of the base, and at a key the base has not, the pointer replaces."""
+    path = _contract(tmp_path, _dump(_min()))
+    overlay = {
+        "extensions": {"prodPath": "runtime/out/prod.csv"},
+        "exposes": [
+            {
+                "exposeId": "out",
+                "binding": {"location": {"path": {"$ref": "#/extensions/prodPath"}}},
+                "tags": {"$ref": "#/extensions/prodPath"},
+            }
+        ],
+    }
+    _write(tmp_path / "overlays" / "prod.yaml", _dump(overlay))
+
+    expose = load_with_overlay(path, "prod")["exposes"][0]
+
+    assert expose["binding"]["location"] == {"path": "runtime/out/prod.csv"}
+    assert expose["tags"] == "runtime/out/prod.csv"
+
+
+@pytest.mark.parametrize(("base_names", "refused"), [("a string", False), ("an object", True)])
+def test_c20_an_overlay_pointer_over_a_base_pointer_is_decided_by_what_that_one_names(
+    tmp_path: Path, base_names: str, refused: bool
+) -> None:
+    """The base's place holds a pointer: the overlay's replaces it when it names no object,
+    and is refused when it names one, as over the object written in place."""
+    doc = _min()
+    doc["extensions"] = {"dev": "runtime/out/dev.csv" if not refused else {"path": "dev.csv"}}
+    doc["exposes"][0]["binding"]["location"]["path"] = {"$ref": "#/extensions/dev"}
+    path = _contract(tmp_path, _dump(doc))
+    overlay = _write(
+        tmp_path / "overlays" / "prod.yaml",
+        _dump(
+            {
+                "extensions": {"prod": "runtime/out/prod.csv"},
+                "exposes": [
+                    {
+                        "exposeId": "out",
+                        "binding": {"location": {"path": {"$ref": "#/extensions/prod"}}},
+                    }
+                ],
+            }
+        ),
+    )
+
+    if refused:
+        _refused_pointer_merge(
+            lambda: load_with_overlay(path, "prod"),
+            ref="#/extensions/prod",
+            file=overlay,
+            pointer="/exposes/0/binding/location/path",
+            into="the object that '#/extensions/dev' names at '/exposes/0/binding/location/path'",
+        )
+    else:
+        location = load_with_overlay(path, "prod")["exposes"][0]["binding"]["location"]
+        assert location == {"path": "runtime/out/prod.csv"}
