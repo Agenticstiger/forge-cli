@@ -1113,3 +1113,20 @@ def test_digest_is_the_planned_contracts_not_the_raw_files(ws: Path) -> None:
     contract_path = _write(ws, _CASES["aliases"])
     raw = compute_contract_digest(load_yaml_safe(contract_path.read_text("utf-8")))
     assert api.load_contract(contract_path).digest != raw
+
+
+def test_a_symlink_named_like_a_contract_in_base_dir_does_not_move_the_ref_root(
+    tmp_path: Path,
+) -> None:
+    """An upload is held to ``base_dir``: a ``contract.fluid.yaml -> .`` link inside it
+    (one tarfile's ``data`` filter keeps) must not widen the root to its parent."""
+    (tmp_path / "tenant-b").mkdir()
+    (tmp_path / "tenant-b" / "secrets.json").write_text('{"token": "B"}', encoding="utf-8")
+    upload = tmp_path / "tenant-a"
+    upload.mkdir()
+    (upload / "contract.fluid.yaml").symlink_to(".")
+    document = {"id": "a.x", "extensions": {"x": {"$ref": "../tenant-b/secrets.json"}}}
+
+    with pytest.raises(ContractLoadError) as err:
+        api.load_contract_from_dict(document, base_dir=upload)
+    assert "escapes the ref root" in str(err.value.__cause__ or err.value)

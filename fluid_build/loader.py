@@ -675,6 +675,7 @@ def _effective_ref_root(
     ref_root: Optional[Union[str, Path]],
     *,
     reads_outside: bool = False,
+    contract_dir: Optional[Path] = None,
 ) -> _RefRoot:
     """The directory every ``$ref`` of *contract* must stay inside.
 
@@ -712,7 +713,12 @@ def _effective_ref_root(
       load: the WARNING is logged once per value per process, and in a
       service it reaches the server log, not the caller.
     """
-    contract_dir = contract_path.resolve().parent
+    # ``contract_dir`` is given when no file is read for the contract (the
+    # in-memory API): the caller's directory is resolved, never a name under
+    # it, so a symlink planted at that name cannot move the root.
+    contract_dir = (
+        Path(contract_dir).resolve() if contract_dir is not None else contract_path.resolve().parent
+    )
     if not reads_outside and next(iter_external_refs(contract), None) is None:
         return _RefRoot(contract_dir)
     if ref_root is not None:
@@ -1186,9 +1192,12 @@ def compose_document(
         dict(document),
         base_dir=base_dir,
         source=None,
-        # No file is read for the contract itself: a name in ``base_dir``
-        # places it, so the root is the one a contract file there would get.
-        root=_effective_ref_root(base_dir / "contract.fluid.yaml", layers, None),
+        # No file is read for the contract itself: the root is the one a
+        # contract file in ``base_dir`` would get, taken from ``base_dir``
+        # itself, so a symlink at a file name inside it moves nothing.
+        root=_effective_ref_root(
+            base_dir / "contract.fluid.yaml", layers, None, contract_dir=base_dir
+        ),
         trace=trace,
         overlay=dict(overlay) if overlay is not None else None,
         overlay_dir=overlay_dir if overlay_dir is not None else base_dir,
