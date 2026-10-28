@@ -160,7 +160,7 @@ jobs:
     # hang (a leaked server loop / deadlocked async session) to minutes
     # instead of GitHub's 6-hour default. A hung job that burns 6h of
     # runner time before anyone notices is how the 3.13/3.14 deadlock
-    # stayed costly. 35, not 25: the \$ref fragment scenario suite
+    # stayed costly. 35, not 25: the $ref fragment scenario suite
     # (tests/fragments, ~1,900 tests) added about 7 minutes, and the 3.10
     # leg then ran 24 of its 25.
     timeout-minutes: 35
