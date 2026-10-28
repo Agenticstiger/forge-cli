@@ -446,12 +446,6 @@ def test_k14_a_kind_the_schema_version_lacks_is_an_error_naming_the_version(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG K14-NO-FILE: validate --fragment KIND with the file left out validates the "
-    "contract found in the working directory as if it were the fragment (6 misleading errors, "
-    "schema 0.7.5) instead of asking for the fragment file",
-)
 def test_k14x_a_fragment_run_without_a_file_does_not_validate_the_contract_beside_it(
     tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -474,6 +468,25 @@ def test_k14x_an_empty_kind_is_refused_not_ignored(
 
     assert rc != 0
     assert "kinds:" in out + err  # the valid kinds are listed, as for any unknown kind
+
+
+@pytest.mark.parametrize(
+    ("kind", "shown"), [("expose", "expose"), ("", "KIND")], ids=["a-kind", "an-empty-kind"]
+)
+def test_k14x_the_error_for_a_missing_file_says_how_to_call_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    shown: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)  # no contract anywhere: the file is still what is missing
+
+    rc, out, err = _validate(capsys, "--fragment", kind)
+
+    assert rc == 1
+    assert "fragment_file_required" in out + err
+    assert f"fluid validate --fragment {shown} <file>" in " ".join((out + err).split())
 
 
 # ── K-15 ────────────────────────────────────────────────────────────────

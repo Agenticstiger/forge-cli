@@ -274,6 +274,20 @@ def run(args, logger: logging.Logger) -> int:
         # first (multi-product workspace), then fall back to a single
         # ``contract.fluid.yaml`` in CWD (the common single-product case).
         if not args.contract:
+            # Not for a fragment run: the file is what it checks, and the contract
+            # found here would be validated as if it were the fragment.
+            kind = _fragment_kind(args)
+            if kind is not None:
+                raise CLIError(
+                    1,
+                    "fragment_file_required",
+                    {
+                        "error": (
+                            "--fragment checks one fragment file, and the file is required: "
+                            f"fluid validate --fragment {kind or 'KIND'} <file>"
+                        )
+                    },
+                )
             workspace_result = _try_workspace_validate(args, schema_manager, logger)
             if workspace_result is not None:
                 return workspace_result
@@ -317,7 +331,7 @@ def run(args, logger: logging.Logger) -> int:
         if contract_lower.endswith(".tgz") or contract_lower.endswith(".tar.gz"):
             return _run_bundle_validation(contract_path, args, schema_manager, logger, start_time)
 
-        if isinstance(getattr(args, "fragment", None), str):
+        if _fragment_kind(args) is not None:
             return _run_fragment_validation(Path(contract_path), args, schema_manager, logger)
 
         # Load contract with overlay
@@ -486,6 +500,17 @@ def _load_with_overlay_warnings(
         contract = load_contract_with_overlay(contract_path, env, logger)
     locate = origins[-1].describe if origins else None
     return contract, [warning.message for warning in overlay_warnings], locate
+
+
+def _fragment_kind(args: Any) -> Optional[str]:
+    """The kind ``--fragment`` was given, ``""`` too; ``None`` when the flag was not used.
+
+    An empty kind is an unknown kind to refuse, never the flag left out. Anything
+    that is not text is not a kind, so an ``args`` object without the attribute
+    (a bare mock, an older caller's namespace) is a whole-contract run.
+    """
+    kind = getattr(args, "fragment", None)
+    return kind if isinstance(kind, str) else None
 
 
 #: ``--fragment`` kinds that are not a ``$defs`` name: an expose's lists.
