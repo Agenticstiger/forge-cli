@@ -863,23 +863,30 @@ class ContractOrigins:
         for cut in range(len(path), -1, -1):
             head, rest = path[:cut], path[cut:]
             for entry in reversed(self._entries.get(head, ())):
-                if isinstance(entry, _Alias):
-                    if rest and rest[0] in entry.siblings:
-                        continue
-                    return self._locate((*entry.target, *rest), hops + 1, definition)
-                if rest and rest[0] in entry.hide:
-                    continue
-                if entry.patch and (definition or not rest):
-                    # A patch wrote keys; the object itself was written elsewhere.
-                    continue
-                if entry.inner is None:
-                    if not rest:
-                        return entry.file, None
-                    continue
-                found, line = self._line(entry.file, (*entry.inner, *rest))
-                if found:
-                    return entry.file, line
+                found = self._from_entry(entry, rest, hops, definition)
+                if found is not _EARLIER:
+                    return found
         return None
+
+    def _from_entry(
+        self, entry: Union[Origin, _Alias], rest: Pointer, hops: int, definition: bool
+    ) -> Any:
+        """Where ``entry`` wrote ``rest`` (the path below it): ``(file, line)``,
+        ``None`` for an alias that names nothing, or ``_EARLIER`` when ``entry``
+        did not write it and an earlier record must answer."""
+        if isinstance(entry, _Alias):
+            if rest and rest[0] in entry.siblings:
+                return _EARLIER
+            return self._locate((*entry.target, *rest), hops + 1, definition)
+        if rest and rest[0] in entry.hide:
+            return _EARLIER
+        if entry.patch and (definition or not rest):
+            # A patch wrote keys; the object itself was written elsewhere.
+            return _EARLIER
+        if entry.inner is None:
+            return _EARLIER if rest else (entry.file, None)
+        found, line = self._line(entry.file, (*entry.inner, *rest))
+        return (entry.file, line) if found else _EARLIER
 
     def _line(self, file: Path, inner: Pointer) -> Tuple[bool, Optional[int]]:
         """Whether ``file`` holds ``inner``, and the 1-based line it is at."""
@@ -888,25 +895,34 @@ class ContractOrigins:
         node = self._trees[file]
         if node is None:
             return True, None
-        import yaml
-
         line = node.start_mark.line + 1
         for token in inner:
-            if isinstance(node, yaml.MappingNode):
-                for key, value in node.value:
-                    if isinstance(key, yaml.ScalarNode) and key.value == str(token):
-                        line, node = key.start_mark.line + 1, value
-                        break
-                else:
-                    return False, None
-            elif isinstance(node, yaml.SequenceNode):
-                if not str(token).isdigit() or int(token) >= len(node.value):
-                    return False, None
-                node = node.value[int(token)]
-                line = node.start_mark.line + 1
-            else:
+            step = _node_child(node, token)
+            if step is None:
                 return False, None
+            line, node = step
         return True, line
+
+
+#: :meth:`ContractOrigins._from_entry`: this record did not write the path.
+_EARLIER = object()
+
+
+def _node_child(node: Any, token: Union[str, int]) -> Optional[Tuple[int, Any]]:
+    """``(line, child)`` for ``token`` under a YAML node: a mapping's key, at the
+    key's line, or a sequence's item, at the item's line; ``None`` if absent."""
+    import yaml
+
+    if isinstance(node, yaml.MappingNode):
+        for key, value in node.value:
+            if isinstance(key, yaml.ScalarNode) and key.value == str(token):
+                return key.start_mark.line + 1, value
+        return None
+    if isinstance(node, yaml.SequenceNode) and str(token).isdigit():
+        if int(token) < len(node.value):
+            item = node.value[int(token)]
+            return item.start_mark.line + 1, item
+    return None
 
 
 def _compose_file(path: Path) -> Any:

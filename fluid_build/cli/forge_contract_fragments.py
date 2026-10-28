@@ -182,22 +182,28 @@ def _section_sites(contract: Dict[str, Any], wanted: Collection[str]) -> Iterato
 
 def _entry_sites(contract: Dict[str, Any], wanted: Collection[str]) -> Iterator[FragmentSite]:
     """Each build and expose, and the parts inside one, in contract order."""
-    for key, (directory, id_field, comment_prefix) in _LIST_SECTIONS.items():
+    for key in _LIST_SECTIONS:
         items = contract.get(key)
-        if not isinstance(items, list):
-            continue
-        for i, item in enumerate(items):
-            if not isinstance(item, dict) or _is_ref(item):
-                continue
-            item_id = item.get(id_field, "")
-            slug = _slugify(item_id) if item_id else f"unnamed-{i}"
-            if key in wanted:
-                header = f"{comment_prefix}{item_id or slug}\n"
-                yield FragmentSite((key, i), f"{directory}/{slug}.yaml", header)
-            if key == "builds":
-                yield from _sql_sites(item, i, slug, wanted)
-            elif key == "exposes":
-                yield from _expose_list_sites(item, i, item_id or slug, slug, wanted)
+        if isinstance(items, list):
+            for i, item in enumerate(items):
+                if isinstance(item, dict) and not _is_ref(item):
+                    yield from _item_sites(key, i, item, wanted)
+
+
+def _item_sites(
+    key: str, i: int, item: Dict[str, Any], wanted: Collection[str]
+) -> Iterator[FragmentSite]:
+    """One build or expose, then the parts inside it."""
+    directory, id_field, comment_prefix = _LIST_SECTIONS[key]
+    item_id = item.get(id_field, "")
+    slug = _slugify(item_id) if item_id else f"unnamed-{i}"
+    if key in wanted:
+        header = f"{comment_prefix}{item_id or slug}\n"
+        yield FragmentSite((key, i), f"{directory}/{slug}.yaml", header)
+    if key == "builds":
+        yield from _sql_sites(item, i, slug, wanted)
+    elif key == "exposes":
+        yield from _expose_list_sites(item, i, item_id or slug, slug, wanted)
 
 
 def _sql_sites(
