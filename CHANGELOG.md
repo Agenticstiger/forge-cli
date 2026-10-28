@@ -53,6 +53,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Command Center gate still lets a credential reach any public `https` endpoint unlisted.
   Mirroring them would have reproduced the hole.
 
+### Fixed
+
+- **`fluid init --discover` against a remote URL failed on DuckDB 2.0.0**, before a byte was read:
+  `Permission Error: Cannot read a CA certificate bundle: file system access is restricted by
+  configuration`. TLS needs the host's trust store, the sandbox granted no path to it, and nothing
+  granted one when a remote prefix was declared — so the whole remote-discovery surface was broken
+  on the engine the project resolves to by default, while the same call worked on 1.5.x. The cause
+  is upstream and deliberate: duckdb/duckdb-httpfs#474 moved the bundle read inside DuckDB's own
+  file system, where curl and OpenSSL used to open it themselves and bypassed `allowed_paths`
+  entirely.
+
+  The sandbox now takes the first CA bundle that exists out of the five DuckDB probes and grants a
+  **private copy** of it — one file in `allowed_paths`, mode 0400 in a 0700 directory the connection
+  owns, with `ca_cert_file` pinned to it (`SET GLOBAL`, so a `con.cursor()` inherits the pin) and
+  the copy removed when the connection object is finalised — and only when the allowlist carries a
+  remote prefix AND that pin lands. A local read gains nothing, `allowed_directories` is
+  untouched (so what a remote prefix grants locally is unchanged), and the allowlist object is not
+  widened. On a host with none of the five (a minimal container, Windows) nothing is granted and
+  DuckDB's own refusal, which names the paths it looked for, is left to speak.
+
+  **Why a copy and not the store itself:** a path in `allowed_paths` is granted for *writing*. The
+  first version of this fix granted the host store directly, and contract SQL could then run
+  `COPY (SELECT 'ATTACKER CA') TO '<store>'` and replace it — measured on 1.5.6 and 2.0.0, a
+  333 KB trust store overwritten with 14 bytes, with an ungranted sibling in the same directory
+  still refused. Only file ownership stood in the way: `/etc/ssl/cert.pem` is root-owned, so an
+  unprivileged `fluid` cannot write it, but `fluid generate ci` emits a `python:3.12-slim` job that
+  runs as root, and a contract built there could have installed its own CA into that container's
+  trust store. Granting a copy removes the reach, which is the part that mattered: the host store is
+  not in `allowed_paths` at all, so the CA grant writes nothing outside this process's own temporary
+  directory (the connection still reaches whatever the contract declared — that is the allowlist's
+  job, unchanged here). It does **not** make the copy itself immutable — the mode is a speed bump. `COPY TO` with
+  its default options writes a temporary file and renames it over the target, so 0400 stops nothing
+  once the containing directory is writable by the SQL, and root ignores the mode regardless. The
+  grant is therefore dropped outright when the copy would land inside a granted directory (`$TMPDIR`
+  pointed into the workspace — an ordinary CI, direnv or Nix arrangement), and dropped when the
+  `ca_cert_file` pin cannot land, which is every connection that loaded no httpfs. What an attacker
+  who replaces the copy gets is the trust anchors of one connection, over remote locations the
+  contract named anyway, on a file that is gone when that connection is.
+
+  Certificate verification is untouched and stays on: an expired and a self-signed certificate are
+  refused on 1.5.6 and 2.0.0 alike, with and without `enable_server_cert_verification` — that
+  setting governs the httplib client, while `s3://` and `https://` go through curl. 1.5.6 exposes
+  `enable_curl_server_cert_verification` (default true) and 2.0.0 no longer does;
+  duckdb/duckdb-httpfs#378 proposes unifying the two and is still open, so the behaviour above is
+  what was measured rather than what upstream documents. Nothing here disables verification.
+
+  Verified by running the CLI: `fluid init --discover s3://noaa-ghcn-pds/csv/by_year/2024.csv`
+  emits 8 columns and `--discover https://…/customer.csv` emits 18, on 1.5.1, 1.5.6 and 2.0.0,
+  and `fluid validate` accepts the result.
+
 ### Upgrade notes
 
 - **A contract whose orchestrator is on a public host now fails until the operator allows it.**
@@ -68,6 +118,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own credentials in the URI itself, which is not a `secretRef` and so is not policed; and
   `{{ env.NAME }}` interpolation inside a contract bypasses `secretRef` entirely. Neither is changed
   by this release.
+
+- **A CA bundle outside DuckDB's five candidate paths cannot be used.** There is no operator
+  override (no `FLUID_DUCKDB_CA_BUNDLE`, and DuckDB consults neither `SSL_CERT_FILE` nor OpenSSL's
+  defaults — measured), so a host whose trust store lives elsewhere, including one behind a
+  TLS-inspecting proxy whose own CA is installed somewhere else, still gets DuckDB's refusal on a
+  remote read. That is no worse than before this release, where every such read failed on 2.0.0
+  regardless, and the refusal still names the paths it looked for — but it is not closed.
+- **`azure://` / `az://` is not measured.** The fix grants the copy for every declared remote
+  prefix, but the Azure filesystem extension does its own TLS and may not read the bundle through
+  this path. `s3://`, `gs://`, `http://` and `https://` were verified live.
 
 ## [0.24.0] — 2026-10-27
 
