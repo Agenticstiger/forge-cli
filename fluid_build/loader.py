@@ -273,8 +273,11 @@ def _deep_merge(
     keyed = _root and _keyed_overlay_merge(base, overlay)
     contract_id = str(base.get("id") or "the contract") if _root else ""
     for k, v in overlay.items():
-        if k in base and is_pointer_node(base[k]) and isinstance(v, list):
-            raise _merge_over_pointer(base[k], (*_at, k), "sets a list")
+        if k in base and is_pointer_node(base[k]) and _object_list(v):
+            # Matched by id, or merged by position, into what the pointer names:
+            # that exists only after the merge. A list of plain values replaces
+            # it, as it replaces the value written inline.
+            raise _merge_over_pointer(base[k], (*_at, k), "patches a list of objects")
         if k in base and isinstance(base[k], dict) and isinstance(v, dict):
             base[k] = _merge_object(base[k], v, (*_at, k), _trace)
         elif (
@@ -314,7 +317,16 @@ def _merge_object(
         return overlay
     if is_pointer_node(overlay):
         raise _pointer_merged(overlay, at, trace)
+    if is_pointer_node(base):
+        # The keys would go beside the pointer and be merged over what it names
+        # as a merge patch, replacing its lists where the overlay merges them.
+        raise _merge_over_pointer(base, at, "patches an object")
     return _deep_merge(base, overlay, _root=False, _at=at, _trace=trace)
+
+
+def _object_list(value: Any) -> bool:
+    """A non-empty list of objects: what an overlay merges entry by entry."""
+    return isinstance(value, list) and bool(value) and all(isinstance(v, dict) for v in value)
 
 
 def _pointer_merged(

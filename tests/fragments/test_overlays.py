@@ -1987,3 +1987,54 @@ def test_a_section_that_is_not_a_list_reaches_the_schema_with_an_overlay(tmp_pat
     (tmp_path / "overlays" / "prod.yaml").write_text("name: P\n", encoding="utf-8")
 
     assert compose_contract(tmp_path / "contract.fluid.yaml", "prod").document["builds"] == 5
+
+
+_SHARED_EXPOSE = """\
+fluidVersion: "0.7.6"
+kind: DataProduct
+id: d.p
+name: P
+extensions:
+  shared:
+    binding: {platform: local, format: csv, location: {path: a.csv}}
+    schema: [{name: id, type: string}, {name: amount, type: number}]
+    tags: [a, b]
+exposes:
+  - exposeId: out
+    kind: table
+    binding: {$ref: "#/extensions/shared/binding"}
+    contract: {schema: {$ref: "#/extensions/shared/schema"}}
+    tags: {$ref: "#/extensions/shared/tags"}
+"""
+
+
+@pytest.mark.parametrize(
+    ("patch", "refused"),
+    [
+        ("binding: {location: {path: prod.csv}}", True),
+        ("contract: {schema: [{name: id, type: string}]}", True),
+        ("tags: [prod]", False),
+        ("tags: []", False),
+        ("binding: none-here", False),
+    ],
+    ids=["object-over-pointer", "object-list-over-pointer", "plain-list", "empty-list", "scalar"],
+)
+def test_an_overlay_value_over_a_base_pointer(tmp_path: Path, patch: str, refused: bool) -> None:
+    """What a base pointer names exists only after the merge: an object or a list of objects
+    merged over it is refused; a scalar or a list of plain values replaces it, as inline."""
+    from fluid_build.loader import compose_contract
+    from fluid_build.util.ref_confinement import RefResolutionError
+
+    (tmp_path / "contract.fluid.yaml").write_text(_SHARED_EXPOSE, encoding="utf-8")
+    (tmp_path / "overlays").mkdir()
+    (tmp_path / "overlays" / "prod.yaml").write_text(
+        "exposes:\n  - exposeId: out\n    " + patch + "\n", encoding="utf-8"
+    )
+
+    if refused:
+        with pytest.raises(RefResolutionError, match="resolved only after the overlay is merged"):
+            compose_contract(tmp_path / "contract.fluid.yaml", "prod")
+    else:
+        expose = compose_contract(tmp_path / "contract.fluid.yaml", "prod").document["exposes"][0]
+        key, _, value = patch.partition(": ")
+        assert expose[key] == yaml.safe_load(value)
