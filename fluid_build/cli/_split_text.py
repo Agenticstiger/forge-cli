@@ -26,7 +26,9 @@ so no round-trip library is needed. A block node's end mark runs past its
 trailing comments and the next entry's indentation, so a span ends at the
 last character of the node's own content instead, plus a comment that ends
 its last line. The blank lines after a keep-chomped block scalar (``|+``)
-are its content, so they move with it.
+are its content, so they move with it. A node's start mark is at its tag or
+anchor, when it has one: written on its key's line, the ref takes the key's
+line, as a flow mapping.
 """
 
 from __future__ import annotations
@@ -140,6 +142,10 @@ def _span(
     if is_text or isinstance(node, yaml.ScalarNode) or node.flow_style:
         return start, end, flow
     end = _with_trailing_comment(text, end)
+    if key is not None and node.start_mark.line == key.start_mark.line:
+        # A tag or an anchor on the key's line ("key: &a", the mapping below):
+        # they go to the fragment with the rest, and the ref takes their place.
+        return start, end, flow
     if key is not None and node.start_mark.column <= key.start_mark.column:
         # A block sequence at its key's own indentation ("key:\n- item"): a
         # mapping in its place must sit deeper than the key.
@@ -219,14 +225,26 @@ def _value(document: Any, path: Sequence[Any]) -> Any:
 def _fragment(text: str, cut: _Cut) -> str:
     """A YAML part's file: its text, moved to column 0, under its header."""
     body = _render(text, cut.start, cut.end, cut.children)
-    column = cut.node.start_mark.column
     lines = body.split("\n")
+    column = cut.node.start_mark.column
+    if text.startswith(("&", "!"), cut.start) and not isinstance(cut.node, yaml.ScalarNode):
+        # A tag or an anchor starts the part: its entries are indented as
+        # the first line after it that is not blank or a comment.
+        column = next((_width(line) for line in lines[1:] if _is_content(line)), column)
     lines[1:] = [_dedent(line, column) for line in lines[1:]]
     newline = "\r\n" if "\r\n" in text else "\n"
     header = cut.site.header.replace("\n", newline) + newline if cut.site.header else ""
     return header + "\n".join(lines).rstrip("\r") + newline
 
 
+def _is_content(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped) and not stripped.startswith("#")
+
+
+def _width(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
 def _dedent(line: str, column: int) -> str:
-    width = len(line) - len(line.lstrip(" "))
-    return line[min(width, column) :]
+    return line[min(_width(line), column) :]

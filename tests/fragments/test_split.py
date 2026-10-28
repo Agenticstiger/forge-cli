@@ -1912,18 +1912,87 @@ def test_i24_a_root_that_is_itself_a_ref_has_nothing_that_moves_or_only_its_own_
     ],
     ids=["tag-on-a-section", "unused-anchor-on-a-section", "unused-anchor-on-an-extension"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-06: a tag or an unused anchor between a key and its block mapping puts the mapping "
-    "on the key's line, so the splice writes 'key: $ref: ...', which does not parse; split "
-    "refuses instead of falling back to a data split as it does when an alias is used",
-)
 def test_i24_a_tag_or_an_unused_anchor_on_a_moved_section_splits(
     tmp_path: Path, text: str, parts: Optional[str]
 ) -> None:
     pair = solo(tmp_path, text)
 
     split_and_check(pair, parts)
+
+
+@pytest.mark.parametrize(
+    "text,parts,target,root_line,body",
+    [
+        (
+            "# header\nid: x\nsovereignty: !!map\n  jurisdiction: EU  # kept\n",
+            None,
+            "fragments/sovereignty.yaml",
+            "\nsovereignty: {$ref: ./fragments/sovereignty.yaml}\n",
+            "!!map\njurisdiction: EU  # kept\n",
+        ),
+        (
+            "# header\nid: x\nsovereignty: &s  # after the anchor\n  jurisdiction: EU\n",
+            None,
+            "fragments/sovereignty.yaml",
+            "\nsovereignty: {$ref: ./fragments/sovereignty.yaml}\n",
+            "&s  # after the anchor\njurisdiction: EU\n",
+        ),
+        (
+            "# header\nid: x\nexposes:\n  - exposeId: o\n    contract:\n      schema: !!seq\n"
+            "        - {name: a, type: string}\n",
+            "schema",
+            "fragments/schemas/o.yaml",
+            "\n      schema: {$ref: ./fragments/schemas/o.yaml}\n",
+            "!!seq\n- {name: a, type: string}\n",
+        ),
+        (
+            "# header\nid: x\nbuilds:\n  - &b\n    id: b\n    engine: sql\n",
+            None,
+            "fragments/builds/b.yaml",
+            "\n  - $ref: ./fragments/builds/b.yaml\n",
+            "&b\nid: b\nengine: sql\n",
+        ),
+        (
+            # The entries are indented as their own lines are, not as the anchor
+            # is: a block scalar under them keeps its indentation.
+            "# header\nid: x\nsovereignty: &s\n  jurisdiction: EU\n  note: |  # head\n"
+            "    kept as written\n",
+            None,
+            "fragments/sovereignty.yaml",
+            "\nsovereignty: {$ref: ./fragments/sovereignty.yaml}\n",
+            "&s\njurisdiction: EU\nnote: |  # head\n  kept as written\n",
+        ),
+        (
+            "# header\nid: x\nbuilds:\n  - &b\n      id: b\n      properties:\n        sql: |\n"
+            "          SELECT 1\n",
+            None,
+            "fragments/builds/b.yaml",
+            "\n  - $ref: ./fragments/builds/b.yaml\n",
+            "&b\nid: b\nproperties:\n  sql: |\n    SELECT 1\n",
+        ),
+    ],
+    ids=[
+        "tag",
+        "anchor-and-a-comment",
+        "tag-on-a-list",
+        "anchor-on-a-list-item",
+        "anchor-over-a-block-scalar",
+        "anchor-over-deeper-entries",
+    ],
+)
+def test_i24_a_tag_or_an_anchor_moves_with_its_part_and_the_ref_takes_the_key_line(
+    tmp_path: Path, text: str, parts: Optional[str], target: str, root_line: str, body: str
+) -> None:
+    """Finding SP-06: the text is spliced, so every comment is kept (no data-split
+    fallback). The tag or anchor, and the rest of its line, start the fragment."""
+    pair = solo(tmp_path, text)
+
+    after = split_and_check(pair, parts)
+
+    assert root_line in text_of(after, NAME)
+    assert text_of(after, NAME).startswith("# header\n")
+    assert text_of(after, target).split("\n\n", 1)[1] == body
+    assert_comments_conserved(text, after)
 
 
 # ── I-25 / I-26: line ends, byte-order mark, the end of the file ────────
