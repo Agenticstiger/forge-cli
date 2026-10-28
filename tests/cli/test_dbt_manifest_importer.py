@@ -340,6 +340,9 @@ class TestEveryContractValidates:
         contract, _ = DbtManifestImporter().import_to_contract(str(_project_dir(tmp_path)))
         out = tmp_path / "contract.fluid.yaml"
         out.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+        # The composition rule scans the contract's workspace for its upstreams, up to
+        # the first boundary; without one it climbs over every test's temp directory.
+        (tmp_path / ".git").mkdir()
         proc = subprocess.run(
             [sys.executable, "-m", "fluid_build.cli", "validate", str(out)],
             cwd=str(tmp_path),
