@@ -168,9 +168,11 @@ def _content_end(text: str, node: Any) -> int:
 
 
 def _with_trailing_comment(text: str, end: int) -> int:
-    """``end``, moved over a comment that ends the same line."""
+    """``end``, moved over a comment that ends the same line, not over its line break."""
     newline = text.find("\n", end)
     line_end = len(text) if newline < 0 else newline
+    if line_end > end and text[line_end - 1] == "\r":
+        line_end -= 1
     rest = text[end:line_end]
     return line_end if rest.strip().startswith("#") else end
 

@@ -1910,11 +1910,9 @@ def test_i24_a_tag_or_an_unused_anchor_on_a_moved_section_splits(
 
 # ── I-25 / I-26: line ends, byte-order mark, the end of the file ────────
 
-#: SPLIT-ALL with CRLF line ends, minus the one comment that ends a moved block
+#: SPLIT-ALL with CRLF line ends, the comment that ends a moved block included
 #: (see ``test_i25_a_comment_ending_a_moved_block...``, finding SP-01).
-SPLIT_ALL_CRLF = SPLIT_ALL.replace(
-    "  dataResidency: true       # trailing comment on its last line\n", "  dataResidency: true\n"
-).replace("\n", "\r\n")
+SPLIT_ALL_CRLF = SPLIT_ALL.replace("\n", "\r\n")
 
 
 def assert_one_line_end(files: Mapping[str, bytes], crlf: bool = True) -> None:
@@ -1963,11 +1961,6 @@ COMMENT_ENDS_MOVED_BLOCK = (
     ],
     ids=["root", "nested-fragment"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-01: a trailing comment on the last line of a moved block takes that line's CR "
-    "with it, so the $ref line that replaces it ends in a bare LF in a CRLF file",
-)
 def test_i25_a_comment_ending_a_moved_block_in_a_crlf_root_keeps_crlf(
     tmp_path: Path, text: str, parts: Optional[str], where: str
 ) -> None:
@@ -1994,7 +1987,6 @@ def test_i25_a_comment_ending_a_moved_block_still_moves_with_it_in_a_crlf_root(
 @pytest.mark.parametrize("line_end", ["\r\n", "\n"], ids=["crlf", "lf"])
 def test_i25_a_byte_order_mark_is_kept(tmp_path: Path, line_end: str) -> None:
     text = "﻿" + SPLIT_ALL.replace("\n", line_end)
-    text = text.replace("       # trailing comment on its last line", "")
     pair = make_pair(tmp_path, {NAME: text.encode("utf-8"), "overlays/prod.yaml": PROD_OVERLAY})
 
     after = split_and_check(pair, ALL_PARTS, envs=(None, "prod"), cli_envs=(None,))
@@ -3141,7 +3133,7 @@ def generated_root(seed: int) -> Tuple[str, List[str], bool]:
     rng = random.Random(seed)
     crlf = rng.random() < 0.3
     for _ in range(50):
-        text = _with_comments(_render(_generated_contract(rng), rng), rng, trailing=not crlf)
+        text = _with_comments(_render(_generated_contract(rng), rng), rng, trailing=True)
         try:
             yaml.safe_load(text)
         except yaml.YAMLError:
