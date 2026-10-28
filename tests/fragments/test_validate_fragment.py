@@ -800,3 +800,21 @@ def test_the_contract_lookup_stops_at_the_fragments_repository(tmp_path: Path) -
     assert _nearest_contract(fragment) is None
     (repo / "contract.fluid.yaml").write_text("id: inner\n", encoding="utf-8")
     assert _nearest_contract(fragment) == (repo / "contract.fluid.yaml").resolve()
+
+
+def test_a_contract_in_a_home_or_temp_root_is_never_a_fragments_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Outside any repository the walk stops before a home directory, a temp root or ``/``:
+    a contract lying there belongs to no fragment below it."""
+    from fluid_build.cli.validate import _nearest_contract
+    from fluid_build.providers import _duckdb_sandbox
+
+    home = (tmp_path / "home").resolve()
+    (home / "Downloads").mkdir(parents=True)
+    (home / "contract.fluid.yaml").write_text("id: anyone\n", encoding="utf-8")
+    fragment = home / "Downloads" / "x.yaml"
+    fragment.write_text("a: 1\n", encoding="utf-8")
+    monkeypatch.setattr(_duckdb_sandbox, "_home_dirs", lambda: (str(home),))
+
+    assert _nearest_contract(fragment) is None

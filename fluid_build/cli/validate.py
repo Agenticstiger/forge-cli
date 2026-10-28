@@ -512,7 +512,7 @@ def _run_fragment_validation(
     """
     import fluid_build.cli.validate as _self
     from fluid_build import contract_refs, loader
-    from fluid_build.util.ref_confinement import RefConfinementError, is_within
+    from fluid_build.util.ref_confinement import RefResolutionError, is_within
 
     kind = args.fragment
     if getattr(args, "env", None):
@@ -550,7 +550,7 @@ def _run_fragment_validation(
             else loader._RefRoot(fragment.resolve().parent)
         )
         if not is_within(fragment.resolve(), root.ref_root):
-            raise RefConfinementError(
+            raise RefResolutionError(
                 f"fragment {fragment} is outside the ref root of its contract {contract} "
                 f"({root.ref_root}): a fragment is checked under the root its contract has"
             )
@@ -602,19 +602,28 @@ def _nearest_contract(fragment: Path) -> Optional[Path]:
     It chooses the fragment's ref root, so a symlink is never taken for it (the
     CLI refuses a symlinked contract path for the same reason: a planted link
     would point the root anywhere), and the walk stops at the fragment's
-    repository or workspace (a directory holding ``.git`` or
-    ``fluid.workspace.yaml``), so an unrelated contract higher up, in a home
-    directory say, cannot widen it.
+    repository or workspace (a directory holding ``.git``, ``.hg``, ``.svn`` or
+    ``fluid.workspace.yaml``), and before a home directory, a temp root or
+    ``/`` (the vetting a workspace ``ref_root`` gets), so an unrelated contract
+    higher up cannot widen it.
     """
+    from fluid_build.providers._duckdb_sandbox import broad_root_reason
+
     start = fragment.resolve()
     for directory in start.parents:
+        if broad_root_reason(directory) is not None:
+            return None
         for name in _CONTRACT_FILE_NAMES:
             candidate = directory / name
             if candidate != start and not candidate.is_symlink() and candidate.is_file():
                 return candidate
-        if (directory / ".git").exists() or (directory / "fluid.workspace.yaml").is_file():
+        if any((directory / marker).exists() for marker in _REPOSITORY_MARKERS):
             return None
     return None
+
+
+#: A directory holding one of these is the top of a fragment's repository or workspace.
+_REPOSITORY_MARKERS = (".git", ".hg", ".svn", "fluid.workspace.yaml")
 
 
 def _contract_version(contract: Optional[Path]) -> Optional[str]:
