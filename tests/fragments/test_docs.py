@@ -555,11 +555,6 @@ def test_j04_the_error_rows_name_the_file_and_what_failed(tmp_path: Path) -> Non
     assert sorted(r["id"] for r in good) == ["good.a", "good.d"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG DOCS-HTML-ROW: index.html links a contract that failed to load to "
-    "contract-contract.html, a page the run never writes, and shows no error for it",
-)
 def test_j04_every_page_the_html_index_links_to_exists(tmp_path: Path) -> None:
     _batch(tmp_path / "src")
     out = tmp_path / "site"
@@ -591,6 +586,36 @@ def test_f23_docs_src_lists_a_root_contract_of_each_suffix_and_never_its_overlay
     assert _docs(src, out, src=True) == 0
 
     assert [Path(r["path"]).name for r in _index(out)] == [f"contract.fluid{suffix}"]
+
+
+def test_j04_a_contract_that_failed_has_a_row_in_the_html_index_that_says_why(
+    tmp_path: Path,
+) -> None:
+    dirs = _batch(tmp_path / "src")
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    page = (out / "index.html").read_text("utf-8")
+    failed = re.findall(r'<tr class="error".*?</tr>', page, re.S)
+
+    assert len(failed) == 2
+    for row, directory in zip(failed, (dirs["B"], dirs["C"]), strict=True):  # in path order
+        assert "<a " not in row, "a row with no page has no link"
+        assert f"{directory.name}/contract.fluid.yaml" in row
+    assert "./missing.yaml" in failed[0] and "not loaded:" in failed[1]
+    assert page.count("<tr ") == 4  # one row per contract; the header row has no attributes
+
+
+def test_j04_the_error_of_a_row_is_escaped_in_the_html_index(tmp_path: Path) -> None:
+    _put(tmp_path / "ok" / "contract.fluid.yaml", _min_doc("ok.one"))
+    _write(tmp_path / "bad" / "contract.fluid.yaml", "fluidVersion: <script>alert(1)</script>: [\n")
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    page = (out / "index.html").read_text("utf-8")
+    assert "<script>alert(1)" not in page
+    assert _elements(page).tags.count("script") == 1  # the filter's own
 
 
 # ── J-05 ────────────────────────────────────────────────────────────────

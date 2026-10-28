@@ -168,10 +168,15 @@ def _load_contract_quiet(path: str, logger: logging.Logger) -> tuple[Any, Any]:
 
 
 def _unique_slugs(entries: list[dict[str, Any]]) -> dict[str, str]:
-    """A page slug per contract path, in index order, with no two the same."""
+    """A page slug per contract path, in index order, with no two the same.
+
+    A row with an ``error`` has no page, so it takes no page name.
+    """
     taken: set[str] = set()
     out: dict[str, str] = {}
     for entry in entries:
+        if entry.get("error"):
+            continue
         base = entry.get("slug") or "contract"
         slug, n = base, 1
         while slug in taken:
@@ -244,6 +249,9 @@ def _render_index_html(entries: list[dict[str, Any]]) -> str:
     """
     rows = []
     for e in entries:
+        if e.get("error"):
+            rows.append(_error_row_html(e))
+            continue
         tags = e.get("tags") or []
         tag_html = (
             " ".join(f'<span class="tag">{html.escape(str(t))}</span>' for t in tags)
@@ -295,6 +303,20 @@ def _render_index_html(entries: list[dict[str, Any]]) -> str:
         else ('<tr><td colspan="10" class="empty">No contracts found.</td></tr>')
     )
     return _INDEX_HTML_TEMPLATE.format(count=len(entries), rows=rows_html)
+
+
+def _error_row_html(entry: dict[str, Any]) -> str:
+    """The row of a contract that is in the catalog without a page: what went
+    wrong with it, in place of the cells it has no values for, and no link."""
+    path, error = str(entry.get("path", "")), str(entry.get("error"))
+    search = html.escape(f"{error} {path}".lower())
+    return (
+        f'<tr class="error" data-search="{search}">'
+        "<td>—</td>"
+        f'<td colspan="8" class="error">{html.escape(error)}</td>'
+        f"<td><code>{html.escape(path)}</code></td>"
+        "</tr>"
+    )
 
 
 def _render_contract_html(contract: Mapping[str, Any], path: str) -> str:
@@ -437,6 +459,7 @@ _BASE_STYLE = """
           padding: 0.05rem 0.35rem; border-radius: 3px; font-size: 0.75rem;
           font-weight: 600; }}
   .empty {{ text-align: center; color: #57606a; padding: 2rem; }}
+  td.error {{ color: #b91c1c; }}
   .search {{ width: 100%; max-width: 30rem; padding: 0.4rem 0.6rem;
              border: 1px solid #d0d7de; border-radius: 6px;
              font-size: 0.9rem; margin-bottom: 1rem; }}
