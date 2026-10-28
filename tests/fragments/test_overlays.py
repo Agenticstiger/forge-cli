@@ -2038,3 +2038,26 @@ def test_an_overlay_value_over_a_base_pointer(tmp_path: Path, patch: str, refuse
         expose = compose_contract(tmp_path / "contract.fluid.yaml", "prod").document["exposes"][0]
         key, _, value = patch.partition(": ")
         assert expose[key] == yaml.safe_load(value)
+
+
+def test_an_overlay_pointer_over_a_base_list_of_objects_is_refused(tmp_path: Path) -> None:
+    """Inline, the list a pointer names merges into the base's by id; resolved after the
+    merge, it could only replace it, dropping entries. Refused, naming the overlay."""
+    from fluid_build.loader import compose_contract
+    from fluid_build.util.ref_confinement import RefResolutionError
+
+    (tmp_path / "contract.fluid.yaml").write_text(
+        'fluidVersion: "0.7.6"\nkind: DataProduct\nid: d.p\n'
+        "builds:\n  - {id: a, engine: sql}\n  - {id: b, engine: sql}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "overlays").mkdir()
+    overlay = tmp_path / "overlays" / "prod.yaml"
+    overlay.write_text(
+        'extensions: {prodBuilds: [{id: b, engine: dbt}]}\nbuilds: {$ref: "#/extensions/prodBuilds"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RefResolutionError) as err:
+        compose_contract(tmp_path / "contract.fluid.yaml", "prod")
+    assert "the list of objects" in str(err.value) and "prod.yaml" in str(err.value)

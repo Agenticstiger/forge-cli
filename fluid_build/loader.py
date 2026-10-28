@@ -278,6 +278,10 @@ def _deep_merge(
             # that exists only after the merge. A list of plain values replaces
             # it, as it replaces the value written inline.
             raise _merge_over_pointer(base[k], (*_at, k), "patches a list of objects")
+        if k in base and is_pointer_node(v) and _object_list(base[k]):
+            # Inline, the list it names would be merged into the base's by id or
+            # by position; resolved after the merge, it could only replace it.
+            raise _pointer_merged(v, (*_at, k), _trace, "the list of objects")
         if k in base and isinstance(base[k], dict) and isinstance(v, dict):
             base[k] = _merge_object(base[k], v, (*_at, k), _trace)
         elif (
@@ -341,13 +345,13 @@ def _object_list(value: Any) -> bool:
 
 
 def _pointer_merged(
-    node: Dict[str, Any], at: _Place, trace: Optional[ComposeTrace]
+    node: Dict[str, Any], at: _Place, trace: Optional[ComposeTrace], what: str = "the object"
 ) -> RefResolutionError:
-    """The refusal of the overlay pointer ``node`` over the base's object at ``at``,
-    named where it was written when ``trace`` knows it."""
+    """The refusal of the overlay pointer ``node`` over the base's object (or list
+    of objects, ``what``) at ``at``, named where it was written when ``trace`` knows it."""
     site = trace.pointer_site(node) if trace is not None else None
     written = ref_location(format_pointer(site[1]), site[0]) if site else "in the overlay"
-    into = f"the object the base contract has at '{format_pointer(at)}'" if at else "the base"
+    into = f"{what} the base contract has at '{format_pointer(at)}'" if at else "the base"
     return pointer_merge_error(node, written, into)
 
 
@@ -1308,7 +1312,13 @@ def _compose(
         }
         # The trace names a refused pointer where it was written (the overlay,
         # or a fragment of it) and keeps the pointers a pointer replaced.
-        composed = _deep_merge(composed, layer, _trace=trace)
+        try:
+            composed = _deep_merge(composed, layer, _trace=trace)
+        except RefResolutionError as exc:
+            # Name the overlay a refusal is about, when the message cannot.
+            if overlay_source is None or str(overlay_source) in str(exc):
+                raise
+            raise RefResolutionError(f"merging the overlay {overlay_source}: {exc}") from exc
         if trace.origins is not None:
             _note_overlay_origins(
                 trace.origins, layer, layer_origins, composed, overlay_source, lengths
