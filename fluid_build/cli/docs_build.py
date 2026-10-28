@@ -23,7 +23,7 @@ import os
 import re
 from typing import Any, Mapping
 
-from ._common import CLIError
+from ._common import CLIError, load_contract_with_overlay
 from ._logging import info
 
 COMMAND = "docs"
@@ -57,10 +57,12 @@ def run(args, logger: logging.Logger) -> int:
         paths = _resolve_contract_paths(args)
         # Load full contracts once so we can render both summaries and
         # per-contract drill-in pages without re-parsing.
-        loaded = [(p, _load_contract_quiet(p)) for p in paths]
-        entries = [_summarize_contract(p, c) for p, c in loaded]
+        loaded = [(p, *_load_contract_quiet(p, logger)) for p in paths]
+        entries = [_summarize_contract(p, c, error) for p, c, error in loaded]
         # Sort by id for deterministic output.
         entries.sort(key=lambda e: (e.get("id") or "", e.get("path", "")))
+        # Two contracts with one id would write one page; each gets its own.
+        slugs = _unique_slugs(entries)
 
         # JSON index (machine-readable; existing consumers depend on it).
         index_json_path = os.path.join(args.out, "index.json")
@@ -75,13 +77,18 @@ def run(args, logger: logging.Logger) -> int:
         # Per-contract drill-in pages. Slug derived from the contract id
         # (falls back to a path hash). Each page links back to the index.
         pages_written = 0
-        for path, contract in loaded:
+        for path, contract, _error in loaded:
             if not isinstance(contract, Mapping):
                 continue
-            slug = _slug_for(contract, path)
-            page_path = os.path.join(args.out, f"contract-{slug}.html")
+            page_path = os.path.join(args.out, f"contract-{slugs[path]}.html")
+            # Rendered before the file is opened: a contract that cannot be
+            # rendered leaves the page it had, not an empty one.
+            try:
+                page = _render_contract_html(contract, path)
+            except Exception as exc:  # noqa: BLE001 - one bad contract, not the catalog
+                raise ValueError(f"{path}: {exc}") from exc
             with open(page_path, "w", encoding="utf-8") as f:
-                f.write(_render_contract_html(contract, path))
+                f.write(page)
             pages_written += 1
 
         info(
@@ -109,10 +116,14 @@ def _resolve_contract_paths(args) -> list[str]:
     return sorted(glob.glob(f"{args.src}/**/contract.fluid.*", recursive=True))
 
 
-def _summarize_contract(path: str, contract: Any) -> dict[str, Any]:
-    """Parse a contract file and extract a small set of header fields for the index."""
+def _summarize_contract(path: str, contract: Any, error: Any = None) -> dict[str, Any]:
+    """Extract a small set of header fields for the index.
+
+    The JSON keeps the contract's own values (``description`` and ``owner``
+    may be objects); the HTML renders them as text.
+    """
     if not isinstance(contract, Mapping):
-        return {"path": path, "id": None, "error": "not a mapping"}
+        return {"path": path, "id": None, "error": error or "not a mapping"}
 
     metadata = contract.get("metadata") if isinstance(contract.get("metadata"), Mapping) else {}
     return {
@@ -123,43 +134,81 @@ def _summarize_contract(path: str, contract: Any) -> dict[str, Any]:
         "description": contract.get("description"),
         "fluidVersion": contract.get("fluidVersion"),
         "kind": contract.get("kind"),
-        "owner": metadata.get("owner") if isinstance(metadata, Mapping) else None,
-        "domain": metadata.get("domain") if isinstance(metadata, Mapping) else None,
-        "layer": metadata.get("layer") if isinstance(metadata, Mapping) else None,
-        "productType": metadata.get("productType") if isinstance(metadata, Mapping) else None,
-        "tags": metadata.get("tags") if isinstance(metadata, Mapping) else None,
+        "owner": metadata.get("owner"),
+        "domain": contract.get("domain") or metadata.get("domain"),
+        "layer": metadata.get("layer"),
+        "productType": metadata.get("productType"),
+        "tags": contract.get("tags") or metadata.get("tags"),
         "exposes_count": len(contract.get("exposes") or []),
         "consumes_count": len(contract.get("consumes") or []),
     }
 
 
-def _load_contract_quiet(path: str) -> Any:
-    """Load a contract without env overlays or alias normalization.
+def _load_contract_quiet(path: str, logger: logging.Logger) -> tuple[Any, Any]:
+    """``(contract, error)``: the contract as every command reads it, without an env.
 
-    The docs index is a read-only summary surface, so we don't need the
-    full loader pipeline — just parse the YAML / JSON and read the headers.
+    Through the loader ``fluid validate`` uses, so a contract split into
+    fragments is read whole (``$ref`` resolved), and YAML goes through its
+    size and alias guard. A contract that cannot be loaded is reported in its
+    index row and gets no page; the rest of the catalog is still written.
     """
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
-    except OSError:
-        return None
-    if path.lower().endswith((".yaml", ".yml")):
-        try:
-            import yaml
+        return load_contract_with_overlay(path, None, logger), None
+    except Exception as exc:  # noqa: BLE001 - one bad contract, not the catalog
+        logger.debug("docs_contract_skipped: %s: %s", path, exc)
+        return None, f"not loaded: {exc}"
 
-            return yaml.safe_load(text)
-        except Exception:
-            return None
-    if path.lower().endswith(".json"):
-        try:
-            return json.loads(text)
-        except Exception:
-            return None
-    return None
+
+def _unique_slugs(entries: list[dict[str, Any]]) -> dict[str, str]:
+    """A page slug per contract path, in index order, with no two the same."""
+    taken: set[str] = set()
+    out: dict[str, str] = {}
+    for entry in entries:
+        base = entry.get("slug") or "contract"
+        slug, n = base, 1
+        while slug in taken:
+            n += 1
+            slug = f"{base}-{n}"
+        taken.add(slug)
+        out[entry["path"]] = slug
+        if "slug" in entry:
+            entry["slug"] = slug
+    return out
+
+
+def _text(value: Any) -> str:
+    """A value as display text: an owner object as ``team (email)``."""
+    if isinstance(value, Mapping):
+        team, email = value.get("team") or value.get("name"), value.get("email")
+        if team or email:
+            return f"{team} ({email})" if team and email else str(team or email)
+        return ", ".join(f"{k}: {v}" for k, v in value.items())
+    return "" if value is None else str(value)
+
+
+def _description_html(description: Any) -> str:
+    """A description as HTML: a string as one paragraph, the 0.7.6 object
+    (purpose, usage, limitations) one labelled paragraph per part."""
+    if isinstance(description, Mapping):
+        parts = []
+        for key in ("purpose", "usage", "limitations"):
+            if description.get(key):
+                label = html.escape(key.capitalize())
+                parts.append(
+                    f"<p><strong>{label}:</strong> {html.escape(str(description[key]))}</p>"
+                )
+        return "\n".join(parts)
+    return f"<p>{html.escape(str(description))}</p>" if description else ""
 
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _description_text(description: Any) -> str:
+    """A description as plain text, for the search filter."""
+    if isinstance(description, Mapping):
+        return " ".join(str(v) for v in description.values() if v)
+    return "" if description is None else str(description)
 
 
 def _slug_for(contract: Mapping[str, Any], path: str) -> str:
@@ -207,11 +256,11 @@ def _render_index_html(entries: list[dict[str, Any]]) -> str:
             for x in [
                 eid,
                 ename,
-                e.get("owner"),
+                _text(e.get("owner")),
                 e.get("domain"),
                 layer,
                 product_type,
-                e.get("description"),
+                _description_text(e.get("description")),
                 " ".join(tags) if isinstance(tags, list) else "",
                 e.get("path"),
             ]
@@ -224,7 +273,7 @@ def _render_index_html(entries: list[dict[str, Any]]) -> str:
             f"<td>{html.escape(str(ename))}</td>"
             f"<td>{html.escape(str(layer))}</td>"
             f"<td>{html.escape(str(product_type))}</td>"
-            f"<td>{html.escape(str(e.get('owner') or '—'))}</td>"
+            f"<td>{html.escape(_text(e.get('owner')) or '—')}</td>"
             f"<td>{html.escape(str(e.get('domain') or '—'))}</td>"
             f"<td>{e.get('exposes_count', 0)}</td>"
             f"<td>{e.get('consumes_count', 0)}</td>"
@@ -246,6 +295,7 @@ def _render_contract_html(contract: Mapping[str, Any], path: str) -> str:
     cid = contract.get("id") or "—"
     cname = contract.get("name") or cid
     description = contract.get("description") or ""
+    domain = contract.get("domain") or metadata.get("domain")
 
     # --- Header metadata block ---
     meta_rows = []
@@ -254,8 +304,8 @@ def _render_contract_html(contract: Mapping[str, Any], path: str) -> str:
         ("Name", cname),
         ("Fluid version", contract.get("fluidVersion")),
         ("Kind", contract.get("kind")),
-        ("Owner", metadata.get("owner") if isinstance(metadata, Mapping) else None),
-        ("Domain", metadata.get("domain") if isinstance(metadata, Mapping) else None),
+        ("Owner", _text(metadata.get("owner")) or None),
+        ("Domain", domain),
         ("Layer", metadata.get("layer") if isinstance(metadata, Mapping) else None),
         ("Product type", metadata.get("productType") if isinstance(metadata, Mapping) else None),
         ("Source path", path),
@@ -282,7 +332,9 @@ def _render_contract_html(contract: Mapping[str, Any], path: str) -> str:
     for c in consumes:
         if not isinstance(c, Mapping):
             continue
-        ref = c.get("ref") or c.get("productId") or c.get("provider") or c.get("id") or "—"
+        ref = c.get("productId") or c.get("ref") or c.get("provider") or c.get("id") or "—"
+        if c.get("productId") and c.get("exposeId"):
+            ref = f"{c['productId']}/{c['exposeId']}"
         consumes_rows.append(f"<li><code>{html.escape(str(ref))}</code></li>")
     consumes_html = (
         "<ul>" + "\n".join(consumes_rows) + "</ul>"
@@ -293,23 +345,38 @@ def _render_contract_html(contract: Mapping[str, Any], path: str) -> str:
     return _CONTRACT_HTML_TEMPLATE.format(
         title=html.escape(str(cname)),
         cid=html.escape(str(cid)),
-        description=html.escape(description),
+        description=_description_html(description),
         meta_rows=meta_html,
         exposes=exposes_html,
         consumes=consumes_html,
     )
 
 
+#: Column sensitivities that mark personal data.
+_PERSONAL_DATA = frozenset({"pii", "phi"})
+
+
+def _columns(expose: Mapping[str, Any]) -> list[Any]:
+    """An expose's columns: ``contract.schema`` (0.7.x), else a legacy top-level ``schema``."""
+    contract = expose.get("contract")
+    if isinstance(contract, Mapping) and isinstance(contract.get("schema"), list):
+        return contract["schema"]
+    legacy = expose.get("schema")
+    return legacy if isinstance(legacy, list) else []
+
+
 def _render_expose_html(expose: Mapping[str, Any], idx: int) -> str:
-    eid = expose.get("id") or expose.get("exposeId") or f"expose-{idx}"
+    eid = expose.get("exposeId") or expose.get("id") or expose.get("name") or f"expose-{idx}"
     schema_rows = []
-    for col in expose.get("schema") or []:
+    for col in _columns(expose):
         if not isinstance(col, Mapping):
             continue
-        nullable = "yes" if col.get("nullable", True) is not False else "no"
-        pii_marker = (
-            '<span class="pii" aria-label="contains PII">PII</span>' if col.get("pii") else ""
-        )
+        if "required" in col:
+            nullable = "no" if col.get("required") else "yes"
+        else:
+            nullable = "yes" if col.get("nullable", True) is not False else "no"
+        personal = col.get("pii") or col.get("sensitivity") in _PERSONAL_DATA
+        pii_marker = '<span class="pii" aria-label="contains PII">PII</span>' if personal else ""
         schema_rows.append(
             "<tr>"
             f"<td><code>{html.escape(str(col.get('name', '—')))}</code></td>"
@@ -430,7 +497,7 @@ _CONTRACT_HTML_TEMPLATE = (
 <a href="index.html" class="back-link">&larr; Back to catalog</a>
 <h1>{title}</h1>
 <p class="meta"><code>{cid}</code></p>
-<p>{description}</p>
+{description}
 
 <h2>Metadata</h2>
 <table aria-label="Contract metadata">
