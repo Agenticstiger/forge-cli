@@ -71,8 +71,11 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
   and a self-signed certificate are already refused on both engines, with and
   without ``enable_server_cert_verification``, which is the httplib flag while
   s3 and https go through curl (duckdb/duckdb-httpfs#378 unified the two).
-  Plain ``http://`` never needed the grant: duckdb/duckdb-httpfs#499 made a
-  failed bundle load non-fatal there, and 2.0.0 carries it.
+  Plain ``http://`` did not need the grant -- duckdb/duckdb-httpfs#499 made a
+  failed bundle load non-fatal there, and 2.0.0 carries it -- but it gets one
+  anyway, because the prefix is what is declared and an http base URL that
+  redirects to https still verifies (which is #499's own reason for loading the
+  bundle on that path).
 * DuckDB folds its ``temp_directory`` into ``allowed_directories``, and its
   default is relative: ``.tmp`` in the working directory, or ``<db>.tmp``
   beside a file database. Both sit where the contract's repository can place a
@@ -1325,10 +1328,16 @@ def sandbox_refusal_hint(allow: DuckDBAllowlist, refusal: Optional[BaseException
         )
     granted = [*allow.dirs, *allow.paths, *allow.remote_prefixes]
     where = ", ".join(granted) if granted else "nothing (in-memory only)"
+    # Named because it is readable, not because anyone declared it: a remote read
+    # also grants the host's trust store (:func:`_ca_bundle_for_remote`), so
+    # "only the locations the contract declares" would be false here. Left out
+    # when there is no remote prefix, where it would be noise on every refusal.
+    bundle = _ca_bundle_for_remote(allow)
+    also = f", and the TLS trust store a remote read needs ({bundle})" if bundle else ""
     return (
         "DuckDB refused it: contract SQL may only read and write the locations the "
-        f"contract declares and its own directory ({where}). Declare the file as an "
-        "input under the contract's directory or workspace, or move it there "
+        f"contract declares and its own directory ({where}){also}. Declare the file as "
+        "an input under the contract's directory or workspace, or move it there "
         f"(the operator can allow another directory with {OPERATOR_DIRS_ENV})."
     )
 

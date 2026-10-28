@@ -196,50 +196,99 @@ def test_the_grant_is_one_file_and_not_a_directory() -> None:
 def test_the_allowlist_the_caller_passed_is_not_widened() -> None:
     """The grant is appended at ``SET`` time, not folded into ``allow``.
 
-    So a refusal hint lists what the contract declared and not a trust store
-    the operator never mentioned.
+    The allowlist object is what every other caller reads, so widening it would
+    make a declared-inputs list grow a path nobody declared.
+
+    The refusal hint is the one place that must still own up to it: it tells the
+    user what contract SQL may read, and with a remote prefix declared that
+    includes the trust store. Saying "only the locations the contract declares"
+    there was false -- ``test_duckdb_can_read_the_bundle_it_was_granted`` proves
+    SQL can read the file. Found by the defect scan on this commit.
     """
-    _host_bundle()
+    bundle = _host_bundle()
     allow = DuckDBAllowlist.none().with_locations(REMOTE)
 
     con = secure_duckdb_connect(":memory:", allow=allow)
     try:
         assert allow.paths == ()
-        assert "ssl" not in sandbox_refusal_hint(allow)
+        assert bundle in sandbox_refusal_hint(allow)
     finally:
         con.close()
+
+
+def test_a_local_refusal_hint_says_nothing_about_a_trust_store() -> None:
+    """No remote prefix, no disclosure: it would be noise on every local refusal."""
+    allow = DuckDBAllowlist.none().with_dirs(os.getcwd())
+
+    assert "trust store" not in sandbox_refusal_hint(allow)
 
 
 # ── which candidate, and in whose order ──────────────────────────────────
 
 
 def test_the_granted_bundle_is_the_first_candidate_that_exists(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Probed in DuckDB's order, so the grant names the file DuckDB opens.
 
     Two candidates present: the earlier one wins. A host that has both
     ``/etc/ssl/certs/ca-certificates.crt`` and ``/etc/ssl/cert.pem`` is
     ordinary on Debian, and granting the later one would leave the read
-    refused on the file DuckDB actually reaches for.
+    refused on the file DuckDB actually reaches for. An absent candidate ahead
+    of both is skipped rather than returned.
+
+    The candidate list is injected rather than ``os.path.isfile`` patched:
+    ``sandbox.os`` IS the stdlib module, so patching its ``isfile`` replaces
+    ``posixpath.isfile`` for pytest and everything else running at the time.
+    With real files on disk this exercises the production probe itself.
     """
-    present = {
-        sandbox._CA_BUNDLE_CANDIDATES[0],
-        sandbox._CA_BUNDLE_CANDIDATES[-1],
-    }
-    monkeypatch.setattr(sandbox.os.path, "isfile", lambda p: p in present)
+    earlier = tmp_path / "earlier-ca-certificates.crt"
+    earlier.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+    later = tmp_path / "later-cert.pem"
+    later.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sandbox,
+        "_CA_BUNDLE_CANDIDATES",
+        (str(tmp_path / "absent.crt"), str(earlier), str(later)),
+    )
 
     allow = DuckDBAllowlist.none().with_locations(REMOTE)
-    assert sandbox._ca_bundle_for_remote(allow) == sandbox._CA_BUNDLE_CANDIDATES[0]
+    assert sandbox._ca_bundle_for_remote(allow) == str(earlier)
 
 
-def test_a_host_with_no_candidate_grants_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_candidate_that_is_not_a_file_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory and a dangling symlink at a candidate path are passed over.
+
+    DuckDB opens a file. Returning a directory would hand ``allowed_paths`` an
+    entry that grants nothing and leave the read refused, and a dangling link
+    the same. ``os.path.isfile`` follows links and answers False for both --
+    pinned here because the fix depends on it.
+    """
+    directory = tmp_path / "dir-shaped.crt"
+    directory.mkdir()
+    dangling = tmp_path / "dangling.pem"
+    dangling.symlink_to(tmp_path / "gone.pem")
+    real = tmp_path / "real-cert.pem"
+    real.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sandbox, "_CA_BUNDLE_CANDIDATES", (str(directory), str(dangling), str(real))
+    )
+
+    allow = DuckDBAllowlist.none().with_locations(REMOTE)
+    assert sandbox._ca_bundle_for_remote(allow) == str(real)
+
+
+def test_a_host_with_no_candidate_grants_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A minimal container or Windows: DuckDB's own refusal is the better message.
 
     Nothing is invented, and the connection still opens -- the failure, if the
     read is attempted, is DuckDB's, naming the paths it looked for.
     """
-    monkeypatch.setattr(sandbox.os.path, "isfile", lambda _p: False)
+    monkeypatch.setattr(sandbox, "_CA_BUNDLE_CANDIDATES", (str(tmp_path / "absent.crt"),))
 
     allow = DuckDBAllowlist.none().with_locations(REMOTE)
     assert sandbox._ca_bundle_for_remote(allow) is None
