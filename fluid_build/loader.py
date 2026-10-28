@@ -324,6 +324,17 @@ def _merge_object(
     return _deep_merge(base, overlay, _root=False, _at=at, _trace=trace)
 
 
+def _refuse_pointer_entries(
+    name: str, base_items: List[Any], identity: Tuple[str, ...], at: _Place
+) -> None:
+    """A keyed merge cannot match a base entry written as a ``#/`` pointer: its id
+    exists only after the merge, so a patch for it would land by position."""
+    for i, item in enumerate(base_items):
+        if is_pointer_node(item):
+            by = " + ".join(identity)
+            raise _merge_over_pointer(item, (*at, i), f"patches '{name}' by {by}")
+
+
 def _object_list(value: Any) -> bool:
     """A non-empty list of objects: what an overlay merges entry by entry."""
     return isinstance(value, list) and bool(value) and all(isinstance(v, dict) for v in value)
@@ -388,10 +399,7 @@ def _merge_dict_list(
     the contract; ``trace`` is :func:`_deep_merge`'s.
     """
     if identity and keyed:
-        for i, item in enumerate(base_items):
-            if is_pointer_node(item):
-                by = " + ".join(identity)
-                raise _merge_over_pointer(item, (*at, i), f"patches '{name}' by {by}")
+        _refuse_pointer_entries(name, base_items, identity, at)
     base_ids = [_item_identity(item, identity) for item in base_items] if identity else []
     overlay_ids = [_item_identity(item, identity) for item in overlay_items] if identity else []
     if identity and keyed and _unique_ids(base_ids):
