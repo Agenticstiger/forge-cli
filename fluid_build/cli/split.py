@@ -150,6 +150,20 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         )
         return 0
 
+    # The split is checked against what the original composes to; one that does
+    # not compose here (a ref that needs FLUID_REF_ROOT, say) cannot be checked,
+    # so it is not split at all, dry run included.
+    from fluid_build.loader import compose_contract
+
+    try:
+        before = compose_contract(contract_path).document
+    except Exception as exc:  # noqa: BLE001 - reported; nothing is written
+        sys.stderr.write(
+            f"❌ Split not written: the contract does not compose here, so its split could "
+            f"not be checked: {exc}\n"
+        )
+        return 1
+
     if dry_run:
         from fluid_build.cli.forge_contract_fragments import describe_fragment_layout
 
@@ -161,7 +175,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     root_text, fragments, lost_comments = _split(contract_path, contract, sites, parts, taken)
     root_out = out_dir / contract_path.name
-    problem = _write_checked(contract_path, root_out, root_text, fragments, out_dir)
+    problem = _write_checked(before, root_out, root_text, fragments, out_dir)
     if problem:
         sys.stderr.write(f"❌ Split not written: {problem}\n")
         return 1
@@ -219,13 +233,14 @@ def _split(
 
 
 def _write_checked(
-    contract_path: Path,
+    before: Dict[str, Any],
     root_out: Path,
     root_text: str,
     fragments: Dict[str, str],
     out_dir: Path,
 ) -> Optional[str]:
-    """Write the split layout, then check it composes to what the original did.
+    """Write the split layout, then check it composes to ``before``, what the
+    original composed to.
 
     Fragments first and the root last, so the contract stays whole until the
     root changes. When the split contract does not compose to the same
@@ -234,10 +249,6 @@ def _write_checked(
     """
     from fluid_build.loader import compose_contract
 
-    try:
-        before: Optional[Dict[str, Any]] = compose_contract(contract_path).document
-    except Exception:  # noqa: BLE001 - an original that does not compose: nothing to compare
-        before = None
     original_root: Optional[str] = None
     if root_out.exists():
         with open(root_out, encoding="utf-8", newline="") as handle:
@@ -254,12 +265,10 @@ def _write_checked(
         root_out.parent.mkdir(parents=True, exist_ok=True)
         with open(root_out, "w", encoding="utf-8", newline="") as handle:
             handle.write(root_text)
-        if before is not None:
-            after = compose_contract(root_out).document
-            if after != before:
-                raise ValueError(
-                    "the split contract does not compose to the original one; nothing was changed"
-                )
+        if compose_contract(root_out).document != before:
+            raise ValueError(
+                "the split contract does not compose to the original one; nothing was changed"
+            )
     except Exception as exc:  # noqa: BLE001 - every failure is taken back
         for path in written:
             path.unlink(missing_ok=True)

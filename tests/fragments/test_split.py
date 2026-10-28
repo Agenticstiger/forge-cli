@@ -1110,7 +1110,8 @@ def test_i13_a_lone_surrogate_in_sql_refuses_the_split_and_keeps_the_root(
 def test_i13_sql_over_the_5_mib_text_cap_in_a_json_root_refuses_the_split(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """SG-32/SG-09 characterisation: a JSON root has no size cap, a text ref does."""
+    """SG-32/SG-09: a root over the 5 MiB cap is refused when it is read, as every file
+    the composition reads is, so split refuses it and changes nothing."""
     big = "x" * (5 * 1024 * 1024 + 10)
     contract = {"id": "x", "builds": [{"id": "t", "engine": "sql", "properties": {"sql": big}}]}
     pair = solo(tmp_path, json.dumps(contract), name="contract.fluid.json")
@@ -1118,7 +1119,8 @@ def test_i13_sql_over_the_5_mib_text_cap_in_a_json_root_refuses_the_split(
 
     assert split(pair.split_contract, "--parts", "sql") == 1
 
-    assert "byte cap" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "5242880-byte" in err and "cap" in err
     assert pair.split_contract.read_bytes() == root
     assert not [p for p in files_of(pair.split) if p != pair.name]
 
@@ -2685,7 +2687,15 @@ def test_i36_refs_in_the_root_that_need_the_ref_root_survive_a_split(
     )
     pair = make_pair(tmp_path, files, REF_ROOT_NAME)
 
-    assert split(pair.split_contract) == 0  # split resolves no ref: the env is not needed
+    # Split checks its result against what the original composes to: without the root its
+    # refs need, there is nothing to check against, so it refuses and changes nothing.
+    monkeypatch.delenv("FLUID_REF_ROOT", raising=False)
+    root = pair.split_contract.read_bytes()
+    assert split(pair.split_contract) == 1
+    assert pair.split_contract.read_bytes() == root
+
+    monkeypatch.setenv("FLUID_REF_ROOT", str(pair.split))
+    assert split(pair.split_contract) == 0
 
     flat = _compose_with_ref_root(pair.flat_contract, pair.flat, monkeypatch)
     assert _compose_with_ref_root(pair.split_contract, pair.split, monkeypatch) == flat
@@ -2709,18 +2719,17 @@ def test_i36_a_moved_part_with_a_ref_that_needs_the_ref_root_splits_with_the_env
     assert _compose_with_ref_root(pair.split_contract, pair.split, monkeypatch) == flat
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-03: without FLUID_REF_ROOT the original does not compose, so split cannot check "
-    "its work; it exits 0 and leaves a contract whose moved part has a ref that no longer "
-    "resolves (the same unrebased ref as SP-02, here silent)",
-)
 def test_i36_split_without_the_ref_root_set_leaves_a_contract_that_still_composes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """SP-03: without FLUID_REF_ROOT the original does not compose, so its split cannot be
+    checked: split refuses, says why, and changes nothing (rebasing the ref is SP-02)."""
     pair = make_pair(tmp_path, REF_ROOT_FILES, REF_ROOT_NAME)
+    before = {p: p.read_bytes() for p in pair.split.rglob("*") if p.is_file()}
 
-    assert split(pair.split_contract) == 0  # today it does: no check ran
+    assert split(pair.split_contract) == 1
+    assert "does not compose here" in capsys.readouterr().err
+    assert {p: p.read_bytes() for p in pair.split.rglob("*") if p.is_file()} == before
 
     flat = _compose_with_ref_root(pair.flat_contract, pair.flat, monkeypatch)
     assert _compose_with_ref_root(pair.split_contract, pair.split, monkeypatch) == flat
