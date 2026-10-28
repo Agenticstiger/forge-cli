@@ -256,11 +256,9 @@ def _contract_is_reference_only(contract_path: Path) -> bool:
     the CI generator agree on which products skip schedule/policy emission.
     """
     try:
-        with open(contract_path, "r", encoding="utf-8") as fh:
-            contract = load_yaml_safe(fh) or {}
-    except (OSError, UnicodeDecodeError, yaml.YAMLError, UnsafeYamlError):
-        return False
-    if not isinstance(contract, dict):
+        # Composed, so a build that lives in a fragment counts too.
+        contract = _load_contract(contract_path)
+    except FanoutError:
         return False
     builds = contract.get("builds")
     if not isinstance(builds, list):
@@ -477,7 +475,20 @@ def _load_contract(contract_path: Path) -> Dict[str, Any]:
             f"contract at {contract_path} did not parse as a mapping",
             key=None,
         )
-    return doc
+    from fluid_build.contract_refs import find_ref_node
+
+    if find_ref_node(doc) is None:
+        return doc
+    # A contract split into fragments is read whole, as every other command
+    # reads it, so its artifacts are those of the same contract written flat.
+    from fluid_build.loader import compose_contract
+
+    try:
+        return compose_contract(contract_path).document
+    except Exception as exc:  # noqa: BLE001 - every emitter reports a FanoutError
+        raise FanoutError(
+            f"contract at {contract_path} could not be composed: {exc}", key=None
+        ) from exc
 
 
 def _emit_opds(contract_path: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:

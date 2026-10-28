@@ -49,12 +49,18 @@ recursive composer fails with ``RecursionError`` a few hundred levels down,
 fewer the deeper the caller's own stack is.
 
 Use :func:`load_yaml_safe` for any YAML that arrives from outside the
-process: LLM output, network/catalog responses, and bundle contents.
+process: LLM output, network/catalog responses, and bundle contents. A file
+that holds it is read with :func:`read_bounded_file`, which refuses anything
+but a regular file and never reads past the cap, so the cap bounds the read
+too, not only the parse.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import os
+import stat
+from pathlib import Path
+from typing import Any, Optional
 
 import yaml
 
@@ -107,13 +113,46 @@ def load_yaml_safe(
     source = _bounded_text(source, max_bytes)
     if _count_aliases(source, max_aliases, max_depth) == 0:
         return yaml.safe_load(source)
+    return _checked_document(
+        source, True, max_alias_expansion, max_alias_expansion_chars, construct=True
+    )
+
+
+def compose_yaml_safe(source: Any) -> Any:
+    """The YAML node graph of ``source`` (its marks give lines), under the caps
+    of :func:`load_yaml_safe`; ``None`` for an empty document.
+
+    Composition keeps an alias as a second reference to its anchor's node, so
+    the graph stays as small as the text; a walk over it must not expand it.
+    """
+    if source is None:
+        return None
+    source = _bounded_text(source, MAX_YAML_BYTES)
+    aliases = _count_aliases(source, MAX_YAML_ALIASES, MAX_YAML_DEPTH)
+    return _checked_document(
+        source, bool(aliases), MAX_YAML_ALIAS_EXPANSION, MAX_YAML_ALIAS_EXPANSION_CHARS
+    )
+
+
+def _checked_document(
+    source: str,
+    has_aliases: bool,
+    max_alias_expansion: int,
+    max_alias_expansion_chars: int,
+    *,
+    construct: bool = False,
+) -> Any:
+    """The single document in ``source``: its node, or its value when
+    ``construct``; ``None`` when empty. A document with aliases is refused
+    when they expand it past the caps (:func:`_check_alias_expansion`)."""
     loader = yaml.SafeLoader(source)
     try:
         node = loader.get_single_node()
         if node is None:
             return None
-        _check_alias_expansion(node, max_alias_expansion, max_alias_expansion_chars)
-        return loader.construct_document(node)
+        if has_aliases:
+            _check_alias_expansion(node, max_alias_expansion, max_alias_expansion_chars)
+        return loader.construct_document(node) if construct else node
     finally:
         loader.dispose()
 
@@ -153,6 +192,56 @@ def _count_aliases(source: str, max_aliases: int, max_depth: int) -> int:
                     "possible anchor-expansion (billion-laughs) DoS"
                 )
     return aliases
+
+
+def read_bounded_file(path: Path, max_bytes: int = MAX_YAML_BYTES) -> Optional[bytes]:
+    """The bytes of ``path``, or ``None`` when it holds more than ``max_bytes``.
+
+    Only a regular file is read. Its kind is checked before it is opened, so a
+    device is never opened, and again on the open file, which is opened
+    without blocking, so a FIFO or a device swapped in between is refused
+    rather than waited on or read without end. At most ``max_bytes + 1`` bytes
+    are read, so a file over the cap, sparse or growing, costs no more than
+    the cap.
+
+    Raises:
+        OSError: ``path`` is not a regular file, does not exist, or cannot be read.
+    """
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        raise OSError("not a regular file")
+    nonblocking = getattr(os, "O_NONBLOCK", 0)
+    try:
+        handle = open(path, "rb", opener=lambda name, flags: os.open(name, flags | nonblocking))
+    except IsADirectoryError as exc:
+        raise OSError("not a regular file") from exc
+    with handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("not a regular file")
+        if info.st_size > max_bytes:
+            return None
+        # Sized by the file, not the cap: a read buffer is allocated whole.
+        limit = info.st_size + 1
+        data = _read_bounded(handle, limit)
+        if len(data) == limit:
+            # It grew after the fstat: read on, never past the cap.
+            data += _read_bounded(handle, max_bytes + 1 - limit)
+    return None if len(data) > max_bytes else data
+
+
+def read_bounded_text(path: Path, max_bytes: int = MAX_YAML_BYTES) -> str:
+    """``path`` as ``Path.read_text(encoding="utf-8")`` reads it (every newline
+    as ``\\n``), under the rules of :func:`read_bounded_file`.
+
+    Raises:
+        UnsafeYamlError: it is over ``max_bytes``.
+        OSError: it is not a regular file, does not exist, or cannot be read.
+        UnicodeDecodeError: it is not UTF-8.
+    """
+    data = read_bounded_file(path, max_bytes)
+    if data is None:
+        raise UnsafeYamlError(f"{path.name} is over the {max_bytes}-byte safety cap")
+    return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _read_bounded(stream: Any, limit: int) -> Any:

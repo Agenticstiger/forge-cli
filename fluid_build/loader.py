@@ -36,13 +36,30 @@ from typing import (
     Union,
 )
 
+from fluid_build.contract_refs import (
+    MAX_REF_DEPTH,
+    ComposeTrace,
+    ContractOrigins,
+    Origin,
+    RefBudget,
+    _is_system_path,
+    find_ref_node,
+    is_pointer_node,
+    is_ref_node,
+    parse_ref,
+    pointer_merge_error,
+    replaces_pointer,
+    resolve_file_refs,
+    resolve_pointer,
+    resolve_pointer_refs,
+)
 from fluid_build.util.ref_confinement import (
     REF_ROOT_ENV,
     RefConfinementError,
     RefResolutionError,
-    confine_ref,
     format_pointer,
     iter_external_refs,
+    ref_location,
 )
 
 try:
@@ -52,10 +69,19 @@ except Exception:  # pragma: no cover
 
 
 __all__ = [
+    # Kept for callers of 0.24.0: the resolver names, as the loader offered them.
+    "_MAX_REF_DEPTH",
+    "_is_ref_node",
+    "_parse_ref",
+    "_resolve_pointer",
     "REF_ROOT_ENV",
+    "ComposedContract",
     "RefConfinementError",
     "RefResolutionError",
     "available_overlay_envs",
+    "collect_origins",
+    "compose_contract",
+    "compose_document",
     "load_contract",
     "load_with_overlay",
     "compile_contract",
@@ -67,11 +93,20 @@ LOG = logging.getLogger("fluid.loader")
 
 
 def _read_text(path: Path) -> str:
+    """The text of a contract, an overlay or a workspace file.
+
+    Read as a ``$ref`` target is (:func:`fluid_build.util.safe_yaml.read_bounded_text`):
+    only a regular file, so a FIFO or a device standing in for one is refused
+    instead of blocking or reading without end, and never past the 5 MiB cap
+    of a YAML document, whatever the suffix.
+    """
+    from fluid_build.util.safe_yaml import read_bounded_text
+
     if not path.exists():
         raise FileNotFoundError(f"Contract/overlay not found: {path}")
     try:
-        return path.read_text(encoding="utf-8")
-    except Exception as e:  # pragma: no cover
+        return read_bounded_text(path)
+    except Exception as e:
         raise RuntimeError(f"Failed to read file {path}: {e}") from e
 
 
@@ -95,38 +130,43 @@ def _parse_file(path: Path) -> Dict[str, Any]:
     """
     Parse a JSON or YAML file based on extension.
     YAML requires PyYAML; if missing, raise a helpful error.
+
+    The root must be an object, on every entry point, raw loads included: an
+    empty YAML file is ``{}``, any other root (a list, a scalar, JSON ``null``)
+    is refused, naming the file.
     """
     suffix = path.suffix.lower()
     text = _read_text(path)
     try:
         if suffix in (".json",):
-            return json.loads(text)
+            return _object_root(json.loads(text), "JSON", path)
         if suffix in (".yaml", ".yml"):
             if yaml is None:
                 raise RuntimeError(
                     "YAML parsing requires PyYAML. Install with: pip install pyyaml "
                     "or use JSON (.json) contracts."
                 )
-            obj = _safe_yaml_load(text)
-            if obj is None:
-                return {}
-            if not isinstance(obj, dict):
-                raise ValueError(f"YAML root must be an object/dict: {path}")
-            return obj
+            return _object_root(_safe_yaml_load(text), "YAML", path)
         # Fallback: try JSON first, then YAML (if available)
         try:
-            return json.loads(text)
+            obj = json.loads(text)
         except Exception:
             if yaml is None:
                 raise
-            obj = _safe_yaml_load(text)
-            if obj is None:
-                return {}
-            if not isinstance(obj, dict):
-                raise ValueError(f"YAML root must be an object/dict: {path}")
-            return obj
+            return _object_root(_safe_yaml_load(text), "YAML", path)
+        return _object_root(obj, "JSON", path)
     except Exception as e:
         raise RuntimeError(f"Failed to parse {path}: {e}") from e
+
+
+def _object_root(obj: Any, kind: str, path: Path) -> Dict[str, Any]:
+    """``obj``, the parsed root of ``path``, which must be an object; an empty
+    YAML document is ``{}``."""
+    if obj is None and kind == "YAML":
+        return {}
+    if not isinstance(obj, dict):
+        raise ValueError(f"{kind} root must be an object/dict: {path}")
+    return obj
 
 
 def parse_contract_text(text: str, *, suffix: str = ".yaml") -> Dict[str, Any]:
@@ -196,8 +236,17 @@ class OverlayMergeError(ValueError):
     """An overlay entry cannot be matched to the base entry it patches."""
 
 
+#: A place in a contract: object keys and list indexes, root first.
+_Place = Tuple[Union[str, int], ...]
+
+
 def _deep_merge(
-    base: Dict[str, Any], overlay: Dict[str, Any], *, _root: bool = True
+    base: Dict[str, Any],
+    overlay: Dict[str, Any],
+    *,
+    _root: bool = True,
+    _at: _Place = (),
+    _trace: Optional[ComposeTrace] = None,
 ) -> Dict[str, Any]:
     """
     Recursively merge overlay into base.
@@ -212,12 +261,34 @@ def _deep_merge(
       is merged by position, and extra overlay entries are appended. See
       :func:`_merge_dict_list`.
     - Scalar lists / mismatched types: overlay value replaces base value entirely.
+    - A same-document pointer (``{$ref: "#/..."}``) over an object of the base
+      is refused (:class:`RefResolutionError`): it is resolved only after the
+      merge, so merging it would put its ``$ref`` beside the base's keys. Where
+      the base has no object, it replaces, as any value does; over a bare
+      pointer of the base it replaces too, and the pointer pass refuses it if
+      that one named an object (:func:`fluid_build.contract_refs.replaces_pointer`).
+
+    ``_at`` is where ``base`` sits in the contract. ``_trace``, the trace of
+    the composition the merge is part of, names a refused pointer where it was
+    written and keeps the pointers a pointer replaced.
     """
+    if is_pointer_node(overlay):
+        # Only the overlay's root gets here: below it, _merge_object decides.
+        raise _pointer_merged(overlay, _at, _trace)
     keyed = _root and _keyed_overlay_merge(base, overlay)
     contract_id = str(base.get("id") or "the contract") if _root else ""
     for k, v in overlay.items():
+        if k in base and is_pointer_node(base[k]) and _object_list(v):
+            # Matched by id, or merged by position, into what the pointer names:
+            # that exists only after the merge. A list of plain values replaces
+            # it, as it replaces the value written inline.
+            raise _merge_over_pointer(base[k], (*_at, k), "patches a list of objects")
+        if k in base and is_pointer_node(v) and _object_list(base[k]):
+            # Inline, the list it names would be merged into the base's by id or
+            # by position; resolved after the merge, it could only replace it.
+            raise _pointer_merged(v, (*_at, k), _trace, "the list of objects")
         if k in base and isinstance(base[k], dict) and isinstance(v, dict):
-            base[k] = _deep_merge(base[k], v, _root=False)
+            base[k] = _merge_object(base[k], v, (*_at, k), _trace)
         elif (
             k in base
             and isinstance(base[k], list)
@@ -227,11 +298,82 @@ def _deep_merge(
         ):
             identity = _OVERLAY_IDENTITY_KEYS.get(k) if _root else None
             base[k] = _merge_dict_list(
-                k, base[k], v, identity, keyed=keyed, contract_id=contract_id
+                k,
+                base[k],
+                v,
+                identity,
+                keyed=keyed,
+                contract_id=contract_id,
+                at=(*_at, k),
+                trace=_trace,
             )
         else:
             base[k] = v
     return base
+
+
+def _merge_object(
+    base: Dict[str, Any], overlay: Dict[str, Any], at: _Place, trace: Optional[ComposeTrace]
+) -> Dict[str, Any]:
+    """``overlay`` merged into ``base``, an object of the base contract at ``at``.
+
+    An overlay pointer replaces a bare pointer of the base (kept in ``trace``
+    for the pointer pass to check) and is refused over any other object.
+    """
+    if replaces_pointer(overlay, base):
+        if trace is not None:
+            trace.note_replaced(overlay, base["$ref"], overlay=True)
+        return overlay
+    if is_pointer_node(overlay):
+        raise _pointer_merged(overlay, at, trace)
+    if is_pointer_node(base):
+        # The keys would go beside the pointer and be merged over what it names
+        # as a merge patch, replacing its lists where the overlay merges them.
+        raise _merge_over_pointer(base, at, "patches an object")
+    return _deep_merge(base, overlay, _root=False, _at=at, _trace=trace)
+
+
+def _refuse_pointer_entries(
+    name: str, base_items: List[Any], identity: Tuple[str, ...], at: _Place
+) -> None:
+    """A keyed merge cannot match a base entry written as a ``#/`` pointer: its id
+    exists only after the merge, so a patch for it would land by position."""
+    for i, item in enumerate(base_items):
+        if is_pointer_node(item):
+            by = " + ".join(identity)
+            raise _merge_over_pointer(item, (*at, i), f"patches '{name}' by {by}")
+
+
+def _object_list(value: Any) -> bool:
+    """A non-empty list of objects: what an overlay merges entry by entry."""
+    return isinstance(value, list) and bool(value) and all(isinstance(v, dict) for v in value)
+
+
+def _pointer_merged(
+    node: Dict[str, Any], at: _Place, trace: Optional[ComposeTrace], what: str = "the object"
+) -> RefResolutionError:
+    """The refusal of the overlay pointer ``node`` over the base's object (or list
+    of objects, ``what``) at ``at``, named where it was written when ``trace`` knows it."""
+    site = trace.pointer_site(node) if trace is not None else None
+    written = ref_location(format_pointer(site[1]), site[0]) if site else "in the overlay"
+    into = f"{what} the base contract has at '{format_pointer(at)}'" if at else "the base"
+    return pointer_merge_error(node, written, into)
+
+
+def _merge_over_pointer(pointer: Dict[str, Any], at: _Place, what: str) -> RefResolutionError:
+    """The refusal of an overlay merged over the base's ``#/`` pointer at ``at``.
+
+    The pointer is resolved only after the overlay is merged, so the overlay
+    cannot see what it names: matched by id, it would be matched by position;
+    a list over it would replace what it names whole.
+    """
+    return RefResolutionError(
+        f"the overlay {what} at '{format_pointer(at)}', where the base contract has the "
+        f"'#/' pointer '{pointer.get('$ref')}'; a pointer names a place in the composed "
+        f"contract and is resolved only after the overlay is merged, so the overlay cannot "
+        f"see what it names. Write that part of the base out, or name a file "
+        f"('./part.yaml#/...'), which is read before the merge."
+    )
 
 
 def _keyed_overlay_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> bool:
@@ -251,6 +393,8 @@ def _merge_dict_list(
     *,
     keyed: bool,
     contract_id: str = "",
+    at: _Place = (),
+    trace: Optional[ComposeTrace] = None,
 ) -> List[Any]:
     """Patch ``overlay_items`` into ``base_items``, by identity or by position.
 
@@ -260,14 +404,25 @@ def _merge_dict_list(
     an overlay entry that names none, or names one twice, is refused: falling
     back to position would retarget it. Before 0.7.6, or when the base's ids
     are missing or repeated, the merge is by position and warns when a patch
-    lands on an entry that names another id.
+    lands on an entry that names another id. ``at`` is where the list sits in
+    the contract; ``trace`` is :func:`_deep_merge`'s.
     """
+    if identity and keyed:
+        _refuse_pointer_entries(name, base_items, identity, at)
     base_ids = [_item_identity(item, identity) for item in base_items] if identity else []
     overlay_ids = [_item_identity(item, identity) for item in overlay_items] if identity else []
     if identity and keyed and _unique_ids(base_ids):
         if len(base_items) > 1 or any(overlay_ids):
             return _merge_by_identity(
-                name, identity, base_items, overlay_items, base_ids, overlay_ids, contract_id
+                name,
+                identity,
+                base_items,
+                overlay_items,
+                base_ids,
+                overlay_ids,
+                contract_id,
+                at=at,
+                trace=trace,
             )
         # At most one base entry and id-less patches: nothing else they could mean.
 
@@ -278,7 +433,7 @@ def _merge_dict_list(
     merged = list(base_items)
     for i, overlay_item in enumerate(overlay_items):
         if i < len(merged) and isinstance(merged[i], dict):
-            merged[i] = _deep_merge(dict(merged[i]), overlay_item, _root=False)
+            merged[i] = _merge_object(dict(merged[i]), overlay_item, (*at, i), trace)
         elif i < len(merged):
             merged[i] = overlay_item
         else:
@@ -294,6 +449,9 @@ def _merge_by_identity(
     base_ids: List[Optional[Tuple[str, ...]]],
     overlay_ids: List[Optional[Tuple[str, ...]]],
     contract_id: str = "",
+    *,
+    at: _Place = (),
+    trace: Optional[ComposeTrace] = None,
 ) -> List[Any]:
     key_label = " + ".join(keys)
     seen: Dict[Tuple[str, ...], int] = {}
@@ -331,7 +489,7 @@ def _merge_by_identity(
             )
             merged.append(overlay_item)
         else:
-            merged[i] = _deep_merge(dict(merged[i]), overlay_item, _root=False)
+            merged[i] = _merge_object(dict(merged[i]), overlay_item, (*at, i), trace)
     return merged
 
 
@@ -495,8 +653,13 @@ def _log_warning_once(text: str, extra: Dict[str, Any]) -> None:
 # $ref resolution — multi-file contract composition
 # ---------------------------------------------------------------------------
 
-_MAX_REF_DEPTH = 20  # safety limit against accidental deep nesting
-
+# The resolver lives in ``fluid_build.contract_refs``; these names stay here for
+# the callers that import them from the loader, as 0.24.0 offered them (pinned
+# by tests/fragments/test_compat_gate.py), and are listed in ``__all__``.
+_MAX_REF_DEPTH = MAX_REF_DEPTH
+_is_ref_node = is_ref_node
+_parse_ref = parse_ref
+_resolve_pointer = resolve_pointer
 
 # ``RefResolutionError`` and its confinement subclass live in
 # ``fluid_build.util.ref_confinement`` (stdlib-only, shared with the bundle
@@ -505,66 +668,19 @@ _MAX_REF_DEPTH = 20  # safety limit against accidental deep nesting
 
 _REF_ROOT_HINT = (
     f"To compose fragments from a wider tree (e.g. a monorepo's shared/ "
-    f"directory), set {REF_ROOT_ENV} to that directory or pass ref_root= to "
-    f"the loader; see docs/contract-refs.md."
+    f"directory), declare ref_root in the workspace's fluid.workspace.yaml, set "
+    f"{REF_ROOT_ENV} to that directory, or pass ref_root= to the loader; see "
+    f"docs/contract-refs.md."
 )
 
+#: The ``fluid.workspace.yaml`` key that widens the ref root of the contracts
+#: under it, relative to the file (``refRoot`` is read too).
+WORKSPACE_REF_ROOT_KEY = "ref_root"
 
-def _is_ref_node(obj: Any) -> bool:
-    """Return True if *obj* is a dict containing a single ``$ref`` key."""
-    return isinstance(obj, dict) and "$ref" in obj and len(obj) == 1
-
-
-def _parse_ref(ref_value: str) -> Tuple[str, Optional[str]]:
-    """Split a $ref value into (file_path, json_pointer | None).
-
-    Examples:
-        "./schemas/user.yaml"          → ("./schemas/user.yaml", None)
-        "./schemas/user.yaml#/User"    → ("./schemas/user.yaml", "/User")
-        "#/definitions/common"         → ("", "/definitions/common")
-    """
-    if "#" in ref_value:
-        file_part, pointer = ref_value.split("#", 1)
-        return file_part, pointer or None
-    return ref_value, None
-
-
-def _resolve_pointer(obj: Any, pointer: str) -> Any:
-    """Resolve a JSON-pointer style path (e.g. ``/builds/0``) into *obj*.
-
-    Only supports ``/key`` and ``/index`` segments — enough for FLUID contracts.
-    """
-    if not pointer or pointer == "/":
-        return obj
-    parts = pointer.strip("/").split("/")
-    current = obj
-    for part in parts:
-        if isinstance(current, dict):
-            if part not in current:
-                raise RefResolutionError(
-                    f"JSON pointer segment '{part}' not found in object "
-                    f"(available keys: {list(current.keys())})"
-                )
-            current = current[part]
-        elif isinstance(current, list):
-            try:
-                current = current[int(part)]
-            except (ValueError, IndexError) as exc:
-                raise RefResolutionError(
-                    f"JSON pointer segment '{part}' is not a valid list index"
-                ) from exc
-        else:
-            raise RefResolutionError(
-                f"Cannot traverse into {type(current).__name__} with pointer segment '{part}'"
-            )
-    return current
-
-
-def _pointer_parts(pointer: Optional[str]) -> Tuple[str, ...]:
-    """Segments of a ``#/a/b`` fragment, for error locations."""
-    if not pointer or pointer == "/":
-        return ()
-    return tuple(pointer.strip("/").split("/"))
+#: Set by an operator to ignore every workspace ``ref_root``: a service that
+#: validates uploaded contracts keeps each to its own directory. A project
+#: ``.env`` cannot set it (``credentials/protected_env.py``).
+IGNORE_WORKSPACE_REF_ROOT_ENV = "FLUID_IGNORE_WORKSPACE_REF_ROOT"
 
 
 def _resolve_refs(
@@ -575,180 +691,26 @@ def _resolve_refs(
     root_hint: str = _REF_ROOT_HINT,
     ignored_ref_root_env: Optional[str] = None,
     _source: Optional[Path] = None,
-    _loc: Tuple[Union[str, int], ...] = (),
-    _seen: Optional[Set[str]] = None,
-    _depth: int = 0,
+    _trace: Optional[ComposeTrace] = None,
 ) -> Any:
-    """Recursively resolve ``$ref`` pointers in a parsed contract tree.
+    """Resolve every ``$ref`` to a file in a parsed contract tree.
 
-    Supports:
-      - External file refs:  ``$ref: ./path/to/file.yaml``
-      - File + pointer:      ``$ref: ./file.yaml#/section``
-      - Same-file pointer:   ``$ref: "#/definitions/x"`` (left in place as-is)
-      - Refs inside lists:   ``builds: [{ $ref: ./builds/ingest.yaml }]``
-
-    Protections:
-      - Confinement: every external ref goes through
-        :func:`fluid_build.util.ref_confinement.confine_ref`. The target,
-        after ``..`` and symlinks are resolved, must sit inside ``ref_root``
-        (default: ``base_dir`` of the first call, i.e. the root contract's
-        directory). Nested refs are held to the SAME root, not to the
-        directory of the fragment that contains them. URLs (``file://``
-        included) and absolute paths are refused.
-      - System-directory deny list (``SecurePathValidator``) as a second
-        layer, for callers that widen ``ref_root``.
-      - Circular reference detection (tracks resolved absolute paths)
-      - Depth limit (``_MAX_REF_DEPTH``) to prevent runaway recursion
-      - Clear error messages naming the ref and its JSON pointer.
-        ``root_hint`` ends an escape message; ``ignored_ref_root_env`` is
-        recorded on every :class:`RefConfinementError`. Both come from
-        :func:`_effective_ref_root` and are held for nested refs too.
+    See :func:`fluid_build.contract_refs.resolve_file_refs`: a ref resolves
+    relative to the file that contains it, confined to ``ref_root`` (default
+    ``base_dir``); a text target (``.sql``, ``.md``, ...) is its text; keys
+    beside ``$ref`` are merged over its target (RFC 7386). Same-document
+    ``#/...`` pointers are kept for the pointer pass. ``root_hint`` and
+    ``ignored_ref_root_env`` come from :func:`_effective_ref_root`.
     """
-    if _depth > _MAX_REF_DEPTH:
-        raise RefResolutionError(
-            f"$ref nesting depth exceeded {_MAX_REF_DEPTH} — "
-            f"possible circular reference or very deep nesting"
-        )
-
-    if _seen is None:
-        _seen = set()
-    root = base_dir if ref_root is None else ref_root
-
-    # ── Handle $ref node ──────────────────────────────────────────
-    if _is_ref_node(obj):
-        ref_value = obj["$ref"]
-        if not isinstance(ref_value, str):
-            raise RefResolutionError(f"$ref value must be a string, got {type(ref_value).__name__}")
-
-        file_part, pointer = _parse_ref(ref_value)
-
-        if not file_part:
-            # Same-file pointer refs (#/definitions/x) — return as-is for now;
-            # these would need the root document to resolve, which is a
-            # future enhancement.
-            LOG.debug("skipping_same_file_ref", extra={"ref": ref_value})
-            return obj
-
-        # Confinement: a URL, an absolute path, or a target outside the root
-        # is refused before the target is tested for existence or opened, so
-        # a refused ref cannot probe the host for files either.
-        ref_path = confine_ref(
-            ref_value,
-            file_part,
-            base_dir=base_dir,
-            root=root,
-            pointer=format_pointer(_loc),
-            source=_source,
-            root_hint=root_hint,
-            ignored_ref_root_env=ignored_ref_root_env,
-        )
-
-        # Defense in depth (F3): system directories stay blocked even when a
-        # caller widens ``ref_root``. Route through the platform-aware
-        # ``SecurePathValidator`` so the deny set matches the rest of the
-        # CLI (it knows macOS ``/etc`` is ``/private/etc``). Imported lazily
-        # to keep ``loader.py``'s import graph free of the ``cli`` package.
-        try:
-            from fluid_build.cli.core import FluidCLIError
-            from fluid_build.cli.security import SecurePathValidator, get_security_context
-
-            SecurePathValidator(get_security_context())._validate_path_security(ref_path, "read")
-        except FluidCLIError as exc:
-            raise RefResolutionError(
-                f"$ref resolves to a blocked system path: {ref_value} " f"(resolved to {ref_path})"
-            ) from exc
-        except ImportError:
-            # Defensive fallback — if the cli.security module is somehow
-            # unavailable, keep the legacy prefix block so refs are still
-            # screened rather than silently allowed.
-            _ref_str = str(ref_path)
-            _BLOCKED_PREFIXES = ("/etc/", "/var/", "/usr/", "/proc/", "/sys/", "/dev/")
-            if any(_ref_str.startswith(p) for p in _BLOCKED_PREFIXES):
-                raise RefResolutionError(
-                    f"$ref resolves to a blocked system path: {ref_value} "
-                    f"(resolved to {ref_path})"
-                )
-
-        # Circular detection keyed on absolute path + pointer.
-        # Use stack-based tracking: add before descending, remove after.
-        # This allows "diamond" dependencies (same file from multiple
-        # branches) while still catching true cycles (A → B → A).
-        ref_key = f"{ref_path}#{pointer or ''}"
-        if ref_key in _seen:
-            raise RefResolutionError(f"Circular $ref detected: {ref_key}")
-        _seen.add(ref_key)
-
-        if not ref_path.exists():
-            raise RefResolutionError(f"$ref target not found: {ref_value} (resolved to {ref_path})")
-
-        try:
-            resolved = _parse_file(ref_path)
-        except Exception as e:
-            raise RefResolutionError(f"Failed to parse $ref target '{ref_value}': {e}") from e
-
-        # Apply JSON pointer if present
-        if pointer:
-            try:
-                resolved = _resolve_pointer(resolved, pointer)
-            except RefResolutionError as e:
-                raise RefResolutionError(
-                    f"Failed to resolve pointer '{pointer}' in '{ref_value}': {e}"
-                ) from e
-
-        # Recursively resolve refs in the loaded content — relative to the
-        # fragment's own directory, but confined to the ORIGINAL root.
-        result = _resolve_refs(
-            resolved,
-            ref_path.parent,
-            ref_root=root,
-            root_hint=root_hint,
-            ignored_ref_root_env=ignored_ref_root_env,
-            _source=ref_path,
-            _loc=_pointer_parts(pointer),
-            _seen=_seen,
-            _depth=_depth + 1,
-        )
-
-        # Pop from ancestry stack so sibling branches can ref the same file
-        _seen.discard(ref_key)
-        return result
-
-    # ── Recurse into dicts ────────────────────────────────────────
-    if isinstance(obj, dict):
-        return {
-            k: _resolve_refs(
-                v,
-                base_dir,
-                ref_root=root,
-                root_hint=root_hint,
-                ignored_ref_root_env=ignored_ref_root_env,
-                _source=_source,
-                _loc=(*_loc, k),
-                _seen=_seen,
-                _depth=_depth,
-            )
-            for k, v in obj.items()
-        }
-
-    # ── Recurse into lists ────────────────────────────────────────
-    if isinstance(obj, list):
-        return [
-            _resolve_refs(
-                item,
-                base_dir,
-                ref_root=root,
-                root_hint=root_hint,
-                ignored_ref_root_env=ignored_ref_root_env,
-                _source=_source,
-                _loc=(*_loc, i),
-                _seen=_seen,
-                _depth=_depth,
-            )
-            for i, item in enumerate(obj)
-        ]
-
-    # ── Scalars pass through ──────────────────────────────────────
-    return obj
+    return resolve_file_refs(
+        obj,
+        base_dir,
+        ref_root=ref_root,
+        root_hint=root_hint,
+        ignored_ref_root_env=ignored_ref_root_env,
+        source=_source,
+        trace=_trace,
+    )
 
 
 class _RefRoot(NamedTuple):
@@ -767,6 +729,9 @@ def _effective_ref_root(
     contract_path: Path,
     contract: Any,
     ref_root: Optional[Union[str, Path]],
+    *,
+    reads_outside: bool = False,
+    contract_dir: Optional[Path] = None,
 ) -> _RefRoot:
     """The directory every ``$ref`` of *contract* must stay inside.
 
@@ -776,10 +741,20 @@ def _effective_ref_root(
     contract itself must live inside the wider root. A blank variable counts
     as unset (the confined default), never as "no confinement".
 
-    The opt-in is only consulted when the contract has an external ref.
+    The opt-in is only consulted when the contract has an external ref, or
+    when ``reads_outside`` says the composition reads a file outside the
+    contract's directory that no ref names (an overlay reached through a
+    symlink, :func:`load_overlay_document`).
 
-    The two sources fail differently when the root is unusable (cannot be
-    resolved, is not a directory, or does not contain the contract):
+    Without either, the workspace may widen it: ``ref_root`` in the nearest
+    ``fluid.workspace.yaml`` above the contract (:func:`_workspace_ref_root`),
+    held to that file's own directory. That is also the root a contract gets
+    when ``FLUID_REF_ROOT`` is ignored for it: the root it would get with the
+    variable unset.
+
+    The two explicit sources fail differently when the root is unusable
+    (cannot be resolved, is not a directory, or does not contain the
+    contract):
 
     * ``ref_root=`` is a choice the caller made for THIS contract, so it is a
       :class:`RefResolutionError`.
@@ -794,13 +769,23 @@ def _effective_ref_root(
       load: the WARNING is logged once per value per process, and in a
       service it reaches the server log, not the caller.
     """
-    contract_dir = contract_path.resolve().parent
+    # ``contract_dir`` is given when no file is read for the contract (the
+    # in-memory API): the caller's directory is resolved, never a name under
+    # it, so a symlink planted at that name cannot move the root.
+    contract_dir = (
+        Path(contract_dir).resolve() if contract_dir is not None else contract_path.resolve().parent
+    )
+    if not reads_outside and next(iter_external_refs(contract), None) is None:
+        return _RefRoot(contract_dir)
     if ref_root is not None:
         explicit, origin = str(ref_root), "ref_root"
     else:
         explicit, origin = os.environ.get(REF_ROOT_ENV, "").strip(), REF_ROOT_ENV
-    if not explicit or next(iter_external_refs(contract), None) is None:
-        return _RefRoot(contract_dir)
+    if not explicit:
+        if ref_root is not None:
+            return _RefRoot(contract_dir)
+        # The root without the variable: the workspace's, else the contract's own.
+        return _workspace_ref_root(contract_dir).root
     try:
         # A stale value can fail to resolve at all: ``~gone/repo`` for a
         # user that no longer exists, a symlink loop, or a parent the
@@ -832,16 +817,246 @@ def _effective_ref_root(
         problem = f"{origin}={explicit!r} cannot be resolved: {str(exc).rstrip('.')}"
     if origin != REF_ROOT_ENV:
         raise RefResolutionError(problem)
-    _note_ref_root_env_ignored(contract_dir, explicit, problem)
+    # The root without the variable, read only now: a ref_root= or a
+    # FLUID_REF_ROOT that applies leaves the workspace file unread.
+    unset, refused = _workspace_ref_root(contract_dir)
+    _note_ref_root_env_ignored(unset.ref_root, explicit, problem)
     return _RefRoot(
-        contract_dir,
+        unset.ref_root,
         root_hint=(
             f"{REF_ROOT_ENV} is set but was ignored for this contract: {problem}. "
-            f"To compose fragments from a wider tree, set {REF_ROOT_ENV} to a "
+            f"{refused}To compose fragments from a wider tree, set {REF_ROOT_ENV} to a "
             f"directory that contains the contract or pass ref_root= to the "
             f"loader; see docs/contract-refs.md."
         ),
         ignored_ref_root_env=explicit,
+    )
+
+
+#: Ends an escape error while ``FLUID_IGNORE_WORKSPACE_REF_ROOT`` is set: the
+#: default hint would suggest declaring the one setting the operator switched off.
+_WORKSPACE_REF_ROOT_OFF_HINT = (
+    f"{IGNORE_WORKSPACE_REF_ROOT_ENV} is set, so no workspace's ref_root applies in this "
+    f"process. To compose fragments from a wider tree, set {REF_ROOT_ENV} to a directory "
+    f"that contains the contract, or pass ref_root= to the loader; see docs/contract-refs.md."
+)
+
+
+class _WorkspaceRoot(NamedTuple):
+    """What a contract's workspace makes of its ref root (:func:`_workspace_ref_root`)."""
+
+    #: The root, and the hint its escape errors end with, that the contract
+    #: gets with no ``ref_root=`` and no ``FLUID_REF_ROOT``.
+    root: _RefRoot
+    #: Why the workspace's ``ref_root`` was ignored for the contract, a
+    #: sentence its escape errors repeat; ``""`` when it applied or none was set.
+    refused: str = ""
+
+
+class _WorkspaceProblem(NamedTuple):
+    """Why a workspace's ``ref_root`` cannot widen anything."""
+
+    #: What kind of problem: a word, or a ``broad_root_reason`` code.
+    code: str
+    #: The sentence a WARNING and an escape error give: the value, what it
+    #: resolved to, and why that cannot be the root.
+    text: str
+
+
+def _workspace_ref_root(contract_dir: Path) -> _WorkspaceRoot:
+    """The ref root a contract in ``contract_dir`` gets from its workspace: the
+    one the workspace declares, if usable, else the contract's own directory.
+
+    ``ref_root`` in the nearest ``fluid.workspace.yaml`` above the contract,
+    a path relative to that file. A project file must not reach outside its
+    own tree (a project ``.env`` may not set ``FLUID_REF_ROOT`` for that
+    reason), so the root must be a directory at or below the file's own,
+    contain the contract, and pass the vetting the DuckDB sandbox gives a
+    workspace grant: not the filesystem root, a home or a temp root, and not
+    above the repository the contract is in. A workspace file planted higher
+    up therefore widens nothing it does not own.
+
+    A value that cannot be used, or a file that cannot be parsed, is ignored:
+    the contract keeps its own directory, a WARNING says why
+    (:func:`_note_workspace_ref_root_ignored`), and so does every escape error
+    of the contract (``refused``), which is all a service's caller sees.
+    ``FLUID_IGNORE_WORKSPACE_REF_ROOT`` switches the setting off, and the
+    file is then not read at all.
+    """
+    if os.environ.get(IGNORE_WORKSPACE_REF_ROOT_ENV, "").strip():
+        return _WorkspaceRoot(_RefRoot(contract_dir, root_hint=_WORKSPACE_REF_ROOT_OFF_HINT))
+    from .util.workspace_root import WORKSPACE_CONFIG_FILENAME, find_workspace_root
+
+    own = _WorkspaceRoot(_RefRoot(contract_dir))
+    try:
+        found = find_workspace_root(contract_dir)
+    except Exception:  # noqa: BLE001 - a tree that cannot be searched declares nothing
+        return own
+    if found is None:
+        return own
+    source = found / WORKSPACE_CONFIG_FILENAME
+    try:
+        workspace = _parse_file(source)
+        if not isinstance(workspace, dict):
+            raise ValueError(f"its root is a {type(workspace).__name__}, not a mapping")
+    except Exception as exc:  # noqa: BLE001 - a file that cannot be parsed declares nothing
+        why = _why_unparseable(exc, source)
+        problem = _WorkspaceProblem("unparseable", f"{source.name} cannot be parsed ({why})")
+        return _workspace_refused(contract_dir, source, problem)
+    block = (
+        workspace.get("workspace") if isinstance(workspace.get("workspace"), dict) else workspace
+    )
+    value = block.get(WORKSPACE_REF_ROOT_KEY, block.get("refRoot"))
+    if value is None:
+        return own
+    root = _workspace_root_or_problem(found, value, contract_dir)
+    if isinstance(root, _WorkspaceProblem):
+        return _workspace_refused(contract_dir, source, root)
+    return _WorkspaceRoot(
+        _RefRoot(
+            root,
+            root_hint=(
+                f"The ref root {root} is the workspace's (ref_root in {source}). To compose "
+                f"from a wider tree, move ref_root up, set {REF_ROOT_ENV}, or pass ref_root= "
+                f"to the loader; see docs/contract-refs.md."
+            ),
+        )
+    )
+
+
+def _workspace_refused(
+    contract_dir: Path, source: Path, problem: _WorkspaceProblem
+) -> _WorkspaceRoot:
+    """The contract's own directory, for a workspace whose ``ref_root`` was
+    ignored: the WARNING, and the sentence the contract's escape errors carry."""
+    _note_workspace_ref_root_ignored(source, problem)
+    refused = f"The workspace's ref_root was ignored for this contract: {problem.text} ({source}). "
+    return _WorkspaceRoot(
+        _RefRoot(
+            contract_dir,
+            root_hint=(
+                f"{refused}To compose fragments from a wider tree, fix that file, set "
+                f"{REF_ROOT_ENV} to a directory that contains the contract, or pass "
+                f"ref_root= to the loader; see docs/contract-refs.md."
+            ),
+        ),
+        refused,
+    )
+
+
+def _why_unparseable(exc: BaseException, source: Path) -> str:
+    """Why ``source`` could not be parsed, in one line that quotes none of it."""
+    seen = {id(exc)}
+    while exc.__cause__ is not None and id(exc.__cause__) not in seen:
+        exc = exc.__cause__  # the parser's own error, under the loader's wrapping
+        seen.add(id(exc))
+    mark = getattr(exc, "problem_mark", None)
+    if mark is not None:
+        # A YAML syntax error prints the line it is on; name the place instead.
+        what = getattr(exc, "problem", None) or "invalid YAML"
+        return _shown(f"{what} at line {mark.line + 1}, column {mark.column + 1}")
+    if isinstance(exc, OSError) and exc.strerror:
+        return exc.strerror
+    # The file is named beside the reason already, and its directory differs
+    # per upload: neither belongs in the reason.
+    text = str(exc).removesuffix(f": {source}").replace(str(source), source.name)
+    return _shown(text.splitlines()[0] if text.strip() else type(exc).__name__)
+
+
+#: How many characters of a value from a workspace file a message shows. The
+#: file may hold megabytes in its ref_root, and every escape error of a
+#: contract under it repeats why that ref_root was ignored.
+_SHOWN_CHARS = 200
+
+
+def _shown(text: str) -> str:
+    """``text`` for a message, cut after :data:`_SHOWN_CHARS` characters."""
+    if len(text) <= _SHOWN_CHARS:
+        return text
+    return f"{text[:_SHOWN_CHARS]}... ({len(text) - _SHOWN_CHARS:,} more characters)"
+
+
+def _workspace_root_or_problem(
+    found: Path, value: Any, contract_dir: Path
+) -> Union[Path, _WorkspaceProblem]:
+    """The directory a workspace ``ref_root`` names, or why it cannot widen anything."""
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    if not isinstance(value, str) or not value.strip():
+        shown = _shown(repr(value))
+        return _WorkspaceProblem(
+            "not_a_path",
+            f"ref_root must be a directory path relative to the workspace file, got {shown}",
+        )
+    text = value.strip()
+    shown = _shown(repr(text))
+
+    def problem(code: str, why: str) -> _WorkspaceProblem:
+        return _WorkspaceProblem(code, f"ref_root {shown} {why}")
+
+    if (
+        text.startswith("~")
+        or PurePosixPath(text).is_absolute()
+        or PureWindowsPath(text).is_absolute()
+        or PureWindowsPath(text).drive
+    ):
+        return problem("not_relative", "must be a path relative to the workspace file's directory")
+    try:
+        workspace_dir = found.resolve()
+        root = (found / text).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return problem("cannot_resolve", f"cannot be resolved: {_shown(str(exc))}")
+    at = _shown(str(root))
+    if not root.is_relative_to(workspace_dir):
+        return problem(
+            "outside_workspace",
+            f"resolves to {at}, outside the workspace directory {workspace_dir}; a workspace "
+            f"file may only widen the root within its own tree",
+        )
+    try:
+        is_dir = root.is_dir()
+    except OSError as exc:
+        # A name too long to look up, or a parent the process may not enter:
+        # Python 3.13 and older raise where 3.14 answers False.
+        why = exc.strerror or _shown(str(exc))
+        return problem("cannot_stat", f"resolves to {at}, which cannot be read: {why}")
+    if not is_dir:
+        return problem("not_a_directory", f"resolves to {at}, which is not a directory")
+    if not contract_dir.is_relative_to(root):
+        return problem("contract_outside", f"resolves to {at}, which does not contain the contract")
+    # The DuckDB sandbox's vetting of a workspace, reused so the two never
+    # disagree on what a project directory is. Imported here only: most
+    # contracts never get this far.
+    from fluid_build.providers._duckdb_sandbox import _repository_below, broad_root_reason
+
+    reason = broad_root_reason(root)
+    if reason is not None:
+        return problem(reason, f"resolves to {at}, which is too broad a root ({reason})")
+    repository = _repository_below(root, contract_dir)
+    if repository is not None:
+        return problem(
+            "outside_repository",
+            f"resolves to {at}, above the repository the contract is in ({repository}); a "
+            f"workspace file there would reach every checkout under it",
+        )
+    return root
+
+
+#: Workspace files whose ``ref_root`` was reported as ignored in this process.
+#: Tests reset it with ``.clear()``.
+_NOTED_WORKSPACE_REF_ROOT_IGNORED: Set[str] = set()
+
+
+def _note_workspace_ref_root_ignored(source: Path, problem: _WorkspaceProblem) -> None:
+    key = str(source)
+    if not _first_time(_NOTED_WORKSPACE_REF_ROOT_IGNORED, key):
+        return
+    LOG.warning(
+        "workspace_ref_root_ignored: %s (%s). Contracts under it keep their own directory "
+        "as the ref root.",
+        problem.text,
+        source,
+        extra={"event": "workspace_ref_root_ignored", "workspace": key, "reason": problem.code},
     )
 
 
@@ -855,16 +1070,24 @@ _NOTED_REF_ROOT_ENV_IGNORED: Set[str] = set()
 _NOTED_REF_ROOT_ENV_IGNORED_LOCK = threading.Lock()
 
 
+def _first_time(noted: Set[str], key: str) -> bool:
+    """Record ``key`` in a ref-root warn-once registry; ``True`` the first time."""
+    with _NOTED_REF_ROOT_ENV_IGNORED_LOCK:
+        if key in noted:
+            return False
+        noted.add(key)
+        return True
+
+
 def _note_ref_root_env_ignored(contract_dir: Path, value: str, problem: str) -> None:
     """WARN, once per ``FLUID_REF_ROOT`` value per process, that it does not
-    apply to this contract and the default root is used."""
-    with _NOTED_REF_ROOT_ENV_IGNORED_LOCK:
-        if value in _NOTED_REF_ROOT_ENV_IGNORED:
-            return
-        _NOTED_REF_ROOT_ENV_IGNORED.add(value)
+    apply to this contract and the root it gets without it (``contract_dir``:
+    its own directory, or its workspace's ``ref_root``) is used."""
+    if not _first_time(_NOTED_REF_ROOT_ENV_IGNORED, value):
+        return
     LOG.warning(
         "ref_root_env_ignored: %s. Ignoring it for this contract: its $refs are "
-        "confined to the contract's own directory %s (the default). Logged once "
+        "confined to %s, the root it gets without the variable. Logged once "
         "per value in this process; a later contract it is ignored for gets no "
         "warning, but its escape errors say the variable was ignored and why.",
         problem,
@@ -898,28 +1121,287 @@ def compile_contract(
             contain the contract. See ``docs/contract-refs.md``.
 
     Returns:
-        Fully resolved contract dict with no remaining ``$ref`` nodes
-        (except same-file pointers, which are preserved).
+        Fully resolved contract dict with no remaining ``$ref`` nodes.
     """
     log = logger or LOG
     p = Path(path).resolve()
-    contract = _parse_file(p)
 
     if not resolve_refs:
-        return contract
+        return _parse_file(p)
 
+    # Parsed once, by the composition: a contract without refs costs one read.
     log.info("compile_start", extra={"path": str(p)})
-    root = _effective_ref_root(p, contract, ref_root)
-    compiled = _resolve_refs(
-        contract,
-        p.parent,
-        ref_root=root.ref_root,
-        root_hint=root.root_hint,
-        ignored_ref_root_env=root.ignored_ref_root_env,
-        _source=p,
-    )
+    compiled = compose_contract(p, ref_root=ref_root, logger=log).document
     log.info("compile_done", extra={"path": str(p)})
     return compiled
+
+
+class ComposedContract(NamedTuple):
+    """A contract composed from its files, as every command reads it."""
+
+    #: The contract: every ``$ref`` resolved, the overlay merged.
+    document: Dict[str, Any]
+    #: The overlay merged in; ``None`` when no env was asked for or none matched.
+    overlay: Optional[Path]
+    #: Every file read, first-read order, resolved: the contract, its
+    #: fragments, then the overlay and its fragments.
+    files: Tuple[Path, ...]
+    #: Which file, and line, each part of ``document`` came from.
+    origins: ContractOrigins
+
+
+def compose_contract(
+    contract_path: str | Path,
+    env: Optional[str] = None,
+    *,
+    ref_root: Optional[Union[str, Path]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> ComposedContract:
+    """The contract at ``contract_path`` as every command reads it for ``env``.
+
+    The one composition behind ``validate``, ``plan``, ``apply``, ``bundle``,
+    ``generate`` and the contract API, so no two of them see different
+    documents:
+
+    1. The contract's file refs resolve (:mod:`fluid_build.contract_refs`).
+    2. The ``env`` overlay (:func:`load_overlay_document`) has its own file
+       refs resolved, relative to the overlay file and confined to the same
+       ref root, so an environment is composed from fragments like the base.
+       Then it is merged (:func:`_deep_merge`), so its ``builds``, ``exposes``
+       and ``consumes`` entries match by the ids their fragments name.
+    3. Same-document pointers resolve against the result.
+
+    The overlay is never dropped: one that cannot be applied is an error. An
+    ``env`` with no overlay gets the base, with the notice of
+    :func:`note_missing_overlay`. The overlay is looked up beside the contract
+    file a symlink leads to, where its refs resolve, and is read as a ref
+    target is: a regular file inside the ref root (:func:`load_overlay_document`).
+
+    Raises:
+        RefResolutionError: a ``$ref`` cannot be resolved; the message names
+            it and the file and JSON pointer it was written at. Also a ``#/``
+            pointer the overlay would merge into an object of the base, and
+            an overlay outside the ref root (:class:`RefConfinementError`).
+        OverlayMergeError: an overlay entry cannot be matched; the message
+            starts with the overlay file.
+        ValueError: the contract or the overlay root is not an object.
+        FileNotFoundError, RuntimeError: the contract cannot be read or parsed.
+        CLIError: ``contract_env_invalid``, ``env`` is not an environment name.
+    """
+    log = logger or LOG
+    path = Path(contract_path)
+    contract = _parse_file(path)
+    if not isinstance(contract, dict):
+        raise ValueError(f"contract root must be an object/dict: {path}")
+    source = path.resolve()
+    found = load_overlay_document(source, env, ref_root=ref_root)
+    overlay_path = found[0] if found is not None else None
+    # The ref root is widened only for a contract with a ref to another file;
+    # an overlay's refs count too.
+    root = _effective_ref_root(path, [contract, found[1]] if found else contract, ref_root)
+    trace = ComposeTrace(ContractOrigins(source))
+    trace.add_file(source)
+    trace.origins.add((), Origin(source, ()))
+    try:
+        document = _compose(
+            contract,
+            base_dir=source.parent,
+            source=source,
+            root=root,
+            trace=trace,
+            overlay=found[1] if found else None,
+            overlay_dir=overlay_path.resolve().parent if overlay_path else None,
+            overlay_source=overlay_path.resolve() if overlay_path else None,
+        )
+    except OverlayMergeError as exc:
+        raise OverlayMergeError(f"{overlay_path}: {exc}") from exc
+    if overlay_path is not None:
+        log.info("overlay_applied", extra={"overlay": str(overlay_path)})
+    elif env:
+        # No overlay found. This used to be a DEBUG line, so ``--env prod``
+        # with a typo'd or missing overlay silently deployed the BASE
+        # contract at the default log level. Say so, once per contract/env.
+        note_missing_overlay(path, env, log, contract=document)
+    composed = ComposedContract(document, overlay_path, tuple(trace.files), trace.origins)
+    sink = _ORIGINS_SINK.get()
+    if sink is not None:
+        sink.append(composed.origins)
+    return composed
+
+
+def compose_document(
+    document: Mapping[str, Any],
+    base_dir: Path,
+    *,
+    overlay: Optional[Mapping[str, Any]] = None,
+    overlay_dir: Optional[Path] = None,
+) -> ComposedContract:
+    """``document`` composed as :func:`compose_contract` composes a contract
+    file in ``base_dir``: its refs confined to the ref root such a file gets
+    (``base_dir``, unless ``FLUID_REF_ROOT`` or the workspace's ``ref_root``
+    widens it, by the same rules), the overlay's refs resolved against
+    ``overlay_dir`` (default ``base_dir``). Neither input is modified;
+    ``files`` lists the fragments read."""
+    trace = ComposeTrace(ContractOrigins())
+    layers = [document, overlay] if overlay is not None else document
+    composed = _compose(
+        dict(document),
+        base_dir=base_dir,
+        source=None,
+        # No file is read for the contract itself: the root is the one a
+        # contract file in ``base_dir`` would get, taken from ``base_dir``
+        # itself, so a symlink at a file name inside it moves nothing.
+        root=_effective_ref_root(
+            base_dir / "contract.fluid.yaml", layers, None, contract_dir=base_dir
+        ),
+        trace=trace,
+        overlay=dict(overlay) if overlay is not None else None,
+        overlay_dir=overlay_dir if overlay_dir is not None else base_dir,
+        overlay_source=None,
+    )
+    return ComposedContract(composed, None, tuple(trace.files), trace.origins)
+
+
+def _compose(
+    contract: Dict[str, Any],
+    *,
+    base_dir: Path,
+    source: Optional[Path],
+    root: _RefRoot,
+    trace: ComposeTrace,
+    overlay: Optional[Dict[str, Any]],
+    overlay_dir: Optional[Path],
+    overlay_source: Optional[Path],
+) -> Dict[str, Any]:
+    """``contract``'s file refs, then the overlay's merged over it, then the
+    same-document pointers of the result: nothing that is a ``$ref`` is left."""
+    budget = RefBudget()
+
+    def refs(
+        document: Dict[str, Any],
+        directory: Path,
+        file: Optional[Path],
+        origins: Optional[ContractOrigins],
+    ) -> Any:
+        return resolve_file_refs(
+            document,
+            directory,
+            ref_root=root.ref_root,
+            root_hint=root.root_hint,
+            ignored_ref_root_env=root.ignored_ref_root_env,
+            source=file,
+            trace=trace,
+            budget=budget,
+            origins=origins,
+        )
+
+    composed = refs(contract, base_dir, source, trace.origins)
+    if not isinstance(composed, dict):
+        # A root ``$ref`` may name a list or a scalar; a contract is an object.
+        raise ValueError(
+            f"contract root must be an object/dict: {source or base_dir} composes to a "
+            f"{type(composed).__name__}"
+        )
+    if overlay is not None and overlay_dir is not None:
+        if overlay_source is not None:
+            trace.add_file(overlay_source)
+        # Resolved first, so a keyed merge sees the ids its fragments name.
+        layer_origins = ContractOrigins()
+        layer = refs(overlay, overlay_dir, overlay_source, layer_origins)
+        if not isinstance(layer, dict):
+            raise ValueError(
+                f"Overlay root must be an object/dict: {overlay_source or overlay_dir} "
+                f"composes to a {type(layer).__name__}"
+            )
+        # A section that is not a list (``builds: 5``) is the schema's to report.
+        lengths = {
+            name: len(section) if isinstance(section := composed.get(name), list) else 0
+            for name in _OVERLAY_IDENTITY_KEYS
+        }
+        # The trace names a refused pointer where it was written (the overlay,
+        # or a fragment of it) and keeps the pointers a pointer replaced.
+        try:
+            composed = _deep_merge(composed, layer, _trace=trace)
+        except RefResolutionError as exc:
+            # Name the overlay a refusal is about, when the message cannot.
+            if overlay_source is None or str(overlay_source) in str(exc):
+                raise
+            raise RefResolutionError(f"merging the overlay {overlay_source}: {exc}") from exc
+        if trace.origins is not None:
+            _note_overlay_origins(
+                trace.origins, layer, layer_origins, composed, overlay_source, lengths
+            )
+    return resolve_pointer_refs(composed, trace=trace, budget=budget)
+
+
+def _note_overlay_origins(
+    origins: ContractOrigins,
+    layer: Dict[str, Any],
+    layer_origins: ContractOrigins,
+    merged: Dict[str, Any],
+    overlay_source: Optional[Path],
+    lengths: Mapping[str, int],
+) -> None:
+    """Record what the overlay wrote, at the paths its entries landed on.
+
+    An entry of a keyed list (``builds``, ``exposes``, ``consumes``) may land at
+    another index than it has in the overlay: matched by id, or appended. The
+    entry with the same id in the merged list is where it landed; an entry that
+    names no id was merged by position. The overlay patches what the base
+    wrote, except an entry it appends, which it wrote whole.
+    """
+    moved: Dict[str, Dict[int, int]] = {}
+    for name, keys in _OVERLAY_IDENTITY_KEYS.items():
+        items, landed = layer.get(name), merged.get(name)
+        if not isinstance(items, list) or not isinstance(landed, list):
+            continue
+        # The first merged entry with each id, indexed once: a lookup per overlay
+        # entry, not a scan of the merged list (quadratic for large lists).
+        first: Dict[Tuple[str, ...], int] = {}
+        for j, landed_item in enumerate(landed):
+            landed_id = _item_identity(landed_item, keys)
+            if landed_id is not None:
+                first.setdefault(landed_id, j)
+        moved[name] = {}
+        for i, item in enumerate(items):
+            ident = _item_identity(item, keys)
+            moved[name][i] = first.get(ident, i) if ident is not None else i
+
+    def move(at: Tuple[Union[str, int], ...]) -> Tuple[Union[str, int], ...]:
+        if len(at) > 1 and at[0] in moved and isinstance(at[1], int):
+            return (at[0], moved[at[0]].get(at[1], at[1]), *at[2:])
+        return at
+
+    if overlay_source is not None:
+        origins.add((), Origin(overlay_source, (), hide=frozenset(moved), patch=True))
+        for name, landing in moved.items():
+            for i, j in landing.items():
+                appended = j >= lengths.get(name, 0)
+                origins.add((name, j), Origin(overlay_source, (name, i), patch=not appended))
+    origins.extend(layer_origins, move, patch=True)
+
+
+#: The :class:`ContractOrigins` of each composition inside a
+#: :func:`collect_origins` block, ``None`` outside one.
+_ORIGINS_SINK: contextvars.ContextVar[Optional[List[ContractOrigins]]] = contextvars.ContextVar(
+    "origins_sink", default=None
+)
+
+
+@contextlib.contextmanager
+def collect_origins() -> Iterator[List[ContractOrigins]]:
+    """Hand the caller where each part of the contracts composed in the block came from.
+
+    ``fluid validate`` loads through the CLI loader, which returns the contract
+    alone; inside this block every :func:`compose_contract` call also appends
+    its :class:`ContractOrigins`, so an error can name the fragment it is in.
+    """
+    sink: List[ContractOrigins] = []
+    token = _ORIGINS_SINK.set(sink)
+    try:
+        yield sink
+    finally:
+        _ORIGINS_SINK.reset(token)
 
 
 def _overlay_candidates(contract_path: Path, env: str) -> Tuple[Path, ...]:
@@ -1182,6 +1664,33 @@ def note_missing_overlay(
     )
 
 
+def load_contract_fields(path: Union[str, Path], *fields: str) -> Dict[str, Any]:
+    """The contract at ``path``, composed only when a value the caller reads needs it.
+
+    For a reader that scans many contracts for a few values (the composition
+    rule's product index, apply's replay walk): ``fields`` are dotted paths
+    (``metadata.productType``). The root is parsed, and the contract composed
+    only when one of those values, or an object above it, is a ``$ref``, so a
+    tree of contracts costs what parsing it does. Other parts are left as
+    written. Raises as :func:`load_contract` does.
+    """
+    raw = _parse_file(Path(path))
+    if any(_ref_along(raw, field.split(".")) for field in fields):
+        return load_contract(path)
+    return raw
+
+
+def _ref_along(node: Any, keys: List[str]) -> bool:
+    """True when the value at ``keys`` under ``node``, or an object above it, holds a ``$ref``."""
+    for key in keys:
+        if is_ref_node(node):
+            return True
+        if not isinstance(node, dict):
+            return False
+        node = node.get(key)
+    return find_ref_node(node) is not None
+
+
 def load_contract(
     path: str | Path,
     *,
@@ -1191,33 +1700,25 @@ def load_contract(
     """
     Load a single FLUID contract file (JSON or YAML).
 
-    By default, any ``$ref`` pointers are resolved transparently so callers
-    always receive a fully-expanded document.  Pass ``resolve_refs=False``
-    to load the raw document without expansion.
+    By default, every ``$ref`` is resolved transparently so callers always
+    receive a fully-expanded document (:func:`compose_contract`, no overlay).
+    Pass ``resolve_refs=False`` to load the raw document without expansion.
 
     ``$ref`` targets are confined to the contract's directory tree; pass
     ``ref_root`` (or set ``FLUID_REF_ROOT``) to widen it to a directory that
     contains the contract. A ref outside the root raises
     :class:`RefConfinementError`.
     """
-    p = Path(path)
-    contract = _parse_file(p)
-    if resolve_refs:
-        source = p.resolve()
-        root = _effective_ref_root(p, contract, ref_root)
-        contract = _resolve_refs(
-            contract,
-            source.parent,
-            ref_root=root.ref_root,
-            root_hint=root.root_hint,
-            ignored_ref_root_env=root.ignored_ref_root_env,
-            _source=source,
-        )
-    return contract
+    if not resolve_refs:
+        return _parse_file(Path(path))
+    return compose_contract(path, ref_root=ref_root).document
 
 
 def load_overlay_document(
-    contract_path: str | Path, env: Optional[str]
+    contract_path: str | Path,
+    env: Optional[str],
+    *,
+    ref_root: Optional[Union[str, Path]] = None,
 ) -> Optional[Tuple[Path, Dict[str, Any]]]:
     """Return ``(path, document)`` for the overlay :func:`load_with_overlay`
     would apply for ``env``, or ``None`` when there is no ``env`` / no
@@ -1230,17 +1731,121 @@ def load_overlay_document(
     ``containers`` map, which wins over ``mode``" — cannot be written at
     all. Same candidate search order, so the two never disagree about
     which file is in play.
+
+    The overlay is a file the composition reads, held to the rules of a
+    ``$ref`` target. ``env`` names it, so it must be one path component
+    (:func:`_refuse_env_path`), never a path that reaches another directory;
+    an empty ``env`` is no env, as ``None`` is, and names no file (``fluid
+    generate artifacts --env ''`` relies on it). It is looked up beside the
+    contract file a symlink leads to, where the contract's refs resolve. It
+    is read only if, symlinks resolved, it is a regular file inside the ref
+    root: the contract's directory, or the root ``ref_root``,
+    ``FLUID_REF_ROOT`` or the workspace widens it to
+    (:func:`_effective_ref_root`), and not in a system directory. It is read
+    with the 5 MiB cap, never past it.
+
+    Raises:
+        CLIError: ``contract_env_invalid``, ``env`` is not one path component.
+        RefConfinementError: the overlay resolves outside the ref root.
+        RefResolutionError: it resolves into a system directory.
+        RuntimeError: it is not a regular file, is over the cap, or cannot be parsed.
+        ValueError: its root is not an object.
     """
     if not env:
         return None
-    base_path = Path(contract_path)
-    for cand in _overlay_candidates(base_path, env):
+    _refuse_env_path(env, contract_path)
+    contract = Path(contract_path).resolve()
+    for cand in _overlay_candidates(contract, env):
         if cand.exists():
+            _confine_overlay(cand, contract, ref_root)
             document = _parse_file(cand)
             if not isinstance(document, dict):
                 raise ValueError(f"Overlay root must be an object/dict: {cand}")
             return cand, document
     return None
+
+
+def _confine_overlay(overlay: Path, contract: Path, ref_root: Optional[Union[str, Path]]) -> None:
+    """Refuse ``overlay`` unless, symlinks resolved, it is inside the ref root.
+
+    An overlay in the contract's own directory is inside every root. One a
+    symlink leads out of it is held to the root the contract's refs get,
+    widened by the same opt-ins, and to the system-directory deny list.
+    """
+    real = overlay.resolve()
+    if real.is_relative_to(contract.parent):
+        return
+    root = _effective_ref_root(contract, None, ref_root, reads_outside=True)
+    resolved_root = root.ref_root.resolve()
+    if not real.is_relative_to(resolved_root):
+        raise RefConfinementError(
+            f"overlay {overlay} escapes the ref root {resolved_root} (after resolving '..' "
+            f"and symlinks it is {real}); an overlay is read only from inside it. "
+            f"{root.root_hint}",
+            ref=str(overlay),
+            pointer="",
+            source=str(contract),
+            root=str(resolved_root),
+            ignored_ref_root_env=root.ignored_ref_root_env,
+        )
+    if _is_system_path(real):
+        raise RefResolutionError(
+            f"overlay {overlay} resolves to a blocked system path: {real}. An overlay is "
+            f"never read from a system directory, whatever the ref root."
+        )
+
+
+#: :func:`_is_env_component` in words, for ``contract_env_invalid``.
+_ENV_RULE = (
+    "an env names an overlay file next to the contract, so it must be one path "
+    "component: not empty, not '.' or '..', no '/', '\\' or NUL, not drive-qualified ('C:prod')"
+)
+
+
+def _is_env_component(env: Any) -> bool:
+    """True when ``env`` keeps every overlay path built from it in the contract's directory.
+
+    Only what makes ``env`` a path is refused, so every other name loads as
+    ``fluid plan --env`` loads it (``_staging``, ``prod+eu``, a long name).
+    The rule does not depend on the platform, so one env means the same thing
+    everywhere: both separators are refused, which also refuses every absolute
+    path, and a Windows drive (``C:prod``) is found with ``ntpath`` on every
+    platform, not with ``os.path``, which finds none on POSIX.
+    """
+    import ntpath
+
+    if not isinstance(env, str) or env in ("", ".", ".."):
+        return False
+    if "\x00" in env or "/" in env or "\\" in env:
+        return False
+    return not ntpath.splitdrive(env)[0]
+
+
+def _refuse_env_path(env: Any, contract_path: Union[str, Path]) -> None:
+    """Refuse an ``env`` that is not one path component: ``contract_env_invalid``.
+
+    The overlay paths are built from ``env`` (``overlays/<env>.yaml`` and the
+    others of :func:`_overlay_candidates`), so ``../x`` or ``/abs/x`` would
+    read a file from anywhere. Checked where the overlay is looked up, so
+    every command holds ``--env`` to the rule the contract API holds ``env``
+    to, under the API's event name.
+    """
+    if _is_env_component(env):
+        return
+    from ._contract_loader import CLIError
+
+    refusal = CLIError(
+        1,
+        "contract_env_invalid",
+        {
+            "env": env,
+            "contract": str(contract_path),
+            "error": f"--env {env!r} is not an environment name: {_ENV_RULE}",
+        },
+    )
+    # ``str()`` of the error is its sentence, as for overlay_declared_but_missing.
+    refusal.args = (refusal.context["error"],)
+    raise refusal
 
 
 def load_with_overlay(
@@ -1254,9 +1859,10 @@ def load_with_overlay(
     """
     Load a contract and, if env is provided, deep-merge a matching overlay.
 
-    ``$ref`` pointers are resolved *before* the overlay is applied so that
-    environment overrides can target any field — including those pulled from
-    external fragments.
+    The document of :func:`compose_contract`: ``$ref`` resolves in the base
+    and in the overlay *before* the merge, so environment overrides can target
+    any field — including those pulled from external fragments — and an
+    overlay can itself be composed from fragments.
 
     Example:
       base: examples/customer360/contract.fluid.yaml
@@ -1264,29 +1870,13 @@ def load_with_overlay(
         examples/customer360/overlays/dev.yaml  (etc...)
     """
     log = logger or logging.getLogger("fluid.loader")
-    base_path = Path(contract_path)
-
-    # Load base (with ref resolution)
-    base = load_contract(base_path, resolve_refs=resolve_refs, ref_root=ref_root)
-
-    # Apply overlay if requested
-    if env:
-        for cand in _overlay_candidates(base_path, env):
-            if cand.exists():
-                try:
-                    overlay = _parse_file(cand)
-                    if not isinstance(overlay, dict):
-                        raise ValueError(f"Overlay root must be an object/dict: {cand}")
-                    merged = _deep_merge(dict(base), overlay)
-                    log.info("overlay_applied", extra={"overlay": str(cand)})
-                    return merged
-                except Exception as e:
-                    raise RuntimeError(f"Failed to apply overlay {cand}: {e}") from e
-        # No overlay found. This used to be a DEBUG line, so ``--env prod``
-        # with a typo'd or missing overlay silently deployed the BASE
-        # contract at the default log level. Say so, once per contract/env.
-        note_missing_overlay(base_path, env, log, contract=base)
-        return base
-
-    # No env → return base as-is
-    return base
+    if not resolve_refs:
+        base = _parse_file(Path(contract_path))
+        found = load_overlay_document(contract_path, env, ref_root=ref_root)
+        if found is None:
+            return base
+        return _deep_merge(dict(base), found[1])
+    try:
+        return compose_contract(contract_path, env, ref_root=ref_root, logger=log).document
+    except OverlayMergeError as exc:
+        raise RuntimeError(f"Failed to apply overlay {exc}") from exc

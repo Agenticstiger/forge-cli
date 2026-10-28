@@ -27,7 +27,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Optional, Union
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Union
 
 import yaml
 
@@ -94,6 +94,42 @@ def format_schema_error(error: Any) -> str:
         # ``not: {pattern: ...}``: a token-shaped variable name, or a ``${``.
         return f"must not match {value['pattern']!r} (value not shown)"
     return f"fails {error.validator}: {error.validator_value!r} (value not shown)"
+
+
+def _locate_error(error: Any, locate: Callable[..., Optional[str]]) -> Optional[str]:
+    """Where the value an error is about was written, by ``locate``.
+
+    ``additionalProperties`` and ``required`` report the object, not the key:
+    an unexpected key is located itself, and a missing one at the object's
+    definition, which is where it belongs, not at a file that only merged
+    other keys into it.
+    """
+    path = list(error.absolute_path)
+    if error.validator == "additionalProperties" and isinstance(error.instance, dict):
+        schema = error.schema if isinstance(error.schema, dict) else {}
+        known = schema.get("properties") or {}
+        patterns = list((schema.get("patternProperties") or {}).keys())
+        for key in error.instance:
+            if key not in known and not any(re.search(p, str(key)) for p in patterns):
+                return locate([*path, key])
+    if error.validator == "required":
+        return locate(path, definition=True)
+    return locate(path)
+
+
+def _error_path(error: Any, locate: Optional[Callable[..., Optional[str]]] = None) -> str:
+    """Where an error is: ``exposes[0].contract.schema[1].type`` (``root`` for the
+    document), after the file and line it was written at when ``locate`` knows
+    one: ``fragments/x.yaml:21 (exposes[0]...)``."""
+    path = ""
+    for part in error.path:
+        if isinstance(part, int):
+            path += f"[{part}]"
+        else:
+            path += f".{part}" if path else str(part)
+    path = path or "root"
+    where = _locate_error(error, locate) if locate is not None else None
+    return f"{where} ({path})" if where else path
 
 
 def _schema_version_sort_key(version: str) -> tuple[int, int, int]:
@@ -251,6 +287,8 @@ class ValidationResult:
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     validation_time: Optional[float] = None
+    #: What was validated, as the summary names it.
+    subject: str = "FLUID contract"
 
     def add_error(self, error: str) -> None:
         """Add a validation error."""
@@ -264,11 +302,11 @@ class ValidationResult:
     def get_summary(self) -> str:
         """Get a human-readable summary."""
         if self.is_valid:
-            summary = f"✅ Valid FLUID contract (schema v{self.schema_version})"
+            summary = f"✅ Valid {self.subject} (schema v{self.schema_version})"
             if self.warnings:
                 summary += f"\n⚠️  {len(self.warnings)} warning(s)"
         else:
-            summary = f"❌ Invalid FLUID contract ({len(self.errors)} error(s))"
+            summary = f"❌ Invalid {self.subject} ({len(self.errors)} error(s))"
             if self.schema_version:
                 summary += f" (schema v{self.schema_version})"
 
@@ -611,6 +649,7 @@ class FluidSchemaManager:
         schema_version: Optional[Union[str, SchemaVersion]] = None,
         strict: bool = True,
         offline_only: bool = False,
+        locate: Optional[Callable[..., Optional[str]]] = None,
     ) -> ValidationResult:
         """
         Validate a FLUID contract against appropriate schema.
@@ -620,6 +659,9 @@ class FluidSchemaManager:
             schema_version: Specific version to validate against (auto-detect if None)
             strict: Whether to fail on warnings
             offline_only: Only use local schemas
+            locate: For a path in ``contract``, the fragment it was written in
+                (``fragments/x.yaml:21``), or ``None`` for the root contract;
+                an error in a fragment is prefixed with it
 
         Returns:
             ValidationResult with details
@@ -656,7 +698,7 @@ class FluidSchemaManager:
         try:
             if JSONSCHEMA_AVAILABLE and "$schema" in schema:
                 # Use JSON Schema validation
-                is_valid = self._validate_with_jsonschema(contract, schema, result)
+                is_valid = self._validate_with_jsonschema(contract, schema, result, locate)
             else:
                 # Fallback to a minimal required-field check only when the
                 # jsonschema library is unavailable (jsonschema is a hard
@@ -677,7 +719,11 @@ class FluidSchemaManager:
         return result
 
     def _validate_with_jsonschema(
-        self, contract: Dict[str, Any], schema: Dict[str, Any], result: ValidationResult
+        self,
+        contract: Dict[str, Any],
+        schema: Dict[str, Any],
+        result: ValidationResult,
+        locate: Optional[Callable[..., Optional[str]]] = None,
     ) -> bool:
         """Validate using JSON Schema library."""
         try:
@@ -692,20 +738,7 @@ class FluidSchemaManager:
             errors = sorted(validator.iter_errors(contract), key=lambda e: e.path)
 
             for error in errors:
-                # Build path string
-                path_parts = []
-                for part in error.path:
-                    if isinstance(part, int):
-                        path_parts.append(f"[{part}]")
-                    else:
-                        if path_parts:
-                            path_parts.append(f".{part}")
-                        else:
-                            path_parts.append(str(part))
-
-                path_str = "".join(path_parts) if path_parts else "root"
-                error_msg = f"{path_str}: {format_schema_error(error)}"
-                result.add_error(error_msg)
+                result.add_error(f"{_error_path(error, locate)}: {format_schema_error(error)}")
 
             return len(errors) == 0
 

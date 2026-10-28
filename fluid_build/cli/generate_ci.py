@@ -412,6 +412,18 @@ def _run_from_generate(args, logger: logging.Logger) -> int:
     return run(args, logger)
 
 
+def _composed_contract(contract_path: str) -> Dict[str, Any]:
+    """The contract as every command reads it (fragments in, no env), or ``{}``
+    when it cannot be read: the caller then falls back to its defaults."""
+    try:
+        from fluid_build.loader import load_contract
+
+        contract = load_contract(contract_path)
+    except Exception:  # noqa: BLE001 - unreadable: the legacy, engine-agnostic default
+        return {}
+    return contract if isinstance(contract, dict) else {}
+
+
 def _contract_is_reference_only(contract_path: str) -> bool:
     """Detect whether a contract is reference-only (no artifact generation).
 
@@ -422,15 +434,7 @@ def _contract_is_reference_only(contract_path: str) -> bool:
     parse error so we err on the side of keeping the generate stages
     (the legacy behavior).
     """
-    try:
-        import yaml
-
-        with open(contract_path, encoding="utf-8") as fh:
-            contract = yaml.safe_load(fh) or {}
-    except (FileNotFoundError, OSError, ImportError):
-        return False
-    except Exception:
-        return False
+    contract = _composed_contract(contract_path)
     builds = contract.get("builds") or []
     if not isinstance(builds, list):
         return False
@@ -450,12 +454,8 @@ def _extract_engine_context(contract_path: str) -> dict:
     the apply stage will actually invoke. Read errors return an empty dict
     (caller falls back to engine-agnostic bootstrap).
     """
-    try:
-        import yaml
-
-        with open(contract_path, encoding="utf-8") as fh:
-            contract = yaml.safe_load(fh) or {}
-    except (FileNotFoundError, OSError, ImportError, Exception):
+    contract = _composed_contract(contract_path)
+    if not contract:
         return {}
 
     builds = contract.get("builds") or []

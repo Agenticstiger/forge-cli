@@ -323,3 +323,132 @@ def test_index_links_to_per_contract_pages(tmp_path):
     html_text = (out_dir / "index.html").read_text()
     assert 'href="contract-orders-product.html"' in html_text
     assert 'href="contract-customers-product.html"' in html_text
+
+
+# ── 0.7.x contracts and fragments (draft 27) ────────────────────────────
+
+SAMPLE_076 = """\
+fluidVersion: "0.7.6"
+kind: DataProduct
+id: commerce.orders
+name: Orders
+description:
+  purpose: One row per order.
+  usage: Join on order_id.
+  limitations: No refunds before 2024.
+domain: commerce
+tags: [finance]
+metadata:
+  layer: Silver
+  owner: {team: commerce-data, email: commerce@example.com}
+consumes:
+  - {productId: commerce.raw_orders, exposeId: orders_raw}
+exposes:
+  - exposeId: orders
+    kind: table
+    binding: {platform: local, format: csv, location: {path: out/orders.csv}}
+    contract:
+      schema:
+        - {name: order_id, type: string, required: true}
+        - {name: email, type: string, sensitivity: pii}
+"""
+
+
+def _docs(src_glob: str, out_dir: Path) -> int:
+    from fluid_build.cli import docs_build
+
+    args = argparse.Namespace(src="unused", files=src_glob, out=str(out_dir))
+    return docs_build.run(args, logging.getLogger("test"))
+
+
+def test_docs_reads_a_076_contract_whole(tmp_path):
+    (tmp_path / "p").mkdir()
+    (tmp_path / "p" / "contract.fluid.yaml").write_text(SAMPLE_076, encoding="utf-8")
+
+    assert _docs(str(tmp_path / "p" / "contract.fluid.yaml"), tmp_path / "site") == 0
+
+    page = (tmp_path / "site" / "contract-commerce-orders.html").read_text(encoding="utf-8")
+    assert "<code>orders</code></h3>" in page and "<code>expose-0</code>" not in page
+    assert "<strong>Purpose:</strong> One row per order." in page
+    assert "<strong>Limitations:</strong> No refunds before 2024." in page
+    assert "<code>order_id</code></td><td>string</td><td>no</td><td></td>" in page
+    assert 'aria-label="contains PII"' in page
+    assert "commerce-data (commerce@example.com)" in page
+    assert "commerce.raw_orders/orders_raw" in page
+    index = json.loads((tmp_path / "site" / "index.json").read_text(encoding="utf-8"))
+    assert index[0]["domain"] == "commerce" and index[0]["tags"] == ["finance"]
+    assert index[0]["owner"] == {"team": "commerce-data", "email": "commerce@example.com"}
+
+
+def test_docs_writes_the_same_page_for_a_contract_before_and_after_split(tmp_path, monkeypatch):
+    from fluid_build.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    contract = tmp_path / "p" / "contract.fluid.yaml"
+    contract.parent.mkdir()
+    contract.write_text(SAMPLE_076, encoding="utf-8")
+    assert _docs(str(contract), tmp_path / "flat") == 0
+
+    assert main(["split", str(contract)]) == 0
+    assert "$ref" in contract.read_text(encoding="utf-8")
+    assert _docs(str(contract), tmp_path / "split") == 0
+
+    for name in ("index.json", "index.html", "contract-commerce-orders.html"):
+        assert (tmp_path / "flat" / name).read_bytes() == (tmp_path / "split" / name).read_bytes()
+
+
+def test_one_bad_contract_does_not_cost_the_catalog(tmp_path):
+    for name, text in {
+        "good": SAMPLE_076,
+        "broken": "fluidVersion: [\n",
+        "dangling": SAMPLE_076.replace("commerce.orders", "x.dangling").replace(
+            "tags: [finance]", "tags: {$ref: ./missing.yaml}"
+        ),
+    }.items():
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "contract.fluid.yaml").write_text(text, encoding="utf-8")
+
+    assert _docs(str(tmp_path / "*" / "contract.fluid.yaml"), tmp_path / "site") == 0
+
+    assert (tmp_path / "site" / "contract-commerce-orders.html").exists()
+    index = json.loads((tmp_path / "site" / "index.json").read_text(encoding="utf-8"))
+    errors = {Path(e["path"]).parent.name: e.get("error") for e in index}
+    assert errors["good"] is None
+    assert errors["broken"].startswith("not loaded:")
+    assert "$ref target not found: ./missing.yaml" in errors["dangling"]
+
+
+def test_two_contracts_with_one_id_get_a_page_each(tmp_path):
+    for name in ("a", "b"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "contract.fluid.yaml").write_text(SAMPLE_076, encoding="utf-8")
+
+    assert _docs(str(tmp_path / "*" / "contract.fluid.yaml"), tmp_path / "site") == 0
+
+    index = json.loads((tmp_path / "site" / "index.json").read_text(encoding="utf-8"))
+    assert [e["slug"] for e in index] == ["commerce-orders", "commerce-orders-2"]
+    for slug in ("commerce-orders", "commerce-orders-2"):
+        assert (tmp_path / "site" / f"contract-{slug}.html").exists()
+
+
+def test_a_page_that_cannot_be_rendered_is_not_emptied(tmp_path, monkeypatch):
+    import pytest
+
+    from fluid_build.cli import docs_build
+    from fluid_build.cli._common import CLIError
+
+    (tmp_path / "p").mkdir()
+    (tmp_path / "p" / "contract.fluid.yaml").write_text(SAMPLE_076, encoding="utf-8")
+    page = tmp_path / "site" / "contract-commerce-orders.html"
+    page.parent.mkdir()
+    page.write_text("the page from the last run", encoding="utf-8")
+
+    def _boom(contract, path):
+        raise RuntimeError("cannot render")
+
+    monkeypatch.setattr(docs_build, "_render_contract_html", _boom)
+    with pytest.raises(CLIError) as err:
+        _docs(str(tmp_path / "p" / "contract.fluid.yaml"), tmp_path / "site")
+
+    assert "contract.fluid.yaml: cannot render" in str(err.value.context)
+    assert page.read_text(encoding="utf-8") == "the page from the last run"

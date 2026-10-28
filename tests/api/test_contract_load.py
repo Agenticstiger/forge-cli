@@ -299,27 +299,28 @@ def test_a_bundle_refuses_an_env_it_was_not_built_for(ws: Path) -> None:
     assert err.value.event == "bundle_env_mismatch"
 
 
-def test_overlay_provenance_matches_what_plan_applied(ws: Path, caplog: Any) -> None:
-    """An overlay holding a ``$ref`` is dropped by the engine's auto-bundle step
-    today (``fluid plan --env prod`` plans the base). Whatever the engine
-    does, the contract equals plan's, and ``overlay`` / ``files`` name the
-    overlay exactly when it reached the contract."""
+def test_an_overlay_composed_from_fragments_is_applied_and_listed(ws: Path, caplog: Any) -> None:
+    """An overlay's own ``$ref`` values resolve relative to the overlay file
+    before the merge: the overlay is applied, never dropped, its fragment is
+    listed among the files, and the contract equals plan's."""
     files = dict(_CASES["composed"])
-    files["overlays/prod.yaml"] = 'name: Orders (prod)\ndescription: {"$ref": "./parts/d.yaml"}\n'
-    files["parts/d.yaml"] = "text: prod\n"
+    files["overlays/prod.yaml"] = 'name: Orders (prod)\ndescription: {"$ref": "../parts/d.yaml"}\n'
+    files["parts/d.yaml"] = "Orders, as prod serves them\n"
     contract_path = _write(ws, files)
     planned = _plan(contract_path, ws / "plan.json", "prod")["contract"]
 
     with caplog.at_level(logging.WARNING, logger="fluid.api.contract"):
         loaded = api.load_contract(contract_path, env="prod")
 
-    overlay_file = contract_path.resolve().parent / "overlays" / "prod.yaml"
-    applied = loaded.contract["name"] == "Orders (prod)"
+    root = contract_path.resolve().parent
     assert loaded.contract == planned
-    assert (loaded.overlay == overlay_file) is applied
-    assert (overlay_file in loaded.files) is applied
-    warned = any("contract_overlay_not_applied" in r.getMessage() for r in caplog.records)
-    assert warned is not applied
+    assert (loaded.contract["name"], loaded.contract["description"]) == (
+        "Orders (prod)",
+        "Orders, as prod serves them",
+    )
+    assert loaded.overlay == root / "overlays" / "prod.yaml"
+    assert loaded.files[-2:] == (root / "overlays" / "prod.yaml", root / "parts" / "d.yaml")
+    assert not caplog.records
 
 
 # ── provenance ──────────────────────────────────────────────────────────
@@ -382,7 +383,7 @@ def test_nested_and_pointer_refs_are_listed_once_in_read_order(ws: Path) -> None
     )
 
 
-def test_a_same_document_pointer_is_reported_unresolved(ws: Path) -> None:
+def test_a_same_document_pointer_is_resolved(ws: Path) -> None:
     contract_path = _write(
         ws,
         {"contract.fluid.yaml": 'id: x\ndefs: {n: 1}\ndescription: {"$ref": "#/defs/n"}\n'},
@@ -390,8 +391,8 @@ def test_a_same_document_pointer_is_reported_unresolved(ws: Path) -> None:
 
     loaded = api.load_contract(contract_path)
 
-    assert loaded.contract["description"] == {"$ref": "#/defs/n"}
-    assert loaded.unresolved_refs == ("#/defs/n",)
+    assert loaded.contract["description"] == 1
+    assert loaded.unresolved_refs == ()
 
 
 # ── in-memory forms ─────────────────────────────────────────────────────
@@ -573,57 +574,62 @@ def test_every_env_plan_loads_selects_its_overlay(ws: Path, env: str) -> None:
     assert loaded.overlay == (contract_path.parent / "overlays" / f"{env}.yaml").resolve()
 
 
-# ── the in-memory overlay follows the engine's auto-bundle step ─────────
+# ── the in-memory overlay is composed as the engine composes it ─────────
 
-# Two shapes in which ``fluid plan --env prod`` drops the overlay, because a
-# ``$ref`` survives the merge and the auto-bundle step reloads the base file.
-_OVERLAY_DROPPED: Dict[str, Dict[str, str]] = {
+# Two shapes in which ``fluid plan --env prod`` used to drop the overlay: a
+# ``$ref`` survived the merge and an auto-bundle step reloaded the base file.
+# Both forms now apply the overlay, and agree.
+_OVERLAY_WITH_REFS: Dict[str, Dict[str, str]] = {
     # A same-document pointer in the base contract (in an open block, so the
     # contract still plans).
     "same_document_pointer": {
         "contract.fluid.yaml": _ALIASES + 'extensions: {n: 1, copy: {"$ref": "#/extensions/n"}}\n',
         "overlays/prod.yaml": "name: Orders (prod)\n",
     },
-    # A ``$ref`` inside the overlay itself.
+    # A ``$ref`` inside the overlay itself, relative to the overlay file.
     "ref_in_overlay": {
         **_CASES["composed"],
-        "overlays/prod.yaml": 'name: Orders (prod)\ndescription: {"$ref": "./parts/d.yaml"}\n',
-        "parts/d.yaml": "text: prod\n",
+        "overlays/prod.yaml": 'name: Orders (prod)\ndescription: {"$ref": "../parts/d.yaml"}\n',
+        "parts/d.yaml": "Orders in prod\n",
     },
 }
 
 
-@pytest.mark.parametrize("shape", sorted(_OVERLAY_DROPPED))
-def test_in_memory_overlay_matches_the_file_form_when_the_engine_drops_it(
+@pytest.mark.parametrize("shape", sorted(_OVERLAY_WITH_REFS))
+def test_in_memory_overlay_matches_the_file_form_when_refs_survive_the_merge(
     ws: Path, shape: str, caplog: Any
 ) -> None:
-    contract_path = _write(ws, _OVERLAY_DROPPED[shape])
+    contract_path = _write(ws, _OVERLAY_WITH_REFS[shape])
     planned = _plan(contract_path, ws / "plan.json", "prod")["contract"]
-    overlay = load_yaml_safe((contract_path.parent / "overlays" / "prod.yaml").read_text("utf-8"))
+    overlay_file = contract_path.parent / "overlays" / "prod.yaml"
+    overlay = load_yaml_safe(overlay_file.read_text("utf-8"))
     from_file = api.load_contract(contract_path, env="prod")
 
     with caplog.at_level(logging.WARNING, logger="fluid.api.contract"):
         caplog.clear()
         from_text = api.load_contract_from_text(
-            contract_path.read_text("utf-8"), base_dir=contract_path.parent, overlay=overlay
+            contract_path.read_text("utf-8"),
+            base_dir=contract_path.parent,
+            overlay=overlay,
+            overlay_dir=overlay_file.parent,
         )
 
     assert from_file.contract == planned
+    assert from_file.contract["name"] == "Orders (prod)"
     assert from_text.contract == from_file.contract
     assert from_text.digest == from_file.digest
-    dropped = from_file.contract["name"] == "Orders"
-    warned = any("contract_overlay_not_applied" in r.getMessage() for r in caplog.records)
-    assert warned is dropped
+    assert not caplog.records
 
 
 def test_in_memory_overlay_without_base_dir_follows_a_same_document_pointer(ws: Path) -> None:
-    """No file ``$ref``: the engine's decision is knowable without a directory."""
-    contract_path = _write(ws, _OVERLAY_DROPPED["same_document_pointer"])
+    """No file ``$ref``: the document composes without a directory."""
+    contract_path = _write(ws, _OVERLAY_WITH_REFS["same_document_pointer"])
     overlay = load_yaml_safe((contract_path.parent / "overlays" / "prod.yaml").read_text("utf-8"))
 
     from_text = api.load_contract_from_text(contract_path.read_text("utf-8"), overlay=overlay)
 
     assert from_text.contract == api.load_contract(contract_path, env="prod").contract
+    assert from_text.contract["extensions"]["copy"] == 1
 
 
 def test_in_memory_overlay_without_base_dir_refuses_an_undecidable_document() -> None:
@@ -634,21 +640,14 @@ def test_in_memory_overlay_without_base_dir_refuses_an_undecidable_document() ->
     assert err.value.event == "contract_overlay_needs_base_dir"
 
 
-def test_in_memory_overlay_logs_to_the_callers_logger() -> None:
-    records: List[logging.LogRecord] = []
-
-    class _Collect(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            records.append(record)
-
-    mine = logging.getLogger("test.api.contract_load.caller")
-    mine.addHandler(_Collect())
+def test_in_memory_overlay_with_a_pointer_is_applied() -> None:
     document = {"id": "x", "name": "base", "defs": {"n": 1}, "d": {"$ref": "#/defs/n"}}
 
-    loaded = api.load_contract_from_dict(document, overlay={"name": "prod"}, logger=mine)
+    loaded = api.load_contract_from_dict(document, overlay={"name": "prod", "defs": {"n": 2}})
 
-    assert loaded.contract["name"] == "base"
-    assert [getattr(r, "event", None) for r in records] == ["contract_overlay_not_applied"]
+    # The pointer resolves after the merge: it names the overlay's value.
+    assert (loaded.contract["name"], loaded.contract["d"]) == ("prod", 2)
+    assert loaded.unresolved_refs == ()
 
 
 # ── YAML aliases: shared in the parse, separate in the engine ───────────
@@ -695,11 +694,11 @@ def test_in_memory_form_without_base_dir_unshares_yaml_aliases(ws: Path, shape: 
     assert api.load_contract_from_text(text).digest == api.load_contract(contract_path).digest
 
 
-def test_aliases_inside_an_overlay_stay_shared_as_in_the_engine(ws: Path) -> None:
-    """The engine parses an overlay file without the resolver, so sharing *inside*
-    the overlay survives the merge, and a rewrite reaches every alias of the
-    node it changes. The in-memory forms keep it the same way. (The base has
-    no ``exposes``, so the merge places the overlay's own node.)"""
+def test_aliases_inside_an_overlay_are_separate_as_in_the_engine(ws: Path) -> None:
+    """The engine composes an overlay like the base, so sharing *inside* the
+    overlay is broken before the merge, and a rewrite reaches only the node it
+    names. The in-memory forms do the same. (The base has no ``exposes``, so
+    the merge places the overlay's own node.)"""
     contract_path = _write(
         ws,
         {
@@ -715,7 +714,8 @@ def test_aliases_inside_an_overlay_stay_shared_as_in_the_engine(ws: Path) -> Non
 
     from_text = api.load_contract_from_text(contract_path.read_text("utf-8"), overlay=overlay)
 
-    assert from_file.contract["extensions"]["copy"]["format"] == "kafka_topic"
+    assert from_file.contract["exposes"][0]["binding"]["format"] == "kafka_topic"
+    assert from_file.contract["extensions"]["copy"]["format"] == "kafka"
     assert from_text.contract == from_file.contract
     assert from_text.digest == from_file.digest
 
@@ -885,17 +885,16 @@ def _engine_post_load_effects(source: str = _ENGINE_SOURCE) -> Tuple[List[str], 
     return steps, writes
 
 
-# The engine loads (``load_with_overlay``, or ``load_contract`` for a loader
-# without it), then runs the auto-bundle step and the rewrites.
-_EXPECTED_STEPS = ["_auto_bundle_if_needed", *contract_api._ENGINE_REWRITES]
+# The engine composes (``load_with_overlay``, or ``load_contract`` for a loader
+# without it), then runs the rewrites.
+_EXPECTED_STEPS = [*contract_api._ENGINE_REWRITES]
 _EXPECTED_WRITES = ["load_with_overlay", "load_contract", *_EXPECTED_STEPS]
 
 
 def test_in_memory_forms_replay_every_engine_loader_step() -> None:
-    """The file form calls the engine loader; the in-memory forms replay its steps
-    (``_replay_overlay`` for the auto-bundle decision, then
-    ``_ENGINE_REWRITES`` by name). A step added to, removed from or moved in
-    the engine fails here until the in-memory forms follow it."""
+    """Every form composes as the engine does, then replays its rewrites
+    (``_ENGINE_REWRITES``, by name). A step added to, removed from or moved in
+    the engine fails here until this module follows it."""
     assert _engine_post_load_effects() == (_EXPECTED_STEPS, _EXPECTED_WRITES)
     for name in contract_api._ENGINE_REWRITES:
         assert callable(getattr(_contract_loader, name))
@@ -1114,3 +1113,20 @@ def test_digest_is_the_planned_contracts_not_the_raw_files(ws: Path) -> None:
     contract_path = _write(ws, _CASES["aliases"])
     raw = compute_contract_digest(load_yaml_safe(contract_path.read_text("utf-8")))
     assert api.load_contract(contract_path).digest != raw
+
+
+def test_a_symlink_named_like_a_contract_in_base_dir_does_not_move_the_ref_root(
+    tmp_path: Path,
+) -> None:
+    """An upload is held to ``base_dir``: a ``contract.fluid.yaml -> .`` link inside it
+    (one tarfile's ``data`` filter keeps) must not widen the root to its parent."""
+    (tmp_path / "tenant-b").mkdir()
+    (tmp_path / "tenant-b" / "secrets.json").write_text('{"token": "B"}', encoding="utf-8")
+    upload = tmp_path / "tenant-a"
+    upload.mkdir()
+    (upload / "contract.fluid.yaml").symlink_to(".")
+    document = {"id": "a.x", "extensions": {"x": {"$ref": "../tenant-b/secrets.json"}}}
+
+    with pytest.raises(ContractLoadError) as err:
+        api.load_contract_from_dict(document, base_dir=upload)
+    assert "escapes the ref root" in str(err.value.__cause__ or err.value)

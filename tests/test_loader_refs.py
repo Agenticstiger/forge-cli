@@ -41,11 +41,11 @@ from textwrap import dedent
 import pytest
 import yaml
 
+from fluid_build.contract_refs import is_ref_node as _is_ref_node
+from fluid_build.contract_refs import parse_ref as _parse_ref
+from fluid_build.contract_refs import resolve_pointer as _resolve_pointer
 from fluid_build.loader import (
     RefResolutionError,
-    _is_ref_node,
-    _parse_ref,
-    _resolve_pointer,
     _resolve_refs,
     compile_contract,
     load_contract,
@@ -79,8 +79,9 @@ class TestIsRefNode:
     def test_valid_ref(self):
         assert _is_ref_node({"$ref": "./file.yaml"}) is True
 
-    def test_ref_with_extra_keys_is_not_ref(self):
-        assert _is_ref_node({"$ref": "./file.yaml", "extra": True}) is False
+    def test_ref_with_sibling_keys_is_a_ref(self):
+        # The siblings are merged over the target (RFC 7386), never ignored.
+        assert _is_ref_node({"$ref": "./file.yaml", "extra": True}) is True
 
     def test_empty_dict(self):
         assert _is_ref_node({}) is False

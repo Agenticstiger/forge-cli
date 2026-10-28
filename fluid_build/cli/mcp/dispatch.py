@@ -245,7 +245,7 @@ def _call_tool(
         if arguments.get("logical_path"):
             logical = _load_logical_draft(Path(arguments["logical_path"]))
         if arguments.get("contract_path"):
-            contract = yaml.safe_load(Path(arguments["contract_path"]).read_text(encoding="utf-8"))
+            contract = _contract_file(arguments["contract_path"])
         return validator.validate(logical=logical, contract=contract).model_dump(
             mode="json", by_alias=True
         )
@@ -430,6 +430,61 @@ def _call_tool(
     raise RuntimeError(f"Unknown tool {name}")
 
 
+def _contract_file(path_arg: str) -> Dict[str, Any]:
+    """The contract at ``path_arg`` as ``fluid validate`` sees it: composed.
+
+    Read raw, a contract kept in fragments holds ``{$ref: ...}`` where its
+    builds and exposes are. The composition confines its fragments to the ref
+    root, which a workspace ``ref_root`` or ``FLUID_REF_ROOT`` may widen past
+    the server's ``--readable-paths``. Under an active policy that root is
+    capped to the readable path holding the contract before any fragment is
+    opened, so a ref outside it fails as an escape, quoting nothing of the
+    file; every file read is then checked again. Without a policy (no server
+    running) only the ref root applies.
+    """
+    from fluid_build import loader
+    from fluid_build.cli.mcp.policy import _path_is_allowed
+
+    path = Path(path_arg)
+    try:
+        policy = _pkg()._policy()
+    except RuntimeError:  # not served: no policy to hold the reads to
+        policy = None
+    ref_root = None
+    if policy is not None:
+        ref_root = _readable_ref_root(path, policy.readable_paths)
+    composed = loader.compose_contract(path, ref_root=ref_root)
+    if policy is not None:
+        for file in composed.files:
+            if not _path_is_allowed(Path(file).resolve(), policy.readable_paths):
+                raise PermissionError(
+                    f"contract {path_arg} composes {file}, which is outside --readable-paths"
+                )
+    if not isinstance(composed.document, dict):
+        raise RuntimeError(f"Contract at {path_arg!r} did not parse to a dict")
+    return composed.document
+
+
+def _readable_ref_root(path: Path, readable: Tuple[Path, ...]) -> Optional[Path]:
+    """The ref root to compose ``path`` under so it reads nothing outside ``readable``:
+    ``None`` (the root it would get) when that root is readable, else the readable path
+    that holds the contract, which narrows it."""
+    from fluid_build import loader
+    from fluid_build.cli.mcp.policy import _path_is_allowed
+
+    # The root it would get if it named another file (reads_outside): one that
+    # names none reads nothing past its own directory anyway.
+    root = loader._effective_ref_root(path, {}, None, reads_outside=True).ref_root
+    if _path_is_allowed(Path(root).resolve(), readable):
+        return None
+    contract = path.resolve()
+    holders = [r.resolve() for r in readable if r.is_dir() and _path_is_allowed(contract, (r,))]
+    # The deepest readable directory holding the contract: the narrowest cap. A
+    # readable path that names files leaves the contract's own directory, and the
+    # check of every file read after the composition.
+    return max(holders, key=lambda r: len(r.parts)) if holders else contract.parent
+
+
 def _resolve_contract_argument(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Accept either ``contract_path`` (filesystem) or ``contract`` (inline dict).
 
@@ -441,11 +496,7 @@ def _resolve_contract_argument(arguments: Dict[str, Any]) -> Dict[str, Any]:
     path_arg = arguments.get("contract_path")
     inline = arguments.get("contract")
     if path_arg:
-        text = Path(path_arg).read_text(encoding="utf-8")
-        loaded = yaml.safe_load(text) or {}
-        if not isinstance(loaded, dict):
-            raise RuntimeError(f"Contract at {path_arg!r} did not parse to a dict")
-        return loaded
+        return _contract_file(path_arg)
     if inline is not None:
         if not isinstance(inline, dict):
             raise RuntimeError("'contract' argument must be a dict")

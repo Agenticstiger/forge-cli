@@ -17,10 +17,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
@@ -109,6 +110,9 @@ Examples:
 
   # Strict: also fail when an overlay patch lands on another entry
   fluid validate contract.fluid.yaml --env prod --strict
+
+  # One fragment on its own, as the expose it stands for
+  fluid validate --fragment expose fragments/exposes/orders.yaml
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -118,6 +122,16 @@ Examples:
 
     # Optional arguments
     p.add_argument("--env", help="Overlay environment (dev/test/prod)")
+    p.add_argument(
+        "--fragment",
+        metavar="KIND",
+        help=(
+            "Validate the file as one fragment of a contract: KIND is a $defs name of the "
+            "schema (expose, build, column, sovereignty, accessPolicy, ...), or quality / "
+            "schema for an expose's lists. The version is --schema-version, else the "
+            "fluidVersion of the nearest contract.fluid.yaml above the file."
+        ),
+    )
 
     # Version control
     p.add_argument(
@@ -303,9 +317,12 @@ def run(args, logger: logging.Logger) -> int:
         if contract_lower.endswith(".tgz") or contract_lower.endswith(".tar.gz"):
             return _run_bundle_validation(contract_path, args, schema_manager, logger, start_time)
 
+        if isinstance(getattr(args, "fragment", None), str):
+            return _run_fragment_validation(Path(contract_path), args, schema_manager, logger)
+
         # Load contract with overlay
         try:
-            contract, overlay_warnings = _load_with_overlay_warnings(
+            contract, overlay_warnings, locate = _load_with_overlay_warnings(
                 args.contract, getattr(args, "env", None), logger
             )
         except Exception as e:
@@ -334,6 +351,7 @@ def run(args, logger: logging.Logger) -> int:
             args=args,
             schema_manager=schema_manager,
             logger=logger,
+            locate=locate,
         )
 
         for warning in overlay_warnings:
@@ -348,7 +366,7 @@ def run(args, logger: logging.Logger) -> int:
         # sub-key of ``contract.extensions`` and validates its own shape
         # there. Errors get appended to the validation result as if they
         # had been emitted by the core schema validator.
-        _run_extension_validators(contract, validation_result, logger)
+        _run_extension_validators(contract, validation_result, logger, locate=locate)
 
         # Run plugin-supplied contract validators (entry-point group
         # ``fluid_build.validators`` — the fluid_sdk ``Validator`` role). Each
@@ -451,19 +469,174 @@ def run(args, logger: logging.Logger) -> int:
 
 def _load_with_overlay_warnings(
     contract_path: str, env: Optional[str], logger: logging.Logger
-) -> tuple[dict, list[str]]:
-    """Load a contract with its ``--env`` overlay, and the overlay warnings to report.
+) -> tuple[dict, list[str], Optional[Callable[..., Optional[str]]]]:
+    """Load a contract with its ``--env`` overlay, the overlay warnings to report,
+    and where each part of it was written.
 
     A positional overlay patch that lands on another entry is only logged by
     the loader, and ``--strict`` reads the validation result, never the log.
     :func:`fluid_build.loader.collect_overlay_warnings` hands it to validate
     instead, so it is reported as a warning and ``--strict`` fails on it.
+    :func:`fluid_build.loader.collect_origins` hands over the composition's
+    origins, so an error in a fragment or the overlay names that file and line.
     """
-    from fluid_build.loader import collect_overlay_warnings
+    from fluid_build.loader import collect_origins, collect_overlay_warnings
 
-    with collect_overlay_warnings() as overlay_warnings:
+    with collect_overlay_warnings() as overlay_warnings, collect_origins() as origins:
         contract = load_contract_with_overlay(contract_path, env, logger)
-    return contract, [warning.message for warning in overlay_warnings]
+    locate = origins[-1].describe if origins else None
+    return contract, [warning.message for warning in overlay_warnings], locate
+
+
+#: ``--fragment`` kinds that are not a ``$defs`` name: an expose's lists.
+_FRAGMENT_POINTERS = {
+    "quality": "#/$defs/exposeContract/properties/quality",
+    "schema": "#/$defs/exposeContract/properties/schema",
+}
+
+#: The file names a root contract has, nearest first.
+_CONTRACT_FILE_NAMES = ("contract.fluid.yaml", "contract.fluid.yml", "contract.fluid.json")
+
+
+def _run_fragment_validation(
+    fragment: Path, args: Any, schema_manager: FluidSchemaManager, logger: logging.Logger
+) -> int:
+    """``fluid validate --fragment KIND FILE``: one fragment, against the schema of what it stands for.
+
+    The fragment's own file refs are resolved, confined as the contract it
+    belongs to would confine them (the nearest ``contract.fluid.yaml`` above
+    it; without one, the fragment's directory). Its errors name it and the
+    line, as validating the whole contract does. Only the schema is checked:
+    the contract-wide rules (sovereignty against regions, overlays) need the
+    whole contract.
+    """
+    from fluid_build import contract_refs, loader
+    from fluid_build.schema_manager import SchemaVersion, ValidationResult
+    from fluid_build.util.ref_confinement import RefResolutionError, is_within
+
+    kind = args.fragment
+    if getattr(args, "env", None):
+        raise CLIError(
+            1,
+            "fragment_env_unsupported",
+            {"error": "--env applies to a whole contract; validate the contract with it"},
+        )
+    contract = _nearest_contract(fragment)
+    version = (
+        args.schema_version
+        or _contract_version(contract)
+        or (schema_manager.latest_bundled_version())
+    )
+    schema = schema_manager.get_schema(SchemaVersion.parse(version), offline_only=True)
+    if not schema:
+        raise CLIError(1, "schema_not_available", {"version": version})
+    defs = schema.get("$defs") or {}
+    pointer = _FRAGMENT_POINTERS.get(kind) or (f"#/$defs/{kind}" if kind in defs else None)
+    if pointer is None:
+        kinds = ", ".join(sorted([*defs, *_FRAGMENT_POINTERS]))
+        raise CLIError(
+            1,
+            "fragment_kind_unknown",
+            {"error": f"{kind!r} is not a kind of fragment in schema {version}; kinds: {kinds}"},
+        )
+
+    origins = loader.ContractOrigins(None)
+    origins.add((), loader.Origin(fragment.resolve(), ()))
+    try:
+        raw = contract_refs._parse_target(fragment.resolve())
+        root = (
+            loader._effective_ref_root(contract, [raw], None)
+            if contract is not None
+            else loader._RefRoot(fragment.resolve().parent)
+        )
+        if not is_within(fragment.resolve(), root.ref_root):
+            raise RefResolutionError(
+                f"fragment {fragment} is outside the ref root of its contract {contract} "
+                f"({root.ref_root}): a fragment is checked under the root its contract has"
+            )
+        document = contract_refs.resolve_file_refs(
+            raw,
+            fragment.resolve().parent,
+            ref_root=root.ref_root,
+            root_hint=root.root_hint,
+            ignored_ref_root_env=root.ignored_ref_root_env,
+            source=fragment.resolve(),
+            trace=contract_refs.ComposeTrace(origins),
+        )
+    except Exception as exc:  # noqa: BLE001 - reported as a load failure, as for a contract
+        raise CLIError(1, "contract_load_failed", {"error": str(exc)})
+    if contract_refs.find_ref_node(document) is not None:
+        raise CLIError(
+            1,
+            "fragment_has_pointers",
+            {
+                "error": (
+                    "the fragment holds same-document pointers (#/...), which name places "
+                    "in the whole contract: validate the contract that uses it"
+                )
+            },
+        )
+
+    def locate(path: Sequence[Any], definition: bool = False) -> Optional[str]:
+        found = origins.locate(path, definition=definition)
+        if found is None:
+            return None
+        try:
+            shown = os.path.relpath(found[0])
+        except ValueError:  # another drive, on Windows
+            shown = str(found[0])
+        return f"{shown}:{found[1]}" if found[1] else shown
+
+    result = ValidationResult(
+        is_valid=True, schema_version=SchemaVersion.parse(version), subject=f"{kind} fragment"
+    )
+    wrapper = {"$schema": schema.get("$schema"), "$defs": defs, "$ref": pointer}
+    if not schema_manager._validate_with_jsonschema(document, wrapper, result, locate):
+        result.is_valid = False
+    return _output_results(result, args, logger)
+
+
+def _nearest_contract(fragment: Path) -> Optional[Path]:
+    """The root contract nearest above ``fragment``, the one it most likely belongs to.
+
+    It chooses the fragment's ref root, so a symlink is never taken for it (the
+    CLI refuses a symlinked contract path for the same reason: a planted link
+    would point the root anywhere), and the walk stops at the fragment's
+    repository or workspace (a directory holding ``.git``, ``.hg``, ``.svn`` or
+    ``fluid.workspace.yaml``), and before a home directory, a temp root or
+    ``/`` (the vetting a workspace ``ref_root`` gets), so an unrelated contract
+    higher up cannot widen it.
+    """
+    from fluid_build.providers._duckdb_sandbox import broad_root_reason
+
+    start = fragment.resolve()
+    for directory in start.parents:
+        if broad_root_reason(directory) is not None:
+            return None
+        for name in _CONTRACT_FILE_NAMES:
+            candidate = directory / name
+            if candidate != start and not candidate.is_symlink() and candidate.is_file():
+                return candidate
+        if any((directory / marker).exists() for marker in _REPOSITORY_MARKERS):
+            return None
+    return None
+
+
+#: A directory holding one of these is the top of a fragment's repository or workspace.
+_REPOSITORY_MARKERS = (".git", ".hg", ".svn", "fluid.workspace.yaml")
+
+
+def _contract_version(contract: Optional[Path]) -> Optional[str]:
+    if contract is None:
+        return None
+    from fluid_build.loader import _parse_file
+
+    try:
+        version = _parse_file(contract).get("fluidVersion")
+    except Exception:  # noqa: BLE001 - no readable version: the default applies
+        return None
+    # A version kept elsewhere (a $ref) is not one this lookup can read.
+    return version if isinstance(version, str) and version else None
 
 
 def _handle_list_versions(schema_manager: FluidSchemaManager, args, logger: logging.Logger) -> int:
@@ -657,9 +830,14 @@ def _validate_contract_for_version(
     args,
     schema_manager: FluidSchemaManager,
     logger: logging.Logger,
+    locate: Optional[Callable[..., Optional[str]]] = None,
 ) -> ValidationResult:
     validation_result = schema_manager.validate_contract(
-        contract, schema_version=target_version, strict=args.strict, offline_only=args.offline
+        contract,
+        schema_version=target_version,
+        strict=args.strict,
+        offline_only=args.offline,
+        locate=locate,
     )
     _run_contract_rules(contract, target_version, validation_result, args, logger)
     return validation_result
@@ -1056,6 +1234,7 @@ def _validate_with_version_fallback(
     args,
     schema_manager: FluidSchemaManager,
     logger: logging.Logger,
+    locate: Optional[Callable[..., Optional[str]]] = None,
 ) -> Tuple[Optional[SchemaVersion], ValidationResult]:
     validation_result = _validate_contract_for_version(
         contract=contract,
@@ -1063,6 +1242,7 @@ def _validate_with_version_fallback(
         args=args,
         schema_manager=schema_manager,
         logger=logger,
+        locate=locate,
     )
 
     if not auto_selected or validation_result.is_valid or not target_version:
@@ -1082,6 +1262,7 @@ def _validate_with_version_fallback(
         args=args,
         schema_manager=schema_manager,
         logger=logger,
+        locate=locate,
     )
     return previous_version, fallback_result
 
@@ -1164,6 +1345,8 @@ def _run_extension_validators(
     contract: Dict[str, Any],
     validation_result: ValidationResult,
     logger: logging.Logger,
+    *,
+    locate: Optional[Callable[..., Optional[str]]] = None,
 ) -> None:
     """Invoke any plugin-registered ``contract.extensions`` validators.
 
@@ -1191,7 +1374,19 @@ def _run_extension_validators(
     from fluid_build.extension_schemas import run_extension_validators
 
     for err in run_extension_validators(contract, logger):
-        validation_result.add_error(err)
+        validation_result.add_error(_in_fragment(err, locate))
+
+
+def _in_fragment(err: str, locate: Optional[Callable[..., Optional[str]]]) -> str:
+    """``extensions.<key>: msg`` as ``<fragment>:<line> (extensions.<key>): msg``
+    when that block was written in a fragment. A validator's own message is
+    plugin text, so only the block it names is located, not the key it means."""
+    head, sep, tail = err.partition(": ")
+    if locate is None or not sep or not head.startswith("extensions."):
+        return err
+    key = head[len("extensions.") :]
+    where = (locate(["extensions", key]) if key else None) or locate(["extensions"])
+    return f"{where} ({head}): {tail}" if where else err
 
 
 def _run_role_validators(
@@ -1489,13 +1684,14 @@ def _try_workspace_validate(
     failed = 0
     for product in products:
         try:
-            contract, overlay_warnings = _load_with_overlay_warnings(
+            contract, overlay_warnings, locate = _load_with_overlay_warnings(
                 str(product.contract_path), getattr(args, "env", None), logger
             )
             result = schema_manager.validate_contract(
                 contract,
                 strict=args.strict,
                 offline_only=getattr(args, "offline", False),
+                locate=locate,
             )
             if _report_workspace_product(product, result, overlay_warnings, args.strict):
                 passed += 1

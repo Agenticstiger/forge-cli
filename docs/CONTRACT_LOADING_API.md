@@ -90,8 +90,10 @@ loaded = load_contract_from_text(text, suffix=".json")    # or JSON
 loaded = load_contract_from_dict(document)                # already parsed
 ```
 
-Neither reads a file. A `$ref` is left in place and listed in
-`loaded.unresolved_refs`; you decide whether that is an error.
+Neither reads a file. A document that names other files keeps every `$ref`
+in place, listed in `loaded.unresolved_refs`; you decide whether that is an
+error. A document that names none has its same-document `#/...` pointers
+resolved, as the engine resolves them.
 
 ### Text with its fragments and an overlay
 
@@ -100,18 +102,18 @@ loaded = load_contract_from_text(
     text,
     base_dir="contracts/orders",              # resolve $ref against this directory
     overlay={"exposes": [{"binding": {"location": {"database": "prod_s"}}}]},
+    overlay_dir="contracts/orders/overlays",  # where the overlay's own $ref resolve
 )
 ```
 
-With `base_dir` set to a contract's directory and `overlay` set to the parsed
-overlay file `--env` would select, the result equals
-`load_contract(that_file, env=...)`, including the case below where the engine
-drops the overlay.
+With `base_dir` set to a contract's directory, `overlay` set to the parsed
+overlay file `--env` would select and `overlay_dir` to that file's directory
+(default `base_dir`), the result equals `load_contract(that_file, env=...)`.
 
-Without `base_dir`, a document holding file `$ref` values cannot say whether
-the engine would apply an overlay (that depends on what the fragments hold),
-so passing `overlay` then raises `contract_overlay_needs_base_dir` instead of
-guessing.
+Without `base_dir`, an overlay cannot be merged over file `$ref` values that
+were never read, so passing `overlay` for a document that names other files,
+or an overlay that names files itself, raises
+`contract_overlay_needs_base_dir` instead of guessing.
 
 ## What "as plan sees it" means
 
@@ -120,12 +122,17 @@ In the engine's order:
 1. **Parse**: JSON, or YAML through the engine's billion-laughs guard.
 2. **`$ref` composition**: each `{"$ref": "./file.yaml#/pointer"}` replaced by
    its target, resolved against the contract's directory (or `base_dir`) by the
-   engine's resolver and under its path rules. Same-document `#/...` pointers
-   are kept, as the engine keeps them, and listed in `unresolved_refs`.
+   engine's resolver and under its path rules (see `docs/contract-refs.md`):
+   a text file (`.sql`, `.md`, ...) is its text, keys beside `$ref` are merged
+   over the target, and a fragment may have any root.
 3. **Overlay**: for `env`, the first of `overlays/<env>.yaml|yml|json`,
    `<env>.yaml|yml|json`, `<contract-stem>.<env>.yaml|yml|json` next to the
-   contract, deep-merged over the base (objects key by key, lists of objects by
-   position, anything else replaced). A bundle is never re-overlaid.
+   contract, its own `$ref` values composed relative to the overlay file,
+   deep-merged over the base (objects key by key, lists of objects by
+   position, or `builds`/`exposes`/`consumes` by id from fluidVersion 0.7.6,
+   anything else replaced). Then same-document `#/...` pointers resolve
+   against the result. No `$ref` is left: one that cannot be resolved fails
+   the load. A bundle is never re-overlaid.
 4. **Alias values**: human-friendly values rewritten to the schema's enum
    value, for example `source.kind: pg` → `postgres`, `source.mode: incremental`
    → `incremental_append`, `binding.format: kafka` → `kafka_topic`,
@@ -140,20 +147,6 @@ it at the schema gate). Write `builds:` to get alias rewriting for builds.
 Validation is not part of loading: a schema-invalid contract loads, and
 `fluid validate` / `fluid plan` reject it.
 
-### Known engine behaviour: an overlay next to a `$ref`
-
-When the overlay file, or the merged contract, still holds a `$ref` (an
-overlay that references a fragment, or a same-document `#/...` pointer in
-the contract), the engine's auto-bundle step reloads the contract from the
-base file and the overlay is dropped: `fluid plan --env prod` plans the base
-contract. `load_contract` returns what plan plans, so it returns the base too,
-but its provenance does not pretend otherwise: `overlay` is `None`, the
-overlay is not in `files`, and a `contract_overlay_not_applied` WARNING names
-the file. The in-memory forms do the same with an `overlay` mapping: they
-return the base and log the same WARNING (to `logger`, or the
-`fluid.api.contract` logger). Keep `$ref` out of overlays, and use file
-references rather than `#/...` pointers in a contract that has overlays.
-
 ## Reference
 
 ### `load_contract(path, *, env=None, logger=None) -> LoadedContract`
@@ -164,15 +157,16 @@ operator-typed paths (no `..`, no symlink) is not applied to `path`; a library
 caller chooses its own paths. `env` must be a single path component (see the
 example above) or `None`; anything else raises `contract_env_invalid`.
 
-### `load_contract_from_text(text, *, suffix=".yaml", base_dir=None, overlay=None, logger=None) -> LoadedContract`
+### `load_contract_from_text(text, *, suffix=".yaml", base_dir=None, overlay=None, overlay_dir=None, logger=None) -> LoadedContract`
 
 Parses `text` with the engine's parser (`suffix` picks it as a file extension
 would), then loads the result as `load_contract_from_dict` does.
 
-### `load_contract_from_dict(document, *, base_dir=None, overlay=None, logger=None) -> LoadedContract`
+### `load_contract_from_dict(document, *, base_dir=None, overlay=None, overlay_dir=None, logger=None) -> LoadedContract`
 
-Loads a parsed document. `document` and `overlay` are never modified. `logger`
-receives the `contract_overlay_not_applied` WARNING.
+Loads a parsed document. `document` and `overlay` are never modified.
+`overlay_dir` (added in 1.2) is the directory the overlay's own `$ref` values
+resolve against: the overlay file's directory, default `base_dir`.
 
 ### `LoadedContract`
 
@@ -184,9 +178,9 @@ A frozen dataclass.
 | `origin` | `"file"` \| `"bundle"` \| `"memory"` | Which entry point and input shape produced it. |
 | `source` | `Path \| None` | The resolved contract or bundle path. |
 | `env` | `str \| None` | The env requested. |
-| `overlay` | `Path \| None` | The overlay file merged for `env` (never set for a bundle; see the known engine behaviour above). |
-| `files` | `tuple[Path, ...]` | Every file composed: the source, each `$ref` target in first-read order, the overlay. |
-| `unresolved_refs` | `tuple[str, ...]` | `$ref` values left in `contract`, in document order. |
+| `overlay` | `Path \| None` | The overlay file merged for `env` (never set for a bundle). A matching overlay is always applied; one that cannot be is a load error. |
+| `files` | `tuple[Path, ...]` | Every file composed: the source, each `$ref` target in first-read order (text files included), the overlay and its `$ref` targets. |
+| `unresolved_refs` | `tuple[str, ...]` | `$ref` values left in `contract`, in document order: only an in-memory load without `base_dir` of a document that names other files leaves any. |
 | `digest` | `str` (property) | `sha256:<hex>` of the planned contract via `compute_contract_digest`, the plan digest's canonicalisation. Not the `fluid contract digest` / `upstreamDigest` value. Raises `contract_not_serialisable` when JSON cannot represent the contract. |
 
 ### `ContractLoadError`
@@ -201,7 +195,7 @@ there is one, and the engine's exception as `__cause__`:
 | `contract_not_a_mapping` | The document (or overlay) root is not an object, from a file (with or without `env`, an overlay or not) or from text. |
 | `contract_ref_unresolved` | A `$ref` target is missing, cyclic, blocked, or its pointer does not resolve. |
 | `contract_env_invalid` | `env` is not a single path component: it is empty, `.` or `..`, holds `/`, `\` or NUL, or is drive-qualified (`C:prod`, on every platform). |
-| `contract_overlay_needs_base_dir` | In-memory form: `overlay` given for a document with file `$ref` values but no `base_dir`. |
+| `contract_overlay_needs_base_dir` | In-memory form: `overlay` given with no `base_dir`, for a document with file `$ref` values or an overlay that has some. |
 | `contract_not_serialisable` | Raised by `.digest`: the contract holds a value JSON cannot represent (an unquoted YAML date, a set, binary, a self-referencing alias). `fluid plan` cannot write it either; quote the value. |
 | `contract_load_failed` | Any other loader failure, including a document that contains itself through a YAML alias (the engine fails on it too). |
 | *engine event* | Passed through unchanged, e.g. `overlay_declared_but_missing`, `bundle_not_found` (a `.tgz` path that does not exist), `bundle_env_mismatch`, `bundle_manifest_invalid`. |
@@ -216,24 +210,25 @@ are written as strings (and always equal by `.digest`).
 
 How each form keeps that promise:
 
-- **The file form** (`load_contract`) calls the engine's loader itself, so a
-  new step in the loader reaches it with no change here.
-  `tests/api/test_contract_load.py` runs the real `fluid plan` on fixtures
-  that exercise every rewrite (alias values, legacy `build:`, `$ref`, overlay,
-  bundle, a magic-word key) and fails if the two differ.
-- **The in-memory forms** have no file to hand the loader, so they replay a
-  fixed sequence: `$ref` resolution, the overlay merge and the auto-bundle
-  step's decision to drop it, then the loader's rewrites by name. The tests
-  pin them to the file form on the same fixtures, and a guard test parses the
-  engine loader's source (`load_contract_with_overlay`) and fails when it
-  gains, loses or reorders a call that takes `contract` or a part of it
+- **Every form composes with the engine's composition**:
+  `loader.compose_contract` for a file (the function every CLI stage reads
+  through), `loader.compose_document` for the in-memory forms: `$ref`
+  resolution, the overlay's own refs, the overlay merge, then same-document
+  pointers. `tests/api/test_contract_load.py` runs the real `fluid plan` on
+  fixtures that exercise every rewrite (alias values, legacy `build:`, `$ref`,
+  overlay, bundle, a magic-word key) and fails if the two differ.
+- **The rewrites** are replayed by name after the composition, in the engine
+  loader's order. The tests pin the in-memory forms to the file form on the
+  same fixtures, and a guard test parses the engine loader's source
+  (`load_contract_with_overlay`) and fails when it gains, loses or reorders a
+  call that takes `contract` or a part of it
   (positionally or by keyword), changes `contract` any other way (an
   assignment that is not a known step, an item or attribute write, a method
   call, `del`, a rebinding), returns anything but `contract`, or reads
   `contract` anywhere else (an alias, a loop over it, a container holding
   it). It does not decide whether such a read changes the contract: it fails
-  on it, so a new step there turns the build red until the in-memory forms
-  replay it too. The guard reads that one function, outside its bundle
+  on it, so a new step there turns the build red until this module replays it
+  too. The guard reads that one function, outside its bundle
   branch: a change inside a function it calls (`load_with_overlay`, the `$ref`
   resolver, a rewrite itself) is caught only where the fixtures exercise it.
 

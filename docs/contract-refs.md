@@ -1,8 +1,11 @@
 # Composing a contract from fragments with `$ref`
 
-A contract can pull any object from another YAML or JSON file with `$ref`.
-`fluid validate`, `plan`, `apply` and `bundle` resolve every ref before they
-do anything else, so the rest of the pipeline sees one document.
+A contract can pull any part of itself from another file with `$ref`: a
+value from a YAML or JSON file (an object, a list, a scalar), or the text of a
+`.sql`, `.md`, `.markdown`, `.txt`, `.py`, `.scala` or `.r` file, read as a
+string and never parsed. `fluid validate`, `plan`, `apply`, `bundle` and every
+other command resolve every ref before they do anything else, so the rest of
+the pipeline sees one document.
 
 ```text
 orders/
@@ -35,8 +38,14 @@ fluid bundle   orders/contract.fluid.yaml   # print the single resolved document
 A ref is resolved relative to the file that contains it, so
 `fragments/builds/ingest.yaml` may itself say `$ref: ../policy.yaml`.
 
-A `$ref` node is an object whose only key is `$ref`. Same-document refs
-(`$ref: "#/definitions/x"`) are left in place as written.
+Keys written beside `$ref` are merged over a copy of what it names, as a
+[JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7386): objects merge, a
+list or a scalar replaces, `null` removes a key. A target that is not an
+object takes no keys beside its `$ref`. A same-document ref
+(`$ref: "#/a/b"`) names a place in the composed contract, after the `--env`
+overlay is merged, whichever file it is written in. A `$ref` in an overlay
+resolves relative to the overlay file. No `$ref` is left after composition: one
+that cannot be resolved fails the command and names the file it was written in.
 
 ---
 
@@ -80,6 +89,13 @@ process can read into itself, and `fluid bundle` would print it back.
 
 ## Widening the root (monorepos)
 
+A workspace can widen it once for every product under it: `ref_root: .` in
+`fluid.workspace.yaml`, relative to that file. The root must stay inside the
+workspace file's own directory, contain the contract, and not be a home, a
+temporary directory, `/` or above the contract's repository; otherwise the
+setting is ignored with a warning. `FLUID_IGNORE_WORKSPACE_REF_ROOT=1` turns it
+off.
+
 To share fragments between products, set the ref root to a directory that
 contains both the contracts and the shared fragments:
 
@@ -102,7 +118,8 @@ contract = load_contract("repo/products/orders/contract.fluid.yaml", ref_root="r
 ```
 
 `load_contract`, `load_with_overlay` and `compile_contract` all accept
-`ref_root`. The argument wins over `FLUID_REF_ROOT`.
+`ref_root`. The argument wins over `FLUID_REF_ROOT`, which wins over the
+workspace's `ref_root`.
 
 Rules for the wider root:
 

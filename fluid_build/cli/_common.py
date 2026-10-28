@@ -32,8 +32,6 @@ from typing import Any, Dict, Optional
 from fluid_build._contract_loader import (
     _FIELD_ALIASES,
     CLIError,
-    _auto_bundle_if_needed,
-    _has_ref_pointers,
     _imp,
     _is_bundle_path,
     _load_contract_from_bundle,

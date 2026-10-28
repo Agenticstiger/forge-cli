@@ -623,15 +623,44 @@ def _effective_contract_id(path: Path, env: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+#: What a YAML reader reads as a line break and a scalar written plain or
+#: single-quoted does not keep: NEL (U+0085) folds into a space, and PS and LS
+#: (U+2028, U+2029) are broken lines other readers fold too.
+_LINE_SEPARATORS = re.compile("[\x85\u2028\u2029]")
+
+
+def _represent_text(dumper: yaml.BaseDumper, value: str) -> yaml.ScalarNode:
+    """A string as YAML scalar: double-quoted, with escapes (``\\N``, ``\\L``, ``\\P``),
+    when it holds NEL, LS or PS, so every reader gets the text back as it was
+    written; any other string is written as PyYAML writes it."""
+    style = '"' if _LINE_SEPARATORS.search(value) else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+
+class ExactSafeDumper(yaml.SafeDumper):
+    """``yaml.SafeDumper`` that keeps NEL, LS and PS in text (:func:`_represent_text`)."""
+
+
+class ExactDumper(yaml.Dumper):
+    """``yaml.Dumper`` that keeps NEL, LS and PS in text (:func:`_represent_text`)."""
+
+
+ExactSafeDumper.add_representer(str, _represent_text)
+ExactDumper.add_representer(str, _represent_text)
+
+
 def _canonicalize_yaml(obj: Any) -> bytes:
     """YAML with ``sort_keys=True`` and no trailing whitespace.
 
     ``default_flow_style=False`` forces block scalars (multi-line strings
     render as ``|``-blocks, not ``"foo\\nbar"``). ``allow_unicode=True`` so
-    non-ASCII IDs don't get ``\\uXXXX`` escaped.
+    non-ASCII IDs don't get ``\\uXXXX`` escaped. A text that holds a line
+    separator YAML would fold (:data:`_LINE_SEPARATORS`) is the one exception,
+    so ``contract.resolved.yaml`` reads back as ``contract.resolved.json`` does.
     """
-    text = yaml.safe_dump(
+    text = yaml.dump(
         obj,
+        Dumper=ExactSafeDumper,
         default_flow_style=False,
         sort_keys=True,
         allow_unicode=True,
@@ -701,6 +730,8 @@ def _slug(raw: str) -> str:
 __all__ = [
     "SOURCE_SENTINEL",
     "MANIFEST_VERSION",
+    "ExactDumper",
+    "ExactSafeDumper",
     "build_bundle_tgz",
     "build_manifest",
     "bundle_overlay_warnings",

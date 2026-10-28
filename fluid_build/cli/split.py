@@ -14,12 +14,20 @@
 
 """fluid split — split a flat contract into composable fragments.
 
-This is the inverse of ``fluid bundle``.  Major sections (sovereignty,
-accessPolicy, builds, exposes) become separate YAML files under
-``fragments/``, referenced via ``$ref`` pointers from the root contract.
+This is the inverse of ``fluid bundle``.  By default the major sections
+(sovereignty, accessPolicy, builds, exposes) become separate YAML files under
+``fragments/``, referenced via ``$ref`` pointers from the root contract;
+``--parts`` chooses others (SQL, quality rules, columns, extension blocks,
+description texts).
+
+A YAML root keeps every comment and every other byte: only the moved parts
+are cut out of its text. The result is checked before the command ends: the
+split contract composes to the same document as the original, or nothing is
+left changed.
 
 Usage:
     fluid split contract.fluid.yaml
+    fluid split contract.fluid.yaml --parts builds,exposes,sql
     fluid split contract.fluid.yaml --dry-run
     fluid split contract.fluid.yaml --out ./output
 """
@@ -27,34 +35,45 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict
-
-try:
-    import yaml  # type: ignore
-except Exception:  # pragma: no cover
-    yaml = None
+from typing import Any, Collection, Dict, List, Optional, Sequence, Tuple
 
 COMMAND = "split"
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
+    from fluid_build.cli.forge_contract_fragments import DEFAULT_PARTS, PARTS
+
     p = subparsers.add_parser(
         COMMAND,
         help="Split a flat contract into composable fragments with $ref pointers",
         description=(
             "Split a monolithic FLUID contract into a fragment-first layout.\n"
             "Major sections (sovereignty, accessPolicy, builds, exposes) become\n"
-            "separate YAML files under fragments/, referenced via $ref.\n\n"
+            "separate files under fragments/, referenced via $ref; --parts\n"
+            "chooses others. A YAML root keeps every comment.\n\n"
             "This is the inverse of 'fluid bundle'."
         ),
         epilog=(
+            "Parts:\n"
+            "  sovereignty, accessPolicy: each section to fragments/<name>.yaml\n"
+            "  builds, exposes: each entry to fragments/<section>/<id>.yaml\n"
+            "  sql: a build's properties.sql to sql/<build id>.sql\n"
+            "  quality: an expose's contract.quality to fragments/quality/<exposeId>.yaml\n"
+            "  schema: an expose's contract.schema to fragments/schemas/<exposeId>.yaml\n"
+            "  extensions: each extension block to fragments/extensions/<name>.yaml\n"
+            "  extensions.<name>: that one extension block\n"
+            "  description: the description texts to docs/<part>.md\n\n"
+            "A part that is already a $ref is left as it is, so splitting twice\n"
+            "changes nothing. A file that exists is never written over.\n\n"
             "Examples:\n"
-            "  fluid split contract.fluid.yaml              # split in place\n"
-            "  fluid split contract.fluid.yaml --dry-run    # preview changes\n"
-            "  fluid split contract.fluid.yaml --out ./out  # different target\n"
+            "  fluid split contract.fluid.yaml                       # split in place\n"
+            "  fluid split contract.fluid.yaml --parts builds,sql    # choose the parts\n"
+            "  fluid split contract.fluid.yaml --dry-run             # preview changes\n"
+            "  fluid split contract.fluid.yaml --out ./out           # different target\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -66,6 +85,14 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Output directory (default: same directory as the contract)",
     )
     p.add_argument(
+        "--parts",
+        default=",".join(DEFAULT_PARTS),
+        help=(
+            f"Comma-separated parts to move to files of their own (default: "
+            f"{','.join(DEFAULT_PARTS)}); any of: {', '.join(PARTS)}, extensions.<name>"
+        ),
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Show what would be created without writing any files",
@@ -74,81 +101,211 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _load_contract(path: str) -> Dict[str, Any]:
-    """Load a YAML or JSON contract file."""
-    import json as _json
+    """Load a YAML or JSON contract file, with the loader's size and alias guard."""
+    from fluid_build.loader import _parse_file
 
     contract_path = Path(path)
     if not contract_path.exists():
         raise FileNotFoundError(f"Contract file not found: {path}")
-
-    text = contract_path.read_text(encoding="utf-8")
-    if contract_path.suffix.lower() == ".json":
-        return _json.loads(text)  # type: ignore[no-any-return]
-    if yaml is None:
-        raise RuntimeError("YAML support requires PyYAML. Install with: pip install pyyaml")
-    return yaml.safe_load(text) or {}  # type: ignore[no-any-return]
+    contract = _parse_file(contract_path)
+    if not isinstance(contract, dict):
+        raise ValueError(f"contract root must be an object/dict: {path}")
+    return contract
 
 
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
-    from fluid_build.cli.forge_contract_fragments import (
-        describe_fragment_layout,
-        split_contract_to_fragments,
-    )
+    from fluid_build.cli.forge_contract_fragments import fragment_sites, parse_parts
 
     contract_path = Path(args.contract)
     dry_run = args.dry_run
     out_dir = Path(args.out) if args.out else contract_path.parent
 
     try:
+        parts = parse_parts(getattr(args, "parts", None) or "")
+    except ValueError as e:
+        sys.stderr.write(f"❌ {e}\n")
+        return 1
+    try:
         contract = _load_contract(str(contract_path))
     except FileNotFoundError as e:
-        sys.stderr.write(f"\u274c {e}\n")
+        sys.stderr.write(f"❌ {e}\n")
         return 2
     except Exception as e:
-        sys.stderr.write(f"\u274c Failed to load contract: {e}\n")
+        sys.stderr.write(f"❌ Failed to load contract: {e}\n")
         return 1
 
-    # Check if there's anything to split.
-    preview = describe_fragment_layout(contract)
-    if not preview:
+    # A file that exists is never written over: a part bound for one gets the
+    # next free name.
+    taken: set = set()
+    while True:
+        sites = fragment_sites(contract, parts, taken)
+        clash = {s.target for s in sites if (out_dir / s.target).exists()} - taken
+        if not clash:
+            break
+        taken |= clash
+
+    if not sites:
         sys.stderr.write(
-            "\u2139 Nothing to split \u2014 contract has no sections that benefit from fragments.\n"
+            "ℹ Nothing to split — contract has no sections that benefit from fragments.\n"
         )
         return 0
 
+    before, problem = _composed(contract_path)
+    if problem:
+        sys.stderr.write(f"❌ Split not written: {problem}\n")
+        return 1
+
     if dry_run:
-        sys.stderr.write(f"Would create {len(preview)} fragments:\n")
-        for p in preview:
-            sys.stderr.write(f"   {p}\n")
+        _print_dry_run(contract, parts, taken)
         return 0
 
-    # Perform the split.
-    root_contract, fragment_files = split_contract_to_fragments(contract)
-
-    # Write fragment files.
-    for rel_path, content in fragment_files.items():
-        fpath = out_dir / rel_path
-        fpath.parent.mkdir(parents=True, exist_ok=True)
-        fpath.write_text(content, encoding="utf-8")
-
-    # Write the updated root contract (with $ref pointers).
+    root_text, fragments, lost_comments = _split(contract_path, contract, sites, parts, taken)
     root_out = out_dir / contract_path.name
-    if yaml is None:
-        raise RuntimeError("YAML support requires PyYAML. Install with: pip install pyyaml")
-    root_out.write_text(
-        yaml.dump(root_contract, default_flow_style=False, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
+    problem = _write_checked(before, root_out, root_text, fragments, out_dir)
+    if problem:
+        sys.stderr.write(f"❌ Split not written: {problem}\n")
+        return 1
 
     # Tell the user what happened.
-    sys.stderr.write(f"\u2705 Split into {len(fragment_files)} fragments:\n")
-    for rel_path in sorted(fragment_files):
+    sys.stderr.write(f"✅ Split into {len(fragments)} fragments:\n")
+    for rel_path in sorted(fragments):
         sys.stderr.write(f"   {rel_path}\n")
     sys.stderr.write(f"\n   Root contract updated with $ref pointers: {root_out}\n")
+    if lost_comments is not None:
+        sys.stderr.write(f"   ℹ Comments in the root were not kept: {lost_comments}.\n")
     sys.stderr.write("   Run fluid bundle to see the resolved output.\n")
 
     logger.info(
         "split_complete",
-        extra={"fragments": len(fragment_files), "out_dir": str(out_dir)},
+        extra={"fragments": len(fragments), "out_dir": str(out_dir)},
     )
     return 0
+
+
+def _composed(contract_path: Path) -> Tuple[Dict[str, Any], Optional[str]]:
+    """``(document, None)``: what the contract composes to here, the document its
+    split is checked against; or ``({}, why)`` when it does not compose here (a
+    ref that needs FLUID_REF_ROOT, say), so it cannot be split, dry run included."""
+    from fluid_build.loader import compose_contract
+
+    try:
+        return compose_contract(contract_path).document, None
+    except Exception as exc:  # noqa: BLE001 - reported; nothing is written
+        return {}, f"the contract does not compose here, so its split could not be checked: {exc}"
+
+
+def _print_dry_run(contract: Dict[str, Any], parts: Sequence[str], taken: Collection[str]) -> None:
+    from fluid_build.cli.forge_contract_fragments import describe_fragment_layout
+
+    targets = describe_fragment_layout(contract, parts, taken)
+    sys.stderr.write(f"Would create {len(targets)} fragments:\n")
+    for target in targets:
+        sys.stderr.write(f"   {target}\n")
+
+
+def _symlink_on_the_way(out_dir: Path, rel_path: str) -> Optional[Path]:
+    """The first directory between ``out_dir`` and ``rel_path`` that is a symlink, if
+    any: a fragment written through it would land outside the output directory."""
+    current = out_dir
+    for part in Path(rel_path).parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            return current
+    return None
+
+
+def _split(
+    contract_path: Path,
+    contract: Dict[str, Any],
+    sites: Sequence[Any],
+    parts: Sequence[str],
+    taken: Collection[str],
+) -> Tuple[str, Dict[str, str], Optional[str]]:
+    """``(root_text, fragments, why_comments_were_not_kept)``.
+
+    A YAML root is spliced (every byte outside the moved parts kept); a JSON
+    root, or YAML that cannot be spliced safely, is split as parsed data,
+    into the same files.
+    """
+    from fluid_build.cli._split_text import SpliceRefused, split_yaml_text
+    from fluid_build.cli.forge_contract_fragments import split_contract_to_fragments
+
+    is_json = contract_path.suffix.lower() == ".json"
+    why: Optional[str] = None
+    if not is_json:
+        # Read and written untranslated, so a CRLF file keeps its line ends.
+        with open(contract_path, encoding="utf-8", newline="") as handle:
+            text = handle.read()
+        try:
+            root_text, fragments = split_yaml_text(text, sites, contract)
+            return root_text, fragments, None
+        except SpliceRefused as exc:
+            why = str(exc)
+    root, fragments = split_contract_to_fragments(contract, parts, taken=taken)
+    if is_json:
+        return json.dumps(root, indent=2, ensure_ascii=False) + "\n", fragments, None
+    import yaml
+
+    from fluid_build.cli.forge_contract_fragments import _exact_dumper
+
+    dumped = yaml.dump(
+        root, Dumper=_exact_dumper(), default_flow_style=False, sort_keys=False, allow_unicode=True
+    )
+    return dumped, fragments, why
+
+
+def _write_checked(
+    before: Dict[str, Any],
+    root_out: Path,
+    root_text: str,
+    fragments: Dict[str, str],
+    out_dir: Path,
+) -> Optional[str]:
+    """Write the split layout, then check it composes to ``before``, what the
+    original composed to.
+
+    Fragments first and the root last, so the contract stays whole until the
+    root changes. When the split contract does not compose to the same
+    document (a part that could not be moved exactly), every file written is
+    taken back and the reason returned.
+    """
+    from fluid_build.loader import compose_contract
+
+    if root_out.is_symlink():
+        # open(..., "w") would write through it, a dangling one included, and the
+        # undo could only remove the link, leaving the written file where it points.
+        return f"{root_out} is a symlink; split writes no file through one"
+    for rel_path in fragments:
+        link = _symlink_on_the_way(out_dir, rel_path)
+        if link is not None:
+            return f"{link} is a symlink; split writes no file through one"
+    original_root: Optional[str] = None
+    if root_out.exists():
+        with open(root_out, encoding="utf-8", newline="") as handle:
+            original_root = handle.read()
+    written: List[Path] = []
+    try:
+        for rel_path, content in fragments.items():
+            target = out_dir / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # newline="" writes the text as it is: a \r in it stays a \r.
+            with open(target, "x", encoding="utf-8", newline="") as handle:
+                handle.write(content)
+            written.append(target)
+        root_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(root_out, "w", encoding="utf-8", newline="") as handle:
+            handle.write(root_text)
+        if compose_contract(root_out).document != before:
+            raise ValueError(
+                "the split contract does not compose to the original one; nothing was changed"
+            )
+    except Exception as exc:  # noqa: BLE001 - every failure is taken back
+        for path in written:
+            path.unlink(missing_ok=True)
+        if original_root is not None:
+            with open(root_out, "w", encoding="utf-8", newline="") as handle:
+                handle.write(original_root)
+        elif root_out.exists():
+            root_out.unlink()
+        return str(exc)
+    return None

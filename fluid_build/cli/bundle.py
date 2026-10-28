@@ -42,7 +42,7 @@ try:
 except Exception:  # pragma: no cover
     yaml = None
 
-from ..loader import RefResolutionError, collect_overlay_warnings, compile_contract
+from ..loader import RefResolutionError, collect_overlay_warnings
 from ..observability.tracing import traced_stage
 
 COMMAND = "bundle"
@@ -177,8 +177,14 @@ def _serialize(contract: Dict[str, Any], fmt: str) -> str:
         raise RuntimeError(
             "YAML output requires PyYAML. Install with: pip install pyyaml\nOr use --format json"
         )
+    # Lazy, as the tgz branch's import is: the module is not needed to print --help.
+    from fluid_build.forge.core.bundle import ExactDumper
+
+    # ``ExactDumper`` writes a text holding NEL, LS or PS double-quoted with escapes, so the
+    # file reads back as the document that was written; any other value is written as before.
     return yaml.dump(
         contract,
+        Dumper=ExactDumper,
         default_flow_style=False,
         allow_unicode=True,
         sort_keys=False,
@@ -206,38 +212,26 @@ def materialize_contract(
 ) -> Tuple[Dict[str, Any], Optional[Path]]:
     """The document ``fluid bundle <contract> --env <env>`` freezes, and the overlay it merged.
 
-    ``$ref`` pointers resolved (:func:`compile_contract`), then the ``env``
-    overlay deep-merged on top, found by the same candidate search as every
-    other stage (``load_overlay_document``), with the same loud notice when
-    ``env`` names an overlay that does not exist. Nothing else: no alias or
-    ``build:`` -> ``builds:`` normalisation, and ``{{ env.* }}`` placeholders
-    stay unresolved. ``fluid generate artifacts <contract> --env`` calls this
-    too, so its artifacts are the ones the bundle would produce.
+    :func:`fluid_build.loader.compose_contract`, the composition every other
+    stage reads: every ``$ref`` resolved, in the overlay too, then the
+    ``env`` overlay deep-merged, found by the same candidate search as every
+    other stage, with the same loud notice when ``env`` names an overlay that
+    does not exist. Nothing else: no alias or ``build:`` -> ``builds:``
+    normalisation, and ``{{ env.* }}`` placeholders stay unresolved.
+    ``fluid generate artifacts <contract> --env`` calls this too, so its
+    artifacts are the ones the bundle would produce.
 
-    Raises what :func:`compile_contract` raises (``FileNotFoundError``,
-    :class:`RefResolutionError`, ...); the caller maps them to its exit codes.
+    Raises what :func:`compose_contract` raises (``FileNotFoundError``,
+    :class:`RefResolutionError`, an ``OverlayMergeError`` naming the overlay,
+    ...); the caller maps them to its exit codes.
     """
-    compiled = compile_contract(contract_path, logger=compile_logger or logger)
-    overlay_path: Optional[Path] = None
-    if env:
-        from ..loader import (
-            OverlayMergeError,
-            _deep_merge,
-            load_overlay_document,
-            note_missing_overlay,
-        )
+    from ..loader import compose_contract
 
-        found = load_overlay_document(contract_path, env)
-        if found is not None:
-            overlay_path, overlay = found
-            try:
-                compiled = _deep_merge(dict(compiled), overlay)
-            except OverlayMergeError as exc:
-                raise OverlayMergeError(f"{overlay_path}: {exc}") from exc
-            logger.info("overlay_applied", extra={"overlay": str(overlay_path)})
-        else:
-            note_missing_overlay(contract_path, env, logger, contract=compiled)
-    return compiled, overlay_path
+    quiet = compile_logger or logger
+    quiet.info("compile_start", extra={"path": str(contract_path)})
+    composed = compose_contract(contract_path, env, logger=logger)
+    quiet.info("compile_done", extra={"path": str(contract_path)})
+    return composed.document, composed.overlay
 
 
 def bundle_contract_id(compiled: Dict[str, Any]) -> str:

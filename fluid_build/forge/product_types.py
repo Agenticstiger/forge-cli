@@ -28,13 +28,14 @@ on the same ``ProductTypeAnswer`` produces a byte-identical contract
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
-from fluid_build.util.safe_yaml import load_yaml_safe
+LOG = logging.getLogger("fluid.forge.product_types")
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -527,13 +528,19 @@ def _build_product_type_index(
     """Scan ``roots`` ONCE and index ``{product id: productType code}``.
 
     Each root is walked a single time and each ``*.fluid.yaml`` file is
-    parsed at most once, regardless of how many ``consumes[]`` entries
+    composed at most once, regardless of how many ``consumes[]`` entries
     will be looked up against the result. Dot-dirs, VCS internals, and
     dependency caches are skipped so the walk stays bounded even when a
     root sits high in the tree.
 
-    Parsing routes through :func:`load_yaml_safe` for billion-laughs
-    protection. A file that fails to parse simply contributes nothing.
+    A contract is read as every command reads it, composed where the values
+    the index needs (``id``, ``metadata.productType``, ``metadata.layer``)
+    come from a ``$ref`` (:func:`fluid_build.loader.load_contract_fields`), so
+    an upstream whose ``metadata`` is kept in a fragment has its productType,
+    and the loader's billion-laughs and ref-root protections apply. A file
+    that cannot be read contributes nothing (logged at DEBUG): the contract
+    being validated reports its own errors, and one broken neighbour must not
+    stop the walk.
     """
     index: Dict[str, Optional[str]] = {}
     seen_files: set[Path] = set()
@@ -559,25 +566,36 @@ def _build_product_type_index(
             seen_files.add(resolved)
             if self_path is not None and resolved == self_path:
                 continue
-            try:
-                data = load_yaml_safe(candidate.read_text(encoding="utf-8")) or {}
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-            pid = data.get("id")
-            if not pid or pid in index:
-                # First-writer-wins keeps the result deterministic and
-                # avoids re-resolving a productType already indexed.
-                continue
-            md = data.get("metadata") or {}
-            raw = md.get("productType") or md.get("layer")
-            if not raw:
-                index[str(pid)] = None
-                continue
-            pt = get_product_type(str(raw))
-            index[str(pid)] = pt.code if pt else None
+            entry = _index_entry(candidate)
+            if entry is not None:
+                pid, code = entry
+                # First-writer-wins keeps the result deterministic.
+                index.setdefault(pid, code)
     return index
+
+
+def _index_entry(candidate: Path) -> Optional[Tuple[str, Optional[str]]]:
+    """``(product id, productType code)`` of the contract at ``candidate``.
+
+    ``None`` when the contract does not compose or names no ``id``. The
+    code is ``None`` when it names neither a ``productType`` nor a ``layer``
+    that maps to one.
+    """
+    from fluid_build.loader import load_contract_fields
+
+    try:
+        data = load_contract_fields(candidate, "id", "metadata.productType", "metadata.layer")
+        pid = data.get("id")
+        if not pid:
+            return None
+        metadata = data.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        raw = metadata.get("productType") or metadata.get("layer")
+        pt = get_product_type(str(raw)) if raw else None
+        return str(pid), pt.code if pt else None
+    except Exception as exc:  # noqa: BLE001 - one broken contract must not stop the walk
+        LOG.debug("composition_index_skip: path=%s error=%s", candidate, exc)
+        return None
 
 
 def _iter_fluid_yaml(root: Path):
