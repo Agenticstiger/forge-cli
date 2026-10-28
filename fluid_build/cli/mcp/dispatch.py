@@ -436,19 +436,24 @@ def _contract_file(path_arg: str) -> Dict[str, Any]:
     Read raw, a contract kept in fragments holds ``{$ref: ...}`` where its
     builds and exposes are. The composition confines its fragments to the ref
     root, which a workspace ``ref_root`` or ``FLUID_REF_ROOT`` may widen past
-    the server's ``--readable-paths``; every file it read must also be readable
-    under the active policy, or the tool refuses, as it refuses such a
-    ``contract_path``. Without a policy (no server running) only the ref root
-    applies.
+    the server's ``--readable-paths``. Under an active policy that root is
+    capped to the readable path holding the contract before any fragment is
+    opened, so a ref outside it fails as an escape, quoting nothing of the
+    file; every file read is then checked again. Without a policy (no server
+    running) only the ref root applies.
     """
+    from fluid_build import loader
     from fluid_build.cli.mcp.policy import _path_is_allowed
-    from fluid_build.loader import compose_contract
 
-    composed = compose_contract(Path(path_arg))
+    path = Path(path_arg)
     try:
         policy = _pkg()._policy()
     except RuntimeError:  # not served: no policy to hold the reads to
         policy = None
+    ref_root = None
+    if policy is not None:
+        ref_root = _readable_ref_root(path, policy.readable_paths)
+    composed = loader.compose_contract(path, ref_root=ref_root)
     if policy is not None:
         for file in composed.files:
             if not _path_is_allowed(Path(file).resolve(), policy.readable_paths):
@@ -458,6 +463,22 @@ def _contract_file(path_arg: str) -> Dict[str, Any]:
     if not isinstance(composed.document, dict):
         raise RuntimeError(f"Contract at {path_arg!r} did not parse to a dict")
     return composed.document
+
+
+def _readable_ref_root(path: Path, readable: Tuple[Path, ...]) -> Optional[Path]:
+    """The ref root to compose ``path`` under so it reads nothing outside ``readable``:
+    ``None`` (the root it would get) when that root is readable, else the readable path
+    that holds the contract, which narrows it."""
+    from fluid_build import loader
+    from fluid_build.cli.mcp.policy import _path_is_allowed
+
+    root = loader._effective_ref_root(path, loader._parse_file(path), None).ref_root
+    if _path_is_allowed(Path(root).resolve(), readable):
+        return None
+    contract = path.resolve()
+    holders = [r.resolve() for r in readable if _path_is_allowed(contract, (r,))]
+    # The deepest readable path holding the contract: the narrowest cap.
+    return max(holders, key=lambda r: len(r.parts)) if holders else contract.parent
 
 
 def _resolve_contract_argument(arguments: Dict[str, Any]) -> Dict[str, Any]:

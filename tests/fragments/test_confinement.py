@@ -1905,8 +1905,9 @@ def test_dx05_mcp_readable_paths_gate_the_ref_targets_too(
     check_tool_permission("validate_contract", {"contract_path": str(path)}, policy=policy)
     with pytest.raises(PermissionError):
         check_tool_permission("validate_contract", {"contract_path": str(secret)}, policy=policy)
-    with pytest.raises(PermissionError, match="outside --readable-paths"):
+    with pytest.raises((PermissionError, RefResolutionError)) as err:
         dispatch._contract_file(str(path))
+    assert SECRET not in str(err.value)
 
 
 def _tree(root: Path, skip: Path) -> Dict[str, Optional[bytes]]:
