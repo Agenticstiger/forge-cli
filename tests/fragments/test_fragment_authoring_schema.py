@@ -54,12 +54,12 @@ _PARTS = "sovereignty,accessPolicy,builds,exposes,sql,quality,schema,extensions,
 
 #: sha256 of each canonical schema as v0.24.0 (0d55f519) shipped it: the golden for K-01.
 _V0_24_0_SHA256 = {
-    "0.7.1": "f23e6345d7cf4738d81634918481f9953d69ec660258ee488b4a650433d4130d",
-    "0.7.2": "2c99ac5a4e82c9f7682b3114ff6855300f8b0f16e3a630be5606e48cf6add9fc",
-    "0.7.3": "8fa6a9d988ac5a11d77707f5d14d858acef8ba75c9cdfb8ab1ea61361a0814b8",
-    "0.7.4": "82977a9efbeaf0850f81cfbda090d0627b9d5e8699274e1a0e53cddac3d3cc5b",
-    "0.7.5": "a1c33dc003599649f23c9bf100f9b8325a06fb9d7ae9f975bebda25ba43a8429",
-    "0.7.6": "8c025e0466fcbe51cdc2ee30b00876cee6ea8633c7a164ca13b2bffc67bd4e78",
+    "0.7.1": "f23e6345d7cf4738d81634918481f9953d69ec660258ee488b4a650433d4130d",  # pragma: allowlist secret
+    "0.7.2": "2c99ac5a4e82c9f7682b3114ff6855300f8b0f16e3a630be5606e48cf6add9fc",  # pragma: allowlist secret
+    "0.7.3": "8fa6a9d988ac5a11d77707f5d14d858acef8ba75c9cdfb8ab1ea61361a0814b8",  # pragma: allowlist secret
+    "0.7.4": "82977a9efbeaf0850f81cfbda090d0627b9d5e8699274e1a0e53cddac3d3cc5b",  # pragma: allowlist secret
+    "0.7.5": "a1c33dc003599649f23c9bf100f9b8325a06fb9d7ae9f975bebda25ba43a8429",  # pragma: allowlist secret
+    "0.7.6": "8c025e0466fcbe51cdc2ee30b00876cee6ea8633c7a164ca13b2bffc67bd4e78",  # pragma: allowlist secret
 }
 
 

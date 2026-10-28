@@ -39,7 +39,7 @@ import yaml
 import fluid_build
 
 CHECKOUT = Path(__file__).resolve().parents[2]
-SECRET = "SECRET-1"
+SECRET = "SECRET-1"  # pragma: allowlist secret
 IS_LINUX = platform.system() == "Linux"
 MEMORY_CAP = 2 * 1024 * 1024 * 1024
 

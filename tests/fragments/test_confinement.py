@@ -61,7 +61,7 @@ from fluid_build.loader import (
 )
 
 CHECKOUT = Path(__file__).resolve().parents[2]
-SECRET = "SECRET-1"
+SECRET = "SECRET-1"  # pragma: allowlist secret
 IS_DARWIN = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
 IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
@@ -970,7 +970,7 @@ _SECRET_SHAPED = [
     pytest.param(".env", "AWS_SECRET=abc-env-value\n", "abc-env-value", id="dotenv"),
     pytest.param(
         "id_rsa",
-        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEKEYBODY\n"
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEKEYBODY\n"  # pragma: allowlist secret
         "-----END OPENSSH PRIVATE KEY-----\n",
         "b3BlbnNzaC1rZXktdjEKEYBODY",
         id="id_rsa",
