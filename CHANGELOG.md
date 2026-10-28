@@ -328,7 +328,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--env /abs/x` is refused by every command.
 
 - **`fluid split` writes a different root than 0.24.0 did**: it keeps the root's text and comments
-  instead of re-dumping it; the fragments are the same.
+  instead of re-dumping it; the fragments are the same. It writes no file through a symlink.
+
+- **A root contract must be a regular file of at most 5 MiB**, as every file the composition reads
+  must be. A contract read through a pipe (`fluid validate <(git show HEAD:contract.fluid.yaml)`)
+  or a JSON root over 5 MiB, both of which 0.24.0 loaded, is now refused; write it to a file, or
+  move its large parts into fragments.
+
+- **A composed contract nests at most 128 levels deep**, the cap every YAML file already had, so
+  the bundle of any contract that composes can be read back.
 
 - **A contract whose orchestrator is on a public host now fails until the operator allows it.**
   Set `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST` in the shell, in CI, or in a
