@@ -47,6 +47,7 @@ from typing import Optional
 
 import yaml
 
+from fluid_build import loader
 from fluid_build.forge import product_types
 from fluid_build.forge.product_types import (
     _build_product_type_index,
@@ -214,25 +215,25 @@ def test_build_index_skips_self_path(tmp_path):
 
 
 def test_build_index_parses_each_file_once(tmp_path, monkeypatch):
-    """The same path is never handed to the YAML loader twice — even when
-    a directory is reachable from several (overlapping) roots."""
+    """The same path is never handed to the contract loader twice — even
+    when a directory is reachable from several (overlapping) roots."""
     _write_contract(tmp_path / "p1.fluid.yaml", product_id="p1", product_type="SDP")
     _write_contract(tmp_path / "sub" / "p2.fluid.yaml", product_id="p2", product_type="ADP")
 
     parsed: list[str] = []
-    real_loader = product_types.load_yaml_safe
+    real_loader = loader.load_contract
 
-    def _counting_loader(text, **kwargs):
-        parsed.append(text)
-        return real_loader(text, **kwargs)
+    def _counting_loader(path, **kwargs):
+        parsed.append(str(path))
+        return real_loader(path, **kwargs)
 
-    monkeypatch.setattr(product_types, "load_yaml_safe", _counting_loader)
+    monkeypatch.setattr(loader, "load_contract", _counting_loader)
 
     # Overlapping roots: ``tmp_path`` already covers ``tmp_path/sub``.
     index = _build_product_type_index([tmp_path, tmp_path / "sub", tmp_path], None)
 
     assert index == {"p1": "SDP", "p2": "ADP"}
-    # 2 files on disk → exactly 2 parses, despite 3 (overlapping) roots.
+    # 2 files on disk → exactly 2 loads, despite 3 (overlapping) roots.
     assert len(parsed) == 2
 
 
@@ -376,16 +377,16 @@ def test_each_fluid_file_parsed_once_for_many_consumes(tmp_path, monkeypatch):
     contract = yaml.safe_load(target.read_text(encoding="utf-8"))
 
     parse_count = {"n": 0}
-    real_loader = product_types.load_yaml_safe
+    real_loader = loader.load_contract
 
-    def _counting_loader(text, **kwargs):
+    def _counting_loader(path, **kwargs):
         parse_count["n"] += 1
-        return real_loader(text, **kwargs)
+        return real_loader(path, **kwargs)
 
-    monkeypatch.setattr(product_types, "load_yaml_safe", _counting_loader)
+    monkeypatch.setattr(loader, "load_contract", _counting_loader)
     validate_composition_for_contract(contract, workspace_root=tmp_path, contract_path=target)
     # 10 files on disk (9 upstreams + target, target skipped as self) →
-    # at most 10 parses total, NOT 10 * 9.
+    # at most 10 loads total, NOT 10 * 9.
     assert parse_count["n"] <= 10
 
 

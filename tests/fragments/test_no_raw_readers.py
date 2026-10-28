@@ -777,16 +777,7 @@ def _mesh(root: Path, *, upstream_metadata_in_a_fragment: bool) -> Path:
     "in_a_fragment",
     [
         pytest.param(False, id="upstream-metadata-inline"),
-        pytest.param(
-            True,
-            id="upstream-metadata-in-a-fragment",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="BUG G20-validate-composition-rule-raw-upstream: validate indexes the "
-                "workspace's contracts by their RAW metadata, so an upstream whose metadata is "
-                "in a fragment has no productType and a rule violation passes",
-            ),
-        ),
+        pytest.param(True, id="upstream-metadata-in-a-fragment"),
     ],
 )
 def test_g20_validate_enforces_the_composition_rule_against_an_upstream_kept_in_fragments(
