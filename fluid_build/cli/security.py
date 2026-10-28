@@ -35,6 +35,9 @@ from pathlib import Path
 from types import FrameType
 from typing import Any, Optional, Set, Union
 
+from fluid_build._path_policy import FORBIDDEN_PATHS
+from fluid_build._path_policy import build_forbidden_paths as _build_forbidden_paths
+
 from .core import FluidCLIError
 
 # Security configuration
@@ -57,79 +60,6 @@ def _not_found_event(file_type: str) -> str:
     return "contract_file_not_found" if file_type == "contract" else "file_not_found"
 
 
-def _build_forbidden_paths() -> Set[str]:
-    """Return the platform-specific set of system-path prefixes to deny.
-
-    SECURITY_REVIEW S-002: the previous hard-coded Linux-only set missed
-    macOS (``/etc`` resolves to ``/private/etc``, which has no prefix in
-    the Linux set) and Windows entirely. The check site uses
-    ``Path.is_relative_to`` for a proper domain-boundary comparison
-    rather than a naive string ``startswith`` — that fixes the
-    false-positive on siblings like ``/etcd/file.yaml``.
-    """
-    system = platform.system()
-    if system == "Darwin":
-        # macOS resolves ``/etc`` to ``/private/etc`` via symlink. Include
-        # ``/private/etc`` so paths that have already been through
-        # ``Path.resolve()`` — which all our validators do — still hit
-        # the deny. Deliberately NOT including ``/private/var`` or
-        # ``/private/tmp``: pytest's ``tmp_path`` fixture lives at
-        # ``/private/var/folders/…`` on macOS, and legitimate app code
-        # uses ``/tmp``. The review's concern is config + binary +
-        # password locations; ``/etc`` (and its ``/private/etc``
-        # resolved form) is the one that actually matters there.
-        #
-        # F4: ``/opt`` (third-party installs), ``/Library`` (system +
-        # app support / LaunchAgents), and ``/var/lib`` (service state)
-        # are added. ``/var/lib`` is deliberately narrower than bare
-        # ``/var`` so the macOS ``/private/var/folders`` temp tree
-        # (pytest's ``tmp_path`` on macOS) remains reachable.
-        # NOTE: bare ``/var`` is intentionally absent — on macOS it
-        # resolves to ``/private/var`` anyway (inert), and on Linux it
-        # over-broadly blocks Jenkins/Docker workspace paths under
-        # ``/var/jenkins_home``. See the Linux branch note below.
-        return {
-            "/etc",
-            "/private/etc",
-            "/usr",
-            "/bin",
-            "/sbin",
-            "/root",
-            "/System",
-            "/Library",
-            "/opt",
-            "/var/lib",
-        }
-    if system == "Windows":
-        return {
-            "C:\\Windows",
-            "C:\\Program Files",
-            "C:\\Program Files (x86)",
-            "C:\\ProgramData",
-        }
-    # Linux and other Unix-likes.
-    # F4: ``/opt`` (third-party installs), ``/Library`` (harmless on
-    # Linux but kept for cross-platform parity), and ``/var/lib``
-    # (service state — databases, container layers) are added.
-    #
-    # NOTE: bare ``/var`` is intentionally NOT in this set. Jenkins
-    # workspaces live at ``/var/jenkins_home/…`` and Docker bind-mounts
-    # commonly resolve under ``/var/jenkins_home`` or ``/var/lib/docker``.
-    # ``/var/lib`` (already present) is the specific concern (service
-    # state / container layers); blocking all of ``/var`` is over-broad
-    # and breaks every Jenkins-container pipeline build at Stage 1 (bundle).
-    return {
-        "/etc",
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/var/lib",
-        "/root",
-        "/opt",
-        "/Library",
-    }
-
-
 # F4: Windows device / UNC path prefixes. ``\\?\`` and ``\\.\`` reach the
 # raw device namespace and bypass the usual drive-letter forbidden-path
 # checks; ``\\`` is a bare UNC share. Any operator-supplied path that
@@ -137,8 +67,6 @@ def _build_forbidden_paths() -> Set[str]:
 # a legitimate reason to read or write through the device namespace.
 _WINDOWS_DEVICE_PREFIXES = ("\\\\?\\", "\\\\.\\", "//?/", "//./")
 
-
-FORBIDDEN_PATHS = _build_forbidden_paths()
 
 # Timeout configuration
 DEFAULT_TIMEOUT = 300  # 5 minutes

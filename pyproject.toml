@@ -855,6 +855,7 @@ source_modules = [
   "fluid_build._console",
   "fluid_build._contract_loader",
   "fluid_build._env_names",
+  "fluid_build._path_policy",
 ]
 forbidden_modules = [
   "fluid_build.cli",
@@ -864,13 +865,15 @@ forbidden_modules = [
 # console renderer, and the contract loader — imported by BOTH ``cli``
 # and ``build_runners``; ``_env_names`` (the ``fluid publish --env``
 # grammar, stdlib-only) is shared by ``cli.publish`` and ``forge``'s
-# pipeline generator. They must never import either package back, or
-# the ``build_runners → cli`` edge above re-forms indirectly (and a
-# ``cli → leaf → cli`` self-loop would defeat the point). ``_contract_loader``
-# legitimately reaches ``forge`` / ``observability`` / ``providers`` and
-# resolves ``fluid_build.loader`` dynamically by name (never a literal
-# import, because ``loader`` itself reaches ``cli.security``); none of
-# those static edges land on ``cli``.
+# pipeline generator; ``_path_policy`` (the system-directory deny set,
+# stdlib-only) is shared by ``cli.security`` and the contract composition,
+# which ``build_runners`` reaches through ``loader``. They must never import
+# either package back, or the ``build_runners → cli`` edge above re-forms
+# indirectly (and a ``cli → leaf → cli`` self-loop would defeat the point).
+# ``_contract_loader`` legitimately reaches ``forge`` / ``observability`` /
+# ``providers`` and resolves ``fluid_build.loader`` dynamically by name (an
+# indirection from when ``loader`` reached ``cli.security``; it no longer
+# does); none of those static edges land on ``cli``.
 allow_indirect_imports = false
 as_packages = true
 

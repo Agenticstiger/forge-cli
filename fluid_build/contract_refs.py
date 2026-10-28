@@ -714,28 +714,21 @@ def _refuse_system_path(target: Path, ref: str, where: str = "") -> None:
 def _is_system_path(target: Path) -> bool:
     """True when ``target`` (resolved) is in a system directory no ref reads.
 
-    The deny set is the CLI's own (``cli.security``'s security context), so
-    the two agree (it knows macOS ``/etc`` is ``/private/etc``), plus the
-    kernel trees (:data:`_KERNEL_TREES`), which that set leaves to the CLI's
-    own path checks. Only the set is used: the CLI's other path rules (a cap
-    on the number of path parts, for one) are about paths an operator types,
-    not about system directories, and would refuse a fragment deep inside
-    the root. Imported lazily to keep this module's import graph free of
-    ``cli``.
+    The deny set is the CLI's own (:data:`fluid_build._path_policy.FORBIDDEN_PATHS`,
+    which knows macOS ``/etc`` is ``/private/etc``), plus the kernel trees
+    (:data:`_KERNEL_TREES`), which that set leaves to the CLI's own path
+    checks. Only the set is used: the CLI's other path rules (a cap on the
+    number of path parts, for one) are about paths an operator types, not
+    about system directories, and would refuse a fragment deep inside the
+    root. It comes from the tier-0 leaf, not ``cli``, which ``build_runners``
+    may not reach.
     """
+    from fluid_build._path_policy import FORBIDDEN_PATHS
+
     text = target.as_posix()
     if any(text == tree or text.startswith(tree + "/") for tree in _KERNEL_TREES):
         return True
-    try:
-        from fluid_build.cli.security import get_security_context
-    except ImportError:
-        # Defensive fallback: if cli.security is somehow unavailable, keep the
-        # legacy prefix block so refs are still screened, not silently allowed.
-        return text.startswith(("/etc/", "/var/", "/usr/", "/proc/", "/sys/", "/dev/"))
-    context = get_security_context()
-    return context.enable_path_validation and any(
-        is_within(target, forbidden) for forbidden in context.forbidden_paths
-    )
+    return any(is_within(target, forbidden) for forbidden in FORBIDDEN_PATHS)
 
 
 def _read_target(

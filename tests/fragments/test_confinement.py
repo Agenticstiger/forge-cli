@@ -1437,11 +1437,12 @@ def test_d35_sg13_a_contract_under_a_denied_directory_cannot_use_local_refs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SG-13 characterization: the deny list applies with the default root too."""
-    from fluid_build.cli.security import get_security_context
+    from fluid_build import _path_policy
 
-    context = get_security_context()
     monkeypatch.setattr(
-        context, "forbidden_paths", set(context.forbidden_paths) | {str(tmp_path.resolve())}
+        _path_policy,
+        "FORBIDDEN_PATHS",
+        set(_path_policy.FORBIDDEN_PATHS) | {str(tmp_path.resolve())},
     )
     product = tmp_path / "p"
     _write(product / "team.yaml", TEAM)
