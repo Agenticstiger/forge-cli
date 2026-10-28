@@ -272,6 +272,8 @@ class ValidationResult:
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     validation_time: Optional[float] = None
+    #: What was validated, as the summary names it.
+    subject: str = "FLUID contract"
 
     def add_error(self, error: str) -> None:
         """Add a validation error."""
@@ -285,11 +287,11 @@ class ValidationResult:
     def get_summary(self) -> str:
         """Get a human-readable summary."""
         if self.is_valid:
-            summary = f"✅ Valid FLUID contract (schema v{self.schema_version})"
+            summary = f"✅ Valid {self.subject} (schema v{self.schema_version})"
             if self.warnings:
                 summary += f"\n⚠️  {len(self.warnings)} warning(s)"
         else:
-            summary = f"❌ Invalid FLUID contract ({len(self.errors)} error(s))"
+            summary = f"❌ Invalid {self.subject} ({len(self.errors)} error(s))"
             if self.schema_version:
                 summary += f" (schema v{self.schema_version})"
 

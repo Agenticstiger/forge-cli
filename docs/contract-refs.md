@@ -89,6 +89,30 @@ Refs may bring at most 1,000,000 values or 50 MiB of text into one contract: a
 target is copied once for every ref that reaches it, so refs that each name the
 one before twice would otherwise double the contract at every step.
 
+### Checking fragments in an editor, and on their own
+
+The canonical schema describes the composed contract, so an editor checking a
+root that holds `{$ref: ...}` against it reports every ref. Point the editor at
+the authoring schema instead, bundled beside the canonical one as
+`fluid_build/schemas/fluid-authoring-schema-0.7.6.json`: the same schema, with
+a `$ref` (siblings included) accepted wherever a value stands, and the
+canonical checks and messages everywhere else. It is generated from the
+canonical schema (`python -m fluid_build.schema_authoring`).
+
+To check one fragment on its own, name what it stands for:
+
+```bash
+fluid validate --fragment expose fragments/exposes/orders.yaml
+fluid validate --fragment quality fragments/quality/orders.yaml
+```
+
+The kind is a `$defs` name of the schema (`expose`, `build`, `column`,
+`sovereignty`, `accessPolicy`, ...) or `quality` / `schema` for an expose's
+lists. The schema version is `--schema-version`, else the `fluidVersion` of
+the nearest `contract.fluid.yaml` above the file. Errors name the file and
+line, as validating the whole contract does; the contract-wide rules
+(sovereignty against regions, overlays) need the whole contract.
+
 ---
 
 ## Where a ref may point: the ref root
