@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import glob
 import html
+import io
 import json
 import logging
 import os
@@ -56,44 +57,50 @@ def register(subparsers: argparse._SubParsersAction):
 
 def run(args, logger: logging.Logger) -> int:
     try:
-        os.makedirs(args.out, exist_ok=True)
-
         paths = _resolve_contract_paths(args)
         # Load full contracts once so we can render both summaries and
         # per-contract drill-in pages without re-parsing.
-        loaded = [(p, *_load_contract_quiet(p, logger)) for p in paths]
-        entries = [_summarize_contract(p, c, error) for p, c, error in loaded]
+        contracts = {p: _load_contract_quiet(p, logger) for p in paths}
+        entries = [_summarize_contract(p, c, error) for p, (c, error) in contracts.items()]
         # Sort by id for deterministic output.
         entries.sort(key=lambda e: (e.get("id") or "", e.get("path", "")))
         # Two contracts with one id would write one page; each gets its own.
         slugs = _unique_slugs(entries)
 
+        # Everything is rendered before any file is opened, so a run that fails
+        # leaves the catalog the previous run wrote and not half of a new one.
         # JSON index (machine-readable; existing consumers depend on it).
-        index_json_path = os.path.join(args.out, "index.json")
-        with open(index_json_path, "w", encoding="utf-8") as f:
-            json.dump(entries, f, indent=2)
+        index_json = io.StringIO()
+        json.dump(entries, index_json, indent=2)
 
         # HTML index (human-readable). One static file; no external deps.
-        index_html_path = os.path.join(args.out, "index.html")
-        with open(index_html_path, "w", encoding="utf-8") as f:
-            f.write(_render_index_html(entries))
+        index_html = _render_index_html(entries)
 
         # Per-contract drill-in pages. Slug derived from the contract id
         # (falls back to a path hash). Each page links back to the index.
-        pages_written = 0
-        for path, contract, _error in loaded:
-            if not isinstance(contract, Mapping):
+        # A contract with no row of its own (it did not load) gets no page.
+        pages: list[tuple[str, str]] = []
+        for entry in entries:
+            path = entry["path"]
+            contract = contracts[path][0]
+            if entry.get("error") or not isinstance(contract, Mapping):
                 continue
-            page_path = os.path.join(args.out, f"contract-{slugs[path]}.html")
-            # Rendered before the file is opened: a contract that cannot be
-            # rendered leaves the page it had, not an empty one.
             try:
                 page = _render_contract_html(contract, path)
-            except Exception as exc:  # noqa: BLE001 - one bad contract, not the catalog
+            except Exception as exc:  # noqa: BLE001 - say which contract, not just what broke
                 raise ValueError(f"{path}: {exc}") from exc
-            with open(page_path, "w", encoding="utf-8") as f:
-                f.write(page)
-            pages_written += 1
+            pages.append((os.path.join(args.out, f"contract-{slugs[path]}.html"), page))
+
+        os.makedirs(args.out, exist_ok=True)
+        index_json_path = os.path.join(args.out, "index.json")
+        index_html_path = os.path.join(args.out, "index.html")
+        for file_path, text in [
+            (index_json_path, index_json.getvalue()),
+            (index_html_path, index_html),
+            *pages,
+        ]:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(text)
 
         info(
             logger,
@@ -101,7 +108,7 @@ def run(args, logger: logging.Logger) -> int:
             out=index_json_path,
             html=index_html_path,
             count=len(entries),
-            pages=pages_written,
+            pages=len(pages),
         )
         return 0
     except Exception as e:

@@ -804,11 +804,6 @@ def test_j07_a_page_that_cannot_be_rendered_keeps_the_page_it_had(
     assert page.read_bytes() == before
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG DOCS-INDEX-TRUNCATED: index.html is opened for writing before it is rendered, "
-    "so a render failure leaves the previous catalog page empty (J-07's guard covers pages only)",
-)
 def test_j07_an_index_html_that_cannot_be_rendered_keeps_the_one_it_had(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -828,11 +823,6 @@ def test_j07_an_index_html_that_cannot_be_rendered_keeps_the_one_it_had(
     assert (out / "index.html").read_bytes() == before
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG DOCS-INDEX-TRUNCATED: index.json is streamed into an open file, so a failure "
-    "part-way leaves the previous index cut off and no longer valid JSON",
-)
 def test_j07_an_index_json_that_cannot_be_written_keeps_the_one_it_had(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -852,6 +842,33 @@ def test_j07_an_index_json_that_cannot_be_written_keeps_the_one_it_had(
     assert _docs(contract, out) != 0
 
     assert (out / "index.json").read_bytes() == before
+
+
+def test_j07_a_run_that_fails_on_one_page_leaves_every_file_of_the_catalog_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pages are rendered before any file is written: the contract whose page does render is
+    not rewritten, nor is the index, when the next one cannot be."""
+    from fluid_build.cli import docs_build
+
+    first = _put(tmp_path / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    _put(tmp_path / "c" / "contract.fluid.yaml", _min_doc("keep.c"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path, out, src=True) == 0
+    before = _tree(out)
+    _put(first, _min_doc("keep.a", name="Renamed since the last run"))
+    render = docs_build._render_contract_html
+
+    def fails_for_c(contract: Any, path: str) -> str:
+        if "keep.c" in str(contract.get("id")):
+            raise RuntimeError("cannot render")
+        return render(contract, path)
+
+    monkeypatch.setattr(docs_build, "_render_contract_html", fails_for_c)
+
+    assert _docs(tmp_path, out, src=True) != 0
+
+    assert _tree(out) == before
 
 
 # ── J-08 ────────────────────────────────────────────────────────────────
