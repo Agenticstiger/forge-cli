@@ -220,11 +220,18 @@ def iter_external_refs(doc: Any) -> Iterator[Tuple[str, str]]:
     """Yield ``(json_pointer, ref)`` for every ``$ref`` that is not ``#...``.
 
     Walks dicts and lists iteratively (no recursion limit to hit on a deep
-    document). Non-string ``$ref`` values are skipped: they resolve nothing.
+    document), each container once: a YAML alias can make a parsed document
+    contain itself, and its refs are reported at the first place they are
+    met. Non-string ``$ref`` values are skipped: they resolve nothing.
     """
+    seen: set[int] = set()
     stack: list[Tuple[Tuple[Union[str, int], ...], Any]] = [((), doc)]
     while stack:
         parts, node = stack.pop()
+        if isinstance(node, (dict, list)):
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
         if isinstance(node, dict):
             ref = node.get("$ref")
             if isinstance(ref, str) and not ref.startswith("#"):

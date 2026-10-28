@@ -1101,6 +1101,25 @@ def test_a_fragment_that_contains_itself_is_refused(tmp_path: Path) -> None:
         load_contract(path)
 
 
+def test_a_root_that_contains_itself_fails_fast(tmp_path: Path) -> None:
+    """The ref-root gate walks the root before composition; it must end on a cycle."""
+    path = tmp_path / "contract.fluid.yaml"
+    _write(path, "id: x\nextensions: &e\n  self: *e\n  part: {$ref: ./part.yaml}\n")
+    _write(tmp_path / "part.yaml", "a: 1\n")
+
+    with pytest.raises(ValueError, match="contains itself through a YAML alias"):
+        load_contract(path)
+    assert contract_refs.find_ref_node(yaml.safe_load(path.read_text("utf-8"))) is not None
+
+
+def test_external_refs_are_listed_once_in_a_document_that_contains_itself() -> None:
+    from fluid_build.util.ref_confinement import iter_external_refs
+
+    loop: Dict[str, Any] = {"part": {"$ref": "./part.yaml"}}
+    loop["self"] = loop
+    assert list(iter_external_refs({"x": loop})) == [("/x/part", "./part.yaml")]
+
+
 def test_the_cap_counts_keys_and_alias_copies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
