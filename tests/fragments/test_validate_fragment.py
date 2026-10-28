@@ -467,11 +467,6 @@ def test_k14x_a_fragment_run_without_a_file_does_not_validate_the_contract_besid
     assert "required" in (out + err).lower()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG K14-NO-FILE: validate --fragment '' (an empty kind) is ignored as if the flag "
-    "were absent, and the file is validated as a whole contract",
-)
 def test_k14x_an_empty_kind_is_refused_not_ignored(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:

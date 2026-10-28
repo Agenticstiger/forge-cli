@@ -317,7 +317,7 @@ def run(args, logger: logging.Logger) -> int:
         if contract_lower.endswith(".tgz") or contract_lower.endswith(".tar.gz"):
             return _run_bundle_validation(contract_path, args, schema_manager, logger, start_time)
 
-        if getattr(args, "fragment", None):
+        if isinstance(getattr(args, "fragment", None), str):
             return _run_fragment_validation(Path(contract_path), args, schema_manager, logger)
 
         # Load contract with overlay

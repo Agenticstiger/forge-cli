@@ -130,7 +130,7 @@ def _walk(node: Any) -> Any:
 
 def render(version: str) -> str:
     """The authoring schema for ``version``, as the bundled file holds it."""
-    canonical = json.loads((_SCHEMAS / f"fluid-schema-{version}.json").read_text("utf-8"))
+    canonical = json.loads((_SCHEMAS / f"fluid-schema-{version}.json").read_text(encoding="utf-8"))
     return json.dumps(authoring_schema(canonical), indent=2, ensure_ascii=False) + "\n"
 
 
