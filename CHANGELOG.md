@@ -64,19 +64,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file system, where curl and OpenSSL used to open it themselves and bypassed `allowed_paths`
   entirely.
 
-  The sandbox now grants the first CA bundle that exists out of the five DuckDB probes, as **one
-  file** in `allowed_paths`, and only when the allowlist carries a remote prefix. A local read
-  gains nothing, `allowed_directories` is untouched — so what a remote prefix grants locally is
-  unchanged — and the grant is not folded into the allowlist, so refusal messages still name only
-  what the contract declared. On a host with none of the five (a minimal container, Windows)
-  nothing is granted and DuckDB's own refusal, which names the paths it looked for, is left to
-  speak.
+  The sandbox now takes the first CA bundle that exists out of the five DuckDB probes and grants a
+  **private, read-only copy** of it — one file in `allowed_paths`, mode 0400 in a 0700 directory
+  the connection owns, with `ca_cert_file` pinned to it and the copy removed on teardown — and only
+  when the allowlist carries a remote prefix. A local read gains nothing, `allowed_directories` is
+  untouched (so what a remote prefix grants locally is unchanged), and the allowlist object is not
+  widened. On a host with none of the five (a minimal container, Windows) nothing is granted and
+  DuckDB's own refusal, which names the paths it looked for, is left to speak.
+
+  **Why a copy and not the store itself:** a path in `allowed_paths` is granted for *writing*. The
+  first version of this fix granted the host store directly, and contract SQL could then run
+  `COPY (SELECT 'ATTACKER CA') TO '<store>'` and replace it — measured on 1.5.6 and 2.0.0, a
+  333 KB trust store overwritten with 14 bytes, with an ungranted sibling in the same directory
+  still refused. Only file ownership stood in the way: `/etc/ssl/cert.pem` is root-owned, so an
+  unprivileged `fluid` cannot write it, but `fluid generate ci` emits a `python:3.12-slim` job that
+  runs as root, and a contract built there could have installed its own CA into that container's
+  trust store. Granting a copy removes the capability: the store is not in `allowed_paths` at all,
+  and the copy's mode refuses an unprivileged write as well.
 
   Certificate verification is untouched and stays on: an expired and a self-signed certificate are
   refused on 1.5.6 and 2.0.0 alike, with and without `enable_server_cert_verification` — that
-  setting governs the httplib client, while `s3://` and `https://` go through curl, whose own flag
-  defaults to on (duckdb/duckdb-httpfs#378 unified the two). Nothing here disables verification or
-  pins `ca_cert_file`.
+  setting governs the httplib client, while `s3://` and `https://` go through curl. 1.5.6 exposes
+  `enable_curl_server_cert_verification` (default true) and 2.0.0 no longer does;
+  duckdb/duckdb-httpfs#378 proposes unifying the two and is still open, so the behaviour above is
+  what was measured rather than what upstream documents. Nothing here disables verification.
 
   Verified by running the CLI: `fluid init --discover s3://noaa-ghcn-pds/csv/by_year/2024.csv`
   emits 8 columns and `--discover https://…/customer.csv` emits 18, on 1.5.1, 1.5.6 and 2.0.0,

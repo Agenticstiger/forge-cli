@@ -60,22 +60,28 @@ What the sandbox can and cannot promise (and why the floor is DuckDB 1.5.0):
   and OpenSSL used to open it themselves, bypassing ``allowed_paths``
   entirely. So on 1.5.x a remote read works with no CA grant, and on 2.0.0 the
   same read fails before a byte moves with ``Cannot read a CA certificate
-  bundle``. :func:`_ca_bundle_for_remote` grants it: one file, only when the
-  allowlist carries a remote prefix. Measured, not assumed:
+  bundle``. Measured, not assumed:
   ``fluid init --discover s3://noaa-ghcn-pds/...`` emitted 8 columns on 1.5.6
   and exited 1 on 2.0.0, measured at ``5f2ec50b`` (and on clean ``7cf5471a``
-  when the card was filed); the grant makes 2.0.0 emit the same 8.
-  Two things this does NOT do, because neither is needed: it does not set
-  ``ca_cert_file`` (the probe mirrors DuckDB's own order, so DuckDB opens the
-  file that was granted), and it touches no verification setting -- an expired
-  and a self-signed certificate are already refused on both engines, with and
-  without ``enable_server_cert_verification``, which is the httplib flag while
-  s3 and https go through curl (duckdb/duckdb-httpfs#378 unified the two).
+  when the card was filed).
+  What is granted is NOT the host store. A path in ``allowed_paths`` can be
+  WRITTEN, so :func:`_ca_bundle_for_remote` only picks which store to copy and
+  :func:`_private_ca_bundle` grants a 0400 copy the connection owns, with
+  ``ca_cert_file`` pinned to it so DuckDB opens that copy and not its own probe
+  result. Granting the store itself was the first version of this and it let
+  contract SQL replace the host trust store wherever the process can write it.
+  No verification setting is touched: an expired and a self-signed certificate
+  are refused on 1.5.6 and 2.0.0 alike, with and without
+  ``enable_server_cert_verification``, which governs the httplib client while
+  s3 and https go through curl. 1.5.6 exposes
+  ``enable_curl_server_cert_verification`` (default true) and 2.0.0 no longer
+  does; duckdb/duckdb-httpfs#378 proposes unifying them and is still open, so
+  the behaviour above is what was measured rather than what upstream documents.
   Plain ``http://`` did not need the grant -- duckdb/duckdb-httpfs#499 made a
   failed bundle load non-fatal there, and 2.0.0 carries it -- but it gets one
-  anyway, because the prefix is what is declared and an http base URL that
-  redirects to https still verifies (which is #499's own reason for loading the
-  bundle on that path).
+  anyway, because the declared prefix is what the grant keys on and an http base
+  URL that redirects to https still verifies (which is #499's own reason for
+  loading the bundle on that path).
 * DuckDB folds its ``temp_directory`` into ``allowed_directories``, and its
   default is relative: ``.tmp`` in the working directory, or ``<db>.tmp``
   beside a file database. Both sit where the contract's repository can place a
@@ -919,6 +925,10 @@ def _open_lock(target: str) -> Any:
 #: Named so an operator who finds one left behind knows what wrote it.
 SPILL_DIR_PREFIX = "fluid-duckdb-spill-"
 
+#: Prefix of the directory holding one connection's private CA-bundle copy
+#: (:func:`_private_ca_bundle`). Named for the same reason.
+CA_DIR_PREFIX = "fluid-duckdb-ca-"
+
 
 def _refuse_caller_spill_dir(config: Optional[Mapping[str, Any]]) -> None:
     """Refuse a ``config`` that names ``temp_directory``: the sandbox owns it.
@@ -1033,11 +1043,13 @@ def _refuse_escaping_remote_prefixes(allow: DuckDBAllowlist) -> None:
 
 #: The CA bundles DuckDB's httpfs probes, in the order its own refusal names
 #: them ("Add one of ... to allowed_paths"). Mirrored from DuckDB rather than
-#: borrowed from ``ssl.get_default_verify_paths()`` or ``certifi``, the way
-#: sethmlarson/truststore picks a trust store for OpenSSL: the grant has to
-#: name the file DuckDB will open, and DuckDB probes these five itself,
-#: consulting neither OpenSSL's defaults nor ``SSL_CERT_FILE``. Granting
-#: certifi's bundle would also add a dependency the base install does not ship.
+#: borrowed from ``ssl.get_default_verify_paths()`` or ``certifi`` (which IS
+#: installed, via requests and httpx), the way sethmlarson/truststore picks a
+#: trust store for OpenSSL: what is copied has to be a store DuckDB itself
+#: would have trusted, and DuckDB probes these five, consulting neither
+#: OpenSSL's defaults nor ``SSL_CERT_FILE``. certifi's bundle sits inside
+#: site-packages, where overwriting it would reach every other tool in the
+#: environment -- the opposite of what :func:`_private_ca_bundle` is for.
 #: ``tests/providers/test_duckdb_sandbox_ca_bundle.py`` parses the list back out
 #: of DuckDB's refusal and fails if upstream's order or contents drift.
 _CA_BUNDLE_CANDIDATES = (
@@ -1050,7 +1062,7 @@ _CA_BUNDLE_CANDIDATES = (
 
 
 def _ca_bundle_for_remote(allow: DuckDBAllowlist) -> Optional[str]:
-    """The one CA bundle to grant for ``allow``'s remote prefixes, if any.
+    """The host CA bundle a remote read needs, if there is one to copy.
 
     ``None`` when the call site declared no remote prefix -- a purely local
     read must not gain a grant it has no use for -- and ``None`` when the host
@@ -1058,6 +1070,10 @@ def _ca_bundle_for_remote(allow: DuckDBAllowlist) -> Optional[str]:
     Granting nothing there is what this already did: DuckDB then raises its own
     refusal naming the paths it looked for, which is more accurate than
     anything this could say.
+
+    What reaches ``allowed_paths`` is never this path. It is a copy made by
+    :func:`_private_ca_bundle`, because a granted path is WRITABLE -- see that
+    function.
 
     A directory is never returned. ``allowed_paths`` grants one file, so this
     cannot widen what :func:`_refuse_ungranted_dirs` reads back from
@@ -1070,6 +1086,40 @@ def _ca_bundle_for_remote(allow: DuckDBAllowlist) -> Optional[str]:
         if os.path.isfile(candidate):
             return candidate
     return None
+
+
+def _private_ca_bundle(bundle: str) -> str:
+    """A mode-0400 copy of ``bundle`` in a 0700 directory this connection owns.
+
+    **A path in ``allowed_paths`` is granted for WRITING, not only reading.**
+    Measured on 1.5.6 and 2.0.0: with the host store granted directly,
+    ``COPY (SELECT 'ATTACKER CA') TO '<store>' (FORMAT CSV, USE_TMP_FILE
+    false)`` replaced a 333 KB trust store with 14 bytes, while an ungranted
+    sibling in the same directory stayed refused. The OS is the only thing that
+    stops it: ``/etc/ssl/cert.pem`` is root-owned, so an unprivileged ``fluid``
+    cannot write it -- but ``cli/scaffold_ci.py`` generates a ``python:3.12-slim``
+    job, which runs as root, and that job runs ``fluid apply``. Contract SQL
+    could have installed its own CA into the trust store of the container it was
+    built in. Found by the world-class inspection of the first version of this
+    fix, which granted the store itself.
+
+    So the store is never granted. The connection reads a copy that belongs to
+    it: 0400 so an unprivileged write is refused by the OS as well as by the
+    allowlist, under :func:`tempfile.mkdtemp`'s 0700 directory outside the
+    contract's tree, removed when the connection is gone. Root can still
+    overwrite the copy, and that is the whole point of the copy -- the damage
+    stops at one connection's own TLS trust, whose remote locations the contract
+    chose anyway, and no state outside the process is touched.
+
+    The cost is one ~330 KB file copy per connection that declared a remote
+    prefix, which is why :func:`_ca_bundle_for_remote` returns ``None`` for
+    every other connection.
+    """
+    directory = tempfile.mkdtemp(prefix=CA_DIR_PREFIX)
+    copy = os.path.join(directory, "ca-bundle.pem")
+    shutil.copyfile(bundle, copy)
+    os.chmod(copy, 0o400)
+    return copy
 
 
 def _refuse_ungranted_dirs(con: Any, allow: DuckDBAllowlist, spill: str) -> None:
@@ -1256,10 +1306,24 @@ def _confine_connection(
     directories = [_with_sep(d) for d in allow.dirs] + list(allow.remote_prefixes)
     con.execute(f"SET allowed_directories = {_sql_list(directories)}")
     # The CA bundle is appended here and NOT folded into ``allow``: the
-    # allowlist stays what the call site declared, so a refusal hint and the
-    # read-back below speak only of the caller's own grants.
-    bundle = _ca_bundle_for_remote(allow)
-    paths = list(allow.paths) + ([bundle] if bundle is not None else [])
+    # allowlist stays what the call site declared, so the read-back below and
+    # every caller that reads ``allow`` as a declared-inputs list are unchanged.
+    # What is granted is a private copy, never the host store: a granted path
+    # can be written (:func:`_private_ca_bundle`).
+    paths = list(allow.paths)
+    host_bundle = _ca_bundle_for_remote(allow)
+    if host_bundle is not None:
+        private = _private_ca_bundle(host_bundle)
+        spill_cleanup.append(
+            weakref.finalize(con, shutil.rmtree, os.path.dirname(private), ignore_errors=True)
+        )
+        paths.append(private)
+        try:
+            con.execute(f"SET ca_cert_file = {quote_ansi_string_literal(private)}")
+        except duckdb.Error:
+            # httpfs is not loaded on this connection, so the setting does not
+            # exist and no TLS will happen either. Nothing to point at.
+            pass
     con.execute(f"SET allowed_paths = {_sql_list(paths)}")
     con.execute("SET enable_external_access = false")
     con.execute("SET lock_configuration = true")
@@ -1332,8 +1396,15 @@ def sandbox_refusal_hint(allow: DuckDBAllowlist, refusal: Optional[BaseException
     # also grants the host's trust store (:func:`_ca_bundle_for_remote`), so
     # "only the locations the contract declares" would be false here. Left out
     # when there is no remote prefix, where it would be noise on every refusal.
-    bundle = _ca_bundle_for_remote(allow)
-    also = f", and the TLS trust store a remote read needs ({bundle})" if bundle else ""
+    # Named without its path: what SQL can read is the private copy
+    # :func:`_private_ca_bundle` made for this connection, not the host store
+    # this returns, and printing the store would point the reader at a file the
+    # SQL was in fact refused.
+    also = (
+        ", and a private read-only copy of the host's TLS trust store, which a remote " "read needs"
+        if _ca_bundle_for_remote(allow)
+        else ""
+    )
     return (
         "DuckDB refused it: contract SQL may only read and write the locations the "
         f"contract declares and its own directory ({where}){also}. Declare the file as "
@@ -1344,6 +1415,7 @@ def sandbox_refusal_hint(allow: DuckDBAllowlist, refusal: Optional[BaseException
 
 __all__ = [
     "BROAD_ROOT_REASONS",
+    "CA_DIR_PREFIX",
     "MIN_DUCKDB_VERSION",
     "OPERATOR_DIRS_ENV",
     "SPILL_DIR_PREFIX",
