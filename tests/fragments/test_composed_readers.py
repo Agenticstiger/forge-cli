@@ -26,7 +26,6 @@ with the one case each scenario names. This file pins what those fixes decided b
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from pathlib import Path

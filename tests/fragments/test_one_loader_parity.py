@@ -50,7 +50,7 @@ import pytest
 import yaml
 
 import fluid_build
-from fluid_build import contract_refs, loader
+from fluid_build import loader
 
 _CHECKOUT = Path(__file__).resolve().parents[2]
 

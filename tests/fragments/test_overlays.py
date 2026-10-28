@@ -38,14 +38,14 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 import yaml
 
 import fluid_build
 from fluid_build import loader
-from fluid_build.loader import OverlayMergeError, RefConfinementError, RefResolutionError
+from fluid_build.loader import RefConfinementError, RefResolutionError
 
 _CHECKOUT = Path(__file__).resolve().parents[2]
 

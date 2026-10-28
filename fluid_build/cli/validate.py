@@ -510,8 +510,8 @@ def _run_fragment_validation(
     the contract-wide rules (sovereignty against regions, overlays) need the
     whole contract.
     """
-    import fluid_build.cli.validate as _self
     from fluid_build import contract_refs, loader
+    from fluid_build.schema_manager import SchemaVersion, ValidationResult
     from fluid_build.util.ref_confinement import RefResolutionError, is_within
 
     kind = args.fragment
@@ -527,7 +527,7 @@ def _run_fragment_validation(
         or _contract_version(contract)
         or (schema_manager.latest_bundled_version())
     )
-    schema = schema_manager.get_schema(_self.SchemaVersion.parse(version), offline_only=True)
+    schema = schema_manager.get_schema(SchemaVersion.parse(version), offline_only=True)
     if not schema:
         raise CLIError(1, "schema_not_available", {"version": version})
     defs = schema.get("$defs") or {}
@@ -587,8 +587,8 @@ def _run_fragment_validation(
             shown = str(found[0])
         return f"{shown}:{found[1]}" if found[1] else shown
 
-    result = _self.ValidationResult(
-        is_valid=True, schema_version=_self.SchemaVersion.parse(version), subject=f"{kind} fragment"
+    result = ValidationResult(
+        is_valid=True, schema_version=SchemaVersion.parse(version), subject=f"{kind} fragment"
     )
     wrapper = {"$schema": schema.get("$schema"), "$defs": defs, "$ref": pointer}
     if not schema_manager._validate_with_jsonschema(document, wrapper, result, locate):

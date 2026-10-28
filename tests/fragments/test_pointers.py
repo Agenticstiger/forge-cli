@@ -264,7 +264,7 @@ def _entry_points() -> Dict[str, Callable[[Path, Optional[str]], Dict[str, Any]]
 
     log = logging.getLogger("test.c03")
     return {
-        "loader.load_with_overlay": lambda p, env: load_with_overlay(p, env),
+        "loader.load_with_overlay": load_with_overlay,
         "cli loader": lambda p, env: load_contract_with_overlay(str(p), env, log),
         "bundle.materialize_contract": lambda p, env: materialize_contract(p, env, log)[0],
         "api.load_contract": lambda p, env: api_load_contract(p, env=env).contract,

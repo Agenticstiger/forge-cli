@@ -160,8 +160,10 @@ jobs:
     # hang (a leaked server loop / deadlocked async session) to minutes
     # instead of GitHub's 6-hour default. A hung job that burns 6h of
     # runner time before anyone notices is how the 3.13/3.14 deadlock
-    # stayed costly.
-    timeout-minutes: 25
+    # stayed costly. 35, not 25: the \$ref fragment scenario suite
+    # (tests/fragments, ~1,900 tests) added about 7 minutes, and the 3.10
+    # leg then ran 24 of its 25.
+    timeout-minutes: 35
     env:
       # Cap glibc malloc arenas. On Linux glibc creates up to one ~64MB
       # virtual arena PER THREAD; a thread-heavy run balloons VIRTUAL
@@ -263,9 +265,11 @@ jobs:
     name: Coverage & Audit (Python 3.12)
     runs-on: ubuntu-latest
     # Observed ~20 min for the old overloaded 3.12 leg; this job carries
-    # the same coverage run minus the perf step. 30 gives headroom while
-    # still bounding a true hang to minutes, not GitHub's 6-hour default.
-    timeout-minutes: 30
+    # the same coverage run minus the perf step. 45 gives headroom while
+    # still bounding a true hang to minutes, not GitHub's 6-hour default;
+    # it was 30 until the fragment scenario suite added about 12 minutes
+    # under coverage (the job ran 19, then past 30).
+    timeout-minutes: 45
     env:
       # Same glibc-arena cap as the test matrix (see comment there) —
       # this is the identical thread-heavy pytest run, plus coverage.

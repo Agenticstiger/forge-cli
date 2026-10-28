@@ -537,7 +537,7 @@ def test_b21_a_sibling_may_name_the_file_its_ref_names(tmp_path: Path) -> None:
     assert got == {"a": 1, "extra": {"a": 1}}
 
 
-@pytest.mark.parametrize("value", [42, 1.5, True, None, ["a"], {"a": 1}], ids=lambda v: repr(v))
+@pytest.mark.parametrize("value", [42, 1.5, True, None, ["a"], {"a": 1}], ids=repr)
 def test_b22_a_ref_value_that_is_not_a_string_is_refused_even_with_siblings(
     tmp_path: Path, value: Any
 ) -> None:
