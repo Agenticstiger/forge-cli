@@ -68,6 +68,9 @@ def split_yaml_text(
     """
     if _has_aliases(text):
         raise SpliceRefused("the contract uses YAML aliases")
+    if "\r" in text.replace("\r\n", ""):
+        # A bare CR ends a line for YAML but not for the line arithmetic here.
+        raise SpliceRefused("the contract ends lines with a bare CR")
     tree = compose_yaml_safe(text)
     if tree is None:
         raise SpliceRefused("the contract is empty")

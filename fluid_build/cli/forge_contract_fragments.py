@@ -320,11 +320,23 @@ def split_contract_to_fragments(
             fragments[site.target] = value
         else:
             fragments[site.target] = (site.header + "\n" if site.header else "") + yaml.dump(
-                value, default_flow_style=False, sort_keys=False, allow_unicode=True
+                value,
+                Dumper=_exact_dumper(),
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
             )
         parent[site.path[-1]] = {"$ref": ref_between(site.target, container_of(site, sites))}
 
     return root, fragments
+
+
+def _exact_dumper() -> Any:
+    """The YAML dumper ``fluid bundle`` writes with: text holding NEL, LS or PS is
+    written escaped, so it reads back exactly (a bare one folds into a space)."""
+    from fluid_build.forge.core.bundle import ExactDumper
+
+    return ExactDumper
 
 
 def _walk(document: Any, path: Iterable[Union[str, int]]) -> Any:

@@ -246,7 +246,11 @@ def _split(
         return json.dumps(root, indent=2, ensure_ascii=False) + "\n", fragments, None
     import yaml
 
-    dumped = yaml.dump(root, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    from fluid_build.cli.forge_contract_fragments import _exact_dumper
+
+    dumped = yaml.dump(
+        root, Dumper=_exact_dumper(), default_flow_style=False, sort_keys=False, allow_unicode=True
+    )
     return dumped, fragments, why
 
 

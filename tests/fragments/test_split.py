@@ -3248,3 +3248,34 @@ def test_no_fragment_is_written_through_a_symlinked_directory(
     assert "symlink" in capsys.readouterr().err
     assert list(outside.iterdir()) == []
     assert contract.read_bytes() == original
+
+
+@pytest.mark.parametrize("char", ["\u0085", "\u2028", "\u2029"], ids=["NEL", "LS", "PS"])
+def test_a_data_split_keeps_next_line_characters(tmp_path: Path, char: str) -> None:
+    """The data fallback (a JSON root) writes text holding NEL, LS or PS escaped, as the
+    bundle does, so the split composes to the original instead of being refused."""
+    contract = tmp_path / "contract.fluid.json"
+    sql = f"SELECT 'a{char}b'"
+    contract.write_text(
+        json.dumps({"id": "x", "builds": [{"id": "t", "properties": {"sql": sql}}]}),
+        encoding="utf-8",
+    )
+    assert split(contract, "--parts", "builds") == 0
+    from fluid_build.loader import load_contract
+
+    assert load_contract(contract)["builds"][0]["properties"]["sql"] == sql
+
+
+def test_a_bare_cr_file_is_split_as_data(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Old Mac line ends: the text splice cannot place them, so the data split runs, saying
+    the root's comments were not kept, and the result composes to the original."""
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_bytes(b"id: x\rbuilds:\r  - id: t\r    engine: sql\r")
+    from fluid_build.loader import load_contract
+
+    before = load_contract(contract)
+    assert split(contract, "--parts", "builds") == 0
+    assert "bare CR" in capsys.readouterr().err
+    assert load_contract(contract) == before
