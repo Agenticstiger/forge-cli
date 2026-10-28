@@ -65,8 +65,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
-import yaml
-
 LOG = logging.getLogger("fluid.build_runners.replay")
 
 REPLAY_MARKER_FILENAME = "replay-pending.json"
@@ -121,15 +119,20 @@ def find_downstream_products(
 
     Returns one dict per match: ``{"product_id": str, "contract_path":
     Path, "consumes_index": int}`` so callers can attribute markers
-    to specific consumes rows. Errors during a single contract read
-    do NOT abort the walk — broken contracts get logged + skipped.
+    to specific consumes rows. Each contract is read as every command
+    reads it (:func:`fluid_build.loader.load_contract`), so a product
+    whose ``consumes[]`` lives in a ``$ref`` fragment is found too.
+    Errors during a single contract read (a file that does not parse,
+    a ref that does not resolve) do NOT abort the walk — broken
+    contracts get logged + skipped.
     """
+    from fluid_build.loader import load_contract
+
     matches: List[Dict[str, Any]] = []
     for path in sorted(workspace_root.rglob("*.fluid.yaml")):
         try:
-            with path.open(encoding="utf-8") as f:
-                contract = yaml.safe_load(f) or {}
-        except (OSError, yaml.YAMLError) as exc:
+            contract = load_contract(path)
+        except Exception as exc:  # noqa: BLE001 - one broken contract must not stop the walk
             LOG.debug("downstream_walk_skip: path=%s error=%s", path, exc)
             continue
         consumes = contract.get("consumes")

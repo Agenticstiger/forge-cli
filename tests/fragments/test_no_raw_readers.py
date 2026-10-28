@@ -813,16 +813,7 @@ def _downstream_workspace(root: Path, *, consumes_in_a_fragment: bool) -> Path:
     "in_a_fragment",
     [
         pytest.param(False, id="consumes-inline"),
-        pytest.param(
-            True,
-            id="consumes-in-a-fragment",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="BUG G20-replay-downstream-raw-consumes: apply's ADP auto-replay finds "
-                "downstream products from the RAW consumes[], so one whose consumes live in a "
-                "fragment gets no replay-pending marker after an upstream cursor rewinds",
-            ),
-        ),
+        pytest.param(True, id="consumes-in-a-fragment"),
     ],
 )
 def test_g20_the_replay_walk_finds_a_downstream_product_whose_consumes_are_in_a_fragment(

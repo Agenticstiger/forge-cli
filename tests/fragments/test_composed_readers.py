@@ -21,6 +21,7 @@ with the one case each scenario names. This file pins what those fixes decided b
 
 * the composition rule's index skips a contract that does not compose, with a debug line,
   and keeps walking;
+* so does the replay walk;
 """
 
 from __future__ import annotations
@@ -159,3 +160,53 @@ def test_the_composition_index_keeps_a_product_whose_metadata_is_not_a_mapping(
     _write(tmp_path / "plain" / "contract.fluid.yaml", _dump(_contract(id="up.plain")))
 
     assert _build_product_type_index([tmp_path], None) == {"up.odd": None, "up.plain": "ADP"}
+
+
+# ── the replay walk ─────────────────────────────────────────────────────
+
+
+def _consumer(root: Path, name: str, consumes: Any) -> Path:
+    return _write(
+        root / name / "contract.fluid.yaml",
+        _dump(_contract(id=f"down.{name}", consumes=consumes)),
+    )
+
+
+def test_the_replay_walk_skips_a_contract_that_does_not_compose_and_finds_the_rest(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from fluid_build.build_runners._replay import find_downstream_products
+
+    ws = tmp_path / "ws"
+    entry = {"productId": "up.orders", "exposeId": "orders"}
+    _consumer(ws, "inline", [entry])
+    _write(ws / "split" / "consumes" / "up.yaml", _dump(entry))
+    _consumer(ws, "split", [{"$ref": "./consumes/up.yaml"}])
+    _consumer(ws, "broken", [{"$ref": "./consumes/missing.yaml"}])
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.build_runners.replay"):
+        found = find_downstream_products(ws, "up.orders")
+
+    assert [m["product_id"] for m in found] == ["down.inline", "down.split"]
+    assert "downstream_walk_skip" in caplog.text and "missing.yaml" in caplog.text
+
+
+def test_a_rewound_upstream_cursor_marks_a_downstream_whose_consumes_are_in_a_fragment(
+    tmp_path: Path,
+) -> None:
+    from fluid_build.api.state import Cursor
+    from fluid_build.build_runners._replay import list_dirty_products
+    from fluid_build.build_runners._state import FileStateStore
+
+    ws = tmp_path / "ws"
+    _write(
+        ws / "split" / "consumes" / "up.yaml",
+        _dump({"productId": "up.orders", "exposeId": "orders"}),
+    )
+    _consumer(ws, "split", [{"$ref": "./consumes/up.yaml"}])
+    store = FileStateStore(ws / ".fluid" / "runs")
+
+    store.set_cursor("up.orders", "main", Cursor(stream="s", value=100, updated_at=""))
+    store.set_cursor("up.orders", "main", Cursor(stream="s", value=40, updated_at=""))
+
+    assert [d["product_id"] for d in list_dirty_products(ws)] == ["down.split"]
