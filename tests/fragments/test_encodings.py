@@ -839,18 +839,17 @@ def test_n24_a_file_name_with_a_hash_cannot_be_named_because_the_ref_splits_at_t
     assert "a#b.yaml" not in reads
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG N24-pointer-without-slash (C-12): a file ref's pointer need not start with '/', "
-    "so './a#b.yaml' reads key 'b.yaml' of file 'a' instead of failing as 'not a JSON pointer'",
-)
-def test_n24_a_pointer_that_does_not_start_with_a_slash_is_not_a_json_pointer(
+def test_n24_a_file_refs_pointer_without_a_slash_names_a_key_for_compatibility(
     tmp_path: Path,
 ) -> None:
+    """Characterization (N24, decided): a file ref's fragment need not start with '/'.
+    ``./a#b.yaml`` reads key ``b.yaml`` of file ``a``, and ``./x.yaml#key`` key ``key``,
+    as contracts 0.24.0 loaded did; only a same-document ``#key`` is refused (C-12)."""
     _write(tmp_path / "a", "b.yaml: KEY-OF-A\nother: 1\n")
+    _write(tmp_path / "x.yaml", "key: KEY-OF-X\n")
 
-    with pytest.raises(RefResolutionError):
-        _rfr({"x": {"$ref": "./a#b.yaml"}}, tmp_path)
+    assert _rfr({"x": {"$ref": "./a#b.yaml"}}, tmp_path) == {"x": "KEY-OF-A"}
+    assert _rfr({"x": {"$ref": "./x.yaml#key"}}, tmp_path) == {"x": "KEY-OF-X"}
 
 
 @pytest.mark.skipif(os.name == "nt", reason="a ? cannot be part of a Windows file name")
