@@ -533,13 +533,14 @@ def _build_product_type_index(
     dependency caches are skipped so the walk stays bounded even when a
     root sits high in the tree.
 
-    A contract is read as every command reads it
-    (:func:`fluid_build.loader.load_contract`): its ``$ref`` fragments in,
-    so an upstream whose ``metadata`` is kept in a fragment has its
-    productType, and the loader's billion-laughs and ref-root protections
-    apply. A file that does not compose contributes nothing (logged at
-    DEBUG): the contract being validated reports its own errors, and one
-    broken neighbour must not stop the walk.
+    A contract is read as every command reads it, composed where the values
+    the index needs (``id``, ``metadata.productType``, ``metadata.layer``)
+    come from a ``$ref`` (:func:`fluid_build.loader.load_contract_fields`), so
+    an upstream whose ``metadata`` is kept in a fragment has its productType,
+    and the loader's billion-laughs and ref-root protections apply. A file
+    that cannot be read contributes nothing (logged at DEBUG): the contract
+    being validated reports its own errors, and one broken neighbour must not
+    stop the walk.
     """
     index: Dict[str, Optional[str]] = {}
     seen_files: set[Path] = set()

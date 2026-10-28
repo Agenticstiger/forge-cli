@@ -286,8 +286,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (an ADP or CDP may not consume what its type forbids) read each upstream's `productType` from its
   raw root, so an upstream whose metadata lives in a fragment passed unchecked; and apply's ADP
   auto-replay found downstream products from their raw `consumes[]`, so one whose consumes live in
-  a fragment got no replay marker when its upstream rewound. Both now read composed contracts,
-  skipping one that does not compose.
+  a fragment got no replay marker when its upstream rewound. Both now read each contract composed
+  where the values they need come from a fragment (and parsed as written otherwise, so a large
+  tree costs what parsing it does), skipping one that cannot be read.
 
 - **The bundle's YAML turned a next-line character into a space.** Text holding U+0085 was kept
   exactly by the loader and the JSON bundle, but `fluid bundle` and the tgz's

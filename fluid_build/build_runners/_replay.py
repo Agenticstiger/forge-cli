@@ -120,8 +120,9 @@ def find_downstream_products(
     Returns one dict per match: ``{"product_id": str, "contract_path":
     Path, "consumes_index": int}`` so callers can attribute markers
     to specific consumes rows. Each contract is read as every command
-    reads it (:func:`fluid_build.loader.load_contract`), so a product
-    whose ``consumes[]`` lives in a ``$ref`` fragment is found too.
+    reads it, composed where its ``id`` or ``consumes[]`` comes from a
+    ``$ref`` (:func:`fluid_build.loader.load_contract_fields`), so a product
+    whose ``consumes[]`` lives in a fragment is found too.
     Errors during a single contract read (a file that does not parse,
     a ref that does not resolve) do NOT abort the walk — broken
     contracts get logged + skipped.
