@@ -1280,7 +1280,11 @@ def _compose(
                 f"Overlay root must be an object/dict: {overlay_source or overlay_dir} "
                 f"composes to a {type(layer).__name__}"
             )
-        lengths = {name: len(composed.get(name) or ()) for name in _OVERLAY_IDENTITY_KEYS}
+        # A section that is not a list (``builds: 5``) is the schema's to report.
+        lengths = {
+            name: len(section) if isinstance(section := composed.get(name), list) else 0
+            for name in _OVERLAY_IDENTITY_KEYS
+        }
         # The trace names a refused pointer where it was written (the overlay,
         # or a fragment of it) and keeps the pointers a pointer replaced.
         composed = _deep_merge(composed, layer, _trace=trace)

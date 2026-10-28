@@ -1974,3 +1974,16 @@ def test_an_overlay_over_a_base_pointer_is_refused_not_misapplied(
     assert compose_contract(tmp_path / "contract.fluid.yaml").document["exposes"]
     with pytest.raises(RefResolutionError, match="resolved only after the overlay is merged"):
         compose_contract(tmp_path / "contract.fluid.yaml", "prod")
+
+
+def test_a_section_that_is_not_a_list_reaches_the_schema_with_an_overlay(tmp_path: Path) -> None:
+    """``builds: 5`` with --env is a schema error to report, not a crash of the merge."""
+    from fluid_build.loader import compose_contract
+
+    (tmp_path / "contract.fluid.yaml").write_text(
+        'fluidVersion: "0.7.6"\nkind: DataProduct\nid: d.p\nbuilds: 5\n', encoding="utf-8"
+    )
+    (tmp_path / "overlays").mkdir()
+    (tmp_path / "overlays" / "prod.yaml").write_text("name: P\n", encoding="utf-8")
+
+    assert compose_contract(tmp_path / "contract.fluid.yaml", "prod").document["builds"] == 5
