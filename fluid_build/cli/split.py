@@ -151,9 +151,12 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         return 0
 
     if dry_run:
-        sys.stderr.write(f"Would create {len(sites)} fragments:\n")
-        for site in sites:
-            sys.stderr.write(f"   {site.target}\n")
+        from fluid_build.cli.forge_contract_fragments import describe_fragment_layout
+
+        targets = describe_fragment_layout(contract, parts, taken)
+        sys.stderr.write(f"Would create {len(targets)} fragments:\n")
+        for target in targets:
+            sys.stderr.write(f"   {target}\n")
         return 0
 
     root_text, fragments, lost_comments = _split(contract_path, contract, sites, parts, taken)

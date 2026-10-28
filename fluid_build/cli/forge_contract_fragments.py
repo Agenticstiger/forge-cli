@@ -333,6 +333,15 @@ def _walk(document: Any, path: Iterable[Union[str, int]]) -> Any:
     return document
 
 
+def describe_fragment_layout(
+    contract: Dict[str, Any], parts: Iterable[str] = DEFAULT_PARTS, taken: Collection[str] = ()
+) -> List[str]:
+    """The fragment files a split would create, in order (``fluid split --dry-run``)."""
+    if not isinstance(contract, dict):
+        return []
+    return [site.target for site in fragment_sites(contract, parts, taken)]
+
+
 def is_complex_enough_for_fragments(contract: Dict[str, Any]) -> bool:
     """Return ``True`` if the contract would benefit from fragment splitting.
 
