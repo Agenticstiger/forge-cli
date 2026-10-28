@@ -177,8 +177,14 @@ def _serialize(contract: Dict[str, Any], fmt: str) -> str:
         raise RuntimeError(
             "YAML output requires PyYAML. Install with: pip install pyyaml\nOr use --format json"
         )
+    # Lazy, as the tgz branch's import is: the module is not needed to print --help.
+    from fluid_build.forge.core.bundle import ExactDumper
+
+    # ``ExactDumper`` writes a text holding NEL, LS or PS double-quoted with escapes, so the
+    # file reads back as the document that was written; any other value is written as before.
     return yaml.dump(
         contract,
+        Dumper=ExactDumper,
         default_flow_style=False,
         allow_unicode=True,
         sort_keys=False,

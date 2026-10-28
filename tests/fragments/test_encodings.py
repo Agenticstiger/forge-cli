@@ -616,12 +616,6 @@ def test_n17_control_characters_in_text_are_kept_and_survive_every_form_sg35(
     assert code == 0, output
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG N17-NEL: fluid bundle writes U+0085 into YAML as a bare NEL, which every YAML "
-    "reader folds into a space; the tgz's resolved.yaml and resolved.json then disagree and "
-    "plan of the tgz plans other SQL than plan of the contract",
-)
 def test_n17_a_next_line_character_in_text_survives_every_form(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
