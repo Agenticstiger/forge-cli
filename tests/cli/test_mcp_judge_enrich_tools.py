@@ -455,5 +455,5 @@ def test_a_fragment_outside_the_readable_paths_is_refused(tmp_path: Path, monkey
     wide = McpPolicy(readable_paths=(tmp_path.resolve(),), writable_paths=(tmp_path.resolve(),))
     monkeypatch.setattr(mcp_mod, "_policy", lambda: wide)
     assert _resolve_contract_argument({"contract_path": str(contract)})["description"] == {
-        "api_key": "SECRET-1"
+        "api_key": "SECRET-1"  # pragma: allowlist secret
     }
