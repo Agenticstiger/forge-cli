@@ -150,27 +150,13 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         )
         return 0
 
-    # The split is checked against what the original composes to; one that does
-    # not compose here (a ref that needs FLUID_REF_ROOT, say) cannot be checked,
-    # so it is not split at all, dry run included.
-    from fluid_build.loader import compose_contract
-
-    try:
-        before = compose_contract(contract_path).document
-    except Exception as exc:  # noqa: BLE001 - reported; nothing is written
-        sys.stderr.write(
-            f"❌ Split not written: the contract does not compose here, so its split could "
-            f"not be checked: {exc}\n"
-        )
+    before, problem = _composed(contract_path)
+    if problem:
+        sys.stderr.write(f"❌ Split not written: {problem}\n")
         return 1
 
     if dry_run:
-        from fluid_build.cli.forge_contract_fragments import describe_fragment_layout
-
-        targets = describe_fragment_layout(contract, parts, taken)
-        sys.stderr.write(f"Would create {len(targets)} fragments:\n")
-        for target in targets:
-            sys.stderr.write(f"   {target}\n")
+        _print_dry_run(contract, parts, taken)
         return 0
 
     root_text, fragments, lost_comments = _split(contract_path, contract, sites, parts, taken)
@@ -194,6 +180,27 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         extra={"fragments": len(fragments), "out_dir": str(out_dir)},
     )
     return 0
+
+
+def _composed(contract_path: Path) -> Tuple[Dict[str, Any], Optional[str]]:
+    """``(document, None)``: what the contract composes to here, the document its
+    split is checked against; or ``({}, why)`` when it does not compose here (a
+    ref that needs FLUID_REF_ROOT, say), so it cannot be split, dry run included."""
+    from fluid_build.loader import compose_contract
+
+    try:
+        return compose_contract(contract_path).document, None
+    except Exception as exc:  # noqa: BLE001 - reported; nothing is written
+        return {}, f"the contract does not compose here, so its split could not be checked: {exc}"
+
+
+def _print_dry_run(contract: Dict[str, Any], parts: Sequence[str], taken: Collection[str]) -> None:
+    from fluid_build.cli.forge_contract_fragments import describe_fragment_layout
+
+    targets = describe_fragment_layout(contract, parts, taken)
+    sys.stderr.write(f"Would create {len(targets)} fragments:\n")
+    for target in targets:
+        sys.stderr.write(f"   {target}\n")
 
 
 def _split(
