@@ -29,6 +29,7 @@ the keys written beside ``$ref`` over it:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -1118,6 +1119,33 @@ def test_external_refs_are_listed_once_in_a_document_that_contains_itself() -> N
     loop: Dict[str, Any] = {"part": {"$ref": "./part.yaml"}}
     loop["self"] = loop
     assert list(iter_external_refs({"x": loop})) == [("/x/part", "./part.yaml")]
+
+
+def test_a_file_reached_by_two_names_is_parsed_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The parse cache is keyed by the file, not the name: hard links (and letter case on a
+    case-insensitive volume) cannot make one 5 MiB fragment parse once per ref."""
+    _write(tmp_path / "part.yaml", "a: 1\n")
+    os.link(tmp_path / "part.yaml", tmp_path / "link.yaml")
+    parsed = []
+    real = contract_refs._parse
+    monkeypatch.setattr(
+        contract_refs, "_parse", lambda target, *a: parsed.append(target) or real(target, *a)
+    )
+
+    path = _contract(tmp_path, {"x": {"$ref": "./part.yaml"}, "y": {"$ref": "./link.yaml"}})
+    assert load_contract(path)["y"] == {"a": 1}
+    assert len(parsed) == 1
+
+
+def test_a_denied_directory_is_denied_in_any_letter_case() -> None:
+    """On a case-insensitive volume ``/USR`` is ``/usr`` and keeps its letters through
+    resolve(): the deny check compares the directories themselves, not their spelling."""
+    usr = Path("/usr")
+    if not usr.is_dir() or not Path("/USR").exists():
+        pytest.skip("needs /usr on a case-insensitive volume")
+    assert contract_refs._is_system_path(Path("/USR/bin").resolve())
 
 
 def test_the_cap_counts_keys_and_alias_copies(

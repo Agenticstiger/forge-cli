@@ -62,6 +62,7 @@ dependency for it, so the resolver is this module.
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import logging
 import os
@@ -389,7 +390,7 @@ class RefBudget:
         #: Each target read so far, by resolved path: its text, or its parsed
         #: value before any pointer is applied. Every later ref to it gets its
         #: own copy, charged as if it had been read again.
-        self.targets: Dict[Path, Any] = {}
+        self.targets: Dict[Any, Any] = {}
 
     def resolve(self, ref: str, where: str) -> None:
         """Count one more ref resolved, refused past :data:`MAX_REF_RESOLUTIONS`."""
@@ -646,7 +647,7 @@ class _FileRefs:
             )
         self.ancestry.add(key)
         try:
-            read_before = target in self.budget.targets
+            read_before = _file_key(target) in self.budget.targets
             value, is_text = _read_target(target, ref, pointer, where, self.budget.targets)
             origins = self.origins
             self.trace.add_file(target)
@@ -730,11 +731,50 @@ def _is_system_path(target: Path) -> bool:
     text = target.as_posix()
     if any(text == tree or text.startswith(tree + "/") for tree in _KERNEL_TREES):
         return True
-    return any(is_within(target, forbidden) for forbidden in FORBIDDEN_PATHS)
+    if any(is_within(target, forbidden) for forbidden in FORBIDDEN_PATHS):
+        return True
+    # By file identity too: on a case-insensitive volume (macOS, Windows) ``/USR``
+    # names ``/usr`` and keeps its letters through resolve().
+    denied = _denied_directories()
+    for directory in (target, *target.parents):
+        try:
+            info = os.stat(directory)
+        except OSError:
+            continue
+        if (info.st_dev, info.st_ino) in denied:
+            return True
+    return False
+
+
+@functools.lru_cache(maxsize=1)
+def _denied_directories() -> FrozenSet[Tuple[int, int]]:
+    """``(st_dev, st_ino)`` of every denied directory that exists here."""
+    from fluid_build._path_policy import FORBIDDEN_PATHS
+
+    found = set()
+    for directory in (*FORBIDDEN_PATHS, *_KERNEL_TREES):
+        try:
+            info = os.stat(directory)
+        except OSError:
+            continue
+        found.add((info.st_dev, info.st_ino))
+    return frozenset(found)
+
+
+def _file_key(target: Path) -> Any:
+    """The file ``target`` names, whatever name reached it, for the parse cache: a hard
+    link, or another letter case on a case-insensitive volume, is the same file and is
+    read and parsed once. Read as text or parsed is part of it."""
+    is_text = target.suffix.lower() in TEXT_REF_SUFFIXES
+    try:
+        info = os.stat(target)
+    except OSError:
+        return (os.fspath(target), is_text)
+    return (info.st_dev, info.st_ino, is_text)
 
 
 def _read_target(
-    target: Path, ref: str, pointer: Optional[str], where: str, read: Dict[Path, Any]
+    target: Path, ref: str, pointer: Optional[str], where: str, read: Dict[Any, Any]
 ) -> Tuple[Any, bool]:
     """``(value, is_text)``: what a file ref names, its pointer applied.
 
@@ -752,9 +792,10 @@ def _read_target(
             f"a JSON or YAML document. Drop '#{pointer}', or keep the text in a YAML file "
             f"under a key and point at that key."
         )
-    if target not in read:
-        read[target] = _read_text(target, ref, where) if is_text else _parse(target, ref, where)
-    value = read[target]
+    key = _file_key(target)
+    if key not in read:
+        read[key] = _read_text(target, ref, where) if is_text else _parse(target, ref, where)
+    value = read[key]
     if is_text:
         return value, True
     if pointer:

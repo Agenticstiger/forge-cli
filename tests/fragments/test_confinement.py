@@ -731,9 +731,14 @@ _SYSTEM_TARGETS = [
         id="System",
         marks=pytest.mark.skipif(not IS_DARWIN, reason="macOS layout"),
     ),
-    # SG-12: on macOS /var is /private/var, which the deny set does not name, so
-    # /var/lib (absent there) is "not found" rather than blocked.
-    pytest.param("var/lib/x.yaml", "not found" if IS_DARWIN else "blocked", id="var-lib"),
+    # SG-12: on macOS /var is /private/var, which the deny set does not name by
+    # spelling; the check also compares the directories themselves, so where
+    # /var/lib exists it is blocked, and where it does not the file is "not found".
+    pytest.param(
+        "var/lib/x.yaml",
+        "blocked" if not IS_DARWIN or Path("/var/lib").exists() else "not found",
+        id="var-lib",
+    ),
 ]
 
 

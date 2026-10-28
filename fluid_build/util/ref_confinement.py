@@ -144,8 +144,10 @@ def is_within(path: Path, directory: Union[Path, str]) -> bool:
     path flavour compares them (case-insensitively on Windows only).
     """
     text = os.path.normcase(os.fspath(path))
-    # Without its trailing separator, so that "/" and "C:\\" are prefixes too.
-    prefix = os.path.normcase(os.fspath(directory)).rstrip("\\/")
+    # Without its trailing separator, so that "/" and "C:\\" are prefixes too. Only
+    # this platform's separators: on POSIX a backslash is part of a name.
+    separators = os.sep + (os.altsep or "")
+    prefix = os.path.normcase(os.fspath(directory)).rstrip(separators)
     return text == prefix or text.startswith(prefix + os.sep)
 
 
