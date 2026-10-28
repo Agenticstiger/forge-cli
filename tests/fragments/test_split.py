@@ -1233,18 +1233,36 @@ def test_i10_every_block_scalar_chomping_survives_a_split(
     ],
     ids=["build-then-build", "last-item-then-key", "section-then-key"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-04: a keep-chomped block scalar (|+, >+) that ends a moved part loses its "
-    "trailing blank lines; split refuses ('does not compose to the original') instead of "
-    "moving them with it or splitting the data",
-)
 def test_i10_a_keep_chomped_scalar_ending_a_moved_part_splits(
     tmp_path: Path, indicator: str, tail: str
 ) -> None:
     pair = solo(tmp_path, "id: x\n" + tail.replace("{i}", indicator))
 
     split_and_check(pair, "builds,sovereignty")
+
+
+@pytest.mark.parametrize("line_end", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("parts", ["builds", "sql", "builds,sql"])
+def test_i10_the_blank_lines_of_a_keep_chomped_scalar_move_with_it(
+    tmp_path: Path, line_end: str, parts: str
+) -> None:
+    """Finding SP-04: the blank lines after ``|+`` text are its value; they go to
+    the fragment, and the root keeps one line end after the ref."""
+    text = (
+        "id: x\nbuilds:\n  - id: a\n    properties:\n      sql: |+\n        SELECT 1\n\n\n"
+        "exposes: []\n"
+    ).replace("\n", line_end)
+    pair = solo(tmp_path, text)
+
+    after = split_and_check(pair, parts)
+
+    assert compose_contract(pair.split_contract).document["builds"][0]["properties"] == {
+        "sql": "SELECT 1\n\n\n"
+    }
+    assert text_of(after, NAME).endswith(f"{line_end}exposes: []{line_end}")
+    assert f"{line_end}{line_end}exposes" not in text_of(after, NAME)
+    if line_end == "\r\n":
+        assert_one_line_end(after)
 
 
 # ── I-16..I-20: quality, schema, extensions, description, part names ────

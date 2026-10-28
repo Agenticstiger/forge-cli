@@ -25,7 +25,8 @@ PyYAML's compose marks give each part's span; PyYAML is a base dependency,
 so no round-trip library is needed. A block node's end mark runs past its
 trailing comments and the next entry's indentation, so a span ends at the
 last character of the node's own content instead, plus a comment that ends
-its last line.
+its last line. The blank lines after a keep-chomped block scalar (``|+``)
+are its content, so they move with it.
 """
 
 from __future__ import annotations
@@ -152,6 +153,11 @@ def _content_end(text: str, node: Any) -> int:
     if isinstance(node, yaml.ScalarNode):
         end = node.end_mark.index
         if node.style in ("|", ">"):
+            if node.value.endswith("\n\n"):
+                # Keep chomping (|+, >+): the blank lines after the text are
+                # in its value and in its span; the line break that ends the
+                # last of them ends the line of whatever replaces the scalar.
+                return _before_line_break(text, end)
             # A block scalar's end mark runs over the blank lines after it.
             start = node.start_mark.index
             end = start + len(text[start:end].rstrip())
@@ -165,6 +171,15 @@ def _content_end(text: str, node: Any) -> int:
     if not children:
         return node.end_mark.index
     return max(_content_end(text, child) for child in children)
+
+
+def _before_line_break(text: str, end: int) -> int:
+    """``end``, moved back over the line break just before it (``\\n`` or ``\\r\\n``)."""
+    if text.endswith("\r\n", 0, end):
+        return end - 2
+    if text.endswith("\n", 0, end):
+        return end - 1
+    return end
 
 
 def _with_trailing_comment(text: str, end: int) -> int:
