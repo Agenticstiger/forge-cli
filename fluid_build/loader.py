@@ -1329,11 +1329,17 @@ def _note_overlay_origins(
         items, landed = layer.get(name), merged.get(name)
         if not isinstance(items, list) or not isinstance(landed, list):
             continue
-        ids = [_item_identity(item, keys) for item in landed]
+        # The first merged entry with each id, indexed once: a lookup per overlay
+        # entry, not a scan of the merged list (quadratic for large lists).
+        first: Dict[Tuple[str, ...], int] = {}
+        for j, landed_item in enumerate(landed):
+            landed_id = _item_identity(landed_item, keys)
+            if landed_id is not None:
+                first.setdefault(landed_id, j)
         moved[name] = {}
         for i, item in enumerate(items):
             ident = _item_identity(item, keys)
-            moved[name][i] = ids.index(ident) if ident is not None and ident in ids else i
+            moved[name][i] = first.get(ident, i) if ident is not None else i
 
     def move(at: Tuple[Union[str, int], ...]) -> Tuple[Union[str, int], ...]:
         if len(at) > 1 and at[0] in moved and isinstance(at[1], int):
