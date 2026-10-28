@@ -164,7 +164,10 @@ def _with_httpfs(allow: DuckDBAllowlist) -> Any:
     try:
         return secure_duckdb_connect(":memory:", allow=allow, extensions=["httpfs"])
     except duckdb.Error:
-        pytest.skip("httpfs is not installable here (offline)")
+        # ``raise pytest.skip.Exception`` rather than ``pytest.skip(...)``, which
+        # raises the same class: a helper that otherwise returns a value and then
+        # falls off the end reads to CodeQL as an implicit ``return None``.
+        raise pytest.skip.Exception("httpfs is not installable here (offline)") from None
 
 
 def _ca_directories() -> List[str]:
@@ -201,7 +204,8 @@ def _host_bundle() -> str:
     for candidate in sandbox._CA_BUNDLE_CANDIDATES:
         if os.path.isfile(candidate):
             return candidate
-    pytest.skip("no CA bundle among DuckDB's candidates on this host")
+    # Raised, not ``pytest.skip(...)``, for the reason given in _with_httpfs.
+    raise pytest.skip.Exception("no CA bundle among DuckDB's candidates on this host")
 
 
 # ── the defect ───────────────────────────────────────────────────────────
