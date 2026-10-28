@@ -167,7 +167,9 @@ def is_pointer_node(obj: Any) -> bool:
     return is_ref_node(obj) and isinstance(obj["$ref"], str) and obj["$ref"].startswith("#")
 
 
-def pointer_merge_error(node: Dict[str, Any], written: str, into: str) -> RefResolutionError:
+def pointer_merge_error(
+    node: Dict[str, Any], written: str, into: str, *, entries: bool = False
+) -> RefResolutionError:
     """The refusal of a ``#/`` pointer that a merge would merge into an object.
 
     A pointer names a place in the composed contract, which exists only once
@@ -175,13 +177,14 @@ def pointer_merge_error(node: Dict[str, Any], written: str, into: str) -> RefRes
     merging it into an object would put its ``$ref`` beside that object's
     keys, which would then beat the values it names. ``written`` says where
     the pointer was written (its file and JSON pointer), ``into`` which object
-    it would be merged into.
+    (or, with ``entries``, which list of objects) it would be merged into.
     """
+    kind, what = ("a list of objects", "the entries") if entries else ("an object", "the keys")
     return RefResolutionError(
         f"$ref '{node.get('$ref')}' {written} would be merged into {into}, but a '#/' "
         f"pointer names a place in the composed contract and is resolved only after every "
-        f"file is read and the overlay merged, so it cannot be merged into an object. Write "
-        f"the keys there instead, or name a file ('./part.yaml#/...'), which is read before "
+        f"file is read and the overlay merged, so it cannot be merged into {kind}. Write "
+        f"{what} there instead, or name a file ('./part.yaml#/...'), which is read before "
         f"the merge."
     )
 
@@ -367,15 +370,17 @@ class ComposeTrace:
             return None
         return entry[1], entry[2]
 
-    def note_replaced(self, node: Any, ref: str) -> None:
+    def note_replaced(self, node: Any, ref: str, *, overlay: bool = False) -> None:
         """The pointer ``node`` was merged over the bare pointer ``ref`` and replaced
-        it: the pointer pass refuses it if ``ref`` names an object (:func:`replaces_pointer`)."""
-        self._replaced[id(node)] = (node, ref)
+        it: the pointer pass refuses it if ``ref`` names an object, or, for an
+        ``overlay`` (which merges lists of objects entry by entry, where keys beside a
+        ``$ref`` replace them), a list of objects (:func:`replaces_pointer`)."""
+        self._replaced[id(node)] = (node, ref, overlay)
 
-    def replaced(self, node: Any) -> Optional[str]:
-        """The ``$ref`` of the pointer ``node`` replaced in a merge, if it did."""
+    def replaced(self, node: Any) -> Optional[Tuple[str, bool]]:
+        """``($ref, by an overlay)`` of the pointer ``node`` replaced in a merge, if it did."""
         entry = self._replaced.get(id(node))
-        return entry[1] if entry is not None and entry[0] is node else None
+        return (entry[1], entry[2]) if entry is not None and entry[0] is node else None
 
 
 class RefBudget:
@@ -976,11 +981,21 @@ class _PointerRefs:
                 f"or '#/' followed by the path, such as '#/builds/0/properties'"
             )
         replaced = self.trace.replaced(node) if self.trace is not None else None
-        if replaced is not None and self.names_an_object(replaced):
-            # A merge put this pointer over a bare one, which names an object.
-            raise pointer_merge_error(
-                node, where, f"the object that '{replaced}' names at '{format_pointer(here)}'"
-            )
+        if replaced is not None:
+            below, by_overlay = replaced
+            # A merge put this pointer over a bare one, which names an object (or,
+            # for an overlay, a list of objects it would merge entry by entry).
+            if self.names_an_object(below):
+                raise pointer_merge_error(
+                    node, where, f"the object that '{below}' names at '{format_pointer(here)}'"
+                )
+            if by_overlay and self.names_an_object(below, lists=True):
+                raise pointer_merge_error(
+                    node,
+                    where,
+                    f"the list of objects that '{below}' names at '{format_pointer(here)}'",
+                    entries=True,
+                )
         target = pointer_tokens(pointer)
         if target in active:
             raise RefResolutionError(
@@ -1033,8 +1048,9 @@ class _PointerRefs:
             return ref_location(format_pointer(site[1]), site[0])
         return f"at JSON pointer '{format_pointer(here)}' of the composed contract"
 
-    def names_an_object(self, ref: str) -> bool:
-        """Whether the pointer ``ref`` names an object in the composed contract.
+    def names_an_object(self, ref: str, *, lists: bool = False) -> bool:
+        """Whether the pointer ``ref`` names an object in the composed contract (with
+        ``lists``, a non-empty list of objects instead).
 
         The pointers met on the way are followed, never expanded, so nothing is
         charged or recorded; a place that is not there, or a chain of pointers
@@ -1054,6 +1070,12 @@ class _PointerRefs:
                 node = self.document
                 continue
             if not tokens:
+                if lists:
+                    return (
+                        isinstance(node, list)
+                        and bool(node)
+                        and all(isinstance(item, dict) for item in node)
+                    )
                 return isinstance(node, dict)
             token = tokens.pop(0)
             if isinstance(node, dict) and token in node:

@@ -2061,3 +2061,29 @@ def test_an_overlay_pointer_over_a_base_list_of_objects_is_refused(tmp_path: Pat
     with pytest.raises(RefResolutionError) as err:
         compose_contract(tmp_path / "contract.fluid.yaml", "prod")
     assert "the list of objects" in str(err.value) and "prod.yaml" in str(err.value)
+
+
+def test_an_overlay_pointer_over_a_base_pointer_to_a_list_of_objects_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Both written as #/ pointers, the overlay's list would replace the base's whole where,
+    inline, it merges by id: refused, as the inline twin is."""
+    from fluid_build.loader import compose_contract
+    from fluid_build.util.ref_confinement import RefResolutionError
+
+    (tmp_path / "contract.fluid.yaml").write_text(
+        'fluidVersion: "0.7.6"\nkind: DataProduct\nid: d.p\n'
+        "extensions: {allBuilds: [{id: a, engine: sql}, {id: b, engine: sql}]}\n"
+        'builds: {$ref: "#/extensions/allBuilds"}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "overlays").mkdir()
+    (tmp_path / "overlays" / "prod.yaml").write_text(
+        'extensions: {prodBuilds: [{id: b, engine: dbt}]}\nbuilds: {$ref: "#/extensions/prodBuilds"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RefResolutionError, match="list of objects"):
+        compose_contract(tmp_path / "contract.fluid.yaml", "prod")
+    # Keys beside a file $ref are a merge patch, where a list replaces: unchanged.
+    assert len(compose_contract(tmp_path / "contract.fluid.yaml").document["builds"]) == 2

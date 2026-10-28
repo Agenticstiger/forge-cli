@@ -317,7 +317,7 @@ def _merge_object(
     """
     if replaces_pointer(overlay, base):
         if trace is not None:
-            trace.note_replaced(overlay, base["$ref"])
+            trace.note_replaced(overlay, base["$ref"], overlay=True)
         return overlay
     if is_pointer_node(overlay):
         raise _pointer_merged(overlay, at, trace)
