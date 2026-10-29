@@ -185,6 +185,24 @@ class TestNoProviderServesIt:
             assert where in said
 
 
+class TestUnderAPluginPolicy:
+    """An allow or block list removes providers; it does not turn a platform no
+    provider is named after into one."""
+
+    @pytest.mark.parametrize(
+        "variable, value",
+        [("FLUID_PLUGINS_ALLOWLIST", "local"), ("FLUID_PLUGINS_BLOCKLIST", "databricks")],
+    )
+    def test_a_platform_no_provider_serves_is_still_refused(
+        self, monkeypatch: pytest.MonkeyPatch, variable: str, value: str
+    ) -> None:
+        # Asking is_allowed() of the platform made any policy switch the check
+        # off: [databricks, local] then landed the table as a placeholder CSV.
+        monkeypatch.setenv(variable, value)
+        contract = _contract([_expose("t", "databricks"), _expose("orders", "local")])
+        assert "exposes[0].binding.platform: databricks" in _refusal(contract).context["error"]
+
+
 class TestTheChoiceIsUnchanged:
     """Among platforms a provider serves, the provider is the one it always was."""
 
@@ -228,6 +246,7 @@ class TestTheChoiceIsUnchanged:
         registry.discover_providers(LOG)
         monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "gcp")
         monkeypatch.delitem(registry.PROVIDERS, "gcp", raising=False)
+        monkeypatch.setattr(registry, "POLICY_BLOCKED", {"gcp"})
         name = _simple_apply_provider(_contract([_expose("t", "gcp")]), LOG)
         assert name == "gcp"
         with pytest.raises(CLIError) as exc:

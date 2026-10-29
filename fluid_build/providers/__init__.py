@@ -52,13 +52,18 @@ import threading
 import warnings
 from dataclasses import dataclass
 from inspect import isclass
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Set, Tuple, Type
 
 # Public, process-wide registry (name -> provider class or factory)
 PROVIDERS: Dict[str, Any] = {}
 
 # Collect discovery errors for diagnostics/UIs
 DISCOVERY_ERRORS: List[Dict[str, str]] = []
+
+# Providers the operator's allow/block policy kept out of ``PROVIDERS``: they
+# exist, so a contract naming one is told the policy removed it, not that no
+# provider by that name exists (``fluid apply``'s platform check reads this).
+POLICY_BLOCKED: Set[str] = set()
 
 # Internal guard/flags
 _LOCK = threading.RLock()
@@ -337,6 +342,7 @@ def register_provider(
             reason="allow_block_policy",
             source=source,
         )
+        POLICY_BLOCKED.add(cname)
         return
 
     # Plugin↔CLI compatibility gate (read-only, outside the lock). Advisory by
@@ -413,6 +419,7 @@ def clear_providers() -> None:
     with _LOCK:
         PROVIDERS.clear()
         DISCOVERY_ERRORS.clear()
+        POLICY_BLOCKED.clear()
         _DISCOVERY_DONE = False
         _DISCOVERY_ATTEMPTS = 0
 
@@ -456,6 +463,9 @@ def discover_providers(logger: Optional[logging.Logger] = None, *, force: bool =
                 count=len(PROVIDERS),
             )
             return
+
+        # What the policy removes is recorded afresh: it may have changed since.
+        POLICY_BLOCKED.clear()
 
         # 0) entry-point plugins (third-party packages)
         _discover_entrypoints(logger)
@@ -524,6 +534,7 @@ def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
                 name=ep.name,
                 reason="allow_block_policy",
             )
+            POLICY_BLOCKED.add(_normalize_name(ep.name))
             continue
         try:
             provider_cls = ep.load()

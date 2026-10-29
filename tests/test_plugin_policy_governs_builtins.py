@@ -46,10 +46,13 @@ LOG = logging.getLogger("test_plugin_policy_governs_builtins")
 def _restore_registries():
     """Both registries are process-global; snapshot and restore them."""
     providers_before = dict(registry.PROVIDERS)
+    blocked_before = set(registry.POLICY_BLOCKED)
     iac_before = dict(iac_registry.IAC_PLUGINS)
     yield
     registry.PROVIDERS.clear()
     registry.PROVIDERS.update(providers_before)
+    registry.POLICY_BLOCKED.clear()
+    registry.POLICY_BLOCKED.update(blocked_before)
     iac_registry.IAC_PLUGINS.clear()
     iac_registry.IAC_PLUGINS.update(iac_before)
 
@@ -81,6 +84,18 @@ class TestBlocklistGovernsBuiltInProviders:
         registry.PROVIDERS.pop("snowflake", None)
         registry.register_provider("snowflake", object, logger=LOG)
         assert "snowflake" not in registry.PROVIDERS
+
+    def test_a_blocked_builtin_is_recorded_as_blocked_until_the_policy_changes(self, monkeypatch):
+        """``fluid apply`` tells a provider the policy removed from a platform no
+        provider is named after by this record, not by asking the policy about an
+        arbitrary platform string."""
+        monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "snowflake")
+        _rediscover()
+        assert "snowflake" in registry.POLICY_BLOCKED
+        assert "databricks" not in registry.POLICY_BLOCKED
+        monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST")
+        _rediscover()
+        assert "snowflake" not in registry.POLICY_BLOCKED
 
     def test_allowlist_excludes_unlisted_builtins(self, monkeypatch):
         """An allowlist means "only these load" — the built-ins were silently

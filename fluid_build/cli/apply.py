@@ -1173,14 +1173,14 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
     applied by no provider here (the local planner lands nothing for them), so
     their platforms choose none. Every other platform must name a registered
     provider, or one the plugin policy removed (``build_provider`` reports
-    that): a binding no provider serves is never handed to another one, which
-    would write it as a local placeholder file and report success, so the run
-    stops with ``apply_platform_unsupported``. Among the platforms left the
+    that; a platform no provider is named after is refused under any policy):
+    a binding no provider serves is never handed to another one, which would
+    write it as a local placeholder file and report success, so the run stops
+    with ``apply_platform_unsupported``. Among the platforms left the
     choice is as before: the last expose's, then, when that is ``local`` or
     there is none, the first build's; ``local`` when none is declared.
     """
     from fluid_build import providers as registry
-    from fluid_build.plugin_manager import is_allowed
     from fluid_build.util.contract import (
         get_expose_id,
         is_externally_run_build,
@@ -1211,7 +1211,7 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
     unsupported = [
         f"{where}: {name}"
         for where, name in lands + runs
-        if name not in registry.PROVIDERS and is_allowed(name)
+        if name not in registry.PROVIDERS and name not in registry.POLICY_BLOCKED
     ]
     if unsupported:
         raise CLIError(
