@@ -30,6 +30,7 @@ import tarfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 from fluid_build.forge.core.bundle import (
     MANIFEST_VERSION,
@@ -514,6 +515,72 @@ class TestCliBundleDefaultFilename:
         rc = run(args, logger)
         assert rc == 0
         assert (tmp_path / "My-Product-v2.fluid.bundle.tgz").exists()
+
+    def _fragment_layout(self, tmp_path: Path) -> Path:
+        """A contract with ``fragments/`` beside it, as ``fluid split`` leaves one."""
+        expose = tmp_path / "fragments" / "exposes" / "orders.yaml"
+        expose.parent.mkdir(parents=True)
+        expose.write_text("exposeId: orders\nkind: table\n")
+        return self._write_contract(
+            tmp_path,
+            "fluidVersion: '0.7.2'\nkind: DataProduct\nid: customer-360\n"
+            "exposes:\n  - $ref: ./fragments/exposes/orders.yaml\n",
+        )
+
+    def test_a_fragment_layout_gets_the_same_tgz_default(self, tmp_path):
+        """Not ``contract.bundled.fluid.yaml``: a tarball under a ``.yaml`` name was read as
+        YAML by the next stage (``'utf-8' codec can't decode byte 0x8b``)."""
+        import argparse
+        import logging
+
+        from fluid_build.cli.bundle import run
+
+        contract_path = self._fragment_layout(tmp_path)
+        args = argparse.Namespace(contract=str(contract_path), out="-", env=None, format="tgz")
+
+        assert run(args, logging.getLogger("test")) == 0
+        assert (tmp_path / "customer-360.fluid.bundle.tgz").exists()
+        assert not (tmp_path / "contract.bundled.fluid.yaml").exists()
+
+    @pytest.mark.parametrize("fmt", ["yaml", "json"])
+    def test_a_fragment_layout_prints_the_bundle_to_stdout(self, tmp_path, capsys, fmt):
+        """``fluid bundle contract.fluid.yaml | ...`` gets the composed contract, as the
+        help says, whether or not fragments/ sits beside it."""
+        import argparse
+        import logging
+
+        from fluid_build.cli.bundle import run
+
+        contract_path = self._fragment_layout(tmp_path)
+        args = argparse.Namespace(contract=str(contract_path), out="-", env=None, format=fmt)
+
+        assert run(args, logging.getLogger("test")) == 0
+        out = capsys.readouterr().out
+        document = json.loads(out) if fmt == "json" else yaml.safe_load(out)
+        assert document["id"] == "customer-360"
+        assert document["exposes"][0]["exposeId"] == "orders"
+        assert not (tmp_path / "contract.bundled.fluid.yaml").exists()
+
+    def test_the_default_tgz_path_gets_the_write_check_an_explicit_out_gets(self, tmp_path):
+        """A symlink planted at ``<id>.fluid.bundle.tgz`` cannot point the write at a
+        forbidden path: the default goes through the same check as ``--out``."""
+        import argparse
+        import logging
+
+        from fluid_build.cli.bundle import run
+        from fluid_build.cli.core import FluidCLIError
+
+        contract_path = self._write_contract(
+            tmp_path, "fluidVersion: '0.7.2'\nkind: DataProduct\nid: customer-360\n"
+        )
+        (tmp_path / "customer-360.fluid.bundle.tgz").symlink_to("/etc/fluid-bundle-probe.tgz")
+        args = argparse.Namespace(contract=str(contract_path), out="-", env=None, format="tgz")
+
+        with pytest.raises(FluidCLIError) as caught:
+            run(args, logging.getLogger("test"))
+
+        assert "forbidden" in caught.value.event
+        assert not Path("/etc/fluid-bundle-probe.tgz").exists()
 
     def test_explicit_out_overrides_default(self, tmp_path):
         contract_path = self._write_contract(
