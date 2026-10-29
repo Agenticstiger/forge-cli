@@ -512,6 +512,25 @@ def test_c12_the_deprecation_spells_the_control_characters_of_the_ref_and_its_pl
     assert warning.ref == f"./t.json#{_FORGED}", "the structured field keeps the value"  # type: ignore[attr-defined]
 
 
+def test_c12_the_deprecation_names_the_whole_path_of_the_file_holding_the_ref(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A path is bounded by the file system, and its end is the file's name: quoted as an
+    excerpt, its first 200 characters, the path of a contract deep enough lost the name of
+    the file to fix."""
+    root = tmp_path / ("d" * 200)
+    _write(root / "t.yaml", "a: 1\n")
+    path = _write(root / "contract.fluid.yaml", 'x: {$ref: "./t.yaml#a"}\n')
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert load_contract(path) == {"x": 1}
+
+    (warning,) = [r for r in caplog.records if getattr(r, "event", None) == _NO_SLASH]
+    assert f"$ref './t.yaml#a' at JSON pointer '/x' in {path.resolve()} has a JSON pointer" in (
+        warning.getMessage()
+    )
+
+
 def test_c12_a_ref_forges_no_line_in_the_cli_log_file(tmp_path: Path) -> None:
     """End to end: ``fluid --log-file`` writes each record as ``{"time": ..., "message":
     "%(message)s"}`` and escapes nothing, so a ref's raw line feed wrote a line of its own

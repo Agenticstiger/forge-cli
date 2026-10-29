@@ -26,6 +26,9 @@ every character that is not printable as ``repr`` writes it (``\\n``,
 :func:`fluid_build.forge.core.bundle.bundle_overlay_warnings` does, and keeps
 the first :data:`EXCERPT_CHARS` characters of the result, naming how many it
 left out, as ``fluid_build.loader`` shortens a workspace file's values.
+:func:`spelled` spells the same characters and keeps all of them, for a value
+something else bounds: a file path, whose end, the file's name, an excerpt
+would cut away.
 
 ``fluid_build._console._show_controls`` is not enough here: it keeps line
 feeds and tabs for the console, and a log line must hold neither. Stdlib only:
@@ -49,9 +52,26 @@ def excerpt(text: str, limit: int = EXCERPT_CHARS) -> str:
     shown: List[str] = []
     size = 0
     for index, char in enumerate(text):
-        piece = char if char.isprintable() else repr(char)[1:-1]
+        piece = _spelled_char(char)
         if size + len(piece) > limit:
             return f"{''.join(shown)}... ({len(text) - index:,} more characters)"
         shown.append(piece)
         size += len(piece)
     return "".join(shown)
+
+
+def spelled(text: str) -> str:
+    """``text`` for a message, each character that is not printable spelled as
+    :func:`excerpt` spells it, and never cut.
+
+    For a file path, which the operating system bounds (it refuses a path longer
+    than its ``PATH_MAX``: 1,024 bytes on macOS, 4,096 on Linux) and whose end,
+    the file's name, is what a reader needs: an excerpt keeps the start. Not for
+    a value from a file, which may be megabytes long."""
+    if text.isprintable():
+        return text
+    return "".join(_spelled_char(char) for char in text)
+
+
+def _spelled_char(char: str) -> str:
+    return char if char.isprintable() else repr(char)[1:-1]

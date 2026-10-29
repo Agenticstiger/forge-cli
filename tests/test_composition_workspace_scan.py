@@ -498,8 +498,9 @@ def test_the_debug_line_quotes_a_duplicate_key_in_a_fragment_with_its_file_and_l
 ):
     """A key written twice in a fragment the upstream refs: the ref error names the ref and
     the contract first, so the 200 characters it was cut to ended inside a path, before the
-    key and its line. The DEBUG line quotes the duplicate-key error under it, whole."""
-    upstream = tmp_path / f"upstream-{'x' * 80}"  # its paths alone run past 200 characters
+    key and its line. The DEBUG line quotes the duplicate-key error under it, whole, and
+    names the contract whole: a path is bounded, and its end is the file's name."""
+    upstream = tmp_path / ("d" * 200)  # its paths alone run past 200 characters
     upstream.mkdir()
     (upstream / "contract.fluid.yaml").write_text(
         "id: up.y\nmetadata: {$ref: ./m.yaml}\n", encoding="utf-8"
@@ -510,9 +511,10 @@ def test_the_debug_line_quotes_a_duplicate_key_in_a_fragment_with_its_file_and_l
         _check(tmp_path, "up.y")
 
     (skip,) = _records(caplog, _SKIP)
-    assert skip.getMessage().endswith(
-        f" could not be read: {(upstream / 'm.yaml').resolve()}:2: duplicate key 'productType' "
-        "(first at line 1; YAML 1.2 requires unique keys); remove one of them"
+    assert skip.getMessage() == (
+        f"composition_index_skip: {upstream / 'contract.fluid.yaml'} could not be read: "
+        f"{(upstream / 'm.yaml').resolve()}:2: duplicate key 'productType' (first at line 1; "
+        "YAML 1.2 requires unique keys); remove one of them"
     )
 
 

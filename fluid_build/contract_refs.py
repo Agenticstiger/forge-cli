@@ -902,19 +902,21 @@ def _note_pointer_without_slash(
     minor release will refuse it, as a same-document ``#foo`` is refused now.
     The warning names the first place the ref was met (``loc`` in ``source``),
     each value it quotes cut to an excerpt: a ref written in a thousand places
-    is one warning, whatever the size of its key or its path.
+    is one warning, whatever the size of its key or its path. The file is named
+    whole, its control characters spelled: a path is bounded, and its end is the
+    file's name.
     """
     event = "ref_pointer_without_slash"
     if not _first_time(event, ref):
         return
     # Imported here, as below: the composition is on the path ``fluid --help``
     # imports, and only a warning needs it.
-    from fluid_build.util.excerpt import excerpt
+    from fluid_build.util.excerpt import excerpt, spelled
 
     fix = f"{parse_ref(ref)[0]}#/{pointer}"
     site = ref_location(excerpt(format_pointer(loc)), None)
     if source is not None:
-        site = f"{site} in {excerpt(str(source))}"
+        site = f"{site} in {spelled(str(source))}"
     LOG.warning(
         "%s: $ref '%s' %s has a JSON pointer without a leading '/', which is deprecated: a "
         "later minor release will refuse it. Write '%s'. A JSON pointer is '' or starts "
@@ -1010,19 +1012,20 @@ def _note_unknown_suffix(path: Path, suffix: str, how: str) -> None:
 
     Keyed on the suffix, not the file: a service composes each upload from a
     fresh temporary directory, so a file's path would warn once per upload.
-    The warning names the first file met with that suffix.
+    The warning names the first file met with that suffix, whole, its control
+    characters spelled.
     """
     event = "ref_target_suffix_unknown"
     if not _first_time(event, suffix):
         return
-    from fluid_build.util.excerpt import excerpt
+    from fluid_build.util.excerpt import excerpt, spelled
 
     LOG.warning(
         "%s: $ref target %s has %s, which a $ref does not know, so it was read as %s. A $ref "
         "parses %s as JSON or YAML and reads %s as text; rename the file to the suffix that "
         "says which it is. Logged once per suffix in this process.",
         event,
-        excerpt(str(path)),
+        spelled(str(path)),
         f"the suffix '{excerpt(suffix)}'" if suffix else "no suffix",
         how,
         ", ".join(sorted(DATA_REF_SUFFIXES)),

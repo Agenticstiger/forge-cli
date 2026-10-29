@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from fluid_build.util.excerpt import EXCERPT_CHARS, excerpt
+from fluid_build.util.excerpt import EXCERPT_CHARS, excerpt, spelled
 
 
 @pytest.mark.parametrize("text", ["", "./x.yaml#/a", "naïve 名前 'quoted' \\ back", "a" * 200])
@@ -50,6 +50,7 @@ def test_every_character_that_is_not_printable_is_spelled_as_repr_writes_it(
     terminal; a bidi control turns the text around it. ``str.isprintable`` refuses each."""
     assert excerpt(text) == shown
     assert excerpt(text).isprintable()
+    assert spelled(text) == shown
 
 
 def test_spelled_characters_count_toward_the_cut() -> None:
@@ -59,3 +60,15 @@ def test_spelled_characters_count_toward_the_cut() -> None:
 
     assert quoted == "\\x1b" * 50 + "... (150 more characters)"
     assert quoted.isprintable()
+
+
+def test_a_path_is_spelled_whole_however_long() -> None:
+    """A file path is bounded by the operating system, and its end is the file's name: an
+    excerpt of a deep path kept its first 200 characters and lost the name. ``spelled``
+    spells what ``excerpt`` spells, and cuts nothing."""
+    path = "/" + "/".join(["d" * 100] * 5) + "/settings.conf"
+    deep = "/" + "d" * 300 + "/t\n2026-10-29 INFO forged\x1b]0;x\x07.conf"
+
+    assert len(path) > EXCERPT_CHARS and spelled(path) == path
+    assert spelled(deep) == "/" + "d" * 300 + "/t\\n2026-10-29 INFO forged\\x1b]0;x\\x07.conf"
+    assert spelled(deep).isprintable()

@@ -542,6 +542,23 @@ def test_a16_the_unknown_suffix_warning_spells_control_characters_of_the_file_na
     ) in message
 
 
+def test_a16_the_unknown_suffix_warning_names_the_whole_path_of_a_deep_file_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A path is bounded by the file system, and its end is the file's name: quoted as an
+    excerpt, its first 200 characters, the path of a file deep enough lost the name, the one
+    thing the warning asks to change."""
+    deep = "d" * 200
+    target = _write(tmp_path / deep / "settings.conf", "retries: 3\n")
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        got = _rfr({"x": {"$ref": f"./{deep}/settings.conf"}}, tmp_path)
+
+    assert got == {"x": {"retries": 3}}
+    (warning,) = _suffix_warnings(caplog)
+    assert f"$ref target {target.resolve()} has the suffix '.conf'" in warning.getMessage()
+
+
 def test_a16_a_known_suffix_and_a_file_that_fails_to_parse_do_not_warn_sg16(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -617,14 +617,15 @@ def _note_unreadable(candidate: Path, exc: Exception) -> None:
     errors, to whoever reads the log. :func:`validate_composition_for_contract`
     warns instead, once, when the file may be the one a consumed product needs.
 
-    The reason is :func:`_skip_reason`, quoted as written, up to
-    :data:`_SKIP_REASON_CHARS` characters.
+    The file is named whole, its control characters spelled: a path is bounded,
+    and its end is the file's name. The reason is :func:`_skip_reason`, quoted
+    as written, up to :data:`_SKIP_REASON_CHARS` characters.
     """
-    from fluid_build.util.excerpt import excerpt
+    from fluid_build.util.excerpt import excerpt, spelled
 
     LOG.debug(
         "composition_index_skip: %s could not be read: %s",
-        excerpt(str(candidate)),
+        spelled(str(candidate)),
         excerpt(_skip_reason(exc), _SKIP_REASON_CHARS),
         extra={"event": "composition_index_skip", "path": str(candidate)},
     )
