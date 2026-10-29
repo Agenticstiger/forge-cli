@@ -71,10 +71,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "  extensions.<name>: that one extension block\n"
             "  description: the description texts to docs/<part>.md\n\n"
             "A part that is already a $ref is left as it is, so splitting twice\n"
-            "changes nothing. A file that exists is never written over. A relative\n"
-            "$ref in a part that moves is rewritten to name the same file from\n"
-            "the part's new one. With --out, the files relative $refs name must be\n"
-            "under the output directory too, where they are beside the contract.\n\n"
+            "changes nothing. A file that exists is never written over, but for a\n"
+            "byte-for-byte copy of the contract in --out that is the only name of\n"
+            "its file. A relative $ref in a part that moves is rewritten to name\n"
+            "the same file from the part's new one. With --out, the files relative\n"
+            "$refs name must be under the output directory too, where they are\n"
+            "beside the contract.\n\n"
             "Examples:\n"
             "  fluid split contract.fluid.yaml                       # split in place\n"
             "  fluid split contract.fluid.yaml --parts builds,sql    # choose the parts\n"
@@ -263,10 +265,22 @@ def _root_in_the_way(contract_path: Path, root_out: Path, before: Dict[str, Any]
         same = compose_contract(root_out).document == before
     except Exception:  # noqa: BLE001 - one that does not compose is another contract
         same = False
-    if same:
+    try:
+        linked = root_out.stat().st_nlink > 1
+    except OSError:
+        linked = True  # not known to be the only name of its file
+    if same and not linked:
         return (
             f"{root_out} already holds this contract (it composes to the same document); "
             f"split writes over no file. To split that one, run: fluid split {root_out}"
+        )
+    if same:
+        # Split in place, it would be written through the link: the other name,
+        # the contract in its own directory say, would change with it.
+        return (
+            f"{root_out} already holds this contract, but is also another name of a "
+            f"file (a hard link) that splitting it would change too; split writes over "
+            f"no file. Move it away, or choose another --out"
         )
     return (
         f"{root_out} already exists; split writes over no file but the contract it "

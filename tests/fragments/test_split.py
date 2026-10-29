@@ -2841,7 +2841,11 @@ def test_i29_a_hard_link_to_the_contract_in_out_is_not_written_through(
 
     assert split(pair.split_contract, "--out", out) == 1
 
-    assert "already holds this contract" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "already holds this contract" in err
+    # The way out it gives does not write through the link: splitting that name
+    # in place would change the contract in its own directory too.
+    assert "Move it away, or choose another --out" in err and "run: fluid split" not in err
     assert digest(tmp_path) == before
 
 
@@ -2861,7 +2865,9 @@ def test_i29_a_copy_in_out_that_is_a_hard_link_to_a_third_file_is_not_written_th
 
     assert split(pair.split_contract, "--out", out) == 1
 
-    assert f"Split not written: {out / NAME} already" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert f"Split not written: {out / NAME} already" in err
+    assert "Move it away, or choose another --out" in err and "run: fluid split" not in err
     assert digest(tmp_path) == before
     assert victim.read_text("utf-8") == SPLIT_ALL
 
@@ -3803,6 +3809,21 @@ def test_i39_split_help_lists_the_parts_option_and_every_part(
     ):
         assert name in out, name
     assert "sovereignty,accessPolicy,builds,exposes" in out  # the default
+
+
+def test_i39_the_help_names_the_one_file_split_writes_over_but_the_contract(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """SP-11 in the help: 'a file that exists is never written over' was said
+    without the one exception, a byte-for-byte copy of the contract in --out."""
+    assert run_cli("split", "-h") == 0
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert (
+        "A file that exists is never written over, but for a byte-for-byte copy of the "
+        "contract in --out that is the only name of its file." in out
+    )
+    assert "With --out, the files relative $refs name must be under the output directory" in out
 
 
 # ── I-40: the authoring schema accepts what split writes ────────────────
