@@ -3067,6 +3067,24 @@ def test_i03_the_header_comment_of_text_cut_from_a_moved_part_stays_in_its_fragm
     assert_comments_conserved(text, after)
 
 
+@pytest.mark.parametrize("comment", ["", "# kept"], ids=["no-comment", "a-comment-after"])
+def test_i03_a_header_line_of_blanks_is_read_in_time_linear_in_it(comment: str) -> None:
+    """A block scalar's header line of 100,000 blanks: looking for its comment
+    tried a match from every blank, time quadratic in the run (about 16 s here);
+    it starts only where the run does now."""
+    from fluid_build.cli._split_text import _header_comment
+
+    blanks = " " * 100_000
+    text = f"sql: |{blanks}{comment}\n  SELECT 1\n"
+    node = yaml.compose(text).value[0][1]
+    started = time.monotonic()
+
+    found = _header_comment(text, node)
+
+    assert time.monotonic() - started < 1
+    assert found == (blanks + comment if comment else "")
+
+
 @pytest.mark.parametrize(
     "name,content,rc",
     [

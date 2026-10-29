@@ -53,8 +53,10 @@ from fluid_build.util.safe_yaml import compose_yaml_safe
 __all__ = ["SpliceRefused", "split_yaml_text"]
 
 #: The comment on a block scalar's header line, the blanks before it included:
-#: a ``#`` that follows a blank, so a ``#`` inside a tag is not one.
-_HEADER_COMMENT = re.compile(r"[ \t]+#.*$")
+#: a ``#`` that follows a blank, so a ``#`` inside a tag is not one. A match
+#: starts only where a run of blanks starts: tried from every blank of a long
+#: run (a line of blanks with no ``#``), the search took time quadratic in it.
+_HEADER_COMMENT = re.compile(r"(?<![ \t])[ \t]+#.*$")
 
 #: The tag of a node that parses as a string.
 _STR = "tag:yaml.org,2002:str"
