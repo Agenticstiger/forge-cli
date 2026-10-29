@@ -15,8 +15,8 @@
 """``fluid import`` full matrix tests (Slice K).
 
 Four importers covered: Meltano project / Airbyte workspace / dlt pipeline /
-Singer config. Every produced contract must validate against the v0.7.3
-schema.
+Singer config. Every produced contract must validate against the schema of
+the version it declares, the newest stable one.
 """
 
 from __future__ import annotations
@@ -92,7 +92,9 @@ class TestMeltanoImporter:
         importer = MeltanoImporter()
         assert importer.can_import(str(project))
         contract, report = importer.import_to_contract(str(project))
-        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        result = schema_manager.validate_contract(
+            contract, contract["fluidVersion"], offline_only=True
+        )
         assert result.is_valid, result.errors
         assert "extractor.tap-postgres" in report.mapped_one_to_one
         assert "loader.target-snowflake" in report.mapped_one_to_one
@@ -159,7 +161,9 @@ class TestAirbyteImporter:
         }
         importer = AirbyteImporter(server_url="https://airbyte.test")
         contract, report = importer.import_to_contract("ws-1")
-        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        result = schema_manager.validate_contract(
+            contract, contract["fluidVersion"], offline_only=True
+        )
         assert result.is_valid, result.errors
         # Password redacted.
         assert "literal-pw" not in json.dumps(contract)
@@ -194,7 +198,9 @@ class TestDltImporter:
         importer = DltImporter()
         assert importer.can_import(str(pipeline_dir))
         contract, report = importer.import_to_contract(str(pipeline_dir))
-        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        result = schema_manager.validate_contract(
+            contract, contract["fluidVersion"], offline_only=True
+        )
         assert result.is_valid, result.errors
         assert "pipeline.state" in report.mapped_one_to_one
         # Streams come from the schema list.
@@ -243,7 +249,9 @@ class TestSingerImporter:
         importer = SingerImporter()
         assert importer.can_import(str(cfg))
         contract, report = importer.import_to_contract(str(cfg))
-        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        result = schema_manager.validate_contract(
+            contract, contract["fluidVersion"], offline_only=True
+        )
         assert result.is_valid, result.errors
         assert "tap.config" in report.mapped_one_to_one
         # Engine should be Meltano (Singer-protocol runner).

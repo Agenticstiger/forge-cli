@@ -327,12 +327,16 @@ class TestEveryContractValidates:
     )
     def test_schema_valid_direct_manifest(self, fixture, schema_manager):
         contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / fixture))
-        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        result = schema_manager.validate_contract(
+            contract, contract["fluidVersion"], offline_only=True
+        )
         assert result.is_valid, result.errors
 
     def test_schema_valid_project_dir_with_catalog(self, tmp_path, schema_manager):
         contract, _ = DbtManifestImporter().import_to_contract(str(_project_dir(tmp_path)))
-        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        result = schema_manager.validate_contract(
+            contract, contract["fluidVersion"], offline_only=True
+        )
         assert result.is_valid, result.errors
 
     def test_fluid_validate_cli_passes_end_to_end(self, tmp_path):
@@ -515,7 +519,9 @@ class TestSemanticLayerImport:
 
     def test_imported_contract_still_passes_schema_validation(self, schema_manager) -> None:
         contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v12.json"))
-        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        result = schema_manager.validate_contract(
+            contract, contract["fluidVersion"], offline_only=True
+        )
         assert result.is_valid, result.errors
 
 
@@ -538,7 +544,9 @@ class TestGovernanceMetaRoundTrip:
 
     def test_contract_with_recovered_governance_still_schema_valid(self, schema_manager) -> None:
         contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v12.json"))
-        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        result = schema_manager.validate_contract(
+            contract, contract["fluidVersion"], offline_only=True
+        )
         assert result.is_valid, result.errors
 
 
@@ -606,7 +614,9 @@ class TestJinjaHardening:
 
     def test_hardened_contract_still_schema_valid(self, schema_manager) -> None:
         contract, _ = self._import_hostile()
-        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        result = schema_manager.validate_contract(
+            contract, contract["fluidVersion"], offline_only=True
+        )
         assert result.is_valid, result.errors
 
     def test_no_rendered_env_var_survives_anywhere_in_contract(self) -> None:

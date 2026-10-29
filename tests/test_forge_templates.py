@@ -24,6 +24,7 @@ from fluid_build.forge.core.interfaces import (
     TemplateMetadata,
 )
 from fluid_build.forge.templates.analytics import AnalyticsTemplate
+from fluid_build.schema_manager import FluidSchemaManager
 
 logger = logging.getLogger("test_forge_templates")
 
@@ -213,9 +214,13 @@ class TestGenerateContract:
             for e in exposes
         )
         # Or the per-expose block may be absent entirely if SLO is
-        # optional for this template — we just confirm the contract
-        # validates against the v0.7.3 schema (caller handles).
-        assert has_per_expose_slo or contract.get("fluidVersion") == "0.7.3"
+        # optional for this template: then the contract must still validate
+        # against the schema of the version it declares.
+        if not has_per_expose_slo:
+            result = FluidSchemaManager().validate_contract(
+                contract, contract["fluidVersion"], offline_only=True
+            )
+            assert result.is_valid, result.errors
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +394,9 @@ class TestTemplateSemantics:
         schema_manager = FluidSchemaManager()
         for template in self._all_templates():
             contract = template.generate_contract(_make_context())
-            result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+            result = schema_manager.validate_contract(
+                contract, contract["fluidVersion"], offline_only=True
+            )
             assert result.is_valid, f"{type(template).__name__}: {result.errors[:3]}"
 
     def test_analytics_derivation_shape(self):
