@@ -240,18 +240,21 @@ def _collect(fluid: Mapping[str, Any], baseline: Mapping[str, Any]) -> Dict[str,
             exposes[expose_id] = entry
     if exposes:
         extras["exposes"] = exposes
+    return {} if _only_a_defaulted_version(fluid, extras) else extras
 
+
+def _only_a_defaulted_version(fluid: Mapping[str, Any], extras: Mapping[str, Any]) -> bool:
+    """Whether ``extras`` holds only the version an import gave a document that had none.
+
+    Recording it adds an entry the source never had, and ODCS → FLUID → ODCS
+    stops being a fixed point. Once anything else rides along, so does the
+    version: that content may need it.
+    """
     # Local import, like ``_reimport``'s.
     from .normalize import defaulted_version
 
     defaulted = defaulted_version(fluid)
-    if defaulted and extras == {"root": {"fluidVersion": defaulted}}:
-        # Only the version, and it is the default an import gave a document
-        # that recorded none: recording it adds an entry the source never had,
-        # and ODCS → FLUID → ODCS stops being a fixed point. Once anything else
-        # rides along, so does the version: that content may need it.
-        return {}
-    return extras
+    return bool(defaulted) and extras == {"root": {"fluidVersion": defaulted}}
 
 
 # ----- ODCS → FLUID --------------------------------------------------------
