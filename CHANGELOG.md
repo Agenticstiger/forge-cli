@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`fluid bundle` without `--out` does what its help says on every contract.** With a
+  `fragments/` directory beside the contract, `yaml` and `json` went to a file,
+  `contract.bundled.fluid.yaml`, instead of stdout, so `fluid bundle contract.fluid.yaml | ...`
+  received nothing; and `--format tgz` wrote its gzip tarball under that `.yaml` name, which the
+  next stage read as YAML (`'utf-8' codec can't decode byte 0x8b`). `fluid ship` bundled that way
+  on every run. Now `yaml` and `json` go to stdout and a `tgz` to
+  `<contract id>.fluid.bundle.tgz`, as for any other contract.
+
+### Upgrade notes
+
+- **`fluid bundle` no longer writes `contract.bundled.fluid.yaml` on its own.** A script that
+  bundled a split contract and then read that file must pass `--out contract.bundled.fluid.yaml`.
+  A `contract.bundled.fluid.yaml` an earlier `fluid ship` left beside a contract is a tarball and
+  can be deleted.
+
 ## [0.25.0] — 2026-10-28
 
 ### Added
