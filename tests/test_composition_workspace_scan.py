@@ -41,6 +41,7 @@ memoisation or the boundary logic is caught.
 
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from typing import Optional
@@ -309,6 +310,40 @@ def test_for_contract_unresolvable_upstream_is_unknown_violation(tmp_path):
     assert out[0].upstream_id == "nowhere.product"
     assert out[0].upstream_type is None
     assert "unknown" in out[0].reason.lower()
+
+
+def test_for_contract_warns_when_an_upstream_contract_cannot_be_read(tmp_path, caplog):
+    """An upstream the loader refuses (a key written twice, since SG-18) is missing from the
+    index, so the rule checks its consumer against nothing: an ADP consuming a CDP passed,
+    where 0.25.0, reading the last value, refused it. The skip was a DEBUG line; it is a
+    WARNING that names the file and why, its reason cut to an excerpt."""
+    upstream = _write_contract(
+        tmp_path / "up" / "cdp.fluid.yaml", product_id="gold.metrics", product_type="CDP"
+    )
+    text = upstream.read_text(encoding="utf-8") + "name: again\n"
+    upstream.write_text(text, encoding="utf-8")
+    target = tmp_path / "target.fluid.yaml"
+    _write_contract(
+        target,
+        product_id="silver.target",
+        product_type="ADP",
+        consumes=[{"productId": "gold.metrics", "exposeId": "out"}],
+    )
+    contract = yaml.safe_load(target.read_text(encoding="utf-8"))
+
+    with caplog.at_level(logging.WARNING, logger="fluid.forge.product_types"):
+        out = validate_composition_for_contract(
+            contract, workspace_root=tmp_path, contract_path=target
+        )
+
+    assert [v.upstream_type for v in out] == [None], "the rule could not be checked"
+    (skip,) = [r for r in caplog.records if getattr(r, "event", None) == "composition_index_skip"]
+    assert skip.levelno == logging.WARNING
+    message = skip.getMessage()
+    assert f"{upstream} could not be read, so the composition rule cannot check" in message
+    line = text.count("\n")
+    assert f": cdp.fluid.yaml:{line}: duplicate key 'name' (first at line 4;" in message
+    assert skip.path == str(upstream)  # type: ignore[attr-defined]
 
 
 def test_for_contract_sdp_rejects_any_upstream(tmp_path):

@@ -538,9 +538,9 @@ def _build_product_type_index(
     come from a ``$ref`` (:func:`fluid_build.loader.load_contract_fields`), so
     an upstream whose ``metadata`` is kept in a fragment has its productType,
     and the loader's billion-laughs and ref-root protections apply. A file
-    that cannot be read contributes nothing (logged at DEBUG): the contract
-    being validated reports its own errors, and one broken neighbour must not
-    stop the walk.
+    that cannot be read contributes nothing, and one broken neighbour must not
+    stop the walk; it is logged at WARNING (:func:`_index_entry`), since a
+    product it defines is then unknown to the composition rule.
     """
     index: Dict[str, Optional[str]] = {}
     seen_files: set[Path] = set()
@@ -594,7 +594,21 @@ def _index_entry(candidate: Path) -> Optional[Tuple[str, Optional[str]]]:
         pt = get_product_type(str(raw)) if raw else None
         return str(pid), pt.code if pt else None
     except Exception as exc:  # noqa: BLE001 - one broken contract must not stop the walk
-        LOG.debug("composition_index_skip: path=%s error=%s", candidate, exc)
+        # A WARNING: a product this file defines is unknown to the index, so a
+        # contract consuming it is checked against nothing, and the run must say
+        # why. A key written twice is one way (SG-18), where the last value was
+        # read before and the rule applied.
+        from fluid_build.util.excerpt import excerpt
+
+        reason = str(exc).strip() or type(exc).__name__
+        LOG.warning(
+            "composition_index_skip: %s could not be read, so the composition rule cannot "
+            "check a contract that consumes a product it defines: %s",
+            excerpt(str(candidate)),
+            # The file is named already; its directory is a long, repeated prefix.
+            excerpt(reason.replace(str(candidate), candidate.name)),
+            extra={"event": "composition_index_skip", "path": str(candidate)},
+        )
         return None
 
 

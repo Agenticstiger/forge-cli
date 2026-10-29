@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A key a `<<` merge brings in and the mapping writes itself is not a duplicate, and `<<` may be
   written more than once. In `fluid.workspace.yaml` a duplicate key makes its `ref_root` ignored
   (with a warning naming the key) and its `expected-environments` an error.
+- **The composition rule says when it cannot read an upstream.** `fluid validate` checks a
+  `consumes[]` entry against the productType of the workspace contract that defines it. A contract
+  there that cannot be read, one that writes a key twice among them, was skipped with a DEBUG line,
+  so a consumer of it passed unchecked; the skip is now a `composition_index_skip` WARNING naming
+  the file and why.
 - **`fluid bundle --format json` refuses keys JSON cannot keep apart.** YAML keeps `200` and
   `"200"` (`true` and `"true"`, `null` and `"null"`) as two keys; JSON writes both as the one name
   `"200"`, so the output held it twice: a JSON reader kept one value, and fluid refused the file.
