@@ -850,6 +850,21 @@ def test_k18_a_fragment_run_refuses_an_env(tmp_path: Path, capsys: pytest.Captur
     assert "fragment_env_unsupported" in out + err and "--env" in out + err
 
 
+@pytest.mark.parametrize("name", ["b.tgz", "b.tar.gz", "B.TGZ"])
+def test_k18_a_fragment_run_refuses_a_bundle(
+    tmp_path: Path, capsys: pytest.CaptureFixture, name: str
+) -> None:
+    """A bundle given with --fragment is refused, never validated as a bundle in its place."""
+    bundle = tmp_path / name
+    bundle.write_bytes(b"\x1f\x8b not read")
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", bundle, "--format", "json")
+
+    assert rc == 1
+    assert "fragment_bundle_unsupported" in out + err
+    assert "bundleDigest" not in out
+
+
 def test_k18_json_and_yml_fragments_validate_like_yaml(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:

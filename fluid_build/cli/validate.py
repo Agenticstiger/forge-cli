@@ -314,12 +314,13 @@ def run(args, logger: logging.Logger) -> int:
         # Detect a .tgz / .tar.gz input and dispatch to the extension-routed
         # validator. Raw .fluid.yaml contracts continue through the legacy
         # JSON-Schema path below (back-compat preserved).
+        # A fragment run first: it refuses a bundle itself, never validates one in its place.
+        if _fragment_kind(args) is not None:
+            return _run_fragment_validation(Path(contract_path), args, schema_manager, logger)
+
         contract_lower = str(contract_path).lower()
         if contract_lower.endswith(".tgz") or contract_lower.endswith(".tar.gz"):
             return _run_bundle_validation(contract_path, args, schema_manager, logger, start_time)
-
-        if _fragment_kind(args) is not None:
-            return _run_fragment_validation(Path(contract_path), args, schema_manager, logger)
 
         # Load contract with overlay
         try:
@@ -554,12 +555,18 @@ def _run_fragment_validation(
     from fluid_build.schema_manager import SchemaVersion, ValidationResult
     from fluid_build.util.ref_confinement import RefResolutionError, is_within
 
-    kind = args.fragment
+    kind = _fragment_kind(args)
     if getattr(args, "env", None):
         raise CLIError(
             1,
             "fragment_env_unsupported",
             {"error": "--env applies to a whole contract; validate the contract with it"},
+        )
+    if fragment.name.lower().endswith((".tgz", ".tar.gz")):
+        raise CLIError(
+            1,
+            "fragment_bundle_unsupported",
+            {"error": "a bundle holds a whole contract: validate it without --fragment"},
         )
     contract = _nearest_contract(fragment)
 
