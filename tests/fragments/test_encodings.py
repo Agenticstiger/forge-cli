@@ -18,10 +18,10 @@ What a fragment may contain at the byte level and in YAML 1.1's corners: byte-or
 marks, line endings, empty files, size caps, files that are not UTF-8, aliases and
 merge keys, duplicate keys, Unicode, odd keys and odd file names.
 
-Scenarios that cite a SPEC GAP (N-01 JSON, N-09, N-13 collision, N-17, N-22
+Scenarios that cite a SPEC GAP (N-01 JSON, N-13 collision, N-17, N-22
 percent-encoding) pin what the code does today, because the spec gives them no
-oracle. A test marked ``xfail(strict=True)`` asserts the spec and names the bug it
-shows.
+oracle. N-09 (SG-18) is decided: a key written twice is refused. A test marked
+``xfail(strict=True)`` asserts the spec and names the bug it shows.
 """
 
 from __future__ import annotations
@@ -127,6 +127,11 @@ def _cli(capsys: pytest.CaptureFixture[str], *argv: str) -> Tuple[int, str]:
     code = main(list(argv))
     captured = capsys.readouterr()
     return code, captured.out + captured.err
+
+
+def _flat(text: str) -> str:
+    """Whitespace-normalised: Rich wraps long lines in the CLI's error panel."""
+    return " ".join(text.split())
 
 
 def _bundle(
@@ -348,24 +353,170 @@ def test_n08_a_merge_key_in_a_fragment_is_applied(tmp_path: Path) -> None:
     assert got["item"] == {"a": 1, "b": 3, "c": 4}
 
 
-def test_n09_a_duplicate_key_keeps_the_last_value_silently_sg18(tmp_path: Path) -> None:
-    """SG-18 characterization: PyYAML's last-wins applies inside fragments."""
-    _write(tmp_path / "dup.yaml", "a: 1\na: 2\n")
-
-    assert _rfr({"x": {"$ref": "./dup.yaml"}}, tmp_path) == {"x": {"a": 2}}
+_UNIQUE = "(YAML 1.2 requires unique keys); remove one of them"
 
 
-def test_n09_two_ref_keys_in_one_mapping_read_only_the_last_file_sg18(tmp_path: Path) -> None:
-    """SG-18 characterization. The first ``$ref`` is dropped by the YAML parser, so the file
-    a reviewer reads first is never read and nothing says so."""
+def test_n09_a_duplicate_key_in_a_fragment_is_refused_naming_file_line_and_key_sg18(
+    tmp_path: Path,
+) -> None:
+    """SG-18, decided: PyYAML keeps the last value and drops the other without a word; every
+    file the composition reads refuses a key written twice instead."""
+    dup = _write(tmp_path / "dup.yaml", "a: 1\nb: {c: 1}\na: 2\n")
+
+    with pytest.raises(RefResolutionError) as info:
+        _rfr({"x": {"$ref": "./dup.yaml"}}, tmp_path)
+
+    message = str(info.value)
+    assert f"{dup}:3: duplicate key 'a' {_UNIQUE}" in message
+    assert "$ref target './dup.yaml' at JSON pointer '/x'" in message
+
+
+def test_n09_two_ref_keys_in_one_mapping_are_a_duplicate_key_and_no_file_is_read_sg18(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SG-18, decided. The parser used to drop the first ``$ref``, so the file a reviewer
+    reads first was never read and nothing said so; now neither is read."""
     _write(tmp_path / "a.yaml", "from: a\n")
     _write(tmp_path / "b.yaml", "from: b\n")
     contract = _write(tmp_path / "contract.fluid.yaml", "x:\n  $ref: ./a.yaml\n  $ref: ./b.yaml\n")
+    reads: List[str] = []
+    from fluid_build.util import safe_yaml
 
-    composed = loader.compose_contract(contract)
+    real = safe_yaml.read_bounded_file
 
-    assert composed.document == {"x": {"from": "b"}}
-    assert [path.name for path in composed.files] == ["contract.fluid.yaml", "b.yaml"]
+    def spy(path: Path, *args: Any, **kwargs: Any) -> Any:
+        reads.append(Path(path).name)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(safe_yaml, "read_bounded_file", spy)
+
+    with pytest.raises(RuntimeError) as info:
+        loader.compose_contract(contract)
+
+    assert str(info.value) == f"{contract}:3: duplicate key '$ref' {_UNIQUE}"
+    assert reads == ["contract.fluid.yaml"]
+
+
+_DUP_YAML = "a: 1\nnested:\n  k: 1\n  k: 2\n"
+
+
+@pytest.mark.parametrize(
+    ("where", "name", "text", "shown"),
+    [
+        ("root", "contract.fluid.yaml", "id: x\nname: n\nid: y\n", ":3: duplicate key 'id'"),
+        ("root", "contract.fluid.json", '{"id": "x", "id": "y"}', ": duplicate key 'id'"),
+        ("overlay", "overlays/dev.yaml", "id: x\nid: y\n", ":2: duplicate key 'id'"),
+        ("fragment", "f.yaml", _DUP_YAML, ":4: duplicate key 'k'"),
+        ("fragment", "f.json", '{"a": {"k": 1, "k": 2}}', ": duplicate key 'k'"),
+        ("fragment", "f.avsc", '{"type": "record", "type": "enum"}', ": duplicate key 'type'"),
+        ("fragment", "f.avsc", "# YAML, not JSON\ntype: record\ntype: enum\n", ":3:"),
+    ],
+    ids=[
+        "yaml-root",
+        "json-root",
+        "overlay",
+        "yaml-fragment",
+        "json-fragment",
+        "avsc",
+        "avsc-yaml",
+    ],
+)
+def test_n09_every_file_the_composition_reads_refuses_a_duplicate_key_sg18(
+    tmp_path: Path, where: str, name: str, text: str, shown: str
+) -> None:
+    file = _write(tmp_path / name, text)
+    contract = tmp_path / "contract.fluid.yaml"
+    if where == "fragment":
+        _write(contract, f"id: x\nx: {{$ref: ./{name}}}\n")
+    elif where == "overlay":
+        _write(contract, "id: x\n")
+    else:
+        contract = file
+
+    with pytest.raises((RuntimeError, RefResolutionError)) as info:
+        loader.compose_contract(contract, "dev" if where == "overlay" else None)
+
+    message = str(info.value)
+    assert f"{file}{shown}" in message
+    assert "remove one of them" in message
+    if name.endswith(".json") or (name.endswith(".avsc") and "{" in text):
+        assert "RFC 8259" in message  # JSON gives no line
+    else:
+        assert "YAML 1.2 requires unique keys" in message
+
+
+def test_n09_contract_text_and_a_bundle_refuse_a_duplicate_key_sg18(tmp_path: Path) -> None:
+    """``parse_contract_text`` reads the library's in-memory text and a bundle's resolved
+    contract: the same rule, the error naming the bundle member it was read from."""
+    from fluid_build.api.contract import ContractLoadError, load_contract, load_contract_from_text
+    from fluid_build.forge.core.bundle import build_manifest, write_tgz
+
+    with pytest.raises(ContractLoadError) as text_info:
+        load_contract_from_text("id: x\nid: y\n")
+    assert text_info.value.event == "contract_parse_failed"
+    assert f"line 2: duplicate key 'id' {_UNIQUE}" in str(text_info.value)
+
+    files = {"contract.resolved.yaml": b"id: x\nkind: DataProduct\nid: y\n"}
+    tgz = tmp_path / "b.tgz"
+    write_tgz(tgz, {**files, "MANIFEST.json": json.dumps(build_manifest(files)).encode()})
+    with pytest.raises(ContractLoadError) as bundle_info:
+        load_contract(tgz)
+    assert bundle_info.value.event == "bundle_load_failed"
+    assert f"contract.resolved.yaml:3: duplicate key 'id' {_UNIQUE}" in str(bundle_info.value)
+
+
+def test_n09_validate_and_bundle_fail_on_a_duplicate_key_naming_it_sg18(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    doc = _min_doc()
+    doc["metadata"]["owner"] = {"$ref": "./owner.yaml"}
+    contract = _write_contract(tmp_path, doc)
+    owner = _write(tmp_path / "owner.yaml", "team: a\nemail: a@example.com\nteam: b\n")
+    out = tmp_path / "b.yaml"
+
+    code, output = _cli(capsys, "validate", str(contract))
+    assert code == 1, output
+    assert f"{owner}:3: duplicate key 'team'" in _flat(output)
+
+    code, output = _cli(capsys, "bundle", str(contract), "--out", str(out))
+    assert code == 2, output
+    assert f"{owner}:3: duplicate key 'team'" in _flat(output)
+    assert not out.exists()
+
+
+def test_n09_a_merged_key_written_again_is_an_override_not_a_duplicate_sg18(
+    tmp_path: Path,
+) -> None:
+    """The keys a mapping writes are checked before ``<<`` expands, so overriding a merged
+    default is not a duplicate, also for a merge source written inline and used again."""
+    _write(
+        tmp_path / "m.yaml",
+        "base: &base {a: 1, b: 1}\n"
+        "top:\n  <<: &mid\n    <<: *base\n    a: 2\n  b: 3\n"
+        "again: *mid\n",
+    )
+
+    got = _rfr({"x": {"$ref": "./m.yaml"}}, tmp_path)["x"]
+
+    assert got["top"] == {"a": 2, "b": 3}
+    assert got["again"] == {"a": 2, "b": 1}
+
+
+def test_n09_a_workspace_file_is_not_part_of_a_contract_and_keeps_the_last_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the files a contract is composed from are held to unique keys. The workspace
+    file (read for its ``ref_root``) and every other reader keep PyYAML's last-wins."""
+    from fluid_build.util.safe_yaml import load_yaml_safe
+
+    monkeypatch.delenv("FLUID_IGNORE_WORKSPACE_REF_ROOT", raising=False)
+    ws = tmp_path / "ws"
+    _write(ws / "fluid.workspace.yaml", "ref_root: nowhere\nref_root: .\n")
+    _write(ws / "shared" / "team.yaml", "team: shared\n")
+    contract = _write(ws / "p" / "contract.fluid.yaml", "x: {$ref: ../shared/team.yaml}\n")
+
+    assert loader.load_contract(contract) == {"x": {"team": "shared"}}
+    assert load_yaml_safe("a: 1\na: 2\n") == {"a": 2}
 
 
 def test_n10_tabs_in_a_yaml_fragment_are_an_error_naming_the_file_and_line(
@@ -450,14 +601,14 @@ def test_n12_keys_with_slash_and_tilde_are_literal_and_escape_in_pointers(
     assert "at JSON pointer '/a~1b/~0k'" in str(info.value)
 
 
-_YAML_11_KEYS = "200: a\nyes: b\non: c\nnull: d\n1.5: e\n"
+_YAML_11_KEYS = "200: a\nyes: b\nnull: d\n1.5: e\n"
 
 
 def test_n13_yaml_1_1_keys_in_a_fragment_equal_the_same_keys_written_inline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    expected = {200: "a", True: "c", None: "d", 1.5: "e"}
+    expected = {200: "a", True: "b", None: "d", 1.5: "e"}
     outputs = {}
     for kind in ("inline", "fragment"):
         root = tmp_path / kind
@@ -478,6 +629,24 @@ def test_n13_yaml_1_1_keys_in_a_fragment_equal_the_same_keys_written_inline(
         outputs[kind] = ((root / "bundled.yaml").read_bytes(), (root / "bundled.json").read_bytes())
 
     assert outputs["fragment"] == outputs["inline"]
+
+
+def test_n13_two_yaml_1_1_spellings_of_one_key_are_a_duplicate_inline_and_in_a_fragment_sg18(
+    tmp_path: Path,
+) -> None:
+    """``yes`` and ``on`` are both the key ``True`` in YAML 1.1: a dict keeps one of them, so
+    the pair is refused like any key written twice, naming both spellings."""
+    _write(tmp_path / "keys.yaml", "yes: b\non: c\n")
+    inline = _write(tmp_path / "contract.fluid.yaml", "id: x\nx:\n  yes: b\n  on: c\n")
+
+    with pytest.raises(RefResolutionError) as fragment_info:
+        _rfr({"x": {"$ref": "./keys.yaml"}}, tmp_path)
+    with pytest.raises(RuntimeError) as inline_info:
+        loader.load_contract(inline)
+
+    same = "duplicate key 'on' (the same key as 'yes' at line"
+    assert f"keys.yaml:2: {same} 1;" in str(fragment_info.value)
+    assert f"{inline}:4: {same} 3;" in str(inline_info.value)
 
 
 def test_n13_a_string_sibling_does_not_merge_with_an_int_key_sg03(tmp_path: Path) -> None:

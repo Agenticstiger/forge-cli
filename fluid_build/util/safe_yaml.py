@@ -53,14 +53,23 @@ process: LLM output, network/catalog responses, and bundle contents. A file
 that holds it is read with :func:`read_bounded_file`, which refuses anything
 but a regular file and never reads past the cap, so the cap bounds the read
 too, not only the parse.
+
+``unique_keys=True`` refuses a key written twice in one mapping, which PyYAML
+otherwise keeps silently, the last value winning (yaml/pyyaml#165); YAML 1.2
+requires unique keys. The contract composition reads every file with it, and
+:func:`load_json_unique` is its JSON twin. The keys a mapping writes are
+checked before a ``<<`` merge expands, so a merged key the mapping writes
+again is an override, not a duplicate: the rule of yamllint's
+``key-duplicates`` and of the PyYAML #165 loaders (torchgen, salt).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
@@ -85,7 +94,47 @@ MAX_YAML_ALIAS_EXPANSION_CHARS = MAX_YAML_BYTES
 
 
 class UnsafeYamlError(ValueError):
-    """Raised when untrusted YAML exceeds the size or alias-expansion caps."""
+    """Raised when untrusted YAML is refused: over the size or alias-expansion
+    caps, or, read with ``unique_keys``, a key written twice (:class:`DuplicateKeyError`)."""
+
+
+class DuplicateKeyError(UnsafeYamlError):
+    """A key written twice in one YAML mapping or JSON object, read with ``unique_keys``.
+
+    ``name`` is how the message names the document (a file path), ``line``
+    the 1-based line of the second key (``None`` for JSON, whose parser gives
+    none), and ``first`` the key as it was first written when that differs
+    (YAML ``on`` and ``yes`` are the one key ``True``).
+    """
+
+    def __init__(
+        self,
+        key: Any,
+        *,
+        name: Optional[str] = None,
+        line: Optional[int] = None,
+        first: Optional[Tuple[Any, int]] = None,
+        json_object: bool = False,
+    ) -> None:
+        self.key = key
+        self.name = name
+        self.line = line
+        self.first = first
+        if name is not None:
+            place = f"{name}:{line}: " if line is not None else f"{name}: "
+        else:
+            place = f"line {line}: " if line is not None else ""
+        why = (
+            "the names of a JSON object must be unique: RFC 8259 leaves a repeated one undefined"
+            if json_object
+            else "YAML 1.2 requires unique keys"
+        )
+        if first is not None:
+            why = f"the same key as {first[0]!r} at line {first[1]}; {why}"
+        fix = "remove one of them"
+        if key == "<<" and not json_object:
+            fix += ", or merge every mapping with one '<<: [*first, *second]'"
+        super().__init__(f"{place}duplicate key {key!r} ({why}); {fix}")
 
 
 def load_yaml_safe(
@@ -96,6 +145,8 @@ def load_yaml_safe(
     max_alias_expansion: int = MAX_YAML_ALIAS_EXPANSION,
     max_alias_expansion_chars: int = MAX_YAML_ALIAS_EXPANSION_CHARS,
     max_depth: int = MAX_YAML_DEPTH,
+    unique_keys: bool = False,
+    name: Optional[str] = None,
 ) -> Any:
     """``yaml.safe_load`` with billion-laughs (anchor-expansion) protection.
 
@@ -107,15 +158,104 @@ def load_yaml_safe(
     composed and refused if its aliases add more than ``max_alias_expansion``
     nodes or ``max_alias_expansion_chars`` scalar characters, or grow it past
     the ratio cap.
+
+    ``unique_keys`` refuses a key written twice in one mapping with
+    :class:`DuplicateKeyError`, whose message names the document by ``name``
+    and the line. Off by default: only the contract composition opts in, and
+    every other reader keeps PyYAML's last-wins.
     """
     if source is None:
         return None
     source = _bounded_text(source, max_bytes)
-    if _count_aliases(source, max_aliases, max_depth) == 0:
+    aliases = _count_aliases(source, max_aliases, max_depth)
+    if aliases == 0 and not unique_keys:
         return yaml.safe_load(source)
     return _checked_document(
-        source, True, max_alias_expansion, max_alias_expansion_chars, construct=True
+        source,
+        bool(aliases),
+        max_alias_expansion,
+        max_alias_expansion_chars,
+        construct=True,
+        unique_keys=unique_keys,
+        name=name,
     )
+
+
+def load_json_unique(text: str, *, name: Optional[str] = None) -> Any:
+    """``json.loads(text)``, refusing a name written twice in one object.
+
+    ``json.loads`` keeps the last value, as PyYAML does; RFC 8259 leaves a
+    repeated name undefined. The twin of ``load_yaml_safe(..., unique_keys=True)``:
+    :class:`DuplicateKeyError` names the document by ``name`` (JSON gives no line).
+    """
+
+    def unique(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise DuplicateKeyError(key, name=name, json_object=True)
+            result[key] = value
+        return result
+
+    return json.loads(text, object_pairs_hook=unique)
+
+
+#: The tag PyYAML gives a ``<<`` merge key, and the one key every ``<<`` of a
+#: mapping counts as.
+_MERGE_TAG = "tag:yaml.org,2002:merge"
+_MERGE_KEY = object()
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """A ``SafeLoader`` that refuses a key written twice in one mapping (yaml/pyyaml#165).
+
+    The check sits in ``flatten_mapping``, before the ``<<`` merges of a
+    mapping are expanded into it: a merged key the mapping writes again is an
+    override, not a duplicate. Not in ``construct_mapping``, as the usual
+    PyYAML #165 loaders put it: a mapping that is itself merged into another is
+    flattened there first, in place, so a mapping defined inline as a merge
+    source (``<<: &mid {<<: *base, a: 2}``) and used again (``*mid``) would hold
+    a merged ``a`` beside its own by the time it is constructed. Each mapping is
+    checked once, the first time it is flattened, which is before any change.
+    Keys are compared as they are constructed (YAML 1.1 ``on`` and ``yes`` are
+    the one key ``True``), so every key a dict would silently drop is refused,
+    and every ``<<`` is one key.
+    """
+
+    def __init__(self, stream: Any, name: Optional[str] = None) -> None:
+        super().__init__(stream)
+        self._document_name = name
+        self._keys_checked: Set[int] = set()
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        if id(node) not in self._keys_checked:
+            self._keys_checked.add(id(node))
+            self._refuse_duplicate_keys(node)
+        super().flatten_mapping(node)
+
+    def _refuse_duplicate_keys(self, node: yaml.MappingNode) -> None:
+        seen: Dict[Any, Tuple[Any, int]] = {}
+        for key_node, _ in node.value:
+            if key_node.tag == _MERGE_TAG:
+                key: Any = _MERGE_KEY
+            elif isinstance(key_node, yaml.ScalarNode):
+                key = self.construct_object(key_node)
+            else:
+                continue  # a collection as a key: construction refuses it as unhashable
+            try:
+                first = seen.get(key)
+            except TypeError:
+                continue  # unhashable: construction refuses it
+            written = key_node.value if isinstance(key_node, yaml.ScalarNode) else key
+            line = key_node.start_mark.line + 1
+            if first is not None:
+                raise DuplicateKeyError(
+                    written,
+                    name=self._document_name,
+                    line=line,
+                    first=first if first[0] != written else None,
+                )
+            seen[key] = (written, line)
 
 
 def compose_yaml_safe(source: Any) -> Any:
@@ -141,11 +281,15 @@ def _checked_document(
     max_alias_expansion_chars: int,
     *,
     construct: bool = False,
+    unique_keys: bool = False,
+    name: Optional[str] = None,
 ) -> Any:
     """The single document in ``source``: its node, or its value when
     ``construct``; ``None`` when empty. A document with aliases is refused
-    when they expand it past the caps (:func:`_check_alias_expansion`)."""
-    loader = yaml.SafeLoader(source)
+    when they expand it past the caps (:func:`_check_alias_expansion`), and,
+    with ``unique_keys``, one with a key written twice in a mapping
+    (:class:`_UniqueKeySafeLoader`)."""
+    loader = _UniqueKeySafeLoader(source, name) if unique_keys else yaml.SafeLoader(source)
     try:
         node = loader.get_single_node()
         if node is None:

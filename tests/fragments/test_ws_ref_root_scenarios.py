@@ -165,9 +165,9 @@ def io_spy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> IoSpy:
         opened.append(str(file))
         return real_open(file, *args, **kwargs)
 
-    def parse_spy(path: Path) -> Any:
+    def parse_spy(path: Path, **kwargs: Any) -> Any:
         parsed.append(str(path))
-        return real_parse(path)
+        return real_parse(path, **kwargs)
 
     def find_spy(start: Optional[Path] = None) -> Any:
         finder_calls.append(start)
@@ -614,7 +614,9 @@ def _patch_filesystem_root(mp: pytest.MonkeyPatch, ws: Workspace) -> None:
     mp.setattr(
         loader,
         "_parse_file",
-        lambda path: {"ref_root": "."} if Path(path).parent == Path(os.sep) else real_parse(path),
+        lambda path, **kw: (
+            {"ref_root": "."} if Path(path).parent == Path(os.sep) else real_parse(path, **kw)
+        ),
     )
 
 

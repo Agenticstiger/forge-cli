@@ -1059,9 +1059,9 @@ def spies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Spies:
         opened.append(str(file))
         return real_open(file, *args, **kwargs)
 
-    def parse_spy(path: Path) -> Any:
+    def parse_spy(path: Path, **kwargs: Any) -> Any:
         parsed.append(str(path))
-        return real_parse(path)
+        return real_parse(path, **kwargs)
 
     def find_spy(start: Optional[Path] = None) -> Any:
         finder_calls.append(start)

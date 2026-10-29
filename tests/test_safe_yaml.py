@@ -23,7 +23,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from fluid_build.util.safe_yaml import MAX_YAML_ALIASES, UnsafeYamlError, load_yaml_safe
+from fluid_build.util.safe_yaml import (
+    MAX_YAML_ALIASES,
+    DuplicateKeyError,
+    UnsafeYamlError,
+    load_json_unique,
+    load_yaml_safe,
+)
 
 
 def test_loads_plain_yaml() -> None:
@@ -290,3 +296,96 @@ def test_callers_report_a_refused_file_as_unreadable(
     monkeypatch.setattr(validators, "_openapi_validator_available", lambda: True)
     issues = validators.validate_openapi("api.yaml", bomb.encode(), strict=True)
     assert [issue.code for issue in issues] == ["OAS-PARSE"]
+
+
+# ── unique_keys: the strict mode the contract composition reads with (SG-18) ──
+
+
+def test_a_duplicate_key_keeps_the_last_value_by_default() -> None:
+    """Every reader but the composition keeps PyYAML's last-wins, unchanged."""
+    assert load_yaml_safe("a: 1\na: 2\n") == {"a": 2}
+    assert load_yaml_safe("x: &x 1\na: *x\na: 2\n") == {"x": 1, "a": 2}
+
+
+@pytest.mark.parametrize(
+    ("text", "line", "key"),
+    [
+        ("a: 1\nb: 2\na: 3\n", 3, "a"),
+        ("x:\n  y: 1\n  z:\n    k: 1\n    k: 2\n", 5, "k"),
+        ("- {a: 1, a: 2}\n", 1, "a"),
+        ("x:\n  $ref: ./a.yaml\n  $ref: ./b.yaml\n", 3, "$ref"),
+        ("a: &x {k: 1}\nb: *x\nb: 2\n", 3, "b"),
+        ("1: one\n1: uno\n", 2, "1"),
+    ],
+    ids=["top-level", "nested", "flow", "two-refs", "with-aliases", "int-key"],
+)
+def test_unique_keys_refuses_a_key_written_twice_naming_the_line(
+    text: str, line: int, key: str
+) -> None:
+    with pytest.raises(DuplicateKeyError) as info:
+        load_yaml_safe(text, unique_keys=True, name="frag.yaml")
+
+    assert str(info.value) == (
+        f"frag.yaml:{line}: duplicate key {key!r} (YAML 1.2 requires unique keys); "
+        "remove one of them"
+    )
+    assert (info.value.key, info.value.line, info.value.name) == (key, line, "frag.yaml")
+    assert isinstance(info.value, UnsafeYamlError), "a refused input, as the caps are"
+
+
+def test_unique_keys_compares_keys_as_constructed() -> None:
+    """YAML 1.1 reads ``on`` and ``yes`` as the one key ``True``: a dict keeps one."""
+    with pytest.raises(DuplicateKeyError) as info:
+        load_yaml_safe("on: 1\nyes: 2\n", unique_keys=True)
+
+    assert str(info.value) == (
+        "line 2: duplicate key 'yes' (the same key as 'on' at line 1; YAML 1.2 requires "
+        "unique keys); remove one of them"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("d: &d {a: 1, b: 2}\nitem:\n  <<: *d\n  b: 3\n", {"a": 1, "b": 3}),
+        ("d: &d {a: 1}\nitem:\n  b: 3\n  <<: *d\n", {"a": 1, "b": 3}),
+        ("d: &d {a: 1}\ne: &e {a: 2}\nitem:\n  <<: [*d, *e]\n", {"a": 1}),
+    ],
+    ids=["override", "merge-last", "merge-list"],
+)
+def test_unique_keys_lets_a_mapping_override_what_a_merge_brings_in(
+    text: str, expected: object
+) -> None:
+    assert load_yaml_safe(text, unique_keys=True)["item"] == expected
+
+
+def test_unique_keys_reads_a_merge_source_written_inline_and_used_again() -> None:
+    """A mapping merged into another is flattened there first, in place: checked in
+    ``construct_mapping`` (the usual PyYAML #165 hook), ``*mid`` would be refused for
+    the merged ``a`` beside its own."""
+    text = "base: &base {a: 1}\ntop:\n  <<: &mid\n    <<: *base\n    a: 2\n  b: 3\nother: *mid\n"
+
+    assert load_yaml_safe(text, unique_keys=True) == {
+        "base": {"a": 1},
+        "top": {"a": 2, "b": 3},
+        "other": {"a": 2},
+    }
+
+
+def test_unique_keys_refuses_two_merge_keys_in_one_mapping() -> None:
+    with pytest.raises(DuplicateKeyError, match=r"line 5: duplicate key '<<'") as info:
+        load_yaml_safe("d: &d {a: 1}\ne: &e {b: 1}\nx:\n  <<: *d\n  <<: *e\n", unique_keys=True)
+
+    assert "<<: [*first, *second]" in str(info.value)
+
+
+def test_load_json_unique_refuses_a_name_written_twice() -> None:
+    assert load_json_unique('{"a": [{"b": 1}], "c": null}') == {"a": [{"b": 1}], "c": None}
+    with pytest.raises(DuplicateKeyError) as info:
+        load_json_unique('{"a": {"k": 1, "k": 2}}', name="f.json")
+
+    assert str(info.value) == (
+        "f.json: duplicate key 'k' (the names of a JSON object must be unique: RFC 8259 "
+        "leaves a repeated one undefined); remove one of them"
+    )
+    assert info.value.line is None

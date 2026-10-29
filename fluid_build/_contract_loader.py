@@ -198,7 +198,9 @@ def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, A
                         )
                 return source_cache[src_path]
 
-            doc = loader.parse_contract_text(raw_bytes.decode("utf-8"), suffix=suffix)
+            doc = loader.parse_contract_text(
+                raw_bytes.decode("utf-8"), suffix=suffix, name=member_name
+            )
             contract = unwrap_source_pointers(doc, _resolve_source)
     except CLIError:
         raise

@@ -63,7 +63,6 @@ from __future__ import annotations
 
 import copy
 import functools
-import json
 import os
 from pathlib import Path
 from typing import (
@@ -857,33 +856,38 @@ def _parse_target(path: Path) -> Any:
     rules or columns can live in a file of their own as a list; a file with
     another suffix keeps the old rule. An empty YAML file is ``{}``, as before.
     Whatever the suffix, the file is read with the cap of a YAML document
-    (:func:`fluid_build.util.safe_yaml.read_bounded_text`).
+    (:func:`fluid_build.util.safe_yaml.read_bounded_text`), and a key written
+    twice in one mapping is refused, as in every file the composition reads
+    (:class:`fluid_build.util.safe_yaml.DuplicateKeyError`).
     """
-    from fluid_build.util.safe_yaml import read_bounded_text
+    from fluid_build.util.safe_yaml import DuplicateKeyError, load_json_unique, read_bounded_text
 
     text = read_bounded_text(path)
     suffix = path.suffix.lower()
+    name = str(path)
     if suffix == ".json":
-        return json.loads(text)
+        return load_json_unique(text, name=name)
     if suffix in (".yaml", ".yml"):
-        return _yaml(text)
+        return _yaml(text, name)
     try:
-        return json.loads(text)
+        return load_json_unique(text, name=name)
+    except DuplicateKeyError:
+        raise
     except ValueError:
         pass
     # Any other suffix (``.avsc``, none at all) parses as JSON, or else as a
     # YAML object, as before: a dotfile or a key file inside the root reads
     # as a YAML string, and a ref must not hand that out.
-    value = _yaml(text)
+    value = _yaml(text, name)
     if not isinstance(value, dict):
         raise ValueError(f"YAML root must be an object/dict: {path}")
     return value
 
 
-def _yaml(text: str) -> Any:
+def _yaml(text: str, name: str) -> Any:
     from fluid_build.util.safe_yaml import load_yaml_safe
 
-    value = load_yaml_safe(text)
+    value = load_yaml_safe(text, unique_keys=True, name=name)
     return {} if value is None else value
 
 
@@ -1240,8 +1244,8 @@ class ContractOrigins:
 
     def _child(self, node: Any, token: Union[str, int]) -> Optional[Tuple[int, Any]]:
         """:func:`_node_child`, with a mapping's keys indexed once, so n errors in
-        one mapping cost n lookups, not n scans of it. A key written twice is
-        found where it was written last, the value the loader keeps."""
+        one mapping cost n lookups, not n scans of it. No key is written twice in
+        a file the composition read: it refuses one that is."""
         import yaml
 
         if not isinstance(node, yaml.MappingNode):

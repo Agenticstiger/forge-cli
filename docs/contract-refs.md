@@ -47,6 +47,14 @@ overlay is merged, whichever file it is written in. A `$ref` in an overlay
 resolves relative to the overlay file. No `$ref` is left after composition: one
 that cannot be resolved fails the command and names the file it was written in.
 
+Every file the composition reads (the contract, an overlay, each fragment)
+writes a key once per mapping. A key written twice, two `$ref` keys included,
+fails the command with the file, the line and the key
+(`owner.yaml:3: duplicate key 'team' (YAML 1.2 requires unique keys)`): YAML
+and JSON parsers keep the last value and drop the other without a word. A key
+that a `<<` merge brings in and the mapping then writes itself is an override,
+not a duplicate.
+
 ---
 
 ## Where a ref may point: the ref root

@@ -22,7 +22,8 @@ split on the copy and asserts that invariant.
 
 Findings are kept as ``xfail(strict=True)`` tests that assert the behaviour
 the catalog asks for; characterisation tests pin today's behaviour where the
-catalog has no oracle (SPEC GAP SG-32, SG-18).
+catalog has no oracle (SPEC GAP SG-32). SG-18 is decided: a duplicate key is
+refused (I-27).
 """
 
 from __future__ import annotations
@@ -2048,24 +2049,27 @@ def test_i26_the_end_of_the_file_is_kept_as_it_was(tmp_path: Path, case: str) ->
 # ── I-27: duplicate top-level keys ──────────────────────────────────────
 
 
-def test_i27_a_duplicate_top_level_key_splits_the_node_the_loader_uses(tmp_path: Path) -> None:
-    """SG-18 characterisation: PyYAML keeps the LAST ``exposes:``; so does the splice."""
+def test_i27_a_duplicate_top_level_key_is_refused_and_nothing_is_split_sg18(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SG-18, decided: a key written twice is refused, naming the file, the line and the
+    key. PyYAML would keep the LAST ``exposes:`` and drop the first without a word, so the
+    splice would move one and leave the other dead in the root."""
     text = (
         "id: x\nexposes:\n  - exposeId: first\n    kind: table\n"
         "exposes:\n  - exposeId: last\n    kind: topic\n"
     )
     pair = solo(tmp_path, text)
     assert [e["exposeId"] for e in yaml.safe_load(text)["exposes"]] == ["last"]
+    before = digest(pair.split)
+    capsys.readouterr()
 
-    after = split_and_check(pair)
+    assert split(pair.split_contract) != 0
 
-    assert new_files(pair, after) == ["fragments/exposes/last.yaml"]
-    root = text_of(after, NAME)
-    assert "  - exposeId: first\n    kind: table\n" in root  # the dead duplicate is left alone
-    assert root.endswith("exposes:\n  - $ref: ./fragments/exposes/last.yaml\n")
-    assert [e["exposeId"] for e in compose_contract(pair.split_contract).document["exposes"]] == [
-        "last"
-    ]
+    err = capsys.readouterr().err
+    assert f"{pair.split_contract}:5: duplicate key 'exposes'" in err
+    assert "YAML 1.2 requires unique keys" in err
+    assert digest(pair.split) == before, "nothing is written"
 
 
 # ── I-28: the dry run ───────────────────────────────────────────────────

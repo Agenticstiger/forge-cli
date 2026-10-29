@@ -110,7 +110,7 @@ def _read_text(path: Path) -> str:
         raise RuntimeError(f"Failed to read file {path}: {e}") from e
 
 
-def _safe_yaml_load(text: str) -> Any:
+def _safe_yaml_load(text: str, *, unique_keys: bool = False, name: Optional[str] = None) -> Any:
     """Parse YAML with billion-laughs (anchor-expansion) protection.
 
     The primary contract-ingestion path MUST cap anchor expansion and
@@ -119,14 +119,30 @@ def _safe_yaml_load(text: str) -> Any:
     against an untrusted contract would otherwise be a host-OOM DoS.
     Routed through :func:`fluid_build.util.safe_yaml.load_yaml_safe`.
     Imported lazily so ``loader.py`` still imports when PyYAML is absent
-    (JSON-only contracts).
+    (JSON-only contracts). ``unique_keys`` refuses a key written twice, the
+    error naming the document by ``name``.
     """
     from fluid_build.util.safe_yaml import load_yaml_safe
 
-    return load_yaml_safe(text)
+    return load_yaml_safe(text, unique_keys=unique_keys, name=name)
 
 
-def _parse_file(path: Path) -> Dict[str, Any]:
+def _json_load(text: str, *, unique_keys: bool, name: Optional[str]) -> Any:
+    """``json.loads``, refusing a name written twice when ``unique_keys``."""
+    if not unique_keys:
+        return json.loads(text)
+    from fluid_build.util.safe_yaml import load_json_unique
+
+    return load_json_unique(text, name=name)
+
+
+def _is_duplicate_key(exc: BaseException) -> bool:
+    from fluid_build.util.safe_yaml import DuplicateKeyError
+
+    return isinstance(exc, DuplicateKeyError)
+
+
+def _parse_file(path: Path, *, unique_keys: bool = True) -> Dict[str, Any]:
     """
     Parse a JSON or YAML file based on extension.
     YAML requires PyYAML; if missing, raise a helpful error.
@@ -134,28 +150,42 @@ def _parse_file(path: Path) -> Dict[str, Any]:
     The root must be an object, on every entry point, raw loads included: an
     empty YAML file is ``{}``, any other root (a list, a scalar, JSON ``null``)
     is refused, naming the file.
+
+    A key written twice in one mapping is refused, naming the file, the line
+    (YAML) and the key: PyYAML and ``json`` would keep the last value and drop
+    the other without a word, and every file a contract is composed from is
+    held to the rule. ``unique_keys=False`` keeps the last value instead, for a
+    file that is not part of a contract (``fluid.workspace.yaml``).
     """
     suffix = path.suffix.lower()
     text = _read_text(path)
+    name = str(path)
     try:
         if suffix in (".json",):
-            return _object_root(json.loads(text), "JSON", path)
+            return _object_root(_json_load(text, unique_keys=unique_keys, name=name), "JSON", path)
         if suffix in (".yaml", ".yml"):
             if yaml is None:
                 raise RuntimeError(
                     "YAML parsing requires PyYAML. Install with: pip install pyyaml "
                     "or use JSON (.json) contracts."
                 )
-            return _object_root(_safe_yaml_load(text), "YAML", path)
+            return _object_root(
+                _safe_yaml_load(text, unique_keys=unique_keys, name=name), "YAML", path
+            )
         # Fallback: try JSON first, then YAML (if available)
         try:
-            obj = json.loads(text)
-        except Exception:
-            if yaml is None:
+            obj = _json_load(text, unique_keys=unique_keys, name=name)
+        except Exception as exc:
+            if yaml is None or _is_duplicate_key(exc):
                 raise
-            return _object_root(_safe_yaml_load(text), "YAML", path)
+            return _object_root(
+                _safe_yaml_load(text, unique_keys=unique_keys, name=name), "YAML", path
+            )
         return _object_root(obj, "JSON", path)
     except Exception as e:
+        if _is_duplicate_key(e):
+            # Its message names the file and the line already.
+            raise RuntimeError(str(e)) from e
         raise RuntimeError(f"Failed to parse {path}: {e}") from e
 
 
@@ -169,7 +199,9 @@ def _object_root(obj: Any, kind: str, path: Path) -> Dict[str, Any]:
     return obj
 
 
-def parse_contract_text(text: str, *, suffix: str = ".yaml") -> Dict[str, Any]:
+def parse_contract_text(
+    text: str, *, suffix: str = ".yaml", name: Optional[str] = None
+) -> Dict[str, Any]:
     """Parse already-read contract text (JSON or YAML) into a dict.
 
     The on-disk path goes through :func:`_parse_file`, which reads bytes
@@ -185,18 +217,21 @@ def parse_contract_text(text: str, *, suffix: str = ".yaml") -> Dict[str, Any]:
     then YAML". YAML is routed through :func:`_safe_yaml_load` so the
     billion-laughs (anchor-expansion) protection that guards the on-disk
     path applies identically to bundle-extracted contracts.
+
+    As in a file, a key written twice in one mapping is refused, the error
+    naming the text by ``name`` (the bundle member it was read from, say).
     """
     suffix = suffix.lower()
     try:
         if suffix == ".json":
-            return json.loads(text)
+            return _json_load(text, unique_keys=True, name=name)
         if suffix in (".yaml", ".yml"):
             if yaml is None:
                 raise RuntimeError(
                     "YAML parsing requires PyYAML. Install with: pip install pyyaml "
                     "or use JSON (.json) contracts."
                 )
-            obj = _safe_yaml_load(text)
+            obj = _safe_yaml_load(text, unique_keys=True, name=name)
             if obj is None:
                 return {}
             if not isinstance(obj, dict):
@@ -204,11 +239,11 @@ def parse_contract_text(text: str, *, suffix: str = ".yaml") -> Dict[str, Any]:
             return obj
         # Fallback: try JSON first, then YAML (if available).
         try:
-            return json.loads(text)
-        except Exception:
-            if yaml is None:
+            return _json_load(text, unique_keys=True, name=name)
+        except Exception as exc:
+            if yaml is None or _is_duplicate_key(exc):
                 raise
-            obj = _safe_yaml_load(text)
+            obj = _safe_yaml_load(text, unique_keys=True, name=name)
             if obj is None:
                 return {}
             if not isinstance(obj, dict):
@@ -896,7 +931,8 @@ def _workspace_ref_root(contract_dir: Path) -> _WorkspaceRoot:
         return own
     source = found / WORKSPACE_CONFIG_FILENAME
     try:
-        workspace = _parse_file(source)
+        # Not part of a contract: a key written twice keeps its last value, as before.
+        workspace = _parse_file(source, unique_keys=False)
         if not isinstance(workspace, dict):
             raise ValueError(f"its root is a {type(workspace).__name__}, not a mapping")
     except Exception as exc:  # noqa: BLE001 - a file that cannot be parsed declares nothing
@@ -1525,7 +1561,7 @@ def declared_environments(
         root = find_workspace_root(base.parent)
         if root is None:
             return found
-        workspace = _parse_file(root / WORKSPACE_CONFIG_FILENAME)
+        workspace = _parse_file(root / WORKSPACE_CONFIG_FILENAME, unique_keys=False)
     except Exception:  # noqa: BLE001 - an unreadable workspace declares nothing
         return found
     if not isinstance(workspace, dict):
