@@ -1678,6 +1678,49 @@ def test_i21_the_dict_level_splitter_rebases_a_ref_once_and_never_its_own() -> N
     assert contract["builds"][0]["properties"]["parameters"] == {"$ref": "./p.yaml"}  # unchanged
 
 
+@pytest.mark.parametrize(
+    "written,rebased",
+    [
+        ("{$ref: ./p.yaml}  # plain", "{$ref: ../../p.yaml}  # plain"),
+        ("{$ref: './p.yaml'}  # single", "{$ref: '../../p.yaml'}  # single"),
+        ('{"$ref": "./p.yaml"}  # double', '{"$ref": "../../p.yaml"}  # double'),
+        ("{$ref: !!str ./p.yaml}  # tagged", "{$ref: ../../p.yaml}  # tagged"),
+        ("\n        $ref: ./p.yaml  # block", "\n    $ref: ../../p.yaml  # block"),
+    ],
+    ids=["plain", "single-quoted", "double-quoted", "tagged", "block-mapping"],
+)
+def test_i21_a_rebased_ref_keeps_its_quoting_and_every_comment(
+    tmp_path: Path, written: str, rebased: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-02 in the text splice: only the ref's scalar is rewritten, in the
+    quoting it was written in (a tag on it goes: the string is a string)."""
+    text = f"# head\nid: x\nbuilds:\n  - id: a\n    properties:\n      parameters: {written}\n"
+    pair = make_pair(tmp_path, {NAME: text, "p.yaml": "mode: full\n"})
+    capsys.readouterr()
+
+    after = split_and_check(pair)
+
+    assert f"\nproperties:\n  parameters: {rebased}\n" in text_of(after, "fragments/builds/a.yaml")
+    assert_comments_conserved(text, after)
+    assert "were not kept" not in capsys.readouterr().err
+
+
+def test_i21_a_ref_written_as_a_block_scalar_is_rebased_by_the_data_split(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A block scalar's span runs into the lines after it, so its text is not
+    rewritten: the data split rebases it, and says the comments were not kept."""
+    text = "id: x\nbuilds:\n  - id: a\n    properties:\n      parameters:\n        $ref: |-\n          ./p.yaml\n"
+    pair = make_pair(tmp_path, {NAME: text, "p.yaml": "mode: full\n"})
+    capsys.readouterr()
+
+    after = split_and_check(pair)
+
+    build = yaml.safe_load(text_of(after, "fragments/builds/a.yaml"))
+    assert build["properties"]["parameters"] == {"$ref": "../../p.yaml"}
+    assert "a $ref value is written as a block scalar" in capsys.readouterr().err
+
+
 def test_i21_refs_that_stay_in_the_root_are_not_touched(tmp_path: Path) -> None:
     text = REFS_IN_PARTS.replace(
         "id: x\n", "id: x\nmetadata:\n  owner: {$ref: ./team.yaml}\n"
