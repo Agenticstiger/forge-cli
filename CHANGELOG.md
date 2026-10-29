@@ -18,13 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the object root `description`, `exposes[].contract.id`, a column's `quality`). 0.7.7 is
   identical to 0.7.6 at open; additive preview fields land there. A contract validates against
   the version it declares, as before, so nothing changes for one that declares 0.7.5.
-- **An ODCS export records the contract's `fluidVersion` always.** It was recorded only where it
-  differed from the exporting CLI's default, and an import takes a missing version from its own
-  default. With 0.7.6 the default, a 0.7.6 contract's export would have come back from 0.25.0 or
-  earlier, which default to 0.7.5, as 0.7.5, and its 0.7.6 fields would have failed. One
-  exception keeps a third-party document's ODCS → FLUID → ODCS exact: a contract imported from a
-  document that recorded no version exports without one while it still declares the version the
-  import gave it and carries only what ODCS has fields for.
+- **An ODCS export records the contract's `fluidVersion` in `fluidExtras` whatever the version.**
+  It was recorded only where it differed from the exporting CLI's default, and an import takes a
+  missing version from its own default. With 0.7.6 the default, a 0.7.6 contract's export would
+  have come back from 0.12.0 to 0.25.0, which default to 0.7.5, as 0.7.5, and its 0.7.6 fields
+  would have failed. One exception keeps a third-party document's ODCS → FLUID → ODCS exact: a
+  contract this release (or a later one) imported from a document that recorded no version
+  exports without one while it still declares the version the import gave it and carries only
+  what ODCS has fields for. `ODCS_FLUID_EXTRAS=false` still writes no `fluidExtras` at all.
 
 ### Fixed
 
@@ -65,10 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where another overlay entry names an id. The file templates `fluid init` copies keep declaring
   the version written in them.
 - `fluid odcs import` and `fluid odps import` of a document that records no version declare
-  0.7.6, so more of it lands in place instead of in the extensions bucket: the team roster, a
-  column's `quality`, and, for a document with one schema object, a contract id that is not a
-  FLUID identifier (one that is becomes the root `id`, as before). `fluid odps import` also
-  places an object's `description`. Re-importing such a document writes a different file.
+  0.7.6, so more of it lands in place instead of in the extensions bucket: the team roster and a
+  column's `quality`. `fluid odps import` also places each output port's contract id and an
+  object's `description`; `fluid odcs import` places a contract id only for a document with one
+  schema object whose id is not a FLUID identifier (one that is becomes the root `id`, as
+  before). Re-importing such a document writes a different file.
 - A 0.7.5 contract's ODCS export now carries `fluidVersion: 0.7.5` in `fluidExtras`.
 - To try what lands next, declare `fluidVersion: "0.7.7"`.
 

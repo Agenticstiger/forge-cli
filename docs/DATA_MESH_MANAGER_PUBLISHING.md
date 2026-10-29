@@ -305,11 +305,13 @@ list before any generation happens. This means:
 - An overlay entry patches the base entry with the same `exposeId`; an
   `exposeId` the base does not have adds an entry (logged as
   `overlay_entry_added`), and an entry with no `exposeId` is refused when the
-  base has more than one expose, or when another overlay entry names one. A contract that declares a `fluidVersion`
-  below 0.7.6 (the overlay's own, when it declares one, wins) merges by
-  position instead: the entry at index `0` patches the base entry at index
-  `0`, and when the base has more than one expose an entry whose `exposeId`
-  differs from the base entry's logs `overlay_patch_retargeted`
+  base has more than one expose, or when another overlay entry names one. If
+  two base exposes share an `exposeId`, the lists merge by position instead
+  (logged as `overlay_merged_by_position`). A contract that declares a
+  `fluidVersion` below 0.7.6 (the overlay's own, when it declares one, wins)
+  merges by position too: the entry at index `0` patches the base entry at
+  index `0`, and when the base has more than one expose an entry whose
+  `exposeId` differs from the base entry's logs `overlay_patch_retargeted`
 - Only the fields present in the overlay entry are changed
 - All other fields (`schema`, `qos`, `lifecycle`) are untouched
 - Both the ODPS product record and the ODCS contracts see the merged result
