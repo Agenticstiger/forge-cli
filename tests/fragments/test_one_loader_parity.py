@@ -49,7 +49,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tu
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 
 _CHECKOUT = Path(__file__).resolve().parents[2]
 
@@ -79,6 +79,7 @@ def _clear_loader_registries() -> None:
     for name, value in vars(loader).items():
         if name.startswith("_NOTED_") and isinstance(value, set):
             value.clear()
+    contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
 
 @pytest.fixture(scope="module", autouse=True)

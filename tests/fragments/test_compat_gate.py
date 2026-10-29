@@ -51,7 +51,7 @@ from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Sequence, Tu
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_TAG = "v0.24.0"
@@ -80,6 +80,7 @@ def _clear_registries() -> None:
     for name, value in list(vars(loader).items()):
         if name.startswith("_NOTED_") and isinstance(value, set):
             value.clear()
+    contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
 
 @pytest.fixture(scope="session")

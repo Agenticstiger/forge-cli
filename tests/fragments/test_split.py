@@ -44,7 +44,7 @@ from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Seq
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 from fluid_build.loader import compose_contract
 
 REPO = Path(__file__).resolve().parents[2]
@@ -425,6 +425,7 @@ def _clear_warn_once() -> None:
     for name, value in list(vars(loader).items()):
         if name.startswith("_NOTED_") and isinstance(value, set):
             value.clear()
+    contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
 
 @pytest.fixture(autouse=True)

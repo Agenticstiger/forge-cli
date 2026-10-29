@@ -83,12 +83,13 @@ def _private_schema_cache(tmp_path_factory: pytest.TempPathFactory) -> Any:
 
 @pytest.fixture(autouse=True)
 def _fresh_loader_state(monkeypatch: pytest.MonkeyPatch) -> Any:
-    from fluid_build import loader
+    from fluid_build import contract_refs, loader
 
     def clear() -> None:
         for name in dir(loader):
             if name.startswith("_NOTED_") and isinstance(getattr(loader, name), set):
                 getattr(loader, name).clear()
+        contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
     clear()
     monkeypatch.delenv("FLUID_REF_ROOT", raising=False)

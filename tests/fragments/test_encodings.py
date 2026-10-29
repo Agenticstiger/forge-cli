@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, loader
 from fluid_build.contract_refs import MAX_TEXT_REF_BYTES, ComposeTrace, resolve_file_refs
 from fluid_build.loader import RefResolutionError
 
@@ -50,6 +50,7 @@ def _clear_warn_once_registries() -> None:
     for name, value in vars(loader).items():
         if name.startswith("_NOTED_") and isinstance(value, set):
             value.clear()
+    contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
 
 @pytest.fixture(autouse=True)

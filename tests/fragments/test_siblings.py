@@ -49,6 +49,7 @@ def _clear_warn_once_registries() -> None:
     for name, value in vars(loader).items():
         if name.startswith("_NOTED_") and isinstance(value, set):
             value.clear()
+    contract_refs._NOTED_REF_WARNINGS.clear()  # the resolver's registry: not a loader attribute
 
 
 @pytest.fixture(autouse=True)
