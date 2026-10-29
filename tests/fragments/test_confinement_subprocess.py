@@ -301,6 +301,25 @@ def test_d23_a_fifo_target_is_refused_without_a_hang(tmp_path: Path, name: str) 
     assert "not a regular file" in _flat(result.stdout + result.stderr)
 
 
+def test_d23_a_fifo_swapped_in_for_the_root_a_fragment_run_reads_is_not_waited_on(
+    tmp_path: Path,
+) -> None:
+    """``validate --fragment`` reads the nearest root contract's fluidVersion after it
+    composed the fragment. A FIFO swapped in for that root in between is refused as not a
+    regular file, never opened and waited on."""
+    fifo = _mkfifo(tmp_path / "p" / "contract.fluid.yaml")
+    code = (
+        "from pathlib import Path\n"
+        "from fluid_build.cli.validate import _contract_version\n"
+        f"_contract_version(Path({str(fifo)!r}))\n"
+    )
+
+    result = _run(["-c", code], cwd=tmp_path, timeout=10)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "not a regular file" in _flat(result.stderr)
+
+
 def test_d23_a_workspace_file_that_is_a_fifo_is_not_waited_on(tmp_path: Path) -> None:
     """Negative control: ``find_workspace_root`` takes a regular file only, so a
     FIFO named ``fluid.workspace.yaml`` declares nothing and blocks nothing."""
