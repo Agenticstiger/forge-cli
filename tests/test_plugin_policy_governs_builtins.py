@@ -47,12 +47,17 @@ def _restore_registries():
     """Both registries are process-global; snapshot and restore them."""
     providers_before = dict(registry.PROVIDERS)
     blocked_before = set(registry.POLICY_BLOCKED)
+    discovered_before = registry._DISCOVERY_DONE
     iac_before = dict(iac_registry.IAC_PLUGINS)
     yield
     registry.PROVIDERS.clear()
     registry.PROVIDERS.update(providers_before)
     registry.POLICY_BLOCKED.clear()
     registry.POLICY_BLOCKED.update(blocked_before)
+    # Restored with the registry it describes: a snapshot taken before this
+    # process discovered anything must not be left behind marked discovered,
+    # or every later discover_providers() call keeps the partial registry.
+    registry._DISCOVERY_DONE = discovered_before
     iac_registry.IAC_PLUGINS.clear()
     iac_registry.IAC_PLUGINS.update(iac_before)
 
