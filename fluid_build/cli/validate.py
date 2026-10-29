@@ -670,15 +670,19 @@ def _fragment_schema_version(flag: Optional[str], fragment: Path, contract: Opti
     if flag:
         return flag
     if contract is None:
-        why = f"no contract.fluid.yaml sits above {fragment.name} to read it from"
+        why = (
+            f"no contract.fluid.yaml above {fragment.name} could be taken (a symlinked one is "
+            "not, and the search stops at the top of its repository or workspace, and before "
+            "a home or temp directory)"
+        )
     else:
         try:
             version = _contract_version(contract)
         except Exception as exc:  # noqa: BLE001 - said below, with the file it is about
-            problem = " ".join(str(exc).split())
+            problem = " ".join(str(exc).split()).rstrip(".")
             why = f"{contract}, the nearest contract above it, cannot be read: {problem}"
         else:
-            if version:
+            if version is not None:
                 return version
             why = f"{contract}, the nearest contract above it, declares no fluidVersion"
     raise CLIError(
@@ -687,28 +691,28 @@ def _fragment_schema_version(flag: Optional[str], fragment: Path, contract: Opti
         {
             "error": (
                 f"cannot tell which schema version to check the fragment against: {why}. "
-                "Pass --schema-version <version>, for example --schema-version 0.7.6."
+                "Pass --schema-version <version>; fluid validate --list-versions lists them."
             )
         },
     )
 
 
 def _contract_version(contract: Path) -> Optional[str]:
-    """The ``fluidVersion`` a root contract declares, as the loader reads a value.
+    """The ``fluidVersion`` a root contract declares, read as the loader reads it.
 
-    Only that value is composed, so a ``$ref`` in it is followed, and a contract
-    that does not compose yet (the fragment under check may be the reason) still
-    gives its version. ``None`` when it declares none. Read as every contract is:
-    bounded, and only as a regular file, so a FIFO swapped in for it cannot hang
-    the run. ``contract.parent`` is already resolved (see :func:`_nearest_contract`).
+    :func:`fluid_build.loader.load_contract_fields` parses the root as every
+    contract is parsed (bounded, a regular file only, an object at the top), and
+    composes the contract only when the version, or the root itself, is a
+    ``$ref``: a version kept in a fragment, a root that is a ``$ref`` to its base
+    and a ``#/`` pointer are all followed, under the ref root the contract has.
+    A contract whose version is written out gives it even when another part of
+    it does not compose yet (the fragment under check may be the reason).
+    ``None`` when it declares none.
     """
-    from fluid_build.loader import compose_document, parse_contract_text
-    from fluid_build.util.safe_yaml import read_bounded_text
+    from fluid_build.loader import load_contract_fields
 
-    document = parse_contract_text(read_bounded_text(contract), suffix=contract.suffix)
-    declared = {"fluidVersion": document.get("fluidVersion")}
-    version = compose_document(declared, contract.parent).document["fluidVersion"]
-    return str(version) if version else None
+    version = load_contract_fields(contract, "fluidVersion").get("fluidVersion")
+    return None if version is None or version == "" else str(version)
 
 
 def _handle_list_versions(schema_manager: FluidSchemaManager, args, logger: logging.Logger) -> int:

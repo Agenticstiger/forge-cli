@@ -93,12 +93,18 @@ def _isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
 #: ``yaml`` / ``json`` and the aliases they are imported under (``import json as _json``).
 _PARSER_MODULES = {"yaml", "_yaml", "json", "_json"}
 _PARSER_METHODS = {"safe_load", "load", "full_load", "unsafe_load", "loads"}
-_PARSER_NAMES = {"load_yaml_safe", "_safe_yaml_load", "_parse_file", "safe_load"}
+_PARSER_NAMES = {
+    "load_yaml_safe",
+    "_safe_yaml_load",
+    "_parse_file",
+    "safe_load",
+    "parse_contract_text",
+}
 
 #: A module with none of these cannot hold a parse call the scan looks for: it is not parsed.
 _WORTH_PARSING = re.compile(
     r"safe_load|yaml\.(?:full_|unsafe_)?load|json\.loads?|_safe_yaml_load|_parse_file"
-    r"|load_yaml_safe|load_overlay_document|resolve_refs"
+    r"|load_yaml_safe|load_overlay_document|resolve_refs|parse_contract_text"
 )
 _READ_ATTRS = {"read_text", "read_bytes", "open"}
 _CONTRACT_WORDS = re.compile(r"contract|fluid\.ya?ml|\.fluid\.|fluid\.json", re.I)
@@ -363,6 +369,12 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
         "split rewrites the root file: it reads its raw text",
         *_site("cli/split.py", "_load_contract"),
     ),
+    **_register(
+        LOADER,
+        "a bundle holds the contract already composed: it parses contract.resolved.* from the "
+        "tarball after the MANIFEST check, and there is no $ref left to follow",
+        *_site("_contract_loader.py", "_load_contract_from_bundle"),
+    ),
     # ── read something other than a contract ──
     **_register(
         NOT_A_CONTRACT,
@@ -615,12 +627,11 @@ def test_g20_docs_build_and_the_mcp_dispatcher_route_through_the_loader() -> Non
 
 # ── the bugs ───────────────────────────────────────────────────────────────
 
-#: Sites whose raw read has no effect a test can show without a model or a cloud (a hint, a
-#: probe whose result is dropped, the version of a file whose root is always inline).
+#: The open bugs among the static cases below.
 _STILL_RAW = pytest.mark.xfail(
     strict=True,
-    reason="BUG G20-raw-read-in-a-named-command: bundle, generate artifacts, validate --fragment "
-    "and the bundle source check each parse the contract root themselves",
+    reason="BUG G20-raw-read-in-a-named-command: bundle, generate artifacts and the bundle "
+    "source check each parse the contract root themselves",
 )
 
 
@@ -628,6 +639,9 @@ def _site_case(path: str, function: str, *, raw: bool = False) -> Any:
     return pytest.param(path, function, id=f"{path}::{function}", marks=_STILL_RAW if raw else ())
 
 
+#: Sites the scan must not find. A ``raw=True`` row is an open bug (strict xfail): its raw read
+#: has no effect a test can show without a model or a cloud (a hint, a probe whose result is
+#: dropped). A plain row guards a fixed site against coming back.
 _STATIC_BUGS = [
     _site_case("cli/bundle.py", "run", raw=True),
     _site_case("cli/validate.py", "_contract_version"),

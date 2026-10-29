@@ -486,6 +486,54 @@ def test_k13_the_version_of_a_json_root_contract_is_read(
     assert "(schema v0.7.5)" in out
 
 
+def _root_that_is_a_ref_to_its_base(contract: Path) -> None:
+    _dump(contract.parent / "base.yaml", _root_doc("0.7.5"))
+    _dump(contract, {"$ref": "./base.yaml", "name": "Overridden"})
+
+
+def _version_behind_a_pointer(contract: Path) -> None:
+    root = _root_doc()
+    root["labels"] = {"ver": "0.7.5"}
+    root["fluidVersion"] = {"$ref": "#/labels/ver"}
+    _dump(contract, root)
+
+
+@pytest.mark.parametrize(
+    "write_root",
+    [_root_that_is_a_ref_to_its_base, _version_behind_a_pointer],
+    ids=["root-is-a-ref", "version-is-a-pointer"],
+)
+def test_k13_the_version_is_read_from_the_root_as_composed(
+    tmp_path: Path, capsys: pytest.CaptureFixture, write_root: Callable[[Path], None]
+) -> None:
+    """The version is the one the whole contract has: a root that is a ``$ref`` to its base,
+    or a ``fluidVersion`` that is a same-document pointer, is composed before it is read."""
+    contract, fragment = _project(tmp_path)
+    write_root(contract)
+    assert _validate(capsys, contract)[0] == 0  # the whole contract reads 0.7.5 too
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    assert rc == 0, out + err
+    assert "(schema v0.7.5)" in out
+
+
+@pytest.mark.parametrize("text", ["[]", "null", '"0.7.6"'])
+def test_k13_a_json_root_that_is_not_an_object_is_named_as_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture, text: str
+) -> None:
+    fragment = _dump(tmp_path / "p" / "fragments" / "orders.yaml", _expose())
+    contract = tmp_path / "p" / "contract.fluid.json"
+    contract.write_text(text, encoding="utf-8")
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "schema_version_required" in flat
+    assert f"{contract.resolve()}, the nearest contract above it, cannot be read:" in flat
+    assert "object" in flat and "attribute" not in flat
+
+
 def test_k13_a_version_that_is_not_one_is_refused_cleanly(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
