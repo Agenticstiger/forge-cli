@@ -85,23 +85,7 @@ def run(args, logger: logging.Logger) -> int:
         # HTML index (human-readable). One static file; no external deps.
         index_html = _render_index_html(entries)
 
-        # Per-contract drill-in pages. Slug derived from the contract id
-        # (falls back to the file name). Each page links back to the index.
-        # Every contract has a row; a row with an error (the contract did not
-        # load, or could not be listed) has no page.
-        pages: list[tuple[str, str]] = []
-        for entry in entries:
-            path = entry["path"]
-            contract = contracts[path][0]
-            if entry.get("error") or not isinstance(contract, Mapping):
-                continue
-            try:
-                # From the same plain data as its index row: no set, no NaN, no
-                # integer too long to turn into text reaches the page.
-                page = _render_contract_html(_plain(contract), path)
-            except Exception as exc:  # noqa: BLE001 - say which contract, not just what broke
-                raise ValueError(f"{path}: {exc}") from exc
-            pages.append((f"contract-{slugs[path]}.html", page))
+        pages = _render_pages(entries, contracts, slugs)
 
         # Pages first and the index that links them last. A character UTF-8
         # cannot hold (a lone surrogate) is written as its ``\uXXXX`` text:
@@ -131,6 +115,33 @@ def run(args, logger: logging.Logger) -> int:
         return 0
     except Exception as e:
         raise CLIError(1, "docs_failed", {"error": str(e)})
+
+
+def _render_pages(
+    entries: list[dict[str, Any]],
+    contracts: dict[str, tuple[Any, Any]],
+    slugs: dict[str, str],
+) -> list[tuple[str, str]]:
+    """The per-contract drill-in pages, as ``(file name, html)``.
+
+    Slug derived from the contract id (falls back to the file name). Each page
+    links back to the index. Every contract has a row; a row with an error (the
+    contract did not load, or could not be listed) has no page.
+    """
+    pages: list[tuple[str, str]] = []
+    for entry in entries:
+        path = entry["path"]
+        contract = contracts[path][0]
+        if entry.get("error") or not isinstance(contract, Mapping):
+            continue
+        try:
+            # From the same plain data as its index row: no set, no NaN, no
+            # integer too long to turn into text reaches the page.
+            page = _render_contract_html(_plain(contract), path)
+        except Exception as exc:  # noqa: BLE001 - say which contract, not just what broke
+            raise ValueError(f"{path}: {exc}") from exc
+        pages.append((f"contract-{slugs[path]}.html", page))
+    return pages
 
 
 def _check_out(out: str) -> None:
