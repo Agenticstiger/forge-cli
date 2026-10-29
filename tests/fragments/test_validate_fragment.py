@@ -326,39 +326,46 @@ def _loose_fragment(tmp_path: Path) -> Path:
     return _dump(tmp_path / "loose" / "fragments" / "orders.yaml", _expose())
 
 
-def test_k13_without_a_root_contract_the_run_never_falls_back_to_an_older_schema(
-    tmp_path: Path, capsys: pytest.CaptureFixture
-) -> None:
-    rc, out, err = _validate(capsys, "--fragment", "expose", _loose_fragment(tmp_path))
-
-    assert "schema v0.7.4" not in out + err  # the silent retry draft 26 warned about
-    assert "retrying previous" not in out + err
-    assert rc in (0, 1)
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG K13-NO-ROOT-VERSION: with no root contract above the fragment and no "
-    "--schema-version, validate --fragment guesses the newest STABLE schema (0.7.5) and exits 0 "
-    "instead of asking for --schema-version (spec 9: the version comes from the flag or the "
-    "nearest root contract)",
-)
 def test_k13_without_a_root_contract_the_run_asks_for_a_schema_version(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
+    """No guess and no silent retry (the 0.7.4 fallback draft 26 warned about): the run
+    stops, says why, and says what to pass."""
     rc, out, err = _validate(capsys, "--fragment", "expose", _loose_fragment(tmp_path))
 
-    assert rc != 0
-    assert "--schema-version" in out + err
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "schema_version_required" in flat
+    assert "no contract.fluid.yaml above orders.yaml could be taken" in flat
+    assert "Pass --schema-version" in flat
+    assert "schema v0.7.4" not in flat and "retrying previous" not in flat
+
+
+def test_quiet_prints_a_version_below_the_minimum(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Every CLIError branch prints under ``--quiet``, not only the generic one."""
+    contract, _ = _project(tmp_path, version="0.7.5")
+
+    rc, out, err = _validate(capsys, contract, "--min-version", ">=0.7.6", "--quiet")
+
+    flat = " ".join((out + err).split())
+    assert rc == 2
+    assert "does not meet minimum requirement >=0.7.6" in flat and "💡" not in flat
+
+
+def test_k13_quiet_still_says_why_the_run_stopped(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``--quiet`` is "errors only": a run that stops says why, without the hints."""
+    rc, out, err = _validate(capsys, "--fragment", "expose", _loose_fragment(tmp_path), "--quiet")
+
+    flat = " ".join((out + err).split())
+    assert rc == 1
+    assert "schema_version_required" in flat and "Pass --schema-version" in flat
+    assert "💡" not in flat
 
 
 @pytest.mark.parametrize("root", ["none", "unreadable"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG K13-NO-ROOT-VERSION: with no readable root contract above it and no "
-    "--schema-version, a fragment valid in 0.7.6 is judged by the guessed newest STABLE schema "
-    "(0.7.5) and gets a false error ('id' was unexpected); an unreadable root is not mentioned",
-)
 def test_k13_a_fragment_valid_in_0_7_6_gets_no_false_error_from_a_guessed_older_schema(
     tmp_path: Path, capsys: pytest.CaptureFixture, root: str
 ) -> None:
@@ -409,6 +416,316 @@ def test_k13_the_flag_wins_over_the_root_contract_and_the_nearest_contract_wins_
     )
 
 
+def _root_without_version(contract: Path) -> None:
+    root = _root_doc()
+    del root["fluidVersion"]
+    _dump(contract, root)
+
+
+def _unreadable_root(contract: Path) -> None:
+    contract.write_text("fluidVersion: [\n", encoding="utf-8")
+
+
+def _root_with_dangling_version_ref(contract: Path) -> None:
+    root = _root_doc()
+    root["fluidVersion"] = {"$ref": "./v.yaml"}
+    _dump(contract, root)
+
+
+@pytest.mark.parametrize(
+    "write_root, why",
+    [
+        (_root_without_version, "declares no fluidVersion"),
+        (_unreadable_root, "does not load:"),
+        (_root_with_dangling_version_ref, "does not load: $ref target not found: ./v.yaml"),
+    ],
+    ids=["no-version", "unreadable", "dangling-version-ref"],
+)
+def test_k13_the_run_names_the_root_contract_that_gave_no_version(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    write_root: Callable[[Path], None],
+    why: str,
+) -> None:
+    """With no --schema-version the run asks for one, and says why the nearest root contract
+    gave none: it declares none, it does not load, or its fluidVersion ref is not there."""
+    contract, fragment = _project(tmp_path)
+    write_root(contract)
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "schema_version_required" in flat
+    assert f"{contract.resolve()}, the nearest contract above it, {why}" in flat
+    assert "Pass --schema-version" in flat
+
+
+def test_k13_a_root_that_does_not_compose_still_gives_its_version(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Only the version is read from the root. A dangling ref elsewhere in it (the fragment
+    under check may be the reason) does not stop the fragment from being checked."""
+    contract, fragment = _project(tmp_path, version="0.7.5")
+    root = _root_doc("0.7.5")
+    root["builds"] = [{"$ref": "./fragments/builds/not-written-yet.yaml"}]
+    _dump(contract, root)
+    assert _validate(capsys, contract)[0] == 1  # the contract itself does not load
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    assert rc == 0, out + err
+    assert "Valid expose fragment (schema v0.7.5)" in out
+
+
+def test_k13_a_version_kept_in_a_fragment_of_the_root_is_followed(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    contract, fragment = _project(tmp_path)
+    root = _root_doc()
+    root["fluidVersion"] = {"$ref": "./version.yaml"}
+    _dump(contract, root)
+    (contract.parent / "version.yaml").write_text("'0.7.4'\n", encoding="utf-8")
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    assert rc == 0, out + err
+    assert "(schema v0.7.4)" in out
+
+
+def test_k13_the_version_of_a_json_root_contract_is_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    fragment = _dump(tmp_path / "p" / "fragments" / "orders.yaml", _expose())
+    (tmp_path / "p" / "contract.fluid.json").write_text(
+        json.dumps(_root_doc("0.7.4")), encoding="utf-8"
+    )
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    assert rc == 0, out + err
+    assert "(schema v0.7.4)" in out
+
+
+def _root_that_is_a_ref_to_its_base(contract: Path) -> None:
+    _dump(contract.parent / "base.yaml", _root_doc("0.7.4"))
+    _dump(contract, {"$ref": "./base.yaml", "name": "Overridden"})
+
+
+def _version_behind_a_pointer(contract: Path) -> None:
+    root = _root_doc()
+    root["labels"] = {"ver": "0.7.4"}
+    root["fluidVersion"] = {"$ref": "#/labels/ver"}
+    _dump(contract, root)
+
+
+@pytest.mark.parametrize(
+    "write_root",
+    [_root_that_is_a_ref_to_its_base, _version_behind_a_pointer],
+    ids=["root-is-a-ref", "version-is-a-pointer"],
+)
+def test_k13_the_version_is_read_from_the_root_as_composed(
+    tmp_path: Path, capsys: pytest.CaptureFixture, write_root: Callable[[Path], None]
+) -> None:
+    """The version is the one the whole contract has: a root that is a ``$ref`` to its base,
+    or a ``fluidVersion`` that is a same-document pointer, is composed before it is read. 0.7.4 is never the version a guess would pick.
+    """
+    contract, fragment = _project(tmp_path)
+    write_root(contract)
+    assert _validate(capsys, contract)[0] == 0  # the whole contract reads 0.7.4 too
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    assert rc == 0, out + err
+    assert "(schema v0.7.4)" in out
+
+
+@pytest.mark.parametrize("text", ["[]", "null", '"0.7.6"'])
+def test_k13_a_json_root_that_is_not_an_object_is_named_as_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture, text: str
+) -> None:
+    fragment = _dump(tmp_path / "p" / "fragments" / "orders.yaml", _expose())
+    contract = tmp_path / "p" / "contract.fluid.json"
+    contract.write_text(text, encoding="utf-8")
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "schema_version_required" in flat
+    assert f"{contract.resolve()}, the nearest contract above it, does not load:" in flat
+    assert "object" in flat and "attribute" not in flat
+
+
+def test_k13_a_root_version_ref_is_confined_as_every_ref_is(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    contract, fragment = _project(tmp_path)
+    (tmp_path / "outside.yaml").write_text("'0.7.6'\n", encoding="utf-8")
+    root = _root_doc()
+    root["fluidVersion"] = {"$ref": "../outside.yaml"}
+    _dump(contract, root)
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "schema_version_required" in flat
+    assert "escapes the ref root" in flat and "Valid expose fragment" not in flat
+
+
+def test_k13_a_version_behind_a_ref_needs_the_rest_of_the_root_to_load(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The trade-off of reading the version as the whole contract would: a version kept
+    behind a ``$ref`` is read from the composed root, so a part of the root that does not
+    compose stops the lookup, and the run says which part (a written-out version does not
+    need the rest of the root, see the K13 'does not compose' test)."""
+    contract, fragment = _project(tmp_path)
+    root = _root_doc()
+    root["fluidVersion"] = {"$ref": "./version.yaml"}
+    root["builds"] = [{"$ref": "./builds/missing.yaml"}]
+    _dump(contract, root)
+    (contract.parent / "version.yaml").write_text("'0.7.4'\n", encoding="utf-8")
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "schema_version_required" in flat
+    assert "does not load: $ref target not found: ./builds/missing.yaml" in flat
+    assert "Pass --schema-version" in flat
+
+
+def test_k13_the_message_has_one_period_where_the_loader_ended_with_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    contract, fragment = _project(tmp_path)
+    (tmp_path / "outside.yaml").write_text("'0.7.6'\n", encoding="utf-8")
+    root = _root_doc()
+    root["fluidVersion"] = {"$ref": "../outside.yaml"}
+    _dump(contract, root)
+
+    _, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    flat = " ".join((out + err).split())
+
+    assert "escapes the ref root" in flat and ".. Pass --schema-version" not in flat
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--fragment", "a/\x1b]0;PWNED\x1b\\b.yaml"],
+        ["--fragment", "x\x1b[2J"],
+    ],
+    ids=["kind-read-as-a-path", "kind"],
+)
+def test_k14x_a_terminal_escape_in_the_kind_is_printed_as_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch, argv: List[str]
+) -> None:
+    """Argv is echoed in the error: an escape sequence in it is spelled, never sent."""
+    monkeypatch.chdir(tmp_path)
+
+    rc, out, err = _validate(capsys, *argv)
+
+    assert rc == 1 and "fragment_file_required" in out + err
+    assert "\x1b" not in out + err and "\\x1b" in out + err
+
+
+def test_k18_a_terminal_escape_in_a_contract_value_is_printed_as_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A ``$ref`` that names a missing file is quoted in ``contract_load_failed``: an escape
+    sequence in it (a contract from a pull request) never reaches the terminal."""
+    expose = _expose()
+    expose["binding"] = {"$ref": "./nope\x1b]0;PWNED\x1b\\.yaml"}
+    fragment = _dump(tmp_path / "loose" / "e.yaml", expose)
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment, "--schema-version", "0.7.6")
+
+    assert rc == 1 and "contract_load_failed" in out + err
+    assert "\x1b" not in out + err
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        "schema_version_required",
+        "fragment_file_required",
+        "fragment_bundle_unsupported",
+        "fragment_kind_unknown",
+        "fragment_env_unsupported",
+        "fragment_has_pointers",
+        "schema_not_available",
+    ],
+)
+def test_every_refusal_of_a_fragment_run_carries_guidance(event: str) -> None:
+    from fluid_build._error_catalog import suggestions_for
+
+    assert suggestions_for(event)
+
+
+def test_k13_a_root_over_the_size_cap_is_not_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    from fluid_build.util.safe_yaml import MAX_YAML_BYTES
+
+    contract, fragment = _project(tmp_path)
+    padding = "#" + "x" * 1023 + "\n"
+    text = contract.read_text(encoding="utf-8")
+    contract.write_text(text + padding * (MAX_YAML_BYTES // len(padding) + 1), encoding="utf-8")
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "schema_version_required" in flat
+    assert f"over the {MAX_YAML_BYTES}-byte" in flat
+
+
+@pytest.mark.parametrize("value", [7, ["0.7.6"], False])
+def test_k13_a_root_version_that_is_not_text_is_refused_as_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture, value: Any
+) -> None:
+    contract, fragment = _project(tmp_path)
+    root = _root_doc()
+    root["fluidVersion"] = value
+    _dump(contract, root)
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
+
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "invalid_schema_version" in flat
+    assert "cli_unhandled_exception" not in flat
+
+
+def test_k13_a_version_that_is_not_one_is_refused_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    _, fragment = _project(tmp_path)
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", fragment, "--schema-version", "bogus")
+
+    flat = " ".join((out + err).split())
+    assert rc == 1
+    assert "invalid_schema_version" in flat and "version: bogus" in flat
+    assert "cli_unhandled_exception" not in flat
+
+
+def test_k13_a_fragment_that_does_not_load_is_told_so_before_a_version_is_asked_for(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """With no root contract and no ``--schema-version`` the run asks for the version, but
+    first it loads the file: what is wrong with the fragment itself comes first."""
+    escaping = _dump(
+        tmp_path / "loose" / "d" / "cols.yaml", [{"name": "id", "type": {"$ref": "../x.md"}}]
+    )
+    broken = _dump(tmp_path / "loose" / "e" / "orders.yaml", _expose())
+    broken.write_text("exposeId: [\n", encoding="utf-8")
+
+    for fragment, said in ((escaping, "escapes the ref root"), (broken, "contract_load_failed")):
+        rc, out, err = _validate(capsys, "--fragment", "schema", fragment)
+
+        assert rc == 1 and said in " ".join((out + err).split())
+        assert "schema_version_required" not in out + err
+
+
 # ── K-14 ────────────────────────────────────────────────────────────────
 
 
@@ -446,12 +763,6 @@ def test_k14_a_kind_the_schema_version_lacks_is_an_error_naming_the_version(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG K14-NO-FILE: validate --fragment KIND with the file left out validates the "
-    "contract found in the working directory as if it were the fragment (6 misleading errors, "
-    "schema 0.7.5) instead of asking for the fragment file",
-)
 def test_k14x_a_fragment_run_without_a_file_does_not_validate_the_contract_beside_it(
     tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -465,6 +776,25 @@ def test_k14x_a_fragment_run_without_a_file_does_not_validate_the_contract_besid
     assert "required" in (out + err).lower()
 
 
+def test_k14x_a_fragment_run_without_a_file_is_refused_before_workspace_discovery(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In a workspace, the fill-in is every product: a missing file must stop the run before
+    discovery, or an empty ``$FILE`` in CI turns into a green whole-workspace validation."""
+    workspace = tmp_path / "ws"
+    _project(workspace, name="a")
+    _project(workspace, name="b")
+    (workspace / "fluid.workspace.yaml").write_text(
+        "schema_version: 1\nkind: WorkspaceConfig\nworkspace:\n  name: demo\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(workspace)
+
+    rc, out, err = _validate(capsys, "--fragment", "expose")
+
+    assert rc == 1 and "fragment_file_required" in out + err
+    assert "Validating" not in out + err and "products valid" not in out + err
+
+
 def test_k14x_an_empty_kind_is_refused_not_ignored(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
@@ -472,8 +802,46 @@ def test_k14x_an_empty_kind_is_refused_not_ignored(
 
     rc, out, err = _validate(capsys, "--fragment", "", fragment)
 
-    assert rc != 0
-    assert "kinds:" in out + err  # the valid kinds are listed, as for any unknown kind
+    flat = " ".join((out + err).split())
+    assert rc != 0  # SG-30: an unknown kind is a refusal, whatever its exit code
+    assert "fragment_kind_unknown" in flat
+    assert "'' is not a kind of fragment in schema 0.7.6" in flat
+    assert "kinds:" in flat  # the valid kinds are listed, as for any unknown kind
+
+
+@pytest.mark.parametrize(
+    ("kind", "shown"), [("expose", "expose"), ("", "KIND")], ids=["a-kind", "an-empty-kind"]
+)
+def test_k14x_the_error_for_a_missing_file_says_how_to_call_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    shown: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)  # no contract anywhere: the file is still what is missing
+
+    rc, out, err = _validate(capsys, "--fragment", kind)
+
+    assert rc == 1
+    assert "fragment_file_required" in out + err
+    assert f"fluid validate --fragment {shown} <file>" in " ".join((out + err).split())
+
+
+@pytest.mark.parametrize("name", ["orders.yaml", "orders.JSON", "exposes/orders"])
+def test_k14x_a_kind_left_out_is_named_as_the_file_it_was_read_as(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """``--fragment <file>`` with the KIND left out: the file was read as the KIND, and the
+    error says so instead of asking for a file that was given."""
+    monkeypatch.chdir(tmp_path)
+
+    rc, out, err = _validate(capsys, "--fragment", name)
+
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "fragment_file_required" in flat
+    assert f"--fragment takes a KIND, then the file, and '{name}' reads as the file" in flat
+    assert f"fluid validate --fragment KIND {name}" in flat
 
 
 # ── K-15 ────────────────────────────────────────────────────────────────
@@ -671,6 +1039,21 @@ def test_k18_a_fragment_run_refuses_an_env(tmp_path: Path, capsys: pytest.Captur
     assert "fragment_env_unsupported" in out + err and "--env" in out + err
 
 
+@pytest.mark.parametrize("name", ["b.tgz", "b.tar.gz", "B.TGZ"])
+def test_k18_a_fragment_run_refuses_a_bundle(
+    tmp_path: Path, capsys: pytest.CaptureFixture, name: str
+) -> None:
+    """A bundle given with --fragment is refused, never validated as a bundle in its place."""
+    bundle = tmp_path / name
+    bundle.write_bytes(b"\x1f\x8b not read")
+
+    rc, out, err = _validate(capsys, "--fragment", "expose", bundle, "--format", "json")
+
+    assert rc == 1
+    assert "fragment_bundle_unsupported" in out + err
+    assert "bundleDigest" not in out
+
+
 def test_k18_json_and_yml_fragments_validate_like_yaml(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
@@ -719,20 +1102,25 @@ def test_k19_the_json_output_has_the_version_and_the_errors(
     assert len(document["errors"]) == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG K19-JSON-FRAGMENT: --format json for --fragment has no 'fragment' field, so a "
-    "consumer cannot tell which kind of fragment the result is about (catalog K-19; not in spec 9)",
-)
-def test_k19_the_json_output_names_the_fragment(
+def test_k19_the_json_output_names_the_kind_whatever_the_verdict(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    _, fragment = _project(tmp_path)
+    contract, fragment = _project(tmp_path)
+    wrong = _dump(tmp_path / "wrong.yaml", [{"rule": "r", "expression": "x", "severity": "loud"}])
 
-    _, out, _ = _validate(capsys, "--fragment", "expose", fragment, "--format", "json")
+    ok = json.loads(_validate(capsys, "--fragment", "expose", fragment, "--format", "json")[1])
+    bad = json.loads(
+        _validate(
+            capsys, "--fragment", "quality", wrong, "--schema-version", "0.7.6", "--format", "json"
+        )[1]
+    )
 
-    document = json.loads(out)
-    assert "fragment" in document
+    assert (ok["valid"], ok["fragment"], ok["schema_version"]) == (True, "expose", "0.7.6")
+    assert (bad["valid"], bad["fragment"], bad["schema_version"]) == (False, "quality", "0.7.6")
+    assert bad["errors"]
+    # A whole contract is not a fragment: its document is the one it always was.
+    whole = json.loads(_validate(capsys, contract, "--format", "json")[1])
+    assert list(whole) == ["valid", "schema_version", "errors", "warnings", "validation_time"]
 
 
 # ── K-20 ────────────────────────────────────────────────────────────────
@@ -816,13 +1204,3 @@ def test_a_contract_in_a_home_or_temp_root_is_never_a_fragments_contract(
     monkeypatch.setattr(_duckdb_sandbox, "_home_dirs", lambda: (str(home),))
 
     assert _nearest_contract(fragment) is None
-
-
-def test_a_contract_whose_fluid_version_is_a_ref_gives_no_version(tmp_path: Path) -> None:
-    """The nearest contract keeps fluidVersion in a fragment: no version is read from it
-    (the run then asks for --schema-version), and nothing crashes."""
-    from fluid_build.cli.validate import _contract_version
-
-    contract = tmp_path / "contract.fluid.yaml"
-    contract.write_text("fluidVersion: {$ref: ./v.yaml}\nid: x\n", encoding="utf-8")
-    assert _contract_version(contract) is None
