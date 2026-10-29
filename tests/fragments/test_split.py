@@ -20,9 +20,10 @@ every environment, and splitting the result again changes nothing. ``Pair``
 builds the flat contract and its copy to split; ``split_and_check`` runs the
 split on the copy and asserts that invariant.
 
-Findings are kept as ``xfail(strict=True)`` tests that assert the behaviour
-the catalog asks for; characterisation tests pin today's behaviour where the
-catalog has no oracle (SPEC GAP SG-32, SG-18).
+Findings were kept as ``xfail(strict=True)`` tests that asserted the
+behaviour the catalog asks for, until each was fixed: none is left, and each
+test now passes and names its finding. Characterisation tests pin today's
+behaviour where the catalog has no oracle (SPEC GAP SG-32, SG-18).
 """
 
 from __future__ import annotations
@@ -955,22 +956,59 @@ def test_i09_windows_device_names_are_not_avoided_today(tmp_path: Path) -> None:
     ]
 
 
-def test_i09_a_300_character_id_cannot_be_written_but_the_dry_run_says_it_can(
+def test_i09_a_300_character_id_gets_a_short_name_the_dry_run_lists(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """SG-32 characterisation (finding SP-07): the slug is not shortened, so the
-    file name is over 255 bytes; ``--dry-run`` lists it and exits 0, the real
-    run fails with ENAMETOOLONG."""
+    """Finding SP-07: a slug over 100 characters is cut short and ends in a hash
+    of the whole id, so every name fits (255 bytes at most); two long ids that
+    start alike get a name each, and the dry run lists what the real run writes."""
     big = "a" * 300
-    pair = solo(tmp_path, f"id: x\nbuilds:\n  - id: {big}\n    engine: sql\n")
-    before = files_of(pair.split)
+    text = (
+        f"id: x\nbuilds:\n  - id: {big}\n    engine: sql\n    properties: {{sql: SELECT 1}}\n"
+        f"  - id: {big}b\n    engine: sql\nexposes:\n  - exposeId: {big}\n    kind: table\n"
+        f"extensions:\n  {big}: {{a: 1}}\n"
+    )
+    pair = solo(tmp_path, text)
+    capsys.readouterr()
 
-    assert split(pair.split_contract, "--dry-run") == 0
-    assert big in capsys.readouterr().err
-    assert split(pair.split_contract) == 1
+    assert split(pair.split_contract, "--dry-run", "--parts", ALL_PARTS) == 0
+    listed = _listed(capsys.readouterr().err)
 
-    assert "File name too long" in capsys.readouterr().err
-    assert files_of(pair.split) == before
+    after = split_and_check(pair, ALL_PARTS)
+
+    def short(name: str) -> str:
+        return f"{'a' * 91}-{hashlib.sha256(name.encode()).hexdigest()[:8]}"
+
+    created = new_files(pair, after)
+    assert listed == created
+    assert created == sorted(
+        [
+            f"fragments/builds/{short(big)}.yaml",
+            f"fragments/builds/{short(big + 'b')}.yaml",
+            f"fragments/exposes/{short(big)}.yaml",
+            f"fragments/extensions/{short(big)}.yaml",
+            f"sql/{short(big)}.sql",
+        ]
+    )
+    assert all(len(rel.rsplit("/", 1)[1].encode("utf-8")) <= 255 for rel in created)
+    composed = compose_contract(pair.split_contract).document
+    assert [b["id"] for b in composed["builds"]] == [big, big + "b"]
+    assert text_of(after, f"fragments/builds/{short(big)}.yaml").startswith(f"# Build: {big}\n")
+
+
+@pytest.mark.parametrize("length", [100, 101])
+def test_i09_a_slug_is_cut_only_past_100_characters(length: int) -> None:
+    from fluid_build.cli.forge_contract_fragments import _slugify
+
+    name = ("Ab" * 51)[:length]
+
+    slug = _slugify(name)
+
+    assert len(slug) == 100
+    if length == 100:
+        assert slug == name.lower()
+    else:
+        assert slug == name.lower()[:91] + "-" + hashlib.sha256(name.encode()).hexdigest()[:8]
 
 
 # ── I-10..I-15: the sql part ────────────────────────────────────────────
@@ -1233,18 +1271,36 @@ def test_i10_every_block_scalar_chomping_survives_a_split(
     ],
     ids=["build-then-build", "last-item-then-key", "section-then-key"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-04: a keep-chomped block scalar (|+, >+) that ends a moved part loses its "
-    "trailing blank lines; split refuses ('does not compose to the original') instead of "
-    "moving them with it or splitting the data",
-)
 def test_i10_a_keep_chomped_scalar_ending_a_moved_part_splits(
     tmp_path: Path, indicator: str, tail: str
 ) -> None:
     pair = solo(tmp_path, "id: x\n" + tail.replace("{i}", indicator))
 
     split_and_check(pair, "builds,sovereignty")
+
+
+@pytest.mark.parametrize("line_end", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("parts", ["builds", "sql", "builds,sql"])
+def test_i10_the_blank_lines_of_a_keep_chomped_scalar_move_with_it(
+    tmp_path: Path, line_end: str, parts: str
+) -> None:
+    """Finding SP-04: the blank lines after ``|+`` text are its value; they go to
+    the fragment, and the root keeps one line end after the ref."""
+    text = (
+        "id: x\nbuilds:\n  - id: a\n    properties:\n      sql: |+\n        SELECT 1\n\n\n"
+        "exposes: []\n"
+    ).replace("\n", line_end)
+    pair = solo(tmp_path, text)
+
+    after = split_and_check(pair, parts)
+
+    assert compose_contract(pair.split_contract).document["builds"][0]["properties"] == {
+        "sql": "SELECT 1\n\n\n"
+    }
+    assert text_of(after, NAME).endswith(f"{line_end}exposes: []{line_end}")
+    assert f"{line_end}{line_end}exposes" not in text_of(after, NAME)
+    if line_end == "\r\n":
+        assert_one_line_end(after)
 
 
 # ── I-16..I-20: quality, schema, extensions, description, part names ────
@@ -1462,12 +1518,9 @@ REFS_IN_PARTS_FILES: Dict[str, str] = {
 }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-02: a relative $ref inside a moved part is copied unchanged into the fragment, "
-    "so it points one or two directories off; split refuses instead of rebasing it",
-)
 def test_i21_refs_in_moved_parts_are_rebased_to_the_fragment(tmp_path: Path) -> None:
+    """Finding SP-02: a relative ref in a part that moves names the same file
+    from the fragment; its quoting and a ``#/pointer`` after the file stay."""
     pair = make_pair(tmp_path, REFS_IN_PARTS_FILES)
 
     after = split_and_check(pair, envs=ENVS)
@@ -1475,13 +1528,11 @@ def test_i21_refs_in_moved_parts_are_rebased_to_the_fragment(tmp_path: Path) -> 
     assert "$ref: ../../sql/transform.sql" in text_of(after, "fragments/builds/transform.yaml")
     assert "../../schemas/orders.yaml" in text_of(after, "fragments/exposes/orders.yaml")
     assert "../../cols.yaml#/a" in text_of(after, "fragments/exposes/totals.yaml")
+    assert '- {$ref: "../../cols.yaml#/a", description: x}' in text_of(
+        after, "fragments/exposes/totals.yaml"
+    )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-02: split in two passes (--parts sql, then --parts builds) fails: the sql ref "
-    "written by the first pass is not rebased when the second moves the build",
-)
 def test_i21_sql_first_then_builds_is_a_two_pass_split_that_works(tmp_path: Path) -> None:
     pair = make_pair(
         tmp_path, {NAME: "id: x\nbuilds:\n  - id: t\n    properties: {sql: SELECT 1}\n"}
@@ -1491,19 +1542,342 @@ def test_i21_sql_first_then_builds_is_a_two_pass_split_that_works(tmp_path: Path
     assert split(pair.split_contract, "--parts", "builds") == 0
 
     assert_same_bundle(pair)
+    # The second pass rebased the ref the first one wrote: the two passes end
+    # where one split of both parts does.
+    one_pass = make_pair(tmp_path / "one", {NAME: pair.flat_contract.read_text("utf-8")})
+    assert split(one_pass.split_contract, "--parts", "builds,sql") == 0
+    assert files_of(pair.split) == files_of(one_pass.split)
 
 
-def test_i21_a_refused_split_for_refs_it_cannot_rebase_changes_no_file(
+#: A file ref whose pointer runs through a part that moves: the place it names
+#: is in the root's text only until the split, so no rebasing can keep it.
+#: (A same-document pointer, ``#/builds/0/id``, survives any split: C-24.)
+REF_INTO_A_MOVED_PART = """\
+id: x
+builds:
+  - id: t
+    engine: sql
+exposes:
+  - exposeId: o
+    kind: table
+    description: {$ref: "./contract.fluid.yaml#/builds/0/id"}
+"""
+
+
+def test_i21_a_file_ref_into_a_part_that_moves_refuses_the_split_and_changes_no_file(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Today's safe outcome: the split is refused before anything is changed."""
-    pair = make_pair(tmp_path, REFS_IN_PARTS_FILES)
+    """What rebasing cannot fix (SP-02): the ref is rebased, but the place its
+    pointer names leaves the root, so the split does not compose to the original;
+    it is refused and taken back."""
+    pair = solo(tmp_path, REF_INTO_A_MOVED_PART)
     files = files_of(pair.split)
 
     assert split(pair.split_contract) == 1
 
-    assert "Split not written" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "Split not written" in err and "../../contract.fluid.yaml#/builds/0/id" in err
     assert files_of(pair.split) == files
+
+
+@pytest.mark.parametrize("parts", [None, "builds,exposes,schema"])
+def test_i21_the_data_split_rebases_the_refs_in_moved_parts_too(
+    tmp_path: Path, parts: Optional[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-02 in the data split: a JSON root, and a YAML root with an alias, are
+    split as parsed data, and their refs are rebased the same way."""
+    as_json = json.dumps(yaml.safe_load(REFS_IN_PARTS), indent=2) + "\n"
+    with_alias = REFS_IN_PARTS.replace("id: x\n", "id: x\nlabels: &l {a: 1}\ntags: *l\n")
+    for name, root in (("json", as_json), ("alias", with_alias)):
+        files = {**REFS_IN_PARTS_FILES, NAME: root}
+        contract = JSON_NAME if name == "json" else NAME
+        if name == "json":
+            files[JSON_NAME] = files.pop(NAME)
+        pair = make_pair(tmp_path / name, files, contract)
+        capsys.readouterr()
+
+        after = split_and_check(pair, parts)
+
+        def loaded(rel: str) -> Any:
+            return yaml.safe_load(text_of(after, rel))
+
+        build = loaded("fragments/builds/transform.yaml")
+        assert build["properties"]["sql"] == {"$ref": "../../sql/transform.sql"}
+        orders = loaded("fragments/exposes/orders.yaml")
+        assert orders["contract"]["schema"] == {"$ref": "../../schemas/orders.yaml"}
+        totals = loaded("fragments/exposes/totals.yaml")["contract"]["schema"]
+        if parts:  # the columns went on to a file of their own, the ref with them
+            assert totals == {"$ref": "../schemas/totals.yaml"}
+            totals = loaded("fragments/schemas/totals.yaml")
+        assert totals == [{"$ref": "../../cols.yaml#/a", "description": "x"}]
+        if name == "alias":
+            assert "were not kept" in capsys.readouterr().err  # it was the data split
+
+
+def test_i21_the_dry_run_of_a_split_with_refs_lists_what_the_real_run_writes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-02 repro: the dry run listed the fragment and exited 0 while the real run
+    refused; now both agree."""
+    text = "id: x\nbuilds:\n  - id: t\n    engine: sql\n    properties:\n      sql: {$ref: ./sql/t.sql}\n"
+    pair = make_pair(tmp_path, {NAME: text, "sql/t.sql": "SELECT 1\n"})
+    capsys.readouterr()
+
+    assert split(pair.split_contract, "--dry-run") == 0
+    listed = _listed(capsys.readouterr().err)
+    after = split_and_check(pair)
+
+    assert listed == new_files(pair, after) == ["fragments/builds/t.yaml"]
+    assert "sql: {$ref: ../../sql/t.sql}" in text_of(after, "fragments/builds/t.yaml")
+
+
+@pytest.mark.parametrize(
+    "ref,container,rebased",
+    [
+        ("./sql/t.sql", "fragments/builds/t.yaml", "../../sql/t.sql"),
+        ("sql/t.sql", "fragments/builds/t.yaml", "../../sql/t.sql"),
+        ("./cols.yaml#/a/0", "fragments/exposes/o.yaml", "../../cols.yaml#/a/0"),
+        ("../shared/p.yaml", "fragments/builds/t.yaml", "../../../shared/p.yaml"),
+        ("./fragments/x.yaml", "fragments/sovereignty.yaml", "./x.yaml"),
+        ("fragments/other/x.yaml", "fragments/builds/t.yaml", "../other/x.yaml"),
+        # The ref's own path is kept as written: a ".." in it is not folded away.
+        ("sql/../sql/t.sql", "fragments/builds/t.yaml", "../../sql/../sql/t.sql"),
+        ("./sql/t.sql", "sql/t.yaml", "./t.sql"),
+        ("./x.yaml", None, "./x.yaml"),
+        ("#/builds/0/id", "fragments/builds/t.yaml", "#/builds/0/id"),
+        ("https://example.com/x.yaml", "fragments/builds/t.yaml", "https://example.com/x.yaml"),
+        ("//host/x.yaml", "fragments/builds/t.yaml", "//host/x.yaml"),
+        ("/abs/x.yaml", "fragments/builds/t.yaml", "/abs/x.yaml"),
+        ("C:\\x.yaml", "fragments/builds/t.yaml", "C:\\x.yaml"),
+        (5, "fragments/builds/t.yaml", 5),
+    ],
+)
+def test_i21_a_ref_is_rebased_by_its_path_alone(ref: Any, container: Any, rebased: Any) -> None:
+    from fluid_build.cli.forge_contract_fragments import rebased_ref
+
+    assert rebased_ref(ref, container) == rebased
+
+
+@pytest.mark.parametrize(
+    "lead,rest,rebased",
+    [
+        ("./", "x.yaml#/a", "../../x.yaml#/a"),
+        (".//", "x.yaml", "../../x.yaml"),
+        ("./", ".x/y.yaml", "../../.x/y.yaml"),  # a dot that starts a name stays
+        ("./", "../x.yaml", "../../../x.yaml"),
+    ],
+)
+def test_i21_the_dot_steps_a_ref_starts_with_are_dropped_in_linear_time(
+    lead: str, rest: str, rebased: str
+) -> None:
+    """``./`` steps were stripped one at a time, a copy of the rest of the ref per
+    step: 200,000 of them took seconds. They are found in one pass now."""
+    from fluid_build.cli.forge_contract_fragments import rebased_ref
+
+    started = time.monotonic()
+
+    assert rebased_ref(lead * 200_000 + rest, "fragments/builds/t.yaml") == rebased
+    assert time.monotonic() - started < 1
+
+
+def test_i21_the_dot_steps_are_found_in_memory_that_does_not_grow_with_them() -> None:
+    """The steps were then matched with ``(?:\\./+)+``: linear in time, but the
+    match kept state for every step, a peak of 124 MB for the million here (330
+    MB of RSS for 2.5 million). The scan that finds them keeps nothing per step;
+    a rebase as a whole holds what reading the path for the ref root's own
+    checks takes, a few bytes per character."""
+    import tracemalloc
+
+    from fluid_build.cli.forge_contract_fragments import _dot_steps, rebased_ref
+
+    path = "./" * 1_000_000 + "x.yaml"
+    ref = path + "#/a"
+    tracemalloc.start()
+    try:
+        assert _dot_steps(path) == 2_000_000
+        scan_peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.reset_peak()
+        assert rebased_ref(ref, "fragments/builds/t.yaml") == "../../x.yaml#/a"
+        rebase_peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert scan_peak < 1_000_000
+    assert rebase_peak < 32_000_000
+
+
+def test_i21_the_dot_step_scan_ends_where_the_pattern_it_replaced_did() -> None:
+    """Every path of up to eight ``.``, ``/`` and ``x``: the scan finds the steps
+    the pattern ``(?:\\./+)+`` matched, no more and no fewer."""
+    import itertools
+
+    from fluid_build.cli.forge_contract_fragments import _dot_steps
+
+    pattern = re.compile(r"(?:\./+)+")
+    for length in range(9):
+        for chars in itertools.product("./x", repeat=length):
+            path = "".join(chars)
+            matched = pattern.match(path)
+            assert _dot_steps(path) == (matched.end() if matched else 0), path
+
+
+def test_i21_the_dict_level_splitter_rebases_a_ref_once_and_never_its_own() -> None:
+    """The sql ref split writes into the build's file names it from there already;
+    only the ref that was in the contract is rebased."""
+    from fluid_build.cli.forge_contract_fragments import split_contract_to_fragments
+
+    contract = {
+        "builds": [
+            {"id": "a", "properties": {"sql": "SELECT 1\n", "parameters": {"$ref": "./p.yaml"}}}
+        ]
+    }
+
+    root, files = split_contract_to_fragments(contract, ("builds", "sql"))
+
+    build = yaml.safe_load(files["fragments/builds/a.yaml"])
+    assert build["properties"] == {
+        "sql": {"$ref": "../../sql/a.sql"},
+        "parameters": {"$ref": "../../p.yaml"},
+    }
+    assert contract["builds"][0]["properties"]["parameters"] == {"$ref": "./p.yaml"}  # unchanged
+
+
+@pytest.mark.parametrize(
+    "written,rebased",
+    [
+        ("{$ref: ./p.yaml}  # plain", "{$ref: ../../p.yaml}  # plain"),
+        ("{$ref: './p.yaml'}  # single", "{$ref: '../../p.yaml'}  # single"),
+        ('{"$ref": "./p.yaml"}  # double', '{"$ref": "../../p.yaml"}  # double'),
+        ("{$ref: !!str ./p.yaml}  # tagged", "{$ref: ../../p.yaml}  # tagged"),
+        ("\n        $ref: ./p.yaml  # block", "\n    $ref: ../../p.yaml  # block"),
+        # A plain one whose new path needs quotes gets double ones: a "#" in it,
+        # or a blank, with a letter that is not ASCII written as it is.
+        ("{$ref: ./p.yaml#/mode}  # hash", '{$ref: "../../p.yaml#/mode"}  # hash'),
+        ("{$ref: ./my é.yaml}  # blank", '{$ref: "../../my é.yaml"}  # blank'),
+    ],
+    ids=[
+        "plain",
+        "single-quoted",
+        "double-quoted",
+        "tagged",
+        "block-mapping",
+        "plain-needing-quotes",
+        "plain-with-a-blank-and-a-letter-not-ascii",
+    ],
+)
+def test_i21_a_rebased_ref_keeps_its_quoting_where_it_can_and_every_comment(
+    tmp_path: Path, written: str, rebased: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-02 in the text splice: only the ref's scalar is rewritten, in the
+    quoting it was written in where the new path allows it (a tag on it goes:
+    the string is a string)."""
+    text = f"# head\nid: x\nbuilds:\n  - id: a\n    properties:\n      parameters: {written}\n"
+    files = {NAME: text, "p.yaml": "mode: full\n", "my é.yaml": "mode: full\n"}
+    pair = make_pair(tmp_path, files)
+    capsys.readouterr()
+
+    after = split_and_check(pair)
+
+    assert f"\nproperties:\n  parameters: {rebased}\n" in text_of(after, "fragments/builds/a.yaml")
+    assert_comments_conserved(text, after)
+    assert "were not kept" not in capsys.readouterr().err
+
+
+#: Characters a line can hold without showing them, or showing other text than
+#: it holds: bidi controls (RLO, LRI and PDI, LRM, ALM), zero-width ones (ZWSP,
+#: ZWJ), a soft hyphen, a private-use and an unassigned code point.
+UNSEEN = "\u202e\u2066\u2069\u200e\u061c\u200b\u200d\xad\ue000\u0378"
+
+
+@pytest.mark.parametrize("char", list(UNSEEN), ids=lambda c: f"U+{ord(c):04X}")
+def test_i21_a_rebased_ref_holding_a_character_that_hides_is_written_escaped(char: str) -> None:
+    """Round-2 review: the rebased ref's double quotes were written with
+    ``allow_unicode``, which PyYAML takes to mean every one of these as it is: a
+    Trojan-Source-style line in the fragment. A value that is not all printable
+    is escaped whole now; one that is keeps its letters (``é``) as they were."""
+    from fluid_build.cli._split_text import _double_quoted
+
+    hidden = _double_quoted(f"../../a{char}é.yaml")
+    shown = _double_quoted("../../aé.yaml")
+
+    assert hidden.isascii()  # every character escaped (\u202E, \xAD, ...)
+    assert yaml.safe_load(hidden) == f"../../a{char}é.yaml"
+    assert shown == '"../../aé.yaml"'
+
+
+def test_i21_a_moved_ref_whose_file_name_holds_an_rlo_is_never_written_raw(
+    tmp_path: Path,
+) -> None:
+    """The same, end to end: a ref the contract escapes (``\\u202E``) stays escaped
+    in the fragment it moves to; no file the split writes holds the RLO itself."""
+    text = (
+        'id: x\nbuilds:\n  - id: a\n    properties:\n      parameters: {$ref: "./p\\u202Eq.yaml"}\n'
+    )
+    pair = make_pair(tmp_path, {NAME: text, "p\u202eq.yaml": "mode: full\n"})
+
+    after = split_and_check(pair)
+
+    assert 'parameters: {$ref: "../../p\\u202Eq.yaml"}' in text_of(after, "fragments/builds/a.yaml")
+    assert not [rel for rel, content in after.items() if "\u202e".encode("utf-8") in content]
+
+
+def test_i21_a_ref_written_as_a_block_scalar_is_rebased_by_the_data_split(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A block scalar's span runs into the lines after it, so its text is not
+    rewritten: the data split rebases it, and says the comments were not kept."""
+    text = "id: x\nbuilds:\n  - id: a\n    properties:\n      parameters:\n        $ref: |-\n          ./p.yaml\n"
+    pair = make_pair(tmp_path, {NAME: text, "p.yaml": "mode: full\n"})
+    capsys.readouterr()
+
+    after = split_and_check(pair)
+
+    build = yaml.safe_load(text_of(after, "fragments/builds/a.yaml"))
+    assert build["properties"]["parameters"] == {"$ref": "../../p.yaml"}
+    assert "a $ref value is written as a block scalar" in capsys.readouterr().err
+
+
+def test_i21_a_ref_an_alias_shares_with_a_part_that_stays_is_rebased_in_the_part_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-02 in the data split: an alias puts one ref object in the root's metadata
+    and in a build. The build's copy is rebased in its fragment; the one that
+    stays in the root is never changed with it."""
+    text = (
+        "id: x\nmetadata:\n  other: &p {$ref: ./p.yaml}\nbuilds:\n  - id: a\n    engine: sql\n"
+        "    properties:\n      parameters: *p\n"
+    )
+    pair = make_pair(tmp_path, {NAME: text, "p.yaml": "mode: full\n"})
+    capsys.readouterr()
+
+    after = split_and_check(pair)
+
+    assert "the contract uses YAML aliases" in capsys.readouterr().err
+    assert yaml.safe_load(text_of(after, NAME))["metadata"]["other"] == {"$ref": "./p.yaml"}
+    build = yaml.safe_load(text_of(after, "fragments/builds/a.yaml"))
+    assert build["properties"]["parameters"] == {"$ref": "../../p.yaml"}
+
+
+def test_i21_a_ref_in_a_part_cut_from_a_moved_part_is_rebased_to_its_own_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-02 in the text splice: a ref in the columns, cut out of the expose that
+    moves too, is rewritten once, in the columns' own file, and not again in the
+    expose's text the columns were cut from."""
+    text = (
+        "# head\nid: x\nexposes:\n  - exposeId: o\n    kind: table\n    contract:\n"
+        "      schema:\n        - {$ref: ./cols.yaml#/a}  # col\n"
+    )
+    pair = make_pair(tmp_path, {NAME: text, "cols.yaml": "a: {name: z, type: string}\n"})
+    capsys.readouterr()
+
+    after = split_and_check(pair, "exposes,schema")
+
+    assert '- {$ref: "../../cols.yaml#/a"}  # col\n' in text_of(after, "fragments/schemas/o.yaml")
+    expose = yaml.safe_load(text_of(after, "fragments/exposes/o.yaml"))
+    assert expose["contract"]["schema"] == {"$ref": "../schemas/o.yaml"}
+    assert_comments_conserved(text, after)
+    assert "were not kept" not in capsys.readouterr().err  # the splice, not the data split
 
 
 def test_i21_refs_that_stay_in_the_root_are_not_touched(tmp_path: Path) -> None:
@@ -1618,6 +1992,143 @@ def test_i22_the_notice_is_only_for_the_alias_fallback(
     assert "were not kept" not in capsys.readouterr().err
 
 
+#: Defaults a merge key puts into two builds: one ``properties`` mapping, at
+#: three places (the defaults and both builds).
+MERGED_DEFAULTS = """\
+id: x
+defaults: &d
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: SELECT 1
+builds:
+  - id: a
+    <<: *d
+  - id: b
+    <<: *d
+"""
+
+#: One ``contract`` mapping, the schema in it, at two exposes.
+ALIASED_CONTRACT = """\
+id: x
+exposes:
+  - exposeId: a
+    contract: &c
+      schema:
+        - {name: c1, type: string}
+  - exposeId: b
+    contract: *c
+"""
+
+#: Contracts where a YAML anchor, alias or merge key puts one container at two
+#: places, each with the parts to split: (text, parts).
+SHARED_CONTAINERS: Dict[str, Tuple[str, str]] = {
+    "merged-defaults-sql": (MERGED_DEFAULTS, "sql"),
+    "merged-defaults-builds-and-sql": (MERGED_DEFAULTS, "builds,sql"),
+    "aliased-contract": (ALIASED_CONTRACT, "exposes,schema"),
+    "aliased-contract-schema-only": (ALIASED_CONTRACT, "schema"),
+    "the-same-build-twice": (
+        "id: x\nbuilds:\n  - &b\n    id: a\n    engine: sql\n"
+        "    properties: {sql: SELECT 1, parameters: {$ref: ./p.yaml}}\n  - *b\n",
+        "builds,sql",
+    ),
+    "merged-properties-holding-a-ref": (
+        "id: x\nprops: &p\n  sql: SELECT 1\n  parameters: {$ref: ./p.yaml}\nbuilds:\n"
+        "  - id: a\n    properties:\n      <<: *p\n  - id: b\n    properties: *p\n",
+        ALL_PARTS,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(SHARED_CONTAINERS))
+def test_i22_parts_in_a_container_an_alias_shares_split_as_data(
+    tmp_path: Path, case: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding N1: the data split replaced a part by its ref in the container
+    itself, so at every place an anchor or a merge key had put that container.
+    The next part there then moved the ref instead of itself: a dict as an sql
+    file (an unexpected error), or the splitter's own ref rebased as if it had
+    been written in the contract (a refusal, where the split before SP-02
+    worked). Each part is now replaced where it moves from, and nowhere else;
+    none of these splits worse than before, and none ends in an error."""
+    text, parts = SHARED_CONTAINERS[case]
+    pair = make_pair(tmp_path, {NAME: text, "p.yaml": "mode: full\n"})
+    capsys.readouterr()
+
+    after = split_and_check(pair, parts)
+
+    assert "the contract uses YAML aliases" in capsys.readouterr().err
+    for rel in new_files(pair, after):
+        if rel.startswith("sql/"):
+            assert after[rel] == b"SELECT 1"
+        elif rel.startswith("fragments/schemas/"):
+            assert yaml.safe_load(text_of(after, rel)) == [{"name": "c1", "type": "string"}]
+    if case.startswith("merged-defaults"):
+        defaults = yaml.safe_load(text_of(after, NAME))["defaults"]  # stays as it was
+        assert defaults["properties"] == {"sql": "SELECT 1"}
+        assert {"sql/a.sql", "sql/b.sql"} <= set(after)
+    if case == "aliased-contract":
+        for expose in ("a", "b"):
+            moved = yaml.safe_load(text_of(after, f"fragments/exposes/{expose}.yaml"))
+            assert moved["contract"]["schema"] == {"$ref": f"../schemas/{expose}.yaml"}
+
+
+def test_i22_the_dict_level_splitter_replaces_a_part_only_where_it_moves_from() -> None:
+    """N1 at the dict level: two builds hold one ``properties`` object."""
+    from fluid_build.cli.forge_contract_fragments import split_contract_to_fragments
+
+    shared = {"sql": "SELECT 1\n", "parameters": {"$ref": "./p.yaml"}}
+    contract = {"builds": [{"id": "a", "properties": shared}, {"id": "b", "properties": shared}]}
+
+    root, files = split_contract_to_fragments(contract, ("builds", "sql"))
+
+    assert files["sql/a.sql"] == files["sql/b.sql"] == "SELECT 1\n"
+    for build in ("a", "b"):
+        moved = yaml.safe_load(files[f"fragments/builds/{build}.yaml"])
+        assert moved["properties"] == {
+            "sql": {"$ref": f"../../sql/{build}.sql"},
+            "parameters": {"$ref": "../../p.yaml"},
+        }
+    assert shared == {"sql": "SELECT 1\n", "parameters": {"$ref": "./p.yaml"}}  # not mutated
+
+
+def test_i22_a_part_that_is_no_text_is_refused_before_anything_is_written(tmp_path: Path) -> None:
+    """N1's crash: a dict where a text belongs ended in an unexpected error from
+    the writer. Whatever puts one there, the split is refused cleanly, nothing made."""
+    from fluid_build.cli import split as split_command
+
+    root = write(tmp_path / NAME, "id: x\n")
+    before = digest(tmp_path)
+    fragments: Dict[str, Any] = {"fragments/builds/a.yaml": "id: a\n", "sql/a.sql": {"$ref": "x"}}
+
+    problem = split_command._write_checked({}, root, "id: y\n", fragments, tmp_path)
+
+    assert problem is not None and problem.startswith("sql/a.sql cannot be written: ")
+    assert digest(tmp_path) == before
+
+
+def test_i22_a_data_split_writes_every_object_in_full_and_passes_no_alias_cap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round-2 review: the copies the data split makes on a part's way share what
+    else they hold with the original, so one object an alias put at two places
+    ended up at many. Dumped with anchors, the builds list aliased in the
+    metadata gave its 60 ``tags`` lists an alias each, past the 50 the loader
+    reads when the split is checked: refused, where the split before split it.
+    Every object is written in full now, in the root and in the fragments."""
+    lines = ["id: x", "builds: &bl"]
+    for i in range(60):
+        lines += [f"  - id: b{i}", "    tags: [t]", "    properties:", f"      sql: SELECT {i}"]
+    pair = solo(tmp_path, "\n".join([*lines, "metadata:", "  copy: *bl"]) + "\n")
+    capsys.readouterr()
+
+    after = split_and_check(pair, "sql")
+
+    assert "the contract uses YAML aliases" in capsys.readouterr().err  # the data split
+    assert len(new_files(pair, after)) == 60
+    assert not [rel for rel, content in after.items() if re.search(rb"[&*]id\d+", content)]
+
+
 # ── I-23: JSON roots ────────────────────────────────────────────────────
 
 JSON_ROOT = json.dumps(yaml.safe_load(SPLIT_ALL), indent=2) + "\n"
@@ -1667,6 +2178,26 @@ def test_i23_a_json_root_holding_text_refs_is_valid_json_and_composes(tmp_path: 
     root = json.loads(text_of(after, JSON_NAME))
     assert root["description"]["purpose"] == {"$ref": "./docs/purpose.md"}
     assert root["builds"][0]["properties"]["sql"] == {"$ref": "./sql/ingest-orders.sql"}
+
+
+def test_i23_a_json_root_with_no_utf_8_form_is_refused_and_changes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding N2: JSON can escape a lone surrogate (``"\\ud800"``) in a key that
+    stays in the root, and the root written back then has no UTF-8 form. That was
+    an unexpected error, exit 2; it is refused now as a part with no UTF-8 form
+    is, before anything is made."""
+    text = '{"id": "x", "\\ud800": 1, "builds": [{"id": "t", "engine": "sql"}]}\n'
+    pair = solo(tmp_path, text, name=JSON_NAME)
+    before = digest(tmp_path)
+    capsys.readouterr()
+
+    assert split(pair.split_contract) == 1
+
+    shown = capsys.readouterr()
+    assert f"Split not written: {pair.split_contract} cannot be written as UTF-8" in shown.err
+    assert "Unexpected error" not in shown.out + shown.err
+    assert digest(tmp_path) == before
 
 
 # ── I-24: every YAML shape a section can be written in ──────────────────
@@ -1894,12 +2425,6 @@ def test_i24_a_root_that_is_itself_a_ref_has_nothing_that_moves_or_only_its_own_
     ],
     ids=["tag-on-a-section", "unused-anchor-on-a-section", "unused-anchor-on-an-extension"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-06: a tag or an unused anchor between a key and its block mapping puts the mapping "
-    "on the key's line, so the splice writes 'key: $ref: ...', which does not parse; split "
-    "refuses instead of falling back to a data split as it does when an alias is used",
-)
 def test_i24_a_tag_or_an_unused_anchor_on_a_moved_section_splits(
     tmp_path: Path, text: str, parts: Optional[str]
 ) -> None:
@@ -1908,13 +2433,86 @@ def test_i24_a_tag_or_an_unused_anchor_on_a_moved_section_splits(
     split_and_check(pair, parts)
 
 
+@pytest.mark.parametrize(
+    "text,parts,target,root_line,body",
+    [
+        (
+            "# header\nid: x\nsovereignty: !!map\n  jurisdiction: EU  # kept\n",
+            None,
+            "fragments/sovereignty.yaml",
+            "\nsovereignty: {$ref: ./fragments/sovereignty.yaml}\n",
+            "!!map\njurisdiction: EU  # kept\n",
+        ),
+        (
+            "# header\nid: x\nsovereignty: &s  # after the anchor\n  jurisdiction: EU\n",
+            None,
+            "fragments/sovereignty.yaml",
+            "\nsovereignty: {$ref: ./fragments/sovereignty.yaml}\n",
+            "&s  # after the anchor\njurisdiction: EU\n",
+        ),
+        (
+            "# header\nid: x\nexposes:\n  - exposeId: o\n    contract:\n      schema: !!seq\n"
+            "        - {name: a, type: string}\n",
+            "schema",
+            "fragments/schemas/o.yaml",
+            "\n      schema: {$ref: ./fragments/schemas/o.yaml}\n",
+            "!!seq\n- {name: a, type: string}\n",
+        ),
+        (
+            "# header\nid: x\nbuilds:\n  - &b\n    id: b\n    engine: sql\n",
+            None,
+            "fragments/builds/b.yaml",
+            "\n  - $ref: ./fragments/builds/b.yaml\n",
+            "&b\nid: b\nengine: sql\n",
+        ),
+        (
+            # The entries are indented as their own lines are, not as the anchor
+            # is: a block scalar under them keeps its indentation.
+            "# header\nid: x\nsovereignty: &s\n  jurisdiction: EU\n  note: |  # head\n"
+            "    kept as written\n",
+            None,
+            "fragments/sovereignty.yaml",
+            "\nsovereignty: {$ref: ./fragments/sovereignty.yaml}\n",
+            "&s\njurisdiction: EU\nnote: |  # head\n  kept as written\n",
+        ),
+        (
+            "# header\nid: x\nbuilds:\n  - &b\n      id: b\n      properties:\n        sql: |\n"
+            "          SELECT 1\n",
+            None,
+            "fragments/builds/b.yaml",
+            "\n  - $ref: ./fragments/builds/b.yaml\n",
+            "&b\nid: b\nproperties:\n  sql: |\n    SELECT 1\n",
+        ),
+    ],
+    ids=[
+        "tag",
+        "anchor-and-a-comment",
+        "tag-on-a-list",
+        "anchor-on-a-list-item",
+        "anchor-over-a-block-scalar",
+        "anchor-over-deeper-entries",
+    ],
+)
+def test_i24_a_tag_or_an_anchor_moves_with_its_part_and_the_ref_takes_the_key_line(
+    tmp_path: Path, text: str, parts: Optional[str], target: str, root_line: str, body: str
+) -> None:
+    """Finding SP-06: the text is spliced, so every comment is kept (no data-split
+    fallback). The tag or anchor, and the rest of its line, start the fragment."""
+    pair = solo(tmp_path, text)
+
+    after = split_and_check(pair, parts)
+
+    assert root_line in text_of(after, NAME)
+    assert text_of(after, NAME).startswith("# header\n")
+    assert text_of(after, target).split("\n\n", 1)[1] == body
+    assert_comments_conserved(text, after)
+
+
 # ── I-25 / I-26: line ends, byte-order mark, the end of the file ────────
 
-#: SPLIT-ALL with CRLF line ends, minus the one comment that ends a moved block
+#: SPLIT-ALL with CRLF line ends, the comment that ends a moved block included
 #: (see ``test_i25_a_comment_ending_a_moved_block...``, finding SP-01).
-SPLIT_ALL_CRLF = SPLIT_ALL.replace(
-    "  dataResidency: true       # trailing comment on its last line\n", "  dataResidency: true\n"
-).replace("\n", "\r\n")
+SPLIT_ALL_CRLF = SPLIT_ALL.replace("\n", "\r\n")
 
 
 def assert_one_line_end(files: Mapping[str, bytes], crlf: bool = True) -> None:
@@ -1963,11 +2561,6 @@ COMMENT_ENDS_MOVED_BLOCK = (
     ],
     ids=["root", "nested-fragment"],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-01: a trailing comment on the last line of a moved block takes that line's CR "
-    "with it, so the $ref line that replaces it ends in a bare LF in a CRLF file",
-)
 def test_i25_a_comment_ending_a_moved_block_in_a_crlf_root_keeps_crlf(
     tmp_path: Path, text: str, parts: Optional[str], where: str
 ) -> None:
@@ -1994,7 +2587,6 @@ def test_i25_a_comment_ending_a_moved_block_still_moves_with_it_in_a_crlf_root(
 @pytest.mark.parametrize("line_end", ["\r\n", "\n"], ids=["crlf", "lf"])
 def test_i25_a_byte_order_mark_is_kept(tmp_path: Path, line_end: str) -> None:
     text = "﻿" + SPLIT_ALL.replace("\n", line_end)
-    text = text.replace("       # trailing comment on its last line", "")
     pair = make_pair(tmp_path, {NAME: text.encode("utf-8"), "overlays/prod.yaml": PROD_OVERLAY})
 
     after = split_and_check(pair, ALL_PARTS, envs=(None, "prod"), cli_envs=(None,))
@@ -2170,49 +2762,114 @@ def test_i29_the_same_directory_given_as_out_is_an_in_place_split(tmp_path: Path
     assert sorted(set(files_of(pair.split)) - set(files_of(pair.flat))) == DEFAULT_LAYOUT
 
 
-def test_i29_an_existing_root_in_out_is_replaced_without_a_word_today(
+def test_i29_an_existing_root_in_out_is_never_written_over(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """SG-32 characterisation (finding SP-11): fragments never overwrite a file,
-    but the root written to ``--out`` replaces a different file of that name."""
+    """Finding SP-11: fragments never overwrote a file, but the root written to
+    ``--out`` replaced another file of its name without a word. Now the split
+    is refused, the dry run included, with the file named and what to do."""
     pair = make_pair(tmp_path, SPLIT_ALL_FILES)
     out = tmp_path / "elsewhere"
     other = b"# somebody else's contract\nid: precious\n"
     write(out / NAME, other)
+    before = digest(tmp_path)
     capsys.readouterr()
 
-    assert split(pair.split_contract, "--dry-run", "--out", out) == 0
-    assert NAME not in capsys.readouterr().err  # the preview does not mention it either
-    assert split(pair.split_contract, "--out", out) == 0
+    for dry_run in (["--dry-run"], []):
+        assert split(pair.split_contract, *dry_run, "--out", out) == 1
 
-    assert (out / NAME).read_bytes() != other
-    assert b"precious" not in (out / NAME).read_bytes()
+        err = capsys.readouterr().err
+        assert f"Split not written: {out / NAME} already exists" in err
+        assert "Move it away, or choose another --out" in err
+        assert "Would create" not in err
+        assert digest(tmp_path) == before
+    assert (out / NAME).read_bytes() == other
 
 
-def test_i29_splitting_twice_into_the_same_out_adds_numbered_copies(tmp_path: Path) -> None:
-    """SG-32 characterisation: the source stays flat, so a second run into the
-    same ``--out`` meets its own first-run files and writes ``-2`` copies; the
-    root now refers to those and the first run's fragments are left over."""
+def test_i29_a_second_split_into_the_same_out_is_refused_and_leaves_the_first_alone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-11: the source stays flat, so a second run into the same ``--out`` met
+    its own first-run files: it wrote ``-2`` copies and left the first run's
+    fragments unreferenced. It is refused now (a split there is not reused:
+    the source may have changed since), and the message says how to split the
+    contract already there; that works."""
     pair = make_pair(tmp_path, SPLIT_ALL_FILES)
     out = tmp_path / "elsewhere"
-
     assert split(pair.split_contract, "--out", out) == 0
-    first = files_of(out)
-    assert split(pair.split_contract, "--out", out) == 0
+    first = digest(out)
+    capsys.readouterr()
 
-    second = files_of(out)
-    assert all(second[rel] == first[rel] for rel in first if rel != NAME)  # nothing rewritten
-    assert sorted(set(second) - set(first)) == [
-        "fragments/access-policy-2.yaml",
-        "fragments/builds/ingest-orders-2.yaml",
-        "fragments/builds/rollup-2.yaml",
-        "fragments/exposes/order_totals-2.yaml",
-        "fragments/exposes/orders-2.yaml",
-        "fragments/sovereignty-2.yaml",
-    ]
-    assert "ingest-orders-2.yaml" in text_of(second, NAME)
-    assert "ingest-orders.yaml" not in text_of(second, NAME)
+    assert split(pair.split_contract, "--out", out, "--parts", "extensions") == 1
+
+    err = capsys.readouterr().err
+    assert f"{out / NAME} already holds this contract" in err
+    assert f"run: fluid split {out / NAME}" in err
+    assert digest(out) == first  # no -2 copy, nothing rewritten
+
+    assert split(out / NAME, "--parts", "extensions") == 0  # the way the message gives
     assert compose_contract(out / NAME).document == compose_contract(pair.flat_contract).document
+    assert sorted(set(files_of(out)) - {NAME}) == sorted(
+        [*DEFAULT_LAYOUT, "fragments/extensions/acme.yaml"]
+    )
+
+
+def test_i29_a_copy_of_the_contract_in_out_is_split_there(tmp_path: Path) -> None:
+    """SP-11: a byte-for-byte copy of the contract is no other file; writing the
+    split root over it loses nothing."""
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    out = tmp_path / "elsewhere"
+    write(out / NAME, SPLIT_ALL)
+
+    assert split(pair.split_contract, "--out", out) == 0
+
+    assert sorted(files_of(out)) == sorted([NAME, *DEFAULT_LAYOUT])
+    assert compose_contract(out / NAME).document == compose_contract(pair.flat_contract).document
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs hard links")
+def test_i29_a_hard_link_to_the_contract_in_out_is_not_written_through(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-11: the same file under another directory is not an in-place split:
+    writing the root there would change the contract in its own directory too."""
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    out = tmp_path / "elsewhere"
+    out.mkdir()
+    os.link(pair.split_contract, out / NAME)
+    before = digest(tmp_path)
+
+    assert split(pair.split_contract, "--out", out) == 1
+
+    err = capsys.readouterr().err
+    assert "already holds this contract" in err
+    # The way out it gives does not write through the link: splitting that name
+    # in place would change the contract in its own directory too.
+    assert "Move it away, or choose another --out" in err and "run: fluid split" not in err
+    assert digest(tmp_path) == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs hard links")
+def test_i29_a_copy_in_out_that_is_a_hard_link_to_a_third_file_is_not_written_through(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-11: a byte-for-byte copy may be written over, but not one that is also
+    another name of a third file: the root is written in place, so that file
+    would change too."""
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    victim = write(tmp_path / "victim" / NAME, SPLIT_ALL)
+    out = tmp_path / "elsewhere"
+    out.mkdir()
+    os.link(victim, out / NAME)
+    before = digest(tmp_path)
+
+    assert split(pair.split_contract, "--out", out) == 1
+
+    err = capsys.readouterr().err
+    assert f"Split not written: {out / NAME} already" in err
+    assert "Move it away, or choose another --out" in err and "run: fluid split" not in err
+    assert digest(tmp_path) == before
+    assert victim.read_text("utf-8") == SPLIT_ALL
 
 
 # ── I-30: an alias bomb ─────────────────────────────────────────────────
@@ -2348,6 +3005,37 @@ def test_i33_a_symlinked_fragments_directory_never_leaves_a_fragment_outside_out
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs symlinks")
+@pytest.mark.parametrize(
+    "link,parts",
+    [("fragments", None), ("fragments/exposes", None), ("sql", "sql")],
+    ids=["fragments", "a-directory-below-it", "sql"],
+)
+def test_i33_a_symlinked_directory_on_the_way_is_refused_by_the_dry_run_and_the_real_run(
+    tmp_path: Path, link: str, parts: Optional[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-08: a directory on the way to a fragment that links outside ``--out`` is
+    refused before anything is written, there or through the link, however deep
+    it sits; and the dry run, which lists what the real run writes, refuses it
+    the same way instead of listing files that would never be written."""
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (pair.split / link).parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(outside, pair.split / link)
+    args = ["--parts", parts] if parts else []
+    before = digest(tmp_path)
+    capsys.readouterr()
+
+    for dry_run in (["--dry-run"], []):
+        assert split(pair.split_contract, *dry_run, *args) == 1
+
+        err = capsys.readouterr().err
+        assert f"{pair.split / link} is a symlink; split writes no file through one" in err
+        assert "Would create" not in err
+        assert digest(tmp_path) == before  # not a file or a directory, inside or out
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs symlinks")
 def test_i33_a_symlinked_sql_directory_is_refused_and_no_text_is_left_outside(
     tmp_path: Path,
 ) -> None:
@@ -2434,6 +3122,7 @@ def test_i34_an_unwritable_fragment_directory_stops_the_split_and_leaves_the_roo
     locked.mkdir(parents=True)
     locked.chmod(0o555)
     root = pair.split_contract.read_bytes()
+    before = digest(pair.split)
     try:
         assert split(pair.split_contract) == 1
     finally:
@@ -2442,6 +3131,7 @@ def test_i34_an_unwritable_fragment_directory_stops_the_split_and_leaves_the_roo
     assert "Split not written" in capsys.readouterr().err
     assert pair.split_contract.read_bytes() == root
     assert not files_of(pair.split / "fragments")  # what was written is taken back
+    assert digest(pair.split) == before  # and fragments/builds/, made for it (SP-05)
 
 
 @needs_posix_permissions
@@ -2460,38 +3150,291 @@ def test_i34_an_unwritable_output_directory_is_a_clean_refusal(
 
 
 @needs_posix_permissions
-def test_i34_an_unwritable_root_file_is_an_unexpected_error_today(
+def test_i34_an_unwritable_root_file_is_refused_like_any_failed_write(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """SG-32 characterisation (finding SP-09): every other failed write is exit 1,
-    'Split not written'. A read-only root fails at the last write, and the undo
-    that tries to write the root back fails the same way inside the handler."""
+    """Finding SP-09: a read-only root fails at the last write, which is reported
+    as every failed write is: exit 1, 'Split not written', the tree as it was.
+    The undo does not write back a root it could not open (that write raised the
+    same error inside the handler: exit 2, 'Unexpected error')."""
     pair = make_pair(tmp_path, SPLIT_ALL_FILES)
     pair.split_contract.chmod(0o444)
+    before = digest(pair.split)
     try:
         rc = split(pair.split_contract)
     finally:
         pair.split_contract.chmod(0o644)
 
-    assert rc == 2
+    assert rc == 1
     shown = capsys.readouterr()
-    assert "Unexpected error" in shown.out + shown.err
-    assert pair.split_contract.read_bytes() == SPLIT_ALL.encode("utf-8")
+    assert "Unexpected error" not in shown.out + shown.err
+    assert "Split not written" in shown.err and "Permission denied" in shown.err
+    assert shown.err.rstrip().endswith("nothing was changed")
+    assert digest(pair.split) == before
+
+
+def test_i34_a_take_back_that_fails_is_reported_and_never_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-09: every step of the undo runs whatever an earlier one did, none raises,
+    and the message names what is left instead of saying nothing was changed."""
+    pair = solo(tmp_path, REF_INTO_A_MOVED_PART)
+
+    def busy(self: Path) -> None:
+        raise OSError(16, "Device or resource busy", str(self))
+
+    monkeypatch.setattr(Path, "rmdir", busy)
+
+    assert split(pair.split_contract) == 1
+
+    err = capsys.readouterr().err
+    assert "Split not written" in err and "nothing was changed" not in err
+    assert "split could not take back" in err
+    assert f"{pair.split / 'fragments' / 'builds'}: Device or resource busy" in err
+    # The other steps ran all the same: the root is put back, the files are gone.
+    assert pair.split_contract.read_text("utf-8") == REF_INTO_A_MOVED_PART
     assert not files_of(pair.split / "fragments")
 
 
-@pytest.mark.parametrize("failure", ["refs-it-cannot-rebase", "out-elsewhere", "lone-surrogate"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-05: a refused split says 'nothing was changed' but leaves the directories it "
-    "made (an empty fragments/ changes what `fluid bundle` does without --out), and for a "
-    "failed write also the empty file it was writing",
-)
-def test_i34_a_refused_split_leaves_the_tree_exactly_as_it_was(
-    tmp_path: Path, failure: str
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_i34_an_interrupt_halfway_takes_the_split_back_and_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupt: type
 ) -> None:
+    """C1: the take-back ran for an ``Exception`` only, so a Ctrl-C (or an exit)
+    while the split was written or checked left it unchecked: fragments written,
+    the root rewritten. It is taken back now, and the interrupt goes on; the CLI
+    then reports it as it reports any interrupt."""
+    import argparse
+    import logging
+
+    from fluid_build.cli import split as split_command
+
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    before = digest(tmp_path)
+    real = loader.compose_contract
+
+    def interrupted(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if (pair.split / "fragments").exists():  # the check of the split just written
+            raise interrupt()
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(loader, "compose_contract", interrupted)
+    args = argparse.Namespace(
+        contract=str(pair.split_contract), out=None, parts="builds,exposes", dry_run=False
+    )
+
+    with pytest.raises(interrupt):
+        split_command.run(args, logging.getLogger("test"))
+
+    assert digest(tmp_path) == before
+    if interrupt is KeyboardInterrupt:
+        assert split(pair.split_contract) == 1  # 'Operation cancelled by user'
+        assert digest(tmp_path) == before
+
+
+def _run_split(contract: Path, parts: str) -> None:
+    """``fluid split <contract> --parts <parts>`` through the command's ``run``,
+    so an interrupt it lets go on reaches the caller (the CLI would report it)."""
+    import argparse
+    import logging
+
+    from fluid_build.cli import split as split_command
+
+    args = argparse.Namespace(contract=str(contract), out=None, parts=parts, dry_run=False)
+    split_command.run(args, logging.getLogger("test"))
+
+
+def test_i34_an_interrupt_just_as_the_root_is_opened_puts_the_root_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C1, the open: ``open(root, "wb")`` empties the root before it returns, and
+    the flag that sent the take-back to it was set after that. An interrupt just
+    then left the contract empty. The root is now put back whenever its bytes
+    differ, from the moment the write reaches it."""
+    import builtins
+
+    from fluid_build.cli import split as split_command
+
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    before = digest(tmp_path)
+
+    def emptied_then_interrupted(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        handle = builtins.open(file, mode, *args, **kwargs)
+        if mode == "wb" and Path(file) == pair.split_contract:
+            handle.close()
+            raise KeyboardInterrupt
+        return handle
+
+    monkeypatch.setattr(split_command, "open", emptied_then_interrupted, raising=False)
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_split(pair.split_contract, "builds,exposes")
+
+    assert pair.split_contract.read_bytes() == SPLIT_ALL.encode("utf-8")
+    assert digest(tmp_path) == before
+
+
+@pytest.mark.parametrize("first", ["an-interrupt-at-the-check", "a-refusal-at-the-check"])
+def test_i34_an_interrupt_during_the_take_back_puts_the_root_back_first_and_goes_on(
+    tmp_path: Path, first: str
+) -> None:
+    """C1, the take-back: it removed the fragments before it put the root back,
+    and an interrupt in it (a second Ctrl-C) stopped it there: a split root over
+    fragments it had removed. The root goes back first now, every step runs all
+    the same, and the first interrupt goes on at the end, also when what was
+    being taken back was a plain refusal."""
+    text = SPLIT_ALL if first == "an-interrupt-at-the-check" else REF_INTO_A_MOVED_PART
+    pair = make_pair(tmp_path, {NAME: text})
+    real_compose = loader.compose_contract
+    real_unlink = Path.unlink
+    unlinked: List[Path] = []
+    root_when_cut: List[bytes] = []
+
+    def check(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if first == "an-interrupt-at-the-check" and (pair.split / "fragments").exists():
+            raise KeyboardInterrupt
+        return real_compose(path, *args, **kwargs)
+
+    def unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        unlinked.append(self)
+        if len(unlinked) == 1:
+            # Were the take-back cut short here (a kill, not an exception), the
+            # contract would be what it is now.
+            root_when_cut.append(pair.split_contract.read_bytes())
+            raise KeyboardInterrupt
+        real_unlink(self, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(loader, "compose_contract", check)
+        patch.setattr(Path, "unlink", unlink)
+        with pytest.raises(KeyboardInterrupt):
+            _run_split(pair.split_contract, "builds,exposes")
+
+    assert root_when_cut == [text.encode("utf-8")]  # the root went back before any fragment
+    assert pair.split_contract.read_text("utf-8") == text
+    left = sorted(set(files_of(pair.split)) - set(files_of(pair.flat)))
+    assert left == [unlinked[0].relative_to(pair.split).as_posix()]  # the others went
+    assert compose_contract(pair.split_contract).document == (
+        compose_contract(pair.flat_contract).document
+    )
+
+
+def test_i34_an_interrupt_whose_take_back_leaves_something_says_what(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """C1: when a step of the take-back fails during an interrupt, the interrupt
+    still goes on, and what is left is printed before it: there is no message to
+    put it in."""
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    real_compose = loader.compose_contract
+
+    def check(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if (pair.split / "fragments").exists():
+            raise KeyboardInterrupt
+        return real_compose(path, *args, **kwargs)
+
+    def locked(self: Path, *args: Any, **kwargs: Any) -> None:
+        raise PermissionError(13, "Permission denied", str(self))
+
+    capsys.readouterr()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(loader, "compose_contract", check)
+        patch.setattr(Path, "unlink", locked)
+        with pytest.raises(KeyboardInterrupt):
+            _run_split(pair.split_contract, "builds,exposes")
+
+    err = capsys.readouterr().err
+    assert "Split interrupted; could not take back " in err
+    stuck = pair.split / "fragments" / "builds" / "ingest-orders.yaml"
+    assert f"{stuck}: Permission denied" in err
+    assert pair.split_contract.read_text("utf-8") == SPLIT_ALL  # the root went back all the same
+
+
+def test_i34_a_file_someone_else_makes_just_before_split_does_survives_the_take_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-05: a fragment is counted as written once split has made its file, not
+    before. A file another process makes at that name just before (so split's
+    exclusive create fails) is not split's to take back, and stays."""
+    from fluid_build.cli import split as split_command
+
+    text = "id: x\nsovereignty:\n  jurisdiction: EU\nbuilds:\n  - id: a\n    pattern: p\n"
+    pair = solo(tmp_path, text)
+    theirs = pair.split / "fragments" / "builds" / "a.yaml"
+    real_open = open
+
+    def made_just_before(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        if mode == "xb" and Path(file) == theirs:
+            theirs.write_text("someone else's file\n", encoding="utf-8")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(split_command, "open", made_just_before, raising=False)
+    capsys.readouterr()
+
+    assert split(pair.split_contract, "--parts", "sovereignty,builds") == 1
+
+    assert "File exists" in capsys.readouterr().err
+    assert theirs.read_text("utf-8") == "someone else's file\n"
+    assert pair.split_contract.read_text("utf-8") == text
+    assert not (pair.split / "fragments" / "sovereignty.yaml").exists()
+
+
+def test_i34_a_write_that_fails_takes_back_the_file_it_was_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-05: the second fragment's file is made, then its write fails (a full disk).
+    That file is taken back with the first: it is counted as written the moment it
+    exists, not once its text is in."""
+    import errno
+
+    from fluid_build.cli import split as split_command
+
+    class _FullDisk:
+        def __init__(self, handle: Any) -> None:
+            self.handle = handle
+
+        def __enter__(self) -> "_FullDisk":
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            self.handle.close()
+
+        def write(self, data: bytes) -> int:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    made: List[Any] = []
+
+    def full_on_the_second(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        handle = open(file, mode, *args, **kwargs)
+        if mode == "xb":
+            made.append(file)
+            if len(made) == 2:
+                return _FullDisk(handle)
+        return handle
+
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    before = digest(tmp_path)
+    monkeypatch.setattr(split_command, "open", full_on_the_second, raising=False)
+    capsys.readouterr()
+
+    assert split(pair.split_contract) == 1
+
+    err = capsys.readouterr().err
+    assert "No space left on device" in err and err.rstrip().endswith("nothing was changed")
+    assert len(made) == 2
+    assert digest(tmp_path) == before
+
+
+@pytest.mark.parametrize("failure", ["refs-it-cannot-rebase", "out-elsewhere", "lone-surrogate"])
+def test_i34_a_refused_split_leaves_the_tree_exactly_as_it_was(
+    tmp_path: Path, failure: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding SP-05: a refusal takes back every directory it made, the whole
+    ``--out`` directory included (a leftover ``fragments/`` changes what
+    ``fluid bundle`` does without ``--out``), and the file it was writing; a
+    text with no UTF-8 form is refused before anything is made."""
     if failure == "refs-it-cannot-rebase":
-        pair = make_pair(tmp_path, REFS_IN_PARTS_FILES)
+        pair = solo(tmp_path, REF_INTO_A_MOVED_PART)
         args: List[Any] = []
     elif failure == "out-elsewhere":
         text = (
@@ -2504,32 +3447,79 @@ def test_i34_a_refused_split_leaves_the_tree_exactly_as_it_was(
         pair = solo(tmp_path, text)
         args = ["--parts", "sql"]
     before = digest(tmp_path)
+    capsys.readouterr()
 
     assert split(pair.split_contract, *args) == 1
 
     assert digest(tmp_path) == before
+    err = capsys.readouterr().err
+    assert "Split not written" in err
+    if failure == "lone-surrogate":
+        assert "sql/t.sql cannot be written as UTF-8" in err
+    else:
+        assert err.rstrip().endswith("nothing was changed")
 
 
-def test_i03_a_comment_on_the_header_of_a_moved_text_scalar_is_dropped_without_a_word(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("line_end", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_i03_a_comment_on_the_header_of_a_moved_text_scalar_stays_beside_its_ref(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], line_end: str
 ) -> None:
-    """SG-32 characterisation (finding SP-10): ``sql: |  # the main query``. The
-    comment is outside the string's value, inside the span that becomes a ref,
-    and a text file cannot hold it. Nothing says it was left out."""
+    """Finding SP-10: ``sql: |  # the main query``. A text file cannot hold the
+    comment, so it stays on the line of the ref that replaces the scalar."""
     text = (
         "id: x\nbuilds:\n  - id: a\n    engine: sql\n    properties:\n"
-        "      sql: |  # the main query\n        SELECT 1\n"
+        "      sql: |-  # the main query\n        SELECT 1\n"
         "description:\n  purpose: >  # about\n    A folded\n    purpose.\n  usage: u  # kept\n"
-    )
+    ).replace("\n", line_end)
     pair = solo(tmp_path, text)
     capsys.readouterr()
 
     after = split_and_check(pair, "sql,description")
 
-    everything = b"\n".join(after.values()).decode("utf-8")
-    assert "the main query" not in everything and "# about" not in everything
-    assert "# kept" in text_of(after, NAME)  # a comment after a scalar's end is the root's
+    root = text_of(after, NAME)
+    assert f"      sql: {{$ref: ./sql/a.sql}}  # the main query{line_end}" in root
+    assert f"  purpose: {{$ref: ./docs/purpose.md}}  # about{line_end}" in root
+    assert f"  usage: {{$ref: ./docs/usage.md}}  # kept{line_end}" in root
+    assert after["sql/a.sql"] == b"SELECT 1"
+    assert_comments_conserved(text, after)
     assert "were not kept" not in capsys.readouterr().err
+
+
+def test_i03_the_header_comment_of_text_cut_from_a_moved_part_stays_in_its_fragment(
+    tmp_path: Path,
+) -> None:
+    """Finding SP-10: the comment stays in the file that holds the ref: here the
+    build's fragment, where the sql ref is."""
+    text = (
+        "id: x\nbuilds:\n  - id: a\n    engine: sql\n    properties:\n"
+        "      sql: !!str |  # the main query\n        SELECT 1\n      parameters: {a: 1}\n"
+    )
+    pair = solo(tmp_path, text)
+
+    after = split_and_check(pair, "builds,sql")
+
+    fragment = text_of(after, "fragments/builds/a.yaml")
+    assert "  sql: {$ref: ../../sql/a.sql}  # the main query\n" in fragment
+    assert after["sql/a.sql"] == b"SELECT 1\n"
+    assert_comments_conserved(text, after)
+
+
+@pytest.mark.parametrize("comment", ["", "# kept"], ids=["no-comment", "a-comment-after"])
+def test_i03_a_header_line_of_blanks_is_read_in_time_linear_in_it(comment: str) -> None:
+    """A block scalar's header line of 100,000 blanks: looking for its comment
+    tried a match from every blank, time quadratic in the run (about 16 s here);
+    it starts only where the run does now."""
+    from fluid_build.cli._split_text import _header_comment
+
+    blanks = " " * 100_000
+    text = f"sql: |{blanks}{comment}\n  SELECT 1\n"
+    node = yaml.compose(text).value[0][1]
+    started = time.monotonic()
+
+    found = _header_comment(text, node)
+
+    assert time.monotonic() - started < 1
+    assert found == (blanks + comment if comment else "")
 
 
 @pytest.mark.parametrize(
@@ -2699,11 +3689,6 @@ def test_i36_refs_in_the_root_that_need_the_ref_root_survive_a_split(
     assert "owner: {$ref: ../shared/team.yaml}" in pair.split_contract.read_text("utf-8")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-02: a relative $ref inside a moved part is not rebased; with FLUID_REF_ROOT set "
-    "(so the original composes and split can check its work) split refuses",
-)
 def test_i36_a_moved_part_with_a_ref_that_needs_the_ref_root_splits_with_the_env_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2714,6 +3699,8 @@ def test_i36_a_moved_part_with_a_ref_that_needs_the_ref_root_splits_with_the_env
 
     flat = _compose_with_ref_root(pair.flat_contract, pair.flat, monkeypatch)
     assert _compose_with_ref_root(pair.split_contract, pair.split, monkeypatch) == flat
+    build = (pair.split / "product/fragments/builds/a.yaml").read_text("utf-8")
+    assert "parameters: {$ref: ../../../shared/params.yaml}" in build
 
 
 def test_i36_split_without_the_ref_root_set_leaves_a_contract_that_still_composes(
@@ -2822,6 +3809,21 @@ def test_i39_split_help_lists_the_parts_option_and_every_part(
     ):
         assert name in out, name
     assert "sovereignty,accessPolicy,builds,exposes" in out  # the default
+
+
+def test_i39_the_help_names_the_one_file_split_writes_over_but_the_contract(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """SP-11 in the help: 'a file that exists is never written over' was said
+    without the one exception, a byte-for-byte copy of the contract in --out."""
+    assert run_cli("split", "-h") == 0
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert (
+        "A file that exists is never written over, but for a byte-for-byte copy of the "
+        "contract in --out that is the only name of its file." in out
+    )
+    assert "With --out, the files relative $refs name must be under the output directory" in out
 
 
 # ── I-40: the authoring schema accepts what split writes ────────────────
@@ -2995,6 +3997,14 @@ _GENERATED_PARTS = [
     "description",
     "extensions.acme",
 ]
+#: The files the generated contracts' refs name, beside the root.
+GENERATED_REF_FILES: Dict[str, str] = {
+    "params/full.yaml": "mode: full\nn: 1\ntags: [a, b]\n",
+    "cols.yaml": (
+        "extra: {name: extra, type: string}\n"
+        "columns:\n  - {name: id, type: string, required: true}\n  - {name: v, type: number}\n"
+    ),
+}
 _SQL_TEXTS = [
     "SELECT 1",
     "SELECT 1\n",
@@ -3008,14 +4018,16 @@ _SQL_TEXTS = [
 
 def _generated_contract(rng: random.Random) -> Dict[str, Any]:
     def build(i: int) -> Dict[str, Any]:
+        parameters: Dict[str, Any] = {"mode": "full", "n": rng.randint(1, 5), "tags": ["a", "b"]}
+        if rng.random() < 0.5:  # a ref, rebased when the build moves; with a sibling or not
+            parameters = {"$ref": "./params/full.yaml"}
+            if rng.random() < 0.5:
+                parameters["n"] = rng.randint(1, 5)
         return {
             "id": rng.choice([f"b{i}", f"build.{i}", f"B-{i}"]),
             "pattern": "embedded-logic",
             "engine": "sql",
-            "properties": {
-                "sql": rng.choice(_SQL_TEXTS),
-                "parameters": {"mode": "full", "n": rng.randint(1, 5), "tags": ["a", "b"]},
-            },
+            "properties": {"sql": rng.choice(_SQL_TEXTS), "parameters": parameters},
         }
 
     def expose(i: int) -> Dict[str, Any]:
@@ -3029,6 +4041,11 @@ def _generated_contract(rng: random.Random) -> Dict[str, Any]:
         }
         if rng.random() < 0.3:
             del contract["quality"]
+        refs = rng.random()
+        if refs < 0.3:  # a column from a file, rebased with the expose or the schema
+            contract["schema"].append({"$ref": "./cols.yaml#/extra"})
+        elif refs < 0.5:  # the whole schema from a file: it moves with the expose only
+            contract["schema"] = {"$ref": "./cols.yaml#/columns"}
         return {
             "exposeId": f"e{i}",
             "kind": "table",
@@ -3104,7 +4121,8 @@ def _render(contract: Dict[str, Any], rng: random.Random) -> str:
 
 
 def _with_comments(text: str, rng: random.Random, trailing: bool) -> str:
-    """Full-line comments at random lines, and trailing ones if ``trailing``.
+    """Full-line comments at random lines, and trailing ones if ``trailing``,
+    a block scalar's header line included.
 
     Lines inside a block scalar are left alone (a ``#`` there is text).
     """
@@ -3130,7 +4148,7 @@ def _with_comments(text: str, rng: random.Random, trailing: bool) -> str:
     for n, line in enumerate(lines):
         if n in full:
             out.append(" " * (len(line) - len(line.lstrip(" "))) + f"# full-{n}")
-        if n in tail and not re.search(r"[|>][-+0-9]*$", line.rstrip()):
+        if n in tail:
             line = f"{line}  # trail-{n}"
         out.append(line)
     return "\n".join(out)
@@ -3141,7 +4159,7 @@ def generated_root(seed: int) -> Tuple[str, List[str], bool]:
     rng = random.Random(seed)
     crlf = rng.random() < 0.3
     for _ in range(50):
-        text = _with_comments(_render(_generated_contract(rng), rng), rng, trailing=not crlf)
+        text = _with_comments(_render(_generated_contract(rng), rng), rng, trailing=True)
         try:
             yaml.safe_load(text)
         except yaml.YAMLError:
@@ -3158,7 +4176,9 @@ def generated_root(seed: int) -> Tuple[str, List[str], bool]:
 @pytest.mark.parametrize("seed", range(24))
 def test_i02_generated_roots_keep_every_comment_and_the_bundle(tmp_path: Path, seed: int) -> None:
     text, parts, crlf = generated_root(seed)
-    pair = solo(tmp_path, text.encode("utf-8"))
+    line_end = "\r\n" if crlf else "\n"
+    files = {rel: body.replace("\n", line_end) for rel, body in GENERATED_REF_FILES.items()}
+    pair = make_pair(tmp_path, {NAME: text.encode("utf-8"), **files})
 
     after = split_and_check(pair, ",".join(parts), cli_envs=())
 
