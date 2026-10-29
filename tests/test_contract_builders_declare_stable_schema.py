@@ -14,7 +14,7 @@
 
 """Code that builds a contract declares the newest stable bundled schema.
 
-The five ``fluid import`` importers, ``fluid product new``, the discover
+The five ``fluid import`` importers, ``fluid product-new``, the discover
 emitter, the streaming preview, the JDBC data-model scaffolder,
 ``forge/product_types`` and ``forge/templates/_v073_builder`` declared
 ``0.7.3`` as a literal while 0.7.5 was current: a version typed into code goes
@@ -116,9 +116,32 @@ ALLOWED = {
     # (``fluid_build.api.conformance``): its declared version is part of the
     # input they were written for.
     "api/conformance/fixtures/minimal.py",
+    # The market's Jinja blueprints, whose rendered contracts
+    # tests/test_market_bundled_blueprints.py pins at 0.7.4: moving them to the
+    # stable schema is a change of its own.
+    "cli/_market_bundled_blueprints.py",
 }
 
+#: The modules that build a contract this change moved off a literal: none may
+#: keep a version in a constant either, which the forms below cannot see.
+BUILDERS = (
+    "cli/_forge_data_model_jdbc.py",
+    "cli/_streaming_contract_preview.py",
+    "cli/discover/emitter.py",
+    "cli/import_workflow/airbyte.py",
+    "cli/import_workflow/dbt.py",
+    "cli/import_workflow/dlt.py",
+    "cli/import_workflow/meltano.py",
+    "cli/import_workflow/singer.py",
+    "cli/product_new.py",
+    "forge/product_types.py",
+    "forge/templates/_v073_builder.py",
+)
+
 _VERSION = re.compile(r"^\d+\.\d+\.\d+$")
+#: Contract text in a string: YAML ``fluidVersion: "0.7.3"`` or JSON
+#: ``"fluidVersion": "0.7.3"``.
+_IN_TEXT = re.compile(r"""fluidVersion["']?\s*:\s*["']?\d+\.\d+\.\d+""")
 
 
 def _is_version(node: object) -> bool:
@@ -135,9 +158,14 @@ def _is_key(node: object) -> bool:
 
 def _literals(tree: ast.AST) -> Iterator[int]:
     """Lines where code sets a contract's version to a literal: a ``fluidVersion``
-    key in a dict display, ``x["fluidVersion"] = ...``, a ``fluidVersion=``
-    keyword, or a ``fluid_version`` default."""
+    key in a dict display, ``x["fluidVersion"] = ...``, ``x.setdefault(...)``, a
+    ``fluidVersion=`` or ``fluid_version=`` keyword, a ``fluid_version`` default,
+    or contract text in a string that declares one."""
     for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if _IN_TEXT.search(node.value):
+                yield node.lineno
+            continue
         if isinstance(node, ast.Dict):
             for key, value in zip(node.keys, node.values, strict=True):
                 if _is_key(key) and _is_version(value):
@@ -148,9 +176,14 @@ def _literals(tree: ast.AST) -> Iterator[int]:
                     if _is_version(node.value):
                         yield node.lineno
         elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "setdefault":
+                if len(node.args) == 2 and _is_key(node.args[0]) and _is_version(node.args[1]):
+                    yield node.lineno
             for keyword in node.keywords:
-                if keyword.arg == "fluidVersion" and _is_version(keyword.value):
-                    yield keyword.value.lineno
+                if keyword.arg in ("fluidVersion", "fluid_version"):
+                    if _is_version(keyword.value):
+                        yield keyword.value.lineno
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name) and node.target.id == "fluid_version":
                 if _is_version(node.value):
@@ -184,6 +217,17 @@ def test_no_contract_builder_types_a_version() -> None:
     )
 
 
+def test_no_builder_keeps_a_version_in_a_constant() -> None:
+    found = []
+    for rel in BUILDERS:
+        tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
+            if value is not None and _is_version(value):
+                found.append(f"fluid_build/{rel}:{node.lineno}")
+    assert not found, "a version constant in a contract builder: " + ", ".join(found)
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -193,6 +237,10 @@ def test_no_contract_builder_types_a_version() -> None:
         "class A:\n    fluid_version: str = '0.7.3'",
         "def f(*, fluid_version='0.7.3'): pass",
         "def f(fluid_version='0.7.3'): pass",
+        'c.setdefault("fluidVersion", "0.7.3")',
+        'build_contract(spec=s, project_config={}, fluid_version="0.7.3")',
+        "T = 'fluidVersion: \"0.7.3\"\\nkind: DataProduct'",
+        'T = \'{"fluidVersion": "0.7.3"}\'',
     ],
 )
 def test_the_fence_sees_each_form(source: str) -> None:

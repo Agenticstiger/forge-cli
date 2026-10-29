@@ -327,6 +327,7 @@ class TestEveryContractValidates:
     )
     def test_schema_valid_direct_manifest(self, fixture, schema_manager):
         contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / fixture))
+        assert contract["fluidVersion"] == type(schema_manager).latest_bundled_version()
         result = schema_manager.validate_contract(
             contract, contract["fluidVersion"], offline_only=True
         )

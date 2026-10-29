@@ -128,7 +128,7 @@ class TestIntrospectJdbc:
 
 
 class TestRunFromJdbcSource:
-    def test_emits_v073_contract_from_sqlite(self, sqlite_db: Path, tmp_path: Path):
+    def test_emits_a_stable_schema_contract_from_sqlite(self, sqlite_db: Path, tmp_path: Path):
         import logging
 
         from fluid_build.cli.forge_data_model import _run_from_jdbc_source

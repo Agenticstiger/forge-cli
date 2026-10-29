@@ -92,6 +92,7 @@ class TestMeltanoImporter:
         importer = MeltanoImporter()
         assert importer.can_import(str(project))
         contract, report = importer.import_to_contract(str(project))
+        assert contract["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
         result = schema_manager.validate_contract(
             contract, contract["fluidVersion"], offline_only=True
         )
@@ -161,6 +162,7 @@ class TestAirbyteImporter:
         }
         importer = AirbyteImporter(server_url="https://airbyte.test")
         contract, report = importer.import_to_contract("ws-1")
+        assert contract["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
         result = schema_manager.validate_contract(
             contract, contract["fluidVersion"], offline_only=True
         )
@@ -198,6 +200,7 @@ class TestDltImporter:
         importer = DltImporter()
         assert importer.can_import(str(pipeline_dir))
         contract, report = importer.import_to_contract(str(pipeline_dir))
+        assert contract["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
         result = schema_manager.validate_contract(
             contract, contract["fluidVersion"], offline_only=True
         )
@@ -249,6 +252,7 @@ class TestSingerImporter:
         importer = SingerImporter()
         assert importer.can_import(str(cfg))
         contract, report = importer.import_to_contract(str(cfg))
+        assert contract["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
         result = schema_manager.validate_contract(
             contract, contract["fluidVersion"], offline_only=True
         )
