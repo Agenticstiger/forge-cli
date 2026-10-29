@@ -387,14 +387,45 @@ def test_c12_bare_fragment_without_a_slash_is_not_a_json_pointer(tmp_path: Path)
     )
 
 
-def test_c12_file_ref_with_a_bare_fragment_stays_lenient_for_released_contracts(
-    tmp_path: Path,
+def test_c12_file_ref_with_a_bare_fragment_still_resolves_with_a_deprecation_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Characterisation, deliberate: ``file.yaml#foo`` reads key ``foo`` (not reported)."""
+    """N-24, decided: ``file.yaml#foo`` still reads key ``foo``, for the contracts written
+    that way, and logs a deprecation WARNING that names the ref and the fix: RFC 6901 says
+    a pointer is "" or starts with "/", and a later minor release refuses it."""
     _write(tmp_path / "x.yaml", "foo: 5\nbar: {baz: 6}\n")
 
-    assert _lc(tmp_path, 'a: {$ref: "./x.yaml#foo"}\n')["a"] == 5
-    assert _lc(tmp_path, 'a: {$ref: "./x.yaml#bar/baz"}\n')["a"] == 6
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert _lc(tmp_path, 'a: {$ref: "./x.yaml#foo"}\n')["a"] == 5
+        assert _lc(tmp_path, 'a: {$ref: "./x.yaml#bar/baz"}\n')["a"] == 6
+        assert _lc(tmp_path, 'a: {$ref: "./x.yaml#/bar/baz"}\n')["a"] == 6
+
+    warnings = [r for r in caplog.records if getattr(r, "event", None) == _NO_SLASH]
+    assert [(r.ref, r.fix) for r in warnings] == [  # type: ignore[attr-defined]
+        ("./x.yaml#foo", "./x.yaml#/foo"),
+        ("./x.yaml#bar/baz", "./x.yaml#/bar/baz"),
+    ]
+    first = warnings[0].getMessage()
+    assert warnings[0].levelno == logging.WARNING
+    assert "$ref './x.yaml#foo' at JSON pointer '/a' in " in first
+    assert "deprecated: a later minor release will refuse it. Write './x.yaml#/foo'" in first
+    assert "RFC 6901" in first
+
+
+def test_c12_the_deprecation_is_logged_once_per_ref_and_never_for_a_same_document_pointer(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write(tmp_path / "x.yaml", "foo: 5\n")
+    path = _contract(tmp_path, 'a: {$ref: "./x.yaml#foo"}\nb: {$ref: "#/a"}\n')
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert load_contract(path) == {"a": 5, "b": 5}
+        assert load_contract(path) == {"a": 5, "b": 5}
+
+    assert len([r for r in caplog.records if getattr(r, "event", None) == _NO_SLASH]) == 1
+
+
+_NO_SLASH = "ref_pointer_without_slash"
 
 
 def test_c13_trailing_and_lone_slash_pointers_sg01(tmp_path: Path) -> None:

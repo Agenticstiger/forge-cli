@@ -27,6 +27,7 @@ oracle. N-09 (SG-18) is decided: a key written twice is refused. A test marked
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tarfile
 import unicodedata
@@ -1204,17 +1205,29 @@ def test_n24_a_file_name_with_a_hash_cannot_be_named_because_the_ref_splits_at_t
     assert "a#b.yaml" not in reads
 
 
-def test_n24_a_file_refs_pointer_without_a_slash_names_a_key_for_compatibility(
-    tmp_path: Path,
+def test_n24_a_file_refs_pointer_without_a_slash_names_a_key_and_is_deprecated(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Characterization (N24, decided): a file ref's fragment need not start with '/'.
-    ``./a#b.yaml`` reads key ``b.yaml`` of file ``a``, and ``./x.yaml#key`` key ``key``,
-    as contracts 0.24.0 loaded did; only a same-document ``#key`` is refused (C-12)."""
+    """N-24, decided: a file ref's fragment need not start with '/' yet. ``./a#b.yaml``
+    reads key ``b.yaml`` of file ``a``, and ``./x.yaml#key`` key ``key``, as contracts
+    0.24.0 loaded did, each with a deprecation WARNING naming the fix; only a
+    same-document ``#key`` is refused (C-12)."""
     _write(tmp_path / "a", "b.yaml: KEY-OF-A\nother: 1\n")
     _write(tmp_path / "x.yaml", "key: KEY-OF-X\n")
 
-    assert _rfr({"x": {"$ref": "./a#b.yaml"}}, tmp_path) == {"x": "KEY-OF-A"}
-    assert _rfr({"x": {"$ref": "./x.yaml#key"}}, tmp_path) == {"x": "KEY-OF-X"}
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert _rfr({"x": {"$ref": "./a#b.yaml"}}, tmp_path) == {"x": "KEY-OF-A"}
+        assert _rfr({"x": {"$ref": "./x.yaml#key"}}, tmp_path) == {"x": "KEY-OF-X"}
+
+    deprecated = {
+        r.ref: r.getMessage()  # type: ignore[attr-defined]
+        for r in caplog.records
+        if getattr(r, "event", None) == "ref_pointer_without_slash"
+    }
+    assert set(deprecated) == {"./a#b.yaml", "./x.yaml#key"}
+    assert "Write './a#/b.yaml'" in deprecated["./a#b.yaml"]
+    assert "Write './x.yaml#/key'" in deprecated["./x.yaml#key"]
+    assert all("a later minor release will refuse it" in m for m in deprecated.values())
 
 
 @pytest.mark.skipif(os.name == "nt", reason="a ? cannot be part of a Windows file name")

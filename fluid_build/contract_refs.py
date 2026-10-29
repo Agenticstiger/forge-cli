@@ -25,7 +25,9 @@ whatever it names:
    text, as a string, never parsed. A file with a suffix neither list knows
    is read as JSON, or else a YAML object, with a warning that names it.
 2. **Apply the pointer.** ``./part.yaml#/rules`` selects inside the target.
-   A pointer cannot select inside a text file.
+   A pointer cannot select inside a text file. One without its leading ``/``
+   (``./part.yaml#rules``) is read as ``/rules`` and logs a deprecation
+   warning: RFC 6901 pointers start with ``/``, and a later release refuses it.
 3. **Merge the siblings.** Keys written next to ``$ref`` are merged over a
    copy of the target as a JSON Merge Patch (RFC 7386): objects merge key by
    key, any other value (a list included) replaces, ``null`` removes the key.
@@ -864,6 +866,8 @@ def _read_target(
     if is_text:
         return value, True
     if pointer:
+        if not pointer.startswith("/"):
+            _note_pointer_without_slash(ref, pointer, where)
         try:
             value = resolve_pointer(value, pointer)
         except RefResolutionError as exc:
@@ -871,6 +875,26 @@ def _read_target(
                 f"Failed to resolve pointer '{pointer}' in '{ref}' {where}: {exc}"
             ) from exc
     return value, False
+
+
+def _note_pointer_without_slash(ref: str, pointer: str, where: str) -> None:
+    """WARN, once per ref, that a file ref's pointer lacks its leading ``/`` (N-24).
+
+    RFC 6901: a JSON pointer is ``""`` or starts with ``/``. A file ref's
+    pointer without one (``./x.yaml#foo``) has always named ``/foo`` and still
+    does, for the contracts written that way; it is deprecated, and a later
+    minor release will refuse it, as a same-document ``#foo`` is refused now.
+    """
+    fix = f"{parse_ref(ref)[0]}#/{pointer}"
+    _warn_once(
+        "ref_pointer_without_slash",
+        f"ref_pointer_without_slash: $ref '{ref}' {where} has a JSON pointer without a "
+        f"leading '/', which is deprecated: a later minor release will refuse it. Write "
+        f"'{fix}'. A JSON pointer is '' or starts with '/' (RFC 6901); until then this one "
+        f"is read as '/{pointer}'.",
+        ref=ref,
+        fix=fix,
+    )
 
 
 def _parse(target: Path, ref: str, where: str) -> Any:

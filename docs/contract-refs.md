@@ -46,6 +46,13 @@ fluid bundle   orders/contract.fluid.yaml   # print the single resolved document
 A ref is resolved relative to the file that contains it, so
 `fragments/builds/ingest.yaml` may itself say `$ref: ../policy.yaml`.
 
+A pointer starts with `/` (`fragments/policy.yaml#/gold`): a JSON pointer is
+`""` or starts with `/` ([RFC 6901](https://www.rfc-editor.org/rfc/rfc6901)).
+A file ref's pointer without it (`fragments/policy.yaml#gold`) is still read as
+`/gold`, but it is deprecated: it logs a `ref_pointer_without_slash` warning
+that names the ref and the fix, and a later minor release will refuse it. A
+same-document `#gold` is refused already.
+
 Keys written beside `$ref` are merged over a copy of what it names, as a
 [JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7386): objects merge, a
 list or a scalar replaces, `null` removes a key. A target that is not an
