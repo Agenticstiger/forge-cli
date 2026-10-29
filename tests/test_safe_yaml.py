@@ -345,6 +345,36 @@ def test_unique_keys_compares_keys_as_constructed() -> None:
 
 
 @pytest.mark.parametrize(
+    "text",
+    [
+        "{=: 1}\n",
+        "=: 1\na: 2\n",
+        "ops:\n  =: eq\n  '!=': ne\n",
+        "base: &b {=: 1}\nuse: {<<: *b, =: 2}\n",
+        "? !!value =\n: 1\n",
+    ],
+    ids=["flow", "block", "nested", "merged-then-overridden", "explicit-tag"],
+)
+def test_unique_keys_reads_a_plain_equals_key_as_stock_pyyaml_does(text: str) -> None:
+    """YAML 1.1 tags a plain ``=`` key ``tag:yaml.org,2002:value``, and PyYAML's
+    ``flatten_mapping`` makes it the string ``"="``. The duplicate check runs before that,
+    so it must read the key as it becomes: SafeLoader has no constructor for the tag, and
+    constructing it refused every file holding ``{=: 1}``, which ``yaml.safe_load`` reads."""
+    assert load_yaml_safe(text, unique_keys=True) == yaml.safe_load(text)
+
+
+@pytest.mark.parametrize("text", ['=: 1\n"=": 2\n', "'=': 1\n=: 2\n", "{=: 1, =: 2}\n"])
+def test_unique_keys_refuses_a_plain_equals_key_beside_the_same_key(text: str) -> None:
+    """A plain ``=`` is the key ``"="``: written beside a quoted one, a dict keeps one."""
+    assert len(yaml.safe_load(text)) == 1, "stock PyYAML drops one of the two"
+
+    with pytest.raises(DuplicateKeyError) as info:
+        load_yaml_safe(text, unique_keys=True, name="f")
+
+    assert (info.value.key, info.value.line) == ("=", text.count("\n"))
+
+
+@pytest.mark.parametrize(
     ("text", "expected"),
     [
         ("d: &d {a: 1, b: 2}\nitem:\n  <<: *d\n  b: 3\n", {"a": 1, "b": 3}),

@@ -203,6 +203,11 @@ def load_json_unique(text: str, *, name: Optional[str] = None) -> Any:
 #: The tag PyYAML gives a ``<<`` merge key: a directive, never a data key.
 _MERGE_TAG = "tag:yaml.org,2002:merge"
 
+#: The tag PyYAML gives a plain ``=`` (YAML 1.1's "value" key type). SafeLoader
+#: has no constructor for it: ``flatten_mapping`` makes such a key the string
+#: ``"="`` before the mapping is constructed, so ``{=: 1}`` loads as ``{"=": 1}``.
+_VALUE_TAG = "tag:yaml.org,2002:value"
+
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
     """A ``SafeLoader`` that refuses a key written twice in one mapping (yaml/pyyaml#165).
@@ -216,7 +221,8 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
     a merged ``a`` beside its own by the time it is constructed. Each mapping is
     checked once, the first time it is flattened, which is before any change.
     Keys are compared as they are constructed (YAML 1.1 ``on`` and ``yes`` are
-    the one key ``True``), so every key a dict would silently drop is refused.
+    the one key ``True``, and a plain ``=`` is the string ``"="`` it becomes in
+    ``flatten_mapping``), so every key a dict would silently drop is refused.
     A ``<<`` is not compared: it is a merge directive, not a data key, so a
     mapping may write several and each merge applies, later ones winning a key
     two of them bring, as PyYAML merges them.
@@ -240,7 +246,11 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
                 continue  # a merge directive: every one of them applies
             if not isinstance(key_node, yaml.ScalarNode):
                 continue  # a collection as a key: construction refuses it as unhashable
-            key = self.construct_object(key_node)
+            if key_node.tag == _VALUE_TAG:
+                # Checked before ``flatten_mapping`` retags it: the key it becomes.
+                key: Any = key_node.value
+            else:
+                key = self.construct_object(key_node)
             try:
                 first = seen.get(key)
             except TypeError:

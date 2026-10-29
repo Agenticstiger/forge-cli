@@ -702,6 +702,29 @@ def test_n13_a_string_sibling_does_not_merge_with_an_int_key_sg03(tmp_path: Path
     assert got == {200: "a", "other": 1, "200": "x"}
 
 
+def test_n13_a_plain_equals_key_loads_as_before_and_the_contract_validates(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``=`` is YAML 1.1's "value" key, which PyYAML reads as the string ``"="``:
+    ``{=: eq}`` is ``{"=": "eq"}``, in the contract and in a fragment, as 0.25.0 read
+    it. The unique-key check constructed the key before PyYAML retags it, and refused it."""
+    _write(tmp_path / "ops.yaml", "=: eq\n'!=': ne\n")
+    doc = _min_doc()
+    doc["builds"][0]["properties"]["parameters"] = {
+        "operators": "INLINE",
+        "more": {"$ref": "./ops.yaml"},
+    }
+    text = yaml.safe_dump(doc, sort_keys=False).replace("operators: INLINE", "operators: {=: eq}")
+    assert "operators: {=: eq}" in text
+    contract = _write(tmp_path / "contract.fluid.yaml", text)
+
+    parameters = loader.load_contract(contract)["builds"][0]["properties"]["parameters"]
+
+    assert parameters == {"operators": {"=": "eq"}, "more": {"=": "eq", "!=": "ne"}}
+    code, output = _cli(capsys, "validate", str(contract))
+    assert code == 0, output
+
+
 # ── N-14 .. N-16: ref values, nesting, look-alike keys ─────────────────
 
 
