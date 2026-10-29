@@ -1047,6 +1047,71 @@ def test_n16_an_openapi_document_moved_to_sources_keeps_its_own_refs_sg05(
     }
 
 
+def test_n16_validate_names_a_bundles_literal_key_as_its_contract_does_sg05(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``$$ref`` key is the literal key ``$ref``: where the schema allows no such key (an
+    expose is closed), ``validate`` refuses the contract for ``'$ref'``. Its bundle holds
+    the key escaped, and ``validate`` must read it back before the schema check: read as
+    written, the bundle's error named ``'$$ref'``, a key the contract does not have."""
+    doc = _min_doc()
+    doc["exposes"][0]["$$ref"] = "#/exposes/0/kind"
+    contract = _write_contract(tmp_path, doc)
+    tgz = tmp_path / "b.tgz"
+
+    code, output = _cli(capsys, "validate", str(contract))
+    assert code == 1, output
+    assert "'$ref' was unexpected" in output and "'$$ref'" not in output
+
+    code, output = _cli(capsys, "bundle", str(contract), "--format", "tgz", "--out", str(tgz))
+    assert code == 0, output
+    with tarfile.open(tgz) as archive:
+        resolved = yaml.safe_load(archive.extractfile("contract.resolved.yaml"))  # type: ignore[arg-type]
+    assert "$$ref" in resolved["exposes"][0], "the bundle holds the key escaped"
+
+    code, output = _cli(capsys, "validate", str(tgz))
+    assert code == 1, output
+    assert "'$ref' was unexpected" in output
+    assert "'$$ref'" not in output
+
+
+def test_n16_a_moved_openapi_document_keeps_every_escape_level_through_a_bundle_sg05(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``sources/openapi/`` holds the document as the composed contract has it: its ``$ref``
+    (written ``$$ref``) and its literal ``$$ref`` (written ``$$$ref``). The bundle reader
+    unescapes the resolved contract BEFORE it puts the document back; after, the
+    document's ``$$ref`` lost a ``$`` a second time and came back as ``$ref``."""
+    from fluid_build._contract_loader import load_contract_with_overlay
+    from fluid_build.api.contract import load_contract
+
+    doc = _min_doc()
+    doc["exposes"][0]["openapi"] = {
+        "openapi": "3.1.0",
+        "paths": {"/o": {"get": {"responses": {"200": {"$$ref": "#/components/responses/Ok"}}}}},
+        "components": {"x-note": {"$$$ref": "a literal key, two dollars"}},
+    }
+    contract = _write_contract(tmp_path, doc)
+    tgz = tmp_path / "b.tgz"
+    composed = loader.compose_contract(contract).document
+    openapi = composed["exposes"][0]["openapi"]
+    assert openapi["paths"]["/o"]["get"]["responses"]["200"] == {
+        "$ref": "#/components/responses/Ok"
+    }
+    assert openapi["components"]["x-note"] == {"$$ref": "a literal key, two dollars"}
+
+    code, output = _cli(capsys, "bundle", str(contract), "--format", "tgz", "--out", str(tgz))
+    assert code == 0, output
+    with tarfile.open(tgz) as archive:
+        (moved,) = [n for n in archive.getnames() if n.startswith("sources/openapi/")]
+        source = yaml.safe_load(archive.extractfile(moved))  # type: ignore[arg-type]
+    assert source == openapi, "the moved document is written as composed"
+
+    assert load_contract(tgz).contract == composed
+    engine = load_contract_with_overlay(str(tgz), None, logging.getLogger("test"))
+    assert engine["exposes"][0]["openapi"] == openapi
+
+
 def _hand_made_bundle(tmp_path: Path, resolved: str) -> Path:
     """A tgz with a valid MANIFEST whose ``contract.resolved.yaml`` is ``resolved``."""
     from fluid_build.forge.core.bundle import build_manifest, write_tgz
