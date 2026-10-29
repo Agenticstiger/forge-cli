@@ -385,7 +385,9 @@ def split_contract_to_fragments(
     Only parts that actually exist, are non-empty, and are not already a
     ``$ref`` are split. A relative ``$ref`` inside a part that moves is
     rewritten to name the same file from the part's new one
-    (:func:`rebased_ref`). The input *contract* is not mutated.
+    (:func:`rebased_ref`). A part is replaced by its ref only where it moves
+    from, even when a YAML anchor or merge key put its container at other
+    places too (:func:`_own_parent`). The input *contract* is not mutated.
     """
     if not isinstance(contract, dict):
         return contract, {}
@@ -396,7 +398,7 @@ def split_contract_to_fragments(
     # Deepest first, so a part inside another (a build's SQL) is a ref in
     # its container's file by the time the container moves.
     for site in sorted(sites, key=lambda s: len(s.path), reverse=True):
-        parent = _walk(root, site.path[:-1])
+        parent = _own_parent(root, site.path)
         value = parent[site.path[-1]]
         if site.text:
             fragments[site.target] = value
@@ -423,10 +425,23 @@ def _exact_dumper() -> Any:
     return ExactDumper
 
 
-def _walk(document: Any, path: Iterable[Union[str, int]]) -> Any:
-    for part in path:
-        document = document[part]
-    return document
+def _own_parent(root: Dict[str, Any], path: Tuple[Union[str, int], ...]) -> Any:
+    """The container that holds the last step of ``path``, made this path's own on
+    the way down: each container below ``root`` is replaced, in the one above it,
+    by a shallow copy of itself.
+
+    A YAML anchor or merge key (``<<: *defaults``) puts one object at several
+    places. Replaced by its ref in place, a part sharing a parent with another
+    one changed there too, and the other one then moved the ref instead of
+    itself: a dict as an sql file, or the splitter's own ref rebased as if it
+    had been written in the contract.
+    """
+    parent: Any = root
+    for step in path[:-1]:
+        own = copy.copy(parent[step])
+        parent[step] = own
+        parent = own
+    return parent
 
 
 def describe_fragment_layout(

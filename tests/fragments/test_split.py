@@ -1833,6 +1833,121 @@ def test_i22_the_notice_is_only_for_the_alias_fallback(
     assert "were not kept" not in capsys.readouterr().err
 
 
+#: Defaults a merge key puts into two builds: one ``properties`` mapping, at
+#: three places (the defaults and both builds).
+MERGED_DEFAULTS = """\
+id: x
+defaults: &d
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: SELECT 1
+builds:
+  - id: a
+    <<: *d
+  - id: b
+    <<: *d
+"""
+
+#: One ``contract`` mapping, the schema in it, at two exposes.
+ALIASED_CONTRACT = """\
+id: x
+exposes:
+  - exposeId: a
+    contract: &c
+      schema:
+        - {name: c1, type: string}
+  - exposeId: b
+    contract: *c
+"""
+
+#: Contracts where a YAML anchor, alias or merge key puts one container at two
+#: places, each with the parts to split: (text, parts).
+SHARED_CONTAINERS: Dict[str, Tuple[str, str]] = {
+    "merged-defaults-sql": (MERGED_DEFAULTS, "sql"),
+    "merged-defaults-builds-and-sql": (MERGED_DEFAULTS, "builds,sql"),
+    "aliased-contract": (ALIASED_CONTRACT, "exposes,schema"),
+    "aliased-contract-schema-only": (ALIASED_CONTRACT, "schema"),
+    "the-same-build-twice": (
+        "id: x\nbuilds:\n  - &b\n    id: a\n    engine: sql\n"
+        "    properties: {sql: SELECT 1, parameters: {$ref: ./p.yaml}}\n  - *b\n",
+        "builds,sql",
+    ),
+    "merged-properties-holding-a-ref": (
+        "id: x\nprops: &p\n  sql: SELECT 1\n  parameters: {$ref: ./p.yaml}\nbuilds:\n"
+        "  - id: a\n    properties:\n      <<: *p\n  - id: b\n    properties: *p\n",
+        ALL_PARTS,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(SHARED_CONTAINERS))
+def test_i22_parts_in_a_container_an_alias_shares_split_as_data(
+    tmp_path: Path, case: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding N1: the data split replaced a part by its ref in the container
+    itself, so at every place an anchor or a merge key had put that container.
+    The next part there then moved the ref instead of itself: a dict as an sql
+    file (an unexpected error), or the splitter's own ref rebased as if it had
+    been written in the contract (a refusal, where the split before SP-02
+    worked). Each part is now replaced where it moves from, and nowhere else;
+    none of these splits worse than before, and none ends in an error."""
+    text, parts = SHARED_CONTAINERS[case]
+    pair = make_pair(tmp_path, {NAME: text, "p.yaml": "mode: full\n"})
+    capsys.readouterr()
+
+    after = split_and_check(pair, parts)
+
+    assert "the contract uses YAML aliases" in capsys.readouterr().err
+    for rel in new_files(pair, after):
+        if rel.startswith("sql/"):
+            assert after[rel] == b"SELECT 1"
+        elif rel.startswith("fragments/schemas/"):
+            assert yaml.safe_load(text_of(after, rel)) == [{"name": "c1", "type": "string"}]
+    if case.startswith("merged-defaults"):
+        defaults = yaml.safe_load(text_of(after, NAME))["defaults"]  # stays as it was
+        assert defaults["properties"] == {"sql": "SELECT 1"}
+        assert {"sql/a.sql", "sql/b.sql"} <= set(after)
+    if case == "aliased-contract":
+        for expose in ("a", "b"):
+            moved = yaml.safe_load(text_of(after, f"fragments/exposes/{expose}.yaml"))
+            assert moved["contract"]["schema"] == {"$ref": f"../schemas/{expose}.yaml"}
+
+
+def test_i22_the_dict_level_splitter_replaces_a_part_only_where_it_moves_from() -> None:
+    """N1 at the dict level: two builds hold one ``properties`` object."""
+    from fluid_build.cli.forge_contract_fragments import split_contract_to_fragments
+
+    shared = {"sql": "SELECT 1\n", "parameters": {"$ref": "./p.yaml"}}
+    contract = {"builds": [{"id": "a", "properties": shared}, {"id": "b", "properties": shared}]}
+
+    root, files = split_contract_to_fragments(contract, ("builds", "sql"))
+
+    assert files["sql/a.sql"] == files["sql/b.sql"] == "SELECT 1\n"
+    for build in ("a", "b"):
+        moved = yaml.safe_load(files[f"fragments/builds/{build}.yaml"])
+        assert moved["properties"] == {
+            "sql": {"$ref": f"../../sql/{build}.sql"},
+            "parameters": {"$ref": "../../p.yaml"},
+        }
+    assert shared == {"sql": "SELECT 1\n", "parameters": {"$ref": "./p.yaml"}}  # not mutated
+
+
+def test_i22_a_part_that_is_no_text_is_refused_before_anything_is_written(tmp_path: Path) -> None:
+    """N1's crash: a dict where a text belongs ended in an unexpected error from
+    the writer. Whatever puts one there, the split is refused cleanly, nothing made."""
+    from fluid_build.cli import split as split_command
+
+    root = write(tmp_path / NAME, "id: x\n")
+    before = digest(tmp_path)
+    fragments: Dict[str, Any] = {"fragments/builds/a.yaml": "id: a\n", "sql/a.sql": {"$ref": "x"}}
+
+    problem = split_command._write_checked({}, root, "id: y\n", fragments, tmp_path)
+
+    assert problem is not None and problem.startswith("sql/a.sql cannot be written: ")
+    assert digest(tmp_path) == before
+
+
 # ── I-23: JSON roots ────────────────────────────────────────────────────
 
 JSON_ROOT = json.dumps(yaml.safe_load(SPLIT_ALL), indent=2) + "\n"

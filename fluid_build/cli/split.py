@@ -350,6 +350,8 @@ def _write_checked(
             data[out_dir / rel_path] = content.encode("utf-8")
         except UnicodeEncodeError as exc:
             return f"{rel_path} cannot be written as UTF-8: {exc}"
+        except Exception as exc:  # noqa: BLE001 - a part that is no text: refused, nothing made
+            return f"{rel_path} cannot be written: {exc}"
     root_data = root_text.encode("utf-8")
     original_root: Optional[bytes] = root_out.read_bytes() if root_out.exists() else None
     made: List[Path] = []
