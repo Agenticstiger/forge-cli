@@ -57,6 +57,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and docs link stay hidden.
 - **`fluid validate missing.fluid.yaml` said "Contract file not found: None"**; it names the
   file again.
+- **`fluid apply` no longer takes a platform for a provider** (#752). Without `--provider`, a
+  default-mode apply named its provider after the last expose's `binding.platform`, else the
+  first build's `execution.runtime.platform`, word for word. So a Flink job writing a Kafka topic
+  ended as `provider_unknown` ("kafka"), and so did a local product with a Flink build on
+  `kubernetes`. The platforms are read in the same order, and the provider is the one they
+  named before; what changed is a platform that names no provider. One that a build running
+  outside forge-cli (`engine: flink`, or `properties.language: flink_sql`) runs on or writes to
+  is passed over: the local planner lands nothing for it, and the rest of the contract applies.
+  Any other platform no provider serves (`databricks`, `postgres`, a Kafka topic nothing in the
+  contract writes, a build's `kubernetes` runtime) stops the run with
+  `apply_platform_unsupported`, naming each field. Before, it was `provider_unknown` when it was
+  the one read, and otherwise handed to the local provider, which wrote a placeholder CSV for it
+  and reported success; an allow or block list set for the plugins does not change that. A
+  `plan.json` whose contract has a build that runs outside forge-cli is not applied by the local
+  provider (`apply_plan_runs_outside_forge`): for a plan it derives its own actions from the
+  contract, the first build's SQL into the first expose's file, which can be the file the job
+  writes. Most such plans stopped before too, as `provider_unknown`; one whose Flink build named
+  no runtime overwrote that file and reported success. In the default mode, `fluid apply` of the
+  contract file applies them. `--provider` (or `FLUID_PROVIDER`) still overrides the provider,
+  and `--provider auto` now leaves the choice to the contract, as it does for the other engines.
 - **`fluid split` rebases a relative `$ref` inside a part it moves.** A ref such as
   `sql: {$ref: ./sql/transform.sql}` was copied unchanged into `fragments/builds/transform.yaml`,
   where it named a file one or two directories off, so split refused the contract, and a split in
@@ -88,6 +108,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- `fluid apply` stops with `apply_platform_unsupported`, exit code 2 as before, where a platform
+  the contract declares has no provider; in `fluid apply`, `provider_unknown` now means a
+  `--provider` value no provider has. A contract with an expose on such a platform beside the
+  exposes that chose the provider, which applied with exit 0 (handed to that provider), now
+  stops: pass `--provider` to apply it as before.
+- When the provider is `local`, every build's `execution.runtime.platform` is checked, not only
+  the first: a later build declared for a platform no provider serves (`composer`,
+  `kubernetes`, ...), whose SQL the local provider ran on DuckDB, now stops the run. Declare it as
+  the job it is, or drop the platform.
+- In the default mode, a `plan.json` of a contract with a Flink build stops with
+  `apply_plan_runs_outside_forge` (exit 2) on the local provider, even with `--provider local`;
+  apply the contract file instead. (`--mode amend-and-build` and `replace-and-build` hand both to
+  the build runner, which this change does not touch.)
 - **`fluid bundle` no longer writes `contract.bundled.fluid.yaml` on its own.** A script that
   bundled a split contract and then read that file must pass `--out contract.bundled.fluid.yaml`.
   A `contract.bundled.fluid.yaml` an earlier `fluid ship` left beside a contract is a tarball, and
