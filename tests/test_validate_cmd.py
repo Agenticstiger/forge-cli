@@ -18,6 +18,8 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from fluid_build.cli.validate import (
     _determine_target_version,
     _find_previous_compatible_version,
@@ -192,3 +194,32 @@ def test_json_output_strict_exit_code_still_reflects_warnings(capsys):
 
     assert _output_json_results(result, _args(format="json", strict=True)) == 1
     assert _json.loads(capsys.readouterr().out)["warnings"] == ["short warning"]
+
+
+@pytest.mark.parametrize(
+    "flag, event",
+    [
+        ("--schema-version", "invalid_schema_version"),
+        ("--min-version", "invalid_min_version"),
+        ("--max-version", "invalid_max_version"),
+    ],
+)
+def test_a_version_flag_that_is_not_one_is_the_event_it_names(tmp_path, capsys, flag, event):
+    """``SchemaVersion.parse`` and ``VersionConstraint.parse`` raise a ``FluidError``, not a
+    ``ValueError``: a bad value is the flag's own typed error, never cli_unhandled_exception."""
+    from fluid_build.cli import main
+
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_text(
+        "fluidVersion: 0.7.5\nkind: DataProduct\nid: t.x\nname: X\ndomain: ops\n"
+        "metadata: {layer: Silver, owner: {team: ops, email: ops@example.com}}\n",
+        encoding="utf-8",
+    )
+
+    rc = main(["validate", str(contract), "--offline", flag, "bogus"])
+
+    captured = capsys.readouterr()
+    text = " ".join((captured.out + captured.err).split())
+    assert rc == 1, text
+    assert f"ERR_{event.upper()}" in text
+    assert "cli_unhandled_exception" not in text

@@ -500,6 +500,22 @@ def _fragment_kind(args: Any) -> Optional[str]:
     return kind if isinstance(kind, str) else None
 
 
+def _parse_version(parse: Callable[[str], Any], text: str, event: str) -> Any:
+    """``parse(text)``: a version, or a version constraint, with a bad one as the typed ``event``.
+
+    ``SchemaVersion.parse`` and ``VersionConstraint.parse`` raise the CLI's
+    ``ValidationError``, a ``FluidError`` and not a ``ValueError``, so each
+    ``except ValueError`` this replaces let ``--schema-version bogus`` end as
+    ``cli_unhandled_exception`` instead of the event it names.
+    """
+    from fluid_build.errors import FluidError
+
+    try:
+        return parse(text)
+    except (ValueError, FluidError) as exc:
+        raise CLIError(1, event, {"version": text, "error": str(exc)})
+
+
 def _refuse_fragment_run_without_file(args: Any) -> None:
     """A fragment run names its file. Without one, workspace discovery would fill in the
     contract of the working directory, which would be validated as if it were the fragment."""
@@ -540,7 +556,6 @@ def _run_fragment_validation(
     whole contract.
     """
     from fluid_build import contract_refs, loader
-    from fluid_build.errors import FluidError
     from fluid_build.schema_manager import SchemaVersion, ValidationResult
     from fluid_build.util.ref_confinement import RefResolutionError, is_within
 
@@ -593,10 +608,7 @@ def _run_fragment_validation(
     # The fragment is composed before a schema version is asked for: what is wrong with the file
     # itself (it cannot be read, its refs escape the root) is reported first.
     version = _fragment_schema_version(args.schema_version, fragment, contract)
-    try:
-        schema_version = SchemaVersion.parse(version)
-    except (ValueError, FluidError) as exc:
-        raise CLIError(1, "invalid_schema_version", {"version": version, "error": str(exc)})
+    schema_version = _parse_version(SchemaVersion.parse, version, "invalid_schema_version")
     schema = schema_manager.get_schema(schema_version, offline_only=True)
     if not schema:
         raise CLIError(1, "schema_not_available", {"version": version})
@@ -760,12 +772,8 @@ def _determine_target_version(
 
     # Explicit version specified
     if args.schema_version:
-        try:
-            return _self.SchemaVersion.parse(args.schema_version), False
-        except ValueError as e:
-            raise CLIError(
-                1, "invalid_schema_version", {"version": args.schema_version, "error": str(e)}
-            )
+        parse = _self.SchemaVersion.parse
+        return _parse_version(parse, args.schema_version, "invalid_schema_version"), False
 
     # Auto-detect from contract
     detected = schema_manager.detect_version(contract)
@@ -838,17 +846,13 @@ def _filter_compatible_versions(versions: list[SchemaVersion], args) -> list[Sch
     compatible = versions
 
     if args.min_version:
-        try:
-            min_constraint = _self.VersionConstraint.parse(args.min_version)
-        except ValueError as e:
-            raise CLIError(1, "invalid_min_version", {"version": args.min_version, "error": str(e)})
+        parse = _self.VersionConstraint.parse
+        min_constraint = _parse_version(parse, args.min_version, "invalid_min_version")
         compatible = [version for version in compatible if min_constraint.matches(version)]
 
     if args.max_version:
-        try:
-            max_constraint = _self.VersionConstraint.parse(args.max_version)
-        except ValueError as e:
-            raise CLIError(1, "invalid_max_version", {"version": args.max_version, "error": str(e)})
+        parse = _self.VersionConstraint.parse
+        max_constraint = _parse_version(parse, args.max_version, "invalid_max_version")
         compatible = [version for version in compatible if max_constraint.matches(version)]
 
     return compatible
@@ -1354,29 +1358,25 @@ def _validate_version_constraints(
 
     # Check minimum version constraint
     if args.min_version:
-        try:
-            min_constraint = _self.VersionConstraint.parse(args.min_version)
-            if not min_constraint.matches(version):
-                raise CLIError(
-                    2,
-                    "version_below_minimum",
-                    {"version": str(version), "constraint": args.min_version},
-                )
-        except ValueError as e:
-            raise CLIError(1, "invalid_min_version", {"version": args.min_version, "error": str(e)})
+        parse = _self.VersionConstraint.parse
+        min_constraint = _parse_version(parse, args.min_version, "invalid_min_version")
+        if not min_constraint.matches(version):
+            raise CLIError(
+                2,
+                "version_below_minimum",
+                {"version": str(version), "constraint": args.min_version},
+            )
 
     # Check maximum version constraint
     if args.max_version:
-        try:
-            max_constraint = _self.VersionConstraint.parse(args.max_version)
-            if not max_constraint.matches(version):
-                raise CLIError(
-                    2,
-                    "version_above_maximum",
-                    {"version": str(version), "constraint": args.max_version},
-                )
-        except ValueError as e:
-            raise CLIError(1, "invalid_max_version", {"version": args.max_version, "error": str(e)})
+        parse = _self.VersionConstraint.parse
+        max_constraint = _parse_version(parse, args.max_version, "invalid_max_version")
+        if not max_constraint.matches(version):
+            raise CLIError(
+                2,
+                "version_above_maximum",
+                {"version": str(version), "constraint": args.max_version},
+            )
 
 
 def _show_schema_info(
