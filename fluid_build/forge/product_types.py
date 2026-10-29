@@ -616,17 +616,53 @@ def _note_unreadable(candidate: Path, exc: Exception) -> None:
     with (a Jinja template of a contract is one), and named them, with their
     errors, to whoever reads the log. :func:`validate_composition_for_contract`
     warns instead, once, when the file may be the one a consumed product needs.
+
+    The reason is :func:`_skip_reason`, quoted as written, up to
+    :data:`_SKIP_REASON_CHARS` characters.
     """
     from fluid_build.util.excerpt import excerpt
 
-    reason = str(exc).strip() or type(exc).__name__
     LOG.debug(
         "composition_index_skip: %s could not be read: %s",
         excerpt(str(candidate)),
-        # The file is named already; its directory is a long, repeated prefix.
-        excerpt(reason.replace(str(candidate), candidate.name)),
+        excerpt(_skip_reason(exc), _SKIP_REASON_CHARS),
         extra={"event": "composition_index_skip", "path": str(candidate)},
     )
+
+
+#: How many characters of a reason :func:`_note_unreadable` quotes. A reason names
+#: files, so the 200 characters of an excerpt could end inside a path, before the key
+#: and the line it is about; and it may quote a ``$ref`` as written, of any size,
+#: which this bounds.
+_SKIP_REASON_CHARS = 4096
+
+
+def _skip_reason(exc: Exception) -> str:
+    """Why a contract could not be read: the deepest error of ``exc``'s ``raise ... from``
+    chain that still names the file it is about, else ``exc``.
+
+    A key written twice in a fragment the contract refs is a ``DuplicateKeyError``
+    (naming the fragment, the line and the key) under the ref error that led to it,
+    whose message names the ref and the contract first; a file that cannot be read
+    is an ``OSError`` with its ``filename``. An error further down that names no
+    file is not quoted: PyYAML calls its input ``<unicode string>``, and the error
+    around it says which file that was. Quoted as written: shortening a path inside
+    it (``str.replace``) turned another path holding it into a file that does not
+    exist.
+    """
+    from fluid_build.util.safe_yaml import DuplicateKeyError
+
+    chosen: BaseException = exc
+    seen = {id(exc)}
+    cause = exc.__cause__
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if (isinstance(cause, DuplicateKeyError) and cause.name) or (
+            isinstance(cause, OSError) and cause.filename
+        ):
+            chosen = cause
+        cause = cause.__cause__
+    return str(chosen).strip() or type(chosen).__name__
 
 
 #: How many of the products it could not check the composition warning names.

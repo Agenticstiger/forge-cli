@@ -493,6 +493,57 @@ def test_each_file_the_scan_cannot_read_is_still_a_debug_line_naming_it_and_why(
     assert "duplicate key 'name'" in skips[str(broken)].getMessage()
 
 
+def test_the_debug_line_quotes_a_duplicate_key_in_a_fragment_with_its_file_and_line(
+    tmp_path, caplog
+):
+    """A key written twice in a fragment the upstream refs: the ref error names the ref and
+    the contract first, so the 200 characters it was cut to ended inside a path, before the
+    key and its line. The DEBUG line quotes the duplicate-key error under it, whole."""
+    upstream = tmp_path / f"upstream-{'x' * 80}"  # its paths alone run past 200 characters
+    upstream.mkdir()
+    (upstream / "contract.fluid.yaml").write_text(
+        "id: up.y\nmetadata: {$ref: ./m.yaml}\n", encoding="utf-8"
+    )
+    (upstream / "m.yaml").write_text("productType: SDP\nproductType: ADP\n", encoding="utf-8")
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.forge.product_types"):
+        _check(tmp_path, "up.y")
+
+    (skip,) = _records(caplog, _SKIP)
+    assert skip.getMessage().endswith(
+        f" could not be read: {(upstream / 'm.yaml').resolve()}:2: duplicate key 'productType' "
+        "(first at line 1; YAML 1.2 requires unique keys); remove one of them"
+    )
+
+
+def test_the_debug_line_rewrites_no_path_when_the_workspace_root_is_relative(
+    tmp_path, caplog, monkeypatch
+):
+    """Library use with ``workspace_root=Path(".")``: the scan names the file
+    ``up2/contract.fluid.yaml``, and shortening that inside the reason turned the absolute
+    path a ref error names, ``.../up2/contract.fluid.yaml``, into ``.../contract.fluid.yaml``,
+    a file that does not exist. The reason is quoted as written: here the ref error, as the
+    YAML error under it names no file, and it names the fragment and the line."""
+    (tmp_path / "up2").mkdir()
+    (tmp_path / "up2" / "contract.fluid.yaml").write_text(
+        "id: up.y\nmetadata: {$ref: ./m.yaml}\n", encoding="utf-8"
+    )
+    (tmp_path / "up2" / "m.yaml").write_text("a: [\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    contract = {"metadata": {"productType": "ADP"}, "consumes": [{"productId": "up.y"}]}
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.forge.product_types"):
+        validate_composition_for_contract(contract, workspace_root=Path("."))
+
+    (skip,) = _records(caplog, _SKIP)
+    message = skip.getMessage()
+    contract_file = (tmp_path / "up2" / "contract.fluid.yaml").resolve()
+    assert message.startswith("composition_index_skip: up2/contract.fluid.yaml could not be read: ")
+    assert f" in {contract_file}: while parsing a flow node" in message
+    assert str(contract_file.parent.parent / "contract.fluid.yaml") not in message
+    assert 'in "m.yaml", line 2, column 1' in message
+
+
 def test_for_contract_sdp_rejects_any_upstream(tmp_path):
     _write_contract(tmp_path / "u.fluid.yaml", product_id="some.upstream", product_type="SDP")
     target = tmp_path / "target.fluid.yaml"
