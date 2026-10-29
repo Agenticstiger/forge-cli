@@ -367,12 +367,12 @@ def _write_checked(
     written: List[Path] = []
     root_opened = False
     try:
-        for target, content in data.items():
+        for target, encoded in data.items():
             _make_dirs(target.parent, made)
             with open(target, "xb") as handle:
                 # Taken back from here on, whatever happens to the write.
                 written.append(target)
-                handle.write(content)
+                handle.write(encoded)
         _make_dirs(root_out.parent, made)
         with open(root_out, "wb") as handle:
             root_opened = True
