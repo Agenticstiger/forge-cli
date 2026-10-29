@@ -367,8 +367,15 @@ def test_k13_quiet_still_says_why_the_run_stopped(
 
 @pytest.mark.parametrize("root", ["none", "unreadable"])
 def test_k13_a_fragment_valid_in_0_7_6_gets_no_false_error_from_a_guessed_older_schema(
-    tmp_path: Path, capsys: pytest.CaptureFixture, root: str
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch, root: str
 ) -> None:
+    # The premise, pinned rather than borrowed: a default that predates the field.
+    # With 0.7.6 the default since #752, a guess would accept the field, and the
+    # test could no longer fail.
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    monkeypatch.setattr(FluidSchemaManager, "PREVIEW_VERSIONS", frozenset({"0.7.6", "0.7.7"}))
+    assert FluidSchemaManager.latest_bundled_version() == "0.7.5"
     fragment = _expose()
     fragment["contract"]["id"] = "stable-contract-id-1"  # NEW in v0.7.6: older schemas refuse it
     where = _dump(tmp_path / "loose" / "sub" / "orders.yaml", fragment)
