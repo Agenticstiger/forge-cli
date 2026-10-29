@@ -61,6 +61,7 @@ def register(subparsers: argparse._SubParsersAction):
 
 def run(args, logger: logging.Logger) -> int:
     try:
+        _check_out(args.out)
         paths = _resolve_contract_paths(args, logger)
         # Load full contracts once so we can render both summaries and
         # per-contract drill-in pages without re-parsing.
@@ -129,15 +130,43 @@ def run(args, logger: logging.Logger) -> int:
         raise CLIError(1, "docs_failed", {"error": str(e)})
 
 
+def _check_out(out: str) -> None:
+    """Refuse an ``--out`` the catalog cannot be written to, and do it at once.
+
+    Before any contract is read, not after the whole catalog is rendered, and
+    without making a directory: a run that fails leaves no ``--out`` behind.
+    """
+    if os.path.lexists(out):
+        if not os.path.isdir(out):
+            raise NotADirectoryError(f"--out {out!r} is not a directory")
+        if not os.access(out, os.W_OK | os.X_OK):
+            raise PermissionError(f"--out {out!r} is a directory this user cannot write to")
+        return
+    nearest = os.path.dirname(os.path.abspath(out))
+    while not os.path.lexists(nearest):
+        nearest = os.path.dirname(nearest)
+    if not os.path.isdir(nearest):
+        raise NotADirectoryError(f"--out {out!r} cannot be made: {nearest!r} is not a directory")
+    if not os.access(nearest, os.W_OK | os.X_OK):
+        raise PermissionError(
+            f"--out {out!r} cannot be made: {nearest!r} is a directory this user cannot write to"
+        )
+
+
 def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
     """Write each ``(name, content)`` of ``files`` into ``out``, in that order.
 
     Every file is first written whole to a temp file beside it, and only when
     all of them are does each replace its file. A run that fails before then
-    takes its temp files back and leaves every file as the last run wrote it.
-    A replace swaps the directory entry: a symlink or a hard link planted in
-    ``out`` is replaced, never written through.
+    takes its temp files back, and the directories it made, and leaves every
+    file as the last run wrote it. A replace swaps the directory entry: a
+    symlink or a hard link planted in ``out`` is replaced, never written through.
     """
+    made: list[str] = []  # the directories this run makes, the deepest first
+    missing = os.path.abspath(out)
+    while not os.path.lexists(missing):
+        made.append(missing)
+        missing = os.path.dirname(missing)
     os.makedirs(out, exist_ok=True)
     staged: list[tuple[str, str]] = []
     try:
@@ -150,6 +179,9 @@ def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
         for temp, _target in staged:
             with contextlib.suppress(OSError):
                 os.unlink(temp)
+        for directory in made:
+            with contextlib.suppress(OSError):
+                os.rmdir(directory)
         raise
 
 

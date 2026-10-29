@@ -1093,6 +1093,79 @@ def test_j07_a_new_file_gets_the_mode_the_umask_gives_and_a_replaced_one_keeps_i
     assert stat.S_IMODE((out / "index.json").stat().st_mode) == 0o644
 
 
+def _docs_error(source: Path, out: Path) -> str:
+    """The error ``fluid docs --src <source> --out <out>`` stops with."""
+    from fluid_build.cli import docs_build
+    from fluid_build.cli._common import CLIError
+
+    args = types.SimpleNamespace(src=str(source), files=None, out=str(out))
+    with pytest.raises(CLIError) as failed:
+        docs_build.run(args, logging.getLogger("test.docs"))
+    assert failed.value.event == "docs_failed"
+    return str(failed.value.context["error"])
+
+
+def _no_contract_read(monkeypatch: pytest.MonkeyPatch) -> List[str]:
+    from fluid_build.cli import docs_build
+
+    read: List[str] = []
+    monkeypatch.setattr(docs_build, "_load_contract_quiet", lambda path, logger: read.append(path))
+    return read
+
+
+@pytest.mark.parametrize("where", ["a-file", "a-file/site"])
+def test_j07_an_out_that_cannot_be_a_directory_is_refused_before_any_contract_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """An --out that names a file, or a directory under one, was reported only once every
+    contract had been loaded and rendered (33 s on a big catalog), at the first write."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    _write(tmp_path / "a-file", "not a directory\n")
+    read = _no_contract_read(monkeypatch)
+
+    error = _docs_error(tmp_path / "src", tmp_path / where)
+
+    assert error.startswith(f"--out {str(tmp_path / where)!r} ") and "not a directory" in error
+    assert read == []
+    assert (tmp_path / "a-file").read_text(encoding="utf-8") == "not a directory\n"
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, not root")
+@pytest.mark.parametrize("where", ["locked", "locked/site", "locked/site/deeper"])
+def test_j07_an_out_this_user_cannot_write_to_is_refused_before_any_contract_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o555)
+    read = _no_contract_read(monkeypatch)
+    try:
+        error = _docs_error(tmp_path / "src", tmp_path / where)
+    finally:
+        locked.chmod(0o755)
+
+    assert error.startswith(f"--out {str(tmp_path / where)!r} ") and "cannot write to" in error
+    assert read == []
+    assert list(locked.iterdir()) == []
+
+
+def test_j07_a_first_run_that_fails_to_write_leaves_no_out_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+
+    def full(target: str, data: bytes) -> str:
+        raise OSError(errno.ENOSPC, "No space left on device", target)
+
+    monkeypatch.setattr(docs_build, "_stage", full)
+
+    assert _docs(tmp_path / "src", tmp_path / "new" / "deeper" / "site", src=True) != 0
+
+    assert [p.name for p in tmp_path.iterdir()] == ["src"]
+
+
 # ── J-08 ────────────────────────────────────────────────────────────────
 
 
