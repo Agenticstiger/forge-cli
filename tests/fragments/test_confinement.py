@@ -1062,9 +1062,9 @@ def test_d24_sg21_an_env_that_is_a_path_is_refused_by_every_command(
     parsed: List[Path] = []
     real = loader._parse_file
 
-    def spy(p: Path, **kwargs: Any) -> Dict[str, Any]:
+    def spy(p: Path) -> Dict[str, Any]:
         parsed.append(Path(p).resolve())
-        return real(p, **kwargs)
+        return real(p)
 
     monkeypatch.setattr(loader, "_parse_file", spy)
     if command == "generate-artifacts":

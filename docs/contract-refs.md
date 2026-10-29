@@ -62,13 +62,16 @@ overlay is merged, whichever file it is written in. A `$ref` in an overlay
 resolves relative to the overlay file. No `$ref` is left after composition: one
 that cannot be resolved fails the command and names the file it was written in.
 
-Every file the composition reads (the contract, an overlay, each fragment)
-writes a key once per mapping. A key written twice, two `$ref` keys included,
-fails the command with the file, the line and the key
+Every file the composition reads (the contract, an overlay, each fragment,
+`fluid.workspace.yaml`) writes a key once per mapping. A key written twice, two
+`$ref` keys included, fails the command with the file, the line and the key
 (`owner.yaml:3: duplicate key 'team' (YAML 1.2 requires unique keys)`): YAML
-and JSON parsers keep the last value and drop the other without a word. A key
-that a `<<` merge brings in and the mapping then writes itself is an override,
-not a duplicate.
+and JSON parsers keep the last value and drop the other without a word. A
+workspace file that writes a key twice is refused as one that cannot be
+parsed: its `ref_root` is ignored with a warning that names the key, and an
+`--env` its `expected-environments` might declare fails with that error
+rather than pass as undeclared. A key that a `<<` merge brings in and the
+mapping then writes itself is an override, not a duplicate.
 
 ### A payload with its own `$ref` keys: write `$$ref`
 
@@ -144,8 +147,8 @@ A workspace can widen it once for every product under it: `ref_root: .` in
 `fluid.workspace.yaml`, relative to that file. The root must stay inside the
 workspace file's own directory, contain the contract, and not be a home, a
 temporary directory, `/` or above the contract's repository; otherwise the
-setting is ignored with a warning. `FLUID_IGNORE_WORKSPACE_REF_ROOT=1` turns it
-off.
+setting is ignored with a warning, as is a workspace file that cannot be parsed
+or writes a key twice. `FLUID_IGNORE_WORKSPACE_REF_ROOT=1` turns it off.
 
 To share fragments between products, set the ref root to a directory that
 contains both the contracts and the shared fragments:

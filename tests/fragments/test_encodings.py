@@ -503,21 +503,60 @@ def test_n09_a_merged_key_written_again_is_an_override_not_a_duplicate_sg18(
     assert got["again"] == {"a": 2, "b": 1}
 
 
-def test_n09_a_workspace_file_is_not_part_of_a_contract_and_keeps_the_last_value(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_n09_a_workspace_file_with_a_duplicate_ref_root_is_refused_naming_the_key_sg18(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Only the files a contract is composed from are held to unique keys. The workspace
-    file (read for its ``ref_root``) and every other reader keep PyYAML's last-wins."""
-    from fluid_build.util.safe_yaml import load_yaml_safe
-
+    """SG-18, decided: ``fluid.workspace.yaml`` is a file the composition reads, held to
+    unique keys. A ``ref_root`` written twice is refused as a file that cannot be parsed
+    is: the contract keeps its own directory, and the WARNING and the escape error name
+    the file, the line and the key, where the last value used to win without a word."""
     monkeypatch.delenv("FLUID_IGNORE_WORKSPACE_REF_ROOT", raising=False)
     ws = tmp_path / "ws"
     _write(ws / "fluid.workspace.yaml", "ref_root: nowhere\nref_root: .\n")
     _write(ws / "shared" / "team.yaml", "team: shared\n")
     contract = _write(ws / "p" / "contract.fluid.yaml", "x: {$ref: ../shared/team.yaml}\n")
+    named = f"fluid.workspace.yaml:2: duplicate key 'ref_root' {_UNIQUE}"
 
-    assert loader.load_contract(contract) == {"x": {"team": "shared"}}
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        with pytest.raises(RefResolutionError, match="escapes the ref root") as info:
+            loader.load_contract(contract)
+
+    assert named in str(info.value)
+    (warning,) = [r for r in caplog.records if r.event == "workspace_ref_root_ignored"]  # type: ignore[attr-defined]
+    assert named in warning.getMessage()
+
+
+def test_n09_a_workspace_that_declares_environments_with_a_duplicate_key_refuses_sg18(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The workspace's ``expected-environments`` decide whether ``--env`` without an overlay
+    is refused. Written with a key twice, which environments it declares cannot be told:
+    the duplicate is the error, never "nothing declared", which would let the env pass."""
+    monkeypatch.delenv("FLUID_IGNORE_WORKSPACE_REF_ROOT", raising=False)
+    ws = tmp_path / "ws"
+    workspace = _write(
+        ws / "fluid.workspace.yaml",
+        "expected-environments:\n  p: [prod]\n  p: [staging]\n",
+    )
+    contract = _write_contract(ws / "p", _min_doc())
+
+    with pytest.raises(RuntimeError) as info:
+        loader.load_with_overlay(contract, "prod")
+
+    assert str(info.value) == f"{workspace}:3: duplicate key 'p' {_UNIQUE}"
+
+
+def test_n09_readers_off_the_composition_path_keep_the_last_value(tmp_path: Path) -> None:
+    """Only what the composition reads is held to unique keys. The other readers of YAML
+    keep PyYAML's last-wins, among them the workspace defaults ``fluid init`` and ``fluid
+    forge`` read (``cli.workspace_config``), which parse the file with ``yaml.safe_load``."""
+    from fluid_build.cli.workspace_config import load_workspace_config
+    from fluid_build.util.safe_yaml import load_yaml_safe
+
+    _write(tmp_path / "fluid.workspace.yaml", "name: first\nname: last\n")
+
     assert load_yaml_safe("a: 1\na: 2\n") == {"a": 2}
+    assert load_workspace_config(tmp_path).name == "last"
 
 
 def test_n10_tabs_in_a_yaml_fragment_are_an_error_naming_the_file_and_line(
