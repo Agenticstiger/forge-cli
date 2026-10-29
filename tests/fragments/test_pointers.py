@@ -428,6 +428,55 @@ def test_c12_the_deprecation_is_logged_once_per_ref_and_never_for_a_same_documen
 _NO_SLASH = "ref_pointer_without_slash"
 
 
+def test_c12_one_ref_written_in_many_places_is_one_bounded_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Security: the warning is keyed on the ref as written, never on the place, and quotes
+    an excerpt of each value. Keyed on its text, which named the JSON pointer of the place,
+    a contract whose one long key held refs logged one warning per ref, each carrying the
+    key: the review's 448 KB contract wrote 800 MB of log and kept it in the registry."""
+    _write(tmp_path / "t.yaml", "a: 1\n")
+    key = "k" * 50_000
+    doc = {"id": "x", key: [{"$ref": "./t.yaml#a"}] * 100, "again": {"$ref": "./t.yaml#a"}}
+    path = _write(tmp_path / "contract.fluid.json", json.dumps(doc))
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert load_contract(path)[key] == [1] * 100
+
+    warnings = [r.getMessage() for r in caplog.records if getattr(r, "event", None) == _NO_SLASH]
+    assert len(warnings) == 1, f"{len(warnings)} warnings for one ref"
+    assert len(warnings[0]) < 1_500, f"a {len(warnings[0]):,}-character warning"
+    # The first place it was met, ``/<key>/0``, cut after 200 characters.
+    assert f"$ref './t.yaml#a' at JSON pointer '/{'k' * 199}... (49,803 more characters)' in " in (
+        warnings[0]
+    )
+    assert len(contract_refs._NOTED_REF_WARNINGS) == 1
+
+
+def test_c12_the_deprecation_registry_is_keyed_on_the_ref_and_stays_bounded(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A long-lived process (the MCP server, a service on ``fluid_build.api``) composes each
+    upload from a fresh temporary directory: the same ref there is the same warning, logged
+    once. And no input grows the registry past its cap: once full, it starts again."""
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        for upload in range(25):
+            root = tmp_path / f"upload-{upload}"
+            _write(root / "t.yaml", "a: 1\n")
+            assert _lc(root, 'x: {$ref: "./t.yaml#a"}\n') == {"x": 1}
+
+    assert len([r for r in caplog.records if getattr(r, "event", None) == _NO_SLASH]) == 1
+    assert len(contract_refs._NOTED_REF_WARNINGS) == 1
+
+    cap = contract_refs._MAX_NOTED_REF_WARNINGS
+    _write(tmp_path / "keys.yaml", "".join(f"k{i}: {i}\n" for i in range(cap + 50)))
+    doc = {f"x{i}": {"$ref": f"./keys.yaml#k{i}"} for i in range(cap + 50)}
+    path = _write(tmp_path / "many.fluid.json", json.dumps(doc))
+
+    assert load_contract(path)[f"x{cap + 49}"] == cap + 49
+    assert len(contract_refs._NOTED_REF_WARNINGS) <= cap
+
+
 def test_c13_trailing_and_lone_slash_pointers_sg01(tmp_path: Path) -> None:
     """SG-01 characterisation. RFC 6901 reads ``/`` as the key ``""``; the resolver strips
     the slash: ``#/`` names the whole document and ``#/bar/`` names ``bar``."""

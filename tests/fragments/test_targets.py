@@ -483,7 +483,7 @@ def test_a16_query_template_and_script_suffixes_are_text_sg16(
     ],
     ids=["yaml", "json", "no-suffix"],
 )
-def test_a16_an_unknown_suffix_is_still_parsed_and_warns_once_per_file_sg16(
+def test_a16_an_unknown_suffix_is_still_parsed_and_warns_once_per_suffix_sg16(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     name: str,
@@ -492,14 +492,20 @@ def test_a16_an_unknown_suffix_is_still_parsed_and_warns_once_per_file_sg16(
     expected: Any,
 ) -> None:
     """SG-16, decided: a suffix the composition knows neither as data nor as text is parsed
-    as before (JSON, or else a YAML object), and one WARNING names the file, how it was
-    read and the suffixes a ref accepts; a file named twice, or composed again, warns once."""
+    as before (JSON, or else a YAML object), and one WARNING names the first file, how it
+    was read and the suffixes a ref accepts. A file named twice, composed again, another
+    file with that suffix, or the same file in a fresh directory, warns no more."""
     target = _write(tmp_path / name, text)
+    _write(tmp_path / f"other-{name}", text)
 
     with caplog.at_level(logging.WARNING, logger="fluid.loader"):
         doc = {"x": {"$ref": f"./{name}"}, "y": {"$ref": f"./{name}"}}
         assert _rfr(doc, tmp_path) == {"x": expected, "y": expected}
         assert _rfr(doc, tmp_path) == {"x": expected, "y": expected}
+        assert _rfr({"z": {"$ref": f"./other-{name}"}}, tmp_path) == {"z": expected}
+        for upload in range(5):
+            root = _write(tmp_path / f"upload-{upload}" / name, text).parent
+            assert _rfr({"x": {"$ref": f"./{name}"}}, root) == {"x": expected}
 
     (warning,) = _suffix_warnings(caplog)
     message = warning.getMessage()
@@ -507,6 +513,7 @@ def test_a16_an_unknown_suffix_is_still_parsed_and_warns_once_per_file_sg16(
     assert f"$ref target {target.resolve()} has " in message
     assert f"so it was read as {how}." in message
     assert ".json, .yaml, .yml" in message and ".hql" in message and ".sql" in message
+    assert "Logged once per suffix in this process." in message
     assert warning.file == str(target.resolve())  # type: ignore[attr-defined]
 
 

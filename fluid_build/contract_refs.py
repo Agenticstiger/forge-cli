@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import hashlib
 import logging
 import os
 import re
@@ -94,6 +95,7 @@ from typing import (
     Union,
 )
 
+from fluid_build.util.excerpt import excerpt
 from fluid_build.util.ref_confinement import (
     RefResolutionError,
     confine_ref,
@@ -171,20 +173,33 @@ DATA_REF_SUFFIXES = frozenset({".json", ".yaml", ".yml", ".avsc"})
 #: of :mod:`fluid_build.loader`, and its warnings belong with the loader's.
 LOG = logging.getLogger("fluid.loader")
 
-#: The text of every warning this module logged in this process: each is
-#: logged once (a contract is composed more than once by some commands).
-#: Tests reset it with ``.clear()``.
-_NOTED_REF_WARNINGS: Set[str] = set()
+#: The warnings this module logged in this process, each as its event and the
+#: value it is about (a ``$ref`` as written, a suffix), never the place it was
+#: met: a contract can write one ref in thousands of places, and a service
+#: composes each upload from a fresh temporary directory, so a key naming the
+#: place or the file would log the same warning once per place and per upload
+#: and grow without bound (``loader`` keys its ``FLUID_REF_ROOT`` registry on
+#: the value for the same reason). The value is kept as a digest, so a long
+#: ref costs no more than a short one, and the registry is emptied when it
+#: holds :data:`_MAX_NOTED_REF_WARNINGS` entries, so no input can grow it
+#: past that; a value then warns once more. Tests reset it with ``.clear()``.
+_NOTED_REF_WARNINGS: Set[Tuple[str, bytes]] = set()
 _NOTED_REF_WARNINGS_LOCK = threading.Lock()
+_MAX_NOTED_REF_WARNINGS = 1024
 
 
-def _warn_once(event: str, text: str, **extra: Any) -> None:
-    """Log ``text`` as a WARNING with ``event``, the first time this process sees it."""
+def _first_time(event: str, value: str) -> bool:
+    """Record ``value`` for ``event`` in :data:`_NOTED_REF_WARNINGS`; ``True`` the first
+    time this process meets it. Checked before the warning is worded, so a value met
+    again costs a digest, never a message."""
+    key = (event, hashlib.sha256(value.encode("utf-8", "surrogatepass")).digest())
     with _NOTED_REF_WARNINGS_LOCK:
-        if text in _NOTED_REF_WARNINGS:
-            return
-        _NOTED_REF_WARNINGS.add(text)
-    LOG.warning("%s", text, extra={"event": event, **extra})
+        if key in _NOTED_REF_WARNINGS:
+            return False
+        if len(_NOTED_REF_WARNINGS) >= _MAX_NOTED_REF_WARNINGS:
+            _NOTED_REF_WARNINGS.clear()
+        _NOTED_REF_WARNINGS.add(key)
+        return True
 
 
 #: Largest text file a ``$ref`` reads: the cap ``util.safe_yaml`` puts on a
@@ -714,6 +729,8 @@ class _FileRefs:
         try:
             read_before = _file_key(target) in self.budget.targets
             value, is_text = _read_target(target, ref, pointer, where, self.budget.targets)
+            if pointer and not pointer.startswith("/"):
+                _note_pointer_without_slash(ref, pointer, loc, source)
             origins = self.origins
             self.trace.add_file(target)
             if origins is not None:
@@ -866,8 +883,6 @@ def _read_target(
     if is_text:
         return value, True
     if pointer:
-        if not pointer.startswith("/"):
-            _note_pointer_without_slash(ref, pointer, where)
         try:
             value = resolve_pointer(value, pointer)
         except RefResolutionError as exc:
@@ -877,23 +892,37 @@ def _read_target(
     return value, False
 
 
-def _note_pointer_without_slash(ref: str, pointer: str, where: str) -> None:
-    """WARN, once per ref, that a file ref's pointer lacks its leading ``/`` (N-24).
+def _note_pointer_without_slash(
+    ref: str, pointer: str, loc: Pointer, source: Optional[Path]
+) -> None:
+    """WARN, once per ref as written, that a file ref's pointer lacks its leading ``/`` (N-24).
 
     RFC 6901: a JSON pointer is ``""`` or starts with ``/``. A file ref's
     pointer without one (``./x.yaml#foo``) has always named ``/foo`` and still
     does, for the contracts written that way; it is deprecated, and a later
     minor release will refuse it, as a same-document ``#foo`` is refused now.
+    The warning names the first place the ref was met (``loc`` in ``source``),
+    each value it quotes cut to an excerpt: a ref written in a thousand places
+    is one warning, whatever the size of its key or its path.
     """
+    event = "ref_pointer_without_slash"
+    if not _first_time(event, ref):
+        return
     fix = f"{parse_ref(ref)[0]}#/{pointer}"
-    _warn_once(
-        "ref_pointer_without_slash",
-        f"ref_pointer_without_slash: $ref '{ref}' {where} has a JSON pointer without a "
-        f"leading '/', which is deprecated: a later minor release will refuse it. Write "
-        f"'{fix}'. A JSON pointer is '' or starts with '/' (RFC 6901); until then this one "
-        f"is read as '/{pointer}'.",
-        ref=ref,
-        fix=fix,
+    site = ref_location(excerpt(format_pointer(loc)), None)
+    if source is not None:
+        site = f"{site} in {excerpt(str(source))}"
+    LOG.warning(
+        "%s: $ref '%s' %s has a JSON pointer without a leading '/', which is deprecated: a "
+        "later minor release will refuse it. Write '%s'. A JSON pointer is '' or starts "
+        "with '/' (RFC 6901); until then this one is read as '/%s'. Logged once per ref in "
+        "this process.",
+        event,
+        excerpt(ref),
+        site,
+        excerpt(fix),
+        excerpt(pointer),
+        extra={"event": event, "ref": ref, "fix": fix},
     )
 
 
@@ -973,19 +1002,32 @@ def _parse_target(path: Path) -> Any:
 
 
 def _note_unknown_suffix(path: Path, suffix: str, how: str) -> None:
-    """WARN, once per file, that ``path`` was parsed for want of a suffix that says
-    what it holds (SG-16): its text could be a mapping by accident."""
-    has = f"the suffix {suffix!r}" if suffix else "no suffix"
-    data = ", ".join(sorted(DATA_REF_SUFFIXES))
-    text = ", ".join(sorted(TEXT_REF_SUFFIXES))
-    _warn_once(
-        "ref_target_suffix_unknown",
-        f"ref_target_suffix_unknown: $ref target {path} has {has}, which a $ref does not "
-        f"know, so it was read as {how}. A $ref parses {data} as JSON or YAML and reads "
-        f"{text} as text; rename the file to the suffix that says which it is.",
-        file=str(path),
-        suffix=suffix,
-        read_as="json" if how == "JSON" else "yaml",
+    """WARN, once per suffix, that ``path`` was parsed for want of a suffix that says
+    what it holds (SG-16): its text could be a mapping by accident.
+
+    Keyed on the suffix, not the file: a service composes each upload from a
+    fresh temporary directory, so a file's path would warn once per upload.
+    The warning names the first file met with that suffix.
+    """
+    event = "ref_target_suffix_unknown"
+    if not _first_time(event, suffix):
+        return
+    LOG.warning(
+        "%s: $ref target %s has %s, which a $ref does not know, so it was read as %s. A $ref "
+        "parses %s as JSON or YAML and reads %s as text; rename the file to the suffix that "
+        "says which it is. Logged once per suffix in this process.",
+        event,
+        excerpt(str(path)),
+        f"the suffix '{excerpt(suffix)}'" if suffix else "no suffix",
+        how,
+        ", ".join(sorted(DATA_REF_SUFFIXES)),
+        ", ".join(sorted(TEXT_REF_SUFFIXES)),
+        extra={
+            "event": event,
+            "file": str(path),
+            "suffix": suffix,
+            "read_as": "json" if how == "JSON" else "yaml",
+        },
     )
 
 

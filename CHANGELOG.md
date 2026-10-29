@@ -30,15 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written more than once. In `fluid.workspace.yaml` a duplicate key makes its `ref_root` ignored
   (with a warning naming the key) and its `expected-environments` an error.
 - **A `$ref` to a file whose suffix fluid does not know logs a warning**
-  (`ref_target_suffix_unknown`), once per file, saying how it was read and which suffixes are
-  known. The file is read as before. `.json`, `.yaml`, `.yml` and `.avsc` never warn.
+  (`ref_target_suffix_unknown`), once per suffix in a process, naming the first such file, how it
+  was read and which suffixes are known. The file is read as before. `.json`, `.yaml`, `.yml` and
+  `.avsc` never warn.
 
 ### Deprecated
 
 - **A file ref's pointer without a leading `/`** (`./x.yaml#key`) resolves as before but logs a
-  warning (`ref_pointer_without_slash`) naming the fix, `./x.yaml#/key`; a later minor release will
-  refuse it, as RFC 6901 has a JSON pointer empty or starting with `/`. The same-document `#key`
-  stays refused.
+  warning (`ref_pointer_without_slash`) naming the fix, `./x.yaml#/key`, once per ref in a process
+  however many places write it; a later minor release will refuse it, as RFC 6901 has a JSON
+  pointer empty or starting with `/`. The same-document `#key` stays refused.
 
 ### Upgrade notes
 
