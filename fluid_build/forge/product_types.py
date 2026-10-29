@@ -521,10 +521,17 @@ def _resolve_scan_roots(
     return roots
 
 
+class _ProductTypeIndex(Dict[str, Optional[str]]):
+    """``{product id: productType code}`` (:func:`_build_product_type_index`), and
+    ``unreadable``: how many ``*.fluid.yaml`` files the scan could not read."""
+
+    unreadable: int = 0
+
+
 def _build_product_type_index(
     roots: List[Path],
     self_path: Optional[Path],
-) -> Dict[str, Optional[str]]:
+) -> _ProductTypeIndex:
     """Scan ``roots`` ONCE and index ``{product id: productType code}``.
 
     Each root is walked a single time and each ``*.fluid.yaml`` file is
@@ -539,10 +546,11 @@ def _build_product_type_index(
     an upstream whose ``metadata`` is kept in a fragment has its productType,
     and the loader's billion-laughs and ref-root protections apply. A file
     that cannot be read contributes nothing, and one broken neighbour must not
-    stop the walk; it is logged at WARNING (:func:`_index_entry`), since a
-    product it defines is then unknown to the composition rule.
+    stop the walk: it is counted in ``unreadable`` and logged at DEBUG
+    (:func:`_note_unreadable`). Whether a consumer needs to hear of it is for
+    :func:`validate_composition_for_contract`, which knows what it consumes.
     """
-    index: Dict[str, Optional[str]] = {}
+    index = _ProductTypeIndex()
     seen_files: set[Path] = set()
     seen_roots: set[Path] = set()
 
@@ -566,7 +574,12 @@ def _build_product_type_index(
             seen_files.add(resolved)
             if self_path is not None and resolved == self_path:
                 continue
-            entry = _index_entry(candidate)
+            try:
+                entry = _index_entry(candidate)
+            except Exception as exc:  # noqa: BLE001 - one broken contract must not stop the walk
+                index.unreadable += 1
+                _note_unreadable(candidate, exc)
+                continue
             if entry is not None:
                 pid, code = entry
                 # First-writer-wins keeps the result deterministic.
@@ -577,39 +590,85 @@ def _build_product_type_index(
 def _index_entry(candidate: Path) -> Optional[Tuple[str, Optional[str]]]:
     """``(product id, productType code)`` of the contract at ``candidate``.
 
-    ``None`` when the contract does not compose or names no ``id``. The
-    code is ``None`` when it names neither a ``productType`` nor a ``layer``
-    that maps to one.
+    ``None`` when the contract names no ``id``; raises when it does not
+    compose. The code is ``None`` when it names neither a ``productType`` nor
+    a ``layer`` that maps to one.
     """
     from fluid_build.loader import load_contract_fields
 
-    try:
-        data = load_contract_fields(candidate, "id", "metadata.productType", "metadata.layer")
-        pid = data.get("id")
-        if not pid:
-            return None
-        metadata = data.get("metadata")
-        metadata = metadata if isinstance(metadata, dict) else {}
-        raw = metadata.get("productType") or metadata.get("layer")
-        pt = get_product_type(str(raw)) if raw else None
-        return str(pid), pt.code if pt else None
-    except Exception as exc:  # noqa: BLE001 - one broken contract must not stop the walk
-        # A WARNING: a product this file defines is unknown to the index, so a
-        # contract consuming it is checked against nothing, and the run must say
-        # why. A key written twice is one way (SG-18), where the last value was
-        # read before and the rule applied.
-        from fluid_build.util.excerpt import excerpt
-
-        reason = str(exc).strip() or type(exc).__name__
-        LOG.warning(
-            "composition_index_skip: %s could not be read, so the composition rule cannot "
-            "check a contract that consumes a product it defines: %s",
-            excerpt(str(candidate)),
-            # The file is named already; its directory is a long, repeated prefix.
-            excerpt(reason.replace(str(candidate), candidate.name)),
-            extra={"event": "composition_index_skip", "path": str(candidate)},
-        )
+    data = load_contract_fields(candidate, "id", "metadata.productType", "metadata.layer")
+    pid = data.get("id")
+    if not pid:
         return None
+    metadata = data.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    raw = metadata.get("productType") or metadata.get("layer")
+    pt = get_product_type(str(raw)) if raw else None
+    return str(pid), pt.code if pt else None
+
+
+def _note_unreadable(candidate: Path, exc: Exception) -> None:
+    """DEBUG: the scan could not read ``candidate``, and why (``composition_index_skip``).
+
+    Not a WARNING: the scan reads every ``*.fluid.yaml`` under its roots, which
+    climb above the consumer's project when no workspace marker stops them, so
+    a WARNING per file fired on every run for files the run has nothing to do
+    with (a Jinja template of a contract is one), and named them, with their
+    errors, to whoever reads the log. :func:`validate_composition_for_contract`
+    warns instead, once, when the file may be the one a consumed product needs.
+    """
+    from fluid_build.util.excerpt import excerpt
+
+    reason = str(exc).strip() or type(exc).__name__
+    LOG.debug(
+        "composition_index_skip: %s could not be read: %s",
+        excerpt(str(candidate)),
+        # The file is named already; its directory is a long, repeated prefix.
+        excerpt(reason.replace(str(candidate), candidate.name)),
+        extra={"event": "composition_index_skip", "path": str(candidate)},
+    )
+
+
+#: How many of the products it could not check the composition warning names.
+_UNCHECKED_NAMED = 5
+
+
+def _warn_unchecked_upstreams(product_ids: List[str], unreadable: int) -> None:
+    """WARN, once for the contract being validated, that the composition rule cannot
+    check the products in ``product_ids`` it consumes (``composition_upstream_unchecked``).
+
+    No contract the scan read defines them, and it could not read ``unreadable``
+    files, any of which may: a key written twice is one way (SG-18), where
+    0.25.0 read the last value and the rule applied. The warning quotes only
+    the consumer's own values, the first :data:`_UNCHECKED_NAMED` product ids,
+    and counts the files; each file and why it could not be read is at DEBUG
+    (:func:`_note_unreadable`). The scan's roots can climb above the consumer's
+    project, and a service hands the log back to its caller
+    (:func:`fluid_build.engine.validate` returns it as ``stderr``), so naming a
+    file or quoting its error would show one caller another's files.
+    """
+    from fluid_build.util.excerpt import excerpt
+
+    event = "composition_upstream_unchecked"
+    named = [f"'{excerpt(pid)}'" for pid in product_ids[:_UNCHECKED_NAMED]]
+    rest = len(product_ids) - len(named)
+    if rest:
+        products = f"products {', '.join(named)} and {rest} more"
+    elif len(named) > 1:
+        products = f"products {', '.join(named[:-1])} and {named[-1]}"
+    else:
+        products = f"product {named[0]}"
+    LOG.warning(
+        "%s: the composition rule cannot check the consumed %s: no contract the workspace "
+        "scan read defines %s, and the scan could not read %d contract file%s. The DEBUG log "
+        "(fluid --log-level DEBUG) names each file it could not read, and why.",
+        event,
+        products,
+        "it" if len(product_ids) == 1 else "them",
+        unreadable,
+        "" if unreadable == 1 else "s",
+        extra={"event": event, "product_ids": list(product_ids), "unreadable_files": unreadable},
+    )
 
 
 def _iter_fluid_yaml(root: Path):
@@ -702,6 +761,13 @@ def validate_composition_for_contract(
         if not ref:
             continue
         upstream_types[str(ref)] = type_index.get(str(ref))
+
+    # A consumed product missing from the index is checked against nothing.
+    # When a file the scan could not read may be the one defining it, say so.
+    if type_index.unreadable:
+        unchecked = [ref for ref in upstream_types if ref not in type_index]
+        if unchecked:
+            _warn_unchecked_upstreams(unchecked, type_index.unreadable)
 
     return validate_composition(target_type=target_pt.code, upstream_types=upstream_types)
 
