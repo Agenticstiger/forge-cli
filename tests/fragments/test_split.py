@@ -1999,6 +1999,26 @@ def test_i23_a_json_root_holding_text_refs_is_valid_json_and_composes(tmp_path: 
     assert root["builds"][0]["properties"]["sql"] == {"$ref": "./sql/ingest-orders.sql"}
 
 
+def test_i23_a_json_root_with_no_utf_8_form_is_refused_and_changes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finding N2: JSON can escape a lone surrogate (``"\\ud800"``) in a key that
+    stays in the root, and the root written back then has no UTF-8 form. That was
+    an unexpected error, exit 2; it is refused now as a part with no UTF-8 form
+    is, before anything is made."""
+    text = '{"id": "x", "\\ud800": 1, "builds": [{"id": "t", "engine": "sql"}]}\n'
+    pair = solo(tmp_path, text, name=JSON_NAME)
+    before = digest(tmp_path)
+    capsys.readouterr()
+
+    assert split(pair.split_contract) == 1
+
+    shown = capsys.readouterr()
+    assert f"Split not written: {pair.split_contract} cannot be written as UTF-8" in shown.err
+    assert "Unexpected error" not in shown.out + shown.err
+    assert digest(tmp_path) == before
+
+
 # ── I-24: every YAML shape a section can be written in ──────────────────
 
 ZOO: Dict[str, Tuple[str, bool]] = {

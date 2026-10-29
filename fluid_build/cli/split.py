@@ -342,8 +342,9 @@ def _write_checked(
     if unsafe:
         return unsafe
     # Every text is encoded before a file or a directory is made: one with no
-    # UTF-8 form (a lone surrogate) is refused with nothing to take back. The
-    # bytes are written as they are, so a \r in a text stays a \r.
+    # UTF-8 form (a lone surrogate in a part, or in a key a JSON root keeps:
+    # JSON can escape one) is refused with nothing to take back. The bytes are
+    # written as they are, so a \r in a text stays a \r.
     data: Dict[Path, bytes] = {}
     for rel_path, content in fragments.items():
         try:
@@ -352,7 +353,10 @@ def _write_checked(
             return f"{rel_path} cannot be written as UTF-8: {exc}"
         except Exception as exc:  # noqa: BLE001 - a part that is no text: refused, nothing made
             return f"{rel_path} cannot be written: {exc}"
-    root_data = root_text.encode("utf-8")
+    try:
+        root_data = root_text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        return f"{root_out} cannot be written as UTF-8: {exc}"
     original_root: Optional[bytes] = root_out.read_bytes() if root_out.exists() else None
     made: List[Path] = []
     written: List[Path] = []
