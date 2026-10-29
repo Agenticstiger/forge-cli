@@ -1192,6 +1192,43 @@ def _refuse_local_plan_beside_outside_jobs(contract: Dict[str, Any]) -> None:
             )
 
 
+#: A platform a contract declares: (field, provider key, run by a job outside forge-cli).
+_Declared = Tuple[str, str, bool]
+
+
+def _declared_platforms(contract: Dict[str, Any]) -> Tuple[List[_Declared], List[_Declared]]:
+    """Each expose's ``binding.platform`` and each build's
+    ``execution.runtime.platform``, spelled as ``providers._normalize_name``
+    spells a registry key, each with whether a job outside forge-cli writes
+    that expose or is that build."""
+    from fluid_build.util.contract import (
+        get_expose_id,
+        is_externally_run_build,
+        is_written_outside_forge,
+    )
+
+    def _key(platform: Any) -> str:
+        return str(platform).strip().lower().replace("-", "_")
+
+    builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
+    lands: List[_Declared] = []
+    for i, expose in enumerate(contract.get("exposes") or []):
+        binding = expose.get("binding") if isinstance(expose, dict) else None
+        platform = binding.get("platform") if isinstance(binding, dict) else None
+        if platform:
+            outside = is_written_outside_forge(get_expose_id(expose), builds)
+            lands.append((f"exposes[{i}].binding.platform", _key(platform), outside))
+    runs: List[_Declared] = []
+    for i, build in enumerate(contract.get("builds") or []):
+        execution = build.get("execution") if isinstance(build, dict) else None
+        runtime = execution.get("runtime") if isinstance(execution, dict) else None
+        platform = runtime.get("platform") if isinstance(runtime, dict) else None
+        if platform:
+            outside = is_externally_run_build(build)
+            runs.append((f"builds[{i}].execution.runtime.platform", _key(platform), outside))
+    return lands, runs
+
+
 def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> str:
     """The provider simple-mode apply uses when ``--provider`` names none.
 
@@ -1218,35 +1255,8 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
       to run elsewhere was never meant to run.
     """
     from fluid_build import providers as registry
-    from fluid_build.util.contract import (
-        get_expose_id,
-        is_externally_run_build,
-        is_written_outside_forge,
-    )
 
-    def _key(platform: Any) -> str:  # as providers._normalize_name spells a registry key
-        return str(platform).strip().lower().replace("-", "_")
-
-    builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
-    # (where, provider name, run by a job outside forge-cli)
-    lands: List[Tuple[str, str, bool]] = []
-    for i, expose in enumerate(contract.get("exposes") or []):
-        binding = expose.get("binding") if isinstance(expose, dict) else None
-        platform = binding.get("platform") if isinstance(binding, dict) else None
-        if platform:
-            outside = is_written_outside_forge(get_expose_id(expose), builds)
-            lands.append((f"exposes[{i}].binding.platform", _key(platform), outside))
-    runs: List[Tuple[str, str, bool]] = []
-    for i, build in enumerate(contract.get("builds") or []):
-        if not isinstance(build, dict):
-            continue
-        execution = build.get("execution")
-        runtime = execution.get("runtime") if isinstance(execution, dict) else None
-        platform = runtime.get("platform") if isinstance(runtime, dict) else None
-        if platform:
-            outside = is_externally_run_build(build)
-            runs.append((f"builds[{i}].execution.runtime.platform", _key(platform), outside))
-
+    lands, runs = _declared_platforms(contract)
     registry.discover_providers(logger)
 
     def _served(name: str) -> bool:
