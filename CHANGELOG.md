@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **FLUID schema 0.7.6 is stable, and 0.7.7 opens as the next preview** (#752). 0.7.6 is the
+  default now: `FluidSchemaManager.latest_bundled_version()`, the version forge-cli writes into
+  the contracts it builds and assumes where none is declared. What graduates is everything 0.7.6
+  added while in preview: declarative packaging modes, `engine: flink`, `trigger.type:
+  continuous`, identity-keyed overlay merges, column masking (`access: mask`) and row filters,
+  KMS keys for buckets and datasets, and the exporter fields (`metadata.team.members`, the object
+  root `description`, `consumes[].contractId`, `exposes[].contract.id`,
+  `binding.location.host`, `binding.serialization`, a column's `quality`). 0.7.7 is identical to
+  0.7.6 at open; additive preview fields land there. A contract validates against the version it
+  declares, as before, so nothing changes for one that declares 0.7.5.
+
 ### Fixed
 
 - **`fluid validate --fragment` no longer guesses a schema version.** With no `--schema-version`
@@ -36,6 +49,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and docs link stay hidden.
 - **`fluid validate missing.fluid.yaml` said "Contract file not found: None"**; it names the
   file again.
+
+### Upgrade notes
+
+- What forge-cli builds now declares 0.7.6 (the importers, `fluid product-new`, `fluid init
+  --discover`, the `fluid forge --scaffold` templates, the copilot). A 0.7.6 contract merges
+  overlay `builds`, `exposes` and `consumes` by id, so an overlay entry that names no id fails to
+  load. The file templates `fluid init` copies keep declaring the version written in them.
+- An ODCS export records the contract's `fluidVersion` in `fluidExtras` only when it differs
+  from the default: a 0.7.5 contract's export now carries `fluidVersion: 0.7.5` there, and a
+  0.7.6 contract's no longer does.
+- To try what lands next, declare `fluidVersion: "0.7.7"`.
 
 ### Security
 

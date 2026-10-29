@@ -22,7 +22,9 @@ the same files go through the CLI of the v0.24.0 release (``git archive
 v0.24.0 fluid_build`` into a temp directory, nothing checked out) and through
 this checkout, and the masked outputs are compared. They skip when the tag is
 not in the checkout's history (a shallow clone). The corpus is every contract
-under ``examples/`` and ``fluid_build/templates/`` that holds no ``$ref``.
+under ``examples/`` and ``fluid_build/templates/`` that holds no ``$ref``. An
+ODCS export may differ by the one line the 0.7.6 promotion (#752) moved, and
+only as the default moved (see ``_ODCS_OUTPUTS``).
 
 The baseline-harness scenarios (M-02 to M-07, M-13) are not here: they are run
 by ``repro/baseline/run_baseline.sh`` outside pytest.
@@ -436,6 +438,77 @@ def _diff(a: str, b: str, limit: int = 12) -> str:
     return "\n".join(lines[:limit]) or "(whitespace only)"
 
 
+# An ODCS export records the contract's ``fluidVersion`` in its ``fluidExtras`` blob only
+# when a re-import would not reproduce it: when it is not the exporting CLI's default. #752
+# promoted 0.7.6, which moved that default from v0.24.0's 0.7.5, so a 0.7.5 contract's ODCS
+# export now carries the line and a 0.7.6 contract's no longer does. That is a deliberate
+# change of the promotion, not of anything this gate guards. The ODCS comparisons take the
+# line out of both sides, require that it moved exactly as the default did, and compare the
+# rest byte for byte: any other difference, or the line moving any other way, still fails.
+# Masking the line outright, or re-recording the outputs, would have accepted either.
+_ODCS_OUTPUTS = frozenset({"odcs.yaml", "odcs-prod.yaml"})
+_DEFAULT_THEN = "0.7.5"  # v0.24.0's latest_bundled_version()
+_EXTRAS_ROOT = ["- property: fluidExtras\n", "  value:\n", "    root:\n"]
+
+
+def _indent(lines: List[str], at: int) -> int:
+    """The indentation of ``lines[at]``; -1 past the end, which closes every block."""
+    return len(lines[at]) - len(lines[at].lstrip(" ")) if at < len(lines) else -1
+
+
+def _without_recorded_version(document: str) -> Tuple[str, Optional[str]]:
+    """One ODCS document without its fluidExtras ``root.fluidVersion``, and that version.
+
+    The line goes with whatever it alone kept there: ``root:`` when the version was all
+    ``root`` held, and the whole fluidExtras property when ``root`` was all it held.
+    """
+    lines = document.splitlines(keepends=True)
+    for first in range(3, len(lines)):
+        if lines[first - 3 : first] != _EXTRAS_ROOT:
+            continue
+        after = first  # one past root's block: its children sit at indentation 6 or more
+        while _indent(lines, after) >= 6:
+            after += 1
+        at = next(
+            (i for i in range(first, after) if lines[i].startswith("      fluidVersion: ")), None
+        )
+        if at is None:
+            break
+        start, end = at, at + 1
+        if after - first == 1:  # root held nothing else
+            start, end = first - 1, after
+            if _indent(lines, end) <= 2:  # nor did the property's value
+                start = first - 3
+                while _indent(lines, end) > 0:
+                    end += 1
+        return "".join(lines[:start] + lines[end:]), lines[at].split(": ", 1)[1].strip()
+    return document, None
+
+
+def _recorded_version_moved_with_the_default(
+    old: Optional[str], new: Optional[str]
+) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """Both ODCS exports without the recorded version, and how it moved otherwise."""
+    if old is None or new is None:
+        return old, new, []
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    default_now = FluidSchemaManager.latest_bundled_version()
+    sides = []
+    for text in (old, new):
+        documents = [_without_recorded_version(d) for d in re.split(r"(?m)^(?=---\n)", text)]
+        sides.append(("".join(d for d, _ in documents), [v for _, v in documents]))
+    (old_rest, old_versions), (new_rest, new_versions) = sides
+    # Not strict: a different number of documents fails the byte comparison of the rest.
+    pairs = zip(old_versions, new_versions, strict=False)
+    moved = [
+        f"fluidExtras root.fluidVersion {then} -> {now}, which the default did not move"
+        for then, now in pairs
+        if then != now and (then, now) not in {(None, _DEFAULT_THEN), (default_now, None)}
+    ]
+    return old_rest, new_rest, moved
+
+
 def mismatches(
     diff: Differential,
     job: str,
@@ -448,7 +521,8 @@ def mismatches(
 
     ``stderr_in_any_order`` compares the log lines as a set: the INFO line
     ``overlay_applied`` now comes from inside the one composition, so it moved
-    from after ``compile_done`` to before it. Nothing else may differ.
+    from after ``compile_done`` to before it. Nothing else may differ. An ODCS
+    export may also differ by the one line #752 moved (``_ODCS_OUTPUTS``).
     """
     found: List[str] = []
     old, new = diff.old.job(job), diff.new.job(job)
@@ -462,6 +536,9 @@ def mismatches(
         old_file, new_file = diff.old.out_file(directory, filename), diff.new.out_file(
             directory, filename
         )
+        if filename in _ODCS_OUTPUTS:
+            old_file, new_file, moved = _recorded_version_moved_with_the_default(old_file, new_file)
+            found += [f"{job}: {m}" for m in moved]
         if old_file != new_file:
             found.append(
                 f"{job}: {filename} differs\n{_diff(old_file or '<missing>', new_file or '<missing>')}"
