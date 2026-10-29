@@ -1143,23 +1143,25 @@ def test_j07_a_symlink_planted_in_out_is_replaced_and_never_written_through(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+@pytest.mark.parametrize("kept", [0o640, 0o664], ids=oct)
 def test_j07_a_new_file_gets_the_mode_the_umask_gives_and_a_replaced_one_keeps_its_own(
-    tmp_path: Path,
+    tmp_path: Path, kept: int
 ) -> None:
-    """Not mkstemp's 0o600: the catalog is there to be served."""
+    """Not mkstemp's 0o600: the catalog is there to be served. The umask (0o022) takes 0o020
+    off 0o664 when the temp file is made, so that mode is kept only by setting it again."""
     _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
     out = tmp_path / "site"
     umask = os.umask(0o022)
     try:
         assert _docs(tmp_path / "src", out, src=True) == 0
         modes = {p.name: stat.S_IMODE(p.stat().st_mode) for p in out.iterdir()}
-        (out / "index.html").chmod(0o640)
+        (out / "index.html").chmod(kept)
         assert _docs(tmp_path / "src", out, src=True) == 0
     finally:
         os.umask(umask)
 
     assert modes == dict.fromkeys(["contract-keep-a.html", "index.html", "index.json"], 0o644)
-    assert stat.S_IMODE((out / "index.html").stat().st_mode) == 0o640
+    assert stat.S_IMODE((out / "index.html").stat().st_mode) == kept
     assert stat.S_IMODE((out / "index.json").stat().st_mode) == 0o644
 
 
@@ -1227,6 +1229,49 @@ def test_j07_a_replaced_file_keeps_its_mode_only_when_it_is_this_users_with_one_
         os.umask(umask)
 
     assert stat.S_IMODE((out / "index.html").stat().st_mode) == 0o644
+
+
+_REPLACED_IN_ORDER = [
+    "contract-keep-a.html",
+    "contract-keep-b.html",
+    "contract-keep-c.html",
+    "index.json",
+    "index.html",
+]
+
+
+@pytest.mark.parametrize("failing", [1, 2, 3, 4, 5, None])
+def test_j07_a_replace_that_fails_leaves_no_dead_link_and_no_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: Optional[int]
+) -> None:
+    """Every page replaces its file before index.json and index.html do, so a replace that
+    fails (EBUSY on the Nth) leaves an index whose every link is to a page that is there, and
+    the temp files not yet moved are removed. With the index first, a failure at the first page
+    would leave the new index linking a page never written."""
+    from fluid_build.cli import docs_build
+
+    first = _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    _put(tmp_path / "src" / "c" / "contract.fluid.yaml", _min_doc("keep.c"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+    _put(first, _min_doc("keep.a", name="Renamed since the last run"))
+    _put(tmp_path / "src" / "b" / "contract.fluid.yaml", _min_doc("keep.b"))  # a new page
+    replaced: List[str] = []
+
+    def busy_on_the_nth(src: str, dst: str) -> None:
+        if len(replaced) + 1 == failing:
+            raise OSError(errno.EBUSY, "Device or resource busy", dst)
+        os.replace(src, dst)
+        replaced.append(os.path.basename(dst))
+
+    monkeypatch.setattr(docs_build, "os", _OsWith(replace=busy_on_the_nth))
+
+    assert (_docs(tmp_path / "src", out, src=True) == 0) is (failing is None)
+
+    assert replaced == _REPLACED_IN_ORDER[: None if failing is None else failing - 1]
+    links = re.findall(r'href="(contract-[^"]*\.html)"', (out / "index.html").read_text("utf-8"))
+    assert links and [link for link in links if not (out / link).is_file()] == []
+    assert not list(out.glob(".*.tmp"))
 
 
 def _docs_error(source: Path, out: Any) -> str:
