@@ -35,6 +35,7 @@ generate the original contract.
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import posixpath
 import re
@@ -434,12 +435,27 @@ def split_contract_to_fragments(
     return root, fragments
 
 
+@functools.lru_cache(maxsize=1)
 def _exact_dumper() -> Any:
-    """The YAML dumper ``fluid bundle`` writes with: text holding NEL, LS or PS is
-    written escaped, so it reads back exactly (a bare one folds into a space)."""
+    """The YAML dumper ``fluid bundle`` writes with (text holding NEL, LS or PS is
+    written escaped, so it reads back exactly: a bare one folds into a space),
+    writing every object in full wherever it is, with no anchor and no alias.
+
+    A data split copies the containers on each part's way (:func:`_own_parent`),
+    and a copy shares what else it holds with the original: an object a YAML
+    alias put at two places can end up at many, and a dumper that names shared
+    objects wrote an alias for each, enough to pass the 50 aliases the loader
+    reads when the split is checked. Written in full, nothing grows past what
+    the contract's own alias cap let in; a document that contains itself is
+    refused before (it does not compose).
+    """
     from fluid_build.forge.core.bundle import ExactDumper
 
-    return ExactDumper
+    class _InFull(ExactDumper):
+        def ignore_aliases(self, data: Any) -> bool:
+            return True
+
+    return _InFull
 
 
 def _own_parent(root: Dict[str, Any], path: Tuple[Union[str, int], ...]) -> Any:

@@ -2107,6 +2107,28 @@ def test_i22_a_part_that_is_no_text_is_refused_before_anything_is_written(tmp_pa
     assert digest(tmp_path) == before
 
 
+def test_i22_a_data_split_writes_every_object_in_full_and_passes_no_alias_cap(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round-2 review: the copies the data split makes on a part's way share what
+    else they hold with the original, so one object an alias put at two places
+    ended up at many. Dumped with anchors, the builds list aliased in the
+    metadata gave its 60 ``tags`` lists an alias each, past the 50 the loader
+    reads when the split is checked: refused, where the split before split it.
+    Every object is written in full now, in the root and in the fragments."""
+    lines = ["id: x", "builds: &bl"]
+    for i in range(60):
+        lines += [f"  - id: b{i}", "    tags: [t]", "    properties:", f"      sql: SELECT {i}"]
+    pair = solo(tmp_path, "\n".join([*lines, "metadata:", "  copy: *bl"]) + "\n")
+    capsys.readouterr()
+
+    after = split_and_check(pair, "sql")
+
+    assert "the contract uses YAML aliases" in capsys.readouterr().err  # the data split
+    assert len(new_files(pair, after)) == 60
+    assert not [rel for rel, content in after.items() if re.search(rb"[&*]id\d+", content)]
+
+
 # ── I-23: JSON roots ────────────────────────────────────────────────────
 
 JSON_ROOT = json.dumps(yaml.safe_load(SPLIT_ALL), indent=2) + "\n"
