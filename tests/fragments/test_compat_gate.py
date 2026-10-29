@@ -438,14 +438,14 @@ def _diff(a: str, b: str, limit: int = 12) -> str:
     return "\n".join(lines[:limit]) or "(whitespace only)"
 
 
-# An ODCS export records the contract's ``fluidVersion`` in its ``fluidExtras`` blob only
-# when a re-import would not reproduce it: when it is not the exporting CLI's default. #752
-# promoted 0.7.6, which moved that default from v0.24.0's 0.7.5, so a 0.7.5 contract's ODCS
-# export now carries the line and a 0.7.6 contract's no longer does. That is a deliberate
-# change of the promotion, not of anything this gate guards. The ODCS comparisons take the
-# line out of both sides, require that it moved exactly as the default did, and compare the
-# rest byte for byte: any other difference, or the line moving any other way, still fails.
-# Masking the line outright, or re-recording the outputs, would have accepted either.
+# v0.24.0's ODCS export recorded the contract's ``fluidVersion`` in its ``fluidExtras`` blob
+# only when it was not the exporting CLI's default, 0.7.5. Since #752 promoted 0.7.6 it is
+# recorded always (a re-import takes a missing one from the READER's default), so a 0.7.5
+# contract's export now carries the line. That is a deliberate change of the promotion, not of
+# anything this gate guards. The ODCS comparisons take the line out of both sides, require
+# that it appeared exactly where v0.24.0 left it out, and compare the rest byte for byte: any
+# other difference, or the line moving any other way, still fails. Masking the line outright,
+# or re-recording the outputs, would have accepted either.
 _ODCS_OUTPUTS = frozenset({"odcs.yaml", "odcs-prod.yaml"})
 _DEFAULT_THEN = "0.7.5"  # v0.24.0's latest_bundled_version()
 _EXTRAS_ROOT = ["- property: fluidExtras\n", "  value:\n", "    root:\n"]
@@ -491,9 +491,6 @@ def _recorded_version_moved_with_the_default(
     """Both ODCS exports without the recorded version, and how it moved otherwise."""
     if old is None or new is None:
         return old, new, []
-    from fluid_build.schema_manager import FluidSchemaManager
-
-    default_now = FluidSchemaManager.latest_bundled_version()
     sides = []
     for text in (old, new):
         documents = [_without_recorded_version(d) for d in re.split(r"(?m)^(?=---\n)", text)]
@@ -502,9 +499,10 @@ def _recorded_version_moved_with_the_default(
     # Not strict: a different number of documents fails the byte comparison of the rest.
     pairs = zip(old_versions, new_versions, strict=False)
     moved = [
-        f"fluidExtras root.fluidVersion {then} -> {now}, which the default did not move"
+        f"fluidExtras root.fluidVersion {then} -> {now}: only one v0.24.0 left out "
+        f"({_DEFAULT_THEN}) may appear"
         for then, now in pairs
-        if then != now and (then, now) not in {(None, _DEFAULT_THEN), (default_now, None)}
+        if then != now and (then, now) != (None, _DEFAULT_THEN)
     ]
     return old_rest, new_rest, moved
 

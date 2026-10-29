@@ -466,3 +466,37 @@ def test_availability_percent_does_not_pick_up_a_float_artifact(
     sla = {p["property"]: p["value"] for p in provider.render(contract)["slaProperties"]}
     assert sla["availability"] == expected
     assert repr(sla["availability"]) == repr(expected)
+
+
+# ---------------------------------------------------------------------------
+# The export records the contract's version for any reader
+# ---------------------------------------------------------------------------
+
+
+def _recorded_root(exported: Dict[str, Any]) -> Dict[str, Any]:
+    for prop in exported.get("customProperties") or []:
+        if prop.get("property") == "fluidExtras":
+            return (prop.get("value") or {}).get("root") or {}
+    return {}
+
+
+@pytest.mark.parametrize("version", ["0.7.5", "0.7.6"])
+def test_the_export_records_the_version_even_when_it_is_the_default(
+    provider: OdcsProvider, version: str
+) -> None:
+    # Left out when it equalled the exporting CLI's default, the version came back
+    # from a reader with another default as that default: a 0.7.6 contract's export
+    # read by a CLI defaulting to 0.7.5 declared 0.7.5, and its 0.7.6 fields failed.
+    contract = {**SNOWFLAKE_CONTRACT, "fluidVersion": version}
+    assert _recorded_root(provider.render(contract)).get("fluidVersion") == version
+
+
+def test_a_reader_with_an_older_default_restores_the_recorded_version(
+    provider: OdcsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exported = provider.render({**SNOWFLAKE_CONTRACT, "fluidVersion": "0.7.6"})
+    monkeypatch.setattr(
+        FluidSchemaManager, "PREVIEW_VERSIONS", frozenset({"0.7.6", "0.7.7"})
+    )  # a reader on a release where 0.7.6 was still the preview
+    assert FluidSchemaManager.latest_bundled_version() == "0.7.5"
+    assert provider.import_contract(exported)["fluidVersion"] == "0.7.6"
