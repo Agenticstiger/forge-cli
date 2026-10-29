@@ -83,7 +83,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--out",
         "-o",
         default="-",
-        help="Output path (default: '-' for stdout)",
+        help=(
+            "Output path (default: '-', stdout for yaml and json; for tgz, "
+            "<contract dir>/<contract id>.fluid.bundle.tgz)"
+        ),
     )
     p.add_argument(
         "--env",
@@ -353,12 +356,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             _lgr.addHandler(_stderr_handler)
             _lgr.propagate = False
 
-    # Auto-detect output: if a fragments/ directory exists alongside the
-    # contract, the user almost certainly wants a bundled file on disk
-    # rather than stdout output.
+    # ``--out`` left out means the same for every contract, fragments/ beside it or not:
+    # yaml and json go to stdout, a tgz to ``<contract id>.fluid.bundle.tgz``. (A
+    # fragment layout used to get ``contract.bundled.fluid.yaml`` instead, a tgz too,
+    # so a pipe received nothing and a later stage read gzip bytes as YAML.)
     contract_dir = Path(contract_path).parent
-    if out == "-" and (contract_dir / "fragments").is_dir():
-        out = str(contract_dir / "contract.bundled.fluid.yaml")
 
     fmt = _infer_format(out, args.format)
 
