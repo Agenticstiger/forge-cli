@@ -17,7 +17,7 @@
 **Why this module exists.** The GCP IaC plugin historically read
 ``contract["metadata"]["policies"]`` to emit BigQuery ``access[]`` entries
 and GCS IAM members. That surface is **not in any shipped schema** — every
-version from 0.7.1 to 0.7.6 declares ``metadata`` with
+version from 0.7.1 to 0.7.7 declares ``metadata`` with
 ``additionalProperties: false`` and no ``policies`` property — so a contract
 carrying it fails ``fluid validate``::
 

@@ -281,7 +281,7 @@ _FK_KEYS = ("foreign_key", "foreignKey", "references", "relationship_to")
 
 # ``column.validationRules[]`` is the *schema-sanctioned* way to declare a
 # range / enum / FK on a column: the ``column`` definition has
-# ``additionalProperties: false`` in every version 0.7.1-0.7.6 and its eleven
+# ``additionalProperties: false`` in every version 0.7.1-0.7.7 and its eleven
 # keys include ``validationRules`` but none of the inline ``minimum`` /
 # ``maximum`` / ``enum`` / ``foreign_key`` spellings recognised above. Those
 # inline forms are accepted best-effort (contracts express intent that way in

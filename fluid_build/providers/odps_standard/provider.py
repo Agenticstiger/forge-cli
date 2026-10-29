@@ -809,8 +809,8 @@ def _to_fluid_document(
     # Anything else ODPS put in ``metadata`` that the closed object rejects.
     # Asked per declared version: the team roster the team mapper writes has a
     # home only from 0.7.6, so an older document's roster is bucketed here (and
-    # exports verbatim from the bucket) rather than promoting the document to a
-    # preview schema just to fit it.
+    # exports verbatim from the bucket) rather than declaring a newer schema
+    # than the document recorded just to fit it.
     accepted_metadata = metadata_keys_for(declared_version)
     stray = {k: v for k, v in metadata.items() if k not in accepted_metadata}
     for key in stray:

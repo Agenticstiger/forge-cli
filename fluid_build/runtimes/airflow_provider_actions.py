@@ -367,7 +367,7 @@ dag = DAG(
         elif script:
             # ``script`` is NOT a schema field -- ``$defs.build`` sets
             # ``additionalProperties: false`` and declares no ``script`` in any
-            # shipped schema (0.7.1-0.7.6), and this generator does not validate
+            # shipped schema (0.7.1-0.7.7), and this generator does not validate
             # before emitting. The only shipped usage
             # (examples/0.7.1/provider-actions-workflow.yaml) is a dbt *model
             # identifier*, not a command line. So quote it like every other
