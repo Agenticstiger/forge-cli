@@ -57,8 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Duplicate keys now fail.** A contract, overlay, fragment or workspace file that writes a key
   twice (often a copy-paste slip, which kept the second value) fails every command that composes
   the contract, `validate`, `plan`, `apply`, `bundle` and `generate artifacts` among them, naming
-  the place: remove the copy you do not want. The commands that only summarise or hash the file
-  as written (`fluid status`, `fluid contract digest`) read it as before.
+  the place: remove the copy you do not want. A few commands that only summarise or hash the file
+  as written, `fluid status` and `fluid contract digest` among them, read it as before.
 - **A payload with `$ref` keys of its own:** write them `$$ref` instead of keeping the payload as a
   string.
 
