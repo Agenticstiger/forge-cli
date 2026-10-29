@@ -246,14 +246,16 @@ def _remove_stale_temps(out: str, names: set[str]) -> None:
         if temp is None or temp.group(1) not in names:
             continue
         with contextlib.suppress(OSError):  # gone already, or not ours to look at
-            if entry.is_file(follow_symlinks=False) and _mine(entry.stat(follow_symlinks=False)):
+            found = entry.stat(follow_symlinks=False)
+            if stat.S_ISREG(found.st_mode) and _mine(found):
                 os.unlink(entry.path)
 
 
 def _mine(st: os.stat_result) -> bool:
-    """Whether this user owns what ``st`` describes (never, where there are no uids)."""
-    getuid = getattr(os, "getuid", None)
-    return getuid is not None and st.st_uid == getuid()
+    """Whether what ``st`` describes is this process's: owned by its effective uid,
+    the owner of every file it makes (never, where there are no uids)."""
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid is not None and st.st_uid == geteuid()
 
 
 def _stage(target: str, data: bytes) -> str:
@@ -264,7 +266,8 @@ def _stage(target: str, data: bytes) -> str:
     catalog is there to be served), or the mode of the file it will replace
     when that file is this user's own and has no other name: never a mode
     someone else chose. The mode is set on the open descriptor, never by path,
-    so a symlink renamed over the temp name meanwhile is not followed. A
+    so a symlink renamed over the temp name meanwhile is not followed: a mode is
+    kept only where there are uids, and every such system has ``os.fchmod``. A
     directory where the file goes is refused here, before any file of the
     catalog is replaced.
     """
@@ -290,10 +293,7 @@ def _stage(target: str, data: bytes) -> str:
     try:
         with open(fd, "wb") as f:  # closes the descriptor however this ends
             if own is not None:  # the bits the umask took off, before a byte is written
-                if hasattr(os, "fchmod"):
-                    os.fchmod(fd, own)
-                else:  # pragma: no cover - Windows before 3.13, which has no uids to match
-                    os.chmod(temp, own)
+                os.fchmod(fd, own)
             f.write(data)
     except BaseException:
         with contextlib.suppress(OSError):

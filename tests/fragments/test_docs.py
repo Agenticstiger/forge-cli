@@ -35,6 +35,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import types
 from collections import Counter
 from html.parser import HTMLParser
@@ -1223,12 +1224,37 @@ def test_j07_a_replaced_file_keeps_its_mode_only_when_it_is_this_users_with_one_
         if whose == "a-file-with-a-second-name":
             os.link(out / "index.html", tmp_path / "second-name.html")
         else:
-            monkeypatch.setattr(docs_build, "os", _OsWith(getuid=lambda: os.getuid() + 1))
+            monkeypatch.setattr(docs_build, "os", _OsWith(geteuid=lambda: os.geteuid() + 1))
         assert _docs(tmp_path / "src", out, src=True) == 0
     finally:
         os.umask(umask)
 
     assert stat.S_IMODE((out / "index.html").stat().st_mode) == 0o644
+
+
+@pytest.mark.skipif(os.name == "nt", reason="file owners")
+def test_j07_the_files_of_the_effective_uid_are_this_runs_whatever_the_real_uid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process owns the files it makes by its effective uid. Compared with the real uid, a
+    setuid run took its own catalog for someone else's: no mode kept, no temp file removed."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    umask = os.umask(0o022)
+    try:
+        assert _docs(tmp_path / "src", out, src=True) == 0
+        (out / "index.html").chmod(0o664)
+        stale = _write(out / ".index.json.0123456789abcdef.tmp", "left by a killed run\n")
+        os.utime(stale, (time.time() - 7200, time.time() - 7200))
+        monkeypatch.setattr(docs_build, "os", _OsWith(getuid=lambda: os.getuid() + 1))
+        assert _docs(tmp_path / "src", out, src=True) == 0
+    finally:
+        os.umask(umask)
+
+    assert stat.S_IMODE((out / "index.html").stat().st_mode) == 0o664
+    assert not stale.exists()
 
 
 _REPLACED_IN_ORDER = [
@@ -1509,7 +1535,7 @@ def test_j07_a_temp_file_of_another_user_is_left_where_it_is(
     assert _docs(tmp_path / "src", out, src=True) == 0
     for name in _LEFT_BY_A_KILLED_RUN:
         _write(out / name, "left behind\n")
-    monkeypatch.setattr(docs_build, "os", _OsWith(getuid=lambda: os.getuid() + 1))
+    monkeypatch.setattr(docs_build, "os", _OsWith(geteuid=lambda: os.geteuid() + 1))
 
     assert _docs(tmp_path / "src", out, src=True) == 0
 
