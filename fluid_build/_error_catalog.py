@@ -95,6 +95,16 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "providers",
     ),
+    "apply_platform_unsupported": (
+        [
+            "If a job outside forge-cli writes the expose (a Flink job, say), declare it as a "
+            "build (engine: flink, or properties.language: flink_sql) whose outputs name the "
+            "expose: forge-cli then leaves the expose to that job",
+            "Run 'fluid providers' to list the providers this install has",
+            "--provider <name> applies the whole contract with the provider you name",
+        ],
+        "providers",
+    ),
     "provider_blocked_by_policy": (
         [
             "This provider is named in FLUID_PLUGINS_BLOCKLIST, or an "

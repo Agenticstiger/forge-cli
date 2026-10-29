@@ -36,6 +36,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and docs link stay hidden.
 - **`fluid validate missing.fluid.yaml` said "Contract file not found: None"**; it names the
   file again.
+- **`fluid apply` no longer takes a platform for a provider** (#752). Without `--provider`, a
+  default-mode apply named its provider after the last expose's `binding.platform`, else the
+  first build's `execution.runtime.platform`, word for word. So a Flink job writing a Kafka topic
+  ended as `provider_unknown` ("kafka"), and so did a local product with a Flink build on
+  `kubernetes`. A build that runs outside forge-cli (`engine: flink`, or `properties.language:
+  flink_sql`) and an expose such a build writes no longer choose the provider: the local planner
+  lands nothing for them, and the rest of the contract applies. Any other platform no provider
+  serves (`databricks`, `postgres`, a Kafka topic nothing in the contract writes, a build's
+  `kubernetes` runtime) stops the run with `apply_platform_unsupported`, naming each field.
+  Before, it was `provider_unknown` when it came last, and otherwise handed to the local
+  provider, which wrote a placeholder CSV for it and reported success. `--provider` still
+  overrides.
+
+### Upgrade notes
+
+- `fluid apply` stops with `apply_platform_unsupported`, exit code 2 as before, where a platform
+  the contract declares has no provider; in `fluid apply`, `provider_unknown` now means a
+  `--provider` value no provider has. A contract with an expose on such a platform before a local
+  one, which applied with exit 0, now stops: pass `--provider local` to apply it as before.
 
 ### Security
 

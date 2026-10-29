@@ -41,7 +41,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.observability.tracing import traced_stage as _traced_stage
@@ -1160,6 +1160,77 @@ def _write_apply_report(
             logger.warning(f"Failed to generate report: {e}")
 
 
+def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> str:
+    """The provider simple-mode apply uses when ``--provider`` names none.
+
+    A ``binding.platform`` says where an expose lands and a build's
+    ``execution.runtime.platform`` where it runs; neither is a provider name,
+    though ``local``, ``gcp``, ``aws`` and ``snowflake`` are both. Read as one,
+    a Kafka binding or a Flink build's ``runtime.platform: kubernetes`` ended
+    the run as ``provider_unknown``.
+
+    A build that runs outside forge-cli and an expose such a build writes are
+    applied by no provider here (the local planner lands nothing for them), so
+    their platforms choose none. Every other platform must name a registered
+    provider, or one the plugin policy removed (``build_provider`` reports
+    that): a binding no provider serves is never handed to another one, which
+    would write it as a local placeholder file and report success, so the run
+    stops with ``apply_platform_unsupported``. Among the platforms left the
+    choice is as before: the last expose's, then, when that is ``local`` or
+    there is none, the first build's; ``local`` when none is declared.
+    """
+    from fluid_build import providers as registry
+    from fluid_build.plugin_manager import is_allowed
+    from fluid_build.util.contract import (
+        get_expose_id,
+        is_externally_run_build,
+        is_written_outside_forge,
+    )
+
+    def _key(platform: Any) -> str:  # as build_provider spells a provider name
+        return str(platform).strip().lower().replace("-", "_")
+
+    builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
+    lands: List[Tuple[str, str]] = []
+    for i, expose in enumerate(contract.get("exposes") or []):
+        binding = expose.get("binding") if isinstance(expose, dict) else None
+        platform = binding.get("platform") if isinstance(binding, dict) else None
+        if platform and not is_written_outside_forge(get_expose_id(expose), builds):
+            lands.append((f"exposes[{i}].binding.platform", _key(platform)))
+    runs: List[Tuple[str, str]] = []
+    for i, build in enumerate(contract.get("builds") or []):
+        if not isinstance(build, dict) or is_externally_run_build(build):
+            continue
+        execution = build.get("execution")
+        runtime = execution.get("runtime") if isinstance(execution, dict) else None
+        platform = runtime.get("platform") if isinstance(runtime, dict) else None
+        if platform:
+            runs.append((f"builds[{i}].execution.runtime.platform", _key(platform)))
+
+    registry.discover_providers(logger)
+    unsupported = [
+        f"{where}: {name}"
+        for where, name in lands + runs
+        if name not in registry.PROVIDERS and is_allowed(name)
+    ]
+    if unsupported:
+        raise CLIError(
+            2,
+            "apply_platform_unsupported",
+            {
+                "error": (
+                    f"no forge-cli provider applies {', '.join(unsupported)}; "
+                    "fluid apply will not hand it to another provider"
+                ),
+                "providers": ", ".join(sorted(registry.PROVIDERS)),
+            },
+        )
+    name = lands[-1][1] if lands else "local"
+    if name == "local" and runs:
+        name = runs[0][1]
+    return name
+
+
 def _run_simple_apply(
     *,
     args,
@@ -1193,32 +1264,20 @@ def _run_simple_apply(
     """
     logger.info("🚀 Executing data product build (simple mode)")
 
-    # Detect provider and project from contract (check builds and exposes)
-    provider_name = "local"  # default
     project = None
     region = contract.get("region", "local")
 
-    # First try to get provider and project from exposes (most specific)
+    # The project comes from the first expose binding that names one.
     for expose in contract.get("exposes", []):
         binding = expose.get("binding", {})
         if "platform" in binding:
-            provider_name = binding["platform"]
-            # Get project from binding location
             location = binding.get("location", {})
             if "project" in location and not project:
                 project = location["project"]
 
-    # Then check builds if not found
-    if provider_name == "local":
-        for build in contract.get("builds", []):
-            runtime = build.get("execution", {}).get("runtime", {})
-            if "platform" in runtime:
-                provider_name = runtime["platform"]
-                break
-
-    # Explicit CLI flags override the contract-derived values.
-    if getattr(args, "provider", None):
-        provider_name = args.provider
+    # Explicit CLI flags override the contract-derived values; the contract's
+    # provider is worked out only when --provider names none.
+    provider_name = getattr(args, "provider", None) or _simple_apply_provider(contract, logger)
     if getattr(args, "project", None):
         project = args.project
     if getattr(args, "region", None):
