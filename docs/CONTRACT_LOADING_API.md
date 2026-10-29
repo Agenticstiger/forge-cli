@@ -126,8 +126,7 @@ In the engine's order:
    engine's resolver and under its path rules (see `docs/contract-refs.md`):
    a text file (`.sql`, `.md`, ...) is its text, keys beside `$ref` are merged
    over the target, and a fragment may have any root. A key written `$$ref` is
-   a payload's literal `$ref` (a JSON Schema's, say): never resolved, it is
-   `$ref` in the result (`$$$ref` is `$$ref`).
+   never resolved: it is the literal key `$ref` in the result.
 3. **Overlay**: for `env`, the first of `overlays/<env>.yaml|yml|json`,
    `<env>.yaml|yml|json`, `<contract-stem>.<env>.yaml|yml|json` next to the
    contract, its own `$ref` values composed relative to the overlay file,
@@ -183,7 +182,7 @@ A frozen dataclass.
 | `env` | `str \| None` | The env requested. |
 | `overlay` | `Path \| None` | The overlay file merged for `env` (never set for a bundle). A matching overlay is always applied; one that cannot be is a load error. |
 | `files` | `tuple[Path, ...]` | Every file composed: the source, each `$ref` target in first-read order (text files included), the overlay and its `$ref` targets. |
-| `unresolved_refs` | `tuple[str, ...]` | `$ref` values left in `contract`, in document order: only an in-memory load without `base_dir` of a document that names other files leaves any (and a bundle written by hand: `fluid bundle` writes none). A `$ref` key a composition leaves is a payload's literal key, written `$$ref`, and is not listed. |
+| `unresolved_refs` | `tuple[str, ...]` | `$ref` values left in `contract`, in document order: only an in-memory load without `base_dir` of a document that names other files leaves any, or a bundle written by hand. A literal `$ref` key (written `$$ref`) is not listed. |
 | `digest` | `str` (property) | `sha256:<hex>` of the planned contract via `compute_contract_digest`, the plan digest's canonicalisation. Not the `fluid contract digest` / `upstreamDigest` value. Raises `contract_not_serialisable` when JSON cannot represent the contract. |
 
 ### `ContractLoadError`
