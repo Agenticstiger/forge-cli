@@ -1397,6 +1397,49 @@ def test_j07_a_failed_first_run_takes_back_a_directory_made_through_a_symlink_an
     assert sorted(p.name for p in tmp_path.iterdir()) == ["L", "elsewhere", "src"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+@pytest.mark.parametrize(
+    ("when", "users"),
+    [("right-after-its-mkdir", ""), ("after-the-tree-is-made", "b/site")],
+)
+def test_j07_a_failed_run_never_takes_back_a_directory_swapped_in_for_one_it_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, when: str, users: str
+) -> None:
+    """The cleanup removed each directory by the real path recorded after its mkdir. With
+    ``--out shared/a/b/site``, a symlink swapped in for ``a`` right after its mkdir (to an
+    empty directory of the user's) had that directory removed; one swapped in once the tree
+    was made had the user's ``b/site`` under it removed. A directory is removed now only
+    while lstat finds the very one the run made (the same device and inode)."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    shared, victim = tmp_path / "shared", tmp_path / "victim"
+    shared.mkdir()
+    (victim / users).mkdir(parents=True)  # the user's own, and empty
+    top = shared / "a"
+
+    def swap() -> None:
+        os.rename(top, shared / "a-moved")
+        top.symlink_to(victim)
+
+    def mkdir_then_swap(path: Any, *args: Any, **kwargs: Any) -> None:
+        os.mkdir(path, *args, **kwargs)
+        if when == "right-after-its-mkdir" and os.fspath(path) == str(top):
+            swap()
+
+    def swap_then_fail(target: str, data: bytes) -> str:
+        if when == "after-the-tree-is-made" and not top.is_symlink():
+            swap()
+        raise OSError(errno.ENOSPC, "No space left on device", target)
+
+    monkeypatch.setattr(docs_build, "os", _OsWith(mkdir=mkdir_then_swap))
+    monkeypatch.setattr(docs_build, "_stage", swap_then_fail)
+
+    assert _docs(tmp_path / "src", top / "b" / "site", src=True) != 0
+
+    assert (victim / users).is_dir()
+
+
 @pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, not root")
 def test_j07_an_out_through_a_symlink_and_dotdot_is_checked_where_it_would_be_made(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

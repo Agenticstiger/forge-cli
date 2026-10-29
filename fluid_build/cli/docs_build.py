@@ -172,7 +172,7 @@ def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
     file as the last run wrote it. A replace swaps the directory entry: a
     symlink or a hard link planted in ``out`` is replaced, never written through.
     """
-    made: list[str] = []  # the real path of each directory this run made, in order
+    made: list[tuple[str, int, int]] = []  # each directory this run made, in order
     staged: list[tuple[str, str]] = []
     try:
         _make_dirs(out, made)
@@ -186,17 +186,16 @@ def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
         for temp, _target in staged:
             with contextlib.suppress(OSError):
                 os.unlink(temp)
-        for directory in reversed(made):
-            with contextlib.suppress(OSError):
-                os.rmdir(directory)
+        _take_back(made)
         raise
 
 
-def _make_dirs(path: str, made: list[str]) -> None:
-    """``os.makedirs(path, exist_ok=True)``, one level at a time, adding the real
-    path of each directory it makes to ``made`` as soon as it is made: a run that
-    fails part-way takes back exactly those, wherever a ``..`` after a symlink
-    put them."""
+def _make_dirs(path: str, made: list[tuple[str, int, int]]) -> None:
+    """``os.makedirs(path, exist_ok=True)``, one level at a time, adding each
+    directory it makes to ``made`` as soon as it is made, as its real path, device
+    and inode: a run that fails part-way takes back exactly those, wherever a
+    ``..`` after a symlink put them. One that ``lstat`` finds is not a directory
+    any more (a symlink swapped in for it) is not recorded."""
     head, tail = os.path.split(path)
     if not tail:
         head, tail = os.path.split(head)
@@ -208,7 +207,20 @@ def _make_dirs(path: str, made: list[str]) -> None:
         if not os.path.isdir(path):
             raise
     else:
-        made.append(os.path.realpath(path))
+        made_now = os.lstat(path)
+        if stat.S_ISDIR(made_now.st_mode):
+            made.append((os.path.realpath(path), made_now.st_dev, made_now.st_ino))
+
+
+def _take_back(made: list[tuple[str, int, int]]) -> None:
+    """Remove the directories :func:`_make_dirs` made, the deepest first, each only
+    while ``lstat`` finds the very directory it made at its path (the same device
+    and inode): never one swapped in for it, nor a symlink's target."""
+    for real, dev, ino in reversed(made):
+        with contextlib.suppress(OSError):
+            now = os.lstat(real)
+            if stat.S_ISDIR(now.st_mode) and (now.st_dev, now.st_ino) == (dev, ino):
+                os.rmdir(real)
 
 
 #: The name :func:`_stage` gives a temp file: ``.<target name>.<16 hex>.tmp``.
