@@ -345,6 +345,18 @@ def test_k13_without_a_root_contract_the_run_asks_for_a_schema_version(
     assert "--schema-version" in out + err
 
 
+def test_k13_quiet_still_says_why_the_run_stopped(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """``--quiet`` is "errors only": a run that stops says why, without the hints."""
+    rc, out, err = _validate(capsys, "--fragment", "expose", _loose_fragment(tmp_path), "--quiet")
+
+    flat = " ".join((out + err).split())
+    assert rc == 1
+    assert "schema_version_required" in flat and "Pass --schema-version" in flat
+    assert "💡" not in flat
+
+
 @pytest.mark.parametrize("root", ["none", "unreadable"])
 def test_k13_a_fragment_valid_in_0_7_6_gets_no_false_error_from_a_guessed_older_schema(
     tmp_path: Path, capsys: pytest.CaptureFixture, root: str

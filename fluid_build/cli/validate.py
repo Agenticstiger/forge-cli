@@ -409,37 +409,32 @@ def run(args, logger: logging.Logger) -> int:
         log_operation_failure(logger, "validate_contract", error=e.event, duration=duration)
 
         # Handle specific CLI errors with user-friendly messages. ``console_error``
-        # prints its text literally, so no value needs escaping first.
+        # prints its text literally, so no value needs escaping first. ``--quiet`` is
+        # "errors only": the error itself always prints, the guidance below does not.
         if e.event == "version_below_minimum":
-            if not args.quiet:
-                console_error(
-                    f"Contract version {e.context.get('version')} does not meet minimum requirement {e.context.get('constraint')}"
-                )
+            console_error(
+                f"Contract version {e.context.get('version')} does not meet minimum requirement {e.context.get('constraint')}"
+            )
         elif e.event == "version_above_maximum":
-            if not args.quiet:
-                console_error(
-                    f"Contract version {e.context.get('version')} exceeds maximum allowed {e.context.get('constraint')}"
-                )
+            console_error(
+                f"Contract version {e.context.get('version')} exceeds maximum allowed {e.context.get('constraint')}"
+            )
         elif e.event == "contract_file_not_found":
-            if not args.quiet:
-                console_error(f"Contract file not found: {e.context.get('path')}")
+            console_error(f"Contract file not found: {e.context.get('path')}")
         elif e.event == "contract_version_unsupported":
-            if not args.quiet:
-                console_error(
-                    e.context.get(
-                        "message",
-                        f"Unsupported contract version: {e.context.get('version')}",
-                    )
+            console_error(
+                e.context.get(
+                    "message",
+                    f"Unsupported contract version: {e.context.get('version')}",
                 )
+            )
         elif e.event == "contract_required":
-            if not args.quiet:
-                console_error(f"{e.context.get('message', 'Contract file is required')}")
+            console_error(f"{e.context.get('message', 'Contract file is required')}")
         else:
-            if not args.quiet:
-                console_error(f"Validation error: {e.event}")
-                if e.context:
-                    for key, value in e.context.items():
-                        _cprint_literal(f"   {key}: {value}")
+            console_error(f"Validation error: {e.event}")
+            if e.context:
+                for key, value in e.context.items():
+                    _cprint_literal(f"   {key}: {value}")
 
         # Stable slug + catalog-driven guidance (Error-UX card). ``e`` is
         # auto-enriched at construction, so catalogued events (contract_*,
