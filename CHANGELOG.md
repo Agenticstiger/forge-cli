@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fluid validate --fragment` no longer guesses a schema version.** With no `--schema-version`
+  and no root contract above the fragment, it checked the fragment against the newest stable
+  schema (0.7.5), so a valid 0.7.6 fragment failed on a field 0.7.5 does not have; a root contract
+  it could not read, or one that kept its `fluidVersion` behind a `$ref`, got the same guess. The
+  version now comes from `--schema-version`, else from the nearest root contract, read as every
+  command reads it: a root that is a `$ref` to its base, a `fluidVersion` kept in a fragment and a
+  same-document pointer are all followed. With neither, the run stops with
+  `schema_version_required` and says why: no root contract above the fragment could be taken, or
+  the nearest one cannot be read or declares no `fluidVersion`.
+- **`fluid validate --fragment KIND` without a file** validated the `contract.fluid.yaml` of the
+  working directory as if it were the fragment. It now says the file is required
+  (`fragment_file_required`). When the KIND was left out, so the file was read as the KIND, the
+  error says that instead.
+- **`fluid validate --fragment KIND bundle.tgz`** validated the bundle and ignored `--fragment`.
+  It is refused now (`fragment_bundle_unsupported`): a bundle is validated whole.
+- **The `--format json` result of a fragment run names the fragment kind**, in a new `fragment`
+  field after `valid`. The JSON of a whole-contract run is unchanged.
+- **A `--schema-version`, `--min-version` or `--max-version` that is not a version** ended as
+  `cli_unhandled_exception`, because the handlers around the parsers caught a `ValueError` the
+  parsers never raise. It is the event the flag names now (`invalid_schema_version`,
+  `invalid_min_version`, `invalid_max_version`), with its hints; the `invalid_schema_version`
+  hint names `fluid validate --list-versions`, the command that lists the versions.
+- **`fluid validate --quiet` printed nothing when a run stopped** on an error such as
+  `contract_load_failed`, although `--quiet` is "errors only". The error now prints; the hints
+  and docs link stay hidden.
+- **`fluid validate missing.fluid.yaml` said "Contract file not found: None"**; it names the
+  file again.
+
+### Security
+
+- **`fluid validate` sent a terminal escape sequence in a message to the terminal.** An argument
+  or a contract value it quotes back (a `$ref` in `contract_load_failed`) could retitle the
+  window, rewrite lines or, where the terminal allows it, write the clipboard. Control characters
+  in those messages are now printed as text (`\x1b`), as the CLI's own error line already did.
+
 ## [0.25.0] — 2026-10-28
 
 ### Added

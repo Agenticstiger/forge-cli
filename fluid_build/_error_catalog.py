@@ -143,9 +143,45 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     # ── schema / version ───────────────────────────────────────────────────
     "invalid_schema_version": (
         [
-            "Set a supported fluidVersion (current line: 0.7.x)",
-            "Run 'fluid validate <contract>' to see the supported versions",
+            "Use a supported version (current line: 0.7.x) in fluidVersion or --schema-version",
+            "Run 'fluid validate --list-versions' to see the supported versions",
         ],
+        "schema-evolution",
+    ),
+    "schema_version_required": (
+        [
+            "Name the version: fluid validate --fragment KIND <file> --schema-version <version>",
+            "Run 'fluid validate --list-versions' to see the supported versions",
+        ],
+        "schema-evolution",
+    ),
+    # ── validate --fragment ────────────────────────────────────────────────
+    "fragment_file_required": (
+        ["Give the kind, then the file: fluid validate --fragment expose <file>"],
+        None,
+    ),
+    "fragment_bundle_unsupported": (
+        ["Validate the bundle without --fragment: fluid validate <bundle>.tgz"],
+        None,
+    ),
+    "fragment_kind_unknown": (
+        [
+            "Use one of the kinds the error lists, for example: fluid validate --fragment expose <file>"
+        ],
+        None,
+    ),
+    "fragment_env_unsupported": (
+        [
+            "Validate the whole contract with the overlay: fluid validate contract.fluid.yaml --env <env>"
+        ],
+        None,
+    ),
+    "fragment_has_pointers": (
+        ["Validate the contract that uses the fragment: fluid validate contract.fluid.yaml"],
+        None,
+    ),
+    "schema_not_available": (
+        ["Run 'fluid validate --list-versions' to see the versions this CLI has"],
         "schema-evolution",
     ),
     "contract_version_unsupported": (
@@ -156,11 +192,11 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         "schema-evolution",
     ),
     "invalid_min_version": (
-        ["Use a valid PEP 440 / semver version string for the minimum bound"],
+        ["Give --min-version a version constraint, for example --min-version '>=0.7.0'"],
         "schema-evolution",
     ),
     "invalid_max_version": (
-        ["Use a valid PEP 440 / semver version string for the maximum bound"],
+        ["Give --max-version a version constraint, for example --max-version '<0.8.0'"],
         "schema-evolution",
     ),
     # ── validation ─────────────────────────────────────────────────────────
