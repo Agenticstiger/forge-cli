@@ -107,6 +107,16 @@ def _contract(exposes: List[Dict[str, Any]], builds: Any = ()) -> Dict[str, Any]
     return contract
 
 
+@pytest.fixture(autouse=True)
+def _providers_discovered() -> None:
+    """The real registry, discovered in full: a test elsewhere that restores a
+    partial snapshot of it must not decide what these tests see."""
+    from fluid_build import providers as registry
+
+    if "local" not in registry.PROVIDERS:
+        registry.discover_providers(LOG, force=True)
+
+
 def _refusal(contract: Dict[str, Any]) -> CLIError:
     with pytest.raises(CLIError) as exc:
         _simple_apply_provider(contract, LOG)
@@ -171,6 +181,17 @@ class TestNoProviderServesIt:
         contract = _contract([_expose("t", "databricks"), _expose("orders", "local")])
         error = _refusal(contract)
         assert "exposes[0].binding.platform: databricks" in error.context["error"]
+
+    def test_a_later_build_too_when_the_builds_are_consulted(self) -> None:
+        # The local provider runs every build's SQL on DuckDB. The first build
+        # chose the provider before; a later one's platform was never read, so
+        # a build declared for Composer quietly ran on DuckDB.
+        contract = _contract(
+            [_expose("orders", "local"), _expose("audit", "local")],
+            [_sql("a", ["orders"], "local"), _sql("b", ["audit"], "composer")],
+        )
+        error = _refusal(contract)
+        assert "builds[1].execution.runtime.platform: composer" in error.context["error"]
 
     def test_every_one_is_named(self) -> None:
         contract = _contract(
@@ -244,6 +265,23 @@ class TestTheChoiceIsUnchanged:
             [_sql(f"b{i}", [], p) for i, p in enumerate(runtimes)],
         )
         assert _simple_apply_provider(contract, LOG) == expected
+
+    def test_an_expose_a_flink_job_writes_still_names_its_provider(self) -> None:
+        # Its platform is passed over only when it names no provider: here the
+        # BigQuery table the Flink job writes chooses gcp, as it did before.
+        contract = _contract(
+            [_expose("orders", "local"), _expose("events", "gcp")],
+            [_sql("make_orders", ["orders"]), _flink(["events"])],
+        )
+        assert _simple_apply_provider(contract, LOG) == "gcp"
+
+    def test_the_builds_are_not_read_when_an_expose_names_a_cloud(self) -> None:
+        # As before: a build's platform is consulted only when the exposes leave
+        # the choice to it, so its kubernetes runtime neither chooses nor stops.
+        contract = _contract(
+            [_expose("a", "gcp"), _expose("b", "snowflake")], [_sql("x", [], "kubernetes")]
+        )
+        assert _simple_apply_provider(contract, LOG) == "snowflake"
 
     def test_a_provider_the_plugin_policy_removed_is_left_to_build_provider(
         self, monkeypatch: pytest.MonkeyPatch

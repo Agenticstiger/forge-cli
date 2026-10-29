@@ -97,11 +97,12 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     "apply_platform_unsupported": (
         [
-            "If a job outside forge-cli writes the expose (a Flink job, say), declare it as a "
-            "build (engine: flink, or properties.language: flink_sql) whose outputs name the "
-            "expose: forge-cli then leaves the expose to that job",
-            "Run 'fluid providers' to list the providers this install has",
-            "--provider <name> applies the whole contract with the provider you name",
+            "If a job outside forge-cli (a Flink job, say) writes that expose or is that "
+            "build, declare the build with engine: flink (or properties.language: flink_sql) "
+            "and outputs naming what it writes: forge-cli then leaves both to the job",
+            "--provider <name> (or FLUID_PROVIDER) applies the whole contract with the "
+            "provider you name; the local provider writes a binding it does not serve as a "
+            "placeholder file",
         ],
         "providers",
     ),

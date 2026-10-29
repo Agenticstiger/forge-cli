@@ -1196,20 +1196,25 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
 
     A ``binding.platform`` says where an expose lands and a build's
     ``execution.runtime.platform`` where it runs; neither is a provider name,
-    though ``local``, ``gcp``, ``aws`` and ``snowflake`` are both. Read as one,
-    a Kafka binding or a Flink build's ``runtime.platform: kubernetes`` ended
-    the run as ``provider_unknown``.
+    though ``local``, ``gcp``, ``aws``, ``snowflake`` and ``redshift`` are also
+    providers. Read as one, a Kafka binding or a Flink build's
+    ``runtime.platform: kubernetes`` ended the run as ``provider_unknown``.
 
-    A build that runs outside forge-cli and an expose such a build writes are
-    applied by no provider here (the local planner lands nothing for them), so
-    their platforms choose none. Every other platform must name a registered
-    provider, or one the plugin policy removed (``build_provider`` reports
-    that; a platform no provider is named after is refused under any policy):
-    a binding no provider serves is never handed to another one, which would
-    write it as a local placeholder file and report success, so the run stops
-    with ``apply_platform_unsupported``. Among the platforms left the
-    choice is as before: the last expose's, then, when that is ``local`` or
-    there is none, the first build's; ``local`` when none is declared.
+    The platforms are consulted as before: every expose's, the last one naming
+    a provider choosing it; then, when that is ``local`` or there is none, the
+    builds', the first one naming a provider choosing it; ``local`` when none
+    does. What changed is a platform that names no provider:
+
+    * A build that runs outside forge-cli, and an expose such a build writes,
+      name where that job runs and writes. No provider applies them here (the
+      local planner lands nothing for them), so such a platform is passed over.
+    * Any other platform no registered provider serves stops the run with
+      ``apply_platform_unsupported`` (one the plugin policy removed is left to
+      ``build_provider``, which says so). It is never handed to another
+      provider, which would write it as a local placeholder file and report
+      success. A build's platform is checked when the builds are consulted:
+      the local provider runs their SQL on DuckDB, where a build declared to
+      run elsewhere was never meant to run.
     """
     from fluid_build import providers as registry
     from fluid_build.util.contract import (
@@ -1218,32 +1223,41 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
         is_written_outside_forge,
     )
 
-    def _key(platform: Any) -> str:  # as build_provider spells a provider name
+    def _key(platform: Any) -> str:  # as providers._normalize_name spells a registry key
         return str(platform).strip().lower().replace("-", "_")
 
     builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
-    lands: List[Tuple[str, str]] = []
+    # (where, provider name, run by a job outside forge-cli)
+    lands: List[Tuple[str, str, bool]] = []
     for i, expose in enumerate(contract.get("exposes") or []):
         binding = expose.get("binding") if isinstance(expose, dict) else None
         platform = binding.get("platform") if isinstance(binding, dict) else None
-        if platform and not is_written_outside_forge(get_expose_id(expose), builds):
-            lands.append((f"exposes[{i}].binding.platform", _key(platform)))
-    runs: List[Tuple[str, str]] = []
+        if platform:
+            outside = is_written_outside_forge(get_expose_id(expose), builds)
+            lands.append((f"exposes[{i}].binding.platform", _key(platform), outside))
+    runs: List[Tuple[str, str, bool]] = []
     for i, build in enumerate(contract.get("builds") or []):
-        if not isinstance(build, dict) or is_externally_run_build(build):
+        if not isinstance(build, dict):
             continue
         execution = build.get("execution")
         runtime = execution.get("runtime") if isinstance(execution, dict) else None
         platform = runtime.get("platform") if isinstance(runtime, dict) else None
         if platform:
-            runs.append((f"builds[{i}].execution.runtime.platform", _key(platform)))
+            outside = is_externally_run_build(build)
+            runs.append((f"builds[{i}].execution.runtime.platform", _key(platform), outside))
 
     registry.discover_providers(logger)
-    unsupported = [
-        f"{where}: {name}"
-        for where, name in lands + runs
-        if name not in registry.PROVIDERS and name not in registry.POLICY_BLOCKED
-    ]
+
+    def _served(name: str) -> bool:
+        return name in registry.PROVIDERS or name in registry.POLICY_BLOCKED
+
+    unsupported = [f"{w}: {n}" for w, n, outside in lands if not outside and not _served(n)]
+    named = [n for _w, n, _outside in lands if _served(n)]
+    name = named[-1] if named else "local"
+    if name == "local":
+        unsupported += [f"{w}: {n}" for w, n, outside in runs if not outside and not _served(n)]
+        named = [n for _w, n, _outside in runs if _served(n)]
+        name = named[0] if named else name
     if unsupported:
         shown = ", ".join(unsupported[:_PLATFORMS_SHOWN])
         if len(unsupported) > _PLATFORMS_SHOWN:
@@ -1253,15 +1267,12 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
             "apply_platform_unsupported",
             {
                 "error": (
-                    f"no forge-cli provider applies {shown}; "
-                    "fluid apply will not hand it to another provider"
+                    f"no forge-cli provider applies {shown}, and fluid apply hands "
+                    "a platform to no other provider"
                 ),
                 "providers": ", ".join(sorted(registry.PROVIDERS)),
             },
         )
-    name = lands[-1][1] if lands else "local"
-    if name == "local" and runs:
-        name = runs[0][1]
     return name
 
 
