@@ -66,7 +66,7 @@ def run(args, logger: logging.Logger) -> int:
         # Load full contracts once so we can render both summaries and
         # per-contract drill-in pages without re-parsing.
         contracts = {p: _load_contract_quiet(p, logger) for p in paths}
-        entries = [_summarize_contract(p, c, error) for p, (c, error) in contracts.items()]
+        entries = [_summarize_contract(p, c, err, logger) for p, (c, err) in contracts.items()]
         # Sort by id for deterministic output. An id is whatever the contract
         # holds, so it is compared as text: a number does not sort against a string.
         entries.sort(key=lambda e: (str(e.get("id") or ""), str(e.get("path", ""))))
@@ -321,13 +321,16 @@ def _count(value: Any) -> int:
     return len(_items(value))
 
 
-def _summarize_contract(path: str, contract: Any, error: Any = None) -> dict[str, Any]:
+def _summarize_contract(
+    path: str, contract: Any, error: Any, logger: logging.Logger
+) -> dict[str, Any]:
     """Extract a small set of header fields for the index.
 
     The JSON keeps the contract's own values (``description`` and ``owner``
     may be objects); the HTML renders them as text. A contract that did not
     load, or whose values cannot be listed, gets a row with its ``error`` and
-    no ``id``: one bad contract is not the catalog.
+    no ``id``: one bad contract is not the catalog. One that could not be
+    listed is logged at DEBUG with its path and the traceback.
     """
     if not isinstance(contract, Mapping):
         return {"path": path, "id": None, "error": error or "not a mapping"}
@@ -351,6 +354,7 @@ def _summarize_contract(path: str, contract: Any, error: Any = None) -> dict[str
             "consumes_count": _count(contract.get("consumes")),
         }
     except Exception as exc:  # noqa: BLE001 - one odd contract, not the catalog
+        logger.debug("docs_contract_not_listed: %s: %s", path, exc, exc_info=True)
         return {"path": path, "id": None, "error": f"not listed: {exc}"}
 
 

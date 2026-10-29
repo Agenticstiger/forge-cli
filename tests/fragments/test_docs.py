@@ -1407,6 +1407,44 @@ def test_j04x_a_contract_with_odd_values_is_listed_with_them_as_text(tmp_path: P
     assert '<span class="tag">1</span>' in index and '<span class="tag">2024-01-01</span>' in index
 
 
+def test_j04x_a_contract_whose_row_cannot_be_made_is_an_error_row_and_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The last-resort ``except`` in the summary kept the catalog but said nothing, so a fault
+    there would hide a contract without a trace. It is now logged at DEBUG with its path."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "a" / "contract.fluid.yaml", _min_doc("good.a"))
+    odd = _put(tmp_path / "b" / "contract.fluid.yaml", _min_doc("odd.b"))
+    _put(tmp_path / "c" / "contract.fluid.yaml", _min_doc("good.c"))
+    slug_for = docs_build._slug_for
+
+    def fails_for_b(contract: Any, path: str) -> str:
+        if contract.get("id") == "odd.b":
+            raise RuntimeError("cannot list this one")
+        return slug_for(contract, path)
+
+    monkeypatch.setattr(docs_build, "_slug_for", fails_for_b)
+    logger = logging.getLogger("test.docs.summary")
+    caplog.set_level(logging.DEBUG, logger=logger.name)
+    out = tmp_path / "site"
+    args = types.SimpleNamespace(src=str(tmp_path), files=None, out=str(out))
+
+    assert docs_build.run(args, logger) == 0
+
+    rows = {Path(r["path"]).parent.name: r for r in _index(out)}
+    assert (rows["b"]["id"], rows["b"]["error"]) == (None, "not listed: cannot list this one")
+    assert sorted(p.name for p in out.glob("contract-*.html")) == [
+        "contract-good-a.html",
+        "contract-good-c.html",
+    ]
+    (row,) = re.findall(r'<tr class="error".*?</tr>', (out / "index.html").read_text("utf-8"), re.S)
+    assert "not listed: cannot list this one" in row and "b/contract.fluid.yaml" in row
+    (record,) = [r for r in caplog.records if "docs_contract_not_listed" in r.getMessage()]
+    assert record.levelno == logging.DEBUG and record.exc_info is not None
+    assert record.getMessage() == f"docs_contract_not_listed: {odd}: cannot list this one"
+
+
 _YAML_ODDITIES = """\
 fluidVersion: "0.7.6"
 kind: DataProduct
