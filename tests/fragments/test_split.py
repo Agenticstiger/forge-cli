@@ -1743,6 +1743,49 @@ def test_i21_a_ref_written_as_a_block_scalar_is_rebased_by_the_data_split(
     assert "a $ref value is written as a block scalar" in capsys.readouterr().err
 
 
+def test_i21_a_ref_an_alias_shares_with_a_part_that_stays_is_rebased_in_the_part_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-02 in the data split: an alias puts one ref object in the root's metadata
+    and in a build. The build's copy is rebased in its fragment; the one that
+    stays in the root is never changed with it."""
+    text = (
+        "id: x\nmetadata:\n  other: &p {$ref: ./p.yaml}\nbuilds:\n  - id: a\n    engine: sql\n"
+        "    properties:\n      parameters: *p\n"
+    )
+    pair = make_pair(tmp_path, {NAME: text, "p.yaml": "mode: full\n"})
+    capsys.readouterr()
+
+    after = split_and_check(pair)
+
+    assert "the contract uses YAML aliases" in capsys.readouterr().err
+    assert yaml.safe_load(text_of(after, NAME))["metadata"]["other"] == {"$ref": "./p.yaml"}
+    build = yaml.safe_load(text_of(after, "fragments/builds/a.yaml"))
+    assert build["properties"]["parameters"] == {"$ref": "../../p.yaml"}
+
+
+def test_i21_a_ref_in_a_part_cut_from_a_moved_part_is_rebased_to_its_own_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-02 in the text splice: a ref in the columns, cut out of the expose that
+    moves too, is rewritten once, in the columns' own file, and not again in the
+    expose's text the columns were cut from."""
+    text = (
+        "# head\nid: x\nexposes:\n  - exposeId: o\n    kind: table\n    contract:\n"
+        "      schema:\n        - {$ref: ./cols.yaml#/a}  # col\n"
+    )
+    pair = make_pair(tmp_path, {NAME: text, "cols.yaml": "a: {name: z, type: string}\n"})
+    capsys.readouterr()
+
+    after = split_and_check(pair, "exposes,schema")
+
+    assert '- {$ref: "../../cols.yaml#/a"}  # col\n' in text_of(after, "fragments/schemas/o.yaml")
+    expose = yaml.safe_load(text_of(after, "fragments/exposes/o.yaml"))
+    assert expose["contract"]["schema"] == {"$ref": "../schemas/o.yaml"}
+    assert_comments_conserved(text, after)
+    assert "were not kept" not in capsys.readouterr().err  # the splice, not the data split
+
+
 def test_i21_refs_that_stay_in_the_root_are_not_touched(tmp_path: Path) -> None:
     text = REFS_IN_PARTS.replace(
         "id: x\n", "id: x\nmetadata:\n  owner: {$ref: ./team.yaml}\n"
@@ -3067,6 +3110,52 @@ def test_i34_an_interrupt_halfway_takes_the_split_back_and_goes_on(
         assert digest(tmp_path) == before
 
 
+def test_i34_a_write_that_fails_takes_back_the_file_it_was_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-05: the second fragment's file is made, then its write fails (a full disk).
+    That file is taken back with the first: it is counted as written the moment it
+    exists, not once its text is in."""
+    import errno
+
+    from fluid_build.cli import split as split_command
+
+    class _FullDisk:
+        def __init__(self, handle: Any) -> None:
+            self.handle = handle
+
+        def __enter__(self) -> "_FullDisk":
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            self.handle.close()
+
+        def write(self, data: bytes) -> int:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    made: List[Any] = []
+
+    def full_on_the_second(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        handle = open(file, mode, *args, **kwargs)
+        if mode == "xb":
+            made.append(file)
+            if len(made) == 2:
+                return _FullDisk(handle)
+        return handle
+
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    before = digest(tmp_path)
+    monkeypatch.setattr(split_command, "open", full_on_the_second, raising=False)
+    capsys.readouterr()
+
+    assert split(pair.split_contract) == 1
+
+    err = capsys.readouterr().err
+    assert "No space left on device" in err and err.rstrip().endswith("nothing was changed")
+    assert len(made) == 2
+    assert digest(tmp_path) == before
+
+
 @pytest.mark.parametrize("failure", ["refs-it-cannot-rebase", "out-elsewhere", "lone-surrogate"])
 def test_i34_a_refused_split_leaves_the_tree_exactly_as_it_was(
     tmp_path: Path, failure: str, capsys: pytest.CaptureFixture[str]
@@ -3624,6 +3713,14 @@ _GENERATED_PARTS = [
     "description",
     "extensions.acme",
 ]
+#: The files the generated contracts' refs name, beside the root.
+GENERATED_REF_FILES: Dict[str, str] = {
+    "params/full.yaml": "mode: full\nn: 1\ntags: [a, b]\n",
+    "cols.yaml": (
+        "extra: {name: extra, type: string}\n"
+        "columns:\n  - {name: id, type: string, required: true}\n  - {name: v, type: number}\n"
+    ),
+}
 _SQL_TEXTS = [
     "SELECT 1",
     "SELECT 1\n",
@@ -3637,14 +3734,16 @@ _SQL_TEXTS = [
 
 def _generated_contract(rng: random.Random) -> Dict[str, Any]:
     def build(i: int) -> Dict[str, Any]:
+        parameters: Dict[str, Any] = {"mode": "full", "n": rng.randint(1, 5), "tags": ["a", "b"]}
+        if rng.random() < 0.5:  # a ref, rebased when the build moves; with a sibling or not
+            parameters = {"$ref": "./params/full.yaml"}
+            if rng.random() < 0.5:
+                parameters["n"] = rng.randint(1, 5)
         return {
             "id": rng.choice([f"b{i}", f"build.{i}", f"B-{i}"]),
             "pattern": "embedded-logic",
             "engine": "sql",
-            "properties": {
-                "sql": rng.choice(_SQL_TEXTS),
-                "parameters": {"mode": "full", "n": rng.randint(1, 5), "tags": ["a", "b"]},
-            },
+            "properties": {"sql": rng.choice(_SQL_TEXTS), "parameters": parameters},
         }
 
     def expose(i: int) -> Dict[str, Any]:
@@ -3658,6 +3757,11 @@ def _generated_contract(rng: random.Random) -> Dict[str, Any]:
         }
         if rng.random() < 0.3:
             del contract["quality"]
+        refs = rng.random()
+        if refs < 0.3:  # a column from a file, rebased with the expose or the schema
+            contract["schema"].append({"$ref": "./cols.yaml#/extra"})
+        elif refs < 0.5:  # the whole schema from a file: it moves with the expose only
+            contract["schema"] = {"$ref": "./cols.yaml#/columns"}
         return {
             "exposeId": f"e{i}",
             "kind": "table",
@@ -3788,7 +3892,9 @@ def generated_root(seed: int) -> Tuple[str, List[str], bool]:
 @pytest.mark.parametrize("seed", range(24))
 def test_i02_generated_roots_keep_every_comment_and_the_bundle(tmp_path: Path, seed: int) -> None:
     text, parts, crlf = generated_root(seed)
-    pair = solo(tmp_path, text.encode("utf-8"))
+    line_end = "\r\n" if crlf else "\n"
+    files = {rel: body.replace("\n", line_end) for rel, body in GENERATED_REF_FILES.items()}
+    pair = make_pair(tmp_path, {NAME: text.encode("utf-8"), **files})
 
     after = split_and_check(pair, ",".join(parts), cli_envs=())
 
