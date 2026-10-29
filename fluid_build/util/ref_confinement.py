@@ -70,6 +70,7 @@ __all__ = [
     "RefResolutionError",
     "confine_ref",
     "format_pointer",
+    "is_relative_file_ref",
     "is_within",
     "iter_external_refs",
     "ref_location",
@@ -160,6 +161,20 @@ def _is_absolute(file_part: str) -> bool:
     )
 
 
+def _is_remote(file_part: str) -> bool:
+    return file_part.startswith("//") or bool(
+        _SCHEME_RE.match(file_part) and not _DRIVE_RE.match(file_part)
+    )
+
+
+def is_relative_file_ref(file_part: str) -> bool:
+    """True when ``file_part``, a ``$ref``'s part before ``#``, names a file by a
+    relative path: the only kind :func:`confine_ref` resolves (against the
+    directory of the file that holds the ref). Empty (a same-document ``#/...``
+    pointer), a URL or an absolute path is not one."""
+    return bool(file_part) and not _is_remote(file_part) and not _is_absolute(file_part)
+
+
 def confine_ref(
     ref: str,
     file_part: str,
@@ -202,9 +217,7 @@ def confine_ref(
             ignored_ref_root_env=ignored_ref_root_env,
         )
 
-    if file_part.startswith("//") or (
-        _SCHEME_RE.match(file_part) and not _DRIVE_RE.match(file_part)
-    ):
+    if _is_remote(file_part):
         raise _refuse(
             "is a URL; remote refs (including file://) are not supported"
             + (" — use a relative path to a file inside the ref root" if root else "")

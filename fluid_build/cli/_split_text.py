@@ -19,7 +19,9 @@ every comment outside a moved part, key order, quoting, flow style and blank
 lines. Each moved part takes its own text to its fragment, comments inside
 it included, and a ``$ref`` takes its place. A part inside another (a
 build's SQL) is cut out of its container's text first, so the container's
-fragment holds the ref to it. The comment on a block scalar's header line
+fragment holds the ref to it. A relative ``$ref`` already in a moved part is
+rewritten in its text, in its own quoting, to name the same file from the
+fragment. The comment on a block scalar's header line
 (``sql: |  # the query``) stays beside the ref that replaces the scalar: a
 text file cannot hold it.
 
@@ -40,7 +42,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
-from fluid_build.cli.forge_contract_fragments import FragmentSite, container_of, ref_between
+from fluid_build.cli.forge_contract_fragments import (
+    FragmentSite,
+    container_of,
+    rebased_ref,
+    ref_between,
+)
 from fluid_build.util.safe_yaml import compose_yaml_safe
 
 __all__ = ["SpliceRefused", "split_yaml_text"]
@@ -49,19 +56,35 @@ __all__ = ["SpliceRefused", "split_yaml_text"]
 #: a ``#`` that follows a blank, so a ``#`` inside a tag is not one.
 _HEADER_COMMENT = re.compile(r"[ \t]+#.*$")
 
+#: The tag of a node that parses as a string.
+_STR = "tag:yaml.org,2002:str"
+
+#: A line width no scalar reaches: the dumper breaks none over two lines.
+_ONE_LINE = 2**31 - 1
+
 
 class SpliceRefused(Exception):
     """The text cannot be spliced safely; the caller splits the parsed contract instead."""
 
 
-class _Cut:
-    def __init__(self, site: FragmentSite, node: Any, start: int, end: int, replacement: str):
-        self.site = site
-        self.node = node
+class _Edit:
+    """A span of the text and what takes its place."""
+
+    def __init__(self, start: int, end: int, replacement: str):
         self.start = start
         self.end = end
         self.replacement = replacement
-        self.children: List["_Cut"] = []
+
+
+class _Cut(_Edit):
+    """A part that moves: its span, the ref that takes its place, and the edits
+    inside it (the parts cut out of it, and its rebased refs)."""
+
+    def __init__(self, site: FragmentSite, node: Any, start: int, end: int, replacement: str):
+        super().__init__(start, end, replacement)
+        self.site = site
+        self.node = node
+        self.children: List[_Edit] = []
 
 
 def split_yaml_text(
@@ -73,8 +96,9 @@ def split_yaml_text(
 
     Raises:
         SpliceRefused: the text holds YAML aliases (moving an anchor or an
-            alias would change what the other one means), or a site is not
-            where the parsed contract says it is.
+            alias would change what the other one means), a site is not
+            where the parsed contract says it is, or a ``$ref`` to rebase is
+            a block scalar.
     """
     if _has_aliases(text):
         raise SpliceRefused("the contract uses YAML aliases")
@@ -102,6 +126,7 @@ def split_yaml_text(
         if cut.site.text:
             fragments[cut.site.target] = _value(contract, cut.site.path)
         else:
+            cut.children += _rebased_refs(cut)
             fragments[cut.site.target] = _fragment(text, cut)
     return _render(text, 0, len(text), top), fragments
 
@@ -219,20 +244,75 @@ def _with_trailing_comment(text: str, end: int) -> int:
     return line_end if rest.strip().startswith("#") else end
 
 
+def _rebased_refs(cut: _Cut) -> List[_Edit]:
+    """An edit for each ``$ref`` in the part ``cut`` moves (not in a part cut out
+    of it) that names a file relative to the root: it is rewritten to name that
+    file from the part's own file (:func:`rebased_ref`), in the quoting it had."""
+    inner = {id(child.node) for child in cut.children if isinstance(child, _Cut)}
+    edits: List[_Edit] = []
+    stack = [cut.node]
+    while stack:
+        node = stack.pop()
+        if id(node) in inner:
+            continue
+        if isinstance(node, yaml.SequenceNode):
+            stack.extend(node.value)
+        elif isinstance(node, yaml.MappingNode):
+            for key, value in node.value:
+                if _is_ref_value(key, value):
+                    ref = rebased_ref(value.value, cut.site.target)
+                    if ref != value.value:
+                        edits.append(_ref_edit(value, ref))
+                else:
+                    stack.append(value)
+    return edits
+
+
+def _is_ref_value(key: Any, value: Any) -> bool:
+    """``key: value`` is a ``$ref`` whose value is a string."""
+    return (
+        isinstance(key, yaml.ScalarNode)
+        and key.tag == _STR
+        and key.value == "$ref"
+        and isinstance(value, yaml.ScalarNode)
+        and value.tag == _STR
+    )
+
+
+def _ref_edit(node: Any, ref: str) -> _Edit:
+    """The edit that writes ``ref`` over the scalar ``node``."""
+    if node.style in ("|", ">"):
+        # A block scalar's span runs into the lines after it; the data split
+        # rewrites the ref instead.
+        raise SpliceRefused("a $ref value is written as a block scalar")
+    if node.style == "'" and ref.isprintable():
+        text = "'" + ref.replace("'", "''") + "'"
+    elif node.style == '"':
+        text = _double_quoted(ref)
+    else:
+        text = _yaml_string(ref)
+    return _Edit(node.start_mark.index, node.end_mark.index, text)
+
+
 def _yaml_string(value: str) -> str:
     """``value`` as a YAML scalar: plain when it is safe, quoted otherwise."""
     if value and all(c.isalnum() or c in "._/-" for c in value):
         return value
-    return yaml.safe_dump(value, default_style='"').strip()
+    return _double_quoted(value)
 
 
-def _render(text: str, lo: int, hi: int, cuts: Sequence[_Cut]) -> str:
+def _double_quoted(value: str) -> str:
+    """``value`` as a double-quoted YAML scalar, on one line however long it is."""
+    return yaml.safe_dump(value, default_style='"', width=_ONE_LINE).strip()
+
+
+def _render(text: str, lo: int, hi: int, edits: Sequence[_Edit]) -> str:
     out: List[str] = []
     pos = lo
-    for cut in sorted(cuts, key=lambda c: c.start):
-        out.append(text[pos : cut.start])
-        out.append(cut.replacement)
-        pos = cut.end
+    for edit in sorted(edits, key=lambda e: e.start):
+        out.append(text[pos : edit.start])
+        out.append(edit.replacement)
+        pos = edit.end
     out.append(text[pos:hi])
     return "".join(out)
 

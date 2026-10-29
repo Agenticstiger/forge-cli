@@ -1480,12 +1480,9 @@ REFS_IN_PARTS_FILES: Dict[str, str] = {
 }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-02: a relative $ref inside a moved part is copied unchanged into the fragment, "
-    "so it points one or two directories off; split refuses instead of rebasing it",
-)
 def test_i21_refs_in_moved_parts_are_rebased_to_the_fragment(tmp_path: Path) -> None:
+    """Finding SP-02: a relative ref in a part that moves names the same file
+    from the fragment; its quoting and a ``#/pointer`` after the file stay."""
     pair = make_pair(tmp_path, REFS_IN_PARTS_FILES)
 
     after = split_and_check(pair, envs=ENVS)
@@ -1493,13 +1490,11 @@ def test_i21_refs_in_moved_parts_are_rebased_to_the_fragment(tmp_path: Path) -> 
     assert "$ref: ../../sql/transform.sql" in text_of(after, "fragments/builds/transform.yaml")
     assert "../../schemas/orders.yaml" in text_of(after, "fragments/exposes/orders.yaml")
     assert "../../cols.yaml#/a" in text_of(after, "fragments/exposes/totals.yaml")
+    assert '- {$ref: "../../cols.yaml#/a", description: x}' in text_of(
+        after, "fragments/exposes/totals.yaml"
+    )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-02: split in two passes (--parts sql, then --parts builds) fails: the sql ref "
-    "written by the first pass is not rebased when the second moves the build",
-)
 def test_i21_sql_first_then_builds_is_a_two_pass_split_that_works(tmp_path: Path) -> None:
     pair = make_pair(
         tmp_path, {NAME: "id: x\nbuilds:\n  - id: t\n    properties: {sql: SELECT 1}\n"}
@@ -1509,19 +1504,141 @@ def test_i21_sql_first_then_builds_is_a_two_pass_split_that_works(tmp_path: Path
     assert split(pair.split_contract, "--parts", "builds") == 0
 
     assert_same_bundle(pair)
+    # The second pass rebased the ref the first one wrote: the two passes end
+    # where one split of both parts does.
+    one_pass = make_pair(tmp_path / "one", {NAME: pair.flat_contract.read_text("utf-8")})
+    assert split(one_pass.split_contract, "--parts", "builds,sql") == 0
+    assert files_of(pair.split) == files_of(one_pass.split)
 
 
-def test_i21_a_refused_split_for_refs_it_cannot_rebase_changes_no_file(
+#: A file ref whose pointer runs through a part that moves: the place it names
+#: is in the root's text only until the split, so no rebasing can keep it.
+#: (A same-document pointer, ``#/builds/0/id``, survives any split: C-24.)
+REF_INTO_A_MOVED_PART = """\
+id: x
+builds:
+  - id: t
+    engine: sql
+exposes:
+  - exposeId: o
+    kind: table
+    description: {$ref: "./contract.fluid.yaml#/builds/0/id"}
+"""
+
+
+def test_i21_a_file_ref_into_a_part_that_moves_refuses_the_split_and_changes_no_file(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Today's safe outcome: the split is refused before anything is changed."""
-    pair = make_pair(tmp_path, REFS_IN_PARTS_FILES)
+    """What rebasing cannot fix (SP-02): the ref is rebased, but the place its
+    pointer names leaves the root, so the split does not compose to the original;
+    it is refused and taken back."""
+    pair = solo(tmp_path, REF_INTO_A_MOVED_PART)
     files = files_of(pair.split)
 
     assert split(pair.split_contract) == 1
 
-    assert "Split not written" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "Split not written" in err and "../../contract.fluid.yaml#/builds/0/id" in err
     assert files_of(pair.split) == files
+
+
+@pytest.mark.parametrize("parts", [None, "builds,exposes,schema"])
+def test_i21_the_data_split_rebases_the_refs_in_moved_parts_too(
+    tmp_path: Path, parts: Optional[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-02 in the data split: a JSON root, and a YAML root with an alias, are
+    split as parsed data, and their refs are rebased the same way."""
+    as_json = json.dumps(yaml.safe_load(REFS_IN_PARTS), indent=2) + "\n"
+    with_alias = REFS_IN_PARTS.replace("id: x\n", "id: x\nlabels: &l {a: 1}\ntags: *l\n")
+    for name, root in (("json", as_json), ("alias", with_alias)):
+        files = {**REFS_IN_PARTS_FILES, NAME: root}
+        contract = JSON_NAME if name == "json" else NAME
+        if name == "json":
+            files[JSON_NAME] = files.pop(NAME)
+        pair = make_pair(tmp_path / name, files, contract)
+        capsys.readouterr()
+
+        after = split_and_check(pair, parts)
+
+        def loaded(rel: str) -> Any:
+            return yaml.safe_load(text_of(after, rel))
+
+        build = loaded("fragments/builds/transform.yaml")
+        assert build["properties"]["sql"] == {"$ref": "../../sql/transform.sql"}
+        orders = loaded("fragments/exposes/orders.yaml")
+        assert orders["contract"]["schema"] == {"$ref": "../../schemas/orders.yaml"}
+        totals = loaded("fragments/exposes/totals.yaml")["contract"]["schema"]
+        if parts:  # the columns went on to a file of their own, the ref with them
+            assert totals == {"$ref": "../schemas/totals.yaml"}
+            totals = loaded("fragments/schemas/totals.yaml")
+        assert totals == [{"$ref": "../../cols.yaml#/a", "description": "x"}]
+        if name == "alias":
+            assert "were not kept" in capsys.readouterr().err  # it was the data split
+
+
+def test_i21_the_dry_run_of_a_split_with_refs_lists_what_the_real_run_writes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-02 repro: the dry run listed the fragment and exited 0 while the real run
+    refused; now both agree."""
+    text = "id: x\nbuilds:\n  - id: t\n    engine: sql\n    properties:\n      sql: {$ref: ./sql/t.sql}\n"
+    pair = make_pair(tmp_path, {NAME: text, "sql/t.sql": "SELECT 1\n"})
+    capsys.readouterr()
+
+    assert split(pair.split_contract, "--dry-run") == 0
+    listed = _listed(capsys.readouterr().err)
+    after = split_and_check(pair)
+
+    assert listed == new_files(pair, after) == ["fragments/builds/t.yaml"]
+    assert "sql: {$ref: ../../sql/t.sql}" in text_of(after, "fragments/builds/t.yaml")
+
+
+@pytest.mark.parametrize(
+    "ref,container,rebased",
+    [
+        ("./sql/t.sql", "fragments/builds/t.yaml", "../../sql/t.sql"),
+        ("sql/t.sql", "fragments/builds/t.yaml", "../../sql/t.sql"),
+        ("./cols.yaml#/a/0", "fragments/exposes/o.yaml", "../../cols.yaml#/a/0"),
+        ("../shared/p.yaml", "fragments/builds/t.yaml", "../../../shared/p.yaml"),
+        ("./fragments/x.yaml", "fragments/sovereignty.yaml", "./x.yaml"),
+        ("fragments/other/x.yaml", "fragments/builds/t.yaml", "../other/x.yaml"),
+        # The ref's own path is kept as written: a ".." in it is not folded away.
+        ("sql/../sql/t.sql", "fragments/builds/t.yaml", "../../sql/../sql/t.sql"),
+        ("./sql/t.sql", "sql/t.yaml", "./t.sql"),
+        ("./x.yaml", None, "./x.yaml"),
+        ("#/builds/0/id", "fragments/builds/t.yaml", "#/builds/0/id"),
+        ("https://example.com/x.yaml", "fragments/builds/t.yaml", "https://example.com/x.yaml"),
+        ("//host/x.yaml", "fragments/builds/t.yaml", "//host/x.yaml"),
+        ("/abs/x.yaml", "fragments/builds/t.yaml", "/abs/x.yaml"),
+        ("C:\\x.yaml", "fragments/builds/t.yaml", "C:\\x.yaml"),
+        (5, "fragments/builds/t.yaml", 5),
+    ],
+)
+def test_i21_a_ref_is_rebased_by_its_path_alone(ref: Any, container: Any, rebased: Any) -> None:
+    from fluid_build.cli.forge_contract_fragments import rebased_ref
+
+    assert rebased_ref(ref, container) == rebased
+
+
+def test_i21_the_dict_level_splitter_rebases_a_ref_once_and_never_its_own() -> None:
+    """The sql ref split writes into the build's file names it from there already;
+    only the ref that was in the contract is rebased."""
+    from fluid_build.cli.forge_contract_fragments import split_contract_to_fragments
+
+    contract = {
+        "builds": [
+            {"id": "a", "properties": {"sql": "SELECT 1\n", "parameters": {"$ref": "./p.yaml"}}}
+        ]
+    }
+
+    root, files = split_contract_to_fragments(contract, ("builds", "sql"))
+
+    build = yaml.safe_load(files["fragments/builds/a.yaml"])
+    assert build["properties"] == {
+        "sql": {"$ref": "../../sql/a.sql"},
+        "parameters": {"$ref": "../../p.yaml"},
+    }
+    assert contract["builds"][0]["properties"]["parameters"] == {"$ref": "./p.yaml"}  # unchanged
 
 
 def test_i21_refs_that_stay_in_the_root_are_not_touched(tmp_path: Path) -> None:
@@ -2570,7 +2687,7 @@ def test_i34_a_refused_split_leaves_the_tree_exactly_as_it_was(
     tmp_path: Path, failure: str
 ) -> None:
     if failure == "refs-it-cannot-rebase":
-        pair = make_pair(tmp_path, REFS_IN_PARTS_FILES)
+        pair = solo(tmp_path, REF_INTO_A_MOVED_PART)
         args: List[Any] = []
     elif failure == "out-elsewhere":
         text = (
@@ -2800,11 +2917,6 @@ def test_i36_refs_in_the_root_that_need_the_ref_root_survive_a_split(
     assert "owner: {$ref: ../shared/team.yaml}" in pair.split_contract.read_text("utf-8")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-02: a relative $ref inside a moved part is not rebased; with FLUID_REF_ROOT set "
-    "(so the original composes and split can check its work) split refuses",
-)
 def test_i36_a_moved_part_with_a_ref_that_needs_the_ref_root_splits_with_the_env_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2815,6 +2927,8 @@ def test_i36_a_moved_part_with_a_ref_that_needs_the_ref_root_splits_with_the_env
 
     flat = _compose_with_ref_root(pair.flat_contract, pair.flat, monkeypatch)
     assert _compose_with_ref_root(pair.split_contract, pair.split, monkeypatch) == flat
+    build = (pair.split / "product/fragments/builds/a.yaml").read_text("utf-8")
+    assert "parameters: {$ref: ../../../shared/params.yaml}" in build
 
 
 def test_i36_split_without_the_ref_root_set_leaves_a_contract_that_still_composes(

@@ -24,6 +24,8 @@ four sections ``fluid split`` has always moved (:data:`DEFAULT_PARTS`).
 :func:`fragment_sites` says where each part sits and which file it goes to,
 for this dict-level splitter and for ``fluid split``'s text splicer
 (``cli/_split_text.py``), so the two move the same parts to the same files.
+Both rewrite a relative ``$ref`` inside a part that moves so that it names
+the same file from the part's new file (:func:`rebased_ref`).
 
 The splitting is purely mechanical — no LLM involved.  This guarantees
 deterministic, always-correct output regardless of the model used to
@@ -49,6 +51,8 @@ from typing import (
 )
 
 import yaml
+
+from fluid_build.util.ref_confinement import is_relative_file_ref
 
 # ── Splittable parts ─────────────────────────────────────────────────────
 
@@ -280,14 +284,77 @@ def ref_between(target: str, container: Optional[str]) -> str:
     return rel if rel.startswith("../") else f"./{rel}"
 
 
+def rebased_ref(ref: Any, container: Optional[str]) -> Any:
+    """``ref``, a ``$ref`` value written in the root, as the file ``container``
+    names the same target (``None``: the root, where it stays as it is).
+
+    A relative ref resolves against the directory of the file that holds it,
+    so one in a part that moves to ``fragments/builds/t.yaml`` climbs back out
+    of that directory first: ``./sql/t.sql`` becomes ``../../sql/t.sql``, and
+    a ``#/pointer`` after the file stays. The ref's own path is kept as it was
+    written, so no ``..`` in it is folded away (that would be wrong past a
+    symlinked directory); only the directories it shares with the container's
+    lead, and a leading ``./``, are dropped. A URL, an absolute path, a
+    same-document ``#/...`` pointer and a value that is not a string are not
+    relative to the file, and come back unchanged.
+    """
+    if container is None or not isinstance(ref, str):
+        return ref
+    file_part, mark, pointer = ref.partition("#")
+    if not is_relative_file_ref(file_part):
+        return ref
+    path = file_part
+    while path.startswith("./"):
+        path = path[2:].lstrip("/")
+    names = path.split("/")
+    climb = [name for name in posixpath.dirname(container).split("/") if name]
+    # A directory the container's path starts with is a real one (split writes
+    # through no symlink), so going into it and back out is no step at all.
+    while len(names) > 1 and climb and names[0] == climb[0]:
+        names.pop(0)
+        climb.pop(0)
+    rel = "/".join([".."] * len(climb) + names)
+    return (rel if rel.startswith("../") else f"./{rel}") + mark + pointer
+
+
+def _rebased_refs(value: Any, at: Tuple[Any, ...], container: str, inner: Collection[Any]) -> Any:
+    """``value``, the part at ``at`` that goes to the file ``container``, with every
+    ``$ref`` written in the root rebased to that file (:func:`rebased_ref`).
+
+    The parts in ``inner`` moved out of it first: each one's ref already names
+    its file from ``container``. What holds no ref to rebase is handed back as
+    it is, and what does is a copy, so a value a YAML alias shares with a part
+    that stays is never changed for both.
+    """
+    out: Any
+    if at in inner:
+        return value
+    if isinstance(value, dict):
+        out = {k: _rebased_refs(v, (*at, k), container, inner) for k, v in value.items()}
+        if "$ref" in value:
+            out["$ref"] = rebased_ref(value["$ref"], container)
+        changed = any(out[k] is not value[k] for k in value)
+    elif isinstance(value, list):
+        out = [_rebased_refs(v, (*at, i), container, inner) for i, v in enumerate(value)]
+        changed = any(new is not old for new, old in zip(out, value, strict=True))
+    else:
+        return value
+    return out if changed else value
+
+
 def container_of(site: FragmentSite, sites: Iterable[FragmentSite]) -> Optional[str]:
     """The fragment ``site`` ends up in: the nearest moved part around it, or the root."""
     best: Optional[FragmentSite] = None
     for other in sites:
-        if len(other.path) < len(site.path) and site.path[: len(other.path)] == other.path:
+        if _inside(site.path, other.path):
             if best is None or len(other.path) > len(best.path):
                 best = other
     return best.target if best is not None else None
+
+
+def _inside(path: Tuple[Any, ...], outer: Tuple[Any, ...]) -> bool:
+    """``path`` is below ``outer`` (not ``outer`` itself)."""
+    return len(outer) < len(path) and path[: len(outer)] == outer
 
 
 def split_contract_to_fragments(
@@ -303,7 +370,9 @@ def split_contract_to_fragments(
     text part (``sql``, ``description``).
 
     Only parts that actually exist, are non-empty, and are not already a
-    ``$ref`` are split. The input *contract* is not mutated.
+    ``$ref`` are split. A relative ``$ref`` inside a part that moves is
+    rewritten to name the same file from the part's new one
+    (:func:`rebased_ref`). The input *contract* is not mutated.
     """
     if not isinstance(contract, dict):
         return contract, {}
@@ -319,6 +388,8 @@ def split_contract_to_fragments(
         if site.text:
             fragments[site.target] = value
         else:
+            inner = {other.path for other in sites if _inside(other.path, site.path)}
+            value = _rebased_refs(value, site.path, site.target, inner)
             fragments[site.target] = (site.header + "\n" if site.header else "") + yaml.dump(
                 value,
                 Dumper=_exact_dumper(),
