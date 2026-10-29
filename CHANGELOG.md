@@ -18,12 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A refused `fluid split` leaves the tree as it was**, as its message says: it took back the
   files it wrote but left the directories it made (an empty `fragments/` changed what other
   commands did), and after a failed write the empty file. A read-only root ended in "Unexpected
-  error" (exit 2); it is now refused like any failed write (exit 1). The dry run refuses a
-  symlinked directory on the way, as the real run already did.
+  error" (exit 2); it is now refused like any failed write (exit 1), as is a JSON root with a
+  character that has no UTF-8 form. An interrupt (Ctrl-C) halfway through the writes is taken
+  back too. The dry run refuses a symlinked directory on the way, as the real run already did.
+- **A part in a container a YAML alias or `<<` merge shares is split from its own place.** Two
+  builds merging the same defaults (`<<: *defaults`) made `fluid split --parts sql` fail with
+  "write() argument must be str, not dict" and leave an empty `sql/b.sql`; each build's sql is now
+  a file of its own.
 - **`fluid split --out DIR` never writes over another file.** An existing `DIR/contract.fluid.yaml`
-  that is not the contract being split was replaced without a word; a second split into the same
-  `--out` wrote `-2` copies and left the first run's fragments unreferenced. Both are refused now,
-  the dry run included, with the remedy.
+  that is not the contract being split (or a byte-for-byte copy of it that is no hard link to
+  another file) was replaced without a word; a second split into the same `--out` wrote `-2`
+  copies and left the first run's fragments unreferenced. Both are refused now, the dry run
+  included, with the remedy.
 - **A long id gets a file name a file system takes.** An id of 300 characters gave a 305-byte
   name: the dry run listed it and the real run failed. A slug over 100 characters now ends in 8 hex
   digits of a hash of the whole id, so two long ids that start alike keep names of their own.
