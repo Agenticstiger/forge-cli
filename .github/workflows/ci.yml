@@ -825,57 +825,74 @@ jobs:
         # auditing first keeps the gate honest. Do NOT fold the scanner
         # install back into the step above.
         #
-        # filelock CVE-2026-112940 / -112913 / -112907 (ignored 2026-10-26,
-        # founder-approved). All three are in filelock's SQLite-backed
-        # ReadWriteLock / AsyncReadWriteLock, and that API is UNREACHABLE in
-        # our closure. Verified, not assumed: no package in a resolved
-        # `.[dev,local]` env references ReadWriteLock outside filelock itself;
-        # fluid_build never imports filelock; and the six packages that do
-        # (cachecontrol, huggingface_hub, litellm, mypy, mypyc, pip) all use
-        # the plain FileLock. All three are also AV:L/PR:L -- they need a
-        # second local user able to create or rename entries in the lock
-        # database's own directory.
+        # filelock: every advisory whose only fix is filelock >= 4.0 is shown as
+        # a warning, not a failure (founder decision 2026-10-29). Thirteen were
+        # published between 2026-10-26 and 2026-10-29 (seven on the 29th alone),
+        # all fixed only in 4.x, so ignoring them by ID chased a moving target.
+        # The fix cannot be resolved here: litellm is a BASE dependency (not an
+        # extra) and its latest release (1.106.6 on 2026-10-29) still declares
+        # filelock<4.0 (checked against the PyPI JSON API), so pinning the fixed
+        # version makes the install unsatisfiable. virtualenv is not a blocker --
+        # its latest allows filelock<5. Upstream tracker: BerriAI/litellm#48394.
         #
-        # filelock CVE-2026-112936 / -112938 (ignored 2026-10-29,
-        # founder-approved), on the same grounds: -112936 is ReadWriteLock /
-        # AsyncReadWriteLock again (a symlink at the lock path), and -112938 is
-        # StrictSoftFileLock / AsyncStrictSoftFileLock, which nothing in the
-        # closure uses either (huggingface_hub uses SoftFileLock, not the strict
-        # one). Both AV:L.
+        # What the filelock advisories touch: ReadWriteLock / StrictSoftFileLock
+        # are used by nothing in the closure; the plain FileLock (pip /
+        # cachecontrol, huggingface_hub, litellm, safety, mypy) and SoftFileLock
+        # (huggingface_hub's fallback where flock is missing) are, with lock
+        # files in the running user's own caches; all need a second local user
+        # (AV:L) who can rename or hard-link entries in the lock's directory.
+        # fluid_build never imports filelock.
         #
-        # filelock CVE-2026-112909 / -112910 (ignored 2026-10-29,
-        # founder-approved, on different grounds). These ARE reachable: -112909
-        # is UnixFileLock, the backend of the plain FileLock on Unix (it empties,
-        # and with a mode chmods, the file it finds at the lock path), and
-        # -112910 is the plain FileLock on Windows ignoring `mode`. pip /
-        # cachecontrol, huggingface_hub, litellm and safety take FileLocks.
-        # Both still need a second local user (AV:L) able to rename or
-        # hard-link files in the lock's directory, and those locks sit in the
-        # running user's own caches. Accepted until the cap below lifts.
-        #
-        # The fix is filelock 4.2.1, which CANNOT be resolved here: litellm is
-        # a BASE dependency (not an extra) and its latest release (1.106.6 on
-        # 2026-10-29) still declares filelock<4.0 (checked against the PyPI JSON
-        # API), so pinning the fixed version makes the install unsatisfiable.
-        # virtualenv is not a blocker -- its latest allows filelock<5.
-        #
-        # Upstream tracker: BerriAI/litellm#48394 (asks litellm to lift the
-        # cap; virtualenv already moved to filelock<5).
-        #
-        # REMOVE all seven as soon as litellm lifts the cap and
+        # Still failing the gate: any other package, any filelock advisory with
+        # a fix inside 3.x or none listed, and a pip-audit run that errors.
+        # REMOVE the filelock allowance as soon as litellm lifts the cap and
         # `filelock>=4.2.1` resolves. Re-check with:
         #   curl -s https://pypi.org/pypi/litellm/json \
         #     | python -c "import json,sys;print([r for r in json.load(sys.stdin)['info']['requires_dist'] if 'filelock' in r])"
-        # Scoped by ID deliberately: any OTHER filelock CVE still fails the gate.
         run: |
-          pip-audit --desc \
-            --ignore-vuln CVE-2026-112940 \
-            --ignore-vuln CVE-2026-112913 \
-            --ignore-vuln CVE-2026-112907 \
-            --ignore-vuln CVE-2026-112936 \
-            --ignore-vuln CVE-2026-112938 \
-            --ignore-vuln CVE-2026-112909 \
-            --ignore-vuln CVE-2026-112910
+          set +e
+          pip-audit --desc --format json --output pip-audit.json
+          audit_rc=$?
+          set -e
+          python - "$audit_rc" <<'PY'
+          import json
+          import sys
+
+          audit_rc = int(sys.argv[1])
+          try:
+              with open("pip-audit.json", encoding="utf-8") as handle:
+                  report = json.load(handle)
+          except (OSError, ValueError) as exc:
+              sys.exit(f"pip-audit gave no report (exit {audit_rc}): {exc}")
+          if audit_rc not in (0, 1):
+              sys.exit(f"pip-audit failed (exit {audit_rc})")
+
+
+          def major(version):
+              head = version.split(".", 1)[0]
+              return int(head) if head.isdigit() else -1
+
+
+          failing, allowed = [], []
+          for dep in report.get("dependencies", []):
+              for vuln in dep.get("vulns", []):
+                  row = (dep["name"], dep["version"], vuln["id"], vuln.get("fix_versions") or [])
+                  fixes = row[3]
+                  only_in_4x = bool(fixes) and min(major(v) for v in fixes) >= 4
+                  if dep["name"].lower() == "filelock" and major(dep["version"]) < 4 and only_in_4x:
+                      allowed.append(row)
+                  else:
+                      failing.append(row)
+          for name, version, vid, fixes in allowed:
+              print(
+                  f"::warning::{name} {version} {vid}: fixed only in {', '.join(fixes)}, "
+                  "which litellm's filelock<4.0 cap blocks (BerriAI/litellm#48394)"
+              )
+          for name, version, vid, fixes in failing:
+              print(f"::error::{name} {version} {vid}: fix {', '.join(fixes) or 'none listed'}")
+          print(f"{len(failing)} failing, {len(allowed)} filelock advisories allowed until the cap lifts")
+          sys.exit(1 if failing else 0)
+          PY
       - name: Install SAST scanners
         run: pip install bandit "semgrep==1.163.0"
       - name: Bandit security scan
