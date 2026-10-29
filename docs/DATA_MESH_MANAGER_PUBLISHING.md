@@ -305,7 +305,7 @@ list before any generation happens. This means:
 - An overlay entry patches the base entry with the same `exposeId`; an
   `exposeId` the base does not have adds an entry (logged as
   `overlay_entry_added`), and an entry with no `exposeId` is refused when the
-  base has more than one expose. A contract that declares a `fluidVersion`
+  base has more than one expose, or when another overlay entry names one. A contract that declares a `fluidVersion`
   below 0.7.6 (the overlay's own, when it declares one, wins) merges by
   position instead: the entry at index `0` patches the base entry at index
   `0`, and when the base has more than one expose an entry whose `exposeId`

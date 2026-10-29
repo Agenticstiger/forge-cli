@@ -12,16 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **FLUID schema 0.7.6 is stable, and 0.7.7 opens as the next preview** (#752). 0.7.6 is the
   default now: `FluidSchemaManager.latest_bundled_version()`, the version forge-cli writes into
   the contracts it builds and assumes where none is declared. What graduates is everything 0.7.6
-  added while in preview, as the 0.21.0 to 0.25.0 entries list it: among it declarative packaging
+  added while in preview, as the 0.13.0 to 0.25.0 entries list it: among it declarative packaging
   modes, `engine: flink`, `trigger.type: continuous`, identity-keyed overlay merges, column
   masking and row filters, KMS keys, federation pins, and the exporter fields (`metadata.team`,
   the object root `description`, `exposes[].contract.id`, a column's `quality`). 0.7.7 is
   identical to 0.7.6 at open; additive preview fields land there. A contract validates against
   the version it declares, as before, so nothing changes for one that declares 0.7.5.
-- **An ODCS export records the contract's `fluidVersion` always.** It was left out when it equalled
-  the exporting CLI's default, and an import takes a missing version from its own default: a
-  0.7.6 contract exported by a CLI defaulting to 0.7.6 came back from one defaulting to 0.7.5 as
-  0.7.5, and its 0.7.6 fields failed.
+- **An ODCS export records the contract's `fluidVersion` always.** It was recorded only where it
+  differed from the exporting CLI's default, and an import takes a missing version from its own
+  default. With 0.7.6 the default, a 0.7.6 contract's export would have come back from 0.25.0 or
+  earlier, which default to 0.7.5, as 0.7.5, and its 0.7.6 fields would have failed. One
+  exception keeps a third-party document's ODCS → FLUID → ODCS exact: a contract imported from a
+  document that recorded no version exports without one while it still declares the version the
+  import gave it and carries only what ODCS has fields for.
 
 ### Fixed
 
@@ -57,13 +60,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - What forge-cli builds now declares 0.7.6 (the importers, `fluid product-new`, `fluid init
   --discover`, the `fluid forge --scaffold` templates, the copilot). A 0.7.6 contract merges
-  overlay `builds`, `exposes` and `consumes` by id, so an overlay entry that names no id fails to
-  load where the base list has more than one entry. The file templates `fluid init` copies keep
-  declaring the version written in them.
+  overlay `builds`, `exposes` and `consumes` by id where every base entry names a unique one, so
+  an overlay entry that names no id fails to load where the base list has more than one entry, or
+  where another overlay entry names an id. The file templates `fluid init` copies keep declaring
+  the version written in them.
 - `fluid odcs import` and `fluid odps import` of a document that records no version declare
-  0.7.6, so a team roster, a port's contract id, a column's `quality` and an object
-  `description` land in place instead of in the extensions bucket: re-importing such a document
-  writes a different file.
+  0.7.6, so more of it lands in place instead of in the extensions bucket: the team roster, a
+  column's `quality`, and, for a document with one schema object, a contract id that is not a
+  FLUID identifier (one that is becomes the root `id`, as before). `fluid odps import` also
+  places an object's `description`. Re-importing such a document writes a different file.
 - A 0.7.5 contract's ODCS export now carries `fluidVersion: 0.7.5` in `fluidExtras`.
 - To try what lands next, declare `fluidVersion: "0.7.7"`.
 
