@@ -97,20 +97,27 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     "apply_platform_unsupported": (
         [
-            "If a job outside forge-cli (a Flink job, say) writes that expose or is that "
-            "build, declare the build with engine: flink (or properties.language: flink_sql) "
-            "and outputs naming what it writes: forge-cli then leaves both to the job",
-            "--provider <name> (or FLUID_PROVIDER) applies the whole contract with the "
-            "provider you name; the local provider writes a binding it does not serve as a "
-            "placeholder file",
+            (
+                "If a job outside forge-cli (a Flink job, say) writes that expose or is that "
+                "build, declare the build with engine: flink (or properties.language: "
+                "flink_sql) and outputs naming what it writes: forge-cli then leaves both to "
+                "the job"
+            ),
+            (
+                "--provider <name> (or FLUID_PROVIDER) applies the whole contract with the "
+                "provider you name; the local provider writes a binding it does not serve as "
+                "a placeholder file"
+            ),
         ],
         "providers",
     ),
     "apply_plan_runs_outside_forge": (
         [
-            "In the default mode, apply the contract file instead (fluid apply "
-            "contract.fluid.yaml): the local planner plans it, and leaves what a job "
-            "outside forge-cli writes to that job",
+            (
+                "In the default mode, apply the contract file instead (fluid apply "
+                "contract.fluid.yaml): the local planner plans it, and leaves what a job "
+                "outside forge-cli writes to that job"
+            ),
         ],
         None,
     ),
