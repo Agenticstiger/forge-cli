@@ -23,7 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.cli.console import error as console_error
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
@@ -299,7 +299,8 @@ def run(args, logger: logging.Logger) -> int:
         try:
             contract_path = validate_cli_path(args.contract, mode="read", file_type="contract")
         except FluidCLIError as exc:
-            if exc.event == "file_not_found":
+            # ``validate_cli_path`` names a missing contract either way, with no path.
+            if exc.event in ("file_not_found", "contract_file_not_found"):
                 raise CLIError(1, "contract_file_not_found", {"path": str(args.contract)})
             raise
         args.contract = str(contract_path)
@@ -697,7 +698,7 @@ def _fragment_schema_version(flag: Optional[str], fragment: Path, contract: Opti
             version = _contract_version(contract)
         except Exception as exc:  # noqa: BLE001 - said below, with the file it is about
             problem = " ".join(str(exc).split()).rstrip(".")
-            why = f"{contract}, the nearest contract above it, cannot be read: {problem}"
+            why = f"{contract}, the nearest contract above it, does not load: {problem}"
         else:
             if version is not None:
                 return version
@@ -1553,8 +1554,11 @@ def _cprint_literal(line: str) -> None:
     inside an identifier or a copy-pasteable command. ``highlight=False``, as
     in :func:`_cprint_json`: Rich's highlighter takes time quadratic in a run
     of ``<`` (4 s for 10,000), and a bundle's MANIFEST can carry one.
+    Printed through :func:`cprint_literal`, which redacts it and spells each
+    control character: a terminal escape in an argument or a contract value
+    (``\\x1b]0;...``) shows as text and never reaches the terminal.
     """
-    cprint(line, markup=False, soft_wrap=True, highlight=False)
+    cprint_literal(line, soft_wrap=True, highlight=False)
 
 
 def _output_json_results(result: ValidationResult, args) -> int:
