@@ -23,7 +23,8 @@ extension path (no external infra) to pin:
 * The introspection helper round-trips: a real SQLite file with two
   tables produces an :class:`IntrospectedDatabase` with the right
   tables + columns + types.
-* The CLI dispatcher writes a v0.7.3 contract under ``--output`` with
+* The CLI dispatcher writes a contract, declaring the newest stable
+  schema, under ``--output`` with
   one ``exposes[]`` entry per table.
 * The JDBC type → logical type mapping is reasonable.
 
@@ -148,7 +149,9 @@ class TestRunFromJdbcSource:
         import yaml as _yaml
 
         contract = _yaml.safe_load(out.read_text())
-        assert contract["fluidVersion"] == "0.7.3"
+        from fluid_build.schema_manager import FluidSchemaManager
+
+        assert contract["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
         # Top-level kind is now required by v0.7.3.
         assert contract["kind"] == "DataProduct"
         assert contract["id"] == "forged_sqlite"
@@ -963,7 +966,7 @@ class TestLivePostgresRoundTrip:
         import yaml as _yaml
 
         contract = _yaml.safe_load(out.read_text())
-        # Validates against v0.7.3.
+        # Validates against the version it declares.
         from fluid_build.schema_manager import validate_contract_file
 
         vr = validate_contract_file(str(out), offline_only=True, logger=logging.getLogger("test"))
