@@ -43,9 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The command now fails before it writes, naming the keys and the JSON pointer of their mapping;
   `--format yaml` keeps both.
 - **A `$ref` to a file whose suffix fluid does not know logs a warning**
-  (`ref_target_suffix_unknown`), once per suffix in a process, naming the first such file, how it
-  was read and which suffixes are known. The file is read as before. `.json`, `.yaml`, `.yml` and
-  `.avsc` never warn.
+  (`ref_target_suffix_unknown`), once per suffix, naming the first such file, how it was read and
+  which suffixes are known. The file is read as before. `.json`, `.yaml`, `.yml` and `.avsc` never
+  warn.
 - **`fluid bundle` without `--out` (or with `--out -`) does what its help says on every
   contract.** With a `fragments/` directory beside the contract, `yaml` and `json` went to a file,
   `contract.bundled.fluid.yaml`, instead of stdout, so `fluid bundle contract.fluid.yaml | ...`
@@ -58,9 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Deprecated
 
 - **A file ref's pointer without a leading `/`** (`./x.yaml#key`) resolves as before but logs a
-  warning (`ref_pointer_without_slash`) naming the fix, `./x.yaml#/key`, once per ref in a process
-  however many places write it; a later minor release will refuse it, as RFC 6901 has a JSON
-  pointer empty or starting with `/`. The same-document `#key` stays refused.
+  warning (`ref_pointer_without_slash`) naming the fix, `./x.yaml#/key`, once per ref however many
+  places write it; a later minor release will refuse it, as RFC 6901 has a JSON pointer empty or
+  starting with `/`. The same-document `#key` stays refused.
 
 ### Security
 

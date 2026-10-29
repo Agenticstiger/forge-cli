@@ -514,7 +514,7 @@ def test_a16_an_unknown_suffix_is_still_parsed_and_warns_once_per_suffix_sg16(
     assert f"$ref target {target.resolve()} has " in message
     assert f"so it was read as {how}." in message
     assert ".json, .yaml, .yml" in message and ".hql" in message and ".sql" in message
-    assert "Logged once per suffix in this process." in message
+    assert "Logged once per suffix." in message
     assert warning.file == str(target.resolve())  # type: ignore[attr-defined]
 
 

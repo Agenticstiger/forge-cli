@@ -454,6 +454,9 @@ def test_c12_one_ref_written_in_many_places_is_one_bounded_warning(
     assert f"$ref './t.yaml#a' at JSON pointer '/{'k' * 199}... (49,803 more characters)' in " in (
         warnings[0]
     )
+    # Once per ref while the registry holds it, which it empties at its cap: never "in this
+    # process".
+    assert warnings[0].endswith("Logged once per ref, however many places write it.")
     assert len(contract_refs._NOTED_REF_WARNINGS) == 1
 
 

@@ -188,9 +188,10 @@ _MAX_NOTED_REF_WARNINGS = 1024
 
 
 def _first_time(event: str, value: str) -> bool:
-    """Record ``value`` for ``event`` in :data:`_NOTED_REF_WARNINGS`; ``True`` the first
-    time this process meets it. Checked before the warning is worded, so a value met
-    again costs a digest, never a message."""
+    """Record ``value`` for ``event`` in :data:`_NOTED_REF_WARNINGS`; ``True`` when the
+    registry does not hold it yet: the first time, and once more after the registry is
+    emptied. Checked before the warning is worded, so a value met again costs a digest,
+    never a message."""
     key = (event, hashlib.sha256(value.encode("utf-8", "surrogatepass")).digest())
     with _NOTED_REF_WARNINGS_LOCK:
         if key in _NOTED_REF_WARNINGS:
@@ -920,8 +921,8 @@ def _note_pointer_without_slash(
     LOG.warning(
         "%s: $ref '%s' %s has a JSON pointer without a leading '/', which is deprecated: a "
         "later minor release will refuse it. Write '%s'. A JSON pointer is '' or starts "
-        "with '/' (RFC 6901); until then this one is read as '/%s'. Logged once per ref in "
-        "this process.",
+        "with '/' (RFC 6901); until then this one is read as '/%s'. Logged once per ref, "
+        "however many places write it.",
         event,
         excerpt(ref),
         site,
@@ -1023,7 +1024,7 @@ def _note_unknown_suffix(path: Path, suffix: str, how: str) -> None:
     LOG.warning(
         "%s: $ref target %s has %s, which a $ref does not know, so it was read as %s. A $ref "
         "parses %s as JSON or YAML and reads %s as text; rename the file to the suffix that "
-        "says which it is. Logged once per suffix in this process.",
+        "says which it is. Logged once per suffix.",
         event,
         spelled(str(path)),
         f"the suffix '{excerpt(suffix)}'" if suffix else "no suffix",
