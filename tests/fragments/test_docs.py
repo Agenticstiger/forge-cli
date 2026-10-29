@@ -1091,7 +1091,7 @@ def test_j07_a_file_already_at_the_temp_name_is_left_alone(
     """O_EXCL refuses a name that is taken, and what is there is not this run's to remove."""
     from fluid_build.cli import docs_build
 
-    monkeypatch.setattr(docs_build.os, "urandom", lambda n: bytes(n))
+    monkeypatch.setattr(docs_build.os, "urandom", bytes)
     taken = tmp_path / f".index.html.{bytes(8).hex()}.tmp"
     taken.write_bytes(b"someone else's")
     with pytest.raises(FileExistsError):
