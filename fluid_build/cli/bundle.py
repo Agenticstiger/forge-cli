@@ -35,7 +35,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 try:
     import yaml  # type: ignore
@@ -189,6 +189,68 @@ def _serialize(contract: Dict[str, Any], fmt: str) -> str:
         allow_unicode=True,
         sort_keys=False,
         width=120,
+    )
+
+
+def _json_name(key: Any) -> Optional[str]:
+    """The name ``json.dumps`` writes for the mapping key ``key``: a string as it is, and a
+    number, a boolean or ``None`` as JSON writes that value (``200``, ``1.5``, ``true``,
+    ``null``). ``None`` for any other key, which ``json.dumps`` refuses on its own."""
+    if isinstance(key, str):
+        return key
+    if key is None or isinstance(key, (bool, int, float)):
+        return json.dumps(key)
+    return None
+
+
+def _json_name_clash(document: Any) -> Optional[Tuple[str, List[Any], str]]:
+    """The first mapping of ``document`` whose keys JSON writes as one name: its JSON
+    pointer, those keys, and the name. ``None`` when every mapping can be written.
+
+    YAML keeps ``200`` and ``"200"`` apart (``true`` and ``"true"``, ``null`` and
+    ``"null"``), and so does the composed contract; ``json.dumps`` writes each pair as one
+    name, twice. RFC 8259 leaves a repeated name to the reader, and every reader of a
+    contract refuses one, this bundle's own output included. Iterative, each container
+    visited once.
+    """
+    from ..util.ref_confinement import format_pointer
+
+    seen: Set[int] = set()
+    stack: List[Tuple[Any, Tuple[Union[str, int], ...]]] = [(document, ())]
+    while stack:
+        node, at = stack.pop()
+        if not isinstance(node, (dict, list)) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, list):
+            stack.extend((item, (*at, i)) for i, item in reversed(list(enumerate(node))))
+            continue
+        names: Dict[str, List[Any]] = {}
+        for key in node:
+            name = _json_name(key)
+            if name is not None:
+                names.setdefault(name, []).append(key)
+        for name, keys in names.items():
+            if len(keys) > 1:
+                return format_pointer(at), keys, name
+        stack.extend(
+            (value, (*at, _json_name(key) or str(key)))
+            for key, value in reversed(list(node.items()))
+        )
+    return None
+
+
+def _json_name_clash_message(pointer: str, keys: List[Any], name: str) -> str:
+    """Why ``--format json`` refuses a contract (:func:`_json_name_clash`), for stderr."""
+    from ..util.excerpt import excerpt
+
+    written = " and ".join(excerpt(repr(k) if isinstance(k, str) else json.dumps(k)) for k in keys)
+    where = f"the mapping at JSON pointer '{excerpt(pointer)}'" if pointer else "the root mapping"
+    return (
+        f"❌ --format json cannot write this contract: {where} has the keys {written}, "
+        f"which JSON writes as one name, {excerpt(json.dumps(name))}; a reader keeps only "
+        f"one of them, and fluid refuses the file. Use --format yaml, which keeps them "
+        f"apart, or rename one of the keys.\n"
     )
 
 
@@ -551,7 +613,15 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # which the composition read from ``$$ref``, is written ``$$ref`` again.
     from ..contract_refs import escape_ref_keys
 
-    output = _serialize(escape_ref_keys(compiled), fmt)
+    document = escape_ref_keys(compiled)
+    if fmt == "json":
+        # JSON cannot keep apart keys YAML can: refuse here, before a file that
+        # every reader of contracts would refuse (or read one key of) is written.
+        clash = _json_name_clash(document)
+        if clash is not None:
+            sys.stderr.write(_json_name_clash_message(*clash))
+            return 2
+    output = _serialize(document, fmt)
 
     if out == "-":
         sys.stdout.write(output)

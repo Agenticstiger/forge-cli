@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A key a `<<` merge brings in and the mapping writes itself is not a duplicate, and `<<` may be
   written more than once. In `fluid.workspace.yaml` a duplicate key makes its `ref_root` ignored
   (with a warning naming the key) and its `expected-environments` an error.
+- **`fluid bundle --format json` refuses keys JSON cannot keep apart.** YAML keeps `200` and
+  `"200"` (`true` and `"true"`, `null` and `"null"`) as two keys; JSON writes both as the one name
+  `"200"`, so the output held it twice: a JSON reader kept one value, and fluid refused the file.
+  The command now fails before it writes, naming the keys and the JSON pointer of their mapping;
+  `--format yaml` keeps both.
 - **A `$ref` to a file whose suffix fluid does not know logs a warning**
   (`ref_target_suffix_unknown`), once per suffix in a process, naming the first such file, how it
   was read and which suffixes are known. The file is read as before. `.json`, `.yaml`, `.yml` and

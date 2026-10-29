@@ -733,6 +733,50 @@ def test_n13_a_string_sibling_does_not_merge_with_an_int_key_sg03(tmp_path: Path
     assert got == {200: "a", "other": 1, "200": "x"}
 
 
+@pytest.mark.parametrize(
+    ("keys", "shown", "name"),
+    [
+        ("200: a\n    '200': b", "200 and '200'", '"200"'),
+        ("true: a\n    'true': b", "true and 'true'", '"true"'),
+        ("'null': a\n    null: b", "'null' and null", '"null"'),
+    ],
+    ids=["int", "bool", "null"],
+)
+def test_n13_bundle_json_refuses_two_keys_json_writes_as_one_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], keys: str, shown: str, name: str
+) -> None:
+    """YAML keeps ``200`` and ``"200"`` apart, and so does the composition; JSON writes both
+    as the name ``"200"``. ``fluid bundle --format json`` wrote that name twice, so every
+    reader of contracts refused the bundle's own output (0.25.0 read one key and dropped
+    the other). It is refused at the writer, naming the keys and where they are, and
+    nothing is written; ``--format yaml`` keeps both keys."""
+    from fluid_build.cli import main
+
+    base = yaml.safe_dump(_min_doc(), sort_keys=False)
+    contract = _write(
+        tmp_path / "contract.fluid.yaml", base + f"extensions:\n  status:\n    {keys}\n"
+    )
+    out = tmp_path / "b.json"
+    refused = (
+        f"the mapping at JSON pointer '/extensions/status' has the keys {shown}, which JSON "
+        f"writes as one name, {name}; a reader keeps only one of them"
+    )
+
+    code, output = _cli(capsys, "bundle", str(contract), "--format", "json", "--out", str(out))
+    assert code == 2, output
+    assert refused in _flat(output) and "Use --format yaml" in output
+    assert not out.exists()
+
+    capsys.readouterr()
+    assert main(["bundle", str(contract), "--format", "json"]) == 2
+    assert '"fluidVersion"' not in capsys.readouterr().out, "nothing written to stdout"
+
+    kept = _bundle(capsys, contract, tmp_path / "b.yaml")["extensions"]["status"]
+    assert kept == loader.load_contract(contract)["extensions"]["status"]
+    assert len(kept) == 2
+    assert loader.load_contract(tmp_path / "b.yaml")["extensions"]["status"] == kept
+
+
 def test_n13_a_plain_equals_key_loads_as_before_and_the_contract_validates(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
