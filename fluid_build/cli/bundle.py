@@ -429,7 +429,16 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 default_name = f"{_slug(str(contract_id_raw))}.fluid.bundle.tgz"
             else:
                 default_name = "contract.fluid.bundle.tgz"
-            out = str(contract_dir / default_name)
+            # The write check an explicit --out gets: a symlink planted at the default
+            # name cannot point the write at a forbidden path.
+            out = str(
+                validate_cli_path(
+                    str(contract_dir / default_name),
+                    mode="write",
+                    must_exist=False,
+                    file_type="output",
+                )
+            )
             sys.stderr.write(
                 f"ℹ️  --out not specified; defaulting to {out}\n"
                 f"   (derived from contract.id; override with --out <path>)\n"

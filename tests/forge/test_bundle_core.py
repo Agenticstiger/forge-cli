@@ -555,10 +555,32 @@ class TestCliBundleDefaultFilename:
         args = argparse.Namespace(contract=str(contract_path), out="-", env=None, format=fmt)
 
         assert run(args, logging.getLogger("test")) == 0
-        document = yaml.safe_load(capsys.readouterr().out)  # JSON is YAML too
+        out = capsys.readouterr().out
+        document = json.loads(out) if fmt == "json" else yaml.safe_load(out)
         assert document["id"] == "customer-360"
         assert document["exposes"][0]["exposeId"] == "orders"
         assert not (tmp_path / "contract.bundled.fluid.yaml").exists()
+
+    def test_the_default_tgz_path_gets_the_write_check_an_explicit_out_gets(self, tmp_path):
+        """A symlink planted at ``<id>.fluid.bundle.tgz`` cannot point the write at a
+        forbidden path: the default goes through the same check as ``--out``."""
+        import argparse
+        import logging
+
+        from fluid_build.cli.bundle import run
+        from fluid_build.cli.core import FluidCLIError
+
+        contract_path = self._write_contract(
+            tmp_path, "fluidVersion: '0.7.2'\nkind: DataProduct\nid: customer-360\n"
+        )
+        (tmp_path / "customer-360.fluid.bundle.tgz").symlink_to("/etc/fluid-bundle-probe.tgz")
+        args = argparse.Namespace(contract=str(contract_path), out="-", env=None, format="tgz")
+
+        with pytest.raises(FluidCLIError) as caught:
+            run(args, logging.getLogger("test"))
+
+        assert "forbidden" in caught.value.event
+        assert not Path("/etc/fluid-bundle-probe.tgz").exists()
 
     def test_explicit_out_overrides_default(self, tmp_path):
         contract_path = self._write_contract(
