@@ -3313,6 +3313,66 @@ def test_i34_an_interrupt_during_the_take_back_puts_the_root_back_first_and_goes
     )
 
 
+def test_i34_an_interrupt_whose_take_back_leaves_something_says_what(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """C1: when a step of the take-back fails during an interrupt, the interrupt
+    still goes on, and what is left is printed before it: there is no message to
+    put it in."""
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    real_compose = loader.compose_contract
+
+    def check(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if (pair.split / "fragments").exists():
+            raise KeyboardInterrupt
+        return real_compose(path, *args, **kwargs)
+
+    def locked(self: Path, *args: Any, **kwargs: Any) -> None:
+        raise PermissionError(13, "Permission denied", str(self))
+
+    capsys.readouterr()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(loader, "compose_contract", check)
+        patch.setattr(Path, "unlink", locked)
+        with pytest.raises(KeyboardInterrupt):
+            _run_split(pair.split_contract, "builds,exposes")
+
+    err = capsys.readouterr().err
+    assert "Split interrupted; could not take back " in err
+    stuck = pair.split / "fragments" / "builds" / "ingest-orders.yaml"
+    assert f"{stuck}: Permission denied" in err
+    assert pair.split_contract.read_text("utf-8") == SPLIT_ALL  # the root went back all the same
+
+
+def test_i34_a_file_someone_else_makes_just_before_split_does_survives_the_take_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-05: a fragment is counted as written once split has made its file, not
+    before. A file another process makes at that name just before (so split's
+    exclusive create fails) is not split's to take back, and stays."""
+    from fluid_build.cli import split as split_command
+
+    text = "id: x\nsovereignty:\n  jurisdiction: EU\nbuilds:\n  - id: a\n    pattern: p\n"
+    pair = solo(tmp_path, text)
+    theirs = pair.split / "fragments" / "builds" / "a.yaml"
+    real_open = open
+
+    def made_just_before(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        if mode == "xb" and Path(file) == theirs:
+            theirs.write_text("someone else's file\n", encoding="utf-8")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(split_command, "open", made_just_before, raising=False)
+    capsys.readouterr()
+
+    assert split(pair.split_contract, "--parts", "sovereignty,builds") == 1
+
+    assert "File exists" in capsys.readouterr().err
+    assert theirs.read_text("utf-8") == "someone else's file\n"
+    assert pair.split_contract.read_text("utf-8") == text
+    assert not (pair.split / "fragments" / "sovereignty.yaml").exists()
+
+
 def test_i34_a_write_that_fails_takes_back_the_file_it_was_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
