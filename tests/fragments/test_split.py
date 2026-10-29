@@ -2403,49 +2403,87 @@ def test_i29_the_same_directory_given_as_out_is_an_in_place_split(tmp_path: Path
     assert sorted(set(files_of(pair.split)) - set(files_of(pair.flat))) == DEFAULT_LAYOUT
 
 
-def test_i29_an_existing_root_in_out_is_replaced_without_a_word_today(
+def test_i29_an_existing_root_in_out_is_never_written_over(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """SG-32 characterisation (finding SP-11): fragments never overwrite a file,
-    but the root written to ``--out`` replaces a different file of that name."""
+    """Finding SP-11: fragments never overwrote a file, but the root written to
+    ``--out`` replaced another file of its name without a word. Now the split
+    is refused, the dry run included, with the file named and what to do."""
     pair = make_pair(tmp_path, SPLIT_ALL_FILES)
     out = tmp_path / "elsewhere"
     other = b"# somebody else's contract\nid: precious\n"
     write(out / NAME, other)
+    before = digest(tmp_path)
     capsys.readouterr()
 
-    assert split(pair.split_contract, "--dry-run", "--out", out) == 0
-    assert NAME not in capsys.readouterr().err  # the preview does not mention it either
-    assert split(pair.split_contract, "--out", out) == 0
+    for dry_run in (["--dry-run"], []):
+        assert split(pair.split_contract, *dry_run, "--out", out) == 1
 
-    assert (out / NAME).read_bytes() != other
-    assert b"precious" not in (out / NAME).read_bytes()
+        err = capsys.readouterr().err
+        assert f"Split not written: {out / NAME} already exists" in err
+        assert "Move it away, or choose another --out" in err
+        assert "Would create" not in err
+        assert digest(tmp_path) == before
+    assert (out / NAME).read_bytes() == other
 
 
-def test_i29_splitting_twice_into_the_same_out_adds_numbered_copies(tmp_path: Path) -> None:
-    """SG-32 characterisation: the source stays flat, so a second run into the
-    same ``--out`` meets its own first-run files and writes ``-2`` copies; the
-    root now refers to those and the first run's fragments are left over."""
+def test_i29_a_second_split_into_the_same_out_is_refused_and_leaves_the_first_alone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-11: the source stays flat, so a second run into the same ``--out`` met
+    its own first-run files: it wrote ``-2`` copies and left the first run's
+    fragments unreferenced. It is refused now (a split there is not reused:
+    the source may have changed since), and the message says how to split the
+    contract already there; that works."""
     pair = make_pair(tmp_path, SPLIT_ALL_FILES)
     out = tmp_path / "elsewhere"
-
     assert split(pair.split_contract, "--out", out) == 0
-    first = files_of(out)
-    assert split(pair.split_contract, "--out", out) == 0
+    first = digest(out)
+    capsys.readouterr()
 
-    second = files_of(out)
-    assert all(second[rel] == first[rel] for rel in first if rel != NAME)  # nothing rewritten
-    assert sorted(set(second) - set(first)) == [
-        "fragments/access-policy-2.yaml",
-        "fragments/builds/ingest-orders-2.yaml",
-        "fragments/builds/rollup-2.yaml",
-        "fragments/exposes/order_totals-2.yaml",
-        "fragments/exposes/orders-2.yaml",
-        "fragments/sovereignty-2.yaml",
-    ]
-    assert "ingest-orders-2.yaml" in text_of(second, NAME)
-    assert "ingest-orders.yaml" not in text_of(second, NAME)
+    assert split(pair.split_contract, "--out", out, "--parts", "extensions") == 1
+
+    err = capsys.readouterr().err
+    assert f"{out / NAME} already holds this contract" in err
+    assert f"run: fluid split {out / NAME}" in err
+    assert digest(out) == first  # no -2 copy, nothing rewritten
+
+    assert split(out / NAME, "--parts", "extensions") == 0  # the way the message gives
     assert compose_contract(out / NAME).document == compose_contract(pair.flat_contract).document
+    assert sorted(set(files_of(out)) - {NAME}) == sorted(
+        [*DEFAULT_LAYOUT, "fragments/extensions/acme.yaml"]
+    )
+
+
+def test_i29_a_copy_of_the_contract_in_out_is_split_there(tmp_path: Path) -> None:
+    """SP-11: a byte-for-byte copy of the contract is no other file; writing the
+    split root over it loses nothing."""
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    out = tmp_path / "elsewhere"
+    write(out / NAME, SPLIT_ALL)
+
+    assert split(pair.split_contract, "--out", out) == 0
+
+    assert sorted(files_of(out)) == sorted([NAME, *DEFAULT_LAYOUT])
+    assert compose_contract(out / NAME).document == compose_contract(pair.flat_contract).document
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs hard links")
+def test_i29_a_hard_link_to_the_contract_in_out_is_not_written_through(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-11: the same file under another directory is not an in-place split:
+    writing the root there would change the contract in its own directory too."""
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    out = tmp_path / "elsewhere"
+    out.mkdir()
+    os.link(pair.split_contract, out / NAME)
+    before = digest(tmp_path)
+
+    assert split(pair.split_contract, "--out", out) == 1
+
+    assert "already holds this contract" in capsys.readouterr().err
+    assert digest(tmp_path) == before
 
 
 # ── I-30: an alias bomb ─────────────────────────────────────────────────

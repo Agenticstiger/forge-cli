@@ -23,7 +23,8 @@ description texts).
 A YAML root keeps every comment and every other byte: only the moved parts
 are cut out of its text. The result is checked before the command ends: the
 split contract composes to the same document as the original, or nothing is
-left changed.
+left changed, no file and no directory. No file is written over but the
+contract split in place: not by a fragment, and not by the root in ``--out``.
 
 Usage:
     fluid split contract.fluid.yaml
@@ -156,7 +157,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     before, problem = _composed(contract_path)
     root_out = out_dir / contract_path.name
     # What the real run would refuse before writing, the dry run refuses too.
-    problem = problem or _unsafe_target(out_dir, root_out, [site.target for site in sites])
+    problem = (
+        problem
+        or _unsafe_target(out_dir, root_out, [site.target for site in sites])
+        or _root_in_the_way(contract_path, root_out, before)
+    )
     if problem:
         sys.stderr.write(f"❌ Split not written: {problem}\n")
         return 1
@@ -222,6 +227,45 @@ def _unsafe_target(out_dir: Path, root_out: Path, rel_paths: Iterable[str]) -> O
         if link is not None:
             return f"{link} is a symlink; split writes no file through one"
     return None
+
+
+def _root_in_the_way(contract_path: Path, root_out: Path, before: Dict[str, Any]) -> Optional[str]:
+    """Why the root cannot be written to ``root_out``, a file already there, if it
+    cannot. Split writes over no file but the contract it splits in place; a
+    byte-for-byte copy of it may be written over too, as nothing is lost. Any
+    other file is refused, a split of this contract written there before
+    included: a second split beside it would only add '-2' copies and leave
+    the first one's fragments unreferenced."""
+    from fluid_build.loader import compose_contract
+
+    if not root_out.exists():
+        return None
+    try:
+        if root_out.samefile(contract_path):
+            # The contract itself, unless it is another link to it elsewhere.
+            if root_out.parent.samefile(contract_path.parent):
+                return None
+        elif (
+            root_out.is_file()
+            and root_out.stat().st_size == contract_path.stat().st_size
+            and root_out.read_bytes() == contract_path.read_bytes()
+        ):
+            return None
+    except OSError:
+        pass  # what cannot be compared is another file
+    try:
+        same = compose_contract(root_out).document == before
+    except Exception:  # noqa: BLE001 - one that does not compose is another contract
+        same = False
+    if same:
+        return (
+            f"{root_out} already holds this contract (it composes to the same document); "
+            f"split writes over no file. To split that one, run: fluid split {root_out}"
+        )
+    return (
+        f"{root_out} already exists; split writes over no file but the contract it "
+        f"splits in place. Move it away, or choose another --out"
+    )
 
 
 def _symlink_on_the_way(out_dir: Path, rel_path: str) -> Optional[Path]:
