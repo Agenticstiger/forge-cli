@@ -1358,6 +1358,62 @@ def test_j07_an_out_through_a_symlink_and_dotdot_is_checked_where_it_would_be_ma
     assert read == []
 
 
+_LEFT_BY_A_KILLED_RUN = [
+    ".index.html.0123456789abcdef.tmp",
+    ".index.json.fedcba9876543210.tmp",
+    ".contract-keep-a.html.00000000000000aa.tmp",
+]
+_NOT_A_TEMP_OF_THIS_RUN = [
+    ".index.html.ABCDEF0123456789.tmp",  # not the hex the temp names have
+    ".index.html.0123456789abcde.tmp",  # 15 digits
+    ".contract-gone.html.0123456789abcdef.tmp",  # no file of this run has that name
+    "index.html.0123456789abcdef.tmp",  # not hidden
+    "notes.txt",
+]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="file owners and symlinks")
+def test_j07_a_run_removes_the_temp_files_a_killed_run_left_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """A run killed between writing its temp files and replacing the catalog (SIGKILL at
+    os.replace) left ``.<name>.<16 hex>.tmp`` files that no later run removed. The next run
+    removes those of its own file names, when they are regular files of this user."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+    for name in _LEFT_BY_A_KILLED_RUN + _NOT_A_TEMP_OF_THIS_RUN:
+        _write(out / name, "left behind\n")
+    victim = _write(tmp_path / "victim.txt", "not the catalog's\n")
+    (out / ".index.html.1111111111111111.tmp").symlink_to(victim)
+
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    assert sorted(p.name for p in out.iterdir()) == sorted(
+        [*_NOT_A_TEMP_OF_THIS_RUN, ".index.html.1111111111111111.tmp"]
+        + ["contract-keep-a.html", "index.html", "index.json"]
+    )
+    assert victim.read_text(encoding="utf-8") == "not the catalog's\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="file owners")
+def test_j07_a_temp_file_of_another_user_is_left_where_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+    for name in _LEFT_BY_A_KILLED_RUN:
+        _write(out / name, "left behind\n")
+    monkeypatch.setattr(docs_build, "os", _OsWith(getuid=lambda: os.getuid() + 1))
+
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    assert set(_LEFT_BY_A_KILLED_RUN) <= {p.name for p in out.iterdir()}
+
+
 def test_j07_a_first_run_that_fails_to_render_leaves_no_out_behind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

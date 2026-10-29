@@ -174,6 +174,7 @@ def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
     staged: list[tuple[str, str]] = []
     try:
         _make_dirs(out, made)
+        _remove_stale_temps(out, {name for name, _data in files})
         for name, data in files:
             target = os.path.join(out, name)
             staged.append((_stage(target, data), target))
@@ -206,6 +207,33 @@ def _make_dirs(path: str, made: list[str]) -> None:
             raise
     else:
         made.append(os.path.realpath(path))
+
+
+#: The name :func:`_stage` gives a temp file: ``.<target name>.<16 hex>.tmp``.
+_TEMP_NAME = re.compile(r"\.(.+)\.[0-9a-f]{16}\.tmp")
+
+
+def _remove_stale_temps(out: str, names: set[str]) -> None:
+    """Remove the temp files a killed run left in ``out`` for any of ``names``.
+
+    A run killed between writing its temp files and replacing the catalog with
+    them (SIGKILL, a power cut) leaves them, and no later run would. Only a
+    regular file of this user, named exactly as :func:`_stage` names a temp
+    file of one of ``names``, is removed: never a symlink, nor a file of
+    someone else's. Best effort: an ``out`` that cannot be listed is left.
+    """
+    try:
+        with os.scandir(out) as listing:
+            entries = list(listing)
+    except OSError:
+        return
+    for entry in entries:
+        temp = _TEMP_NAME.fullmatch(entry.name)
+        if temp is None or temp.group(1) not in names:
+            continue
+        with contextlib.suppress(OSError):  # gone already, or not ours to look at
+            if entry.is_file(follow_symlinks=False) and _mine(entry.stat(follow_symlinks=False)):
+                os.unlink(entry.path)
 
 
 def _mine(st: os.stat_result) -> bool:
