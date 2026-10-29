@@ -338,7 +338,8 @@ def _write_checked(
     to the same document (a part that could not be moved exactly), all of it
     is taken back: every file written, the root's old text, and every
     directory made for them, ``--out`` included, so the tree is as it was.
-    The reason is returned.
+    The reason is returned. An interrupt halfway (Ctrl-C, an exit) is taken
+    back too, and raised again.
     """
     from fluid_build.loader import compose_contract
 
@@ -378,8 +379,14 @@ def _write_checked(
             handle.write(root_data)
         if compose_contract(root_out).document != before:
             raise ValueError("the split contract does not compose to the original one")
-    except Exception as exc:  # noqa: BLE001 - every failure is taken back
+    except BaseException as exc:  # noqa: BLE001 - every failure is taken back
         left = _take_back(written, root_out if root_opened else None, original_root, made)
+        if not isinstance(exc, Exception):
+            # Ctrl-C or an exit, halfway: the unchecked split is taken back all the
+            # same, and the interrupt goes on.
+            if left:
+                sys.stderr.write(f"❌ Split interrupted; could not take back {'; '.join(left)}\n")
+            raise
         if left:
             return f"{exc}; and split could not take back {'; '.join(left)}"
         return f"{exc}; nothing was changed"

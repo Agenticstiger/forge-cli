@@ -3031,6 +3031,42 @@ def test_i34_a_take_back_that_fails_is_reported_and_never_raises(
     assert not files_of(pair.split / "fragments")
 
 
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_i34_an_interrupt_halfway_takes_the_split_back_and_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupt: type
+) -> None:
+    """C1: the take-back ran for an ``Exception`` only, so a Ctrl-C (or an exit)
+    while the split was written or checked left it unchecked: fragments written,
+    the root rewritten. It is taken back now, and the interrupt goes on; the CLI
+    then reports it as it reports any interrupt."""
+    import argparse
+    import logging
+
+    from fluid_build.cli import split as split_command
+
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    before = digest(tmp_path)
+    real = loader.compose_contract
+
+    def interrupted(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if (pair.split / "fragments").exists():  # the check of the split just written
+            raise interrupt()
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(loader, "compose_contract", interrupted)
+    args = argparse.Namespace(
+        contract=str(pair.split_contract), out=None, parts="builds,exposes", dry_run=False
+    )
+
+    with pytest.raises(interrupt):
+        split_command.run(args, logging.getLogger("test"))
+
+    assert digest(tmp_path) == before
+    if interrupt is KeyboardInterrupt:
+        assert split(pair.split_contract) == 1  # 'Operation cancelled by user'
+        assert digest(tmp_path) == before
+
+
 @pytest.mark.parametrize("failure", ["refs-it-cannot-rebase", "out-elsewhere", "lone-surrogate"])
 def test_i34_a_refused_split_leaves_the_tree_exactly_as_it_was(
     tmp_path: Path, failure: str, capsys: pytest.CaptureFixture[str]
