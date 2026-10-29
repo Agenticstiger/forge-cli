@@ -18,6 +18,8 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from fluid_build.cli.validate import (
     _determine_target_version,
     _find_previous_compatible_version,
@@ -192,3 +194,65 @@ def test_json_output_strict_exit_code_still_reflects_warnings(capsys):
 
     assert _output_json_results(result, _args(format="json", strict=True)) == 1
     assert _json.loads(capsys.readouterr().out)["warnings"] == ["short warning"]
+
+
+@pytest.mark.parametrize(
+    "flag, event",
+    [
+        ("--schema-version", "invalid_schema_version"),
+        ("--min-version", "invalid_min_version"),
+        ("--max-version", "invalid_max_version"),
+    ],
+)
+def test_a_version_flag_that_is_not_one_is_the_event_it_names(tmp_path, capsys, flag, event):
+    """``SchemaVersion.parse`` and ``VersionConstraint.parse`` raise a ``FluidError``, not a
+    ``ValueError``: a bad value is the flag's own typed error, never cli_unhandled_exception."""
+    from fluid_build.cli import main
+
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_text(
+        "fluidVersion: 0.7.5\nkind: DataProduct\nid: t.x\nname: X\ndomain: ops\n"
+        "metadata: {layer: Silver, owner: {team: ops, email: ops@example.com}}\n",
+        encoding="utf-8",
+    )
+
+    rc = main(["validate", str(contract), "--offline", flag, "bogus"])
+
+    captured = capsys.readouterr()
+    text = " ".join((captured.out + captured.err).split())
+    assert rc == 1, text
+    assert f"ERR_{event.upper()}" in text
+    assert "cli_unhandled_exception" not in text
+
+
+def test_a_missing_contract_is_named(tmp_path, capsys):
+    """``validate_cli_path`` raises contract_file_not_found with no path: the message still
+    names the file (it printed "Contract file not found: None")."""
+    from fluid_build.cli import main
+
+    missing = tmp_path / "nope.fluid.yaml"
+
+    rc = main(["validate", str(missing), "--offline"])
+
+    captured = capsys.readouterr()
+    text = " ".join((captured.out + captured.err).split())
+    assert rc == 1
+    # The error line is wrapped at the terminal width (80 columns on CI), possibly inside the
+    # path, so the path is looked for with every whitespace taken out.
+    assert "Contract file not found:" in text and "not found: None" not in text
+    assert str(missing).replace(" ", "") in "".join(text.split())
+
+
+@pytest.mark.parametrize(
+    "flag, example", [("--min-version", "'>=0.7.0'"), ("--max-version", "'<0.8.0'")]
+)
+def test_a_bad_version_bound_hint_shows_a_constraint(tmp_path, capsys, flag, example):
+    from fluid_build.cli import main
+
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_text("fluidVersion: 0.7.5\nkind: DataProduct\nid: t.x\n", encoding="utf-8")
+
+    main(["validate", str(contract), "--offline", flag, "bogus"])
+
+    captured = capsys.readouterr()
+    assert f"{flag} {example}" in captured.out + captured.err

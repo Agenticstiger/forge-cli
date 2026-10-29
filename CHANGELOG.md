@@ -44,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ref_target_suffix_unknown`), once per suffix in a process, naming the first such file, how it
   was read and which suffixes are known. The file is read as before. `.json`, `.yaml`, `.yml` and
   `.avsc` never warn.
+- **`fluid bundle` without `--out` (or with `--out -`) does what its help says on every
+  contract.** With a `fragments/` directory beside the contract, `yaml` and `json` went to a file,
+  `contract.bundled.fluid.yaml`, instead of stdout, so `fluid bundle contract.fluid.yaml | ...`
+  received nothing; and `--format tgz` wrote its gzip tarball under that `.yaml` name, which the
+  next stage read as YAML (`'utf-8' codec can't decode byte 0x8b`) and `--sign` / `--attest`
+  refused (`signing_bundle_wrong_format`). `fluid ship` bundled that way on every run. Now `yaml`
+  and `json` go to stdout and a `tgz` to `<contract id>.fluid.bundle.tgz`, as for any other
+  contract.
 
 ### Deprecated
 
@@ -51,6 +59,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warning (`ref_pointer_without_slash`) naming the fix, `./x.yaml#/key`, once per ref in a process
   however many places write it; a later minor release will refuse it, as RFC 6901 has a JSON
   pointer empty or starting with `/`. The same-document `#key` stays refused.
+
+### Security
+
+- **The default `fluid bundle --format tgz` path gets the write check an explicit `--out` gets.**
+  A symlink planted at `<contract id>.fluid.bundle.tgz` could point the write at a forbidden path
+  (`/etc`, as root in a CI container); it is refused now, as `--out` with that path always was.
+- **`fluid validate` sent a terminal escape sequence in a message to the terminal.** An argument
+  or a contract value it quotes back (a `$ref` in `contract_load_failed`) could retitle the
+  window, rewrite lines or, where the terminal allows it, write the clipboard. Control characters
+  in those messages are now printed as text (`\x1b`), as the CLI's own error line already did.
+
+### Fixed
+
+- **`fluid validate --fragment` no longer guesses a schema version.** With no `--schema-version`
+  and no root contract above the fragment, it checked the fragment against the newest stable
+  schema (0.7.5), so a valid 0.7.6 fragment failed on a field 0.7.5 does not have; a root contract
+  it could not read, or one that kept its `fluidVersion` behind a `$ref`, got the same guess. The
+  version now comes from `--schema-version`, else from the nearest root contract, read as every
+  command reads it: a root that is a `$ref` to its base, a `fluidVersion` kept in a fragment and a
+  same-document pointer are all followed. With neither, the run stops with
+  `schema_version_required` and says why: no root contract above the fragment could be taken, or
+  the nearest one cannot be read or declares no `fluidVersion`.
+- **`fluid validate --fragment KIND` without a file** validated the `contract.fluid.yaml` of the
+  working directory as if it were the fragment. It now says the file is required
+  (`fragment_file_required`). When the KIND was left out, so the file was read as the KIND, the
+  error says that instead.
+- **`fluid validate --fragment KIND bundle.tgz`** validated the bundle and ignored `--fragment`.
+  It is refused now (`fragment_bundle_unsupported`): a bundle is validated whole.
+- **The `--format json` result of a fragment run names the fragment kind**, in a new `fragment`
+  field after `valid`. The JSON of a whole-contract run is unchanged.
+- **A `--schema-version`, `--min-version` or `--max-version` that is not a version** ended as
+  `cli_unhandled_exception`, because the handlers around the parsers caught a `ValueError` the
+  parsers never raise. It is the event the flag names now (`invalid_schema_version`,
+  `invalid_min_version`, `invalid_max_version`), with its hints; the `invalid_schema_version`
+  hint names `fluid validate --list-versions`, the command that lists the versions.
+- **`fluid validate --quiet` printed nothing when a run stopped** on an error such as
+  `contract_load_failed`, although `--quiet` is "errors only". The error now prints; the hints
+  and docs link stay hidden.
+- **`fluid validate missing.fluid.yaml` said "Contract file not found: None"**; it names the
+  file again.
+- **`fluid split` rebases a relative `$ref` inside a part it moves.** A ref such as
+  `sql: {$ref: ./sql/transform.sql}` was copied unchanged into `fragments/builds/transform.yaml`,
+  where it named a file one or two directories off, so split refused the contract, and a split in
+  two passes (`--parts sql`, then `--parts builds`) could not work. The ref now names the same file
+  from the fragment (`../../sql/transform.sql`, a `#/pointer` kept); a URL, an absolute path and a
+  same-document pointer are left as written.
+- **A refused `fluid split` leaves the tree as it was**, as its message says: it took back the
+  files it wrote but left the directories it made (an empty `fragments/` changed what other
+  commands did), and after a failed write the empty file. A read-only root ended in "Unexpected
+  error" (exit 2); it is now refused like any failed write (exit 1), as is a JSON root with a
+  character that has no UTF-8 form. An interrupt (Ctrl-C) halfway through the writes is taken
+  back too. The dry run refuses a symlinked directory on the way, as the real run already did.
+- **A part in a container a YAML alias or `<<` merge shares is split from its own place.** Two
+  builds merging the same defaults (`<<: *defaults`) made `fluid split --parts sql` fail with
+  "write() argument must be str, not dict" and leave an empty `sql/b.sql`; each build's sql is now
+  a file of its own.
+- **`fluid split --out DIR` never writes over another file.** An existing `DIR/contract.fluid.yaml`
+  that is not the contract being split (or a byte-for-byte copy of it that is no hard link to
+  another file) was replaced without a word; a second split into the same `--out` wrote `-2`
+  copies and left the first run's fragments unreferenced. Both are refused now, the dry run
+  included, with the remedy.
+- **A long id gets a file name a file system takes.** An id of 300 characters gave a 305-byte
+  name: the dry run listed it and the real run failed. A slug over 100 characters now ends in 8 hex
+  digits of a hash of the whole id, so two long ids that start alike keep names of their own.
+- **`fluid split` keeps more of the root as written:** a comment on the last line of a moved block
+  keeps the line's CR in a CRLF file; a keep-chomped block scalar (`|+`, `>+`) keeps its trailing
+  blank lines; a tag or an unused anchor on a moved section's key line no longer makes the splice
+  write unparseable YAML; and a comment on a block scalar's header line stays beside its `$ref`.
 
 ### Upgrade notes
 
@@ -61,6 +137,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as written, `fluid status` and `fluid contract digest` among them, read it as before.
 - **A payload with `$ref` keys of its own:** write them `$$ref` instead of keeping the payload as a
   string.
+- **`fluid bundle` no longer writes `contract.bundled.fluid.yaml` on its own.** A script that
+  bundled a split contract and then read that file must pass `--out contract.bundled.fluid.yaml`.
+  A `contract.bundled.fluid.yaml` an earlier `fluid ship` left beside a contract is a tarball, and
+  one an earlier `fluid bundle` left is a copy of the contract that may be stale; delete either.
 
 ## [0.25.0] — 2026-10-28
 

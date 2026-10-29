@@ -24,6 +24,8 @@ four sections ``fluid split`` has always moved (:data:`DEFAULT_PARTS`).
 :func:`fragment_sites` says where each part sits and which file it goes to,
 for this dict-level splitter and for ``fluid split``'s text splicer
 (``cli/_split_text.py``), so the two move the same parts to the same files.
+Both rewrite a relative ``$ref`` inside a part that moves so that it names
+the same file from the part's new file (:func:`rebased_ref`).
 
 The splitting is purely mechanical — no LLM involved.  This guarantees
 deterministic, always-correct output regardless of the model used to
@@ -33,6 +35,8 @@ generate the original contract.
 from __future__ import annotations
 
 import copy
+import functools
+import hashlib
 import posixpath
 import re
 from typing import (
@@ -49,6 +53,8 @@ from typing import (
 )
 
 import yaml
+
+from fluid_build.util.ref_confinement import is_relative_file_ref
 
 # ── Splittable parts ─────────────────────────────────────────────────────
 
@@ -95,6 +101,15 @@ _CODE_SUFFIX = {"python": "py", "pyspark": "py", "scala": "scala", "r": "r"}
 #: Description parts written as Markdown by the ``description`` part.
 _DESCRIPTION_PARTS = ("purpose", "usage", "limitations")
 
+#: The longest slug a file is named by. A longer one is cut short and ends in
+#: a hash of the whole id instead, so the name stays far under the 255 bytes a
+#: file name may have, a ``-N`` and the longest suffix included, and two long
+#: ids that start alike still get a name each. The cap is the default of
+#: pants' ``safe_filename``; the hash that ends the cut slug, 8 hex digits of
+#: SHA-256 over the whole id, is kubespawner's ``strip_and_hash``.
+_MAX_SLUG = 100
+_SLUG_HASH = 8
+
 
 class FragmentSite(NamedTuple):
     """One part of a contract that goes to a file of its own."""
@@ -127,10 +142,13 @@ def parse_parts(spec: str) -> Tuple[str, ...]:
 
 
 def _slugify(value: str) -> str:
-    """Convert an identifier to a filesystem-safe slug."""
+    """Convert an identifier to a filesystem-safe slug, at most :data:`_MAX_SLUG` long."""
     slug = re.sub(r"[^a-zA-Z0-9_-]", "-", str(value).strip())
-    slug = re.sub(r"-{2,}", "-", slug).strip("-")
-    return slug.lower() or "unnamed"
+    slug = re.sub(r"-{2,}", "-", slug).strip("-").lower() or "unnamed"
+    if len(slug) <= _MAX_SLUG:
+        return slug
+    whole = hashlib.sha256(str(value).encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{slug[: _MAX_SLUG - _SLUG_HASH - 1].rstrip('-')}-{whole[:_SLUG_HASH]}"
 
 
 def _file_text(value: Any) -> bool:
@@ -280,14 +298,94 @@ def ref_between(target: str, container: Optional[str]) -> str:
     return rel if rel.startswith("../") else f"./{rel}"
 
 
+def rebased_ref(ref: Any, container: Optional[str]) -> Any:
+    """``ref``, a ``$ref`` value written in the root, as the file ``container``
+    names the same target (``None``: the root, where it stays as it is).
+
+    A relative ref resolves against the directory of the file that holds it,
+    so one in a part that moves to ``fragments/builds/t.yaml`` climbs back out
+    of that directory first: ``./sql/t.sql`` becomes ``../../sql/t.sql``, and
+    a ``#/pointer`` after the file stays. The ref's own path is kept as it was
+    written, so no ``..`` in it is folded away (that would be wrong past a
+    symlinked directory); only the directories it shares with the container's
+    lead, and the ``./`` steps it starts with, are dropped. A URL, an absolute path, a
+    same-document ``#/...`` pointer and a value that is not a string are not
+    relative to the file, and come back unchanged.
+    """
+    if container is None or not isinstance(ref, str):
+        return ref
+    file_part, mark, pointer = ref.partition("#")
+    if not is_relative_file_ref(file_part):
+        return ref
+    names = file_part[_dot_steps(file_part) :].split("/")
+    climb = [name for name in posixpath.dirname(container).split("/") if name]
+    # A directory the container's path starts with is a real one (split writes
+    # through no symlink), so going into it and back out is no step at all.
+    while len(names) > 1 and climb and names[0] == climb[0]:
+        names.pop(0)
+        climb.pop(0)
+    rel = "/".join([".."] * len(climb) + names)
+    return (rel if rel.startswith("../") else f"./{rel}") + mark + pointer
+
+
+def _dot_steps(path: str) -> int:
+    """How long the ``./`` steps are that ``path`` starts with (``./``, ``.//``,
+    ``././``): they name the directory the ref is written in, so they say
+    nothing once it is rebased.
+
+    Scanned, not matched: the pattern ``(?:\\./+)+`` is linear in time but
+    keeps state for every step it takes (2.5 million steps held 330 MB), and
+    Python 3.10 has no possessive quantifier to drop it. The run of ``.`` and
+    ``/`` the path starts with ends, as the steps do, before a ``..`` (a climb,
+    kept) or before a last ``.`` (a name that starts with one, or ``.``).
+    """
+    if not path.startswith("./"):
+        return 0
+    end = len(path) - len(path.lstrip("./"))
+    climb = path.find("..", 0, end)
+    if climb >= 0:
+        return climb
+    return end - 1 if path[end - 1] == "." else end
+
+
+def _rebased_refs(value: Any, at: Tuple[Any, ...], container: str, inner: Collection[Any]) -> Any:
+    """``value``, the part at ``at`` that goes to the file ``container``, with every
+    ``$ref`` written in the root rebased to that file (:func:`rebased_ref`).
+
+    The parts in ``inner`` moved out of it first: each one's ref already names
+    its file from ``container``. What holds no ref to rebase is handed back as
+    it is, and what does is a copy, so a value a YAML alias shares with a part
+    that stays is never changed for both.
+    """
+    out: Any
+    if at in inner:
+        return value
+    if isinstance(value, dict):
+        out = {k: _rebased_refs(v, (*at, k), container, inner) for k, v in value.items()}
+        if "$ref" in value:
+            out["$ref"] = rebased_ref(value["$ref"], container)
+        changed = any(out[k] is not value[k] for k in value)
+    elif isinstance(value, list):
+        out = [_rebased_refs(v, (*at, i), container, inner) for i, v in enumerate(value)]
+        changed = any(new is not old for new, old in zip(out, value, strict=True))
+    else:
+        return value
+    return out if changed else value
+
+
 def container_of(site: FragmentSite, sites: Iterable[FragmentSite]) -> Optional[str]:
     """The fragment ``site`` ends up in: the nearest moved part around it, or the root."""
     best: Optional[FragmentSite] = None
     for other in sites:
-        if len(other.path) < len(site.path) and site.path[: len(other.path)] == other.path:
+        if _inside(site.path, other.path):
             if best is None or len(other.path) > len(best.path):
                 best = other
     return best.target if best is not None else None
+
+
+def _inside(path: Tuple[Any, ...], outer: Tuple[Any, ...]) -> bool:
+    """``path`` is below ``outer`` (not ``outer`` itself)."""
+    return len(outer) < len(path) and path[: len(outer)] == outer
 
 
 def split_contract_to_fragments(
@@ -303,7 +401,11 @@ def split_contract_to_fragments(
     text part (``sql``, ``description``).
 
     Only parts that actually exist, are non-empty, and are not already a
-    ``$ref`` are split. The input *contract* is not mutated.
+    ``$ref`` are split. A relative ``$ref`` inside a part that moves is
+    rewritten to name the same file from the part's new one
+    (:func:`rebased_ref`). A part is replaced by its ref only where it moves
+    from, even when a YAML anchor or merge key put its container at other
+    places too (:func:`_own_parent`). The input *contract* is not mutated.
     """
     if not isinstance(contract, dict):
         return contract, {}
@@ -314,11 +416,13 @@ def split_contract_to_fragments(
     # Deepest first, so a part inside another (a build's SQL) is a ref in
     # its container's file by the time the container moves.
     for site in sorted(sites, key=lambda s: len(s.path), reverse=True):
-        parent = _walk(root, site.path[:-1])
+        parent = _own_parent(root, site.path)
         value = parent[site.path[-1]]
         if site.text:
             fragments[site.target] = value
         else:
+            inner = {other.path for other in sites if _inside(other.path, site.path)}
+            value = _rebased_refs(value, site.path, site.target, inner)
             fragments[site.target] = (site.header + "\n" if site.header else "") + yaml.dump(
                 value,
                 Dumper=_exact_dumper(),
@@ -331,18 +435,46 @@ def split_contract_to_fragments(
     return root, fragments
 
 
+@functools.lru_cache(maxsize=1)
 def _exact_dumper() -> Any:
-    """The YAML dumper ``fluid bundle`` writes with: text holding NEL, LS or PS is
-    written escaped, so it reads back exactly (a bare one folds into a space)."""
+    """The YAML dumper ``fluid bundle`` writes with (text holding NEL, LS or PS is
+    written escaped, so it reads back exactly: a bare one folds into a space),
+    writing every object in full wherever it is, with no anchor and no alias.
+
+    A data split copies the containers on each part's way (:func:`_own_parent`),
+    and a copy shares what else it holds with the original: an object a YAML
+    alias put at two places can end up at many, and a dumper that names shared
+    objects wrote an alias for each, enough to pass the 50 aliases the loader
+    reads when the split is checked. Written in full, nothing grows past what
+    the contract's own alias cap let in; a document that contains itself is
+    refused before (it does not compose).
+    """
     from fluid_build.forge.core.bundle import ExactDumper
 
-    return ExactDumper
+    class _InFull(ExactDumper):
+        def ignore_aliases(self, data: Any) -> bool:
+            return True
+
+    return _InFull
 
 
-def _walk(document: Any, path: Iterable[Union[str, int]]) -> Any:
-    for part in path:
-        document = document[part]
-    return document
+def _own_parent(root: Dict[str, Any], path: Tuple[Union[str, int], ...]) -> Any:
+    """The container that holds the last step of ``path``, made this path's own on
+    the way down: each container below ``root`` is replaced, in the one above it,
+    by a shallow copy of itself.
+
+    A YAML anchor or merge key (``<<: *defaults``) puts one object at several
+    places. Replaced by its ref in place, a part sharing a parent with another
+    one changed there too, and the other one then moved the ref instead of
+    itself: a dict as an sql file, or the splitter's own ref rebased as if it
+    had been written in the contract.
+    """
+    parent: Any = root
+    for step in path[:-1]:
+        own = copy.copy(parent[step])
+        parent[step] = own
+        parent = own
+    return parent
 
 
 def describe_fragment_layout(
