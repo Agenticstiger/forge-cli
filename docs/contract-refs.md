@@ -2,10 +2,18 @@
 
 A contract can pull any part of itself from another file with `$ref`: a
 value from a YAML or JSON file (an object, a list, a scalar), or the text of a
-`.sql`, `.md`, `.markdown`, `.txt`, `.py`, `.scala` or `.r` file, read as a
-string and never parsed. `fluid validate`, `plan`, `apply`, `bundle` and every
-other command resolve every ref before they do anything else, so the rest of
-the pipeline sees one document.
+`.sql`, `.md`, `.markdown`, `.txt`, `.py`, `.scala`, `.r`, `.hql`, `.ddl`,
+`.cql`, `.j2`, `.jinja` or `.sh` file, read as a string and never parsed.
+`fluid validate`, `plan`, `apply`, `bundle` and every other command resolve
+every ref before they do anything else, so the rest of the pipeline sees one
+document.
+
+`.json`, `.yaml` and `.yml` are JSON or YAML, and so is `.avsc` (an Avro
+schema). A file with any other suffix, or none, is still read as JSON, or else
+as a YAML object, but logs a `ref_target_suffix_unknown` warning that names the
+file, how it was read and the suffixes a ref knows: text under an unknown
+suffix could otherwise become a mapping without anyone noticing. Rename such a
+file to the suffix that says what it holds.
 
 ```text
 orders/

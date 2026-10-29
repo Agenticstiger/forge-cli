@@ -36,7 +36,10 @@ from typing import (
     Union,
 )
 
+# ``_NOTED_REF_WARNINGS`` (the resolver's warn-once registry) is imported so a
+# test that resets every ``loader._NOTED_*`` registry resets it too.
 from fluid_build.contract_refs import (
+    _NOTED_REF_WARNINGS,
     MAX_REF_DEPTH,
     ComposeTrace,
     ContractOrigins,

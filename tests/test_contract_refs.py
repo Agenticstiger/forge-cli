@@ -29,6 +29,7 @@ the keys written beside ``$ref`` over it:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict
@@ -1082,8 +1083,11 @@ def test_kernel_trees_stay_blocked_with_any_root(target: str) -> None:
         contract_refs._refuse_system_path(Path(target), target)
 
 
-def test_a_file_without_a_known_suffix_must_still_hold_an_object(tmp_path: Path) -> None:
-    """A dotfile inside the root reads as a YAML string; a ref must not hand it out."""
+def test_a_file_without_a_known_suffix_must_still_hold_an_object(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A dotfile inside the root reads as a YAML string; a ref must not hand it out. An
+    ``.avsc`` is a known JSON suffix: read as JSON, any root, and no warning."""
     _write(tmp_path / ".env", "API_TOKEN=s3cr3t\n")
     _write(tmp_path / "schema.avsc", '[{"type": "record", "name": "A"}]')
     leaky = _contract(tmp_path, {"x": {"$ref": "./.env"}})
@@ -1091,7 +1095,9 @@ def test_a_file_without_a_known_suffix_must_still_hold_an_object(tmp_path: Path)
     with pytest.raises(RefResolutionError, match="YAML root must be an object/dict"):
         load_contract(leaky)
     fine = _contract(tmp_path, {"x": {"$ref": "./schema.avsc"}})
-    assert load_contract(fine)["x"] == [{"type": "record", "name": "A"}]
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert load_contract(fine)["x"] == [{"type": "record", "name": "A"}]
+    assert not [r for r in caplog.records if getattr(r, "event", "").startswith("ref_target")]
 
 
 def test_a_fragment_that_contains_itself_is_refused(tmp_path: Path) -> None:

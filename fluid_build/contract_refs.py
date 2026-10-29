@@ -22,7 +22,8 @@ whatever it names:
 1. **Read the target.** ``./part.yaml`` reads a file. Its root may be any
    JSON or YAML value (an object, a list, a scalar), and a file with a text
    suffix (:data:`TEXT_REF_SUFFIXES`: ``.sql``, ``.md`` and so on) is its
-   text, as a string, never parsed.
+   text, as a string, never parsed. A file with a suffix neither list knows
+   is read as JSON, or else a YAML object, with a warning that names it.
 2. **Apply the pointer.** ``./part.yaml#/rules`` selects inside the target.
    A pointer cannot select inside a text file.
 3. **Merge the siblings.** Keys written next to ``$ref`` are merged over a
@@ -71,8 +72,10 @@ from __future__ import annotations
 
 import copy
 import functools
+import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import (
     Any,
@@ -105,6 +108,7 @@ __all__ = [
     "ComposeTrace",
     "ContractOrigins",
     "Origin",
+    "DATA_REF_SUFFIXES",
     "RefBudget",
     "escape_ref_keys",
     "find_ref_node",
@@ -131,11 +135,55 @@ Pointer = Tuple[Union[str, int], ...]
 MAX_REF_DEPTH = 20
 
 #: Suffixes a ``$ref`` reads as text. The value is the file's content as a
-#: string, never parsed: SQL and Markdown, and the other languages an
+#: string, never parsed: SQL and Markdown, the other languages an
 #: embedded-logic build's ``properties.sql`` may be written in (its
-#: ``language``: pyspark and python, scala, r). Any other suffix is parsed as
-#: JSON or YAML.
-TEXT_REF_SUFFIXES = frozenset({".sql", ".md", ".markdown", ".txt", ".py", ".scala", ".r"})
+#: ``language``: pyspark and python, scala, r), and the other text a contract
+#: keeps beside it: HiveQL, DDL, CQL, Jinja templates and shell. Any other
+#: suffix is parsed as JSON or YAML.
+TEXT_REF_SUFFIXES = frozenset(
+    {
+        ".sql",
+        ".md",
+        ".markdown",
+        ".txt",
+        ".py",
+        ".scala",
+        ".r",
+        ".hql",
+        ".ddl",
+        ".cql",
+        ".j2",
+        ".jinja",
+        ".sh",
+    }
+)
+
+#: Suffixes a ``$ref`` parses as JSON or YAML without a word: a JSON or YAML
+#: document's own, and ``.avsc`` (an Avro schema is JSON). A file with any
+#: other suffix, or none, is parsed too, as before, but logs
+#: ``ref_target_suffix_unknown``: text under a suffix this table lacks would
+#: otherwise become a mapping without anyone seeing it.
+DATA_REF_SUFFIXES = frozenset({".json", ".yaml", ".yml", ".avsc"})
+
+#: The composition logs under the loader's name: the resolver was split out
+#: of :mod:`fluid_build.loader`, and its warnings belong with the loader's.
+LOG = logging.getLogger("fluid.loader")
+
+#: The text of every warning this module logged in this process: each is
+#: logged once (a contract is composed more than once by some commands).
+#: Tests reset it with ``.clear()``.
+_NOTED_REF_WARNINGS: Set[str] = set()
+_NOTED_REF_WARNINGS_LOCK = threading.Lock()
+
+
+def _warn_once(event: str, text: str, **extra: Any) -> None:
+    """Log ``text`` as a WARNING with ``event``, the first time this process sees it."""
+    with _NOTED_REF_WARNINGS_LOCK:
+        if text in _NOTED_REF_WARNINGS:
+            return
+        _NOTED_REF_WARNINGS.add(text)
+    LOG.warning("%s", text, extra={"event": event, **extra})
+
 
 #: Largest text file a ``$ref`` reads: the cap ``util.safe_yaml`` puts on a
 #: YAML document, which every other file the composition reads (the root
@@ -882,19 +930,39 @@ def _parse_target(path: Path) -> Any:
         return load_json_unique(text, name=name)
     if suffix in (".yaml", ".yml"):
         return _yaml(text, name)
-    try:
-        return load_json_unique(text, name=name)
-    except DuplicateKeyError:
-        raise
-    except ValueError:
-        pass
     # Any other suffix (``.avsc``, none at all) parses as JSON, or else as a
     # YAML object, as before: a dotfile or a key file inside the root reads
     # as a YAML string, and a ref must not hand that out.
-    value = _yaml(text, name)
-    if not isinstance(value, dict):
-        raise ValueError(f"YAML root must be an object/dict: {path}")
+    try:
+        value = load_json_unique(text, name=name)
+        how = "JSON"
+    except DuplicateKeyError:
+        raise
+    except ValueError:
+        value = _yaml(text, name)
+        if not isinstance(value, dict):
+            raise ValueError(f"YAML root must be an object/dict: {path}")
+        how = "a YAML object"
+    if suffix not in DATA_REF_SUFFIXES:
+        _note_unknown_suffix(path, suffix, how)
     return value
+
+
+def _note_unknown_suffix(path: Path, suffix: str, how: str) -> None:
+    """WARN, once per file, that ``path`` was parsed for want of a suffix that says
+    what it holds (SG-16): its text could be a mapping by accident."""
+    has = f"the suffix {suffix!r}" if suffix else "no suffix"
+    data = ", ".join(sorted(DATA_REF_SUFFIXES))
+    text = ", ".join(sorted(TEXT_REF_SUFFIXES))
+    _warn_once(
+        "ref_target_suffix_unknown",
+        f"ref_target_suffix_unknown: $ref target {path} has {has}, which a $ref does not "
+        f"know, so it was read as {how}. A $ref parses {data} as JSON or YAML and reads "
+        f"{text} as text; rename the file to the suffix that says which it is.",
+        file=str(path),
+        suffix=suffix,
+        read_as="json" if how == "JSON" else "yaml",
+    )
 
 
 def _yaml(text: str, name: str) -> Any:

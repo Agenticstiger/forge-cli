@@ -28,6 +28,7 @@ marked ``xfail(strict=True)`` asserts the spec and names the bug it shows.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tarfile
 from pathlib import Path
@@ -450,23 +451,82 @@ def test_a15_siblings_on_a_text_target_are_refused_naming_them(tmp_path: Path) -
     assert "./t.sql" in message
 
 
-def test_a16_unlisted_text_like_suffixes_are_parsed_as_yaml_sg16(tmp_path: Path) -> None:
-    """SG-16 characterization. Only the seven listed suffixes are text; any other name is
-    JSON or YAML. A ``.hql`` file whose text has a ``': '`` therefore becomes a one-key
-    mapping, silently; text that is not a YAML object is refused with the file named."""
-    _write(tmp_path / "q.hql", "SELECT 'a: b' FROM t")
-    assert _rfr({"x": {"$ref": "./q.hql"}}, tmp_path) == {"x": {"SELECT 'a": "b' FROM t"}}
+#: The ``event`` of the warning a target with a suffix the composition does not know logs.
+_UNKNOWN_SUFFIX = "ref_target_suffix_unknown"
 
-    for name, text in [("notes", "Hello\nworld # tail"), ("run.sh", "echo hi\n")]:
-        _write(tmp_path / name, text)
+
+def _suffix_warnings(caplog: pytest.LogCaptureFixture) -> List[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event", None) == _UNKNOWN_SUFFIX]
+
+
+@pytest.mark.parametrize("suffix", [".hql", ".ddl", ".cql", ".j2", ".jinja", ".sh", ".HQL"])
+def test_a16_query_template_and_script_suffixes_are_text_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, suffix: str
+) -> None:
+    """SG-16, decided: HiveQL, DDL, CQL, Jinja and shell files are text, never parsed. Read as
+    YAML, ``SELECT 'a: b'`` was a one-key mapping and ``{{ a }}: b`` a parse error."""
+    text = "SELECT 'a: b' FROM t\n{{ a }}: b\n"
+    _write(tmp_path / f"q{suffix}", text)
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert _rfr({"x": {"$ref": f"./q{suffix}"}}, tmp_path) == {"x": text}
+
+    assert _suffix_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("name", "text", "how", "expected"),
+    [
+        ("settings.conf", "retries: 3\n", "a YAML object", {"retries": 3}),
+        ("data.jsonl", '{"retries": 3}', "JSON", {"retries": 3}),
+        ("values", "retries: 3\n", "a YAML object", {"retries": 3}),
+    ],
+    ids=["yaml", "json", "no-suffix"],
+)
+def test_a16_an_unknown_suffix_is_still_parsed_and_warns_once_per_file_sg16(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    name: str,
+    text: str,
+    how: str,
+    expected: Any,
+) -> None:
+    """SG-16, decided: a suffix the composition knows neither as data nor as text is parsed
+    as before (JSON, or else a YAML object), and one WARNING names the file, how it was
+    read and the suffixes a ref accepts; a file named twice, or composed again, warns once."""
+    target = _write(tmp_path / name, text)
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        doc = {"x": {"$ref": f"./{name}"}, "y": {"$ref": f"./{name}"}}
+        assert _rfr(doc, tmp_path) == {"x": expected, "y": expected}
+        assert _rfr(doc, tmp_path) == {"x": expected, "y": expected}
+
+    (warning,) = _suffix_warnings(caplog)
+    message = warning.getMessage()
+    assert warning.levelno == logging.WARNING
+    assert f"$ref target {target.resolve()} has " in message
+    assert f"so it was read as {how}." in message
+    assert ".json, .yaml, .yml" in message and ".hql" in message and ".sql" in message
+    assert warning.file == str(target.resolve())  # type: ignore[attr-defined]
+
+
+def test_a16_a_known_suffix_and_a_file_that_fails_to_parse_do_not_warn_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``.avsc`` is a JSON data suffix (an Avro schema): parsed without a word. A file whose
+    text is not a YAML object is refused as before, the error naming it."""
+    _write(tmp_path / "s.avsc", '{"type": "record", "name": "A", "fields": []}')
+    _write(tmp_path / "v.yml", "k: v\n")
+    _write(tmp_path / "notes", "Hello\nworld # tail")
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        got = _rfr({"a": {"$ref": "./s.avsc"}, "b": {"$ref": "./v.yml"}}, tmp_path)
         with pytest.raises(RefResolutionError, match="must be an object") as info:
-            _rfr({"x": {"$ref": f"./{name}"}}, tmp_path)
-        assert f"./{name}" in str(info.value)
+            _rfr({"x": {"$ref": "./notes"}}, tmp_path)
 
-    _write(tmp_path / "t.j2", "{{ a }}: b\n")
-    with pytest.raises(RefResolutionError, match="Failed to parse") as info:
-        _rfr({"x": {"$ref": "./t.j2"}}, tmp_path)
-    assert "t.j2" in str(info.value)
+    assert got["a"]["name"] == "A" and got["b"] == {"k": "v"}
+    assert "./notes" in str(info.value)
+    assert _suffix_warnings(caplog) == []
 
 
 @pytest.mark.parametrize(
@@ -771,22 +831,28 @@ def test_a24_a_directory_is_never_a_target(tmp_path: Path, ref: str) -> None:
     assert f"'{ref}'" in str(info.value)
 
 
-def test_a25_the_suffix_is_the_last_one_and_a_dotfile_has_none_sg16(tmp_path: Path) -> None:
-    """SG-16 characterization: ``x.sql.yaml`` is YAML, ``x.yaml.sql`` is text, and a file named
-    exactly ``.sql`` has no suffix, so it is parsed (``Path('.sql').suffix == ''``)."""
+def test_a25_the_suffix_is_the_last_one_and_a_dotfile_has_none_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """SG-16: ``x.sql.yaml`` is YAML, ``x.yaml.sql`` is text, and a file named exactly
+    ``.sql`` has no suffix (``Path('.sql').suffix == ''``), so it is parsed, with the
+    warning every file without a suffix the composition knows gets."""
     for name in ("x.sql.yaml", "x.yaml.sql", ".sql"):
         _write(tmp_path / name, "k: v\n")
 
-    got = _rfr(
-        {
-            "a": {"$ref": "./x.sql.yaml"},
-            "b": {"$ref": "./x.yaml.sql"},
-            "c": {"$ref": "./.sql"},
-        },
-        tmp_path,
-    )
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        got = _rfr(
+            {
+                "a": {"$ref": "./x.sql.yaml"},
+                "b": {"$ref": "./x.yaml.sql"},
+                "c": {"$ref": "./.sql"},
+            },
+            tmp_path,
+        )
 
     assert got == {"a": {"k": "v"}, "b": "k: v\n", "c": {"k": "v"}}
+    (warning,) = _suffix_warnings(caplog)
+    assert f"{(tmp_path / '.sql').resolve()} has no suffix" in warning.getMessage()
 
 
 def test_a26_a_symlink_is_read_by_the_suffix_of_its_target_sg16(tmp_path: Path) -> None:
