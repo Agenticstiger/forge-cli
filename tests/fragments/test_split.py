@@ -2658,23 +2658,49 @@ def test_i34_an_unwritable_output_directory_is_a_clean_refusal(
 
 
 @needs_posix_permissions
-def test_i34_an_unwritable_root_file_is_an_unexpected_error_today(
+def test_i34_an_unwritable_root_file_is_refused_like_any_failed_write(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """SG-32 characterisation (finding SP-09): every other failed write is exit 1,
-    'Split not written'. A read-only root fails at the last write, and the undo
-    that tries to write the root back fails the same way inside the handler."""
+    """Finding SP-09: a read-only root fails at the last write, which is reported
+    as every failed write is: exit 1, 'Split not written', the tree as it was.
+    The undo does not write back a root it could not open (that write raised the
+    same error inside the handler: exit 2, 'Unexpected error')."""
     pair = make_pair(tmp_path, SPLIT_ALL_FILES)
     pair.split_contract.chmod(0o444)
+    before = digest(pair.split)
     try:
         rc = split(pair.split_contract)
     finally:
         pair.split_contract.chmod(0o644)
 
-    assert rc == 2
+    assert rc == 1
     shown = capsys.readouterr()
-    assert "Unexpected error" in shown.out + shown.err
-    assert pair.split_contract.read_bytes() == SPLIT_ALL.encode("utf-8")
+    assert "Unexpected error" not in shown.out + shown.err
+    assert "Split not written" in shown.err and "Permission denied" in shown.err
+    assert shown.err.rstrip().endswith("nothing was changed")
+    assert digest(pair.split) == before
+
+
+def test_i34_a_take_back_that_fails_is_reported_and_never_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-09: every step of the undo runs whatever an earlier one did, none raises,
+    and the message names what is left instead of saying nothing was changed."""
+    pair = solo(tmp_path, REF_INTO_A_MOVED_PART)
+
+    def busy(self: Path) -> None:
+        raise OSError(16, "Device or resource busy", str(self))
+
+    monkeypatch.setattr(Path, "rmdir", busy)
+
+    assert split(pair.split_contract) == 1
+
+    err = capsys.readouterr().err
+    assert "Split not written" in err and "nothing was changed" not in err
+    assert "split could not take back" in err
+    assert f"{pair.split / 'fragments' / 'builds'}: Device or resource busy" in err
+    # The other steps ran all the same: the root is put back, the files are gone.
+    assert pair.split_contract.read_text("utf-8") == REF_INTO_A_MOVED_PART
     assert not files_of(pair.split / "fragments")
 
 

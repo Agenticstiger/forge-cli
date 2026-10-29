@@ -35,11 +35,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Collection, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Collection, Dict, List, Optional, Sequence, Tuple
 
 COMMAND = "split"
 
@@ -296,6 +297,7 @@ def _write_checked(
     original_root: Optional[bytes] = root_out.read_bytes() if root_out.exists() else None
     made: List[Path] = []
     written: List[Path] = []
+    root_opened = False
     try:
         for target, content in data.items():
             _make_dirs(target.parent, made)
@@ -305,20 +307,41 @@ def _write_checked(
                 handle.write(content)
         _make_dirs(root_out.parent, made)
         with open(root_out, "wb") as handle:
+            root_opened = True
             handle.write(root_data)
         if compose_contract(root_out).document != before:
             raise ValueError("the split contract does not compose to the original one")
     except Exception as exc:  # noqa: BLE001 - every failure is taken back
-        for path in written:
-            path.unlink(missing_ok=True)
-        if original_root is not None:
-            root_out.write_bytes(original_root)
-        elif root_out.exists():
-            root_out.unlink()
-        for directory in reversed(made):
-            directory.rmdir()
+        left = _take_back(written, root_out if root_opened else None, original_root, made)
+        if left:
+            return f"{exc}; and split could not take back {'; '.join(left)}"
         return f"{exc}; nothing was changed"
     return None
+
+
+def _take_back(
+    written: List[Path], root_out: Optional[Path], original_root: Optional[bytes], made: List[Path]
+) -> List[str]:
+    """Undo a split that failed halfway: remove the files ``written``, put the
+    root back when it was opened for writing (``root_out``; a root that could
+    not be opened, a read-only one, is as it was), then remove the directories
+    ``made``, deepest first. Every step is tried, whatever an earlier one did,
+    and none raises: what could not be undone comes back, one line per path."""
+    steps: List[Tuple[Path, Callable[[], Any]]] = [
+        (path, functools.partial(path.unlink, missing_ok=True)) for path in written
+    ]
+    if root_out is not None and original_root is not None:
+        steps.append((root_out, functools.partial(root_out.write_bytes, original_root)))
+    elif root_out is not None:
+        steps.append((root_out, functools.partial(root_out.unlink, missing_ok=True)))
+    steps += [(directory, directory.rmdir) for directory in reversed(made)]
+    left: List[str] = []
+    for path, step in steps:
+        try:
+            step()
+        except Exception as exc:  # noqa: BLE001 - reported; the next step still runs
+            left.append(f"{path}: {getattr(exc, 'strerror', None) or exc}")
+    return left
 
 
 def _make_dirs(directory: Path, made: List[Path]) -> None:
