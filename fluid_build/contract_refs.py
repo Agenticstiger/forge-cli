@@ -95,7 +95,6 @@ from typing import (
     Union,
 )
 
-from fluid_build.util.excerpt import excerpt
 from fluid_build.util.ref_confinement import (
     RefResolutionError,
     confine_ref,
@@ -908,6 +907,10 @@ def _note_pointer_without_slash(
     event = "ref_pointer_without_slash"
     if not _first_time(event, ref):
         return
+    # Imported here, as below: the composition is on the path ``fluid --help``
+    # imports, and only a warning needs it.
+    from fluid_build.util.excerpt import excerpt
+
     fix = f"{parse_ref(ref)[0]}#/{pointer}"
     site = ref_location(excerpt(format_pointer(loc)), None)
     if source is not None:
@@ -1012,6 +1015,8 @@ def _note_unknown_suffix(path: Path, suffix: str, how: str) -> None:
     event = "ref_target_suffix_unknown"
     if not _first_time(event, suffix):
         return
+    from fluid_build.util.excerpt import excerpt
+
     LOG.warning(
         "%s: $ref target %s has %s, which a $ref does not know, so it was read as %s. A $ref "
         "parses %s as JSON or YAML and reads %s as text; rename the file to the suffix that "

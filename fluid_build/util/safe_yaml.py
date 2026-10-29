@@ -76,8 +76,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
-from fluid_build.util.excerpt import excerpt
-
 # Caps tuned well above any legitimate contract / manifest. A real data
 # contract uses few-to-zero YAML aliases; a billion-laughs payload needs
 # dozens of nested alias references to reach dangerous expansion.
@@ -160,6 +158,9 @@ def _duplicate_key_message(
     json_object: bool,
 ) -> str:
     """What :class:`DuplicateKeyError` says: the place, the key, and the first one."""
+    # Imported here: this module is on the path ``fluid --help`` imports.
+    from fluid_build.util.excerpt import excerpt
+
     if name is not None:
         place = f"{name}:{line}: " if line is not None else f"{name}: "
     else:
