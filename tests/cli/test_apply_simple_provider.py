@@ -26,6 +26,7 @@ CSV for it, whenever a later expose was local. These pin the rule
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -203,6 +204,15 @@ class TestUnderAPluginPolicy:
         assert "exposes[0].binding.platform: databricks" in _refusal(contract).context["error"]
 
 
+class TestTheMessage:
+    def test_it_names_ten_fields_and_counts_the_rest(self) -> None:
+        contract = _contract([_expose(f"t{i}", "databricks") for i in range(12)])
+        said = _refusal(contract).context["error"]
+        assert "exposes[9].binding.platform: databricks" in said
+        assert "exposes[10]" not in said
+        assert "and 2 more" in said
+
+
 class TestTheChoiceIsUnchanged:
     """Among platforms a provider serves, the provider is the one it always was."""
 
@@ -268,6 +278,35 @@ def _apply(contract: Dict[str, Any], *flags: str) -> int:
     return apply_run(args, LOG)
 
 
+def _flink_beside_a_local_product() -> Dict[str, Any]:
+    """A SQL build landing ``orders`` and a Flink job writing ``flink_out``,
+    with the Flink job's expose first."""
+    return _contract(
+        [_expose("flink_out", "local"), _expose("orders", "local")],
+        [_sql("make_orders", ["orders"]), _flink(["flink_out"])],
+    )
+
+
+def _plan(contract: Dict[str, Any]) -> str:
+    """A digest-bound plan.json embedding ``contract``, as ``fluid plan`` writes
+    one: the abstract ops the local provider does not dispatch."""
+    from fluid_build.forge.core.plan_digest import inject_digests
+
+    plan = {
+        "format_version": contract["fluidVersion"],
+        "mode": "amend",
+        "contract": copy.deepcopy(contract),
+        "actions": [
+            {"op": "provisionDataset", "action_id": "p0", "params": {}},
+            {"op": "scheduleTask", "action_id": "s0", "params": {}},
+        ],
+    }
+    Path("runtime").mkdir(exist_ok=True)
+    path = Path("runtime/plan.json")
+    path.write_text(json.dumps(inject_digests(plan, bundle_path=None)), "utf-8")
+    return str(path)
+
+
 def _landed(root: Path) -> List[str]:
     return sorted(p.name for p in root.rglob("*") if p.suffix in (".csv", ".parquet"))
 
@@ -294,6 +333,35 @@ class TestFluidApply:
             _apply(contract)
         assert exc.value.event == "apply_platform_unsupported"
         assert _landed(workspace) == []
+
+    def test_a_local_plan_beside_a_flink_job_is_refused_and_overwrites_nothing(
+        self, workspace: Path
+    ) -> None:
+        # The local provider applies a plan.json by deriving its own actions from
+        # the contract: the first build's SQL into the first expose's file, which
+        # here is the Flink job's. It overwrote that file and reported success.
+        plan = _plan(_flink_beside_a_local_product())
+        (workspace / "out").mkdir()
+        (workspace / "out" / "flink_out.csv").write_text("written-by-flink\n", "utf-8")
+        for flags in ((), ("--provider", "local")):
+            with pytest.raises(CLIError) as exc:
+                apply_run(build_parser().parse_args(["apply", plan, *flags, "--yes"]), LOG)
+            assert exc.value.event == "apply_plan_runs_outside_forge"
+            assert "builds[1]" in exc.value.context["error"]
+        assert (workspace / "out" / "flink_out.csv").read_text("utf-8") == "written-by-flink\n"
+
+    def test_the_contract_file_applies_and_leaves_the_flink_output_alone(
+        self, workspace: Path
+    ) -> None:
+        (workspace / "out").mkdir()
+        (workspace / "out" / "flink_out.csv").write_text("written-by-flink\n", "utf-8")
+        assert _apply(_flink_beside_a_local_product()) == 0
+        assert (workspace / "out" / "flink_out.csv").read_text("utf-8") == "written-by-flink\n"
+
+    def test_a_local_plan_with_no_flink_job_still_applies(self, workspace: Path) -> None:
+        contract = _contract([_expose("orders", "local")], [_sql("make_orders", ["orders"])])
+        args = build_parser().parse_args(["apply", _plan(contract), "--yes"])
+        assert apply_run(args, LOG) == 0
 
     def test_provider_still_overrides(self, workspace: Path) -> None:
         contract = _contract([_expose("events_out", "kafka")])

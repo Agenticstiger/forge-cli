@@ -105,6 +105,13 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "providers",
     ),
+    "apply_plan_runs_outside_forge": (
+        [
+            "Apply the contract file instead (fluid apply contract.fluid.yaml): the local "
+            "planner plans it, and leaves what a job outside forge-cli writes to that job",
+        ],
+        None,
+    ),
     "provider_blocked_by_policy": (
         [
             "This provider is named in FLUID_PLUGINS_BLOCKLIST, or an "

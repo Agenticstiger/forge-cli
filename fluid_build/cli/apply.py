@@ -1160,6 +1160,37 @@ def _write_apply_report(
             logger.warning(f"Failed to generate report: {e}")
 
 
+#: How many unsupported platform fields ``apply_platform_unsupported`` names.
+_PLATFORMS_SHOWN = 10
+
+
+def _refuse_local_plan_beside_outside_jobs(contract: Dict[str, Any]) -> None:
+    """Refuse to apply a plan.json with the local provider when a build of its
+    contract runs outside forge-cli.
+
+    ``fluid plan`` records abstract ops the local provider does not dispatch, so
+    for a plan it derives its own actions from the contract: the first build's
+    SQL into the first expose's file. Beside a job that runs outside forge-cli
+    that lands the wrong rows, over the job's own output. The contract file is
+    planned by the local planner instead, which leaves that job's output to it.
+    """
+    from fluid_build.util.contract import is_externally_run_build
+
+    for i, build in enumerate(contract.get("builds") or []):
+        if isinstance(build, dict) and is_externally_run_build(build):
+            raise CLIError(
+                2,
+                "apply_plan_runs_outside_forge",
+                {
+                    "error": (
+                        f"builds[{i}] runs outside forge-cli, and the local provider "
+                        "applies a plan.json by deriving its own actions from the "
+                        "contract, which would land what that job writes"
+                    ),
+                },
+            )
+
+
 def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> str:
     """The provider simple-mode apply uses when ``--provider`` names none.
 
@@ -1214,12 +1245,15 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
         if name not in registry.PROVIDERS and name not in registry.POLICY_BLOCKED
     ]
     if unsupported:
+        shown = ", ".join(unsupported[:_PLATFORMS_SHOWN])
+        if len(unsupported) > _PLATFORMS_SHOWN:
+            shown += f" and {len(unsupported) - _PLATFORMS_SHOWN} more"
         raise CLIError(
             2,
             "apply_platform_unsupported",
             {
                 "error": (
-                    f"no forge-cli provider applies {', '.join(unsupported)}; "
+                    f"no forge-cli provider applies {shown}; "
                     "fluid apply will not hand it to another provider"
                 ),
                 "providers": ", ".join(sorted(registry.PROVIDERS)),
@@ -1278,6 +1312,8 @@ def _run_simple_apply(
     # Explicit CLI flags override the contract-derived values; the contract's
     # provider is worked out only when --provider names none.
     provider_name = getattr(args, "provider", None) or _simple_apply_provider(contract, logger)
+    if plan_data is not None and str(provider_name).strip().lower() == "local":
+        _refuse_local_plan_beside_outside_jobs(contract)
     if getattr(args, "project", None):
         project = args.project
     if getattr(args, "region", None):

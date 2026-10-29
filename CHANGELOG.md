@@ -46,8 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serves (`databricks`, `postgres`, a Kafka topic nothing in the contract writes, a build's
   `kubernetes` runtime) stops the run with `apply_platform_unsupported`, naming each field.
   Before, it was `provider_unknown` when it came last, and otherwise handed to the local
-  provider, which wrote a placeholder CSV for it and reported success. `--provider` still
-  overrides.
+  provider, which wrote a placeholder CSV for it and reported success; an allow or block list
+  set for the plugins does not change that. A `plan.json` whose contract has a build that runs
+  outside forge-cli is not applied by the local provider (`apply_plan_runs_outside_forge`): for
+  a plan it derives its own actions from the contract, the first build's SQL into the first
+  expose's file, which can be the file the job writes. Most such plans stopped before too, as
+  `provider_unknown`; one whose Flink build named no runtime overwrote that file and reported
+  success. `fluid apply` of the contract file applies them. `--provider` (or `FLUID_PROVIDER`)
+  still overrides the provider.
 
 ### Upgrade notes
 
@@ -55,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the contract declares has no provider; in `fluid apply`, `provider_unknown` now means a
   `--provider` value no provider has. A contract with an expose on such a platform before a local
   one, which applied with exit 0, now stops: pass `--provider local` to apply it as before.
+- A `plan.json` of a contract with a Flink build stops with `apply_plan_runs_outside_forge` (exit
+  2) on the local provider, even with `--provider local`; apply the contract file instead.
 
 ### Security
 
