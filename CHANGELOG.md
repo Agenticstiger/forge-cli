@@ -12,18 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **One odd contract no longer ends `fluid docs`.** A contract holding a value of an unexpected
   type (an `id` that is a number, `tags: [1, 2]`, a YAML date or `!!set`, a non-finite float, an
   integer too long to print, `exposes: 5`, a column `sensitivity` that is a list, a string with a
-  lone surrogate) stopped the whole catalog with `docs_failed` and a bare Python message naming no
-  contract, or wrote an `index.json` strict JSON parsers reject (`NaN`). That contract is now
+  lone surrogate) stopped the whole catalog with `docs_failed` and a bare Python message, or wrote
+  an `index.json` strict JSON parsers reject (`NaN`). That contract is now
   listed like the rest: an odd character is shown escaped, a set as a sorted list, a non-finite
   float or an over-long integer as text, and `index.json` is strict JSON with json's own key
   spelling (`true`, `null`), as before.
-- **A failing `fluid docs` run keeps the catalog the last run wrote.** `index.html` was opened for
+- **A failing `fluid docs` run no longer leaves a broken catalog.** `index.html` was opened for
   writing before it was rendered and `index.json` was streamed into an open file, so a run that
-  failed left `index.html` empty or `index.json` cut off mid-document; an id over 242 characters
-  made a page name the file system refused, after the index already linked it. Every file is now
-  rendered and encoded first, written beside its target, and moved in only when all are written;
-  a page name is at most 100 characters (a longer id ends in a hash of the whole id); a symlink
-  planted in `--out` is replaced, not written through.
+  failed left `index.html` empty or `index.json` cut off mid-document; an id of 242 characters or
+  more made a page name the file system refused, after the index already linked it. Every file is
+  now rendered and encoded first and written beside its target; only when all are written are they
+  moved in, pages before the index, so a run that fails while writing keeps the catalog the last
+  run wrote, and one that fails while moving files in leaves no dead link. A page's slug is at most
+  100 characters (a longer id ends in a hash of the whole id); a symlink planted in `--out` is
+  replaced, not written through; directories and temp files a failed or killed run left are
+  removed.
 - **A contract that does not load is a row with its error, not a dead link.** `index.html` linked
   it to `contract-contract.html`, a page the run never wrote, and its error was only in
   `index.json`.
@@ -32,10 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page and an index row with no id; it followed symlinked directories with no loop check (two
   self-links hung it) and out of `--src`; and a `--src` holding glob characters
   (`my [team] products`) silently gave an empty catalog. It now lists `contract.fluid.yaml`
-  (`.yml`, `.json`) only, does not follow a symlinked directory (name them with `--files`), and
-  skips a contract symlink that leads out of `--src`.
-- **An `--out` the catalog cannot be written to is refused at once**, before any contract is read,
-  instead of after the whole catalog was loaded and rendered.
+  (`.yml`, `.json`) only, does not follow a symlinked directory, and skips a contract symlink that
+  leads out of `--src`; `--files` takes a glob, which does follow links, for a tree that needs them.
+  An empty `--out` is refused before any contract is read.
 
 ## [0.25.0] — 2026-10-28
 
