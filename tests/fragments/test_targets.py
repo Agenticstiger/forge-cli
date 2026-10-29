@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import tarfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -557,6 +558,42 @@ def test_a16_the_unknown_suffix_warning_names_the_whole_path_of_a_deep_file_sg16
     assert got == {"x": {"retries": 3}}
     (warning,) = _suffix_warnings(caplog)
     assert f"$ref target {target.resolve()} has the suffix '.conf'" in warning.getMessage()
+
+
+def test_a16_a_quiet_block_quiets_only_the_composition_in_its_own_context_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``quiet_ref_warnings`` holds for its own thread or task, as the loader's overlay
+    sink does: while one thread reads another product's contract in a block, an ordinary
+    composition in another thread, the user's own, still warns. A module-wide flag would
+    have quieted it. Deterministic: the user's composition runs while the other thread is
+    held inside its block."""
+    theirs = _write(tmp_path / "theirs" / "x.conf", "a: 1\n").parent
+    mine = _write(tmp_path / "mine" / "y.ini", "a: 1\n").parent
+    inside, release = threading.Event(), threading.Event()
+    errors: List[BaseException] = []
+
+    def read_theirs() -> None:
+        try:
+            with contract_refs.quiet_ref_warnings("a test reads it for another product"):
+                inside.set()
+                assert release.wait(timeout=60)
+                assert _rfr({"x": {"$ref": "./x.conf"}}, theirs) == {"x": {"a": 1}}
+        except BaseException as exc:  # noqa: BLE001 - reported below, in the test's thread
+            errors.append(exc)
+            inside.set()
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
+        other = threading.Thread(target=read_theirs)
+        other.start()
+        assert inside.wait(timeout=60)
+        assert _rfr({"y": {"$ref": "./y.ini"}}, mine) == {"y": {"a": 1}}
+        release.set()
+        other.join(timeout=60)
+
+    assert errors == []
+    levels = {Path(r.file).name: r.levelno for r in _suffix_warnings(caplog)}  # type: ignore[attr-defined]
+    assert levels == {"y.ini": logging.WARNING, "x.conf": logging.DEBUG}
 
 
 def test_a16_a_known_suffix_and_a_file_that_fails_to_parse_do_not_warn_sg16(

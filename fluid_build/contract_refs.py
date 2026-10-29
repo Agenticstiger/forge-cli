@@ -72,6 +72,8 @@ dependency for it, so the resolver is this module.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import copy
 import functools
 import hashlib
@@ -86,6 +88,7 @@ from typing import (
     Dict,
     FrozenSet,
     Iterable,
+    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -121,6 +124,7 @@ __all__ = [
     "merge_patch",
     "parse_ref",
     "pointer_merge_error",
+    "quiet_ref_warnings",
     "ref_values",
     "replaces_pointer",
     "resolve_file_refs",
@@ -187,19 +191,79 @@ _NOTED_REF_WARNINGS_LOCK = threading.Lock()
 _MAX_NOTED_REF_WARNINGS = 1024
 
 
-def _first_time(event: str, value: str) -> bool:
-    """Record ``value`` for ``event`` in :data:`_NOTED_REF_WARNINGS`; ``True`` when the
-    registry does not hold it yet: the first time, and once more after the registry is
-    emptied. Checked before the warning is worded, so a value met again costs a digest,
-    never a message."""
+class _QuietRefWarnings(NamedTuple):
+    """A :func:`quiet_ref_warnings` block: why its ref warnings are DEBUG lines, and
+    the values it has logged, so a ref written in many places is still one line."""
+
+    why: str
+    noted: Set[Tuple[str, bytes]]
+    lock: threading.Lock
+
+
+#: The :func:`quiet_ref_warnings` block running in this context, ``None`` outside
+#: one. A context variable, as ``loader._OVERLAY_WARNING_SINK`` is, so a
+#: composition in another thread or task, the user's own among them, still warns.
+_QUIET_REF_WARNINGS: contextvars.ContextVar[Optional[_QuietRefWarnings]] = contextvars.ContextVar(
+    "quiet_ref_warnings", default=None
+)
+
+
+@contextlib.contextmanager
+def quiet_ref_warnings(why: str) -> Iterator[None]:
+    """Compose another product's contract without its ref warnings reaching WARNING.
+
+    A reader that scans the workspace for a few values of every contract in it
+    (the composition rule's product index) composes contracts the run is not
+    about. Their ``ref_pointer_without_slash`` and ``ref_target_suffix_unknown``
+    are for whoever composes them for themselves: as WARNINGs they named other
+    products' files and refs to this run, and to another tenant where a service
+    hands its log back to its caller; and recorded in
+    :data:`_NOTED_REF_WARNINGS`, they were not said again to the contract's own
+    author. Inside the block each is a DEBUG line that says ``why``, once per
+    value, and the registry is left as it was.
+    """
+    token = _QUIET_REF_WARNINGS.set(_QuietRefWarnings(why, set(), threading.Lock()))
+    try:
+        yield
+    finally:
+        _QUIET_REF_WARNINGS.reset(token)
+
+
+def _first_time(event: str, value: str, quiet: Optional[_QuietRefWarnings] = None) -> bool:
+    """Record ``value`` for ``event`` in :data:`_NOTED_REF_WARNINGS`, or in ``quiet``'s
+    own record when a :func:`quiet_ref_warnings` block is running; ``True`` when that
+    record does not hold it yet: the first time, and once more after the record is
+    emptied at :data:`_MAX_NOTED_REF_WARNINGS` entries. Checked before the warning is
+    worded, so a value met again costs a digest, never a message."""
     key = (event, hashlib.sha256(value.encode("utf-8", "surrogatepass")).digest())
-    with _NOTED_REF_WARNINGS_LOCK:
-        if key in _NOTED_REF_WARNINGS:
+    noted, lock = (
+        (_NOTED_REF_WARNINGS, _NOTED_REF_WARNINGS_LOCK)
+        if quiet is None
+        else (quiet.noted, quiet.lock)
+    )
+    with lock:
+        if key in noted:
             return False
-        if len(_NOTED_REF_WARNINGS) >= _MAX_NOTED_REF_WARNINGS:
-            _NOTED_REF_WARNINGS.clear()
-        _NOTED_REF_WARNINGS.add(key)
+        if len(noted) >= _MAX_NOTED_REF_WARNINGS:
+            noted.clear()
+        noted.add(key)
         return True
+
+
+def _log_ref_warning(
+    quiet: Optional[_QuietRefWarnings], text: str, once: str, extra: Dict[str, Any]
+) -> None:
+    """Log the ref warning ``text``: a WARNING ending in ``once``, which says how often
+    it is logged, or inside a :func:`quiet_ref_warnings` block a DEBUG line saying why."""
+    if quiet is None:
+        LOG.warning("%s %s", text, once, extra=extra)
+    else:
+        LOG.debug(
+            "%s A DEBUG line, not a WARNING: %s.",
+            text,
+            quiet.why,
+            extra={**extra, "quieted": quiet.why},
+        )
 
 
 #: Largest text file a ``$ref`` reads: the cap ``util.safe_yaml`` puts on a
@@ -905,10 +969,11 @@ def _note_pointer_without_slash(
     each value it quotes cut to an excerpt: a ref written in a thousand places
     is one warning, whatever the size of its key or its path. The file is named
     whole, its control characters spelled: a path is bounded, and its end is the
-    file's name.
+    file's name. Inside a :func:`quiet_ref_warnings` block it is a DEBUG line.
     """
     event = "ref_pointer_without_slash"
-    if not _first_time(event, ref):
+    quiet = _QUIET_REF_WARNINGS.get()
+    if not _first_time(event, ref, quiet):
         return
     # Imported here, as below: the composition is on the path ``fluid --help``
     # imports, and only a warning needs it.
@@ -918,17 +983,14 @@ def _note_pointer_without_slash(
     site = ref_location(excerpt(format_pointer(loc)), None)
     if source is not None:
         site = f"{site} in {spelled(str(source))}"
-    LOG.warning(
-        "%s: $ref '%s' %s has a JSON pointer without a leading '/', which is deprecated: a "
-        "later minor release will refuse it. Write '%s'. A JSON pointer is '' or starts "
-        "with '/' (RFC 6901); until then this one is read as '/%s'. Logged once per ref, "
-        "however many places write it.",
-        event,
-        excerpt(ref),
-        site,
-        excerpt(fix),
-        excerpt(pointer),
-        extra={"event": event, "ref": ref, "fix": fix},
+    _log_ref_warning(
+        quiet,
+        f"{event}: $ref '{excerpt(ref)}' {site} has a JSON pointer without a leading '/', "
+        f"which is deprecated: a later minor release will refuse it. Write "
+        f"'{excerpt(fix)}'. A JSON pointer is '' or starts with '/' (RFC 6901); until then "
+        f"this one is read as '/{excerpt(pointer)}'.",
+        "Logged once per ref, however many places write it.",
+        {"event": event, "ref": ref, "fix": fix},
     )
 
 
@@ -1014,24 +1076,24 @@ def _note_unknown_suffix(path: Path, suffix: str, how: str) -> None:
     Keyed on the suffix, not the file: a service composes each upload from a
     fresh temporary directory, so a file's path would warn once per upload.
     The warning names the first file met with that suffix, whole, its control
-    characters spelled.
+    characters spelled. Inside a :func:`quiet_ref_warnings` block it is a DEBUG
+    line.
     """
     event = "ref_target_suffix_unknown"
-    if not _first_time(event, suffix):
+    quiet = _QUIET_REF_WARNINGS.get()
+    if not _first_time(event, suffix, quiet):
         return
     from fluid_build.util.excerpt import excerpt, spelled
 
-    LOG.warning(
-        "%s: $ref target %s has %s, which a $ref does not know, so it was read as %s. A $ref "
-        "parses %s as JSON or YAML and reads %s as text; rename the file to the suffix that "
-        "says which it is. Logged once per suffix.",
-        event,
-        spelled(str(path)),
-        f"the suffix '{excerpt(suffix)}'" if suffix else "no suffix",
-        how,
-        ", ".join(sorted(DATA_REF_SUFFIXES)),
-        ", ".join(sorted(TEXT_REF_SUFFIXES)),
-        extra={
+    has = f"the suffix '{excerpt(suffix)}'" if suffix else "no suffix"
+    _log_ref_warning(
+        quiet,
+        f"{event}: $ref target {spelled(str(path))} has {has}, which a $ref does not know, "
+        f"so it was read as {how}. A $ref parses {', '.join(sorted(DATA_REF_SUFFIXES))} as "
+        f"JSON or YAML and reads {', '.join(sorted(TEXT_REF_SUFFIXES))} as text; rename the "
+        f"file to the suffix that says which it is.",
+        "Logged once per suffix.",
+        {
             "event": event,
             "file": str(path),
             "suffix": suffix,

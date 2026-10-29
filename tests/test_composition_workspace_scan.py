@@ -42,14 +42,15 @@ memoisation or the boundary logic is caught.
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional, Tuple
 
 import pytest
 import yaml
 
-from fluid_build import loader
+from fluid_build import contract_refs, engine, loader
 from fluid_build.forge import product_types
 from fluid_build.forge.product_types import (
     _build_product_type_index,
@@ -544,6 +545,128 @@ def test_the_debug_line_rewrites_no_path_when_the_workspace_root_is_relative(
     assert f" in {contract_file}: while parsing a flow node" in message
     assert str(contract_file.parent.parent / "contract.fluid.yaml") not in message
     assert 'in "m.yaml", line 2, column 1' in message
+
+
+#: Why the composition index quiets another product's ref warnings, as its DEBUG line says.
+_QUIETED = (
+    "A DEBUG line, not a WARNING: the composition rule read this contract only for its id "
+    "and productType."
+)
+
+
+@pytest.fixture
+def _fresh_ref_warnings(monkeypatch) -> Iterator[None]:
+    """No ambient ref root, and the ref warnings' warn-once registry, process-wide, empty."""
+    monkeypatch.delenv("FLUID_REF_ROOT", raising=False)
+    monkeypatch.setenv("FLUID_IGNORE_WORKSPACE_REF_ROOT", "1")
+    contract_refs._NOTED_REF_WARNINGS.clear()
+    yield
+    contract_refs._NOTED_REF_WARNINGS.clear()
+
+
+def _neighbours(workspace: Path) -> Tuple[Path, Path]:
+    """Tenant B keeps its metadata in a file whose suffix a ``$ref`` does not know, and
+    tenant C points into its file without the leading ``/``: composed, each logs a ref
+    warning. A consumer elsewhere in the workspace consumes neither."""
+    b = workspace / "tenant-b" / "contract.fluid.yaml"
+    b.parent.mkdir(parents=True)
+    b.write_text("id: b.x\nmetadata: {$ref: ./meta-secret.conf}\n", encoding="utf-8")
+    (b.parent / "meta-secret.conf").write_text("productType: SDP\n", encoding="utf-8")
+    c = workspace / "tenant-c" / "contract.fluid.yaml"
+    c.parent.mkdir(parents=True)
+    c.write_text("id: c.x\nmetadata: {$ref: './m-secret.yaml#meta'}\n", encoding="utf-8")
+    (c.parent / "m-secret.yaml").write_text("meta: {productType: SDP}\n", encoding="utf-8")
+    return b, c
+
+
+class _StderrAtWarning(logging.Handler):
+    """Python's last resort where the host configured no handler (uvicorn's default): each
+    WARNING written to ``sys.stderr`` as it is when the record is made, which
+    ``fluid_build.engine`` redirects into the result's ``stderr``."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        sys.stderr.write(self.format(record) + "\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fresh_ref_warnings")
+async def test_validating_a_contract_says_nothing_of_another_products_refs(tmp_path):
+    """Security: the composition index composes every workspace contract whose id or
+    productType is a ``$ref``, other tenants' too, and their ref warnings were WARNINGs:
+    ``engine.validate`` of tenant A, which consumes neither, handed A tenant B's file name
+    (``ref_target_suffix_unknown``) and tenant C's ref and path
+    (``ref_pointer_without_slash``) in its ``stderr``."""
+    (tmp_path / ".git").mkdir()
+    _neighbours(tmp_path)
+    consumer = _write_contract(
+        tmp_path / "tenant-a" / "contract.fluid.yaml",
+        product_id="a.x",
+        product_type="ADP",
+        consumes=[{"productId": "up.x", "exposeId": "out"}],
+    )
+    host = _StderrAtWarning()
+    logging.getLogger().addHandler(host)
+    try:
+        result = await engine.validate(str(consumer))
+    finally:
+        logging.getLogger().removeHandler(host)
+
+    shown = result.stdout + result.stderr
+    assert "composition_upstream_unchecked" not in shown, "the index read every file"
+    for leaked in ("tenant-b", "tenant-c", "secret", "ref_target_suffix", "ref_pointer"):
+        assert leaked not in shown, leaked
+
+
+@pytest.mark.usefixtures("_fresh_ref_warnings")
+def test_a_contract_the_index_read_still_warns_once_when_composed_itself(tmp_path, caplog):
+    """The warn-once registry is the contract author's: the index recorded B's and C's
+    warnings when it read them for A, so composing B or C afterwards said nothing. The
+    index leaves the registry alone; each still warns, once."""
+    b, c = _neighbours(tmp_path)
+    _check(tmp_path, "up.x")
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        for path in (b, c, b, c):
+            loader.load_contract(path)
+
+    said = sorted(
+        (r.event, r.levelno)  # type: ignore[attr-defined]
+        for r in caplog.records
+        if getattr(r, "event", "").startswith("ref_")
+    )
+    assert said == [
+        ("ref_pointer_without_slash", logging.WARNING),
+        ("ref_target_suffix_unknown", logging.WARNING),
+    ]
+
+
+@pytest.mark.usefixtures("_fresh_ref_warnings")
+def test_the_ref_warnings_of_a_contract_the_index_reads_are_debug_lines(tmp_path, caplog):
+    """What the index read and quieted is still in the DEBUG log, its paths spelled whole,
+    saying why it is not a WARNING."""
+    b, c = _neighbours(tmp_path)
+
+    with caplog.at_level(logging.DEBUG, logger="fluid.loader"):
+        _check(tmp_path, "up.x")
+
+    quieted = {r.event: r for r in _records(caplog) if hasattr(r, "quieted")}  # type: ignore[attr-defined]
+    assert sorted(quieted) == ["ref_pointer_without_slash", "ref_target_suffix_unknown"]
+    assert {r.levelno for r in quieted.values()} == {logging.DEBUG}
+    suffix = quieted["ref_target_suffix_unknown"].getMessage()
+    assert suffix.startswith(
+        f"ref_target_suffix_unknown: $ref target {(b.parent / 'meta-secret.conf').resolve()} "
+        "has the suffix '.conf', which a $ref does not know"
+    )
+    pointer = quieted["ref_pointer_without_slash"].getMessage()
+    assert pointer.startswith(
+        f"ref_pointer_without_slash: $ref './m-secret.yaml#meta' at JSON pointer '/metadata' "
+        f"in {c.resolve()} has a JSON pointer without a leading '/'"
+    )
+    assert suffix.endswith(_QUIETED) and pointer.endswith(_QUIETED)
 
 
 def test_for_contract_sdp_rejects_any_upstream(tmp_path):

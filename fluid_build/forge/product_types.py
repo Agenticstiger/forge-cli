@@ -593,10 +593,21 @@ def _index_entry(candidate: Path) -> Optional[Tuple[str, Optional[str]]]:
     ``None`` when the contract names no ``id``; raises when it does not
     compose. The code is ``None`` when it names neither a ``productType`` nor
     a ``layer`` that maps to one.
+
+    The contract is another product's, read for two values: its ref warnings
+    (a ``$ref`` pointer without its ``/``, a target suffix a ``$ref`` does not
+    know) are DEBUG lines here, left for its own author to see when composing
+    it (:func:`fluid_build.contract_refs.quiet_ref_warnings`). As WARNINGs they
+    named that product's files to this run, which a service hands back to its
+    caller, another tenant.
     """
+    from fluid_build.contract_refs import quiet_ref_warnings
     from fluid_build.loader import load_contract_fields
 
-    data = load_contract_fields(candidate, "id", "metadata.productType", "metadata.layer")
+    with quiet_ref_warnings(
+        "the composition rule read this contract only for its id and productType"
+    ):
+        data = load_contract_fields(candidate, "id", "metadata.productType", "metadata.layer")
     pid = data.get("id")
     if not pid:
         return None
