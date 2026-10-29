@@ -267,9 +267,11 @@ def _write_checked(
     original composed to.
 
     Fragments first and the root last, so the contract stays whole until the
-    root changes. When the split contract does not compose to the same
-    document (a part that could not be moved exactly), every file written is
-    taken back and the reason returned.
+    root changes. When a write fails, or the split contract does not compose
+    to the same document (a part that could not be moved exactly), all of it
+    is taken back: every file written, the root's old text, and every
+    directory made for them, ``--out`` included, so the tree is as it was.
+    The reason is returned.
     """
     from fluid_build.loader import compose_contract
 
@@ -281,33 +283,51 @@ def _write_checked(
         link = _symlink_on_the_way(out_dir, rel_path)
         if link is not None:
             return f"{link} is a symlink; split writes no file through one"
-    original_root: Optional[str] = None
-    if root_out.exists():
-        with open(root_out, encoding="utf-8", newline="") as handle:
-            original_root = handle.read()
+    # Every text is encoded before a file or a directory is made: one with no
+    # UTF-8 form (a lone surrogate) is refused with nothing to take back. The
+    # bytes are written as they are, so a \r in a text stays a \r.
+    data: Dict[Path, bytes] = {}
+    for rel_path, content in fragments.items():
+        try:
+            data[out_dir / rel_path] = content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            return f"{rel_path} cannot be written as UTF-8: {exc}"
+    root_data = root_text.encode("utf-8")
+    original_root: Optional[bytes] = root_out.read_bytes() if root_out.exists() else None
+    made: List[Path] = []
     written: List[Path] = []
     try:
-        for rel_path, content in fragments.items():
-            target = out_dir / rel_path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            # newline="" writes the text as it is: a \r in it stays a \r.
-            with open(target, "x", encoding="utf-8", newline="") as handle:
+        for target, content in data.items():
+            _make_dirs(target.parent, made)
+            with open(target, "xb") as handle:
+                # Taken back from here on, whatever happens to the write.
+                written.append(target)
                 handle.write(content)
-            written.append(target)
-        root_out.parent.mkdir(parents=True, exist_ok=True)
-        with open(root_out, "w", encoding="utf-8", newline="") as handle:
-            handle.write(root_text)
+        _make_dirs(root_out.parent, made)
+        with open(root_out, "wb") as handle:
+            handle.write(root_data)
         if compose_contract(root_out).document != before:
-            raise ValueError(
-                "the split contract does not compose to the original one; nothing was changed"
-            )
+            raise ValueError("the split contract does not compose to the original one")
     except Exception as exc:  # noqa: BLE001 - every failure is taken back
         for path in written:
             path.unlink(missing_ok=True)
         if original_root is not None:
-            with open(root_out, "w", encoding="utf-8", newline="") as handle:
-                handle.write(original_root)
+            root_out.write_bytes(original_root)
         elif root_out.exists():
             root_out.unlink()
-        return str(exc)
+        for directory in reversed(made):
+            directory.rmdir()
+        return f"{exc}; nothing was changed"
     return None
+
+
+def _make_dirs(directory: Path, made: List[Path]) -> None:
+    """``directory`` and each missing directory above it, every one it creates
+    added to ``made`` (``mkdir(parents=True)`` says nothing of which it made)."""
+    missing: List[Path] = []
+    while directory != directory.parent and not directory.exists():
+        missing.append(directory)
+        directory = directory.parent
+    for path in reversed(missing):
+        path.mkdir()
+        made.append(path)

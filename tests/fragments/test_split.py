@@ -2630,6 +2630,7 @@ def test_i34_an_unwritable_fragment_directory_stops_the_split_and_leaves_the_roo
     locked.mkdir(parents=True)
     locked.chmod(0o555)
     root = pair.split_contract.read_bytes()
+    before = digest(pair.split)
     try:
         assert split(pair.split_contract) == 1
     finally:
@@ -2638,6 +2639,7 @@ def test_i34_an_unwritable_fragment_directory_stops_the_split_and_leaves_the_roo
     assert "Split not written" in capsys.readouterr().err
     assert pair.split_contract.read_bytes() == root
     assert not files_of(pair.split / "fragments")  # what was written is taken back
+    assert digest(pair.split) == before  # and fragments/builds/, made for it (SP-05)
 
 
 @needs_posix_permissions
@@ -2677,15 +2679,13 @@ def test_i34_an_unwritable_root_file_is_an_unexpected_error_today(
 
 
 @pytest.mark.parametrize("failure", ["refs-it-cannot-rebase", "out-elsewhere", "lone-surrogate"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG SP-05: a refused split says 'nothing was changed' but leaves the directories it "
-    "made (an empty fragments/ changes what `fluid bundle` does without --out), and for a "
-    "failed write also the empty file it was writing",
-)
 def test_i34_a_refused_split_leaves_the_tree_exactly_as_it_was(
-    tmp_path: Path, failure: str
+    tmp_path: Path, failure: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Finding SP-05: a refusal takes back every directory it made, the whole
+    ``--out`` directory included (a leftover ``fragments/`` changes what
+    ``fluid bundle`` does without ``--out``), and the file it was writing; a
+    text with no UTF-8 form is refused before anything is made."""
     if failure == "refs-it-cannot-rebase":
         pair = solo(tmp_path, REF_INTO_A_MOVED_PART)
         args: List[Any] = []
@@ -2700,10 +2700,17 @@ def test_i34_a_refused_split_leaves_the_tree_exactly_as_it_was(
         pair = solo(tmp_path, text)
         args = ["--parts", "sql"]
     before = digest(tmp_path)
+    capsys.readouterr()
 
     assert split(pair.split_contract, *args) == 1
 
     assert digest(tmp_path) == before
+    err = capsys.readouterr().err
+    assert "Split not written" in err
+    if failure == "lone-surrogate":
+        assert "sql/t.sql cannot be written as UTF-8" in err
+    else:
+        assert err.rstrip().endswith("nothing was changed")
 
 
 @pytest.mark.parametrize("line_end", ["\n", "\r\n"], ids=["lf", "crlf"])
