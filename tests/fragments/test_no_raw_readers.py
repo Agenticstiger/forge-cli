@@ -374,7 +374,7 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
         LOADER,
         "a bundle holds the contract already composed: it parses contract.resolved.* from the "
         "tarball after the MANIFEST check, and there is no $ref left to follow",
-        *_site("_contract_loader.py", "_load_contract_from_bundle"),
+        *_site("_contract_loader.py", "_read_bundle_contract"),
     ),
     # ── read something other than a contract ──
     **_register(
