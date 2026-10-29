@@ -25,8 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moved in, pages before the index, so a run that fails while writing keeps the catalog the last
   run wrote, and one that fails while moving files in leaves no dead link. A page's slug is at most
   100 characters (a longer id ends in a hash of the whole id); a symlink planted in `--out` is
-  replaced, not written through; directories and temp files a failed or killed run left are
-  removed.
+  replaced, not written through. A run that fails removes the directories it made itself, and
+  a later run removes the temp files a killed run left beside the catalog's files, once they are
+  over an hour old.
 - **A contract that does not load is a row with its error, not a dead link.** `index.html` linked
   it to `contract-contract.html`, a page the run never wrote, and its error was only in
   `index.json`.
@@ -37,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`my [team] products`) silently gave an empty catalog. It now lists `contract.fluid.yaml`
   (`.yml`, `.json`) only, does not follow a symlinked directory, and skips a contract symlink that
   leads out of `--src`; `--files` takes a glob, which does follow links, for a tree that needs them.
-  An empty `--out` is refused before any contract is read.
+  An empty `--out` now says so, instead of a bare `[Errno 2]`.
 
 ## [0.25.0] — 2026-10-28
 
