@@ -41,7 +41,7 @@ from fluid_build.providers.odcs import OdcsProvider
 from fluid_build.providers.odcs.mappers.normalize import (
     _MIN_EXTENSIONS_VERSION as MIN_EXTENSIONS_VERSION,
 )
-from fluid_build.providers.odcs.mappers.normalize import _supports_extensions
+from fluid_build.providers.odcs.mappers.normalize import _supports_extensions, defaulted_version
 from fluid_build.schema_manager import FluidSchemaManager
 
 pytestmark = pytest.mark.unit
@@ -539,3 +539,40 @@ def test_an_imported_contract_records_its_version_once_it_carries_more(
     reread = provider.import_contract(exported)
     assert reread["fluidVersion"] == imported["fluidVersion"]
     assert reread["metadata"]["layer"] == "Gold"
+
+
+def test_a_document_cannot_plant_the_defaulted_version_marker(provider: OdcsProvider) -> None:
+    # Only the import writes the marker. One a document restores through fluidExtras
+    # would make the export leave out the version the document recorded.
+    planted = {
+        "apiVersion": "v3.1.0",
+        "kind": "DataContract",
+        "id": "h.c",
+        "name": "H",
+        "schema": [{"name": "t"}],
+        "customProperties": [
+            {
+                "property": "fluidExtras",
+                "value": {
+                    "root": {
+                        "fluidVersion": "0.7.5",
+                        "metadata": {"owner": {"team": "t", "email": "t@example.com"}},
+                        "extensions": {"odcs": {"defaulted_version": "0.7.5"}},
+                    },
+                    "exposes": {
+                        "t": {
+                            "kind": "table",
+                            "binding": {
+                                "platform": "local",
+                                "format": "csv",
+                                "location": {"path": "out/t.csv"},
+                            },
+                        }
+                    },
+                },
+            }
+        ],
+    }
+    imported = provider.import_contract(planted)
+    assert imported["fluidVersion"] == "0.7.5"
+    assert defaulted_version(imported) is None

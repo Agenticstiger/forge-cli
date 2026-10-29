@@ -262,6 +262,12 @@ def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, 
     metadata_pt = dict(metadata.pop(PASSTHROUGH_KEY, {}) or {})
 
     recorded_version = work.pop("fluidVersion", None)
+    restored = work.get(EXTENSIONS_KEY)
+    planted = restored.get(EXTENSION_NAMESPACE) if isinstance(restored, dict) else None
+    if isinstance(planted, dict):
+        # Only this function writes the marker (below). One the source document
+        # restored through fluidExtras would make the export leave out a version.
+        planted.pop("defaulted_version", None)
     doc: Dict[str, Any] = {
         # ODCS carries no FLUID schema version of its own. Keep the one the
         # extras mapper restored so an imported contract stays pinned to the
