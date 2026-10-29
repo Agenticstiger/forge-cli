@@ -100,21 +100,24 @@ A staging overlay looks like this:
 ```yaml
 # overlays/staging.yaml
 exposes:
-  - binding:
+  - exposeId: prices_daily
+    binding:
       location:
         project: staging-gcp-project
         dataset: crypto_data_staging
         region: EU
-  - binding:
+  - exposeId: prices_hourly
+    binding:
       location:
         project: staging-gcp-project
         dataset: crypto_data_staging
         region: EU
 ```
 
-One entry per expose (by position), patching only the fields you want to
-override. Everything else — `exposeId`, schema, QoS, lifecycle state — is
-preserved from the base contract.
+One entry per expose you override, matched to the base expose with the same
+`exposeId` (by position in a contract that declares a `fluidVersion` below
+0.7.6), patching only the fields you want to override. Everything else —
+schema, QoS, lifecycle state — is preserved from the base contract.
 
 ---
 
@@ -296,12 +299,17 @@ expose port means:
 ## Environment Overlay Deep Merge
 
 When `--overlay` is supplied, the CLI calls `load_with_overlay()` which
-performs a **positional deep merge** of the overlay's `exposes` list into the
-base contract's `exposes` list before any generation happens. This means:
+deep-merges the overlay's `exposes` list into the base contract's `exposes`
+list before any generation happens. This means:
 
-- Overlay entry at index `0` patches base entry at index `0`, and so on
+- An overlay entry patches the base entry with the same `exposeId`, and one
+  that names no base entry is added (logged as `overlay_entry_added`). A
+  contract that declares a `fluidVersion` below 0.7.6 merges by position
+  instead: the entry at index `0` patches the base entry at index `0`, and an
+  entry whose `exposeId` differs from the base entry's logs
+  `overlay_patch_retargeted`
 - Only the fields present in the overlay entry are changed
-- All other fields (`exposeId`, `schema`, `qos`, `lifecycle`) are untouched
+- All other fields (`schema`, `qos`, `lifecycle`) are untouched
 - Both the ODPS product record and the ODCS contracts see the merged result
 
 This is the same mechanism used by `fluid bundle --format yaml --env staging`
