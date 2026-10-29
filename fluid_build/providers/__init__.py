@@ -464,8 +464,12 @@ def discover_providers(logger: Optional[logging.Logger] = None, *, force: bool =
             )
             return
 
-        # What the policy removes is recorded afresh: it may have changed since.
-        POLICY_BLOCKED.clear()
+        # What the policy now allows is no longer blocked. A name it still
+        # blocks stays recorded: one registered at import time (redshift, by
+        # the aws package) is not offered again when its module is cached.
+        from fluid_build.plugin_manager import is_allowed
+
+        POLICY_BLOCKED.difference_update({n for n in POLICY_BLOCKED if is_allowed(n)})
 
         # 0) entry-point plugins (third-party packages)
         _discover_entrypoints(logger)
