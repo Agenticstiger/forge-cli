@@ -1163,6 +1163,72 @@ def test_j07_a_new_file_gets_the_mode_the_umask_gives_and_a_replaced_one_keeps_i
     assert stat.S_IMODE((out / "index.json").stat().st_mode) == 0o644
 
 
+class _OsWith:
+    """The ``os`` module with some of its functions replaced, for docs_build alone."""
+
+    def __init__(self, **replaced: Any) -> None:
+        self.__dict__.update(replaced)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(os, name)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes and symlinks")
+def test_j07_a_symlink_renamed_over_a_temp_file_never_gets_the_kept_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kept mode was set by path after the temp file was opened, so a symlink renamed over
+    the temp name in between took it: a 0600 secret.key became 0777. It is set on the open
+    descriptor now."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+    (out / "index.html").chmod(0o777)  # the next run keeps this mode
+    secret = _write(tmp_path / "secret.key", "key\n")
+    secret.chmod(0o600)
+
+    def swap_after_open(path: str, flags: int, mode: int = 0o777, **kw: Any) -> int:
+        fd = os.open(path, flags, mode, **kw)
+        if os.path.basename(path).startswith(".index.html."):
+            (tmp_path / "swap").symlink_to(secret)
+            os.replace(tmp_path / "swap", path)
+        return fd
+
+    monkeypatch.setattr(docs_build, "os", _OsWith(open=swap_after_open))
+
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    assert stat.S_IMODE(secret.stat().st_mode) == 0o600
+    assert secret.read_text(encoding="utf-8") == "key\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+@pytest.mark.parametrize("whose", ["a-file-with-a-second-name", "another-users-file"])
+def test_j07_a_replaced_file_keeps_its_mode_only_when_it_is_this_users_with_one_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, whose: str
+) -> None:
+    """A mode someone else chose (their file, or a hard link to one) is not given to a page."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    umask = os.umask(0o022)
+    try:
+        assert _docs(tmp_path / "src", out, src=True) == 0
+        (out / "index.html").chmod(0o666)
+        if whose == "a-file-with-a-second-name":
+            os.link(out / "index.html", tmp_path / "second-name.html")
+        else:
+            monkeypatch.setattr(docs_build, "os", _OsWith(getuid=lambda: os.getuid() + 1))
+        assert _docs(tmp_path / "src", out, src=True) == 0
+    finally:
+        os.umask(umask)
+
+    assert stat.S_IMODE((out / "index.html").stat().st_mode) == 0o644
+
+
 def _docs_error(source: Path, out: Path) -> str:
     """The error ``fluid docs --src <source> --out <out>`` stops with."""
     from fluid_build.cli import docs_build

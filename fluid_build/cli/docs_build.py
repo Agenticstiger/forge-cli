@@ -187,13 +187,22 @@ def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
         raise
 
 
+def _mine(st: os.stat_result) -> bool:
+    """Whether this user owns what ``st`` describes (never, where there are no uids)."""
+    getuid = getattr(os, "getuid", None)
+    return getuid is not None and st.st_uid == getuid()
+
+
 def _stage(target: str, data: bytes) -> str:
     """``data`` in a new temp file in ``target``'s directory; the temp file's path.
 
     Made as click's atomic ``open_file`` makes its temp file: ``O_EXCL``, with
     the mode the umask gives (as ``open()`` did; not mkstemp's ``0o600``, the
-    catalog is there to be served), or the mode of the file it will replace.
-    A directory where the file goes is refused here, before any file of the
+    catalog is there to be served), or the mode of the file it will replace
+    when that file is this user's own and has no other name: never a mode
+    someone else chose. The mode is set on the open descriptor, never by path,
+    so a symlink renamed over the temp name meanwhile is not followed. A
+    directory where the file goes is refused here, before any file of the
     catalog is replaced.
     """
     try:
@@ -203,7 +212,12 @@ def _stage(target: str, data: bytes) -> str:
     if current is not None and stat.S_ISDIR(current.st_mode):
         raise IsADirectoryError(f"{target} is a directory")
     own: int | None = None
-    if current is not None and stat.S_ISREG(current.st_mode):
+    if (
+        current is not None
+        and stat.S_ISREG(current.st_mode)
+        and _mine(current)
+        and current.st_nlink == 1
+    ):
         own = current.st_mode & 0o777
     directory, name = os.path.split(target)
     # O_EXCL: never an existing file, nor a symlink someone put at this name.
@@ -211,9 +225,12 @@ def _stage(target: str, data: bytes) -> str:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     fd = os.open(temp, flags, 0o666 if own is None else own)
     try:
-        with open(fd, "wb") as f:
-            if own is not None:
-                os.chmod(temp, own)  # the bits the umask took off
+        with open(fd, "wb") as f:  # closes the descriptor however this ends
+            if own is not None:  # the bits the umask took off, before a byte is written
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, own)
+                else:  # pragma: no cover - Windows before 3.13, which has no uids to match
+                    os.chmod(temp, own)
             f.write(data)
     except BaseException:
         with contextlib.suppress(OSError):
