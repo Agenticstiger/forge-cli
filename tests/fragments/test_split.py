@@ -3166,6 +3166,93 @@ def test_i34_an_interrupt_halfway_takes_the_split_back_and_goes_on(
         assert digest(tmp_path) == before
 
 
+def _run_split(contract: Path, parts: str) -> None:
+    """``fluid split <contract> --parts <parts>`` through the command's ``run``,
+    so an interrupt it lets go on reaches the caller (the CLI would report it)."""
+    import argparse
+    import logging
+
+    from fluid_build.cli import split as split_command
+
+    args = argparse.Namespace(contract=str(contract), out=None, parts=parts, dry_run=False)
+    split_command.run(args, logging.getLogger("test"))
+
+
+def test_i34_an_interrupt_just_as_the_root_is_opened_puts_the_root_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C1, the open: ``open(root, "wb")`` empties the root before it returns, and
+    the flag that sent the take-back to it was set after that. An interrupt just
+    then left the contract empty. The root is now put back whenever its bytes
+    differ, from the moment the write reaches it."""
+    import builtins
+
+    from fluid_build.cli import split as split_command
+
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    before = digest(tmp_path)
+
+    def emptied_then_interrupted(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        handle = builtins.open(file, mode, *args, **kwargs)
+        if mode == "wb" and Path(file) == pair.split_contract:
+            handle.close()
+            raise KeyboardInterrupt
+        return handle
+
+    monkeypatch.setattr(split_command, "open", emptied_then_interrupted, raising=False)
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_split(pair.split_contract, "builds,exposes")
+
+    assert pair.split_contract.read_bytes() == SPLIT_ALL.encode("utf-8")
+    assert digest(tmp_path) == before
+
+
+@pytest.mark.parametrize("first", ["an-interrupt-at-the-check", "a-refusal-at-the-check"])
+def test_i34_an_interrupt_during_the_take_back_puts_the_root_back_first_and_goes_on(
+    tmp_path: Path, first: str
+) -> None:
+    """C1, the take-back: it removed the fragments before it put the root back,
+    and an interrupt in it (a second Ctrl-C) stopped it there: a split root over
+    fragments it had removed. The root goes back first now, every step runs all
+    the same, and the first interrupt goes on at the end, also when what was
+    being taken back was a plain refusal."""
+    text = SPLIT_ALL if first == "an-interrupt-at-the-check" else REF_INTO_A_MOVED_PART
+    pair = make_pair(tmp_path, {NAME: text})
+    real_compose = loader.compose_contract
+    real_unlink = Path.unlink
+    unlinked: List[Path] = []
+    root_when_cut: List[bytes] = []
+
+    def check(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if first == "an-interrupt-at-the-check" and (pair.split / "fragments").exists():
+            raise KeyboardInterrupt
+        return real_compose(path, *args, **kwargs)
+
+    def unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        unlinked.append(self)
+        if len(unlinked) == 1:
+            # Were the take-back cut short here (a kill, not an exception), the
+            # contract would be what it is now.
+            root_when_cut.append(pair.split_contract.read_bytes())
+            raise KeyboardInterrupt
+        real_unlink(self, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(loader, "compose_contract", check)
+        patch.setattr(Path, "unlink", unlink)
+        with pytest.raises(KeyboardInterrupt):
+            _run_split(pair.split_contract, "builds,exposes")
+
+    assert root_when_cut == [text.encode("utf-8")]  # the root went back before any fragment
+    assert pair.split_contract.read_text("utf-8") == text
+    left = sorted(set(files_of(pair.split)) - set(files_of(pair.flat)))
+    assert left == [unlinked[0].relative_to(pair.split).as_posix()]  # the others went
+    assert compose_contract(pair.split_contract).document == (
+        compose_contract(pair.flat_contract).document
+    )
+
+
 def test_i34_a_write_that_fails_takes_back_the_file_it_was_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

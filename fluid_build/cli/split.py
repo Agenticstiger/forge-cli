@@ -367,7 +367,7 @@ def _write_checked(
     original_root: Optional[bytes] = root_out.read_bytes() if root_out.exists() else None
     made: List[Path] = []
     written: List[Path] = []
-    root_opened = False
+    root_reached = False
     try:
         for target, encoded in data.items():
             _make_dirs(target.parent, made)
@@ -376,19 +376,24 @@ def _write_checked(
                 written.append(target)
                 handle.write(encoded)
         _make_dirs(root_out.parent, made)
+        # Before the open, not after it: open() truncates the root before it
+        # returns, so an interrupt that comes just then finds it empty.
+        root_reached = True
         with open(root_out, "wb") as handle:
-            root_opened = True
             handle.write(root_data)
         if compose_contract(root_out).document != before:
             raise ValueError("the split contract does not compose to the original one")
     except BaseException as exc:  # noqa: BLE001 - every failure is taken back
-        left = _take_back(written, root_out if root_opened else None, original_root, made)
-        if not isinstance(exc, Exception):
-            # Ctrl-C or an exit, halfway: the unchecked split is taken back all the
-            # same, and the interrupt goes on.
+        left, interrupted = _take_back(
+            written, root_out if root_reached else None, original_root, made
+        )
+        # Ctrl-C or an exit, halfway or during the take-back: the unchecked split
+        # is taken back all the same, and the first interrupt goes on.
+        interrupt = interrupted if isinstance(exc, Exception) else exc
+        if interrupt is not None:
             if left:
                 sys.stderr.write(f"❌ Split interrupted; could not take back {'; '.join(left)}\n")
-            raise
+            raise interrupt
         if left:
             return f"{exc}; and split could not take back {'; '.join(left)}"
         return f"{exc}; nothing was changed"
@@ -397,27 +402,45 @@ def _write_checked(
 
 def _take_back(
     written: List[Path], root_out: Optional[Path], original_root: Optional[bytes], made: List[Path]
-) -> List[str]:
-    """Undo a split that failed halfway: remove the files ``written``, put the
-    root back when it was opened for writing (``root_out``; a root that could
-    not be opened, a read-only one, is as it was), then remove the directories
-    ``made``, deepest first. Every step is tried, whatever an earlier one did,
-    and none raises: what could not be undone comes back, one line per path."""
-    steps: List[Tuple[Path, Callable[[], Any]]] = [
-        (path, functools.partial(path.unlink, missing_ok=True)) for path in written
-    ]
-    if root_out is not None and original_root is not None:
-        steps.append((root_out, functools.partial(root_out.write_bytes, original_root)))
-    elif root_out is not None:
-        steps.append((root_out, functools.partial(root_out.unlink, missing_ok=True)))
+) -> Tuple[List[str], Optional[BaseException]]:
+    """Undo a split that failed halfway.
+
+    The root first (``root_out``, ``None`` when the write never reached it):
+    written back when its bytes differ from ``original_root``, so a read-only
+    one that could not be opened is left alone; removed when it was not there
+    before. Then the files ``written``, then the directories ``made``, deepest
+    first. The root goes first, so an undo cut short leaves the contract as it
+    was, not a split root whose fragments are gone.
+
+    Every step is tried whatever an earlier one did, an interrupt (a second
+    Ctrl-C) included, and none raises. Returns what could not be undone, one
+    entry per path, and the first interrupt, for the caller to raise again.
+    """
+    steps: List[Tuple[Path, Callable[[], Any]]] = []
+    if root_out is not None:
+        steps.append((root_out, functools.partial(_put_back, root_out, original_root)))
+    steps += [(path, functools.partial(path.unlink, missing_ok=True)) for path in written]
     steps += [(directory, directory.rmdir) for directory in reversed(made)]
     left: List[str] = []
+    interrupt: Optional[BaseException] = None
     for path, step in steps:
         try:
             step()
-        except Exception as exc:  # noqa: BLE001 - reported; the next step still runs
-            left.append(f"{path}: {getattr(exc, 'strerror', None) or exc}")
-    return left
+        except BaseException as exc:  # noqa: BLE001 - reported; the next step still runs
+            why = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+            left.append(f"{path}: {why}")
+            if interrupt is None and not isinstance(exc, Exception):
+                interrupt = exc
+    return left, interrupt
+
+
+def _put_back(root: Path, original: Optional[bytes]) -> None:
+    """``root`` as it was before the split: ``original`` written back when its
+    bytes differ from it, or removed when there was none."""
+    if original is None:
+        root.unlink(missing_ok=True)
+    elif not root.is_file() or root.read_bytes() != original:
+        root.write_bytes(original)
 
 
 def _make_dirs(directory: Path, made: List[Path]) -> None:
