@@ -26,6 +26,7 @@ import math
 import os
 import re
 import stat
+import time
 from typing import Any, Mapping
 
 from ._common import CLIError, load_contract_with_overlay
@@ -226,6 +227,12 @@ def _take_back(made: list[tuple[str, int, int]]) -> None:
 #: The name :func:`_stage` gives a temp file: ``.<target name>.<16 hex>.tmp``.
 _TEMP_NAME = re.compile(r"\.(.+)\.[0-9a-f]{16}\.tmp")
 
+#: How long since it was last written before a temp file is taken for one a
+#: killed run left. A run between writing its temp files and moving them in
+#: has younger ones, and an hour is far longer than any run takes; git prune
+#: likewise removes a ``tmp_obj_`` file only once it is older than its expiry.
+_STALE_AFTER_SECONDS = 3600
+
 
 def _remove_stale_temps(out: str, names: set[str]) -> None:
     """Remove the temp files a killed run left in ``out`` for any of ``names``.
@@ -233,21 +240,26 @@ def _remove_stale_temps(out: str, names: set[str]) -> None:
     A run killed between writing its temp files and replacing the catalog with
     them (SIGKILL, a power cut) leaves them, and no later run would. Only a
     regular file of this user, named exactly as :func:`_stage` names a temp
-    file of one of ``names``, is removed: never a symlink, nor a file of
-    someone else's. Best effort: an ``out`` that cannot be listed is left.
+    file of one of ``names``, and last written over an hour ago
+    (:data:`_STALE_AFTER_SECONDS`, far longer than a run takes, so never one
+    of a run still at work on this catalog), is removed: never a symlink, nor
+    a file of someone else's. Best effort: an ``out`` that cannot be listed is
+    left.
     """
     try:
         with os.scandir(out) as listing:
             entries = list(listing)
     except OSError:
         return
+    now = time.time()
     for entry in entries:
         temp = _TEMP_NAME.fullmatch(entry.name)
         if temp is None or temp.group(1) not in names:
             continue
         with contextlib.suppress(OSError):  # gone already, or not ours to look at
             found = entry.stat(follow_symlinks=False)
-            if stat.S_ISREG(found.st_mode) and _mine(found):
+            stale = now - found.st_mtime > _STALE_AFTER_SECONDS
+            if stat.S_ISREG(found.st_mode) and _mine(found) and stale:
                 os.unlink(entry.path)
 
 

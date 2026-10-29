@@ -1500,20 +1500,32 @@ _NOT_A_TEMP_OF_THIS_RUN = [
 ]
 
 
+def _left_behind(path: Path, seconds_ago: float = 7200) -> Path:
+    """A file last written ``seconds_ago`` (by default two hours ago, by a killed run)."""
+    _write(path, "left behind\n")
+    then = time.time() - seconds_ago
+    os.utime(path, (then, then))
+    return path
+
+
 @pytest.mark.skipif(os.name == "nt", reason="file owners and symlinks")
 def test_j07_a_run_removes_the_temp_files_a_killed_run_left_and_nothing_else(
     tmp_path: Path,
 ) -> None:
     """A run killed between writing its temp files and replacing the catalog (SIGKILL at
     os.replace) left ``.<name>.<16 hex>.tmp`` files that no later run removed. The next run
-    removes those of its own file names, when they are regular files of this user."""
+    removes those of its own file names, when they are regular files of this user last
+    written over an hour ago."""
     _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
     out = tmp_path / "site"
     assert _docs(tmp_path / "src", out, src=True) == 0
     for name in _LEFT_BY_A_KILLED_RUN + _NOT_A_TEMP_OF_THIS_RUN:
-        _write(out / name, "left behind\n")
+        _left_behind(out / name)
     victim = _write(tmp_path / "victim.txt", "not the catalog's\n")
-    (out / ".index.html.1111111111111111.tmp").symlink_to(victim)
+    link = out / ".index.html.1111111111111111.tmp"
+    link.symlink_to(victim)
+    then = time.time() - 7200
+    os.utime(link, (then, then), follow_symlinks=False)  # as old as a killed run's: only a link
 
     assert _docs(tmp_path / "src", out, src=True) == 0
 
@@ -1534,12 +1546,32 @@ def test_j07_a_temp_file_of_another_user_is_left_where_it_is(
     out = tmp_path / "site"
     assert _docs(tmp_path / "src", out, src=True) == 0
     for name in _LEFT_BY_A_KILLED_RUN:
-        _write(out / name, "left behind\n")
+        _left_behind(out / name)
     monkeypatch.setattr(docs_build, "os", _OsWith(geteuid=lambda: os.geteuid() + 1))
 
     assert _docs(tmp_path / "src", out, src=True) == 0
 
     assert set(_LEFT_BY_A_KILLED_RUN) <= {p.name for p in out.iterdir()}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="file owners")
+def test_j07_a_temp_file_written_within_the_hour_is_a_live_runs_and_is_left(
+    tmp_path: Path,
+) -> None:
+    """The sweep took the temp files of a run of the same user writing the same --out at that
+    moment (which then failed at its first replace). It takes only a temp file last written
+    over an hour ago: one of 61 minutes goes, one of 59 stays."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+    old = _left_behind(out / ".index.json.0123456789abcdef.tmp", seconds_ago=61 * 60)
+    live = _left_behind(out / ".index.json.fedcba9876543210.tmp", seconds_ago=59 * 60)
+    fresh = _left_behind(out / ".index.html.00000000000000aa.tmp", seconds_ago=0)
+
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    assert not old.exists()
+    assert live.exists() and fresh.exists()
 
 
 def test_j07_a_first_run_that_fails_to_render_leaves_no_out_behind(
