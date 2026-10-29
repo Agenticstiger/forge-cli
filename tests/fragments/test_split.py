@@ -2686,6 +2686,27 @@ def test_i29_a_hard_link_to_the_contract_in_out_is_not_written_through(
     assert digest(tmp_path) == before
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="needs hard links")
+def test_i29_a_copy_in_out_that_is_a_hard_link_to_a_third_file_is_not_written_through(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-11: a byte-for-byte copy may be written over, but not one that is also
+    another name of a third file: the root is written in place, so that file
+    would change too."""
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    victim = write(tmp_path / "victim" / NAME, SPLIT_ALL)
+    out = tmp_path / "elsewhere"
+    out.mkdir()
+    os.link(victim, out / NAME)
+    before = digest(tmp_path)
+
+    assert split(pair.split_contract, "--out", out) == 1
+
+    assert f"Split not written: {out / NAME} already" in capsys.readouterr().err
+    assert digest(tmp_path) == before
+    assert victim.read_text("utf-8") == SPLIT_ALL
+
+
 # ── I-30: an alias bomb ─────────────────────────────────────────────────
 
 

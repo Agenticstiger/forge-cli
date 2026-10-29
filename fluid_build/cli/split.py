@@ -232,10 +232,10 @@ def _unsafe_target(out_dir: Path, root_out: Path, rel_paths: Iterable[str]) -> O
 def _root_in_the_way(contract_path: Path, root_out: Path, before: Dict[str, Any]) -> Optional[str]:
     """Why the root cannot be written to ``root_out``, a file already there, if it
     cannot. Split writes over no file but the contract it splits in place; a
-    byte-for-byte copy of it may be written over too, as nothing is lost. Any
-    other file is refused, a split of this contract written there before
-    included: a second split beside it would only add '-2' copies and leave
-    the first one's fragments unreferenced."""
+    byte-for-byte copy of it that is the only name of its file may be written
+    over too, as nothing is lost. Any other file is refused, a split of this
+    contract written there before included: a second split beside it would
+    only add '-2' copies and leave the first one's fragments unreferenced."""
     from fluid_build.loader import compose_contract
 
     if not root_out.exists():
@@ -245,12 +245,16 @@ def _root_in_the_way(contract_path: Path, root_out: Path, before: Dict[str, Any]
             # The contract itself, unless it is another link to it elsewhere.
             if root_out.parent.samefile(contract_path.parent):
                 return None
-        elif (
-            root_out.is_file()
-            and root_out.stat().st_size == contract_path.stat().st_size
-            and root_out.read_bytes() == contract_path.read_bytes()
-        ):
-            return None
+        elif root_out.is_file():
+            info = root_out.stat()
+            # The root is written in place: a copy that is also another name
+            # of a third file (a hard link) would change that file too.
+            if (
+                info.st_nlink == 1
+                and info.st_size == contract_path.stat().st_size
+                and root_out.read_bytes() == contract_path.read_bytes()
+            ):
+                return None
     except OSError:
         pass  # what cannot be compared is another file
     try:
