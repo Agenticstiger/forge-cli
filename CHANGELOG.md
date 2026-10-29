@@ -93,9 +93,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `apply_plan_runs_outside_forge` (exit 2) on the local provider, even with `--provider local`;
   apply the contract file instead. (`--mode amend-and-build` and `replace-and-build` hand both to
   the build runner, which this change does not touch.)
-
-### Upgrade notes
-
 - **`fluid bundle` no longer writes `contract.bundled.fluid.yaml` on its own.** A script that
   bundled a split contract and then read that file must pass `--out contract.bundled.fluid.yaml`.
   A `contract.bundled.fluid.yaml` an earlier `fluid ship` left beside a contract is a tarball, and
