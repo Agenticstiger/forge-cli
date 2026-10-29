@@ -19,7 +19,7 @@
 
 The world-class bootstrap fills context fields one answer at a time
 (``project_goal`` → ``data_product_type`` → ``domain`` → ``owner_team``
-→ …). After each answer this module re-shapes a v0.7.3 contract from
+→ …). After each answer this module re-shapes a contract (the v0.7.3 shape) from
 the current context and renders it next to the prompt so the user can
 see the contract growing in real time.
 
@@ -37,7 +37,7 @@ LOG = logging.getLogger(__name__)
 
 
 def shape_contract_from_context(ctx: Mapping[str, Any]) -> Dict[str, Any]:
-    """Shape a partial v0.7.3 contract from whatever the user has answered.
+    """Shape a partial contract from whatever the user has answered.
 
     Accepts an empty context — emits a placeholder contract.
     Accepts a fully-answered context — emits a complete schema-valid
@@ -64,8 +64,12 @@ def shape_contract_from_context(ctx: Mapping[str, Any]) -> Dict[str, Any]:
     domain = (ctx.get("domain") or "—").strip()
     owner_team = (ctx.get("owner_team") or ctx.get("owner") or "—").strip()
 
+    # The newest stable bundled schema, never a literal (one goes stale every release);
+    # imported here so jsonschema stays off the --help path.
+    from fluid_build.schema_manager import FluidSchemaManager
+
     contract: Dict[str, Any] = {
-        "fluidVersion": "0.7.3",
+        "fluidVersion": FluidSchemaManager.latest_bundled_version(),
         "kind": "DataProduct",
         "id": _suggest_id(name, domain, layer),
         "name": name,

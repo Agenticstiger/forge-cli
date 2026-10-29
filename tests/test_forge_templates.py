@@ -24,6 +24,7 @@ from fluid_build.forge.core.interfaces import (
     TemplateMetadata,
 )
 from fluid_build.forge.templates.analytics import AnalyticsTemplate
+from fluid_build.schema_manager import FluidSchemaManager
 
 logger = logging.getLogger("test_forge_templates")
 
@@ -165,9 +166,10 @@ class TestGenerateContract:
         ctx = _make_context()
         contract = template.generate_contract(ctx)
         assert "fluidVersion" in contract
-        # Templates emit v0.7.3 directly via the spec-driven builder.
-        # v0.5.7 was the legacy shape that the runtime had to coerce.
-        assert contract["fluidVersion"] == "0.7.3"
+        # Templates build the v0.7.3 shape via the spec-driven builder and
+        # declare the newest stable schema, which accepts it. v0.5.7 was the
+        # legacy shape that the runtime had to coerce.
+        assert contract["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
 
     def test_has_kind_data_product(self):
         template = AnalyticsTemplate()
@@ -213,9 +215,13 @@ class TestGenerateContract:
             for e in exposes
         )
         # Or the per-expose block may be absent entirely if SLO is
-        # optional for this template — we just confirm the contract
-        # validates against the v0.7.3 schema (caller handles).
-        assert has_per_expose_slo or contract.get("fluidVersion") == "0.7.3"
+        # optional for this template: then the contract must still validate
+        # against the schema of the version it declares.
+        if not has_per_expose_slo:
+            result = FluidSchemaManager().validate_contract(
+                contract, contract["fluidVersion"], offline_only=True
+            )
+            assert result.is_valid, result.errors
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +395,9 @@ class TestTemplateSemantics:
         schema_manager = FluidSchemaManager()
         for template in self._all_templates():
             contract = template.generate_contract(_make_context())
-            result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+            result = schema_manager.validate_contract(
+                contract, contract["fluidVersion"], offline_only=True
+            )
             assert result.is_valid, f"{type(template).__name__}: {result.errors[:3]}"
 
     def test_analytics_derivation_shape(self):

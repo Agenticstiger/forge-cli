@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
@@ -40,6 +40,13 @@ LOG = logging.getLogger("fluid.forge.product_types")
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+
+
+def _latest_stable_schema() -> str:
+    """The newest STABLE bundled schema version."""
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    return FluidSchemaManager.latest_bundled_version()
 
 
 @dataclass(frozen=True)
@@ -771,7 +778,11 @@ class ProductTypeAnswer:
     owner_team: str = "data-team"
     owner_email: str = "data-team@example.com"
     description: Optional[str] = None
-    fluid_version: str = "0.7.3"
+    # default_factory, not a literal: a dataclass default is evaluated once at
+    # class-creation time, so a literal here freezes the version at whatever was
+    # current when it was typed. Lazily imported inside the factory to keep
+    # jsonschema off the --help path.
+    fluid_version: str = field(default_factory=_latest_stable_schema)
 
     # SDP-specific
     source_kind: Optional[str] = None

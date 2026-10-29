@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`fluid import`, `fluid product-new`, `fluid init --discover`, `fluid forge data-model
+  from-source` and the `fluid forge --scaffold` templates declare the newest stable schema, 0.7.5,
+  not 0.7.3**, two stable versions behind the templates #619 moved, so a contract they wrote
+  started without what 0.7.4 and 0.7.5 added. They read the newest stable bundled schema now, so
+  a promoted preview moves them too (as do the forge interview's live preview and the
+  product-type scaffold library). The shape they write is unchanged, and 0.7.5 accepts it wherever
+  0.7.3 did. The market blueprints (`fluid init --blueprint`, `fluid market --instantiate`) and
+  the gcp and snowflake quickstarts still declare 0.7.4.
 - **`fluid bundle` without `--out` (or with `--out -`) does what its help says on every
   contract.** With a `fragments/` directory beside the contract, `yaml` and `json` went to a file,
   `contract.bundled.fluid.yaml`, instead of stdout, so `fluid bundle contract.fluid.yaml | ...`
@@ -108,6 +116,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- Running `fluid import` again over a contract it wrote before changes the contract's
+  `fluidVersion` line from 0.7.3 to 0.7.5.
 - `fluid apply` stops with `apply_platform_unsupported`, exit code 2 as before, where a platform
   the contract declares has no provider; in `fluid apply`, `provider_unknown` now means a
   `--provider` value no provider has. A contract with an expose on such a platform beside the
