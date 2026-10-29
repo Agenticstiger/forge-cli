@@ -143,8 +143,8 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     # ── schema / version ───────────────────────────────────────────────────
     "invalid_schema_version": (
         [
-            "Set a supported fluidVersion (current line: 0.7.x)",
-            "Run 'fluid validate <contract>' to see the supported versions",
+            "Use a supported version (current line: 0.7.x) in fluidVersion or --schema-version",
+            "Run 'fluid validate --list-versions' to see the supported versions",
         ],
         "schema-evolution",
     ),
