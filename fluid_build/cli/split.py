@@ -385,7 +385,9 @@ def _write_checked(
             handle.write(root_data)
         if compose_contract(root_out).document != before:
             raise ValueError("the split contract does not compose to the original one")
-    except BaseException as exc:  # noqa: BLE001 - every failure is taken back
+    except Exception as exc:  # every failure is taken back
+        return _taken_back(exc, written, root_out if root_reached else None, original_root, made)
+    except (KeyboardInterrupt, SystemExit) as exc:  # an interrupt too, then raised again
         return _taken_back(exc, written, root_out if root_reached else None, original_root, made)
     return None
 
@@ -464,12 +466,18 @@ def _take_back(
     for path, step in steps:
         try:
             step()
-        except BaseException as exc:  # noqa: BLE001 - reported; the next step still runs
-            why = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
-            left.append(f"{path}: {why}")
-            if interrupt is None and not isinstance(exc, Exception):
+        except Exception as exc:  # reported; the next step still runs
+            left.append(f"{path}: {_why(exc)}")
+        except (KeyboardInterrupt, SystemExit) as exc:  # the same, and raised again after
+            left.append(f"{path}: {_why(exc)}")
+            if interrupt is None:
                 interrupt = exc
     return left, interrupt
+
+
+def _why(exc: BaseException) -> str:
+    """What stopped a take-back step: the OS's reason, the message, or the name."""
+    return getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
 
 
 def _put_back(root: Path, original: Optional[bytes]) -> None:
