@@ -87,7 +87,8 @@ def test_current_preview_does_not_become_the_default():
     # PREVIEW_VERSIONS must never be the default for untagged contracts — the
     # default stays the latest STABLE, so plan.json format_version (and
     # digests) only move on a deliberate GA promotion.
-    # (0.7.5 was promoted to stable on 2026-07-18; 0.7.6 is the open preview.)
+    # (0.7.5 was promoted to stable on 2026-07-18 and 0.7.6 on 2026-10-29, by
+    # #752; 0.7.7 is the open preview.)
     assert "0.7.5" not in SchemaManager.PREVIEW_VERSIONS  # promoted to stable (GA)
     for preview in SchemaManager.PREVIEW_VERSIONS:
         assert SchemaManager.latest_bundled_version() != preview

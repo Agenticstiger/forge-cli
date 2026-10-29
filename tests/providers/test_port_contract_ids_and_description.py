@@ -73,8 +73,8 @@ def _contract(
 ) -> Dict[str, Any]:
     """A 0.7.6 contract declared the documented way.
 
-    0.7.6 is a PREVIEW schema version, so it is validatable only because the
-    contract declares it — see ``FluidSchemaManager.PREVIEW_VERSIONS``.
+    0.7.6 is the version that added the fields these cases use. It opened as a
+    preview and is stable since #752; the contract declares it either way.
     """
     contract_block: Dict[str, Any] = {}
     if contract_id is not None:
@@ -326,12 +326,14 @@ class TestPinnedContractId:
 class TestImportedContractId:
     """An id the product already answers to must survive the round-trip.
 
-    The imported document cannot carry it in ``exposes[].contract.id``: an
-    import is pinned to the current STABLE FLUID schema, whose
-    ``exposeContract`` is closed, so the field would make every imported
-    contract fail ``fluid validate``. It rides in the per-expose pass-through
-    bucket instead, which is what the exporters read when the contract pins
-    nothing itself.
+    At a version without ``exposeContract.id`` (anything before 0.7.6) the
+    imported document cannot carry it in ``exposes[].contract.id``: the field
+    would make the contract fail ``fluid validate``. It rides in the per-expose
+    pass-through bucket instead, which is what the exporters read when the
+    contract pins nothing itself. This bundle records no version, so it imports
+    at the stable default, which since #752 is 0.7.6 and takes the id in the
+    field as well; tests/providers/test_odps_import_version_pin.py pins the
+    bucket-only path at a version without it.
     """
 
     FOREIGN_ID = "9f1c2b34-5d6e-47a8-b9c0-1d2e3f4a5b6c"

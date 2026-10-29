@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Schema surface of ``sink.catalogAuth`` (0.7.6 preview only).
+"""Schema surface of ``sink.catalogAuth`` (new in 0.7.6).
 
 The ``*Env`` fields hold an environment variable NAME, so a secret pasted in
 their place fails the schema, and the schema error does not quote it
@@ -129,7 +129,7 @@ def _errors(version: str, catalog_auth: Any) -> list:
     ],
     ids=["lakekeeper", "audience-resource", "polaris", "unity-bearer"],
 )
-def test_preview_accepts_catalog_auth(catalog_auth):
+def test_076_accepts_catalog_auth(catalog_auth):
     assert _errors("0.7.6", catalog_auth) == []
 
 
@@ -179,7 +179,7 @@ def test_ga_075_refuses_the_key():
         ({**_OAUTH2, "resource": "urn:${RES}"}, "resource: must not match"),
     ],
 )
-def test_preview_refuses_a_malformed_catalog_auth(catalog_auth, expected):
+def test_076_refuses_a_malformed_catalog_auth(catalog_auth, expected):
     errors = _errors("0.7.6", catalog_auth)
     assert any(expected in e for e in errors), errors
 

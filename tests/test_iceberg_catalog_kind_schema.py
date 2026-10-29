@@ -14,7 +14,7 @@
 
 """Schema surface for the Iceberg catalog kinds (Lakekeeper, Polaris).
 
-``sink.catalog`` is an enum, and before the open 0.7.6 preview it had no
+``sink.catalog`` is an enum, and before 0.7.6 it had no
 ``lakekeeper`` or ``polaris`` member, so a build could name the catalog only
 on the expose's free-string ``location.catalog``. 0.7.6 accepts both; 0.7.5
 is GA and frozen, so it keeps refusing them. The kind table in
@@ -113,7 +113,7 @@ def test_base_contract_is_valid(version: str) -> None:
 
 
 @pytest.mark.parametrize("catalog", ["lakekeeper", "polaris"])
-def test_preview_accepts_the_new_sink_catalogs(catalog: str) -> None:
+def test_076_accepts_the_new_sink_catalogs(catalog: str) -> None:
     contract = _contract("0.7.6", sink_catalog=catalog, location=dict(_LAKEKEEPER_LOCATION))
     contract["exposes"][0]["binding"]["location"]["catalog"] = catalog
     result = _validate(contract, "0.7.6")

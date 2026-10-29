@@ -100,7 +100,7 @@ class TestSchema:
         assert _errors("0.7.6", _contract()) == []
 
     def test_0_7_5_is_unchanged(self) -> None:
-        # 0.7.6 is the preview; the stable version does not move.
+        # The trigger arrived in 0.7.6; the released 0.7.5 does not move.
         assert any("'continuous'" in msg for msg in _errors("0.7.5", _contract("0.7.5")))
 
     @pytest.mark.parametrize(
