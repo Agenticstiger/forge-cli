@@ -517,12 +517,14 @@ def _columns(expose: Mapping[str, Any]) -> list[Any]:
 
 def _column_row_html(col: Mapping[str, Any]) -> str:
     """One column as a table row. Nullable follows ``required`` (0.7.x), else
-    the legacy ``nullable``; PII follows ``sensitivity``, or the legacy ``pii``."""
+    the legacy ``nullable``; PII follows ``sensitivity``, or the legacy ``pii``.
+    A sensitivity is one level, a string: a list or a mapping there marks nothing."""
     if "required" in col:
         nullable = "no" if col.get("required") else "yes"
     else:
         nullable = "yes" if col.get("nullable", True) is not False else "no"
-    personal = col.get("pii") or col.get("sensitivity") in _PERSONAL_DATA
+    sensitivity = col.get("sensitivity")
+    personal = col.get("pii") or (isinstance(sensitivity, str) and sensitivity in _PERSONAL_DATA)
     pii_marker = '<span class="pii" aria-label="contains PII">PII</span>' if personal else ""
     return (
         "<tr>"

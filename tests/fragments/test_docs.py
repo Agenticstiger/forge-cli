@@ -487,6 +487,26 @@ def test_j03_the_legacy_nullable_and_pii_keys_are_a_fallback_for_old_contracts(
     assert rows["both"][2] == "no"
 
 
+def test_j03_a_sensitivity_that_is_not_one_level_marks_nothing_and_the_page_renders(
+    tmp_path: Path,
+) -> None:
+    """The schema's ``sensitivityLevel`` is one string. A list or a mapping there raised
+    ``unhashable type`` and ended the whole catalog."""
+    columns = [
+        {"name": "listed", "type": "string", "sensitivity": ["pii", "financial"]},
+        {"name": "mapped", "type": "string", "sensitivity": {"level": "pii"}},
+        {"name": "email", "type": "string", "sensitivity": "pii"},
+    ]
+    doc = _min_doc("cols.odd")
+    doc["exposes"][0]["contract"]["schema"] = columns
+    _put(tmp_path / "p" / "contract.fluid.yaml", doc)
+
+    assert _docs(tmp_path / "p" / "contract.fluid.yaml", tmp_path / "site") == 0
+
+    (section,) = _sections(_page(tmp_path / "site", "cols-odd"))
+    assert {r[0]: r[3] for r in section["rows"]} == {"listed": "", "mapped": "", "email": "PII"}
+
+
 def test_j03_every_shipped_example_shows_the_columns_it_declares(tmp_path: Path) -> None:
     from fluid_build.loader import compose_contract
 
@@ -1170,6 +1190,14 @@ def test_j12_a_pointer_to_an_overlay_only_node_is_an_error_row_without_an_env(
 
 # ── robustness: one odd value must not cost the catalog (spec 10) ───────
 
+
+def _odd_column(**column: Any) -> Dict[str, Any]:
+    """The ``exposes`` of :func:`_min_doc` with one column whose keys are ``column``."""
+    expose = _min_doc()["exposes"][0]
+    expose["contract"] = {"schema": [{"name": "c", "type": "string", **column}]}
+    return {"exposes": [expose]}
+
+
 _ODD = [
     pytest.param({"id": 123}, id="integer-id"),
     pytest.param({"id": True}, id="boolean-id"),
@@ -1182,6 +1210,8 @@ _ODD = [
         {"metadata": {"owner": {"team": "t", "since": datetime.date(2024, 1, 1)}}},
         id="owner-with-a-yaml-date",
     ),
+    pytest.param(_odd_column(sensitivity=["pii", "financial"]), id="sensitivity-a-list"),
+    pytest.param(_odd_column(sensitivity={"level": "pii"}), id="sensitivity-a-mapping"),
 ]
 
 
