@@ -138,6 +138,8 @@ def _check_out(out: str) -> None:
     Before any contract is read, not after the whole catalog is rendered, and
     without making a directory: a run that fails leaves no ``--out`` behind.
     """
+    if not out:  # --out "$OUT" with OUT unset
+        raise ValueError("--out is empty: name the directory to write the catalog to")
     if os.path.lexists(out):
         if not os.path.isdir(out):
             raise NotADirectoryError(f"--out {out!r} is not a directory")

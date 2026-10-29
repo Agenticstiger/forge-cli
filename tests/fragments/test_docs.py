@@ -1229,7 +1229,7 @@ def test_j07_a_replaced_file_keeps_its_mode_only_when_it_is_this_users_with_one_
     assert stat.S_IMODE((out / "index.html").stat().st_mode) == 0o644
 
 
-def _docs_error(source: Path, out: Path) -> str:
+def _docs_error(source: Path, out: Any) -> str:
     """The error ``fluid docs --src <source> --out <out>`` stops with."""
     from fluid_build.cli import docs_build
     from fluid_build.cli._common import CLIError
@@ -1264,6 +1264,20 @@ def test_j07_an_out_that_cannot_be_a_directory_is_refused_before_any_contract_is
     assert error.startswith(f"--out {str(tmp_path / where)!r} ") and "not a directory" in error
     assert read == []
     assert (tmp_path / "a-file").read_text(encoding="utf-8") == "not a directory\n"
+
+
+def test_j07_an_empty_out_is_refused_before_any_contract_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--out "$OUT"`` with OUT unset passed the up-front check, and the run failed only once
+    the whole catalog was loaded and rendered, with ``No such file or directory: ''``."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    read = _no_contract_read(monkeypatch)
+
+    error = _docs_error(tmp_path / "src", "")
+
+    assert error == "--out is empty: name the directory to write the catalog to"
+    assert read == []
 
 
 @pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, not root")
