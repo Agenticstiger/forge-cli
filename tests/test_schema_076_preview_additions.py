@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Schema pins for the five optional 0.7.6 preview fields.
+"""Schema pins for the optional fields 0.7.6 added.
 
 Each one closes a hole where a valid contract could not say something its
 own exporters already read:
@@ -39,9 +39,10 @@ own exporters already read:
 The field names are Bitol's (ODCS v3.1.0 / ODPS v1.1.0) so import and export
 are a pass-through rather than a translation.
 
-All of them are optional and 0.7.6 is preview-gated: a contract that sets
-none of them validates exactly as it does today, and a 0.7.5 contract
-cannot reach them at all.
+All of them are optional and version-gated: a contract that sets none of them
+validates exactly as it does today, and a 0.7.5 contract cannot reach them at
+all. 0.7.6 opened as a preview and is stable since #752 promoted it, so the
+default version an untagged contract gets now carries every one of them.
 """
 
 from __future__ import annotations
@@ -236,14 +237,41 @@ class TestPresent:
 
 
 # ---------------------------------------------------------------------------
-# Preview gating: 0.7.5 cannot reach any of them
+# Version gating: 0.7.5 cannot reach any of them; the stable default can
 # ---------------------------------------------------------------------------
 
 
-class TestPreviewGated:
-    def test_076_is_the_preview_version(self):
-        assert "0.7.6" in FluidSchemaManager.PREVIEW_VERSIONS
-        assert FluidSchemaManager.latest_bundled_version() != "0.7.6"
+class TestVersionGated:
+    def test_076_is_stable_and_no_preview_is_the_default(self, manager):
+        # This pinned the preview gate while 0.7.6 was behind it. #752 promoted
+        # 0.7.6, so the gate now reads the other way: the version an untagged
+        # contract is checked against takes every field this file is about.
+        # Asked of the default rather than of "0.7.6", so a later promotion,
+        # which only ever adds, does not have to come back here;
+        # test_schema_manager.py pins the default itself.
+        assert "0.7.6" not in FluidSchemaManager.PREVIEW_VERSIONS
+        default = FluidSchemaManager.latest_bundled_version()
+        contract = _with_column_quality(_ODCS_RULE)
+        contract["fluidVersion"] = default
+        contract["metadata"]["team"] = {"name": "Sales Platform"}
+        contract["description"] = {"purpose": "Order lines."}
+        contract["consumes"] = [
+            {
+                "productId": "silver.crm.customers_v2",
+                "exposeId": "customers",
+                "contractId": "urn:acme:contract:crm-customers:3",
+            }
+        ]
+        contract["exposes"][0]["contract"]["id"] = "urn:acme:contract:orders:1"
+        expose = _kafka_expose()
+        expose["binding"]["location"]["host"] = "broker:9092"
+        expose["binding"]["serialization"] = {"value": "avro"}
+        contract["exposes"].append(expose)
+        _assert_valid(manager, contract, version=default)
+        # The gate itself, version-agnostic (the invariant #431 wrote): whatever
+        # is in PREVIEW_VERSIONS stays opt-in, as 0.7.6 did until it graduated.
+        for preview in FluidSchemaManager.PREVIEW_VERSIONS:
+            assert default != preview
 
     def test_metadata_team_rejected_on_075(self, manager):
         contract = _base_contract(version="0.7.5")

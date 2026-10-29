@@ -667,8 +667,8 @@ class TestSchema:
         assert not FluidSchemaManager().validate_contract(contract).is_valid
 
     def test_the_fields_are_0_7_6_only(self):
-        # New fields land in the preview schema; 0.7.5 GA keeps
-        # additionalProperties: false and is not touched.
+        # New fields land in the open preview, which was 0.7.6 for these; the
+        # released 0.7.5 keeps additionalProperties: false and is not touched.
         for exposure in (_expose(expire=True), _expose(expire=None, encryption={})):
             contract = _contract(exposure)
             contract["fluidVersion"] = "0.7.5"

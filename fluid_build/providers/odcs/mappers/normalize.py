@@ -261,15 +261,19 @@ def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, 
     metadata = dict(work.get("metadata") or {})
     metadata_pt = dict(metadata.pop(PASSTHROUGH_KEY, {}) or {})
 
+    recorded_version = _pop_recorded_version(work)
     doc: Dict[str, Any] = {
         # ODCS carries no FLUID schema version of its own. Keep the one the
         # extras mapper restored so an imported contract stays pinned to the
         # version it was authored against; only a genuinely foreign document
         # gets the default. The restored value came out of a document that may
         # be foreign or hostile, so it goes through the allowlist.
-        "fluidVersion": resolve_declared_version(work.pop("fluidVersion", None)),
+        "fluidVersion": resolve_declared_version(recorded_version),
         "kind": work.pop("kind", None) or "DataProduct",
     }
+    if recorded_version is None:
+        # This reader's default, not the source's: see :func:`defaulted_version`.
+        bucket["defaulted_version"] = doc["fluidVersion"]
 
     contract_block = work.get("contract")
     contract_id = None
@@ -700,11 +704,39 @@ def _normalize_field(
 # --------------------------------------------------------------------------
 
 
-def rehydrate(fluid: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Inverse of :func:`to_document` — no-op when there is no ODCS bucket."""
+def _bucket(fluid: Mapping[str, Any]) -> Mapping[str, Any]:
+    """``fluid``'s ``extensions.odcs`` mapping itself, or ``{}``."""
     extensions = fluid.get(EXTENSIONS_KEY)
     bucket = extensions.get(EXTENSION_NAMESPACE) if isinstance(extensions, Mapping) else None
-    if not isinstance(bucket, Mapping) or not bucket:
+    return bucket if isinstance(bucket, Mapping) else {}
+
+
+def _pop_recorded_version(work: Dict[str, Any]) -> Any:
+    """Pop the FLUID version the source document recorded, and a marker it planted.
+
+    Only :func:`to_document` writes ``defaulted_version``. One the source restored
+    through fluidExtras would make the export leave out a version.
+    """
+    planted = _bucket(work)
+    if isinstance(planted, dict):
+        planted.pop("defaulted_version", None)
+    return work.pop("fluidVersion", None)
+
+
+def defaulted_version(fluid: Mapping[str, Any]) -> Optional[str]:
+    """The version :func:`to_document` gave a document that recorded none, if it did.
+
+    The export leaves that version unrecorded while nothing else needs it, so a
+    foreign document's ODCS → FLUID → ODCS stays a fixed point.
+    """
+    value = _bucket(fluid).get("defaulted_version")
+    return value if isinstance(value, str) else None
+
+
+def rehydrate(fluid: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Inverse of :func:`to_document` — no-op when there is no ODCS bucket."""
+    bucket = _bucket(fluid)
+    if not bucket:
         return fluid
 
     work = copy.deepcopy(dict(fluid))

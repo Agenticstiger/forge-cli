@@ -105,10 +105,12 @@ class TestImportContract:
         original = yaml.safe_load(_bundle_product_path().read_text(encoding="utf-8"))
         assert pt["source"] == original, "import must preserve the original ODPS doc"
         # The whole bucket, not just the key this test is named for. `team` is
-        # bucketed only while the declared version has no `metadata.team`; when
-        # 0.7.6 becomes the stable default the roster lands there and this set
-        # loses it.
+        # the verbatim roster the re-export replays, so it stays here even now
+        # that the stable default (0.7.6, since #752) also gives the roster a
+        # home in `metadata.team`; this comment once expected the promotion to
+        # take it out of the set.
         assert sorted(pt) == ["description", "source", "team"]
+        assert fluid["metadata"]["team"] == pt["team"]
 
 
 # ---------------------------------------------------------------------------

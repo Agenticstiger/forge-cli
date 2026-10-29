@@ -10,11 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`fluid import`, `fluid product-new`, `fluid init --discover`, `fluid forge data-model
-  from-source` and the `fluid forge --scaffold` templates declare the newest stable schema, 0.7.5,
-  not 0.7.3**, two stable versions behind the templates #619 moved, so a contract they wrote
-  started without what 0.7.4 and 0.7.5 added. They read the newest stable bundled schema now, so
-  a promoted preview moves them too (as do the forge interview's live preview and the
-  product-type scaffold library). The shape they write is unchanged, and 0.7.5 accepts it wherever
+  from-source` and the `fluid forge --scaffold` templates declare the newest stable schema, 0.7.6,
+  not 0.7.3**, which was two stable versions behind the templates #619 moved, so a contract they
+  wrote started without what 0.7.4 and 0.7.5 added. They read the newest stable bundled schema
+  now, so a promoted preview moves them too (as do the forge interview's live preview and the
+  product-type scaffold library). The shape they write is unchanged, and 0.7.6 accepts it wherever
   0.7.3 did. The market blueprints (`fluid init --blueprint`, `fluid market --instantiate`) and
   the gcp and snowflake quickstarts still declare 0.7.4.
 - **`fluid bundle` without `--out` (or with `--out -`) does what its help says on every
@@ -25,6 +25,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused (`signing_bundle_wrong_format`). `fluid ship` bundled that way on every run. Now `yaml`
   and `json` go to stdout and a `tgz` to `<contract id>.fluid.bundle.tgz`, as for any other
   contract.
+- **FLUID schema 0.7.6 is stable, and 0.7.7 opens as the next preview** (#752). 0.7.6 is the
+  default now: `FluidSchemaManager.latest_bundled_version()`, the version forge-cli writes into
+  the contracts it builds and assumes where none is declared. What graduates is everything 0.7.6
+  added while in preview, as the 0.13.0 to 0.25.0 entries list it: among it declarative packaging
+  modes, `engine: flink`, `trigger.type: continuous`, identity-keyed overlay merges, column
+  masking and row filters, KMS keys, federation pins, and the exporter fields (`metadata.team`,
+  the object root `description`, `exposes[].contract.id`, a column's `quality`). 0.7.7 is
+  identical to 0.7.6 at open; additive preview fields land there. A contract validates against
+  the version it declares, as before, so nothing changes for one that declares 0.7.5.
+- **An ODCS export records the contract's `fluidVersion` in `fluidExtras` whatever the version.**
+  It was recorded only where it differed from the exporting CLI's default, and an import takes a
+  missing version from its own default. With 0.7.6 the default, a 0.7.6 contract's export would
+  have come back from 0.12.0 to 0.25.0, which default to 0.7.5, as 0.7.5, and its 0.7.6 fields
+  would have failed. One exception keeps a third-party document's ODCS → FLUID → ODCS exact: a
+  contract this release (or a later one) imported from a document that recorded no version
+  exports without one while it still declares the version the import gave it and carries only
+  what ODCS has fields for. `ODCS_FLUID_EXTRAS=false` still writes no `fluidExtras` at all.
 
 ### Security
 
@@ -117,7 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Upgrade notes
 
 - Running `fluid import` again over a contract it wrote before changes the contract's
-  `fluidVersion` line from 0.7.3 to 0.7.5.
+  `fluidVersion` line from 0.7.3 to 0.7.6.
 - `fluid apply` stops with `apply_platform_unsupported`, exit code 2 as before, where a platform
   the contract declares has no provider; in `fluid apply`, `provider_unknown` now means a
   `--provider` value no provider has. A contract with an expose on such a platform beside the
@@ -135,6 +152,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bundled a split contract and then read that file must pass `--out contract.bundled.fluid.yaml`.
   A `contract.bundled.fluid.yaml` an earlier `fluid ship` left beside a contract is a tarball, and
   one an earlier `fluid bundle` left is a copy of the contract that may be stale; delete either.
+- What forge-cli builds now declares 0.7.6 (the importers, `fluid product-new`, `fluid init
+  --discover`, the `fluid forge --scaffold` templates, the copilot). A 0.7.6 contract merges
+  overlay `builds`, `exposes` and `consumes` by id where every base entry names a unique one, so
+  an overlay entry that names no id fails to load where the base list has more than one entry, or
+  where another overlay entry names an id. The file templates `fluid init` copies keep declaring
+  the version written in them.
+- `fluid odcs import` and `fluid odps import` of a document that records no version declare
+  0.7.6, so more of it lands in place instead of in the extensions bucket: the team roster and a
+  column's `quality`. `fluid odps import` also places each output port's contract id and an
+  object's `description`; `fluid odcs import` places a contract id only for a document with one
+  schema object whose id is not a FLUID identifier (one that is becomes the root `id`, as
+  before). Re-importing such a document writes a different file.
+- A 0.7.5 contract's ODCS export now carries `fluidVersion: 0.7.5` in `fluidExtras`.
+- To try what lands next, declare `fluidVersion: "0.7.7"`.
 
 ## [0.25.0] — 2026-10-28
 

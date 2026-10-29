@@ -54,6 +54,7 @@ def test_every_schema_that_carries_admins_is_covered():
         "fluid-schema-0.7.4.json",
         "fluid-schema-0.7.5.json",
         "fluid-schema-0.7.6.json",
+        "fluid-schema-0.7.7.json",
     ]
 
 

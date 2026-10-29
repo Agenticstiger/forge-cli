@@ -14,7 +14,7 @@
 
 """``exposes[].policy.privacy.masking[]`` applied to the rows before they land.
 
-Every bundled schema (fluid-schema 0.7.1 to 0.7.6) accepts
+Every bundled schema (fluid-schema 0.7.1 to 0.7.7) accepts
 ``{column, strategy: mask|hash|tokenize|encrypt|k_anonymity, params}`` on an
 expose, and until this module only the MCP output-port gateway read it (it
 drops every masked column from what it serves). The DuckDB acquisition runner
@@ -132,7 +132,7 @@ TOKENIZE = "tokenize"
 ENCRYPT = "encrypt"
 K_ANONYMITY = "k_anonymity"
 
-#: Every strategy the contract schema's enum accepts (fluid-schema 0.7.1 to 0.7.6).
+#: Every strategy the contract schema's enum accepts (fluid-schema 0.7.1 to 0.7.7).
 SCHEMA_STRATEGIES: Tuple[str, ...] = (MASK, HASH, TOKENIZE, ENCRYPT, K_ANONYMITY)
 #: The strategies a value can be put through at landing.
 LANDING_STRATEGIES: Tuple[str, ...] = (HASH, MASK, TOKENIZE, ENCRYPT)

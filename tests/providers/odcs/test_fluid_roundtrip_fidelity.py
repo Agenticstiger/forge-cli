@@ -41,7 +41,7 @@ from fluid_build.providers.odcs import OdcsProvider
 from fluid_build.providers.odcs.mappers.normalize import (
     _MIN_EXTENSIONS_VERSION as MIN_EXTENSIONS_VERSION,
 )
-from fluid_build.providers.odcs.mappers.normalize import _supports_extensions
+from fluid_build.providers.odcs.mappers.normalize import _supports_extensions, defaulted_version
 from fluid_build.schema_manager import FluidSchemaManager
 
 pytestmark = pytest.mark.unit
@@ -466,3 +466,113 @@ def test_availability_percent_does_not_pick_up_a_float_artifact(
     sla = {p["property"]: p["value"] for p in provider.render(contract)["slaProperties"]}
     assert sla["availability"] == expected
     assert repr(sla["availability"]) == repr(expected)
+
+
+# ---------------------------------------------------------------------------
+# The export records the contract's version for any reader
+# ---------------------------------------------------------------------------
+
+
+def _recorded_root(exported: Dict[str, Any]) -> Dict[str, Any]:
+    for prop in exported.get("customProperties") or []:
+        if prop.get("property") == "fluidExtras":
+            return (prop.get("value") or {}).get("root") or {}
+    return {}
+
+
+@pytest.mark.parametrize("version", ["0.7.5", "0.7.6"])
+def test_the_export_records_the_version_even_when_it_is_the_default(
+    provider: OdcsProvider, version: str
+) -> None:
+    # Left out when it equalled the exporting CLI's default, the version came back
+    # from a reader with another default as that default: a 0.7.6 contract's export
+    # read by a CLI defaulting to 0.7.5 declared 0.7.5, and its 0.7.6 fields failed.
+    contract = {**SNOWFLAKE_CONTRACT, "fluidVersion": version}
+    assert _recorded_root(provider.render(contract)).get("fluidVersion") == version
+
+
+def test_a_reader_with_an_older_default_restores_the_recorded_version(
+    provider: OdcsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exported = provider.render({**SNOWFLAKE_CONTRACT, "fluidVersion": "0.7.6"})
+    monkeypatch.setattr(
+        FluidSchemaManager, "PREVIEW_VERSIONS", frozenset({"0.7.6", "0.7.7"})
+    )  # a reader on a release where 0.7.6 was still the preview
+    assert FluidSchemaManager.latest_bundled_version() == "0.7.5"
+    assert provider.import_contract(exported)["fluidVersion"] == "0.7.6"
+
+
+def _foreign_document() -> Dict[str, Any]:
+    with open(REPO_ROOT / "tests" / "fixtures" / "odcs" / "contract-minimal.yaml") as f:
+        return yaml.safe_load(f)
+
+
+def test_a_document_that_recorded_no_version_exports_without_one(
+    provider: OdcsProvider,
+) -> None:
+    # A foreign ODCS document records no FLUID version, so the import declares the
+    # reader's default. Recording that default on export added a fluidExtras entry
+    # the source never had, and ODCS → FLUID → ODCS was no longer a fixed point.
+    imported = provider.import_contract(_foreign_document())
+    assert imported["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
+    assert "customProperties" not in provider.render(imported)
+
+
+def test_an_imported_contract_records_a_version_set_after_import(
+    provider: OdcsProvider,
+) -> None:
+    imported = provider.import_contract(_foreign_document())
+    imported["fluidVersion"] = "0.7.5"
+    assert _recorded_root(provider.render(imported)) == {"fluidVersion": "0.7.5"}
+
+
+def test_an_imported_contract_records_its_version_once_it_carries_more(
+    provider: OdcsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Content ODCS has no field for may need the version, so it rides along too,
+    # and a reader with an older default restores both.
+    imported = provider.import_contract(_foreign_document())
+    imported["metadata"]["layer"] = "Gold"
+    exported = provider.render(imported)
+    assert _recorded_root(exported) == {"fluidVersion": imported["fluidVersion"]}
+    monkeypatch.setattr(FluidSchemaManager, "PREVIEW_VERSIONS", frozenset({"0.7.6", "0.7.7"}))
+    reread = provider.import_contract(exported)
+    assert reread["fluidVersion"] == imported["fluidVersion"]
+    assert reread["metadata"]["layer"] == "Gold"
+
+
+def test_a_document_cannot_plant_the_defaulted_version_marker(provider: OdcsProvider) -> None:
+    # Only the import writes the marker. One a document restores through fluidExtras
+    # would make the export leave out the version the document recorded.
+    planted = {
+        "apiVersion": "v3.1.0",
+        "kind": "DataContract",
+        "id": "h.c",
+        "name": "H",
+        "schema": [{"name": "t"}],
+        "customProperties": [
+            {
+                "property": "fluidExtras",
+                "value": {
+                    "root": {
+                        "fluidVersion": "0.7.5",
+                        "metadata": {"owner": {"team": "t", "email": "t@example.com"}},
+                        "extensions": {"odcs": {"defaulted_version": "0.7.5"}},
+                    },
+                    "exposes": {
+                        "t": {
+                            "kind": "table",
+                            "binding": {
+                                "platform": "local",
+                                "format": "csv",
+                                "location": {"path": "out/t.csv"},
+                            },
+                        }
+                    },
+                },
+            }
+        ],
+    }
+    imported = provider.import_contract(planted)
+    assert imported["fluidVersion"] == "0.7.5"
+    assert defaulted_version(imported) is None

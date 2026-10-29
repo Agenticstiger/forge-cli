@@ -24,7 +24,7 @@ The **canonical** source is ``exposes[].contract.dq.rules[]`` (``$defs.dqSpec``
 engine executes (``providers/quality_engine.execute_quality_checks``). Reading
 anywhere else is how this exporter came to be dead code: it used to read
 ``exposes[].quality.tests[]``, and ``$defs.expose`` is ``additionalProperties:
-false`` in 0.7.1–0.7.6 without a ``quality`` key, so *no schema-valid contract
+false`` in 0.7.1–0.7.7 without a ``quality`` key, so *no schema-valid contract
 could ever produce a single check*. ``fluid test --engine soda`` therefore
 always printed "nothing to check" and exited 0 — a silent pass on the same
 surface a loud crash used to occupy.

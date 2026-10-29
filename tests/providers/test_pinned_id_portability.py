@@ -54,9 +54,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pytest
+import yaml
 
 from fluid_build.cli.validate import run_on_contract_dict
 from fluid_build.providers.odcs import OdcsProvider
+from fluid_build.providers.odcs.mappers.extras import FLUID_EXTRAS_PROPERTY
 from fluid_build.providers.odcs.mappers.normalize import (
     EXTENSION_NAMESPACE as ODCS_NAMESPACE,
 )
@@ -67,6 +69,20 @@ from fluid_build.providers.odps_standard.provider import (
 from fluid_build.schema_manager import FluidSchemaManager
 
 pytestmark = pytest.mark.unit
+
+# 0.7.6 added the three fields this file is about. These cases were written
+# while it was the preview and the stable default lacked all three; #752
+# promoted it, so a case about "a version without the field" names one, and a
+# case about a document that records nothing gets the default, which has them.
+#: A bundled version without ``exposeContract.id``, column ``quality`` or the
+#: structured root ``description``.
+WITHOUT_FIELDS = "0.7.5"
+#: The default a document that records no version is imported at.
+STABLE = FluidSchemaManager.latest_bundled_version()
+#: The open preview: a version that has the fields and is never the default.
+PREVIEW = [
+    v for v in FluidSchemaManager.BUNDLED_VERSIONS if v in FluidSchemaManager.PREVIEW_VERSIONS
+][-1]
 
 URN = "urn:acme:contract:hourly-orders:v1"
 PRODUCT_ID = "gold.hourly_orders"
@@ -97,8 +113,9 @@ def _contract(
 ) -> Dict[str, Any]:
     """A 0.7.6 contract with one output port, declared the documented way.
 
-    0.7.6 is a PREVIEW schema version, validatable only because the contract
-    declares it — see ``FluidSchemaManager.PREVIEW_VERSIONS``.
+    0.7.6 is the version that added the fields these cases use. It opened as a
+    preview and is stable since #752; the contract declares it either way, so a
+    later default does not change what these cases exercise.
     """
     column: Dict[str, Any] = {"name": "order_hour", "type": "TIMESTAMP", "required": True}
     if quality is not None:
@@ -184,6 +201,83 @@ def _odcs_bucket(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 def _odps_bucket(contract: Dict[str, Any]) -> Dict[str, Any]:
     return _bucket(contract, ODPS_NAMESPACE)
+
+
+def _recording(document: Dict[str, Any], version: Optional[str]) -> Dict[str, Any]:
+    """An ODCS ``document`` recording ``version`` where a forge export records it.
+
+    ``None`` leaves the document recording nothing, as a third-party one does.
+    """
+    if version is not None:
+        document["customProperties"] = [
+            {"property": FLUID_EXTRAS_PROPERTY, "value": {"root": {"fluidVersion": version}}}
+        ]
+    return document
+
+
+def _foreign_odcs_with_a_urn(recorded: Optional[str] = None) -> Dict[str, Any]:
+    """A third-party ODCS contract whose id is a URN; nothing it records restores a pin."""
+    return _recording(
+        {
+            "version": "1.0.0",
+            "kind": "DataContract",
+            "apiVersion": "v3.1.0",
+            "id": URN,
+            "name": "Hourly Orders Contract",
+            "status": "active",
+            "schema": [
+                {
+                    "name": EXPOSE_ID,
+                    "physicalType": "table",
+                    "logicalType": "object",
+                    "properties": [{"name": "order_hour", "physicalType": "timestamp"}],
+                }
+            ],
+        },
+        recorded,
+    )
+
+
+def _foreign_odcs_with_a_rule(recorded: Optional[str] = None) -> Dict[str, Any]:
+    """A third-party ODCS contract whose ``order_hour`` column carries a quality rule."""
+    return _recording(
+        {
+            "version": "1.0.0",
+            "kind": "DataContract",
+            "apiVersion": "v3.1.0",
+            "id": "commerce.hourly_orders",
+            "name": "Hourly Orders Contract",
+            "status": "active",
+            "schema": [
+                {
+                    "name": EXPOSE_ID,
+                    "physicalType": "table",
+                    "logicalType": "object",
+                    "properties": [
+                        {
+                            "name": "order_hour",
+                            "physicalType": "timestamp",
+                            "quality": [QUALITY_RULE],
+                        }
+                    ],
+                }
+            ],
+        },
+        recorded,
+    )
+
+
+def _record_in_every_sibling(bundle: Path, version: Optional[str]) -> None:
+    """Make every sibling ODCS of ``bundle`` record ``version``, or nothing at all.
+
+    The sibling ODCS is the only place an exported bundle records its FLUID version.
+    """
+    for sibling in bundle.glob("*.odcs.yaml"):
+        doc = yaml.safe_load(sibling.read_text(encoding="utf-8"))
+        doc.pop("customProperties", None)
+        sibling.write_text(
+            yaml.safe_dump(_recording(doc, version), sort_keys=False), encoding="utf-8"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -284,28 +378,29 @@ class TestPinnedUrnPortability:
 
     def test_a_foreign_odcs_with_a_urn_id_imports_and_validates(self, odcs: OdcsProvider) -> None:
         # No ``fluidExtras``, so nothing restores a pin and the declared version
-        # is the stable default, whose ``exposeContract`` is closed. The bucket
-        # replay is the whole of what carries the id on this path.
-        foreign = {
-            "version": "1.0.0",
-            "kind": "DataContract",
-            "apiVersion": "v3.1.0",
-            "id": URN,
-            "name": "Hourly Orders Contract",
-            "status": "active",
-            "schema": [
-                {
-                    "name": EXPOSE_ID,
-                    "physicalType": "table",
-                    "logicalType": "object",
-                    "properties": [{"name": "order_hour", "physicalType": "timestamp"}],
-                }
-            ],
-        }
-        imported = odcs.import_contract(foreign)
+        # is the stable default. Since #752 that is a version that declares
+        # ``exposeContract.id``, so the URN also lands there, beside the bucket.
+        imported = odcs.import_contract(_foreign_odcs_with_a_urn())
 
+        assert imported["fluidVersion"] == STABLE
         assert _validate(imported) == []
         assert imported["id"] != URN
+        assert imported["exposes"][0]["contract"]["id"] == URN
+        assert _odcs_bucket(imported)["contract_id"] == URN
+        assert odcs.render(imported)["id"] == URN
+
+    def test_at_a_version_without_the_field_the_bucket_alone_carries_the_urn(
+        self, odcs: OdcsProvider
+    ) -> None:
+        # The path the case above pinned while the stable default's
+        # ``exposeContract`` was closed: no inline home, so the bucket replay is
+        # the whole of what carries the id.
+        imported = odcs.import_contract(_foreign_odcs_with_a_urn(WITHOUT_FIELDS))
+
+        assert imported["fluidVersion"] == WITHOUT_FIELDS
+        assert _validate(imported) == []
+        assert imported["id"] != URN
+        assert "id" not in imported["exposes"][0]["contract"]
         assert _odcs_bucket(imported)["contract_id"] == URN
         assert odcs.render(imported)["id"] == URN
 
@@ -379,36 +474,30 @@ class TestColumnQualityRoundTrip:
         # ``column`` is ``additionalProperties: false`` and gained ``quality``
         # only in 0.7.6, so a document that records an older version has to be
         # bucketed — inline would make the import emit an invalid contract.
-        foreign = {
-            "version": "1.0.0",
-            "kind": "DataContract",
-            "apiVersion": "v3.1.0",
-            "id": "commerce.hourly_orders",
-            "name": "Hourly Orders Contract",
-            "status": "active",
-            "schema": [
-                {
-                    "name": EXPOSE_ID,
-                    "physicalType": "table",
-                    "logicalType": "object",
-                    "properties": [
-                        {
-                            "name": "order_hour",
-                            "physicalType": "timestamp",
-                            "quality": [QUALITY_RULE],
-                        }
-                    ],
-                }
-            ],
-        }
-        imported = odcs.import_contract(foreign)
+        # (The document recorded nothing, which meant the stable default until
+        # #752 gave the default the field; the next case is that document now.)
+        older = FluidSchemaManager().get_schema(WITHOUT_FIELDS, offline_only=True)
+        assert "quality" not in older["$defs"]["column"]["properties"]
+        imported = odcs.import_contract(_foreign_odcs_with_a_rule(WITHOUT_FIELDS))
 
-        assert imported["fluidVersion"] not in FluidSchemaManager.PREVIEW_VERSIONS
+        assert imported["fluidVersion"] == WITHOUT_FIELDS
         assert "quality" not in _column(imported)
         fields = _odcs_bucket(imported)["exposes"][EXPOSE_ID]["fields"]
         assert fields["order_hour"]["quality"] == [QUALITY_RULE]
         assert _validate(imported) == []
         # Still lossless on its own leg: the export replays it from the bucket.
+        assert odcs.render(imported)["schema"][0]["properties"][0]["quality"] == [QUALITY_RULE]
+
+    def test_a_document_recording_nothing_carries_the_rules_inline_at_stable(
+        self, odcs: OdcsProvider
+    ) -> None:
+        # Nothing recorded means the stable default, whose ``column`` declares
+        # ``quality`` since #752: the rules ride inline, as the field intends.
+        imported = odcs.import_contract(_foreign_odcs_with_a_rule())
+
+        assert imported["fluidVersion"] == STABLE
+        assert _column(imported)["quality"] == [QUALITY_RULE]
+        assert _validate(imported) == []
         assert odcs.render(imported)["schema"][0]["properties"][0]["quality"] == [QUALITY_RULE]
 
     def test_the_schema_declares_the_field_the_import_writes(self) -> None:
@@ -475,31 +564,44 @@ class TestStructuredDescriptionOnTheOdpsLeg:
 
         assert odcs.render(imported)["description"] == DESCRIPTION_OBJECT
 
-    def test_a_bundle_recording_no_version_still_roots_purpose_alone(
+    def test_a_bundle_recording_an_older_version_still_roots_purpose_alone(
         self, odps: BitolOdpsProvider, tmp_path: Path
     ) -> None:
         """The promotion asks the schema, not the version string.
 
-        A third-party bundle records no ``fluidVersion``, so the import declares
-        the latest bundled STABLE version, whose root ``description`` is a
-        string. Rooting the object there would write a contract the import's own
-        validate-before-write gate refuses — so ``purpose`` must still win, with
-        the object recoverable from the bucket. Built by stripping the recorded
-        version out of the sibling ODCS, which is the only place it lives.
+        A bundle recording a version whose root ``description`` is a string is
+        imported at that version. Rooting the object there would write a
+        contract the import's own validate-before-write gate refuses — so
+        ``purpose`` must still win, with the object recoverable from the bucket.
+        This stripped the record instead, and relied on the stable default
+        being such a version, which #752 ended; the next case is that bundle.
         """
-        import yaml
-
-        out = tmp_path / "foreign"
+        out = tmp_path / "older"
         _export_bundle(odps, _contract(description=DESCRIPTION_OBJECT), out)
-        for sibling in out.glob("*.odcs.yaml"):
-            doc = yaml.safe_load(sibling.read_text(encoding="utf-8"))
-            doc.pop("customProperties", None)
-            sibling.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+        _record_in_every_sibling(out, WITHOUT_FIELDS)
 
         imported = odps.import_directory(out)
 
-        assert imported["fluidVersion"] != "0.7.6", "the strip did not take effect"
+        assert imported["fluidVersion"] == WITHOUT_FIELDS
         assert imported["description"] == DESCRIPTION_OBJECT["purpose"]
+        assert _odps_bucket(imported)["metadata"]["description"] == DESCRIPTION_OBJECT
+
+    def test_a_bundle_recording_no_version_roots_the_object_at_stable(
+        self, odps: BitolOdpsProvider, tmp_path: Path
+    ) -> None:
+        """A third-party bundle records no ``fluidVersion``, so the import
+        declares the stable default, whose root ``description`` takes an object
+        since #752. Exported from the preview, so seeing the default declared is
+        what shows the strip took effect.
+        """
+        out = tmp_path / "foreign"
+        _export_bundle(odps, _contract(description=DESCRIPTION_OBJECT, version=PREVIEW), out)
+        _record_in_every_sibling(out, None)
+
+        imported = odps.import_directory(out)
+
+        assert imported["fluidVersion"] == STABLE, "the strip did not take effect"
+        assert imported["description"] == DESCRIPTION_OBJECT
         assert _odps_bucket(imported)["metadata"]["description"] == DESCRIPTION_OBJECT
 
     def test_the_schema_text_matches_the_behaviour(self) -> None:
