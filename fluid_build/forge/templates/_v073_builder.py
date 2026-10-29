@@ -297,9 +297,10 @@ def build_contract(
 ) -> Dict[str, Any]:
     """Build a v0.7.3-canonical contract for *spec* + *project_config*.
 
-    Output passes ``fluid validate`` against fluid-schema-0.7.3 with
-    no coercion needed. Equivalence axiom enforced: layer + productType
-    are populated as a canonical pair.
+    Output passes ``fluid validate`` at the version it declares (the newest
+    stable schema unless *fluid_version* names one; the shape is the v0.7.3
+    one, which later schemas accept) with no coercion needed. Equivalence
+    axiom enforced: layer + productType are populated as a canonical pair.
     """
     if fluid_version is None:
         from fluid_build.schema_manager import FluidSchemaManager
