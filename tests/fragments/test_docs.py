@@ -1212,6 +1212,12 @@ _ODD = [
     ),
     pytest.param(_odd_column(sensitivity=["pii", "financial"]), id="sensitivity-a-list"),
     pytest.param(_odd_column(sensitivity={"level": "pii"}), id="sensitivity-a-mapping"),
+    pytest.param({"name": float("nan"), "tags": [float("-inf")]}, id="yaml-nan-and-inf"),
+    pytest.param({"tags": {"b", "a"}}, id="tags-a-yaml-set"),
+    pytest.param(
+        {"metadata": {"owner": {"team": "t", False: "no", True: "yes", None: "~"}}},
+        id="owner-with-yaml-1.1-bool-and-null-keys",
+    ),
 ]
 
 
@@ -1255,6 +1261,75 @@ def test_j04x_a_contract_with_odd_values_is_listed_with_them_as_text(tmp_path: P
     assert "No exposed datasets." in page and "No upstream products." in page
     index = (out / "index.html").read_text("utf-8")
     assert '<span class="tag">1</span>' in index and '<span class="tag">2024-01-01</span>' in index
+
+
+_YAML_ODDITIES = """\
+fluidVersion: "0.7.6"
+kind: DataProduct
+id: odd.yaml
+name: .nan
+domain: ops
+description: {purpose: .inf, usage: -.inf}
+tags: !!set {charlie: null, alpha: null, bravo: null}
+metadata:
+  layer: Silver
+  owner: {team: t, NO: norway, yes: affirmative, ~: nothing, 1.5: a float}
+"""
+
+
+def _strict_json(text: str) -> Any:
+    def refuse(token: str) -> None:
+        raise ValueError(f"{token} is not JSON")
+
+    return json.loads(text, parse_constant=refuse)
+
+
+def test_j04x_index_json_is_strict_json_whatever_yaml_values_a_contract_holds(
+    tmp_path: Path,
+) -> None:
+    """``.nan`` and ``.inf`` were written as ``NaN`` and ``Infinity``, which strict JSON parsers
+    reject; a ``!!set`` as ``str(set)``, in hash order; and the YAML 1.1 keys ``NO``, ``yes``
+    and ``~`` as ``False``, ``True`` and ``None`` where index.json has always had ``false``,
+    ``true`` and ``null``, json's own spelling."""
+    _write(tmp_path / "odd" / "contract.fluid.yaml", _YAML_ODDITIES)
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    (row,) = _strict_json((out / "index.json").read_text(encoding="utf-8"))
+    assert row["name"] == "nan"
+    assert row["description"] == {"purpose": "inf", "usage": "-inf"}
+    assert row["tags"] == ["alpha", "bravo", "charlie"]
+    assert row["owner"] == {
+        "team": "t",
+        "false": "norway",
+        "true": "affirmative",
+        "null": "nothing",
+        "1.5": "a float",
+    }
+    index = (out / "index.html").read_text("utf-8")
+    assert '<span class="tag">alpha</span> <span class="tag">bravo</span>' in index
+
+
+def test_j04x_an_integer_too_long_to_turn_into_text_is_listed_and_shown_as_a_note(
+    tmp_path: Path,
+) -> None:
+    """A YAML hex literal can hold an integer of more digits than Python turns into text
+    (4300): it ended the sort of the index, its JSON, and its page."""
+    _put(tmp_path / "good" / "contract.fluid.yaml", _min_doc("good.one"))
+    text = yaml.safe_dump(_min_doc("HUGE"), sort_keys=False).replace("HUGE", "0x" + "f" * 4000)
+    _write(tmp_path / "huge" / "contract.fluid.yaml", text)
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    rows = _index(out)
+    assert [(r["id"], r["name"]) for r in rows] == [
+        ("(an integer too long to show)", "(an integer too long to show)"),
+        ("good.one", "good.one"),
+    ]
+    page = _page(out, rows[0]["slug"])
+    assert "<h1>(an integer too long to show)</h1>" in page
 
 
 # ── J-14 ────────────────────────────────────────────────────────────────

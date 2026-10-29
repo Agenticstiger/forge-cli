@@ -22,6 +22,7 @@ import html
 import io
 import json
 import logging
+import math
 import os
 import re
 import stat
@@ -74,8 +75,9 @@ def run(args, logger: logging.Logger) -> int:
         # Everything is rendered, and encoded, before any file is opened, so a
         # run that fails here leaves the catalog the previous run wrote.
         # JSON index (machine-readable; existing consumers depend on it).
+        # Strict JSON: _plain left no NaN or Infinity, and none may come back.
         index_json = io.StringIO()
-        json.dump(entries, index_json, indent=2)
+        json.dump(entries, index_json, indent=2, allow_nan=False)
 
         # HTML index (human-readable). One static file; no external deps.
         index_html = _render_index_html(entries)
@@ -90,7 +92,9 @@ def run(args, logger: logging.Logger) -> int:
             if entry.get("error") or not isinstance(contract, Mapping):
                 continue
             try:
-                page = _render_contract_html(contract, path)
+                # From the same plain data as its index row: no set, no NaN, no
+                # integer too long to turn into text reaches the page.
+                page = _render_contract_html(_plain(contract), path)
             except Exception as exc:  # noqa: BLE001 - say which contract, not just what broke
                 raise ValueError(f"{path}: {exc}") from exc
             pages.append((f"contract-{slugs[path]}.html", page))
@@ -200,20 +204,53 @@ def _resolve_contract_paths(args) -> list[str]:
     return sorted(found)
 
 
-def _plain(value: Any) -> Any:
-    """``value`` as plain JSON data.
+#: What an integer too long to turn into text is shown as. A YAML hex literal can
+#: hold one of more digits than Python turns into text (4300), and json writes an
+#: integer as its text.
+_TOO_LONG = "(an integer too long to show)"
 
-    What a contract may hold that JSON has no type for (a YAML date, a set)
-    becomes its text, and a key that is not a string becomes one, so one odd
-    value cannot make the catalog unwritable.
+
+def _plain(value: Any) -> Any:
+    """``value`` as data strict JSON can hold, so one odd value cannot end the catalog.
+
+    A YAML set becomes a list in a fixed order. ``.nan`` and ``.inf``, which
+    strict JSON has no token for, and what JSON has no type for (a YAML date)
+    become their text, and an integer too long to turn into text becomes
+    :data:`_TOO_LONG`. A key that is not a string is spelled as json spells a
+    key (``true``, ``false``, ``null``, a number: what index.json has always
+    had), or, when JSON has no key of its type, as its text.
     """
     if isinstance(value, Mapping):
-        return {str(k): _plain(v) for k, v in value.items()}
+        return {_key(k): _plain(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_plain(v) for v in value]
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if isinstance(value, (set, frozenset)):
+        return sorted([_plain(v) for v in value], key=_set_order)
+    if value is None or isinstance(value, (str, bool)):
         return value
+    if isinstance(value, int):
+        try:
+            str(value)
+        except ValueError:
+            return _TOO_LONG
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
     return str(value)
+
+
+def _key(key: Any) -> str:
+    """A mapping key as text: as json spells a key of its type, or its own text."""
+    if isinstance(key, str):
+        return key
+    if key is None or isinstance(key, (bool, float)):
+        return json.dumps(key)  # null, true, false, 1.5, NaN
+    return str(_plain(key))
+
+
+def _set_order(value: Any) -> tuple[str, str]:
+    """Where a member of a set is listed: by its text, then by its type (``1``, ``"1"``)."""
+    return str(value), type(value).__name__
 
 
 def _items(value: Any) -> list[Any]:
