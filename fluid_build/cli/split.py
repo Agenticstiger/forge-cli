@@ -42,7 +42,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Callable, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Collection, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 COMMAND = "split"
 
@@ -362,22 +362,10 @@ def _write_checked(
     unsafe = _unsafe_target(out_dir, root_out, fragments)
     if unsafe:
         return unsafe
-    # Every text is encoded before a file or a directory is made: one with no
-    # UTF-8 form (a lone surrogate in a part, or in a key a JSON root keeps:
-    # JSON can escape one) is refused with nothing to take back. The bytes are
-    # written as they are, so a \r in a text stays a \r.
-    data: Dict[Path, bytes] = {}
-    for rel_path, content in fragments.items():
-        try:
-            data[out_dir / rel_path] = content.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            return f"{rel_path} cannot be written as UTF-8: {exc}"
-        except Exception as exc:  # noqa: BLE001 - a part that is no text: refused, nothing made
-            return f"{rel_path} cannot be written: {exc}"
-    try:
-        root_data = root_text.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        return f"{root_out} cannot be written as UTF-8: {exc}"
+    encoded = _encoded(root_out, root_text, fragments, out_dir)
+    if isinstance(encoded, str):
+        return encoded
+    data, root_data = encoded
     original_root: Optional[bytes] = root_out.read_bytes() if root_out.exists() else None
     made: List[Path] = []
     written: List[Path] = []
@@ -398,20 +386,56 @@ def _write_checked(
         if compose_contract(root_out).document != before:
             raise ValueError("the split contract does not compose to the original one")
     except BaseException as exc:  # noqa: BLE001 - every failure is taken back
-        left, interrupted = _take_back(
-            written, root_out if root_reached else None, original_root, made
-        )
-        # Ctrl-C or an exit, halfway or during the take-back: the unchecked split
-        # is taken back all the same, and the first interrupt goes on.
-        interrupt = interrupted if isinstance(exc, Exception) else exc
-        if interrupt is not None:
-            if left:
-                sys.stderr.write(f"❌ Split interrupted; could not take back {'; '.join(left)}\n")
-            raise interrupt
-        if left:
-            return f"{exc}; and split could not take back {'; '.join(left)}"
-        return f"{exc}; nothing was changed"
+        return _taken_back(exc, written, root_out if root_reached else None, original_root, made)
     return None
+
+
+def _encoded(
+    root_out: Path, root_text: str, fragments: Dict[str, str], out_dir: Path
+) -> Union[str, Tuple[Dict[Path, bytes], bytes]]:
+    """Every text of the split as bytes, each fragment's by its path, and the
+    root's; or why one cannot be written.
+
+    Encoded before a file or a directory is made: one with no UTF-8 form (a lone
+    surrogate in a part, or in a key a JSON root keeps: JSON can escape one) is
+    refused with nothing to take back. The bytes are written as they are, so a
+    \\r in a text stays a \\r.
+    """
+    data: Dict[Path, bytes] = {}
+    for rel_path, content in fragments.items():
+        try:
+            data[out_dir / rel_path] = content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            return f"{rel_path} cannot be written as UTF-8: {exc}"
+        except Exception as exc:  # noqa: BLE001 - a part that is no text: refused, nothing made
+            return f"{rel_path} cannot be written: {exc}"
+    try:
+        return data, root_text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        return f"{root_out} cannot be written as UTF-8: {exc}"
+
+
+def _taken_back(
+    exc: BaseException,
+    written: List[Path],
+    root_out: Optional[Path],
+    original_root: Optional[bytes],
+    made: List[Path],
+) -> str:
+    """Take back a split that ``exc`` stopped halfway, and say why it stopped.
+
+    Ctrl-C or an exit, halfway or during the take-back: the unchecked split is
+    taken back all the same, and the first interrupt is raised again.
+    """
+    left, interrupted = _take_back(written, root_out, original_root, made)
+    interrupt = interrupted if isinstance(exc, Exception) else exc
+    if interrupt is not None:
+        if left:
+            sys.stderr.write(f"❌ Split interrupted; could not take back {'; '.join(left)}\n")
+        raise interrupt
+    if left:
+        return f"{exc}; and split could not take back {'; '.join(left)}"
+    return f"{exc}; nothing was changed"
 
 
 def _take_back(
