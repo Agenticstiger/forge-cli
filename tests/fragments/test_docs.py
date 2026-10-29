@@ -288,6 +288,37 @@ def _elements(page: str) -> _Elements:
     return parser
 
 
+class _Rows(HTMLParser):
+    """Every table row of a page: its attributes, and each cell's tag, colspan and text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: List[Dict[str, Any]] = []
+        self._cell: Optional[Dict[str, Any]] = None
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag == "tr":
+            self.rows.append({"attrs": dict(attrs), "cells": []})
+        elif tag in ("td", "th") and self.rows:
+            span = int(dict(attrs).get("colspan") or 1)
+            self._cell = {"tag": tag, "span": span, "text": ""}
+            self.rows[-1]["cells"].append(self._cell)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("td", "th"):
+            self._cell = None
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell["text"] += data
+
+
+def _rows(page: str) -> List[Dict[str, Any]]:
+    parser = _Rows()
+    parser.feed(page)
+    return parser.rows
+
+
 # ── J-01 ────────────────────────────────────────────────────────────────
 
 
@@ -710,6 +741,45 @@ def test_j04_the_error_of_a_row_is_escaped_in_the_html_index(tmp_path: Path) -> 
     page = (out / "index.html").read_text("utf-8")
     assert "<script>alert(1)" not in page
     assert _elements(page).tags.count("script") == 1  # the filter's own
+
+
+def test_j04_an_error_row_spans_the_header_and_the_filter_finds_it_by_its_error(
+    tmp_path: Path,
+) -> None:
+    _batch(tmp_path / "src")
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    rows = _rows((out / "index.html").read_text("utf-8"))
+    (header,) = [r for r in rows if r["cells"] and {c["tag"] for c in r["cells"]} == {"th"}]
+    failed = [r for r in rows if r["attrs"].get("class") == "error"]
+    by_dir = {Path(r["path"]).parent.name: r for r in _index(out)}
+
+    assert len(header["cells"]) == 10 and len(failed) == 2
+    for row, name in zip(failed, "BC", strict=True):  # in path order
+        path, error = by_dir[name]["path"], by_dir[name]["error"]
+        cells = row["cells"]
+        assert {c["tag"] for c in cells} == {"td"}
+        assert sum(c["span"] for c in cells) == len(header["cells"])
+        assert error in [c["text"] for c in cells]
+        assert cells[-1]["text"] == path  # the path in a cell of its own, the last
+        assert row["attrs"]["data-search"] == f"{error} {path}".lower()
+
+
+def test_j04_an_error_row_takes_no_page_name_from_a_contract_that_sorts_after_it(
+    tmp_path: Path,
+) -> None:
+    """A row with an error sorts first (it has no id) and has no page. Were it given a page
+    name it would take ``contract``, and the contract whose id is ``contract`` would lose it."""
+    _write(tmp_path / "broken" / "contract.fluid.yaml", "fluidVersion: [\n")
+    _put(tmp_path / "real" / "contract.fluid.yaml", _min_doc("contract"))
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    assert [r.get("slug") for r in _index(out)] == [None, "contract"]
+    assert [p.name for p in out.glob("contract-*.html")] == ["contract-contract.html"]
+    assert 'href="contract-contract.html"' in (out / "index.html").read_text("utf-8")
 
 
 # ── J-05 ────────────────────────────────────────────────────────────────
@@ -1162,6 +1232,24 @@ def test_j07_a_first_run_that_fails_to_write_leaves_no_out_behind(
     monkeypatch.setattr(docs_build, "_stage", full)
 
     assert _docs(tmp_path / "src", tmp_path / "new" / "deeper" / "site", src=True) != 0
+
+    assert [p.name for p in tmp_path.iterdir()] == ["src"]
+
+
+def test_j07_a_first_run_that_fails_to_render_leaves_no_out_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--out is made only once every file is rendered."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+
+    def boom(contract: Any, path: str) -> str:
+        raise RuntimeError("cannot render")
+
+    monkeypatch.setattr(docs_build, "_render_contract_html", boom)
+
+    assert _docs(tmp_path / "src", tmp_path / "site", src=True) != 0
 
     assert [p.name for p in tmp_path.iterdir()] == ["src"]
 
