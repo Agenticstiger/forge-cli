@@ -1302,6 +1302,62 @@ def test_j07_a_first_run_that_fails_to_write_leaves_no_out_behind(
     assert [p.name for p in tmp_path.iterdir()] == ["src"]
 
 
+def test_j07_a_first_run_whose_out_cannot_be_made_whole_leaves_none_of_it_behind(
+    tmp_path: Path,
+) -> None:
+    """os.makedirs ran outside the cleanup: a name too long three levels down failed it after
+    new1/ and new1/new2/ were made, and those were left."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "new1" / "new2" / ("x" * 300) / "site"
+
+    assert _docs(tmp_path / "src", out, src=True) != 0
+
+    assert [p.name for p in tmp_path.iterdir()] == ["src"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+def test_j07_a_failed_first_run_takes_back_a_directory_made_through_a_symlink_and_dotdot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--out L/../made`` with ``L`` a symlink makes ``made`` beside L's target, not beside
+    L: the directory to take back is the one the OS made, by its real path."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    (tmp_path / "elsewhere" / "sub").mkdir(parents=True)
+    (tmp_path / "L").symlink_to(tmp_path / "elsewhere" / "sub")
+
+    def full(target: str, data: bytes) -> str:
+        raise OSError(errno.ENOSPC, "No space left on device", target)
+
+    monkeypatch.setattr(docs_build, "_stage", full)
+
+    assert _docs(tmp_path / "src", tmp_path / "L" / ".." / "made", src=True) != 0
+
+    assert [p.name for p in (tmp_path / "elsewhere").iterdir()] == ["sub"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["L", "elsewhere", "src"]
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, not root")
+def test_j07_an_out_through_a_symlink_and_dotdot_is_checked_where_it_would_be_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """abspath() folded ``L/../made`` to a directory beside L, so the up-front check looked
+    at the wrong parent and the run failed only after the whole catalog was rendered."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    (tmp_path / "elsewhere" / "sub").mkdir(parents=True)
+    (tmp_path / "L").symlink_to(tmp_path / "elsewhere" / "sub")
+    (tmp_path / "elsewhere").chmod(0o555)
+    read = _no_contract_read(monkeypatch)
+    try:
+        error = _docs_error(tmp_path / "src", tmp_path / "L" / ".." / "made")
+    finally:
+        (tmp_path / "elsewhere").chmod(0o755)
+
+    assert f"{str(tmp_path / 'elsewhere')!r} is a directory this user cannot write to" in error
+    assert read == []
+
+
 def test_j07_a_first_run_that_fails_to_render_leaves_no_out_behind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

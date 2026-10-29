@@ -144,14 +144,20 @@ def _check_out(out: str) -> None:
         if not os.access(out, os.W_OK | os.X_OK):
             raise PermissionError(f"--out {out!r} is a directory this user cannot write to")
         return
-    nearest = os.path.dirname(os.path.abspath(out))
+    # Up the path as written, not as abspath() folds it: in "link/../made" the
+    # ".." is the link target's parent, where the directory would be made.
+    nearest = out
     while not os.path.lexists(nearest):
-        nearest = os.path.dirname(nearest)
+        parent = os.path.dirname(nearest) or os.curdir
+        if parent == nearest:
+            break
+        nearest = parent
+    where = os.path.realpath(nearest)
     if not os.path.isdir(nearest):
-        raise NotADirectoryError(f"--out {out!r} cannot be made: {nearest!r} is not a directory")
+        raise NotADirectoryError(f"--out {out!r} cannot be made: {where!r} is not a directory")
     if not os.access(nearest, os.W_OK | os.X_OK):
         raise PermissionError(
-            f"--out {out!r} cannot be made: {nearest!r} is a directory this user cannot write to"
+            f"--out {out!r} cannot be made: {where!r} is a directory this user cannot write to"
         )
 
 
@@ -160,18 +166,14 @@ def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
 
     Every file is first written whole to a temp file beside it, and only when
     all of them are does each replace its file. A run that fails before then
-    takes its temp files back, and the directories it made, and leaves every
+    takes its temp files back, and each directory it made, and leaves every
     file as the last run wrote it. A replace swaps the directory entry: a
     symlink or a hard link planted in ``out`` is replaced, never written through.
     """
-    made: list[str] = []  # the directories this run makes, the deepest first
-    missing = os.path.abspath(out)
-    while not os.path.lexists(missing):
-        made.append(missing)
-        missing = os.path.dirname(missing)
-    os.makedirs(out, exist_ok=True)
+    made: list[str] = []  # the real path of each directory this run made, in order
     staged: list[tuple[str, str]] = []
     try:
+        _make_dirs(out, made)
         for name, data in files:
             target = os.path.join(out, name)
             staged.append((_stage(target, data), target))
@@ -181,10 +183,29 @@ def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
         for temp, _target in staged:
             with contextlib.suppress(OSError):
                 os.unlink(temp)
-        for directory in made:
+        for directory in reversed(made):
             with contextlib.suppress(OSError):
                 os.rmdir(directory)
         raise
+
+
+def _make_dirs(path: str, made: list[str]) -> None:
+    """``os.makedirs(path, exist_ok=True)``, one level at a time, adding the real
+    path of each directory it makes to ``made`` as soon as it is made: a run that
+    fails part-way takes back exactly those, wherever a ``..`` after a symlink
+    put them."""
+    head, tail = os.path.split(path)
+    if not tail:
+        head, tail = os.path.split(head)
+    if head and tail and not os.path.exists(head):
+        _make_dirs(head, made)
+    try:
+        os.mkdir(path)
+    except OSError:
+        if not os.path.isdir(path):
+            raise
+    else:
+        made.append(os.path.realpath(path))
 
 
 def _mine(st: os.stat_result) -> bool:
