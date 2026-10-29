@@ -308,11 +308,17 @@ def _yaml_string(value: str) -> str:
 def _double_quoted(value: str) -> str:
     """``value`` as a double-quoted YAML scalar, on one line however long it is.
 
-    A printable letter that is not ASCII (``é``) is written as it is, as the
-    contract had it; NEL, LS, PS and what is not printable are escaped all the
-    same, so the value reads back exactly.
+    A value that is all printable keeps its letters that are not ASCII
+    (``é``), as the contract had them. One that holds anything else is escaped
+    whole, as the single-quoted rule has it: PyYAML would write a bidi control
+    (U+202E), a zero-width or soft hyphen, a private-use or unassigned code
+    point as it is, and the line would show other text than it holds (Trojan
+    Source). NEL, LS and PS are escaped either way, so the value reads back
+    exactly.
     """
-    return yaml.safe_dump(value, default_style='"', width=_ONE_LINE, allow_unicode=True).strip()
+    return yaml.safe_dump(
+        value, default_style='"', width=_ONE_LINE, allow_unicode=value.isprintable()
+    ).strip()
 
 
 def _render(text: str, lo: int, hi: int, edits: Sequence[_Edit]) -> str:

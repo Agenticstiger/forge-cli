@@ -1783,6 +1783,44 @@ def test_i21_a_rebased_ref_keeps_its_quoting_where_it_can_and_every_comment(
     assert "were not kept" not in capsys.readouterr().err
 
 
+#: Characters a line can hold without showing them, or showing other text than
+#: it holds: bidi controls (RLO, LRI and PDI, LRM, ALM), zero-width ones (ZWSP,
+#: ZWJ), a soft hyphen, a private-use and an unassigned code point.
+UNSEEN = "\u202e\u2066\u2069\u200e\u061c\u200b\u200d\xad\ue000\u0378"
+
+
+@pytest.mark.parametrize("char", list(UNSEEN), ids=lambda c: f"U+{ord(c):04X}")
+def test_i21_a_rebased_ref_holding_a_character_that_hides_is_written_escaped(char: str) -> None:
+    """Round-2 review: the rebased ref's double quotes were written with
+    ``allow_unicode``, which PyYAML takes to mean every one of these as it is: a
+    Trojan-Source-style line in the fragment. A value that is not all printable
+    is escaped whole now; one that is keeps its letters (``é``) as they were."""
+    from fluid_build.cli._split_text import _double_quoted
+
+    hidden = _double_quoted(f"../../a{char}é.yaml")
+    shown = _double_quoted("../../aé.yaml")
+
+    assert hidden.isascii()  # every character escaped (\u202E, \xAD, ...)
+    assert yaml.safe_load(hidden) == f"../../a{char}é.yaml"
+    assert shown == '"../../aé.yaml"'
+
+
+def test_i21_a_moved_ref_whose_file_name_holds_an_rlo_is_never_written_raw(
+    tmp_path: Path,
+) -> None:
+    """The same, end to end: a ref the contract escapes (``\\u202E``) stays escaped
+    in the fragment it moves to; no file the split writes holds the RLO itself."""
+    text = (
+        'id: x\nbuilds:\n  - id: a\n    properties:\n      parameters: {$ref: "./p\\u202Eq.yaml"}\n'
+    )
+    pair = make_pair(tmp_path, {NAME: text, "p\u202eq.yaml": "mode: full\n"})
+
+    after = split_and_check(pair)
+
+    assert 'parameters: {$ref: "../../p\\u202Eq.yaml"}' in text_of(after, "fragments/builds/a.yaml")
+    assert not [rel for rel, content in after.items() if "\u202e".encode("utf-8") in content]
+
+
 def test_i21_a_ref_written_as_a_block_scalar_is_rebased_by_the_data_split(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
