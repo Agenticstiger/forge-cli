@@ -178,7 +178,7 @@ class TestDiscoverSuccessKeepsPasswordOut:
     def test_emitted_contract_validates(self, monkeypatch, tmp_path):
         _run(monkeypatch, tmp_path, f"postgres://alice:{SENTINEL}@db/shop", _StubDiscoverer())
         doc = yaml.safe_load(_contracts(tmp_path)[0].read_text(encoding="utf-8"))
-        result = FluidSchemaManager().validate_contract(doc, "0.7.3", offline_only=True)
+        result = FluidSchemaManager().validate_contract(doc, doc["fluidVersion"], offline_only=True)
         assert result.is_valid, result.errors
 
     def test_no_password_in_uri_means_no_secret_ref_and_no_hint(

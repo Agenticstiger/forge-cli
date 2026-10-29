@@ -41,7 +41,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.observability.tracing import traced_stage as _traced_stage
@@ -1160,6 +1160,134 @@ def _write_apply_report(
             logger.warning(f"Failed to generate report: {e}")
 
 
+#: How many unsupported platform fields ``apply_platform_unsupported`` names.
+_PLATFORMS_SHOWN = 10
+
+
+def _refuse_local_plan_beside_outside_jobs(contract: Dict[str, Any]) -> None:
+    """Refuse to apply a plan.json with the local provider when a build of its
+    contract runs outside forge-cli.
+
+    ``fluid plan`` records abstract ops the local provider does not dispatch, so
+    for a plan it derives its own actions from the contract: the first build's
+    SQL into the first expose's file. Beside a job that runs outside forge-cli
+    that lands the wrong rows, over the job's own output. In the default mode
+    the contract file is planned by the local planner instead, which leaves
+    that job's output to it.
+    """
+    from fluid_build.util.contract import is_externally_run_build
+
+    for i, build in enumerate(contract.get("builds") or []):
+        if isinstance(build, dict) and is_externally_run_build(build):
+            raise CLIError(
+                2,
+                "apply_plan_runs_outside_forge",
+                {
+                    "error": (
+                        f"builds[{i}] runs outside forge-cli, and the local provider "
+                        "applies a plan.json by deriving its own actions from the "
+                        "contract, which would land what that job writes"
+                    ),
+                },
+            )
+
+
+#: A platform a contract declares: (field, provider key, run by a job outside forge-cli).
+_Declared = Tuple[str, str, bool]
+
+
+def _declared_platforms(contract: Dict[str, Any]) -> Tuple[List[_Declared], List[_Declared]]:
+    """Each expose's ``binding.platform`` and each build's
+    ``execution.runtime.platform``, spelled as ``providers._normalize_name``
+    spells a registry key, each with whether a job outside forge-cli writes
+    that expose or is that build."""
+    from fluid_build.util.contract import (
+        get_expose_id,
+        is_externally_run_build,
+        is_written_outside_forge,
+    )
+
+    def _key(platform: Any) -> str:
+        return str(platform).strip().lower().replace("-", "_")
+
+    builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
+    lands: List[_Declared] = []
+    for i, expose in enumerate(contract.get("exposes") or []):
+        binding = expose.get("binding") if isinstance(expose, dict) else None
+        platform = binding.get("platform") if isinstance(binding, dict) else None
+        if platform:
+            outside = is_written_outside_forge(get_expose_id(expose), builds)
+            lands.append((f"exposes[{i}].binding.platform", _key(platform), outside))
+    runs: List[_Declared] = []
+    for i, build in enumerate(contract.get("builds") or []):
+        execution = build.get("execution") if isinstance(build, dict) else None
+        runtime = execution.get("runtime") if isinstance(execution, dict) else None
+        platform = runtime.get("platform") if isinstance(runtime, dict) else None
+        if platform:
+            outside = is_externally_run_build(build)
+            runs.append((f"builds[{i}].execution.runtime.platform", _key(platform), outside))
+    return lands, runs
+
+
+def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> str:
+    """The provider simple-mode apply uses when ``--provider`` names none.
+
+    A ``binding.platform`` says where an expose lands and a build's
+    ``execution.runtime.platform`` where it runs; neither is a provider name,
+    though ``local``, ``gcp``, ``aws``, ``snowflake`` and ``redshift`` are also
+    providers. Read as one, a Kafka binding or a Flink build's
+    ``runtime.platform: kubernetes`` ended the run as ``provider_unknown``.
+
+    The platforms are consulted as before: every expose's, the last one naming
+    a provider choosing it; then, when that is ``local`` or there is none, the
+    builds', the first one naming a provider choosing it; ``local`` when none
+    does. What changed is a platform that names no provider:
+
+    * A build that runs outside forge-cli, and an expose such a build writes,
+      name where that job runs and writes. No provider applies them here (the
+      local planner lands nothing for them), so such a platform is passed over.
+    * Any other platform no registered provider serves stops the run with
+      ``apply_platform_unsupported`` (one the plugin policy removed is left to
+      ``build_provider``, which says so). It is never handed to another
+      provider, which would write it as a local placeholder file and report
+      success. A build's platform is checked when the provider is ``local``:
+      the local provider runs the builds' SQL on DuckDB, where a build declared
+      to run elsewhere was never meant to run.
+    """
+    from fluid_build import providers as registry
+
+    lands, runs = _declared_platforms(contract)
+    registry.discover_providers(logger)
+
+    def _served(name: str) -> bool:
+        return name in registry.PROVIDERS or name in registry.POLICY_BLOCKED
+
+    unsupported = [f"{w}: {n}" for w, n, outside in lands if not outside and not _served(n)]
+    named = [n for _w, n, _outside in lands if _served(n)]
+    name = named[-1] if named else "local"
+    if name == "local":
+        named = [n for _w, n, _outside in runs if _served(n)]
+        name = named[0] if named else name
+    if name == "local":
+        unsupported += [f"{w}: {n}" for w, n, outside in runs if not outside and not _served(n)]
+    if unsupported:
+        shown = ", ".join(unsupported[:_PLATFORMS_SHOWN])
+        if len(unsupported) > _PLATFORMS_SHOWN:
+            shown += f" and {len(unsupported) - _PLATFORMS_SHOWN} more"
+        raise CLIError(
+            2,
+            "apply_platform_unsupported",
+            {
+                "error": (
+                    f"no forge-cli provider applies {shown}, and fluid apply hands "
+                    "a platform to no other provider"
+                ),
+                "providers": ", ".join(sorted(registry.PROVIDERS)),
+            },
+        )
+    return name
+
+
 def _run_simple_apply(
     *,
     args,
@@ -1193,32 +1321,25 @@ def _run_simple_apply(
     """
     logger.info("🚀 Executing data product build (simple mode)")
 
-    # Detect provider and project from contract (check builds and exposes)
-    provider_name = "local"  # default
     project = None
     region = contract.get("region", "local")
 
-    # First try to get provider and project from exposes (most specific)
+    # The project comes from the first expose binding that names one.
     for expose in contract.get("exposes", []):
         binding = expose.get("binding", {})
         if "platform" in binding:
-            provider_name = binding["platform"]
-            # Get project from binding location
             location = binding.get("location", {})
             if "project" in location and not project:
                 project = location["project"]
 
-    # Then check builds if not found
-    if provider_name == "local":
-        for build in contract.get("builds", []):
-            runtime = build.get("execution", {}).get("runtime", {})
-            if "platform" in runtime:
-                provider_name = runtime["platform"]
-                break
-
-    # Explicit CLI flags override the contract-derived values.
-    if getattr(args, "provider", None):
-        provider_name = args.provider
+    # Explicit CLI flags override the contract-derived values; the contract's
+    # provider is worked out only when --provider names none.
+    requested = getattr(args, "provider", None)
+    if str(requested or "").strip().lower() == "auto":  # as --provider auto means elsewhere
+        requested = None
+    provider_name = requested or _simple_apply_provider(contract, logger)
+    if plan_data is not None and str(provider_name).strip().lower() == "local":
+        _refuse_local_plan_beside_outside_jobs(contract)
     if getattr(args, "project", None):
         project = args.project
     if getattr(args, "region", None):

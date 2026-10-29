@@ -47,8 +47,12 @@ def emit_contract(
     ``streams`` field carries the per-table list. This matches how all six
     runners interpret a multi-stream source.
     """
+    # The newest stable bundled schema, never a literal (one goes stale every release);
+    # imported here so jsonschema stays off the --help path.
+    from fluid_build.schema_manager import FluidSchemaManager
+
     return {
-        "fluidVersion": "0.7.3",
+        "fluidVersion": FluidSchemaManager.latest_bundled_version(),
         "kind": "DataProduct",
         "id": product_id,
         "name": name,

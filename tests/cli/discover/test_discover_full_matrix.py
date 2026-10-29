@@ -164,7 +164,9 @@ class TestContractEmitter:
             connection={"host": "x"},
             streams=streams,
         )
-        result = FluidSchemaManager().validate_contract(contract, "0.7.3", offline_only=True)
+        result = FluidSchemaManager().validate_contract(
+            contract, contract["fluidVersion"], offline_only=True
+        )
         assert result.is_valid, result.errors
 
     def test_safe_id_for_dotted_stream_names(self):
@@ -293,5 +295,7 @@ class TestPostgresDiscoverToContractE2E:
             },
             streams=streams,
         )
-        result = FluidSchemaManager().validate_contract(contract, "0.7.3", offline_only=True)
+        result = FluidSchemaManager().validate_contract(
+            contract, contract["fluidVersion"], offline_only=True
+        )
         assert result.is_valid, result.errors

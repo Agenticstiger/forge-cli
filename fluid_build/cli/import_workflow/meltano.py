@@ -61,8 +61,12 @@ class MeltanoImporter(Importer):
             report.mapped_one_to_one.append(f"loader.{loaders[0].get('name', 'unknown')}")
 
         product_id = f"bronze.{(meltano.get('default_environment') or 'imported')}_{tap_kind}"
+        # The newest stable bundled schema, never a literal (one goes stale every release);
+        # imported here so jsonschema stays off the --help path.
+        from fluid_build.schema_manager import FluidSchemaManager
+
         contract = {
-            "fluidVersion": "0.7.3",
+            "fluidVersion": FluidSchemaManager.latest_bundled_version(),
             "kind": "DataProduct",
             "id": product_id,
             "name": f"Imported from Meltano: {tap_name}",

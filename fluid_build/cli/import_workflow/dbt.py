@@ -454,8 +454,12 @@ def _assemble_bucket_contract(
         if split_by == "folder" and bucket_key != _ROOT_BUCKET
         else "models/"
     )
+    # The newest stable bundled schema, never a literal (one goes stale every release);
+    # imported here so jsonschema stays off the --help path.
+    from fluid_build.schema_manager import FluidSchemaManager
+
     contract: Dict[str, Any] = {
-        "fluidVersion": "0.7.3",
+        "fluidVersion": FluidSchemaManager.latest_bundled_version(),
         "kind": "DataProduct",
         "id": product_id,
         "name": f"Imported from dbt: {display}",
