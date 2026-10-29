@@ -698,18 +698,16 @@ def _contract_version(contract: Path) -> Optional[str]:
 
     Only that value is composed, so a ``$ref`` in it is followed, and a contract
     that does not compose yet (the fragment under check may be the reason) still
-    gives its version. ``None`` when it declares none.
+    gives its version. ``None`` when it declares none. Read as every contract is:
+    bounded, and only as a regular file, so a FIFO swapped in for it cannot hang
+    the run. ``contract.parent`` is already resolved (see :func:`_nearest_contract`).
     """
     from fluid_build.loader import compose_document, parse_contract_text
-    from fluid_build.util.safe_yaml import MAX_YAML_BYTES
+    from fluid_build.util.safe_yaml import read_bounded_text
 
-    with open(contract, "rb") as handle:
-        data = handle.read(MAX_YAML_BYTES + 1)
-    if len(data) > MAX_YAML_BYTES:
-        raise ValueError(f"the file is over the {MAX_YAML_BYTES}-byte cap")
-    document = parse_contract_text(data.decode("utf-8"), suffix=contract.suffix)
+    document = parse_contract_text(read_bounded_text(contract), suffix=contract.suffix)
     declared = {"fluidVersion": document.get("fluidVersion")}
-    version = compose_document(declared, contract.resolve().parent).document["fluidVersion"]
+    version = compose_document(declared, contract.parent).document["fluidVersion"]
     return str(version) if version else None
 
 
