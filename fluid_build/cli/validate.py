@@ -516,17 +516,20 @@ def _refuse_fragment_run_without_file(args: Any) -> None:
     """A fragment run names its file. Without one, workspace discovery would fill in the
     contract of the working directory, which would be validated as if it were the fragment."""
     kind = _fragment_kind(args)
-    if kind is not None:
-        raise CLIError(
-            1,
-            "fragment_file_required",
-            {
-                "error": (
-                    "--fragment checks one fragment file, and the file is required: "
-                    f"fluid validate --fragment {kind or 'KIND'} <file>"
-                )
-            },
+    if kind is None:
+        return
+    if "/" in kind or "\\" in kind or kind.lower().endswith((".yaml", ".yml", ".json")):
+        # The likeliest slip: the KIND left out, so the file was read as the KIND.
+        why = (
+            f"--fragment takes a KIND, then the file, and {kind!r} reads as the file: "
+            f"fluid validate --fragment KIND {kind}"
         )
+    else:
+        why = (
+            "--fragment checks one fragment file, and the file is required: "
+            f"fluid validate --fragment {kind or 'KIND'} <file>"
+        )
+    raise CLIError(1, "fragment_file_required", {"error": why})
 
 
 #: ``--fragment`` kinds that are not a ``$defs`` name: an expose's lists.

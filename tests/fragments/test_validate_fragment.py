@@ -655,6 +655,22 @@ def test_k14x_the_error_for_a_missing_file_says_how_to_call_it(
     assert f"fluid validate --fragment {shown} <file>" in " ".join((out + err).split())
 
 
+@pytest.mark.parametrize("name", ["orders.yaml", "orders.JSON", "exposes/orders"])
+def test_k14x_a_kind_left_out_is_named_as_the_file_it_was_read_as(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """``--fragment <file>`` with the KIND left out: the file was read as the KIND, and the
+    error says so instead of asking for a file that was given."""
+    monkeypatch.chdir(tmp_path)
+
+    rc, out, err = _validate(capsys, "--fragment", name)
+
+    flat = " ".join((out + err).split())
+    assert rc == 1 and "fragment_file_required" in flat
+    assert f"--fragment takes a KIND, then the file, and '{name}' reads as the file" in flat
+    assert f"fluid validate --fragment KIND {name}" in flat
+
+
 # ── K-15 ────────────────────────────────────────────────────────────────
 
 _VALID = {

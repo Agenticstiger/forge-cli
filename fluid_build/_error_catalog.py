@@ -148,6 +148,22 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "schema-evolution",
     ),
+    "schema_version_required": (
+        [
+            "Name the version: fluid validate --fragment KIND <file> --schema-version <version>",
+            "Run 'fluid validate --list-versions' to see the supported versions",
+        ],
+        "schema-evolution",
+    ),
+    # ── validate --fragment ────────────────────────────────────────────────
+    "fragment_file_required": (
+        ["Give the kind, then the file: fluid validate --fragment expose <file>"],
+        None,
+    ),
+    "fragment_bundle_unsupported": (
+        ["Validate the bundle without --fragment: fluid validate <bundle>.tgz"],
+        None,
+    ),
     "contract_version_unsupported": (
         [
             "Migrate the contract to the current 0.7.x schema",
