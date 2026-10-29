@@ -44,6 +44,7 @@ except ImportError:
     _HAS_SDK_CONTRACT = False
 
 from fluid_build.util.contract import (
+    builds_writing_expose,
     get_builds,
     get_consumes,
     get_expose_id,
@@ -523,10 +524,7 @@ def _produced_outside_forge(expose_id: Any, builds: List[Dict[str, Any]], log: A
     a local table under its name could publish another build's rows, so it is
     not landed and the warning asks for ``outputs``.
     """
-    dict_builds = [b for b in builds if isinstance(b, dict)]
-    producers = [
-        b for b in dict_builds if isinstance(b.get("outputs"), list) and expose_id in b["outputs"]
-    ] or [b for b in dict_builds if not isinstance(b.get("outputs"), list)]
+    producers = builds_writing_expose(expose_id, builds)
     outside = [b for b in producers if is_externally_run_build(b)]
     if not outside:
         return False

@@ -381,19 +381,23 @@ class TestRunSimpleModeProviderDetection:
     def test_builds_fallback_provider_detection(
         self, mock_load, mock_bp, _mock_actions, _mock_metric, _mock_success, _mock_start
     ):
-        """Lines 419-424: provider detected from builds[].execution.runtime.platform."""
+        """Provider detected from builds[].execution.runtime.platform when it names
+        one (a platform that names none is refused: test_apply_simple_provider)."""
+        from fluid_build import providers as registry
         from fluid_build.cli.apply import run
 
         mock_load.return_value = {
             "id": "proj",
-            "builds": [{"execution": {"runtime": {"platform": "spark"}}}],
+            "builds": [{"execution": {"runtime": {"platform": "snowflake"}}}],
         }
         mock_bp.return_value = MagicMock()
 
-        result = run(self._make_args(dry_run=True), LOG)
+        registry.discover_providers(LOG)
+        with patch.dict(registry.PROVIDERS, {"snowflake": registry.PROVIDERS.get("snowflake")}):
+            result = run(self._make_args(dry_run=True), LOG)
         assert result == 0
         call_args = mock_bp.call_args
-        assert call_args[0][0] == "spark"
+        assert call_args[0][0] == "snowflake"
 
     @patch("fluid_build.cli.apply.RICH_AVAILABLE", False)
     @patch("fluid_build.cli.apply.log_operation_start")

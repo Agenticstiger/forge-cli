@@ -46,10 +46,18 @@ LOG = logging.getLogger("test_plugin_policy_governs_builtins")
 def _restore_registries():
     """Both registries are process-global; snapshot and restore them."""
     providers_before = dict(registry.PROVIDERS)
+    blocked_before = set(registry.POLICY_BLOCKED)
+    discovered_before = registry._DISCOVERY_DONE
     iac_before = dict(iac_registry.IAC_PLUGINS)
     yield
     registry.PROVIDERS.clear()
     registry.PROVIDERS.update(providers_before)
+    registry.POLICY_BLOCKED.clear()
+    registry.POLICY_BLOCKED.update(blocked_before)
+    # Restored with the registry it describes: a snapshot taken before this
+    # process discovered anything must not be left behind marked discovered,
+    # or every later discover_providers() call keeps the partial registry.
+    registry._DISCOVERY_DONE = discovered_before
     iac_registry.IAC_PLUGINS.clear()
     iac_registry.IAC_PLUGINS.update(iac_before)
 
@@ -81,6 +89,56 @@ class TestBlocklistGovernsBuiltInProviders:
         registry.PROVIDERS.pop("snowflake", None)
         registry.register_provider("snowflake", object, logger=LOG)
         assert "snowflake" not in registry.PROVIDERS
+
+    def test_a_blocked_builtin_is_recorded_as_blocked_until_the_policy_changes(self, monkeypatch):
+        """``fluid apply`` tells a provider the policy removed from a platform no
+        provider is named after by this record, not by asking the policy about an
+        arbitrary platform string."""
+        monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "snowflake")
+        _rediscover()
+        assert "snowflake" in registry.POLICY_BLOCKED
+        assert "databricks" not in registry.POLICY_BLOCKED
+        monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST")
+        _rediscover()
+        assert "snowflake" not in registry.POLICY_BLOCKED
+
+    def test_every_place_the_policy_turns_a_provider_away_records_it(self, monkeypatch):
+        """An explicit registration and a plugin entry point are both recorded,
+        and ``clear_providers`` forgets them with the registry."""
+        monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "snowflake,mycloud")
+        registry.POLICY_BLOCKED.discard("snowflake")
+        registry.register_provider("snowflake", object, logger=LOG)
+        assert "snowflake" in registry.POLICY_BLOCKED
+
+        class _EntryPoint:
+            name = "mycloud"
+
+            def load(self):  # pragma: no cover - the policy turns it away first
+                raise AssertionError("a blocked plugin was loaded")
+
+        class _EntryPoints:  # the 3.12+ SelectableGroups shape
+            def select(self, group):
+                return [_EntryPoint()] if group == "fluid_build.providers" else []
+
+        monkeypatch.setattr(registry.importlib.metadata, "entry_points", _EntryPoints)
+        registry._discover_entrypoints(LOG)
+        assert "mycloud" in registry.POLICY_BLOCKED
+
+        registry.clear_providers()
+        assert not registry.POLICY_BLOCKED
+
+    def test_a_provider_registered_at_import_stays_blocked_through_rediscovery(self, monkeypatch):
+        """redshift registers when the aws package is imported, and a cached
+        module is not imported again: forgetting every record at the start of a
+        rediscovery reported a blocked redshift as no provider at all."""
+        monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "redshift")
+        registry.register_provider("redshift", object, logger=LOG)  # as at import
+        assert "redshift" in registry.POLICY_BLOCKED
+        _rediscover()
+        assert "redshift" in registry.POLICY_BLOCKED
+        monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST")
+        _rediscover()
+        assert "redshift" not in registry.POLICY_BLOCKED  # allowed again, forgotten
 
     def test_allowlist_excludes_unlisted_builtins(self, monkeypatch):
         """An allowlist means "only these load" — the built-ins were silently
