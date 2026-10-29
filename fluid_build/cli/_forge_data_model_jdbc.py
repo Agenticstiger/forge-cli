@@ -103,7 +103,7 @@ def _run_from_jdbc_source(
         )
         return 1
 
-    # Synthesise a minimal valid v0.7.3 contract from the introspected
+    # Synthesise a minimal valid contract (the v0.7.3 shape) from the introspected
     # tables. Each table becomes one ``exposes[]`` entry with its column
     # list. Required top-level fields: fluidVersion, kind, id, name,
     # metadata (with owner), exposes (with exposeId, kind, binding,
