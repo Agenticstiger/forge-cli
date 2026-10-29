@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Contracts forge-cli writes declare the newest stable schema, 0.7.5, not 0.7.3.**
+  `fluid import` (airbyte, dbt, dlt, meltano, singer), `fluid product-new`, `fluid init
+  --discover`, `fluid forge data-model --source <jdbc url>`, the `fluid forge` templates,
+  product-type scaffolds and live contract preview all typed `fluidVersion: 0.7.3`, two stable
+  versions behind the templates (#619), so a contract they wrote started without what 0.7.4 and
+  0.7.5 added. They read the newest stable bundled schema now, so a promoted preview moves them
+  too. The shape they write is unchanged, and 0.7.5 accepts it wherever 0.7.3 did.
+
 ### Fixed
 
 - **`fluid validate --fragment` no longer guesses a schema version.** With no `--schema-version`

@@ -166,9 +166,10 @@ class TestGenerateContract:
         ctx = _make_context()
         contract = template.generate_contract(ctx)
         assert "fluidVersion" in contract
-        # Templates emit v0.7.3 directly via the spec-driven builder.
-        # v0.5.7 was the legacy shape that the runtime had to coerce.
-        assert contract["fluidVersion"] == "0.7.3"
+        # Templates build the v0.7.3 shape via the spec-driven builder and
+        # declare the newest stable schema, which accepts it. v0.5.7 was the
+        # legacy shape that the runtime had to coerce.
+        assert contract["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
 
     def test_has_kind_data_product(self):
         template = AnalyticsTemplate()

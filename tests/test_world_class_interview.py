@@ -417,7 +417,9 @@ def test_streaming_contract_preview_renders_after_each_answer(tmp_path, silent_c
 
     # Empty context — produces a placeholder schema-shaped contract
     contract_empty = shape_contract_from_context({})
-    assert contract_empty["fluidVersion"] == "0.7.3"
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    assert contract_empty["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
     assert contract_empty["kind"] == "DataProduct"
 
     # Mid-flow: only goal answered

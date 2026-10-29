@@ -64,8 +64,12 @@ def shape_contract_from_context(ctx: Mapping[str, Any]) -> Dict[str, Any]:
     domain = (ctx.get("domain") or "—").strip()
     owner_team = (ctx.get("owner_team") or ctx.get("owner") or "—").strip()
 
+    # The newest stable bundled schema, never a literal (one goes stale every release);
+    # imported here so jsonschema stays off the --help path.
+    from fluid_build.schema_manager import FluidSchemaManager
+
     contract: Dict[str, Any] = {
-        "fluidVersion": "0.7.3",
+        "fluidVersion": FluidSchemaManager.latest_bundled_version(),
         "kind": "DataProduct",
         "id": _suggest_id(name, domain, layer),
         "name": name,

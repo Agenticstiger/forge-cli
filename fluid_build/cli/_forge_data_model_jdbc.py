@@ -123,8 +123,12 @@ def _run_from_jdbc_source(
     product_id = base_name.lower().replace(" ", "_")
     if not _FLUID_ID_RE.match(product_id):
         product_id = slugify_identifier(base_name, fallback="source_model")
+    # The newest stable bundled schema, never a literal (one goes stale every release);
+    # imported here so jsonschema stays off the --help path.
+    from fluid_build.schema_manager import FluidSchemaManager
+
     contract: Dict[str, Any] = {
-        "fluidVersion": "0.7.3",
+        "fluidVersion": FluidSchemaManager.latest_bundled_version(),
         "kind": "DataProduct",
         "id": product_id,
         "name": base_name,

@@ -33,8 +33,11 @@ def register(subparsers: argparse._SubParsersAction):
     p.set_defaults(cmd=COMMAND, func=run)
 
 
+#: The skeleton ``run`` writes. Its ``fluidVersion`` is stamped there, from the
+#: newest stable bundled schema: a literal goes stale every release, and this
+#: module-level dict cannot read the schema at import time without dragging
+#: jsonschema onto the --help path.
 SAMPLE = {
-    "fluidVersion": "0.7.3",
     "kind": "DataProduct",
     "id": "gold.customer360_v1",
     "name": "Customer 360",
@@ -64,10 +67,16 @@ def run(args, logger: logging.Logger) -> int:
         pid = args.id
         base = os.path.join(args.out_dir, pid.replace(".", "_"))
         os.makedirs(base, exist_ok=True)
-        SAMPLE["id"] = pid
-        SAMPLE["name"] = pid.split(".")[-1]
+        from fluid_build.schema_manager import FluidSchemaManager
+
+        contract = {
+            "fluidVersion": FluidSchemaManager.latest_bundled_version(),
+            **SAMPLE,
+            "id": pid,
+            "name": pid.split(".")[-1],
+        }
         path = os.path.join(base, "contract.fluid.json")
-        atomic_write(path, json.dumps(SAMPLE, indent=2))
+        atomic_write(path, json.dumps(contract, indent=2))
         info(logger, "product_new_written", path=path)
         return 0
     except Exception as e:

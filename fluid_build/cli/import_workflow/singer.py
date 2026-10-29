@@ -63,8 +63,12 @@ class SingerImporter(Importer):
         # Heuristic: derive the tap kind from the file name (`tap-postgres.json` → postgres).
         tap_kind = tap_cfg_path.stem.replace("tap-", "")
         product_id = f"bronze.singer_{tap_kind}"
+        # The newest stable bundled schema, never a literal (one goes stale every release);
+        # imported here so jsonschema stays off the --help path.
+        from fluid_build.schema_manager import FluidSchemaManager
+
         return {
-            "fluidVersion": "0.7.3",
+            "fluidVersion": FluidSchemaManager.latest_bundled_version(),
             "kind": "DataProduct",
             "id": product_id,
             "name": f"Imported from Singer: tap-{tap_kind}",

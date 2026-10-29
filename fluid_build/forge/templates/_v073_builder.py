@@ -287,7 +287,13 @@ def build_contract(
     *,
     spec: TemplateSpec,
     project_config: Mapping[str, Any],
-    fluid_version: str = "0.7.3",
+    # None, not a literal: a function default is evaluated at import time, so a
+    # version typed here freezes. Resolved below to the newest STABLE bundled
+    # schema. NOTE this changes the DECLARED version only - the contract SHAPE
+    # this builder produces is still the v0.7.3 canonical shape its name refers
+    # to, and newer schemas accept it (verified: every 0.7.2-shaped template
+    # validates at 0.7.5).
+    fluid_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a v0.7.3-canonical contract for *spec* + *project_config*.
 
@@ -295,6 +301,11 @@ def build_contract(
     no coercion needed. Equivalence axiom enforced: layer + productType
     are populated as a canonical pair.
     """
+    if fluid_version is None:
+        from fluid_build.schema_manager import FluidSchemaManager
+
+        fluid_version = FluidSchemaManager.latest_bundled_version()
+
     project_name = project_config.get("name") or f"{spec.template_name}-product"
     domain = project_config.get("domain") or "analytics"
     owner = project_config.get("owner") or f"{spec.template_name}-team"
