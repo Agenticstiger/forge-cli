@@ -40,7 +40,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Callable, Collection, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
 
 COMMAND = "split"
 
@@ -154,6 +154,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         return 0
 
     before, problem = _composed(contract_path)
+    root_out = out_dir / contract_path.name
+    # What the real run would refuse before writing, the dry run refuses too.
+    problem = problem or _unsafe_target(out_dir, root_out, [site.target for site in sites])
     if problem:
         sys.stderr.write(f"❌ Split not written: {problem}\n")
         return 1
@@ -163,7 +166,6 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         return 0
 
     root_text, fragments, lost_comments = _split(contract_path, contract, sites, parts, taken)
-    root_out = out_dir / contract_path.name
     problem = _write_checked(before, root_out, root_text, fragments, out_dir)
     if problem:
         sys.stderr.write(f"❌ Split not written: {problem}\n")
@@ -204,6 +206,22 @@ def _print_dry_run(contract: Dict[str, Any], parts: Sequence[str], taken: Collec
     sys.stderr.write(f"Would create {len(targets)} fragments:\n")
     for target in targets:
         sys.stderr.write(f"   {target}\n")
+
+
+def _unsafe_target(out_dir: Path, root_out: Path, rel_paths: Iterable[str]) -> Optional[str]:
+    """Why the split cannot be written where it goes, if it cannot: a symlink at
+    the root's name, or a symlinked directory on the way to a fragment, where a
+    file written would land outside the output directory. Checked before the
+    dry run lists anything, and again before the first write."""
+    if root_out.is_symlink():
+        # open(..., "w") would write through it, a dangling one included, and the
+        # undo could only remove the link, leaving the written file where it points.
+        return f"{root_out} is a symlink; split writes no file through one"
+    for rel_path in rel_paths:
+        link = _symlink_on_the_way(out_dir, rel_path)
+        if link is not None:
+            return f"{link} is a symlink; split writes no file through one"
+    return None
 
 
 def _symlink_on_the_way(out_dir: Path, rel_path: str) -> Optional[Path]:
@@ -276,14 +294,9 @@ def _write_checked(
     """
     from fluid_build.loader import compose_contract
 
-    if root_out.is_symlink():
-        # open(..., "w") would write through it, a dangling one included, and the
-        # undo could only remove the link, leaving the written file where it points.
-        return f"{root_out} is a symlink; split writes no file through one"
-    for rel_path in fragments:
-        link = _symlink_on_the_way(out_dir, rel_path)
-        if link is not None:
-            return f"{link} is a symlink; split writes no file through one"
+    unsafe = _unsafe_target(out_dir, root_out, fragments)
+    if unsafe:
+        return unsafe
     # Every text is encoded before a file or a directory is made: one with no
     # UTF-8 form (a lone surrogate) is refused with nothing to take back. The
     # bytes are written as they are, so a \r in a text stays a \r.

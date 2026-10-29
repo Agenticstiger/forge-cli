@@ -2581,6 +2581,37 @@ def test_i33_a_symlinked_fragments_directory_never_leaves_a_fragment_outside_out
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs symlinks")
+@pytest.mark.parametrize(
+    "link,parts",
+    [("fragments", None), ("fragments/exposes", None), ("sql", "sql")],
+    ids=["fragments", "a-directory-below-it", "sql"],
+)
+def test_i33_a_symlinked_directory_on_the_way_is_refused_by_the_dry_run_and_the_real_run(
+    tmp_path: Path, link: str, parts: Optional[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SP-08: a directory on the way to a fragment that links outside ``--out`` is
+    refused before anything is written, there or through the link, however deep
+    it sits; and the dry run, which lists what the real run writes, refuses it
+    the same way instead of listing files that would never be written."""
+    pair = make_pair(tmp_path, SPLIT_ALL_FILES)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (pair.split / link).parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(outside, pair.split / link)
+    args = ["--parts", parts] if parts else []
+    before = digest(tmp_path)
+    capsys.readouterr()
+
+    for dry_run in (["--dry-run"], []):
+        assert split(pair.split_contract, *dry_run, *args) == 1
+
+        err = capsys.readouterr().err
+        assert f"{pair.split / link} is a symlink; split writes no file through one" in err
+        assert "Would create" not in err
+        assert digest(tmp_path) == before  # not a file or a directory, inside or out
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs symlinks")
 def test_i33_a_symlinked_sql_directory_is_refused_and_no_text_is_left_outside(
     tmp_path: Path,
 ) -> None:
