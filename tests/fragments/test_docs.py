@@ -29,6 +29,7 @@ import datetime
 import errno
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -609,6 +610,76 @@ def test_f23_docs_src_lists_a_root_contract_of_each_suffix_and_never_its_overlay
     assert _docs(src, out, src=True) == 0
 
     assert [Path(r["path"]).name for r in _index(out)] == [f"contract.fluid{suffix}"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+def test_f23_docs_src_does_not_follow_a_symlinked_directory(tmp_path: Path) -> None:
+    """Two links to ``.`` in --src made the glob walk without end, and a link out of --src
+    listed the contracts outside it. In a subprocess with a timeout: a loop would hang."""
+    src = tmp_path / "src"
+    _put(src / "p" / "contract.fluid.yaml", _min_doc("inside.one"))
+    _put(tmp_path / "elsewhere" / "q" / "contract.fluid.yaml", _min_doc("outside.one"))
+    (src / "loop1").symlink_to(".")
+    (src / "loop2").symlink_to(".")
+    (src / "link-out").symlink_to(tmp_path / "elsewhere")
+
+    done = _run_cli(
+        ["docs", "--src", str(src), "--out", str(tmp_path / "site")], tmp_path, timeout=60
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert [r["path"] for r in _index(tmp_path / "site")] == [
+        str(src / "p" / "contract.fluid.yaml")
+    ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+def test_f23_docs_src_lists_a_contract_once_and_never_one_that_links_out_of_src(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from fluid_build.cli import docs_build
+
+    src = tmp_path / "src"
+    orders = _put(src / "orders" / "contract.fluid.yaml", _min_doc("orders.one"))
+    (src / "alias").mkdir()
+    (src / "alias" / "contract.fluid.yaml").symlink_to(orders)
+    outside = _put(tmp_path / "elsewhere" / "contract.fluid.yaml", _min_doc("outside.one"))
+    (src / "leak").mkdir()
+    (src / "leak" / "contract.fluid.yaml").symlink_to(outside)
+    (src / "linked-dir").symlink_to(tmp_path / "elsewhere")
+    logger = logging.getLogger("test.docs.src")
+    caplog.set_level(logging.DEBUG, logger=logger.name)
+    args = types.SimpleNamespace(src=str(src), files=None, out=str(tmp_path / "site"))
+
+    assert docs_build.run(args, logger) == 0
+
+    assert [r["path"] for r in _index(tmp_path / "site")] == [str(orders)]
+    said = [r.getMessage() for r in caplog.records]
+    assert f"docs_src_link_not_followed: {src / 'linked-dir'}" in said
+    assert any(m.startswith(f"docs_contract_outside_src: {src / 'leak'}") for m in said)
+
+
+def test_f23_docs_src_is_a_directory_name_and_never_a_pattern(tmp_path: Path) -> None:
+    """``--src 'my [team] products'`` was a glob character class, so the catalog came out
+    empty without a word."""
+    src = tmp_path / "my [team] products"
+    _put(src / "p" / "contract.fluid.yaml", _min_doc("team.one"))
+    out = tmp_path / "site"
+
+    assert _docs(src, out, src=True) == 0
+
+    assert [r["id"] for r in _index(out)] == ["team.one"]
+
+
+def test_f23_docs_src_skips_a_hidden_directory_as_the_glob_did(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    _put(src / "p" / "contract.fluid.yaml", _min_doc("shown.one"))
+    _put(src / ".cache" / "p" / "contract.fluid.yaml", _min_doc("hidden.one"))
+    out = tmp_path / "site"
+
+    assert _docs(src, out, src=True) == 0
+
+    assert [r["id"] for r in _index(out)] == ["shown.one"]
 
 
 def test_j04_a_contract_that_failed_has_a_row_in_the_html_index_that_says_why(

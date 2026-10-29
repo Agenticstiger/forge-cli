@@ -61,7 +61,7 @@ def register(subparsers: argparse._SubParsersAction):
 
 def run(args, logger: logging.Logger) -> int:
     try:
-        paths = _resolve_contract_paths(args)
+        paths = _resolve_contract_paths(args, logger)
         # Load full contracts once so we can render both summaries and
         # per-contract drill-in pages without re-parsing.
         contracts = {p: _load_contract_quiet(p, logger) for p in paths}
@@ -188,20 +188,46 @@ def _stage(target: str, data: bytes) -> str:
     return temp
 
 
-def _resolve_contract_paths(args) -> list[str]:
+def _resolve_contract_paths(args, logger: logging.Logger) -> list[str]:
     """Resolve the set of contract files to summarize.
 
     ``--files`` wins when present (explicit glob mode); otherwise fall
-    back to the recursive scan under ``--src``, which lists the root contracts
-    (:data:`_CONTRACT_FILE_NAMES`) and not the overlays beside them.
+    back to the recursive scan under ``--src`` (:func:`_root_contracts`).
     """
     files_glob = getattr(args, "files", None)
     if files_glob:
         return sorted(glob.glob(files_glob, recursive=True))
-    found: set[str] = set()
-    for name in _CONTRACT_FILE_NAMES:
-        found.update(glob.glob(f"{args.src}/**/{name}", recursive=True))
-    return sorted(found)
+    return _root_contracts(args.src, logger)
+
+
+def _root_contracts(src: str, logger: logging.Logger) -> list[str]:
+    """Every root contract (:data:`_CONTRACT_FILE_NAMES`, never the overlay
+    beside one) under ``src``, sorted, each file once.
+
+    ``src`` is walked, not globbed, so a ``[`` in its name is a character and
+    not a pattern that matches nothing. A symlinked directory is not followed:
+    two links to ``.`` were a walk without end, and a link out of ``src``
+    listed what is outside it. A hidden directory is skipped, as the glob
+    skipped it. A root contract that is a symlink is listed when the file it
+    names is inside ``src`` and not listed by its own path already.
+    """
+    top = os.path.normcase(os.path.join(os.path.realpath(src), ""))
+    candidates: list[str] = []
+    for directory, dirs, names in os.walk(src):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for d in dirs:
+            if os.path.islink(os.path.join(directory, d)):
+                logger.debug("docs_src_link_not_followed: %s", os.path.join(directory, d))
+        candidates += [os.path.join(directory, n) for n in names if n in _CONTRACT_FILE_NAMES]
+    listed: dict[str, str] = {}
+    # A file by its own path before by a symlink to it.
+    for path in sorted(candidates, key=lambda p: (os.path.islink(p), p)):
+        real = os.path.realpath(path)
+        if not os.path.normcase(real).startswith(top):
+            logger.debug("docs_contract_outside_src: %s -> %s", path, real)
+        elif real not in listed:
+            listed[real] = path
+    return sorted(listed.values())
 
 
 #: What an integer too long to turn into text is shown as. A YAML hex literal can
