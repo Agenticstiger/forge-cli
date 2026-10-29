@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid validate --quiet` printed nothing when a run stopped** on an error such as
   `contract_load_failed`, although `--quiet` is "errors only". The error now prints; the hints
   and docs link stay hidden.
+- **`fluid validate missing.fluid.yaml` said "Contract file not found: None"**; it names the
+  file again.
+
+### Security
+
+- **`fluid validate` sent a terminal escape sequence in a message to the terminal.** An argument
+  or a contract value it quotes back (a `$ref` in `contract_load_failed`) could retitle the
+  window, rewrite lines or, where the terminal allows it, write the clipboard. Control characters
+  in those messages are now printed as text (`\x1b`), as the CLI's own error line already did.
 
 ## [0.25.0] — 2026-10-28
 
