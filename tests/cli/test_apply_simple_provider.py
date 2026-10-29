@@ -193,6 +193,16 @@ class TestNoProviderServesIt:
         error = _refusal(contract)
         assert "builds[1].execution.runtime.platform: composer" in error.context["error"]
 
+    def test_one_beside_the_exposes_that_choose_a_cloud(self) -> None:
+        # [kafka, snowflake, gcp]: the last expose chose gcp, which was then handed
+        # the Kafka topic too.
+        contract = _contract(
+            [_expose("t", "kafka"), _expose("a", "snowflake"), _expose("b", "gcp")]
+        )
+        error = _refusal(contract)
+        assert "exposes[0].binding.platform: kafka" in error.context["error"]
+        assert error.suggestions  # the catalog's guidance came with it
+
     def test_every_one_is_named(self) -> None:
         contract = _contract(
             [_expose("a", "kafka"), _expose("b", "local"), _expose("c", "databricks")],
@@ -223,6 +233,25 @@ class TestUnderAPluginPolicy:
         monkeypatch.setenv(variable, value)
         contract = _contract([_expose("t", "databricks"), _expose("orders", "local")])
         assert "exposes[0].binding.platform: databricks" in _refusal(contract).context["error"]
+
+
+class TestTheRegistry:
+    def test_the_check_discovers_the_providers_itself(self) -> None:
+        # With nothing discovered yet, a local contract must not be refused for
+        # want of a registry: the check runs discovery before it reads it.
+        from fluid_build import providers as registry
+
+        saved = (dict(registry.PROVIDERS), set(registry.POLICY_BLOCKED))
+        registry.clear_providers()
+        try:
+            contract = _contract([_expose("orders", "local")])
+            assert _simple_apply_provider(contract, LOG) == "local"
+        finally:
+            registry.PROVIDERS.clear()
+            registry.PROVIDERS.update(saved[0])
+            registry.POLICY_BLOCKED.clear()
+            registry.POLICY_BLOCKED.update(saved[1])
+            registry.discover_providers(LOG)
 
 
 class TestTheMessage:
@@ -265,6 +294,23 @@ class TestTheChoiceIsUnchanged:
             [_sql(f"b{i}", [], p) for i, p in enumerate(runtimes)],
         )
         assert _simple_apply_provider(contract, LOG) == expected
+
+    def test_a_flink_builds_runtime_that_names_a_provider_still_chooses_it(self) -> None:
+        # A Flink job on AWS Managed Service for Apache Flink: runtime aws chose
+        # aws before, and still does; only a platform that names no provider is
+        # passed over.
+        contract = _contract([_expose("orders", "local")], [_flink(["orders"], shape="engine")])
+        contract["builds"][0]["execution"] = {"runtime": {"platform": "aws"}}
+        assert _simple_apply_provider(contract, LOG) == "aws"
+
+    def test_the_builds_that_choose_a_cloud_are_not_checked_further(self) -> None:
+        # The first build named gcp, which applies the contract; a later build's
+        # composer runtime is gcp's to run, not the local provider's.
+        contract = _contract(
+            [_expose("orders", "local")],
+            [_sql("a", ["orders"], "gcp"), _sql("b", [], "composer")],
+        )
+        assert _simple_apply_provider(contract, LOG) == "gcp"
 
     def test_an_expose_a_flink_job_writes_still_names_its_provider(self) -> None:
         # Its platform is passed over only when it names no provider: here the
@@ -316,13 +362,16 @@ def _apply(contract: Dict[str, Any], *flags: str) -> int:
     return apply_run(args, LOG)
 
 
-def _flink_beside_a_local_product() -> Dict[str, Any]:
+def _flink_beside_a_local_product(shape: str = "engine") -> Dict[str, Any]:
     """A SQL build landing ``orders`` and a Flink job writing ``flink_out``,
     with the Flink job's expose first."""
-    return _contract(
+    contract = _contract(
         [_expose("flink_out", "local"), _expose("orders", "local")],
-        [_sql("make_orders", ["orders"]), _flink(["flink_out"])],
+        [_sql("make_orders", ["orders"]), _flink(["flink_out"], shape=shape)],
     )
+    if shape == "language":
+        contract["fluidVersion"] = "0.7.5"
+    return contract
 
 
 def _plan(contract: Dict[str, Any]) -> str:
@@ -372,13 +421,14 @@ class TestFluidApply:
         assert exc.value.event == "apply_platform_unsupported"
         assert _landed(workspace) == []
 
+    @pytest.mark.parametrize("shape", ["engine", "language"])
     def test_a_local_plan_beside_a_flink_job_is_refused_and_overwrites_nothing(
-        self, workspace: Path
+        self, workspace: Path, shape: str
     ) -> None:
         # The local provider applies a plan.json by deriving its own actions from
         # the contract: the first build's SQL into the first expose's file, which
         # here is the Flink job's. It overwrote that file and reported success.
-        plan = _plan(_flink_beside_a_local_product())
+        plan = _plan(_flink_beside_a_local_product(shape))
         (workspace / "out").mkdir()
         (workspace / "out" / "flink_out.csv").write_text("written-by-flink\n", "utf-8")
         for flags in ((), ("--provider", "local")):
@@ -386,6 +436,7 @@ class TestFluidApply:
                 apply_run(build_parser().parse_args(["apply", plan, *flags, "--yes"]), LOG)
             assert exc.value.event == "apply_plan_runs_outside_forge"
             assert "builds[1]" in exc.value.context["error"]
+            assert exc.value.suggestions  # the catalog's guidance came with it
         assert (workspace / "out" / "flink_out.csv").read_text("utf-8") == "written-by-flink\n"
 
     def test_the_contract_file_applies_and_leaves_the_flink_output_alone(
@@ -400,6 +451,11 @@ class TestFluidApply:
         contract = _contract([_expose("orders", "local")], [_sql("make_orders", ["orders"])])
         args = build_parser().parse_args(["apply", _plan(contract), "--yes"])
         assert apply_run(args, LOG) == 0
+
+    def test_provider_auto_leaves_the_choice_to_the_contract(self, workspace: Path) -> None:
+        # --provider auto (or FLUID_PROVIDER=auto) ended as provider_unknown 'auto'.
+        contract = _contract([_expose("orders", "local")], [_sql("make_orders", ["orders"])])
+        assert _apply(contract, "--provider", "auto") == 0
 
     def test_provider_still_overrides(self, workspace: Path) -> None:
         contract = _contract([_expose("events_out", "kafka")])

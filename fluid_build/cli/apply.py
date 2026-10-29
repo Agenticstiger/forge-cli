@@ -1171,8 +1171,9 @@ def _refuse_local_plan_beside_outside_jobs(contract: Dict[str, Any]) -> None:
     ``fluid plan`` records abstract ops the local provider does not dispatch, so
     for a plan it derives its own actions from the contract: the first build's
     SQL into the first expose's file. Beside a job that runs outside forge-cli
-    that lands the wrong rows, over the job's own output. The contract file is
-    planned by the local planner instead, which leaves that job's output to it.
+    that lands the wrong rows, over the job's own output. In the default mode
+    the contract file is planned by the local planner instead, which leaves
+    that job's output to it.
     """
     from fluid_build.util.contract import is_externally_run_build
 
@@ -1212,9 +1213,9 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
       ``apply_platform_unsupported`` (one the plugin policy removed is left to
       ``build_provider``, which says so). It is never handed to another
       provider, which would write it as a local placeholder file and report
-      success. A build's platform is checked when the builds are consulted:
-      the local provider runs their SQL on DuckDB, where a build declared to
-      run elsewhere was never meant to run.
+      success. A build's platform is checked when the provider is ``local``:
+      the local provider runs the builds' SQL on DuckDB, where a build declared
+      to run elsewhere was never meant to run.
     """
     from fluid_build import providers as registry
     from fluid_build.util.contract import (
@@ -1255,9 +1256,10 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
     named = [n for _w, n, _outside in lands if _served(n)]
     name = named[-1] if named else "local"
     if name == "local":
-        unsupported += [f"{w}: {n}" for w, n, outside in runs if not outside and not _served(n)]
         named = [n for _w, n, _outside in runs if _served(n)]
         name = named[0] if named else name
+    if name == "local":
+        unsupported += [f"{w}: {n}" for w, n, outside in runs if not outside and not _served(n)]
     if unsupported:
         shown = ", ".join(unsupported[:_PLATFORMS_SHOWN])
         if len(unsupported) > _PLATFORMS_SHOWN:
@@ -1322,7 +1324,10 @@ def _run_simple_apply(
 
     # Explicit CLI flags override the contract-derived values; the contract's
     # provider is worked out only when --provider names none.
-    provider_name = getattr(args, "provider", None) or _simple_apply_provider(contract, logger)
+    requested = getattr(args, "provider", None)
+    if str(requested or "").strip().lower() == "auto":  # as --provider auto means elsewhere
+        requested = None
+    provider_name = requested or _simple_apply_provider(contract, logger)
     if plan_data is not None and str(provider_name).strip().lower() == "local":
         _refuse_local_plan_beside_outside_jobs(contract)
     if getattr(args, "project", None):

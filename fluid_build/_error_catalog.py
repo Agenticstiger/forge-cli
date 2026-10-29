@@ -108,8 +108,9 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     "apply_plan_runs_outside_forge": (
         [
-            "Apply the contract file instead (fluid apply contract.fluid.yaml): the local "
-            "planner plans it, and leaves what a job outside forge-cli writes to that job",
+            "In the default mode, apply the contract file instead (fluid apply "
+            "contract.fluid.yaml): the local planner plans it, and leaves what a job "
+            "outside forge-cli writes to that job",
         ],
         None,
     ),

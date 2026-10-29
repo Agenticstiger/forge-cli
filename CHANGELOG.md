@@ -53,21 +53,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider (`apply_plan_runs_outside_forge`): for a plan it derives its own actions from the
   contract, the first build's SQL into the first expose's file, which can be the file the job
   writes. Most such plans stopped before too, as `provider_unknown`; one whose Flink build named
-  no runtime overwrote that file and reported success. `fluid apply` of the contract file
-  applies them. `--provider` (or `FLUID_PROVIDER`) still overrides the provider.
+  no runtime overwrote that file and reported success. In the default mode, `fluid apply` of the
+  contract file applies them. `--provider` (or `FLUID_PROVIDER`) still overrides the provider,
+  and `--provider auto` now leaves the choice to the contract, as it does for the other engines.
 
 ### Upgrade notes
 
 - `fluid apply` stops with `apply_platform_unsupported`, exit code 2 as before, where a platform
   the contract declares has no provider; in `fluid apply`, `provider_unknown` now means a
-  `--provider` value no provider has. A contract with an expose on such a platform before a local
-  one, which applied with exit 0, now stops: pass `--provider local` to apply it as before.
-- When the builds choose the provider (no expose names one other than `local`), every build's
-  `execution.runtime.platform` is checked, not only the first: a later build declared for a
-  platform no provider serves (`composer`, `kubernetes`, ...), whose SQL the local provider ran on
-  DuckDB, now stops the run. Declare it as the job it is, or drop the platform.
-- A `plan.json` of a contract with a Flink build stops with `apply_plan_runs_outside_forge` (exit
-  2) on the local provider, even with `--provider local`; apply the contract file instead.
+  `--provider` value no provider has. A contract with an expose on such a platform beside the
+  exposes that chose the provider, which applied with exit 0 (handed to that provider), now
+  stops: pass `--provider` to apply it as before.
+- When the provider is `local`, every build's `execution.runtime.platform` is checked, not only
+  the first: a later build declared for a platform no provider serves (`composer`,
+  `kubernetes`, ...), whose SQL the local provider ran on DuckDB, now stops the run. Declare it as
+  the job it is, or drop the platform.
+- In the default mode, a `plan.json` of a contract with a Flink build stops with
+  `apply_plan_runs_outside_forge` (exit 2) on the local provider, even with `--provider local`;
+  apply the contract file instead. (`--mode amend-and-build` and `replace-and-build` hand both to
+  the build runner, which this change does not touch.)
 
 ### Security
 
