@@ -23,7 +23,9 @@ description texts).
 A YAML root keeps every comment and every other byte: only the moved parts
 are cut out of its text. The result is checked before the command ends: the
 split contract composes to the same document as the original, or nothing is
-left changed.
+left changed, no file and no directory. No file is written over but the
+contract split in place, or a byte-for-byte copy of it in ``--out`` that is
+the only name of its file: not by a fragment, and not by the root.
 
 Usage:
     fluid split contract.fluid.yaml
@@ -35,11 +37,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Collection, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Collection, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 COMMAND = "split"
 
@@ -68,7 +71,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "  extensions.<name>: that one extension block\n"
             "  description: the description texts to docs/<part>.md\n\n"
             "A part that is already a $ref is left as it is, so splitting twice\n"
-            "changes nothing. A file that exists is never written over.\n\n"
+            "changes nothing. A file that exists is never written over, but for a\n"
+            "byte-for-byte copy of the contract in --out that is the only name of\n"
+            "its file. A relative $ref in a part that moves is rewritten to name\n"
+            "the same file from the part's new one. With --out, the files relative\n"
+            "$refs name must be under the output directory too, where they are\n"
+            "beside the contract.\n\n"
             "Examples:\n"
             "  fluid split contract.fluid.yaml                       # split in place\n"
             "  fluid split contract.fluid.yaml --parts builds,sql    # choose the parts\n"
@@ -151,6 +159,13 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         return 0
 
     before, problem = _composed(contract_path)
+    root_out = out_dir / contract_path.name
+    # What the real run would refuse before writing, the dry run refuses too.
+    problem = (
+        problem
+        or _unsafe_target(out_dir, root_out, [site.target for site in sites])
+        or _root_in_the_way(contract_path, root_out, before)
+    )
     if problem:
         sys.stderr.write(f"❌ Split not written: {problem}\n")
         return 1
@@ -160,7 +175,6 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         return 0
 
     root_text, fragments, lost_comments = _split(contract_path, contract, sites, parts, taken)
-    root_out = out_dir / contract_path.name
     problem = _write_checked(before, root_out, root_text, fragments, out_dir)
     if problem:
         sys.stderr.write(f"❌ Split not written: {problem}\n")
@@ -201,6 +215,77 @@ def _print_dry_run(contract: Dict[str, Any], parts: Sequence[str], taken: Collec
     sys.stderr.write(f"Would create {len(targets)} fragments:\n")
     for target in targets:
         sys.stderr.write(f"   {target}\n")
+
+
+def _unsafe_target(out_dir: Path, root_out: Path, rel_paths: Iterable[str]) -> Optional[str]:
+    """Why the split cannot be written where it goes, if it cannot: a symlink at
+    the root's name, or a symlinked directory on the way to a fragment, where a
+    file written would land outside the output directory. Checked before the
+    dry run lists anything, and again before the first write."""
+    if root_out.is_symlink():
+        # open(..., "w") would write through it, a dangling one included, and the
+        # undo could only remove the link, leaving the written file where it points.
+        return f"{root_out} is a symlink; split writes no file through one"
+    for rel_path in rel_paths:
+        link = _symlink_on_the_way(out_dir, rel_path)
+        if link is not None:
+            return f"{link} is a symlink; split writes no file through one"
+    return None
+
+
+def _root_in_the_way(contract_path: Path, root_out: Path, before: Dict[str, Any]) -> Optional[str]:
+    """Why the root cannot be written to ``root_out``, a file already there, if it
+    cannot. Split writes over no file but the contract it splits in place; a
+    byte-for-byte copy of it that is the only name of its file may be written
+    over too, as nothing is lost. Any other file is refused, a split of this
+    contract written there before included: a second split beside it would
+    only add '-2' copies and leave the first one's fragments unreferenced."""
+    from fluid_build.loader import compose_contract
+
+    if not root_out.exists():
+        return None
+    try:
+        if root_out.samefile(contract_path):
+            # The contract itself, unless it is another link to it elsewhere.
+            if root_out.parent.samefile(contract_path.parent):
+                return None
+        elif root_out.is_file():
+            info = root_out.stat()
+            # The root is written in place: a copy that is also another name
+            # of a third file (a hard link) would change that file too.
+            if (
+                info.st_nlink == 1
+                and info.st_size == contract_path.stat().st_size
+                and root_out.read_bytes() == contract_path.read_bytes()
+            ):
+                return None
+    except OSError:
+        pass  # what cannot be compared is another file
+    try:
+        same = compose_contract(root_out).document == before
+    except Exception:  # noqa: BLE001 - one that does not compose is another contract
+        same = False
+    try:
+        linked = root_out.stat().st_nlink > 1
+    except OSError:
+        linked = True  # not known to be the only name of its file
+    if same and not linked:
+        return (
+            f"{root_out} already holds this contract (it composes to the same document); "
+            f"split writes over no file. To split that one, run: fluid split {root_out}"
+        )
+    if same:
+        # Split in place, it would be written through the link: the other name,
+        # the contract in its own directory say, would change with it.
+        return (
+            f"{root_out} already holds this contract, but is also another name of a "
+            f"file (a hard link) that splitting it would change too; split writes over "
+            f"no file. Move it away, or choose another --out"
+        )
+    return (
+        f"{root_out} already exists; split writes over no file but the contract it "
+        f"splits in place. Move it away, or choose another --out"
+    )
 
 
 def _symlink_on_the_way(out_dir: Path, rel_path: str) -> Optional[Path]:
@@ -265,47 +350,152 @@ def _write_checked(
     original composed to.
 
     Fragments first and the root last, so the contract stays whole until the
-    root changes. When the split contract does not compose to the same
-    document (a part that could not be moved exactly), every file written is
-    taken back and the reason returned.
+    root changes. When a write fails, or the split contract does not compose
+    to the same document (a part that could not be moved exactly), all of it
+    is taken back: every file written, the root's old text, and every
+    directory made for them, ``--out`` included, so the tree is as it was.
+    The reason is returned. An interrupt halfway (Ctrl-C, an exit) is taken
+    back too, and raised again.
     """
     from fluid_build.loader import compose_contract
 
-    if root_out.is_symlink():
-        # open(..., "w") would write through it, a dangling one included, and the
-        # undo could only remove the link, leaving the written file where it points.
-        return f"{root_out} is a symlink; split writes no file through one"
-    for rel_path in fragments:
-        link = _symlink_on_the_way(out_dir, rel_path)
-        if link is not None:
-            return f"{link} is a symlink; split writes no file through one"
-    original_root: Optional[str] = None
-    if root_out.exists():
-        with open(root_out, encoding="utf-8", newline="") as handle:
-            original_root = handle.read()
+    unsafe = _unsafe_target(out_dir, root_out, fragments)
+    if unsafe:
+        return unsafe
+    encoded = _encoded(root_out, root_text, fragments, out_dir)
+    if isinstance(encoded, str):
+        return encoded
+    data, root_data = encoded
+    original_root: Optional[bytes] = root_out.read_bytes() if root_out.exists() else None
+    made: List[Path] = []
     written: List[Path] = []
+    root_reached = False
     try:
-        for rel_path, content in fragments.items():
-            target = out_dir / rel_path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            # newline="" writes the text as it is: a \r in it stays a \r.
-            with open(target, "x", encoding="utf-8", newline="") as handle:
-                handle.write(content)
-            written.append(target)
-        root_out.parent.mkdir(parents=True, exist_ok=True)
-        with open(root_out, "w", encoding="utf-8", newline="") as handle:
-            handle.write(root_text)
+        for target, encoded in data.items():
+            _make_dirs(target.parent, made)
+            with open(target, "xb") as handle:
+                # Taken back from here on, whatever happens to the write.
+                written.append(target)
+                handle.write(encoded)
+        _make_dirs(root_out.parent, made)
+        # Before the open, not after it: open() truncates the root before it
+        # returns, so an interrupt that comes just then finds it empty.
+        root_reached = True
+        with open(root_out, "wb") as handle:
+            handle.write(root_data)
         if compose_contract(root_out).document != before:
-            raise ValueError(
-                "the split contract does not compose to the original one; nothing was changed"
-            )
-    except Exception as exc:  # noqa: BLE001 - every failure is taken back
-        for path in written:
-            path.unlink(missing_ok=True)
-        if original_root is not None:
-            with open(root_out, "w", encoding="utf-8", newline="") as handle:
-                handle.write(original_root)
-        elif root_out.exists():
-            root_out.unlink()
-        return str(exc)
+            raise ValueError("the split contract does not compose to the original one")
+    except Exception as exc:  # every failure is taken back
+        return _taken_back(exc, written, root_out if root_reached else None, original_root, made)
+    except (KeyboardInterrupt, SystemExit) as exc:  # an interrupt too, then raised again
+        return _taken_back(exc, written, root_out if root_reached else None, original_root, made)
     return None
+
+
+def _encoded(
+    root_out: Path, root_text: str, fragments: Dict[str, str], out_dir: Path
+) -> Union[str, Tuple[Dict[Path, bytes], bytes]]:
+    """Every text of the split as bytes, each fragment's by its path, and the
+    root's; or why one cannot be written.
+
+    Encoded before a file or a directory is made: one with no UTF-8 form (a lone
+    surrogate in a part, or in a key a JSON root keeps: JSON can escape one) is
+    refused with nothing to take back. The bytes are written as they are, so a
+    \\r in a text stays a \\r.
+    """
+    data: Dict[Path, bytes] = {}
+    for rel_path, content in fragments.items():
+        try:
+            data[out_dir / rel_path] = content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            return f"{rel_path} cannot be written as UTF-8: {exc}"
+        except Exception as exc:  # noqa: BLE001 - a part that is no text: refused, nothing made
+            return f"{rel_path} cannot be written: {exc}"
+    try:
+        return data, root_text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        return f"{root_out} cannot be written as UTF-8: {exc}"
+
+
+def _taken_back(
+    exc: BaseException,
+    written: List[Path],
+    root_out: Optional[Path],
+    original_root: Optional[bytes],
+    made: List[Path],
+) -> str:
+    """Take back a split that ``exc`` stopped halfway, and say why it stopped.
+
+    Ctrl-C or an exit, halfway or during the take-back: the unchecked split is
+    taken back all the same, and the first interrupt is raised again.
+    """
+    left, interrupted = _take_back(written, root_out, original_root, made)
+    interrupt = interrupted if isinstance(exc, Exception) else exc
+    if interrupt is not None:
+        if left:
+            sys.stderr.write(f"❌ Split interrupted; could not take back {'; '.join(left)}\n")
+        raise interrupt
+    if left:
+        return f"{exc}; and split could not take back {'; '.join(left)}"
+    return f"{exc}; nothing was changed"
+
+
+def _take_back(
+    written: List[Path], root_out: Optional[Path], original_root: Optional[bytes], made: List[Path]
+) -> Tuple[List[str], Optional[BaseException]]:
+    """Undo a split that failed halfway.
+
+    The root first (``root_out``, ``None`` when the write never reached it):
+    written back when its bytes differ from ``original_root``, so a read-only
+    one that could not be opened is left alone; removed when it was not there
+    before. Then the files ``written``, then the directories ``made``, deepest
+    first. The root goes first, so an undo cut short leaves the contract as it
+    was, not a split root whose fragments are gone.
+
+    Every step is tried whatever an earlier one did, an interrupt (a second
+    Ctrl-C) included, and none raises. Returns what could not be undone, one
+    entry per path, and the first interrupt, for the caller to raise again.
+    """
+    steps: List[Tuple[Path, Callable[[], Any]]] = []
+    if root_out is not None:
+        steps.append((root_out, functools.partial(_put_back, root_out, original_root)))
+    steps += [(path, functools.partial(path.unlink, missing_ok=True)) for path in written]
+    steps += [(directory, directory.rmdir) for directory in reversed(made)]
+    left: List[str] = []
+    interrupt: Optional[BaseException] = None
+    for path, step in steps:
+        try:
+            step()
+        except Exception as exc:  # reported; the next step still runs
+            left.append(f"{path}: {_why(exc)}")
+        except (KeyboardInterrupt, SystemExit) as exc:  # the same, and raised again after
+            left.append(f"{path}: {_why(exc)}")
+            if interrupt is None:
+                interrupt = exc
+    return left, interrupt
+
+
+def _why(exc: BaseException) -> str:
+    """What stopped a take-back step: the OS's reason, the message, or the name."""
+    return getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+
+
+def _put_back(root: Path, original: Optional[bytes]) -> None:
+    """``root`` as it was before the split: ``original`` written back when its
+    bytes differ from it, or removed when there was none."""
+    if original is None:
+        root.unlink(missing_ok=True)
+    elif not root.is_file() or root.read_bytes() != original:
+        root.write_bytes(original)
+
+
+def _make_dirs(directory: Path, made: List[Path]) -> None:
+    """``directory`` and each missing directory above it, every one it creates
+    added to ``made`` (``mkdir(parents=True)`` says nothing of which it made)."""
+    missing: List[Path] = []
+    while directory != directory.parent and not directory.exists():
+        missing.append(directory)
+        directory = directory.parent
+    for path in reversed(missing):
+        path.mkdir()
+        made.append(path)
