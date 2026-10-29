@@ -38,7 +38,7 @@ def test_a_long_value_is_cut_naming_what_was_left_out() -> None:
         ("x\r\ny\tz", "x\\r\\ny\\tz"),
         ("\x1b[2K\x1b]0;owned\x07", "\\x1b[2K\\x1b]0;owned\\x07"),
         ("\x00\x7f\x85\x9b", "\\x00\\x7f\\x85\\x9b"),
-        ("ab‮cd⁦ ﻿", "ab\\u202ecd\\u2066\\u2028\\ufeff"),
+        ("ab\u202ecd\u2066\u2028\ufeff", "ab\\u202ecd\\u2066\\u2028\\ufeff"),
         ("\ud800 \xa0", "\\ud800 \\xa0"),
     ],
     ids=["line-feed", "crlf-tab", "escape-sequences", "c0-c1", "bidi-and-separators", "other"],

@@ -497,7 +497,7 @@ def test_c12_the_deprecation_spells_the_control_characters_of_the_ref_and_its_pl
     written, a line feed in either began a line that read as the CLI's own, and an escape
     sequence reached the terminal. Each control character is spelled as ``repr`` writes it."""
     _write(tmp_path / "t.json", json.dumps({_FORGED: 1}))
-    site = "k\x1b]0;x\x07‮"
+    site = "k\x1b]0;x\x07\u202e"
     path = _write(
         tmp_path / "contract.fluid.json", json.dumps({site: {"$ref": f"./t.json#{_FORGED}"}})
     )
