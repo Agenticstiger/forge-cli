@@ -74,7 +74,8 @@ def run(args, logger: logging.Logger) -> int:
         slugs = _unique_slugs(entries)
 
         # Everything is rendered, and encoded, before any file is opened, so a
-        # run that fails here leaves the catalog the previous run wrote.
+        # run that fails while rendering leaves the catalog the previous run
+        # wrote; _write_catalog keeps it for a run that fails while writing.
         # JSON index (machine-readable; existing consumers depend on it).
         # Strict JSON: _plain left no NaN or Infinity, and none may come back.
         index_json = io.StringIO()
@@ -84,8 +85,9 @@ def run(args, logger: logging.Logger) -> int:
         index_html = _render_index_html(entries)
 
         # Per-contract drill-in pages. Slug derived from the contract id
-        # (falls back to a path hash). Each page links back to the index.
-        # A contract with no row of its own (it did not load) gets no page.
+        # (falls back to the file name). Each page links back to the index.
+        # Every contract has a row; a row with an error (the contract did not
+        # load, or could not be listed) has no page.
         pages: list[tuple[str, str]] = []
         for entry in entries:
             path = entry["path"]
@@ -326,11 +328,12 @@ def _summarize_contract(
 ) -> dict[str, Any]:
     """Extract a small set of header fields for the index.
 
-    The JSON keeps the contract's own values (``description`` and ``owner``
-    may be objects); the HTML renders them as text. A contract that did not
-    load, or whose values cannot be listed, gets a row with its ``error`` and
-    no ``id``: one bad contract is not the catalog. One that could not be
-    listed is logged at DEBUG with its path and the traceback.
+    The JSON keeps the contract's own values as plain data (:func:`_plain`):
+    ``description`` and ``owner`` may be objects; the HTML renders them as
+    text. A contract that did not load, or whose values cannot be listed,
+    gets a row with its ``error`` and no ``id``: one bad contract is not the
+    catalog. One that could not be listed is logged at DEBUG with its path
+    and the traceback.
     """
     if not isinstance(contract, Mapping):
         return {"path": path, "id": None, "error": error or "not a mapping"}
@@ -442,10 +445,10 @@ _SLUG_HASH = 8
 def _slug_for(contract: Mapping[str, Any], path: str) -> str:
     """Stable, URL-safe slug for a contract — used as the per-page filename.
 
-    Prefers ``contract.id``; falls back to the file stem when id is absent
-    so we still produce a meaningful filename. All lower-cased; consecutive
-    non-alphanumerics collapse to a single hyphen; at most :data:`_MAX_SLUG`
-    long.
+    Prefers ``contract.id``; falls back to the file stem when id is absent,
+    or not a string, so we still produce a meaningful filename. All
+    lower-cased; consecutive non-alphanumerics collapse to a single hyphen;
+    at most :data:`_MAX_SLUG` long.
     """
     raw = contract.get("id") if isinstance(contract, Mapping) else None
     if not isinstance(raw, str) or not raw:
@@ -539,7 +542,10 @@ def _error_row_html(entry: dict[str, Any]) -> str:
 
 
 def _render_contract_html(contract: Mapping[str, Any], path: str) -> str:
-    """Render a single per-contract page with full schema + lineage detail."""
+    """Render a single per-contract page with full schema + lineage detail.
+
+    ``contract`` is plain data (:func:`_plain`), as :func:`run` passes it.
+    """
     metadata = contract.get("metadata") if isinstance(contract.get("metadata"), Mapping) else {}
     cid = contract.get("id") or "—"
     cname = contract.get("name") or cid
