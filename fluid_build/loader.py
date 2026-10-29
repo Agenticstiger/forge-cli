@@ -246,6 +246,9 @@ def parse_contract_text(
                 raise ValueError("contract root must be an object/dict")
             return obj
     except Exception as e:
+        if _is_duplicate_key(e):
+            # Its message names the text (by ``name``) and the line already.
+            raise RuntimeError(str(e)) from e
         raise RuntimeError(f"Failed to parse contract text: {e}") from e
 
 

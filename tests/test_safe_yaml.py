@@ -17,7 +17,9 @@ denial-of-service defense for untrusted YAML (G1)."""
 
 from __future__ import annotations
 
+import copy
 import io
+import pickle
 from pathlib import Path
 
 import pytest
@@ -308,28 +310,31 @@ def test_a_duplicate_key_keeps_the_last_value_by_default() -> None:
 
 
 @pytest.mark.parametrize(
-    ("text", "line", "key"),
+    ("text", "line", "key", "first"),
     [
-        ("a: 1\nb: 2\na: 3\n", 3, "a"),
-        ("x:\n  y: 1\n  z:\n    k: 1\n    k: 2\n", 5, "k"),
-        ("- {a: 1, a: 2}\n", 1, "a"),
-        ("x:\n  $ref: ./a.yaml\n  $ref: ./b.yaml\n", 3, "$ref"),
-        ("a: &x {k: 1}\nb: *x\nb: 2\n", 3, "b"),
-        ("1: one\n1: uno\n", 2, "1"),
+        ("a: 1\nb: 2\na: 3\n", 3, "a", 1),
+        ("x:\n  y: 1\n  z:\n    k: 1\n    k: 2\n", 5, "k", 4),
+        ("- {a: 1, a: 2}\n", 1, "a", 1),
+        ("x:\n  $ref: ./a.yaml\n  $ref: ./b.yaml\n", 3, "$ref", 2),
+        ("a: &x {k: 1}\nb: *x\nb: 2\n", 3, "b", 2),
+        ("1: one\n1: uno\n", 2, "1", 1),
     ],
     ids=["top-level", "nested", "flow", "two-refs", "with-aliases", "int-key"],
 )
-def test_unique_keys_refuses_a_key_written_twice_naming_the_line(
-    text: str, line: int, key: str
+def test_unique_keys_refuses_a_key_written_twice_naming_both_lines(
+    text: str, line: int, key: str, first: int
 ) -> None:
+    """The line of each occurrence: the second, where the error points, and the first,
+    the one to compare it with, even when both are spelled the same."""
     with pytest.raises(DuplicateKeyError) as info:
         load_yaml_safe(text, unique_keys=True, name="frag.yaml")
 
     assert str(info.value) == (
-        f"frag.yaml:{line}: duplicate key {key!r} (YAML 1.2 requires unique keys); "
-        "remove one of them"
+        f"frag.yaml:{line}: duplicate key {key!r} (first at line {first}; YAML 1.2 requires "
+        "unique keys); remove one of them"
     )
     assert (info.value.key, info.value.line, info.value.name) == (key, line, "frag.yaml")
+    assert info.value.first == (key, first)
     assert isinstance(info.value, UnsafeYamlError), "a refused input, as the caps are"
 
 
@@ -419,7 +424,8 @@ def test_unique_keys_applies_every_merge_key_of_a_mapping() -> None:
             defaults + "m:\n  <<: *a\n  z: 3\n  <<: *b\n  z: 4\n", unique_keys=True, name="f"
         )
     assert str(info.value) == (
-        "f:7: duplicate key 'z' (YAML 1.2 requires unique keys); remove one of them"
+        "f:7: duplicate key 'z' (first at line 5; YAML 1.2 requires unique keys); remove one "
+        "of them"
     ), "a data key written twice beside the merges is still refused"
 
 
@@ -429,7 +435,68 @@ def test_load_json_unique_refuses_a_name_written_twice() -> None:
         load_json_unique('{"a": {"k": 1, "k": 2}}', name="f.json")
 
     assert str(info.value) == (
-        "f.json: duplicate key 'k' (the names of a JSON object must be unique: RFC 8259 "
-        "leaves a repeated one undefined); remove one of them"
+        "f.json: duplicate key 'k' (RFC 8259 section 4: the names within an object SHOULD be "
+        "unique, and what a reader does with a repeated one is unpredictable, so it is "
+        "refused; JSON parsing gives no line); remove one of them"
     )
-    assert info.value.line is None
+    assert (info.value.line, info.value.first) == (None, None), "json.loads reports no line"
+
+
+@pytest.mark.parametrize("read", ["yaml", "json"])
+def test_a_duplicate_key_is_quoted_as_an_excerpt_however_long(read: str) -> None:
+    """A 1.5 MB key written twice made a 1.5 MB message, printed by every command that
+    reads the file; the message quotes 200 characters of it and names how many more."""
+    key = "k" * 100_000
+    with pytest.raises(DuplicateKeyError) as info:
+        if read == "yaml":
+            # An explicit key: YAML caps an implicit one at 1,024 characters.
+            load_yaml_safe(f"? {key}\n: 1\n? {key}\n: 2\n", unique_keys=True, name="f.yaml")
+        else:
+            load_json_unique(f'{{"{key}": 1, "{key}": 2}}', name="f.json")
+
+    message = str(info.value)
+    assert len(message) < 600, f"a {len(message):,}-character message"
+    assert f"duplicate key '{'k' * 199}... (99,802 more characters) (" in message
+    assert info.value.key == key, "the error keeps the key itself"
+
+
+def test_the_first_spelling_of_a_key_is_quoted_as_an_excerpt_too() -> None:
+    """``1.000...0`` and ``1.0`` are one float key, so the first spelling is quoted with
+    the second: cut as well, however long it is."""
+    first = "1." + "0" * 100_000
+    with pytest.raises(DuplicateKeyError) as info:
+        load_yaml_safe(f"? {first}\n: a\n1.0: b\n", unique_keys=True)
+
+    message = str(info.value)
+    assert len(message) < 600, f"a {len(message):,}-character message"
+    assert f"line 3: duplicate key '1.0' (the same key as '{first[:199]}... (" in message
+    assert info.value.first == (first, 1)
+
+
+@pytest.mark.parametrize("read", ["yaml", "json"])
+def test_a_duplicate_key_error_keeps_its_fields_when_pickled_or_copied(read: str) -> None:
+    """A service hands errors across processes (``multiprocessing``, a task queue) and
+    copies them: rebuilt from ``args``, the message, the error lost its key and place."""
+    with pytest.raises(DuplicateKeyError) as info:
+        if read == "yaml":
+            load_yaml_safe("on: 1\nb: 2\nyes: 3\n", unique_keys=True, name="f.yaml")
+        else:
+            load_json_unique('{"k": 1, "k": 2}', name="f.json")
+    error = info.value
+    error.reported_by = "the caller"  # type: ignore[attr-defined]
+
+    for twin in (
+        pickle.loads(pickle.dumps(error)),
+        copy.copy(error),
+        copy.deepcopy(error),
+    ):
+        assert type(twin) is DuplicateKeyError
+        assert str(twin) == str(error)
+        assert (twin.key, twin.name, twin.line, twin.first, twin.json_object) == (
+            error.key,
+            error.name,
+            error.line,
+            error.first,
+            error.json_object,
+        )
+        assert twin.reported_by == "the caller", "state a caller adds is kept too"

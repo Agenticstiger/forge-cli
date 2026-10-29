@@ -76,6 +76,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
+from fluid_build.util.excerpt import excerpt
+
 # Caps tuned well above any legitimate contract / manifest. A real data
 # contract uses few-to-zero YAML aliases; a billion-laughs payload needs
 # dozens of nested alias references to reach dangerous expansion.
@@ -104,10 +106,14 @@ class UnsafeYamlError(ValueError):
 class DuplicateKeyError(UnsafeYamlError):
     """A key written twice in one YAML mapping or JSON object, read with ``unique_keys``.
 
-    ``name`` is how the message names the document (a file path), ``line``
-    the 1-based line of the second key (``None`` for JSON, whose parser gives
-    none), and ``first`` the key as it was first written when that differs
-    (YAML ``on`` and ``yes`` are the one key ``True``).
+    ``key`` is the key as written the second time, ``name`` how the message
+    names the document (a file path), ``line`` the 1-based line of the second
+    key, and ``first`` the key as it was first written with its line: the same
+    spelling, or another one of the same key (YAML 1.1 ``on`` and ``yes`` are
+    both ``True``). JSON has neither line: ``json.loads`` reports no position
+    for a name, and the message says so. Each key is quoted as an excerpt
+    (:func:`fluid_build.util.excerpt.excerpt`): a key may be megabytes long.
+    Pickled or copied, the error keeps every field.
     """
 
     def __init__(
@@ -123,18 +129,57 @@ class DuplicateKeyError(UnsafeYamlError):
         self.name = name
         self.line = line
         self.first = first
-        if name is not None:
-            place = f"{name}:{line}: " if line is not None else f"{name}: "
-        else:
-            place = f"line {line}: " if line is not None else ""
+        self.json_object = json_object
+        super().__init__(_duplicate_key_message(key, name, line, first, json_object))
+
+    def __reduce__(self) -> Tuple[Any, ...]:
+        # Rebuilt from its fields: the default rebuilds an exception from ``args``,
+        # here the message, which this ``__init__`` would read as the key.
+        fields = (type(self), self.key, self.name, self.line, self.first, self.json_object)
+        return _rebuild_duplicate_key_error, fields, self.__dict__
+
+
+def _rebuild_duplicate_key_error(
+    cls: Any,
+    key: Any,
+    name: Optional[str],
+    line: Optional[int],
+    first: Optional[Tuple[Any, int]],
+    json_object: bool,
+) -> DuplicateKeyError:
+    """A :class:`DuplicateKeyError` unpickled or copied (its ``__reduce__``)."""
+    error: DuplicateKeyError = cls(key, name=name, line=line, first=first, json_object=json_object)
+    return error
+
+
+def _duplicate_key_message(
+    key: Any,
+    name: Optional[str],
+    line: Optional[int],
+    first: Optional[Tuple[Any, int]],
+    json_object: bool,
+) -> str:
+    """What :class:`DuplicateKeyError` says: the place, the key, and the first one."""
+    if name is not None:
+        place = f"{name}:{line}: " if line is not None else f"{name}: "
+    else:
+        place = f"line {line}: " if line is not None else ""
+    if json_object:
         why = (
-            "the names of a JSON object must be unique: RFC 8259 leaves a repeated one undefined"
-            if json_object
-            else "YAML 1.2 requires unique keys"
+            "RFC 8259 section 4: the names within an object SHOULD be unique, and what a "
+            "reader does with a repeated one is unpredictable, so it is refused; JSON "
+            "parsing gives no line"
         )
-        if first is not None:
-            why = f"the same key as {first[0]!r} at line {first[1]}; {why}"
-        super().__init__(f"{place}duplicate key {key!r} ({why}); remove one of them")
+    elif first is None:
+        why = "YAML 1.2 requires unique keys"
+    elif first[0] == key:
+        why = f"first at line {first[1]}; YAML 1.2 requires unique keys"
+    else:
+        why = (
+            f"the same key as {excerpt(repr(first[0]))} at line {first[1]}; YAML 1.2 "
+            f"requires unique keys"
+        )
+    return f"{place}duplicate key {excerpt(repr(key))} ({why}); remove one of them"
 
 
 def load_yaml_safe(
@@ -160,9 +205,10 @@ def load_yaml_safe(
     the ratio cap.
 
     ``unique_keys`` refuses a key written twice in one mapping with
-    :class:`DuplicateKeyError`, whose message names the document by ``name``
-    and the line. Off by default: only the contract composition opts in, and
-    every other reader keeps PyYAML's last-wins.
+    :class:`DuplicateKeyError`, whose message names the document by ``name``,
+    the line, the key and the line of its first occurrence. Off by default:
+    only the contract composition opts in, and every other reader keeps
+    PyYAML's last-wins.
     """
     if source is None:
         return None
@@ -184,9 +230,11 @@ def load_yaml_safe(
 def load_json_unique(text: str, *, name: Optional[str] = None) -> Any:
     """``json.loads(text)``, refusing a name written twice in one object.
 
-    ``json.loads`` keeps the last value, as PyYAML does; RFC 8259 leaves a
-    repeated name undefined. The twin of ``load_yaml_safe(..., unique_keys=True)``:
-    :class:`DuplicateKeyError` names the document by ``name`` (JSON gives no line).
+    ``json.loads`` keeps the last value, as PyYAML does. RFC 8259 section 4
+    says the names within an object SHOULD be unique and that what a reader
+    does with a repeated one is unpredictable, so it is refused. The twin of
+    ``load_yaml_safe(..., unique_keys=True)``: :class:`DuplicateKeyError` names
+    the document by ``name`` and the key; ``json.loads`` gives no line.
     """
 
     def unique(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
@@ -258,12 +306,7 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
             written = key_node.value
             line = key_node.start_mark.line + 1
             if first is not None:
-                raise DuplicateKeyError(
-                    written,
-                    name=self._document_name,
-                    line=line,
-                    first=first if first[0] != written else None,
-                )
+                raise DuplicateKeyError(written, name=self._document_name, line=line, first=first)
             seen[key] = (written, line)
 
 

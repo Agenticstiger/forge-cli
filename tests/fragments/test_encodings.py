@@ -354,7 +354,9 @@ def test_n08_a_merge_key_in_a_fragment_is_applied(tmp_path: Path) -> None:
     assert got["item"] == {"a": 1, "b": 3, "c": 4}
 
 
-_UNIQUE = "(YAML 1.2 requires unique keys); remove one of them"
+def _unique(first: int) -> str:
+    """The tail of a YAML duplicate-key error whose first occurrence is at line ``first``."""
+    return f"(first at line {first}; YAML 1.2 requires unique keys); remove one of them"
 
 
 def test_n09_a_duplicate_key_in_a_fragment_is_refused_naming_file_line_and_key_sg18(
@@ -368,7 +370,7 @@ def test_n09_a_duplicate_key_in_a_fragment_is_refused_naming_file_line_and_key_s
         _rfr({"x": {"$ref": "./dup.yaml"}}, tmp_path)
 
     message = str(info.value)
-    assert f"{dup}:3: duplicate key 'a' {_UNIQUE}" in message
+    assert f"{dup}:3: duplicate key 'a' {_unique(1)}" in message
     assert "$ref target './dup.yaml' at JSON pointer '/x'" in message
 
 
@@ -394,7 +396,7 @@ def test_n09_two_ref_keys_in_one_mapping_are_a_duplicate_key_and_no_file_is_read
     with pytest.raises(RuntimeError) as info:
         loader.compose_contract(contract)
 
-    assert str(info.value) == f"{contract}:3: duplicate key '$ref' {_UNIQUE}"
+    assert str(info.value) == f"{contract}:3: duplicate key '$ref' {_unique(2)}"
     assert reads == ["contract.fluid.yaml"]
 
 
@@ -455,7 +457,8 @@ def test_n09_contract_text_and_a_bundle_refuse_a_duplicate_key_sg18(tmp_path: Pa
     with pytest.raises(ContractLoadError) as text_info:
         load_contract_from_text("id: x\nid: y\n")
     assert text_info.value.event == "contract_parse_failed"
-    assert f"line 2: duplicate key 'id' {_UNIQUE}" in str(text_info.value)
+    assert f"line 2: duplicate key 'id' {_unique(1)}" in str(text_info.value)
+    assert "Failed to parse contract text" not in str(text_info.value), "said once"
 
     files = {"contract.resolved.yaml": b"id: x\nkind: DataProduct\nid: y\n"}
     tgz = tmp_path / "b.tgz"
@@ -463,7 +466,8 @@ def test_n09_contract_text_and_a_bundle_refuse_a_duplicate_key_sg18(tmp_path: Pa
     with pytest.raises(ContractLoadError) as bundle_info:
         load_contract(tgz)
     assert bundle_info.value.event == "bundle_load_failed"
-    assert f"contract.resolved.yaml:3: duplicate key 'id' {_UNIQUE}" in str(bundle_info.value)
+    assert f"contract.resolved.yaml:3: duplicate key 'id' {_unique(1)}" in str(bundle_info.value)
+    assert "Failed to parse contract text" not in str(bundle_info.value)
 
 
 def test_n09_validate_and_bundle_fail_on_a_duplicate_key_naming_it_sg18(
@@ -519,7 +523,7 @@ def test_n09_a_workspace_file_with_a_duplicate_ref_root_is_refused_naming_the_ke
     _write(ws / "fluid.workspace.yaml", "ref_root: nowhere\nref_root: .\n")
     _write(ws / "shared" / "team.yaml", "team: shared\n")
     contract = _write(ws / "p" / "contract.fluid.yaml", "x: {$ref: ../shared/team.yaml}\n")
-    named = f"fluid.workspace.yaml:2: duplicate key 'ref_root' {_UNIQUE}"
+    named = f"fluid.workspace.yaml:2: duplicate key 'ref_root' {_unique(1)}"
 
     with caplog.at_level(logging.WARNING, logger="fluid.loader"):
         with pytest.raises(RefResolutionError, match="escapes the ref root") as info:
@@ -547,7 +551,7 @@ def test_n09_a_workspace_that_declares_environments_with_a_duplicate_key_refuses
     with pytest.raises(RuntimeError) as info:
         loader.load_with_overlay(contract, "prod")
 
-    assert str(info.value) == f"{workspace}:3: duplicate key 'p' {_UNIQUE}"
+    assert str(info.value) == f"{workspace}:3: duplicate key 'p' {_unique(2)}"
 
 
 def test_n09_readers_off_the_composition_path_keep_the_last_value(tmp_path: Path) -> None:

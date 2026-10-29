@@ -64,9 +64,10 @@ that cannot be resolved fails the command and names the file it was written in.
 
 Every file the composition reads (the contract, an overlay, each fragment,
 `fluid.workspace.yaml`) writes a key once per mapping. A key written twice, two
-`$ref` keys included, fails the command with the file, the line and the key
-(`owner.yaml:3: duplicate key 'team' (YAML 1.2 requires unique keys)`): YAML
-and JSON parsers keep the last value and drop the other without a word. A
+`$ref` keys included, fails the command, naming the file and the key, and in
+YAML the line of each copy (`owner.yaml:3: duplicate key 'team' (first at line
+1; YAML 1.2 requires unique keys)`): YAML and JSON parsers keep the last value
+and drop the other without a word. A
 workspace file that writes a key twice is refused as one that cannot be
 parsed: its `ref_root` is ignored with a warning that names the key, and an
 `--env` its `expected-environments` might declare fails with that error

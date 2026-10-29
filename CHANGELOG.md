@@ -24,8 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A key written twice in a contract file is refused.** In the root contract, an overlay, a
   `$ref` fragment, a bundle's contract and `fluid.workspace.yaml`, a duplicate key kept its last
   value without a word, and two `$ref` keys in one mapping read only the second file. It now fails,
-  naming the file, the line and the key:
-  `contract.fluid.yaml:26: duplicate key 'name' (YAML 1.2 requires unique keys)`.
+  naming the file and the key, and in YAML the line of each copy:
+  `contract.fluid.yaml:26: duplicate key 'name' (first at line 3; YAML 1.2 requires unique keys)`.
+  A JSON file gets no line: Python's JSON parser reports none.
   A key a `<<` merge brings in and the mapping writes itself is not a duplicate, and `<<` may be
   written more than once. In `fluid.workspace.yaml` a duplicate key makes its `ref_root` ignored
   (with a warning naming the key) and its `expected-environments` an error.
