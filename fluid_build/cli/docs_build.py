@@ -194,6 +194,7 @@ def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
     """
     made: list[tuple[str, int, int]] = []  # each directory this run made, in order
     staged: list[tuple[str, str]] = []
+    done = False
     try:
         _make_dirs(out, made)
         _remove_stale_temps(out, {name for name, _data in files})
@@ -202,12 +203,13 @@ def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
             staged.append((_stage(target, data), target))
         for temp, target in staged:
             os.replace(temp, target)
-    except BaseException:
-        for temp, _target in staged:
-            with contextlib.suppress(OSError):
-                os.unlink(temp)
-        _take_back(made)
-        raise
+        done = True
+    finally:
+        if not done:  # whatever stopped it, an interrupt included
+            for temp, _target in staged:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp)
+            _take_back(made)
 
 
 def _make_dirs(path: str, made: list[tuple[str, int, int]]) -> None:
@@ -321,15 +323,22 @@ def _stage(target: str, data: bytes) -> str:
     temp = os.path.join(directory, f".{name}.{os.urandom(8).hex()}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     fd = os.open(temp, flags, 0o666 if own is None else own)
+    handle = None
+    done = False
     try:
-        with open(fd, "wb") as f:  # closes the descriptor however this ends
+        handle = open(fd, "wb")  # owns the descriptor from here, and closes it
+        with handle:
             if own is not None:  # the bits the umask took off, before a byte is written
                 os.fchmod(fd, own)
-            f.write(data)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(temp)
-        raise
+            handle.write(data)
+        done = True
+    finally:
+        if handle is None:  # open() itself failed: the descriptor is still ours to close
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if not done:
+            with contextlib.suppress(OSError):
+                os.unlink(temp)
     return temp
 
 
