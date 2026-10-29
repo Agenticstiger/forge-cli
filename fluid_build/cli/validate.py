@@ -23,7 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.cli.console import error as console_error
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
@@ -274,6 +274,7 @@ def run(args, logger: logging.Logger) -> int:
         # first (multi-product workspace), then fall back to a single
         # ``contract.fluid.yaml`` in CWD (the common single-product case).
         if not args.contract:
+            _refuse_fragment_run_without_file(args)
             workspace_result = _try_workspace_validate(args, schema_manager, logger)
             if workspace_result is not None:
                 return workspace_result
@@ -298,7 +299,8 @@ def run(args, logger: logging.Logger) -> int:
         try:
             contract_path = validate_cli_path(args.contract, mode="read", file_type="contract")
         except FluidCLIError as exc:
-            if exc.event == "file_not_found":
+            # ``validate_cli_path`` names a missing contract either way, with no path.
+            if exc.event in ("file_not_found", "contract_file_not_found"):
                 raise CLIError(1, "contract_file_not_found", {"path": str(args.contract)})
             raise
         args.contract = str(contract_path)
@@ -313,12 +315,13 @@ def run(args, logger: logging.Logger) -> int:
         # Detect a .tgz / .tar.gz input and dispatch to the extension-routed
         # validator. Raw .fluid.yaml contracts continue through the legacy
         # JSON-Schema path below (back-compat preserved).
+        # A fragment run first: it refuses a bundle itself, never validates one in its place.
+        if _fragment_kind(args) is not None:
+            return _run_fragment_validation(Path(contract_path), args, schema_manager, logger)
+
         contract_lower = str(contract_path).lower()
         if contract_lower.endswith(".tgz") or contract_lower.endswith(".tar.gz"):
             return _run_bundle_validation(contract_path, args, schema_manager, logger, start_time)
-
-        if isinstance(getattr(args, "fragment", None), str):
-            return _run_fragment_validation(Path(contract_path), args, schema_manager, logger)
 
         # Load contract with overlay
         try:
@@ -408,37 +411,32 @@ def run(args, logger: logging.Logger) -> int:
         log_operation_failure(logger, "validate_contract", error=e.event, duration=duration)
 
         # Handle specific CLI errors with user-friendly messages. ``console_error``
-        # prints its text literally, so no value needs escaping first.
+        # prints its text literally, so no value needs escaping first. ``--quiet`` is
+        # "errors only": the error itself always prints, the guidance below does not.
         if e.event == "version_below_minimum":
-            if not args.quiet:
-                console_error(
-                    f"Contract version {e.context.get('version')} does not meet minimum requirement {e.context.get('constraint')}"
-                )
+            console_error(
+                f"Contract version {e.context.get('version')} does not meet minimum requirement {e.context.get('constraint')}"
+            )
         elif e.event == "version_above_maximum":
-            if not args.quiet:
-                console_error(
-                    f"Contract version {e.context.get('version')} exceeds maximum allowed {e.context.get('constraint')}"
-                )
+            console_error(
+                f"Contract version {e.context.get('version')} exceeds maximum allowed {e.context.get('constraint')}"
+            )
         elif e.event == "contract_file_not_found":
-            if not args.quiet:
-                console_error(f"Contract file not found: {e.context.get('path')}")
+            console_error(f"Contract file not found: {e.context.get('path')}")
         elif e.event == "contract_version_unsupported":
-            if not args.quiet:
-                console_error(
-                    e.context.get(
-                        "message",
-                        f"Unsupported contract version: {e.context.get('version')}",
-                    )
+            console_error(
+                e.context.get(
+                    "message",
+                    f"Unsupported contract version: {e.context.get('version')}",
                 )
+            )
         elif e.event == "contract_required":
-            if not args.quiet:
-                console_error(f"{e.context.get('message', 'Contract file is required')}")
+            console_error(f"{e.context.get('message', 'Contract file is required')}")
         else:
-            if not args.quiet:
-                console_error(f"Validation error: {e.event}")
-                if e.context:
-                    for key, value in e.context.items():
-                        _cprint_literal(f"   {key}: {value}")
+            console_error(f"Validation error: {e.event}")
+            if e.context:
+                for key, value in e.context.items():
+                    _cprint_literal(f"   {key}: {value}")
 
         # Stable slug + catalog-driven guidance (Error-UX card). ``e`` is
         # auto-enriched at construction, so catalogued events (contract_*,
@@ -488,6 +486,53 @@ def _load_with_overlay_warnings(
     return contract, [warning.message for warning in overlay_warnings], locate
 
 
+def _fragment_kind(args: Any) -> Optional[str]:
+    """The kind ``--fragment`` was given, ``""`` too; ``None`` when the flag was not used.
+
+    An empty kind is an unknown kind to refuse, never the flag left out. Anything
+    that is not text is not a kind, so an ``args`` object without the attribute
+    (a bare mock, an older caller's namespace) is a whole-contract run.
+    """
+    kind = getattr(args, "fragment", None)
+    return kind if isinstance(kind, str) else None
+
+
+def _parse_version(parse: Callable[[str], Any], text: str, event: str) -> Any:
+    """``parse(text)``: a version, or a version constraint, with a bad one as the typed ``event``.
+
+    ``SchemaVersion.parse`` and ``VersionConstraint.parse`` raise the CLI's
+    ``ValidationError``, a ``FluidError`` and not a ``ValueError``, so each
+    ``except ValueError`` this replaces let ``--schema-version bogus`` end as
+    ``cli_unhandled_exception`` instead of the event it names.
+    """
+    from fluid_build.errors import FluidError
+
+    try:
+        return parse(text)
+    except (ValueError, FluidError) as exc:
+        raise CLIError(1, event, {"version": text, "error": str(exc)})
+
+
+def _refuse_fragment_run_without_file(args: Any) -> None:
+    """A fragment run names its file. Without one, workspace discovery would fill in the
+    contract of the working directory, which would be validated as if it were the fragment."""
+    kind = _fragment_kind(args)
+    if kind is None:
+        return
+    if "/" in kind or "\\" in kind or kind.lower().endswith((".yaml", ".yml", ".json")):
+        # The likeliest slip: the KIND left out, so the file was read as the KIND.
+        why = (
+            f"--fragment takes a KIND, then the file, and {kind!r} reads as the file: "
+            f"fluid validate --fragment KIND {kind}"
+        )
+    else:
+        why = (
+            "--fragment checks one fragment file, and the file is required: "
+            f"fluid validate --fragment {kind or 'KIND'} <file>"
+        )
+    raise CLIError(1, "fragment_file_required", {"error": why})
+
+
 #: ``--fragment`` kinds that are not a ``$defs`` name: an expose's lists.
 _FRAGMENT_POINTERS = {
     "quality": "#/$defs/exposeContract/properties/quality",
@@ -514,31 +559,20 @@ def _run_fragment_validation(
     from fluid_build.schema_manager import SchemaVersion, ValidationResult
     from fluid_build.util.ref_confinement import RefResolutionError, is_within
 
-    kind = args.fragment
+    kind = _fragment_kind(args)
     if getattr(args, "env", None):
         raise CLIError(
             1,
             "fragment_env_unsupported",
             {"error": "--env applies to a whole contract; validate the contract with it"},
         )
-    contract = _nearest_contract(fragment)
-    version = (
-        args.schema_version
-        or _contract_version(contract)
-        or (schema_manager.latest_bundled_version())
-    )
-    schema = schema_manager.get_schema(SchemaVersion.parse(version), offline_only=True)
-    if not schema:
-        raise CLIError(1, "schema_not_available", {"version": version})
-    defs = schema.get("$defs") or {}
-    pointer = _FRAGMENT_POINTERS.get(kind) or (f"#/$defs/{kind}" if kind in defs else None)
-    if pointer is None:
-        kinds = ", ".join(sorted([*defs, *_FRAGMENT_POINTERS]))
+    if fragment.name.lower().endswith((".tgz", ".tar.gz")):
         raise CLIError(
             1,
-            "fragment_kind_unknown",
-            {"error": f"{kind!r} is not a kind of fragment in schema {version}; kinds: {kinds}"},
+            "fragment_bundle_unsupported",
+            {"error": "a bundle holds a whole contract: validate it without --fragment"},
         )
+    contract = _nearest_contract(fragment)
 
     origins = loader.ContractOrigins(None)
     origins.add((), loader.Origin(fragment.resolve(), ()))
@@ -577,6 +611,23 @@ def _run_fragment_validation(
             },
         )
 
+    # The fragment is composed before a schema version is asked for: what is wrong with the file
+    # itself (it cannot be read, its refs escape the root) is reported first.
+    version = _fragment_schema_version(args.schema_version, fragment, contract)
+    schema_version = _parse_version(SchemaVersion.parse, version, "invalid_schema_version")
+    schema = schema_manager.get_schema(schema_version, offline_only=True)
+    if not schema:
+        raise CLIError(1, "schema_not_available", {"version": version})
+    defs = schema.get("$defs") or {}
+    pointer = _FRAGMENT_POINTERS.get(kind) or (f"#/$defs/{kind}" if kind in defs else None)
+    if pointer is None:
+        kinds = ", ".join(sorted([*defs, *_FRAGMENT_POINTERS]))
+        raise CLIError(
+            1,
+            "fragment_kind_unknown",
+            {"error": f"{kind!r} is not a kind of fragment in schema {version}; kinds: {kinds}"},
+        )
+
     def locate(path: Sequence[Any], definition: bool = False) -> Optional[str]:
         found = origins.locate(path, definition=definition)
         if found is None:
@@ -588,7 +639,7 @@ def _run_fragment_validation(
         return f"{shown}:{found[1]}" if found[1] else shown
 
     result = ValidationResult(
-        is_valid=True, schema_version=SchemaVersion.parse(version), subject=f"{kind} fragment"
+        is_valid=True, schema_version=schema_version, subject=f"{kind} fragment"
     )
     wrapper = {"$schema": schema.get("$schema"), "$defs": defs, "$ref": pointer}
     if not schema_manager._validate_with_jsonschema(document, wrapper, result, locate):
@@ -626,17 +677,60 @@ def _nearest_contract(fragment: Path) -> Optional[Path]:
 _REPOSITORY_MARKERS = (".git", ".hg", ".svn", "fluid.workspace.yaml")
 
 
-def _contract_version(contract: Optional[Path]) -> Optional[str]:
-    if contract is None:
-        return None
-    from fluid_build.loader import _parse_file
+def _fragment_schema_version(flag: Optional[str], fragment: Path, contract: Optional[Path]) -> str:
+    """The schema version a fragment is checked against.
 
-    try:
-        version = _parse_file(contract).get("fluidVersion")
-    except Exception:  # noqa: BLE001 - no readable version: the default applies
-        return None
-    # A version kept elsewhere (a $ref) is not one this lookup can read.
-    return version if isinstance(version, str) and version else None
+    ``--schema-version``, else the ``fluidVersion`` of the nearest root contract
+    above the fragment. With neither the run asks for ``--schema-version``: a
+    fragment checked against a version nobody named is judged by the wrong
+    schema (a valid 0.7.6 fragment fails on a field 0.7.5 does not have).
+    """
+    if flag:
+        return flag
+    if contract is None:
+        why = (
+            f"no contract.fluid.yaml above {fragment.name} could be taken (a symlinked one is "
+            "not, and the search stops at the top of its repository or workspace, and before "
+            "a home or temp directory)"
+        )
+    else:
+        try:
+            version = _contract_version(contract)
+        except Exception as exc:  # noqa: BLE001 - said below, with the file it is about
+            problem = " ".join(str(exc).split()).rstrip(".")
+            why = f"{contract}, the nearest contract above it, does not load: {problem}"
+        else:
+            if version is not None:
+                return version
+            why = f"{contract}, the nearest contract above it, declares no fluidVersion"
+    raise CLIError(
+        1,
+        "schema_version_required",
+        {
+            "error": (
+                f"cannot tell which schema version to check the fragment against: {why}. "
+                "Pass --schema-version <version>; fluid validate --list-versions lists them."
+            )
+        },
+    )
+
+
+def _contract_version(contract: Path) -> Optional[str]:
+    """The ``fluidVersion`` a root contract declares, read as the loader reads it.
+
+    :func:`fluid_build.loader.load_contract_fields` parses the root as every
+    contract is parsed (bounded, a regular file only, an object at the top), and
+    composes the contract only when the version, or the root itself, is a
+    ``$ref``: a version kept in a fragment, a root that is a ``$ref`` to its base
+    and a ``#/`` pointer are all followed, under the ref root the contract has.
+    A contract whose version is written out gives it even when another part of
+    it does not compose yet (the fragment under check may be the reason).
+    ``None`` when it declares none.
+    """
+    from fluid_build.loader import load_contract_fields
+
+    version = load_contract_fields(contract, "fluidVersion").get("fluidVersion")
+    return None if version is None or version == "" else str(version)
 
 
 def _handle_list_versions(schema_manager: FluidSchemaManager, args, logger: logging.Logger) -> int:
@@ -684,12 +778,8 @@ def _determine_target_version(
 
     # Explicit version specified
     if args.schema_version:
-        try:
-            return _self.SchemaVersion.parse(args.schema_version), False
-        except ValueError as e:
-            raise CLIError(
-                1, "invalid_schema_version", {"version": args.schema_version, "error": str(e)}
-            )
+        parse = _self.SchemaVersion.parse
+        return _parse_version(parse, args.schema_version, "invalid_schema_version"), False
 
     # Auto-detect from contract
     detected = schema_manager.detect_version(contract)
@@ -762,17 +852,13 @@ def _filter_compatible_versions(versions: list[SchemaVersion], args) -> list[Sch
     compatible = versions
 
     if args.min_version:
-        try:
-            min_constraint = _self.VersionConstraint.parse(args.min_version)
-        except ValueError as e:
-            raise CLIError(1, "invalid_min_version", {"version": args.min_version, "error": str(e)})
+        parse = _self.VersionConstraint.parse
+        min_constraint = _parse_version(parse, args.min_version, "invalid_min_version")
         compatible = [version for version in compatible if min_constraint.matches(version)]
 
     if args.max_version:
-        try:
-            max_constraint = _self.VersionConstraint.parse(args.max_version)
-        except ValueError as e:
-            raise CLIError(1, "invalid_max_version", {"version": args.max_version, "error": str(e)})
+        parse = _self.VersionConstraint.parse
+        max_constraint = _parse_version(parse, args.max_version, "invalid_max_version")
         compatible = [version for version in compatible if max_constraint.matches(version)]
 
     return compatible
@@ -1278,29 +1364,25 @@ def _validate_version_constraints(
 
     # Check minimum version constraint
     if args.min_version:
-        try:
-            min_constraint = _self.VersionConstraint.parse(args.min_version)
-            if not min_constraint.matches(version):
-                raise CLIError(
-                    2,
-                    "version_below_minimum",
-                    {"version": str(version), "constraint": args.min_version},
-                )
-        except ValueError as e:
-            raise CLIError(1, "invalid_min_version", {"version": args.min_version, "error": str(e)})
+        parse = _self.VersionConstraint.parse
+        min_constraint = _parse_version(parse, args.min_version, "invalid_min_version")
+        if not min_constraint.matches(version):
+            raise CLIError(
+                2,
+                "version_below_minimum",
+                {"version": str(version), "constraint": args.min_version},
+            )
 
     # Check maximum version constraint
     if args.max_version:
-        try:
-            max_constraint = _self.VersionConstraint.parse(args.max_version)
-            if not max_constraint.matches(version):
-                raise CLIError(
-                    2,
-                    "version_above_maximum",
-                    {"version": str(version), "constraint": args.max_version},
-                )
-        except ValueError as e:
-            raise CLIError(1, "invalid_max_version", {"version": args.max_version, "error": str(e)})
+        parse = _self.VersionConstraint.parse
+        max_constraint = _parse_version(parse, args.max_version, "invalid_max_version")
+        if not max_constraint.matches(version):
+            raise CLIError(
+                2,
+                "version_above_maximum",
+                {"version": str(version), "constraint": args.max_version},
+            )
 
 
 def _show_schema_info(
@@ -1472,21 +1554,30 @@ def _cprint_literal(line: str) -> None:
     inside an identifier or a copy-pasteable command. ``highlight=False``, as
     in :func:`_cprint_json`: Rich's highlighter takes time quadratic in a run
     of ``<`` (4 s for 10,000), and a bundle's MANIFEST can carry one.
+    Printed through :func:`cprint_literal`, which redacts it and spells each
+    control character: a terminal escape in an argument or a contract value
+    (``\\x1b]0;...``) shows as text and never reaches the terminal.
     """
-    cprint(line, markup=False, soft_wrap=True, highlight=False)
+    cprint_literal(line, soft_wrap=True, highlight=False)
 
 
 def _output_json_results(result: ValidationResult, args) -> int:
     """Output results in JSON format."""
     import json
 
-    output = {
-        "valid": result.is_valid,
-        "schema_version": str(result.schema_version) if result.schema_version else None,
-        "errors": result.errors,
-        "warnings": result.warnings,
-        "validation_time": result.validation_time,
-    }
+    output: Dict[str, Any] = {"valid": result.is_valid}
+    fragment = _fragment_kind(args)
+    if fragment is not None:
+        # Which kind of fragment this verdict is about.
+        output["fragment"] = fragment
+    output.update(
+        {
+            "schema_version": str(result.schema_version) if result.schema_version else None,
+            "errors": result.errors,
+            "warnings": result.warnings,
+            "validation_time": result.validation_time,
+        }
+    )
 
     _cprint_json(json.dumps(output, indent=2))
     return 0 if result.is_valid and (not args.strict or not result.warnings) else 1
