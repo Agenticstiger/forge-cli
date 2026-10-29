@@ -24,7 +24,8 @@ A YAML root keeps every comment and every other byte: only the moved parts
 are cut out of its text. The result is checked before the command ends: the
 split contract composes to the same document as the original, or nothing is
 left changed, no file and no directory. No file is written over but the
-contract split in place: not by a fragment, and not by the root in ``--out``.
+contract split in place, or a byte-for-byte copy of it in ``--out`` that is
+the only name of its file: not by a fragment, and not by the root.
 
 Usage:
     fluid split contract.fluid.yaml
@@ -72,7 +73,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "A part that is already a $ref is left as it is, so splitting twice\n"
             "changes nothing. A file that exists is never written over. A relative\n"
             "$ref in a part that moves is rewritten to name the same file from\n"
-            "the part's new one.\n\n"
+            "the part's new one. With --out, the files relative $refs name must be\n"
+            "under the output directory too, where they are beside the contract.\n\n"
             "Examples:\n"
             "  fluid split contract.fluid.yaml                       # split in place\n"
             "  fluid split contract.fluid.yaml --parts builds,sql    # choose the parts\n"

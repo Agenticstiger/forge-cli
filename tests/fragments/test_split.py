@@ -20,9 +20,10 @@ every environment, and splitting the result again changes nothing. ``Pair``
 builds the flat contract and its copy to split; ``split_and_check`` runs the
 split on the copy and asserts that invariant.
 
-Findings are kept as ``xfail(strict=True)`` tests that assert the behaviour
-the catalog asks for; characterisation tests pin today's behaviour where the
-catalog has no oracle (SPEC GAP SG-32, SG-18).
+Findings were kept as ``xfail(strict=True)`` tests that asserted the
+behaviour the catalog asks for, until each was fixed: none is left, and each
+test now passes and names its finding. Characterisation tests pin today's
+behaviour where the catalog has no oracle (SPEC GAP SG-32, SG-18).
 """
 
 from __future__ import annotations
@@ -1708,16 +1709,30 @@ def test_i21_the_dict_level_splitter_rebases_a_ref_once_and_never_its_own() -> N
         ('{"$ref": "./p.yaml"}  # double', '{"$ref": "../../p.yaml"}  # double'),
         ("{$ref: !!str ./p.yaml}  # tagged", "{$ref: ../../p.yaml}  # tagged"),
         ("\n        $ref: ./p.yaml  # block", "\n    $ref: ../../p.yaml  # block"),
+        # A plain one whose new path needs quotes gets double ones: a "#" in it,
+        # or a blank, with a letter that is not ASCII written as it is.
+        ("{$ref: ./p.yaml#/mode}  # hash", '{$ref: "../../p.yaml#/mode"}  # hash'),
+        ("{$ref: ./my é.yaml}  # blank", '{$ref: "../../my é.yaml"}  # blank'),
     ],
-    ids=["plain", "single-quoted", "double-quoted", "tagged", "block-mapping"],
+    ids=[
+        "plain",
+        "single-quoted",
+        "double-quoted",
+        "tagged",
+        "block-mapping",
+        "plain-needing-quotes",
+        "plain-with-a-blank-and-a-letter-not-ascii",
+    ],
 )
-def test_i21_a_rebased_ref_keeps_its_quoting_and_every_comment(
+def test_i21_a_rebased_ref_keeps_its_quoting_where_it_can_and_every_comment(
     tmp_path: Path, written: str, rebased: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """SP-02 in the text splice: only the ref's scalar is rewritten, in the
-    quoting it was written in (a tag on it goes: the string is a string)."""
+    quoting it was written in where the new path allows it (a tag on it goes:
+    the string is a string)."""
     text = f"# head\nid: x\nbuilds:\n  - id: a\n    properties:\n      parameters: {written}\n"
-    pair = make_pair(tmp_path, {NAME: text, "p.yaml": "mode: full\n"})
+    files = {NAME: text, "p.yaml": "mode: full\n", "my é.yaml": "mode: full\n"}
+    pair = make_pair(tmp_path, files)
     capsys.readouterr()
 
     after = split_and_check(pair)

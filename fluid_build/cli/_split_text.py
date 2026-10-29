@@ -20,10 +20,11 @@ lines. Each moved part takes its own text to its fragment, comments inside
 it included, and a ``$ref`` takes its place. A part inside another (a
 build's SQL) is cut out of its container's text first, so the container's
 fragment holds the ref to it. A relative ``$ref`` already in a moved part is
-rewritten in its text, in its own quoting, to name the same file from the
-fragment. The comment on a block scalar's header line
-(``sql: |  # the query``) stays beside the ref that replaces the scalar: a
-text file cannot hold it.
+rewritten in its text to name the same file from the fragment, in the
+quoting it was written in where the new path allows it: a plain one gets
+double quotes when the path needs them (a ``#`` or a blank in it). The
+comment on a block scalar's header line (``sql: |  # the query``) stays
+beside the ref that replaces the scalar: a text file cannot hold it.
 
 PyYAML's compose marks give each part's span; PyYAML is a base dependency,
 so no round-trip library is needed. A block node's end mark runs past its
@@ -249,7 +250,8 @@ def _with_trailing_comment(text: str, end: int) -> int:
 def _rebased_refs(cut: _Cut) -> List[_Edit]:
     """An edit for each ``$ref`` in the part ``cut`` moves (not in a part cut out
     of it) that names a file relative to the root: it is rewritten to name that
-    file from the part's own file (:func:`rebased_ref`), in the quoting it had."""
+    file from the part's own file (:func:`rebased_ref`), in the quoting it had
+    where the new path allows it (:func:`_ref_edit`)."""
     inner = {id(child.node) for child in cut.children if isinstance(child, _Cut)}
     edits: List[_Edit] = []
     stack = [cut.node]
@@ -304,8 +306,13 @@ def _yaml_string(value: str) -> str:
 
 
 def _double_quoted(value: str) -> str:
-    """``value`` as a double-quoted YAML scalar, on one line however long it is."""
-    return yaml.safe_dump(value, default_style='"', width=_ONE_LINE).strip()
+    """``value`` as a double-quoted YAML scalar, on one line however long it is.
+
+    A printable letter that is not ASCII (``é``) is written as it is, as the
+    contract had it; NEL, LS, PS and what is not printable are escaped all the
+    same, so the value reads back exactly.
+    """
+    return yaml.safe_dump(value, default_style='"', width=_ONE_LINE, allow_unicode=True).strip()
 
 
 def _render(text: str, lo: int, hi: int, edits: Sequence[_Edit]) -> str:
