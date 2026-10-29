@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **One odd contract no longer ends `fluid docs`.** A contract holding a value of an unexpected
+  type (an `id` that is a number, `tags: [1, 2]`, a YAML date in `metadata.owner`, `exposes: 5`)
+  stopped the whole catalog with `docs_failed` and a bare Python message naming no contract, and
+  no page was written. That contract is now listed like the rest, its values shown as text.
+- **A failing `fluid docs` run keeps the catalog the last run wrote.** `index.html` was opened
+  for writing before it was rendered and `index.json` was streamed into an open file, so a run
+  that failed left `index.html` empty or `index.json` cut off mid-document. Every file is now
+  rendered before the first one is opened.
+- **A contract that does not load is a row with its error, not a dead link.** `index.html`
+  linked it to `contract-contract.html`, a page the run never wrote, and its error was only in
+  `index.json`.
+- **`fluid docs --src` lists a product's root contract only.** It globbed `contract.fluid.*`,
+  so the overlay `contract.fluid.prod.yaml` beside a contract got a page and an index row with no
+  id.
+
 ## [0.25.0] — 2026-10-28
 
 ### Added
