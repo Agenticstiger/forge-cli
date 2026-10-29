@@ -237,9 +237,10 @@ def test_a_missing_contract_is_named(tmp_path, capsys):
     captured = capsys.readouterr()
     text = " ".join((captured.out + captured.err).split())
     assert rc == 1
-    # the path may be wrapped at the terminal width, so its file name stands for it
-    assert "Contract file not found:" in text and "nope.fluid.yaml" in text
-    assert "not found: None" not in text
+    # The error line is wrapped at the terminal width (80 columns on CI), possibly inside the
+    # path, so the path is looked for with every whitespace taken out.
+    assert "Contract file not found:" in text and "not found: None" not in text
+    assert str(missing).replace(" ", "") in "".join(text.split())
 
 
 @pytest.mark.parametrize(
