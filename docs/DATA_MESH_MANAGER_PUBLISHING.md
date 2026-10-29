@@ -302,12 +302,14 @@ When `--overlay` is supplied, the CLI calls `load_with_overlay()` which
 deep-merges the overlay's `exposes` list into the base contract's `exposes`
 list before any generation happens. This means:
 
-- An overlay entry patches the base entry with the same `exposeId`, and one
-  that names no base entry is added (logged as `overlay_entry_added`). A
-  contract that declares a `fluidVersion` below 0.7.6 merges by position
-  instead: the entry at index `0` patches the base entry at index `0`, and an
-  entry whose `exposeId` differs from the base entry's logs
-  `overlay_patch_retargeted`
+- An overlay entry patches the base entry with the same `exposeId`; an
+  `exposeId` the base does not have adds an entry (logged as
+  `overlay_entry_added`), and an entry with no `exposeId` is refused when the
+  base has more than one expose. A contract that declares a `fluidVersion`
+  below 0.7.6 (the overlay's own, when it declares one, wins) merges by
+  position instead: the entry at index `0` patches the base entry at index
+  `0`, and when the base has more than one expose an entry whose `exposeId`
+  differs from the base entry's logs `overlay_patch_retargeted`
 - Only the fields present in the overlay entry are changed
 - All other fields (`schema`, `qos`, `lifecycle`) are untouched
 - Both the ODPS product record and the ODCS contracts see the merged result

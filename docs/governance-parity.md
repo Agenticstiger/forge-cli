@@ -7,7 +7,7 @@ and which real identities the contract's logical principals are on that cloud.
 checks the live platform against the same derivation apply emitted from.
 
 The fields are in fluid-schema **0.7.6**, stable since 0.7.7 opened as the preview. 0.7.5 is
-unchanged, so a contract needs `fluidVersion: "0.7.6"` to validate with them.
+unchanged, so a contract needs `fluidVersion: "0.7.6"` or later to validate with them.
 
 ## The parity table
 
