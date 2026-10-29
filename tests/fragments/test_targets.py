@@ -517,6 +517,30 @@ def test_a16_an_unknown_suffix_is_still_parsed_and_warns_once_per_suffix_sg16(
     assert warning.file == str(target.resolve())  # type: ignore[attr-defined]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="a Windows file name cannot hold a control character")
+def test_a16_the_unknown_suffix_warning_spells_control_characters_of_the_file_name_sg16(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Security: a file name is input too. Logged as written, its line feed began a forged
+    log line and its escape sequences reached the terminal; each is spelled as ``repr``
+    writes it, in the path and in the suffix."""
+    name = "t\n2026-10-29 INFO fluid: ok\x1b]0;owned\x07.c\x1bnf"
+    try:
+        _write(tmp_path / name, "retries: 3\n")
+    except OSError:
+        pytest.skip("this file system refuses a control character in a file name")
+
+    with caplog.at_level(logging.WARNING, logger="fluid.loader"):
+        assert _rfr({"x": {"$ref": f"./{name}"}}, tmp_path) == {"x": {"retries": 3}}
+
+    (warning,) = _suffix_warnings(caplog)
+    message = warning.getMessage()
+    assert message.isprintable(), message
+    assert (
+        "/t\\n2026-10-29 INFO fluid: ok\\x1b]0;owned\\x07.c\\x1bnf has the suffix '.c\\x1bnf'"
+    ) in message
+
+
 def test_a16_a_known_suffix_and_a_file_that_fails_to_parse_do_not_warn_sg16(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
