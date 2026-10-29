@@ -1486,6 +1486,45 @@ def test_j07_an_out_through_a_symlink_and_dotdot_is_checked_where_it_would_be_ma
     assert read == []
 
 
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, not root")
+def test_j07_an_out_with_dotdot_after_a_part_not_made_yet_is_checked_where_it_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ro/inner/new/../../x`` is made in ``ro``: the walk up as written stopped at the
+    writable ``ro/inner``, so a read-only ``ro`` failed the run only after the render."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    (tmp_path / "ro" / "inner").mkdir(parents=True)
+    (tmp_path / "ro").chmod(0o555)
+    read = _no_contract_read(monkeypatch)
+    try:
+        error = _docs_error(tmp_path / "src", tmp_path / "ro/inner/new/../../x")
+    finally:
+        (tmp_path / "ro").chmod(0o755)
+
+    assert f"{str(tmp_path / 'ro')!r} is a directory this user cannot write to" in error
+    assert read == []
+    assert [p.name for p in (tmp_path / "ro" / "inner").iterdir()] == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+@pytest.mark.parametrize("where", ["dangling/site", "a-file/../site"])
+def test_j07_an_out_through_a_part_that_is_no_directory_is_refused_before_any_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """The real path of ``dangling/site`` is under the missing target, whose nearest
+    parent is writable, and that of ``a-file/../site`` folds the file away: only the walk up
+    the path as written meets the part no directory can be made under."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    (tmp_path / "dangling").symlink_to(tmp_path / "nowhere")
+    _write(tmp_path / "a-file", "not a directory\n")
+    read = _no_contract_read(monkeypatch)
+
+    error = _docs_error(tmp_path / "src", tmp_path / where)
+
+    assert error.startswith(f"--out {str(tmp_path / where)!r} cannot be made: ")
+    assert error.endswith(" is not a directory") and read == []
+
+
 _LEFT_BY_A_KILLED_RUN = [
     ".index.html.0123456789abcdef.tmp",
     ".index.json.fedcba9876543210.tmp",

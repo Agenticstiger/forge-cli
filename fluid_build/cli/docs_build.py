@@ -147,21 +147,29 @@ def _check_out(out: str) -> None:
         if not os.access(out, os.W_OK | os.X_OK):
             raise PermissionError(f"--out {out!r} is a directory this user cannot write to")
         return
-    # Up the path as written, not as abspath() folds it: in "link/../made" the
-    # ".." is the link target's parent, where the directory would be made.
-    nearest = out
-    while not os.path.lexists(nearest):
-        parent = os.path.dirname(nearest) or os.curdir
-        if parent == nearest:
+    # Up to the nearest directory there is, twice. Up --out as written, never as
+    # abspath() folds it, a part that is no directory (a file, a dangling symlink)
+    # stops it as it stops the mkdir. Up its real path, a ".." after a part not
+    # made yet lands where the OS takes it: "ro/inner/new/../../x" is made in ro.
+    for start in (out, os.path.realpath(out)):
+        nearest = _nearest_there(os.path.dirname(start) or os.curdir)
+        where = os.path.realpath(nearest)
+        if not os.path.isdir(nearest):
+            raise NotADirectoryError(f"--out {out!r} cannot be made: {where!r} is not a directory")
+        if not os.access(nearest, os.W_OK | os.X_OK):
+            raise PermissionError(
+                f"--out {out!r} cannot be made: {where!r} is a directory this user cannot write to"
+            )
+
+
+def _nearest_there(path: str) -> str:
+    """``path``, or the nearest of its parents that ``lstat`` finds."""
+    while not os.path.lexists(path):
+        parent = os.path.dirname(path) or os.curdir
+        if parent == path:
             break
-        nearest = parent
-    where = os.path.realpath(nearest)
-    if not os.path.isdir(nearest):
-        raise NotADirectoryError(f"--out {out!r} cannot be made: {where!r} is not a directory")
-    if not os.access(nearest, os.W_OK | os.X_OK):
-        raise PermissionError(
-            f"--out {out!r} cannot be made: {where!r} is a directory this user cannot write to"
-        )
+        path = parent
+    return path
 
 
 def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
