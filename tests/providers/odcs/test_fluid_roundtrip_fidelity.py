@@ -500,3 +500,42 @@ def test_a_reader_with_an_older_default_restores_the_recorded_version(
     )  # a reader on a release where 0.7.6 was still the preview
     assert FluidSchemaManager.latest_bundled_version() == "0.7.5"
     assert provider.import_contract(exported)["fluidVersion"] == "0.7.6"
+
+
+def _foreign_document() -> Dict[str, Any]:
+    with open(REPO_ROOT / "tests" / "fixtures" / "odcs" / "contract-minimal.yaml") as f:
+        return yaml.safe_load(f)
+
+
+def test_a_document_that_recorded_no_version_exports_without_one(
+    provider: OdcsProvider,
+) -> None:
+    # A foreign ODCS document records no FLUID version, so the import declares the
+    # reader's default. Recording that default on export added a fluidExtras entry
+    # the source never had, and ODCS → FLUID → ODCS was no longer a fixed point.
+    imported = provider.import_contract(_foreign_document())
+    assert imported["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
+    assert "customProperties" not in provider.render(imported)
+
+
+def test_an_imported_contract_records_a_version_set_after_import(
+    provider: OdcsProvider,
+) -> None:
+    imported = provider.import_contract(_foreign_document())
+    imported["fluidVersion"] = "0.7.5"
+    assert _recorded_root(provider.render(imported)) == {"fluidVersion": "0.7.5"}
+
+
+def test_an_imported_contract_records_its_version_once_it_carries_more(
+    provider: OdcsProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Content ODCS has no field for may need the version, so it rides along too,
+    # and a reader with an older default restores both.
+    imported = provider.import_contract(_foreign_document())
+    imported["metadata"]["layer"] = "Gold"
+    exported = provider.render(imported)
+    assert _recorded_root(exported) == {"fluidVersion": imported["fluidVersion"]}
+    monkeypatch.setattr(FluidSchemaManager, "PREVIEW_VERSIONS", frozenset({"0.7.6", "0.7.7"}))
+    reread = provider.import_contract(exported)
+    assert reread["fluidVersion"] == imported["fluidVersion"]
+    assert reread["metadata"]["layer"] == "Gold"

@@ -68,8 +68,9 @@ _ROOT_MAPPED = frozenset(
 
 # Root keys recorded even where the round-trip would reproduce them. A re-import
 # reproduces ``fluidVersion`` from the READER's default, not the writer's: left
-# out when it equals the exporting CLI's default, a 0.7.6 contract's export came
-# back from a CLI whose default is 0.7.5 as 0.7.5, and its 0.7.6 fields failed.
+# out when it equalled the exporting CLI's default, a 0.7.6 contract read by a
+# CLI whose default is 0.7.5 would come back as 0.7.5, and its 0.7.6 fields
+# would fail. ``_collect`` makes the one exception.
 _ROOT_ALWAYS = frozenset({"fluidVersion"})
 
 # ``metadata`` keys reproduced elsewhere in the ODCS document. ``owner`` is
@@ -239,6 +240,17 @@ def _collect(fluid: Mapping[str, Any], baseline: Mapping[str, Any]) -> Dict[str,
             exposes[expose_id] = entry
     if exposes:
         extras["exposes"] = exposes
+
+    # Local import, like ``_reimport``'s.
+    from .normalize import defaulted_version
+
+    defaulted = defaulted_version(fluid)
+    if defaulted and extras == {"root": {"fluidVersion": defaulted}}:
+        # Only the version, and it is the default an import gave a document
+        # that recorded none: recording it adds an entry the source never had,
+        # and ODCS → FLUID → ODCS stops being a fixed point. Once anything else
+        # rides along, so does the version: that content may need it.
+        return {}
     return extras
 
 
