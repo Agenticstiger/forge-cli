@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`$$ref` writes a literal `$ref` key.** A JSON Schema or OpenAPI payload inside `parameters` or
+  an extension that carries `$ref` keys of its own has failed composition since 0.25.0, because
+  every `$ref` key is read as a contract reference (0.25.0's note said to keep such a payload as a
+  string). Write those keys `$$ref`: the composed contract has `$ref` there, never resolved, and
+  `$$$ref` gives `$$ref`. `fluid bundle` writes the escape back, so a bundle stays a contract input;
+  the library and the exports see `$ref`.
+- **`.hql`, `.ddl`, `.cql`, `.j2`, `.jinja` and `.sh` are text suffixes:** a `$ref` to such a file
+  becomes its text. Before, `q.hql` holding `SELECT 'a: b' FROM t` was parsed as YAML and became
+  the mapping `{"SELECT 'a": "b' FROM t"}`.
+
+### Changed
+
+- **A key written twice in a contract file is refused.** In the root contract, an overlay, a
+  `$ref` fragment, a bundle's contract and `fluid.workspace.yaml`, a duplicate key kept its last
+  value without a word, and two `$ref` keys in one mapping read only the second file. It now fails,
+  naming the file, the line and the key:
+  `contract.fluid.yaml:26: duplicate key 'name' (YAML 1.2 requires unique keys)`.
+  A key a `<<` merge brings in and the mapping writes itself is not a duplicate, and `<<` may be
+  written more than once. In `fluid.workspace.yaml` a duplicate key makes its `ref_root` ignored
+  (with a warning naming the key) and its `expected-environments` an error.
+- **A `$ref` to a file whose suffix fluid does not know logs a warning**
+  (`ref_target_suffix_unknown`), once per file, saying how it was read and which suffixes are
+  known. The file is read as before. `.json`, `.yaml`, `.yml` and `.avsc` never warn.
+
+### Deprecated
+
+- **A file ref's pointer without a leading `/`** (`./x.yaml#key`) resolves as before but logs a
+  warning (`ref_pointer_without_slash`) naming the fix, `./x.yaml#/key`; a later minor release will
+  refuse it, as RFC 6901 has a JSON pointer empty or starting with `/`. The same-document `#key`
+  stays refused.
+
+### Upgrade notes
+
+- **Duplicate keys now fail.** A contract, overlay, fragment or workspace file that writes a key
+  twice (often a copy-paste slip, which kept the second value) fails `validate`, `bundle`, `plan`
+  and every command that loads it, naming the place: remove the copy you do not want.
+- **A payload with `$ref` keys of its own:** write them `$$ref` instead of keeping the payload as a
+  string.
+
 ## [0.25.0] — 2026-10-28
 
 ### Added
