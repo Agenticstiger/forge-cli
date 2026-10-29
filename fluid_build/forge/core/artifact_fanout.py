@@ -459,9 +459,16 @@ def _slug_from_contract(contract: Dict[str, Any]) -> str:
 
 
 def _load_contract(contract_path: Path) -> Dict[str, Any]:
+    """The contract every emitter exports, read as the composition reads it.
+
+    A key written twice is refused (``unique_keys``), as ``validate``, ``plan``
+    and ``bundle`` refuse it: read with PyYAML's last-wins, a second
+    ``accessPolicy`` would be the one exported while every other command
+    refused the file. The error is a :class:`FanoutError` naming the line.
+    """
     try:
         with open(contract_path, "r", encoding="utf-8") as fh:
-            doc = load_yaml_safe(fh)
+            doc = load_yaml_safe(fh, unique_keys=True, name=str(contract_path))
     except OSError as exc:
         # FanoutError is what `fluid generate artifacts` reports; anything else
         # ends as an unhandled exception.

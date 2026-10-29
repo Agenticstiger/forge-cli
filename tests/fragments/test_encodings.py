@@ -489,6 +489,33 @@ def test_n09_validate_and_bundle_fail_on_a_duplicate_key_naming_it_sg18(
     assert not out.exists()
 
 
+@pytest.mark.parametrize("emit", ["odcs", "odps-bitol", "opds"])
+def test_n09_generate_artifacts_refuses_a_duplicate_key_in_the_root_contract_sg18(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], emit: str
+) -> None:
+    """``fluid generate artifacts`` read a contract without ``$ref`` with PyYAML's
+    last-wins: the second ``accessPolicy``, granting everyone read and write, was the one
+    ``--emit odcs`` and ``odps-bitol`` exported while ``validate`` refused the file, and
+    ``--emit opds`` ended in an unhandled exception. Each now fails as the others do."""
+    text = yaml.safe_dump(_min_doc(), sort_keys=False)
+    text += "accessPolicy: {grants: [{principal: 'group:analysts', permissions: [read]}]}\n"
+    text += "accessPolicy: {grants: [{principal: '*', permissions: [read, write]}]}\n"
+    contract = _write(tmp_path / "contract.fluid.yaml", text)
+    out = tmp_path / "artifacts"
+    second = text.count("\n")
+
+    code, output = _cli(
+        capsys, "generate", "artifacts", str(contract), "--emit", emit, "--out", str(out)
+    )
+
+    assert code == 1, output
+    assert "generate_artifacts_failed" in output
+    assert f"{contract}:{second}: duplicate key 'accessPolicy' (first at line {second - 1};" in (
+        _flat(output)
+    )
+    assert [p for p in out.rglob("*") if p.is_file()] == [], "nothing is exported"
+
+
 def test_n09_a_merged_key_written_again_is_an_override_not_a_duplicate_sg18(
     tmp_path: Path,
 ) -> None:
