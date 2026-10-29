@@ -35,6 +35,7 @@ generate the original contract.
 from __future__ import annotations
 
 import copy
+import hashlib
 import posixpath
 import re
 from typing import (
@@ -99,6 +100,15 @@ _CODE_SUFFIX = {"python": "py", "pyspark": "py", "scala": "scala", "r": "r"}
 #: Description parts written as Markdown by the ``description`` part.
 _DESCRIPTION_PARTS = ("purpose", "usage", "limitations")
 
+#: The longest slug a file is named by. A longer one is cut short and ends in
+#: a hash of the whole id instead, so the name stays far under the 255 bytes a
+#: file name may have, a ``-N`` and the longest suffix included, and two long
+#: ids that start alike still get a name each. The cap is the default of
+#: pants' ``safe_filename``; the hash that ends the cut slug, 8 hex digits of
+#: SHA-256 over the whole id, is kubespawner's ``strip_and_hash``.
+_MAX_SLUG = 100
+_SLUG_HASH = 8
+
 
 class FragmentSite(NamedTuple):
     """One part of a contract that goes to a file of its own."""
@@ -131,10 +141,13 @@ def parse_parts(spec: str) -> Tuple[str, ...]:
 
 
 def _slugify(value: str) -> str:
-    """Convert an identifier to a filesystem-safe slug."""
+    """Convert an identifier to a filesystem-safe slug, at most :data:`_MAX_SLUG` long."""
     slug = re.sub(r"[^a-zA-Z0-9_-]", "-", str(value).strip())
-    slug = re.sub(r"-{2,}", "-", slug).strip("-")
-    return slug.lower() or "unnamed"
+    slug = re.sub(r"-{2,}", "-", slug).strip("-").lower() or "unnamed"
+    if len(slug) <= _MAX_SLUG:
+        return slug
+    whole = hashlib.sha256(str(value).encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{slug[: _MAX_SLUG - _SLUG_HASH - 1].rstrip('-')}-{whole[:_SLUG_HASH]}"
 
 
 def _file_text(value: Any) -> bool:

@@ -955,22 +955,59 @@ def test_i09_windows_device_names_are_not_avoided_today(tmp_path: Path) -> None:
     ]
 
 
-def test_i09_a_300_character_id_cannot_be_written_but_the_dry_run_says_it_can(
+def test_i09_a_300_character_id_gets_a_short_name_the_dry_run_lists(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """SG-32 characterisation (finding SP-07): the slug is not shortened, so the
-    file name is over 255 bytes; ``--dry-run`` lists it and exits 0, the real
-    run fails with ENAMETOOLONG."""
+    """Finding SP-07: a slug over 100 characters is cut short and ends in a hash
+    of the whole id, so every name fits (255 bytes at most); two long ids that
+    start alike get a name each, and the dry run lists what the real run writes."""
     big = "a" * 300
-    pair = solo(tmp_path, f"id: x\nbuilds:\n  - id: {big}\n    engine: sql\n")
-    before = files_of(pair.split)
+    text = (
+        f"id: x\nbuilds:\n  - id: {big}\n    engine: sql\n    properties: {{sql: SELECT 1}}\n"
+        f"  - id: {big}b\n    engine: sql\nexposes:\n  - exposeId: {big}\n    kind: table\n"
+        f"extensions:\n  {big}: {{a: 1}}\n"
+    )
+    pair = solo(tmp_path, text)
+    capsys.readouterr()
 
-    assert split(pair.split_contract, "--dry-run") == 0
-    assert big in capsys.readouterr().err
-    assert split(pair.split_contract) == 1
+    assert split(pair.split_contract, "--dry-run", "--parts", ALL_PARTS) == 0
+    listed = _listed(capsys.readouterr().err)
 
-    assert "File name too long" in capsys.readouterr().err
-    assert files_of(pair.split) == before
+    after = split_and_check(pair, ALL_PARTS)
+
+    def short(name: str) -> str:
+        return f"{'a' * 91}-{hashlib.sha256(name.encode()).hexdigest()[:8]}"
+
+    created = new_files(pair, after)
+    assert listed == created
+    assert created == sorted(
+        [
+            f"fragments/builds/{short(big)}.yaml",
+            f"fragments/builds/{short(big + 'b')}.yaml",
+            f"fragments/exposes/{short(big)}.yaml",
+            f"fragments/extensions/{short(big)}.yaml",
+            f"sql/{short(big)}.sql",
+        ]
+    )
+    assert all(len(rel.rsplit("/", 1)[1].encode("utf-8")) <= 255 for rel in created)
+    composed = compose_contract(pair.split_contract).document
+    assert [b["id"] for b in composed["builds"]] == [big, big + "b"]
+    assert text_of(after, f"fragments/builds/{short(big)}.yaml").startswith(f"# Build: {big}\n")
+
+
+@pytest.mark.parametrize("length", [100, 101])
+def test_i09_a_slug_is_cut_only_past_100_characters(length: int) -> None:
+    from fluid_build.cli.forge_contract_fragments import _slugify
+
+    name = ("Ab" * 51)[:length]
+
+    slug = _slugify(name)
+
+    assert len(slug) == 100
+    if length == 100:
+        assert slug == name.lower()
+    else:
+        assert slug == name.lower()[:91] + "-" + hashlib.sha256(name.encode()).hexdigest()[:8]
 
 
 # ── I-10..I-15: the sql part ────────────────────────────────────────────
