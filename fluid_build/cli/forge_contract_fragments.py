@@ -109,6 +109,11 @@ _DESCRIPTION_PARTS = ("purpose", "usage", "limitations")
 _MAX_SLUG = 100
 _SLUG_HASH = 8
 
+#: The ``./`` steps a relative ref may start with (``./``, ``.//``, ``././``):
+#: they name the directory it is written in, so say nothing once it is
+#: rebased. Matched once, not stripped a step at a time (a copy per step).
+_LEADING_DOT_STEPS = re.compile(r"(?:\./+)+")
+
 
 class FragmentSite(NamedTuple):
     """One part of a contract that goes to a file of its own."""
@@ -307,7 +312,7 @@ def rebased_ref(ref: Any, container: Optional[str]) -> Any:
     a ``#/pointer`` after the file stays. The ref's own path is kept as it was
     written, so no ``..`` in it is folded away (that would be wrong past a
     symlinked directory); only the directories it shares with the container's
-    lead, and a leading ``./``, are dropped. A URL, an absolute path, a
+    lead, and the ``./`` steps it starts with, are dropped. A URL, an absolute path, a
     same-document ``#/...`` pointer and a value that is not a string are not
     relative to the file, and come back unchanged.
     """
@@ -316,10 +321,8 @@ def rebased_ref(ref: Any, container: Optional[str]) -> Any:
     file_part, mark, pointer = ref.partition("#")
     if not is_relative_file_ref(file_part):
         return ref
-    path = file_part
-    while path.startswith("./"):
-        path = path[2:].lstrip("/")
-    names = path.split("/")
+    lead = _LEADING_DOT_STEPS.match(file_part)
+    names = file_part[lead.end() if lead else 0 :].split("/")
     climb = [name for name in posixpath.dirname(container).split("/") if name]
     # A directory the container's path starts with is a real one (split writes
     # through no symlink), so going into it and back out is no step at all.

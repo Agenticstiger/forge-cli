@@ -1657,6 +1657,28 @@ def test_i21_a_ref_is_rebased_by_its_path_alone(ref: Any, container: Any, rebase
     assert rebased_ref(ref, container) == rebased
 
 
+@pytest.mark.parametrize(
+    "lead,rest,rebased",
+    [
+        ("./", "x.yaml#/a", "../../x.yaml#/a"),
+        (".//", "x.yaml", "../../x.yaml"),
+        ("./", ".x/y.yaml", "../../.x/y.yaml"),  # a dot that starts a name stays
+        ("./", "../x.yaml", "../../../x.yaml"),
+    ],
+)
+def test_i21_the_dot_steps_a_ref_starts_with_are_dropped_in_linear_time(
+    lead: str, rest: str, rebased: str
+) -> None:
+    """``./`` steps were stripped one at a time, a copy of the rest of the ref per
+    step: 200,000 of them took seconds. They are matched once now."""
+    from fluid_build.cli.forge_contract_fragments import rebased_ref
+
+    started = time.monotonic()
+
+    assert rebased_ref(lead * 200_000 + rest, "fragments/builds/t.yaml") == rebased
+    assert time.monotonic() - started < 1
+
+
 def test_i21_the_dict_level_splitter_rebases_a_ref_once_and_never_its_own() -> None:
     """The sql ref split writes into the build's file names it from there already;
     only the ref that was in the contract is rebased."""
