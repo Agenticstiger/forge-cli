@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import glob
 import hashlib
 import html
@@ -294,15 +295,15 @@ def _mine(st: os.stat_result) -> bool:
 def _stage(target: str, data: bytes) -> str:
     """``data`` in a new temp file in ``target``'s directory; the temp file's path.
 
-    Made as click's atomic ``open_file`` makes its temp file: ``O_EXCL``, with
-    the mode the umask gives (as ``open()`` did; not mkstemp's ``0o600``, the
-    catalog is there to be served), or the mode of the file it will replace
-    when that file is this user's own and has no other name: never a mode
-    someone else chose. The mode is set on the open descriptor, never by path,
-    so a symlink renamed over the temp name meanwhile is not followed: a mode is
-    kept only where there are uids, and every such system has ``os.fchmod``. A
-    directory where the file goes is refused here, before any file of the
-    catalog is replaced.
+    Made by ``open(temp, "xb")``, so ``O_EXCL``, with the mode ``open()`` gives a
+    new file, the umask's (not mkstemp's ``0o600``: the catalog is there to be
+    served); or with the mode of the file it will replace when that file is this
+    user's own and has no other name, never a mode someone else chose. That mode
+    goes to the ``open(2)`` itself, so the file is never wider than it, and is set
+    again on the open descriptor, never by path, so a symlink renamed over the
+    temp name meanwhile is not followed: a mode is kept only where there are
+    uids, and every such system has ``os.fchmod``. A directory where the file
+    goes is refused here, before any file of the catalog is replaced.
     """
     try:
         current = os.lstat(target)
@@ -319,26 +320,22 @@ def _stage(target: str, data: bytes) -> str:
     ):
         own = current.st_mode & 0o777
     directory, name = os.path.split(target)
-    # O_EXCL: never an existing file, nor a symlink someone put at this name.
     temp = os.path.join(directory, f".{name}.{os.urandom(8).hex()}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-    fd = os.open(temp, flags, 0o666 if own is None else own)
-    handle = None
-    done = False
+    opener = None if own is None else functools.partial(os.open, mode=own)
     try:
-        handle = open(fd, "wb")  # owns the descriptor from here, and closes it
-        with handle:
+        # "x" is O_EXCL: never an existing file, nor a symlink someone put at this name.
+        with open(temp, "xb", opener=opener) as handle:
             if own is not None:  # the bits the umask took off, before a byte is written
-                os.fchmod(fd, own)
+                os.fchmod(handle.fileno(), own)
             handle.write(data)
-        done = True
-    finally:
-        if handle is None:  # open() itself failed: the descriptor is still ours to close
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        if not done:
-            with contextlib.suppress(OSError):
-                os.unlink(temp)
+    except FileExistsError:
+        raise  # not ours to remove
+    except BaseException:
+        # The name is new and random, so a file there is the one the open(2) made;
+        # open() closes its descriptor itself when it fails after the open(2).
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
     return temp
 
 

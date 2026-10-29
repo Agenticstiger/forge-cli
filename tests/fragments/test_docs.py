@@ -1066,34 +1066,37 @@ def test_j07_a_run_that_fails_to_write_a_file_leaves_every_file_of_the_catalog_a
     assert _tree(out) == before  # and no temp file is left beside them
 
 
-def test_j07_a_descriptor_open_cannot_wrap_is_closed_and_its_temp_file_removed(
+def test_j07_a_temp_file_open_made_but_could_not_wrap_is_removed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``open(fd)`` failing after ``os.open`` (out of memory, say) left the descriptor open:
-    the ``with`` that closes it had not started. It is closed, and the temp file removed."""
+    """``open()`` failing after its open(2) made the file (out of memory, say) left the
+    temp file behind. open() closes its own descriptor; the temp file is removed."""
     from fluid_build.cli import docs_build
 
-    opened: List[int] = []
-    real_os_open = os.open
+    real_open = open
 
-    def spy(path: Any, flags: int, mode: int = 0o777) -> int:
-        fd = real_os_open(path, flags, mode)
-        opened.append(fd)
-        return fd
-
-    def cannot_wrap(*_args: Any, **_kwargs: Any) -> Any:
+    def made_then_failed(*args: Any, **kwargs: Any) -> Any:
+        real_open(*args, **kwargs).close()  # the open(2) succeeded, then open() failed
         raise MemoryError
 
-    monkeypatch.setattr(docs_build.os, "open", spy)
-    monkeypatch.setattr(docs_build, "open", cannot_wrap, raising=False)
+    monkeypatch.setattr(docs_build, "open", made_then_failed, raising=False)
     with pytest.raises(MemoryError):
         docs_build._stage(str(tmp_path / "index.html"), b"<html></html>")
-    monkeypatch.undo()
-
-    assert len(opened) == 1
-    with pytest.raises(OSError):
-        os.fstat(opened[0])  # closed
     assert list(tmp_path.iterdir()) == []
+
+
+def test_j07_a_file_already_at_the_temp_name_is_left_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O_EXCL refuses a name that is taken, and what is there is not this run's to remove."""
+    from fluid_build.cli import docs_build
+
+    monkeypatch.setattr(docs_build.os, "urandom", lambda n: bytes(n))
+    taken = tmp_path / f".index.html.{bytes(8).hex()}.tmp"
+    taken.write_bytes(b"someone else's")
+    with pytest.raises(FileExistsError):
+        docs_build._stage(str(tmp_path / "index.html"), b"<html></html>")
+    assert taken.read_bytes() == b"someone else's"
 
 
 def test_j07_an_interrupt_while_writing_takes_back_what_the_run_wrote(
