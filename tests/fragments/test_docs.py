@@ -26,9 +26,12 @@ shows a defect found while writing these tests; the reason names it.
 from __future__ import annotations
 
 import datetime
+import errno
+import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import types
@@ -869,6 +872,134 @@ def test_j07_a_run_that_fails_on_one_page_leaves_every_file_of_the_catalog_as_it
     assert _docs(tmp_path, out, src=True) != 0
 
     assert _tree(out) == before
+
+
+def test_j07_a_run_that_fails_to_write_a_file_leaves_every_file_of_the_catalog_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that fails (a full disk) leaves no file cut short and none replaced: each file
+    goes to a temp file beside it first, and the temp files replace the catalog only when every
+    one of them is written."""
+    from fluid_build.cli import docs_build
+
+    first = _put(tmp_path / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    _put(tmp_path / "c" / "contract.fluid.yaml", _min_doc("keep.c"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path, out, src=True) == 0
+    before = _tree(out)
+    _put(first, _min_doc("keep.a", name="Renamed since the last run"))
+    stage, staged = docs_build._stage, []
+
+    def full_on_the_third(target: str, data: bytes) -> str:
+        staged.append(target)
+        if len(staged) == 3:
+            raise OSError(errno.ENOSPC, "No space left on device", target)
+        return stage(target, data)
+
+    monkeypatch.setattr(docs_build, "_stage", full_on_the_third)
+
+    assert _docs(tmp_path, out, src=True) != 0
+
+    assert len(staged) == 3
+    assert _tree(out) == before  # and no temp file is left beside them
+
+
+def test_j07_a_name_utf8_cannot_hold_is_shown_as_text_and_the_catalog_written(
+    tmp_path: Path,
+) -> None:
+    """A lone surrogate (``"\\ud800"`` in YAML) failed the write of index.html after the file
+    was opened, and left it empty. It is written as its ``\\ud800`` text instead."""
+    _put(tmp_path / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path, out, src=True) == 0
+    odd = yaml.safe_dump(_min_doc("odd.name", name="ODD"), sort_keys=False)
+    _write(tmp_path / "b" / "contract.fluid.yaml", odd.replace("ODD", '"bad \\ud800 char"'))
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    assert sorted(_tree(out)) == [
+        "contract-keep-a.html",
+        "contract-odd-name.html",
+        "index.html",
+        "index.json",
+    ]
+    for page in ("index.html", "contract-odd-name.html"):
+        assert "bad \\ud800 char" in (out / page).read_text(encoding="utf-8")
+    assert [r["name"] for r in _index(out)] == ["keep.a", "bad \ud800 char"]
+
+
+def test_j07_a_long_id_names_a_page_well_under_the_file_name_limit(tmp_path: Path) -> None:
+    """An id of 242 characters or more named a page over the 255 bytes a file name may have,
+    and its write failed after the index linking it was rewritten. The slug is cut to 100
+    characters and ends in a hash of the whole id, so two ids that start alike get a page each."""
+    ids = ["long." + "x" * 295, "long." + "x" * 294 + "y"]
+    for n, cid in enumerate(ids):
+        _put(tmp_path / f"p{n}" / "contract.fluid.yaml", _min_doc(cid))
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    slugs = {r["id"]: r["slug"] for r in _index(out)}
+    for cid in ids:
+        digest = hashlib.sha256(cid.encode("utf-8")).hexdigest()[:8]
+        assert slugs[cid] == "long-" + "x" * 86 + f"-{digest}"
+        assert (out / f"contract-{slugs[cid]}.html").is_file()
+    links = re.findall(r'href="(contract-[^"]*\.html)"', (out / "index.html").read_text("utf-8"))
+    assert sorted(links) == sorted(f"contract-{slug}.html" for slug in slugs.values())
+
+
+def test_j07_a_directory_where_a_page_goes_fails_the_run_before_any_file_is_replaced(
+    tmp_path: Path,
+) -> None:
+    first = _put(tmp_path / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path, out, src=True) == 0
+    _put(first, _min_doc("keep.a", name="Renamed since the last run"))
+    _put(tmp_path / "b" / "contract.fluid.yaml", _min_doc("keep.b"))
+    (out / "contract-keep-b.html").mkdir()
+    before = _tree(out)
+
+    assert _docs(tmp_path, out, src=True) != 0
+
+    assert _tree(out) == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+def test_j07_a_symlink_planted_in_out_is_replaced_and_never_written_through(
+    tmp_path: Path,
+) -> None:
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    out.mkdir()
+    victim = _write(tmp_path / "victim.txt", "not the catalog's\n")
+    (out / "index.html").symlink_to(victim)
+
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    assert victim.read_text(encoding="utf-8") == "not the catalog's\n"
+    assert not (out / "index.html").is_symlink()
+    assert "<title>Fluid Contracts Catalog</title>" in (out / "index.html").read_text("utf-8")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_j07_a_new_file_gets_the_mode_the_umask_gives_and_a_replaced_one_keeps_its_own(
+    tmp_path: Path,
+) -> None:
+    """Not mkstemp's 0o600: the catalog is there to be served."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    umask = os.umask(0o022)
+    try:
+        assert _docs(tmp_path / "src", out, src=True) == 0
+        modes = {p.name: stat.S_IMODE(p.stat().st_mode) for p in out.iterdir()}
+        (out / "index.html").chmod(0o640)
+        assert _docs(tmp_path / "src", out, src=True) == 0
+    finally:
+        os.umask(umask)
+
+    assert modes == dict.fromkeys(["contract-keep-a.html", "index.html", "index.json"], 0o644)
+    assert stat.S_IMODE((out / "index.html").stat().st_mode) == 0o640
+    assert stat.S_IMODE((out / "index.json").stat().st_mode) == 0o644
 
 
 # ── J-08 ────────────────────────────────────────────────────────────────

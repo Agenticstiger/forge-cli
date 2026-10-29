@@ -15,13 +15,16 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
+import hashlib
 import html
 import io
 import json
 import logging
 import os
 import re
+import stat
 from typing import Any, Mapping
 
 from ._common import CLIError, load_contract_with_overlay
@@ -68,8 +71,8 @@ def run(args, logger: logging.Logger) -> int:
         # Two contracts with one id would write one page; each gets its own.
         slugs = _unique_slugs(entries)
 
-        # Everything is rendered before any file is opened, so a run that fails
-        # leaves the catalog the previous run wrote and not half of a new one.
+        # Everything is rendered, and encoded, before any file is opened, so a
+        # run that fails here leaves the catalog the previous run wrote.
         # JSON index (machine-readable; existing consumers depend on it).
         index_json = io.StringIO()
         json.dump(entries, index_json, indent=2)
@@ -90,18 +93,24 @@ def run(args, logger: logging.Logger) -> int:
                 page = _render_contract_html(contract, path)
             except Exception as exc:  # noqa: BLE001 - say which contract, not just what broke
                 raise ValueError(f"{path}: {exc}") from exc
-            pages.append((os.path.join(args.out, f"contract-{slugs[path]}.html"), page))
+            pages.append((f"contract-{slugs[path]}.html", page))
 
-        os.makedirs(args.out, exist_ok=True)
+        # Pages first and the index that links them last. A character UTF-8
+        # cannot hold (a lone surrogate) is written as its ``\uXXXX`` text:
+        # shown, never the end of the catalog.
+        _write_catalog(
+            args.out,
+            [
+                (name, text.encode("utf-8", "backslashreplace"))
+                for name, text in [
+                    *pages,
+                    ("index.json", index_json.getvalue()),
+                    ("index.html", index_html),
+                ]
+            ],
+        )
         index_json_path = os.path.join(args.out, "index.json")
         index_html_path = os.path.join(args.out, "index.html")
-        for file_path, text in [
-            (index_json_path, index_json.getvalue()),
-            (index_html_path, index_html),
-            *pages,
-        ]:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(text)
 
         info(
             logger,
@@ -114,6 +123,65 @@ def run(args, logger: logging.Logger) -> int:
         return 0
     except Exception as e:
         raise CLIError(1, "docs_failed", {"error": str(e)})
+
+
+def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
+    """Write each ``(name, content)`` of ``files`` into ``out``, in that order.
+
+    Every file is first written whole to a temp file beside it, and only when
+    all of them are does each replace its file. A run that fails before then
+    takes its temp files back and leaves every file as the last run wrote it.
+    A replace swaps the directory entry: a symlink or a hard link planted in
+    ``out`` is replaced, never written through.
+    """
+    os.makedirs(out, exist_ok=True)
+    staged: list[tuple[str, str]] = []
+    try:
+        for name, data in files:
+            target = os.path.join(out, name)
+            staged.append((_stage(target, data), target))
+        for temp, target in staged:
+            os.replace(temp, target)
+    except BaseException:
+        for temp, _target in staged:
+            with contextlib.suppress(OSError):
+                os.unlink(temp)
+        raise
+
+
+def _stage(target: str, data: bytes) -> str:
+    """``data`` in a new temp file in ``target``'s directory; the temp file's path.
+
+    Made as click's atomic ``open_file`` makes its temp file: ``O_EXCL``, with
+    the mode the umask gives (as ``open()`` did; not mkstemp's ``0o600``, the
+    catalog is there to be served), or the mode of the file it will replace.
+    A directory where the file goes is refused here, before any file of the
+    catalog is replaced.
+    """
+    try:
+        current = os.lstat(target)
+    except FileNotFoundError:
+        current = None
+    if current is not None and stat.S_ISDIR(current.st_mode):
+        raise IsADirectoryError(f"{target} is a directory")
+    own: int | None = None
+    if current is not None and stat.S_ISREG(current.st_mode):
+        own = current.st_mode & 0o777
+    directory, name = os.path.split(target)
+    # O_EXCL: never an existing file, nor a symlink someone put at this name.
+    temp = os.path.join(directory, f".{name}.{os.urandom(8).hex()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(temp, flags, 0o666 if own is None else own)
+    try:
+        with open(fd, "wb") as f:
+            if own is not None:
+                os.chmod(temp, own)  # the bits the umask took off
+            f.write(data)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
+    return temp
 
 
 def _resolve_contract_paths(args) -> list[str]:
@@ -263,18 +331,31 @@ def _description_text(description: Any) -> str:
     return "" if description is None else str(description)
 
 
+#: The longest page slug. A longer one is cut short and ends in ``-`` and 8 hex
+#: digits of the SHA-256 of the whole id, so a page name stays far under the 255
+#: bytes a file name may have and two long ids that start alike still get a page
+#: each. The cap is the default of pants' ``safe_filename``; the hash that ends a
+#: cut slug is kubespawner's ``strip_and_hash``.
+_MAX_SLUG = 100
+_SLUG_HASH = 8
+
+
 def _slug_for(contract: Mapping[str, Any], path: str) -> str:
     """Stable, URL-safe slug for a contract — used as the per-page filename.
 
     Prefers ``contract.id``; falls back to the file stem when id is absent
     so we still produce a meaningful filename. All lower-cased; consecutive
-    non-alphanumerics collapse to a single hyphen.
+    non-alphanumerics collapse to a single hyphen; at most :data:`_MAX_SLUG`
+    long.
     """
     raw = contract.get("id") if isinstance(contract, Mapping) else None
     if not isinstance(raw, str) or not raw:
         raw = os.path.splitext(os.path.basename(path))[0]
-    slug = _SLUG_RE.sub("-", raw.lower()).strip("-")
-    return slug or "contract"
+    slug = _SLUG_RE.sub("-", raw.lower()).strip("-") or "contract"
+    if len(slug) <= _MAX_SLUG:
+        return slug
+    whole = hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{slug[: _MAX_SLUG - _SLUG_HASH - 1].rstrip('-')}-{whole[:_SLUG_HASH]}"
 
 
 def _render_index_html(entries: list[dict[str, Any]]) -> str:
