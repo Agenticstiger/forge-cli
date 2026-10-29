@@ -274,20 +274,7 @@ def run(args, logger: logging.Logger) -> int:
         # first (multi-product workspace), then fall back to a single
         # ``contract.fluid.yaml`` in CWD (the common single-product case).
         if not args.contract:
-            # Not for a fragment run: the file is what it checks, and the contract
-            # found here would be validated as if it were the fragment.
-            kind = _fragment_kind(args)
-            if kind is not None:
-                raise CLIError(
-                    1,
-                    "fragment_file_required",
-                    {
-                        "error": (
-                            "--fragment checks one fragment file, and the file is required: "
-                            f"fluid validate --fragment {kind or 'KIND'} <file>"
-                        )
-                    },
-                )
+            _refuse_fragment_run_without_file(args)
             workspace_result = _try_workspace_validate(args, schema_manager, logger)
             if workspace_result is not None:
                 return workspace_result
@@ -511,6 +498,23 @@ def _fragment_kind(args: Any) -> Optional[str]:
     """
     kind = getattr(args, "fragment", None)
     return kind if isinstance(kind, str) else None
+
+
+def _refuse_fragment_run_without_file(args: Any) -> None:
+    """A fragment run names its file. Without one, workspace discovery would fill in the
+    contract of the working directory, which would be validated as if it were the fragment."""
+    kind = _fragment_kind(args)
+    if kind is not None:
+        raise CLIError(
+            1,
+            "fragment_file_required",
+            {
+                "error": (
+                    "--fragment checks one fragment file, and the file is required: "
+                    f"fluid validate --fragment {kind or 'KIND'} <file>"
+                )
+            },
+        )
 
 
 #: ``--fragment`` kinds that are not a ``$defs`` name: an expose's lists.

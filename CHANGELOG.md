@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fluid validate --fragment` no longer guesses a schema version.** With no `--schema-version`
+  and no root contract above the fragment, it checked the fragment against the newest stable
+  schema (0.7.5), so a valid 0.7.6 fragment failed on a field 0.7.5 does not have. It now stops
+  and asks for `--schema-version` (`schema_version_required`), and says why: there is no contract
+  above the fragment, or the nearest one cannot be read or declares no `fluidVersion`. A
+  `fluidVersion` kept behind a `$ref` is followed. A version that is not one is the
+  `invalid_schema_version` error, not a traceback.
+- **`fluid validate --fragment KIND` without a file** validated the `contract.fluid.yaml` of the
+  working directory as if it were the fragment. It now says the file is required
+  (`fragment_file_required`), and an empty kind (`--fragment ''`) is refused as an unknown kind,
+  with the valid kinds listed.
+- **The `--format json` result of a fragment run names the fragment kind**, in a new `fragment`
+  field after `valid`. The JSON of a whole-contract run is unchanged.
+
 ## [0.25.0] — 2026-10-28
 
 ### Added

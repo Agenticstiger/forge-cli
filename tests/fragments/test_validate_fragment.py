@@ -396,33 +396,48 @@ def test_k13_the_flag_wins_over_the_root_contract_and_the_nearest_contract_wins_
     )
 
 
-def test_k13_a_root_contract_with_no_version_is_named_when_the_run_asks(
-    tmp_path: Path, capsys: pytest.CaptureFixture
-) -> None:
-    contract, fragment = _project(tmp_path)
+def _root_without_version(contract: Path) -> None:
     root = _root_doc()
     del root["fluidVersion"]
     _dump(contract, root)
 
-    rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
 
-    flat = " ".join((out + err).split())
-    assert rc == 1 and "schema_version_required" in flat
-    assert f"{contract.resolve()}, the nearest contract above it, declares no fluidVersion" in flat
-    assert "Pass --schema-version" in flat
-
-
-def test_k13_an_unreadable_root_contract_is_named_when_the_run_asks(
-    tmp_path: Path, capsys: pytest.CaptureFixture
-) -> None:
-    contract, fragment = _project(tmp_path)
+def _unreadable_root(contract: Path) -> None:
     contract.write_text("fluidVersion: [\n", encoding="utf-8")
 
+
+def _root_with_dangling_version_ref(contract: Path) -> None:
+    root = _root_doc()
+    root["fluidVersion"] = {"$ref": "./v.yaml"}
+    _dump(contract, root)
+
+
+@pytest.mark.parametrize(
+    "write_root, why",
+    [
+        (_root_without_version, "declares no fluidVersion"),
+        (_unreadable_root, "cannot be read:"),
+        (_root_with_dangling_version_ref, "cannot be read: $ref target not found: ./v.yaml"),
+    ],
+    ids=["no-version", "unreadable", "dangling-version-ref"],
+)
+def test_k13_the_run_names_the_root_contract_that_gave_no_version(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    write_root: Callable[[Path], None],
+    why: str,
+) -> None:
+    """With no --schema-version the run asks for one, and says why the nearest root contract
+    gave none: it declares none, it cannot be read, or its fluidVersion ref is not there."""
+    contract, fragment = _project(tmp_path)
+    write_root(contract)
+
     rc, out, err = _validate(capsys, "--fragment", "expose", fragment)
 
     flat = " ".join((out + err).split())
     assert rc == 1 and "schema_version_required" in flat
-    assert f"{contract.resolve()}, the nearest contract above it, cannot be read:" in flat
+    assert f"{contract.resolve()}, the nearest contract above it, {why}" in flat
+    assert "Pass --schema-version" in flat
 
 
 def test_k13_a_root_that_does_not_compose_still_gives_its_version(
@@ -936,13 +951,3 @@ def test_a_contract_in_a_home_or_temp_root_is_never_a_fragments_contract(
     monkeypatch.setattr(_duckdb_sandbox, "_home_dirs", lambda: (str(home),))
 
     assert _nearest_contract(fragment) is None
-
-
-def test_a_contract_whose_fluid_version_is_a_ref_gives_no_version(tmp_path: Path) -> None:
-    """The nearest contract keeps fluidVersion in a fragment: no version is read from it
-    (the run then asks for --schema-version), and nothing crashes."""
-    from fluid_build.cli.validate import _contract_version
-
-    contract = tmp_path / "contract.fluid.yaml"
-    contract.write_text("fluidVersion: {$ref: ./v.yaml}\nid: x\n", encoding="utf-8")
-    assert _contract_version(contract) is None
