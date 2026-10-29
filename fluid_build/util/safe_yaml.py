@@ -60,7 +60,10 @@ requires unique keys. The contract composition reads every file with it, and
 :func:`load_json_unique` is its JSON twin. The keys a mapping writes are
 checked before a ``<<`` merge expands, so a merged key the mapping writes
 again is an override, not a duplicate: the rule of yamllint's
-``key-duplicates`` and of the PyYAML #165 loaders (torchgen, salt).
+``key-duplicates`` and of the PyYAML #165 loaders (torchgen, salt). A ``<<``
+is a merge directive, not a data key: a mapping may write it more than once,
+every merge applies as PyYAML applies it and nothing is dropped, as yamllint
+allows by default.
 """
 
 from __future__ import annotations
@@ -131,10 +134,7 @@ class DuplicateKeyError(UnsafeYamlError):
         )
         if first is not None:
             why = f"the same key as {first[0]!r} at line {first[1]}; {why}"
-        fix = "remove one of them"
-        if key == "<<" and not json_object:
-            fix += ", or merge every mapping with one '<<: [*first, *second]'"
-        super().__init__(f"{place}duplicate key {key!r} ({why}); {fix}")
+        super().__init__(f"{place}duplicate key {key!r} ({why}); remove one of them")
 
 
 def load_yaml_safe(
@@ -200,10 +200,8 @@ def load_json_unique(text: str, *, name: Optional[str] = None) -> Any:
     return json.loads(text, object_pairs_hook=unique)
 
 
-#: The tag PyYAML gives a ``<<`` merge key, and the one key every ``<<`` of a
-#: mapping counts as.
+#: The tag PyYAML gives a ``<<`` merge key: a directive, never a data key.
 _MERGE_TAG = "tag:yaml.org,2002:merge"
-_MERGE_KEY = object()
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -218,8 +216,10 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
     a merged ``a`` beside its own by the time it is constructed. Each mapping is
     checked once, the first time it is flattened, which is before any change.
     Keys are compared as they are constructed (YAML 1.1 ``on`` and ``yes`` are
-    the one key ``True``), so every key a dict would silently drop is refused,
-    and every ``<<`` is one key.
+    the one key ``True``), so every key a dict would silently drop is refused.
+    A ``<<`` is not compared: it is a merge directive, not a data key, so a
+    mapping may write several and each merge applies, later ones winning a key
+    two of them bring, as PyYAML merges them.
     """
 
     def __init__(self, stream: Any, name: Optional[str] = None) -> None:
@@ -237,16 +237,15 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
         seen: Dict[Any, Tuple[Any, int]] = {}
         for key_node, _ in node.value:
             if key_node.tag == _MERGE_TAG:
-                key: Any = _MERGE_KEY
-            elif isinstance(key_node, yaml.ScalarNode):
-                key = self.construct_object(key_node)
-            else:
+                continue  # a merge directive: every one of them applies
+            if not isinstance(key_node, yaml.ScalarNode):
                 continue  # a collection as a key: construction refuses it as unhashable
+            key = self.construct_object(key_node)
             try:
                 first = seen.get(key)
             except TypeError:
                 continue  # unhashable: construction refuses it
-            written = key_node.value if isinstance(key_node, yaml.ScalarNode) else key
+            written = key_node.value
             line = key_node.start_mark.line + 1
             if first is not None:
                 raise DuplicateKeyError(

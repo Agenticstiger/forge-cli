@@ -71,7 +71,9 @@ workspace file that writes a key twice is refused as one that cannot be
 parsed: its `ref_root` is ignored with a warning that names the key, and an
 `--env` its `expected-environments` might declare fails with that error
 rather than pass as undeclared. A key that a `<<` merge brings in and the
-mapping then writes itself is an override, not a duplicate.
+mapping then writes itself is an override, not a duplicate, and a mapping may
+write `<<` more than once: a merge key is a directive, not a data key, and
+every merge applies.
 
 ### A payload with its own `$ref` keys: write `$$ref`
 

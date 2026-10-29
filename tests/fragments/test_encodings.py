@@ -489,7 +489,8 @@ def test_n09_a_merged_key_written_again_is_an_override_not_a_duplicate_sg18(
     tmp_path: Path,
 ) -> None:
     """The keys a mapping writes are checked before ``<<`` expands, so overriding a merged
-    default is not a duplicate, also for a merge source written inline and used again."""
+    default is not a duplicate, also for a merge source written inline and used again; and
+    a ``<<`` is a merge directive, not a data key, so a mapping may write two."""
     _write(
         tmp_path / "m.yaml",
         "base: &base {a: 1, b: 1}\n"
@@ -497,10 +498,13 @@ def test_n09_a_merged_key_written_again_is_an_override_not_a_duplicate_sg18(
         "again: *mid\n",
     )
 
-    got = _rfr({"x": {"$ref": "./m.yaml"}}, tmp_path)["x"]
+    _write(tmp_path / "two.yaml", "a: &a {x: 1}\nb: &b {y: 2}\nboth:\n  <<: *a\n  <<: *b\n  z: 3\n")
 
-    assert got["top"] == {"a": 2, "b": 3}
-    assert got["again"] == {"a": 2, "b": 1}
+    got = _rfr({"x": {"$ref": "./m.yaml"}, "y": {"$ref": "./two.yaml"}}, tmp_path)
+
+    assert got["x"]["top"] == {"a": 2, "b": 3}
+    assert got["x"]["again"] == {"a": 2, "b": 1}
+    assert got["y"]["both"] == {"x": 1, "y": 2, "z": 3}, "two << lines: both merges apply"
 
 
 def test_n09_a_workspace_file_with_a_duplicate_ref_root_is_refused_naming_the_key_sg18(

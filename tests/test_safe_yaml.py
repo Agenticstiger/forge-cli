@@ -372,11 +372,25 @@ def test_unique_keys_reads_a_merge_source_written_inline_and_used_again() -> Non
     }
 
 
-def test_unique_keys_refuses_two_merge_keys_in_one_mapping() -> None:
-    with pytest.raises(DuplicateKeyError, match=r"line 5: duplicate key '<<'") as info:
-        load_yaml_safe("d: &d {a: 1}\ne: &e {b: 1}\nx:\n  <<: *d\n  <<: *e\n", unique_keys=True)
+def test_unique_keys_applies_every_merge_key_of_a_mapping() -> None:
+    """A ``<<`` is a merge directive, not a data key: a mapping may write several, each
+    merge applies as PyYAML applies it (a later ``<<`` wins a key two of them bring),
+    and nothing is dropped. yamllint allows them by default too."""
+    defaults = "a: &a {x: 1, k: from-a}\nb: &b {y: 2, k: from-b}\n"
 
-    assert "<<: [*first, *second]" in str(info.value)
+    merged = load_yaml_safe(defaults + "m:\n  <<: *a\n  <<: *b\n  z: 3\n", unique_keys=True)
+    assert merged["m"] == {"x": 1, "y": 2, "k": "from-b", "z": 3}
+
+    explicit = load_yaml_safe(defaults + "m:\n  <<: *a\n  <<: *b\n  k: own\n", unique_keys=True)
+    assert explicit["m"] == {"x": 1, "y": 2, "k": "own"}, "a key the mapping writes wins"
+
+    with pytest.raises(DuplicateKeyError) as info:
+        load_yaml_safe(
+            defaults + "m:\n  <<: *a\n  z: 3\n  <<: *b\n  z: 4\n", unique_keys=True, name="f"
+        )
+    assert str(info.value) == (
+        "f:7: duplicate key 'z' (YAML 1.2 requires unique keys); remove one of them"
+    ), "a data key written twice beside the merges is still refused"
 
 
 def test_load_json_unique_refuses_a_name_written_twice() -> None:
