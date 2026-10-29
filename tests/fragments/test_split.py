@@ -1671,13 +1671,54 @@ def test_i21_the_dot_steps_a_ref_starts_with_are_dropped_in_linear_time(
     lead: str, rest: str, rebased: str
 ) -> None:
     """``./`` steps were stripped one at a time, a copy of the rest of the ref per
-    step: 200,000 of them took seconds. They are matched once now."""
+    step: 200,000 of them took seconds. They are found in one pass now."""
     from fluid_build.cli.forge_contract_fragments import rebased_ref
 
     started = time.monotonic()
 
     assert rebased_ref(lead * 200_000 + rest, "fragments/builds/t.yaml") == rebased
     assert time.monotonic() - started < 1
+
+
+def test_i21_the_dot_steps_are_found_in_memory_that_does_not_grow_with_them() -> None:
+    """The steps were then matched with ``(?:\\./+)+``: linear in time, but the
+    match kept state for every step, a peak of 124 MB for the million here (330
+    MB of RSS for 2.5 million). The scan that finds them keeps nothing per step;
+    a rebase as a whole holds what reading the path for the ref root's own
+    checks takes, a few bytes per character."""
+    import tracemalloc
+
+    from fluid_build.cli.forge_contract_fragments import _dot_steps, rebased_ref
+
+    path = "./" * 1_000_000 + "x.yaml"
+    ref = path + "#/a"
+    tracemalloc.start()
+    try:
+        assert _dot_steps(path) == 2_000_000
+        scan_peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.reset_peak()
+        assert rebased_ref(ref, "fragments/builds/t.yaml") == "../../x.yaml#/a"
+        rebase_peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert scan_peak < 1_000_000
+    assert rebase_peak < 32_000_000
+
+
+def test_i21_the_dot_step_scan_ends_where_the_pattern_it_replaced_did() -> None:
+    """Every path of up to eight ``.``, ``/`` and ``x``: the scan finds the steps
+    the pattern ``(?:\\./+)+`` matched, no more and no fewer."""
+    import itertools
+
+    from fluid_build.cli.forge_contract_fragments import _dot_steps
+
+    pattern = re.compile(r"(?:\./+)+")
+    for length in range(9):
+        for chars in itertools.product("./x", repeat=length):
+            path = "".join(chars)
+            matched = pattern.match(path)
+            assert _dot_steps(path) == (matched.end() if matched else 0), path
 
 
 def test_i21_the_dict_level_splitter_rebases_a_ref_once_and_never_its_own() -> None:

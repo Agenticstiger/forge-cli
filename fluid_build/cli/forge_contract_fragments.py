@@ -109,11 +109,6 @@ _DESCRIPTION_PARTS = ("purpose", "usage", "limitations")
 _MAX_SLUG = 100
 _SLUG_HASH = 8
 
-#: The ``./`` steps a relative ref may start with (``./``, ``.//``, ``././``):
-#: they name the directory it is written in, so say nothing once it is
-#: rebased. Matched once, not stripped a step at a time (a copy per step).
-_LEADING_DOT_STEPS = re.compile(r"(?:\./+)+")
-
 
 class FragmentSite(NamedTuple):
     """One part of a contract that goes to a file of its own."""
@@ -321,8 +316,7 @@ def rebased_ref(ref: Any, container: Optional[str]) -> Any:
     file_part, mark, pointer = ref.partition("#")
     if not is_relative_file_ref(file_part):
         return ref
-    lead = _LEADING_DOT_STEPS.match(file_part)
-    names = file_part[lead.end() if lead else 0 :].split("/")
+    names = file_part[_dot_steps(file_part) :].split("/")
     climb = [name for name in posixpath.dirname(container).split("/") if name]
     # A directory the container's path starts with is a real one (split writes
     # through no symlink), so going into it and back out is no step at all.
@@ -331,6 +325,26 @@ def rebased_ref(ref: Any, container: Optional[str]) -> Any:
         climb.pop(0)
     rel = "/".join([".."] * len(climb) + names)
     return (rel if rel.startswith("../") else f"./{rel}") + mark + pointer
+
+
+def _dot_steps(path: str) -> int:
+    """How long the ``./`` steps are that ``path`` starts with (``./``, ``.//``,
+    ``././``): they name the directory the ref is written in, so they say
+    nothing once it is rebased.
+
+    Scanned, not matched: the pattern ``(?:\\./+)+`` is linear in time but
+    keeps state for every step it takes (2.5 million steps held 330 MB), and
+    Python 3.10 has no possessive quantifier to drop it. The run of ``.`` and
+    ``/`` the path starts with ends, as the steps do, before a ``..`` (a climb,
+    kept) or before a last ``.`` (a name that starts with one, or ``.``).
+    """
+    if not path.startswith("./"):
+        return 0
+    end = len(path) - len(path.lstrip("./"))
+    climb = path.find("..", 0, end)
+    if climb >= 0:
+        return climb
+    return end - 1 if path[end - 1] == "." else end
 
 
 def _rebased_refs(value: Any, at: Tuple[Any, ...], container: str, inner: Collection[Any]) -> Any:
