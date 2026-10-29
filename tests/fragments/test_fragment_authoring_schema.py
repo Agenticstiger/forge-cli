@@ -61,6 +61,49 @@ _V0_24_0_SHA256 = {
     "0.7.6": "8c025e0466fcbe51cdc2ee30b00876cee6ea8633c7a164ca13b2bffc67bd4e78",  # pragma: allowlist secret
 }
 
+# K-01 pins that the fragments work changed no canonical schema. A schema promotion changes
+# them on purpose, so the guard keeps v0.24.0's hashes as they are and is told about each
+# deliberate change by name instead: re-recording the hashes would have accepted whatever
+# else changed alongside, and an edit nobody listed here still fails as it did before.
+
+#: Deliberate edits since v0.24.0, as (text now, text v0.24.0 shipped) pairs. K-01 puts each
+#: one back, where it must occur exactly once, and holds the result to the v0.24.0 hash.
+_EDITED_SINCE_V0_24_0: Dict[str, List[Tuple[str, str]]] = {
+    # #752 promoted 0.7.6 to stable: its title, its description and the fluidVersion
+    # description stopped calling it the preview. No validation keyword changed.
+    "0.7.6": [
+        (
+            '"FLUID 0.7.6 — Declarative Packaging Modes"',
+            '"FLUID 0.7.6 — Declarative Packaging Modes (preview)"',
+        ),
+        (
+            "FLUID contract schema 0.7.6 — opened as the preview when 0.7.5 was promoted to"
+            " stable, and stable itself since 0.7.7 opened.",
+            "FLUID contract schema 0.7.6 — the current PREVIEW version, opened when 0.7.5 was"
+            " promoted to stable.",
+        ),
+        (
+            'every 0.7.3 contract validates as 0.7.4 unchanged."',
+            "every 0.7.3 contract validates as 0.7.4 unchanged. '0.7.6' is the current"
+            ' preview."',
+        ),
+    ],
+}
+
+#: Canonical schemas added since v0.24.0, with the change that added each. There are no
+#: v0.24.0 bytes to hold one to; K-01 holds the set of files to these plus the golden.
+_ADDED_SINCE_V0_24_0 = {
+    "0.7.7": "#752 opened it as the next preview when it promoted 0.7.6 to stable",
+}
+
+
+def _known_versions() -> List[str]:
+    """Every canonical schema version K-01 accounts for, oldest first."""
+    return sorted(
+        {*_V0_24_0_SHA256, *_ADDED_SINCE_V0_24_0},
+        key=lambda v: tuple(int(part) for part in v.split(".")),
+    )
+
 
 # ── fixtures ────────────────────────────────────────────────────────────
 
@@ -243,14 +286,21 @@ def _fragments(project: Path) -> Iterator[Tuple[str, str, Any]]:
 
 
 @pytest.mark.parametrize("version", sorted(_V0_24_0_SHA256))
-def test_k01_the_canonical_schemas_are_the_bytes_v0_24_0_shipped(version: str) -> None:
-    digest = hashlib.sha256((_SCHEMAS / f"fluid-schema-{version}.json").read_bytes()).hexdigest()
-    assert digest == _V0_24_0_SHA256[version], f"fluid-schema-{version}.json changed"
+def test_k01_the_canonical_schemas_are_the_bytes_v0_24_0_shipped_but_for_listed_edits(
+    version: str,
+) -> None:
+    name = f"fluid-schema-{version}.json"
+    raw = (_SCHEMAS / name).read_bytes()
+    for now, then in _EDITED_SINCE_V0_24_0.get(version, []):
+        assert raw.count(now.encode("utf-8")) == 1, f"{name}: {now!r} is not there exactly once"
+        raw = raw.replace(now.encode("utf-8"), then.encode("utf-8"))
+    digest = hashlib.sha256(raw).hexdigest()
+    assert digest == _V0_24_0_SHA256[version], f"{name} changed beyond the listed edits"
 
 
-def test_k01_no_canonical_schema_was_added_or_dropped() -> None:
+def test_k01_no_canonical_schema_was_added_or_dropped_unlisted() -> None:
     names = sorted(p.name for p in _SCHEMAS.glob("fluid-schema-*.json"))
-    assert names == [f"fluid-schema-{v}.json" for v in sorted(_V0_24_0_SHA256)]
+    assert names == sorted(f"fluid-schema-{v}.json" for v in _known_versions())
 
 
 # ── K-02 ────────────────────────────────────────────────────────────────
@@ -338,17 +388,18 @@ def test_k02_the_shipped_multifile_example_only_lacks_a_version_the_schema_accep
 # ── K-03 ────────────────────────────────────────────────────────────────
 
 
-def _golden_stable_versions(preview: Any) -> List[str]:
-    return sorted(v for v in _V0_24_0_SHA256 if v not in preview)
+def _known_stable_versions(preview: Any) -> List[str]:
+    return [v for v in _known_versions() if v not in preview]
 
 
 def test_k03_the_authoring_file_is_not_a_schema_version(tmp_path: Path) -> None:
     from fluid_build.schema_manager import FluidSchemaManager
 
-    stable = _golden_stable_versions(FluidSchemaManager.PREVIEW_VERSIONS)
-    # NB the catalog says "still 0.7.6": 0.7.6 is the preview, so the stable default is 0.7.5.
+    stable = _known_stable_versions(FluidSchemaManager.PREVIEW_VERSIONS)
+    # NB the catalog says "still 0.7.6". It was written while 0.7.6 was the preview and the
+    # stable default 0.7.5; #752 promoted 0.7.6, so the default is 0.7.6 now.
     assert FluidSchemaManager.latest_bundled_version() == stable[-1]
-    assert FluidSchemaManager.BUNDLED_VERSIONS == sorted(_V0_24_0_SHA256)
+    assert FluidSchemaManager.BUNDLED_VERSIONS == _known_versions()
     manager = FluidSchemaManager(cache_dir=tmp_path / "cache")
     assert not [v for v in manager.list_available_versions() if "authoring" in v]
     assert not [v for v in manager._bundled_schemas if "authoring" in v]
@@ -387,7 +438,7 @@ def test_k03_the_name_matches_no_glob_or_pattern_version_discovery_uses() -> Non
     assert fnmatch.fnmatch("fluid-schema-0.7.6.authoring.json", "fluid-schema-*.json")
     assert not fnmatch.fnmatch(name, "fluid-schema-*.json")
     assert not SCHEMA_FILE_PATTERN.match(name)
-    assert version_cmd._bundled_schema_versions() == sorted(_V0_24_0_SHA256)
+    assert version_cmd._bundled_schema_versions() == _known_versions()
     assert list(_SCHEMAS.glob("fluid-schema-*authoring*")) == []
 
 

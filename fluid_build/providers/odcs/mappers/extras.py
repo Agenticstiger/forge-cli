@@ -66,6 +66,13 @@ _ROOT_MAPPED = frozenset(
     }
 )
 
+# Root keys recorded even where the round-trip would reproduce them. A re-import
+# reproduces ``fluidVersion`` from the READER's default, not the writer's: left
+# out when it equalled the exporting CLI's default, a 0.7.6 contract read by a
+# CLI whose default is 0.7.5 would come back as 0.7.5, and its 0.7.6 fields
+# would fail. ``_collect`` makes the one exception.
+_ROOT_ALWAYS = frozenset({"fluidVersion"})
+
 # ``metadata`` keys reproduced elsewhere in the ODCS document. ``owner`` is
 # deliberately absent: ODCS ``team`` models {name, members[{username, role}]}
 # and has no slot for ``slack`` or ``oncall``, so the FLUID owner block only
@@ -164,13 +171,17 @@ def _reimport(odcs: Mapping[str, Any], ctx: ExportCtx) -> Mapping[str, Any]:
 
 
 def _delta(
-    source: Mapping[str, Any], baseline: Mapping[str, Any], mapped: frozenset
+    source: Mapping[str, Any],
+    baseline: Mapping[str, Any],
+    mapped: frozenset,
+    always: frozenset = frozenset(),
 ) -> Dict[str, Any]:
-    """Keys of ``source`` the round-trip neither maps nor reproduces."""
+    """Keys of ``source`` the round-trip neither maps nor reproduces, and those in
+    ``always`` whatever the round-trip would reproduce."""
     return {
         k: copy.deepcopy(v)
         for k, v in source.items()
-        if k not in mapped and not k.startswith("_") and baseline.get(k) != v
+        if k not in mapped and not k.startswith("_") and (k in always or baseline.get(k) != v)
     }
 
 
@@ -181,7 +192,7 @@ def _as_mapping(value: Any) -> Mapping[str, Any]:
 def _collect(fluid: Mapping[str, Any], baseline: Mapping[str, Any]) -> Dict[str, Any]:
     extras: Dict[str, Any] = {}
 
-    root = _delta(fluid, baseline, _ROOT_MAPPED)
+    root = _delta(fluid, baseline, _ROOT_MAPPED, _ROOT_ALWAYS)
     if root:
         extras["root"] = root
 
@@ -229,7 +240,21 @@ def _collect(fluid: Mapping[str, Any], baseline: Mapping[str, Any]) -> Dict[str,
             exposes[expose_id] = entry
     if exposes:
         extras["exposes"] = exposes
-    return extras
+    return {} if _only_a_defaulted_version(fluid, extras) else extras
+
+
+def _only_a_defaulted_version(fluid: Mapping[str, Any], extras: Mapping[str, Any]) -> bool:
+    """Whether ``extras`` holds only the version an import gave a document that had none.
+
+    Recording it adds an entry the source never had, and ODCS → FLUID → ODCS
+    stops being a fixed point. Once anything else rides along, so does the
+    version: that content may need it.
+    """
+    # Local import, like ``_reimport``'s.
+    from .normalize import defaulted_version
+
+    defaulted = defaulted_version(fluid)
+    return bool(defaulted) and extras == {"root": {"fluidVersion": defaulted}}
 
 
 # ----- ODCS → FLUID --------------------------------------------------------

@@ -17,14 +17,14 @@
 Three guarantees:
 
 * valid isolated / shared / hybrid packaging contracts validate against the
-  0.7.6 preview schema (top-level `packaging` and the per-exposure
+  0.7.6 schema (top-level `packaging` and the per-exposure
   `binding.packaging` override);
 * invalid shapes are rejected (`additionalProperties: false` discipline —
   bad mode enum, unknown container kind, bad container value, unknown block
   key, wrong types);
-* the block is preview-gated: 0.7.5 (and thus every GA contract) rejects a
-  `packaging` key outright, and a 0.7.6 contract WITHOUT the block still
-  validates — legacy contracts are unaffected.
+* the block is version-gated: 0.7.5 rejects a `packaging` key outright, and a
+  0.7.6 contract WITHOUT the block still validates — legacy contracts are
+  unaffected. 0.7.6 opened as a preview and is stable since #752 promoted it.
 """
 
 from __future__ import annotations
@@ -186,8 +186,8 @@ class TestInvalidPackagingShapes:
         _assert_invalid(manager, contract)
 
 
-class TestPreviewGateSeparation:
-    """0.7.5 (GA) must not accept the block — it is 0.7.6-preview only."""
+class TestVersionGateSeparation:
+    """0.7.5 must not accept the block — it arrived in 0.7.6."""
 
     def test_075_rejects_top_level_packaging(self, manager):
         contract = _base_contract(version="0.7.5")
@@ -207,8 +207,23 @@ class TestPreviewGateSeparation:
         contract = _base_contract(version="0.7.6")
         _assert_valid(manager, contract, version="0.7.6")
 
-    def test_076_stays_preview_gated(self):
-        # The preview gate is what keeps untagged contracts from silently
-        # opting in (RFC §Migration & compatibility).
-        assert "0.7.6" in FluidSchemaManager.PREVIEW_VERSIONS
-        assert FluidSchemaManager.latest_bundled_version() != "0.7.6"
+    def test_076_is_stable_and_no_preview_is_the_default(self, manager):
+        # This pinned the preview gate, which the RFC (§Migration &
+        # compatibility) named as what kept untagged contracts from silently
+        # opting in. #752 promoted 0.7.6, a step the RFC said needs no
+        # packaging-specific work, so the default an untagged contract gets now
+        # takes the block. Opting in still means writing one: no block resolves
+        # to LEGACY, whose byte-identical emit
+        # tests/iac/test_iac_packaging_default_pin.py pins. Asked of the
+        # default rather than of "0.7.6", so a later promotion, which only ever
+        # adds, does not have to come back here.
+        assert "0.7.6" not in FluidSchemaManager.PREVIEW_VERSIONS
+        default = FluidSchemaManager.latest_bundled_version()
+        contract = _base_contract(version=default)
+        contract["packaging"] = {"mode": "shared", "pool": "sales-domain"}
+        contract["exposes"][0]["binding"]["packaging"] = {"mode": "isolated"}
+        _assert_valid(manager, contract, version=default)
+        # The gate itself, version-agnostic (the invariant #431 wrote): whatever
+        # is in PREVIEW_VERSIONS stays opt-in, as 0.7.6 did until it graduated.
+        for preview in FluidSchemaManager.PREVIEW_VERSIONS:
+            assert default != preview

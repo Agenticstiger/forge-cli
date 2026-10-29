@@ -318,11 +318,11 @@ class TestOutputPortLineage:
 
 
 # ---------------------------------------------------------------------------
-# Defect 19c — the new field is preview-gated
+# Defect 19c — the new field is version-gated (0.7.6 on)
 # ---------------------------------------------------------------------------
 
 
-class TestTheFieldIsPreviewGated:
+class TestTheFieldIsVersionGated:
     def test_it_validates_at_0_7_6(self):
         contract = _contract({"versionConstraint": "^2.1", "contractVersion": "2.3.4"})
         result = FluidSchemaManager().validate_contract(contract, offline_only=True)

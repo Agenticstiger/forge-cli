@@ -51,6 +51,7 @@ from fluid_build.api.catalog_publication import _render_odcs_yaml
 from fluid_build.cli.validate import _run_contract_rules
 from fluid_build.providers.base import ProviderError
 from fluid_build.providers.datamesh_manager.datamesh_manager import DataMeshManagerProvider
+from fluid_build.providers.odcs.mappers.extras import FLUID_EXTRAS_PROPERTY
 from fluid_build.providers.odcs.provider import OdcsProvider
 from fluid_build.providers.odps_standard.provider import BitolOdpsProvider
 from fluid_build.schema_manager import FluidSchemaManager, ValidationResult
@@ -142,6 +143,10 @@ def imported_with_uuid_contract_id(tmp_path) -> Dict[str, Any]:
     declared 0.7.5, where ``exposeContract`` is closed and has no ``id`` field
     — which is precisely the shape the four non-rehydrating entry points used
     to re-derive over.
+
+    The ODCS sibling records 0.7.5 for that. It used to record nothing and get
+    0.7.5 as the stable default, until #752 made the default 0.7.6, which has
+    the field.
     """
     (tmp_path / "product.odps.yaml").write_text(
         yaml.safe_dump(
@@ -182,6 +187,12 @@ def imported_with_uuid_contract_id(tmp_path) -> Dict[str, Any]:
                         "properties": [{"name": "ITEM_ID", "logicalType": "integer"}],
                     }
                 ],
+                "customProperties": [
+                    {
+                        "property": FLUID_EXTRAS_PROPERTY,
+                        "value": {"root": {"fluidVersion": "0.7.5"}},
+                    }
+                ],
             },
             sort_keys=False,
         ),
@@ -190,7 +201,8 @@ def imported_with_uuid_contract_id(tmp_path) -> Dict[str, Any]:
     imported = BitolOdpsProvider().import_directory(tmp_path)
     # Guard the fixture's own premise: if a later schema bump lets the import
     # write ``contract.id`` instead, the entry-point test below would pass for
-    # the wrong reason.
+    # the wrong reason. (#752 was that bump for a document recording nothing.)
+    assert imported["fluidVersion"] == "0.7.5"
     assert "id" not in (imported["exposes"][0].get("contract") or {})
     assert (
         imported["extensions"]["odps"]["exposes"]["items"]["expose"]["contract_id"]

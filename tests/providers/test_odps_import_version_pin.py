@@ -36,6 +36,11 @@ What is asserted of the imported contract goes through
 :func:`fluid_build.cli.validate.run_on_contract_dict` — the same
 ``offline_only`` validation the CLI gate runs — rather than through this file's
 own idea of the schema.
+
+These cases were written while 0.7.6 was the preview and 0.7.5 the stable
+default, so "preview" stood for "has the fields" and "stable" for "lacks them".
+#752 promoted 0.7.6, which split those roles apart; the constants below name
+each one, and every case asks for the role its assertion is about.
 """
 
 from __future__ import annotations
@@ -55,8 +60,14 @@ from fluid_build.providers.odps_standard import BitolOdpsProvider
 from fluid_build.providers.odps_standard.provider import _supports_expose_contract_id
 from fluid_build.schema_manager import SchemaManager
 
-PREVIEW = "0.7.6"
+#: The version that added the five fields :func:`_contract_with_the_fields` uses.
+WITH_FIELDS = "0.7.6"
+#: A bundled version without them: its closed objects refuse every one.
+WITHOUT_FIELDS = "0.7.5"
+#: The default: what a document that records nothing, or a refused value, declares.
 STABLE = SchemaManager.latest_bundled_version()
+#: The open preview: honoured when a document records it, never the default.
+PREVIEW = [v for v in SchemaManager.BUNDLED_VERSIONS if v in SchemaManager.PREVIEW_VERSIONS][-1]
 
 # A UUID, the case ``exposeContract.id`` exists for: a catalog that requires an
 # id format of its own cannot be served by the derived ``{product}.{expose}``.
@@ -91,15 +102,15 @@ def _write(path: Path, doc: Dict[str, Any]) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _preview_contract() -> Dict[str, Any]:
-    """A 0.7.6 contract using all five of the fields that version added.
+def _contract_with_the_fields(version: str = WITH_FIELDS) -> Dict[str, Any]:
+    """A contract declaring ``version`` and using all five of the fields 0.7.6 added.
 
-    Each one is rejected by the stable schema — asserted as the premise in
-    :meth:`TestTheHeadlineCase.test_the_stable_schema_really_does_refuse_them`,
+    Each one is rejected by a version without them — asserted as the premise in
+    :meth:`TestTheHeadlineCase.test_a_version_without_the_fields_really_does_refuse_them`,
     so this fixture cannot quietly stop testing anything.
     """
     return {
-        "fluidVersion": PREVIEW,
+        "fluidVersion": version,
         "kind": "DataProduct",
         "id": "retail.orders",
         "name": "Retail Orders",
@@ -156,9 +167,8 @@ def _preview_contract() -> Dict[str, Any]:
 
 
 def _stable_contract() -> Dict[str, Any]:
-    """The same product, written against the stable schema — no preview fields."""
-    contract = _preview_contract()
-    contract["fluidVersion"] = STABLE
+    """The same product declaring the stable default, without the five fields."""
+    contract = _contract_with_the_fields(STABLE)
     contract["description"] = contract["description"]["purpose"]
     del contract["consumers"]
     del contract["metadata"]["team"]
@@ -297,24 +307,38 @@ def _passthrough_contract_id(fluid: Dict[str, Any]) -> Optional[str]:
 # The headline case: the round trip that exited 1.
 # ---------------------------------------------------------------------------
 
+# The versions a headline round trip records. WITH_FIELDS is the case a user
+# meets now that it is stable. But "declares the version the document recorded"
+# proves nothing when that version is also the default, as WITH_FIELDS has been
+# since #752; the open preview has every field too and is never the default, so
+# a return to pinning the default still fails here.
+_RECORDED_WITH_THE_FIELDS = [
+    pytest.param(WITH_FIELDS, id="the-version-that-added-them"),
+    pytest.param(PREVIEW, id="a-version-that-is-not-the-default"),
+]
+
 
 class TestTheHeadlineCase:
-    def test_the_stable_schema_really_does_refuse_them(self) -> None:
+    def test_a_version_without_the_fields_really_does_refuse_them(self) -> None:
         # The premise. Without this the acceptance test below could pass on a
-        # contract that never needed the preview schema at all.
-        contract = _preview_contract()
+        # contract that never needed a version with the fields at all. It asked
+        # the stable schema until #752 made the stable one a version with them.
+        # The names are quoted because a bare "id" also matches the
+        # "customer_id" inside the description's own error message.
+        contract = _contract_with_the_fields(WITHOUT_FIELDS)
         result = SchemaManager().validate_contract(
-            contract, schema_version=STABLE, offline_only=True
+            contract, schema_version=WITHOUT_FIELDS, offline_only=True
         )
         assert not result.is_valid
         rejected = " ".join(result.errors)
-        for field in ("consumers", "description", "host", "id", "team"):
+        for field in ("'consumers'", "description", "'host'", "'id'", "'team'"):
             assert field in rejected
 
+    @pytest.mark.parametrize("recorded", _RECORDED_WITH_THE_FIELDS)
     def test_export_then_import_declares_the_recorded_version_and_validates(
-        self, provider: BitolOdpsProvider, tmp_path: Path
+        self, provider: BitolOdpsProvider, tmp_path: Path, recorded: str
     ) -> None:
-        source = _preview_contract()
+        source = _contract_with_the_fields(recorded)
         _assert_valid(source)
 
         provider.render(source, out_dir=tmp_path)
@@ -323,7 +347,7 @@ class TestTheHeadlineCase:
         # The two halves the brief calls acceptance: it validates, and it
         # declares the version the source document recorded.
         _assert_valid(imported)
-        assert imported["fluidVersion"] == PREVIEW
+        assert imported["fluidVersion"] == recorded
 
         # Three of the five come back as the fields they were written as.
         assert imported["metadata"]["team"] == source["metadata"]["team"]
@@ -348,12 +372,13 @@ class TestTheHeadlineCase:
         # the import pinned to stable too.
         assert "consumers" not in imported
 
+    @pytest.mark.parametrize("recorded", _RECORDED_WITH_THE_FIELDS)
     def test_the_product_doc_still_round_trips_zero_diff(
-        self, provider: BitolOdpsProvider, tmp_path: Path
+        self, provider: BitolOdpsProvider, tmp_path: Path, recorded: str
     ) -> None:
-        # Honouring a newer version must not change what comes back out: the
-        # re-export is still an exact fixed point.
-        provider.render(_preview_contract(), out_dir=tmp_path)
+        # Honouring the recorded version must not change what comes back out:
+        # the re-export is still an exact fixed point.
+        provider.render(_contract_with_the_fields(recorded), out_dir=tmp_path)
         original = yaml.safe_load(next(tmp_path.glob("*.odps.yaml")).read_text(encoding="utf-8"))
         assert provider.render(provider.import_directory(tmp_path))["product"] == original
 
@@ -393,8 +418,9 @@ class TestWhatIsHonoured:
         self, provider: BitolOdpsProvider, tmp_path: Path
     ) -> None:
         # The recorded version lives in the sibling contracts. With none to
-        # resolve there is nothing to read, so the stable default stands.
-        provider.render(_preview_contract(), out_dir=tmp_path)
+        # resolve there is nothing to read, so the stable default stands. The
+        # source records the preview, so the default standing is visible.
+        provider.render(_contract_with_the_fields(PREVIEW), out_dir=tmp_path)
         product = next(tmp_path.glob("*.odps.yaml"))
         for odcs in tmp_path.glob("*.odcs.yaml"):
             odcs.unlink()
@@ -546,29 +572,47 @@ class TestWhatIsRefused:
 
 
 class TestExposeContractId:
-    def test_an_imported_id_lands_in_contract_id_at_preview(
+    def test_an_imported_id_lands_in_contract_id_at_a_version_with_the_field(
         self, provider: BitolOdpsProvider, tmp_path: Path
     ) -> None:
-        imported = provider.import_directory(_foreign_bundle(tmp_path, PREVIEW))
+        imported = provider.import_directory(_foreign_bundle(tmp_path, WITH_FIELDS))
 
         _assert_valid(imported)
-        assert imported["fluidVersion"] == PREVIEW
+        assert imported["fluidVersion"] == WITH_FIELDS
         assert _expose(imported)["contract"]["id"] == PORT_CONTRACT_ID
 
-    def test_an_imported_id_stays_in_the_passthrough_at_stable(
+    def test_an_imported_id_stays_in_the_passthrough_at_a_version_without_the_field(
         self, provider: BitolOdpsProvider, tmp_path: Path
     ) -> None:
-        # ``exposeContract`` is closed at the stable version, so the id has no
-        # inline home; the pass-through the exporter reads as its fallback is
-        # where it has to stay.
+        # ``exposeContract`` is closed at a version without the field, so the id
+        # has no inline home; the pass-through the exporter reads as its
+        # fallback is where it has to stay. (This read a document recording
+        # nothing, which landed on the stable default until #752 gave the
+        # default the field; the next case is that document now.)
+        imported = provider.import_directory(_foreign_bundle(tmp_path, WITHOUT_FIELDS))
+
+        _assert_valid(imported)
+        assert imported["fluidVersion"] == WITHOUT_FIELDS
+        assert "id" not in _expose(imported)["contract"]
+        assert _passthrough_contract_id(imported) == PORT_CONTRACT_ID
+
+    def test_a_document_recording_nothing_gets_the_id_inline_at_stable(
+        self, provider: BitolOdpsProvider, tmp_path: Path
+    ) -> None:
+        # The third-party case: nothing recorded, so the stable default, which
+        # since #752 declares ``exposeContract.id`` — the id has a real home.
+        assert _supports_expose_contract_id(STABLE)
         imported = provider.import_directory(_foreign_bundle(tmp_path, record=False))
 
         _assert_valid(imported)
         assert imported["fluidVersion"] == STABLE
-        assert "id" not in _expose(imported)["contract"]
-        assert _passthrough_contract_id(imported) == PORT_CONTRACT_ID
+        assert _expose(imported)["contract"]["id"] == PORT_CONTRACT_ID
 
-    @pytest.mark.parametrize("recorded", [PREVIEW, None], ids=["preview", "stable"])
+    @pytest.mark.parametrize(
+        "recorded",
+        [WITH_FIELDS, WITHOUT_FIELDS, None],
+        ids=["inline", "passthrough", "recording-nothing"],
+    )
     def test_the_id_re_exports_verbatim_either_way(
         self, provider: BitolOdpsProvider, tmp_path: Path, recorded: Optional[str]
     ) -> None:
@@ -587,7 +631,7 @@ class TestExposeContractId:
         # ``extensions.odcs``, so called straight on an ODPS-imported contract
         # it never sees ``expose.odps_passthrough`` and derived the id instead.
         # With the id written inline as a real schema field, that path is right.
-        imported = provider.import_directory(_foreign_bundle(tmp_path, PREVIEW))
+        imported = provider.import_directory(_foreign_bundle(tmp_path, WITH_FIELDS))
 
         rendered = OdcsProvider().render(imported, expose_id="orders")
         assert rendered["id"] == PORT_CONTRACT_ID
@@ -607,15 +651,21 @@ class TestARestoredIdAtAVersionWithoutTheField:
 
     This is the version-conditional branch, so the premise is asserted rather
     than assumed: the day 0.7.4 or 0.7.5 grows an ``exposeContract.id`` these
-    cases stop exercising the branch, and the premise is what says so.
+    cases stop exercising the branch, and the premise is what says so. (They
+    named the stable default until #752 promoted 0.7.6, the version that added
+    the field, and the default stopped being a version without it.)
     """
 
-    @pytest.mark.parametrize("recorded", [STABLE, "0.7.4"], ids=["stable", "older-than-stable"])
+    @pytest.mark.parametrize(
+        "recorded", [WITHOUT_FIELDS, "0.7.4"], ids=["last-without-the-field", "older-still"]
+    )
     def test_the_premise_that_version_has_no_expose_contract_id(self, recorded: str) -> None:
         assert not _supports_expose_contract_id(recorded)
-        assert _supports_expose_contract_id(PREVIEW)
+        assert _supports_expose_contract_id(WITH_FIELDS)
 
-    @pytest.mark.parametrize("recorded", [STABLE, "0.7.4"], ids=["stable", "older-than-stable"])
+    @pytest.mark.parametrize(
+        "recorded", [WITHOUT_FIELDS, "0.7.4"], ids=["last-without-the-field", "older-still"]
+    )
     def test_a_restored_id_moves_to_the_passthrough(
         self, provider: BitolOdpsProvider, tmp_path: Path, recorded: str
     ) -> None:
@@ -628,7 +678,9 @@ class TestARestoredIdAtAVersionWithoutTheField:
         assert "id" not in _expose(imported)["contract"]
         assert _passthrough_contract_id(imported) == PORT_CONTRACT_ID
 
-    @pytest.mark.parametrize("recorded", [STABLE, "0.7.4"], ids=["stable", "older-than-stable"])
+    @pytest.mark.parametrize(
+        "recorded", [WITHOUT_FIELDS, "0.7.4"], ids=["last-without-the-field", "older-still"]
+    )
     def test_a_restored_id_still_re_exports_verbatim(
         self, provider: BitolOdpsProvider, tmp_path: Path, recorded: str
     ) -> None:
@@ -645,10 +697,10 @@ class TestARestoredIdAtAVersionWithoutTheField:
     ) -> None:
         # The other half of the conditional, from the same fixture: nothing is
         # moved out of a schema that declares the field.
-        imported = provider.import_directory(_bundle_with_a_restored_id(tmp_path, PREVIEW))
+        imported = provider.import_directory(_bundle_with_a_restored_id(tmp_path, WITH_FIELDS))
 
         _assert_valid(imported)
-        assert imported["fluidVersion"] == PREVIEW
+        assert imported["fluidVersion"] == WITH_FIELDS
         assert _expose(imported)["contract"]["id"] == PORT_CONTRACT_ID
 
 
@@ -687,32 +739,45 @@ class TestTeamRoster:
         # reads only its own dialect's bucket, could not see it. An ODPS export
         # of an ODCS-imported contract therefore published a one-member team
         # derived from the owner, losing two people and all three roles.
-        source = _odcs_with_roster(PREVIEW)
+        source = _odcs_with_roster(WITH_FIELDS)
         imported = OdcsProvider().import_contract(source)
 
         _assert_valid(imported)
-        assert imported["fluidVersion"] == PREVIEW
+        assert imported["fluidVersion"] == WITH_FIELDS
         assert imported["metadata"]["team"] == source["team"]
 
         exported = BitolOdpsProvider().render(imported)["product"]
         assert exported["team"] == source["team"]
 
     def test_the_roster_also_round_trips_back_to_odcs_exactly(self) -> None:
-        source = _odcs_with_roster(PREVIEW)
+        source = _odcs_with_roster(WITH_FIELDS)
         imported = OdcsProvider().import_contract(source)
         assert OdcsProvider().render(imported)["team"] == source["team"]
 
     def test_a_roster_the_declared_version_cannot_hold_is_bucketed(self) -> None:
-        # The conditional, not a promotion: a document that recorded the stable
-        # version is not pushed onto a preview schema to make the roster fit.
+        # The conditional, not a promotion: a document that recorded a version
+        # without ``metadata.team`` is not pushed onto a newer schema to make the
+        # roster fit. (It recorded nothing, and so landed on the stable default,
+        # until #752 gave the default the field; the next case is that one now.)
+        source = _odcs_with_roster(WITHOUT_FIELDS)
+        imported = OdcsProvider().import_contract(source)
+
+        _assert_valid(imported)
+        assert imported["fluidVersion"] == WITHOUT_FIELDS
+        assert "team" not in imported["metadata"]
+        assert imported["extensions"]["odcs"]["metadata_extra"]["team"] == source["team"]
+        # Bucketed is not lost: the ODCS export reproduces it exactly.
+        assert OdcsProvider().render(imported)["team"] == source["team"]
+
+    def test_a_document_recording_nothing_holds_the_roster_at_stable(self) -> None:
+        # Nothing recorded means the stable default, which since #752 declares
+        # ``metadata.team``: the roster has a real home, not the bucket.
         source = _odcs_with_roster(None)
         imported = OdcsProvider().import_contract(source)
 
         _assert_valid(imported)
         assert imported["fluidVersion"] == STABLE
-        assert "team" not in imported["metadata"]
-        assert imported["extensions"]["odcs"]["metadata_extra"]["team"] == source["team"]
-        # Bucketed is not lost: the ODCS export reproduces it exactly.
+        assert imported["metadata"]["team"] == source["team"]
         assert OdcsProvider().render(imported)["team"] == source["team"]
 
     def test_an_odps_bundle_roster_survives_at_both_versions(
@@ -720,16 +785,18 @@ class TestTeamRoster:
     ) -> None:
         # The ODPS leg keeps the verbatim team in its OWN pass-through bucket,
         # so the re-export carries every member whether the roster could be
-        # placed in ``metadata`` or not.
-        for recorded in (PREVIEW, None):
-            root = tmp_path / f"bundle-{recorded or 'none'}"
-            _write(root / "orders.odcs.yaml", copy.deepcopy(_FOREIGN_ODCS))
+        # placed in ``metadata`` or not. The second version was "record
+        # nothing", which meant the stable default until #752 gave the default
+        # the field; a recorded version without it is what keeps that half.
+        for recorded in (WITH_FIELDS, WITHOUT_FIELDS):
+            root = tmp_path / f"bundle-{recorded}"
+            _write(root / "orders.odcs.yaml", _odcs_with_roster(recorded))
             product = copy.deepcopy(_FOREIGN_ODPS)
             product["team"] = copy.deepcopy(_ODCS_WITH_ROSTER["team"])
-            if recorded is not None:
-                _write(root / "orders.odcs.yaml", _odcs_with_roster(recorded))
             _write(root / "acme.sales.odps.yaml", product)
 
             imported = provider.import_directory(root)
             _assert_valid(imported)
+            # Placed at one version and not at the other, or this is one case.
+            assert ("team" in imported["metadata"]) is (recorded == WITH_FIELDS)
             assert provider.render(imported)["product"]["team"] == product["team"]

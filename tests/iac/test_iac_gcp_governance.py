@@ -755,7 +755,7 @@ class TestSchema:
 
         return list(FluidSchemaManager().validate_contract(contract).errors)
 
-    def test_the_preview_schema_accepts_the_gcp_fields(self):
+    def test_the_0_7_6_schema_accepts_the_gcp_fields(self):
         contract = self._schema_contract(
             principals={**MAPPING, ANALYSTS: ["group:a@northwind.com", "group:b@northwind.com"]},
             lifecycle={"retention": "P90D", "expire": True},

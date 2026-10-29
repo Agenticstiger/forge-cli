@@ -529,8 +529,9 @@ class TestBucketPolicyValue:
         assert not result.is_valid
 
     def test_the_field_is_0_7_6_only(self):
-        # New fields land in the preview schema; the GA 0.7.5 keeps
-        # additionalProperties: false. A 0.7.5 contract gets the default.
+        # New fields land in the open preview, which was 0.7.6 for this one; the
+        # released 0.7.5 keeps additionalProperties: false. A 0.7.5 contract gets
+        # the default.
         contract = _contract([OTHER], bucket_policy="none")
         contract["fluidVersion"] = "0.7.5"
         assert not FluidSchemaManager().validate_contract(contract).is_valid

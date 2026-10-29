@@ -454,8 +454,12 @@ def _assemble_bucket_contract(
         if split_by == "folder" and bucket_key != _ROOT_BUCKET
         else "models/"
     )
+    # The newest stable bundled schema, never a literal (one goes stale every release);
+    # imported here so jsonschema stays off the --help path.
+    from fluid_build.schema_manager import FluidSchemaManager
+
     contract: Dict[str, Any] = {
-        "fluidVersion": "0.7.3",
+        "fluidVersion": FluidSchemaManager.latest_bundled_version(),
         "kind": "DataProduct",
         "id": product_id,
         "name": f"Imported from dbt: {display}",
@@ -1269,8 +1273,8 @@ def _attach_semantic_models(
     brownfield dbt project lost its semantic layer on the way IN. The
     posture matches the rest of the importer — map faithfully what the
     contract schema can hold, degrade loudly (report notes) for what it
-    can't (agg_params pre-0.7.6, window_groupings, cumulative/conversion
-    metric types).
+    can't (agg_params, which it does not carry yet, window_groupings,
+    cumulative/conversion metric types).
     """
     semantic_models = manifest.get("semantic_models") or {}
     if not isinstance(semantic_models, dict) or not semantic_models:
@@ -1439,18 +1443,17 @@ def _semantics_block_from_semantic_model(
             )
             continue
         if agg == "percentile" and not _percentile_params_are_default(raw.get("agg_params")):
-            # ``measures[].aggParams`` only lands in the 0.7.6 preview schema
-            # and the importer emits the GA fluidVersion, so the parameters
-            # cannot be carried. Keeping the measure without them would
-            # silently re-default it to DEFAULT_PERCENTILE — a p90 measure
-            # would keep its name and start answering the median. Drop the
-            # whole measure so the loss is loud instead of numeric.
+            # ``measures[].aggParams`` arrived in schema 0.7.6 and this importer
+            # does not carry it, so the parameters cannot be kept. Keeping the
+            # measure without them would silently re-default it to
+            # DEFAULT_PERCENTILE — a p90 measure would keep its name and start
+            # answering the median. Drop the whole measure so the loss is loud
+            # instead of numeric.
             report.unsupported.append(
                 f"semantic model {sm_name}: measure {raw['name']!r} is a percentile "
-                f"measure whose agg_params ({raw.get('agg_params')!r}) require "
-                "fluidVersion >= 0.7.6 — measure dropped rather than re-defaulted "
-                f"to percentile={_DEFAULT_PERCENTILE}. Upgrade the contract "
-                "version and re-import to keep it."
+                f"measure whose agg_params ({raw.get('agg_params')!r}) fluid import "
+                "does not carry yet — measure dropped rather than re-defaulted "
+                f"to percentile={_DEFAULT_PERCENTILE}."
             )
             continue
         measure: Dict[str, Any] = {"name": str(raw["name"]), "agg": agg}
@@ -1484,8 +1487,7 @@ def _semantics_block_from_semantic_model(
             # silently change; record the loss and keep the measure.
             report.unsupported.append(
                 f"semantic model {sm_name}: measure {raw['name']!r} agg_params "
-                "requires fluidVersion >= 0.7.6 — dropped (re-import after "
-                "upgrading the contract version to keep them)"
+                "dropped: fluid import does not carry agg_params yet"
             )
         measures.append(measure)
     if measures:

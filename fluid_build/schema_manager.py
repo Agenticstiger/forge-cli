@@ -439,7 +439,11 @@ class FluidSchemaManager:
     # (0.7.5 was promoted to stable 2026-07-18: Redshift-Serverless/Kinesis
     # bindingLocation fields + the vector/embeddings vectorConfig output port.
     # 0.7.6 opened as the next preview, identical at open.)
-    PREVIEW_VERSIONS: FrozenSet[str] = frozenset({"0.7.6"})
+    # (0.7.6 was promoted to stable 2026-10-29, against the criteria #752 wrote
+    # down: packaging modes, engine flink, the continuous trigger,
+    # identity-keyed overlay merges, column masking and row filters, and the
+    # exporter fields. 0.7.7 opened as the next preview, identical at open.)
+    PREVIEW_VERSIONS: FrozenSet[str] = frozenset({"0.7.7"})
 
     @classmethod
     def latest_bundled_version(cls) -> str:
