@@ -55,6 +55,34 @@ and JSON parsers keep the last value and drop the other without a word. A key
 that a `<<` merge brings in and the mapping then writes itself is an override,
 not a duplicate.
 
+### A payload with its own `$ref` keys: write `$$ref`
+
+Every `$ref` key is read as a contract reference, so a document that carries
+its own `$ref` keys (a JSON Schema or an OpenAPI fragment inside `parameters`
+or an extension) writes them `$$ref`. A key written `$$ref` is never resolved:
+the composed contract holds it as the literal key `$ref`, after the check that
+no reference is left.
+
+```yaml
+builds:
+  - id: ingest
+    properties:
+      parameters:
+        payloadSchema:
+          $$ref: "#/$defs/Order"     # the payload's own ref: composes to `$ref: "#/$defs/Order"`
+          $defs:
+            Order: {type: object}
+```
+
+One `$` is dropped per level, so any key can be written: `$$$ref` composes to
+`$$ref`. A same-document pointer names an escaped key as it is written
+(`#/…/payloadSchema/$$ref`). `fluid bundle` writes such a key `$$ref` again, in
+its YAML and JSON output and in a tgz's `contract.resolved.*`, so a bundle
+stays contract input: composing it gives the same contract, and every command
+that reads a bundle reads `$ref`. An OpenAPI document `fluid bundle --format
+tgz` moves to `sources/openapi/` keeps its own `$ref` keys, as written for
+OpenAPI.
+
 ---
 
 ## Where a ref may point: the ref root

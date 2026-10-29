@@ -475,10 +475,12 @@ def _load_contract(contract_path: Path) -> Dict[str, Any]:
             f"contract at {contract_path} did not parse as a mapping",
             key=None,
         )
-    from fluid_build.contract_refs import find_ref_node
+    from fluid_build.contract_refs import find_ref_node, unescape_ref_keys
 
     if find_ref_node(doc) is None:
-        return doc
+        # What composing it gives: a ``$$ref`` key (a payload's literal ``$ref``,
+        # as ``fluid bundle`` writes one too) reads as ``$ref``.
+        return unescape_ref_keys(doc)
     # A contract split into fragments is read whole, as every other command
     # reads it, so its artifacts are those of the same contract written flat.
     from fluid_build.loader import compose_contract

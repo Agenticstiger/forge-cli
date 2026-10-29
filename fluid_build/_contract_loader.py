@@ -28,9 +28,10 @@ contracts and raises ``CLIError``), so it must never import from
 Two rules keep that invariant true, and both are load-bearing:
 
 * Every ``fluid_build.*`` dependency here is either (a) imported *inside* a
-  function (lazy) and known not to reach ``cli`` — ``forge.core.bundle`` /
-  ``forge.core.validators`` / ``observability.secret_redactor`` /
-  ``providers.snowflake.util.config`` — or (b) resolved dynamically by name
+  function (lazy) and known not to reach ``cli`` — ``contract_refs`` /
+  ``forge.core.bundle`` / ``forge.core.validators`` /
+  ``observability.secret_redactor`` / ``providers.snowflake.util.config`` —
+  or (b) resolved dynamically by name
   through :func:`_imp` so the static import graph carries no edge.
 * ``fluid_build.loader`` is reached **only** through :func:`_imp` (never a
   literal ``import``), because ``loader`` itself lazily reaches
@@ -105,6 +106,17 @@ def _is_bundle_path(path: str) -> bool:
 def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, Any]:
     """Load the resolved contract from inside a ``.tgz`` / ``.tar.gz`` bundle.
 
+    :func:`_read_bundle_contract`'s contract.
+    """
+    return _read_bundle_contract(path, logger)[0]
+
+
+def _read_bundle_contract(
+    path: str, logger: logging.Logger
+) -> Tuple[Dict[str, Any], Tuple[str, ...]]:
+    """The resolved contract inside a ``.tgz`` / ``.tar.gz`` bundle, and the ``$ref``
+    values it holds as written.
+
     ``fluid bundle`` (pipeline stage 1) emits a gzip tarball whose payload
     includes ``contract.resolved.{yaml,json}`` plus a tamper-evident
     ``MANIFEST.json``. ``fluid validate`` already understands this layout
@@ -122,10 +134,17 @@ def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, A
          is read with the bounded reader (decompression-bomb cap) and
          parsed via ``loader.parse_contract_text`` — same billion-laughs
          guard as the on-disk path.
-      3. ``unwrap_source_pointers`` resolves any ``{"$source": "sources/…"}``
+      3. Its escaped keys are read (``contract_refs.unescape_ref_keys``):
+         ``fluid bundle`` writes a payload's literal ``$ref`` key as
+         ``$$ref`` so that the resolved contract stays contract input, and
+         this reader, which composes nothing, reads it back as ``$ref``. A
+         ``$ref`` the file holds as written is a reference nothing resolved
+         (one ``fluid bundle`` never writes); it is kept, and listed.
+      4. ``unwrap_source_pointers`` resolves any ``{"$source": "sources/…"}``
          sentinels (inline SQL / OpenAPI that ``fluid bundle`` extracts into
          ``sources/``) back into real values, so downstream planners see a
-         fully-materialised contract — never a bare sentinel dict.
+         fully-materialised contract — never a bare sentinel dict. A file in
+         ``sources/`` is written as the contract held it, unescaped.
 
     The returned contract is exactly what the planner / apply path would
     have seen had the operator passed the original ``contract.fluid.yaml``,
@@ -133,6 +152,7 @@ def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, A
     """
     import tarfile
 
+    from fluid_build.contract_refs import ref_values, unescape_ref_keys
     from fluid_build.forge.core.bundle import read_tar_member_bounded, validate_manifest
     from fluid_build.forge.core.validators import unwrap_source_pointers
 
@@ -201,7 +221,8 @@ def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, A
             doc = loader.parse_contract_text(
                 raw_bytes.decode("utf-8"), suffix=suffix, name=member_name
             )
-            contract = unwrap_source_pointers(doc, _resolve_source)
+            frozen = ref_values(doc)
+            contract = unwrap_source_pointers(unescape_ref_keys(doc), _resolve_source)
     except CLIError:
         raise
     except (tarfile.TarError, OSError, ValueError, RuntimeError) as exc:
@@ -222,7 +243,17 @@ def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, A
         )
 
     logger.debug("bundle_contract_loaded: %s (member=%s)", bundle_path, member_name)
-    return contract
+    return contract, frozen
+
+
+def _load_bundle(
+    path: str, env: Optional[str], logger: logging.Logger
+) -> Tuple[Dict[str, Any], Tuple[str, ...]]:
+    """What :func:`load_contract_with_overlay` loads from the bundle at ``path``, and
+    the ``$ref`` values it holds unresolved (:func:`_read_bundle_contract`)."""
+    contract, frozen = _read_bundle_contract(path, logger)
+    check_bundle_env(path, env, logger)
+    return _normalize_contract_aliases(contract), frozen
 
 
 def load_contract_with_overlay(
@@ -243,9 +274,7 @@ def load_contract_with_overlay(
     # to be ignored, so ``fluid plan base.tgz --env aws`` planned the base
     # contract while the operator believed they were planning AWS.
     if _is_bundle_path(path):
-        contract = _load_contract_from_bundle(path, logger)
-        check_bundle_env(path, env, logger)
-        return _normalize_contract_aliases(contract)
+        return _load_bundle(path, env, logger)[0]
 
     try:
         loader = _imp("fluid_build.loader")

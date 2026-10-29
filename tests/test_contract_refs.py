@@ -1195,3 +1195,101 @@ def test_an_overlay_must_compose_to_an_object(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Overlay root must be an object/dict"):
         load_with_overlay(path, "prod")
+
+
+# ── a payload's literal $ref key: the $$ref escape (SG-05) ─────────────
+
+
+def test_unescape_drops_one_dollar_and_escape_adds_it_back() -> None:
+    written = {
+        "a": {"$$ref": "#/x", "$$$ref": "y", "$ref_x": 1, "$$REF": 2, 7: "an int key"},
+        "l": [{"$$ref": 1}, "$$ref"],
+    }
+    before = json.dumps(written, default=str)
+
+    composed = contract_refs.unescape_ref_keys(written)
+
+    assert composed == {
+        "a": {"$ref": "#/x", "$$ref": "y", "$ref_x": 1, "$$REF": 2, 7: "an int key"},
+        "l": [{"$ref": 1}, "$$ref"],
+    }
+    assert list(composed["a"]) == ["$ref", "$$ref", "$ref_x", "$$REF", 7], "key order kept"
+    assert contract_refs.escape_ref_keys(composed) == written
+    assert json.dumps(written, default=str) == before, "the input is not modified"
+
+
+def test_a_document_without_an_escaped_key_is_returned_as_it_is() -> None:
+    doc = {"a": [{"b": 1}], "$REF": 2, "x$ref": 3}
+
+    assert contract_refs.unescape_ref_keys(doc) is doc
+    assert contract_refs.escape_ref_keys(doc) is doc
+    assert not contract_refs.has_escaped_ref_key(doc)
+    assert contract_refs.has_escaped_ref_key([{"$$ref": 1}])
+    assert not contract_refs.has_escaped_ref_key({"$ref": "./x.yaml"})
+
+
+def test_unescape_keeps_an_alias_shared_and_a_container_inside_its_copy() -> None:
+    shared = {"$$ref": "s"}
+    doc: Dict[str, Any] = {"a": shared, "b": shared}
+    doc["self"] = doc
+
+    got = contract_refs.unescape_ref_keys(doc)
+
+    assert got["a"] == {"$ref": "s"} and got["a"] is got["b"]
+    assert got["self"] is got
+
+
+def test_unescape_walks_a_deep_document_without_recursion() -> None:
+    deep: Dict[str, Any] = {}
+    node = deep
+    for _ in range(5_000):
+        node["n"] = {}
+        node = node["n"]
+    node["$$ref"] = 1
+
+    got = contract_refs.unescape_ref_keys(deep)
+
+    for _ in range(5_000):
+        got = got["n"]
+    assert got == {"$ref": 1}
+
+
+def test_a_ref_beside_its_escape_is_refused_naming_the_place() -> None:
+    with pytest.raises(ValueError) as info:
+        contract_refs.unescape_ref_keys({"x": [{"$ref": "./a.yaml", "$$ref": "b"}]})
+
+    assert str(info.value).startswith(
+        "the object at JSON pointer '/x/0' holds both '$$ref' and '$ref', which both read as "
+        "the key '$ref'"
+    )
+
+
+def test_no_ref_scanner_reads_an_escaped_key_as_a_reference() -> None:
+    from fluid_build.util.ref_confinement import iter_external_refs
+
+    doc = {"p": {"$$ref": "./x.yaml", "q": [{"$$$ref": "#/y"}]}}
+
+    assert contract_refs.find_ref_node(doc) is None
+    assert list(iter_external_refs(doc)) == []
+    assert contract_refs.ref_values(doc) == ()
+    assert contract_refs.is_ref_node(doc["p"]) is False
+
+
+def test_readers_that_skip_the_composition_read_an_escaped_key_as_it_composes(
+    tmp_path: Path,
+) -> None:
+    """``generate artifacts`` reads a contract without a ``$ref`` itself, and the field
+    reader composes only what the fields need: both give what the composition gives."""
+    from fluid_build.forge.core.artifact_fanout import _load_contract
+    from fluid_build.loader import load_contract_fields
+
+    body = {"id": "x", "consumes": [{"productId": "p", "schema": {"$$ref": "#/defs/a"}}]}
+    path = _contract(tmp_path, body)
+    composed = load_contract(path)
+
+    assert composed["consumes"] == [{"productId": "p", "schema": {"$ref": "#/defs/a"}}]
+    assert _load_contract(path) == composed
+    assert load_contract_fields(path, "id", "consumes") == composed
+    assert load_contract_fields(path, "id")["consumes"][0]["schema"] == {
+        "$$ref": "#/defs/a"
+    }, "a field nobody asked for is left as written"

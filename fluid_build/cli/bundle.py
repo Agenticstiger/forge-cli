@@ -193,7 +193,10 @@ def _serialize(contract: Dict[str, Any], fmt: str) -> str:
 
 
 def _has_refs(obj: Any) -> bool:
-    """Check if a parsed contract tree contains any $ref pointers."""
+    """Check if a parsed contract tree contains any $ref pointers.
+
+    Exact key ``$ref``: a ``$$ref`` key is a payload's literal ``$ref``, no reference.
+    """
     if isinstance(obj, dict):
         if "$ref" in obj:
             return True
@@ -544,7 +547,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         return 0
 
     # ── yaml / json branch (legacy single-file output) ─────────────────────
-    output = _serialize(compiled, fmt)
+    # The output is contract input again: a payload's literal ``$ref`` key,
+    # which the composition read from ``$$ref``, is written ``$$ref`` again.
+    from ..contract_refs import escape_ref_keys
+
+    output = _serialize(escape_ref_keys(compiled), fmt)
 
     if out == "-":
         sys.stdout.write(output)

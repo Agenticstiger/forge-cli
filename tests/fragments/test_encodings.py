@@ -730,6 +730,211 @@ def test_n16_look_alike_keys_are_ordinary_keys(
     assert "'$REF' was unexpected" in output
 
 
+# ── SG-05: a payload's own $ref keys, written $$ref ─────────────────────
+
+#: A JSON Schema payload with refs of its own. ``#/$defs/...`` names nothing in the
+#: contract, so resolving any of them as a contract ref would fail.
+_PAYLOAD = {
+    "$$ref": "#/$defs/Order",
+    "$defs": {"Order": {"type": "object", "properties": {"id": {"$$ref": "#/$defs/Id"}}}},
+}
+_PAYLOAD_COMPOSED = {
+    "$ref": "#/$defs/Order",
+    "$defs": {"Order": {"type": "object", "properties": {"id": {"$ref": "#/$defs/Id"}}}},
+}
+
+
+def _payload_contract(root: Path) -> Path:
+    """MIN with the payload in ``parameters`` (and a ``$$$ref`` and a list), in a fragment
+    and in the dev overlay."""
+    doc = _min_doc()
+    doc["builds"][0]["properties"]["parameters"] = {
+        "payloadSchema": _PAYLOAD,
+        "literal": {"$$$ref": "two dollars"},
+        "list": [{"$$ref": "./missing.yaml"}],
+    }
+    doc["extensions"] = {"fragment": {"$ref": "./ext.yaml"}}
+    _write(root / "ext.yaml", "schema:\n  $$ref: ./nowhere.yaml\n")
+    _write(root / "overlays" / "dev.yaml", 'extensions: {overlay: {$$ref: "#/none"}}\n')
+    return _write_contract(root, doc)
+
+
+def test_n16_a_double_dollar_key_is_a_literal_ref_key_and_is_never_resolved_sg05(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SG-05, decided: ``$$ref`` is the literal key ``$ref`` in the composed contract, in
+    the root, a fragment and an overlay alike; one ``$`` is dropped per level."""
+    from fluid_build.api.contract import load_contract
+
+    monkeypatch.chdir(tmp_path)
+    contract = _payload_contract(tmp_path)
+
+    composed = loader.compose_contract(contract, "dev")
+
+    params = composed.document["builds"][0]["properties"]["parameters"]
+    assert params == {
+        "payloadSchema": _PAYLOAD_COMPOSED,
+        "literal": {"$$ref": "two dollars"},
+        "list": [{"$ref": "./missing.yaml"}],
+    }
+    assert composed.document["extensions"] == {
+        "fragment": {"schema": {"$ref": "./nowhere.yaml"}},
+        "overlay": {"$ref": "#/none"},
+    }
+    assert [p.name for p in composed.files] == ["contract.fluid.yaml", "ext.yaml", "dev.yaml"]
+    loaded = load_contract(contract, env="dev")
+    assert loaded.contract == composed.document
+    assert loaded.unresolved_refs == (), "a payload's $ref is no unresolved reference"
+    assert loaded.origin_of(["builds", 0, "properties", "parameters", "payloadSchema", "$ref"])
+    code, output = _cli(capsys, "validate", str(contract), "--env", "dev")
+    assert code == 0, output
+
+
+def test_n16_a_payload_ref_is_still_a_contract_reference_unless_escaped_sg05(
+    tmp_path: Path,
+) -> None:
+    doc = _min_doc()
+    doc["builds"][0]["properties"]["parameters"] = {"payloadSchema": {"$ref": "#/$defs/Order"}}
+    contract = _write_contract(tmp_path, doc)
+
+    with pytest.raises(RefResolutionError, match="'/\\$defs/Order' in the composed contract"):
+        loader.load_contract(contract)
+
+
+def test_n16_the_escape_is_read_last_on_every_path_of_the_composition_sg05() -> None:
+    """After the check that no ``$ref`` is left, also for a document without any ``$ref``
+    (the pointer pass returns early), and only for a document that is composed."""
+    from fluid_build.api.contract import load_contract_from_dict
+
+    plain = load_contract_from_dict({"id": "x", "p": {"$$ref": "#/q", "$$$ref": 1}})
+    assert plain.contract == {"id": "x", "p": {"$ref": "#/q", "$$ref": 1}}
+    assert plain.unresolved_refs == ()
+
+    pointed = load_contract_from_dict(
+        {"s": {"$$ref": "#/x", "k": 1}, "copy": {"$ref": "#/s"}, "key": {"$ref": "#/s/$$ref"}}
+    )
+    assert pointed.contract["copy"] == {"$ref": "#/x", "k": 1}
+    assert pointed.contract["key"] == "#/x", "a pointer names an escaped key as written"
+    assert pointed.unresolved_refs == ()
+
+    names_files = load_contract_from_dict({"x": {"$ref": "./f.yaml"}, "p": {"$$ref": "#/q"}})
+    assert names_files.contract == {"x": {"$ref": "./f.yaml"}, "p": {"$$ref": "#/q"}}
+    assert names_files.unresolved_refs == ("./f.yaml",), "nothing is composed, nor unescaped"
+
+
+def _bundle_text(capsys: pytest.CaptureFixture[str], contract: Path, out: Path, *flags: str) -> str:
+    code, output = _cli(capsys, "bundle", str(contract), "--out", str(out), *flags)
+    assert code == 0, output
+    return out.read_text(encoding="utf-8")
+
+
+def test_n16_a_bundle_writes_the_escape_back_and_composes_to_the_same_contract_sg05(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bundle stays contract input: bundle(original) composed again == compose(original),
+    in YAML, JSON and the tgz, and a plan made from any of them carries the payload's
+    ``$ref`` as ``$ref``."""
+    from fluid_build.api.contract import load_contract
+
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "src"
+    contract = _payload_contract(root)
+    original = loader.compose_contract(contract, "dev").document
+
+    for name, flags in (("b.yaml", ()), ("b.json", ("--format", "json"))):
+        text = _bundle_text(capsys, contract, tmp_path / name, "--env", "dev", *flags)
+        written = json.loads(text) if name.endswith(".json") else yaml.safe_load(text)
+        assert written["builds"][0]["properties"]["parameters"]["payloadSchema"] == _PAYLOAD
+        assert written["builds"][0]["properties"]["parameters"]["literal"] == {
+            "$$$ref": "two dollars"
+        }
+        assert loader.compose_contract(tmp_path / name).document == original
+
+    code, output = _cli(
+        capsys, "bundle", str(contract), "--env", "dev", "--format", "tgz", "--out", "b.tgz"
+    )
+    assert code == 0, output
+    with tarfile.open(tmp_path / "b.tgz") as archive:
+        for member in ("contract.resolved.yaml", "contract.resolved.json"):
+            text = archive.extractfile(member).read().decode()  # type: ignore[union-attr]
+            assert '"#/$defs/Order"' in text or "'#/$defs/Order'" in text
+            assert "$$ref" in text and "$$$ref" in text
+    loaded = load_contract(tmp_path / "b.tgz", env="dev")
+    assert loaded.contract == original
+    assert loaded.unresolved_refs == ()
+    code, output = _cli(capsys, "validate", str(tmp_path / "b.tgz"))
+    assert code == 0, output
+
+    for label, source in (("contract", contract), ("tgz", tmp_path / "b.tgz")):
+        code, output = _cli(capsys, "plan", str(source), "--env", "dev", "--out", f"{label}.json")
+        assert code == 0, output
+        planned = json.loads((tmp_path / f"{label}.json").read_text(encoding="utf-8"))
+        assert planned["contract"]["builds"][0]["properties"]["parameters"] == (
+            original["builds"][0]["properties"]["parameters"]
+        )
+
+
+def test_n16_an_openapi_document_moved_to_sources_keeps_its_own_refs_sg05(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``fluid bundle --format tgz`` moves an expose's inline OpenAPI to ``sources/openapi``
+    after it composes, so that file holds the document as OpenAPI reads it: ``$ref``."""
+    from fluid_build.api.contract import load_contract
+
+    doc = _min_doc()
+    doc["exposes"][0]["openapi"] = {
+        "openapi": "3.1.0",
+        "paths": {"/o": {"get": {"responses": {"200": {"$$ref": "#/components/responses/Ok"}}}}},
+    }
+    contract = _write_contract(tmp_path, doc)
+    tgz = tmp_path / "b.tgz"
+
+    code, output = _cli(capsys, "bundle", str(contract), "--format", "tgz", "--out", str(tgz))
+    assert code == 0, output
+
+    with tarfile.open(tgz) as archive:
+        (moved,) = [n for n in archive.getnames() if n.startswith("sources/openapi/")]
+        source = yaml.safe_load(archive.extractfile(moved))  # type: ignore[arg-type]
+        resolved = yaml.safe_load(archive.extractfile("contract.resolved.yaml"))  # type: ignore[arg-type]
+    ok = {"$ref": "#/components/responses/Ok"}
+    assert source["paths"]["/o"]["get"]["responses"]["200"] == ok
+    assert resolved["exposes"][0]["openapi"] == {"$source": moved}
+    assert load_contract(tgz).contract["exposes"][0]["openapi"]["paths"]["/o"]["get"] == {
+        "responses": {"200": ok}
+    }
+
+
+def _hand_made_bundle(tmp_path: Path, resolved: str) -> Path:
+    """A tgz with a valid MANIFEST whose ``contract.resolved.yaml`` is ``resolved``."""
+    from fluid_build.forge.core.bundle import build_manifest, write_tgz
+
+    files = {"contract.resolved.yaml": resolved.encode()}
+    tgz = tmp_path / "hand.tgz"
+    write_tgz(tgz, {**files, "MANIFEST.json": json.dumps(build_manifest(files)).encode()})
+    return tgz
+
+
+def test_n16_a_bare_ref_in_a_hand_made_bundle_is_listed_and_one_beside_its_escape_refused(
+    tmp_path: Path,
+) -> None:
+    """``fluid bundle`` never writes a bare ``$ref``: one a bundle holds was written by hand
+    (or by a release before the escape) and resolves nothing. It stays, and is listed."""
+    from fluid_build.api.contract import ContractLoadError, load_contract
+
+    frozen = load_contract(
+        _hand_made_bundle(tmp_path, "id: x\na: {$ref: ./x.yaml}\nb: {$$ref: y}\n")
+    )
+    assert frozen.contract == {"id": "x", "a": {"$ref": "./x.yaml"}, "b": {"$ref": "y"}}
+    assert frozen.unresolved_refs == ("./x.yaml",)
+
+    with pytest.raises(ContractLoadError) as info:
+        load_contract(_hand_made_bundle(tmp_path, "id: x\na: {$ref: ./x.yaml, $$ref: y}\n"))
+    assert info.value.event == "bundle_load_failed"
+    assert "'/a' holds both '$$ref' and '$ref', which both read as the key '$ref'" in str(
+        info.value
+    )
+
+
 # ── N-17, N-18: control characters and whitespace ──────────────────────
 
 _CONTROL_TEXT = "SELECT 1\x00\x01\x07\x1b[0m\x7f\n"

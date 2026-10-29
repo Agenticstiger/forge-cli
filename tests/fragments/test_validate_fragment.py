@@ -318,6 +318,28 @@ def test_k12_the_errors_of_the_narrow_case_name_the_fragment_file_and_line(
     assert f"fragments/exposes/orders.yaml:{kind_line} (kind)" in out_alone
 
 
+def test_k12_an_escaped_key_is_checked_as_it_composes_and_named_where_it_is_written_sg05(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """SG-05: ``$$ref`` composes to the literal key ``$ref``. A fragment is checked as it
+    composes (``'$ref' was unexpected`` in a closed expose), and the error names the line
+    the key is written on, ``$$ref``, as the whole contract's error does."""
+    expose = _expose()
+    expose["$$ref"] = "#/not/a/reference"
+    contract, fragment = _project(tmp_path, expose)
+    lines = fragment.read_text("utf-8").splitlines()
+    key_line = next(n for n, text in enumerate(lines, 1) if text.startswith("$$ref:"))
+
+    rc_whole, out_whole, _ = _validate(capsys, contract)
+    rc_alone, out_alone, _ = _validate(capsys, "--fragment", "expose", fragment)
+
+    assert (rc_whole, rc_alone) == (1, 1)
+    for out in (out_whole, out_alone):
+        assert "'$ref' was unexpected" in out
+        assert "'$$ref' was unexpected" not in out
+        assert f"fragments/exposes/orders.yaml:{key_line} " in out
+
+
 # ── K-13 ────────────────────────────────────────────────────────────────
 
 

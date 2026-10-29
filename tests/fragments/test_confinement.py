@@ -1154,14 +1154,16 @@ def test_d25_sg23_a_ref_frozen_in_a_bundle_never_resolves_from_cwd_or_beside_it(
     tmp_path: Path, cli: Callable[..., Tuple[int, str]], command: str
 ) -> None:
     """SG-23 characterization: a bundle's ``$ref`` stays a frozen literal, which the
-    schema then refuses where the position is closed (``metadata.owner``)."""
+    schema then refuses where the position is closed (``metadata.owner``). A ``$ref``
+    key a composed contract holds is a payload's literal key (SG-05): the bundle writes
+    it ``$$ref`` and reads it back, so it is not listed as unresolved."""
     tgz = _frozen_bundle(tmp_path, _with_owner({"$ref": "./x.yaml"}))
     plan = tmp_path / "plan.json"
 
     if command == "api":
         loaded = api_load_contract(tgz)
         assert loaded.contract["metadata"]["owner"] == {"$ref": "./x.yaml"}
-        assert loaded.unresolved_refs == ("./x.yaml",)
+        assert loaded.unresolved_refs == ()
         return
     args: List[Any] = [command, tgz]
     if command == "plan":

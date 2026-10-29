@@ -44,6 +44,7 @@ from fluid_build.contract_refs import (
     RefBudget,
     _is_system_path,
     find_ref_node,
+    has_escaped_ref_key,
     is_pointer_node,
     is_ref_node,
     parse_ref,
@@ -1717,14 +1718,15 @@ def load_contract_fields(path: Union[str, Path], *fields: str) -> Dict[str, Any]
 
 
 def _ref_along(node: Any, keys: List[str]) -> bool:
-    """True when the value at ``keys`` under ``node``, or an object above it, holds a ``$ref``."""
+    """True when the value at ``keys`` under ``node``, or an object above it, holds a
+    ``$ref``, or the value holds a ``$$ref`` escape the composition reads as ``$ref``."""
     for key in keys:
         if is_ref_node(node):
             return True
         if not isinstance(node, dict):
             return False
         node = node.get(key)
-    return find_ref_node(node) is not None
+    return find_ref_node(node) is not None or has_escaped_ref_key(node)
 
 
 def load_contract(

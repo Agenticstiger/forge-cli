@@ -576,6 +576,8 @@ def _run_fragment_validation(
                 )
             },
         )
+    # Checked as it composes: a payload's ``$$ref`` key is its literal ``$ref``.
+    document = contract_refs.unescape_ref_keys(document)
 
     def locate(path: Sequence[Any], definition: bool = False) -> Optional[str]:
         found = origins.locate(path, definition=definition)
