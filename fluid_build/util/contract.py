@@ -148,6 +148,22 @@ def is_externally_run_build(build: Mapping[str, Any]) -> bool:
     return isinstance(language, str) and language.strip().lower() in EXTERNALLY_RUN_LANGUAGES
 
 
+def builds_writing_expose(expose_id: Any, builds: Any) -> List[Mapping[str, Any]]:
+    """The builds that write the expose ``expose_id``: those whose ``outputs``
+    name it or, when none does, those that declare no ``outputs`` (a build that
+    declares them has said what it writes)."""
+    dict_builds = [b for b in builds or [] if isinstance(b, Mapping)]
+    return [
+        b for b in dict_builds if isinstance(b.get("outputs"), list) and expose_id in b["outputs"]
+    ] or [b for b in dict_builds if not isinstance(b.get("outputs"), list)]
+
+
+def is_written_outside_forge(expose_id: Any, builds: Any) -> bool:
+    """True when a build that runs outside forge-cli writes the expose, or may
+    (:func:`builds_writing_expose`): forge-cli lands nothing under its name."""
+    return any(is_externally_run_build(b) for b in builds_writing_expose(expose_id, builds))
+
+
 def describe_externally_run_build(build: Mapping[str, Any]) -> str:
     """What makes the build run elsewhere, for messages: ``engine 'flink'`` or
     ``language 'flink_sql'``."""
