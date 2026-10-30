@@ -94,7 +94,9 @@ AWS_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
 #: Databricks plugin manages exposes only, so a dbt build on Databricks next to
 #: exposes on another cloud says where that build runs, not a second cloud. It
 #: would make the contract ambiguous, and ``fluid apply`` then falls back to the
-#: native engine. Drop a cloud from here once its plugin emits build resources.
+#: native engine. With no other cloud declared it still counts (see
+#: ``_without_build_only``). Drop a cloud from here once its plugin emits build
+#: resources.
 BUILD_ONLY_CLOUDS = frozenset({"databricks"})
 
 
@@ -168,19 +170,27 @@ def candidate_regions(contract: Mapping[str, Any]) -> List[str]:
 
 
 def _build_declarations(contract: Mapping[str, Any]) -> Iterator[Tuple[object, str]]:
-    """``builds[].provider`` and ``builds[].execution.runtime.platform`` tokens,
-    except a cloud whose plugin compiles no builds (:data:`BUILD_ONLY_CLOUDS`)."""
+    """``builds[].provider`` and ``builds[].execution.runtime.platform`` tokens."""
     for i, build in enumerate(contract.get("builds") or []):
         if not isinstance(build, dict):
             continue
         runtime = (build.get("execution") or {}).get("runtime") or {}
         platform = runtime.get("platform") if isinstance(runtime, dict) else None
-        for token, source in (
-            (build.get("provider"), f"builds[{i}].provider"),
-            (platform, f"builds[{i}].execution.runtime.platform"),
-        ):
-            if canonical_cloud(token) not in BUILD_ONLY_CLOUDS:
-                yield token, source
+        yield build.get("provider"), f"builds[{i}].provider"
+        yield platform, f"builds[{i}].execution.runtime.platform"
+
+
+def _without_build_only(found: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """``found`` less a :data:`BUILD_ONLY_CLOUDS` cloud only a build declared, when
+    another cloud is declared too. Alone it stays: the contract then applies on
+    that cloud, through its plugin, whose refusals (a build that names its own
+    host) must keep running."""
+    kept = [
+        (cloud, source)
+        for cloud, source in found
+        if not (cloud in BUILD_ONLY_CLOUDS and source.startswith("builds["))
+    ]
+    return kept or found
 
 
 def detect_cloud_declarations(contract: Mapping[str, Any]) -> List[Tuple[str, str]]:
@@ -236,7 +246,7 @@ def detect_cloud_declarations(contract: Mapping[str, Any]) -> List[Tuple[str, st
                 found.append(("aws", f"region {region}"))
                 break
 
-    return found
+    return _without_build_only(found)
 
 
 def detect_clouds(contract: Mapping[str, Any]) -> List[str]:

@@ -81,6 +81,13 @@ class TestDetectCloudDeclarations:
         dbx = {"exposes": [{"binding": {"platform": "databricks"}}], "builds": [build]}
         assert provider_match.detect_clouds(dbx) == ["databricks"]
 
+    def test_a_build_on_databricks_alone_still_declares_it(self):
+        # With no other cloud the contract applies through the Databricks plugin,
+        # whose refusals (a build naming its own host) must keep running.
+        build = {"engine": "dbt", "execution": {"runtime": {"platform": "databricks"}}}
+        kafka = {"exposes": [{"binding": {"platform": "kafka"}}], "builds": [build]}
+        assert provider_match.detect_clouds(kafka) == ["databricks"]
+
     def test_region_fallback_only_when_nothing_stronger(self):
         assert provider_match.detect_clouds({"binding": {"region": "eu-west-2"}}) == ["aws"]
         # A GCP region is not an AWS region and must not trigger the fallback.

@@ -433,6 +433,44 @@ def test_fluid_validate_reports_the_refusals(monkeypatch, tmp_path: Path, capfd)
     assert rc != 0 and "sets binding.location.host" in out
 
 
+def test_a_databricks_build_beside_non_cloud_exposes_still_meets_the_host_guard(
+    monkeypatch, tmp_path: Path, capfd
+):
+    # Its only cloud is the build's: the contract must still compile through the
+    # Databricks plugin, or apply goes native and the dbt runner sends
+    # DATABRICKS_TOKEN to the host the contract names.
+    isolate_workspace(
+        monkeypatch,
+        tmp_path,
+        host="https://adb-1.azuredatabricks.net",
+        warehouse_id=WAREHOUSE,
+        plugin_cache=str(tmp_path),
+    )
+    contract = make_contract()
+    contract["exposes"] = [
+        {
+            "exposeId": "events",
+            "kind": "table",
+            "binding": {"platform": "kafka", "format": "json", "location": {"topic": "events"}},
+            "contract": {"schema": [{"name": "id", "type": "string"}]},
+        }
+    ]
+    contract["builds"] = [
+        {
+            "id": "b1",
+            "engine": "dbt",
+            "pattern": "embedded-logic",
+            "repository": "./",
+            "execution": {
+                "trigger": {"type": "manual"},
+                "runtime": {"platform": "databricks", "resources": {"host": "127.0.0.1:8999"}},
+            },
+        }
+    ]
+    rc, out = run_fluid(capfd, "generate", "iac", write_contract(tmp_path, contract))
+    assert rc != 0 and "databricks-host-in-contract" in out
+
+
 def test_fluid_validate_fails_closed_when_the_check_cannot_run(monkeypatch):
     from fluid_build.cli import validate as validate_cli
 
