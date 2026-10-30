@@ -41,6 +41,7 @@ class TestCanonicalCloud:
             ("BigQuery", "gcp"),
             ("snowflake", "snowflake"),
             ("confluent", "confluent"),
+            ("Databricks", "databricks"),
             ("duckdb", "local"),
             ("azure", ""),
             ("", ""),

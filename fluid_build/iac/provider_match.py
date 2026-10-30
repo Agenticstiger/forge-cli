@@ -73,6 +73,11 @@ PROVIDER_ALIASES = {
     # confluent`` auto-detects to the OpenTofu confluent plugin, matching its
     # entry in OPENTOFU_DEFAULT_PROVIDERS.
     "confluent": "confluent",
+    # Databricks Unity Catalog — ``binding.platform: databricks`` auto-detects
+    # to the OpenTofu databricks plugin. Without this entry the contract
+    # detects as no cloud at all and ``fluid apply`` falls back to the native
+    # path, which has no Databricks apply.
+    "databricks": "databricks",
     # ``local`` (and its DuckDB engine) is a recognised target but has no
     # OpenTofu plugin — it runs in-process. Detected so we can emit an
     # actionable error rather than the misleading "no supported cloud".
@@ -114,7 +119,7 @@ def canonical_cloud(token: object) -> str:
     """Map a raw contract platform/provider token to a canonical cloud name.
 
     Returns the canonical name (``aws``/``gcp``/``snowflake``/``confluent``/
-    ``local``) or ``""`` when the token is empty or unrecognised.
+    ``databricks``/``local``) or ``""`` when the token is empty or unrecognised.
     """
     if not isinstance(token, str):
         return ""
