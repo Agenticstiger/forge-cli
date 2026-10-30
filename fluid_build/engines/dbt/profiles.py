@@ -186,11 +186,12 @@ def _contract_expr(value: Any) -> Optional[str]:
         _logger.warning("profiles.yml: a contract value carries Jinja; not used")
         return None
     names = _ENV_VAR_JINJA_RE.findall(emitted)
-    secret = next((name for name in names if is_sensitive_key_name(name)), None)
-    if secret:
+    # The variable's NAME is logged, never a value.
+    refused = next((name for name in names if is_sensitive_key_name(name)), None)
+    if refused:
         _logger.warning(
             "profiles.yml: a contract value reads %s, a credential-shaped variable; not used",
-            secret,
+            refused,
         )
         return None
     return emitted
