@@ -884,7 +884,9 @@ def _enforce_data_loss_gate(
                 "--allow-data-loss to proceed"
             },
         )
-    # Past the gate, a loss means --allow-data-loss was given: audit it.
+    # Past the gate, only an override with a loss is left to audit.
+    if not allow_data_loss:
+        return
     if not (destroys > 0 or lost_in_place):
         return
     # Audit-trail: every destructive apply through the override is logged at
