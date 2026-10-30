@@ -474,12 +474,16 @@ class TestDatabricksExt2:
             result = _run(provider.login())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
-    @patch("os.path.exists", return_value=True)
     @patch("os.remove")
-    def test_logout_clears_config(self, mock_remove, _mock_exists):
-        provider = DatabricksAuthProvider({}, LOG)
+    def test_logout_removes_only_the_named_profile(self, mock_remove, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("DATABRICKS_CONFIG_FILE", raising=False)
+        cfg = tmp_path / ".databrickscfg"
+        cfg.write_text("[DEFAULT]\nhost = h\n\n[other]\nhost = o\n")
+        provider = DatabricksAuthProvider({"profile": "DEFAULT"}, LOG)
         assert _run(provider.logout()) is True
-        mock_remove.assert_called_once()
+        mock_remove.assert_not_called()
+        assert cfg.read_text() == "[other]\nhost = o\n"
 
     @patch("os.path.exists", return_value=False)
     def test_logout_no_config(self, _mock_exists):

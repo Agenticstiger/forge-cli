@@ -467,12 +467,23 @@ def register(subparsers: argparse._SubParsersAction):
     logout_parser = sp.add_parser(
         "logout",
         help="Logout from a provider",
-        description=f"Revoke credentials for a provider.\n\nAvailable providers: {_provider_names}",
+        description=(
+            f"Revoke credentials for a provider.\n\nAvailable providers: {_provider_names}\n\n"
+            "Databricks: ~/.databrickscfg holds every profile, so name the one to remove "
+            "(fluid auth logout databricks <profile>); the others are kept."
+        ),
     )
     logout_parser.add_argument(
         "provider",
         nargs="?",
         help=f"Provider to logout from ({_provider_names})",
+    )
+    # Not ``dest="profile"``: that is the global ``fluid --profile`` switch.
+    logout_parser.add_argument(
+        "config_profile",
+        nargs="?",
+        metavar="profile",
+        help="Databricks only: the ~/.databrickscfg profile to remove",
     )
     logout_parser.set_defaults(func=run)
 
@@ -577,7 +588,8 @@ def run(args, logger: logging.Logger) -> int:
                 logger.info("Example: fluid auth logout gcp")
                 return 1
 
-            return asyncio.run(handle_logout(provider, auth_manager, logger))
+            profile = getattr(args, "config_profile", None)
+            return asyncio.run(handle_logout(provider, auth_manager, logger, profile=profile))
 
         elif args.verb == "doctor":
             fix = getattr(args, "fix", False)
@@ -662,8 +674,21 @@ async def handle_login(provider: str, auth_manager: AuthManager, logger: logging
         return 1
 
 
-async def handle_logout(provider: str, auth_manager: AuthManager, logger: logging.Logger) -> int:
-    """Handle logout command"""
+async def handle_logout(
+    provider: str,
+    auth_manager: AuthManager,
+    logger: logging.Logger,
+    profile: Optional[str] = None,
+) -> int:
+    """Handle logout command; ``profile`` is the one ~/.databrickscfg profile to remove."""
+    if profile:
+        target = auth_manager.get_provider(provider)
+        if not isinstance(target, DatabricksAuthProvider):
+            logger.error(
+                f"❌ A profile applies to databricks only. Usage: fluid auth logout {provider}"
+            )
+            return 1
+        target.profile = profile
     try:
         success = await auth_manager.logout(provider)
 

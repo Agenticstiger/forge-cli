@@ -989,6 +989,9 @@ class DatabricksAuthProvider(AuthProvider):
         self.token = config.get("token")
         self.cluster_id = config.get("cluster_id")
         self.workspace_id = config.get("workspace_id")
+        # The one config-file profile logout may remove
+        # (``fluid auth logout databricks <profile>``).
+        self.profile = config.get("profile")
 
     def _validate_via_api(self, host: str, token: str) -> AuthResult:
         """Validate Databricks credentials via REST API (no CLI needed)."""
@@ -1193,18 +1196,42 @@ class DatabricksAuthProvider(AuthProvider):
             return AuthResult(provider=self.name, status=AuthStatus.ERROR, error_message=str(e))
 
     async def logout(self) -> bool:
-        """Logout from Databricks (clear stored configuration)"""
+        """Forget the Databricks credentials fluid saved, plus one named profile.
+
+        ``fluid auth login`` saves a host and token to the OS keyring; those
+        are fluid's own and always go. The config file
+        (``DATABRICKS_CONFIG_FILE``, else ``~/.databrickscfg``) belongs to the
+        Databricks CLI, SDK, dbt and terraform and holds every profile, so
+        only the profile named in ``config["profile"]`` is cut from it. With
+        no name, nothing in the file changes; the file is never deleted.
+        """
         try:
-            config_file = os.path.expanduser("~/.databrickscfg")
-            if os.path.exists(config_file):
-                os.remove(config_file)
-                self.logger.info("Databricks configuration cleared")
-            return True
+            from fluid_build.cli import _databrickscfg
+
+            forgot = self._forget_saved_credentials()
+            return _databrickscfg.drop_profile(self.profile, self.logger) and forgot
         except Exception as e:
+            self.logger.error("Failed to log out of Databricks: %s", redact_secret_text(str(e)))
+            return False
+
+    def _forget_saved_credentials(self) -> bool:
+        """Delete the host and token ``fluid auth login`` saved to the OS keyring."""
+        saved = [key for key in ("host", "token") if self._get_keyring_credential(key)]
+        if not saved:
+            return True
+        from fluid_build.credentials.keyring_store import KeyringCredentialStore
+
+        try:
+            for key in saved:
+                KeyringCredentialStore.delete_credential(f"{self.name}.{key}")
+        except Exception:
+            # Keyring backend errors can echo the credential: name the failure only.
             self.logger.error(
-                "Failed to clear Databricks configuration: %s", redact_secret_text(str(e))
+                "Could not remove the Databricks credentials fluid saved in the OS keyring."
             )
             return False
+        self.logger.info("Removed the Databricks credentials fluid saved in the OS keyring.")
+        return True
 
     async def check_auth(self) -> AuthResult:
         """Check Databricks auth — tries REST API first, CLI second."""
