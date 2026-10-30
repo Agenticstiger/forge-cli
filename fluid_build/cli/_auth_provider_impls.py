@@ -1176,7 +1176,10 @@ class DatabricksAuthProvider(AuthProvider):
                     if cfg_host and cfg_token:
                         result = self._validate_via_api(cfg_host, cfg_token)
                         if result.status == AuthStatus.AUTHENTICATED:
-                            return self._annotate_method(result, "~/.databrickscfg")
+                            return self._annotate_method(
+                                result,
+                                os.environ.get("DATABRICKS_CONFIG_FILE") or "~/.databrickscfg",
+                            )
                 except Exception:
                     pass
 
@@ -1270,7 +1273,10 @@ class DatabricksAuthProvider(AuthProvider):
                     if cfg_host and cfg_token:
                         result = self._validate_via_api(cfg_host, cfg_token)
                         if result.status == AuthStatus.AUTHENTICATED:
-                            return self._annotate_method(result, "~/.databrickscfg")
+                            return self._annotate_method(
+                                result,
+                                os.environ.get("DATABRICKS_CONFIG_FILE") or "~/.databrickscfg",
+                            )
                 except Exception:
                     pass
 

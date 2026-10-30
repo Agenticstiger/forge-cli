@@ -453,6 +453,33 @@ def test_status_reads_the_file_logout_edits(home, tmp_path, monkeypatch):
     assert hosts == ["https://team.cloud.databricks.com"]
 
 
+def test_status_names_the_file_it_read(home, tmp_path, monkeypatch):
+    from fluid_build.cli.auth import AuthResult, AuthStatus, DatabricksAuthProvider
+
+    team = tmp_path / "team.cfg"
+    team.write_text(
+        "[DEFAULT]\nhost = https://team.cloud.databricks.com\ntoken = dapi-fake-team\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(team))
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+    monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
+    provider = DatabricksAuthProvider({}, LOG)
+    monkeypatch.setattr(
+        provider,
+        "_validate_via_api",
+        lambda host, token: AuthResult(provider="databricks", status=AuthStatus.AUTHENTICATED),
+    )
+    result = asyncio.run(provider.check_auth())
+    assert result.auth_method == str(team)
+
+
+def test_a_none_option_is_no_option(home, monkeypatch):
+    # A caller that forwards profile=None to every provider is not refused.
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    assert asyncio.run(AuthManager({}, LOG).logout("aws", profile=None)) is True
+
+
 def test_default_profile_pointer_goes_with_its_profile():
     text = TWO_PROFILES + "\n[__settings__]\nauth_storage = secure\ndefault_profile = other\n"
     result = cfgfile.remove_profile(text, "other")

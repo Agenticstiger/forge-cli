@@ -398,8 +398,9 @@ class AuthManager:
         if not provider:
             self.logger.error(f"Provider '{provider_name}' not found")
             return False
+        options = {key: value for key, value in options.items() if value is not None}
         if options:
-            unsupported = sorted(set(options) - provider.logout_options)
+            unsupported = sorted(set(options) - getattr(provider, "logout_options", frozenset()))
             if unsupported:
                 self.logger.error(
                     f"❌ fluid auth logout {provider_name} takes no {', '.join(unsupported)}"

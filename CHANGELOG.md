@@ -87,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profiles is left alone and the command exits 1, listing them; `DATABRICKS_CONFIG_PROFILE` is
   quoted in that hint, never acted on. `DATABRICKS_CONFIG_FILE` names the file, as it does for
   the Databricks tools, and `fluid auth login` and `fluid auth status databricks` now read that
-  file too. An OAuth profile (`auth_type = databricks-cli`) is left to `databricks auth logout
+  file instead of `~/.databrickscfg` when it is set. An OAuth profile (`auth_type = databricks-cli`) is left to `databricks auth logout
   --profile=<name> --delete`, which clears its cached tokens too; a hard-linked file, or one that
   belongs to another user (a logout under sudo), is left as it is. Every logout also removes the
   host and token `fluid auth login` saved in the OS keyring, and fails if the keyring refuses. A
