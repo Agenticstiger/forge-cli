@@ -1381,12 +1381,6 @@ def test_f23_an_overlay_beside_the_contract_resolves_refs_relative_to_its_own_di
     assert loaded.overlay == (path.parent / candidate).resolve()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG F23-docs-lists-an-overlay-as-a-product: `fluid docs --src` globs "
-    "contract.fluid.*, which also matches the overlay candidate contract.fluid.<env>.yaml, and "
-    "writes it a page and an index row with no id",
-)
 def test_f23_docs_do_not_list_an_overlay_beside_the_contract_as_a_product(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:

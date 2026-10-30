@@ -15,18 +15,29 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import functools
 import glob
+import hashlib
 import html
+import io
 import json
 import logging
+import math
 import os
 import re
+import stat
+import time
 from typing import Any, Mapping
 
 from ._common import CLIError, load_contract_with_overlay
 from ._logging import info
 
 COMMAND = "docs"
+
+#: The file names a product's root contract has. ``--src`` lists these and nothing
+#: else: ``contract.fluid.<env>.yaml`` beside one is its overlay, not a product.
+_CONTRACT_FILE_NAMES = ("contract.fluid.yaml", "contract.fluid.yml", "contract.fluid.json")
 
 
 def register(subparsers: argparse._SubParsersAction):
@@ -52,44 +63,47 @@ def register(subparsers: argparse._SubParsersAction):
 
 def run(args, logger: logging.Logger) -> int:
     try:
-        os.makedirs(args.out, exist_ok=True)
-
-        paths = _resolve_contract_paths(args)
+        _check_out(args.out)
+        paths = _resolve_contract_paths(args, logger)
         # Load full contracts once so we can render both summaries and
         # per-contract drill-in pages without re-parsing.
-        loaded = [(p, *_load_contract_quiet(p, logger)) for p in paths]
-        entries = [_summarize_contract(p, c, error) for p, c, error in loaded]
-        # Sort by id for deterministic output.
-        entries.sort(key=lambda e: (e.get("id") or "", e.get("path", "")))
+        contracts = {p: _load_contract_quiet(p, logger) for p in paths}
+        entries = [_summarize_contract(p, c, err, logger) for p, (c, err) in contracts.items()]
+        # Sort by id for deterministic output. An id is whatever the contract
+        # holds, so it is compared as text: a number does not sort against a string.
+        entries.sort(key=lambda e: (str(e.get("id") or ""), str(e.get("path", ""))))
         # Two contracts with one id would write one page; each gets its own.
         slugs = _unique_slugs(entries)
 
+        # Everything is rendered, and encoded, before any file is opened, so a
+        # run that fails while rendering leaves the catalog the previous run
+        # wrote; _write_catalog keeps it for a run that fails while writing.
         # JSON index (machine-readable; existing consumers depend on it).
-        index_json_path = os.path.join(args.out, "index.json")
-        with open(index_json_path, "w", encoding="utf-8") as f:
-            json.dump(entries, f, indent=2)
+        # Strict JSON: _plain left no NaN or Infinity, and none may come back.
+        index_json = io.StringIO()
+        json.dump(entries, index_json, indent=2, allow_nan=False)
 
         # HTML index (human-readable). One static file; no external deps.
-        index_html_path = os.path.join(args.out, "index.html")
-        with open(index_html_path, "w", encoding="utf-8") as f:
-            f.write(_render_index_html(entries))
+        index_html = _render_index_html(entries)
 
-        # Per-contract drill-in pages. Slug derived from the contract id
-        # (falls back to a path hash). Each page links back to the index.
-        pages_written = 0
-        for path, contract, _error in loaded:
-            if not isinstance(contract, Mapping):
-                continue
-            page_path = os.path.join(args.out, f"contract-{slugs[path]}.html")
-            # Rendered before the file is opened: a contract that cannot be
-            # rendered leaves the page it had, not an empty one.
-            try:
-                page = _render_contract_html(contract, path)
-            except Exception as exc:  # noqa: BLE001 - one bad contract, not the catalog
-                raise ValueError(f"{path}: {exc}") from exc
-            with open(page_path, "w", encoding="utf-8") as f:
-                f.write(page)
-            pages_written += 1
+        pages = _render_pages(entries, contracts, slugs)
+
+        # Pages first and the index that links them last. A character UTF-8
+        # cannot hold (a lone surrogate) is written as its ``\uXXXX`` text:
+        # shown, never the end of the catalog.
+        _write_catalog(
+            args.out,
+            [
+                (name, text.encode("utf-8", "backslashreplace"))
+                for name, text in [
+                    *pages,
+                    ("index.json", index_json.getvalue()),
+                    ("index.html", index_html),
+                ]
+            ],
+        )
+        index_json_path = os.path.join(args.out, "index.json")
+        index_html_path = os.path.join(args.out, "index.html")
 
         info(
             logger,
@@ -97,51 +111,371 @@ def run(args, logger: logging.Logger) -> int:
             out=index_json_path,
             html=index_html_path,
             count=len(entries),
-            pages=pages_written,
+            pages=len(pages),
         )
         return 0
     except Exception as e:
         raise CLIError(1, "docs_failed", {"error": str(e)})
 
 
-def _resolve_contract_paths(args) -> list[str]:
+def _render_pages(
+    entries: list[dict[str, Any]],
+    contracts: dict[str, tuple[Any, Any]],
+    slugs: dict[str, str],
+) -> list[tuple[str, str]]:
+    """The per-contract drill-in pages, as ``(file name, html)``.
+
+    Slug derived from the contract id (falls back to the file name). Each page
+    links back to the index. Every contract has a row; a row with an error (the
+    contract did not load, or could not be listed) has no page.
+    """
+    pages: list[tuple[str, str]] = []
+    for entry in entries:
+        path = entry["path"]
+        contract = contracts[path][0]
+        if entry.get("error") or not isinstance(contract, Mapping):
+            continue
+        try:
+            # From the same plain data as its index row: no set, no NaN, no
+            # integer too long to turn into text reaches the page.
+            page = _render_contract_html(_plain(contract), path)
+        except Exception as exc:  # noqa: BLE001 - say which contract, not just what broke
+            raise ValueError(f"{path}: {exc}") from exc
+        pages.append((f"contract-{slugs[path]}.html", page))
+    return pages
+
+
+def _check_out(out: str) -> None:
+    """Refuse an ``--out`` the catalog cannot be written to, and do it at once.
+
+    Before any contract is read, not after the whole catalog is rendered, and
+    without making a directory: a run that fails leaves no ``--out`` behind.
+    """
+    if not out:  # --out "$OUT" with OUT unset
+        raise ValueError("--out is empty: name the directory to write the catalog to")
+    if os.path.lexists(out):
+        if not os.path.isdir(out):
+            raise NotADirectoryError(f"--out {out!r} is not a directory")
+        if not os.access(out, os.W_OK | os.X_OK):
+            raise PermissionError(f"--out {out!r} is a directory this user cannot write to")
+        return
+    # Up to the nearest directory there is, twice. Up --out as written, never as
+    # abspath() folds it, a part that is no directory (a file, a dangling symlink)
+    # stops it as it stops the mkdir. Up its real path, a ".." after a part not
+    # made yet lands where the OS takes it: "ro/inner/new/../../x" is made in ro.
+    for start in (out, os.path.realpath(out)):
+        nearest = _nearest_there(os.path.dirname(start) or os.curdir)
+        where = os.path.realpath(nearest)
+        if not os.path.isdir(nearest):
+            raise NotADirectoryError(f"--out {out!r} cannot be made: {where!r} is not a directory")
+        if not os.access(nearest, os.W_OK | os.X_OK):
+            raise PermissionError(
+                f"--out {out!r} cannot be made: {where!r} is a directory this user cannot write to"
+            )
+
+
+def _nearest_there(path: str) -> str:
+    """``path``, or the nearest of its parents that ``lstat`` finds."""
+    while not os.path.lexists(path):
+        parent = os.path.dirname(path) or os.curdir
+        if parent == path:
+            break
+        path = parent
+    return path
+
+
+def _write_catalog(out: str, files: list[tuple[str, bytes]]) -> None:
+    """Write each ``(name, content)`` of ``files`` into ``out``, in that order.
+
+    Every file is first written whole to a temp file beside it, and only when
+    all of them are does each replace its file. A run that fails before then
+    takes its temp files back, and each directory it made, and leaves every
+    file as the last run wrote it. A replace swaps the directory entry: a
+    symlink or a hard link planted in ``out`` is replaced, never written through.
+    """
+    made: list[tuple[str, int, int]] = []  # each directory this run made, in order
+    staged: list[tuple[str, str]] = []
+    done = False
+    try:
+        _make_dirs(out, made)
+        _remove_stale_temps(out, {name for name, _data in files})
+        for name, data in files:
+            target = os.path.join(out, name)
+            staged.append((_stage(target, data), target))
+        for temp, target in staged:
+            os.replace(temp, target)
+        done = True
+    finally:
+        if not done:  # whatever stopped it, an interrupt included
+            for temp, _target in staged:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp)
+            _take_back(made)
+
+
+def _make_dirs(path: str, made: list[tuple[str, int, int]]) -> None:
+    """``os.makedirs(path, exist_ok=True)``, one level at a time, adding each
+    directory it makes to ``made`` as soon as it is made, as its real path, device
+    and inode: a run that fails part-way takes back exactly those, wherever a
+    ``..`` after a symlink put them. One that ``lstat`` finds is not a directory
+    any more (a symlink swapped in for it) is not recorded."""
+    head, tail = os.path.split(path)
+    if not tail:
+        head, tail = os.path.split(head)
+    if head and tail and not os.path.exists(head):
+        _make_dirs(head, made)
+    try:
+        os.mkdir(path)
+    except OSError:
+        if not os.path.isdir(path):
+            raise
+    else:
+        made_now = os.lstat(path)
+        if stat.S_ISDIR(made_now.st_mode):
+            made.append((os.path.realpath(path), made_now.st_dev, made_now.st_ino))
+
+
+def _take_back(made: list[tuple[str, int, int]]) -> None:
+    """Remove the directories :func:`_make_dirs` made, the deepest first, each only
+    while ``lstat`` finds the very directory it made at its path (the same device
+    and inode): never one swapped in for it, nor a symlink's target."""
+    for real, dev, ino in reversed(made):
+        with contextlib.suppress(OSError):
+            now = os.lstat(real)
+            if stat.S_ISDIR(now.st_mode) and (now.st_dev, now.st_ino) == (dev, ino):
+                os.rmdir(real)
+
+
+#: The name :func:`_stage` gives a temp file: ``.<target name>.<16 hex>.tmp``.
+_TEMP_NAME = re.compile(r"\.(.+)\.[0-9a-f]{16}\.tmp")
+
+#: How long since it was last written before a temp file is taken for one a
+#: killed run left. A run between writing its temp files and moving them in
+#: has younger ones, and an hour is far longer than any run takes; git prune
+#: likewise removes a ``tmp_obj_`` file only once it is older than its expiry.
+_STALE_AFTER_SECONDS = 3600
+
+
+def _remove_stale_temps(out: str, names: set[str]) -> None:
+    """Remove the temp files a killed run left in ``out`` for any of ``names``.
+
+    A run killed between writing its temp files and replacing the catalog with
+    them (SIGKILL, a power cut) leaves them, and no later run would. Only a
+    regular file of this user, named exactly as :func:`_stage` names a temp
+    file of one of ``names``, and last written over an hour ago
+    (:data:`_STALE_AFTER_SECONDS`, far longer than a run takes, so never one
+    of a run still at work on this catalog), is removed: never a symlink, nor
+    a file of someone else's. Best effort: an ``out`` that cannot be listed is
+    left.
+    """
+    try:
+        with os.scandir(out) as listing:
+            entries = list(listing)
+    except OSError:
+        return
+    now = time.time()
+    for entry in entries:
+        temp = _TEMP_NAME.fullmatch(entry.name)
+        if temp is None or temp.group(1) not in names:
+            continue
+        with contextlib.suppress(OSError):  # gone already, or not ours to look at
+            found = entry.stat(follow_symlinks=False)
+            stale = now - found.st_mtime > _STALE_AFTER_SECONDS
+            if stat.S_ISREG(found.st_mode) and _mine(found) and stale:
+                os.unlink(entry.path)
+
+
+def _mine(st: os.stat_result) -> bool:
+    """Whether what ``st`` describes is this process's: owned by its effective uid,
+    the owner of every file it makes (never, where there are no uids)."""
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid is not None and st.st_uid == geteuid()
+
+
+def _stage(target: str, data: bytes) -> str:
+    """``data`` in a new temp file in ``target``'s directory; the temp file's path.
+
+    Made by ``open(temp, "xb")``, so ``O_EXCL``, with the mode ``open()`` gives a
+    new file, the umask's (not mkstemp's ``0o600``: the catalog is there to be
+    served); or with the mode of the file it will replace when that file is this
+    user's own and has no other name, never a mode someone else chose. That mode
+    goes to the ``open(2)`` itself, so the file is never wider than it, and is set
+    again on the open descriptor, never by path, so a symlink renamed over the
+    temp name meanwhile is not followed: a mode is kept only where there are
+    uids, and every such system has ``os.fchmod``. A directory where the file
+    goes is refused here, before any file of the catalog is replaced.
+    """
+    try:
+        current = os.lstat(target)
+    except FileNotFoundError:
+        current = None
+    if current is not None and stat.S_ISDIR(current.st_mode):
+        raise IsADirectoryError(f"{target} is a directory")
+    own: int | None = None
+    if (
+        current is not None
+        and stat.S_ISREG(current.st_mode)
+        and _mine(current)
+        and current.st_nlink == 1
+    ):
+        own = current.st_mode & 0o777
+    directory, name = os.path.split(target)
+    temp = os.path.join(directory, f".{name}.{os.urandom(8).hex()}.tmp")
+    opener = None if own is None else functools.partial(os.open, mode=own)
+    try:
+        # "x" is O_EXCL: never an existing file, nor a symlink someone put at this name.
+        with open(temp, "xb", opener=opener) as handle:
+            if own is not None:  # the bits the umask took off, before a byte is written
+                os.fchmod(handle.fileno(), own)
+            handle.write(data)
+    except FileExistsError:
+        raise  # not ours to remove
+    except BaseException:
+        # The name is new and random, so a file there is the one the open(2) made;
+        # open() closes its descriptor itself when it fails after the open(2).
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
+    return temp
+
+
+def _resolve_contract_paths(args, logger: logging.Logger) -> list[str]:
     """Resolve the set of contract files to summarize.
 
     ``--files`` wins when present (explicit glob mode); otherwise fall
-    back to the recursive scan under ``--src``.
+    back to the recursive scan under ``--src`` (:func:`_root_contracts`).
     """
     files_glob = getattr(args, "files", None)
     if files_glob:
         return sorted(glob.glob(files_glob, recursive=True))
-    return sorted(glob.glob(f"{args.src}/**/contract.fluid.*", recursive=True))
+    return _root_contracts(args.src, logger)
 
 
-def _summarize_contract(path: str, contract: Any, error: Any = None) -> dict[str, Any]:
+def _root_contracts(src: str, logger: logging.Logger) -> list[str]:
+    """Every root contract (:data:`_CONTRACT_FILE_NAMES`, never the overlay
+    beside one) under ``src``, sorted, each file once.
+
+    ``src`` is walked, not globbed, so a ``[`` in its name is a character and
+    not a pattern that matches nothing. A symlinked directory is not followed:
+    two links to ``.`` were a walk without end, and a link out of ``src``
+    listed what is outside it. A hidden directory is skipped, as the glob
+    skipped it. A root contract that is a symlink is listed when the file it
+    names is inside ``src`` and not listed by its own path already.
+    """
+    top = os.path.normcase(os.path.join(os.path.realpath(src), ""))
+    candidates: list[str] = []
+    for directory, dirs, names in os.walk(src):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for d in dirs:
+            if os.path.islink(os.path.join(directory, d)):
+                logger.debug("docs_src_link_not_followed: %s", os.path.join(directory, d))
+        candidates += [os.path.join(directory, n) for n in names if n in _CONTRACT_FILE_NAMES]
+    listed: dict[str, str] = {}
+    # A file by its own path before by a symlink to it.
+    for path in sorted(candidates, key=lambda p: (os.path.islink(p), p)):
+        real = os.path.realpath(path)
+        if not os.path.normcase(real).startswith(top):
+            logger.debug("docs_contract_outside_src: %s -> %s", path, real)
+        elif real not in listed:
+            listed[real] = path
+    return sorted(listed.values())
+
+
+#: What an integer too long to turn into text is shown as. A YAML hex literal can
+#: hold one of more digits than Python turns into text (4300), and json writes an
+#: integer as its text.
+_TOO_LONG = "(an integer too long to show)"
+
+
+def _plain(value: Any) -> Any:
+    """``value`` as data strict JSON can hold, so one odd value cannot end the catalog.
+
+    A YAML set becomes a list in a fixed order. ``.nan`` and ``.inf``, which
+    strict JSON has no token for, and what JSON has no type for (a YAML date)
+    become their text, and an integer too long to turn into text becomes
+    :data:`_TOO_LONG`. A key that is not a string is spelled as json spells a
+    key (``true``, ``false``, ``null``, a number: what index.json has always
+    had), or, when JSON has no key of its type, as its text.
+    """
+    if isinstance(value, Mapping):
+        return {_key(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted([_plain(v) for v in value], key=_set_order)
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        try:
+            str(value)
+        except ValueError:
+            return _TOO_LONG
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    return str(value)
+
+
+def _key(key: Any) -> str:
+    """A mapping key as text: as json spells a key of its type, or its own text."""
+    if isinstance(key, str):
+        return key
+    if key is None or isinstance(key, (bool, float)):
+        return json.dumps(key)  # null, true, false, 1.5, NaN
+    return str(_plain(key))
+
+
+def _set_order(value: Any) -> tuple[str, str]:
+    """Where a member of a set is listed: by its text, then by its type (``1``, ``"1"``)."""
+    return str(value), type(value).__name__
+
+
+def _items(value: Any) -> list[Any]:
+    """The entries of a list-valued key; a value that is not a list holds none."""
+    return value if isinstance(value, list) else []
+
+
+def _count(value: Any) -> int:
+    """How many entries a list-valued key holds."""
+    return len(_items(value))
+
+
+def _summarize_contract(
+    path: str, contract: Any, error: Any, logger: logging.Logger
+) -> dict[str, Any]:
     """Extract a small set of header fields for the index.
 
-    The JSON keeps the contract's own values (``description`` and ``owner``
-    may be objects); the HTML renders them as text.
+    The JSON keeps the contract's own values as plain data (:func:`_plain`):
+    ``description`` and ``owner`` may be objects; the HTML renders them as
+    text. A contract that did not load, or whose values cannot be listed,
+    gets a row with its ``error`` and no ``id``: one bad contract is not the
+    catalog. One that could not be listed is logged at DEBUG with its path
+    and the traceback.
     """
     if not isinstance(contract, Mapping):
         return {"path": path, "id": None, "error": error or "not a mapping"}
 
-    metadata = contract.get("metadata") if isinstance(contract.get("metadata"), Mapping) else {}
-    return {
-        "path": path,
-        "slug": _slug_for(contract, path),
-        "id": contract.get("id"),
-        "name": contract.get("name"),
-        "description": contract.get("description"),
-        "fluidVersion": contract.get("fluidVersion"),
-        "kind": contract.get("kind"),
-        "owner": metadata.get("owner"),
-        "domain": contract.get("domain") or metadata.get("domain"),
-        "layer": metadata.get("layer"),
-        "productType": metadata.get("productType"),
-        "tags": contract.get("tags") or metadata.get("tags"),
-        "exposes_count": len(contract.get("exposes") or []),
-        "consumes_count": len(contract.get("consumes") or []),
-    }
+    try:
+        metadata = contract.get("metadata") if isinstance(contract.get("metadata"), Mapping) else {}
+        return {
+            "path": path,
+            "slug": _slug_for(contract, path),
+            "id": _plain(contract.get("id")),
+            "name": _plain(contract.get("name")),
+            "description": _plain(contract.get("description")),
+            "fluidVersion": _plain(contract.get("fluidVersion")),
+            "kind": _plain(contract.get("kind")),
+            "owner": _plain(metadata.get("owner")),
+            "domain": _plain(contract.get("domain") or metadata.get("domain")),
+            "layer": _plain(metadata.get("layer")),
+            "productType": _plain(metadata.get("productType")),
+            "tags": _plain(contract.get("tags") or metadata.get("tags")),
+            "exposes_count": _count(contract.get("exposes")),
+            "consumes_count": _count(contract.get("consumes")),
+        }
+    except Exception as exc:  # noqa: BLE001 - one odd contract, not the catalog
+        logger.debug("docs_contract_not_listed: %s: %s", path, exc, exc_info=True)
+        return {"path": path, "id": None, "error": f"not listed: {exc}"}
 
 
 def _load_contract_quiet(path: str, logger: logging.Logger) -> tuple[Any, Any]:
@@ -160,10 +494,15 @@ def _load_contract_quiet(path: str, logger: logging.Logger) -> tuple[Any, Any]:
 
 
 def _unique_slugs(entries: list[dict[str, Any]]) -> dict[str, str]:
-    """A page slug per contract path, in index order, with no two the same."""
+    """A page slug per contract path, in index order, with no two the same.
+
+    A row with an ``error`` has no page, so it takes no page name.
+    """
     taken: set[str] = set()
     out: dict[str, str] = {}
     for entry in entries:
+        if entry.get("error"):
+            continue
         base = entry.get("slug") or "contract"
         slug, n = base, 1
         while slug in taken:
@@ -211,18 +550,31 @@ def _description_text(description: Any) -> str:
     return "" if description is None else str(description)
 
 
+#: The longest page slug. A longer one is cut short and ends in ``-`` and 8 hex
+#: digits of the SHA-256 of the whole id, so a page name stays far under the 255
+#: bytes a file name may have and two long ids that start alike still get a page
+#: each. The cap is the default of pants' ``safe_filename``; the hash that ends a
+#: cut slug is kubespawner's ``strip_and_hash``.
+_MAX_SLUG = 100
+_SLUG_HASH = 8
+
+
 def _slug_for(contract: Mapping[str, Any], path: str) -> str:
     """Stable, URL-safe slug for a contract — used as the per-page filename.
 
-    Prefers ``contract.id``; falls back to the file stem when id is absent
-    so we still produce a meaningful filename. All lower-cased; consecutive
-    non-alphanumerics collapse to a single hyphen.
+    Prefers ``contract.id``; falls back to the file stem when id is absent,
+    or not a string, so we still produce a meaningful filename. All
+    lower-cased; consecutive non-alphanumerics collapse to a single hyphen;
+    at most :data:`_MAX_SLUG` long.
     """
     raw = contract.get("id") if isinstance(contract, Mapping) else None
     if not isinstance(raw, str) or not raw:
         raw = os.path.splitext(os.path.basename(path))[0]
-    slug = _SLUG_RE.sub("-", raw.lower()).strip("-")
-    return slug or "contract"
+    slug = _SLUG_RE.sub("-", raw.lower()).strip("-") or "contract"
+    if len(slug) <= _MAX_SLUG:
+        return slug
+    whole = hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{slug[: _MAX_SLUG - _SLUG_HASH - 1].rstrip('-')}-{whole[:_SLUG_HASH]}"
 
 
 def _render_index_html(entries: list[dict[str, Any]]) -> str:
@@ -236,6 +588,9 @@ def _render_index_html(entries: list[dict[str, Any]]) -> str:
     """
     rows = []
     for e in entries:
+        if e.get("error"):
+            rows.append(_error_row_html(e))
+            continue
         tags = e.get("tags") or []
         tag_html = (
             " ".join(f'<span class="tag">{html.escape(str(t))}</span>' for t in tags)
@@ -261,7 +616,7 @@ def _render_index_html(entries: list[dict[str, Any]]) -> str:
                 layer,
                 product_type,
                 _description_text(e.get("description")),
-                " ".join(tags) if isinstance(tags, list) else "",
+                " ".join(str(t) for t in tags) if isinstance(tags, list) else "",
                 e.get("path"),
             ]
         ).lower()
@@ -289,8 +644,25 @@ def _render_index_html(entries: list[dict[str, Any]]) -> str:
     return _INDEX_HTML_TEMPLATE.format(count=len(entries), rows=rows_html)
 
 
+def _error_row_html(entry: dict[str, Any]) -> str:
+    """The row of a contract that is in the catalog without a page: what went
+    wrong with it, in place of the cells it has no values for, and no link."""
+    path, error = str(entry.get("path", "")), str(entry.get("error"))
+    search = html.escape(f"{error} {path}".lower())
+    return (
+        f'<tr class="error" data-search="{search}">'
+        "<td>—</td>"
+        f'<td colspan="8" class="error">{html.escape(error)}</td>'
+        f"<td><code>{html.escape(path)}</code></td>"
+        "</tr>"
+    )
+
+
 def _render_contract_html(contract: Mapping[str, Any], path: str) -> str:
-    """Render a single per-contract page with full schema + lineage detail."""
+    """Render a single per-contract page with full schema + lineage detail.
+
+    ``contract`` is plain data (:func:`_plain`), as :func:`run` passes it.
+    """
     metadata = contract.get("metadata") if isinstance(contract.get("metadata"), Mapping) else {}
     cid = contract.get("id") or "—"
     cname = contract.get("name") or cid
@@ -320,14 +692,14 @@ def _render_contract_html(contract: Mapping[str, Any], path: str) -> str:
 
     # --- Exposes (one section per exposed dataset) ---
     expose_sections: list[str] = []
-    for idx, expose in enumerate(contract.get("exposes") or []):
+    for idx, expose in enumerate(_items(contract.get("exposes"))):
         if not isinstance(expose, Mapping):
             continue
         expose_sections.append(_render_expose_html(expose, idx))
     exposes_html = "\n".join(expose_sections) or "<p><em>No exposed datasets.</em></p>"
 
     # --- Consumes ---
-    consumes = contract.get("consumes") or []
+    consumes = _items(contract.get("consumes"))
     consumes_rows = []
     for c in consumes:
         if not isinstance(c, Mapping):
@@ -367,12 +739,14 @@ def _columns(expose: Mapping[str, Any]) -> list[Any]:
 
 def _column_row_html(col: Mapping[str, Any]) -> str:
     """One column as a table row. Nullable follows ``required`` (0.7.x), else
-    the legacy ``nullable``; PII follows ``sensitivity``, or the legacy ``pii``."""
+    the legacy ``nullable``; PII follows ``sensitivity``, or the legacy ``pii``.
+    A sensitivity is one level, a string: a list or a mapping there marks nothing."""
     if "required" in col:
         nullable = "no" if col.get("required") else "yes"
     else:
         nullable = "yes" if col.get("nullable", True) is not False else "no"
-    personal = col.get("pii") or col.get("sensitivity") in _PERSONAL_DATA
+    sensitivity = col.get("sensitivity")
+    personal = col.get("pii") or (isinstance(sensitivity, str) and sensitivity in _PERSONAL_DATA)
     pii_marker = '<span class="pii" aria-label="contains PII">PII</span>' if personal else ""
     return (
         "<tr>"
@@ -429,6 +803,7 @@ _BASE_STYLE = """
           padding: 0.05rem 0.35rem; border-radius: 3px; font-size: 0.75rem;
           font-weight: 600; }}
   .empty {{ text-align: center; color: #57606a; padding: 2rem; }}
+  td.error {{ color: #b91c1c; }}
   .search {{ width: 100%; max-width: 30rem; padding: 0.4rem 0.6rem;
              border: 1px solid #d0d7de; border-radius: 6px;
              font-size: 0.9rem; margin-bottom: 1rem; }}

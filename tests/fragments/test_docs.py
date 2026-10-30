@@ -26,11 +26,16 @@ shows a defect found while writing these tests; the reason names it.
 from __future__ import annotations
 
 import datetime
+import errno
+import hashlib
 import json
+import logging
 import os
 import re
+import stat
 import subprocess
 import sys
+import time
 import types
 from collections import Counter
 from html.parser import HTMLParser
@@ -284,6 +289,37 @@ def _elements(page: str) -> _Elements:
     return parser
 
 
+class _Rows(HTMLParser):
+    """Every table row of a page: its attributes, and each cell's tag, colspan and text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: List[Dict[str, Any]] = []
+        self._cell: Optional[Dict[str, Any]] = None
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag == "tr":
+            self.rows.append({"attrs": dict(attrs), "cells": []})
+        elif tag in ("td", "th") and self.rows:
+            span = int(dict(attrs).get("colspan") or 1)
+            self._cell = {"tag": tag, "span": span, "text": ""}
+            self.rows[-1]["cells"].append(self._cell)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("td", "th"):
+            self._cell = None
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell["text"] += data
+
+
+def _rows(page: str) -> List[Dict[str, Any]]:
+    parser = _Rows()
+    parser.feed(page)
+    return parser.rows
+
+
 # ── J-01 ────────────────────────────────────────────────────────────────
 
 
@@ -484,6 +520,26 @@ def test_j03_the_legacy_nullable_and_pii_keys_are_a_fallback_for_old_contracts(
     assert rows["both"][2] == "no"
 
 
+def test_j03_a_sensitivity_that_is_not_one_level_marks_nothing_and_the_page_renders(
+    tmp_path: Path,
+) -> None:
+    """The schema's ``sensitivityLevel`` is one string. A list or a mapping there raised
+    ``unhashable type`` and ended the whole catalog."""
+    columns = [
+        {"name": "listed", "type": "string", "sensitivity": ["pii", "financial"]},
+        {"name": "mapped", "type": "string", "sensitivity": {"level": "pii"}},
+        {"name": "email", "type": "string", "sensitivity": "pii"},
+    ]
+    doc = _min_doc("cols.odd")
+    doc["exposes"][0]["contract"]["schema"] = columns
+    _put(tmp_path / "p" / "contract.fluid.yaml", doc)
+
+    assert _docs(tmp_path / "p" / "contract.fluid.yaml", tmp_path / "site") == 0
+
+    (section,) = _sections(_page(tmp_path / "site", "cols-odd"))
+    assert {r[0]: r[3] for r in section["rows"]} == {"listed": "", "mapped": "", "email": "PII"}
+
+
 def test_j03_every_shipped_example_shows_the_columns_it_declares(tmp_path: Path) -> None:
     from fluid_build.loader import compose_contract
 
@@ -555,11 +611,6 @@ def test_j04_the_error_rows_name_the_file_and_what_failed(tmp_path: Path) -> Non
     assert sorted(r["id"] for r in good) == ["good.a", "good.d"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG DOCS-HTML-ROW: index.html links a contract that failed to load to "
-    "contract-contract.html, a page the run never writes, and shows no error for it",
-)
 def test_j04_every_page_the_html_index_links_to_exists(tmp_path: Path) -> None:
     _batch(tmp_path / "src")
     out = tmp_path / "site"
@@ -568,6 +619,168 @@ def test_j04_every_page_the_html_index_links_to_exists(tmp_path: Path) -> None:
     links = re.findall(r'href="(contract-[^"]*\.html)"', (out / "index.html").read_text("utf-8"))
     assert links
     assert [link for link in links if not (out / link).is_file()] == []
+
+
+@pytest.mark.parametrize("suffix", [".yaml", ".yml", ".json"])
+def test_f23_docs_src_lists_a_root_contract_of_each_suffix_and_never_its_overlay(
+    tmp_path: Path, suffix: str
+) -> None:
+    """``contract.fluid.<env>.<suffix>`` beside a root contract is an overlay (the loader's
+    candidate ``<stem>.<env>.<suffix>``), whatever its suffix."""
+    src = tmp_path / "src"
+    document = _min_doc(f"suffix.{suffix[1:]}")
+    root = src / "p" / f"contract.fluid{suffix}"
+    root.parent.mkdir(parents=True)
+    root.write_text(
+        json.dumps(document) if suffix == ".json" else yaml.safe_dump(document), encoding="utf-8"
+    )
+    (src / "p" / f"contract.fluid.prod{suffix}").write_text("{}\n", encoding="utf-8")
+    (src / "p" / "overlays").mkdir()
+    (src / "p" / "overlays" / f"test{suffix}").write_text("{}\n", encoding="utf-8")
+    out = tmp_path / "site"
+
+    assert _docs(src, out, src=True) == 0
+
+    assert [Path(r["path"]).name for r in _index(out)] == [f"contract.fluid{suffix}"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+def test_f23_docs_src_does_not_follow_a_symlinked_directory(tmp_path: Path) -> None:
+    """Two links to ``.`` in --src made the glob walk without end, and a link out of --src
+    listed the contracts outside it. In a subprocess with a timeout: a loop would hang."""
+    src = tmp_path / "src"
+    _put(src / "p" / "contract.fluid.yaml", _min_doc("inside.one"))
+    _put(tmp_path / "elsewhere" / "q" / "contract.fluid.yaml", _min_doc("outside.one"))
+    (src / "loop1").symlink_to(".")
+    (src / "loop2").symlink_to(".")
+    (src / "link-out").symlink_to(tmp_path / "elsewhere")
+
+    done = _run_cli(
+        ["docs", "--src", str(src), "--out", str(tmp_path / "site")], tmp_path, timeout=60
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert [r["path"] for r in _index(tmp_path / "site")] == [
+        str(src / "p" / "contract.fluid.yaml")
+    ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+def test_f23_docs_src_lists_a_contract_once_and_never_one_that_links_out_of_src(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from fluid_build.cli import docs_build
+
+    src = tmp_path / "src"
+    orders = _put(src / "orders" / "contract.fluid.yaml", _min_doc("orders.one"))
+    (src / "alias").mkdir()
+    (src / "alias" / "contract.fluid.yaml").symlink_to(orders)
+    outside = _put(tmp_path / "elsewhere" / "contract.fluid.yaml", _min_doc("outside.one"))
+    (src / "leak").mkdir()
+    (src / "leak" / "contract.fluid.yaml").symlink_to(outside)
+    (src / "linked-dir").symlink_to(tmp_path / "elsewhere")
+    logger = logging.getLogger("test.docs.src")
+    caplog.set_level(logging.DEBUG, logger=logger.name)
+    args = types.SimpleNamespace(src=str(src), files=None, out=str(tmp_path / "site"))
+
+    assert docs_build.run(args, logger) == 0
+
+    assert [r["path"] for r in _index(tmp_path / "site")] == [str(orders)]
+    said = [r.getMessage() for r in caplog.records]
+    assert f"docs_src_link_not_followed: {src / 'linked-dir'}" in said
+    assert any(m.startswith(f"docs_contract_outside_src: {src / 'leak'}") for m in said)
+
+
+def test_f23_docs_src_is_a_directory_name_and_never_a_pattern(tmp_path: Path) -> None:
+    """``--src 'my [team] products'`` was a glob character class, so the catalog came out
+    empty without a word."""
+    src = tmp_path / "my [team] products"
+    _put(src / "p" / "contract.fluid.yaml", _min_doc("team.one"))
+    out = tmp_path / "site"
+
+    assert _docs(src, out, src=True) == 0
+
+    assert [r["id"] for r in _index(out)] == ["team.one"]
+
+
+def test_f23_docs_src_skips_a_hidden_directory_as_the_glob_did(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    _put(src / "p" / "contract.fluid.yaml", _min_doc("shown.one"))
+    _put(src / ".cache" / "p" / "contract.fluid.yaml", _min_doc("hidden.one"))
+    out = tmp_path / "site"
+
+    assert _docs(src, out, src=True) == 0
+
+    assert [r["id"] for r in _index(out)] == ["shown.one"]
+
+
+def test_j04_a_contract_that_failed_has_a_row_in_the_html_index_that_says_why(
+    tmp_path: Path,
+) -> None:
+    dirs = _batch(tmp_path / "src")
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    page = (out / "index.html").read_text("utf-8")
+    failed = re.findall(r'<tr class="error".*?</tr>', page, re.S)
+
+    assert len(failed) == 2
+    for row, directory in zip(failed, (dirs["B"], dirs["C"]), strict=True):  # in path order
+        assert "<a " not in row, "a row with no page has no link"
+        assert f"{directory.name}/contract.fluid.yaml" in row
+    assert "./missing.yaml" in failed[0] and "not loaded:" in failed[1]
+    assert page.count("<tr ") == 4  # one row per contract; the header row has no attributes
+
+
+def test_j04_the_error_of_a_row_is_escaped_in_the_html_index(tmp_path: Path) -> None:
+    _put(tmp_path / "ok" / "contract.fluid.yaml", _min_doc("ok.one"))
+    _write(tmp_path / "bad" / "contract.fluid.yaml", "fluidVersion: <script>alert(1)</script>: [\n")
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    page = (out / "index.html").read_text("utf-8")
+    assert "<script>alert(1)" not in page
+    assert _elements(page).tags.count("script") == 1  # the filter's own
+
+
+def test_j04_an_error_row_spans_the_header_and_the_filter_finds_it_by_its_error(
+    tmp_path: Path,
+) -> None:
+    _batch(tmp_path / "src")
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    rows = _rows((out / "index.html").read_text("utf-8"))
+    (header,) = [r for r in rows if r["cells"] and {c["tag"] for c in r["cells"]} == {"th"}]
+    failed = [r for r in rows if r["attrs"].get("class") == "error"]
+    by_dir = {Path(r["path"]).parent.name: r for r in _index(out)}
+
+    assert len(header["cells"]) == 10 and len(failed) == 2
+    for row, name in zip(failed, "BC", strict=True):  # in path order
+        path, error = by_dir[name]["path"], by_dir[name]["error"]
+        cells = row["cells"]
+        assert {c["tag"] for c in cells} == {"td"}
+        assert sum(c["span"] for c in cells) == len(header["cells"])
+        assert error in [c["text"] for c in cells]
+        assert cells[-1]["text"] == path  # the path in a cell of its own, the last
+        assert row["attrs"]["data-search"] == f"{error} {path}".lower()
+
+
+def test_j04_an_error_row_takes_no_page_name_from_a_contract_that_sorts_after_it(
+    tmp_path: Path,
+) -> None:
+    """A row with an error sorts first (it has no id) and has no page. Were it given a page
+    name it would take ``contract``, and the contract whose id is ``contract`` would lose it."""
+    _write(tmp_path / "broken" / "contract.fluid.yaml", "fluidVersion: [\n")
+    _put(tmp_path / "real" / "contract.fluid.yaml", _min_doc("contract"))
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    assert [r.get("slug") for r in _index(out)] == [None, "contract"]
+    assert [p.name for p in out.glob("contract-*.html")] == ["contract-contract.html"]
+    assert 'href="contract-contract.html"' in (out / "index.html").read_text("utf-8")
 
 
 # ── J-05 ────────────────────────────────────────────────────────────────
@@ -756,11 +969,6 @@ def test_j07_a_page_that_cannot_be_rendered_keeps_the_page_it_had(
     assert page.read_bytes() == before
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG DOCS-INDEX-TRUNCATED: index.html is opened for writing before it is rendered, "
-    "so a render failure leaves the previous catalog page empty (J-07's guard covers pages only)",
-)
 def test_j07_an_index_html_that_cannot_be_rendered_keeps_the_one_it_had(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -780,11 +988,6 @@ def test_j07_an_index_html_that_cannot_be_rendered_keeps_the_one_it_had(
     assert (out / "index.html").read_bytes() == before
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG DOCS-INDEX-TRUNCATED: index.json is streamed into an open file, so a failure "
-    "part-way leaves the previous index cut off and no longer valid JSON",
-)
 def test_j07_an_index_json_that_cannot_be_written_keeps_the_one_it_had(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -804,6 +1007,683 @@ def test_j07_an_index_json_that_cannot_be_written_keeps_the_one_it_had(
     assert _docs(contract, out) != 0
 
     assert (out / "index.json").read_bytes() == before
+
+
+def test_j07_a_run_that_fails_on_one_page_leaves_every_file_of_the_catalog_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pages are rendered before any file is written: the contract whose page does render is
+    not rewritten, nor is the index, when the next one cannot be."""
+    from fluid_build.cli import docs_build
+
+    first = _put(tmp_path / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    _put(tmp_path / "c" / "contract.fluid.yaml", _min_doc("keep.c"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path, out, src=True) == 0
+    before = _tree(out)
+    _put(first, _min_doc("keep.a", name="Renamed since the last run"))
+    render = docs_build._render_contract_html
+
+    def fails_for_c(contract: Any, path: str) -> str:
+        if "keep.c" in str(contract.get("id")):
+            raise RuntimeError("cannot render")
+        return render(contract, path)
+
+    monkeypatch.setattr(docs_build, "_render_contract_html", fails_for_c)
+
+    assert _docs(tmp_path, out, src=True) != 0
+
+    assert _tree(out) == before
+
+
+def test_j07_a_run_that_fails_to_write_a_file_leaves_every_file_of_the_catalog_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that fails (a full disk) leaves no file cut short and none replaced: each file
+    goes to a temp file beside it first, and the temp files replace the catalog only when every
+    one of them is written."""
+    from fluid_build.cli import docs_build
+
+    first = _put(tmp_path / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    _put(tmp_path / "c" / "contract.fluid.yaml", _min_doc("keep.c"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path, out, src=True) == 0
+    before = _tree(out)
+    _put(first, _min_doc("keep.a", name="Renamed since the last run"))
+    stage, staged = docs_build._stage, []
+
+    def full_on_the_third(target: str, data: bytes) -> str:
+        staged.append(target)
+        if len(staged) == 3:
+            raise OSError(errno.ENOSPC, "No space left on device", target)
+        return stage(target, data)
+
+    monkeypatch.setattr(docs_build, "_stage", full_on_the_third)
+
+    assert _docs(tmp_path, out, src=True) != 0
+
+    assert len(staged) == 3
+    assert _tree(out) == before  # and no temp file is left beside them
+
+
+def test_j07_a_temp_file_open_made_but_could_not_wrap_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``open()`` failing after its open(2) made the file (out of memory, say) left the
+    temp file behind. open() closes its own descriptor; the temp file is removed."""
+    from fluid_build.cli import docs_build
+
+    real_open = open
+
+    def made_then_failed(*args: Any, **kwargs: Any) -> Any:
+        real_open(*args, **kwargs).close()  # the open(2) succeeded, then open() failed
+        raise MemoryError
+
+    monkeypatch.setattr(docs_build, "open", made_then_failed, raising=False)
+    with pytest.raises(MemoryError):
+        docs_build._stage(str(tmp_path / "index.html"), b"<html></html>")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_j07_a_file_already_at_the_temp_name_is_left_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O_EXCL refuses a name that is taken, and what is there is not this run's to remove."""
+    from fluid_build.cli import docs_build
+
+    monkeypatch.setattr(docs_build.os, "urandom", bytes)
+    taken = tmp_path / f".index.html.{bytes(8).hex()}.tmp"
+    taken.write_bytes(b"someone else's")
+    with pytest.raises(FileExistsError):
+        docs_build._stage(str(tmp_path / "index.html"), b"<html></html>")
+    assert taken.read_bytes() == b"someone else's"
+
+
+def test_j07_an_interrupt_while_writing_takes_back_what_the_run_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C between two staged files is no Exception, and is taken back all the same."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "new" / "site"
+    stage, staged = docs_build._stage, []
+
+    def interrupted_on_the_second(target: str, data: bytes) -> str:
+        staged.append(target)
+        if len(staged) == 2:
+            raise KeyboardInterrupt
+        return stage(target, data)
+
+    monkeypatch.setattr(docs_build, "_stage", interrupted_on_the_second)
+    with pytest.raises(KeyboardInterrupt):
+        docs_build._write_catalog(str(out), [("a.html", b"a"), ("b.html", b"b")])
+    assert not (tmp_path / "new").exists()  # the temp file and the directories it made
+
+
+def test_j07_a_name_utf8_cannot_hold_is_shown_as_text_and_the_catalog_written(
+    tmp_path: Path,
+) -> None:
+    """A lone surrogate (``"\\ud800"`` in YAML) failed the write of index.html after the file
+    was opened, and left it empty. It is written as its ``\\ud800`` text instead."""
+    _put(tmp_path / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path, out, src=True) == 0
+    odd = yaml.safe_dump(_min_doc("odd.name", name="ODD"), sort_keys=False)
+    _write(tmp_path / "b" / "contract.fluid.yaml", odd.replace("ODD", '"bad \\ud800 char"'))
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    assert sorted(_tree(out)) == [
+        "contract-keep-a.html",
+        "contract-odd-name.html",
+        "index.html",
+        "index.json",
+    ]
+    for page in ("index.html", "contract-odd-name.html"):
+        assert "bad \\ud800 char" in (out / page).read_text(encoding="utf-8")
+    assert [r["name"] for r in _index(out)] == ["keep.a", "bad \ud800 char"]
+
+
+def test_j07_a_long_id_names_a_page_well_under_the_file_name_limit(tmp_path: Path) -> None:
+    """An id of 242 characters or more named a page over the 255 bytes a file name may have,
+    and its write failed after the index linking it was rewritten. The slug is cut to 100
+    characters and ends in a hash of the whole id, so two ids that start alike get a page each."""
+    ids = ["long." + "x" * 295, "long." + "x" * 294 + "y"]
+    for n, cid in enumerate(ids):
+        _put(tmp_path / f"p{n}" / "contract.fluid.yaml", _min_doc(cid))
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    slugs = {r["id"]: r["slug"] for r in _index(out)}
+    for cid in ids:
+        digest = hashlib.sha256(cid.encode("utf-8")).hexdigest()[:8]
+        assert slugs[cid] == "long-" + "x" * 86 + f"-{digest}"
+        assert (out / f"contract-{slugs[cid]}.html").is_file()
+    links = re.findall(r'href="(contract-[^"]*\.html)"', (out / "index.html").read_text("utf-8"))
+    assert sorted(links) == sorted(f"contract-{slug}.html" for slug in slugs.values())
+
+
+def test_j07_a_directory_where_a_page_goes_fails_the_run_before_any_file_is_replaced(
+    tmp_path: Path,
+) -> None:
+    first = _put(tmp_path / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path, out, src=True) == 0
+    _put(first, _min_doc("keep.a", name="Renamed since the last run"))
+    _put(tmp_path / "b" / "contract.fluid.yaml", _min_doc("keep.b"))
+    (out / "contract-keep-b.html").mkdir()
+    before = _tree(out)
+
+    assert _docs(tmp_path, out, src=True) != 0
+
+    assert _tree(out) == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+def test_j07_a_symlink_planted_in_out_is_replaced_and_never_written_through(
+    tmp_path: Path,
+) -> None:
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    out.mkdir()
+    victim = _write(tmp_path / "victim.txt", "not the catalog's\n")
+    (out / "index.html").symlink_to(victim)
+
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    assert victim.read_text(encoding="utf-8") == "not the catalog's\n"
+    assert not (out / "index.html").is_symlink()
+    assert "<title>Fluid Contracts Catalog</title>" in (out / "index.html").read_text("utf-8")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+@pytest.mark.parametrize("kept", [0o640, 0o664], ids=oct)
+def test_j07_a_new_file_gets_the_mode_the_umask_gives_and_a_replaced_one_keeps_its_own(
+    tmp_path: Path, kept: int
+) -> None:
+    """Not mkstemp's 0o600: the catalog is there to be served. The umask (0o022) takes 0o020
+    off 0o664 when the temp file is made, so that mode is kept only by setting it again."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    umask = os.umask(0o022)
+    try:
+        assert _docs(tmp_path / "src", out, src=True) == 0
+        modes = {p.name: stat.S_IMODE(p.stat().st_mode) for p in out.iterdir()}
+        (out / "index.html").chmod(kept)
+        assert _docs(tmp_path / "src", out, src=True) == 0
+    finally:
+        os.umask(umask)
+
+    assert modes == dict.fromkeys(["contract-keep-a.html", "index.html", "index.json"], 0o644)
+    assert stat.S_IMODE((out / "index.html").stat().st_mode) == kept
+    assert stat.S_IMODE((out / "index.json").stat().st_mode) == 0o644
+
+
+class _OsWith:
+    """The ``os`` module with some of its functions replaced, for docs_build alone."""
+
+    def __init__(self, **replaced: Any) -> None:
+        self.__dict__.update(replaced)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(os, name)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes and symlinks")
+def test_j07_a_symlink_renamed_over_a_temp_file_never_gets_the_kept_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kept mode was set by path after the temp file was opened, so a symlink renamed over
+    the temp name in between took it: a 0600 secret.key became 0777. It is set on the open
+    descriptor now."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+    (out / "index.html").chmod(0o777)  # the next run keeps this mode
+    secret = _write(tmp_path / "secret.key", "key\n")
+    secret.chmod(0o600)
+
+    def swap_after_open(path: str, flags: int, mode: int = 0o777, **kw: Any) -> int:
+        fd = os.open(path, flags, mode, **kw)
+        if os.path.basename(path).startswith(".index.html."):
+            (tmp_path / "swap").symlink_to(secret)
+            os.replace(tmp_path / "swap", path)
+        return fd
+
+    monkeypatch.setattr(docs_build, "os", _OsWith(open=swap_after_open))
+
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    assert stat.S_IMODE(secret.stat().st_mode) == 0o600
+    assert secret.read_text(encoding="utf-8") == "key\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+@pytest.mark.parametrize("whose", ["a-file-with-a-second-name", "another-users-file"])
+def test_j07_a_replaced_file_keeps_its_mode_only_when_it_is_this_users_with_one_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, whose: str
+) -> None:
+    """A mode someone else chose (their file, or a hard link to one) is not given to a page."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    umask = os.umask(0o022)
+    try:
+        assert _docs(tmp_path / "src", out, src=True) == 0
+        (out / "index.html").chmod(0o666)
+        if whose == "a-file-with-a-second-name":
+            os.link(out / "index.html", tmp_path / "second-name.html")
+        else:
+            monkeypatch.setattr(docs_build, "os", _OsWith(geteuid=lambda: os.geteuid() + 1))
+        assert _docs(tmp_path / "src", out, src=True) == 0
+    finally:
+        os.umask(umask)
+
+    assert stat.S_IMODE((out / "index.html").stat().st_mode) == 0o644
+
+
+@pytest.mark.skipif(os.name == "nt", reason="file owners")
+def test_j07_the_files_of_the_effective_uid_are_this_runs_whatever_the_real_uid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process owns the files it makes by its effective uid. Compared with the real uid, a
+    setuid run took its own catalog for someone else's: no mode kept, no temp file removed."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    umask = os.umask(0o022)
+    try:
+        assert _docs(tmp_path / "src", out, src=True) == 0
+        (out / "index.html").chmod(0o664)
+        stale = _write(out / ".index.json.0123456789abcdef.tmp", "left by a killed run\n")
+        os.utime(stale, (time.time() - 7200, time.time() - 7200))
+        monkeypatch.setattr(docs_build, "os", _OsWith(getuid=lambda: os.getuid() + 1))
+        assert _docs(tmp_path / "src", out, src=True) == 0
+    finally:
+        os.umask(umask)
+
+    assert stat.S_IMODE((out / "index.html").stat().st_mode) == 0o664
+    assert not stale.exists()
+
+
+_REPLACED_IN_ORDER = [
+    "contract-keep-a.html",
+    "contract-keep-b.html",
+    "contract-keep-c.html",
+    "index.json",
+    "index.html",
+]
+
+
+@pytest.mark.parametrize("failing", [1, 2, 3, 4, 5, None])
+def test_j07_a_replace_that_fails_leaves_no_dead_link_and_no_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: Optional[int]
+) -> None:
+    """Every page replaces its file before index.json and index.html do, so a replace that
+    fails (EBUSY on the Nth) leaves an index whose every link is to a page that is there, and
+    the temp files not yet moved are removed. With the index first, a failure at the first page
+    would leave the new index linking a page never written."""
+    from fluid_build.cli import docs_build
+
+    first = _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    _put(tmp_path / "src" / "c" / "contract.fluid.yaml", _min_doc("keep.c"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+    _put(first, _min_doc("keep.a", name="Renamed since the last run"))
+    _put(tmp_path / "src" / "b" / "contract.fluid.yaml", _min_doc("keep.b"))  # a new page
+    replaced: List[str] = []
+
+    def busy_on_the_nth(src: str, dst: str) -> None:
+        if len(replaced) + 1 == failing:
+            raise OSError(errno.EBUSY, "Device or resource busy", dst)
+        os.replace(src, dst)
+        replaced.append(os.path.basename(dst))
+
+    monkeypatch.setattr(docs_build, "os", _OsWith(replace=busy_on_the_nth))
+
+    assert (_docs(tmp_path / "src", out, src=True) == 0) is (failing is None)
+
+    assert replaced == _REPLACED_IN_ORDER[: None if failing is None else failing - 1]
+    links = re.findall(r'href="(contract-[^"]*\.html)"', (out / "index.html").read_text("utf-8"))
+    assert links and [link for link in links if not (out / link).is_file()] == []
+    assert not list(out.glob(".*.tmp"))
+
+
+def _docs_error(source: Path, out: Any) -> str:
+    """The error ``fluid docs --src <source> --out <out>`` stops with."""
+    from fluid_build.cli import docs_build
+    from fluid_build.cli._common import CLIError
+
+    args = types.SimpleNamespace(src=str(source), files=None, out=str(out))
+    with pytest.raises(CLIError) as failed:
+        docs_build.run(args, logging.getLogger("test.docs"))
+    assert failed.value.event == "docs_failed"
+    return str(failed.value.context["error"])
+
+
+def _no_contract_read(monkeypatch: pytest.MonkeyPatch) -> List[str]:
+    from fluid_build.cli import docs_build
+
+    read: List[str] = []
+    monkeypatch.setattr(docs_build, "_load_contract_quiet", lambda path, logger: read.append(path))
+    return read
+
+
+@pytest.mark.parametrize("where", ["a-file", "a-file/site"])
+def test_j07_an_out_that_cannot_be_a_directory_is_refused_before_any_contract_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """An --out that names a file, or a directory under one, was reported only once every
+    contract had been loaded and rendered (33 s on a big catalog), at the first write."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    _write(tmp_path / "a-file", "not a directory\n")
+    read = _no_contract_read(monkeypatch)
+
+    error = _docs_error(tmp_path / "src", tmp_path / where)
+
+    assert error.startswith(f"--out {str(tmp_path / where)!r} ") and "not a directory" in error
+    assert read == []
+    assert (tmp_path / "a-file").read_text(encoding="utf-8") == "not a directory\n"
+
+
+def test_j07_an_empty_out_is_refused_before_any_contract_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--out "$OUT"`` with OUT unset passed the up-front check, and the run failed only once
+    the whole catalog was loaded and rendered, with ``No such file or directory: ''``."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    read = _no_contract_read(monkeypatch)
+
+    error = _docs_error(tmp_path / "src", "")
+
+    assert error == "--out is empty: name the directory to write the catalog to"
+    assert read == []
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, not root")
+@pytest.mark.parametrize("where", ["locked", "locked/site", "locked/site/deeper"])
+def test_j07_an_out_this_user_cannot_write_to_is_refused_before_any_contract_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o555)
+    read = _no_contract_read(monkeypatch)
+    try:
+        error = _docs_error(tmp_path / "src", tmp_path / where)
+    finally:
+        locked.chmod(0o755)
+
+    assert error.startswith(f"--out {str(tmp_path / where)!r} ") and "cannot write to" in error
+    assert read == []
+    assert list(locked.iterdir()) == []
+
+
+def test_j07_a_first_run_that_fails_to_write_leaves_no_out_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+
+    def full(target: str, data: bytes) -> str:
+        raise OSError(errno.ENOSPC, "No space left on device", target)
+
+    monkeypatch.setattr(docs_build, "_stage", full)
+
+    assert _docs(tmp_path / "src", tmp_path / "new" / "deeper" / "site", src=True) != 0
+
+    assert [p.name for p in tmp_path.iterdir()] == ["src"]
+
+
+def test_j07_a_first_run_whose_out_cannot_be_made_whole_leaves_none_of_it_behind(
+    tmp_path: Path,
+) -> None:
+    """os.makedirs ran outside the cleanup: a name too long three levels down failed it after
+    new1/ and new1/new2/ were made, and those were left."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "new1" / "new2" / ("x" * 300) / "site"
+
+    assert _docs(tmp_path / "src", out, src=True) != 0
+
+    assert [p.name for p in tmp_path.iterdir()] == ["src"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+def test_j07_a_failed_first_run_takes_back_a_directory_made_through_a_symlink_and_dotdot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--out L/../made`` with ``L`` a symlink makes ``made`` beside L's target, not beside
+    L: the directory to take back is the one the OS made, by its real path."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    (tmp_path / "elsewhere" / "sub").mkdir(parents=True)
+    (tmp_path / "L").symlink_to(tmp_path / "elsewhere" / "sub")
+
+    def full(target: str, data: bytes) -> str:
+        raise OSError(errno.ENOSPC, "No space left on device", target)
+
+    monkeypatch.setattr(docs_build, "_stage", full)
+
+    assert _docs(tmp_path / "src", tmp_path / "L" / ".." / "made", src=True) != 0
+
+    assert [p.name for p in (tmp_path / "elsewhere").iterdir()] == ["sub"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["L", "elsewhere", "src"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+@pytest.mark.parametrize(
+    ("when", "users"),
+    [("right-after-its-mkdir", ""), ("after-the-tree-is-made", "b/site")],
+)
+def test_j07_a_failed_run_never_takes_back_a_directory_swapped_in_for_one_it_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, when: str, users: str
+) -> None:
+    """The cleanup removed each directory by the real path recorded after its mkdir. With
+    ``--out shared/a/b/site``, a symlink swapped in for ``a`` right after its mkdir (to an
+    empty directory of the user's) had that directory removed; one swapped in once the tree
+    was made had the user's ``b/site`` under it removed. A directory is removed now only
+    while lstat finds the very one the run made (the same device and inode)."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    shared, victim = tmp_path / "shared", tmp_path / "victim"
+    shared.mkdir()
+    (victim / users).mkdir(parents=True)  # the user's own, and empty
+    top = shared / "a"
+
+    def swap() -> None:
+        os.rename(top, shared / "a-moved")
+        top.symlink_to(victim)
+
+    def mkdir_then_swap(path: Any, *args: Any, **kwargs: Any) -> None:
+        os.mkdir(path, *args, **kwargs)
+        if when == "right-after-its-mkdir" and os.fspath(path) == str(top):
+            swap()
+
+    def swap_then_fail(target: str, data: bytes) -> str:
+        if when == "after-the-tree-is-made" and not top.is_symlink():
+            swap()
+        raise OSError(errno.ENOSPC, "No space left on device", target)
+
+    monkeypatch.setattr(docs_build, "os", _OsWith(mkdir=mkdir_then_swap))
+    monkeypatch.setattr(docs_build, "_stage", swap_then_fail)
+
+    assert _docs(tmp_path / "src", top / "b" / "site", src=True) != 0
+
+    assert (victim / users).is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, not root")
+def test_j07_an_out_through_a_symlink_and_dotdot_is_checked_where_it_would_be_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """abspath() folded ``L/../made`` to a directory beside L, so the up-front check looked
+    at the wrong parent and the run failed only after the whole catalog was rendered."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    (tmp_path / "elsewhere" / "sub").mkdir(parents=True)
+    (tmp_path / "L").symlink_to(tmp_path / "elsewhere" / "sub")
+    (tmp_path / "elsewhere").chmod(0o555)
+    read = _no_contract_read(monkeypatch)
+    try:
+        error = _docs_error(tmp_path / "src", tmp_path / "L" / ".." / "made")
+    finally:
+        (tmp_path / "elsewhere").chmod(0o755)
+
+    assert f"{str(tmp_path / 'elsewhere')!r} is a directory this user cannot write to" in error
+    assert read == []
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, not root")
+def test_j07_an_out_with_dotdot_after_a_part_not_made_yet_is_checked_where_it_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ro/inner/new/../../x`` is made in ``ro``: the walk up as written stopped at the
+    writable ``ro/inner``, so a read-only ``ro`` failed the run only after the render."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    (tmp_path / "ro" / "inner").mkdir(parents=True)
+    (tmp_path / "ro").chmod(0o555)
+    read = _no_contract_read(monkeypatch)
+    try:
+        error = _docs_error(tmp_path / "src", tmp_path / "ro/inner/new/../../x")
+    finally:
+        (tmp_path / "ro").chmod(0o755)
+
+    assert f"{str(tmp_path / 'ro')!r} is a directory this user cannot write to" in error
+    assert read == []
+    assert [p.name for p in (tmp_path / "ro" / "inner").iterdir()] == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a privilege on Windows")
+@pytest.mark.parametrize("where", ["dangling/site", "a-file/../site"])
+def test_j07_an_out_through_a_part_that_is_no_directory_is_refused_before_any_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """The real path of ``dangling/site`` is under the missing target, whose nearest
+    parent is writable, and that of ``a-file/../site`` folds the file away: only the walk up
+    the path as written meets the part no directory can be made under."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    (tmp_path / "dangling").symlink_to(tmp_path / "nowhere")
+    _write(tmp_path / "a-file", "not a directory\n")
+    read = _no_contract_read(monkeypatch)
+
+    error = _docs_error(tmp_path / "src", tmp_path / where)
+
+    assert error.startswith(f"--out {str(tmp_path / where)!r} cannot be made: ")
+    assert error.endswith(" is not a directory") and read == []
+
+
+_LEFT_BY_A_KILLED_RUN = [
+    ".index.html.0123456789abcdef.tmp",
+    ".index.json.fedcba9876543210.tmp",
+    ".contract-keep-a.html.00000000000000aa.tmp",
+]
+_NOT_A_TEMP_OF_THIS_RUN = [
+    ".index.html.ABCDEF0123456789.tmp",  # not the hex the temp names have
+    ".index.html.0123456789abcde.tmp",  # 15 digits
+    ".contract-gone.html.0123456789abcdef.tmp",  # no file of this run has that name
+    "index.html.0123456789abcdef.tmp",  # not hidden
+    "notes.txt",
+]
+
+
+def _left_behind(path: Path, seconds_ago: float = 7200) -> Path:
+    """A file last written ``seconds_ago`` (by default two hours ago, by a killed run)."""
+    _write(path, "left behind\n")
+    then = time.time() - seconds_ago
+    os.utime(path, (then, then))
+    return path
+
+
+@pytest.mark.skipif(os.name == "nt", reason="file owners and symlinks")
+def test_j07_a_run_removes_the_temp_files_a_killed_run_left_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """A run killed between writing its temp files and replacing the catalog (SIGKILL at
+    os.replace) left ``.<name>.<16 hex>.tmp`` files that no later run removed. The next run
+    removes those of its own file names, when they are regular files of this user last
+    written over an hour ago."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+    for name in _LEFT_BY_A_KILLED_RUN + _NOT_A_TEMP_OF_THIS_RUN:
+        _left_behind(out / name)
+    victim = _write(tmp_path / "victim.txt", "not the catalog's\n")
+    link = out / ".index.html.1111111111111111.tmp"
+    link.symlink_to(victim)
+    then = time.time() - 7200
+    os.utime(link, (then, then), follow_symlinks=False)  # as old as a killed run's: only a link
+
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    assert sorted(p.name for p in out.iterdir()) == sorted(
+        [*_NOT_A_TEMP_OF_THIS_RUN, ".index.html.1111111111111111.tmp"]
+        + ["contract-keep-a.html", "index.html", "index.json"]
+    )
+    assert victim.read_text(encoding="utf-8") == "not the catalog's\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="file owners")
+def test_j07_a_temp_file_of_another_user_is_left_where_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+    for name in _LEFT_BY_A_KILLED_RUN:
+        _left_behind(out / name)
+    monkeypatch.setattr(docs_build, "os", _OsWith(geteuid=lambda: os.geteuid() + 1))
+
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    assert set(_LEFT_BY_A_KILLED_RUN) <= {p.name for p in out.iterdir()}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="file owners")
+def test_j07_a_temp_file_written_within_the_hour_is_a_live_runs_and_is_left(
+    tmp_path: Path,
+) -> None:
+    """The sweep took the temp files of a run of the same user writing the same --out at that
+    moment (which then failed at its first replace). It takes only a temp file last written
+    over an hour ago: one of 61 minutes goes, one of 59 stays."""
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+    out = tmp_path / "site"
+    assert _docs(tmp_path / "src", out, src=True) == 0
+    old = _left_behind(out / ".index.json.0123456789abcdef.tmp", seconds_ago=61 * 60)
+    live = _left_behind(out / ".index.json.fedcba9876543210.tmp", seconds_ago=59 * 60)
+    fresh = _left_behind(out / ".index.html.00000000000000aa.tmp", seconds_ago=0)
+
+    assert _docs(tmp_path / "src", out, src=True) == 0
+
+    assert not old.exists()
+    assert live.exists() and fresh.exists()
+
+
+def test_j07_a_first_run_that_fails_to_render_leaves_no_out_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--out is made only once every file is rendered."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "src" / "a" / "contract.fluid.yaml", _min_doc("keep.a"))
+
+    def boom(contract: Any, path: str) -> str:
+        raise RuntimeError("cannot render")
+
+    monkeypatch.setattr(docs_build, "_render_contract_html", boom)
+
+    assert _docs(tmp_path / "src", tmp_path / "site", src=True) != 0
+
+    assert [p.name for p in tmp_path.iterdir()] == ["src"]
 
 
 # ── J-08 ────────────────────────────────────────────────────────────────
@@ -974,6 +1854,14 @@ def test_j12_a_pointer_to_an_overlay_only_node_is_an_error_row_without_an_env(
 
 # ── robustness: one odd value must not cost the catalog (spec 10) ───────
 
+
+def _odd_column(**column: Any) -> Dict[str, Any]:
+    """The ``exposes`` of :func:`_min_doc` with one column whose keys are ``column``."""
+    expose = _min_doc()["exposes"][0]
+    expose["contract"] = {"schema": [{"name": "c", "type": "string", **column}]}
+    return {"exposes": [expose]}
+
+
 _ODD = [
     pytest.param({"id": 123}, id="integer-id"),
     pytest.param({"id": True}, id="boolean-id"),
@@ -986,17 +1874,18 @@ _ODD = [
         {"metadata": {"owner": {"team": "t", "since": datetime.date(2024, 1, 1)}}},
         id="owner-with-a-yaml-date",
     ),
+    pytest.param(_odd_column(sensitivity=["pii", "financial"]), id="sensitivity-a-list"),
+    pytest.param(_odd_column(sensitivity={"level": "pii"}), id="sensitivity-a-mapping"),
+    pytest.param({"name": float("nan"), "tags": [float("-inf")]}, id="yaml-nan-and-inf"),
+    pytest.param({"tags": {"b", "a"}}, id="tags-a-yaml-set"),
+    pytest.param(
+        {"metadata": {"owner": {"team": "t", False: "no", True: "yes", None: "~"}}},
+        id="owner-with-yaml-1.1-bool-and-null-keys",
+    ),
 ]
 
 
 @pytest.mark.parametrize("odd", _ODD)
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG DOCS-ABORT: a contract holding a value of an unexpected type (non-string id, "
-    "non-string tags, a YAML date, exposes that is not a list) makes fluid docs fail as a whole "
-    "('docs_failed', naming no contract), against spec 10: one bad contract does not abort the "
-    "catalog",
-)
 def test_j04x_one_contract_with_an_odd_value_does_not_abort_the_catalog(
     tmp_path: Path, odd: Dict[str, Any]
 ) -> None:
@@ -1008,6 +1897,141 @@ def test_j04x_one_contract_with_an_odd_value_does_not_abort_the_catalog(
 
     assert (out / "contract-good-one.html").is_file()
     assert len(_index(out)) == 2
+
+
+def test_j04x_a_contract_with_odd_values_is_listed_with_them_as_text(tmp_path: Path) -> None:
+    _put(tmp_path / "good" / "contract.fluid.yaml", _min_doc("good.one"))
+    _put(
+        tmp_path / "odd" / "contract.fluid.yaml",
+        _min_doc(
+            "odd.one",
+            id=123,
+            tags=[1, datetime.date(2024, 1, 1)],
+            exposes=5,
+            consumes=5,
+            metadata={"owner": {"team": "t", datetime.date(2024, 1, 2): "a date for a key"}},
+        ),
+    )
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    (row,) = [r for r in _index(out) if r["id"] == 123]
+    assert row["tags"] == [1, "2024-01-01"]
+    assert row["exposes_count"] == row["consumes_count"] == 0
+    assert row["owner"] == {"team": "t", "2024-01-02": "a date for a key"}
+    assert "error" not in row
+    page = _page(out, row["slug"])
+    assert "No exposed datasets." in page and "No upstream products." in page
+    index = (out / "index.html").read_text("utf-8")
+    assert '<span class="tag">1</span>' in index and '<span class="tag">2024-01-01</span>' in index
+
+
+def test_j04x_a_contract_whose_row_cannot_be_made_is_an_error_row_and_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The last-resort ``except`` in the summary kept the catalog but said nothing, so a fault
+    there would hide a contract without a trace. It is now logged at DEBUG with its path."""
+    from fluid_build.cli import docs_build
+
+    _put(tmp_path / "a" / "contract.fluid.yaml", _min_doc("good.a"))
+    odd = _put(tmp_path / "b" / "contract.fluid.yaml", _min_doc("odd.b"))
+    _put(tmp_path / "c" / "contract.fluid.yaml", _min_doc("good.c"))
+    slug_for = docs_build._slug_for
+
+    def fails_for_b(contract: Any, path: str) -> str:
+        if contract.get("id") == "odd.b":
+            raise RuntimeError("cannot list this one")
+        return slug_for(contract, path)
+
+    monkeypatch.setattr(docs_build, "_slug_for", fails_for_b)
+    logger = logging.getLogger("test.docs.summary")
+    caplog.set_level(logging.DEBUG, logger=logger.name)
+    out = tmp_path / "site"
+    args = types.SimpleNamespace(src=str(tmp_path), files=None, out=str(out))
+
+    assert docs_build.run(args, logger) == 0
+
+    rows = {Path(r["path"]).parent.name: r for r in _index(out)}
+    assert (rows["b"]["id"], rows["b"]["error"]) == (None, "not listed: cannot list this one")
+    assert sorted(p.name for p in out.glob("contract-*.html")) == [
+        "contract-good-a.html",
+        "contract-good-c.html",
+    ]
+    (row,) = re.findall(r'<tr class="error".*?</tr>', (out / "index.html").read_text("utf-8"), re.S)
+    assert "not listed: cannot list this one" in row and "b/contract.fluid.yaml" in row
+    (record,) = [r for r in caplog.records if "docs_contract_not_listed" in r.getMessage()]
+    assert record.levelno == logging.DEBUG and record.exc_info is not None
+    assert record.getMessage() == f"docs_contract_not_listed: {odd}: cannot list this one"
+
+
+_YAML_ODDITIES = """\
+fluidVersion: "0.7.6"
+kind: DataProduct
+id: odd.yaml
+name: .nan
+domain: ops
+description: {purpose: .inf, usage: -.inf}
+tags: !!set {charlie: null, alpha: null, bravo: null}
+metadata:
+  layer: Silver
+  owner: {team: t, NO: norway, yes: affirmative, ~: nothing, 1.5: a float}
+"""
+
+
+def _strict_json(text: str) -> Any:
+    def refuse(token: str) -> None:
+        raise ValueError(f"{token} is not JSON")
+
+    return json.loads(text, parse_constant=refuse)
+
+
+def test_j04x_index_json_is_strict_json_whatever_yaml_values_a_contract_holds(
+    tmp_path: Path,
+) -> None:
+    """``.nan`` and ``.inf`` were written as ``NaN`` and ``Infinity``, which strict JSON parsers
+    reject; a ``!!set`` as ``str(set)``, in hash order; and the YAML 1.1 keys ``NO``, ``yes``
+    and ``~`` as ``False``, ``True`` and ``None`` where index.json has always had ``false``,
+    ``true`` and ``null``, json's own spelling."""
+    _write(tmp_path / "odd" / "contract.fluid.yaml", _YAML_ODDITIES)
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    (row,) = _strict_json((out / "index.json").read_text(encoding="utf-8"))
+    assert row["name"] == "nan"
+    assert row["description"] == {"purpose": "inf", "usage": "-inf"}
+    assert row["tags"] == ["alpha", "bravo", "charlie"]
+    assert row["owner"] == {
+        "team": "t",
+        "false": "norway",
+        "true": "affirmative",
+        "null": "nothing",
+        "1.5": "a float",
+    }
+    index = (out / "index.html").read_text("utf-8")
+    assert '<span class="tag">alpha</span> <span class="tag">bravo</span>' in index
+
+
+def test_j04x_an_integer_too_long_to_turn_into_text_is_listed_and_shown_as_a_note(
+    tmp_path: Path,
+) -> None:
+    """A YAML hex literal can hold an integer of more digits than Python turns into text
+    (4300): it ended the sort of the index, its JSON, and its page."""
+    _put(tmp_path / "good" / "contract.fluid.yaml", _min_doc("good.one"))
+    text = yaml.safe_dump(_min_doc("HUGE"), sort_keys=False).replace("HUGE", "0x" + "f" * 4000)
+    _write(tmp_path / "huge" / "contract.fluid.yaml", text)
+    out = tmp_path / "site"
+
+    assert _docs(tmp_path, out, src=True) == 0
+
+    rows = _index(out)
+    assert [(r["id"], r["name"]) for r in rows] == [
+        ("(an integer too long to show)", "(an integer too long to show)"),
+        ("good.one", "good.one"),
+    ]
+    page = _page(out, rows[0]["slug"])
+    assert "<h1>(an integer too long to show)</h1>" in page
 
 
 # ── J-14 ────────────────────────────────────────────────────────────────
