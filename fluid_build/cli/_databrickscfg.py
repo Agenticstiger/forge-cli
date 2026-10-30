@@ -43,9 +43,10 @@ SETTINGS_SECTION = "__settings__"
 # check in ``remove_profile``.
 _HEADER = re.compile(r"\[(?P<name>.+)\]")
 _DEFAULT_PROFILE = re.compile(r"\s*default_profile\s*[=:]\s*(?P<value>.*?)\s*$")
-# The Databricks CLI and Go SDK read the file with go-ini, whose
-# SpaceBeforeInlineComment ends a value at a "#" or ";" after whitespace.
-_INLINE_COMMENT = re.compile(r"\s[#;]")
+# The Databricks CLI and Go SDK read the file with go-ini: with
+# SpaceBeforeInlineComment a value ends at " #" or " ;", and then loses one
+# pair of surrounding quotes (go-ini parser.go readValue).
+_INLINE_COMMENT = re.compile(r" [#;]")
 _COMMENT_PREFIXES = ("#", ";")
 
 
@@ -234,5 +235,10 @@ def _names_default(line: str, profile: str) -> bool:
 
 
 def _value(raw: str) -> str:
-    """A value as the Databricks CLI reads it, up to an inline comment."""
-    return _INLINE_COMMENT.split(raw, 1)[0].strip()
+    """A value as the Databricks CLI reads it: no inline comment, no quotes."""
+    value = _INLINE_COMMENT.split(raw, 1)[0].strip()
+    quote = value[:1]
+    if quote in ("'", '"') and len(value) > 1 and value.endswith(quote):
+        if quote not in value[1:-1]:
+            value = value[1:-1]
+    return value

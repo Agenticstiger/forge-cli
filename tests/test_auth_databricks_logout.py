@@ -31,7 +31,7 @@ import stat
 import keyring
 import pytest
 from keyring.backend import KeyringBackend
-from keyring.errors import KeyringError
+from keyring.errors import KeyringError, PasswordDeleteError
 
 from fluid_build.cli import _databrickscfg as cfgfile
 from fluid_build.cli.auth import AuthManager
@@ -276,16 +276,17 @@ def test_keyring_is_cleared_even_when_the_file_is_left_alone(home):
 
 
 class _Keyring(KeyringBackend):
-    """An in-memory keyring whose reads or deletes fail, like a locked one."""
+    """An in-memory keyring that fails like a locked one, or like the macOS
+    backend, which raises PasswordDeleteError for "not found" and "denied" alike."""
 
     priority = 1  # type: ignore[assignment]
 
-    def __init__(self, *, reads_fail=False, deletes_fail=False):
+    def __init__(self, *, saved=True, reads_fail=False, deletes_fail=None):
         super().__init__()
-        self.store = {
-            ("fluid-cli", "databricks.host"): "https://saved.cloud.databricks.com",
-            ("fluid-cli", "databricks.token"): "dapi-fake-saved",
-        }
+        self.store = {}
+        if saved:
+            self.store[("fluid-cli", "databricks.host")] = "https://saved.cloud.databricks.com"
+            self.store[("fluid-cli", "databricks.token")] = "dapi-fake-saved"
         self.reads_fail, self.deletes_fail = reads_fail, deletes_fail
 
     def get_password(self, service, username):
@@ -298,8 +299,10 @@ class _Keyring(KeyringBackend):
 
     def delete_password(self, service, username):
         if self.deletes_fail:
-            raise KeyringError("locked")
-        self.store.pop((service, username), None)
+            raise self.deletes_fail("denied")
+        if (service, username) not in self.store:
+            raise PasswordDeleteError("not found")
+        del self.store[(service, username)]
 
 
 def test_a_keyring_that_cannot_read_is_still_cleared(home):
@@ -309,12 +312,19 @@ def test_a_keyring_that_cannot_read_is_still_cleared(home):
     assert backend.store == {}
 
 
-def test_a_keyring_that_cannot_delete_fails_the_logout(home, caplog):
-    backend = _Keyring(deletes_fail=True)
+def test_an_empty_keyring_that_reports_not_found_is_a_clean_logout(home):
+    keyring.set_keyring(_Keyring(saved=False))
+    assert _logout("other") is True
+
+
+@pytest.mark.parametrize("error", [KeyringError, PasswordDeleteError])
+def test_a_keyring_that_refuses_the_delete_fails_the_logout(home, caplog, error):
+    backend = _Keyring(deletes_fail=error)
     keyring.set_keyring(backend)
     with caplog.at_level(logging.INFO):
         assert _logout("other") is False
     assert "Could not remove the Databricks host and token" in caplog.text
+    assert "Removed the Databricks credentials" not in caplog.text
     assert "dapi-fake-saved" not in caplog.text
 
 
@@ -375,9 +385,10 @@ def test_default_profile_pointer_goes_with_its_profile():
     }
 
 
-def test_a_default_pointer_with_an_inline_comment_goes_too():
-    # The Databricks CLI reads "other # note" as "other" (go-ini SpaceBeforeInlineComment).
-    text = TWO_PROFILES + "\n[__settings__]\ndefault_profile = other # note\n"
+@pytest.mark.parametrize("pointer", ["other # note", "other ; note", '"other"', "'other'"])
+def test_a_default_pointer_goes_as_the_databricks_cli_reads_it(pointer):
+    # go-ini (SpaceBeforeInlineComment) reads every one of these as "other".
+    text = TWO_PROFILES + f"\n[__settings__]\ndefault_profile = {pointer}\n"
     result = cfgfile.remove_profile(text, "other")
     assert cfgfile.read_profiles(result)["__settings__"] == {}
 

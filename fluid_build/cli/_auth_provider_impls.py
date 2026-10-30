@@ -980,6 +980,16 @@ class SnowflakeAuthProvider(AuthProvider):
             return AuthResult(provider=self.name, status=AuthStatus.ERROR, error_message=str(e))
 
 
+def _keyring_lacks(service: str, username: str) -> bool:
+    """True when a keyring read confirms nothing is stored under ``username``."""
+    import keyring
+
+    try:
+        return keyring.get_password(service, username) is None
+    except Exception:
+        return False
+
+
 class DatabricksAuthProvider(AuthProvider):
     """Databricks authentication provider"""
 
@@ -1218,20 +1228,26 @@ class DatabricksAuthProvider(AuthProvider):
         """Delete the host and token ``fluid auth login`` saved to the OS keyring.
 
         Both deletes run even when a read finds nothing, since a backend that
-        fails to read may still hold them; False when one is not confirmed.
+        fails to read may still hold them; False when one is not confirmed gone.
         """
         import keyring
         from keyring.errors import NoKeyringError, PasswordDeleteError
 
         from fluid_build.credentials.keyring_store import KeyringCredentialStore
 
+        service = KeyringCredentialStore.SERVICE_NAME
         saved = [key for key in ("host", "token") if self._get_keyring_credential(key)]
         failed = []
         for key in ("host", "token"):
             try:
-                keyring.delete_password(KeyringCredentialStore.SERVICE_NAME, f"{self.name}.{key}")
-            except (NoKeyringError, PasswordDeleteError):
-                pass  # no keyring backend, or nothing saved under this key
+                keyring.delete_password(service, f"{self.name}.{key}")
+            except NoKeyringError:
+                pass  # no keyring backend: nothing can have been saved
+            except PasswordDeleteError:
+                # "Not found", or (macOS backend) a denied or locked keychain:
+                # the key is gone only when a read confirms it.
+                if not _keyring_lacks(service, f"{self.name}.{key}"):
+                    failed.append(key)
             except Exception:
                 # Keyring backend errors can echo the credential: name the key only.
                 failed.append(key)
