@@ -43,6 +43,9 @@ SETTINGS_SECTION = "__settings__"
 # check in ``remove_profile``.
 _HEADER = re.compile(r"\[(?P<name>.+)\]")
 _DEFAULT_PROFILE = re.compile(r"\s*default_profile\s*[=:]\s*(?P<value>.*?)\s*$")
+# The Databricks CLI and Go SDK read the file with go-ini, whose
+# SpaceBeforeInlineComment ends a value at a "#" or ";" after whitespace.
+_INLINE_COMMENT = re.compile(r"\s[#;]")
 _COMMENT_PREFIXES = ("#", ";")
 
 
@@ -72,11 +75,16 @@ def drop_profile(profile: Optional[str], logger: logging.Logger) -> bool:
         if profile:
             logger.error("No profile %r to remove: %s does not exist.", profile, path)
         return not profile
-    with open(path, encoding="utf-8", newline="") as fh:
+    # The real file, so a symlinked ~/.databrickscfg stays a link.
+    real = os.path.realpath(path)
+    with open(real, encoding="utf-8", newline="") as fh:
         text = fh.read()
+    before = os.stat(real)
     try:
         profiles = read_profiles(text)
-        refusal = _refusal(profile, profiles)
+        if not profile and not _names(profiles):
+            return True  # no profile in the file: nothing to remove
+        refusal = _refusal(profile, profiles, before.st_nlink)
         if refusal is None and profile:
             text = remove_profile(text, profile)
     except ConfigFileError as exc:
@@ -87,9 +95,14 @@ def drop_profile(profile: Optional[str], logger: logging.Logger) -> bool:
 
     from fluid_build.credentials.encrypted_store import _atomic_write_bytes
 
-    # Write the real file, so a symlinked ~/.databrickscfg stays a link:
-    # owner-only (0600) through a temp file and a rename, never a delete.
-    _atomic_write_bytes(Path(os.path.realpath(path)), text.encode("utf-8"), mode=0o600)
+    # Owner-only (0600) through a temp file and a rename, never a delete.
+    _atomic_write_bytes(Path(real), text.encode("utf-8"), mode=0o600)
+    if hasattr(os, "chown") and before.st_uid != os.geteuid():
+        # Run under sudo: hand the file back to its owner, whose tools read it.
+        try:
+            os.chown(real, before.st_uid, before.st_gid)
+        except OSError:
+            logger.warning("%s now belongs to this user, not to its previous owner.", path)
     logger.info(
         "Removed profile %r from %s (kept: %s). The token or secret it held stays valid "
         "until it is revoked in the Databricks workspace.",
@@ -100,7 +113,9 @@ def drop_profile(profile: Optional[str], logger: logging.Logger) -> bool:
     return True
 
 
-def _refusal(profile: Optional[str], profiles: Dict[str, Dict[str, str]]) -> Optional[str]:
+def _refusal(
+    profile: Optional[str], profiles: Dict[str, Dict[str, str]], links: int
+) -> Optional[str]:
     """Why ``profile`` stays in a file that holds ``profiles``; None when it may go."""
     names = ", ".join(_names(profiles)) or "none"
     if not profile:
@@ -108,7 +123,7 @@ def _refusal(profile: Optional[str], profiles: Dict[str, Dict[str, str]]) -> Opt
         return (
             f"it holds every Databricks profile ({names}) and is shared with the "
             "Databricks CLI, SDK, dbt and terraform. Name the profile to remove: "
-            f"fluid auth logout databricks {shlex.quote(named) if named else '<profile>'}"
+            f"fluid auth logout databricks {_word(named) if named else '<profile>'}"
         )
     if profile == SETTINGS_SECTION:
         return f"[{profile}] holds the Databricks CLI's settings, not a profile."
@@ -119,10 +134,18 @@ def _refusal(profile: Optional[str], profiles: Dict[str, Dict[str, str]]) -> Opt
         # profile: cut the profile first and the CLI can no longer clear them.
         return (
             f"profile {profile!r} signs in through the Databricks CLI's OAuth cache. Run "
-            f"`databricks auth logout {shlex.quote(profile)} --delete` so its cached "
-            "tokens go too."
+            f"`databricks auth logout --profile={shlex.quote(profile)} --delete` so its "
+            "cached tokens go too."
         )
+    if links > 1:
+        # The rename replaces one name; the file's other names would keep the token.
+        return f"another hard link to this file would keep [{profile}]; remove it by hand."
     return None
+
+
+def _word(name: str) -> str:
+    """``name`` as one shell word that a command line cannot take for a flag."""
+    return ("-- " if name.startswith("-") else "") + shlex.quote(name)
 
 
 def _names(profiles: Dict[str, Dict[str, str]]) -> List[str]:
@@ -160,7 +183,7 @@ def remove_profile(text: str, profile: str) -> str:
     """
     expected = {name: keys for name, keys in read_profiles(text).items() if name != profile}
     settings = expected.get(SETTINGS_SECTION, {})
-    clear_default = settings.get("default_profile") == profile
+    clear_default = _value(settings.get("default_profile", "")) == profile
     if clear_default:
         del settings["default_profile"]
 
@@ -174,15 +197,11 @@ def remove_profile(text: str, profile: str) -> str:
         if name == SETTINGS_SECTION and clear_default:
             block = [line for line in block if not _names_default(line, profile)]
         kept.extend(block)
-    if blocks and blocks[-1][2] == profile:
-        # The cut reached the end of the file: drop the blank lines it left.
-        while kept and not kept[-1].strip():
-            kept.pop()
 
     result = "".join(kept)
     if read_profiles(result) != expected:
         raise ConfigFileError(
-            f"cutting [{profile}] line by line would also change another profile; "
+            f"[{profile}] could not be cut out cleanly (an indented header, say); "
             "remove it by hand."
         )
     return result
@@ -203,10 +222,17 @@ def _blocks(lines: List[str]) -> List[Tuple[int, int, str]]:
         while start > 0 and lines[start - 1].lstrip().startswith(_COMMENT_PREFIXES):
             start -= 1
         starts.append((start, match.group("name")))
+    if not starts:
+        return []
     ends = [start for start, _ in starts[1:]] + [len(lines)]
     return [(start, end, name) for (start, name), end in zip(starts, ends, strict=True)]
 
 
 def _names_default(line: str, profile: str) -> bool:
     match = _DEFAULT_PROFILE.match(line)
-    return match is not None and match.group("value") == profile
+    return match is not None and _value(match.group("value")) == profile
+
+
+def _value(raw: str) -> str:
+    """A value as the Databricks CLI reads it, up to an inline comment."""
+    return _INLINE_COMMENT.split(raw, 1)[0].strip()

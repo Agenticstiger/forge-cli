@@ -30,6 +30,8 @@ import stat
 
 import keyring
 import pytest
+from keyring.backend import KeyringBackend
+from keyring.errors import KeyringError
 
 from fluid_build.cli import _databrickscfg as cfgfile
 from fluid_build.cli.auth import AuthManager
@@ -87,9 +89,7 @@ def test_named_profile_goes_and_other_stays_byte_for_byte(home):
 
 def test_removing_other_keeps_default(home):
     assert _logout("other") is True
-    assert (home / ".databrickscfg").read_text(encoding="utf-8") == DEFAULT_BLOCK.rstrip(
-        "\n"
-    ) + "\n"
+    assert (home / ".databrickscfg").read_text(encoding="utf-8") == DEFAULT_BLOCK
 
 
 def test_no_profile_changes_nothing_and_says_how_to_name_one(home, caplog):
@@ -161,7 +161,58 @@ def test_oauth_profile_is_left_to_the_databricks_cli(home, caplog):
     with caplog.at_level(logging.INFO):
         assert _logout("sso") is False
     assert cfg.read_text(encoding="utf-8") == text
-    assert "databricks auth logout sso --delete" in caplog.text
+    assert "databricks auth logout --profile=sso --delete" in caplog.text
+
+
+def test_dash_named_profiles_stay_values_in_the_hints(home, monkeypatch, caplog):
+    cfg = home / ".databrickscfg"
+    cfg.write_text(
+        "[-x]\nhost = https://x.cloud.databricks.com\nauth_type = databricks-cli\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "-y")
+    with caplog.at_level(logging.INFO):
+        assert _logout("-x") is False
+        assert _logout() is False
+    assert "databricks auth logout --profile=-x --delete" in caplog.text
+    assert "fluid auth logout databricks -- -y" in caplog.text
+
+
+def test_only_indented_headers_are_refused_not_crashed(home, caplog):
+    cfg = home / ".databrickscfg"
+    cfg.write_text(" [a]\nk = 1\n", encoding="utf-8")
+    with caplog.at_level(logging.INFO):
+        assert _logout("a") is False
+    assert cfg.read_text(encoding="utf-8") == " [a]\nk = 1\n"
+    assert "could not be cut out cleanly" in caplog.text
+
+
+def test_a_file_with_no_profile_needs_no_name(home):
+    cfg = home / ".databrickscfg"
+    cfg.write_text("; nothing here yet\n", encoding="utf-8")
+    assert _logout() is True
+    assert cfg.read_text(encoding="utf-8") == "; nothing here yet\n"
+
+
+@posix_only
+def test_a_hard_linked_config_is_left_alone(home, caplog):
+    cfg = home / ".databrickscfg"
+    os.link(cfg, home / "second-name")
+    with caplog.at_level(logging.INFO):
+        assert _logout("other") is False
+    assert cfg.read_text(encoding="utf-8") == TWO_PROFILES
+    assert "another hard link to this file" in caplog.text
+
+
+@posix_only
+def test_a_file_written_under_sudo_goes_back_to_its_owner(home, monkeypatch):
+    cfg = home / ".databrickscfg"
+    owner = cfg.stat()
+    calls = []
+    monkeypatch.setattr(os, "geteuid", lambda: owner.st_uid + 1)
+    monkeypatch.setattr(os, "chown", lambda path, uid, gid: calls.append((path, uid, gid)))
+    assert _logout("other") is True
+    assert calls == [(os.path.realpath(cfg), owner.st_uid, owner.st_gid)]
 
 
 def test_unparsable_file_is_untouched_and_not_quoted(home, caplog):
@@ -224,6 +275,49 @@ def test_keyring_is_cleared_even_when_the_file_is_left_alone(home):
     assert (home / ".databrickscfg").read_text(encoding="utf-8") == TWO_PROFILES
 
 
+class _Keyring(KeyringBackend):
+    """An in-memory keyring whose reads or deletes fail, like a locked one."""
+
+    priority = 1  # type: ignore[assignment]
+
+    def __init__(self, *, reads_fail=False, deletes_fail=False):
+        super().__init__()
+        self.store = {
+            ("fluid-cli", "databricks.host"): "https://saved.cloud.databricks.com",
+            ("fluid-cli", "databricks.token"): "dapi-fake-saved",
+        }
+        self.reads_fail, self.deletes_fail = reads_fail, deletes_fail
+
+    def get_password(self, service, username):
+        if self.reads_fail:
+            raise KeyringError("locked")
+        return self.store.get((service, username))
+
+    def set_password(self, service, username, password):
+        self.store[(service, username)] = password
+
+    def delete_password(self, service, username):
+        if self.deletes_fail:
+            raise KeyringError("locked")
+        self.store.pop((service, username), None)
+
+
+def test_a_keyring_that_cannot_read_is_still_cleared(home):
+    backend = _Keyring(reads_fail=True)
+    keyring.set_keyring(backend)
+    assert _logout("other") is True
+    assert backend.store == {}
+
+
+def test_a_keyring_that_cannot_delete_fails_the_logout(home, caplog):
+    backend = _Keyring(deletes_fail=True)
+    keyring.set_keyring(backend)
+    with caplog.at_level(logging.INFO):
+        assert _logout("other") is False
+    assert "Could not remove the Databricks host and token" in caplog.text
+    assert "dapi-fake-saved" not in caplog.text
+
+
 # ── fluid auth logout databricks <profile>: the CLI route ─────────────
 # ``databricks`` is a registered provider, so the whole command reaches the
 # handler: ``main`` runs it the way a user does.
@@ -279,6 +373,13 @@ def test_default_profile_pointer_goes_with_its_profile():
         "DEFAULT": {"host": "https://default.cloud.databricks.com", "token": "dapi-fake-default"},
         "__settings__": {"auth_storage": "secure"},
     }
+
+
+def test_a_default_pointer_with_an_inline_comment_goes_too():
+    # The Databricks CLI reads "other # note" as "other" (go-ini SpaceBeforeInlineComment).
+    text = TWO_PROFILES + "\n[__settings__]\ndefault_profile = other # note\n"
+    result = cfgfile.remove_profile(text, "other")
+    assert cfgfile.read_profiles(result)["__settings__"] == {}
 
 
 def test_default_profile_pointer_to_another_profile_stays():

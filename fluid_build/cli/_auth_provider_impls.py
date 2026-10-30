@@ -1215,22 +1215,34 @@ class DatabricksAuthProvider(AuthProvider):
             return False
 
     def _forget_saved_credentials(self) -> bool:
-        """Delete the host and token ``fluid auth login`` saved to the OS keyring."""
-        saved = [key for key in ("host", "token") if self._get_keyring_credential(key)]
-        if not saved:
-            return True
+        """Delete the host and token ``fluid auth login`` saved to the OS keyring.
+
+        Both deletes run even when a read finds nothing, since a backend that
+        fails to read may still hold them; False when one is not confirmed.
+        """
+        import keyring
+        from keyring.errors import NoKeyringError, PasswordDeleteError
+
         from fluid_build.credentials.keyring_store import KeyringCredentialStore
 
-        try:
-            for key in saved:
-                KeyringCredentialStore.delete_credential(f"{self.name}.{key}")
-        except Exception:
-            # Keyring backend errors can echo the credential: name the failure only.
+        saved = [key for key in ("host", "token") if self._get_keyring_credential(key)]
+        failed = []
+        for key in ("host", "token"):
+            try:
+                keyring.delete_password(KeyringCredentialStore.SERVICE_NAME, f"{self.name}.{key}")
+            except (NoKeyringError, PasswordDeleteError):
+                pass  # no keyring backend, or nothing saved under this key
+            except Exception:
+                # Keyring backend errors can echo the credential: name the key only.
+                failed.append(key)
+        if failed:
             self.logger.error(
-                "Could not remove the Databricks credentials fluid saved in the OS keyring."
+                "Could not remove the Databricks %s fluid saved in the OS keyring.",
+                " and ".join(failed),
             )
             return False
-        self.logger.info("Removed the Databricks credentials fluid saved in the OS keyring.")
+        if saved:
+            self.logger.info("Removed the Databricks credentials fluid saved in the OS keyring.")
         return True
 
     async def check_auth(self) -> AuthResult:
