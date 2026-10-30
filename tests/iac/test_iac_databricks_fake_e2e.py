@@ -247,3 +247,13 @@ def test_a_missing_catalog_fails_at_plan(workspace, fake, capfd):
     assert "catalog 'nope'" in out
     # Nothing was created on the way to the failure.
     assert fake.schemas == {} and fake.sql_log == []
+
+
+def test_no_credentials_names_the_variables_to_set(workspace, fake, capfd, monkeypatch):
+    monkeypatch.delenv("DATABRICKS_HOST")
+    monkeypatch.delenv("DATABRICKS_TOKEN")
+    path = write_contract(workspace, make_contract())
+    rc, out = apply_contract(capfd, path)
+    assert rc == 1 and "databricks-credentials-missing" in out
+    assert "DATABRICKS_HOST" in out and "DATABRICKS_TOKEN" in out
+    assert fake.schemas == {} and fake.sql_log == []

@@ -819,7 +819,7 @@ def _refuse_unadopted(
         "opentofu_adoption_failed",
         {
             "error": f"could not tell whether {block.id} already exists, so it was not "
-            f"adopted into {block.to}: {_tail(output, 400)}",
+            f"adopted into {block.to}: {_first_error(output)}",
             "why": "the provider replaces an existing object it creates over; "
             "applying now could replace it, with the plan showing a plain create",
         },
@@ -1319,3 +1319,13 @@ def _data_loss_blocked(changes: Mapping[str, int], allow_data_loss: bool) -> boo
 
 def _tail(text: str, limit: int = 800) -> str:
     return (text or "")[-limit:]
+
+
+def _first_error(text: str, limit: int = 400) -> str:
+    """``tofu`` output from its first ``Error:`` on, where the cause is stated.
+
+    The tail of a failed import is the data-source context printed after the
+    error, which cut the cause itself off mid-sentence.
+    """
+    start = (text or "").find("Error:")
+    return text[start : start + limit] if start >= 0 else _tail(text, limit)

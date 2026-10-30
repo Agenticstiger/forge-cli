@@ -471,6 +471,15 @@ class TestExplainPlanFailure:
         refusal = self.plugin.explain_plan_failure(out, _contract(), [])
         assert refusal.kind == "databricks-column-identity"
 
+    def test_no_credentials(self):
+        out = (
+            "Error: cannot configure default credentials, please check "
+            "https://docs.databricks.com/en/dev-tools/auth.html to configure credentials"
+        )
+        refusal = self.plugin.explain_plan_failure(out, _contract(), [])
+        assert refusal.kind == "databricks-credentials-missing"
+        assert "DATABRICKS_TOKEN" in " ".join(refusal.remediation)
+
     def test_anything_else_is_left_alone(self):
         assert self.plugin.explain_plan_failure("Error: 503", _contract(), []) is None
 
@@ -550,6 +559,18 @@ class TestEngine:
             engine._adopt_existing(IAC_PLUGINS["databricks"], _contract(), [], "/w", {}, _LOG)
         assert exc.value.event == "opentofu_adoption_failed"
         assert "main.sales" in exc.value.context["error"]
+
+    def test_an_adoption_failure_keeps_its_cause(self, monkeypatch):
+        # The data-source context tofu prints after the error pushed the cause out.
+        stderr = "Error: PERMISSION_DENIED: no USE SCHEMA\n\n" + "  with data.x,\n" * 60
+        monkeypatch.setattr(engine.runner, "tofu_state_list", lambda *a, **k: [])
+        monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: [])
+        monkeypatch.setattr(
+            engine.runner, "tofu_import", lambda *a, **k: TofuResult("import", 1, "", stderr, [])
+        )
+        with pytest.raises(CLIError) as exc:
+            engine._adopt_existing(IAC_PLUGINS["databricks"], _contract(), [], "/w", {}, _LOG)
+        assert "Error: PERMISSION_DENIED: no USE SCHEMA" in exc.value.context["error"]
 
 
 # ── the committed lock ──────────────────────────────────────────────────────

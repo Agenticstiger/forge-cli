@@ -117,6 +117,7 @@ _TYPE_CHANGE = "changing the 'type' of an existing column is not supported"
 _IDENTITY_CHANGE = "changing the 'identity' type of an existing column is not supported"
 _MIXED_CHANGE = "detected changes in both number of columns and existing column field values"
 _MISSING_CATALOG_RE = re.compile(r"Catalog '([^']+)' does not exist")
+_NO_CREDENTIALS = "cannot configure default credentials"
 
 #: How the provider normalises a column type before comparing two of them
 #: (``columnTypeAliases`` in ``resource_sql_table.go``), lower case first.
@@ -937,6 +938,15 @@ class DatabricksIacPlugin:
         ``state`` is the current state's resources (``runner.tofu_state_resources``),
         read to name the columns the provider's own message leaves out.
         """
+        if _NO_CREDENTIALS in (output or ""):
+            return _refusal(
+                "credentials-missing",
+                "the Databricks provider found no credentials: no workspace and token in "
+                "the environment, and no profile in ~/.databrickscfg.",
+                "Set DATABRICKS_HOST and DATABRICKS_TOKEN (a personal access token), or "
+                "DATABRICKS_HOST with DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET (a "
+                "service principal's OAuth secret), then re-run 'fluid apply'.",
+            )
         missing = _MISSING_CATALOG_RE.search(output or "")
         if missing:
             return _refusal(
