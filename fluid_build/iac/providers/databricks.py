@@ -225,24 +225,54 @@ def _column_type(raw: Any, where: str, refusals: List[UnsupportedBindingError]) 
 
     declared = str(raw or "string")
     resolved = dbt_types.sql_type(declared, "databricks")
-    _base, args = dbt_types.split_parameterized(resolved)
+    if not dbt_types.known_type(declared, "databricks"):
+        problem = f"which the Databricks emitter does not map: it would become {resolved!r}"
+    else:
+        problem = _type_problem(resolved, dbt_types.split_parameterized(resolved))
+    if problem is None:
+        return resolved
+    refusals.append(
+        _refusal(
+            "column-type",
+            f"{where} has type {declared!r}, {problem}.",
+            "Declare a FLUID type such as string, integer, bigint, decimal(12,2), double, "
+            "boolean, date, timestamp, array or object.",
+        )
+    )
+    return None
+
+
+def _type_problem(resolved: str, parts: Tuple[str, Optional[str]]) -> Optional[str]:
+    """Why ``resolved`` is no Databricks column type, or ``None`` when it is one."""
+    base, args = parts
     try:
         if args is not None:
             validate_sql_type_param_payload(args)
         if not _COLUMN_TYPE_RE.match(resolved):
             raise ValueError(resolved)
     except ValueError:
-        refusals.append(
-            _refusal(
-                "column-type",
-                f"{where} has type {declared!r}, which does not render to a Databricks "
-                f"column type (got {resolved!r}).",
-                "Declare a FLUID type such as string, integer, bigint, decimal(12,2), "
-                "double, boolean, date or timestamp.",
+        return f"which does not render to a Databricks column type (got {resolved!r})"
+    if base == "decimal" and args:
+        precision, _, scale = args.partition(",")
+        # Databricks rejects these at CREATE TABLE, after the schema was created.
+        if not 1 <= int(precision) <= 38 or int(scale or 0) > int(precision):
+            return "but a Databricks DECIMAL takes a precision of 1 to 38 and no larger scale"
+    return None
+
+
+def _scale_zero_warnings(tables: Sequence[_Table]) -> List[str]:
+    """Columns created as a bare DECIMAL, which Databricks reads as DECIMAL(10,0)."""
+    default = _PROVIDER_TYPE_ALIASES["decimal"].upper()
+    out = []
+    for table in tables:
+        bare = [column["name"] for column in table.columns if column["type"] == "decimal"]
+        if bare:
+            out.append(
+                f"{table.where} declares {', '.join(bare)} with no precision or scale, so "
+                f"Databricks creates {default} and keeps no fractional digits. Declare "
+                "decimal(p,s), for example decimal(18,2)."
             )
-        )
-        return None
-    return resolved
+    return out
 
 
 def _set(value: Any) -> bool:
@@ -1092,11 +1122,11 @@ def validate_databricks_binding(
 
     The same pass the emitter runs (:func:`_compile`), so ``fluid validate``
     reports every refusal at stage 2, with the emitter's message, instead of
-    the first one at apply.
+    the first one at apply. The warnings name what applies but loses precision.
     """
-    refusals = _compile(contract, os.environ if env is None else env, validating=True).refusals
-    errors = [f"{exc} {' '.join(exc.remediation)}".strip() for exc in refusals]
-    return errors, []
+    compiled = _compile(contract, os.environ if env is None else env, validating=True)
+    errors = [f"{exc} {' '.join(exc.remediation)}".strip() for exc in compiled.refusals]
+    return errors, _scale_zero_warnings(compiled.tables)
 
 
 __all__ = [

@@ -219,6 +219,11 @@ _REFUSALS = [
     ("expire", {"exposes.0.lifecycle": {"expire": True, "retention": "P30D"}}, "retention"),
     ("injection", {"exposes.0.binding.location.table": "o`; DROP TABLE x"}, "identifier"),
     ("column-type", {"exposes.0.contract.schema": [{"name": "a", "type": "decimal(1,x)"}]}, "type"),
+    # Unmapped: would be created as string.
+    ("typed-array", {"exposes.0.contract.schema": [{"name": "a", "type": "array<int>"}]}, "type"),
+    # Databricks rejects both at CREATE TABLE, after the schema exists.
+    ("precision", {"exposes.0.contract.schema": [{"name": "a", "type": "decimal(40,2)"}]}, "type"),
+    ("scale", {"exposes.0.contract.schema": [{"name": "a", "type": "decimal(10,12)"}]}, "type"),
     ("no-columns", {"exposes.0.contract.schema": []}, "no-columns"),
     (
         "dup-column",
@@ -311,6 +316,15 @@ def test_validate_reports_every_refusal_at_once(monkeypatch):
     for needle in ("location.host", "masking", dbx.WAREHOUSE_ENV, "reserved top-level domain"):
         assert needle in joined
     assert warnings == []
+
+
+def test_a_bare_decimal_warns_that_it_keeps_no_fraction():
+    schema = [{"name": "price", "type": "number"}, {"name": "id", "type": "bigint"}]
+    errors, warnings = dbx.validate_databricks_binding(
+        _contract(**{"exposes.0.contract.schema": schema})
+    )
+    assert errors == []
+    assert len(warnings) == 1 and "price" in warnings[0] and "DECIMAL(10,0)" in warnings[0]
 
 
 def test_two_schemas_meeting_at_one_address_are_refused():

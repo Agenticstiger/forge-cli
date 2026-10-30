@@ -171,6 +171,14 @@ class TestTypes:
     def test_sql_type(self, fluid, databricks):
         assert _types.sql_type(fluid, "databricks") == databricks
 
+    @pytest.mark.parametrize(
+        "fluid,known",
+        [("number", True), ("varchar(25)", True), ("json", True), ("geography", False)],
+    )
+    def test_known_type_tells_a_mapping_from_the_fallback(self, fluid, known):
+        assert _types.known_type(fluid, "databricks") is known
+        assert _types.known_type("array<int>", "databricks") is False
+
     def test_a_bare_number_warns_about_scale_zero(self):
         contract = _contract("databricks")
         warnings = _types.precision_warnings(contract, contract["builds"][0])

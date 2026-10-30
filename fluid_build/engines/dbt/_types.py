@@ -397,6 +397,14 @@ def sql_type(fluid_type: str, adapter: Optional[str] = None) -> str:
     return resolved
 
 
+def known_type(fluid_type: str, adapter: str) -> bool:
+    """Whether ``adapter``'s table maps ``fluid_type``, rather than :func:`sql_type`
+    falling back to the adapter's catch-all (``array<int>`` becomes ``string``)."""
+    table = _ADAPTER_TABLES.get(adapter.lower())
+    key = split_parameterized(fluid_type)[0].lower()
+    return table is not None and (key in table or _ALIASES.get(key) in table)
+
+
 # Types whose *unparameterized* spelling silently defaults to scale 0 on an
 # adapter, so a monetary value declared with them loses its cents. Keyed by
 # adapter → {resolved SQL type: the default the warehouse applies}.
