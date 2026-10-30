@@ -238,7 +238,7 @@ def apply_via_opentofu(
 
     plan = runner.tofu_plan(str(workdir), env=env)
     if not plan.ok:
-        raise CLIError(1, "opentofu_plan_failed", {"error": _tail(plan.stderr or plan.stdout)})
+        raise _plan_failure(plugin, contract, plan, str(workdir), env)
     changes = runner.change_summary(plan)
     cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
     if report is not None:
@@ -257,6 +257,9 @@ def apply_via_opentofu(
             f"  {len(revoked)} access grant(s) or policy tag(s) removed (access revoked, no "
             "data lost; not gated): " + ", ".join(revoked)
         )
+    # In-place updates that delete data — a dropped column — which the destroy
+    # count above never sees (``~`` in the summary, not ``-``).
+    lost_in_place = _in_place_changes(plugin, changes, str(workdir), env)
 
     # Report what the plan's ``lifecycle.ignore_changes`` deliberately hides.
     # Without this, a contract whose column types no longer match the live
@@ -265,46 +268,7 @@ def apply_via_opentofu(
     # "apply complete" as "the table now matches the contract".
     _report_suppressed_drift(plugin, contract, str(workdir), env, args, logger)
 
-    # Data-loss gate — `tofu` has no CTAS/CLONE data snapshot (see
-    # AUTOGEN_SPIKE.md, risk R1), so a destructive plan fails closed.
-    allow_data_loss = bool(getattr(args, "allow_data_loss", False))
-    if _data_loss_blocked(data_changes, allow_data_loss):
-        raise CLIError(
-            1,
-            "opentofu_data_loss_gate",
-            {
-                "error": f"plan destroys {data_changes['remove']} resource(s); `tofu` does not "
-                "snapshot data — re-run with --allow-data-loss to proceed"
-            },
-        )
-    if allow_data_loss and int(data_changes.get("remove", 0)) > 0:
-        # Audit-trail: every destructive apply through the override is
-        # logged at WARNING so CI log-scrapers + operators have a
-        # paper-trail. Matches the same posture as the native engine's
-        # _verify_plan_binding bypass warning.
-        cprint(
-            f"\n  ⚠️  --allow-data-loss: {data_changes['remove']} resource(s) will be "
-            "DESTROYED and no pre-replace snapshot is taken — this engine has "
-            "no CTAS/CLONE step, so `fluid rollback` will have no restore point."
-        )
-        logger.warning(
-            "--allow-data-loss: bypassing the data-loss gate; %d resource(s) "
-            "will be destroyed by `tofu apply` with NO pre-replace snapshot "
-            "(`fluid rollback` has no restore point). Provider: %s. Plan changes: "
-            "+%d ~%d -%d.",
-            int(data_changes.get("remove", 0)),
-            provider,
-            changes["add"],
-            changes["change"],
-            changes["remove"],
-        )
-        warn(
-            logger,
-            "opentofu_destructive_gate_override",
-            provider=provider,
-            resources_to_destroy=int(data_changes.get("remove", 0)),
-            **changes,
-        )
+    _enforce_data_loss_gate(args, logger, provider, changes, data_changes, lost_in_place)
 
     if dry_run:
         cprint("\ndry-run: plan only — not applying.")
@@ -792,10 +756,17 @@ def _adopt_existing(
     Best-effort: a candidate already in state is skipped; one that does not
     exist in the cloud fails to import and is left for ``tofu apply`` to
     create. Genuine apply-time errors still surface from ``tofu apply``.
+
+    Except for a plugin with ``strict_adoption``, whose provider would REPLACE
+    an existing object it creates over (Databricks' CREATE OR REPLACE TABLE,
+    databricks/terraform-provider-databricks#6140): there an import that fails
+    for any reason but "no such object" stops the apply, since the object may
+    exist and the plan would then show its replacement as a plain create.
     """
     candidates = plugin.discover_imports(contract, actions)
     if not candidates:
         return
+    strict = bool(getattr(plugin, "strict_adoption", False))
     in_state = set(runner.tofu_state_list(workdir, env=env))
     adopted = 0
     for block in candidates:
@@ -804,6 +775,8 @@ def _adopt_existing(
         result = runner.tofu_import(workdir, block.to, block.id, env=env)
         if result.ok:
             adopted += 1
+        elif strict:
+            _refuse_unadopted(plugin, contract, block, result, workdir, env)
         else:
             logger.debug(
                 "opentofu: import skipped %s (id=%s): %s",
@@ -813,6 +786,184 @@ def _adopt_existing(
             )
     if adopted:
         cprint(f"  brownfield:  adopted {adopted} pre-existing resource(s) into state")
+
+
+#: How ``tofu import`` reports an id with no object behind it (OpenTofu's
+#: ``import`` command): the one failure adoption treats as "create it".
+_IMPORT_ABSENT = "Cannot import non-existent remote object"
+
+
+def _refuse_unadopted(
+    plugin: Any,
+    contract: Mapping[str, Any],
+    block: Any,
+    result: Any,
+    workdir: str,
+    env: Mapping[str, str],
+) -> None:
+    """Under ``strict_adoption``, stop on an import that failed for any reason but
+    "no such object" (that one is left for ``tofu apply`` to create).
+
+    ``tofu import`` reads the module's data sources first, so a failure the plugin
+    knows (a catalog that does not exist) surfaces here, before the plan, and gets
+    the fix-it the plan would give.
+    """
+    output = (result.stderr or "") + (result.stdout or "")
+    if _IMPORT_ABSENT in output:
+        return
+    explained = _explained_failure(plugin, contract, output, workdir, env)
+    if explained is not None:
+        raise explained
+    raise CLIError(
+        1,
+        "opentofu_adoption_failed",
+        {
+            "error": f"could not tell whether {block.id} already exists, so it was not "
+            f"adopted into {block.to}: {_tail(output, 400)}",
+            "why": "the provider replaces an existing object it creates over; "
+            "applying now could replace it, with the plan showing a plain create",
+        },
+    )
+
+
+def _in_place_changes(
+    plugin: Any, changes: Mapping[str, int], workdir: str, env: Mapping[str, str]
+) -> List[str]:
+    """What the plan's in-place updates do to existing data, one line per change.
+
+    Optional plugin capability ``plan_data_changes(plan)`` over the saved plan
+    as ``tofu show -json`` prints it: a resource updated in place can still
+    delete data (Databricks drops a removed column with ``ALTER TABLE ... DROP
+    COLUMN``) or keep it under another name (a positional rename), and the
+    change summary counts that as ``~``, never as ``-``. Fails closed: a plan
+    with updates that cannot be read back counts.
+    """
+    review = getattr(plugin, "plan_data_changes", None)
+    if not callable(review) or not int(changes.get("change", 0)):
+        return []
+    shown = runner.tofu_show_plan(workdir, plan_file="tfplan", env=env)
+    if shown is None:
+        return ["the saved plan could not be read back, so a dropped column cannot be ruled out"]
+    return list(review(shown))
+
+
+def _enforce_data_loss_gate(
+    args,
+    logger: logging.Logger,
+    provider: str,
+    changes: Mapping[str, int],
+    data_changes: Mapping[str, int],
+    lost_in_place: List[str],
+) -> None:
+    """The data-loss gate: refuse a plan that destroys a data-bearing resource or
+    changes existing data in place, unless ``--allow-data-loss``; audit the override.
+
+    ``tofu`` has no CTAS/CLONE data snapshot (see AUTOGEN_SPIKE.md, risk R1), so a
+    destructive plan fails closed.
+    """
+    allow_data_loss = bool(getattr(args, "allow_data_loss", False))
+    destroys = int(data_changes.get("remove", 0))
+    if not allow_data_loss and (_data_loss_blocked(data_changes, False) or lost_in_place):
+        losses = [f"plan destroys {destroys} resource(s)"] if destroys > 0 else []
+        if lost_in_place:
+            losses.append("plan changes existing data in place (" + "; ".join(lost_in_place) + ")")
+        raise CLIError(
+            1,
+            "opentofu_data_loss_gate",
+            {
+                "error": "; ".join(losses) + "; `tofu` does not snapshot data — re-run with "
+                "--allow-data-loss to proceed"
+            },
+        )
+    if not allow_data_loss or not (destroys > 0 or lost_in_place):
+        return
+    # Audit-trail: every destructive apply through the override is logged at
+    # WARNING so CI log-scrapers + operators have a paper-trail. Matches the same
+    # posture as the native engine's _verify_plan_binding bypass warning.
+    if destroys > 0:
+        cprint(
+            f"\n  ⚠️  --allow-data-loss: {destroys} resource(s) will be "
+            "DESTROYED and no pre-replace snapshot is taken — this engine has "
+            "no CTAS/CLONE step, so `fluid rollback` will have no restore point."
+        )
+        logger.warning(
+            "--allow-data-loss: bypassing the data-loss gate; %d resource(s) "
+            "will be destroyed by `tofu apply` with NO pre-replace snapshot "
+            "(`fluid rollback` has no restore point). Provider: %s. Plan changes: "
+            "+%d ~%d -%d.",
+            destroys,
+            provider,
+            changes["add"],
+            changes["change"],
+            changes["remove"],
+        )
+    if lost_in_place:
+        cprint(
+            "\n  ⚠️  --allow-data-loss: existing data is changed in place with no snapshot: "
+            + "; ".join(lost_in_place)
+        )
+        logger.warning(
+            "--allow-data-loss: bypassing the data-loss gate for in-place data changes "
+            "(%s). Provider: %s.",
+            "; ".join(lost_in_place),
+            provider,
+        )
+    warn(
+        logger,
+        "opentofu_destructive_gate_override",
+        provider=provider,
+        resources_to_destroy=destroys,
+        **({"in_place_data_loss": list(lost_in_place)} if lost_in_place else {}),
+        **changes,
+    )
+
+
+def _explained_failure(
+    plugin: Any,
+    contract: Mapping[str, Any],
+    output: str,
+    workdir: str,
+    env: Mapping[str, str],
+) -> Optional[CLIError]:
+    """A plugin's fix-it for a failed ``tofu`` run, or ``None`` when it has none.
+
+    Optional plugin capability ``explain_plan_failure(output, contract, state)``
+    turns a provider error the operator cannot act on (Databricks: "changing the
+    'type' of an existing column is not supported", naming no column) into one
+    they can. The event is ``opentofu_plan_failed`` for log parsers.
+    """
+    explain = getattr(plugin, "explain_plan_failure", None)
+    if not callable(explain):
+        return None
+    try:
+        refusal = explain(output, contract, runner.tofu_state_resources(workdir, env=env))
+    except Exception as exc:  # noqa: BLE001 — advisory; the raw error still surfaces
+        logging.getLogger(__name__).debug("plan-failure explanation failed: %s", exc)
+        return None
+    if refusal is None:
+        return None
+    err = CLIError(
+        1,
+        "opentofu_plan_failed",
+        {"kind": refusal.kind, "error": str(refusal), "remediation": list(refusal.remediation)},
+    )
+    err.suggestions = list(refusal.remediation)
+    return err
+
+
+def _plan_failure(
+    plugin: Any,
+    contract: Mapping[str, Any],
+    plan: Any,
+    workdir: str,
+    env: Mapping[str, str],
+) -> CLIError:
+    """The error for a failed ``tofu plan``: the plugin's fix-it, else the raw tail."""
+    output = (plan.stdout or "") + (plan.stderr or "")
+    explained = _explained_failure(plugin, contract, output, workdir, env)
+    if explained is not None:
+        return explained
+    return CLIError(1, "opentofu_plan_failed", {"error": _tail(plan.stderr or plan.stdout)})
 
 
 def _guard_region_move(
@@ -1071,7 +1222,8 @@ def _report_suppressed_drift(
 #: that also lets the same plan drop tables). The same split policy-as-code gates
 #: over ``tofu show -json`` make by resource type (OPA's Terraform tutorial weighs
 #: deletes per type). A key's IAM grant is not here: without it BigQuery cannot
-#: decrypt the table.
+#: decrypt the table. ``databricks_grant`` is authoritative for one principal on one
+#: securable, so removing it revokes that principal's privileges and nothing else.
 ACCESS_ONLY_RESOURCE_TYPES = frozenset(
     {
         "google_bigquery_dataset_iam_member",
@@ -1081,6 +1233,7 @@ ACCESS_ONLY_RESOURCE_TYPES = frozenset(
         "google_data_catalog_policy_tag",
         "google_data_catalog_taxonomy",
         "aws_lakeformation_permissions",
+        "databricks_grant",
     }
 )
 

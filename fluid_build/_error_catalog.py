@@ -277,6 +277,14 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Run 'fluid plan <contract>' and inspect the emitted plan for the failing action"],
         None,
     ),
+    "opentofu_adoption_failed": (
+        [
+            "Check the provider credentials and network access, then re-run 'fluid apply'",
+            "The apply stopped before planning: it could not tell whether the object "
+            + "exists, and creating over it would replace it",
+        ],
+        "troubleshooting#connectivity",
+    ),
     "opentofu_region_moved": (
         [
             "If the resources should stay where they are, set the binding's location.region "

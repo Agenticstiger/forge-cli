@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 import os
@@ -1086,6 +1087,9 @@ def _run_contract_rules(
             )
             validation_result.is_valid = False
 
+        # --- Databricks: everything its emitter refuses, from the same pass ---
+        _apply_binding_check(validation_result, contract, _DATABRICKS_CHECK, "Databricks")
+
         # --- Iceberg prerequisite checks (anti-no-op gate) ------------------
         # The Snowflake and GCP IaC emitters are emit-when-derivable: an
         # Iceberg expose missing a required input yields no EXTERNAL VOLUME /
@@ -1272,6 +1276,35 @@ def _run_contract_rules(
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Composition rule check skipped: {exc}")
+
+
+#: No SQL warehouse in DATABRICKS_WAREHOUSE_ID, a contract-named host, Iceberg, and
+#: governance (masks, row filters, column restrictions) applied but never enforced.
+_DATABRICKS_CHECK = "fluid_build.iac.providers.databricks:validate_databricks_binding"
+
+
+def _apply_binding_check(validation_result, contract: Mapping[str, Any], target: str, label: str):
+    """Run one ``module:function`` binding check, ``(errors, warnings)``, into the result.
+
+    Fails closed: a check that cannot be imported or that raises is an error,
+    never a gate silently switched off (the Iceberg-sink block above says why).
+    """
+    module_name, _, function = target.partition(":")
+    try:
+        check = getattr(importlib.import_module(module_name), function)
+        errors, warnings = check(contract)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_error(
+            f"{label} binding check could not run ({type(exc).__name__}: {exc}); "
+            f"the contract was NOT checked for {label} binding defects"
+        )
+        validation_result.is_valid = False
+        return
+    for msg in errors:
+        validation_result.add_error(msg)
+        validation_result.is_valid = False
+    for msg in warnings:
+        validation_result.add_warning(msg)
 
 
 def _duplicate_contract_id_errors(contract: Mapping[str, Any]) -> List[str]:

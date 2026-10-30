@@ -431,6 +431,7 @@ _DEFAULT_MODULES = (
     "fluid_build.providers.gcp",
     "fluid_build.providers.aws",
     "fluid_build.providers.snowflake",
+    "fluid_build.providers.databricks",
     # odps is a spec-export format, not a cloud provider — intentionally excluded
     # from provider preload/discovery (see providers/opds/__init__.py).
 )

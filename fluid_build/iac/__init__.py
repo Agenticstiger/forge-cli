@@ -67,11 +67,13 @@ __all__ = [
 # ── Built-in plugins — registered on import (one per cloud) ───────────
 from .providers.aws import AwsIacPlugin
 from .providers.confluent import ConfluentIacPlugin
+from .providers.databricks import DatabricksIacPlugin
 from .providers.gcp import GcpIacPlugin
 from .providers.snowflake import SnowflakeIacPlugin
 
 register_iac_plugin("aws", AwsIacPlugin())
 register_iac_plugin("confluent", ConfluentIacPlugin())
+register_iac_plugin("databricks", DatabricksIacPlugin())
 register_iac_plugin("gcp", GcpIacPlugin())
 register_iac_plugin("snowflake", SnowflakeIacPlugin())
 

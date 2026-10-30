@@ -7,8 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Databricks (Unity Catalog) applies through the OpenTofu engine.** A contract bound to
+  `platform: databricks` validates, plans, generates (`fluid generate iac`) and applies like the
+  other clouds. The `databricks/databricks` provider is pinned to `~> 1.140.0`, and `tofu init`
+  checks it against a committed lock. `location.database` names an existing catalog, read at plan
+  time and never created; `location.schema` and `location.table` are the schema and the managed
+  Delta table the product owns. `accessPolicy.grants` and an expose's `policy.authz.readers` /
+  `writers` become one grant per principal, plus `USE_SCHEMA` on the schema. The workspace and
+  the SQL warehouse come from `DATABRICKS_HOST` and `DATABRICKS_WAREHOUSE_ID` only, never from the
+  contract. A table that already exists is imported before the first apply instead of being
+  replaced. A dropped column is refused like a destroy unless `--allow-data-loss` is given, and
+  so is a rename: with the column count unchanged the provider renames by position, so the old
+  values would stay under the new name. A revoked grant is not refused. A column type change or
+  a missing catalog fails at plan, naming the column or the catalog. `fluid validate` refuses
+  what would apply without being enforced: a host in the contract (on a binding or a build),
+  Iceberg, masks, row filters, column restrictions and a packaging block. The product owns its
+  schema: a grant is authoritative for its principal, so on a schema that already existed and
+  that other teams share, each principal the contract names keeps `USE_SCHEMA` alone there.
+  Jobs (dbt on serverless compute) come next.
+
 ### Changed
 
+- **A dbt build with no `builds[].execution.runtime.platform` takes its platform from the first
+  `exposes[].binding`**, for the generated `profiles.yml` and the model-contract column types. It
+  fell back to DuckDB whatever the binding said, so a contract that named its platform only on the
+  binding got a profile for the wrong warehouse. A build that declares its runtime platform is
+  unchanged.
 - **`fluid import`, `fluid product-new`, `fluid init --discover`, `fluid forge data-model
   from-source` and the `fluid forge --scaffold` templates declare the newest stable schema, 0.7.6,
   not 0.7.3**, which was two stable versions behind the templates #619 moved, so a contract they
@@ -30,11 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the contracts it builds and assumes where none is declared. What graduates is everything 0.7.6
   added while in preview, as the 0.13.0 to 0.25.0 entries list it: among it declarative packaging
   modes, `engine: flink`, `trigger.type: continuous`, identity-keyed overlay merges, column
-- **A dbt build with no `builds[].execution.runtime.platform` takes its platform from the first
-  `exposes[].binding`**, for the generated `profiles.yml` and the model-contract column types. It
-  fell back to DuckDB whatever the binding said, so a contract that named its platform only on the
-  binding got a profile for the wrong warehouse. A build that declares its runtime platform is
-  unchanged.
   masking and row filters, KMS keys, federation pins, and the exporter fields (`metadata.team`,
   the object root `description`, `exposes[].contract.id`, a column's `quality`). 0.7.7 is
   identical to 0.7.6 at open; additive preview fields land there. A contract validates against
@@ -60,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid generate` writes a Databricks `profiles.yml` and Databricks column types for a dbt
+  build on Databricks.** It wrote a DuckDB profile and DuckDB types, and the dbt runner prefers a
+  `profiles.yml` in the project directory, so a run could build into a local DuckDB file instead
+  of the workspace. The profile reads the same environment variables as the dbt runner's
+  (`DATABRICKS_HOST`, `DATABRICKS_HTTP_PATH`, `DATABRICKS_TOKEN`), with the catalog and schema
+  from the contract's Databricks binding.
 - **`fluid validate --fragment` no longer guesses a schema version.** With no `--schema-version`
   and no root contract above the fragment, it checked the fragment against the newest stable
   schema (0.7.5), so a valid 0.7.6 fragment failed on a field 0.7.5 does not have; a root contract
@@ -81,12 +108,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cli_unhandled_exception`, because the handlers around the parsers caught a `ValueError` the
   parsers never raise. It is the event the flag names now (`invalid_schema_version`,
   `invalid_min_version`, `invalid_max_version`), with its hints; the `invalid_schema_version`
-- **`fluid generate` writes a Databricks `profiles.yml` and Databricks column types for a dbt
-  build on Databricks.** It wrote a DuckDB profile and DuckDB types, and the dbt runner prefers a
-  `profiles.yml` in the project directory, so a run could build into a local DuckDB file instead
-  of the workspace. The profile reads the same environment variables as the dbt runner's
-  (`DATABRICKS_HOST`, `DATABRICKS_HTTP_PATH`, `DATABRICKS_TOKEN`), with the catalog and schema
-  from the contract's Databricks binding.
   hint names `fluid validate --list-versions`, the command that lists the versions.
 - **`fluid validate --quiet` printed nothing when a run stopped** on an error such as
   `contract_load_failed`, although `--quiet` is "errors only". The error now prints; the hints

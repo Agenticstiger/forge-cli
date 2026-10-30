@@ -99,6 +99,22 @@ SNOWFLAKE_VALIDATION_AVAILABLE = _dist_installed("snowflake-connector-python")
 AWS_VALIDATION_AVAILABLE = _dist_installed("boto3")
 LOCAL_VALIDATION_AVAILABLE = _dist_installed("duckdb")
 
+#: Known platforms with no live validation provider: ``(warning, suggestion)``.
+#: Databricks has no Unity Catalog introspection on this path yet (no SDK); its
+#: offline checks are `fluid validate`'s, and `fluid apply --mode dry-run` is a
+#: real `tofu plan` against the workspace.
+_NO_LIVE_VALIDATION = {
+    "databricks": (
+        "Live validation against Unity Catalog is not available for provider 'databricks' yet",
+        "Run 'fluid validate' for the offline binding checks and "
+        "'fluid apply --mode dry-run' to plan against the workspace.",
+    ),
+    "azure": (
+        "Provider 'azure' validation not yet implemented",
+        "Supported providers: gcp, snowflake, aws, local. Others coming soon.",
+    ),
+}
+
 LOG = logging.getLogger("fluid.cli.contract_validation")
 COMMAND = "contract-validation"
 
@@ -566,13 +582,10 @@ class ContractValidator:
             from ..providers.local_validation import LocalValidationProvider
 
             self.validation_provider = LocalValidationProvider({"base_dir": base_dir})
-        elif self.provider_name in ["databricks", "azure"]:
+        elif self.provider_name in _NO_LIVE_VALIDATION:
+            message, suggestion = _NO_LIVE_VALIDATION[self.provider_name]
             self.report.add_issue(
-                "warning",
-                "binding",
-                f"Provider '{self.provider_name}' validation not yet implemented",
-                "binding.platform",
-                suggestion="Supported providers: gcp, snowflake, aws, local. Others coming soon.",
+                "warning", "binding", message, "binding.platform", suggestion=suggestion
             )
             return
         else:

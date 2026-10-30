@@ -482,7 +482,7 @@ class TestTheGateAndTheReporterDisagreeOnlyOnUnknownPlatforms:
     def test_they_agree_on_every_known_platform(self, platform):
         assert binds_cluster([platform]) == ("cluster" in container_kinds_for_platforms([platform]))
 
-    @pytest.mark.parametrize("platform", ["local", "databricks", "", None])
+    @pytest.mark.parametrize("platform", ["local", "azure", "", None])
     def test_unknown_platforms_diverge_each_in_its_safe_direction(self, platform):
         assert binds_cluster([platform]) is False  # no invented rejection
         assert container_kinds_for_platforms([platform]) == frozenset(CONTAINER_KINDS)  # hide none
