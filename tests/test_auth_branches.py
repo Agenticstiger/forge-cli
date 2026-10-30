@@ -472,14 +472,15 @@ class TestDatabricksAuthProvider:
         result = asyncio.run(p.check_auth())
         assert result.status in (AuthStatus.ERROR, AuthStatus.NOT_AUTHENTICATED)
 
-    def test_logout_removes_config(self, tmp_path):
+    def test_logout_without_profile_keeps_config(self, tmp_path):
+        # ~/.databrickscfg holds every profile: no profile named, no change.
         p = self._make_provider()
         config_file = tmp_path / ".databrickscfg"
         config_file.write_text("[DEFAULT]\nhost = test\n")
         with patch("os.path.expanduser", return_value=str(config_file)):
             result = asyncio.run(p.logout())
-            assert result is True
-            assert not config_file.exists()
+            assert result is False
+            assert config_file.read_text() == "[DEFAULT]\nhost = test\n"
 
     def test_logout_no_config(self, tmp_path):
         p = self._make_provider()

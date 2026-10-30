@@ -33,7 +33,7 @@ _keyring_error_warned = False
 
 try:
     import keyring
-    from keyring.errors import KeyringError, PasswordDeleteError
+    from keyring.errors import KeyringError, NoKeyringError, PasswordDeleteError
 
     KEYRING_AVAILABLE = True
 except ImportError:
@@ -136,6 +136,37 @@ class KeyringCredentialStore:
         except KeyringError as e:
             logger.error(f"Failed to delete credential from keyring: {e}")
             raise
+
+    @staticmethod
+    def forget_credential(key: str) -> bool:
+        """
+        Delete a credential and confirm it is gone.
+
+        Unlike ``delete_credential``, a ``PasswordDeleteError`` is not read as
+        "not found": the macOS backend raises it for a denied or locked
+        keychain too, so only a read that finds nothing confirms the delete.
+
+        Args:
+            key: Credential key to delete
+
+        Returns:
+            False when the credential may still be stored
+        """
+        if not KEYRING_AVAILABLE:
+            return True  # no keyring library: nothing can have been saved
+        try:
+            keyring.delete_password(KeyringCredentialStore.SERVICE_NAME, key)
+            return True
+        except NoKeyringError:
+            return True  # no keyring backend: nothing can have been saved
+        except PasswordDeleteError:
+            try:
+                return keyring.get_password(KeyringCredentialStore.SERVICE_NAME, key) is None
+            except Exception:
+                return False
+        except Exception:
+            # Backend errors can echo the credential: report the outcome only.
+            return False
 
     @staticmethod
     def list_credentials() -> list:

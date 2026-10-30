@@ -983,6 +983,9 @@ class SnowflakeAuthProvider(AuthProvider):
 class DatabricksAuthProvider(AuthProvider):
     """Databricks authentication provider"""
 
+    #: ``fluid auth logout databricks <profile>``: the one config-file profile to remove.
+    logout_options = frozenset({"profile"})
+
     def __init__(self, config: Dict[str, Any], logger: logging.Logger):
         super().__init__("databricks", config, logger)
         self.host = config.get("host")
@@ -1158,8 +1161,10 @@ class DatabricksAuthProvider(AuthProvider):
                 if result.status == AuthStatus.AUTHENTICATED:
                     return self._annotate_method(result, "saved access token")
 
-            # 4. ~/.databrickscfg file
-            cfg_path = os.path.expanduser("~/.databrickscfg")
+            # 4. ~/.databrickscfg file (DATABRICKS_CONFIG_FILE moves it, as logout honours)
+            from fluid_build.cli._databrickscfg import config_path
+
+            cfg_path = config_path()
             if os.path.exists(cfg_path):
                 try:
                     import configparser
@@ -1171,7 +1176,10 @@ class DatabricksAuthProvider(AuthProvider):
                     if cfg_host and cfg_token:
                         result = self._validate_via_api(cfg_host, cfg_token)
                         if result.status == AuthStatus.AUTHENTICATED:
-                            return self._annotate_method(result, "~/.databrickscfg")
+                            return self._annotate_method(
+                                result,
+                                os.environ.get("DATABRICKS_CONFIG_FILE") or "~/.databrickscfg",
+                            )
                 except Exception:
                     pass
 
@@ -1192,19 +1200,42 @@ class DatabricksAuthProvider(AuthProvider):
         except Exception as e:
             return AuthResult(provider=self.name, status=AuthStatus.ERROR, error_message=str(e))
 
-    async def logout(self) -> bool:
-        """Logout from Databricks (clear stored configuration)"""
+    async def logout(self, profile: Optional[str] = None) -> bool:
+        """Forget the Databricks credentials fluid saved, plus one named profile.
+
+        ``fluid auth login`` saves a host and token to the OS keyring; those
+        are fluid's own and always go. The config file
+        (``DATABRICKS_CONFIG_FILE``, else ``~/.databrickscfg``) belongs to the
+        Databricks CLI, SDK, dbt and terraform and holds every profile, so
+        only ``profile`` is cut from it. With no profile, nothing in the file
+        changes; the file is never deleted.
+        """
         try:
-            config_file = os.path.expanduser("~/.databrickscfg")
-            if os.path.exists(config_file):
-                os.remove(config_file)
-                self.logger.info("Databricks configuration cleared")
-            return True
+            from fluid_build.cli import _databrickscfg
+
+            forgot = self._forget_saved_credentials()
+            return _databrickscfg.drop_profile(profile, self.logger) and forgot
         except Exception as e:
+            self.logger.error("Failed to log out of Databricks: %s", redact_secret_text(str(e)))
+            return False
+
+    def _forget_saved_credentials(self) -> bool:
+        """Delete the host and token ``fluid auth login`` saved to the OS keyring.
+
+        Both deletes run even when a read finds nothing, since a backend that
+        fails to read may still hold them; False when one is not confirmed gone.
+        """
+        saved = [key for key in ("host", "token") if self._get_keyring_credential(key)]
+        failed = [key for key in ("host", "token") if not self._forget_keyring_credential(key)]
+        if failed:
             self.logger.error(
-                "Failed to clear Databricks configuration: %s", redact_secret_text(str(e))
+                "Could not remove the Databricks %s fluid saved in the OS keyring.",
+                " and ".join(failed),
             )
             return False
+        if saved:
+            self.logger.info("Removed the Databricks credentials fluid saved in the OS keyring.")
+        return True
 
     async def check_auth(self) -> AuthResult:
         """Check Databricks auth — tries REST API first, CLI second."""
@@ -1227,8 +1258,10 @@ class DatabricksAuthProvider(AuthProvider):
                 if result.status == AuthStatus.AUTHENTICATED:
                     return self._annotate_method(result, "REST API")
 
-            # Try ~/.databrickscfg
-            cfg_path = os.path.expanduser("~/.databrickscfg")
+            # Try ~/.databrickscfg (DATABRICKS_CONFIG_FILE moves it, as logout honours)
+            from fluid_build.cli._databrickscfg import config_path
+
+            cfg_path = config_path()
             if os.path.exists(cfg_path):
                 try:
                     import configparser
@@ -1240,7 +1273,10 @@ class DatabricksAuthProvider(AuthProvider):
                     if cfg_host and cfg_token:
                         result = self._validate_via_api(cfg_host, cfg_token)
                         if result.status == AuthStatus.AUTHENTICATED:
-                            return self._annotate_method(result, "~/.databrickscfg")
+                            return self._annotate_method(
+                                result,
+                                os.environ.get("DATABRICKS_CONFIG_FILE") or "~/.databrickscfg",
+                            )
                 except Exception:
                     pass
 

@@ -474,12 +474,17 @@ class TestDatabricksExt2:
             result = _run(provider.login())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
-    @patch("os.path.exists", return_value=True)
     @patch("os.remove")
-    def test_logout_clears_config(self, mock_remove, _mock_exists):
+    def test_logout_removes_only_the_named_profile(self, mock_remove, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.delenv("DATABRICKS_CONFIG_FILE", raising=False)
+        cfg = tmp_path / ".databrickscfg"
+        cfg.write_text("[DEFAULT]\nhost = h\n\n[other]\nhost = o\n")
         provider = DatabricksAuthProvider({}, LOG)
-        assert _run(provider.logout()) is True
-        mock_remove.assert_called_once()
+        assert _run(provider.logout(profile="DEFAULT")) is True
+        mock_remove.assert_not_called()
+        assert cfg.read_text() == "[other]\nhost = o\n"
 
     @patch("os.path.exists", return_value=False)
     def test_logout_no_config(self, _mock_exists):
@@ -1007,13 +1012,21 @@ class TestDatabricksAdditional:
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 
-    def test_logout_failure(self):
-        """Lines 829-831: logout fails to remove file."""
+    def test_logout_failure(self, tmp_path, monkeypatch):
+        """A write that fails leaves the config file as it was and fails the logout."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.delenv("DATABRICKS_CONFIG_FILE", raising=False)
+        cfg = tmp_path / ".databrickscfg"
+        cfg.write_text("[DEFAULT]\nhost = h\n\n[other]\nhost = o\n")
         provider = DatabricksAuthProvider({}, LOG)
-        with patch("os.path.exists", return_value=True):
-            with patch("os.remove", side_effect=OSError("permission denied")):
-                result = _run(provider.logout())
+        with patch(
+            "fluid_build.credentials.encrypted_store._atomic_write_bytes",
+            side_effect=OSError("permission denied"),
+        ):
+            result = _run(provider.logout(profile="DEFAULT"))
         assert result is False
+        assert cfg.read_text() == "[DEFAULT]\nhost = h\n\n[other]\nhost = o\n"
 
 
 # ---------------------------------------------------------------------------

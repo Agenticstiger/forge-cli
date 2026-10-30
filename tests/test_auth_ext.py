@@ -396,12 +396,18 @@ class TestDatabricksAuthProvider:
             result = _run_coro(p.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
-    def test_logout_removes_config_file(self):
-        with patch("os.path.exists", return_value=True):
-            with patch("os.remove") as mock_remove:
-                result = _run_coro(self._provider().logout())
-        assert result is True
-        mock_remove.assert_called_once()
+    def test_logout_never_deletes_config_file(self, tmp_path, monkeypatch):
+        # ~/.databrickscfg holds every profile: with none named, nothing changes.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.delenv("DATABRICKS_CONFIG_FILE", raising=False)
+        cfg = tmp_path / ".databrickscfg"
+        cfg.write_text("[DEFAULT]\nhost = h\n")
+        with patch("os.remove") as mock_remove:
+            result = _run_coro(self._provider().logout())
+        assert result is False
+        mock_remove.assert_not_called()
+        assert cfg.read_text() == "[DEFAULT]\nhost = h\n"
 
 
 # ---------------------------------------------------------------------------

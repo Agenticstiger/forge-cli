@@ -77,6 +77,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`fluid auth logout databricks` no longer deletes `~/.databrickscfg`.** That file belongs to
+  the Databricks CLI, SDK, dbt and terraform and holds every profile and its token; logout
+  removed all of it, through `AuthManager.logout` and, since #769 added `databricks` to the
+  provider registry the CLI checks its `provider` argument against, through the command too. It
+  now removes only the profile you name (`fluid auth logout databricks <profile>`, or
+  `AuthManager.logout("databricks", profile=...)`), keeps every other profile's lines, writes
+  the file back owner-only (0600) and never deletes it. With no profile named, a file that holds
+  profiles is left alone and the command exits 1, listing them; `DATABRICKS_CONFIG_PROFILE` is
+  quoted in that hint, never acted on. `DATABRICKS_CONFIG_FILE` names the file, as it does for
+  the Databricks tools, and `fluid auth login` and `fluid auth status databricks` now read that
+  file instead of `~/.databrickscfg` when it is set. An OAuth profile (`auth_type = databricks-cli`) is left to `databricks auth logout
+  --profile=<name> --delete`, which clears its cached tokens too; a hard-linked file, or one that
+  belongs to another user (a logout under sudo), is left as it is. Every logout also removes the
+  host and token `fluid auth login` saved in the OS keyring, and fails if the keyring refuses. A
+  removed token stays valid until it is revoked in the workspace.
 - **The default `fluid bundle --format tgz` path gets the write check an explicit `--out` gets.**
   A symlink planted at `<contract id>.fluid.bundle.tgz` could point the write at a forbidden path
   (`/etc`, as root in a CI container); it is refused now, as `--out` with that path always was.
