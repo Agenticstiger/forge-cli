@@ -272,11 +272,13 @@ jobs:
   coverage-and-audit:
     name: Coverage & Audit (Python 3.14)
     runs-on: ubuntu-latest
-    # Under sysmon the run takes about as long as a plain test leg. 30
-    # bounds a true hang to minutes, not GitHub's 6-hour default, and is
-    # under the ~40 min a fallback to the C tracer takes, so a silent
-    # fallback fails the job instead of only slowing it.
-    timeout-minutes: 30
+    # Under sysmon the run takes about as long as a plain test leg, 12-22
+    # min. 45 bounds a true hang, not GitHub's 6-hour default, and leaves
+    # room for GitHub's own status lag: this timeout is enforced server-side,
+    # and on 2026-10-30 a 30-minute cap cancelled a run on main whose tests
+    # and gates had all passed. A fallback to the C tracer is caught by the
+    # "Coverage measures with sysmon" step, not by this timeout.
+    timeout-minutes: 45
     env:
       # Same glibc-arena cap as the test matrix (see comment there) —
       # this is the identical thread-heavy pytest run, plus coverage.
@@ -284,7 +286,8 @@ jobs:
       # Set, not left to the 3.14 default: a default sysmon that meets a
       # setting it cannot serve (a plugin, dynamic contexts) falls back to
       # the C tracer without a word; set explicitly, coverage.py 7.17
-      # still falls back but logs a `no-sysmon` CoverageWarning.
+      # still falls back but logs a `no-sysmon` CoverageWarning, and the
+      # "Coverage measures with sysmon" step fails the job on it.
       COVERAGE_CORE: sysmon
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -316,6 +319,23 @@ jobs:
           # in CI. Capped below 2.0: dbt v2 is a separate, non-Apache-2.0
           # distribution whose emitter differences are not what this tests.
           pip install "dbt-core<2" dbt-duckdb
+
+      # coverage.py picks its core when measurement starts, from this job's
+      # COVERAGE_CORE and the [tool.coverage.run] config that pytest-cov
+      # reads too, so a one-line script shows in a second what the C tracer
+      # would otherwise show as a ~40-minute run. `--debug=core` logs the
+      # choice: "Using core=sysmon" or "Using core=ctrace".
+      - name: Coverage measures with sysmon
+        run: |
+          echo "pass" > "$RUNNER_TEMP/noop.py"
+          COVERAGE_DEBUG=core COVERAGE_DEBUG_FILE="$RUNNER_TEMP/core.log" \
+            python -m coverage run --source="$RUNNER_TEMP" \
+            --data-file="$RUNNER_TEMP/.coverage.core" "$RUNNER_TEMP/noop.py"
+          cat "$RUNNER_TEMP/core.log"
+          if ! grep -q "Using core=sysmon" "$RUNNER_TEMP/core.log"; then
+            echo "::error::coverage.py would not measure with sys.monitoring, so the run below would take ~40 min (see #770)."
+            exit 1
+          fi
 
       # ── Tests + Coverage ────────────────────────────────────────
       - name: Run tests with coverage
