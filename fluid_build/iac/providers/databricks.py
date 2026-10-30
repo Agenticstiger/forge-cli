@@ -118,14 +118,15 @@ _TABLE_PRIVILEGES = {
 }
 
 #: A rendered column type: a name, an optional element type, optional
-#: precision/scale. Anything else would be handed to the warehouse as SQL.
-_COLUMN_TYPE_RE = re.compile(r"^[a-z_]+(<[a-z_]+>)?(\([0-9]+(,[0-9]+)?\))?$")
+#: precision/scale of a few digits. Anything else would be handed to the warehouse
+#: as SQL (and ``int()`` refuses a digit string past Python's limit).
+_COLUMN_TYPE_RE = re.compile(r"^[a-z_]+(<[a-z_]+>)?(\([0-9]{1,4}(,[0-9]{1,4})?\))?$")
 
 #: A rendered DECIMAL with no scale (``decimal``, ``decimal(12)``): scale 0.
 _SCALE_ZERO_RE = re.compile(r"^decimal(\([0-9]+\))?$")
 
 #: A rendered DECIMAL with arguments, in any spelling (``decimal(12)``, ``decimal(038,2)``).
-_DECIMAL_ARGS_RE = re.compile(r"^decimal\(([0-9]+)(?:,([0-9]+))?\)$")
+_DECIMAL_ARGS_RE = re.compile(r"^decimal\(([0-9]{1,4})(?:,([0-9]{1,4}))?\)$")
 
 #: What ``tofu plan`` prints for each plan-time error :meth:`explain_plan_failure`
 #: turns into a fix-it (provider 1.140.0 messages, verbatim).
@@ -134,6 +135,8 @@ _IDENTITY_CHANGE = "changing the 'identity' type of an existing column is not su
 _MIXED_CHANGE = "detected changes in both number of columns and existing column field values"
 _MISSING_CATALOG_RE = re.compile(r"Catalog '([^']+)' does not exist")
 _NO_CREDENTIALS = "cannot configure default credentials"
+#: Go's network errors when the workspace does not answer.
+_UNREACHABLE_RE = re.compile(r"connection refused|no such host|i/o timeout")
 
 #: How the provider normalises a column type before comparing two of them
 #: (``columnTypeAliases`` in ``resource_sql_table.go``), lower case first.
@@ -1083,6 +1086,14 @@ class DatabricksIacPlugin:
                 "Set DATABRICKS_HOST and DATABRICKS_TOKEN (a personal access token), or "
                 "DATABRICKS_HOST with DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET (a "
                 "service principal's OAuth secret), then re-run 'fluid apply'.",
+            )
+        if _UNREACHABLE_RE.search(output or ""):
+            return _refusal(
+                "workspace-unreachable",
+                "the workspace DATABRICKS_HOST names did not answer (connection refused, "
+                "unknown host or a timeout).",
+                "Check DATABRICKS_HOST and that this machine can reach it (VPN, proxy, "
+                "firewall), then re-run 'fluid apply'.",
             )
         missing = _MISSING_CATALOG_RE.search(output or "")
         if missing:

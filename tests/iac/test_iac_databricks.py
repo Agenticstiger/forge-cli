@@ -272,6 +272,12 @@ _REFUSALS = [
         {"exposes.0.contract.schema": [{"name": "a", "type": "decimal(10,12)"}]},
         "column-type",
     ),
+    # Past Python's int() digit limit: a refusal, not an unhandled ValueError.
+    (
+        "huge-precision",
+        {"exposes.0.contract.schema": [{"name": "a", "type": "decimal(" + "9" * 5000 + ")"}]},
+        "column-type",
+    ),
     ("no-columns", {"exposes.0.contract.schema": []}, "no-columns"),
     (
         "dup-column",
@@ -649,6 +655,11 @@ class TestExplainPlanFailure:
         assert refusal.kind == "databricks-credentials-missing"
         assert "DATABRICKS_TOKEN" in " ".join(refusal.remediation)
 
+    def test_an_unreachable_workspace(self):
+        out = "Error: cannot read schema: dial tcp 127.0.0.1:9: connect: connection refused"
+        refusal = self.plugin.explain_plan_failure(out, _contract(), [])
+        assert refusal.kind == "databricks-workspace-unreachable"
+
     def test_anything_else_is_left_alone(self):
         assert self.plugin.explain_plan_failure("Error: 503", _contract(), []) is None
 
@@ -743,7 +754,7 @@ class TestEngine:
         monkeypatch.setattr(
             engine.runner,
             "tofu_import",
-            lambda *a, **k: TofuResult("import", 1, "", "dial tcp: connection refused", []),
+            lambda *a, **k: TofuResult("import", 1, "", "Error: 500 Internal Server Error", []),
         )
         with pytest.raises(CLIError) as exc:
             engine._adopt_existing(IAC_PLUGINS["databricks"], _contract(), [], "/w", {}, _LOG)

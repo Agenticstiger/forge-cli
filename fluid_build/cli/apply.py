@@ -454,10 +454,8 @@ def register(subparsers: argparse._SubParsersAction):
         action="store_true",
         default=False,
         help=(
-            "Required for replace modes when env != dev or target has rows "
-            "(a pre-replace snapshot enables ``fluid rollback``), and for an "
-            "OpenTofu plan that destroys a data-bearing resource or drops or "
-            "renames a column in place (no snapshot is taken)."
+            "Required for replaces outside dev or on rows (snapshotted), and OpenTofu "
+            "plans that destroy data or drop/rename Databricks columns."
         ),
     )
     mode_group.add_argument(
