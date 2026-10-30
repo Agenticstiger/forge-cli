@@ -43,7 +43,8 @@ from typing import Iterator, List
 
 import pytest
 
-from fluid_build.iac import runner
+from fluid_build.iac import IAC_PLUGINS, runner
+from fluid_build.iac.module import LOCK_FILE_NAME, dependency_lock
 
 from ._databricks_cli import (  # noqa: F401 — plugin_cache is a fixture
     COLUMNS,
@@ -257,3 +258,13 @@ def test_no_credentials_names_the_variables_to_set(workspace, fake, capfd, monke
     assert rc == 1 and "databricks-credentials-missing" in out
     assert "DATABRICKS_HOST" in out and "DATABRICKS_TOKEN" in out
     assert fake.schemas == {} and fake.sql_log == []
+
+
+def test_diff_initialises_with_the_committed_lock(workspace, fake, capfd):
+    path = write_contract(workspace, make_contract())
+    assert apply_contract(capfd, path)[0] == 0
+    [lock] = workspace.glob(f".fluid/iac/databricks/*/{LOCK_FILE_NAME}")
+    lock.unlink()  # written by the apply; the diff must write its own
+    rc, out = run_fluid(capfd, "diff", path)
+    assert rc == 0, out
+    assert lock.read_text() == dependency_lock(IAC_PLUGINS["databricks"])

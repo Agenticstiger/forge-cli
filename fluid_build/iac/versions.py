@@ -54,7 +54,11 @@ PROVIDER_PINS: Dict[str, Dict[str, str]] = {
     # the checksums in the committed lock file
     # (``iac/providers/locks/databricks.terraform.lock.hcl``) are the only
     # integrity check ``tofu init`` has. A bump moves this pin and that lock
-    # together.
+    # together, and re-checks the provider messages the plugin's fix-its match
+    # (``_TYPE_CHANGE``, ``_IDENTITY_CHANGE``, ``_MIXED_CHANGE``,
+    # ``_NO_CREDENTIALS`` in ``iac/providers/databricks.py``) and its
+    # ``resource_sql_table.go`` diff rules: only the type change is exercised
+    # against the real provider in CI.
     "databricks": {"source": "databricks/databricks", "version": "~> 1.140.0"},
 }
 

@@ -21,6 +21,7 @@ provider do with the module is pinned against a stand-in workspace in
 
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import logging
@@ -37,6 +38,8 @@ from fluid_build.iac.module import LOCK_FILE_NAME, dependency_lock, write_depend
 from fluid_build.iac.providers import databricks as dbx
 from fluid_build.iac.runner import TofuResult
 from fluid_build.iac.versions import PROVIDER_PINS
+
+from ._databricks_cli import isolate_workspace, make_contract, run_fluid, write_contract
 
 pytestmark = [pytest.mark.unit, pytest.mark.databricks]
 
@@ -203,28 +206,72 @@ class TestModule:
 _REFUSALS = [
     ("host", {"exposes.0.binding.location.host": "evil.example.com"}, "host-in-contract"),
     ("iceberg", {"exposes.0.binding.format": "iceberg"}, "iceberg-unsupported"),
-    ("iceberg-config", {"exposes.0.binding.icebergConfig": {"writeVersion": 2}}, "iceberg"),
+    (
+        "iceberg-config",
+        {"exposes.0.binding.icebergConfig": {"writeVersion": 2}},
+        "iceberg-unsupported",
+    ),
     ("format", {"exposes.0.binding.format": "parquet"}, "format-unsupported"),
     ("kind", {"exposes.0.kind": "view"}, "kind-unsupported"),
     ("catalog", {"exposes.0.binding.location.catalog": "unity"}, "location-field"),
     ("warehouse", {"exposes.0.binding.location.warehouse": "wh"}, "location-field"),
     ("no-table", {"exposes.0.binding.location.table": ""}, "location-incomplete"),
     ("packaging", {"packaging": {"mode": "isolated"}}, "packaging-unmapped"),
-    ("binding-packaging", {"exposes.0.binding.packaging": {"mode": "isolated"}}, "packaging"),
-    ("masking", {"exposes.0.policy.privacy": {"masking": [{"column": "x"}]}}, "governance"),
-    ("row-level", {"exposes.0.policy.privacy": {"rowLevelPolicy": {"a": 1}}}, "governance"),
-    ("row-filters", {"exposes.0.policy.authz.rowFilters": [{"a": 1}]}, "governance"),
-    ("column-restr", {"exposes.0.policy.authz.columnRestrictions": [{"a": 1}]}, "governance"),
-    ("lf", {"exposes.0.binding.governance": {"lakeFormation": {"grants": []}}}, "governance"),
+    (
+        "binding-packaging",
+        {"exposes.0.binding.packaging": {"mode": "isolated"}},
+        "packaging-unmapped",
+    ),
+    (
+        "masking",
+        {"exposes.0.policy.privacy": {"masking": [{"column": "x"}]}},
+        "governance-unmapped",
+    ),
+    (
+        "row-level",
+        {"exposes.0.policy.privacy": {"rowLevelPolicy": {"a": 1}}},
+        "governance-unmapped",
+    ),
+    ("row-filters", {"exposes.0.policy.authz.rowFilters": [{"a": 1}]}, "governance-unmapped"),
+    (
+        "column-restr",
+        {"exposes.0.policy.authz.columnRestrictions": [{"a": 1}]},
+        "governance-unmapped",
+    ),
+    (
+        "lf",
+        {"exposes.0.binding.governance": {"lakeFormation": {"grants": []}}},
+        "governance-unmapped",
+    ),
     ("encryption", {"exposes.0.binding.encryption": {"kms": "k"}}, "encryption-unmapped"),
-    ("expire", {"exposes.0.lifecycle": {"expire": True, "retention": "P30D"}}, "retention"),
+    (
+        "expire",
+        {"exposes.0.lifecycle": {"expire": True, "retention": "P30D"}},
+        "retention-unmapped",
+    ),
     ("injection", {"exposes.0.binding.location.table": "o`; DROP TABLE x"}, "identifier"),
-    ("column-type", {"exposes.0.contract.schema": [{"name": "a", "type": "decimal(1,x)"}]}, "type"),
+    (
+        "column-type",
+        {"exposes.0.contract.schema": [{"name": "a", "type": "decimal(1,x)"}]},
+        "column-type",
+    ),
     # Unmapped: would be created as string.
-    ("typed-array", {"exposes.0.contract.schema": [{"name": "a", "type": "array<int>"}]}, "type"),
+    (
+        "typed-array",
+        {"exposes.0.contract.schema": [{"name": "a", "type": "array<int>"}]},
+        "column-type",
+    ),
     # Databricks rejects both at CREATE TABLE, after the schema exists.
-    ("precision", {"exposes.0.contract.schema": [{"name": "a", "type": "decimal(40,2)"}]}, "type"),
-    ("scale", {"exposes.0.contract.schema": [{"name": "a", "type": "decimal(10,12)"}]}, "type"),
+    (
+        "precision",
+        {"exposes.0.contract.schema": [{"name": "a", "type": "decimal(40,2)"}]},
+        "column-type",
+    ),
+    (
+        "scale",
+        {"exposes.0.contract.schema": [{"name": "a", "type": "decimal(10,12)"}]},
+        "column-type",
+    ),
     ("no-columns", {"exposes.0.contract.schema": []}, "no-columns"),
     (
         "dup-column",
@@ -242,7 +289,7 @@ def test_refusal(label: str, overrides: Dict[str, Any], kind: str):
     assert errors, label
     with pytest.raises(UnsupportedBindingError) as exc:
         IAC_PLUGINS["databricks"].emit(contract)
-    assert exc.value.kind.startswith("databricks-") and kind in exc.value.kind
+    assert exc.value.kind == f"databricks-{kind}"
 
 
 def test_a_build_that_names_its_own_host_is_refused():
@@ -326,6 +373,41 @@ def test_a_bare_decimal_warns_that_it_keeps_no_fraction():
     )
     assert errors == []
     assert len(warnings) == 1 and "price" in warnings[0] and "DECIMAL(10,0)" in warnings[0]
+
+
+def test_fluid_validate_reports_the_refusals(monkeypatch, tmp_path: Path, capfd):
+    isolate_workspace(
+        monkeypatch,
+        tmp_path,
+        host="https://adb-1.azuredatabricks.net",
+        warehouse_id=WAREHOUSE,
+        plugin_cache=str(tmp_path),
+    )
+    contract = make_contract()
+    contract["exposes"][0]["binding"]["location"]["host"] = "evil.example.com"
+    rc, out = run_fluid(capfd, "validate", write_contract(tmp_path, contract))
+    assert rc != 0 and "sets binding.location.host" in out
+
+
+def test_fluid_validate_fails_closed_when_the_check_cannot_run(monkeypatch):
+    from fluid_build.cli import validate as validate_cli
+
+    class _Result:
+        is_valid = True
+
+        def __init__(self) -> None:
+            self.errors: List[str] = []
+
+        def add_error(self, message: str) -> None:
+            self.errors.append(message)
+
+    def broken(contract):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(dbx, "validate_databricks_binding", broken)
+    result = _Result()
+    validate_cli._databricks_binding_check(result, _contract())
+    assert result.is_valid is False and "NOT checked" in result.errors[0]
 
 
 def test_two_schemas_meeting_at_one_address_are_refused():
@@ -551,7 +633,7 @@ class TestEngine:
         "stderr,adopted",
         [("Error: Cannot import non-existent remote object", False), ("", True)],
     )
-    def test_strict_adoption_tolerates_only_absence(self, monkeypatch, stderr, adopted):
+    def test_strict_adoption_tolerates_only_absence(self, monkeypatch, capfd, stderr, adopted):
         calls = []
         monkeypatch.setattr(engine.runner, "tofu_state_list", lambda *a, **k: [])
 
@@ -562,6 +644,19 @@ class TestEngine:
         monkeypatch.setattr(engine.runner, "tofu_import", fake_import)
         engine._adopt_existing(IAC_PLUGINS["databricks"], _contract(), [], "/w", {}, _LOG)
         assert len(calls) == 2
+        assert ("adopted 2 pre-existing" in "".join(capfd.readouterr())) is adopted
+
+    def test_an_in_place_override_is_audited(self, caplog):
+        changes = {"add": 0, "change": 1, "remove": 0}
+        lost = ["main.sales.orders: drops column(s) b"]
+        with caplog.at_level(logging.WARNING):
+            engine._enforce_data_loss_gate(
+                argparse.Namespace(allow_data_loss=True), _LOG, "databricks", changes, changes, lost
+            )
+        audit = [r.getMessage() for r in caplog.records]
+        audit = [m for m in audit if "opentofu_destructive_gate_override" in m]
+        assert len(audit) == 1 and "in_place_data_loss" in audit[0]
+        assert "drops column(s) b" in audit[0]
 
     def test_strict_adoption_stops_on_any_other_failure(self, monkeypatch):
         monkeypatch.setattr(engine.runner, "tofu_state_list", lambda *a, **k: [])
