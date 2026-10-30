@@ -205,14 +205,14 @@ def test_a_hard_linked_config_is_left_alone(home, caplog):
 
 
 @posix_only
-def test_a_file_written_under_sudo_goes_back_to_its_owner(home, monkeypatch):
-    cfg = home / ".databrickscfg"
-    owner = cfg.stat()
-    calls = []
-    monkeypatch.setattr(os, "geteuid", lambda: owner.st_uid + 1)
-    monkeypatch.setattr(os, "chown", lambda path, uid, gid: calls.append((path, uid, gid)))
-    assert _logout("other") is True
-    assert calls == [(os.path.realpath(cfg), owner.st_uid, owner.st_gid)]
+def test_another_users_file_is_left_alone(home, monkeypatch, caplog):
+    # Under sudo the rewrite would leave the owner a file they cannot read.
+    owner = (home / ".databrickscfg").stat().st_uid
+    monkeypatch.setattr(os, "geteuid", lambda: owner + 1)
+    with caplog.at_level(logging.INFO):
+        assert _logout("other") is False
+    assert (home / ".databrickscfg").read_text(encoding="utf-8") == TWO_PROFILES
+    assert "belongs to another user" in caplog.text
 
 
 def test_unparsable_file_is_untouched_and_not_quoted(home, caplog):

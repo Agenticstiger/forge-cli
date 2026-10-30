@@ -85,7 +85,7 @@ def drop_profile(profile: Optional[str], logger: logging.Logger) -> bool:
         profiles = read_profiles(text)
         if not profile and not _names(profiles):
             return True  # no profile in the file: nothing to remove
-        refusal = _refusal(profile, profiles, before.st_nlink)
+        refusal = _refusal(profile, profiles, before)
         if refusal is None and profile:
             text = remove_profile(text, profile)
     except ConfigFileError as exc:
@@ -98,12 +98,6 @@ def drop_profile(profile: Optional[str], logger: logging.Logger) -> bool:
 
     # Owner-only (0600) through a temp file and a rename, never a delete.
     _atomic_write_bytes(Path(real), text.encode("utf-8"), mode=0o600)
-    if hasattr(os, "chown") and before.st_uid != os.geteuid():
-        # Run under sudo: hand the file back to its owner, whose tools read it.
-        try:
-            os.chown(real, before.st_uid, before.st_gid)
-        except OSError:
-            logger.warning("%s now belongs to this user, not to its previous owner.", path)
     logger.info(
         "Removed profile %r from %s (kept: %s). The token or secret it held stays valid "
         "until it is revoked in the Databricks workspace.",
@@ -115,7 +109,7 @@ def drop_profile(profile: Optional[str], logger: logging.Logger) -> bool:
 
 
 def _refusal(
-    profile: Optional[str], profiles: Dict[str, Dict[str, str]], links: int
+    profile: Optional[str], profiles: Dict[str, Dict[str, str]], before: os.stat_result
 ) -> Optional[str]:
     """Why ``profile`` stays in a file that holds ``profiles``; None when it may go."""
     names = ", ".join(_names(profiles)) or "none"
@@ -138,9 +132,13 @@ def _refusal(
             f"`databricks auth logout --profile={shlex.quote(profile)} --delete` so its "
             "cached tokens go too."
         )
-    if links > 1:
+    if before.st_nlink > 1:
         # The rename replaces one name; the file's other names would keep the token.
         return f"another hard link to this file would keep [{profile}]; remove it by hand."
+    if hasattr(os, "geteuid") and before.st_uid != os.geteuid():
+        # The rewrite would belong to this user (root, under sudo), and the
+        # owner's own tools could no longer read it.
+        return "it belongs to another user; run the logout as that user."
     return None
 
 
