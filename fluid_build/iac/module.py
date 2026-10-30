@@ -26,11 +26,18 @@ read those from the environment, keeping the artifact secret-free.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 
 from .base import IacProviderPlugin
 from .importer import ImportBlock, import_section
 from .naming import TofuExpr
+
+#: Where the committed OpenTofu dependency locks live (shipped as package data).
+_LOCKS_DIR = Path(__file__).parent / "providers" / "locks"
+
+#: The file ``tofu init`` reads and verifies provider packages against.
+LOCK_FILE_NAME = ".terraform.lock.hcl"
 from .versions import REQUIRED_TOFU_VERSION
 
 
@@ -145,3 +152,32 @@ def build_module(
         provider={plugin.name: provider_cfg} if provider_cfg else None,
     )
     return render_tofu_json(document)
+
+
+def dependency_lock(plugin: IacProviderPlugin) -> Optional[str]:
+    """The committed ``.terraform.lock.hcl`` text for ``plugin``, or ``None``.
+
+    A plugin opts in with a ``dependency_lock`` attribute naming a file under
+    ``iac/providers/locks/``; the rest ship none and ``tofu init`` records
+    whatever it installs, as before. With the lock in place ``tofu init``
+    installs exactly the locked version and checks the package against the
+    recorded checksums, which matters where the registry has no signing key
+    for the provider (Databricks: opentofu/opentofu#4814). OpenTofu's own
+    guidance is to commit the lock next to the configuration; forge-cli writes
+    the configuration, so it ships the lock.
+    """
+    name = getattr(plugin, "dependency_lock", None)
+    if not name:
+        return None
+    return (_LOCKS_DIR / name).read_text(encoding="utf-8")
+
+
+def write_dependency_lock(plugin: IacProviderPlugin, directory: Union[str, Path]) -> None:
+    """Write ``plugin``'s committed lock into the module ``directory``, if it has one.
+
+    Written over any lock ``tofu init`` left there: the plugin's version pin
+    and its committed lock move together, so the committed file is the record.
+    """
+    text = dependency_lock(plugin)
+    if text is not None:
+        (Path(directory) / LOCK_FILE_NAME).write_text(text, encoding="utf-8")

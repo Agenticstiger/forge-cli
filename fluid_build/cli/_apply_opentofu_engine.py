@@ -44,6 +44,7 @@ from fluid_build.iac.backend import (
 )
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.credentials import build_tofu_env, credential_report
+from fluid_build.iac.module import write_dependency_lock
 from fluid_build.iac.naming import safe_ident
 from fluid_build.iac.state_migration import (
     PENDING,
@@ -141,6 +142,9 @@ def apply_via_opentofu(
     module_path = workdir / "main.tf.json"
     module, actions = emit_module(plugin, contract, target, logger)
     module_path.write_text(module, encoding="utf-8")
+    # The provider version and checksums `tofu init` must accept, for a plugin
+    # that ships a committed lock (iac/module.py::dependency_lock).
+    write_dependency_lock(plugin, workdir)
 
     env = build_tofu_env()
     env.update(plugin.credential_env(env))

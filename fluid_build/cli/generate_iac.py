@@ -37,6 +37,7 @@ from fluid_build.iac import (
     render_tofu_json,
 )
 from fluid_build.iac.base import UnsupportedBindingError
+from fluid_build.iac.module import write_dependency_lock
 from fluid_build.iac.packaging import resolve_packaging
 
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
@@ -140,6 +141,9 @@ def run(args, logger: logging.Logger) -> int:
         out_path = os.path.join(out_dir, "main.tf.json")
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(rendered)
+        # Next to the module, as OpenTofu expects a committed lock: `--validate`
+        # and the reviewer's own `tofu init` then install the locked provider.
+        write_dependency_lock(plugin, out_dir)
     except CLIError:
         raise
     except UnsupportedBindingError as exc:
