@@ -172,11 +172,52 @@ _DUCKDB: Dict[str, str] = {
     "uuid": "uuid",
 }
 
+# Databricks SQL, for dbt-databricks and for the Unity Catalog table the IaC
+# emitter creates (``iac/providers/databricks.py`` types its columns through
+# this table, so the table and a dbt model contract agree). Follows
+# datacontract-cli's ``convert_to_databricks`` except for ``float``: FLUID's
+# float is the generic floating type, which every other table here resolves to
+# 64 bits, so it is ``double`` rather than Databricks' 4-byte ``float``. The
+# integer spellings are native keys so ``int8`` is not narrowed to ``int``.
+_DATABRICKS: Dict[str, str] = {
+    "string": "string",
+    "integer": "int",
+    "number": "decimal",
+    "float": "double",
+    "boolean": "boolean",
+    "date": "date",
+    "timestamp": "timestamp",
+    "datetime": "timestamp_ntz",
+    "array": "array<string>",
+    "object": "variant",
+    # Native spellings with no cross-platform alias.
+    "int": "int",
+    "int2": "smallint",
+    "int4": "int",
+    "int8": "bigint",
+    "bigint": "bigint",
+    "long": "bigint",
+    "smallint": "smallint",
+    "tinyint": "tinyint",
+    "byteint": "tinyint",
+    "double": "double",
+    "decimal": "decimal",
+    "numeric": "decimal",
+    "timestamp_ntz": "timestamp_ntz",
+    "binary": "binary",
+    "bytes": "binary",
+    "varbinary": "binary",
+    "blob": "binary",
+    "variant": "variant",
+    "time": "string",  # Databricks has no TIME type
+}
+
 _ADAPTER_TABLES: Dict[str, Dict[str, str]] = {
     "bigquery": _BIGQUERY,
     "snowflake": _SNOWFLAKE,
     "redshift": _REDSHIFT,
     "duckdb": _DUCKDB,
+    "databricks": _DATABRICKS,
 }
 
 # Fallback for FLUID types unknown to an adapter table (mirrors the generic
@@ -186,6 +227,7 @@ _ADAPTER_FALLBACK: Dict[str, str] = {
     "snowflake": "varchar",
     "redshift": "varchar",
     "duckdb": "varchar",
+    "databricks": "string",
 }
 
 # SQL alias spellings folded onto a canonical FLUID scalar *before* the
@@ -276,6 +318,7 @@ _PARAMETRIC: Dict[str, frozenset] = {
     ),
     "redshift": frozenset({"varchar", "char", "character", "decimal", "numeric"}),
     "duckdb": frozenset({"varchar", "decimal", "numeric"}),
+    "databricks": frozenset({"decimal"}),
     # Generic (adapter-less) skeleton casts.
     "": frozenset({"varchar", "char", "decimal", "numeric", "timestamp"}),
 }
@@ -365,6 +408,9 @@ _SCALE_ZERO_DEFAULTS: Dict[str, Dict[str, str]] = {
         "decimal": "NUMBER(38,0)",
         "numeric": "NUMBER(38,0)",
     },
+    # Databricks: DECIMAL with no precision and scale is DECIMAL(10,0) (the
+    # Databricks SQL DECIMAL docs; the Terraform provider normalises the same way).
+    "databricks": {"decimal": "DECIMAL(10,0)"},
 }
 
 
@@ -381,7 +427,7 @@ def precision_warnings(contract: Mapping[str, Any], build: Mapping[str, Any]) ->
     contract edit: ``type: number(12,2)``, which :func:`sql_type` now honours.
     Returns a list of human-readable strings, empty when nothing is at risk.
     """
-    adapter = adapter_for_build(build)
+    adapter = adapter_for_build(build, contract)
     at_risk = _SCALE_ZERO_DEFAULTS.get(adapter)
     if not at_risk:
         return []
@@ -417,17 +463,37 @@ def precision_warnings(contract: Mapping[str, Any], build: Mapping[str, Any]) ->
     return out
 
 
-def adapter_for_build(build: Mapping[str, Any]) -> str:
-    """Resolve the dbt profile adapter for a contract build.
+def build_platform(build: Mapping[str, Any], contract: Optional[Mapping[str, Any]] = None) -> str:
+    """The platform a build runs on, lower-cased.
 
-    Reads ``builds[].execution.runtime.platform`` with the same platform
-    dispatch as ``profiles.py::_profile_for_platform`` so the contract
-    ``data_type`` always matches the adapter the generated
-    ``profiles.yml`` targets.
+    ``builds[].execution.runtime.platform`` when the build declares it, else the
+    platform of the contract's first ``exposes[].binding`` (where the build's
+    output lands), else ``local``. Without the binding fallback a contract that
+    names its platform only on the binding got a DuckDB profile and DuckDB
+    column types, whatever the binding said.
     """
     execution = build.get("execution", {}) if isinstance(build, Mapping) else {}
     runtime = execution.get("runtime", {}) if isinstance(execution, Mapping) else {}
-    platform = str(runtime.get("platform", "local") or "local").lower()
+    platform = runtime.get("platform") if isinstance(runtime, Mapping) else None
+    if not platform and isinstance(contract, Mapping):
+        for expose in contract.get("exposes", []) or []:
+            binding = expose.get("binding") if isinstance(expose, Mapping) else None
+            if isinstance(binding, Mapping) and binding.get("platform"):
+                platform = binding["platform"]
+                break
+    return str(platform or "local").lower()
+
+
+def adapter_for_build(
+    build: Mapping[str, Any], contract: Optional[Mapping[str, Any]] = None
+) -> str:
+    """Resolve the dbt profile adapter for a contract build.
+
+    Reads the platform with :func:`build_platform` and the same dispatch as
+    ``profiles.py::_profile_for_platform``, so the contract ``data_type``
+    always matches the adapter the generated ``profiles.yml`` targets.
+    """
+    platform = build_platform(build, contract)
 
     if platform in ("gcp", "bigquery"):
         return "bigquery"
@@ -435,4 +501,6 @@ def adapter_for_build(build: Mapping[str, Any]) -> str:
         return "snowflake"
     if platform in ("aws", "redshift"):
         return "redshift"
+    if platform == "databricks":
+        return "databricks"
     return "duckdb"

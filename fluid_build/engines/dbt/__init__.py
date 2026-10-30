@@ -125,7 +125,7 @@ class DbtEngine(TransformationEngine):
         # ``--model-contracts`` project fails its own contract on first run.
         from . import _types as _types
 
-        adapter = _types.adapter_for_build(build)
+        adapter = _types.adapter_for_build(build, contract)
 
         model_files = generate_models(
             contract,

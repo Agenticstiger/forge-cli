@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the contracts it builds and assumes where none is declared. What graduates is everything 0.7.6
   added while in preview, as the 0.13.0 to 0.25.0 entries list it: among it declarative packaging
   modes, `engine: flink`, `trigger.type: continuous`, identity-keyed overlay merges, column
+- **A dbt build with no `builds[].execution.runtime.platform` takes its platform from the first
+  `exposes[].binding`**, for the generated `profiles.yml` and the model-contract column types. It
+  fell back to DuckDB whatever the binding said, so a contract that named its platform only on the
+  binding got a profile for the wrong warehouse. A build that declares its runtime platform is
+  unchanged.
   masking and row filters, KMS keys, federation pins, and the exporter fields (`metadata.team`,
   the object root `description`, `exposes[].contract.id`, a column's `quality`). 0.7.7 is
   identical to 0.7.6 at open; additive preview fields land there. A contract validates against
@@ -76,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cli_unhandled_exception`, because the handlers around the parsers caught a `ValueError` the
   parsers never raise. It is the event the flag names now (`invalid_schema_version`,
   `invalid_min_version`, `invalid_max_version`), with its hints; the `invalid_schema_version`
+- **`fluid generate` writes a Databricks `profiles.yml` and Databricks column types for a dbt
+  build on Databricks.** It wrote a DuckDB profile and DuckDB types, and the dbt runner prefers a
+  `profiles.yml` in the project directory, so a run could build into a local DuckDB file instead
+  of the workspace. The profile reads the same environment variables as the dbt runner's
+  (`DATABRICKS_HOST`, `DATABRICKS_HTTP_PATH`, `DATABRICKS_TOKEN`), with the catalog and schema
+  from the contract's Databricks binding.
   hint names `fluid validate --list-versions`, the command that lists the versions.
 - **`fluid validate --quiet` printed nothing when a run stopped** on an error such as
   `contract_load_failed`, although `--quiet` is "errors only". The error now prints; the hints

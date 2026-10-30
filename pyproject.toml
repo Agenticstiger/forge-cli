@@ -732,6 +732,7 @@ markers = [
     "aws: Tests requiring AWS credentials",
     "gcp: Tests requiring GCP credentials",
     "snowflake: Tests requiring Snowflake credentials",
+    "databricks: Databricks provider tests (offline tiers use an in-process stand-in, never a workspace)",
     "provider: Tests for provider implementations",
     "datamesh: Tests for DataMesh Manager provider",
     "policy: Tests for policy validators",
