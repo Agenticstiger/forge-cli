@@ -279,7 +279,7 @@ class TestContractValidator:
 
     @patch("fluid_build.cli.contract_validation.load_contract_with_overlay")
     @patch("fluid_build.cli.contract_validation.FluidSchemaManager")
-    def test_databricks_live_validation_not_available(self, MockSM, mock_load):
+    def test_databricks_provider_not_implemented(self, MockSM, mock_load):
         contract = self._make_contract()
         contract["exposes"][0]["binding"]["platform"] = "databricks"
         mock_load.return_value = contract

@@ -290,6 +290,10 @@ def test_refusal(label: str, overrides: Dict[str, Any], kind: str):
     with pytest.raises(UnsupportedBindingError) as exc:
         IAC_PLUGINS["databricks"].emit(contract)
     assert exc.value.kind == f"databricks-{kind}"
+    # The plan-only provider refuses it too: a refused table would leave no
+    # action, a smaller plan instead of an error.
+    with pytest.raises(UnsupportedBindingError):
+        dbx.planned_objects(contract)
 
 
 def test_a_build_that_names_its_own_host_is_refused():
@@ -724,14 +728,6 @@ class TestPlanner:
         with pytest.raises(ProviderError):
             provider.apply([])
         assert provider.capabilities()["apply"] is False
-
-    def test_refuses_what_the_emitter_refuses(self):
-        # The refused table would leave no action: an empty plan, exit 0.
-        contract = _contract()
-        contract["exposes"][0]["binding"]["location"]["host"] = "adb-1.azuredatabricks.net"
-        with pytest.raises(UnsupportedBindingError) as exc:
-            dbx.planned_objects(contract)
-        assert exc.value.kind == "databricks-host-in-contract"
 
 
 def test_an_import_failure_the_plugin_knows_gets_its_fix_it(monkeypatch):
