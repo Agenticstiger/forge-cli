@@ -72,6 +72,15 @@ class TestProfile:
         assert dev["host"] == "{{ env_var('DATABRICKS_HOST') }}"
         assert dev["token"] == "{{ env_var('DATABRICKS_TOKEN') }}"
 
+    def test_the_schema_comes_from_the_catalogs_binding(self):
+        # A BigQuery expose listed first must not lend its dataset to the
+        # Databricks profile, whose catalog comes from the Databricks binding.
+        contract = _contract("databricks")
+        gcp = {"exposeId": "bq", "binding": {"platform": "gcp", "location": {"dataset": "ds"}}}
+        contract["exposes"].insert(0, gcp)
+        dev = _dev(generate_profiles(contract, contract["builds"][0]))
+        assert dev["catalog"] == "main" and dev["schema"] == "sales"
+
     def test_a_binding_only_contract_gets_databricks(self):
         contract = _contract()  # no builds[].execution.runtime.platform
         assert _dev(generate_profiles(contract, contract["builds"][0]))["type"] == "databricks"

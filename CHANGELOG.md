@@ -20,13 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract. A table that already exists is imported before the first apply instead of being
   replaced. A dropped column is refused like a destroy unless `--allow-data-loss` is given, and
   so is a rename: with the column count unchanged the provider renames by position, so the old
-  values would stay under the new name. A revoked grant is not refused. A column type change, a
-  missing catalog or missing credentials fails at plan, naming the column, the catalog or the
-  variables to set. `fluid validate` refuses what would apply without being enforced: a host in
+  values would stay under the new name. A column reorder is refused outright, as no apply can
+  reach it. A revoked grant is not refused. A column type change, a missing catalog, missing
+  credentials or a workspace that does not answer fails at plan, naming the column, the catalog,
+  the variables to set or the host. `fluid validate` refuses what would apply without being enforced: a host in
   the contract (on a binding or a build), Iceberg, masks, row filters, column restrictions, a
-  packaging block, and a column type Databricks has no mapping for (it would be created as
-  `string`) or would reject. It warns when a bare `number` or `decimal` would be created as
-  DECIMAL(10,0), which keeps no fractional digits. The product owns its
+  packaging block, a `binding.location` key it would drop (`path`, `region`, ...), duplicate
+  partitions, and a column type Databricks has no mapping for (it would be created as `string`)
+  or would reject. It warns when a DECIMAL with no scale would keep no fractional digits. The
+  product owns its
   schema: a grant is authoritative for its principal, so on a schema that already existed and
   that other teams share, each principal the contract names keeps `USE_SCHEMA` alone there.
   Jobs (dbt on serverless compute) come next.
@@ -37,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `exposes[].binding`**, for the generated `profiles.yml` and the model-contract column types. It
   fell back to DuckDB whatever the binding said, so a contract that named its platform only on the
   binding got a profile for the wrong warehouse. A build that declares its runtime platform is
-  unchanged.
+  unchanged. The dbt runner's own generated profile, used only when a project carries no
+  `profiles.yml`, still defaults to DuckDB.
 - **`fluid import`, `fluid product-new`, `fluid init --discover`, `fluid forge data-model
   from-source` and the `fluid forge --scaffold` templates declare the newest stable schema, 0.7.6,
   not 0.7.3**, which was two stable versions behind the templates #619 moved, so a contract they
@@ -89,7 +92,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `profiles.yml` in the project directory, so a run could build into a local DuckDB file instead
   of the workspace. The profile reads the same environment variables as the dbt runner's
   (`DATABRICKS_HOST`, `DATABRICKS_HTTP_PATH`, `DATABRICKS_TOKEN`), with the catalog and schema
-  from the contract's Databricks binding.
+  from the contract's Databricks binding. For every adapter, a contract's catalog, schema or
+  dataset now reaches `profiles.yml` only as literal text, a FLUID placeholder or dbt's exact
+  `{{ env_var('NAME') }}` (with an optional quoted default) naming no credential-shaped
+  variable; other Jinja, such as `{{ target.name }}`, is left out with a warning and the
+  environment default applies, since dbt prints these values back in errors and run logs.
 - **`fluid validate --fragment` no longer guesses a schema version.** With no `--schema-version`
   and no root contract above the fragment, it checked the fragment against the newest stable
   schema (0.7.5), so a valid 0.7.6 fragment failed on a field 0.7.5 does not have; a root contract

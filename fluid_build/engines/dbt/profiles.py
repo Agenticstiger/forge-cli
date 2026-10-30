@@ -67,11 +67,14 @@ def generate_profiles(
     contract_id = contract.get("id", "fluid_project")
     profile_name = _sanitize_project_name(contract_id)
 
+    platform = _types.build_platform(build, contract)
     profile = _profile_for_platform(
-        _types.build_platform(build, contract),
+        platform,
         profile_name,
         output_dir=output_dir,
-        schema_expr=resolve_schema_expr(contract, build),
+        schema_expr=resolve_schema_expr(
+            contract, build, platform="databricks" if platform == "databricks" else None
+        ),
         catalog_expr=resolve_catalog_expr(contract, build),
     )
     if not profile:
@@ -85,6 +88,8 @@ def generate_profiles(
 def resolve_schema_expr(
     contract: Dict[str, Any],
     build: Dict[str, Any],
+    *,
+    platform: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve the dbt target schema the *contract* declares.
 
@@ -106,9 +111,13 @@ def resolve_schema_expr(
     ``env_var('X')`` by the same normaliser ``sources.py`` uses, so the two
     emitters agree on how contract placeholders reach dbt. Returns ``None``
     when the contract declares no schema, leaving the caller's env-var
-    fallback in place.
+    fallback in place. With ``platform``, only that platform's bindings count:
+    a Databricks profile takes its schema from the binding it takes its catalog
+    from, not from another cloud's expose in the same contract.
     """
-    return _declared_expr(contract, build, ("schema", "dataset"), ("schema", "dataset"))
+    return _declared_expr(
+        contract, build, ("schema", "dataset"), ("schema", "dataset"), platform=platform
+    )
 
 
 def resolve_catalog_expr(
