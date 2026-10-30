@@ -279,6 +279,14 @@ _REFUSALS = [
         "column-duplicate",
     ),
     ("partition", {"exposes.0.binding.location.partitionBy": ["nope"]}, "partition-column"),
+    (
+        "dup-partition",
+        {"exposes.0.binding.location.partitionBy": ["region", "Region"]},
+        "partition-duplicate",
+    ),
+    # Location keys the emitter would drop: an external path, a cloud region.
+    ("path", {"exposes.0.binding.location.path": "s3://lake/orders/"}, "location-field"),
+    ("region", {"exposes.0.binding.location.region": "eu-west-1"}, "location-field"),
 ]
 
 

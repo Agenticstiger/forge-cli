@@ -95,6 +95,13 @@ RETRY_TIMEOUT_SECONDS = 60
 _DELTA_FORMATS = ("delta_table",)
 _ICEBERG_FORMATS = ("iceberg", "iceberg_table")
 
+#: The ``binding.location`` keys the emitter reads, or refuses with a message of
+#: their own. Any other key the schema allows (``path``, ``region``, ...) would
+#: be dropped, so it is refused.
+_LOCATION_KEYS = frozenset(
+    {"database", "schema", "table", "partitionBy", "host", "catalog", "warehouse"}
+)
+
 #: FLUID permission → Unity Catalog table privilege. ``create`` has no table
 #: privilege and is skipped, as the BigQuery table map skips it.
 _TABLE_PRIVILEGES = {
@@ -431,6 +438,16 @@ def _refuse_shape(
                     f"Remove location.{key}; put the catalog in location.database.",
                 )
             )
+    for key in sorted(k for k in loc if k not in _LOCATION_KEYS and _set(loc[k])):
+        refusals.append(
+            _refusal(
+                "location-field",
+                f"{where} sets binding.location.{key}, which the Databricks emitter does not "
+                "map: it creates a managed Delta table in location.database and "
+                "location.schema.",
+                f"Remove location.{key}.",
+            )
+        )
     if _set(binding.get("packaging")):
         refusals.append(_packaging_refusal(f"{where} binding.packaging"))
 
@@ -523,6 +540,15 @@ def _partitions(
                     "partition-column",
                     f"{where} partitions by {name!r}, which contract.schema does not declare.",
                     "Partition by a declared column, or declare it.",
+                )
+            )
+        elif name in partitions:
+            refusals.append(
+                _refusal(
+                    "partition-duplicate",
+                    f"{where} partitions by {name!r} twice; CREATE TABLE rejects that after "
+                    "the schema was created.",
+                    "List each partition column once.",
                 )
             )
         elif name is not None:
