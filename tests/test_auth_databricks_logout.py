@@ -62,6 +62,7 @@ posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX file modes and
 def home(tmp_path, monkeypatch):
     """A scratch HOME holding a two-profile ~/.databrickscfg (mode 0600)."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # what expanduser reads on Windows
     monkeypatch.delenv("DATABRICKS_CONFIG_FILE", raising=False)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     cfg = tmp_path / ".databrickscfg"
@@ -71,8 +72,7 @@ def home(tmp_path, monkeypatch):
 
 
 def _logout(profile=None) -> bool:
-    config = {"databricks": {"profile": profile}} if profile else {}
-    return asyncio.run(AuthManager(config, LOG).logout("databricks"))
+    return asyncio.run(AuthManager({}, LOG).logout("databricks", profile=profile))
 
 
 def _mode(path) -> int:
@@ -162,6 +162,36 @@ def test_oauth_profile_is_left_to_the_databricks_cli(home, caplog):
         assert _logout("sso") is False
     assert cfg.read_text(encoding="utf-8") == text
     assert "databricks auth logout --profile=sso --delete" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "auth_type", ['"databricks-cli"', "'databricks-cli'", "databricks-cli # sso"]
+)
+def test_oauth_profile_is_recognised_as_the_databricks_cli_reads_it(home, auth_type):
+    cfg = home / ".databrickscfg"
+    text = (
+        f"{TWO_PROFILES}\n[sso]\nhost = https://sso.cloud.databricks.com\nauth_type = {auth_type}\n"
+    )
+    cfg.write_text(text, encoding="utf-8")
+    assert _logout("sso") is False
+    assert cfg.read_text(encoding="utf-8") == text
+
+
+def test_a_file_that_is_not_utf8_is_left_alone(home, caplog):
+    cfg = home / ".databrickscfg"
+    data = b"[DEFAULT]\nhost = https://default.cloud.databricks.com\xff\n"
+    cfg.write_bytes(data)
+    with caplog.at_level(logging.INFO):
+        assert _logout("DEFAULT") is False
+    assert cfg.read_bytes() == data
+    assert "was not changed: it is not UTF-8 text" in caplog.text
+
+
+def test_crlf_survives_the_round_trip_through_the_file(home):
+    cfg = home / ".databrickscfg"
+    cfg.write_bytes(TWO_PROFILES.replace("\n", "\r\n").encode())
+    assert _logout("DEFAULT") is True
+    assert cfg.read_bytes() == OTHER_BLOCK.replace("\n", "\r\n").encode()
 
 
 def test_dash_named_profiles_stay_values_in_the_hints(home, monkeypatch, caplog):
@@ -317,6 +347,21 @@ def test_an_empty_keyring_that_reports_not_found_is_a_clean_logout(home):
     assert _logout("other") is True
 
 
+def test_a_locked_keychain_fails_the_logout(home, caplog):
+    # Reads raise and deletes are denied: nothing confirms the token is gone.
+    keyring.set_keyring(_Keyring(reads_fail=True, deletes_fail=PasswordDeleteError))
+    with caplog.at_level(logging.INFO):
+        assert _logout("other") is False
+    assert "Could not remove the Databricks host and token" in caplog.text
+
+
+def test_no_keyring_backend_is_a_clean_logout(home):
+    from keyring.backends import fail
+
+    keyring.set_keyring(fail.Keyring())
+    assert _logout("other") is True
+
+
 @pytest.mark.parametrize("error", [KeyringError, PasswordDeleteError])
 def test_a_keyring_that_refuses_the_delete_fails_the_logout(home, caplog, error):
     backend = _Keyring(deletes_fail=error)
@@ -362,7 +407,14 @@ def test_cli_profile_is_refused_for_other_providers(home, monkeypatch, caplog, c
     monkeypatch.setattr("shutil.which", lambda name: None)
     with caplog.at_level(logging.INFO):
         assert _fluid("aws", "dev") == 1
-    assert "applies to databricks only" in caplog.text + "".join(capsys.readouterr())
+    assert "fluid auth logout aws takes no profile" in caplog.text + "".join(capsys.readouterr())
+
+
+def test_programmatic_callers_get_the_same_refusal(home, monkeypatch, caplog):
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    with caplog.at_level(logging.INFO):
+        assert asyncio.run(AuthManager({}, LOG).logout("aws", profile="dev")) is False
+    assert "fluid auth logout aws takes no profile" in caplog.text
 
 
 # ── the line-level cut itself ─────────────────────────────────────────
@@ -373,7 +425,32 @@ def test_config_path_follows_databricks_config_file(monkeypatch, tmp_path):
     assert cfgfile.config_path() == str(tmp_path / "x.cfg")
     monkeypatch.delenv("DATABRICKS_CONFIG_FILE")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     assert cfgfile.config_path() == str(tmp_path / ".databrickscfg")
+
+
+def test_status_reads_the_file_logout_edits(home, tmp_path, monkeypatch):
+    from fluid_build.cli.auth import AuthResult, AuthStatus, DatabricksAuthProvider
+
+    team = tmp_path / "team.cfg"
+    team.write_text(
+        "[DEFAULT]\nhost = https://team.cloud.databricks.com\ntoken = dapi-fake-team\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(team))
+    monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+    monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    provider = DatabricksAuthProvider({}, LOG)
+    hosts = []
+
+    def _validate(host, token):
+        hosts.append(host)
+        return AuthResult(provider="databricks", status=AuthStatus.NOT_AUTHENTICATED)
+
+    monkeypatch.setattr(provider, "_validate_via_api", _validate)
+    asyncio.run(provider.check_auth())
+    assert hosts == ["https://team.cloud.databricks.com"]
 
 
 def test_default_profile_pointer_goes_with_its_profile():
@@ -391,6 +468,13 @@ def test_a_default_pointer_goes_as_the_databricks_cli_reads_it(pointer):
     text = TWO_PROFILES + f"\n[__settings__]\ndefault_profile = {pointer}\n"
     result = cfgfile.remove_profile(text, "other")
     assert cfgfile.read_profiles(result)["__settings__"] == {}
+
+
+def test_a_pointer_go_ini_reads_as_another_name_stays():
+    # A quote inside the value stops go-ini from stripping the outer pair.
+    text = TWO_PROFILES + '\n[__settings__]\ndefault_profile = "o"ther"\n'
+    result = cfgfile.remove_profile(text, "other")
+    assert cfgfile.read_profiles(result)["__settings__"] == {"default_profile": '"o"ther"'}
 
 
 def test_default_profile_pointer_to_another_profile_stays():

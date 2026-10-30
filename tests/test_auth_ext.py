@@ -399,6 +399,7 @@ class TestDatabricksAuthProvider:
     def test_logout_never_deletes_config_file(self, tmp_path, monkeypatch):
         # ~/.databrickscfg holds every profile: with none named, nothing changes.
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         monkeypatch.delenv("DATABRICKS_CONFIG_FILE", raising=False)
         cfg = tmp_path / ".databrickscfg"
         cfg.write_text("[DEFAULT]\nhost = h\n")

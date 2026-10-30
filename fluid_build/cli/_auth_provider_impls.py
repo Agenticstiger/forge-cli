@@ -980,18 +980,11 @@ class SnowflakeAuthProvider(AuthProvider):
             return AuthResult(provider=self.name, status=AuthStatus.ERROR, error_message=str(e))
 
 
-def _keyring_lacks(service: str, username: str) -> bool:
-    """True when a keyring read confirms nothing is stored under ``username``."""
-    import keyring
-
-    try:
-        return keyring.get_password(service, username) is None
-    except Exception:
-        return False
-
-
 class DatabricksAuthProvider(AuthProvider):
     """Databricks authentication provider"""
+
+    #: ``fluid auth logout databricks <profile>``: the one config-file profile to remove.
+    logout_options = frozenset({"profile"})
 
     def __init__(self, config: Dict[str, Any], logger: logging.Logger):
         super().__init__("databricks", config, logger)
@@ -999,9 +992,6 @@ class DatabricksAuthProvider(AuthProvider):
         self.token = config.get("token")
         self.cluster_id = config.get("cluster_id")
         self.workspace_id = config.get("workspace_id")
-        # The one config-file profile logout may remove
-        # (``fluid auth logout databricks <profile>``).
-        self.profile = config.get("profile")
 
     def _validate_via_api(self, host: str, token: str) -> AuthResult:
         """Validate Databricks credentials via REST API (no CLI needed)."""
@@ -1171,8 +1161,10 @@ class DatabricksAuthProvider(AuthProvider):
                 if result.status == AuthStatus.AUTHENTICATED:
                     return self._annotate_method(result, "saved access token")
 
-            # 4. ~/.databrickscfg file
-            cfg_path = os.path.expanduser("~/.databrickscfg")
+            # 4. ~/.databrickscfg file (DATABRICKS_CONFIG_FILE moves it, as logout honours)
+            from fluid_build.cli._databrickscfg import config_path
+
+            cfg_path = config_path()
             if os.path.exists(cfg_path):
                 try:
                     import configparser
@@ -1205,21 +1197,21 @@ class DatabricksAuthProvider(AuthProvider):
         except Exception as e:
             return AuthResult(provider=self.name, status=AuthStatus.ERROR, error_message=str(e))
 
-    async def logout(self) -> bool:
+    async def logout(self, profile: Optional[str] = None) -> bool:
         """Forget the Databricks credentials fluid saved, plus one named profile.
 
         ``fluid auth login`` saves a host and token to the OS keyring; those
         are fluid's own and always go. The config file
         (``DATABRICKS_CONFIG_FILE``, else ``~/.databrickscfg``) belongs to the
         Databricks CLI, SDK, dbt and terraform and holds every profile, so
-        only the profile named in ``config["profile"]`` is cut from it. With
-        no name, nothing in the file changes; the file is never deleted.
+        only ``profile`` is cut from it. With no profile, nothing in the file
+        changes; the file is never deleted.
         """
         try:
             from fluid_build.cli import _databrickscfg
 
             forgot = self._forget_saved_credentials()
-            return _databrickscfg.drop_profile(self.profile, self.logger) and forgot
+            return _databrickscfg.drop_profile(profile, self.logger) and forgot
         except Exception as e:
             self.logger.error("Failed to log out of Databricks: %s", redact_secret_text(str(e)))
             return False
@@ -1230,27 +1222,8 @@ class DatabricksAuthProvider(AuthProvider):
         Both deletes run even when a read finds nothing, since a backend that
         fails to read may still hold them; False when one is not confirmed gone.
         """
-        import keyring
-        from keyring.errors import NoKeyringError, PasswordDeleteError
-
-        from fluid_build.credentials.keyring_store import KeyringCredentialStore
-
-        service = KeyringCredentialStore.SERVICE_NAME
         saved = [key for key in ("host", "token") if self._get_keyring_credential(key)]
-        failed = []
-        for key in ("host", "token"):
-            try:
-                keyring.delete_password(service, f"{self.name}.{key}")
-            except NoKeyringError:
-                pass  # no keyring backend: nothing can have been saved
-            except PasswordDeleteError:
-                # "Not found", or (macOS backend) a denied or locked keychain:
-                # the key is gone only when a read confirms it.
-                if not _keyring_lacks(service, f"{self.name}.{key}"):
-                    failed.append(key)
-            except Exception:
-                # Keyring backend errors can echo the credential: name the key only.
-                failed.append(key)
+        failed = [key for key in ("host", "token") if not self._forget_keyring_credential(key)]
         if failed:
             self.logger.error(
                 "Could not remove the Databricks %s fluid saved in the OS keyring.",
@@ -1282,8 +1255,10 @@ class DatabricksAuthProvider(AuthProvider):
                 if result.status == AuthStatus.AUTHENTICATED:
                     return self._annotate_method(result, "REST API")
 
-            # Try ~/.databrickscfg
-            cfg_path = os.path.expanduser("~/.databrickscfg")
+            # Try ~/.databrickscfg (DATABRICKS_CONFIG_FILE moves it, as logout honours)
+            from fluid_build.cli._databrickscfg import config_path
+
+            cfg_path = config_path()
             if os.path.exists(cfg_path):
                 try:
                     import configparser

@@ -162,6 +162,9 @@ class AuthResult:
 class AuthProvider:
     """Base class for authentication providers"""
 
+    #: Options ``logout`` takes, e.g. Databricks' ``profile``; others are refused.
+    logout_options: frozenset[str] = frozenset()
+
     def __init__(self, name: str, config: Dict[str, Any], logger: logging.Logger):
         self.name = name
         self.config = config
@@ -235,6 +238,12 @@ class AuthProvider:
         except Exception as e:
             self.logger.debug(f"Failed to save to keyring: {e}")
             return False
+
+    def _forget_keyring_credential(self, key: str) -> bool:
+        """Delete a credential saved to the OS keyring; False if it may remain."""
+        from fluid_build.credentials.keyring_store import KeyringCredentialStore
+
+        return KeyringCredentialStore.forget_credential(f"{self.name}.{key}")
 
     def _offer_save_to_keyring(self, credentials: Dict[str, str]) -> None:
         """If interactive, ask the user whether to persist credentials to the OS keyring."""
@@ -383,14 +392,21 @@ class AuthManager:
 
         return await provider.login(**kwargs)
 
-    async def logout(self, provider_name: str) -> bool:
-        """Logout from specified provider"""
+    async def logout(self, provider_name: str, **options: Any) -> bool:
+        """Logout from specified provider; ``options`` must be ones it declares."""
         provider = self.get_provider(provider_name)
         if not provider:
             self.logger.error(f"Provider '{provider_name}' not found")
             return False
+        if options:
+            unsupported = sorted(set(options) - provider.logout_options)
+            if unsupported:
+                self.logger.error(
+                    f"❌ fluid auth logout {provider_name} takes no {', '.join(unsupported)}"
+                )
+                return False
 
-        return await provider.logout()
+        return await provider.logout(**options)
 
     async def check_auth(self, provider_name: str) -> AuthResult:
         """Check authentication status for specified provider"""
@@ -469,8 +485,9 @@ def register(subparsers: argparse._SubParsersAction):
         help="Logout from a provider",
         description=(
             f"Revoke credentials for a provider.\n\nAvailable providers: {_provider_names}\n\n"
-            "Databricks: ~/.databrickscfg holds every profile, so name the one to remove "
-            "(fluid auth logout databricks <profile>); the others are kept."
+            "Databricks: the config file (~/.databrickscfg, or DATABRICKS_CONFIG_FILE) holds "
+            "every profile, so name the one to remove (fluid auth logout databricks "
+            "<profile>); the others are kept."
         ),
     )
     logout_parser.add_argument(
@@ -483,7 +500,8 @@ def register(subparsers: argparse._SubParsersAction):
         "config_profile",
         nargs="?",
         metavar="profile",
-        help="Databricks only: the ~/.databrickscfg profile to remove",
+        help="Databricks only: the profile to remove from ~/.databrickscfg "
+        "(or DATABRICKS_CONFIG_FILE)",
     )
     logout_parser.set_defaults(func=run)
 
@@ -681,16 +699,9 @@ async def handle_logout(
     profile: Optional[str] = None,
 ) -> int:
     """Handle logout command; ``profile`` is the one ~/.databrickscfg profile to remove."""
-    if profile:
-        target = auth_manager.get_provider(provider)
-        if not isinstance(target, DatabricksAuthProvider):
-            logger.error(
-                f"❌ A profile applies to databricks only. Usage: fluid auth logout {provider}"
-            )
-            return 1
-        target.profile = profile
     try:
-        success = await auth_manager.logout(provider)
+        options = {"profile": profile} if profile else {}
+        success = await auth_manager.logout(provider, **options)
 
         if success:
             logger.info(f"✅ Successfully logged out from {provider}")

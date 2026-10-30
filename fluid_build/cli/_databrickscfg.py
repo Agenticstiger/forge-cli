@@ -78,16 +78,18 @@ def drop_profile(profile: Optional[str], logger: logging.Logger) -> bool:
         return not profile
     # The real file, so a symlinked ~/.databrickscfg stays a link.
     real = os.path.realpath(path)
-    with open(real, encoding="utf-8", newline="") as fh:
-        text = fh.read()
     before = os.stat(real)
     try:
+        with open(real, encoding="utf-8", newline="") as fh:
+            text = fh.read()
         profiles = read_profiles(text)
         if not profile and not _names(profiles):
             return True  # no profile in the file: nothing to remove
         refusal = _refusal(profile, profiles, before)
         if refusal is None and profile:
             text = remove_profile(text, profile)
+    except UnicodeDecodeError:
+        refusal = "it is not UTF-8 text."
     except ConfigFileError as exc:
         refusal = str(exc)
     if refusal is not None:
@@ -124,7 +126,7 @@ def _refusal(
         return f"[{profile}] holds the Databricks CLI's settings, not a profile."
     if profile not in profiles:
         return f"it has no profile {profile!r} (profiles: {names})."
-    if profiles[profile].get("auth_type") == "databricks-cli":
+    if _value(profiles[profile].get("auth_type", "")) == "databricks-cli":
         # Its OAuth tokens sit in the Databricks CLI's cache, found through this
         # profile: cut the profile first and the CLI can no longer clear them.
         return (
