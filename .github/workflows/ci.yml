@@ -258,27 +258,39 @@ jobs:
   # the same ~5-min profile (uniform legs are far less likely to be
   # singled out by runner-infra SIGTERM cancellations) while this job
   # runs concurrently, so overall PR wall-clock does not regress.
-  # Step order, commands, env, and Codecov behavior are preserved
-  # verbatim from the old 3.12 leg. The perf-budget suite is NOT
-  # duplicated here — it runs serially on every matrix leg above.
+  # The perf-budget suite is NOT duplicated here — it runs serially on
+  # every matrix leg above.
+  #
+  # Python 3.14, not 3.12: branch coverage (`branch = true`) can only use
+  # coverage.py's sys.monitoring core ("sysmon") on 3.14+, where it is the
+  # default; on 3.12 and 3.13 it falls back to the C tracer
+  # (https://coverage.readthedocs.io/en/latest/config.html, `[run] core`).
+  # Measured on tests/fragments/test_split.py, the heaviest module (390
+  # tests): 3.12 226s plain, 546s with coverage; 3.14 217s plain, 220s
+  # with coverage. The tracer's 2.4x took this job from ~15 to ~40 min
+  # once the fragment suite landed; under sysmon it costs about nothing.
   coverage-and-audit:
-    name: Coverage & Audit (Python 3.12)
+    name: Coverage & Audit (Python 3.14)
     runs-on: ubuntu-latest
-    # Observed ~20 min for the old overloaded 3.12 leg; this job carries
-    # the same coverage run minus the perf step. 45 gives headroom while
-    # still bounding a true hang to minutes, not GitHub's 6-hour default;
-    # it was 30 until the fragment scenario suite added about 12 minutes
-    # under coverage (the job ran 19, then past 30).
-    timeout-minutes: 45
+    # Under sysmon the run takes about as long as a plain test leg. 30
+    # bounds a true hang to minutes, not GitHub's 6-hour default, and is
+    # under the ~40 min a fallback to the C tracer takes, so a silent
+    # fallback fails the job instead of only slowing it.
+    timeout-minutes: 30
     env:
       # Same glibc-arena cap as the test matrix (see comment there) —
       # this is the identical thread-heavy pytest run, plus coverage.
       MALLOC_ARENA_MAX: "2"
+      # Set, not left to the 3.14 default: a default sysmon that meets a
+      # setting it cannot serve (a plugin, dynamic contexts) falls back to
+      # the C tracer without a word; set explicitly, coverage.py 7.17
+      # still falls back but logs a `no-sysmon` CoverageWarning.
+      COVERAGE_CORE: sysmon
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           cache: pip
 
       - name: Install dependencies
@@ -368,14 +380,14 @@ jobs:
         run: python -m coverage report || true
 
       # ── Artifacts ───────────────────────────────────────────────
-      # Distinct artifact name — the 3.12 matrix leg above still owns
-      # `test-results-py3.12` (its plain-run junit.xml), and duplicate
+      # Distinct artifact name — the 3.14 matrix leg above still owns
+      # `test-results-py3.14` (its plain-run junit.xml), and duplicate
       # artifact names fail under upload-artifact v4+.
       - name: Upload coverage results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: coverage-results-py3.12
+          name: coverage-results-py3.14
           path: |
             junit.xml
             coverage.xml
