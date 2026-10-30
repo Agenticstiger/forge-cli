@@ -836,7 +836,9 @@ def _in_place_changes(
     delete data (Databricks drops a removed column with ``ALTER TABLE ... DROP
     COLUMN``) or keep it under another name (a positional rename), and the
     change summary counts that as ``~``, never as ``-``. Fails closed: a plan
-    with updates that cannot be read back counts.
+    with updates that cannot be read back counts. A plan the provider cannot
+    apply at all (a Databricks column reorder) the plugin refuses, and no
+    ``--allow-data-loss`` lets it through.
     """
     review = getattr(plugin, "plan_data_changes", None)
     if not callable(review) or not int(changes.get("change", 0)):
@@ -844,7 +846,14 @@ def _in_place_changes(
     shown = runner.tofu_show_plan(workdir, plan_file="tfplan", env=env)
     if shown is None:
         return ["the saved plan could not be read back, so a dropped column cannot be ruled out"]
-    return list(review(shown))
+    try:
+        return list(review(shown))
+    except UnsupportedBindingError as exc:
+        raise CLIError(
+            1,
+            "unsupported_binding",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        )
 
 
 def _enforce_data_loss_gate(

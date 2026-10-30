@@ -896,6 +896,28 @@ def column_changes(
     return [name for name in old if name not in set(new)], []
 
 
+def column_reorder(
+    before: Sequence[Mapping[str, Any]], after: Sequence[Mapping[str, Any]]
+) -> Optional[Tuple[List[str], List[str]]]:
+    """``(live, declared)`` column orders the provider cannot get from one to the
+    other, else ``None``.
+
+    The provider never moves a column. With the count unchanged it renames by
+    position, so renaming onto a name the table already has (a swap) fails part
+    way through the apply. With the count changed it adds and drops by name, so
+    columns kept in a new order stay where they are, and the next plan, at an
+    equal count, renames them by position for good.
+    """
+    old = [str(c.get("name")) for c in before]
+    new = [str(c.get("name")) for c in after]
+    if len(old) == len(new):
+        onto_existing = any(o != n and n in old for o, n in zip(old, new, strict=True))
+        return (old, new) if onto_existing else None
+    kept = set(old) & set(new)
+    live, declared = [c for c in old if c in kept], [c for c in new if c in kept]
+    return (live, declared) if live != declared else None
+
+
 def _changed_columns(
     live: Sequence[Mapping[str, Any]], declared: Sequence[Mapping[str, Any]]
 ) -> List[str]:
@@ -984,7 +1006,8 @@ class DatabricksIacPlugin:
         the provider renames by position, and a contract cannot say whether it
         means a rename or a drop and an add, so the old values staying under the
         new name is gated too. A column list the plan cannot show yet counts,
-        fail-closed.
+        fail-closed. A new column order the provider cannot reach
+        (:func:`column_reorder`) is refused outright: no flag makes it apply.
         """
         lost: List[str] = []
         for change in plan.get("resource_changes") or []:
@@ -1003,6 +1026,18 @@ class DatabricksIacPlugin:
                     f"{table}: the planned column list is unknown, so a drop cannot be ruled out"
                 )
                 continue
+            reorder = column_reorder(_columns_of(before), _columns_of(after))
+            if reorder is not None:
+                raise _refusal(
+                    "column-reorder",
+                    f"{table}: the contract orders its columns {', '.join(reorder[1])}, the "
+                    f"live table {', '.join(reorder[0])}. Databricks cannot move a column: the "
+                    "provider renames by position or adds and drops by name, so the apply would "
+                    "fail part way or leave a table no later plan matches.",
+                    "Keep the existing columns in their live order and add new ones after "
+                    "them; to replace a column, drop it in one apply and add the new one in "
+                    "the next.",
+                )
             dropped, renamed = column_changes(_columns_of(before), _columns_of(after))
             if dropped:
                 lost.append(f"{table}: drops column(s) {', '.join(dropped)}")

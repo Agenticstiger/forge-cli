@@ -69,7 +69,9 @@ class IacProviderPlugin(Protocol):
       object" must stop the apply (:meth:`discover_imports`).
     * ``plan_data_changes(plan)``: what the saved plan's in-place updates do to
       existing data (``tofu show -json``), one line each; any line needs
-      ``--allow-data-loss``, as a destroy does.
+      ``--allow-data-loss``, as a destroy does. It raises
+      :class:`UnsupportedBindingError` for an update the provider cannot apply,
+      which stops the apply whatever the flags.
     * ``explain_plan_failure(output, contract, state)``: an
       :class:`UnsupportedBindingError` naming the fix for a failed ``tofu``
       run, or ``None``.

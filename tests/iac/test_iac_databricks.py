@@ -498,6 +498,21 @@ class TestColumnChanges:
     def test_add_only(self):
         assert dbx.column_changes(_cols("a"), _cols("a", "b")) == ([], [])
 
+    @pytest.mark.parametrize(
+        "before,after,reorder",
+        [
+            # Kept columns reordered while one is added: added by name, never moved.
+            (("a", "b"), ("b", "a", "c"), (["a", "b"], ["b", "a"])),
+            # A swap at an equal count: renaming a onto b, which exists, fails.
+            (("a", "b"), ("b", "a"), (["a", "b"], ["b", "a"])),
+            (("a", "b"), ("a", "x"), None),
+            (("a", "b"), ("a", "b", "c"), None),
+            (("a", "b", "c"), ("a", "c"), None),
+        ],
+    )
+    def test_a_reorder_the_provider_cannot_reach(self, before, after, reorder):
+        assert dbx.column_reorder(_cols(*before), _cols(*after)) == reorder
+
 
 def _plan(actions, before_cols, after_cols, after_unknown=None) -> Dict[str, Any]:
     named = {"catalog_name": "main", "schema_name": "sales", "name": "orders"}
@@ -556,6 +571,14 @@ class TestPlanDataChanges:
             _plan(["update"], _cols("a"), None, after_unknown={"column": True})
         )
         assert lost and "cannot be ruled out" in lost[0]
+
+    def test_a_reorder_is_refused_not_gated(self):
+        with pytest.raises(UnsupportedBindingError) as exc:
+            IAC_PLUGINS["databricks"].plan_data_changes(
+                _plan(["update"], _cols("a", "b"), _cols("b", "a", "c"))
+            )
+        assert exc.value.kind == "databricks-column-reorder"
+        assert "live order" in " ".join(exc.value.remediation)
 
 
 # ── plan-time errors become fix-its ─────────────────────────────────────────
@@ -645,6 +668,14 @@ class TestEngine:
         monkeypatch.setattr(engine.runner, "tofu_show_plan", lambda *a, **k: None)
         lost = engine._in_place_changes(IAC_PLUGINS["databricks"], {"change": 1}, "/w", {})
         assert lost and "cannot be ruled out" in lost[0]
+
+    def test_a_plan_the_plugin_refuses_stops_the_apply(self, monkeypatch):
+        shown = _plan(["update"], _cols("a", "b"), _cols("b", "a", "c"))
+        monkeypatch.setattr(engine.runner, "tofu_show_plan", lambda *a, **k: shown)
+        with pytest.raises(CLIError) as exc:
+            engine._in_place_changes(IAC_PLUGINS["databricks"], {"change": 1}, "/w", {})
+        assert exc.value.event == "unsupported_binding"
+        assert exc.value.context["kind"] == "databricks-column-reorder"
 
     def test_no_update_means_no_extra_tofu_call(self, monkeypatch):
         def boom(*a, **k):

@@ -193,6 +193,17 @@ def test_a_positional_rename_is_refused_like_a_destroy(workspace, fake, capfd):
     assert _columns(fake) == ["id", "total", "region"]
 
 
+def test_a_reorder_is_refused_even_with_allow_data_loss(workspace, fake, capfd):
+    # With a column added the provider adds by name and never moves a column, so
+    # the next plan would rename by position forever: refused before any change.
+    assert apply_contract(capfd, write_contract(workspace, make_contract()))[0] == 0
+    reordered = [COLUMNS[1], COLUMNS[0], COLUMNS[2], ("note", "string", False)]
+    path = write_contract(workspace, make_contract(columns=reordered))
+    rc, out = apply_contract(capfd, path, "--allow-data-loss")
+    assert rc == 1 and "databricks-column-reorder" in out
+    assert _columns(fake) == ["id", "amount", "region"]
+
+
 def test_an_added_column_applies_in_place(workspace, fake, capfd):
     assert apply_contract(capfd, write_contract(workspace, make_contract()))[0] == 0
     marker = fake.tables[TABLE]["marker"]
