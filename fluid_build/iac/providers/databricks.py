@@ -113,6 +113,9 @@ _TABLE_PRIVILEGES = {
 #: precision/scale. Anything else would be handed to the warehouse as SQL.
 _COLUMN_TYPE_RE = re.compile(r"^[a-z_]+(<[a-z_]+>)?(\([0-9]+(,[0-9]+)?\))?$")
 
+#: A rendered DECIMAL with no scale (``decimal``, ``decimal(12)``): scale 0.
+_SCALE_ZERO_RE = re.compile(r"^decimal(\([0-9]+\))?$")
+
 #: What ``tofu plan`` prints for each plan-time error :meth:`explain_plan_failure`
 #: turns into a fix-it (provider 1.140.0 messages, verbatim).
 _TYPE_CHANGE = "changing the 'type' of an existing column is not supported"
@@ -263,16 +266,17 @@ def _type_problem(resolved: str, parts: Tuple[str, Optional[str]]) -> Optional[s
 
 
 def _scale_zero_warnings(tables: Sequence[_Table]) -> List[str]:
-    """Columns created as a bare DECIMAL, which Databricks reads as DECIMAL(10,0)."""
+    """Columns created as a DECIMAL with no scale, which Databricks reads as scale 0
+    (a bare DECIMAL is DECIMAL(10,0))."""
     default = _PROVIDER_TYPE_ALIASES["decimal"].upper()
     out = []
     for table in tables:
-        bare = [column["name"] for column in table.columns if column["type"] == "decimal"]
+        bare = [c["name"] for c in table.columns if _SCALE_ZERO_RE.match(c["type"])]
         if bare:
             out.append(
-                f"{table.where} declares {', '.join(bare)} with no precision or scale, so "
-                f"Databricks creates {default} and keeps no fractional digits. Declare "
-                "decimal(p,s), for example decimal(18,2)."
+                f"{table.where} declares {', '.join(bare)} with no scale, so Databricks keeps "
+                f"no fractional digits (a bare DECIMAL is {default}). Declare decimal(p,s), "
+                "for example decimal(18,2)."
             )
     return out
 

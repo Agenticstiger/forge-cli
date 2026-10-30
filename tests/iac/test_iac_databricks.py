@@ -367,12 +367,17 @@ def test_validate_reports_every_refusal_at_once(monkeypatch):
 
 
 def test_a_bare_decimal_warns_that_it_keeps_no_fraction():
-    schema = [{"name": "price", "type": "number"}, {"name": "id", "type": "bigint"}]
+    schema = [
+        {"name": "price", "type": "number"},
+        {"name": "fee", "type": "decimal(12)"},
+        {"name": "rate", "type": "decimal(12,4)"},
+    ]
     errors, warnings = dbx.validate_databricks_binding(
         _contract(**{"exposes.0.contract.schema": schema})
     )
     assert errors == []
-    assert len(warnings) == 1 and "price" in warnings[0] and "DECIMAL(10,0)" in warnings[0]
+    assert len(warnings) == 1 and "price, fee with no scale" in warnings[0]
+    assert "DECIMAL(10,0)" in warnings[0] and "rate" not in warnings[0]
 
 
 def test_fluid_validate_reports_the_refusals(monkeypatch, tmp_path: Path, capfd):
