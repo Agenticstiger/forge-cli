@@ -33,7 +33,7 @@ class TestDefaultEngine:
 
     def test_unknown_provider_defaults_to_native(self):
         # A provider not in the registry falls back to the native engine.
-        assert cutover.default_engine("databricks") == "native"
+        assert cutover.default_engine("azure") == "native"
         assert cutover.default_engine("local") == "native"
 
     def test_cutover_provider_defaults_to_opentofu(self, monkeypatch):

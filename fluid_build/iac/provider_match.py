@@ -50,7 +50,7 @@ a new alias cannot land on one side of the gate only.
 from __future__ import annotations
 
 import re
-from typing import Any, List, Mapping, Optional, Tuple
+from typing import Any, Iterator, List, Mapping, Optional, Tuple
 
 # Cloud aliases → canonical IaC plugin name. The contract surface uses a few
 # interchangeable spellings (``binding.provider: aws`` vs ``binding.platform:
@@ -73,6 +73,11 @@ PROVIDER_ALIASES = {
     # confluent`` auto-detects to the OpenTofu confluent plugin, matching its
     # entry in OPENTOFU_DEFAULT_PROVIDERS.
     "confluent": "confluent",
+    # Databricks Unity Catalog — ``binding.platform: databricks`` auto-detects
+    # to the OpenTofu databricks plugin. Without this entry the contract
+    # detects as no cloud at all and ``fluid apply`` falls back to the native
+    # path, which has no Databricks apply.
+    "databricks": "databricks",
     # ``local`` (and its DuckDB engine) is a recognised target but has no
     # OpenTofu plugin — it runs in-process. Detected so we can emit an
     # actionable error rather than the misleading "no supported cloud".
@@ -84,6 +89,15 @@ PROVIDER_ALIASES = {
 # detection hint — GCP regions (``us-central1``) and the dash-suffixed AWS form
 # are distinguishable by the trailing ``-<n>``.
 AWS_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
+
+#: Clouds a build may run on that no IaC module compiles builds for: the
+#: Databricks plugin manages exposes only, so a dbt build on Databricks next to
+#: exposes on another cloud says where that build runs, not a second cloud. It
+#: would make the contract ambiguous, and ``fluid apply`` then falls back to the
+#: native engine. With no other cloud declared it still counts (see
+#: ``_without_build_only``). Drop a cloud from here once its plugin emits build
+#: resources.
+BUILD_ONLY_CLOUDS = frozenset({"databricks"})
 
 
 class ProviderBindingMismatch(Exception):
@@ -114,7 +128,7 @@ def canonical_cloud(token: object) -> str:
     """Map a raw contract platform/provider token to a canonical cloud name.
 
     Returns the canonical name (``aws``/``gcp``/``snowflake``/``confluent``/
-    ``local``) or ``""`` when the token is empty or unrecognised.
+    ``databricks``/``local``) or ``""`` when the token is empty or unrecognised.
     """
     if not isinstance(token, str):
         return ""
@@ -153,6 +167,30 @@ def candidate_regions(contract: Mapping[str, Any]) -> List[str]:
     for exposure in contract.get("exposes") or []:
         _collect((exposure or {}).get("binding") or {})
     return regions
+
+
+def _build_declarations(contract: Mapping[str, Any]) -> Iterator[Tuple[object, str]]:
+    """``builds[].provider`` and ``builds[].execution.runtime.platform`` tokens."""
+    for i, build in enumerate(contract.get("builds") or []):
+        if not isinstance(build, dict):
+            continue
+        runtime = (build.get("execution") or {}).get("runtime") or {}
+        platform = runtime.get("platform") if isinstance(runtime, dict) else None
+        yield build.get("provider"), f"builds[{i}].provider"
+        yield platform, f"builds[{i}].execution.runtime.platform"
+
+
+def _without_build_only(found: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """``found`` less a :data:`BUILD_ONLY_CLOUDS` cloud only a build declared, when
+    another cloud is declared too. Alone it stays: the contract then applies on
+    that cloud, through its plugin, whose refusals (a build that names its own
+    host) must keep running."""
+    kept = [
+        (cloud, source)
+        for cloud, source in found
+        if not (cloud in BUILD_ONLY_CLOUDS and source.startswith("builds["))
+    ]
+    return kept or found
 
 
 def detect_cloud_declarations(contract: Mapping[str, Any]) -> List[Tuple[str, str]]:
@@ -198,14 +236,8 @@ def detect_cloud_declarations(contract: Mapping[str, Any]) -> List[Tuple[str, st
         _add(top_binding.get("platform"), "binding.platform")
         _add(top_binding.get("provider"), "binding.provider")
 
-    # builds[].provider and builds[].execution.runtime.platform.
-    for i, build in enumerate(contract.get("builds") or []):
-        if not isinstance(build, dict):
-            continue
-        _add(build.get("provider"), f"builds[{i}].provider")
-        runtime = (build.get("execution") or {}).get("runtime") or {}
-        if isinstance(runtime, dict):
-            _add(runtime.get("platform"), f"builds[{i}].execution.runtime.platform")
+    for token, source in _build_declarations(contract):
+        _add(token, source)
 
     # Region fallback — only consulted when nothing stronger was declared.
     if not found:
@@ -214,7 +246,7 @@ def detect_cloud_declarations(contract: Mapping[str, Any]) -> List[Tuple[str, st
                 found.append(("aws", f"region {region}"))
                 break
 
-    return found
+    return _without_build_only(found)
 
 
 def detect_clouds(contract: Mapping[str, Any]) -> List[str]:

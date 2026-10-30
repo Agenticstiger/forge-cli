@@ -553,7 +553,7 @@ class TestTheSummaryOnlyClaimsKindsThePlatformMaps:
             "fluidVersion": "0.7.6",
             "id": "x",
             "packaging": {"mode": "isolated"},
-            "exposes": [{"exposeId": "t", "binding": {"platform": "databricks"}}],
+            "exposes": [{"exposeId": "t", "binding": {"platform": "azure"}}],
         }
         assert build_packaging_summary(contract)["applicableContainers"] == sorted(CONTAINER_KINDS)
         assert "not applicable here:" not in self._lines(contract)

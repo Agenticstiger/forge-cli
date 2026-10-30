@@ -33,7 +33,11 @@ from typing import FrozenSet, Optional
 #: packages and native apply paths are retired (see ``AUTOGEN_SPIKE.md``);
 #: ``fluid apply`` compiles their contracts to ``.tf.json`` and runs
 #: ``tofu``. The OpenTofu engine is the default for every provider.
-OPENTOFU_DEFAULT_PROVIDERS: FrozenSet[str] = frozenset({"aws", "gcp", "snowflake", "confluent"})
+#: ``databricks`` was born on it: its planner (``providers/databricks``) only
+#: plans, so there is no native CRUD to retire.
+OPENTOFU_DEFAULT_PROVIDERS: FrozenSet[str] = frozenset(
+    {"aws", "gcp", "snowflake", "confluent", "databricks"}
+)
 
 
 def default_engine(provider: str) -> str:

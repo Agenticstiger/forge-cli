@@ -183,6 +183,7 @@ class TestAdapterTypeMapping:
             "Snowflake": "snowflake",
             "aws": "redshift",
             "redshift": "redshift",
+            "databricks": "databricks",
             "local": "duckdb",
             "anything-else": "duckdb",
         }
