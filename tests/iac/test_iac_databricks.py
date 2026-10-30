@@ -384,6 +384,27 @@ def test_a_bare_decimal_warns_that_it_keeps_no_fraction():
     assert "DECIMAL(10,0)" in warnings[0] and "rate" not in warnings[0]
 
 
+@pytest.mark.parametrize(
+    "declared,emitted",
+    [
+        ("number(12)", "decimal(12,0)"),
+        ("decimal(038, 2)", "decimal(38,2)"),
+        ("number", "decimal"),
+        ("decimal(18,2)", "decimal(18,2)"),
+    ],
+)
+def test_a_decimal_is_emitted_as_databricks_reports_it(declared: str, emitted: str):
+    # The provider compares the declared type with the live one as text: any
+    # other spelling plans a type change, refused, on every apply after the first.
+    contract = _contract(**{"exposes.0.contract.schema": [{"name": "a", "type": declared}]})
+    [table] = IAC_PLUGINS["databricks"].emit(contract)["databricks_sql_table"].values()
+    assert table["column"][0]["type"] == emitted
+    assert (
+        dbx._changed_columns([{"name": "a", "type": emitted}], [{"name": "a", "type": declared}])
+        == []
+    )
+
+
 def test_fluid_validate_reports_the_refusals(monkeypatch, tmp_path: Path, capfd):
     isolate_workspace(
         monkeypatch,

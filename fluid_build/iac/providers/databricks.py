@@ -116,6 +116,9 @@ _COLUMN_TYPE_RE = re.compile(r"^[a-z_]+(<[a-z_]+>)?(\([0-9]+(,[0-9]+)?\))?$")
 #: A rendered DECIMAL with no scale (``decimal``, ``decimal(12)``): scale 0.
 _SCALE_ZERO_RE = re.compile(r"^decimal(\([0-9]+\))?$")
 
+#: A rendered DECIMAL with arguments, in any spelling (``decimal(12)``, ``decimal(038,2)``).
+_DECIMAL_ARGS_RE = re.compile(r"^decimal\(([0-9]+)(?:,([0-9]+))?\)$")
+
 #: What ``tofu plan`` prints for each plan-time error :meth:`explain_plan_failure`
 #: turns into a fix-it (provider 1.140.0 messages, verbatim).
 _TYPE_CHANGE = "changing the 'type' of an existing column is not supported"
@@ -235,7 +238,7 @@ def _column_type(raw: Any, where: str, refusals: List[UnsupportedBindingError]) 
     else:
         problem = _type_problem(resolved, dbt_types.split_parameterized(resolved))
     if problem is None:
-        return resolved
+        return _canonical_type(resolved)
     refusals.append(
         _refusal(
             "column-type",
@@ -265,13 +268,32 @@ def _type_problem(resolved: str, parts: Tuple[str, Optional[str]]) -> Optional[s
     return None
 
 
+def _canonical_type(resolved: str) -> str:
+    """``resolved`` spelled as Databricks reports it back: ``decimal(12)`` is
+    ``decimal(12,0)``. The provider compares the declared type with the live one
+    as text, and any other spelling plans a type change, which it refuses, on
+    every apply after the first."""
+    match = _DECIMAL_ARGS_RE.match(resolved)
+    if match is None:
+        return resolved
+    return f"decimal({int(match.group(1))},{int(match.group(2) or 0)})"
+
+
 def _scale_zero_warnings(tables: Sequence[_Table]) -> List[str]:
-    """Columns created as a DECIMAL with no scale, which Databricks reads as scale 0
-    (a bare DECIMAL is DECIMAL(10,0))."""
+    """Columns declared as a DECIMAL with no scale, which Databricks creates with
+    scale 0 (a bare DECIMAL is DECIMAL(10,0))."""
+    from ...engines.dbt import _types as dbt_types
+
     default = _PROVIDER_TYPE_ALIASES["decimal"].upper()
     out = []
     for table in tables:
-        bare = [c["name"] for c in table.columns if _SCALE_ZERO_RE.match(c["type"])]
+        schema = (table.exposure.get("contract") or {}).get("schema") or []
+        bare = [
+            str(column.get("name"))
+            for column in schema
+            if isinstance(column, Mapping)
+            and _SCALE_ZERO_RE.match(dbt_types.sql_type(str(column.get("type")), "databricks"))
+        ]
         if bare:
             out.append(
                 f"{table.where} declares {', '.join(bare)} with no scale, so Databricks keeps "
@@ -870,7 +892,9 @@ def _changed_columns(
     out = []
     for old, new in pairs:
         old_type = norm(old.get("type"))
-        new_type = norm(dbt_types.sql_type(str(new.get("type") or ""), "databricks"))
+        new_type = norm(
+            _canonical_type(dbt_types.sql_type(str(new.get("type") or ""), "databricks"))
+        )
         if old_type != new_type:
             out.append(f"{new['name']}: {old_type} in the live table, {new_type} in the contract")
         if bool(old.get("nullable", True)) != bool(new.get("nullable", True)):
