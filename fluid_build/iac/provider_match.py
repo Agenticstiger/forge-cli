@@ -90,6 +90,13 @@ PROVIDER_ALIASES = {
 # are distinguishable by the trailing ``-<n>``.
 AWS_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
 
+#: Clouds a build may run on that no IaC module compiles builds for: the
+#: Databricks plugin manages exposes only, so a dbt build on Databricks next to
+#: exposes on another cloud says where that build runs, not a second cloud. It
+#: would make the contract ambiguous, and ``fluid apply`` then falls back to the
+#: native engine. Drop a cloud from here once its plugin emits build resources.
+BUILD_ONLY_CLOUDS = frozenset({"databricks"})
+
 
 class ProviderBindingMismatch(Exception):
     """``--provider X`` contradicts every cloud the contract declares.
@@ -203,14 +210,19 @@ def detect_cloud_declarations(contract: Mapping[str, Any]) -> List[Tuple[str, st
         _add(top_binding.get("platform"), "binding.platform")
         _add(top_binding.get("provider"), "binding.provider")
 
-    # builds[].provider and builds[].execution.runtime.platform.
+    # builds[].provider and builds[].execution.runtime.platform, except a cloud
+    # whose plugin compiles no builds (BUILD_ONLY_CLOUDS).
     for i, build in enumerate(contract.get("builds") or []):
         if not isinstance(build, dict):
             continue
-        _add(build.get("provider"), f"builds[{i}].provider")
         runtime = (build.get("execution") or {}).get("runtime") or {}
-        if isinstance(runtime, dict):
-            _add(runtime.get("platform"), f"builds[{i}].execution.runtime.platform")
+        platform = runtime.get("platform") if isinstance(runtime, dict) else None
+        for token, source in (
+            (build.get("provider"), f"builds[{i}].provider"),
+            (platform, f"builds[{i}].execution.runtime.platform"),
+        ):
+            if canonical_cloud(token) not in BUILD_ONLY_CLOUDS:
+                _add(token, source)
 
     # Region fallback — only consulted when nothing stronger was declared.
     if not found:
