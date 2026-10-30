@@ -23,10 +23,10 @@ Two layers:
 - :data:`_GENERIC` — the pre-existing platform-agnostic mapping, kept
   byte-for-byte identical to the old ``models._sql_type`` table. It is
   the default (``adapter=None``) so skeleton casts are unchanged.
-- Per-adapter overrides for the four profile adapters this engine can
-  emit (``profiles.py``): ``bigquery`` / ``snowflake`` / ``redshift`` /
-  ``duckdb``. Generic types alone fail on some adapters — BigQuery has
-  no ``varchar`` — so contract ``data_type`` must be adapter-correct.
+- Per-adapter overrides for each profile adapter this engine can emit
+  (``profiles.py``; the keys of :data:`_ADAPTER_TABLES`). Generic types
+  alone fail on some adapters — BigQuery has no ``varchar`` — so
+  contract ``data_type`` must be adapter-correct.
 
 The per-adapter tables adapt the mapping shape of ``datacontract-cli``'s
 ``export/sql_type_converter.py`` (MIT), trimmed to the FLUID scalar

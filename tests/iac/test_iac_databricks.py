@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Databricks IaC plugin, tier 1: the emitted module, the refusals, and the apply hooks.
+"""Databricks IaC plugin, Stage 1 unit: the emitted module, the refusals, the apply hooks.
 
 Pure functions only: no ``tofu``, no network. What real ``tofu`` and the real
-provider do with the module is tier 3 (``test_iac_databricks_fake_e2e.py``).
+provider do with the module is pinned against a stand-in workspace in
+``test_iac_databricks_fake_e2e.py``.
 """
 
 from __future__ import annotations

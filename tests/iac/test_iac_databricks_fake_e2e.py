@@ -20,14 +20,14 @@ all run for real. Only the workspace is ``_fake_databricks.FakeDatabricks``, an
 in-process stand-in for the Unity Catalog, SQL statement and permissions APIs,
 so no Databricks account or credential is involved.
 
-Pinned (the Databricks plan's Phase 1 exit criteria, and its 0b findings):
-validate, plan, ``generate iac --validate`` and ``apply --mode dry-run`` route
-to OpenTofu; a second plan is empty; a replace is refused without
-``--allow-data-loss``; a grant revoke is not; a dropped column is refused like a
-destroy (it is an in-place ``~``); an added column applies in place; a table
+Pinned (Stage 1: real ``tofu``, stand-in workspace): validate, plan,
+``generate iac --validate`` and ``apply --mode dry-run`` route to OpenTofu; a
+second plan is empty; a replace is refused without ``--allow-data-loss``; a
+grant revoke is not; a dropped column and a positional rename are refused like a
+destroy (each is an in-place ``~``); an added column applies in place; a table
 that exists but is not in state is adopted, not replaced; a column type change
 and a missing catalog fail at plan with a message that names the column or the
-catalog.
+catalog; missing credentials fail naming the variables to set.
 
 Not proven here: what real Databricks accepts (SQL dialect, warehouse state,
 privilege names, Unity Catalog storage); that is the manual live tier.

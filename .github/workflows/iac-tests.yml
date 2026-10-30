@@ -10,6 +10,11 @@ name: iac-tests
 #   * Stage 3 — real AWS + real GCP via OIDC keyless. Runs nightly + on
 #     manual workflow_dispatch. Skipped on forks (no secrets).
 #
+# Databricks has no Stage 3 here (live runs are manual). Its Stage 1 also
+# drives real tofu and the provider against an in-process stand-in
+# (tests/iac/_fake_databricks.py); dmux/minilake runs nightly as a
+# non-gating second oracle.
+#
 # OIDC patterns borrowed from aws-actions/configure-aws-credentials@v4
 # and google-github-actions/auth@v2 — both are the recommended keyless
 # (Workload Identity Federation) entry points for their respective

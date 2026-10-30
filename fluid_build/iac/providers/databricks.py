@@ -39,17 +39,17 @@ resources, with no new schema field (fluid-schema 0.7.6):
   left with ``USE_SCHEMA`` alone. A product owns its schema here; a schema
   shared between products needs the packaging modes, refused for now.
 
-Two inputs come from the environment, never from the contract (founder
-decision 2026-10-29): ``DATABRICKS_HOST``, which the provider reads itself
-(a contract that named the host would be handed the credential, the #758
-class), and ``DATABRICKS_WAREHOUSE_ID``, the SQL warehouse every table
-statement runs on. The warehouse id is the one value this plugin reads from the
-environment. It is an identifier, not a secret; without it the provider starts
-a cluster of its own to run the DDL.
+Two inputs come from the environment, never from the contract:
+``DATABRICKS_HOST``, which the provider reads itself (a contract that named the
+host would be handed the credential, the #758 class), and
+``DATABRICKS_WAREHOUSE_ID``, the SQL warehouse every table statement runs on.
+The warehouse id is the one value this plugin reads from the environment. It is
+an identifier, not a secret; without it the provider starts a cluster of its own
+to run the DDL.
 
 Everything the module would apply with exit 0 but not enforce, or not create,
-is refused instead (:func:`_refuse`, run by ``fluid validate`` through
-:func:`validate_databricks_binding` and by the emitter).
+is refused instead, in the one pass :func:`_compile` makes for both ``fluid
+validate`` (through :func:`validate_databricks_binding`) and the emitter.
 
 The provider's own diff rules, read from ``catalog/resource_sql_table.go`` at
 v1.140.0, shape the apply-time checks below: with the column count unchanged it
@@ -86,7 +86,7 @@ WAREHOUSE_ENV = "DATABRICKS_WAREHOUSE_ID"
 
 #: Seconds the provider keeps retrying one failing HTTP request. Its default is
 #: 300 per request, and a plan reads every resource in turn, so an unreachable
-#: host took about 25 minutes to fail (measured, phase-0b). The provider block
+#: host took about 25 minutes to fail (measured on 1.140.0). The provider block
 #: is the only place that bounds it: there is no environment variable
 #: (databricks/terraform-provider-databricks#6141).
 RETRY_TIMEOUT_SECONDS = 60
@@ -319,8 +319,8 @@ def _refuse_governance(
                 f"{where} declares {', '.join(unmapped)}, which the Databricks emitter does not "
                 "map yet. Applied anyway, the table would be readable without the mask, filter "
                 "or restriction the contract promises.",
-                "Remove them from the databricks binding until Unity Catalog column masks, "
-                "row filters and ABAC policies are mapped, and enforce access with grants.",
+                "Remove them from this expose until Unity Catalog column masks, row filters "
+                "and ABAC policies are mapped, and enforce access with grants.",
             )
         )
     if _set(binding.get("encryption")):
@@ -910,8 +910,8 @@ class DatabricksIacPlugin:
 
     def credential_env(self, env: Mapping[str, str]) -> Dict[str, str]:
         # The provider reads DATABRICKS_HOST / DATABRICKS_TOKEN / the OAuth client
-        # pair itself. Narrowing what it may read (~/.databrickscfg, the auth type)
-        # is Phase 2 of the Databricks plan.
+        # pair itself. What it may also read (~/.databrickscfg, the auth type) is
+        # not narrowed yet.
         return {}
 
     def discover_imports(

@@ -13,7 +13,8 @@
 # limitations under the License.
 
 """The ``fluid`` CLI against a stand-in Databricks workspace, shared by the
-in-process fake tier and the minilake nightly oracle, so both drive one flow."""
+in-process stand-in (Stage 1) and the minilake nightly oracle, so both drive one
+flow."""
 
 from __future__ import annotations
 
@@ -75,7 +76,7 @@ def make_contract(
         "kind": "DataProduct",
         "id": product_id,
         "name": "Databricks test orders",
-        "description": "Databricks provider offline-tier contract",
+        "description": "Databricks provider test contract",
         "metadata": {"owner": {"team": "data-platform"}, "layer": "Gold"},
         "exposes": [
             {

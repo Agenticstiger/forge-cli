@@ -454,8 +454,10 @@ def register(subparsers: argparse._SubParsersAction):
         action="store_true",
         default=False,
         help=(
-            "Required for replace modes when env != dev or target has rows. "
-            "Pre-replace snapshot enables ``fluid rollback``."
+            "Required for replace modes when env != dev or target has rows "
+            "(a pre-replace snapshot enables ``fluid rollback``), and for an "
+            "OpenTofu plan that destroys a data-bearing resource or drops or "
+            "renames a column in place (no snapshot is taken)."
         ),
     )
     mode_group.add_argument(

@@ -20,10 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract. A table that already exists is imported before the first apply instead of being
   replaced. A dropped column is refused like a destroy unless `--allow-data-loss` is given, and
   so is a rename: with the column count unchanged the provider renames by position, so the old
-  values would stay under the new name. A revoked grant is not refused. A column type change or
-  a missing catalog fails at plan, naming the column or the catalog. `fluid validate` refuses
-  what would apply without being enforced: a host in the contract (on a binding or a build),
-  Iceberg, masks, row filters, column restrictions and a packaging block. The product owns its
+  values would stay under the new name. A revoked grant is not refused. A column type change, a
+  missing catalog or missing credentials fails at plan, naming the column, the catalog or the
+  variables to set. `fluid validate` refuses what would apply without being enforced: a host in
+  the contract (on a binding or a build), Iceberg, masks, row filters, column restrictions, a
+  packaging block, and a column type Databricks has no mapping for (it would be created as
+  `string`) or would reject. It warns when a bare `number` or `decimal` would be created as
+  DECIMAL(10,0), which keeps no fractional digits. The product owns its
   schema: a grant is authoritative for its principal, so on a schema that already existed and
   that other teams share, each principal the contract names keeps `USE_SCHEMA` alone there.
   Jobs (dbt on serverless compute) come next.
