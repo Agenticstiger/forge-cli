@@ -31,9 +31,10 @@ _logger = logging.getLogger(__name__)
 #: The one dbt Jinja form a contract value may carry as written:
 #: ``{{ env_var('NAME') }}``, with an optional quoted default. Anything else
 #: (``~``, ``{% set %}``, a call written any other way) is evaluated by dbt as
-#: written, so it is refused rather than parsed.
+#: written, so it is refused rather than parsed. The default holds no ``$``:
+#: ``${NAME}`` there would be translated into a second ``env_var`` unscanned.
 _ENV_VAR_JINJA_RE = re.compile(
-    r"\{\{\s*env_var\(\s*'([A-Za-z_][A-Za-z0-9_]*)'\s*(?:,\s*'[^'{}%#]*'\s*)?\)\s*\}\}"
+    r"\{\{\s*env_var\(\s*'([A-Za-z_][A-Za-z0-9_]*)'\s*(?:,\s*'[^'{}%#$]*'\s*)?\)\s*\}\}"
 )
 _JINJA_MARKERS = ("{{", "{%", "{#")
 

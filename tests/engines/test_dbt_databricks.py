@@ -115,6 +115,8 @@ class TestCredentialPlaceholders:
             '{{ env_var ("DATABRICKS_TOKEN") }}',
             '{% set n = "DATABRICKS_TOKEN" %}{{ env_var(n) }}',
             "{# a comment #}main",
+            # A placeholder in the default would become a second, unscanned env_var.
+            "{{ env_var('DBX_CATALOG', '$DATABRICKS_TOKEN') }}",
         ],
     )
     def test_a_credential_never_becomes_the_catalog_or_schema(self, value):
