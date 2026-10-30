@@ -587,6 +587,15 @@ class TestPlanner:
         assert ("databricks_grant", "schema/main.sales/analysts") in ids
         with pytest.raises(ProviderError):
             provider.apply([])
+        assert provider.capabilities()["apply"] is False
+
+    def test_refuses_what_the_emitter_refuses(self):
+        # The refused table would leave no action: an empty plan, exit 0.
+        contract = _contract()
+        contract["exposes"][0]["binding"]["location"]["host"] = "adb-1.azuredatabricks.net"
+        with pytest.raises(UnsupportedBindingError) as exc:
+            dbx.planned_objects(contract)
+        assert exc.value.kind == "databricks-host-in-contract"
 
 
 def test_an_import_failure_the_plugin_knows_gets_its_fix_it(monkeypatch):

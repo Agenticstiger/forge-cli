@@ -1025,9 +1025,13 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     ``providers/databricks`` plans through this, not a second reading of the
     contract, so ``fluid diff`` and ``--provider databricks`` see exactly what
     ``fluid apply`` creates. Each action names its ``resource_type`` and
-    ``resource_id`` (the shape ``cli/diff.py`` keys resources by).
+    ``resource_id`` (the shape ``cli/diff.py`` keys resources by). A contract the
+    emitter refuses is refused here too: a refused table leaves no action, and
+    a plan without it would be a smaller plan, not an error.
     """
     compiled = _compile(contract, os.environ)
+    if compiled.refusals:
+        raise compiled.refusals[0]
     actions: List[Dict[str, Any]] = []
     for body in compiled.data.get("databricks_catalog", {}).values():
         actions.append(

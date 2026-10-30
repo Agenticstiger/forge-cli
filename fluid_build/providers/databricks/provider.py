@@ -52,6 +52,11 @@ class DatabricksProvider(BaseProvider):
     def get_provider_info(cls) -> ProviderMetadata:
         return replace(_METADATA)
 
+    def capabilities(self) -> Mapping[str, bool]:
+        caps = dict(super().capabilities())
+        caps["apply"] = self.native_apply
+        return caps
+
     def plan(
         self, contract: Mapping[str, Any], *, mode: Optional[str] = None
     ) -> List[Dict[str, Any]]:
