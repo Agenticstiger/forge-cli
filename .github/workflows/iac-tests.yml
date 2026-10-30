@@ -3,7 +3,8 @@ name: iac-tests
 # Three-stage test ladder for the IaC autogenerator (see
 # HONESTLY_TESTED.md for the full coverage matrix):
 #
-#   * Stage 1 — unit + tofu validate. No creds, runs on every PR + push.
+#   * Stage 1 — unit + tofu validate. No creds, runs on every PR + push;
+#     its tofu lanes (moto, in-process stand-ins) run as parallel jobs.
 #   * Stage 2 — docker emulators (LocalStack for AWS,
 #     goccy/bigquery-emulator + fsouza/fake-gcs-server + gcloud pubsub
 #     for GCP). Runs on every PR + push.
@@ -85,12 +86,138 @@ jobs:
     name: "Stage 1 — unit + tofu validate"
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
+    env:
+      # The unit step runs under xdist: the same glibc-arena cap as ci.yml's
+      # test matrix, which keeps a thread-heavy run's virtual memory flat.
+      MALLOC_ARENA_MAX: "2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
+          cache: pip
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
+        with:
+          tofu_version: 1.12.0
+
+      # The emulator extra is never installed in this job, so it cannot change
+      # what the unit step runs; the tofu lanes below install it in their own.
+      - name: Install Python deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -e '.[dev]'
+
+      # Same distribution as the ci.yml test matrix, which runs these tests
+      # under xdist on every PR: one process took five minutes of this job.
+      - name: Stage 1 — unit (pure-function emit)
+        run: .venv/bin/python -m pytest -m "unit and not slow" -q -n auto --dist loadscope
+
+      - name: Stage 1 — tofu validate (creds-free)
+        run: .venv/bin/python -m pytest tests/iac/test_iac_tofu_validate.py -q
+
+  # The tofu lanes are independent (each runs its own files against moto or an
+  # in-process stand-in, and asserts its own junit), so each is its own job:
+  # run one after another they made Stage 1 the sum of them, ~27 min; in
+  # parallel it is the longest one. Each lane fails if a file it requires only
+  # skipped (scripts/ci/assert_lane_coverage.py).
+  stage1-lanes:
+    name: "Stage 1 — ${{ matrix.lane.name }}"
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        lane:
+          # The Lake Formation bucket-policy filter is only decided when `tofu
+          # plan` reads the caller identity, so it is proven by a real plan
+          # against moto's STS. The column-grant file rides the same lane:
+          # `tofu validate` passes a table_with_columns block the provider
+          # refuses at plan, so only a plan proves it.
+          - name: "Lake Formation bucket-policy + column-grant plans (tofu plan vs moto, creds-free)"
+            tests: tests/iac/test_iac_lakeformation_bucket_policy_plan.py tests/iac/test_iac_lakeformation_column_grants_plan.py
+            pytest-args: ""
+            junit: lf-bucket-policy-plan.xml
+            require: |
+              LF bucket-policy plan=tests/iac/test_iac_lakeformation_bucket_policy_plan.py
+              LF column-grant plan=tests/iac/test_iac_lakeformation_column_grants_plan.py
+          # Retention and encryption at rest: the key policy is only evaluated
+          # at plan time, and the lifecycle rule, default SSE-KMS, key rotation
+          # and the key's scheduled deletion only exist after a real apply /
+          # destroy, so both run against moto (S3, KMS, STS).
+          - name: "retention + KMS plan/apply/destroy (tofu vs moto, creds-free)"
+            tests: tests/iac/test_iac_aws_retention_encryption_moto.py
+            pytest-args: ""
+            junit: retention-kms-moto.xml
+            require: |
+              retention + KMS moto=tests/iac/test_iac_aws_retention_encryption_moto.py
+          # `fluid diff` refreshes the apply's OpenTofu state: a real apply,
+          # then the refresh plan, against moto. Whether a clean apply reads as
+          # no drift depends on what the provider reads back, so only a real
+          # run proves it.
+          - name: "state drift (fluid diff reads the apply's state vs moto, creds-free)"
+            tests: tests/iac/test_iac_state_drift_moto.py
+            pytest-args: "-p no:randomly"
+            junit: state-drift.xml
+            require: |
+              state drift=tests/iac/test_iac_state_drift_moto.py
+          # Lake Formation tags: a tag the contract defines is named by
+          # reference, one the platform owns by its literal key. Only a real
+          # apply and plan show that an association applied with depends_on
+          # plans no change under the reference, and that a platform-owned tag
+          # is associated and survives the destroy.
+          - name: "Lake Formation tags apply + plan (tofu vs moto, creds-free)"
+            tests: tests/iac/test_iac_lakeformation_tags_moto.py
+            pytest-args: "-p no:randomly"
+            junit: lf-tags-moto.xml
+            require: |
+              LF tags moto=tests/iac/test_iac_lakeformation_tags_moto.py
+          # The default state key names the provider, and the first apply
+          # after the upgrade moves the old key's state with `tofu init
+          # -migrate-state`. Only a real apply, move and plan prove the plan
+          # after it changes nothing.
+          - name: "per-provider state key and its migration (tofu vs moto, creds-free)"
+            tests: tests/iac/test_iac_state_key_migration_moto.py
+            pytest-args: "-p no:randomly"
+            junit: state-key-migration.xml
+            require: |
+              state key migration=tests/iac/test_iac_state_key_migration_moto.py
+          # Governance parity (retention, CMEK, column restrictions, mapped
+          # principals): tofu validate of each governed GCP shape; a real plan
+          # and apply with terraform-provider-google against an in-process
+          # stand-in for the BigQuery REST API (the goccy emulator crashes the
+          # provider on apply), which is where the data-loss gate decides; and
+          # the Lake Formation excluded columns planned against moto.
+          - name: "governance parity (tofu vs BigQuery stand-in and moto, creds-free)"
+            tests: tests/iac/test_iac_gcp_governance_plan.py tests/iac/test_iac_aws_column_restrictions.py tests/iac/test_iac_gcp_governance.py
+            pytest-args: "-p no:randomly"
+            junit: governance-parity.xml
+            require: |
+              GCP governance plan=tests/iac/test_iac_gcp_governance_plan.py
+              AWS column restrictions=tests/iac/test_iac_aws_column_restrictions.py
+              GCP governance validate=tests/iac/test_iac_gcp_governance.py
+          # Databricks: the real `fluid` CLI, `tofu` and the databricks/databricks
+          # provider against an in-process Unity Catalog stand-in. What the
+          # data-loss gate decides depends on what the provider plans for a live
+          # table (a partition change is a replace, a dropped column an in-place
+          # ALTER, a type change a plan error), so only a real plan proves it.
+          # `tofu init` verifies the provider against the committed lock.
+          - name: "Databricks (fluid CLI + tofu vs a Unity Catalog stand-in, creds-free)"
+            tests: tests/iac/test_iac_databricks_fake_e2e.py
+            pytest-args: "-p no:randomly"
+            junit: databricks-fake.xml
+            require: |
+              Databricks fake tier=tests/iac/test_iac_databricks_fake_e2e.py
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
 
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
@@ -101,99 +228,32 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/pip install --quiet --upgrade pip
-          .venv/bin/pip install --quiet -e '.[dev]'
-
-      - name: Stage 1 — unit (pure-function emit)
-        run: .venv/bin/python -m pytest -m "unit and not slow" -q
-
-      - name: Stage 1 — tofu validate (creds-free)
-        run: .venv/bin/python -m pytest tests/iac/test_iac_tofu_validate.py -q
-
-      # The Lake Formation bucket-policy filter is only decided when `tofu plan`
-      # reads the caller identity, so it is proven by a real plan against moto's
-      # STS. Installed after the unit step so the extra cannot change what that
-      # step runs; the coverage assert fails the step if the file only skipped.
-      # The column-grant file rides the same step: `tofu validate` passes a
-      # table_with_columns block the provider refuses at plan, so only a plan
-      # proves it, and the assert fails the step if it only skipped.
-      - name: Stage 1 — Lake Formation bucket-policy + column-grant plans (tofu plan vs moto, creds-free)
-        run: |
           .venv/bin/pip install --quiet -e '.[dev,test-emulators]'
-          .venv/bin/python -m pytest tests/iac/test_iac_lakeformation_bucket_policy_plan.py \
-            tests/iac/test_iac_lakeformation_column_grants_plan.py \
-            -q --junitxml=lf-bucket-policy-plan.xml
-          .venv/bin/python scripts/ci/assert_lane_coverage.py lf-bucket-policy-plan.xml \
-            --require "LF bucket-policy plan=tests/iac/test_iac_lakeformation_bucket_policy_plan.py" \
-            --require "LF column-grant plan=tests/iac/test_iac_lakeformation_column_grants_plan.py"
 
-      # Retention and encryption at rest: the key policy is only evaluated at
-      # plan time, and the lifecycle rule, default SSE-KMS, key rotation and the
-      # key's scheduled deletion only exist after a real apply / destroy, so
-      # both run against moto (S3, KMS, STS). Fails if the file only skipped.
-      - name: Stage 1 — retention + KMS plan/apply/destroy (tofu vs moto, creds-free)
+      # One provider download per lane: the tests use TF_PLUGIN_CACHE_DIR when
+      # it is set (env.setdefault) and a fresh temporary cache per module when
+      # it is not. A lane runs one pytest process, so nothing writes the cache
+      # concurrently (OpenTofu's plugin cache is not safe for that).
+      - name: Share one provider cache across the lane's modules
         run: |
-          .venv/bin/python -m pytest tests/iac/test_iac_aws_retention_encryption_moto.py \
-            -q --junitxml=retention-kms-moto.xml
-          .venv/bin/python scripts/ci/assert_lane_coverage.py retention-kms-moto.xml \
-            --require "retention + KMS moto=tests/iac/test_iac_aws_retention_encryption_moto.py"
-      # `fluid diff` refreshes the apply's OpenTofu state: a real apply, then
-      # the refresh plan, against moto. Whether a clean apply reads as no drift
-      # depends on what the provider reads back, so only a real run proves it.
-      # The emulator extra is already installed by the step above.
-      - name: Stage 1 — state drift (fluid diff reads the apply's state vs moto, creds-free)
+          mkdir -p "$RUNNER_TEMP/tofu-plugin-cache"
+          echo "TF_PLUGIN_CACHE_DIR=$RUNNER_TEMP/tofu-plugin-cache" >> "$GITHUB_ENV"
+
+      - name: Stage 1 — ${{ matrix.lane.name }}
+        env:
+          LANE_TESTS: ${{ matrix.lane.tests }}
+          LANE_PYTEST_ARGS: ${{ matrix.lane.pytest-args }}
+          LANE_JUNIT: ${{ matrix.lane.junit }}
+          LANE_REQUIRE: ${{ matrix.lane.require }}
         run: |
-          .venv/bin/python -m pytest tests/iac/test_iac_state_drift_moto.py \
-            -q -p no:randomly --junitxml=state-drift.xml
-          .venv/bin/python scripts/ci/assert_lane_coverage.py state-drift.xml \
-            --require "state drift=tests/iac/test_iac_state_drift_moto.py"
-      # Lake Formation tags: a tag the contract defines is named by reference, one
-      # the platform owns by its literal key. Only a real apply and plan show that
-      # an association applied with depends_on plans no change under the
-      # reference, and that a platform-owned tag is associated and survives the
-      # destroy. Fails if the file only skipped.
-      - name: Stage 1 — Lake Formation tags apply + plan (tofu vs moto, creds-free)
-        run: |
-          .venv/bin/python -m pytest tests/iac/test_iac_lakeformation_tags_moto.py \
-            -q -p no:randomly --junitxml=lf-tags-moto.xml
-          .venv/bin/python scripts/ci/assert_lane_coverage.py lf-tags-moto.xml \
-            --require "LF tags moto=tests/iac/test_iac_lakeformation_tags_moto.py"
-      # The default state key names the provider, and the first apply after the
-      # upgrade moves the old key's state with `tofu init -migrate-state`. Only a
-      # real apply, move and plan prove the plan after it changes nothing.
-      - name: Stage 1 — per-provider state key and its migration (tofu vs moto, creds-free)
-        run: |
-          .venv/bin/python -m pytest tests/iac/test_iac_state_key_migration_moto.py \
-            -q -p no:randomly --junitxml=state-key-migration.xml
-          .venv/bin/python scripts/ci/assert_lane_coverage.py state-key-migration.xml \
-            --require "state key migration=tests/iac/test_iac_state_key_migration_moto.py"
-      # Governance parity (retention, CMEK, column restrictions, mapped
-      # principals): tofu validate of each governed GCP shape; a real plan and
-      # apply with terraform-provider-google against an in-process stand-in for
-      # the BigQuery REST API (the goccy emulator crashes the provider on
-      # apply), which is where the data-loss gate decides; and the Lake
-      # Formation excluded columns planned against moto. Fails if a file only
-      # skipped.
-      - name: Stage 1 — governance parity (tofu vs BigQuery stand-in and moto, creds-free)
-        run: |
-          .venv/bin/python -m pytest tests/iac/test_iac_gcp_governance_plan.py \
-            tests/iac/test_iac_aws_column_restrictions.py tests/iac/test_iac_gcp_governance.py \
-            -q -p no:randomly --junitxml=governance-parity.xml
-          .venv/bin/python scripts/ci/assert_lane_coverage.py governance-parity.xml \
-            --require "GCP governance plan=tests/iac/test_iac_gcp_governance_plan.py" \
-            --require "AWS column restrictions=tests/iac/test_iac_aws_column_restrictions.py" \
-            --require "GCP governance validate=tests/iac/test_iac_gcp_governance.py"
-      # Databricks: the real `fluid` CLI, `tofu` and databricks/databricks provider
-      # against an in-process Unity Catalog stand-in. What the data-loss gate decides
-      # depends on what the provider plans for a live table (a partition change is a
-      # replace, a dropped column an in-place ALTER, a type change a plan error), so
-      # only a real plan proves it. `tofu init` verifies the provider against the
-      # committed lock. Fails if the file only skipped.
-      - name: Stage 1 — Databricks (fluid CLI + tofu vs a Unity Catalog stand-in, creds-free)
-        run: |
-          .venv/bin/python -m pytest tests/iac/test_iac_databricks_fake_e2e.py \
-            -q -p no:randomly --junitxml=databricks-fake.xml
-          .venv/bin/python scripts/ci/assert_lane_coverage.py databricks-fake.xml \
-            --require "Databricks fake tier=tests/iac/test_iac_databricks_fake_e2e.py"
+          read -ra tests <<< "$LANE_TESTS"
+          read -ra extra <<< "$LANE_PYTEST_ARGS"
+          .venv/bin/python -m pytest "${tests[@]}" -q "${extra[@]}" --junitxml="$LANE_JUNIT"
+          requires=()
+          while IFS= read -r label; do
+            [ -n "$label" ] && requires+=(--require "$label")
+          done <<< "$LANE_REQUIRE"
+          .venv/bin/python scripts/ci/assert_lane_coverage.py "$LANE_JUNIT" "${requires[@]}"
 
   # -------------------------------------------------------------------
   # Stage 2 — docker emulators. PR + push.
