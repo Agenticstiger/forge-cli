@@ -50,7 +50,7 @@ a new alias cannot land on one side of the gate only.
 from __future__ import annotations
 
 import re
-from typing import Any, List, Mapping, Optional, Tuple
+from typing import Any, Iterator, List, Mapping, Optional, Tuple
 
 # Cloud aliases → canonical IaC plugin name. The contract surface uses a few
 # interchangeable spellings (``binding.provider: aws`` vs ``binding.platform:
@@ -167,6 +167,22 @@ def candidate_regions(contract: Mapping[str, Any]) -> List[str]:
     return regions
 
 
+def _build_declarations(contract: Mapping[str, Any]) -> Iterator[Tuple[object, str]]:
+    """``builds[].provider`` and ``builds[].execution.runtime.platform`` tokens,
+    except a cloud whose plugin compiles no builds (:data:`BUILD_ONLY_CLOUDS`)."""
+    for i, build in enumerate(contract.get("builds") or []):
+        if not isinstance(build, dict):
+            continue
+        runtime = (build.get("execution") or {}).get("runtime") or {}
+        platform = runtime.get("platform") if isinstance(runtime, dict) else None
+        for token, source in (
+            (build.get("provider"), f"builds[{i}].provider"),
+            (platform, f"builds[{i}].execution.runtime.platform"),
+        ):
+            if canonical_cloud(token) not in BUILD_ONLY_CLOUDS:
+                yield token, source
+
+
 def detect_cloud_declarations(contract: Mapping[str, Any]) -> List[Tuple[str, str]]:
     """Every canonical cloud the contract declares, with where it said so.
 
@@ -210,19 +226,8 @@ def detect_cloud_declarations(contract: Mapping[str, Any]) -> List[Tuple[str, st
         _add(top_binding.get("platform"), "binding.platform")
         _add(top_binding.get("provider"), "binding.provider")
 
-    # builds[].provider and builds[].execution.runtime.platform, except a cloud
-    # whose plugin compiles no builds (BUILD_ONLY_CLOUDS).
-    for i, build in enumerate(contract.get("builds") or []):
-        if not isinstance(build, dict):
-            continue
-        runtime = (build.get("execution") or {}).get("runtime") or {}
-        platform = runtime.get("platform") if isinstance(runtime, dict) else None
-        for token, source in (
-            (build.get("provider"), f"builds[{i}].provider"),
-            (platform, f"builds[{i}].execution.runtime.platform"),
-        ):
-            if canonical_cloud(token) not in BUILD_ONLY_CLOUDS:
-                _add(token, source)
+    for token, source in _build_declarations(contract):
+        _add(token, source)
 
     # Region fallback — only consulted when nothing stronger was declared.
     if not found:
