@@ -121,6 +121,8 @@ class TestCredentialPlaceholders:
             # then reads DATABRICKS_TOKEN with nothing left to scan it.
             "{{ env_var('DATABRICKS_TOKEN', 'a{{ env.or }}b') }}",
             "{{ env_var('a{{ env.or }}') }}",
+            # Jinja reads '\' as an open string, so the call runs on into the rest.
+            "{{ env_var('A', '\\') }}x' ~ env_var('DATABRICKS_TOKEN') ~ '') }}",
         ],
     )
     def test_a_credential_never_becomes_the_catalog_or_schema(self, value):
