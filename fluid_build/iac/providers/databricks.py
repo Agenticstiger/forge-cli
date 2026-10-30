@@ -71,7 +71,13 @@ from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
-from ..principals import DATABRICKS, grant_key, principal_map, resolve_principal
+from ..principals import (
+    _ENV_TEMPLATE_RE,
+    DATABRICKS,
+    grant_key,
+    principal_map,
+    resolve_principal,
+)
 from ..provider_match import canonical_cloud, is_cloud
 from ..versions import required_providers
 
@@ -106,10 +112,6 @@ _TABLE_PRIVILEGES = {
 #: A rendered column type: a name, an optional element type, optional
 #: precision/scale. Anything else would be handed to the warehouse as SQL.
 _COLUMN_TYPE_RE = re.compile(r"^[a-z_]+(<[a-z_]+>)?(\([0-9]+(,[0-9]+)?\))?$")
-
-#: ``{{ env.NAME }}`` — resolved by ``fluid apply``, not by ``fluid validate``;
-#: validation checks an identifier with each template as one plain segment.
-_ENV_TEMPLATE_RE = re.compile(r"\{\{\s*env\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}")
 
 #: What ``tofu plan`` prints for each plan-time error :meth:`explain_plan_failure`
 #: turns into a fix-it (provider 1.140.0 messages, verbatim).

@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import logging
 import os
@@ -1088,7 +1087,7 @@ def _run_contract_rules(
             validation_result.is_valid = False
 
         # --- Databricks: everything its emitter refuses, from the same pass ---
-        _apply_binding_check(validation_result, contract, _DATABRICKS_CHECK, "Databricks")
+        _databricks_binding_check(validation_result, contract)
 
         # --- Iceberg prerequisite checks (anti-no-op gate) ------------------
         # The Snowflake and GCP IaC emitters are emit-when-derivable: an
@@ -1278,25 +1277,22 @@ def _run_contract_rules(
                 info(logger, f"Composition rule check skipped: {exc}")
 
 
-#: No SQL warehouse in DATABRICKS_WAREHOUSE_ID, a contract-named host, Iceberg, and
-#: governance (masks, row filters, column restrictions) applied but never enforced.
-_DATABRICKS_CHECK = "fluid_build.iac.providers.databricks:validate_databricks_binding"
-
-
-def _apply_binding_check(validation_result, contract: Mapping[str, Any], target: str, label: str):
-    """Run one ``module:function`` binding check, ``(errors, warnings)``, into the result.
+def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) -> None:
+    """What the Databricks emitter would refuse (no SQL warehouse in
+    DATABRICKS_WAREHOUSE_ID, a contract-named host, Iceberg, governance applied
+    but never enforced), and its warnings, into the result.
 
     Fails closed: a check that cannot be imported or that raises is an error,
     never a gate silently switched off (the Iceberg-sink block above says why).
     """
-    module_name, _, function = target.partition(":")
     try:
-        check = getattr(importlib.import_module(module_name), function)
-        errors, warnings = check(contract)
+        from fluid_build.iac.providers.databricks import validate_databricks_binding
+
+        errors, warnings = validate_databricks_binding(contract)
     except Exception as exc:  # noqa: BLE001 — reported, never swallowed
         validation_result.add_error(
-            f"{label} binding check could not run ({type(exc).__name__}: {exc}); "
-            f"the contract was NOT checked for {label} binding defects"
+            f"Databricks binding check could not run ({type(exc).__name__}: {exc}); "
+            "the contract was NOT checked for Databricks binding defects"
         )
         validation_result.is_valid = False
         return
