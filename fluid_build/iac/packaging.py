@@ -98,6 +98,10 @@ PLATFORM_CONTAINER_KINDS: Mapping[str, FrozenSet[str]] = {
     "aws": frozenset({"bucket", "database"}),
     "gcp": frozenset({"bucket", "dataset"}),
     "snowflake": frozenset({"database", "schema", "warehouse"}),
+    # Unity Catalog: location.database is the catalog, location.schema the
+    # schema. The emitter refuses a ``packaging`` block on a databricks binding
+    # for now (iac/providers/databricks.py), so these are reported, never owned.
+    "databricks": frozenset({"database", "schema"}),
     "confluent": frozenset({"cluster"}),
     "kafka": frozenset({"cluster"}),
 }

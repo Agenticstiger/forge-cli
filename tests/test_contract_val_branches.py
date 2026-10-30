@@ -343,9 +343,14 @@ class TestProviderDetection:
             contract_path=Path("test.yaml"), use_cache=False, track_history=False, check_data=False
         )
         report = v.validate()
-        # Should have "not yet implemented" warning
-        warnings = [i for i in report.issues if "not yet implemented" in i.message]
-        assert len(warnings) >= 1
+        # No live Unity Catalog check yet: a warning, never an "unknown provider" error
+        warnings = [
+            i
+            for i in report.issues
+            if i.message
+            == "Live validation against Unity Catalog is not available for provider 'databricks' yet"
+        ]
+        assert len(warnings) == 1
 
     @patch("fluid_build.cli.contract_validation.load_contract_with_overlay")
     @patch("fluid_build.cli.contract_validation.FluidSchemaManager")

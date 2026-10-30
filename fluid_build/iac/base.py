@@ -55,6 +55,34 @@ class IacProviderPlugin(Protocol):
 
     This mirrors dbt's per-platform adapter pattern (``dbt-bigquery``,
     ``dbt-snowflake``), which scales that way to 40+ adapters.
+
+    Beyond the members below, the engine reads optional capabilities with
+    ``getattr``; a plugin defines only the ones it needs:
+
+    * ``provider_block_for(contract)``: the ``provider {}`` settings when they
+      depend on the contract, in place of :meth:`provider_block`.
+    * ``dependency_lock``: a file name under ``iac/providers/locks/``, the
+      committed ``.terraform.lock.hcl`` written next to each module before
+      ``tofu init``.
+    * ``strict_adoption``: ``True`` when the provider replaces an object it
+      creates over, so an import that fails for any reason but "no such
+      object" must stop the apply (:meth:`discover_imports`).
+    * ``plan_data_changes(plan)``: what the saved plan's in-place updates do to
+      existing data (``tofu show -json``), one line each; any line needs
+      ``--allow-data-loss``, as a destroy does. It raises
+      :class:`UnsupportedBindingError` for an update the provider cannot apply,
+      which stops the apply whatever the flags.
+    * ``explain_plan_failure(output, contract, state)``: an
+      :class:`UnsupportedBindingError` naming the fix for a failed ``tofu``
+      run, or ``None``.
+    * ``recorded_regions(state)``: the regions the state's resources live in,
+      so an apply pinned to another region is refused, not re-created there.
+    * ``suppressed_drift(contract, prior_state)``: drift the module hides with
+      ``ignore_changes``, reported, never gated.
+    * ``reconcile_state(module, state)``: patches the written module against
+      the current state before the plan.
+    * ``catalog_move_spec()``: the ``CatalogMoveSpec`` of an out-of-tree cloud
+      whose emitter moved its catalog resources (``iac/catalog_moves.py``).
     """
 
     #: Short cloud name, e.g. "gcp" / "aws" / "snowflake".
@@ -91,7 +119,9 @@ class IacProviderPlugin(Protocol):
         Most plugins return ``{}`` — their output is all ``resource``
         blocks. The AWS plugin uses this for ``data.archive_file``, which
         zips inline Lambda source so a function ships without a separate
-        packaging step. Same purity contract as :meth:`emit`.
+        packaging step; the Databricks plugin for ``data.databricks_catalog``,
+        the catalog it references and never creates. Same purity contract as
+        :meth:`emit`.
         """
         ...
 
@@ -125,18 +155,20 @@ class IacProviderPlugin(Protocol):
         ``tofu apply`` reconciles brownfield infrastructure instead of
         failing with "already exists".
 
-        Candidates need not all exist: non-existent ones are skipped. A
-        plugin with no brownfield support returns ``[]``.
+        Candidates need not all exist: non-existent ones are skipped. Any
+        other import failure is skipped too, unless the plugin sets
+        ``strict_adoption``, which makes it stop the apply. A plugin with no
+        brownfield support returns ``[]``.
         """
         ...
 
     def provider_block(self) -> Dict[str, Any]:
         """Return the ``provider {}`` sub-tree for this cloud, or ``{}``.
 
-        Keyed by provider name, e.g.
-        ``{"snowflake": {"preview_features_enabled": [...]}}``. Most plugins
-        return ``{}`` — their provider self-configures from the environment
-        and needs no static block. When a block is returned it carries only
+        The settings themselves, e.g. ``{"preview_features_enabled": [...]}``;
+        :func:`~fluid_build.iac.module.build_module` keys them by the plugin's
+        ``name``. Most plugins return ``{}`` — their provider self-configures
+        from the environment and needs no static block. When a block is returned it carries only
         non-secret settings (feature flags, never credentials), so the
         emitted ``.tf.json`` stays credential-free.
         """

@@ -183,6 +183,7 @@ def _plan_and_classify(
 ) -> StateDriftReport:
     from fluid_build.iac import runner
     from fluid_build.iac.credentials import build_tofu_env
+    from fluid_build.iac.module import write_dependency_lock
 
     from ._apply_opentofu_engine import (
         _guard_region_move,
@@ -204,6 +205,8 @@ def _plan_and_classify(
             return _error(f"the module could not be emitted: {_cli_error_text(exc)}", location)
         workdir.mkdir(parents=True, exist_ok=True)
         module_path.write_text(module, encoding="utf-8")
+        # The same locked provider `fluid apply` installs (iac/module.py).
+        write_dependency_lock(plugin, workdir)
 
         env = build_tofu_env()
         env.update(plugin.credential_env(env))

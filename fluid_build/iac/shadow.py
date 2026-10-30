@@ -52,6 +52,8 @@ _TF_TYPE_TO_KIND = {
     "aws_s3_bucket": "bucket",
     "aws_kinesis_stream": "stream",
     "aws_mwaa_environment": "environment",
+    "databricks_schema": "schema",
+    "databricks_sql_table": "table",
     "google_bigquery_dataset": "dataset",
     "google_bigquery_table": "table",
     "google_storage_bucket": "bucket",

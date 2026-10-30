@@ -11,6 +11,11 @@ name: iac-tests
 #   * Stage 3 — real AWS + real GCP via OIDC keyless. Runs nightly + on
 #     manual workflow_dispatch. Skipped on forks (no secrets).
 #
+# Databricks has no Stage 3 here (live runs are manual). Its Stage 1 also
+# drives real tofu and the provider against an in-process stand-in
+# (tests/iac/_fake_databricks.py); dmux/minilake runs nightly as a
+# non-gating second oracle.
+#
 # OIDC patterns borrowed from aws-actions/configure-aws-credentials@v4
 # and google-github-actions/auth@v2 — both are the recommended keyless
 # (Workload Identity Federation) entry points for their respective
@@ -42,6 +47,9 @@ on:
       - "fluid_build/cli/_diff_state.py"
       - "fluid_build/cli/diff.py"
       - "fluid_build/build_runners/dbt/**"
+      # The Databricks emitter types its columns through the dbt engine's table.
+      - "fluid_build/engines/dbt/_types.py"
+      - "fluid_build/providers/databricks/**"
       - "tests/iac/**"
       - ".github/workflows/iac-tests.yml"
   push:
@@ -63,6 +71,7 @@ on:
           - stage3-aws
           - stage3-gcp
           - stage3-all
+          - databricks-minilake
 
 permissions:
   contents: read
@@ -190,6 +199,18 @@ jobs:
               GCP governance plan=tests/iac/test_iac_gcp_governance_plan.py
               AWS column restrictions=tests/iac/test_iac_aws_column_restrictions.py
               GCP governance validate=tests/iac/test_iac_gcp_governance.py
+          # Databricks: the real `fluid` CLI, `tofu` and the databricks/databricks
+          # provider against an in-process Unity Catalog stand-in. What the
+          # data-loss gate decides depends on what the provider plans for a live
+          # table (a partition change is a replace, a dropped column an in-place
+          # ALTER, a type change a plan error), so only a real plan proves it.
+          # `tofu init` verifies the provider against the committed lock.
+          - name: "Databricks (fluid CLI + tofu vs a Unity Catalog stand-in, creds-free)"
+            tests: tests/iac/test_iac_databricks_fake_e2e.py
+            pytest-args: "-p no:randomly"
+            junit: databricks-fake.xml
+            require: |
+              Databricks fake tier=tests/iac/test_iac_databricks_fake_e2e.py
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -351,6 +372,69 @@ jobs:
       - name: Stop GCP emulators
         if: always() && hashFiles('tests/iac/_gcp_emulator/docker-compose.yml') != ''
         run: docker compose -f tests/iac/_gcp_emulator/docker-compose.yml down
+
+  # -------------------------------------------------------------------
+  # Nightly — Databricks against minilake, a second, independent oracle
+  # (github.com/dmux/minilake, MIT): the same fluid CLI flow the Stage 1
+  # fake tier runs, against an emulator this repository did not write.
+  # NON-GATING (continue-on-error): minilake is an oracle under evaluation,
+  # read per resource from the uploaded JUnit file, never a PR gate. The
+  # image is pinned by digest; bump it deliberately, like a provider pin.
+  # -------------------------------------------------------------------
+  nightly-databricks-minilake:
+    name: "Nightly — Databricks vs minilake (non-gating)"
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'schedule'
+      || (github.event_name == 'workflow_dispatch' && inputs.stage == 'databricks-minilake')
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
+        with:
+          tofu_version: 1.12.0
+
+      - name: Install Python deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -e '.[dev]'
+
+      - name: Start minilake (v1.9.0, pinned by digest)
+        run: |
+          docker run -d --name minilake -p 8000:8000 -e MINILAKE_SPARK_PREWARM=0 \
+            ghcr.io/dmux/minilake@sha256:d6ad5687d494cb03e638a5bcf10fed98eb935990ef2aa833162cdd655ecd733e
+          for _ in $(seq 1 60); do
+            curl -fsS http://localhost:8000/_minilake/health && exit 0
+            sleep 2
+          done
+          docker logs minilake
+          exit 1
+
+      - name: Databricks vs minilake
+        env:
+          FLUID_DATABRICKS_MINILAKE_URL: http://localhost:8000
+        run: |
+          .venv/bin/python -m pytest tests/iac/test_iac_databricks_minilake.py \
+            -q -p no:randomly -rA --junitxml=databricks-minilake.xml
+
+      - name: Upload the per-resource result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: databricks-minilake
+          path: databricks-minilake.xml
+
+      - name: Stop minilake
+        if: always()
+        run: docker rm -f minilake
 
   # -------------------------------------------------------------------
   # Stage 3 AWS — real cloud, OIDC keyless. Nightly + manual.

@@ -1086,6 +1086,9 @@ def _run_contract_rules(
             )
             validation_result.is_valid = False
 
+        # --- Databricks: everything its emitter refuses, from the same pass ---
+        _databricks_binding_check(validation_result, contract)
+
         # --- Iceberg prerequisite checks (anti-no-op gate) ------------------
         # The Snowflake and GCP IaC emitters are emit-when-derivable: an
         # Iceberg expose missing a required input yields no EXTERNAL VOLUME /
@@ -1272,6 +1275,32 @@ def _run_contract_rules(
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Composition rule check skipped: {exc}")
+
+
+def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) -> None:
+    """What the Databricks emitter would refuse (no SQL warehouse in
+    DATABRICKS_WAREHOUSE_ID, a contract-named host, Iceberg, governance applied
+    but never enforced), and its warnings, into the result.
+
+    Fails closed: a check that cannot be imported or that raises is an error,
+    never a gate silently switched off (the Iceberg-sink block above says why).
+    """
+    try:
+        from fluid_build.iac.providers.databricks import validate_databricks_binding
+
+        errors, warnings = validate_databricks_binding(contract)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_error(
+            f"Databricks binding check could not run ({type(exc).__name__}: {exc}); "
+            "the contract was NOT checked for Databricks binding defects"
+        )
+        validation_result.is_valid = False
+        return
+    for msg in errors:
+        validation_result.add_error(msg)
+        validation_result.is_valid = False
+    for msg in warnings:
+        validation_result.add_warning(msg)
 
 
 def _duplicate_contract_id_errors(contract: Mapping[str, Any]) -> List[str]:

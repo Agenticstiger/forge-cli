@@ -304,7 +304,7 @@ def generate_catalogs_yml(
     """
     from . import _types as _types
 
-    adapter = _types.adapter_for_build(build)
+    adapter = _types.adapter_for_build(build, contract)
     if adapter not in _SUPPORTED_ADAPTERS:
         return None
 

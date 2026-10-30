@@ -80,9 +80,9 @@ _BUCKET_RE = re.compile(r"[A-Za-z0-9._-]+")
 #: prints on its state line (a newline there would forge a line of output).
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
-#: What a provider name in a state key may hold: the IaC plugin names
-#: (``aws``, ``gcp``, ``snowflake``, ``confluent``) and nothing that could add
-#: a path segment or a control character to the key.
+#: What a provider name in a state key may hold: an IaC plugin name (``aws``,
+#: ``databricks``, ...) and nothing that could add a path segment or a control
+#: character to the key.
 _PROVIDER_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 #: Environment variable ``fluid apply`` reads for the state backend when

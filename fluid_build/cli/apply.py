@@ -454,8 +454,8 @@ def register(subparsers: argparse._SubParsersAction):
         action="store_true",
         default=False,
         help=(
-            "Required for replace modes when env != dev or target has rows. "
-            "Pre-replace snapshot enables ``fluid rollback``."
+            "Required for replaces outside dev or on rows (snapshotted), and OpenTofu "
+            "plans that destroy data or drop/rename Databricks columns."
         ),
     )
     mode_group.add_argument(
@@ -1260,7 +1260,13 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
     registry.discover_providers(logger)
 
     def _served(name: str) -> bool:
-        return name in registry.PROVIDERS or name in registry.POLICY_BLOCKED
+        # A plan-only provider (``native_apply = False``: databricks) is applied by
+        # the OpenTofu engine alone; this path cannot serve its platform, and
+        # handing it to another provider would land a placeholder file.
+        provider = registry.PROVIDERS.get(name)
+        if provider is not None:
+            return bool(getattr(provider, "native_apply", True))
+        return name in registry.POLICY_BLOCKED
 
     unsupported = [f"{w}: {n}" for w, n, outside in lands if not outside and not _served(n)]
     named = [n for _w, n, _outside in lands if _served(n)]

@@ -28,6 +28,7 @@ import subprocess
 import pytest
 
 from fluid_build.iac import IAC_PLUGINS, build_module
+from fluid_build.iac.module import write_dependency_lock
 
 pytestmark = [pytest.mark.integration, pytest.mark.provider]
 
@@ -193,6 +194,34 @@ _SAMPLE_CONTRACTS = {
                     "schema": [
                         {"name": "ID", "type": "integer", "required": True},
                         {"name": "MSG", "type": "string"},
+                    ]
+                },
+            }
+        ],
+    },
+    "databricks": {
+        "id": "demo.databricks.orders",
+        "accessPolicy": {"grants": [{"principal": "group:analysts", "permissions": ["read"]}]},
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "binding": {
+                    "platform": "databricks",
+                    "format": "delta_table",
+                    "location": {
+                        "database": "main",
+                        "schema": "sales",
+                        "table": "orders",
+                        "partitionBy": ["region"],
+                    },
+                },
+                "contract": {
+                    "schema": [
+                        {"name": "id", "type": "bigint", "required": True},
+                        {"name": "amount", "type": "decimal(18,2)"},
+                        {"name": "region", "type": "string"},
+                        {"name": "tags", "type": "array"},
+                        {"name": "payload", "type": "object"},
                     ]
                 },
             }
@@ -394,14 +423,19 @@ _SAMPLE_ACTIONS = {
 
 @pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
 @pytest.mark.parametrize("cloud", sorted(_SAMPLE_CONTRACTS))
-def test_emitted_tfjson_passes_tofu_validate(cloud, tmp_path):
+def test_emitted_tfjson_passes_tofu_validate(cloud, tmp_path, monkeypatch):
     plugin = IAC_PLUGINS.get(cloud)
     if plugin is None:
         pytest.skip(f"no IaC plugin registered for {cloud}")
+    # The Databricks emitter reads the SQL warehouse from the environment only.
+    monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", "wh-validate-only")
 
     (tmp_path / "main.tf.json").write_text(
         build_module(plugin, _SAMPLE_CONTRACTS[cloud], actions=_SAMPLE_ACTIONS.get(cloud, ()))
     )
+    # A plugin's committed lock, as `fluid apply` writes it: `tofu init` must
+    # install the locked provider and accept its recorded checksums.
+    write_dependency_lock(plugin, tmp_path)
 
     _tofu_init_or_skip(tmp_path)
 

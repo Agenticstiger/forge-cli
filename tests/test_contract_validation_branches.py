@@ -289,7 +289,7 @@ class TestContractValidator:
 
         v = ContractValidator(Path("test.yaml"), use_cache=False, check_data=False)
         report = v.validate()
-        assert any("not yet implemented" in w.message for w in report.get_warnings())
+        assert any("Unity Catalog is not available" in w.message for w in report.get_warnings())
 
     @patch("fluid_build.cli.contract_validation.load_contract_with_overlay")
     @patch("fluid_build.cli.contract_validation.FluidSchemaManager")

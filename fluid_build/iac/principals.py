@@ -42,6 +42,11 @@ Rules, the same on every cloud:
   (``user:``, ``group:``, ``serviceAccount:``, ``domain:``) on GCP, an IAM ARN on
   AWS (``principal-invalid``). On AWS an unmapped principal must already be an ARN,
   since it can only be matched against the Lake Formation grants' ARNs.
+* On Databricks an identity is a bare Unity Catalog principal name (a user's
+  email, a group's name, a service principal's application ID). Unmapped, a
+  ``user:`` or ``group:`` principal loses its prefix; a ``serviceAccount:`` or
+  ``domain:`` one has no counterpart and is refused, as is a reserved-TLD
+  placeholder.
 
 Prior art, adapted rather than depended on (none is a library for this):
 
@@ -92,6 +97,14 @@ _ENV_TEMPLATE_RE = re.compile(r"\{\{\s*env\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}")
 #: Platforms this module resolves identities for.
 GCP = "gcp"
 AWS = "aws"
+DATABRICKS = "databricks"
+
+#: An example identity per platform, for the unmapped-principal remediation.
+_EXAMPLE_IDENTITY = {
+    GCP: "group:data-platform@yourcompany.com",
+    AWS: "arn:aws:iam::<account>:role/<name>",
+    DATABRICKS: "data-platform",
+}
 
 PrincipalMap = Dict[str, Tuple[str, ...]]
 
@@ -231,6 +244,52 @@ def _aws_identity(identity: str, *, raw: str, where: str, mapped: bool = True) -
     return identity
 
 
+def _databricks_identity(identity: str, *, raw: str, where: str, mapped: bool = True) -> str:
+    """A Unity Catalog principal: a user's email, a group's name, or a service
+    principal's application ID, written bare. Unity Catalog takes the name with no
+    type prefix, so an unmapped ``user:`` / ``group:`` principal loses its prefix,
+    while a service account or domain has no Unity Catalog counterpart to fall to.
+    """
+    head, sep, rest = identity.partition(":")
+    prefix = head.strip().lower() if sep else ""
+    name = identity.strip()
+    if prefix in _GCP_PREFIXES:
+        if mapped:
+            raise UnsupportedBindingError(
+                "principal-invalid",
+                f"{where}: principal {raw!r} maps to {identity!r}. A Databricks identity is "
+                "the bare principal name, with no type prefix.",
+                (f"Map it to {rest.strip()!r} instead.",),
+            )
+        if prefix not in ("user", "group"):
+            raise UnsupportedBindingError(
+                "principal-unmapped",
+                f"{where}: principal {raw!r} is a {head.strip()} principal, which has no Unity "
+                "Catalog counterpart, and this binding's binding.principals does not map it.",
+                (
+                    "Map it in binding.principals to the Databricks service principal's "
+                    "application ID, or to a group name.",
+                ),
+            )
+        name = rest.strip()
+    domain = name.rsplit("@", 1)[-1].strip().rstrip(".").lower() if "@" in name else ""
+    tld = domain.rsplit(".", 1)[-1] if domain else ""
+    if not name or any(ch.isspace() and ch != " " for ch in name) or tld in RESERVED_TLDS:
+        raise UnsupportedBindingError(
+            "principal-placeholder",
+            f"{where}: principal {raw!r} resolves to {name!r}, which cannot be a Databricks "
+            "principal"
+            + (f" (.{tld} is a reserved top-level domain, RFC 2606)" if tld else "")
+            + ".",
+            (
+                "Map it in this environment's binding.principals to the real user, group or "
+                "service principal, e.g. principals: {'" + raw + "': 'data-platform'}.",
+                "Map it to [] if it has no identity on Databricks; nothing is granted to it.",
+            ),
+        )
+    return name
+
+
 def resolve_principal(
     raw: Any,
     mapping: Optional[PrincipalMap],
@@ -253,11 +312,7 @@ def resolve_principal(
         if identities is None and fallback is not None:
             identities = mapping.get(logical_key(fallback))
         if identities is None:
-            example = (
-                "group:data-platform@yourcompany.com"
-                if platform == GCP
-                else "arn:aws:iam::<account>:role/<name>"
-            )
+            example = _EXAMPLE_IDENTITY[platform]
             raise UnsupportedBindingError(
                 "principal-unmapped",
                 f"{where} names principal {key!r}, and this {platform} binding's "
@@ -277,7 +332,7 @@ def resolve_principal(
         identities = (f"{split[1]}:{split[0]}",) if split else (key,)
     else:
         identities = (key,)
-    check = _gcp_identity if platform == GCP else _aws_identity
+    check = {GCP: _gcp_identity, AWS: _aws_identity, DATABRICKS: _databricks_identity}[platform]
     mapped = mapping is not None
     return tuple(
         check(identity, raw=key, where=where, mapped=mapped or platform == AWS)
@@ -326,6 +381,7 @@ def gcp_grants(
 
 __all__ = [
     "AWS",
+    "DATABRICKS",
     "GCP",
     "RESERVED_TLDS",
     "gcp_grants",

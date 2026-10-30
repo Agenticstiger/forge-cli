@@ -48,6 +48,18 @@ PROVIDER_PINS: Dict[str, Dict[str, str]] = {
     # ``redshift-data`` API (no ``aws_redshiftserverless_external_schema``
     # exists today; filed upstream — see ``AUTOGEN_SPIKE.md``).
     "null": {"source": "hashicorp/null", "version": "~> 3.0"},
+    # Databricks Unity Catalog. Pinned to one minor, not ``~> 1.0``: the
+    # provider releases weekly, 1.114.x shipped a state regression, and the
+    # OpenTofu registry serves no GPG key for it (opentofu/opentofu#4814), so
+    # the checksums in the committed lock file
+    # (``iac/providers/locks/databricks.terraform.lock.hcl``) are the only
+    # integrity check ``tofu init`` has. A bump moves this pin and that lock
+    # together, and re-checks the provider messages the plugin's fix-its match
+    # (``_TYPE_CHANGE``, ``_IDENTITY_CHANGE``, ``_MIXED_CHANGE``,
+    # ``_NO_CREDENTIALS`` in ``iac/providers/databricks.py``) and its
+    # ``resource_sql_table.go`` diff rules: only the type change is exercised
+    # against the real provider in CI.
+    "databricks": {"source": "databricks/databricks", "version": "~> 1.140.0"},
 }
 
 

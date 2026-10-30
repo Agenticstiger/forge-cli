@@ -582,6 +582,10 @@ fluid_build = [
   "providers/**/assets/**/*",
   "providers/**/*.json",
   "providers/**/*.yaml",
+  # Committed OpenTofu dependency locks, one per IaC plugin that ships one
+  # (``iac/module.py::dependency_lock``). Without it a wheel install would
+  # run ``tofu init`` with no checksums to verify the provider against.
+  "iac/providers/locks/*.hcl",
 ]
 # Avoid shipping compiled junk, stale backups, and test fixtures.
 #
@@ -732,6 +736,7 @@ markers = [
     "aws: Tests requiring AWS credentials",
     "gcp: Tests requiring GCP credentials",
     "snowflake: Tests requiring Snowflake credentials",
+    "databricks: Databricks provider tests (offline tiers use an in-process stand-in, never a workspace)",
     "provider: Tests for provider implementations",
     "datamesh: Tests for DataMesh Manager provider",
     "policy: Tests for policy validators",
