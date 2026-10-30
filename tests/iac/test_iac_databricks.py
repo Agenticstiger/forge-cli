@@ -470,6 +470,17 @@ def test_two_exposes_on_one_table_are_refused():
     assert exc.value.kind == "databricks-table-duplicate"
 
 
+def test_principals_that_fold_to_one_name_keep_their_own_grants():
+    # safe_ident turns both into data_eng: one address, a collision the contract
+    # cannot rename away. The principals are distinct identities.
+    contract = _contract(**{"exposes.0.policy.authz.readers": ["data-eng", "data_eng"]})
+    contract["accessPolicy"] = {}
+    assert dbx.validate_databricks_binding(contract) == ([], [])
+    grants = IAC_PLUGINS["databricks"].emit(contract)["databricks_grant"]
+    on_table = sorted(g["principal"] for g in grants.values() if "table" in g)
+    assert on_table == ["data-eng", "data_eng"]
+
+
 def test_env_templates_validate_as_one_segment():
     contract = _contract(**{"exposes.0.binding.location.database": "{{ env.DBX_CATALOG }}"})
     assert dbx.validate_databricks_binding(contract) == ([], [])

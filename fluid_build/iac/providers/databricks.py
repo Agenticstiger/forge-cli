@@ -61,6 +61,7 @@ so an existing table must be imported before the first apply.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass, field
@@ -632,7 +633,8 @@ def _refuse_grant_shapes(
                 _refusal(
                     "grant-scope-unmapped",
                     f"accessPolicy grant to {grant_key(grant)!r} is scoped by resources, which "
-                    "the Databricks emitter does not evaluate: it would grant on every table.",
+                    "the Databricks emitter does not evaluate: the grant would reach no "
+                    "Databricks table.",
                     "Drop resources (the grant then covers every table of the product), or "
                     "use the expose's policy.authz.readers / writers.",
                 )
@@ -690,6 +692,20 @@ def _table_privileges(
             for principal, granted in privileges.items():
                 out.setdefault(target.full_name, {}).setdefault(principal, set()).update(granted)
     return out
+
+
+def _principal_key(principal: str) -> str:
+    """``principal`` as an address segment no other principal shares.
+
+    ``safe_ident`` turns every character but letters, digits and ``_`` into
+    ``_``, so ``data-eng`` and ``data_eng`` would meet at one address, a
+    collision the contract cannot rename away. A principal it changes carries
+    a digest of its exact text.
+    """
+    folded = safe_ident(principal)
+    if folded == principal:
+        return folded
+    return f"{folded}_{hashlib.sha256(principal.encode('utf-8')).hexdigest()[:8]}"
 
 
 def _claim(compiled: _Compiled, rtype: str, key: str, owner: str, body: Dict[str, Any]) -> None:
@@ -842,7 +858,7 @@ def _compile(
             _claim(
                 compiled,
                 "databricks_grant",
-                safe_ident(f"{table_key}_{principal}"),
+                f"{table_key}_{_principal_key(principal)}",
                 f"{principal!r} on table {table.full_name}",
                 {
                     "table": tofu_ref(f"databricks_sql_table.{table_key}.id"),
@@ -853,7 +869,7 @@ def _compile(
             _claim(
                 compiled,
                 "databricks_grant",
-                safe_ident(f"{schema_key}_usage_{principal}"),
+                f"{schema_key}_usage_{_principal_key(principal)}",
                 f"{principal!r} on schema {table.catalog}.{table.schema}",
                 {
                     "schema": tofu_ref(f"databricks_schema.{schema_key}.id"),
