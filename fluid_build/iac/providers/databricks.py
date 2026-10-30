@@ -1205,6 +1205,7 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "op": "databricks.schema.ensure",
                 "resource_type": "databricks_schema",
                 "resource_id": f"{table.catalog}.{table.schema}",
+                "schema": table.schema,
             }
         )
         actions.append(
@@ -1212,6 +1213,7 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "op": "databricks.table.ensure",
                 "resource_type": "databricks_sql_table",
                 "resource_id": table.full_name,
+                "table": table.name,
                 "columns": [dict(column) for column in table.columns],
                 "partitions": list(table.partitions),
             }

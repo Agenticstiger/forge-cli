@@ -807,6 +807,14 @@ class TestPlanner:
         assert ("databricks_catalog", "main") in ids
         assert ("databricks_grant", "table/main.sales.orders/analysts") in ids
         assert ("databricks_grant", "schema/main.sales/analysts") in ids
+        # `fluid generate iac --shadow` reads the same names off both engines.
+        from fluid_build.iac.shadow import shadow_compare
+
+        report = shadow_compare(
+            _contract(), plugin=IAC_PLUGINS["databricks"], native_actions=provider.plan(_contract())
+        )
+        # Grants are OpenTofu-only, as other clouds' IAM members are.
+        assert report.ok and {r.kind for r in report.matched} == {"schema", "table"}
         with pytest.raises(ProviderError):
             provider.apply([])
         assert provider.capabilities()["apply"] is False
