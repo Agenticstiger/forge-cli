@@ -117,6 +117,10 @@ class TestCredentialPlaceholders:
             "{# a comment #}main",
             # A placeholder in the default would become a second, unscanned env_var.
             "{{ env_var('DBX_CATALOG', '$DATABRICKS_TOKEN') }}",
+            # Translated, the inner placeholder splits the default: the outer call
+            # then reads DATABRICKS_TOKEN with nothing left to scan it.
+            "{{ env_var('DATABRICKS_TOKEN', 'a{{ env.or }}b') }}",
+            "{{ env_var('a{{ env.or }}') }}",
         ],
     )
     def test_a_credential_never_becomes_the_catalog_or_schema(self, value):

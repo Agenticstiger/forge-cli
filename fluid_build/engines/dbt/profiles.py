@@ -24,15 +24,15 @@ from typing import Any, Dict, Optional, Tuple
 import yaml
 
 from .project_yml import _sanitize_project_name
-from .sources import _FLUID_ENV_RE, _SHELL_ENV_RE, _normalize_placeholder
+from .sources import _normalize_placeholder
 
 _logger = logging.getLogger(__name__)
 
 #: The one dbt Jinja form a contract value may carry as written:
 #: ``{{ env_var('NAME') }}``, with an optional quoted default. Anything else
 #: (``~``, ``{% set %}``, a call written any other way) is evaluated by dbt as
-#: written, so it is refused rather than parsed. The default holds no ``$``:
-#: ``${NAME}`` there would be translated into a second ``env_var`` unscanned.
+#: written, so it is refused rather than parsed. The default holds no ``$`` or
+#: brace, so no placeholder in it can turn into a second, nested call.
 _ENV_VAR_JINJA_RE = re.compile(
     r"\{\{\s*env_var\(\s*'([A-Za-z_][A-Za-z0-9_]*)'\s*(?:,\s*'[^'{}%#$]*'\s*)?\)\s*\}\}"
 )
@@ -158,19 +158,20 @@ def _contract_expr(value: Any) -> Optional[str]:
     puts the secret where dbt prints names back (``catalog not found``, run
     logs), the names ``resolve_env_templates_in_contract`` refuses to resolve.
     A refused value is not used; the caller falls back to its environment default.
+
+    Checked as emitted, after the translation: ``{{ env.X }}`` inside an
+    ``env_var`` default only becomes a second, nested call there.
     """
     from fluid_build.observability.secret_redactor import is_sensitive_key_name
 
     text = str(value).strip() if value is not None else ""
     if not text:
         return None
-    rest = _ENV_VAR_JINJA_RE.sub("", _FLUID_ENV_RE.sub("", text))
-    if any(marker in rest for marker in _JINJA_MARKERS):
+    emitted = _normalize_placeholder(text) or ""
+    if any(marker in _ENV_VAR_JINJA_RE.sub("", emitted) for marker in _JINJA_MARKERS):
         _logger.warning("profiles.yml: a contract value carries Jinja; not used")
         return None
-    names = (
-        _FLUID_ENV_RE.findall(text) + _ENV_VAR_JINJA_RE.findall(text) + _SHELL_ENV_RE.findall(rest)
-    )
+    names = _ENV_VAR_JINJA_RE.findall(emitted)
     secret = next((name for name in names if is_sensitive_key_name(name)), None)
     if secret:
         _logger.warning(
@@ -178,7 +179,7 @@ def _contract_expr(value: Any) -> Optional[str]:
             secret,
         )
         return None
-    return _normalize_placeholder(text)
+    return emitted
 
 
 def _profile_for_platform(
