@@ -368,9 +368,23 @@ def _runtime(
         timeout = _seconds(runtime["timeout"], f"{where} execution.runtime.timeout", refusals)
         if timeout is not None:
             task["timeout_seconds"] = timeout
+    run_as = _run_as(runtime, where, refusals, run_as_allowed)
+    if run_as:
+        job["run_as"] = run_as
+    return job, task
+
+
+def _run_as(
+    runtime: Mapping[str, Any],
+    where: str,
+    refusals: List[UnsupportedBindingError],
+    run_as_allowed: FrozenSet[str],
+) -> Optional[Dict[str, str]]:
+    """The job's ``run_as`` for ``execution.runtime.serviceAccount``, or ``None``
+    (with a refusal unless it is unset): a service principal the operator lists."""
     account = str(runtime.get("serviceAccount") or "").strip()
     if not account:
-        return job, task
+        return None
     if not _APPLICATION_ID_RE.match(account):
         # A user is never taken from a contract: the identity that applies it is
         # often a workspace admin, who may set any user, so a contract author could
@@ -386,7 +400,7 @@ def _runtime(
             )
         )
     elif account.lower() in run_as_allowed:
-        job["run_as"] = {"service_principal_name": account.lower()}
+        return {"service_principal_name": account.lower()}
     else:
         # Nor a service principal the operator has not listed: the identity that
         # applies may hold Service Principal User on several, so a contract alone
@@ -403,7 +417,7 @@ def _runtime(
                 "that applies the contract.",
             )
         )
-    return job, task
+    return None
 
 
 def run_as_allowlist(env: Mapping[str, str]) -> FrozenSet[str]:
