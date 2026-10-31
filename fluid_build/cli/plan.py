@@ -1087,8 +1087,13 @@ def _plan_legacy(contract: Dict[str, Any], args, logger: logging.Logger) -> Dict
     contract = run_pre_plan(provider, contract, logger)
 
     if hasattr(provider, "plan"):
+        from fluid_build.iac.source import contract_source, source_contract_file
+
         try:
-            actions = provider.plan(contract)
+            # A planner that lists a build's local files reads them from the
+            # contract's directory (iac/source.py).
+            with contract_source(source_contract_file(getattr(args, "contract", None))):
+                actions = provider.plan(contract)
         except Exception as exc:
             run_on_error(provider, exc, "plan", logger)
             raise

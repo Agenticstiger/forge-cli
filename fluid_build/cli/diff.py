@@ -272,7 +272,12 @@ def run(args, logger: logging.Logger) -> int:
         provider = build_provider(provider_arg, project_arg, region_arg, logger)
 
         info(logger, "diff_planning", contract_kind=contract.get("kind", "unknown"))
-        desired_actions = provider.plan(contract)
+        from fluid_build.iac.source import contract_source, source_contract_file
+
+        # A planner that lists a build's local files reads them from the contract's
+        # directory (iac/source.py).
+        with contract_source(source_contract_file(getattr(args, "contract", None))):
+            desired_actions = provider.plan(contract)
 
         # Extract resource identifiers from desired state
         desired_resources = _extract_resource_ids(desired_actions)

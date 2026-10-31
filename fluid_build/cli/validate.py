@@ -1087,7 +1087,10 @@ def _run_contract_rules(
             validation_result.is_valid = False
 
         # --- Databricks: everything its emitter refuses, from the same pass ---
-        _databricks_binding_check(validation_result, contract)
+        from fluid_build.iac.source import contract_source, source_contract_file
+
+        with contract_source(source_contract_file(getattr(args, "contract", None))):
+            _databricks_binding_check(validation_result, contract)
 
         # --- Iceberg prerequisite checks (anti-no-op gate) ------------------
         # The Snowflake and GCP IaC emitters are emit-when-derivable: an

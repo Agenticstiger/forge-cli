@@ -46,6 +46,7 @@ from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.credentials import build_tofu_env, credential_report
 from fluid_build.iac.module import write_dependency_lock
 from fluid_build.iac.naming import safe_ident
+from fluid_build.iac.source import contract_source, source_contract_file
 from fluid_build.iac.state_migration import (
     PENDING,
     StateMigrationError,
@@ -72,7 +73,15 @@ def apply_via_opentofu(
     resolved here) and the file is not re-read, so a source changed after
     the gate cannot reach ``tofu`` unvalidated. Without it the contract is
     loaded from ``args.contract``.
+
+    Every compile of the run sees the contract's file (``iac/source.py``), so a
+    plugin that ships a build's local files finds them as the runners do.
     """
+    with contract_source(source_contract_file(getattr(args, "contract", None))):
+        return _apply_via_opentofu(args, logger, contract)
+
+
+def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping[str, Any]]) -> int:
     # Plan-binding verification — must run BEFORE any tofu apply so a
     # tampered plan.json is rejected before infra changes. The native
     # apply path (cli/apply.py::_verify_plan_digests) had this gate; the

@@ -522,7 +522,8 @@ class TestEngineWiring:
 
         from fluid_build.cli import _apply_opentofu_engine as engine
 
-        source = inspect.getsource(engine.apply_via_opentofu)
+        # The run's body (apply_via_opentofu wraps it in the contract-source block).
+        source = inspect.getsource(engine._apply_via_opentofu)
         guard_at = source.index("_guard_packaging_transitions(")
         adopt_at = source.index("_adopt_existing(")
         plan_at = source.index("runner.tofu_plan(")

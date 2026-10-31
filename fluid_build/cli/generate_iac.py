@@ -39,6 +39,7 @@ from fluid_build.iac import (
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.module import write_dependency_lock
 from fluid_build.iac.packaging import resolve_packaging
+from fluid_build.iac.source import contract_source, source_contract_file
 
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
 from ._logging import info
@@ -123,14 +124,16 @@ def run(args, logger: logging.Logger) -> int:
         logger.debug("packaging resolved: legacy=%s pool=%s", packaging.is_legacy, packaging.pool)
         provider = _resolve_provider(contract, getattr(args, "provider", "auto"))
         plugin = get_iac_plugin(provider)
-        actions = native_actions(contract, logger, offline=True)
-        resources = plugin.emit(contract, actions)
+        with contract_source(source_contract_file(contract_path)):
+            actions = native_actions(contract, logger, offline=True)
+            resources = plugin.emit(contract, actions)
+            data = plugin.emit_data(contract, actions)
         count = sum(len(items) for items in resources.values())
         provider_cfg = provider_config(plugin, contract)
         document = assemble_tofu_document(
             required_providers=plugin.required_providers,
             resources=resources,
-            data=plugin.emit_data(contract, actions),
+            data=data,
             # `.tf.json` keys the provider block by the provider's local name.
             provider={plugin.name: provider_cfg} if provider_cfg else None,
         )
