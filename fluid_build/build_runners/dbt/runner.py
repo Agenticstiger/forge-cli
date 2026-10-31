@@ -268,6 +268,23 @@ def _normalize_selectors(raw: Any) -> List[str]:
     return cleaned
 
 
+def build_selectors(build: Dict[str, Any]) -> List[str]:
+    """The ``--select`` values a dbt build runs with: ``properties.select`` (or the
+    legacy ``models``), else ``+<model>+`` for a build with one output at most.
+
+    The Databricks job for the build (``iac/providers/databricks_jobs.py``) selects
+    with this too, so a local run and the workspace job build the same nodes.
+    """
+    props = build.get("properties") or {}
+    selectors = _normalize_selectors(props.get("select") or props.get("models"))
+    if not selectors:
+        model = props.get("model")
+        outputs = build.get("outputs") or []
+        if model and len(outputs) <= 1:
+            selectors = [f"+{model}+"]
+    return selectors
+
+
 def _infer_dbt_adapter(build: Dict[str, Any]) -> Optional[str]:
     engine = str(build.get("engine") or "").strip().lower()
     if engine.startswith("dbt-") and len(engine) > 4:
@@ -642,12 +659,7 @@ def build_dbt_command(
             # subprocess we spawn from here on should respect the fallback.
             os.environ.pop("DBT_TARGET", None)
 
-    selectors = _normalize_selectors(props.get("select") or props.get("models"))
-    if not selectors:
-        model = props.get("model")
-        outputs = build.get("outputs") or []
-        if model and len(outputs) <= 1:
-            selectors = [f"+{model}+"]
+    selectors = build_selectors(build)
     if selectors:
         dbt_args += ["--select", *selectors]
 

@@ -30,8 +30,16 @@ and ``replaced`` (tables a CREATE OR REPLACE hit while they existed). Each table
 ``marker`` that changes only when the table is (re)created, so a test can tell "the same table"
 from "a replaced table" after an apply.
 
+It also serves ``databricks_job`` (create / get / reset / delete, plus the ``list`` an exact
+``name`` filter needs), ``databricks_workspace_file`` (import / get-status / delete) and
+``data.databricks_current_user``, and answers the Unity Catalog effective-permissions read.
+Jobs and workspace files are kept as sent (``jobs[id]["settings"]``, ``workspace_files[path]``),
+so a test asserts on exactly what the provider submitted; ``add_job`` / ``add_workspace_file``
+seed brownfield objects.
+
 Not proven here: what real Databricks accepts (SQL dialect, warehouse state, the privilege
-model, Unity Catalog storage), jobs (Phase 2) and any workspace-level setting.
+model, Unity Catalog storage), whether a job's settings are valid (the fake stores any), job
+runs, and any workspace-level setting.
 
 The provider is pointed at it with ``host`` and a dummy ``token``. Standalone:
 ``python _fake_databricks.py --port 8765``.
@@ -39,6 +47,7 @@ The provider is pointed at it with ``host`` and a dummy ``token``. Standalone:
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import re
@@ -55,6 +64,28 @@ _ORG_ID = "1234567890123456"
 _IDENT = r"`?([^`.\s]+)`?"
 _FULL = rf"{_IDENT}\.{_IDENT}\.{_IDENT}"
 _QUOTED = r"'((?:[^'\\]|\\.)*)'"
+
+
+def _multipart(content_type: str, raw: bytes) -> Dict[str, Any]:
+    """Fields of a multipart/form-data body (what workspace import uploads); a file part's
+    bytes come back base64-encoded, the shape the JSON form of the same call uses."""
+    mt = re.search(r"boundary=([^;\s]+)", content_type)
+    fields: Dict[str, Any] = {}
+    if not mt:
+        return fields
+    for chunk in raw.split(b"--" + mt.group(1).encode())[1:]:
+        if chunk.startswith(b"--"):
+            break
+        head, _, data = chunk.lstrip(b"\r\n").partition(b"\r\n\r\n")
+        data = data[:-2] if data.endswith(b"\r\n") else data
+        name = re.search(rb'name="([^"]*)"', head)
+        if name is None:
+            continue
+        is_file = b"filename=" in head
+        fields[name.group(1).decode()] = (
+            base64.b64encode(data).decode() if is_file else data.decode()
+        )
+    return fields
 
 
 def _err(status: int, code: str, msg: str) -> Tuple[int, Dict[str, Any]]:
@@ -381,6 +412,10 @@ class FakeDatabricks:
         # (securable_type, full_name) -> {principal: [privileges]}
         self.grants: Dict[Tuple[str, str], Dict[str, List[str]]] = {}
         self.statements: Dict[str, Dict[str, Any]] = {}
+        # job_id -> {job_id, created_time, creator_user_name, settings}; settings as the provider sent
+        self.jobs: Dict[int, Dict[str, Any]] = {}
+        self.workspace_files: Dict[str, bytes] = {}  # workspace path -> content
+        self.workspace_dirs: set = set()  # directories a workspace import / mkdirs created
         self.warehouse_id = warehouse_id
         self.requests: List[Tuple[str, str]] = []  # every request
         self.queries: List[Tuple[str, str, str]] = []  # (method, path, raw query)
@@ -388,6 +423,8 @@ class FakeDatabricks:
         self.sql_log: List[str] = []  # every SQL statement received
         self.replaced: List[str] = []  # tables a CREATE OR REPLACE hit while they existed
         self._marker = 0
+        self._job_seq = 0
+        self._object_ids: Dict[str, int] = {}  # workspace path -> object_id
         self._lock = threading.RLock()
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -407,8 +444,12 @@ class FakeDatabricks:
                 parsed = urlparse(self.path)
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n) if n else b""
+                ctype = self.headers.get("Content-Type") or ""
                 try:
-                    body = json.loads(raw) if raw else {}
+                    if ctype.startswith("multipart/form-data"):
+                        body = _multipart(ctype, raw)
+                    else:
+                        body = json.loads(raw) if raw else {}
                 except ValueError:
                     body = {}
                 path = unquote(parsed.path)
@@ -500,6 +541,43 @@ class FakeDatabricks:
             self._ensure_schema(cat, sch)
             self.tables[full_name] = _new_table(cols, tail, self._next_marker())
 
+    def add_job(self, settings: Dict[str, Any]) -> int:
+        """Seed a job (brownfield) from its settings; returns the new job id."""
+        with self._lock:
+            self._job_seq += 1
+            self.jobs[self._job_seq] = {
+                "job_id": self._job_seq,
+                "created_time": int(time.time() * 1000),
+                "creator_user_name": _USER,
+                "run_as_user_name": _USER,
+                "settings": copy.deepcopy(settings),
+            }
+            return self._job_seq
+
+    def job_settings(self, job_id: int) -> Dict[str, Any]:
+        """A job's settings exactly as stored (what the provider last sent)."""
+        return copy.deepcopy(self.jobs[job_id]["settings"])
+
+    def add_workspace_file(self, path: str, content: Any) -> None:
+        """Seed a workspace file (brownfield); ``content`` is bytes or text."""
+        data = content.encode() if isinstance(content, str) else bytes(content)
+        with self._lock:
+            self._put_file(path, data)
+
+    def file_content(self, path: str) -> bytes:
+        """A workspace file's bytes."""
+        return self.workspace_files[path]
+
+    def grant(self, securable_type: str, full_name: str, principal: str, *privileges: str) -> None:
+        """Seed a direct grant, e.g. ``grant("catalog", "main", "group:bi", "USE_CATALOG")``."""
+        with self._lock:
+            g = self.grants.setdefault((securable_type, full_name), {})
+            g[principal] = sorted(set(g.get(principal, [])) | set(privileges))
+
+    def grant_catalog(self, catalog: str, principal: str, *privileges: str) -> None:
+        """Seed catalog-level privileges (e.g. ``USE_CATALOG``); schemas and tables inherit them."""
+        self.grant("catalog", catalog, principal, *privileges)
+
     # ------------------------------------------------------------------ routing
     def _route(
         self, method: str, path: str, query: Dict[str, List[str]], body: Dict[str, Any]
@@ -534,6 +612,22 @@ class FakeDatabricks:
         a("DELETE", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._delete_table)
         a("GET", r"/api/2\.1/unity-catalog/permissions/([a-z_]+)/([^/]+)", self._get_perms)
         a("PATCH", r"/api/2\.1/unity-catalog/permissions/([a-z_]+)/([^/]+)", self._patch_perms)
+        a(
+            "GET",
+            r"/api/2\.1/unity-catalog/effective-permissions/([a-z_]+)/([^/]+)",
+            self._get_effective_perms,
+        )
+        # ---- jobs
+        a("POST", r"/api/2\.2/jobs/create", self._job_create)
+        a("GET", r"/api/2\.2/jobs/get", self._job_get)
+        a("GET", r"/api/2\.2/jobs/list", self._job_list)
+        a("POST", r"/api/2\.2/jobs/reset", self._job_reset)
+        a("POST", r"/api/2\.2/jobs/delete", self._job_delete)
+        # ---- workspace files
+        a("POST", r"/api/2\.0/workspace/mkdirs", self._ws_mkdirs)
+        a("POST", r"/api/2\.0/workspace/import", self._ws_import)
+        a("GET", r"/api/2\.0/workspace/get-status", self._ws_status)
+        a("POST", r"/api/2\.0/workspace/delete", self._ws_delete)
         # ---- sql
         a("POST", r"/api/2\.0/sql/statements/?", self._exec_sql)
         a("GET", r"/api/2\.0/sql/statements/([^/]+)", self._get_stmt)
@@ -697,6 +791,130 @@ class FakeDatabricks:
             cur -= set(ch.get("remove") or [])
             g[ch["principal"]] = sorted(cur)
         return 200, self._assignments(g)
+
+    def _inherited_from(self, securable_type: str, full_name: str) -> List[Tuple[str, str]]:
+        """The (type, name) pairs above a securable whose grants it inherits."""
+        parts = full_name.split(".")
+        if securable_type == "table" and len(parts) == 3:
+            return [("schema", ".".join(parts[:2])), ("catalog", parts[0])]
+        if securable_type == "schema" and len(parts) == 2:
+            return [("catalog", parts[0])]
+        return []
+
+    def _get_effective_perms(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        """Direct grants on the securable plus those inherited from its schema and catalog.
+
+        Each privilege carries ``inherited_from_type`` / ``inherited_from_name`` when it comes
+        from a parent. Simplification: every privilege inherits (real UC is narrower for a few).
+        """
+        stype, full = m.group(1), m.group(2)
+        only = (q.get("principal") or [None])[0]
+        eff: Dict[str, Dict[str, Dict[str, Any]]] = {}  # principal -> privilege -> entry
+        sources: List[Tuple[str, str, bool]] = [(stype, full, False)]
+        sources += [(t, n, True) for t, n in self._inherited_from(stype, full)]
+        for t, n, inherited in sources:
+            for principal, privs in self.grants.get((t, n), {}).items():
+                for priv in privs:
+                    entry: Dict[str, Any] = {"privilege": priv}
+                    if inherited:
+                        entry.update(inherited_from_type=t.upper(), inherited_from_name=n)
+                    # a direct grant wins over an inherited one
+                    eff.setdefault(principal, {}).setdefault(priv, entry)
+        return 200, {
+            "privilege_assignments": [
+                {"principal": p, "privileges": [v[k] for k in sorted(v)]}
+                for p, v in eff.items()
+                if v and (only is None or p == only)
+            ]
+        }
+
+    # -- jobs
+    def _job_create(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        return 200, {"job_id": self.add_job(b)}
+
+    def _job_get(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        jid = int((q.get("job_id") or ["0"])[0])
+        if jid not in self.jobs:
+            return _err(400, "INVALID_PARAMETER_VALUE", f"Job {jid} does not exist.")
+        return 200, self.jobs[jid]
+
+    def _job_list(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        """``name`` is an exact, case-insensitive match, as on the real API."""
+        name = (q.get("name") or [None])[0]
+        limit = int((q.get("limit") or ["20"])[0])
+        start = int((q.get("page_token") or ["0"])[0])
+        hits = [
+            j
+            for j in self.jobs.values()
+            if name is None or j["settings"].get("name", "").lower() == name.lower()
+        ]
+        page = hits[start : start + limit]
+        out: Dict[str, Any] = {"jobs": page, "has_more": start + limit < len(hits)}
+        if out["has_more"]:
+            out["next_page_token"] = str(start + limit)
+        return 200, out
+
+    def _job_reset(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        jid = int(b.get("job_id", 0))
+        if jid not in self.jobs:
+            return _err(400, "INVALID_PARAMETER_VALUE", f"Job {jid} does not exist.")
+        self.jobs[jid]["settings"] = copy.deepcopy(b.get("new_settings") or {})
+        return 200, {}
+
+    def _job_delete(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        # the real API answers 200 for a job that is already gone
+        self.jobs.pop(int(b.get("job_id", 0)), None)
+        return 200, {}
+
+    # -- workspace files
+    def _put_file(self, path: str, data: bytes) -> None:
+        parent = path.rsplit("/", 1)[0]
+        while parent:
+            self.workspace_dirs.add(parent)
+            parent = parent.rsplit("/", 1)[0]
+        self._object_ids.setdefault(path, len(self._object_ids) + 1)
+        self.workspace_files[path] = data
+
+    def _ws_mkdirs(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        path = b.get("path", "")
+        while path:
+            self.workspace_dirs.add(path)
+            path = path.rsplit("/", 1)[0]
+        return 200, {}
+
+    def _ws_import(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        path = b.get("path", "")
+        parent = path.rsplit("/", 1)[0]
+        if parent and parent not in self.workspace_dirs:
+            # the provider answers this by mkdirs, then imports again
+            return _err(
+                404, "RESOURCE_DOES_NOT_EXIST", f"The parent folder ({parent}) does not exist."
+            )
+        overwrite = b.get("overwrite") in (True, "true")  # multipart sends the string
+        if path in self.workspace_files and not overwrite:
+            return _err(400, "RESOURCE_ALREADY_EXISTS", f"Path ({path}) already exists.")
+        self._put_file(path, base64.b64decode(b.get("content") or ""))
+        return 200, {}
+
+    def _ws_status(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        path = (q.get("path") or [""])[0]
+        if path in self.workspace_files:
+            return 200, {
+                "path": path,
+                "object_type": "FILE",
+                "object_id": self._object_ids[path],
+                "size": len(self.workspace_files[path]),
+            }
+        if path in self.workspace_dirs:
+            return 200, {"path": path, "object_type": "DIRECTORY", "object_id": 1}
+        return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Path ({path}) doesn't exist.")
+
+    def _ws_delete(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        path = b.get("path", "")
+        if path not in self.workspace_files:
+            return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Path ({path}) doesn't exist.")
+        del self.workspace_files[path]
+        return 200, {}
 
     # -- warehouse / sql
     def _get_wh(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:

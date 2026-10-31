@@ -42,6 +42,11 @@ class ImportBlock:
 
     to: str
     id: str
+    #: An import whose failure is never fatal, even for a plugin with
+    #: ``strict_adoption``: the resource's create overwrites what it would have
+    #: adopted (a Databricks grant is authoritative for its principal), so a
+    #: failed import costs an honest plan, never a silent replace.
+    best_effort: bool = False
 
 
 def import_section(blocks: List[ImportBlock]) -> Dict[str, Any]:

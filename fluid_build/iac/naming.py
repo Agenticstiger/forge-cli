@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 
@@ -30,6 +31,19 @@ def safe_ident(value: Any) -> str:
     if cleaned[0].isdigit():
         cleaned = f"r_{cleaned}"
     return cleaned
+
+
+def unique_ident(value: str) -> str:
+    """:func:`safe_ident`, plus a digest of ``value`` whenever folding changed it.
+
+    ``safe_ident`` turns every character but letters, digits and ``_`` into
+    ``_``, so ``data-eng`` and ``data_eng`` would meet at one address, a
+    collision the contract cannot rename away.
+    """
+    folded = safe_ident(value)
+    if folded == value:
+        return folded
+    return f"{folded}_{hashlib.sha256(value.encode('utf-8')).hexdigest()[:8]}"
 
 
 class TofuExpr(str):

@@ -41,6 +41,7 @@ from fluid_build.util.binding_paths import ENV_PLACEHOLDER_RE
 from fluid_build.util.contract import (
     describe_externally_run_build,
     is_continuous_build,
+    is_databricks_job_build,
     is_externally_run_build,
 )
 
@@ -92,6 +93,12 @@ def is_dbt_build(build: Dict[str, Any]) -> bool:
     return engine == "dbt" or engine.startswith("dbt-")
 
 
+def _record_run_elsewhere(build_id: str, report: Any) -> None:
+    """Record a build its own platform runs: skipped, ``reason: runs_outside_forge``."""
+    if report is not None:
+        report.record_build(build_id=build_id, status="skipped", reason="runs_outside_forge")
+
+
 def _report_externally_run_build(build: Dict[str, Any], build_id: str, report: Any) -> None:
     """Say that a build runs on its own platform; it is not run here.
 
@@ -106,8 +113,52 @@ def _report_externally_run_build(build: Dict[str, Any], build_id: str, report: A
         f"\n⏭️  Build '{build_id}' - {describe_externally_run_build(build)} runs on "
         f"{platform}, outside forge-cli; there is nothing for forge-cli to run."
     )
-    if report is not None:
-        report.record_build(build_id=build_id, status="skipped", reason="runs_outside_forge")
+    _record_run_elsewhere(build_id, report)
+
+
+def _report_databricks_job_build(contract: Dict[str, Any], build_id: str, report: Any) -> None:
+    """Say that a dbt build runs in its Databricks workspace, as a job; not here.
+
+    ``fluid apply`` provisions the job through OpenTofu
+    (``iac/providers/databricks_jobs.py``) and Databricks runs dbt on the job's
+    trigger, so a local run would be a second, unscheduled copy of it. Counted
+    and recorded as :func:`_report_externally_run_build` counts a Flink job.
+    """
+    product = contract.get("id") or contract.get("name") or "product"
+    cprint(
+        f"\n⏭️  Build '{build_id}' - dbt runs in the Databricks workspace as job "
+        f"'fluid {product} {build_id}' on its trigger (fluid apply provisions it); "
+        "start a run now from the job's page, or with: databricks jobs run-now <job id>.",
+        markup=False,
+    )
+    _record_run_elsewhere(build_id, report)
+
+
+def _writes_a_databricks_table(contract: Dict[str, Any], build: Dict[str, Any]) -> bool:
+    """True when ``build`` writes a Databricks-bound expose, so the Databricks plugin
+    provisions its job (``iac/providers/databricks_jobs.py``)."""
+    from fluid_build.iac.provider_match import is_cloud
+    from fluid_build.util.contract import builds_writing_expose
+
+    builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
+    return any(
+        isinstance(expose, dict)
+        and is_cloud(expose.get("binding") or {}, "databricks")
+        and any(b is build for b in builds_writing_expose(expose.get("exposeId"), builds))
+        for expose in contract.get("exposes") or []
+    )
+
+
+def _refuse_unprovisioned_databricks_build(build_id: str) -> int:
+    """Say why a dbt build on Databricks that writes no Databricks expose fails; return 1."""
+    cprint(
+        f"\n❌ Build '{build_id}' - execution.runtime.platform is databricks, but it writes no "
+        "Databricks expose: no job is provisioned for it, so nothing would run it. List its "
+        "Databricks expose in builds[].outputs, or name the platform it runs on "
+        "(fluid validate reports the same: databricks-job-no-target).",
+        markup=False,
+    )
+    return 1
 
 
 def is_embedded_sql_build(build: Dict[str, Any]) -> bool:
@@ -270,6 +321,8 @@ def _batch_runner_for(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str
         if embedded_sql_platform(build) not in EMBEDDED_SQL_PLATFORMS:
             return None
         return "inline-SQL builds", None
+    if is_databricks_job_build(build):
+        return None  # its Databricks job runs it, continuous or not
     if is_dbt_build(build):
         return "dbt builds", "dbt"
     if name in PLATFORM_RUN_ENGINES and embedded_sql_platform(build) not in LOCAL_SQL_PLATFORMS:
@@ -391,8 +444,7 @@ def _report_continuous_outside_forge(build: Dict[str, Any], build_id: str, repor
         "running, outside forge-cli; there is nothing for forge-cli to run.",
         markup=False,
     )
-    if report is not None:
-        report.record_build(build_id=build_id, status="skipped", reason="runs_outside_forge")
+    _record_run_elsewhere(build_id, report)
 
 
 # Acquisition-engine registry: ``engine name → (module path, callable name)``.
@@ -1396,6 +1448,19 @@ def run_builds_from_args(
         if is_externally_run_build(build):
             _report_externally_run_build(build, build_id, report)
             total_external += 1
+            continue
+
+        if is_databricks_job_build(build):
+            if _writes_a_databricks_table(contract, build):
+                _report_databricks_job_build(contract, build_id, report)
+                total_external += 1
+                continue
+            # No Databricks table: no plugin provisions its job, so nothing would run it.
+            result = _refuse_unprovisioned_databricks_build(build_id)
+            _report_build(report, contract_path.parent, product_id, build_id, result, runs_before)
+            total_failed += 1
+            if args.fail_fast:
+                break
             continue
 
         if _runs_outside_forge_continuously(build):

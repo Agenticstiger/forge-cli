@@ -387,6 +387,8 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
             "build_runners/dbt/profiles.py", "_list_profile_targets", "_load_dbt_project_config"
         ),
         *_site("build_runners/dlt/destinations.py", "_expand_bigquery_service_account"),
+        # The build's dbt_project.yml, for the dbt project files a Databricks job uploads.
+        *_site("iac/providers/databricks_jobs.py", "_project_source"),
     ),
     **_register(
         NOT_A_CONTRACT,

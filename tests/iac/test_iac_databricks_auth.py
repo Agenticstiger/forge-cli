@@ -335,6 +335,13 @@ class TestOverlayAndSdkConfig:
         assert exc.value.kind == "databricks-credentials-missing"
 
 
+def test_the_plugin_credential_env_is_the_auth_overlay():
+    from fluid_build.iac import IAC_PLUGINS
+
+    env: Optional[Dict[str, str]] = _env(DATABRICKS_TOKEN=TOKEN)
+    assert IAC_PLUGINS["databricks"].credential_env(env) == auth.tofu_env_overlay(env)
+
+
 class TestCredentialValues:
     """What a message is scrubbed of by value: the environment's and the profile's."""
 

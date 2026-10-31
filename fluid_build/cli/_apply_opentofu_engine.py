@@ -156,7 +156,7 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
     write_dependency_lock(plugin, workdir)
 
     env = build_tofu_env()
-    env.update(plugin.credential_env(env))
+    env.update(credential_overlay(plugin, env))
     present, _absent = credential_report(plugin, env)
 
     cprint(f"\nOpenTofu engine — provider: {provider}")
@@ -260,12 +260,20 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
 
     # Revoking a grant destroys a member resource and loses no data: only the
     # removals of data-bearing resources reach the data-loss gate.
-    data_changes, revoked = _data_bearing_changes(changes, runner.planned_removals(plan))
+    removals = runner.planned_removals(plan)
+    data_changes, revoked = _data_bearing_changes(changes, removals)
     if revoked:
         cprint(
             f"  {len(revoked)} access grant(s) or policy tag(s) removed (access revoked, no "
             "data lost; not gated): " + ", ".join(revoked)
         )
+    retired = _retired_definitions(changes, removals)
+    if retired:
+        cprint(
+            f"  {len(retired)} job(s) or workspace file(s) removed (no table data lost; not "
+            "gated; a job's run history goes with it): " + ", ".join(retired)
+        )
+    _report_plan_notices(plugin, contract, logger)
     # In-place updates that delete data — a dropped column — which the destroy
     # count above never sees (``~`` in the summary, not ``-``).
     lost_in_place = _in_place_changes(plugin, changes, str(workdir), env)
@@ -561,12 +569,25 @@ def emit_module(
         # The emitter refused to substitute a different resource kind for the
         # declared binding. Surface it as a typed CLI error rather than a
         # traceback — and, critically, before anything reaches the warehouse.
-        raise CLIError(
-            1,
-            "unsupported_binding",
-            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
-        )
+        raise _binding_error(exc)
     return module, actions
+
+
+def _binding_error(exc: UnsupportedBindingError) -> CLIError:
+    return CLIError(
+        1,
+        "unsupported_binding",
+        {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+    )
+
+
+def credential_overlay(plugin: Any, env: Mapping[str, str]) -> Dict[str, str]:
+    """``plugin.credential_env(env)``; a refusal (no host, two credentials, a
+    profile for another workspace) is a typed CLI error before ``tofu`` starts."""
+    try:
+        return plugin.credential_env(env)
+    except UnsupportedBindingError as exc:
+        raise _binding_error(exc)
 
 
 @contextmanager
@@ -784,7 +805,7 @@ def _adopt_existing(
         result = runner.tofu_import(workdir, block.to, block.id, env=env)
         if result.ok:
             adopted += 1
-        elif strict:
+        elif strict and not block.best_effort:
             _refuse_unadopted(plugin, contract, block, result, workdir, env)
         else:
             logger.debug(
@@ -1259,21 +1280,53 @@ ACCESS_ONLY_RESOURCE_TYPES = frozenset(
 )
 
 
+#: Resource types whose destroy deletes a definition the contract re-creates, and
+#: no table data: a Databricks job (its run history goes with it) and a workspace
+#: file of a dbt project uploaded from the build's repository. Removing a build
+#: from the contract removes them, ungated, with a line saying so (founder
+#: decision for the Databricks provider, 2026-10-29).
+RUN_DEFINITION_RESOURCE_TYPES = frozenset({"databricks_job", "databricks_workspace_file"})
+
+
 def _data_bearing_changes(
     changes: Mapping[str, int], removals: List[Tuple[str, str]]
 ) -> Tuple[Dict[str, int], List[str]]:
     """``(changes with only data-bearing removals, addresses of access-only removals)``.
 
-    Fails closed: when the plan's per-resource events do not account for every
-    removal in its summary (an older ``tofu``, a truncated stream), every removal
-    counts, as before.
+    Neither access-only removals nor run definitions
+    (:func:`_retired_definitions`) count. Fails closed: when the plan's
+    per-resource events do not account for every removal in its summary (an
+    older ``tofu``, a truncated stream), every removal counts, as before.
     """
     counted = {key: int(changes.get(key, 0)) for key in ("add", "change", "remove")}
     if len(removals) != counted["remove"]:
         return counted, []
     revoked = [addr for addr, kind in removals if kind in ACCESS_ONLY_RESOURCE_TYPES]
-    counted["remove"] -= len(revoked)
+    counted["remove"] -= len(revoked) + len(_retired_definitions(changes, removals))
     return counted, revoked
+
+
+def _retired_definitions(changes: Mapping[str, int], removals: List[Tuple[str, str]]) -> List[str]:
+    """Addresses of removed run definitions (:data:`RUN_DEFINITION_RESOURCE_TYPES`),
+    ``[]`` when the plan's events do not account for every removal (fail closed)."""
+    if len(removals) != int(changes.get("remove", 0)):
+        return []
+    return [addr for addr, kind in removals if kind in RUN_DEFINITION_RESOURCE_TYPES]
+
+
+def _report_plan_notices(plugin: Any, contract: Mapping[str, Any], logger: logging.Logger) -> None:
+    """Print what the plugin says the apply cannot do itself (``plan_notices``), such as
+    a Unity Catalog privilege on an object the product does not own. Advisory only."""
+    notices = getattr(plugin, "plan_notices", None)
+    if not callable(notices):
+        return
+    try:
+        lines = list(notices(contract))
+    except Exception as exc:  # noqa: BLE001 — advisory only, never fails an apply
+        logger.debug("plan notices unavailable: %s", type(exc).__name__)
+        return
+    for line in lines:
+        cprint(f"  note: {line}")
 
 
 def _reconcile_with_state(

@@ -185,6 +185,23 @@ def is_continuous_build(build: Mapping[str, Any]) -> bool:
     return isinstance(kind, str) and kind.strip().lower() == "continuous"
 
 
+def is_databricks_job_build(build: Mapping[str, Any]) -> bool:
+    """True when a dbt build runs in a Databricks workspace as a job: its engine is
+    ``dbt`` or ``dbt-<adapter>`` and ``execution.runtime.platform`` is ``databricks``.
+    ``fluid apply`` provisions the job through OpenTofu
+    (``iac/providers/databricks_jobs.py``); Databricks runs it on its trigger."""
+    engine = get_build_engine(build)
+    if not isinstance(engine, str):
+        return False
+    name = engine.strip().lower()
+    if name != "dbt" and not name.startswith("dbt-"):
+        return False
+    execution = build.get("execution")
+    runtime = execution.get("runtime") if isinstance(execution, Mapping) else None
+    platform = runtime.get("platform") if isinstance(runtime, Mapping) else None
+    return isinstance(platform, str) and platform.strip().lower() == "databricks"
+
+
 def is_unscheduled_build(build: Mapping[str, Any]) -> bool:
     """True when no scheduler starts the build's runs: its job runs outside
     forge-cli (:func:`is_externally_run_build`), or continuously

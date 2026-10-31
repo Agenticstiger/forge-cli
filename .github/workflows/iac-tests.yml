@@ -49,6 +49,8 @@ on:
       - "fluid_build/build_runners/dbt/**"
       # The Databricks emitter types its columns through the dbt engine's table.
       - "fluid_build/engines/dbt/_types.py"
+      # ... and writes a dbt job's cron as Quartz.
+      - "fluid_build/util/cron.py"
       - "fluid_build/providers/databricks/**"
       - "tests/iac/**"
       - ".github/workflows/iac-tests.yml"
@@ -204,13 +206,18 @@ jobs:
           # data-loss gate decides depends on what the provider plans for a live
           # table (a partition change is a replace, a dropped column an in-place
           # ALTER, a type change a plan error), so only a real plan proves it.
+          # So does a dbt build's job: a second plan of the job and its uploaded
+          # workspace files is only empty if the provider reads back what it sent.
           # `tofu init` verifies the provider against the committed lock.
           - name: "Databricks (fluid CLI + tofu vs a Unity Catalog stand-in, creds-free)"
-            tests: tests/iac/test_iac_databricks_fake_e2e.py
+            tests: >-
+              tests/iac/test_iac_databricks_fake_e2e.py
+              tests/iac/test_iac_databricks_jobs_fake_e2e.py
             pytest-args: "-p no:randomly"
             junit: databricks-fake.xml
             require: |
               Databricks fake tier=tests/iac/test_iac_databricks_fake_e2e.py
+              Databricks jobs fake tier=tests/iac/test_iac_databricks_jobs_fake_e2e.py
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
