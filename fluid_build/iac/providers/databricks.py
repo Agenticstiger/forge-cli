@@ -99,7 +99,13 @@ from ..principals import (
 from ..provider_match import canonical_cloud, is_cloud
 from ..versions import required_providers
 from .databricks_auth import tofu_env_overlay
-from .databricks_jobs import CompiledJobs, DbtJob, compile_dbt_jobs, dbt_written_exposes
+from .databricks_jobs import (
+    CompiledJobs,
+    DbtJob,
+    compile_dbt_jobs,
+    dbt_written_exposes,
+    run_as_allowlist,
+)
 
 #: The SQL warehouse every ``databricks_sql_table`` statement runs on.
 WAREHOUSE_ENV = "DATABRICKS_WAREHOUSE_ID"
@@ -843,7 +849,14 @@ def _compile(
         _emit_table(compiled, table, cid, warehouse, dbt_owned=table.expose_id in dbt_written)
         _emit_grants(compiled, table, cid, privileges.get(table.full_name, {}))
     _merge_jobs(
-        compiled, compile_dbt_jobs(contract, compiled.tables, warehouse, validating=validating)
+        compiled,
+        compile_dbt_jobs(
+            contract,
+            compiled.tables,
+            warehouse,
+            validating=validating,
+            run_as_allowed=run_as_allowlist(env),
+        ),
     )
 
     # A grant applies to every Databricks expose, so its refusal (an unmapped

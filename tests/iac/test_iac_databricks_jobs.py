@@ -92,10 +92,13 @@ def _compile(
     tmp_path: Optional[Path] = None,
     *,
     validating: bool = False,
+    env: Optional[Dict[str, str]] = None,
 ) -> dbx._Compiled:
     source = tmp_path / "contract.fluid.yaml" if tmp_path is not None else None
     with contract_source(source):
-        return dbx._compile(contract, {dbx.WAREHOUSE_ENV: WAREHOUSE}, validating=validating)
+        return dbx._compile(
+            contract, {dbx.WAREHOUSE_ENV: WAREHOUSE, **(env or {})}, validating=validating
+        )
 
 
 def _kinds(compiled: dbx._Compiled) -> List[str]:
@@ -712,11 +715,28 @@ class TestRetriesTimeoutNotificationsRunAs:
     def test_a_notification_that_would_notify_no_one_is_refused(self, entry):
         _refused(_contract(builds__0__execution__notifications=[entry]), "notification")
 
-    def test_a_uuid_service_account_runs_as_a_service_principal_lower_cased(self):
+    def test_a_listed_service_principal_is_the_jobs_run_as_lower_cased(self):
         account = "ABCDEF01-2345-6789-ABCD-EF0123456789"
         runtime = {"platform": "databricks", "serviceAccount": account}
-        job = _job(_compile(_contract(builds__0__execution__runtime=runtime)))
+        listed = {"FLUID_DATABRICKS_RUN_AS_ALLOWLIST": f" other-id , {account.lower()} "}
+        job = _job(_compile(_contract(builds__0__execution__runtime=runtime), env=listed))
         assert job["run_as"] == {"service_principal_name": account.lower()}
+
+    @pytest.mark.parametrize(
+        "listed", ["", "11111111-2222-3333-4444-555555555555"], ids=["unset", "another"]
+    )
+    def test_a_service_principal_the_operator_does_not_list_is_refused(self, listed):
+        # The applier may hold Service Principal User on several: the contract
+        # alone never picks the one its dbt code runs as.
+        account = "abcdef01-2345-6789-abcd-ef0123456789"
+        runtime = {"platform": "databricks", "serviceAccount": account}
+        compiled = _compile(
+            _contract(builds__0__execution__runtime=runtime),
+            env={"FLUID_DATABRICKS_RUN_AS_ALLOWLIST": listed},
+        )
+        assert _kinds(compiled) == ["databricks-job-run-as-unlisted"]
+        assert "FLUID_DATABRICKS_RUN_AS_ALLOWLIST" in " ".join(compiled.refusals[0].remediation)
+        assert "databricks_job" not in compiled.resources
 
     @pytest.mark.parametrize("account", ["bot@corp.com", "robot", "sa-123", "not-a-uuid-0000"])
     def test_any_other_service_account_is_refused(self, account):

@@ -42,8 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   job runs `dbt deps`, then `dbt build` with the selectors and vars a local run uses.
   `execution.trigger` becomes a Quartz `schedule` (days of the week by name, so none is off by
   one), Databricks' `continuous` trigger, or no trigger for `manual`. `retries`, email
-  `notifications`, `runtime.timeout` and `runtime.serviceAccount` (as the job's run-as) map to
-  the job. What the job would take and not honour is refused: an event or dataset trigger, a
+  `notifications`, `runtime.timeout` and `runtime.serviceAccount` map to the job. The job runs
+  as that service principal only when the operator lists its application id in
+  `FLUID_DATABRICKS_RUN_AS_ALLOWLIST`; a contract alone never picks the identity a job runs as. What the job would take and not honour is refused: an event or dataset trigger, a
   backoff that is not fixed, a Slack notification, a runtime image or environment, and a `vars`
   value holding an `{{ env.* }}` template, which the job settings would store in clear. Removing
   a job or an uploaded file needs no `--allow-data-loss`, since no table data is lost (the job's

@@ -57,7 +57,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from ...util.binding_paths import ENV_PLACEHOLDER_RE
@@ -71,6 +71,10 @@ from ..source import current_contract_source
 #: dbt adapter, installed per run (Phase 0b ran exactly this against the provider).
 ENVIRONMENT_VERSION = "2"
 DBT_DATABRICKS = "dbt-databricks>=1.8.0,<2.0.0"
+
+#: The service principals a contract may name as a job's run-as, by application id
+#: (comma-separated). Unset, a contract can name none: a job runs as the applier.
+RUN_AS_ALLOWLIST_ENV = "FLUID_DATABRICKS_RUN_AS_ALLOWLIST"
 
 #: Workspace upload limits. Every file is base64 inside ``main.tf.json``, and the
 #: provider allows "a few megabytes" per workspace file.
@@ -328,7 +332,10 @@ def _notifications(
 
 
 def _runtime(
-    runtime: Mapping[str, Any], where: str, refusals: List[UnsupportedBindingError]
+    runtime: Mapping[str, Any],
+    where: str,
+    refusals: List[UnsupportedBindingError],
+    run_as_allowed: FrozenSet[str],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """``(job settings, task settings)`` from ``execution.runtime``."""
     job: Dict[str, Any] = {}
@@ -362,24 +369,48 @@ def _runtime(
         if timeout is not None:
             task["timeout_seconds"] = timeout
     account = str(runtime.get("serviceAccount") or "").strip()
-    if account:
-        if _APPLICATION_ID_RE.match(account):
-            job["run_as"] = {"service_principal_name": account.lower()}
-        else:
-            # A user is never taken from a contract: the identity that applies it is
-            # often a workspace admin, who may set any user, so a contract author could
-            # run their dbt code as anyone.
-            refusals.append(
-                _refusal(
-                    "run-as",
-                    f"{where} execution.runtime.serviceAccount is {account!r}, not a service "
-                    "principal's application id. A job runs as a service principal from a "
-                    "contract, never as a user.",
-                    "Set it to the service principal's application id (a UUID), or remove it "
-                    "to run the job as the identity that applies the contract.",
-                )
+    if not account:
+        return job, task
+    if not _APPLICATION_ID_RE.match(account):
+        # A user is never taken from a contract: the identity that applies it is
+        # often a workspace admin, who may set any user, so a contract author could
+        # run their dbt code as anyone.
+        refusals.append(
+            _refusal(
+                "run-as",
+                f"{where} execution.runtime.serviceAccount is {account!r}, not a service "
+                "principal's application id. A job runs as a service principal from a "
+                "contract, never as a user.",
+                "Set it to the service principal's application id (a UUID), or remove it "
+                "to run the job as the identity that applies the contract.",
             )
+        )
+    elif account.lower() in run_as_allowed:
+        job["run_as"] = {"service_principal_name": account.lower()}
+    else:
+        # Nor a service principal the operator has not listed: the identity that
+        # applies may hold Service Principal User on several, so a contract alone
+        # could run its dbt code as a more privileged one.
+        refusals.append(
+            _refusal(
+                "run-as-unlisted",
+                f"{where} execution.runtime.serviceAccount names service principal "
+                f"{account.lower()}, which {RUN_AS_ALLOWLIST_ENV} does not list: a job runs as "
+                "a service principal only when the operator says so, never on the contract's "
+                "word alone.",
+                f"Where fluid apply runs, add it to {RUN_AS_ALLOWLIST_ENV} (application ids, "
+                "comma-separated), or remove serviceAccount to run the job as the identity "
+                "that applies the contract.",
+            )
+        )
     return job, task
+
+
+def run_as_allowlist(env: Mapping[str, str]) -> FrozenSet[str]:
+    """The service principals (application ids, lower-cased) ``RUN_AS_ALLOWLIST_ENV``
+    lets a contract name as a job's run-as."""
+    listed = str(env.get(RUN_AS_ALLOWLIST_ENV) or "").split(",")
+    return frozenset(item.strip().lower() for item in listed if item.strip())
 
 
 def _git_source(
@@ -655,6 +686,7 @@ class _Build:
     where: str
     product: str
     warehouse: str
+    run_as_allowed: FrozenSet[str] = frozenset()
 
     @property
     def key(self) -> str:
@@ -697,6 +729,7 @@ def compile_dbt_jobs(
     warehouse: str,
     *,
     validating: bool = False,
+    run_as_allowed: FrozenSet[str] = frozenset(),
 ) -> CompiledJobs:
     """Every Databricks dbt job of ``contract``, with its workspace files and refusals.
 
@@ -712,7 +745,9 @@ def compile_dbt_jobs(
         if not isinstance(build, Mapping) or not is_databricks_job_build(build):
             continue
         build_id = str(build.get("id") or index)
-        item = _Build(build, build_id, f"builds[{index}] ({build_id})", product, warehouse)
+        item = _Build(
+            build, build_id, f"builds[{index}] ({build_id})", product, warehouse, run_as_allowed
+        )
         before = len(compiled.refusals)
         settings = _job_settings(item, compiled)
         table = _target_table(item, builds, tables, compiled.refusals)
@@ -737,7 +772,7 @@ def _job_settings(item: _Build, compiled: CompiledJobs) -> _Settings:
     execution = build.get("execution") if isinstance(build.get("execution"), Mapping) else {}
     runtime = execution.get("runtime") if isinstance(execution.get("runtime"), Mapping) else {}
     trigger, schedule = _trigger(execution, where, refusals)
-    run_job, run_task = _runtime(runtime, where, refusals)
+    run_job, run_task = _runtime(runtime, where, refusals, item.run_as_allowed)
     props = build.get("properties") if isinstance(build.get("properties"), Mapping) else {}
     if props.get("target"):
         compiled.warnings.append(

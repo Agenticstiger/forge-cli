@@ -480,6 +480,8 @@ def test_a_databricks_dbt_job_passes_tofu_validate(source, tmp_path, monkeypatch
     from fluid_build.iac.source import contract_source
 
     monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", "wh-validate-only")
+    # The GIT job runs as a service principal, which the operator must list.
+    monkeypatch.setenv("FLUID_DATABRICKS_RUN_AS_ALLOWLIST", "6f5c4e3d-2b1a-4c9d-8e7f-0a1b2c3d4e5f")
     project = tmp_path / "dbt"
     (project / "models").mkdir(parents=True)
     (project / "dbt_project.yml").write_text("name: orders\nversion: '1.0'\n")
