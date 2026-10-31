@@ -17,6 +17,7 @@ which generates dbt project files at ``fluid generate speed-transformation``
 time; this package executes dbt builds at ``fluid apply --build`` time."""
 
 from .profiles import (
+    DbtProfileError,
     _build_generated_dbt_profile,
     _create_temp_dbt_profiles_dir,
     _load_dbt_project_config,
@@ -29,6 +30,7 @@ from .runner import (
 )
 
 __all__ = [
+    "DbtProfileError",
     "_build_generated_dbt_profile",
     "_create_temp_dbt_profiles_dir",
     "_load_dbt_project_config",

@@ -99,6 +99,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or a contract value it quotes back (a `$ref` in `contract_load_failed`) could retitle the
   window, rewrite lines or, where the terminal allows it, write the clipboard. Control characters
   in those messages are now printed as text (`\x1b`), as the CLI's own error line already did.
+- **A contract could send the warehouse credential of a dbt build to a host it named.** The
+  profile `fluid apply --mode amend-and-build` generates for a dbt build on Databricks, Redshift
+  or Postgres took `builds[].execution.runtime.resources.host` before `DATABRICKS_HOST` /
+  `REDSHIFT_HOST` / `PGHOST`, and paired it with `DATABRICKS_TOKEN` / `REDSHIFT_PASSWORD` (or the
+  IAM credentials) / `PGPASSWORD` from the environment. The host now comes from the environment
+  only, as the Databricks OpenTofu path already does (Redshift Serverless over IAM with no
+  `REDSHIFT_HOST` still derives the endpoint from the workgroup, account and region). A contract
+  that names one now fails that build before dbt starts, with `DbtProfileError` naming the field;
+  remove `runtime.resources.host` and set the variable instead.
+- **A Databricks catalog or schema from the contract could carry the token.** dbt evaluates
+  `profiles.yml` as Jinja, and the runner resolved `{{ env.* }}` placeholders the contract loader
+  leaves alone because their name looks like a credential, so `runtime.resources.catalog:
+  "{{ env.DATABRICKS_TOKEN }}"` (or an `env_var()` call, or Jinja nested in its default) sent the
+  token to the workspace as a name dbt prints back. The name dbt ends with must now be a plain
+  identifier of at most 255 characters (Unity Catalog's limit): written as one, a
+  `{{ env.NAME }}` placeholder resolving to one, or exactly `{{ env_var('NAME') }}` with an
+  optional identifier default, where NAME ends in `_CATALOG` or `_SCHEMA`. No variable it reads
+  may look like a credential (the redactor's rule or a `_KEY` / `_PAT` / `_PASS` suffix), and it
+  may not hold a credential variable's value, which also catches a placeholder a plan resolved
+  before the runner saw its name. Anything else now fails that build before dbt starts, with
+  `DbtProfileError` naming the field and any variable: use a plain name (no `-`, `.` or leading
+  digit), read the name from a `_CATALOG` / `_SCHEMA` variable, or leave the field out and set
+  `DATABRICKS_CATALOG` / `DATABRICKS_SCHEMA`.
 
 ### Fixed
 
