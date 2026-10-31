@@ -114,9 +114,10 @@ def synthesize_orchestration_from_builds(
     The returned dict is suitable for injection into the contract before
     calling a scheduler's ``validate()`` and ``generate()`` methods.
     """
-    # A Flink job, or any build whose trigger is continuous, runs on its own
-    # platform: there is nothing to schedule for it, and a nightly task that
-    # "runs" it would at best log its SQL and at worst start a second copy.
+    # A Flink job, a dbt build Databricks runs as a job, or any build whose
+    # trigger is continuous, runs on its own platform: there is nothing to
+    # schedule for it, and a nightly task that "runs" it would at best log its
+    # SQL and at worst start a second copy.
     builds: List[Dict[str, Any]] = [
         b
         for b in contract.get("builds", []) or []

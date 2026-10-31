@@ -48,7 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value holding an `{{ env.* }}` template, which the job settings would store in clear. Removing
   a job or an uploaded file needs no `--allow-data-loss`, since no table data is lost (the job's
   run history goes with it), and the apply says so. `fluid apply --mode amend-and-build` leaves
-  such a build to its job and says how to start a run now.
+  such a build to its job and says how to start a run now, and forge-cli's own schedules
+  (`fluid generate schedule`, the `fluid apply` Airflow DAG) give it no task: Databricks starts
+  its runs.
 - **A table a dbt build writes is left to dbt after the apply creates it.** dbt's `table`
   materialization rebuilds it with CREATE OR REPLACE. So the module ignores its columns,
   partitions, clustering, properties and comment, and sets no column mapping. Each apply reports

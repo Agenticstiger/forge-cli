@@ -204,14 +204,20 @@ def is_databricks_job_build(build: Mapping[str, Any]) -> bool:
 
 def is_unscheduled_build(build: Mapping[str, Any]) -> bool:
     """True when no scheduler starts the build's runs: its job runs outside
-    forge-cli (:func:`is_externally_run_build`), or continuously
-    (:func:`is_continuous_build`)."""
-    return is_externally_run_build(build) or is_continuous_build(build)
+    forge-cli (:func:`is_externally_run_build`), continuously
+    (:func:`is_continuous_build`), or as a Databricks job on the job's own
+    trigger (:func:`is_databricks_job_build`)."""
+    return (
+        is_externally_run_build(build)
+        or is_continuous_build(build)
+        or is_databricks_job_build(build)
+    )
 
 
 def has_only_unscheduled_builds(contract: Mapping[str, Any]) -> bool:
     """True when the contract has builds and no scheduler starts any of them:
-    each runs outside forge-cli, or continuously (:func:`is_unscheduled_build`).
+    each runs outside forge-cli, continuously, or as a Databricks job
+    (:func:`is_unscheduled_build`).
     A contract with no builds is False: no build of it was left out."""
     builds = [b for b in get_builds(contract) if isinstance(b, Mapping)]
     return bool(builds) and all(is_unscheduled_build(b) for b in builds)

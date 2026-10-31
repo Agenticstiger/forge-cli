@@ -295,3 +295,55 @@ class TestRunBuilds:
         assert ran == ["local"]  # the Databricks job build was not handed over
         assert JOB_LINE in out and "Run outside forge-cli: 1" in out
         assert "Executed: 1" in out
+
+
+class TestNoSchedulerStartsAJobBuild:
+    """Databricks starts a job build on its own trigger: forge-cli's schedulers
+    give it no task, as they give a Flink job none."""
+
+    JOB = {
+        "id": "dbt_daily",
+        "engine": "dbt",
+        "execution": {
+            "trigger": {"type": "schedule", "cron": "0 2 * * *"},
+            "runtime": {"platform": "databricks"},
+        },
+    }
+    LOCAL = {
+        "id": "local_daily",
+        "engine": "dbt",
+        "execution": {"trigger": {"type": "schedule", "cron": "0 3 * * *"}},
+    }
+
+    def test_a_job_build_is_unscheduled_and_a_local_one_is_not(self):
+        from fluid_build.util.contract import has_only_unscheduled_builds, is_unscheduled_build
+
+        assert is_unscheduled_build(self.JOB) and not is_unscheduled_build(self.LOCAL)
+        assert has_only_unscheduled_builds({"builds": [self.JOB]})
+
+    def test_the_fluid_apply_dag_does_not_schedule_it(self):
+        # Each tick would run a full `fluid apply` that runs no dbt.
+        from fluid_build.schedulers.airflow.fluid_apply import (
+            _trigger_schedule,
+            has_scheduled_builds,
+        )
+
+        assert _trigger_schedule(self.JOB) is None
+        assert not has_scheduled_builds({"builds": [self.JOB]})
+        assert has_scheduled_builds({"builds": [self.JOB, self.LOCAL]})
+
+    def test_schedule_synthesis_gives_it_no_task(self):
+        from fluid_build.schedulers.synthesis import synthesize_orchestration_from_builds
+
+        assert (
+            synthesize_orchestration_from_builds({"id": "p", "builds": [self.JOB]}, "airflow") == {}
+        )
+        tasks = synthesize_orchestration_from_builds(
+            {"id": "p", "builds": [self.JOB, self.LOCAL]}, "airflow"
+        )["tasks"]
+        assert [t["taskId"] for t in tasks] == ["local_daily"]
+
+    def test_a_composer_dag_takes_its_cron_from_another_build(self):
+        from fluid_build.cli.scaffold_composer import _extract_cron
+
+        assert _extract_cron({"builds": [self.JOB, self.LOCAL]}) == "0 3 * * *"
