@@ -1269,6 +1269,8 @@ def _print_feature_checks(checks: List[Dict[str, any]], verbose: bool = False):
     """Print feature checks with appropriate formatting."""
 
     if RICH_AVAILABLE:
+        from rich.markup import escape
+
         console = Console()
 
         table = Table(title="🔍 FLUID Feature Availability", show_header=True)
@@ -1284,7 +1286,9 @@ def _print_feature_checks(checks: List[Dict[str, any]], verbose: bool = False):
 
             row = [check["check"], f"[{status_color}]{check['status']}[/{status_color}]"]
             if verbose:
-                row.append(check["details"])
+                # Literal text: a fix-it such as `pip install 'data-product-forge[databricks]'`
+                # would otherwise lose its extra to Rich's markup.
+                row.append(escape(check["details"]))
 
             table.add_row(*row)
 

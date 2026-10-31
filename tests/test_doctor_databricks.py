@@ -85,3 +85,24 @@ def test_sdk_missing_is_informational(monkeypatch):
     row = _check_databricks_readiness()
     assert row["ok"] is True and "Configured" in row["status"]
     assert "pip install 'data-product-forge[databricks]'" in row["details"]
+
+
+def test_the_install_command_keeps_its_extra(monkeypatch, capsys):
+    # Rich read `[databricks]` as markup and printed `pip install 'data-product-forge'`,
+    # which installs no databricks-sdk.
+    from fluid_build.cli.doctor import _print_feature_checks
+
+    monkeypatch.setenv("COLUMNS", "200")
+    details = "databricks-sdk not installed: pip install 'data-product-forge[databricks]'"
+    _print_feature_checks(
+        [
+            {
+                "check": "Databricks Provider",
+                "status": "✅ Configured",
+                "ok": True,
+                "details": details,
+            }
+        ],
+        verbose=True,
+    )
+    assert "pip install 'data-product-forge[databricks]'" in capsys.readouterr().out
