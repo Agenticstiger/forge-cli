@@ -831,6 +831,75 @@ def _check_snowflake_readiness() -> Dict[str, any]:
     }
 
 
+def _check_databricks_readiness() -> Dict[str, any]:
+    """Report Databricks workspace, credential, warehouse and SDK readiness.
+
+    Calls ``resolve_workspace_auth`` -- the one policy ``fluid apply`` runs --
+    rather than re-implementing credential logic (``UnityCredentials``), so the
+    doctor reports exactly what apply will do. Never opens a connection and
+    never prints a token or secret. Non-critical (``ok`` stays True): a
+    workspace that does not use Databricks must not fail doctor.
+    """
+    env = os.environ
+    # The workspace variables only: DATABRICKS_API_BASE / _API_KEY configure an
+    # LLM served by Databricks, not a workspace forge-cli applies to.
+    workspace_vars = (
+        "DATABRICKS_HOST",
+        "DATABRICKS_TOKEN",
+        "DATABRICKS_CLIENT_ID",
+        "DATABRICKS_CLIENT_SECRET",
+        "DATABRICKS_CONFIG_PROFILE",
+        "DATABRICKS_WAREHOUSE_ID",
+    )
+    if not any(env.get(name) for name in workspace_vars):
+        return {
+            "check": "Databricks Provider",
+            "category": "providers",
+            "status": "⚪ Not configured",
+            "ok": True,
+            "details": "No Databricks workspace variable set; Databricks is not in use.",
+        }
+
+    from fluid_build.iac.base import UnsupportedBindingError
+    from fluid_build.iac.providers.databricks_auth import resolve_workspace_auth
+
+    problems: List[str] = []
+    try:
+        auth = resolve_workspace_auth(env)
+        who = f"workspace={auth.host} auth={auth.auth_type}"
+        if auth.profile:
+            who += f" profile={auth.profile}"
+    except UnsupportedBindingError as exc:
+        fix = exc.remediation[0] if exc.remediation else ""
+        who = f"credential refused ({exc.kind}): {exc}" + (f" Fix: {fix}" if fix else "")
+        problems.append("credential")
+
+    if env.get("DATABRICKS_WAREHOUSE_ID"):
+        warehouse = "DATABRICKS_WAREHOUSE_ID set"
+    else:
+        warehouse = "DATABRICKS_WAREHOUSE_ID not set (the SQL warehouse table statements run on)"
+        problems.append("warehouse")
+
+    try:
+        import importlib.metadata as _md
+
+        _md.version("databricks-sdk")
+        sdk = "databricks-sdk installed"
+    except Exception:  # noqa: BLE001 — absence is the signal
+        sdk = (
+            "databricks-sdk not installed (needed by `fluid verify` only): "
+            "pip install 'data-product-forge[databricks]'"
+        )
+
+    return {
+        "check": "Databricks Provider",
+        "category": "providers",
+        "status": "⚠️  Needs attention" if problems else "✅ Configured",
+        "ok": True,
+        "details": f"{who}; {warehouse}; {sdk}",
+    }
+
+
 def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
     """
     Check FLUID feature availability (v0.7.x line).
@@ -1005,6 +1074,7 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
     # available!" that said nothing about the provider actually in use —
     # while `fluid test` / `fluid plan` hard-fail without the connector.
     checks.append(_check_snowflake_readiness())
+    checks.append(_check_databricks_readiness())
 
     # dbt engine detection — Python dbt-core v1 vs Fusion (dbt Core v2,
     # Rust). Non-critical (ok=True either way): a missing dbt only matters
