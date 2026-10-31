@@ -43,22 +43,24 @@ def unique_ident(value: str) -> str:
     folded = safe_ident(value)
     if folded == value:
         return folded
-    return f"{folded}_{_digest(value)}"
+    return f"{folded}_{_digest(value, 8)}"
 
 
 def digest_ident(value: str) -> str:
-    """:func:`safe_ident` plus a digest of ``value``, always: a name in a namespace
-    other contracts share, such as a workspace folder.
+    """:func:`safe_ident` plus a 128-bit digest of ``value``, always: a name in a
+    namespace other contracts share, such as a workspace folder.
 
     :func:`unique_ident` keeps a value that is already folded as it is, so a
     contract could name itself ``data_eng_<digest>`` and meet ``data-eng``'s
-    folded form; here every distinct value keeps a distinct name.
+    folded form. Its 8 hex digits would not hold here either: ids that fold
+    alike are endless (``_.-`` runs), so an author could search for one whose
+    32-bit digest matches another product's. 128 bits leaves no such search.
     """
-    return f"{safe_ident(value)}_{_digest(value)}"
+    return f"{safe_ident(value)}_{_digest(value, 32)}"
 
 
-def _digest(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+def _digest(value: str, length: int) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 
 
 class TofuExpr(str):

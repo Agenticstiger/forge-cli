@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -900,3 +901,9 @@ class TestUploadRoot:
 
     def test_the_same_ids_get_the_same_folder(self):
         assert self._root("sales.orders") == self._root("sales.orders")
+
+    def test_each_folder_name_carries_a_128_bit_digest(self):
+        # An 8-hex digest of a crafted id that folds alike is a short search away.
+        product, build = self._root("sales.orders").split("/")[2:4]
+        for segment in (product, build):
+            assert re.fullmatch(r"[A-Za-z0-9_]+_[0-9a-f]{32}", segment), segment
