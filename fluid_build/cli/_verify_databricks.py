@@ -46,12 +46,9 @@ Every failure is a result, never a traceback, and no message carries a token.
 
 from __future__ import annotations
 
-import logging
 import os
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import quote
-
-LOG = logging.getLogger("fluid.cli.verify.databricks")
 
 #: The optional-dependency extra that brings databricks-sdk.
 DATABRICKS_EXTRA_INSTALL = "pip install 'data-product-forge[databricks]'"
