@@ -30,14 +30,75 @@ import json
 import logging
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import yaml
+
+from fluid_build._errors import FluidUserError, doc_url
 
 from ..base import _resolve_env_placeholders
 
 LOG = logging.getLogger("fluid.build_runners.dbt.profiles")
+
+#: Platforms whose profile sends a credential from the environment to its
+#: ``host``: the name in messages, the host variable, what is sent there, and
+#: where the host comes from instead.
+_ENV_HOST_PLATFORMS = {
+    "databricks": ("Databricks", "DATABRICKS_HOST", "DATABRICKS_TOKEN", "DATABRICKS_HOST only"),
+    "redshift": (
+        "Redshift",
+        "REDSHIFT_HOST",
+        "REDSHIFT_PASSWORD or the IAM credentials",
+        "REDSHIFT_HOST, or for Redshift Serverless without it, the workgroup's own endpoint",
+    ),
+    "postgres": ("Postgres", "PGHOST", "PGPASSWORD", "PGHOST only"),
+}
+
+
+@dataclass
+class DbtProfileError(FluidUserError):
+    """A contract value the generated dbt profile will not carry.
+
+    Raised before the profile is written. The message names the field and any
+    variable, never a value, which may be the credential itself.
+    """
+
+    code: str = "DbtProfileError"
+
+
+def _refuse_contract_host(build: Dict[str, Any], raw_resources: Any, platform: str) -> None:
+    """Refuse ``runtime.resources.host`` on a platform whose credential comes
+    from the environment.
+
+    The profile sends that credential to its host, so a host the contract names
+    would choose where the credential goes (the #758 class). The host comes
+    from the environment only, as on the IaC path
+    (``iac/providers/databricks.py::_refuse_build_hosts``). Checked as written:
+    a ``{{ env.* }}`` placeholder in the host is a contract-named host too.
+    """
+    host = raw_resources.get("host") if isinstance(raw_resources, Mapping) else None
+    if host is None or not str(host).strip():
+        return
+    label, host_env, credential, source = _ENV_HOST_PLATFORMS[platform]
+    raise DbtProfileError(
+        what=(
+            f"build '{build.get('id', 'unknown')}' names its own {label} host "
+            "(execution.runtime.resources.host)"
+        ),
+        why=(
+            f"The dbt profile sends {credential} from the environment to its host, so a "
+            f"host in the contract would choose where that credential goes. The host "
+            f"comes from {source}."
+        ),
+        fix=(
+            f"Remove execution.runtime.resources.host and set {host_env} in the "
+            "environment that runs the build."
+        ),
+        doc=doc_url(),
+        extras={"field": "execution.runtime.resources.host", "variable": host_env},
+    )
 
 
 def _load_dbt_project_config(project_dir: Path) -> Dict[str, Any]:
@@ -101,10 +162,16 @@ def _list_profile_targets(
 def _build_generated_dbt_profile(
     build: Dict[str, Any], project_config: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
+    """The profile for ``build``'s platform, credentials from the environment.
+
+    Raises :class:`DbtProfileError` for a contract value that would choose where
+    an environment credential goes.
+    """
     execution = build.get("execution") or {}
     runtime = execution.get("runtime") or {}
     platform = str(runtime.get("platform", "local")).strip().lower()
-    resources = _resolve_env_placeholders(runtime.get("resources") or {})
+    raw_resources = runtime.get("resources") or {}
+    resources = _resolve_env_placeholders(raw_resources)
     props = _resolve_env_placeholders(build.get("properties") or {})
     profile_name = _resolve_dbt_profile_name(props, project_config)
     target_name = _resolve_dbt_target_name(props)
@@ -265,6 +332,7 @@ def _build_generated_dbt_profile(
         return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
 
     if platform in {"aws", "redshift"}:
+        _refuse_contract_host(build, raw_resources, "redshift")
         cluster_id = resources.get("cluster_id") or os.getenv("REDSHIFT_CLUSTER_ID")
         iam_profile = os.getenv("REDSHIFT_IAM_PROFILE") or os.getenv("AWS_PROFILE")
         # Redshift Serverless: contract carries a workgroup (and optionally
@@ -284,7 +352,7 @@ def _build_generated_dbt_profile(
 
         output = {
             "type": "redshift",
-            "host": resources.get("host") or os.getenv("REDSHIFT_HOST", ""),
+            "host": os.getenv("REDSHIFT_HOST", ""),
             "user": resources.get("user") or os.getenv("REDSHIFT_USER", ""),
             "port": int(resources.get("port") or os.getenv("REDSHIFT_PORT") or 5439),
             "dbname": resources.get("database") or os.getenv("REDSHIFT_DATABASE", ""),
@@ -352,9 +420,10 @@ def _build_generated_dbt_profile(
         return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
 
     if platform in {"postgres", "postgresql"}:
+        _refuse_contract_host(build, raw_resources, "postgres")
         output = {
             "type": "postgres",
-            "host": resources.get("host") or os.getenv("PGHOST", ""),
+            "host": os.getenv("PGHOST", ""),
             "user": resources.get("user") or os.getenv("PGUSER", ""),
             "password": os.getenv("PGPASSWORD", ""),
             "port": int(resources.get("port") or os.getenv("PGPORT") or 5432),
@@ -368,9 +437,10 @@ def _build_generated_dbt_profile(
         return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
 
     if platform == "databricks":
+        _refuse_contract_host(build, raw_resources, "databricks")
         output = {
             "type": "databricks",
-            "host": resources.get("host") or os.getenv("DATABRICKS_HOST", ""),
+            "host": os.getenv("DATABRICKS_HOST", ""),
             "http_path": resources.get("http_path") or os.getenv("DATABRICKS_HTTP_PATH", ""),
             "token": os.getenv("DATABRICKS_TOKEN", ""),
             "catalog": resources.get("catalog") or os.getenv("DATABRICKS_CATALOG", ""),

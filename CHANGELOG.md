@@ -99,6 +99,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or a contract value it quotes back (a `$ref` in `contract_load_failed`) could retitle the
   window, rewrite lines or, where the terminal allows it, write the clipboard. Control characters
   in those messages are now printed as text (`\x1b`), as the CLI's own error line already did.
+- **A contract could send the warehouse credential of a dbt build to a host it named.** The
+  profile `fluid apply --mode amend-and-build` generates for a dbt build on Databricks, Redshift
+  or Postgres took `builds[].execution.runtime.resources.host` before `DATABRICKS_HOST` /
+  `REDSHIFT_HOST` / `PGHOST`, and paired it with `DATABRICKS_TOKEN` / `REDSHIFT_PASSWORD` (or the
+  IAM credentials) / `PGPASSWORD` from the environment. The host now comes from the environment
+  only, as the Databricks OpenTofu path already does (a Redshift Serverless workgroup without
+  `REDSHIFT_HOST` still gets its own endpoint), and a contract that names one is refused before
+  the profile is written (`DbtProfileError`); remove `runtime.resources.host` and set the
+  variable instead.
 
 ### Fixed
 

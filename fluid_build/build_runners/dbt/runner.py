@@ -48,8 +48,14 @@ from fluid_build._console import error as console_error
 from fluid_build.util.contract import is_continuous_build
 
 from .._path_safety import confine_to_workspace
-from ..base import SENSITIVE_ENV_KEY_RE, _resolve_env_placeholders, refuse_continuous_trigger
+from ..base import (
+    SENSITIVE_ENV_KEY_RE,
+    _print_typed_error,
+    _resolve_env_placeholders,
+    refuse_continuous_trigger,
+)
 from .profiles import (
+    DbtProfileError,
     _list_profile_targets,
     _load_dbt_project_config,
     _resolve_dbt_profile_name,
@@ -946,7 +952,16 @@ def execute_dbt_build(
         return refuse_continuous_trigger("dbt builds as batch runs, which end")
 
     project_config = _load_dbt_project_config(project_dir)
-    profiles_dir, temp_profiles_dir = resolve_dbt_profiles_dir(build, project_dir, project_config)
+    try:
+        profiles_dir, temp_profiles_dir = resolve_dbt_profiles_dir(
+            build, project_dir, project_config
+        )
+    except DbtProfileError as exc:
+        # Refused before the profile is written, and before dbt starts.
+        _print_typed_error(exc)
+        LOG.error("dbt_profile_refused build_id=%s code=%s", build_id, exc.code)
+        cprint(f"{'=' * 80}")
+        return 1
 
     try:
         command = build_dbt_command(
