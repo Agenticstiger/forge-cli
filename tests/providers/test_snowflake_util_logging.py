@@ -184,3 +184,23 @@ class TestSnowflakeRedactionSymmetryGaps:
         line = f"private_key={value}"
         assert value not in redact_string(line)
         assert value not in redact_secret_text(line)
+
+
+class TestDatabricksRedaction:
+    def test_pat_masked_with_and_without_suffix(self) -> None:
+        # Runtime-built so no literal token sits in the source (push protection).
+        for suffix in ("", "-2"):
+            pat = "dapi" + "0123456789abcdef" * 2 + suffix
+            assert pat not in redact_string(f"Authorization: Bearer {pat}")
+            assert pat not in redact_string(f"tok {pat} end")
+
+    def test_pat_lookalikes_untouched(self) -> None:
+        for line in ("dapi0123", "dapi" + "0123456789abcdef"):
+            assert redact_string(line) == line
+
+    def test_key_names_masked_in_text_and_dict(self) -> None:
+        for name in ("DATABRICKS_TOKEN", "DATABRICKS_CLIENT_SECRET", "DATABRICKS_PASSWORD"):
+            assert redact_string(f"{name}=abc123") == f"{name}=[REDACTED]"
+            assert "abc123" not in redact_string('{"%s": "abc123"}' % name)
+            assert redact_dict({name: "abc123"})[name] == "[REDACTED]"
+        assert redact_dict({"client_secret": "abc123"})["client_secret"] == "[REDACTED]"
