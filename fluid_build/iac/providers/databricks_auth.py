@@ -121,6 +121,30 @@ def _host(env: Mapping[str, str]) -> str:
     return host
 
 
+#: ``[DEFAULT]`` is a profile like any other, and no profile inherits its keys:
+#: so databricks-sdk-py reads the file (``config.py``, from the raw sections) and
+#: the Go SDK the provider runs. configparser alone would hide ``DEFAULT`` from
+#: ``has_section`` and merge its keys into every other profile.
+_NO_DEFAULT_SECTION = "\0"
+#: The Databricks CLI's settings section (``default_profile``), never a profile.
+_SETTINGS_SECTION = "__settings__"
+
+
+def _config_file(env: Mapping[str, str]) -> Path:
+    return Path(str(env.get(CONFIG_FILE_ENV) or "~/.databrickscfg")).expanduser()
+
+
+def _profile_keys(path: Path, profile: str) -> Optional[Dict[str, str]]:
+    """The keys ``profile`` itself holds in the config file at ``path``, or
+    ``None`` when the file has no such profile. Raises what parsing it raises."""
+    parser = configparser.RawConfigParser(default_section=_NO_DEFAULT_SECTION)
+    if not parser.read(path, encoding="utf-8") or profile == _SETTINGS_SECTION:
+        return None
+    if not parser.has_section(profile):
+        return None
+    return dict(parser.items(profile))
+
+
 def _profile_auth(env: Mapping[str, str], host: str, profile: str) -> WorkspaceAuth:
     in_env = sorted(name for name in _METHOD_VARS if env.get(name))
     if in_env:
@@ -131,24 +155,22 @@ def _profile_auth(env: Mapping[str, str], host: str, profile: str) -> WorkspaceA
             f"Unset {', '.join(in_env)} to use the profile, or unset {PROFILE_ENV} to use the "
             "environment's credential.",
         )
-    path = Path(str(env.get(CONFIG_FILE_ENV) or "~/.databrickscfg")).expanduser()
-    parser = configparser.RawConfigParser()
+    path = _config_file(env)
     try:
-        read = parser.read(path, encoding="utf-8")
+        section = _profile_keys(path, profile)
     except (configparser.Error, UnicodeDecodeError) as exc:
         raise _refusal(
             "profile-unreadable",
             f"{path} could not be read as a Databricks config file ({type(exc).__name__}).",
             "Fix the file (databricks auth profiles lists what it holds).",
         ) from None
-    if not read or not parser.has_section(profile):
+    if section is None:
         raise _refusal(
             "profile-missing",
             f"{PROFILE_ENV} names profile {profile!r}, which {path} does not have.",
             f"Create it (databricks auth login --host {host} --profile {profile}), or unset "
             f"{PROFILE_ENV}.",
         )
-    section = parser[profile]
     named = str(section.get("host") or "").strip()
     if not named or normalize_host(named) != host:
         raise _refusal(
@@ -237,16 +259,11 @@ def credential_values(env: Mapping[str, str]) -> List[str]:
     profile = str(env.get(PROFILE_ENV) or "").strip()
     if not profile:
         return values
-    parser = configparser.RawConfigParser()
     try:
-        parser.read(
-            Path(str(env.get(CONFIG_FILE_ENV) or "~/.databrickscfg")).expanduser(),
-            encoding="utf-8",
-        )
+        section = _profile_keys(_config_file(env), profile)
     except (configparser.Error, UnicodeDecodeError):
         return values
-    if parser.has_section(profile):
-        section = parser[profile]
+    if section:
         values += [str(section[key]) for key in _PROFILE_SECRETS if section.get(key)]
     return values
 

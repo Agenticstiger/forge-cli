@@ -250,6 +250,33 @@ class TestProfile:
         env = self._env(tmp_path, f"[ci]\nhost = {HOST}\nclient_id = {CLIENT_ID}\n")
         assert _refusal(env).kind == "databricks-profile-auth"
 
+    def test_the_default_profile_is_a_profile(self, tmp_path):
+        # What `databricks configure` writes when no profile is named.
+        text = f"[DEFAULT]\nhost = {HOST}\ntoken = {TOKEN}\n"
+        env = _env(
+            DATABRICKS_CONFIG_PROFILE="DEFAULT",
+            DATABRICKS_CONFIG_FILE=_profile_file(tmp_path, text),
+        )
+        result = auth.resolve_workspace_auth(env)
+        assert result.profile == "DEFAULT" and result.auth_type == "pat"
+
+    def test_a_profile_does_not_inherit_the_default_profiles_keys(self, tmp_path):
+        # Neither SDK merges [DEFAULT] into another profile: its token is not this one's.
+        text = f"[DEFAULT]\nhost = {HOST}\ntoken = {TOKEN}\n\n[ci]\nhost = {HOST}\n"
+        assert _refusal(self._env(tmp_path, text)).kind == "databricks-profile-auth"
+
+    def test_a_profile_does_not_take_its_host_from_the_default_profile(self, tmp_path):
+        text = f"[DEFAULT]\nhost = {HOST}\n\n[ci]\ntoken = {TOKEN}\n"
+        assert _refusal(self._env(tmp_path, text)).kind == "databricks-profile-host"
+
+    def test_the_cli_settings_section_is_not_a_profile(self, tmp_path):
+        text = f"[__settings__]\ndefault_profile = ci\nhost = {HOST}\ntoken = x\n"
+        env = _env(
+            DATABRICKS_CONFIG_PROFILE="__settings__",
+            DATABRICKS_CONFIG_FILE=_profile_file(tmp_path, text),
+        )
+        assert _refusal(env).kind == "databricks-profile-missing"
+
     @pytest.mark.parametrize(
         "var", ["DATABRICKS_TOKEN", "DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET"]
     )
@@ -362,6 +389,16 @@ class TestCredentialValues:
         values = credential_values(env)
         assert token in values and secret in values
         assert "id" not in values
+
+    def test_the_default_profiles_secret_and_no_inherited_one(self, tmp_path):
+        from fluid_build.iac.providers.databricks_auth import credential_values
+
+        token = "tok-" + "c3" * 8
+        cfg = tmp_path / "databrickscfg"
+        cfg.write_text(f"[DEFAULT]\nhost = {HOST}\ntoken = {token}\n\n[ci]\nhost = {HOST}\n")
+        env = {"DATABRICKS_CONFIG_FILE": str(cfg)}
+        assert credential_values({**env, "DATABRICKS_CONFIG_PROFILE": "DEFAULT"}) == [token]
+        assert credential_values({**env, "DATABRICKS_CONFIG_PROFILE": "ci"}) == []
 
     def test_no_profile_named_reads_no_file(self, tmp_path):
         from fluid_build.iac.providers.databricks_auth import credential_values
