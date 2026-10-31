@@ -53,7 +53,8 @@ _ENV_HOST_PLATFORMS = {
         "Redshift",
         "REDSHIFT_HOST",
         "REDSHIFT_PASSWORD or the IAM credentials",
-        "REDSHIFT_HOST, or for Redshift Serverless without it, the workgroup's own endpoint",
+        "REDSHIFT_HOST, or for Redshift Serverless over IAM without it, the endpoint of the "
+        "workgroup, account and region",
     ),
     "postgres": ("Postgres", "PGHOST", "PGPASSWORD", "PGHOST only"),
 }
@@ -291,8 +292,8 @@ def _databricks_name(
                 "identifier (letters, digits and underscores, not starting with a digit, at "
                 f"most {_MAX_NAME_LEN} characters): written as one, a {{{{ env.NAME }}}} "
                 "placeholder resolving to one, or exactly {{ env_var('NAME') }} with an "
-                "identifier default, NAME ending in _CATALOG or _SCHEMA, no longer than the "
-                "name, and the variable holding one."
+                "identifier default, NAME ending in _CATALOG or _SCHEMA and itself at most "
+                f"{_MAX_NAME_LEN} characters, and the variable holding one."
             ),
             fix=(
                 "Rename it, read a _CATALOG or _SCHEMA variable with "
@@ -602,8 +603,7 @@ def _build_generated_dbt_profile(
                 # ``gaierror`` even when ``is_serverless: true`` is set
                 # in the profile. So derive the canonical endpoint
                 # hostname here when we have everything needed
-                # (workgroup + acct + region) and the operator didn't
-                # supply an explicit ``host``.
+                # (workgroup + acct + region) and REDSHIFT_HOST is unset.
                 output["is_serverless"] = True
                 output["serverless_work_group"] = str(workgroup)
                 acct = (

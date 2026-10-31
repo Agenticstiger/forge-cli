@@ -104,10 +104,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or Postgres took `builds[].execution.runtime.resources.host` before `DATABRICKS_HOST` /
   `REDSHIFT_HOST` / `PGHOST`, and paired it with `DATABRICKS_TOKEN` / `REDSHIFT_PASSWORD` (or the
   IAM credentials) / `PGPASSWORD` from the environment. The host now comes from the environment
-  only, as the Databricks OpenTofu path already does (a Redshift Serverless workgroup without
-  `REDSHIFT_HOST` still gets its own endpoint), and a contract that names one is refused before
-  the profile is written (`DbtProfileError`); remove `runtime.resources.host` and set the
-  variable instead.
+  only, as the Databricks OpenTofu path already does (Redshift Serverless over IAM with no
+  `REDSHIFT_HOST` still derives the endpoint from the workgroup, account and region). A contract
+  that names one now fails that build before dbt starts, with `DbtProfileError` naming the field;
+  remove `runtime.resources.host` and set the variable instead.
 - **A Databricks catalog or schema from the contract could carry the token.** dbt evaluates
   `profiles.yml` as Jinja, and the runner resolved `{{ env.* }}` placeholders the contract loader
   leaves alone because their name looks like a credential, so `runtime.resources.catalog:
@@ -118,7 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   optional identifier default, where NAME ends in `_CATALOG` or `_SCHEMA`. No variable it reads
   may look like a credential (the redactor's rule or a `_KEY` / `_PAT` / `_PASS` suffix), and it
   may not hold a credential variable's value, which also catches a placeholder a plan resolved
-  before the runner saw its name. Anything else is refused.
+  before the runner saw its name. Anything else now fails that build before dbt starts, with
+  `DbtProfileError` naming the field and any variable: use a plain name (no `-`, `.` or leading
+  digit), read the name from a `_CATALOG` / `_SCHEMA` variable, or leave the field out and set
+  `DATABRICKS_CATALOG` / `DATABRICKS_SCHEMA`.
 
 ### Fixed
 

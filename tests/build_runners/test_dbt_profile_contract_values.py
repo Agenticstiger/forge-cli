@@ -391,9 +391,7 @@ class TestDatabricksNames:
         assert "is not a Databricks name" in caught.value.what
         assert "REDSHIFT_PASSWORD" not in _shown(caught.value)
 
-    def test_a_name_may_be_as_long_as_unity_catalog_allows(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_a_name_may_be_as_long_as_unity_catalog_allows(self) -> None:
         longest = "c" * 255
 
         output = _output(_build_generated_dbt_profile(_build("databricks", catalog=longest), {}))
