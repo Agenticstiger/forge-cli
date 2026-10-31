@@ -937,7 +937,8 @@ def _emit_files(
     ``databricks_directory`` created before it; the files' addresses.
 
     The provider creates a file's missing parent folder only when, after the upload
-    failed, the parent is still missing (``resource_workspace_file.go``, 1.140.0).
+    failed, the parent is still missing (``resource_workspace_file.go``, 1.140.0;
+    databricks/terraform-provider-databricks#6145).
     Files uploading in parallel into a new tree then fail at a first apply when a
     sibling's mkdirs made the parent in between (``models/x.sql`` creates ``files/``
     under ``dbt_project.yml``). With every folder there first, no upload meets a
