@@ -409,6 +409,14 @@ def tofu_import(
     )
 
 
+def tofu_state_rm(
+    workdir: str, addresses: List[str], *, env: Optional[Mapping[str, str]] = None
+) -> TofuResult:
+    """``tofu state rm`` — stop tracking resources in state. The cloud objects
+    stay as they are: this only forgets them (OpenTofu's ``state rm``)."""
+    return _run(["state", "rm", *addresses], workdir=workdir, env=env, command="state-rm")
+
+
 def planned_removals(result: TofuResult) -> List[Tuple[str, str]]:
     """``(address, resource type)`` of every resource a plan deletes or replaces.
 

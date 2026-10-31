@@ -279,14 +279,40 @@ def test_an_existing_table_without_column_mapping_is_refused_not_upgraded(worksp
         rc, out = apply_contract(capfd, path, *extra)
         assert rc == 1 and "databricks-adopt-protocol-upgrade" in out, out
         assert "ALTER TABLE `main`.`sales`.`orders` SET TBLPROPERTIES" in out
+        assert "released the" in out, out
     assert not [sql for sql in fake.sql_log if "TBLPROPERTIES" in sql]
     assert fake.tables[TABLE]["properties"] == {}
+    # The refused runs applied nothing, so they leave nothing they imported in
+    # state: leaving the table out of the contract, as the refusal offers, then
+    # plans no destroy of a table the product never created.
+    assert _tables_in_state(workspace) == []
 
     # The owner runs the ALTER in Databricks; the next apply adopts the table.
     fake.tables[TABLE]["properties"]["delta.columnMapping.mode"] = "name"
     rc, out = apply_contract(capfd, path)
     assert rc == 0, out
     assert fake.replaced == []
+
+
+def test_a_dry_run_leaves_the_state_as_it_found_it(workspace, fake, capfd):
+    # The plan adopts the existing table to show its update, not its replacement;
+    # a dry-run then forgets it again, and the apply adopts it for good.
+    fake.create_table(TABLE, LIVE_COLUMNS, properties={"delta.columnMapping.mode": "name"})
+    path = write_contract(workspace, make_contract())
+    rc, out = apply_contract(capfd, path, "--mode", "dry-run")
+    assert rc == 0 and "brownfield: adopted" in out and "released the" in out, out
+    assert _tables_in_state(workspace) == []
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0 and "released the" not in out, out
+    assert len(_tables_in_state(workspace)) == 1
+    assert fake.replaced == []
+
+
+def _tables_in_state(workspace: Path) -> List[str]:
+    workdirs = list((workspace / ".fluid" / "iac" / "databricks").iterdir())
+    assert len(workdirs) == 1, workdirs
+    listed = runner.tofu_state_list(str(workdirs[0]))
+    return [address for address in listed if address.startswith("databricks_sql_table.")]
 
 
 def test_a_type_change_fails_at_plan_naming_the_column(workspace, fake, capfd):

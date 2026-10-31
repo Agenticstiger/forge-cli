@@ -175,6 +175,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `fluid apply` that applies nothing leaves the OpenTofu state as it found it.** Brownfield
+  adoption imports existing objects into state before the plan, and `tofu import` writes state at
+  once. A run that then stopped (`--mode dry-run`, a refusal, the data-loss gate, a failed plan)
+  kept them, though no apply had taken them over, and a contract that then left one out planned
+  its destroy: of an object forge-cli never created. Such a run now hands them back with `tofu
+  state rm`, which leaves the objects as they are, and the next apply adopts them again. On every
+  cloud. It matters most for a Databricks table refused for lacking column mapping, whose
+  refusal offers leaving the table out of the contract.
 - **`fluid generate` writes a Databricks `profiles.yml` and Databricks column types for a dbt
   build on Databricks.** It wrote a DuckDB profile and DuckDB types, and the dbt runner prefers a
   `profiles.yml` in the project directory, so a run could build into a local DuckDB file instead
