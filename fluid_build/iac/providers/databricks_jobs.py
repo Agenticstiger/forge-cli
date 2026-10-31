@@ -64,7 +64,7 @@ from ...util.binding_paths import ENV_PLACEHOLDER_RE
 from ...util.contract import builds_writing_expose, is_databricks_job_build
 from ...util.cron import unix_to_quartz
 from ..base import UnsupportedBindingError
-from ..naming import TofuExpr, safe_ident, tofu_ref, unique_ident
+from ..naming import TofuExpr, digest_ident, safe_ident, tofu_ref, unique_ident
 from ..source import current_contract_source
 
 #: The serverless environment the dbt task runs in: client version 2 and the
@@ -699,9 +699,13 @@ class _Build:
     @property
     def root(self) -> str:
         """Its uploaded project, below the applying identity's home: one folder per
-        product and build, never shared (``unique_ident``: ``sales.orders`` and
-        ``sales-orders`` fold alike, and one would run the other's models)."""
-        return f"/.fluid/{unique_ident(self.product)}/{unique_ident(self.build_id)}/files"
+        product and build, never shared. Each id carries its digest
+        (``digest_ident``), since one identity may apply many contracts into one
+        home: ``sales.orders`` and ``sales-orders`` fold alike, and an id written
+        as another's folded form would otherwise land in its folder, where the
+        upload overwrites that product's models (the provider never reads a
+        file's content back, so its next plan would not notice)."""
+        return f"/.fluid/{digest_ident(self.product)}/{digest_ident(self.build_id)}/files"
 
 
 @dataclass(frozen=True)

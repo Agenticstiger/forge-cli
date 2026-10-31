@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 from fluid_build.iac import IAC_PLUGINS, build_module
-from fluid_build.iac.naming import TofuExpr, unique_ident
+from fluid_build.iac.naming import TofuExpr, digest_ident, unique_ident
 from fluid_build.iac.providers import databricks as dbx
 from fluid_build.iac.providers import databricks_jobs as jobs
 from fluid_build.iac.source import contract_source
@@ -39,7 +39,7 @@ WAREHOUSE = "wh-0123456789abcdef"
 GIT = "https://github.com/o/r?tag=v1.2.0"
 HOME = "${data.databricks_current_user.me.home}"
 # One folder per product and build, never shared: ``sales.orders`` folds to a digest.
-ROOT = f".fluid/{unique_ident('sales.orders')}/transform/files"
+ROOT = f".fluid/{digest_ident('sales.orders')}/{digest_ident('transform')}/files"
 
 
 def _set(target: Any, path: str, value: Any) -> None:
@@ -878,3 +878,25 @@ def test_the_module_is_deterministic_for_one_project(tmp_path, monkeypatch):
         second = build_module(IAC_PLUGINS["databricks"], contract)
     assert first == second
     assert os.fspath(tmp_path) not in first  # no local path leaks into the module
+
+
+class TestUploadRoot:
+    """One folder per product and build in the applier's home, never shared."""
+
+    @staticmethod
+    def _root(product: str, build_id: str = "transform") -> str:
+        from fluid_build.iac.providers.databricks_jobs import _Build
+
+        return _Build({}, build_id, "builds[0]", product, WAREHOUSE).root
+
+    def test_an_id_written_as_another_ids_folded_form_gets_its_own_folder(self):
+        # `sales_eu_<digest>` is how `sales-eu` folds: as a product id of its own
+        # it must not land in that product's folder and replace its models.
+        assert self._root("sales-eu") != self._root(unique_ident("sales-eu"))
+        assert self._root("p", "x-y") != self._root("p", unique_ident("x-y"))
+
+    def test_ids_that_fold_alike_get_their_own_folders(self):
+        assert len({self._root(p) for p in ("sales.orders", "sales-orders", "sales_orders")}) == 3
+
+    def test_the_same_ids_get_the_same_folder(self):
+        assert self._root("sales.orders") == self._root("sales.orders")

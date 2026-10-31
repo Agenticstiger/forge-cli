@@ -29,7 +29,7 @@ from fluid_build.cli import _apply_opentofu_engine as engine
 from fluid_build.cli._common import CLIError
 from fluid_build.iac import IAC_PLUGINS
 from fluid_build.iac.base import UnsupportedBindingError
-from fluid_build.iac.naming import unique_ident
+from fluid_build.iac.naming import digest_ident
 from fluid_build.iac.providers import databricks as dbx
 from fluid_build.iac.source import contract_source
 
@@ -350,7 +350,7 @@ class TestPlannedObjects:
         with contract_source(tmp_path / "contract.fluid.yaml"):
             actions = dbx.planned_objects(contract)
         files = [a for a in actions if a["resource_type"] == "databricks_workspace_file"]
-        root = f"~/.fluid/{unique_ident('sales.orders')}/transform/files"
+        root = f"~/.fluid/{digest_ident('sales.orders')}/{digest_ident('transform')}/files"
         assert [a["resource_id"] for a in files] == [
             f"{root}/dbt_project.yml",
             f"{root}/models/m.sql",

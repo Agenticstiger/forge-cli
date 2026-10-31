@@ -42,7 +42,7 @@ from typing import Any, Dict, Iterator, Optional
 import pytest
 
 from fluid_build.iac import runner
-from fluid_build.iac.naming import unique_ident
+from fluid_build.iac.naming import digest_ident
 
 from ._databricks_cli import (  # noqa: F401 — plugin_cache is a fixture
     apply_contract,
@@ -62,7 +62,10 @@ pytestmark = [
 ]
 
 TABLE = "main.sales.orders"
-ROOT = f"/Users/fake-user@example.test/.fluid/{unique_ident('dbx.fake.orders')}/dbt_daily/files"
+ROOT = (
+    "/Users/fake-user@example.test/.fluid/"
+    f"{digest_ident('dbx.fake.orders')}/{digest_ident('dbt_daily')}/files"
+)
 GIT = "https://github.com/example-org/orders-dbt"
 
 

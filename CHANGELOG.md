@@ -36,8 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serverless job with a dbt task. Databricks runs it on the SQL warehouse `DATABRICKS_WAREHOUSE_ID`
   names, in the catalog and schema of the expose the build writes. Its `repository` is either the
   local dbt project or an `https://` Git URL. A local project is uploaded under the applying
-  identity's home (`.fluid/<product>/<build>/files`), and only what dbt reads goes up: never
-  `profiles.yml`, `target/`, a hidden file or a symbolic link. A Git URL names exactly one of
+  identity's home (`.fluid/<product>/<build>/files`, each id with its digest, so no two
+  products share a folder), and only what dbt reads goes up: never `profiles.yml`, `target/`, a
+  hidden file or a symbolic link. A Git URL names exactly one of
   `?branch=`, `?tag=` or `?commit=`, plus `&path=` for a project below the repository root. The
   job runs `dbt deps`, then `dbt build` with the selectors and vars a local run uses.
   `execution.trigger` becomes a Quartz `schedule` (days of the week by name, so none is off by
