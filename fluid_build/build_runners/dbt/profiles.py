@@ -29,14 +29,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import yaml
 
 from fluid_build._errors import FluidUserError, doc_url
+from fluid_build.util.binding_paths import ENV_PLACEHOLDER_RE
 
 from ..base import _resolve_env_placeholders
 
@@ -55,6 +57,33 @@ _ENV_HOST_PLATFORMS = {
     ),
     "postgres": ("Postgres", "PGHOST", "PGPASSWORD", "PGHOST only"),
 }
+
+#: The one dbt Jinja form a contract catalog or schema may take: the whole
+#: value is ``{{ env_var('NAME') }}``, with an optional default that is a plain
+#: identifier. Stricter than the template emitter's pattern
+#: (``engines/dbt/profiles.py::_ENV_VAR_JINJA_RE``): matched against the whole
+#: value, so dbt has nothing else to evaluate, and the default can hold no
+#: quote, backslash or brace to end the call early or open a second one.
+_ENV_VAR_CALL_RE = re.compile(
+    r"\{\{\s*env_var\(\s*'([A-Za-z_][A-Za-z0-9_]*)'"
+    r"\s*(?:,\s*'([A-Za-z_][A-Za-z0-9_]*)'\s*)?\)\s*\}\}"
+)
+
+#: The variables that call may read: named for a catalog or a schema (founder,
+#: 2026-10-30). dbt reads the variable after this check, and no name rule can
+#: say which of the others hold a credential.
+_ENV_VAR_NAME_SUFFIXES = ("_CATALOG", "_SCHEMA")
+
+#: The shortest environment value looked for inside a catalog or schema name:
+#: the redactor's exact-match floor
+#: (``observability/secret_redactor.py::_MIN_REGISTERED_SECRET_LEN``), below
+#: which values occur inside ordinary words.
+_MIN_CREDENTIAL_VALUE_LEN = 6
+
+#: Unity Catalog caps every securable name at 255 characters ("Unity Catalog
+#: requirements and limitations", docs.databricks.com). Checked before any value
+#: is looked for, it also bounds how many guesses one name can hold.
+_MAX_NAME_LEN = 255
 
 
 @dataclass
@@ -99,6 +128,184 @@ def _refuse_contract_host(build: Dict[str, Any], raw_resources: Any, platform: s
         doc=doc_url(),
         extras={"field": "execution.runtime.resources.host", "variable": host_env},
     )
+
+
+def _is_credential_name(name: str) -> bool:
+    """Whether the variable ``name`` holds a credential, by either rule the
+    codebase keeps: the redactor's (``is_sensitive_key_name``) and the dotenv
+    policy's suffixes (``credentials/protected_env.py::CREDENTIAL_NAME_SUFFIXES``:
+    ``_KEY``, ``_PAT``, ``_PASS`` ...), which catch names the first misses, such
+    as ``DATABRICKS_PAT`` and ``FLUID_ENCRYPTION_KEY``."""
+    from fluid_build.credentials.protected_env import CREDENTIAL_NAME_SUFFIXES
+    from fluid_build.observability.secret_redactor import is_sensitive_key_name
+
+    return is_sensitive_key_name(name) or name.upper().endswith(CREDENTIAL_NAME_SUFFIXES)
+
+
+def _credentials_in(text: str) -> Set[str]:
+    """The credential variables in the environment whose value ``text`` holds.
+
+    For a placeholder resolved before this runner saw it, which leaves no name
+    to read: ``fluid apply plan.json`` resolves the contract's ``{{ env.* }}``
+    first, all but the names ``is_sensitive_key_name`` flags, so the values that
+    arrive resolved belong to names only the suffix rule
+    (``credentials/protected_env.py::CREDENTIAL_NAME_SUFFIXES``) knows. That
+    rule alone also suits a scan of the whole environment: the redactor's
+    matches ``auth`` inside ``GIT_AUTHOR_NAME``, and would refuse a schema
+    ``airflow_staging`` because that variable holds ``airflow``.
+
+    Values are compared stripped: the loader strips what it resolves, so a
+    secret mounted from a file keeps its newline in the environment and loses
+    it in the name.
+    """
+    from fluid_build.credentials.protected_env import CREDENTIAL_NAME_SUFFIXES
+
+    return {
+        name
+        for name, value in os.environ.items()
+        if len(value.strip()) >= _MIN_CREDENTIAL_VALUE_LEN
+        and value.strip() in text
+        and name.upper().endswith(CREDENTIAL_NAME_SUFFIXES)
+    }
+
+
+def _databricks_name(
+    build: Dict[str, Any], raw_resources: Any, resources: Dict[str, Any], key: str
+) -> Optional[str]:
+    """The contract's Databricks ``catalog`` or ``schema``; ``None`` for the
+    environment default.
+
+    dbt renders every profiles.yml value as Jinja, and prints the catalog and
+    schema back (a "catalog not found" error, the run logs). So the name dbt
+    ends with must be a plain identifier (``providers/_sql_safety.py``, the rule
+    the IaC emitter applies to Unity Catalog names): written as one, a FLUID
+    ``{{ env.NAME }}`` placeholder resolving to one, or exactly
+    ``{{ env_var('NAME') }}`` with an identifier default, NAME ending in
+    ``_CATALOG`` or ``_SCHEMA`` and the variable holding one. And no credential
+    may reach it: no variable it reads is credential-named
+    (:func:`_is_credential_name`), and it holds no credential variable's value.
+    The allowlist of ``engines/dbt/profiles.py::_contract_expr``, refusing
+    instead of falling back: a build must not run in a catalog the contract did
+    not name.
+
+    A placeholder is resolved in one of three places: the contract loader on a
+    plan, all but credential-named ones; this runner
+    (``_resolve_env_placeholders``), every one left; dbt, for ``env_var``. So
+    the names are read from the value as written and from the emitted call, and
+    the values from the name dbt ends with. A credential resolved here inside
+    an ``env_var`` default is identifier-shaped, and a variable can resolve to
+    Jinja of its own, such as a CI branch name.
+
+    The checks run in that order, values last: a value that is no name is
+    refused before any credential is looked for in it, so a refusal tells a
+    contract which credential it matched only for a name of at most
+    :data:`_MAX_NAME_LEN` characters. That bound covers the variable an
+    ``env_var`` reads too: the scan reads the whole call, so a name of guesses
+    would otherwise carry any number of them.
+    """
+    from fluid_build.providers._sql_safety import validate_ident
+
+    raw = raw_resources.get(key) if isinstance(raw_resources, Mapping) else None
+    written = "" if raw is None else str(raw)
+    emitted = str(resources.get(key) or "").strip()
+    call = _ENV_VAR_CALL_RE.fullmatch(emitted)
+    names = set(ENV_PLACEHOLDER_RE.findall(written))
+    # The name dbt ends with: as emitted, or for a call the variable as set now
+    # (dbt runs in this environment), else the default. The default is a name
+    # too: a containerized dbt sees only the forwarded variables, and falls back
+    # to it for the rest.
+    final = emitted
+    if call:
+        names.add(call.group(1))
+        final = os.environ.get(call.group(1)) or call.group(2) or ""
+    field = f"execution.runtime.resources.{key}"
+    default_env = f"DATABRICKS_{key.upper()}"
+    build_id = build.get("id", "unknown")
+
+    def _carries(variables: List[str], *, by_value: bool) -> DbtProfileError:
+        listed = ", ".join(variables)
+        if by_value:
+            what = f"{field} holds the value of {listed}, which looks like a credential"
+            fix = (
+                f"Read the {key} from a variable named for it (ending in _CATALOG or "
+                f"_SCHEMA), or remove {field} and set {default_env} in the environment."
+            )
+        else:
+            # The contract loader's rule too, so it leaves such a placeholder
+            # unresolved elsewhere and asks for the same rename.
+            what = f"{field} reads {listed}, which looks like a credential"
+            fix = (
+                f"If {listed} holds no secret, rename it outside the "
+                "password/secret/token/key/auth family (an env_var() name must also end in "
+                f"_CATALOG or _SCHEMA), or remove {field} and set {default_env} in the "
+                "environment."
+            )
+        return DbtProfileError(
+            what=f"build '{build_id}': {what}",
+            why=(
+                f"The Databricks {key} is sent to the workspace as a name and printed back in "
+                "errors and run logs, so a credential there would be disclosed."
+            ),
+            fix=fix,
+            doc=doc_url(),
+            extras={"field": field, "variables": variables},
+        )
+
+    named = sorted(name for name in names if _is_credential_name(name))
+    if named:
+        raise _carries(named, by_value=False)
+    if call and not call.group(1).upper().endswith(_ENV_VAR_NAME_SUFFIXES):
+        raise DbtProfileError(
+            what=(
+                f"build '{build_id}': {field} reads {call.group(1)}, which is not a catalog or "
+                "schema variable"
+            ),
+            why=(
+                "dbt reads an env_var() when it runs, after this check, so only a variable named "
+                "for a catalog or schema (ending in _CATALOG or _SCHEMA) may supply one: any "
+                "other could hold a credential."
+            ),
+            fix=(
+                f"Read a variable ending in _CATALOG or _SCHEMA, such as {default_env}, or remove "
+                f"{field} and set {default_env} in the environment."
+            ),
+            doc=doc_url(),
+            extras={"field": field, "variables": [call.group(1)]},
+        )
+
+    def _is_name(text: str) -> bool:
+        try:
+            validate_ident(text)
+        except ValueError:
+            return False
+        return len(text) <= _MAX_NAME_LEN
+
+    # An empty one is no value (the environment default applies), or a call to
+    # an unset variable with no default, which dbt reports itself.
+    parts = (final, call.group(2), call.group(1)) if call else (final,)
+    if not all(_is_name(part) for part in parts if part):
+        raise DbtProfileError(
+            what=f"build '{build_id}': {field} is not a Databricks name the profile can carry",
+            why=(
+                "dbt evaluates profiles.yml as Jinja, so the name it ends with must be a plain "
+                "identifier (letters, digits and underscores, not starting with a digit, at "
+                f"most {_MAX_NAME_LEN} characters): written as one, a {{{{ env.NAME }}}} "
+                "placeholder resolving to one, or exactly {{ env_var('NAME') }} with an "
+                "identifier default, NAME ending in _CATALOG or _SCHEMA, no longer than the "
+                "name, and the variable holding one."
+            ),
+            fix=(
+                "Rename it, read a _CATALOG or _SCHEMA variable with "
+                f"{{{{ env_var('NAME') }}}}, or remove {field} and set {default_env} in the "
+                "environment."
+            ),
+            doc=doc_url(),
+            extras={"field": field},
+        )
+    held = sorted(_credentials_in(emitted) | _credentials_in(final))
+    if held:
+        raise _carries(held, by_value=True)
+    return emitted or None
 
 
 def _load_dbt_project_config(project_dir: Path) -> Dict[str, Any]:
@@ -165,7 +372,7 @@ def _build_generated_dbt_profile(
     """The profile for ``build``'s platform, credentials from the environment.
 
     Raises :class:`DbtProfileError` for a contract value that would choose where
-    an environment credential goes.
+    an environment credential goes, or what dbt evaluates around it.
     """
     execution = build.get("execution") or {}
     runtime = execution.get("runtime") or {}
@@ -438,13 +645,15 @@ def _build_generated_dbt_profile(
 
     if platform == "databricks":
         _refuse_contract_host(build, raw_resources, "databricks")
+        catalog = _databricks_name(build, raw_resources, resources, "catalog")
+        schema = _databricks_name(build, raw_resources, resources, "schema")
         output = {
             "type": "databricks",
             "host": os.getenv("DATABRICKS_HOST", ""),
             "http_path": resources.get("http_path") or os.getenv("DATABRICKS_HTTP_PATH", ""),
             "token": os.getenv("DATABRICKS_TOKEN", ""),
-            "catalog": resources.get("catalog") or os.getenv("DATABRICKS_CATALOG", ""),
-            "schema": resources.get("schema") or os.getenv("DATABRICKS_SCHEMA", "default"),
+            "catalog": catalog or os.getenv("DATABRICKS_CATALOG", ""),
+            "schema": schema or os.getenv("DATABRICKS_SCHEMA", "default"),
             "threads": int(resources.get("threads") or props.get("threads") or 4),
         }
         return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
