@@ -76,6 +76,14 @@ _CLOUD_ENV = {
     "azure": ("AZURE_SUBSCRIPTION_ID", "AZURE_CLIENT_ID"),
     "snowflake": ("SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER"),
 }
+# Databricks needs a host plus one credential; presence only, never values and
+# never ~/.databrickscfg. (Importing fluid_build.iac here would blow the budget.)
+_DATABRICKS_HOST_ENV = "DATABRICKS_HOST"
+_DATABRICKS_CRED_ENV = (
+    ("DATABRICKS_TOKEN",),
+    ("DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET"),
+    ("DATABRICKS_CONFIG_PROFILE",),
+)
 # AI-credential environment markers.
 _AI_ENV = (
     "OPENAI_API_KEY",
@@ -306,6 +314,10 @@ def _probe_cloud_creds() -> Dict[str, Any]:
             if os.environ.get(var):
                 found.append(cloud)
                 break
+    if os.environ.get(_DATABRICKS_HOST_ENV) and any(
+        all(os.environ.get(v) for v in group) for group in _DATABRICKS_CRED_ENV
+    ):
+        found.append("databricks")
     return {"cloud_credentials": found}
 
 

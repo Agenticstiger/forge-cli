@@ -1169,20 +1169,11 @@ def _catalogue_dimensions(
     schema: Mapping[str, Any], actual_location: str, expected_location: str, region: str
 ) -> Dict[str, Any]:
     """The four dimensions every verifier reports, from what Glue says."""
+    from fluid_build.cli._verify_dimensions import schema_dimensions
+
     location_ok = _normalize_s3(actual_location) == _normalize_s3(expected_location)
     return {
-        "structure": {
-            "status": "pass" if not (schema["missing"] or schema["extra"]) else "fail",
-            "matching_fields": schema["matching"],
-            "missing_fields": schema["missing"],
-            "extra_fields": schema["extra"],
-            "total_expected": schema["total_expected"],
-            "total_actual": schema["total_actual"],
-        },
-        "types": {
-            "status": "pass" if not schema["type_mismatches"] else "fail",
-            "mismatches": schema["type_mismatches"],
-        },
+        **schema_dimensions(schema),
         "constraints": {
             "status": "pass",
             "mismatches": [],

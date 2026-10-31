@@ -387,6 +387,8 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
             "build_runners/dbt/profiles.py", "_list_profile_targets", "_load_dbt_project_config"
         ),
         *_site("build_runners/dlt/destinations.py", "_expand_bigquery_service_account"),
+        # The build's dbt_project.yml, for the dbt project files a Databricks job uploads.
+        *_site("iac/providers/databricks_jobs.py", "_project_source"),
     ),
     **_register(
         NOT_A_CONTRACT,
@@ -397,8 +399,10 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
             "_load_contract",
             "_reconcile_with_state",
             "_verify_plan_binding_for_opentofu",
-            "apply_via_opentofu",
+            "_apply_via_opentofu",
         ),
+        # A plan.json's contract_metadata, for the source contract the plan records.
+        *_site("iac/source.py", "source_contract_file"),
     ),
     **_register(
         NOT_A_CONTRACT,

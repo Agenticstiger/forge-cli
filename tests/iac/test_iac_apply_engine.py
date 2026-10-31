@@ -240,6 +240,130 @@ class TestBrownfieldAdoption:
         engine._adopt_existing(_Plugin(), {}, [], "/wd", {}, logging.getLogger("test"))
 
 
+class TestImportsKeptOnlyByAnApply:
+    """What a run imported is handed back (``tofu state rm``) unless its apply
+    starts: a run that applies nothing leaves the state as it found it."""
+
+    @pytest.fixture
+    def tofu(self, monkeypatch):
+        calls: dict = {"import": [], "state_rm": [], "apply": 0, "plan_events": []}
+        for name in ("FLUID_STATE_BACKEND", "OPENLINEAGE_URL"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(engine.runner, "tofu_path", lambda: "/usr/bin/tofu")
+        monkeypatch.setattr(engine.runner, "require_tofu_version", lambda: None)
+
+        def ok(command, events=None):
+            return engine.runner.TofuResult(command, 0, "", "", events=events or [])
+
+        def imported(workdir, address, resource_id, *, env=None):
+            calls["import"].append(address)
+            return ok("import")
+
+        def state_rm(workdir, addresses, *, env=None):
+            calls["state_rm"].append(list(addresses))
+            return ok("state-rm")
+
+        def applied(*a, **k):
+            calls["apply"] += 1
+            return ok("apply")
+
+        monkeypatch.setattr(engine.runner, "tofu_init", lambda *a, **k: ok("init"))
+        monkeypatch.setattr(engine.runner, "tofu_state_list", lambda *a, **k: [])
+        monkeypatch.setattr(engine.runner, "tofu_state_resources", lambda *a, **k: [])
+        monkeypatch.setattr(engine.runner, "tofu_import", imported)
+        monkeypatch.setattr(engine.runner, "tofu_state_rm", state_rm)
+        monkeypatch.setattr(
+            engine.runner, "tofu_plan", lambda *a, **k: ok("plan", calls["plan_events"])
+        )
+        monkeypatch.setattr(engine.runner, "tofu_apply", applied)
+        return calls
+
+    @staticmethod
+    def _apply(tmp_path, *, dry_run=False):
+        args = argparse.Namespace(
+            contract=str(_GCP_CONTRACT),
+            env=None,
+            provider=None,
+            workspace_dir=tmp_path,
+            state_backend=None,
+            dry_run=dry_run,
+            allow_data_loss=False,
+        )
+        return engine.apply_via_opentofu(args, logging.getLogger("test"))
+
+    def test_a_dry_run_hands_back_what_it_imported(self, tofu, tmp_path, capfd):
+        assert self._apply(tmp_path, dry_run=True) == 0
+        assert tofu["import"], "the contract has resources to adopt"
+        assert tofu["state_rm"] == [tofu["import"]]
+        assert "released the" in capfd.readouterr().out
+
+    def test_a_refused_run_hands_back_what_it_imported(self, tofu, tmp_path):
+        tofu["plan_events"][:] = [
+            {
+                "type": "planned_change",
+                "change": {
+                    "action": "delete",
+                    "resource": {
+                        "addr": "google_bigquery_table.t",
+                        "resource_type": "google_bigquery_table",
+                    },
+                },
+            },
+            {"type": "change_summary", "changes": {"add": 0, "change": 0, "remove": 1}},
+        ]
+        with pytest.raises(CLIError) as exc:
+            self._apply(tmp_path)
+        assert exc.value.event == "opentofu_data_loss_gate"
+        assert tofu["state_rm"] == [tofu["import"]] and tofu["apply"] == 0
+
+    def test_an_apply_keeps_what_it_imported(self, tofu, tmp_path):
+        assert self._apply(tmp_path) == 0
+        assert tofu["import"] and tofu["apply"] == 1
+        assert tofu["state_rm"] == []
+
+    def test_a_release_that_fails_says_how_to_finish_it(self, tofu, tmp_path, monkeypatch, capfd):
+        monkeypatch.setattr(
+            engine.runner,
+            "tofu_state_rm",
+            lambda *a, **k: engine.runner.TofuResult("state-rm", 1, "", "state locked"),
+        )
+        assert self._apply(tmp_path, dry_run=True) == 0
+        out = capfd.readouterr().out
+        assert "stay in state, though nothing was applied" in out
+        assert " state rm " in out
+
+    def test_an_import_the_strict_check_stops_still_hands_back_the_earlier_ones(self, monkeypatch):
+        from fluid_build.iac.importer import ImportBlock
+
+        removed: list = []
+        monkeypatch.setattr(engine.runner, "tofu_state_list", lambda *a, **k: [])
+        results = iter(
+            [
+                engine.runner.TofuResult("import", 0, "", ""),
+                engine.runner.TofuResult("import", 1, "", "permission denied"),
+            ]
+        )
+        monkeypatch.setattr(engine.runner, "tofu_import", lambda *a, **k: next(results))
+        monkeypatch.setattr(
+            engine.runner,
+            "tofu_state_rm",
+            lambda workdir, addresses, *, env=None: removed.append(list(addresses))
+            or engine.runner.TofuResult("state-rm", 0, "", ""),
+        )
+
+        class _Plugin:
+            strict_adoption = True
+
+            def discover_imports(self, contract, actions=()):
+                return [ImportBlock(to="x_schema.s", id="s"), ImportBlock(to="x_table.t", id="t")]
+
+        log = logging.getLogger("test")
+        with pytest.raises(CLIError):
+            with engine._imports_kept_only_by_an_apply("/wd", {}, log) as held:
+                engine._adopt_existing(_Plugin(), {}, [], "/wd", {}, log, held.addresses)
+        assert removed == [["x_schema.s"]]
+
+
 class TestPerContractState:
     """Each contract applies into its own ``tofu`` workdir + state."""
 

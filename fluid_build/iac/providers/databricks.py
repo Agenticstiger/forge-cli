@@ -37,7 +37,24 @@ resources, with no new schema field (fluid-schema 0.7.6):
   named principal's privileges on its schema: on a schema that existed before
   (adopted on the first apply) and that other teams share, such a principal is
   left with ``USE_SCHEMA`` alone. A product owns its schema here; a schema
-  shared between products needs the packaging modes, refused for now.
+  shared between products needs the packaging modes, refused for now. Readers
+  also need ``USE CATALOG`` on the catalog, which the product does not own and
+  never grants: the apply names who needs it (:meth:`plan_notices`), and
+  ``fluid verify`` checks it.
+* A dbt build that runs on Databricks (``execution.runtime.platform:
+  databricks``) becomes a serverless ``databricks_job`` with a ``dbt_task``, and
+  a local project its ``databricks_workspace_file`` uploads
+  (``databricks_jobs.py``).
+* A table a dbt build writes, locally or as a job, is rebuilt by dbt's ``table``
+  materialization with CREATE OR REPLACE, so the module creates it and then
+  leaves its definition to dbt: ``lifecycle.ignore_changes`` on what that
+  statement rewrites, no column mapping, and the drift it hides reported on
+  every apply (:meth:`suppressed_drift`); ``fluid verify`` is the gate. Every
+  other table is the module's own, column for column.
+* An existing table is adopted before the first apply. One without column
+  mapping is refused, not upgraded: setting ``delta.columnMapping.mode`` upgrades
+  the table's Delta protocol, which older readers cannot read, and that is the
+  owner's call to make in Databricks, not a side effect of an apply.
 
 Two inputs come from the environment, never from the contract:
 ``DATABRICKS_HOST``, which the provider reads itself (a contract that named the
@@ -61,17 +78,17 @@ so an existing table must be imported before the first apply.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ...providers._sql_safety import validate_ident, validate_sql_type_param_payload
+from ...util.contract import is_databricks_job_build
 from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
 from ..importer import ImportBlock
-from ..naming import safe_ident, tofu_ref
+from ..naming import safe_ident, tofu_ref, unique_ident
 from ..principals import (
     _ENV_TEMPLATE_RE,
     DATABRICKS,
@@ -81,6 +98,14 @@ from ..principals import (
 )
 from ..provider_match import canonical_cloud, is_cloud
 from ..versions import required_providers
+from .databricks_auth import tofu_env_overlay
+from .databricks_jobs import (
+    CompiledJobs,
+    DbtJob,
+    compile_dbt_jobs,
+    dbt_written_exposes,
+    run_as_allowlist,
+)
 
 #: The SQL warehouse every ``databricks_sql_table`` statement runs on.
 WAREHOUSE_ENV = "DATABRICKS_WAREHOUSE_ID"
@@ -127,6 +152,14 @@ _SCALE_ZERO_RE = re.compile(r"^decimal(\([0-9]+\))?$")
 
 #: A rendered DECIMAL with arguments, in any spelling (``decimal(12)``, ``decimal(038,2)``).
 _DECIMAL_ARGS_RE = re.compile(r"^decimal\(([0-9]{1,4})(?:,([0-9]{1,4}))?\)$")
+
+#: The Delta table property the module sets on a table it owns: Delta drops and
+#: renames columns only under column mapping.
+COLUMN_MAPPING = "delta.columnMapping.mode"
+
+#: What a dbt ``table`` model's CREATE OR REPLACE rewrites, so the module leaves
+#: it alone on a table a dbt build writes (``dbt_written_exposes``).
+_DBT_OWNED = ("column", "partitions", "cluster_keys", "properties", "comment")
 
 #: What ``tofu plan`` prints for each plan-time error :meth:`explain_plan_failure`
 #: turns into a fix-it (provider 1.140.0 messages, verbatim).
@@ -188,6 +221,11 @@ class _Compiled:
     owners: Dict[str, str] = field(default_factory=dict)
     #: ``(securable type, full name, principal, privileges)`` per grant emitted.
     grants: List[Tuple[str, str, str, List[str]]] = field(default_factory=list)
+    #: The dbt jobs, and the full names of the tables a dbt build writes.
+    jobs: List[DbtJob] = field(default_factory=list)
+    dbt_written: List[str] = field(default_factory=list)
+    #: What applies but is worth saying (``fluid validate`` warnings).
+    warnings: List[str] = field(default_factory=list)
 
 
 def _refusal(kind: str, message: str, *remediation: str) -> UnsupportedBindingError:
@@ -697,20 +735,6 @@ def _table_privileges(
     return out
 
 
-def _principal_key(principal: str) -> str:
-    """``principal`` as an address segment no other principal shares.
-
-    ``safe_ident`` turns every character but letters, digits and ``_`` into
-    ``_``, so ``data-eng`` and ``data_eng`` would meet at one address, a
-    collision the contract cannot rename away. A principal it changes carries
-    a digest of its exact text.
-    """
-    folded = safe_ident(principal)
-    if folded == principal:
-        return folded
-    return f"{folded}_{hashlib.sha256(principal.encode('utf-8')).hexdigest()[:8]}"
-
-
 def _claim(compiled: _Compiled, rtype: str, key: str, owner: str, body: Dict[str, Any]) -> None:
     """Add one resource, refusing two different objects that share an address.
 
@@ -731,6 +755,40 @@ def _claim(compiled: _Compiled, rtype: str, key: str, owner: str, body: Dict[str
         return
     compiled.owners[address] = owner
     compiled.resources.setdefault(rtype, {})[key] = body
+
+
+def _claim_grant(
+    compiled: _Compiled,
+    key: str,
+    securable: Tuple[str, str, str],
+    principal: str,
+    privileges: List[str],
+) -> None:
+    """One ``databricks_grant``, the import that adopts it, and its planner record.
+
+    ``securable`` is ``(type, full name, reference)``. The principal's existing
+    privileges on it are imported first (``<type>/<full name>/<principal>``, the
+    provider's import id), so the plan shows what the authoritative grant takes
+    away as an update rather than a plain create. The import is best-effort: it
+    fails for a securable not created yet, and the grant's create sets the same
+    privileges anyway.
+    """
+    kind, full_name, ref = securable
+    address = f"databricks_grant.{key}"
+    owner = f"{principal!r} on {kind} {full_name}"
+    first = address not in compiled.owners
+    _claim(
+        compiled,
+        "databricks_grant",
+        key,
+        owner,
+        {kind: ref, "principal": principal, "privileges": privileges},
+    )
+    if first and compiled.owners.get(address) == owner:
+        compiled.imports.append(
+            ImportBlock(address, f"{kind}/{full_name}/{principal}", best_effort=True)
+        )
+        compiled.grants.append((kind, full_name, principal, privileges))
 
 
 def _refuse_build_hosts(
@@ -772,14 +830,51 @@ def _compile(
         for index, exposure in enumerate(contract.get("exposes") or [])
         if isinstance(exposure, Mapping) and is_cloud(exposure.get("binding") or {}, "databricks")
     ]
-    if not exposures:
+    job_builds = any(
+        isinstance(build, Mapping) and is_databricks_job_build(build)
+        for build in contract.get("builds") or []
+    )
+    if not exposures and not job_builds:
         return compiled
     if _set(contract.get("packaging")):
         refusals.append(_packaging_refusal("the contract"))
 
+    targets = _resolve_tables(compiled, exposures, validating=validating)
+    warehouse = _warehouse(env, refusals)
+    _refuse_duplicate_tables(compiled.tables, refusals)
+    cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+    privileges = _table_privileges(contract, targets, refusals)
+    dbt_written = dbt_written_exposes(contract, compiled.tables)
+    for table in compiled.tables:
+        _emit_table(compiled, table, cid, warehouse, dbt_owned=table.expose_id in dbt_written)
+        _emit_grants(compiled, table, cid, privileges.get(table.full_name, {}))
+    _merge_jobs(
+        compiled,
+        compile_dbt_jobs(
+            contract,
+            compiled.tables,
+            warehouse,
+            validating=validating,
+            run_as_allowed=run_as_allowlist(env),
+        ),
+    )
+
+    # A grant applies to every Databricks expose, so its refusal (an unmapped
+    # principal, say) would otherwise be reported once per table.
+    unique: Dict[str, UnsupportedBindingError] = {}
+    for refusal in refusals:
+        unique.setdefault(f"{refusal.kind}:{refusal}", refusal)
+    compiled.refusals = list(unique.values())
+    return compiled
+
+
+def _resolve_tables(
+    compiled: _Compiled, exposures: Sequence[Tuple[int, Mapping[str, Any]]], *, validating: bool
+) -> List[_GrantTarget]:
+    """Resolve each Databricks expose into ``compiled.tables``; a grant target for every one."""
     targets: List[_GrantTarget] = []
     for index, exposure in exposures:
-        table = _resolve_table(index, exposure, refusals, validating=validating)
+        table = _resolve_table(index, exposure, compiled.refusals, validating=validating)
         if table is not None:
             compiled.tables.append(table)
         targets.append(
@@ -790,7 +885,11 @@ def _compile(
                 full_name=table.full_name if table is not None else None,
             )
         )
+    return targets
 
+
+def _warehouse(env: Mapping[str, str], refusals: List[UnsupportedBindingError]) -> str:
+    """``DATABRICKS_WAREHOUSE_ID``, or ``""`` and a refusal."""
     warehouse = str(env.get(WAREHOUSE_ENV) or "").strip()
     if not warehouse:
         refusals.append(
@@ -802,9 +901,14 @@ def _compile(
                 "DATABRICKS_HOST names (SQL Warehouses > the warehouse > Connection details).",
             )
         )
+    return warehouse
 
+
+def _refuse_duplicate_tables(
+    tables: Sequence[_Table], refusals: List[UnsupportedBindingError]
+) -> None:
     bound: Dict[str, str] = {}
-    for table in compiled.tables:
+    for table in tables:
         if table.full_name in bound:
             refusals.append(
                 _refusal(
@@ -816,82 +920,93 @@ def _compile(
             )
         bound.setdefault(table.full_name, table.where)
 
-    cid = safe_ident(contract.get("id") or contract.get("name") or "product")
-    privileges = _table_privileges(contract, targets, refusals)
-    for table in compiled.tables:
-        catalog_key = safe_ident(f"{cid}_{table.catalog}")
-        schema_key = safe_ident(f"{cid}_{table.catalog}_{table.schema}")
-        table_key = safe_ident(f"{cid}_{table.catalog}_{table.schema}_{table.name}")
 
-        compiled.data.setdefault("databricks_catalog", {})[catalog_key] = {"name": table.catalog}
-        schema_ref = tofu_ref(f"databricks_schema.{schema_key}.name")
-        if f"databricks_schema.{schema_key}" not in compiled.owners:
-            compiled.imports.append(
-                ImportBlock(f"databricks_schema.{schema_key}", f"{table.catalog}.{table.schema}")
-            )
-        _claim(
-            compiled,
-            "databricks_schema",
-            schema_key,
-            f"schema {table.catalog}.{table.schema}",
-            {
-                "catalog_name": tofu_ref(f"data.databricks_catalog.{catalog_key}.name"),
-                "name": table.schema,
-            },
+def _keys(cid: str, table: _Table) -> Tuple[str, str, str]:
+    """``(catalog, schema, table)`` resource keys of one table."""
+    return (
+        safe_ident(f"{cid}_{table.catalog}"),
+        safe_ident(f"{cid}_{table.catalog}_{table.schema}"),
+        safe_ident(f"{cid}_{table.catalog}_{table.schema}_{table.name}"),
+    )
+
+
+def _emit_table(
+    compiled: _Compiled, table: _Table, cid: str, warehouse: str, *, dbt_owned: bool
+) -> None:
+    """The catalog reference, the owned schema and the table, with their imports."""
+    catalog_key, schema_key, table_key = _keys(cid, table)
+    catalog_name = tofu_ref(f"data.databricks_catalog.{catalog_key}.name")
+    compiled.data.setdefault("databricks_catalog", {})[catalog_key] = {"name": table.catalog}
+    if f"databricks_schema.{schema_key}" not in compiled.owners:
+        compiled.imports.append(
+            ImportBlock(f"databricks_schema.{schema_key}", f"{table.catalog}.{table.schema}")
         )
-        body: Dict[str, Any] = {
-            "catalog_name": tofu_ref(f"data.databricks_catalog.{catalog_key}.name"),
-            "schema_name": schema_ref,
-            "name": table.name,
-            "table_type": "MANAGED",
-            "data_source_format": "DELTA",
-            "warehouse_id": warehouse,
-            "properties": {"delta.columnMapping.mode": "name"},
-            "column": [dict(column) for column in table.columns],
-        }
-        if table.partitions:
-            body["partitions"] = list(table.partitions)
-        _claim(compiled, "databricks_sql_table", table_key, f"table {table.full_name}", body)
-        # Imported before the first plan: the provider creates a managed Delta
-        # table with CREATE OR REPLACE, so a table that exists but is not in
-        # state would otherwise be replaced, and the plan would only show +1.
-        compiled.imports.append(ImportBlock(f"databricks_sql_table.{table_key}", table.full_name))
+    _claim(
+        compiled,
+        "databricks_schema",
+        schema_key,
+        f"schema {table.catalog}.{table.schema}",
+        {"catalog_name": catalog_name, "name": table.schema},
+    )
+    body: Dict[str, Any] = {
+        "catalog_name": catalog_name,
+        "schema_name": tofu_ref(f"databricks_schema.{schema_key}.name"),
+        "name": table.name,
+        "table_type": "MANAGED",
+        "data_source_format": "DELTA",
+        "warehouse_id": warehouse,
+        "column": [dict(column) for column in table.columns],
+    }
+    if dbt_owned:
+        # dbt's table materialization rebuilds it with CREATE OR REPLACE: the
+        # module creates it (its grants need it to exist) and leaves the rest to
+        # dbt, as the Snowflake emitter does (iac/providers/snowflake.py).
+        body["lifecycle"] = {"ignore_changes": list(_DBT_OWNED)}
+        compiled.dbt_written.append(table.full_name)
+    else:
+        body["properties"] = {COLUMN_MAPPING: "name"}
+    if table.partitions:
+        body["partitions"] = list(table.partitions)
+    _claim(compiled, "databricks_sql_table", table_key, f"table {table.full_name}", body)
+    # Imported before the first plan: the provider creates a managed Delta
+    # table with CREATE OR REPLACE, so a table that exists but is not in
+    # state would otherwise be replaced, and the plan would only show +1.
+    compiled.imports.append(ImportBlock(f"databricks_sql_table.{table_key}", table.full_name))
 
-        for principal, granted in sorted(privileges.get(table.full_name, {}).items()):
-            _claim(
-                compiled,
-                "databricks_grant",
-                f"{table_key}_{_principal_key(principal)}",
-                f"{principal!r} on table {table.full_name}",
-                {
-                    "table": tofu_ref(f"databricks_sql_table.{table_key}.id"),
-                    "principal": principal,
-                    "privileges": sorted(granted),
-                },
-            )
-            _claim(
-                compiled,
-                "databricks_grant",
-                f"{schema_key}_usage_{_principal_key(principal)}",
-                f"{principal!r} on schema {table.catalog}.{table.schema}",
-                {
-                    "schema": tofu_ref(f"databricks_schema.{schema_key}.id"),
-                    "principal": principal,
-                    "privileges": ["USE_SCHEMA"],
-                },
-            )
-            compiled.grants.append(("table", table.full_name, principal, sorted(granted)))
-            compiled.grants.append(
-                ("schema", f"{table.catalog}.{table.schema}", principal, ["USE_SCHEMA"])
-            )
 
-    # A grant applies to every Databricks expose, so its refusal (an unmapped
-    # principal, say) would otherwise be reported once per table.
-    unique: Dict[str, UnsupportedBindingError] = {}
-    for refusal in refusals:
-        unique.setdefault(f"{refusal.kind}:{refusal}", refusal)
-    compiled.refusals = list(unique.values())
-    return compiled
+def _emit_grants(
+    compiled: _Compiled, table: _Table, cid: str, privileges: Mapping[str, set]
+) -> None:
+    """Each principal's privileges on the table, and USE_SCHEMA on its schema."""
+    _catalog_key, schema_key, table_key = _keys(cid, table)
+    on_table = ("table", table.full_name, tofu_ref(f"databricks_sql_table.{table_key}.id"))
+    on_schema = (
+        "schema",
+        f"{table.catalog}.{table.schema}",
+        tofu_ref(f"databricks_schema.{schema_key}.id"),
+    )
+    for principal, granted in sorted(privileges.items()):
+        _claim_grant(
+            compiled, f"{table_key}_{unique_ident(principal)}", on_table, principal, sorted(granted)
+        )
+        _claim_grant(
+            compiled,
+            f"{schema_key}_usage_{unique_ident(principal)}",
+            on_schema,
+            principal,
+            ["USE_SCHEMA"],
+        )
+
+
+def _merge_jobs(compiled: _Compiled, jobs: CompiledJobs) -> None:
+    """The dbt jobs' resources, data sources, refusals and warnings, into ``compiled``."""
+    compiled.refusals.extend(jobs.refusals)
+    compiled.warnings.extend(jobs.warnings)
+    compiled.jobs = jobs.jobs
+    for rtype, key, owner, body in jobs.resources:
+        _claim(compiled, rtype, key, owner, body)
+    for dtype, entries in jobs.data.items():
+        compiled.data.setdefault(dtype, {}).update(entries)
 
 
 def _columns_of(values: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -937,6 +1052,12 @@ def column_reorder(
     return (live, declared) if live != declared else None
 
 
+def _norm_type(value: Any) -> str:
+    """A column type as the provider compares two of them (``columnTypeAliases``)."""
+    text = _canonical_type(str(value or "").replace("`", "").lower())
+    return _PROVIDER_TYPE_ALIASES.get(text, text)
+
+
 def _changed_columns(
     live: Sequence[Mapping[str, Any]], declared: Sequence[Mapping[str, Any]]
 ) -> List[str]:
@@ -947,10 +1068,6 @@ def _changed_columns(
     """
     from ...engines.dbt import _types as dbt_types
 
-    def norm(value: Any) -> str:
-        text = str(value or "").replace("`", "").lower()
-        return _PROVIDER_TYPE_ALIASES.get(text, text)
-
     if len(live) == len(declared):
         pairs = list(zip(live, declared, strict=True))
     else:
@@ -958,10 +1075,8 @@ def _changed_columns(
         pairs = [(c, by_name[str(c.get("name"))]) for c in live if str(c.get("name")) in by_name]
     out = []
     for old, new in pairs:
-        old_type = norm(old.get("type"))
-        new_type = norm(
-            _canonical_type(dbt_types.sql_type(str(new.get("type") or ""), "databricks"))
-        )
+        old_type = _norm_type(old.get("type"))
+        new_type = _norm_type(dbt_types.sql_type(str(new.get("type") or ""), "databricks"))
         if old_type != new_type:
             out.append(f"{new['name']}: {old_type} in the live table, {new_type} in the contract")
         if bool(old.get("nullable", True)) != bool(new.get("nullable", True)):
@@ -969,6 +1084,113 @@ def _changed_columns(
             want_null = "nullable" if new.get("nullable", True) else "NOT NULL"
             out.append(f"{new['name']}: {live_null} in the live table, {want_null} in the contract")
     return out
+
+
+def _quoted(full_name: str) -> str:
+    """``catalog.schema.table`` as backtick-quoted SQL, for a fix-it to copy."""
+    return ".".join(f"`{part.replace('`', '``')}`" for part in full_name.split("."))
+
+
+def _refuse_protocol_upgrade(
+    table: str, before: Mapping[str, Any], after: Mapping[str, Any]
+) -> None:
+    """Refuse an update that would turn on column mapping for an existing table.
+
+    The module sets ``delta.columnMapping.mode=name`` on every table it owns, so
+    on a table adopted without it the plan's first change is that property, and
+    the provider's ``ALTER TABLE ... SET TBLPROPERTIES`` upgrades the table's
+    Delta protocol to one with the column-mapping feature: older Delta readers
+    and some external engines then cannot read it, and unsetting the property
+    does not undo it. That is the table owner's call, so the apply stops and
+    says how to make it, whatever flag is passed.
+    """
+    wanted = (after.get("properties") or {}).get(COLUMN_MAPPING)
+    live = (before.get("properties") or {}).get(COLUMN_MAPPING) or (
+        before.get("effective_properties") or {}
+    ).get(COLUMN_MAPPING)
+    if wanted != "name" or live == "name":
+        return
+    raise _refusal(
+        "adopt-protocol-upgrade",
+        f"{table} exists without column mapping, and taking it over would set "
+        f"{COLUMN_MAPPING}=name: a Delta protocol upgrade that older Delta readers and some "
+        "external engines cannot read, and that unsetting the property does not undo.",
+        "If every reader of the table can read column mapping, run in Databricks: ALTER TABLE "
+        f"{_quoted(table)} SET TBLPROPERTIES ('{COLUMN_MAPPING}' = 'name'), then re-run "
+        "fluid apply.",
+        "Otherwise leave this table out of the contract, or let a dbt build write it (the "
+        "module then leaves its definition to dbt and sets no column mapping).",
+    )
+
+
+def _dbt_column_drift(
+    compiled: _Compiled, prior_resources: Iterable[Mapping[str, Any]]
+) -> List[Dict[str, Any]]:
+    """One record per table a dbt build writes whose live columns drifted.
+
+    ``prior_resources`` is the refreshed pre-apply state; each table's
+    ``values.column`` is what Databricks holds after dbt's last run. Types
+    compare as the provider normalises them.
+    """
+    declared = {
+        table.full_name: table.columns
+        for table in compiled.tables
+        if table.full_name in compiled.dbt_written
+    }
+    records: List[Dict[str, Any]] = []
+    for resource in prior_resources:
+        if resource.get("type") != "databricks_sql_table":
+            continue
+        values = resource.get("values") or {}
+        full = ".".join(
+            str(values.get(key) or "").lower() for key in ("catalog_name", "schema_name", "name")
+        )
+        if full not in declared:
+            continue
+        live = {str(c.get("name")).lower(): _norm_type(c.get("type")) for c in _columns_of(values)}
+        want = {c["name"]: _norm_type(c["type"]) for c in declared[full]}
+        record = {
+            "table": full,
+            "type_mismatches": [
+                {"column": name, "declared": want[name], "live": live[name]}
+                for name in want
+                if name in live and live[name] != want[name]
+            ],
+            "missing": [name for name in want if name not in live],
+            "extra": [name for name in live if name not in want],
+        }
+        if record["type_mismatches"] or record["missing"] or record["extra"]:
+            records.append(record)
+    return records
+
+
+def _use_catalog_notices(compiled: _Compiled) -> List[str]:
+    """Who needs ``USE CATALOG`` on each catalog, and the GRANT its owner runs.
+
+    A reader of a table needs it on the table's catalog, which the product
+    references and does not own, so the module never grants it: a
+    ``databricks_grant`` is authoritative for its principal, and would revoke
+    that principal's other privileges on the catalog, for every product in it.
+    ``fluid verify`` checks it.
+    """
+    readers: Dict[str, List[str]] = {}
+    for kind, full_name, principal, _privileges in compiled.grants:
+        if kind == "table":
+            catalog = full_name.split(".")[0]
+            if principal not in readers.setdefault(catalog, []):
+                readers[catalog].append(principal)
+    notices = []
+    for catalog, principals in sorted(readers.items()):
+        grants = "; ".join(
+            f"GRANT USE CATALOG ON CATALOG {_quoted(catalog)} TO `{p.replace('`', '``')}`"
+            for p in sorted(principals)
+        )
+        notices.append(
+            f"{', '.join(sorted(principals))} also need USE CATALOG on catalog {catalog}, "
+            f"which forge-cli never grants (the catalog is not the product's). Its owner "
+            f"runs: {grants}. fluid verify checks it."
+        )
+    return notices
 
 
 class DatabricksIacPlugin:
@@ -981,6 +1203,7 @@ class DatabricksIacPlugin:
         "DATABRICKS_TOKEN",
         "DATABRICKS_CLIENT_ID",
         "DATABRICKS_CLIENT_SECRET",
+        "DATABRICKS_CONFIG_PROFILE",
     )
     #: The committed lock ``tofu init`` verifies the provider against
     #: (``iac/module.py::dependency_lock``).
@@ -1004,10 +1227,10 @@ class DatabricksIacPlugin:
         return _compile(contract, os.environ).data
 
     def credential_env(self, env: Mapping[str, str]) -> Dict[str, str]:
-        # The provider reads DATABRICKS_HOST / DATABRICKS_TOKEN / the OAuth client
-        # pair itself. What it may also read (~/.databrickscfg, the auth type) is
-        # not narrowed yet.
-        return {}
+        """Pin the credential the provider uses (``databricks_auth.py``): the
+        environment's, or the one profile ``DATABRICKS_CONFIG_PROFILE`` names for
+        ``DATABRICKS_HOST``; never a DEFAULT profile it happens to find."""
+        return tofu_env_overlay(env)
 
     def discover_imports(
         self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()
@@ -1040,6 +1263,7 @@ class DatabricksIacPlugin:
             table = ".".join(
                 str(before.get(key) or "") for key in ("catalog_name", "schema_name", "name")
             )
+            _refuse_protocol_upgrade(table, before, after)
             if (detail.get("after_unknown") or {}).get("column") is True:
                 lost.append(
                     f"{table}: the planned column list is unknown, so a drop cannot be ruled out"
@@ -1066,6 +1290,17 @@ class DatabricksIacPlugin:
                     f"stay under {new}"
                 )
         return lost
+
+    def suppressed_drift(
+        self, contract: Mapping[str, Any], prior_resources: Iterable[Mapping[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Column drift on the tables a dbt build writes, which ``ignore_changes``
+        hides, in the shape the engine reports (``_report_suppressed_drift``)."""
+        return _dbt_column_drift(_compile(contract, os.environ), prior_resources)
+
+    def plan_notices(self, contract: Mapping[str, Any]) -> List[str]:
+        """What the apply cannot do itself and someone must: ``USE CATALOG``."""
+        return _use_catalog_notices(_compile(contract, os.environ))
 
     def explain_plan_failure(
         self,
@@ -1177,6 +1412,33 @@ class DatabricksIacPlugin:
         return out
 
 
+def _job_actions(jobs: Sequence[DbtJob]) -> List[Dict[str, Any]]:
+    """Plan actions for the dbt jobs and the project files they upload."""
+    actions: List[Dict[str, Any]] = []
+    for job in jobs:
+        actions.append(
+            {
+                "op": "databricks.job.ensure",
+                "resource_type": "databricks_job",
+                "resource_id": job.name,
+                "build": job.build_id,
+                "source": job.source,
+                "trigger": job.trigger,
+            }
+        )
+        actions.extend(
+            {
+                "op": "databricks.workspace_file.ensure",
+                "resource_type": "databricks_workspace_file",
+                # Under the applying identity's home, which only the apply knows.
+                "resource_id": f"~{job.root}/{rel}",
+                "build": job.build_id,
+            }
+            for rel in job.files
+        )
+    return actions
+
+
 def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """The objects the module manages, as plan actions, for the native planner.
 
@@ -1229,6 +1491,7 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "privileges": list(privileges),
             }
         )
+    actions.extend(_job_actions(compiled.jobs))
     unique: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for action in actions:
         unique.setdefault((action["resource_type"], action["resource_id"]), action)
@@ -1246,13 +1509,59 @@ def validate_databricks_binding(
     """
     compiled = _compile(contract, os.environ if env is None else env, validating=True)
     errors = [f"{exc} {' '.join(exc.remediation)}".strip() for exc in compiled.refusals]
-    return errors, _scale_zero_warnings(compiled.tables)
+    return errors, _scale_zero_warnings(compiled.tables) + compiled.warnings
+
+
+@dataclass(frozen=True)
+class ManagedTable:
+    """A table the module manages, as ``fluid verify`` checks it."""
+
+    expose_id: str
+    full_name: str
+    #: ``{name, type, nullable}`` in contract order; types as the provider compares them.
+    columns: Tuple[Dict[str, Any], ...]
+    #: Principals granted a privilege on it, who need USE CATALOG on its catalog.
+    readers: Tuple[str, ...]
+    #: Written by a dbt build: the module ignores its column drift, verify gates it.
+    dbt_written: bool
+
+
+def managed_objects(
+    contract: Mapping[str, Any], env: Optional[Mapping[str, str]] = None
+) -> Tuple[List[ManagedTable], List[DbtJob]]:
+    """``(tables, jobs)`` the module manages for ``contract``, from the emitter's own
+    pass, so ``fluid verify`` checks exactly what ``fluid apply`` provisions."""
+    compiled = _compile(contract, os.environ if env is None else env, validating=True)
+    readers: Dict[str, List[str]] = {}
+    for kind, full_name, principal, _privileges in compiled.grants:
+        if kind == "table" and principal not in readers.setdefault(full_name, []):
+            readers[full_name].append(principal)
+    tables = [
+        ManagedTable(
+            expose_id=table.expose_id,
+            full_name=table.full_name,
+            columns=tuple(
+                {**column, "type": _norm_type(column["type"])} for column in table.columns
+            ),
+            readers=tuple(readers.get(table.full_name, ())),
+            dbt_written=table.full_name in compiled.dbt_written,
+        )
+        for table in compiled.tables
+    ]
+    return tables, list(compiled.jobs)
 
 
 __all__ = [
+    "COLUMN_MAPPING",
     "RETRY_TIMEOUT_SECONDS",
     "WAREHOUSE_ENV",
     "DatabricksIacPlugin",
+    "ManagedTable",
     "column_changes",
+    "managed_objects",
+    "normalize_column_type",
     "validate_databricks_binding",
 ]
+
+#: How the provider compares two column types, for a live type ``fluid verify`` reads.
+normalize_column_type = _norm_type

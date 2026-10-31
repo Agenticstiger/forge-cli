@@ -72,7 +72,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fluid_build.build_runners._ids import IdentifierViolation, validate_identifier
 from fluid_build.providers.common.codegen_utils import py_str_literal
-from fluid_build.util.contract import is_externally_run_build
+from fluid_build.util.contract import is_unscheduled_build
 
 #: Engine used for a scheduled build when the contract names none.
 DEFAULT_ENGINE = "airflow"
@@ -243,9 +243,10 @@ class ScheduledBuild:
 
 def _trigger_schedule(build: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The build's cron trigger, or ``None`` when Airflow should not schedule it."""
-    # A Flink job runs on its own platform: a DAG that runs ``fluid apply`` for
-    # it would run nothing and pass.
-    if is_externally_run_build(build):
+    # A Flink job runs on its own platform, and a dbt build on Databricks on its
+    # job's own trigger: a DAG that runs ``fluid apply`` for either would run
+    # nothing and pass. Nor does a continuous build need one.
+    if is_unscheduled_build(build):
         return None
     execution = build.get("execution")
     if not isinstance(execution, dict):

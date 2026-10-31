@@ -448,6 +448,72 @@ def test_emitted_tfjson_passes_tofu_validate(cloud, tmp_path, monkeypatch):
     assert validate.returncode == 0, validate.stderr or validate.stdout
 
 
+#: A dbt build that runs on Databricks, both sources: a serverless job with every
+#: setting the emitter maps, its local project uploaded as workspace files (or
+#: cloned from a Git tag), and the table it writes left to dbt (ignore_changes).
+_DATABRICKS_JOB_BUILDS = {
+    "git": {
+        "repository": "https://github.com/example-org/orders-dbt?tag=v1.2.0&path=transform",
+        "properties": {"model": "orders", "vars": {"run_date": "today"}},
+        "execution": {
+            "trigger": {"type": "schedule", "cron": "0 2 * * 1-5", "timezone": "Europe/Zurich"},
+            "runtime": {
+                "platform": "databricks",
+                "timeout": "2h",
+                "serviceAccount": "6f5c4e3d-2b1a-4c9d-8e7f-0a1b2c3d4e5f",
+            },
+            "retries": {"maxAttempts": 3, "initialDelay": "5m"},
+            "notifications": [{"type": "email", "target": "data@example.com"}],
+        },
+    },
+    "workspace": {
+        "repository": "./dbt",
+        "properties": {"model": "orders"},
+        "execution": {"trigger": {"type": "continuous"}, "runtime": {"platform": "databricks"}},
+    },
+}
+
+
+@pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
+@pytest.mark.parametrize("source", sorted(_DATABRICKS_JOB_BUILDS))
+def test_a_databricks_dbt_job_passes_tofu_validate(source, tmp_path, monkeypatch):
+    from fluid_build.iac.source import contract_source
+
+    monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", "wh-validate-only")
+    # The GIT job runs as a service principal, which the operator must list.
+    monkeypatch.setenv("FLUID_DATABRICKS_RUN_AS_ALLOWLIST", "6f5c4e3d-2b1a-4c9d-8e7f-0a1b2c3d4e5f")
+    project = tmp_path / "dbt"
+    (project / "models").mkdir(parents=True)
+    (project / "dbt_project.yml").write_text("name: orders\nversion: '1.0'\n")
+    (project / "models" / "orders.sql").write_text("select 1 as id\n")
+    contract = json.loads(json.dumps(_SAMPLE_CONTRACTS["databricks"]))
+    contract["builds"] = [
+        {
+            "id": "dbt_daily",
+            "engine": "dbt",
+            "outputs": ["orders"],
+            **_DATABRICKS_JOB_BUILDS[source],
+        }
+    ]
+    plugin = IAC_PLUGINS["databricks"]
+    with contract_source(tmp_path / "contract.fluid.yaml"):
+        text = build_module(plugin, contract)
+    resources = json.loads(text)["resource"]
+    assert list(resources["databricks_job"]) == ["demo_databricks_orders_dbt_daily"]
+    assert bool(resources.get("databricks_workspace_file")) is (source == "workspace")
+
+    (tmp_path / "main.tf.json").write_text(text)
+    write_dependency_lock(plugin, tmp_path)
+    _tofu_init_or_skip(tmp_path)
+    validate = subprocess.run(
+        [_TOFU, "validate", "-no-color"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert validate.returncode == 0, validate.stderr or validate.stdout
+
+
 # Per-cloud cross-account / cross-project shapes. Stage 1 unit tests
 # pin the dict; this pins the *.tf.json against the real ``tofu``
 # binary — catches any provider-schema mismatch in the new

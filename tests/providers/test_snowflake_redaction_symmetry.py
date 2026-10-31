@@ -256,3 +256,100 @@ class TestProviderKeyPatternSymmetry:
         assert named, "expected a named-group assignment pattern in SENSITIVE_PATTERNS"
         for pat in named:
             assert "sep" in pat.groupindex, f"named pattern missing 'sep' group: {pat.pattern!r}"
+
+
+def _databricks_pat(suffix: str = "") -> str:
+    # Built at runtime so no literal token-shaped string sits in the source
+    # (GitHub push protection).
+    return "dapi" + "0123456789abcdef" * 2 + suffix
+
+
+class TestDatabricksSymmetry:
+    """Databricks credentials must be masked identically by both layers.
+
+    PAT regex vendored from gitleaks ``databricks-api-token``. OAuth client
+    secrets have no public format, so they are covered by key name only.
+    """
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "token {t} used",
+            "{t}",
+            "Authorization: Bearer {t}",
+            "GET https://adb-1.azuredatabricks.net/api?t={t} 200",
+        ],
+    )
+    @pytest.mark.parametrize("suffix", ["", "-2"])
+    def test_both_layers_mask_pat(self, template: str, suffix: str) -> None:
+        pat = _databricks_pat(suffix)
+        line = template.format(t=pat)
+        assert pat not in redact_secret_text(line)
+        assert pat not in redact_string(line)
+        assert "dapi0123456789abcdef" not in redact_secret_text(line)
+        assert "dapi0123456789abcdef" not in redact_string(line)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "dapi0123",
+            "see dapi and more",
+            "dapi" + "0123456789abcdef",  # 16 hex: too short for a PAT
+        ],
+    )
+    def test_lookalikes_left_alone(self, line: str) -> None:
+        assert redact_secret_text(line) == line
+        assert redact_string(line) == line
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "x_{t}",  # after a word character
+            "token%3D{t}",  # URL-encoded after '='
+            "{t}0",  # followed by more hex
+        ],
+    )
+    def test_both_layers_mask_pat_without_boundaries(self, template: str) -> None:
+        # Unlike gitleaks' rule, no boundary is required: a log line that
+        # over-redacts costs nothing, a token glued to other text would leak.
+        line = template.format(t=_databricks_pat())
+        assert "0123456789abcdef" * 2 not in redact_secret_text(line)
+        assert "0123456789abcdef" * 2 not in redact_string(line)
+
+    def test_both_layers_mask_an_uppercase_pat(self) -> None:
+        pat = "dapi" + "0123456789ABCDEF" * 2
+        assert pat not in redact_secret_text(f"token {pat}")
+        assert pat not in redact_string(f"token {pat}")
+
+    @pytest.mark.parametrize(
+        "name",
+        ["DATABRICKS_TOKEN", "DATABRICKS_CLIENT_SECRET", "DATABRICKS_PASSWORD", "client_secret"],
+    )
+    @pytest.mark.parametrize("sep", ["=", ": "])
+    def test_both_layers_mask_assignments(self, name: str, sep: str) -> None:
+        line = f"{name}{sep}s3cr3t-value-xyz"
+        assert "s3cr3t-value-xyz" not in redact_secret_text(line)
+        assert "s3cr3t-value-xyz" not in redact_string(line)
+        assert redact_secret_text(line).startswith(name)
+        assert redact_string(line).startswith(name)
+
+    @pytest.mark.parametrize(
+        "name",
+        ["DATABRICKS_TOKEN", "DATABRICKS_CLIENT_SECRET", "DATABRICKS_PASSWORD", "client_secret"],
+    )
+    def test_both_layers_mask_json_text(self, name: str) -> None:
+        line = '{"%s": "s3cr3t-value-xyz"}' % name
+        assert "s3cr3t-value-xyz" not in redact_secret_text(line)
+        assert "s3cr3t-value-xyz" not in redact_string(line)
+
+    def test_dict_keys_masked(self) -> None:
+        data = {
+            "client_secret": "v1",  # pragma: allowlist secret
+            "DATABRICKS_TOKEN": "v2",
+            "DATABRICKS_CLIENT_SECRET": "v3",  # pragma: allowlist secret
+            "DATABRICKS_PASSWORD": "v4",  # pragma: allowlist secret
+            "host": "keep-me",
+        }
+        out = redact_dict(data)
+        assert [out[k] for k in list(data)[:4]] == ["[REDACTED]"] * 4
+        assert out["host"] == "keep-me"

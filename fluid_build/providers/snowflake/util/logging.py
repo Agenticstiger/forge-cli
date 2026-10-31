@@ -77,6 +77,10 @@ SENSITIVE_PATTERNS = [
     re.compile(r'"api[_-]?key":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"client_secret":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"passphrase":\s*"[^"]*"', re.IGNORECASE),
+    # Databricks env-style keys as JSON text (the bare ``NAME=value`` / ``NAME: value``
+    # forms are caught by the assignment pattern below; the global layer's
+    # assignment regex also handles the quoted-key form).
+    re.compile(r'"databricks_(?:token|client_secret|password)":\s*"[^"]*"', re.IGNORECASE),
     # Bare key:value / key=value assignments — both separators.
     # Named groups so ``redact_string`` keeps the key name + separator and
     # redacts only the value (``password=hunter2`` -> ``password=[REDACTED]``)
@@ -158,6 +162,11 @@ SENSITIVE_PATTERNS = [
     re.compile(r"\bvc_[A-Za-z0-9]{20,}"),  # Vercel
     re.compile(r"\btvly-[A-Za-z0-9_-]{16,}"),  # Tavily (incl. tvly-dev-…) search key
     re.compile(r"\bBSA[A-Za-z0-9_-]{20,}"),  # Brave Search subscription token
+    # Databricks PAT: gitleaks' (MIT) ``databricks-api-token`` regex, without its
+    # word boundaries and case: a token after ``_`` or URL-encoded after ``%3D``
+    # would leak, and redacting a look-alike costs nothing. OAuth client secrets
+    # have no public format: key-name coverage only.
+    re.compile(r"dapi[a-fA-F0-9]{32}(?:-\d)?"),
     # Fernet token — URL-safe base64 with the fixed ``gAAAAA`` header.
     re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}"),
     # PEM private-key block (RSA / EC / OPENSSH / DSA / bare PKCS#8 ...).

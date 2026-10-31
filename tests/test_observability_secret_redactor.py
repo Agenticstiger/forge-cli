@@ -623,7 +623,7 @@ class TestGlobalRedactionSymmetryGaps:
         out = redact_value(
             {
                 "conn_str": "Driver={ODBC};Server=h;Pwd=topsecretpw;",
-                "connection_url": "jdbc:pg://user:topsecretpw@host/db",
+                "connection_url": "jdbc:pg://user:topsecretpw@host/db",  # pragma: allowlist secret
             }
         )
         assert out["conn_str"] == "***REDACTED***"
@@ -660,3 +660,41 @@ class TestGlobalRedactionSymmetryGaps:
             sv = redact_dict({key: "leaked-value-here"})
             assert gv[key] == "***REDACTED***"
             assert sv[key] == "[REDACTED]"
+
+
+class TestDatabricksCredentials:
+    """Databricks PAT (gitleaks ``databricks-api-token``) + key-name coverage."""
+
+    @staticmethod
+    def _pat(suffix: str = "") -> str:
+        return "dapi" + "0123456789abcdef" * 2 + suffix  # runtime-built: push protection
+
+    @pytest.mark.parametrize("suffix", ["", "-3"])
+    def test_pat_masked(self, suffix: str) -> None:
+        from fluid_build.observability.secret_redactor import redact_secret_text
+
+        pat = self._pat(suffix)
+        out = redact_secret_text(f"host auth {pat} ok")
+        assert pat not in out
+        assert "dapi0123" not in out
+
+    @pytest.mark.parametrize("line", ["dapi0123", "dapi" + "0123456789abcdef"])
+    def test_lookalike_untouched(self, line: str) -> None:
+        from fluid_build.observability.secret_redactor import redact_secret_text
+
+        assert redact_secret_text(line) == line
+
+    @pytest.mark.parametrize(
+        "name",
+        ["DATABRICKS_TOKEN", "DATABRICKS_CLIENT_SECRET", "DATABRICKS_PASSWORD", "client_secret"],
+    )
+    def test_key_names_masked(self, name: str) -> None:
+        from fluid_build.observability.secret_redactor import (
+            is_sensitive_key_name,
+            redact_secret_text,
+        )
+
+        assert is_sensitive_key_name(name)
+        assert "v4lue-xyz" not in redact_secret_text(f"{name}=v4lue-xyz")
+        assert "v4lue-xyz" not in redact_secret_text(f"{name}: v4lue-xyz")
+        assert "v4lue-xyz" not in redact_secret_text('{"%s": "v4lue-xyz"}' % name)

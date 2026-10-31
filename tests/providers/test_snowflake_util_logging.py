@@ -126,7 +126,7 @@ class TestSnowflakeRedactionSymmetryGaps:
 
     def test_eyj_anchored_jwt_still_masked(self) -> None:
         # The tighter eyJ-anchored patterns must still win (positioned first).
-        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMSJ9.c2lnbmF0dXJlSGVyZQ"
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMSJ9.c2lnbmF0dXJlSGVyZQ"  # pragma: allowlist secret
         assert jwt not in redact_string(f"bearer {jwt}")
 
     def test_short_dotted_identifiers_not_over_redacted(self) -> None:
@@ -140,7 +140,7 @@ class TestSnowflakeRedactionSymmetryGaps:
         # bare-assignment alternation (to protect multiline PEMs), so a bare
         # non-PEM ``private_key=<value>`` had no matcher until the dedicated
         # after-PEM pattern was added.
-        value = "MIIEvQIBADANBgkqhkiNONPEMVALUE0123456789"
+        value = "MIIEvQIBADANBgkqhkiNONPEMVALUE0123456789"  # pragma: allowlist secret
         out = redact_string(f"private_key={value}")
         assert value not in out
         assert out.startswith("private_key=")  # key name preserved
@@ -157,13 +157,13 @@ class TestSnowflakeRedactionSymmetryGaps:
         # consumed by the PEM pattern first — the base64 body must NOT leak,
         # and the bare pattern must not bite into the PEM body.
         pem = (
-            "-----BEGIN RSA PRIVATE KEY-----\n"
-            "MIIEvQIBADANBgkqPEMBODYMUSTVANISH0123456789\n"
-            "abcdefghijklmnopqrstuvwxyz9876543210ABCDEF\n"
+            "-----BEGIN RSA PRIVATE KEY-----\n"  # pragma: allowlist secret
+            "MIIEvQIBADANBgkqPEMBODYMUSTVANISH0123456789\n"  # pragma: allowlist secret
+            "abcdefghijklmnopqrstuvwxyz9876543210ABCDEF\n"  # pragma: allowlist secret
             "-----END RSA PRIVATE KEY-----"
         )
         out = redact_string(f"private_key={pem}")
-        assert "PEMBODYMUSTVANISH0123456789" not in out
+        assert "PEMBODYMUSTVANISH0123456789" not in out  # pragma: allowlist secret
         assert "MIIEvQIBADANBgkq" not in out
         assert "[REDACTED]" in out
 
@@ -180,7 +180,30 @@ class TestSnowflakeRedactionSymmetryGaps:
         assert jwt not in redact_string(f"t {jwt} x")
         assert jwt not in redact_secret_text(f"t {jwt} x")
 
-        value = "MIIEvQIBADANBgkqhkiNONPEMVALUE0123456789"
+        value = "MIIEvQIBADANBgkqhkiNONPEMVALUE0123456789"  # pragma: allowlist secret
         line = f"private_key={value}"
         assert value not in redact_string(line)
         assert value not in redact_secret_text(line)
+
+
+class TestDatabricksRedaction:
+    def test_pat_masked_with_and_without_suffix(self) -> None:
+        # Runtime-built so no literal token sits in the source (push protection).
+        for suffix in ("", "-2"):
+            pat = "dapi" + "0123456789abcdef" * 2 + suffix
+            assert pat not in redact_string(f"Authorization: Bearer {pat}")
+            assert pat not in redact_string(f"tok {pat} end")
+
+    def test_pat_lookalikes_untouched(self) -> None:
+        for line in ("dapi0123", "dapi" + "0123456789abcdef"):
+            assert redact_string(line) == line
+
+    def test_key_names_masked_in_text_and_dict(self) -> None:
+        for name in ("DATABRICKS_TOKEN", "DATABRICKS_CLIENT_SECRET", "DATABRICKS_PASSWORD"):
+            assert redact_string(f"{name}=abc123") == f"{name}=[REDACTED]"
+            assert "abc123" not in redact_string('{"%s": "abc123"}' % name)
+            assert redact_dict({name: "abc123"})[name] == "[REDACTED]"
+        assert (
+            redact_dict({"client_secret": "abc123"})["client_secret"]  # pragma: allowlist secret
+            == "[REDACTED]"
+        )

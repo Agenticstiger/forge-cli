@@ -175,7 +175,11 @@ def _check(contract: Mapping[str, Any], args: Any, logger: logging.Logger) -> St
         runner.require_tofu_version()
     except runner.TofuVersionError as exc:
         return _not_checked(str(exc), state=target.location)
-    return _plan_and_classify(plugin, resolved, target, logger)
+    from fluid_build.iac.source import contract_source, source_contract_file
+
+    # The contract's file, for a plugin that ships a build's local files.
+    with contract_source(source_contract_file(getattr(args, "contract", None))):
+        return _plan_and_classify(plugin, resolved, target, logger)
 
 
 def _plan_and_classify(
@@ -189,6 +193,7 @@ def _plan_and_classify(
         _guard_region_move,
         _reconcile_with_state,
         _tail,
+        credential_overlay,
         emit_module,
         read_target,
         recorded_legacy_backend,
@@ -209,7 +214,10 @@ def _plan_and_classify(
         write_dependency_lock(plugin, workdir)
 
         env = build_tofu_env()
-        env.update(plugin.credential_env(env))
+        try:
+            env.update(credential_overlay(plugin, env))
+        except CLIError as exc:
+            return _error(_cli_error_text(exc), location)
         init = runner.tofu_init(
             str(workdir),
             backend=target.backend is not None,

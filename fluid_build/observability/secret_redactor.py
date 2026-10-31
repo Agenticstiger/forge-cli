@@ -133,6 +133,11 @@ _PROVIDER_KEY_RES = (
     re.compile(r"\bvc_[A-Za-z0-9]{20,}"),  # Vercel
     re.compile(r"\btvly-[A-Za-z0-9_-]{16,}"),  # Tavily (incl. tvly-dev-…) search key
     re.compile(r"\bBSA[A-Za-z0-9_-]{20,}"),  # Brave Search subscription token
+    # Databricks PAT: gitleaks' (MIT) ``databricks-api-token`` regex, without its
+    # word boundaries and case: a token after ``_`` or URL-encoded after ``%3D``
+    # would leak, and redacting a look-alike costs nothing. OAuth client secrets
+    # have no public format: key-name coverage only.
+    re.compile(r"dapi[a-fA-F0-9]{32}(?:-\d)?"),
 )
 # Fernet token — URL-safe base64 starting with the fixed ``gAAAAA`` header
 # emitted by ``cryptography.fernet`` (version byte 0x80 + timestamp).

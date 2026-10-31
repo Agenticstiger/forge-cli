@@ -61,11 +61,16 @@ def transformation_builds(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     Excludes inline-SQL builds: an ``engine: dbt`` build that carries
     ``properties.sql`` runs through the local DuckDB engine, not dbt (see
     ``build_runners/base.py``), so it never produces a ``run_results.json``.
+    Excludes a dbt build that runs as a Databricks job too: dbt runs in the
+    workspace, and its run results stay with the job's runs there.
     """
     from fluid_build.build_runners.base import is_dbt_build, is_embedded_sql_build
+    from fluid_build.util.contract import is_databricks_job_build
 
     return [
-        b for b in contract.get("builds", []) if is_dbt_build(b) and not is_embedded_sql_build(b)
+        b
+        for b in contract.get("builds", [])
+        if is_dbt_build(b) and not is_embedded_sql_build(b) and not is_databricks_job_build(b)
     ]
 
 

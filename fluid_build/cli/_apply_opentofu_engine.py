@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -46,6 +46,7 @@ from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.credentials import build_tofu_env, credential_report
 from fluid_build.iac.module import write_dependency_lock
 from fluid_build.iac.naming import safe_ident
+from fluid_build.iac.source import contract_source, source_contract_file
 from fluid_build.iac.state_migration import (
     PENDING,
     StateMigrationError,
@@ -72,7 +73,15 @@ def apply_via_opentofu(
     resolved here) and the file is not re-read, so a source changed after
     the gate cannot reach ``tofu`` unvalidated. Without it the contract is
     loaded from ``args.contract``.
+
+    Every compile of the run sees the contract's file (``iac/source.py``), so a
+    plugin that ships a build's local files finds them as the runners do.
     """
+    with contract_source(source_contract_file(getattr(args, "contract", None))):
+        return _apply_via_opentofu(args, logger, contract)
+
+
+def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping[str, Any]]) -> int:
     # Plan-binding verification — must run BEFORE any tofu apply so a
     # tampered plan.json is rejected before infra changes. The native
     # apply path (cli/apply.py::_verify_plan_digests) had this gate; the
@@ -147,7 +156,7 @@ def apply_via_opentofu(
     write_dependency_lock(plugin, workdir)
 
     env = build_tofu_env()
-    env.update(plugin.credential_env(env))
+    env.update(credential_overlay(plugin, env))
     present, _absent = credential_report(plugin, env)
 
     cprint(f"\nOpenTofu engine — provider: {provider}")
@@ -234,46 +243,58 @@ def apply_via_opentofu(
     # DESTROY (iac/catalog_moves.py).
     _guard_catalog_moves(plugin, contract, provider, str(workdir), env, logger, actions=actions)
 
-    _adopt_existing(plugin, contract, actions, str(workdir), env, logger)
+    # What this run imports stays in state only once its ``tofu apply`` starts
+    # (:func:`_imports_kept_only_by_an_apply`).
+    with _imports_kept_only_by_an_apply(str(workdir), env, logger) as imported:
+        _adopt_existing(plugin, contract, actions, str(workdir), env, logger, imported.addresses)
 
-    plan = runner.tofu_plan(str(workdir), env=env)
-    if not plan.ok:
-        raise _plan_failure(plugin, contract, plan, str(workdir), env)
-    changes = runner.change_summary(plan)
-    cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
-    if report is not None:
-        report.record_infra(
-            planned=changes,
-            applied=None,
-            resources=_module_addresses(module),
-            dry_run=bool(getattr(args, "dry_run", False)),
-        )
+        plan = runner.tofu_plan(str(workdir), env=env)
+        if not plan.ok:
+            raise _plan_failure(plugin, contract, plan, str(workdir), env)
+        changes = runner.change_summary(plan)
+        cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
+        if report is not None:
+            report.record_infra(
+                planned=changes,
+                applied=None,
+                resources=_module_addresses(module),
+                dry_run=bool(getattr(args, "dry_run", False)),
+            )
 
-    # Revoking a grant destroys a member resource and loses no data: only the
-    # removals of data-bearing resources reach the data-loss gate.
-    data_changes, revoked = _data_bearing_changes(changes, runner.planned_removals(plan))
-    if revoked:
-        cprint(
-            f"  {len(revoked)} access grant(s) or policy tag(s) removed (access revoked, no "
-            "data lost; not gated): " + ", ".join(revoked)
-        )
-    # In-place updates that delete data — a dropped column — which the destroy
-    # count above never sees (``~`` in the summary, not ``-``).
-    lost_in_place = _in_place_changes(plugin, changes, str(workdir), env)
+        # Revoking a grant destroys a member resource and loses no data: only the
+        # removals of data-bearing resources reach the data-loss gate.
+        removals = runner.planned_removals(plan)
+        data_changes, revoked = _data_bearing_changes(changes, removals)
+        if revoked:
+            cprint(
+                f"  {len(revoked)} access grant(s) or policy tag(s) removed (access revoked, no "
+                "data lost; not gated): " + ", ".join(revoked)
+            )
+        retired = _retired_definitions(changes, removals)
+        if retired:
+            cprint(
+                f"  {len(retired)} job(s), workspace file(s) or folder(s) removed (no table data "
+                "lost; not gated; a job's run history goes with it): " + ", ".join(retired)
+            )
+        _report_plan_notices(plugin, contract, logger)
+        # In-place updates that delete data — a dropped column — which the destroy
+        # count above never sees (``~`` in the summary, not ``-``).
+        lost_in_place = _in_place_changes(plugin, changes, str(workdir), env)
 
-    # Report what the plan's ``lifecycle.ignore_changes`` deliberately hides.
-    # Without this, a contract whose column types no longer match the live
-    # table plans clean and applies with exit 0 — including under the
-    # destructive ``--mode replace``, where the operator reasonably reads
-    # "apply complete" as "the table now matches the contract".
-    _report_suppressed_drift(plugin, contract, str(workdir), env, args, logger)
+        # Report what the plan's ``lifecycle.ignore_changes`` deliberately hides.
+        # Without this, a contract whose column types no longer match the live
+        # table plans clean and applies with exit 0 — including under the
+        # destructive ``--mode replace``, where the operator reasonably reads
+        # "apply complete" as "the table now matches the contract".
+        _report_suppressed_drift(plugin, contract, str(workdir), env, args, logger)
 
-    _enforce_data_loss_gate(args, logger, provider, changes, data_changes, lost_in_place)
+        _enforce_data_loss_gate(args, logger, provider, changes, data_changes, lost_in_place)
 
-    if dry_run:
-        cprint("\ndry-run: plan only — not applying.")
-        info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
-        return 0
+        if dry_run:
+            cprint("\ndry-run: plan only — not applying.")
+            info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
+            return 0
+        imported.keep()
 
     # ``fluid apply`` is the headline state-changing command, so a receiver
     # configured with the standard OPENLINEAGE_URL must see it. Emission was
@@ -552,12 +573,25 @@ def emit_module(
         # The emitter refused to substitute a different resource kind for the
         # declared binding. Surface it as a typed CLI error rather than a
         # traceback — and, critically, before anything reaches the warehouse.
-        raise CLIError(
-            1,
-            "unsupported_binding",
-            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
-        )
+        raise _binding_error(exc)
     return module, actions
+
+
+def _binding_error(exc: UnsupportedBindingError) -> CLIError:
+    return CLIError(
+        1,
+        "unsupported_binding",
+        {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+    )
+
+
+def credential_overlay(plugin: Any, env: Mapping[str, str]) -> Dict[str, str]:
+    """``plugin.credential_env(env)``; a refusal (no host, two credentials, a
+    profile for another workspace) is a typed CLI error before ``tofu`` starts."""
+    try:
+        return plugin.credential_env(env)
+    except UnsupportedBindingError as exc:
+        raise _binding_error(exc)
 
 
 @contextmanager
@@ -748,6 +782,7 @@ def _adopt_existing(
     workdir: str,
     env: Mapping[str, str],
     logger: logging.Logger,
+    held: Optional[List[str]] = None,
 ) -> None:
     """Brownfield adoption — ``tofu import`` each declared resource that
     already exists in the cloud, so ``tofu apply`` reconciles it instead of
@@ -762,6 +797,9 @@ def _adopt_existing(
     databricks/terraform-provider-databricks#6140): there an import that fails
     for any reason but "no such object" stops the apply, since the object may
     exist and the plan would then show its replacement as a plain create.
+
+    Each import is appended to ``held``, which the caller hands back when the run
+    does not apply (:func:`_imports_kept_only_by_an_apply`).
     """
     candidates = plugin.discover_imports(contract, actions)
     if not candidates:
@@ -775,7 +813,9 @@ def _adopt_existing(
         result = runner.tofu_import(workdir, block.to, block.id, env=env)
         if result.ok:
             adopted += 1
-        elif strict:
+            if held is not None:
+                held.append(block.to)
+        elif strict and not block.best_effort:
             _refuse_unadopted(plugin, contract, block, result, workdir, env)
         else:
             logger.debug(
@@ -786,6 +826,63 @@ def _adopt_existing(
             )
     if adopted:
         cprint(f"  brownfield:  adopted {adopted} pre-existing resource(s) into state")
+
+
+@dataclass
+class _Imports:
+    """What one run's brownfield adoption imported (:func:`_adopt_existing`)."""
+
+    addresses: List[str] = field(default_factory=list)
+    kept: bool = False
+
+    def keep(self) -> None:
+        """The apply starts: what this run imported is the apply's now."""
+        self.kept = True
+
+
+@contextmanager
+def _imports_kept_only_by_an_apply(workdir: str, env: Mapping[str, str], logger: logging.Logger):
+    """Hand back what a run imported when it ends before ``tofu apply`` starts.
+
+    ``tofu import`` writes state at once. A run that then stops (a dry-run, a
+    refusal, the data-loss gate, a failed plan) would leave objects in state that
+    no apply of the contract ever took over, and one the contract then leaves out
+    plans as a destroy: of an object forge-cli never created. ``tofu state rm``
+    forgets them again (the objects stay as they are), so a run that applies
+    nothing leaves the state as it found it, and the next apply adopts again.
+    """
+    imports = _Imports()
+    try:
+        yield imports
+    except BaseException:
+        _hand_back(imports, workdir, env, logger)
+        raise
+    if not imports.kept:
+        _hand_back(imports, workdir, env, logger)
+
+
+def _hand_back(
+    imports: _Imports, workdir: str, env: Mapping[str, str], logger: logging.Logger
+) -> None:
+    if not imports.addresses:
+        return
+    count = len(imports.addresses)
+    result = runner.tofu_state_rm(workdir, imports.addresses, env=env)
+    if result.ok:
+        cprint(f"  brownfield:  released the {count} adopted resource(s); nothing was applied")
+        return
+    warn(
+        logger,
+        "opentofu_adoption_release_failed",
+        resources=imports.addresses,
+        error=_tail(result.stderr or result.stdout, 200),
+    )
+    cprint(
+        f"  ⚠️  {count} adopted resource(s) stay in state, though nothing was applied: "
+        + ", ".join(imports.addresses)
+        + f". To leave them unmanaged: tofu -chdir={workdir} state rm "
+        + " ".join(imports.addresses)
+    )
 
 
 #: How ``tofu import`` reports an id with no object behind it (OpenTofu's
@@ -1250,21 +1347,55 @@ ACCESS_ONLY_RESOURCE_TYPES = frozenset(
 )
 
 
+#: Resource types whose destroy deletes a definition the contract re-creates, and
+#: no table data: a Databricks job (its run history goes with it) and a workspace
+#: file of a dbt project uploaded from the build's repository. Removing a build
+#: from the contract removes them, ungated, with a line saying so (founder
+#: decision for the Databricks provider, 2026-10-29).
+RUN_DEFINITION_RESOURCE_TYPES = frozenset(
+    {"databricks_job", "databricks_workspace_file", "databricks_directory"}
+)
+
+
 def _data_bearing_changes(
     changes: Mapping[str, int], removals: List[Tuple[str, str]]
 ) -> Tuple[Dict[str, int], List[str]]:
     """``(changes with only data-bearing removals, addresses of access-only removals)``.
 
-    Fails closed: when the plan's per-resource events do not account for every
-    removal in its summary (an older ``tofu``, a truncated stream), every removal
-    counts, as before.
+    Neither access-only removals nor run definitions
+    (:func:`_retired_definitions`) count. Fails closed: when the plan's
+    per-resource events do not account for every removal in its summary (an
+    older ``tofu``, a truncated stream), every removal counts, as before.
     """
     counted = {key: int(changes.get(key, 0)) for key in ("add", "change", "remove")}
     if len(removals) != counted["remove"]:
         return counted, []
     revoked = [addr for addr, kind in removals if kind in ACCESS_ONLY_RESOURCE_TYPES]
-    counted["remove"] -= len(revoked)
+    counted["remove"] -= len(revoked) + len(_retired_definitions(changes, removals))
     return counted, revoked
+
+
+def _retired_definitions(changes: Mapping[str, int], removals: List[Tuple[str, str]]) -> List[str]:
+    """Addresses of removed run definitions (:data:`RUN_DEFINITION_RESOURCE_TYPES`),
+    ``[]`` when the plan's events do not account for every removal (fail closed)."""
+    if len(removals) != int(changes.get("remove", 0)):
+        return []
+    return [addr for addr, kind in removals if kind in RUN_DEFINITION_RESOURCE_TYPES]
+
+
+def _report_plan_notices(plugin: Any, contract: Mapping[str, Any], logger: logging.Logger) -> None:
+    """Print what the plugin says the apply cannot do itself (``plan_notices``), such as
+    a Unity Catalog privilege on an object the product does not own. Advisory only."""
+    notices = getattr(plugin, "plan_notices", None)
+    if not callable(notices):
+        return
+    try:
+        lines = list(notices(contract))
+    except Exception as exc:  # noqa: BLE001 — advisory only, never fails an apply
+        logger.debug("plan notices unavailable: %s", type(exc).__name__)
+        return
+    for line in lines:
+        cprint(f"  note: {line}")
 
 
 def _reconcile_with_state(

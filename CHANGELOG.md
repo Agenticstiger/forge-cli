@@ -31,10 +31,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   product owns its
   schema: a grant is authoritative for its principal, so on a schema that already existed and
   that other teams share, each principal the contract names keeps `USE_SCHEMA` alone there.
-  Jobs (dbt on serverless compute) come next.
+- **A dbt build on Databricks runs in the workspace, as a job `fluid apply` provisions through
+  OpenTofu.** A dbt build whose `execution.runtime.platform` is `databricks` becomes one
+  serverless job with a dbt task. Databricks runs it on the SQL warehouse `DATABRICKS_WAREHOUSE_ID`
+  names, in the catalog and schema of the expose the build writes. Its `repository` is either the
+  local dbt project or an `https://` Git URL. A local project is uploaded under the applying
+  identity's home (`.fluid/<product>/<build>/files`, each id with its digest, so no two products
+  share a folder; each folder is created before the files in it, since the provider's own
+  fallback for a missing parent races between parallel uploads), and only what dbt reads goes
+  up: never `profiles.yml`, `target/`, a hidden file or a symbolic link. The apply uploads the
+  project as it is when the apply runs, as a local dbt run reads its project when it runs: a
+  plan's `planDigest` / `bundleDigest` bind the contract, not the project's files. A Git URL
+  names exactly one of `?branch=`, `?tag=` or `?commit=`, plus `&path=` for a project below the
+  repository root. The job runs `dbt deps`, then `dbt build` with the selectors and vars a local
+  run uses.
+  `execution.trigger` becomes a Quartz `schedule` (days of the week by name, so none is off by
+  one), Databricks' `continuous` trigger, or no trigger for `manual`. `retries`, email
+  `notifications`, `runtime.timeout` and `runtime.serviceAccount` map to the job. The job runs
+  as that service principal only when the operator lists its application id in
+  `FLUID_DATABRICKS_RUN_AS_ALLOWLIST`; a contract alone never picks the identity a job runs as. What the job would take and not honour is refused: an event or dataset trigger, a
+  backoff that is not fixed, a Slack notification, a runtime image or environment, and a `vars`
+  value holding an `{{ env.* }}` template, which the job settings would store in clear. Removing
+  a job or an uploaded file needs no `--allow-data-loss`, since no table data is lost (the job's
+  run history goes with it), and the apply says so. `fluid apply --mode amend-and-build` leaves
+  such a build to its job and says how to start a run now, and forge-cli's own schedules
+  (`fluid generate schedule`, the `fluid apply` Airflow DAG) give it no task: Databricks starts
+  its runs.
+- **A table a dbt build writes is left to dbt after the apply creates it.** dbt's `table`
+  materialization rebuilds it with CREATE OR REPLACE. So the module ignores its columns,
+  partitions, clustering, properties and comment, and sets no column mapping. Each apply reports
+  the column drift it no longer reconciles, and `fluid verify` is the gate. This covers a table
+  the build writes locally or as a job.
+- **`fluid verify` checks Databricks tables live**, with the `[databricks]` extra. It checks:
+  - the columns against the contract;
+  - that every reader can use the catalog (`USE CATALOG`);
+  - that each dbt job exists exactly once.
+  forge-cli never grants `USE CATALOG`, since the catalog is not the product's. `fluid apply`
+  prints the `GRANT` statement its owner runs. `fluid doctor` and the `fluid forge` welcome scan
+  report Databricks readiness.
+- **One Databricks credential, pinned.** `fluid apply`, `fluid diff` and `fluid verify` take the
+  workspace from `DATABRICKS_HOST` only. The credential comes from one of two places:
+  - `DATABRICKS_TOKEN`, or the OAuth pair `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET`;
+  - the `~/.databrickscfg` profile `DATABRICKS_CONFIG_PROFILE` names, which must be for that
+    host.
+  No other profile is read. Before, a run without `DATABRICKS_HOST` went to whatever workspace
+  the DEFAULT profile named, with its token. Before `tofu` starts, the run refuses two
+  credentials at once, a profile for another workspace, and a plain-HTTP host. A Databricks
+  personal access token is masked in logs, in both redaction layers (pattern from gitleaks'
+  `databricks-api-token` rule).
+- **An existing Databricks table without column mapping is refused, not taken over.** Setting
+  `delta.columnMapping.mode=name` upgrades the table's Delta protocol, which older readers and
+  some external engines cannot read. The message gives the `ALTER TABLE` its owner can run.
+  Existing grants are imported with their table, so the plan shows what the contract takes away
+  as an update instead of a create.
 
 ### Changed
 
+- **`fluid apply --mode amend-and-build` on a dbt build that runs on Databricks needs OpenTofu,
+  and no longer runs dbt on this machine.** Such a build is one whose
+  `execution.runtime.platform` is `databricks`. Its job runs it in the workspace on its trigger
+  (see Added). The apply provisions that job through OpenTofu, then says how to start a run now:
+  from the job's page, or with `databricks jobs run-now`. A dbt build without that platform still
+  runs here, with the dbt-databricks profile.
 - **A dbt build with no `builds[].execution.runtime.platform` takes its platform from the first
   `exposes[].binding`**, for the generated `profiles.yml` and the model-contract column types. It
   fell back to DuckDB whatever the binding said, so a contract that named its platform only on the
@@ -125,6 +183,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `fluid apply` that applies nothing leaves the OpenTofu state as it found it.** Brownfield
+  adoption imports existing objects into state before the plan, and `tofu import` writes state at
+  once. A run that then stopped (`--mode dry-run`, a refusal, the data-loss gate, a failed plan)
+  kept them, though no apply had taken them over, and a contract that then left one out planned
+  its destroy: of an object forge-cli never created. Such a run now hands them back with `tofu
+  state rm`, which leaves the objects as they are, and the next apply adopts them again. On every
+  cloud. It matters most for a Databricks table refused for lacking column mapping, whose
+  refusal offers leaving the table out of the contract.
 - **`fluid generate` writes a Databricks `profiles.yml` and Databricks column types for a dbt
   build on Databricks.** It wrote a DuckDB profile and DuckDB types, and the dbt runner prefers a
   `profiles.yml` in the project directory, so a run could build into a local DuckDB file instead

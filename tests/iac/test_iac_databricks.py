@@ -189,12 +189,24 @@ class TestModule:
         assert "dapi" not in first and "azuredatabricks" not in first
         assert "force_destroy" not in first
 
-    def test_imports_cover_the_schema_and_the_table(self):
+    def test_imports_cover_the_schema_the_table_and_their_grants(self):
         imports = IAC_PLUGINS["databricks"].discover_imports(_contract())
-        assert [(b.to, b.id) for b in imports] == [
+        assert [(b.to, b.id) for b in imports if not b.best_effort] == [
             ("databricks_schema.sales_orders_main_sales", "main.sales"),
             (TABLE, "main.sales.orders"),
         ]
+        # Each grant by the provider's own id, best-effort: on a new table it fails,
+        # and the grant's create sets the same privileges.
+        grants = {b.id for b in imports if b.best_effort}
+        assert grants == {
+            "table/main.sales.orders/analysts",
+            "table/main.sales.orders/bi",
+            "table/main.sales.orders/alice@corp.com",
+            "schema/main.sales/analysts",
+            "schema/main.sales/bi",
+            "schema/main.sales/alice@corp.com",
+        }
+        assert all(b.to.startswith("databricks_grant.") for b in imports if b.best_effort)
 
     def test_other_clouds_are_untouched(self):
         contract = _contract(**{"exposes.0.binding.platform": "snowflake"})
@@ -771,9 +783,23 @@ class TestEngine:
             return TofuResult("import", 1 if stderr else 0, "", stderr, [])
 
         monkeypatch.setattr(engine.runner, "tofu_import", fake_import)
+        imports = IAC_PLUGINS["databricks"].discover_imports(_contract())
         engine._adopt_existing(IAC_PLUGINS["databricks"], _contract(), [], "/w", {}, _LOG)
-        assert len(calls) == 2
-        assert ("adopted 2 pre-existing" in "".join(capfd.readouterr())) is adopted
+        assert calls == [block.to for block in imports]
+        out = "".join(capfd.readouterr())
+        assert (f"adopted {len(imports)} pre-existing" in out) is adopted
+
+    def test_a_failed_grant_import_never_stops_the_apply(self, monkeypatch):
+        # A grant's securable may not exist yet; its create replaces what an import
+        # would have adopted, so only the schema and the table import strictly.
+        monkeypatch.setattr(engine.runner, "tofu_state_list", lambda *a, **k: [])
+
+        def fake_import(workdir, address, rid, env=None):
+            ok = not address.startswith("databricks_grant.")
+            return TofuResult("import", 0 if ok else 1, "", "" if ok else "Error: 404", [])
+
+        monkeypatch.setattr(engine.runner, "tofu_import", fake_import)
+        engine._adopt_existing(IAC_PLUGINS["databricks"], _contract(), [], "/w", {}, _LOG)
 
     def test_an_in_place_override_is_audited(self, caplog):
         changes = {"add": 0, "change": 1, "remove": 0}

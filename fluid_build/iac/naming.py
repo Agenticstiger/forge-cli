@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 
@@ -30,6 +31,36 @@ def safe_ident(value: Any) -> str:
     if cleaned[0].isdigit():
         cleaned = f"r_{cleaned}"
     return cleaned
+
+
+def unique_ident(value: str) -> str:
+    """:func:`safe_ident`, plus a digest of ``value`` whenever folding changed it.
+
+    ``safe_ident`` turns every character but letters, digits and ``_`` into
+    ``_``, so ``data-eng`` and ``data_eng`` would meet at one address, a
+    collision the contract cannot rename away.
+    """
+    folded = safe_ident(value)
+    if folded == value:
+        return folded
+    return f"{folded}_{_digest(value, 8)}"
+
+
+def digest_ident(value: str) -> str:
+    """:func:`safe_ident` plus a 128-bit digest of ``value``, always: a name in a
+    namespace other contracts share, such as a workspace folder.
+
+    :func:`unique_ident` keeps a value that is already folded as it is, so a
+    contract could name itself ``data_eng_<digest>`` and meet ``data-eng``'s
+    folded form. Its 8 hex digits would not hold here either: ids that fold
+    alike are endless (``_.-`` runs), so an author could search for one whose
+    32-bit digest matches another product's. 128 bits leaves no such search.
+    """
+    return f"{safe_ident(value)}_{_digest(value, 32)}"
+
+
+def _digest(value: str, length: int) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 
 
 class TofuExpr(str):
