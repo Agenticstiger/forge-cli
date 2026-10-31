@@ -1188,6 +1188,33 @@ def _render_masking_dimension(masking: Dict[str, Any], ok: str, heading: str) ->
         )
 
 
+#: Dimensions that list findings (``_verify_databricks``), and their headings.
+_FINDINGS_DIMENSIONS = (
+    ("catalog_access", "\n   🔍 Catalog access (USE CATALOG)"),
+    ("jobs", "\n   🔍 Jobs"),
+)
+
+
+def _render_findings_dimensions(dimensions: Dict[str, Any]) -> None:
+    """Console view of each dimension that lists findings, when a verifier reported it."""
+    for key, heading in _FINDINGS_DIMENSIONS:
+        dimension = dimensions.get(key)
+        if dimension is None:
+            continue
+        cprint(heading)
+        if dimension.get("status") == "pass":
+            cprint(f"      ✅ PASS - {dimension.get('message', '')}", markup=False)
+            continue
+        cprint(f"      ❌ FAIL - {dimension.get('message', '')}", markup=False)
+        for finding in dimension.get("findings") or []:
+            cprint(f"         ❌ {finding.get('message', '')}", markup=False)
+            if finding.get("fix"):
+                cprint(
+                    f"            Fix (run by an admin of the catalog): {finding['fix']}",
+                    markup=False,
+                )
+
+
 #: What ``fluid apply`` provisions for a GCP-bound expose, as far as stage 9
 #: cares. Two coarse outcomes, because verify only needs to know "is there a
 #: verifier for this?" — the fine-grained resource kind is the emitter's
@@ -1437,7 +1464,20 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # platform, so those fall through to the format chain unchanged.
         gcp_kind = _gcp_provisioned_kind(expose_config.get("binding"))
 
-        if format_type == "bigquery_table" or gcp_kind == _GCP_BIGQUERY:
+        from fluid_build.iac.provider_match import is_cloud as _is_cloud
+
+        if _is_cloud(expose_config.get("binding"), "databricks"):
+            # A Unity Catalog table, its readers' catalog access and its dbt
+            # jobs, read through databricks-sdk. See _verify_databricks.py.
+            from fluid_build.cli._verify_databricks import verify_databricks_expose
+
+            results[expose_name] = verify_databricks_expose(
+                expose_name,
+                expose_config,
+                contract=contract,
+                reference_only=reference_only,
+            )
+        elif format_type == "bigquery_table" or gcp_kind == _GCP_BIGQUERY:
             # Get properties from either 'properties' or 'binding.location'
             properties = expose_config.get("properties", {})
             if not properties:
@@ -1800,6 +1840,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # and the verifier checked it (the Glue + Athena and BigQuery ones do).
         if dimensions.get("masking") is not None:
             _render_masking_dimension(dimensions["masking"], "pass", "\n   🔍 Dimension 5: Masking")
+
+        # Databricks: reader access to the catalog, and the dbt jobs.
+        _render_findings_dimensions(dimensions)
 
         # Remediation guidance
         cprint(f"\n   💡 Remediation: {severity.get('remediation', 'UNKNOWN')}")
