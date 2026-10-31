@@ -375,7 +375,7 @@ class TestCredentialValues:
     def test_the_environment_and_the_named_profile_secrets(self, tmp_path):
         from fluid_build.iac.providers.databricks_auth import credential_values
 
-        token, secret = "tok-" + "a1" * 8, "sec-" + "b2" * 8
+        token, secret = "tok-" + "a1" * 8, "sec-" + "b2" * 8  # pragma: allowlist secret
         cfg = tmp_path / "databrickscfg"
         cfg.write_text(
             f"[ci]\nhost = https://x.cloud.databricks.com\nclient_id = id\nclient_secret = {secret}\n",

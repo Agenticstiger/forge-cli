@@ -344,10 +344,10 @@ class TestDatabricksSymmetry:
 
     def test_dict_keys_masked(self) -> None:
         data = {
-            "client_secret": "v1",
+            "client_secret": "v1",  # pragma: allowlist secret
             "DATABRICKS_TOKEN": "v2",
-            "DATABRICKS_CLIENT_SECRET": "v3",
-            "DATABRICKS_PASSWORD": "v4",
+            "DATABRICKS_CLIENT_SECRET": "v3",  # pragma: allowlist secret
+            "DATABRICKS_PASSWORD": "v4",  # pragma: allowlist secret
             "host": "keep-me",
         }
         out = redact_dict(data)

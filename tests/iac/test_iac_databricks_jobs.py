@@ -497,7 +497,10 @@ class TestGitSource:
         }
         assert "project_directory" not in found["dbt_task"]
 
-    @pytest.mark.parametrize("commit", ["abc1234", "0123456789abcdef0123456789ABCDEF01234567"])
+    @pytest.mark.parametrize(
+        "commit",
+        ["abc1234", "0123456789abcdef0123456789ABCDEF01234567"],  # pragma: allowlist secret
+    )
     def test_commit_of_seven_to_forty_hex(self, commit):
         found = self._git(f"https://github.com/o/r?commit={commit}")
         assert found["git_source"]["commit"] == commit
@@ -541,7 +544,7 @@ class TestGitSource:
             ("http://github.com/o/r?tag=v1", "git-url"),
             ("git://github.com/o/r?tag=v1", "git-url"),
             ("git@github.com:o/r.git", "git-url"),
-            ("https://user:pass@github.com/o/r?tag=v1", "git-url"),
+            ("https://user:pass@github.com/o/r?tag=v1", "git-url"),  # pragma: allowlist secret
             ("https://token@github.com/o/r?tag=v1", "git-url"),
             ("https://git.example.com/o/r?tag=v1", "git-host"),
             ("https://github.com.evil.example/o/r?tag=v1", "git-host"),

@@ -22,7 +22,7 @@ import pytest
 from fluid_build.cli.doctor import _check_databricks_readiness
 
 HOST = "https://example.cloud.databricks.com"
-SECRET = "fake-" + "x" * 12 + "-secret"
+SECRET = "fake-" + "x" * 12 + "-secret"  # pragma: allowlist secret
 
 
 @pytest.fixture(autouse=True)

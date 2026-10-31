@@ -623,7 +623,7 @@ class TestGlobalRedactionSymmetryGaps:
         out = redact_value(
             {
                 "conn_str": "Driver={ODBC};Server=h;Pwd=topsecretpw;",
-                "connection_url": "jdbc:pg://user:topsecretpw@host/db",
+                "connection_url": "jdbc:pg://user:topsecretpw@host/db",  # pragma: allowlist secret
             }
         )
         assert out["conn_str"] == "***REDACTED***"

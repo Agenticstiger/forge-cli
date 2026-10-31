@@ -64,15 +64,15 @@ CONFIG_FILE_ENV = "DATABRICKS_CONFIG_FILE"
 AUTH_TYPE_ENV = "DATABRICKS_AUTH_TYPE"
 TOKEN_ENV = "DATABRICKS_TOKEN"
 CLIENT_ID_ENV = "DATABRICKS_CLIENT_ID"
-CLIENT_SECRET_ENV = "DATABRICKS_CLIENT_SECRET"
+CLIENT_SECRET_ENV = "DATABRICKS_CLIENT_SECRET"  # pragma: allowlist secret
 
 #: The credential variables unified auth reads, and the method each belongs to.
 _METHOD_VARS = {
     TOKEN_ENV: "pat",
     CLIENT_ID_ENV: "oauth-m2m",
-    CLIENT_SECRET_ENV: "oauth-m2m",
+    CLIENT_SECRET_ENV: "oauth-m2m",  # pragma: allowlist secret
     "DATABRICKS_USERNAME": "basic",
-    "DATABRICKS_PASSWORD": "basic",
+    "DATABRICKS_PASSWORD": "basic",  # pragma: allowlist secret
 }
 _LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
 

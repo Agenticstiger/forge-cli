@@ -484,7 +484,7 @@ class TestCredentialOverlay:
             "DATABRICKS_HOST": "https://adb-1.azuredatabricks.net",
             "DATABRICKS_TOKEN": "fake-token-value",
             "DATABRICKS_CLIENT_ID": "id",
-            "DATABRICKS_CLIENT_SECRET": "fake-secret-value",
+            "DATABRICKS_CLIENT_SECRET": "fake-secret-value",  # pragma: allowlist secret
         }
         with pytest.raises(CLIError) as exc:
             engine.credential_overlay(PLUGIN, env)
