@@ -416,6 +416,7 @@ class FakeDatabricks:
         self.jobs: Dict[int, Dict[str, Any]] = {}
         self.workspace_files: Dict[str, bytes] = {}  # workspace path -> content
         self.workspace_dirs: set = set()  # directories a workspace import / mkdirs created
+        self.missing_parent_uploads: List[str] = []  # imports that met no parent folder
         self.warehouse_id = warehouse_id
         self.requests: List[Tuple[str, str]] = []  # every request
         self.queries: List[Tuple[str, str, str]] = []  # (method, path, raw query)
@@ -886,7 +887,9 @@ class FakeDatabricks:
         path = b.get("path", "")
         parent = path.rsplit("/", 1)[0]
         if parent and parent not in self.workspace_dirs:
-            # the provider answers this by mkdirs, then imports again
+            # the provider answers this by mkdirs and a second import, but only when the
+            # parent is still missing by then (a race between parallel uploads)
+            self.missing_parent_uploads.append(path)
             return _err(
                 404, "RESOURCE_DOES_NOT_EXIST", f"The parent folder ({parent}) does not exist."
             )
@@ -911,9 +914,21 @@ class FakeDatabricks:
 
     def _ws_delete(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
         path = b.get("path", "")
-        if path not in self.workspace_files:
+        if path in self.workspace_files:
+            del self.workspace_files[path]
+            return 200, {}
+        if path not in self.workspace_dirs:
             return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Path ({path}) doesn't exist.")
-        del self.workspace_files[path]
+        inside = [
+            p for p in (*self.workspace_files, *self.workspace_dirs) if p.startswith(path + "/")
+        ]
+        if inside and b.get("recursive") not in (True, "true"):
+            # the workspace API refuses a non-empty folder unless the delete is recursive
+            return _err(400, "DIRECTORY_NOT_EMPTY", f"Folder ({path}) is not empty.")
+        for p in inside:
+            self.workspace_files.pop(p, None)
+            self.workspace_dirs.discard(p)
+        self.workspace_dirs.discard(path)
         return 200, {}
 
     # -- warehouse / sql

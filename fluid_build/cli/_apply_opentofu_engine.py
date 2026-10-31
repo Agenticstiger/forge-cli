@@ -273,8 +273,8 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
         retired = _retired_definitions(changes, removals)
         if retired:
             cprint(
-                f"  {len(retired)} job(s) or workspace file(s) removed (no table data lost; not "
-                "gated; a job's run history goes with it): " + ", ".join(retired)
+                f"  {len(retired)} job(s), workspace file(s) or folder(s) removed (no table data "
+                "lost; not gated; a job's run history goes with it): " + ", ".join(retired)
             )
         _report_plan_notices(plugin, contract, logger)
         # In-place updates that delete data — a dropped column — which the destroy
@@ -1352,7 +1352,9 @@ ACCESS_ONLY_RESOURCE_TYPES = frozenset(
 #: file of a dbt project uploaded from the build's repository. Removing a build
 #: from the contract removes them, ungated, with a line saying so (founder
 #: decision for the Databricks provider, 2026-10-29).
-RUN_DEFINITION_RESOURCE_TYPES = frozenset({"databricks_job", "databricks_workspace_file"})
+RUN_DEFINITION_RESOURCE_TYPES = frozenset(
+    {"databricks_job", "databricks_workspace_file", "databricks_directory"}
+)
 
 
 def _data_bearing_changes(

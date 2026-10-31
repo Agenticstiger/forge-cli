@@ -167,6 +167,10 @@ def test_a_dbt_build_runs_as_a_serverless_job_with_its_project_uploaded(workspac
     assert settings["tags"] == {"fluid_product": "dbx.fake.orders", "fluid_build": "dbt_daily"}
     assert sorted(fake.workspace_files) == [f"{ROOT}/dbt_project.yml", f"{ROOT}/models/orders.sql"]
     assert fake.file_content(f"{ROOT}/models/orders.sql") == b"select 1 as id\n"
+    # Every folder existed before a file went into it: the provider's own fallback for
+    # a missing parent races between parallel uploads.
+    assert {ROOT, f"{ROOT}/models"} <= fake.workspace_dirs
+    assert fake.missing_parent_uploads == []
 
     assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]
 
@@ -209,9 +213,21 @@ def test_removing_the_job_is_not_gated_and_is_said(workspace, fake, capfd):
     # The build now runs locally: its job and uploaded project go; its table stays.
     rc, out = apply_contract(capfd, write_contract(workspace, job_contract(platform=None)))
     assert rc == 0, out
-    assert "job(s) or workspace file(s) removed (no table data lost; not gated" in out
+    assert "job(s), workspace file(s) or folder(s) removed (no table data lost; not gated" in out
     assert fake.jobs == {} and fake.workspace_files == {}
+    assert not [folder for folder in fake.workspace_dirs if folder.startswith(ROOT)]
     assert TABLE in fake.tables
+
+
+def test_a_folder_holding_something_else_is_not_deleted_with_the_job(workspace, fake, capfd):
+    # No folder is deleted recursively: a file someone else put there stops the removal
+    # and is named, instead of going with the job.
+    rc, out = apply_contract(capfd, write_contract(workspace, job_contract()))
+    assert rc == 0, out
+    fake._put_file(f"{ROOT}/models/notes.txt", b"kept")
+    rc, out = apply_contract(capfd, write_contract(workspace, job_contract(platform=None)))
+    assert rc == 1 and "is not empty" in out, out
+    assert fake.file_content(f"{ROOT}/models/notes.txt") == b"kept"
 
 
 def test_the_table_a_dbt_build_writes_keeps_what_dbt_made_and_the_drift_is_said(

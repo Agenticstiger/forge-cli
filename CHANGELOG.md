@@ -36,13 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serverless job with a dbt task. Databricks runs it on the SQL warehouse `DATABRICKS_WAREHOUSE_ID`
   names, in the catalog and schema of the expose the build writes. Its `repository` is either the
   local dbt project or an `https://` Git URL. A local project is uploaded under the applying
-  identity's home (`.fluid/<product>/<build>/files`, each id with its digest, so no two
-  products share a folder), and only what dbt reads goes up: never `profiles.yml`, `target/`, a
-  hidden file or a symbolic link. The apply uploads the project as it is when the apply runs,
-  as a local dbt run reads its project when it runs: a plan's `planDigest` / `bundleDigest`
-  bind the contract, not the project's files. A Git URL names exactly one of
-  `?branch=`, `?tag=` or `?commit=`, plus `&path=` for a project below the repository root. The
-  job runs `dbt deps`, then `dbt build` with the selectors and vars a local run uses.
+  identity's home (`.fluid/<product>/<build>/files`, each id with its digest, so no two products
+  share a folder; each folder is created before the files in it, since the provider's own
+  fallback for a missing parent races between parallel uploads), and only what dbt reads goes
+  up: never `profiles.yml`, `target/`, a hidden file or a symbolic link. The apply uploads the
+  project as it is when the apply runs, as a local dbt run reads its project when it runs: a
+  plan's `planDigest` / `bundleDigest` bind the contract, not the project's files. A Git URL
+  names exactly one of `?branch=`, `?tag=` or `?commit=`, plus `&path=` for a project below the
+  repository root. The job runs `dbt deps`, then `dbt build` with the selectors and vars a local
+  run uses.
   `execution.trigger` becomes a Quartz `schedule` (days of the week by name, so none is off by
   one), Databricks' `continuous` trigger, or no trigger for `manual`. `retries`, email
   `notifications`, `runtime.timeout` and `runtime.serviceAccount` map to the job. The job runs

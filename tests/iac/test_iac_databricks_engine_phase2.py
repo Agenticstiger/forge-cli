@@ -381,10 +381,11 @@ def _summary(remove: int) -> Dict[str, int]:
 
 
 class TestDataLossGate:
-    def test_run_definitions_are_the_job_and_the_workspace_file(self):
+    def test_run_definitions_are_the_job_its_files_and_their_folders(self):
         assert engine.RUN_DEFINITION_RESOURCE_TYPES == {
             "databricks_job",
             "databricks_workspace_file",
+            "databricks_directory",
         }
 
     def test_removed_jobs_and_files_are_not_data_bearing(self):

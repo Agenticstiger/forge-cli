@@ -933,7 +933,34 @@ def _emit_job(
 def _emit_files(
     compiled: CompiledJobs, item: _Build, files: Sequence[Tuple[str, bytes]]
 ) -> List[str]:
-    """One ``databricks_workspace_file`` per project file; their addresses."""
+    """One ``databricks_workspace_file`` per project file, each in a
+    ``databricks_directory`` created before it; the files' addresses.
+
+    The provider creates a file's missing parent folder only when, after the upload
+    failed, the parent is still missing (``resource_workspace_file.go``, 1.140.0).
+    Files uploading in parallel into a new tree then fail at a first apply when a
+    sibling's mkdirs made the parent in between (``models/x.sql`` creates ``files/``
+    under ``dbt_project.yml``). With every folder there first, no upload meets a
+    missing parent. Each folder waits on its parent folder, so a removal deletes them
+    deepest first; none deletes recursively, so a folder holding anything else stays
+    and says so.
+    """
+    folders: Dict[str, str] = {}
+
+    def folder(rel_dir: str) -> str:
+        if rel_dir not in folders:
+            body: Dict[str, Any] = {
+                "path": _under_home("", f"{item.root}/{rel_dir}" if rel_dir else item.root)
+            }
+            if rel_dir:
+                body["depends_on"] = [folder(rel_dir.rpartition("/")[0])]
+            key = f"{item.key}_dir_{unique_ident(rel_dir)}" if rel_dir else f"{item.key}_dir"
+            compiled.resources.append(
+                ("databricks_directory", key, f"{item.where} folder {rel_dir or '.'}", body)
+            )
+            folders[rel_dir] = f"databricks_directory.{key}"
+        return folders[rel_dir]
+
     depends: List[str] = []
     for rel, data in files:
         key = f"{item.key}_{unique_ident(rel)}"
@@ -945,6 +972,7 @@ def _emit_files(
                 {
                     "path": _under_home("", f"{item.root}/{rel}"),
                     "content_base64": base64.b64encode(data).decode("ascii"),
+                    "depends_on": [folder(rel.rpartition("/")[0])],
                 },
             )
         )

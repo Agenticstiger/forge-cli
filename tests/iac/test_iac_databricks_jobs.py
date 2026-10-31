@@ -142,6 +142,27 @@ class TestWorkspaceJob:
         _project(tmp_path)
         return _compile(_contract("./dbt", **overrides), tmp_path)
 
+    def test_each_folder_exists_before_the_files_in_it(self, tmp_path):
+        # The provider recreates a missing parent folder only when it is still missing
+        # after a failed upload, so parallel uploads into a new tree raced: each file
+        # waits on its folder instead, and each folder on its parent.
+        _project(tmp_path, {"models/m.sql": "select 1\n", "models/staging/s.sql": "select 2\n"})
+        compiled = _compile(_contract("./dbt"), tmp_path)
+        folders = compiled.resources["databricks_directory"]
+        by_path = {str(body["path"]).split(ROOT)[-1]: (key, body) for key, body in folders.items()}
+        assert sorted(by_path) == ["", "/models", "/models/staging"]
+        root_key, root = by_path[""]
+        assert "depends_on" not in root
+        assert by_path["/models"][1]["depends_on"] == [f"databricks_directory.{root_key}"]
+        assert by_path["/models/staging"][1]["depends_on"] == [
+            f"databricks_directory.{by_path['/models'][0]}"
+        ]
+        for body in compiled.resources["databricks_workspace_file"].values():
+            rel = str(body["path"]).split(ROOT)[-1]
+            (parent,) = body["depends_on"]
+            assert parent == f"databricks_directory.{by_path[rel.rpartition('/')[0]][0]}"
+        assert all("delete_recursive" not in body for body in folders.values())
+
     def test_commands_are_dbt_deps_then_dbt_build_with_the_runners_model_selector(self, tmp_path):
         # One output at most and properties.model: the runner's +model+.
         task = _task(self._compiled(tmp_path))
