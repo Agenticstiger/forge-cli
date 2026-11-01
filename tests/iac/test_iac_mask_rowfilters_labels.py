@@ -239,6 +239,13 @@ class TestTheSharedDerivations:
         assert labels["fluid_residency"] == "true"
         assert labels["layer"] == "silver"
 
+    def test_governance_labels_keep_sixty_unless_the_caller_lifts_the_cap(self):
+        contract = {"labels": {f"k{i:03d}": "v" for i in range(75)}}
+        assert len(governance_labels(contract, {})) == 60
+        assert len(governance_labels(contract, {}, limit=60)) == 60
+        assert len(governance_labels(contract, {}, limit=None)) == 75
+        assert list(governance_labels(contract, {}, limit=2)) == ["k000", "k001"]
+
 
 # ── GCP ──────────────────────────────────────────────────────────────────
 
