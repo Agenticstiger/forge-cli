@@ -28,7 +28,8 @@ refuses it), ALTER TABLE SET / DROP ROW FILTER, ALTER COLUMN SET / DROP MASK, an
 The bindings are served on the table (``row_filter``, ``columns[].mask``) as Unity Catalog serves
 them, and a CREATE OR REPLACE TABLE keeps them (Databricks docs: REPLACE preserves row filters
 and column masks). ``fail_on(substring, message)`` makes every statement containing it FAIL,
-for the fail-safe tests; ``timeline`` orders statements against permission changes.
+for the fail-safe tests; ``fail_route(method, path_part)`` answers matching requests with an
+error, to fail a ``tofu apply`` part way; ``timeline`` orders statements against permission changes.
 Any other statement FAILS (state ``FAILED``) and stays visible in ``sql_log``, so a new
 statement shape shows up as an error, never as a silent no-op. Every other endpoint answers a
 Databricks-shaped 404 and is recorded in ``unknown``.
@@ -613,6 +614,8 @@ class FakeDatabricks:
         # ("sql", statement) and ("perm", full_name) in the order they arrived
         self.timeline: List[Tuple[str, str]] = []
         self.failing: List[Tuple[str, str]] = []  # (substring, message): matching statements FAIL
+        # (method, path substring, status, message): matching requests are answered with an error
+        self.failing_routes: List[Tuple[str, str, int, str]] = []
         self.replaced: List[str] = []  # tables a CREATE OR REPLACE hit while they existed
         self._marker = 0
         self._job_seq = 0
@@ -741,6 +744,13 @@ class FakeDatabricks:
         """Make every later statement containing ``substring`` FAIL with ``message``."""
         self.failing.append((substring, message))
 
+    def fail_route(
+        self, method: str, path_part: str, status: int = 400, message: str = "injected failure"
+    ) -> None:
+        """Answer every later ``method`` request whose path holds ``path_part`` with an error
+        (a 4xx, which the provider does not retry), to make a ``tofu apply`` fail part way."""
+        self.failing_routes.append((method, path_part, status, message))
+
     def function_in_use(self, full_name: str) -> bool:
         for t in self.tables.values():
             used = [(t.get("row_filter") or {}).get("function_name")]
@@ -799,6 +809,9 @@ class FakeDatabricks:
     def _route(
         self, method: str, path: str, query: Dict[str, List[str]], body: Dict[str, Any]
     ) -> Tuple[int, Any]:
+        for fail_method, fail_path, status, message in self.failing_routes:
+            if method == fail_method and fail_path in path:
+                return _err(status, "INVALID_PARAMETER_VALUE", message)
         for m, rx, fn in self.routes:
             if m == method:
                 mt = rx.match(path)

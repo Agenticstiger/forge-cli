@@ -570,3 +570,96 @@ def test_the_engine_runs_the_hooks_around_tofu_apply_in_this_order():
     dry = source.index('_enforce_access(plugin, "pre_apply", contract, dry_run=True)')
     assert gate < dry < source.index('cprint("\\ndry-run: plan only')
     assert gate < pre < keep < apply < post
+
+
+# ── after a tofu apply that failed part way ─────────────────────────────────
+def test_after_a_failed_apply_post_apply_binds_what_exists_and_skips_a_missing_table(fake):
+    seed(fake)
+    run = Run(fake)
+    PLUGIN.post_apply(
+        contract(), say=run.said.append, client_factory=fake.client, after_failed_apply=True
+    )
+    assert live(fake)["row_filter"]["function_name"].startswith("main.cp360.fluid_rf_profile_")
+    assert len(live_masks(fake)) == 4
+
+    # A table the failed apply never created is skipped: no failure, no revoke.
+    other = Run(FakeDatabricks().start())
+    try:
+        PLUGIN.post_apply(
+            contract(),
+            say=other.said.append,
+            client_factory=other.fake.client,
+            after_failed_apply=True,
+        )
+        assert other.fake.sql_log == []
+        assert "not created by the failed apply" in other.text
+        assert "NOT REVOKED" not in other.text and "fail-safe" not in other.text
+    finally:
+        other.fake.stop()
+
+
+def test_after_a_failed_apply_nothing_is_dropped_even_what_the_contract_no_longer_asks(fake):
+    seed(fake)
+    Run(fake).pre(contract())
+    narrower = contract(restrictions=[DENY], filters=None)
+    run = Run(fake)
+    PLUGIN.post_apply(
+        narrower, say=run.said.append, client_factory=fake.client, after_failed_apply=True
+    )
+    assert not any(s.startswith(("DROP", "ALTER")) for s in run.statements())
+    assert "row_filter" in live(fake) and "msisdn" in live_masks(fake)
+    # The same contract after a successful apply does drop them.
+    PLUGIN.post_apply(narrower, say=run.said.append, client_factory=fake.client)
+    assert "row_filter" not in live(fake) and "msisdn" not in live_masks(fake)
+
+
+def test_a_table_without_restrictions_is_not_even_read_after_a_failed_apply(fake):
+    seed(fake)
+    Run(fake).pre(contract())
+    PLUGIN.post_apply(
+        contract(restrictions=None, filters=None),
+        say=print,
+        client_factory=fake.client,
+        after_failed_apply=True,
+    )
+    assert "row_filter" in live(fake) and len(live_masks(fake)) == 4
+
+
+def test_a_binding_that_fails_after_a_failed_apply_revokes_and_says_so(fake):
+    seed(fake)
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] warehouse stopped")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        PLUGIN.post_apply(
+            contract(), say=run.said.append, client_factory=fake.client, after_failed_apply=True
+        )
+    assert str(exc.value).startswith("the apply failed part way")
+    assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == []
+    assert fake.grants[("table", TABLE)][STEWARDS_GROUP] == ["SELECT"]
+
+
+def test_the_engine_prints_an_enforcement_failure_after_a_failed_apply_and_never_raises_it(
+    capsys,
+):
+    rec = _Recorder(enforce.EnforcementError("it broke", ("fix it",)))
+    rec.post_apply = lambda contract, say=None, after_failed_apply=False: (  # type: ignore
+        rec.calls.append(("post_apply", after_failed_apply)),
+        (_ for _ in ()).throw(enforce.EnforcementError("it broke", ("fix it",))),
+    )
+    engine._enforce_after_failed_apply(rec, {})
+    assert rec.calls == [("post_apply", True)]
+    out = capsys.readouterr().out
+    assert "it broke" in out and "fix it" in out
+
+    boom = _Recorder()
+    boom.post_apply = lambda contract, say=None, after_failed_apply=False: 1 / 0  # type: ignore
+    engine._enforce_after_failed_apply(boom, {})  # a bug in the hook never hides the apply's error
+    assert "ZeroDivisionError" in capsys.readouterr().out
+    engine._enforce_after_failed_apply(object(), {})  # no hook: nothing happens
+
+
+def test_the_engine_binds_before_it_raises_the_apply_failure():
+    source = __import__("inspect").getsource(engine._apply_via_opentofu)
+    bind = source.index("_enforce_after_failed_apply(plugin, contract)")
+    failed = source.index('"opentofu_apply_failed"')
+    assert source.index("runner.tofu_apply(") < bind < failed

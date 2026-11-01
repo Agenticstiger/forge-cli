@@ -311,6 +311,9 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
     with _apply_lineage(contract, provider=provider, planned=changes) as record:
         apply_result = runner.tofu_apply(str(workdir), env=env)
         if not apply_result.ok:
+            # A table the failed apply created, its grants and the job that fills it can all
+            # exist with no mask or filter: bind what exists (never drop) before failing.
+            _enforce_after_failed_apply(plugin, contract)
             raise CLIError(
                 1,
                 "opentofu_apply_failed",
@@ -359,6 +362,28 @@ def _enforce_access(
             "opentofu_access_enforcement_failed",
             {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
         ) from exc
+
+
+def _enforce_after_failed_apply(plugin: Any, contract: Mapping[str, Any]) -> None:
+    """Best effort, bind-only ``post_apply`` for a ``tofu apply`` that failed part way.
+
+    A failure here is printed, never raised: the error the run exits with is the apply's own
+    (``opentofu_apply_failed``). The plugin binds what exists, revokes ``SELECT`` where it
+    cannot, skips tables that do not exist and drops nothing (``after_failed_apply``).
+    """
+    run = getattr(plugin, "post_apply", None)
+    if not callable(run):
+        return
+    cprint(
+        "\n  tofu apply failed part way: binding the masks and row filter on the tables that "
+        "exist before the run stops (no mask or filter is dropped)."
+    )
+    try:
+        run(contract, say=cprint, after_failed_apply=True)
+    except UnsupportedBindingError as exc:
+        cprint(f"  access enforcement after the failed apply: {exc} {' '.join(exc.remediation)}")
+    except Exception as exc:  # noqa: BLE001 — the apply's own error is what the run raises
+        cprint(f"  access enforcement after the failed apply could not run: {type(exc).__name__}")
 
 
 def _applied_env(args) -> Optional[str]:

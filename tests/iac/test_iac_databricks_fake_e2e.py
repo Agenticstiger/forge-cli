@@ -743,3 +743,64 @@ def test_a_contract_with_an_invalid_predicate_is_refused_before_anything_runs(
     rc, out = apply_contract(capfd, write_contract(workspace, contract))
     assert rc == 1 and "databricks-row-filter-invalid" in out
     assert fake.sql_log == [] and fake.tables == {}
+
+
+@requires_sdk
+def test_an_apply_that_fails_after_creating_the_table_still_binds_it_and_fails_with_the_apply_error(
+    workspace, fake, capfd
+):
+    # The table is created, then the grant on it fails: a later run of a job that fills the
+    # table would read it with no mask or filter if the failed apply stopped there.
+    fake.fail_route("PATCH", "/permissions/table/", message="grant refused")
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted()))
+
+    assert rc == 1, out
+    assert "opentofu_apply_failed" in out, "the run fails with the apply's own error"
+    assert "opentofu_access_enforcement_failed" not in out
+    assert TABLE in fake.tables, "the failed apply did create the table"
+    assert "row_filter" in _live(fake) and sorted(_masks(fake)) == ["amount", "region"]
+    assert "binding the masks and row filter on the tables that exist" in out
+    assert not any(s.startswith(("DROP", "REVOKE")) for s in fake.sql_log)
+
+
+@requires_sdk
+def test_an_apply_that_fails_before_creating_the_table_binds_nothing_and_says_nothing_alarming(
+    workspace, fake, capfd
+):
+    fake.fail_route("POST", "/unity-catalog/schemas", message="no schema for you")
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted()))
+
+    assert rc == 1 and "opentofu_apply_failed" in out, out
+    assert TABLE not in fake.tables and fake.sql_log == []
+    assert "not created by the failed apply" in out
+    assert "NOT REVOKED" not in out
+
+
+@requires_sdk
+def test_a_failed_apply_never_drops_a_binding_the_contract_no_longer_asks_for(
+    workspace, fake, capfd
+):
+    assert apply_contract(capfd, write_contract(workspace, _restricted()))[0] == 0
+    before = _live(fake)["row_filter"]["function_name"]
+    mark = len(fake.sql_log)
+
+    # No restriction now, and a new reader whose grant fails: dropping the filter would widen
+    # access, and waits for an apply that succeeds.
+    fake.fail_route("PATCH", "/permissions/table/", message="grant refused")
+    contract = _restricted(
+        mask=False,
+        deny=False,
+        row_filter=False,
+        readers=("group:analysts", "group:bi", "group:new"),
+    )
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 1 and "opentofu_apply_failed" in out, out
+    assert _live(fake)["row_filter"]["function_name"] == before
+    assert sorted(_masks(fake)) == ["amount", "region"]
+    assert not any(s.startswith("DROP") for s in fake.sql_log[mark:])
+    assert "access widened" not in out
+
+    fake.failing_routes.clear()
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 0, out
+    assert "row_filter" not in _live(fake) and _masks(fake) == {}, "dropped once it succeeded"

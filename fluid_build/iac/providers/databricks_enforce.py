@@ -452,9 +452,22 @@ def pre_apply(
 
 
 def post_apply(
-    targets: Sequence[Target], say: Say, client_factory: Optional[ClientFactory] = None
+    targets: Sequence[Target],
+    say: Say,
+    client_factory: Optional[ClientFactory] = None,
+    *,
+    after_failed_apply: bool = False,
 ) -> None:
-    """Bind what is still missing, drop what the contract no longer asks, fail safe."""
+    """Bind what is still missing, drop what the contract no longer asks, fail safe.
+
+    ``after_failed_apply`` is the bind-only mode for a ``tofu apply`` that failed part way: a
+    table it created, its grants and the job that fills it can exist with no mask or filter, and
+    a scheduled run would expose unmasked rows. It binds what exists, revokes SELECT where it
+    cannot bind, skips a table that does not exist (expected after a failed apply) and drops
+    nothing: dropping widens access and waits for an apply that succeeded.
+    """
+    if after_failed_apply:
+        targets = [t for t in targets if t.enforcement is not None]
     if not targets:
         return
     pair = _client_for(targets, client_factory, say)
@@ -466,11 +479,15 @@ def post_apply(
     for target in targets:
         live = _read(client, target)
         if live is None:
-            if target.enforcement is not None:
+            if after_failed_apply:
+                say(f"  {target.full_name}: not created by the failed apply; nothing to bind.")
+            elif target.enforcement is not None:
                 failed.append((target, "the table does not exist after the apply"))
                 unrevoked += _fail_safe(runner, target, say)
             continue
         plan = plan_table(target.full_name, target.enforcement, live)
+        if after_failed_apply:
+            plan.drop = []
         if plan.bind or plan.drop:
             say(f"\n  {target.full_name}: masks and row filter")
         for step in [*plan.bind, *plan.drop]:
@@ -489,8 +506,12 @@ def post_apply(
     if failed:
         names = ", ".join(sorted({t.full_name for t, _ in failed}))
         raise EnforcementError(
-            f"the apply succeeded, but the masks or row filter of {names} could not be put in "
-            "place. "
+            (
+                "the apply failed part way, and "
+                if after_failed_apply
+                else "the apply succeeded, but "
+            )
+            + f"the masks or row filter of {names} could not be put in place. "
             + (
                 "SELECT was revoked on each from the principals the contract restricts "
                 "(listed above), so none of them can read unmasked rows. "

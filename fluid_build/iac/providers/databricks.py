@@ -1672,11 +1672,19 @@ class DatabricksIacPlugin:
         contract: Mapping[str, Any],
         say: Optional[Callable[[str], None]] = None,
         client_factory: Optional[Callable[[], Any]] = None,
+        after_failed_apply: bool = False,
     ) -> None:
         """After ``tofu apply``: bind on the tables it created, drop what the contract no
         longer restricts, and revoke ``SELECT`` from the restricted principals of any table
-        it could not bind (``databricks_enforce.post_apply``)."""
-        post_apply(self._enforcement_targets(contract), say or print, client_factory)
+        it could not bind (``databricks_enforce.post_apply``). ``after_failed_apply`` is the
+        bind-only mode for an apply that failed part way: it drops nothing and skips a table
+        that was never created."""
+        post_apply(
+            self._enforcement_targets(contract),
+            say or print,
+            client_factory,
+            after_failed_apply=after_failed_apply,
+        )
 
     def plan_notices(self, contract: Mapping[str, Any]) -> List[str]:
         """What the apply cannot do itself and someone must: ``USE CATALOG``."""
