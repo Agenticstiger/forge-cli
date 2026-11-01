@@ -37,7 +37,14 @@ What is checked is what the emitter's own pass says it provisions
    Read from ``GET .../entity-tag-assignments/{type}/{name}/tags``, which pages.
    A dbt ``CREATE OR REPLACE`` may drop a table's tags (Databricks does not
    say), so this is the gate: the fix is ``fluid apply``.
-4. **The jobs.** Each dbt build that writes the expose has exactly one job of
+4. **Row filter and column masks.** The contract's ``columnRestrictions`` and ``rowFilters``
+   are Unity Catalog SQL functions bound on the table (``databricks_access.py``), named by a
+   hash of their definition. The table's ``row_filter.function_name`` / ``input_column_names``
+   and each column's ``mask.function_name``, from the GetTable already read, must be the
+   expected ones: a missing binding, or one to another function, is CRITICAL (the table is
+   readable without what the contract promises), and the fix is ``fluid apply``, which binds
+   them before it grants. ``skip`` when the contract restricts nothing.
+5. **The jobs.** Each dbt build that writes the expose has exactly one job of
    its name. None means ``fluid apply`` did not run (or the job was deleted);
    several mean an apply without its state created a duplicate.
 
@@ -437,6 +444,114 @@ def _tags_dimension(client: Any, table: Any) -> Dict[str, Any]:
     }
 
 
+def _enforcement_dimension(table: Any, live_table: Mapping[str, Any]) -> Dict[str, Any]:
+    """The row filter and column masks the contract asks for, against the table's live ones.
+
+    Expected function names carry a hash of their definition, so a changed predicate or
+    rule is a different name and shows here as "different function". ``skip`` when the
+    contract declares no restriction: nothing was promised. A binding the contract does
+    not ask for is not checked.
+    """
+    from fluid_build.iac.providers.databricks_access import same_function
+
+    row_filter = getattr(table, "row_filter", None)
+    masks = tuple(getattr(table, "masks", ()))
+    if row_filter is None and not masks:
+        return {
+            "status": "skip",
+            "message": "the contract declares no column restriction or row filter to check",
+            "findings": [],
+        }
+    findings: List[Dict[str, Any]] = []
+    if row_filter is not None:
+        function, columns = row_filter
+        live = live_table.get("row_filter") or {}
+        actual = str(live.get("function_name") or "") if isinstance(live, Mapping) else ""
+        inputs = [str(c).lower() for c in (live.get("input_column_names") or [])]
+        if not actual:
+            findings.append(
+                {
+                    "kind": "row_filter",
+                    "expected": function,
+                    "actual": None,
+                    "message": f"{table.full_name} has no row filter, expected {function}",
+                }
+            )
+        elif not same_function(actual, function):
+            findings.append(
+                {
+                    "kind": "row_filter",
+                    "expected": function,
+                    "actual": actual,
+                    "message": (
+                        f"{table.full_name} has row filter {actual}, the contract's is {function}"
+                    ),
+                }
+            )
+        elif inputs != [c.lower() for c in columns]:
+            findings.append(
+                {
+                    "kind": "row_filter",
+                    "expected": function,
+                    "actual": actual,
+                    "message": (
+                        f"row filter {function} on {table.full_name} reads columns "
+                        f"{', '.join(inputs) or 'none'}, expected {', '.join(columns)}"
+                    ),
+                }
+            )
+    live_columns = {
+        str(c.get("name") or "").lower(): c
+        for c in live_table.get("columns") or []
+        if isinstance(c, Mapping)
+    }
+    for column, function in masks:
+        mask = (live_columns.get(column.lower()) or {}).get("mask") or {}
+        actual = str(mask.get("function_name") or "") if isinstance(mask, Mapping) else ""
+        if not actual:
+            findings.append(
+                {
+                    "kind": "mask",
+                    "column": column,
+                    "expected": function,
+                    "actual": None,
+                    "message": f"{table.full_name}.{column} has no mask, expected {function}",
+                }
+            )
+        elif not same_function(actual, function):
+            findings.append(
+                {
+                    "kind": "mask",
+                    "column": column,
+                    "expected": function,
+                    "actual": actual,
+                    "message": (
+                        f"{table.full_name}.{column} has mask {actual}, the contract's is "
+                        f"{function}"
+                    ),
+                }
+            )
+    total = len(masks) + (1 if row_filter is not None else 0)
+    if not findings:
+        return {
+            "status": "pass",
+            "message": f"all {total} row filter and column mask binding(s) are in place",
+            "findings": [],
+        }
+    return {
+        "status": "fail",
+        "message": (
+            f"{len(findings)} of {total} row filter and column mask binding(s) missing or "
+            "different: the table is readable without what the contract promises"
+        ),
+        "findings": findings,
+        "fix": (
+            "Run fluid apply: it binds the row filter and masks (before any grant it adds) "
+            "and revokes SELECT from the restricted principals of a table it cannot bind"
+        ),
+    }
+
+
 def _jobs_dimension(client: Any, expose_id: str, contract: Mapping[str, Any], jobs: Any) -> Any:
     """The dimension for the dbt jobs that write ``expose_id``; ``None`` when there are none."""
     from fluid_build.util.contract import builds_writing_expose
@@ -491,9 +606,11 @@ def _severity(
     missing_table: str = "",
     residency: Optional[Mapping[str, Any]] = None,
     tags: Optional[Mapping[str, Any]] = None,
+    enforcement: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The shared drift grading, raised to CRITICAL by a missing table, reader, job,
-    a workspace outside the declared region or a governance tag that is not there."""
+    a workspace outside the declared region, a governance tag that is not there or a row
+    filter or column mask that is not bound."""
     from fluid_build.cli.verify import assess_drift_severity
 
     severity = assess_drift_severity(
@@ -520,6 +637,11 @@ def _severity(
     if (tags or {}).get("status") == "fail":
         reasons.append(tags["message"] + ": " + "; ".join(f["message"] for f in tags["findings"]))
         actions.append(tags["fix"])
+    if (enforcement or {}).get("status") == "fail":
+        reasons.append(
+            enforcement["message"] + ": " + "; ".join(f["message"] for f in enforcement["findings"])
+        )
+        actions.append(enforcement["fix"])
     if not reasons:
         return severity
     already = severity["level"] == "CRITICAL"
@@ -621,6 +743,7 @@ def verify_databricks_expose(
         access = _access_dimension(client, table)
         residency = _residency_dimension(client, table)
         tags = _tags_dimension(client, table)
+        enforcement = _enforcement_dimension(table, live_table)
         job_dim = _jobs_dimension(client, expose_id, contract, jobs)
     except Exception as exc:  # noqa: BLE001 — a check that could not run is an error
         return _error(
@@ -632,6 +755,7 @@ def verify_databricks_expose(
     dimensions["catalog_access"] = access
     dimensions["residency"] = residency
     dimensions["governance_tags"] = tags
+    dimensions["row_filter_masks"] = enforcement
     if job_dim is not None:
         dimensions["jobs"] = job_dim
 
@@ -644,6 +768,7 @@ def verify_databricks_expose(
             "catalog_access",
             "residency",
             "governance_tags",
+            "row_filter_masks",
             "jobs",
         )
         if name in dimensions
@@ -653,7 +778,9 @@ def verify_databricks_expose(
         "exists": True,
         "table_id": target,
         "target": target,
-        "severity": _severity(diff, access, job_dim, residency=residency, tags=tags),
+        "severity": _severity(
+            diff, access, job_dim, residency=residency, tags=tags, enforcement=enforcement
+        ),
         "dimensions": dimensions,
         "metadata": {
             "num_rows": None,

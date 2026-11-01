@@ -1193,6 +1193,7 @@ _FINDINGS_DIMENSIONS = (
     ("catalog_access", "\n   🔍 Catalog access (USE CATALOG)"),
     ("residency", "\n   🔍 Residency (workspace region)"),
     ("governance_tags", "\n   🔍 Governance tags (Unity Catalog)"),
+    ("row_filter_masks", "\n   🔍 Row filter and column masks (Unity Catalog)"),
     ("jobs", "\n   🔍 Jobs"),
 )
 
