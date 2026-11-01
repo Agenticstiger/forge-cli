@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-11-01
+
 ### Added
 
 - **Databricks (Unity Catalog) applies through the OpenTofu engine.** A contract bound to
@@ -62,6 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partitions, clustering, properties and comment, and sets no column mapping. Each apply reports
   the column drift it no longer reconciles, and `fluid verify` is the gate. This covers a table
   the build writes locally or as a job.
+  Known limitation: the rebuild drops a contract's NOT NULL, so `fluid verify` reports the
+  column. It stays NOT NULL only when the dbt model declares it: an enforced model contract
+  (`contract: {enforced: true}`) with a `not_null` constraint on the column.
 - **`fluid verify` checks Databricks tables live**, with the `[databricks]` extra. It checks:
   - the columns against the contract;
   - that every reader can use the catalog (`USE CATALOG`);
@@ -6410,7 +6415,10 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.25.0...v0.26.0
+[0.25.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.24.0...v0.25.0
+[0.24.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.20.0...v0.21.0
