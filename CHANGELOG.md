@@ -271,8 +271,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named before; what changed is a platform that names no provider. One that a build running
   outside forge-cli (`engine: flink`, or `properties.language: flink_sql`) runs on or writes to
   is passed over: the local planner lands nothing for it, and the rest of the contract applies.
-  Any other platform no provider serves (`databricks`, `postgres`, a Kafka topic nothing in the
-  contract writes, a build's `kubernetes` runtime) stops the run with
+  Any other platform no provider serves (`postgres`, a Kafka topic nothing in the contract
+  writes, a build's `kubernetes` runtime) stops the run with
   `apply_platform_unsupported`, naming each field. Before, it was `provider_unknown` when it was
   the one read, and otherwise handed to the local provider, which wrote a placeholder CSV for it
   and reported success; an allow or block list set for the plugins does not change that. A
