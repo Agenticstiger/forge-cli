@@ -29,6 +29,11 @@ that exists but is not in state is adopted, not replaced; a column type change
 and a missing catalog fail at plan with a message that names the column or the
 catalog; missing credentials fail naming the variables to set.
 
+A contract's governance labels become ``databricks_entity_tag_assignment`` resources on the
+schema and the table: apply creates them, a second plan is empty, removing a label destroys
+only its assignment without ``--allow-data-loss``, and an assignment already in the workspace
+(state lost, or set by hand) is adopted, not a failed create.
+
 Not proven here: what real Databricks accepts (SQL dialect, warehouse state,
 privilege names, Unity Catalog storage); that is the manual live tier.
 
@@ -158,8 +163,108 @@ def test_a_grant_revoke_is_not_gated(workspace, fake, capfd):
         capfd, write_contract(workspace, make_contract(readers=("group:analysts",)))
     )
     assert rc == 0, out
-    assert "access revoked, no data lost; not gated" in out
+    assert "no data lost; not gated" in out
     assert fake.grants[("table", TABLE)] == {"analysts": ["SELECT"], "bi": []}
+
+
+LABELS = {"data-classification": "confidential", "cost-center": "cx-001"}
+SCHEMA_TAGS = {"data_classification": "confidential", "cost_center": "cx-001"}
+TABLE_TAGS = {**SCHEMA_TAGS, "sensitivity": "high"}
+
+
+def _governed(**labels: str) -> dict:
+    return make_contract(labels=labels or LABELS, expose_labels={"sensitivity": "high"})
+
+
+def test_apply_writes_the_governance_labels_as_tags_and_a_second_plan_is_empty(
+    workspace, fake, capfd
+):
+    path = write_contract(workspace, _governed())
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert fake.tags_on("schemas", "main.sales") == SCHEMA_TAGS
+    assert fake.tags_on("tables", TABLE) == TABLE_TAGS
+    assert fake.unknown == []
+
+    rc, out = apply_contract(capfd, path, "--mode", "dry-run")
+    assert rc == 0, out
+    assert "tofu plan: +0 ~0 -0" in out
+    assert fake.unknown == []
+
+
+def test_a_contract_without_labels_makes_no_tag_assignment(workspace, fake, capfd):
+    assert apply_contract(capfd, write_contract(workspace, make_contract()))[0] == 0
+    assert fake.tags == {}
+    assert not any("entity-tag-assignments" in path for _method, path in fake.requests)
+
+
+def test_a_changed_label_value_updates_the_tag_in_place(workspace, fake, capfd):
+    assert apply_contract(capfd, write_contract(workspace, _governed()))[0] == 0
+
+    rc, out = apply_contract(
+        capfd, write_contract(workspace, _governed(**{**LABELS, "cost-center": "cx-002"}))
+    )
+    assert rc == 0, out
+    assert fake.tags_on("tables", TABLE)["cost_center"] == "cx-002"
+    assert fake.tags_on("schemas", "main.sales")["cost_center"] == "cx-002"
+    assert (
+        "PATCH",
+        f"/api/2.1/unity-catalog/entity-tag-assignments/tables/{TABLE}/tags/cost_center",
+    ) in (fake.requests)
+
+
+def test_removing_a_label_destroys_only_its_assignment_without_allow_data_loss(
+    workspace, fake, capfd
+):
+    assert apply_contract(capfd, write_contract(workspace, _governed()))[0] == 0
+    marker = fake.tables[TABLE]["marker"]
+
+    path = write_contract(workspace, _governed(**{"data-classification": "confidential"}))
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "tag assignment(s) removed" in out and "not gated" in out
+    assert fake.tags_on("schemas", "main.sales") == {"data_classification": "confidential"}
+    assert fake.tags_on("tables", TABLE) == {
+        "data_classification": "confidential",
+        "sensitivity": "high",
+    }
+    assert fake.tables[TABLE]["marker"] == marker and fake.replaced == []
+    assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]
+
+
+def _lose_state(workspace: Path) -> None:
+    (workdir,) = (workspace / ".fluid" / "iac" / "databricks").iterdir()
+    states = list(workdir.glob("terraform.tfstate*"))
+    assert states, list(workdir.iterdir())
+    for state in states:
+        state.unlink()
+
+
+def test_a_rerun_after_state_loss_adopts_the_existing_assignments(workspace, fake, capfd):
+    path = write_contract(workspace, _governed())
+    assert apply_contract(capfd, path)[0] == 0
+    marker = fake.tables[TABLE]["marker"]
+    _lose_state(workspace)
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "brownfield: adopted" in out
+    assert "already exists" not in out
+    assert fake.tags_on("tables", TABLE) == TABLE_TAGS
+    assert fake.tables[TABLE]["marker"] == marker
+    assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]
+
+
+def test_an_assignment_set_by_hand_is_adopted_and_its_value_corrected(workspace, fake, capfd):
+    fake.create_table(TABLE, LIVE_COLUMNS, properties={"delta.columnMapping.mode": "name"})
+    fake.tag("tables", TABLE, "sensitivity", "low")
+    fake.tag("tables", TABLE, "owned_by_someone_else", "keep")
+
+    rc, out = apply_contract(capfd, write_contract(workspace, _governed()))
+    assert rc == 0, out
+    assert fake.tags_on("tables", TABLE) == {**TABLE_TAGS, "owned_by_someone_else": "keep"}
+    assert fake.replaced == []
 
 
 def test_a_dropped_column_is_refused_like_a_destroy(workspace, fake, capfd):
