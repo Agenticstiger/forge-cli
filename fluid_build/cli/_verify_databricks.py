@@ -300,6 +300,44 @@ def _access_dimension(client: Any, table: Any) -> Dict[str, Any]:
     }
 
 
+def _residency_dimension(client: Any, table: Any) -> Dict[str, Any]:
+    """The workspace's metastore region against the one the contract declares.
+
+    ``skip`` when the contract declares no region: nothing was promised, so
+    nothing can be broken (the sovereignty check is what asks for one).
+    """
+    declared = str(getattr(table, "region", "") or "")
+    if not declared:
+        return {
+            "status": "skip",
+            "message": "the contract declares no binding.location.region to check",
+            "declared": None,
+            "actual": None,
+        }
+    summary = _get(client, "/api/2.1/unity-catalog/metastore_summary")
+    actual = str(summary.get("region") or "")
+    if actual.lower() == declared.lower():
+        return {
+            "status": "pass",
+            "message": f"the workspace's metastore is in {actual}, as declared",
+            "declared": declared,
+            "actual": actual,
+        }
+    shown = actual or "no region"
+    return {
+        "status": "fail",
+        "message": (
+            f"the contract declares region {declared} but the workspace's metastore is in {shown}"
+        ),
+        "declared": declared,
+        "actual": actual or None,
+        "fix": (
+            f"Point DATABRICKS_HOST at a workspace in {declared}, or correct "
+            "binding.location.region in the contract"
+        ),
+    }
+
+
 def _jobs_dimension(client: Any, expose_id: str, contract: Mapping[str, Any], jobs: Any) -> Any:
     """The dimension for the dbt jobs that write ``expose_id``; ``None`` when there are none."""
     from fluid_build.util.contract import builds_writing_expose
@@ -352,8 +390,10 @@ def _severity(
     access: Optional[Mapping[str, Any]],
     jobs: Optional[Mapping[str, Any]],
     missing_table: str = "",
+    residency: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """The shared drift grading, raised to CRITICAL by a missing table, reader or job."""
+    """The shared drift grading, raised to CRITICAL by a missing table, reader, job
+    or a workspace outside the declared region."""
     from fluid_build.cli.verify import assess_drift_severity
 
     severity = assess_drift_severity(
@@ -374,6 +414,9 @@ def _severity(
     for finding in (jobs or {}).get("findings") or []:
         reasons.append(finding["message"])
         actions.append(finding["message"].split(": ", 1)[-1])
+    if (residency or {}).get("status") == "fail":
+        reasons.append(residency["message"])
+        actions.append(residency["fix"])
     if not reasons:
         return severity
     already = severity["level"] == "CRITICAL"
@@ -473,6 +516,7 @@ def verify_databricks_expose(
     dimensions = _shape_dimensions(diff, target)
     try:
         access = _access_dimension(client, table)
+        residency = _residency_dimension(client, table)
         job_dim = _jobs_dimension(client, expose_id, contract, jobs)
     except Exception as exc:  # noqa: BLE001 — a check that could not run is an error
         return _error(
@@ -482,12 +526,13 @@ def verify_databricks_expose(
             dimensions=dimensions,
         )
     dimensions["catalog_access"] = access
+    dimensions["residency"] = residency
     if job_dim is not None:
         dimensions["jobs"] = job_dim
 
     has_issues = any(
         dimensions[name]["status"] == "fail"
-        for name in ("structure", "types", "constraints", "catalog_access", "jobs")
+        for name in ("structure", "types", "constraints", "catalog_access", "residency", "jobs")
         if name in dimensions
     )
     return {
@@ -495,7 +540,7 @@ def verify_databricks_expose(
         "exists": True,
         "table_id": target,
         "target": target,
-        "severity": _severity(diff, access, job_dim),
+        "severity": _severity(diff, access, job_dim, residency=residency),
         "dimensions": dimensions,
         "metadata": {
             "num_rows": None,

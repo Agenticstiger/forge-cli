@@ -118,6 +118,7 @@ class StubWorkspace:
             "bi": ["ALL_PRIVILEGES"],
         }
         self.jobs: List[Dict[str, Any]] = []
+        self.region = "eu-central-1"
         self.fail_on: Optional[str] = None
         self.page_size = 100
         self.api_client = StubApiClient(self)
@@ -146,6 +147,8 @@ class StubWorkspace:
                 else []
             )
             return {"privilege_assignments": assignments}
+        if path == "/api/2.1/unity-catalog/metastore_summary":
+            return {"metastore_id": "ms-1", "region": self.region, "cloud": "aws"}
         if path == "/api/2.2/jobs/list":
             hits = [j for j in self.jobs if j["settings"]["name"] == query.get("name")]
             start = int(query.get("page_token") or 0)
@@ -291,6 +294,47 @@ def test_use_catalog_or_all_privileges_passes(workspace):
     workspace.catalog_privileges = {"analysts": ["USE_CATALOG"], "bi": ["ALL_PRIVILEGES"]}
 
     assert verify(workspace)["dimensions"]["catalog_access"]["status"] == "pass"
+
+
+def contract_with_region(region: str) -> Dict[str, Any]:
+    document = copy.deepcopy(CONTRACT)
+    document["exposes"][0]["binding"]["location"]["region"] = region
+    return document
+
+
+def test_a_workspace_in_the_declared_region_passes_residency(workspace):
+    workspace.region = "eu-central-1"
+
+    result = verify(workspace, contract_with_region("EU-Central-1"))
+
+    assert result["status"] == "match"
+    residency = result["dimensions"]["residency"]
+    assert residency["status"] == "pass"
+    assert residency["declared"] == "eu-central-1" and residency["actual"] == "eu-central-1"
+
+
+def test_a_workspace_in_another_region_fails_residency_with_a_fix(workspace):
+    workspace.region = "us-west-2"
+
+    result = verify(workspace, contract_with_region("eu-central-1"))
+
+    assert result["status"] == "mismatch" and result["severity"]["level"] == "CRITICAL"
+    residency = result["dimensions"]["residency"]
+    assert residency["status"] == "fail"
+    assert residency["declared"] == "eu-central-1" and residency["actual"] == "us-west-2"
+    assert "DATABRICKS_HOST" in residency["fix"] and "eu-central-1" in residency["fix"]
+    assert "us-west-2" in result["severity"]["reason"]
+    assert residency["fix"] in " ".join(result["severity"]["actions"])
+
+
+def test_no_declared_region_skips_residency_without_failing(workspace):
+    workspace.region = "us-west-2"
+
+    result = verify(workspace)
+
+    assert result["status"] == "match"
+    assert result["dimensions"]["residency"]["status"] == "skip"
+    assert not any(path.endswith("metastore_summary") for _m, path, _q in workspace.calls)
 
 
 def test_names_in_the_grant_have_their_backticks_doubled():
@@ -460,11 +504,13 @@ def test_an_expose_the_emitter_manages_no_table_for_is_not_checked(workspace):
 # ── Through the real `fluid verify` ─────────────────────────────────────
 
 
-def _run_verify(tmp_path, monkeypatch, capfd, workspace, *flags: str):
+def _run_verify(
+    tmp_path, monkeypatch, capfd, workspace, *flags: str, contract: Optional[Dict[str, Any]] = None
+):
     from fluid_build.cli import main
 
     path = tmp_path / "contract.fluid.yaml"
-    path.write_text(yaml.safe_dump(CONTRACT, sort_keys=False), encoding="utf-8")
+    path.write_text(yaml.safe_dump(contract or CONTRACT, sort_keys=False), encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.setenv("FLUID_NO_TELEMETRY", "1")
@@ -496,6 +542,34 @@ def test_fluid_verify_passes_a_matching_table_under_strict(tmp_path, monkeypatch
 
     assert "Match: 1" in out
     assert code == 0
+
+
+def test_fluid_verify_prints_the_residency_fix_and_strict_fails(
+    tmp_path, monkeypatch, capfd, workspace
+):
+    workspace.region = "us-west-2"
+
+    code, out = _run_verify(
+        tmp_path,
+        monkeypatch,
+        capfd,
+        workspace,
+        "--strict",
+        contract=contract_with_region("eu-central-1"),
+    )
+
+    assert "Residency (workspace region)" in out
+    assert "declares region eu-central-1 but the workspace's metastore is in us-west-2" in out
+    assert "Point DATABRICKS_HOST at a workspace in eu-central-1" in out
+    assert code != 0
+
+
+def test_fluid_verify_shows_residency_skipped_not_failed_without_a_region(
+    tmp_path, monkeypatch, capfd, workspace
+):
+    code, out = _run_verify(tmp_path, monkeypatch, capfd, workspace, "--strict")
+
+    assert "Residency (workspace region) ⚪ SKIPPED" in out and code == 0
 
 
 # ── The real SDK, against the stand-in workspace ────────────────────────
