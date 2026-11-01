@@ -116,7 +116,6 @@ def _host(env: Mapping[str, str]) -> str:
             "https://<workspace>.cloud.databricks.com.",
         )
     host = normalize_host(raw)
-    parts = urlsplit(host)
     if not is_acceptable_host(host):
         raise _refusal(
             "host-insecure",

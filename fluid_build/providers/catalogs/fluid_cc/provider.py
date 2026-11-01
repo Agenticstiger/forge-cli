@@ -659,10 +659,23 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
         https (plain http only to loopback), leaves it out: not an error. So
         does a host carrying user-info (``https://user:pass@host``):
         ``normalize_host`` keeps the netloc whole, and the user-info would be
-        published to the Command Center with the link.
+        published to the Command Center with the link. And an endpoint the
+        checkout's project config named never gets it: the runner's environment
+        is not the checkout's to send (``cli/publish.py`` keeps ``{{ env.* }}``
+        unresolved for such an endpoint, and ``_auth_headers`` sends it no
+        operator credential).
         """
+        if self.project_endpoint_file is not None:
+            self.logger.debug(
+                "no workspace_host published: the endpoint was named by the checkout (%s)",
+                self.project_endpoint_file,
+            )
+            return None
         raw = os.environ.get(DATABRICKS_HOST_ENV, "").strip()
-        host = normalize_host(raw) if raw else ""
+        try:
+            host = normalize_host(raw) if raw else ""
+        except ValueError:  # a malformed netloc (an unclosed IPv6 bracket): leave it out
+            host = ""
         if host and is_acceptable_host(host) and "@" not in urlsplit(host).netloc:
             return host
         self.logger.debug(

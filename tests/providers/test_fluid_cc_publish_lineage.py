@@ -837,7 +837,12 @@ class TestWorkspaceHost:
     """A Databricks expose publishes the workspace host, from ``DATABRICKS_HOST`` only."""
 
     @staticmethod
-    def _metadata(cc, platform: str, location: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _metadata(
+        cc,
+        platform: str,
+        location: Optional[Dict[str, Any]] = None,
+        project_file: Optional[str] = None,
+    ) -> Dict[str, Any]:
         provider = get_catalog_provider(
             "fluid-command-center",
             {
@@ -847,6 +852,8 @@ class TestWorkspaceHost:
                 "retry_delay": 0,
             },
         )
+        # What config_manager sets when the checkout's project config named the endpoint.
+        provider.project_endpoint_file = project_file
         contract = {
             "id": "p.x",
             "name": "X",
@@ -889,6 +896,16 @@ class TestWorkspaceHost:
         metadata = self._metadata(cc, "databricks")
         assert "workspace_host" not in metadata
         assert "pass" not in json.dumps(metadata) and "tok@" not in json.dumps(metadata)
+
+    def test_an_endpoint_the_checkout_named_never_gets_the_runners_host(self, cc, monkeypatch):
+        # The runner's environment is not the checkout's to send (cli/publish.py).
+        monkeypatch.setenv("DATABRICKS_HOST", "https://dbc-abc.cloud.databricks.com")
+        metadata = self._metadata(cc, "databricks", project_file="fluid.config.yaml")
+        assert "workspace_host" not in metadata
+
+    def test_a_malformed_host_is_left_out_not_raised(self, cc, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_HOST", "https://[::1")
+        assert "workspace_host" not in self._metadata(cc, "databricks")
 
     @pytest.mark.parametrize("platform", ["aws", "gcp", "snowflake", "local"])
     def test_other_platforms_never_get_one(self, cc, monkeypatch, platform):
