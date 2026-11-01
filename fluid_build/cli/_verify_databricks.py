@@ -213,7 +213,14 @@ def grant_statement(catalog: str, principal: str) -> str:
 
 
 def _catalog_privileges(client: Any, catalog: str, principal: str) -> set:
-    """The privileges ``principal`` effectively holds on ``catalog`` (following pages)."""
+    """The privileges ``principal`` effectively holds on ``catalog`` (following pages).
+
+    The call is scoped to ``principal``, so every assignment it returns is one the
+    principal holds. An assignment names the principal that CONVEYS the privilege,
+    not the one asked about: asked about ``account users``, a live workspace
+    (2026-11-01) answered with ``_workspace_users_workspace_<id>``'s USE_CATALOG. A
+    filter on the asked-for name read that as no USE CATALOG at all.
+    """
     path = f"/api/2.1/unity-catalog/effective-permissions/catalog/{quote(catalog, safe='')}"
     held: set = set()
     token: Optional[str] = None
@@ -225,8 +232,6 @@ def _catalog_privileges(client: Any, catalog: str, principal: str) -> set:
         page = _get(client, path, query)
         for assignment in page.get("privilege_assignments") or []:
             if not isinstance(assignment, Mapping):
-                continue
-            if str(assignment.get("principal") or "").lower() != principal.lower():
                 continue
             for priv in assignment.get("privileges") or []:
                 name = priv.get("privilege") if isinstance(priv, Mapping) else priv
