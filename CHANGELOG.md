@@ -17,17 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now a region-placed platform like aws, gcp and azure: with a `sovereignty` block, a Databricks
   binding that declares no `location.region` is a finding (an error under `strict`, a warning
   under `advisory`), and a declared region is held to `allowedRegions`, `deniedRegions` and
-  `jurisdiction` like any cloud region. The declaration is verified, not trusted: when a region
-  is declared the module reads the workspace's metastore (`data.databricks_current_metastore`)
-  and every schema it owns carries a precondition that the metastore's region equals the
-  declared one, so `tofu plan` (a dry-run included) fails, naming both regions, before anything is
-  written when `DATABRICKS_HOST` names a workspace in another region. The region is lower-cased
-  and must be a plain region name (`databricks-region-invalid` otherwise, as it is written into
-  the module), and two Databricks exposes declaring different regions are refused
-  (`databricks-region-conflict`: one workspace has one region). A contract that declares no
-  region gets the module it always did. `fluid verify` gains a residency dimension that reads the
-  workspace's metastore summary: it passes when the region matches the declaration, fails with
-  the fix when it does not, and is skipped when the contract declares none.
+  `jurisdiction` like any cloud region. `fluid apply` and `generate iac` hold the policy too,
+  not only `fluid validate`: as the GCP emitter does, the Databricks emitter refuses a placement
+  the policy forbids (`SovereigntyViolationError`, before any module exists), a missing region
+  under `strict` included. The declaration is verified, not trusted: when a region is declared
+  the module reads the workspace's metastore (`data.databricks_current_metastore`) and every
+  schema it owns carries a precondition that the metastore's region equals the declared one, so
+  `tofu plan` (a dry-run included) fails, naming both regions, before anything is written when
+  `DATABRICKS_HOST` names a workspace in another region. The region must be written as a plain
+  lower-case region name (`databricks-region-invalid` otherwise): the policy compares it
+  verbatim and it is written into the module, so `US-WEST-2` is refused rather than normalised
+  past `deniedRegions: [us-west-2]`. Two Databricks exposes declaring different regions are
+  refused (`databricks-region-conflict`: one workspace has one region). A contract with no region
+  and no `sovereignty` block gets the module it always did. `fluid verify` gains a residency
+  dimension that reads the workspace's metastore summary for every table the module manages: it
+  passes when the region matches the declaration, fails with the fix when it does not, and is
+  skipped when the contract declares none.
 
 ## [0.26.0] — 2026-11-01
 

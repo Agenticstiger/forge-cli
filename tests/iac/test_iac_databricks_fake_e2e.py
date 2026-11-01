@@ -368,12 +368,30 @@ def test_a_workspace_in_another_region_fails_the_plan_naming_both_regions(worksp
     assert fake.unknown == []
 
 
-def test_a_region_in_another_case_still_matches(workspace, fake, capfd):
+def test_a_region_in_another_case_is_refused_before_tofu(workspace, fake, capfd):
+    # The sovereignty policy compares the region verbatim, so a spelling the
+    # module normalised could pass deniedRegions and land in that region.
     path = write_contract(workspace, make_contract(region="EU-Central-1"))
 
     rc, out = apply_contract(capfd, path, "--mode", "dry-run")
 
-    assert rc == 0, out
+    assert rc != 0 and "databricks-region-invalid" in out, out
+    assert "opentofu_plan_failed" not in out
+    assert fake.schemas == {} and fake.tables == {} and fake.sql_log == []
+
+
+def test_apply_refuses_a_placement_the_sovereignty_policy_denies(workspace, fake, capfd):
+    # fluid apply runs only the schema gate, not fluid validate's policy check,
+    # so the emitter holds the policy, as the GCP emitter does.
+    contract = make_contract(region="us-west-2")
+    contract["sovereignty"] = {"deniedRegions": ["us-west-2"], "enforcementMode": "strict"}
+    path = write_contract(workspace, contract)
+
+    rc, out = apply_contract(capfd, path, "--mode", "dry-run")
+
+    assert rc != 0 and "sovereignty" in out.lower() and "us-west-2" in out, out
+    assert "opentofu_plan_failed" not in out
+    assert fake.schemas == {} and fake.tables == {} and fake.sql_log == []
 
 
 def test_no_host_names_the_variable_to_set(workspace, fake, capfd, monkeypatch):

@@ -303,14 +303,17 @@ def contract_with_region(region: str) -> Dict[str, Any]:
 
 
 def test_a_workspace_in_the_declared_region_passes_residency(workspace):
-    workspace.region = "eu-central-1"
+    # The contract's region is canonical (the emitter refuses any other
+    # spelling); the metastore's is compared without case, as the plan's
+    # precondition lower()s it.
+    workspace.region = "EU-Central-1"
 
-    result = verify(workspace, contract_with_region("EU-Central-1"))
+    result = verify(workspace, contract_with_region("eu-central-1"))
 
     assert result["status"] == "match"
     residency = result["dimensions"]["residency"]
     assert residency["status"] == "pass"
-    assert residency["declared"] == "eu-central-1" and residency["actual"] == "eu-central-1"
+    assert residency["declared"] == "eu-central-1" and residency["actual"] == "EU-Central-1"
 
 
 def test_a_workspace_in_another_region_fails_residency_with_a_fix(workspace):

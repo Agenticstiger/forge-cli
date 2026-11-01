@@ -63,11 +63,16 @@ resources, with no new schema field (fluid-schema 0.7.6):
   (``data.databricks_current_metastore``) and every schema it owns carries a
   ``lifecycle.precondition`` that the metastore's region equals the declared
   one, so ``tofu plan`` fails, before anything is written, when
-  ``DATABRICKS_HOST`` names a workspace in another region. The value is
-  lower-cased and must be a plain region name (it is interpolated into the
-  module): ``databricks-region-invalid`` otherwise; two exposes declaring
-  different regions is ``databricks-region-conflict``, a workspace having one.
-  A contract that declares no region gets the module it always did.
+  ``DATABRICKS_HOST`` names a workspace in another region. The value must be a
+  plain lower-case region name as written (the policy compares it verbatim, and
+  it is interpolated into the module): ``databricks-region-invalid`` otherwise;
+  two exposes declaring different regions is ``databricks-region-conflict``, a
+  workspace having one. The policy itself is held where the data would land, as
+  the GCP emitter holds it: :meth:`DatabricksIacPlugin.emit`, the one way
+  ``fluid apply`` and ``generate iac`` reach this module, raises
+  ``SovereigntyViolationError`` on a placement the policy refuses (a missing
+  region under ``strict`` included). A contract that declares no region and no
+  sovereignty block gets the module it always did.
 
 Two inputs come from the environment, never from the contract:
 ``DATABRICKS_HOST``, which the provider reads itself (a contract that named the
@@ -91,6 +96,7 @@ so an existing table must be imported before the first apply.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -120,6 +126,8 @@ from .databricks_jobs import (
     run_as_allowlist,
 )
 
+_LOG = logging.getLogger(__name__)
+
 #: The SQL warehouse every ``databricks_sql_table`` statement runs on.
 WAREHOUSE_ENV = "DATABRICKS_WAREHOUSE_ID"
 
@@ -141,9 +149,10 @@ _LOCATION_KEYS = frozenset(
     {"database", "schema", "table", "partitionBy", "host", "catalog", "warehouse", "region"}
 )
 
-#: A declared workspace region, lower-cased: ``eu-central-1``, ``westeurope``,
-#: ``us-east1``. It is interpolated into the tf.json, where ``${`` and ``%{``
-#: are template syntax, so this is a security boundary, not a style check.
+#: A declared workspace region, written lower-case: ``eu-central-1``,
+#: ``westeurope``, ``us-east1``. It is interpolated into the tf.json, where
+#: ``${`` and ``%{`` are template syntax, and the sovereignty policy compares it
+#: verbatim, so this is a security boundary, not a style check.
 _REGION_RE = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 
 #: FLUID permission → Unity Catalog table privilege. ``create`` has no table
@@ -655,23 +664,85 @@ def _resolve_table(
 
 
 def _region(where: str, loc: Mapping[str, Any], refusals: List[UnsupportedBindingError]) -> str:
-    """The declared workspace region, lower-cased; ``""`` if none, or refused."""
+    """The declared workspace region, exactly as written; ``""`` if none, or refused.
+
+    Never normalised: the sovereignty policy compares ``binding.location.region``
+    verbatim with ``allowedRegions`` and ``deniedRegions`` (``policy/
+    sovereignty.py``), so a ``US-WEST-2`` this module lower-cased passed a
+    ``deniedRegions: [us-west-2]`` check and then planned against a us-west-2
+    workspace. ``fullmatch``, not ``match``: ``$`` also matches before a final
+    newline.
+    """
     raw = loc.get("region")
     if not _set(raw):
         return ""
-    region = str(raw).strip().lower()
-    if not isinstance(raw, str) or not _REGION_RE.match(region):
+    if not isinstance(raw, str) or not _REGION_RE.fullmatch(raw):
         refusals.append(
             _refusal(
                 "region-invalid",
-                f"{where} has binding.location.region {raw!r}, which is not a region name. A "
-                "region is lower-case letters, digits and hyphens, starting with a letter "
-                "(eu-central-1, westeurope): it is written into the module the plan runs.",
-                "Set location.region to the region of the workspace DATABRICKS_HOST names.",
+                f"{where} has binding.location.region {raw!r}, which is not a region name as "
+                "the sovereignty policy compares it: lower-case letters, digits and hyphens, "
+                "starting with a letter, no spaces (eu-central-1, westeurope). It is also "
+                "written into the module the plan runs.",
+                "Set location.region, written that way, to the region of the workspace "
+                "DATABRICKS_HOST names.",
             )
         )
         return ""
-    return region
+    return raw
+
+
+def _enforce_sovereignty(contract: Mapping[str, Any], tables: Sequence[_Table]) -> None:
+    """Raise when the contract's ``sovereignty`` policy refuses where the tables land.
+
+    ``fluid validate`` and ``plan --check-sovereignty`` run the policy over the
+    whole contract, but ``fluid apply`` and ``generate iac`` reach this module
+    through :meth:`DatabricksIacPlugin.emit` alone, so the policy is held there
+    too, where the data would land, as the GCP emitter holds it
+    (``providers/gcp/util/sovereignty.py::enforce_gcp_sovereignty``). Each
+    Databricks table is one placement, in the region its expose declares (none
+    is check 0); the module's precondition then proves the workspace is there.
+    Not in :func:`_compile`: ``fluid validate`` reports the policy itself, and
+    would report each finding twice.
+    """
+    sovereignty = contract.get("sovereignty")
+    if not isinstance(sovereignty, Mapping) or not sovereignty or not tables:
+        return
+    from ..._errors import SovereigntyViolationError, doc_url
+    from ...policy.sovereignty import SovereigntyValidator
+
+    placements = [(table.expose_id, table.region or None) for table in tables]
+    _, violations = SovereigntyValidator().check_placements(
+        sovereignty, placements, region_placed={where for where, _ in placements}
+    )
+    errors = [v for v in violations if v.severity == "error"]
+    for v in violations:
+        if v.severity != "error":
+            _LOG.warning("databricks sovereignty (%s): %s: %s", v.severity, v.expose_id, v.message)
+    if not errors:
+        return
+    allowed = [str(r) for r in (sovereignty.get("allowedRegions") or [])]
+    # ``where: message``, de-duplicated in order. Not ``[where]``: the CLI
+    # renders errors through rich, which reads square brackets as markup.
+    findings = "; ".join(dict.fromkeys(f"{v.expose_id}: {v.message}" for v in errors))
+    raise SovereigntyViolationError(
+        what=f"Databricks placement refused by the sovereignty policy: {findings}",
+        why=(
+            "contract.sovereignty is enforced "
+            f"({sovereignty.get('enforcementMode', 'strict')}) and "
+            + (
+                f"allows {', '.join(allowed)}"
+                if allowed
+                else f"requires jurisdiction {sovereignty.get('jurisdiction')!r}"
+            )
+            + "; the tables would be created in the workspace DATABRICKS_HOST names."
+        ),
+        fix=(
+            "Set binding.location.region on every databricks expose to the region of the "
+            "workspace DATABRICKS_HOST names, one the policy allows, or change the policy."
+        ),
+        doc=doc_url("sovereignty"),
+    )
 
 
 def _refuse_region_conflict(
@@ -1320,6 +1391,7 @@ class DatabricksIacPlugin:
         compiled = _compile(contract, os.environ)
         if compiled.refusals:
             raise compiled.refusals[0]
+        _enforce_sovereignty(contract, compiled.tables)
         return compiled.resources
 
     def emit_data(
@@ -1639,6 +1711,9 @@ def managed_objects(
     for kind, full_name, principal, _privileges in compiled.grants:
         if kind == "table" and principal not in readers.setdefault(full_name, []):
             readers[full_name].append(principal)
+    # The module checks every schema against the one declared region, so verify
+    # checks every table against it too, not only the expose that declared it.
+    region = next((table.region for table in compiled.tables if table.region), "")
     tables = [
         ManagedTable(
             expose_id=table.expose_id,
@@ -1648,7 +1723,7 @@ def managed_objects(
             ),
             readers=tuple(readers.get(table.full_name, ())),
             dbt_written=table.full_name in compiled.dbt_written,
-            region=table.region,
+            region=region,
         )
         for table in compiled.tables
     ]
