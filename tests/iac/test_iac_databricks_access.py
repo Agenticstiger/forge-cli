@@ -75,7 +75,10 @@ def _sha8(definition: str) -> str:
 
 
 # ── the exact SQL ───────────────────────────────────────────────────────────
-MEMBER = "(is_account_group_member('fluid-demo-lab-analysts'))"
+MEMBER = (
+    "(is_account_group_member('fluid-demo-lab-analysts') "
+    "OR current_user() = 'fluid-demo-lab-analysts')"
+)
 ROW_BODY = (
     f"NOT {MEMBER} OR ({MEMBER} AND (`consent_data_analytics` = TRUE AND "
     "(`is_suppressed` IS NULL OR `is_suppressed` = FALSE)))"
@@ -306,7 +309,11 @@ def test_a_principal_in_a_deny_and_a_mask_gets_the_deny_and_a_mask_only_group_re
 
 
 # ── principals ──────────────────────────────────────────────────────────────
-def test_users_and_service_principals_are_matched_by_current_user():
+def _both_ways(identity: str) -> str:
+    return f"is_account_group_member('{identity}') OR current_user() = '{identity}'"
+
+
+def test_every_identity_is_tested_as_a_group_and_as_a_user_whatever_its_prefix():
     users = [
         {"principal": "user:ana@northwind.example", "columns": ["email"], "access": "deny"},
         {"principal": "serviceAccount:etl", "columns": ["score"], "access": "deny"},
@@ -322,11 +329,35 @@ def test_users_and_service_principals_are_matched_by_current_user():
         },
     )
     by_column = {m.column: m.function.create for m in compiled(doc).masks}
-    assert "WHEN (current_user() = 'ana@northwind.com') THEN" in by_column["email"]
-    assert (
-        "WHEN (current_user() = '0f1e2d3c-1111-2222-3333-444455556666') THEN" in by_column["score"]
-    )
-    assert "is_account_group_member" not in by_column["email"]
+    assert f"WHEN ({_both_ways('ana@northwind.com')}) THEN" in by_column["email"]
+    assert f"WHEN ({_both_ways('0f1e2d3c-1111-2222-3333-444455556666')}) THEN" in by_column["score"]
+
+
+@pytest.mark.parametrize(
+    "identity", ["0f1e2d3c-1111-2222-3333-444455556666", "ana@northwind.com"], ids=["sp", "email"]
+)
+def test_a_group_principal_mapped_to_a_service_principal_or_a_user_still_matches_them(identity):
+    """binding.principals may map a ``group:`` principal to a service principal's application
+    ID or a user's email. The grant to that identity applies, so the restriction must too."""
+    doc = contract(principals={ANALYSTS: identity, STEWARDS: STEWARDS_GROUP})
+    enforcement = compiled(doc)
+    test = f"current_user() = '{identity}'"
+    assert test in enforcement.row_filter.function.create
+    assert all(test in m.function.create for m in enforcement.masks)
+    assert enforcement.restricted == (identity,)
+
+
+def test_a_session_user_that_is_a_mapped_identity_and_in_no_group_is_restricted():
+    """DuckDB's session user is ``duckdb``: map the group principal to it, and put it in no
+    group, as a service principal is."""
+    doc = contract(principals={ANALYSTS: "duckdb", STEWARDS: STEWARDS_GROUP})
+    enforcement = compiled(doc)
+    assert _masked(enforcement, "msisdn", [], "0791234567") == "XXXXX4567"
+    assert _masked(enforcement, "email", [], "a@b.c") is None
+    rows = [(True, None), (False, None), (None, None)]
+    assert _filter_rows(enforcement, [], rows) == [(True, None)]
+    # A group of that name restricts a member too: both tests are made.
+    assert _masked(enforcement, "email", ["duckdb"], "a@b.c") is None
 
 
 def test_a_logical_principal_with_several_identities_matches_any_of_them():
@@ -334,7 +365,7 @@ def test_a_logical_principal_with_several_identities_matches_any_of_them():
         restrictions=[DENY], filters=None, principals={ANALYSTS: ["g-one", "g-two"], STEWARDS: "s"}
     )
     create = compiled(doc).masks[0].function.create
-    assert "(is_account_group_member('g-one') OR is_account_group_member('g-two'))" in create
+    assert f"({_both_ways('g-one')} OR {_both_ways('g-two')})" in create
     assert compiled(doc).restricted == ("g-one", "g-two")
 
 
@@ -354,6 +385,7 @@ def test_principal_names_are_escaped_string_literals_and_identifiers():
     )
     create = compiled(doc).masks[0].function.create
     assert "current_user() = 'o\\'brien\\\\'" in create
+    assert "is_account_group_member('o\\'brien\\\\')" in create
     # Databricks' own parser reads it back as the name, not as o + brien.
     import sqlglot
 

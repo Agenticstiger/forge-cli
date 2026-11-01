@@ -191,25 +191,22 @@ def _function(
 # ── principals ─────────────────────────────────────────────────────────
 
 
-def _kind(principal: str, at: str) -> str:
-    """How a logical principal is recognised in SQL, from its prefix.
+def _check_principal(principal: str, at: str) -> None:
+    """Refuse a principal no Unity Catalog identity can stand for: no prefix, or ``domain:``.
 
-    ``group:`` is an account group (``is_account_group_member``), ``user:`` a user
-    (``current_user()``), ``serviceAccount:`` a service principal (``current_user()`` is its
-    application ID). A principal with no prefix, or ``domain:``, names no one SQL can match.
+    The prefix is not used to choose how the identity is tested: ``binding.principals`` may
+    map a ``group:`` principal to a service principal's application ID or to a user's email,
+    and a test of the wrong kind would match no one while the grant to that identity still
+    applies, which fails open. Every identity is tested as a group and as a user
+    (:func:`_member_sql`).
     """
     head, sep, rest = logical_key(principal).partition(":")
-    if sep and rest.strip():
-        if head == "group":
-            return GROUP
-        if head == "user":
-            return USER
-        if head == "serviceAccount":
-            return SERVICE_PRINCIPAL
+    if sep and rest.strip() and head in (GROUP, USER, SERVICE_PRINCIPAL):
+        return
     raise _refusal(
         "principal-kind",
         f"{at} names principal {principal!r}, which is not a group:, user: or serviceAccount: "
-        "principal, so there is no Unity Catalog SQL test for it.",
+        "principal, so there is no Unity Catalog identity to test for.",
         "Write the principal as group:<name>, user:<email> or serviceAccount:<name>, and map "
         "it in binding.principals to the Databricks identity.",
     )
@@ -228,29 +225,33 @@ def string_literal(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def _member_sql(kind: str, identity: str) -> str:
+def _member_sql(identity: str) -> str:
+    """True when the session user is ``identity``, whatever it is.
+
+    A group, a user and a service principal are all tested: ``is_account_group_member`` for the
+    name as a group, ``current_user()`` for it as a user's email or a service principal's
+    application ID. A name that is both a group and a user is restricted either way, which errs
+    closed.
+    """
     reject_control_chars(identity, "principal")
     literal = string_literal(identity)
-    if kind == GROUP:
-        return f"is_account_group_member({literal})"
-    return f"current_user() = {literal}"
+    return f"is_account_group_member({literal}) OR current_user() = {literal}"
 
 
 class _Resolver:
-    """Logical principals to ``[(kind, identity)]``, through ``binding.principals``."""
+    """Logical principals to their Unity Catalog identities, through ``binding.principals``."""
 
     def __init__(self, binding: Mapping[str, Any], where: str):
         self._map = principal_map(binding)
         self._where = where
 
-    def __call__(self, principal: str, at: str) -> Tuple[Tuple[str, str], ...]:
-        kind = _kind(principal, at)
-        identities = resolve_principal(principal, self._map, platform=DATABRICKS, where=self._where)
-        return tuple((kind, identity) for identity in identities)
+    def __call__(self, principal: str, at: str) -> Tuple[str, ...]:
+        _check_principal(principal, at)
+        return resolve_principal(principal, self._map, platform=DATABRICKS, where=self._where)
 
 
-def _any_member(members: Sequence[Tuple[str, str]]) -> str:
-    terms = sorted({_member_sql(kind, identity) for kind, identity in members})
+def _any_member(identities: Sequence[str]) -> str:
+    terms = sorted({_member_sql(identity) for identity in identities})
     return "(" + " OR ".join(terms) + ")"
 
 
@@ -438,8 +439,8 @@ def _compile_masks(
     resolve: _Resolver,
     restricted: Dict[str, None],
 ) -> Tuple[MaskSpec, ...]:
-    denied: Dict[str, List[Tuple[str, str]]] = {}
-    masked: Dict[str, List[Tuple[str, str]]] = {}
+    denied: Dict[str, List[str]] = {}
+    masked: Dict[str, List[str]] = {}
     rules: Dict[str, str] = {}
     for i, restriction in enumerate(restrictions):
         at = f"{where}.policy.authz.columnRestrictions[{i}]"
@@ -457,7 +458,7 @@ def _compile_masks(
                 "access: mask to let them read them masked.",
             )
         members = resolve(restriction.principal, at)
-        for _kind_, identity in members:
+        for identity in members:
             restricted.setdefault(identity, None)
         for column in restriction.columns:
             canonical = lower[column.lower()]
@@ -520,7 +521,7 @@ def _compile_row_filter(
         return None
     parts: List[Tuple[str, str]] = []  # (membership SQL, predicate SQL)
     used: Dict[str, None] = {}
-    all_members: List[Tuple[str, str]] = []
+    all_members: List[str] = []
     for i, entry in enumerate(filters):
         at = f"{where}.policy.authz.rowFilters[{i}]"
         members = resolve(entry.principal, at)
@@ -529,7 +530,7 @@ def _compile_row_filter(
         sql, columns = render_predicate(entry.where, lower, at, types)
         for column in columns:
             used.setdefault(column, None)
-        for _kind_, identity in members:
+        for identity in members:
             restricted.setdefault(identity, None)
         all_members.extend(members)
         parts.append((_any_member(members), sql))
