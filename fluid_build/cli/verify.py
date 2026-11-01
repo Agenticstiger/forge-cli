@@ -1191,6 +1191,7 @@ def _render_masking_dimension(masking: Dict[str, Any], ok: str, heading: str) ->
 #: Dimensions that list findings (``_verify_databricks``), and their headings.
 _FINDINGS_DIMENSIONS = (
     ("catalog_access", "\n   🔍 Catalog access (USE CATALOG)"),
+    ("residency", "\n   🔍 Residency (workspace region)"),
     ("jobs", "\n   🔍 Jobs"),
 )
 
@@ -1205,7 +1206,12 @@ def _render_findings_dimensions(dimensions: Dict[str, Any]) -> None:
         if dimension.get("status") == "pass":
             cprint(f"      ✅ PASS - {dimension.get('message', '')}", markup=False)
             continue
+        if dimension.get("status") == "skip":
+            cprint(f"      ⚪ SKIPPED - {dimension.get('message', '')}", markup=False)
+            continue
         cprint(f"      ❌ FAIL - {dimension.get('message', '')}", markup=False)
+        if dimension.get("fix"):
+            cprint(f"         Fix: {dimension['fix']}", markup=False)
         for finding in dimension.get("findings") or []:
             cprint(f"         ❌ {finding.get('message', '')}", markup=False)
             if finding.get("fix"):

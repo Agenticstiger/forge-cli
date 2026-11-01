@@ -302,9 +302,16 @@ _REFUSALS = [
         {"exposes.0.binding.location.partitionBy": ["region", "Region"]},
         "partition-duplicate",
     ),
-    # Location keys the emitter would drop: an external path, a cloud region.
+    # A location key the emitter would drop: an external path.
     ("path", {"exposes.0.binding.location.path": "s3://lake/orders/"}, "location-field"),
-    ("region", {"exposes.0.binding.location.region": "eu-west-1"}, "location-field"),
+    # The region is written into the module, so only a plain region name passes.
+    ("region-template", {"exposes.0.binding.location.region": "${x}"}, "region-invalid"),
+    ("region-directive", {"exposes.0.binding.location.region": "%{if true}"}, "region-invalid"),
+    ("region-space", {"exposes.0.binding.location.region": "EU WEST"}, "region-invalid"),
+    ("region-long", {"exposes.0.binding.location.region": "a" * 80}, "region-invalid"),
+    ("region-short", {"exposes.0.binding.location.region": "a"}, "region-invalid"),
+    ("region-number", {"exposes.0.binding.location.region": 12}, "region-invalid"),
+    ("region-quote", {"exposes.0.binding.location.region": 'eu"'}, "region-invalid"),
 ]
 
 
@@ -320,6 +327,164 @@ def test_refusal(label: str, overrides: Dict[str, Any], kind: str):
     # action, a smaller plan instead of an error.
     with pytest.raises(UnsupportedBindingError):
         dbx.planned_objects(contract)
+
+
+# ── residency: binding.location.region ──────────────────────────────────────
+_METASTORE = "data.databricks_current_metastore.sales_orders_metastore.metastore_info[0].region"
+
+
+class TestRegion:
+    def test_a_declared_region_is_accepted(self):
+        contract = _contract(**{"exposes.0.binding.location.region": "eu-central-1"})
+        assert dbx.validate_databricks_binding(contract)[0] == []
+        assert IAC_PLUGINS["databricks"].emit(contract)
+
+    def test_the_metastore_is_read_and_every_schema_checks_it(self):
+        doc = _module(_contract(**{"exposes.0.binding.location.region": "eu-central-1"}))
+        assert doc["data"]["databricks_current_metastore"] == {"sales_orders_metastore": {}}
+        assert doc["data"]["databricks_catalog"] == {"sales_orders_main": {"name": "main"}}
+        schema = doc["resource"]["databricks_schema"]["sales_orders_main_sales"]
+        (check,) = schema["lifecycle"]["precondition"]
+        assert check["condition"] == f'${{lower({_METASTORE}) == "eu-central-1"}}'
+        message = check["error_message"]
+        assert "eu-central-1" in message and "${" + _METASTORE + "}" in message
+        assert "DATABRICKS_HOST" in message and "binding.location.region" in message
+
+    def test_without_a_region_the_module_is_unchanged(self):
+        plain = _module(_contract())
+        declared = _module(_contract(**{"exposes.0.binding.location.region": "eu-central-1"}))
+        assert "databricks_current_metastore" not in plain["data"]
+        assert "lifecycle" not in plain["resource"]["databricks_schema"]["sales_orders_main_sales"]
+        # A declared region only adds the data source and the precondition.
+        del declared["data"]["databricks_current_metastore"]
+        del declared["resource"]["databricks_schema"]["sales_orders_main_sales"]["lifecycle"]
+        assert declared == plain
+
+    @pytest.mark.parametrize(
+        "spelled", ["EU-Central-1", " eu-central-1", "eu-central-1 ", "eu-central-1\n"]
+    )
+    def test_a_region_not_written_as_the_policy_compares_it_is_refused(self, spelled):
+        # Normalising it let US-WEST-2 pass deniedRegions: [us-west-2] (the policy
+        # compares verbatim) and then plan against a us-west-2 workspace.
+        contract = _contract(**{"exposes.0.binding.location.region": spelled})
+        errors, _ = dbx.validate_databricks_binding(contract)
+        assert any("region" in error for error in errors)
+        with pytest.raises(UnsupportedBindingError) as exc:
+            IAC_PLUGINS["databricks"].emit(contract)
+        assert exc.value.kind == "databricks-region-invalid"
+
+    def test_verify_checks_every_table_against_the_declared_region(self):
+        contract = _contract(**{"exposes.0.binding.location.region": "eu-central-1"})
+        second = copy.deepcopy(contract["exposes"][0])
+        second["exposeId"] = "orders_b"
+        second["binding"]["location"].update(table="orders_b")
+        del second["binding"]["location"]["region"]
+        contract["exposes"].append(second)
+        tables, _ = dbx.managed_objects(contract)
+        assert [table.region for table in tables] == ["eu-central-1", "eu-central-1"]
+
+    def test_two_regions_in_one_contract_are_refused(self):
+        contract = _contract(**{"exposes.0.binding.location.region": "eu-central-1"})
+        second = copy.deepcopy(contract["exposes"][0])
+        second["exposeId"] = "orders_us"
+        second["binding"]["location"].update(table="orders_us", region="us-west-2")
+        contract["exposes"].append(second)
+        errors, _ = dbx.validate_databricks_binding(contract)
+        assert len(errors) == 1 and "eu-central-1" in errors[0] and "us-west-2" in errors[0]
+        with pytest.raises(UnsupportedBindingError) as exc:
+            IAC_PLUGINS["databricks"].emit(contract)
+        assert exc.value.kind == "databricks-region-conflict"
+
+    def test_the_same_region_twice_is_one_data_source_and_no_conflict(self):
+        contract = _contract(**{"exposes.0.binding.location.region": "eu-central-1"})
+        second = copy.deepcopy(contract["exposes"][0])
+        second["exposeId"] = "orders_b"
+        second["binding"]["location"].update(table="orders_b", region="eu-central-1")
+        contract["exposes"].append(second)
+        assert dbx.validate_databricks_binding(contract)[0] == []
+        doc = _module(contract)
+        assert list(doc["data"]["databricks_current_metastore"]) == ["sales_orders_metastore"]
+
+    def test_a_schema_two_exposes_share_keeps_the_check_whichever_declares_it(self):
+        # The schema resource is claimed once per table and keeps the last body,
+        # so taking the region per table lost the precondition when the last
+        # expose in a shared schema declared none.
+        contract = _contract(**{"exposes.0.binding.location.region": "eu-central-1"})
+        second = copy.deepcopy(contract["exposes"][0])
+        second["exposeId"] = "orders_b"
+        second["binding"]["location"].update(table="orders_b")
+        del second["binding"]["location"]["region"]
+        contract["exposes"].append(second)
+        assert dbx.validate_databricks_binding(contract)[0] == []
+        schema = _module(contract)["resource"]["databricks_schema"]["sales_orders_main_sales"]
+        (check,) = schema["lifecycle"]["precondition"]
+        assert check["condition"] == f'${{lower({_METASTORE}) == "eu-central-1"}}'
+
+    def test_every_schema_is_checked_when_one_expose_declares_the_region(self):
+        contract = _contract(**{"exposes.0.binding.location.region": "eu-central-1"})
+        second = copy.deepcopy(contract["exposes"][0])
+        second["exposeId"] = "events"
+        second["binding"]["location"].update(schema="events", table="events")
+        del second["binding"]["location"]["region"]
+        contract["exposes"].append(second)
+        schemas = _module(contract)["resource"]["databricks_schema"]
+        assert sorted(schemas) == ["sales_orders_main_events", "sales_orders_main_sales"]
+        assert all("precondition" in body.get("lifecycle", {}) for body in schemas.values())
+
+    def test_the_import_and_plan_paths_are_unaffected(self):
+        plain, declared = _contract(), _contract(
+            **{"exposes.0.binding.location.region": "eu-central-1"}
+        )
+        plugin = IAC_PLUGINS["databricks"]
+        assert plugin.discover_imports(declared) == plugin.discover_imports(plain)
+        assert dbx.planned_objects(declared) == dbx.planned_objects(plain)
+        (table,) = dbx.managed_objects(declared)[0]
+        assert table.region == "eu-central-1"
+
+
+class TestSovereigntyOnEmit:
+    """``fluid apply`` and ``generate iac`` reach the module through ``emit`` alone,
+    so the policy is held there, as the GCP emitter holds it."""
+
+    @staticmethod
+    def _sovereign(mode: str = "strict", **policy: Any) -> Dict[str, Any]:
+        contract = _contract()
+        contract["sovereignty"] = {"enforcementMode": mode, **policy}
+        return contract
+
+    def test_no_region_under_strict_is_refused_on_emit(self):
+        from fluid_build._errors import SovereigntyViolationError
+
+        contract = self._sovereign(jurisdiction="EU")
+        with pytest.raises(SovereigntyViolationError) as exc:
+            IAC_PLUGINS["databricks"].emit(contract)
+        assert "orders" in str(exc.value) and "no region" in str(exc.value)
+
+    def test_a_declared_denied_region_is_refused_on_emit(self):
+        from fluid_build._errors import SovereigntyViolationError
+
+        contract = self._sovereign(deniedRegions=["us-west-2"])
+        contract["exposes"][0]["binding"]["location"]["region"] = "us-west-2"
+        with pytest.raises(SovereigntyViolationError) as exc:
+            IAC_PLUGINS["databricks"].emit(contract)
+        assert "us-west-2" in str(exc.value)
+        # A deny-list-only policy names its deny-list, not a missing jurisdiction.
+        assert "denies us-west-2" in exc.value.why and "None" not in exc.value.why
+
+    def test_a_declared_allowed_region_is_emitted(self):
+        contract = self._sovereign(jurisdiction="EU", allowedRegions=["eu-central-1"])
+        contract["exposes"][0]["binding"]["location"]["region"] = "eu-central-1"
+        assert IAC_PLUGINS["databricks"].emit(contract)
+
+    def test_advisory_only_warns(self, caplog):
+        contract = self._sovereign("advisory", jurisdiction="EU")
+        with caplog.at_level(logging.WARNING):
+            assert IAC_PLUGINS["databricks"].emit(contract)
+        assert "databricks sovereignty" in caplog.text
+
+    def test_validate_reports_the_policy_once_not_from_the_binding_check(self):
+        # fluid validate runs the policy itself; the binding check stays silent on it.
+        assert dbx.validate_databricks_binding(self._sovereign(jurisdiction="EU"))[0] == []
 
 
 def test_a_build_that_names_its_own_host_is_refused():

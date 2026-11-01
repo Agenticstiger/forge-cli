@@ -617,9 +617,12 @@ class SovereigntyValidator:
 
 #: Platforms whose bindings put data in a cloud region: a binding on one of
 #: these with a sovereignty block and no region is a finding (check 0), not a
-#: skip. Other platforms (``local`` above all, and those whose region lives
-#: outside the binding) keep the old behaviour: no region, nothing checked.
-REGION_PLACED_PLATFORMS = frozenset({"aws", "gcp", "azure"})
+#: skip. A Databricks workspace's region is declared in
+#: ``binding.location.region`` and verified against the workspace's metastore
+#: at plan time (``iac/providers/databricks.py``). Other platforms (``local``
+#: above all, and those whose region lives outside the binding) keep the old
+#: behaviour: no region, nothing checked.
+REGION_PLACED_PLATFORMS = frozenset({"aws", "gcp", "azure", "databricks"})
 
 #: Multi-region locations the vendored region table does not carry. BigQuery
 #: and Cloud Storage both name their multi-regions ``US`` (data centres in the
