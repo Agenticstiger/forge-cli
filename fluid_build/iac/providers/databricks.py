@@ -41,6 +41,17 @@ resources, with no new schema field (fluid-schema 0.7.6):
   also need ``USE CATALOG`` on the catalog, which the product does not own and
   never grants: the apply names who needs it (:meth:`plan_notices`), and
   ``fluid verify`` checks it.
+* A contract's governance labels, the same ones AWS tags and GCP labels carry
+  (``iac/governance_labels.py``: ``labels``, classification, jurisdiction, regulation,
+  residency), are Unity Catalog tags: one ``databricks_entity_tag_assignment`` per
+  tag on each owned schema (the contract's own) and each table (the expose's too).
+  A tag key may not contain ``-``, so each ``-`` becomes ``_``
+  (``data-classification`` is ``data_classification``); two labels that meet at one
+  key are ``databricks-tag-collision`` and more than the 50 tags a securable holds is
+  ``databricks-tags-too-many``, refused rather than overwritten or dropped. An
+  existing assignment is imported best-effort before the first apply, and removing a
+  label destroys only its assignment, which holds no data. Whether a tag survives a
+  dbt ``CREATE OR REPLACE`` is undocumented, so ``fluid verify`` is the gate.
 * A dbt build that runs on Databricks (``execution.runtime.platform:
   databricks``) becomes a serverless ``databricks_job`` with a ``dbt_task``, and
   a local project its ``databricks_workspace_file`` uploads
@@ -106,6 +117,7 @@ from ...providers._sql_safety import validate_ident, validate_sql_type_param_pay
 from ...util.contract import is_databricks_job_build
 from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
+from ..governance_labels import governance_labels
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref, unique_ident
 from ..principals import (
@@ -255,6 +267,13 @@ class _Compiled:
     dbt_written: List[str] = field(default_factory=list)
     #: What applies but is worth saying (``fluid validate`` warnings).
     warnings: List[str] = field(default_factory=list)
+    #: ``(entity type, full name, tag key, tag value)`` per tag assignment emitted.
+    tags: List[Tuple[str, str, str, str]] = field(default_factory=list)
+
+
+#: Unity Catalog allows 50 tags on a securable ("Apply tags to Unity Catalog securable
+#: objects", Databricks docs). Its keys may not contain ``. , - = / :``.
+_MAX_TAGS = 50
 
 
 def _refusal(kind: str, message: str, *remediation: str) -> UnsupportedBindingError:
@@ -994,6 +1013,7 @@ def _compile(
             compiled, table, cid, warehouse, region, dbt_owned=table.expose_id in dbt_written
         )
         _emit_grants(compiled, table, cid, privileges.get(table.full_name, {}))
+        _emit_tags(compiled, table, cid, contract)
     _merge_jobs(
         compiled,
         compile_dbt_jobs(
@@ -1172,6 +1192,116 @@ def _emit_grants(
             principal,
             ["USE_SCHEMA"],
         )
+
+
+def _uc_tags(
+    where: str,
+    contract: Mapping[str, Any],
+    exposure: Mapping[str, Any],
+    refusals: List[UnsupportedBindingError],
+) -> Dict[str, str]:
+    """The governance labels of ``where`` as Unity Catalog tags, or ``{}`` and a refusal.
+
+    ``governance_labels`` keys are ``[a-z0-9_-]``, and a tag key may not contain
+    ``-``, so each ``-`` becomes ``_``; the values go as they are. Two labels that
+    meet at one key, or more tags than a securable holds, are refused: the module
+    would otherwise overwrite one tag with another, or drop some without a word.
+    """
+    labels = governance_labels(contract, exposure, limit=None)
+    tags: Dict[str, str] = {}
+    source: Dict[str, str] = {}
+    for label, value in labels.items():
+        key = label.replace("-", "_")
+        if key in tags:
+            refusals.append(
+                _refusal(
+                    "tag-collision",
+                    f"{where}: the labels {source[key]!r} and {label!r} are both the Unity "
+                    f"Catalog tag key {key!r} (a tag key may not contain '-', so each '-' "
+                    "becomes '_'), and one would silently replace the other.",
+                    "Rename one of the labels so they differ once '-' is read as '_'.",
+                )
+            )
+            return {}
+        tags[key] = value
+        source[key] = label
+    if len(tags) > _MAX_TAGS:
+        refusals.append(
+            _refusal(
+                "tags-too-many",
+                f"{where} would carry {len(tags)} governance tags, and Unity Catalog allows "
+                f"{_MAX_TAGS} on a securable, so the rest would be dropped without a word.",
+                f"Remove labels from the contract (or the expose) until {_MAX_TAGS} or fewer "
+                "remain; the classification, jurisdiction, regulation and residency each count "
+                "as one.",
+            )
+        )
+        return {}
+    return tags
+
+
+def _claim_tags(
+    compiled: _Compiled,
+    prefix: str,
+    entity: Tuple[str, str, str],
+    tags: Mapping[str, str],
+) -> None:
+    """One ``databricks_entity_tag_assignment`` per tag, and the import that adopts it.
+
+    ``entity`` is ``(entity type, full name, reference)``. The reference orders the
+    assignment after the schema or table it tags (their ``id`` is the full name, read
+    from the provider's ``resource_schema.go`` and ``resource_sql_table.go`` at
+    v1.140.0). The import id is the provider's, ``entity_type,entity_name,tag_key``;
+    it is best-effort because it fails for an entity not created yet, and the
+    assignment's create sets the same value anyway.
+    """
+    kind, full_name, ref = entity
+    for tag_key, tag_value in sorted(tags.items()):
+        key = f"{prefix}_{unique_ident(tag_key)}"
+        address = f"databricks_entity_tag_assignment.{key}"
+        owner = f"tag {tag_key!r} on {kind} {full_name}"
+        first = address not in compiled.owners
+        _claim(
+            compiled,
+            "databricks_entity_tag_assignment",
+            key,
+            owner,
+            {
+                "entity_type": kind,
+                "entity_name": ref,
+                "tag_key": tag_key,
+                "tag_value": tag_value,
+            },
+        )
+        if first and compiled.owners.get(address) == owner:
+            compiled.imports.append(
+                ImportBlock(address, f"{kind},{full_name},{tag_key}", best_effort=True)
+            )
+            compiled.tags.append((kind, full_name, tag_key, tag_value))
+
+
+def _emit_tags(compiled: _Compiled, table: _Table, cid: str, contract: Mapping[str, Any]) -> None:
+    """The governance labels on the table's schema and on the table.
+
+    The schema carries the contract's own (no expose's), so two exposes in one schema
+    claim one and the same body at each address (:func:`_claim` keeps the last).
+    """
+    _catalog_key, schema_key, table_key = _keys(cid, table)
+    schema_name = f"{table.catalog}.{table.schema}"
+    on_schema = _uc_tags(f"schema {schema_name}", contract, {}, compiled.refusals)
+    _claim_tags(
+        compiled,
+        f"{schema_key}_schema_tag",
+        ("schemas", schema_name, tofu_ref(f"databricks_schema.{schema_key}.id")),
+        on_schema,
+    )
+    on_table = _uc_tags(table.where, contract, table.exposure, compiled.refusals)
+    _claim_tags(
+        compiled,
+        f"{table_key}_table_tag",
+        ("tables", table.full_name, tofu_ref(f"databricks_sql_table.{table_key}.id")),
+        on_table,
+    )
 
 
 def _merge_jobs(compiled: _Compiled, jobs: CompiledJobs) -> None:
@@ -1668,6 +1798,17 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "privileges": list(privileges),
             }
         )
+    for kind, full_name, tag_key, tag_value in compiled.tags:
+        actions.append(
+            {
+                "op": "databricks.tag",
+                "resource_type": "databricks_entity_tag_assignment",
+                # The provider's own import id for a tag assignment.
+                "resource_id": f"{kind},{full_name},{tag_key}",
+                "tag_key": tag_key,
+                "tag_value": tag_value,
+            }
+        )
     actions.extend(_job_actions(compiled.jobs))
     unique: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for action in actions:
@@ -1703,6 +1844,10 @@ class ManagedTable:
     dbt_written: bool
     #: The workspace region the contract declares, lower-cased; ``""`` if none.
     region: str = ""
+    #: ``(key, value)`` tags the table, and its schema, are meant to carry (the module's
+    #: ``databricks_entity_tag_assignment`` resources), sorted by key.
+    tags: Tuple[Tuple[str, str], ...] = ()
+    schema_tags: Tuple[Tuple[str, str], ...] = ()
 
 
 def managed_objects(
@@ -1718,6 +1863,9 @@ def managed_objects(
     # The module checks every schema against the one declared region, so verify
     # checks every table against it too, not only the expose that declared it.
     region = next((table.region for table in compiled.tables if table.region), "")
+    tagged: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    for kind, full_name, tag_key, tag_value in compiled.tags:
+        tagged.setdefault((kind, full_name), []).append((tag_key, tag_value))
     tables = [
         ManagedTable(
             expose_id=table.expose_id,
@@ -1728,6 +1876,10 @@ def managed_objects(
             readers=tuple(readers.get(table.full_name, ())),
             dbt_written=table.full_name in compiled.dbt_written,
             region=region,
+            tags=tuple(sorted(tagged.get(("tables", table.full_name), ()))),
+            schema_tags=tuple(
+                sorted(tagged.get(("schemas", f"{table.catalog}.{table.schema}"), ()))
+            ),
         )
         for table in compiled.tables
     ]

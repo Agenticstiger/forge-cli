@@ -267,8 +267,8 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
         data_changes, revoked = _data_bearing_changes(changes, removals)
         if revoked:
             cprint(
-                f"  {len(revoked)} access grant(s) or policy tag(s) removed (access revoked, no "
-                "data lost; not gated): " + ", ".join(revoked)
+                f"  {len(revoked)} access grant(s), policy tag(s) or tag assignment(s) removed "
+                "(access or metadata only, no data lost; not gated): " + ", ".join(revoked)
             )
         retired = _retired_definitions(changes, removals)
         if retired:
@@ -1332,7 +1332,9 @@ def _report_suppressed_drift(
 #: over ``tofu show -json`` make by resource type (OPA's Terraform tutorial weighs
 #: deletes per type). A key's IAM grant is not here: without it BigQuery cannot
 #: decrypt the table. ``databricks_grant`` is authoritative for one principal on one
-#: securable, so removing it revokes that principal's privileges and nothing else.
+#: securable, so removing it revokes that principal's privileges and nothing else. A
+#: ``databricks_entity_tag_assignment`` is one governance tag on a schema or table:
+#: removing a label from the contract deletes the tag, and the table keeps its data.
 ACCESS_ONLY_RESOURCE_TYPES = frozenset(
     {
         "google_bigquery_dataset_iam_member",
@@ -1343,6 +1345,7 @@ ACCESS_ONLY_RESOURCE_TYPES = frozenset(
         "google_data_catalog_taxonomy",
         "aws_lakeformation_permissions",
         "databricks_grant",
+        "databricks_entity_tag_assignment",
     }
 )
 

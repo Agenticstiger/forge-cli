@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 import yaml
@@ -68,13 +68,15 @@ def make_contract(
     catalog: str = "main",
     product_id: str = "dbx.fake.orders",
     region: str = "",
+    labels: Optional[Dict[str, str]] = None,
+    expose_labels: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     location: Dict[str, Any] = {"database": catalog, "schema": "sales", "table": "orders"}
     if region:
         location["region"] = region
     if partitions:
         location["partitionBy"] = list(partitions)
-    return {
+    contract = {
         "fluidVersion": "0.7.6",
         "kind": "DataProduct",
         "id": product_id,
@@ -100,6 +102,11 @@ def make_contract(
             }
         ],
     }
+    if labels:
+        contract["labels"] = dict(labels)
+    if expose_labels:
+        contract["exposes"][0]["labels"] = dict(expose_labels)
+    return contract
 
 
 def write_contract(root: Path, document: Dict[str, Any]) -> str:

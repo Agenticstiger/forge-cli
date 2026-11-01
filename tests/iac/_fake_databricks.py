@@ -17,9 +17,11 @@
 What it proves: what the real ``databricks/databricks`` provider (1.140.0) and ``tofu`` plan,
 apply and import for a live object. It serves ``data.databricks_catalog``,
 ``databricks_schema``, ``databricks_sql_table`` (whose DDL goes through the SQL Statement
-Execution API) and ``databricks_grant``. A small SQL interpreter understands exactly the
-statements ``databricks_sql_table`` sends (CREATE [OR REPLACE] TABLE, ALTER TABLE ADD / DROP /
-RENAME / ALTER COLUMN, SET / UNSET TBLPROPERTIES, CLUSTER BY, COMMENT ON TABLE, DROP TABLE).
+Execution API), ``databricks_grant`` and ``databricks_entity_tag_assignment`` (create, get,
+update, delete and the paginated list ``fluid verify`` reads; ``tags``, ``tag_page_size``). A
+small SQL interpreter understands exactly the statements ``databricks_sql_table`` sends (CREATE
+[OR REPLACE] TABLE, ALTER TABLE ADD / DROP / RENAME / ALTER COLUMN, SET / UNSET TBLPROPERTIES,
+CLUSTER BY, COMMENT ON TABLE, DROP TABLE).
 Any other statement FAILS (state ``FAILED``) and stays visible in ``sql_log``, so a new
 statement shape shows up as an error, never as a silent no-op. Every other endpoint answers a
 Databricks-shaped 404 and is recorded in ``unknown``.
@@ -420,6 +422,12 @@ class FakeDatabricks:
         self.tables: Dict[str, Dict[str, Any]] = {}  # "cat.schema.table"
         # (securable_type, full_name) -> {principal: [privileges]}
         self.grants: Dict[Tuple[str, str], Dict[str, List[str]]] = {}
+        # (entity_type, entity_name, tag_key) -> tag_value, for entity tag assignments
+        self.tags: Dict[Tuple[str, str, str], str] = {}
+        # list page size (0: one page). Every page but the last carries next_page_token, and
+        # a page_size above zero also serves an EMPTY page with a token first, which the
+        # real API is allowed to do.
+        self.tag_page_size = 0
         self.statements: Dict[str, Dict[str, Any]] = {}
         # job_id -> {job_id, created_time, creator_user_name, settings}; settings as the provider sent
         self.jobs: Dict[int, Dict[str, Any]] = {}
@@ -584,6 +592,15 @@ class FakeDatabricks:
             g = self.grants.setdefault((securable_type, full_name), {})
             g[principal] = sorted(set(g.get(principal, [])) | set(privileges))
 
+    def tag(self, entity_type: str, full_name: str, key: str, value: str = "") -> None:
+        """Seed a tag assignment, e.g. ``tag("tables", "main.s.t", "owner", "me")``."""
+        with self._lock:
+            self.tags[(entity_type, full_name, key)] = value
+
+    def tags_on(self, entity_type: str, full_name: str) -> Dict[str, str]:
+        """The tags an entity holds, ``{key: value}``."""
+        return {k: v for (t, n, k), v in self.tags.items() if t == entity_type and n == full_name}
+
     def grant_catalog(self, catalog: str, principal: str, *privileges: str) -> None:
         """Seed catalog-level privileges (e.g. ``USE_CATALOG``); schemas and tables inherit them."""
         self.grant("catalog", catalog, principal, *privileges)
@@ -628,6 +645,23 @@ class FakeDatabricks:
             r"/api/2\.1/unity-catalog/effective-permissions/([a-z_]+)/([^/]+)",
             self._get_effective_perms,
         )
+        # ---- entity tag assignments
+        a("POST", r"/api/2\.1/unity-catalog/entity-tag-assignments", self._create_tag)
+        a(
+            "GET",
+            r"/api/2\.1/unity-catalog/entity-tag-assignments/([a-z_]+)/([^/]+)/tags",
+            self._list_tags,
+        )
+        for method, fn in (
+            ("GET", self._get_tag),
+            ("PATCH", self._patch_tag),
+            ("DELETE", self._delete_tag),
+        ):
+            a(
+                method,
+                r"/api/2\.1/unity-catalog/entity-tag-assignments/([a-z_]+)/([^/]+)/tags/([^/]+)",
+                fn,
+            )
         # ---- jobs
         a("POST", r"/api/2\.2/jobs/create", self._job_create)
         a("GET", r"/api/2\.2/jobs/get", self._job_get)
@@ -736,6 +770,7 @@ class FakeDatabricks:
             return _err(400, "INVALID_STATE", "Schema is not empty")
         del self.schemas[full]
         self.grants.pop(("schema", full), None)
+        self._drop_tags("schemas", full)
         return 200, {}
 
     # -- tables
@@ -794,7 +829,86 @@ class FakeDatabricks:
             return _err(404, "TABLE_DOES_NOT_EXIST", f"Table '{full}' does not exist.")
         del self.tables[full]
         self.grants.pop(("table", full), None)
+        self._drop_tags("tables", full)
         return 200, {}
+
+    # -- entity tag assignments
+    def _drop_tags(self, entity_type: str, full: str) -> None:
+        for key in [k for k in self.tags if k[:2] == (entity_type, full)]:
+            del self.tags[key]
+
+    def _tag_doc(self, entity_type: str, name: str, key: str) -> Dict[str, Any]:
+        doc = {
+            "entity_type": entity_type,
+            "entity_name": name,
+            "tag_key": key,
+            "update_time": "2026-10-30T00:00:00Z",
+            "updated_by": _USER,
+        }
+        value = self.tags[(entity_type, name, key)]
+        if value:
+            doc["tag_value"] = value
+        return doc
+
+    def _entity_exists(self, entity_type: str, name: str) -> bool:
+        if entity_type == "tables":
+            return name in self.tables
+        if entity_type == "schemas":
+            return name in self.schemas
+        return entity_type == "catalogs" and name in self.catalogs
+
+    def _create_tag(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        t, n, k = b.get("entity_type"), b.get("entity_name"), b.get("tag_key")
+        if not (t and n and k):
+            return _err(
+                400, "INVALID_PARAMETER_VALUE", "entity_type, entity_name, tag_key required"
+            )
+        if not self._entity_exists(t, n):
+            return _err(404, "RESOURCE_DOES_NOT_EXIST", f"{t} '{n}' does not exist.")
+        if (t, n, k) in self.tags:
+            return _err(409, "RESOURCE_ALREADY_EXISTS", f"Tag '{k}' already exists on '{n}'.")
+        self.tags[(t, n, k)] = b.get("tag_value") or ""
+        return 200, self._tag_doc(t, n, k)
+
+    def _get_tag(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        t, n, k = m.group(1), m.group(2), m.group(3)
+        if (t, n, k) not in self.tags:
+            return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Tag '{k}' does not exist on '{n}'.")
+        return 200, self._tag_doc(t, n, k)
+
+    def _patch_tag(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        t, n, k = m.group(1), m.group(2), m.group(3)
+        if (t, n, k) not in self.tags:
+            return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Tag '{k}' does not exist on '{n}'.")
+        if (q.get("update_mask") or [""])[0] != "tag_value":
+            return _err(400, "INVALID_PARAMETER_VALUE", "fake: update_mask must be tag_value")
+        self.tags[(t, n, k)] = b.get("tag_value") or ""
+        return 200, self._tag_doc(t, n, k)
+
+    def _delete_tag(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        t, n, k = m.group(1), m.group(2), m.group(3)
+        if (t, n, k) not in self.tags:
+            return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Tag '{k}' does not exist on '{n}'.")
+        del self.tags[(t, n, k)]
+        return 200, {}
+
+    def _list_tags(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        t, n = m.group(1), m.group(2)
+        if not self._entity_exists(t, n):
+            return _err(404, "RESOURCE_DOES_NOT_EXIST", f"{t} '{n}' does not exist.")
+        keys = sorted(k for (tt, nn, k) in self.tags if (tt, nn) == (t, n))
+        size = self.tag_page_size
+        if not size:
+            return 200, {"tag_assignments": [self._tag_doc(t, n, k) for k in keys]}
+        # page 0 is empty with a token; page i+1 holds keys[i*size:(i+1)*size]
+        token = (q.get("page_token") or ["0"])[0]
+        page = int(token)
+        start = (page - 1) * size
+        chunk = [] if page == 0 else keys[start : start + size]
+        out: Dict[str, Any] = {"tag_assignments": [self._tag_doc(t, n, k) for k in chunk]}
+        if page * size < len(keys):
+            out["next_page_token"] = str(page + 1)
+        return 200, out
 
     # -- permissions (any securable type: table, schema, catalog, ...)
     def _assignments(self, g: Dict[str, List[str]]) -> Dict[str, Any]:

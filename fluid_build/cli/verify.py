@@ -1192,6 +1192,7 @@ def _render_masking_dimension(masking: Dict[str, Any], ok: str, heading: str) ->
 _FINDINGS_DIMENSIONS = (
     ("catalog_access", "\n   🔍 Catalog access (USE CATALOG)"),
     ("residency", "\n   🔍 Residency (workspace region)"),
+    ("governance_tags", "\n   🔍 Governance tags (Unity Catalog)"),
     ("jobs", "\n   🔍 Jobs"),
 )
 

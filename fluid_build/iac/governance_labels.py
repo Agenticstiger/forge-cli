@@ -25,7 +25,7 @@ found there, not only in the contract. The values are coerced to GCP's label alp
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 _LABEL_KEY_RE = re.compile(r"[^a-z0-9_-]")
 
@@ -35,14 +35,18 @@ def _label(value: Any) -> str:
     return _LABEL_KEY_RE.sub("-", str(value).strip().lower())[:63]
 
 
-def governance_labels(contract: Mapping[str, Any], exposure: Mapping[str, Any]) -> Dict[str, str]:
+def governance_labels(
+    contract: Mapping[str, Any], exposure: Mapping[str, Any], *, limit: Optional[int] = 60
+) -> Dict[str, str]:
     """The contract's governance as GCP labels: its labels, classification and regulation.
 
     The contract's and the expose's ``labels`` (each key and value coerced to GCP's
     label alphabet), plus ``fluid_classification``, ``fluid_jurisdiction``,
     ``fluid_regulation`` and ``fluid_residency`` from the expose's classification and
     the contract's ``sovereignty``. A key that does not start with a letter is
-    prefixed ``l_``; empty values are dropped; at most 60 are kept, in key order.
+    prefixed ``l_``; empty values are dropped; at most ``limit`` (60, GCP's cap) are
+    kept, in key order. ``limit=None`` keeps them all, for a caller that must refuse
+    a count its target cannot hold rather than drop labels silently.
     """
     out: Dict[str, str] = {}
     for source in (contract.get("labels"), exposure.get("labels")):
@@ -72,7 +76,8 @@ def governance_labels(contract: Mapping[str, Any], exposure: Mapping[str, Any]) 
         out["fluid_regulation"] = _label("_".join(str(f) for f in frameworks))
     if sovereignty.get("dataResidency") is not None:
         out["fluid_residency"] = "true" if sovereignty.get("dataResidency") else "false"
-    return {k: out[k] for k in sorted(out)[:60]}
+    keys = sorted(out)
+    return {k: out[k] for k in (keys if limit is None else keys[:limit])}
 
 
 __all__ = ["governance_labels"]

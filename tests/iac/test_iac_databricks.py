@@ -487,6 +487,177 @@ class TestSovereigntyOnEmit:
         assert dbx.validate_databricks_binding(self._sovereign(jurisdiction="EU"))[0] == []
 
 
+# ── governance tags ─────────────────────────────────────────────────────────
+SCHEMA_TAGS = {
+    "cost_center": "cx-001",
+    "data_classification": "confidential",
+    "fluid_jurisdiction": "eu",
+    "fluid_regulation": "gdpr",
+    "fluid_residency": "true",
+    "gdpr_article": "art6-1b-contractual",
+}
+TABLE_TAGS = {**SCHEMA_TAGS, "retention": "7y", "sensitivity": "high"}
+TAG = "databricks_entity_tag_assignment"
+
+
+def _governed(**overrides: Any) -> Dict[str, Any]:
+    """A CP360-like contract: contract and expose labels, and a sovereignty policy."""
+    contract = _contract(**overrides)
+    contract["labels"] = {
+        "data-classification": "confidential",
+        "cost-center": "cx-001",
+        "gdpr-article": "art6-1b-contractual",
+    }
+    contract["exposes"][0]["labels"] = {"sensitivity": "high", "retention": "7y"}
+    contract["sovereignty"] = {
+        "jurisdiction": "EU",
+        "regulatoryFramework": ["GDPR"],
+        "dataResidency": True,
+        "enforcementMode": "advisory",
+    }
+    return contract
+
+
+def _tags_on(doc: Dict[str, Any], entity_type: str) -> Dict[str, str]:
+    return {
+        body["tag_key"]: body["tag_value"]
+        for body in doc["resource"].get(TAG, {}).values()
+        if body["entity_type"] == entity_type
+    }
+
+
+class TestGovernanceTags:
+    def test_the_schema_and_the_table_carry_the_contracts_governance_as_tags(self):
+        doc = _module(_governed())
+        assert _tags_on(doc, "schemas") == SCHEMA_TAGS
+        assert _tags_on(doc, "tables") == TABLE_TAGS
+
+    def test_a_dash_in_a_label_is_an_underscore_in_the_tag_key_and_the_value_is_kept(self):
+        doc = _module(_governed())
+        schema_tag = doc["resource"][TAG]["sales_orders_main_sales_schema_tag_data_classification"]
+        assert schema_tag == {
+            "entity_type": "schemas",
+            "entity_name": "${databricks_schema.sales_orders_main_sales.id}",
+            "tag_key": "data_classification",
+            "tag_value": "confidential",
+        }
+        table_tag = doc["resource"][TAG]["sales_orders_main_sales_orders_table_tag_sensitivity"]
+        assert table_tag == {
+            "entity_type": "tables",
+            "entity_name": "${databricks_sql_table.sales_orders_main_sales_orders.id}",
+            "tag_key": "sensitivity",
+            "tag_value": "high",
+        }
+        assert doc["resource"][TAG]["sales_orders_main_sales_schema_tag_gdpr_article"][
+            "tag_value"
+        ] == ("art6-1b-contractual")
+        assert not any("-" in body["tag_key"] for body in doc["resource"][TAG].values())
+
+    def test_a_contract_without_labels_gets_the_module_it_always_did(self):
+        doc = _module(_contract())
+        assert TAG not in doc["resource"]
+        assert IAC_PLUGINS["databricks"].discover_imports(_contract()) == [
+            block
+            for block in IAC_PLUGINS["databricks"].discover_imports(_contract())
+            if "tag_assignment" not in block.to
+        ]
+        assert dbx.planned_objects(_contract()) == [
+            a for a in dbx.planned_objects(_contract()) if a["resource_type"] != TAG
+        ]
+        assert dbx.managed_objects(_contract())[0][0].tags == ()
+
+    def test_two_exposes_in_one_schema_claim_one_body_per_schema_tag(self):
+        contract = _governed()
+        second = copy.deepcopy(contract["exposes"][0])
+        second["exposeId"] = "lines"
+        second["binding"]["location"]["table"] = "lines"
+        second["labels"] = {"sensitivity": "low"}
+        contract["exposes"].append(second)
+        doc = _module(contract)
+        schema_tags = [b for b in doc["resource"][TAG].values() if b["entity_type"] == "schemas"]
+        assert len(schema_tags) == len(SCHEMA_TAGS)
+        assert _tags_on(doc, "schemas") == SCHEMA_TAGS
+        tables = {
+            b["entity_name"]: b["tag_value"]
+            for b in doc["resource"][TAG].values()
+            if b["tag_key"] == "sensitivity"
+        }
+        assert tables == {
+            "${databricks_sql_table.sales_orders_main_sales_orders.id}": "high",
+            "${databricks_sql_table.sales_orders_main_sales_lines.id}": "low",
+        }
+        imports = [i for i in IAC_PLUGINS["databricks"].discover_imports(contract) if "tag" in i.to]
+        assert len({i.to for i in imports}) == len(imports)
+
+    def test_existing_assignments_are_imported_best_effort_by_the_providers_id(self):
+        imports = {
+            block.to: block
+            for block in IAC_PLUGINS["databricks"].discover_imports(_governed())
+            if block.to.startswith(TAG)
+        }
+        assert len(imports) == len(SCHEMA_TAGS) + len(TABLE_TAGS)
+        schema = imports[f"{TAG}.sales_orders_main_sales_schema_tag_data_classification"]
+        assert schema.id == "schemas,main.sales,data_classification"
+        table = imports[f"{TAG}.sales_orders_main_sales_orders_table_tag_sensitivity"]
+        assert table.id == "tables,main.sales.orders,sensitivity"
+        assert all(block.best_effort for block in imports.values())
+
+    def test_the_planner_names_each_assignment_by_its_import_id(self):
+        ids = {
+            a["resource_id"] for a in dbx.planned_objects(_governed()) if a["resource_type"] == TAG
+        }
+        assert "schemas,main.sales,fluid_jurisdiction" in ids
+        assert "tables,main.sales.orders,retention" in ids
+        assert len(ids) == len(SCHEMA_TAGS) + len(TABLE_TAGS)
+
+    def test_two_labels_that_meet_at_one_tag_key_are_refused_never_overwritten(self):
+        contract = _governed()
+        contract["labels"] = {"cost-center": "a", "cost_center": "b"}
+        for call in (
+            lambda: IAC_PLUGINS["databricks"].emit(contract),
+            lambda: dbx.planned_objects(contract),
+        ):
+            with pytest.raises(UnsupportedBindingError) as raised:
+                call()
+            assert raised.value.kind == "databricks-tag-collision"
+            assert "cost_center" in str(raised.value)
+        errors, _ = dbx.validate_databricks_binding(contract)
+        # the schema and the table both carry the contract's labels
+        assert len(errors) == 2 and all("cost_center" in e for e in errors)
+
+    def test_more_tags_than_a_securable_holds_is_refused_never_dropped(self):
+        contract = _contract()
+        contract["labels"] = {f"k{i:03d}": "v" for i in range(51)}
+        with pytest.raises(UnsupportedBindingError) as raised:
+            IAC_PLUGINS["databricks"].emit(contract)
+        assert raised.value.kind == "databricks-tags-too-many"
+        assert "51" in str(raised.value) and "50" in str(raised.value)
+        errors, _ = dbx.validate_databricks_binding(contract)
+        # the schema and the table both carry them: one refusal for each securable
+        assert len(errors) == 2 and all("51" in e for e in errors)
+        # and counted past governance_labels' own cap of 60
+        contract["labels"] = {f"k{i:03d}": "v" for i in range(75)}
+        assert "75" in dbx.validate_databricks_binding(contract)[0][0]
+
+    def test_exactly_fifty_tags_fit(self):
+        contract = _contract()
+        contract["labels"] = {f"k{i:03d}": "v" for i in range(50)}
+        doc = _module(contract)
+        assert len(_tags_on(doc, "schemas")) == 50 and len(_tags_on(doc, "tables")) == 50
+
+    def test_the_table_alone_over_the_cap_is_refused_once(self):
+        contract = _contract()
+        contract["labels"] = {f"k{i:03d}": "v" for i in range(48)}
+        contract["exposes"][0]["labels"] = {"x1": "a", "x2": "b", "x3": "c"}
+        errors, _ = dbx.validate_databricks_binding(contract)
+        assert len(errors) == 1 and "exposes[0] (orders)" in errors[0]
+
+    def test_managed_objects_carry_the_expected_tags_for_verify(self):
+        (table,), _ = dbx.managed_objects(_governed())
+        assert dict(table.tags) == TABLE_TAGS
+        assert dict(table.schema_tags) == SCHEMA_TAGS
+
+
 def test_a_build_that_names_its_own_host_is_refused():
     # The dbt runner reads runtime.resources.host before DATABRICKS_HOST and
     # would send the workspace token there.
@@ -887,6 +1058,24 @@ class TestEngine:
             [("databricks_grant.g", "databricks_grant")],
         )
         assert counted["remove"] == 0 and revoked == ["databricks_grant.g"]
+
+    def test_removing_a_label_destroys_only_its_assignment_which_is_not_data_loss(self):
+        removals = [(f"{TAG}.t", TAG)]
+        counted, revoked = engine._data_bearing_changes(
+            {"add": 0, "change": 0, "remove": 1}, removals
+        )
+        assert counted["remove"] == 0 and revoked == [f"{TAG}.t"]
+        # the gate lets it through without --allow-data-loss
+        engine._enforce_data_loss_gate(
+            argparse.Namespace(allow_data_loss=False), _LOG, "databricks", counted, counted, []
+        )
+
+    def test_an_assignment_beside_a_table_destroy_still_gates_the_table(self):
+        counted, revoked = engine._data_bearing_changes(
+            {"add": 0, "change": 0, "remove": 2},
+            [(f"{TAG}.t", TAG), (TABLE, "databricks_sql_table")],
+        )
+        assert counted["remove"] == 1 and revoked == [f"{TAG}.t"]
 
     def test_a_table_destroy_still_is(self):
         counted, _ = engine._data_bearing_changes(

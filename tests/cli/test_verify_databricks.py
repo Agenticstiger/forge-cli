@@ -121,6 +121,11 @@ class StubWorkspace:
         self.region = "eu-central-1"
         self.fail_on: Optional[str] = None
         self.page_size = 100
+        # (entity type, full name) -> {tag key: value}, served paginated by ``tag_page_size``
+        self.tags: Dict[Any, Dict[str, str]] = {}
+        self.tag_page_size = 100
+        self.empty_tag_page_first = False
+        self.stuck_tag_token = False
         self.api_client = StubApiClient(self)
         self.calls: List[Any] = []
 
@@ -147,6 +152,25 @@ class StubWorkspace:
                 else []
             )
             return {"privilege_assignments": assignments}
+        if path.startswith("/api/2.1/unity-catalog/entity-tag-assignments/"):
+            _, _, _, _, _, kind, name, _tags = path.split("/")
+            keys = sorted(self.tags.get((kind, name), {}))
+            size = self.tag_page_size
+            pages = [keys[i : i + size] for i in range(0, len(keys), size)] or [[]]
+            if self.empty_tag_page_first:
+                pages.insert(0, [])
+            index = int(query.get("page_token") or 0) if not self.stuck_tag_token else 0
+            body: Dict[str, Any] = {
+                "tag_assignments": [
+                    {"entity_type": kind, "entity_name": name, "tag_key": k, "tag_value": v}
+                    for k, v in ((k, self.tags[(kind, name)][k]) for k in pages[index])
+                ]
+            }
+            if index + 1 < len(pages):
+                body["next_page_token"] = str(index + 1)
+            if self.stuck_tag_token:
+                body["next_page_token"] = "same"
+            return body
         if path == "/api/2.1/unity-catalog/metastore_summary":
             return {"metastore_id": "ms-1", "region": self.region, "cloud": "aws"}
         if path == "/api/2.2/jobs/list":
@@ -573,6 +597,122 @@ def test_fluid_verify_shows_residency_skipped_not_failed_without_a_region(
     code, out = _run_verify(tmp_path, monkeypatch, capfd, workspace, "--strict")
 
     assert "Residency (workspace region) ⚪ SKIPPED" in out and code == 0
+
+
+# ── Governance tags ─────────────────────────────────────────────────────
+
+
+def governed_contract() -> Dict[str, Any]:
+    document = copy.deepcopy(CONTRACT)
+    document["labels"] = {"data-classification": "confidential", "cost-center": "cx-001"}
+    document["exposes"][0]["labels"] = {"sensitivity": "high"}
+    return document
+
+
+def seed_tags(workspace: StubWorkspace, **extra: str) -> None:
+    schema = {"data_classification": "confidential", "cost_center": "cx-001"}
+    workspace.tags[("schemas", "main.sales")] = dict(schema, **extra)
+    workspace.tags[("tables", TABLE)] = dict(schema, sensitivity="high", **extra)
+
+
+def test_every_expected_tag_on_the_table_and_its_schema_passes(workspace):
+    seed_tags(workspace, set_by_someone_else="whatever")
+
+    result = verify(workspace, governed_contract())
+
+    assert result["status"] == "match" and result["severity"]["level"] == "SUCCESS"
+    tags = result["dimensions"]["governance_tags"]
+    assert tags["status"] == "pass" and "5 governance tag(s)" in tags["message"]
+    asked = [path for _m, path, _q in workspace.calls if "entity-tag-assignments" in path]
+    assert asked == [
+        "/api/2.1/unity-catalog/entity-tag-assignments/schemas/main.sales/tags",
+        f"/api/2.1/unity-catalog/entity-tag-assignments/tables/{TABLE}/tags",
+    ]
+
+
+def test_a_missing_tag_fails_with_the_fix_and_is_critical(workspace):
+    seed_tags(workspace)
+    del workspace.tags[("tables", TABLE)]["sensitivity"]
+
+    result = verify(workspace, governed_contract())
+
+    assert result["status"] == "mismatch" and result["severity"]["level"] == "CRITICAL"
+    tags = result["dimensions"]["governance_tags"]
+    assert tags["status"] == "fail"
+    (finding,) = tags["findings"]
+    assert finding["tag"] == "sensitivity" and finding["actual"] is None
+    assert finding["entity"] == f"table {TABLE}"
+    assert "fluid apply" in tags["fix"] and "CREATE OR REPLACE" in tags["fix"]
+    assert "sensitivity" in result["severity"]["reason"]
+    assert tags["fix"] in " ".join(result["severity"]["actions"])
+
+
+def test_a_tag_with_another_value_fails_and_names_both(workspace):
+    seed_tags(workspace)
+    workspace.tags[("schemas", "main.sales")]["data_classification"] = "public"
+
+    result = verify(workspace, governed_contract())
+
+    tags = result["dimensions"]["governance_tags"]
+    assert tags["status"] == "fail"
+    (finding,) = tags["findings"]
+    assert (finding["expected"], finding["actual"]) == ("confidential", "public")
+    assert "public" in finding["message"] and "confidential" in finding["message"]
+
+
+def test_the_tag_list_is_read_across_every_page_an_empty_one_with_a_token_included(workspace):
+    seed_tags(workspace)
+    workspace.tag_page_size = 1
+    workspace.empty_tag_page_first = True
+
+    result = verify(workspace, governed_contract())
+
+    assert result["dimensions"]["governance_tags"]["status"] == "pass", result["dimensions"]
+    tokens = [
+        q.get("page_token")
+        for _m, path, q in workspace.calls
+        if path.endswith(f"/tables/{TABLE}/tags")
+    ]
+    assert tokens == [None, "1", "2", "3"]
+
+
+def test_a_tag_list_that_never_ends_is_an_error_not_a_pass(workspace):
+    seed_tags(workspace)
+    workspace.stuck_tag_token = True
+
+    result = verify(workspace, governed_contract())
+
+    assert result["status"] == "error" and "never ended" in result["error"]
+
+
+def test_a_contract_without_governance_labels_skips_the_tags_and_asks_nothing(workspace):
+    result = verify(workspace)
+
+    assert result["status"] == "match"
+    assert result["dimensions"]["governance_tags"]["status"] == "skip"
+    assert not any("entity-tag-assignments" in path for _m, path, _q in workspace.calls)
+
+
+def test_fluid_verify_prints_the_tag_fix_and_strict_fails(tmp_path, monkeypatch, capfd, workspace):
+    seed_tags(workspace)
+    del workspace.tags[("tables", TABLE)]["sensitivity"]
+
+    code, out = _run_verify(
+        tmp_path, monkeypatch, capfd, workspace, "--strict", contract=governed_contract()
+    )
+
+    assert "Governance tags (Unity Catalog)" in out
+    assert "table main.sales.orders has no tag sensitivity" in out
+    assert "Run fluid apply" in out and "CREATE OR REPLACE" in out
+    assert code != 0
+
+
+def test_fluid_verify_shows_the_tags_skipped_without_labels(
+    tmp_path, monkeypatch, capfd, workspace
+):
+    code, out = _run_verify(tmp_path, monkeypatch, capfd, workspace, "--strict")
+
+    assert "Governance tags (Unity Catalog) ⚪ SKIPPED" in out and code == 0
 
 
 # ── The real SDK, against the stand-in workspace ────────────────────────

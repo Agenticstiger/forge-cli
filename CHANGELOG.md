@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
+  never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
+  sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
+  (labels) but not a Databricks table, and nothing said so. They are Unity Catalog tags now,
+  from the same `governance_labels` the other two clouds use: one
+  `databricks_entity_tag_assignment` per tag on each schema the product owns (the contract's own
+  labels, classification, jurisdiction, regulation and residency, identical for every expose in
+  the schema) and on each table (the expose's labels and classification too). A tag key may not
+  contain `-`, so each `-` in a key is `_` (`data-classification` is `data_classification`,
+  `fluid_jurisdiction` stays); values are kept. Two labels that meet at one key
+  (`cost-center` and `cost_center`) are refused as `databricks-tag-collision` instead of one
+  overwriting the other, and more than the 50 tags Unity Catalog allows on a securable is
+  `databricks-tags-too-many` instead of some being dropped; `fluid validate` reports both. A
+  contract with no labels gets the module it always did. An assignment that already exists is
+  imported before the first apply (best-effort, as grants are), so a re-run after lost state
+  adopts it instead of failing, and removing a label destroys only its assignment, which holds
+  no data, so it does not need `--allow-data-loss`. `fluid verify` gains a governance-tags
+  dimension: every tag the contract implies must be on the table and its schema with its value
+  (a missing or changed one is CRITICAL, with `fluid apply` as the fix; a tag someone else set
+  is ignored; no labels, skipped). Whether a table keeps its tags across the `CREATE OR REPLACE`
+  a dbt `table` materialization runs is not documented by Databricks and not proven here, so a
+  dbt-written table's tags may need `fluid apply` again: verify is the gate. `governance_labels`
+  takes a `limit` (default 60, unchanged for AWS and GCP; `None` for no cap). Not run against a
+  live workspace.
+
 - **A contract's `sovereignty` policy was never checked for a Databricks expose, so residency
   failed open.** `fluid validate` and `plan --check-sovereignty` skipped a Databricks binding as
   a platform with no region, and the emitter refused `binding.location.region` as a field it
