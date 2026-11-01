@@ -18,6 +18,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not Databricks, and when the checkout's project config named the endpoint (the runner's
   environment is not the checkout's to send, as for `{{ env.* }}` and the operator's credential).
 
+- **A Databricks contract's column restrictions and row filters are enforced by Unity Catalog,
+  where they were refused.** `exposes[].policy.authz.columnRestrictions` and `rowFilters` were
+  `databricks-governance-unmapped`; they are now SQL functions bound on the table, so a query
+  by a restricted principal is rewritten by the engine whichever tool sends it, with the
+  semantics GCP and AWS give the same fields. `access: deny` becomes a mask that returns NULL
+  for the principal: Unity Catalog has no column-level grant, so a denied column stays listed
+  in the table's schema and reads NULL (the founder accepted that). `access: mask` returns
+  `last_four` (`XXXXX` and the last four characters), `first_four`, or NULL for `nullify`; a
+  value of four characters or fewer is its SHA-256 and a NULL stays NULL, as on AWS. One mask
+  per column (the Unity Catalog limit) combines every restriction on it, a principal in a deny
+  and a mask gets the deny, and everyone else reads the value. One row filter per table: its
+  principals' members read the union of those principals' predicates, everyone else every row.
+  Logical principals resolve through `binding.principals`: `group:` is
+  `is_account_group_member('<name>')`, `user:` and `serviceAccount:` are `current_user() =
+  '<name>'`; a principal with no such test (no prefix, `domain:`) is
+  `databricks-principal-kind`, and `access: allow` (which would blind every reader it does not
+  name, the owner and the pipelines included), a text mask on a non-string column
+  (`databricks-mask-type`) and anything else this cannot express are refused rather than
+  dropped. A predicate is contract text that becomes a function body, so it is parsed as one
+  boolean expression (sqlglot, Databricks dialect), checked node by node against an allowlist
+  (comparisons, `AND` / `OR` / `NOT`, `IS NULL`, `IN`, `BETWEEN`, `LIKE`, literals, `CAST`, the
+  table's columns and `lower`, `upper`, `length`, `trim`, `coalesce`, `abs`) and written back
+  from the tree, never spliced: a `;`, a comment, a subquery, a session function such as
+  `current_user()`, an undeclared column or a predicate that reads no column is
+  `databricks-row-filter-invalid`. The functions are created once, as `CREATE FUNCTION IF NOT
+  EXISTS ... fluid_rf_<table>_<hash8>` and `fluid_mask_<table>_<column>_<hash8>`, named by a
+  hash of their definition: Unity Catalog refuses to replace a function a filter or mask uses,
+  so a changed predicate or rule is a new function bound in place of the old one, and the same
+  contract always names the same function. Superseded functions are not dropped (harmless
+  metadata; cleaning them up is a follow-up). The provider (1.140.0) has no function resource
+  and no mask or filter attribute on `databricks_sql_table` (terraform-provider-databricks#4550),
+  so `ALTER TABLE ... SET ROW FILTER ... ON (...)` and `ALTER COLUMN ... SET MASK` run on the
+  SQL warehouse (`DATABRICKS_WAREHOUSE_ID`) through the SQL Statement Execution API, outside
+  OpenTofu, in two hooks `fluid apply` calls around `tofu apply`: a `pre_apply` that binds the
+  tables that already exist, so a grant the apply adds lands on a protected table, and a
+  `post_apply` that binds the tables the apply created, empty. Databricks keeps a table's row
+  filter and masks across the `CREATE OR REPLACE TABLE` a dbt build runs (its docs say so), so
+  rebuilds keep them. The live bindings are read from the Tables API and only what differs
+  runs, so a second apply executes no statement; `--mode dry-run` prints the statements and
+  runs none. A restriction removed from the contract is dropped (`DROP ROW FILTER`, `DROP
+  MASK`) after the apply, printed as an access-widening change and not gated as data loss; only
+  a filter or mask whose function carries this module's name prefix is ever dropped, so one an
+  admin set by hand is left alone. It fails closed: a pre-apply failure stops the run before
+  `tofu apply`; if `post_apply` cannot bind a table it revokes `SELECT` on it from every
+  principal a restriction names (so a later dbt run cannot expose unmasked rows to them), prints
+  exactly what it revoked and why, and exits non-zero, and re-running `fluid apply` once the
+  cause is fixed binds first and grants again. A contract with restrictions now needs the
+  `[databricks]` extra (databricks-sdk) at apply, and says so when it is missing. `fluid verify`
+  gains a row-filter-and-masks dimension: the expected function names (content-hashed) against
+  the live `row_filter` and each column's `mask` from the GetTable it already reads; a missing
+  or different binding is CRITICAL with `fluid apply` as the fix, and a contract that restricts
+  nothing skips it. `policy.privacy.masking` (landing-time masking), `rowLevelPolicy` and
+  `binding.governance` are still refused. Proven against the in-process stand-in with a real
+  `tofu` apply, and the function bodies evaluated in DuckDB; not run against a live workspace:
+  that `CREATE FUNCTION IF NOT EXISTS`, `SET ROW FILTER` and `SET MASK` behave as the stand-in
+  models them, that `SET` replaces a binding already on the table, that `current_user()` is a
+  service principal's application ID, and what a warehouse of each type enforces are unproven.
+
 ### Fixed
 
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
