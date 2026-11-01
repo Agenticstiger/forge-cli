@@ -722,6 +722,15 @@ def _enforce_sovereignty(contract: Mapping[str, Any], tables: Sequence[_Table]) 
     if not errors:
         return
     allowed = [str(r) for r in (sovereignty.get("allowedRegions") or [])]
+    denied = [str(r) for r in (sovereignty.get("deniedRegions") or [])]
+    if allowed:
+        rule = f"allows {', '.join(allowed)}"
+    elif sovereignty.get("jurisdiction"):
+        rule = f"requires jurisdiction {sovereignty['jurisdiction']!r}"
+    elif denied:
+        rule = f"denies {', '.join(denied)}"
+    else:
+        rule = "requires a region it can check"
     # ``where: message``, de-duplicated in order. Not ``[where]``: the CLI
     # renders errors through rich, which reads square brackets as markup.
     findings = "; ".join(dict.fromkeys(f"{v.expose_id}: {v.message}" for v in errors))
@@ -729,13 +738,8 @@ def _enforce_sovereignty(contract: Mapping[str, Any], tables: Sequence[_Table]) 
         what=f"Databricks placement refused by the sovereignty policy: {findings}",
         why=(
             "contract.sovereignty is enforced "
-            f"({sovereignty.get('enforcementMode', 'strict')}) and "
-            + (
-                f"allows {', '.join(allowed)}"
-                if allowed
-                else f"requires jurisdiction {sovereignty.get('jurisdiction')!r}"
-            )
-            + "; the tables would be created in the workspace DATABRICKS_HOST names."
+            f"({sovereignty.get('enforcementMode', 'strict')}) and {rule}; the tables would "
+            "be created in the workspace DATABRICKS_HOST names."
         ),
         fix=(
             "Set binding.location.region on every databricks expose to the region of the "

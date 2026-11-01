@@ -468,6 +468,8 @@ class TestSovereigntyOnEmit:
         with pytest.raises(SovereigntyViolationError) as exc:
             IAC_PLUGINS["databricks"].emit(contract)
         assert "us-west-2" in str(exc.value)
+        # A deny-list-only policy names its deny-list, not a missing jurisdiction.
+        assert "denies us-west-2" in exc.value.why and "None" not in exc.value.why
 
     def test_a_declared_allowed_region_is_emitted(self):
         contract = self._sovereign(jurisdiction="EU", allowedRegions=["eu-central-1"])
