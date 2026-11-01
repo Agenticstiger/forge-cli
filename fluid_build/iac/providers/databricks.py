@@ -52,6 +52,22 @@ resources, with no new schema field (fluid-schema 0.7.6):
   existing assignment is imported best-effort before the first apply, and removing a
   label destroys only its assignment, which holds no data. Whether a tag survives a
   dbt ``CREATE OR REPLACE`` is undocumented, so ``fluid verify`` is the gate.
+* ``policy.authz.columnRestrictions`` and ``policy.authz.rowFilters`` are enforced by Unity
+  Catalog: SQL functions bound on the table, with the semantics GCP and AWS give them
+  (``databricks_access.py``). ``deny`` is a mask that returns NULL (Unity Catalog has no
+  column grant, so the column stays listed), ``mask`` returns ``last_four`` / ``first_four`` /
+  NULL, and a row filter (one per table) is the union of its principals' predicates for the
+  members of those principals and every row for everyone else. The functions are created once
+  under names that carry a hash of their definition, since Unity Catalog refuses to replace one
+  a filter uses, and are bound with ``ALTER TABLE`` on the SQL warehouse through the SQL
+  Statement Execution API, outside OpenTofu: the provider has no function resource and no mask
+  or filter attribute (terraform-provider-databricks#4550). :meth:`DatabricksIacPlugin.pre_apply`
+  binds on the tables that exist before ``tofu apply`` runs, :meth:`~DatabricksIacPlugin.post_apply`
+  on the ones it created (revoking ``SELECT`` from the restricted principals of a table it
+  cannot bind) and drops what the contract no longer restricts (``databricks_enforce.py``).
+  A predicate that is not one boolean expression over the table's columns is
+  ``databricks-row-filter-invalid``; ``access: allow``, a principal with no SQL test and a text
+  mask on a non-string column are refused too. ``fluid verify`` checks the bindings.
 * A dbt build that runs on Databricks (``execution.runtime.platform:
   databricks``) becomes a serverless ``databricks_job`` with a ``dbt_task``, and
   a local project its ``databricks_workspace_file`` uploads
@@ -111,7 +127,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ...providers._sql_safety import validate_ident, validate_sql_type_param_payload
 from ...util.contract import is_databricks_job_build
@@ -129,6 +145,7 @@ from ..principals import (
 )
 from ..provider_match import canonical_cloud, is_cloud
 from ..versions import required_providers
+from .databricks_access import TableEnforcement, compile_enforcement
 from .databricks_auth import tofu_env_overlay
 from .databricks_jobs import (
     CompiledJobs,
@@ -239,6 +256,8 @@ class _Table:
     exposure: Mapping[str, Any]
     #: The declared workspace region, lower-cased and validated; ``""`` if none.
     region: str = ""
+    #: The column masks and row filter Unity Catalog enforces on it, if the expose has any.
+    enforcement: Optional[TableEnforcement] = None
 
     @property
     def full_name(self) -> str:
@@ -429,8 +448,6 @@ def _refuse_governance(
         for name, value in (
             ("policy.privacy.masking", privacy.get("masking")),
             ("policy.privacy.rowLevelPolicy", privacy.get("rowLevelPolicy")),
-            ("policy.authz.rowFilters", authz.get("rowFilters")),
-            ("policy.authz.columnRestrictions", authz.get("columnRestrictions")),
             ("binding.governance", binding.get("governance")),
         )
         if _set(value)
@@ -442,8 +459,10 @@ def _refuse_governance(
                 f"{where} declares {', '.join(unmapped)}, which the Databricks emitter does not "
                 "map yet. Applied anyway, the table would be readable without the mask, filter "
                 "or restriction the contract promises.",
-                "Remove them from this expose until Unity Catalog column masks, row filters "
-                "and ABAC policies are mapped, and enforce access with grants.",
+                "Remove them from this expose until they are mapped (landing-time masking and "
+                "ABAC policies are not), and enforce access with grants. policy.authz."
+                "columnRestrictions and policy.authz.rowFilters are mapped: they become Unity "
+                "Catalog column masks and a row filter.",
             )
         )
     if _set(binding.get("encryption")):
@@ -666,6 +685,21 @@ def _resolve_table(
     partitions = _partitions(where, loc, columns, refusals, validating=validating)
     region = _region(where, loc, refusals)
     _refuse_governance(where, binding, exposure, refusals)
+    enforcement: Optional[TableEnforcement] = None
+    if len(refusals) == before:
+        try:
+            enforcement = compile_enforcement(
+                where=where,
+                index=index,
+                exposure=exposure,
+                binding=binding,
+                catalog=names["database"],
+                schema=names["schema"],
+                table=names["table"],
+                columns=columns,
+            )
+        except UnsupportedBindingError as exc:
+            refusals.append(exc)
     if len(refusals) > before:
         return None
     return _Table(
@@ -679,6 +713,7 @@ def _resolve_table(
         binding=binding,
         exposure=exposure,
         region=region,
+        enforcement=enforcement,
     )
 
 
@@ -1848,6 +1883,10 @@ class ManagedTable:
     #: ``databricks_entity_tag_assignment`` resources), sorted by key.
     tags: Tuple[Tuple[str, str], ...] = ()
     schema_tags: Tuple[Tuple[str, str], ...] = ()
+    #: The row filter Unity Catalog must have bound: ``(function full name, input columns)``.
+    row_filter: Optional[Tuple[str, Tuple[str, ...]]] = None
+    #: ``(column, function full name)`` per column mask it must have bound.
+    masks: Tuple[Tuple[str, str], ...] = ()
 
 
 def managed_objects(
@@ -1879,6 +1918,18 @@ def managed_objects(
             tags=tuple(sorted(tagged.get(("tables", table.full_name), ()))),
             schema_tags=tuple(
                 sorted(tagged.get(("schemas", f"{table.catalog}.{table.schema}"), ()))
+            ),
+            row_filter=(
+                (
+                    table.enforcement.row_filter.function.full_name,
+                    table.enforcement.row_filter.columns,
+                )
+                if table.enforcement and table.enforcement.row_filter
+                else None
+            ),
+            masks=tuple(
+                (mask.column, mask.function.full_name)
+                for mask in (table.enforcement.masks if table.enforcement else ())
             ),
         )
         for table in compiled.tables

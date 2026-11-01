@@ -244,11 +244,13 @@ _REFUSALS = [
         {"exposes.0.policy.privacy": {"rowLevelPolicy": {"a": 1}}},
         "governance-unmapped",
     ),
-    ("row-filters", {"exposes.0.policy.authz.rowFilters": [{"a": 1}]}, "governance-unmapped"),
+    # rowFilters and columnRestrictions are mapped now (databricks_access.py): a malformed
+    # entry is refused as one, never dropped.
+    ("row-filters", {"exposes.0.policy.authz.rowFilters": [{"a": 1}]}, "row-filter-invalid"),
     (
         "column-restr",
         {"exposes.0.policy.authz.columnRestrictions": [{"a": 1}]},
-        "governance-unmapped",
+        "column-restriction-invalid",
     ),
     (
         "lf",
