@@ -387,6 +387,32 @@ class TestRegion:
         doc = _module(contract)
         assert list(doc["data"]["databricks_current_metastore"]) == ["sales_orders_metastore"]
 
+    def test_a_schema_two_exposes_share_keeps_the_check_whichever_declares_it(self):
+        # The schema resource is claimed once per table and keeps the last body,
+        # so taking the region per table lost the precondition when the last
+        # expose in a shared schema declared none.
+        contract = _contract(**{"exposes.0.binding.location.region": "eu-central-1"})
+        second = copy.deepcopy(contract["exposes"][0])
+        second["exposeId"] = "orders_b"
+        second["binding"]["location"].update(table="orders_b")
+        del second["binding"]["location"]["region"]
+        contract["exposes"].append(second)
+        assert dbx.validate_databricks_binding(contract)[0] == []
+        schema = _module(contract)["resource"]["databricks_schema"]["sales_orders_main_sales"]
+        (check,) = schema["lifecycle"]["precondition"]
+        assert check["condition"] == f'${{lower({_METASTORE}) == "eu-central-1"}}'
+
+    def test_every_schema_is_checked_when_one_expose_declares_the_region(self):
+        contract = _contract(**{"exposes.0.binding.location.region": "eu-central-1"})
+        second = copy.deepcopy(contract["exposes"][0])
+        second["exposeId"] = "events"
+        second["binding"]["location"].update(schema="events", table="events")
+        del second["binding"]["location"]["region"]
+        contract["exposes"].append(second)
+        schemas = _module(contract)["resource"]["databricks_schema"]
+        assert sorted(schemas) == ["sales_orders_main_events", "sales_orders_main_sales"]
+        assert all("precondition" in body.get("lifecycle", {}) for body in schemas.values())
+
     def test_the_import_and_plan_paths_are_unaffected(self):
         plain, declared = _contract(), _contract(
             **{"exposes.0.binding.location.region": "eu-central-1"}

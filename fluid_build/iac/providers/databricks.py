@@ -906,11 +906,18 @@ def _compile(
     warehouse = _warehouse(env, refusals)
     _refuse_duplicate_tables(compiled.tables, refusals)
     _refuse_region_conflict(compiled.tables, refusals)
+    # One workspace, one region: whichever expose declares it, every schema the
+    # module owns is checked against it. Taken per table, a schema two exposes
+    # share kept the body of whichever was emitted last (``_claim``), and lost
+    # the check when that one declared no region.
+    region = next((table.region for table in compiled.tables if table.region), "")
     cid = safe_ident(contract.get("id") or contract.get("name") or "product")
     privileges = _table_privileges(contract, targets, refusals)
     dbt_written = dbt_written_exposes(contract, compiled.tables)
     for table in compiled.tables:
-        _emit_table(compiled, table, cid, warehouse, dbt_owned=table.expose_id in dbt_written)
+        _emit_table(
+            compiled, table, cid, warehouse, region, dbt_owned=table.expose_id in dbt_written
+        )
         _emit_grants(compiled, table, cid, privileges.get(table.full_name, {}))
     _merge_jobs(
         compiled,
@@ -995,9 +1002,12 @@ def _keys(cid: str, table: _Table) -> Tuple[str, str, str]:
 
 
 def _emit_table(
-    compiled: _Compiled, table: _Table, cid: str, warehouse: str, *, dbt_owned: bool
+    compiled: _Compiled, table: _Table, cid: str, warehouse: str, region: str, *, dbt_owned: bool
 ) -> None:
-    """The catalog reference, the owned schema and the table, with their imports."""
+    """The catalog reference, the owned schema and the table, with their imports.
+
+    ``region`` is the workspace region the contract declares (``""`` if none).
+    """
     catalog_key, schema_key, table_key = _keys(cid, table)
     catalog_name = tofu_ref(f"data.databricks_catalog.{catalog_key}.name")
     compiled.data.setdefault("databricks_catalog", {})[catalog_key] = {"name": table.catalog}
@@ -1006,8 +1016,8 @@ def _emit_table(
             ImportBlock(f"databricks_schema.{schema_key}", f"{table.catalog}.{table.schema}")
         )
     schema_body: Dict[str, Any] = {"catalog_name": catalog_name, "name": table.schema}
-    if table.region:
-        schema_body["lifecycle"] = {"precondition": [_region_precondition(compiled, cid, table)]}
+    if region:
+        schema_body["lifecycle"] = {"precondition": [_region_precondition(compiled, cid, region)]}
     _claim(
         compiled,
         "databricks_schema",
@@ -1041,8 +1051,8 @@ def _emit_table(
     compiled.imports.append(ImportBlock(f"databricks_sql_table.{table_key}", table.full_name))
 
 
-def _region_precondition(compiled: _Compiled, cid: str, table: _Table) -> Dict[str, Any]:
-    """The plan-time check that the workspace is in the declared region.
+def _region_precondition(compiled: _Compiled, cid: str, region: str) -> Dict[str, Any]:
+    """The plan-time check that the workspace is in the declared ``region``.
 
     ``data.databricks_current_metastore`` calls the metastore summary of the
     workspace ``DATABRICKS_HOST`` names (provider ``catalog/
@@ -1055,11 +1065,11 @@ def _region_precondition(compiled: _Compiled, cid: str, table: _Table) -> Dict[s
     compiled.data.setdefault("databricks_current_metastore", {})[key] = {}
     actual = f"data.databricks_current_metastore.{key}.metastore_info[0].region"
     return {
-        "condition": tofu_ref(f'lower({actual}) == "{table.region}"'),
+        "condition": tofu_ref(f'lower({actual}) == "{region}"'),
         "error_message": TofuExpr(
-            f"The contract declares binding.location.region {table.region}, but the workspace "
+            f"The contract declares binding.location.region {region}, but the workspace "
             "DATABRICKS_HOST names is in ${" + actual + "}. Residency is checked against the "
-            f"workspace's metastore. Point DATABRICKS_HOST at a workspace in {table.region}, "
+            f"workspace's metastore. Point DATABRICKS_HOST at a workspace in {region}, "
             "or correct binding.location.region."
         ),
     }
