@@ -297,6 +297,31 @@ def test_names_in_the_grant_have_their_backticks_doubled():
     assert grant_statement("we`ird", "a`b") == "GRANT USE CATALOG ON CATALOG `we``ird` TO `a``b`"
 
 
+def test_a_privilege_a_group_conveys_counts_for_the_reader_asked_about(workspace):
+    # Asked about one principal, Unity Catalog answers with the assignment of the
+    # group that conveys the privilege (live, 2026-11-01: `account users` held
+    # USE_CATALOG under `_workspace_users_workspace_<id>`). It is the reader's,
+    # because the call asked about that reader alone.
+    original = workspace.answer
+    asked: set = set()
+
+    def answer(method: str, path: str, query: Dict[str, Any]) -> Dict[str, Any]:
+        if "effective-permissions" in path:
+            asked.add(query.get("principal"))
+            conveyed = {"privilege": "USE_CATALOG", "inherited_from_type": None}
+            return {
+                "privilege_assignments": [
+                    {"principal": "_workspace_users_workspace_1", "privileges": [conveyed]}
+                ]
+            }
+        return original(method, path, query)
+
+    workspace.answer = answer  # type: ignore[method-assign]
+
+    assert verify(workspace)["dimensions"]["catalog_access"]["status"] == "pass"
+    assert asked == {"analysts", "bi"}
+
+
 def test_effective_permissions_follow_next_page_token(workspace):
     pages = {
         None: {"privilege_assignments": [], "next_page_token": "p2"},
