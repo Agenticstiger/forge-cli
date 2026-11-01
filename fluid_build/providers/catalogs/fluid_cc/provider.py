@@ -657,7 +657,7 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
         The Command Center builds a console link from it. Never read from the
         contract (forge-cli refuses ``binding.location.host``). Unset, or not
         https (plain http only to loopback), leaves it out: not an error. So
-        does a host carrying user-info (``https://user:pass@host``):
+        does a host carrying user-info (``https://{user}:{password}@host``):
         ``normalize_host`` keeps the netloc whole, and the user-info would be
         published to the Command Center with the link. And an endpoint the
         checkout's project config named never gets it: the runner's environment

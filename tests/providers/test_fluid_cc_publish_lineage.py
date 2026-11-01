@@ -885,7 +885,7 @@ class TestWorkspaceHost:
     @pytest.mark.parametrize(
         "host",
         [
-            "https://user:pass@dbc-abc.cloud.databricks.com",
+            "https://user:pass@dbc-abc.cloud.databricks.com",  # pragma: allowlist secret
             "https://tok@dbc-abc.cloud.databricks.com",
         ],
     )
