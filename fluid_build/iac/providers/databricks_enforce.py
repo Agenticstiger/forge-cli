@@ -337,6 +337,9 @@ def _client_for(
     an unreachable workspace is a note, not an error.
     """
     required = any(t.enforcement is not None for t in targets)
+    # Without the SDK a contract that restricts nothing has no apply-time use for it, and an
+    # earlier restriction left in place only narrows access: silent. Any other failure to get a
+    # client is a note, since a removal could not be checked.
     try:
         client = (factory or default_client)()
         warehouse = str(os.environ.get(WAREHOUSE_ENV) or "").strip()
@@ -356,6 +359,7 @@ def _client_for(
                 "row filters are applied through it.",
                 (f"Install the extra: {DATABRICKS_EXTRA_INSTALL}",),
             ) from None
+        return None  # no restriction was ever asked for: there is nothing to say
     except Exception as exc:  # noqa: BLE001 — a bad credential must not become a traceback
         if required:
             raise EnforcementError(

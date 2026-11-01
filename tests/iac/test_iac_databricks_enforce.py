@@ -407,19 +407,29 @@ def test_a_contract_with_restrictions_needs_the_sdk_and_a_warehouse(fake, monkey
     assert exc.value.kind == "databricks-warehouse-unset"
 
 
-def test_a_contract_without_restrictions_only_notes_that_removals_were_not_checked(fake):
+def test_a_contract_without_restrictions_needs_no_sdk_and_says_nothing(fake):
     said: List[str] = []
 
     def no_sdk():
         raise ImportError("databricks")
 
+    bare = contract(restrictions=None, filters=None)
+    PLUGIN.post_apply(bare, say=said.append, client_factory=no_sdk)
+    PLUGIN.pre_apply(bare, say=said.append, client_factory=no_sdk)
+    PLUGIN.pre_apply(bare, say=said.append, dry_run=True, client_factory=no_sdk)
+    assert said == []
+
+
+def test_a_client_that_cannot_be_made_for_a_contract_without_restrictions_is_a_note(fake):
+    said: List[str] = []
+
+    def broken():
+        raise RuntimeError("no route to host")
+
     PLUGIN.post_apply(
-        contract(restrictions=None, filters=None), say=said.append, client_factory=no_sdk
+        contract(restrictions=None, filters=None), say=said.append, client_factory=broken
     )
     assert any("not checked for removal" in line for line in said)
-    PLUGIN.pre_apply(
-        contract(restrictions=None, filters=None), say=said.append, client_factory=no_sdk
-    )
 
 
 def test_a_read_failure_is_an_error_naming_the_table(fake):
