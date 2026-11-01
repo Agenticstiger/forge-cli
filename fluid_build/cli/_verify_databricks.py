@@ -31,7 +31,13 @@ What is checked is what the emitter's own pass says it provisions
    reach the table. Read from the catalog's effective permissions. forge-cli
    never grants it (the catalog is not the product's), so the finding carries
    the statement an admin runs.
-3. **The jobs.** Each dbt build that writes the expose has exactly one job of
+3. **Governance tags.** The contract's governance labels are Unity Catalog tags
+   (``databricks_entity_tag_assignment``) on the table and its schema. Each
+   expected tag must be there with its value; a tag someone else set is ignored.
+   Read from ``GET .../entity-tag-assignments/{type}/{name}/tags``, which pages.
+   A dbt ``CREATE OR REPLACE`` may drop a table's tags (Databricks does not
+   say), so this is the gate: the fix is ``fluid apply``.
+4. **The jobs.** Each dbt build that writes the expose has exactly one job of
    its name. None means ``fluid apply`` did not run (or the job was deleted);
    several mean an apply without its state created a duplicate.
 
@@ -244,6 +250,35 @@ def _catalog_privileges(client: Any, catalog: str, principal: str) -> set:
     return held
 
 
+def _live_tags(client: Any, entity_type: str, full_name: str) -> Dict[str, str]:
+    """The tags on a table or schema, ``{key: value}``, following every page.
+
+    The list is paginated: keep reading while ``next_page_token`` is present, an
+    empty page included, since the server may answer one with a token. A token seen
+    twice, or more than ``_MAX_PAGES`` pages, is a server that never stops, and an
+    error rather than a quiet stop (a stop would read as missing tags).
+    """
+    path = (
+        f"/api/2.1/unity-catalog/entity-tag-assignments/{entity_type}/"
+        f"{quote(full_name, safe='.')}/tags"
+    )
+    live: Dict[str, str] = {}
+    token: Optional[str] = None
+    seen: set = set()
+    for _ in range(_MAX_PAGES):
+        page = _get(client, path, {"page_token": token} if token else None)
+        for entry in page.get("tag_assignments") or []:
+            if isinstance(entry, Mapping) and entry.get("tag_key") is not None:
+                live[str(entry["tag_key"])] = str(entry.get("tag_value") or "")
+        token = page.get("next_page_token") or None
+        if not token:
+            return live
+        if token in seen:
+            break
+        seen.add(token)
+    raise _Unreadable(f"the tag list of {full_name} never ended")
+
+
 def _jobs_named(client: Any, name: str) -> List[Dict[str, Any]]:
     """Every job whose name is exactly ``name`` (the ``name`` filter is a hint, not trusted)."""
     found: List[Dict[str, Any]] = []
@@ -338,6 +373,70 @@ def _residency_dimension(client: Any, table: Any) -> Dict[str, Any]:
     }
 
 
+def _tags_dimension(client: Any, table: Any) -> Dict[str, Any]:
+    """The governance tags the module sets on the table and its schema, against the live ones.
+
+    ``skip`` when the contract has no governance labels: nothing was promised. A
+    tag set by someone else is ignored; a missing one, or one with another value,
+    fails.
+    """
+    schema = table.full_name.rsplit(".", 1)[0]
+    wanted = (
+        ("schemas", schema, f"schema {schema}", tuple(getattr(table, "schema_tags", ()))),
+        ("tables", table.full_name, f"table {table.full_name}", tuple(getattr(table, "tags", ()))),
+    )
+    total = sum(len(expected) for *_rest, expected in wanted)
+    if not total:
+        return {
+            "status": "skip",
+            "message": "the contract has no governance labels to check as tags",
+            "findings": [],
+        }
+    findings: List[Dict[str, Any]] = []
+    for entity_type, name, label, expected in wanted:
+        if not expected:
+            continue
+        live = _live_tags(client, entity_type, name)
+        for key, value in expected:
+            if key not in live:
+                findings.append(
+                    {
+                        "entity": label,
+                        "tag": key,
+                        "expected": value,
+                        "actual": None,
+                        "message": f"{label} has no tag {key} (expected {value!r})",
+                    }
+                )
+            elif live[key] != value:
+                findings.append(
+                    {
+                        "entity": label,
+                        "tag": key,
+                        "expected": value,
+                        "actual": live[key],
+                        "message": (
+                            f"{label} has tag {key}={live[key]!r}, the contract says {value!r}"
+                        ),
+                    }
+                )
+    if not findings:
+        return {
+            "status": "pass",
+            "message": f"all {total} governance tag(s) are on the table and its schema",
+            "findings": [],
+        }
+    return {
+        "status": "fail",
+        "message": f"{len(findings)} of {total} governance tag(s) missing or changed",
+        "findings": findings,
+        "fix": (
+            "Run fluid apply to set them again; a dbt CREATE OR REPLACE may have dropped "
+            "them (whether Databricks keeps tags across it is undocumented)"
+        ),
+    }
+
+
 def _jobs_dimension(client: Any, expose_id: str, contract: Mapping[str, Any], jobs: Any) -> Any:
     """The dimension for the dbt jobs that write ``expose_id``; ``None`` when there are none."""
     from fluid_build.util.contract import builds_writing_expose
@@ -391,9 +490,10 @@ def _severity(
     jobs: Optional[Mapping[str, Any]],
     missing_table: str = "",
     residency: Optional[Mapping[str, Any]] = None,
+    tags: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """The shared drift grading, raised to CRITICAL by a missing table, reader, job
-    or a workspace outside the declared region."""
+    """The shared drift grading, raised to CRITICAL by a missing table, reader, job,
+    a workspace outside the declared region or a governance tag that is not there."""
     from fluid_build.cli.verify import assess_drift_severity
 
     severity = assess_drift_severity(
@@ -417,6 +517,9 @@ def _severity(
     if (residency or {}).get("status") == "fail":
         reasons.append(residency["message"])
         actions.append(residency["fix"])
+    if (tags or {}).get("status") == "fail":
+        reasons.append(tags["message"] + ": " + "; ".join(f["message"] for f in tags["findings"]))
+        actions.append(tags["fix"])
     if not reasons:
         return severity
     already = severity["level"] == "CRITICAL"
@@ -517,6 +620,7 @@ def verify_databricks_expose(
     try:
         access = _access_dimension(client, table)
         residency = _residency_dimension(client, table)
+        tags = _tags_dimension(client, table)
         job_dim = _jobs_dimension(client, expose_id, contract, jobs)
     except Exception as exc:  # noqa: BLE001 — a check that could not run is an error
         return _error(
@@ -527,12 +631,21 @@ def verify_databricks_expose(
         )
     dimensions["catalog_access"] = access
     dimensions["residency"] = residency
+    dimensions["governance_tags"] = tags
     if job_dim is not None:
         dimensions["jobs"] = job_dim
 
     has_issues = any(
         dimensions[name]["status"] == "fail"
-        for name in ("structure", "types", "constraints", "catalog_access", "residency", "jobs")
+        for name in (
+            "structure",
+            "types",
+            "constraints",
+            "catalog_access",
+            "residency",
+            "governance_tags",
+            "jobs",
+        )
         if name in dimensions
     )
     return {
@@ -540,7 +653,7 @@ def verify_databricks_expose(
         "exists": True,
         "table_id": target,
         "target": target,
-        "severity": _severity(diff, access, job_dim, residency=residency),
+        "severity": _severity(diff, access, job_dim, residency=residency, tags=tags),
         "dimensions": dimensions,
         "metadata": {
             "num_rows": None,
