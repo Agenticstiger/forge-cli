@@ -98,6 +98,12 @@ def normalize_host(host: str) -> str:
     return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
 
 
+def is_acceptable_host(host: str) -> bool:
+    """Is a normalised host one the credential may be sent to: https, or http to loopback only."""
+    parts = urlsplit(host)
+    return parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in _LOOPBACK)
+
+
 def _host(env: Mapping[str, str]) -> str:
     raw = str(env.get(HOST_ENV) or "").strip()
     if not raw:
@@ -111,7 +117,7 @@ def _host(env: Mapping[str, str]) -> str:
         )
     host = normalize_host(raw)
     parts = urlsplit(host)
-    if parts.scheme != "https" and (parts.scheme != "http" or parts.hostname not in _LOOPBACK):
+    if not is_acceptable_host(host):
         raise _refusal(
             "host-insecure",
             f"{HOST_ENV} is {host}, not an https:// URL: the credential would cross the network "

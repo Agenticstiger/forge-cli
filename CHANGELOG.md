@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid publish` tells the Command Center which workspace holds a Databricks table.** The
+  product's `metadata.workspace_host` is now `https://<host>[:port]` taken from `DATABRICKS_HOST`,
+  normalised and checked as the provider checks it (https, or plain http only to a loopback
+  stand-in), so the Command Center can build a console link. It is never read from the contract,
+  where a host would be handed the credential, and it is left out when `DATABRICKS_HOST` is unset
+  or not acceptable, or the expose is not Databricks. Nothing credential-like rides along.
+
 ### Fixed
 
 - **A contract's `sovereignty` policy was never checked for a Databricks expose, so residency

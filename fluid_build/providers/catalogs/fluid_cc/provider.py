@@ -38,6 +38,9 @@ import httpx
 import yaml
 
 from fluid_build.errors import ConfigurationError
+from fluid_build.iac.provider_match import is_cloud
+from fluid_build.iac.providers.databricks_auth import HOST_ENV as DATABRICKS_HOST_ENV
+from fluid_build.iac.providers.databricks_auth import is_acceptable_host, normalize_host
 
 from ...common import CircuitBreaker, get_auth_headers, metrics_collector
 from ..base import PUBLIC_CLASSIFICATION, BaseCatalogProvider, CatalogAsset, PublishResult
@@ -647,6 +650,22 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
                         success=False, catalog_id=self.name, asset_id=asset.id, error=error_msg
                     )
 
+    def _databricks_workspace_host(self) -> Optional[str]:
+        """``https://<host>[:port]`` of the workspace, from ``DATABRICKS_HOST`` only.
+
+        The Command Center builds a console link from it. Never read from the
+        contract (forge-cli refuses ``binding.location.host``). Unset, or not
+        https (plain http only to loopback), leaves it out: not an error.
+        """
+        raw = os.environ.get(DATABRICKS_HOST_ENV, "").strip()
+        host = normalize_host(raw) if raw else ""
+        if host and is_acceptable_host(host):
+            return host
+        self.logger.debug(
+            "no workspace_host published: %s is unset or not an https URL", DATABRICKS_HOST_ENV
+        )
+        return None
+
     def _asset_body(self, asset: CatalogAsset) -> Dict[str, Any]:
         """The ``POST`` / ``PATCH /api/v1/assets`` body for ``asset``.
 
@@ -680,6 +699,10 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
         }
         if asset.environment:
             metadata["fluid_env"] = asset.environment
+        if is_cloud({"platform": asset.platform}, "databricks"):
+            workspace_host = self._databricks_workspace_host()
+            if workspace_host:
+                metadata["workspace_host"] = workspace_host
         # owner_id is replaced by the backend with the authenticated user, but
         # the Pydantic model requires it, so a placeholder is sent.
         body: Dict[str, Any] = {
