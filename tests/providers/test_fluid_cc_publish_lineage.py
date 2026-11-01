@@ -875,6 +875,21 @@ class TestWorkspaceHost:
         monkeypatch.setenv("DATABRICKS_HOST", "http://127.0.0.1:8080/x")
         assert self._metadata(cc, "databricks")["workspace_host"] == "http://127.0.0.1:8080"
 
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "https://user:pass@dbc-abc.cloud.databricks.com",
+            "https://tok@dbc-abc.cloud.databricks.com",
+        ],
+    )
+    def test_a_host_carrying_user_info_is_never_published(self, cc, monkeypatch, host):
+        # normalize_host keeps the netloc whole: the user-info would reach the
+        # Command Center with the link.
+        monkeypatch.setenv("DATABRICKS_HOST", host)
+        metadata = self._metadata(cc, "databricks")
+        assert "workspace_host" not in metadata
+        assert "pass" not in json.dumps(metadata) and "tok@" not in json.dumps(metadata)
+
     @pytest.mark.parametrize("platform", ["aws", "gcp", "snowflake", "local"])
     def test_other_platforms_never_get_one(self, cc, monkeypatch, platform):
         monkeypatch.setenv("DATABRICKS_HOST", "https://dbc-abc.cloud.databricks.com")

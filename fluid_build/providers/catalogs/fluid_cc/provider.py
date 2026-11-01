@@ -33,6 +33,7 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import httpx
 import yaml
@@ -655,14 +656,18 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
 
         The Command Center builds a console link from it. Never read from the
         contract (forge-cli refuses ``binding.location.host``). Unset, or not
-        https (plain http only to loopback), leaves it out: not an error.
+        https (plain http only to loopback), leaves it out: not an error. So
+        does a host carrying user-info (``https://user:pass@host``):
+        ``normalize_host`` keeps the netloc whole, and the user-info would be
+        published to the Command Center with the link.
         """
         raw = os.environ.get(DATABRICKS_HOST_ENV, "").strip()
         host = normalize_host(raw) if raw else ""
-        if host and is_acceptable_host(host):
+        if host and is_acceptable_host(host) and "@" not in urlsplit(host).netloc:
             return host
         self.logger.debug(
-            "no workspace_host published: %s is unset or not an https URL", DATABRICKS_HOST_ENV
+            "no workspace_host published: %s is unset, not an https URL, or carries user-info",
+            DATABRICKS_HOST_ENV,
         )
         return None
 
