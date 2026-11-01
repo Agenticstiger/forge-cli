@@ -291,9 +291,15 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
         _enforce_data_loss_gate(args, logger, provider, changes, data_changes, lost_in_place)
 
         if dry_run:
+            _enforce_access(plugin, "pre_apply", contract, dry_run=True)
             cprint("\ndry-run: plan only — not applying.")
             info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
             return 0
+        # Access enforcement the cloud keeps outside OpenTofu (Unity Catalog column masks
+        # and row filters) goes onto the tables that already exist BEFORE the apply, so a
+        # grant the apply adds lands on a protected table. A failure stops the run here:
+        # nothing has been applied.
+        _enforce_access(plugin, "pre_apply", contract)
         imported.keep()
 
     # ``fluid apply`` is the headline state-changing command, so a receiver
@@ -319,8 +325,40 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
             planned=changes, applied=applied, resources=_module_addresses(module), dry_run=False
         )
 
+    # The tables this apply created exist now, empty: they get their masks and row filter
+    # before any build can fill them. A table that cannot be bound is locked for the principals
+    # it restricts, and the run fails.
+    _enforce_access(plugin, "post_apply", contract)
+
     info(logger, "opentofu_apply_ok", provider=provider, **applied)
     return 0
+
+
+def _enforce_access(
+    plugin: Any, hook: str, contract: Mapping[str, Any], *, dry_run: bool = False
+) -> None:
+    """Run a plugin's ``pre_apply`` / ``post_apply`` access-enforcement hook, if it has one.
+
+    Optional plugin capability, discovered like ``plan_notices``: the Databricks plugin
+    binds Unity Catalog column masks and row filters, which the provider cannot manage
+    (``iac/providers/databricks_enforce.py``). Unlike the advisory hooks this one gates: a
+    refusal or failure is a typed error and the run exits non-zero. With ``dry_run`` the
+    plugin prints the statements and runs none.
+    """
+    run = getattr(plugin, hook, None)
+    if not callable(run):
+        return
+    try:
+        if dry_run:
+            run(contract, say=cprint, dry_run=True)
+        else:
+            run(contract, say=cprint)
+    except UnsupportedBindingError as exc:
+        raise CLIError(
+            1,
+            "opentofu_access_enforcement_failed",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        ) from exc
 
 
 def _applied_env(args) -> Optional[str]:

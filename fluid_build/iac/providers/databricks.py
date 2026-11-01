@@ -147,6 +147,7 @@ from ..provider_match import canonical_cloud, is_cloud
 from ..versions import required_providers
 from .databricks_access import TableEnforcement, compile_enforcement
 from .databricks_auth import tofu_env_overlay
+from .databricks_enforce import Target, post_apply, pre_apply, preview
 from .databricks_jobs import (
     CompiledJobs,
     DbtJob,
@@ -1639,6 +1640,43 @@ class DatabricksIacPlugin:
         """Column drift on the tables a dbt build writes, which ``ignore_changes``
         hides, in the shape the engine reports (``_report_suppressed_drift``)."""
         return _dbt_column_drift(_compile(contract, os.environ), prior_resources)
+
+    @staticmethod
+    def _enforcement_targets(contract: Mapping[str, Any]) -> List[Target]:
+        compiled = _compile(contract, os.environ)
+        if compiled.refusals:
+            raise compiled.refusals[0]
+        return [Target(table.full_name, table.enforcement) for table in compiled.tables]
+
+    def pre_apply(
+        self,
+        contract: Mapping[str, Any],
+        say: Optional[Callable[[str], None]] = None,
+        dry_run: bool = False,
+        client_factory: Optional[Callable[[], Any]] = None,
+    ) -> None:
+        """Before ``tofu apply``: bind the contract's column masks and row filter on the
+        tables that already exist (``databricks_enforce.pre_apply``), so a grant the apply
+        adds lands on a protected table. With ``dry_run`` it prints every statement either
+        hook would run, and runs none. Raises :class:`UnsupportedBindingError` to stop the
+        run before the apply."""
+        targets = self._enforcement_targets(contract)
+        say = say or print
+        if dry_run:
+            preview(targets, say, client_factory)
+        else:
+            pre_apply(targets, say, client_factory)
+
+    def post_apply(
+        self,
+        contract: Mapping[str, Any],
+        say: Optional[Callable[[str], None]] = None,
+        client_factory: Optional[Callable[[], Any]] = None,
+    ) -> None:
+        """After ``tofu apply``: bind on the tables it created, drop what the contract no
+        longer restricts, and revoke ``SELECT`` from the restricted principals of any table
+        it could not bind (``databricks_enforce.post_apply``)."""
+        post_apply(self._enforcement_targets(contract), say or print, client_factory)
 
     def plan_notices(self, contract: Mapping[str, Any]) -> List[str]:
         """What the apply cannot do itself and someone must: ``USE CATALOG``."""
