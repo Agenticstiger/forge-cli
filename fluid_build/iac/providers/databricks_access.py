@@ -70,6 +70,10 @@ MASK_PREFIX = "fluid_mask_"
 #: arguments (sqlglot class names).
 ALLOWED_FUNCTIONS = ("lower", "upper", "length", "trim", "coalesce", "abs")
 
+#: Mask rules, strictest first (nullify and first_four hide more than last_four; the deny above
+#: them all hides everything).
+MASK_STRICTNESS = ("nullify", "first_four", "last_four")
+
 _STRING_TYPES = frozenset({"string", "varchar", "char"})
 _MAX_NAME = 128
 _MASK_TEXT = "XXXXX"
@@ -395,7 +399,7 @@ def compile_enforcement(
     lower = {name.lower(): name for name in types}
     resolve = _Resolver(binding, where)
     try:
-        restrictions = restrictions_for(exposure, index)
+        restrictions = restrictions_for(exposure, index, rule_per_principal=True)
     except UnsupportedBindingError as exc:
         raise _refusal("column-restriction-invalid", f"{where}: {exc}", *exc.remediation) from exc
     try:
@@ -440,15 +444,14 @@ def _compile_masks(
     restricted: Dict[str, None],
 ) -> Tuple[MaskSpec, ...]:
     denied: Dict[str, List[str]] = {}
-    masked: Dict[str, List[str]] = {}
-    rules: Dict[str, str] = {}
+    # column -> mask rule -> identities that read it masked by that rule: a rule belongs to
+    # the principal that names it, not to the column.
+    masked: Dict[str, Dict[str, List[str]]] = {}
     for i, restriction in enumerate(restrictions):
         at = f"{where}.policy.authz.columnRestrictions[{i}]"
-        if restriction.access == DENY:
-            target = denied
-        elif restriction.access == MASK and restriction.mask in MASK_RULES:
-            target = masked
-        else:
+        if restriction.access not in (DENY, MASK) or (
+            restriction.access == MASK and restriction.mask not in MASK_RULES
+        ):
             raise _refusal(
                 "column-allow-unmapped",
                 f"{at} is access: {restriction.access}. An allow list would hide the column "
@@ -462,31 +465,36 @@ def _compile_masks(
             restricted.setdefault(identity, None)
         for column in restriction.columns:
             canonical = lower[column.lower()]
-            target.setdefault(canonical, []).extend(members)
-            if restriction.access == MASK:
-                rules[canonical] = restriction.mask
+            if restriction.access == DENY:
+                denied.setdefault(canonical, []).extend(members)
+            else:
+                masked.setdefault(canonical, {}).setdefault(restriction.mask, []).extend(members)
     out: List[MaskSpec] = []
     for column in types:  # the table's column order
-        deny_members, mask_members = denied.get(column, []), masked.get(column, [])
-        if not (deny_members or mask_members):
+        deny_members = denied.get(column, [])
+        by_rule = {rule: members for rule, members in masked.get(column, {}).items() if members}
+        if not (deny_members or by_rule):
             continue
         column_type = types[column]
-        rule = rules.get(column)
-        if mask_members and rule != "nullify" and column_type.lower() not in _STRING_TYPES:
-            raise _refusal(
-                "mask-type",
-                f"{where} masks {column} ({column_type}) by {rule}, which masks text.",
-                "Mask a string column, or use mask: nullify.",
-            )
+        for rule in by_rule:
+            if rule != "nullify" and column_type.lower() not in _STRING_TYPES:
+                raise _refusal(
+                    "mask-type",
+                    f"{where} masks {column} ({column_type}) by {rule}, which masks text.",
+                    "Mask a string column, or use mask: nullify.",
+                )
+        # Strictest first, so a member of several groups gets the strictest rule that matches:
+        # the deny (NULL), then nullify (NULL), then first_four, then last_four.
         branches: List[str] = []
         if deny_members:
             branches.append(
                 f"WHEN {_any_member(deny_members)} THEN CAST(NULL AS {column_type.upper()})"
             )
-        if mask_members and rule is not None:
-            branches.append(
-                f"WHEN {_any_member(mask_members)} THEN {_mask_value(rule, column_type)}"
-            )
+        for rule in MASK_STRICTNESS:
+            if rule in by_rule:
+                branches.append(
+                    f"WHEN {_any_member(by_rule[rule])} THEN {_mask_value(rule, column_type)}"
+                )
         body = "CASE " + " ".join(branches) + " ELSE `val` END"
         function = _function(
             catalog, schema, MASK_PREFIX, f"{table}_{column}", f"`val` {column_type.upper()}",

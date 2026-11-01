@@ -427,12 +427,90 @@ def test_a_restriction_the_mapping_cannot_express_is_refused(restriction, why):
     assert error.kind == "databricks-column-restriction-invalid", why
 
 
-def test_two_masking_rules_for_one_column_are_refused():
-    restrictions = [
-        MASK,
-        {"principal": STEWARDS, "columns": ["msisdn"], "access": "mask", "mask": "first_four"},
+GUESTS = "group:guests@northwind.example"
+GUESTS_GROUP = "fluid-demo-lab-guests"
+THREE = {ANALYSTS: ANALYSTS_GROUP, STEWARDS: STEWARDS_GROUP, GUESTS: GUESTS_GROUP}
+
+
+def _by_rule(rules: dict) -> list:
+    return [
+        {"principal": principal, "columns": ["msisdn"], "access": "mask", "mask": rule}
+        for principal, rule in rules.items()
     ]
-    assert _kinds(contract(restrictions=restrictions)) == "databricks-column-restriction-invalid"
+
+
+def test_each_principal_gets_the_mask_rule_it_names_not_the_last_ones():
+    """A nullify and B last_four on one column: A reads NULL, not the last four characters."""
+    restrictions = _by_rule({ANALYSTS: "nullify", STEWARDS: "last_four"})
+    enforcement = compiled(contract(restrictions=restrictions, filters=None))
+    assert len(enforcement.masks) == 1, "one mask per column"
+    value = "0791234567"
+    assert _masked(enforcement, "msisdn", [ANALYSTS_GROUP], value) is None
+    assert _masked(enforcement, "msisdn", [STEWARDS_GROUP], value) == "XXXXX4567"
+    assert _masked(enforcement, "msisdn", ["nobody"], value) == value
+    # A member of both gets the strictest rule that matches.
+    assert _masked(enforcement, "msisdn", [ANALYSTS_GROUP, STEWARDS_GROUP], value) is None
+
+
+def test_the_same_result_whichever_restriction_is_written_first():
+    one = compiled(contract(restrictions=_by_rule({ANALYSTS: "nullify", STEWARDS: "last_four"})))
+    two = compiled(contract(restrictions=_by_rule({STEWARDS: "last_four", ANALYSTS: "nullify"})))
+    assert one.masks == two.masks
+
+
+def test_mask_branches_are_ordered_strictest_first_deny_nullify_first_four_last_four():
+    restrictions = [
+        {"principal": GUESTS, "columns": ["msisdn"], "access": "deny"},
+        *_by_rule({ANALYSTS: "last_four", STEWARDS: "first_four"}),
+        {"principal": "group:ops@northwind.example", "columns": ["msisdn"], "access": "mask",
+         "mask": "nullify"},
+    ]  # fmt: skip
+    principals = {**THREE, "group:ops@northwind.example": "fluid-demo-lab-ops"}
+    enforcement = compiled(contract(restrictions=restrictions, filters=None, principals=principals))
+    body = enforcement.masks[0].function.create
+    deny = body.index(f"WHEN ({_both_ways(GUESTS_GROUP)}) THEN CAST(NULL")
+    nullify = body.index(f"WHEN ({_both_ways('fluid-demo-lab-ops')}) THEN CAST(NULL")
+    first = body.index(f"WHEN ({_both_ways(STEWARDS_GROUP)}) THEN CASE")
+    last = body.index(f"WHEN ({_both_ways(ANALYSTS_GROUP)}) THEN CASE")
+    assert deny < nullify < first < last
+    value = "0791234567"
+    groups = {"deny": GUESTS_GROUP, "nullify": "fluid-demo-lab-ops", "first": STEWARDS_GROUP,
+              "last": ANALYSTS_GROUP}  # fmt: skip
+    assert _masked(enforcement, "msisdn", [groups["last"]], value) == "XXXXX4567"
+    assert _masked(enforcement, "msisdn", [groups["first"]], value) == "0791XXXXX"
+    assert _masked(enforcement, "msisdn", [groups["first"], groups["last"]], value) == "0791XXXXX"
+    assert _masked(enforcement, "msisdn", [groups["nullify"], groups["first"]], value) is None
+    assert _masked(enforcement, "msisdn", [groups["deny"], groups["nullify"]], value) is None
+    assert _masked(enforcement, "msisdn", list(groups.values()), value) is None
+
+
+def test_a_principal_naming_two_rules_for_a_column_gets_the_stricter():
+    restrictions = _by_rule({ANALYSTS: "last_four"}) + [
+        {"principal": ANALYSTS, "columns": ["msisdn"], "access": "mask", "mask": "first_four"}
+    ]
+    enforcement = compiled(contract(restrictions=restrictions, filters=None))
+    assert _masked(enforcement, "msisdn", [ANALYSTS_GROUP], "0791234567") == "0791XXXXX"
+
+
+def test_gcp_and_aws_still_refuse_two_masking_rules_for_one_column():
+    from fluid_build.iac.column_access import restrictions_for
+
+    exposure = contract(restrictions=_by_rule({ANALYSTS: "nullify", STEWARDS: "last_four"}))[
+        "exposes"
+    ][0]
+    with pytest.raises(UnsupportedBindingError, match="one masking rule"):
+        restrictions_for(exposure)
+    assert len(restrictions_for(exposure, rule_per_principal=True)) == 2
+
+
+def test_each_text_rule_is_checked_against_the_column_type():
+    on_score = [
+        {"principal": ANALYSTS, "columns": ["score"], "access": "mask", "mask": "nullify"},
+        {"principal": STEWARDS, "columns": ["score"], "access": "mask", "mask": "first_four"},
+    ]
+    error = refusal(contract(restrictions=on_score, filters=None))
+    assert error.kind == "databricks-mask-type" and "first_four" in str(error)
+    assert compiled(contract(restrictions=on_score[:1], filters=None)).masks[0].column == "score"
 
 
 def test_a_text_mask_on_a_non_string_column_is_refused_and_nullify_is_not():
