@@ -28,11 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `last_four` (`XXXXX` and the last four characters), `first_four`, or NULL for `nullify`; a
   value of four characters or fewer is its SHA-256 and a NULL stays NULL, as on AWS. One mask
   per column (the Unity Catalog limit) combines every restriction on it, a principal in a deny
-  and a mask gets the deny, and everyone else reads the value. One row filter per table: its
+  and a mask gets the deny, and everyone else reads the value. A mask rule belongs to the
+  principal that names it, not to the column (on Databricks a column may be masked by
+  `nullify` for one principal and `last_four` for another; GCP and AWS still refuse that): the
+  function has one branch per rule, strictest first (deny, `nullify`, `first_four`,
+  `last_four`), so a member of several groups gets the strictest that matches, and each text
+  rule is type-checked against the column. One row filter per table: its
   principals' members read the union of those principals' predicates, everyone else every row.
-  Logical principals resolve through `binding.principals`: `group:` is
-  `is_account_group_member('<name>')`, `user:` and `serviceAccount:` are `current_user() =
-  '<name>'`; a principal with no such test (no prefix, `domain:`) is
+  Logical principals resolve through `binding.principals`, and every resolved identity is
+  tested both ways, `(is_account_group_member('<name>') OR current_user() = '<name>')`,
+  whatever the principal's prefix: a `group:` principal may be mapped to a service principal's
+  application ID or a user's email, and a test of the wrong kind would match no one while the
+  grant to that identity still applied (a name that is both a group and a user is restricted
+  either way, which errs closed). A principal with no prefix or a `domain:` one is
   `databricks-principal-kind`, and `access: allow` (which would blind every reader it does not
   name, the owner and the pipelines included), a text mask on a non-string column
   (`databricks-mask-type`) and anything else this cannot express are refused rather than
@@ -63,7 +71,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admin set by hand is left alone. It fails closed: a pre-apply failure stops the run before
   `tofu apply`; if `post_apply` cannot bind a table it revokes `SELECT` on it from every
   principal a restriction names (so a later dbt run cannot expose unmasked rows to them), prints
-  exactly what it revoked and why, and exits non-zero, and re-running `fluid apply` once the
+  exactly what it revoked and why, and exits non-zero. The same bind-only pass runs when
+  `tofu apply` itself fails part way, before the apply's own error is raised: a table the apply
+  created, its grants and the dbt job that fills it can exist with no mask or filter, and a
+  scheduled run would expose unmasked rows. It binds what exists, revokes where it cannot bind,
+  skips a table that was never created and drops nothing (dropping widens access and waits for
+  an apply that succeeded); a failure there is printed and the run still exits with
+  `opentofu_apply_failed`. Re-running `fluid apply` once the
   cause is fixed binds first and grants again. A contract with restrictions now needs the
   `[databricks]` extra (databricks-sdk) at apply, and says so when it is missing. `fluid verify`
   gains a row-filter-and-masks dimension: the expected function names (content-hashed) against
