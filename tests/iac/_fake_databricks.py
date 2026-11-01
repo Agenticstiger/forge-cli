@@ -32,7 +32,9 @@ from "a replaced table" after an apply.
 
 It also serves ``databricks_job`` (create / get / reset / delete, plus the ``list`` an exact
 ``name`` filter needs), ``databricks_workspace_file`` (import / get-status / delete) and
-``data.databricks_current_user``, and answers the Unity Catalog effective-permissions read.
+``data.databricks_current_user`` and ``data.databricks_current_metastore`` (the metastore
+summary, whose region is ``FakeDatabricks(region=...)``), and answers the Unity Catalog
+effective-permissions read.
 Jobs and workspace files are kept as sent (``jobs[id]["settings"]``, ``workspace_files[path]``),
 so a test asserts on exactly what the provider submitted; ``add_job`` / ``add_workspace_file``
 seed brownfield objects.
@@ -405,7 +407,14 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
 
 # ---------------------------------------------------------------------- the server
 class FakeDatabricks:
-    def __init__(self, catalogs: Tuple[str, ...] = ("main",), warehouse_id: str = "wh-fake-0001"):
+    def __init__(
+        self,
+        catalogs: Tuple[str, ...] = ("main",),
+        warehouse_id: str = "wh-fake-0001",
+        region: str = "eu-central-1",
+    ):
+        # The region the workspace's metastore is in (GET .../metastore_summary).
+        self.region = region
         self.catalogs: Dict[str, Dict[str, Any]] = {c: {"name": c} for c in catalogs}
         self.schemas: Dict[str, Dict[str, Any]] = {}  # "cat.schema"
         self.tables: Dict[str, Dict[str, Any]] = {}  # "cat.schema.table"
@@ -604,6 +613,7 @@ class FakeDatabricks:
         a("GET", r"/api/2\.0/settings/types/default_namespace_ws/names/default", self._nf_setting)
         # ---- unity catalog
         a("GET", r"/api/2\.1/unity-catalog/current-metastore-assignment", self._cur_metastore)
+        a("GET", r"/api/2\.1/unity-catalog/metastore_summary", self._metastore_summary)
         a("GET", r"/api/2\.1/unity-catalog/catalogs/([^/]+)", self._get_catalog)
         a("POST", r"/api/2\.1/unity-catalog/schemas", self._create_schema)
         a("GET", r"/api/2\.1/unity-catalog/schemas/([^/]+)", self._get_schema)
@@ -654,6 +664,19 @@ class FakeDatabricks:
             "metastore_id": "ms-fake",
             "workspace_id": int(_ORG_ID),
             "default_catalog_name": "main",
+        }
+
+    def _metastore_summary(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        """What ``data.databricks_current_metastore`` and ``fluid verify`` read the region from."""
+        return 200, {
+            "metastore_id": "ms-fake",
+            "name": "fake-metastore",
+            "region": self.region,
+            "cloud": "aws",
+            "global_metastore_id": f"aws:{self.region}:ms-fake",
+            "default_data_access_config_id": "dac-fake",
+            "storage_root": f"s3://fake-metastore-{self.region}/root",
+            "owner": _USER,
         }
 
     def _get_catalog(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:

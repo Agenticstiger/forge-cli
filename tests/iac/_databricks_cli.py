@@ -67,8 +67,11 @@ def make_contract(
     readers: Tuple[str, ...] = ("group:analysts", "group:bi"),
     catalog: str = "main",
     product_id: str = "dbx.fake.orders",
+    region: str = "",
 ) -> Dict[str, Any]:
     location: Dict[str, Any] = {"database": catalog, "schema": "sales", "table": "orders"}
+    if region:
+        location["region"] = region
     if partitions:
         location["partitionBy"] = list(partitions)
     return {

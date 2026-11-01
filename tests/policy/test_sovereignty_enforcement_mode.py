@@ -300,3 +300,67 @@ def test_explicit_deny_is_an_error_in_every_mode() -> None:
         doc = contract(enforcementMode=mode, deniedRegions=[US_REGION])
         assert "error" in severities(doc)
         assert SovereigntyValidator().validate(doc)[0] is False
+
+
+# ---------------------------------------------------------------------------
+# Databricks is region-placed: its residency must not fail open
+# ---------------------------------------------------------------------------
+
+
+def databricks_contract(*, region: Any = None, **sovereignty: Any) -> Dict[str, Any]:
+    """An EU-policy contract whose one expose is a Unity Catalog table."""
+    location: Dict[str, Any] = {"database": "main", "schema": "s", "table": "t"}
+    if region is not None:
+        location["region"] = region
+    doc = contract(**sovereignty)
+    doc["exposes"][0]["binding"] = {
+        "platform": "databricks",
+        "format": "delta_table",
+        "location": location,
+    }
+    return doc
+
+
+def test_databricks_without_a_region_is_a_check_0_error_under_strict() -> None:
+    doc = databricks_contract(enforcementMode="strict", jurisdiction="EU")
+    is_valid, violations = SovereigntyValidator().validate(doc)
+    assert is_valid is False
+    assert [v.severity for v in violations] == ["error"]
+    assert "declares no region" in violations[0].message
+    assert violations[0].expose_id == "e"
+
+
+def test_databricks_without_a_region_only_warns_under_advisory() -> None:
+    doc = databricks_contract(enforcementMode="advisory", jurisdiction="EU")
+    is_valid, violations = SovereigntyValidator().validate(doc)
+    assert is_valid is True
+    assert [v.severity for v in violations] == ["warning"]
+
+
+def test_databricks_in_a_denied_region_is_an_error() -> None:
+    doc = databricks_contract(
+        region="us-west-2",
+        enforcementMode="strict",
+        jurisdiction="EU",
+        deniedRegions=["us-west-2"],
+    )
+    is_valid, violations = SovereigntyValidator().validate(doc)
+    assert is_valid is False
+    assert any(v.severity == "error" and "us-west-2" in v.message for v in violations)
+
+
+def test_databricks_in_an_allowed_region_has_no_violation() -> None:
+    doc = databricks_contract(
+        region="eu-central-1",
+        enforcementMode="strict",
+        jurisdiction="EU",
+        allowedRegions=["eu-central-1"],
+        deniedRegions=["us-west-2"],
+    )
+    assert SovereigntyValidator().validate(doc) == (True, [])
+
+
+def test_databricks_without_a_sovereignty_block_has_no_violation() -> None:
+    doc = databricks_contract()
+    doc.pop("sovereignty")
+    assert SovereigntyValidator().validate(doc) == (True, [])

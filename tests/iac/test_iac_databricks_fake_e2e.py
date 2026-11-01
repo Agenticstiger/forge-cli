@@ -340,6 +340,42 @@ def test_a_missing_catalog_fails_at_plan(workspace, fake, capfd):
     assert fake.schemas == {} and fake.sql_log == []
 
 
+def test_a_workspace_in_the_declared_region_plans_and_applies(workspace, fake, capfd):
+    # The stand-in's metastore is in eu-central-1: the precondition reads it through the
+    # real provider's data.databricks_current_metastore and holds.
+    path = write_contract(workspace, make_contract(region="eu-central-1"))
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "main.sales" in fake.schemas
+    assert ("GET", "/api/2.1/unity-catalog/metastore_summary") in fake.requests
+    assert fake.unknown == []
+
+    rc, out = apply_contract(capfd, path, "--mode", "dry-run")
+    assert rc == 0 and "tofu plan: +0 ~0 -0" in out, out
+
+
+def test_a_workspace_in_another_region_fails_the_plan_naming_both_regions(workspace, fake, capfd):
+    path = write_contract(workspace, make_contract(region="us-west-2"))
+
+    rc, out = apply_contract(capfd, path, "--mode", "dry-run")
+
+    assert rc == 1 and "opentofu_plan_failed" in out, out
+    assert "us-west-2" in out and "eu-central-1" in out
+    assert "DATABRICKS_HOST" in out
+    # The plan failed before anything was written.
+    assert fake.schemas == {} and fake.tables == {} and fake.sql_log == []
+    assert fake.unknown == []
+
+
+def test_a_region_in_another_case_still_matches(workspace, fake, capfd):
+    path = write_contract(workspace, make_contract(region="EU-Central-1"))
+
+    rc, out = apply_contract(capfd, path, "--mode", "dry-run")
+
+    assert rc == 0, out
+
+
 def test_no_host_names_the_variable_to_set(workspace, fake, capfd, monkeypatch):
     # Without it the provider would take the DEFAULT profile's workspace.
     monkeypatch.delenv("DATABRICKS_HOST")

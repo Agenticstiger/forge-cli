@@ -56,6 +56,19 @@ resources, with no new schema field (fluid-schema 0.7.6):
   the table's Delta protocol, which older readers cannot read, and that is the
   owner's call to make in Databricks, not a side effect of an apply.
 
+* ``binding.location.region`` is the region the workspace is in, declared so a
+  contract's ``sovereignty`` policy can check it (``policy/sovereignty.py``
+  treats Databricks as a region-placed platform). A declaration is verified,
+  not trusted: the module reads the workspace's metastore
+  (``data.databricks_current_metastore``) and every schema it owns carries a
+  ``lifecycle.precondition`` that the metastore's region equals the declared
+  one, so ``tofu plan`` fails, before anything is written, when
+  ``DATABRICKS_HOST`` names a workspace in another region. The value is
+  lower-cased and must be a plain region name (it is interpolated into the
+  module): ``databricks-region-invalid`` otherwise; two exposes declaring
+  different regions is ``databricks-region-conflict``, a workspace having one.
+  A contract that declares no region gets the module it always did.
+
 Two inputs come from the environment, never from the contract:
 ``DATABRICKS_HOST``, which the provider reads itself (a contract that named the
 host would be handed the credential, the #758 class), and
@@ -88,7 +101,7 @@ from ...util.contract import is_databricks_job_build
 from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
 from ..importer import ImportBlock
-from ..naming import safe_ident, tofu_ref, unique_ident
+from ..naming import TofuExpr, safe_ident, tofu_ref, unique_ident
 from ..principals import (
     _ENV_TEMPLATE_RE,
     DATABRICKS,
@@ -125,8 +138,13 @@ _ICEBERG_FORMATS = ("iceberg", "iceberg_table")
 #: their own. Any other key the schema allows (``path``, ``region``, ...) would
 #: be dropped, so it is refused.
 _LOCATION_KEYS = frozenset(
-    {"database", "schema", "table", "partitionBy", "host", "catalog", "warehouse"}
+    {"database", "schema", "table", "partitionBy", "host", "catalog", "warehouse", "region"}
 )
+
+#: A declared workspace region, lower-cased: ``eu-central-1``, ``westeurope``,
+#: ``us-east1``. It is interpolated into the tf.json, where ``${`` and ``%{``
+#: are template syntax, so this is a security boundary, not a style check.
+_REGION_RE = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 
 #: FLUID permission → Unity Catalog table privilege. ``create`` has no table
 #: privilege and is skipped, as the BigQuery table map skips it.
@@ -198,6 +216,8 @@ class _Table:
     partitions: Tuple[str, ...]
     binding: Mapping[str, Any]
     exposure: Mapping[str, Any]
+    #: The declared workspace region, lower-cased and validated; ``""`` if none.
+    region: str = ""
 
     @property
     def full_name(self) -> str:
@@ -616,6 +636,7 @@ def _resolve_table(
     names = _location_names(where, loc, refusals, validating=validating)
     columns = _columns(where, exposure, refusals, validating=validating)
     partitions = _partitions(where, loc, columns, refusals, validating=validating)
+    region = _region(where, loc, refusals)
     _refuse_governance(where, binding, exposure, refusals)
     if len(refusals) > before:
         return None
@@ -629,7 +650,49 @@ def _resolve_table(
         partitions=tuple(partitions),
         binding=binding,
         exposure=exposure,
+        region=region,
     )
+
+
+def _region(where: str, loc: Mapping[str, Any], refusals: List[UnsupportedBindingError]) -> str:
+    """The declared workspace region, lower-cased; ``""`` if none, or refused."""
+    raw = loc.get("region")
+    if not _set(raw):
+        return ""
+    region = str(raw).strip().lower()
+    if not isinstance(raw, str) or not _REGION_RE.match(region):
+        refusals.append(
+            _refusal(
+                "region-invalid",
+                f"{where} has binding.location.region {raw!r}, which is not a region name. A "
+                "region is lower-case letters, digits and hyphens, starting with a letter "
+                "(eu-central-1, westeurope): it is written into the module the plan runs.",
+                "Set location.region to the region of the workspace DATABRICKS_HOST names.",
+            )
+        )
+        return ""
+    return region
+
+
+def _refuse_region_conflict(
+    tables: Sequence[_Table], refusals: List[UnsupportedBindingError]
+) -> None:
+    """One workspace has one region: two exposes declaring different ones cannot both hold."""
+    declared: Dict[str, str] = {}
+    for table in tables:
+        if table.region:
+            declared.setdefault(table.region, table.where)
+    if len(declared) > 1:
+        named = "; ".join(f"{where} declares {region}" for region, where in declared.items())
+        refusals.append(
+            _refusal(
+                "region-conflict",
+                f"The Databricks exposes declare different regions ({named}), but the module "
+                "applies to one workspace (DATABRICKS_HOST), which is in one region.",
+                "Declare the same location.region on every Databricks expose, or split the "
+                "exposes into products that apply to their own workspace.",
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -842,6 +905,7 @@ def _compile(
     targets = _resolve_tables(compiled, exposures, validating=validating)
     warehouse = _warehouse(env, refusals)
     _refuse_duplicate_tables(compiled.tables, refusals)
+    _refuse_region_conflict(compiled.tables, refusals)
     cid = safe_ident(contract.get("id") or contract.get("name") or "product")
     privileges = _table_privileges(contract, targets, refusals)
     dbt_written = dbt_written_exposes(contract, compiled.tables)
@@ -941,12 +1005,15 @@ def _emit_table(
         compiled.imports.append(
             ImportBlock(f"databricks_schema.{schema_key}", f"{table.catalog}.{table.schema}")
         )
+    schema_body: Dict[str, Any] = {"catalog_name": catalog_name, "name": table.schema}
+    if table.region:
+        schema_body["lifecycle"] = {"precondition": [_region_precondition(compiled, cid, table)]}
     _claim(
         compiled,
         "databricks_schema",
         schema_key,
         f"schema {table.catalog}.{table.schema}",
-        {"catalog_name": catalog_name, "name": table.schema},
+        schema_body,
     )
     body: Dict[str, Any] = {
         "catalog_name": catalog_name,
@@ -972,6 +1039,30 @@ def _emit_table(
     # table with CREATE OR REPLACE, so a table that exists but is not in
     # state would otherwise be replaced, and the plan would only show +1.
     compiled.imports.append(ImportBlock(f"databricks_sql_table.{table_key}", table.full_name))
+
+
+def _region_precondition(compiled: _Compiled, cid: str, table: _Table) -> Dict[str, Any]:
+    """The plan-time check that the workspace is in the declared region.
+
+    ``data.databricks_current_metastore`` calls the metastore summary of the
+    workspace ``DATABRICKS_HOST`` names (provider ``catalog/
+    data_current_metastore.go``, v1.140.0), which carries the metastore's
+    region; a schema's precondition fails the plan when it differs. The
+    region interpolated here passed :data:`_REGION_RE`, so it carries no
+    template syntax.
+    """
+    key = safe_ident(f"{cid}_metastore")
+    compiled.data.setdefault("databricks_current_metastore", {})[key] = {}
+    actual = f"data.databricks_current_metastore.{key}.metastore_info[0].region"
+    return {
+        "condition": tofu_ref(f'lower({actual}) == "{table.region}"'),
+        "error_message": TofuExpr(
+            f"The contract declares binding.location.region {table.region}, but the workspace "
+            "DATABRICKS_HOST names is in ${" + actual + "}. Residency is checked against the "
+            f"workspace's metastore. Point DATABRICKS_HOST at a workspace in {table.region}, "
+            "or correct binding.location.region."
+        ),
+    }
 
 
 def _emit_grants(
@@ -1524,6 +1615,8 @@ class ManagedTable:
     readers: Tuple[str, ...]
     #: Written by a dbt build: the module ignores its column drift, verify gates it.
     dbt_written: bool
+    #: The workspace region the contract declares, lower-cased; ``""`` if none.
+    region: str = ""
 
 
 def managed_objects(
@@ -1545,6 +1638,7 @@ def managed_objects(
             ),
             readers=tuple(readers.get(table.full_name, ())),
             dbt_written=table.full_name in compiled.dbt_written,
+            region=table.region,
         )
         for table in compiled.tables
     ]
