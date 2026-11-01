@@ -34,8 +34,17 @@ schema and the table: apply creates them, a second plan is empty, removing a lab
 only its assignment without ``--allow-data-loss``, and an assignment already in the workspace
 (state lost, or set by hand) is adopted, not a failed create.
 
+A contract's column restrictions and row filters become Unity Catalog SQL functions bound on
+the table, run on the warehouse outside OpenTofu (``databricks_enforce.py``): apply binds the
+filter and masks, a second apply executes no statement, a table that already exists is bound
+before ``tofu apply`` can grant on it, a changed predicate binds a new function, a removed
+restriction is dropped, a binding that fails revokes SELECT from the restricted principals and
+fails the run (and the next apply binds first and grants again), and a failure before the apply
+stops it with nothing applied.
+
 Not proven here: what real Databricks accepts (SQL dialect, warehouse state,
-privilege names, Unity Catalog storage); that is the manual live tier.
+privilege names, Unity Catalog storage, that CREATE FUNCTION IF NOT EXISTS and SET MASK / SET
+ROW FILTER behave as the stand-in models them); that is the manual live tier.
 
 Skipped unless ``tofu`` is on PATH; ``tofu init`` needs the registry, a
 provider cache or a filesystem mirror for ``databricks/databricks``.
@@ -43,6 +52,7 @@ provider cache or a filesystem mirror for ``databricks/databricks``.
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 from typing import Iterator, List
 
@@ -526,3 +536,210 @@ def test_diff_initialises_with_the_committed_lock(workspace, fake, capfd):
     rc, out = run_fluid(capfd, "diff", path)
     assert rc == 0, out
     assert lock.read_text() == dependency_lock(IAC_PLUGINS["databricks"])
+
+
+# ── column masks and row filters ────────────────────────────────────────────
+def _sdk_missing() -> bool:
+    try:
+        return importlib.util.find_spec("databricks.sdk") is None
+    except ModuleNotFoundError:
+        return True
+
+
+requires_sdk = pytest.mark.skipif(
+    _sdk_missing(), reason="databricks-sdk (the [databricks] extra) is not installed"
+)
+
+EU = "region = 'eu'"
+
+
+def _restricted(
+    *,
+    where: str = EU,
+    deny: bool = True,
+    mask: bool = True,
+    row_filter: bool = True,
+    readers=("group:analysts", "group:bi"),
+) -> dict:
+    """``orders`` with ``amount`` denied and ``region`` masked to the analysts, who also read
+    only some rows. ``bi`` is not restricted."""
+    contract = make_contract(readers=readers)
+    authz = contract["exposes"][0]["policy"]["authz"]
+    restrictions = []
+    if deny:
+        restrictions.append(
+            {"principal": "group:analysts", "columns": ["amount"], "access": "deny"}
+        )
+    if mask:
+        restrictions.append(
+            {
+                "principal": "group:analysts",
+                "columns": ["region"],
+                "access": "mask",
+                "mask": "last_four",
+            }
+        )
+    if restrictions:
+        authz["columnRestrictions"] = restrictions
+    if row_filter:
+        authz["rowFilters"] = [{"principal": "group:analysts", "where": where}]
+    return contract
+
+
+def _live(fake: FakeDatabricks) -> dict:
+    return fake.tables[TABLE]
+
+
+def _masks(fake: FakeDatabricks) -> dict:
+    return {c["name"]: c["mask"]["function_name"] for c in _live(fake)["columns"] if c.get("mask")}
+
+
+def _brownfield(fake: FakeDatabricks) -> None:
+    fake.create_table(TABLE, LIVE_COLUMNS, properties={"delta.columnMapping.mode": "name"})
+
+
+@requires_sdk
+def test_apply_binds_the_filter_and_masks_and_a_second_apply_executes_no_statement(
+    workspace, fake, capfd
+):
+    path = write_contract(workspace, _restricted())
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    row_filter = _live(fake)["row_filter"]
+    assert row_filter["function_name"].startswith("main.sales.fluid_rf_orders_")
+    assert row_filter["input_column_names"] == ["region"]
+    assert sorted(_masks(fake)) == ["amount", "region"]
+    assert all(f in fake.functions for f in [row_filter["function_name"], *_masks(fake).values()])
+    # The table was created by this apply, so everything was bound after it, empty.
+    assert fake.grants[("table", TABLE)] == {"analysts": ["SELECT"], "bi": ["SELECT"]}
+    assert "masks and row filter" in out and fake.unknown == []
+
+    statements = len(fake.sql_log)
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "tofu plan: +0 ~0 -0" in out
+    assert len(fake.sql_log) == statements, "a second apply executes no statement"
+    assert fake.unknown == []
+
+
+@requires_sdk
+def test_a_table_that_exists_is_bound_before_the_apply_can_grant_on_it(workspace, fake, capfd):
+    _brownfield(fake)
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted()))
+    assert rc == 0, out
+    assert "row_filter" in _live(fake) and len(_masks(fake)) == 2
+    assert fake.replaced == []
+
+    timeline = fake.timeline
+    last_bind = max(
+        i for i, (kind, what) in enumerate(timeline) if kind == "sql" and "SET " in what
+    )
+    first_grant = min(
+        i for i, (kind, what) in enumerate(timeline) if kind == "perm" and what.endswith("orders")
+    )
+    assert last_bind < first_grant, "every binding was made before the first grant on the table"
+
+
+@requires_sdk
+def test_a_dry_run_prints_the_statements_and_executes_none(workspace, fake, capfd):
+    _brownfield(fake)
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted()), "--mode", "dry-run")
+    assert rc == 0, out
+    assert "before apply: bind row filter" in out and "SET ROW FILTER" in out
+    assert "dry-run: none of these statements ran." in out and "dry-run: plan only" in out
+    assert fake.sql_log == [] and fake.functions == {} and "row_filter" not in _live(fake)
+
+
+@requires_sdk
+def test_a_changed_predicate_binds_a_new_function_and_keeps_the_old_one(workspace, fake, capfd):
+    assert apply_contract(capfd, write_contract(workspace, _restricted()))[0] == 0
+    old = _live(fake)["row_filter"]["function_name"]
+    masks = _masks(fake)
+
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted(where="region = 'uk'")))
+    assert rc == 0, out
+    new = _live(fake)["row_filter"]["function_name"]
+    assert new != old and old in fake.functions and new in fake.functions
+    assert _masks(fake) == masks
+    assert not any(s.startswith("DROP") for s in fake.sql_log)
+    assert not any("REPLACE FUNCTION" in s for s in fake.sql_log)
+
+
+@requires_sdk
+def test_a_removed_restriction_is_dropped_and_said_to_widen_access(workspace, fake, capfd):
+    assert apply_contract(capfd, write_contract(workspace, _restricted()))[0] == 0
+
+    rc, out = apply_contract(
+        capfd, write_contract(workspace, _restricted(mask=False, row_filter=False))
+    )
+    assert rc == 0, out
+    assert "access widened (no data lost, not gated): drop row filter" in out
+    assert "access widened (no data lost, not gated): drop mask" in out
+    assert "row_filter" not in _live(fake)
+    assert sorted(_masks(fake)) == ["amount"]
+
+    rc, out = apply_contract(
+        capfd, write_contract(workspace, _restricted(deny=False, mask=False, row_filter=False))
+    )
+    assert rc == 0, out
+    assert _masks(fake) == {} and "row_filter" not in _live(fake)
+    statements = len(fake.sql_log)
+    assert apply_contract(capfd, write_contract(workspace, make_contract()))[0] == 0
+    assert len(fake.sql_log) == statements
+
+
+@requires_sdk
+def test_a_failed_binding_revokes_select_fails_the_run_and_the_next_apply_fixes_it(
+    workspace, fake, capfd
+):
+    path = write_contract(workspace, _restricted())
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] warehouse stopped")
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 1, out
+    assert "opentofu_access_enforcement_failed" in out
+    assert "warehouse stopped" in out and "SELECT was revoked" in out
+    assert "revoked: REVOKE SELECT ON TABLE `main`.`sales`.`orders` FROM `analysts`" in out
+    assert fake.grants[("table", TABLE)]["analysts"] == []
+    assert fake.grants[("table", TABLE)]["bi"] == ["SELECT"], "an unrestricted reader keeps it"
+    assert "row_filter" not in _live(fake)
+
+    fake.failing.clear()
+    mark = len(fake.timeline)
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "row_filter" in _live(fake) and len(_masks(fake)) == 2
+    assert fake.grants[("table", TABLE)]["analysts"] == ["SELECT"], "granted again by the apply"
+    again = fake.timeline[mark:]
+    bound = next(i for i, (k, w) in enumerate(again) if k == "sql" and "SET ROW FILTER" in w)
+    granted = next(i for i, (k, w) in enumerate(again) if k == "perm" and w.endswith("orders"))
+    assert bound < granted, "the table is bound before the grant is put back"
+
+
+@requires_sdk
+def test_a_failure_before_the_apply_stops_it_with_nothing_applied(workspace, fake, capfd):
+    _brownfield(fake)
+    assert apply_contract(capfd, write_contract(workspace, _restricted()))[0] == 0
+    # A new reader, and a changed predicate whose function cannot be made.
+    fake.fail_on("CREATE FUNCTION", "[INSUFFICIENT_PERMISSIONS] cannot create a function")
+    contract = _restricted(
+        where="region = 'uk'", readers=("group:analysts", "group:bi", "group:new")
+    )
+
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 1, out
+    assert "opentofu_access_enforcement_failed" in out and "the apply did not run" in out
+    assert "new" not in fake.grants[("table", TABLE)], "tofu apply never ran"
+    assert not any(s.startswith("REVOKE") for s in fake.sql_log)
+    assert fake.grants[("table", TABLE)]["analysts"] == ["SELECT"]
+
+
+@requires_sdk
+def test_a_contract_with_an_invalid_predicate_is_refused_before_anything_runs(
+    workspace, fake, capfd
+):
+    contract = _restricted(where="region = 'eu'; DROP TABLE main.sales.orders")
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 1 and "databricks-row-filter-invalid" in out
+    assert fake.sql_log == [] and fake.tables == {}
