@@ -801,3 +801,112 @@ def test_function_problem_names_every_difference_and_none_for_the_expected_funct
     problem = enforce.function_problem(bad, row, {DEPLOY_USER})
     assert "owner is x" in problem and "its body is 'true'" in problem
     assert "it returns int" in problem
+
+
+# ── a binding an admin made by hand is never replaced silently ──────────────
+def _admin_filter(fake: FakeDatabricks, table: str = TABLE) -> str:
+    cat, sch, name = table.split(".")
+    sql = enforce.SqlRunner(fake.client(), fake.warehouse_id)
+    sql.run(
+        f"CREATE FUNCTION `{cat}`.`{sch}`.`admin_rows_{name}`(`region` STRING) "
+        "RETURNS BOOLEAN RETURN true"
+    )
+    sql.run(
+        f"ALTER TABLE `{cat}`.`{sch}`.`{name}` SET ROW FILTER "
+        f"`{cat}`.`{sch}`.`admin_rows_{name}` ON (`region`)"
+    )
+    return f"{cat}.{sch}.admin_rows_{name}"
+
+
+def _admin_mask(fake: FakeDatabricks, column: str) -> str:
+    sql = enforce.SqlRunner(fake.client(), fake.warehouse_id)
+    sql.run(
+        f"CREATE FUNCTION `main`.`cp360`.`admin_mask_{column}`(`v` STRING) "
+        "RETURNS STRING RETURN `v`"
+    )
+    sql.run(
+        f"ALTER TABLE `main`.`cp360`.`profile` ALTER COLUMN `{column}` SET MASK "
+        f"`main`.`cp360`.`admin_mask_{column}`"
+    )
+    return f"main.cp360.admin_mask_{column}"
+
+
+def test_a_row_filter_set_by_hand_is_not_replaced_by_the_contracts(fake):
+    seed(fake)
+    theirs = _admin_filter(fake)
+    done = len(fake.sql_log)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        Run(fake).pre(contract())
+    message = str(exc.value)
+    assert TABLE in message and theirs in message and "did not create" in message
+    assert "DROP ROW FILTER" in " ".join(exc.value.remediation)
+    assert "policy.authz.rowFilters" in " ".join(exc.value.remediation)
+    assert len(fake.sql_log) == done, "nothing was changed, not even a function created"
+    assert live(fake)["row_filter"]["function_name"] == theirs
+
+
+def test_a_mask_set_by_hand_is_not_replaced_and_the_message_names_the_column(fake):
+    seed(fake)
+    theirs = _admin_mask(fake, "email")
+    done = len(fake.sql_log)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        Run(fake).pre(contract())
+    assert f"{TABLE}.email" in str(exc.value) and theirs in str(exc.value)
+    assert "DROP MASK" in " ".join(exc.value.remediation)
+    assert len(fake.sql_log) == done
+    assert live_masks(fake) == {"email": theirs}
+
+
+def test_a_refusal_on_a_later_table_changes_nothing_on_an_earlier_one(fake):
+    seed(fake)
+    fake.create_table("main.cp360.profile2", [(n, t, True) for n, t in COLUMNS])
+    doc = contract()
+    doc["exposes"].append(
+        {
+            **contract()["exposes"][0],
+            "exposeId": "profile2",
+            "binding": {
+                **contract()["exposes"][0]["binding"],
+                "location": {"database": "main", "schema": "cp360", "table": "profile2"},
+            },
+        }
+    )
+    _admin_filter(fake, "main.cp360.profile2")
+    done = len(fake.sql_log)
+    with pytest.raises(UnsupportedBindingError, match="profile2"):
+        Run(fake).pre(doc)
+    assert len(fake.sql_log) == done
+    assert "row_filter" not in live(fake), "the first table was not bound either"
+
+
+def test_a_binding_set_by_hand_on_something_the_contract_does_not_restrict_is_left_alone(fake):
+    seed(fake)
+    theirs = _admin_mask(fake, "region")
+    Run(fake).pre(contract(restrictions=[DENY], filters=None))
+    assert live_masks(fake)["region"] == theirs
+    assert "email" in live_masks(fake)
+
+
+def test_a_filter_this_module_made_is_still_replaced_without_a_fuss(fake):
+    seed(fake)
+    Run(fake).pre(contract())
+    Run(fake).pre(contract(filters=[{**FILTER, "where": "consent_data_analytics = false"}]))
+    assert live(fake)["row_filter"]["input_column_names"] == ["consent_data_analytics"]
+
+
+def test_a_foreign_binding_found_after_the_apply_is_a_failed_bind_with_the_fail_safe(fake):
+    seed(fake)
+    theirs = _admin_filter(fake)
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        run.post(contract())
+    assert theirs in str(exc.value)
+    assert live(fake)["row_filter"]["function_name"] == theirs, "theirs was not replaced"
+    assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == []
+
+
+def test_a_dry_run_reports_the_refusal_too(fake):
+    seed(fake)
+    _admin_filter(fake)
+    with pytest.raises(UnsupportedBindingError, match="did not create"):
+        Run(fake).pre(contract(), dry_run=True)

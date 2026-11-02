@@ -834,3 +834,25 @@ def test_a_function_pre_created_under_the_hashed_name_stops_the_apply_before_any
     assert "attacker@example.test" in out
     assert mask.column not in _masks(fake), "the hostile function was never bound"
     assert ("table", TABLE) not in fake.grants, "tofu apply never ran: nothing was granted"
+
+
+@requires_sdk
+def test_a_row_filter_set_by_hand_stops_the_apply_and_is_left_in_place(workspace, fake, capfd):
+    _brownfield(fake)
+    from fluid_build.iac.providers.databricks_enforce import SqlRunner
+
+    sql = SqlRunner(fake.client(), fake.warehouse_id)
+    theirs = "main.sales.admin_rows"
+    sql.run(
+        "CREATE FUNCTION `main`.`sales`.`admin_rows`(`region` STRING) RETURNS BOOLEAN RETURN true"
+    )
+    sql.run(
+        "ALTER TABLE `main`.`sales`.`orders` SET ROW FILTER `main`.`sales`.`admin_rows` "
+        "ON (`region`)"
+    )
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted()))
+    assert rc == 1, out
+    assert "opentofu_access_enforcement_failed" in out and "did not create" in out
+    assert theirs in out and "Nothing was changed" in out
+    assert _live(fake)["row_filter"]["function_name"] == theirs
+    assert ("table", TABLE) not in fake.grants, "tofu apply never ran"

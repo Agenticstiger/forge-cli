@@ -59,10 +59,14 @@ from .databricks_access import (
     Function,
     TableEnforcement,
     is_forge_function,
+    quote_table,
     revoke_statements,
     same_function,
     unbind_mask,
     unbind_row_filter,
+)
+from .databricks_access import (
+    quote as quote_ident,
 )
 
 #: The SQL warehouse every statement runs on.
@@ -83,6 +87,11 @@ class EnforcementError(UnsupportedBindingError):
 
     def __init__(self, message: str, remediation: Sequence[str] = ()):
         super().__init__("databricks-enforcement-failed", message, tuple(remediation))
+
+
+class ForeignBinding(EnforcementError):
+    """The table has a row filter or mask this module did not create, where the contract asks
+    for its own: setting ours would silently replace it."""
 
 
 class StatementFailed(Exception):
@@ -335,6 +344,25 @@ def _verify_step(function: Function, needs: Tuple[str, ...]) -> Step:
     )
 
 
+def _foreign(table: str, kind: str, live: str, column: Optional[str]) -> ForeignBinding:
+    where = f"{table}.{column}" if column else table
+    drop = (
+        f"ALTER TABLE {quote_table(table)} ALTER COLUMN {quote_ident(column)} DROP MASK"
+        if column
+        else unbind_row_filter(table)
+    )
+    contract_field = "policy.authz.columnRestrictions" if column else "policy.authz.rowFilters"
+    return ForeignBinding(
+        f"{where} has a {kind}, {live}, that this module did not create (its name has no "
+        "fluid_ prefix), and the contract asks for its own: binding it would replace "
+        "that one silently. Nothing was changed.",
+        (
+            f"Remove it ({drop}) so the contract's {kind} takes its place, or move its rule into "
+            f"the contract ({contract_field}) and remove it, then re-run fluid apply.",
+        ),
+    )
+
+
 def plan_table(
     full_name: str, enforcement: Optional[TableEnforcement], live: Optional[Mapping[str, Any]]
 ) -> TablePlan:
@@ -355,6 +383,8 @@ def plan_table(
             same_function(live_filter, spec.function.full_name)
             and live_inputs == [c.lower() for c in spec.columns]
         ):
+            if live_filter and not is_forge_function(live_filter, ROW_FILTER_PREFIX):
+                raise _foreign(full_name, "row filter", live_filter, None)
             needs = tuple(c.lower() for c in spec.columns)
             plan.bind.append(
                 Step(
@@ -381,6 +411,9 @@ def plan_table(
         if live is None or not same_function(
             live_mask.get("function_name"), mask.function.full_name
         ):
+            live_function = str(live_mask.get("function_name") or "")
+            if live_function and not is_forge_function(live_function, MASK_PREFIX):
+                raise _foreign(full_name, "column mask", live_function, mask.column)
             needs = (mask.column.lower(),)
             plan.bind.append(
                 Step(
@@ -559,14 +592,18 @@ def pre_apply(
     if pair is None:  # unreachable: a restriction was declared, so _client_for raised
         raise EnforcementError("no Databricks client for the masks and row filters.")
     client, runner = pair.client, pair
+    # Read and plan every table first: a refusal (a binding this module did not create) must
+    # come before any change, on any table.
+    work: List[Tuple[Target, List[Step]]] = []
     for target in wanted:
         live = _read(client, target)
         if live is None:
             continue  # created by this apply: post_apply binds it, empty
         plan = plan_table(target.full_name, target.enforcement, live)
         steps = [s for s in plan.bind if _ready(s, live)]
-        if not steps:
-            continue
+        if steps:
+            work.append((target, steps))
+    for target, steps in work:
         say(f"\n  {target.full_name}: binding masks and row filter before the apply")
         for step in steps:
             try:
@@ -619,7 +656,13 @@ def post_apply(
                 failed.append((target, "the table does not exist after the apply"))
                 unrevoked += _fail_safe(runner, target, say)
             continue
-        plan = plan_table(target.full_name, target.enforcement, live)
+        try:
+            plan = plan_table(target.full_name, target.enforcement, live)
+        except ForeignBinding as exc:
+            say(f"    FAILED: {exc}")
+            failed.append((target, str(exc)))
+            unrevoked += _fail_safe(runner, target, say)
+            continue
         if after_failed_apply:
             plan.drop = []
         if plan.bind or plan.drop:
@@ -696,6 +739,7 @@ __all__ = [
     "DATABRICKS_EXTRA_INSTALL",
     "WAREHOUSE_ENV",
     "EnforcementError",
+    "ForeignBinding",
     "FunctionMismatch",
     "Session",
     "SqlRunner",
