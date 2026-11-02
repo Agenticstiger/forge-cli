@@ -560,10 +560,11 @@ def _restricted(
     mask: bool = True,
     row_filter: bool = True,
     readers=("group:analysts", "group:bi"),
+    columns=None,
 ) -> dict:
     """``orders`` with ``amount`` denied and ``region`` masked to the analysts, who also read
     only some rows. ``bi`` is not restricted."""
-    contract = make_contract(readers=readers)
+    contract = make_contract(readers=readers, **({"columns": columns} if columns else {}))
     authz = contract["exposes"][0]["policy"]["authz"]
     restrictions = []
     if deny:
@@ -882,3 +883,32 @@ def test_a_row_filter_set_by_hand_stops_the_apply_and_is_left_in_place(workspace
     assert theirs in out and "Nothing was changed" in out
     assert _live(fake)["row_filter"]["function_name"] == theirs
     assert ("table", TABLE) not in fake.grants, "tofu apply never ran"
+
+
+@requires_sdk
+def test_a_filter_needing_a_column_the_apply_adds_is_held_by_a_deny_all_filter_before_it(
+    workspace, fake, capfd
+):
+    _brownfield(fake)  # the table holds rows and has no ``channel`` column yet
+    contract = _restricted(
+        where="channel = 'web'", columns=COLUMNS + [("channel", "string", False)]
+    )
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 0, out
+    row_filter = _live(fake)["row_filter"]
+    assert row_filter["input_column_names"] == ["channel"]
+    assert "deny_all" not in row_filter["function_name"], "the real filter replaced the interim one"
+
+    timeline = fake.timeline
+    interim = next(
+        i
+        for i, (k, w) in enumerate(timeline)
+        if k == "sql" and "SET ROW FILTER" in w and "deny_all" in w
+    )
+    first_grant = min(
+        i for i, (k, w) in enumerate(timeline) if k == "perm" and w.endswith("orders")
+    )
+    add_column = next(i for i, (k, w) in enumerate(timeline) if k == "sql" and "ADD COLUMN" in w)
+    real = max(i for i, (k, w) in enumerate(timeline) if k == "sql" and "SET ROW FILTER" in w)
+    assert interim < add_column < real, "deny-all, then the new column, then the real filter"
+    assert interim < first_grant

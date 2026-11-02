@@ -446,6 +446,33 @@ def plan_table(
     return plan
 
 
+def interim_steps(
+    enforcement: Optional[TableEnforcement],
+    plan: TablePlan,
+    live: Optional[Mapping[str, Any]],
+    full_name: str,
+) -> List[Step]:
+    """The deny-all row filter to bind while the real one waits for a column the apply adds.
+
+    The table exists and holds rows, so until ``post_apply`` binds the real filter the
+    restricted identities would read every row. The interim filter is the fail-safe's own
+    (:func:`deny_all_steps`); ``post_apply`` replaces it. None when the real filter can bind now,
+    or the deny-all one is already bound.
+    """
+    if live is None or enforcement is None:
+        return []  # a table that does not exist has no rows to hide yet
+    if enforcement.row_filter is None or enforcement.deny_all is None:
+        return []
+    real = enforcement.row_filter
+    waiting = [s for s in plan.bind if s.statement == real.bind and not _ready(s, live)]
+    if not waiting:
+        return []
+    current = ((live or {}).get("row_filter") or {}).get("function_name")
+    if same_function(current, enforcement.deny_all.function.full_name):
+        return []
+    return deny_all_steps(enforcement, full_name)
+
+
 def _ready(step: Step, live: Optional[Mapping[str, Any]]) -> bool:
     columns = _live_columns(live or {})
     return live is not None and all(c in columns for c in step.needs)
@@ -566,7 +593,11 @@ def preview(
     for target in targets:
         live = _read(client, target)
         plan = plan_table(target.full_name, target.enforcement, live)
-        steps = [("before apply" if _ready(s, live) else "after apply", s) for s in plan.bind]
+        steps = [
+            ("before apply", s)
+            for s in interim_steps(target.enforcement, plan, live, target.full_name)
+        ]
+        steps += [("before apply" if _ready(s, live) else "after apply", s) for s in plan.bind]
         steps += [("after apply", s) for s in plan.drop]
         if steps:
             lines.append((plan, steps))
@@ -603,6 +634,9 @@ def pre_apply(
             continue  # created by this apply: post_apply binds it, empty
         plan = plan_table(target.full_name, target.enforcement, live)
         steps = [s for s in plan.bind if _ready(s, live)]
+        interim = interim_steps(target.enforcement, plan, live, target.full_name)
+        if interim:
+            steps = [*interim, *steps]
         if steps:
             work.append((target, steps))
     for target, steps in work:
@@ -939,6 +973,7 @@ __all__ = [
     "Target",
     "TablePlan",
     "deny_all_steps",
+    "interim_steps",
     "deploy_identity",
     "function_problem",
     "plan_table",

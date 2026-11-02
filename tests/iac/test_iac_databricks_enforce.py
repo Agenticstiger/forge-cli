@@ -271,11 +271,13 @@ def test_a_filter_or_mask_an_admin_set_by_hand_is_never_dropped(fake):
     assert live_masks(fake) == {"email": "main.cp360.admin_mask"}
 
 
-def test_a_statement_that_needs_a_column_the_apply_adds_waits_for_post_apply(fake):
+def test_a_filter_that_needs_a_column_the_apply_adds_is_held_by_a_deny_all_filter_until_then(fake):
     seed(fake, columns=[c for c in COLUMNS if c[0] != "is_suppressed"])
     run = Run(fake)
     run.pre(contract())
-    assert "row_filter" not in live(fake), "the filter needs is_suppressed, which is not there yet"
+    deny_all = _expected().deny_all.function.full_name
+    # The table exists and holds rows: the restricted group reads none until the real filter binds.
+    assert live(fake)["row_filter"] == {"function_name": deny_all, "input_column_names": []}
     assert len(live_masks(fake)) == 4, "the masks needed no new column"
 
     fake.tables[TABLE]["columns"].append(
@@ -286,6 +288,59 @@ def test_a_statement_that_needs_a_column_the_apply_adds_waits_for_post_apply(fak
         "consent_data_analytics",
         "is_suppressed",
     ]
+    assert live(fake)["row_filter"]["function_name"] == _expected().row_filter.function.full_name
+
+
+def test_the_interim_filter_is_bound_once_and_before_anything_else(fake):
+    seed(fake, columns=[c for c in COLUMNS if c[0] != "is_suppressed"])
+    first = Run(fake)
+    first.pre(contract())
+    statements = first.statements()
+    deny = next(i for i, s in enumerate(statements) if "SET ROW FILTER" in s)
+    assert "deny_all" in statements[deny], "the first filter bound is the deny-all one"
+    assert all("SET MASK" not in s for s in statements[:deny])
+    again = Run(fake)
+    again.pre(contract())
+    assert again.statements() == [], "a second run binds nothing: the interim filter is in place"
+
+
+def test_no_interim_filter_when_the_real_one_can_bind_now_or_the_contract_has_none(fake):
+    seed(fake)
+    Run(fake).pre(contract())
+    assert "deny_all" not in live(fake)["row_filter"]["function_name"]
+    assert not any("deny_all" in f for f in fake.functions)
+    bare = Run(FakeDatabricks().start())
+    try:
+        seed(bare.fake, columns=[c for c in COLUMNS if c[0] != "is_suppressed"])
+        bare.pre(contract(filters=None))
+        assert not any("deny_all" in f for f in bare.fake.functions)
+    finally:
+        bare.fake.stop()
+
+
+def test_a_dry_run_shows_the_interim_filter_before_the_apply(fake):
+    seed(fake, columns=[c for c in COLUMNS if c[0] != "is_suppressed"])
+    run = Run(fake)
+    run.pre(contract(), dry_run=True)
+    assert "before apply: bind deny-all row filter" in run.text
+    assert "after apply: bind row filter" in run.text
+    assert fake.sql_log == []
+
+
+def test_a_hostile_deny_all_function_stops_the_run_before_the_apply(fake):
+    seed(fake, columns=[c for c in COLUMNS if c[0] != "is_suppressed"])
+    _plant(fake, _expected().deny_all.function, body="true")
+    with pytest.raises(UnsupportedBindingError, match="its body is 'true'"):
+        Run(fake).pre(contract())
+    assert "row_filter" not in live(fake)
+
+
+def test_a_foreign_row_filter_is_not_replaced_by_the_interim_filter(fake):
+    seed(fake, columns=[c for c in COLUMNS if c[0] != "is_suppressed"])
+    theirs = _admin_filter(fake)
+    with pytest.raises(UnsupportedBindingError, match="did not create"):
+        Run(fake).pre(contract())
+    assert live(fake)["row_filter"]["function_name"] == theirs
 
 
 def test_a_create_or_replace_table_keeps_the_bindings_in_the_stand_in(fake):
