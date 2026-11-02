@@ -45,7 +45,7 @@ from ._databricks_governed import (
     STEWARDS_GROUP,
     contract,
 )
-from ._fake_databricks import FakeDatabricks
+from ._fake_databricks import DEPLOY_USER, FakeDatabricks
 
 pytestmark = [pytest.mark.unit, pytest.mark.databricks]
 
@@ -521,7 +521,7 @@ def test_a_table_already_enforcing_exactly_this_has_nothing_to_do():
 
 def test_a_gate_that_is_not_there_is_everything_to_bind():
     plan = enforce.plan_table(TABLE, _enf(), None)
-    assert not plan.exists and len(plan.bind) == 10 and plan.drop == []
+    assert not plan.exists and len(plan.bind) == 15 and plan.drop == []
 
 
 # ── the engine's gate ───────────────────────────────────────────────────────
@@ -663,3 +663,141 @@ def test_the_engine_binds_before_it_raises_the_apply_failure():
     bind = source.index("_enforce_after_failed_apply(plugin, contract)")
     failed = source.index('"opentofu_apply_failed"')
     assert source.index("runner.tofu_apply(") < bind < failed
+
+
+# ── a function someone else made under the hashed name ──────────────────────
+def _expected():
+    return dbx._compile(contract(), {dbx.WAREHOUSE_ENV: "wh"}).tables[0].enforcement
+
+
+def _params(fn):
+    return [(n, t) for n, t in fn.params]
+
+
+def _plant(fake, fn, *, owner="attacker@example.test", body=None, returns=None, params=None):
+    fake.add_function(
+        fn.full_name,
+        _params(fn) if params is None else params,
+        returns or fn.returns,
+        fn.body if body is None else body,
+        owner,
+    )
+
+
+def test_a_function_pre_created_under_a_mask_name_is_never_bound(fake):
+    """``RETURN val`` under the computable name, made by someone with CREATE FUNCTION."""
+    seed(fake)
+    mask = next(m for m in _expected().masks if m.column == "email")
+    _plant(fake, mask.function, body="`val`")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        run.pre(contract())
+    message = str(exc.value)
+    assert mask.function.full_name in message
+    assert "attacker@example.test" in message and "its body is '`val`'" in message
+    assert "It was not bound" in message
+    assert not any(
+        f"SET MASK `{mask.function.full_name.replace('.', '`.`')}`" in s for s in run.statements()
+    )
+    assert "email" not in live_masks(fake)
+    assert fake.functions[mask.function.full_name]["body"] == "`val`", "theirs is left as it is"
+
+
+def test_a_function_pre_created_under_the_row_filter_name_is_never_bound(fake):
+    seed(fake)
+    row = _expected().row_filter
+    _plant(fake, row.function, body="true")
+    with pytest.raises(UnsupportedBindingError, match="its body is 'true'"):
+        Run(fake).pre(contract())
+    assert "row_filter" not in live(fake)
+
+
+def test_a_function_with_the_expected_body_but_another_owner_is_not_bound(fake):
+    seed(fake)
+    row = _expected().row_filter
+    _plant(fake, row.function, owner="someone-else@example.test")
+    with pytest.raises(UnsupportedBindingError) as exc:
+        Run(fake).pre(contract())
+    assert "its owner is someone-else@example.test" in str(exc.value)
+    assert DEPLOY_USER in str(exc.value)
+    assert "row_filter" not in live(fake)
+
+
+@pytest.mark.parametrize(
+    "change,fragment",
+    [
+        ({"returns": "INT"}, "it returns int"),
+        ({"params": [("val", "INT")]}, "its parameters are"),
+        ({"params": []}, "its parameters are"),
+    ],
+    ids=["return-type", "parameter-type", "no-parameters"],
+)
+def test_a_function_with_other_parameters_or_return_type_is_not_bound(fake, change, fragment):
+    seed(fake)
+    mask = next(m for m in _expected().masks if m.column == "email")
+    _plant(fake, mask.function, owner=DEPLOY_USER, **change)
+    with pytest.raises(UnsupportedBindingError, match=fragment):
+        Run(fake).pre(contract())
+    assert "email" not in live_masks(fake)
+
+
+def test_a_function_that_only_differs_in_whitespace_or_case_of_types_is_bound(fake):
+    seed(fake)
+    row = _expected().row_filter
+    _plant(
+        fake,
+        row.function,
+        owner=DEPLOY_USER.upper(),
+        body="  " + row.function.body.replace(" ", "  ") + "\n",
+        params=[(n, t.lower()) for n, t in row.function.params],
+    )
+    Run(fake).pre(contract())
+    assert live(fake)["row_filter"]["function_name"] == row.function.full_name
+
+
+def test_a_function_that_was_made_by_this_module_passes_its_own_check(fake):
+    seed(fake)
+    run = Run(fake)
+    run.pre(contract())
+    assert live(fake)["row_filter"]["function_name"] == _expected().row_filter.function.full_name
+    assert all(
+        s.startswith(("CREATE FUNCTION IF NOT EXISTS", "ALTER TABLE")) for s in run.statements()
+    )
+
+
+def test_the_identity_is_read_once_per_run(fake):
+    seed(fake)
+    Run(fake).pre(contract())
+    me = [r for r in fake.requests if r == ("GET", "/api/2.0/preview/scim/v2/Me")]
+    assert len(me) == 1
+
+
+def test_a_hostile_function_after_a_successful_apply_is_a_failed_bind_with_the_fail_safe(fake):
+    seed(fake)
+    mask = next(m for m in _expected().masks if m.column == "email")
+    _plant(fake, mask.function, body="`val`")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError):
+        run.post(contract())
+    assert "email" not in live_masks(fake)
+    assert "attacker@example.test" in run.text, "what differs is printed"
+    assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == [], "the fail-safe ran"
+
+
+def test_function_problem_names_every_difference_and_none_for_the_expected_function():
+    row = _expected().row_filter.function
+    info = {
+        "owner": DEPLOY_USER,
+        "routine_body": "SQL",
+        "routine_definition": row.body,
+        "full_data_type": "boolean",
+        "input_params": {
+            "parameters": [{"name": n, "type_text": t.lower()} for n, t in row.params]
+        },
+    }
+    assert enforce.function_problem(info, row, {DEPLOY_USER}) is None
+    assert "does not exist" in enforce.function_problem(None, row, {DEPLOY_USER})
+    bad = dict(info, owner="x", routine_definition="true", full_data_type="int")
+    problem = enforce.function_problem(bad, row, {DEPLOY_USER})
+    assert "owner is x" in problem and "its body is 'true'" in problem
+    assert "it returns int" in problem

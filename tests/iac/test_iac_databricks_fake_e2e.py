@@ -804,3 +804,33 @@ def test_a_failed_apply_never_drops_a_binding_the_contract_no_longer_asks_for(
     rc, out = apply_contract(capfd, write_contract(workspace, contract))
     assert rc == 0, out
     assert "row_filter" not in _live(fake) and _masks(fake) == {}, "dropped once it succeeded"
+
+
+@requires_sdk
+def test_a_function_pre_created_under_the_hashed_name_stops_the_apply_before_anything_is_applied(
+    workspace, fake, capfd
+):
+    from fluid_build.iac.providers import databricks as dbx
+
+    _brownfield(fake)
+    contract = _restricted()
+    path = write_contract(workspace, contract)
+    enforcement = (
+        dbx._compile(contract, {dbx.WAREHOUSE_ENV: fake.warehouse_id}).tables[0].enforcement
+    )
+    mask = enforcement.masks[0]
+    # Someone with CREATE FUNCTION took the name, with a body that returns the value as it is.
+    fake.add_function(
+        mask.function.full_name,
+        [("val", mask.function.params[0][1])],
+        mask.function.returns,
+        "`val`",
+    )
+
+    rc, out = apply_contract(capfd, path)
+
+    assert rc == 1, out
+    assert "opentofu_access_enforcement_failed" in out and "It was not bound" in out
+    assert "attacker@example.test" in out
+    assert mask.column not in _masks(fake), "the hostile function was never bound"
+    assert ("table", TABLE) not in fake.grants, "tofu apply never ran: nothing was granted"

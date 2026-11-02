@@ -72,6 +72,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 NOT_FOUND = "NOT_FOUND"
 _USER = "fake-user@example.test"
 _ORG_ID = "1234567890123456"
+#: The identity a run authenticates as (``GET .../scim/v2/Me``), and so a function's owner.
+DEPLOY_USER = _USER
 
 _IDENT = r"`?([^`.\s]+)`?"
 _FULL = rf"{_IDENT}\.{_IDENT}\.{_IDENT}"
@@ -331,6 +333,7 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
             "returns": returns.group(1).strip(),
             "body": returns.group(2).strip(),
             "sql": s,
+            "owner": _USER,  # the identity the run authenticates as (GET .../scim/v2/Me)
         }
         return True, ""
 
@@ -839,6 +842,7 @@ class FakeDatabricks:
         a("GET", r"/api/2\.1/unity-catalog/schemas/([^/]+)", self._get_schema)
         a("PATCH", r"/api/2\.1/unity-catalog/schemas/([^/]+)", self._patch_schema)
         a("DELETE", r"/api/2\.1/unity-catalog/schemas/([^/]+)", self._delete_schema)
+        a("GET", r"/api/2\.1/unity-catalog/functions/([^/]+)", self._get_function)
         a("GET", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._get_table)
         a("DELETE", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._delete_table)
         a("GET", r"/api/2\.1/unity-catalog/permissions/([a-z_]+)/([^/]+)", self._get_perms)
@@ -975,6 +979,61 @@ class FakeDatabricks:
         self.grants.pop(("schema", full), None)
         self._drop_tags("schemas", full)
         return 200, {}
+
+    # -- functions
+    def add_function(
+        self,
+        full_name: str,
+        params: Sequence[Tuple[str, str]],
+        returns: str,
+        body: str,
+        owner: str = "attacker@example.test",
+    ) -> None:
+        """Seed a SQL function as someone else made it, without a SQL statement (the stand-in's
+        ``sql_log`` stays as it was): ``params`` is ``[(name, type)]``."""
+        with self._lock:
+            self.functions[full_name] = {
+                "params": [{"name": n, "type": t.lower()} for n, t in params],
+                "returns": returns,
+                "body": body,
+                "sql": "",
+                "owner": owner,
+            }
+
+    def _get_function(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        """FunctionInfo, with the fields databricks-sdk-go v0.190.0 names: ``owner``,
+        ``routine_definition``, ``input_params.parameters[]`` and ``full_data_type``."""
+        full = m.group(1)
+        fn = self.functions.get(full)
+        if fn is None:
+            return _err(404, "FUNCTION_DOES_NOT_EXIST", f"Function '{full}' does not exist.")
+        cat, sch, name = full.split(".")
+        returns = fn["returns"].lower()
+        return 200, {
+            "name": name,
+            "catalog_name": cat,
+            "schema_name": sch,
+            "full_name": full,
+            "function_id": f"fid-{full}",
+            "owner": fn.get("owner"),
+            "created_by": fn.get("owner"),
+            "routine_body": "SQL",
+            "routine_definition": fn["body"],
+            "parameter_style": "S",
+            "data_type": re.split(r"[(<]", returns)[0].upper(),
+            "full_data_type": returns,
+            "input_params": {
+                "parameters": [
+                    {
+                        "name": p["name"],
+                        "position": i,
+                        "type_text": p["type"],
+                        "type_name": re.split(r"[(<]", p["type"])[0].upper(),
+                    }
+                    for i, p in enumerate(fn["params"])
+                ]
+            },
+        }
 
     # -- tables
     def _get_table(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:

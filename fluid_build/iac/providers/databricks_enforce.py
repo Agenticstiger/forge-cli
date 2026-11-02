@@ -49,13 +49,14 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from ..base import UnsupportedBindingError
 from .databricks_access import (
     MASK_PREFIX,
     ROW_FILTER_PREFIX,
+    Function,
     TableEnforcement,
     is_forge_function,
     revoke_statements,
@@ -88,6 +89,10 @@ class StatementFailed(Exception):
     """One SQL statement did not succeed; the message is the server's, scrubbed."""
 
 
+class FunctionMismatch(StatementFailed):
+    """A function under a content-hashed name is not the one this module would create."""
+
+
 @dataclass(frozen=True)
 class Step:
     """One statement, and what it is for."""
@@ -98,6 +103,9 @@ class Step:
     needs: Tuple[str, ...] = ()
     #: Drops a mask or filter: it widens access.
     widens: bool = False
+    #: A step with no statement: read this function back and check it is the expected one
+    #: (:func:`function_problem`) before anything binds it.
+    function: Optional[Function] = None
 
 
 @dataclass
@@ -162,6 +170,84 @@ def read_table(client: Any, full_name: str) -> Optional[Dict[str, Any]]:
             return None
         raise
     return out if isinstance(out, dict) else {}
+
+
+def read_function(client: Any, full_name: str) -> Optional[Dict[str, Any]]:
+    """``GET /api/2.1/unity-catalog/functions/{full_name}`` (FunctionInfo), or ``None`` if absent."""
+    try:
+        out = client.api_client.do(
+            "GET", f"/api/2.1/unity-catalog/functions/{quote(full_name, safe='.')}"
+        )
+    except Exception as exc:  # noqa: BLE001 — a 404 is an answer, anything else is raised on
+        if _is_not_found(exc):
+            return None
+        raise
+    return out if isinstance(out, dict) else {}
+
+
+def deploy_identity(client: Any) -> str:
+    """The identity this run authenticates as: ``userName`` of ``GET /api/2.0/preview/scim/v2/Me``.
+
+    That is who ``CREATE FUNCTION`` makes the owner (a user's email, a service principal's
+    application ID), and the credential the provider and this module share, so it is the one
+    owner a function under a hashed name may have.
+    """
+    me = client.api_client.do("GET", "/api/2.0/preview/scim/v2/Me")
+    name = str(me.get("userName") or "") if isinstance(me, Mapping) else ""
+    if not name:
+        raise StatementFailed("the workspace did not say which identity this run is")
+    return name
+
+
+def _squash(text: Any) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _type(text: Any) -> str:
+    return "".join(str(text or "").split()).lower()
+
+
+def function_problem(
+    info: Optional[Mapping[str, Any]], expected: Function, owners: Collection[str]
+) -> Optional[str]:
+    """Why the live function is not ``expected``, or ``None`` when it is.
+
+    A content-hashed name can be computed from the contract, so anyone who can create a
+    function in the schema can create one under it first, and ``CREATE FUNCTION IF NOT
+    EXISTS`` would keep theirs. Owner, body, parameters and return type must all be the
+    expected ones, whitespace-normalised (FunctionInfo: ``owner``, ``routine_definition``,
+    ``input_params.parameters[]``, ``full_data_type``; databricks-sdk-go v0.190.0).
+    """
+    if info is None:
+        return f"{expected.full_name} does not exist"
+    problems: List[str] = []
+    owner = str(info.get("owner") or "")
+    if owner.lower() not in {o.lower() for o in owners}:
+        problems.append(f"its owner is {owner or 'unknown'}, not {' or '.join(sorted(owners))}")
+    body_language = str(info.get("routine_body") or "SQL").upper()
+    if body_language != "SQL":
+        problems.append(f"it is a {body_language} function, not SQL")
+    if _squash(info.get("routine_definition")) != _squash(expected.body):
+        problems.append(
+            f"its body is {_squash(info.get('routine_definition'))!r}, expected "
+            f"{_squash(expected.body)!r}"
+        )
+    live_params = [
+        (str(p.get("name") or "").lower(), _type(p.get("type_text") or p.get("type_name")))
+        for p in ((info.get("input_params") or {}).get("parameters") or [])
+        if isinstance(p, Mapping)
+    ]
+    want_params = [(n.lower(), _type(t)) for n, t in expected.params]
+    if live_params != want_params:
+        problems.append(f"its parameters are {live_params}, expected {want_params}")
+    live_returns = _type(info.get("full_data_type") or info.get("data_type"))
+    if live_returns != _type(expected.returns):
+        problems.append(
+            f"it returns {live_returns or 'nothing'}, expected {_type(expected.returns)}"
+        )
+    if not problems:
+        return None
+    return f"{expected.full_name} is not the function this module creates: " + "; ".join(problems)
 
 
 class SqlRunner:
@@ -239,6 +325,16 @@ def _live_columns(live: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
     }
 
 
+def _verify_step(function: Function, needs: Tuple[str, ...]) -> Step:
+    return Step(
+        "",
+        f"check that {function.full_name} is the function this module creates (owner, body, "
+        "parameters, return type)",
+        needs,
+        function=function,
+    )
+
+
 def plan_table(
     full_name: str, enforcement: Optional[TableEnforcement], live: Optional[Mapping[str, Any]]
 ) -> TablePlan:
@@ -267,6 +363,7 @@ def plan_table(
                     needs,
                 )
             )
+            plan.bind.append(_verify_step(spec.function, needs))
             plan.bind.append(
                 Step(spec.bind, f"bind row filter {spec.function.full_name} on {full_name}", needs)
             )
@@ -292,6 +389,7 @@ def plan_table(
                     needs,
                 )
             )
+            plan.bind.append(_verify_step(mask.function, needs))
             plan.bind.append(
                 Step(
                     mask.bind,
@@ -318,6 +416,41 @@ def _ready(step: Step, live: Optional[Mapping[str, Any]]) -> bool:
     return live is not None and all(c in columns for c in step.needs)
 
 
+class Session:
+    """The client, the warehouse runner and, read once, the identity this run is."""
+
+    def __init__(self, client: Any, runner: SqlRunner):
+        self.client = client
+        self.runner = runner
+        self._identity: Optional[str] = None
+
+    @property
+    def identity(self) -> str:
+        if self._identity is None:
+            self._identity = deploy_identity(self.client)
+        return self._identity
+
+    def run(self, step: Step) -> None:
+        """Run a step: a statement on the warehouse, or the check of a function."""
+        if step.function is None:
+            self.runner.run(step.statement)
+            return
+        try:
+            info = read_function(self.client, step.function.full_name)
+            problem = function_problem(info, step.function, {self.identity})
+        except StatementFailed:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise FunctionMismatch(
+                f"could not read {step.function.full_name}: {type(exc).__name__}: {_scrub(exc)}"
+            ) from exc
+        if problem is not None:
+            raise FunctionMismatch(
+                f"{problem}. It was not bound: a function someone else made under this name "
+                "would otherwise decide who reads the table"
+            )
+
+
 # ── the hooks ──────────────────────────────────────────────────────────
 
 
@@ -329,7 +462,7 @@ class Target:
 
 def _client_for(
     targets: Sequence[Target], factory: Optional[ClientFactory], say: Say
-) -> Optional[Tuple[Any, SqlRunner]]:
+) -> Optional[Session]:
     """A client and runner, or ``None`` (with a note) when only removals could be checked.
 
     A contract with a restriction needs both, and fails without them; one without can only
@@ -348,7 +481,7 @@ def _client_for(
                 f"{WAREHOUSE_ENV} is not set, and the masks and row filters run on that warehouse.",
                 (f"Set {WAREHOUSE_ENV} to the id of a SQL warehouse in the workspace.",),
             )
-        return client, SqlRunner(client, warehouse)
+        return Session(client, SqlRunner(client, warehouse))
     except UnsupportedBindingError:
         if required:
             raise
@@ -393,7 +526,7 @@ def preview(
     pair = _client_for(targets, client_factory, say)
     if pair is None:
         return
-    client, _runner = pair
+    client = pair.client
     lines: List[Tuple[TablePlan, List[Tuple[str, Step]]]] = []
     for target in targets:
         live = _read(client, target)
@@ -410,7 +543,8 @@ def preview(
         for when, step in steps:
             note = " [widens access]" if step.widens else ""
             say(f"    {when}{note}: {step.what}")
-            say(f"      {step.statement}")
+            if step.statement:
+                say(f"      {step.statement}")
     say("    dry-run: none of these statements ran.")
 
 
@@ -424,7 +558,7 @@ def pre_apply(
     pair = _client_for(wanted, client_factory, say)
     if pair is None:  # unreachable: a restriction was declared, so _client_for raised
         raise EnforcementError("no Databricks client for the masks and row filters.")
-    client, runner = pair
+    client, runner = pair.client, pair
     for target in wanted:
         live = _read(client, target)
         if live is None:
@@ -436,7 +570,7 @@ def pre_apply(
         say(f"\n  {target.full_name}: binding masks and row filter before the apply")
         for step in steps:
             try:
-                runner.run(step.statement)
+                runner.run(step)
             except StatementFailed as exc:
                 raise EnforcementError(
                     f"{target.full_name}: {step.what} failed before the apply, so the apply did "
@@ -473,7 +607,7 @@ def post_apply(
     pair = _client_for(targets, client_factory, say)
     if pair is None:
         return
-    client, runner = pair
+    client, runner = pair.client, pair
     failed: List[Tuple[Target, str]] = []
     unrevoked: List[str] = []
     for target in targets:
@@ -494,7 +628,7 @@ def post_apply(
             if step.widens:
                 say(f"    access widened (no data lost, not gated): {step.what}")
             try:
-                runner.run(step.statement)
+                runner.run(step)
             except StatementFailed as exc:
                 reason = f"{step.what} failed: {exc}. The statement was: {step.statement}"
                 say(f"    FAILED: {reason}")
@@ -527,7 +661,7 @@ def post_apply(
         )
 
 
-def _fail_safe(runner: SqlRunner, target: Target, say: Say) -> List[str]:
+def _fail_safe(runner: Session, target: Target, say: Say) -> List[str]:
     """Revoke ``SELECT`` on the table from every principal a restriction names, and say so.
 
     Returns the statements that failed, which the caller reports as not revoked.
@@ -546,7 +680,7 @@ def _fail_safe(runner: SqlRunner, target: Target, say: Say) -> List[str]:
     unrevoked: List[str] = []
     for statement in statements:
         try:
-            runner.run(statement)
+            runner.runner.run(statement)
         except StatementFailed as exc:
             unrevoked.append(statement)
             say(
@@ -562,14 +696,19 @@ __all__ = [
     "DATABRICKS_EXTRA_INSTALL",
     "WAREHOUSE_ENV",
     "EnforcementError",
+    "FunctionMismatch",
+    "Session",
     "SqlRunner",
     "StatementFailed",
     "Step",
     "Target",
     "TablePlan",
+    "deploy_identity",
+    "function_problem",
     "plan_table",
     "post_apply",
     "pre_apply",
     "preview",
+    "read_function",
     "read_table",
 ]

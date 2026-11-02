@@ -43,7 +43,11 @@ What is checked is what the emitter's own pass says it provisions
    and each column's ``mask.function_name``, from the GetTable already read, must be the
    expected ones: a missing binding, or one to another function, is CRITICAL (the table is
    readable without what the contract promises), and the fix is ``fluid apply``, which binds
-   them before it grants. ``skip`` when the contract restricts nothing.
+   them before it grants. Each bound function is read back too
+   (``GET /api/2.1/unity-catalog/functions/{name}``): its owner must be this verify's identity
+   or the table's owner, and its body, parameters and return type the expected ones, since a
+   content-hashed name is computable from the contract and could have been taken by someone
+   else's function. ``skip`` when the contract restricts nothing.
 5. **The jobs.** Each dbt build that writes the expose has exactly one job of
    its name. None means ``fluid apply`` did not run (or the job was deleted);
    several mean an apply without its state created a duplicate.
@@ -444,13 +448,20 @@ def _tags_dimension(client: Any, table: Any) -> Dict[str, Any]:
     }
 
 
-def _enforcement_dimension(table: Any, live_table: Mapping[str, Any]) -> Dict[str, Any]:
+def _enforcement_dimension(
+    table: Any, live_table: Mapping[str, Any], client: Any = None
+) -> Dict[str, Any]:
     """The row filter and column masks the contract asks for, against the table's live ones.
 
     Expected function names carry a hash of their definition, so a changed predicate or
     rule is a different name and shows here as "different function". ``skip`` when the
     contract declares no restriction: nothing was promised. A binding the contract does
     not ask for is not checked.
+
+    A bound function is read back too (``client`` given): its owner must be the identity
+    this verify runs as or the table's owner, and its body, parameters and return type the
+    expected ones. The hashed name is computable from the contract, so a function someone else
+    created under it first would pass a comparison of names.
     """
     from fluid_build.iac.providers.databricks_access import same_function
 
@@ -531,6 +542,8 @@ def _enforcement_dimension(table: Any, live_table: Mapping[str, Any]) -> Dict[st
                     ),
                 }
             )
+    if client is not None and getattr(table, "enforcement", None) is not None:
+        findings += _function_findings(table, live_table, client, findings)
     total = len(masks) + (1 if row_filter is not None else 0)
     if not findings:
         return {
@@ -550,6 +563,50 @@ def _enforcement_dimension(table: Any, live_table: Mapping[str, Any]) -> Dict[st
             "and revokes SELECT from the restricted principals of a table it cannot bind"
         ),
     }
+
+
+def _function_findings(
+    table: Any, live_table: Mapping[str, Any], client: Any, named: Sequence[Mapping[str, Any]]
+) -> List[Dict[str, Any]]:
+    """A finding for each expected, correctly named binding whose function is not the expected one."""
+    from fluid_build.iac.providers.databricks_enforce import (
+        deploy_identity,
+        function_problem,
+        read_function,
+    )
+
+    enforcement = table.enforcement
+    wrong = {f.get("expected") for f in named}
+    expected = []
+    if enforcement.row_filter is not None:
+        expected.append(("row filter", enforcement.row_filter.function))
+    expected += [(f"mask on {m.column}", m.function) for m in enforcement.masks]
+    expected = [(label, fn) for label, fn in expected if fn.full_name not in wrong]
+    if not expected:
+        return []
+    owners = {str(live_table.get("owner") or "")}
+    try:
+        owners.add(deploy_identity(client))
+    except Exception:  # noqa: BLE001 — the table's owner alone is then the reference
+        pass
+    owners.discard("")
+    out: List[Dict[str, Any]] = []
+    for label, fn in expected:
+        try:
+            info = read_function(client, fn.full_name)
+        except Exception as exc:  # noqa: BLE001 — a function that cannot be read is not verified
+            raise _Unreadable(f"could not read function {fn.full_name}: {_failure(exc)}") from exc
+        problem = function_problem(info, fn, owners or {"unknown"})
+        if problem is not None:
+            out.append(
+                {
+                    "kind": "function",
+                    "expected": fn.full_name,
+                    "actual": fn.full_name,
+                    "message": f"the {label} of {table.full_name}: {problem}",
+                }
+            )
+    return out
 
 
 def _jobs_dimension(client: Any, expose_id: str, contract: Mapping[str, Any], jobs: Any) -> Any:
@@ -743,7 +800,7 @@ def verify_databricks_expose(
         access = _access_dimension(client, table)
         residency = _residency_dimension(client, table)
         tags = _tags_dimension(client, table)
-        enforcement = _enforcement_dimension(table, live_table)
+        enforcement = _enforcement_dimension(table, live_table, client)
         job_dim = _jobs_dimension(client, expose_id, contract, jobs)
     except Exception as exc:  # noqa: BLE001 — a check that could not run is an error
         return _error(

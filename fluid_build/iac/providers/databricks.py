@@ -1933,6 +1933,9 @@ class ManagedTable:
     row_filter: Optional[Tuple[str, Tuple[str, ...]]] = None
     #: ``(column, function full name)`` per column mask it must have bound.
     masks: Tuple[Tuple[str, str], ...] = ()
+    #: The whole expectation, with each function's definition: what ``fluid verify`` checks
+    #: a bound function's owner, body, parameters and return type against.
+    enforcement: Optional[TableEnforcement] = None
 
 
 def managed_objects(
@@ -1977,6 +1980,7 @@ def managed_objects(
                 (mask.column, mask.function.full_name)
                 for mask in (table.enforcement.masks if table.enforcement else ())
             ),
+            enforcement=table.enforcement,
         )
         for table in compiled.tables
     ]

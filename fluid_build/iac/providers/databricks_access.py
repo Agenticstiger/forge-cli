@@ -98,6 +98,12 @@ class Function:
     full_name: str
     #: The ``CREATE FUNCTION IF NOT EXISTS`` statement.
     create: str
+    #: What the function must be, for :func:`fluid_build.iac.providers.databricks_enforce.
+    #: function_problem` to check a live one against: ``((name, SQL type), ...)``, the return
+    #: type and the body (the expression after ``RETURN``).
+    params: Tuple[Tuple[str, str], ...] = ()
+    returns: str = ""
+    body: str = ""
 
 
 @dataclass(frozen=True)
@@ -181,14 +187,24 @@ def _function_name(prefix: str, stem: str, definition: str) -> str:
 
 
 def _function(
-    catalog: str, schema: str, prefix: str, stem: str, params: str, returns: str, body: str
+    catalog: str,
+    schema: str,
+    prefix: str,
+    stem: str,
+    params: Sequence[Tuple[str, str]],
+    returns: str,
+    body: str,
 ) -> Function:
-    definition = f"({params}) RETURNS {returns} RETURN {body}"
+    listed = ", ".join(f"{quote(name)} {sql_type}" for name, sql_type in params)
+    definition = f"({listed}) RETURNS {returns} RETURN {body}"
     name = _function_name(prefix, stem, definition)
     full = f"{catalog}.{schema}.{name}"
     return Function(
         full_name=full,
         create=f"CREATE FUNCTION IF NOT EXISTS {quote_table(full)}{definition}",
+        params=tuple((n, t) for n, t in params),
+        returns=returns,
+        body=body,
     )
 
 
@@ -497,7 +513,7 @@ def _compile_masks(
                 )
         body = "CASE " + " ".join(branches) + " ELSE `val` END"
         function = _function(
-            catalog, schema, MASK_PREFIX, f"{table}_{column}", f"`val` {column_type.upper()}",
+            catalog, schema, MASK_PREFIX, f"{table}_{column}", [("val", column_type.upper())],
             column_type.upper(), body,
         )  # fmt: skip
         out.append(
@@ -549,7 +565,7 @@ def _compile_row_filter(
         [f"NOT {_any_member(all_members)}"]
         + [f"({member} AND ({predicate}))" for member, predicate in sorted(parts)]
     )
-    params = ", ".join(f"{quote(c)} {types[c].upper()}" for c in ordered)
+    params = [(c, types[c].upper()) for c in ordered]
     function = _function(catalog, schema, ROW_FILTER_PREFIX, table, params, "BOOLEAN", body)
     return RowFilterSpec(
         function=function,
