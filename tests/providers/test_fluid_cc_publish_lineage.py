@@ -833,6 +833,94 @@ class TestDryRun:
 # ---------------------------------------------------------------------------
 
 
+class TestWorkspaceHost:
+    """A Databricks expose publishes the workspace host, from ``DATABRICKS_HOST`` only."""
+
+    @staticmethod
+    def _metadata(
+        cc,
+        platform: str,
+        location: Optional[Dict[str, Any]] = None,
+        project_file: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        provider = get_catalog_provider(
+            "fluid-command-center",
+            {
+                "endpoint": cc.url,
+                "auth": {"type": "api_key", "api_key": API_KEY},
+                "organization_id": ORG_A["id"],
+                "retry_delay": 0,
+            },
+        )
+        # What config_manager sets when the checkout's project config named the endpoint.
+        provider.project_endpoint_file = project_file
+        contract = {
+            "id": "p.x",
+            "name": "X",
+            "exposes": [
+                {"binding": {"platform": platform, "location": location or {"table": "t"}}}
+            ],
+        }
+        asset = provider.map_contract_to_asset(contract)
+        return provider._asset_body(asset)["metadata"]
+
+    def test_databricks_expose_publishes_scheme_and_host_only(self, cc, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_HOST", "https://dbc-abc.cloud.databricks.com/some/path?x=1")
+        metadata = self._metadata(cc, "databricks")
+        assert metadata["workspace_host"] == "https://dbc-abc.cloud.databricks.com"
+
+    def test_unset_host_leaves_the_key_out(self, cc, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+        assert "workspace_host" not in self._metadata(cc, "databricks")
+
+    @pytest.mark.parametrize("host", ["http://example.com", "ftp://example.com", "   "])
+    def test_unacceptable_host_leaves_the_key_out(self, cc, monkeypatch, host):
+        monkeypatch.setenv("DATABRICKS_HOST", host)
+        assert "workspace_host" not in self._metadata(cc, "databricks")
+
+    def test_http_to_loopback_is_kept_for_a_stand_in(self, cc, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_HOST", "http://127.0.0.1:8080/x")
+        assert self._metadata(cc, "databricks")["workspace_host"] == "http://127.0.0.1:8080"
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "https://user:pass@dbc-abc.cloud.databricks.com",  # pragma: allowlist secret
+            "https://tok@dbc-abc.cloud.databricks.com",
+        ],
+    )
+    def test_a_host_carrying_user_info_is_never_published(self, cc, monkeypatch, host):
+        # normalize_host keeps the netloc whole: the user-info would reach the
+        # Command Center with the link.
+        monkeypatch.setenv("DATABRICKS_HOST", host)
+        metadata = self._metadata(cc, "databricks")
+        assert "workspace_host" not in metadata
+        assert "pass" not in json.dumps(metadata) and "tok@" not in json.dumps(metadata)
+
+    def test_an_endpoint_the_checkout_named_never_gets_the_runners_host(self, cc, monkeypatch):
+        # The runner's environment is not the checkout's to send (cli/publish.py).
+        monkeypatch.setenv("DATABRICKS_HOST", "https://dbc-abc.cloud.databricks.com")
+        metadata = self._metadata(cc, "databricks", project_file="fluid.config.yaml")
+        assert "workspace_host" not in metadata
+
+    def test_a_malformed_host_is_left_out_not_raised(self, cc, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_HOST", "https://[::1")
+        assert "workspace_host" not in self._metadata(cc, "databricks")
+
+    @pytest.mark.parametrize("platform", ["aws", "gcp", "snowflake", "local"])
+    def test_other_platforms_never_get_one(self, cc, monkeypatch, platform):
+        monkeypatch.setenv("DATABRICKS_HOST", "https://dbc-abc.cloud.databricks.com")
+        assert "workspace_host" not in self._metadata(cc, platform)
+
+    def test_a_contract_named_host_does_not_influence_it(self, cc, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_HOST", "https://dbc-abc.cloud.databricks.com")
+        metadata = self._metadata(cc, "databricks", {"table": "t", "host": "https://evil.example"})
+        assert metadata["workspace_host"] == "https://dbc-abc.cloud.databricks.com"
+        monkeypatch.delenv("DATABRICKS_HOST")
+        metadata = self._metadata(cc, "databricks", {"table": "t", "host": "https://evil.example"})
+        assert "workspace_host" not in metadata
+
+
 class TestDerivedLineageEdges:
     def test_lineage_upstream_is_read_when_consumes_is_absent(self):
         contract = {

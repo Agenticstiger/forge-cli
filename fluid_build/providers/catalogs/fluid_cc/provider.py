@@ -33,11 +33,15 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import httpx
 import yaml
 
 from fluid_build.errors import ConfigurationError
+from fluid_build.iac.provider_match import is_cloud
+from fluid_build.iac.providers.databricks_auth import HOST_ENV as DATABRICKS_HOST_ENV
+from fluid_build.iac.providers.databricks_auth import is_acceptable_host, normalize_host
 
 from ...common import CircuitBreaker, get_auth_headers, metrics_collector
 from ..base import PUBLIC_CLASSIFICATION, BaseCatalogProvider, CatalogAsset, PublishResult
@@ -647,6 +651,39 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
                         success=False, catalog_id=self.name, asset_id=asset.id, error=error_msg
                     )
 
+    def _databricks_workspace_host(self) -> Optional[str]:
+        """``https://<host>[:port]`` of the workspace, from ``DATABRICKS_HOST`` only.
+
+        The Command Center builds a console link from it. Never read from the
+        contract (forge-cli refuses ``binding.location.host``). Unset, or not
+        https (plain http only to loopback), leaves it out: not an error. So
+        does a host carrying user-info (``https://{user}:{password}@host``):
+        ``normalize_host`` keeps the netloc whole, and the user-info would be
+        published to the Command Center with the link. And an endpoint the
+        checkout's project config named never gets it: the runner's environment
+        is not the checkout's to send (``cli/publish.py`` keeps ``{{ env.* }}``
+        unresolved for such an endpoint, and ``_auth_headers`` sends it no
+        operator credential).
+        """
+        if self.project_endpoint_file is not None:
+            self.logger.debug(
+                "no workspace_host published: the endpoint was named by the checkout (%s)",
+                self.project_endpoint_file,
+            )
+            return None
+        raw = os.environ.get(DATABRICKS_HOST_ENV, "").strip()
+        try:
+            host = normalize_host(raw) if raw else ""
+        except ValueError:  # a malformed netloc (an unclosed IPv6 bracket): leave it out
+            host = ""
+        if host and is_acceptable_host(host) and "@" not in urlsplit(host).netloc:
+            return host
+        self.logger.debug(
+            "no workspace_host published: %s is unset, not an https URL, or carries user-info",
+            DATABRICKS_HOST_ENV,
+        )
+        return None
+
     def _asset_body(self, asset: CatalogAsset) -> Dict[str, Any]:
         """The ``POST`` / ``PATCH /api/v1/assets`` body for ``asset``.
 
@@ -680,6 +717,10 @@ class FluidCommandCenterProvider(BaseCatalogProvider):
         }
         if asset.environment:
             metadata["fluid_env"] = asset.environment
+        if is_cloud({"platform": asset.platform}, "databricks"):
+            workspace_host = self._databricks_workspace_host()
+            if workspace_host:
+                metadata["workspace_host"] = workspace_host
         # owner_id is replaced by the backend with the authenticated user, but
         # the Pydantic model requires it, so a placeholder is sent.
         body: Dict[str, Any] = {
