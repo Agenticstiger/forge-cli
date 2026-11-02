@@ -59,7 +59,9 @@ from .databricks_access import (
     Function,
     TableEnforcement,
     is_forge_function,
+    quote_principal,
     quote_table,
+    revoke_all_statement,
     revoke_statements,
     same_function,
     unbind_mask,
@@ -645,8 +647,7 @@ def post_apply(
     if pair is None:
         return
     client, runner = pair.client, pair
-    failed: List[Tuple[Target, str]] = []
-    unrevoked: List[str] = []
+    failed: List[Tuple[Target, str, FailSafe]] = []
     for target in targets:
         try:
             live = _read(client, target)
@@ -660,22 +661,20 @@ def post_apply(
                 )
                 continue
             say(f"    FAILED: {exc}")
-            failed.append((target, str(exc)))
-            unrevoked += _fail_safe(runner, target, say)
+            failed.append((target, str(exc), _fail_safe(runner, target, say)))
             continue
         if live is None:
             if after_failed_apply:
                 say(f"  {target.full_name}: not created by the failed apply; nothing to bind.")
             elif target.enforcement is not None:
-                failed.append((target, "the table does not exist after the apply"))
-                unrevoked += _fail_safe(runner, target, say)
+                why = "the table does not exist after the apply"
+                failed.append((target, why, _fail_safe(runner, target, say)))
             continue
         try:
             plan = plan_table(target.full_name, target.enforcement, live)
         except ForeignBinding as exc:
             say(f"    FAILED: {exc}")
-            failed.append((target, str(exc)))
-            unrevoked += _fail_safe(runner, target, say)
+            failed.append((target, str(exc), _fail_safe(runner, target, say, live=live)))
             continue
         if after_failed_apply:
             plan.drop = []
@@ -689,13 +688,12 @@ def post_apply(
             except StatementFailed as exc:
                 reason = f"{step.what} failed: {exc}. The statement was: {step.statement}"
                 say(f"    FAILED: {reason}")
-                failed.append((target, reason))
                 if target.enforcement is not None:
-                    unrevoked += _fail_safe(runner, target, say)
+                    failed.append((target, reason, _fail_safe(runner, target, say, live=live)))
                 break
             say(f"    done: {step.what}")
     if failed:
-        names = ", ".join(sorted({t.full_name for t, _ in failed}))
+        names = ", ".join(sorted({t.full_name for t, _, _ in failed}))
         raise EnforcementError(
             (
                 "the apply failed part way, and "
@@ -703,50 +701,228 @@ def post_apply(
                 else "the apply succeeded, but "
             )
             + f"the masks or row filter of {names} could not be put in place. "
-            + (
-                "SELECT was revoked on each from the principals the contract restricts "
-                "(listed above), so none of them can read unmasked rows. "
-                if not unrevoked
-                else "SELECT could NOT be revoked by: " + "; ".join(unrevoked) + ". Run those "
-                "yourself, now. "
-            )
-            + " ".join(f"{t.full_name}: {why}" for t, why in failed),
+            + " ".join(f"{t.full_name}: {why}. {_describe(t, fs)}" for t, why, fs in failed),
             (
                 "Fix the cause, then re-run fluid apply: it binds the masks and row filter "
-                "first and grants SELECT again afterwards.",
+                "first (replacing a deny-all filter) and grants again afterwards.",
             ),
         )
 
 
-def _fail_safe(runner: Session, target: Target, say: Say) -> List[str]:
-    """Revoke ``SELECT`` on the table from every principal a restriction names, and say so.
+@dataclass
+class FailSafe:
+    """What the fail-safe did for one table that could not be bound, and what it could not close."""
 
-    Returns the statements that failed, which the caller reports as not revoked.
+    #: The deny-all row filter is bound: the restricted identities read no rows, by any grant path.
+    locked: bool = False
+    #: The contract restricts no identity on Databricks: nothing to bind or revoke.
+    nothing_to_restrict: bool = False
+    #: Why the deny-all filter was not bound (it failed, or it would replace a filter not made here).
+    deny_all_problem: str = ""
+    revoked: List[str] = field(default_factory=list)
+    unrevoked: List[str] = field(default_factory=list)
+    #: Grant paths a table-level REVOKE cannot close, each with what to run.
+    still_open: List[str] = field(default_factory=list)
+    #: Whether the inherited grants could be listed at all.
+    checked: bool = False
+    #: Whether the table's grants could be listed (else only the restricted identities were revoked).
+    listed: bool = True
+
+
+_READ = frozenset({"SELECT", "ALL_PRIVILEGES"})
+
+
+def deny_all_steps(enforcement: TableEnforcement, full_name: str) -> List[Step]:
+    """Create, check and bind the zero-column deny-all row filter for the restricted identities."""
+    spec = enforcement.deny_all
+    assert spec is not None
+    return [
+        Step(
+            spec.function.create, f"create deny-all row filter function {spec.function.full_name}"
+        ),
+        _verify_step(spec.function, ()),
+        Step(spec.bind, f"bind deny-all row filter {spec.function.full_name} on {full_name}"),
+    ]
+
+
+def _list_pages(client: Any, path: str) -> List[Dict[str, Any]]:
+    """Every privilege assignment the permissions API lists for a securable, following pages."""
+    out: List[Dict[str, Any]] = []
+    token: Optional[str] = None
+    for _ in range(50):
+        page = client.api_client.do("GET", path, query={"page_token": token} if token else None)
+        out += [a for a in (page.get("privilege_assignments") or []) if isinstance(a, Mapping)]
+        token = page.get("next_page_token") or None
+        if not token:
+            return out
+    raise StatementFailed("the permission list never ended")
+
+
+def _privileges(entry: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
+    out: Dict[str, Mapping[str, Any]] = {}
+    for priv in entry.get("privileges") or []:
+        detail = priv if isinstance(priv, Mapping) else {"privilege": priv}
+        if detail.get("privilege"):
+            out[str(detail["privilege"]).upper()] = detail
+    return out
+
+
+def _fail_safe(
+    session: Session, target: Target, say: Say, *, live: Optional[Mapping[str, Any]] = None
+) -> FailSafe:
+    """Close the table to the restricted identities after a failed bind, and say exactly how.
+
+    First a deny-all row filter bound for them (:func:`deny_all_steps`): it blocks them whatever
+    grant path gives them the table, a group they are in, a schema or a catalog grant. If that
+    cannot be bound (it failed, or the table has a row filter this module did not create, which
+    it would replace), SELECT is revoked on the table from every grantee but its owner, listed
+    through the permissions API. A table-level REVOKE cannot close a grant on the schema or the
+    catalog: those are listed, with what to run.
     """
     enforcement = target.enforcement
     assert enforcement is not None
-    statements = revoke_statements(target.full_name, enforcement.restricted)
-    if not statements:
-        say(f"    fail-safe: {target.full_name} restricts no identity on Databricks; none revoked.")
-        return []
-    say(
-        f"    fail-safe: revoking SELECT on {target.full_name} from "
-        f"{', '.join(enforcement.restricted)}, because their mask or row filter is not in "
-        "place and a later dbt run could expose unmasked rows to them:"
-    )
-    unrevoked: List[str] = []
-    for statement in statements:
+    result = FailSafe()
+    table = target.full_name
+    if not enforcement.restricted or enforcement.deny_all is None:
+        result.nothing_to_restrict = True
+        say(f"    fail-safe: {table} restricts no identity on Databricks; nothing to close.")
+        return result
+    if live is None:
         try:
-            runner.runner.run(statement)
+            live = read_table(session.client, table)
+        except Exception:  # noqa: BLE001 — unreadable: the filter that is there is unknown
+            live = None
+    current = ((live or {}).get("row_filter") or {}).get("function_name") or ""
+    if live is None:
+        result.deny_all_problem = "the table could not be read, so a filter on it is unknown"
+    elif current and not is_forge_function(current, ROW_FILTER_PREFIX):
+        result.deny_all_problem = (
+            f"it would replace {current}, a row filter this module did not create"
+        )
+    else:
+        say(
+            f"    fail-safe: binding a deny-all row filter on {table} for "
+            f"{', '.join(enforcement.restricted)}:"
+        )
+        try:
+            for step in deny_all_steps(enforcement, table):
+                session.run(step)
         except StatementFailed as exc:
-            unrevoked.append(statement)
-            say(
-                f"    NOT REVOKED: {statement} failed ({exc}). Run it yourself, now: until it "
-                "runs, that principal can read the table without its mask or filter."
-            )
+            result.deny_all_problem = f"it failed: {exc}"
+            say(f"    deny-all row filter {result.deny_all_problem}")
         else:
-            say(f"      revoked: {statement}")
-    return unrevoked
+            result.locked = True
+            say(f"      done: {enforcement.deny_all.function.full_name} is bound on {table}")
+            return result
+    say(f"    fail-safe: no deny-all row filter ({result.deny_all_problem}); locking {table}.")
+    _lock(session, table, live, enforcement, result, say)
+    return result
+
+
+def _lock(
+    session: Session,
+    table: str,
+    live: Optional[Mapping[str, Any]],
+    enforcement: TableEnforcement,
+    result: FailSafe,
+    say: Say,
+) -> None:
+    """Revoke SELECT (and ALL PRIVILEGES) on the table from every grantee but its owner."""
+    owner = str((live or {}).get("owner") or "")
+    grantees: Dict[str, set] = {}
+    try:
+        for entry in _list_pages(
+            session.client, f"/api/2.1/unity-catalog/permissions/table/{quote(table, safe='.')}"
+        ):
+            held = set(_privileges(entry)) & _READ
+            if entry.get("principal") and held:
+                grantees[str(entry["principal"])] = held
+    except Exception as exc:  # noqa: BLE001
+        result.listed = False
+        say(
+            f"    could not list the grants on {table} ({type(exc).__name__}): revoking only from "
+            f"{', '.join(enforcement.restricted)}"
+        )
+        grantees = {p: {"SELECT"} for p in enforcement.restricted}
+    for principal, held in sorted(grantees.items()):
+        if owner and principal.lower() == owner.lower():
+            continue
+        statements = []
+        if "SELECT" in held:
+            statements += revoke_statements(table, [principal])
+        if "ALL_PRIVILEGES" in held:
+            statements.append(revoke_all_statement(table, principal))
+        for statement in statements:
+            try:
+                session.runner.run(statement)
+            except StatementFailed as exc:
+                result.unrevoked.append(statement)
+                say(f"    NOT REVOKED: {statement} failed ({exc})")
+            else:
+                result.revoked.append(statement)
+                say(f"      revoked: {statement}")
+    _open_paths(session, table, owner, result)
+
+
+def _open_paths(session: Session, table: str, owner: str, result: FailSafe) -> None:
+    """What still lets someone read the table: a grant inherited from its schema or catalog."""
+    try:
+        entries = _list_pages(
+            session.client,
+            f"/api/2.1/unity-catalog/effective-permissions/table/{quote(table, safe='.')}",
+        )
+    except Exception:  # noqa: BLE001
+        result.checked = False
+        return
+    result.checked = True
+    for entry in entries:
+        principal = str(entry.get("principal") or "")
+        if not principal or (owner and principal.lower() == owner.lower()):
+            continue
+        for priv, detail in _privileges(entry).items():
+            source = str(detail.get("inherited_from_name") or "")
+            if priv not in _READ or not source:
+                continue
+            kind = str(detail.get("inherited_from_type") or "SCHEMA").upper()
+            target_sql = ".".join(quote_ident(part) for part in source.split("."))
+            verb = "ALL PRIVILEGES" if priv == "ALL_PRIVILEGES" else priv
+            result.still_open.append(
+                f"{principal} holds {priv} on {kind} {source}, which a table-level REVOKE cannot "
+                f"close; run: REVOKE {verb} ON {kind} {target_sql} FROM {quote_principal(principal)}"
+            )
+
+
+def _describe(target: Target, fs: FailSafe) -> str:
+    """The fail-safe, in words: exactly what was done, and every path still open."""
+    if fs.nothing_to_restrict:
+        return "The contract restricts no identity on Databricks, so nothing was bound or revoked."
+    if fs.locked:
+        assert target.enforcement is not None and target.enforcement.deny_all is not None
+        return (
+            f"A deny-all row filter ({target.enforcement.deny_all.function.full_name}) is bound: "
+            f"{', '.join(target.enforcement.restricted)} read no rows of it, whatever grant gives "
+            "them the table. SELECT was not revoked from anyone."
+        )
+    done = f"The deny-all row filter could not be bound ({fs.deny_all_problem}). " + (
+        "SELECT (and ALL PRIVILEGES where held) was revoked on the table from "
+        + ", ".join(sorted({s.rsplit(" FROM ", 1)[1] for s in fs.revoked}))
+        + " (every grantee but its owner). "
+        if fs.revoked
+        else "Nothing was revoked. "
+    )
+    if not fs.listed:
+        done += "Its grants could not be listed, so only the restricted identities were revoked. "
+    if fs.unrevoked:
+        done += (
+            "These could NOT be revoked, run them yourself, now: " + "; ".join(fs.unrevoked) + ". "
+        )
+    if fs.still_open:
+        done += "Still open: " + " | ".join(fs.still_open) + ". "
+    elif fs.checked:
+        done += "No grant inherited from the schema or the catalog was found open. "
+    else:
+        done += "Grants inherited from the schema or the catalog could not be checked: check them. "
+    return done.rstrip()
 
 
 __all__ = [
@@ -754,6 +930,7 @@ __all__ = [
     "WAREHOUSE_ENV",
     "EnforcementError",
     "ForeignBinding",
+    "FailSafe",
     "FunctionMismatch",
     "Session",
     "SqlRunner",
@@ -761,6 +938,7 @@ __all__ = [
     "Step",
     "Target",
     "TablePlan",
+    "deny_all_steps",
     "deploy_identity",
     "function_problem",
     "plan_table",

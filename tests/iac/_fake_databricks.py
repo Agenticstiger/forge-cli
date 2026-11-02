@@ -337,7 +337,11 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
         }
         return True, ""
 
-    m = re.match(rf"REVOKE\s+(\w+)\s+ON\s+TABLE\s+{_FULL}\s+FROM\s+`((?:[^`]|``)+)`\s*$", s, re.I)
+    m = re.match(
+        rf"REVOKE\s+(ALL\s+PRIVILEGES|\w+)\s+ON\s+TABLE\s+{_FULL}\s+FROM\s+`((?:[^`]|``)+)`\s*$",
+        s,
+        re.I,
+    )
     if m:
         priv, cat, sch, name, who = m.groups()
         full = f"{cat}.{sch}.{name}"
@@ -345,7 +349,8 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
             return False, f"[TABLE_OR_VIEW_NOT_FOUND] {full}"
         held = fake.grants.setdefault(("table", full), {})
         who = who.replace("``", "`")
-        held[who] = [p for p in held.get(who, []) if p != priv.upper()]
+        gone = "ALL_PRIVILEGES" if priv.upper().startswith("ALL") else priv.upper()
+        held[who] = [p for p in held.get(who, []) if p != gone]
         return True, ""
 
     m = re.match(rf"DROP\s+TABLE\s+(IF\s+EXISTS\s+)?{_FULL}\s*$", s, re.I)

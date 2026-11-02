@@ -42,6 +42,7 @@ from ._databricks_governed import (
     DENY,
     FILTER,
     MASK,
+    STEWARDS,
     STEWARDS_GROUP,
     contract,
 )
@@ -334,33 +335,37 @@ def test_a_pre_apply_failure_stops_the_run_and_revokes_nothing(fake):
     assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == ["SELECT"]
 
 
-def test_a_post_apply_failure_revokes_select_from_the_restricted_principals_only(fake):
+def test_a_post_apply_failure_binds_a_deny_all_filter_for_the_restricted_and_revokes_nothing(fake):
     seed(fake)
     fake.fail_on("SET MASK", "[INTERNAL_ERROR] warehouse stopped")
     run = Run(fake)
     with pytest.raises(UnsupportedBindingError) as exc:
         run.post(contract())
 
-    assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == []
-    assert fake.grants[("table", TABLE)][STEWARDS_GROUP] == ["SELECT"]
-    revoke = "REVOKE SELECT ON TABLE `main`.`cp360`.`profile` FROM `fluid-demo-lab-analysts`"
-    assert [s for s in fake.sql_log if s.startswith("REVOKE")] == [revoke]
-    assert f"revoked: {revoke}" in run.text
-    assert "fail-safe: revoking SELECT" in run.text and "could expose unmasked rows" in run.text
+    deny_all = _expected().deny_all.function.full_name
+    assert live(fake)["row_filter"]["function_name"] == deny_all
+    assert live(fake)["row_filter"]["input_column_names"] == []
+    assert not any(s.startswith("REVOKE") for s in fake.sql_log), "no grant was touched"
+    assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == ["SELECT"]
+    assert "fail-safe: binding a deny-all row filter" in run.text
     message = str(exc.value)
-    assert "SELECT was revoked" in message and "[INTERNAL_ERROR] warehouse stopped" in message
+    assert "[INTERNAL_ERROR] warehouse stopped" in message
+    assert f"A deny-all row filter ({deny_all}) is bound" in message
+    assert "whatever grant gives them the table" in message
+    assert "SELECT was not revoked from anyone" in message
     assert "re-run fluid apply" in " ".join(exc.value.remediation)
 
 
 def test_a_failed_revoke_is_reported_as_not_revoked(fake):
     seed(fake)
-    fake.fail_on("SET ROW FILTER")
+    fake.fail_on("SET ROW FILTER")  # the real filter and the deny-all filter both fail
     fake.fail_on("REVOKE", "[PERMISSION_DENIED] cannot revoke")
     run = Run(fake)
     with pytest.raises(UnsupportedBindingError) as exc:
         run.post(contract())
     assert "NOT REVOKED: REVOKE SELECT" in run.text
-    assert "could NOT be revoked" in str(exc.value) and "Run those yourself, now" in str(exc.value)
+    assert "could NOT be revoked, run them yourself, now" in str(exc.value)
+    assert "Nothing was revoked" in str(exc.value)
     assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == ["SELECT"]
 
 
@@ -625,7 +630,7 @@ def test_a_table_without_restrictions_is_not_even_read_after_a_failed_apply(fake
     assert "row_filter" in live(fake) and len(live_masks(fake)) == 4
 
 
-def test_a_binding_that_fails_after_a_failed_apply_revokes_and_says_so(fake):
+def test_a_binding_that_fails_after_a_failed_apply_locks_the_table_and_says_so(fake):
     seed(fake)
     fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] warehouse stopped")
     run = Run(fake)
@@ -634,8 +639,9 @@ def test_a_binding_that_fails_after_a_failed_apply_revokes_and_says_so(fake):
             contract(), say=run.said.append, client_factory=fake.client, after_failed_apply=True
         )
     assert str(exc.value).startswith("the apply failed part way")
+    # The deny-all filter could not be bound either: SELECT is revoked from every grantee.
     assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == []
-    assert fake.grants[("table", TABLE)][STEWARDS_GROUP] == ["SELECT"]
+    assert fake.grants[("table", TABLE)][STEWARDS_GROUP] == []
 
 
 def test_the_engine_prints_an_enforcement_failure_after_a_failed_apply_and_never_raises_it(
@@ -781,7 +787,8 @@ def test_a_hostile_function_after_a_successful_apply_is_a_failed_bind_with_the_f
         run.post(contract())
     assert "email" not in live_masks(fake)
     assert "attacker@example.test" in run.text, "what differs is printed"
-    assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == [], "the fail-safe ran"
+    # The fail-safe ran: the (genuine) deny-all filter blocks the restricted group.
+    assert live(fake)["row_filter"]["function_name"] == _expected().deny_all.function.full_name
 
 
 def test_function_problem_names_every_difference_and_none_for_the_expected_function():
@@ -951,11 +958,13 @@ def test_a_read_that_fails_for_one_table_is_a_failed_bind_for_it_and_the_next_ta
             client_factory=fake.client,
             after_failed_apply=after_failed_apply,
         )
-    # T1 could not be read: it is revoked, not left granted and unbound.
+    # T1 could not be read, so a filter on it is unknown and the deny-all filter is not bound
+    # over it: its grants are revoked (every grantee but the owner), not left granted and unbound.
     assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == []
-    assert fake.grants[("table", TABLE)][STEWARDS_GROUP] == ["SELECT"]
+    assert fake.grants[("table", TABLE)][STEWARDS_GROUP] == []
     assert "could not read main.cp360.profile " in str(exc.value)
     assert "revoked: REVOKE SELECT ON TABLE `main`.`cp360`.`profile`" in run.text
+    assert "the table could not be read, so a filter on it is unknown" in str(exc.value)
     # T2 was still tried: it is bound, and keeps its grant.
     live2 = fake.tables["main.cp360.profile2"]
     assert live2["row_filter"]["function_name"].startswith("main.cp360.fluid_rf_profile2_")
@@ -982,3 +991,135 @@ def test_a_read_failure_before_the_apply_still_stops_the_run(fake):
     fake.fail_route("GET", r"/tables/main\.cp360\.profile$", 503, "temporarily unavailable")
     with pytest.raises(UnsupportedBindingError, match="could not read main.cp360.profile"):
         Run(fake).pre(contract())
+
+
+# ── the fail-safe: a deny-all filter, then a lock ───────────────────────────
+def _holders(fake: FakeDatabricks) -> Dict[str, List[str]]:
+    return {p: v for p, v in fake.grants[("table", TABLE)].items() if v}
+
+
+def test_the_deny_all_filter_hides_every_row_from_the_restricted_and_none_from_anyone_else():
+    duck = pytest.importorskip("duckdb")
+    import sqlglot
+
+    spec = _expected().deny_all
+    assert spec.columns == () and spec.function.params == ()
+    assert spec.bind.endswith("ON ()")
+    body = spec.function.create.split(" RETURN ", 1)[1]
+    sql = sqlglot.transpile(body, read="databricks", write="duckdb")[0]
+
+    def keeps(groups):
+        con = duck.connect()
+        members = ", ".join("'" + g + "'" for g in groups)
+        con.execute(f"CREATE MACRO is_account_group_member(g) AS list_contains([{members}], g)")
+        return con.execute(f"SELECT {sql}").fetchone()[0]
+
+    assert keeps([ANALYSTS_GROUP]) is False
+    assert keeps([STEWARDS_GROUP]) is True
+    assert keeps([]) is True
+    assert _expected().deny_all.function.full_name.startswith(
+        "main.cp360.fluid_rf_profile_deny_all_"
+    )
+
+
+def test_a_failed_bind_leaves_a_deny_all_filter_that_the_next_apply_replaces(fake):
+    seed(fake)
+    fake.fail_on("SET MASK", "[INTERNAL_ERROR] warehouse stopped")
+    with pytest.raises(UnsupportedBindingError):
+        Run(fake).post(contract())
+    deny_all = _expected().deny_all.function.full_name
+    assert live(fake)["row_filter"]["function_name"] == deny_all
+
+    fake.failing.clear()
+    Run(fake).pre(contract())
+    assert live(fake)["row_filter"]["function_name"] == _expected().row_filter.function.full_name
+    assert len(live_masks(fake)) == 4
+    assert deny_all in fake.functions, "the deny-all function is kept: harmless metadata"
+
+
+def test_a_hostile_function_under_the_deny_all_name_is_not_bound_and_the_table_is_locked(fake):
+    seed(fake)
+    spec = _expected().deny_all
+    _plant(fake, spec.function, body="true")
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")  # the real filter fails too
+    fake.fail_on("fluid_mask_profile", "[INTERNAL_ERROR] x")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        run.post(contract())
+    assert "its body is 'true'" in run.text
+    assert "row_filter" not in live(fake), "the hostile deny-all was never bound"
+    assert "The deny-all row filter could not be bound" in str(exc.value)
+    assert _holders(fake) == {}, "so SELECT was revoked from every grantee"
+
+
+def test_when_the_deny_all_filter_fails_select_is_revoked_from_every_grantee_but_the_owner(fake):
+    seed(fake)
+    fake.grant("table", TABLE, "other-group", "SELECT")  # a path the restricted member is on
+    fake.grant("table", TABLE, "power-group", "ALL_PRIVILEGES")
+    fake.grant("table", TABLE, "fake-user@example.test", "SELECT")  # the table's owner
+    fake.grant("table", TABLE, "modifier", "MODIFY")
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        run.post(contract())
+    held = _holders(fake)
+    assert held == {"fake-user@example.test": ["SELECT"], "modifier": ["MODIFY"]}
+    revokes = sorted(s for s in fake.sql_log if s.startswith("REVOKE"))
+    assert "REVOKE ALL PRIVILEGES ON TABLE `main`.`cp360`.`profile` FROM `power-group`" in revokes
+    assert "REVOKE SELECT ON TABLE `main`.`cp360`.`profile` FROM `other-group`" in revokes
+    assert not any("fake-user" in s or "modifier" in s for s in revokes)
+    message = str(exc.value)
+    assert "every grantee but its owner" in message
+    assert "other-group" in message and "power-group" in message
+    assert "No grant inherited from the schema or the catalog was found open" in message
+
+
+def test_a_grant_inherited_from_the_schema_or_catalog_is_named_with_what_to_run(fake):
+    seed(fake)
+    fake.grant("schema", "main.cp360", "schema-readers", "SELECT")
+    fake.grant("catalog", "main", "catalog-admins", "ALL_PRIVILEGES")
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        run.post(contract())
+    message = str(exc.value)
+    assert "Still open:" in message
+    assert (
+        "schema-readers holds SELECT on SCHEMA main.cp360, which a table-level REVOKE cannot "
+        "close; run: REVOKE SELECT ON SCHEMA `main`.`cp360` FROM `schema-readers`"
+    ) in message
+    assert "run: REVOKE ALL PRIVILEGES ON CATALOG `main` FROM `catalog-admins`" in message
+    assert "No grant inherited" not in message
+
+
+def test_a_foreign_row_filter_is_not_replaced_by_the_deny_all_filter_either(fake):
+    seed(fake)
+    theirs = _admin_filter(fake)
+    fake.fail_on("SET MASK", "[INTERNAL_ERROR] x")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        run.post(contract())
+    assert live(fake)["row_filter"]["function_name"] == theirs
+    assert f"it would replace {theirs}, a row filter this module did not create" in str(exc.value)
+    assert _holders(fake) == {}, "locked by revoking instead"
+
+
+def test_a_grant_listing_that_fails_revokes_only_the_restricted_identities_and_says_so(fake):
+    seed(fake)
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    fake.fail_route("GET", r"/permissions/table/", 503, "unavailable")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        run.post(contract())
+    assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == []
+    assert fake.grants[("table", TABLE)][STEWARDS_GROUP] == ["SELECT"]
+    assert "Its grants could not be listed, so only the restricted identities were revoked" in str(
+        exc.value
+    )
+
+
+def test_a_contract_whose_restricted_principals_have_no_identity_has_nothing_to_close(fake):
+    seed(fake)
+    doc = contract(principals={ANALYSTS: [], STEWARDS: STEWARDS_GROUP})
+    enforcement = dbx._compile(doc, {dbx.WAREHOUSE_ENV: "wh"}).tables[0].enforcement
+    assert enforcement.deny_all is None

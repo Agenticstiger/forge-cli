@@ -690,19 +690,20 @@ def test_a_removed_restriction_is_dropped_and_said_to_widen_access(workspace, fa
 
 
 @requires_sdk
-def test_a_failed_binding_revokes_select_fails_the_run_and_the_next_apply_fixes_it(
+def test_a_failed_binding_with_no_deny_all_locks_the_table_and_the_next_apply_fixes_it(
     workspace, fake, capfd
 ):
     path = write_contract(workspace, _restricted())
+    # Neither the real filter nor the deny-all filter can be bound.
     fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] warehouse stopped")
 
     rc, out = apply_contract(capfd, path)
     assert rc == 1, out
     assert "opentofu_access_enforcement_failed" in out
-    assert "warehouse stopped" in out and "SELECT was revoked" in out
+    assert "warehouse stopped" in out and "every grantee but its owner" in out
     assert "revoked: REVOKE SELECT ON TABLE `main`.`sales`.`orders` FROM `analysts`" in out
     assert fake.grants[("table", TABLE)]["analysts"] == []
-    assert fake.grants[("table", TABLE)]["bi"] == ["SELECT"], "an unrestricted reader keeps it"
+    assert fake.grants[("table", TABLE)]["bi"] == [], "revoked from every grantee but the owner"
     assert "row_filter" not in _live(fake)
 
     fake.failing.clear()
@@ -710,11 +711,36 @@ def test_a_failed_binding_revokes_select_fails_the_run_and_the_next_apply_fixes_
     rc, out = apply_contract(capfd, path)
     assert rc == 0, out
     assert "row_filter" in _live(fake) and len(_masks(fake)) == 2
-    assert fake.grants[("table", TABLE)]["analysts"] == ["SELECT"], "granted again by the apply"
+    assert fake.grants[("table", TABLE)] == {"analysts": ["SELECT"], "bi": ["SELECT"]}
     again = fake.timeline[mark:]
     bound = next(i for i, (k, w) in enumerate(again) if k == "sql" and "SET ROW FILTER" in w)
     granted = next(i for i, (k, w) in enumerate(again) if k == "perm" and w.endswith("orders"))
     assert bound < granted, "the table is bound before the grant is put back"
+
+
+@requires_sdk
+def test_a_failed_mask_leaves_a_deny_all_filter_and_every_grant_in_place_until_the_next_apply(
+    workspace, fake, capfd
+):
+    path = write_contract(workspace, _restricted())
+    fake.fail_on("SET MASK", "[INTERNAL_ERROR] warehouse stopped")
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 1, out
+    assert "A deny-all row filter (main.sales.fluid_rf_orders_deny_all_" in out
+    assert "SELECT was not revoked from anyone" in out
+    deny_all = _live(fake)["row_filter"]
+    assert deny_all["function_name"].startswith("main.sales.fluid_rf_orders_deny_all_")
+    assert deny_all["input_column_names"] == []
+    assert fake.grants[("table", TABLE)] == {"analysts": ["SELECT"], "bi": ["SELECT"]}
+    assert not any(s.startswith("REVOKE") for s in fake.sql_log)
+
+    fake.failing.clear()
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert _live(fake)["row_filter"]["function_name"].startswith("main.sales.fluid_rf_orders_")
+    assert "deny_all" not in _live(fake)["row_filter"]["function_name"]
+    assert len(_masks(fake)) == 2
 
 
 @requires_sdk

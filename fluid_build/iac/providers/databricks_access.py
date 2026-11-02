@@ -128,9 +128,14 @@ class TableEnforcement:
     full_name: str
     row_filter: Optional[RowFilterSpec]
     masks: Tuple[MaskSpec, ...]
-    #: Every identity a restriction names: the ones to revoke ``SELECT`` from if a binding
-    #: cannot be made (:func:`revoke_statements`).
+    #: Every identity a restriction names: the ones a deny-all filter blocks, and the ones to
+    #: revoke ``SELECT`` from, if a binding cannot be made.
     restricted: Tuple[str, ...]
+    #: The fixed-purpose row filter that blocks every restricted identity from every row,
+    #: whatever grant gives them the table: the zero-column function ``RETURN NOT <any
+    #: restricted identity>``. Bound when the real filter or a mask cannot be (a failed bind), and
+    #: as an interim filter while the real one waits for a column. ``None`` with no identity.
+    deny_all: Optional[RowFilterSpec] = None
 
 
 # ── SQL helpers ────────────────────────────────────────────────────────
@@ -157,6 +162,14 @@ def revoke_statements(full_name: str, principals: Sequence[str]) -> List[str]:
         f"REVOKE SELECT ON TABLE {quote_table(full_name)} FROM {quote_principal(p)}"
         for p in principals
     ]
+
+
+def revoke_all_statement(full_name: str, principal: str) -> str:
+    """``REVOKE ALL PRIVILEGES`` on the table, for a grantee holding ALL_PRIVILEGES (a revoke
+    of SELECT alone does not take that away)."""
+    return (
+        f"REVOKE ALL PRIVILEGES ON TABLE {quote_table(full_name)} FROM {quote_principal(principal)}"
+    )
 
 
 def unbind_row_filter(full_name: str) -> str:
@@ -444,6 +457,30 @@ def compile_enforcement(
         row_filter=row_filter,
         masks=masks,
         restricted=tuple(sorted(restricted)),
+        deny_all=_deny_all(catalog, schema, table, full_name, tuple(sorted(restricted))),
+    )
+
+
+def _deny_all(
+    catalog: str, schema: str, table: str, full_name: str, restricted: Sequence[str]
+) -> Optional[RowFilterSpec]:
+    """The zero-column row filter that hides every row from the restricted identities."""
+    if not restricted:
+        return None
+    function = _function(
+        catalog,
+        schema,
+        ROW_FILTER_PREFIX,
+        f"{table}_deny_all",
+        [],
+        "BOOLEAN",
+        f"NOT {_any_member(restricted)}",
+    )
+    return RowFilterSpec(
+        function=function,
+        columns=(),
+        bind=f"ALTER TABLE {quote_table(full_name)} SET ROW FILTER "
+        f"{quote_table(function.full_name)} ON ()",
     )
 
 
@@ -589,6 +626,7 @@ __all__ = [
     "is_forge_function",
     "quote_table",
     "render_predicate",
+    "revoke_all_statement",
     "revoke_statements",
     "string_literal",
     "same_function",
