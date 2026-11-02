@@ -68,27 +68,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs none. A restriction removed from the contract is dropped (`DROP ROW FILTER`, `DROP
   MASK`) after the apply, printed as an access-widening change and not gated as data loss; only
   a filter or mask whose function carries this module's name prefix is ever dropped, so one an
-  admin set by hand is left alone. It fails closed: a pre-apply failure stops the run before
-  `tofu apply`; if `post_apply` cannot bind a table it revokes `SELECT` on it from every
-  principal a restriction names (so a later dbt run cannot expose unmasked rows to them), prints
-  exactly what it revoked and why, and exits non-zero. The same bind-only pass runs when
-  `tofu apply` itself fails part way, before the apply's own error is raised: a table the apply
-  created, its grants and the dbt job that fills it can exist with no mask or filter, and a
-  scheduled run would expose unmasked rows. It binds what exists, revokes where it cannot bind,
-  skips a table that was never created and drops nothing (dropping widens access and waits for
-  an apply that succeeded); a failure there is printed and the run still exits with
-  `opentofu_apply_failed`. Re-running `fluid apply` once the
-  cause is fixed binds first and grants again. A contract with restrictions now needs the
-  `[databricks]` extra (databricks-sdk) at apply, and says so when it is missing. `fluid verify`
-  gains a row-filter-and-masks dimension: the expected function names (content-hashed) against
-  the live `row_filter` and each column's `mask` from the GetTable it already reads; a missing
-  or different binding is CRITICAL with `fluid apply` as the fix, and a contract that restricts
-  nothing skips it. `policy.privacy.masking` (landing-time masking), `rowLevelPolicy` and
-  `binding.governance` are still refused. Proven against the in-process stand-in with a real
-  `tofu` apply, and the function bodies evaluated in DuckDB; not run against a live workspace:
-  that `CREATE FUNCTION IF NOT EXISTS`, `SET ROW FILTER` and `SET MASK` behave as the stand-in
-  models them, that `SET` replaces a binding already on the table, that `current_user()` is a
-  service principal's application ID, and what a warehouse of each type enforces are unproven.
+  admin set by hand is left alone, and one is never replaced silently either: where the contract
+  asks for its own row filter or mask and the table has one whose function lacks the `fluid_`
+  prefix, the run stops before any change, on any table, naming the table, the column and the
+  live function (remove it, or move its rule into the contract). A content-hashed name can be
+  computed from the contract, so anyone with `CREATE FUNCTION` on the schema could take it first
+  with a body that returns the value unmasked, and `CREATE FUNCTION IF NOT EXISTS` would keep
+  theirs: after each create and before any bind the function is read
+  (`GET /api/2.1/unity-catalog/functions/{name}`) and its owner (the identity the run
+  authenticates as, `userName` of `scim/v2/Me`, who `CREATE FUNCTION` makes the owner), body,
+  parameters and return type must be the expected ones, whitespace-normalised; a mismatch is
+  not bound and is printed with what differs. It fails closed: a pre-apply failure stops the run
+  before `tofu apply`. When `post_apply` cannot bind a table (a failed statement, a hostile
+  function, a row filter set by hand, or a Tables API read that fails, which is tried per table
+  so one 503 does not stop the others), it binds a fixed-purpose deny-all row filter for the
+  restricted identities (a zero-column function, `RETURN NOT <any restricted identity>`, bound
+  `ON ()`, content-hashed and checked like the others), which blocks them whatever grant path
+  gives them the table: a group they are also in, a schema or catalog grant. If that cannot be
+  bound, or would replace a row filter not made here, it revokes `SELECT` (and `ALL PRIVILEGES`)
+  on the table from every grantee but its owner, listed through the permissions API, and names
+  every path still open, a grant on the schema or catalog that a table-level `REVOKE` cannot
+  close, with the statement to run. The message says exactly what was done, and the run exits
+  non-zero. The same bind-only pass runs when `tofu apply` itself fails part way, before the
+  apply's own error is raised: a table the apply created, its grants and the dbt job that fills
+  it can exist with no mask or filter. It binds what exists, closes what it cannot bind, skips a
+  table that was never created and drops nothing (dropping widens access and waits for an apply
+  that succeeded); a failure there is printed and the run still exits with
+  `opentofu_apply_failed`. When a row filter needs a column the apply adds, `pre_apply` holds the
+  table, which has rows, behind the same deny-all filter until `post_apply` binds the real one.
+  A dbt job that writes a restricted table which is not yet protected (the table is missing, a
+  binding is missing or differs, a bound function is not the expected one, or the live state
+  cannot be read) is created with `pause_status: PAUSED` on its schedule or continuous block,
+  so it cannot fill the table before it is bound; the next `fluid apply`, once the bindings
+  match, unpauses it in place, with no drift from unpausing it by hand, and the apply says so
+  (an explicit run-now works meanwhile). A manual job has nothing to pause, and `fluid validate`
+  and the pure compile never read the workspace. Re-running `fluid apply` once the cause of a
+  failed bind is fixed binds first (replacing a deny-all filter) and grants again.
+  `fluid generate iac` refuses a Databricks contract that compiles any mask or row filter
+  (`databricks-enforcement-outside-module`): they are bound by `fluid apply` around `tofu
+  apply`, not in the module, and a plain `tofu apply` of it would grant unmasked access;
+  `fluid apply`, `plan` and `validate` are unaffected. A contract with restrictions now needs
+  the `[databricks]` extra (databricks-sdk) at apply, and says so when it is missing. `fluid
+  verify` gains a row-filter-and-masks dimension: the expected function names (content-hashed)
+  against the live `row_filter` and each column's `mask` from the GetTable it already reads, and
+  each bound function read back for its owner (this verify's identity or the table's owner),
+  body, parameters and return type; a missing or different binding is CRITICAL with `fluid
+  apply` as the fix, and a contract that restricts nothing skips it. `policy.privacy.masking`
+  (landing-time masking), `rowLevelPolicy` and `binding.governance` are still refused. Proven
+  against the in-process stand-in with a real `tofu` apply, and the function bodies evaluated
+  in DuckDB; not run against a live workspace: that `CREATE FUNCTION IF NOT EXISTS`, `SET ROW
+  FILTER` (with `ON ()` as well) and `SET MASK` behave as the stand-in models them, that `SET`
+  replaces a binding already on the table (if it does not, a changed predicate or the interim
+  filter fails closed with the old binding in place; a `DROP` first was not used because it
+  leaves a window with no filter), that FunctionInfo's `routine_definition` is the body as
+  written, that `current_user()` is a service principal's application ID, and what a warehouse
+  of each type enforces are unproven.
 
 ### Fixed
 
