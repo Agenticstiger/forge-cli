@@ -912,3 +912,23 @@ def test_a_filter_needing_a_column_the_apply_adds_is_held_by_a_deny_all_filter_b
     real = max(i for i, (k, w) in enumerate(timeline) if k == "sql" and "SET ROW FILTER" in w)
     assert interim < add_column < real, "deny-all, then the new column, then the real filter"
     assert interim < first_grant
+
+
+def test_generate_iac_refuses_a_module_a_plain_tofu_apply_would_leave_unmasked(
+    workspace, fake, capfd
+):
+    path = write_contract(workspace, _restricted())
+
+    rc, out = run_fluid(capfd, "generate", "iac", path, "--out", "iac")
+    assert rc == 1, out
+    assert "databricks-enforcement-outside-module" in out
+    assert "plain tofu apply" in out and "fluid apply" in out
+    assert not (workspace / "iac" / "main.tf.json").exists(), "no module was written"
+
+    # validate, plan and a dry-run apply are unaffected, and so is a contract without any.
+    assert run_fluid(capfd, "validate", path)[0] == 0
+    assert run_fluid(capfd, "plan", path, "--out", "plan.json")[0] == 0
+    plain = write_contract(workspace, make_contract())
+    rc, out = run_fluid(capfd, "generate", "iac", plain, "--out", "iac")
+    assert rc == 0, out
+    assert (workspace / "iac" / "main.tf.json").is_file()

@@ -1641,6 +1641,36 @@ class DatabricksIacPlugin:
         hides, in the shape the engine reports (``_report_suppressed_drift``)."""
         return _dbt_column_drift(_compile(contract, os.environ), prior_resources)
 
+    def standalone_module_refusal(
+        self, contract: Mapping[str, Any]
+    ) -> Optional[UnsupportedBindingError]:
+        """Why this contract's module must not be applied on its own, or ``None``.
+
+        Column masks and row filters are not in the module: they are bound on the SQL
+        warehouse around ``tofu apply`` (``pre_apply`` / ``post_apply``). A module written for
+        review and a plain ``tofu apply`` would create the table and grant SELECT with none of
+        them. ``fluid generate iac`` asks this before it writes one; ``emit`` stays pure, and
+        ``fluid apply``, ``plan`` and ``validate`` are unaffected. A contract that does not
+        compile is left to ``emit``, which raises its own refusal.
+        """
+        compiled = _compile(contract, os.environ)
+        if compiled.refusals:
+            return None
+        guarded = [t for t in compiled.tables if t.enforcement is not None]
+        if not guarded:
+            return None
+        return _refusal(
+            "enforcement-outside-module",
+            f"{', '.join(t.where for t in guarded)} declare column restrictions or row filters, "
+            "which Unity Catalog enforces through functions bound on the SQL warehouse by "
+            "fluid apply, around tofu apply. They are not in the module generate iac writes, "
+            "and a plain tofu apply of it would create the table and grant SELECT with no mask "
+            "or row filter, exposing unmasked data to the principals the contract restricts.",
+            "Use fluid apply, which binds the masks and row filters before it grants and "
+            "revokes access when it cannot (fluid apply --mode dry-run shows the statements).",
+            "Or remove the column restrictions and row filters from the contract.",
+        )
+
     @staticmethod
     def _enforcement_targets(contract: Mapping[str, Any]) -> List[Target]:
         compiled = _compile(contract, os.environ)

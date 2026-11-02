@@ -688,3 +688,37 @@ def test_validate_reports_every_refusal_with_the_emitters_message():
     allow = {"principal": ANALYSTS, "columns": ["email"], "access": "allow"}
     errors, _ = dbx.validate_databricks_binding(contract(restrictions=[allow]), ENV)
     assert errors and "allow list" in errors[0]
+
+
+# ── generate iac refuses a module a plain tofu apply would leave unprotected ─
+def test_the_plugin_refuses_a_standalone_module_for_a_contract_with_masks_or_filters(monkeypatch):
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, ENV[dbx.WAREHOUSE_ENV])
+    from fluid_build.iac import IAC_PLUGINS
+
+    plugin = IAC_PLUGINS["databricks"]
+    refused = plugin.standalone_module_refusal(contract())
+    assert refused.kind == "databricks-enforcement-outside-module"
+    assert "plain tofu apply" in str(refused) and "no mask or row filter" in str(refused)
+    assert "fluid apply" in " ".join(refused.remediation)
+    assert "exposes[0] (profile)" in str(refused)
+
+
+def test_a_contract_without_restrictions_or_with_a_refusal_of_its_own_gets_no_such_refusal(
+    monkeypatch,
+):
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, ENV[dbx.WAREHOUSE_ENV])
+    from fluid_build.iac import IAC_PLUGINS
+
+    plugin = IAC_PLUGINS["databricks"]
+    assert plugin.standalone_module_refusal(contract(restrictions=None, filters=None)) is None
+    # A contract that does not compile is left to emit, which raises its own refusal.
+    allow = {"principal": ANALYSTS, "columns": ["email"], "access": "allow"}
+    assert plugin.standalone_module_refusal(contract(restrictions=[allow])) is None
+
+
+def test_emit_stays_pure_and_still_emits_the_module_for_fluid_apply(monkeypatch):
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, ENV[dbx.WAREHOUSE_ENV])
+    from fluid_build.iac import IAC_PLUGINS
+
+    resources = IAC_PLUGINS["databricks"].emit(contract())
+    assert "databricks_sql_table" in resources and "databricks_grant" in resources
