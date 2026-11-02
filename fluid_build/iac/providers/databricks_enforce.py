@@ -801,6 +801,58 @@ def _privileges(entry: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
     return out
 
 
+def unprotected(
+    targets: Sequence[Target], client_factory: Optional[ClientFactory] = None
+) -> Dict[str, str]:
+    """``{table: why}`` for each table with restrictions that is not yet protected as the
+    contract expects, read live; every such table when the live state cannot be read.
+
+    Protected means the table exists, its row filter and masks are the expected functions bound
+    on the expected columns, and each of those functions is the one this module creates (owner,
+    body, parameters, return type). A dbt job that writes a table that is not yet protected is
+    created paused (``DatabricksIacPlugin.emit``), so it cannot fill it first. Fails closed: no
+    SDK, no credential or a failed read all count as not protected.
+    """
+    wanted = [t for t in targets if t.enforcement is not None]
+    if not wanted:
+        return {}
+    quiet: List[str] = []
+    try:
+        session = _client_for(wanted, client_factory, quiet.append)
+    except Exception as exc:  # noqa: BLE001 — unknown is unprotected
+        return {
+            t.full_name: f"the live state could not be read ({type(exc).__name__})" for t in wanted
+        }
+    if session is None:
+        return {t.full_name: "the live state could not be read" for t in wanted}
+    out: Dict[str, str] = {}
+    for target in wanted:
+        enforcement = target.enforcement
+        assert enforcement is not None
+        try:
+            live = read_table(session.client, target.full_name)
+            if live is None:
+                out[target.full_name] = "the table does not exist yet"
+                continue
+            plan = plan_table(target.full_name, enforcement, live)
+            if plan.bind:
+                out[target.full_name] = "its masks or row filter are not bound as the contract says"
+                continue
+            functions = [m.function for m in enforcement.masks]
+            if enforcement.row_filter is not None:
+                functions.append(enforcement.row_filter.function)
+            for fn in functions:
+                problem = function_problem(
+                    read_function(session.client, fn.full_name), fn, {session.identity}
+                )
+                if problem is not None:
+                    out[target.full_name] = problem
+                    break
+        except Exception as exc:  # noqa: BLE001 — a failed read is not protection
+            out[target.full_name] = f"it could not be checked ({type(exc).__name__})"
+    return out
+
+
 def _fail_safe(
     session: Session, target: Target, say: Say, *, live: Optional[Mapping[str, Any]] = None
 ) -> FailSafe:
@@ -982,4 +1034,5 @@ __all__ = [
     "preview",
     "read_function",
     "read_table",
+    "unprotected",
 ]

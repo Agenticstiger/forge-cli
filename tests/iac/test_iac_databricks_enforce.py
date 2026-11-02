@@ -1178,3 +1178,116 @@ def test_a_contract_whose_restricted_principals_have_no_identity_has_nothing_to_
     doc = contract(principals={ANALYSTS: [], STEWARDS: STEWARDS_GROUP})
     enforcement = dbx._compile(doc, {dbx.WAREHOUSE_ENV: "wh"}).tables[0].enforcement
     assert enforcement.deny_all is None
+
+
+# ── a dbt job that writes a table not yet protected is created paused ───────
+def _job_contract(trigger=None, *, outputs=("profile",), doc=None):
+    doc = doc or contract()
+    doc["builds"] = [
+        {
+            "id": "daily",
+            "engine": "dbt",
+            "repository": "https://github.com/o/r?tag=v1",
+            "outputs": list(outputs),
+            "properties": {"model": "profile"},
+            "execution": {
+                "trigger": trigger or {"type": "schedule", "cron": "0 2 * * *"},
+                "runtime": {"platform": "databricks"},
+            },
+        }
+    ]
+    return doc
+
+
+def _emitted_job(doc):
+    resources = PLUGIN.emit(doc)
+    (job,) = resources["databricks_job"].values()
+    return job
+
+
+@pytest.fixture
+def workspace_client(fake, monkeypatch):
+    monkeypatch.setattr(enforce, "default_client", fake.client)
+    return fake
+
+
+@pytest.mark.parametrize(
+    "trigger,block",
+    [
+        ({"type": "schedule", "cron": "*/5 * * * *"}, "schedule"),
+        ({"type": "continuous"}, "continuous"),
+    ],
+    ids=["frequent-cron", "continuous"],
+)
+def test_a_job_writing_a_table_that_does_not_exist_yet_is_created_paused(
+    workspace_client, trigger, block
+):
+    job = _emitted_job(_job_contract(trigger))
+    assert job[block]["pause_status"] == "PAUSED"
+    notices = "\n".join(PLUGIN.plan_notices(_job_contract(trigger)))
+    assert "is created paused" in notices and "main.cp360.profile" in notices
+    assert "next fluid apply" in notices and "run-now" in notices
+
+
+def test_a_job_is_unpaused_once_the_live_bindings_match(workspace_client):
+    fake = workspace_client
+    seed(fake)
+    assert _emitted_job(_job_contract())["schedule"]["pause_status"] == "PAUSED"
+    Run(fake).pre(contract())
+    job = _emitted_job(_job_contract())
+    assert job["schedule"]["pause_status"] == "UNPAUSED"
+    assert not any("is created paused" in n for n in PLUGIN.plan_notices(_job_contract()))
+
+
+def test_a_job_stays_paused_while_a_binding_is_missing_or_differs(workspace_client):
+    fake = workspace_client
+    seed(fake)
+    Run(fake).pre(contract())
+    del fake.tables[TABLE]["row_filter"]
+    assert _emitted_job(_job_contract())["schedule"]["pause_status"] == "PAUSED"
+    Run(fake).pre(contract())
+    assert _emitted_job(_job_contract())["schedule"]["pause_status"] == "UNPAUSED"
+    Run(fake).pre(contract(filters=[{**FILTER, "where": "consent_data_analytics = false"}]))
+    assert (
+        _emitted_job(_job_contract())["schedule"]["pause_status"] == "PAUSED"
+    ), "another predicate"
+
+
+def test_a_job_stays_paused_while_a_bound_function_is_not_the_expected_one(workspace_client):
+    fake = workspace_client
+    seed(fake)
+    Run(fake).pre(contract())
+    name = _expected().masks[0].function.full_name
+    fake.functions[name]["owner"] = "attacker@example.test"
+    assert _emitted_job(_job_contract())["schedule"]["pause_status"] == "PAUSED"
+
+
+def test_a_job_is_paused_when_the_live_state_cannot_be_read(workspace_client, monkeypatch):
+    fake = workspace_client
+    seed(fake)
+    Run(fake).pre(contract())
+    fake.fail_route("GET", r"/tables/main\.cp360\.profile$", 503, "unavailable")
+    assert _emitted_job(_job_contract())["schedule"]["pause_status"] == "PAUSED"
+    fake.failing_routes.clear()
+
+    def no_sdk():
+        raise ImportError("databricks")
+
+    monkeypatch.setattr(enforce, "default_client", no_sdk)
+    assert _emitted_job(_job_contract())["schedule"]["pause_status"] == "PAUSED"
+
+
+def test_a_manual_job_and_a_job_writing_no_restricted_table_are_left_alone(workspace_client):
+    fake = workspace_client
+    manual = _emitted_job(_job_contract({"type": "manual"}))
+    assert "schedule" not in manual and "continuous" not in manual
+    plain = contract(restrictions=None, filters=None)
+    assert _emitted_job(_job_contract(doc=plain))["schedule"]["pause_status"] == "UNPAUSED"
+    assert fake.requests == [], "no live read when nothing restricted is written by a job"
+
+
+def test_pure_compilation_never_reads_the_workspace_or_pauses(fake):
+    compiled = dbx._compile(_job_contract(), {dbx.WAREHOUSE_ENV: "wh"})
+    (job,) = compiled.resources["databricks_job"].values()
+    assert job["schedule"]["pause_status"] == "UNPAUSED"
+    assert fake.requests == []

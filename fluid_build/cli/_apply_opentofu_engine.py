@@ -328,9 +328,11 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
             planned=changes, applied=applied, resources=_module_addresses(module), dry_run=False
         )
 
-    # The tables this apply created exist now, empty: they get their masks and row filter
-    # before any build can fill them. A table that cannot be bound is locked for the principals
-    # it restricts, and the run fails.
+    # The tables this apply created exist now, empty, and get their masks and row filter here.
+    # A dbt job that writes one was created paused in this same apply (the plugin's ``emit``
+    # reads the live bindings), and the next apply starts it once they are in place, so no
+    # build fills a table first. A table that cannot be bound is closed to the principals it
+    # restricts (a deny-all row filter, else revoked), and the run fails.
     _enforce_access(plugin, "post_apply", contract)
 
     info(logger, "opentofu_apply_ok", provider=provider, **applied)

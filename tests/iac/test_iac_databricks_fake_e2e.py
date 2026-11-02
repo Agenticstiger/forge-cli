@@ -932,3 +932,41 @@ def test_generate_iac_refuses_a_module_a_plain_tofu_apply_would_leave_unmasked(
     rc, out = run_fluid(capfd, "generate", "iac", plain, "--out", "iac")
     assert rc == 0, out
     assert (workspace / "iac" / "main.tf.json").is_file()
+
+
+@requires_sdk
+def test_a_dbt_job_created_with_its_restricted_table_is_paused_until_the_next_apply(
+    workspace, fake, capfd
+):
+    contract = _restricted()
+    contract["builds"] = [
+        {
+            "id": "transform",
+            "engine": "dbt",
+            "pattern": "hybrid-reference",
+            "repository": "https://github.com/o/r?tag=v1",
+            "outputs": ["orders"],
+            "properties": {"model": "orders", "select": "orders+"},
+            "execution": {
+                "trigger": {"type": "schedule", "cron": "*/5 * * * *"},
+                "runtime": {"platform": "databricks"},
+            },
+        }
+    ]
+    path = write_contract(workspace, contract)
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    (job,) = fake.jobs.values()
+    assert job["settings"]["schedule"]["pause_status"] == "PAUSED"
+    assert "is created paused" in out and "run-now" in out
+    assert "row_filter" in _live(fake), "the table was bound in the same apply"
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "tofu plan: +0 ~1 -0" in out, "only the job changes: it is unpaused"
+    (job,) = fake.jobs.values()
+    assert job["settings"]["schedule"]["pause_status"] == "UNPAUSED"
+    assert "is created paused" not in out
+
+    assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]

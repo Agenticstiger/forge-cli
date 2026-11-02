@@ -147,7 +147,7 @@ from ..provider_match import canonical_cloud, is_cloud
 from ..versions import required_providers
 from .databricks_access import TableEnforcement, compile_enforcement
 from .databricks_auth import tofu_env_overlay
-from .databricks_enforce import Target, post_apply, pre_apply, preview
+from .databricks_enforce import Target, post_apply, pre_apply, preview, unprotected
 from .databricks_jobs import (
     CompiledJobs,
     DbtJob,
@@ -1562,6 +1562,8 @@ class DatabricksIacPlugin:
         if compiled.refusals:
             raise compiled.refusals[0]
         _enforce_sovereignty(contract, compiled.tables)
+        for job, _tables in _jobs_to_pause(compiled, contract):
+            _pause(compiled, job)
         return compiled.resources
 
     def emit_data(
@@ -1717,8 +1719,18 @@ class DatabricksIacPlugin:
         )
 
     def plan_notices(self, contract: Mapping[str, Any]) -> List[str]:
-        """What the apply cannot do itself and someone must: ``USE CATALOG``."""
-        return _use_catalog_notices(_compile(contract, os.environ))
+        """What the apply cannot do itself and someone must: ``USE CATALOG``; and the dbt jobs
+        it creates paused until the tables they write are protected."""
+        compiled = _compile(contract, os.environ)
+        notices = _use_catalog_notices(compiled)
+        for job, tables in _jobs_to_pause(compiled, contract):
+            notices.append(
+                f"job {job.name!r} is created paused (pause_status PAUSED): it writes "
+                f"{', '.join(sorted(tables))}, whose masks and row filter are not bound yet, and "
+                "a run before that would fill an unprotected table. The next fluid apply, once "
+                "they are bound, starts its schedule; an explicit run-now works meanwhile."
+            )
+        return notices
 
     def explain_plan_failure(
         self,
@@ -1828,6 +1840,59 @@ class DatabricksIacPlugin:
             if full in live:
                 out.extend(f"{full}.{line}" for line in _changed_columns(live[full], declared))
         return out
+
+
+def _jobs_to_pause(
+    compiled: _Compiled, contract: Mapping[str, Any]
+) -> List[Tuple[DbtJob, Dict[str, str]]]:
+    """``(job, {table: why})`` for each dbt job that writes a table that is not yet protected.
+
+    The masks and row filters are bound around ``tofu apply``, not by it, so a job created in
+    the same apply as its table and the grant on it could run (continuous, or a frequent cron)
+    and fill the table before ``post_apply`` binds them. Such a job is created paused and
+    started by the next apply, once the live bindings match. A manual job has nothing to pause.
+    Read live, only for a contract with both a restricted table and a job; unreadable counts as
+    not protected.
+    """
+    from ...util.contract import builds_writing_expose
+
+    guarded = [t for t in compiled.tables if t.enforcement is not None]
+    if not guarded or not compiled.jobs:
+        return []
+    builds = [b for b in contract.get("builds") or [] if isinstance(b, Mapping)]
+    writes = {
+        t.full_name: {
+            str(b.get("id")) for b in builds_writing_expose(t.exposure.get("exposeId"), builds)
+        }
+        for t in guarded
+    }
+    candidates = [
+        job
+        for job in compiled.jobs
+        if job.trigger != "manual" and any(job.build_id in ids for ids in writes.values())
+    ]
+    if not candidates:
+        return []
+    open_tables = unprotected([Target(t.full_name, t.enforcement) for t in guarded])
+    out: List[Tuple[DbtJob, Dict[str, str]]] = []
+    for job in candidates:
+        why = {
+            name: reason
+            for name, reason in open_tables.items()
+            if job.build_id in writes.get(name, ())
+        }
+        if why:
+            out.append((job, why))
+    return out
+
+
+def _pause(compiled: _Compiled, job: DbtJob) -> None:
+    """``pause_status: PAUSED`` on the job's schedule or continuous block."""
+    key = job.address.split(".", 1)[1]
+    body = compiled.resources.get("databricks_job", {}).get(key) or {}
+    for block in ("schedule", "continuous"):
+        if isinstance(body.get(block), dict):
+            body[block]["pause_status"] = "PAUSED"
 
 
 def _job_actions(jobs: Sequence[DbtJob]) -> List[Dict[str, Any]]:
