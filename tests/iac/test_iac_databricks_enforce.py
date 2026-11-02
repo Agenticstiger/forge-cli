@@ -910,3 +910,75 @@ def test_a_dry_run_reports_the_refusal_too(fake):
     _admin_filter(fake)
     with pytest.raises(UnsupportedBindingError, match="did not create"):
         Run(fake).pre(contract(), dry_run=True)
+
+
+# ── a Tables API read that fails ────────────────────────────────────────────
+def _two_tables() -> Dict[str, Any]:
+    doc = contract()
+    doc["exposes"].append(
+        {
+            **contract()["exposes"][0],
+            "exposeId": "profile2",
+            "binding": {
+                **contract()["exposes"][0]["binding"],
+                "location": {"database": "main", "schema": "cp360", "table": "profile2"},
+            },
+        }
+    )
+    return doc
+
+
+def _seed_two(fake: FakeDatabricks) -> None:
+    seed(fake)
+    fake.create_table("main.cp360.profile2", [(n, t, True) for n, t in COLUMNS])
+    fake.grant("table", "main.cp360.profile2", ANALYSTS_GROUP, "SELECT")
+
+
+@pytest.mark.parametrize("status", [503, 429])
+@pytest.mark.parametrize(
+    "after_failed_apply", [False, True], ids=["after-apply", "after-failed-apply"]
+)
+def test_a_read_that_fails_for_one_table_is_a_failed_bind_for_it_and_the_next_table_is_tried(
+    fake, status, after_failed_apply
+):
+    _seed_two(fake)
+    fake.fail_route("GET", r"/tables/main\.cp360\.profile$", status, "temporarily unavailable")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        PLUGIN.post_apply(
+            _two_tables(),
+            say=run.said.append,
+            client_factory=fake.client,
+            after_failed_apply=after_failed_apply,
+        )
+    # T1 could not be read: it is revoked, not left granted and unbound.
+    assert fake.grants[("table", TABLE)][ANALYSTS_GROUP] == []
+    assert fake.grants[("table", TABLE)][STEWARDS_GROUP] == ["SELECT"]
+    assert "could not read main.cp360.profile " in str(exc.value)
+    assert "revoked: REVOKE SELECT ON TABLE `main`.`cp360`.`profile`" in run.text
+    # T2 was still tried: it is bound, and keeps its grant.
+    live2 = fake.tables["main.cp360.profile2"]
+    assert live2["row_filter"]["function_name"].startswith("main.cp360.fluid_rf_profile2_")
+    assert fake.grants[("table", "main.cp360.profile2")][ANALYSTS_GROUP] == ["SELECT"]
+    assert "main.cp360.profile2" not in str(exc.value).split("could not be put in place")[0]
+
+
+def test_a_read_that_fails_for_a_table_without_restrictions_is_a_note_and_the_rest_go_on(fake):
+    _seed_two(fake)
+    bare = _two_tables()
+    first = bare["exposes"][0]["policy"]["authz"]
+    first.pop("columnRestrictions")
+    first.pop("rowFilters")
+    fake.fail_route("GET", r"/tables/main\.cp360\.profile$", 503, "temporarily unavailable")
+    run = Run(fake)
+    PLUGIN.post_apply(bare, say=run.said.append, client_factory=fake.client)
+    assert "could not be read, so its earlier masks" in run.text
+    assert "row_filter" in fake.tables["main.cp360.profile2"], "the next table was bound"
+    assert not any(s.startswith("REVOKE") for s in run.statements())
+
+
+def test_a_read_failure_before_the_apply_still_stops_the_run(fake):
+    seed(fake)
+    fake.fail_route("GET", r"/tables/main\.cp360\.profile$", 503, "temporarily unavailable")
+    with pytest.raises(UnsupportedBindingError, match="could not read main.cp360.profile"):
+        Run(fake).pre(contract())

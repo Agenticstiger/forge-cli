@@ -648,7 +648,21 @@ def post_apply(
     failed: List[Tuple[Target, str]] = []
     unrevoked: List[str] = []
     for target in targets:
-        live = _read(client, target)
+        try:
+            live = _read(client, target)
+        except EnforcementError as exc:
+            # A transient 429 or 503 on one table must not leave it granted and unbound, nor
+            # stop the others from being tried: it is a failed bind for that table.
+            if target.enforcement is None:
+                say(
+                    f"  note: {target.full_name} could not be read, so its earlier masks and "
+                    "row filter were not checked for removal; any left in place keep restricting."
+                )
+                continue
+            say(f"    FAILED: {exc}")
+            failed.append((target, str(exc)))
+            unrevoked += _fail_safe(runner, target, say)
+            continue
         if live is None:
             if after_failed_apply:
                 say(f"  {target.full_name}: not created by the failed apply; nothing to bind.")

@@ -750,8 +750,9 @@ class FakeDatabricks:
     def fail_route(
         self, method: str, path_part: str, status: int = 400, message: str = "injected failure"
     ) -> None:
-        """Answer every later ``method`` request whose path holds ``path_part`` with an error
-        (a 4xx, which the provider does not retry), to make a ``tofu apply`` fail part way."""
+        """Answer every later ``method`` request whose path matches the regex ``path_part`` with
+        an error (a 4xx, which the provider does not retry), to make a ``tofu apply`` fail part
+        way, or (a 429 or 503) to make one read fail."""
         self.failing_routes.append((method, path_part, status, message))
 
     def function_in_use(self, full_name: str) -> bool:
@@ -813,7 +814,7 @@ class FakeDatabricks:
         self, method: str, path: str, query: Dict[str, List[str]], body: Dict[str, Any]
     ) -> Tuple[int, Any]:
         for fail_method, fail_path, status, message in self.failing_routes:
-            if method == fail_method and fail_path in path:
+            if method == fail_method and re.search(fail_path, path):
                 return _err(status, "INVALID_PARAMETER_VALUE", message)
         for m, rx, fn in self.routes:
             if m == method:
