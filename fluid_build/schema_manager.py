@@ -703,6 +703,8 @@ class FluidSchemaManager:
             if JSONSCHEMA_AVAILABLE and "$schema" in schema:
                 # Use JSON Schema validation
                 is_valid = self._validate_with_jsonschema(contract, schema, result, locate)
+                if is_valid:
+                    is_valid = self._validate_managed_streaming(contract, result)
             else:
                 # Fallback to a minimal required-field check only when the
                 # jsonschema library is unavailable (jsonschema is a hard
@@ -721,6 +723,32 @@ class FluidSchemaManager:
 
         result.validation_time = time.time() - start_time
         return result
+
+    def _validate_managed_streaming(
+        self, contract: Dict[str, Any], result: ValidationResult
+    ) -> bool:
+        """Typed nested columns and the managed Flink lane: checks of a whole contract.
+
+        Not part of :meth:`_validate_with_jsonschema`, which ``fluid validate
+        --fragment`` also runs on a fragment, and a fragment can be a list or a
+        string.
+        """
+        from fluid_build.streaming.compiler import validation_errors, validation_warnings
+        from fluid_build.streaming.types import parse_type
+
+        before = len(result.errors)
+        for expose in contract.get("exposes") or []:
+            for column in (expose.get("contract") or {}).get("schema") or []:
+                if {"fields", "element", "key", "value"} & column.keys():
+                    try:
+                        parse_type(column, path=column["name"])
+                    except ValueError as exc:
+                        result.add_error(str(exc))
+        for message in validation_errors(contract):
+            result.add_error(message)
+        for message in validation_warnings(contract):
+            result.add_warning(message)
+        return len(result.errors) == before
 
     def _validate_with_jsonschema(
         self,
@@ -744,21 +772,7 @@ class FluidSchemaManager:
             for error in errors:
                 result.add_error(f"{_error_path(error, locate)}: {format_schema_error(error)}")
 
-            if not errors:
-                from fluid_build.streaming.compiler import validation_errors
-                from fluid_build.streaming.types import parse_type
-
-                for expose in contract.get("exposes") or []:
-                    for column in (expose.get("contract") or {}).get("schema") or []:
-                        if {"fields", "element", "key", "value"} & column.keys():
-                            try:
-                                parse_type(column, path=column["name"])
-                            except ValueError as exc:
-                                result.add_error(str(exc))
-                for message in validation_errors(contract):
-                    result.add_error(message)
-
-            return not result.errors
+            return len(errors) == 0
 
         except Exception as e:
             result.add_error(f"JSON Schema validation error: {str(e)}")

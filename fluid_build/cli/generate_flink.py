@@ -1,3 +1,17 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Generate reviewable, deterministic Flink SQL and operator resources."""
 
 from __future__ import annotations
@@ -23,7 +37,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     from fluid_build.cli.console import cprint
     from fluid_build.cli.plan import _gate_contract_for_plan_or_apply
     from fluid_build.cli.security import validate_cli_path
-    from fluid_build.streaming.compiler import compile_contract
+    from fluid_build.streaming.compiler import compile_contract, validation_warnings
 
     source = validate_cli_path(args.contract, mode="read", file_type="contract")
     output = validate_cli_path(args.out, mode="write", must_exist=False, file_type="output")
@@ -31,11 +45,18 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     _gate_contract_for_plan_or_apply(contract, logger, command="plan")
     artifacts = compile_contract(contract)
     if not artifacts:
+        # An older contract that already set parameters.flink.management is told
+        # why its schema keeps the job external, not to opt in again.
+        reasons = validation_warnings(contract)
         raise CLIError(
             1,
             "generate_flink_external",
             {
-                "error": "No managed Flink build; opt in with properties.parameters.flink",
+                "error": (
+                    reasons[0]
+                    if reasons
+                    else "No managed Flink build; opt in with properties.parameters.flink"
+                ),
             },
         )
     output = Path(output)

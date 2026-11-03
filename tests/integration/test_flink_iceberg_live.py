@@ -1,3 +1,17 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Actual generated Flink job -> nested Iceberg rows, including task recovery.
 
 Run explicitly with FLUID_TEST_FLINK_ICEBERG=1 after building the example image.
@@ -240,7 +254,10 @@ for row in rows:
         row["attributes"] = dict(row["attributes"])
 assert sorted(rows, key=lambda x: x["event_id"]) == sorted(expected, key=lambda x: x["event_id"])
 print("PASS: 200 unique records; five nested structs, nulls, empty containers, exact decimals; task recovery")
-""".replace("EXPECTED_EVENTS", repr(json.dumps(events + more)))
+"""
+        # A separate statement: black 24 (ci.yml) and black 26 (the dev extra)
+        # disagree on how to wrap a call made on a triple-quoted string.
+        readback = readback.replace("EXPECTED_EVENTS", repr(json.dumps(events + more)))
         network = project + "_default"
         result = subprocess.run(
             [

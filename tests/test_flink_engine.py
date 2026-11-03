@@ -40,31 +40,10 @@ import yaml
 
 from fluid_build.build_runners.base import is_embedded_sql_build, run_builds_from_args
 from fluid_build.util.contract import is_externally_run_build
+from tests._flink_support import flink_build as _flink_build
+from tests._flink_support import flink_contract as _contract
 
 SCHEMAS = Path(__file__).resolve().parent.parent / "fluid_build" / "schemas"
-
-FLINK_SQL = (
-    "INSERT INTO service_instances_full\n"
-    "SELECT i.id, i.status, v.location\n"
-    "FROM service_instances i\n"
-    "JOIN inventory v ON i.id = v.instance_id\n"
-)
-
-
-def _flink_build(platform: str = "kubernetes", *, engine: str = "flink") -> Dict[str, Any]:
-    build: Dict[str, Any] = {
-        "id": "reconcile",
-        "engine": engine,
-        "pattern": "embedded-logic",
-        "properties": {
-            "language": "flink_sql",
-            "sql": FLINK_SQL,
-            "parameters": {"parallelism": 2},
-        },
-    }
-    if platform:
-        build["execution"] = {"runtime": {"platform": platform}}
-    return build
 
 
 #: ``engine: flink`` (0.7.6), and the 0.7.5 way to declare the same job.
@@ -72,43 +51,6 @@ SHAPES = [
     pytest.param(("0.7.6", "flink"), id="engine-flink"),
     pytest.param(("0.7.5", "sql"), id="language-flink-sql"),
 ]
-
-
-def _contract(fluid_version: str = "0.7.6", engine: str = "flink") -> Dict[str, Any]:
-    contract = {
-        "fluidVersion": fluid_version,
-        "kind": "DataProduct",
-        "id": "network.service-instances-full",
-        "name": "Service instances (reconciled)",
-        "metadata": {"owner": {"team": "data-engineering"}},
-        "consumes": [
-            {
-                "productId": "network.service-instances",
-                "exposeId": "service_instances",
-                "versionConstraint": "^1.0",
-            }
-        ],
-        "builds": [_flink_build(engine=engine)],
-        "exposes": [
-            {
-                "exposeId": "service_instances_full",
-                "kind": "topic",
-                "binding": {
-                    "platform": "kafka",
-                    "format": "kafka_topic",
-                    "location": {"topic": "network.service-instances-full"},
-                },
-                "contract": {
-                    "schema": [
-                        {"name": "id", "type": "string"},
-                        {"name": "status", "type": "string"},
-                        {"name": "location", "type": "string"},
-                    ]
-                },
-            }
-        ],
-    }
-    return contract
 
 
 def _errors(version: str, contract: Dict[str, Any]) -> list:
