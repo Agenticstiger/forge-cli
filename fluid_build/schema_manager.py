@@ -43,6 +43,7 @@ from .errors import ValidationError as FluidValidationError
 # anywhere in this module — and RefResolver is deprecated, so the day a
 # jsonschema release drops it this ImportError would have silently disabled
 # schema validation across the CLI. Never name more in a probe than you use.
+_JSONSCHEMA_IMPORT_ERROR: Optional[ImportError] = None
 try:
     import jsonschema
 
@@ -65,6 +66,9 @@ _UNQUOTED_VALUE_PATHS = frozenset({"catalogAuth"})
 
 #: Validators whose jsonschema message names only keys, never a value.
 _KEY_ONLY_VALIDATORS = frozenset({"required", "additionalProperties"})
+
+#: Ends a ``pattern`` error when the value's final line break is all that fails it.
+LINE_BREAK_HINT = " (it ends in a line break, which a YAML | or > block keeps and |- or >- drops)"
 
 
 def format_schema_error(error: Any) -> str:
@@ -175,7 +179,7 @@ def _pattern_keyword(validator: Any, pattern: str, instance: Any, schema: Any) -
         return
     message = f"{instance!r} does not match {pattern!r}"
     if re.search(pattern, instance):  # only the final line break fails
-        message += " (it ends in a line break, which a YAML | or > block keeps and |- or >- drops)"
+        message += LINE_BREAK_HINT
     yield jsonschema.ValidationError(message)
 
 
@@ -189,7 +193,9 @@ def schema_validator(schema: Mapping[str, Any], default: Any = None) -> Any:
     ``pattern`` ends at the end of the value (:func:`_end_anchored`). Validate
     against a FLUID schema, or a vendored or plugin one, through this, never
     ``validator_for`` directly. ``default`` is the dialect of a schema that
-    declares none, jsonschema's newest when not given.
+    declares none, jsonschema's newest when not given. Raises ``ImportError``
+    when jsonschema could not be imported; check :data:`JSONSCHEMA_AVAILABLE`
+    first to skip instead.
 
     The keyword is replaced the way check-jsonschema replaces it, with
     ``jsonschema.validators.extend``. Two places keep jsonschema's own
@@ -201,6 +207,8 @@ def schema_validator(schema: Mapping[str, Any], default: Any = None) -> Any:
     ``patternProperties``, with ``^[a-z]{2}$`` language codes. A test fails if
     either changes (``_KEY_PATTERNS`` in tests/test_schema_pattern_end_anchor.py).
     """
+    if not JSONSCHEMA_AVAILABLE:
+        raise ImportError("jsonschema is not available") from _JSONSCHEMA_IMPORT_ERROR
     if default is None:
         validator_class = jsonschema.validators.validator_for(schema)
     else:

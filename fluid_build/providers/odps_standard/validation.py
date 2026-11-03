@@ -75,7 +75,8 @@ def schema_for_document(odps: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def validate(odps: Mapping[str, Any], schema: Mapping[str, Any]) -> None:
-    """Validate an ODPS product against the vendored v1.0.0 JSON Schema."""
+    """Validate an ODPS product against ``schema``, the vendored one for its
+    ``apiVersion`` (:func:`schema_for_document`)."""
     try:
         import jsonschema
     except ImportError:

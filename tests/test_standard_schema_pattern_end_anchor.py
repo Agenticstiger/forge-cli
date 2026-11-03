@@ -29,16 +29,18 @@ they would have to start using for a check to leave the rewrite.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterator
 
 import jsonschema
 import pytest
 import yaml
 
+import fluid_build
 import fluid_build.extension_schemas as extension_schemas
-from fluid_build.forge.core.artifact_validators import validate_odcs
+from fluid_build.forge.core.artifact_validators import validate_odcs, validate_opds
 from fluid_build.forge_datamodel.emit import osi_sidecar
 from fluid_build.providers.base import ProviderError
 from fluid_build.providers.odcs.validation import collect_errors, load_schema
@@ -61,10 +63,10 @@ def _odcs(table_id: str) -> Dict[str, Any]:
     return {**_ODCS_BASE, "schema": [{"id": table_id, "name": "orders", "logicalType": "object"}]}
 
 
-def _odcs_yaml(block: str) -> str:
+def _odcs_yaml(block: str, table_id: str = "t1") -> str:
     """An ODCS document whose ``schema[0].id`` is a YAML block scalar: ``|`` or ``|-``."""
     body = yaml.safe_dump(_ODCS_BASE)
-    return f"{body}schema:\n- id: {block}\n    t1\n  name: orders\n  logicalType: object\n"
+    return f"{body}schema:\n- id: {block}\n    {table_id}\n  name: orders\n  logicalType: object\n"
 
 
 # ── ODCS: fluid odcs validate, fluid validate-artifacts ─────────────────────
@@ -94,6 +96,21 @@ def test_fluid_odcs_validate_refuses_a_block_scalar_table_id(tmp_path: Path, cap
     text = capsys.readouterr().out
     assert rc == 1, text
     assert "schema.0.id: 't1\\n' does not match" in text, text
+
+
+def test_fluid_odcs_validate_keeps_the_hint_whole(tmp_path: Path, capsys: Any) -> None:
+    """The command cuts each message to 120 characters. Cut inside the hint, a long id's
+    message ended ``... block keeps and |``, which reads as advice to use ``|``."""
+    from fluid_build.cli import main
+
+    path = tmp_path / "orders.odcs.yaml"
+    path.write_text(_odcs_yaml("|", "customer_orders_v1"), encoding="utf-8")
+
+    rc = main(["odcs", "validate", str(path), "--no-vowl"])
+
+    text = " ".join(capsys.readouterr().out.split())  # undo the console's line wrapping
+    assert rc == 1, text
+    assert f"'customer_orders_v1\\n' does not match '^[A-Za-z0-9_-]+$'{_LINE_BREAK_HINT}" in text
 
 
 def test_validate_artifacts_refuses_a_block_scalar_table_id() -> None:
@@ -133,6 +150,17 @@ def test_opds_validation_reads_a_pattern_as_ecma_does(monkeypatch: Any) -> None:
     assert errors == [f"name: 'orders\\n' does not match '^[a-z]+$'{_LINE_BREAK_HINT}"]
 
 
+def test_an_opds_schema_that_declares_no_dialect_is_2020_12(monkeypatch: Any) -> None:
+    """What the check pinned before. Draft 7 has no ``dependentRequired`` and would
+    pass this document."""
+    schema = {"type": "object", "dependentRequired": {"a": ["b"]}}
+    monkeypatch.setitem(opds_validator._SCHEMA_CACHE, "0.0-test", schema)
+
+    valid, errors, _ = opds_validator.validate_against_opds_schema({"a": 1}, "0.0-test")
+
+    assert (valid, errors) == (False, ["root: 'b' is a dependency of 'a'"])
+
+
 def test_ossie_document_validation_reads_a_pattern_as_ecma_does(monkeypatch: Any) -> None:
     monkeypatch.setattr(osi_sidecar, "_load_ossie_schema", lambda: _NAME_SCHEMA)
     assert osi_sidecar.validate_osi_document({"name": "orders"}) == []
@@ -140,6 +168,18 @@ def test_ossie_document_validation_reads_a_pattern_as_ecma_does(monkeypatch: Any
     issues = osi_sidecar.validate_osi_document({"name": "orders\n"})
 
     assert issues == [f"name: 'orders\\n' does not match '^[a-z]+$'{_LINE_BREAK_HINT}"]
+
+
+def test_without_jsonschema_each_check_says_it_is_missing(monkeypatch: Any) -> None:
+    """The checks read the flag ``schema_validator`` needs. A jsonschema that is found
+    but fails to import is reported as missing, not as ``NameError: jsonschema``."""
+    monkeypatch.setattr("fluid_build.schema_manager.JSONSCHEMA_AVAILABLE", False)
+
+    assert [i.code for i in validate_odcs("odcs/o.odcs.yaml", b"id: x")] == ["ODCS-LIB-MISSING"]
+    assert [i.code for i in validate_opds("opds/o.opds.json", b"{}")] == ["OPDS-LIB-MISSING"]
+    assert collect_errors(_odcs("t1\n"), {}) == []
+    with pytest.raises(ImportError, match="jsonschema is not available"):
+        osi_sidecar.validate_osi_document({})
 
 
 # ── plugin extension blocks ─────────────────────────────────────────────────
@@ -195,3 +235,30 @@ def test_an_extension_schema_that_declares_no_dialect_is_draft_07(monkeypatch: A
     kept = {"output": "x", "patterns": []}
     assert _assemble(monkeypatch, schema, kept) == {"x": kept}
     assert _assemble(monkeypatch, schema, {"output": "x"}) == {}
+
+
+# ── one way to build a validator ────────────────────────────────────────────
+
+
+def _validator_builds(path: Path) -> Iterator[str]:
+    """Calls in ``path`` that build a jsonschema validator themselves."""
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name == "validator_for" or re.fullmatch(r"Draft\d+Validator", name):
+            yield f"{path.name}:{node.lineno}: {name}()"
+        elif name == "validate" and ast.unparse(func) == "jsonschema.validate":
+            if all(k.arg != "cls" for k in node.keywords):
+                yield f"{path.name}:{node.lineno}: jsonschema.validate()"
+
+
+def test_every_validator_is_built_by_schema_validator() -> None:
+    """A check that builds its own validator reads ``$`` as Python does again; #799 and
+    this change each found such checks one at a time. Give ``schema_validator`` the
+    dialect class as ``default=`` instead of building it."""
+    package = Path(fluid_build.__file__).parent
+    paths = [p for p in sorted(package.rglob("*.py")) if p != package / "schema_manager.py"]
+    assert len(paths) > 500, len(paths)  # the glob found the package
+    assert [build for path in paths for build in _validator_builds(path)] == []

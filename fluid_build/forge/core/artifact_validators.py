@@ -36,7 +36,6 @@ dashboard, one mental model across stages 2 and 4.
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import logging
 import shutil
@@ -111,10 +110,6 @@ def _load_schema(path: Path) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Soft-import helpers
 # ---------------------------------------------------------------------------
-
-
-def _jsonschema_available() -> bool:
-    return importlib.util.find_spec("jsonschema") is not None
 
 
 def _conftest_available() -> bool:
@@ -401,7 +396,9 @@ def validate_opds(path: str, content: bytes) -> List[ValidationIssue]:
             )
         ]
 
-    if not _jsonschema_available():
+    from fluid_build.schema_manager import JSONSCHEMA_AVAILABLE
+
+    if not JSONSCHEMA_AVAILABLE:
         return [
             ValidationIssue(
                 file=path,
