@@ -37,10 +37,10 @@ class ResourceValidator:
     """Validates AWS resource configurations before execution."""
 
     # AWS naming rules
-    S3_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$")
-    GLUE_DATABASE_PATTERN = re.compile(r"^[a-z0-9_]+$")
-    GLUE_TABLE_PATTERN = re.compile(r"^[a-z0-9_]+$")
-    LAMBDA_FUNCTION_PATTERN = re.compile(r"^[a-zA-Z0-9\-_]+$")
+    S3_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]\Z")
+    GLUE_DATABASE_PATTERN = re.compile(r"^[a-z0-9_]+\Z")
+    GLUE_TABLE_PATTERN = re.compile(r"^[a-z0-9_]+\Z")
+    LAMBDA_FUNCTION_PATTERN = re.compile(r"^[a-zA-Z0-9\-_]+\Z")
 
     # AWS service quotas (defaults - can be increased)
     DEFAULT_QUOTAS = {
@@ -69,9 +69,10 @@ class ResourceValidator:
 
         Rules:
         - 3-63 characters
-        - Lowercase letters, numbers, hyphens
+        - Lowercase letters, numbers, dots, hyphens (a dot-separated name is a
+          legal bucket name)
         - Must start and end with letter or number
-        - No consecutive hyphens
+        - No consecutive dots, no dot next to a hyphen, no consecutive hyphens
         - No IP address format
 
         Args:
@@ -91,13 +92,16 @@ class ResourceValidator:
 
         if not self.S3_BUCKET_PATTERN.match(bucket):
             return False, (
-                f"Bucket name '{bucket}' is invalid. "
-                "Must contain only lowercase letters, numbers, and hyphens. "
+                f"Bucket name {bucket!r} is invalid. "
+                "Must contain only lowercase letters, numbers, dots, and hyphens. "
                 "Must start and end with letter or number."
             )
 
         if "--" in bucket:
             return False, "Bucket name cannot contain consecutive hyphens"
+
+        if ".." in bucket or ".-" in bucket or "-." in bucket:
+            return False, "Bucket name cannot contain '..', '.-' or '-.'"
 
         # Check for IP address format (e.g., 192.168.0.1)
         if re.match(r"^\d+\.\d+\.\d+\.\d+$", bucket):
@@ -135,7 +139,7 @@ class ResourceValidator:
 
         if not self.GLUE_DATABASE_PATTERN.match(database):
             return False, (
-                f"Database name '{database}' is invalid. "
+                f"Database name {database!r} is invalid. "
                 "Must contain only lowercase letters, numbers, and underscores."
             )
 
@@ -164,7 +168,7 @@ class ResourceValidator:
 
         if not self.GLUE_TABLE_PATTERN.match(table):
             return False, (
-                f"Table name '{table}' is invalid. "
+                f"Table name {table!r} is invalid. "
                 "Must contain only lowercase letters, numbers, and underscores."
             )
 
@@ -193,7 +197,7 @@ class ResourceValidator:
 
         if not self.LAMBDA_FUNCTION_PATTERN.match(function):
             return False, (
-                f"Function name '{function}' is invalid. "
+                f"Function name {function!r} is invalid. "
                 "Must contain only letters, numbers, hyphens, and underscores."
             )
 

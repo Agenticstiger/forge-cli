@@ -38,6 +38,7 @@ from fluid_build.api.changelog_rules import (
     diff_sovereignty,
 )
 from fluid_build.api.changelog_types import Change, ChangelogReport
+from tests.test_schema_076_preview_additions import _base_contract
 
 FIXTURES = Path(__file__).parent / "fixtures" / "changelog"
 
@@ -640,6 +641,271 @@ def test_pii_removed_is_info_signal():
     pii = [c for c in changes if c.kind == "column_pii_removed"]
     assert len(pii) == 1
     assert pii[0].severity == "info"
+
+
+# ---------------------------------------------------------------------------
+# 0.7.x contracts keep their columns under exposes[].contract.schema
+# ---------------------------------------------------------------------------
+
+
+def _contract_076(columns):
+    """The valid 0.7.6 contract the schema tests share, with ``columns`` on its one expose.
+
+    0.7.6 closes ``$defs.column``: it has no ``nullable``, ``primaryKey`` or
+    ``pii`` key, and NOT NULL is spelled ``required: true``.
+    """
+    contract = _base_contract("0.7.6")
+    contract["exposes"][0]["contract"]["schema"] = columns
+    return contract
+
+
+_ID_COLUMN = {"name": "id", "type": "string", "required": True}
+
+
+def test_076_fixture_validates_against_the_bundled_schema():
+    """The shape every test below diffs: if 0.7.6 stops accepting it they prove nothing."""
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    columns = [_ID_COLUMN, {"name": "note", "type": "string", "required": False}]
+    result = FluidSchemaManager().validate_contract(
+        _contract_076(columns), schema_version="0.7.6", offline_only=True
+    )
+    assert result.is_valid, result.errors
+
+
+def test_076_identical_contracts_have_no_changes():
+    assert compare_contracts(_contract_076([_ID_COLUMN]), _contract_076([_ID_COLUMN])).total == 0
+
+
+@pytest.mark.parametrize(
+    "column, severity",
+    [
+        pytest.param({"name": "note", "type": "string"}, "non_breaking", id="plain"),
+        pytest.param(
+            {"name": "note", "type": "string", "required": False},
+            "non_breaking",
+            id="required-false",
+        ),
+        pytest.param(
+            {"name": "note", "type": "string", "required": True}, "breaking", id="required-true"
+        ),
+    ],
+)
+def test_076_added_column_severity_follows_required(column, severity):
+    report = compare_contracts(_contract_076([_ID_COLUMN]), _contract_076([_ID_COLUMN, column]))
+
+    assert report.total == 1
+    (change,) = getattr(report, severity)
+    assert change.kind == "column_added"
+    assert change.path == "exposes[0].contract.schema.note"
+    assert ("NOT NULL" in change.description) == (severity == "breaking")
+
+
+def test_076_column_removed_is_breaking():
+    old = _contract_076([_ID_COLUMN, {"name": "note", "type": "string"}])
+
+    report = compare_contracts(old, _contract_076([_ID_COLUMN]))
+
+    assert report.total == 1
+    (change,) = report.breaking
+    assert change.kind == "column_removed"
+    assert change.path == "exposes[0].contract.schema.note"
+
+
+@pytest.mark.parametrize(
+    "old_type, new_type, severity, kind",
+    [
+        ("string", "int", "breaking", "column_type_changed"),
+        ("bigint", "int", "breaking", "column_type_changed"),
+        ("int", "bigint", "non_breaking", "column_type_widened"),
+        ("decimal(10,2)", "decimal(20,2)", "non_breaking", "column_type_widened"),
+    ],
+)
+def test_076_column_type_change_is_classified(old_type, new_type, severity, kind):
+    old = _contract_076([{"name": "id", "type": old_type}])
+    new = _contract_076([{"name": "id", "type": new_type}])
+
+    report = compare_contracts(old, new)
+
+    assert report.total == 1
+    (change,) = getattr(report, severity)
+    assert change.kind == kind
+    assert change.path == "exposes[0].contract.schema.id.type"
+    assert (change.before, change.after) == (old_type.upper(), new_type.upper())
+
+
+@pytest.mark.parametrize(
+    "old_required, new_required, severity, kind",
+    [
+        (False, True, "breaking", "column_nullable_tightened"),
+        (True, False, "non_breaking", "column_nullable_loosened"),
+    ],
+)
+def test_076_required_flip_is_a_nullability_change(old_required, new_required, severity, kind):
+    old = _contract_076([{"name": "id", "type": "string", "required": old_required}])
+    new = _contract_076([{"name": "id", "type": "string", "required": new_required}])
+
+    report = compare_contracts(old, new)
+
+    assert report.total == 1
+    (change,) = getattr(report, severity)
+    assert change.kind == kind
+    assert change.path == "exposes[0].contract.schema.id.required"
+    assert (change.before, change.after) == (not old_required, not new_required)
+
+
+@pytest.mark.parametrize(
+    "column, severity",
+    [
+        pytest.param({}, "non_breaking", id="neither"),
+        pytest.param({"nullable": True}, "non_breaking", id="nullable-true"),
+        pytest.param({"nullable": False}, "breaking", id="nullable-false"),
+        pytest.param({"required": False}, "non_breaking", id="required-false"),
+        pytest.param({"required": True}, "breaking", id="required-true"),
+        pytest.param({"required": 1}, "breaking", id="required-truthy"),
+        pytest.param(
+            {"required": True, "nullable": True}, "breaking", id="required-beats-nullable"
+        ),
+        pytest.param(
+            {"required": False, "nullable": False}, "breaking", id="nullable-false-stands"
+        ),
+    ],
+)
+def test_a_column_is_not_null_when_required_or_nullable_false_says_so(column, severity):
+    """The emitters read ``required`` alone, so a column that declares both and contradicts
+    itself is read as the stricter of the two, never as nullable."""
+    old = {"id": "x", "schema": []}
+    new = {"id": "x", "schema": [{"name": "n", "type": "INT", **column}]}
+
+    changes = diff_columns(old, new, "x", 0)
+
+    assert [(c.kind, c.severity) for c in changes] == [("column_added", severity)]
+
+
+@pytest.mark.parametrize(
+    "old_column, new_column, primary_key, kind, key",
+    [
+        ({"nullable": True}, {"nullable": False}, False, "column_nullable_tightened", "nullable"),
+        ({"nullable": False}, {"nullable": True}, False, "column_nullable_loosened", "nullable"),
+        ({}, {"required": True}, False, "column_nullable_tightened", "required"),
+        ({"required": True}, {}, False, "column_nullable_loosened", "required"),
+        # Spelled differently on the two sides: the new column decides.
+        ({"nullable": False}, {"required": False}, False, "column_nullable_loosened", "required"),
+        ({"required": True}, {"nullable": True}, False, "column_nullable_loosened", "nullable"),
+        ({"nullable": False}, {"nullable": True}, True, "primary_key_nullable", "nullable"),
+        ({"required": True}, {"required": False}, True, "primary_key_nullable", "required"),
+    ],
+)
+def test_a_nullability_change_is_reported_at_the_key_the_contract_uses(
+    old_column, new_column, primary_key, kind, key
+):
+    def expose(column):
+        columns = [{"name": "n", "type": "INT", **column}]
+        return {"id": "x", "schema": columns, **({"primaryKey": ["n"]} if primary_key else {})}
+
+    changes = diff_columns(expose(old_column), expose(new_column), "x", 0)
+
+    assert [(c.kind, c.path) for c in changes] == [(kind, f"exposes[0].schema.n.{key}")]
+
+
+def test_nested_field_added_required_is_breaking():
+    old = {
+        "id": "x",
+        "schema": [
+            {"name": "address", "type": "STRUCT", "fields": [{"name": "street", "type": "STRING"}]}
+        ],
+    }
+    new = {
+        "id": "x",
+        "schema": [
+            {
+                "name": "address",
+                "type": "STRUCT",
+                "fields": [
+                    {"name": "street", "type": "STRING"},
+                    {"name": "country", "type": "STRING", "required": True},
+                ],
+            }
+        ],
+    }
+
+    changes = diff_columns(old, new, "x", 0)
+
+    assert [(c.kind, c.severity) for c in changes] == [("nested_field_added", "breaking")]
+
+
+def test_flat_schema_wins_when_an_expose_carries_both_layouts():
+    a, b, c = (
+        {"name": "a", "type": "STRING"},
+        {"name": "b", "type": "STRING"},
+        {"name": "c", "type": "STRING"},
+    )
+    old = {"id": "x", "schema": [a], "contract": {"schema": [a, b]}}
+    new = {"id": "x", "schema": [a, c], "contract": {"schema": [a, b]}}
+
+    changes = diff_columns(old, new, "x", 0)
+
+    assert [(ch.kind, ch.path) for ch in changes] == [("column_added", "exposes[0].schema.c")]
+
+
+def _contract_flat(columns):
+    """``_contract_076``'s pre-0.7 twin: columns at ``exposes[].schema``, NOT NULL as ``nullable``."""
+    contract = _contract_076([])
+    contract["exposes"] = [{"id": "orders", "schema": columns}]
+    return contract
+
+
+def test_moving_columns_from_schema_to_contract_schema_is_not_a_change():
+    """A pre-0.7 baseline against its 0.7.x rewrite: ``nullable: false`` is ``required: true``."""
+    old = _contract_flat([{"name": "id", "type": "STRING", "nullable": False}])
+    new = _contract_076([{"name": "id", "type": "string", "required": True}])
+
+    assert compare_contracts(old, new).total == 0
+
+
+def test_a_column_dropped_while_moving_to_contract_schema_is_still_found():
+    old = _contract_flat([{"name": "id", "type": "STRING"}, {"name": "note", "type": "STRING"}])
+    new = _contract_076([{"name": "id", "type": "string"}])
+
+    report = compare_contracts(old, new)
+
+    assert report.total == 1
+    assert [(c.kind, c.path) for c in report.breaking] == [
+        ("column_removed", "exposes[0].contract.schema.note")
+    ]
+
+
+@pytest.mark.parametrize("fail_on_breaking, expected_rc", [(True, 1), (False, 0)])
+def test_cli_diff_baseline_sees_a_required_column_added_to_a_076_contract(
+    tmp_path, fail_on_breaking, expected_rc
+):
+    """``--fail-on-breaking`` is the exit code CI gates on; it must see 0.7.x columns."""
+    import yaml
+
+    from fluid_build.cli import diff as diff_mod
+
+    old = tmp_path / "old.fluid.yaml"
+    new = tmp_path / "new.fluid.yaml"
+    old.write_text(yaml.safe_dump(_contract_076([_ID_COLUMN])))
+    added = {"name": "region", "type": "string", "required": True}
+    new.write_text(yaml.safe_dump(_contract_076([_ID_COLUMN, added])))
+    out = tmp_path / "diff.json"
+    args = argparse.Namespace(
+        contract=str(new),
+        baseline=str(old),
+        env=None,
+        state=None,
+        out=str(out),
+        exit_on_drift=False,
+        fail_on_breaking=fail_on_breaking,
+        format="json",
+        cmd="diff",
+    )
+
+    rc = diff_mod.run(args, logging.getLogger("test.diff"))
+
+    assert rc == expected_rc
+    assert [c["kind"] for c in json.loads(out.read_text())["breaking"]] == ["column_added"]
 
 
 # ---------------------------------------------------------------------------

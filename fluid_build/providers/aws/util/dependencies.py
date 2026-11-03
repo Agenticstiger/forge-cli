@@ -31,7 +31,12 @@ class DependencyGraph:
 
     def __init__(self):
         """Initialize empty dependency graph."""
-        self.nodes: Set[str] = set()
+        # Insertion-ordered (a dict, not a set): ``topological_sort`` walks it, so a
+        # set made the action order, and with it the emitted module, differ between
+        # runs. The IaC emitter interpolates a Lambda's attributes only when the
+        # function was emitted first, so a schedule or permission planned for it
+        # came out as a literal ARN or a reference depending on the hash seed.
+        self.nodes: Dict[str, None] = {}
         self.edges: Dict[str, Set[str]] = defaultdict(set)  # node -> dependencies
         self.action_map: Dict[str, Dict[str, Any]] = {}
 
@@ -46,7 +51,7 @@ class DependencyGraph:
             Action ID
         """
         action_id = action.get("id", self._generate_id(action))
-        self.nodes.add(action_id)
+        self.nodes[action_id] = None
         self.action_map[action_id] = action
         return action_id
 

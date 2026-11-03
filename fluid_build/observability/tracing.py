@@ -33,8 +33,9 @@ are optional deps. When they're not installed OR when
 ``OTEL_EXPORTER_OTLP_ENDPOINT`` is unset, :func:`traced_stage` returns
 the wrapped function unchanged — the decorator is a no-op. This lets
 teams that don't want OTEL opt out by simply not setting the env var;
-teams that want it install via ``data-product-forge[observability]``
-and point the env var at their collector.
+teams that want it run ``pip install opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http`` and point the env var at their
+collector.
 
 **Security note:** span attributes are filtered through the existing
 :class:`fluid_build.observability.secret_redactor.SecretRedactingFilter`

@@ -40,6 +40,13 @@ def _contract(schema, *, name="Orders"):
     }
 
 
+def _contract_076(columns, *, name="Orders"):
+    """The 0.7.x layout: columns under ``exposes[].contract.schema``, NOT NULL as ``required``."""
+    contract = _contract([], name=name)
+    contract["exposes"] = [{"exposeId": "main", "kind": "table", "contract": {"schema": columns}}]
+    return contract
+
+
 @pytest.fixture()
 def record_console():
     rich_console = pytest.importorskip("rich.console")
@@ -97,3 +104,25 @@ def test_never_raises_on_garbage_input(record_console):
     """The presenter is advisory and must never crash the authoring flow."""
     assert render_refine_diff("not-a-mapping", 12345, console=record_console) is False
     assert render_refine_diff({}, {}, console=record_console) is False
+
+
+@pytest.mark.parametrize(
+    "extra_in, shown",
+    [
+        pytest.param("new", ("amount", "not null"), id="required-column-added"),
+        pytest.param("old", ("amount", "column_removed"), id="column-removed"),
+    ],
+)
+def test_076_changes_are_rendered_not_swallowed(record_console, extra_in, shown):
+    """A refine that adds or drops a column of a 0.7.x contract must not say 'No changes'."""
+    id_column = {"name": "id", "type": "string"}
+    amount = {"name": "amount", "type": "number", "required": True}
+    old = _contract_076([id_column] + ([amount] if extra_in == "old" else []))
+    new = _contract_076([id_column] + ([amount] if extra_in == "new" else []))
+
+    rendered = render_refine_diff(old, new, console=record_console)
+
+    out = record_console.export_text().lower()
+    assert rendered is True
+    assert "no changes" not in out
+    assert all(fragment in out for fragment in shown)

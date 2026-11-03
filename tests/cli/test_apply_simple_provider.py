@@ -125,6 +125,29 @@ def _refusal(contract: Dict[str, Any]) -> CLIError:
     return exc.value
 
 
+class TestRetiredRedshiftPlatform:
+    """``redshift`` stopped being a provider but is still a valid runtime platform;
+    it resolves to ``aws``, which the retired registry entry forwarded to."""
+
+    def test_a_redshift_runtime_build_beside_a_local_product_selects_aws(self) -> None:
+        contract = _contract(
+            [_expose("orders", "local")], [_sql("make_orders", ["orders"], platform="redshift")]
+        )
+        assert _simple_apply_provider(contract, LOG) == "aws"
+
+    def test_a_redshift_expose_selects_aws(self) -> None:
+        assert _simple_apply_provider(_contract([_expose("orders", "redshift")]), LOG) == "aws"
+
+    def test_plan_resolves_the_same_way(self) -> None:
+        from fluid_build.cli._common import resolve_provider_from_contract
+
+        contract = _contract(
+            [_expose("orders", "local")], [_sql("make_orders", ["orders"], platform="redshift")]
+        )
+        contract["exposes"][0]["binding"].pop("platform")
+        assert resolve_provider_from_contract(contract)[0] == "aws"
+
+
 class TestOutsideForgeCli:
     """A job that runs outside forge-cli, and what it writes, choose no provider."""
 

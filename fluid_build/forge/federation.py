@@ -236,6 +236,7 @@ _POLICY_WARNED: Set[Tuple[str, Tuple[str, ...]]] = set()
 # (``~/.cache/fluid/federation-git/<id>`` and the digest-cache file).
 # Constrain it to a conservative slug so a tampered manifest row can't
 # smuggle ``../`` traversal or absolute-path segments into those sinks.
+# Matched with ``fullmatch``: ``$`` also matches before a trailing newline.
 _WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
@@ -589,7 +590,7 @@ class FederatedWorkspace:
         # anything outside a conservative slug so a tampered manifest
         # row cannot smuggle ``../`` traversal or absolute segments into
         # those path sinks.
-        if not _WORKSPACE_ID_RE.match(ws_id):
+        if not _WORKSPACE_ID_RE.fullmatch(ws_id):
             raise ValueError(
                 f"federation workspace id {ws_id!r} is invalid: must match "
                 f"{_WORKSPACE_ID_RE.pattern} (alphanumerics, dot, dash, "

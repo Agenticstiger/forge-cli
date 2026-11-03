@@ -31,7 +31,7 @@ from fluid_build.util.contract import is_externally_run_build
 
 from ..util import warehouse as _warehouse
 from ..util.logging import format_event
-from ..util.names import normalize_database_name
+from ..util.names import EVENTBRIDGE_RULE_NAME, bounded_aws_name, normalize_database_name
 
 
 def _resolve_env_templates(value: str) -> str:
@@ -740,7 +740,10 @@ def _plan_scheduling(
                 {
                     "op": "events.ensure_schedule",
                     "id": "schedule_rule",
-                    "name": f"{contract.get('id', 'contract').replace('.', '-')}-schedule",
+                    "name": bounded_aws_name(
+                        f"{contract.get('id', 'contract').replace('.', '-')}-schedule",
+                        EVENTBRIDGE_RULE_NAME,
+                    ),
                     "schedule": eventbridge_schedule,
                     "description": f"Schedule for {contract.get('name')}",
                     "tags": _get_resource_tags(contract),

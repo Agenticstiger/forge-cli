@@ -44,7 +44,7 @@ import re
 # DOS-via-filename attacks. Crucially this excludes ``/``, ``\``, ``..``
 # (a leading dot is rejected) and any path separator, so a validated id
 # can never traverse out of the directory it is joined into.
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]{0,127}$")
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]{0,127}\Z")
 
 
 class IdentifierViolation(ValueError):
