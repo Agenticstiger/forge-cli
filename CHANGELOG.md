@@ -132,6 +132,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid diff --baseline` reported nothing for column changes in a 0.7.x contract.** It read
+  columns from `exposes[].schema`, but a 0.7.x contract keeps them in `exposes[].contract.schema`
+  (as does every `fluid init` template), so a removed column, a type change or a new NOT NULL
+  column was missed, `--fail-on-breaking` exited 0, and the `fluid forge --refine` preview said
+  "No changes vs the existing contract." It now reads `contract.schema` when `schema` is absent,
+  and a column is NOT NULL when `required` is true or `nullable` is `false`, for an added column
+  and for a change in nullability (a flat `schema` column that says only `required: true` was
+  nullable before). Contracts that used to diff clean can now report breaking changes (a removed
+  column, a type change that is not a widening, an added `required: true` column), so a pipeline
+  that runs `fluid diff --baseline --fail-on-breaking` can start exiting 1. A finding for a 0.7.x
+  column is reported at `exposes[N].contract.schema.<column>`, and a nullability one at its
+  `.required`. Still not compared in a 0.7.x contract: quality-rule severity and a column's
+  `sensitivity`. A 0.7.x primary key is not recognised either, so a key column that becomes
+  nullable is reported as non-breaking.
+
 - **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
   `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
   diagnostic (the summary, the resource address and the provider's detail) and says that OpenTofu
@@ -152,6 +167,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pip install fluid-build[...]`; they now name `data-product-forge` with the right extra, and a
   ratchet test keeps the wrong name out. `data-product-forge[mcp]` resolves as an empty alias.
   `fluid-build` on PyPI is now only an alias that installs `data-product-forge`.
+- **Two applies on the same S3 state could race.** The S3 backend was emitted without locking, so a
+  scheduled apply and a manual one (or an apply and a teardown) wrote the same state unguarded.
+  `tofu init` now gets `-backend-config=use_lockfile=true` for an S3 backend on OpenTofu 1.10 or
+  newer; the emitted module is unchanged. On an older OpenTofu a WARNING says the state is
+  unlocked. Upgrade note: `tofu plan` takes the lock too, so every role that runs plan,
+  `fluid apply --dry-run`, `fluid diff` or `fluid verify --state-drift` against S3 state needs
+  `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `<key>.tflock`, or sets
+  `FLUID_TOFU_S3_LOCKFILE=0`. A workdir kept from before the upgrade is re-initialised with
+  `-reconfigure` once, only when it recorded this same bucket, key and region. The opt-out also takes effect on a
+  workdir that already had locking on. A run killed hard can leave `<key>.tflock` behind;
+  `tofu force-unlock <ID>` in the workdir (the ID is in tofu's error) clears it. A run that
+  hits `FLUID_TOFU_TIMEOUT_SECONDS` is now interrupted (SIGINT) so tofu releases the lock, and
+  killed only if it ignores that for 30 seconds.
 - **A column type AWS Glue or BigQuery could not hold was written anyway, and `fluid validate
   --strict` passed.** The Glue emitter mapped 22 type names and turned every other one into
   `string`: 47 of the 79 types the schema admits, among them `smallint`, `tinyint`, `int2`,
@@ -240,6 +268,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dimension that reads the workspace's metastore summary for every table the module manages: it
   passes when the region matches the declaration, fails with the fix when it does not, and is
   skipped when the contract declares none.
+
+### Removed
+
+- **`redshift` and `datamesh-manager` are no longer providers.** Neither deployed anything as a
+  provider: `redshift` only forwarded to `aws`, and Data Mesh Manager is a catalog. `fluid providers` now lists `aws`, `databricks`, `gcp`, `local` and `snowflake`, plus any
+  third-party plugin. Redshift objects apply through the `aws` provider, and Data Mesh Manager
+  publishing is unchanged (`fluid publish --target datamesh-manager`, `fluid datamesh-manager`).
+  **Breaking (CLI surface):** `--provider redshift` and `--provider datamesh-manager` (and
+  `FLUID_PROVIDER`) are no longer accepted; they exit 2 with the replacement
+  (`--provider aws`, or `fluid publish --target datamesh-manager`) instead of a bare "unknown
+  provider". A contract's `redshift` build runtime or expose platform is served by `aws`, and plugins
+  cannot claim either retired name.
 
 ### Security
 

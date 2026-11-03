@@ -19,7 +19,8 @@ Surfaces:
   S3 / Glue / Athena / Lambda / EventBridge / Redshift.
 * :class:`RedshiftProvider` — owns Redshift's rollback DDL (DROP +
   CTAS) which is incompatible with the rest of AWS's S3 prefix-copy
-  semantics; registered under the ``"redshift"`` provider name.
+  semantics. Not a registered provider (retired as one, see
+  ``providers.RETIRED_PROVIDERS``); the rollback dispatch imports it directly.
 
 The legacy ``aws.py::AWSProvider`` (1601 LOC, registered as
 ``LegacyAWSProvider``) was deleted — its rollback methods migrated
@@ -33,8 +34,5 @@ from .provider import AwsProvider
 from .redshift_provider import RedshiftProvider
 
 register_provider("aws", AwsProvider)
-# Redshift dispatches by its own name so the rollback writer can route
-# DROP+CTAS DDL emission to a class with the right semantics.
-register_provider("redshift", RedshiftProvider)
 
 __all__ = ["AwsProvider", "RedshiftProvider"]

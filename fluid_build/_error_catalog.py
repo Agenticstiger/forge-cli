@@ -74,7 +74,7 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     # ── providers ──────────────────────────────────────────────────────────
     "provider_not_specified": (
         [
-            "Pass a provider: --provider local|gcp|snowflake|aws|azure",
+            "Pass a provider: --provider aws|databricks|gcp|local|snowflake",
             "Or set the FLUID_PROVIDER environment variable",
             "Run 'fluid providers' to list the available providers",
         ],
@@ -91,7 +91,14 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     "provider_unknown": (
         [
             "Run 'fluid providers' to see the available providers",
-            "Valid built-ins: local, gcp, snowflake, aws, azure",
+            "Valid built-ins: aws, databricks, gcp, local, snowflake",
+        ],
+        "providers",
+    ),
+    "provider_retired": (
+        [
+            "Run 'fluid providers' to see the available providers",
+            "CHANGELOG.md lists it under Removed, with its replacement",
         ],
         "providers",
     ),

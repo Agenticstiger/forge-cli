@@ -286,19 +286,15 @@ something is a deployment target:
 `--provider` also accepts `confluent`, for Kafka-side resources, and `auto`,
 which is the default and reads the target out of the contract's binding.
 
-**`fluid providers` prints a longer list, and it is a different thing.** It is
-the registry of everything that registers as a provider plugin, which includes
-publishers and a partly-landed emitter:
+**`fluid providers` prints these providers and any third-party plugins.** Two
+names that older releases listed are no longer providers (0.27.0):
 
 - `datamesh_manager` is a **publish** target, reached by
-  [`fluid publish`](https://agenticstiger.github.io/forge_docs/cli/datamesh-manager.html).
-  It receives a contract's metadata; it never provisions infrastructure.
-- `redshift` has an emitter in the tree but is **not selectable with
-  `--provider`** — `fluid generate iac --provider redshift` exits with
-  `invalid choice`. Treat it as unfinished rather than as a fourth cloud.
-
-Neither belongs in a list of places a data product can be deployed, and this
-README previously listed both as though they were.
+  [`fluid publish --target datamesh-manager`](https://agenticstiger.github.io/forge_docs/cli/datamesh-manager.html)
+  or `fluid datamesh-manager`. It receives a contract's metadata; it never
+  provisions infrastructure. `--provider datamesh-manager` exits 2 and says so.
+- `redshift` is part of the `aws` provider. `--provider redshift` exits 2 and
+  says to use `--provider aws`.
 
 That column is the set each emitter is capable of. Which resources a particular contract actually
 produces is visible before anything is applied: `fluid generate iac <contract>` writes the
