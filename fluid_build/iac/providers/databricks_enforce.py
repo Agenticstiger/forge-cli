@@ -859,34 +859,37 @@ def drop_orphan_functions(session: Session, targets: Sequence[Target], say: Say)
         ]
         mine = f"{where}.".lower()
         keep = {n[len(mine) :] for n in expected | bound if n.startswith(mine)}
-        dropped: List[str] = []
+        settled: List[str] = []
         for target in members:
             table = target.full_name.split(".")[2]
             for name in _orphans(names, table, columns.get(table.lower(), ()), keep):
-                if name in dropped:
-                    continue
-                full = f"{where}.{name}"
-                try:
-                    owner = str((read_function(client, full) or {}).get("owner") or "")
-                    me = session.identity
-                except Exception:  # noqa: BLE001 — unknown owner: leave it
-                    owner, me = "", ""
-                if not me or not owner_matches(owner, {me}):
-                    why = (
-                        f"owned by {owner}, not by the deploy identity"
-                        if owner
-                        else "owner unknown"
-                    )
-                    say(f"  left function {full}: {why}")
-                    dropped.append(name)  # said once; not tried again for another table
-                    continue
-                try:
-                    session.runner.run(f"DROP FUNCTION IF EXISTS {quote_table(full)}")
-                except StatementFailed as exc:
-                    say(f"  note: superseded function {full} was not dropped: {exc}")
-                    continue
-                dropped.append(name)
-                say(f"  dropped superseded function {full}")
+                if name not in settled and _drop_if_owned(session, f"{where}.{name}", say):
+                    settled.append(name)
+
+
+def _drop_if_owned(session: Session, full: str, say: Say) -> bool:
+    """Drop one orphan function when the deploy identity owns it, printing what happened.
+
+    ``True`` when it is settled: dropped, or left (and named) because another identity owns it
+    or the owner cannot be read, so it is not tried again for another table. ``False`` when the
+    ``DROP`` itself failed.
+    """
+    try:
+        owner = str((read_function(session.client, full) or {}).get("owner") or "")
+        me = session.identity
+    except Exception:  # noqa: BLE001 — unknown owner: leave it
+        owner, me = "", ""
+    if not me or not owner_matches(owner, {me}):
+        why = f"owned by {owner}, not by the deploy identity" if owner else "owner unknown"
+        say(f"  left function {full}: {why}")
+        return True
+    try:
+        session.runner.run(f"DROP FUNCTION IF EXISTS {quote_table(full)}")
+    except StatementFailed as exc:
+        say(f"  note: superseded function {full} was not dropped: {exc}")
+        return False
+    say(f"  dropped superseded function {full}")
+    return True
 
 
 @dataclass

@@ -138,14 +138,11 @@ def staging_volume(env: Mapping[str, str]) -> StagingVolume:
     return StagingVolume(*parts)
 
 
-def _safe_part(value: Any) -> str:
-    """One path component: a contract-supplied id must not climb out of the volume."""
-    return re.sub(r"[^A-Za-z0-9_-]", "_", str(value)) or "_"
-
-
 def run_prefix(volume: StagingVolume, product_id: Any, build_id: Any, run_id: Any) -> str:
     """The directory one run stages in: ``<volume>/<product>/<build>/<run id>``."""
-    parts = (_safe_part(product_id), _safe_part(build_id), _safe_part(run_id))
+    from .duckdb.runner import _path_part  # one safe path component, as the local staging uses
+
+    parts = (_path_part(product_id), _path_part(build_id), _path_part(run_id))
     return "/".join((volume.path, *parts))
 
 
