@@ -324,6 +324,46 @@ def test_the_cli_prints_markdown_and_json_verbatim(tmp_path, capsys, fmt):
         assert out == render_markdown(report) + "\n"
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("@octocat [phish](https://evil.example/p) token=z", id="value"),
+        pytest.param("[a](https://e.x) token=", id="dangling-equals"),
+        pytest.param("[a](https://e.x) token:", id="dangling-colon"),
+        pytest.param("[a](https://e.x) secret: ", id="dangling-colon-space"),
+    ],
+)
+def test_a_credential_shaped_name_cannot_close_its_code_span_early(tmp_path, capsys, name):
+    """Redaction ran over the finished document, and its value took the closing fence along.
+
+    The next fence then closed the span, and the description, which quotes the
+    name, rendered as Markdown: a live link, image or mention.
+    """
+    old = _contract([_ID])
+    new = _contract([_ID, {"name": name, "type": "string"}])
+
+    assert _run_cli(tmp_path, old, new, fmt="markdown") == 0
+
+    html = _html(capsys.readouterr().out)
+    assert html.count("<li>") == 1
+    assert html.count("<code>") == 2, html
+    for tag in ("<a ", "<img", "<redacted>"):
+        assert tag not in html, (tag, html)
+
+
+def test_credentials_are_redacted_value_by_value_and_the_json_still_parses(tmp_path, capsys):
+    column = {"name": "x token=abc123", "type": "string", "description": "password=hunter2"}
+    old = _contract([_ID])
+    new = _contract([_ID, column])
+
+    assert _run_cli(tmp_path, old, new, fmt="json") == 0
+
+    out = capsys.readouterr().out
+    (added,) = json.loads(out)["non_breaking"]
+    assert "abc123" not in out and "hunter2" not in out
+    assert added["after"]["description"].startswith("password=") and "REDACTED" in out
+
+
 def test_the_refine_preview_prints_names_literally():
     from rich.console import Console
 

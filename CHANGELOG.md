@@ -160,7 +160,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each long line at the terminal width (80 columns in CI), putting a line break inside a JSON
   string, and read `[...]` in a column name as markup. JSON and Markdown are now printed
   verbatim, and text without markup or `:emoji:` codes, so a column named `[/]` no longer
-  crashes the text output. The `--out` file was never affected.
+  crashes the text output. Credential-shaped values are redacted in each value before the
+  document is written, by the redactor logging uses, so a name ending in `token=x` no
+  longer cuts its JSON string short. The `--out` file was never affected.
 
 - **The `fluid forge --refine` preview read no columns from a `schema: {fields: [...]}`
   expose.** The diff now unwraps it at `schema` and `contract.schema` alike, as `fluid verify`
@@ -305,7 +307,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now spells each control, bidi and invisible character as `\x1b` or `\u202e` and doubles a
   backslash. Markdown puts the path and the description each in one code span: a backslash escape
   is not enough there, because GitHub still links `\@user`, `\#1` and `\:smile\:` after
-  rendering. The fence is one backtick longer than any run of backticks in the name. A Markdown
+  rendering. The fence is one backtick longer than any run of backticks in the name, and the
+  document is redacted per value before it is written, so a redaction cannot take the closing
+  fence with it. A Markdown
   entry now reads ``- **column_added** `exposes[0].contract.schema.email` — `column 'email' added
   to expose 'orders'` ``. The `fluid forge --refine` preview prints the same text without markup.
 

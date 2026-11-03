@@ -265,8 +265,10 @@ def render_markdown(report: ChangelogReport) -> str:
     The path and the description quote names from the contract, so each is
     one code span (:func:`_code`): a name can add no link, image, comment,
     heading or list item, and mentions no one. ``kind`` is this module's own
-    vocabulary (``[a-z_]``). Print the result verbatim (``cprint_json``):
-    Rich would read ``[...]`` in it as markup and wrap its long lines.
+    vocabulary (``[a-z_]``). Redact each value before rendering and print the
+    result verbatim: Rich would read ``[...]`` in it as markup and wrap its
+    long lines, and a redaction regex run over the finished text can take a
+    closing fence with a ``token=x`` value (``fluid diff`` does both right).
     """
     parts: list[str] = ["# Contract changelog", ""]
 

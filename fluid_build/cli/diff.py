@@ -18,6 +18,7 @@ import argparse
 import copy
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
@@ -836,25 +837,46 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
 def _print_version_diff(report: ChangelogReport, fmt: str) -> None:
     """Print a version-diff ``report`` to stdout as ``fmt`` (text, json or markdown).
 
-    JSON and Markdown are documents a program reads, written verbatim: Rich
-    would wrap a long line at the terminal width (inside a JSON string, or a
-    Markdown code span) and read ``[...]`` in a name as markup. Text is printed
-    literally, so a name cannot style it, swap in an emoji or (``[/]``) crash
-    it, and soft-wrapped, as the drift report is, so each entry stays one
+    Every value is redacted first, by the redactor logging uses
+    (``redact_value``), so a credential-shaped name or description never
+    reaches stdout. JSON and Markdown are documents a program reads, so they
+    are then written verbatim. A regex pass over the finished document cut
+    through its structure: a name ending in ``token=x`` lost the closing quote
+    of its JSON string, or the closing fence of its Markdown code span, which
+    let the rest of the line render as Markdown. Rich would also wrap a long
+    line at the terminal width and read ``[...]`` in a name as markup. Text is
+    printed literally, so a name cannot style it, swap in an emoji or (``[/]``)
+    crash it, and soft-wrapped, as the drift report is, so each entry stays one
     greppable line. The JSON envelope is also written to ``--out``.
     """
-    from fluid_build.cli.console import cprint_json, cprint_literal
+    import dataclasses
+
+    from fluid_build.cli.console import cprint_literal
+    from fluid_build.observability.secret_redactor import redact_value
 
     from ..api.changelog import render_markdown, render_text
+    from ..api.changelog_types import ChangelogReport as _Report
+
+    safe = _Report()
+    for change in (*report.breaking, *report.non_breaking, *report.info):
+        safe.add(
+            dataclasses.replace(
+                change,
+                path=redact_value(change.path),
+                description=redact_value(change.description),
+                before=redact_value(change.before),
+                after=redact_value(change.after),
+            )
+        )
 
     if fmt == "json":
         import json as _json
 
-        cprint_json(_json.dumps(report.to_dict(), indent=2))
+        sys.stdout.write(_json.dumps(safe.to_dict(), indent=2) + "\n")
     elif fmt == "markdown":
-        cprint_json(render_markdown(report))
+        sys.stdout.write(render_markdown(safe) + "\n")
     else:
-        cprint_literal(render_text(report), soft_wrap=True, highlight=False)
+        cprint_literal(render_text(safe), soft_wrap=True, highlight=False)
 
 
 def _invalid_contracts_error(
