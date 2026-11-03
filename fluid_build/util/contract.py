@@ -1062,3 +1062,37 @@ def slugify_identifier(value: str, *, fallback: str = "project") -> str:
     if slug[0].isdigit():
         slug = f"x-{slug}"
     return slug
+
+
+# ── Column keys ────────────────────────────────────────────────────────────
+# Which columns are keys, read the same way wherever it matters: the dbt engine
+# gives these a ``primary_key`` constraint (``engines/dbt/schema_yml.py``), and
+# ``fluid diff`` reports one that becomes nullable as breaking.
+
+_PK_KEYS = ("primary", "primaryKey", "primary_key", "pk", "isPrimary")
+
+
+def is_truthy(value: Any) -> bool:
+    """Loose truthiness for YAML/JSON booleans-as-strings (``"true"``/``True``)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+def column_is_key(col: Mapping[str, Any]) -> bool:
+    """True when the column is declared a uniqueness key / primary key."""
+    if is_truthy(col.get("unique")):
+        return True
+    if any(is_truthy(col.get(k)) for k in _PK_KEYS):
+        return True
+    if str(col.get("semanticType") or "").strip().lower() in ("identifier", "primary_key"):
+        return True
+    labels = col.get("labels")
+    if isinstance(labels, Mapping):
+        if is_truthy(labels.get("unique")):
+            return True
+        if str(labels.get("constraint") or "").strip().lower() in ("primary_key", "unique"):
+            return True
+    return False

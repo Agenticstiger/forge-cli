@@ -711,7 +711,10 @@ def test_a_column_the_dbt_engine_builds_as_a_key_made_nullable_is_breaking(marke
 
 def test_the_primary_key_matches_the_columns_the_dbt_engine_builds_as_keys():
     from fluid_build.api.changelog_rules import _in_primary_key
-    from fluid_build.engines.dbt._test_mapping import column_is_key
+    from fluid_build.engines.dbt import _test_mapping
+    from fluid_build.util.contract import column_is_key
+
+    assert _test_mapping.column_is_key is column_is_key  # one definition for both
 
     columns = [
         {},
