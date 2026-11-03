@@ -1,0 +1,47 @@
+# Dependency budget — the base install may not resolve to more packages than
+# its committed ceiling (scripts/ci/dep_budget.py).
+#
+# Not a required PR check on purpose: an upstream release can add a transitive
+# package with no change here, and that must not block or redden unrelated
+# work. It runs on PRs and pushes to main that touch something that can change
+# the count, and weekly, so upstream growth is seen within a week. On failure
+# the log names the packages added and removed against
+# scripts/ci/dep_budget_baselines/.
+
+name: Dependency budget
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - pyproject.toml
+      - scripts/ci/dep_budget.py
+      - scripts/ci/dep_budget_baselines/**
+      - .github/workflows/dep-budget.yml
+  push:
+    branches: [main]
+    paths:
+      - pyproject.toml
+      - scripts/ci/dep_budget.py
+      - scripts/ci/dep_budget_baselines/**
+      - .github/workflows/dep-budget.yml
+  schedule:
+    - cron: "41 6 * * 1"  # Mondays 06:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dep-budget:
+    name: Package count ceiling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+      # Pinned: a different uv can resolve a different tree.
+      - run: pip install "uv==0.11.23"
+      - name: Resolve the base install for each target and compare to its ceiling
+        run: python scripts/ci/dep_budget.py

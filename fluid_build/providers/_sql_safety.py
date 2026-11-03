@@ -17,7 +17,11 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping, Optional
 
-_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# The whole-string allowlists in this module end in ``\Z``, not ``$``. Python's
+# ``$`` also matches just before a trailing newline, so ``validate_ident`` used
+# to return ``"orders\n"`` unchanged, and that newline split any line-based
+# file the name was written into (a Java properties file, a log line).
+_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 # Identifier-quote characters for every supported dialect belong in the
 # safe set: ``"`` (ANSI / Snowflake), ``[`` ``]`` (T-SQL), and ``` ` ```
 # (BigQuery / MySQL). The backtick was the missing one — BigQuery table
@@ -28,7 +32,7 @@ _SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # be rejected and the ``query`` tool fails on BigQuery. A backtick can't
 # open a statement or a comment, so the ``;`` / ``--`` / ``/* */`` and
 # blocked-keyword guards below still hold.
-_SAFE_EXPR_CHARS = re.compile(r"^[A-Za-z0-9_\s().,<>=!'+\-*/%|&\"`:\[\]]+$")
+_SAFE_EXPR_CHARS = re.compile(r"^[A-Za-z0-9_\s().,<>=!'+\-*/%|&\"`:\[\]]+\Z")
 _BLOCKED_EXPR_TOKENS = re.compile(
     r"(?i)\b("
     r"alter|call|copy|create|delete|drop|execute|grant|insert|merge|put|remove|"
@@ -132,7 +136,7 @@ def dialect_uses_backslash_escapes(dialect: str | None) -> bool:
 # at most one comma so a contract cannot smuggle DDL through a type parameter
 # (identifiers/literals are already routed through ``validate_ident`` /
 # ``quote_string_literal``).
-_SQL_TYPE_PARAM_PAYLOAD = re.compile(r"^[0-9]+(\s*,\s*[0-9]+)?$")
+_SQL_TYPE_PARAM_PAYLOAD = re.compile(r"^[0-9]+(\s*,\s*[0-9]+)?\Z")
 
 # A *whole* column-type token (not just the ``(...)`` payload) such as
 # ``INT`` / ``VARCHAR(255)`` / ``NUMBER(18,4)`` / ``TIMESTAMP_NTZ`` /
@@ -143,7 +147,7 @@ _SQL_TYPE_PARAM_PAYLOAD = re.compile(r"^[0-9]+(\s*,\s*[0-9]+)?$")
 # set deliberately excludes ``;`` ``"`` ``-`` ``*`` ``/`` ``=`` so a type
 # token cannot carry a statement terminator, an identifier-quote, or a
 # comment sequence into the surrounding ``CREATE TABLE`` DDL.
-_SQL_TYPE_NAME = re.compile(r"^[A-Za-z0-9_ ()',]+$")
+_SQL_TYPE_NAME = re.compile(r"^[A-Za-z0-9_ ()',]+\Z")
 
 
 class SqlTypeError(ValueError):
@@ -161,7 +165,7 @@ def validate_sql_type_name(type_name: str) -> str:
     (e.g. ``VARCHAR(255)``) directly into ``CREATE TABLE`` SQL. ``validate_ident``
     is too strict for parameterised / multi-word types (it forbids parens and
     spaces), so this applies the conservative type allowlist
-    ``^[A-Za-z0-9_ ()',]+$`` and additionally fails closed on comment
+    ``^[A-Za-z0-9_ ()',]+\\Z`` and additionally fails closed on comment
     sequences (``--`` / ``/*`` / ``*/``) — defence-in-depth mirroring
     :func:`validate_sql_expression_allowlist`. Raises :class:`SqlTypeError`
     (a ``ValueError`` subclass) on anything outside the allowlist so callers
