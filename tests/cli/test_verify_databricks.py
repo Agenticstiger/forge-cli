@@ -37,6 +37,7 @@ from fluid_build.cli._verify_databricks import grant_statement, verify_databrick
 
 pytestmark = pytest.mark.unit
 
+DEPLOYER = "deployer@example.test"
 FAKE_TOKEN = "fake-workspace-token"  # pragma: allowlist secret
 CONTRACT: Dict[str, Any] = {
     "fluidVersion": "0.7.6",
@@ -124,6 +125,13 @@ class StubWorkspace:
         # (entity type, full name) -> {tag key: value}, served paginated by ``tag_page_size``
         self.tags: Dict[Any, Dict[str, str]] = {}
         self.tag_page_size = 100
+        # full name -> the table's ``row_filter`` as GetTable serves it
+        self.row_filters: Dict[str, Dict[str, Any]] = {}
+        # function full name -> FunctionInfo as GET .../functions/{name} serves it
+        self.functions: Dict[str, Dict[str, Any]] = {}
+        self.identity = DEPLOYER  # ``userName`` of GET .../scim/v2/Me
+        self.table_owner = "table-owner@example.test"
+        self.me_fails = False
         self.empty_tag_page_first = False
         self.stuck_tag_token = False
         self.api_client = StubApiClient(self)
@@ -142,7 +150,23 @@ class StubWorkspace:
             full = path.rsplit("/", 1)[1]
             if full not in self.tables:
                 raise StubHttpError(404, f"Table '{full}' does not exist.")
-            return {"full_name": full, "columns": self.tables[full]}
+            table: Dict[str, Any] = {
+                "full_name": full,
+                "columns": self.tables[full],
+                "owner": self.table_owner,
+            }
+            if full in self.row_filters:
+                table["row_filter"] = self.row_filters[full]
+            return table
+        if path == "/api/2.0/preview/scim/v2/Me":
+            if self.me_fails:
+                raise StubHttpError(500, "scim down")
+            return {"userName": self.identity}
+        if path.startswith("/api/2.1/unity-catalog/functions/"):
+            full = path.rsplit("/", 1)[1]
+            if full not in self.functions:
+                raise StubHttpError(404, f"Function '{full}' does not exist.")
+            return self.functions[full]
         if path.startswith("/api/2.1/unity-catalog/effective-permissions/catalog/"):
             principal = query["principal"]
             privileges = self.catalog_privileges.get(principal, [])
@@ -713,6 +737,300 @@ def test_fluid_verify_shows_the_tags_skipped_without_labels(
     code, out = _run_verify(tmp_path, monkeypatch, capfd, workspace, "--strict")
 
     assert "Governance tags (Unity Catalog) ⚪ SKIPPED" in out and code == 0
+
+
+# ── Row filter and column masks ─────────────────────────────────────────
+
+
+def restricted_contract(**overrides: Any) -> Dict[str, Any]:
+    """``orders`` with ``amount`` denied and ``region`` masked to ``analysts``, who also see
+    only ``eu`` rows (``bi`` is not restricted)."""
+    document = copy.deepcopy(CONTRACT)
+    authz = document["exposes"][0]["policy"]["authz"]
+    authz["columnRestrictions"] = [
+        {"principal": "group:analysts", "columns": ["amount"], "access": "deny"},
+        {
+            "principal": "group:analysts",
+            "columns": ["region"],
+            "access": "mask",
+            "mask": "last_four",
+        },
+    ]
+    authz["rowFilters"] = [
+        {"principal": "group:analysts", "where": overrides.get("where", "region = 'eu'")}
+    ]
+    return document
+
+
+def expected_enforcement(contract: Dict[str, Any]):
+    from fluid_build.iac.providers.databricks import managed_objects
+
+    (table,), _ = managed_objects(contract, {})
+    return table
+
+
+def function_info(fn: Any, owner: str = DEPLOYER, **changes: Any) -> Dict[str, Any]:
+    """FunctionInfo for an expected ``Function``, as Unity Catalog serves it."""
+    info: Dict[str, Any] = {
+        "full_name": fn.full_name,
+        "owner": owner,
+        "routine_body": "SQL",
+        "routine_definition": fn.body,
+        "full_data_type": fn.returns.lower(),
+        "input_params": {
+            "parameters": [
+                {"name": n, "position": i, "type_text": t.lower()}
+                for i, (n, t) in enumerate(fn.params)
+            ]
+        },
+    }
+    info.update(changes)
+    return info
+
+
+def bind_all(workspace: StubWorkspace, contract: Dict[str, Any]) -> None:
+    """What ``fluid apply`` leaves on the table: the contract's own filter and masks, and
+    their functions, made by the identity that deployed."""
+    table = expected_enforcement(contract)
+    enforcement = table.enforcement
+    for fn in [enforcement.row_filter.function, *(m.function for m in enforcement.masks)]:
+        workspace.functions[fn.full_name] = function_info(fn)
+    function, columns = table.row_filter
+    workspace.row_filters[TABLE] = {"function_name": function, "input_column_names": list(columns)}
+    for column, mask in table.masks:
+        next(c for c in workspace.tables[TABLE] if c["name"] == column)["mask"] = {
+            "function_name": mask
+        }
+
+
+def test_the_expected_names_carry_a_hash_of_the_definition():
+    table = expected_enforcement(restricted_contract())
+    assert table.row_filter[0].startswith("main.sales.fluid_rf_orders_")
+    assert [c for c, _f in table.masks] == ["amount", "region"]
+    other = expected_enforcement(restricted_contract(where="region = 'uk'"))
+    assert other.row_filter[0] != table.row_filter[0]
+    assert other.masks == table.masks
+
+
+def test_a_table_with_every_expected_binding_passes(workspace):
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+
+    result = verify(workspace, contract)
+
+    assert result["status"] == "match" and result["severity"]["level"] == "SUCCESS"
+    dimension = result["dimensions"]["row_filter_masks"]
+    assert dimension["status"] == "pass" and "all 3 " in dimension["message"]
+
+
+def test_a_missing_row_filter_fails_with_the_fix_and_is_critical(workspace):
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+    del workspace.row_filters[TABLE]
+
+    result = verify(workspace, contract)
+
+    assert result["status"] == "mismatch" and result["severity"]["level"] == "CRITICAL"
+    dimension = result["dimensions"]["row_filter_masks"]
+    assert dimension["status"] == "fail"
+    (finding,) = dimension["findings"]
+    assert finding["kind"] == "row_filter" and finding["actual"] is None
+    assert "has no row filter" in finding["message"]
+    assert "fluid apply" in dimension["fix"]
+    assert "has no row filter" in result["severity"]["reason"]
+    assert dimension["fix"] in " ".join(result["severity"]["actions"])
+
+
+def test_a_row_filter_bound_to_another_function_fails_and_names_both(workspace):
+    contract = restricted_contract()
+    bind_all(workspace, restricted_contract(where="region = 'uk'"))  # the old predicate's
+
+    result = verify(workspace, contract)
+
+    (finding,) = [
+        f for f in result["dimensions"]["row_filter_masks"]["findings"] if f["kind"] == "row_filter"
+    ]
+    assert finding["actual"] != finding["expected"]
+    assert finding["actual"] in finding["message"] and finding["expected"] in finding["message"]
+    assert result["severity"]["level"] == "CRITICAL"
+
+
+def test_a_row_filter_reading_other_columns_fails(workspace):
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+    workspace.row_filters[TABLE]["input_column_names"] = ["id"]
+
+    dimension = verify(workspace, contract)["dimensions"]["row_filter_masks"]
+
+    assert (
+        dimension["status"] == "fail" and "reads columns id" in dimension["findings"][0]["message"]
+    )
+
+
+def test_a_missing_mask_and_a_mask_of_another_function_fail(workspace):
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+    columns = {c["name"]: c for c in workspace.tables[TABLE]}
+    del columns["amount"]["mask"]
+    columns["region"]["mask"] = {"function_name": "main.sales.fluid_mask_orders_region_deadbeef"}
+
+    dimension = verify(workspace, contract)["dimensions"]["row_filter_masks"]
+
+    assert dimension["status"] == "fail" and len(dimension["findings"]) == 2
+    by_column = {f["column"]: f for f in dimension["findings"]}
+    assert by_column["amount"]["actual"] is None and "has no mask" in by_column["amount"]["message"]
+    assert by_column["region"]["actual"].endswith("deadbeef")
+
+
+def test_function_names_compare_without_case_or_backticks(workspace):
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+    workspace.row_filters[TABLE]["function_name"] = (
+        "`" + workspace.row_filters[TABLE]["function_name"].upper() + "`"
+    )
+
+    assert verify(workspace, contract)["dimensions"]["row_filter_masks"]["status"] == "pass"
+
+
+def test_a_contract_without_restrictions_skips_the_dimension(workspace):
+    result = verify(workspace)
+
+    assert result["dimensions"]["row_filter_masks"]["status"] == "skip"
+    assert result["status"] == "match"
+
+
+def _first_function(contract: Dict[str, Any]) -> Any:
+    return expected_enforcement(contract).enforcement.masks[0].function
+
+
+def test_a_function_someone_else_made_under_the_hashed_name_fails_verify_though_the_name_matches(
+    workspace,
+):
+    """The name is computable from the contract: ``RETURN val`` under it, bound, passes every
+    check of names and shows the column unmasked."""
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+    fn = _first_function(contract)
+    workspace.functions[fn.full_name] = function_info(
+        fn, owner="attacker@example.test", routine_definition="`val`"
+    )
+
+    result = verify(workspace, contract)
+
+    dimension = result["dimensions"]["row_filter_masks"]
+    assert dimension["status"] == "fail" and result["severity"]["level"] == "CRITICAL"
+    (finding,) = dimension["findings"]
+    assert finding["kind"] == "function"
+    assert "attacker@example.test" in finding["message"]
+    assert "its body is '`val`'" in finding["message"]
+
+
+def test_a_function_with_the_right_body_but_another_owner_fails(workspace):
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+    fn = expected_enforcement(contract).enforcement.row_filter.function
+    workspace.functions[fn.full_name] = function_info(fn, owner="someone@example.test")
+
+    dimension = verify(workspace, contract)["dimensions"]["row_filter_masks"]
+
+    assert dimension["status"] == "fail"
+    assert "owner is someone@example.test" in dimension["findings"][0]["message"]
+
+
+def test_a_function_owned_by_the_table_owner_passes(workspace):
+    """Verify may run as someone other than the deployer: the table's owner is its reference too."""
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+    workspace.identity = "reader@example.test"
+    for name, info in list(workspace.functions.items()):
+        workspace.functions[name] = dict(info, owner=workspace.table_owner)
+
+    assert verify(workspace, contract)["dimensions"]["row_filter_masks"]["status"] == "pass"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"full_data_type": "int"},
+        {"routine_body": "EXTERNAL"},
+        {"input_params": {"parameters": []}},
+        {"routine_definition": "`val` IS NOT NULL"},
+    ],
+    ids=["returns", "language", "parameters", "body"],
+)
+def test_a_function_that_differs_in_return_type_language_parameters_or_body_fails(
+    workspace, change
+):
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+    fn = _first_function(contract)
+    workspace.functions[fn.full_name] = function_info(fn, **change)
+
+    assert verify(workspace, contract)["dimensions"]["row_filter_masks"]["status"] == "fail"
+
+
+def test_a_body_that_differs_only_in_whitespace_passes(workspace):
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+    fn = _first_function(contract)
+    spaced = fn.body.replace(" ", "   \n ")
+    workspace.functions[fn.full_name] = function_info(fn, routine_definition=spaced)
+
+    assert verify(workspace, contract)["dimensions"]["row_filter_masks"]["status"] == "pass"
+
+
+def test_a_bound_function_that_does_not_exist_fails(workspace):
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+    fn = _first_function(contract)
+    del workspace.functions[fn.full_name]
+
+    dimension = verify(workspace, contract)["dimensions"]["row_filter_masks"]
+
+    assert dimension["status"] == "fail" and "does not exist" in dimension["findings"][0]["message"]
+
+
+def test_verify_still_checks_the_function_when_the_identity_cannot_be_read(workspace):
+    contract = restricted_contract()
+    bind_all(workspace, contract)
+    workspace.me_fails = True
+    for name, info in list(workspace.functions.items()):
+        workspace.functions[name] = dict(info, owner=workspace.table_owner)
+    assert verify(workspace, contract)["dimensions"]["row_filter_masks"]["status"] == "pass"
+    fn = _first_function(contract)
+    workspace.functions[fn.full_name] = function_info(fn, owner="attacker@example.test")
+    assert verify(workspace, contract)["dimensions"]["row_filter_masks"]["status"] == "fail"
+
+
+def test_a_binding_the_contract_does_not_ask_for_is_not_a_finding(workspace):
+    workspace.row_filters[TABLE] = {
+        "function_name": "main.sales.admin_rows",
+        "input_column_names": [],
+    }
+
+    assert verify(workspace)["status"] == "match"
+
+
+def test_fluid_verify_prints_the_missing_binding_and_strict_fails(
+    tmp_path, monkeypatch, capfd, workspace
+):
+    code, out = _run_verify(
+        tmp_path, monkeypatch, capfd, workspace, "--strict", contract=restricted_contract()
+    )
+
+    assert "Row filter and column masks (Unity Catalog)" in out
+    assert "main.sales.orders has no row filter" in out
+    assert "main.sales.orders.amount has no mask" in out
+    assert "Run fluid apply" in out
+    assert code != 0
+
+
+def test_fluid_verify_shows_the_dimension_skipped_without_restrictions(
+    tmp_path, monkeypatch, capfd, workspace
+):
+    code, out = _run_verify(tmp_path, monkeypatch, capfd, workspace, "--strict")
+
+    assert "Row filter and column masks (Unity Catalog) ⚪ SKIPPED" in out and code == 0
 
 
 # ── The real SDK, against the stand-in workspace ────────────────────────

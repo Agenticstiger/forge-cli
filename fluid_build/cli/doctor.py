@@ -471,6 +471,15 @@ and their current values.
     # documented only in CLAUDE.md and source docstrings, never on the
     # CLI itself.
     p.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Exit 1 when the summary is 'Action needed' (any built-in check not ready, "
+            "including copilot readiness); by default only a failed feature check does. "
+            "Ignored with --features-only, which reports feature checks alone"
+        ),
+    )
+    p.add_argument(
         "--env",
         action="store_true",
         help="List recognised FLUID_* runtime kill switches with current values + defaults",
@@ -508,6 +517,9 @@ def run(args, logger: logging.Logger) -> int:
     # backend resolution errors, and never costs the happy path more
     # than a few ms.
     store_backend_status = _inspect_store_backend()
+    # --strict: the "Action needed" summary becomes the exit code, so a copilot
+    # that is not ready fails a CI gate instead of printing a warning and exiting 0.
+    needs_action = getattr(args, "strict", False) is True and not copilot_readiness.ready
 
     # If features-only mode, just show features and exit
     if getattr(args, "features_only", False):
@@ -523,13 +535,17 @@ def run(args, logger: logging.Logger) -> int:
         import sys as _sys
 
         _json.dump(
-            {"store_backend": store_backend_status},
+            {
+                "store_backend": store_backend_status,
+                "copilot_ready": bool(copilot_readiness.ready),
+                "action_needed": not feature_checks_ok or not copilot_readiness.ready,
+            },
             _sys.stdout,
             indent=2,
             default=str,
         )
         _sys.stdout.write("\n")
-        return 0 if feature_checks_ok else 1
+        return 0 if feature_checks_ok and not needs_action else 1
 
     resolved_script = _resolve_extended_diagnostic_script()
     extended_available = resolved_script is not None
@@ -553,7 +569,7 @@ def run(args, logger: logging.Logger) -> int:
     )
 
     if not extended_requested:
-        return 0 if feature_checks_ok else 1
+        return 0 if feature_checks_ok and not needs_action else 1
 
     if resolved_script is None:
         raise _extended_diagnostic_error(
@@ -602,7 +618,7 @@ def run(args, logger: logging.Logger) -> int:
         info(logger, "doctor_ok")
 
         # Return success only if both feature checks and infrastructure checks pass
-        return 0 if feature_checks_ok else 1
+        return 0 if feature_checks_ok and not needs_action else 1
 
     except subprocess.TimeoutExpired:
         raise CLIError(1, "doctor_timeout", context={"timeout": 300})
