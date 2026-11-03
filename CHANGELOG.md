@@ -602,6 +602,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``- **column_added** `exposes[0].contract.schema.email` — `column 'email' added to expose 'orders'` ``.
   The `fluid forge --refine` preview prints the same text without markup.
 
+- **The ODCS and plugin-extension checks let a value with a trailing newline through a `pattern`,
+  too.** The fix above covered the FLUID schemas only. `fluid odcs validate` and
+  `fluid validate-artifacts` accepted an ODCS `schema[].id: "t1\n"` while refusing `"t 1"`, and
+  the forge copilot kept an LLM-proposed extension block whose value ended in a line break, such
+  as `use: "ci:basic\n"` for `customScaffold`. Every JSON Schema check now reads `$` as the end of
+  the value, with the same hint, including the ODPS, OPDS and Ossie checks, whose vendored schemas
+  have no such pattern yet. An extension schema is read in the dialect its `$schema` declares, and
+  as draft-07 when it declares none, so a 2020-12 `unevaluatedProperties: false` is no longer
+  ignored. `patternProperties` keys are still matched as before, so OPDS's language-code key
+  `^[a-z]{2}$` accepts `"en\n"`.
+
 ## [0.26.0] — 2026-11-01
 
 ### Added

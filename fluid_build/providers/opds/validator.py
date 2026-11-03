@@ -119,8 +119,14 @@ def validate_against_opds_schema(
         valid, errors = _basic_validation(opds_data, version)
         return valid, errors, "basic"
 
+    from fluid_build.schema_manager import schema_validator
+
     try:
-        validator = jsonschema.Draft202012Validator(schema)
+        # The dialect the schema declares (v4.1: 2020-12, also the default),
+        # with a pattern's "$" read as the end of the value, as ECMA-262 does.
+        # The patternProperties language-code keys (^[a-z]{2}$) keep
+        # jsonschema's own re.search; see schema_manager.schema_validator.
+        validator = schema_validator(schema, default=jsonschema.Draft202012Validator)
         errors = list(validator.iter_errors(opds_data))
 
         # Filter a known upstream OPDS v4.1 schema false-positive: the

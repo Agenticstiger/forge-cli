@@ -22,7 +22,8 @@ sub-key (complementing the existing ``fluid_build.extension_validators`` group):
     customScaffold = "data_product_forge_custom_scaffold.validation:get_extension_schema"
 
 The provider has the signature ``get_extension_schema(fluid_version=None) -> dict``
-and returns a draft-07 JSON Schema describing the data *under* the extension key.
+and returns a JSON Schema describing the data *under* the extension key: draft-07,
+unless the schema declares another dialect in its ``$schema``.
 
 These helpers let the ``fluid forge`` copilot (a) ground contract generation on
 the installed extension schemas and (b) validate the generated blocks before
@@ -200,6 +201,7 @@ def assemble_proposed_extensions(
         from jsonschema import Draft7Validator
     except ImportError:  # pragma: no cover — jsonschema is a hard dependency
         Draft7Validator = None  # type: ignore[assignment]
+    from fluid_build.schema_manager import schema_validator
 
     out: Dict[str, Any] = {}
     for key, block in proposed.items():
@@ -207,7 +209,11 @@ def assemble_proposed_extensions(
         if schema is None:
             continue
         if Draft7Validator is not None:
-            if next(iter(Draft7Validator(schema).iter_errors(block)), None) is not None:
+            # The dialect the plugin's schema declares, draft-07 when it declares
+            # none; Draft 7 ignores a newer keyword rather than enforcing it. A
+            # pattern's "$" is the end of the value, as ECMA-262 reads it.
+            validator = schema_validator(schema, default=Draft7Validator)
+            if next(iter(validator.iter_errors(block)), None) is not None:
                 continue  # invalid — let the repair loop surface it; don't emit junk
         out[key] = block
     return out
