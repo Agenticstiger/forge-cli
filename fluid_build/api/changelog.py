@@ -31,6 +31,7 @@ from .changelog_rules import (
     diff_agent_policy,
     diff_columns,
     diff_consumes,
+    diff_duplicates,
     diff_metadata,
     diff_quality_severity,
     diff_sovereignty,
@@ -43,7 +44,9 @@ def compare_contracts(baseline: Mapping[str, Any], new: Mapping[str, Any]) -> Ch
     """Return a structured changelog comparing two parsed contracts.
 
     ``baseline`` is treated as "old"; ``new`` as the candidate. Idempotent —
-    passing the same dict twice produces an empty report.
+    passing the same dict twice produces an empty report — unless the contract
+    declares an expose id, a column name or a nested field name twice: that is
+    reported whatever the baseline holds (see :func:`diff_duplicates`).
     """
     report = ChangelogReport()
 
@@ -62,6 +65,10 @@ def compare_contracts(baseline: Mapping[str, Any], new: Mapping[str, Any]) -> Ch
     # Agent policy + sovereignty.
     report.extend(diff_agent_policy(baseline, new))
     report.extend(diff_sovereignty(baseline, new))
+
+    # A name the new contract declares twice: the comparison below keeps only
+    # the last declaration of it.
+    report.extend(diff_duplicates(new))
 
     # Per-expose schema and quality.
     for expose_id, idx, base_expose, new_expose in iter_expose_pairs(baseline, new):

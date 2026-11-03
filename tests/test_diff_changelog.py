@@ -21,6 +21,7 @@ Covers the diff engine (``api/changelog.py``), rule classifications
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import sys
@@ -37,6 +38,7 @@ from fluid_build.api.changelog_rules import (
     diff_agent_policy,
     diff_columns,
     diff_consumes,
+    diff_duplicates,
     diff_quality_severity,
     diff_sovereignty,
 )
@@ -1121,6 +1123,178 @@ def test_cli_diff_baseline_fails_on_a_type_change_that_used_to_pass(
 
     assert rc == expected_rc
     assert [c["kind"] for c in report["breaking"]] == ["column_type_changed"]
+
+
+def _contract_with_exposes(*exposes):
+    """A 0.7.6 contract with one expose per ``(expose_id, columns)`` pair."""
+    contract = _contract_076([])
+    template = contract["exposes"][0]
+    contract["exposes"] = []
+    for expose_id, columns in exposes:
+        expose = copy.deepcopy(template)
+        expose["exposeId"] = expose_id
+        expose["contract"]["schema"] = columns
+        contract["exposes"].append(expose)
+    return contract
+
+
+@pytest.mark.parametrize(
+    "declared, kinds",
+    [
+        pytest.param(["int", "string"], {"column_duplicate_name"}, id="last-matches-baseline"),
+        pytest.param(
+            ["string", "int"], {"column_duplicate_name", "column_type_changed"}, id="last-differs"
+        ),
+        pytest.param(["string", "string"], {"column_duplicate_name"}, id="identical"),
+        pytest.param(["string"] * 3, {"column_duplicate_name"}, id="three-times"),
+    ],
+)
+def test_076_a_column_declared_twice_in_the_new_contract_is_breaking(declared, kinds):
+    """The index keeps the last declaration of a name, so the diff never saw the other one."""
+    old = _contract_076([_ID_COLUMN, {"name": "note", "type": "string"}])
+    new = _contract_076([_ID_COLUMN] + [{"name": "note", "type": t} for t in declared])
+    _assert_schema_valid(old, new)
+
+    report = compare_contracts(old, new)
+
+    assert {c.kind for c in report.breaking} == kinds
+    assert report.total == len(kinds)
+    (duplicate,) = [c for c in report.breaking if c.kind == "column_duplicate_name"]
+    assert duplicate.path == "exposes[0].contract.schema.note"
+    assert [c["type"] for c in duplicate.after] == declared
+
+
+_ZIP = {"name": "zip", "type": "STRING"}
+
+
+def _address(*fields):
+    return {"name": "addr", "type": "STRUCT", "fields": list(fields)}
+
+
+@pytest.mark.parametrize(
+    "old_columns, new_columns, non_breaking",
+    [
+        pytest.param(
+            [_address(_ZIP)],
+            [_address({"name": "zip", "type": "INT"}, _ZIP)],
+            [],
+            id="column-in-both-contracts",
+        ),
+        pytest.param(
+            [{"name": "id", "type": "STRING"}],
+            [{"name": "id", "type": "STRING"}, _address(_ZIP, _ZIP)],
+            ["column_added"],
+            id="column-is-new",
+        ),
+    ],
+)
+def test_a_nested_field_declared_twice_in_the_new_contract_is_breaking(
+    old_columns, new_columns, non_breaking
+):
+    report = compare_contracts(_contract_flat(old_columns), _contract_flat(new_columns))
+
+    assert [c.kind for c in report.non_breaking] == non_breaking
+    assert [(c.kind, c.path) for c in report.breaking] == [
+        ("nested_field_duplicate_name", "exposes[0].schema.addr.fields.zip")
+    ]
+
+
+def test_076_an_expose_id_declared_twice_in_the_new_contract_is_breaking():
+    as_string = [{"name": "a", "type": "string"}]
+    as_int = [{"name": "a", "type": "int"}]
+    old = _contract_with_exposes(("orders", as_string))
+    new = _contract_with_exposes(("orders", as_int), ("orders", as_string))
+    _assert_schema_valid(old, new)
+
+    report = compare_contracts(old, new)
+
+    assert report.total == 1
+    (change,) = report.breaking
+    assert (change.kind, change.path) == ("expose_duplicate_id", "exposes[1]")
+    assert change.after == {"id": "orders", "indexes": [0, 1]}
+
+
+def test_076_distinct_names_and_ids_are_not_duplicates():
+    columns = [_ID_COLUMN, {"name": "note", "type": "string"}]
+    contract = _contract_with_exposes(("orders", columns), ("customers", columns))
+    _assert_schema_valid(contract)
+
+    assert compare_contracts(contract, copy.deepcopy(contract)).total == 0
+
+
+def test_a_duplicate_in_an_expose_that_is_new_to_the_contract_is_breaking():
+    """A new expose has no baseline to hide a change from, but it is just as ambiguous."""
+    customers = ("customers", [_ID_COLUMN])
+    note = {"name": "note", "type": "string"}
+    old = _contract_with_exposes(customers)
+    new = _contract_with_exposes(customers, ("orders", [_ID_COLUMN, note, note]))
+    _assert_schema_valid(old, new)
+
+    report = compare_contracts(old, new)
+
+    assert [c.kind for c in report.non_breaking] == ["expose_added"]
+    assert [(c.kind, c.path) for c in report.breaking] == [
+        ("column_duplicate_name", "exposes[1].contract.schema.note")
+    ]
+
+
+def test_a_nested_field_declared_twice_below_the_first_level_is_breaking():
+    lat = {"name": "lat", "type": "DOUBLE"}
+    geo = {"name": "geo", "type": "STRUCT", "fields": [lat, lat]}
+    contract = _contract_flat([{"name": "addr", "type": "STRUCT", "fields": [geo]}])
+
+    assert [(c.kind, c.path) for c in diff_duplicates(contract)] == [
+        ("nested_field_duplicate_name", "exposes[0].schema.addr.fields.geo.fields.lat")
+    ]
+
+
+def test_076_a_duplicate_both_contracts_declare_is_still_reported():
+    """The documented exception to idempotence: the earlier declaration is hidden in both."""
+    note = {"name": "note", "type": "string"}
+    contract = _contract_076([_ID_COLUMN, note, note])
+    _assert_schema_valid(contract)
+
+    report = compare_contracts(contract, copy.deepcopy(contract))
+
+    assert [c.kind for c in report.breaking] == ["column_duplicate_name"]
+    assert report.total == 1
+
+
+def test_076_a_duplicate_only_the_baseline_declares_is_not_reported():
+    note = {"name": "note", "type": "string"}
+    old = _contract_076([_ID_COLUMN, note, note])
+    new = _contract_076([_ID_COLUMN, note])
+
+    assert compare_contracts(old, new).total == 0
+
+
+def test_an_expose_is_named_by_id_or_exposeid_and_an_unnamed_one_by_position():
+    exposes = [{"id": "a"}, {"exposeId": "a"}, {"id": "b"}, {"schema": []}, {"id": "_pos_3"}]
+
+    found = diff_duplicates({"exposes": exposes})
+
+    assert [(c.kind, c.path) for c in found] == [("expose_duplicate_id", "exposes[1]")]
+
+
+@pytest.mark.parametrize("schema", [5, True, 3.5, "text", {"x": 1}])
+def test_a_malformed_schema_in_an_expose_that_is_new_does_not_crash(schema):
+    """The duplicate walk reads exposes the comparison used to skip as merely added."""
+    old = {"exposes": [{"id": "a", "schema": [{"name": "x", "type": "INT"}]}]}
+    new = {"exposes": [old["exposes"][0], {"id": "b", "schema": schema}]}
+
+    report = compare_contracts(old, new)
+
+    assert [c.kind for c in report.non_breaking] == ["expose_added"]
+    assert report.total == 1
+
+
+def test_the_duplicate_findings_render():
+    note = {"name": "note", "type": "string"}
+    report = compare_contracts(_contract_076([_ID_COLUMN]), _contract_076([_ID_COLUMN, note, note]))
+
+    assert "column_duplicate_name" in render_text(report)
+    assert "column_duplicate_name" in render_markdown(report)
+    assert json.loads(json.dumps(report.to_dict()))["breaking"][0]["after"] == [note, note]
 
 
 # ---------------------------------------------------------------------------

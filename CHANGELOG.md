@@ -175,6 +175,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `time` to `timestamp` or `datetime`, `float` to `decimal` or `numeric`, and `int`, `integer`
     or `int32` to `float` are no longer widenings. `float` to `double` and `int` to `double` are.
 
+- **`fluid diff --baseline` reports a name the new contract declares twice.** The comparison matched
+  exposes, columns and nested fields by name and kept the last of a repeated name, so an earlier
+  declaration was never compared. An expose id (`exposeId`, or `id`), a column name or a nested
+  field name that the new contract declares more than once is now `breaking`
+  (`expose_duplicate_id`, `column_duplicate_name`, `nested_field_duplicate_name`), in an expose both
+  contracts have and in one that is new, and whatever the baseline holds: a contract that already
+  declares a name twice is reported against itself until one declaration is removed, so a pipeline
+  that gates on it can start exiting 1, and the `fluid forge --refine` preview lists it as a
+  breaking change.
+
 - **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
   `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
   diagnostic (the summary, the resource address and the provider's detail) and says that OpenTofu

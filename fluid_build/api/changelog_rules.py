@@ -254,14 +254,67 @@ def _classify_type_diff(old_full: str, new_full: str) -> Tuple[str, str]:
     return ("breaking", "column_type_changed")
 
 
+def _column_name(col: Any) -> Optional[str]:
+    """The name a column is matched by: ``name``, else ``id``."""
+    if isinstance(col, Mapping):
+        name = col.get("name") or col.get("id")
+        if isinstance(name, str):
+            return name
+    return None
+
+
 def _columns_by_name(columns: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    """Index columns by name; the last of a repeated name wins.
+
+    :func:`diff_duplicates` reports the names this would collapse.
+    """
     out: dict[str, Mapping[str, Any]] = {}
     for col in columns or []:
-        if isinstance(col, Mapping):
-            name = col.get("name") or col.get("id")
-            if isinstance(name, str):
-                out[name] = col
+        name = _column_name(col)
+        if name is not None:
+            out[name] = col
     return out
+
+
+def _duplicate_columns(columns: Sequence[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
+    """Every name declared more than once, with all of its declarations."""
+    seen: dict[str, list[Mapping[str, Any]]] = {}
+    if not isinstance(columns, Sequence):
+        return {}
+    for col in columns:
+        name = _column_name(col)
+        if name is not None:
+            seen.setdefault(name, []).append(col)
+    return {name: cols for name, cols in seen.items() if len(cols) > 1}
+
+
+def _duplicate_changes(
+    declarations: Sequence[Mapping[str, Any]],
+    *,
+    kind: str,
+    noun: str,
+    expose_id: str,
+    path_prefix: str,
+) -> List[Change]:
+    """A breaking ``Change`` for every name the new contract declares more than once.
+
+    :func:`_columns_by_name` keeps the last declaration of a name, so without this
+    the earlier one would never be compared against the baseline.
+    """
+    return [
+        Change(
+            path=f"{path_prefix}.{name}",
+            kind=kind,
+            severity="breaking",
+            description=(
+                f"{noun} '{name}' is declared {len(declared)} times in expose "
+                f"'{expose_id}'; keep one (a later declaration hides an earlier one)"
+            ),
+            before=None,
+            after=[dict(d) for d in declared],
+        )
+        for name, declared in _duplicate_columns(declarations).items()
+    ]
 
 
 def _expose_schema(expose: Mapping[str, Any]) -> Tuple[Sequence[Any], Optional[str]]:
@@ -888,14 +941,10 @@ def iter_expose_pairs(
     base_exposes = list(baseline.get("exposes") or [])
     new_exposes = list(new.get("exposes") or [])
     base_by_id = {
-        (e.get("id") or e.get("exposeId") or f"_pos_{i}"): (i, e)
-        for i, e in enumerate(base_exposes)
-        if isinstance(e, Mapping)
+        _expose_key(i, e): (i, e) for i, e in enumerate(base_exposes) if isinstance(e, Mapping)
     }
     new_by_id = {
-        (e.get("id") or e.get("exposeId") or f"_pos_{i}"): (i, e)
-        for i, e in enumerate(new_exposes)
-        if isinstance(e, Mapping)
+        _expose_key(i, e): (i, e) for i, e in enumerate(new_exposes) if isinstance(e, Mapping)
     }
     all_ids = set(base_by_id) | set(new_by_id)
     for eid in all_ids:
@@ -903,3 +952,89 @@ def iter_expose_pairs(
         n = new_by_id.get(eid)
         idx_in_new = n[0] if n else (b[0] if b else 0)
         yield eid, idx_in_new, (b[1] if b else None), (n[1] if n else None)
+
+
+def _expose_key(index: int, expose: Mapping[str, Any]) -> Any:
+    """The id exposes are matched by; one without an id is matched by position."""
+    return expose.get("id") or expose.get("exposeId") or f"_pos_{index}"
+
+
+def _nested_duplicates(columns: Sequence[Any], *, expose_id: str, path_prefix: str) -> List[Change]:
+    """Every ``fields`` name declared twice below *columns*, at any depth."""
+    changes: List[Change] = []
+    if not isinstance(columns, Sequence):
+        return changes
+    for col in columns:
+        name = _column_name(col)
+        fields = col.get("fields") if name is not None else None
+        if isinstance(fields, Sequence):
+            prefix = f"{path_prefix}.{name}.fields"
+            changes.extend(
+                _duplicate_changes(
+                    fields,
+                    kind="nested_field_duplicate_name",
+                    noun="nested field",
+                    expose_id=expose_id,
+                    path_prefix=prefix,
+                )
+            )
+            changes.extend(_nested_duplicates(fields, expose_id=expose_id, path_prefix=prefix))
+    return changes
+
+
+def _duplicate_exposes(exposes: Sequence[Any]) -> List[Change]:
+    """Every expose id declared twice. An expose without an id is matched by position."""
+    declared_at: dict[Any, list[int]] = {}
+    for i, expose in enumerate(exposes):
+        if isinstance(expose, Mapping):
+            expose_id = expose.get("id") or expose.get("exposeId")
+            if expose_id:
+                declared_at.setdefault(expose_id, []).append(i)
+    return [
+        Change(
+            path=f"exposes[{at[-1]}]",
+            kind="expose_duplicate_id",
+            severity="breaking",
+            description=(
+                f"expose '{expose_id}' is declared {len(at)} times "
+                f"(at {', '.join(f'exposes[{i}]' for i in at)}); "
+                f"keep one (a later declaration hides an earlier one)"
+            ),
+            before=None,
+            after={"id": expose_id, "indexes": at},
+        )
+        for expose_id, at in declared_at.items()
+        if len(at) > 1
+    ]
+
+
+def diff_duplicates(new: Mapping[str, Any]) -> List[Change]:
+    """Flag every expose id, column name and nested field name *new* declares twice.
+
+    Breaking, and reported whatever the baseline holds. The comparison indexes
+    exposes, columns and fields by name and keeps the last of a repeated name,
+    so an earlier declaration would never be compared against the baseline,
+    and an emitter is free to read either one. It follows that a contract that
+    already declares a name twice is reported against itself, until one
+    declaration is removed.
+    """
+    exposes = list(new.get("exposes") or [])
+    changes = _duplicate_exposes(exposes)
+    for i, expose in enumerate(exposes):
+        if not isinstance(expose, Mapping):
+            continue
+        columns, where_found = _expose_schema(expose)
+        if where_found is None:
+            continue
+        key, prefix = _expose_key(i, expose), f"exposes[{i}].{where_found}"
+        changes.extend(
+            _duplicate_changes(
+                columns,
+                kind="column_duplicate_name",
+                noun="column",
+                expose_id=key,
+                path_prefix=prefix,
+            )
+        )
+        changes.extend(_nested_duplicates(columns, expose_id=key, path_prefix=prefix))
+    return changes
