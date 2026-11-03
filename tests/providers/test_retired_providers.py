@@ -52,9 +52,8 @@ def test_built_in_provider_set_is_exactly_five():
 def test_retired_packages_stay_importable_but_do_not_autoregister():
     import fluid_build.providers.datamesh_manager as dmm
     from fluid_build.providers.aws import RedshiftProvider
-    from fluid_build.providers.datamesh_manager import DataMeshManagerProvider
 
-    assert RedshiftProvider and DataMeshManagerProvider
+    assert RedshiftProvider and dmm.DataMeshManagerProvider
     assert getattr(dmm, "__fluid_no_autoregister__", False) is True
     assert not hasattr(dmm, "NAME") and not hasattr(dmm, "Provider")
 
@@ -218,7 +217,7 @@ def test_an_explicit_registration_of_a_retired_name_stays_allowed(_restore_regis
 
 def test_the_hint_does_not_depend_on_the_registry_loading(monkeypatch, caplog, capsys):
     # A registry that failed to load (``_known_provider_names`` -> []) must not hide it.
-    import fluid_build.cli as cli
+    from fluid_build import cli
 
     monkeypatch.delenv("FLUID_PROVIDER", raising=False)
     monkeypatch.setattr(cli, "_known_provider_names", lambda: [])
