@@ -147,6 +147,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls its "v1" headings an internal milestone. A test fails if it announces a 1.x release while
   the package is below 1.0. The package description named GCP, Snowflake and Local and now names
   AWS and Databricks too.
+- **The same AWS contract could emit a different module from one run to the next.** The AWS
+  planner ordered its actions through a `set`, so the order changed with Python's hash seed, and
+  with it the emitted module: a Lambda permission, schedule target, event-source mapping or S3
+  notification named the function by literal ARN in one run and by
+  `${aws_lambda_function.<name>.arn}` in the next (the reference only when the function happened
+  to be planned first), so tofu sometimes had no ordering edge to the function. Actions now keep
+  the order they were planned in. Measured on 21 AWS contracts: modules without a Lambda are
+  byte-identical to before; scheduled ones now always emit the reference.
+
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
