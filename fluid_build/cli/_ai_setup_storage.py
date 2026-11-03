@@ -115,7 +115,7 @@ _DOMAIN_FRECENCY_HALF_LIFE_DAYS = 30.0
 # Privacy guard: only a bare domain slug is ever persisted. Mirrors
 # ``forge_domain_enrichment._SAFE_DOMAIN_RE``, lower-cased and length-capped —
 # the regex is what keeps prompt text / paths / PII out of the history file.
-_DOMAIN_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_DOMAIN_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
 
 
 def _allow_plaintext_ai_secrets() -> bool:

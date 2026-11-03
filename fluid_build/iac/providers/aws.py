@@ -103,7 +103,7 @@ LOG = logging.getLogger(__name__)
 # binding carries (a jurisdiction such as "EU", a Google region, an unresolved
 # "{{ env.AWS_REGION }}") must not become the provider's region; it used to be
 # ignored, and still is.
-_AWS_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+$")
+_AWS_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+\Z")
 
 
 def recorded_regions(resources: Iterable[Mapping[str, Any]]) -> set:
@@ -735,6 +735,29 @@ class AwsIacPlugin:
         provider v6).
         """
         cfg = dict(self.provider_block())
+        for index, expose in enumerate(contract.get("exposes") or []):
+            binding = expose.get("binding") or {}
+            raw = (binding.get("location") or {}).get("region")
+            # A region code with whitespace around it (a YAML ``|`` block ends in a
+            # newline) is refused. Dropping it leaves the provider on the
+            # environment's region; pinning it stripped applies a region the
+            # sovereignty policy, which reads the value as written, never checked.
+            if (
+                is_cloud(binding, "aws")
+                and isinstance(raw, str)
+                and raw != raw.strip()
+                and _AWS_REGION_RE.match(raw.strip())
+            ):
+                raise UnsupportedBindingError(
+                    "aws-region-whitespace",
+                    f"exposes[{expose.get('exposeId') or index}] binding.location.region is "
+                    f"{raw!r}: a region code with whitespace around it. The sovereignty policy "
+                    "checks the region as written, so it is refused rather than pinned stripped.",
+                    (
+                        f"Write the region alone: region: {raw.strip()} (a YAML '|' block ends "
+                        "the value in a newline).",
+                    ),
+                )
         named = {
             str(((e.get("binding") or {}).get("location") or {}).get("region"))
             for e in contract.get("exposes") or []
