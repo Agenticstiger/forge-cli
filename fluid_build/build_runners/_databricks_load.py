@@ -24,14 +24,18 @@ module moves it into the table in three steps:
    ``<volume>/<product>/<build>/<run id>/<file>.parquet``;
 2. run ONE statement on ``DATABRICKS_WAREHOUSE_ID`` through the SQL Statement Execution API::
 
-       INSERT OVERWRITE `c`.`s`.`t` SELECT `col`, ... FROM read_files('<run dir>', format => 'parquet')
+       INSERT OVERWRITE `c`.`s`.`t` SELECT `col`, ... FROM read_files('<staged file>', format => 'parquet')
 
-   a full refresh that rewrites the table's rows and nothing else: the table's definition, grants,
+   reading the one file this run uploaded, never the directory (a file someone else put there is not
+   loaded), a full refresh that rewrites the table's rows and nothing else: the table's definition, grants,
    tags, row filter and column masks stay (``INSERT OVERWRITE`` is a data operation; ``CREATE OR
    REPLACE`` is the statement that rebuilds a table);
 3. delete the staged files and their directory, whether the load worked or not. The volume must never
    keep landed data (masked, but still the product's data). A file that cannot be deleted fails the
-   run and is named, so that someone deletes it.
+   run and is named, so that someone deletes it. Ctrl-C (or any other interrupt) during the upload or
+   the INSERT cancels the statement and still deletes the files before it propagates. A run killed
+   outright (SIGKILL, a CI runner torn down) cannot clean up, so each load first deletes what an
+   earlier run of the same build left under ``<volume>/<product>/<build>/``.
 
 The table is the IaC's: a missing table is an error that names ``fluid apply``, and this module never
 creates or alters one. The volume is named by ``DATABRICKS_STAGING_VOLUME``
@@ -201,13 +205,13 @@ def unsupported_reason(mode: str, sink_format: str, stream_count: int) -> Option
     return None
 
 
-def insert_overwrite_statement(target: LoadTarget, run_dir: str) -> str:
-    """The one statement that loads the run's files: every name an identifier the emitter
+def insert_overwrite_statement(target: LoadTarget, source: str) -> str:
+    """The one statement that loads the run's file: every name an identifier the emitter
     accepted, quoted; the path a Spark string literal (backslash escapes)."""
     columns = ", ".join(quote_ident(column) for column in target.columns)
     return (
         f"INSERT OVERWRITE {quote_table(target.full_name)} SELECT {columns} "
-        f"FROM read_files({string_literal(run_dir)}, format => 'parquet')"
+        f"FROM read_files({string_literal(source)}, format => 'parquet')"
     )
 
 
@@ -278,10 +282,10 @@ class Landing:
         except (IndexError, TypeError, ValueError) as exc:
             raise DatabricksLoadError(f"counting {full} returned no readable count") from exc
 
-    def _insert(self, prefix: str) -> Tuple[int, str]:
+    def _insert(self, remote: str) -> Tuple[int, str]:
         full = self.target.full_name
         try:
-            doc = self._sql.execute(insert_overwrite_statement(self.target, prefix))
+            doc = self._sql.execute(insert_overwrite_statement(self.target, remote))
             reported = _rows_reported(doc)
             if reported is None:
                 # A full refresh leaves exactly the file's rows, so the table's count is the load's.
@@ -305,6 +309,50 @@ class Landing:
             if not _is_not_found(exc):
                 return [f"{prefix} ({_failure(exc)})"]
         return []
+
+    def _sweep_stale(self, build_dir: str, current: str, logger: logging.Logger) -> List[str]:
+        """Delete what earlier runs of this build left in ``build_dir`` (a run killed before its
+        own delete); the run directories deleted. Best effort: a failure is logged, not raised,
+        because this run's own files are deleted by this run whatever happens here."""
+        do = self._client.api_client.do
+        swept: List[str] = []
+        try:
+            runs = _mapping(do("GET", _fs("directories", build_dir))).get("contents") or []
+        except Exception as exc:  # noqa: BLE001
+            if not _is_not_found(exc):
+                logger.warning(
+                    "databricks.load could not list %s for earlier runs' staged files: %s",
+                    build_dir,
+                    _failure(exc),
+                )
+            return swept
+        for run in runs:
+            run_dir = str(_mapping(run).get("path") or "").rstrip("/")
+            if not _mapping(run).get("is_directory") or run_dir == current:
+                continue
+            if not run_dir.startswith(build_dir + "/") or "/" in run_dir[len(build_dir) + 1 :]:
+                continue  # only a direct child of this build's directory
+            try:
+                listed = _mapping(do("GET", _fs("directories", run_dir))).get("contents") or []
+                for entry in listed:
+                    path = str(_mapping(entry).get("path") or "")
+                    if _mapping(entry).get("is_directory") or not path.startswith(run_dir + "/"):
+                        continue
+                    do("DELETE", _fs("files", path))
+                do("DELETE", _fs("directories", run_dir))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "databricks.load could not delete an earlier run's staged files in %s; "
+                    "delete them: %s",
+                    run_dir,
+                    _failure(exc),
+                )
+                continue
+            swept.append(run_dir)
+            logger.warning(
+                "databricks.load deleted staged files an earlier run left behind: %s", run_dir
+            )
+        return swept
 
     # ── the load ───────────────────────────────────────────────────────
 
@@ -337,12 +385,13 @@ class Landing:
             )
         prefix = run_prefix(self.volume, product_id, build_id, run_id)
         remote = f"{prefix}/{os.path.basename(path)}"
+        swept = self._sweep_stale(prefix.rsplit("/", 1)[0], prefix, logger)
         loaded = 0
         rows_from = ""
         failure: Optional[DatabricksLoadError] = None
         try:
             self._upload(path, prefix, remote)
-            loaded, rows_from = self._insert(prefix)
+            loaded, rows_from = self._insert(remote)
             if loaded != expected_rows:
                 raise DatabricksLoadError(
                     f"loaded {loaded} rows into {full}, but the landed file holds {expected_rows}"
@@ -351,6 +400,17 @@ class Landing:
             failure = exc
         except Exception as exc:  # noqa: BLE001 — a failure must still reach the delete below
             failure = DatabricksLoadError(_failure(exc))
+        except BaseException:
+            # Ctrl-C or SystemExit mid-load (the statement runner has cancelled the INSERT): the
+            # staged files still go before the interrupt propagates.
+            left = self._delete(prefix, remote)
+            if left:
+                logger.error(
+                    "databricks.load interrupted, and the staged files, which hold the landed "
+                    "data, could not be deleted; delete them: %s",
+                    "; ".join(left),
+                )
+            raise
         left = self._delete(prefix, remote)
         if failure is not None:
             tail = (
@@ -378,6 +438,7 @@ class Landing:
             "rows_from": rows_from,
             "staged_to": prefix,
             "staged_files_deleted": True,
+            "earlier_runs_staging_deleted": swept,
         }
 
 

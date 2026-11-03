@@ -293,6 +293,7 @@ class SqlRunner:
     def execute(self, statement: str) -> Mapping[str, Any]:
         """:meth:`run`, and the finished statement's document (its ``result`` and ``manifest``)."""
         do = self._client.api_client.do
+        doc: Any = None
         try:
             doc = do(
                 "POST",
@@ -315,6 +316,12 @@ class SqlRunner:
             raise
         except Exception as exc:  # noqa: BLE001 — every transport failure is the statement's
             raise StatementFailed(f"{type(exc).__name__}: {_scrub(exc)}") from exc
+        except BaseException:
+            # Ctrl-C or SystemExit while the statement runs: it would go on running on the
+            # warehouse after this process has gone.
+            if isinstance(doc, Mapping) and doc.get("statement_id"):
+                self._cancel(doc)
+            raise
         state = self._state(doc)
         if state != "SUCCEEDED":
             error = (doc.get("status") or {}).get("error") or {}

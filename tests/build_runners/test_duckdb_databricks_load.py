@@ -275,8 +275,9 @@ def test_the_file_is_uploaded_loaded_and_the_staged_copy_deleted(fake, tmp_path)
     assert fake.volume_files() == [], "never leave landed data in the volume"
     puts = [p for m, p in fake.file_ops if m == "PUT"]
     assert puts == [f"{run_dir}/subs.parquet"]
-    # in order: the directory, the file, then (after the load) the file and the directory go
-    assert [m for m, _ in fake.file_ops] == ["PUT-DIR", "PUT", "DELETE", "DELETE-DIR"]
+    # in order: earlier runs looked for, the directory, the file, then (after the load) the file
+    # and the directory go
+    assert [m for m, _ in fake.file_ops] == ["LIST", "PUT-DIR", "PUT", "DELETE", "DELETE-DIR"]
     assert fake.sql_log[-1].startswith("INSERT OVERWRITE `main`.`bronze`.`subs`")
     assert fake.unknown == []
 
@@ -373,6 +374,90 @@ def test_a_failed_upload_is_cleaned_up_and_nothing_loads(fake, tmp_path):
     assert "PERMISSION_DENIED" in str(exc.value)
     assert not [s for s in fake.sql_log if "INSERT" in s]
     assert fake.volume_files() == []
+
+
+def _volume_file(fake: FakeDatabricks, volume_path: str, data: bytes) -> None:
+    real = fake._fs_path(volume_path)
+    assert real is not None, volume_path
+    Path(real).parent.mkdir(parents=True, exist_ok=True)
+    Path(real).write_bytes(data)
+
+
+def test_the_load_reads_the_uploaded_file_not_the_run_directory(fake, tmp_path):
+    run_dir = f"{VOLUME}/bronze_subs/ingest/run-1"
+    # someone with WRITE VOLUME drops a file into the run's directory before the INSERT
+    planted = _parquet(tmp_path, rows=[("666", "+0", "00000")], name="planted.parquet")
+    _volume_file(fake, f"{run_dir}/planted.parquet", planted.read_bytes())
+
+    with pytest.raises(load.DatabricksLoadError) as exc:
+        _load(_landing(fake), _parquet(tmp_path))
+
+    insert = [s for s in fake.sql_log if s.startswith("INSERT OVERWRITE")]
+    assert insert and insert[0].endswith(
+        f"read_files('{run_dir}/subs.parquet', format => 'parquet')"
+    )
+    assert [r["id"] for r in fake.rows(TABLE)] == ["1", "2", "3"], "the planted rows are not loaded"
+    # the directory cannot be removed while the planted file is in it: the run says so
+    assert "could not delete" in str(exc.value) and run_dir in str(exc.value)
+
+
+def test_an_interrupt_mid_load_still_deletes_the_staged_files(fake, tmp_path, monkeypatch):
+    landing = _landing(fake)
+
+    def interrupted(statement):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(landing._sql, "execute", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        _load(landing, _parquet(tmp_path))
+    assert fake.volume_files() == [], "Ctrl-C must not leave landed data in the volume"
+    assert [m for m, _ in fake.file_ops][-2:] == ["DELETE", "DELETE-DIR"]
+
+
+def test_an_interrupted_statement_is_cancelled_on_the_warehouse():
+    from fluid_build.iac.providers.databricks_enforce import SqlRunner
+
+    calls: List[tuple] = []
+
+    class _Api:
+        def do(self, method, path, **kwargs):
+            calls.append((method, path))
+            if method == "POST" and path.endswith("/statements/"):
+                return {"statement_id": "s-1", "status": {"state": "RUNNING"}}
+            if method == "GET":
+                raise KeyboardInterrupt
+            return {}
+
+    class _Client:
+        api_client = _Api()
+
+    runner = SqlRunner(_Client(), "wh", sleep=lambda _s: None)
+    with pytest.raises(KeyboardInterrupt):
+        runner.execute("INSERT OVERWRITE `a`.`b`.`c` SELECT 1")
+    assert ("POST", "/api/2.0/sql/statements/s-1/cancel") in calls
+
+
+def test_staged_files_an_earlier_killed_run_left_are_deleted_first(fake, tmp_path):
+    stale = f"{VOLUME}/bronze_subs/ingest/run-0"
+    other_build = f"{VOLUME}/bronze_subs/other/run-0"
+    _volume_file(fake, f"{stale}/subs.parquet", b"left by a run that was killed")
+    _volume_file(fake, f"{other_build}/subs.parquet", b"another build's run")
+
+    facts = _load(_landing(fake), _parquet(tmp_path), run_id="run-1")
+
+    assert facts["earlier_runs_staging_deleted"] == [stale]
+    assert fake.volume_files() == [f"{other_build}/subs.parquet"], "only this build's directory"
+    assert [r["id"] for r in fake.rows(TABLE)] == ["1", "2", "3"]
+
+
+def test_a_stale_run_that_cannot_be_deleted_does_not_stop_the_load(fake, tmp_path):
+    stale = f"{VOLUME}/bronze_subs/ingest/run-0"
+    _volume_file(fake, f"{stale}/subs.parquet", b"left behind")
+    fake.fail_route("DELETE", r"/fs/files/Volumes/.*/ingest/run-0/", 403, "PERMISSION_DENIED")
+    facts = _load(_landing(fake), _parquet(tmp_path), run_id="run-1")
+    assert facts["earlier_runs_staging_deleted"] == []
+    assert fake.volume_files() == [f"{stale}/subs.parquet"]
+    assert [r["id"] for r in fake.rows(TABLE)] == ["1", "2", "3"]
 
 
 def test_a_volume_that_does_not_exist_names_it(fake, tmp_path, monkeypatch):

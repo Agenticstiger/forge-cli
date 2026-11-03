@@ -608,9 +608,9 @@ def _insert_doc(n: int, report: bool) -> Dict[str, Any]:
 def _data_statement(fake: "FakeDatabricks", sql: str) -> Optional[Tuple[bool, str, Dict[str, Any]]]:
     """``(ok, error, result)`` for a statement that reads or writes rows, ``None`` for any other.
 
-    ``INSERT OVERWRITE <t> SELECT <cols> FROM read_files('<dir>', format => 'parquet')`` replaces
-    the rows of ``<t>`` with the Parquet files under ``<dir>`` (a path on a volume the Files API
-    holds), the columns taken by position as an INSERT without a column list takes them.
+    ``INSERT OVERWRITE <t> SELECT <cols> FROM read_files('<path>', format => 'parquet')`` replaces
+    the rows of ``<t>`` with the Parquet file at ``<path>``, or every one under it when it is a
+    directory (a path on a volume the Files API holds), the columns taken by position as an INSERT without a column list takes them.
     """
     s = sql.strip().rstrip(";").strip()
     m = re.match(
@@ -638,12 +638,13 @@ def _data_statement(fake: "FakeDatabricks", sql: str) -> Optional[Tuple[bool, st
                 f"the table has {len(table['columns'])} columns, the query {len(wanted)}.",
                 {},
             )
-        directory = fake._fs_path(re.sub(r"\\(.)", r"\1", literal))
-        files = (
-            sorted(str(p) for p in Path(directory).rglob("*.parquet"))
-            if directory is not None and os.path.isdir(directory)
-            else []
-        )
+        source = fake._fs_path(re.sub(r"\\(.)", r"\1", literal))
+        if source is not None and os.path.isfile(source):
+            files = [source]
+        elif source is not None and os.path.isdir(source):
+            files = sorted(str(p) for p in Path(source).rglob("*.parquet"))
+        else:
+            files = []
         if not files:
             return (
                 False,
