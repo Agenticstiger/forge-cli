@@ -99,7 +99,8 @@ _log = logging.getLogger(__name__)
 
 # Conservative default identifier shape — covers Snowflake / BigQuery /
 # Unity / Glue without quoting weirdness. Catalogs with looser rules
-# (e.g., DataHub URN strings) override the regex per-adapter.
+# (e.g., DataHub URN strings) override the regex per-adapter. Matched
+# with ``fullmatch``: ``$`` also matches before a trailing newline.
 _DEFAULT_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -143,7 +144,7 @@ def validate_and_quote_identifier(
         non-SQL-shaped identifiers.
     """
     rule = pattern or _DEFAULT_IDENTIFIER
-    if not rule.match(value or ""):
+    if not rule.fullmatch(value or ""):
         raise CatalogConfigError(
             message=f"Invalid {kind} identifier: {value!r}",
             suggestions=[

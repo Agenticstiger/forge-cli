@@ -1407,17 +1407,17 @@ def run_builds_from_args(
     # rather than traversing the filesystem. The parallel pipeline
     # (``cli/_acquisition_stage_ext``) already validates the same fields;
     # this closes the one-sided-guard gap on the runtime path.
-    from ._ids import validate_identifier
+    from ._ids import validate_build_ids
 
     # Only non-empty ids are checked: an absent/empty id cannot traverse
     # (``_build_dir`` falls back to a safe "product" default and
     # ``FileStateStore._confine()`` is the backstop), while a non-empty id
     # like ``../../../../tmp/escape`` is rejected here before any path is made.
-    if contract.get("id"):
-        validate_identifier(contract["id"], kind="contract.id")
-    for _b in builds:
-        if _b.get("id"):
-            validate_identifier(_b["id"], kind="build.id")
+    # ``fluid apply`` runs the same check before it applies anything
+    # (``cli/apply.py::_gate_build_ids_for_apply``), so on the OpenTofu engine
+    # an id is not refused here after ``tofu apply``; this one stays as the
+    # backstop for any caller that skips it.
+    validate_build_ids(contract)
 
     # The running ``fluid apply``'s run report, if any: each build is recorded on it.
     from fluid_build.observability.apply_run import current_apply_run

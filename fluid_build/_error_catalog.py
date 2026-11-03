@@ -74,7 +74,7 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     # ── providers ──────────────────────────────────────────────────────────
     "provider_not_specified": (
         [
-            "Pass a provider: --provider local|gcp|snowflake|aws|azure",
+            "Pass a provider: --provider aws|databricks|gcp|local|snowflake",
             "Or set the FLUID_PROVIDER environment variable",
             "Run 'fluid providers' to list the available providers",
         ],
@@ -91,7 +91,14 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     "provider_unknown": (
         [
             "Run 'fluid providers' to see the available providers",
-            "Valid built-ins: local, gcp, snowflake, aws, azure",
+            "Valid built-ins: aws, databricks, gcp, local, snowflake",
+        ],
+        "providers",
+    ),
+    "provider_retired": (
+        [
+            "Run 'fluid providers' to see the available providers",
+            "CHANGELOG.md lists it under Removed, with its replacement",
         ],
         "providers",
     ),
@@ -256,6 +263,17 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     # ── plan / apply ───────────────────────────────────────────────────────
     "planner_failed": (
         ["Run 'fluid validate <contract>' first to rule out a contract problem"],
+        None,
+    ),
+    "apply_build_identifier_invalid": (
+        [
+            "Rename the id to fit, for example orders_v1 instead of 1orders, and apply again",
+            (
+                "A renamed id starts over: its builds get new cursors and watermarks under "
+                ".fluid/runs/, and a renamed contract.id gets a new OpenTofu workdir under "
+                ".fluid/iac/<provider>/"
+            ),
+        ],
         None,
     ),
     "output_write_failed": (

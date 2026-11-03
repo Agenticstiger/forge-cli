@@ -119,8 +119,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against the live `row_filter` and each column's `mask` from the GetTable it already reads, and
   each bound function read back for its owner (this verify's identity or the table's owner),
   body, parameters and return type; a missing or different binding is CRITICAL with `fluid
-  apply` as the fix, and a contract that restricts nothing skips it. `policy.privacy.masking`
-  (landing-time masking), `rowLevelPolicy` and `binding.governance` are still refused. Proven
+  apply` as the fix, and a contract that restricts nothing skips it. `rowLevelPolicy` and
+  `binding.governance` are still refused, and `policy.privacy.masking` (landing-time masking) is
+  refused unless a DuckDB acquisition writes the expose (see the bronze landing entry). Proven
   against the in-process stand-in with a real `tofu` apply, and the function bodies evaluated
   in DuckDB; not run against a live workspace: that `CREATE FUNCTION IF NOT EXISTS`, `SET ROW
   FILTER` (with `ON ()` as well) and `SET MASK` behave as the stand-in models them, that `SET`
@@ -130,7 +131,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written, that `current_user()` is a service principal's application ID, and what a warehouse
   of each type enforces are unproven.
 
+- **`lifecycle.expire` on a Databricks table is accepted when the table is rebuilt in full and
+  its Delta history is limited.** It used to be refused (`databricks-retention-unmapped`):
+  nothing on Databricks deletes rows by age. A table rewritten whole on every run holds no row
+  copy older than a run except in its Delta history, which `VACUUM` (run by predictive
+  optimization on Unity Catalog managed tables) empties after `delta.logRetentionDuration`
+  (30 days by default) and `delta.deletedFileRetentionDuration` (7 days). So the emitter and
+  `fluid validate` now accept `expire: true` when every build writing the expose is a dbt build
+  whose model for the table resolves to `materialized: table`, or forge-cli's DuckDB acquisition
+  with `properties.source.mode: full_refresh` (its Databricks landing overwrites the whole table,
+  and runs no other mode; another mode is `databricks-retention-incremental`, none `-unmapped`),
+  and `lifecycle.retention` is at least the larger of the two history properties (the model's
+  `tblproperties` when it sets them). The model is the one whose `alias`, else file name, is the
+  expose's table, with `materialized` resolved as dbt does: `config()` in the SQL, then the
+  model's YAML `config:`, then `dbt_project.yml` by the most specific path; the default is `view`.
+  The build must also run that model: its `--select` (`properties.model` / `select`, as
+  `build_selectors` makes it) must include the model by name, fully qualified name (dbt-core
+  1.11's fqn method: an exact prefix, with or without the project's name, a wildcard globbing the
+  whole rest of the name) or path, else
+  `databricks-retention-not-selected` (graph operators on another node, tags, configs and state
+  cannot be evaluated here and are refused too). A table name, retention or source mode that is
+  still an `{{ env.X }}` placeholder is left by `fluid validate` to the emitter, which checks it
+  substituted, and `fluid verify` reads the contract with its placeholders substituted, as `fluid
+  apply` does.
+  Refused, with the fix: `databricks-retention-incremental` (`incremental`, `snapshot`),
+  `-not-table` (`view` and the rest), `-dbt-unresolved` (a Git repository, or a value that is not
+  a plain literal: `var()`, a conditional `config()`, a custom `schema`), `-too-short`
+  (a retention under the history, so under 30 days by default), `-period` (missing or not ISO 8601)
+  and `-unmapped` (any other writer, or none). ISO 8601 years and months are counted at their
+  shortest (P1Y = 365 days, P1M = 28 days), so the check never passes a retention that is too
+  short. `fluid verify` gains a `retention` dimension: the live table's Delta history
+  (`properties` and `delta_runtime_properties_kvpairs`) must not exceed the contract's retention
+  (CRITICAL, with the `ALTER TABLE ... SET TBLPROPERTIES`), and predictive optimization off for
+  the table is a warning with the fix (enable it, or schedule `VACUUM`), as is a table GetTable
+  serves without any properties (Delta's defaults were assumed; check `SHOW TBLPROPERTIES`);
+  skipped without `expire`. Not run against a live workspace: which property names Unity Catalog's GetTable
+  serves for a table's Delta retention, and what predictive optimization reports, are modelled
+  on databricks-sdk-go v0.190.0, not observed.
+
+- **A Databricks `accessPolicy` grant scoped by `resources` lands on the tables it names.** It used
+  to be refused (`databricks-grant-scope-unmapped`) whatever it named, which blocked every product
+  whose grants carry `resources: ["$.exposes[?(@.exposeId=='<id>')]"]`. The emitter now evaluates
+  that shape (single or double quotes, spaces allowed) and `$.exposes[*]` / `$.exposes` (every
+  expose), and grants only on the matching tables; several resources add up. A grant without
+  `resources` still covers every table. Any other JSONPath (`$.exposes[0]`, a filter on another
+  field, `||`, a path below the expose), alone or beside a good one, and an exposeId this contract
+  does not have, stay `databricks-grant-scope-unmapped`, with a message that names the resource and
+  says the grant is refused rather than placed on more tables than it names; a blank resource
+  (`""`) is one of those, not "every expose". `fluid validate` and
+  the emitter read the one `_compile` verdict, and `fluid verify`'s catalog-access check reads the
+  per-table grants, so a scoped reader is checked only where it is granted. The scope is parsed
+  once, in `iac/access.py` (`AccessGrant.scope`); what the AWS and GCP emitters produce is
+  unchanged. Known gap, not fixed here: the GCP emitter applies every `accessPolicy` grant to every
+  expose and never reads `resources`, and the AWS emitter does not read `accessPolicy.grants`, so a
+  scoped grant is not scoped there.
+
+- **The DuckDB acquisition runner lands a Databricks expose in its table, and `policy.privacy.masking`
+  is accepted on one it writes.** For `platform: databricks` the runner used to write a LOCAL file
+  (`location.path`, else `out/`) and report success with nothing in Databricks. It now hashes (or
+  tokenizes, encrypts, masks) at landing as before, writes Parquet under `.fluid/staging`, uploads it
+  through the Files API to `DATABRICKS_STAGING_VOLUME` (`/Volumes/<catalog>/<schema>/<volume>`, from
+  the environment only, like `DATABRICKS_WAREHOUSE_ID`) as `<product>/<build>/<run id>/<file>.parquet`,
+  and runs one statement on the warehouse, `INSERT OVERWRITE <catalog>.<schema>.<table>
+  (<the contract's columns>) SELECT <the same columns> FROM read_files('<the staged file>', format =>
+  'parquet')`: a full refresh, each value into the column of its name, that rewrites the rows and keeps the table's definition, grants, tags, row filter and column masks.
+  It reads only the file the run uploaded, never the directory, so a file someone else puts there is
+  not loaded. The staged files are deleted afterwards whether or not the load worked, and on Ctrl-C
+  too (an INSERT the warehouse has answered for is cancelled first); a file that cannot be deleted
+  fails the run and is named first in the error. A run killed outright cannot clean up, so each
+  load first deletes what earlier runs of the same build left under `<volume>/<product>/<build>/`:
+  only a directory named like a run id that holds nothing but Parquet files, all over an hour old
+  (a run still in progress keeps its upload, and a directory forge-cli did not stage is left).
+  Give the staging a volume of its own. The run record gains
+  `facets.databricks_load` (table, rows loaded, where it staged, that it deleted, and
+  `earlier_runs_staging_deleted`). The table must exist: a missing one fails naming
+  `fluid apply`, and the runner never creates or alters a table. An unset volume or warehouse, a
+  mode other than `full_refresh`, a sink other than Parquet and more than one stream are refused
+  before anything runs, and the emitter refuses the mode and the sink format already
+  (`databricks-landing-unsupported`), with any masking rule the runner cannot apply
+  (`databricks-masking-invalid`), so `fluid validate` says so before `fluid apply` creates the
+  table. Every other platform's landing is unchanged. The Databricks emitter now
+  accepts `policy.privacy.masking` on an expose when every build that writes it is a DuckDB
+  acquisition build (the runner applies the mask before the data leaves the machine, as on AWS), and
+  keeps refusing it, with the reason, for a dbt-written expose, another engine, or no build at all;
+  `fluid validate` and `fluid apply` read the one `_compile` verdict. `rowLevelPolicy` and
+  `binding.governance` are still refused. Proven against the in-process stand-in (Files API,
+  `INSERT OVERWRITE ... read_files` over the uploaded Parquet in DuckDB) with a real `tofu` apply
+  followed by the build; not run against a live workspace: what `read_files` and `INSERT OVERWRITE`
+  do on a managed table that carries a mask and a row filter, that `INSERT OVERWRITE` keeps them,
+  the Files API's limits, and whether a type the Parquet carries is accepted by the table's are
+  unproven. The run-time schema gate still compares a declared `string` with DuckDB's `VARCHAR` as a
+  type change; declare `varchar` for a column the source reads as text.
+
 ### Fixed
+
+- **`fluid apply --mode amend-and-build` provisioned a product, then refused its id.** The build
+  phase keeps run records, cursors and watermarks under `.fluid/runs/<contract.id>/<build.id>/`,
+  so its ids must start with a letter or underscore, use only letters, digits, `_`, `.` and `-`,
+  and be at most 128 characters. The contract schema allows more (`1orders`, or a longer id), so
+  `fluid validate` and `fluid plan` passed such an id. Only the build runner checked it, and on the
+  OpenTofu engine (AWS, GCP, Snowflake, Confluent, Databricks and IaC plugin clouds) the runner
+  starts after `tofu apply`: the infrastructure was created, and the run then stopped with
+  "Unexpected error". A build mode (`amend-and-build`, `replace-and-build`) now checks
+  `contract.id` and every `builds[].id` before the apply hooks, `tofu` and the runner, on both
+  engines, and refuses with `ERR_APPLY_BUILD_IDENTIFIER_INVALID`, which names the id, says nothing
+  was applied and suggests a rename. A mode without a build phase, and a contract without builds,
+  are not checked, as before.
 
 - **`fluid diff --baseline` reported nothing for column changes in a 0.7.x contract.** It read
   columns from `exposes[].schema`, but a 0.7.x contract keeps them in `exposes[].contract.schema`
@@ -167,6 +273,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pip install fluid-build[...]`; they now name `data-product-forge` with the right extra, and a
   ratchet test keeps the wrong name out. `data-product-forge[mcp]` resolves as an empty alias.
   `fluid-build` on PyPI is now only an alias that installs `data-product-forge`.
+- **Two applies on the same S3 state could race.** The S3 backend was emitted without locking, so a
+  scheduled apply and a manual one (or an apply and a teardown) wrote the same state unguarded.
+  `tofu init` now gets `-backend-config=use_lockfile=true` for an S3 backend on OpenTofu 1.10 or
+  newer; the emitted module is unchanged. On an older OpenTofu a WARNING says the state is
+  unlocked. Upgrade note: `tofu plan` takes the lock too, so every role that runs plan,
+  `fluid apply --dry-run`, `fluid diff` or `fluid verify --state-drift` against S3 state needs
+  `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `<key>.tflock`, or sets
+  `FLUID_TOFU_S3_LOCKFILE=0`. A workdir kept from before the upgrade is re-initialised with
+  `-reconfigure` once, only when it recorded this same bucket, key and region. The opt-out also takes effect on a
+  workdir that already had locking on. A run killed hard can leave `<key>.tflock` behind;
+  `tofu force-unlock <ID>` in the workdir (the ID is in tofu's error) clears it. A run that
+  hits `FLUID_TOFU_TIMEOUT_SECONDS` is now interrupted (SIGINT) so tofu releases the lock, and
+  killed only if it ignores that for 30 seconds.
+- **A column type AWS Glue or BigQuery could not hold was written anyway, and `fluid validate
+  --strict` passed.** The Glue emitter mapped 22 type names and turned every other one into
+  `string`: 47 of the 79 types the schema admits, among them `smallint`, `tinyint`, `int2`,
+  `int4`, `int8`, `real`, `money`, `bit`, `year`, `datetime2`, `timestamptz` and the other
+  timestamp spellings, `varbinary` and `blob`, and every array, struct, map, object, record and
+  row. The BigQuery emitter wrote `ARRAY` for an array, which is not a BigQuery column type (an
+  array is a REPEATED column of an element type), and a `STRUCT` with no fields, which BigQuery
+  rejects at apply, after the dataset was created; the element type of `array(string)` was
+  dropped on both clouds. Every type is now classified for each cloud. Each scalar with a Hive or
+  Athena type gets it (`smallint`, `int`, `bigint`, `float`, `double`, `timestamp`, `binary`,
+  `money` as `decimal(19,4)`, `bit` as `boolean`, `year` as `smallint`; the zone-aware
+  timestamps are `timestamp`, which keeps the UTC instant and not the offset; a bare `number` is
+  `decimal(38,9)`, as a bare `decimal` always was). A type Glue has no form for but that keeps
+  its value as text (`json`, `jsonb`, `variant`, `super`, `time`, `interval`, `bignumeric`) is
+  still written as `string`, and `fluid validate` now warns for it, so `--strict` fails; BigQuery
+  warns for `geometry` and `geom`, which are planar and become the spherical `GEOGRAPHY`, and
+  for a `decimal(p,s)` wider than a BigQuery NUMERIC holds (29 integer and 9 fractional digits;
+  declare `bignumeric`). A
+  type with no faithful form at all is refused with kind `column-type`: an array, struct, map,
+  object, record or row (also `array(string)`), a `bit(n)` wider than one bit and a type no
+  table maps, on both clouds, and on Glue also `geography`, `geometry`, `geom`, `point` and
+  `hll`, and a decimal Hive would reject (precision over 38 or 0, a scale over the precision
+  or below 0). The
+  refusal names the expose, each column, its declared type and why, and the fix (declare `json`
+  or `string` for now; typed nested columns are planned). `fluid validate`, `fluid generate iac`
+  and `fluid apply` raise the same refusal from the same function, so a contract that passes
+  validate cannot fail generate on a type. A BigQuery view carries no schema and is not checked.
+  `fluid verify` and `fluid diff` compare the live table with the new mapping, so a Glue table
+  applied by an earlier version reports type mismatches (verify: CRITICAL; diff: drift) on those
+  columns until `fluid apply` runs; verify's "require table recreation" wording is wrong for
+  these columns, a re-apply updates them in place. Changing a Glue column's type in place is
+  held by the data-loss gate: `fluid apply` (and its dry run) refuses, naming each table and
+  `column: old -> new`, until `--allow-data-loss`, because Parquet written under the old type
+  (Athena INSERT or CTAS, dbt) may stop reading until it is rewritten, and reverting the type
+  restores reads; a difference in spacing alone (`decimal(10, 2)`) is no change. The 0.16.2
+  note that only a bare `array` has no BigQuery form is superseded: an array of any element type and every
+  struct-like type are refused until the contract schema can declare element and field types.
+  BigQuery decimal precision and scale are still not emitted.
+
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
@@ -216,6 +374,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dimension that reads the workspace's metastore summary for every table the module manages: it
   passes when the region matches the declaration, fails with the fix when it does not, and is
   skipped when the contract declares none.
+- **An AWS contract's schedule was dropped without a word, and the one it got was not labelled.**
+  The workflow Lambda was named `fluid-workflow-<id>` raw, so a dotted id (the schema's own
+  example is `gold.hr.employee_360_v1`, and 27 of 28 examples use dots) or one over about 49
+  characters failed the plan validator, and `native_actions` swallowed the refusal at DEBUG:
+  `fluid generate iac` and `fluid apply` logged "Planned EventBridge schedule", wrote the Glue and
+  S3 resources and no `aws_lambda_function`, `aws_lambda_permission` or `aws_scheduler_schedule`,
+  exit 0. Every name the schedule planner derives from an id (Lambda functions, permission
+  statement ids, the schedule, event rules, the state machine, the MWAA environment) now goes
+  through one helper that replaces what the service refuses with `-` and, when it had to change
+  the name at all (a replacement, or a cut to the service limit), ends it in a hash of the whole
+  id, so `a.b` and `a-b` cannot share one Lambda and two long ids stay apart; a name the service
+  already accepts is left as written, so nothing deployed is renamed. A plan its own validator
+  rejects, an orchestration task the planner rejects and a schedule-planner failure are a typed
+  `PlanValidationError`, matched by type through the cause chain like a sovereignty refusal:
+  `generate iac` exits non-zero and `apply` raises, where a planner that could not run (no SDK,
+  no credentials) stays best-effort. This holds for every AWS plan-validator refusal, so a
+  contract with no schedule that the validator refuses (a bad Glue name, say) now fails
+  `generate iac` and `apply` too, where it used to emit the module without a word (`fluid plan`
+  already refused it). The scheduled Lambda only logs each
+  task and runs no build, and both roles it names (`fluid-workflow-execution`,
+  `EventBridgeSchedulerRole`) are never created, so every plan that emits it now warns
+  `schedule_placeholder_lambda`. When no AWS account can be resolved (no `AWS_ACCOUNT_ID`, no
+  credentials for `sts:GetCallerIdentity`), a contract that declares orchestration (a schedule,
+  triggers or tasks) is refused by name, before any name is derived from it, rather than as a Glue
+  or S3 name `None-fluid-staging` the validator would reject, and the message says so when the
+  cause is a missing boto3 (`pip install 'data-product-forge[aws]'`) rather than credentials. A
+  contract without orchestration needs no native plan and applies its exposes as before; the
+  sovereignty check still runs first either way.
+- **The AWS plan validator refused dotted S3 bucket names.** S3 allows lowercase letters, digits,
+  dots and hyphens (3-63 characters, a letter or digit at each end, no `..`, `.-` or `-.`, not
+  shaped like an IP address); the validator allowed no dot, which was harmless while its refusals
+  were swallowed and is not now that they stop `generate iac` and `apply`.
+- **A contract value could run as code in the AWS workflow Lambda.** The schedule planner spliced
+  task params and the contract id into the Lambda's Python source inside quote marks, so a task
+  param such as `'''+__import__('os').system('id')+'''` (the schema accepts any task params)
+  closed the literal and ran on every schedule tick under `fluid-workflow-execution`, and an id
+  with a trailing newline left a Lambda that was a SyntaxError. Every value now reaches the
+  source as a `repr()` literal.
+- **The same AWS contract could emit a different module from one run to the next.** The AWS
+  planner ordered its actions through a `set`, so the order changed with Python's hash seed, and
+  with it the emitted module: a Lambda permission, schedule target, event-source mapping or S3
+  notification named the function by literal ARN in one run and by
+  `${aws_lambda_function.<name>.arn}` in the next (the reference only when the function happened
+  to be planned first), so tofu sometimes had no ordering edge to the function. Actions now keep
+  the order they were planned in. Measured on 21 AWS contracts: modules without a Lambda are
+  byte-identical to before; scheduled ones now always emit the reference.
+
+### Removed
+
+- **`redshift` and `datamesh-manager` are no longer providers.** Neither deployed anything as a
+  provider: `redshift` only forwarded to `aws`, and Data Mesh Manager is a catalog. `fluid providers` now lists `aws`, `databricks`, `gcp`, `local` and `snowflake`, plus any
+  third-party plugin. Redshift objects apply through the `aws` provider, and Data Mesh Manager
+  publishing is unchanged (`fluid publish --target datamesh-manager`, `fluid datamesh-manager`).
+  **Breaking (CLI surface):** `--provider redshift` and `--provider datamesh-manager` (and
+  `FLUID_PROVIDER`) are no longer accepted; they exit 2 with the replacement
+  (`--provider aws`, or `fluid publish --target datamesh-manager`) instead of a bare "unknown
+  provider". A contract's `redshift` build runtime or expose platform is served by `aws`, and plugins
+  cannot claim either retired name.
+
+- **A failed fail-safe no longer locks the run out, and says what it could not close.** When a
+  mask or row filter cannot be bound, the lock that revokes SELECT from every grantee but the
+  owner now also skips the identity the run is (it has to repair the table), and when the
+  table's owner could not be read it says the owner could not be skipped. An owner the contract
+  itself restricts reads its table whatever is revoked: the message now names that path as still
+  open, with the `ALTER TABLE ... OWNER TO` to run. When the permission listing shows no
+  `inherited_from_*` field at all, it says it could not determine whether a schema or catalog
+  grant is open, where it claimed none was.
+
+- **A job paused for an unprotected table is announced and found.** The apply decides once, in
+  `emit`, which dbt jobs to create paused, and its notice reads that decision, so a transient
+  read error can no longer pause a job without saying so. `fluid verify` now fails the jobs
+  dimension for a job that is paused while its table's masks or row filter are not in place,
+  with the apply that binds them and starts the job as the fix.
+
+- **A changed contract no longer leaves its old masks and row filter functions behind.** After
+  a successful apply (never in a dry run, never after a failed apply or a failed bind), the
+  functions in the product schema that carry the table's `fluid_rf_<table>_`,
+  `fluid_mask_<table>_<column>_` or deny-all name and are neither expected now nor bound to any
+  table in the schema (every table is read first; if one cannot be, nothing is dropped) are
+  dropped, each printed, and only when the run's own identity owns the function: one with
+  another owner, or an owner that cannot be read, is left and named. A function without the
+  `fluid_` prefix is never touched.
+
+- **A plan that fails the residency check prints one line.** The apply showed the last 800
+  characters of the tofu JSON, which cut off the sentence naming the live region. It now says
+  the declared region, the live region (read from the diagnostic's message, or its `values`)
+  and the fix.
 
 ### Security
 
@@ -226,6 +471,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `main.tf.json`. The module's allowlists now end in `\Z`, so such a name is refused with
   `Invalid SQL identifier: 'spectrum_events\n'`. That includes a name that reaches it with a
   trailing newline from an environment variable or a file; strip the value where it is set.
+### Upgrade notes
+
+- A contract with a column typed `array`, `struct`, `map`, `object`, `record` or `row` (or
+  `array(...)`) on an `aws` Glue table or a `gcp` BigQuery table now fails `fluid validate`,
+  `fluid generate iac` and `fluid apply` with `column-type`, where it validated and wrote a
+  `string` column (Glue) or an invalid one (BigQuery). Declare the column `json` (BigQuery's
+  JSON type; Glue stores it as `string` and validate warns) or `string` until typed nested
+  columns are supported.
+- Other new refusals (kind `column-type`): on Glue, `geography`, `geometry`, `geom`, `point` and
+  `hll` (previously a silent `string`; declare `string` or `binary`) and a decimal Hive rejects
+  (precision over 38 or 0, scale over the precision or below 0); on both clouds, `bit(n)` with
+  n over 1 and any type no table maps.
+- New validate warnings, so `--strict` fails: on Glue, `json`, `jsonb`, `variant`, `super`,
+  `time`, `interval` and `bignumeric` (written as `string`, as before; declare `string` to say
+  so); on BigQuery, `geometry` and `geom` (planar, written as the spherical `GEOGRAPHY`) and a
+  `decimal(p,s)` wider than a NUMERIC holds (29 integer or 9 fractional digits; declare
+  `bignumeric`).
+- A Glue table's `smallint`, `tinyint`, `real`, `money`, `timestamptz` and the other types that
+  used to become `string` now get their Hive type, which is a column type change on a table an
+  earlier version applied. `fluid apply` refuses it, and so does its dry run, until
+  `--allow-data-loss`: the refusal names each table and `column: old -> new`. Parquet files
+  written under the old `string` schema (by Athena INSERT or CTAS, or dbt) hold strings, so
+  after `string` -> `smallint` Athena fails every read of them until they are rewritten (files
+  forge's own DuckDB build wrote are fixed by the change). Reverting the column type in the
+  contract restores reads, and `--allow-data-loss` proceeds (measured against moto with real
+  `tofu`: refused without the flag, `~1` applied with it). A difference in spacing alone, such as
+  `decimal(10, 2)` and `decimal(10,2)`, never trips the gate, and neither does an added or
+  removed column, which the gate did not cover before. Consumers that compare these columns as
+  strings (`small = '5'`) may need changes. Until the apply, `fluid verify` and `fluid diff`
+  report the mismatch. With the plan's change list unreadable, an AWS apply that updates
+  anything in place now also needs the flag, as a Databricks apply already did.
+- `decimal(10, 2)` is now written `decimal(10,2)`. Against moto, that alone applies without the
+  flag; real Glue was not measured.
+
+- **Other validators let a value with a trailing newline through, too.** The same `$` ended other
+  whole-string patterns, so a value written as a YAML `|` block, read from a `.env` file or decoded
+  from `%0A` in a URL kept its newline: `fluid generate iac` put `region = "eu-west-1\n"` on the
+  AWS provider, and a Databricks job got `branch = "main\n"` from `?branch=main%0A`. They now end
+  in `\Z` or are matched with `fullmatch`, so such a value is refused with the validator's usual
+  message, or takes the path the code already has for a value that is not a plain name: a product
+  id forged from a JDBC source or imported from dbt or ODCS is slugified. An AWS binding region
+  with whitespace around it is refused (`aws-region-whitespace`), because the sovereignty policy
+  checks the region as written. Covered: quality-check selectors, catalog and JDBC identifiers,
+  BigQuery and GCP project ids, contract, build, federation-workspace and overlay-env ids,
+  row-filter names, Singer tap and target names, prompt profile and overlay names, mission
+  predicate paths, AWS and GCP resource names, Snowflake account segments, Databricks git refs,
+  and the identifier and version checks of ODCS and ODPS imports.
+
+- **Schema validation let a value with a trailing newline through a `pattern`.** JSON Schema
+  writes `pattern` in ECMA-262, where `$` matches only at the end of the value, but the
+  jsonschema library runs it with Python's `re.search`, whose `$` also matches before a final
+  newline. So `fluid validate` accepted `id: "orders\n"`, which an `id: |` block scalar produces,
+  under every bundled schema version (0.7.1 to 0.7.7). Contract, fragment and bundle validation
+  now read `$` as the end of the value. Such a value is refused at its path, with a hint when
+  the line break is the only problem: `(it ends in a line break, which a YAML | or > block keeps
+  and |- or >- drops)`. A `sink.catalogAuth` field gets no hint, since its value is never shown.
+  The schemas themselves are unchanged.
 
 ## [0.26.0] — 2026-11-01
 

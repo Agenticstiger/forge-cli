@@ -1139,9 +1139,9 @@ def run_ai_copilot_mode(
         copilot = copilot_class()
         is_non_interactive = bool(get_cli_arg_fn(args, "non_interactive", False))
 
-        # Phase 0.2 — detect-first welcome scan. Runs in <50ms (parallel
-        # probes) and renders a populated panel so the user sees what we
-        # already know before any prompt. Skipped silently in
+        # Phase 0.2 — detect-first welcome scan. Parallel probes under a
+        # wall-clock cap (see ``_welcome_scan``) render a populated panel so
+        # the user sees what we already know before any prompt. Skipped silently in
         # non-interactive runs and for return users (forge_count >= 5).
         # Set FLUID_FORGE_NO_WELCOME=1 to suppress for tests / CI.
         if (

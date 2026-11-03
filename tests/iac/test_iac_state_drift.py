@@ -26,7 +26,6 @@ the table deleted by hand. The same scenarios run end to end in
 from __future__ import annotations
 
 import json
-import subprocess
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -340,18 +339,26 @@ def test_format_path():
 # ---------------------------------------------------------------------------
 
 
-def _fake_run(calls: List[List[str]], *, returncode: int = 0, stdout: str = ""):
-    def _run(argv, **kwargs):
-        calls.append(list(argv))
-        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+def _fake_popen(calls: List[List[str]], *, returncode: int = 0, stdout: str = ""):
+    """A ``subprocess.Popen`` stand-in: ``runner._run`` starts tofu with Popen so a
+    timeout can interrupt it before killing it."""
 
-    return _run
+    class _Child:
+        def __init__(self, argv, **kwargs):
+            calls.append(list(argv))
+            self.args = argv
+            self.returncode = returncode
+
+        def communicate(self, timeout=None):
+            return stdout, ""
+
+    return _Child
 
 
 def test_tofu_plan_detailed_asks_for_the_detailed_exit_code(monkeypatch, tmp_path):
     calls: List[List[str]] = []
     monkeypatch.setattr(runner, "tofu_path", lambda: "/bin/tofu")
-    monkeypatch.setattr(runner.subprocess, "run", _fake_run(calls, returncode=2))
+    monkeypatch.setattr(runner.subprocess, "Popen", _fake_popen(calls, returncode=2))
     result = runner.tofu_plan_detailed(str(tmp_path), out_file="fluid-drift.tfplan")
     assert calls[0][1:] == [
         "plan",
@@ -377,7 +384,7 @@ def test_tofu_show_plan(monkeypatch, tmp_path, returncode, stdout, expected):
     calls: List[List[str]] = []
     monkeypatch.setattr(runner, "tofu_path", lambda: "/bin/tofu")
     monkeypatch.setattr(
-        runner.subprocess, "run", _fake_run(calls, returncode=returncode, stdout=stdout)
+        runner.subprocess, "Popen", _fake_popen(calls, returncode=returncode, stdout=stdout)
     )
     assert runner.tofu_show_plan(str(tmp_path), plan_file="p") == expected
     assert calls[0][1:] == ["show", "-json", "p"]

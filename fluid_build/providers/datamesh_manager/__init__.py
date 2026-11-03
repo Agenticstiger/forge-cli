@@ -20,17 +20,11 @@ Publishes FLUID contracts to Data Mesh Manager / Entropy Data platform.
 
 from fluid_build.providers.datamesh_manager.datamesh_manager import DataMeshManagerProvider
 
-# Self-register with the provider registry so ``fluid providers`` lists us
-# and ``discover_providers()`` picks us up automatically.
-try:
-    from fluid_build.providers import register_provider
+# Data Mesh Manager is a catalog, not a deployment provider: it is reached by
+# ``fluid publish --target datamesh-manager`` and ``fluid datamesh-manager``,
+# which import the class directly. Opt out of every passive registration
+# (including the single-BaseProvider-subclass fallback) so it stays out of
+# ``fluid providers``.
+__fluid_no_autoregister__ = True
 
-    register_provider("datamesh-manager", DataMeshManagerProvider)
-except Exception:
-    pass  # Registry not yet available (e.g. during isolated import)
-
-# Expose NAME + Provider for auto-discovery strategy 2 as a fallback
-NAME = "datamesh-manager"
-Provider = DataMeshManagerProvider
-
-__all__ = ["DataMeshManagerProvider", "NAME", "Provider"]
+__all__ = ["DataMeshManagerProvider"]

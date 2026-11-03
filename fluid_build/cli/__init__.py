@@ -152,9 +152,10 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
         # Deliberately NO argparse ``choices``. The provider set is a registry
         # (built-ins + ``fluid_build.providers`` entry-point plugins), and the
         # hardcoded enum disagreed with it in both directions: it rejected
-        # ``redshift`` and ``datamesh_manager``, which ``fluid providers``
-        # lists, and accepted ``azure``, which is not registered at all — and a
-        # pip-installed provider plugin could never be passed. Enumerating the
+        # ``redshift`` and ``datamesh_manager`` (then registered; since retired,
+        # see ``RETIRED_PROVIDERS``), and accepted ``azure``, which is not
+        # registered at all — and a pip-installed provider plugin could never be
+        # passed. Enumerating the
         # registry here is not an option: discovery imports every provider
         # module, and ``build_parser()`` is the ``fluid --help`` cold path.
         # The value is validated against the live registry in
@@ -344,12 +345,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         # `--provider` / `FLUID_PROVIDER` keeps its current startup cost
         # (tests/perf/test_startup_budget.py).
         requested_provider = getattr(args, "provider", None)
+        # A retired name needs no discovery: the answer is the same whatever the
+        # registry holds, and a registry that failed to load must not hide it.
+        from fluid_build.providers import retired_provider_hint
+
+        retired = bool(requested_provider) and retired_provider_hint(requested_provider) is not None
         known_providers = (
             _known_provider_names()
-            if requested_provider and requested_provider != _PROVIDER_AUTO
+            if requested_provider and requested_provider != _PROVIDER_AUTO and not retired
             else []
         )
         _validate_global_args(args, cli.logger, known_providers=known_providers)
+        if retired:
+            return 2
         if requested_provider and known_providers and requested_provider not in known_providers:
             return 2
 
@@ -750,8 +758,17 @@ def _validate_global_args(
         # would drag provider discovery onto the `--help` path. Checking it
         # here means the accepted values are exactly what `fluid providers`
         # lists, plugins included.
-        known = _known_provider_names() if known_providers is None else known_providers
-        if known and args.provider not in known and args.provider != _PROVIDER_AUTO:
+        from fluid_build.providers import retired_provider_hint
+
+        retired_hint = retired_provider_hint(args.provider)
+        known = (
+            []
+            if retired_hint
+            else (_known_provider_names() if known_providers is None else known_providers)
+        )
+        if retired_hint:
+            issues.append(retired_hint)
+        elif known and args.provider not in known and args.provider != _PROVIDER_AUTO:
             issues.append(
                 f"Unknown provider '{args.provider}' — installed providers: "
                 f"{', '.join(known)} (see `fluid providers`)"

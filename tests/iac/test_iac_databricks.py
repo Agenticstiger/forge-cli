@@ -694,7 +694,7 @@ def test_unset_warehouse_is_refused(monkeypatch):
             {"principal": "group:x", "permissions": ["read"], "conditions": {"ip": "1"}},
             "conditions",
         ),
-        ({"principal": "group:x", "permissions": ["read"], "resources": ["$.exposes"]}, "scope"),
+        ({"principal": "group:x", "permissions": ["read"], "resources": ["$.exposes[0]"]}, "scope"),
         ({"principal": "user:bob@corp.example", "permissions": ["read"]}, "principal-placeholder"),
         ({"principal": "serviceAccount:sa@p.iam", "permissions": ["read"]}, "principal-unmapped"),
     ],
@@ -1048,6 +1048,58 @@ class TestExplainPlanFailure:
         refusal = self.plugin.explain_plan_failure(out, _contract(), [])
         assert refusal.kind == "databricks-workspace-unreachable"
 
+    RESIDENCY = (
+        "The contract declares binding.location.region eu-central-1, but the workspace "
+        "DATABRICKS_HOST names is in us-west-2. Residency is checked against the workspace's "
+        "metastore. Point DATABRICKS_HOST at a workspace in eu-central-1, or correct "
+        "binding.location.region."
+    )
+
+    def _residency_json(self, padding=2000):
+        diagnostic = {
+            "severity": "error",
+            "summary": "Resource precondition failed",
+            "detail": self.RESIDENCY,
+            "range": {"filename": "main.tf.json"},
+            "snippet": {
+                "code": "x" * padding,
+                "values": [
+                    {
+                        "traversal": "data.databricks_current_metastore.m.metastore_info[0].region",
+                        "statement": 'is "us-west-2"',
+                    }
+                ],
+            },
+        }
+        return json.dumps({"@level": "error", "diagnostic": diagnostic})
+
+    def test_a_residency_failure_is_one_clean_line_with_both_regions_and_the_fix(self):
+        out = self._residency_json()
+        assert len(out) > 1600, "the engine's tail would cut the sentence"
+        refusal = self.plugin.explain_plan_failure(out, _contract(), [])
+        text = str(refusal)
+        assert refusal.kind == "databricks-residency-region"
+        assert "\n" not in text and not refusal.remediation
+        assert "eu-central-1" in text and "us-west-2" in text
+        assert "DATABRICKS_HOST" in text and "binding.location.region" in text
+
+    def test_a_residency_failure_in_the_wrapped_human_output(self):
+        out = "Error: Resource precondition failed\n\n  on main.tf.json line 3:\n\n" + "\n".join(
+            "  " + line for line in __import__("textwrap").wrap(self.RESIDENCY, 60)
+        )
+        text = str(self.plugin.explain_plan_failure(out, _contract(), []))
+        assert "eu-central-1" in text and "us-west-2" in text and "\n" not in text
+
+    def test_the_live_region_comes_from_the_diagnostic_values_when_the_text_lacks_it(self):
+        diagnostic = {
+            "detail": "The contract declares binding.location.region eu-central-1, but the "
+            "workspace DATABRICKS_HOST names is in (unknown).",
+            "snippet": {"values": [{"statement": 'is "us-west-2"'}]},
+        }
+        out = json.dumps({"diagnostic": diagnostic})
+        text = str(self.plugin.explain_plan_failure(out, _contract(), []))
+        assert "us-west-2" in text and "eu-central-1" in text
+
     def test_anything_else_is_left_alone(self):
         assert self.plugin.explain_plan_failure("Error: 503", _contract(), []) is None
 
@@ -1273,3 +1325,13 @@ def test_the_native_simple_apply_never_takes_the_platform():
         _simple_apply_provider(contract, _LOG)
     assert exc.value.event == "apply_platform_unsupported"
     assert "exposes[0].binding.platform: databricks" in exc.value.context["error"]
+
+
+@pytest.mark.parametrize(
+    "value", [{1: "a", "b": "c"}, {__import__("datetime").date(2024, 1, 1): "x"}]
+)
+def test_a_contract_json_cannot_key_reuses_no_pause_decision(value):
+    contract = _contract()
+    contract["metadata"] = {"free_form": value}
+    assert dbx._contract_key(contract) is None
+    IAC_PLUGINS["databricks"].emit(contract)  # no TypeError from the key

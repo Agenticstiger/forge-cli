@@ -37,6 +37,7 @@ an existing allowed edge (``cli/apply.py`` already imports
 from __future__ import annotations
 
 import re
+from typing import Any, Mapping, Optional
 
 # A permissive regex, identical to ``validate_ident`` in
 # ``providers/_sql_safety``: alphanumerics + dots + dashes + underscores,
@@ -44,11 +45,21 @@ import re
 # DOS-via-filename attacks. Crucially this excludes ``/``, ``\``, ``..``
 # (a leading dot is rejected) and any path separator, so a validated id
 # can never traverse out of the directory it is joined into.
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]{0,127}$")
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]{0,127}\Z")
 
 
 class IdentifierViolation(ValueError):
-    """Raised when a contract identifier fails validation."""
+    """Raised when a contract identifier fails validation.
+
+    ``kind`` and ``value`` name the id that failed when the raiser knows it
+    (:func:`validate_identifier` always does), so a caller can report it
+    without parsing the message.
+    """
+
+    def __init__(self, message: str, *, kind: Optional[str] = None, value: Any = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.value = value
 
 
 def validate_identifier(value: str, *, kind: str) -> str:
@@ -65,6 +76,30 @@ def validate_identifier(value: str, *, kind: str) -> str:
             f"{kind} {value!r} is not a valid identifier "
             "(must match ^[A-Za-z_][A-Za-z0-9_.\\-]{0,127}$). This guard "
             "blocks template-injection / path-traversal attacks via "
-            "attacker-controlled contract metadata."
+            "attacker-controlled contract metadata.",
+            kind=kind,
+            value=value,
         )
     return value
+
+
+def validate_build_ids(contract: Mapping[str, Any]) -> None:
+    """Validate the ids a contract's build phase uses: ``contract.id`` and each ``builds[].id``.
+
+    The build runner (``base.run_builds_from_args``) runs this before any
+    build, and ``fluid apply`` runs it before it applies anything, so the two
+    refuse the same ids. A contract with no builds has no build phase and is
+    not checked. An empty or absent id is skipped: it cannot traverse, and the
+    state store falls back to a safe default. A ``builds`` entry that is not a
+    mapping is left to the schema gate.
+
+    Raises :class:`IdentifierViolation` for the first id that fails.
+    """
+    builds = contract.get("builds") or []
+    if not builds:
+        return
+    if contract.get("id"):
+        validate_identifier(contract["id"], kind="contract.id")
+    for build in builds:
+        if isinstance(build, Mapping) and build.get("id"):
+            validate_identifier(build["id"], kind="build.id")

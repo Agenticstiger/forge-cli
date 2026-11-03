@@ -64,7 +64,7 @@ _SCHEMA_VERSION_RE = re.compile(r"/v(\d+)\.json")
 _REF_RE = re.compile(r"ref\(\s*(?:['\"][^'\"]+['\"]\s*,\s*)?['\"]([^'\"]+)['\"]\s*\)")
 
 # FLUID identifier pattern (schema `$defs.identifier`).
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*[A-Za-z0-9_]$|^[A-Za-z0-9_]$")
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*[A-Za-z0-9_]\Z|^[A-Za-z0-9_]\Z")
 
 # dbt folder layer → medallion layer (mirrors engines/dbt/models.py).
 _LAYER_TO_MEDALLION = {"staging": "Bronze", "intermediate": "Silver", "marts": "Gold"}
