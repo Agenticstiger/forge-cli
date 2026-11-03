@@ -103,7 +103,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         - Metadata and governance completeness
         - Optional drift detection against historical results
 
-        Supports all FLUID providers: gcp, snowflake, aws, local.
+        Supports all FLUID providers: aws, databricks, gcp, local, snowflake.
         """,
         epilog="""
 Examples:
@@ -139,7 +139,9 @@ Examples:
 
     # --- optional ---
     p.add_argument("--env", help="Environment overlay (dev/test/prod)")
-    p.add_argument("--provider", help="Override provider platform (gcp, snowflake, aws, local)")
+    p.add_argument(
+        "--provider", help="Override provider platform (aws, databricks, gcp, local, snowflake)"
+    )
     p.add_argument("--project", help="Override project/account ID")
     p.add_argument("--region", help="Override region/location")
 

@@ -217,6 +217,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes when the region matches the declaration, fails with the fix when it does not, and is
   skipped when the contract declares none.
 
+### Removed
+
+- **`redshift` and `datamesh-manager` are no longer providers.** Neither deployed anything as a
+  provider: `redshift` only forwarded to `aws`, and Data Mesh Manager is a catalog. `fluid providers` now lists `aws`, `databricks`, `gcp`, `local` and `snowflake`, plus any
+  third-party plugin. Redshift objects apply through the `aws` provider, and Data Mesh Manager
+  publishing is unchanged (`fluid publish --target datamesh-manager`, `fluid datamesh-manager`).
+  **Breaking (CLI surface):** `--provider redshift` and `--provider datamesh-manager` (and
+  `FLUID_PROVIDER`) are no longer accepted; they exit 2 with the replacement
+  (`--provider aws`, or `fluid publish --target datamesh-manager`) instead of a bare "unknown
+  provider". A contract's `redshift` build runtime or expose platform is served by `aws`, and plugins
+  cannot claim either retired name.
+
 ### Security
 
 - **`validate_ident` let a name with a trailing newline through.** Python's `$` also matches just
