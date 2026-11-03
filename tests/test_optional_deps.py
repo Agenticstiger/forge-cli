@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.abc
+import importlib.metadata
 import importlib.util
 import logging
 import subprocess
@@ -246,8 +247,6 @@ def test_doctor_shows_the_extra_for_a_missing_optional_runtime(block, cli, top, 
 
 
 def test_doctor_imports_neither_litellm_mcp_nor_openlineage_and_reports_versions(tmp_path):
-    from importlib import metadata
-
     code = textwrap.dedent(
         """
         import sys
@@ -259,12 +258,10 @@ def test_doctor_imports_neither_litellm_mcp_nor_openlineage_and_reports_versions
         print("NMODS=%d" % len(sys.modules))
         """
     )
-    import fluid_build
-
     env = {
         "PATH": "/usr/bin:/bin",
         # the package under test, not whichever copy the interpreter finds first
-        "PYTHONPATH": str(Path(fluid_build.__file__).resolve().parent.parent),
+        "PYTHONPATH": str(REPO),
         "HOME": str(tmp_path),
         "FLUID_NONINTERACTIVE": "1",
         "NO_COLOR": "1",
@@ -279,9 +276,9 @@ def test_doctor_imports_neither_litellm_mcp_nor_openlineage_and_reports_versions
         timeout=180,
     )
     assert "IMPORTED=[]" in proc.stdout, proc.stdout[-2000:] + proc.stderr[-2000:]
-    assert f"litellm {metadata.version('litellm')}" in proc.stdout
+    assert f"litellm {importlib.metadata.version('litellm')}" in proc.stdout
     for dist in ("mcp", "openlineage-python"):
-        assert f"{dist} {metadata.version(dist)}" in " ".join(proc.stdout.split())
+        assert f"{dist} {importlib.metadata.version(dist)}" in " ".join(proc.stdout.split())
     assert "(unknown)" not in proc.stdout
 
 
