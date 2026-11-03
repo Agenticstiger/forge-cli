@@ -407,6 +407,24 @@ def test_cli_error_context_is_redacted_and_control_characters_are_spelled_out(mo
     assert "detail:" in out
 
 
+def test_cli_error_prints_no_credential_shape_the_full_redactor_knows(monkeypatch, capsys):
+    leaky = (
+        "AKIAIOSFODNN7EXAMPLE Authorization: Bearer abcdef0123456789token "
+        "postgres://admin:s3cretpw@db.example.com/orders"
+    )
+    err = CLIError(1, "opentofu_apply_failed", {"detail": leaky})
+    err.suggestions = [leaky]
+    _raise_from_command(monkeypatch, err)
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    out = _unwrapped(capsys.readouterr().out)
+    assert rc == 1
+    assert not [
+        s for s in ("AKIAIOSFODNN7EXAMPLE", "abcdef0123456789token", "s3cretpw") if s in out
+    ]
+
+
 def test_fluid_cli_error_format_for_user_prints_brackets_literally():
     """``FluidCLIError.format_for_user`` (the top-level handler's renderer) had
     the same flaw: ``exposes[orders]`` and ``pkg[gcp]`` lost their brackets."""

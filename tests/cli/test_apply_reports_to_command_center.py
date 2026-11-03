@@ -685,3 +685,47 @@ def test_a_non_string_diagnostic_field_does_not_raise():
     err = engine._apply_failure(runner.TofuResult("apply", 1, "", "", events), "/w")
 
     assert err.context["error"] == "403 (7)"
+
+
+_LEAKS = ("AKIAIOSFODNN7EXAMPLE", "abcdef0123456789token", "s3cretpw")
+
+
+def _leaky() -> str:
+    return (
+        "access key AKIAIOSFODNN7EXAMPLE, Authorization: Bearer abcdef0123456789token, "
+        "dsn postgres://admin:s3cretpw@db.example.com/orders"
+    )
+
+
+def test_a_failed_apply_diagnostic_is_redacted_before_it_is_cut():
+    detail = "x" * 780 + " postgres://admin:s3cretpw@db.example.com/orders " + _leaky()
+    events = [{"diagnostic": {"severity": "error", "summary": _leaky(), "detail": detail}}]
+
+    err = engine._apply_failure(runner.TofuResult("apply", 1, "", "", events), "/w")
+
+    shown = json.dumps(err.context)
+    assert not [leak for leak in _LEAKS if leak in shown]
+
+
+def test_a_failed_apply_without_a_diagnostic_is_redacted():
+    err = engine._apply_failure(runner.TofuResult("apply", 1, "", "Error: " + _leaky(), []), "/w")
+
+    assert not [leak for leak in _LEAKS if leak in err.context["error"]]
+
+
+@pytest.mark.parametrize(
+    "output, locked",
+    [
+        ("Error: Error acquiring the state lock\n" + _leaky(), True),
+        ("Error: could not read block device " + _leaky(), False),
+    ],
+)
+def test_a_failed_plan_is_redacted_and_names_how_to_clear_a_held_lock(output, locked):
+    plan = runner.TofuResult("plan", 1, "", output, [])
+
+    err = engine._plan_failure(object(), {}, plan, "/work/my dir", {})
+
+    assert err.event == "opentofu_plan_failed"
+    assert not [leak for leak in _LEAKS if leak in err.context["error"]]
+    hint = "\n".join(err.suggestions)
+    assert ("tofu force-unlock <id>' in '/work/my dir'" in hint) is locked

@@ -57,6 +57,7 @@ from fluid_build.iac.state_migration import (
     records_backend,
 )
 from fluid_build.iac.state_migration import reconcile_state_key as _reconcile_state
+from fluid_build.observability.secret_redactor import redact_secret_text
 
 from ._apply_cc_report import current_report
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
@@ -1138,7 +1139,17 @@ def _plan_failure(
     explained = _explained_failure(plugin, contract, output, workdir, env)
     if explained is not None:
         return explained
-    return CLIError(1, "opentofu_plan_failed", {"error": _tail(plan.stderr or plan.stdout)})
+    err = CLIError(
+        1,
+        "opentofu_plan_failed",
+        {"error": _tail(redact_secret_text(plan.stderr or plan.stdout or ""))},
+    )
+    if _mentions_state_lock(output):
+        err.suggestions = list(err.suggestions) + [
+            "The state is locked: wait for the other run, or clear a stale lock with "
+            f"'tofu force-unlock <id>' in {shlex.quote(workdir)}"
+        ]
+    return err
 
 
 def _guard_region_move(
@@ -1568,9 +1579,11 @@ def _apply_failure(result: Any, workdir: str) -> CLIError:
     locked = False
     if diagnostics:
         first = diagnostics[0]
-        address = str(first.get("address") or "").strip()
-        detail = str(first.get("detail") or "").strip()
-        summary = str(first.get("summary") or "").strip() or "tofu apply failed"
+        # Redacted before it is cut: a credential split at the limit (a URL that lost
+        # its ``@``) matches no pattern.
+        address = redact_secret_text(str(first.get("address") or "").strip())
+        detail = redact_secret_text(str(first.get("detail") or "").strip())
+        summary = redact_secret_text(str(first.get("summary") or "").strip()) or "tofu apply failed"
         context["error"] = summary + (f" ({address})" if address else "")
         if address:
             context["resource"] = address
@@ -1582,7 +1595,7 @@ def _apply_failure(result: Any, workdir: str) -> CLIError:
     else:
         output = result.stderr or result.stdout or ""
         context["error"] = (
-            _first_error(output, 800)
+            _first_error(redact_secret_text(output), 800)
             if "Error:" in output
             else f"tofu apply exited {getattr(result, 'returncode', 1)}"
         )

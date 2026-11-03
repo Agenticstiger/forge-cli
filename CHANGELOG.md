@@ -137,9 +137,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diagnostic (the summary, the resource address and the provider's detail) and says that OpenTofu
   records state as it goes, so fixing the cause and re-running `fluid apply` normally continues;
   `tofu state list` in the working directory shows what exists, and a state-lock error also
-  points at `tofu force-unlock`. The raw output tail is logged under `--debug`. Every value a
-  `CLIError` prints is now redacted and has its control characters spelled out, as the other
-  error handlers already did, so a provider message carrying a credential is masked.
+  points at `tofu force-unlock`, as does a plan that fails on a held state lock. The raw output
+  tail is logged under `--debug`. Every value a `CLIError` prints (context and suggestions) now
+  goes through the full secret redactor, so a provider message carrying an access key id, a
+  bearer token or a URL password is masked, and has its control characters spelled out, as the
+  other error handlers already did.
 - **`fluid roadmap` claimed a 1.0 release and the package description left providers out.** The
   roadmap said "forge-cli v1.0 shipped"; the package is 0.x Beta, and the roadmap now says so and
   calls its "v1" headings an internal milestone. A test fails if it announces a 1.x release while
