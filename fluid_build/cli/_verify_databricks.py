@@ -48,7 +48,16 @@ What is checked is what the emitter's own pass says it provisions
    or the table's owner, and its body, parameters and return type the expected ones, since a
    content-hashed name is computable from the contract and could have been taken by someone
    else's function. ``skip`` when the contract restricts nothing.
-5. **The jobs.** Each dbt build that writes the expose has exactly one job of
+5. **Retention.** An expose with ``lifecycle.expire`` is accepted because its table is rebuilt in
+   full and the contract's retention covers its Delta history (``databricks_retention.py``).
+   The table's live ``delta.logRetentionDuration`` and ``delta.deletedFileRetentionDuration``
+   (``properties`` and ``delta_runtime_properties_kvpairs`` of the GetTable already read;
+   unset means Delta's 30 and 7 days) must not make the history longer than the contract's
+   retention: CRITICAL if they do, with the ``ALTER TABLE`` that sets them. Predictive
+   optimization, which runs ``VACUUM`` on managed tables, off for the table
+   (``effective_predictive_optimization_flag``) is a warning: nothing removes the old files
+   until a ``VACUUM`` runs. ``skip`` when the contract sets no expire.
+6. **The jobs.** Each dbt build that writes the expose has exactly one job of
    its name. None means ``fluid apply`` did not run (or the job was deleted);
    several mean an apply without its state created a duplicate.
 
@@ -384,6 +393,113 @@ def _residency_dimension(client: Any, table: Any) -> Dict[str, Any]:
     }
 
 
+def _live_properties(live_table: Mapping[str, Any]) -> Dict[str, Any]:
+    """The table's properties as GetTable serves them: ``properties``, with the Delta runtime
+    ones (``delta_runtime_properties_kvpairs``, the table's current state) over them."""
+    props: Dict[str, Any] = {}
+    declared = live_table.get("properties")
+    if isinstance(declared, Mapping):
+        props.update(declared)
+    runtime = live_table.get("delta_runtime_properties_kvpairs")
+    runtime = runtime.get("delta_runtime_properties") if isinstance(runtime, Mapping) else None
+    if isinstance(runtime, Mapping):
+        props.update(runtime)
+    return props
+
+
+def _predictive_optimization(live_table: Mapping[str, Any]) -> Optional[str]:
+    """``ENABLE`` or ``DISABLE`` for the table, as Unity Catalog reports it (the effective flag,
+    else the table's own unless it inherits); ``None`` when it does not say."""
+    effective = live_table.get("effective_predictive_optimization_flag")
+    value = effective.get("value") if isinstance(effective, Mapping) else None
+    if not value:
+        value = live_table.get("enable_predictive_optimization")
+    value = str(value or "").upper()
+    return value if value in {"ENABLE", "DISABLE"} else None
+
+
+def _retention_dimension(table: Any, live_table: Mapping[str, Any]) -> Dict[str, Any]:
+    """The table's live Delta history retention against the contract's ``lifecycle.retention``.
+
+    ``skip`` when the contract sets no expire: nothing was promised. ``fail`` when the longer
+    of ``delta.logRetentionDuration`` and ``delta.deletedFileRetentionDuration`` (each at
+    Delta's default when unset) exceeds the contract's retention, or one is not an interval.
+    ``warn`` (not a failure) when predictive optimization is off for the table.
+    """
+    from fluid_build.iac.providers.databricks_retention import (
+        DELETED_FILE_RETENTION,
+        LOG_RETENTION,
+        days_text,
+        history_seconds,
+    )
+
+    promised = getattr(table, "retention_seconds", None)
+    if promised is None:
+        return {
+            "status": "skip",
+            "message": "the contract sets no lifecycle.expire to check the Delta history against",
+            "findings": [],
+            "warnings": [],
+        }
+    period = getattr(table, "retention_period", None)
+    optimization = _predictive_optimization(live_table)
+    quoted = ".".join(_quote_name(part) for part in table.full_name.split("."))
+    schema = ".".join(_quote_name(part) for part in table.full_name.split(".")[:2])
+    warnings: List[str] = []
+    if optimization == "DISABLE":
+        warnings.append(
+            f"predictive optimization is off for {table.full_name}, so nothing runs VACUUM and "
+            "the old data files stay past the retention. Enable it "
+            f"(ALTER SCHEMA {schema} ENABLE PREDICTIVE OPTIMIZATION), or schedule "
+            f"VACUUM {quoted}"
+        )
+    result: Dict[str, Any] = {
+        "retention": period,
+        "predictive_optimization": optimization,
+        "findings": [],
+        "warnings": warnings,
+    }
+    try:
+        effective = history_seconds(_live_properties(live_table))
+    except ValueError as exc:
+        return {
+            **result,
+            "status": "fail",
+            "message": f"a Delta retention property of {table.full_name} cannot be read: {exc}",
+            "findings": [{"message": str(exc)}],
+            "fix": (
+                f"Set {LOG_RETENTION} and {DELETED_FILE_RETENTION} on the table to "
+                "'interval N days'"
+            ),
+        }
+    result["history_seconds"] = effective
+    if effective > promised:
+        days = max(promised // 86400, 1)
+        fix = (
+            f"ALTER TABLE {quoted} SET TBLPROPERTIES ('{LOG_RETENTION}' = 'interval {days} "
+            f"days', '{DELETED_FILE_RETENTION}' = 'interval {days} days'), or raise "
+            "lifecycle.retention"
+        )
+        message = (
+            f"the Delta history of {table.full_name} is {days_text(effective)}, longer than "
+            f"the contract's retention {period} ({days_text(promised)})"
+        )
+        return {
+            **result,
+            "status": "fail",
+            "message": message,
+            "findings": [{"message": message}],
+            "fix": fix,
+        }
+    message = (
+        f"the Delta history of {table.full_name} is {days_text(effective)}, within the "
+        f"contract's retention {period} ({days_text(promised)})"
+    )
+    if warnings:
+        return {**result, "status": "warn", "message": message, "fix": warnings[0]}
+    return {**result, "status": "pass", "message": message}
+
+
 def _tags_dimension(client: Any, table: Any) -> Dict[str, Any]:
     """The governance tags the module sets on the table and its schema, against the live ones.
 
@@ -664,6 +780,7 @@ def _severity(
     residency: Optional[Mapping[str, Any]] = None,
     tags: Optional[Mapping[str, Any]] = None,
     enforcement: Optional[Mapping[str, Any]] = None,
+    retention: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The shared drift grading, raised to CRITICAL by a missing table, reader, job,
     a workspace outside the declared region, a governance tag that is not there or a row
@@ -699,6 +816,9 @@ def _severity(
             enforcement["message"] + ": " + "; ".join(f["message"] for f in enforcement["findings"])
         )
         actions.append(enforcement["fix"])
+    if (retention or {}).get("status") == "fail":
+        reasons.append(retention["message"])
+        actions.append(retention["fix"])
     if not reasons:
         return severity
     already = severity["level"] == "CRITICAL"
@@ -801,6 +921,7 @@ def verify_databricks_expose(
         residency = _residency_dimension(client, table)
         tags = _tags_dimension(client, table)
         enforcement = _enforcement_dimension(table, live_table, client)
+        retention = _retention_dimension(table, live_table)
         job_dim = _jobs_dimension(client, expose_id, contract, jobs)
     except Exception as exc:  # noqa: BLE001 — a check that could not run is an error
         return _error(
@@ -813,6 +934,7 @@ def verify_databricks_expose(
     dimensions["residency"] = residency
     dimensions["governance_tags"] = tags
     dimensions["row_filter_masks"] = enforcement
+    dimensions["retention"] = retention
     if job_dim is not None:
         dimensions["jobs"] = job_dim
 
@@ -826,6 +948,7 @@ def verify_databricks_expose(
             "residency",
             "governance_tags",
             "row_filter_masks",
+            "retention",
             "jobs",
         )
         if name in dimensions
@@ -836,7 +959,13 @@ def verify_databricks_expose(
         "table_id": target,
         "target": target,
         "severity": _severity(
-            diff, access, job_dim, residency=residency, tags=tags, enforcement=enforcement
+            diff,
+            access,
+            job_dim,
+            residency=residency,
+            tags=tags,
+            enforcement=enforcement,
+            retention=retention,
         ),
         "dimensions": dimensions,
         "metadata": {

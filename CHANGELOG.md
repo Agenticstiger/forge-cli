@@ -124,6 +124,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written, that `current_user()` is a service principal's application ID, and what a warehouse
   of each type enforces are unproven.
 
+- **`lifecycle.expire` on a Databricks table is accepted when the table is rebuilt in full and
+  its Delta history is limited.** It used to be refused (`databricks-retention-unmapped`):
+  nothing on Databricks deletes rows by age. A table rewritten whole on every run holds no row
+  copy older than a run except in its Delta history, which `VACUUM` (run by predictive
+  optimization on Unity Catalog managed tables) empties after `delta.logRetentionDuration`
+  (30 days by default) and `delta.deletedFileRetentionDuration` (7 days). So the emitter and
+  `fluid validate` now accept `expire: true` when every build writing the expose is a dbt build
+  whose model for the table resolves to `materialized: table`, or forge-cli's DuckDB acquisition
+  (which relies on its Databricks landing being an overwrite of the whole table), and
+  `lifecycle.retention` is at least the larger of the two history properties (the model's
+  `tblproperties` when it sets them). The model is the one whose `alias`, else file name, is the
+  expose's table, with `materialized` resolved as dbt does: `config()` in the SQL, then the
+  model's YAML `config:`, then `dbt_project.yml` by the most specific path; the default is `view`.
+  The build must also run that model: its `--select` (`properties.model` / `select`, as
+  `build_selectors` makes it) must include the model by name, fully qualified name or path, else
+  `databricks-retention-not-selected` (graph operators on another node, tags, configs and state
+  cannot be evaluated here and are refused too).
+  Refused, with the fix: `databricks-retention-incremental` (`incremental`, `snapshot`),
+  `-not-table` (`view` and the rest), `-dbt-unresolved` (a Git repository, or a value that is not
+  a plain literal: `var()`, a conditional `config()`, a custom `schema`), `-too-short`
+  (a retention under the history, so under 30 days by default), `-period` (missing or not ISO 8601)
+  and `-unmapped` (any other writer, or none). ISO 8601 years and months are counted at their
+  shortest (P1Y = 365 days, P1M = 28 days), so the check never passes a retention that is too
+  short. `fluid verify` gains a `retention` dimension: the live table's Delta history
+  (`properties` and `delta_runtime_properties_kvpairs`) must not exceed the contract's retention
+  (CRITICAL, with the `ALTER TABLE ... SET TBLPROPERTIES`), and predictive optimization off for
+  the table is a warning with the fix (enable it, or schedule `VACUUM`); skipped without
+  `expire`. Not run against a live workspace: which property names Unity Catalog's GetTable
+  serves for a table's Delta retention, and what predictive optimization reports, are modelled
+  on databricks-sdk-go v0.190.0, not observed.
+
 ### Fixed
 
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
