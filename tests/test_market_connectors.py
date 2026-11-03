@@ -1035,20 +1035,10 @@ class TestBuildSearchFiltersExtra:
 
 
 def _cc_filters(query):
-    """The attributes the Command Center connector reads off a filter object."""
-    from types import SimpleNamespace
+    """A real ``SearchFilters`` (the connector must read its real field names)."""
+    from fluid_build.cli.market import SearchFilters
 
-    return SimpleNamespace(
-        query=query,
-        domains=[],
-        owners=[],
-        tags=[],
-        layers=[],
-        statuses=[],
-        min_quality_score=0,
-        limit=None,
-        offset=None,
-    )
+    return SearchFilters(text_query=query)
 
 
 class TestCommandCenterConnectorConnect:

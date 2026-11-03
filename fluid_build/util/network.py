@@ -211,6 +211,14 @@ def create_session_with_retries(
     )
 
 
+_REQUESTS_ONLY_KWARGS = {
+    "verify": "pass the CA bundle through the client (REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE "
+    "or util.http_client.new_client) -- verify= is a client option in httpx",
+    "cert": "client certificates are a client option in httpx (new_client(cert=...))",
+    "stream": "use session.stream(...) for a streamed response in httpx",
+}
+
+
 def safe_request(
     method: str,
     url: str,
@@ -254,6 +262,14 @@ def safe_request(
     if session is None:
         session = create_session_with_retries()
 
+    # ``requests`` keyword names that ``httpx`` spells differently: translate the
+    # one that maps one-to-one, refuse the rest rather than ignore them silently.
+    if "allow_redirects" in kwargs:
+        kwargs["follow_redirects"] = kwargs.pop("allow_redirects")
+    for name, instead in _REQUESTS_ONLY_KWARGS.items():
+        if name in kwargs:
+            raise TypeError(f"safe_request() no longer takes {name!r}: {instead}")
+
     # Add timeout to kwargs
     kwargs["timeout"] = request_timeout
 
@@ -264,8 +280,11 @@ def safe_request(
         else:
             response = session.request(method, url, **kwargs)
 
-        # Raise for HTTP errors
-        response.raise_for_status()
+        # Raise for 4xx/5xx only, as ``requests`` did: ``httpx``'s
+        # ``raise_for_status()`` also raises on a 1xx/3xx (a 304, a 301 with no
+        # ``Location``).
+        if response.is_error:
+            response.raise_for_status()
 
         return response
 

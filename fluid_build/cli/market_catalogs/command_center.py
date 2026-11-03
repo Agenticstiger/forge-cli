@@ -84,6 +84,9 @@ class CommandCenterConnector(BaseCatalogConnector):
                 response_hooks=[refuse_foreign_redirect],
                 max_redirects=10,
                 trust_env=False,
+                # aiohttp's default context: the system CA store, so a corporate
+                # CA installed only there is still trusted.
+                system_trust=True,
             )
 
             self.logger.info(f"Connected to Command Center catalog: {self.base_url}")
@@ -102,18 +105,18 @@ class CommandCenterConnector(BaseCatalogConnector):
             # Build query parameters
             params = {}
 
-            if filters.query:
-                params["query"] = filters.query
-            if filters.domains:
-                params["domains"] = ",".join(filters.domains)
-            if filters.owners:
-                params["owners"] = ",".join(filters.owners)
+            if filters.text_query:
+                params["query"] = filters.text_query
+            if filters.domain:
+                params["domains"] = filters.domain
+            if filters.owner:
+                params["owners"] = filters.owner
             if filters.tags:
                 params["tags"] = ",".join(filters.tags)
-            if filters.layers:
-                params["layers"] = ",".join([layer.value for layer in filters.layers])
-            if filters.statuses:
-                params["statuses"] = ",".join([status.value for status in filters.statuses])
+            if filters.layer:
+                params["layers"] = filters.layer.value
+            if filters.status:
+                params["statuses"] = filters.status.value
             if filters.min_quality_score:
                 params["min_quality"] = filters.min_quality_score
             if filters.limit:
@@ -122,7 +125,9 @@ class CommandCenterConnector(BaseCatalogConnector):
                 params["offset"] = filters.offset
 
             # Make request
-            response = await self.session.get(self.base_url, params=params)
+            from fluid_build.util.http_client import merge_query
+
+            response = await self.session.get(merge_query(self.base_url, params))
             if response.status_code != 200:
                 self.logger.warning(f"Command Center search failed: {response.status_code}")
                 return []

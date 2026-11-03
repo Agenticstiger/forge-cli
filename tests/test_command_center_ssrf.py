@@ -158,6 +158,10 @@ class TestClientCheckAvailabilityGate:
         when the configured URL is the metadata service."""
         monkeypatch.setenv("FLUID_COMMAND_CENTER_URL", "http://169.254.169.254")
         with respx.mock(assert_all_called=False) as router:
+            # A catch-all that answers 200: any attempted request is recorded
+            # (an unmocked request would be an error the client swallows, so
+            # ``router.calls`` would stay empty and prove nothing).
+            router.route().respond(200)
             client = CommandCenterClient()
         assert client.available is False
         # No HTTP probe should have been issued.
@@ -166,6 +170,7 @@ class TestClientCheckAvailabilityGate:
     def test_check_availability_refuses_rfc1918_url(self, monkeypatch):
         monkeypatch.setenv("FLUID_COMMAND_CENTER_URL", "http://10.0.0.9:8000")
         with respx.mock(assert_all_called=False) as router:
+            router.route().respond(200)  # records any attempted request
             client = CommandCenterClient()
         assert client.available is False
         assert not router.calls

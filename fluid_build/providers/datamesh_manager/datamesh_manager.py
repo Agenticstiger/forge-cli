@@ -1233,9 +1233,14 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         # GET/PUT/DELETE (not POST) with exponential backoff -- what the
         # ``requests`` session with a urllib3 ``Retry`` did. See util/http_client.
         if self._session_instance is None:
+            from fluid_build.observability.reporter import refuse_foreign_redirect
             from fluid_build.util.http_client import new_client
 
+            # Every request carries ``x-api-key``, which httpx (unlike
+            # ``Authorization``) keeps across origins: a redirect is followed
+            # only within the API's own origin.
             self._session_instance = new_client(
+                response_hooks=[refuse_foreign_redirect],
                 retry={
                     "total": 3,
                     "backoff_factor": 0.5,
@@ -1261,6 +1266,8 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
     ) -> HttpResponse:
         import httpx
 
+        from fluid_build.observability.reporter import CredentialRedirectRefused
+
         url = f"{self.api_url}{path}"
         self._log.debug("%s %s", method, url)
         try:
@@ -1271,6 +1278,14 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 json=json_body,
                 timeout=_TIMEOUT,
             )
+        except CredentialRedirectRefused as exc:
+            # Not retried (the hook runs above the retry transport) and not
+            # followed: the key and body are for the configured origin only.
+            raise ProviderError(
+                f"Refused to follow a redirect from the Entropy Data API: {exc}. "
+                "The API key and request body were not sent there; if the API moved, "
+                "update DMM_API_URL."
+            ) from exc
         except (
             httpx.NetworkError,
             httpx.RemoteProtocolError,

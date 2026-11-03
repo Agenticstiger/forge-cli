@@ -282,7 +282,9 @@ class CommandCenterClient:
                 return False
 
             # For other status codes, try GET with limit
-            response = _probe("GET", url, timeout=1, params={"limit": 1})
+            from fluid_build.util.http_client import merge_query
+
+            response = _probe("GET", merge_query(url, {"limit": 1}), timeout=1)
             return response.status_code in (200, 401, 403)  # Exists (may need auth)
 
         except Exception as e:

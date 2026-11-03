@@ -93,6 +93,15 @@ def _http_errors() -> tuple:
     return (httpx.HTTPError, httpx.InvalidURL)
 
 
+def _response_errors() -> tuple:
+    """:func:`_http_errors` plus a body that is not JSON.
+
+    ``requests`` wrapped a ``.json()`` decode failure in a ``RequestException``;
+    ``httpx`` lets the ``ValueError`` (``json.JSONDecodeError``) through.
+    """
+    return _http_errors() + (ValueError,)
+
+
 def _is_timeout(exc: BaseException) -> bool:
     import httpx
 
@@ -192,9 +201,12 @@ def _marketplace_request(
         CredentialRedirectRefused,
         refuse_foreign_redirect,
     )
-    from fluid_build.util.http_client import new_client
+    from fluid_build.util.http_client import merge_query, new_client
 
     timeout = kwargs.pop("timeout", MARKETPLACE_HTTP_TIMEOUT_SECONDS)
+    # ``requests`` merged ``params`` into the URL's own query (``?tenant=acme``);
+    # ``httpx`` would replace it.
+    url = merge_query(url, kwargs.pop("params", None))
 
     for attempt in range(MARKETPLACE_HTTP_RETRIES + 1):
         # A retry is a new redirect chain, judged afresh.
@@ -229,6 +241,9 @@ def _format_marketplace_error(exc: BaseException) -> str:
         )
     if _is_connection_error(exc):
         return "Could not connect to the marketplace API. Check Command Center or FLUID_API_URL."
+
+    if isinstance(exc, ValueError):
+        return "Marketplace API returned a response that is not valid JSON."
 
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
@@ -547,7 +562,7 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
             data = response.json()
             registry = data.get("items", [])
             registry_total = data.get("total", len(registry))
-        except _http_errors() as e:
+        except _response_errors() as e:
             message = _format_marketplace_error(e)
             # A bundled-only result is still useful; only hard-fail when there
             # is nothing at all to show.
@@ -654,7 +669,7 @@ def show_blueprint_info(args, logger: logging.Logger, api_url: str) -> int:
             )
             response.raise_for_status()
             bp = response.json()
-        except _http_errors() as e:
+        except _response_errors() as e:
             message = _format_marketplace_error(e)
             console.print(f"[red]❌ {message}[/red]")
             logger.error("Failed to get blueprint info: %s", message, exc_info=True)
@@ -768,7 +783,7 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
             )
             response.raise_for_status()
             bp = response.json()
-        except _http_errors() as e:
+        except _response_errors() as e:
             message = _format_marketplace_error(e)
             console.print(f"[red]❌ Failed to fetch blueprint: {message}[/red]")
             logger.error("Failed to fetch blueprint: %s", message, exc_info=True)
@@ -822,7 +837,7 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
             result = response.json()
             contract = result["contract"]
             cost_estimate = result.get("cost_estimate", "N/A")
-        except _http_errors() as e:
+        except _response_errors() as e:
             message = _format_marketplace_error(e)
             console.print(f"[red]❌ Failed to instantiate blueprint: {message}[/red]")
             logger.error("Blueprint instantiation failed: %s", message, exc_info=True)

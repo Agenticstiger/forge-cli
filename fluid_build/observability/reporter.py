@@ -23,7 +23,7 @@ import threading
 import time
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Tuple
-from urllib.parse import urljoin, urlparse, urlsplit
+from urllib.parse import urlparse, urlsplit
 
 # Reuse the canonical SSRF post-DNS-resolution gate (RFC1918,
 # link-local 169.254.0.0/16 — AWS/GCP metadata — loopback, reserved;
@@ -198,9 +198,24 @@ def refuse_foreign_redirect(response: Any, *_args: Any, **_kwargs: Any) -> Any:
     """
     if not response.is_redirect:
         return response
+    import httpx  # a hook only runs inside an httpx client; keep it off the cold path
+
     source = str(response.url)
-    target = urljoin(source, response.headers.get("location", ""))
-    refusal = credential_redirect_refusal(source, target)
+    location = response.headers.get("location", "")
+    try:
+        parsed = httpx.URL(location)
+    except httpx.InvalidURL:
+        parsed = None
+    if parsed is None:
+        refusal: Optional[str] = "it redirects to a Location that is not a valid URL"
+    elif parsed.scheme and not parsed.host:
+        # ``httpx`` copies the request's host onto such a Location (``https:/x``,
+        # ``http:``) and drops its port; never judge or follow that form.
+        refusal = "it redirects to a Location with a scheme but no host"
+    else:
+        # The URL the client will follow: the Location resolved against the
+        # request URL (the public ``URL.join``), not ``urljoin`` on the response URL.
+        refusal = credential_redirect_refusal(source, str(response.request.url.join(parsed)))
     if refusal is None:
         return response
     try:
@@ -373,13 +388,19 @@ class CommandCenterReporter:
         # so a redirect is followed only within the endpoint's own origin.
         self.session: Optional[Any] = None
         if self.enabled:
-            from fluid_build.util.http_client import new_client
+            from fluid_build.util.http_client import CaBundleError, new_client
 
             headers = {"Content-Type": "application/json"}
             if config.api_key:
                 headers["X-API-Key"] = config.api_key
             headers.update(config.headers or {})
-            self.session = new_client(headers=headers, response_hooks=[refuse_foreign_redirect])
+            try:
+                self.session = new_client(headers=headers, response_hooks=[refuse_foreign_redirect])
+            except CaBundleError as exc:
+                # An unusable CA bundle must not take the command down, and TLS
+                # is not relaxed to get past it: reporting is off for this run.
+                logger.warning("Command Center reporter disabled: %s.", exc)
+                self.enabled = False
 
     def start(self):
         """Start background worker thread."""

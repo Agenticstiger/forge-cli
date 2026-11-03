@@ -81,6 +81,15 @@ class RetryError(httpx.TransportError):
     """
 
 
+class CaBundleError(OSError):
+    """``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE`` names a path that cannot be loaded.
+
+    An ``OSError``, as ``requests`` raised it (per request); the text names the
+    variable. Verification is never switched off or swapped for certifi to get
+    past it.
+    """
+
+
 def tls_verify() -> Union[bool, ssl.SSLContext]:
     """The ``verify=`` value ``requests`` would have used, for ``httpx``.
 
@@ -88,12 +97,30 @@ def tls_verify() -> Union[bool, ssl.SSLContext]:
     a file or directory, which ``requests`` used in place of its default. Never
     ``False``: nothing here switches verification off.
     """
-    bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE")
+    name = "REQUESTS_CA_BUNDLE" if os.environ.get("REQUESTS_CA_BUNDLE") else "CURL_CA_BUNDLE"
+    bundle = os.environ.get(name)
     if not bundle:
         return True
-    if os.path.isdir(bundle):
-        return ssl.create_default_context(capath=bundle)
-    return ssl.create_default_context(cafile=bundle)
+    try:
+        if os.path.isdir(bundle):
+            return ssl.create_default_context(capath=bundle)
+        return ssl.create_default_context(cafile=bundle)
+    except (OSError, ssl.SSLError) as exc:
+        raise CaBundleError(
+            f"{name} is set to {bundle!r}, which cannot be loaded as a CA bundle ({exc})"
+        ) from exc
+
+
+def merge_query(url: str, params: Optional[Mapping[str, Any]]) -> str:
+    """``url`` with ``params`` merged into its own query string, as ``requests`` did.
+
+    ``httpx`` replaces a URL's query with ``params=``; ``requests`` kept the
+    URL's own pairs and appended the new ones. Empty ``params`` leave ``url``
+    untouched (``httpx`` would erase its query).
+    """
+    if not params:
+        return str(url)
+    return str(httpx.URL(str(url)).copy_merge_params(params))
 
 
 def parse_retry_after(raw: Optional[str]) -> Optional[float]:
@@ -108,17 +135,23 @@ def parse_retry_after(raw: Optional[str]) -> Optional[float]:
     try:
         secs = float(int(raw))
         return secs if secs >= 0 else None
+    except OverflowError:
+        # An integer too large for a float (hundreds of digits): unusable.
+        return None
     except ValueError:
         pass
     try:
         parsed = email.utils.parsedate_to_datetime(raw)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return None
     if parsed is None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+    try:
+        return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+    except OverflowError:
+        return None
 
 
 class RetryTransport(httpx.BaseTransport):
@@ -187,7 +220,9 @@ class RetryTransport(httpx.BaseTransport):
         if response.status_code in _RETRY_AFTER_STATUSES:
             advertised = parse_retry_after(response.headers.get("Retry-After"))
             if advertised is not None:
-                delay = advertised
+                # Capped like the backoff (httpx-retries' ``max_backoff_wait``): a
+                # server does not get to park the CLI for days.
+                delay = min(_BACKOFF_MAX, advertised)
         response.close()
         return delay
 
@@ -274,6 +309,7 @@ def new_async_client(
     follow_redirects: bool = True,
     max_redirects: int = MAX_REDIRECTS,
     trust_env: bool = True,
+    system_trust: bool = False,
     **kwargs: Any,
 ) -> httpx.AsyncClient:
     """The async twin of :func:`new_client` (``httpx.AsyncClient``).
@@ -281,6 +317,11 @@ def new_async_client(
     ``response_hooks`` stay plain functions: they are wrapped in the coroutine
     ``httpx`` requires of an async client's event hooks, so one hook (for
     example ``refuse_foreign_redirect``) serves the sync and async clients.
+
+    ``system_trust=True`` verifies against the system CA store
+    (``ssl.create_default_context()``, what ``aiohttp`` used) instead of
+    certifi / ``REQUESTS_CA_BUNDLE``, for a caller that must keep trusting a
+    corporate CA installed only system-wide. Verification stays on.
     """
 
     def _as_async(hook: Callable[[httpx.Response], Any]) -> Callable[[httpx.Response], Any]:
@@ -297,7 +338,9 @@ def new_async_client(
         timeout=timeout,
         follow_redirects=follow_redirects,
         max_redirects=max_redirects,
-        verify=tls_verify() if trust_env else True,
+        verify=(
+            ssl.create_default_context() if system_trust else tls_verify() if trust_env else True
+        ),
         event_hooks={"response": [_as_async(h) for h in response_hooks]},
         trust_env=trust_env,
         **kwargs,
