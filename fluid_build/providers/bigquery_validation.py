@@ -43,7 +43,7 @@ from fluid_build.providers.validation_provider import (
 # need a dedicated allowlist: 6–30 chars, lowercase-or-mixed letter start,
 # letters/digits/hyphens in the middle, and a letter/digit terminator.
 # See https://cloud.google.com/resource-manager/docs/creating-managing-projects.
-_BQ_PROJECT_ID = re.compile(r"^[A-Za-z][A-Za-z0-9-]{4,28}[A-Za-z0-9]$")
+_BQ_PROJECT_ID = re.compile(r"^[A-Za-z][A-Za-z0-9-]{4,28}[A-Za-z0-9]\Z")
 
 
 def _quote_bq_project(project: str) -> str:

@@ -41,7 +41,7 @@ from fluid_build.providers.validation_provider import ValidationIssue
 LOG = logging.getLogger("fluid.providers.quality_engine")
 
 # Safe SQL identifier regex (letters, digits, underscores only)
-_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 def _validate_ident(name: str) -> str:

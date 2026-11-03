@@ -37,7 +37,7 @@ from ..util.names import normalize_bucket_name, normalize_dataset_name
 # contain hyphens, so ``_sql_safety.validate_ident`` (which rejects ``-``)
 # cannot vet them — this dedicated check guards the project component of a
 # BigQuery fully-qualified name before it is interpolated into DDL/DML.
-_GCP_PROJECT_RE = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
+_GCP_PROJECT_RE = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]\Z")
 
 
 def _validate_bq_project(project: str) -> str:

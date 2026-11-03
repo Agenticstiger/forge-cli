@@ -26,11 +26,14 @@ embeds them in argv or in the ``.tf.json``.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 # Per-command wall-clock cap. A hung ``tofu`` (e.g., an unauthenticated
@@ -43,6 +46,13 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 # can take many minutes for the eventual consistency to settle).
 _DEFAULT_TOFU_TIMEOUT_SECONDS = 1800
 _MIN_REQUIRED_VERSION = (1, 6, 0)
+# S3-native state locking (``use_lockfile``) arrived in OpenTofu 1.10.
+_S3_LOCKFILE_MIN_VERSION = (1, 10, 0)
+# After SIGINT on a timeout, how long tofu gets to release its lock and exit
+# before it is killed.
+_TIMEOUT_GRACE_SECONDS = 30
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_timeout() -> int:
@@ -162,33 +172,41 @@ def _run(
 ) -> TofuResult:
     tofu = _require_tofu()
     timeout = _resolve_timeout()
+    child = subprocess.Popen(
+        [tofu, *args],
+        cwd=workdir,
+        env=dict(env) if env is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     try:
-        proc = subprocess.run(
-            [tofu, *args],
-            cwd=workdir,
-            env=dict(env) if env is not None else None,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
+        stdout, stderr = child.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # SIGINT first: tofu's interrupt stops the operation and releases the
+        # state lock. A SIGKILL leaves ``<key>.tflock`` behind and every later
+        # run fails until someone runs ``tofu force-unlock``. Only a tofu that
+        # ignores the interrupt for the grace period is killed.
+        try:
+            child.send_signal(signal.SIGINT)
+            stdout, _ = child.communicate(timeout=_TIMEOUT_GRACE_SECONDS)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            child.kill()
+            stdout, _ = child.communicate()
         # Surface the partial output if any — the timeout itself is the
         # signal (apply engine treats a TofuResult with returncode != 0
         # as a failure). Use returncode=124 to mirror coreutils ``timeout``.
         return TofuResult(
             command=command,
             returncode=124,
-            stdout=(
-                (exc.stdout or b"").decode("utf-8", errors="replace")
-                if isinstance(exc.stdout, (bytes, bytearray))
-                else (exc.stdout or "")
-            ),
+            stdout=stdout or "",
             stderr=(
                 f"`tofu {command}` exceeded the {timeout}s wall-clock "
                 "limit (FLUID_TOFU_TIMEOUT_SECONDS overrides the default)."
             ),
             events=[],
         )
+    proc = subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
     events = _parse_json_events(proc.stdout) if "-json" in args else []
     return TofuResult(
         command=command,
@@ -197,6 +215,101 @@ def _run(
         stderr=proc.stderr,
         events=events,
     )
+
+
+def _needs_reconfigure_for_lockfile(workdir: str, config: Mapping[str, Any]) -> bool:
+    """True when ``workdir`` was initialised on this same S3 state, without the lockfile.
+
+    Adding ``use_lockfile`` to a kept workdir changes its backend config, which
+    ``tofu init`` refuses without ``-reconfigure``. That is safe only when the
+    recorded backend is this one: the same bucket, key and region (compared when
+    the module names one), ``use_lockfile`` not already true. A recorded backend
+    that differs in any of them is left to tofu's own error, never repointed.
+    """
+    from .state_migration import recorded_backend
+
+    recorded = recorded_backend(Path(workdir))
+    if not recorded or set(recorded) != {"s3"}:
+        return False
+    have = recorded["s3"] or {}
+    if have.get("use_lockfile") is True:
+        return False
+    fields = ("bucket", "key") + (("region",) if config.get("region") else ())
+    return all(have.get(k) == config.get(k) for k in fields)
+
+
+def _drops_saved_lockfile(workdir: str, config: Mapping[str, Any]) -> bool:
+    """True when ``workdir`` saved ``use_lockfile=true`` for this same bucket and key.
+
+    With no ``-backend-config`` override tofu reuses that saved partial config, so
+    an opt-out (or a tofu we will not pass the flag to) needs ``-reconfigure`` to
+    drop it. Same bucket and key, so no state moves.
+    """
+    from .state_migration import recorded_backend
+
+    recorded = recorded_backend(Path(workdir))
+    if not recorded or set(recorded) != {"s3"}:
+        return False
+    have = recorded["s3"] or {}
+    return have.get("use_lockfile") is True and all(
+        have.get(k) == config.get(k) for k in ("bucket", "key")
+    )
+
+
+def _s3_lockfile_args(workdir: str, *, force_copy: bool = False) -> List[str]:
+    """``-backend-config=use_lockfile=true`` when the module's backend is S3.
+
+    The flag is passed at init, not emitted into the module, so the module's
+    bytes (an adopter may keep them as golden files) do not change. Gated on
+    the installed tofu (>= 1.10) and switched off by ``FLUID_TOFU_S3_LOCKFILE=0``
+    for a role that cannot write the ``<key>.tflock`` object. ``-reconfigure``
+    rides along when a kept workdir recorded this state without the lockfile, and
+    when it saved the lockfile but the flag is no longer passed (so the opt-out
+    takes effect). Never with ``force_copy``: tofu lets ``-reconfigure`` win over
+    ``-force-copy`` and would silently skip the state copy.
+    """
+    try:
+        with open(os.path.join(workdir, "main.tf.json"), encoding="utf-8") as fh:
+            backend = json.load(fh).get("terraform", {}).get("backend", {})
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not isinstance(backend, dict) or not isinstance(backend.get("s3"), dict):
+        return []
+    if os.environ.get("FLUID_TOFU_S3_LOCKFILE", "").strip().lower() in ("0", "false", "no", "off"):
+        return _unlock_args(workdir, backend["s3"], force_copy)
+    version = tofu_version()
+    if version is None or version < _S3_LOCKFILE_MIN_VERSION:
+        if version is None:
+            reason = (
+                "the OpenTofu version could not be read, so the lock flag was skipped "
+                "rather than risk an unrecognised build failing init"
+            )
+        else:
+            reason = (
+                f"OpenTofu {'.'.join(str(p) for p in version)} predates 1.10, so two applies "
+                "on the same product can race. Upgrade OpenTofu to 1.10 or newer, "
+                "or run with --ensure-opentofu (pins a version that locks)"
+            )
+        logger.warning(
+            json.dumps(
+                {
+                    "event": "s3_state_unlocked",
+                    "tofu_version": ".".join(str(p) for p in version) if version else None,
+                    "message": f"S3 state is not locked: {reason}.",
+                }
+            )
+        )
+        return _unlock_args(workdir, backend["s3"], force_copy)
+    args = ["-backend-config=use_lockfile=true"]
+    if not force_copy and _needs_reconfigure_for_lockfile(workdir, backend["s3"]):
+        args.append("-reconfigure")
+    return args
+
+
+def _unlock_args(workdir: str, config: Mapping[str, Any], force_copy: bool) -> List[str]:
+    if not force_copy and _drops_saved_lockfile(workdir, config):
+        return ["-reconfigure"]
+    return []
 
 
 def tofu_init(
@@ -223,7 +336,9 @@ def tofu_init(
     args = ["init", "-input=false", "-no-color"]
     if not backend:
         args.append("-backend=false")
-    if reconfigure:
+    else:
+        args.extend(a for a in _s3_lockfile_args(workdir, force_copy=force_copy) if a not in args)
+    if reconfigure and "-reconfigure" not in args:
         args.append("-reconfigure")
     if force_copy:
         args.append("-force-copy")

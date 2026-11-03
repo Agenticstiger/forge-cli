@@ -349,9 +349,14 @@ postgres = [
 
 # LiteLLM is now a core dependency (above), not an extra. The
 # ``[litellm]`` alias is kept empty for back-compat with anyone who
-# scripted ``pip install fluid-build[litellm]`` during the opt-in
+# scripted ``pip install data-product-forge[litellm]`` during the opt-in
 # preview window.
 litellm = []
+
+# mcp is in the base install today. This empty alias lets
+# ``pip install 'data-product-forge[mcp]'`` resolve now; it gets filled
+# when mcp leaves the base install.
+mcp = []
 
 # V1.5 metadata-source catalog adapters.
 #

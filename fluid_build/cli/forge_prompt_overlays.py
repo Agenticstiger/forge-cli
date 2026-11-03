@@ -96,7 +96,7 @@ _OVERLAYS_DIR: Path = Path(__file__).with_name("agent_specs") / "prompt_overlays
 # leading dot/underscore. First line of defence against
 # ``--prompt-overlay ../../etc``; :func:`_resolve_overlay_path` adds a
 # resolved-realpath containment check as the second.
-_OVERLAY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_OVERLAY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 _ALLOWED_MODES = ("replace", "append", "prepend")
 

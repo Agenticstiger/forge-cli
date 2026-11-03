@@ -418,3 +418,37 @@ def test_a_read_only_caller_reads_the_old_key_until_the_apply_moves_it(moto, tmp
     assert outcome.outcome == mig.PENDING
     assert outcome.read_from == _block(_LEGACY_KEY)
     assert _AWS_KEY not in _keys(moto)
+
+
+def test_a_workdir_kept_from_before_the_lockfile_upgrades_in_place(moto, tmp_path, monkeypatch):
+    """Old release's init (no use_lockfile) then the new one on the same kept workdir."""
+    contract = _write(tmp_path, _contract())
+    monkeypatch.setenv("FLUID_TOFU_S3_LOCKFILE", "0")
+    _apply_as_the_old_release(contract, tmp_path)
+    before = _object(moto, _LEGACY_KEY)
+    assert before["resources"]
+
+    monkeypatch.delenv("FLUID_TOFU_S3_LOCKFILE")
+    _apply_as_the_old_release(contract, tmp_path)  # must not raise opentofu_init_failed
+
+    after = _object(moto, _LEGACY_KEY)
+    assert _addresses(after) == _addresses(before)
+    (workdir,) = [p.parent.parent for p in tmp_path.rglob(".terraform/terraform.tfstate")]
+    assert mig.recorded_backend(workdir)["s3"]["use_lockfile"] is True
+
+
+def test_the_opt_out_takes_effect_on_a_workdir_that_had_locking_on(moto, tmp_path, monkeypatch):
+    """Apply with locking, then with FLUID_TOFU_S3_LOCKFILE=0 on the same kept workdir."""
+    contract = _write(tmp_path, _contract())
+    monkeypatch.delenv("FLUID_TOFU_S3_LOCKFILE", raising=False)
+    _apply_as_the_old_release(contract, tmp_path)
+    before = _object(moto, _LEGACY_KEY)
+    assert before["resources"]
+    (workdir,) = [p.parent.parent for p in tmp_path.rglob(".terraform/terraform.tfstate")]
+    assert mig.recorded_backend(workdir)["s3"]["use_lockfile"] is True
+
+    monkeypatch.setenv("FLUID_TOFU_S3_LOCKFILE", "0")
+    _apply_as_the_old_release(contract, tmp_path)
+
+    assert mig.recorded_backend(workdir)["s3"]["use_lockfile"] in (None, False)
+    assert _addresses(_object(moto, _LEGACY_KEY)) == _addresses(before)

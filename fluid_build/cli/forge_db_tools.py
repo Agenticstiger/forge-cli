@@ -346,7 +346,7 @@ def _fetch_sample_rows(arguments: Dict[str, Any], env: Mapping[str, str]) -> Dic
     except ImportError:
         return {
             "error": "DuckDbNotInstalled",
-            "message": "fetch_sample_rows requires duckdb (pip install 'fluid-build[local]').",
+            "message": "fetch_sample_rows requires duckdb (pip install 'data-product-forge[local]').",
         }
     from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 

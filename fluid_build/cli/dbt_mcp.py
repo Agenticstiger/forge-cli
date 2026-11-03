@@ -188,7 +188,7 @@ class DbtMcpClient:
             from mcp import ClientSessionGroup, StdioServerParameters
         except ImportError as exc:  # pragma: no cover - mcp is a base dep
             raise RuntimeError(
-                "The dbt MCP delegate requires the 'mcp' SDK (ships with fluid-build)."
+                "The dbt MCP delegate requires the 'mcp' SDK (pip install 'data-product-forge[mcp]')."
             ) from exc
 
         params = StdioServerParameters(

@@ -662,7 +662,7 @@ class InputSanitizer:
             return False
 
         # Check format: alphanumeric, hyphens, underscores only
-        if not re.match(r"^[a-zA-Z0-9_-]+$", name):
+        if not re.match(r"^[a-zA-Z0-9_-]+\Z", name):
             return False
 
         # Check length

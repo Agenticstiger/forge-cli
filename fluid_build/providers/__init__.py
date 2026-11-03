@@ -105,6 +105,68 @@ def _normalize_name(name: str) -> str:
     return name.strip().lower().replace("-", "_")
 
 
+#: Names that are no longer providers -> what to do instead. Not
+#: registry entries: a user who typed one gets this line (exit 2) rather than a
+#: bare "unknown provider". Keys are :func:`_normalize_name` spellings.
+RETIRED_PROVIDERS: Dict[str, str] = {
+    "redshift": "Redshift is part of the aws provider; use --provider aws",
+    "datamesh_manager": (
+        "Data Mesh Manager is a catalog, not a provider; use "
+        "`fluid publish --target datamesh-manager` (or `fluid datamesh-manager`)"
+    ),
+}
+
+
+#: The provider that now serves a retired name used as a *platform* in a contract
+#: (``builds[].execution.runtime.platform: redshift`` still validates). Data Mesh
+#: Manager is a catalog, not a platform, so it has none.
+RETIRED_SUCCESSORS: Dict[str, str] = {"redshift": "aws"}
+
+
+def resolve_retired_platform(name: str) -> str:
+    """The successor provider for a retired platform name; any other name unchanged."""
+    if not isinstance(name, str):
+        return name
+    return RETIRED_SUCCESSORS.get(_normalize_name(name), name)
+
+
+def _claims_retired_name(name: str, who: str, logger: Optional[logging.Logger]) -> bool:
+    """True (after a WARNING) when a plugin tries to register a retired provider name.
+
+    A retired name stays reserved: an entry point able to claim ``redshift`` would
+    replace the retirement hint for ``--provider redshift`` and win the platform
+    lookup for contracts. Only discovery calls this; an explicit
+    ``register_provider(...)`` call in code stays allowed.
+    """
+    if not isinstance(name, str) or _normalize_name(name) not in RETIRED_PROVIDERS:
+        return False
+    # The plugin goes into the message itself, repr'd so control characters are
+    # escaped: the CLI's formatters print the message only, and this line is how
+    # an operator learns which package to uninstall.
+    (logger or _log).warning(
+        "provider_retired_name_reserved: %r tried to register the retired provider %r; "
+        "it was skipped",
+        who,
+        _normalize_name(name),
+        extra={
+            "evt": "provider_retired_name_reserved",
+            "_name": _normalize_name(name),
+            "plugin": who,
+        },
+    )
+    return True
+
+
+def retired_provider_hint(name: Optional[str]) -> Optional[str]:
+    """One-line ``--provider``/``FLUID_PROVIDER`` error for a retired name, else ``None``."""
+    if not name:
+        return None
+    use = RETIRED_PROVIDERS.get(_normalize_name(name))
+    if use is None:
+        return None
+    return f"Provider '{name}' was retired: {use}"
+
+
 def _add_discovery_error(source: str, modname: str, exc: BaseException) -> None:
     # DISCOVERY_ERRORS is surfaced to users via registry_dump() / `fluid providers
     # --debug`, so it must NOT carry raw exception text or a full traceback — either
@@ -466,7 +528,7 @@ def discover_providers(logger: Optional[logging.Logger] = None, *, force: bool =
             return
 
         # What the policy now allows is no longer blocked. A name it still
-        # blocks stays recorded: one registered at import time (redshift, by
+        # blocks stays recorded: one registered at import time (aws, by
         # the aws package) is not offered again when its module is cached.
         from fluid_build.plugin_manager import is_allowed
 
@@ -540,6 +602,12 @@ def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
                 reason="allow_block_policy",
             )
             POLICY_BLOCKED.add(_normalize_name(ep.name))
+            continue
+        from fluid_build.plugin_manager import entry_point_distribution
+
+        if _claims_retired_name(
+            ep.name, entry_point_distribution(ep) or str(getattr(ep, "value", ep)), logger
+        ):
             continue
         try:
             provider_cls = ep.load()
@@ -634,6 +702,8 @@ def _auto_register_from_module(mod, logger: Optional[logging.Logger]) -> None:
     providers_map = getattr(mod, "PROVIDERS", None)
     if isinstance(providers_map, dict) and providers_map:
         for name, prov in list(providers_map.items()):
+            if _claims_retired_name(name, getattr(mod, "__name__", "<unknown>"), logger):
+                continue
             try:
                 register_provider(name, prov, override=False, logger=logger)
             except Exception as exc:
@@ -651,6 +721,8 @@ def _auto_register_from_module(mod, logger: Optional[logging.Logger]) -> None:
     name = getattr(mod, "NAME", None)
     prov = getattr(mod, "Provider", None)
     if isinstance(name, str) and prov is not None:
+        if _claims_retired_name(name, getattr(mod, "__name__", "<unknown>"), logger):
+            return
         try:
             register_provider(name, prov, override=False, logger=logger)
             _safe_log(
@@ -686,6 +758,8 @@ def _auto_register_from_module(mod, logger: Optional[logging.Logger]) -> None:
             inferred = _normalize_name(getattr(cls, "name", cls.__name__).replace("Provider", ""))
             if not _is_valid_name(inferred):
                 inferred = _normalize_name(getattr(mod, "__name__", "provider").rsplit(".", 1)[-1])
+            if _claims_retired_name(inferred, getattr(mod, "__name__", "<unknown>"), logger):
+                return
             register_provider(inferred, cls, override=False, logger=logger)
             _safe_log(
                 logger,
