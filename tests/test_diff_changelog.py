@@ -38,6 +38,7 @@ from fluid_build.api.changelog_rules import (
     diff_sovereignty,
 )
 from fluid_build.api.changelog_types import Change, ChangelogReport
+from tests.test_schema_076_preview_additions import _base_contract
 
 FIXTURES = Path(__file__).parent / "fixtures" / "changelog"
 
@@ -648,30 +649,14 @@ def test_pii_removed_is_info_signal():
 
 
 def _contract_076(columns):
-    """A valid 0.7.6 contract whose one expose carries ``columns``.
+    """The valid 0.7.6 contract the schema tests share, with ``columns`` on its one expose.
 
     0.7.6 closes ``$defs.column``: it has no ``nullable``, ``primaryKey`` or
     ``pii`` key, and NOT NULL is spelled ``required: true``.
     """
-    return {
-        "fluidVersion": "0.7.6",
-        "kind": "DataProduct",
-        "id": "gold.sales.orders",
-        "name": "Orders",
-        "metadata": {"owner": {"team": "sales", "email": "sales@example.com"}},
-        "exposes": [
-            {
-                "exposeId": "orders",
-                "kind": "table",
-                "binding": {
-                    "platform": "snowflake",
-                    "format": "snowflake_table",
-                    "location": {"table": "ORDERS"},
-                },
-                "contract": {"schema": columns},
-            }
-        ],
-    }
+    contract = _base_contract("0.7.6")
+    contract["exposes"][0]["contract"]["schema"] = columns
+    return contract
 
 
 _ID_COLUMN = {"name": "id", "type": "string", "required": True}
@@ -804,6 +789,9 @@ def test_a_column_is_not_null_when_required_or_nullable_false_says_so(column, se
         ({"nullable": False}, {"nullable": True}, False, "column_nullable_loosened", "nullable"),
         ({}, {"required": True}, False, "column_nullable_tightened", "required"),
         ({"required": True}, {}, False, "column_nullable_loosened", "required"),
+        # Spelled differently on the two sides: the new column decides.
+        ({"nullable": False}, {"required": False}, False, "column_nullable_loosened", "required"),
+        ({"required": True}, {"nullable": True}, False, "column_nullable_loosened", "nullable"),
         ({"nullable": False}, {"nullable": True}, True, "primary_key_nullable", "nullable"),
         ({"required": True}, {"required": False}, True, "primary_key_nullable", "required"),
     ],

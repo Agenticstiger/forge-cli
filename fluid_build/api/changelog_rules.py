@@ -199,8 +199,9 @@ def _is_nullable(column: Mapping[str, Any]) -> bool:
 
     Pre-0.7 columns spell NOT NULL ``nullable: false``. A 0.7.x column has no
     ``nullable`` key and spells it ``required: true``. A column is NOT NULL
-    when either says so: the emitters read ``required`` alone, so a column
-    that declares both and contradicts itself must not be read as nullable.
+    when either says so: the IaC emitters read ``required`` alone, by
+    truthiness, so a column that declares both and contradicts itself must not
+    be read as nullable.
     """
     return column.get("nullable") is not False and not column.get("required")
 
@@ -209,7 +210,8 @@ def _nullability_key(old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
     """The key a nullability change is reported at: the one the contract uses.
 
     A 0.7.x column says ``required``, a pre-0.7 one ``nullable``. The new
-    column decides; the old one does when the new says neither.
+    column decides; the old one does when the new says neither. A column that
+    carries both is reported at ``nullable``.
     """
     for column in (new, old):
         if "nullable" in column:
@@ -256,7 +258,7 @@ def diff_columns(
     new_by_name = _columns_by_name(new_cols)
     pk = _primary_key_set(new_expose) | _primary_key_set(baseline_expose)
     # Paths follow the layout the new contract uses (the baseline's, when the
-    # new one gave the expose no schema), so each leads to a key that exists.
+    # new one gave the expose no schema).
     path_prefix = f"exposes[{expose_idx}].{new_at or base_at or 'schema'}"
 
     changes: List[Change] = []
