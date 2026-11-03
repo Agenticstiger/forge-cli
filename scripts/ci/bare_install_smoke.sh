@@ -25,7 +25,8 @@
 # offline, and nothing here needs a credential.
 set -euo pipefail
 
-VENV="$1"
+# Absolute, because the module-count probe below runs from /tmp.
+VENV="$(cd "$1" && pwd)"
 CONTRACT="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 
 # Ceiling for `import fluid_build.cli; build_parser()` on a bare install.
@@ -44,6 +45,7 @@ if [ "$count" -ge "$BARE_MAX_MODULES" ]; then
 fi
 
 work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
 cd "$work"
 FLUID="$VENV/bin/fluid"
 "$FLUID" validate "$CONTRACT"

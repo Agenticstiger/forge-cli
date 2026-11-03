@@ -53,38 +53,56 @@ TARGETS: dict[str, tuple[str, str, int]] = {
     "windows-py312": ("windows", "3.12", 89),
 }
 
-_REQ = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==")
+# ``name==version`` or ``name @ url``: uv writes one or the other per package.
+_REQ = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:==|@)")
 
 
 def parse_packages(compiled: str) -> list[str]:
-    """Package names (PEP 503 normalised, sorted) from ``uv pip compile`` output."""
+    """Package names (PEP 503 normalised, sorted) from ``uv pip compile`` output.
+
+    A line that is neither a comment nor a requirement fails loudly, so an
+    output format this does not understand cannot let a package through
+    uncounted.
+    """
     names = set()
     for line in compiled.splitlines():
-        m = _REQ.match(line.strip())
-        if m:
-            names.add(re.sub(r"[-_.]+", "-", m.group(1)).lower())
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _REQ.match(line)
+        if not m:
+            raise ValueError(f"unrecognised line in uv pip compile output: {line!r}")
+        names.add(re.sub(r"[-_.]+", "-", m.group(1)).lower())
     return sorted(names)
 
 
 def compile_target(platform: str, python: str) -> list[str]:
-    out = subprocess.run(
-        [
-            "uv",
-            "pip",
-            "compile",
-            "pyproject.toml",
-            "--python-version",
-            python,
-            "--python-platform",
-            platform,
-            "--no-header",
-            "--no-annotate",
-        ],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
+    try:
+        out = subprocess.run(
+            [
+                "uv",
+                "pip",
+                "compile",
+                "pyproject.toml",
+                "--python-version",
+                python,
+                "--python-platform",
+                platform,
+                "--no-header",
+                "--no-annotate",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except subprocess.CalledProcessError as exc:
+        # A resolver conflict or an index outage: show uv's own reason, which
+        # CalledProcessError's message leaves out.
+        raise SystemExit(
+            f"uv pip compile failed for {platform}/{python} (exit {exc.returncode}):\n"
+            f"{(exc.stderr or '').strip()}"
+        ) from exc
     return parse_packages(out)
 
 
@@ -113,14 +131,22 @@ def main(argv: list[str] | None = None) -> int:
     for name, (platform, python, ceiling) in TARGETS.items():
         packages = compile_target(platform, python)
         path = BASELINES / f"{name}.txt"
-        if args.update:
-            BASELINES.mkdir(exist_ok=True)
-            path.write_text("".join(f"{p}\n" for p in packages))
+        # Compare against the committed baseline before --update rewrites it,
+        # so an over-ceiling failure still names what changed.
         baseline = path.read_text().split() if path.exists() else []
         print(f"{name}: {len(packages)} packages (ceiling {ceiling})")
         msg = check(name, packages, ceiling, baseline)
         if msg:
             failures.append(msg)
+        elif len(packages) < ceiling:
+            # Ratchet: a ceiling with room to spare would let the count creep back.
+            print(
+                f"::notice::{name} is under its ceiling: lower it to {len(packages)} "
+                "in scripts/ci/dep_budget.py and run --update"
+            )
+        if args.update:
+            BASELINES.mkdir(exist_ok=True)
+            path.write_text("".join(f"{p}\n" for p in packages))
     if failures:
         print("\n" + "\n".join(failures), file=sys.stderr)
         return 1
