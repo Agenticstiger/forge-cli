@@ -272,9 +272,10 @@ def test_odps_import_semver_check_refuses_a_trailing_newline():
 def test_mission_predicate_path_refuses_a_trailing_newline():
     from fluid_build.copilot.missions.spec import MissionSpecError, validate_predicate_path
 
-    validate_predicate_path("exposes[*].contract", label="checks[0]")
-    with pytest.raises(MissionSpecError, match="invalid path segment"):
-        validate_predicate_path("exposes[*].contract\n", label="checks[0]")
+    # A stripped path can still carry one at the end of an inner segment.
+    validate_predicate_path("exposes[*].contract.dq", label="checks[0]")
+    with pytest.raises(MissionSpecError, match=r"invalid path segment 'contract\\n'"):
+        validate_predicate_path("exposes[*].contract\n.dq", label="checks[0]")
 
 
 # --- Values emitted into OpenTofu ---------------------------------------------
@@ -371,7 +372,9 @@ def test_aws_resource_names_refuse_a_trailing_newline(method, value):
 
     check = getattr(ResourceValidator("123456789012", "eu-west-1"), method)
     assert check(value) == (True, None)
-    assert check(f"{value}\n")[0] is False
+    valid, message = check(f"{value}\n")
+    assert valid is False
+    assert f"{value}\\n" in message  # the refused newline is shown, not printed
 
 
 @pytest.mark.parametrize(

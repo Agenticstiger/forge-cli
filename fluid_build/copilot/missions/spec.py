@@ -172,7 +172,7 @@ def validate_predicate_path(path: str, *, label: str) -> None:
     for segment in path.split("."):
         if not _SEGMENT_RE.match(segment):
             raise MissionSpecError(
-                f"{label}: invalid path segment '{segment}' in '{path}'. The predicate "
+                f"{label}: invalid path segment {segment!r} in {path!r}. The predicate "
                 "grammar is frozen: dotted keys with optional [*] array fan-out "
                 "(e.g. exposes[*].contract.dq.rules)."
             )
